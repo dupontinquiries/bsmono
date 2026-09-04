@@ -192,21 +192,67 @@ impl ChatPanel {
             ui.separator();
 
             // message list — role-aligned bubbles, newest at the bottom, auto-scrolled.
-            ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+            //
+            // NOT `.stick_to_bottom(true)` — that was here originally and,
+            // once the message area sits inside the bottom-up sub-layout
+            // above, scrolled PAST the actual content on the very first
+            // frame a message appears: confirmed live under Xvfb, a fresh
+            // chat that had never been manually scrolled showed nothing at
+            // all after sending, right up until a manual scroll-up revealed
+            // both bubbles sitting above the visible area. `stick_to_bottom`
+            // tracks content height against the viewport across frames to
+            // decide how far "the bottom" is; nested inside a layout whose
+            // own available height depends on what's added to it in the
+            // SAME frame (the footer below, added moments earlier in this
+            // bottom-up flow), that tracking saw a viewport size that didn't
+            // match the one actually rendered into.
+            //
+            // `scroll_to_cursor` sidesteps the cross-frame tracking
+            // entirely: called right after the last widget, it asks for
+            // whatever the cursor's position ACTUALLY is this frame,
+            // rather than a remembered content height from a frame where
+            // the surrounding layout may have been sized differently.
+            ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for m in &self.messages {
                     let (align, fill, text_col) = match m.role {
                         Role::User => (Align::Max, Color32::from_rgb(46, 92, 158), Color32::WHITE),
                         Role::Assistant => (Align::Min, ui.visuals().extreme_bg_color, ui.visuals().text_color()),
                     };
-                    ui.with_layout(Layout::top_down(align), |ui| {
-                        egui::Frame::new()
+                    // WIDTH ALLOCATED FIRST, not constrained from inside.
+                    // The old code entered `Layout::top_down(align)` at the
+                    // OUTER (full list) width and only capped the bubble's
+                    // own width once already inside the Frame — so `Align::
+                    // Max` right-aligned against the WIDE outer rect while
+                    // the bubble itself sized down to its short content,
+                    // and the two didn't agree on where "the right edge"
+                    // was. Confirmed with a real-frame test: a short user
+                    // message in a 500px-wide pane rendered its bubble
+                    // ending at x=545 — 41px past the pane's own right
+                    // edge, clipped and mostly invisible, matching exactly
+                    // what a "hi" clipped down to a single visible letter
+                    // looked like live.
+                    //
+                    // Allocating the narrower rect up front, then aligning
+                    // WITHIN it, means there is only one width in play.
+                    let max_w = ui.available_width() * 0.78;
+                    ui.allocate_ui_with_layout(egui::vec2(max_w, 0.0), Layout::top_down(align), |ui| {
+                        let frame_resp = egui::Frame::new()
                             .fill(fill)
                             .inner_margin(egui::Margin::symmetric(10, 6))
                             .corner_radius(10)
                             .show(ui, |ui| {
-                                ui.set_max_width(ui.available_width() * 0.78);
                                 ui.label(RichText::new(&m.content).color(text_col));
                             });
+                        // TEST SUPPORT ONLY: same temp-memory pattern as the
+                        // input row above, keyed by role, so a test can
+                        // check where a right-aligned (User) bubble actually
+                        // lands without replicating egui's id math.
+                        let key = match m.role {
+                            Role::User => "chat_panel_last_user_bubble_rect_for_test",
+                            Role::Assistant => "chat_panel_last_assistant_bubble_rect_for_test",
+                        };
+                        ui.ctx().memory_mut(|mem| mem.data.insert_temp(
+                            egui::Id::new(key), frame_resp.response.rect));
                     });
                     ui.add_space(4.0);
                 }
@@ -215,6 +261,7 @@ impl ChatPanel {
                         ui.label(RichText::new("…").weak());
                     });
                 }
+                ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
             });
         });
 
@@ -300,5 +347,35 @@ mod tests {
             "the input row rendered well outside the pane's own bounds: {r:?} vs {bounds:?} \
              — the empty-state ScrollArea most likely claimed the whole height \
              before the input row got a turn");
+    }
+
+    /// Diagnostic for a clipped-looking user bubble seen live: a right-
+    /// aligned (`Role::User`) message appeared to render mostly off the
+    /// right edge of the pane, only its first character visible. Checking
+    /// whether that's real clipping or just a narrow test window before
+    /// deciding whether it needs a fix.
+    #[test]
+    fn a_user_bubble_lands_within_the_pane_not_off_its_right_edge() {
+        let mut panel = ChatPanel::default();
+        panel.messages.push(ChatMessage { role: Role::Assistant, content: "hi".into() });
+        panel.messages.push(ChatMessage { role: Role::User, content: "hello there".into() });
+        let ctx = egui::Context::default();
+        let size = egui::vec2(500.0, 400.0);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(raw, |ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size);
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                let _ = panel.ui_with(ui);
+            });
+        });
+        let user_rect: Option<egui::Rect> = ctx.memory(|m|
+            m.data.get_temp(egui::Id::new("chat_panel_last_user_bubble_rect_for_test")));
+        let r = user_rect.expect("the user bubble never rendered at all");
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size).expand(4.0);
+        assert!(bounds.contains_rect(r),
+            "the user bubble rendered outside the pane's own bounds: {r:?} vs {bounds:?}");
     }
 }
