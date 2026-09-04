@@ -777,22 +777,6 @@ pub const PALETTE_ROWS_MAX: usize = 200;
 /// a bare stack with nothing bounding it and a Ui does not scroll, it clips.
 pub const PALETTE_LIST_H: f32 = 360.0;
 
-/// How tall the palette's result list should be for `rows` results.
-///
-/// A function of the ROW COUNT, which is the whole point. A ScrollArea given
-/// only a `max_height` inside an auto-sizing Area takes whatever height it is
-/// offered, and what it is offered depends on what the Area measured last
-/// frame — so the box shrinks on a narrow result set and has no way to grow
-/// back. Deriving the height from the results instead breaks that loop.
-///
-/// Padded a little per row for the frame's inner margin, and floored at one
-/// row so an empty list is a thin strip rather than nothing at all — a
-/// zero-height scroll area is indistinguishable from a palette that failed to
-/// open.
-pub fn palette_list_h(ui: &egui::Ui, rows: usize) -> f32 {
-    let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
-    (row * rows.max(1) as f32).min(PALETTE_LIST_H)
-}
 
 /// The strip: a palette button that opens on tap-and-hold, then recents
 /// and pinned quick actions.
@@ -1075,22 +1059,26 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                             // rows fit.
                             egui::ScrollArea::vertical()
                                 .id_salt("palette_commands")
-                                // HEIGHT FROM THE CONTENT, capped — not `max_height` alone.
+                                // SIZE TO THE CONTENT, capped.
                                 //
-                                // The palette lives in an auto-sizing Area, so a ScrollArea
-                                // asked only for a MAXIMUM takes whatever height it is
-                                // offered, which in an Area that sizes to its content is
-                                // whatever the last frame happened to be. That latches: the
-                                // box shrinks on a narrow result set and never grows back
-                                // when the results do. Reported as "the window height also
-                                // shrinks and never grows even with ample elements".
+                                // `min_scrolled_height == max_height` pinned the box to an
+                                // ESTIMATE — `interact_size.y` per row — and each row is
+                                // actually a Frame with its own 4pt inner margin, so the
+                                // estimate is short and the list scrolled even with three
+                                // entries in it. Reported as "the height is too small, it
+                                // doesn't feel like it is responding to the content".
                                 //
-                                // Asking for an exact height computed from the row count
-                                // breaks the loop: the size is a function of the results,
-                                // not of the previous size.
-                                .min_scrolled_height(palette_list_h(ui, shown))
-                                .max_height(palette_list_h(ui, shown))
-                                .auto_shrink([false, false])
+                                // `auto_shrink[1] = true` sizes to the real content instead.
+                                // That does NOT bring back the latch it replaced: the latch
+                                // came from `max_height` alone taking whatever the Area
+                                // offered, which depended on last frame. Content height does
+                                // not.
+                                .max_height(PALETTE_LIST_H)
+                                .auto_shrink([false, true])
+                                // The scrollbar was always reserving its gutter, which is
+                                // the "excessive padding on the right hand side".
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                                 .show(ui, |ui| {
                             for (i, (label, _)) in items.iter().take(shown).enumerate() {
                                 let selected = i == p.selected;
@@ -1169,9 +1157,14 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                     // Asking for an exact height computed from the row count
                                     // breaks the loop: the size is a function of the results,
                                     // not of the previous size.
-                                    .min_scrolled_height(palette_list_h(ui, ranked.len()))
-                                    .max_height(palette_list_h(ui, ranked.len()))
-                                    .auto_shrink([false, false])
+                                    // Same change as the commands list above: size to the
+                                    // real content, capped, and only show the scrollbar when
+                                    // it is needed. See that comment for why this does not
+                                    // reintroduce the latch it replaced.
+                                    .max_height(PALETTE_LIST_H)
+                                    .auto_shrink([false, true])
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                                     .show(ui, |ui| {
                                 for (i, (full, rel)) in ranked.iter().enumerate() {
                                     let selected = i == p.selected;
