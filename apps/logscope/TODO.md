@@ -3062,16 +3062,28 @@ Until that is decided, adding a `:brief` command would mean inventing a tree to 
 briefing derived from a tree the operator does not recognise is worse than no briefing — the
 module's own header says an explainer that fabricates is worse than none.
 
-**`ModelStatus` (the second liaison input): blocked on ONE missing field.** `is_fully_supported`
-and `what_is_blocked_with` want `ModelStatus { name, arch, gaps }`, and the engine already produces
-the gaps (`archfeat::gap_report(arch, variant)`, used at lib.rs:9649 and 9837 to PRINT them to
-stderr). But `gpu_kernels::Model` carries no `arch` string — the loader resolves an `ArchConfig`,
-uses it, and drops the name. Smallest real step in this whole area: put `arch: String` on Model
-(the loader has it in hand at construction), expose `model_gaps()` returning the same lines the
-loader prints, build a `ModelStatus` in the backend, and let the HUD show "this model has declared
-gaps: …" — the liaison rule (declare the gap rather than generate garbage) applied where the
-operator can see it instead of in stderr. That is a contained change with a clear verification: the
-HUD line must appear for a model with gaps and be absent for one without.
+**`ModelStatus` (the second liaison input): the engine half is DONE (`570a49b4`), the HUD half is
+not.** `is_fully_supported` and `what_is_blocked_with` want `ModelStatus { name, arch, gaps }`, and
+the engine already produces the gaps (`archfeat::gap_report(arch, variant)`, used at lib.rs:9649
+and 9837 to PRINT them to stderr). `gpu_kernels::Model` now carries `pub arch: String` and
+`pub moe_variant: u32`, set at both construction sites (the real GGUF loader and the int8 resident
+cache, which defaults to `"llama"`/`0` — the only values the cache format's own existing
+llama-family-only guarantee permits, not a guess), plus `Model::model_gaps()` returning the same
+lines the loader already prints. `cargo check -p gpu-gemm` is clean; `archfeat`'s own 10 gap-report
+tests still pass unaffected — no test exists yet for `model_gaps()` itself, deliberately: `Model`
+has no test-friendly constructor (see `active_params_per_token`'s own comment on exactly this,
+extracted as a free function for the same reason), and a two-line self-field delegation didn't
+seem to justify manufacturing one.
+
+**Not done**: building a `ModelStatus` in the backend and wiring the HUD line. Stopped here on
+purpose rather than pushing into `liaisonhud.rs` — `liaison.rs`'s own comment a few lines above
+this entry already documents TWO separate `liaison` modules in this codebase (`logscope::liaison`,
+which `ModelStatus` lives in, and `logscope-egui`'s own `crate::liaison`, a different module with a
+different `Statement` type), and picking the wrong one to wire against is exactly the "two
+liaisons, two Statements, one live" trap C14_TODO §10 already names. That needs someone who knows
+which is live to confirm before touching it, not a guess made to close this item out. The
+verification the original entry asked for (HUD line present for a model with gaps, absent for one
+without) is still open.
 
 **Debate: not audited beyond names.** `debaterun::{adjustment, blind, needs_reframe}` and
 `debatepanel::last_complete_line` are uncalled. Whether the panel is mounted at all was not
