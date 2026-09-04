@@ -50,6 +50,29 @@ vertex transforms on the CPU or a small set of hinge uniforms in `forward.glsl`.
 That is the next piece of engine work, and it is the only one that makes the
 other 1,009 models transform.
 
+**UPDATE (c15unified session): the approach is now PROVEN, the engine wire is
+not.** `rust/foldview` (built after this doc, per git history — 2026-08-17 vs
+this file's 2026-08-01) is exactly this path: `motion::schedule` +
+`motion::axis_angle` folding a single mesh via anatomy detection, no partner
+mesh, no parts table. It's real — rigid-motion-verified per sampled timeline
+point (`model_verify::verify_pair`), tested against actual imported vehicle
+geometry (tank/flyer/racer), not just the procedural bot parts. So the
+question this section poses ("can a single-mesh anatomy-based fold actually
+look right") has an answer, and the answer is yes.
+
+But foldview is a Rust **viewer/harness**, not the C engine — its own README
+calls it "the harness that work renders into," a tool for iterating on the
+approach with pixels, not a replacement for `game.c`/`forward.glsl`. Nothing
+in `exengine/` or `game.c` calls into foldview or vice versa; they don't
+share a build, a binary, or a runtime. So the engine-side gap this section
+describes — folding `ex_model_t` still only supports position/rotation/scale,
+still can't bend a single mesh — is very likely still exactly as open as when
+this was written. What changed is the risk of doing that work: it's now
+"port a proven approach" rather than "build and validate a new one blind."
+Did not attempt the port itself — real C-engine + GLSL work, unverifiable in
+this sandbox (no display, and this session's toolchain is Rust, not the C
+engine's own build).
+
 ## What to remove, and what not to
 
 The empty `g_tmodels` path is already inert — `tmodel_for()` returns null, so
