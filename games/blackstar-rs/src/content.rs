@@ -379,6 +379,19 @@ mod tests {
         }
     }
 
+    /// Same property as `every_troop_id_is_unique` below, for the catalog
+    /// troops/loadouts pick a chassis from: `chassis(id)` does the same
+    /// `.find(|c| c.id == id)` lookup, so a duplicate id would silently
+    /// shadow one chassis behind another rather than error. Only 7 entries
+    /// today, small enough a duplicate is unlikely to slip in unnoticed --
+    /// added for the same reason the others were, not because this one
+    /// looked suspicious.
+    #[test]
+    fn every_chassis_id_is_unique() {
+        let ids: std::collections::BTreeSet<_> = CHASSIS.iter().map(|c| c.id).collect();
+        assert_eq!(ids.len(), CHASSIS.len(), "CHASSIS has a duplicate id -- one chassis is unreachable by lookup");
+    }
+
     /// Same property `stations.rs` checks for `STATIONS`, added there this
     /// session: `troop(id)` (used by `skirmish::fighter` to build every NPC
     /// combatant, campaign or raid) does `TROOPS.iter().find(|t| t.id ==
