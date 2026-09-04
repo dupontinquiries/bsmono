@@ -158,6 +158,17 @@ pub enum Command {
     /// in the command rather than resolving it at parse time keeps the toggle honest — the parser
     /// does not know the current state, and guessing here would make ":tour" mean "on" forever.
     Tour(Option<f32>),
+    /// `:capacity` / `:cap` — briefing on which local models fit the operator's actual RAM, from the
+    /// capacity_tree findings (CAPACITY.md / model-fit.md / hardware-matrix.md), filtered to their tier.
+    Capacity,
+    /// `:queen <task>` — stage the Queen's prompt (the roster + `QUEEN_PROMPT` + the task) as the
+    /// next input, so whichever model is loaded can design a `WorkerSpec` for it. Staged rather than
+    /// generated automatically, same as `:prompt` — the operator picks the model and sends.
+    Queen(String),
+    /// `:enlist` — parse the LATEST assistant reply as a `WorkerSpec` (the Queen's output) and, if it
+    /// validates, add it to the roster. A spec that fails validation is reported with the exact
+    /// correction (`SpecError::correction`) rather than silently dropped or silently added broken.
+    Enlist,
     Noop,              // empty line
     Unknown(String),
 }
@@ -555,6 +566,9 @@ pub fn parse_command(line: &str) -> Command {
             else { Command::Tour(Some(a.parse::<f32>().unwrap_or(TOUR_DEFAULT_SPEED).clamp(0.0, 20.0))) }
         }
         "prompt" | "pr" => Command::Prompt(arg.to_string()),
+        "capacity" | "cap" => Command::Capacity,
+        "queen" => Command::Queen(arg.to_string()),
+        "enlist" => Command::Enlist,
         _ => cmd.parse::<usize>().map(Command::Goto).unwrap_or_else(|_| Command::Unknown(line.into())),
     }
 }
