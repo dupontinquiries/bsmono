@@ -56,6 +56,19 @@ pub struct Live {
     pub range: f32,
     /// bot index being chased, when this flies as a missile
     pub seek: Option<usize>,
+    /// Mark index that FIRED this, if the shooter is itself a mark.
+    ///
+    /// A shot spawns at its shooter's muzzle, which is inside that shooter's
+    /// own `r + LETHAL_R` sphere — so without this the hit loop below reports
+    /// an impact on the first step, before the shot has travelled anywhere.
+    /// The shooter shoots itself, at point blank, every trigger pull.
+    ///
+    /// Today both pools happen to be safe: `hostile_shots` steps against a
+    /// one-element mark list holding only the player, and the player's pool
+    /// steps against bots. Neither contains its own shooter. That is a
+    /// property of two call sites rather than of this module, and the first
+    /// bot-vs-bot fight would break it silently.
+    pub owner: Option<usize>,
 }
 
 pub struct Impact {
@@ -95,6 +108,7 @@ impl Shots {
         element: Element,
         amb: &Ambient,
         seek: Option<usize>,
+        owner: Option<usize>,
     ) {
         let (mass_kg, area_m2, cd) = match delivery {
             Delivery::Blast => ROCKET,
@@ -128,6 +142,7 @@ impl Shots {
             travelled: 0.0,
             range,
             seek,
+            owner,
         });
     }
 
@@ -182,6 +197,10 @@ impl Shots {
 
             // arrivals: a mark first, then the ground, then the range
             for (i, m) in marks.iter().enumerate() {
+                // Never the shooter. See `Live::owner`.
+                if s.owner == Some(i) {
+                    continue;
+                }
                 if (s.pos - m.pos).length() < m.r + LETHAL_R {
                     let fall = ballistics::falloff(&s.spec, amb, s.travelled);
                     out.push(Impact {
@@ -233,8 +252,8 @@ mod tests {
         let vac = Ambient::vacuum();
         let mut a = Shots::default();
         let mut b = Shots::default();
-        a.spawn(Vec3::ZERO, Vec3::X, Delivery::Kinetic, 300.0, 5.0, Element::None, &air, None);
-        b.spawn(Vec3::ZERO, Vec3::X, Delivery::Kinetic, 300.0, 5.0, Element::None, &vac, None);
+        a.spawn(Vec3::ZERO, Vec3::X, Delivery::Kinetic, 300.0, 5.0, Element::None, &air, None, None);
+        b.spawn(Vec3::ZERO, Vec3::X, Delivery::Kinetic, 300.0, 5.0, Element::None, &vac, None, None);
         for _ in 0..120 {
             a.step(1.0 / 120.0, 0.0, &air, &[], &flat);
             b.step(1.0 / 120.0, 0.0, &vac, &[], &flat);
@@ -250,7 +269,7 @@ mod tests {
         let mut p = Shots::default();
         // crossing target, classic PN test geometry
         let mut mark = Mark { pos: Vec3::new(120.0, 0.0, 0.0), vel: Vec3::new(0.0, 0.0, 22.0), r: 1.5 };
-        p.spawn(Vec3::ZERO, Vec3::X, Delivery::Blast, 90.0, 8.0, Element::None, &amb, Some(0));
+        p.spawn(Vec3::ZERO, Vec3::X, Delivery::Blast, 90.0, 8.0, Element::None, &amb, Some(0), None);
         for _ in 0..(6 * 120) {
             mark.pos += mark.vel * (1.0 / 120.0);
             let hits = p.step(1.0 / 120.0, 0.0, &amb, &[mark], &flat);
@@ -268,7 +287,7 @@ mod tests {
     fn an_unlocked_shot_drops_under_gravity_and_finds_the_floor() {
         let amb = Ambient::earthlike();
         let mut p = Shots::default();
-        p.spawn(Vec3::new(0.0, 5.0, 0.0), Vec3::X, Delivery::Kinetic, 60.0, 5.0, Element::None, &amb, None);
+        p.spawn(Vec3::new(0.0, 5.0, 0.0), Vec3::X, Delivery::Kinetic, 60.0, 5.0, Element::None, &amb, None, None);
         let floor = |_: f32, _: f32| 0.0;
         for _ in 0..(10 * 120) {
             let ends = p.step(1.0 / 120.0, 9.81, &amb, &[], &floor);
@@ -288,7 +307,7 @@ mod tests {
         let hit_dv = |dist: f32| -> f32 {
             let mut p = Shots::default();
             let m = Mark { pos: Vec3::new(dist, 0.0, 0.0), vel: Vec3::ZERO, r: 1.0 };
-            p.spawn(Vec3::ZERO, Vec3::X, Delivery::Kinetic, 300.0, 10.0, Element::None, &amb, None);
+            p.spawn(Vec3::ZERO, Vec3::X, Delivery::Kinetic, 300.0, 10.0, Element::None, &amb, None, None);
             for _ in 0..(5 * 120) {
                 if let Some(h) = p.step(1.0 / 120.0, 0.0, &amb, &[m], &flat).first() {
                     return h.dv.length();
@@ -300,4 +319,61 @@ mod tests {
         assert!(near > 0.0 && far > 0.0, "one of them never landed: {near} {far}");
         assert!(near > far, "range cost nothing: {near} vs {far}");
     }
+    #[test]
+    fn a_shot_does_not_hit_the_mark_that_fired_it() {
+        // A shot spawns at its shooter's muzzle, inside that shooter's own
+        // `r + LETHAL_R` sphere. Without `owner` the hit loop reports an
+        // impact on the very first step, before the shot has moved: the
+        // shooter shoots itself, point blank, every trigger pull.
+        let amb = Ambient::earthlike();
+        let ground = |_: f32, _: f32| -1000.0;
+        let shooter = Mark { pos: Vec3::ZERO, vel: Vec3::ZERO, r: 3.0 };
+        let victim = Mark { pos: Vec3::new(50.0, 0.0, 0.0), vel: Vec3::ZERO, r: 3.0 };
+
+        let mut p = Shots::default();
+        // Fired BY mark 0, from inside mark 0, straight at mark 1.
+        // 120 m/s, which is what `main.rs` gives a hostile Kinetic shot.
+        // My first version used 300 and the test PASSED with the exclusion
+        // deleted: at 300 m/s one 16 ms step carries the shot 4.8 m, just
+        // outside the shooter's 3.0 + 1.6 sphere. The bug is real at the
+        // speeds bots actually fire and invisible at the speed I picked —
+        // a test tuned to miss its own subject.
+        p.spawn(Vec3::ZERO, Vec3::X, Delivery::Kinetic, 120.0, 5.0,
+                Element::None, &amb, None, Some(0));
+        let first = p.step(0.016, 9.81, &amb, &[shooter, victim], &ground);
+        assert!(first.iter().all(|i| i.target != Some(0)),
+                "the shot hit the mark that fired it");
+        assert!(p.live.len() == 1 || first.iter().any(|i| i.target == Some(1)),
+                "the shot vanished without hitting anything");
+
+        // And it still reaches its target — the skip must not make the shot
+        // inert, which a `retain(false)` fix would.
+        for _ in 0..200 {
+            for i in p.step(0.016, 9.81, &amb, &[shooter, victim], &ground) {
+                if i.target == Some(1) {
+                    return;
+                }
+                assert_ne!(i.target, Some(0), "the shooter was hit later in flight");
+            }
+        }
+        panic!("the shot never reached the target it was aimed at");
+    }
+
+    #[test]
+    fn a_shot_with_no_owner_can_hit_every_mark() {
+        // The player's pool passes `None`, because the player is not in the
+        // bot mark list. Excluding index 0 by default would make bot 0
+        // invulnerable — a far worse bug than the one being fixed, and
+        // invisible until someone noticed one enemy never dying.
+        let amb = Ambient::earthlike();
+        let ground = |_: f32, _: f32| -1000.0;
+        let target = Mark { pos: Vec3::new(2.0, 0.0, 0.0), vel: Vec3::ZERO, r: 3.0 };
+        let mut p = Shots::default();
+        p.spawn(Vec3::ZERO, Vec3::X, Delivery::Kinetic, 300.0, 5.0,
+                Element::None, &amb, None, None);
+        let hits = p.step(0.016, 9.81, &amb, &[target], &ground);
+        assert!(hits.iter().any(|i| i.target == Some(0)),
+                "an ownerless shot failed to hit mark 0");
+    }
+
 }

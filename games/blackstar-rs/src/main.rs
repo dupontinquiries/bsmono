@@ -3815,7 +3815,7 @@ impl Game {
                         ballistics::Delivery::Blast => 55.0,
                         _ => 120.0,
                     };
-                    self.hostile_shots.spawn(from, dir, deliv, speed, dmg / IMPULSE_TO_DAMAGE, element, &self.ambient, None);
+                    self.hostile_shots.spawn(from, dir, deliv, speed, dmg / IMPULSE_TO_DAMAGE, element, &self.ambient, None, None);
                 }
                 field::Event::Melee { dmg, .. } => {
                     self.player_take(dmg, ppos, sections::Kind::Kinetic);
@@ -4053,7 +4053,7 @@ impl Game {
             // a hood gun is steadier than a hand: half the form's spread
             let dir = (fwd + (side * jx + upv * jy) * (p.spread * 0.5)).normalize_or(fwd);
             let deliv = if deliv == ballistics::Delivery::Beam { ballistics::Delivery::Kinetic } else { deliv };
-            self.shots.spawn(origin, dir, deliv, p.speed.max(60.0) + self.car.vel.length(), p.impulse * mul, elem, &self.ambient, None);
+            self.shots.spawn(origin, dir, deliv, p.speed.max(60.0) + self.car.vel.length(), p.impulse * mul, elem, &self.ambient, None, None);
         }
     }
 
@@ -4170,6 +4170,9 @@ impl Game {
                         elem,
                         &self.ambient,
                         seek,
+                        // The player is not in the bot mark list, so there is
+                        // no index to exclude.
+                        None,
                     );
                 }
             }
