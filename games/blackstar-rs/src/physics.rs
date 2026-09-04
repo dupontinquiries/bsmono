@@ -934,6 +934,17 @@ fn step_bodies(world: &mut World, car: &mut Car, ball: &mut Ball, dt: f32, cfg_g
         }
         world.bodies[i].pos = pos;
         world.bodies[i].vel = vel;
+        // TUMBLE: integrate orientation from spin. A no-op for anything
+        // constructed with spin = ZERO (every bouncy/round body), so this
+        // only changes behavior for the leaves, which is the point —
+        // `rot`/`scale` were being set at spawn and then never read again,
+        // so a leaf span its whole life at its spawn orientation, never
+        // fluttering, despite carrying real angular velocity the whole time.
+        let spin = world.bodies[i].spin;
+        if spin != Vec3::ZERO {
+            let b = &mut world.bodies[i];
+            b.rot = (Quat::from_scaled_axis(spin * dt) * b.rot).normalize();
+        }
     }
     // asteroid-asteroid collisions (n <= 10: the O(n^2) is nothing)
     for i in 0..n {
@@ -977,7 +988,15 @@ fn step_bodies(world: &mut World, car: &mut Car, ball: &mut Ball, dt: f32, cfg_g
                 glam::Vec3::new(r * (1.0 + a * 0.5), r * (1.0 - a), r * (1.0 + a * 0.5)),
             )
         } else {
-            (glam::Quat::IDENTITY, glam::Vec3::splat(r))
+            // was (Quat::IDENTITY, Vec3::splat(r)) unconditionally — every
+            // non-squashing body drew as a plain sphere at spawn
+            // orientation, discarding its own `rot`/`scale` (a leaf is
+            // authored as a flat blade, `scale: (lr, lr*0.1, lr*1.5)`, and
+            // now tumbles via the spin integration above). Round bodies are
+            // unaffected: they're constructed with `scale: Vec3::splat(r)`
+            // and `rot: Quat::IDENTITY` already, so this is the same value,
+            // just read from the field instead of rebuilt from `r`.
+            (b.rot, b.scale)
         };
         let sh = &mut world.shapes[shape];
         sh.pos = pos;
@@ -2634,6 +2653,67 @@ mod reset_tests {
                  use Car::stand_h"
             );
         }
+    }
+
+    /// The dead-field warning on `world::Body::{scale,rot,spin}` was real:
+    /// nothing read them. `world.rs`'s own "BIG LEAVES" (style 13, MONKEY
+    /// RUN) constructs leaf bodies with an anisotropic blade `scale`, a
+    /// random starting `rot`, and a real angular `spin` meant to make them
+    /// "flutter and settle" — but the render-sync in `step_bodies` only
+    /// ever read `b.squash` (always 0.0 for a leaf) and fell back to
+    /// `(Quat::IDENTITY, Vec3::splat(r))` unconditionally otherwise, so
+    /// every leaf spent its whole life drawn as a plain sphere at its spawn
+    /// orientation, motionless, despite carrying real angular velocity the
+    /// entire time.
+    #[test]
+    fn a_leaf_body_actually_tumbles_and_keeps_its_blade_shape() {
+        // world::style(N) indexes the style TABLE, not `MapStyle::focal`
+        // (the generation match's own discriminant) — "MONKEY RUN" is
+        // table index 24, focal 13.
+        let mut world = World::generate(7, crate::world::style(24), 0.19, 1.0);
+        let leaf = world
+            .bodies
+            .iter()
+            .position(|b| b.spin != Vec3::ZERO)
+            .expect("style 13 (MONKEY RUN) should generate spinning leaf bodies");
+        let shape = world.bodies[leaf].shape;
+        let scale = world.bodies[leaf].scale;
+        assert!(
+            (scale.x - scale.y).abs() > scale.y * 0.5,
+            "a leaf's own scale should be a flat blade, not round: {scale:?}"
+        );
+        let rot0 = world.bodies[leaf].rot;
+
+        // keep car/ball far away so shove logic can't interfere, and hold
+        // still (zero controls) — this is purely about the rotation sync.
+        let mut car = Car::new();
+        car.pos = Vec3::new(4000.0, 4000.0, 4000.0);
+        let mut ball = Ball::new();
+        ball.pos = car.pos;
+        let cfg = Config::default();
+        let c = Controls::default();
+        let mut ev = StepEvents::default();
+        for _ in 0..30 {
+            step(&mut car, &mut ball, &mut world, &c, &cfg, 1.0 / 60.0, &mut ev);
+        }
+
+        assert_ne!(
+            world.bodies[leaf].rot, rot0,
+            "a leaf with nonzero spin never rotated after 0.5s of stepping"
+        );
+        // AND THE ACTUAL DRAWN/COLLIDED SHAPE, not just the physics state —
+        // this is the part that was silently dropped before the fix.
+        let synced_rot = world.shapes[shape].mat.to_scale_rotation_translation().1;
+        assert_ne!(
+            synced_rot,
+            Quat::IDENTITY,
+            "the leaf tumbled in physics but its drawn shape stayed at identity rotation"
+        );
+        let synced_scale = world.shapes[shape].mat.to_scale_rotation_translation().0;
+        assert!(
+            (synced_scale.x - synced_scale.y).abs() > synced_scale.y * 0.5,
+            "the leaf's drawn shape lost its blade scale: {synced_scale:?}"
+        );
     }
 
     #[test]
