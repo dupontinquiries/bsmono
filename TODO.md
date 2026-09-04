@@ -310,15 +310,49 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   project~~ DONE (`project_search.rs`, Ctrl+Shift+F). ~~Go to symbol in
   workspace~~ DONE (`workspace_symbols.rs`, Ctrl+T, name index over every
   file's existing tree-sitter outline — not semantic go-to-def).
-- ~~**Multi-cursor**~~ **DONE, and it had been done for a while.**
-  `aperture-core/src/multicursor.rs` — `Cursors`, `Edit`, `merge_overlaps`,
-  16 tests — implements exactly what this line described, in almost the same
-  words ("milestone 4: `Selection` becomes `Vec<Selection>` and edits fan
-  out"). It had no `mod` declaration, so it was never compiled and its tests
-  never ran, and this entry went on calling it future work. Found by
-  `maintenance/tools/orphan_check.py`; declared 2026-08-22.
-  Still to do: the shell has no keybinding for it, so the capability exists in
-  the core and nothing in the UI reaches it.
+- ~~**Multi-cursor**~~ **the core was already done; now wired into the shell.**
+  `aperture-core/src/multicursor.rs` — `Cursors`, `Edit`, `merge_overlaps` —
+  implements exactly what this line described, in almost the same words
+  ("milestone 4: `Selection` becomes `Vec<Selection>` and edits fan out").
+  Found orphaned (no `mod` line, never compiled, its tests never ran) by
+  `maintenance/tools/orphan_check.py`, declared 2026-08-22.
+
+  Fixed a real bug on the way: `after_insert` computed the cursor shift as
+  `text.len()` (bytes) against a crate where every other offset — `Op`,
+  `Buffer`, `Selection` — is char indices. Invisible for ASCII, wrong by the
+  extra-byte count for any non-ASCII insert; no existing test caught it
+  because none used non-ASCII text.
+
+  Added the piece that actually needs the buffer, not just `Selection`
+  values: `find_occurrence`/`all_occurrences`/`word_at` plus the three
+  gestures built on them (`add_next_occurrence` — Ctrl+D, `select_all_
+  occurrences` — Ctrl+Shift+L, `add_vertical` — column cursors). 15 new
+  tests. `cargo test -p aperture-core --features tree-sitter`: 130/130.
+
+  Shell side: `AppState` keeps `editor.sel` as the primary and adds
+  `extra_cursors: Vec<Selection>` for the rest — NOT a rewrite of `Editor` to
+  own `Vec<Selection>` directly, which would touch every one of the ~30
+  existing motion/edit call sites in one commit. `cursors()`/`set_cursors()`
+  are the only crossing points; every pre-existing single-cursor path is
+  unaware the field exists and is provably unchanged (empty `extra_cursors`
+  ⇒ `cursors()` returns exactly the old single-`Selection` case).
+  Ctrl+D, Ctrl+Shift+L, typing, Backspace, Delete, Enter, Tab, arrow/word/
+  doc motion, and Escape (collapse to primary) are wired; `fan_out_ranges`
+  applies per-cursor edits as one undo step using the SAME ascending-shift
+  arithmetic as `Editor::replace_many`, generalized to ranges that aren't
+  the stored selection (backspace deletes text no selection represents).
+  Multi-cursor typing deliberately bypasses ghost completion, auto-pair and
+  the symbol popup rather than guessing a fan-out story for any of them.
+  `view.rs` draws secondary carets (static, not blinking — blink is a
+  "where's MY cursor" cue for the one the keyboard follows) and secondary
+  selection fills. `cargo test -p aperture-egui --lib`: 77/77 (was 64; 13
+  new, 10 of them exercising this).
+
+  Not done: no smooth-camera trailing for secondary carets (they're drawn at
+  their raw position, no interpolation — fine, since only the primary's
+  position feeds the follow-camera); no visual verification under Xvfb this
+  pass — `cargo test` is real, but nobody has looked at a screenshot of two
+  carets blinking side by side.
 - **CJK/double-width**: caret x assumes monospace `col * char_w`; wide glyphs
   need galley-measured x (egui does no full shaping — known engine limit).
 - **IME preedit** (`egui::Event::Ime`), **LSP** (own crate behind the same

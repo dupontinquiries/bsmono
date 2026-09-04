@@ -56,6 +56,8 @@ pub enum K {
     H,
     T,
     G,
+    D,
+    L,
 }
 
 /// Incremental search. Matches are absolute char ranges, kept sorted; the
@@ -428,6 +430,21 @@ pub struct AppState {
     line_map_scratch: aperture_complete::prefixcache::LineMap,
     pub command_line: String,
 
+    /// Multi-cursor: the SECONDARY cursors. `editor.sel` stays the primary.
+    ///
+    /// Not `Cursors` wholesale, and not moved into `Editor`, on purpose. Every
+    /// existing path — motion, find, ghost completion, IME, click, helix — is
+    /// written against one `editor.sel`, and rewriting thirty call sites to be
+    /// cursor-set-aware in one go is how a working editor stops working. With
+    /// this vec empty (the overwhelmingly common case) not one of those paths
+    /// changes behaviour or even branches differently; with it non-empty, the
+    /// handful of paths that fan out consult `cursors()` and go through
+    /// `aperture_core::multicursor`, which owns the offset arithmetic.
+    ///
+    /// The promotion into `Editor` stays available: `cursors()` is the only
+    /// reader, so moving the storage later is a change to two functions rather
+    /// than to the shell.
+    pub extra_cursors: Vec<aperture_core::editor::Selection>,
     pub ghost_since: Option<u64>,
     pub palette: Option<crate::palette_ui::PaletteState>,
     pub theme_id: snapclone_theme::PaletteId,
@@ -554,6 +571,7 @@ impl AppState {
             line_map: aperture_complete::prefixcache::LineMap::new(),
             line_map_scratch: aperture_complete::prefixcache::LineMap::new(),
             command_line: String::new(),
+            extra_cursors: Vec::new(),
             ghost_since: None,
             palette: None,
             theme_id: snapclone_theme::PaletteId::Night,
@@ -1615,8 +1633,113 @@ impl AppState {
         fx
     }
 
+    // ── multi-cursor ──────────────────────────────────────────────────────
+    //
+    // `editor.sel` is always the primary; `extra_cursors` holds the rest.
+    // These two are the ONLY place that boundary is crossed — everything
+    // else either reads `editor.sel` (unaware there might be more) or calls
+    // `fan_out_edit` (aware there might be). Assembling/disassembling a
+    // `Cursors` here rather than storing one keeps every pre-existing
+    // single-cursor call site correct by construction: they simply never see
+    // the rest.
+
+    /// The full cursor set, primary first.
+    fn cursors(&self) -> aperture_core::multicursor::Cursors {
+        if self.extra_cursors.is_empty() {
+            aperture_core::multicursor::Cursors::single(self.editor.sel)
+        } else {
+            let mut sels = vec![self.editor.sel];
+            sels.extend(self.extra_cursors.iter().copied());
+            aperture_core::multicursor::Cursors::new(sels)
+        }
+    }
+
+    /// Split a (possibly reordered, possibly merged) `Cursors` back into
+    /// `editor.sel` + `extra_cursors`. `Cursors::new`'s primary-tracking is
+    /// what makes this safe to call after a merge: the primary index still
+    /// points at the right selection even though the vec was sorted.
+    fn set_cursors(&mut self, c: aperture_core::multicursor::Cursors) {
+        let all = c.all();
+        self.editor.sel = c.primary();
+        self.extra_cursors = all.iter().copied().filter(|s| *s != c.primary()).collect();
+    }
+
+    /// Apply arbitrary per-cursor `(start, end, text)` ranges as one undo
+    /// step, then place a caret at each range's post-edit position.
+    ///
+    /// NOT `Cursors::after_insert`: that method assumes each edit's removed
+    /// span is exactly the corresponding *selection* (`s.max() - s.min()`),
+    /// which is true for typing-over-a-selection but false for backspace,
+    /// where a caret (an empty selection) still removes one character. Ranges
+    /// here are already char index, so the same ascending-shift arithmetic
+    /// applies — it just has to read `removed` from the range instead of
+    /// from the original `Selection`.
+    fn fan_out_ranges(&mut self, mut ranges: Vec<(usize, usize, String)>, now_ms: u64) {
+        ranges.sort_by_key(|r| r.0);
+        let mut shift: isize = 0;
+        let mut new_carets = Vec::with_capacity(ranges.len());
+        for (start, end, text) in &ranges {
+            let grow = text.chars().count() as isize;
+            let removed = (*end as isize) - (*start as isize);
+            let at = (*start as isize + shift + grow).max(0) as usize;
+            new_carets.push(Selection::caret(at));
+            shift += grow - removed;
+        }
+        self.editor.replace_many(ranges, now_ms);
+        self.set_cursors(aperture_core::multicursor::Cursors::new(new_carets));
+    }
+
+    fn fan_out_insert(&mut self, text: &str, now_ms: u64) {
+        let c = self.cursors();
+        let ranges: Vec<(usize, usize, String)> =
+            c.all().iter().map(|s| (s.min(), s.max(), text.to_string())).collect();
+        self.fan_out_ranges(ranges, now_ms);
+    }
+
+    /// Backspace at every cursor: each becomes a one-char-back deletion (or,
+    /// if it already has a selection, that selection).
+    fn fan_out_backspace(&mut self, now_ms: u64) {
+        let c = self.cursors();
+        let ranges: Vec<(usize, usize, String)> = c.all().iter().map(|s| {
+            if s.is_caret() {
+                let end = s.head;
+                let start = self.editor.buffer.clamp(end.saturating_sub(1));
+                (start, end, String::new())
+            } else {
+                (s.min(), s.max(), String::new())
+            }
+        }).collect();
+        self.fan_out_ranges(ranges, now_ms);
+    }
+
+    fn fan_out_delete_forward(&mut self, now_ms: u64) {
+        let c = self.cursors();
+        let ranges: Vec<(usize, usize, String)> = c.all().iter().map(|s| {
+            if s.is_caret() {
+                let start = s.head;
+                let end = self.editor.buffer.clamp(start + 1);
+                (start, end, String::new())
+            } else {
+                (s.min(), s.max(), String::new())
+            }
+        }).collect();
+        self.fan_out_ranges(ranges, now_ms);
+    }
+
     fn type_text(&mut self, t: &str, now_ms: u64) {
         self.preedit.clear(); // a real insertion always ends any pending composition
+        if !self.extra_cursors.is_empty() {
+            // Ghost completion, auto-pair and the symbol popup are all keyed
+            // to ONE caret's context — none of the three has a fan-out story,
+            // and guessing one is worse than not having it. Multi-cursor
+            // typing is plain insertion, at every cursor, nothing speculative
+            // shown at any of them.
+            self.ghost.dismiss();
+            self.debounce.cancel();
+            self.fan_out_insert(t, now_ms);
+            self.after_edit(now_ms);
+            return;
+        }
         if self.try_auto_pair(t, now_ms) {
             self.popup = None;
             return;
@@ -1835,9 +1958,14 @@ impl AppState {
             (PageDown, false) => self.moved(|s, sh| s.editor.move_vertical(24, sh), shift),
             (Home, false) => self.moved(|s, sh| s.editor.move_home(sh), shift),
             (End, false) => self.moved(|s, sh| s.editor.move_end(sh), shift),
+            (D, true) => self.add_next_cursor(now_ms),
+            (L, true) if shift => self.select_all_cursor_occurrences(now_ms),
             (Backspace, _) => {
                 self.ghost.dismiss();
-                if !self.backspace_pair(now_ms) {
+                if !self.extra_cursors.is_empty() {
+                    self.fan_out_backspace(now_ms);
+                    self.after_edit(now_ms);
+                } else if !self.backspace_pair(now_ms) {
                     self.editor.backspace(now_ms);
                     self.after_edit(now_ms);
                 }
@@ -1845,17 +1973,29 @@ impl AppState {
             }
             (Delete, _) => {
                 self.ghost.dismiss();
-                self.editor.delete_forward(now_ms);
+                if !self.extra_cursors.is_empty() {
+                    self.fan_out_delete_forward(now_ms);
+                } else {
+                    self.editor.delete_forward(now_ms);
+                }
                 self.after_edit(now_ms);
             }
             (Enter, _) => {
                 self.ghost.dismiss();
-                self.editor.newline_smart(now_ms);
+                if !self.extra_cursors.is_empty() {
+                    self.fan_out_insert("\n", now_ms);
+                } else {
+                    self.editor.newline_smart(now_ms);
+                }
                 self.after_edit(now_ms);
                 self.arm_completion(now_ms);
             }
             (Tab, false) => {
-                self.editor.insert_tab(now_ms);
+                if !self.extra_cursors.is_empty() {
+                    self.fan_out_insert("\t", now_ms);
+                } else {
+                    self.editor.insert_tab(now_ms);
+                }
                 self.after_edit(now_ms);
             }
             (Escape, _) => {
@@ -1871,16 +2011,48 @@ impl AppState {
                 self.dismiss_menu();
                 self.ghost.dismiss();
                 self.debounce.cancel();
-                // Escape is the way BACK to Normal, which is what makes
-                // Insert safe to enter: there is always one key that
-                // returns you to a known mode.
-                if self.typewriter_mode {
+                // Multiple cursors collapse to the primary — the one the
+                // user had before Ctrl+D/Ctrl+Shift+L added the rest — same
+                // as every other editor's Escape, and one keystroke closer
+                // to a known state, which is what Escape is for.
+                if !self.extra_cursors.is_empty() {
+                    self.extra_cursors.clear();
+                } else if self.typewriter_mode {
                     self.helix = aperture_core::helix::Mode::Normal;
                 }
             }
             _ => {}
         }
         let _ = fx;
+    }
+
+    /// Ctrl+D: select the word under the caret, or add the next occurrence
+    /// of what's already selected. `None` means the gesture had nothing to
+    /// do (no word under a lone caret, or no further occurrence) — reported
+    /// rather than silently ignored, the same as the palette's "no matches".
+    fn add_next_cursor(&mut self, now_ms: u64) {
+        let c = self.cursors();
+        match aperture_core::multicursor::add_next_occurrence(&self.editor.buffer, &c) {
+            Some(next) => {
+                self.set_cursors(next);
+                self.follow_caret = true;
+                self.ghost.dismiss();
+            }
+            None => self.set_status("Ctrl+D: nothing more to select", now_ms),
+        }
+    }
+
+    /// Ctrl+Shift+L: a cursor on every occurrence of the current word or
+    /// selection.
+    fn select_all_cursor_occurrences(&mut self, now_ms: u64) {
+        let c = self.cursors();
+        match aperture_core::multicursor::select_all_occurrences(&self.editor.buffer, &c) {
+            Some(all) => {
+                self.set_cursors(all);
+                self.ghost.dismiss();
+            }
+            None => self.set_status("Ctrl+Shift+L: no other occurrences", now_ms),
+        }
     }
 
     fn with_dismiss(&mut self, f: impl FnOnce(&mut Self), _now_ms: u64) {
@@ -1892,10 +2064,33 @@ impl AppState {
         self.follow_caret = true;
     }
 
-    fn moved(&mut self, f: impl FnOnce(&mut Self, bool), shift: bool) {
+    /// Run a motion against every cursor, not just the primary.
+    ///
+    /// `f` only ever touches `editor.sel` (that's the whole existing motion
+    /// API), so fanning it out is: run it once per cursor with THAT cursor
+    /// loaded into `editor.sel`, and collect where it ends up. No new motion
+    /// code, no per-cursor duplication of `move_word`/`move_vertical`/etc —
+    /// the single-cursor implementations are reused unmodified.
+    ///
+    /// `Fn`, not `FnOnce`: every existing call site is a closure over nothing
+    /// but a couple of `Copy` primitives, so this costs those sites nothing.
+    fn moved(&mut self, f: impl Fn(&mut Self, bool), shift: bool) {
         self.ghost.dismiss();
         self.debounce.cancel();
-        f(self, shift);
+        if self.extra_cursors.is_empty() {
+            f(self, shift);
+        } else {
+            let extras = std::mem::take(&mut self.extra_cursors);
+            let mut new_sels = Vec::with_capacity(extras.len() + 1);
+            f(self, shift);
+            new_sels.push(self.editor.sel); // the (still-)primary, moved first
+            for e in extras {
+                self.editor.sel = e;
+                f(self, shift);
+                new_sels.push(self.editor.sel);
+            }
+            self.set_cursors(aperture_core::multicursor::Cursors::new(new_sels));
+        }
         self.follow_caret = true;
     }
 
@@ -2404,6 +2599,133 @@ mod tests {
     }
     fn key(s: &mut AppState, k: K, ctrl: bool, t: u64) {
         s.handle(Ev::Key { key: k, ctrl, shift: false, alt: false }, t);
+    }
+    fn key_shift(s: &mut AppState, k: K, ctrl: bool, t: u64) {
+        s.handle(Ev::Key { key: k, ctrl, shift: true, alt: false }, t);
+    }
+
+    // ── multi-cursor ────────────────────────────────────────────────────────
+    //
+    // These test the SHELL's half — `cursors()`/`set_cursors()`/`fan_out_*`
+    // and the keys that reach them — not the arithmetic in
+    // `aperture_core::multicursor`, which has its own suite.
+
+    #[test]
+    fn ctrl_d_selects_the_word_then_the_next_occurrence() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("let total = total + 1;");
+        s.editor.sel = aperture_core::editor::Selection::caret(2); // inside "let"... move to "total"
+        s.editor.sel = aperture_core::editor::Selection::caret(6); // inside first "total"
+
+        key(&mut s, K::D, true, 0);
+        assert!(s.extra_cursors.is_empty(), "first press only selects the word");
+        assert_eq!((s.editor.sel.min(), s.editor.sel.max()), (4, 9));
+
+        key(&mut s, K::D, true, 1);
+        assert_eq!(s.extra_cursors.len(), 1, "second press adds the next occurrence");
+    }
+
+    #[test]
+    fn ctrl_d_with_nothing_further_sets_a_status_and_adds_no_cursor() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("let total = 1;");
+        s.editor.sel = aperture_core::editor::Selection::caret(6);
+        key(&mut s, K::D, true, 0);
+        key(&mut s, K::D, true, 1);
+        assert!(s.extra_cursors.is_empty());
+        let (msg, _) = s.status.clone().expect("a status message explains the no-op");
+        assert!(msg.contains("nothing more"), "{msg}");
+    }
+
+    #[test]
+    fn typing_with_multiple_cursors_inserts_at_every_one_as_one_undo_step() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("total\ntotal\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(6)];
+
+        typed(&mut s, "x", 0);
+        assert_eq!(s.editor.buffer.to_string(), "xtotal\nxtotal\n");
+        // Both carets land right after their own inserted 'x'.
+        assert_eq!(s.editor.sel, aperture_core::editor::Selection::caret(1));
+        assert_eq!(s.extra_cursors, vec![aperture_core::editor::Selection::caret(8)]);
+
+        s.editor.undo();
+        assert_eq!(s.editor.buffer.to_string(), "total\ntotal\n", "one undo removes both inserts");
+    }
+
+    #[test]
+    fn backspace_with_multiple_cursors_removes_one_char_before_each() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("aXbb\naXbb\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(2); // after the X on line 1
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(7)]; // after the X on line 2
+
+        key(&mut s, K::Backspace, false, 0);
+        assert_eq!(s.editor.buffer.to_string(), "abb\nabb\n");
+    }
+
+    #[test]
+    fn a_multibyte_insert_lands_every_cursor_at_the_right_char_offset() {
+        // The unit bug this session fixed in aperture-core, exercised through
+        // the shell path that actually calls it.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("a\na\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(2)];
+
+        typed(&mut s, "é", 0);
+        assert_eq!(s.editor.buffer.to_string(), "éa\néa\n");
+        assert_eq!(s.editor.sel, aperture_core::editor::Selection::caret(1));
+        assert_eq!(s.extra_cursors, vec![aperture_core::editor::Selection::caret(4)],
+            "a byte-counting shift would have landed this cursor inside the first é");
+    }
+
+    #[test]
+    fn arrow_motion_fans_out_to_every_cursor() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("abcdef\nabcdef\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(7)];
+
+        key(&mut s, K::Right, false, 0);
+        assert_eq!(s.editor.sel, aperture_core::editor::Selection::caret(1));
+        assert_eq!(s.extra_cursors, vec![aperture_core::editor::Selection::caret(8)]);
+    }
+
+    #[test]
+    fn escape_collapses_to_the_primary_and_leaves_the_buffer_untouched() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("total\ntotal\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(6)];
+
+        key(&mut s, K::Escape, false, 0);
+        assert!(s.extra_cursors.is_empty());
+        assert_eq!(s.editor.sel, aperture_core::editor::Selection::caret(0),
+            "Escape returns to the PRIMARY, not the first or the last");
+        assert_eq!(s.editor.buffer.to_string(), "total\ntotal\n");
+    }
+
+    #[test]
+    fn ctrl_shift_l_selects_every_occurrence_of_the_current_word() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("x = 1\ny = 2\nx = 3\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0); // the first "x"
+        key_shift(&mut s, K::L, true, 0);
+        assert_eq!(s.extra_cursors.len(), 1, "one extra cursor: the second x");
+    }
+
+    #[test]
+    fn a_single_cursor_never_touches_the_fan_out_path() {
+        // The zero-extra-cursors case must be byte-for-byte the old behaviour
+        // — this is the regression the whole feature is not allowed to cause.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("hello");
+        s.editor.sel = aperture_core::editor::Selection::caret(5);
+        typed(&mut s, "!", 0);
+        assert_eq!(s.editor.buffer.to_string(), "hello!");
+        assert!(s.extra_cursors.is_empty());
     }
 
     #[test]

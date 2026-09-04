@@ -8,10 +8,12 @@
 //!
 //! ## Apply back-to-front, always
 //!
-//! Selections are byte offsets. Insert three characters at offset 10 and every
-//! cursor after 10 is now three bytes wrong. Apply the edits in **descending**
-//! order and the ones not yet applied are all *before* the edit point, so their
-//! offsets are still valid when their turn comes.
+//! Selections are **char indices**, the same unit `Op`, `Buffer` and `Editor`
+//! use — this module's prose used to say "byte offsets", and one line of its
+//! code believed it (see `after_insert`). Insert three characters at index 10
+//! and every cursor after 10 is now three characters wrong. Apply the edits in
+//! **descending** order and the ones not yet applied are all *before* the edit
+//! point, so their indices are still valid when their turn comes.
 //!
 //! Front-to-back would need every later cursor shifted after every edit — the
 //! same answer, arrived at with an O(n²) correction pass and one off-by-one per
@@ -30,6 +32,7 @@
 //! was there first — the one the user placed deliberately before adding the
 //! rest.
 
+use crate::buffer::Buffer;
 use crate::editor::Selection;
 
 /// Several cursors, kept sorted and non-overlapping.
@@ -116,7 +119,14 @@ impl Cursors {
     /// Computed rather than re-derived from the buffer, because after a fan-out
     /// edit the buffer no longer tells you which cursor was which.
     pub fn after_insert(&self, text: &str) -> Cursors {
-        let grow = text.len() as isize;
+        // CHARS, not bytes. `Selection` is a char index everywhere else in the
+        // crate — `Op::caret_after` counts `text.chars()`, `Buffer::insert`
+        // takes a char index — and `text.len()` here made every cursor after
+        // the first land N bytes past where the buffer actually put it for any
+        // non-ASCII insertion. Invisible for ASCII, which is why 16 tests
+        // passed over it; the module also had no `mod` line for months, so no
+        // caller ever typed an accented character through it.
+        let grow = text.chars().count() as isize;
         // SIGNED, and the test caught why: replacing a 4-byte selection with 2
         // bytes is a net shift of MINUS two, and a usize accumulator panics on
         // the subtraction. Every later cursor depends on this running total, so
@@ -165,6 +175,166 @@ pub fn merge_overlaps(sorted: Vec<Selection>) -> Vec<Selection> {
         }
     }
     out
+}
+
+// ── deriving new cursors from the buffer ────────────────────────────────────
+//
+// Everything above is pure over `Selection` and never looks at text. The three
+// gestures that actually CREATE cursors have to: "the next one like this" and
+// "one line down from the lowest" are both questions about the document.
+//
+// They live here rather than in the shell because they are the part with an
+// answer that can be wrong — off-by-one at a word boundary, a wrapped search
+// that finds itself, a column that falls off the end of a shorter line — and
+// the shell has no cheap way to test any of that. The shell's remaining job is
+// one keybinding each.
+
+/// Char index of `needle`'s next occurrence at or after `from`, wrapping once.
+///
+/// Wrapping rather than stopping: the gesture is "give me another one", and
+/// stopping at the end of the file means the last few matches in a file are
+/// only reachable by scrolling up and starting over.
+///
+/// O(n) in the document per call — it materialises the rope. That is a
+/// keystroke-rate operation on a file that already fits in memory, and the
+/// alternative (a rope-aware streaming matcher) is a real chunk of code to
+/// write and test. Revisit if it ever shows up in a profile.
+pub fn find_occurrence(buf: &Buffer, needle: &str, from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let doc = buf.to_string();
+    let from_byte = char_to_byte(&doc, from);
+    doc[from_byte..]
+        .find(needle)
+        .map(|b| from_byte + b)
+        .or_else(|| doc[..from_byte].find(needle))
+        .map(|b| doc[..b].chars().count())
+}
+
+/// Every occurrence of `needle`, as selections, in document order.
+pub fn all_occurrences(buf: &Buffer, needle: &str) -> Vec<Selection> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let doc = buf.to_string();
+    let n = needle.chars().count();
+    let mut out = Vec::new();
+    let mut at = 0usize; // byte
+    while let Some(rel) = doc[at..].find(needle) {
+        let b = at + rel;
+        let c = doc[..b].chars().count();
+        out.push(Selection { anchor: c, head: c + n });
+        // Step by one CHAR, not one byte, and not by the needle's length:
+        // overlapping matches ("aa" in "aaa") are real matches, and a byte
+        // step would land mid-codepoint and slice-panic on the next `find`.
+        at = b + needle.chars().next().map(char::len_utf8).unwrap_or(1);
+    }
+    out
+}
+
+/// The identifier-ish word containing or immediately before `at`.
+///
+/// "Immediately before" matters: the caret sits *after* the last character of
+/// a word you just finished typing, and `Ctrl+D` there obviously means that
+/// word. Expanding only forward would select nothing in the single most
+/// common position for the caret to be in.
+pub fn word_at(buf: &Buffer, at: usize) -> Selection {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let n = buf.len_chars();
+    let at = at.min(n);
+    let mut start = at;
+    let mut end = at;
+    while end < n && buf.char_at(end).map(is_word).unwrap_or(false) {
+        end += 1;
+    }
+    while start > 0 && buf.char_at(start - 1).map(is_word).unwrap_or(false) {
+        start -= 1;
+    }
+    Selection { anchor: start, head: end }
+}
+
+/// `Ctrl+D`: select the word under the caret, or add the next occurrence of
+/// what is already selected.
+///
+/// Returns `None` when there is nothing to add — no word under a lone caret,
+/// or a needle whose only occurrence is the one already selected. `None` is
+/// "the gesture did nothing", which the shell can report; it is deliberately
+/// not "here are your cursors back, unchanged", so a status message is
+/// possible without diffing two `Cursors`.
+pub fn add_next_occurrence(buf: &Buffer, c: &Cursors) -> Option<Cursors> {
+    let p = c.primary();
+    if p.is_caret() {
+        let w = word_at(buf, p.head);
+        if w.is_caret() {
+            return None;
+        }
+        // First press only promotes the caret to a word — it does not also
+        // jump somewhere else. Two things happening on one keystroke is how
+        // you lose track of where you are.
+        let mut sels = vec![w];
+        sels.extend(c.all().iter().skip(1).copied());
+        return Some(Cursors::new(sels));
+    }
+    let needle = buf.slice_to_string(p.min(), p.max());
+    let last_end = c.all().iter().map(|s| s.max()).max().unwrap_or(p.max());
+    let at = find_occurrence(buf, &needle, last_end)?;
+    if c.all().iter().any(|s| s.min() == at) {
+        return None; // wrapped onto a cursor we already have
+    }
+    let fresh = Selection { anchor: at, head: at + needle.chars().count() };
+    // Fresh first: `Cursors::new` takes the primary from the head of the list,
+    // and the viewport should follow the cursor that was just created —
+    // otherwise Ctrl+D silently adds cursors off-screen.
+    let mut sels = vec![fresh];
+    sels.extend(c.all().iter().copied());
+    Some(Cursors::new(sels))
+}
+
+/// `Ctrl+Shift+L`: a cursor on every occurrence of the current selection.
+pub fn select_all_occurrences(buf: &Buffer, c: &Cursors) -> Option<Cursors> {
+    let p = c.primary();
+    let base = if p.is_caret() { word_at(buf, p.head) } else { p };
+    if base.is_caret() {
+        return None;
+    }
+    let needle = buf.slice_to_string(base.min(), base.max());
+    let hits = all_occurrences(buf, &needle);
+    if hits.len() < 2 {
+        return None;
+    }
+    // The primary stays wherever the user already was, not the first hit in
+    // the file: this gesture should not scroll you to the top.
+    let mut sels = vec![base];
+    sels.extend(hits);
+    Some(Cursors::new(sels))
+}
+
+/// `Ctrl+Alt+Up` / `Ctrl+Alt+Down`: a caret one line above or below.
+///
+/// Grown from the OUTERMOST cursor in the direction of travel, so holding the
+/// key extends the column downward instead of fighting over the same gap.
+pub fn add_vertical(buf: &Buffer, c: &Cursors, dy: isize) -> Option<Cursors> {
+    let heads = c.all().iter().map(|s| s.head);
+    let edge = if dy < 0 { heads.min() } else { heads.max() }?;
+    let p = buf.char_to_pos(edge);
+    let line = p.line as isize + dy;
+    if line < 0 || line as usize >= buf.len_lines() {
+        return None;
+    }
+    let line = line as usize;
+    // Clamp rather than skip: a short line gets a caret at its end, which is
+    // what every editor does and what makes a column of cursors down a ragged
+    // block behave.
+    let col = p.col.min(buf.line_len(line));
+    let at = buf.pos_to_char(crate::buffer::Pos::new(line, col));
+    let mut sels = vec![Selection::caret(at)];
+    sels.extend(c.all().iter().copied());
+    Some(Cursors::new(sels))
+}
+
+fn char_to_byte(s: &str, ci: usize) -> usize {
+    s.char_indices().nth(ci).map(|(b, _)| b).unwrap_or(s.len())
 }
 
 #[cfg(test)]
@@ -312,6 +482,134 @@ mod tests {
         assert!(!c.is_multi());
         assert_eq!(c.primary(), Selection::caret(9));
         assert_eq!(c.insert_edits("q").len(), 1);
+    }
+
+    #[test]
+    fn cursors_shift_by_characters_not_bytes() {
+        // The bug this module shipped with. `é` is one char and TWO bytes, so
+        // a byte-counting `grow` moved every later cursor one past where
+        // `Buffer::insert` (which takes a char index) actually put the text.
+        // Every existing test used ASCII, where the two agree.
+        let c = Cursors::new(vec![Selection::caret(0), Selection::caret(10)]);
+        let after = c.after_insert("é");
+        // 1 = its own insert; 12 = 10 + the first cursor's insert + its own.
+        // Under the byte-counting version these were 2 and 14.
+        assert_eq!(after.all()[0].head, 1);
+        assert_eq!(after.all()[1].head, 12, "the second cursor shifted by bytes, not chars");
+    }
+
+    #[test]
+    fn a_lone_caret_first_selects_the_word_it_sits_in() {
+        // One keystroke, one visible effect: promote to a word. Also jumping
+        // to another occurrence on the same press is how you lose your place.
+        let b = Buffer::from_str("let total = total + 1;");
+        let c = Cursors::single(Selection::caret(6)); // inside "total"
+        let next = add_next_occurrence(&b, &c).expect("a word is under the caret");
+        assert_eq!(next.len(), 1);
+        assert_eq!((next.all()[0].min(), next.all()[0].max()), (4, 9));
+    }
+
+    #[test]
+    fn the_caret_after_a_word_still_selects_that_word() {
+        // Where the caret actually is when you finish typing a name. Expanding
+        // only forward would select nothing in the commonest position.
+        let b = Buffer::from_str("total = 1");
+        let w = word_at(&b, 5); // just past the 'l'
+        assert_eq!((w.min(), w.max()), (0, 5));
+    }
+
+    #[test]
+    fn the_second_press_adds_the_next_occurrence_and_follows_it() {
+        let b = Buffer::from_str("let total = total + 1;");
+        let c = Cursors::new(vec![sel(4, 9)]); // "total"
+        let next = add_next_occurrence(&b, &c).expect("a second 'total' exists");
+        assert_eq!(next.len(), 2);
+        assert_eq!(next.primary().min(), 12, "the viewport must follow the NEW cursor");
+    }
+
+    #[test]
+    fn a_needle_with_only_one_occurrence_adds_nothing() {
+        // `None` is "the gesture did nothing", so the shell can say so without
+        // diffing two cursor sets.
+        let b = Buffer::from_str("let total = 1;");
+        let c = Cursors::new(vec![sel(4, 9)]);
+        assert!(add_next_occurrence(&b, &c).is_none());
+    }
+
+    #[test]
+    fn the_search_wraps_but_will_not_re_add_a_cursor_it_already_has() {
+        // Wrapping is what makes the last matches in a file reachable; without
+        // the second half of that rule, the wrap lands back on cursor one and
+        // silently does nothing while looking like it worked.
+        let b = Buffer::from_str("total total");
+        let c = Cursors::new(vec![sel(0, 5), sel(6, 11)]);
+        assert!(add_next_occurrence(&b, &c).is_none());
+    }
+
+    #[test]
+    fn occurrences_can_overlap() {
+        // "aa" occurs twice in "aaa". Stepping by the needle's length would
+        // report one, and stepping by a byte would slice mid-codepoint.
+        let b = Buffer::from_str("aaa");
+        assert_eq!(all_occurrences(&b, "aa").len(), 2);
+    }
+
+    #[test]
+    fn occurrence_indices_are_chars_not_bytes() {
+        // The same unit error as `after_insert`, in the other direction: a
+        // byte offset here would put the cursor inside a multi-byte character.
+        let b = Buffer::from_str("héllo world héllo");
+        let hits = all_occurrences(&b, "héllo");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[1].min(), 12, "byte offsets leaked into a char index");
+    }
+
+    #[test]
+    fn select_all_occurrences_keeps_the_primary_where_the_user_was() {
+        // Taking the first hit as primary scrolls you to the top of the file
+        // as a side effect of a gesture that is about the word you're on.
+        let b = Buffer::from_str("x = 1\ny = 2\nx = 3");
+        let c = Cursors::single(Selection::caret(12)); // the second "x"
+        let all = select_all_occurrences(&b, &c).expect("two x's");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.primary().min(), 12);
+    }
+
+    #[test]
+    fn a_cursor_below_lands_on_the_same_column() {
+        let b = Buffer::from_str("abcdef\nabcdef\n");
+        let c = Cursors::single(Selection::caret(3)); // line 0, col 3
+        let down = add_vertical(&b, &c, 1).expect("a line below exists");
+        assert_eq!(down.len(), 2);
+        assert_eq!(b.char_to_pos(down.all()[1].head), crate::buffer::Pos::new(1, 3));
+    }
+
+    #[test]
+    fn a_short_line_gets_a_caret_at_its_end_rather_than_none() {
+        // Skipping short lines makes a column of cursors down ragged code
+        // silently incomplete; clamping is what every editor does.
+        let b = Buffer::from_str("abcdef\nab\n");
+        let c = Cursors::single(Selection::caret(5)); // line 0, col 5
+        let down = add_vertical(&b, &c, 1).expect("a line below exists");
+        assert_eq!(b.char_to_pos(down.all()[1].head), crate::buffer::Pos::new(1, 2));
+    }
+
+    #[test]
+    fn vertical_growth_extends_from_the_outermost_cursor() {
+        // Otherwise holding the key fights over the same gap: every press
+        // would re-derive from the primary and merge into an existing cursor.
+        let b = Buffer::from_str("a\nb\nc\nd\n");
+        let c = Cursors::new(vec![Selection::caret(0), Selection::caret(2)]);
+        let down = add_vertical(&b, &c, 1).expect("line 2 exists");
+        assert_eq!(down.len(), 3);
+        assert_eq!(b.char_to_pos(down.all()[2].head).line, 2);
+    }
+
+    #[test]
+    fn there_is_no_line_above_the_first_one() {
+        let b = Buffer::from_str("only\n");
+        let c = Cursors::single(Selection::caret(2));
+        assert!(add_vertical(&b, &c, -1).is_none());
     }
 
     #[test]

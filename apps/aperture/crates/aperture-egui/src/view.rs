@@ -469,7 +469,40 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
         }
     }
 
-    // Rows: gutter number + syntax-colored galley. Split the borrows so the
+    // Secondary selections — same fill, drawn for every extra cursor that
+    // isn't a bare caret. A separate loop rather than folding into the block
+    // above: the primary reads `state.editor.sel` directly (it always has,
+    // and every other caller of that field is untouched by multi-cursor), so
+    // duplicating its five lines here is cheaper than threading an iterator
+    // through code that has to keep working for the zero-extra-cursors case.
+    for s in &state.extra_cursors {
+        if s.is_caret() {
+            continue;
+        }
+        let sel_fill = colors.accent.gamma_multiply(0.25);
+        let (a, b) = (s.min(), s.max());
+        let (pa, pb) = (state.editor.buffer.char_to_pos(a), state.editor.buffer.char_to_pos(b));
+        for line in pa.line..=pb.line {
+            if line + 1 < first || line > last {
+                continue;
+            }
+            let c0 = if line == pa.line { pa.col } else { 0 };
+            let c1 = if line == pb.line { pb.col } else { state.editor.buffer.line_len(line) + 1 };
+            let y = rect.top() - scroll + line as f32 * m.line_h
+                + if line >= shift_from { shift_px } else { 0.0 };
+            let text = state.editor.buffer.line(line);
+            let v0 = aperture_core::width::char_col_to_visual_clamped(&text, c0) as f32;
+            let v1 = aperture_core::width::char_col_to_visual_clamped(&text, c1) as f32;
+            painter.rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(content_left + v0 * m.char_w, y),
+                    Vec2::new(((v1 - v0) * m.char_w).max(m.char_w * 0.4), m.line_h),
+                ),
+                2.0,
+                sel_fill,
+            );
+        }
+    }
     // syntax cache can pull line text while we hold the rest of state.
     let AppState { editor, syntax, find, git_changed, .. } = &mut *state;
     for line in first..last {
@@ -609,6 +642,26 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     }
     if !moving {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(530));
+    }
+
+    // Secondary carets — static, not blinking: blink timing is a "where is
+    // MY cursor" cue for the one the keyboard follows, and would just be
+    // visual noise multiplied across however many are on screen.
+    for s in &state.extra_cursors {
+        let p = state.editor.buffer.char_to_pos(s.head);
+        if p.line + 1 < first || p.line > last {
+            continue;
+        }
+        let line_text = state.editor.buffer.line(p.line);
+        let vx = aperture_core::width::char_col_to_visual(&line_text, p.col) as f32;
+        let ex = content_left + vx * m.char_w;
+        let ey = rect.top() - scroll + p.line as f32 * m.line_h
+            + if p.line >= shift_from { shift_px } else { 0.0 };
+        painter.rect_filled(
+            Rect::from_min_size(Pos2::new(ex - 1.0, ey + 1.0), Vec2::new(2.0, m.line_h - 2.0)),
+            1.0,
+            colors.accent.gamma_multiply(0.8),
+        );
     }
 
     // Tell the platform's IME candidate window where to appear — without
@@ -1480,6 +1533,8 @@ fn map_key(key: egui::Key) -> Option<K> {
         EK::H => K::H,
         EK::T => K::T,
         EK::G => K::G,
+        EK::D => K::D,
+        EK::L => K::L,
         EK::F => K::F,
         EK::F3 => K::F3,
         EK::Space => K::Space,
