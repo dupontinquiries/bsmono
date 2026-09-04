@@ -48,7 +48,15 @@ pub struct LspClient {
     _reader: std::thread::JoinHandle<()>,
 }
 
-const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+// 90s, not a shorter "reasonable" default: found empirically by this
+// crate's own end-to-end test (aperture-egui's lsp_popup_e2e.rs) timing
+// out at 30s on a completion that specifically needs std/crate-graph
+// indexing (a prelude type like `String`, as opposed to a same-file local
+// symbol, which answers in well under a second — see client.rs's own doc
+// on why THAT case doesn't need this much room). A caller that wants a
+// snappier UI timeout for its own purposes should apply it on top of this
+// one, not assume this constant already reflects the fast path.
+const CALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 impl LspClient {
     /// Spawn `cmd` and complete the `initialize`/`initialized` handshake.

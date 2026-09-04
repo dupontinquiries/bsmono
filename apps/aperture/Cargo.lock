@@ -124,6 +124,7 @@ dependencies = [
  "aperture-complete",
  "aperture-core",
  "aperture-engine",
+ "aperture-lsp",
  "eframe",
  "egui",
  "egui_kittest",

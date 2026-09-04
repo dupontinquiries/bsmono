@@ -449,6 +449,28 @@ pub struct AppState {
     pub palette: Option<crate::palette_ui::PaletteState>,
     pub theme_id: snapclone_theme::PaletteId,
     pub status: Option<(String, u64)>, // message, expires_at_ms
+    /// `None` until a file recognized as having a configured server is
+    /// opened AND spawning that server succeeds — optional and best-effort
+    /// throughout, per `lsp_worker`'s own doc. Only Rust (`rust-analyzer`)
+    /// is wired up; every other language simply never sets this.
+    lsp: Option<crate::lsp_worker::LspWorker>,
+    lsp_uri: Option<String>,
+    /// LSP's own per-document version counter — required by `didChange`,
+    /// and deliberately NOT `editor.version` (that counts every internal
+    /// mutation including ones the server was never told about, e.g. before
+    /// this file had a worker at all; reusing it would let the two
+    /// disagree about how many changes the server has actually seen).
+    lsp_doc_version: i64,
+    /// Bumped on every popup-refresh that fires an LSP request; an
+    /// arriving [`lsp_worker::LspOutcome`] is applied only if this still
+    /// matches — the same generation-gate `aperture_complete::engine`
+    /// already uses so a slow answer can't land after the caret moved on.
+    lsp_gen: u64,
+    /// The word-start offset the current `lsp_gen` request was made for —
+    /// `poll_lsp` needs this to open a FRESH popup when the local tier
+    /// found nothing but LSP answers anyway (a std type invisible to the
+    /// local single-file outline, for instance).
+    lsp_pending_prefix_start: Option<usize>,
 }
 
 /// The strip as it starts: empty recents, a few pinned quick actions.
@@ -576,6 +598,11 @@ impl AppState {
             palette: None,
             theme_id: snapclone_theme::PaletteId::Night,
             status: None,
+            lsp: None,
+            lsp_uri: None,
+            lsp_doc_version: 1,
+            lsp_gen: 0,
+            lsp_pending_prefix_start: None,
         };
         if with_engine {
             s.apply_env_provider();
@@ -1153,11 +1180,43 @@ impl AppState {
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.label.len().cmp(&b.1.label.len())));
         let items: Vec<PopupItem> = scored.into_iter().map(|(_, i)| i).take(24).collect();
         if items.is_empty() {
+            // The LOCAL tier has nothing, but LSP might — a std type like
+            // "String" is invisible to this file's own tree-sitter outline
+            // by construction, not a matching failure to fix here. Don't
+            // give up on the popup just because this tier came up empty;
+            // request LSP and let `poll_lsp` open the popup itself if an
+            // answer arrives before the person moves on.
             self.popup = None;
+            self.request_lsp_completion(start);
         } else {
             self.ghost.dismiss();
             self.popup = Some(Popup { items, sel: 0, prefix_start: start });
+            self.request_lsp_completion(start);
         }
+    }
+
+    /// Ask the LSP worker (if one is running) for completions at the
+    /// caret, tagged with a fresh generation so a slow answer that lands
+    /// after the popup has moved on gets discarded by `poll_lsp` rather
+    /// than silently appended to (or opening) whatever's showing by then.
+    /// `prefix_start` is remembered alongside the generation so `poll_lsp`
+    /// can construct a FRESH popup from an LSP-only answer, not just merge
+    /// into one the local tier already opened.
+    fn request_lsp_completion(&mut self, prefix_start: usize) {
+        let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) else { return };
+        self.lsp_gen += 1;
+        self.lsp_pending_prefix_start = Some(prefix_start);
+        let p = self.editor.caret_pos();
+        // KNOWN GAP: LSP's `position.character` is a UTF-16 code-unit
+        // offset, not a char column — `caret_pos().col` is chars (the same
+        // convention `aperture_core::width` exists to convert FROM for
+        // on-screen pixel columns, a different unit again). They agree for
+        // ASCII, which is everything this session's tests use, and diverge
+        // for anything outside the BMP or requiring surrogate pairs. Not
+        // fixed here: it needs the same kind of dedicated conversion table
+        // `width.rs` is for visual columns, and this popup's own tests
+        // don't yet exercise non-ASCII Rust identifiers to catch it.
+        lsp.request_completion(uri.clone(), p.line as u32, p.col as u32, self.lsp_gen);
     }
 
     fn popup_accept(&mut self, now_ms: u64) {
@@ -1870,7 +1929,68 @@ impl AppState {
         self.syntax.absorb(&mut self.editor.buffer);
         self.follow_caret = true;
         self.invalidate_cache_for_edit();
+        self.notify_lsp_changed();
         let _ = now_ms;
+    }
+
+    /// `didChange` on every edit, unconditionally — no debounce, unlike the
+    /// AI completion path. A stale server-side document view would answer
+    /// completions against text that no longer exists, which is a worse
+    /// failure than one extra IPC message per keystroke costs; the worker
+    /// thread absorbs the cost off the UI thread regardless (see
+    /// `lsp_worker`'s own doc for why this is safe to call often).
+    fn notify_lsp_changed(&mut self) {
+        let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) else { return };
+        self.lsp_doc_version += 1;
+        lsp.change(uri.clone(), self.editor.buffer.to_string(), self.lsp_doc_version);
+    }
+
+    /// Apply an arrived LSP completion outcome to the popup, if it's still
+    /// for the request the popup is actually waiting on. Called once per
+    /// frame from the view's tick, same shape as `poll_completions`.
+    pub fn poll_lsp(&mut self) {
+        let Some(lsp) = &self.lsp else { return };
+        while let Some(outcome) = lsp.poll() {
+            if outcome.generation != self.lsp_gen {
+                continue; // superseded by a later request; the caret moved on
+            }
+            match &mut self.popup {
+                Some(popup) => {
+                    let existing: std::collections::HashSet<String> =
+                        popup.items.iter().map(|i| i.label.clone()).collect();
+                    for item in outcome.items {
+                        if existing.contains(&item.label) {
+                            continue; // already offered by the local-symbol tier
+                        }
+                        popup.items.push(PopupItem {
+                            label: item.label,
+                            insert: item.insert_text,
+                            detail: item.detail.unwrap_or_default(),
+                        });
+                    }
+                }
+                None => {
+                    // The local tier had nothing (e.g. a std type this
+                    // file never defines) — LSP answering anyway is reason
+                    // enough to open the popup fresh, provided the person
+                    // hasn't since moved the caret elsewhere.
+                    let Some(prefix_start) = self.lsp_pending_prefix_start else { continue };
+                    if outcome.items.is_empty() {
+                        continue;
+                    }
+                    let items: Vec<PopupItem> = outcome
+                        .items
+                        .into_iter()
+                        .map(|item| PopupItem {
+                            label: item.label,
+                            insert: item.insert_text,
+                            detail: item.detail.unwrap_or_default(),
+                        })
+                        .collect();
+                    self.popup = Some(Popup { items, sel: 0, prefix_start });
+                }
+            }
+        }
     }
 
     /// Retire cached completions whose context genuinely left the buffer.
@@ -2233,8 +2353,45 @@ impl AppState {
                 self.cam.scroll_y.snap(0.0);
                 self.follow_caret = false;
                 self.set_status("opened", now_ms);
+                self.start_lsp_for_current_file(&text);
             }
             Err(e) => self.set_status(&format!("open failed: {e}"), now_ms),
+        }
+    }
+
+    /// Absolute `file://` URI for `path` — LSP addresses documents by URI,
+    /// never by a bare path, and a relative one would be ambiguous about
+    /// which directory it's relative TO once it crosses the wire to a
+    /// server process with its own cwd.
+    fn file_uri(path: &std::path::Path) -> String {
+        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        format!("file://{}", abs.display())
+    }
+
+    /// Best-effort: spawn `rust-analyzer` for the just-opened file if it's
+    /// Rust and nothing has already been started for a different file this
+    /// session. Silent on failure (no `rust-analyzer` on `PATH` is the
+    /// overwhelmingly common case in any environment that hasn't installed
+    /// it) — this is an ADDITIONAL tier, never something the editor depends
+    /// on working. Only Rust is wired up; every other language leaves
+    /// `self.lsp` as `None`, same as before this method existed.
+    fn start_lsp_for_current_file(&mut self, text: &str) {
+        if self.lang != Language::Rust {
+            return;
+        }
+        let Some(path) = self.path.clone() else { return };
+        let uri = Self::file_uri(&path);
+        let root_uri = Self::file_uri(&self.workspace_root());
+        if self.lsp.is_none() {
+            match crate::lsp_worker::LspWorker::spawn("rust-analyzer", &[], &root_uri) {
+                Ok(w) => self.lsp = Some(w),
+                Err(_) => return, // no server available — stay on the local-only tier
+            }
+        }
+        self.lsp_doc_version = 1;
+        self.lsp_uri = Some(uri.clone());
+        if let Some(lsp) = &self.lsp {
+            lsp.open(uri, text.to_string());
         }
     }
 

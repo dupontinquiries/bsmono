@@ -36,6 +36,7 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
         state.show_loop_pane = !state.show_loop_pane;
     }
     state.poll_completions(now_ms);
+    state.poll_lsp();
     state.poll_note();
     state.poll_route_ai();
     state.poll_edit_ai(now_ms);

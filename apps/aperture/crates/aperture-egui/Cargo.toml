@@ -45,6 +45,7 @@ app = ["dep:eframe"]
 [dependencies]
 aperture-core = { workspace = true }
 aperture-complete = { workspace = true }
+aperture-lsp = { workspace = true }
 aperture-engine = { workspace = true }
 egui = { workspace = true }
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
