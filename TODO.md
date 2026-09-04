@@ -365,8 +365,27 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   of the editor is space-only and tab-stop-aligned per column; now computes
   each cursor's own stop. Re-verified interactively after the fix: one
   Ctrl+Z now restores a three-keystroke typed run at both cursors.
+
+  A THIRD bug, same method: after verifying the coalescing fix, the very
+  same undo left no visible secondary cursor on screen — worth noticing
+  rather than assuming was fine. `extra_cursors` was never told when the
+  buffer got mutated or replaced outside the fan-out path: undo, redo,
+  paste, cut, an AI edit landing, opening a different file, and every
+  revision-preview/materialize/branch path (all funnel through
+  `set_preview_text`) left stale offsets sitting there for the next
+  keystroke to fan out to. Added `discard_extra_cursors` as one choke
+  point, wired into all six sites. Verified by immediately typing a
+  character right after undo and confirming it landed exactly once.
+
+  Also wired `add_vertical` (column cursors) to Ctrl+Alt+Up/Down — it
+  existed in core from the start of this work but had never been bound to
+  a key, an orphan at the function level. Verified interactively: three
+  presses built a column across three lines, mixed correctly with an
+  existing selection from Ctrl+D (typing replaced the selection, inserted
+  at the plain carets), one undo restored all three.
+
   `cargo test -p aperture-core --features tree-sitter`: 134/134.
-  `cargo test -p aperture-egui --lib`: 79/79.
+  `cargo test -p aperture-egui --lib`: 85/85.
 - **CJK/double-width**: caret x assumes monospace `col * char_w`; wide glyphs
   need galley-measured x (egui does no full shaping — known engine limit).
 - **IME preedit** (`egui::Event::Ime`), **LSP** (own crate behind the same
