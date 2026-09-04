@@ -518,13 +518,41 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   outside the BMP — the same class of fix `aperture_core::width.rs`
   already is for visual columns, not built here.
 
-  Not done: diagnostics (`publishDiagnostics` — a server-initiated
-  notification the reader thread still drops on the floor), go-to-
-  definition, hover, incremental sync (`did_change` always sends the
-  whole document). `workspace_symbols`'s local tree-sitter outline and
-  `route`'s keyword-scored candidates stay the fast, dependency-free
-  default tiers; LSP is an ADDITIONAL tier alongside them, never a
-  replacement.
+  ~~diagnostics (`publishDiagnostics` — a server-initiated notification
+  the reader thread still drops on the floor)~~ **client-level piece
+  DONE, one commit later; NOT wired to the shell.** `Diagnostic`/
+  `DiagnosticSeverity`, parsed in `reader_loop` (the notification
+  replaces the FULL list per URI each time, no delta to reconcile), read
+  via `LspClient::diagnostics(uri)` — there's no request/response for
+  diagnostics in the protocol, only a push, so this just reads the reader
+  thread's own cache. 6 new parser unit tests. The real proof: a genuine
+  `&str`-to-`i32` mismatch against a real `rust-analyzer`, checked for
+  the right severity and line.
+
+  Found and fixed a real test bug on the way: `scratch_package()` built
+  its temp directory from `std::process::id()` alone — identical for
+  every test in one binary, and `cargo test` runs them concurrently on
+  separate threads by default, so parallel tests were racing on the same
+  directory and the same rust-analyzer workspace root. Fixed to take a
+  per-test name.
+
+  What did NOT make it in, named rather than hidden: a second test
+  asserting that fixing the error via a follow-up `didChange` clears the
+  diagnostic. An isolated repro showed the SECOND `didChange`'s content
+  genuinely never reflected in a later diagnostics update, even after 40+
+  seconds — the diagnostic stayed pinned to the FIRST version's error.
+  Real client bug, a rust-analyzer version/config quirk, or a sandbox
+  resource limitation — not enough signal yet to know which, and a flaky
+  or wrong test claiming more than is proven would be worse than naming
+  the gap. Follow-up work.
+
+  Still not done: go-to-definition, hover, incremental sync (`did_change`
+  always sends the whole document), and wiring diagnostics into the shell
+  at all (no gutter marks, no status count — the client can fetch them,
+  nothing in `aperture-egui` asks it to yet).
+  `workspace_symbols`'s local tree-sitter outline and `route`'s
+  keyword-scored candidates stay the fast, dependency-free default tiers;
+  LSP is an ADDITIONAL tier alongside them, never a replacement.
 
   Interactive Xvfb verification DID happen, one commit later, and found
   a THIRD real bug the automated test's own code path couldn't have
