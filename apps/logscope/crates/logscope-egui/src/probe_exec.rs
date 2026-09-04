@@ -43,9 +43,10 @@ pub fn run(root: &std::path::Path, p: &Probe) -> Result<Vec<Finding>, ProbeError
     match p {
         Probe::Slice { path, first, last } => slice(root, path, *first, *last).map(|f| vec![f]),
         Probe::Grep { pattern, glob, max_hits } => grep(root, pattern, glob.as_deref(), *max_hits),
+        Probe::Outline { path } => outline(root, path).map(|f| vec![f]),
         // Not yet executable. Returning an empty vec would read as "nothing
         // found", which is a lie the queen would act on.
-        Probe::Outline { .. } | Probe::Symbol { .. } | Probe::Deps { .. } => {
+        Probe::Symbol { .. } | Probe::Deps { .. } => {
             Err(ProbeError::Unreadable {
                 path: String::new(),
                 why: "probe kind has no executor yet".into(),
@@ -104,6 +105,48 @@ pub fn slice(root: &std::path::Path, path: &str, first: u32, last: u32)
         return Err(ProbeError::BadRange);
     }
     Ok(Finding { path: path.into(), first, last: seen.min(last), text: out })
+}
+
+/// Item names and their line spans — the survey probe.
+///
+/// # This one DOES read the whole file, and that is the point
+///
+/// `ast::extract` parses the source, so the bytes are read. What matters is
+/// what leaves: the finding is a list of item names and line numbers, not the
+/// code. A 900-line file becomes about forty lines of index, and those forty
+/// lines are what decide whether any `Slice` of it is worth the tokens.
+///
+/// Reading once on disk to avoid reading repeatedly into the prompt is the
+/// whole trade. It is also why `Outline` is priced at 300 tokens against a
+/// file's ten thousand.
+///
+/// Uses `crate::ast`, which already extracts exactly this — kind, name,
+/// enclosing impl or mod, and a line span — and had no caller.
+pub fn outline(root: &std::path::Path, path: &str) -> Result<Finding, ProbeError> {
+    let full = root.join(path);
+    let src = std::fs::read_to_string(&full)
+        .map_err(|e| open_err(e.kind(), path, &e.to_string()))?;
+    let items = crate::ast::extract(&src);
+    let total = src.lines().count().max(1) as u32;
+
+    let mut text = String::new();
+    for it in &items {
+        // 1-based, to match `slice` and grep. `ast` reports 0-based, and a
+        // survey whose line numbers are one out sends every slice it justifies
+        // one line off — which reads as the model quoting the wrong statement.
+        let line = it.start_line as u32 + 1;
+        match &it.parent {
+            Some(p) => text.push_str(&format!("{line}: {:?} {p}::{}\n", it.kind, it.name)),
+            None => text.push_str(&format!("{line}: {:?} {}\n", it.kind, it.name)),
+        }
+    }
+    if items.is_empty() {
+        // Distinct from a parse failure only in that it is not an error: a
+        // file with no items is a real answer, and saying so beats an empty
+        // finding the queen reads as a probe that did not run.
+        text.push_str("(no items)\n");
+    }
+    Ok(Finding { path: path.into(), first: 1, last: total, text })
 }
 
 /// Literal substring search. One finding per matching line.
@@ -250,12 +293,20 @@ mod tests {
 
     #[test]
     fn an_unexecutable_probe_errors_rather_than_returning_nothing() {
-        // Outline, Symbol and Deps have no executor yet. An empty vec would
-        // read as "nothing found" — a lie the queen would act on by looking
-        // somewhere else.
+        // Symbol and Deps have no executor. An empty vec would read as
+        // "nothing found" — a lie the queen would act on by looking somewhere
+        // else.
+        //
+        // This test named Outline until Outline gained an executor, and then
+        // failed — correctly. A test that asserts a feature is MISSING has to
+        // be revisited when it arrives, which is the one kind of failing test
+        // worth being pleased about.
         let root = fixture("noexec", 5);
-        let r = run(&root, &Probe::Outline { path: "f.rs".into() });
-        assert!(matches!(r, Err(ProbeError::Unreadable { .. })), "{r:?}");
+        for p in [Probe::Symbol { name: "x".into(), path_hint: None },
+                  Probe::Deps { krate: "k".into(), depth: 1 }] {
+            let r = run(&root, &p);
+            assert!(matches!(r, Err(ProbeError::Unreadable { .. })), "{p:?} -> {r:?}");
+        }
     }
 
     #[test]
@@ -282,6 +333,66 @@ mod tests {
                    ProbeError::Unreadable { path: "a.rs".into(), why: "denied".into() });
         assert!(matches!(open_err(std::io::ErrorKind::IsADirectory, "d", "is a dir"),
                          ProbeError::Unreadable { .. }));
+    }
+
+    fn rust_fixture(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("outline-{}-{name}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("f.rs"), body).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_outline_names_the_items_without_returning_the_code() {
+        // The economic claim the whole survey-first rule rests on. If the
+        // outline carried bodies it would cost what the file costs and there
+        // would be no reason to run it first.
+        let body = "fn alpha() {\n    let x = 1;\n    println!(\"a long body line that must not appear\");\n}\nstruct Beta { f: u32 }\nimpl Beta {\n    fn gamma(&self) {}\n}\n";
+        let root = rust_fixture("names", body);
+        let f = outline(&root, "f.rs").unwrap();
+        for want in ["alpha", "Beta", "gamma"] {
+            assert!(f.text.contains(want), "{want} missing from outline:\n{}", f.text);
+        }
+        assert!(!f.text.contains("must not appear"),
+                "the outline carried a body:\n{}", f.text);
+        assert!(f.text.len() < body.len(), "the outline is not smaller than the file");
+    }
+
+    #[test]
+    fn outline_line_numbers_are_one_based_like_every_other_probe() {
+        // `ast` reports 0-based. A survey one line out sends every slice it
+        // justifies one line off, which reads as the model quoting the wrong
+        // statement — and is invisible unless something checks.
+        let root = rust_fixture("lines", "// c\nfn first() {}\n");
+        let f = outline(&root, "f.rs").unwrap();
+        assert!(f.text.starts_with("2: "), "expected line 2, got:\n{}", f.text);
+    }
+
+    #[test]
+    fn a_file_with_no_items_says_so_rather_than_returning_nothing() {
+        // An empty finding reads as a probe that did not run. "No items" is a
+        // real answer and moves the queen on.
+        let root = rust_fixture("empty", "// just a comment\n");
+        let f = outline(&root, "f.rs").unwrap();
+        assert!(f.text.contains("no items"), "{}", f.text);
+        assert!(!f.text.is_empty());
+    }
+
+    #[test]
+    fn outline_of_a_missing_file_is_an_error_not_an_empty_index() {
+        let root = rust_fixture("gone", "fn a() {}\n");
+        assert_eq!(outline(&root, "nope.rs").unwrap_err(),
+                   ProbeError::NotFound("nope.rs".into()));
+    }
+
+    #[test]
+    fn run_dispatches_outline_now_that_it_has_an_executor() {
+        // The wiring, which `outline`'s own tests cannot see: they pass
+        // perfectly with `run` still returning the not-implemented error.
+        let root = rust_fixture("dispatch", "fn a() {}\n");
+        let r = run(&root, &Probe::Outline { path: "f.rs".into() }).expect("outline runs");
+        assert_eq!(r.len(), 1);
+        assert!(r[0].text.contains("a"), "{}", r[0].text);
     }
 
 }
