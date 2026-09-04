@@ -89,6 +89,17 @@ downstream reads the profile instead of hard-coded defaults.
 **This is the shift you described**: the map stops being where the game
 starts and becomes somewhere the profile sends you.
 
+**Plumbing done (c15unified, at time of this check), wizard not.**
+`chassis`/`name`/`paint` already existed as `Save::car`/`name`/`look`.
+Added `faction`/`element`/`signature`/`hull`/`berth` to `Save` too, wired
+through `parse`/`render`, bounds-checked against the real catalogs. This is
+only the save-format half of "one `Profile` struct" — there's still no
+actual `Profile` type gathering these into one thing downstream code reads,
+and no wizard writes to them yet, so every new save still gets whatever
+`Save::default()` picks. The wizard itself (1a/1b) is real UI/UX work —
+page flow, wording, layout — not attempted here; it needs a display to
+build against, which this sandbox doesn't have.
+
 ### 1d. Where multiplayer goes
 
 The wizard flow becomes the single-player entry. Multiplayer moves behind
