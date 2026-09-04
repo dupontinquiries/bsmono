@@ -280,7 +280,14 @@ fn doc(name: &str, title: &str, md: &str) -> voiceterm_egui::manpage_view::Doc {
         } else if t.is_empty() {
             html.push_str("<br>");
         } else {
-            html.push_str(&format!("<p>{}</p>", escape(t)));
+            // INLINE MARKDOWN. This used to be `escape(t)` — every bold span
+            // and every link in a bundled doc came through as literal
+            // asterisks and brackets (`**[vision.md](vision.md)**`, verbatim)
+            // because nothing between the block-level cases above (headers,
+            // fences, blank lines) ever looked at `**`, `` ` `` or `[...](...)`
+            // inside a plain paragraph line. README.md and ROADMAP.md — real
+            // files, `include_str!`'d below — both use all three.
+            html.push_str(&format!("<p>{}</p>", inline_md(t)));
         }
     }
     // An unclosed fence at EOF: close it, or the reader renders the rest of the
@@ -297,6 +304,158 @@ fn doc(name: &str, title: &str, md: &str) -> voiceterm_egui::manpage_view::Doc {
 /// an unescaped `<` in a code fence silently eats everything to the next `>`.
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Inline markdown within one paragraph line: `` `code` ``, `**bold**`, and
+/// `[text](url)`. Plain characters are escaped individually so the two never
+/// fight over the same pass — a naive "escape first, then look for markup"
+/// order would search for `**` after `<`/`>` had already been substituted in,
+/// silently missing anything adjacent to an escaped character.
+///
+/// Single-pass, character-indexed rather than regex: this crate has no regex
+/// dependency, and three fixed delimiters don't need one.
+fn inline_md(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
+            if let Some(end) = find_str(&chars, i + 2, "**") {
+                let inner: String = chars[i + 2..end].iter().collect();
+                out.push_str("<b>");
+                // RECURSE, don't just escape: `**[vision.md](vision.md)**` is
+                // a bold LINK, and README.md writes its file list exactly
+                // that way. A plain `escape(&inner)` here left the link
+                // syntax literal inside the bold tag — passed the first
+                // version of this fix, failed the one test that nested two
+                // spans instead of one.
+                out.push_str(&inline_md(&inner));
+                out.push_str("</b>");
+                i = end + 2;
+                continue;
+            }
+        } else if chars[i] == '`' {
+            if let Some(end) = find_char(&chars, i + 1, '`') {
+                let inner: String = chars[i + 1..end].iter().collect();
+                // NOT recursed: a code span is the one place markdown
+                // convention says formatting inside is suppressed, so
+                // `` `**not bold**` `` must stay literal asterisks.
+                out.push_str("<code>");
+                out.push_str(&escape(&inner));
+                out.push_str("</code>");
+                i = end + 1;
+                continue;
+            }
+        } else if chars[i] == '[' {
+            if let Some(close_bracket) = find_char(&chars, i + 1, ']') {
+                if chars.get(close_bracket + 1) == Some(&'(') {
+                    if let Some(close_paren) = find_char(&chars, close_bracket + 2, ')') {
+                        let text: String = chars[i + 1..close_bracket].iter().collect();
+                        let url: String = chars[close_bracket + 2..close_paren].iter().collect();
+                        out.push_str(&format!(
+                            "<a href=\"{}\">{}</a>", escape(&url), inline_md(&text)));
+                        i = close_paren + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // No markup matched at `i` (or an opening delimiter with no closing
+        // one — a truncated `**bold` at end of line, say): fall through to
+        // one escaped plain character, same as the unmatched-delimiter case
+        // above via `continue` not firing.
+        let mut buf = [0u8; 4];
+        out.push_str(&escape(chars[i].encode_utf8(&mut buf)));
+        i += 1;
+    }
+    out
+}
+
+/// First index at or after `from` where `chars` contains `needle` verbatim.
+fn find_str(chars: &[char], from: usize, needle: &str) -> Option<usize> {
+    let n: Vec<char> = needle.chars().collect();
+    if n.is_empty() || from > chars.len() { return None; }
+    (from..=chars.len().saturating_sub(n.len())).find(|&i| chars[i..i + n.len()] == n[..])
+}
+
+/// First index at or after `from` where `chars` contains `needle`.
+fn find_char(chars: &[char], from: usize, needle: char) -> Option<usize> {
+    (from..chars.len()).find(|&i| chars[i] == needle)
+}
+
+#[cfg(test)]
+mod doc_markdown_tests {
+    use super::*;
+
+    #[test]
+    fn plain_text_is_just_escaped() {
+        assert_eq!(inline_md("hello world"), "hello world");
+        assert_eq!(inline_md("a < b & c > d"), "a &lt; b &amp; c &gt; d");
+    }
+
+    #[test]
+    fn bold_renders_as_a_tag_not_literal_asterisks() {
+        assert_eq!(inline_md("**bold**"), "<b>bold</b>");
+        assert_eq!(inline_md("say **this** now"), "say <b>this</b> now");
+    }
+
+    #[test]
+    fn inline_code_renders_as_a_tag() {
+        assert_eq!(inline_md("run `cargo test`"), "run <code>cargo test</code>");
+    }
+
+    #[test]
+    fn a_link_renders_as_an_anchor_not_literal_brackets() {
+        assert_eq!(inline_md("[vision.md](vision.md)"),
+                   "<a href=\"vision.md\">vision.md</a>");
+    }
+
+    /// The exact case observed live: a bold link, which is how README.md
+    /// actually writes its file list. Regression pin for the bug this
+    /// function replaced `escape(t)` to fix.
+    #[test]
+    fn a_bold_link_is_not_left_as_literal_markdown_syntax() {
+        assert_eq!(
+            inline_md("**[vision.md](vision.md)** — long-term goals"),
+            "<b><a href=\"vision.md\">vision.md</a></b> — long-term goals");
+    }
+
+    #[test]
+    fn an_unterminated_delimiter_falls_back_to_literal_text() {
+        // No closing `**`: must not consume or corrupt the rest of the line.
+        assert_eq!(inline_md("this **never closes"), "this **never closes");
+        assert_eq!(inline_md("a `dangling code span"), "a `dangling code span");
+    }
+
+    #[test]
+    fn markup_characters_inside_a_span_are_still_escaped() {
+        // The span content goes through `escape` too, not straight into the
+        // tag — a link label containing `<` must not inject a stray tag.
+        assert_eq!(inline_md("[a < b](x)"), "<a href=\"x\">a &lt; b</a>");
+    }
+
+    #[test]
+    fn a_code_span_suppresses_nested_markdown_but_bold_does_not() {
+        // Markdown convention: code spans have the highest precedence and
+        // switch off formatting inside them; bold and links do not, which
+        // is exactly what the bold-link case above depends on.
+        assert_eq!(inline_md("`**not bold**`"), "<code>**not bold**</code>");
+    }
+
+    #[test]
+    fn a_full_paragraph_line_through_doc_matches_inline_md() {
+        let d = doc("t", "T", "**[vision.md](vision.md)** — goals");
+        assert!(d.html.contains("<b><a href=\"vision.md\">vision.md</a></b>"),
+                "doc() must route paragraph lines through inline_md: {}", d.html);
+    }
+
+    #[test]
+    fn headers_and_fences_are_unaffected() {
+        let d = doc("t", "T", "# Title\n\n```\nlet x = 1;\n```\n\n**bold** after");
+        assert!(d.html.contains("<h1>Title</h1>"));
+        assert!(d.html.contains("<pre>let x = 1;\n</pre>"));
+        assert!(d.html.contains("<p><b>bold</b> after</p>"));
+    }
 }
 
 struct VoicetermApp {
