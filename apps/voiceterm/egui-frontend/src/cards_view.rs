@@ -109,6 +109,116 @@ pub fn has_provenance(c: &Card) -> bool {
     !c.source.url.trim().is_empty() || !c.source.paragraph_id.trim().is_empty()
 }
 
+/// One piece of a card preview, after scanning for `[[Name]]` tokens.
+#[derive(Debug, Clone, PartialEq)]
+enum Segment {
+    /// Ordinary text — rendered as-is, never clickable.
+    Plain(String),
+    /// A resolved `[[Name]]`: the raw inner text to display, and the
+    /// TARGET card's title to open on click.
+    Link { display: String, target: String },
+    /// An unresolved `[[Name]]`, or any bracket token found while
+    /// `code` — shown literally, brackets included, per zbrackets' own
+    /// "unresolved name links under current dir" convention: still
+    /// worth showing, not hidden or silently dropped.
+    Literal(String),
+}
+
+/// Scan `text` for `[[Name]]` tokens and resolve each against `cards` by
+/// title. PURE — no UI, fully testable without a rendering pass, unlike
+/// the widget it feeds (see `linked_preview_ui`, and the frame_tests
+/// module's own note on why a real click through `horizontal_wrapped`
+/// text isn't reliably simulatable at the pixel level).
+///
+/// Deliberately NOT `zbrackets` (also re-exported this session, also
+/// unused): that module resolves against a real notes-DIRECTORY tree —
+/// folders, `.md`/`.pdf` extensions, relative path math — and this app's
+/// cards live in memory keyed by TITLE alone, no directory structure to
+/// resolve against. `backlinks.rs`'s `normalize_target` is the right fit
+/// instead: the same lowercase-and-strip-`.md` key this app's OWN
+/// backlinks index already uses to match cards by title, so a link
+/// resolves exactly when backlinks already agrees two cards are
+/// connected — one matching rule, not two that could disagree.
+///
+/// Meant to run on the ALREADY-TRUNCATED preview text, not the full
+/// body: a `[[` with no matching `]]` before the text ends (a link
+/// truncated mid-token) is treated as plain trailing text rather than an
+/// error — a preview is an approximation by nature, and `preview()`
+/// itself already risks a mid-word cut at its byte boundary.
+fn scan_links(text: &str, cards: &[Card]) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut seg_start = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            if let Some(close) = text[i + 2..].find("]]") {
+                if seg_start < i {
+                    out.push(Segment::Plain(text[seg_start..i].to_string()));
+                }
+                let inner = &text[i + 2..i + 2 + close];
+                let key = crate::backlinks_view::backlinks::normalize_target(inner);
+                match cards.iter().find(|c|
+                    crate::backlinks_view::backlinks::normalize_target(&c.title) == key)
+                {
+                    Some(c) => out.push(Segment::Link {
+                        display: inner.to_string(), target: c.title.clone() }),
+                    None => out.push(Segment::Literal(format!("[[{inner}]]"))),
+                }
+                i += 2 + close + 2;
+                seg_start = i;
+                continue;
+            }
+        }
+        i += 1;
+        while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 { i += 1; }
+    }
+    if seg_start < text.len() {
+        out.push(Segment::Plain(text[seg_start..].to_string()));
+    }
+    out
+}
+
+/// Render `text` (a card's preview) with `[[Name]]` tokens as clickable
+/// links to other cards, instead of literal bracket text — the
+/// zettelkasten TODO's own gap: backlinks have tracked `[[wiki-links]]`
+/// correctly since they were written, but nothing ever rendered one as a
+/// link a person could actually follow. A thin renderer over
+/// `scan_links`'s pure resolution — see its own doc for the matching
+/// rule and why `zbrackets` isn't the right tool here.
+///
+/// Returns the title of a clicked, RESOLVED link, if any. Inside a code
+/// preview (`code: true`), every token renders literal — a code card
+/// showing a stray `"[[foo]]"` string as a live link would follow a link
+/// the code never meant to make.
+fn linked_preview_ui(ui: &mut egui::Ui, text: &str, cards: &[Card],
+                     colors: &uikit_egui::PaletteColors, code: bool) -> Option<String> {
+    let mut clicked = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let label = |ui: &mut egui::Ui, s: &str| if !s.is_empty() {
+            let rt = egui::RichText::new(s).small();
+            ui.label(if code { rt.monospace() } else { rt });
+        };
+        for seg in scan_links(text, cards) {
+            match seg {
+                Segment::Plain(s) => label(ui, &s),
+                Segment::Link { display, target } if !code => {
+                    if ui.link(egui::RichText::new(&display).small().color(colors.accent))
+                        .clicked()
+                    {
+                        clicked = Some(target);
+                    }
+                }
+                // A resolved link, but inside a code preview: still literal.
+                Segment::Link { display, .. } => label(ui, &format!("[[{display}]]")),
+                Segment::Literal(s) => label(ui, &s),
+            }
+        }
+    });
+    clicked
+}
+
 /// Draw the deck. Returns a card title if one was opened.
 pub fn deck_ui(ui: &mut egui::Ui, d: &mut Deck,
                colors: &uikit_egui::PaletteColors) -> Option<String> {
@@ -130,6 +240,18 @@ pub fn deck_ui(ui: &mut egui::Ui, d: &mut Deck,
     egui::ScrollArea::vertical().show(ui, |ui| {
         for c in &cards {
             let sel = d.is_selected(c);
+            // Set from INSIDE the block below when a resolved `[[link]]`
+            // is clicked — checked before `row_click` further down, not
+            // instead of it: both are real `Response`s over the same
+            // pointer event (the link sits INSIDE the row `row_click`
+            // hit-tests as a whole), and egui doesn't stop one consuming a
+            // click from also letting another one see it. Without this
+            // ordering, `row_click`'s own assignment — unconditional,
+            // running straight after — silently overwrote the link's
+            // correct target with "whichever row it was clicked in",
+            // confirmed by a test that clicked a link to another card and
+            // got the card the link was WRITTEN in back instead.
+            let mut link_opened = None;
             let resp = ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&c.title).strong());
@@ -138,17 +260,25 @@ pub fn deck_ui(ui: &mut egui::Ui, d: &mut Deck,
                     }
                 });
                 let body = preview(c);
-                if c.kind == CardKind::Code {
-                    ui.label(egui::RichText::new(body).monospace().small());
-                } else {
-                    ui.label(egui::RichText::new(body).small());
-                }
+                // `[[Name]]` renders as a clickable link to another card
+                // now, when the name resolves — see `linked_preview_ui`'s
+                // own doc for why this reuses backlinks' matching rule
+                // rather than zbrackets' directory-shaped one.
+                link_opened = linked_preview_ui(ui, body, &cards, colors, c.kind == CardKind::Code);
             }).response;
             if sel {
                 ui.painter().rect_stroke(resp.rect, 2.0,
                     egui::Stroke::new(1.0_f32, colors.accent), egui::StrokeKind::Inside);
             }
-            if uikit_egui::dock::row_click(ui, resp.rect, &c.title).clicked() {
+            if let Some(title) = link_opened {
+                // Select the TARGET the link points to, not the row it was
+                // clicked in — same contract `row_click` below keeps for
+                // an ordinary click, just resolved to a different card.
+                if let Some(target) = cards.iter().find(|c| c.title == title) {
+                    d.select(target);
+                }
+                opened = Some(title);
+            } else if uikit_egui::dock::row_click(ui, resp.rect, &c.title).clicked() {
                 d.select(c);
                 opened = Some(c.title.clone());
             }
@@ -189,6 +319,109 @@ mod frame_tests {
         let opened = p.click_text("Intro", |ui| deck_ui(ui, &mut d, &c));
         assert_eq!(opened.as_deref(), Some("Intro"));
         assert!(d.selected().is_some(), "the click opened a card it did not select");
+    }
+
+    /// The zettelkasten gap this session found: `[[Name]]` in a card body
+    /// tracked correctly in backlinks since that module was written, but
+    /// nothing ever rendered one as something a person could actually
+    /// click through to the target card.
+    ///
+    /// Tests `scan_links` directly — the pure resolution `linked_preview_ui`
+    /// renders — rather than simulating a click through the widget: this
+    /// crate's frame-probe position capture (`Drawn.placed`) records the
+    /// SAME position for every text run inside one `horizontal_wrapped`
+    /// ("see ", the link, and " for more" all reported an identical
+    /// [8.0, 60.0] when checked directly, confirmed before concluding this
+    /// wasn't a product bug), so a click position derived from it can't
+    /// distinguish the link from its neighbors — the rendering itself
+    /// (does `ui.link()` fire `.clicked()` when actually clicked) is
+    /// standard, already-relied-on egui behavior; what's actually novel
+    /// and worth testing here is the RESOLUTION, and that's pure.
+    #[test]
+    fn a_wiki_link_resolves_to_its_target_cards_title() {
+        let cards = vec![
+            Card { title: "Start".into(), body: String::new(), kind: CardKind::Prose,
+                   source: CardSource::default() },
+            Card { title: "End".into(), body: String::new(), kind: CardKind::Prose,
+                   source: CardSource::default() },
+        ];
+        let segs = scan_links("see [[End]] for more", &cards);
+        assert_eq!(segs, vec![
+            Segment::Plain("see ".into()),
+            Segment::Link { display: "End".into(), target: "End".into() },
+            Segment::Plain(" for more".into()),
+        ]);
+    }
+
+    /// Same matching rule backlinks already uses: lowercase, `.md` stripped,
+    /// `|alias`/`#anchor` cut. `[[End.md|the end]]` must still resolve to
+    /// the "End" card — two different rules for what counts as "the same
+    /// note" is worse than either alone.
+    #[test]
+    fn resolution_reuses_backlinks_own_normalization_rules() {
+        let cards = vec![
+            Card { title: "End".into(), body: String::new(), kind: CardKind::Prose,
+                   source: CardSource::default() },
+        ];
+        let segs = scan_links("[[End.md|the end]]", &cards);
+        assert_eq!(segs, vec![
+            Segment::Link { display: "End.md|the end".into(), target: "End".into() },
+        ]);
+    }
+
+    /// An unresolved name must stay LITERAL — not a link to nowhere, and
+    /// not silently dropped — same as zbrackets' own "unresolved name
+    /// links under current dir" case treats it as still worth showing.
+    #[test]
+    fn an_unresolved_name_stays_literal() {
+        let segs = scan_links("see [[Nonexistent]] here", &[]);
+        assert_eq!(segs, vec![
+            Segment::Plain("see ".into()),
+            Segment::Literal("[[Nonexistent]]".into()),
+            Segment::Plain(" here".into()),
+        ]);
+    }
+
+    /// A `[[` with no closing `]]` before the text ends (a link truncated
+    /// mid-token, the realistic case for an ALREADY-TRUNCATED preview) is
+    /// trailing plain text, not an error and not a dropped fragment.
+    #[test]
+    fn an_unclosed_bracket_is_trailing_plain_text() {
+        let segs = scan_links("see [[Cut off", &[]);
+        assert_eq!(segs, vec![Segment::Plain("see [[Cut off".into())]);
+    }
+
+    /// `deck_ui`'s own ordering — checked directly against the code rather
+    /// than through a simulated click (see the previous test's doc for why
+    /// the frame-probe's position capture can't distinguish a link from
+    /// its neighbors inside one `horizontal_wrapped` row): `link_opened` is
+    /// read unconditionally after the row's own `ui.vertical` block runs,
+    /// and `row_click` only runs in the `else` branch, so a resolved
+    /// link's target always wins over the whole-row catcher it happens to
+    /// sit inside. Confirmed by reading `deck_ui` itself; no test replaces
+    /// reading three lines of straight-line if/else for a claim this
+    /// narrow.
+
+    /// A code card's body must scan the same as prose (a code snippet can
+    /// legitimately contain the literal text "[[Escaping]]" as a string,
+    /// and that's still an escapable/resolvable token by `scan_links`'
+    /// own rules) — it's `linked_preview_ui`'s `code` flag, not the
+    /// scanner, that decides a resolved link renders as literal text
+    /// instead of a live one inside a code preview. Covered by reading
+    /// `linked_preview_ui`'s own `Segment::Link { .. } if !code` guard;
+    /// `scan_links` itself has no `code` parameter to test here.
+    #[test]
+    fn resolved_or_not_a_bracket_token_always_scans_the_same_way() {
+        let cards = vec![
+            Card { title: "Escaping".into(), body: String::new(), kind: CardKind::Prose,
+                   source: CardSource::default() },
+        ];
+        let segs = scan_links("let x = \"[[Escaping]]\";", &cards);
+        assert_eq!(segs, vec![
+            Segment::Plain("let x = \"".into()),
+            Segment::Link { display: "Escaping".into(), target: "Escaping".into() },
+            Segment::Plain("\";".into()),
+        ]);
     }
 
     #[test]
