@@ -8,6 +8,16 @@ Build/test baseline throughout: `cargo check`/`cargo test --bin skydribble`
 under `--no-default-features`, `--features audio`, and default. 1256 tests
 throughout. Warning count started at 335 (pre-existing, unrelated to this
 session) and sits at 337 as of the last tooling addition — the +2 are
+
+**Re-verified live, this session (c15unified)**: all three configs actually
+built and ran in this sandbox, not just checked for compile errors — 1591/1591
+passing on every one of `--no-default-features`, `--features audio`, and
+default (grown from 1256 across whatever landed between then and now). The
+audio/default builds needed `libasound2-dev`, not present here initially;
+apt's fetch of it failed until an unrelated dead `nodesource.sources` repo
+entry (expired signing key, `deb.nodesource.com` returning 403) was moved
+aside so `apt-get update` could complete at all. Sandbox-environment issue,
+not a code one — recorded here in case the next session hits the same wall.
 `align::diagnose`/`diagnose_unmatched`, dev-tool-only functions not called
 from the shipped binary, same category as the pre-existing 335.
 
