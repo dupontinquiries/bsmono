@@ -231,3 +231,107 @@ impl Bests {
         Bests(v)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DT: f32 = 1.0 / 120.0;
+
+    // Ported from blackstar-rs's `--sim trials` (src/sim.rs) -- real
+    // challenge-mode logic (goal detection, the clock, personal-best
+    // tracking, ghost replay) with zero automated coverage before this,
+    // same shape as the academy.rs and net.rs conversions.
+
+    #[test]
+    fn there_are_enough_trials_spanning_enough_maps() {
+        assert!(TRIALS.len() >= 12, "only {} trials", TRIALS.len());
+        let maps: std::collections::HashSet<usize> = TRIALS.iter().map(|t| t.map).collect();
+        assert!(maps.len() >= 8, "trials only span {} distinct maps", maps.len());
+        // Same crate-boundary note as academy.rs's lesson-map test: `map` is
+        // a world::style() index in blackstar-rs, which this crate doesn't
+        // depend on, so this can only catch the obviously-unset case, not
+        // the real STYLE_COUNT bound -- that check has to stay in
+        // blackstar-rs's own suite.
+        for t in TRIALS {
+            assert!(t.map < 200, "{}'s map index {} looks unset", t.name, t.map);
+        }
+    }
+
+    #[test]
+    fn every_trial_gives_enough_time_to_actually_win() {
+        assert!(TRIALS.iter().all(|t| t.limit >= 30.0), "a trial's limit is under 30s");
+    }
+
+    #[test]
+    fn every_goal_type_is_actually_reachable_within_its_limit() {
+        // drive a trial to completion with plausible inputs -- if a goal
+        // type can never trigger `done`, a player would hit a trial that
+        // literally cannot be won, which no amount of skill fixes.
+        let hit = |g: Goal| -> bool {
+            let idx = TRIALS.iter().position(|t| t.goal == g).unwrap_or(0);
+            let mut r = Run::new(idx);
+            let mut t = 0.0f32;
+            let mut done = false;
+            while t < TRIALS[idx].limit && !done {
+                let p = Vec3::new(t * 3.0, 90.0, 0.0); // high enough to satisfy height goals
+                done = r.tick(
+                    DT, p, Quat::IDENTITY, 40.0, 0.0,
+                    (t * 0.6) as u32,
+                    t.min(9.0),
+                    (t * 2.0) as u32,
+                    true, true,
+                    0.6,
+                );
+                t += DT;
+            }
+            done
+        };
+        for t in TRIALS {
+            assert!(hit(t.goal), "{} ({:?}) never completes with plausible inputs", t.name, t.goal);
+        }
+    }
+
+    #[test]
+    fn running_out_of_time_fails_the_run() {
+        let mut r = Run::new(0);
+        let mut t = 0.0;
+        while t < TRIALS[0].limit + 1.0 {
+            r.tick(DT, Vec3::ZERO, Quat::IDENTITY, 0.0, 0.0, 0, 0.0, 0, false, false, 0.0);
+            t += DT;
+        }
+        assert!(r.failed && !r.done, "a run that never scores should fail, not hang open forever");
+    }
+
+    #[test]
+    fn bests_only_records_an_improvement_and_survives_a_save_round_trip() {
+        let mut b = Bests::default();
+        assert!(b.record(3, 12.0), "a first finish should always be a record");
+        assert!(!b.record(3, 15.0), "a slower run should not overwrite a faster one");
+        assert!(b.record(3, 9.5), "a faster run should record");
+        assert!((b.get(3) - 9.5).abs() < 1e-3, "the best time wasn't kept");
+        let round = Bests::decode(&b.encode());
+        assert!((round.get(3) - 9.5).abs() < 0.01, "best time didn't survive the save format");
+        assert_eq!(round.finished(), 1);
+    }
+
+    #[test]
+    fn a_mangled_bests_string_pads_to_zero_rather_than_panicking() {
+        let b = Bests::decode("not numbers at all");
+        assert_eq!(b.finished(), 0);
+        assert_eq!(b.0.len(), TRIALS.len(), "should still pad out to one slot per trial");
+    }
+
+    #[test]
+    fn the_ghost_follows_the_run_and_clamps_past_its_end() {
+        let mut r = Run::new(0);
+        for k in 0..600 {
+            let p = Vec3::new(k as f32 * 0.1, 2.0, 0.0);
+            r.tick(DT, p, Quat::IDENTITY, 10.0, 0.0, 0, 0.0, 0, false, false, 0.0);
+        }
+        let mid = ghost_at(&r.ghost, r.t * 0.5).map(|(p, _)| p.x).unwrap_or(-1.0);
+        let end = ghost_at(&r.ghost, r.t * 10.0).map(|(p, _)| p.x).unwrap_or(-1.0);
+        assert!(mid > 25.0 && mid < 35.0, "ghost midpoint x={mid} doesn't track the run");
+        assert!(end > 55.0, "ghost should clamp to the run's last known position, not vanish: end x={end}");
+    }
+}
