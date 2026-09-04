@@ -56,6 +56,13 @@ pub fn parse_line_calls(text: &str, nonce: &str) -> (Vec<Tool>, Vec<LineReject>)
                     _ => bad.push(LineReject::BadArgs { verb: verb.into(), want: "read_range <path> <first-line> <last-line>" }),
                 }
             }
+            // `!<nonce> read_near <path> <name>` — the name is "the rest of the line" rather than
+            // one token, so a multi-word anchor (rare, but a small model may copy one from a grep
+            // hit) is not silently truncated to its first word.
+            "read_near" if args.len() >= 2 => {
+                out.push(Tool::ReadNear { path: args[0].into(), name: args[1..].join(" ") })
+            }
+            "read_near" => bad.push(LineReject::BadArgs { verb: verb.into(), want: "read_near <path> <name>" }),
             "list" if args.len() <= 1 => {
                 out.push(Tool::ListDir { path: args.first().copied().unwrap_or("").into() })
             }
