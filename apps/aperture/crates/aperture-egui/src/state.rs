@@ -1674,32 +1674,80 @@ impl AppState {
     /// here are already char index, so the same ascending-shift arithmetic
     /// applies — it just has to read `removed` from the range instead of
     /// from the original `Selection`.
-    fn fan_out_ranges(&mut self, mut ranges: Vec<(usize, usize, String)>, now_ms: u64) {
-        ranges.sort_by_key(|r| r.0);
+    ///
+    /// `coalesce` is threaded straight to `Editor`'s coalescing choice
+    /// between `replace_many` (a fresh undo step, always) and
+    /// `replace_many_coalescing` (may merge into the previous keystroke's
+    /// group) — the same fork `insert_text`/`backspace` make per character.
+    fn fan_out_ranges(&mut self, ranges: Vec<(usize, usize, String)>, coalesce: bool, now_ms: u64) {
+        let new_carets = Self::carets_after_ranges(&ranges);
+        if coalesce {
+            self.editor.replace_many_coalescing(ranges, true, now_ms);
+        } else {
+            self.editor.replace_many(ranges, now_ms);
+        }
+        self.set_cursors(aperture_core::multicursor::Cursors::new(new_carets));
+    }
+
+    /// Where each cursor ends up after `ranges` is applied — computed
+    /// up front, against the ORIGINAL offsets, the same way `replace_many`
+    /// itself does internally. Kept separate from `Editor` (which has no
+    /// notion of "cursor") rather than derived from `editor.sel` afterward,
+    /// since a fan-out edit leaves only ONE caret in `editor.sel` and the
+    /// rest have to be reconstructed from the ranges regardless.
+    fn carets_after_ranges(ranges: &[(usize, usize, String)]) -> Vec<Selection> {
+        let mut sorted: Vec<&(usize, usize, String)> = ranges.iter().collect();
+        sorted.sort_by_key(|r| r.0);
         let mut shift: isize = 0;
-        let mut new_carets = Vec::with_capacity(ranges.len());
-        for (start, end, text) in &ranges {
+        let mut new_carets = Vec::with_capacity(sorted.len());
+        for (start, end, text) in sorted {
             let grow = text.chars().count() as isize;
             let removed = (*end as isize) - (*start as isize);
             let at = (*start as isize + shift + grow).max(0) as usize;
             new_carets.push(Selection::caret(at));
             shift += grow - removed;
         }
-        self.editor.replace_many(ranges, now_ms);
-        self.set_cursors(aperture_core::multicursor::Cursors::new(new_carets));
+        new_carets
+    }
+
+    /// Tab at every cursor: each pads to ITS OWN next tab stop, not a shared
+    /// literal `\t` — `Editor::insert_tab` never inserts a real tab
+    /// character (the whole file is space-indented; `TAB_WIDTH` is the stop
+    /// distance, not a byte to insert), and two cursors at different columns
+    /// legitimately need a different number of spaces.
+    fn fan_out_insert_tab(&mut self, now_ms: u64) {
+        let c = self.cursors();
+        let ranges: Vec<(usize, usize, String)> = c.all().iter().map(|s| {
+            let col = self.editor.buffer.char_to_pos(s.min()).col;
+            let n = aperture_core::editor::TAB_WIDTH - (col % aperture_core::editor::TAB_WIDTH);
+            (s.min(), s.max(), " ".repeat(n))
+        }).collect();
+        self.fan_out_ranges(ranges, false, now_ms);
     }
 
     fn fan_out_insert(&mut self, text: &str, now_ms: u64) {
         let c = self.cursors();
         let ranges: Vec<(usize, usize, String)> =
             c.all().iter().map(|s| (s.min(), s.max(), text.to_string())).collect();
-        self.fan_out_ranges(ranges, now_ms);
+        // Same rule as `Editor::insert_text`: only a single non-newline
+        // character coalesces with the run before it.
+        let coalesce = text.chars().count() == 1 && text != "\n";
+        self.fan_out_ranges(ranges, coalesce, now_ms);
     }
 
     /// Backspace at every cursor: each becomes a one-char-back deletion (or,
     /// if it already has a selection, that selection).
     fn fan_out_backspace(&mut self, now_ms: u64) {
         let c = self.cursors();
+        // Coalescing only when EVERY cursor is a plain caret deleting a
+        // single non-newline character — the same condition `Editor::
+        // backspace` checks for its one cursor. A cursor with a live
+        // selection makes this a "delete selection" gesture instead of a
+        // keystroke, and mixing the two into one fan-out group would let an
+        // unrelated multi-char deletion silently absorb into a typing run.
+        let coalesce = c.all().iter().all(|s| {
+            s.is_caret() && self.editor.buffer.char_at(s.head.saturating_sub(1)) != Some('\n')
+        });
         let ranges: Vec<(usize, usize, String)> = c.all().iter().map(|s| {
             if s.is_caret() {
                 let end = s.head;
@@ -1709,7 +1757,7 @@ impl AppState {
                 (s.min(), s.max(), String::new())
             }
         }).collect();
-        self.fan_out_ranges(ranges, now_ms);
+        self.fan_out_ranges(ranges, coalesce, now_ms);
     }
 
     fn fan_out_delete_forward(&mut self, now_ms: u64) {
@@ -1723,7 +1771,9 @@ impl AppState {
                 (s.min(), s.max(), String::new())
             }
         }).collect();
-        self.fan_out_ranges(ranges, now_ms);
+        // `Editor::delete_forward` never coalesces (`false`, unconditionally)
+        // — matched here rather than given its own rule.
+        self.fan_out_ranges(ranges, false, now_ms);
     }
 
     fn type_text(&mut self, t: &str, now_ms: u64) {
@@ -1992,7 +2042,7 @@ impl AppState {
             }
             (Tab, false) => {
                 if !self.extra_cursors.is_empty() {
-                    self.fan_out_insert("\t", now_ms);
+                    self.fan_out_insert_tab(now_ms);
                 } else {
                     self.editor.insert_tab(now_ms);
                 }
@@ -2652,6 +2702,55 @@ mod tests {
 
         s.editor.undo();
         assert_eq!(s.editor.buffer.to_string(), "total\ntotal\n", "one undo removes both inserts");
+    }
+
+    #[test]
+    fn a_typed_run_across_multiple_cursors_undoes_as_one_gesture() {
+        // Caught interactively, not by the test suite: typing "sum" over two
+        // selected occurrences of "total" replaced both correctly, but Ctrl+Z
+        // only removed the LAST character — three keystrokes, three separate
+        // undo groups. Each `fan_out_insert` call was going through
+        // `Editor::replace_many`, which never coalesces, unlike single-cursor
+        // `insert_text`. This is the regression test for the fix
+        // (`replace_many_coalescing`).
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("let total = 1;\nlet total = 2;\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(6); // inside first "total"
+        key(&mut s, K::D, true, 0); // word-select
+        key(&mut s, K::D, true, 10); // add the second "total"
+        assert_eq!(s.extra_cursors.len(), 1);
+
+        typed(&mut s, "s", 20);
+        typed(&mut s, "u", 30);
+        typed(&mut s, "m", 40);
+        assert_eq!(s.editor.buffer.to_string(), "let sum = 1;\nlet sum = 2;\n");
+
+        s.editor.undo();
+        assert_eq!(s.editor.buffer.to_string(), "let total = 1;\nlet total = 2;\n",
+            "one undo for the whole typed run, at both cursors");
+    }
+
+    #[test]
+    fn a_motion_between_keystrokes_seals_the_group_same_as_single_cursor_typing() {
+        // `Editor::set_head` (every motion funnels through it) already calls
+        // `History::seal()` — true for the single-cursor path today, and
+        // fanning a motion out to every cursor (`moved`) calls the same
+        // `set_head` once per cursor, so the seal happens there too without
+        // any multi-cursor-specific code needing to know about it.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("aa\naa\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(3)];
+
+        typed(&mut s, "x", 0);
+        key(&mut s, K::Right, false, 10); // motion seals, via set_head
+        typed(&mut s, "y", 20);
+        assert_eq!(s.editor.buffer.to_string(), "xaya\nxaya\n");
+        s.editor.undo();
+        assert_eq!(s.editor.buffer.to_string(), "xaa\nxaa\n",
+            "the motion sealed the group: only 'y' undoes");
+        s.editor.undo();
+        assert_eq!(s.editor.buffer.to_string(), "aa\naa\n");
     }
 
     #[test]

@@ -209,18 +209,12 @@ impl Editor {
         self.goal_col = None;
     }
 
-    /// Apply many non-overlapping `(start, end, text)` replacements as ONE
-    /// undo step — "replace all," not "replace, then replace, then replace
-    /// N-1 more times." Ranges are sorted and applied HIGH-TO-LOW: an edit
-    /// at a later offset never shifts an earlier one, so processing back to
-    /// front means every range in the input can be computed once, up front,
-    /// against the ORIGINAL text — no caller-side offset bookkeeping. Caret
-    /// lands at the last (lowest-offset) replacement's end.
-    pub fn replace_many(&mut self, mut ranges: Vec<(usize, usize, String)>, now_ms: u64) {
-        if ranges.is_empty() {
-            return;
-        }
-        let _ = now_ms; // batched edits don't coalesce with typing either way
+    /// Apply sorted `(start, end, text)` ranges high-to-low against the
+    /// buffer and return the ops plus the resulting caret. Shared by
+    /// [`replace_many`] and [`replace_many_coalescing`] — they differ only in
+    /// how the resulting ops get recorded (a fresh group vs. one that may
+    /// coalesce with the last), not in how the buffer gets mutated.
+    fn apply_ranges(&mut self, mut ranges: Vec<(usize, usize, String)>) -> (Vec<Op>, usize) {
         ranges.sort_by(|a, b| b.0.cmp(&a.0));
         let mut ops = Vec::with_capacity(ranges.len() * 2);
         let mut caret = self.sel.head;
@@ -238,7 +232,48 @@ impl Editor {
                 ops.push(ins);
             }
         }
+        (ops, caret)
+    }
+
+    /// Apply many non-overlapping `(start, end, text)` replacements as ONE
+    /// undo step — "replace all," not "replace, then replace, then replace
+    /// N-1 more times." Ranges are sorted and applied HIGH-TO-LOW: an edit
+    /// at a later offset never shifts an earlier one, so processing back to
+    /// front means every range in the input can be computed once, up front,
+    /// against the ORIGINAL text — no caller-side offset bookkeeping. Caret
+    /// lands at the last (lowest-offset) replacement's end.
+    pub fn replace_many(&mut self, ranges: Vec<(usize, usize, String)>, now_ms: u64) {
+        if ranges.is_empty() {
+            return;
+        }
+        let _ = now_ms; // batched edits don't coalesce with typing either way
+        let (ops, caret) = self.apply_ranges(ranges);
         self.history.record_group(ops);
+        self.sel = Selection::caret(self.buffer.clamp(caret));
+        self.version += 1;
+        self.goal_col = None;
+    }
+
+    /// Like [`replace_many`], but for multi-cursor TYPING: within
+    /// [`History`]'s coalescing window, appends onto the previous fan-out
+    /// group instead of starting a new one, so a run of keystrokes across
+    /// several cursors undoes as one gesture — the multi-cursor analogue of
+    /// `insert_text`'s single-char coalescing. `coalesce` follows the same
+    /// rule `insert_text` uses: true for a single non-newline character,
+    /// false for anything else (a paste, a newline, a multi-char block) —
+    /// those already start their own group in the single-cursor path and
+    /// have no more reason to merge here.
+    pub fn replace_many_coalescing(
+        &mut self,
+        ranges: Vec<(usize, usize, String)>,
+        coalesce: bool,
+        now_ms: u64,
+    ) {
+        if ranges.is_empty() {
+            return;
+        }
+        let (ops, caret) = self.apply_ranges(ranges);
+        self.history.record_group_coalescing(ops, coalesce, now_ms);
         self.sel = Selection::caret(self.buffer.clamp(caret));
         self.version += 1;
         self.goal_col = None;
@@ -564,6 +599,56 @@ mod tests {
         let mut e = Editor::from_str("unchanged\n");
         e.replace_many(vec![], 0);
         assert_eq!(e.buffer.to_string(), "unchanged\n");
+    }
+
+    #[test]
+    fn replace_many_coalescing_merges_consecutive_calls_within_the_window() {
+        // The multi-cursor analogue of a run of single-char keystrokes: three
+        // separate `replace_many_coalescing` calls (one per "keystroke", each
+        // touching two cursors) should undo as ONE gesture, not three.
+        let mut e = Editor::from_str("a\na\n");
+        e.replace_many_coalescing(vec![(0, 0, "x".into()), (2, 2, "x".into())], true, 0);
+        e.replace_many_coalescing(vec![(1, 1, "y".into()), (4, 4, "y".into())], true, 100);
+        e.replace_many_coalescing(vec![(2, 2, "z".into()), (6, 6, "z".into())], true, 200);
+        assert_eq!(e.buffer.to_string(), "xyza\nxyza\n");
+        e.undo();
+        assert_eq!(e.buffer.to_string(), "a\na\n", "three coalesced keystrokes, one undo");
+    }
+
+    #[test]
+    fn replace_many_coalescing_seals_after_the_window_elapses() {
+        let mut e = Editor::from_str("a\n");
+        e.replace_many_coalescing(vec![(0, 0, "x".into())], true, 0);
+        e.replace_many_coalescing(vec![(1, 1, "y".into())], true, 5_000); // past COALESCE_WINDOW_MS
+        assert_eq!(e.buffer.to_string(), "xya\n");
+        e.undo();
+        assert_eq!(e.buffer.to_string(), "xa\n", "the second call started its own group");
+        e.undo();
+        assert_eq!(e.buffer.to_string(), "a\n");
+    }
+
+    #[test]
+    fn replace_many_coalescing_false_never_merges() {
+        // Multi-char fan-out (a paste, a newline) must not silently join
+        // whatever typing run preceded it.
+        let mut e = Editor::from_str("a\n");
+        e.replace_many_coalescing(vec![(0, 0, "x".into())], true, 0);
+        e.replace_many_coalescing(vec![(1, 1, "Q".into())], false, 10);
+        e.undo();
+        assert_eq!(e.buffer.to_string(), "xa\n", "the non-coalescing call is its own step");
+    }
+
+    #[test]
+    fn replace_many_and_replace_many_coalescing_never_merge_into_each_other() {
+        // A find-and-replace-all (`replace_many`, always a fresh group)
+        // between two keystrokes must not glue them together.
+        let mut e = Editor::from_str("a\n");
+        e.replace_many_coalescing(vec![(0, 0, "x".into())], true, 0);
+        e.replace_many(vec![(2, 2, "!".into())], 10);
+        e.replace_many_coalescing(vec![(1, 1, "y".into())], true, 20);
+        assert_eq!(e.buffer.to_string(), "xya!\n");
+        e.undo();
+        assert_eq!(e.buffer.to_string(), "xa!\n", "only the last keystroke undid");
     }
 
 }
