@@ -59,6 +59,15 @@ impl eframe::App for ScenePreview {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Same push as app.rs's real per-frame update (see its comment for why the host drives
+        // this rather than scene-kit reading env vars for it). Without this, scene-view — the
+        // headless harness this crate's own doc comment says exists for tuning these environments
+        // — never reflects power_mode() at all, auto-detected or explicit, and the render_scale()
+        // effect it exists to let you SEE is invisible in the one tool built to see it.
+        {
+            let d = crate::theme::detail(crate::theme::effective_variant());
+            scene_kit::perf::set_overrides(crate::theme::power_mode(), d.0, d.2);
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::default().inner_margin(0.0))
             .show_inside(ui, |ui| {

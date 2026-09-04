@@ -229,9 +229,13 @@ impl Renderer {
         let force_es = std::env::var("LOGSCOPE_GL_ES").map(|v| v != "0").unwrap_or(false);
         let version = if cfg!(target_arch = "wasm32") || force_es { "#version 300 es" } else { "#version 330" };
         // one-time provenance line so a tint/format bug can be tied to the actual driver + GLSL profile in use
+        let renderer_str = gl.get_parameter_string(glow::RENDERER);
         eprintln!("[logscope] GL_VENDOR={} GL_RENDERER={} GL_VERSION={} | GLSL {} | GL_SHADING_LANGUAGE_VERSION={}",
-            gl.get_parameter_string(glow::VENDOR), gl.get_parameter_string(glow::RENDERER),
+            gl.get_parameter_string(glow::VENDOR), renderer_str,
             gl.get_parameter_string(glow::VERSION), version, gl.get_parameter_string(glow::SHADING_LANGUAGE_VERSION));
+        // Recorded for `perf::suggested_power_for_renderer` — see that function for why nothing
+        // downstream should FORCE a power level from this alone, only default one when unset.
+        crate::perf::record_detected_renderer(renderer_str);
         let scene = link(gl, version, gpuscene::SHADER_VS, gpuscene::SHADER_FS, true);
         let bright = link(gl, version, gpuscene::SHADER_POST_VS, gpuscene::SHADER_BRIGHT_FS, true);
         let blur = link(gl, version, gpuscene::SHADER_POST_VS, gpuscene::SHADER_BLUR_FS, true);
