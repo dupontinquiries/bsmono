@@ -3085,7 +3085,7 @@ which is live to confirm before touching it, not a guess made to close this item
 verification the original entry asked for (HUD line present for a model with gaps, absent for one
 without) is still open.
 
-**Debate: audited (`<commit>`).** The panel IS mounted — `crate::debatepanel::ui(ui, &slots)` at
+**Debate: audited (`f63aa6a0`).** The panel IS mounted — `crate::debatepanel::ui(ui, &slots)` at
 `chat.rs:9595`, fed real state from `workspace_exec::debate_slots()`, not a stub. So this is a
 different shape from the liaison case above, not the same one: nothing here is unreachable.
 
