@@ -769,6 +769,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn boss_ids_are_unique() {
+        for (i, b) in BOSSES.iter().enumerate() {
+            assert!(BOSSES.iter().skip(i + 1).all(|o| o.id != b.id), "duplicate boss {}", b.id);
+        }
+    }
+
     /// `Arena.note` — ten real, hand-written lore lines (e.g. "the horizon
     /// curves the wrong way; every SYNC ends here") — had zero UI consumer
     /// anywhere in the codebase: constructed here, flagged by the compiler

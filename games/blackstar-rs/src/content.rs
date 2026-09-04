@@ -407,6 +407,9 @@ mod tests {
         for (i, s) in SIGNATURES.iter().enumerate() {
             assert!(SIGNATURES.iter().skip(i + 1).all(|o| o.id != s.id), "duplicate signature {}", s.id);
         }
+        for (i, a) in ABILITIES.iter().enumerate() {
+            assert!(ABILITIES.iter().skip(i + 1).all(|o| o.id != a.id), "duplicate ability {}", a.id);
+        }
     }
 
     #[test]
