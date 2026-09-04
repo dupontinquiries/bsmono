@@ -3085,9 +3085,24 @@ which is live to confirm before touching it, not a guess made to close this item
 verification the original entry asked for (HUD line present for a model with gaps, absent for one
 without) is still open.
 
-**Debate: not audited beyond names.** `debaterun::{adjustment, blind, needs_reframe}` and
-`debatepanel::last_complete_line` are uncalled. Whether the panel is mounted at all was not
-checked; do that before assuming the same shape as the liaison.
+**Debate: audited (`<commit>`).** The panel IS mounted — `crate::debatepanel::ui(ui, &slots)` at
+`chat.rs:9595`, fed real state from `workspace_exec::debate_slots()`, not a stub. So this is a
+different shape from the liaison case above, not the same one: nothing here is unreachable.
+
+What's actually missing is narrower than the entry names. `panelvoice::triage`/`Ask` (the debate
+protocol's ASK half — deciding which debater's question reaches the operator) IS wired: live in
+`chat.rs` (`pending_asks`, the `panelvoice::triage(...)` call in `fan_step`). Only
+`debaterun::{adjustment, blind, needs_reframe}` (the BLIND half) are genuinely uncalled anywhere —
+confirmed by grep, not assumed from the names. `debate_slots()` already says so itself, honestly,
+at the exact point it matters: `blind: false, // Blindness is a panelvoice concept the fan does not
+model yet. False rather than guessed`. That is not a bug hiding behind a name — it's the same
+"declare the gap rather than fabricate" rule the liaison module states as its own hard constraint,
+already applied here without anyone having to add it.
+
+Wiring `debaterun`'s blind logic into the fan would mean deciding how a fan branch — which doesn't
+currently track per-round operator visibility at all — learns whether it "has seen the operator's
+input this round." That's an architecture question about the fan's own state, not a call-site fix,
+so left open rather than guessed at here.
 
 ## ⌖ THE "ASSERTS ABSENCE" CLASS — audited, two found, one seam left
 
