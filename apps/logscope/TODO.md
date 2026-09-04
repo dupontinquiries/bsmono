@@ -3011,6 +3011,47 @@ kernel-validate section) or park native generation and keep the DiT primitives a
 foundation they already are. Do NOT delete the primitives as "unwired" — they are gated,
 documented, and the text-encoder half (text_forward_hidden) is exercised by the conditioning gate.
 
+## ⌖ VISION (image-to-text): built to the same waterline as image generation, and ALSO unwired
+
+Found while looking at model/vision support with llama.cpp as reference (this session). Same
+architecture and same gap as the "IMAGE GENERATION — two stalled tracks" entry above, one section
+up — checked by grep, not assumed from the similarity:
+
+- `vision_cli.rs`: a pure argv builder for `llama-mtmd-cli` (llama.cpp's real multimodal binary —
+  model gguf + `--mmproj` CLIP-ViT projector + an image path), unit-testable, no subprocess
+  spawning of its own. Same shape as `mediagen.rs`'s sd-cli argv builder.
+- `media.rs::describe_image(bin, models, image, prompt)`: resolves the VLM+mmproj pair under
+  `models/text`, builds the `VisionCli`, spawns it, extracts the description from stdout. This is
+  the actual image-to-text entry point.
+- `gpu_kernels` (this project's own inference engine) has NO native vision path at all — grepped
+  the whole crate for `clip`/`vision`/`mmproj`: one hit, and it's a REFUSAL
+  (`lib.rs:10430`, "a diffusion checkpoint … or an mmproj has no tokenizer" — the loader explicitly
+  declines to load a vision projector as if it were a text model). Vision here means delegating to
+  upstream llama.cpp's `llama-mtmd-cli`, same as image generation delegates to `sd-cli`; it is not
+  something to build natively without first committing to a CLIP-ViT + native conv kernels, which
+  is a materially bigger undertaking than the delegate path and not attempted here.
+- `describe_image` has **zero callers** anywhere in `logscope-egui` outside `media.rs` itself —
+  grepped, not assumed. Nothing in `chat.rs` or any tab constructs one. The same is true of
+  `tts_cli.rs`'s TTS argv builder (also only consumed by `media.rs`) — this looks less like "vision
+  specifically got missed" and more like the whole `media.rs` subprocess-delegate layer (image
+  generation, vision, TTS) was built to the same waterline and none of the three ever got a UI
+  trigger.
+
+**Not wired here.** Wiring this needs, at minimum: (1) a trigger — a `:describe`/`:vision` command
+through `vimmode::Command`'s existing dispatch, or an image-drop/paste handler; (2) a way to attach
+an image path from the composer/UI, which nothing here currently has; (3) running off the UI
+thread — `describe_image` blocks on a real subprocess that can take many seconds, and the shape to
+copy is already in this file (`chat.rs`'s existing `mpsc::channel` + `std::thread::spawn` +
+poll-once-per-frame pattern, e.g. the `VerifyJob` wiring at line 8093 — same idiom, different
+subprocess); (4) a binary-path setting for `llama-mtmd-cli`, which nothing resolves today (the
+image-gen entry above notes the identical gap for `sd_cli`); (5) surfacing stderr on failure the
+way the fleet surfaces refusals — named, not swallowed.
+
+Deliberately not attempted blind in this pass: `chat.rs` is 10,000+ lines, this sandbox has no
+display to actually see a wired result render, and a threading change to a file this size and this
+central, unverified beyond "it compiles," is exactly the kind of change that should be checked by
+someone who can run the app. The investigation is complete and precise; the wiring is not started.
+
 ## ⌖ MOBILE OVERCROWDING — the rule exists, one row obeys it (audited 2026-08-16)
 
 `mobilelayout.rs` is written, tested, and documents the cause exactly: `ui.horizontal()` does not
