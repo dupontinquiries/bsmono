@@ -100,6 +100,7 @@ pub mod repl_voice_glow;
 pub mod setup_wizard;
 pub mod chat_panel;
 pub mod model_picker;
+pub mod stable_pick;
 pub mod log_view;
 pub mod mono_tile;
 pub mod slide_menu;
