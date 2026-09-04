@@ -1863,6 +1863,37 @@ mod tests {
         assert_eq!(ids.len(), STATIONS.len());
     }
 
+    /// The test above catches a DUPLICATE in `STATIONS` (two entries with
+    /// the same id) but not an OMISSION -- a Station variant that exists
+    /// but was never added to the array, which is a different, quieter bug:
+    /// the console router, the room layout, everything keyed off `STATIONS`
+    /// simply never finds out that station exists. Same shape as
+    /// `input.rs`'s `every_action_variant_is_in_the_actions_list_exactly_
+    /// once` and this session's `weapons.rs`/`gear.rs` equivalents: scan the
+    /// enum's own declared variants and check each is in `STATIONS` exactly
+    /// once, so a duplicate-and-omit at the same length can't hide either.
+    #[test]
+    fn every_station_variant_is_in_stations_exactly_once() {
+        let src = include_str!("stations.rs");
+        let decl = src
+            .split("pub enum Station {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the Station enum");
+        let variants: Vec<&str> = decl
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+            .filter_map(|l| l.strip_suffix(','))
+            .collect();
+        assert!(variants.len() >= 6, "only found {} variants; the scan broke", variants.len());
+        assert_eq!(variants.len(), STATIONS.len(), "Station enum and STATIONS have different lengths");
+        for v in &variants {
+            let count = STATIONS.iter().filter(|s| format!("{s:?}") == *v).count();
+            assert_eq!(count, 1, "Station::{v} appears {count} times in STATIONS, not exactly once");
+        }
+    }
+
     fn board() -> Shipboard {
         Shipboard {
             camp: CampaignLog::default(),
