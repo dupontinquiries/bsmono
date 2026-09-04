@@ -1193,6 +1193,73 @@ If geometry does vanish, the follow-up is `glow::FRONT_AND_BACK` culling
 disabled for the specific meshes at fault rather than reverting wholesale, and
 the vanished ones are then a list of primitives to fix the winding on.
 
+
+## 24. dandere2x blocky artefacts: the merge hard-copies every residual block
+
+Reported with a frame showing the block grid plainly: "still blocky artifacts
+but now it's because of the crossover and not a lack of color". The colour half
+was the bleed ring padding black (fixed, f0049067). This is the other half, and
+it is a different bug in a different place.
+
+### Where the crossover is
+
+`residual::merge_tiered` assembles each output frame as a MOSAIC. Every block
+comes from one of five sources:
+
+* the faded previous frame (Stationary)
+* a copy from elsewhere in that frame (Moved)
+* an older reference frame (Recalled)
+* the content-keyed block cache (Cached)
+* a freshly network-upscaled residual (Residual)
+
+The last line of the residual loop is the whole problem:
+
+    out.copy_block(r, bs * s, (rv.cell_x * cell + bleed) * s, ..., rv.frame_x * s, ...)
+
+A HARD COPY of a `bs·s` square. A block the network just upscaled is pasted
+edge-to-edge against neighbours produced at a different time, by a different
+path, possibly at a different tier. Any difference in tone or detail between
+the two shows as a straight line on the block grid — which is exactly what the
+screenshot shows, and why it reads as "crossover" rather than as colour.
+
+### The ring that would fix it is already computed and thrown away
+
+`make_residual` gives every block `bleed` pixels of real context —
+`cell = bs + 2·bleed` — and pads with `Pad::Replicate` so the CNN sees a
+plausible continuation. The network upscales the WHOLE cell, ring included.
+
+Then `merge` reads back only the interior, at offset `+bleed·s`, and discards
+the ring. The overlap needed to blend the seam is computed on every block, at
+full network cost, and dropped.
+
+### This is §19's fix in a second place
+
+§19 is the GPU tile compositor, where the same crop happens between TILES.
+This is the CPU merge, where it happens between BLOCKS. Same shape, same
+remedy, and `Blender` in `d2x-core/net.rs` survived the merge with its tests
+passing — it is the weighted accumulate both places need.
+
+The block case is easier than the tile case:
+
+* it is host-side Rust, not a shader — no accumulation buffer, no
+  normalisation pass;
+* `bleed` defaults to 8 at the CLI, so there are 8 pixels of real overlap per
+  side to ramp across;
+* only Residual blocks need it. A Stationary block is already continuous with
+  its neighbours because it came from the same frame.
+
+Roughly: replace `copy_block` with a weighted write over `bs + 2·bleed`,
+ramping from 0 at the ring's outer edge to 1 at the block boundary, accumulating
+where two rings overlap.
+
+### Check the tier crossover too
+
+`residual_tiers` routes blocks to different networks by difficulty. Two
+ADJACENT blocks can land in different tiers and be upscaled by different
+models, which is a bigger discontinuity than the same model applied twice. If
+blending the ring does not settle it, the next question is whether tier
+assignment should be smoothed spatially rather than decided per block.
+
 ---
 
 # C14_TODO — open threads from the c14 session (blackstar/voice line)
