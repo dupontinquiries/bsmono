@@ -119,3 +119,42 @@ current name invites exactly the confusion of thinking it is the transform.
 The avatar fold blend works and is the one to overhaul first — it is the only
 system that animates anything today, and `TRANSFORM_OVERHAUL.md` has the four
 specific defects.
+
+## UPDATE (c15unified session): a real crash fixed, and a real hang found and NOT fixed
+
+Got much further into an actual live run than any prior session note here —
+found SDL2's `offscreen` video driver (`SDL_VIDEODRIVER=offscreen
+LIBGL_ALWAYS_SOFTWARE=1`), which uses EGL instead of GLX and sidesteps the
+`SDL_GL_ACCELERATED_VISUAL` wall that made Xvfb's own GLX a dead end (see the
+engine-build commit). This got real shader compiles and real asset loading
+happening for the first time.
+
+**Found and fixed a real, always-reproducible crash**, unrelated to anything
+sandbox-specific: `game_init` loads all 32 `g_theme_ids` world models up
+front with no null check, and 22 of the 32 have no matching `.iqm` in this
+bundle — `ex_iqm_load_model` returns NULL on a missing file, and the very
+next line dereferenced it. This would have crashed on literally every launch,
+on any machine, missing assets or not — a genuine bug, not an artifact of
+this environment. Fixed the load site plus five other identically-unguarded
+`g_theme_models[i]->` dereferences elsewhere in the file (map-switch code in
+dropship/raid/edef/race modes) that would have crashed the same way the
+first time a player changed maps. See that commit for the full null-check
+audit.
+
+**Found and did NOT fix a real hang, past that point.** After the crash fix,
+the same run gets through loading many more models/textures, compiles
+`forward.glsl`, and then goes fully quiet — 150 seconds observed, zero new
+log output, pegged at ~100% CPU the whole time. Attached gdb to the live
+process: the top of the stack is deep inside unsymbolized JIT-compiled code
+(llvmpipe/Mesa's runtime-generated shader code — the stack values look like
+packed float pairs, not return addresses), so this is happening inside the
+software rasterizer itself, not identifiable application code. Could not
+distinguish "genuinely stuck" from "an extremely slow single frame" with the
+tools available here — 150 seconds felt too long for one frame of a modest
+scene even under llvmpipe, but that's a guess, not a measurement. Diagnosing
+further needs either Mesa debug symbols, a profiler, or (more likely to
+actually answer the question) a machine with a real GPU where this would
+either render in milliseconds or reveal the same hang without llvmpipe as a
+confounding variable. Not attempting a fix blind into unsymbolized driver
+code — recording precisely what was checked and where it stopped so the next
+attempt doesn't redo this diagnosis from zero.
