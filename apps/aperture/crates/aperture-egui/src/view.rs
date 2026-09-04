@@ -97,6 +97,9 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
     if state.pending_edit.is_some() {
         edit_review_overlay(ctx, state, &colors);
     }
+    if state.hover_overlay.is_some() {
+        hover_overlay(ctx, state, &colors);
+    }
 }
 
 /// "AI: Edit Selection…"'s review step — original vs. proposed, explicit
@@ -159,6 +162,51 @@ fn edit_review_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColo
         state.accept_pending_edit();
     } else if reject {
         state.reject_pending_edit();
+    }
+}
+
+/// Ctrl+I's full result, distinct from the one-line status headline
+/// `AppState::poll_lsp` already sets — a real type signature plus doc
+/// comment is often several lines, and this is the space to show all of
+/// it rather than truncate to what fits in the status bar. Dismissed by
+/// `AppState` itself on Escape or the next edit (see `hover_overlay`
+/// field's own doc), not by anything in this function — this is a pure
+/// render of whatever state currently holds, same discipline every other
+/// overlay in this file follows.
+fn hover_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors) {
+    let Some(contents) = state.hover_overlay.clone() else { return };
+    let mut dismiss = false;
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        dismiss = true;
+    }
+    egui::Area::new(Id::new("aperture_hover"))
+        .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 72.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(colors.bg_raised)
+                .stroke(Stroke::new(1.0_f32, colors.border))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.set_width(uikit_egui::dialog::dialog_width(
+                        ui.ctx().content_rect().width(), 520.0));
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("hover").color(colors.text_weak).small());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("×").clicked() {
+                                dismiss = true;
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().id_salt("hover_contents").max_height(240.0).show(ui, |ui| {
+                        ui.label(egui::RichText::new(&contents).monospace().color(colors.text));
+                    });
+                });
+        });
+    if dismiss {
+        state.hover_overlay = None;
     }
 }
 

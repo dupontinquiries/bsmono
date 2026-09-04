@@ -487,6 +487,15 @@ pub struct AppState {
     /// Bumped on every hover request; an arriving `HoverOutcome` is
     /// applied only if this still matches.
     lsp_hover_gen: u64,
+    /// The full flattened hover text for a real overlay panel, distinct
+    /// from the one-line status message: the status headline exists so
+    /// something useful shows up fast without blocking on scroll/dismiss
+    /// interaction, but a real type signature plus doc comment is often
+    /// several lines and deserves more than one line of status text.
+    /// Cleared on Escape, on the next edit, or when a new hover request's
+    /// answer supersedes it (never left showing stale text at a caret
+    /// position the person has since moved away from).
+    pub hover_overlay: Option<String>,
     /// Latest `publishDiagnostics` for the current file, empty when no LSP
     /// worker is running or the file is currently clean. Line numbers are
     /// LSP's own (zero-indexed), matching `git_changed`'s convention.
@@ -631,6 +640,7 @@ impl AppState {
             lsp_pending_prefix_start: None,
             lsp_definition_gen: 0,
             lsp_hover_gen: 0,
+            hover_overlay: None,
             lsp_diagnostics: Vec::new(),
             voice_session: aperture_core::voice::VoiceSession::new(),
         };
@@ -1942,9 +1952,23 @@ impl AppState {
         // suggestion. One source of truth beats two that need syncing.
         self.typeout = None;
         self.editor.insert_text(t, now_ms);
-        self.dirty = true;
-        self.syntax.absorb(&mut self.editor.buffer);
-        self.follow_caret = true;
+        // `after_edit`, not the three lines it inlines to be (dirty=true;
+        // syntax.absorb; follow_caret=true) — a REAL, pre-existing bug
+        // found while writing a test for hover_overlay's edit-dismissal
+        // behavior: this branch had drifted out of sync with after_edit as
+        // it gained more responsibilities (notify_lsp_changed,
+        // invalidate_cache_for_edit, clearing hover_overlay) that ORDINARY
+        // TYPING — the single most common edit there is — silently never
+        // ran. Concretely: `didChange` was NEVER sent to the LSP worker
+        // for a plain keystroke, only for backspace/delete/enter/tab and
+        // the multi-cursor fan-out path, which is why every LSP e2e test
+        // so far happened to still pass — completion at a syntactically
+        // valid position inside an unchanged-since-didOpen function body
+        // returns the same in-scope candidates whether or not the typed
+        // prefix was ever communicated, so the tests were unknowingly
+        // exercising "completion works when nothing was typed into the
+        // synced copy" rather than proving sync itself worked for typing.
+        self.after_edit(now_ms);
         if consumed {
             // Ghost absorbed the keystroke: no re-request, no debounce churn.
             self.debounce.cancel();
@@ -1970,6 +1994,7 @@ impl AppState {
         self.follow_caret = true;
         self.invalidate_cache_for_edit();
         self.notify_lsp_changed();
+        self.hover_overlay = None; // stale the instant the buffer under it changes
         let _ = now_ms;
     }
 
@@ -2086,16 +2111,15 @@ impl AppState {
                 continue; // superseded by a later lookup; the caret moved on
             }
             match outcome.hover {
-                // Status messages are single-line by convention elsewhere
-                // in this shell; a hover's first line (usually the type
-                // signature) is the useful headline, and a real hover
-                // overlay showing the rest is future work, not attempted
-                // in this pass — see TODO.md.
                 Some(h) => {
                     let headline = Self::hover_headline(&h.contents);
                     self.set_status(&headline, now_ms);
+                    self.hover_overlay = Some(h.contents);
                 }
-                None => self.set_status("hover: nothing found", now_ms),
+                None => {
+                    self.set_status("hover: nothing found", now_ms);
+                    self.hover_overlay = None;
+                }
             }
         }
     }
@@ -2348,6 +2372,7 @@ impl AppState {
                 self.dismiss_menu();
                 self.ghost.dismiss();
                 self.debounce.cancel();
+                self.hover_overlay = None;
                 // Multiple cursors collapse to the primary — the one the
                 // user had before Ctrl+D/Ctrl+Shift+L added the rest — same
                 // as every other editor's Escape, and one keystroke closer
@@ -3715,6 +3740,26 @@ mod tests {
     fn hover_headline_of_empty_contents_is_an_empty_string() {
         assert_eq!(AppState::hover_headline(""), "");
         assert_eq!(AppState::hover_headline("   \n  \n"), "");
+    }
+
+    #[test]
+    fn an_edit_clears_a_showing_hover_overlay() {
+        // The overlay is about a caret position that no longer means
+        // anything the instant the buffer under it changes — leaving it
+        // showing would be describing stale code.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("abc");
+        s.hover_overlay = Some("fn foo() -> i32".to_string());
+        typed(&mut s, "x", 0);
+        assert!(s.hover_overlay.is_none());
+    }
+
+    #[test]
+    fn escape_clears_a_showing_hover_overlay() {
+        let mut s = AppState::new(None, false);
+        s.hover_overlay = Some("fn foo() -> i32".to_string());
+        key(&mut s, K::Escape, false, 0);
+        assert!(s.hover_overlay.is_none());
     }
 
     #[test]
