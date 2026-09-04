@@ -50,7 +50,7 @@ fn a_real_type_error_surfaces_in_appstate_lsp_diagnostics() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut found_error = false;
     while Instant::now() < deadline {
-        s.poll_lsp();
+        s.poll_lsp(0);
         if s.lsp_diagnostics.iter().any(|d| d.severity == aperture_lsp::DiagnosticSeverity::Error) {
             found_error = true;
             break;

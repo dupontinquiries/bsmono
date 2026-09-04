@@ -92,7 +92,7 @@ fn opening_a_rust_file_and_typing_a_prefix_surfaces_a_cross_file_lsp_completion(
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut found = false;
     while Instant::now() < deadline {
-        s.poll_lsp();
+        s.poll_lsp(0);
         if let Some(popup) = &s.popup {
             if popup.items.iter().any(|i| i.label.contains("cross_file_only_symbol")) {
                 found = true;

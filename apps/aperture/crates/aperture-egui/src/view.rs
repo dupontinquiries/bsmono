@@ -36,7 +36,7 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
         state.show_loop_pane = !state.show_loop_pane;
     }
     state.poll_completions(now_ms);
-    state.poll_lsp();
+    state.poll_lsp(now_ms);
     state.poll_note();
     state.poll_route_ai();
     state.poll_edit_ai(now_ms);
@@ -1618,6 +1618,7 @@ fn map_key(key: egui::Key) -> Option<K> {
         EK::L => K::L,
         EK::F => K::F,
         EK::F3 => K::F3,
+        EK::F12 => K::F12,
         EK::Space => K::Space,
         _ => return None,
     })

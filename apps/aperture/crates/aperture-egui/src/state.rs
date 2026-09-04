@@ -48,6 +48,7 @@ pub enum K {
     E,
     F,
     F3,
+    F12,
     Space,
     Comma,
     Period,
@@ -471,10 +472,19 @@ pub struct AppState {
     /// found nothing but LSP answers anyway (a std type invisible to the
     /// local single-file outline, for instance).
     lsp_pending_prefix_start: Option<usize>,
+    /// Bumped on every go-to-definition request; an arriving
+    /// `DefinitionOutcome` is applied only if this still matches — same
+    /// generation-gate `lsp_gen` already is for completions.
+    lsp_definition_gen: u64,
     /// Latest `publishDiagnostics` for the current file, empty when no LSP
     /// worker is running or the file is currently clean. Line numbers are
     /// LSP's own (zero-indexed), matching `git_changed`'s convention.
     pub lsp_diagnostics: Vec<aperture_lsp::Diagnostic>,
+    /// Vocabulary buildup + per-speaker "again" history for voice commands
+    /// — see `aperture_core::voice::VoiceSession`'s own doc for the honest
+    /// scope (no microphone, no diarization; this is what happens once an
+    /// utterance is already text and already attributed to someone).
+    voice_session: aperture_core::voice::VoiceSession,
 }
 
 /// The strip as it starts: empty recents, a few pinned quick actions.
@@ -607,7 +617,9 @@ impl AppState {
             lsp_doc_version: 1,
             lsp_gen: 0,
             lsp_pending_prefix_start: None,
+            lsp_definition_gen: 0,
             lsp_diagnostics: Vec::new(),
+            voice_session: aperture_core::voice::VoiceSession::new(),
         };
         if with_engine {
             s.apply_env_provider();
@@ -1963,8 +1975,17 @@ impl AppState {
     /// Apply an arrived LSP completion outcome to the popup, if it's still
     /// for the request the popup is actually waiting on. Called once per
     /// frame from the view's tick, same shape as `poll_completions`.
-    pub fn poll_lsp(&mut self) {
+    pub fn poll_lsp(&mut self, now_ms: u64) {
         let Some(lsp) = &self.lsp else { return };
+        // Drained into a local Vec, not processed inline: `jump_to_lsp_
+        // definition` needs `&mut self` (it can call `open_file`, which
+        // reassigns `self.lsp` itself), so it can't run while `lsp` — a
+        // borrow of `self.lsp` — is still alive. Collecting first, then
+        // dropping `lsp` before the second loop, is the whole fix.
+        let mut definition_outcomes = Vec::new();
+        while let Some(outcome) = lsp.poll_definition() {
+            definition_outcomes.push(outcome);
+        }
         while let Some(diags) = lsp.poll_diagnostics() {
             self.lsp_diagnostics = diags;
         }
@@ -2007,6 +2028,18 @@ impl AppState {
                         .collect();
                     self.popup = Some(Popup { items, sel: 0, prefix_start });
                 }
+            }
+        }
+        // `lsp` (borrowed from `self.lsp`) is no longer used past this
+        // point, so `&mut self` calls below are fine — this is why
+        // `definition_outcomes` was collected rather than processed above.
+        for outcome in definition_outcomes {
+            if outcome.generation != self.lsp_definition_gen {
+                continue; // superseded by a later lookup; the caret moved on
+            }
+            match outcome.locations.first().cloned() {
+                Some(loc) => self.jump_to_lsp_definition(&loc, now_ms),
+                None => self.set_status("go to definition: nothing found", now_ms),
             }
         }
     }
@@ -2164,6 +2197,7 @@ impl AppState {
                     self.open_find();
                 } 
             }
+            (F12, false) => self.go_to_definition(now_ms),
             (Space, true) if shift => self.trigger_completion_now(now_ms),
             (Space, true) => self.refresh_popup(1),
             (Left, true) => self.moved(|s, sh| s.editor.move_word(-1, sh), shift),
@@ -2411,6 +2445,59 @@ impl AppState {
         if let Some(lsp) = &self.lsp {
             lsp.open(uri, text.to_string());
         }
+    }
+
+    /// Inverse of `file_uri` — strips the `file://` prefix this crate's own
+    /// URIs always use. Not a general URI parser (no percent-decoding, no
+    /// handling of a `file://host/path` authority): every URI this method
+    /// ever sees either came from `file_uri` itself or from a server
+    /// answering a request THIS client made with one of those URIs, so the
+    /// simple cases are the only ones that can actually occur here.
+    fn path_from_file_uri(uri: &str) -> Option<std::path::PathBuf> {
+        uri.strip_prefix("file://").map(std::path::PathBuf::from)
+    }
+
+    /// F12: ask the LSP worker where the symbol under the caret is defined.
+    /// No-op, silently, when no worker is running — same "this tier simply
+    /// isn't available" handling every other LSP entry point uses.
+    fn go_to_definition(&mut self, now_ms: u64) {
+        let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) else {
+            self.set_status("go to definition: no language server running", now_ms);
+            return;
+        };
+        self.lsp_definition_gen += 1;
+        let p = self.editor.caret_pos();
+        let line_text = self.editor.buffer.line(p.line);
+        let utf16_col = aperture_core::width::char_col_to_utf16(&line_text, p.col);
+        lsp.request_definition(uri.clone(), p.line as u32, utf16_col, self.lsp_definition_gen);
+    }
+
+    /// Apply an arrived go-to-definition answer: jump to the FIRST location
+    /// (the common case is exactly one; `Location`'s own doc explains why
+    /// the client returns every one rather than picking for the caller —
+    /// this is the one place in the shell that has to pick, since a caret
+    /// can only go one place at a time. A palette-driven "choose among N"
+    /// for the rare multi-result case is future work, not attempted here).
+    fn jump_to_lsp_definition(&mut self, loc: &aperture_lsp::Location, now_ms: u64) {
+        let Some(target_path) = Self::path_from_file_uri(&loc.uri) else {
+            self.set_status("go to definition: couldn't resolve the target path", now_ms);
+            return;
+        };
+        // Same file: move the caret in the buffer that's ALREADY open,
+        // rather than reopening it — reopening would discard any unsaved
+        // edits, which `open_file` always does (fresh `Editor::from_str`
+        // straight from disk).
+        let same_file = self.path.as_ref().is_some_and(|p| Self::file_uri(p) == loc.uri);
+        if !same_file {
+            self.open_file(target_path, now_ms);
+        }
+        let line = (loc.line as usize).min(self.editor.buffer.len_lines().saturating_sub(1));
+        let line_text = self.editor.buffer.line(line);
+        let col = aperture_core::width::utf16_col_to_char(&line_text, loc.character);
+        let at = self.editor.buffer.pos_to_char(aperture_core::buffer::Pos::new(line, col));
+        self.editor.sel = Selection::caret(at);
+        self.follow_caret = true;
+        self.set_status("jumped to definition", now_ms);
     }
 
     // ── AI wiring, called from the view's frame tick ────────────────────────
@@ -2865,9 +2952,44 @@ impl AppState {
     /// from `handle()` — the caller is responsible for actually setting the
     /// platform clipboard (this crate is headless w.r.t. `arboard`/egui's
     /// own clipboard, same reason `Effects` exists at all).
+    ///
+    /// Single-speaker convenience: everything from this entry point shares
+    /// one "again"/vocab history bucket, keyed `"local"`. A caller with a
+    /// real multi-participant story (several people voice-driving one
+    /// shared session) should call `run_voice_command_as` directly with
+    /// each person's own identity instead — see that method's doc for why
+    /// "again" specifically needs to know who's asking.
     pub fn run_voice_command(&mut self, utterance: &str, now_ms: u64) -> Option<String> {
+        self.run_voice_command_as("local", utterance, now_ms)
+    }
+
+    /// Like `run_voice_command`, but attributed to `speaker` — whatever
+    /// upstream identity a real pipeline hands this layer (a `SiteId`-
+    /// shaped string is the natural choice, matching `aperture_collab`'s
+    /// existing multi-participant identity model rather than inventing a
+    /// second one). Two things become per-speaker rather than global:
+    ///
+    /// 1. "again"/"repeat that" replays THAT SPEAKER's own last command,
+    ///    not whoever spoke most recently in the whole session — the one
+    ///    piece of multi-user behavior that is silently wrong by default
+    ///    (Bob saying "again" after Alice's command should not redo
+    ///    Alice's edit under Bob's name).
+    /// 2. The vocabulary itself is shared (everyone benefits from the same
+    ///    project's symbol names being sayable), but resolution still
+    ///    happens per-utterance, so a "go to compute total" ambiguity is
+    ///    never influenced by what a DIFFERENT speaker said earlier.
+    pub fn run_voice_command_as(&mut self, speaker: &str, utterance: &str, now_ms: u64) -> Option<String> {
         use aperture_core::voice::VoiceCommand as V;
-        match aperture_core::voice::parse(utterance) {
+        // Vocabulary buildup: whatever this file's own outline currently
+        // knows about, refreshed on every command rather than cached —
+        // a voice command is rare enough (a few per minute at most) that
+        // re-deriving from the already-parsed tree costs nothing worth
+        // guarding, and a stale vocabulary (missing a function someone
+        // just wrote) would be a confusing, silent failure to navigate to
+        // exactly the thing they just added.
+        let vocab: Vec<String> = self.gather_symbols().iter().map(|(name, _)| name.clone()).collect();
+        self.voice_session.set_vocab(vocab);
+        match self.voice_session.handle(speaker, utterance) {
             V::Save => self.save(now_ms),
             V::Undo => self.editor.undo(),
             V::Redo => self.editor.redo(),
@@ -2909,6 +3031,24 @@ impl AppState {
             V::GoToLine(n) => {
                 self.editor.goto_line(n.saturating_sub(1)); // spoken "line 1" is index 0
                 self.follow_caret = true;
+            }
+            V::GoToSymbol(name) => {
+                // Re-derive the line from the outline directly rather than
+                // threading it through `gather_symbols`'s (name, sig) pairs
+                // — those exist for the completion popup's display text and
+                // were never meant to carry a jump target too; asking them
+                // to would couple two unrelated callers' needs together.
+                let line = self.syntax.outline(&self.editor.buffer).into_iter()
+                    .find(|item| item.name == name)
+                    .map(|item| item.line);
+                match line {
+                    Some(line) => {
+                        self.editor.goto_line(line);
+                        self.follow_caret = true;
+                    }
+                    None => self.set_status(
+                        &format!("voice: \"{name}\" isn't in this file's outline anymore"), now_ms),
+                }
             }
             V::AddNextCursor => self.add_next_cursor(now_ms),
             V::SelectAllOccurrences => self.select_all_cursor_occurrences(now_ms),
@@ -3317,6 +3457,68 @@ mod tests {
         s.editor = aperture_core::editor::Editor::from_str("a\nb\nc\n");
         s.run_voice_command("go to line 2", 0);
         assert_eq!(s.editor.caret_pos().line, 1, "spoken 'line 2' is index 1");
+    }
+
+    #[test]
+    fn voice_go_to_symbol_navigates_using_this_files_own_outline() {
+        let mut s = AppState::new(None, false);
+        s.lang = aperture_core::syntax::Language::Rust;
+        s.syntax.set_language(s.lang);
+        s.editor = aperture_core::editor::Editor::from_str(
+            "fn compute_total() -> i32 {\n    42\n}\n\nfn main() {\n    compute_total();\n}\n",
+        );
+        s.run_voice_command("go to compute total", 0);
+        assert_eq!(s.editor.caret_pos().line, 0, "compute_total is defined on line 0");
+    }
+
+    #[test]
+    fn voice_go_to_symbol_with_no_match_falls_through_to_the_generic_unknown_message() {
+        // "nothing_defined_here" never matches the vocabulary at all, so
+        // parse_with_vocab returns Unknown before GoToSymbol's own
+        // outline-lookup-failed message is ever reached — that message is
+        // for the narrower case of a name that WAS vocab-matched but can no
+        // longer be found (a stale-outline race), not "no match at all".
+        let mut s = AppState::new(None, false);
+        s.lang = aperture_core::syntax::Language::Rust;
+        s.syntax.set_language(s.lang);
+        s.editor = aperture_core::editor::Editor::from_str("fn main() {}\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(5);
+        s.run_voice_command("go to nothing_defined_here", 0);
+        assert_eq!(s.editor.caret_pos().line, 0, "no jump should have happened");
+        let (msg, _) = s.status.clone().expect("a status should explain the miss");
+        assert!(msg.contains("didn't understand"), "{msg}");
+    }
+
+    #[test]
+    fn voice_vocabulary_grows_as_the_buffer_changes() {
+        // The whole point of "buildup": a function added mid-session
+        // becomes sayable without any extra step reindexing it.
+        let mut s = AppState::new(None, false);
+        s.lang = aperture_core::syntax::Language::Rust;
+        s.syntax.set_language(s.lang);
+        s.editor = aperture_core::editor::Editor::from_str("fn main() {}\n");
+        assert!(s.run_voice_command("go to freshly_added", 0).is_none());
+        assert!(s.status.as_ref().unwrap().0.contains("didn't understand"));
+
+        s.editor = aperture_core::editor::Editor::from_str("fn freshly_added() {}\nfn main() {}\n");
+        s.run_voice_command("go to freshly added", 0);
+        assert_eq!(s.editor.caret_pos().line, 0, "the newly-typed function should now be navigable by voice");
+    }
+
+    #[test]
+    fn two_speakers_sharing_a_session_each_get_their_own_again() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("a\nb\nc\nd\ne\n");
+        s.run_voice_command_as("alice", "go to line 2", 0);
+        s.run_voice_command_as("bob", "go to line 4", 0);
+
+        // Bob's "again" must replay BOB's own last command (line 4), not
+        // Alice's — the one multi-user behavior that's wrong by default.
+        s.run_voice_command_as("bob", "again", 0);
+        assert_eq!(s.editor.caret_pos().line, 3, "bob's again should return to line 4 (index 3)");
+
+        s.run_voice_command_as("alice", "again", 0);
+        assert_eq!(s.editor.caret_pos().line, 1, "alice's again should return to line 2 (index 1)");
     }
 
     #[test]

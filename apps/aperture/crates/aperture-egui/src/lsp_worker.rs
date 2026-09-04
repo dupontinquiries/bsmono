@@ -13,7 +13,7 @@
 //! stays the popup's baseline either way (see `aperture_lsp`'s crate doc for
 //! why LSP is an ADDITIONAL tier, not a replacement).
 
-use aperture_lsp::{CompletionItem, Diagnostic, LspClient};
+use aperture_lsp::{CompletionItem, Diagnostic, Location, LspClient};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::Duration;
 
@@ -21,6 +21,7 @@ enum Msg {
     Open { uri: String, text: String },
     Change { uri: String, text: String, version: i64 },
     Complete { uri: String, line: u32, character: u32, generation: u64 },
+    Definition { uri: String, line: u32, character: u32, generation: u64 },
 }
 
 /// A completed (or failed-and-empty) completion request, tagged with the
@@ -31,10 +32,21 @@ pub struct LspOutcome {
     pub items: Vec<CompletionItem>,
 }
 
+/// Same generation-gating shape as `LspOutcome`, for `textDocument/
+/// definition` — a separate type rather than folding into `LspOutcome`
+/// because the two requests answer different questions and a caller
+/// checking "did MY request land" gets confused fastest when two unrelated
+/// answers share one Option<T> and one generation counter.
+pub struct DefinitionOutcome {
+    pub generation: u64,
+    pub locations: Vec<Location>,
+}
+
 pub struct LspWorker {
     tx: Sender<Msg>,
     rx: Receiver<LspOutcome>,
     diag_rx: Receiver<Vec<Diagnostic>>,
+    def_rx: Receiver<DefinitionOutcome>,
 }
 
 impl LspWorker {
@@ -47,11 +59,12 @@ impl LspWorker {
         let (tx, worker_rx) = channel::<Msg>();
         let (out_tx, rx) = channel::<LspOutcome>();
         let (diag_tx, diag_rx) = channel::<Vec<Diagnostic>>();
+        let (def_tx, def_rx) = channel::<DefinitionOutcome>();
         std::thread::Builder::new()
             .name("aperture-lsp-worker".into())
-            .spawn(move || worker(client, worker_rx, out_tx, diag_tx))
+            .spawn(move || worker(client, worker_rx, out_tx, diag_tx, def_tx))
             .expect("spawn LSP worker thread");
-        Ok(LspWorker { tx, rx, diag_rx })
+        Ok(LspWorker { tx, rx, diag_rx, def_rx })
     }
 
     pub fn open(&self, uri: String, text: String) {
@@ -69,6 +82,13 @@ impl LspWorker {
         let _ = self.tx.send(Msg::Complete { uri, line, character, generation });
     }
 
+    /// Queue a go-to-definition request. Same coalesce-to-newest rule as
+    /// completions — a definition lookup superseded by a later keystroke
+    /// or another lookup isn't worth answering.
+    pub fn request_definition(&self, uri: String, line: u32, character: u32, generation: u64) {
+        let _ = self.tx.send(Msg::Definition { uri, line, character, generation });
+    }
+
     /// Non-blocking; call once per frame.
     pub fn poll(&self) -> Option<LspOutcome> {
         self.rx.try_recv().ok()
@@ -80,16 +100,22 @@ impl LspWorker {
     pub fn poll_diagnostics(&self) -> Option<Vec<Diagnostic>> {
         self.diag_rx.try_recv().ok()
     }
+
+    /// Non-blocking; call once per frame.
+    pub fn poll_definition(&self) -> Option<DefinitionOutcome> {
+        self.def_rx.try_recv().ok()
+    }
 }
 
-fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx: Sender<Vec<Diagnostic>>) {
+fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx: Sender<Vec<Diagnostic>>, def_tx: Sender<DefinitionOutcome>) {
     // Drain-to-newest before acting, same shape as aperture_complete's own
     // worker loop: Open/Change messages all apply in order (each is a real,
     // needed state transition the server must see), but if several
-    // Complete requests piled up while a previous completion call was
-    // in flight, only the LAST one is worth answering — the caret has
-    // moved on.
+    // Complete or Definition requests piled up while a previous call was
+    // in flight, only the LAST one of each kind is worth answering — the
+    // caret has moved on.
     let mut pending_complete: Option<(String, u32, u32, u64)> = None;
+    let mut pending_definition: Option<(String, u32, u32, u64)> = None;
     // The URI diagnostics get checked against — whatever the last Open or
     // Change named. `publishDiagnostics` is a PUSH, not a reply to
     // anything this worker asked for, so there is no message to drain for
@@ -116,6 +142,9 @@ fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx:
                 Some(Msg::Complete { uri, line, character, generation }) => {
                     pending_complete = Some((uri, line, character, generation));
                 }
+                Some(Msg::Definition { uri, line, character, generation }) => {
+                    pending_definition = Some((uri, line, character, generation));
+                }
                 None => break,
             }
             match rx.try_recv() {
@@ -127,6 +156,12 @@ fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx:
         if let Some((uri, line, character, generation)) = pending_complete.take() {
             let items = client.completion(&uri, line, character).unwrap_or_default();
             if tx.send(LspOutcome { generation, items }).is_err() {
+                return; // receiver dropped
+            }
+        }
+        if let Some((uri, line, character, generation)) = pending_definition.take() {
+            let locations = client.goto_definition(&uri, line, character).unwrap_or_default();
+            if def_tx.send(DefinitionOutcome { generation, locations }).is_err() {
                 return; // receiver dropped
             }
         }
