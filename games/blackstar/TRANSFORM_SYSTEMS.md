@@ -73,6 +73,19 @@ Did not attempt the port itself — real C-engine + GLSL work, unverifiable in
 this sandbox (no display, and this session's toolchain is Rust, not the C
 engine's own build).
 
+**UPDATE, same session, right after writing the above:** got curious whether
+"unverifiable... not the C engine's own build" was actually true, or just
+assumed. It wasn't true — `engine_src/`'s own Makefile builds with plain
+`make` once `gcc`/`libsdl2-dev`/`libgl1-mesa-dev` are installed. It had never
+actually linked in this bundle (60 `.c` files, including `transform.c` and
+`robot_parts.c` themselves, were missing from the Makefile's hardcoded
+object list — see the engine-build commit). Fixed that, so the C engine now
+builds and runs up to SDL/GL window creation. Still can't get a window under
+this sandbox's Xvfb (GLX visual mismatch, a real ceiling — see that commit
+for what was tried), so the actual port work above is still unverifiable
+here, but "the C engine's own build" is no longer a wall between this repo
+and testing it — just this sandbox's lack of a real display.
+
 ## What to remove, and what not to
 
 The empty `g_tmodels` path is already inert — `tmodel_for()` returns null, so
