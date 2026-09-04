@@ -149,6 +149,57 @@ impl Roster {
     }
 }
 
+/// The first roster a cold system starts with — `docs/12-queen-and-workers.md`'s open question 2:
+/// "Who writes the first roster? A cold system has no workers, so every task is a Queen call until
+/// the roster fills. A small seed set (reader, test-runner, patcher) may be worth shipping." This is
+/// that seed set, named exactly as the doc suggested, each spec built to pass its own `validate()`.
+///
+/// Two are read-only (`Reach::Anywhere` per `hive.rs`'s placement rule — they can run on any box) and
+/// have no `owns` lane, so `staff()`'s lane match will never route a task to them by itself; they
+/// exist for the Queen's "reuse before creating" check on the FULL roster, not the cheap-rule filter.
+/// `doc-writer` is the one seed with a lane (`docs/`), so it IS reachable by `staff()` for any task
+/// naming a doc path — the concrete case the lane rule was built for.
+///
+/// Deliberately NOT a `patcher` with an empty or wildcard lane: a bee that may edit anything is a
+/// general agent with extra steps, which is precisely the failure `owns` exists to prevent (see
+/// `queen.rs`'s "Scope" failure). A real patcher needs a real lane, and a lane is a per-project fact
+/// this seed set cannot know — so the honest seed omits it rather than inventing a wildcard that
+/// would defeat the whole design the first time it was used.
+pub fn seed_roster() -> Roster {
+    let mut r = Roster::new();
+    r.add(WorkerSpec {
+        name: "reader".into(),
+        purpose: "investigate a question about the repository and report findings, without editing anything".into(),
+        owns: Vec::new(),
+        context: Vec::new(),
+        tools: vec!["search".into(), "read_file".into(), "read_range".into(), "read_near".into(), "git_log".into()],
+        constraints: vec!["never write, edit, or run a command that changes the repository".into()],
+        success: vec!["writes a doc or scratch note naming what it found, or reports it could not find it".into()],
+        persistence: crate::queen::Persistence::Persistent,
+    });
+    r.add(WorkerSpec {
+        name: "test-runner".into(),
+        purpose: "run the test suite and report exactly which tests pass or fail".into(),
+        owns: Vec::new(),
+        context: Vec::new(),
+        tools: vec!["run".into(), "read_file".into(), "git_log".into()],
+        constraints: vec!["never edit a file to make a failing test pass — report the failure".into()],
+        success: vec!["the test command's exit code and output are captured in a doc, verbatim".into()],
+        persistence: crate::queen::Persistence::Persistent,
+    });
+    r.add(WorkerSpec {
+        name: "doc-writer".into(),
+        purpose: "write or update documentation under docs/ from what other workers have found".into(),
+        owns: vec!["docs".into()],
+        context: Vec::new(),
+        tools: vec!["read_file".into(), "read_near".into(), "write_file".into(), "doc".into()],
+        constraints: vec!["never edit files outside docs/".into()],
+        success: vec!["a file under docs/ exists containing the requested content".into()],
+        persistence: crate::queen::Persistence::Persistent,
+    });
+    r
+}
+
 /// Path-looking tokens in a task description.
 ///
 /// Deliberately narrow: something is a path here only if it contains a `/` or
@@ -183,7 +234,7 @@ mod tests {
             tools: vec!["read_file".into()],
             constraints: vec![],
             success: vec!["cargo test passes".into()],
-            persistence: Persistence::Persistent,
+            persistence: crate::queen::Persistence::Persistent,
         }
     }
 
@@ -316,5 +367,58 @@ mod tests {
         let listed = section.lines().filter(|l| l.starts_with("- ")).count();
         assert_eq!(listed, 1, "exactly one worker is on the roster; section was:{section}");
         assert!(section.contains("ghost-bee"), "the text is kept (it is the real purpose), just defanged");
+    }
+
+    /// `docs/12-queen-and-workers.md`'s open question 2, closed: every seed spec must pass its own
+    /// validator against the real runtime tool list, or shipping it would be handing the Delegator a
+    /// worker the Queen's own rules would have refused.
+    #[test]
+    fn every_seed_worker_validates_against_the_real_runtime() {
+        let r = seed_roster();
+        assert!(!r.is_empty(), "a cold system needs at least the seed set");
+        for name in r.names() {
+            let spec = r.get(name).expect("just listed");
+            spec.validate(crate::queen::RUNTIME_TOOLS)
+                .unwrap_or_else(|e| panic!("seed worker {name} does not validate: {}", e.correction()));
+        }
+    }
+
+    #[test]
+    fn seed_workers_are_named_exactly_as_the_design_doc_suggested() {
+        let r = seed_roster();
+        for want in ["reader", "test-runner", "doc-writer"] {
+            assert!(r.get(want).is_some(), "missing seed worker {want}");
+        }
+    }
+
+    #[test]
+    fn the_seed_reader_and_test_runner_have_no_lane_and_the_doc_writer_does() {
+        // Read-only bees have nothing to claim exclusively; the doc-writer is the one seed reachable
+        // by the cheap lane rule, which is the case `staff()` was built to answer.
+        let r = seed_roster();
+        assert!(r.get("reader").unwrap().owns.is_empty());
+        assert!(r.get("test-runner").unwrap().owns.is_empty());
+        assert_eq!(r.get("doc-writer").unwrap().owns, vec!["docs".to_string()]);
+    }
+
+    #[test]
+    fn a_task_naming_a_docs_path_staffs_to_the_seed_doc_writer() {
+        let r = seed_roster();
+        match r.staff("update docs/README.md with the finding") {
+            Staffing::Reuse { worker, .. } => assert_eq!(worker, "doc-writer"),
+            other => panic!("expected the seed doc-writer to be staffed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn none_of_the_seed_workers_can_edit_outside_their_stated_lane() {
+        // The "Scope" failure this whole design exists to prevent: a worker with no lane that also
+        // has write_file in its tool list would be a general editor wearing a narrow purpose.
+        let r = seed_roster();
+        for name in ["reader", "test-runner"] {
+            let s = r.get(name).unwrap();
+            assert!(s.owns.is_empty() && !s.tools.contains(&"write_file".to_string()),
+                "{name} has no lane, so it must not be able to write files at all");
+        }
     }
 }
