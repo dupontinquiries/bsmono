@@ -53,6 +53,29 @@ started. Read C13 §0 before trusting any visual claim.
     still coexist at top-centre. Both want the panel migration, not
     another round of hand-retuned literals.
 
+  - **UPDATE (c15unified session): checked both halves separately —
+    one was already fixed, one wasn't.**
+    - The menu hit-test half is DONE, just never noted here. Every one
+      of pause/garage/tweaks/academy/maps now shares one named constant
+      between its draw code and its hit-test code (`TW_ROW_H`,
+      `GARAGE_ROW_H`, `ACADEMY_ROW_H`, `hit_row`/`hit_row_scrolled`) —
+      structurally can't drift apart, unlike the old duplicated-pitch
+      mirrors. Grepped for the old `size * 2.4` literal: zero live
+      references, only comments describing the historical bug.
+    - The banner/combo overlap was real and still live. `trial_banner`/
+      `lesson_banner` occupy y∈[0.66,0.895] x∈[-0.34,0.34]; the combo
+      label/bar sit at y=0.88 / y∈[0.815,0.823], centred at x=0 —
+      inside that box. Not a mode-exclusivity bug (a Do-a-trick lesson
+      reads `self.combo` into its own progress bar, so both are
+      legitimately active at once) — a screen-space one. Fixed with
+      `HudInfo::banner_active` (`self.lesson.is_some() ||
+      self.trial.is_some()`), gating the combo draw. New test
+      `the_combo_readout_is_suppressed_under_a_trial_or_lesson_banner`,
+      same two-part shape (local redraw + call-site source scan) as the
+      existing watermark test, so it can't pass by a flag that exists
+      but nothing wires. 1592/1592 across all three build configs (was
+      1591 — the +1 is this test). NOT verified on an actual screen.
+
 - **Fold cinematics** (`camera.rs`, `sound.rs`, `main.rs::advance_xform`):
   director's-camera mode (`CamMode::Cinematic`) during a fold, arc speed
   tied to `content::Chassis::fold_spin` (previously dead data), servo-sweep

@@ -7689,6 +7689,7 @@ impl Game {
             car_rings: self.car_rings,
             goals: self.goals,
             combo: self.combo,
+            banner_active: self.lesson.is_some() || self.trial.is_some(),
             combo_left: (self.combo_t / COMBO_WINDOW).clamp(0.0, 1.0),
             air_t: self.air_t,
             best_air: self.save.best_air,
