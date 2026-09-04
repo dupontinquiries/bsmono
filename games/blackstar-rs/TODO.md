@@ -9,6 +9,27 @@ under `--no-default-features`, `--features audio`, and default. 1256 tests
 throughout. Warning count started at 335 (pre-existing, unrelated to this
 session) and sits at 337 as of the last tooling addition — the +2 are
 
+**Warning-count baseline is stale (c15unified session).** Actual count under
+`--no-default-features` today: **512**, not 337. Broken down by category,
+it's overwhelmingly genuine dead code — 134 unused functions, 69 unused
+constants, 53 never-constructed structs, 40 unused methods, 25 never-read
+fields, 23 unused enums, plus smaller categories — not lint-version noise (a
+newer rustc surfacing warnings an older one didn't); those exist too
+(`mismatched_lifetime_syntaxes` appears once) but don't explain a jump this
+size. **Not attempting a fix**: 175+ warnings accumulated across however many
+commits since 337 was recorded, with no bisection done to find where, and
+this codebase explicitly keeps some code deliberately unwired on purpose
+(`suitability.rs` is named elsewhere in this file as exactly that case) — a
+blanket dead-code sweep risks deleting scaffolding meant to stay. Checked
+specifically whether any of it touches raid/campaign/boss/tread work (this
+session's actual focus): it does not — grepped the warning list for those
+names, zero matches, so campaign.rs/raidcon.rs/raidgen.rs/raidflow.rs/
+raidrun.rs/raidlog.rs/raidforge.rs are warning-clean. Recording the real
+number here so the next session doesn't cite 337 as current; a real cleanup
+pass would want git-blame/bisection to separate "abandoned" from
+"intentionally staged for later," which is a different, bigger task than
+this note.
+
 **Re-verified live, this session (c15unified)**: all three configs actually
 built and ran in this sandbox, not just checked for compile errors — 1591/1591
 passing on every one of `--no-default-features`, `--features audio`, and
