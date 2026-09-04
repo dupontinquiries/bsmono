@@ -592,11 +592,32 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   checked against what a real server actually resolves. `cargo test -p
   aperture-lsp`: 29/29 (24 unit + 5 real-server), ~4s.
 
+  ~~wiring go-to-definition into the shell at all (no Ctrl+click, no
+  palette command — client capability only)~~ **DONE, F12.** Third
+  `lsp_worker.rs` outcome channel (`DefinitionOutcome`, its own generation
+  counter — two unrelated answers sharing one `Option<T>` is confusing
+  fastest), same coalesce-to-newest rule as completions. `go_to_definition`
+  converts the caret's char column to UTF-16 via `char_col_to_utf16` (a
+  second real caller for the position fix above); `jump_to_lsp_definition`
+  takes the first location LSP names, opens the target file through the
+  normal `open_file` path if it isn't the current one, converts the
+  response position back with `utf16_col_to_char`. `poll_lsp` now
+  collects definition outcomes into a local `Vec` before processing —
+  applying one can call `open_file`, which reassigns `self.lsp` itself,
+  which can't happen while still holding the `&self.lsp` borrow
+  `poll_definition()` needs.
+
+  Real proof: `lsp_goto_definition_e2e.rs` jumps ACROSS FILES through a
+  real `rust-analyzer` and checks the editor actually landed there.
+  Retries F12 if the first answer comes back empty — the same
+  "server needs a moment right after `didOpen`" finding from completions
+  and diagnostics, confirmed again here with an isolated raw-client repro
+  (identical query: empty on the first attempt, succeeds ~1s later)
+  before assuming a retry was the right fix rather than a symptom of
+  something actually broken.
+
   Still not done: hover, incremental sync (`did_change` always sends the
-  whole document), and wiring go-to-definition into the shell at all (no
-  Ctrl+click, no palette command — client capability only, same
-  client-first-then-shell-wiring split completions and diagnostics both
-  went through).
+  whole document).
   `workspace_symbols`'s local tree-sitter outline and `route`'s
   keyword-scored candidates stay the fast, dependency-free default tiers;
   LSP is an ADDITIONAL tier alongside them, never a replacement.
@@ -662,6 +683,41 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   something that runs on every transcript unconditionally); this needs a
   real audio pipeline wired to aperture's process model, which is a
   materially different and larger piece of work than the grammar above.
+
+  **Follow-on, same session: vocabulary buildup + multi-speaker
+  sessions.** `parse_with_vocab` resolves "go to <name>" / "jump to
+  <name>" / "navigate to <name>" against a LIVE vocabulary (a project's
+  own symbol names) rather than a fixed word list — substring/prefix
+  matching, not a general fuzzy scorer, since `uikit_egui::fuzzy` lives
+  in a UI crate `aperture-core` can't depend on without giving up its
+  headless property, and the one transformation actually needed (joining
+  spoken words with underscores, since a recognizer emits pauses as
+  spaces) doesn't need general fuzzy matching to get right. Vocabulary is
+  refreshed from the current outline on every command, not cached — a
+  voice command is rare enough that re-deriving costs nothing, and a
+  stale vocabulary missing a function someone just wrote would be a
+  confusing silent failure.
+
+  `VoiceSession`: per-speaker "again"/"repeat that" history, keyed by a
+  `SiteId`-shaped string matching `aperture_collab`'s existing
+  multi-participant model rather than inventing a second one (though
+  collab itself still isn't wired to the shell either). The one piece of
+  multi-user behavior that's silently wrong by default if missed: Bob
+  saying "again" must replay BOB's own last command, not whoever spoke
+  most recently session-wide. `run_voice_command` now delegates to
+  `run_voice_command_as("local", ...)`; a real multi-participant caller
+  uses `run_voice_command_as` directly.
+
+  `cargo test -p aperture-core --features tree-sitter`: 160/160 (was
+  148). `cargo test -p aperture-egui --lib`: 102/102 (was 98).
+
+  Not done: no audio pipeline (still 100% text-side — an utterance has
+  to arrive as a string from somewhere upstream), no real speaker
+  diarization/voiceprint (speaker identity is an opaque string this
+  layer trusts, not something it derives), no wiring of
+  `aperture-collab`'s actual multi-participant session into
+  `aperture-egui` (`run_voice_command_as` exists and is tested, but
+  nothing in the shell calls it with more than one speaker yet).
 
 ## voiceterm — loop-trimmer off-by-one (fixed at source, 2026-08-19)
 
