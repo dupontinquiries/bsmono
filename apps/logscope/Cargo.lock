@@ -2913,6 +2913,7 @@ dependencies = [
  "cli-kit",
  "config-kit",
  "cpal",
+ "crossbeam-channel",
  "eframe",
  "egui",
  "gpu-gemm",

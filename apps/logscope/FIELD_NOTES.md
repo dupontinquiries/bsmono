@@ -632,8 +632,23 @@ line-level. The streaming cursor (▌) lands on the last line. (chat.rs: `parse_
 LayoutJob runs aren't individually clickable; full click-through would need per-link Hyperlink widgets.
 
 **Tab-level parity** already holds: the egui tabs (bloc, cargo, charts, chat, code, modify, peek, rotate,
-sources) cover the GTK tabs and add `charts`. Remaining within-tab gaps to assess later: the GTK `ollama.rs`
-(an Ollama HTTP provider backend — would need an HTTP dep) and shared `components.rs` widgets.
+sources) cover the GTK tabs and add `charts`. Remaining within-tab gaps: shared `components.rs` widgets,
+not yet assessed.
+
+**CORRECTION (this session): the GTK `ollama.rs` gap above was stale and wrong.** The HTTP dep this
+note said was needed already exists — `logscope::providers` (shared by both frontends) has real
+`ureq`-based Ollama HTTP calls and a real parallel LAN scanner (`scan_lan_parallel`,
+`probe_host`). The actual bug was worse than "not ported": egui's `app.rs::rescan()` was LIVE
+production code (not a test fixture) that shipped two hardcoded fake hosts and fake model lists —
+`qwen2.5:7b` on a made-up `192.168.1.42` — instead of calling the real scanner, so the model picker
+could show servers and models that do not exist on the user's actual network. Fixed by wiring
+`rescan()` to `probe_host` (localhost) + `scan_lan_parallel` (LAN, bridged from its
+`crossbeam_channel` type into the existing `mpsc` channel `drain_scan()` already polls) — the
+downstream consumer, `build_model_entries`, was already real and unaffected. Verified with a
+standalone binary calling the exact same two functions: completes cleanly in ~5s, 0 hosts found —
+correct for this sandbox (no LAN, no Ollama server), and confirms the code path itself doesn't
+hang or panic rather than assuming it from reading the source. Removed the now-dead `mi()`/
+`tier_for()` fixture helpers `rescan()` no longer needs.
 
 **DeepSeek-style models — design note** (see outputs/DEEPSEEK_SUPPORT.md, analysis not implementation):
 "DeepSeek" splits into (1) the R1 *distills*, which are dense Llama/Qwen — the Llama ones (e.g.

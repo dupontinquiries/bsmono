@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use egui::RichText;
 use logscope::llm_backend;
-use logscope::model_selector::{ModelInfo, ModelTier};
+use logscope::model_selector::ModelInfo;
 use logscope::providers::{build_model_entries, ModelEntry};
 
 use crate::analysis;
@@ -134,14 +134,6 @@ impl LogscopeApp {
             self.tabs.chat.boot_demo(spatial);
         }
     }
-}
-
-fn tier_for(p: u64) -> ModelTier {
-    if p < 3000 { ModelTier::Small } else if p <= 13000 { ModelTier::Medium } else { ModelTier::Large }
-}
-fn mi(name: &str, params_m: u64, vram: u64, host: &str) -> ModelInfo {
-    ModelInfo { name: name.into(), tier: tier_for(params_m), size_bytes: params_m * 600_000,
-        size_vram: vram, params_m, host: host.into(), autohost: false, quant: "Q4_K_M".into() }
 }
 
 impl LogscopeApp {
@@ -281,14 +273,23 @@ impl LogscopeApp {
         self.scan_rx = Some(rx);
         self.scanning = true;
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(250));
-            let _ = tx.send(("http://localhost:11434".into(),
-                vec![mi("qwen2.5:7b", 7000, 512_000_000, "localhost:11434"),
-                     mi("llama3.1:8b", 8000, 0, "localhost:11434")]));
-            std::thread::sleep(Duration::from_millis(400));
-            let _ = tx.send(("http://192.168.1.42:11434".into(),
-                vec![mi("mixtral:8x7b", 47000, 0, "192.168.1.42:11434"),
-                     mi("qwen2.5:7b", 7000, 0, "192.168.1.42:11434")]));
+            // `scan_lan_parallel` deliberately excludes loopback (see its own doc comment) — LAN
+            // discovery and localhost are two different questions, so ask both.
+            if let Ok(reg) = logscope::providers::ProviderRegistry::open() {
+                let batch = logscope::providers::probe_host(&reg, "http://localhost:11434");
+                if !batch.is_empty() {
+                    let _ = tx.send(("http://localhost:11434".to_string(), batch));
+                }
+            }
+            // `scan_lan_parallel` takes a `crossbeam_channel::Sender` specifically (see providers.rs)
+            // — bridged into this thread's own std mpsc `tx` rather than changing scan_rx's type
+            // everywhere the app already polls it.
+            let (ctx, crx) = crossbeam_channel::unbounded();
+            logscope::providers::scan_lan_parallel(&ctx);
+            drop(ctx);
+            while let Ok(batch) = crx.recv() {
+                let _ = tx.send(batch);
+            }
         });
         self.scan_local();
     }
