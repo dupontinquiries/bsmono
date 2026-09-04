@@ -301,6 +301,29 @@ pub mod table_nlp;
 /// depends on table_ops, already above it, so `#[path]` costs nothing new.
 #[path = "../../src/notebook.rs"]
 pub mod notebook;
+/// Zellij voice/assisted control — PURE core (phrase → `zellij action`
+/// argv, zellij-session detection). Fully self-contained (no `use` of any
+/// other module in this crate), tested, and — like notebook.rs above —
+/// has never been re-exported here, so its 12 tests never ran as part of
+/// this crate and the module was unreachable from the egui binary.
+///
+/// NOT wired into the voice pipeline in this commit: `in_zellij_session`
+/// takes the env var as a plain parameter specifically so it stays pure,
+/// but the real question — whether zellij is running inside the PTY's
+/// child shell — isn't something this app's own process env can answer.
+/// A child process's environment doesn't propagate back to its parent;
+/// checking `std::env::var("ZELLIJ")` here would report whether the EGUI
+/// APP is in a zellij session, not whether the shell it's hosting is.
+/// That needs either a real detection mechanism (parsing shell output,
+/// a manual opt-in toggle — the TODO's own "OPTIONAL, opt-in" framing
+/// would fit that) or an accepted approximation, and shipping a
+/// confidently-labeled feature that's silently checking the wrong
+/// process's environment would be exactly the "looks wired, isn't"
+/// shape this session spent most of its time finding and fixing
+/// elsewhere. Filed as the reason to decide before wiring, not silently
+/// worked around.
+#[path = "../../src/zellij_voice.rs"]
+pub mod zellij_voice;
 /// Note clipping's data model + markdown serialization — see
 /// TODO_notes_clip.md. Pure and tested since v0.1.641; had no re-export
 /// and no caller in this frontend before now, same shape as notebook.rs
