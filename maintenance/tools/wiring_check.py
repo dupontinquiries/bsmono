@@ -112,7 +112,7 @@ def uncalled_renderers(src):
             except OSError: continue
     for q, txt in texts.items():
         prod = txt.split('#[cfg(test)]')[0]
-        for m in re.finditer(r'pub fn (\w+)\s*(?:<[^>]*>)?\s*\([^)]*&mut\s+(?:egui::)?Ui', prod):
+        for m in re.finditer(r'pub fn (\w+)\s*(?:<[^>]*>)?\s*\(\s*(?:&(?:mut\s+)?self\s*,\s*)?(?:mut\s+)?\w+\s*:\s*&mut\s+(?:egui::)?Ui\b', prod):
             # A function may DECLARE why it is uncalled, in the doc comment
             # directly above it. rusty-board's keyboard_ui_with_signal is the
             # case: an alternative to keyboard_ui for a caller that wants the
