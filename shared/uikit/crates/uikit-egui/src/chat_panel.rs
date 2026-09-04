@@ -138,57 +138,84 @@ impl ChatPanel {
             });
         }
 
-        // message list — role-aligned bubbles, newest at the bottom, auto-scrolled.
-        ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-            for m in &self.messages {
-                let (align, fill, text_col) = match m.role {
-                    Role::User => (Align::Max, Color32::from_rgb(46, 92, 158), Color32::WHITE),
-                    Role::Assistant => (Align::Min, ui.visuals().extreme_bg_color, ui.visuals().text_color()),
-                };
-                ui.with_layout(Layout::top_down(align), |ui| {
-                    egui::Frame::new()
-                        .fill(fill)
-                        .inner_margin(egui::Margin::symmetric(10, 6))
-                        .corner_radius(10)
-                        .show(ui, |ui| {
-                            ui.set_max_width(ui.available_width() * 0.78);
-                            ui.label(RichText::new(&m.content).color(text_col));
-                        });
-                });
-                ui.add_space(4.0);
-            }
-            if self.busy {
-                ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                    ui.label(RichText::new("…").weak());
-                });
-            }
-        });
-
-        // input row — Enter or the button sends (disabled while busy).
-        ui.separator();
-        ui.horizontal(|ui| {
-            // provider picker — press-drag the badge to open a grid of providers.
-            let badge = ui.button(RichText::new(format!("◆ {}", self.provider)).small());
-            let providers = [
-                SlideOption::new("llama", "llama"),
-                SlideOption::new("gpt", "gpt"),
-                SlideOption::new("claude", "claude"),
-            ];
-            if let SlideOutcome::Selected(id, _) = self.provider_menu.show(ui, &badge, &providers) {
-                self.provider = id;
-            }
-            let enter =
-                ui.add(egui::TextEdit::singleline(&mut self.input).id_salt("chat_panel-self_input").desired_width(f32::INFINITY).hint_text("Message…"))
-                    .lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let clicked = ui.add_enabled(!self.busy, egui::Button::new("Send")).clicked();
-            if (enter || clicked) && !self.busy {
-                let t = self.input.trim().to_string();
-                if !t.is_empty() {
-                    sent = Some(t);
-                    self.input.clear();
+        // MESSAGE AREA (fills the remaining space) AND THE FOOTER BELOW IT,
+        // in a bottom-up sub-layout. `ScrollArea::auto_shrink([false, false])`
+        // claims "available height" in whatever it's given — and in a normal
+        // top-down flow, added before the footer, "available" means the
+        // WHOLE remaining pane, since egui has no way to know a fixed-height
+        // footer is coming after it. The footer (separator + input row) then
+        // got zero room and never rendered at all, which a real-frame test
+        // confirmed: the input `TextEdit` never even registered a response
+        // in an empty chat, at any window size — there was no way to send
+        // the first message, ever.
+        //
+        // Bottom-up fixes it structurally rather than with a guessed pixel
+        // reservation: widgets added first land at the BOTTOM, so adding the
+        // input row and its separator first claims their natural (small,
+        // fixed) height there, and the scroll area — added last in THIS
+        // sub-layout, so it fills whatever is left above them — never sees
+        // less room than it should.
+        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+            // input row — Enter or the button sends (disabled while busy).
+            ui.horizontal(|ui| {
+                // provider picker — press-drag the badge to open a grid of providers.
+                let badge = ui.button(RichText::new(format!("◆ {}", self.provider)).small());
+                let providers = [
+                    SlideOption::new("llama", "llama"),
+                    SlideOption::new("gpt", "gpt"),
+                    SlideOption::new("claude", "claude"),
+                ];
+                if let SlideOutcome::Selected(id, _) = self.provider_menu.show(ui, &badge, &providers) {
+                    self.provider = id;
                 }
-            }
+                let r_input = ui.add(egui::TextEdit::singleline(&mut self.input).id_salt("chat_panel-self_input").desired_width(f32::INFINITY).hint_text("Message…"));
+                // TEST SUPPORT ONLY: stash the rect in egui's own temp memory
+                // (auto-expiring, standard idiom — see the same pattern in
+                // voiceterm-egui's bars.rs) so a test can find it without
+                // replicating `id_salt`'s actual formula, `ui.id().with(salt)`
+                // — which depends on the surrounding ui nesting and isn't
+                // safely reproducible from outside. Nothing reads this key
+                // outside `#[cfg(test)]`.
+                ui.ctx().memory_mut(|m| m.data.insert_temp(
+                    egui::Id::new("chat_panel_input_rect_for_test"), r_input.rect));
+                let enter = r_input.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let clicked = ui.add_enabled(!self.busy, egui::Button::new("Send")).clicked();
+                if (enter || clicked) && !self.busy {
+                    let t = self.input.trim().to_string();
+                    if !t.is_empty() {
+                        sent = Some(t);
+                        self.input.clear();
+                    }
+                }
+            });
+            ui.separator();
+
+            // message list — role-aligned bubbles, newest at the bottom, auto-scrolled.
+            ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+                for m in &self.messages {
+                    let (align, fill, text_col) = match m.role {
+                        Role::User => (Align::Max, Color32::from_rgb(46, 92, 158), Color32::WHITE),
+                        Role::Assistant => (Align::Min, ui.visuals().extreme_bg_color, ui.visuals().text_color()),
+                    };
+                    ui.with_layout(Layout::top_down(align), |ui| {
+                        egui::Frame::new()
+                            .fill(fill)
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .corner_radius(10)
+                            .show(ui, |ui| {
+                                ui.set_max_width(ui.available_width() * 0.78);
+                                ui.label(RichText::new(&m.content).color(text_col));
+                            });
+                    });
+                    ui.add_space(4.0);
+                }
+                if self.busy {
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        ui.label(RichText::new("…").weak());
+                    });
+                }
+            });
         });
 
         (sent, action)
@@ -220,5 +247,58 @@ mod tests {
     fn llama_maps_to_assistant() {
         let msgs = parse_messages("M\u{1F}llama\u{1F}from the local model");
         assert_eq!(msgs[0].role, Role::Assistant);
+    }
+
+    /// Real-frame check for a bug found live, under Xvfb: a fresh (empty)
+    /// chat pane showed the header, "Ask the local model anything…", and
+    /// nothing else — no input row, no Send button, at ANY window height,
+    /// and scrolling revealed nothing further. "The wire-format parsing is
+    /// pure and unit-tested; only the rendering needs egui" (this file's
+    /// own header) turned out to be exactly the gap: nothing had ever
+    /// driven `ui_with` through a real frame to check what it actually
+    /// draws when the message list is empty.
+    ///
+    /// Bounded to a small rect on purpose, the same way the bar_ui tests
+    /// in voiceterm-egui are: `ScrollArea::auto_shrink([false, false])`
+    /// greedily claims "available height" in whatever container it's
+    /// given, and the input row is added AFTER it in the code — so if the
+    /// container is generous (as a real window usually is), the scroll
+    /// area can claim all of it before the footer ever gets a turn.
+    #[test]
+    fn the_input_row_is_reachable_in_an_empty_chat() {
+        let mut panel = ChatPanel::default();
+        let ctx = egui::Context::default();
+        // 320px, not a razor-thin 300: this is checking "does the footer
+        // get its natural size at all", not pixel-perfect spacing budgets —
+        // the original bug failed this by never rendering the row at all,
+        // not by missing a tight bound by a pixel of frame margin.
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 320.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(raw, |ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 320.0));
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                let _ = panel.ui_with(ui);
+            });
+        });
+        // Queried AFTER the frame ends, not from inside the closure — egui's
+        // temp memory (like Context::read_response) is finalised at end-of-pass.
+        let input_rect: Option<egui::Rect> = ctx.memory(|m|
+            m.data.get_temp(egui::Id::new("chat_panel_input_rect_for_test")));
+        assert!(input_rect.is_some(),
+            "the message TextEdit never got a response at all — id_salt \
+             mismatch or it was never reached during layout");
+        let r = input_rect.unwrap();
+        // A SMALL tolerance, not exact containment: this is checking "did
+        // the footer get a real, sane position" — the original bug failed
+        // the `is_some()` check above outright, with no rect at all. A
+        // rect landing a pixel past a hand-picked round-number bound is
+        // ordinary frame-margin rounding, not the defect being tested for.
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 320.0)).expand(4.0);
+        assert!(bounds.contains_rect(r),
+            "the input row rendered well outside the pane's own bounds: {r:?} vs {bounds:?} \
+             — the empty-state ScrollArea most likely claimed the whole height \
+             before the input row got a turn");
     }
 }
