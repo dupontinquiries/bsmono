@@ -324,6 +324,36 @@ pub mod notebook;
 /// worked around.
 #[path = "../../src/zellij_voice.rs"]
 pub mod zellij_voice;
+/// Zettelkasten `[[wiki-link]]` resolution — PURE core (index a set of
+/// note paths by basename, classify + resolve each `[[...]]` token in a
+/// body against that index, rewrite a whole markdown document). 19
+/// tests, self-contained (only `std::collections::HashMap`), never
+/// re-exported here — same shape as notebook.rs and zellij_voice.rs
+/// above.
+///
+/// Backlinks are UNAFFECTED by any of this: `src/backlinks.rs` (already
+/// wired, via `backlinks_view.rs`) does its OWN `[[...]]` extraction
+/// internally to build the "what links here" index — a note that types
+/// `[[Other Note]]` already shows up in Other Note's backlinks today,
+/// with zero help from this module. What zbrackets uniquely adds is
+/// RENDERING: turning `[[Other Note]]` into an actual clickable link
+/// instead of literal bracket text, when a note's body is displayed.
+///
+/// NOT wired into `cards_view::deck_ui`'s body rendering in this commit.
+/// That needs care this pass didn't have room for: `deck_ui` renders
+/// preview bodies for every card in the list (not just the selected
+/// one) via a single `ui.label(RichText::new(body)...)` call per card,
+/// and making `[[...]]` clickable there means restructuring that into a
+/// per-card scan-and-split render (the same technique this session's
+/// `inline_md()` used for the Docs pane's bold/code/link spans) PLUS
+/// deciding how a resolved target (a file path, per zbrackets' own
+/// model) maps back to one of THIS app's in-memory cards, which are
+/// keyed by title, not a real notes-directory path — `deck_ui` is a
+/// small, working, tested widget, and reshaping its rendering contract
+/// deserved more attention than this pass had left to give it correctly
+/// the first time.
+#[path = "../../src/zbrackets.rs"]
+pub mod zbrackets;
 /// Note clipping's data model + markdown serialization — see
 /// TODO_notes_clip.md. Pure and tested since v0.1.641; had no re-export
 /// and no caller in this frontend before now, same shape as notebook.rs
