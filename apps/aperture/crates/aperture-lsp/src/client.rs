@@ -34,6 +34,13 @@ pub struct CompletionItem {
     pub detail: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Location {
+    pub uri: String,
+    pub line: u32,
+    pub character: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiagnosticSeverity {
     Error,
@@ -206,6 +213,22 @@ impl LspClient {
         self.diagnostics.lock().unwrap().get(uri).cloned().unwrap_or_default()
     }
 
+    /// `textDocument/definition` at `(line, character)`. Returns every
+    /// location the server names — usually one, but a trait method's
+    /// definition can legitimately resolve to several implementations, and
+    /// collapsing to "just the first" would silently pick one arbitrarily
+    /// on a caller's behalf.
+    pub fn goto_definition(&self, uri: &str, line: u32, character: u32) -> std::io::Result<Vec<Location>> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        });
+        let result = self
+            .request("textDocument/definition", params)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("goto_definition failed: {e}")))?;
+        Ok(parse_definition_result(&result))
+    }
+
     fn notify(&self, method: &str, params: Value) -> std::io::Result<()> {
         let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         write_message(&mut *self.stdin.lock().unwrap(), &msg)
@@ -327,6 +350,55 @@ fn parse_diagnostics(params: &Value) -> Vec<Diagnostic> {
         .collect()
 }
 
+/// `textDocument/definition` replies as `null` (nothing found), a single
+/// `Location`, an array of `Location`, or — for a server advertising
+/// `definitionLinkSupport` (not a capability this client declares, but
+/// nothing stops a server from sending it anyway) — an array of
+/// `LocationLink`, which names the target differently (`targetUri`/
+/// `targetSelectionRange` instead of `uri`/`range`). Handling only the
+/// shape this client expects and silently returning nothing against a
+/// server that chose another is exactly the bug `parse_completion_result`'s
+/// own doc warns about, for the same reason, one call away.
+fn parse_definition_result(result: &Value) -> Vec<Location> {
+    if result.is_null() {
+        return Vec::new();
+    }
+    let items: Vec<&Value> = if let Some(arr) = result.as_array() {
+        arr.iter().collect()
+    } else {
+        vec![result]
+    };
+    items.iter().filter_map(|it| parse_one_location(it)).collect()
+}
+
+fn parse_one_location(v: &Value) -> Option<Location> {
+    // Plain Location: {uri, range: {start: {line, character}, ...}}.
+    if let (Some(uri), Some(range)) = (v.get("uri").and_then(Value::as_str), v.get("range")) {
+        let start = range.get("start")?;
+        return Some(Location {
+            uri: uri.to_string(),
+            line: start.get("line")?.as_u64()? as u32,
+            character: start.get("character")?.as_u64()? as u32,
+        });
+    }
+    // LocationLink: {targetUri, targetSelectionRange: {start: {...}, ...}}.
+    // targetSelectionRange (the identifier itself) is preferred over
+    // targetRange (the whole enclosing item, e.g. a function's full body)
+    // when both are present — a caller jumping "to the definition" wants
+    // the caret on the name, not the top of a possibly long block.
+    if let Some(uri) = v.get("targetUri").and_then(Value::as_str) {
+        let range = v.get("targetSelectionRange").or_else(|| v.get("targetRange"))?;
+        let start = range.get("start")?;
+        return Some(Location {
+            uri: uri.to_string(),
+            line: start.get("line")?.as_u64()? as u32,
+            character: start.get("character")?.as_u64()? as u32,
+        });
+    }
+    None
+}
+
+
 /// `textDocument/completion` replies as either `CompletionItem[]` or a
 /// `CompletionList { items: CompletionItem[] }` — both legal per the spec,
 /// and a client that only handles one shape will silently see zero results
@@ -357,6 +429,66 @@ fn parse_completion_result(result: &Value) -> Vec<CompletionItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn definition_parses_a_single_plain_location() {
+        let v = json!({ "uri": "file:///a.rs", "range": { "start": { "line": 3, "character": 5 }, "end": { "line": 3, "character": 10 } } });
+        assert_eq!(parse_definition_result(&v), vec![Location { uri: "file:///a.rs".into(), line: 3, character: 5 }]);
+    }
+
+    #[test]
+    fn definition_parses_an_array_of_locations() {
+        let v = json!([
+            { "uri": "file:///a.rs", "range": { "start": { "line": 1, "character": 0 } } },
+            { "uri": "file:///b.rs", "range": { "start": { "line": 2, "character": 4 } } },
+        ]);
+        assert_eq!(parse_definition_result(&v), vec![
+            Location { uri: "file:///a.rs".into(), line: 1, character: 0 },
+            Location { uri: "file:///b.rs".into(), line: 2, character: 4 },
+        ]);
+    }
+
+    #[test]
+    fn definition_null_result_is_empty_not_an_error() {
+        // No definition found is a valid, common answer (e.g. the caret
+        // isn't on anything definable) — not a malformed response.
+        assert_eq!(parse_definition_result(&Value::Null), Vec::<Location>::new());
+    }
+
+    #[test]
+    fn definition_parses_location_link_shape_preferring_target_selection_range() {
+        // A server advertising definitionLinkSupport (not a capability this
+        // client declares, but nothing on the wire enforces that) may still
+        // send LocationLink instead of plain Location.
+        let v = json!([{
+            "targetUri": "file:///a.rs",
+            "targetRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 1 } },
+            "targetSelectionRange": { "start": { "line": 2, "character": 7 }, "end": { "line": 2, "character": 12 } },
+        }]);
+        assert_eq!(
+            parse_definition_result(&v),
+            vec![Location { uri: "file:///a.rs".into(), line: 2, character: 7 }],
+            "should land on the identifier (targetSelectionRange), not the whole item (targetRange)"
+        );
+    }
+
+    #[test]
+    fn definition_falls_back_to_target_range_when_selection_range_is_absent() {
+        let v = json!([{
+            "targetUri": "file:///a.rs",
+            "targetRange": { "start": { "line": 4, "character": 2 } },
+        }]);
+        assert_eq!(parse_definition_result(&v), vec![Location { uri: "file:///a.rs".into(), line: 4, character: 2 }]);
+    }
+
+    #[test]
+    fn definition_skips_a_malformed_entry_rather_than_losing_the_whole_batch() {
+        let v = json!([
+            { "uri": "file:///a.rs" }, // missing range entirely
+            { "uri": "file:///b.rs", "range": { "start": { "line": 9, "character": 1 } } },
+        ]);
+        assert_eq!(parse_definition_result(&v), vec![Location { uri: "file:///b.rs".into(), line: 9, character: 1 }]);
+    }
 
     #[test]
     fn parses_a_bare_array_response() {

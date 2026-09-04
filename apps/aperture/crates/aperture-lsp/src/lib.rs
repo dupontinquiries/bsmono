@@ -42,4 +42,4 @@
 pub mod client;
 pub mod rpc;
 
-pub use client::{CompletionItem, Diagnostic, DiagnosticSeverity, LspClient};
+pub use client::{CompletionItem, Diagnostic, DiagnosticSeverity, Location, LspClient};

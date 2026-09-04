@@ -219,3 +219,39 @@ fn a_real_type_error_produces_a_real_diagnostic() {
     client.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn goto_definition_finds_a_locally_defined_function_through_a_real_rust_analyzer() {
+    if !rust_analyzer_available() {
+        eprintln!("SKIPPED: rust-analyzer not on PATH");
+        return;
+    }
+    let dir = scratch_package("gotodef");
+    let main_rs = dir.join("src/main.rs");
+    // The call site is on line 2 (0-indexed); the definition is line 0.
+    let source = "fn compute_total() -> i32 { 42 }\n\nfn main() {\n    let x = compute_total();\n    let _ = x;\n}\n";
+    std::fs::write(&main_rs, source).unwrap();
+    let uri = format!("file://{}", main_rs.display());
+    let root_uri = format!("file://{}", dir.display());
+
+    let client = aperture_lsp::LspClient::spawn("rust-analyzer", &[], &root_uri)
+        .expect("spawn rust-analyzer");
+    client.did_open(&uri, "rust", source, 1).expect("didOpen");
+
+    // Caret inside "compute_total(" on the call site, line 3, somewhere
+    // within the identifier (character 14, inside "compute_total").
+    let mut locations = Vec::new();
+    for attempt in 0..20 {
+        locations = client.goto_definition(&uri, 3, 14).unwrap_or_default();
+        if !locations.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500 * (attempt + 1).min(4)));
+    }
+    assert!(!locations.is_empty(), "expected at least one definition location for compute_total");
+    assert_eq!(locations[0].uri, uri, "the definition is in the same file");
+    assert_eq!(locations[0].line, 0, "compute_total is defined on line 0");
+
+    client.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
