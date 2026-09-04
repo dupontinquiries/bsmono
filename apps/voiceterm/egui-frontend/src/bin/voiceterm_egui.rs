@@ -2411,6 +2411,23 @@ impl eframe::App for VoicetermApp {
                                 let u = self.browser.url.clone();
                                 self.browser.load(&u);
                             }
+                            // THE STAR. `Browser::is_bookmarked`/`toggle_bookmark`
+                            // existed with a doc comment saying "drives the
+                            // star's filled state" and no star anywhere — the
+                            // sitemap, the walk player, the connections graph
+                            // and the archived-page browser all read
+                            // `bookmarks.all()` as though pages get saved, and
+                            // nothing in this pane ever called `save`. Disabled
+                            // on an empty URL: starring nothing is not a
+                            // command, it is a blank bookmark waiting to
+                            // confuse the sitemap that reads this list.
+                            let can_star = !self.browser.url.trim().is_empty();
+                            let starred = self.browser.is_bookmarked();
+                            let glyph = if starred { "\u{2605}" } else { "\u{2606}" }; // ★ / ☆
+                            if ui.add_enabled(can_star, egui::Button::new(glyph)).clicked() {
+                                let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
+                                self.browser.toggle_bookmark(now_ms);
+                            }
                         });
                         // THE SITEMAP, under the URL bar. `explore` holds the
                         // views over voiceterm's browsing cores and had no
@@ -3897,6 +3914,33 @@ impl eframe::App for VoicetermApp {
                         }
                         // Open/Read/NewTab drive the web pane / reader — on-device wiring, same
                         // status as the workspace actions above.
+                        //
+                        // Traced further this session: it is not just this
+                        // match arm. `WsCall::OpenWebPane` (shell.rs) already
+                        // creates the pane via `TermPanes::split_web` — but
+                        // with an EMPTY url, on the documented assumption
+                        // that "the reader fills it in". No public method
+                        // exists to do that: `Workspace::model()` is
+                        // read-only, and there's no `set_pane_web_url(id,
+                        // url)` wrapper over `TermPanes::set_pane_kind`.
+                        //
+                        // Deeper than that: even with such a setter, `self.
+                        // browser: Browser` (this struct) is ONE shared
+                        // field, not keyed by pane id. `PaneKind::Web{url}`
+                        // is per-pane in the tiling model already, but the
+                        // Web view above renders `self.browser` regardless
+                        // of which pane asked for it — so two web panes open
+                        // at once would show the same page in both. Wiring
+                        // this arm needs that design decision made first
+                        // (a HashMap<u64, Browser>, most likely) before the
+                        // dispatch itself is the easy part: find the new
+                        // pane via `active_pane_ids().max()` (the newest-id
+                        // convention `close_newest_web_pane` already uses),
+                        // set its url, seed that pane's `Browser` entry, and
+                        // call `.load()`. Not done here — no network access
+                        // in this sandbox to verify a real page fetch even
+                        // once the plumbing exists, and the per-pane-state
+                        // refactor is its own decision, not a slot-in fix.
                         Some(LinkAction::Open(_)) | Some(LinkAction::Read(_)) | Some(LinkAction::NewTab(_)) => {}
                         None => {}
                     }
