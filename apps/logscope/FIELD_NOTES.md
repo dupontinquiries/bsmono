@@ -677,6 +677,33 @@ writes to an actual temp directory and reads the bytes back to confirm the polic
 failure rather than reading as success the way the old placeholder always did. Full
 logscope-egui --features gui suite: 1330/1330 (1325 + 5 new), 0 regressions.
 
+**Third mockup found, NOT fixed — `tabs/bloc.rs` (11.9x shrink, `ui/bloc_tab.rs` 966 -> `bloc.rs`
+81).** Same shape as the other two: `blocs: Vec<BlocItem>` was four hardcoded fake entries
+("prefetch_ahead", "logrotate.tmpl" — names that read as real content but were never backed by
+anything), and selecting a row updated `self.sel` and did nothing else — the editor never loaded
+the selected bloc's text. `logscope::bloc_engine::builtin_templates()` looked like the same class
+of fix as `modify.rs`/`rotate.rs`: a real, pure, 32-entry template library with zero GTK
+dependency, sitting unused.
+
+**Wired it, then reverted.** `bloc_engine` is `#[cfg(feature = "bloc")]` in `logscope`, and that
+feature is `tree-sitter` + three language grammars (`Cargo.toml`: `bloc = ["dep:tree-sitter",
+"dep:tree-sitter-rust", "dep:tree-sitter-python", "dep:tree-sitter-javascript"]`).
+`logscope-egui` depends on `logscope` with `default-features = false` specifically — the default
+feature set exists to keep the GTK app's exact behavior, and egui opting out of it is a choice
+already made, not an omission. `builtin_templates()` itself needs none of tree-sitter; it is
+plain static string data sharing a file with code that does. Enabling the whole `bloc` feature to
+reach 32 template strings would add real native-code compilation (tree-sitter parser generation)
+to every egui build, on a project whose own stack targets mobile ARM devices where build time and
+binary size are explicitly stated priorities — not something to decide unilaterally by wiring one
+tab. Reverted `bloc.rs` to its prior state (confirmed `cargo check -p logscope-egui --features gui`
+clean afterward) rather than ship that tradeoff without it being someone's actual decision.
+
+**What would actually fix this, for whoever decides the tradeoff is worth it**: split
+`builtin_templates`/`TemplateBlocDef`/`PLACEHOLDER` out of the tree-sitter-gated part of
+`bloc_engine.rs` (they don't need the feature; nothing about them requires it) into an ungated
+location, or their own tiny always-on module. That is a shared-crate module-boundary change, not a
+per-tab port, and belongs with whoever owns `logscope::bloc_engine`'s API shape.
+
 **DeepSeek-style models — design note** (see outputs/DEEPSEEK_SUPPORT.md, analysis not implementation):
 "DeepSeek" splits into (1) the R1 *distills*, which are dense Llama/Qwen — the Llama ones (e.g.
 R1-Distill-Llama-8B) should run **today** on the llama path, and their `<think>` output already renders via
