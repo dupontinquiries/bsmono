@@ -766,6 +766,29 @@ answer:
 the ship-level travel state machine (`ship.rs`, 15 tests) — board, plot a
 course, cruise, descend, arrive.
 
+**UPDATE (c15unified session) — "tested" does not mean "wired," and this
+one wasn't, more completely than this note implied.** Went looking at
+`ship.rs::Hull.transforms` after a dead-field compiler warning, expecting
+another quick single-call-site fix like the arena/destination/commander
+ones this session already found. It wasn't: `Hull::fold_sec()` and
+`Ship::launch()` (the methods that actually read `transforms`) are called
+ONLY from `#[cfg(test)]` code — confirmed by grep, both call sites are
+inside `ship.rs`'s own test module. `main.rs` doesn't reference
+`ship::Ship` at all, doesn't call `.launch()`, `.board()`, or anything else
+that would drive one through the state machine this section calls "done."
+The only `ship::` reference anywhere in `main.rs` is the bare enum variant
+`ship::Phase::Cruise`, passed as an argument to `deck::Deck::open` — and
+`main.rs` has its own comment admitting exactly this: "shell has no live
+`ship::Ship` yet." So the 15 tests are real and the state machine they
+cover is real, but "done" should read as "built and unit-tested in
+isolation, with zero integration into the live game" — a meaningfully
+different and smaller claim. Separately, `survival::Envelope`
+(`vacuum_ok`/`flare_tolerance`/`endurance_s` — real survival mechanics,
+not placeholders) is in the same boat: zero references from `main.rs`,
+likely part of the same unbuilt integration rather than a separate gap.
+Not attempting the integration itself — same reasoning as the section
+below: it's the "genuinely new feature" fork, not a bug fix.
+
 **Does not exist at all:** a player-piloted spaceship. Every instance of
 a ship moving through space in this codebase is either a scripted,
 deterministic flyover (`dropship.rs` — its own doc comment: "canned...
