@@ -455,8 +455,41 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
 
   `cargo test -p aperture-egui --lib`: 88/88, unaffected (the fix and the
   new tests are both `view.rs`/integration-test-only).
-- **LSP**: still genuinely open. Own crate, behind the same worker pattern
-  as the completion `Engine` — this one is real scope, not a stale note.
+- ~~**LSP**~~ **client crate DONE and verified against a real server; not
+  wired into the shell.** New `crates/aperture-lsp`: `rpc.rs` (Content-Length
+  JSON-RPC framing, tested against adversarial byte streams — truncated
+  body, missing header, stray extra header, back-to-back messages — not
+  just its own writer's round-trip), `client.rs` (spawn a server, the
+  `initialize` handshake, `did_open`/`did_change`/`completion`).
+
+  Deliberately BLOCKING per request, not `aperture_complete::engine::
+  Engine`'s worker/inbox/outbox shape — building that concurrency story
+  before this crate had ever been driven against a real server would mean
+  guessing which calls are slow instead of finding out. The seam for an
+  `Engine`-style wrapper is this client's own public methods.
+
+  The real proof, not just unit tests of parsing logic:
+  `tests/rust_analyzer_smoke.rs` downloads and spawns an ACTUAL
+  `rust-analyzer` (no apt package for it in this sandbox; a GitHub release
+  binary) against a real minimal cargo package on disk. Three tests:
+  completing a locally-defined function (the whole handshake → didOpen →
+  completion round trip), a blank-line edge position, and `did_change`
+  actually taking effect (writes a v2 file, sends `didChange`, completes a
+  function that only exists in v2 — would fail if `didChange` were a
+  no-op). Skips rather than fails when `rust-analyzer` isn't on `PATH`.
+  `cargo test -p aperture-lsp`: 17/17 (14 unit + 3 real-server), ~2s,
+  reproducible across repeat runs, no lingering server process after
+  `shutdown()`.
+
+  Not done, named explicitly: diagnostics (`publishDiagnostics` — a
+  server-initiated notification the reader thread currently drops
+  on the floor), go-to-definition, hover, incremental sync (`did_change`
+  always sends the whole document), and — the big one — no wiring into
+  `aperture-egui` at all. This crate is usable and tested standalone;
+  nothing in the shell calls it yet. `workspace_symbols`'s local
+  tree-sitter outline and `route`'s keyword-scored candidates stay the
+  fast, dependency-free default tiers; LSP is meant to layer in as an
+  ADDITIONAL, optional tier alongside them, not replace either.
 - **Voice commands — the text-side half, DONE; the audio half deliberately
   not attempted.** aperture has no microphone, no ASR, no wake-word
   detector, and building one from scratch would duplicate `shared/
