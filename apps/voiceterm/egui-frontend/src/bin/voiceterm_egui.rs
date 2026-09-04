@@ -3657,9 +3657,35 @@ impl eframe::App for VoicetermApp {
                                     }
                                     Structured::Table(t) => {
                                         ui.colored_label(c.text_weak, format!(
-                                            "\u{25A4} table detected — {} rows \u{d7} {} cols",
+                                            "\u{25A4} table — {} rows \u{d7} {} cols",
                                             t.rows.len(), t.headers.len()));
-                                        ui.label(egui::RichText::new(&b.output).monospace().weak());
+                                        // Step 2 of TODO_notebook_view.md's own
+                                        // sequencing, done narrowly: an aligned
+                                        // read-only grid over TableData's own
+                                        // fields, not raw monospace text dumped
+                                        // as-is. Deliberately NOT the full
+                                        // interactive `table_view_ui` the Table
+                                        // pane uses — that needs a per-instance
+                                        // `TableView` for its sort/filter state,
+                                        // and giving each notebook cell its own
+                                        // persistent state (a HashMap keyed by
+                                        // block id) is real, separate work; a
+                                        // sort button that resets every frame
+                                        // would be worse than no button. This
+                                        // view stays what it's named: read-only.
+                                        egui::Grid::new(("notebook_table", b.id))
+                                            .striped(true).show(ui, |ui| {
+                                            for h in &t.headers {
+                                                ui.label(egui::RichText::new(h).strong().small());
+                                            }
+                                            ui.end_row();
+                                            for row in &t.rows {
+                                                for cell in row {
+                                                    ui.label(egui::RichText::new(cell).small());
+                                                }
+                                                ui.end_row();
+                                            }
+                                        });
                                     }
                                     Structured::Map(pairs) => {
                                         ui.colored_label(c.text_weak,
