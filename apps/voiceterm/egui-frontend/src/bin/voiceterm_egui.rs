@@ -607,6 +607,16 @@ struct VoicetermApp {
     mail_from_disk: Vec<voiceterm_egui::mail_view::Message>,
     /// Where that came from, for the status line and the rescan button.
     mail_store_path: Option<std::path::PathBuf>,
+    /// Body text, keyed by message id, for the lazy-fetch a reader does on
+    /// open — kept apart per source for the same reason `mail_from_disk`/
+    /// `mail_messages` are: a rescan of one must not discard the other.
+    /// `self.mail.bodies` (the cache `message_ui` reads) starts every
+    /// message at `Body::NotLoaded`; these are what a message-open now
+    /// looks up to fill it in, rather than leaving it permanently empty —
+    /// see the commit this field was added in for what "permanently empty"
+    /// looked like before.
+    mail_bodies_disk: std::collections::HashMap<String, String>,
+    mail_bodies_terminal: std::collections::HashMap<String, String>,
     /// The open message id on the Mail view, if any.
     mail_open: Option<String>,
     /// The command audit chain: every submitted line hashed into a tamper-
@@ -1099,12 +1109,14 @@ impl VoicetermApp {
         match voiceterm_egui::mail_store::discover() {
             Some((path, _kind)) => {
                 self.mail_from_disk = voiceterm_egui::mail_store::load(&path);
+                self.mail_bodies_disk = voiceterm_egui::mail_store::load_bodies(&path);
                 self.mail_store_path = Some(path);
             }
             None => {
                 // Cleared, not left: a store that has gone away must not
                 // keep showing its last contents as though they were live.
                 self.mail_from_disk.clear();
+                self.mail_bodies_disk.clear();
                 self.mail_store_path = None;
             }
         }
@@ -1136,6 +1148,14 @@ impl VoicetermApp {
         }
         self.mail_scanned_blocks = blocks.len();
         let mut found = Vec::new();
+        // Keyed the SAME way `load_bodies` keys the disk side: per split
+        // part, with `messages_from_text`'s own `"{origin}#{i}"` fallback-id
+        // convention, not a bare per-block origin. A block whose output is
+        // itself mbox-shaped (piped through `cat` on an mbox file, say) can
+        // still contain more than one message with no Message-ID each —
+        // the same collision this session already caught and fixed on the
+        // disk side would reappear here with a bare origin.
+        let mut bodies = std::collections::HashMap::new();
         for b in blocks.iter() {
             // `duration_ms` is the kit's "this block has ended" — `finish`
             // is the only thing that sets it, and it is None while the
@@ -1148,9 +1168,15 @@ impl VoicetermApp {
             if !voiceterm_egui::blocks::looks_like_email(b.output.trim_start()) {
                 continue;
             }
-            found.extend(voiceterm_egui::mail_rfc822::messages_from_text(
-                &format!("block:{}", b.id), &b.output));
+            let origin = format!("block:{}", b.id);
+            found.extend(voiceterm_egui::mail_rfc822::messages_from_text(&origin, &b.output));
+            for (i, raw) in voiceterm_egui::mail_rfc822::split_mbox(&b.output).iter().enumerate() {
+                let part_origin = format!("{origin}#{i}");
+                let id = voiceterm_egui::mail_rfc822::message_from_text(&part_origin, raw).id;
+                bodies.insert(id, voiceterm_egui::mail_rfc822::body_from_text(raw));
+            }
         }
+        self.mail_bodies_terminal = bodies;
         // Rebuilt wholesale rather than appended to: a block's output can
         // still change after it closes (a late write), and appending would
         // leave the earlier parse of the same block beside the new one.
@@ -2594,6 +2620,25 @@ impl eframe::App for VoicetermApp {
                             }
                         }
                         if let Some(id) = self.mail_open.clone() {
+                            // THE LAZY FETCH ITSELF. `self.mail.bodies` is a
+                            // cache — `MailView`'s own doc calls it "fetched
+                            // lazily" — but nothing ever fetched into it, so
+                            // every message showed empty regardless of
+                            // source. Fetch once per id, from whichever
+                            // source map has it (disk first, matching
+                            // `mail_store::merge`'s own precedence), and
+                            // cache the result so re-opening the same
+                            // message doesn't redo the lookup every frame.
+                            if !self.mail.bodies.contains_key(&id) {
+                                let text = self.mail_bodies_disk.get(&id)
+                                    .or_else(|| self.mail_bodies_terminal.get(&id));
+                                let body = match text {
+                                    Some(t) => voiceterm_egui::mail_view::Body::Plain(t.clone()),
+                                    None => voiceterm_egui::mail_view::Body::Failed(
+                                        "no body found for this message".to_string()),
+                                };
+                                self.mail.bodies.insert(id.clone(), body);
+                            }
                             if let Some(m) = self.mail_all.iter().find(|m| m.id == id) {
                                 let body = self.mail.bodies.get(&id)
                                     .map(|b| b.text().to_string()).unwrap_or_default();
@@ -4716,6 +4761,8 @@ fn main() -> eframe::Result<()> {
                 mail_all: Vec::new(),
                 mail_scanned_blocks: 0,
                 mail_from_disk: Vec::new(),
+                mail_bodies_disk: std::collections::HashMap::new(),
+                mail_bodies_terminal: std::collections::HashMap::new(),
                 mail_store_path: None,
                 mail_open: None,
                 audit: Default::default(),
