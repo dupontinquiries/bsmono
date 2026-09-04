@@ -66,6 +66,22 @@ pub enum Tool {
     /// which small models drift on (line numbers, context hashes) — either applies exactly or fails
     /// with a teachable error (0 matches = stale anchor, >1 = grow the anchor).
     Edit { path: String, find: String, replace: String },
+    /// Write, compile, and CACHE a small standalone Rust tool the model itself authors.
+    ///
+    /// The ask this exists for: teaching the model shell tools (sed, rg, head, tail, git, tldr —
+    /// see `default_allow`) covers what already exists as a binary. It does not cover "I need a
+    /// one-off text transform none of those do" — today that means re-deriving the same helper
+    /// logic inline, in the model's own reasoning, every single call, because there is nowhere to
+    /// put a reusable answer. `Scratch` records an IDEA; this compiles one.
+    ///
+    /// `source` is a complete `fn main()` program, compiled with `rustc -O` to
+    /// `.logscope/tools/<slug>/<slug>` and content-hashed: an identical `source` on a later call
+    /// is NOT recompiled, it reuses the cached binary — the "cached into a tool storage" half of
+    /// the ask, not just "the model can invoke rustc". A successful compile adds `<slug>` to this
+    /// workspace's OWN `Run` allowlist (not the global default — only a tool the model itself just
+    /// wrote and compiled becomes runnable, nothing reaches further), so the model then invokes it
+    /// through the existing `run` tool at the reported path — one new capability, not two.
+    MakeTool { name: String, source: String },
     /// A SIDE IDEA the model wants to keep without acting on it.
     ///
     /// Every other tool here changes or reads the workspace. This one changes
@@ -103,7 +119,7 @@ pub enum Tool {
 /// One list, and a test that fails if the enum grows a variant that is not in it.
 pub const RUNTIME_TOOLS: &[&str] = &[
     "write_file", "edit", "read_file", "read_range", "list_dir", "search", "run", "git_log", "doc",
-    "propose", "scratch_code",
+    "propose", "scratch_code", "make_tool",
 ];
 
 impl Tool {
@@ -122,6 +138,7 @@ impl Tool {
             Tool::Propose { .. } => "propose",
             Tool::Edit { .. } => "edit",
             Tool::Doc { .. } => "doc",
+            Tool::MakeTool { .. } => "make_tool",
         }
     }
 
@@ -139,6 +156,7 @@ impl Tool {
             Tool::ReadRange { path, start, end } => format!("read {path}:{start}-{end}"),
             Tool::Edit { path, find, replace } => format!("edit {} (−{} +{} B)", path, find.len(), replace.len()),
             Tool::Doc { name, content } => format!("doc {} ({} B, shared)", name, content.len()),
+            Tool::MakeTool { name, source } => format!("make_tool {name} ({} B)", source.len()),
         }
     }
 }
@@ -312,6 +330,7 @@ impl Workspace {
             Tool::ReadRange { path, start, end } => self.read_range(path, *start, *end),
             Tool::Edit { path, find, replace } => self.edit_file(path, find, replace),
             Tool::Doc { name, content } => self.write_doc(name, content),
+            Tool::MakeTool { name, source } => self.make_tool(name, source),
             Tool::Scratch { title, lang, body } => self.scratch(title, lang, body),
         }
     }
@@ -634,6 +653,72 @@ the task.", body.len(), if truncated { ", truncated" } else { "" }))
         match std::fs::write(&path, content) {
             Ok(()) => ToolResult::ok(format!("shared doc '{slug}' written ({} B) — every worker's next prompt includes it", content.len())),
             Err(e) => ToolResult::err(format!("doc write: {e}")),
+        }
+    }
+
+    /// Write, compile, and content-hash-cache a standalone Rust tool. See `Tool::MakeTool`'s doc
+    /// comment for the design; this is the mechanism.
+    fn make_tool(&mut self, name: &str, source: &str) -> ToolResult {
+        // Same slugging rule as write_doc, minus hyphens: this becomes a Rust binary filename AND
+        // an argv[0] basename checked against the allowlist, and a hyphenated basename is legal
+        // there but needlessly invites confusion with the CLI-flag-shaped names already on it
+        // (sed, rg, wc) — letters/digits/underscore only keeps it visually distinct as
+        // "something this workspace made", not "something that was already on the machine".
+        let slug: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+        let slug = slug.trim_matches('_').to_string();
+        if slug.is_empty() { return ToolResult::err("make_tool: name must contain letters/digits"); }
+        if source.trim().is_empty() { return ToolResult::err("make_tool: source is empty — nothing to compile"); }
+
+        let dir = self.root.join(".logscope").join("tools").join(&slug);
+        if let Err(e) = std::fs::create_dir_all(&dir) { return ToolResult::err(format!("make_tool mkdir: {e}")); }
+        let src_path = dir.join("main.rs");
+        let bin_path = dir.join(&slug);
+        let hash_path = dir.join(".hash");
+        let rel_bin = format!(".logscope/tools/{slug}/{slug}");
+
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            source.hash(&mut h);
+            format!("{:016x}", h.finish())
+        };
+
+        // CACHE HIT: identical source, binary still present. Skip rustc entirely — this is the
+        // "cached into a tool storage" half of the ask, not just "the model can shell out to
+        // rustc". Checked by content hash, not mtime: a workspace can be checked out fresh with
+        // an old mtime on a byte-identical file, and mtime would recompile for nothing.
+        if bin_path.is_file() && std::fs::read_to_string(&hash_path).ok().as_deref() == Some(hash.as_str()) {
+            self.allow.insert(slug.clone());
+            return ToolResult::ok(format!(
+                "make_tool '{slug}': unchanged, reusing the cached binary — no rebuild. Run it with \
+{{\"tool\":\"run\",\"argv\":[\"{rel_bin}\", ...]}}."));
+        }
+
+        if let Err(e) = std::fs::write(&src_path, source) {
+            return ToolResult::err(format!("make_tool: writing source: {e}"));
+        }
+        let compiled = std::process::Command::new("rustc")
+            .args(["-O", "--edition", "2021", "-o"]).arg(&bin_path).arg(&src_path)
+            .output();
+        match compiled {
+            Ok(o) if o.status.success() => {
+                let _ = std::fs::write(&hash_path, &hash);
+                self.allow.insert(slug.clone());
+                ToolResult::ok(format!(
+                    "make_tool '{slug}': compiled, cached at {rel_bin}. Run it with \
+{{\"tool\":\"run\",\"argv\":[\"{rel_bin}\", ...]}} — it stays cached across calls (this workspace's \
+run allowlist now includes '{slug}') until the source given to make_tool changes."))
+            }
+            Ok(o) => {
+                let mut se = String::from_utf8_lossy(&o.stderr).into_owned();
+                truncate(&mut se, self.max_output);
+                // No allowlist entry, no cache write: a failed compile must not look like a
+                // usable tool on the next call, and the stale hash file (if this is a retry)
+                // would otherwise make a DIFFERENT broken source read as "unchanged, cached".
+                let _ = std::fs::remove_file(&hash_path);
+                ToolResult::err(format!("make_tool '{slug}': rustc failed\n{se}"))
+            }
+            Err(e) => ToolResult::err(format!("make_tool: could not run rustc ({e}) — is it on PATH?")),
         }
     }
 
@@ -1795,6 +1880,7 @@ fn diagnose(block: &str) -> Rejected {
         // should still be able to record it — demanding a title is exactly the
         // friction that makes a side-channel go unused.
         "scratch_code" | "scratch" | "idea" => &["body"],
+        "make_tool" => &["name", "source"],
         _ => return Rejected::UnknownTool(tool),
     };
     for f in need {
@@ -1929,6 +2015,11 @@ fn parse_one(block: &str) -> Option<Tool> {
             lang: json_str(block, "lang").or_else(|| json_str(block, "language"))
                 .unwrap_or_else(|| "text".into()),
             body: json_str(block, "body").or_else(|| json_str(block, "content"))
+                .or_else(|| json_str(block, "code"))?,
+        }),
+        "make_tool" => Some(Tool::MakeTool {
+            name: json_str(block, "name")?,
+            source: json_str(block, "source").or_else(|| json_str(block, "content"))
                 .or_else(|| json_str(block, "code"))?,
         }),
         "run" => {
@@ -2328,6 +2419,7 @@ Every one still has to go inside a ```tool{nonce_attr} fence, JSON on the next l
 - propose     {{ \"tool\":\"propose\", \"path\":\"<rel path>\", \"content\":\"<a section of code>\" }}  (DRY RUN — writes nothing, see below)
 - doc         {{ \"tool\":\"doc\", \"name\":\"survey\", \"content\":\"<markdown>\" }}  (SHARED crew doc — every worker's next prompt includes it)
 - scratch_code {{ \"tool\":\"scratch_code\", \"title\":\"<short>\", \"lang\":\"rust\", \"body\":\"<sketch>\" }}  (a SIDE IDEA — changes nothing, see below)
+- make_tool    {{ \"tool\":\"make_tool\", \"name\":\"<slug>\", \"source\":\"<a complete fn main() Rust program>\" }}  (compiles + CACHES a reusable tool; run it after with the `run` tool at the path make_tool reports)
 
 Once more, because the argument lines above outnumber it eleven to one and the
 LAST form you read is the one you will copy. A complete call looks like this and
@@ -3807,6 +3899,42 @@ error: could not compile `demo` (lib) due to 3 previous errors
         // state question, not a question about whether the allowlist wiring works.
         let tldr = ws.apply(&Tool::Run { argv: vec!["tldr".into(), "--version".into()] });
         assert!(tldr.ok, "tldr must at least be launchable (not blocked): {}", tldr.output);
+    }
+
+    /// End-to-end, not just "the tool variant exists": a real program, compiled, then actually
+    /// INVOKED through the existing `run` tool (not a separate execution path) at the path
+    /// make_tool reports, and a genuine output check — not just exit-code-zero — to make sure the
+    /// compiled binary is the one that ran.
+    #[test]
+    fn make_tool_compiles_caches_and_is_runnable_via_run() {
+        let mut ws = Workspace::new(tmp("make_tool"));
+        let source = r#"fn main() { println!("logscope-tool-alive"); }"#;
+        let first = ws.apply(&Tool::MakeTool { name: "greeter".into(), source: source.into() });
+        assert!(first.ok, "{}", first.output);
+        assert!(first.output.contains("compiled"), "{}", first.output);
+
+        let ran = ws.apply(&Tool::Run {
+            argv: vec![".logscope/tools/greeter/greeter".into()],
+        });
+        assert!(ran.ok, "{}", ran.output);
+        assert!(ran.output.contains("logscope-tool-alive"),
+            "the compiled binary's actual output must come back: {}", ran.output);
+
+        // Second call, IDENTICAL source: must hit the cache, not invoke rustc again.
+        let second = ws.apply(&Tool::MakeTool { name: "greeter".into(), source: source.into() });
+        assert!(second.ok, "{}", second.output);
+        assert!(second.output.contains("unchanged"), "expected a cache hit: {}", second.output);
+    }
+
+    #[test]
+    fn make_tool_rejects_a_program_that_fails_to_compile() {
+        let mut ws = Workspace::new(tmp("make_tool_bad"));
+        let bad = ws.apply(&Tool::MakeTool { name: "broken".into(), source: "fn main( {".into() });
+        assert!(!bad.ok, "{}", bad.output);
+        assert!(bad.output.contains("rustc failed"), "{}", bad.output);
+        // A failed compile must not grant Run access to a name that has no working binary behind it.
+        let ran = ws.apply(&Tool::Run { argv: vec![".logscope/tools/broken/broken".into()] });
+        assert!(!ran.ok);
     }
 
     #[test]
@@ -5442,6 +5570,7 @@ mod long_horizon_tests {
             Tool::Doc { name: "d".into(), content: String::new() },
             Tool::Propose { path: "p".into(), content: "fn x() {}".into() },
             Tool::Scratch { title: "t".into(), lang: "rust".into(), body: "idea".into() },
+            Tool::MakeTool { name: "t".into(), source: "fn main() {}".into() },
         ];
         for t in &all {
             assert!(RUNTIME_TOOLS.contains(&t.wire_name()),
