@@ -140,3 +140,19 @@ which are structurally different (a real file vs. a block's captured
 output) — shipping a fetch that only works for one source would be
 the same "half-fixed, looks complete" shape as the bug this note
 follows.
+
+### RESOLVED, same session
+
+Took a variant of (2): rather than re-read on demand, added
+`mail_store::load_bodies`/`mail_rfc822::body_from_text` (additive, no
+existing signature touched) computed ALONGSIDE the existing scans
+(`rescan_mail_store`, `harvest_mail_from_blocks`) rather than on
+open — cheap enough (bodies are read once per scan either way, since
+`load` already reads full file text) that "on scan" vs "on open"
+wasn't worth the extra bookkeeping true laziness would need. Both
+sources wired identically, verified live with a real Maildir message.
+Caught and fixed one real bug in review before it shipped: the mbox
+branch's no-Message-ID fallback id has to match `messages_from_text`'s
+own `"{origin}#{i}"` per-part convention, not a bare shared origin, or
+two id-less messages in one file silently collide onto the same body.
+See the two commits following this note for the full detail.
