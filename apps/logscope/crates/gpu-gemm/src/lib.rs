@@ -10055,6 +10055,15 @@ pub struct Model {
     /// the count marks that a native MTP draft head is PRESENT — the prerequisite for wiring MTP speculative
     /// decode (a lossless speedup, like the n-gram draft) later. 0 = no MTP head.
     pub mtp_layers: usize,
+    /// `{arch}.architecture` (the GGUF's own arch string, e.g. "qwen3moe", "gemma3") and the gap
+    /// lines `archfeat::gap_report` produced for it at load time. Added so a `ModelStatus` can be
+    /// built after the fact — `gpu_kernels::Model` used to carry the arch's EFFECTS (rope_neox,
+    /// mla, dsa, ...) but not its NAME, so the gaps the loader already computes and prints to
+    /// stderr had no way back into the app: `docs/12-queen-and-workers.md`'s liaison audit found
+    /// this exact hole. `gaps` is the same lines already eprintln'd during load — not
+    /// recomputed, so it can never drift from what the operator's log actually said.
+    pub arch: String,
+    pub gaps: Vec<String>,
     /// Masked-DIFFUSION checkpoint (llada2/rnd1/dream/llada): trained to denoise, not to continue.
     /// AR-decoding one emits fluent noise BY DESIGN — callers (serve, the egui worker) must route
     /// generation through `diffuse_generate` when this is set, or refuse with that explanation.
@@ -10882,12 +10891,15 @@ that looks wrong.");
         // three rounds because partial support is indistinguishable from a quantization, streaming, or
         // conversion bug once the output is merely wrong rather than absent. The requirements come from
         // llama.cpp's per-architecture files; see archfeat.rs.
-        {
+        // Captured (not just eprintln'd) so `ModelStatus` can report the SAME lines the operator saw
+        // at load time later — the loader already computed this; the gap was never computing it,
+        // only that `Model` had nowhere to keep it. See the `arch`/`gaps` fields' doc comment.
+        let loaded_gaps: Vec<String> = {
             let variant = g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0);
-            for line in crate::archfeat::gap_report(&g.arch(), variant) {
-                eprintln!("wgpu-engine: ⚠ {line}");
-            }
-        }
+            let lines = crate::archfeat::gap_report(&g.arch(), variant);
+            for line in &lines { eprintln!("wgpu-engine: ⚠ {line}"); }
+            lines
+        };
         // RoPE pairing style is per-FAMILY: llama rotates adjacent pairs (NORM); qwen/gemma/phi rotate
         // split halves (NEOX). Angles are identical — only the pairing differs — so the wrong style yields
         // real-word, positionally-scrambled output (the dense-Qwen salad). Set from the arch registry.
@@ -12988,7 +13000,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
             if n_sh > 0 { eprintln!("loader: shared expert ACTIVE on {n_sh} layer(s) — the always-on contribution is present (a grafted file proves its repair here)"); }
         }
 
-        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale, attn_scale, logit_softcap, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, rope_neox: !acfg.rope_interleaved, rope_dims: rot, rope_mscale: mscale, trained_ctx, planned_weight_bytes, mla, dsa, mtp_layers: mtp, diffusion, mask_token_id, shift_logits })
+        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale, attn_scale, logit_softcap, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, rope_neox: !acfg.rope_interleaved, rope_dims: rot, rope_mscale: mscale, trained_ctx, planned_weight_bytes, mla, dsa, mtp_layers: mtp, arch: arch.clone(), gaps: loaded_gaps, diffusion, mask_token_id, shift_logits })
     }
 
     // ── int8-resident weight cache ───────────────────────────────────────────────────────────
@@ -13120,7 +13132,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
-        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale: 1.0, attn_scale: None, logit_softcap: None, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, rope_neox: false, rope_dims: d / n_heads.max(1), rope_mscale: 1.0, trained_ctx, planned_weight_bytes: 0, mla: None, dsa: None, mtp_layers: 0, diffusion: false, mask_token_id: None, shift_logits: false })
+        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale: 1.0, attn_scale: None, logit_softcap: None, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, rope_neox: false, rope_dims: d / n_heads.max(1), rope_mscale: 1.0, trained_ctx, planned_weight_bytes: 0, mla: None, dsa: None, mtp_layers: 0, arch: String::new(), gaps: Vec::new(), diffusion: false, mask_token_id: None, shift_logits: false })
     }
     fn read_tensor(&self, r: &mut Rd) -> Option<Tensor> {
         let (rows, cols) = (r.u32()? as usize, r.u32()? as usize);
