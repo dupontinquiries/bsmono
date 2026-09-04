@@ -86,6 +86,26 @@ for what was tried), so the actual port work above is still unverifiable
 here, but "the C engine's own build" is no longer a wall between this repo
 and testing it — just this sandbox's lack of a real display.
 
+**Cross-validated independently, same session:** this repo has a SECOND,
+better-maintained build (`CMakeLists.txt` + `CMakeFiles`, root of
+`games/blackstar`) that already listed all 60 files correctly except
+`test_transport.c` (properly excluded — own `main()`) and gates
+`vk_backend.c` behind an opt-in `USE_VULKAN` option with vendored Khronos
+headers (off by default) — exactly matching this session's own reasoning for
+excluding it from the Makefile fix, arrived at independently. Built it
+(`cmake .. && make`): succeeds, and its `ctest` suite is 67/69 real C unit
+tests passing (`test_transform`, `test_combat`, `test_vehicle`,
+`test_turret`, and dozens more — genuine engine-level coverage this session
+didn't know existed until running it). The 2 failures
+(`content_validate`, `model_tuning`) are the same already-documented cause
+as everywhere else this session — this bundle keeps 21 example models plus
+voxel representatives where the full ~1,012-model corpus used to be, so
+both fail on missing `.iqm`/model data files, not engine logic. Also notable:
+a purpose-built `lint_dead_fields`/`lint_dead_fields_rs` tool already exists
+in this repo (`tools/lint_dead_fields.py`, `rust/contentlint`) for exactly
+the failure pattern this session hunted manually on the Rust side all day —
+both pass clean on current content.
+
 ## What to remove, and what not to
 
 The empty `g_tmodels` path is already inert — `tmodel_for()` returns null, so
