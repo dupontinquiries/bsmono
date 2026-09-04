@@ -66,8 +66,15 @@ pub fn compile(code: &str, cmd: &str, file: Option<&str>) -> Verdict {
                else { format!("{cmd} {p}") };
     let verdict = match Command::new("sh").arg("-c").arg(&full).output() {
         Ok(o) if o.status.success() => Verdict::Pass,
+        // Exit 127 is `sh`'s "command not found" — the checker binary itself is missing, not a
+        // real compile failure. `sh -c` spawns fine either way, so this can't be caught by the
+        // Err arm below; it has to be read off the exit code. A device with no rustc in PATH
+        // (this project's actual mobile targets don't ship one) would otherwise grade every
+        // snippet Fail and silently poison :best ranking / :fill keep-green with a signal that
+        // was never measuring the code at all.
+        Ok(o) if o.status.code() == Some(127) => Verdict::None,
         Ok(_) => Verdict::Fail,
-        Err(_) => Verdict::None, // no toolchain / couldn't spawn — don't fake a verdict
+        Err(_) => Verdict::None, // couldn't spawn `sh` itself — don't fake a verdict
     };
     if file.is_none() { let _ = std::fs::remove_file(&path); }
     verdict
@@ -98,6 +105,18 @@ mod tests {
         assert_eq!(compile("pub fn add(a:i32,b:i32)->i32{a+b}", DEFAULT_CHECK, None), Verdict::Pass);
         assert_eq!(compile("pub fn add(a:i32,b:i32)->i32{a+}", DEFAULT_CHECK, None), Verdict::Fail);
         assert_eq!(compile("   ", DEFAULT_CHECK, None), Verdict::None, "empty code is not graded");
+    }
+
+    /// C14_TODO §21: on a device with no rustc in PATH, `sh -c "rustc …"` still spawns —
+    /// it's `sh` that runs, and `sh` exits 127 ("command not found"). That used to fall into the
+    /// same match arm as a genuine compile failure, so a fleet device without a Rust toolchain
+    /// graded every real-code reply Fail instead of skipping the check. Uses a checker command
+    /// that can't possibly exist rather than trying to actually uninstall rustc for the test.
+    #[test]
+    fn a_missing_checker_binary_is_none_not_fail() {
+        let bogus = "logscope_verdict_test_binary_that_does_not_exist_anywhere --emit=metadata -o /dev/null";
+        assert_eq!(compile("pub fn add(a:i32,b:i32)->i32{a+b}", bogus, None), Verdict::None,
+            "a missing checker must not be graded as a compile failure");
     }
 }
 
