@@ -379,6 +379,20 @@ mod tests {
         }
     }
 
+    /// Same property `stations.rs` checks for `STATIONS`, added there this
+    /// session: `troop(id)` (used by `skirmish::fighter` to build every NPC
+    /// combatant, campaign or raid) does `TROOPS.iter().find(|t| t.id ==
+    /// id)`, so a duplicate id doesn't error -- it just makes the SECOND
+    /// troop with that id permanently unreachable, silently using the
+    /// first one's stats instead. 33 entries is past the point a duplicate
+    /// would be obvious on a read-through, unlike the 5-13-entry catalogs
+    /// (`ELEMENTS`, `VERBS`) checked elsewhere this session.
+    #[test]
+    fn every_troop_id_is_unique() {
+        let ids: std::collections::BTreeSet<_> = TROOPS.iter().map(|t| t.id).collect();
+        assert_eq!(ids.len(), TROOPS.len(), "TROOPS has a duplicate id -- one troop is unreachable by lookup");
+    }
+
     use super::*;
     use crate::patrol;
 
