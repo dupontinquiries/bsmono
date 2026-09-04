@@ -199,6 +199,14 @@ impl Default for Shell {
             backend: 0,
             input: String::new(),
             output: String::new(),
+            // Lost by the c14unified-026 merge: it took THEIR app.rs hunk,
+            // which predates these two fields, while the struct definition
+            // (auto-merged) kept them. A struct literal missing a field is a
+            // compile error rather than a silent bug, which is the only reason
+            // this was cheap — it shipped in bundle 006 and the operator hit it
+            // on the first build.
+            output_suggested: String::new(),
+            pending_start: None,
             models_dir: job::default_model_paths()
                 .into_iter()
                 .find(|p| p.exists())
