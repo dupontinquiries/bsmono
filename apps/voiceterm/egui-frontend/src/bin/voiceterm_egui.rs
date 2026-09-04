@@ -3309,11 +3309,25 @@ impl eframe::App for VoicetermApp {
                         // turn to turn — `reload` REPLACES the list, which
                         // would have erased history on every message even
                         // once the format matched.
-                        if let Some(sent) = self.chat.ui(ui) {
-                            use voiceterm_egui::chat_panel::{ChatMessage, Role};
+                        // THE HEADER BUTTONS WERE ALSO DISCARDED. `.ui(ui)`
+                        // is `ui_with(ui).0` — the sent text only, dropping
+                        // `.1`, the `ChatAction` New/Close report. Header
+                        // and buttons render (from the earlier QML-outline
+                        // fix upstream) and looked live, but clicking either
+                        // did nothing: confirmed by clicking "New" here and
+                        // watching the same two messages stay on screen.
+                        // `ui_with` is what actually carries both.
+                        use voiceterm_egui::chat_panel::{ChatAction, ChatMessage, Role};
+                        let (sent, action) = self.chat.ui_with(ui);
+                        if let Some(sent) = sent {
                             self.chat.messages.push(ChatMessage { role: Role::User, content: sent });
                             self.chat.messages.push(ChatMessage { role: Role::Assistant,
                                 content: "(no local model attached in this build)".to_string() });
+                        }
+                        match action {
+                            Some(ChatAction::New) => self.chat.messages.clear(),
+                            Some(ChatAction::Close) => { self.workspace.open_view(PaneView::Terminal); }
+                            None => {}
                         }
                     }
                     PaneView::Notes => {
