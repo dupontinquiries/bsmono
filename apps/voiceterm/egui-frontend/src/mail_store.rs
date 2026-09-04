@@ -187,6 +187,60 @@ pub fn load(path: &Path) -> Vec<Message> {
     }
 }
 
+/// The same traversal as [`load`], but returns body text keyed by message
+/// id instead of metadata — the lazy-fetch half a reader calls on open,
+/// not the list a caller shows for every message.
+///
+/// A genuinely separate pass, not `load` with an extra field bolted on:
+/// bodies are the reason this reads every file's FULL text at all
+/// (`load` needs only the headers a `Message` carries), and keeping the
+/// two apart means listing a mailbox never pays for parsing bodies it
+/// isn't about to show. Mirrors `load`'s Maildir/mbox branches exactly,
+/// including the tmp/-is-skipped and size-cap rules, so the two never
+/// disagree about which files exist to read.
+pub fn load_bodies(path: &Path) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    match classify(path) {
+        Kind::Maildir => {
+            for f in maildir_files(path) {
+                let Ok(text) = std::fs::read_to_string(&f) else { continue };
+                let origin = f.file_name().map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "maildir".to_string());
+                let id = crate::mail_rfc822::message_from_text(&origin, &text).id;
+                out.insert(id, crate::mail_rfc822::body_from_text(&text));
+                if out.len() >= MAX_MESSAGES { break; }
+            }
+        }
+        Kind::Mbox => {
+            let Ok(meta) = std::fs::metadata(path) else { return out };
+            if meta.len() > MAX_FILE_BYTES {
+                return out;
+            }
+            let Ok(text) = std::fs::read_to_string(path) else { return out };
+            let origin = path.file_name().map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "mbox".to_string());
+            // `#{i}`, matching `messages_from_text`'s own origin exactly —
+            // that function suffixes each split part with its index for
+            // the SAME reason a Maildir file's whole name is the origin:
+            // a message with no Message-ID falls back to `origin` as its
+            // id, and multiple such messages in one mbox file need to stay
+            // distinct. Using a bare, shared origin here (an earlier draft
+            // of this function did) would silently collide their bodies —
+            // whichever no-id message loaded last would overwrite the rest
+            // in the map, and every one of them would then show the WRONG
+            // body when opened. Caught before this shipped, not after.
+            for (i, raw) in crate::mail_rfc822::split_mbox(&text).iter().enumerate() {
+                let part_origin = format!("{origin}#{i}");
+                let id = crate::mail_rfc822::message_from_text(&part_origin, raw).id;
+                out.insert(id, crate::mail_rfc822::body_from_text(raw));
+                if out.len() >= MAX_MESSAGES { break; }
+            }
+        }
+        Kind::Unknown => {}
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +311,47 @@ body
         let msgs = load(&path);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].subject, "Newer", "not newest first");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_bodies_keys_match_loads_ids_for_a_maildir() {
+        // The lazy-fetch map is only useful if its keys are the SAME ids
+        // `load` hands the reader — a body map that can't be looked up by
+        // the id the inbox list actually uses is a body map for nothing.
+        let root = tmp("bodies-maildir");
+        std::fs::create_dir_all(root.join("cur")).unwrap();
+        std::fs::write(root.join("cur").join("1"), MSG).unwrap();
+        let msgs = load(&root);
+        let bodies = load_bodies(&root);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(bodies.get(&msgs[0].id).map(|s| s.as_str()), Some("body\n"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The exact bug caught in review before this shipped: two messages in
+    /// one mbox file, NEITHER with a Message-ID, must not collide onto the
+    /// same fallback key. An earlier draft used a bare, shared `origin` as
+    /// the fallback id for every part of the file — this pins the fix
+    /// (`format!("{origin}#{i}")`, matching `messages_from_text`'s own
+    /// per-part origin exactly) rather than trusting it silently.
+    #[test]
+    fn load_bodies_does_not_collide_two_no_id_messages_in_one_mbox() {
+        let path = tmp("bodies-mbox-no-id");
+        // Both messages omit Message-ID on purpose.
+        let a = "From: a@x\nSubject: First\nDate: Tue, 4 Mar 2025 09:15:00 +0000\n\nfirst body\n";
+        let b = "From: b@x\nSubject: Second\nDate: Tue, 4 Mar 2025 10:00:00 +0000\n\nsecond body\n";
+        std::fs::write(&path, format!("From x\n{a}From y\n{b}")).unwrap();
+        let msgs = load(&path);
+        let bodies = load_bodies(&path);
+        assert_eq!(msgs.len(), 2);
+        assert_ne!(msgs[0].id, msgs[1].id, "the two messages must not share a fallback id");
+        let body_for = |subject: &str| {
+            let id = &msgs.iter().find(|m| m.subject == subject).unwrap().id;
+            bodies.get(id).cloned()
+        };
+        assert_eq!(body_for("First"), Some("first body\n".to_string()));
+        assert_eq!(body_for("Second"), Some("second body\n".to_string()));
         let _ = std::fs::remove_file(&path);
     }
 

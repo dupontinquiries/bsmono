@@ -340,6 +340,19 @@ pub fn message_from_text(origin: &str, raw: &str) -> Message {
     build(origin, raw)
 }
 
+/// The body text alone, for the lazy-fetch a reader does on open. `Message`
+/// itself carries no body — deliberately, since the metadata (subject,
+/// sender, time) is kept for every message in a list while a body is a
+/// larger payload only worth parsing for the one the reader has open —
+/// this is `build`'s own `parse_message(raw).body` extracted so a caller
+/// with the same raw text already in hand doesn't have to duplicate the
+/// parse to reach it. Pure: does no id/threading work `build` doesn't
+/// already do, and is meant to be called on the SAME `raw` a caller
+/// already passed (or would pass) to `message_from_text`.
+pub fn body_from_text(raw: &str) -> String {
+    parse_message(raw).body
+}
+
 fn build(origin: &str, raw: &str) -> Message {
     {
         let p = parse_message(raw);
@@ -429,6 +442,15 @@ The engine weaves algebraic patterns.
         assert_eq!(s.name, "Ada Lovelace");
         assert_eq!(s.address, "ada@example.com");
         assert!(!m[0].unread, "mail read out of a terminal is not unread");
+    }
+
+    /// `body_from_text` exists because `Message` itself carries no body —
+    /// this is the lazy-fetch half, pinned separately from the metadata
+    /// test above so a change to one can't silently break the other
+    /// without its own test noticing.
+    #[test]
+    fn body_from_text_extracts_the_body_alone() {
+        assert_eq!(body_from_text(ONE), "The engine weaves algebraic patterns.\n");
     }
 
     #[test]
