@@ -34,6 +34,13 @@ pub trait Backend {
     /// Chat-template family the loaded model expects, so the app builds a matching prompt.
     /// Defaults to Plain; the wgpu engine detects the real family from the tokenizer.
     fn template(&self) -> TemplateKind { TemplateKind::Plain }
+    /// The Liaison's view of the loaded model's architecture support — its GGUF arch string and
+    /// whatever gaps the loader found, so `what_is_blocked_with` can report them instead of them
+    /// only ever reaching a `wgpu-engine: ⚠` stderr line. `None` by default: only the wgpu engine
+    /// (`gpu_kernels::Model`) tracks this today — llama.cpp and the daemon path have no such data
+    /// to report, and a fabricated "no gaps" would be exactly the ungrounded claim the Liaison
+    /// refuses to make.
+    fn model_status(&self) -> Option<logscope::liaison::ModelStatus> { None }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -780,6 +787,19 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
         pub fn template(&self) -> TemplateKind { self.template }
         /// The loaded model's file basename (log/UI tag).
         pub fn model_name(&self) -> &str { &self.name }
+        /// The Liaison's `ModelStatus` for the resident model: its GGUF-declared arch and whatever
+        /// gap lines the loader printed at load time. Closes the hole `docs/12-queen-and-workers.md`'s
+        /// liaison audit named — `Model` used to carry an arch's EFFECTS but not its name, so this
+        /// data existed only as a `wgpu-engine: ⚠` stderr line with no way back into the app. Not
+        /// wired into the chat UI yet (that needs a `dyn Backend`-level accessor, since `Engine` is
+        /// one concrete backend among several) — this is the piece that was missing to do it.
+        pub fn model_status(&self) -> logscope::liaison::ModelStatus {
+            logscope::liaison::ModelStatus {
+                name: self.name.clone(),
+                arch: self.model.arch.clone(),
+                gaps: self.model.gaps.clone(),
+            }
+        }
 
         /// What ONE more instance of this model would cost in device memory: the weights the
         /// planner actually placed, plus a KV cache for the app's default window. Replicator mode
@@ -2310,6 +2330,12 @@ impl Backend for Wgpu {
         #[cfg(not(feature = "wgpu-engine"))]
         { TemplateKind::Llama3 }
     }
+    fn model_status(&self) -> Option<logscope::liaison::ModelStatus> {
+        #[cfg(feature = "wgpu-engine")]
+        { self.engine.as_ref().map(|e| e.model_status()) }
+        #[cfg(not(feature = "wgpu-engine"))]
+        { None }
+    }
 }
 
 pub fn make(kind: BackendKind) -> Box<dyn Backend> {
@@ -2469,7 +2495,10 @@ impl TemplateKind {
 }
 
 /// What a successful load reports back to the UI.
-pub struct LoadInfo { pub path: String, pub template: TemplateKind }
+pub struct LoadInfo { pub path: String, pub template: TemplateKind,
+    /// The Liaison's view of what just loaded — `None` when the backend has nothing to report
+    /// (llama.cpp, the daemon path) rather than a fabricated "no gaps".
+    pub model_status: Option<logscope::liaison::ModelStatus> }
 
 pub enum Cmd { SetBackend(BackendKind), SetParams(GenParams), Load(String), Generate(String), Continue(String) }
 pub enum Evt { Loaded(Result<LoadInfo, String>), Token(String), Done { tokens: usize, secs: f32 }, Error(String) }
@@ -2902,12 +2931,12 @@ fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, temp
                     template_out.store(template.to_u8(), Ordering::Relaxed);
                     crate::diag!("worker: '{path}' is already loaded — keeping it \
 (weights, KV prefix tree and warmed pipelines survive)");
-                    let _ = evt.send(Evt::Loaded(Ok(LoadInfo { path, template })));
+                    let _ = evt.send(Evt::Loaded(Ok(LoadInfo { path, template, model_status: backend.model_status() })));
                     continue;
                 }
                 crate::diag!("worker: loading '{path}' via {} backend", backend.name());
                 match backend.load(&path, &params) {
-                    Ok(()) => { let template = backend.template(); template_out.store(template.to_u8(), Ordering::Relaxed); loaded = Some(path.clone()); let _ = evt.send(Evt::Loaded(Ok(LoadInfo { path, template }))); }
+                    Ok(()) => { let template = backend.template(); template_out.store(template.to_u8(), Ordering::Relaxed); loaded = Some(path.clone()); let _ = evt.send(Evt::Loaded(Ok(LoadInfo { path, template, model_status: backend.model_status() }))); }
                     Err(e) => { loaded = None; crate::diag!("worker: load failed: {e}"); let _ = evt.send(Evt::Loaded(Err(e))); }
                 }
             }
