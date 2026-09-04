@@ -180,6 +180,11 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
+    // Reverse-DNS app id, matching the .desktop entry this needs to name
+    // exactly (packaging/org.ambientlearner.AmbientLearner.desktop) — see
+    // uikit_egui::desktop's own docs for why an unset id is not cosmetic on
+    // Wayland, where there is no WM_CLASS fallback at all.
+    const APP_ID: &str = "org.ambientlearner.AmbientLearner";
     let opts = eframe::NativeOptions {
         // Glow SAID, not left to eframe: its 0.34 defaults include
         // wgpu but not glow, and wgpu's default device descriptor
@@ -188,9 +193,7 @@ fn main() -> eframe::Result<()> {
         // enough; gitmind-egui declared one and still got wgpu
         // through feature unification.
         renderer: eframe::Renderer::Glow,
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 720.0])
-            .with_title("Ambient Learner"),
+        viewport: uikit_egui::desktop::viewport(APP_ID, "Ambient Learner", [420.0, 720.0]),
         ..Default::default()
     };
     eframe::run_native("ambient-learner-egui", opts, Box::new(|cc| {

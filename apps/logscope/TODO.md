@@ -3130,3 +3130,40 @@ threshold). This paragraph described the fix before it landed; nobody updated it
 history of what the gap was, since deleting it would lose the reasoning for why `decode_ratio` is
 a separate parameter from `tok_s` rather than derived from it — but the "remaining" framing was
 wrong and is corrected here rather than left to mislead the next reader into re-doing this.
+
+## ⌖ gpu-gemm's OOM-downgrade ladder is written and NEVER CALLED (found via testonly_check.py)
+
+`testonly_check.py apps/logscope/crates` (run at its own documented cross-crate scope, not
+per-crate — the per-crate numbers are known misleading, see the tool's own docstring) reported
+`oom::load_with_downgrade` as test-only. Checked further and it's worse than that: grepping the
+whole workspace for the name finds exactly ONE occurrence — its own definition. Not called by a
+test either; `oom.rs` has no test module at all. `testonly_check`'s "test-only" label undersells
+this one.
+
+`load_with_downgrade`'s own doc comment describes it as "the self-tuning loader loop that makes
+the GPU-budget guess irrelevant" — walk a residency ladder best-first, retry on OOM after
+resetting, return the first format that actually allocates. `memplan::fitting_residencies()`
+builds exactly the `Vec<Residency>` ladder this function's `ladder` parameter expects — the two
+were clearly designed as a pair. And `memplan.rs`'s own comment two lines above `fitting_residencies`
+references this as if it already exists at runtime: *"a conservative fraction of RAM that the
+loader's OOM-downgrade ladder tightens further at runtime"* — describing the exact "70B → Failed
+to allocate BO VMA" crash this function was built to prevent, on exactly the hardware
+(Asahi/Honeykrisp unified memory) this project already knows has a BO-VMA ceiling well below what
+it advertises.
+
+**Not wired here.** Finding the real GPU-buffer-allocation call site in a 20K-line `lib.rs` and
+routing it through `load_with_downgrade` needs care I can't verify without real GPU hardware — a
+wrong wiring here fails exactly the way the missing wiring does now, just later and more
+confusingly. What's confirmed, by grep and by reading both doc comments side by side rather than
+assumed from the function's name: the ladder-building half and the ladder-walking half both exist,
+were clearly designed to compose, and nothing composes them. The actual allocation path currently
+presumably takes `fitting_residencies()`'s single best-fit answer and allocates once, with no
+retry — meaning a plan that's slightly too optimistic (exactly the case `memplan.rs`'s own BO-VMA
+comment describes) hard-fails instead of gracefully stepping down, on hardware this project has
+already hit that exact crash on.
+
+**Next step for whoever picks this up**: find where `Residency` from `fitting_residencies()` is
+actually consumed to allocate a real `wgpu::Buffer`, and check whether that call site is already
+inside something shaped like a retry loop under a different name (possible — this codebase has
+already found a couple of "ported twice, wired once" cases this session) before assuming
+`load_with_downgrade` needs to be threaded in fresh.

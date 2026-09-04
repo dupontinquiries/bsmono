@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata. Without this the app installs and launches but does not
+     appear in GNOME Software or KDE Discover at all — those read metainfo, not
+     .desktop entries, so a missing file makes an installed app invisible to the
+     one place most users look. -->
+<component type="desktop-application">
+  <id>org.hatch.Hatch</id>
+  <name>Hatch</name>
+  <summary>Fullscreen app launcher grid</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>Hatch is a fullscreen app grid launcher: tap an icon to launch, tap the background to dismiss, search from the pill at the bottom.</p>
+    <ul>
+      <li>Configurable columns, icon size, and background opacity</li>
+      <li>Icon decoding for both PNG and SVG application icons</li>
+      <li>A system row alongside the app grid</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">org.hatch.Hatch.desktop</launchable>
+  <releases>
+    <release version="0.1.0" date="2026-08-02"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

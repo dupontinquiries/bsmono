@@ -27,6 +27,29 @@ def entries(app):
         out += [os.path.join(root, f) for f in files if f.endswith('.desktop')]
     return out
 
+def has_binary(frontend_dir):
+    """True if this egui-frontend crate actually produces an executable.
+
+    Found via tadpole-egui: it has an `egui-frontend/src` directory (so the
+    original check treated it as an app needing a .desktop entry) but its
+    Cargo.toml is `[lib] name = "tadpole"` with no `[[bin]]`, no
+    `src/main.rs`, and no `src/bin/*.rs` anywhere — a library meant to be
+    embedded elsewhere, not a standalone launchable app. A .desktop entry
+    for it would name an `Exec=` binary that does not exist. Checks all
+    three ways a crate can define a binary, not just the explicit
+    `[[bin]]` table — most apps here rely on the implicit `src/main.rs`.
+    """
+    toml = os.path.join(frontend_dir, 'Cargo.toml')
+    try:
+        if '[[bin]]' in open(toml, encoding='utf8').read():
+            return True
+    except OSError:
+        pass
+    if os.path.isfile(os.path.join(frontend_dir, 'src', 'main.rs')):
+        return True
+    bin_dir = os.path.join(frontend_dir, 'src', 'bin')
+    return os.path.isdir(bin_dir) and any(f.endswith('.rs') for f in os.listdir(bin_dir))
+
 def value(text, key):
     for line in text.splitlines():
         if line.startswith(key): return line[len(key):].strip()
@@ -37,6 +60,7 @@ def main():
     for app in sorted(os.listdir(APPS)):
         src = os.path.join(APPS, app, 'egui-frontend', 'src')
         if not os.path.isdir(src): continue
+        if not has_binary(os.path.join(APPS, app, 'egui-frontend')): continue
         es = entries(app)
         if not es:
             print(f"{app}: NO .desktop entry — the app cannot appear in a menu")

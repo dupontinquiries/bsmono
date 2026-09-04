@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata. Without this the app installs and launches but does not
+     appear in GNOME Software or KDE Discover at all — those read metainfo, not
+     .desktop entries, so a missing file makes an installed app invisible to the
+     one place most users look.
+
+     No <project_license> tag: neither this crate's Cargo.toml nor
+     egui-frontend/Cargo.toml declares one, and there is no repo-wide LICENSE
+     file to fall back on. Omitted rather than guessed — a license claim in
+     AppStream metadata is a real statement, not a formality to fill in. -->
+<component type="desktop-application">
+  <id>org.ambientlearner.AmbientLearner</id>
+  <name>Ambient Learner</name>
+  <summary>AI-powered ambient temperature learning system</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <description>
+    <p>Ambient Learner observes temperature patterns over time and adjusts climate control automatically, rather than following a fixed schedule.</p>
+  </description>
+  <launchable type="desktop-id">org.ambientlearner.AmbientLearner.desktop</launchable>
+  <releases>
+    <release version="0.1.0" date="2026-09-04"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>
