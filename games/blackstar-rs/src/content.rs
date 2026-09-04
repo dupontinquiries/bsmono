@@ -242,8 +242,49 @@ mod tests {
         }
         let src = include_str!("main.rs");
         assert!(
-            src.contains(r#""sortie accepted — {} over {} — {foe}""#),
+            src.contains(r#""{chapter}sortie accepted — {} over {} — {foe}""#),
             "begin_sortie's toast no longer shows the foe commander's doctrine text"
+        );
+    }
+
+    /// `Film.title`/`.subtitle` — every one of the story's films (chapters)
+    /// has both, real authored names -- and neither had any UI consumer:
+    /// `campaign.rs` tracks which film a mission belongs to for progression
+    /// logic, but nothing ever announced a chapter to the player.
+    /// `main.rs::begin_sortie` now prepends the film's title/subtitle to its
+    /// toast, but ONLY on that film's first mission (checked via
+    /// `missions_of`, not a stored flag) -- announcing it on every mission
+    /// of a multi-mission film would just be repetitive chrome, the same
+    /// judgment call `patrol::tick_patrol` made about its combat-event half.
+    #[test]
+    fn every_film_has_real_titles_and_only_its_opening_mission_announces_it() {
+        for f in super::FILMS {
+            assert!(!f.title.is_empty(), "film {} has no title", f.n);
+            assert!(!f.subtitle.is_empty(), "film {} has no subtitle", f.n);
+        }
+        // the actual "only the opening mission" logic, mirrored here rather
+        // than re-run through main.rs (which needs a live Game to call
+        // begin_sortie on) -- if this ever disagrees with main.rs's own
+        // check, that's a real bug this test exists to catch.
+        for f in super::FILMS {
+            let ms: Vec<_> = super::missions_of(f.n).collect();
+            if ms.len() < 2 {
+                continue; // nothing to distinguish "opening" from
+            }
+            assert_ne!(
+                ms[0].id, ms[1].id,
+                "film {} has a duplicate opening mission id, which would break the first-mission check",
+                f.n
+            );
+        }
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("let is_films_first_mission = content::missions_of(s.mission.film)"),
+            "begin_sortie no longer gates the chapter announcement on the film's opening mission"
+        );
+        assert!(
+            src.contains("content::film(s.mission.film).map(|f| format!(\"{} — {} — \", f.title, f.subtitle))"),
+            "begin_sortie no longer builds the chapter announcement from Film's title/subtitle"
         );
     }
 

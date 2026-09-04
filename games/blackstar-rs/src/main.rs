@@ -8178,7 +8178,24 @@ impl Game {
                 // player is about to walk into, not decoration.
                 let doctrine = campaign::foe_doctrine(s.mission);
                 let foe = content::commander(doctrine).map(|c| c.desc).unwrap_or("");
-                self.toastf(&format!("sortie accepted — {} over {} — {foe}", s.mission.id, d.name));
+                // `content::Film.title`/`.subtitle` — every film (story
+                // chapter) has both, real authored names, and neither had a
+                // UI consumer: campaign.rs tracks which film a mission
+                // belongs to for progression logic, but nothing ever
+                // announced a chapter to the player. Surfaced once, on that
+                // film's OPENING mission only (checked via
+                // `content::missions_of`, not a new stored flag) rather than
+                // on every mission of it, which would just be repetitive
+                // chrome.
+                let is_films_first_mission = content::missions_of(s.mission.film)
+                    .next()
+                    .is_some_and(|first| first.id == s.mission.id);
+                let chapter = if is_films_first_mission {
+                    content::film(s.mission.film).map(|f| format!("{} — {} — ", f.title, f.subtitle)).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                self.toastf(&format!("{chapter}sortie accepted — {} over {} — {foe}", s.mission.id, d.name));
                 self.raid = None; // one flight at a time
                 let mut s = s;
                 s.set_ride_h(self.car.ride_h.max(self.car.half_h));
