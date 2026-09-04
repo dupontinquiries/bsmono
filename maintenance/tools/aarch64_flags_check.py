@@ -30,7 +30,21 @@ import pathlib, re, sys
 # `fp16` is rustc's name for LLVM's `fullfp16` — the error text says the
 # latter, which is why copying from the error gives an unknown-feature warning.
 UNSAFE_FEATURES = ["fp16", "fhm", "dotprod", "i8mm", "bf16", "sve", "sve2", "lse128"]
-UNSAFE_CPUS = ["apple-", "native", "cortex-a7", "cortex-a71", "neoverse"]
+# Verified against ARM's own architecture pages before trusting a name here, in both
+# directions — a bare "cortex-a7" used to sit in this list and was WRONG two ways at once:
+#   * FALSE POSITIVE: it matches "cortex-a72" and "cortex-a73" by substring, but both are
+#     ARMv8-A (the SAME generation as the PinePhone's Cortex-A53 baseline) — genuinely safe,
+#     yet flagged as if they over-promised.
+#   * FALSE NEGATIVE: it did nothing to catch "cortex-a55" (ARMv8.2-A, genuinely unsafe,
+#     and one of the most common small cores in real Android/embedded ARM SoCs) — the entry
+#     LOOKED like it covered the "cortex-a7x are risky" family but didn't actually name any
+#     of the real ARMv8.2-A ones on purpose, it only caught a75/76/77/78 by the accident of
+#     them starting with the same two digits as the safe a72/a73.
+# Replaced with the specific ARMv8.2-A+ cores confirmed unsafe: A55/A75/A76/A77/A78.
+# "cortex-a71" is untouched — already correctly narrow (matches only A710/A715, both
+# ARMv9-A, without over-matching A72/A73 the way a bare "cortex-a7" did).
+UNSAFE_CPUS = ["apple-", "native", "cortex-a55", "cortex-a75", "cortex-a76", "cortex-a77",
+               "cortex-a78", "cortex-a71", "neoverse"]
 
 AARCH64_SECTION = re.compile(r'\[target\.[^\]]*aarch64[^\]]*\]')
 
