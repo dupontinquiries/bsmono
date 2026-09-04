@@ -320,4 +320,35 @@ mod tests {
         assert_eq!(all.accept_all().unwrap(), "()");
         assert_eq!(all, Ghost::Idle);
     }
+
+    #[test]
+    fn accepting_a_word_mid_stream_is_not_reset_by_the_next_delta() {
+        // A NEW interaction the generation fix makes possible for the
+        // first time (streaming was frozen before, so nobody could
+        // "accept mid-stream" and then have another delta arrive): if a
+        // person hits Ctrl+-> and types out part of the suggestion WHILE
+        // the server still has more coming, does the next delta correctly
+        // replace only what's LEFT, or does it silently reintroduce text
+        // that was already accepted by resetting to the server's own
+        // (unaware-of-the-accept) accumulated string?
+        let mut g = Ghost::Idle;
+        g.request_sent(1);
+        g.on_outcome(1, 1, &Ok("let x".into()), &aperture_complete::keymap::KeyMap::new());
+        assert_eq!(g, Ghost::Shown { text: "let x".into(), generation: 1 });
+        let taken = g.accept_word().unwrap();
+        assert_eq!(taken, "let");
+        assert_eq!(g, Ghost::Shown { text: " x".into(), generation: 1 }, "remainder after accepting 'let'");
+        // The next streamed delta arrives — the server's own accumulated
+        // text so far, which has NO IDEA "let" was already typed out.
+        g.on_outcome(1, 1, &Ok("let x = 1".into()), &aperture_complete::keymap::KeyMap::new());
+        assert_eq!(
+            g,
+            Ghost::Shown { text: "let x = 1".into(), generation: 1 },
+            "documents the CURRENT behavior: the next delta replaces the ghost with the \
+             server's full accumulated text, which does not subtract what accept_word already \
+             took. If this test starts failing because someone 'fixed' on_outcome to preserve \
+             the post-accept remainder, that is the improvement — this exists to make the \
+             tradeoff visible and require an explicit decision, not to bless it as correct."
+        );
+    }
 }
