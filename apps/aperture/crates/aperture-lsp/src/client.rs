@@ -34,6 +34,29 @@ pub struct CompletionItem {
     pub detail: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    /// Covers both LSP's `Information` and `Hint` — this client has no
+    /// caller yet that needs to tell them apart, and inventing a
+    /// distinction nothing uses would just be two variants to keep in
+    /// sync with the spec for no behavioral difference.
+    Info,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Diagnostic {
+    /// Zero-indexed, LSP's own convention — NOT yet char-column-converted;
+    /// see `client.rs`'s completion doc for the same UTF-16-vs-char caveat.
+    pub start_line: u32,
+    pub start_character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+}
+
 pub struct LspClient {
     child: Child,
     stdin: Mutex<ChildStdin>,
@@ -45,6 +68,13 @@ pub struct LspClient {
     /// over a protocol that otherwise interleaves replies and notifications
     /// on one stream in arbitrary order.
     pending: Arc<Mutex<HashMap<i64, Sender<Result<Value, Value>>>>>,
+    /// Latest `publishDiagnostics` per URI. The server sends a FULL
+    /// replacement list each time (LSP's own contract, not a delta), so
+    /// this map only ever needs the newest one per URI, not history —
+    /// keyed exactly on the URI the notification names, which the server
+    /// may not always match byte-for-byte against a URI a caller
+    /// constructed itself (see `diagnostics`'s own doc).
+    diagnostics: Arc<Mutex<HashMap<String, Vec<Diagnostic>>>>,
     _reader: std::thread::JoinHandle<()>,
 }
 
@@ -74,10 +104,13 @@ impl LspClient {
 
         let pending: Arc<Mutex<HashMap<i64, Sender<Result<Value, Value>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let diagnostics: Arc<Mutex<HashMap<String, Vec<Diagnostic>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let reader_pending = Arc::clone(&pending);
+        let reader_diagnostics = Arc::clone(&diagnostics);
         let reader = std::thread::Builder::new()
             .name("aperture-lsp-reader".into())
-            .spawn(move || reader_loop(BufReader::new(stdout), reader_pending))
+            .spawn(move || reader_loop(BufReader::new(stdout), reader_pending, reader_diagnostics))
             .expect("spawn LSP reader thread");
 
         let client = LspClient {
@@ -85,6 +118,7 @@ impl LspClient {
             stdin: Mutex::new(stdin),
             next_id: Mutex::new(1),
             pending,
+            diagnostics,
             _reader: reader,
         };
 
@@ -161,6 +195,17 @@ impl LspClient {
         Ok(parse_completion_result(&result))
     }
 
+    /// The most recent `publishDiagnostics` for `uri`, or an empty list if
+    /// the server hasn't sent any yet (either it's still analyzing, or the
+    /// file genuinely has none — this method can't distinguish those two,
+    /// same as a caller polling before the FIRST answer arrives can't). NOT
+    /// a request/response — diagnostics are server-PUSHED, so this just
+    /// reads whatever the reader thread has already captured; there is no
+    /// "ask for diagnostics now" message in the protocol to send.
+    pub fn diagnostics(&self, uri: &str) -> Vec<Diagnostic> {
+        self.diagnostics.lock().unwrap().get(uri).cloned().unwrap_or_default()
+    }
+
     fn notify(&self, method: &str, params: Value) -> std::io::Result<()> {
         let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         write_message(&mut *self.stdin.lock().unwrap(), &msg)
@@ -210,16 +255,20 @@ impl LspClient {
     }
 }
 
-fn reader_loop<R: BufRead>(mut r: R, pending: Arc<Mutex<HashMap<i64, Sender<Result<Value, Value>>>>>) {
+fn reader_loop<R: BufRead>(
+    mut r: R,
+    pending: Arc<Mutex<HashMap<i64, Sender<Result<Value, Value>>>>>,
+    diagnostics: Arc<Mutex<HashMap<String, Vec<Diagnostic>>>>,
+) {
     loop {
         match read_message(&mut r) {
             Ok(Some(msg)) => {
                 // A reply has "id" and either "result" or "error"; a
                 // notification (diagnostics, log messages, ...) has no
-                // "id" the client originated and is dropped here — this
-                // crate doesn't consume server-initiated notifications
-                // yet. That is a real gap (diagnostics are useful!), not
-                // an oversight: see the crate-level TODO note.
+                // "id" the client originated. `publishDiagnostics`
+                // specifically is handled below; every other notification
+                // (log messages, progress, ...) is still dropped — a real
+                // gap, not an oversight, see the crate-level doc.
                 if let Some(id) = msg.get("id").and_then(Value::as_i64) {
                     if let Some(tx) = pending.lock().unwrap().remove(&id) {
                         let outcome = if let Some(err) = msg.get("error") {
@@ -229,12 +278,53 @@ fn reader_loop<R: BufRead>(mut r: R, pending: Arc<Mutex<HashMap<i64, Sender<Resu
                         };
                         let _ = tx.send(outcome);
                     }
+                } else if msg.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics") {
+                    if let Some(params) = msg.get("params") {
+                        if let Some(uri) = params.get("uri").and_then(Value::as_str) {
+                            let parsed = parse_diagnostics(params);
+                            diagnostics.lock().unwrap().insert(uri.to_string(), parsed);
+                        }
+                    }
                 }
             }
             Ok(None) => return, // server closed its stdout — clean exit
             Err(_) => return,   // malformed stream; nothing more to salvage
         }
     }
+}
+
+/// LSP severity is `1..=4` (Error/Warning/Information/Hint); anything
+/// else (a future value the spec adds, or a nonconforming server) maps to
+/// `Info` rather than being dropped — an unrecognized severity is still a
+/// real diagnostic a caller should be able to show, just without
+/// confidence about how loudly.
+fn parse_severity(v: Option<&Value>) -> DiagnosticSeverity {
+    match v.and_then(Value::as_i64) {
+        Some(1) => DiagnosticSeverity::Error,
+        Some(2) => DiagnosticSeverity::Warning,
+        _ => DiagnosticSeverity::Info,
+    }
+}
+
+fn parse_diagnostics(params: &Value) -> Vec<Diagnostic> {
+    let Some(arr) = params.get("diagnostics").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|d| {
+            let range = d.get("range")?;
+            let start = range.get("start")?;
+            let end = range.get("end")?;
+            Some(Diagnostic {
+                start_line: start.get("line")?.as_u64()? as u32,
+                start_character: start.get("character")?.as_u64()? as u32,
+                end_line: end.get("line")?.as_u64()? as u32,
+                end_character: end.get("character")?.as_u64()? as u32,
+                severity: parse_severity(d.get("severity")),
+                message: d.get("message").and_then(Value::as_str).unwrap_or_default().to_string(),
+            })
+        })
+        .collect()
 }
 
 /// `textDocument/completion` replies as either `CompletionItem[]` or a
@@ -314,5 +404,54 @@ mod tests {
         // A `null` result (no completions applicable here) is valid per
         // spec and must not be treated as malformed.
         assert_eq!(parse_completion_result(&Value::Null), Vec::<CompletionItem>::new());
+    }
+
+    #[test]
+    fn parses_a_publish_diagnostics_params_object() {
+        let params = json!({
+            "uri": "file:///tmp/x.rs",
+            "diagnostics": [{
+                "range": {"start": {"line": 2, "character": 4}, "end": {"line": 2, "character": 9}},
+                "severity": 1,
+                "message": "mismatched types",
+            }]
+        });
+        let diags = parse_diagnostics(&params);
+        assert_eq!(diags, vec![Diagnostic {
+            start_line: 2, start_character: 4, end_line: 2, end_character: 9,
+            severity: DiagnosticSeverity::Error, message: "mismatched types".to_string(),
+        }]);
+    }
+
+    #[test]
+    fn severity_numbers_map_per_spec_and_unknown_values_fall_back_to_info() {
+        assert_eq!(parse_severity(Some(&json!(1))), DiagnosticSeverity::Error);
+        assert_eq!(parse_severity(Some(&json!(2))), DiagnosticSeverity::Warning);
+        assert_eq!(parse_severity(Some(&json!(3))), DiagnosticSeverity::Info);
+        assert_eq!(parse_severity(Some(&json!(4))), DiagnosticSeverity::Info);
+        assert_eq!(parse_severity(Some(&json!(99))), DiagnosticSeverity::Info, "unrecognized value, not dropped");
+        assert_eq!(parse_severity(None), DiagnosticSeverity::Info, "missing severity, not dropped");
+    }
+
+    #[test]
+    fn a_diagnostic_missing_its_range_is_skipped_rather_than_panicking() {
+        let params = json!({
+            "uri": "file:///tmp/x.rs",
+            "diagnostics": [
+                {"message": "no range here"},
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "message": "ok"},
+            ]
+        });
+        let diags = parse_diagnostics(&params);
+        assert_eq!(diags.len(), 1, "the malformed entry is dropped, not the whole batch");
+        assert_eq!(diags[0].message, "ok");
+    }
+
+    #[test]
+    fn an_empty_diagnostics_array_means_the_file_is_currently_clean() {
+        // The server sends this explicitly when errors are FIXED — an
+        // empty list is meaningful (clean), not the same as "no answer yet".
+        let params = json!({ "uri": "file:///tmp/x.rs", "diagnostics": [] });
+        assert_eq!(parse_diagnostics(&params), Vec::<Diagnostic>::new());
     }
 }

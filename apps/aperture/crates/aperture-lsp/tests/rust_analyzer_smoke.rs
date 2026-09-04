@@ -16,12 +16,21 @@
 /// recognizes as one — a bare loose `.rs` file with no `Cargo.toml` puts it
 /// in a reduced "detached file" mode that isn't representative of how
 /// aperture would actually use this crate against a person's real project.
-fn scratch_package() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("aperture-lsp-smoke-{}", std::process::id()));
+/// `name` must be distinct PER TEST, not just per process: `cargo test`
+/// runs multiple tests from one binary concurrently on separate threads
+/// by default, and `std::process::id()` alone is the same for all of them
+/// — the bug this comment exists because of. Two tests sharing a
+/// directory raced on the same `src/main.rs` and the same rust-analyzer
+/// workspace root, and the symptom looked like a real protocol bug (a
+/// diagnostic that should have cleared but didn't) until the actual cause
+/// — directory collision, not server behavior — was found.
+fn scratch_package(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("aperture-lsp-smoke-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir); // a previous run's leftovers, if any
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
         dir.join("Cargo.toml"),
-        "[package]\nname = \"aperture_lsp_smoke\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        format!("[package]\nname = \"aperture_lsp_smoke_{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
     )
     .unwrap();
     dir
@@ -44,7 +53,7 @@ fn completes_a_locally_defined_function_through_a_real_rust_analyzer() {
         return;
     }
 
-    let dir = scratch_package();
+    let dir = scratch_package("completes_a_locally_defined_function");
     let main_rs = dir.join("src/main.rs");
     // Two locally-defined functions with a common prefix, and a caller that
     // has typed the prefix but not finished the name — this is exactly what
@@ -104,7 +113,7 @@ fn an_empty_prefix_position_still_gets_a_clean_reply_not_an_error() {
         eprintln!("SKIPPED: rust-analyzer not on PATH");
         return;
     }
-    let dir = scratch_package();
+    let dir = scratch_package("empty_prefix");
     let main_rs = dir.join("src/main.rs");
     let source = "fn main() {\n    \n}\n";
     std::fs::write(&main_rs, source).unwrap();
@@ -130,7 +139,7 @@ fn did_change_is_reflected_in_the_next_completion() {
         eprintln!("SKIPPED: rust-analyzer not on PATH");
         return;
     }
-    let dir = scratch_package();
+    let dir = scratch_package("did_change");
     let main_rs = dir.join("src/main.rs");
     let v1 = "fn main() {\n    let x = 1;\n}\n";
     std::fs::write(&main_rs, v1).unwrap();
@@ -161,6 +170,50 @@ fn did_change_is_reflected_in_the_next_completion() {
     assert!(
         labels.iter().any(|l| l.contains("freshly_added_function")),
         "didChange's new function should be completable; got {labels:?}"
+    );
+
+    client.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_real_type_error_produces_a_real_diagnostic() {
+    if !rust_analyzer_available() {
+        eprintln!("SKIPPED: rust-analyzer not on PATH");
+        return;
+    }
+    let dir = scratch_package("type_error");
+    let main_rs = dir.join("src/main.rs");
+    // A genuine, unambiguous type error: assigning a &str to an i32.
+    let source = "fn main() {\n    let x: i32 = \"not a number\";\n    let _ = x;\n}\n";
+    std::fs::write(&main_rs, source).unwrap();
+    let uri = format!("file://{}", main_rs.display());
+    let root_uri = format!("file://{}", dir.display());
+
+    let client = aperture_lsp::LspClient::spawn("rust-analyzer", &[], &root_uri)
+        .expect("spawn rust-analyzer");
+    client.did_open(&uri, "rust", source, 1).expect("didOpen");
+
+    // Diagnostics are PUSHED, not requested — poll the client's own cache
+    // (populated by the reader thread off publishDiagnostics) rather than
+    // sending anything.
+    let mut diags = Vec::new();
+    for attempt in 0..30 {
+        diags = client.diagnostics(&uri);
+        if !diags.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500 * (attempt + 1).min(4)));
+    }
+    assert!(!diags.is_empty(), "expected at least one diagnostic for a real type mismatch");
+    assert!(
+        diags.iter().any(|d| d.severity == aperture_lsp::DiagnosticSeverity::Error),
+        "a &str-to-i32 mismatch should be an Error, not a lesser severity; got {diags:?}"
+    );
+    // Line 1 (0-indexed) is where the mismatched assignment is.
+    assert!(
+        diags.iter().any(|d| d.start_line == 1),
+        "expected the diagnostic anchored on the assignment's line; got {diags:?}"
     );
 
     client.shutdown();
