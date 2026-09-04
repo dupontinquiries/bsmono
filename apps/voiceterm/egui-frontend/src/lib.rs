@@ -354,6 +354,13 @@ pub mod zellij_voice;
 /// the first time.
 #[path = "../../src/zbrackets.rs"]
 pub mod zbrackets;
+/// Modeless vim-style count-prefix accumulator (`{N}b` = cycle N forward,
+/// `{N}B` = N back) — the state machine behind TODO_tab_cycle_shortcut.md,
+/// fully done and wired in the Qt frontend since v0.1.719. Pure,
+/// self-contained (no `use` of anything), 8 tests, never re-exported here.
+/// Reusable for any modeless count command, not just tab cycling.
+#[path = "../../src/count_prefix.rs"]
+pub mod count_prefix;
 /// Note clipping's data model + markdown serialization — see
 /// TODO_notes_clip.md. Pure and tested since v0.1.641; had no re-export
 /// and no caller in this frontend before now, same shape as notebook.rs
