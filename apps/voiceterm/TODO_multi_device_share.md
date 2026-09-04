@@ -54,3 +54,36 @@ check for the chosen DB (speakers.toml / fingerprints.bin) — that's
 transport-agnostic and I can build+test it in-sandbox without guessing the
 transport. If B, that's a dedicated design session. If D, see
 TODO_new_speaker_enroll + the handoff item — nothing new needed.
+
+## Found this session (egui port): the panel exists, nothing reaches it
+
+`peer_panel.rs` (egui-frontend) is a complete, tested port of the QML
+`peerPanel` — acoustic-tone identity handshake, voice verification step,
+the works. `self.peer: Option<(PeerPanel, HsState)>` renders correctly
+via `peer_panel_ui` whenever it's `Some`. It is initialized `None` and
+**never set to `Some` anywhere in the binary** — no button, palette
+command, or gesture starts a handshake. Confirmed by grep: zero
+occurrences of `self.peer = Some`.
+
+Two things block wiring this the "easy" way (a palette command that
+just does `self.peer = Some((PeerPanel { ...⟩, HsState::Idle))`):
+
+1. `PeerPanel` has no `Default` — it needs real `my_id`, `my_key_fp`,
+   `workspace_digest`, and (optionally) `my_voiceprint_ref`. There is
+   no identity/keypair provider anywhere in this codebase to supply
+   real values for these. Inventing placeholder strings for a panel
+   whose whole purpose is a TRUST decision would be worse than leaving
+   it unreachable — it would look like a real identity while being
+   fabricated.
+2. The acoustic transport itself (`shared/peer-handshake/src/
+   audio_dialup.rs`'s `symbols_to_samples`/`samples_to_symbols`) is
+   pure and presumably tested, but actually playing/capturing real
+   audio needs a real audio I/O backend, which this build doesn't
+   have wired (same gap noted elsewhere for `voice_routing`/
+   `acoustic_cache` — no live mic pipeline in this build).
+
+Scoped next step, if picked up: a real identity-generation module
+(keypair + fingerprint + workspace digest, persisted like snapclone's
+own `sc-eed906fa` identity.conf pattern) is the actual prerequisite —
+not a bigger version of the panel wiring, a different, smaller,
+separable piece of work that the panel then consumes.
