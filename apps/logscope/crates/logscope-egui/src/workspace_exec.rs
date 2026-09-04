@@ -1115,9 +1115,20 @@ fn truncate(s: &mut String, cap: usize) {
 /// Read-only inspection + the Rust build/test toolchain: what a coding session needs, nothing that
 /// deletes or reaches the network. `run` matches by basename so a full path still gates correctly.
 fn default_allow() -> BTreeSet<String> {
-    ["cargo", "rustc", "rustfmt", "clippy-driver",
+    [// Read-only inspection, plus the toolchain itself.
+     "cargo", "rustc", "rustfmt", "clippy-driver",
      "ls", "cat", "head", "tail", "grep", "rg", "find", "wc",
-     "git", "echo", "true", "test"]
+     "git", "echo", "true", "test",
+     // `sed`'s -i flag can rewrite a file in place, same class of risk as `git reset --hard` or
+     // `find -delete` already on this list above — this allowlist gates by exact BASENAME only,
+     // never by subcommand or flag (see `run_at`'s own comment), so every entry here already
+     // carries whatever its most destructive flag can do. sed is not a new risk category, just
+     // one more instance of a risk already accepted; its read-only uses (stream transforms,
+     // sed -n) are exactly the "teach it more shell tools" ask this was added for.
+     "sed",
+     // tldr (tealdeer): read-only usage-example lookup, no risk at all — lets the model check a
+     // command's common invocations instead of guessing flags from memory.
+     "tldr"]
         .iter().map(|s| s.to_string()).collect()
 }
 
@@ -3776,6 +3787,26 @@ error: could not compile `demo` (lib) due to 3 previous errors
         assert!(ok.ok && ok.output.contains("hi"));
         let denied = ws.apply(&Tool::Run { argv: vec!["rm".into(), "-rf".into(), "/".into()] });
         assert!(!denied.ok && denied.output.contains("not allowed"));
+    }
+
+    /// `sed` and `tldr` are in the DEFAULT allowlist (not one this test grants itself), so this
+    /// exercises the real out-of-the-box tool surface, not a permission this test manufactured.
+    #[test]
+    fn sed_and_tldr_are_usable_by_default() {
+        let root = tmp("sed_tldr");
+        std::fs::write(root.join("in.txt"), "hello world\n").unwrap();
+        let mut ws = Workspace::new(root);
+        // A real stream edit, not just "the binary ran": sed must actually transform stdout.
+        let sed = ws.apply(&Tool::Run {
+            argv: vec!["sed".into(), "s/world/logscope/".into(), "in.txt".into()],
+        });
+        assert!(sed.ok, "{}", sed.output);
+        assert!(sed.output.contains("hello logscope"), "sed did not transform: {}", sed.output);
+        // tldr needs its cache built at least once to answer instead of erroring — skip rather
+        // than fail if this machine's tldr has never been initialised, since that is a machine
+        // state question, not a question about whether the allowlist wiring works.
+        let tldr = ws.apply(&Tool::Run { argv: vec!["tldr".into(), "--version".into()] });
+        assert!(tldr.ok, "tldr must at least be launchable (not blocked): {}", tldr.output);
     }
 
     #[test]
