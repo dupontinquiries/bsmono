@@ -632,8 +632,27 @@ line-level. The streaming cursor (▌) lands on the last line. (chat.rs: `parse_
 LayoutJob runs aren't individually clickable; full click-through would need per-link Hyperlink widgets.
 
 **Tab-level parity** already holds: the egui tabs (bloc, cargo, charts, chat, code, modify, peek, rotate,
-sources) cover the GTK tabs and add `charts`. Remaining within-tab gaps: shared `components.rs` widgets,
-not yet assessed.
+sources) cover the GTK tabs and add `charts`.
+
+**`components.rs` assessed — not a gap, superseded by design.** Every piece in this shared-widgets
+file is either (1) literal GTK widget construction (`build_model_dropdown`, `populate_model_store`
+— `gtk4::DropDown`/`StringList`, meaningless outside GTK), or (2) logic solving a problem specific
+to GTK's architecture that egui's doesn't have:
+- `resolve_key_to_host`/`display_split_entry` decode a `"model@host"` STRING key back into model +
+  host, because `gtk4::DropDown` can only store plain strings as item identities. egui's
+  `PickerItem` is a real enum (`model.rs`) that carries `host` as a typed struct field directly —
+  `PickerItem::key()` uses its own encoding (`"ollama:{model}"` / `"file:{path}"`) for a completely
+  different purpose (stable selection identity across a rescan), never needs to decode a host back
+  out of a string, and was never meant to match GTK's format.
+- `UiScheduler` coalesces multiple GTK `glib::idle_add_local_once` callbacks into one, avoiding
+  "20 updates -> 20 redraws" in glib's retained-mode mainloop. egui is immediate-mode: the whole UI
+  rebuilds from current state every frame regardless of how many things changed, so the problem
+  this debounces does not exist to have — there is nothing to port, not something left undone.
+
+That closes the parity audit this file's own note opened: three real mockups found by line-count
+triage (`modify.rs`, `rotate.rs` fixed; `bloc.rs` found and correctly deferred on a dependency-cost
+question), one live bug found beside it (`app.rs::rescan()`'s fake Ollama data, fixed), and the one
+named remaining item (`components.rs`) resolving to "already superseded," not "still needed."
 
 **CORRECTION (this session): the GTK `ollama.rs` gap above was stale and wrong.** The HTTP dep this
 note said was needed already exists — `logscope::providers` (shared by both frontends) has real
