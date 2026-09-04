@@ -1624,6 +1624,28 @@ Honest gaps, not forgotten ones.
   mean inventing the caller.
 * `linebank::verify` is called only by tests; the real caller needs
   `voiceprint-kit` wired to actual audio.
+* **`blackstar-rs/src/rig.rs`** (found via `orphan_check.py`, then read rather
+  than assumed) — no `mod rig` anywhere, zero tests, 445 lines. Not a stub:
+  the doc comment cites measured stats from a real animation (Keelwright
+  "Change form", 83 joints, 8.33s — 61% skinned, 39% rigid, the exact ratio
+  that argues for walking the node hierarchy rather than a flat matrix list).
+  This is proper glTF skin+clip evaluation — arbitrary continuous sampling of
+  an authored animation.
+  Two open questions, same shape as §9's `unendlich-world`:
+  1. `xform.rs`'s morph is a DIFFERENT approach already shipping — vertex-lerp
+     between 5 authored poses (`BLEND_SEC = 1.3`, tuned easing per damage
+     state). It's not obviously the same problem `rig.rs` solves; `rig.rs`
+     generalises to any glTF clip, `xform.rs` is hand-tuned for exactly one
+     move. Whether `rig.rs` was meant to REPLACE that move's morph or ADD
+     support for other animations `xform.rs` was never built to handle is a
+     product question, not a technical one.
+  2. `joints.rs` already reads a SEPARATE joint-position format written by an
+     external `foldview --joints-json` tool, for debug visualisation only —
+     not the same data path `rig.rs` would need (glTF skins/clips), but worth
+     knowing about before assuming `rig.rs` is the only joint-aware code here.
+  Not wired here: same reasoning as §9 — restoring a 445-line, zero-test
+  animation evaluator into a shipping game blind, with no way to see the
+  result in this sandbox, is how a "verified" claim goes wrong.
 
 `link.rs` DID get a caller: `finale.rs`'s Photon climax now refuses off the
 tether, which is the one place in six films the ceiling is reached.
