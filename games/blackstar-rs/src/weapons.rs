@@ -1528,6 +1528,37 @@ impl Form {
 mod ported_tests {
     use super::*;
 
+    /// Same guard shape as `input.rs`'s `every_action_variant_is_in_the_
+    /// actions_list_exactly_once` (and `save.rs`'s `the_round_trip_test_
+    /// covers_every_field`): `ELEMENTS: [Element; 7]`'s length is compiler-
+    /// checked, but nothing stops a duplicate (two `Element::Fire` entries)
+    /// silently standing in for a real omission (no `Element::Water`
+    /// anywhere) at the same length. `None` is deliberately excluded (it's
+    /// "no element chosen," not a playable one), so this checks "every
+    /// OTHER variant, exactly once" rather than every variant.
+    #[test]
+    fn every_non_none_element_is_in_elements_exactly_once() {
+        let src = include_str!("weapons.rs");
+        let decl = src
+            .split("pub enum Element {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the Element enum");
+        let variants: Vec<&str> = decl
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+            .filter_map(|l| l.strip_suffix(','))
+            .filter(|v| *v != "None")
+            .collect();
+        assert!(variants.len() >= 5, "only found {} variants; the scan broke", variants.len());
+        assert_eq!(variants.len(), ELEMENTS.len(), "Element enum (minus None) and ELEMENTS have different lengths");
+        for v in &variants {
+            let count = ELEMENTS.iter().filter(|e| format!("{e:?}") == *v).count();
+            assert_eq!(count, 1, "Element::{v} appears {count} times in ELEMENTS, not exactly once");
+        }
+    }
+
     #[test]
     fn every_element_has_two_good_and_two_bad_matchups() {
         for a in ELEMENTS {
