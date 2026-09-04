@@ -2379,7 +2379,7 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             let side = car.rot * Vec3::X;
             let off = (ball.pos - car.pos).dot(side);
             let reach = car.half_w.max(0.25) + ball.r;
-            let hold = (1.0 - (off.abs() / reach).clamp(0.0, 1.0)).powi(2);
+            let _hold = (1.0 - (off.abs() / reach).clamp(0.0, 1.0)).powi(2);
             // the dish is a HINT toward the centre line, not a magnet: it
             // only bites near the sweet spot, so a ball already sliding off
             // keeps going
@@ -2393,7 +2393,7 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             // grip (what this was) gives you either a magnet or a marble,
             // and neither of those is dribbling.
             let f = (off.abs() / reach).clamp(0.0, 1.0);
-            let well = if f < 0.66 { (1.0 - f / 0.66).powi(2) } else { 0.0 };
+            let _well = if f < 0.66 { (1.0 - f / 0.66).powi(2) } else { 0.0 };
             // NO DISH. A hood that pulls the ball back to its centre line
             // is what made carries feel magnetic. Keeping the ball is your
             // steering now, not the car's shape.

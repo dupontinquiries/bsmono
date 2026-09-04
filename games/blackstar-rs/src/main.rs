@@ -2750,7 +2750,7 @@ impl Game {
                 };
                 let (blue_home, orange_home) = (home_z(-1.0), home_z(1.0));
                 let bp = self.ball.pos;
-                let mut spawn = |team: u8, k: usize, brain: bots::Brain, sel: &mut Self| {
+                let spawn = |team: u8, k: usize, brain: bots::Brain, sel: &mut Self| {
                     let side = if team == bots::TEAM_BLUE { 1.0 } else { -1.0 };
                     // teammates spawn on the real surface too (a raised
                     // deck would otherwise swallow the whole lineup)
@@ -8723,7 +8723,7 @@ impl Game {
         // shrinks it — the oldest contact cue there is. Alpha, so the
         // back-to-front sort draws it over the terrain and under the body.
         {
-            let mut blob = |objs: &mut Vec<ObjDraw>, pos: Vec3, r: f32| {
+            let blob = |objs: &mut Vec<ObjDraw>, pos: Vec3, r: f32| {
                 let gy = self.world.ground_h(pos.x, pos.z);
                 let h = (pos.y - gy).max(0.0);
                 let fade = (1.0 - h / 6.0).clamp(0.12, 1.0);
@@ -8753,7 +8753,7 @@ impl Game {
         // hostile rounds pulled toward a hot red so whose it is reads at a
         // glance, the way Destiny keeps enemy fire on its own palette.
         {
-            let mut tracer = |objs: &mut Vec<ObjDraw>, s: &shots::Live, hostile: bool| {
+            let tracer = |objs: &mut Vec<ObjDraw>, s: &shots::Live, hostile: bool| {
                 let v = s.vel;
                 let speed = v.length();
                 if speed < 1.0 {

@@ -2414,7 +2414,7 @@ pub fn run(args: &[String]) {
             let mut touches = 0;
             let mut flip_touches = 0;
             let mut flipping = false;
-            let mut record = |ev: &StepEvents, ball: &Ball, best: &mut Vec3, touches: &mut i32| {
+            let record = |ev: &StepEvents, ball: &Ball, best: &mut Vec3, touches: &mut i32| {
                 if !ev.touches.is_empty() {
                     *touches += 1;
                     *best = ball.vel; // last contact wins: that is separation
@@ -2625,7 +2625,7 @@ pub fn run(args: &[String]) {
                     while firstc < spans.len() && spans[firstc].1 <= t {
                         firstc += 1; // retired: the ray is past it
                     }
-                    for (_, i) in cand.iter() {
+                    for (_, _i) in cand.iter() {
                         old += 1;
                     }
                     for (_, _, i) in spans[firstc..].iter() {
@@ -4269,7 +4269,7 @@ pub fn run(args: &[String]) {
                 // floor, so start just below the axis. And enter at PACE:
                 // these lines are ridden, not crawled — several are entered
                 // by launcher and none of them are climbable from a stop.
-                let si0 = 0usize;
+                let _si0 = 0usize;
                 let dir0 = (pts[1] - pts[0]).normalize_or(Vec3::Z);
                 car.pos = pts[0].lerp(pts[1], 0.12) - Vec3::Y * (start_r * 0.45);
                 let dir = dir0;
@@ -7184,7 +7184,7 @@ pub fn run(args: &[String]) {
         // press-to-liftoff latency across surfaces and timings: the ground
         // jump must be as instant as the flip
         let cfg = Config::default();
-        let mut row = |label: &str, style_i: usize, presses: &[f32], drive: f32| {
+        let row = |label: &str, style_i: usize, presses: &[f32], drive: f32| {
             let world = World::generate(31, crate::world::style(style_i), 0.31, 1.0);
             let mut worst = 0.0f32;
             let mut fails = 0;

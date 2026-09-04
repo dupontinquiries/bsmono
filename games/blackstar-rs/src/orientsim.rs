@@ -219,7 +219,7 @@ fn classify_pose(pose_dir: &Path) -> Option<Classified> {
     Some(Classified { guess, lo, hi, center, kinded })
 }
 
-fn kinded_prims(c: &Classified) -> Vec<crate::partdetect::KindedPrim> {
+fn kinded_prims(c: &Classified) -> Vec<crate::partdetect::KindedPrim<'_>> {
     c.kinded.iter().map(|(v, k)| crate::partdetect::KindedPrim { verts: v, kind: *k }).collect()
 }
 

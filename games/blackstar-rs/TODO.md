@@ -30,6 +30,17 @@ pass would want git-blame/bisection to separate "abandoned" from
 "intentionally staged for later," which is a different, bigger task than
 this note.
 
+**Follow-up, same session**: ran `cargo fix --allow-dirty` under all three
+configs — genuinely safe here, since it only applies rustc's own mechanical
+suggestions (drop an unnecessary `mut`, prefix an unused var/param with `_`,
+one explicit lifetime elision) and never deletes a function, struct, or
+field. Reviewed the full diff by hand before trusting it: every change is
+exactly that category, nothing structural. 512 → 490. Full 1592-test suite
+still green on all three configs after. The remaining ~490 are the dead-code
+category (unused functions/structs/constants/fields) cargo fix correctly
+leaves alone — that's the real cleanup, and it's the bisection-first job
+described above, not a `cargo fix` job.
+
 **Re-verified live, this session (c15unified)**: all three configs actually
 built and ran in this sandbox, not just checked for compile errors — 1591/1591
 passing on every one of `--no-default-features`, `--features audio`, and
