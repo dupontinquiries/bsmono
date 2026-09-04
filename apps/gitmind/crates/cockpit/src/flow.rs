@@ -1216,6 +1216,52 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
         run_flags: String::new(),
         bin_name: Some("ambient-learner-egui".into()),
     };
+    // FIVE APPS THE STORE DID NOT OFFER. `manifest_primary_apps_that_the_store
+    // _does_not_offer` has reported them for a while and nobody read the
+    // output; the operator noticed the store was short by comparing it against
+    // `ls apps/`. Each is custom rather than a simple-list entry because none
+    // is a package at `apps/<n>`:
+    //
+    //   hatch, drivemind, switcheroo, dialer — workspaces whose runnable crate
+    //   is a member, the same shape as aperture and cadscope.
+    //   dandere2x — a workspace AND it needs `gpu,app`; the bin is a member
+    //   with the same name as the workspace, which is what makes a bare entry
+    //   look plausible and build nothing.
+    let hatch = || crate::suite::SuiteApp {
+        name: "hatch".into(),
+        path: "apps/hatch/egui-frontend".into(),
+        features: vec![], no_default: false, target: String::new(), run_flags: String::new(),
+        bin_name: Some("hatch-egui".into()),
+    };
+    let drivemind = || crate::suite::SuiteApp {
+        name: "drivemind".into(),
+        path: "apps/drivemind/crates/gui-egui".into(),
+        features: vec![], no_default: false, target: String::new(), run_flags: String::new(),
+        bin_name: Some("drivemind-egui".into()),
+    };
+    let switcheroo = || crate::suite::SuiteApp {
+        name: "switcheroo".into(),
+        path: "apps/switcheroo/crates/switcheroo-egui".into(),
+        features: vec![], no_default: false, target: String::new(), run_flags: String::new(),
+        // The crate is `switcheroo-egui`; its bin is `switcheroo`.
+        bin_name: Some("switcheroo".into()),
+    };
+    let dandere2x = || crate::suite::SuiteApp {
+        name: "dandere2x".into(),
+        path: "apps/dandere2x/crates/dandere2x".into(),
+        // Its own default is `gpu,app`, but `no_default` elsewhere in this
+        // store means a caller can end up with neither; naming them is what
+        // the operator's own build line does.
+        features: vec!["gpu".into(), "app".into()],
+        no_default: false, target: String::new(), run_flags: String::new(),
+        bin_name: Some("dandere2x".into()),
+    };
+    let dialer = || crate::suite::SuiteApp {
+        name: "dialer".into(),
+        path: "apps/dialer/crates/dialer-egui".into(),
+        features: vec![], no_default: false, target: String::new(), run_flags: String::new(),
+        bin_name: Some("dialer-egui".into()),
+    };
     let unendlich = || crate::suite::SuiteApp {
         name: "unendlich".into(),
         path: "unendlich".into(),
@@ -1228,14 +1274,24 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     let mut work_group = group("work", "Productivity, comms & input", &work);
     work_group.apps.push(bsettings());
     work_group.apps.push(ambient_learner());
+    work_group.apps.push(dialer());
+    work_group.apps.push(switcheroo());
+    work_group.apps.push(hatch());
+    work_group.apps.push(drivemind());
     let mut media_group = group("media", "Video, camera, imaging & games", &media);
     // Media rather than music: it is a video NLE first, with the audio editor
     // sharing its core — the README's own framing.
     media_group.apps.push(studio());
     media_group.apps.push(unendlich());
+    media_group.apps.push(dandere2x());
     let mut all_group = group("bigsilicons-apps", "Every BigSilicon app — build all in one go", &all);
     all_group.apps.push(bsettings());
     all_group.apps.push(ambient_learner());
+    all_group.apps.push(dialer());
+    all_group.apps.push(switcheroo());
+    all_group.apps.push(hatch());
+    all_group.apps.push(drivemind());
+    all_group.apps.push(dandere2x());
     all_group.apps.push(beatspace());
     all_group.apps.push(studio());
     all_group.apps.push(aperture());
@@ -1321,8 +1377,12 @@ mod store_group_tests {
         // `egui-frontend` deliberately. Same exception, different cause, and
         // worth saying so: the next reader will otherwise assume it is another
         // workspace.
-        const EXPLICIT_PATH: [&str; 6] =
-            ["bsettings", "studio", "aperture", "cadscope", "simscope", "ambient-learner"];
+        const EXPLICIT_PATH: [&str; 11] = [
+            "bsettings", "studio", "aperture", "cadscope", "simscope", "ambient-learner",
+            // Five apps the store did not offer at all until they were added;
+            // each is a workspace whose runnable crate is a member.
+            "hatch", "drivemind", "switcheroo", "dialer", "dandere2x",
+        ];
         for a in &all.apps {
             assert!(!a.path.contains('/') || EXPLICIT_PATH.contains(&a.name.as_str()),
                     "{} has an explicit path {:?} but is not on the exception list",
@@ -2072,6 +2132,11 @@ mod launch_consistency_tests {
         );
     }
 
+    /// `settings-app` is offered under the name `bsettings` — the crate is
+    /// `bigsilicon-settings`, the manifest id is `settings-app`, and the store
+    /// shows what the user calls it. Matching on the id alone reports it as
+    /// missing, which it is not; the entry's PATH is what settles it.
+    ///
     /// The complement: an app the manifest calls primary and runnable should be
     /// offered, or its absence should be a decision somebody made rather than a
     /// list nobody updated.
@@ -2095,9 +2160,19 @@ mod launch_consistency_tests {
             .iter()
             .flat_map(|g| g.apps.iter().map(|a| a.name.clone()))
             .collect();
+        let offered_paths: std::collections::BTreeSet<String> = store_groups()
+            .iter()
+            .flat_map(|g| g.apps.iter().map(|a| a.path.clone()))
+            .collect();
 
         let mut gap = Vec::new();
         for e in &entries {
+            // Match on PATH as well as name: an entry can legitimately be
+            // shown under a different label than its manifest id, which
+            // `settings-app` / `bsettings` is.
+            if offered_paths.contains(e.path.as_str()) {
+                continue;
+            }
             if !e.primary || !e.is_runnable() {
                 continue;
             }
