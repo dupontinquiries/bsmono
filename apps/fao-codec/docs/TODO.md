@@ -591,3 +591,19 @@ Encode a real video with FAO_V9=1, look at `/tmp/v9_signs_of_life.ppm`.
 If it shows a coherent blob → continue investing. If it's black/random → fix the bug or roll back.
 
 The risk of starting v9 is bounded: v8 playback is untouched, V9DC is a trailer-only addition.
+
+**Partial answer, not the real one — no captured video exists in this environment to run the
+actual test.** Added `v9_volumetric::tests::a_synthetic_triangle_survives_the_full_v9_round_trip`:
+a synthetic red triangle through the FULL pipeline — `build_v9_chunk_from_v8` → `write_v9_trailer`
+→ `read_v9_trailer` → `decode_v9_chunk` → `ray_march` — checking the actual bytes a decoder would
+see, not just the in-memory structs. Result: **positive**. The ray-marched image is not all-black
+(`lit_pixels > 0`) and the brightest pixel reads red, matching the mesh colour, after surviving DCT
+quantisation and the Gaussian splat falloff. Full lib suite: 103/103, no regressions.
+
+This says the pipeline's *mechanism* works — geometry and colour both survive serialization and
+volumetric reconstruction on a case simple enough to reason about by hand. It does NOT answer the
+actual decision point: whether it holds up on real scene complexity, real camera motion, and real
+lighting, which is exactly what a synthetic single triangle can't exercise (no occlusion, no
+multi-block boundaries, no SH view-dependence since the mesh has one flat colour). Encoding a real
+video is still the open task; this just means a bug in the basic wiring is not what would explain
+a bad result if/when that test runs.

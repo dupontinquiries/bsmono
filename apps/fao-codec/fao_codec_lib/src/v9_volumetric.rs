@@ -985,4 +985,62 @@ mod tests {
         let key = MortonKey::encode(5, 5, 5);
         assert!(g.cells.contains_key(&key));
     }
+
+    /// End-to-end: build -> encode -> serialize -> parse -> decode -> ray-march, on a synthetic
+    /// mesh rather than real captured footage (none is available in this environment — this
+    /// exercises the same pipeline the "encode a real video, check for a coherent blob vs.
+    /// black/noise" decision point in docs/TODO.md asks for, just with a triangle standing in for
+    /// a real scene). Answers the part of that question this sandbox CAN answer: whether the
+    /// pipeline itself round-trips a signal at all, not whether it looks good on real content.
+    #[test]
+    fn a_synthetic_triangle_survives_the_full_v9_round_trip() {
+        // A bright red triangle, well inside the AABB the ray-march below will intersect.
+        let mesh = SceneMesh {
+            vertices: vec![
+                Vec3 { x: -1.0, y: -1.0, z: 5.0 },
+                Vec3 { x: 1.0, y: -1.0, z: 5.0 },
+                Vec3 { x: 0.0, y: 1.0, z: 5.0 },
+            ],
+            vertex_colors: vec![[1.0, 0.0, 0.0]; 3],
+            indices: vec![0, 1, 2],
+            normals: vec![Vec3 { x: 0.0, y: 0.0, z: -1.0 }; 3],
+            ..Default::default()
+        };
+        let features = [Vec3 { x: 0.0, y: 0.0, z: 5.0 }];
+
+        let chunk = build_v9_chunk_from_v8(&mesh, &features, 32, 0, 1);
+        assert!(!chunk.blocks.is_empty(), "a real triangle must produce at least one voxel block");
+
+        // Round-trip through the actual container format, not the in-memory struct — the
+        // "decision point" is about what a DECODER sees, which means going through the bytes.
+        let bytes = write_v9_trailer(&[chunk]);
+        let parsed = read_v9_trailer(&bytes).expect("a just-written V9DC trailer must parse");
+        assert_eq!(parsed.len(), 1);
+
+        let grid = decode_v9_chunk(&parsed[0]);
+        assert!(!grid.cells.is_empty(), "decoding must repopulate the voxel grid, not return empty");
+
+        // Camera at the origin looking down +z (identity rotation; ray_march's own camera-space
+        // ray uses +z as forward) — the triangle at z=5 sits directly ahead.
+        let pose = CameraPose::default();
+        let rgb = ray_march(&grid, &pose, 64, 64);
+        assert_eq!(rgb.len(), 64 * 64 * 3);
+
+        let lit_pixels = rgb.chunks(3).filter(|p| p[0] > 10 || p[1] > 10 || p[2] > 10).count();
+        assert!(lit_pixels > 0,
+            "ray-march of a real triangle must not be all-black — got a signs-of-life NEGATIVE");
+
+        // The red channel should dominate somewhere in frame — a coherent red blob, not
+        // colourless noise. Checked as a channel comparison rather than an exact colour match,
+        // since DCT quantisation and the Gaussian splat falloff both soften the original [1,0,0].
+        let (mut best_r, mut best_g, mut best_b) = (0u8, 0u8, 0u8);
+        for p in rgb.chunks(3) {
+            if p[0] as u32 + p[1] as u32 + p[2] as u32 > best_r as u32 + best_g as u32 + best_b as u32 {
+                best_r = p[0]; best_g = p[1]; best_b = p[2];
+            }
+        }
+        assert!(best_r > best_g && best_r > best_b,
+            "the brightest pixel should read red (mesh colour), got rgb({best_r},{best_g},{best_b}) \
+— a signs-of-life NEGATIVE (colour not surviving the round trip) even though geometry did");
+    }
 }
