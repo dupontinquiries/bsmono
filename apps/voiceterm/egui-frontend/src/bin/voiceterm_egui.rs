@@ -2859,10 +2859,35 @@ impl eframe::App for VoicetermApp {
                         // stack; showing base rows under a "sorted by size"
                         // status is the exact lie this tab used to tell.
                         let shown = self.table_engine.apply();
-                        let line = self.table.input.clone();
-                        if voiceterm_egui::table_view::table_view_ui(
-                            ui, &mut self.table, &shown.headers, &shown.rows, &c).is_some()
+                        if let Some(submitted_line) = voiceterm_egui::table_view::table_view_ui(
+                            ui, &mut self.table, &shown.headers, &shown.rows, &c)
                         {
+                            // THE BUTTONS DISCARDED THEIR OWN RETURN VALUE. The
+                            // "undo"/"reset" buttons return `Some("undo")` /
+                            // `Some("reset")` from `table_view_ui` — but until
+                            // now this call site only checked `.is_some()` and
+                            // then called `submit_with_engine`, which reads
+                            // `self.table.input` (the TEXT FIELD), not the
+                            // string the button actually returned. The field
+                            // is empty after every prior submit, and `submit`
+                            // treats an empty line as "nothing typed" and
+                            // returns immediately — so both buttons silently
+                            // did nothing, while typing "undo" and pressing
+                            // Enter worked, because that path writes the field
+                            // itself before returning the same string.
+                            //
+                            // `submitted_line` is correct for BOTH sources: in
+                            // the typed-Enter case it already equals what's in
+                            // the field (the widget wrote it); in the
+                            // button-click case it's the only place the
+                            // intent lives at all. Write it back before
+                            // submitting so button and typed input go through
+                            // the identical parse path, and capture it now —
+                            // submit() clears the field on success, so this is
+                            // the last point it's readable for the re-parse
+                            // below.
+                            let line = submitted_line.clone();
+                            self.table.input = submitted_line;
                             use voiceterm_egui::table_view::Submitted;
                             match voiceterm_egui::table_view::submit_with_engine(&mut self.table) {
                                 // submit() is generic over op types and throws
