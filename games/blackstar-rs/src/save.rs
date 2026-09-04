@@ -72,6 +72,30 @@ pub struct Save {
     /// the action bar: nine slots, each item's side and ammo type,
     /// and the active slot (see hotbar.rs)
     pub hotbar: String,
+    /// PLAN.md Phase 1c plumbing, added ahead of the character-creation
+    /// wizard itself (no UI reaches these yet — same shape as `wep_mods`
+    /// above: the catalogs and types are real and tested,
+    /// `patrol::Faction`/`weapons::ELEMENTS`/`content::SIGNATURES`/
+    /// `ship::HULLS`, but there was nowhere to remember a pick even once
+    /// a wizard existed to make one). Kept as raw indices/discriminants
+    /// rather than importing each type here, matching how `car`/`map`
+    /// are already plain `usize` rather than `content::Chassis`/
+    /// `world::MapStyle`.
+    ///
+    /// `faction`: `patrol::Faction` discriminant order (0=None,
+    /// 1=Hijacks, 2=Corrupted, 3=BlackstarClans, 4=Coalition).
+    pub faction: u8,
+    /// index into `weapons::ELEMENTS` (7 entries).
+    pub element: u8,
+    /// index into `content::SIGNATURES`.
+    pub signature: usize,
+    /// index into `ship::HULLS`.
+    pub hull: usize,
+    /// which room of the chosen hull the player spawns in — an index
+    /// into that hull's own room list, not validated against a specific
+    /// hull here (the wizard picks hull first, so cross-checking belongs
+    /// there, not in the save format).
+    pub berth: usize,
 }
 
 impl Default for Save {
@@ -159,6 +183,15 @@ impl Default for Save {
             watch: String::new(),
             hotbar: starter.line(),
             look: String::new(),
+            // Coalition ("allies, mostly") as the default identity, index 4
+            // in patrol::Faction's own declared order -- see the field's doc
+            // comment on Save for the full mapping. Not 0/None: that reads
+            // as "no faction chosen" rather than a real starting pick.
+            faction: 4,
+            element: 0,
+            signature: 0,
+            hull: 0,
+            berth: 0,
         }
     }
 }
@@ -226,6 +259,11 @@ pub fn parse(text: &str) -> (Save, Bindings, Config) {
             "map" => s.map = v.parse::<usize>().unwrap_or(s.map) % crate::world::STYLE_COUNT,
             "seed" => s.seed = v.parse().unwrap_or(s.seed),
             "name" => s.name = v.to_string(),
+            "faction" => s.faction = v.parse::<u8>().unwrap_or(s.faction) % 5,
+            "element" => s.element = v.parse::<u8>().unwrap_or(s.element) % crate::weapons::ELEMENTS.len() as u8,
+            "signature" => s.signature = v.parse::<usize>().unwrap_or(s.signature) % crate::content::SIGNATURES.len(),
+            "hull" => s.hull = v.parse::<usize>().unwrap_or(s.hull) % crate::ship::HULLS.len(),
+            "berth" => s.berth = v.parse::<usize>().unwrap_or(s.berth),
             "cfg" => {
                 if let Some((ck, cv)) = v.split_once(' ') {
                     cfg.load_line(ck, cv);
@@ -300,6 +338,11 @@ pub fn render(s: &Save, b: &Bindings, cfg: &Config) -> String {
     if !s.name.is_empty() {
         let _ = writeln!(out, "name {}", s.name);
     }
+    let _ = writeln!(out, "faction {}", s.faction);
+    let _ = writeln!(out, "element {}", s.element);
+    let _ = writeln!(out, "signature {}", s.signature);
+    let _ = writeln!(out, "hull {}", s.hull);
+    let _ = writeln!(out, "berth {}", s.berth);
     b.save_lines(&mut out);
     cfg.save_lines(&mut out);
     out
@@ -378,6 +421,11 @@ mod tests {
             case: "thermal_plate".into(),
             watch: "native:3:1".into(),
             hotbar: "1:2:3".into(),
+            faction: 2,
+            element: 5,
+            signature: 7,
+            hull: 3,
+            berth: 4,
         }
     }
 
@@ -426,6 +474,11 @@ mod tests {
         assert_eq!(got.case, want.case, "case");
         assert_eq!(got.watch, want.watch, "watch");
         assert_eq!(got.hotbar, want.hotbar, "hotbar");
+        assert_eq!(got.faction, want.faction, "faction");
+        assert_eq!(got.element, want.element, "element");
+        assert_eq!(got.signature, want.signature, "signature");
+        assert_eq!(got.hull, want.hull, "hull");
+        assert_eq!(got.berth, want.berth, "berth");
     }
 
     /// The guard against the NEXT one: if somebody adds a field to `Save` and
