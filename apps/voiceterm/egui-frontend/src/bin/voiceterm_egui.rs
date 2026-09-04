@@ -787,7 +787,16 @@ impl VoicetermApp {
             self.tabbar_open = false;
             self.keycaps_open = false;
         } else {
-            self.keycaps_open = true;
+            // MINIMAL BY DEFAULT ON DESKTOP TOO. This used to open the
+            // keycaps footer (pipe/brace chips, terminal keycap row,
+            // summaries scope, a date field, the say field — five things
+            // stacked, permanently) on anything wide enough to be a
+            // desktop. Compact/mobile already defaulted this closed and
+            // relied on gesture/shortcut access instead (bar_ui below);
+            // desktop had no equivalent restraint. A terminal emulator
+            // that always shows five rows of chrome under the terminal
+            // is not what "minimal" means anywhere else in this app.
+            self.keycaps_open = false;
         }
     }
 
@@ -839,6 +848,7 @@ impl VoicetermApp {
             // needing — see the comment on the command itself. The chord
             // (Ctrl+Shift+M) is now escape/resume only, not entry.
             Command::ToggleChrome => { self.chrome.toggle(); }
+            Command::ToggleKeycaps => { self.keycaps_open = !self.keycaps_open; }
             // A site rule from the palette, without opening a panel: this
             // is what people actually want when a page has eaten its own
             // sidebar or is unreadable through the ads.
@@ -1875,8 +1885,45 @@ impl eframe::App for VoicetermApp {
                     self.send_input(send.as_bytes());
                 }
             }
+            // A discoverable way back to minimal: this panel is now closed
+            // by default (see compact_defaults_applied), so once it's open
+            // by request, closing it again needs its own control rather
+            // than becoming permanent again by accident.
+            if ui.small_button("\u{2715} hide").clicked() {
+                self.keycaps_open = false;
+            }
         });
         }  // if show_chrome — the keycap and gesture rows
+
+        // THE REVEAL HANDLE. Closed by default now (desktop used to default
+        // this OPEN — see compact_defaults_applied), so there has to be a
+        // way back that isn't "resize the window past 600px and reopen the
+        // app." A palette command covers the keyboard/voice path
+        // (Command::ToggleKeycaps); this is the pointer path, and
+        // deliberately NOT just a plain toggle button.
+        //
+        // The pipe/brace toolbar and bar_ui both ask for a press-HOLD then
+        // drag — natural on a touchscreen, awkward with a mouse, which has
+        // no equivalent of "rest a finger and wait". `SlideMenu::show_tap`
+        // (already built for the link menu, unused as a second general
+        // input mode until now) opens on a plain click instead and commits
+        // on a second click — the same fan-out, reachable without ever
+        // holding a button down. One cell today; the shape holds if this
+        // handle grows options later without changing how it is driven.
+        if show_chrome && !self.keycaps_open {
+            egui::TopBottomPanel::bottom("footer_handle").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let handle = ui.small_button("\u{22EF}");
+                    let menu = voiceterm_egui::slide_menu::SlideMenu::new("footer_reveal_menu").columns(1);
+                    let opts = [voiceterm_egui::slide_menu::SlideOption::new("show", "Show toolbar")];
+                    if let SlideOutcome::Selected(id, _) =
+                        menu.show_tap(ui, egui::Id::new("footer_reveal"), &handle, &opts)
+                    {
+                        if id == "show" { self.keycaps_open = true; }
+                    }
+                });
+            });
+        }
 
         // the settings screen as the QML has it: settingsPopup (main.qml:27729),
         // a centered modal popup. Resizability went with the panel form; the

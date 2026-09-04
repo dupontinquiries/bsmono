@@ -88,6 +88,14 @@ pub enum Command {
     /// escapes/resumes; this is how you choose voice chrome in the first
     /// place, from the palette or by voice like every other mode here.
     ToggleChrome,
+    /// Show or hide the keycaps/summaries/date/say footer.
+    ///
+    /// Closed by default on desktop now (see the same commit's note on
+    /// `compact_defaults_applied`) — a terminal that always shows five
+    /// rows of chrome under the prompt isn't minimal, so it needed a real
+    /// way back. The pointer path is a click-to-arm handle
+    /// (`SlideMenu::show_tap`, next to it); this is the keyboard/voice one.
+    ToggleKeycaps,
 }
 
 /// The three filter levels, as a palette-addressable value.
@@ -184,6 +192,8 @@ pub fn vocabulary() -> Vec<Entry> {
                    keywords: &["preferences", "config", "options"] });
     v.push(Entry { command: Command::ToggleChrome, title: "Toggle voice mode".into(),
                    keywords: &["chrome", "compact", "hide controls", "minimal"] });
+    v.push(Entry { command: Command::ToggleKeycaps, title: "Toggle toolbar".into(),
+                   keywords: &["keycaps", "keys", "footer", "summaries", "show extras"] });
     v.push(Entry { command: Command::ShowPalette, title: "Open command palette".into(),
                    keywords: &["commands"] });
     v
@@ -282,6 +292,9 @@ pub fn parse_phrase(phrase: &str) -> Option<Command> {
     if p.contains("voice mode") || p.contains("voice chrome") || p.contains("touch mode") {
         return Some(Command::ToggleChrome);
     }
+    if p.contains("toolbar") || p.contains("keycaps") || p.contains("show extras") {
+        return Some(Command::ToggleKeycaps);
+    }
     // A view name anywhere in the sentence. Longest label first, so "mail"
     // inside a longer name cannot win over the name itself.
     let mut named: Vec<PaneView> = PaneView::ALL.to_vec();
@@ -374,6 +387,17 @@ mod tests {
         assert_eq!(parse_phrase("go to touch mode"), Some(Command::ToggleChrome));
         assert!(vocabulary().iter().any(|e| e.command == Command::ToggleChrome),
                 "voice chrome must appear in the palette list, not only as a phrase");
+    }
+
+    /// The keycaps/summaries/date/say footer defaults closed on desktop now
+    /// (it used to default open — see compact_defaults_applied's comment);
+    /// this is the keyboard/voice door back, alongside the pointer one
+    /// (a click-to-arm SlideMenu handle, in the binary).
+    #[test]
+    fn the_footer_is_reachable_by_phrase_and_by_palette() {
+        assert_eq!(parse_phrase("show me the toolbar"), Some(Command::ToggleKeycaps));
+        assert!(vocabulary().iter().any(|e| e.command == Command::ToggleKeycaps),
+                "the footer toggle must appear in the palette list, not only as a phrase");
     }
 
     /// A swipe must reach tabs by the same route as the palette and the voice
