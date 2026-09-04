@@ -439,7 +439,10 @@ impl Renderer {
         gl.uniform_1_f32(loc("u_fog").as_ref(), u.fog);
         gl.uniform_1_f32(loc("u_caustic").as_ref(), u.caustic);
         gl.uniform_3_f32(loc("u_caustic_col").as_ref(), u.caustic_col[0], u.caustic_col[1], u.caustic_col[2]);
-        gl.uniform_1_f32(loc("u_nacre").as_ref(), u.nacre);
+        // diagnostic: LOGSCOPE_NACRE=0 kills the thin-film iridescence term to bisect the reported
+        // rainbow banding on water-tagged surfaces (dome/walls/floor) without touching the shader.
+        let nacre_val = if std::env::var("LOGSCOPE_NACRE").as_deref() == Ok("0") { 0.0 } else { u.nacre };
+        gl.uniform_1_f32(loc("u_nacre").as_ref(), nacre_val);
         // SHADOW MAP → texture unit 2 (units 0,1 hold the material/normal arrays)
         self.sampler(gl, self.scene, "u_shadow", 2, t.shadow_tex);
         gl.uniform_matrix_4_f32_slice(loc("u_light_viewproj").as_ref(), false, &u.light_viewproj);
