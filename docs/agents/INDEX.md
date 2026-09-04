@@ -28,6 +28,16 @@ false alarm, and the rule that follows: probe before patching.
 
 ## Catalog (≈40 docs)
 
+### Domain guides — what the user actually does
+
+- [`producer-workflows.md`](producer-workflows.md) — what five hours of
+  the maintainer's FL Studio footage taught about trap/producer
+  workflows: session shape, the idiom (kit, tempo, hats, 808, ramps,
+  sends), the gestures that cost time and what `apps/studio` did about
+  them, collaboration and music-video targets, the analysis method, and
+  the maintainer's vocabulary. Read before deciding what the studio app
+  is missing.
+
 **games/unendlich** — by far the largest cluster. (Moved from `apps/`; the old path was purged, so references to `apps/unendlich` in older notes are historical.)
 - `HANDOFF_I1_viewmodel.md`, `HAIKU_WORKER_BRIEF.md`, `docs/KNOWN-TEST-FAILURES.md`
 - `handoff/` — ~25 task handoffs: `HANDOFF_{fog,weather,water_physics,plants,
