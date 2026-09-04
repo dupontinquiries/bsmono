@@ -471,7 +471,20 @@ pub fn run(args: &[String]) {
         let atlas = crate::bake_car_sdfs(&mut models);
         let h = models[0].sdf_half;
         let dec = |x: usize, y: usize, z: usize| -> f32 {
-            let i = ((z as u32 * CSDF_H + y as u32) * CSDF_W + x as u32) as usize;
+            // The atlas is a CSDF_TILES x CSDF_TILES grid of models per depth
+            // slab (see bake_car_sdfs / shader.wgsl) -- model 0 sits at tile
+            // (0,0,0), so its own local (x,y,z) needs no tile OFFSET, but the
+            // row/slice STRIDE is still the FULL atlas width/height
+            // (CSDF_W/CSDF_H * CSDF_TILES), not the per-tile size. Using the
+            // per-tile size here (as this line originally did) reads whatever
+            // sits CSDF_TILES-times too close in y and CSDF_TILES-times too
+            // close in x -- mostly padding/other-model data -- which is why
+            // this walk previously measured a synthetic 0.32/0.31/0.64 car as
+            // having negative half-extents.
+            use crate::render::CSDF_TILES;
+            let aw = CSDF_W * CSDF_TILES;
+            let ah = CSDF_H * CSDF_TILES;
+            let i = ((z as u32 * ah + y as u32) * aw + x as u32) as usize;
             (atlas[i] as f32 / 255.0) * 2.4 - 0.6
         };
         // walk out from the centre along each axis: where does solid end?
