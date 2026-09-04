@@ -456,10 +456,27 @@ mod tests {
         // handles it by drawing nothing. An error here would turn "no
         // webcam plugged in" into a visible fault.
         let list = enumerate();
-        // Cannot assert emptiness — CI might have a loopback device — so
-        // assert the shape instead: whatever comes back is well formed.
+        // Cannot assert emptiness — a machine might have a loopback device —
+        // so assert the shape instead: whatever comes back is well formed.
+        //
+        // NOT `starts_with("video")`. That held only for the v4l2 fallback,
+        // and `enumerate` prefers PipeWire when a session exists — where an id
+        // is a NODE NAME like
+        // `v4l2_input.platform-580000000.pcie-pci-0000_04_00.0-usb-0_2_1.0`.
+        // `camera_select`'s own doc says so in as many words: "pipewiresrc
+        // target-object=<node> — not a /dev/videoN path".
+        //
+        // So the test asserted the fallback's shape and failed on the machine
+        // the app is actually for. Found by running the suite on a real device
+        // (fleet-logs, 2026-09-04); every build box here has no PipeWire
+        // session, takes the v4l2 path, and passed.
+        //
+        // The real invariant is what the id is USED for: it goes into a
+        // gstreamer property, so it must be non-empty and free of whitespace.
         for d in &list {
-            assert!(d.id.starts_with("video"), "id is the node name: {}", d.id);
+            assert!(!d.id.is_empty(), "a device with no id cannot be selected");
+            assert!(!d.id.contains(char::is_whitespace),
+                    "an id with whitespace breaks `pipewiresrc target-object=`: {:?}", d.id);
             assert!(!d.label.is_empty(), "every device needs a label");
         }
     }
