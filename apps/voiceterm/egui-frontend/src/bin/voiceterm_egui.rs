@@ -1292,6 +1292,44 @@ impl eframe::App for VoicetermApp {
 
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // WORKSPACE TAB CYCLING. Ctrl+Right / Ctrl+Left. Checked at the very
+        // top of `update()`, before anything else reads `ctx.input()`.
+        //
+        // History worth keeping: this was tried twice before in this same
+        // session and reverted both times as apparently non-functional —
+        // first as Ctrl+Tab (egui/winit reserve plain Tab for widget-focus
+        // internally, so that guess was at least plausible), then as
+        // Ctrl+Right/Left moved to this exact position (which SHOULD have
+        // worked and, it turns out, DID: a diagnostic print confirmed the
+        // key arrives with `mods.command == true` and `repeat == false`,
+        // exactly what `key_pressed` requires). The actual blocker was a
+        // SEPARATE bug fixed one commit prior: `Workspace::command()` had
+        // no match arm for "next tab"/"previous tab" at all, so
+        // `apply(&WsCall::Command("next tab"))` silently returned `false`
+        // and did nothing — regardless of whether the key was ever
+        // detected correctly. It was. This is the same code reverted
+        // last time, restored now that the thing actually blocking it is
+        // fixed.
+        //
+        // Ctrl+Right/Left rather than Ctrl+Tab: the ordinary browser/
+        // editor convention, and NOT the vim-style modeless `{N}b`/`{N}B`
+        // this session found built and tested (count_prefix.rs,
+        // TODO_tab_cycle_shortcut.md) but left unwired — that scheme needs
+        // a reliable "am I in a text field right now" exclusion this
+        // frontend has no established pattern for, and bare 'b'/digit keys
+        // are typed constantly, especially in the terminal. A modifier-
+        // gated arrow combination sidesteps that whole question: Ctrl+
+        // Right is not something typing, in a shell or anywhere else,
+        // ever produces.
+        ctx.input(|i| {
+            if i.modifiers.command && i.key_pressed(egui::Key::ArrowRight) {
+                self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command("next tab".into()));
+            }
+            if i.modifiers.command && i.key_pressed(egui::Key::ArrowLeft) {
+                self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command("previous tab".into()));
+            }
+        });
+
         uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(self.theme));
         // ONCE PER FRAME, shared by every panel that needs it. detect reads
         // the context and asks whether any touch input exists this frame;
