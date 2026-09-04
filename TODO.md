@@ -407,10 +407,56 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   emoji) can still be a few px off. That's an engine limit, not a bug in
   this table, and not worth chasing further without shaping support egui
   doesn't have.
-- **IME preedit** (`egui::Event::Ime`), **LSP** (own crate behind the same
-  worker pattern as the completion Engine), **egui_kittest** snapshots for the
-  view layer (state layer is already headless-tested), **minimap** on the
-  scrollbar rail.
+- ~~**IME preedit**~~ **DONE, and this note didn't know it either.**
+  `egui::Event::Ime` → `Ev::Preedit`/`Ev::Text(commit)` is fully wired
+  (`view.rs` translates it, `state.rs` shows composing text with an
+  underline distinct from the ghost, reports `IMEOutput` so the platform's
+  own candidate window appears at the caret) with its own test coverage
+  (`preedit_shows_composing_text_and_dismisses_ghost_and_popup` and
+  siblings). Same pattern as the CJK and minimap entries below: the work
+  landed, the note just never got told.
+- ~~**minimap** on the scrollbar rail~~ **DONE** — `view.rs`'s `scrollbar()`
+  already draws it (its own doc comment says so: "Minimap marks: where in
+  the WHOLE FILE... does something worth noticing sit?"), diff lines and
+  find matches over the full-file scrollbar rail, tested
+  (`scrollbar_marks_reflect_real_uncommitted_lines_and_find_matches`). Marks
+  rather than a literal miniature code render — if a real pixel-preview minimap
+  is what's wanted instead, that is a different, bigger feature, not a
+  follow-up to this one.
+- ~~**egui_kittest** snapshots for the view layer~~ **DONE.** A prior pass
+  proved the harness→render→compare pipeline worked at all with a
+  deliberately text-free solid-rectangle baseline
+  (`tests/kittest_snapshot.rs`), reasoning that a system-font substitution
+  could make a text-bearing snapshot flaky across machines. Checked that
+  assumption before extending it: `view.rs` uses `FontId::monospace`, which
+  resolves to egui's own EMBEDDED font, not a system one — bundled bytes
+  shipped inside the `egui` crate, so two machines on the same `egui`
+  version render identical glyph bitmaps. Added `tests/view_snapshot.rs`:
+  an empty buffer, a small syntax-highlighted Rust file, and a multi-cursor
+  selection (the one piece of this session's multi-cursor work that had
+  only ever been eyeballed in an Xvfb screenshot, now a standing regression
+  test instead of a one-time look). Needed `mesa-vulkan-drivers` (lavapipe)
+  installed in-sandbox for egui_kittest's wgpu-based renderer to have a
+  device at all — undocumented prerequisite, worth knowing for the next
+  session that tries this cold.
+
+  Found a real bug on the way, by looking at what the baseline actually
+  rendered rather than only checking the test passed: at 400px width the
+  status bar's right-to-left "Ctrl+P commands · F2 loop" hint visually
+  overlapped the left-to-right "Rust" language label — mixing writing
+  directions inside one `ui.horizontal` doesn't reserve space between them
+  in egui, so at narrow widths (the mobile-Linux targets this project
+  cares about, not just a small desktop window) the two drew on top of
+  each other. Fixed by measuring remaining width before the right-aligned
+  section and hiding the hint — the single most droppable thing in the
+  bar — when there isn't room for it, rather than letting it collide.
+  Verified both directions with baseline snapshots: hidden and legible at
+  400px, present and legible at 700px.
+
+  `cargo test -p aperture-egui --lib`: 88/88, unaffected (the fix and the
+  new tests are both `view.rs`/integration-test-only).
+- **LSP**: still genuinely open. Own crate, behind the same worker pattern
+  as the completion `Engine` — this one is real scope, not a stale note.
 
 ## voiceterm — loop-trimmer off-by-one (fixed at source, 2026-08-19)
 

@@ -978,6 +978,16 @@ fn status_bar(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, now_ms:
             );
         }
 
+        // Measured on the OUTER horizontal, right before the right-aligned
+        // section starts — this is what's actually left after everything
+        // drawn so far on the left (filename, Ln/Col, language, and
+        // whichever of the optional follow/rev/git markers fired). The
+        // right-to-left child ui below does NOT get this number for free:
+        // it lays out from ITS OWN right edge outward, with no awareness of
+        // how far the left-hand cursor already advanced, so on a narrow
+        // window (a phone screen, not just a small desktop window) the two
+        // sides drew on top of each other instead of one giving way.
+        let room = ui.available_width();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some((msg, until)) = &state.status {
                 if now_ms < *until {
@@ -996,8 +1006,17 @@ fn status_bar(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, now_ms:
                 ("ai idle".to_string(), colors.text_weak)
             };
             ui.label(egui::RichText::new(chip).color(color));
-            ui.separator();
-            ui.label(egui::RichText::new("Ctrl+P commands · F2 loop").color(colors.text_weak));
+            // The hint is the single most droppable thing in this bar — a
+            // reminder of a shortcut, not state the person needs to see —
+            // so it is the one thing that gives way when space runs out,
+            // rather than silently overlapping whatever drew first.
+            // 220px comfortably fits "Ctrl+P commands · F2 loop" at the
+            // status bar's font size; below that it would either truncate
+            // mid-word or collide with the chip just drawn.
+            if room > 220.0 {
+                ui.separator();
+                ui.label(egui::RichText::new("Ctrl+P commands · F2 loop").color(colors.text_weak));
+            }
         });
     });
     if state.rev_ix.is_some() && !state.rev_note.is_empty() {
