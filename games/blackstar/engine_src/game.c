@@ -1275,7 +1275,7 @@ static float g_hit_flash = 0.0f;      // red screen flash on taking damage
 static float g_hit_dir[3] = {0,0,0};  // world dir the last hit came from
 static const char *g_hit_src = "";    // what hit us (for the HUD)
 static long g_high_score = 0;
-static void hide_body(ex_model_t **parts);
+static void hide_body(ex_model_t *parts[EX_ROBOT_PARTS]);
 static void save_config(void);
 static void load_config(void);
 static void load_map_colliders(const char *mapid);
