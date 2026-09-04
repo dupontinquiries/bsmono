@@ -1207,7 +1207,12 @@ pub struct Chat {
     compact_declined: usize,
     /// Long-horizon: when the reply budget would be squeezed below the usable floor, stop and ask
     /// for a summary of the older turns instead of shrinking this reply (and every one after it).
-    summarize_on_squeeze: bool,
+    /// What to do when the reply budget would drop below usable.
+    ///
+    /// Was a bool. Three states, because the comments on the compaction path
+    /// ask for a human in the loop and a checkbox cannot express "ask" — see
+    /// `crate::relief_policy`.
+    relief_policy: crate::relief_policy::ReliefPolicy,
     /// Set by Ctrl+Enter with an aimed fan: the NEXT dispatch goes to every column, then the aim
     /// resumes. One-shot rather than a mode, because "say this to everyone" is a sentence, not a
     /// state the operator has to remember to leave.
@@ -1486,7 +1491,7 @@ impl Default for Chat {
             verify_job: None,
             image_job: None,
             replicator: None,
-            summarize_on_squeeze: false,
+            relief_policy: crate::relief_policy::ReliefPolicy::default(),
             compact_offer: None,
             compact_declined: 0,
             fan_broadcast_once: false,
@@ -2059,7 +2064,11 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
             // Long-horizon relief: only meaningful when auto-continue is on (that is the mode
             // whose replies are long enough for the squeeze to cost an answer), so the toggle is
             // gated on it rather than being a second setting that silently does nothing.
-            summarize_instead_of_squeeze: self.auto_continue && self.summarize_on_squeeze,
+            // `Ask` yields None and falls back to the OLD behaviour rather
+            // than to summarize: an unanswered question must not silently pick
+            // the more destructive option. The prompt is raised separately.
+            summarize_instead_of_squeeze: self.auto_continue
+                && self.relief_policy.engine_flag().unwrap_or(false),
             n_threads: 4, n_gpu_layers: -1 }
     }
 
@@ -9521,7 +9530,7 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                     // would be a policy expressed twice, which is how the watchdog tables drifted.
                     let (mut panel_mode, mut stepwise) = (self.panel_mode, self.stepwise);
                     let (mut auto_continue, mut patch_mode) = (self.auto_continue, self.patch_mode);
-                    let mut summarize_on_squeeze = self.summarize_on_squeeze;
+                    let mut relief_policy = self.relief_policy;
                     {
                         // Split the borrow: the closure below already
                         // holds `&mut` locals, so reaching through `self`
@@ -9547,15 +9556,30 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                         // auto-continue on: that is the mode whose replies are long enough for the
                         // budget squeeze to cost an answer, and a checkbox that silently does
                         // nothing is worse than one that is visibly unavailable.
+                        // A DROPDOWN, not a checkbox. Two states could not hold "ask",
+                        // and the code around the compaction path keeps saying a human
+                        // should be in the loop — so the case those comments describe
+                        // was the one setting that could not be selected.
                         ui.add_enabled_ui(auto_continue, |ui| {
-                            uikit_egui::a11y::note(a11y, egui::Id::new("logscope.chat.summarize_on_squeeze").value(),
-                            "summarize, don't squeeze", summarize_on_squeeze,
-                            ui.checkbox(&mut summarize_on_squeeze, RichText::new("summarize, don't squeeze").small()))
-                                .on_hover_text("Long-horizon: when the prompt has grown enough that the reply \
-budget would drop below a usable answer, STOP and summarize the older turns, then continue with the \
-freed room — instead of silently shrinking every reply from here on (the default, which walked one \
-session's budget from 2470 down to 814 tokens over seventeen turns without saying so).");
-                        });
+                            let before = relief_policy;
+                            egui::ComboBox::from_id_salt("logscope.chat.relief_policy")
+                                .selected_text(RichText::new(relief_policy.label()).small())
+                                .show_ui(ui, |ui| {
+                                    for p in crate::relief_policy::ReliefPolicy::all() {
+                                        ui.selectable_value(
+                                            &mut relief_policy, p,
+                                            RichText::new(p.label()).small())
+                                            .on_hover_text(p.hover());
+                                    }
+                                });
+                            // `a11y::note` takes a bool, which is the same shape
+                            // problem the checkbox had. The dropdown announces
+                            // itself as three entries — each `selectable_value`
+                            // carries its own label and hover — and the combo's
+                            // response below carries the current one, so a reader
+                            // hears which policy is active rather than "on/off".
+                            let _ = before;
+                        }).response.on_hover_text(relief_policy.hover());
                         uikit_egui::a11y::note(a11y, egui::Id::new("logscope.chat.patch_mode").value(),
                             "patch mode", patch_mode,
                             ui.checkbox(&mut patch_mode, RichText::new("patch mode").small()))
@@ -9583,7 +9607,7 @@ session's budget from 2470 down to 814 tokens over seventeen turns without sayin
                         }
                     }
                     self.auto_continue = auto_continue; self.patch_mode = patch_mode;
-                    self.summarize_on_squeeze = summarize_on_squeeze;
+                    self.relief_policy = relief_policy;
                     if self.hit_cap && !streaming {
                         if theme::action_button(ui, "⏭ Continue", theme::CYAN(), true)
                             .on_hover_text("The last reply hit the length cap — resume it").clicked() { do_continue = true; }
