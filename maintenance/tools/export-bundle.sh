@@ -35,8 +35,18 @@ SUMMARY="$(printf '%s' "$SUMMARY" | tr '[:upper:] _' '[:lower:]--' | tr -cd 'a-z
 [ -n "$SUMMARY" ] || { echo "summary slug reduced to nothing" >&2; exit 1; }
 
 mkdir -p "$OUT"
-last=$(ls "$OUT" 2>/dev/null | sed -n "s/^${SERIES}-\([0-9]\{3\}\)-.*\.bundle$/\1/p" | sort -n | tail -1)
+# The sequence comes from BOTH the output directory and a stamp file, and the
+# stamp is why. Reading the directory alone means deleting an old bundle — to
+# free disk, which this sandbox needs to do constantly — resets the counter: a
+# session that had shipped 006 exported the next one as 001. The number is
+# supposed to say which drop this is, and a second 001 makes two bundles
+# indistinguishable by name.
+STAMP="$OUT/.${SERIES}-seq"
+last_dir=$(ls "$OUT" 2>/dev/null | sed -n "s/^${SERIES}-\([0-9]\{3\}\)-.*\.bundle$/\1/p" | sort -n | tail -1)
+last_stamp=$(cat "$STAMP" 2>/dev/null | tr -dc '0-9')
+last=$(printf '%s\n%s\n' "${last_dir:-0}" "${last_stamp:-0}" | sort -n | tail -1)
 next=$(printf '%03d' $(( 10#${last:-0} + 1 )))
+printf '%s\n' "$next" > "$STAMP"
 path="$OUT/${SERIES}-${next}-${SUMMARY}.bundle"
 
 cd "$REPO"
