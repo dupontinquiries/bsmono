@@ -1139,6 +1139,60 @@ Two harness traps worth knowing:
   server was simply gone. The error names the display, not the dead server, so
   check `ps aux | grep Xvfb` before believing the app is at fault.
 
+
+## 23. logscope-egui mesh artefacts: backface culling is never enabled
+
+Reported as "we have some mesh issues in logscope-egui", with a screenshot
+showing spiky black wedges and odd shading through the scene.
+
+Investigated rather than fixed, because the obvious one-line change could make
+it worse and I could not verify it in the time I had.
+
+### What I ruled out
+
+**Not NaN normals.** `scene_kit::mesh3d::norm` guards a zero-length vector and
+returns `+Y` rather than dividing by zero — and because `NaN > 1e-6` is false,
+a NaN input takes the same safe branch. The vertex-normal accumulation in
+`rock` and friends is area-weighted by construction (the cross product's
+magnitude IS the area), which is the correct scheme, not a bug.
+
+That matters because blackstar's non-finite audit (c14unified-026) found five
+defective modules of nine, so it was the first thing to suspect here. scene-kit
+is clean on this point.
+
+### What I found
+
+`shared/scene-kit/src/glow_scene.rs` enables `DEPTH_TEST` in two places and
+**never enables `CULL_FACE`**. Grep returns nothing for it.
+
+With depth testing on and culling off you do not get wrong ORDERING — the depth
+buffer handles that — but every back face is rasterised and shaded. Where a
+mesh is open, or its winding is inconsistent, you see its interior lit as
+though it were exterior. That is consistent with the artefacts in the
+screenshot, and it also doubles the fragment work in a scene this dense.
+
+### Why the one-line fix is not obviously safe
+
+`gl.enable(glow::CULL_FACE)` is correct only if every mesh winds consistently.
+`mesh3d` has 32 places pushing triangles; the parameterised primitives (sphere,
+rock, tube) derive their topology and will be consistent, but the hand-built
+quads and panels each spell out `[0,1,2],[0,2,3]` and any one of them written
+against a flipped basis would VANISH rather than shade oddly.
+
+So enabling culling turns a shading artefact into a missing-geometry artefact
+if the assumption is wrong, and there is no compiler check for it.
+
+### The experiment to run
+
+This is now cheap, per §22: build `logscope-egui`, run it under Xvfb, screenshot
+the scene, enable `CULL_FACE`, screenshot again, and compare. Ten minutes of
+build and two screenshots settles both questions at once — whether culling
+fixes the artefacts, and whether anything disappears.
+
+If geometry does vanish, the follow-up is `glow::FRONT_AND_BACK` culling
+disabled for the specific meshes at fault rather than reverting wholesale, and
+the vanished ones are then a list of primitives to fix the winding on.
+
 ---
 
 # C14_TODO — open threads from the c14 session (blackstar/voice line)
