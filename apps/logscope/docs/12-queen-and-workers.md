@@ -165,3 +165,49 @@ pinning a persistent worker to a node when nothing else forces a move.
    until the roster fills. A small seed set (reader, test-runner, patcher) may be worth shipping.
 3. **What does a bee do when its success criteria are unmeetable?** It must be able to say so and
    stop, rather than loop — the `RefusalLadder` shape, one level up.
+
+## Status: what is now wired (was: none of it)
+
+Everything above was pure design + a tested library with no caller when this section was written.
+As of this pass, the following is real, running code, not just this document:
+
+* **The seed roster (open question 2, answered with a concrete set).** `roster::seed_roster()`
+  ships `reader` (read-only, no lane, `search`/`read_file`/`read_range`/`read_near`/`git_log`),
+  `test-runner` (read-only, `run`/`read_file`/`git_log`), and `doc-writer` (owns `docs`,
+  `read_file`/`read_near`/`write_file`/`doc`). Deliberately **no** generic `patcher` — a lane-less
+  patcher with write access is exactly the "Scope" failure `owns` exists to prevent; a real patcher
+  needs a real lane, which a seed set cannot know. See `roster::seed_roster`'s doc comment.
+
+* **Lane enforcement is real, not aspirational.** `Workspace` carries an `owns: Vec<String>`
+  (empty = unrestricted, so every pre-existing caller is unaffected); `write_file` and `edit_file`
+  both call `check_owned()` before touching disk, refusing with a message that names the lane. The
+  system prompt tells a confined model its lane in plain language when one is set.
+
+* **`Chat::stage_lane`** — the Delegator's cheap rule, live in `:agent`, `:fan-agent`, and `:docs`:
+  each stages the task against `self.roster.staff(task)` before running. A `Reuse` match confines
+  the run to that worker's lane. An `Ambiguous` match (two workers, equally-specific lanes) is
+  named in the HUD rather than silently falling through to an unconfined run, pointing at `:queen`.
+  A `Create` result (no lane matched — the ordinary case for prose tasks) stays silent by design;
+  flagging the common case would just be HUD noise.
+
+* **`:queen <task>` / `:enlist`** — the Queen call itself. `:queen` stages
+  `Roster::queen_request(task)` (the roster + `QUEEN_PROMPT` + the task) as the next input, so
+  whichever model is loaded can design a `WorkerSpec` — no new async plumbing, a Queen call is just
+  a prompt. `:enlist` walks the active lineage to the latest assistant reply, parses it with
+  `queen::WorkerSpec::parse`, validates it against the real runtime tool list, and adds it to
+  `Chat::roster` (a session-lifetime field, seeded from `seed_roster()`) if it validates — or
+  reports the exact `SpecError::correction()` if not, without adding a broken spec.
+
+* **Open question 3, answered for the lane case.** `Stop::LaneRefused` — three consecutive turns
+  where every write/edit attempted was refused by `check_owned`, even across *different*
+  out-of-lane paths (which the repetition guard cannot see, since each attempt is a distinct
+  action), stops the run and names the lane rather than burning the step budget. See
+  `AgentRun::lane_refusals` / `Stop::LaneRefused` in `workspace_exec.rs`.
+
+**Still not built:** open question 1 (the focusing-effect measurement) needs an actual run, not
+code. `hive.rs`'s placement logic (`Reach::Anywhere` vs `Colocated`) is untouched — there is no
+remote/multi-box dispatch path yet to exercise it. Per-branch staffing in a fan-out (today
+`:fan-agent`/`:docs` staff the WHOLE task once, not each branch's sub-task independently) is not
+attempted. And the roster does not persist across a restart — only a worker's own memory directory
+does (per the design above); `Chat::roster` is rebuilt from `seed_roster()` plus whatever was
+`:enlist`ed fresh each session.
