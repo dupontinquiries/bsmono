@@ -2914,6 +2914,7 @@ dependencies = [
  "config-kit",
  "cpal",
  "crossbeam-channel",
+ "dirs",
  "eframe",
  "egui",
  "gpu-gemm",

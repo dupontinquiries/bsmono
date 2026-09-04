@@ -650,6 +650,33 @@ correct for this sandbox (no LAN, no Ollama server), and confirms the code path 
 hang or panic rather than assuming it from reading the source. Removed the now-dead `mi()`/
 `tier_for()` fixture helpers `rescan()` no longer needs.
 
+**Line-count triage found a second mockup: `tabs/rotate.rs`.** Same method as `modify.rs`'s port —
+compared every GTK `ui/*_tab.rs` against its egui counterpart by line count. `rotation_tab.rs`
+(931) -> `rotate.rs` (71, a 13.1x shrink — the most extreme of any tab, including `modify.rs`'s
+original 14.8x) was a naive filename miss on the FIRST pass (`rotation_tab.rs` maps to `rotate.rs`,
+not `rotation.rs` — the loop's own automatic name-derivation was wrong, not a real gap), caught by
+checking rather than trusting the "no counterpart" result the script printed.
+
+What was there: the identical mockup shape as `modify.rs` before its fix — `config_text()` built a
+preview from UI state with no connection to the real backend, and "Apply" was a no-op button that
+always reported success regardless of outcome. `logscope::rotation` (`write_logrotate_conf`,
+`write_systemd_user_units`) and `logscope::probe::probe` already existed, pure and GTK-free, same
+as `modify.rs`'s scoring functions — real backend, unwired UI.
+
+Wired `probe()` for the tab's own step 1 (ownership/tier before offering a save target — a
+`/var/log` file owned by root needs a different target than one under `$HOME`), and real writes on
+Apply: `write_logrotate_conf` for the two logrotate-style targets, `write_systemd_user_units` for
+the systemd one, with the result (success + path written, or the real error) shown instead of the
+old placeholder that always read "Applied". Added `dirs` as a direct dependency for `~` expansion.
+
+5 new tests, checked against real files: `apply_writes_a_real_logrotate_conf_with_the_real_values`
+writes to an actual temp directory and reads the bytes back to confirm the policy's real values
+(keep-count, compress) landed in the file, not just that the function returned `Ok`;
+`apply_reports_failure_rather_than_a_false_ok_when_the_write_cannot_happen` forces a real
+`create_dir_all` failure (a file blocking where a directory needs to go) and asserts it surfaces as
+failure rather than reading as success the way the old placeholder always did. Full
+logscope-egui --features gui suite: 1330/1330 (1325 + 5 new), 0 regressions.
+
 **DeepSeek-style models — design note** (see outputs/DEEPSEEK_SUPPORT.md, analysis not implementation):
 "DeepSeek" splits into (1) the R1 *distills*, which are dense Llama/Qwen — the Llama ones (e.g.
 R1-Distill-Llama-8B) should run **today** on the llama path, and their `<think>` output already renders via

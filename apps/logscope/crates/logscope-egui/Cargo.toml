@@ -5,6 +5,9 @@ edition = "2021"
 description = "egui/eframe port skeleton of the logscope UI (replaces the GTK4/Adwaita shell)"
 
 [dependencies]
+# Home-directory expansion for rotate.rs's "~/.config/..." save targets — same version logscope
+# itself already pins.
+dirs = "5.0"
 # scan_lan_parallel (logscope::providers) takes a crossbeam_channel::Sender specifically — bridged
 # into app.rs's own std::sync::mpsc channel in rescan() rather than changing that channel's type
 # everywhere it's already threaded through drain_scan()/scan_rx.
