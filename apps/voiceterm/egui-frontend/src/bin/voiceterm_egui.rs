@@ -4748,6 +4748,14 @@ fn main() -> eframe::Result<()> {
                 web_prefs: voiceterm_egui::web_prefs::load(),
                 graph_source: String::new(),
             };
+            // Set once, here, rather than left for the assistant's first
+            // reply to explain (the previous state — see b6e55cf5's commit
+            // message): a limitation worth knowing before typing a
+            // message, not discovered only after sending one. `ChatPanel`
+            // has no way to know its own backend's state; this is the
+            // caller telling it, same as `provider`/`busy`.
+            app.chat.backend_status = Some(
+                "no local model attached in this build — replies are a placeholder, not a real response".to_string());
             // Take the focused pane id FROM THE MODEL rather than
             // hardcoding it.
             //
