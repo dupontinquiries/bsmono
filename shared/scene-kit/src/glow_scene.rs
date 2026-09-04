@@ -368,6 +368,29 @@ impl Renderer {
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(t.scene_fbo));
         gl.viewport(0, 0, t.sw, t.sh);
         gl.enable(glow::DEPTH_TEST); gl.depth_func(glow::LESS);
+        // BACK FACES OFF, behind an env switch.
+        //
+        // `CULL_FACE` was never enabled here. Depth testing gets the ORDER
+        // right, but every back face is still rasterised and shaded — so an
+        // open mesh, or one whose winding disagrees with the rest, shows its
+        // interior lit as though it were exterior. That is a candidate for the
+        // reported mesh artefacts, and it also doubles fragment work in a
+        // scene this dense.
+        //
+        // Behind `LOGSCOPE_CULL=0` rather than unconditional, because
+        // `mesh3d` pushes triangles in ~32 places. The parameterised
+        // primitives derive their topology and will be consistent; the
+        // hand-built quads each spell out `[0,1,2],[0,2,3]` and any one
+        // written against a flipped basis will VANISH under culling rather
+        // than merely shade oddly. A switch turns "some geometry disappeared"
+        // into one environment variable instead of a rebuild.
+        if std::env::var("LOGSCOPE_CULL").as_deref() != Ok("0") {
+            gl.enable(glow::CULL_FACE);
+            gl.cull_face(glow::BACK);
+            gl.front_face(glow::CCW);
+        } else {
+            gl.disable(glow::CULL_FACE);
+        }
         // Alpha blend the scene pass: geometry is painter-sorted back-to-front (pack_sorted), so alpha<1 glass
         // shows the ocean through it while opaque meshes blend to a no-op. Premultiply-friendly src-over.
         gl.enable(glow::BLEND);
