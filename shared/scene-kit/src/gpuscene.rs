@@ -545,13 +545,21 @@ void main() {
     // NACRE: thin-film iridescence on glass/water — a view-dependent hue shimmer (the pearl/mother-of-pearl
     // sheen). Strongest at grazing angles (fresnel) and on glossy surfaces, so glass dome, crystal, clear
     // windows and water-material pearls shimmer with a slow rainbow rim without washing out the base colour.
+    //
+    // Frequencies tuned for a SMALL glossy facet (a pearl, a window pane), where fresnel and world position
+    // barely vary across the object — the "spectral sweep" reads as a gentle shimmer. `is_water` also covers
+    // the floor, glass dome and outer walls (surfaces spanning tens of units), where the same phase function
+    // completed several full 2π rainbow cycles across one continuous surface: visible as flat-out banding,
+    // confirmed by LOGSCOPE_NACRE=0 making it vanish entirely. Cut both phase frequencies by roughly an order
+    // of magnitude so a big surface gets a slow single drift instead of a repeating rainbow; amplitude
+    // untouched, so pearls/panes keep their original shimmer strength, just spread over more distance/time.
     if (is_water) {
-        float ph = fres * 6.2831 + dot(N, view) * 3.5 + u_time * 0.25 + v_world.y * 0.15;
+        float ph = fres * 1.6 + u_time * 0.25 + v_world.y * 0.04;
         vec3 nacre = 0.5 + 0.5 * cos(ph + vec3(0.0, 2.094, 4.188)); // R,G,B offset 120° → spectral sweep
         col += u_nacre * nacre * fres * gloss * (0.22 + 0.18 * u_ambient);
         // view-INDEPENDENT mother-of-pearl sheen: a slow rainbow that flows across the surface by world position
         // + time, so even flat, head-on facets (the in-scene UI panel) shimmer and "play with light".
-        float ph2 = dot(v_world.xyz, vec3(0.7, 1.1, 0.5)) * 0.85 + u_time * 0.45;
+        float ph2 = dot(v_world.xyz, vec3(0.07, 0.11, 0.05)) + u_time * 0.25;
         vec3 sheen = 0.5 + 0.5 * cos(ph2 + vec3(0.0, 2.094, 4.188));
         col += u_nacre * sheen * gloss * 0.075 * (0.5 + 0.5 * u_ambient);
     }
