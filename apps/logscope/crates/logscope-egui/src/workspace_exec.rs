@@ -27,6 +27,8 @@ use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use logscope::filewindow;
+use logscope::symbolfind;
 
 // ── tools the model can call ────────────────────────────────────────────────────────────────────
 
@@ -49,6 +51,12 @@ pub enum Tool {
     Search { pattern: String, path: String },
     /// Read a line range of a file (1-based, inclusive) — the surgical companion to `Search` for workers.
     ReadRange { path: String, start: usize, end: usize },
+    /// Locate `name` in `path` and read WINDOW(S) around its matches, ranked so a definition
+    /// anchors before a mere use (`symbolfind`), sized to the model's class and merged when
+    /// matches cluster (`filewindow`), with an explicit caveat when the read is partial. The
+    /// tool that connects two modules this project already had — grep tells a model where
+    /// something is, `read_range` makes it guess one window at a time to actually see it.
+    ReadNear { path: String, name: String },
     /// Recent COMMIT HISTORY of the workspace. What a repository has recently
     /// done is evidence a file read cannot supply — why a field exists, which
     /// change broke a build, whose convention a module follows. Rendered
@@ -102,8 +110,8 @@ pub enum Tool {
 ///
 /// One list, and a test that fails if the enum grows a variant that is not in it.
 pub const RUNTIME_TOOLS: &[&str] = &[
-    "write_file", "edit", "read_file", "read_range", "list_dir", "search", "run", "git_log", "doc",
-    "propose", "scratch_code",
+    "write_file", "edit", "read_file", "read_range", "read_near", "list_dir", "search", "run",
+    "git_log", "doc", "propose", "scratch_code",
 ];
 
 impl Tool {
@@ -117,6 +125,7 @@ impl Tool {
             Tool::Run { .. } => "run",
             Tool::Search { .. } => "search",
             Tool::ReadRange { .. } => "read_range",
+            Tool::ReadNear { .. } => "read_near",
             Tool::GitLog { .. } => "git_log",
             Tool::Scratch { .. } => "scratch_code",
             Tool::Propose { .. } => "propose",
@@ -137,6 +146,7 @@ impl Tool {
             Tool::Run { argv } => format!("run {}", argv.join(" ")),
             Tool::Search { pattern, path } => format!("search /{}/ in {}", pattern, if path.is_empty() { "." } else { path }),
             Tool::ReadRange { path, start, end } => format!("read {path}:{start}-{end}"),
+            Tool::ReadNear { path, name } => format!("read_near {path} ~ {name}"),
             Tool::Edit { path, find, replace } => format!("edit {} (−{} +{} B)", path, find.len(), replace.len()),
             Tool::Doc { name, content } => format!("doc {} ({} B, shared)", name, content.len()),
         }
@@ -201,6 +211,13 @@ pub struct Workspace {
     /// reconstruct — a timestamp gives order, not "this idea came out of that
     /// one" — so it is recorded at write time.
     scratch_last: Option<String>,
+    /// Paths this run may WRITE to — the Queen/worker design's `owns` lane (`docs/12-queen-and-
+    /// workers.md`), enforced here for the first time rather than existing only as a spec field
+    /// nothing checked. Empty = unrestricted, so every existing caller that never set this is
+    /// unaffected. Read tools are never restricted by it: a lane is about what a worker may
+    /// CHANGE, and a bee that cannot even look outside its lane cannot tell whether editing inside
+    /// it is safe.
+    owns: Vec<String>,
 }
 
 impl Workspace {
@@ -214,6 +231,13 @@ impl Workspace {
     /// The engine's own parameter count — beats the label when both are known.
     pub fn with_model_params(mut self, params: Option<u64>) -> Self {
         self.model_params = params;
+        self
+    }
+
+    /// This run may only WRITE inside these lanes; reads are unrestricted (see the field doc on
+    /// `owns`). Empty (the default) means unrestricted, matching every caller that predates this.
+    pub fn with_owns(mut self, owns: Vec<String>) -> Self {
+        self.owns = owns;
         self
     }
 
@@ -233,6 +257,7 @@ impl Workspace {
             model_params: None,
             scratch_last: None,
             last_green: None,
+            owns: Vec::new(),
         }
     }
 
@@ -310,6 +335,7 @@ impl Workspace {
             Tool::Run { argv } => self.run(argv),
             Tool::Search { pattern, path } => self.search(pattern, path),
             Tool::ReadRange { path, start, end } => self.read_range(path, *start, *end),
+            Tool::ReadNear { path, name } => self.read_near(path, name),
             Tool::Edit { path, find, replace } => self.edit_file(path, find, replace),
             Tool::Doc { name, content } => self.write_doc(name, content),
             Tool::Scratch { title, lang, body } => self.scratch(title, lang, body),
@@ -533,6 +559,84 @@ Continue with read_range {rel} {} {}]",
         ToolResult::ok(out)
     }
 
+    /// Locate `name` in `path` and read the WINDOW(S) around its matches, rather than making the
+    /// model guess a `read_range` one attempt at a time.
+    ///
+    /// This is `symbolfind` (rank a hit as a definition, a use, a test-only use, a comment or a
+    /// string literal, and prefer the definition) and `filewindow` (merge nearby hits into one
+    /// window, keep windows whole rather than truncating them, and say honestly what was NOT
+    /// read) wired to an actual file on disk. Both were fully implemented and tested with no
+    /// caller: a model could locate a name with `search` and then still had to read a whole file
+    /// or binary-search `read_range` to see it.
+    fn read_near(&self, rel: &str, name: &str) -> ToolResult {
+        if name.trim().is_empty() {
+            return ToolResult::err("read_near: name is empty — give the symbol or text to anchor on");
+        }
+        let abs = match self.resolve_read(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
+        let text = match std::fs::read_to_string(&abs) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData =>
+                return ToolResult::err(format!("read_near {rel}: binary file — not read.")),
+            Err(e) => return ToolResult::err(format!("read {rel}: {e}")),
+        };
+        if looks_binary(text.as_bytes()) {
+            return ToolResult::err(format!("read_near {rel}: binary file — not read."));
+        }
+        let all_lines: Vec<&str> = text.lines().collect();
+        let total = all_lines.len();
+
+        // Cheap brace-depth test-region scan: a `#[cfg(test)]` line opens a region that closes
+        // when brace depth returns to what it was when the attribute was seen. Syntactic, like
+        // `symbolfind::classify` itself — a real parse would need the file to compile.
+        let mut test_regions: Vec<(usize, usize)> = Vec::new();
+        let mut test_start: Option<(usize, i32)> = None;
+        let mut depth = 0i32;
+        let mut matches: Vec<(usize, String)> = Vec::new();
+        for (i, line) in all_lines.iter().enumerate() {
+            let n = i + 1;
+            if line.contains("#[cfg(test)]") && test_start.is_none() {
+                test_start = Some((n, depth));
+            }
+            depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+            if let Some((s, d0)) = test_start {
+                if depth <= d0 && n > s { test_regions.push((s, n)); test_start = None; }
+            }
+            if line.contains(name) { matches.push((n, line.to_string())); }
+        }
+        if let Some((s, _)) = test_start { test_regions.push((s, total)); }
+        if matches.is_empty() {
+            return ToolResult::err(format!(
+                "read_near {rel}: no line contains {name:?} ({total} lines total) — try `search` \
+for a looser match, or check the spelling"));
+        }
+
+        let ranked = symbolfind::rank(&matches, name, &test_regions);
+        let mut anchors = symbolfind::definition_anchors(&ranked);
+        if anchors.is_empty() {
+            // No definition among the hits (a use-only or comment-only search) — anchor on every
+            // match in file order, capped so a common word doesn't explode into one window each.
+            anchors = ranked.iter().map(|m| m.line).take(20).collect();
+        }
+
+        let b = crate::read_harness::budget(
+            crate::read_harness::ModelClass::resolve(self.model_params, &self.model_label));
+        let plan = filewindow::plan(total, &anchors, b.chunk_lines);
+
+        let mut out = String::new();
+        for (wi, w) in plan.windows.iter().enumerate() {
+            let end = w.end.min(total);
+            let body = all_lines[w.start.saturating_sub(1)..end].join("\n");
+            out.push_str(&crate::read_harness::fence(
+                &format!("{rel} — window {}/{}", wi + 1, plan.windows.len()),
+                &format!("lines {}-{} of {total}, anchored on {:?}: {}", w.start, end, name, w.because),
+                &body, &b, Some(w.start)));
+        }
+        if let Some(c) = plan.caveat() {
+            out.push_str(&format!("\n{c}\n"));
+        }
+        ToolResult::ok(out)
+    }
+
     /// Ingest raw external bytes (a DRAG-AND-DROPPED file) to a sandboxed workspace path, recording a
     /// `FileEvent`. Unlike `WriteFile` (UTF-8 contents from the model), this takes bytes, so dropped
     /// binaries land intact. `dest_rel` is workspace-relative.
@@ -637,8 +741,27 @@ the task.", body.len(), if truncated { ", truncated" } else { "" }))
         }
     }
 
+    /// Refuse a write outside this run's `owns` lanes, when it has any — the Queen/worker design's
+    /// scope guarantee, enforced. Same prefix-or-exact match as `roster::Roster::staff` uses to
+    /// STAFF a task to a lane; here it GATES a write against one. Empty `owns` (every caller that
+    /// predates this) is unrestricted, matching the field's documented default.
+    fn check_owned(&self, rel: &str) -> Result<(), String> {
+        if self.owns.is_empty() { return Ok(()); }
+        let covers = self.owns.iter().any(|lane| {
+            let lane = lane.trim_end_matches('/');
+            if lane.is_empty() { return false; }
+            rel == lane || rel.strip_prefix(lane).is_some_and(|r| r.starts_with('/'))
+        });
+        if covers { Ok(()) } else {
+            Err(format!(
+                "{rel}: outside this worker's lane ({}) — this worker may only write there; a task \
+touching {rel} belongs to a different worker or a new one", self.owns.join(", ")))
+        }
+    }
+
     fn write_file(&mut self, rel: &str, contents: &str) -> ToolResult {
         if rel.starts_with('~') { return ToolResult::err(format!("{rel}: library roots (~std/~deps) are READ-ONLY")); }
+        if let Err(e) = self.check_owned(rel) { return ToolResult::err(e); }
         let abs = match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
         let existed = abs.exists();
         // BEFORE THE WRITE, NOT AFTER. A refusal the model can act on is worth far more than a
@@ -669,6 +792,7 @@ the task.", body.len(), if truncated { ", truncated" } else { "" }))
     /// model exactly how to recover (re-read for a stale anchor, extend an ambiguous one).
     fn edit_file(&mut self, rel: &str, find: &str, replace: &str) -> ToolResult {
         if rel.starts_with('~') { return ToolResult::err(format!("{rel}: library roots (~std/~deps) are READ-ONLY")); }
+        if let Err(e) = self.check_owned(rel) { return ToolResult::err(e); }
         let abs = match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
         if find.is_empty() {
             return ToolResult::err(format!("edit {rel}: empty find anchor — copy the exact text to replace"));
@@ -1481,6 +1605,11 @@ pub struct AgentConfig {
     /// Supersedes `hector_mode`, which is the single Hardware profile and is still honoured: a run
     /// setting the old bool gets `[Hardware]` unless it named profiles explicitly.
     pub profiles: Vec<crate::engprofile::ProfileId>,
+    /// Paths this run may WRITE to (the Queen/worker `owns` lane). Empty = unrestricted, so every
+    /// existing caller is unaffected. See `Workspace::check_owned` for the enforcement and
+    /// `logscope_fan::roster::seed_roster`/`Roster::staff` for where this gets filled in from a
+    /// staffing decision rather than typed by hand.
+    pub owns: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -1514,6 +1643,7 @@ impl Default for AgentConfig {
             require_proof: false,
             extra_allow: Vec::new(),
             profiles: Vec::new(),
+            owns: Vec::new(),
         }
     }
 }
@@ -1771,6 +1901,7 @@ fn diagnose(block: &str) -> Rejected {
         "read_file" => &["path"],
         "edit" | "edit_file" | "patch" => &["path", "find"],
         "read_range" => &["path"],
+        "read_near" => &["path", "name"],
         // `pattern` OR `query` satisfies search, so neither can be listed as
         // required — parse_tool_block accepts either and rejecting here would
         // refuse a call the parser would have built.
@@ -1881,6 +2012,10 @@ fn parse_one(block: &str) -> Option<Tool> {
                 .or_else(|| json_num(block, "end")).unwrap_or(start);
             Some(Tool::ReadRange { path, start, end })
         }
+        "read_near" => Some(Tool::ReadNear {
+            path: json_str(block, "path")?,
+            name: json_str(block, "name").or_else(|| json_str(block, "symbol"))?,
+        }),
         "search" => Some(Tool::Search {
             pattern: json_str(block, "pattern").or_else(|| json_str(block, "query"))?,
             path: json_str(block, "path").unwrap_or_default(),
@@ -2044,6 +2179,13 @@ pub enum Stop {
     Stalled,
     /// The model call itself failed (e.g. generation error).
     ModelError(String),
+    /// Every write/edit this run attempted landed outside its owned lane, several turns running —
+    /// the Queen/worker design's open question 3 ("what does a bee do when its success criteria
+    /// are unmeetable... it must be able to say so and stop, rather than loop"), applied to the
+    /// lane guarantee. A model that keeps trying different out-of-lane paths is not looping in the
+    /// sense the repetition guard catches (each attempt is a DIFFERENT action), so this needed its
+    /// own counter rather than reusing `Stalled`.
+    LaneRefused { lane: Vec<String> },
 }
 
 /// The full record a session produces: every turn + why it stopped + the file-event feed + the plan the
@@ -2233,10 +2375,12 @@ pub fn system_prompt(task: &str, cfg: &AgentConfig) -> String {
         ReadPolicy::Full => "\
 - read_file   { \"tool\":\"read_file\", \"path\":\"<rel path>\" }  (whole file — prefer this; context is cheap)
 - search      { \"tool\":\"search\", \"pattern\":\"<text>\", \"path\":\"<rel or empty>\" }  (grep the repo — find where a concept lives)
-- read_range  { \"tool\":\"read_range\", \"path\":\"<rel path>\", \"start\":<line>, \"end\":<line> }  (a slice of a big file)"
+- read_range  { \"tool\":\"read_range\", \"path\":\"<rel path>\", \"start\":<line>, \"end\":<line> }  (a slice of a big file)
+- read_near   { \"tool\":\"read_near\", \"path\":\"<rel path>\", \"name\":\"<symbol or text>\" }  (jump straight to every place a name appears in one file, too big to read whole)"
             .to_string(),
         ReadPolicy::Surgical => "\
 - search      { \"tool\":\"search\", \"pattern\":\"<text>\", \"path\":\"<rel or empty>\" }  (grep the repo — use this first)
+- read_near   { \"tool\":\"read_near\", \"path\":\"<rel path>\", \"name\":\"<symbol or text>\" }  (once search names the FILE, this reads the windows around the name — prefer it over read_range)
 - read_range  { \"tool\":\"read_range\", \"path\":\"<rel path>\", \"start\":<line>, \"end\":<line> }  (read just the lines you need)
 - read_file   { \"tool\":\"read_file\", \"path\":\"<rel path>\" }  (whole file — only when it is small)"
             .to_string(),
@@ -2253,6 +2397,11 @@ you. Favor code that compiles over clever code that might not; when you see erro
         )
     };
     let doc_note = if cfg.doc_mode { format!("\n\n{}", crate::docorg::DOC_ORG_GUIDE) } else { String::new() };
+    let owns_note = if cfg.owns.is_empty() { String::new() } else {
+        format!("\n\nYOUR LANE: you may only write_file/edit within {} — a write outside it is \
+refused by the runtime, not just discouraged. If the task needs a change elsewhere, say so and stop \
+rather than attempting it.", cfg.owns.join(", "))
+    };
     // Working discipline. Placed with the other mode blocks so prompt order
     // stays stable across runs (a moving prompt invalidates KV reuse).
     // WORKING DISCIPLINE. `profiles` supersedes the single `hector_mode` bool, which maps to the
@@ -2376,7 +2525,7 @@ Rules:
 - After each tool call you will see its result, then decide the next step.
 - When the task is finished and verified, reply with the single line: {DONE_MARKER}
 
-Emit one or a few tool calls per turn, then wait for results.{patch_note}{verify_note}{doc_note}{hector_note}{persona_note}{ctx_note}"
+Emit one or a few tool calls per turn, then wait for results.{patch_note}{verify_note}{doc_note}{owns_note}{hector_note}{persona_note}{ctx_note}"
     )
 }
 
@@ -2964,6 +3113,9 @@ pub struct AgentRun {
     /// nothing could answer "what is this run doing" without reading the transcript back.
     task: String,
     started: std::time::Instant,
+    /// Consecutive turns where every write/edit attempted was refused by `check_owned` — see
+    /// `Stop::LaneRefused`. Reset by any turn that isn't purely lane-refused writes.
+    lane_refusals: u32,
 }
 
 impl AgentRun {
@@ -2981,6 +3133,7 @@ impl AgentRun {
         let ws = Workspace::new(work_dir)
             .with_model_label(cfg.model_label.clone())
             .with_model_params(cfg.model_params)
+            .with_owns(cfg.owns.clone())
             // The configured verify command is allowed to run: it comes from the operator, and
             // gating it on the model's allowlist made any non-cargo suite structurally unverifiable.
             .allow_also(cfg.verify_cmd.first().cloned())
@@ -2996,6 +3149,7 @@ impl AgentRun {
             compacted: 0,
             task: task.to_string(),
             started: std::time::Instant::now(),
+            lane_refusals: 0,
         };
         (run, prompt)
     }
@@ -3012,10 +3166,36 @@ impl AgentRun {
     /// The worker finished a turn: process the accumulated reply and decide the next action.
     pub fn on_done(&mut self) -> AgentStep {
         let text = std::mem::take(&mut self.reply);
-        let (_results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard, &mut self.ladder, self.guide.as_mut());
+        let (results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard, &mut self.ladder, self.guide.as_mut());
         self.turns += 1;
         self.step += 1;
         if let Some(stop) = stop { return AgentStep::Finished(stop); }
+        // LANE-REFUSAL LADDER. `check_owned` refuses a write outside `cfg.owns`, but a model that
+        // reacts by trying a DIFFERENT out-of-lane path each turn produces a different action
+        // signature every time — invisible to the repetition guard above, which exists to catch
+        // the model repeating itself, not to catch it trying many things that are all refused for
+        // the same structural reason. Three consecutive turns where every attempted write/edit
+        // was refused this way means the task cannot be done inside this lane at all.
+        if !self.cfg.owns.is_empty() {
+            let writes: Vec<&ToolResult> = results.iter()
+                .filter(|(t, _)| matches!(t, Tool::WriteFile { .. } | Tool::Edit { .. }))
+                .map(|(_, r)| r)
+                .collect();
+            let all_lane_refused = !writes.is_empty()
+                && writes.iter().all(|r| !r.ok && r.output.contains("outside this worker's lane"));
+            if all_lane_refused {
+                self.lane_refusals += 1;
+                if self.lane_refusals >= 3 {
+                    return AgentStep::Finished(Stop::LaneRefused { lane: self.cfg.owns.clone() });
+                }
+                self.prompt.push_str(&format!(
+                    "\n\n(Every write this turn was outside your lane ({}). If the task needs a \
+change elsewhere, say so and stop rather than trying another out-of-lane path.)\n",
+                    self.cfg.owns.join(", ")));
+            } else if !writes.is_empty() {
+                self.lane_refusals = 0; // a write that succeeded, or failed for another reason, resets it
+            }
+        }
         if self.step >= self.cfg.max_steps { return AgentStep::Finished(Stop::StepLimit); }
         // The clock, checked here — before a step begins — for the reason in
         // `AgentConfig::max_wall`: a step is the atom, and a run cut between
@@ -3767,6 +3947,50 @@ error: could not compile `demo` (lib) due to 3 previous errors
         assert_eq!(evs[0].change, FileChange::Created);
         assert_eq!(evs[1].change, FileChange::Modified);
         assert_eq!(evs[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn a_write_outside_the_owned_lane_is_refused_and_names_the_lane() {
+        let mut ws = Workspace::new(tmp("owns-refuse")).with_owns(vec!["docs".into()]);
+        let r = ws.apply(&Tool::WriteFile { path: "src/lib.rs".into(), contents: "fn a(){}".into() });
+        assert!(!r.ok, "a write outside docs/ must be refused");
+        assert!(r.output.contains("docs"), "the refusal must name the lane: {}", r.output);
+        assert!(!ws.root().join("src/lib.rs").exists(), "nothing was written");
+    }
+
+    #[test]
+    fn a_write_inside_the_owned_lane_succeeds() {
+        let mut ws = Workspace::new(tmp("owns-allow")).with_owns(vec!["docs".into()]);
+        let r = ws.apply(&Tool::WriteFile { path: "docs/notes.md".into(), contents: "# notes".into() });
+        assert!(r.ok, "{}", r.output);
+    }
+
+    #[test]
+    fn an_edit_outside_the_owned_lane_is_also_refused() {
+        let mut ws = Workspace::new(tmp("owns-edit"));
+        // write it first with NO restriction, then reopen the workspace as a confined worker
+        let _ = ws.apply(&Tool::WriteFile { path: "src/lib.rs".into(), contents: "fn a(){}".into() });
+        let mut confined = Workspace::new(ws.root()).with_owns(vec!["docs".into()]);
+        let r = confined.apply(&Tool::Edit { path: "src/lib.rs".into(), find: "a".into(), replace: "b".into() });
+        assert!(!r.ok, "an edit outside the lane must be refused just like a write");
+    }
+
+    #[test]
+    fn an_unrestricted_workspace_owns_writes_anywhere_as_before() {
+        // Empty `owns` (every caller before this existed) must be completely unaffected.
+        let mut ws = Workspace::new(tmp("owns-empty"));
+        let r = ws.apply(&Tool::WriteFile { path: "anything/at/all.rs".into(), contents: "fn a(){}".into() });
+        assert!(r.ok, "{}", r.output);
+    }
+
+    #[test]
+    fn a_lane_note_appears_in_the_prompt_only_when_a_lane_is_set() {
+        let mut cfg = AgentConfig::default();
+        let bare = system_prompt("do a thing", &cfg);
+        assert!(!bare.contains("YOUR LANE"), "no lane, no note");
+        cfg.owns = vec!["docs".into()];
+        let scoped = system_prompt("do a thing", &cfg);
+        assert!(scoped.contains("YOUR LANE") && scoped.contains("docs"), "{scoped}");
     }
 
     #[test]
@@ -4865,6 +5089,45 @@ mod long_horizon_tests {
         format!("```tool\n{{\"tool\":\"write_file\",\"path\":\"{path}\",\"contents\":\"// attempt {n}\\n\"}}\n```")
     }
 
+    /// The lane ladder (`Stop::LaneRefused`): a model that tries a DIFFERENT out-of-lane path every
+    /// turn produces a different action signature each time, so the repetition guard never fires —
+    /// this needed its own counter. Three consecutive turns of nothing-but-lane-refusals must stop
+    /// the run and NAME the lane, rather than burning the whole step budget on a task that structurally
+    /// cannot be done inside it.
+    #[test]
+    fn three_consecutive_lane_refusals_on_different_paths_stop_the_run() {
+        let d = tmp("lane-ladder");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 20,
+            verify_cmd: Vec::new(), verify_exts: Vec::new(), owns: vec!["docs".into()], ..Default::default() };
+        // Every attempt targets a DIFFERENT path outside docs/ — distinct action signatures, so this
+        // is NOT what the repetition/churn guards catch; only the lane ladder should stop it.
+        let script: Vec<String> = (1..=3).map(|n| write_call(&format!("src/attempt{n}.rs"), n)).collect();
+        let (stop, run) = drive(&d, "add a feature to src/", cfg, &script);
+        match stop {
+            Stop::LaneRefused { lane } => assert_eq!(lane, vec!["docs".to_string()]),
+            other => panic!("expected LaneRefused, got {other:?}"),
+        }
+        // And nothing was actually written outside the lane — the refusal held every time.
+        assert!(run.events().is_empty(), "no write should have landed: {:?}", run.events());
+    }
+
+    /// A write that succeeds INSIDE the lane, interleaved with out-of-lane attempts, must reset the
+    /// counter rather than accumulate across unrelated turns.
+    #[test]
+    fn a_successful_in_lane_write_resets_the_lane_ladder() {
+        let d = tmp("lane-ladder-reset");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 20,
+            verify_cmd: Vec::new(), verify_exts: Vec::new(), owns: vec!["docs".into()], ..Default::default() };
+        let mut script: Vec<String> = (1..=2).map(|n| write_call(&format!("src/attempt{n}.rs"), n)).collect();
+        script.push(write_call("docs/notes.md", 99)); // in-lane — resets the counter
+        script.extend((3..=4).map(|n| write_call(&format!("src/attempt{n}.rs"), n)));
+        let (stop, _run) = drive(&d, "add a feature", cfg, &script);
+        // Only 2 consecutive out-of-lane turns after the reset — below the threshold of 3 — so the
+        // run must reach a normal stop (step limit via the drive() DONE-marker tail), not LaneRefused.
+        assert!(!matches!(stop, Stop::LaneRefused { .. }), "the in-lane write should have reset the ladder");
+    }
     /// The stall detector: consecutive checks with the error count pinned reach Blocked. Asserted on
     /// the PHASE, not on `Stop::Stalled` — the repetition guard produces that same stop, so the stop
     /// alone proves nothing about the phase machine (verified by switching `stateful_guide` off: the
@@ -5406,6 +5669,7 @@ mod long_horizon_tests {
             Tool::Run { argv: vec!["true".into()] },
             Tool::Search { pattern: "x".into(), path: String::new() },
             Tool::ReadRange { path: "p".into(), start: 1, end: 2 },
+            Tool::ReadNear { path: "p".into(), name: "x".into() },
             Tool::GitLog { n: 1, path: String::new() },
             Tool::Edit { path: "p".into(), find: "a".into(), replace: "b".into() },
             Tool::Doc { name: "d".into(), content: String::new() },
