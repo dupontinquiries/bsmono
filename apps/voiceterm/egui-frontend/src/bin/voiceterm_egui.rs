@@ -696,6 +696,11 @@ struct VoicetermApp {
     /// a THIRD permanent bottom bar stacked under the bar and the session
     /// strip — see `apply_compact_defaults`.
     keycaps_open: bool,
+    /// The session's running note — TODO_notes_clip.md's "active Note"
+    /// that clips accumulate into. One note for the whole session is the
+    /// smallest useful shape; splitting into multiple named notes is real
+    /// future work the TODO itself defers past its first slice.
+    clip_note: voiceterm_egui::note_clip::Note,
     /// Whether the one-time narrow-surface default has been applied. Applied
     /// once rather than every frame, so collapsing is a starting position the
     /// user can override, not a cage that re-shuts whatever they open.
@@ -849,6 +854,35 @@ impl VoicetermApp {
             // (Ctrl+Shift+M) is now escape/resume only, not entry.
             Command::ToggleChrome => { self.chrome.toggle(); }
             Command::ToggleKeycaps => { self.keycaps_open = !self.keycaps_open; }
+            // TODO_notes_clip.md's smallest slice: "Terminal: selection
+            // already works... 'clip this' over a terminal selection".
+            // Attribution is best-effort — there is no link from a
+            // Selection back to the CommandBlock it was made within, so
+            // the most recent block is the closest approximation. True
+            // for the common case (clipping something just seen), not
+            // guaranteed for a selection made further back in scrollback.
+            Command::ClipSelection => {
+                let content = self.app.selection.take().map(|s| s.text);
+                match content {
+                    Some(text) if !text.trim().is_empty() => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs()).unwrap_or(0);
+                        let (command, at) = self.blocks.blocks.last()
+                            .map(|b| (b.command.clone(), b.started_at))
+                            .unwrap_or_else(|| (String::new(), now));
+                        let clip = voiceterm_egui::note_clip::Clip {
+                            kind: voiceterm_egui::note_clip::ClipKind::Text,
+                            content: text,
+                            source: voiceterm_egui::note_clip::Source::Terminal { command, at },
+                            captured_at: now,
+                        };
+                        self.clip_note.push_clip(clip);
+                        self.toasts.success("Clipped to notes", 0.0);
+                    }
+                    _ => { self.toasts.warning("nothing selected to clip", 0.0); }
+                }
+            }
             // A site rule from the palette, without opening a panel: this
             // is what people actually want when a page has eaten its own
             // sidebar or is unreadable through the ads.
@@ -3445,6 +3479,27 @@ impl eframe::App for VoicetermApp {
                                 }
                             }
                         }
+                        // CLIPS, WITH PROVENANCE. A separate spine from the
+                        // capture/cards/backlinks system above — that one
+                        // splits free-typed prose into cards; this is
+                        // TODO_notes_clip.md's "highlight → card": select
+                        // something in the terminal, run `Command::
+                        // ClipSelection`, and it lands here with a citation
+                        // saying which command produced it. Read-only
+                        // display of `Note::to_markdown()`'s raw output for
+                        // this first slice — a rendered markdown view (the
+                        // same doc.rs/manpage_view pipeline the Docs pane
+                        // uses) is real future work, not attempted here.
+                        if !self.clip_note.blocks.is_empty() {
+                            ui.separator();
+                            ui.label(egui::RichText::new(format!(
+                                "clips — {}", self.clip_note.title)).weak().size(11.0));
+                            egui::ScrollArea::vertical().id_salt("clip_note").max_height(200.0)
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new(
+                                        self.clip_note.to_markdown()).monospace());
+                                });
+                        }
                     }
                     PaneView::Build => {
                         // Compiler output as a navigable list. No cargo is
@@ -4513,6 +4568,7 @@ fn main() -> eframe::Result<()> {
         Box::new(move |_cc| {
             let mut app = VoicetermApp {
                 keycaps_open: true,
+                clip_note: voiceterm_egui::note_clip::Note::new("Session clips"),
                 compact_defaults_applied: false,
                 ingest: Default::default(),
                 // Discovery once at startup, not per frame: scanning

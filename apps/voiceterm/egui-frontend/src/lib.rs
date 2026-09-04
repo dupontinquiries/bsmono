@@ -301,6 +301,12 @@ pub mod table_nlp;
 /// depends on table_ops, already above it, so `#[path]` costs nothing new.
 #[path = "../../src/notebook.rs"]
 pub mod notebook;
+/// Note clipping's data model + markdown serialization — see
+/// TODO_notes_clip.md. Pure and tested since v0.1.641; had no re-export
+/// and no caller in this frontend before now, same shape as notebook.rs
+/// just above.
+#[path = "../../src/note_clip.rs"]
+pub mod note_clip;
 // The GestureHost+SlidePopup replacement (grid gesture menus with QML-parity variants) lives in
 // the shared kit; re-exported under a voiceterm-familiar name.
 pub use uikit_egui::slide_menu;
