@@ -397,6 +397,16 @@ mod tests {
         for (i, t) in TROOPS.iter().enumerate() {
             assert!(TROOPS.iter().skip(i + 1).all(|o| o.id != t.id), "duplicate troop {}", t.id);
         }
+        // COMMANDERS and SIGNATURES were missing from this check -- both are
+        // looked up by id the same way CHASSIS/TROOPS are (commander(id),
+        // signature(id), both a plain .find() that would silently return
+        // the FIRST of two same-id entries and hide the second forever).
+        for (i, c) in COMMANDERS.iter().enumerate() {
+            assert!(COMMANDERS.iter().skip(i + 1).all(|o| o.id != c.id), "duplicate commander {}", c.id);
+        }
+        for (i, s) in SIGNATURES.iter().enumerate() {
+            assert!(SIGNATURES.iter().skip(i + 1).all(|o| o.id != s.id), "duplicate signature {}", s.id);
+        }
     }
 
     #[test]

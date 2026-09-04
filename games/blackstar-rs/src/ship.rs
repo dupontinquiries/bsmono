@@ -461,6 +461,16 @@ mod tests {
     // suggests and which is a different enum — `Row::item` is a menu Item.
     use crate::menu::Item;
 
+    /// Same shape as `content.rs`'s `ids_are_unique_everywhere`: `hull(id)`
+    /// is a plain `.find()`, which would silently return the first of two
+    /// same-id `Hull` entries and hide the second forever.
+    #[test]
+    fn hull_ids_are_unique() {
+        for (i, h) in HULLS.iter().enumerate() {
+            assert!(HULLS.iter().skip(i + 1).all(|o| o.id != h.id), "duplicate hull {}", h.id);
+        }
+    }
+
     #[test]
     fn size_decides_what_a_ship_can_do() {
         let lander = hull("hawkdrop").unwrap();

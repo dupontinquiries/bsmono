@@ -759,6 +759,16 @@ mod tests {
         }
     }
 
+    /// Same shape as `content.rs`'s `ids_are_unique_everywhere`: `arena(id)`
+    /// is a plain `.find()`, which would silently return the first of two
+    /// same-id `Arena` entries and hide the second forever.
+    #[test]
+    fn arena_ids_are_unique() {
+        for (i, a) in ARENAS.iter().enumerate() {
+            assert!(ARENAS.iter().skip(i + 1).all(|o| o.id != a.id), "duplicate arena {}", a.id);
+        }
+    }
+
     /// `Arena.note` — ten real, hand-written lore lines (e.g. "the horizon
     /// curves the wrong way; every SYNC ends here") — had zero UI consumer
     /// anywhere in the codebase: constructed here, flagged by the compiler
