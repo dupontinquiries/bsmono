@@ -131,6 +131,7 @@ pub use logscope_fan::cmdpalette;
 #[cfg(feature = "gui")] pub mod context_probe;
 #[cfg(feature = "gui")] pub mod fan_policy;
 #[cfg(feature = "gui")] pub mod probe_exec;
+#[cfg(feature = "gui")] pub mod queen;
 #[cfg(feature = "gui")] pub mod relief_policy;
 #[cfg(feature = "gui")] pub mod noderole;   // what a node IS (root/fork/pruned/artifact…), for the label above its text
 #[cfg(feature = "gui")] pub mod nodelabel;  // node label text (word-safe elision) and which labels get drawn
