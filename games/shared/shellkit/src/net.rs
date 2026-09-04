@@ -613,3 +613,104 @@ impl Net {
         self.status.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal peer at a given position, ready for `smooth()`. `last` is
+    /// `Instant::now()` at construction, so calling `smooth` immediately
+    /// after leaves dead-reckoning's `elapsed()` term at ~0 — this isolates
+    /// the exponential-smoothing half of the function from the dead-
+    /// reckoning half, which needs real wall-clock time to test instead.
+    fn peer_at(pos: Vec3, shown: Vec3) -> PeerCar {
+        PeerCar {
+            name: "peer".into(),
+            car: 0,
+            flip: false,
+            boosting: false,
+            pos,
+            vel: Vec3::ZERO,
+            rot: Quat::IDENTITY,
+            wheel_spin: 0.0,
+            steer_vis: 0.0,
+            shown,
+            last: Instant::now(),
+        }
+    }
+
+    fn net_with_peer(p: PeerCar) -> Net {
+        let mut n = Net::new();
+        n.peers[0] = Some(p);
+        n
+    }
+
+    #[test]
+    fn smoothing_pulls_shown_toward_target_at_the_documented_rate() {
+        // k = (dt * 14.0).min(1.0) is the function's own formula -- this
+        // test would catch a change to either the 14.0 rate or the min(1.0)
+        // clamp, not just "did shown move at all". Distance chosen so the
+        // REMAINING gap after one smoothing step stays under the function's
+        // own 6.0 snap threshold (2.0 * (1 - 0.28) = 1.44) -- a bigger gap
+        // reads as "just teleported" and snaps instead of smoothing, which
+        // is a different behavior this test isn't the one to cover.
+        let mut n = net_with_peer(peer_at(Vec3::new(2.0, 0.0, 0.0), Vec3::ZERO));
+        let dt = 0.02; // k = 0.28
+        n.smooth(dt);
+        let shown = n.peers[0].as_ref().unwrap().shown;
+        let k = (dt * 14.0f32).min(1.0);
+        let expected = Vec3::ZERO + (Vec3::new(2.0, 0.0, 0.0) - Vec3::ZERO) * k;
+        assert!((shown - expected).length() < 1e-4, "shown={shown:?} expected={expected:?}");
+    }
+
+    #[test]
+    fn a_large_dt_clamps_the_smoothing_rate_to_one_not_beyond() {
+        // (dt * 14.0).min(1.0): a dropped-frame-sized dt (e.g. 1.0s) must
+        // not overshoot target, which an unclamped k > 1.0 would do.
+        let mut n = net_with_peer(peer_at(Vec3::new(1.0, 0.0, 0.0), Vec3::ZERO));
+        n.smooth(1.0);
+        let shown = n.peers[0].as_ref().unwrap().shown;
+        assert!((shown - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-4, "overshot or undershot: {shown:?}");
+    }
+
+    #[test]
+    fn a_target_more_than_six_units_away_snaps_instead_of_creeping() {
+        // the function's own anti-rubber-band clause: a peer that jumped
+        // (a respawn, a fold, a network hiccup catching up) should not be
+        // seen crawling across the map at the smoothing rate.
+        let mut n = net_with_peer(peer_at(Vec3::new(50.0, 0.0, 0.0), Vec3::ZERO));
+        n.smooth(0.016);
+        let shown = n.peers[0].as_ref().unwrap().shown;
+        assert_eq!(shown, Vec3::new(50.0, 0.0, 0.0), "should have snapped, not smoothed: {shown:?}");
+    }
+
+    #[test]
+    fn a_target_just_under_six_units_still_smooths() {
+        // the boundary case right next to the snap test above: close
+        // enough that even a slow dt's small step should stay under 6.0
+        // rather than tripping the snap.
+        let mut n = net_with_peer(peer_at(Vec3::new(5.9, 0.0, 0.0), Vec3::ZERO));
+        n.smooth(0.016);
+        let shown = n.peers[0].as_ref().unwrap().shown;
+        assert!(shown.x > 0.0 && shown.x < 5.9, "should have smoothed partway, not snapped: {shown:?}");
+    }
+
+    #[test]
+    fn player_count_is_one_plus_live_peers_not_slot_count() {
+        // MAX_PLAYERS slots exist regardless of how many are filled --
+        // player_count must read occupancy, not Vec length.
+        let mut n = Net::new();
+        assert_eq!(n.player_count(), 1, "just the local player, no peers yet");
+        n.peers[0] = Some(peer_at(Vec3::ZERO, Vec3::ZERO));
+        n.peers[3] = Some(peer_at(Vec3::ZERO, Vec3::ZERO));
+        assert_eq!(n.player_count(), 3, "local + 2 filled slots, not MAX_PLAYERS");
+    }
+
+    #[test]
+    fn peers_iterator_skips_empty_slots() {
+        let mut n = Net::new();
+        n.peers[2] = Some(peer_at(Vec3::new(7.0, 0.0, 0.0), Vec3::ZERO));
+        let positions: Vec<Vec3> = n.peers().map(|p| p.pos).collect();
+        assert_eq!(positions, vec![Vec3::new(7.0, 0.0, 0.0)], "empty slots should not appear");
+    }
+}
