@@ -3023,19 +3023,46 @@ up — checked by grep, not assumed from the similarity:
 - `media.rs::describe_image(bin, models, image, prompt)`: resolves the VLM+mmproj pair under
   `models/text`, builds the `VisionCli`, spawns it, extracts the description from stdout. This is
   the actual image-to-text entry point.
-- `gpu_kernels` (this project's own inference engine) has NO native vision path at all — grepped
-  the whole crate for `clip`/`vision`/`mmproj`: one hit, and it's a REFUSAL
-  (`lib.rs:10430`, "a diffusion checkpoint … or an mmproj has no tokenizer" — the loader explicitly
-  declines to load a vision projector as if it were a text model). Vision here means delegating to
-  upstream llama.cpp's `llama-mtmd-cli`, same as image generation delegates to `sd-cli`; it is not
-  something to build natively without first committing to a CLIP-ViT + native conv kernels, which
-  is a materially bigger undertaking than the delegate path and not attempted here.
+- `gpu_kernels` (the `gpu-gemm` crate specifically) has no vision path — grepped that crate for
+  `clip`/`vision`/`mmproj`: one hit, and it's a REFUSAL (`lib.rs:10430`, "a diffusion checkpoint …
+  or an mmproj has no tokenizer"). **That claim was correct but incomplete — see the correction
+  below, found by `unhosted_check.py` in a later pass this same session.** Vision via the delegate
+  path (`vision_cli`/`llama-mtmd-cli`) still stands as the actual, working answer for today.
 - `describe_image` has **zero callers** anywhere in `logscope-egui` outside `media.rs` itself —
   grepped, not assumed. Nothing in `chat.rs` or any tab constructs one. The same is true of
   `tts_cli.rs`'s TTS argv builder (also only consumed by `media.rs`) — this looks less like "vision
   specifically got missed" and more like the whole `media.rs` subprocess-delegate layer (image
   generation, vision, TTS) was built to the same waterline and none of the three ever got a UI
   trigger.
+
+**CORRECTION, found later this session via `unhosted_check.py`: a real native CPU-reference ViT
+vision encoder already exists — not in `gpu-gemm`, in the `logscope` crate itself, which the first
+pass of this investigation never checked.** Three real modules, ~1100 lines total, forming one
+correctly-composed chain:
+- `multimodal.rs`: pure tiling/geometry math (LLaVA/AnyRes-style dynamic tiling) and prompt-slot
+  assembly. Genuinely used, by `vision_preprocess.rs`.
+- `vision_preprocess.rs`: pixel resampling + CLIP mean/std normalization, written WITH llama.cpp's
+  `clip.cpp` as a direct reference (its own comment: "llama.cpp reads `clip.vision.image_mean` /
+  `image_std` from the mmproj GGUF and THROWS if absent... because the values differ by encoder
+  family" — not a guessed constant). Genuinely used, by `vision_encoder.rs`.
+- `vision_encoder.rs`: the actual ViT transformer forward pass — patch-embed, positional encoding,
+  N transformer blocks (LN → MHA → residual → LN → MLP → residual), final LN + projector.
+  `encode_image()` is the real top-level entry point, and its own doc comment describes it as
+  already integrated: "This is the single call the engine makes to turn a decoded image into
+  language-model-ready vision tokens." No engine makes that call anywhere. Zero callers of
+  `encode_image` or `vision_encoder::` in any crate — grepped the whole repo, not assumed from the
+  confident doc comment (the exact trap the gpu-gemm OOM-downgrade-ladder finding elsewhere in this
+  file already named: a doc comment describing an integration as done is not evidence it happened).
+
+So the honest, corrected picture: this project has BOTH a working delegate path (llama-mtmd-cli,
+real but unwired to any UI trigger) AND a complete, tested, native CPU reference implementation
+(also real, also entirely unwired, AND never GPU-ported — it is explicitly the "CPU reference a
+wgpu port would match numerically," per its own module doc, same role the gemm crate's naive
+kernels play for the main LLM). Neither was attempted blind in this pass, for the same reason:
+wiring either means UI-thread work (the delegate) or GPU kernel work + UI wiring (the native path),
+both bigger than a verification pass should force through. Whoever picks this up should decide
+between them, not assume the delegate path is the only option — the native encoder is real,
+tested, and further along than "not attempted" suggested when this entry was first written.
 
 **Not wired here.** Wiring this needs, at minimum: (1) a trigger — a `:describe`/`:vision` command
 through `vimmode::Command`'s existing dispatch, or an image-drop/paste handler; (2) a way to attach
