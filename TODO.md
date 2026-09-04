@@ -650,8 +650,38 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   and go-to-definition's tests already do. `cargo test -p aperture-egui
   --lib`: 106/106 (was 102).
 
-  Still not done: incremental sync (`did_change` always sends the whole
-  document), and a real hover overlay (currently a one-line status
+  ~~incremental sync (`did_change` always sends the whole document)~~
+  **client-level DONE, one commit later; the shell still uses full sync.**
+  `LspClient::did_change_range(uri, start_line, start_character, end_line,
+  end_character, new_text, version)` for a RANGE-based delta, gated on
+  `supports_incremental_sync()` reading the server's own advertised
+  `capabilities.textDocumentSync` — refuses rather than sending a range
+  delta to a server that only understands full-document sync, which
+  would silently desync its copy of the file. `parse_sync_kind` handles
+  both legal shapes (a bare integer or the modern `{change: N}` object).
+  Real proof: two range-based inserts against a real `rust-analyzer` (a
+  new function, then a call site), confirmed via completion that the
+  incrementally-inserted symbol actually landed. `cargo test -p
+  aperture-lsp`: 40/40 (33 unit + 7 real-server, was 36).
+
+  Two self-inflicted bugs found and fixed while building this: a
+  `str_replace` that landed a struct field inside the wrong function's
+  parameter list (caught immediately by the compiler), and — worth
+  naming since it's a genuine lapse — a duplicated `#[test]` attribute
+  that I INITIALLY misdiagnosed as a harmless test-harness quirk from a
+  symbol-table dump, before `cargo check --workspace`'s own `warning:
+  duplicated attribute` on the very next build showed the source-grep
+  reasoning had been wrong. Left in TODO.md as a lesson, not smoothed
+  over: check the compiler's own warnings before building a case for why
+  something odd "must be" benign.
+
+  Still not done: the worker/shell side still calls the full-document
+  `did_change` unconditionally — this is client capability only. Wiring
+  the shell to prefer `did_change_range` needs an actual text diff
+  between old and new buffer content, which `aperture-core` has no
+  utility for yet (`Op`/`History` exist for undo, not for producing a
+  minimal diff between two arbitrary strings) — real, separate scope.
+  Also still not done: a real hover overlay (currently a one-line status
   message, not a panel showing the full flattened text).
   `workspace_symbols`'s local tree-sitter outline and `route`'s
   keyword-scored candidates stay the fast, dependency-free default tiers;
