@@ -12445,7 +12445,7 @@ void game_exit()
   if (g_avatar_xform) ex_xform_free(g_avatar_xform);
   ex_chunk_world_free(g_chunks);
   ex_event_bus_free(g_bus);
-  ex_scene_destroy(scene);
+  if (scene) ex_scene_destroy(scene);
   ex_vga_destroy();
   printf("Exiting\n");
 }
