@@ -3286,9 +3286,34 @@ impl eframe::App for VoicetermApp {
                         // no llama.cpp in this crate, so the reply is an
                         // explicit notice rather than a fabricated answer —
                         // an invented assistant turn is worse than none.
+                        //
+                        // THE WRONG FORMAT, ENTIRELY. This used to build a
+                        // plain-English string ("user: ...\nassistant: ...")
+                        // and hand it to `reload`, which expects the wire
+                        // format `parse_messages` actually parses:
+                        // `M<0x1F><role><0x1F><content>`. A plain-English
+                        // blob matches none of that, so `parse_messages`
+                        // found zero records and `reload` silently emptied
+                        // the transcript on every single send — confirmed
+                        // live: typed a message, pressed Enter, the field
+                        // cleared (the send DID fire) and nothing ever
+                        // appeared, still showing the empty-state placeholder.
+                        //
+                        // `reload` exists to sync from an external backend's
+                        // full-transcript dump — there is no such backend
+                        // here, and `ChatPanel::messages`/`ChatMessage` are
+                        // both public for exactly this reason, so push
+                        // directly instead of round-tripping through a wire
+                        // format built for a backend that doesn't exist in
+                        // this build. Appends, so the conversation persists
+                        // turn to turn — `reload` REPLACES the list, which
+                        // would have erased history on every message even
+                        // once the format matched.
                         if let Some(sent) = self.chat.ui(ui) {
-                            self.chat.reload(&format!(
-                                "user: {sent}\nassistant: (no local model attached in this build)"));
+                            use voiceterm_egui::chat_panel::{ChatMessage, Role};
+                            self.chat.messages.push(ChatMessage { role: Role::User, content: sent });
+                            self.chat.messages.push(ChatMessage { role: Role::Assistant,
+                                content: "(no local model attached in this build)".to_string() });
                         }
                     }
                     PaneView::Notes => {
