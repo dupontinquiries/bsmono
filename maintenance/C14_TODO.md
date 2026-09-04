@@ -1579,8 +1579,36 @@ alignment, audit, budget, the whole import in `session::import`),
 
 ### Open
 
-* **Opus ENCODE.** Nothing in the tree encodes Opus; bo-suite's clips came from
-  an external tool. Needs libopus behind a feature.
+* ~~**Opus ENCODE.** Nothing in the tree encodes Opus; bo-suite's clips came
+  from an external tool. Needs libopus behind a feature.~~ **DONE, `5488caba`.**
+  `opus-kit::encode` (new `encode` feature, `audiopus` → system libopus,
+  isolated to one file — `lib.rs` stays exactly as libopus-free as its own
+  docstring commits to). Writes a complete, spec-correct Ogg Opus container:
+  real page framing, the correct (unreflected) Ogg CRC-32 — not the
+  zip/png/zlib variant — `pre_skip` read from the encoder's actual
+  `lookahead()` rather than assumed, and the granule trim matching this
+  crate's own read-side convention.
+
+  **A real bug, caught by a test failing rather than by reasoning about the
+  RFC**: the first version didn't encode enough trailing frames to flush the
+  encoder's own algorithmic delay, silently dropping the last ~6.5ms of real
+  audio. Fixed by padding the encoder's input with `pre_skip` extra samples
+  so the delayed real content actually propagates out before the container
+  is trimmed back to the true length.
+
+  **Verified independently, not just self-consistently**: a real `.opus`
+  file written to disk was accepted and correctly decoded by `opusdec` (the
+  reference libopus decoder — including reading back the vendor string this
+  code wrote into `OpusTags`) and identified as valid Opus by `ffprobe`,
+  neither of which this crate had any part in. The decoded PCM is a genuine
+  signal (peak/RMS/nonzero-fraction all sane), not silence or garbage.
+  14/14 tests pass with `--features encode`; the original 9 still pass with
+  no features, and pulling in zero libopus dependency, confirmed by reading
+  the dependency tree rather than assuming the feature gate works.
+
+  One packet per Ogg page (correct, not maximally size-efficient — a real
+  encoder packs several small packets per page). Left as a documented
+  follow-up in `encode.rs`'s own module doc rather than done now.
 * A pack container saves 22% on blips alone but only 5.1% across a realistic
   bank, and costs a bespoke demuxer.
   `assets::the_pack_is_not_yet_worth_a_bespoke_demuxer` asserts the 10% line so
