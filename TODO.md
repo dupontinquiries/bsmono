@@ -576,8 +576,27 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   on the mismatched line, "✕ 2 errors" in the status bar, both sourced
   from a live server process.
 
-  Still not done: go-to-definition, hover, incremental sync (`did_change`
-  always sends the whole document).
+  ~~go-to-definition~~ **client-level DONE, one commit later; not wired
+  into the shell.** `LspClient::goto_definition(uri, line, character) ->
+  Vec<Location>` — every location the server names, not collapsed to the
+  first (a trait method can legitimately resolve to several
+  implementations). Handles all three response shapes the spec allows
+  (`null`, a single `Location`, an array, and `LocationLink` — a shape
+  this client doesn't advertise support for but nothing on the wire stops
+  a server from sending anyway), preferring `LocationLink`'s
+  `targetSelectionRange` (the identifier) over `targetRange` (the whole
+  enclosing item) so a jump lands on the name, not the top of a
+  potentially long function body. 10 new unit tests. Real proof:
+  `goto_definition_finds_a_locally_defined_function_through_a_real_
+  rust_analyzer` — a call site and its definition in the same file,
+  checked against what a real server actually resolves. `cargo test -p
+  aperture-lsp`: 29/29 (24 unit + 5 real-server), ~4s.
+
+  Still not done: hover, incremental sync (`did_change` always sends the
+  whole document), and wiring go-to-definition into the shell at all (no
+  Ctrl+click, no palette command — client capability only, same
+  client-first-then-shell-wiring split completions and diagnostics both
+  went through).
   `workspace_symbols`'s local tree-sitter outline and `route`'s
   keyword-scored candidates stay the fast, dependency-free default tiers;
   LSP is an ADDITIONAL tier alongside them, never a replacement.
