@@ -524,12 +524,19 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   whole document). `workspace_symbols`'s local tree-sitter outline and
   `route`'s keyword-scored candidates stay the fast, dependency-free
   default tiers; LSP is an ADDITIONAL tier alongside them, never a
-  replacement — and nobody has watched it on screen yet: this pass hit a
-  disk-space crunch (`target/debug/incremental` alone was 1.7GB against
-  under 400MB free, crashing a linker mid-build) and the fix was cleared
-  rather than risk another OOM building a GUI binary on top of it, so
-  the wiring is proven by an automated test exercising the real code
-  path, not by an interactive Xvfb session watching the popup render.
+  replacement.
+
+  Interactive Xvfb verification DID happen, one commit later, and found
+  a THIRD real bug the automated test's own code path couldn't have
+  caught: `AppState::new` (what `aperture some_file.rs` — the normal way
+  anyone runs the binary — actually calls) never went through
+  `open_file`, so LSP spawning silently never fired for a file opened
+  from the command line, only via the in-app Ctrl+O dialog. Found by
+  launching the real binary the normal way and watching nothing happen;
+  fixed by calling `start_lsp_for_current_file` from `new()` too.
+  Screenshot-verified afterward: typed a cross-file prefix in a real
+  window, the popup showed `cross_file_only_symbol  fn() -> i32` merged
+  in with the local tier's own candidates.
 - **Voice commands — the text-side half, DONE; the audio half deliberately
   not attempted.** aperture has no microphone, no ASR, no wake-word
   detector, and building one from scratch would duplicate `shared/
