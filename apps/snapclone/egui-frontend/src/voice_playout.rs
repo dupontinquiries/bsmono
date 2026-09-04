@@ -220,6 +220,23 @@ impl VoicePlayout {
         &mut self.streams[last].1
     }
 
+    /// Drop any per-sender jitter buffer for someone no longer in the
+    /// call. Mirrors `group_voice::GroupVoice::set_participants`'s own
+    /// level-pruning for the same reason: a `PeerStream` has no natural
+    /// end-of-life otherwise (only `stop()` clears everything, which is
+    /// for the WHOLE call ending, not one participant leaving a group
+    /// call that continues). Left unpruned, a departed sender's stream
+    /// sits forever returning `Silence`/`Conceal` each tick, and
+    /// `senders()` over-reports who's actually in the call.
+    ///
+    /// `still_present` is a predicate rather than a list to avoid this
+    /// module needing to know `Participant`'s shape — same reasoning
+    /// `group_voice` itself doesn't need to know anything about audio
+    /// frames.
+    pub fn retain_senders(&mut self, still_present: impl Fn(&str) -> bool) {
+        self.streams.retain(|(id, _)| still_present(id));
+    }
+
     pub fn peek(&self, id: &str) -> Option<&PeerStream> {
         self.streams.iter().find(|(k, _)| k == id).map(|(_, s)| s)
     }
@@ -424,6 +441,36 @@ mod tests {
         assert_eq!(v.senders(), 0);
         v.start();
         assert_eq!(v.tick().len(), 0);
+    }
+
+    #[test]
+    fn retain_senders_drops_a_departed_participants_stream() {
+        // The gap this closes: group_voice::set_participants already
+        // prunes a departed participant's LEVEL (see that module's own
+        // levels_for_departed_participants_do_not_linger), but nothing
+        // pruned their jitter buffer here — a group call that continues
+        // after someone leaves would keep a phantom PeerStream forever,
+        // over-reporting senders() and doing pointless per-tick work for
+        // someone who will never send another frame.
+        let mut v = VoicePlayout::default();
+        v.start();
+        v.on_frame("ada", f(1));
+        v.on_frame("bob", f(1));
+        assert_eq!(v.senders(), 2);
+        v.retain_senders(|id| id == "ada"); // bob left the call
+        assert_eq!(v.senders(), 1);
+        assert!(v.peek("ada").is_some(), "the remaining participant's stream must survive");
+        assert!(v.peek("bob").is_none(), "the departed participant's stream must be gone");
+    }
+
+    #[test]
+    fn retain_senders_with_everyone_still_present_changes_nothing() {
+        let mut v = VoicePlayout::default();
+        v.start();
+        v.on_frame("ada", f(1));
+        v.on_frame("bob", f(1));
+        v.retain_senders(|_| true);
+        assert_eq!(v.senders(), 2);
     }
 
     #[test]
