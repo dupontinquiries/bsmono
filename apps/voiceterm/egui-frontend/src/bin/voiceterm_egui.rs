@@ -383,80 +383,6 @@ fn find_char(chars: &[char], from: usize, needle: char) -> Option<usize> {
     (from..chars.len()).find(|&i| chars[i] == needle)
 }
 
-#[cfg(test)]
-mod doc_markdown_tests {
-    use super::*;
-
-    #[test]
-    fn plain_text_is_just_escaped() {
-        assert_eq!(inline_md("hello world"), "hello world");
-        assert_eq!(inline_md("a < b & c > d"), "a &lt; b &amp; c &gt; d");
-    }
-
-    #[test]
-    fn bold_renders_as_a_tag_not_literal_asterisks() {
-        assert_eq!(inline_md("**bold**"), "<b>bold</b>");
-        assert_eq!(inline_md("say **this** now"), "say <b>this</b> now");
-    }
-
-    #[test]
-    fn inline_code_renders_as_a_tag() {
-        assert_eq!(inline_md("run `cargo test`"), "run <code>cargo test</code>");
-    }
-
-    #[test]
-    fn a_link_renders_as_an_anchor_not_literal_brackets() {
-        assert_eq!(inline_md("[vision.md](vision.md)"),
-                   "<a href=\"vision.md\">vision.md</a>");
-    }
-
-    /// The exact case observed live: a bold link, which is how README.md
-    /// actually writes its file list. Regression pin for the bug this
-    /// function replaced `escape(t)` to fix.
-    #[test]
-    fn a_bold_link_is_not_left_as_literal_markdown_syntax() {
-        assert_eq!(
-            inline_md("**[vision.md](vision.md)** — long-term goals"),
-            "<b><a href=\"vision.md\">vision.md</a></b> — long-term goals");
-    }
-
-    #[test]
-    fn an_unterminated_delimiter_falls_back_to_literal_text() {
-        // No closing `**`: must not consume or corrupt the rest of the line.
-        assert_eq!(inline_md("this **never closes"), "this **never closes");
-        assert_eq!(inline_md("a `dangling code span"), "a `dangling code span");
-    }
-
-    #[test]
-    fn markup_characters_inside_a_span_are_still_escaped() {
-        // The span content goes through `escape` too, not straight into the
-        // tag — a link label containing `<` must not inject a stray tag.
-        assert_eq!(inline_md("[a < b](x)"), "<a href=\"x\">a &lt; b</a>");
-    }
-
-    #[test]
-    fn a_code_span_suppresses_nested_markdown_but_bold_does_not() {
-        // Markdown convention: code spans have the highest precedence and
-        // switch off formatting inside them; bold and links do not, which
-        // is exactly what the bold-link case above depends on.
-        assert_eq!(inline_md("`**not bold**`"), "<code>**not bold**</code>");
-    }
-
-    #[test]
-    fn a_full_paragraph_line_through_doc_matches_inline_md() {
-        let d = doc("t", "T", "**[vision.md](vision.md)** — goals");
-        assert!(d.html.contains("<b><a href=\"vision.md\">vision.md</a></b>"),
-                "doc() must route paragraph lines through inline_md: {}", d.html);
-    }
-
-    #[test]
-    fn headers_and_fences_are_unaffected() {
-        let d = doc("t", "T", "# Title\n\n```\nlet x = 1;\n```\n\n**bold** after");
-        assert!(d.html.contains("<h1>Title</h1>"));
-        assert!(d.html.contains("<pre>let x = 1;\n</pre>"));
-        assert!(d.html.contains("<p><b>bold</b> after</p>"));
-    }
-}
 
 struct VoicetermApp {
     app: App,
@@ -4732,3 +4658,78 @@ fn default_command_docs() -> Vec<voiceterm_egui::command_search::CommandDoc> {
     ]
 }
 
+
+#[cfg(test)]
+mod doc_markdown_tests {
+    use super::*;
+
+    #[test]
+    fn plain_text_is_just_escaped() {
+        assert_eq!(inline_md("hello world"), "hello world");
+        assert_eq!(inline_md("a < b & c > d"), "a &lt; b &amp; c &gt; d");
+    }
+
+    #[test]
+    fn bold_renders_as_a_tag_not_literal_asterisks() {
+        assert_eq!(inline_md("**bold**"), "<b>bold</b>");
+        assert_eq!(inline_md("say **this** now"), "say <b>this</b> now");
+    }
+
+    #[test]
+    fn inline_code_renders_as_a_tag() {
+        assert_eq!(inline_md("run `cargo test`"), "run <code>cargo test</code>");
+    }
+
+    #[test]
+    fn a_link_renders_as_an_anchor_not_literal_brackets() {
+        assert_eq!(inline_md("[vision.md](vision.md)"),
+                   "<a href=\"vision.md\">vision.md</a>");
+    }
+
+    /// The exact case observed live: a bold link, which is how README.md
+    /// actually writes its file list. Regression pin for the bug this
+    /// function replaced `escape(t)` to fix.
+    #[test]
+    fn a_bold_link_is_not_left_as_literal_markdown_syntax() {
+        assert_eq!(
+            inline_md("**[vision.md](vision.md)** — long-term goals"),
+            "<b><a href=\"vision.md\">vision.md</a></b> — long-term goals");
+    }
+
+    #[test]
+    fn an_unterminated_delimiter_falls_back_to_literal_text() {
+        // No closing `**`: must not consume or corrupt the rest of the line.
+        assert_eq!(inline_md("this **never closes"), "this **never closes");
+        assert_eq!(inline_md("a `dangling code span"), "a `dangling code span");
+    }
+
+    #[test]
+    fn markup_characters_inside_a_span_are_still_escaped() {
+        // The span content goes through `escape` too, not straight into the
+        // tag — a link label containing `<` must not inject a stray tag.
+        assert_eq!(inline_md("[a < b](x)"), "<a href=\"x\">a &lt; b</a>");
+    }
+
+    #[test]
+    fn a_code_span_suppresses_nested_markdown_but_bold_does_not() {
+        // Markdown convention: code spans have the highest precedence and
+        // switch off formatting inside them; bold and links do not, which
+        // is exactly what the bold-link case above depends on.
+        assert_eq!(inline_md("`**not bold**`"), "<code>**not bold**</code>");
+    }
+
+    #[test]
+    fn a_full_paragraph_line_through_doc_matches_inline_md() {
+        let d = doc("t", "T", "**[vision.md](vision.md)** — goals");
+        assert!(d.html.contains("<b><a href=\"vision.md\">vision.md</a></b>"),
+                "doc() must route paragraph lines through inline_md: {}", d.html);
+    }
+
+    #[test]
+    fn headers_and_fences_are_unaffected() {
+        let d = doc("t", "T", "# Title\n\n```\nlet x = 1;\n```\n\n**bold** after");
+        assert!(d.html.contains("<h1>Title</h1>"));
+        assert!(d.html.contains("<pre>let x = 1;\n</pre>"));
+        assert!(d.html.contains("<p><b>bold</b> after</p>"));
+    }
+}
