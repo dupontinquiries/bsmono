@@ -1015,6 +1015,56 @@ backgrounded across tool calls. The X server, window manager and capture are
 seconds. Disk is the real constraint: a debug target dir is 1-3 GB and this
 sandbox hit genuine `No space left on device` twice today.
 
+
+## 21. Fleet test run: 10 of 59 failed, and one failure is the harness
+
+From `fleet-logs.zip`, a full run of bundle 006 on the device. Triaged rather
+than fixed, because most need the hardware.
+
+### The one that is not a code failure
+
+**`uikit_egui` cannot be found by rustdoc**, in TWO crates —
+`rusty-board-egui` and `logscope-egui`. Both are `E0463 can't find crate`, both
+only in the DOCTEST target, and both list a correct `--extern uikit_egui=…`
+in the rustdoc command line. The crate is a plain path dependency in each; the
+lib target compiled fine seconds earlier.
+
+The build directory is **`/dev/shm/fleet-build`** — tmpfs, so RAM. The likely
+cause is that it filled and some rlibs were lost or truncated while others
+survived, which fits the shape: two specific crates missing, everything else
+resolving.
+
+`uikit-egui` is a plausible casualty. It embeds 566 KB of subsetted Noto fonts
+(`NotoSansSymbols2-uisubset.ttf` 364 KB, `NotoSansMath-uisubset.ttf` 202 KB)
+that I added in 7098bc4a, so its rlib is among the larger ones in the fleet.
+
+`logscope-crates-gpu-gemm` also died in `/dev/shm/fleet-build` with a SIGSEGV,
+which is consistent with the same pressure.
+
+**Check before chasing this as a Rust problem:** `df -h /dev/shm` during a
+fleet build. If it is filling, point `CARGO_TARGET_DIR` at disk — a full fleet
+debug build is several GB, and this sandbox has hit disk exhaustion twice today
+with far less in flight.
+
+### Real failures, by app
+
+| app | failure |
+|---|---|
+| snapclone-egui | `camera_enumerate` asserted `id.starts_with("video")`; the device returns a PipeWire `v4l2_input.platform-…` id. **Fixed in b1775838.** |
+| beatspace | `instruction requires: fullfp16` — an aarch64 codegen flag, not a test |
+| bo-suite | `speaker_calibration::label_updates_on_subsequent_calibration_if_empty` |
+| bot-arena | `delete_local_removes_cached_model`, and `shelter_does_not_sandbox_bwrap_out_of_existence` — the second needs bwrap |
+| logscope | `a_range_read_of_a_huge_file_does_not_allocate_it`, `compile_grades_real_code` |
+| studio | three `studio-video` probes — silent-video audio, thumbnail strip, PNG bytes; all need ffmpeg |
+| gpu-gemm | SIGSEGV, see above |
+
+### What this run proves about `--lib`
+
+Both `E0463`s are in the **doctest** target. `cargo test --lib` does not build
+doctests and would report every one of these crates green — which is the
+warning c14unified-026 arrived with, demonstrated on the same day by an
+independent run. I used `-q --lib` throughout this session.
+
 ---
 
 # C14_TODO — open threads from the c14 session (blackstar/voice line)
