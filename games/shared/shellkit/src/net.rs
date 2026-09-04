@@ -840,4 +840,72 @@ mod tests {
         let mut o = 0;
         assert!(get_str(&b, &mut o).is_none(), "should refuse rather than read past the buffer");
     }
+
+    /// END-TO-END, REAL SOCKETS: two full `Net` stacks in one process share
+    /// a temp `FileStore` (the same control plane `host()`/`join()` use in
+    /// production, just pointed at a test-local path) and run the actual
+    /// UDP data plane on loopback -- real `host_with`/`join_with`, real
+    /// `tick()`, real HELLO/WELCOME/STATE wire traffic, not a mock.
+    ///
+    /// This is the automated form of `blackstar-rs`'s own `--sim mp` sim
+    /// harness (`src/sim.rs`, `if name == "mp"`), which already proved this
+    /// path works (confirmed by running it: "MP LOOPBACK: PASS") but only as
+    /// a manual, println!-driven binary nobody runs by accident -- a
+    /// regression here would sit unnoticed until someone remembered to run
+    /// it by hand. This is that same proof, as a real `assert!` in `cargo
+    /// test`. Kept the loop far shorter (steps-based, not the sim's 3
+    /// wall-clock seconds of `thread::sleep`) since correctness doesn't need
+    /// real-time pacing, only enough ticks for HELLO to reach the host and
+    /// WELCOME/STATE to come back.
+    #[test]
+    fn host_and_join_actually_sync_over_real_loopback_udp() {
+        let store = std::env::temp_dir().join(format!(
+            "shellkit-net-test-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos() // unique across parallel test threads
+        ));
+        let _ = std::fs::remove_dir_all(&store);
+        let mut a = Net::new();
+        let mut b = Net::new();
+        let host_status = a.host_with("ALICE", store.clone());
+        assert!(host_status.starts_with("HOSTING"), "host_with failed: {host_status}");
+        let join_status = b.join_with("BOB", "ALICE", store.clone());
+        assert!(join_status.starts_with("JOINED"), "join_with failed: {join_status}");
+
+        let mut events = Vec::new();
+        let mk = |x: f32| MyState {
+            car: 0,
+            flip: false,
+            boosting: false,
+            pos: Vec3::new(x, 1.0, 0.0),
+            vel: Vec3::ZERO,
+            rot: Quat::IDENTITY,
+            wheel_spin: 0.0,
+            steer_vis: 0.0,
+        };
+        let mut joined = (false, false); // (host saw BOB, client saw HOST)
+        for _ in 0..800 {
+            a.tick(0.016, &mk(-4.0), Vec3::ZERO, Vec3::ZERO, Quat::IDENTITY, 20, 9, &mut events);
+            b.tick(0.016, &mk(4.0), Vec3::ZERO, Vec3::ZERO, Quat::IDENTITY, 20, 9, &mut events);
+            for e in events.drain(..) {
+                if let NetEvent::Joined(n) = e {
+                    if n == "BOB" { joined.0 = true }
+                    if n == "HOST" { joined.1 = true }
+                }
+            }
+            a.smooth(0.016);
+            b.smooth(0.016);
+            std::thread::sleep(std::time::Duration::from_micros(500));
+        }
+        let _ = std::fs::remove_dir_all(&store);
+
+        assert!(joined.0, "host never saw BOB's Joined event");
+        assert!(joined.1, "client never saw HOST's Joined event");
+        assert_eq!(a.player_count(), 2, "host should see itself + 1 peer");
+        assert_eq!(b.player_count(), 2, "client should see itself + 1 peer");
+        let host_peer_x: Vec<f32> = a.peers().map(|p| p.shown.x).collect();
+        let client_peer_x: Vec<f32> = b.peers().map(|p| p.shown.x).collect();
+        assert!((host_peer_x[0] - 4.0).abs() < 1.6, "host's view of the client's x drifted: {host_peer_x:?}");
+        assert!((client_peer_x[0] - -4.0).abs() < 1.6, "client's view of the host's x drifted: {client_peer_x:?}");
+    }
 }
