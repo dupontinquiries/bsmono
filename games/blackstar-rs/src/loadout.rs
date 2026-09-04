@@ -217,6 +217,18 @@ mod tests {
         *MODS.iter().find(|x| x.name == name).unwrap()
     }
 
+    /// Same shape as content.rs/raidcon.rs/ship.rs/casting.rs's guards:
+    /// looked up by `.name` here rather than `.id`, but the risk is
+    /// identical -- `MODS.iter().find(|x| x.name == name)` (this file's own
+    /// `m()` helper above, and real call sites elsewhere) would silently
+    /// return the first of two same-name entries.
+    #[test]
+    fn mod_names_are_unique() {
+        for (i, md) in MODS.iter().enumerate() {
+            assert!(MODS.iter().skip(i + 1).all(|o| o.name != md.name), "duplicate mod name {}", md.name);
+        }
+    }
+
     #[test]
     fn a_mod_opens_a_world_that_was_closed() {
         // the point of the whole system: an upgrade is a place, not a number

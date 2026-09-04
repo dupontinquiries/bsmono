@@ -410,6 +410,9 @@ mod tests {
         for (i, a) in ABILITIES.iter().enumerate() {
             assert!(ABILITIES.iter().skip(i + 1).all(|o| o.id != a.id), "duplicate ability {}", a.id);
         }
+        for (i, r) in HUB.iter().enumerate() {
+            assert!(HUB.iter().skip(i + 1).all(|o| o.id != r.id), "duplicate room {}", r.id);
+        }
     }
 
     #[test]
