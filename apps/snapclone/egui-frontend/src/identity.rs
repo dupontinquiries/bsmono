@@ -28,13 +28,33 @@
 //! of the rule: if the two ever disagree, the failure is a code you cannot
 //! scan, and that is the thing worth pinning.
 //!
-//! ## Randomness without a dependency
+//! ## Randomness: a canary read, then crypto_kit's own
 //!
-//! Four bytes from `/dev/urandom`. The target set is Linux throughout —
-//! postmarketOS, Fairphone, PinePhone, Asahi, desktop — so this is not a
-//! portability compromise, it is the platform interface. The fallback when the
-//! read fails is deliberately NOT silent-but-plausible: see
-//! [`generate_sc_id`].
+//! Key generation itself is delegated to `crypto_kit::ed25519_keypair`
+//! (`sc_id` is [`fingerprint`]'s hash of the resulting public key, not
+//! raw random bytes assembled here) — an earlier version of this doc
+//! described minting the id from bytes read directly out of
+//! `/dev/urandom`, which is no longer what `create()` does; this section
+//! drifted out of sync with that refactor until now.
+//!
+//! What `create()` DOES still do itself is `read_urandom(&mut [0u8; 1])`
+//! before calling into `crypto_kit` — a one-byte canary read of
+//! `/dev/urandom`, refusing to mint an identity (`None`, not a silent
+//! fallback to a weaker source) if that file can't be read at all. Worth
+//! stating honestly what this canary does and does not guarantee:
+//! `crypto_kit::ed25519_keypair` gets its randomness from `rand_core::
+//! OsRng` with the `getrandom` feature, which on any Linux kernel newer
+//! than 3.17 (every target here — postmarketOS, Fairphone, PinePhone,
+//! Asahi, desktop — is well past that) calls the `getrandom(2)` SYSCALL
+//! directly, not the `/dev/urandom` FILE this canary opens. The two are
+//! backed by the same kernel entropy pool and fail together on any
+//! ordinary system, so the canary is a reasonable correlated signal in
+//! practice — but it is a DIFFERENT code path, not a guarantee: a sandbox
+//! that blocks one and not the other (seccomp denying `getrandom(2)`
+//! specifically, or a chroot with no `/dev`, either of which describes
+//! some CI/dev-container environments) could pass this check and then
+//! have `OsRng` panic anyway, since `crypto_kit` exposes no fallible
+//! variant this module could catch instead.
 
 /// The file this lives in, under the XDG config dir. Separate from
 /// `settings.conf` because it is not a setting: there is no correct alternative
@@ -172,6 +192,11 @@ pub fn is_valid(s: &str) -> bool {
 /// the consequence — two installations each dropping the other's gossip as its
 /// own — surfaces as "the other phone never appears" with nothing pointing back
 /// here.
+///
+/// The probe and `OsRng` are two different syscalls (see the module doc's
+/// "Randomness" section) that fail together on any ordinary system but are
+/// not the same code path — a correlated signal this crate can act on, not
+/// an airtight guarantee `OsRng` cannot still panic despite this passing.
 pub fn create() -> Option<Identity> {
     read_urandom(&mut [0u8; 1])?;
     let (secret, public) = crypto_kit::ed25519_keypair();
