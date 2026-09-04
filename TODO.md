@@ -481,15 +481,55 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   reproducible across repeat runs, no lingering server process after
   `shutdown()`.
 
-  Not done, named explicitly: diagnostics (`publishDiagnostics` — a
-  server-initiated notification the reader thread currently drops
-  on the floor), go-to-definition, hover, incremental sync (`did_change`
-  always sends the whole document), and — the big one — no wiring into
-  `aperture-egui` at all. This crate is usable and tested standalone;
-  nothing in the shell calls it yet. `workspace_symbols`'s local
-  tree-sitter outline and `route`'s keyword-scored candidates stay the
-  fast, dependency-free default tiers; LSP is meant to layer in as an
-  ADDITIONAL, optional tier alongside them, not replace either.
+  ~~no wiring into `aperture-egui` at all~~ **DONE, same session,
+  follow-up commit.** `lsp_worker.rs` — the `Engine`-shaped wrapper this
+  crate's own doc pointed at — plus `AppState` fields and a merge into
+  the existing symbol popup. Opening a `.rs` file spawns `rust-analyzer`
+  best-effort (silent if it's not on `PATH`); every edit sends
+  `didChange` unconditionally from `after_edit`; the popup now opens (or
+  gets extra items merged in) from an LSP answer even when the LOCAL
+  tree-sitter-outline tier found nothing — a std or cross-file symbol,
+  which that tier is structurally unable to see (it parses only the
+  currently open buffer, confirmed by reading `gather_symbols`, not
+  guessed).
+
+  Two more real bugs found building the end-to-end proof, not guessed:
+  the first version of the test used a std type (`String`) to prove the
+  LSP tier specifically, and hung for 110s producing nothing —
+  `rustc --print sysroot` showed no `rust-src` component installed in
+  this sandbox, so rust-analyzer genuinely cannot resolve std types here
+  at all. Rewritten around a cross-file symbol instead (same
+  "structurally invisible to the local tier" property, no sysroot
+  needed) — and THAT still failed until a second bug was found: a
+  completion queried immediately after a rapid burst of `didChange`
+  notifications with no pause can race ahead of rust-analyzer's own
+  reanalysis. Confirmed with an isolated repro (identical edit sequence:
+  zero items with no pause, correct items with a 1s pause) before
+  touching the test again. Also bumped `LspClient::CALL_TIMEOUT` from
+  30s to 90s, found too short on this same path.
+
+  `cargo test -p aperture-egui --lib`: 98/98, unaffected. The new
+  `lsp_popup_e2e` test: 1/1, through the REAL `AppState -> LspWorker ->
+  rust-analyzer -> popup` path, reproducible, no lingering process.
+
+  Known limitation left in place, named rather than silently wrong: LSP
+  `position.character` is a UTF-16 code-unit offset; `caret_pos().col` is
+  a char count. They agree for ASCII (everything tested) and diverge
+  outside the BMP — the same class of fix `aperture_core::width.rs`
+  already is for visual columns, not built here.
+
+  Not done: diagnostics (`publishDiagnostics` — a server-initiated
+  notification the reader thread still drops on the floor), go-to-
+  definition, hover, incremental sync (`did_change` always sends the
+  whole document). `workspace_symbols`'s local tree-sitter outline and
+  `route`'s keyword-scored candidates stay the fast, dependency-free
+  default tiers; LSP is an ADDITIONAL tier alongside them, never a
+  replacement — and nobody has watched it on screen yet: this pass hit a
+  disk-space crunch (`target/debug/incremental` alone was 1.7GB against
+  under 400MB free, crashing a linker mid-build) and the fix was cleared
+  rather than risk another OOM building a GUI binary on top of it, so
+  the wiring is proven by an automated test exercising the real code
+  path, not by an interactive Xvfb session watching the popup render.
 - **Voice commands — the text-side half, DONE; the audio half deliberately
   not attempted.** aperture has no microphone, no ASR, no wake-word
   detector, and building one from scratch would duplicate `shared/
