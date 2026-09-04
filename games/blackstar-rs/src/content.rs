@@ -227,6 +227,26 @@ mod tests {
     /// mission, is a vendor with a backstory — Destiny's three legends standing
     /// in the Tower while the player did the work. If a name is worth putting
     /// in a cutscene slide, it should appear ON SCREEN somewhere in the saga.
+    /// `Commander.desc` — five real, hand-written doctrine lines ("presses
+    /// relentlessly; concentrates on the player and rarely yields ground")
+    /// — had no consumer anywhere in the codebase: `campaign::foe_doctrine`
+    /// picks a live commander id per mission and `skirmish`/`brain` read
+    /// its numeric dials, but nothing ever read what it actually SAYS about
+    /// how that doctrine fights. `main.rs::begin_sortie` — the moment a
+    /// mission is accepted — is the fix.
+    #[test]
+    fn every_commander_has_real_doctrine_text_and_a_sortie_actually_shows_it() {
+        for c in super::COMMANDERS {
+            assert!(c.desc.len() > 15, "{} has a placeholder-length desc: {:?}", c.id, c.desc);
+            assert!(c.desc.chars().any(|c| c == ' '), "{} desc isn't prose: {:?}", c.id, c.desc);
+        }
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains(r#""sortie accepted — {} over {} — {foe}""#),
+            "begin_sortie's toast no longer shows the foe commander's doctrine text"
+        );
+    }
+
     #[test]
     fn every_character_the_prose_names_is_present_somewhere() {
         let on_screen: std::collections::HashSet<&str> = MISSIONS

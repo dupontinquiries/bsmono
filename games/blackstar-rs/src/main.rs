@@ -8168,7 +8168,17 @@ impl Game {
                 self.load_map(mapsim::style_for(d), dest_seed(d.id));
                 self.set_medium_for(d);
                 self.close_deck();
-                self.toastf(&format!("sortie accepted — {} over {}", s.mission.id, d.name));
+                // `content::Commander.desc` — real, hand-written doctrine
+                // flavour ("presses relentlessly; concentrates on the
+                // player and rarely yields ground") — had no consumer
+                // anywhere in the codebase. `campaign::foe_doctrine(mission)`
+                // already picks which of the five doctrines actually drives
+                // this mission's opposition (`skirmish::Squad::new` reads
+                // it too), so this is real information about the fight the
+                // player is about to walk into, not decoration.
+                let doctrine = campaign::foe_doctrine(s.mission);
+                let foe = content::commander(doctrine).map(|c| c.desc).unwrap_or("");
+                self.toastf(&format!("sortie accepted — {} over {} — {foe}", s.mission.id, d.name));
                 self.raid = None; // one flight at a time
                 let mut s = s;
                 s.set_ride_h(self.car.ride_h.max(self.car.half_h));
