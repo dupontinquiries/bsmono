@@ -583,6 +583,20 @@ struct VoicetermApp {
     /// the inbox list draws Message rows, so both live here and are set
     /// together.
     mail_messages: Vec<voiceterm_egui::mail_view::Message>,
+    /// The MERGED (disk + harvested, deduplicated) list `rebuild_mail`
+    /// computes — what `inbox_ui` actually renders. NOT the same thing as
+    /// `mail_messages` above, whatever that field's own comment says:
+    /// `mail_messages` is harvested-from-terminal-blocks ONLY (an INPUT to
+    /// the merge), and disk-scanned mail from `rescan_mail_store` never
+    /// touched it. Before this field existed, `inbox_ui` read
+    /// `mail_messages` directly, so scanning a real Maildir populated
+    /// `self.mail` (which the merge DOES reach, via `set_messages`) while
+    /// the actual on-screen inbox list kept reading the un-merged,
+    /// terminal-only source and stayed empty — confirmed live: created a
+    /// real Maildir message, clicked "rescan mail", the header correctly
+    /// said "1 message(s)" while "Inbox" right below still said "No
+    /// messages."
+    mail_all: Vec<voiceterm_egui::mail_view::Message>,
     /// How many blocks had been scanned for mail last time. The scan walks
     /// closed blocks and parses the email-shaped ones; re-parsing every
     /// block every frame would re-read the whole session's output at frame
@@ -1112,6 +1126,7 @@ impl VoicetermApp {
         let all = voiceterm_egui::mail_store::merge(
             &self.mail_from_disk, &self.mail_messages);
         self.mail.set_messages(&all);
+        self.mail_all = all;
     }
 
     fn harvest_mail_from_blocks(&mut self) {
@@ -2571,7 +2586,7 @@ impl eframe::App for VoicetermApp {
                         // The inbox proper (mail_panes, ported): rows over the
                         // real Message model, message pane below on open.
                         use voiceterm_egui::mail as mp;
-                        if let Some(act) = mp::inbox_ui(ui, &self.mail_messages, false, &c) {
+                        if let Some(act) = mp::inbox_ui(ui, &self.mail_all, false, &c) {
                             match act {
                                 mp::MailAction::Open(id) => self.mail_open = Some(id),
                                 mp::MailAction::Search(q) => self.mail.query = q,
@@ -2579,7 +2594,7 @@ impl eframe::App for VoicetermApp {
                             }
                         }
                         if let Some(id) = self.mail_open.clone() {
-                            if let Some(m) = self.mail_messages.iter().find(|m| m.id == id) {
+                            if let Some(m) = self.mail_all.iter().find(|m| m.id == id) {
                                 let body = self.mail.bodies.get(&id)
                                     .map(|b| b.text().to_string()).unwrap_or_default();
                                 let view = mp::MessageView {
@@ -4698,6 +4713,7 @@ fn main() -> eframe::Result<()> {
                 graph: Default::default(),
                 archive: Default::default(),
                 mail_messages: Vec::new(),
+                mail_all: Vec::new(),
                 mail_scanned_blocks: 0,
                 mail_from_disk: Vec::new(),
                 mail_store_path: None,
