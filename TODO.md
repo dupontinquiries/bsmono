@@ -350,6 +350,24 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   aperture-complete`: 97/97, unaffected — the bug was entirely one layer
   above the already-correct provider/engine streaming. Full workspace
   check clean.
+
+  **A second bug found by checking whether the fix ITSELF introduced a
+  problem** — the fix makes an interaction possible for the first time
+  (streaming was frozen, so nobody could ever accept mid-stream while
+  more deltas were still arriving): accepting part of a streaming
+  suggestion (Ctrl+→) WHILE the server has more coming gets silently
+  reintroduced by the next delta. `on_outcome` replaces the ghost with
+  the server's own running-total text, which has no idea anything was
+  typed out from underneath it — accept "let " from "let x", the next
+  delta arrives with "let x = 1" (the server's own total), and the ghost
+  jumps back to the FULL text rather than the correct remainder.
+  Deliberately NOT fixed — a real fix needs `Shown` to track how many
+  characters were already consumed and strip that prefix before
+  re-running each new delta through `multipass`, and multipass's block-
+  splitting on a SUFFIX rather than the whole reply is its own separate
+  question. Documented with a test written to make the CURRENT
+  (undesirable) behavior explicit and say plainly that a future fix
+  breaking it is the correct outcome, not a regression.
 - **infer-kit extraction**: `aperture-complete/providers.rs` ollama client is
   adapted from `logscope-fan/src/ollama.rs` (adds FIM suffix + de-chunking).
   Two call sites now exist — next co-change, lift `shared/infer-kit`.
