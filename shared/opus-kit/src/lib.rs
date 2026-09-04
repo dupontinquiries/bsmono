@@ -235,6 +235,9 @@ pub fn parse(data: &[u8]) -> Result<Stream, Error> {
     Ok(Stream { head, pages, end_granule, bytes: data.len() })
 }
 
+#[cfg(feature = "encode")]
+pub mod encode;
+
 #[cfg(test)]
 mod tests {
     use super::*;
