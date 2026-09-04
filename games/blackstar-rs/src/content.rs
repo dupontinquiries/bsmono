@@ -36,6 +36,16 @@ pub struct Chassis {
     /// camera's sweep in `camera::Camera::start_cinematic`
     pub fold_spin: f32,
     pub bulk: f32,
+    /// UNUSED (c15unified, checked rather than guessed): `bulk`/`arm`/`leg`
+    /// all feed `skirmish::fighter`'s stat formula (`hp = 90*bulk + 30*arm`,
+    /// `speed = 7*move_mul*leg`) — the only consumer of chassis proportions
+    /// found anywhere in this crate (abstract campaign/NPC combat math, not
+    /// live visual model scaling — grepped main.rs for any body-scaling use
+    /// of these four fields; none exists either). `height` alone has no
+    /// term in that formula or anywhere else. Not inventing one: whether
+    /// height should trade into evasion, hitbox size, reach, or nothing at
+    /// all is a real balance call, not a wiring gap with one obvious answer
+    /// the way `Arena.note`/`Commander.desc` were.
     pub height: f32,
     pub arm: f32,
     pub leg: f32,
