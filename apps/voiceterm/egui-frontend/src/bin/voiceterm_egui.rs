@@ -3690,10 +3690,20 @@ impl eframe::App for VoicetermApp {
                                     Structured::Map(pairs) => {
                                         ui.colored_label(c.text_weak,
                                             format!("key/value — {} pairs", pairs.len()));
-                                        for (k, v) in &pairs {
-                                            ui.label(egui::RichText::new(
-                                                format!("{k}: {v}")).monospace());
-                                        }
+                                        // Bold key, matching the Table
+                                        // branch's bold header row — same
+                                        // "the structure is visually
+                                        // distinct from the values" idea,
+                                        // applied to the other Structured
+                                        // kind rather than left as plain
+                                        // "key: value" text only.
+                                        egui::Grid::new(("notebook_map", b.id)).show(ui, |ui| {
+                                            for (k, v) in &pairs {
+                                                ui.label(egui::RichText::new(k).strong().small());
+                                                ui.label(egui::RichText::new(v).small());
+                                                ui.end_row();
+                                            }
+                                        });
                                     }
                                 }
                             }
