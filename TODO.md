@@ -932,7 +932,12 @@ asked as a question.
   and Shift+PageUp/Down) and not in `pty_input::chord`, so nothing on the
   reserved paths eats it.
 
-  PRIME SUSPECT: `pty_input::drain_egui` line ~176 —
+  **CONFIRMED 2026-09-05** by `ctrl_c_reaches_the_pty_with_no_focus_and_is_swallowed_by_a_focused_field`
+  in `pty_input.rs`: with nothing focused Ctrl+C produces `[0x03]`; with a
+  focused `TextEdit` on screen the drain returns EMPTY and the interrupt
+  never leaves the app. No longer a suspicion.
+
+  THE CAUSE: `pty_input::drain_egui` line ~176 —
   `if ui.ctx().egui_wants_keyboard_input() { return Vec::new(); }`. That
   discards the WHOLE event batch, Ctrl+C included, whenever any egui widget
   wants the keyboard. voiceterm has many text fields (the say box, filters,
@@ -943,9 +948,21 @@ asked as a question.
   a small set of control chords through even when a widget has focus, or to
   ensure the terminal pane takes focus when clicked.
 
-  Reproduce first: `tests/real_pty.rs` drives a real shell and is the place
-  for a failing case (spawn `sleep 41`, send Ctrl+C, assert the child is
-  gone) — note `cargo test --lib` does NOT run it.
+  THE FIX IS A JUDGEMENT CALL, deliberately not made here. The guard exists
+  for a real reason — its comment records that typing a search query was
+  also typing it into the shell — and Ctrl+C is ALSO the copy chord in a
+  text field, so "let control chords through" would break copy where a
+  person expects it. Three options, in rough order of preference:
+
+  1. Make the terminal pane take egui focus when clicked, so a focused field
+     genuinely means the field is where you are typing. Fixes the class, not
+     just Ctrl+C.
+  2. Allow a small chord set through only when the focused widget is NOT a
+     text field (egui can distinguish).
+  3. Allowlist Ctrl+C/D/Z unconditionally and accept losing copy in fields.
+
+  The characterising test asserts today's behaviour, so whichever is chosen
+  it will fail loudly and can be updated deliberately.
 - [ ] **voiceterm-egui: further visual bugs.** REPORTED, unspecified. Known
   and open from this session: the locator strip costs ~39 px for an 11 px
   label (measured), and a one-frame panel overlap after a programmatic

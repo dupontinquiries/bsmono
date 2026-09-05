@@ -517,6 +517,32 @@ mod headless_tests {
         got.into_inner()
     }
 
+    /// Same, but with a TextEdit that HAS FOCUS in the frame — the state
+    /// the app is in whenever the say box, a filter or the palette is open.
+    fn drive_with_focused_field(events: Vec<egui::Event>, mode: TermMode) -> Vec<Outcome> {
+        let ctx = egui::Context::default();
+        let got = std::cell::RefCell::new(Vec::new());
+        let mut buf = String::new();
+        let id = egui::Id::new("focused-field");
+        // Frame 1: create the field and give it focus.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut buf).id(id));
+                r.request_focus();
+            });
+        });
+        // Frame 2: the field is focused; now deliver the keys.
+        let mut raw = egui::RawInput::default();
+        raw.events = events;
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = ui.add(egui::TextEdit::singleline(&mut buf).id(id));
+                *got.borrow_mut() = drain_egui(ui, mode, false);
+            });
+        });
+        got.into_inner()
+    }
+
     fn bytes(outs: &[Outcome]) -> Vec<u8> {
         outs.iter().flat_map(|o| o.bytes.clone()).collect()
     }
@@ -629,4 +655,40 @@ mod headless_tests {
             "a focused field owns the keyboard; the shell must not also see it"
         );
     }
+    /// REPORTED FROM THE DEVICE: Ctrl+C does not kill a running process.
+    ///
+    /// The encoder is fine — `encode(Char('c'), ctrl)` is `[0x03]`, asserted
+    /// elsewhere in this file — and Ctrl+C is not a widget chord. This pins
+    /// where it actually goes: `drain_egui` returns EARLY, discarding the
+    /// whole event batch, whenever any egui widget wants keyboard input.
+    /// With a focused text field on screen the interrupt never reaches the
+    /// PTY at all.
+    ///
+    /// Characterising, not aspirational: it asserts what the code does
+    /// today, so the behaviour is a recorded fact rather than a suspicion.
+    /// The guard is there for a real reason (typing a search query was also
+    /// typing it into the shell), so the fix is a judgement about which
+    /// chords outrank a focused field — Ctrl+C is also Copy — and belongs
+    /// with someone who can try it on the device.
+    #[test]
+    fn ctrl_c_reaches_the_pty_with_no_focus_and_is_swallowed_by_a_focused_field() {
+        let ctrl_c = vec![egui::Event::Key {
+            key: egui::Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }];
+
+        // No focused widget: the interrupt gets through, as it should.
+        let free = drive(ctrl_c.clone(), PLAIN);
+        assert_eq!(bytes(&free), vec![0x03], "Ctrl+C must reach the shell when nothing has focus");
+
+        // A focused field: the whole batch is dropped, interrupt included.
+        let blocked = drive_with_focused_field(ctrl_c, PLAIN);
+        assert!(bytes(&blocked).is_empty(),
+                "recorded current behaviour — if this now passes bytes through, \
+                 the guard was changed and the device report should be re-tested");
+    }
+
 }
