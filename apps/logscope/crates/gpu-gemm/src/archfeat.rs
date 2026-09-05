@@ -650,6 +650,16 @@ mod tests {
         }
     }
 
+    /// The `LSI8C` cache path in lib.rs constructs `Model { arch: "llama", moe_variant: 0,
+    /// gaps: Vec::new() }` on the strength of "llama-family only, never MoE". That is only
+    /// truthful while llama declares no gaps; the day it does, `gaps` on that path is a lie
+    /// and `Model::model_gaps()` will disagree with it. This is the tripwire.
+    #[test]
+    fn llama_cache_path_has_no_gaps_to_capture() {
+        assert!(gap_report("llama", 0).is_empty(), "cache path assumes llama has no gaps: {:?}", gap_report("llama", 0));
+        assert!(gap_report("llama", 8).is_empty(), "cache path assumes llama is never MoE-gapped");
+    }
+
     #[test]
     fn gemma4_names_a_structural_blocker_not_a_missing_knob() {
         // Per-layer head_dim is not something to bolt on: head_dim is a single model-wide value

@@ -10,3 +10,10 @@ part anyone got wrong.
 """
 
 [dependencies]
+audiopus = { version = "0.2", optional = true }
+
+[features]
+# Real Opus encoding, needing system libopus via audiopus's FFI binding —
+# everything else in this crate is pure Rust and stays that way. See
+# encode.rs for why this is a separate module rather than folding into lib.rs.
+encode = ["dep:audiopus"]

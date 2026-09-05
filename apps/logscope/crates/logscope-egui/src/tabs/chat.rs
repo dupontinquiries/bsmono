@@ -6346,7 +6346,12 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
                 let caustic = match name { "Atlantis" => 0.32, "Mistfall" => 0.2, _ => 0.0 };
                 let aquatic = name == "Atlantis";
                 let sun_uv = if aquatic { [0.5, 0.10] } else { sun_uv }; // shafts pour down from the oculus overhead
-                let (gr_amt, gr_w, gr_dec) = if aquatic { (0.9_f32, 0.52_f32, 0.95_f32) } else { (0.6, 0.45, 0.92) };
+                // gr_amt was 0.9 for Atlantis — the highest god-ray weight in any theme — and on top of
+                // this scene's own caustic + underwater-tint passes it blew the whole dome out to a flat
+                // cyan wash (screenshot A/B, fixed camera: LOGSCOPE_GODRAY=0.4 vs default, llvmpipe).
+                // Trimmed to match the bloom trim two scenes below already gets. gr_w/gr_dec (shaft
+                // width/falloff shape) are untouched — this is an amplitude fix, not a shape fix.
+                let (gr_amt, gr_w, gr_dec) = if aquatic { (0.36_f32, 0.52_f32, 0.95_f32) } else { (0.6, 0.45, 0.92) };
                 // COMPOSER PEARL — env-driven for now (headless preview of the refractive pearl in-scene); the
                 // interactive "cast your next pearl into the scene" flow will drive these live.
                 let pearl = std::env::var("LOGSCOPE_PEARL").ok().and_then(|v| v.trim().parse::<f32>().ok())
@@ -6431,8 +6436,17 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
                     // tint passes stacking additional brightness on top — screenshot comparison (close-range
                     // llvmpipe render) showed it blowing out to a near-solid cyan wash; disabling the tonemap
                     // shoulder made it WORSE (near-white), which rules out the tonemap and points upstream, here.
-                    threshold: gthr * 1.0, bloom_amt: gbloom * 0.85 * match name { "Old Library" => 0.5, "Cloudscape" => 0.42, "Reading Room" => 0.4, "Recursive Citadel" => 0.5, "Folding@home" => 0.4, "Mansion Garden" => 0.26, "Atlantis" => 0.4, _ => 1.0 }, texscale: dtexscale, bump: dbump,
-                    caustic, godray_amt: gr_amt, godray_weight: gr_w, godray_decay: gr_dec,
+                    // LOGSCOPE_BLOOM / LOGSCOPE_GODRAY are diagnostic MULTIPLIERS (default 1.0 = no change),
+                    // in the same idiom as LOGSCOPE_SAT / LOGSCOPE_SHOULDER above. `LOGSCOPE_NO_POST` turns the
+                    // whole chain off at once, which proves a tint is post rather than scene but cannot say
+                    // WHICH pass; these two split it without a rebuild.
+                    threshold: gthr * 1.0,
+                    bloom_amt: gbloom * 0.85 * match name { "Old Library" => 0.5, "Cloudscape" => 0.42, "Reading Room" => 0.4, "Recursive Citadel" => 0.5, "Folding@home" => 0.4, "Mansion Garden" => 0.26, "Atlantis" => 0.4, _ => 1.0 }
+                        * std::env::var("LOGSCOPE_BLOOM").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0),
+                    texscale: dtexscale, bump: dbump,
+                    caustic,
+                    godray_amt: gr_amt * std::env::var("LOGSCOPE_GODRAY").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0),
+                    godray_weight: gr_w, godray_decay: gr_dec,
                     pearl, pearl_variant, pearl_pos, pearl_r, aspect: rect.width() / rect.height().max(1.0),
                     nacre: std::env::var("LOGSCOPE_NACRE").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.4),
                     underwater,

@@ -137,7 +137,7 @@ const UNCHECKABLE: &[&str] = &[
 /// rejected as UnknownTool while one naming imaginary tools validated clean.
 pub const RUNTIME_TOOLS: &[&str] = &[
     "write_file", "edit", "read_file", "read_range", "read_near", "list_dir", "search", "run",
-    "git_log", "doc", "propose", "scratch_code",
+    "git_log", "doc", "propose", "scratch_code", "make_tool",
 ];
 
 impl WorkerSpec {

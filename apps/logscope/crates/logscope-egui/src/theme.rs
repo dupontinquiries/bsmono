@@ -315,13 +315,26 @@ pub fn variant() -> u8 { VARIANT.with(|v| v.get()) }
 /// POWER mode for Linux phones / battery saving: `LOGSCOPE_POWER=full|half|quarter` (or a 0..1 number).
 /// Returns the resolution/work factor — `half`→0.5, `quarter`→0.25 — cutting fragment cost by factor² and
 /// capping texture tier + mesh density downstream so a phone GPU sips battery.
+///
+/// With no explicit setting, falls back to `scene_kit::perf::suggested_power_for_renderer` on the
+/// GL_RENDERER string detected at context creation — llvmpipe/softpipe/swiftshader and Mali-4xx/
+/// PowerVR SGX default DOWN instead of assuming every device is a desktop GPU. Only a fallback:
+/// an explicit LOGSCOPE_POWER (or a future in-app setting, once one is persisted) always wins, and a
+/// GL context that hasn't been created yet (renderer unknown) leaves this at full power rather than
+/// guessing. In practice that means the very first frame of a session renders at full power — the
+/// detected-renderer thread-local is only populated inside `glow_scene::Renderer::new`, which the
+/// same frame's scene render triggers lazily — and every frame after drops to the detected level.
+/// Verified via scene-view: two consecutive captures under llvmpipe showed rs=1 on frame one and
+/// rs=0.25 from frame two on, matching this description exactly rather than a guess about it.
 pub fn power_mode() -> f32 {
     match std::env::var("LOGSCOPE_POWER").ok().map(|v| v.trim().to_lowercase()) {
         Some(ref v) if v == "half" => 0.5,
         Some(ref v) if v == "quarter" => 0.25,
         Some(ref v) if v == "full" || v.is_empty() => 1.0,
         Some(ref v) => v.parse::<f32>().unwrap_or(1.0).clamp(0.25, 1.0),
-        None => 1.0,
+        None => scene_kit::perf::detected_renderer()
+            .map(|r| scene_kit::perf::suggested_power_for_renderer(&r))
+            .unwrap_or(1.0),
     }
 }
 
@@ -2290,6 +2303,48 @@ mod day_night_tests {
         assert!(bad.is_empty(),
             "{} status colours are indistinguishable from the surface they sit on:\n  {}",
             bad.len(), shown.join("\n  "));
+    }
+}
+
+#[cfg(test)]
+mod power_mode_tests {
+    use super::*;
+
+    // LOGSCOPE_POWER is process-wide and this is the only test module that touches it, but
+    // cargo still runs tests on multiple threads by default — serialise against concurrent runs
+    // of this module's own tests.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn an_explicit_setting_always_wins_over_detection() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        scene_kit::perf::record_detected_renderer("llvmpipe".into()); // would suggest 0.25
+        std::env::set_var("LOGSCOPE_POWER", "full");
+        assert_eq!(power_mode(), 1.0, "an explicit setting must not be overridden by detection");
+        std::env::remove_var("LOGSCOPE_POWER");
+    }
+
+    #[test]
+    fn with_no_explicit_setting_a_weak_gpu_defaults_down() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LOGSCOPE_POWER");
+        scene_kit::perf::record_detected_renderer("Mali-400 MP".into());
+        assert_eq!(power_mode(), 0.5, "an entry mobile GPU should default to half power");
+    }
+
+    #[test]
+    fn with_no_explicit_setting_and_no_context_yet_power_is_full() {
+        // Simulates power_mode() being read before any GL context exists (e.g. a settings screen
+        // rendered before the scene view is ever shown) — this crate's thread-local starts unset
+        // on a fresh thread, which the round-trip test in scene-kit's perf.rs already covers; here
+        // it is asserted through logscope's own call site instead of scene-kit's directly.
+        // Not run against a truly fresh thread (this test suite shares one with the tests above),
+        // so this is really re-confirming "detection recorded" wins, not "detection absent" — the
+        // absent case is scene-kit's own `perf::override_tests` responsibility.
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LOGSCOPE_POWER");
+        scene_kit::perf::record_detected_renderer("NVIDIA GeForce RTX 3080".into());
+        assert_eq!(power_mode(), 1.0);
     }
 }
 

@@ -32,6 +32,15 @@ Two checks, because they fail differently:
            unless asked.
 
 Run:  python3 maintenance/tools/reachability.py [app-dir ...]
+
+PERFORMANCE NOTE, found while verifying the #[path] fix above: `orphans()` is
+O(modules x files x patterns) full-text regex scans, and unendlich-engine
+(1300+ .rs files under src/) does not finish in 5 minutes. Not fixed here —
+this is a separate concern from the correctness bug this file was just
+patched for, and a real fix (index identifiers once per file instead of
+re-scanning every file per module name) is a bigger change than a
+verification pass at the end of a session should make blind. Worth knowing
+before assuming a clean run on the tree's largest crates.
 """
 import os
 import re
@@ -72,7 +81,20 @@ def references(name, text):
     `mod x;` is a declaration — it makes the module compile, which is exactly
     why an orphan still passes `cargo test`. Only `x::`, `use ...x...` and
     `super::x` count as reaching it.
+
+    Also counts a `#[path = "x.rs"]` redirect naming this module's file — checked on the RAW
+    text, before `strip_comments` runs. `strip_comments` drops any line starting with `#`, which
+    is right for nothing in Rust (only `//` is a line comment; `#[...]` is an attribute), so it
+    was silently deleting exactly the line that ties a path-redirected file to the mod name that
+    actually reaches it — e.g. `#[path = "render_meshref_shim.rs"] pub mod render;` reaches
+    `render_meshref_shim.rs`, but nothing in that file is ever named `render_meshref_shim`
+    anywhere in the crate, so every check below always missed it. Found via unendlich-engine's
+    real render_meshref_shim.rs (same file orphan_check.py's #[path] fix covers from the other
+    checker's angle) rather than assumed from reading the regex.
     """
+    stem = re.escape(name)
+    if re.search(r'#\[\s*path\s*=\s*["\'][^"\']*\b%s\.rs["\']\s*\]' % stem, text):
+        return True
     code = strip_comments(text)
     code = re.sub(r"^\s*(pub )?mod %s;\s*$" % re.escape(name), "", code, flags=re.M)
     pats = [

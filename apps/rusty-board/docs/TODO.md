@@ -288,13 +288,22 @@ keep the placements that improved the metrics.
 **Output:** `~/.local/state/rusty-board/typing-stats.toml` updated
 periodically.
 
-### Deprecation warnings cleanup
+### Deprecation warnings cleanup — DONE, note was stale
 
 `style_context()` and the per-widget `add_provider` calls in
-`settings_panel.rs` are deprecated as of GTK4 4.10. The replacement is
-`widget.add_css_class(class_name)` for classes set via global CSS, which
-we already use for the color swatch palette. Migration is mostly
-done; there might be one or two stragglers.
+`settings_panel.rs` were deprecated as of GTK4 4.10. Checked rather than
+assumed "mostly done": grep for the deprecated per-widget pattern
+(`.style_context()`, `widget.add_provider(`, `.add_provider(`) across the
+whole crate returns zero hits. The two `style_context_add_provider_for_display`
+call sites that remain (`ui/theme.rs`, `ui/settings_panel.rs`) are a
+different, non-deprecated function — the modern DISPLAY-level global CSS
+provider registration, not the per-widget one this item was about — and
+matched an earlier grep only by substring. `add_css_class` (the documented
+replacement) is in active use across seven files. Not compiled to confirm
+zero deprecation warnings — this sandbox has no fetchable `libgtk-4-dev`
+package (a mirror gap, not a repo problem) — but the absence grep checked
+for is exactly the thing a clean build would also confirm, so this is
+marked done on that evidence rather than left to read as still open.
 
 ## Low priority / blocked
 

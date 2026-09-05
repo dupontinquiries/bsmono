@@ -52,14 +52,34 @@ def stub_sites(path):
     return out
 
 def consumers(name):
-    n = 0
-    for app in os.listdir(APPS):
-        c = os.path.join(APPS, app, 'egui-frontend', 'Cargo.toml')
-        if not os.path.isfile(c): continue
+    """How many distinct APPS depend on `name`, from any Cargo.toml under apps/ — not just the
+    fixed `apps/<app>/egui-frontend/Cargo.toml` path this used to hardcode.
+
+    Found via logscope: its real egui frontend is `crates/logscope-egui/Cargo.toml`, not
+    `egui-frontend/Cargo.toml` (that path does not exist for this app at all — logscope's own
+    layout puts every crate under `crates/`). The hardcoded path silently missed EVERY shared
+    crate logscope-egui depends on, for the single largest, most actively developed app in this
+    tree — confirmed by hand for math-kit, noise-kit, and scene-kit, all three real dependencies
+    of logscope-egui that this reported as zero-consumer "candidates for something a port is
+    currently faking" when they are anything but.
+
+    Counts distinct top-level apps (not crates) so an app with five internal crates depending on
+    the same shared crate still reads as one consumer, matching what the original "ports" column
+    name means — how many apps use this, not how many files mention it.
+    """
+    seen_apps = set()
+    for root, dirs, files in os.walk(APPS):
+        dirs[:] = [d for d in dirs if d != 'target']
+        if 'Cargo.toml' not in files: continue
+        app = os.path.relpath(root, APPS).split(os.sep)[0]
+        if app in seen_apps: continue
+        c = os.path.join(root, 'Cargo.toml')
         try:
-            if name in open(c, encoding='utf8').read(): n += 1
-        except Exception: pass
-    return n
+            if name in open(c, encoding='utf8').read():
+                seen_apps.add(app)
+        except Exception:
+            pass
+    return len(seen_apps)
 
 def main():
     rows = []

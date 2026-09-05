@@ -27,7 +27,57 @@ pub fn bump_scale() -> f32 {
     std::env::var("SCENE_KIT_BUMP").ok().and_then(|v| v.parse().ok()).unwrap_or(1.05f32).clamp(0.2, 3.0)
 }
 
-// ── host override ────────────────────────────────────────────────────────────
+/// Suggested `power_mode()` for a `GL_RENDERER` string, when nothing has chosen one explicitly.
+///
+/// Every dial in this file defaults to full power regardless of hardware — correct for the sandbox
+/// this was built in, wrong for the actual fleet: postmarketOS / Fairphone / PinePhone / Asahi
+/// devices run tiled mobile GPUs or software rasterisers that were never going to sustain the same
+/// render scale and mesh density as a desktop discrete GPU, and nothing here has ever looked at
+/// `GL_RENDERER` to say so. The renderer string is already logged at context creation
+/// (`glow_scene::Renderer::new`) and thrown away.
+///
+/// Conservative both directions: only renderers this can positively identify as weak get throttled;
+/// anything unrecognised — including hardware not in this list yet — stays at full power rather than
+/// guessing a desktop GPU is slow. An explicit `LOGSCOPE_POWER` / `SCENE_KIT_POWER` or an in-app
+/// setting always overrides this; it only fills the gap where nothing has decided yet.
+pub fn suggested_power_for_renderer(renderer: &str) -> f32 {
+    let r = renderer.to_ascii_lowercase();
+    // Software rasterisers: no GPU at all. llvmpipe is this sandbox's own renderer (see every
+    // Xvfb capture this session) and would otherwise "verify" full power on hardware that has none.
+    if r.contains("llvmpipe") || r.contains("softpipe") || r.contains("swiftshader") {
+        return 0.25;
+    }
+    // Older/entry mobile tiles: Mali-4xx (Utgard, no compute, tiny fill rate) and PowerVR SGX
+    // (iPhone 4S/5-era and the low-end Android sets sharing that IP) are the weakest GPUs this
+    // fleet's phone targets plausibly ship. Half power, not quarter — these still have a real GPU.
+    if r.contains("mali-4") || r.contains("powervr sgx") {
+        return 0.5;
+    }
+    // Everything else — Mali-T/G (Fairphone/PinePhone's actual Midgard/Bifrost/Valhall tiers),
+    // Adreno, Asahi's AGX, VideoCore, or any desktop GPU — is left at full power. This is
+    // deliberately not a full mobile-GPU database: it grows the next time a specific device is
+    // slow and its GL_RENDERER string is in hand, not from a guess about silicon not yet measured.
+    1.0
+}
+
+thread_local! {
+    static DETECTED_RENDERER: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Record the `GL_RENDERER` string once a GL context exists, for `suggested_power_for_renderer`
+/// callers that run before or after context creation and have no `&glow::Context` of their own
+/// (a UI settings panel, in particular). Thread-local because glow contexts are `!Send` and this
+/// is only ever read back on the same thread that created the context.
+pub fn record_detected_renderer(renderer: String) {
+    DETECTED_RENDERER.with(|d| *d.borrow_mut() = Some(renderer));
+}
+
+/// The last-recorded `GL_RENDERER` string, if a context has been created on this thread yet.
+pub fn detected_renderer() -> Option<String> {
+    DETECTED_RENDERER.with(|d| d.borrow().clone())
+}
+
+
 //
 // The env vars above are the DEFAULT, not the only source. logscope reads
 // these two dials from its `theme` module, where they are user-settable in the
@@ -115,5 +165,49 @@ mod override_tests {
         clear_overrides();
         assert_eq!(power_mode(), 1.0);
         assert_eq!(texture_res(), 256);
+    }
+
+    // ── suggested_power_for_renderer / detected_renderer ──────────────────────
+
+    #[test]
+    fn software_rasterizers_are_throttled_hardest() {
+        assert_eq!(suggested_power_for_renderer("llvmpipe (LLVM 20.1.2, 256 bits)"), 0.25);
+        assert_eq!(suggested_power_for_renderer("softpipe"), 0.25);
+        assert_eq!(suggested_power_for_renderer("SwiftShader Device (LLVM 16.0.0)"), 0.25);
+    }
+
+    #[test]
+    fn entry_mobile_gpus_get_half_power() {
+        assert_eq!(suggested_power_for_renderer("Mali-400 MP"), 0.5);
+        assert_eq!(suggested_power_for_renderer("PowerVR SGX 543MP2"), 0.5);
+    }
+
+    #[test]
+    fn newer_mobile_and_desktop_gpus_stay_full() {
+        // These are the fleet's actual phone targets (Fairphone/PinePhone-class Mali, and Asahi's
+        // AGX) — the classifier must NOT lump them in with the Mali-4xx (Utgard) entry above.
+        for r in ["Mali-G610 MC4", "Mali-T860", "Apple M1 (AGX)", "Adreno (TM) 640",
+                  "NVIDIA GeForce RTX 3080", "AMD Radeon RX 6800", "unknown future GPU XYZ"] {
+            assert_eq!(suggested_power_for_renderer(r), 1.0, "{r} should stay full power");
+        }
+    }
+
+    #[test]
+    fn classification_is_case_insensitive() {
+        assert_eq!(suggested_power_for_renderer("LLVMPIPE"), 0.25);
+        assert_eq!(suggested_power_for_renderer("MALI-450 MP"), 0.5);
+    }
+
+    #[test]
+    fn detected_renderer_round_trips() {
+        // Thread-local, so no lock needed against the numeric-override tests above — but this test
+        // still only asserts what IT just recorded, since another test on the same thread may run
+        // either side of it and there is no "unset" to restore afterward.
+        record_detected_renderer("Mali-400 MP".into());
+        assert_eq!(detected_renderer().as_deref(), Some("Mali-400 MP"));
+        assert_eq!(
+            detected_renderer().map(|r| suggested_power_for_renderer(&r)),
+            Some(0.5)
+        );
     }
 }

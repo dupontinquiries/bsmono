@@ -154,14 +154,35 @@ SYNTHETIC = {
 }
 
 
-def capture(keys, cols=80, rows=24, settle=0.45):
-    rcfile = os.path.join(OUT, ".bashrc.tmp")
-    with open(rcfile, "w") as fh:
-        fh.write(BASHRC)
+# zsh's prompt is themed the same way BASHRC's is (SGR + a glyph), for the same reason: a themed
+# prompt is what the original report used, and zle's redraw of a coloured PS1 is a different code
+# path from a plain one in some shells' completion/redraw logic.
+#
+# PROMPT_SP (on by default) is left ON, not turned off: it is what PRODUCES the end-of-line mark --
+# a reverse-video placeholder, padding to the terminal width, then \r-and-redraw -- when output
+# doesn't end in a newline. That shape is exactly the "themed zsh...different redraw shape"
+# C14_TODO section 4 asked for, and bash has no equivalent (it never marks a missing trailing
+# newline at all). An earlier draft of this file unsetopt'd PROMPT_SP believing it was extra
+# framing around the mark; captured with it off, the mark simply never appeared. Verified the
+# other direction too: with PROMPT_SP at its default, the captured bytes are
+# ESC[1m ESC[7m # ESC[27m ESC[1m ESC[0m + spaces-to-width + \r SPACE \r\r -- bold+reverse, the #
+# placeholder (root-prompt char; regular users get %), then the pad-and-redraw.
+ZSHRC = (
+    "PS1=$'%{\\e[1;35m%}\\u279c %{\\e[36m%}%1~%{\\e[0m%} '\n"
+    "bindkey -e\n"  # emacs keybindings, so edit_in_place-equivalent keys behave like bash's
+)
+
+
+def capture(keys, argv, rcfile_content, rcfile_path, extra_env=None, cols=80, rows=24, settle=0.45):
+    rc_dir = os.path.dirname(rcfile_path)
+    os.makedirs(rc_dir, exist_ok=True)
+    with open(rcfile_path, "w") as fh:
+        fh.write(rcfile_content)
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"
     env.pop("PROMPT_COMMAND", None)
-    argv = ["/usr/bin/bash", "--noprofile", "--rcfile", rcfile, "-i"]
+    if extra_env:
+        env.update(extra_env)
     pid, fd = pty.fork()
     if pid == 0:
         os.execve(argv[0], argv, env)
@@ -197,21 +218,60 @@ def capture(keys, cols=80, rows=24, settle=0.45):
         os.waitpid(pid, 0)
     except ChildProcessError:
         pass
-    os.unlink(rcfile)
+    os.unlink(rcfile_path)
+    if rc_dir != OUT:
+        try:
+            os.rmdir(rc_dir)
+        except OSError:
+            pass
     return bytes(out)
+
+
+ZSH_SCENARIOS = {
+    # THE scenario this batch exists for. zsh's default PROMPT_EOL_MARK marks output that doesn't
+    # end in a newline with a reverse-video placeholder, then pads to the terminal width with
+    # spaces, then CRs back to redraw the prompt on the same row — a shape bash simply does not
+    # have, since bash never marks a missing trailing newline at all. `printf` with no `\n` is the
+    # direct way to trigger it without depending on any particular command's own behaviour.
+    "zsh_eol_mark": [b"printf 'no newline here'" + CR],
+
+    # The themed prompt (SGR colour + a multi-byte glyph) through zle's OWN redraw path rather than
+    # readline's — same motivation as bash's prompt_echo, different line editor. If the byte-indexed
+    # vs column-indexed cursor bug C13_TODO #19 was about exists on zle's side too, this is where it
+    # would show: the glyph is exactly where the two disagree.
+    "zsh_prompt_echo": [b"echo hello" + CR],
+
+    # zle line editing: emacs-style keys (bindkey -e above) exercised the same way edit_in_place
+    # does for readline — home, forward-word, kill-to-end, accept. zsh's zle redraws differently
+    # from readline internally even when the KEYS are the same, so this is not a redundant capture.
+    "zsh_edit_in_place": [b"echo alpha beta gamma", b"\x01", b"\x05", b"\x17", b"\x17", CR],
+
+    # The right-margin case for zle specifically: readline and zle defer-wrap differently in some
+    # implementations' redraw math, and wrap_long_line only ever exercised readline's.
+    "zsh_wrap_long_line": [b"echo " + b"x" * 90 + CR],
+}
 
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    wanted = sys.argv[1:] or sorted(SCENARIOS) + sorted(SYNTHETIC)
+    wanted = sys.argv[1:] or sorted(SCENARIOS) + sorted(SYNTHETIC) + sorted(ZSH_SCENARIOS)
     for name in wanted:
         if name in SYNTHETIC:
             data = SYNTHETIC[name]
         elif name in SCENARIOS:
-            data = capture(SCENARIOS[name])
+            rcfile = os.path.join(OUT, ".bashrc.tmp")
+            data = capture(SCENARIOS[name],
+                            ["/usr/bin/bash", "--noprofile", "--rcfile", rcfile, "-i"],
+                            BASHRC, rcfile)
+        elif name in ZSH_SCENARIOS:
+            # zsh has no --rcfile: it reads $ZDOTDIR/.zshrc (or $HOME/.zshrc), so the rc lives in
+            # its own throwaway directory under a fixed filename instead of an arbitrary path.
+            zdotdir = os.path.join(OUT, ".zdotdir.tmp")
+            data = capture(ZSH_SCENARIOS[name], ["/usr/bin/zsh", "-i"], ZSHRC,
+                            os.path.join(zdotdir, ".zshrc"), extra_env={"ZDOTDIR": zdotdir})
         else:
             sys.exit("unknown scenario: %s (have: %s)" % (
-                name, ", ".join(sorted(set(SCENARIOS) | set(SYNTHETIC)))))
+                name, ", ".join(sorted(set(SCENARIOS) | set(SYNTHETIC) | set(ZSH_SCENARIOS)))))
         path = os.path.join(OUT, name + ".bin")
         with open(path, "wb") as fh:
             fh.write(data)

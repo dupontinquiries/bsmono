@@ -189,6 +189,18 @@ impl ProgressReadout {
 }
 
 /// Draw the picker. Returns the chosen canonical id.
+///
+/// Found uncalled by `wiring_check.py`, checked rather than assumed a false positive: the whole
+/// subsystem this belongs to (`EntityPicker`, `PickerRow`, `ResolvedMatch`) has zero references
+/// anywhere outside this file. This is not `keyboard_ui_with_signal`'s shape (a deliberate,
+/// permanent non-wiring with a settled reason) — it's a complete, apparently-finished
+/// disambiguation feature (`EntityPicker::ask(reference, matches)` opens on 2+ ambiguous
+/// candidates, refuses to open on a single match) that was never connected to voiceterm's actual
+/// voice-command resolution pipeline. See `TODO_entity_picker_wiring.md`. Left open on purpose:
+/// wiring it needs finding where a spoken entity reference currently resolves to its single best
+/// match today (likely silently, with no disambiguation at all) and routing the multi-match case
+/// through `ask()` instead — an architecture question about this app's command pipeline, not a
+/// call-site fix, and one this session didn't have the context to answer blind.
 pub fn picker_ui(ui: &mut egui::Ui, p: &mut EntityPicker,
                  c: &uikit_egui::PaletteColors) -> Option<String> {
     if !p.open { return None; }

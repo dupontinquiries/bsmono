@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Ambient Learner
+GenericName=Temperature Learning System
+Comment=AI-powered ambient temperature learning system
+Exec=ambient-learner-egui
+Icon=preferences-system
+Terminal=false
+Categories=Utility;System;
+Keywords=temperature;thermostat;climate;learning;ambient;
+StartupNotify=true
+StartupWMClass=org.ambientlearner.AmbientLearner

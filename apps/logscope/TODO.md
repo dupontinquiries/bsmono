@@ -3011,6 +3011,74 @@ kernel-validate section) or park native generation and keep the DiT primitives a
 foundation they already are. Do NOT delete the primitives as "unwired" — they are gated,
 documented, and the text-encoder half (text_forward_hidden) is exercised by the conditioning gate.
 
+## ⌖ VISION (image-to-text): built to the same waterline as image generation, and ALSO unwired
+
+Found while looking at model/vision support with llama.cpp as reference (this session). Same
+architecture and same gap as the "IMAGE GENERATION — two stalled tracks" entry above, one section
+up — checked by grep, not assumed from the similarity:
+
+- `vision_cli.rs`: a pure argv builder for `llama-mtmd-cli` (llama.cpp's real multimodal binary —
+  model gguf + `--mmproj` CLIP-ViT projector + an image path), unit-testable, no subprocess
+  spawning of its own. Same shape as `mediagen.rs`'s sd-cli argv builder.
+- `media.rs::describe_image(bin, models, image, prompt)`: resolves the VLM+mmproj pair under
+  `models/text`, builds the `VisionCli`, spawns it, extracts the description from stdout. This is
+  the actual image-to-text entry point.
+- `gpu_kernels` (the `gpu-gemm` crate specifically) has no vision path — grepped that crate for
+  `clip`/`vision`/`mmproj`: one hit, and it's a REFUSAL (`lib.rs:10430`, "a diffusion checkpoint …
+  or an mmproj has no tokenizer"). **That claim was correct but incomplete — see the correction
+  below, found by `unhosted_check.py` in a later pass this same session.** Vision via the delegate
+  path (`vision_cli`/`llama-mtmd-cli`) still stands as the actual, working answer for today.
+- `describe_image` has **zero callers** anywhere in `logscope-egui` outside `media.rs` itself —
+  grepped, not assumed. Nothing in `chat.rs` or any tab constructs one. The same is true of
+  `tts_cli.rs`'s TTS argv builder (also only consumed by `media.rs`) — this looks less like "vision
+  specifically got missed" and more like the whole `media.rs` subprocess-delegate layer (image
+  generation, vision, TTS) was built to the same waterline and none of the three ever got a UI
+  trigger.
+
+**CORRECTION, found later this session via `unhosted_check.py`: a real native CPU-reference ViT
+vision encoder already exists — not in `gpu-gemm`, in the `logscope` crate itself, which the first
+pass of this investigation never checked.** Three real modules, ~1100 lines total, forming one
+correctly-composed chain:
+- `multimodal.rs`: pure tiling/geometry math (LLaVA/AnyRes-style dynamic tiling) and prompt-slot
+  assembly. Genuinely used, by `vision_preprocess.rs`.
+- `vision_preprocess.rs`: pixel resampling + CLIP mean/std normalization, written WITH llama.cpp's
+  `clip.cpp` as a direct reference (its own comment: "llama.cpp reads `clip.vision.image_mean` /
+  `image_std` from the mmproj GGUF and THROWS if absent... because the values differ by encoder
+  family" — not a guessed constant). Genuinely used, by `vision_encoder.rs`.
+- `vision_encoder.rs`: the actual ViT transformer forward pass — patch-embed, positional encoding,
+  N transformer blocks (LN → MHA → residual → LN → MLP → residual), final LN + projector.
+  `encode_image()` is the real top-level entry point, and its own doc comment describes it as
+  already integrated: "This is the single call the engine makes to turn a decoded image into
+  language-model-ready vision tokens." No engine makes that call anywhere. Zero callers of
+  `encode_image` or `vision_encoder::` in any crate — grepped the whole repo, not assumed from the
+  confident doc comment (the exact trap the gpu-gemm OOM-downgrade-ladder finding elsewhere in this
+  file already named: a doc comment describing an integration as done is not evidence it happened).
+
+So the honest, corrected picture: this project has BOTH a working delegate path (llama-mtmd-cli,
+real but unwired to any UI trigger) AND a complete, tested, native CPU reference implementation
+(also real, also entirely unwired, AND never GPU-ported — it is explicitly the "CPU reference a
+wgpu port would match numerically," per its own module doc, same role the gemm crate's naive
+kernels play for the main LLM). Neither was attempted blind in this pass, for the same reason:
+wiring either means UI-thread work (the delegate) or GPU kernel work + UI wiring (the native path),
+both bigger than a verification pass should force through. Whoever picks this up should decide
+between them, not assume the delegate path is the only option — the native encoder is real,
+tested, and further along than "not attempted" suggested when this entry was first written.
+
+**Not wired here.** Wiring this needs, at minimum: (1) a trigger — a `:describe`/`:vision` command
+through `vimmode::Command`'s existing dispatch, or an image-drop/paste handler; (2) a way to attach
+an image path from the composer/UI, which nothing here currently has; (3) running off the UI
+thread — `describe_image` blocks on a real subprocess that can take many seconds, and the shape to
+copy is already in this file (`chat.rs`'s existing `mpsc::channel` + `std::thread::spawn` +
+poll-once-per-frame pattern, e.g. the `VerifyJob` wiring at line 8093 — same idiom, different
+subprocess); (4) a binary-path setting for `llama-mtmd-cli`, which nothing resolves today (the
+image-gen entry above notes the identical gap for `sd_cli`); (5) surfacing stderr on failure the
+way the fleet surfaces refusals — named, not swallowed.
+
+Deliberately not attempted blind in this pass: `chat.rs` is 10,000+ lines, this sandbox has no
+display to actually see a wired result render, and a threading change to a file this size and this
+central, unverified beyond "it compiles," is exactly the kind of change that should be checked by
+someone who can run the app. The investigation is complete and precise; the wiring is not started.
+
 ## ⌖ MOBILE OVERCROWDING — the rule exists, one row obeys it (audited 2026-08-16)
 
 `mobilelayout.rs` is written, tested, and documents the cause exactly: `ui.horizontal()` does not
@@ -3062,20 +3130,47 @@ Until that is decided, adding a `:brief` command would mean inventing a tree to 
 briefing derived from a tree the operator does not recognise is worse than no briefing — the
 module's own header says an explainer that fabricates is worse than none.
 
-**`ModelStatus` (the second liaison input): blocked on ONE missing field.** `is_fully_supported`
-and `what_is_blocked_with` want `ModelStatus { name, arch, gaps }`, and the engine already produces
-the gaps (`archfeat::gap_report(arch, variant)`, used at lib.rs:9649 and 9837 to PRINT them to
-stderr). But `gpu_kernels::Model` carries no `arch` string — the loader resolves an `ArchConfig`,
-uses it, and drops the name. Smallest real step in this whole area: put `arch: String` on Model
-(the loader has it in hand at construction), expose `model_gaps()` returning the same lines the
-loader prints, build a `ModelStatus` in the backend, and let the HUD show "this model has declared
-gaps: …" — the liaison rule (declare the gap rather than generate garbage) applied where the
-operator can see it instead of in stderr. That is a contained change with a clear verification: the
-HUD line must appear for a model with gaps and be absent for one without.
+**`ModelStatus` (the second liaison input): the engine half is DONE (`570a49b4`), the HUD half is
+not.** `is_fully_supported` and `what_is_blocked_with` want `ModelStatus { name, arch, gaps }`, and
+the engine already produces the gaps (`archfeat::gap_report(arch, variant)`, used at lib.rs:9649
+and 9837 to PRINT them to stderr). `gpu_kernels::Model` now carries `pub arch: String` and
+`pub moe_variant: u32`, set at both construction sites (the real GGUF loader and the int8 resident
+cache, which defaults to `"llama"`/`0` — the only values the cache format's own existing
+llama-family-only guarantee permits, not a guess), plus `Model::model_gaps()` returning the same
+lines the loader already prints. `cargo check -p gpu-gemm` is clean; `archfeat`'s own 10 gap-report
+tests still pass unaffected — no test exists yet for `model_gaps()` itself, deliberately: `Model`
+has no test-friendly constructor (see `active_params_per_token`'s own comment on exactly this,
+extracted as a free function for the same reason), and a two-line self-field delegation didn't
+seem to justify manufacturing one.
 
-**Debate: not audited beyond names.** `debaterun::{adjustment, blind, needs_reframe}` and
-`debatepanel::last_complete_line` are uncalled. Whether the panel is mounted at all was not
-checked; do that before assuming the same shape as the liaison.
+**Not done**: building a `ModelStatus` in the backend and wiring the HUD line. Stopped here on
+purpose rather than pushing into `liaisonhud.rs` — `liaison.rs`'s own comment a few lines above
+this entry already documents TWO separate `liaison` modules in this codebase (`logscope::liaison`,
+which `ModelStatus` lives in, and `logscope-egui`'s own `crate::liaison`, a different module with a
+different `Statement` type), and picking the wrong one to wire against is exactly the "two
+liaisons, two Statements, one live" trap C14_TODO §10 already names. That needs someone who knows
+which is live to confirm before touching it, not a guess made to close this item out. The
+verification the original entry asked for (HUD line present for a model with gaps, absent for one
+without) is still open.
+
+**Debate: audited (`f63aa6a0`).** The panel IS mounted — `crate::debatepanel::ui(ui, &slots)` at
+`chat.rs:9595`, fed real state from `workspace_exec::debate_slots()`, not a stub. So this is a
+different shape from the liaison case above, not the same one: nothing here is unreachable.
+
+What's actually missing is narrower than the entry names. `panelvoice::triage`/`Ask` (the debate
+protocol's ASK half — deciding which debater's question reaches the operator) IS wired: live in
+`chat.rs` (`pending_asks`, the `panelvoice::triage(...)` call in `fan_step`). Only
+`debaterun::{adjustment, blind, needs_reframe}` (the BLIND half) are genuinely uncalled anywhere —
+confirmed by grep, not assumed from the names. `debate_slots()` already says so itself, honestly,
+at the exact point it matters: `blind: false, // Blindness is a panelvoice concept the fan does not
+model yet. False rather than guessed`. That is not a bug hiding behind a name — it's the same
+"declare the gap rather than fabricate" rule the liaison module states as its own hard constraint,
+already applied here without anyone having to add it.
+
+Wiring `debaterun`'s blind logic into the fan would mean deciding how a fan branch — which doesn't
+currently track per-round operator visibility at all — learns whether it "has seen the operator's
+input this round." That's an architecture question about the fan's own state, not a call-site fix,
+so left open rather than guessed at here.
 
 ## ⌖ THE "ASSERTS ABSENCE" CLASS — audited, two found, one seam left
 
@@ -3092,11 +3187,51 @@ against the tree. Remaining hits after this pass are ACCURATE and were verified 
     plumbing exists, the shader does not).
   * lib.rs:9528 — MLA down/up projections in that specific arm, still true.
 
-REMAINING SEAM (UI, not stderr): the operator reads the app, and the engine strip never mentions
-speculative decoding. `enginestrip::concerns()` already receives `tok_s` and DISCARDS it
-(`let _ = tok_s;`), which is the hook — but a "decode is starved" concern needs the prefill/decode
-RATIO, not throughput, and concerns() is not given it. Doing this properly means: pass the
-SelfRelative verdict (or its ratio) into concerns(), add `Concern::DecodeStarved { ratio }` to
-logscope::machinery, and render it with the flag to set. Deliberately not faked from tok_s alone —
-a starvation claim derived from throughput without a baseline is exactly the "percentage of a
-number nobody measured" the roofline module refuses to print.
+REMAINING SEAM (UI, not stderr) — ALREADY RESOLVED, note was stale. Found while auditing this
+file: `enginestrip::concerns()` already takes `decode_ratio: Option<f32>` and pushes
+`Concern::DecodeStarved { ratio }` when it clears `DECODE_STARVED_X`; `backend.rs` computes the
+SelfRelative verdict, publishes the ratio through `LAST_DECODE_RATIO` (an atomic, with a comment
+citing exactly this reasoning — a starvation claim needs the baseline, not throughput), and
+`chat.rs:8295` reads it back into the strip. `logscope::machinery::Concern::DecodeStarved` exists
+and is rendered and tested (`enginestrip.rs`'s own test module asserts it does NOT fire below the
+threshold). This paragraph described the fix before it landed; nobody updated it after. Left as
+history of what the gap was, since deleting it would lose the reasoning for why `decode_ratio` is
+a separate parameter from `tok_s` rather than derived from it — but the "remaining" framing was
+wrong and is corrected here rather than left to mislead the next reader into re-doing this.
+
+## ⌖ gpu-gemm's OOM-downgrade ladder is written and NEVER CALLED (found via testonly_check.py)
+
+`testonly_check.py apps/logscope/crates` (run at its own documented cross-crate scope, not
+per-crate — the per-crate numbers are known misleading, see the tool's own docstring) reported
+`oom::load_with_downgrade` as test-only. Checked further and it's worse than that: grepping the
+whole workspace for the name finds exactly ONE occurrence — its own definition. Not called by a
+test either; `oom.rs` has no test module at all. `testonly_check`'s "test-only" label undersells
+this one.
+
+`load_with_downgrade`'s own doc comment describes it as "the self-tuning loader loop that makes
+the GPU-budget guess irrelevant" — walk a residency ladder best-first, retry on OOM after
+resetting, return the first format that actually allocates. `memplan::fitting_residencies()`
+builds exactly the `Vec<Residency>` ladder this function's `ladder` parameter expects — the two
+were clearly designed as a pair. And `memplan.rs`'s own comment two lines above `fitting_residencies`
+references this as if it already exists at runtime: *"a conservative fraction of RAM that the
+loader's OOM-downgrade ladder tightens further at runtime"* — describing the exact "70B → Failed
+to allocate BO VMA" crash this function was built to prevent, on exactly the hardware
+(Asahi/Honeykrisp unified memory) this project already knows has a BO-VMA ceiling well below what
+it advertises.
+
+**Not wired here.** Finding the real GPU-buffer-allocation call site in a 20K-line `lib.rs` and
+routing it through `load_with_downgrade` needs care I can't verify without real GPU hardware — a
+wrong wiring here fails exactly the way the missing wiring does now, just later and more
+confusingly. What's confirmed, by grep and by reading both doc comments side by side rather than
+assumed from the function's name: the ladder-building half and the ladder-walking half both exist,
+were clearly designed to compose, and nothing composes them. The actual allocation path currently
+presumably takes `fitting_residencies()`'s single best-fit answer and allocates once, with no
+retry — meaning a plan that's slightly too optimistic (exactly the case `memplan.rs`'s own BO-VMA
+comment describes) hard-fails instead of gracefully stepping down, on hardware this project has
+already hit that exact crash on.
+
+**Next step for whoever picks this up**: find where `Residency` from `fitting_residencies()` is
+actually consumed to allocate a real `wgpu::Buffer`, and check whether that call site is already
+inside something shaped like a retry loop under a different name (possible — this codebase has
+already found a couple of "ported twice, wired once" cases this session) before assuming
+`load_with_downgrade` needs to be threaded in fresh.

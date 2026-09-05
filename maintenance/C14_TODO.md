@@ -91,14 +91,38 @@ terminal" (§20) than everything in §2 combined, and it is its own session: it
 wants a second cell buffer, saved cursor/pen across the switch, and a decision
 about whether the alternate screen contributes to scrollback (it must not).
 
-## 4. The corpus is bash-only; the reported shell was zsh
+## 4. The corpus is bash-only; the reported shell was zsh — TOOL DONE, BLOCKED ON TMUX
 
-`tools/capture_vt.py` records from a real pty, but zsh is not installed in this
-sandbox, so the eight recorded scenarios are bash/readline. The original report
-was a themed zsh, whose zle emits a different redraw shape (reverse-video
-placeholder, run of spaces to the terminal width, `\r`-and-redraw). Capturing
-those on a machine with zsh is cheap — add scenarios to `SCENARIOS` and run the
-two tools — and is the single highest-value addition to the corpus.
+**Progress in `d7e7934b`, not closure.** `capture_vt.py` now supports zsh
+(it needed different plumbing than bash — no `--rcfile` flag, so the rc lives
+in a `ZDOTDIR`-pointed directory as a file literally named `.zshrc`) and has
+four zsh scenarios ready, including `zsh_eol_mark`: zsh's default `PROMPT_SP`
+marks output with no trailing newline via a reverse-video placeholder, pads
+to terminal width, then `\r`-and-redraws — exactly the "themed
+zsh...different redraw shape" this entry describes, and something bash has
+no equivalent of at all.
+
+Caught a real bug in my own first draft before it shipped: I wrote
+`unsetopt PROMPT_SP` believing it was framing around the mark: it's the
+option that PRODUCES the mark, and with it off the mark never appeared —
+found by diffing captured bytes with the option on vs off, not by trusting
+the docs.
+
+**Blocked**: `tmux new-session` reports "server exited unexpectedly" in this
+sandbox before even binding a socket — not a permissions issue (the socket
+dir gets created with correct perms), reproduced across several environments
+and with verbose logging that never even opens its own log file. `pyte`
+alone is not trusted for `.expect` generation (see `render_ref.py`'s own
+docstring — `save_restore` is the worked example of pyte silently encoding a
+bug as correct), so no `.bin`/`.expect` pair was committed. The captured
+bytes were verified by hand against the described defect shape and are very
+likely trustworthy — the pty mechanics are identical to the unchanged bash
+path, confirmed byte-identical to its own checked-in fixture after the
+refactor — but that is not the same as tmux confirming them.
+
+**What unblocks this**: `tools/capture_vt.py zsh_eol_mark zsh_prompt_echo
+zsh_edit_in_place zsh_wrap_long_line` then `tools/render_ref.py`, on a
+machine where tmux actually starts.
 
 ## 5. `lock_check.py` cannot see a lock made stale by a transitive path dep
 
@@ -115,7 +139,14 @@ Cycles are possible in principle and the walk needs a visited set.
 
 Not fixed here; the lock itself was refreshed in `8b483653`.
 
-## 6. `eframe_backend_check` fails on unendlich-dash, and the fix is not obvious
+## 6. `eframe_backend_check` fails on unendlich-dash — RESOLVED, see below
+
+**Resolved in `2a6b6563`.** The checker now recognises the dual-backend
+runtime-fallback pattern (both `Renderer::Wgpu` and `Renderer::Glow` named
+explicitly in source) as a legitimate reason to leave `default-features` on,
+rather than flagging it as accidental over-linking. Full rationale in the
+checker's own docstring; the analysis below is left as the record of how
+that shape was found.
 
 `games/unendlich/crates/unendlich-dash/Cargo.toml` declares
 `eframe = { version = "0.34", features = ["glow"] }` with defaults left on.
@@ -142,8 +173,7 @@ test either branch of this in the sandbox, and an unverifiable edit to a feature
 set is how a working GUI stops starting.
 
 Worth considering instead: the checker gaining a case for "both backends, chosen
-at runtime with a fallback", which is a legitimate pattern it currently has no
-way to express.
+at runtime with a fallback" — done, see `2a6b6563` at the top of this entry.
 
 ## 7. Merges taken this session
 
@@ -1566,8 +1596,36 @@ alignment, audit, budget, the whole import in `session::import`),
 
 ### Open
 
-* **Opus ENCODE.** Nothing in the tree encodes Opus; bo-suite's clips came from
-  an external tool. Needs libopus behind a feature.
+* ~~**Opus ENCODE.** Nothing in the tree encodes Opus; bo-suite's clips came
+  from an external tool. Needs libopus behind a feature.~~ **DONE, `5488caba`.**
+  `opus-kit::encode` (new `encode` feature, `audiopus` → system libopus,
+  isolated to one file — `lib.rs` stays exactly as libopus-free as its own
+  docstring commits to). Writes a complete, spec-correct Ogg Opus container:
+  real page framing, the correct (unreflected) Ogg CRC-32 — not the
+  zip/png/zlib variant — `pre_skip` read from the encoder's actual
+  `lookahead()` rather than assumed, and the granule trim matching this
+  crate's own read-side convention.
+
+  **A real bug, caught by a test failing rather than by reasoning about the
+  RFC**: the first version didn't encode enough trailing frames to flush the
+  encoder's own algorithmic delay, silently dropping the last ~6.5ms of real
+  audio. Fixed by padding the encoder's input with `pre_skip` extra samples
+  so the delayed real content actually propagates out before the container
+  is trimmed back to the true length.
+
+  **Verified independently, not just self-consistently**: a real `.opus`
+  file written to disk was accepted and correctly decoded by `opusdec` (the
+  reference libopus decoder — including reading back the vendor string this
+  code wrote into `OpusTags`) and identified as valid Opus by `ffprobe`,
+  neither of which this crate had any part in. The decoded PCM is a genuine
+  signal (peak/RMS/nonzero-fraction all sane), not silence or garbage.
+  14/14 tests pass with `--features encode`; the original 9 still pass with
+  no features, and pulling in zero libopus dependency, confirmed by reading
+  the dependency tree rather than assuming the feature gate works.
+
+  One packet per Ogg page (correct, not maximally size-efficient — a real
+  encoder packs several small packets per page). Left as a documented
+  follow-up in `encode.rs`'s own module doc rather than done now.
 * A pack container saves 22% on blips alone but only 5.1% across a realistic
   bank, and costs a bespoke demuxer.
   `assets::the_pack_is_not_yet_worth_a_bespoke_demuxer` asserts the 10% line so
@@ -1611,6 +1669,28 @@ Honest gaps, not forgotten ones.
   mean inventing the caller.
 * `linebank::verify` is called only by tests; the real caller needs
   `voiceprint-kit` wired to actual audio.
+* **`blackstar-rs/src/rig.rs`** (found via `orphan_check.py`, then read rather
+  than assumed) — no `mod rig` anywhere, zero tests, 445 lines. Not a stub:
+  the doc comment cites measured stats from a real animation (Keelwright
+  "Change form", 83 joints, 8.33s — 61% skinned, 39% rigid, the exact ratio
+  that argues for walking the node hierarchy rather than a flat matrix list).
+  This is proper glTF skin+clip evaluation — arbitrary continuous sampling of
+  an authored animation.
+  Two open questions, same shape as §9's `unendlich-world`:
+  1. `xform.rs`'s morph is a DIFFERENT approach already shipping — vertex-lerp
+     between 5 authored poses (`BLEND_SEC = 1.3`, tuned easing per damage
+     state). It's not obviously the same problem `rig.rs` solves; `rig.rs`
+     generalises to any glTF clip, `xform.rs` is hand-tuned for exactly one
+     move. Whether `rig.rs` was meant to REPLACE that move's morph or ADD
+     support for other animations `xform.rs` was never built to handle is a
+     product question, not a technical one.
+  2. `joints.rs` already reads a SEPARATE joint-position format written by an
+     external `foldview --joints-json` tool, for debug visualisation only —
+     not the same data path `rig.rs` would need (glTF skins/clips), but worth
+     knowing about before assuming `rig.rs` is the only joint-aware code here.
+  Not wired here: same reasoning as §9 — restoring a 445-line, zero-test
+  animation evaluator into a shipping game blind, with no way to see the
+  result in this sandbox, is how a "verified" claim goes wrong.
 
 `link.rs` DID get a caller: `finale.rs`'s Photon climax now refuses off the
 tether, which is the one place in six films the ceiling is reached.

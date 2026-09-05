@@ -10064,6 +10064,10 @@ pub struct Model {
     /// recomputed, so it can never drift from what the operator's log actually said.
     pub arch: String,
     pub gaps: Vec<String>,
+    /// Expert count read from the checkpoint (`{arch}.expert_count`), 0 for a dense model —
+    /// `archfeat::gap_report`'s second argument, the same value `gaps` was computed with, so
+    /// `model_gaps()` below can recompute the identical list from the fields alone.
+    pub moe_variant: u32,
     /// Masked-DIFFUSION checkpoint (llada2/rnd1/dream/llada): trained to denoise, not to continue.
     /// AR-decoding one emits fluent noise BY DESIGN — callers (serve, the egui worker) must route
     /// generation through `diffuse_generate` when this is set, or refuse with that explanation.
@@ -10150,6 +10154,15 @@ impl Model {
         let std = crate::ctxwin::kv_bytes_per_token(self.n_layers, self.n_kv_heads, self.head_dim, 4);
         let mla = self.mla.map(|c| (self.n_layers * c.latent_width() * 4) as u64).unwrap_or(0);
         std + mla
+    }
+
+    /// `archfeat::gap_report(arch, moe_variant)` recomputed from the fields. Equal to `gaps` by
+    /// construction — the loader computed `gaps` from the same two inputs — so prefer `gaps` (it
+    /// is what the operator's log said) and treat this as the way to ask again without archfeat.
+    /// Two sessions added the same capability independently (one captured, one recomputing);
+    /// both shapes are kept so neither caller changes.
+    pub fn model_gaps(&self) -> Vec<String> {
+        crate::archfeat::gap_report(&self.arch, self.moe_variant)
     }
 }
 
@@ -13000,7 +13013,12 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
             if n_sh > 0 { eprintln!("loader: shared expert ACTIVE on {n_sh} layer(s) — the always-on contribution is present (a grafted file proves its repair here)"); }
         }
 
-        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale, attn_scale, logit_softcap, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, rope_neox: !acfg.rope_interleaved, rope_dims: rot, rope_mscale: mscale, trained_ctx, planned_weight_bytes, mla, dsa, mtp_layers: mtp, arch: arch.clone(), gaps: loaded_gaps, diffusion, mask_token_id, shift_logits })
+        // arch + moe_variant: re-read here rather than reuse an earlier local — `arch` and
+        // `acfg.prefix` are both still in scope, but a fresh read matches this file's own existing
+        // convention (expert_count is independently re-read at every site that needs it, e.g. the
+        // treat_unsupported branch above) and costs nothing over trusting a 2500-line-old binding.
+        let moe_variant = g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0);
+        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale, attn_scale, logit_softcap, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, rope_neox: !acfg.rope_interleaved, rope_dims: rot, rope_mscale: mscale, trained_ctx, planned_weight_bytes, mla, dsa, mtp_layers: mtp, arch: arch.clone(), gaps: loaded_gaps, moe_variant, diffusion, mask_token_id, shift_logits })
     }
 
     // ── int8-resident weight cache ───────────────────────────────────────────────────────────
@@ -13132,7 +13150,11 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
-        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale: 1.0, attn_scale: None, logit_softcap: None, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, rope_neox: false, rope_dims: d / n_heads.max(1), rope_mscale: 1.0, trained_ctx, planned_weight_bytes: 0, mla: None, dsa: None, mtp_layers: 0, arch: String::new(), gaps: Vec::new(), diffusion: false, mask_token_id: None, shift_logits: false })
+        // arch/moe_variant are NOT in the `LSI8C` cache format (never needed until ModelStatus) —
+        // defaulted from the same constraint the RoPE line above already relies on: this path is
+        // llama-family only and never MoE, so "llama"/0 are not guesses, they're what loading via
+        // this cache already guarantees about anything that reaches here.
+        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale: 1.0, attn_scale: None, logit_softcap: None, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, rope_neox: false, rope_dims: d / n_heads.max(1), rope_mscale: 1.0, trained_ctx, planned_weight_bytes: 0, mla: None, dsa: None, mtp_layers: 0, arch: "llama".to_string(), gaps: Vec::new(), moe_variant: 0, diffusion: false, mask_token_id: None, shift_logits: false })
     }
     fn read_tensor(&self, r: &mut Rd) -> Option<Tensor> {
         let (rows, cols) = (r.u32()? as usize, r.u32()? as usize);

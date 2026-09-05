@@ -632,8 +632,96 @@ line-level. The streaming cursor (▌) lands on the last line. (chat.rs: `parse_
 LayoutJob runs aren't individually clickable; full click-through would need per-link Hyperlink widgets.
 
 **Tab-level parity** already holds: the egui tabs (bloc, cargo, charts, chat, code, modify, peek, rotate,
-sources) cover the GTK tabs and add `charts`. Remaining within-tab gaps to assess later: the GTK `ollama.rs`
-(an Ollama HTTP provider backend — would need an HTTP dep) and shared `components.rs` widgets.
+sources) cover the GTK tabs and add `charts`.
+
+**`components.rs` assessed — not a gap, superseded by design.** Every piece in this shared-widgets
+file is either (1) literal GTK widget construction (`build_model_dropdown`, `populate_model_store`
+— `gtk4::DropDown`/`StringList`, meaningless outside GTK), or (2) logic solving a problem specific
+to GTK's architecture that egui's doesn't have:
+- `resolve_key_to_host`/`display_split_entry` decode a `"model@host"` STRING key back into model +
+  host, because `gtk4::DropDown` can only store plain strings as item identities. egui's
+  `PickerItem` is a real enum (`model.rs`) that carries `host` as a typed struct field directly —
+  `PickerItem::key()` uses its own encoding (`"ollama:{model}"` / `"file:{path}"`) for a completely
+  different purpose (stable selection identity across a rescan), never needs to decode a host back
+  out of a string, and was never meant to match GTK's format.
+- `UiScheduler` coalesces multiple GTK `glib::idle_add_local_once` callbacks into one, avoiding
+  "20 updates -> 20 redraws" in glib's retained-mode mainloop. egui is immediate-mode: the whole UI
+  rebuilds from current state every frame regardless of how many things changed, so the problem
+  this debounces does not exist to have — there is nothing to port, not something left undone.
+
+That closes the parity audit this file's own note opened: three real mockups found by line-count
+triage (`modify.rs`, `rotate.rs` fixed; `bloc.rs` found and correctly deferred on a dependency-cost
+question), one live bug found beside it (`app.rs::rescan()`'s fake Ollama data, fixed), and the one
+named remaining item (`components.rs`) resolving to "already superseded," not "still needed."
+
+**CORRECTION (this session): the GTK `ollama.rs` gap above was stale and wrong.** The HTTP dep this
+note said was needed already exists — `logscope::providers` (shared by both frontends) has real
+`ureq`-based Ollama HTTP calls and a real parallel LAN scanner (`scan_lan_parallel`,
+`probe_host`). The actual bug was worse than "not ported": egui's `app.rs::rescan()` was LIVE
+production code (not a test fixture) that shipped two hardcoded fake hosts and fake model lists —
+`qwen2.5:7b` on a made-up `192.168.1.42` — instead of calling the real scanner, so the model picker
+could show servers and models that do not exist on the user's actual network. Fixed by wiring
+`rescan()` to `probe_host` (localhost) + `scan_lan_parallel` (LAN, bridged from its
+`crossbeam_channel` type into the existing `mpsc` channel `drain_scan()` already polls) — the
+downstream consumer, `build_model_entries`, was already real and unaffected. Verified with a
+standalone binary calling the exact same two functions: completes cleanly in ~5s, 0 hosts found —
+correct for this sandbox (no LAN, no Ollama server), and confirms the code path itself doesn't
+hang or panic rather than assuming it from reading the source. Removed the now-dead `mi()`/
+`tier_for()` fixture helpers `rescan()` no longer needs.
+
+**Line-count triage found a second mockup: `tabs/rotate.rs`.** Same method as `modify.rs`'s port —
+compared every GTK `ui/*_tab.rs` against its egui counterpart by line count. `rotation_tab.rs`
+(931) -> `rotate.rs` (71, a 13.1x shrink — the most extreme of any tab, including `modify.rs`'s
+original 14.8x) was a naive filename miss on the FIRST pass (`rotation_tab.rs` maps to `rotate.rs`,
+not `rotation.rs` — the loop's own automatic name-derivation was wrong, not a real gap), caught by
+checking rather than trusting the "no counterpart" result the script printed.
+
+What was there: the identical mockup shape as `modify.rs` before its fix — `config_text()` built a
+preview from UI state with no connection to the real backend, and "Apply" was a no-op button that
+always reported success regardless of outcome. `logscope::rotation` (`write_logrotate_conf`,
+`write_systemd_user_units`) and `logscope::probe::probe` already existed, pure and GTK-free, same
+as `modify.rs`'s scoring functions — real backend, unwired UI.
+
+Wired `probe()` for the tab's own step 1 (ownership/tier before offering a save target — a
+`/var/log` file owned by root needs a different target than one under `$HOME`), and real writes on
+Apply: `write_logrotate_conf` for the two logrotate-style targets, `write_systemd_user_units` for
+the systemd one, with the result (success + path written, or the real error) shown instead of the
+old placeholder that always read "Applied". Added `dirs` as a direct dependency for `~` expansion.
+
+5 new tests, checked against real files: `apply_writes_a_real_logrotate_conf_with_the_real_values`
+writes to an actual temp directory and reads the bytes back to confirm the policy's real values
+(keep-count, compress) landed in the file, not just that the function returned `Ok`;
+`apply_reports_failure_rather_than_a_false_ok_when_the_write_cannot_happen` forces a real
+`create_dir_all` failure (a file blocking where a directory needs to go) and asserts it surfaces as
+failure rather than reading as success the way the old placeholder always did. Full
+logscope-egui --features gui suite: 1330/1330 (1325 + 5 new), 0 regressions.
+
+**Third mockup found, NOT fixed — `tabs/bloc.rs` (11.9x shrink, `ui/bloc_tab.rs` 966 -> `bloc.rs`
+81).** Same shape as the other two: `blocs: Vec<BlocItem>` was four hardcoded fake entries
+("prefetch_ahead", "logrotate.tmpl" — names that read as real content but were never backed by
+anything), and selecting a row updated `self.sel` and did nothing else — the editor never loaded
+the selected bloc's text. `logscope::bloc_engine::builtin_templates()` looked like the same class
+of fix as `modify.rs`/`rotate.rs`: a real, pure, 32-entry template library with zero GTK
+dependency, sitting unused.
+
+**Wired it, then reverted.** `bloc_engine` is `#[cfg(feature = "bloc")]` in `logscope`, and that
+feature is `tree-sitter` + three language grammars (`Cargo.toml`: `bloc = ["dep:tree-sitter",
+"dep:tree-sitter-rust", "dep:tree-sitter-python", "dep:tree-sitter-javascript"]`).
+`logscope-egui` depends on `logscope` with `default-features = false` specifically — the default
+feature set exists to keep the GTK app's exact behavior, and egui opting out of it is a choice
+already made, not an omission. `builtin_templates()` itself needs none of tree-sitter; it is
+plain static string data sharing a file with code that does. Enabling the whole `bloc` feature to
+reach 32 template strings would add real native-code compilation (tree-sitter parser generation)
+to every egui build, on a project whose own stack targets mobile ARM devices where build time and
+binary size are explicitly stated priorities — not something to decide unilaterally by wiring one
+tab. Reverted `bloc.rs` to its prior state (confirmed `cargo check -p logscope-egui --features gui`
+clean afterward) rather than ship that tradeoff without it being someone's actual decision.
+
+**What would actually fix this, for whoever decides the tradeoff is worth it**: split
+`builtin_templates`/`TemplateBlocDef`/`PLACEHOLDER` out of the tree-sitter-gated part of
+`bloc_engine.rs` (they don't need the feature; nothing about them requires it) into an ungated
+location, or their own tiny always-on module. That is a shared-crate module-boundary change, not a
+per-tab port, and belongs with whoever owns `logscope::bloc_engine`'s API shape.
 
 **DeepSeek-style models — design note** (see outputs/DEEPSEEK_SUPPORT.md, analysis not implementation):
 "DeepSeek" splits into (1) the R1 *distills*, which are dense Llama/Qwen — the Llama ones (e.g.
