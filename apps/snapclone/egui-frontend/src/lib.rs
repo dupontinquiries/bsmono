@@ -101,6 +101,7 @@ pub mod snap_export;
 pub mod snap_state;
 pub mod snap_transport;
 pub mod snap_wire;
+pub mod av1_encode;
 pub mod tab_bar;
 pub mod thumbnails;
 pub mod trace_channels;
