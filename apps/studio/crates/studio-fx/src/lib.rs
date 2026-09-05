@@ -13,6 +13,7 @@
 
 pub mod schema;
 pub mod compositor;
+pub mod reference;
 pub mod analysis;
 pub mod playrate;
 pub mod saturation;
