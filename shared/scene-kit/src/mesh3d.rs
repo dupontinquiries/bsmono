@@ -1696,6 +1696,33 @@ pub fn rune_cells(seed: u64, grid: usize) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    /// Render a glyph to text art from the same bits `label_cells` reads, so
+    /// a wrong font is visible here instead of in a screenshot.
+    fn art(ch: char) -> Vec<String> {
+        let g = glyph5x7(ch);
+        (0..7).map(|y| (0..5).map(|x| if (g[x] >> y) & 1 == 1 { '#' } else { '.' })
+              .collect::<String>()).collect()
+    }
+
+    #[test]
+    fn the_glyph_table_actually_spells_the_letters_it_is_asked_for() {
+        // P: full left stem, closed bowl on the top half, nothing on the
+        // bottom right. If the table is transposed or bit-reversed this fails.
+        let p = art('P');
+        assert!(p.iter().all(|r| r.starts_with('#')), "P has a left stem: {p:?}");
+        assert!(p[0].contains("##"), "P's top bar: {p:?}");
+        assert_eq!(&p[6][1..], "....", "P's bottom row is stem only: {p:?}");
+        // A letter with a hole in the middle by design, and one without.
+        assert!(art('O')[3].starts_with('#') && art('O')[3].ends_with('#'));
+        assert!(art('I').iter().any(|r| r.contains('#')));
+        // Every character PARAMS needs is present and non-blank — a missing
+        // entry rendering as an empty grid is exactly the "holes" symptom.
+        for ch in "PARAMSTEMPCTXREPLYMINP0123456789".chars() {
+            let a = art(ch);
+            assert!(a.iter().any(|r| r.contains('#')), "{ch:?} is blank in the table");
+        }
+    }
+
     #[test]
     fn a_label_cell_never_projects_below_the_floor() {
         // The fault this is for: at this camera the PARAMS plaque's cells were
