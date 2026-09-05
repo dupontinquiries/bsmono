@@ -103,6 +103,28 @@ struct Common {
     /// at an odd pixel).
     #[arg(long, default_value = "bilinear")]
     halfpel_filter: String,
+    /// After half-pel, refine to quarter-pel (needs a scale that is a multiple of 4).
+    #[arg(long)]
+    quarterpel: bool,
+    /// Redraw (whole frame or region) when the packed residual would cover at
+    /// least this fraction of the frame's pixels; with bleed 8 on 30 px blocks
+    /// a cell is 2.35x a block, so 0.9 fires at ~38% missing blocks.
+    #[arg(long, default_value_t = 0.9)]
+    redraw_fraction: f64,
+    /// Upscale the bounding rectangle of missing blocks as one image (with
+    /// bleed) when that is cheaper than packing them or than the whole frame;
+    /// matched blocks outside it are kept. Letterbox bars stay copies.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    region_redraw: bool,
+    /// Motion search against the anchor (last redrawn frame, a fresh network
+    /// pass) with this RMSE gate (8-bit units); 0 = off. 12 was the gate the
+    /// propagation measurement used.
+    #[arg(long, default_value_t = 0.0)]
+    anchor_rmse: f64,
+    /// Force a new anchor (full redraw) every N frames (0 = never). Bounds
+    /// how far blocks are propagated from a restored frame; ±2 measured good.
+    #[arg(long, default_value_t = 0)]
+    anchor_max_age: u32,
     /// Host memory the job may hold (e.g. 96G). Default: half of MemAvailable.
     #[arg(long)]
     ram_budget: Option<String>,
@@ -284,6 +306,11 @@ fn job_from(common: &Common, input: PathBuf, output: PathBuf) -> anyhow::Result<
     j.pipeline.plate_min_confidence = common.plate_confidence;
     j.pipeline.mv_seed = common.mv_seed;
     j.pipeline.analyze.halfpel = common.halfpel;
+    j.pipeline.analyze.quarterpel = common.quarterpel;
+    j.pipeline.analyze.redraw_fraction = common.redraw_fraction;
+    j.pipeline.analyze.region_redraw = common.region_redraw;
+    j.pipeline.analyze.anchor_rmse = common.anchor_rmse;
+    j.pipeline.analyze.anchor_max_age = common.anchor_max_age;
     j.pipeline.analyze.subpel_filter = match common.halfpel_filter.as_str() {
         "bilinear" => d2x_core::SubpelFilter::Bilinear,
         "6tap" => d2x_core::SubpelFilter::SixTap,
@@ -308,13 +335,15 @@ fn print_event(e: &Event) {
             eprintln!("upscaler: {upscaler}\nmatcher: {matcher}, gate: {gate}");
         }
         Event::FrameDone { index, stats, analyze_time, upscale_time, merge_time } => {
-            let kind = if stats.redraw { "REDRAW" } else { "" };
+            let kind = if stats.redraw { "REDRAW".to_string() } else if let Some((_, _, w, h)) = stats.region { format!("REGION {w}x{h}") } else { String::new() };
             eprintln!(
-                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} half {:4} plt {:4} rec {:3} cache {:3} miss {:4} fade {:3}  residual {} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
+                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} half {:4} q4 {:4} anc {:4} plt {:4} rec {:3} cache {:3} miss {:4} fade {:3}  residual {} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
                 stats.psnr,
                 stats.stationary,
                 stats.moved,
                 stats.moved_half,
+                stats.moved_quarter,
+                stats.anchored,
                 stats.plated,
                 stats.recalled,
                 stats.cached,
@@ -368,7 +397,8 @@ fn main() -> anyhow::Result<()> {
             let (source, _) = job::open_source(&job)?;
             let bleed = job.pipeline.analyze.bleed;
             let summary = d2x_core::pipeline::analyze_only(source, job.pipeline, |i, s, frac, t| {
-                eprintln!("frame {i:6}  psnr {:5.1}  stat {:4} mov {:4} half {:4} plt {:4} rec {:3} miss {:4} fade {:3}  upscaled {:5.1}%{}  {:.1}ms", s.psnr, s.stationary, s.moved, s.moved_half, s.plated, s.recalled, s.missing, s.fades, frac * 100.0, if s.redraw { " REDRAW" } else { "" }, t.as_secs_f64() * 1e3);
+                let kind = if s.redraw { " REDRAW".to_string() } else if let Some((_, _, w, h)) = s.region { format!(" REGION {w}x{h}") } else { String::new() };
+                eprintln!("frame {i:6}  psnr {:5.1}  stat {:4} mov {:4} half {:4} q4 {:4} anc {:4} plt {:4} rec {:3} miss {:4} fade {:3}  upscaled {:5.1}%{kind}  {:.1}ms", s.psnr, s.stationary, s.moved, s.moved_half, s.moved_quarter, s.anchored, s.plated, s.recalled, s.missing, s.fades, frac * 100.0, t.as_secs_f64() * 1e3);
             })?;
             let _ = bleed;
             let total = summary.heavy_pixel_fraction + summary.plate_pixel_fraction;

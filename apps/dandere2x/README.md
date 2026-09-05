@@ -282,6 +282,34 @@ What is built:
   means resampling the CNN output — the trade a DLSS-class accumulator
   makes on purpose. (The 6-tap sampler is a straightforward closure loop,
   ~1 s/frame at 1080p on one core; not optimised, since it did not earn it.)
+- **Region redraw** (`--region-redraw`, default on; `--redraw-fraction`,
+  default 0.9): when the packed residual would cost more than the redraw
+  fraction, or the bounding rectangle of the missing blocks is cheaper than
+  packing them, that rectangle is upscaled as ONE image with its bleed ring
+  (`REGION WxH` in the log) and blended back; blocks matched outside it —
+  letterbox bars, a static HUD — stay copies. With bleed 8 on 30 px blocks
+  a cell is 2.35× a block, so the old rule redrew the whole frame at ~38%
+  missing and threw those copies away. Lone Ranger AV1, 120 frames, q90:
+  66.7% → 53.6% of pixels through the network.
+- **Anchor propagation** (`--anchor-rmse R`, default 0 = off; `--anchor-max-age N`,
+  default 0 = never): the diamond search also runs against the *anchor* —
+  the last redrawn frame, whose output is a fresh network pass — under a
+  flat RMSE gate instead of the JPEG gate (`anc` column; `RecalledMoved` in
+  the plan, copied from the anchor's upscale). A region redraw covering at
+  least half the frame is an anchor too. `--anchor-max-age N` forces a new
+  anchor every N frames, bounding how far blocks are propagated: the
+  low/high ground-truth measurement (`examples/tdenoise --from --oracle`)
+  gained +0.8 dB / +0.008 SSIM at ±1, +0.3–0.6 dB at ±2, nothing at ±3–4
+  and lost beyond, so 3–5 is the range to sweep. Measured, q90, 120 frames:
+  Lone Ranger 53.6% → 33.3% (`--anchor-rmse 12`), 36.9% with `--anchor-max-age 5`;
+  SMITE 95.9% → 54.5% unbounded, **31.4%** with `--anchor-max-age 5 --halfpel
+  --quarterpel` — fresh anchors are closer, so more blocks pass. The RMSE
+  gate is the quality knob; 8 costs almost nothing over 12 on film (33.6%).
+  Verify with `compare --per-frame` and watch the minimum.
+- **Quarter-pel** (`--quarterpel`, with `--halfpel`; exact copy only at
+  scales that are a multiple of 4 — the x4 models): half-pel becomes a
+  search stage centring a quarter-pel refinement; the mirror is the 4×4 box
+  downsample of the output, bit for bit. SMITE +2.4 points over half-pel.
 - **Gate hysteresis** (`--streak-bonus b`, default 0 = off): a block reused
   for `n` consecutive frames gets its threshold scaled by
   `1 + b·min(n,8)/8`, so blocks that keep matching stop flickering out at

@@ -179,6 +179,10 @@ impl<T: Clone> Ring<T> {
     fn refs(&self) -> Vec<&T> {
         self.recent.iter().chain(self.keyframes.iter()).collect()
     }
+    /// Index of the newest anchor in `refs()`, if any.
+    fn anchor(&self) -> Option<u8> {
+        if self.keyframes.is_empty() || self.recent.len() >= 255 { None } else { Some(self.recent.len() as u8) }
+    }
     /// After a frame is finished: `prev` becomes a recent reference; a redraw
     /// frame is also retained as a shot start.
     fn advance(&mut self, prev: T, this: &T, this_is_redraw: bool) {
@@ -400,7 +404,7 @@ pub fn run_tiered_with_cache(
         let reference: &dyn ReferenceMaker = &reference;
         let mut prev_working: Option<Frame> = None;
         let mut ring: Ring<Frame> = Ring::new(recent_refs, keyframe_refs);
-        let mut state = AnalyzeState { streak: Vec::new(), cache: cache_a };
+        let mut state = AnalyzeState { streak: Vec::new(), cache: cache_a, anchor: None, since_anchor: 0 };
         let mut reader = WindowReader::new(source, reader_window, acfg.min_psnr, plate_conf, bs, noise);
         'windows: loop {
             let t_win = Instant::now();
@@ -430,11 +434,12 @@ pub fn run_tiered_with_cache(
                     }
                     Some(mut prev) => {
                         let older = ring.refs();
+                        state.anchor = ring.anchor();
                         let r = analyze_tiered(&mut prev, &frame, &older, view, hint, reference, matcher.as_ref(), &acfg, n_tiers, &mut state);
                         match r {
                             Ok((plan, working_next, cached)) => {
                                 let residual = make_residual(&frame, &plan, bleed);
-                                ring.advance(prev, &working_next, plan.redraw);
+                                ring.advance(prev, &working_next, plan.stats.is_anchor(&plan.grid));
                                 prev_working = Some(working_next);
                                 Work { index, plan: Some(plan), residual, cached, analyze_time: t0.elapsed(), plate: plate_msg }
                             }
@@ -584,7 +589,8 @@ pub fn run_tiered_with_cache(
             heavy_sum += heavy;
             frames += 1;
             if let Some(p) = prev_up.take() {
-                ring.advance(p, &out, stats.redraw);
+                let anchor = work.plan.as_ref().map_or(true, |pl| pl.stats.is_anchor(&pl.grid));
+                ring.advance(p, &out, anchor);
             }
             prev_up = Some(out);
             on_event(Event::FrameDone { index: work.index, stats, analyze_time: work.analyze_time, upscale_time, merge_time });
@@ -654,13 +660,14 @@ pub fn analyze_only(
                 }
                 Some(mut p) => {
                     let older = ring.refs();
+                    state.anchor = ring.anchor();
                     let view = plate.as_ref().map(|pl| pl.view(i));
                     let (plan, next_w, _) = analyze_tiered(&mut p, &frame, &older, view, hint, &reference, matcher.as_ref(), &cfg.analyze, cfg.tiers.max(1), &mut state)?;
                     let fr = plan.stats.upscaled_fraction(&plan.grid, bleed);
                     fraction_sum += fr;
                     heavy_sum += plan.stats.heavy_fraction(&plan.grid, bleed);
                     on_frame(index, &plan.stats, fr, t0.elapsed());
-                    ring.advance(p, &next_w, plan.redraw);
+                    ring.advance(p, &next_w, plan.stats.is_anchor(&plan.grid));
                     prev = Some(next_w);
                 }
             }

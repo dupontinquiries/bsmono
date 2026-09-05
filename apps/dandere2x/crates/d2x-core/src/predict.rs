@@ -44,6 +44,25 @@ pub struct AnalyzeConfig {
     pub halfpel: bool,
     /// The interpolant used to evaluate (and mirror) half-pel candidates.
     pub subpel_filter: SubpelFilter,
+    /// After half-pel, try the eight quarter-pel neighbours of the best
+    /// half-pel candidate (bilinear). Exact copy only at scales that are a
+    /// multiple of 4.
+    pub quarterpel: bool,
+    /// When the packed residual would cost more than `redraw_fraction` of
+    /// the frame, or the bounding rectangle of missing blocks is cheaper
+    /// than packing them, upscale that rectangle as ONE image (with bleed)
+    /// instead of the whole frame. Blocks matched outside it are kept.
+    pub region_redraw: bool,
+    /// RMSE gate (8-bit units) for motion search against the anchor —
+    /// the last redrawn frame, whose output is a fresh network pass. 0 =
+    /// no anchor search. Content-independent, unlike the JPEG gate, which
+    /// is what the propagation measurement used.
+    pub anchor_rmse: f64,
+    /// Force a full redraw (a new anchor) when the last anchor is this many
+    /// frames old (0 = never). The propagation measurement gained for ±2
+    /// frames from a restored anchor and lost past ±4; this bounds the
+    /// distance blocks are propagated over, at one network pass per N frames.
+    pub anchor_max_age: u32,
     /// Texture thresholds (luma standard deviation, 0–255 units) for routing
     /// missing blocks to cheaper tiers: below `[0]` → tier 2 (bicubic),
     /// below `[1]` → tier 1 (cheap network), else tier 0. Only tiers the
@@ -61,7 +80,7 @@ pub struct AnalyzeConfig {
 
 impl Default for AnalyzeConfig {
     fn default() -> Self {
-        AnalyzeConfig { block_size: 30, bleed: 1, min_psnr: 5.2, redraw_fraction: 0.90, fade: true, halfpel: false, subpel_filter: SubpelFilter::Bilinear, tier_std: [1.0, 4.0], tier_metric: TierMetric::HighFreq, streak_bonus: 0.0 }
+        AnalyzeConfig { block_size: 30, bleed: 1, min_psnr: 5.2, redraw_fraction: 0.90, fade: true, halfpel: false, subpel_filter: SubpelFilter::Bilinear, quarterpel: false, region_redraw: false, anchor_rmse: 0.0, anchor_max_age: 0, tier_std: [1.0, 4.0], tier_metric: TierMetric::HighFreq, streak_bonus: 0.0 }
     }
 }
 
@@ -73,6 +92,12 @@ pub struct AnalyzeState {
     /// Consecutive frames each cell has been reused (any non-Missing match).
     pub streak: Vec<u16>,
     pub cache: Option<std::sync::Arc<std::sync::Mutex<BlockCache>>>,
+    /// Index into `older` of the anchor for this frame (set by the pipeline
+    /// per frame; the ring puts the newest retained anchor after the recent
+    /// references). `None` = no anchor search.
+    pub anchor: Option<u8>,
+    /// Frames since the last anchor (full redraw or ≥ half-frame region).
+    pub since_anchor: u32,
 }
 
 /// Upscaled bytes for the `Cached` blocks of one plan, attached by the
@@ -324,6 +349,36 @@ pub fn analyze_tiered(
     tiers: usize,
     state: &mut AnalyzeState,
 ) -> anyhow::Result<(FramePlan, Frame, CachedBlocks)> {
+    state.since_anchor = state.since_anchor.saturating_add(1);
+    if cfg.anchor_max_age > 0 && state.since_anchor > cfg.anchor_max_age {
+        let grid = Grid::new(next.width, next.height, cfg.block_size);
+        if state.streak.len() != grid.len() {
+            state.streak = vec![0; grid.len()];
+        }
+        state.streak.iter_mut().for_each(|s| *s = 0);
+        state.since_anchor = 0;
+        return Ok((FramePlan::redraw(grid, prev_working.psnr(next)), next.clone(), CachedBlocks::new()));
+    }
+    let r = analyze_tiered_inner(prev_working, next, older, plate, mv_hint, reference, matcher, cfg, tiers, state)?;
+    if r.0.stats.is_anchor(&r.0.grid) {
+        state.since_anchor = 0;
+    }
+    Ok(r)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_tiered_inner(
+    prev_working: &mut Frame,
+    next: &Frame,
+    older: &[&Frame],
+    plate: Option<PlateView<'_>>,
+    mv_hint: Option<(i64, i64)>,
+    reference: &dyn ReferenceMaker,
+    matcher: &dyn BlockMatcher,
+    cfg: &AnalyzeConfig,
+    tiers: usize,
+    state: &mut AnalyzeState,
+) -> anyhow::Result<(FramePlan, Frame, CachedBlocks)> {
     anyhow::ensure!(
         (prev_working.width, prev_working.height) == (next.width, next.height),
         "analyze: frame size changed {}x{} -> {}x{}",
@@ -375,6 +430,7 @@ pub fn analyze_tiered(
 
     // --- match pass against the faded prev.
     let prev_ro: &Frame = prev_working;
+    let anchor = state.anchor;
     let matches: Vec<BlockMatch> = (0..grid.len())
         .into_par_iter()
         .map(|i| {
@@ -402,8 +458,33 @@ pub fn analyze_tiered(
                     return BlockMatch::Moved { src_x: c.src_x, src_y: c.src_y };
                 }
                 if cfg.halfpel {
-                    if let Some(h) = refine_halfpel(prev_ro, next, x, y, bs, c, limit, cfg.subpel_filter) {
-                        return h;
+                    // With quarter-pel on, the half-pel stage is a search
+                    // stage, not a gate: its best (which may be the integer
+                    // candidate) centres the quarter-pel search.
+                    let lim_h = if cfg.quarterpel { u64::MAX } else { limit };
+                    if let Some((hsse, sx2, sy2)) = best_halfpel(prev_ro, next, x, y, bs, c, lim_h, cfg.subpel_filter) {
+                        if cfg.quarterpel {
+                            if let Some((qsse, sx4, sy4)) = refine_quarterpel(prev_ro, next, x, y, bs, sx2, sy2, hsse) {
+                                if qsse <= limit {
+                                    return BlockMatch::MovedQuarter { sx4, sy4 };
+                                }
+                            }
+                        }
+                        if hsse <= limit && (sx2 % 2 == 1 || sy2 % 2 == 1) {
+                            return BlockMatch::MovedHalf { sx2, sy2 };
+                        }
+                    }
+                }
+            }
+            if let (Some(a), true) = (anchor, cfg.anchor_rmse > 0.0) {
+                if let Some(old) = older.get(a as usize) {
+                    if (old.width, old.height) == (next.width, next.height) {
+                        let alim = (cfg.anchor_rmse * cfg.anchor_rmse * (bs * bs * 3) as f64) as u64;
+                        if let Some(c) = matcher.search(old, next, x, y, bs, alim) {
+                            if c.sse <= alim {
+                                return BlockMatch::RecalledMoved { r: a, src_x: c.src_x, src_y: c.src_y };
+                            }
+                        }
                     }
                 }
             }
@@ -425,6 +506,8 @@ pub fn analyze_tiered(
             BlockMatch::Cached { .. } => stats.cached += 1,
             BlockMatch::Plated { .. } => stats.plated += 1,
             BlockMatch::MovedHalf { .. } => stats.moved_half += 1,
+            BlockMatch::MovedQuarter { .. } => stats.moved_quarter += 1,
+            BlockMatch::RecalledMoved { .. } => stats.anchored += 1,
             BlockMatch::Missing => stats.missing += 1,
         }
     }
@@ -437,7 +520,62 @@ pub fn analyze_tiered(
     let cell = (cfg.block_size + 2 * cfg.bleed) as f64;
     let residual_px = (cols as f64 * cell) * (rows as f64 * cell);
     let frame_px = (grid.width() as f64) * (grid.height() as f64);
-    if residual_px >= cfg.redraw_fraction * frame_px {
+    // Region redraw: the bounding rectangle of the missing blocks, padded by
+    // bleed and clamped to the frame, as one image. Cheaper than packing
+    // whenever the misses are dense (no per-block bleed), never dearer than
+    // the whole frame, and seamless inside.
+    let region: Option<(u32, u32, u32, u32, u64)> = if cfg.region_redraw && stats.missing > 0 {
+        let (mut bx0, mut by0, mut bx1, mut by1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        for (i, m) in matches.iter().enumerate() {
+            if *m == BlockMatch::Missing {
+                let (x, y) = grid.origin(i);
+                bx0 = bx0.min(x);
+                by0 = by0.min(y);
+                bx1 = bx1.max(x + bs);
+                by1 = by1.max(y + bs);
+            }
+        }
+        let px0 = bx0.saturating_sub(cfg.bleed);
+        let py0 = by0.saturating_sub(cfg.bleed);
+        let px1 = (bx1 + cfg.bleed).min(grid.width());
+        let py1 = (by1 + cfg.bleed).min(grid.height());
+        Some((bx0, by0, bx1 - bx0, by1 - by0, ((px1 - px0) as u64) * ((py1 - py0) as u64)))
+    } else {
+        None
+    };
+    let packed_ok = residual_px < cfg.redraw_fraction * frame_px;
+    if let Some((rx, ry, rw, rh, rpx)) = region {
+        let whole = (rw, rh) == (grid.width(), grid.height());
+        if (!packed_ok || (rpx as f64) < residual_px) && !whole {
+            let mut matches = matches;
+            let mut stats = FrameStats { psnr, fades: fades.len() as u32, ..Default::default() };
+            for (i, m) in matches.iter_mut().enumerate() {
+                let (x, y) = grid.origin(i);
+                if x >= rx && x < rx + rw && y >= ry && y < ry + rh {
+                    *m = BlockMatch::Missing;
+                }
+                match *m {
+                    BlockMatch::Stationary => stats.stationary += 1,
+                    BlockMatch::Moved { .. } => stats.moved += 1,
+                    BlockMatch::Recalled { .. } => stats.recalled += 1,
+                    BlockMatch::Cached { .. } => stats.cached += 1,
+                    BlockMatch::Plated { .. } => stats.plated += 1,
+                    BlockMatch::MovedHalf { .. } => stats.moved_half += 1,
+                    BlockMatch::MovedQuarter { .. } => stats.moved_quarter += 1,
+                    BlockMatch::RecalledMoved { .. } => stats.anchored += 1,
+                    BlockMatch::Missing => stats.missing += 1,
+                }
+            }
+            stats.region = Some((rx, ry, rw, rh));
+            stats.region_px = rpx;
+            for (s, m) in state.streak.iter_mut().zip(&matches) {
+                *s = if *m == BlockMatch::Missing { 0 } else { s.saturating_add(1) };
+            }
+            let working_next = reconstruct(next, prev_working, older, plate, cfg, &grid, &matches);
+            return Ok((FramePlan { grid, matches, residuals: Vec::new(), fades, redraw: false, stats }, working_next, CachedBlocks::new()));
+        }
+    }
+    if !packed_ok {
         // Undo the fades: the redraw output is the original next frame, and
         // the low-res prev must not carry a shift the high-res prev never got.
         for f in &fades {
@@ -533,6 +671,15 @@ pub fn analyze_tiered(
     stats.residual_tiers = residual_tiers;
 
     // --- low-res reconstruction of next: matched blocks come from prev.
+    let working_next = reconstruct(next, prev_working, older, plate, cfg, &grid, &matches);
+
+    Ok((FramePlan { grid, matches, residuals, fades, redraw: false, stats }, working_next, cached_blocks))
+}
+
+/// The low-res mirror of what the merge will output: matched blocks from
+/// their sources, everything else the frame's own pixels.
+fn reconstruct(next: &Frame, prev_working: &Frame, older: &[&Frame], plate: Option<PlateView<'_>>, cfg: &AnalyzeConfig, grid: &Grid, matches: &[BlockMatch]) -> Frame {
+    let bs = cfg.block_size;
     let mut working_next = next.clone();
     for (i, m) in matches.iter().enumerate() {
         let (x, y) = grid.origin(i);
@@ -540,26 +687,63 @@ pub fn analyze_tiered(
             BlockMatch::Stationary => working_next.copy_block(prev_working, bs, x, y, x, y),
             BlockMatch::Moved { src_x, src_y } => working_next.copy_block(prev_working, bs, src_x, src_y, x, y),
             BlockMatch::Recalled { r } => working_next.copy_block(older[r as usize], bs, x, y, x, y),
+            BlockMatch::RecalledMoved { r, src_x, src_y } => working_next.copy_block(older[r as usize], bs, src_x, src_y, x, y),
             BlockMatch::Plated { px, py } => working_next.copy_block(plate.expect("Plated without a plate").lo, bs, px, py, x, y),
             BlockMatch::MovedHalf { sx2, sy2 } => {
                 let b = cfg.subpel_filter.block(prev_working, sx2, sy2, bs);
+                working_next.copy_block(&b, bs, 0, 0, x, y);
+            }
+            BlockMatch::MovedQuarter { sx4, sy4 } => {
+                let b = prev_working.block_quarterpel(sx4, sy4, bs);
                 working_next.copy_block(&b, bs, 0, 0, x, y);
             }
             // Cached blocks are the frame's own content, like Missing.
             BlockMatch::Cached { .. } | BlockMatch::Missing => {}
         }
     }
-
-    Ok((FramePlan { grid, matches, residuals, fades, redraw: false, stats }, working_next, cached_blocks))
+    working_next
 }
 
-/// The best of the eight half-pel neighbours of an integer candidate, if
-/// one passes the gate. Bilinear samples of `prev`; `block_sse` against the
-/// materialised sample (eight small blocks per failing block — cheap next
-/// to the JPEG gate, and only paid where the integer search failed).
+/// The best of the eight quarter-pel neighbours of a half-pel position
+/// (bilinear) that beats `start_sse`, as `(sse, sx4, sy4)`.
 #[allow(clippy::too_many_arguments)]
-fn refine_halfpel(prev: &Frame, next: &Frame, x: u32, y: u32, bs: u32, c: crate::matcher::Candidate, limit: u64, filter: SubpelFilter) -> Option<BlockMatch> {
+fn refine_quarterpel(prev: &Frame, next: &Frame, x: u32, y: u32, bs: u32, sx2: u32, sy2: u32, start_sse: u64) -> Option<(u64, u32, u32)> {
+    let limit = start_sse.saturating_sub(1);
     let mut best: Option<(u64, u32, u32)> = None;
+    for dy4 in -1i64..=1 {
+        for dx4 in -1i64..=1 {
+            if dx4 == 0 && dy4 == 0 {
+                continue;
+            }
+            let sx4 = sx2 as i64 * 2 + dx4;
+            let sy4 = sy2 as i64 * 2 + dy4;
+            if sx4 < 0 || sy4 < 0 {
+                continue;
+            }
+            let (sx4, sy4) = (sx4 as u32, sy4 as u32);
+            if sx4 / 4 + bs + (sx4 % 4 > 0) as u32 > prev.width || sy4 / 4 + bs + (sy4 % 4 > 0) as u32 > prev.height {
+                continue;
+            }
+            let b = prev.block_quarterpel(sx4, sy4, bs);
+            let lim = best.map_or(limit, |b| b.0);
+            if let Some(sse) = block_sse_bounded(next, x, y, &b, 0, 0, bs, lim) {
+                if best.map_or(true, |b| sse < b.0) {
+                    best = Some((sse, sx4, sy4));
+                }
+            }
+        }
+    }
+    best
+}
+
+/// The best of an integer candidate and its eight half-pel neighbours
+/// (`(sse, sx2, sy2)`, half-pel units) under `limit`. Bilinear samples of
+/// `prev`; `block_sse` against the materialised sample (eight small blocks
+/// per failing block — cheap next to the JPEG gate, and only paid where the
+/// integer search failed).
+#[allow(clippy::too_many_arguments)]
+fn best_halfpel(prev: &Frame, next: &Frame, x: u32, y: u32, bs: u32, c: crate::matcher::Candidate, limit: u64, filter: SubpelFilter) -> Option<(u64, u32, u32)> {
+    let mut best: Option<(u64, u32, u32)> = if c.sse <= limit { Some((c.sse, c.src_x * 2, c.src_y * 2)) } else { None };
     for dy2 in -1i64..=1 {
         for dx2 in -1i64..=1 {
             if dx2 == 0 && dy2 == 0 {
@@ -583,7 +767,7 @@ fn refine_halfpel(prev: &Frame, next: &Frame, x: u32, y: u32, bs: u32, c: crate:
             }
         }
     }
-    best.map(|(_, sx2, sy2)| BlockMatch::MovedHalf { sx2, sy2 })
+    best
 }
 
 /// Debug aid: the SSE of the reconstruction against the true next frame,
@@ -803,7 +987,7 @@ mod cache_tests {
             }
         };
         let cache = Arc::new(Mutex::new(BlockCache::new(1 << 20)));
-        let mut st = AnalyzeState { streak: Vec::new(), cache: Some(cache.clone()) };
+        let mut st = AnalyzeState { streak: Vec::new(), cache: Some(cache.clone()), anchor: None, since_anchor: 0 };
         // Frame 1: the stamp at (16,16), with a black bleed ring? No — bleed
         // ring comes from the surrounding smooth image, so use a frame where
         // the ring is identical both times: put the stamp fully inside a

@@ -73,6 +73,13 @@ pub enum BlockMatch {
     /// frame passes the gate. In the upscaled domain that is the integer
     /// position `(sx2·s / 2, sy2·s / 2)`, an exact copy for even scales.
     MovedHalf { sx2: u32, sy2: u32 },
+    /// Quarter-pel: `(sx4 / 4, sy4 / 4)` in the previous frame; an exact
+    /// copy at `(sx4·s / 4, sy4·s / 4)` when `s` is a multiple of 4.
+    MovedQuarter { sx4: u32, sy4: u32 },
+    /// The block at `(src_x, src_y)` of older reference `r` (the anchor —
+    /// the last redrawn frame, whose output is a fresh network pass) passes
+    /// the anchor gate. Propagation from a restored frame.
+    RecalledMoved { r: u8, src_x: u32, src_y: u32 },
     /// Nothing in any reference passes; the block must be upscaled.
     Missing,
 }
@@ -119,6 +126,16 @@ pub struct FrameStats {
     pub plated: u32,
     /// Blocks matched at a half-pel offset in the previous frame.
     pub moved_half: u32,
+    /// Blocks matched at a quarter-pel offset in the previous frame.
+    pub moved_quarter: u32,
+    /// Blocks propagated from the anchor with motion.
+    pub anchored: u32,
+    /// Region redraw: the bounding rectangle of missing blocks, in frame
+    /// pixels (block-aligned), upscaled as one image instead of packed
+    /// cells or the whole frame. `(x, y, w, h)`.
+    pub region: Option<(u32, u32, u32, u32)>,
+    /// Pixels of the padded region image (0 without a region).
+    pub region_px: u64,
     /// Residual image size in cells per tier (0×0 if none). Rectangular:
     /// `cols = ceil(sqrt(n))`, `rows = ceil(n / cols)`, so at most `cols − 1`
     /// cells are wasted instead of up to `2·sqrt(n)` for a square.
@@ -148,7 +165,7 @@ impl FrameStats {
         let frame_px = (grid.width() as f64) * (grid.height() as f64);
         // Tiers 0 and 1 are networks; tier 2 is bicubic and costs nothing worth counting.
         let res_px: f64 = self.residual_tiers.iter().take(2).map(|&(c, r)| (c as f64 * cell) * (r as f64 * cell)).sum();
-        res_px / frame_px
+        (res_px + self.region_px as f64) / frame_px
     }
 
     /// Fraction of the frame's pixels that went through the *main* network.
@@ -158,7 +175,14 @@ impl FrameStats {
         }
         let cell = (grid.block_size + 2 * bleed) as f64;
         let (c, r) = self.residual_tiers[0];
-        (c as f64 * cell) * (r as f64 * cell) / ((grid.width() as f64) * (grid.height() as f64))
+        ((c as f64 * cell) * (r as f64 * cell) + self.region_px as f64) / ((grid.width() as f64) * (grid.height() as f64))
+    }
+
+    /// A frame worth keeping as an anchor: a full redraw, or a region redraw
+    /// covering at least half the frame — either way most of its output is
+    /// a fresh network pass.
+    pub fn is_anchor(&self, grid: &Grid) -> bool {
+        self.redraw || self.region.map_or(false, |(_, _, w, h)| (w as u64) * (h as u64) * 2 >= (grid.width() as u64) * (grid.height() as u64))
     }
 }
 

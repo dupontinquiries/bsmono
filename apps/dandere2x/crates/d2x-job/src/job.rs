@@ -602,7 +602,7 @@ impl Upscaler for SharedUpscaler {
 fn segment_stamp(job: &Job, scale: u32) -> String {
     let a = &job.pipeline.analyze;
     format!(
-        "d2x1 in={} scale={} model={} cascade={} flat={} kernel={} q={} block={} bleed={} noise={} matcher={:?} tier={:?} streak={} refs={:?} plate={}/{} mvseed={} halfpel={}/{:?} codec={} crf={} preset={} tenbit={} jobs={}",
+        "d2x1 in={} scale={} model={} cascade={} flat={} kernel={} q={} block={} bleed={} noise={} matcher={:?} tier={:?} streak={} refs={:?} plate={}/{} mvseed={} halfpel={}/{:?} q4={} redraw={} region={} anchor={}/{} codec={} crf={} preset={} tenbit={} jobs={}",
         job.input.display(),
         scale,
         job.model.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
@@ -622,6 +622,11 @@ fn segment_stamp(job: &Job, scale: u32) -> String {
         job.pipeline.mv_seed,
         a.halfpel,
         a.subpel_filter,
+        a.quarterpel,
+        a.redraw_fraction,
+        a.region_redraw,
+        a.anchor_rmse,
+        a.anchor_max_age,
         job.encode.codec,
         job.encode.crf,
         job.encode.preset,
