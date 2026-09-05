@@ -462,6 +462,22 @@ impl GpuContext {
 }
 
 pub struct WgpuUpscaler {
+    /// Measures how long each GPU submission actually blocks, and how far
+    /// over a compositor frame it runs.
+    ///
+    /// This is the stutter: a submitted command buffer is not preemptible,
+    /// so while a whole-frame upscale runs the COMPOSITOR cannot get its own
+    /// work through and the entire desktop drops frames. Nicing the process
+    /// does nothing — the queue is not scheduled by the CPU scheduler.
+    ///
+    /// Measured first, deliberately. The controller can only be tuned
+    /// against real numbers, and the numbers are what a metrics pane needs
+    /// anyway. Splitting the work to act on them is the next step; see the
+    /// note at the poll site.
+    /// A `Cell` because one of the two poll sites is on an `&self` method.
+    /// `Pacer` is `Copy` and this is single-threaded per upscaler, so a cell
+    /// is the whole cost — no lock for a counter.
+    pace: std::cell::Cell<gpu_kit::pace::Pacer>,
     ctx: Arc<GpuContext>,
     pub net: Arc<Network>,
     pub tile: u32,
@@ -768,7 +784,7 @@ impl WgpuUpscaler {
             sets.push(ActSet { conv_cache: vec![None; steps.len()], bufs, steps, pack_params, pack_bind: None, staging });
         }
         let set_bytes_total = set_bytes(&net, tile as u64) * inflight as u64;
-        Ok(WgpuUpscaler { ctx, net, tile, inflight, kernel: opts.kernel, target_scale: opts.target_scale, conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, extract_pipeline, extract_layout, frame_buf: None, frame_words: 0, frame_width: 0, frame_height: 0, frame_out: None, frame_out_words: 0, out_stride: 0, pack_layout, tile_cache: Vec::new(), tile_cache_key: None, rgba_scratch: Vec::new(), batch_staging: None, sets, _weights: weights, set_bytes_total })
+        Ok(WgpuUpscaler { pace: std::cell::Cell::new(gpu_kit::pace::Pacer::new(1)), ctx, net, tile, inflight, kernel: opts.kernel, target_scale: opts.target_scale, conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, extract_pipeline, extract_layout, frame_buf: None, frame_words: 0, frame_width: 0, frame_height: 0, frame_out: None, frame_out_words: 0, out_stride: 0, pack_layout, tile_cache: Vec::new(), tile_cache_key: None, rgba_scratch: Vec::new(), batch_staging: None, sets, _weights: weights, set_bytes_total })
     }
 
     /// Encode and submit one tile on activation set `si`; returns the
@@ -915,7 +931,20 @@ impl WgpuUpscaler {
             let _ = tx.send(r);
         });
         // Wait for *this* submission only, so later tiles keep computing.
+        // TIME THE SUBMISSION. This poll blocks until the GPU has finished
+        // the command buffer, so wall-clock around it IS how long the queue
+        // was occupied — and therefore how long the compositor was locked
+        // out of it. No timestamp query needed for the number that matters.
+        //
+        // Both poll sites are instrumented: there are two, and measuring
+        // one would have quietly reported half the GPU time as zero.
+        let t_gpu = std::time::Instant::now();
         self.ctx.device.poll(wgpu::PollType::Wait { submission_index: Some(idx), timeout: None }).context("device poll")?;
+        {
+            let mut p = self.pace.get();
+            p.record(t_gpu.elapsed().as_secs_f32() * 1000.0);
+            self.pace.set(p);
+        }
         let mapped = match rx.try_recv() {
             Ok(r) => r,
             Err(_) => {
@@ -1138,7 +1167,20 @@ impl WgpuUpscaler {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        // TIME THE SUBMISSION. This poll blocks until the GPU has finished
+        // the command buffer, so wall-clock around it IS how long the queue
+        // was occupied — and therefore how long the compositor was locked
+        // out of it. No timestamp query needed for the number that matters.
+        //
+        // Both poll sites are instrumented: there are two, and measuring
+        // one would have quietly reported half the GPU time as zero.
+        let t_gpu = std::time::Instant::now();
         self.ctx.device.poll(wgpu::PollType::Wait { submission_index: Some(idx), timeout: None }).context("device poll")?;
+        {
+            let mut p = self.pace.get();
+            p.record(t_gpu.elapsed().as_secs_f32() * 1000.0);
+            self.pace.set(p);
+        }
         if rx.try_recv().is_err() {
             self.ctx.device.poll(wgpu::PollType::wait_indefinitely()).context("device poll")?;
             rx.recv().context("map_async dropped")?.context("map_async")?;
@@ -1154,6 +1196,15 @@ impl WgpuUpscaler {
         staging.unmap();
         Ok(out)
     }
+}
+
+impl WgpuUpscaler {
+    /// GPU submission timings — for a metrics pane, and for deciding
+    /// whether the work needs splitting on this machine.
+    ///
+    /// `overrun_rate()` is the one to show if there is room for a single
+    /// number: every overrun is a compositor frame the user felt.
+    pub fn gpu_metrics(&self) -> gpu_kit::pace::Metrics { self.pace.get().metrics() }
 }
 
 impl Upscaler for WgpuUpscaler {

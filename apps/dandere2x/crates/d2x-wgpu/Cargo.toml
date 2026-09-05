@@ -6,6 +6,8 @@ license.workspace = true
 description = "waifu2x upconv_7 on wgpu compute (Vulkan on Asahi/Mesa, Metal/DX12/GL elsewhere), implementing d2x-core Upscaler. CPU-validated by selftest."
 
 [dependencies]
+# GPU submission pacing + metrics (see the poll site in lib.rs).
+gpu-kit = { path = "../../../../shared/gpu-kit" }
 d2x-core = { path = "../d2x-core" }
 anyhow.workspace = true
 wgpu.workspace = true

@@ -988,6 +988,22 @@ asked as a question.
   WAS: eframe surfaces dropped files via `ctx.input(|i| &i.raw.dropped_files)`;
   the confirmation matters because a drop replaces the input path and the
   previous one is not recoverable from the UI.
+- [ ] **Act on the GPU pacing numbers (`gpu_kit::pace`).** The MEASUREMENT is
+  wired: `WgpuUpscaler` times both `device.poll` sites (there are two —
+  instrumenting one would have reported half the GPU time as zero) and
+  exposes `gpu_metrics()`. What is NOT done is acting on them: the pacer's
+  `chunk()` is ignored because a whole-frame upscale is submitted as one
+  command buffer. Splitting it means banding the frame — `PackDst` already
+  carries `crop_x/crop_y/crop_w/crop_h`, so the shape is there. Do the
+  measurement pass on real hardware FIRST; if `overrun_rate()` is near zero
+  on the target machine the splitting is not worth its complexity.
+- [ ] **A metrics pane in each app.** `gpu_kit::pace::Metrics::summary()`
+  renders the line and `overrun_rate()` is the single number worth showing.
+  dandere2x can read it today via `gpu_metrics()`; logscope needs the same
+  instrumentation around its `glow_scene` draw first.
+- [ ] **logscope scene props need more depth.** Reported alongside the
+  stutter; not started. The props read as flat next to the reference images.
+
 - [ ] **logscope scenes: ground and leaf textures gone flat (reported with a
   screenshot, 2026-09-05).** NOT REPRODUCED here — at HEAD under llvmpipe the
   Canopy terrain still shows its texture, so this is environment-dependent
