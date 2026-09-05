@@ -34,11 +34,25 @@ def main(argv):
     gl = glsl_fields(open(glsl_path).read(), name)
     if rs is None: print(f"NOT FOUND: Rust struct {name} in {rust_path}"); return 2
     if gl is None: print(f"NOT FOUND: GLSL block {name} in {glsl_path}"); return 2
-    if len(rs) != len(gl):
-        print(f"MISMATCH count: rust={len(rs)} glsl={len(gl)}")
+    if len(rs) < len(gl):
+        # GLSL somehow declares MORE fields than Rust has — always a real
+        # problem (it would read past the struct, or duplicate a name).
+        print(f"MISMATCH count: rust={len(rs)} glsl={len(gl)} (glsl longer than rust)")
         print(f"  rust: {rs}\n  glsl: {gl}"); return 1
+    # A GLSL block shorter than the Rust struct is EXPECTED, not a defect:
+    # a shader stage only reads the UBO fields it actually uses, and later
+    # (vertex-only, or fragment-only) fields legitimately go undeclared on
+    # a side that never touches them — see r595's disturber array, added
+    # after chunk.frag's own last-used field, read only from chunk.vert.
+    # What actually causes the "silent UB" this checker exists to catch is
+    # the GLSL's fields being a non-PREFIX subset (skipping one) or
+    # reordered relative to Rust — checked below regardless of length.
     drift = [(i, a, b) for i, (a, b) in enumerate(zip(rs, gl)) if a != b]
-    print(f"{name}: {len(rs)} fields, order matches" + ("" if not drift else " (NAME DRIFT)"))
-    for i, a, b in drift: print(f"    field {i}: rust '{a}' vs glsl '{b}' (order ok, names differ)")
+    if drift:
+        print(f"MISMATCH order/name: rust={rs}\n  glsl={gl}")
+        for i, a, b in drift: print(f"    field {i}: rust '{a}' vs glsl '{b}'")
+        return 1
+    suffix = f" (glsl declares a {len(gl)}-field PREFIX of rust's {len(rs)})" if len(rs) != len(gl) else ""
+    print(f"{name}: {len(gl)} fields match in order{suffix}")
     return 0
 if __name__ == "__main__": sys.exit(main(sys.argv))

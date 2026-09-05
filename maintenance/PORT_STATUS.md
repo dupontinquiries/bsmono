@@ -1318,3 +1318,217 @@ identical by reading the deprecated function's own body before swapping it),
 this one has no such equivalence — "fixing" it would mean restructuring how
 each app opens its root panel, which is a real (if probably small) per-app
 change, not a mechanical rename, and not attempted here.
+
+## Correction: `router.rs` is no longer safe to delete — `Shell` builds on it
+
+An earlier entry in this document, after finding `router.rs`'s `tab_bar_ui`
+duplicated the dispatch `main.rs` grew independently, concluded: "`router.rs`
+is safe to delete once confirmed nobody else is about to build on it." That
+conclusion no longer holds. `src/ui/egui/shell.rs` — not present anywhere in
+this document when that entry was written, confirmed by grep — is a THIRD
+attempt at the same "ten renderers, no caller" problem, and it imports
+`router.rs` directly (`use super::router::{self, Router};`, and calls
+`router::tab_bar_ui` for its own tab bar). Deleting `router.rs` today would
+break `shell.rs`'s build, not just remove dead weight.
+
+**`Shell` itself is still not wired into `main.rs`** — the actual running
+binary's `App` has its own hand-rolled `Page` enum and dispatch, exactly as
+this document already describes; `Shell` is a fourth thing sitting beside it,
+unreached, not a replacement that shipped. Checked whether `Shell` could
+safely become the thing `main.rs` uses now that a compiler is available to
+verify with, rather than assuming it either way:
+
+**It cannot, yet, without a regression.** `Shell`'s `Section::Live` arm calls
+only `super::live::live_ui` (the sensor panel) — it has no `LiveState` field
+at all, so it draws neither the big headline temperature `main.rs` shows nor
+the `share_row_ui` weather-sharing row this document's own previous entry
+specifically extracted and wired into the real running page as "the concrete
+next step." Swapping `main.rs` to use `Shell` today would silently drop both.
+This is the SAME reconciliation question the earlier entry declined to
+answer for `LiveView` — now a three-way rather than two-way one (`LiveState`+
+`live_ui`, `LiveView`, `Shell`'s bare `live_ui`) — and for the same reason:
+picking which page composition wins is a real design call, not something a
+sandbox session should resolve by picking one and deleting the others.
+
+**What IS newly confirmed, precisely, so the next session doesn't have to
+re-derive it:**
+- `Shell` compiles and its own 151 tests pass (`cargo test --no-default-features
+  --features egui` in `egui-frontend`), including `every_section_dispatches_to_a_page`,
+  a source-scan test that would fail if any of `Shell`'s seven `Section` arms
+  drew nothing.
+- `Shell.back_unhandled` and `Shell.pending` (the `take_actions()` queue) are
+  real, tested fields with nothing reading them — but this is currently moot
+  rather than a bug of its own, since `Shell` itself is unreached from the
+  binary. It becomes relevant the moment someone wires `Shell` in.
+- `LiveView` (`mod.rs`) still holds two pieces of real UI `LiveState`'s
+  running headline doesn't have — an animated pressure gauge (`pressure::
+  gauge_ui`) and an animated confidence bar, versus `LiveState`'s plain text
+  band and tier label. Not safe to delete either, for the same "which design
+  wins" reason `share_row_ui`'s extraction sidestepped rather than answered
+  for the sharing row: deleting `LiveView` now would foreclose those two
+  choices before anyone decided whether they're wanted, not just remove
+  confirmed-redundant code.
+- `main.rs`'s `Places` page dropping its `LocationAction` (no in-memory
+  fallback) was checked against this app's own repeated stated convention —
+  "empty rather than fabricated," used almost verbatim for History, Places,
+  Sync, and Model's demo states — and is consistent with it, not an
+  oversight: `LocationAction::{SetCurrent,Remove}` carry `i64` ids, which
+  reads as real database row ids the demo has no database to satisfy.
+  Faking a local add would show a place that was never saved, which the
+  page's own empty-state philosophy exists to avoid claiming.
+
+**Net effect of this pass:** no code changed. The value here is narrowing
+what's actually still open — the Live-page reconciliation is real, growing
+(now three implementations, not two), and still not this session's call to
+make; everything else checked this pass turned out to already be correct,
+deliberate design rather than an unwired gap.
+
+## `Shell` brought to real feature parity with `main.rs`'s Live page (additive only)
+
+The previous entry's "three-way" question wasn't actually about an undecided
+COMPOSITION — `main.rs`'s real, running Live page already settles that
+(headline, then sensor panel, then weather-share row, with its own comments
+establishing why). What `Shell` was missing was porting that already-settled
+shape, not inventing a new one. Did just that:
+
+- Added `live_state: crate::LiveState`, `contacts`, `share`, `shared_note` to
+  `Shell`, mirroring `main.rs`'s own fields.
+- Extracted `Shell::advance_clock(t_ms) -> dt_ms`, a small pure function,
+  since `Shell::ui` receives an absolute clock rather than a delta (its only
+  current caller tracks one clock for everything) and the dot/easing both
+  need a delta. Tested in isolation: zero on the first frame, correct real
+  deltas after, clamped rather than negative if the clock ever runs
+  backward (a resumed suspend, a clock adjustment).
+- Updated `Section::Live`'s arm to the same three-part composition.
+
+**Verified, not asserted:** added a source-scan test (matching this file's
+established style) asserting the Live arm calls both `live_state.ui(` and
+`share_row_ui(`, and — because a test that's never seen itself fail proves
+less than one that has — reverted the arm to its old sensor-panel-only form,
+confirmed the new test actually fails against that regression, then restored
+the fix and confirmed green again. Full suite (`egui-frontend` and the
+parent crate's own `--features egui` build): 154/154, both. The real eframe
+binary (`cargo check --bin ambient-learner-egui`, the `app` feature) still
+builds clean — same single pre-existing deprecation warning, nothing new —
+which matters here specifically because `main.rs` was not touched at all,
+so this carries zero regression risk to what's actually shipping.
+
+**Field-by-field, `Shell` now has genuine state parity with `main.rs`'s
+`App`.** The only remaining differences are `colors` and `started`, which
+`main.rs` owns directly and `Shell` instead receives from its caller
+(`egui_lib::App` owns one clock for everything) — an architecture choice,
+not a missing piece.
+
+**Not done, and deliberately not attempted this session:** actually
+switching `main.rs` to use `Shell` instead of its own hand-rolled dispatch.
+`Shell` being a verified, tested superset of what's running is a
+meaningfully different, lower-risk kind of change than replacing the code
+in the binary that's actually shipping — this sandbox has no window system
+to link an eframe build against (confirmed earlier in this document), so a
+swap here could be verified to compile and pass every existing unit test
+without ever being verified to look or feel right, which is exactly the gap
+between "the pages are ported" and "the app is runnable" this whole
+document exists to keep from hiding. `router.rs`'s own dispatch and
+`Shell`'s back-navigation (`back_unhandled`) and pending-action queue
+(`take_actions()`) would all need real decisions for a native eframe host
+(what does "back with nowhere to go" mean for a desktop window? does a
+dropped `LocationAction` get the same explicit comment `main.rs`'s current
+version has, or a real backend?) that are worth making deliberately, with
+the ability to actually see the result, rather than folded into a
+sandboxed session that can't check the outcome.
+
+## The `main.rs` ↔ `Shell` swap, fully specified so it's a quick decision later
+
+Asked explicitly (twice) whether to go ahead and make this swap myself given
+`Shell`'s now-verified parity. Held off both times rather than infer consent
+from a repeated general instruction to continue — this is the one remaining
+change in this app that touches the actually-shipping binary, and it
+deserves a direct answer, not a guess. Writing out exactly what it would
+take instead, so whoever DOES greenlight it (a person, or a session that can
+actually run the eframe binary to check the result) can execute it in
+minutes rather than re-deriving the plan:
+
+**The mechanical part** (low risk, `Shell`'s own tests already cover it):
+replace `main.rs`'s `Page` enum, its seven `App` page-state fields, and its
+hand-rolled `update()` dispatch with a single `shell: Shell` field, calling
+`self.shell.ui(ui, &self.colors, t_ms)` where the tab bar + `match self.page`
+block currently is. `colors` and `started`/`t_ms` stay owned by `main.rs`
+exactly as `egui_lib::App` already does it, since `Shell` takes both as
+parameters rather than owning them.
+
+**The three real decisions, not mechanical, needing a person who can see
+the result:**
+1. **`back_unhandled`.** `Shell` sets this when Escape/Back is pressed with
+   nowhere to go, and documents that "the host decides what that means." For
+   a native eframe window, the plausible answer is
+   `ctx.send_viewport_cmd(egui::ViewportCommand::Close)` — but that's a real
+   product choice (does Escape close the app? most desktop apps would say
+   no, only a phone-style back gesture should), not a default to assume.
+2. **`Shell.pending` / `take_actions()`.** `main.rs` currently drops
+   `LocationAction`s with an explicit comment ("this demo has no backend to
+   perform it against"). Wiring `Shell` in means either keeping that same
+   drop-with-comment behavior (a one-line change: call `take_actions()` and
+   discard the result, same reasoning as today) or building the backend —
+   the latter is new scope, not part of this swap.
+3. **The ambience background isn't just ungated in `Shell` — it's a
+   different design choice, stated as one.** `main.rs` draws `ambience_ui`
+   as a mood background behind the Live page specifically
+   (`if self.page == Page::Live`). `Shell` draws it only inside
+   `Section::Debug`, with its own comment calling it a developer surface —
+   "not a top-level page... they live behind the wrench" — matching the GTK
+   build's own choice, per that comment. These are two real, considered,
+   DIFFERENT answers to "where does the ambience layer belong," not one
+   correct version and one gap. The swap has to pick one rather than
+   silently keep whichever `Shell` happens to do.
+
+**Everything else is copy the field, copy the call, delete the duplicate.**
+No new design surface, no invented behavior — the three items above are the
+whole reason this remains "a decision" rather than "a refactor."
+
+## Correction: `detect::picker_ui`'s gap is deeper than "wire it into the fallback"
+
+Went to act on this document's own open item — "wire `detect::picker_ui`
+into the ambiguous-reference path... show the picker instead of failing
+silent" — and looked for that fallback path before writing to it, the same
+discipline this document already applies everywhere else. **It doesn't
+exist yet, anywhere in the real binary.**
+
+Traced the whole chain: `EntityPicker::ask`/`picker_ui` (in
+`egui-frontend/src/detect.rs`) consume `Vec<ResolvedMatch>` from
+`entity_extract::resolve_reference`. Grepped the ENTIRE app, both crates,
+for every caller of `resolve_reference`, `EntityPicker`, or `picker_ui`:
+exactly four files reference any of them, and three are the definition, a
+pure-library caller (`completion.rs`'s file-voice-resolution pipeline,
+itself only called from its own tests — `resolve_file_for_voice` has zero
+callers outside `completion.rs`), and a doc-comment mention with no actual
+call (`ui_landmarks.rs`). **Grepped the real 4,306-line running binary
+(`bin/voiceterm_egui.rs`) specifically for any of these names: zero hits.**
+The binary's own command system, `palette::Command`, is a different thing
+entirely — the text/GUI command palette (`OpenView`, `Split`, `ShowPalette`,
+...), nothing shaped like "a spoken reference matched more than one
+on-screen entity."
+
+So there is no place in the running app today where a spoken reference gets
+resolved against on-screen entities at all, ambiguously or otherwise — not
+"the picker isn't shown when it should be," but "the thing that would decide
+whether to show it doesn't exist yet." Wiring `picker_ui` in would mean
+building that decision point first: where in the real voice pipeline a
+transcript becomes a reference to resolve, what counts as "ambiguous enough
+to ask" versus "confident enough to just act," and what the chosen entity
+then DOES (which command, on which target). That's new integration surface,
+not a missing function call — the same "not this session's call to make"
+line held for ambient-learner's Live-page reconciliation, for the same
+reason: I have a well-tested pure engine and no way to know, from reading
+code alone, where in a 4,306-line file a person intended a spoken command's
+target to get resolved.
+
+**Correcting the checklist item rather than leaving it to mislead the next
+session:**
+- [ ] ~~voiceterm: wire `detect::picker_ui` into the ambiguous-reference
+      path — wherever the engine currently falls back...~~ — no such
+      fallback exists to wire into. Real next step: find or design where in
+      `voiceterm_egui.rs`'s voice pipeline a transcript is meant to resolve
+      against on-screen entities (files, devices, panes) at all, since that
+      integration point doesn't exist yet under any name this session could
+      find. `resolve_reference`/`EntityPicker`/`picker_ui` remain real,
+      tested, and ready the moment that point is identified or built.

@@ -12301,3 +12301,81 @@ field's zero crossing (candidate directions unchanged from the r604 ledger: CPU 
 gate, precomputed noise tiles, or f64 emulation in GLSL). Until then: tree site stays r612 (0.921/1.369 mass — honest
 numbers for an honestly-forked surface), clean seeds stay gate-worthy (0 and 610 terrain), and every instrument
 (parity panel, tree-biome histogram, lapse, decision-export) is in-tree for the surface project to verify against.
+
+## Session note: this ledger is ~124 rounds behind the actual code, and the bin can now be compile-checked in-sandbox
+
+Picked this file up fresh (no memory of prior sessions' reasoning) and found two things worth recording precisely
+rather than acting on blind:
+
+**The bin can be `cargo check`ed here now.** It previously failed at the `glfw-sys` build script
+("RandR headers not found; install libxrandr development package") — a real, specific, fixable cause, not a
+structural sandbox limit like the GPU/Vulkan gap (still real: no `/dev/dri`, no `vulkaninfo`, `RAN` genuinely stays
+out of reach here). `apt-get install libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev` (all present via
+`archive.ubuntu.com`/`security.ubuntu.com`, already in this sandbox's allowed network domains) fixed it:
+`cargo check -p unendlich-engine --bin unendlich-fullgame --features "render window ui-overlay"` now finishes clean
+(warnings only). Compile-checking the bin was a real gap this ledger's own tier system names — CHECKED vs WIRED
+vs RAN — worth having, and worth a future session installing these same packages early rather than accepting
+"the bin can't compile here" as still true without re-testing it.
+
+**This file's last entry is r617; the actual source is at least at r741.** Grepped every `r[0-9]+` comment
+reference in `unendlich_fullgame.rs` alone and found r734, r736, r738, r741 — comments this ledger has no
+corresponding round for. That's at least 124 rounds of shipped, commented, presumably-reasoned work with no entry
+here. Concretely confirmed one instance rather than assuming the gap is uniform: the r617-era ledger inherited an
+open item from an EARLIER note (line ~11193, "STILL TODO (operator noted): a HAND-HELD BLOCK viewmodel... block
+selection has no in-hand model yet") that reads, on its face, like it's still open at r617. **It isn't.** Traced
+every assignment site of `renderer.creative_place_item` (the field the first-person viewmodel actually reads) and
+`selected_palette_idx`/`renderer.creative_selected` (the newer scroll/click/Alt-chord selection this TODO's own
+round added) in the current source: all three input paths — number keys, scroll wheel, and click-to-select — call
+the same `apply_creative_hotbar_slot` helper in the creative branch, which sets `creative_place_item` correctly.
+An `r657` comment sitting right beside this logic describes replacing "the old decoupled 9-block PLACE_PALETTE
+(clicks used to select the wrong block...)" with exactly this unified path. The TODO was closed at some point
+between r554 and r657; nobody updated this file to say so.
+
+**Not attempted: catching this ledger up properly, or touching the active terrain-parity investigation (r617's own
+next step).** A 124-round gap needs someone who was there for the reasoning to summarize honestly — reconstructing
+it from diffs alone risks exactly the false-confidence this document's own tier system exists to prevent, and I
+have no way to know how many OTHER "still open" notes are similarly stale without checking each one against current
+source the way I checked this one. Recording the concrete, verifiable facts (the two capability/state corrections
+above) rather than guessing at the other ~123 rounds' worth of context is the honest stopping point here.
+
+## Found the REAL current coordinator system, and unlocked lavapipe: HARNESS was RED, now fixed and GREEN
+
+Found `COORDINATOR_BOOTSTRAP.md`/`handoff/COORDINATOR_TODO.md` — an active, more current multi-agent
+coordination system (worker threads, R27-numbered rounds, distinct from this file's r-numbers) that this
+session should have found before the previous entry. It independently confirms the exact bin-compile fix
+already recorded here (same package list). Worth stating plainly for whoever reads this file next: **check
+`COORDINATOR_BOOTSTRAP.md` FIRST** — it is the more current entry point.
+
+**Lavapipe (software Vulkan) now genuinely works here**, unlocking GPU-shader verification this session had
+written off as hardware-blocked: `apt-get install mesa-vulkan-drivers=24.0.5-1ubuntu1` (the newest version
+404s from `noble-updates`; the `noble`-base version installs fine) plus `vulkan-tools` gets a real enumerated
+device — confirmed via `vulkaninfo`: `deviceName = llvmpipe (LLVM 17.0.6, 256 bits)`, `PHYSICAL_DEVICE_TYPE_CPU`.
+Also installed `glslang-tools=14.0.0-2` + `spirv-tools=2023.6~rc1-2` (same `noble`-vs-`noble-updates` 404
+pattern; older versions install fine) to unblock the harness's shader-compile and descriptor-layout gates. This
+means `harness/run.sh` — previously only partially runnable here — now runs its FULL check set.
+
+**Ran it: HARNESS RED.** R16 (CameraUbo Rust↔GLSL field parity) reported a count mismatch — Rust's `CameraUbo`
+has 17 fields, `chunk.frag`'s declares 15, missing `disturbers`/`disturber_meta` (r595's foliage-disturber
+array). Traced this precisely rather than assume either the game or the checker was wrong: `chunk.vert`
+**does** declare and use both fields (confirmed by reading the file directly) — r595's own entry describes
+exactly this, tested and validated at the time. The two fields are consumed ONLY in the vertex shader (foliage
+bends before rasterization; the fragment shader has no reason to read player/mob positions). **The regression
+was in `harness/ubo_parity.py` itself, not the game**: it hardcodes `chunk.frag` as its one reference file and
+demanded an exact field-COUNT match, which was silently true only by coincidence until r595 legitimately grew
+the UBO's tail with vertex-only fields — a normal, valid GLSL/Vulkan pattern (a stage may declare a prefix of a
+UBO block, using only the offsets it needs).
+
+**Fixed the checker, not the game**: `ubo_parity.py` now treats a GLSL declaration that's a strictly-ordered
+PREFIX of the Rust struct as passing (the real hazard the checker's own docstring names — silent UB from field
+REORDERING — is unaffected by a shader simply not reading the tail). A GLSL block LONGER than Rust, or any
+field out of order/renamed at a shared index, still fails. Verified both directions concretely, not just by
+reading the diff: temporarily swapped `sun_color`/`sky_color` in `chunk.frag` and confirmed the checker still
+catches it (`MISMATCH order/name`, exit 1, pinpointing the exact swapped indices) before restoring the real
+file and reconfirming clean. Full harness re-run: **HARNESS GREEN** (R16 passes as a 15-field prefix match; R23
+GPU gate 36/36 shaders; R32's six "NEW shader" neural-network-inference entries are informational, matching the
+script's own non-failing treatment of them, not part of what was red).
+
+Net effect: no game code changed, one real gap in the validation tooling fixed and verified in both directions,
+and this sandbox's checkable surface for `unendlich` work is now substantially larger (real lavapipe GPU
+checks, not just CPU-side compiles) than either this file's or my own previous entry's understanding of what's
+possible here.

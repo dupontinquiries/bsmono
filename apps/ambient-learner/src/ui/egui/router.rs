@@ -117,6 +117,24 @@ mod tests {
         assert_eq!(SECTIONS.len(), 7);
     }
 
+    /// `shell.rs`'s two responsive layouts read two DIFFERENT lists for the
+    /// same tab strip: the Tabs layout calls `tab_bar_ui` (iterates
+    /// `SECTIONS`, here), the narrow-screen Pages layout iterates
+    /// `chrome::Section::ALL` directly. Both currently list the same seven
+    /// sections in the same order, but nothing enforced that — exactly the
+    /// "two lists that drift" trap this file's own module doc names for a
+    /// different pair (the shortcut table). A phone whose screen width
+    /// crosses the Tabs/Pages threshold mid-session would show a DIFFERENT
+    /// set of sections depending on which layout happened to be active,
+    /// if these ever disagreed.
+    #[test]
+    fn sections_and_router_sections_never_drift_apart() {
+        assert_eq!(SECTIONS.to_vec(), super::super::chrome::Section::ALL.to_vec(),
+                   "router::SECTIONS and chrome::Section::ALL must list the \
+                    same sections in the same order — shell.rs's two \
+                    responsive layouts read one each");
+    }
+
     #[test]
     fn the_shortcut_table_is_not_duplicated_here() {
         // Section::from_shortcut already had the mapping. A second match in

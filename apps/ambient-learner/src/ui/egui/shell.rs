@@ -51,6 +51,26 @@ pub struct Shell {
     /// value (dry air draws no droplets) rather than an absent one. Built
     /// explicitly so nobody reads a default as "no data".
     pub sparkles: super::ambience::Sparkles,
+    /// The headline reading (eased temperature, confidence, sparkline) —
+    /// the piece `Section::Live`'s dispatch was missing entirely until
+    /// this field existed. See that arm's own comment for the parity
+    /// gap this closes and what it deliberately does not touch yet
+    /// (`main.rs` is still the one running binary; this brings `Shell`
+    /// up to the SAME composition it already uses, additively).
+    pub live_state: crate::LiveState,
+    /// `t_ms` from the PREVIOUS frame, so this can derive its own delta —
+    /// `Shell::ui` receives an absolute clock, not a delta, because
+    /// `egui_lib::App` is the only current caller and has no other need
+    /// for one. `None` on the very first frame, so that frame's delta is
+    /// zero rather than "however long since the Unix epoch".
+    last_t_ms: Option<f32>,
+    /// Weather-sharing contacts. Empty rather than fabricated, matching
+    /// every other page's demo-state convention here (see `main.rs`'s own
+    /// comment on the same field): a demo with no snapclone connection
+    /// has no contacts, which is the true state.
+    pub contacts: Vec<(String, String)>,
+    pub share: weather_share::WeatherShare,
+    pub shared_note: Option<String>,
     /// Set when Back was pressed with no history left. The host decides what
     /// that means — on a phone it is usually "close the app", and deciding
     /// that here would make a UI module own the process lifetime.
@@ -64,6 +84,19 @@ pub struct Shell {
 }
 
 impl Shell {
+    /// How long since the last frame, given the current absolute clock.
+    /// `Shell::ui` receives `t_ms` rather than a delta (its only current
+    /// caller, `egui_lib::App`, tracks one clock for everything), so this
+    /// derives one and remembers where it left off. Zero on the very
+    /// first call — there is no "last frame" to measure against yet, and
+    /// treating a startup gap as elapsed time would jump every easing
+    /// on the first frame rather than starting at rest.
+    fn advance_clock(&mut self, t_ms: f32) -> f32 {
+        let dt = (t_ms - self.last_t_ms.unwrap_or(t_ms)).max(0.0);
+        self.last_t_ms = Some(t_ms);
+        dt
+    }
+
     /// Draw the whole frame: chrome, tabs, and the current page.
     ///
     /// `t_ms` is the animation clock, passed in rather than read from the
@@ -134,7 +167,23 @@ impl Shell {
 
         match self.router.current() {
             Section::Live => {
+                // Ported from `main.rs`'s own `Page::Live` arm: headline
+                // reading, then the sensor panel, then weather-sharing —
+                // the composition that arm's own comments established as
+                // correct, not a new choice made here. `Shell` previously
+                // called only the sensor panel, which was the whole
+                // parity gap (see the module doc's history).
+                let dt_ms = self.advance_clock(t_ms);
+                self.live_state.tick(dt_ms / 1000.0);
+                self.live_state.ui(ui);
+                self.dot.live = self.live.readings().iter().any(|(_, _, r)| r.available());
+                self.dot.tick(dt_ms);
+                if self.dot.live { ui.ctx().request_repaint(); }
                 super::live::live_ui(ui, &self.live, &self.dot, colors);
+                ui.add_space(12.0);
+                ui.separator();
+                super::share_row_ui(ui, &self.live_state.snapshot, &self.contacts,
+                                     &mut self.share, &mut self.shared_note);
             }
             Section::History => super::history::history_ui(ui, &self.history, colors),
             Section::Places => {
@@ -193,6 +242,46 @@ mod tests {
             let arm = &rest[..end];
             assert!(arm.contains("_ui("), "{s}'s arm draws nothing:\n{arm}");
         }
+    }
+
+    /// The parity gap this session's own PORT_STATUS.md entry named:
+    /// `Section::Live` used to call only the sensor panel, missing the
+    /// headline reading and the weather-share row `main.rs`'s own
+    /// (separately maintained) Live page already has. A source check for
+    /// the same reason the test above is one — the property that matters
+    /// is that the SPECIFIC arm calls both, not merely that some `_ui(`
+    /// call exists somewhere in it.
+    #[test]
+    fn the_live_arm_draws_the_headline_and_the_share_row_too() {
+        let src = include_str!("shell.rs");
+        let body = &src[src.find("match self.router.current()").expect("the dispatch moved")..];
+        let at = body.find("Section::Live").expect("Live has no arm");
+        let rest = &body[at + "Section::Live".len()..];
+        let end = rest.find("Section::").unwrap_or(rest.len());
+        let arm = &rest[..end];
+        assert!(arm.contains("live_state.ui("), "the headline reading is missing:\n{arm}");
+        assert!(arm.contains("share_row_ui("), "weather-sharing is missing:\n{arm}");
+    }
+
+    #[test]
+    fn advance_clock_measures_zero_on_the_first_frame_then_real_deltas() {
+        // No "last frame" exists yet on the very first call — treating a
+        // cold-start gap as elapsed time would jump every easing rather
+        // than starting at rest.
+        let mut s = Shell::default();
+        assert_eq!(s.advance_clock(5_000.0), 0.0, "nothing to measure against yet");
+        assert_eq!(s.advance_clock(5_016.0), 16.0, "a real 16ms frame");
+        assert_eq!(s.advance_clock(5_016.0), 0.0, "two frames with the same clock: no time passed");
+    }
+
+    #[test]
+    fn advance_clock_never_goes_negative_on_a_clock_that_moves_backward() {
+        // A resumed suspend or a clock adjustment can hand back an earlier
+        // timestamp than the last one seen; a negative delta would run
+        // every easing backward.
+        let mut s = Shell::default();
+        s.advance_clock(5_000.0);
+        assert_eq!(s.advance_clock(4_000.0), 0.0, "must clamp, not go negative");
     }
 
     #[test]
@@ -254,6 +343,14 @@ impl Default for Shell {
             ambience: Default::default(),
             // 0% is dry, which is a reading. See the field's note.
             sparkles: super::ambience::Sparkles { humidity_pct: 0.0 },
+            // A plausible reading, matching `LiveState::demo`'s own reasoning:
+            // a shell that cannot be constructed before the first sensor
+            // reading looks broken on launch, not waiting.
+            live_state: crate::LiveState::demo(),
+            last_t_ms: None,
+            contacts: Vec::new(),
+            share: weather_share::WeatherShare::new("ambient-learner-demo"),
+            shared_note: None,
             pending: Vec::new(),
             back_unhandled: false,
         }

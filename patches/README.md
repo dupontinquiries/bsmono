@@ -33,6 +33,12 @@ the whisper + speaker-stack IO adapter, and the reaction **classifier** (transcr
 Steer/Interrupt/Affirm/AddContext flipping `Backend::generate`'s cancel) — the "steer an
 in-flight generation" half of the feature.
 
+### `studio-phonetic`  — studio-live session, orphaned voice-retry port
+`studio-phonetic.rs` + `studio-phonetic.HANDOFF.md`. Targets
+`apps/studio/crates/studio-app/src/phonetic.rs`. Pure, 10 tests, no caller: the
+`voice.rs` wiring that used it was lost with the rest of that session's studio
+work. The handoff says what to redo.
+
 ## Extraction log  (patch → shared kit)
 
 | shared/ target | lifted from |
