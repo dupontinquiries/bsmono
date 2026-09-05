@@ -216,7 +216,22 @@ impl Adaptive {
         style.spacing.interact_size.y = style.spacing.interact_size.y.max(t);
         style.spacing.button_padding.x = style.spacing.button_padding.x.max(self.gutter);
         style.spacing.button_padding.y = style.spacing.button_padding.y.max(self.gutter * 0.75);
-        style.spacing.item_spacing = egui::vec2(self.gutter, self.gutter);
+        // ITEM SPACING, fixed in two ways.
+        //
+        // 1. It was ASSIGNED, three lines under a comment promising to
+        //    "never shrink what an app already set larger" — which the two
+        //    lines above honour with `.max()` and this one silently broke.
+        //    An app that had chosen a roomier rhythm lost it.
+        // 2. x and y were the SAME number. They are not the same quantity:
+        //    x separates controls side by side (a finger needs the room),
+        //    y is vertical rhythm between rows of text. Forcing them equal
+        //    is why stacked labels sit in gaps that look wrong — a status
+        //    line ends up with a finger-sized gap under it.
+        //
+        // The 0.75 ratio is not invented here; it is the one the line above
+        // already uses for `button_padding.y` against `.x`.
+        style.spacing.item_spacing.x = style.spacing.item_spacing.x.max(self.gutter);
+        style.spacing.item_spacing.y = style.spacing.item_spacing.y.max(self.gutter * 0.75);
         if self.touch {
             // touch scrolling likes a touch more slop before a drag is a drag
             style.interaction.resize_grab_radius_side = style.interaction.resize_grab_radius_side.max(10.0);
@@ -312,5 +327,33 @@ pub fn apply_text_floor(ctx: &egui::Context, adaptive: &Adaptive) {
             if let Some(f) = st.text_styles.get_mut(&egui::TextStyle::Small) { f.size = floor; }
         });
     }
+    #[test]
+    fn spacing_never_shrinks_what_an_app_already_chose() {
+        // The promise three lines above the old assignment, which it broke.
+        let ctx = egui::Context::default();
+        let mut style = (*ctx.style()).clone();
+        style.spacing.item_spacing = egui::vec2(20.0, 18.0);
+        ctx.set_global_style(style);
+        Adaptive::default().with_gutter(8.0).apply_touch_defaults(&ctx);
+        let got = ctx.style().spacing.item_spacing;
+        assert_eq!(got, egui::vec2(20.0, 18.0), "a roomier app rhythm was overwritten");
+    }
+
+    #[test]
+    fn vertical_rhythm_is_tighter_than_the_horizontal_gutter() {
+        // Different quantities: x separates controls a finger must hit,
+        // y is the gap between rows of text. Equal is what made stacked
+        // labels sit in finger-sized gaps.
+        let ctx = egui::Context::default();
+        let mut style = (*ctx.style()).clone();
+        style.spacing.item_spacing = egui::vec2(0.0, 0.0);
+        ctx.set_global_style(style);
+        Adaptive::default().with_gutter(8.0).apply_touch_defaults(&ctx);
+        let got = ctx.style().spacing.item_spacing;
+        assert_eq!(got.x, 8.0);
+        assert!(got.y < got.x, "y {} should be tighter than x {}", got.y, got.x);
+        assert!((got.y - 6.0).abs() < 1e-6, "0.75 of the gutter, as button_padding uses");
+    }
+
 }
 

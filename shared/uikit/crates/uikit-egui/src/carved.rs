@@ -173,6 +173,48 @@ pub fn pill(ui: &mut Ui, text: &str, base: Color32, accent: Color32, ink: Color3
     resp
 }
 
+/// Padding inside a text inset.
+pub const INSET_PAD: f32 = 10.0;
+
+/// The size an inset needs to hold `content`.
+///
+/// Pure, so the geometry is testable without a painter.
+pub fn inset_size(content: Vec2) -> Vec2 {
+    Vec2::new(content.x + INSET_PAD * 2.0, content.y + INSET_PAD * 2.0)
+}
+
+/// A bordered, padded surface for a RUN OF TEXT — a note, a status
+/// paragraph, an explanation.
+///
+/// # When to use which
+///
+/// The monorepo has three text treatments and they were being confused,
+/// which is why so much text sits bare on a background:
+///
+/// * [`chip`] — a TAG. One or two words at `FONT_XS`, pill-shaped. For a
+///   status word or a count, never for a sentence.
+/// * `inset` (this) — a PARAGRAPH that needs to read as a thing rather than
+///   as loose text on the page. Square corners, one-pixel border, padded.
+/// * [`crate::overlay::card`] — a PANEL. Owns a region, has a shadow, sits
+///   above the page. Too heavy for a sentence.
+///
+/// The rule of thumb: if the text would look abandoned without a surface
+/// under it, it wants an inset. If it is a label FOR something adjacent, it
+/// does not — a border around a field's caption just adds noise.
+pub fn inset(ui: &mut Ui, c: &crate::PaletteColors, body: impl FnOnce(&mut Ui)) {
+    let outer = ui.available_rect_before_wrap();
+    let frame = egui::Frame::NONE
+        .fill(c.bg_raised)
+        .stroke(Stroke::new(1.0_f32, c.border))
+        .corner_radius(CornerRadius::same(tokens::RADIUS_SM as u8))
+        .inner_margin(egui::Margin::same(INSET_PAD as i8));
+    let _ = outer;
+    frame.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        body(ui);
+    });
+}
+
 /// A small static tag.
 pub fn chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32, border: Color32) {
     let font = FontId::proportional(tokens::FONT_XS as f32);
@@ -230,4 +272,18 @@ fn carved_clickable(
     paint_carved(ui, rect, base, acc, skin, s, phase);
     carved_text(ui, rect.center(), text, font, ink, skin);
     resp
+}
+
+#[cfg(test)]
+mod inset_tests {
+    use super::*;
+
+    #[test]
+    fn an_inset_reserves_its_padding_on_every_side() {
+        let content = Vec2::new(120.0, 40.0);
+        let outer = inset_size(content);
+        assert_eq!(outer.x, content.x + INSET_PAD * 2.0);
+        assert_eq!(outer.y, content.y + INSET_PAD * 2.0);
+        assert!(inset_size(Vec2::ZERO).x > 0.0 && inset_size(Vec2::ZERO).y > 0.0);
+    }
 }
