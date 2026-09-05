@@ -2972,6 +2972,9 @@ impl Snapclone {
 
     pub fn ui(&mut self, ui: &mut Ui, adaptive: &Adaptive) {
         let colors = uikit_egui::palette_colors(&self.palette);
+        // The kit's readability floor: `.small()` is 9 pt in egui's default
+        // style, under 10 pt on a phone. Measured by the layout probe test.
+        uikit_egui::adaptive::apply_text_floor(ui.ctx(), adaptive);
         let surface = ui.available_rect_before_wrap();
 
         // The interaction layer advances every frame, on every page: a ripple
@@ -2989,6 +2992,7 @@ impl Snapclone {
         // Read from the events, not the modifier snapshot: the chord's
         // modifiers ride on the key event, and a first pointer position has
         // no delta.
+        let text_focus = ui.memory(|m| m.focused().is_some()) && !self.palette_open;
         let (tab, moved, ctrl_k, page_key) = ui.input(|i| {
             let mut tab = false; let mut moved = false; let mut ctrl_k = false; let mut page = None;
             for e in &i.events {
@@ -2998,6 +3002,11 @@ impl Snapclone {
                         match key {
                             egui::Key::Tab => tab = true,
                             egui::Key::K if chord => ctrl_k = true,
+                            // Ctrl+P is what every other palette in the
+                            // fleet answers to (studio, voiceterm); `/` is
+                            // the one-finger version when no field has focus.
+                            egui::Key::P if chord => ctrl_k = true,
+                            egui::Key::Slash if !chord && !modifiers.shift && !text_focus => ctrl_k = true,
                             egui::Key::Num1 if chord => page = Some(0),
                             egui::Key::Num2 if chord => page = Some(1),
                             egui::Key::Num3 if chord => page = Some(2),
@@ -4585,14 +4594,17 @@ impl Snapclone {
 
         let nodes = crate::wayfinder::build_nodes(self.self_fix, &self.wayfinder_contacts);
         let photos = crate::wayfinder::place_photos(&nodes, &self.wayfinder_snaps);
+        // Said BEFORE the map, which takes every remaining point: written
+        // after it, this line landed below the map's clip and was painted
+        // nowhere (the layout probe: "clipped by 143pt").
+        if nodes.is_empty() {
+            ui.colored_label(c.text_weak, "No contacts to place yet.");
+        }
         if let Some(id) = crate::wayfinder::wayfinder_ui(ui, &nodes, &photos, c) {
             // Tapping a contact jumps to Friends with them selected, per the
             // Qt page: the map is a way IN to a conversation, not a dead end.
             self.apply_friends(crate::friends::Action::Selected(id));
             self.nav.go_page(2);
-        }
-        if nodes.is_empty() {
-            ui.colored_label(c.text_weak, "No contacts to place yet.");
         }
         // The signal strip: how much to trust each bearing. The policy maps a
         // fix's age and accuracy to a presentation — live arrow, faded arrow,
@@ -5385,6 +5397,53 @@ mod tests {
         }
         assert!(app.received.len() <= 48);
         assert_eq!(app.received[0].id, "s12", "the oldest went first");
+    }
+
+    /// Every page, at a phone's width and a desktop's, through the kit's
+    /// layout probe: text over text, text cut by its column, text off the
+    /// screen, and type under 10 pt on the phone. Prints the report so a
+    /// run shows the collisions; asserts the counts below the ratchet.
+    #[test]
+    fn every_page_lays_out_without_text_collisions() {
+        use egui::{Context, RawInput, Pos2};
+        for (label, size, compact) in [("phone", egui::vec2(360.0, 780.0), true), ("desktop", egui::vec2(1280.0, 800.0), false)] {
+            for page in 0..PAGES.len() {
+                let ctx = Context::default();
+                let mut app = app();
+                app.nav.go_page(page);
+                let mut adaptive = Adaptive::default();
+                if compact { adaptive.class = uikit_egui::adaptive::DeviceClass::Phone; }
+                let screen = egui::Rect::from_min_size(Pos2::ZERO, size);
+                let mut shapes = Vec::new();
+                for _ in 0..3 {
+                    let out = ctx.run(RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+                    });
+                    shapes = out.shapes;
+                }
+                let r = uikit_egui::layout_probe::analyse(screen, &shapes, compact);
+                eprintln!("== {label} / {} ({} texts, smallest {:.1}pt)\n{}", PAGES[page], r.texts, r.smallest_font_pt, r.describe());
+                // THE RATCHET. Measured 2026-09-05 after the text floor and
+                // the Wayfinder fix. Two known remainders, both named so
+                // the next fix lowers a number rather than re-discovers it:
+                // * phone / Camera: the camera page is the one page drawn
+                //   outside the ScrollArea (`if page == 0` in draw_page),
+                //   so its composer row, delivery line and send receipt run
+                //   under the tab bar on a 780-pt screen — six text
+                //   overlaps and "colour" cut by 34 pt.
+                // * desktop / Friends: the card's chevron runs 4 pt past
+                //   the card on two rows.
+                let (max_overlaps, max_clipped) = match (label, page) {
+                    ("phone", 0) => (6, 1),
+                    ("desktop", 2) => (0, 2),
+                    _ => (0, 0),
+                };
+                assert!(r.overlaps.len() <= max_overlaps && r.clipped.len() <= max_clipped,
+                        "{label}/{}: {} overlaps (≤{max_overlaps}), {} clipped (≤{max_clipped}):\n{}",
+                        PAGES[page], r.overlaps.len(), r.clipped.len(), r.describe());
+                assert!(r.tiny.is_empty() && r.offscreen.is_empty(), "{label}/{}:\n{}", PAGES[page], r.describe());
+            }
+        }
     }
 
     /// Ctrl+K opens the palette, typing narrows it, Enter runs the choice —

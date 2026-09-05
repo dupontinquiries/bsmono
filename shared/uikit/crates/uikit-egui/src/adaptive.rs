@@ -297,3 +297,20 @@ mod tests {
         assert_eq!(p.pick("one-col", "two-col", "sidebar"), "one-col");
     }
 }
+
+/// Raise egui's `TextStyle::Small` (9 pt by default) to the readability
+/// floor on a compact surface. Every `.small()` label in every app is 9 pt
+/// otherwise — the single biggest source of "tiny" findings the layout
+/// probe reports on a phone. Call once per frame after the palette is
+/// applied; idempotent.
+pub fn apply_text_floor(ctx: &egui::Context, adaptive: &Adaptive) {
+    if !adaptive.is_compact() { return; }
+    let floor = crate::layout_probe::MIN_READABLE_PT;
+    let needs = ctx.style().text_styles.get(&egui::TextStyle::Small).map(|f| f.size < floor).unwrap_or(false);
+    if needs {
+        ctx.style_mut(|st| {
+            if let Some(f) = st.text_styles.get_mut(&egui::TextStyle::Small) { f.size = floor; }
+        });
+    }
+}
+
