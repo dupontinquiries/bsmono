@@ -127,9 +127,25 @@ pub struct Studio {
     /// for no strip. Local monitoring-adjacent state like `solo`: what you
     /// are LOOKING at is not a project fact.
     pub auto_target: Option<studio_core::AutoTarget>,
+    /// Or which BINDING the strip shows — a curve through its gate, drawn
+    /// at the gate's origin. Exclusive with `auto_target`: one strip, one
+    /// thing. Same local-only status as the lane choice.
+    pub auto_binding: Option<studio_core::BindingId>,
     /// The strip's point mid-drag — ghost until release, ops on release,
     /// the fader rule.
     pub auto_drag: Option<studio_egui::auto::PointDrag>,
+    /// What `y` yanked: clip ids, read back at paste time so a paste
+    /// copies the clip AS IT IS NOW (and its bindings), not a snapshot
+    /// from whenever `y` was pressed. Local: your clipboard is not a
+    /// project fact.
+    pub clipboard: Vec<studio_core::ClipId>,
+    /// What a placement does to the clips it lands on — the default and
+    /// per-track overrides. Local (workspace sidecar): it decides which
+    /// ops THIS editor emits, and every op it emits converges the same.
+    pub overlap: studio_core::Overlap,
+    pub overlap_tracks: std::collections::BTreeMap<studio_core::TrackId, studio_core::Overlap>,
+    /// A take is rolling on this site — rides in presence so peers know.
+    pub recording: bool,
     /// Workbench layout: the timeline stays on screen with the Rack /
     /// Program / Mixer in a resizable strip below it, instead of four
     /// full-screen tabs. The tabs remain the phone's layout; this is the
@@ -206,7 +222,12 @@ impl Studio {
             clip_gain_drag: None,
             roll_drag: None,
             auto_target: None,
+            auto_binding: None,
             auto_drag: None,
+            clipboard: Vec::new(),
+            overlap: studio_core::Overlap::default(),
+            overlap_tracks: Default::default(),
+            recording: false,
             combined: false,
             closed_groups: Default::default(),
             key_guide: true,
@@ -563,6 +584,7 @@ impl Studio {
             Some(last) => last.playhead != playhead
                 || last.selection != self.selection
                 || last.active_track != active_track
+                || last.recording != self.recording
                 || (self.display_name.is_empty() != last.name.starts_with("site "))
                 || (!self.display_name.is_empty() && last.name != self.display_name),
         };
@@ -579,7 +601,7 @@ impl Studio {
             playhead,
             selection: self.selection.clone(),
             active_track,
-            seq: self.presence_seq + 1,
+            seq: self.presence_seq + 1, recording: self.recording,
         };
         self.presence_seq += 1;
         self.last_presence = Some(cur.clone());
@@ -833,6 +855,10 @@ impl Studio {
                 }
                 replies
             }
+            // Voice is for the jitter buffer and the sink, not the Doc;
+            // the receive half is not wired yet, so a frame is dropped
+            // here on purpose rather than half-handled.
+            Packet::Voice { .. } => Vec::new(),
         }
     }
 
@@ -913,12 +939,190 @@ impl Studio {
             self.status = "nudge: nothing selected".into();
             return;
         }
-        for id in self.selection.clone() {
-            let Some(c) = self.session.doc.project.clips.get(&id).cloned() else { continue };
-            let pos = studio_core::Ticks((c.pos.0 + delta.0).max(0));
-            if pos != c.pos {
-                self.edit(studio_core::Op::MoveClip { id, pos, track: c.track }, "nudged");
+        // One delta, one undo, in collision-free order: nudging a chopped
+        // take right one clip at a time used to refuse at the first clip,
+        // which would land on its own unmoved neighbour.
+        let ids = self.selection.clone();
+        let Some(anchor) = ids.iter().find(|id| self.session.doc.project.clips.contains_key(id)).copied() else {
+            self.status = "nudge: the selection no longer exists".into();
+            return;
+        };
+        let want = studio_core::Ticks(self.session.doc.project.clips[&anchor].pos.0 + delta.0);
+        match self.session.doc.project.move_together_ops(&ids, anchor, want) {
+            Ok(ops) if ops.is_empty() => self.status = "nudge: already at the start".into(),
+            Ok(ops) => { let n = ops.len(); let ops = self.with_room(ops); self.edit_group(ops, &format!("nudged {n}")); }
+            Err(e) => self.status = format!("nudge refused: {e:?}"),
+        }
+    }
+
+    /// The clips that move with `id`: every composition it belongs to,
+    /// plus the selection if it is selected — or just itself when
+    /// `alone`. A group is moved by grabbing any member; that is what a
+    /// fold is for.
+    pub fn moving_set(&self, id: studio_core::ClipId, alone: bool) -> Vec<studio_core::ClipId> {
+        let mut set = vec![id];
+        if alone { return set; }
+        let p = &self.session.doc.project;
+        for g in p.groups.values() {
+            if g.clips.contains(&id) {
+                set.extend(g.clips.iter().copied().filter(|c| p.clips.contains_key(c)));
             }
+        }
+        if self.selection.contains(&id) { set.extend(self.selection.iter().copied()); }
+        set.sort(); set.dedup();
+        set
+    }
+
+    /// The overlap policy for a track: its override, else the default.
+    pub fn policy_for(&self, track: studio_core::TrackId) -> studio_core::Overlap {
+        self.overlap_tracks.get(&track).copied().unwrap_or(self.overlap)
+    }
+
+    /// Resolve the placements in `ops` (MoveClip / AddClip) against each
+    /// track's overlap policy, on a probe copy so a second placement sees
+    /// what the first one trimmed. Trim: make_room_ops before the op.
+    /// Lane: the op is retargeted to the parent's shadow lane (created if
+    /// absent), and room is then made on the lane. Refuse: the op goes as
+    /// is and the model says no. Everything else passes through.
+    pub fn with_room(&self, ops: Vec<studio_core::Op>) -> Vec<studio_core::Op> {
+        use studio_core::{Op, Overlap};
+        let moving: Vec<studio_core::ClipId> = ops.iter().filter_map(|o| match o {
+            Op::MoveClip { id, .. } => Some(*id), Op::AddClip { clip } => Some(clip.id), _ => None }).collect();
+        let mut probe = self.session.doc.project.clone();
+        let mut next = probe.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1
+            + ops.iter().filter(|o| matches!(o, Op::AddClip { .. })).count() as u64;
+        let mut next_track = probe.tracks.iter().map(|t| t.id.0).max().unwrap_or(0) + 1;
+        let mut out = Vec::with_capacity(ops.len());
+        fn push(probe: &mut studio_core::Project, out: &mut Vec<studio_core::Op>, op: studio_core::Op) {
+            let _ = probe.apply(&op);
+            out.push(op);
+        }
+        for op in ops {
+            let prospective = match &op {
+                Op::MoveClip { id, pos, track } => probe.clips.get(id).map(|c| {
+                    let mut c = c.clone(); c.pos = *pos; c.track = *track; c }),
+                Op::AddClip { clip } => Some(clip.clone()),
+                _ => None,
+            };
+            let Some(mut clip) = prospective else { push(&mut probe, &mut out, op); continue };
+            let mut op = op;
+            match self.policy_for(clip.track) {
+                Overlap::Refuse => {}
+                Overlap::Lane if !probe.overlappers(&clip, &moving).is_empty() => {
+                    let lane = match probe.shadow_lane(clip.track) {
+                        Some(l) => l,
+                        None => {
+                            let l = studio_core::TrackId(next_track);
+                            next_track += 1;
+                            if let Ok(mk) = probe.shadow_lane_ops(clip.track, l) {
+                                for m in mk { push(&mut probe, &mut out, m); }
+                            }
+                            l
+                        }
+                    };
+                    clip.track = lane;
+                    op = match op {
+                        Op::MoveClip { id, pos, .. } => Op::MoveClip { id, pos, track: lane },
+                        Op::AddClip { mut clip } => { clip.track = lane; Op::AddClip { clip } }
+                        other => other,
+                    };
+                    for r in probe.make_room_ops(&clip, &moving, &mut next) { push(&mut probe, &mut out, r); }
+                }
+                Overlap::Lane => {}
+                Overlap::Trim => {
+                    for r in probe.make_room_ops(&clip, &moving, &mut next) { push(&mut probe, &mut out, r); }
+                }
+            }
+            push(&mut probe, &mut out, op);
+        }
+        out
+    }
+
+    /// Set the overlap policy for one track (or the default with `None`).
+    pub fn set_overlap(&mut self, track: Option<studio_core::TrackId>, policy: studio_core::Overlap) {
+        match track {
+            Some(t) => { self.overlap_tracks.insert(t, policy); }
+            None => self.overlap = policy,
+        }
+        self.status = format!("overlap on {}: {}", match track {
+            Some(t) => self.session.doc.project.tracks.iter().find(|x| x.id == t)
+                .map(|x| x.name.clone()).unwrap_or_else(|| "?".into()),
+            None => "every track".into() }, policy.name());
+    }
+
+    /// A timeline drop: the whole moving set by the anchor's delta, each
+    /// on its own track; a lone clip also honours the track it was
+    /// dropped on. One group, one undo, refused whole.
+    pub fn drop_clip(&mut self, id: studio_core::ClipId, pos: Ticks, track: studio_core::TrackId, alone: bool) {
+        let set = self.moving_set(id, alone);
+        let ops = if set.len() == 1 {
+            vec![studio_core::Op::MoveClip { id, pos, track }]
+        } else {
+            match self.session.doc.project.move_together_ops(&set, id, pos) {
+                Ok(ops) => ops,
+                Err(e) => { self.status = format!("move refused: {e:?}"); return; }
+            }
+        };
+        if ops.is_empty() { self.status = "moved: nowhere to go".into(); return; }
+        let moved = ops.len();
+        let ops = self.with_room(ops);
+        let gave_way = ops.len() - moved;
+        let what = if moved == 1 { "moved".to_string() } else { format!("moved {moved} together") };
+        if ops.len() == 1 {
+            self.edit(ops.into_iter().next().unwrap(), &what);
+        } else {
+            self.edit_group(ops, &format!("{what}{}", if gave_way > 0 {
+                format!(", {gave_way} op{} made room", if gave_way == 1 { "" } else { "s" }) } else { String::new() }));
+        }
+    }
+
+    /// Cut every selected clip on the rack grid: `steps` per cut (4 is a
+    /// beat, 16 a bar in the rack's own 16th-note grid). Pieces stay in
+    /// their compositions and a clip-gated curve keeps playing what it
+    /// played — `split_on_grid_ops`'s promises. Cutting by the grid rather
+    /// than by ear is also the answer to editing over a Bluetooth link,
+    /// where the ear is a few hundred milliseconds late.
+    pub fn split_selection_on_grid(&mut self, steps: i64) {
+        if self.selection.is_empty() {
+            self.status = "split on grid: nothing selected".into();
+            return;
+        }
+        let grid = Ticks(self.rack.tempo().step_len().0.max(1) * steps.max(1));
+        let p = &self.session.doc.project;
+        let mut next = p.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1;
+        let ids: Vec<_> = self.selection.iter().copied().filter(|c| p.clips.contains_key(c)).collect();
+        match p.split_on_grid_ops(&ids, grid, Ticks::ZERO, &mut next) {
+            Ok(ops) if ops.is_empty() => self.status = "split on grid: no grid line crosses the selection".into(),
+            Ok(ops) => {
+                let cuts = ops.iter().filter(|o| matches!(o, studio_core::Op::AddClip { .. })).count();
+                let regated = ops.iter().filter(|o| matches!(o, studio_core::Op::SetBinding { .. })).count();
+                let new_ids: Vec<_> = ops.iter().filter_map(|o| match o {
+                    studio_core::Op::AddClip { clip } => Some(clip.id), _ => None }).collect();
+                let what = format!("cut {cuts} time{}{}", if cuts == 1 { "" } else { "s" },
+                    if regated > 0 { format!(" ({regated} clip-gated curve{} now gated to the original span)",
+                                             if regated == 1 { "" } else { "s" }) } else { String::new() });
+                self.edit_group(ops, &what);
+                if new_ids.iter().all(|c| self.session.doc.project.clips.contains_key(c)) {
+                    self.selection.extend(new_ids);
+                }
+            }
+            Err(e) => self.status = format!("split on grid refused: {e:?}"),
+        }
+    }
+
+    /// Give this binding its own copy of its curve. Says "already unique"
+    /// rather than cloning a curve nothing else shares.
+    pub fn make_unique(&mut self, id: studio_core::BindingId) {
+        let p = &self.session.doc.project;
+        let Some(b) = p.bindings.get(&id) else { self.status = "make unique: no such binding".into(); return };
+        if p.curve_share_count(b.curve) <= 1 {
+            self.status = "already unique — nothing else shares this curve".into();
+            return;
+        }
+        let new_curve = studio_core::CurveId(p.curves.keys().map(|c| c.0).max().unwrap_or(0) + 1);
+        match p.make_curve_unique_ops(id, new_curve) {
+            Ok(ops) => self.edit_group(ops, "curve made unique"),
+            Err(e) => self.status = format!("make unique refused: {e:?}"),
         }
     }
 
@@ -1014,6 +1218,8 @@ impl Studio {
                         for id in sel { self.edit(studio_core::Op::RemoveClip { id }, "deleted"); }
                     }
                     Action::Split => self.split_at_playhead(),
+                    Action::Yank => self.yank(),
+                    Action::Paste => { let at = self.transport.position(); self.paste_at(at); }
                     Action::FlipTrimSide => {
                         self.trim_side = match self.trim_side {
                             studio_egui::TrimSide::Left => studio_egui::TrimSide::Right,
@@ -1058,6 +1264,134 @@ impl Studio {
             }
             Err(e) => self.status = format!("split refused: {e:?}"),
         }
+    }
+
+    /// `y`: remember the selection for `p`. Ids, not clips — see
+    /// `clipboard`'s docs.
+    pub fn yank(&mut self) {
+        if self.selection.is_empty() {
+            self.status = "nothing selected to yank".into();
+            return;
+        }
+        self.clipboard = self.selection.clone();
+        self.status = format!("yanked {} clip{}", self.clipboard.len(),
+                              if self.clipboard.len() == 1 { "" } else { "s" });
+    }
+
+    /// `p`: copy every yanked clip so the earliest lands at `at`, each on
+    /// its own track, keeping their spacing — AND every curve gated to
+    /// each original re-bound onto its copy, through
+    /// `Project::duplicate_clip_ops`. One `edit_group`, so a paste of nine
+    /// clips with their rides is one press of `u`. This is the gesture the
+    /// curves module exists for: duplicating a clip no longer means
+    /// redrawing its automation. Yanked clips that were deleted since are
+    /// skipped and counted out loud; a refusal (no room on the track)
+    /// rolls the whole paste back, `edit_group`'s rule.
+    pub fn paste_at(&mut self, at: Ticks) {
+        let p = &self.session.doc.project;
+        let live: Vec<studio_core::Clip> = self.clipboard.iter()
+            .filter_map(|id| p.clips.get(id).cloned()).collect();
+        let gone = self.clipboard.len() - live.len();
+        if live.is_empty() {
+            self.status = if self.clipboard.is_empty() { "nothing yanked".into() }
+                          else { "every yanked clip has since been deleted".into() };
+            return;
+        }
+        let first = live.iter().map(|c| c.pos).min().unwrap_or(Ticks::ZERO);
+        let mut next_clip = p.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1;
+        let mut next_binding = p.bindings.keys().map(|b| b.0).max().unwrap_or(0) + 1;
+        let mut ops = Vec::new();
+        let mut new_ids = Vec::with_capacity(live.len());
+        let mut bindings = 0;
+        for c in &live {
+            let pos = at.saturating_add(c.pos.saturating_sub(first));
+            let new_id = studio_core::ClipId(next_clip);
+            next_clip += 1;
+            match p.duplicate_clip_ops(c.id, new_id, pos, c.track, &mut next_binding) {
+                Ok(dup) => {
+                    bindings += dup.len() - 1;
+                    ops.extend(dup);
+                    new_ids.push(new_id);
+                }
+                Err(e) => { self.status = format!("paste refused: {e:?}"); return; }
+            }
+        }
+        // Compositions come along: a group whose members were (partly)
+        // yanked is recreated over the copies — a chopped take pasted
+        // into the next hook is still one thing there.
+        let mut next_group = p.groups.keys().map(|g| g.0).max().unwrap_or(0) + 1;
+        let mut groups = 0;
+        for g in p.groups.values() {
+            let members: Vec<studio_core::ClipId> = live.iter().zip(new_ids.iter())
+                .filter(|(c, _)| g.clips.contains(&c.id)).map(|(_, n)| *n).collect();
+            if members.len() >= 2 || (!members.is_empty() && members.len() == g.clips.len()) {
+                ops.push(studio_core::Op::SetGroup { id: studio_core::GroupId(next_group),
+                    name: format!("{} copy", g.name), clips: members });
+                next_group += 1;
+                groups += 1;
+            }
+        }
+        let n = live.len();
+        let ops = self.with_room(ops);
+        self.edit_group(ops, &format!("pasted {n} clip{}{}{}{}",
+            if groups > 0 { format!(" in {groups} composition{}", if groups == 1 { "" } else { "s" }) }
+            else { String::new() },
+            if n == 1 { "" } else { "s" },
+            if bindings > 0 { format!(" with {bindings} automation binding{}", if bindings == 1 { "" } else { "s" }) }
+            else { String::new() },
+            if gone > 0 { format!(" ({gone} yanked clip{} no longer exist{})",
+                                  if gone == 1 { "" } else { "s" }, if gone == 1 { "s" } else { "" }) }
+            else { String::new() }));
+        // A refused group leaves the selection alone; a landed one selects
+        // the copies, so the next `p` or nudge acts on what just arrived.
+        if self.session.doc.project.clips.contains_key(&new_ids[0]) {
+            self.selection = new_ids;
+        }
+    }
+
+    /// Mint a curve and bind it: gated to every selected clip, aimed at
+    /// `target` — or, with no target given, at each clip's OWN track gain,
+    /// the ride everyone reaches for first. With nothing selected the
+    /// curve binds `Always` to `target` (a plain lane you can reuse), and
+    /// with neither there is nothing to aim at, said out loud. One group,
+    /// one undo; the strip switches to the new binding so the next click
+    /// places its first point.
+    pub fn new_curve_on_selection(&mut self, target: Option<studio_core::AutoTarget>) {
+        use studio_core::{Binding, BindingId, CurveId, Gate, Op};
+        let p = &self.session.doc.project;
+        let curve = CurveId(p.curves.keys().map(|c| c.0).max().unwrap_or(0) + 1);
+        let mut next_binding = p.bindings.keys().map(|b| b.0).max().unwrap_or(0) + 1;
+        let name = format!("curve {}", curve.0);
+        let mut ops = vec![Op::SetCurve { id: curve, name: name.clone() }];
+        let first_binding = BindingId(next_binding);
+        if self.selection.is_empty() {
+            let Some(target) = target else {
+                self.status = "select clips to gate a curve to, or pick a lane to bind one to".into();
+                return;
+            };
+            ops.push(Op::SetBinding { id: first_binding, binding: Binding { curve, target, gate: Gate::Always } });
+        } else {
+            for id in &self.selection {
+                let Some(c) = p.clips.get(id) else { continue };
+                let target = target.unwrap_or(studio_core::AutoTarget::TrackGain(c.track));
+                ops.push(Op::SetBinding { id: BindingId(next_binding),
+                    binding: Binding { curve, target, gate: Gate::Clip(*id) } });
+                next_binding += 1;
+            }
+        }
+        let bound = ops.len() - 1;
+        self.edit_group(ops, &format!("{name} bound to {bound} target{}", if bound == 1 { "" } else { "s" }));
+        if self.session.doc.project.bindings.contains_key(&first_binding) {
+            self.auto_target = None;
+            self.auto_binding = Some(first_binding);
+        }
+    }
+
+    /// Drop one binding. The curve stays — it may drive other clips, and
+    /// a curve nothing drives is inert, not garbage.
+    pub fn unbind(&mut self, id: studio_core::BindingId) {
+        self.edit(studio_core::Op::RemoveBinding { id }, "unbound");
+        if self.auto_binding == Some(id) { self.auto_binding = None; }
     }
 
     /// The playhead to render, honouring theatre mode.
@@ -1999,6 +2333,11 @@ impl Default for App {
             .find(|p| p.label() == ws.panel) { studio.panel = *p; }
         studio.view.px_per_sec = ws.px_per_sec;
         studio.view.scroll = studio_core::Ticks(ws.scroll_ticks);
+        studio.overlap = studio_core::Overlap::parse(&ws.overlap).unwrap_or_default();
+        studio.overlap_tracks = ws.overlap_tracks.split(',')
+            .filter_map(|kv| { let (t, p) = kv.split_once(':')?;
+                Some((studio_core::TrackId(t.trim().parse().ok()?), studio_core::Overlap::parse(p)?)) })
+            .collect();
         studio.closed_groups = ws.closed_groups.iter()
             .map(|g| studio_core::GroupId(*g)).collect();
         let bounce_format = morph_pad::BounceFormat::from_token(&ws.bounce_format);
@@ -2029,9 +2368,7 @@ impl Default for App {
         } else {
             None
         };
-        let library_root = std::env::var("STUDIO_LIBRARY")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| "library".into());
+        let library_root = project_dir::library_root();
         let library_tree = library::TreeState::default();
         let midi = midi::MidiIn::open(std::env::var("STUDIO_MIDI").ok().as_deref()).ok();
         let analog = WootingAnalog::default();
@@ -2400,6 +2737,9 @@ impl eframe::App for App {
                         display_name: self.studio.display_name.clone(),
                         rebinds: self.rebinds.encode(),
                         piano_zones: self.zones.encode(),
+                        overlap: self.studio.overlap.name().to_string(),
+                        overlap_tracks: self.studio.overlap_tracks.iter()
+                            .map(|(t, p)| format!("{}:{}", t.0, p.name())).collect::<Vec<_>>().join(","),
                     });
                     // The directory must exist (and be ours) BEFORE the
                     // file is written: a save into a fresh project root
@@ -2452,6 +2792,7 @@ impl eframe::App for App {
                 // on it — a recording UI that does not show you it is
                 // recording is how takes get lost.
                 let live = self.mic.recording();
+                self.studio.recording = live;
                 let label = if live { format!("⏺ {:.1}s", self.mic.elapsed()) }
                             else { "⏺".to_string() };
                 let btn = egui::Button::new(label)
@@ -3483,15 +3824,19 @@ impl eframe::App for App {
                         // The drop is an op like any other: undoable, on the
                         // wire, and REFUSABLE — check_room may say no, and
                         // the status says so instead of the clip snapping
-                        // back wordlessly.
-                        self.studio.edit(
-                            studio_core::Op::MoveClip { id, pos, track }, "moved");
+                        // back wordlessly. A clip that belongs to a
+                        // composition, or to a multi-selection, takes the
+                        // others with it (alt-drag moves just this one —
+                        // kdenlive's "select inside the group" key).
+                        let alone = ui.input(|i| i.modifiers.alt);
+                        self.studio.drop_clip(id, pos, track, alone);
                     }
 
                     // ── the automation strip ─────────────────────────────
                     // A target whose track or bus has been removed clears
                     // itself rather than offering a strip every edit on
-                    // which would be refused.
+                    // which would be refused. A binding that was removed
+                    // (by undo, or by a peer) likewise.
                     if let Some(t) = self.studio.auto_target {
                         let p = &self.studio.session.doc.project;
                         let alive = match t {
@@ -3502,34 +3847,108 @@ impl eframe::App for App {
                         };
                         if !alive { self.studio.auto_target = None; }
                     }
+                    if let Some(b) = self.studio.auto_binding {
+                        if !self.studio.session.doc.project.bindings.contains_key(&b) {
+                            self.studio.auto_binding = None;
+                        }
+                    }
                     ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
                         ui.label("automate:");
                         let mut target = self.studio.auto_target;
-                        if ui.add(egui::Button::selectable(target.is_none(), "off")).clicked() {
-                            target = None;
+                        let mut binding = self.studio.auto_binding;
+                        if ui.add(egui::Button::selectable(target.is_none() && binding.is_none(), "off")).clicked() {
+                            target = None; binding = None;
                         }
                         for t in &self.studio.session.doc.project.tracks {
                             let this = Some(studio_core::AutoTarget::TrackGain(t.id));
                             if ui.add(egui::Button::selectable(target == this, &t.name)).clicked() {
-                                target = this;
+                                target = this; binding = None;
                             }
                         }
                         for b in self.studio.session.doc.project.busses.values() {
                             let this = Some(studio_core::AutoTarget::BusGain(b.id));
                             if ui.add(egui::Button::selectable(target == this,
                                                                format!("bus: {}", b.name))).clicked() {
-                                target = this;
+                                target = this; binding = None;
                             }
                         }
                         self.studio.auto_target = target;
+                        self.studio.auto_binding = binding;
                     });
+                    // The curves row: every binding, and the one button
+                    // that makes a new curve. A lane is the clock's; a
+                    // binding is a clip's — the strip shows one or the other.
+                    let mut new_curve = false;
+                    let mut unbind: Option<studio_core::BindingId> = None;
+                    let mut uniq: Option<studio_core::BindingId> = None;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("curves:");
+                        let sel = self.studio.selection.len();
+                        let hint = if sel > 0 {
+                            format!("new curve gated to the {sel} selected clip{}, riding each clip's track gain (y/p paste it along)",
+                                    if sel == 1 { "" } else { "s" })
+                        } else if self.studio.auto_target.is_some() {
+                            "new curve bound always to the chosen lane".into()
+                        } else {
+                            "select clips (or pick a lane) first".into()
+                        };
+                        if ui.button("+ curve").on_hover_text(hint).clicked() { new_curve = true; }
+                        let p = &self.studio.session.doc.project;
+                        let target_name = |t: studio_core::AutoTarget| match t {
+                            studio_core::AutoTarget::TrackGain(id) =>
+                                p.tracks.iter().find(|x| x.id == id).map(|x| x.name.clone())
+                                    .unwrap_or_else(|| "?".into()),
+                            studio_core::AutoTarget::BusGain(id) =>
+                                p.busses.get(&id).map(|x| format!("bus {}", x.name))
+                                    .unwrap_or_else(|| "?".into()),
+                        };
+                        let gate_name = |g: studio_core::Gate| match g {
+                            studio_core::Gate::Always => "always".to_string(),
+                            studio_core::Gate::Clip(c) => if p.clips.contains_key(&c) {
+                                format!("clip {}", c.0) } else { format!("clip {} (gone)", c.0) },
+                            studio_core::Gate::Window { start, end } =>
+                                format!("{:.2}–{:.2}s", start.to_seconds(), end.to_seconds()),
+                        };
+                        let mut pick = self.studio.auto_binding;
+                        for (id, b) in &p.bindings {
+                            let curve = p.curves.get(&b.curve).map(|c| c.name.as_str()).unwrap_or("?");
+                            let shared = p.curve_share_count(b.curve);
+                            // "shared ×N" is said BEFORE a point is moved, because
+                            // the whole value of a shared curve is also its whole
+                            // danger: eleven other clips hear the edit.
+                            let label = if shared > 1 {
+                                format!("{curve} (shared ×{shared}) → {} @ {}", target_name(b.target), gate_name(b.gate))
+                            } else {
+                                format!("{curve} → {} @ {}", target_name(b.target), gate_name(b.gate))
+                            };
+                            if ui.add(egui::Button::selectable(pick == Some(*id), label))
+                                .on_hover_text("show this binding's curve in the strip")
+                                .clicked() { pick = Some(*id); }
+                            if shared > 1 && ui.small_button("unique")
+                                .on_hover_text("give this binding its own copy of the curve; the others keep sharing")
+                                .clicked() { uniq = Some(*id); }
+                            if ui.small_button("×").on_hover_text("unbind (the curve stays)").clicked() {
+                                unbind = Some(*id);
+                            }
+                        }
+                        if pick != self.studio.auto_binding {
+                            self.studio.auto_binding = pick;
+                            self.studio.auto_target = None;
+                        }
+                    });
+                    if new_curve {
+                        let t = self.studio.auto_target;
+                        self.studio.new_curve_on_selection(t);
+                    }
+                    if let Some(id) = unbind { self.studio.unbind(id); }
+                    if let Some(id) = uniq { self.studio.make_unique(id); }
                     if let Some(target) = self.studio.auto_target {
                         let points = self.studio.session.doc.project.automation
                             .get(&target).cloned().unwrap_or_default();
                         let mut drag = self.studio.auto_drag;
                         let edits = studio_egui::auto::strip(
-                            ui, &points, self.studio.current_view(), &mut drag, Some(ph), &colors);
+                            ui, &points, self.studio.current_view(), &mut drag, Some(ph), &colors, None);
                         self.studio.auto_drag = drag;
                         for e in edits {
                             match e {
@@ -3540,6 +3959,37 @@ impl eframe::App for App {
                                     studio_core::Op::RemoveAutoPoint { target, at },
                                     "automation point removed"),
                             }
+                        }
+                    } else if let Some(bid) = self.studio.auto_binding {
+                        // The binding's curve, shifted to the gate's origin
+                        // so it draws where it plays; edits shift back into
+                        // curve time. `shift_points` is pure and pinned.
+                        let p = &self.studio.session.doc.project;
+                        let b = p.bindings[&bid];
+                        let opening = b.gate.opening(p);
+                        match (p.curves.get(&b.curve), opening) {
+                            (Some(curve), Some(opening)) => {
+                                let curve_id = b.curve;
+                                let points = shift_points(&curve.points, opening.origin);
+                                let mut drag = self.studio.auto_drag;
+                                let edits = studio_egui::auto::strip(
+                                    ui, &points, self.studio.current_view(), &mut drag, Some(ph), &colors,
+                                    opening.span);
+                                self.studio.auto_drag = drag;
+                                for e in edits {
+                                    match e {
+                                        studio_egui::auto::AutoEdit::Set { at, value } => self.studio.edit(
+                                            studio_core::Op::SetCurvePoint { curve: curve_id,
+                                                at: curve_time(at, opening.origin), value },
+                                            "curve point"),
+                                        studio_egui::auto::AutoEdit::Remove { at } => self.studio.edit(
+                                            studio_core::Op::RemoveCurvePoint { curve: curve_id,
+                                                at: curve_time(at, opening.origin) },
+                                            "curve point removed"),
+                                    }
+                                }
+                            }
+                            _ => { ui.label("this binding's gate clip is gone — it plays nothing until the clip is back"); }
                         }
                     }
                 }
@@ -3981,6 +4431,20 @@ impl App {
                             "no bus feeding master to analyse".into(),
                     }
                 }
+                palette::ShellVerb::NewCurve => {
+                    let t = self.studio.auto_target;
+                    self.studio.new_curve_on_selection(t);
+                }
+                palette::ShellVerb::SplitOnGrid(steps) => self.studio.split_selection_on_grid(steps as i64),
+                palette::ShellVerb::Overlap(policy) => {
+                    let track = self.studio.selection.first()
+                        .and_then(|c| self.studio.session.doc.project.clips.get(c)).map(|c| c.track);
+                    self.studio.set_overlap(track, policy);
+                }
+                palette::ShellVerb::MakeCurveUnique => match self.studio.auto_binding {
+                    Some(b) => self.studio.make_unique(b),
+                    None => self.studio.status = "make unique: pick a binding in the curves row first".into(),
+                },
                 palette::ShellVerb::ArchiveDialog => {
                     self.archive_ui = Some(ArchiveUi::default());
                 }
@@ -5990,6 +6454,331 @@ mod clip_fx_tests {
         assert!(e(&quiet) < e(&loud), "the fader moved the clip");
         s.key(studio_egui::keys::Key::c('u'));
         assert_eq!(s.render_arrangement(48_000, &sources), loud, "one gesture, one undo");
+    }
+}
+
+/// A curve's points shifted from curve time to timeline time for the
+/// strip: `+origin`, the gate's own definition of where t = 0 sits.
+pub fn shift_points(points: &[(Ticks, f32)], origin: Ticks) -> Vec<(Ticks, f32)> {
+    points.iter().map(|(t, v)| (t.saturating_add(origin), *v)).collect()
+}
+
+/// The inverse for an edit the strip reports in timeline time: back into
+/// curve time, clamped at zero — a click left of a clip's start is a point
+/// at the clip's start, never a negative curve time nothing could play.
+pub fn curve_time(at: Ticks, origin: Ticks) -> Ticks {
+    Ticks(at.saturating_sub(origin).0.max(0))
+}
+
+#[cfg(test)]
+mod curve_shell_tests {
+    //! The shell half of the curves module: `y`/`p` carry a clip's
+    //! bindings, a curve is minted from the selection, and the strip's
+    //! time shift is an exact inverse.
+    use super::*;
+    use studio_core::{AutoTarget, Gate, Op, Ticks};
+    use studio_egui::keys::Key;
+
+    /// Demo project, clip 1 selected, a curve gated to it with a dip
+    /// halfway through the clip.
+    fn with_bound_clip() -> (Studio, studio_core::ClipId, studio_core::CurveId) {
+        let mut s = Studio::demo();
+        let clip = studio_core::ClipId(1);
+        s.selection = vec![clip];
+        s.new_curve_on_selection(None);
+        let curve = s.session.doc.project.bindings.values().next().expect("bound").curve;
+        s.edit(Op::SetCurvePoint { curve, at: Ticks::ZERO, value: 1.0 }, "pt");
+        s.edit(Op::SetCurvePoint { curve, at: Ticks::from_seconds(1.5), value: 0.0 }, "pt");
+        s.edit(Op::SetCurvePoint { curve, at: Ticks::from_seconds(3.0), value: 1.0 }, "pt");
+        (s, clip, curve)
+    }
+
+    #[test]
+    fn a_new_curve_on_the_selection_is_gated_to_the_clip_and_rides_its_track() {
+        let (s, clip, curve) = with_bound_clip();
+        let p = &s.session.doc.project;
+        assert_eq!(p.curves.len(), 1);
+        assert_eq!(p.bindings.len(), 1);
+        let b = p.bindings.values().next().unwrap();
+        assert_eq!(b.gate, Gate::Clip(clip));
+        assert_eq!(b.target, AutoTarget::TrackGain(p.clips[&clip].track), "the clip's own track gain");
+        assert_eq!(b.curve, curve);
+        assert_eq!(s.auto_binding, p.bindings.keys().next().copied(), "the strip switched to it");
+        assert!(s.auto_target.is_none());
+        // The dip is real, halfway into clip 1 (pos 0 s, len 3 s).
+        assert!((p.auto_value(b.target, Ticks::from_seconds(1.5))).abs() < 1e-6);
+    }
+
+    #[test]
+    fn yank_then_paste_copies_the_clip_with_its_binding_as_one_undo() {
+        let (mut s, clip, curve) = with_bound_clip();
+        let track = s.session.doc.project.clips[&clip].track;
+        s.key(Key::c('y'));
+        assert!(s.status.starts_with("yanked 1 clip"), "status was: {}", s.status);
+        // Far right, where every track is empty in the demo.
+        let at = Ticks::from_seconds(100.0);
+        s.transport.set_position(at);
+        s.key(Key::c('p'));
+        assert!(s.status.contains("pasted 1 clip with 1 automation binding"), "status was: {}", s.status);
+        let p = &s.session.doc.project;
+        assert_eq!(p.clips.len(), 7);
+        let copy = p.clips.values().find(|c| c.pos == at).expect("the copy landed at the playhead");
+        assert_eq!(copy.track, track, "same track");
+        assert_eq!(p.curves.len(), 1, "the curve is shared, never copied");
+        assert_eq!(p.bindings.len(), 2);
+        assert!(p.bindings.values().any(|b| b.gate == Gate::Clip(copy.id) && b.curve == curve),
+                "a binding re-aimed at the copy");
+        assert!((p.auto_value(AutoTarget::TrackGain(track), Ticks::from_seconds(101.5))).abs() < 1e-6,
+                "the copy rides the same dip 1.5 s in");
+        assert_eq!(s.selection, vec![copy.id], "the paste is what is selected now");
+        // ONE undo takes the clip and its binding away together.
+        s.key(Key::c('u'));
+        let p = &s.session.doc.project;
+        assert_eq!(p.clips.len(), 6);
+        assert_eq!(p.bindings.len(), 1);
+    }
+
+    #[test]
+    fn a_paste_with_no_room_makes_room_by_default_and_refuses_whole_when_told_to() {
+        let (mut s, _clip, _) = with_bound_clip();
+        s.yank();
+        // Clip 4 sits on track 1 at 10.5 s; pasting a 3 s clip at 9 s
+        // overlaps its head. Newest wins: 4 is left-trimmed and slid to
+        // 12 s, the paste lands, one undo restores everything.
+        let before = s.session.doc.project.clone();
+        s.paste_at(Ticks::from_seconds(9.0));
+        assert!(s.status.starts_with("pasted 1 clip"), "status was: {}", s.status);
+        let p = &s.session.doc.project;
+        assert_eq!(p.clips[&studio_core::ClipId(4)].pos, Ticks::from_seconds(12.0));
+        assert_eq!(p.clips[&studio_core::ClipId(4)].len, Ticks::from_seconds(1.5));
+        s.key(Key::c('u'));
+        assert_eq!(s.session.doc.project, before, "one undo, and the take is whole again");
+        // Refuse: nothing may land — not the clip, not the binding.
+        s.overlap = studio_core::Overlap::Refuse;
+        s.paste_at(Ticks::from_seconds(9.0));
+        assert!(s.status.contains("refused"), "status was: {}", s.status);
+        assert_eq!(s.session.doc.project, before, "a refused paste leaves nothing behind");
+    }
+
+    #[test]
+    fn a_yanked_clip_deleted_before_the_paste_is_counted_not_pasted() {
+        let (mut s, clip, _) = with_bound_clip();
+        s.selection = vec![clip, studio_core::ClipId(2)];
+        s.yank();
+        s.edit(Op::RemoveClip { id: studio_core::ClipId(2) }, "deleted");
+        s.paste_at(Ticks::from_seconds(100.0));
+        assert!(s.status.contains("pasted 1 clip") && s.status.contains("1 yanked clip no longer exists"),
+                "status was: {}", s.status);
+        s.clipboard.clear();
+        s.paste_at(Ticks::from_seconds(200.0));
+        assert_eq!(s.status, "nothing yanked");
+    }
+
+    #[test]
+    fn a_curve_with_nothing_to_aim_at_says_so_and_a_lane_target_binds_always() {
+        let mut s = Studio::demo();
+        s.selection.clear();
+        s.new_curve_on_selection(None);
+        assert!(s.session.doc.project.curves.is_empty());
+        assert!(s.status.contains("select clips"), "status was: {}", s.status);
+        let t = AutoTarget::TrackGain(s.session.doc.project.tracks[0].id);
+        s.new_curve_on_selection(Some(t));
+        let p = &s.session.doc.project;
+        assert_eq!(p.bindings.len(), 1);
+        let b = p.bindings.values().next().unwrap();
+        assert_eq!(b.gate, Gate::Always);
+        assert_eq!(b.target, t);
+    }
+
+    #[test]
+    fn unbind_drops_the_binding_and_keeps_the_curve() {
+        let (mut s, _, curve) = with_bound_clip();
+        let id = *s.session.doc.project.bindings.keys().next().unwrap();
+        s.unbind(id);
+        let p = &s.session.doc.project;
+        assert!(p.bindings.is_empty());
+        assert!(p.curves.contains_key(&curve), "an unbound curve is inert, not garbage");
+        assert!(s.auto_binding.is_none(), "the strip stopped showing what no longer exists");
+    }
+
+    /// Demo project with clips 1 and 4 (both on track 1, at 0 s and
+    /// 10.5 s) grouped as "hook".
+    fn with_group() -> Studio {
+        let mut s = Studio::demo();
+        s.edit(Op::SetGroup { id: studio_core::GroupId(1), name: "hook".into(),
+            clips: vec![studio_core::ClipId(1), studio_core::ClipId(4)] }, "grouped");
+        s
+    }
+
+    #[test]
+    fn dropping_one_member_moves_the_whole_composition_as_one_undo() {
+        let mut s = with_group();
+        let t = s.session.doc.project.clips[&studio_core::ClipId(1)].track;
+        s.selection.clear();
+        s.drop_clip(studio_core::ClipId(1), Ticks::from_seconds(50.0), t, false);
+        assert!(s.status.contains("moved 2 together"), "status was: {}", s.status);
+        let p = &s.session.doc.project;
+        assert_eq!(p.clips[&studio_core::ClipId(1)].pos, Ticks::from_seconds(50.0));
+        assert_eq!(p.clips[&studio_core::ClipId(4)].pos, Ticks::from_seconds(60.5), "the other member kept its 10.5 s spacing");
+        s.key(Key::c('u'));
+        assert_eq!(s.session.doc.project.clips[&studio_core::ClipId(4)].pos, Ticks::from_seconds(10.5), "one undo, both back");
+        // Alt-drag moves just the one.
+        s.drop_clip(studio_core::ClipId(1), Ticks::from_seconds(50.0), t, true);
+        assert_eq!(s.status, "moved");
+        assert_eq!(s.session.doc.project.clips[&studio_core::ClipId(4)].pos, Ticks::from_seconds(10.5));
+    }
+
+    #[test]
+    fn a_nudge_of_adjacent_clips_lands_where_one_at_a_time_used_to_refuse() {
+        let mut s = Studio::demo();
+        // Pack three clips shoulder to shoulder on track 1, then nudge right.
+        let t = s.session.doc.project.clips[&studio_core::ClipId(1)].track;
+        s.edit(Op::MoveClip { id: studio_core::ClipId(4), pos: Ticks::from_seconds(3.0), track: t }, "packed");
+        assert_eq!(s.status, "packed", "clip 4 sits flush against clip 1 now");
+        s.selection = vec![studio_core::ClipId(1), studio_core::ClipId(4)];
+        s.nudge_selected(Ticks::from_seconds(1.0));
+        assert!(s.status.starts_with("nudged 2"), "status was: {}", s.status);
+        let p = &s.session.doc.project;
+        assert_eq!(p.clips[&studio_core::ClipId(1)].pos, Ticks::from_seconds(1.0));
+        assert_eq!(p.clips[&studio_core::ClipId(4)].pos, Ticks::from_seconds(4.0));
+    }
+
+    #[test]
+    fn pasting_a_composition_recreates_it_over_the_copies() {
+        let mut s = with_group();
+        s.selection = vec![studio_core::ClipId(1), studio_core::ClipId(4)];
+        s.yank();
+        s.paste_at(Ticks::from_seconds(100.0));
+        assert!(s.status.contains("in 1 composition"), "status was: {}", s.status);
+        let p = &s.session.doc.project;
+        assert_eq!(p.groups.len(), 2);
+        let copy = p.groups.values().find(|g| g.name == "hook copy").expect("the copy is named after its original");
+        assert_eq!(copy.clips.len(), 2);
+        assert!(copy.clips.iter().all(|c| p.clips[c].pos >= Ticks::from_seconds(100.0)), "made of the pasted clips");
+        s.key(Key::c('u'));
+        assert_eq!(s.session.doc.project.groups.len(), 1, "one undo takes the copies and their composition");
+    }
+
+    #[test]
+    fn cutting_on_beats_keeps_the_pieces_in_the_composition_and_says_how_many() {
+        let mut s = with_group();
+        // The demo's rack is 140 BPM-ish; whatever it is, a 3 s clip has
+        // more than one beat inside it.
+        s.selection = vec![studio_core::ClipId(1)];
+        let beat = s.rack.tempo().step_len().0 * 4;
+        let expect_cuts = (Ticks::from_seconds(3.0).0 - 1) / beat;
+        s.split_selection_on_grid(4);
+        assert!(s.status.starts_with(&format!("cut {expect_cuts} time")), "status was: {}", s.status);
+        let p = &s.session.doc.project;
+        assert_eq!(p.groups[&studio_core::GroupId(1)].clips.len(), 2 + expect_cuts as usize, "pieces joined the hook");
+        assert_eq!(s.selection.len(), 1 + expect_cuts as usize, "the pieces are selected with their original");
+        s.key(Key::c('u'));
+        assert_eq!(s.session.doc.project.clips.len(), 6, "one undo");
+        s.selection.clear();
+        s.split_selection_on_grid(4);
+        assert_eq!(s.status, "split on grid: nothing selected");
+    }
+
+    #[test]
+    fn make_unique_needs_a_shared_curve_and_then_shows_the_split_count() {
+        let (mut s, _, curve) = with_bound_clip();
+        let id = *s.session.doc.project.bindings.keys().next().unwrap();
+        s.make_unique(id);
+        assert!(s.status.starts_with("already unique"), "status was: {}", s.status);
+        // Share it with clip 2, then make clip 2's binding unique.
+        s.edit(Op::SetBinding { id: studio_core::BindingId(2), binding: studio_core::Binding {
+            curve, target: AutoTarget::TrackGain(s.session.doc.project.clips[&studio_core::ClipId(2)].track),
+            gate: Gate::Clip(studio_core::ClipId(2)) } }, "bound");
+        assert_eq!(s.session.doc.project.curve_share_count(curve), 2);
+        s.make_unique(studio_core::BindingId(2));
+        assert_eq!(s.status, "curve made unique — one undo reverses all 5", "status was: {}", s.status);
+        let p = &s.session.doc.project;
+        assert_eq!(p.curve_share_count(curve), 1);
+        assert_eq!(p.curves.len(), 2);
+        assert_ne!(p.bindings[&studio_core::BindingId(2)].curve, curve);
+    }
+
+    #[test]
+    fn a_drop_onto_a_long_take_trims_it_by_default_and_refuses_only_when_asked() {
+        // Demo: clips 1 (0–3 s) and 4 (10.5–13.5 s) share track 1. Drop 4
+        // onto 1's tail: newest wins, 1 is trimmed, one undo restores both.
+        let mut s = Studio::demo();
+        let t = s.session.doc.project.clips[&studio_core::ClipId(1)].track;
+        assert_eq!(s.policy_for(t), studio_core::Overlap::Trim, "the default");
+        s.selection.clear();
+        s.drop_clip(studio_core::ClipId(4), Ticks::from_seconds(2.0), t, true);
+        assert!(s.status.contains("made room"), "status was: {}", s.status);
+        let p = &s.session.doc.project;
+        assert_eq!(p.clips[&studio_core::ClipId(4)].pos, Ticks::from_seconds(2.0));
+        assert_eq!(p.clips[&studio_core::ClipId(1)].len, Ticks::from_seconds(2.0), "the take gave way to the newcomer");
+        s.key(Key::c('u'));
+        let p = &s.session.doc.project;
+        assert_eq!(p.clips[&studio_core::ClipId(1)].len, Ticks::from_seconds(3.0));
+        assert_eq!(p.clips[&studio_core::ClipId(4)].pos, Ticks::from_seconds(10.5), "one undo, both facts back");
+        s.set_overlap(Some(t), studio_core::Overlap::Refuse);
+        s.drop_clip(studio_core::ClipId(4), Ticks::from_seconds(2.0), t, true);
+        assert!(s.status.contains("refused"), "status was: {}", s.status);
+        assert_eq!(s.session.doc.project.clips[&studio_core::ClipId(4)].pos, Ticks::from_seconds(10.5));
+    }
+
+    #[test]
+    fn the_lane_policy_lands_the_overlap_on_a_shadow_track_through_the_same_bus() {
+        let mut s = Studio::demo();
+        let t = s.session.doc.project.clips[&studio_core::ClipId(1)].track;
+        s.set_overlap(Some(t), studio_core::Overlap::Lane);
+        assert!(s.status.ends_with(": lane"), "status was: {}", s.status);
+        let tracks_before = s.session.doc.project.tracks.len();
+        s.selection.clear();
+        s.drop_clip(studio_core::ClipId(4), Ticks::from_seconds(1.0), t, true);
+        let p = &s.session.doc.project;
+        assert_eq!(p.tracks.len(), tracks_before + 1, "a shadow lane was made");
+        let lane = p.shadow_lane(t).expect("found by name beside its parent");
+        let moved = &p.clips[&studio_core::ClipId(4)];
+        assert_eq!(moved.track, lane);
+        assert_eq!(moved.pos, Ticks::from_seconds(1.0));
+        assert_eq!(p.clips[&studio_core::ClipId(1)].len, Ticks::from_seconds(3.0), "the take on the parent is untouched");
+        assert_eq!(p.tracks.iter().find(|x| x.id == lane).unwrap().route,
+                   p.tracks.iter().find(|x| x.id == t).unwrap().route, "same bus");
+        // A second overlap reuses the lane rather than making another.
+        s.drop_clip(studio_core::ClipId(5), Ticks::from_seconds(0.5), t, true);
+        assert_eq!(s.session.doc.project.tracks.len(), tracks_before + 1);
+        s.key(Key::c('u'));
+        s.key(Key::c('u'));
+        assert_eq!(s.session.doc.project.tracks.len(), tracks_before, "undo removes the lane it made");
+    }
+
+    #[test]
+    fn overlap_policy_survives_the_workspace_sidecar() {
+        let mut ws = workspace::WorkspaceState::default();
+        ws.overlap = "lane".into();
+        ws.overlap_tracks = "3:refuse,7:trim, junk ,9:nope".into();
+        let back = workspace::WorkspaceState::decode(&ws.encode());
+        assert_eq!(back.overlap, "lane");
+        assert_eq!(back.overlap_tracks, ws.overlap_tracks);
+        assert_eq!(studio_core::Overlap::parse(&back.overlap), Some(studio_core::Overlap::Lane));
+        let parsed: Vec<_> = back.overlap_tracks.split(',')
+            .filter_map(|kv| { let (t, p) = kv.split_once(':')?;
+                Some((t.trim().parse::<u64>().ok()?, studio_core::Overlap::parse(p)?)) }).collect();
+        assert_eq!(parsed, vec![(3, studio_core::Overlap::Refuse), (7, studio_core::Overlap::Trim)],
+                   "junk and unknown policies are dropped, never load-bearing");
+    }
+
+    #[test]
+    fn presence_says_when_a_take_is_rolling() {
+        let mut s = Studio::demo();
+        s.recording = true;
+        let pkt = s.presence_beat(10_000).expect("first presence is always due");
+        match pkt { studio_collab::wire::Packet::Presence(p) => assert!(p.recording), other => panic!("{other:?}") }
+    }
+
+    #[test]
+    fn the_strips_time_shift_is_exact_and_clamps_at_the_gate() {
+        let origin = Ticks(1_000);
+        let pts = vec![(Ticks(0), 1.0), (Ticks(500), 0.0)];
+        let shown = shift_points(&pts, origin);
+        assert_eq!(shown, vec![(Ticks(1_000), 1.0), (Ticks(1_500), 0.0)]);
+        for (t, _) in &shown { assert_eq!(curve_time(*t, origin), Ticks(t.0 - origin.0)); }
+        assert_eq!(curve_time(Ticks(200), origin), Ticks::ZERO, "left of the gate is the gate's start");
     }
 }
 

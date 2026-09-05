@@ -996,7 +996,7 @@ pub fn show_tree(ui: &mut egui::Ui, roots: &Roots, state: &mut TreeState,
             // looked intermittent: it only bites on an empty or unscanned
             // root.
             ui.add(egui::Label::new(
-                egui::RichText::new("Empty. Set STUDIO_LIBRARY, or put samples in ./library.")
+                egui::RichText::new(format!("Empty. Put samples in {}, or set STUDIO_LIBRARY.", root.display()))
                     .color(c.text_weak)).wrap());
         }
         walk(ui, root, 0, state, rack, project, prefs, compact, c, &mut action);

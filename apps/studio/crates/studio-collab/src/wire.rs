@@ -31,11 +31,20 @@
 //! can be receiving live edits while the catch-up is still arriving.
 
 use crate::{Presence, RackSync, SiteId, Stamp, StampedOp};
-use studio_core::{AutoTarget, Bus, BusId, Clip, ClipId, Effect, GroupId, Op, Send, Source, SourceId, Ticks, Track, TrackId, TrackKind};
+use studio_core::{AutoTarget, Binding, BindingId, Bus, BusId, Clip, ClipId, CurveId, Effect, Gate, GroupId, Op, Send, Source, SourceId, Ticks, Track, TrackId, TrackKind};
 use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 
 /// Bumped whenever the encoding changes shape. A peer that sees a version it
 /// does not know refuses the packet rather than guessing.
+///
+/// v15: `Presence` gained `recording` (one byte after `seq`) and
+/// `Packet::Voice`(10) — one encoded voice frame for the in-house call,
+/// `site` + `seq` + bytes; the codec is the shell's business.
+///
+/// v14: reusable automation — `SetCurve`(32), `RemoveCurve`(33),
+/// `SetCurvePoint`(34), `RemoveCurvePoint`(35), `SetBinding`(36),
+/// `RemoveBinding`(37) — with the `Gate` encoding (kind byte: 0 always,
+/// 1 clip + id, 2 window + start + end) and `CurveId`/`BindingId`.
 ///
 /// v13: the key and the markers — `SetKey`(26), `SetMarker`(27),
 /// `RemoveMarker`(28), `ClearMarkers`(29).
@@ -79,7 +88,7 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 13;
+pub const WIRE_VERSION: u8 = 15;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -97,6 +106,11 @@ pub enum Packet {
     /// project references a source it has no bytes for — an `AddSource` op
     /// travels light, and the media follows content-addressed.
     AssetRequest { source: studio_core::SourceId },
+    /// One encoded voice frame from `site` — the in-house call. Never
+    /// logged, never replayed; a late frame is dropped by the receiver's
+    /// jitter buffer (`voice::Jitter`). The bytes are whatever codec the
+    /// shell chose (Opus by intent); this crate never decodes them.
+    Voice { site: SiteId, seq: u32, frame: Vec<u8> },
     /// The asset's shape: chunk ids only, so a receiver asks for exactly
     /// what its content-addressed store lacks (a re-bounce that changed one
     /// bar re-ships one bar).
@@ -263,6 +277,28 @@ fn get_auto_target(r: &mut R) -> Option<AutoTarget> {
     }
 }
 
+fn put_gate(o: &mut Vec<u8>, g: Gate) {
+    match g {
+        Gate::Always => put_u8(o, 0),
+        Gate::Clip(id) => { put_u8(o, 1); put_u64(o, id.0); }
+        Gate::Window { start, end } => { put_u8(o, 2); put_ticks(o, start); put_ticks(o, end); }
+    }
+}
+fn get_gate(r: &mut R) -> Option<Gate> {
+    match r.u8()? {
+        0 => Some(Gate::Always),
+        1 => Some(Gate::Clip(ClipId(r.u64()?))),
+        2 => Some(Gate::Window { start: r.ticks()?, end: r.ticks()? }),
+        _ => None, // an unknown gate kind refuses the packet, like an unknown op
+    }
+}
+fn put_binding(o: &mut Vec<u8>, b: &Binding) {
+    put_u64(o, b.curve.0); put_auto_target(o, b.target); put_gate(o, b.gate);
+}
+fn get_binding(r: &mut R) -> Option<Binding> {
+    Some(Binding { curve: CurveId(r.u64()?), target: get_auto_target(r)?, gate: get_gate(r)? })
+}
+
 fn put_track(o: &mut Vec<u8>, t: &Track) {
     put_u64(o, t.id.0);
     put_u8(o, matches!(t.kind, TrackKind::Audio) as u8);
@@ -360,6 +396,14 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::SetGroupTempo { id, tempo } => {
             put_u8(o, 31); put_u64(o, id.0); put_opt_tempo(o, tempo);
         }
+        Op::SetCurve { id, name } => { put_u8(o, 32); put_u64(o, id.0); put_str(o, name); }
+        Op::RemoveCurve { id } => { put_u8(o, 33); put_u64(o, id.0); }
+        Op::SetCurvePoint { curve, at, value } => {
+            put_u8(o, 34); put_u64(o, curve.0); put_ticks(o, *at); put_f32(o, *value);
+        }
+        Op::RemoveCurvePoint { curve, at } => { put_u8(o, 35); put_u64(o, curve.0); put_ticks(o, *at); }
+        Op::SetBinding { id, binding } => { put_u8(o, 36); put_u64(o, id.0); put_binding(o, binding); }
+        Op::RemoveBinding { id } => { put_u8(o, 37); put_u64(o, id.0); }
         Op::Group { ops } => {
             put_u8(o, 25);
             put_u16(o, ops.len().min(u16::MAX as usize) as u16);
@@ -489,6 +533,12 @@ fn get_op(r: &mut R) -> Option<Op> {
         29 => Op::ClearMarkers,
         30 => Op::SetGroupKey { id: GroupId(r.u64()?), key: get_opt_key(r)? },
         31 => Op::SetGroupTempo { id: GroupId(r.u64()?), tempo: get_opt_tempo(r)? },
+        32 => Op::SetCurve { id: CurveId(r.u64()?), name: r.str()? },
+        33 => Op::RemoveCurve { id: CurveId(r.u64()?) },
+        34 => Op::SetCurvePoint { curve: CurveId(r.u64()?), at: r.ticks()?, value: r.f32()? },
+        35 => Op::RemoveCurvePoint { curve: CurveId(r.u64()?), at: r.ticks()? },
+        36 => Op::SetBinding { id: BindingId(r.u64()?), binding: get_binding(r)? },
+        37 => Op::RemoveBinding { id: BindingId(r.u64()?) },
         25 => {
             let n = r.u16()? as usize;
             let mut ops = Vec::with_capacity(n.min(4096));
@@ -739,6 +789,7 @@ impl Packet {
                 put_str(&mut o, &p.name);
                 put_ticks(&mut o, p.playhead);
                 put_u64(&mut o, p.seq);
+                put_u8(&mut o, p.recording as u8);
                 put_u8(&mut o, p.active_track.is_some() as u8);
                 put_u64(&mut o, p.active_track.map(|t| t.0).unwrap_or(0));
                 put_u16(&mut o, p.selection.len().min(u16::MAX as usize) as u16);
@@ -746,6 +797,11 @@ impl Packet {
             }
             Packet::Hello { site, since } => {
                 put_u8(&mut o, 3); put_u64(&mut o, site.0); put_u64(&mut o, *since);
+            }
+            Packet::Voice { site, seq, frame } => {
+                put_u8(&mut o, 10); put_u64(&mut o, site.0); put_u32(&mut o, *seq);
+                put_u16(&mut o, frame.len().min(u16::MAX as usize) as u16);
+                o.extend_from_slice(&frame[..frame.len().min(u16::MAX as usize)]);
             }
             Packet::Catchup { ops } => {
                 put_u8(&mut o, 4);
@@ -797,6 +853,7 @@ impl Packet {
                 let name = r.str()?;
                 let playhead = r.ticks()?;
                 let seq = r.u64()?;
+                let recording = r.u8()? != 0;
                 let has_track = r.u8()? != 0;
                 let track = r.u64()?;
                 let n = r.u16()? as usize;
@@ -805,10 +862,16 @@ impl Packet {
                 Packet::Presence(Presence {
                     site, name, playhead, seq,
                     active_track: has_track.then_some(TrackId(track)),
-                    selection,
+                    selection, recording,
                 })
             }
             3 => Packet::Hello { site: SiteId(r.u64()?), since: r.u64()? },
+            10 => {
+                let site = SiteId(r.u64()?);
+                let seq = r.u32()?;
+                let n = r.u16()? as usize;
+                Packet::Voice { site, seq, frame: r.take(n)?.to_vec() }
+            }
             4 => {
                 let n = r.u32()? as usize;
                 // Bounded so a corrupt length cannot make us allocate a gigabyte
@@ -916,6 +979,9 @@ impl super::Doc {
             // growing a second job.
             Packet::AssetRequest { .. } | Packet::AssetManifest { .. }
             | Packet::ChunkRequest { .. } | Packet::Chunk { .. } => None,
+            // Voice is audio for the shell's jitter buffer and sink — the
+            // Doc must never see it, log it, or replay it.
+            Packet::Voice { .. } => None,
         }
     }
 }
@@ -1020,6 +1086,18 @@ mod tests {
             Op::SetRoute { track: TrackId(2), bus: None },
             Op::RemoveSource { id: SourceId(3) },
             Op::SetTrackGain { id: TrackId(2), gain: 0.7 },
+            Op::SetCurve { id: CurveId(4), name: "filter sweep — ad-lib".into() },
+            Op::RemoveCurve { id: CurveId(4) },
+            Op::SetCurvePoint { curve: CurveId(4), at: Ticks::from_seconds(0.5), value: 0.0 },
+            Op::RemoveCurvePoint { curve: CurveId(4), at: Ticks::from_seconds(0.5) },
+            Op::SetBinding { id: BindingId(1), binding: Binding { curve: CurveId(4),
+                target: AutoTarget::TrackGain(TrackId(2)), gate: Gate::Always } },
+            Op::SetBinding { id: BindingId(2), binding: Binding { curve: CurveId(4),
+                target: AutoTarget::BusGain(BusId(1)), gate: Gate::Clip(ClipId(9)) } },
+            Op::SetBinding { id: BindingId(3), binding: Binding { curve: CurveId(4),
+                target: AutoTarget::TrackGain(TrackId(2)),
+                gate: Gate::Window { start: Ticks::from_seconds(8.0), end: Ticks::from_seconds(16.0) } } },
+            Op::RemoveBinding { id: BindingId(3) },
         ]
     }
 
@@ -1039,13 +1117,13 @@ mod tests {
     fn presence_and_the_handshake_round_trip() {
         let pr = Packet::Presence(Presence {
             site: SiteId(2), name: "ada".into(), playhead: Ticks::from_seconds(31.5),
-            selection: vec![ClipId(1), ClipId(4)], active_track: Some(TrackId(9)), seq: 17,
+            selection: vec![ClipId(1), ClipId(4)], active_track: Some(TrackId(9)), seq: 17, recording: false,
         });
         assert_eq!(Packet::decode(&pr.encode()).unwrap(), pr);
         // no active track is a distinct state from track 0
         let none = Packet::Presence(Presence {
             site: SiteId(2), name: "ada".into(), playhead: Ticks::ZERO,
-            selection: vec![], active_track: None, seq: 1,
+            selection: vec![], active_track: None, seq: 1, recording: false,
         });
         match Packet::decode(&none.encode()).unwrap() {
             Packet::Presence(p) => assert!(p.active_track.is_none(), "None must not decode as Some(0)"),
@@ -1200,7 +1278,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 13, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 15, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]
@@ -1294,6 +1372,41 @@ mod automation_wire_tests {
             let p = Packet::Op(StampedOp { stamp: Stamp { lamport: 7, site: SiteId(2) }, op });
             assert_eq!(Packet::decode(&p.encode()).expect("decodes"), p);
         }
+    }
+
+    #[test]
+    fn a_recording_flag_and_a_voice_frame_survive_the_wire_and_refuse_every_prefix() {
+        let p = Packet::Presence(Presence { site: SiteId(4), name: "ada".into(), playhead: Ticks(77),
+            selection: vec![ClipId(2)], active_track: Some(TrackId(1)), seq: 9, recording: true });
+        let back = Packet::decode(&p.encode()).expect("decodes");
+        assert_eq!(back, p);
+        match back { Packet::Presence(pr) => assert!(pr.recording), _ => unreachable!() }
+        let v = Packet::Voice { site: SiteId(4), seq: 123_456, frame: vec![1, 2, 3, 250, 0, 7] };
+        let full = v.encode();
+        assert_eq!(Packet::decode(&full).expect("decodes"), v);
+        for cut in 1..full.len() {
+            assert!(Packet::decode(&full[..cut]).is_none(), "a {cut}-byte prefix must not decode");
+        }
+        let empty = Packet::Voice { site: SiteId(1), seq: 0, frame: vec![] };
+        assert_eq!(Packet::decode(&empty.encode()).expect("an empty frame is a legal packet"), empty);
+    }
+
+    #[test]
+    fn an_unknown_gate_kind_refuses_the_packet_and_every_binding_prefix_fails() {
+        let p = Packet::Op(StampedOp { stamp: Stamp { lamport: 7, site: SiteId(2) },
+            op: Op::SetBinding { id: BindingId(5), binding: Binding { curve: CurveId(1),
+                target: AutoTarget::BusGain(BusId(2)), gate: Gate::Clip(ClipId(3)) } } });
+        let full = p.encode();
+        assert_eq!(Packet::decode(&full).expect("decodes"), p);
+        for cut in 1..full.len() {
+            assert!(Packet::decode(&full[..cut]).is_none(), "a {cut}-byte prefix must not decode");
+        }
+        // The gate kind byte is the LAST tag in the packet: after the header,
+        // stamp, op tag, binding id, curve id and the target's kind+id.
+        let gate_at = full.iter().rposition(|&b| b == 1).expect("the clip-gate tag is there");
+        let mut future = full.clone();
+        future[gate_at] = 9;
+        assert!(Packet::decode(&future).is_none(), "an unknown gate must not be guessed at");
     }
 }
 

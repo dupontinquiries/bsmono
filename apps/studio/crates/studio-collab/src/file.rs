@@ -114,6 +114,24 @@ pub fn snapshot(project: &Project) -> Vec<Op> {
             ops.push(Op::SetAutoPoint { target: *target, at: *at, value: *value });
         }
     }
+    // Curves, then the bindings that aim them — curves first because a
+    // binding validates against its curve, bindings after clips because
+    // a clip gate validates against its clip, and all of it BEFORE the
+    // relock, for the lanes' reason: a locked track refuses a binding on
+    // its gain. A binding gated to a clip that no longer exists is left
+    // out (SetBinding would refuse it); it was inert in memory anyway.
+    for (id, c) in &project.curves {
+        ops.push(Op::SetCurve { id: *id, name: c.name.clone() });
+        for (at, value) in &c.points {
+            ops.push(Op::SetCurvePoint { curve: *id, at: *at, value: *value });
+        }
+    }
+    for (id, b) in &project.bindings {
+        if let studio_core::Gate::Clip(c) = b.gate {
+            if !project.clips.contains_key(&c) { continue; }
+        }
+        ops.push(Op::SetBinding { id: *id, binding: *b });
+    }
     // Compositions rebuild after their clips exist; a group whose clips all
     // dangled (every member deleted) has an unappliable op, so it is
     // filtered to the members that still exist — and dropped entirely when
@@ -480,5 +498,47 @@ mod automation_file_tests {
             rebuilt.apply(op).expect("every snapshot op applies cleanly");
         }
         assert_eq!(rebuilt, p, "lanes, lock state and all");
+    }
+
+    #[test]
+    fn curves_and_bindings_survive_the_round_trip_and_a_dangling_gate_is_dropped() {
+        use studio_core::{Binding, BindingId, Clip, ClipId, CurveId, Gate, Source, SourceId};
+        let mut p = Project { name: "bound".into(), ..Default::default() };
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
+            name: "vox".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "a.wav".into(),
+            len: Ticks(10_000), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),
+            pos: Ticks(100), src_in: Ticks::ZERO, len: Ticks(500), gain: 1.0, effects: vec![] } }).unwrap();
+        p.apply(&Op::SetCurve { id: CurveId(1), name: "dip".into() }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(0), value: 1.0 }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(250), value: 0.2 }).unwrap();
+        let t = AutoTarget::TrackGain(TrackId(1));
+        p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
+            curve: CurveId(1), target: t, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+        p.apply(&Op::SetBinding { id: BindingId(2), binding: Binding {
+            curve: CurveId(1), target: t, gate: Gate::Window { start: Ticks(1_000), end: Ticks(2_000) } } }).unwrap();
+        // Locked on purpose, the lane test's reason: the bindings must land
+        // before the relock or a locked track's ride vanishes on save.
+        p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: false, locked: true }).unwrap();
+
+        let file = SaveFile::from_project(&p, Vec::new(), None);
+        let back = SaveFile::decode(&file.encode()).expect("decodes");
+        let mut rebuilt = Project { name: back.name.clone(), ..Default::default() };
+        for op in &back.snapshot {
+            rebuilt.apply(op).expect("every snapshot op applies cleanly");
+        }
+        assert_eq!(rebuilt, p, "curves, bindings, lock state and all");
+        assert!((rebuilt.auto_value(t, Ticks(350)) - 0.2).abs() < 1e-6, "and the ride still reads");
+
+        // A binding whose clip is gone dangles in memory and is dropped from
+        // the file rather than saved as an op the loader would refuse.
+        p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: false, locked: false }).unwrap();
+        p.apply(&Op::RemoveClip { id: ClipId(1) }).unwrap();
+        let snap = snapshot(&p);
+        let bindings_saved = snap.iter().filter(|o| matches!(o, Op::SetBinding { .. })).count();
+        assert_eq!(bindings_saved, 1, "the window binding survives, the dangling clip gate does not");
+        let mut again = Project { name: p.name.clone(), ..Default::default() };
+        for op in &snap { again.apply(op).expect("no refused op in a snapshot"); }
     }
 }

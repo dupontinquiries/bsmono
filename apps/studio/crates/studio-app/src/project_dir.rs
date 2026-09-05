@@ -92,6 +92,36 @@ pub fn projects_root() -> PathBuf {
     }
 }
 
+/// Where the sample library is: `$STUDIO_LIBRARY`; else `./library` IF
+/// it exists (the documented cwd convention, kept for everyone who has
+/// one); else `$XDG_DATA_HOME/studio/library`, else
+/// `~/.local/share/studio/library`. The freedesktop location, so a
+/// packaged build launched from a menu (cwd `/`, or `$HOME`) finds the
+/// same samples a terminal launch does instead of an empty sidebar
+/// telling you to set a variable — `projects_root`'s rule, one root over.
+/// The resolver is pure so the fallback order can be pinned without
+/// touching the process environment from a test.
+pub fn library_root() -> PathBuf {
+    let cwd_has_library = std::path::Path::new("library").is_dir();
+    library_root_from(std::env::var("STUDIO_LIBRARY").ok(), cwd_has_library,
+                      std::env::var("XDG_DATA_HOME").ok(), std::env::var("HOME").ok())
+}
+
+pub fn library_root_from(explicit: Option<String>, cwd_has_library: bool,
+                         xdg_data_home: Option<String>, home: Option<String>) -> PathBuf {
+    if let Some(p) = explicit {
+        if !p.trim().is_empty() { return PathBuf::from(p); }
+    }
+    if cwd_has_library { return PathBuf::from("library"); }
+    if let Some(x) = xdg_data_home {
+        if !x.trim().is_empty() { return PathBuf::from(x).join("studio/library"); }
+    }
+    match home {
+        Some(h) if !h.trim().is_empty() => PathBuf::from(h).join(".local/share/studio/library"),
+        _ => PathBuf::from("library"),
+    }
+}
+
 /// A file-system-safe directory name for a project title.
 pub fn slug(name: &str) -> String {
     let s: String = name.chars().map(|c| {
@@ -369,6 +399,27 @@ pub fn file_at(dir: &Path, commit: &str, file: &str) -> Result<Vec<u8>, String> 
 }
 
 fn _paths_are_send() { fn f<T: Send>() {} f::<PathBuf>(); }
+
+#[cfg(test)]
+mod library_root_tests {
+    use super::*;
+
+    #[test]
+    fn the_library_falls_back_in_the_documented_order() {
+        let f = |e: Option<&str>, cwd: bool, x: Option<&str>, h: Option<&str>|
+            library_root_from(e.map(String::from), cwd, x.map(String::from), h.map(String::from));
+        assert_eq!(f(Some("/mnt/packs"), true, Some("/x"), Some("/h")), PathBuf::from("/mnt/packs"),
+                   "an explicit root wins over everything");
+        assert_eq!(f(Some("  "), true, Some("/x"), Some("/h")), PathBuf::from("library"),
+                   "a blank variable is unset; a ./library that exists is honoured");
+        assert_eq!(f(None, false, Some("/x"), Some("/h")), PathBuf::from("/x/studio/library"),
+                   "no ./library: the freedesktop data dir");
+        assert_eq!(f(None, false, None, Some("/h")), PathBuf::from("/h/.local/share/studio/library"),
+                   "no XDG_DATA_HOME: its default under HOME");
+        assert_eq!(f(None, false, None, None), PathBuf::from("library"),
+                   "no HOME at all (a service): the old cwd default, so nothing breaks");
+    }
+}
 
 #[cfg(test)]
 mod tests {

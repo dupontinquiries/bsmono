@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata — the fleet's rule (see voiceterm/packaging):
+     without it an installed app is invisible to GNOME Software and KDE
+     Discover, which read metainfo rather than .desktop entries. -->
+<component type="desktop-application">
+  <id>org.bigsilicon.Studio</id>
+  <name>Studio</name>
+  <summary>Beat rack, timeline and mixer, editable by two people at once</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>Studio is an audio editor with a video timeline: an FL-style step rack and piano roll as the generator, a kdenlive-style arrangement as the structure, and a bus mixer — with every edit an operation that undoes, saves and travels to a collaborator by the same mechanism.</p>
+    <ul>
+      <li>Automation curves that belong to clips: bind one curve to many clips, move or paste a clip and its ride comes along</li>
+      <li>Compositions that fold a section to one block; nudge, quantize and align it as one thing</li>
+      <li>Records vocal takes, tunes them offline or live, exports Opus, FLAC or WAV, and archives a session as one file</li>
+      <li>One panel at a time on a phone, a workbench on a desktop</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">org.bigsilicon.Studio.desktop</launchable>
+  <provides>
+    <binary>studio</binary>
+  </provides>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <recommends>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </recommends>
+  <releases>
+    <release version="0.1.0" date="2026-09-02"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

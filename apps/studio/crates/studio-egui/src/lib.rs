@@ -505,8 +505,11 @@ pub fn timeline(
         painter.line_segment([Pos2::new(x, origin.y + RULER_H), Pos2::new(x, rect.max.y)],
                              Stroke::new(1.5_f32, tint));
         // the name rides at the top so several peers stay readable
+        // A live take is said in the label itself: the one thing a
+        // collaborator must not do to a singer mid-take is move her.
+        let label = if peer.recording { format!("{} ● rec", peer.name) } else { peer.name.clone() };
         painter.text(Pos2::new(x + 3.0, origin.y + RULER_H + 1.0), Align2::LEFT_TOP,
-                     &peer.name, FontId::proportional(10.0), tint);
+                     label, FontId::proportional(10.0), tint);
     }
 
     // ── our own playhead, last, so it is never hidden by a peer's ──────────
@@ -901,7 +904,7 @@ mod tests {
         assert!(doc.peers_on(ClipId(10)).is_empty());
         doc.presence(Presence { site: SiteId(2), name: "ada".into(),
             playhead: Ticks::from_seconds(3.0), selection: vec![ClipId(10)],
-            active_track: Some(TrackId(1)), seq: 1 });
+            active_track: Some(TrackId(1)), seq: 1 , recording: false,});
         assert_eq!(doc.peers_on(ClipId(10)).len(), 1, "the peer is inside the 2s..6s clip");
         assert!(doc.peers_on(ClipId(20)).is_empty(), "and not inside the other one");
     }

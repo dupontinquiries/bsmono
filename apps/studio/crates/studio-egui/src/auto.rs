@@ -95,12 +95,16 @@ pub fn commit(drag: &PointDrag) -> Vec<AutoEdit> {
 
 /// Draw one lane's strip. Returns edits for the host to apply.
 ///
-/// `points` must be sorted by time (the model keeps them that way);
-/// `playhead` draws the same transport line the timeline shows so the two
-/// stay one instrument.
+/// `points` must be sorted by time (the model keeps them that way) and
+/// be in TIMELINE time — a host showing a gated curve shifts them to the
+/// gate's origin first and shifts edits back. `gate` is that gate's span:
+/// shaded, and the curve's flat holds stop at its edges because outside
+/// the gate the binding reads unity, and the strip must draw what the mix
+/// does. `None` is a plain lane. `playhead` draws the same transport line
+/// the timeline shows so the two stay one instrument.
 pub fn strip(ui: &mut egui::Ui, points: &[(Ticks, f32)], view: &View,
              drag: &mut Option<PointDrag>, playhead: Option<Ticks>,
-             c: &uikit_egui::PaletteColors) -> Vec<AutoEdit> {
+             c: &uikit_egui::PaletteColors, gate: Option<(Ticks, Ticks)>) -> Vec<AutoEdit> {
     let mut edits = Vec::new();
     let width = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, AUTO_H),
@@ -110,6 +114,21 @@ pub fn strip(ui: &mut egui::Ui, points: &[(Ticks, f32)], view: &View,
     let lane_left = rect.left() + view.gutter;
 
     painter.rect_filled(rect, 0.0, c.bg_base);
+    // The gate: where the binding is live. Shaded so a curve that sits
+    // under one clip reads as that clip's, and so the strip is not mistaken
+    // for a lane that spans the song.
+    let (hold_left, hold_right) = match gate {
+        Some((s, e)) => {
+            let (x0, x1) = (view.time_to_x(s, rect.left()).max(lane_left),
+                            view.time_to_x(e, rect.left()).max(lane_left));
+            if x1 > x0 {
+                painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x0, top), egui::pos2(x1, top + h)),
+                                    0.0, c.accent.gamma_multiply(0.12));
+            }
+            (x0, x1.min(rect.right()))
+        }
+        None => (lane_left, rect.right()),
+    };
     // The unity line: the value at which the ride is transparent. Without
     // it every lane reads as "somewhere", and the one thing a ride needs
     // to say at a glance is "above or below what the fader already does".
@@ -137,8 +156,8 @@ pub fn strip(ui: &mut egui::Ui, points: &[(Ticks, f32)], view: &View,
     };
     if let (Some(first), Some(last)) = (shown.first(), shown.last()) {
         let y0 = value_to_y(first.1, top, h);
-        painter.line_segment([egui::pos2(lane_left, y0),
-                              egui::pos2(view.time_to_x(first.0, rect.left()), y0)],
+        painter.line_segment([egui::pos2(hold_left, y0),
+                              egui::pos2(view.time_to_x(first.0, rect.left()).max(hold_left), y0)],
                              egui::Stroke::new(1.5, c.accent));
         for w in shown.windows(2) {
             painter.line_segment(
@@ -147,14 +166,15 @@ pub fn strip(ui: &mut egui::Ui, points: &[(Ticks, f32)], view: &View,
                 egui::Stroke::new(1.5, c.accent));
         }
         let yn = value_to_y(last.1, top, h);
-        painter.line_segment([egui::pos2(view.time_to_x(last.0, rect.left()), yn),
-                              egui::pos2(rect.right(), yn)],
+        painter.line_segment([egui::pos2(view.time_to_x(last.0, rect.left()).min(hold_right), yn),
+                              egui::pos2(hold_right, yn)],
                              egui::Stroke::new(1.5, c.accent));
     } else {
         // No points: the lane is a transparent ride at unity. Saying so
         // beats an empty strip that reads as broken.
         painter.text(rect.center(), egui::Align2::CENTER_CENTER,
-                     "click to add a point — the lane rides the fader",
+                     if gate.is_some() { "click to add a point — the curve rides its clip" }
+                     else { "click to add a point — the lane rides the fader" },
                      egui::FontId::proportional(11.0), c.text_weak);
     }
     for (t, v) in &shown {
