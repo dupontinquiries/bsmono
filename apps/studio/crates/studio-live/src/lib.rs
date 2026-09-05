@@ -339,6 +339,92 @@ impl Pattern {
     }
     /// The modifiers at (ch, step), or the all-defaults `StepMod` if none
     /// were ever set — indistinguishable from "a plain hit" by design.
+    /// Bjorklund's algorithm: `pulses` hits spread as evenly as `steps`
+    /// allows, rotated by `rotate`. E(8,3) is the tresillo, E(16,5) the
+    /// bossa bell, E(12,7) the West African bell — the rhythms a drummer
+    /// reaches for first, one integer each. Returned as a row mask so it
+    /// slots straight into `rows`.
+    pub fn euclid(steps: u32, pulses: u32, rotate: u32) -> u64 {
+        let steps = steps.clamp(1, 64);
+        let pulses = pulses.min(steps);
+        if pulses == 0 { return 0; }
+        // Bjorklund's recursion proper (the SNS timing-system algorithm
+        // Toussaint's paper is about): distribute the remainders level by
+        // level. Bresenham gives the same necklace but a different first
+        // hit, and E(8,3) is written x..x..x., not x..x.x.., so the spelling
+        // matters.
+        let mut counts: Vec<u32> = Vec::new();
+        let mut remainders: Vec<u32> = vec![pulses];
+        let mut divisor = steps - pulses;
+        let mut level = 0usize;
+        loop {
+            counts.push(divisor / remainders[level]);
+            remainders.push(divisor % remainders[level]);
+            divisor = remainders[level];
+            level += 1;
+            if remainders[level] <= 1 { break; }
+        }
+        counts.push(divisor);
+        fn build(level: i64, counts: &[u32], remainders: &[u32], out: &mut Vec<bool>) {
+            if level == -1 { out.push(false); }
+            else if level == -2 { out.push(true); }
+            else {
+                for _ in 0..counts[level as usize] { build(level - 1, counts, remainders, out); }
+                if remainders[level as usize] != 0 { build(level - 2, counts, remainders, out); }
+            }
+        }
+        let mut bits: Vec<bool> = Vec::with_capacity(steps as usize);
+        build(level as i64, &counts, &remainders, &mut bits);
+        bits.truncate(steps as usize);
+        let mut mask = 0u64;
+        for (i, b) in bits.iter().enumerate() { if *b { mask |= 1 << i; } }
+        // Start on a hit, as every notation does.
+        let first = mask.trailing_zeros();
+        let width = steps;
+        let rot = |m: u64, by: u32| -> u64 {
+            let by = by % width;
+            if by == 0 { return m; }
+            let full = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+            ((m >> by) | (m << (width - by))) & full
+        };
+        let normalised = rot(mask, first);
+        // then apply the caller's rotation (to the right: later steps)
+        let by = rotate % width;
+        if by == 0 { normalised } else { rot(normalised, width - by) }
+    }
+
+    /// Fill a channel's row with a euclidean rhythm, replacing what was there.
+    pub fn set_euclid(&mut self, ch: usize, pulses: u32, rotate: u32) {
+        if let Some(row) = self.rows.get_mut(ch) {
+            *row = Self::euclid(self.steps, pulses, rotate);
+        }
+    }
+
+    /// Humanise a channel: every hit gets a velocity within `amount` of 1
+    /// (0.15 = the ±15% a hand gives), drawn from a hash of (seed, channel,
+    /// step) so the same seed always plays the same take — a groove you can
+    /// keep or re-roll, never a different one on every playback. Off-beat
+    /// steps lean softer than on-beat ones, which is what a hand does.
+    pub fn humanize(&mut self, ch: usize, amount: f32, seed: u32) {
+        let amount = amount.clamp(0.0, 0.5);
+        let Some(&row) = self.rows.get(ch) else { return };
+        for step in 0..self.steps {
+            if row & (1 << step) == 0 { continue; }
+            let h = Self::hash3(seed, ch as u32, step);
+            let r = (h % 10_000) as f32 / 10_000.0 * 2.0 - 1.0; // −1..1
+            let lean = if step % 4 == 0 { 0.0 } else { -0.3 };
+            let vel = (1.0 + amount * (r * 0.7 + lean)).clamp(0.2, 1.0);
+            let mut m = self.mod_at(ch, step);
+            m.vel = vel;
+            self.mods.insert((ch, step), m);
+        }
+    }
+
+    fn hash3(a: u32, b: u32, c: u32) -> u32 {
+        let mut h = a.wrapping_mul(0x9E37_79B9) ^ b.wrapping_mul(0x85EB_CA6B) ^ c.wrapping_mul(0xC2B2_AE35);
+        h ^= h >> 15; h = h.wrapping_mul(0x2C1B_3C6D); h ^= h >> 12; h
+    }
+
     pub fn mod_at(&self, ch: usize, step: u32) -> StepMod {
         self.mods.get(&(ch, step)).copied().unwrap_or_default()
     }
@@ -2582,5 +2668,55 @@ mod gated_synth_tests {
         let ratio = octave / base.max(1.0);
         assert!((ratio - 2.0).abs() < 0.06,
                 "an octave in the roll is an octave out of the synth: {ratio}");
+    }
+}
+
+#[cfg(test)]
+mod rhythm_tests {
+    use super::*;
+
+    fn show(mask: u64, steps: u32) -> String {
+        (0..steps).map(|i| if mask & (1 << i) != 0 { 'x' } else { '.' }).collect()
+    }
+
+    #[test]
+    fn the_named_euclidean_rhythms_come_out_as_written() {
+        assert_eq!(show(Pattern::euclid(8, 3, 0), 8), "x..x..x.", "tresillo");
+        assert_eq!(show(Pattern::euclid(8, 5, 0), 8), "x.xx.xx.", "cinquillo");
+        assert_eq!(show(Pattern::euclid(16, 5, 0), 16), "x..x..x..x..x...", "bossa bell");
+        // E(12,7): Toussaint writes x.xx.x.xx.x.; Bjorklund's recursion lands one
+        // rotation over. Same necklace — assert that, since the spelling differs by
+        // implementation and the rhythm does not.
+        let bell = Pattern::euclid(12, 7, 0);
+        assert!((0..12).any(|r| show(Pattern::euclid(12, 7, r), 12) == "x.xx.x.xx.x."), "{}", show(bell, 12));
+        assert_eq!(show(Pattern::euclid(4, 4, 0), 4), "xxxx");
+        assert_eq!(show(Pattern::euclid(8, 0, 0), 8), "........");
+        assert_eq!(show(Pattern::euclid(8, 9, 0), 8), "xxxxxxxx", "pulses cap at steps");
+    }
+
+    #[test]
+    fn rotation_moves_the_hits_later_and_wraps() {
+        assert_eq!(show(Pattern::euclid(8, 3, 1), 8), ".x..x..x");
+        assert_eq!(show(Pattern::euclid(8, 3, 8), 8), "x..x..x.", "a full turn is identity");
+        assert_eq!(Pattern::euclid(8, 3, 3).count_ones(), 3);
+    }
+
+    #[test]
+    fn humanise_is_bounded_deterministic_and_softer_off_the_beat() {
+        let mut p = Pattern::new("h", 16, 2);
+        p.set_euclid(0, 16, 0);
+        p.humanize(0, 0.15, 7);
+        let a: Vec<f32> = (0..16).map(|s| p.mod_at(0, s).vel).collect();
+        assert!(a.iter().all(|v| (0.55..=1.0).contains(v)), "{a:?}");
+        let on: f32 = [0, 4, 8, 12].iter().map(|&s| a[s]).sum::<f32>() / 4.0;
+        let off: f32 = (0..16).filter(|s| s % 4 != 0).map(|s| a[s]).sum::<f32>() / 12.0;
+        assert!(on > off, "on-beat {on} should lean louder than off-beat {off}");
+        let mut q = Pattern::new("h", 16, 2);
+        q.set_euclid(0, 16, 0);
+        q.humanize(0, 0.15, 7);
+        assert_eq!((0..16).map(|s| q.mod_at(0, s).vel).collect::<Vec<_>>(), a, "same seed, same take");
+        q.humanize(0, 0.15, 8);
+        assert_ne!((0..16).map(|s| q.mod_at(0, s).vel).collect::<Vec<_>>(), a, "a new seed is a new take");
+        assert!(p.mod_at(1, 0).vel == 1.0, "the other channel is untouched");
     }
 }
