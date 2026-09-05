@@ -19,6 +19,8 @@ pub mod panels;
 pub mod ble;
 #[cfg(feature = "ble")]
 pub mod hap;
+#[cfg(feature = "ble")]
+pub mod hap_rs;
 
 use std::time::{Duration, Instant};
 use switcheroo_core::{Backend, Command, DemoBackend, DeviceId, Hub};

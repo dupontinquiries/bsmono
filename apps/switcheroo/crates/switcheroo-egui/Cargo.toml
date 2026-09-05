@@ -13,6 +13,11 @@ required-features = ["app"]
 switcheroo-core = { path = "../switcheroo-core" }
 # The HomeKit protocol. Headless; only `hap.rs` (behind `ble`) drives it over a radio.
 hap-core = { path = "../hap-core" }
+# The published hap-rust stack: SRP cross-verified against aiohomekit traces
+# and real accessories, plus mDNS, the accessory database and Thread
+# provisioning. `crate::hap_rs` uses it; `crate::hap` keeps the hand-rolled
+# path until this one is confirmed on hardware.
+hap-controller = { version = "3", features = ["ble"] }
 # THE SHARED KIT. switcheroo was the only egui app in the fleet not on it: no
 # palette, eight hardcoded colours, and — because the symbol fonts are
 # installed by `apply_palette` — its own star and refresh glyphs rendering as
