@@ -105,6 +105,10 @@ pub const CARDS: &[Card] = &[
     Card { command: "/cancel", signature: "/cancel",
            summary: "Drop a model request in flight. The worker finishes; its answer is discarded.",
            example: "/cancel", arg_words: &[] },
+    Card { command: "/refine", signature: "/refine [vary|trim|depth|settle|green|all]",
+           summary: "Small detail passes over your last build. No model needed; each undoes on its own.",
+           example: "/refine trim",
+           arg_words: &["vary", "trim", "depth", "settle", "green", "all"] },
     Card { command: "/repair", signature: "/repair",
            summary: "Ask the model to fix only the lines of its last plan that failed.",
            example: "/repair", arg_words: &[] },
@@ -604,7 +608,7 @@ mod tests {
         const PARSER_VERBS: &[&str] = &[
             "/build", "/plan", "/commit", "/undo", "/focus", "/anim",
             "/model", "/provider", "/keys", "/find", "/locate",
-            "/cancel", "/land", "/world", "/shot", "/repair", "/deferred",
+            "/cancel", "/land", "/world", "/shot", "/repair", "/deferred", "/refine",
         ];
         for v in PARSER_VERBS {
             assert!(card_for(v).is_some(), "{v} has no card, so nobody will find it");

@@ -120,6 +120,9 @@ pub struct ChatSession {
     last_inverse: Vec<(i32, i32, i32, u16)>,
     /// The referent for follow-up turns.
     pub last_build: Option<LastBuild>,
+    /// Seed for the refinement ladder, so re-running a rung reproduces
+    /// it and running the next one does not repeat the last one's noise.
+    pub refine_seed: i32,
     /// Lines the model got wrong on the last turn, for `/repair`.
     pub last_salvage: Option<crate::recovery::Salvage>,
     /// Blocks that could not be placed because their chunk was not
@@ -148,6 +151,7 @@ impl ChatSession {
     pub fn new(chunk_size: i32, from_y: i32) -> Self {
         Self { budget: 200_000, chunk_size, from_y, profile: Profile::GroundUp,
                climate: (0.5, 0.5), sea_level: 64, scene_radius: 24, two_pass: false,
+               refine_seed: 1,
                ..Default::default() }
     }
 
@@ -233,6 +237,19 @@ impl ChatSession {
         let pad = 3;
         a.0 >= lb.min.0 - pad && a.0 <= lb.max.0 + pad
             && a.2 >= lb.min.2 - pad && a.2 <= lb.max.2 + pad
+    }
+
+    /// The refinement ladder for the last build, read from the site.
+    pub fn refine_ladder<W: VoxelWorld>(&self, tools: &VoxelTools<W>, gaze: &Gaze)
+        -> Option<Vec<crate::refine::Rung>> {
+        let lb = self.last_build.as_ref()?;
+        let amb = tools.read_ambient(lb.min.0, lb.min.2, self.from_y,
+                                     self.climate.0, self.climate.1, self.sea_level);
+        let ws = crate::land::Workset {
+            id: "last".into(), name: lb.name.clone(), owner: String::new(),
+            members: vec![], min: lb.min, max: lb.max, turns: vec![] };
+        let _ = gaze;
+        Some(crate::refine::ladder(&ws, &amb, self.refine_seed))
     }
 
     /// A macro the prose names, expanded against the last build, so it
@@ -953,5 +970,35 @@ mod tests {
             Reply::Say(m) => assert!(m.contains("rejected"), "{m}"),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn refining_the_last_build_needs_no_model_and_actually_changes_it() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        s.receive_plan(&mut t, &g, "# hut\nenclose @-5,-5 @5,5 h=5 block=stone\n");
+        s.commit(&mut t, &g);
+        let before = (60..75).flat_map(|y| (-6..=6).map(move |x| (x, y)))
+            .filter(|(x, y)| t.world.get(*x, *y, -5) != 0).count();
+
+        let rungs = s.refine_ladder(&t, &g).expect("a build to refine");
+        assert_eq!(rungs.len(), 5);
+        // run the first two rungs and check the wall actually changed
+        for r in rungs.iter().take(2) {
+            match s.receive_plan(&mut t, &g, &r.ir) {
+                Reply::Preview { blocks, .. } =>
+                    assert!(blocks > 0, "rung '{}' changed nothing", r.name),
+                o => panic!("rung '{}': {o:?}", r.name),
+            }
+            s.commit(&mut t, &g);
+        }
+        let mixed: std::collections::BTreeSet<u16> = (60..75)
+            .flat_map(|y| (-6..=6).map(move |x| (x, y)))
+            .map(|(x, y)| t.world.get(x, y, -5))
+            .filter(|b| *b != 0).collect();
+        assert!(mixed.len() > 1, "the wall is no longer one material: {mixed:?}");
+        assert!(before > 0);
     }
 }

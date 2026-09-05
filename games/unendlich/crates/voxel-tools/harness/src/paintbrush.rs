@@ -601,6 +601,36 @@ impl Paintbrush {
                 log::info!("[paintbrush] shot {kind} of {name}: {} poses", poses.len());
                 Pending::Camera(poses)
             }
+            Command::Refine(which) => {
+                let view = WorldView(cm);
+                let mut staged = StagedWorld::new(&view);
+                let tools = VoxelTools::new(&mut staged);
+                let Some(rungs) = self.session.refine_ladder(&tools, gaze) else {
+                    self.say("nothing to refine -- build something first");
+                    return Pending::None;
+                };
+                let ir = match which.as_deref() {
+                    None => { self.say(voxel_tools::refine::menu(&rungs)); return Pending::None; }
+                    Some("all") => voxel_tools::refine::all(&rungs),
+                    Some(name) => match voxel_tools::refine::rung(&rungs, name) {
+                        Some(r) => { self.say(format!("{}: {}", r.name, r.what)); r.ir.clone() }
+                        None => {
+                            self.say(format!("no pass '{name}'; try: {}",
+                                rungs.iter().map(|r| r.name).collect::<Vec<_>>().join(", ")));
+                            return Pending::None;
+                        }
+                    },
+                };
+                drop(tools);
+                // A refinement is a plan like any other: previewed,
+                // committed and undone on its own, which is the whole
+                // reason it is a ladder rather than one "finish" button.
+                let mut staged2 = StagedWorld::new(&view);
+                let mut tools2 = VoxelTools::new(&mut staged2);
+                let r = self.session.receive_plan_for(&mut tools2, gaze, &ir, None);
+                self.push(r);
+                Pending::None
+            }
             Command::Repair => {
                 match self.session.repair_prompt() {
                     None => { self.say("nothing to repair -- the last plan had no bad lines"); Pending::None }

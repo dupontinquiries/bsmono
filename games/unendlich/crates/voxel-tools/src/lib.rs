@@ -91,6 +91,8 @@ pub mod camera;
 pub mod mood;
 /// Recovery: salvage, dependent rollback, deferred retries, journal replay.
 pub mod recovery;
+/// Refinement: small graduated detail passes after the big plan.
+pub mod refine;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.

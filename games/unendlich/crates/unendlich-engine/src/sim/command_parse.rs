@@ -142,6 +142,9 @@ pub enum Command {
     Cancel,
     /// `/repair` — ask the model to fix only the lines it got wrong.
     Repair,
+    /// `/refine [rung|all]` — small detail passes over the last build.
+    /// No argument lists them.
+    Refine(Option<String>),
     /// `/deferred [drop]` — blocks waiting for their chunk to load.
     Deferred { drop: bool },
     /// `/land` — list claims here; `/land info <id>`; `/land add <id> <player>`.
@@ -267,6 +270,11 @@ pub fn parse(line: &str) -> Command {
         "/keys" => if args.is_empty() { Command::Keys } else { Command::Unknown },
         "/cancel" => if args.is_empty() { Command::Cancel } else { Command::Unknown },
         "/repair" => if args.is_empty() { Command::Repair } else { Command::Unknown },
+        "/refine" => match args.as_slice() {
+            [] => Command::Refine(None),
+            [r] => Command::Refine(Some(r.to_ascii_lowercase())),
+            _ => Command::Unknown,
+        },
         "/deferred" => match args.as_slice() {
             [] => Command::Deferred { drop: false },
             [d] if d.eq_ignore_ascii_case("drop") => Command::Deferred { drop: true },
@@ -438,6 +446,8 @@ impl Command {
             Command::Keys => Some("/keys".to_string()),
             Command::Cancel => Some("/cancel".to_string()),
             Command::Repair => Some("/repair".to_string()),
+            Command::Refine(None) => Some("/refine".to_string()),
+            Command::Refine(Some(r)) => Some(format!("/refine {r}")),
             Command::Deferred { drop: false } => Some("/deferred".to_string()),
             Command::Deferred { drop: true } => Some("/deferred drop".to_string()),
             Command::Land(LandOp::Here) => Some("/land".to_string()),
@@ -759,6 +769,17 @@ mod tests {
         assert_eq!(parse("/deferred DROP"), Command::Deferred { drop: true });
         assert_eq!(parse("/deferred keep"), Command::Unknown);
         for c in [Command::Repair, Command::Deferred { drop: true }] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c);
+        }
+    }
+
+    #[test]
+    fn refine_parses_and_round_trips() {
+        assert_eq!(parse("/refine"), Command::Refine(None));
+        assert_eq!(parse("/refine trim"), Command::Refine(Some("trim".into())));
+        assert_eq!(parse("/refine ALL"), Command::Refine(Some("all".into())));
+        assert_eq!(parse("/refine a b"), Command::Unknown);
+        for c in [Command::Refine(None), Command::Refine(Some("vary".into()))] {
             assert_eq!(parse(&c.to_command_string().unwrap()), c);
         }
     }

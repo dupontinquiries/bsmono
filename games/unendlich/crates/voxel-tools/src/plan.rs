@@ -394,7 +394,16 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                 None => None,
             }
         };
-        let mut bad = |m: String| issues.push(Issue { severity: Severity::Error, op: idx, message: m });
+        // EVERY parse error carries its line number. `recovery::salvage`
+        // identifies bad lines by parsing "line N" out of the message,
+        // so an error without one is invisible to it -- the salvage
+        // finds nothing to drop, concludes the plan is clean, and the
+        // whole thing is rejected on the errors anyway. That is exactly
+        // what happened to a 1B whose fifth line was a malformed
+        // restyle: four good lines thrown away with it.
+        let mut bad = |m: String| issues.push(Issue {
+            severity: Severity::Error, op: idx,
+            message: format!("line {}: {m}", lineno + 1) });
         let blk = |d: &str| resolve_block(&kv(&t, "block").unwrap_or_else(|| d.to_string()));
         let hollow = t.contains(&"hollow");
 
@@ -760,9 +769,12 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     _ => bad("fill needs two x,y,z triples".into()),
                 }
             }
+            // "line N:" PREFIX, not a trailing parenthetical: salvage
+            // parses the first "line " it finds, and a suffix form put
+            // the number after the text where it was never looked for.
             other => issues.push(Issue {
                 severity: Severity::Error, op: idx,
-                message: format!("unknown op '{other}' (line {})", lineno + 1) }),
+                message: format!("line {}: unknown op '{other}'", lineno + 1) }),
         }
         for n in notes.drain(..) {
             issues.push(Issue { severity: Severity::Warning, op: ops.len().max(1),
@@ -1636,6 +1648,47 @@ scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
                 assert_eq!(name.as_deref(), Some("Alex"));
             }
             o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn the_exact_reply_that_was_rejected_now_salvages() {
+        // From the field: a 1B whose fifth line was a malformed restyle.
+        // Four good lines were thrown away with it because the error
+        // carried no line number and `salvage` could not see it.
+        let ir = "# tower\n\
+                  terraform @-5,-5 @5,5 smooth block=stone\n\
+                  cylinder @0,0 r=3 h=11 block=stone hollow\n\
+                  roof @-3,-3 @3,3 hip block=dark_oak_planks\n\
+                  restyle stone ruined\n\
+                  tree @8,4 oak h=7\n";
+        let (_, issues) = parse_plan_at(ir, Some((0, 65, 0)));
+        let errs: Vec<&Issue> = issues.iter()
+            .filter(|i| i.severity == Severity::Error).collect();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].message.starts_with("line 5:"),
+                "the error must name its line or salvage cannot use it: {}", errs[0].message);
+
+        let s = crate::recovery::salvage(ir, &issues);
+        assert_eq!(s.bad.len(), 1, "one line dropped, not the plan");
+        assert!(s.bad[0].1.contains("restyle"));
+        assert!(!s.is_total_loss());
+        let (plan, clean) = parse_plan_at(&s.good, Some((0, 65, 0)));
+        assert!(clean.iter().all(|i| i.severity != Severity::Error));
+        assert_eq!(plan.ops.len(), 4, "the four good ops survive");
+    }
+
+    #[test]
+    fn every_parse_error_names_its_line() {
+        // The property, not the instance: salvage depends on it for all
+        // of them, so one bare message reintroduces the bug.
+        let ir = "cylinder\nfrobnicate\nrestyle stone ruined\nmirror @0,0,0\n                  form nosuchform @0,0 @4,4\nmood nosuchmood @0,0 @4,4\n";
+        let (_, issues) = parse_plan_at(ir, Some((0, 65, 0)));
+        let errs: Vec<&Issue> = issues.iter()
+            .filter(|i| i.severity == Severity::Error).collect();
+        assert!(errs.len() >= 4, "several distinct failures: {errs:?}");
+        for e in errs {
+            assert!(e.message.starts_with("line "), "bare error message: {}", e.message);
         }
     }
 }

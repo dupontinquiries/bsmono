@@ -299,4 +299,20 @@ fn macro_scenario() {
     if let Pending::Camera(poses) = pb.dispatch(&cm, &gaze, cmd) {
         println!("  orbit: {} poses", poses.len());
     }
+
+    // the refinement ladder: small passes, no model
+    println!("\n==== refinement ladder");
+    let cmd = line(&mut pb, "/refine").unwrap();
+    pb.dispatch(&cm, &gaze, cmd);
+    for l in pb.drain_log() { for m in l.lines() { println!("  {m}"); } }
+    for rung in ["vary", "trim", "settle"] {
+        let cmd = line(&mut pb, &format!("/refine {rung}")).unwrap();
+        pb.dispatch(&cm, &gaze, cmd);
+        let planned = pb.drain_log().iter().find(|l| l.contains("blocks planned")).cloned();
+        let cmd = line(&mut pb, "/commit").unwrap();
+        pb.dispatch(&cm, &gaze, cmd);
+        let built = pb.drain_log().iter().find(|l| l.contains("built")).cloned();
+        println!("  {rung:8} {} -> {}", planned.unwrap_or_default().trim(),
+                 built.unwrap_or_default().trim());
+    }
 }
