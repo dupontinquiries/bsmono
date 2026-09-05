@@ -774,6 +774,11 @@ struct VoicetermApp {
     /// edges come from text. Holding the SOURCE means the graph redraws when
     /// the text changes, which is the point of a live diagram.
     graph_source: String,
+    /// Which graph the pane draws: the deck's notes (the real zettelkasten,
+    /// linked by `[[wikilink]]`) or the typed niftyplot scratch document.
+    /// Defaults to the notes — the scratch buffer is a diagramming tool that
+    /// happens to share this view.
+    graph_from_notes: bool,
     // The settings screen (QML settings page) renders when `surfaces` says
     // `Surface::Settings`; edits apply live (App::apply_settings + palette
     // each frame) and persist to prefs.kv on change.
@@ -2951,49 +2956,64 @@ impl eframe::App for VoicetermApp {
                                 .weak().size(10.0));
                         }
                         ui.separator();
-                        // Parsed from the source, exactly as the Qt bin's
-                        // nifty_topology does: parse, then take ids and edges.
-                        ui.add(egui::TextEdit::multiline(&mut self.graph_source).id_salt("voiceterm_egui-self_graph_source")
-                               .desired_rows(3).hint_text("graph source"));
-                        let doc = nifty_core::niftyplot::parse(&self.graph_source);
-                        if doc.nodes.is_empty() {
-                            // An empty graph is a real state — an unwritten
-                            // diagram — but it must SAY so rather than drawing
-                            // an empty ring that looks like a failed render.
-                            ui.colored_label(c.text_weak, "no nodes — type a graph above");
+                        // WHICH GRAPH. This pane could only ever draw the typed
+                        // scratch document. The notes themselves — the actual
+                        // zettelkasten, already the corpus that backlinks and
+                        // TF-IDF are rebuilt from — had no way in. Both sources
+                        // now produce (ids, topology) or say why they cannot,
+                        // and ONE draw path below gets the focus seeding, the
+                        // depth controls and the breadcrumbs, so the notes are
+                        // not given a lesser view than the scratch buffer.
+                        ui.horizontal(|ui| {
+                            ui.colored_label(c.text_weak, "graph of:");
+                            ui.selectable_value(&mut self.graph_from_notes, true, "my notes");
+                            ui.selectable_value(&mut self.graph_from_notes, false, "typed source");
+                        });
+                        let built: Option<(Vec<String>, voiceterm_egui::graph_view::nifty::Topology)> =
+                        if self.graph_from_notes {
+                            let notes: Vec<(String, String)> = self.deck.cards.iter()
+                                .map(|card| (card.title.clone(), card.body.clone())).collect();
+                            if notes.is_empty() {
+                                ui.colored_label(c.text_weak,
+                                    "no notes yet — capture some, or switch to the typed source");
+                                None
+                            } else {
+                                Some((notes.iter().map(|(t, _)| t.clone()).collect(),
+                                      voiceterm_egui::graph_view::topology_from_notes(&notes)))
+                            }
                         } else {
-                            let ids: Vec<String> = doc.nodes.iter().map(|n| n.id.clone()).collect();
-                            let edges: Vec<(String, String)> = doc.edges.iter()
-                                .map(|e| (e.from.clone(), e.to.clone())).collect();
-                            // SEED THE FOCUS. `GraphView::layout` returns
-                            // nothing at all while `focus` is empty (see its
-                            // early return), and nothing here ever set it —
-                            // so a freshly typed graph rendered "no graph
-                            // loaded" forever, indistinguishable from a parse
-                            // failure, no matter how many nodes it had. Reset
-                            // rather than route through `focus_on` when the
-                            // current focus isn't even IN this graph (a fresh
-                            // one, or the source changed under it): pushing a
-                            // breadcrumb to a node that doesn't exist in the
-                            // topology being drawn is worse than no
-                            // breadcrumb.
+                            // Parsed from the source, exactly as the Qt bin's
+                            // nifty_topology does: parse, then take ids and edges.
+                            ui.add(egui::TextEdit::multiline(&mut self.graph_source).id_salt("voiceterm_egui-self_graph_source")
+                                   .desired_rows(3).hint_text("graph source"));
+                            let doc = nifty_core::niftyplot::parse(&self.graph_source);
+                            if doc.nodes.is_empty() {
+                                // An empty graph is a real state — an unwritten
+                                // diagram — but it must SAY so rather than drawing
+                                // an empty ring that looks like a failed render.
+                                ui.colored_label(c.text_weak, "no nodes — type a graph above");
+                                None
+                            } else {
+                                let ids: Vec<String> = doc.nodes.iter().map(|n| n.id.clone()).collect();
+                                let edges: Vec<(String, String)> = doc.edges.iter()
+                                    .map(|e| (e.from.clone(), e.to.clone())).collect();
+                                Some((ids.clone(),
+                                      voiceterm_egui::graph_view::nifty::Topology::new(&ids, &edges)))
+                            }
+                        };
+                        if let Some((ids, topo)) = built {
+                            // SEED THE FOCUS. `GraphView::layout` returns nothing
+                            // while `focus` is empty, and a focus that is not IN
+                            // the graph being drawn is reset rather than
+                            // breadcrumbed to a node that does not exist.
                             if !ids.iter().any(|id| *id == self.graph.focus) {
                                 if let Some(first) = ids.first() {
                                     self.graph.focus = first.clone();
                                     self.graph.trail.clear();
                                 }
                             }
-                            let topo = voiceterm_egui::graph_view::nifty::Topology::new(&ids, &edges);
-                            // DEPTH AND BACK. `GraphView::deeper`/`shallower`/
-                            // `back` have been unit-tested since before this
-                            // pane existed (depth_is_capped_because_a_full_
-                            // graph_is_a_hairball, among others) and the
-                            // module's own header lists "depth control" as
-                            // one of four things this view adds over the
-                            // bare ring layout — but nothing here ever called
-                            // them, so a graph past a couple hops had no way
-                            // to narrow, and wandering into it (breadcrumbs
-                            // were already drawn) had no way back.
+                            // DEPTH AND BACK: unit-tested since before this pane
+                            // existed, but nothing called them until now.
                             ui.horizontal(|ui| {
                                 if ui.small_button("−").clicked() { self.graph.shallower(); }
                                 ui.label(format!("depth {}", self.graph.depth));
@@ -4933,6 +4953,7 @@ fn main() -> eframe::Result<()> {
                 bar_note: String::new(),
                 web_prefs: voiceterm_egui::web_prefs::load(),
                 graph_source: String::new(),
+                graph_from_notes: true,
             };
             // Set once, here, rather than left for the assistant's first
             // reply to explain (the previous state — see b6e55cf5's commit
