@@ -95,6 +95,10 @@ pub struct PipelineConfig {
     /// Pairwise phase-correlation confidence below which a frame's motion
     /// is held rather than accumulated into the plate placement.
     pub plate_min_confidence: f32,
+    /// Seed the block motion search with each frame's global motion (phase
+    /// correlation, one estimate per frame pair). Lets the diamond search
+    /// reach pans beyond its radius; costs one phase correlation per frame.
+    pub mv_seed: bool,
 }
 
 impl Default for PipelineConfig {
@@ -112,6 +116,7 @@ impl Default for PipelineConfig {
             block_cache_bytes: 0,
             plate_window: 0,
             plate_min_confidence: 0.2,
+            mv_seed: false,
         }
     }
 }
@@ -212,8 +217,9 @@ struct WindowReader {
     bs: u32,
     noise: u8,
     index: u64,
-    /// First frame of the next window, already prepared.
-    pending: Option<Frame>,
+    /// First frame of the next window, already prepared, with its motion
+    /// relative to the frame before it (None across a cut).
+    pending: Option<(Frame, Option<(f32, f32)>)>,
     done: bool,
     pc: Option<PhaseCorrelation>,
     /// `D2X_PLATE_DEBUG=1`: print every pair's motion and every window.
@@ -227,9 +233,18 @@ struct Window {
     frames: Vec<Frame>,
     disp: Vec<(f32, f32)>,
     confidence: Vec<f32>,
+    /// Each frame's motion relative to its predecessor (`cur[x] ≈
+    /// prev[x − dx]`); `None` for the first frame after a cut or at the
+    /// start of the source.
+    pair: Vec<Option<(f32, f32)>>,
 }
 
 impl Window {
+    /// The block-search hint for frame `i`: where its content sits in the
+    /// previous frame, as a source offset.
+    fn hint(&self, i: usize) -> Option<(i64, i64)> {
+        self.pair[i].map(|(dx, dy)| (-(dx.round() as i64), -(dy.round() as i64)))
+    }
     fn plate(&self, min_confidence: f32) -> Plate {
         let refs: Vec<&Frame> = self.frames.iter().collect();
         let _ = min_confidence; // motion below it already ended the window
@@ -259,10 +274,10 @@ impl WindowReader {
         }
     }
     fn next_window(&mut self) -> anyhow::Result<Option<Window>> {
-        let first = match self.pending.take() {
+        let (first, first_pair) = match self.pending.take() {
             Some(f) => f,
             None => match self.read_one()? {
-                Some(f) => f,
+                Some(f) => (f, None),
                 None => return Ok(None),
             },
         };
@@ -270,9 +285,11 @@ impl WindowReader {
         if self.window > 1 && self.pc.is_none() {
             self.pc = Some(PhaseCorrelation::for_frame(first.width, first.height));
         }
-        let mut win = Window { start, frames: vec![first], disp: vec![(0.0, 0.0)], confidence: vec![1.0] };
+        let mut win = Window { start, frames: vec![first], disp: vec![(0.0, 0.0)], confidence: vec![1.0], pair: vec![first_pair] };
         let (mut ax, mut ay) = (0.0f32, 0.0f32);
-        while win.frames.len() < self.window {
+        // Read one frame past the window so the next window's first frame
+        // also gets its motion hint; that frame waits in `pending`.
+        while self.window > 1 {
             match self.read_one()? {
                 Some(f) => {
                     let last = win.frames.last().unwrap();
@@ -282,7 +299,11 @@ impl WindowReader {
                         eprintln!("plate: frame {:6} motion ({:+7.2}, {:+7.2}) conf {:.2}{}", self.index - 1, m.dx, m.dy, m.confidence, if cut { "  CUT" } else { "" });
                     }
                     if cut {
-                        self.pending = Some(f);
+                        self.pending = Some((f, None));
+                        break;
+                    }
+                    if win.frames.len() >= self.window {
+                        self.pending = Some((f, Some((m.dx, m.dy))));
                         break;
                     }
                     ax += m.dx;
@@ -290,6 +311,7 @@ impl WindowReader {
                     win.frames.push(f);
                     win.disp.push((ax, ay));
                     win.confidence.push(m.confidence);
+                    win.pair.push(Some((m.dx, m.dy)));
                 }
                 None => break,
             }
@@ -369,6 +391,9 @@ pub fn run_tiered_with_cache(
     let cache_a = cache.clone();
     let cache_b = cache;
     let (plate_window, plate_conf) = (cfg.plate_window, cfg.plate_min_confidence);
+    // The reader needs pairwise motion for hints even without plates.
+    let reader_window = if plate_window > 1 { plate_window } else if cfg.mv_seed { 2 } else { 1 };
+    let mv_seed = cfg.mv_seed;
 
     // Stage A.
     let analyzer = std::thread::Builder::new().name("d2x-analyze".into()).spawn(move || {
@@ -376,7 +401,7 @@ pub fn run_tiered_with_cache(
         let mut prev_working: Option<Frame> = None;
         let mut ring: Ring<Frame> = Ring::new(recent_refs, keyframe_refs);
         let mut state = AnalyzeState { streak: Vec::new(), cache: cache_a };
-        let mut reader = WindowReader::new(source, plate_window, acfg.min_psnr, plate_conf, bs, noise);
+        let mut reader = WindowReader::new(source, reader_window, acfg.min_psnr, plate_conf, bs, noise);
         'windows: loop {
             let t_win = Instant::now();
             let win = match reader.next_window() {
@@ -389,9 +414,11 @@ pub fn run_tiered_with_cache(
             };
             let plate = if plate_window > 1 && win.frames.len() > 1 { Some(win.plate(plate_conf)) } else { None };
             let (start, n_win) = (win.start, win.frames.len() as u64);
+            let hints: Vec<Option<(i64, i64)>> = (0..win.frames.len()).map(|i| if mv_seed { win.hint(i) } else { None }).collect();
             for (i, frame) in win.frames.into_iter().enumerate() {
                 let t0 = Instant::now();
                 let index = start + i as u64;
+                let hint = hints[i];
                 let plate_msg = if i == 0 { plate.as_ref().map(|p| (p.lo.clone(), n_win)) } else { None };
                 let view = plate.as_ref().map(|p| p.view(i));
                 let mut work = match prev_working.take() {
@@ -403,7 +430,7 @@ pub fn run_tiered_with_cache(
                     }
                     Some(mut prev) => {
                         let older = ring.refs();
-                        let r = analyze_tiered(&mut prev, &frame, &older, view, reference, matcher.as_ref(), &acfg, n_tiers, &mut state);
+                        let r = analyze_tiered(&mut prev, &frame, &older, view, hint, reference, matcher.as_ref(), &acfg, n_tiers, &mut state);
                         match r {
                             Ok((plan, working_next, cached)) => {
                                 let residual = make_residual(&frame, &plan, bleed);
@@ -597,7 +624,8 @@ pub fn analyze_only(
     let mut heavy_sum = 0.0;
     let mut plate_sum = 0.0;
     let mut frame_area = 0.0;
-    let mut reader = WindowReader::new(source, cfg.plate_window, cfg.analyze.min_psnr, cfg.plate_min_confidence, bs, cfg.noise);
+    let reader_window = if cfg.plate_window > 1 { cfg.plate_window } else if cfg.mv_seed { 2 } else { 1 };
+    let mut reader = WindowReader::new(source, reader_window, cfg.analyze.min_psnr, cfg.plate_min_confidence, bs, cfg.noise);
     while let Some(win) = reader.next_window()? {
         let t_win = Instant::now();
         if frame_area == 0.0 {
@@ -611,9 +639,11 @@ pub fn analyze_only(
             None
         };
         let start = win.start;
+        let hints: Vec<Option<(i64, i64)>> = (0..win.frames.len()).map(|i| if cfg.mv_seed { win.hint(i) } else { None }).collect();
         for (i, frame) in win.frames.into_iter().enumerate() {
             let t0 = if i == 0 { t_win } else { Instant::now() };
             index = start + i as u64;
+            let hint = hints[i];
             match prev.take() {
                 None => {
                     fraction_sum += 1.0;
@@ -625,7 +655,7 @@ pub fn analyze_only(
                 Some(mut p) => {
                     let older = ring.refs();
                     let view = plate.as_ref().map(|pl| pl.view(i));
-                    let (plan, next_w, _) = analyze_tiered(&mut p, &frame, &older, view, &reference, matcher.as_ref(), &cfg.analyze, cfg.tiers.max(1), &mut state)?;
+                    let (plan, next_w, _) = analyze_tiered(&mut p, &frame, &older, view, hint, &reference, matcher.as_ref(), &cfg.analyze, cfg.tiers.max(1), &mut state)?;
                     let fr = plan.stats.upscaled_fraction(&plan.grid, bleed);
                     fraction_sum += fr;
                     heavy_sum += plan.stats.heavy_fraction(&plan.grid, bleed);

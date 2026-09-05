@@ -36,6 +36,12 @@ pub struct AnalyzeConfig {
     pub redraw_fraction: f64,
     /// Run the per-block brightness-shift pass.
     pub fade: bool,
+    /// After the integer motion search fails the gate, try the eight
+    /// half-pel neighbours of its best candidate (bilinear). Sharp content
+    /// under sub-pixel camera motion fails an integer match by construction;
+    /// this is the cheapest thing that can catch it. Needs an even upscale
+    /// factor for the merge to stay an exact copy.
+    pub halfpel: bool,
     /// Texture thresholds (luma standard deviation, 0–255 units) for routing
     /// missing blocks to cheaper tiers: below `[0]` → tier 2 (bicubic),
     /// below `[1]` → tier 1 (cheap network), else tier 0. Only tiers the
@@ -53,7 +59,7 @@ pub struct AnalyzeConfig {
 
 impl Default for AnalyzeConfig {
     fn default() -> Self {
-        AnalyzeConfig { block_size: 30, bleed: 1, min_psnr: 5.2, redraw_fraction: 0.90, fade: true, tier_std: [1.0, 4.0], tier_metric: TierMetric::HighFreq, streak_bonus: 0.0 }
+        AnalyzeConfig { block_size: 30, bleed: 1, min_psnr: 5.2, redraw_fraction: 0.90, fade: true, halfpel: false, tier_std: [1.0, 4.0], tier_metric: TierMetric::HighFreq, streak_bonus: 0.0 }
     }
 }
 
@@ -266,7 +272,7 @@ pub fn analyze(
     cfg: &AnalyzeConfig,
 ) -> anyhow::Result<(FramePlan, Frame)> {
     let mut st = AnalyzeState::default();
-    let (plan, w, _) = analyze_tiered(prev_working, next, older, None, reference, matcher, cfg, 1, &mut st)?;
+    let (plan, w, _) = analyze_tiered(prev_working, next, older, None, None, reference, matcher, cfg, 1, &mut st)?;
     Ok((plan, w))
 }
 
@@ -277,12 +283,17 @@ pub fn analyze(
 /// SSE, and a hit sources the block from the plate's (denoised, once-
 /// upscaled) pixels rather than extending the copy chain through the
 /// previous output.
+///
+/// `mv_hint` is the frame's global motion as a source offset — the block at
+/// `(x, y)` is expected at `(x + hint.0, y + hint.1)` in `prev` — handed to
+/// [`BlockMatcher::search_from`].
 #[allow(clippy::too_many_arguments)]
 pub fn analyze_tiered(
     prev_working: &mut Frame,
     next: &Frame,
     older: &[&Frame],
     plate: Option<PlateView<'_>>,
+    mv_hint: Option<(i64, i64)>,
     reference: &dyn ReferenceMaker,
     matcher: &dyn BlockMatcher,
     cfg: &AnalyzeConfig,
@@ -354,9 +365,22 @@ pub fn analyze_tiered(
                     return BlockMatch::Plated { px, py };
                 }
             }
-            if let Some(c) = matcher.search(prev_ro, next, x, y, bs, limit) {
+            // The integer search is bounded by the gate; for half-pel
+            // refinement we want its best candidate even when that fails, so
+            // the bound is lifted only when refinement is on.
+            let ilimit = if cfg.halfpel { u64::MAX } else { limit };
+            let found = match mv_hint {
+                Some(h) => matcher.search_from(prev_ro, next, x, y, bs, ilimit, h),
+                None => matcher.search(prev_ro, next, x, y, bs, ilimit),
+            };
+            if let Some(c) = found {
                 if c.sse <= limit {
                     return BlockMatch::Moved { src_x: c.src_x, src_y: c.src_y };
+                }
+                if cfg.halfpel {
+                    if let Some(h) = refine_halfpel(prev_ro, next, x, y, bs, c, limit) {
+                        return h;
+                    }
                 }
             }
             for (r, old) in older.iter().enumerate().take(255) {
@@ -376,6 +400,7 @@ pub fn analyze_tiered(
             BlockMatch::Recalled { .. } => stats.recalled += 1,
             BlockMatch::Cached { .. } => stats.cached += 1,
             BlockMatch::Plated { .. } => stats.plated += 1,
+            BlockMatch::MovedHalf { .. } => stats.moved_half += 1,
             BlockMatch::Missing => stats.missing += 1,
         }
     }
@@ -492,12 +517,48 @@ pub fn analyze_tiered(
             BlockMatch::Moved { src_x, src_y } => working_next.copy_block(prev_working, bs, src_x, src_y, x, y),
             BlockMatch::Recalled { r } => working_next.copy_block(older[r as usize], bs, x, y, x, y),
             BlockMatch::Plated { px, py } => working_next.copy_block(plate.expect("Plated without a plate").lo, bs, px, py, x, y),
+            BlockMatch::MovedHalf { sx2, sy2 } => {
+                let b = prev_working.block_halfpel(sx2, sy2, bs);
+                working_next.copy_block(&b, bs, 0, 0, x, y);
+            }
             // Cached blocks are the frame's own content, like Missing.
             BlockMatch::Cached { .. } | BlockMatch::Missing => {}
         }
     }
 
     Ok((FramePlan { grid, matches, residuals, fades, redraw: false, stats }, working_next, cached_blocks))
+}
+
+/// The best of the eight half-pel neighbours of an integer candidate, if
+/// one passes the gate. Bilinear samples of `prev`; `block_sse` against the
+/// materialised sample (eight small blocks per failing block — cheap next
+/// to the JPEG gate, and only paid where the integer search failed).
+fn refine_halfpel(prev: &Frame, next: &Frame, x: u32, y: u32, bs: u32, c: crate::matcher::Candidate, limit: u64) -> Option<BlockMatch> {
+    let mut best: Option<(u64, u32, u32)> = None;
+    for dy2 in -1i64..=1 {
+        for dx2 in -1i64..=1 {
+            if dx2 == 0 && dy2 == 0 {
+                continue;
+            }
+            let sx2 = c.src_x as i64 * 2 + dx2;
+            let sy2 = c.src_y as i64 * 2 + dy2;
+            if sx2 < 0 || sy2 < 0 {
+                continue;
+            }
+            let (sx2, sy2) = (sx2 as u32, sy2 as u32);
+            if sx2 / 2 + bs + (sx2 % 2) > prev.width || sy2 / 2 + bs + (sy2 % 2) > prev.height {
+                continue;
+            }
+            let b = prev.block_halfpel(sx2, sy2, bs);
+            let lim = best.map_or(limit, |b| b.0);
+            if let Some(sse) = block_sse_bounded(next, x, y, &b, 0, 0, bs, lim) {
+                if best.map_or(true, |b| sse < b.0) {
+                    best = Some((sse, sx2, sy2));
+                }
+            }
+        }
+    }
+    best.map(|(_, sx2, sy2)| BlockMatch::MovedHalf { sx2, sy2 })
 }
 
 /// Debug aid: the SSE of the reconstruction against the true next frame,
@@ -656,7 +717,7 @@ mod tier_tests {
         }
         let mut w = prev.clone();
         let mut st = AnalyzeState::default();
-        let (plan, _, _) = analyze_tiered(&mut w, &next, &[], None, &JpegReference { quality: 97 }, &Stationary, &cfg, 3, &mut st).unwrap();
+        let (plan, _, _) = analyze_tiered(&mut w, &next, &[], None, None, &JpegReference { quality: 97 }, &Stationary, &cfg, 3, &mut st).unwrap();
         assert_eq!(plan.stats.missing, 3, "{:?}", plan.stats);
         let tier_at = |x: u32| plan.residuals.iter().find(|r| r.frame_x == x && r.frame_y == 0).unwrap().tier;
         assert_eq!(tier_at(0), 2, "flat -> bicubic");
@@ -665,7 +726,7 @@ mod tier_tests {
         assert_eq!(plan.stats.residual_tiers, [(1, 1), (1, 1), (1, 1)]);
         // With a single tier everything is tier 0.
         let mut w = prev.clone();
-        let (plan1, _, _) = analyze_tiered(&mut w, &next, &[], None, &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+        let (plan1, _, _) = analyze_tiered(&mut w, &next, &[], None, None, &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
         assert!(plan1.residuals.iter().all(|r| r.tier == 0));
         assert_eq!(plan1.stats.residual_tiers[0], (2, 2));
     }
@@ -677,7 +738,7 @@ mod tier_tests {
         let mut st = AnalyzeState::default();
         let mut w = base.clone();
         for _ in 0..8 {
-            let (_, nw, _) = analyze_tiered(&mut w, &base, &[], None, &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+            let (_, nw, _) = analyze_tiered(&mut w, &base, &[], None, None, &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
             w = nw;
         }
         assert!(st.streak.iter().all(|&s| s == 8));
@@ -687,9 +748,9 @@ mod tier_tests {
         next.add_uniform_noise(2, 5);
         let mut w0 = base.clone();
         let mut fresh = AnalyzeState::default();
-        let (p_fresh, _, _) = analyze_tiered(&mut w0, &next, &[], None, &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut fresh).unwrap();
+        let (p_fresh, _, _) = analyze_tiered(&mut w0, &next, &[], None, None, &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut fresh).unwrap();
         let mut w1 = base.clone();
-        let (p_streak, _, _) = analyze_tiered(&mut w1, &next, &[], None, &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+        let (p_streak, _, _) = analyze_tiered(&mut w1, &next, &[], None, None, &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
         assert!(p_streak.stats.missing <= p_fresh.stats.missing, "streak {:?} vs fresh {:?}", p_streak.stats, p_fresh.stats);
     }
 }
@@ -728,7 +789,7 @@ mod cache_tests {
         stamp(&mut f1, 16, 16);
         let _ = base;
         let mut w = uniform.clone();
-        let (p1, _, c1) = analyze_tiered(&mut w, &f1, &[], None, &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+        let (p1, _, c1) = analyze_tiered(&mut w, &f1, &[], None, None, &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
         assert!(c1.is_empty());
         let rv = p1.residuals.iter().find(|r| (r.frame_x, r.frame_y) == (16, 16)).unwrap();
         cache.lock().unwrap().insert(rv.key, Arc::new(vec![7u8; 32 * 32 * 3]));
@@ -736,7 +797,7 @@ mod cache_tests {
         let mut f2 = uniform.clone();
         stamp(&mut f2, 32, 32);
         let mut w = f1.clone();
-        let (p2, _, c2) = analyze_tiered(&mut w, &f2, &[], None, &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+        let (p2, _, c2) = analyze_tiered(&mut w, &f2, &[], None, None, &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
         let cell = (32 / 16) + (32 / 16) * p2.grid.cols;
         assert!(matches!(p2.matches[cell as usize], BlockMatch::Cached { .. }), "{:?}", p2.matches[cell as usize]);
         assert_eq!(p2.stats.cached, 1);

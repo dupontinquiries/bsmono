@@ -69,6 +69,10 @@ pub enum BlockMatch {
     /// The block at `(px, py)` of the window's plate passes the gate. Plate
     /// coordinates; the merge reads the plate's upscale at `(px·s, py·s)`.
     Plated { px: u32, py: u32 },
+    /// The block at half-pel position `(sx2 / 2, sy2 / 2)` of the previous
+    /// frame passes the gate. In the upscaled domain that is the integer
+    /// position `(sx2·s / 2, sy2·s / 2)`, an exact copy for even scales.
+    MovedHalf { sx2: u32, sy2: u32 },
     /// Nothing in any reference passes; the block must be upscaled.
     Missing,
 }
@@ -113,6 +117,8 @@ pub struct FrameStats {
     pub cached: u32,
     /// Blocks served from the window's plate.
     pub plated: u32,
+    /// Blocks matched at a half-pel offset in the previous frame.
+    pub moved_half: u32,
     /// Residual image size in cells per tier (0×0 if none). Rectangular:
     /// `cols = ceil(sqrt(n))`, `rows = ceil(n / cols)`, so at most `cols − 1`
     /// cells are wasted instead of up to `2·sqrt(n)` for a square.

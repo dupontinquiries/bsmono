@@ -159,6 +159,46 @@ impl Frame {
         out
     }
 
+    /// The `size`×`size` block whose top-left is at `(sx2 / 2, sy2 / 2)` in
+    /// half-pel units: bilinear where an ordinate is odd, exact copy where
+    /// both are even. Rounded `(a + b + 1) >> 1` / `(a + b + c + d + 2) >> 2`,
+    /// which is exactly the 2×2 box-downsample of a 2× nearest-upscaled
+    /// frame read at that odd output offset — so this is the true low-res
+    /// mirror of what the merge copies, not an approximation of it.
+    /// Requires `sx2 / 2 + size (+1 if odd) <= width` and likewise for y.
+    pub fn block_halfpel(&self, sx2: u32, sy2: u32, size: u32) -> Frame {
+        let (x0, y0) = (sx2 / 2, sy2 / 2);
+        let (fx, fy) = (sx2 % 2 == 1, sy2 % 2 == 1);
+        debug_assert!(x0 + size + fx as u32 <= self.width && y0 + size + fy as u32 <= self.height, "block_halfpel OOB");
+        let mut out = Frame::new(size, size);
+        let rb = (size as usize) * 3;
+        for j in 0..size {
+            let d = out.idx(0, j);
+            let r0 = self.row(y0 + j, x0, x0 + size + fx as u32);
+            let r1 = if fy { self.row(y0 + j + 1, x0, x0 + size + fx as u32) } else { r0 };
+            let o = &mut out.data[d..d + rb];
+            match (fx, fy) {
+                (false, false) => o.copy_from_slice(&r0[..rb]),
+                (true, false) => {
+                    for i in 0..rb {
+                        o[i] = ((r0[i] as u16 + r0[i + 3] as u16 + 1) >> 1) as u8;
+                    }
+                }
+                (false, true) => {
+                    for i in 0..rb {
+                        o[i] = ((r0[i] as u16 + r1[i] as u16 + 1) >> 1) as u8;
+                    }
+                }
+                (true, true) => {
+                    for i in 0..rb {
+                        o[i] = ((r0[i] as u16 + r0[i + 3] as u16 + r1[i] as u16 + r1[i + 3] as u16 + 2) >> 2) as u8;
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Add uniform noise in `[-strength, strength]` to every channel, clamped.
     /// Deterministic for a given seed (a SplitMix64 stream), so a run is
     /// reproducible and tests can pin outputs.

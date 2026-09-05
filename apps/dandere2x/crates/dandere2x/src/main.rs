@@ -89,6 +89,15 @@ struct Common {
     /// trusted for plate placement (0..1).
     #[arg(long, default_value_t = 0.2)]
     plate_confidence: f32,
+    /// Seed the diamond search with each frame's global motion (phase
+    /// correlation), so pans beyond the search radius are still copies.
+    #[arg(long)]
+    mv_seed: bool,
+    /// After an integer motion match fails the gate, try its eight half-pel
+    /// neighbours (bilinear). Sub-pixel camera motion on sharp content fails
+    /// integer matching by construction. Needs an even scale (x2, x4).
+    #[arg(long)]
+    halfpel: bool,
     /// Host memory the job may hold (e.g. 96G). Default: half of MemAvailable.
     #[arg(long)]
     ram_budget: Option<String>,
@@ -268,6 +277,8 @@ fn job_from(common: &Common, input: PathBuf, output: PathBuf) -> anyhow::Result<
     j.pipeline.analyze.streak_bonus = common.streak_bonus;
     j.pipeline.plate_window = common.plate_window;
     j.pipeline.plate_min_confidence = common.plate_confidence;
+    j.pipeline.mv_seed = common.mv_seed;
+    j.pipeline.analyze.halfpel = common.halfpel;
     j.cascade_model = common.cascade.as_ref().map(|c| if c == "default" { None } else { Some(PathBuf::from(c)) });
     j.flat_bypass = common.flat_bypass;
     j.pipeline.tiers = 1 + j.cascade_model.is_some() as usize + j.flat_bypass as usize;
@@ -289,10 +300,11 @@ fn print_event(e: &Event) {
         Event::FrameDone { index, stats, analyze_time, upscale_time, merge_time } => {
             let kind = if stats.redraw { "REDRAW" } else { "" };
             eprintln!(
-                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} plt {:4} rec {:3} cache {:3} miss {:4} fade {:3}  residual {} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
+                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} half {:4} plt {:4} rec {:3} cache {:3} miss {:4} fade {:3}  residual {} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
                 stats.psnr,
                 stats.stationary,
                 stats.moved,
+                stats.moved_half,
                 stats.plated,
                 stats.recalled,
                 stats.cached,
@@ -346,7 +358,7 @@ fn main() -> anyhow::Result<()> {
             let (source, _) = job::open_source(&job)?;
             let bleed = job.pipeline.analyze.bleed;
             let summary = d2x_core::pipeline::analyze_only(source, job.pipeline, |i, s, frac, t| {
-                eprintln!("frame {i:6}  psnr {:5.1}  stat {:4} mov {:4} plt {:4} rec {:3} miss {:4} fade {:3}  upscaled {:5.1}%{}  {:.1}ms", s.psnr, s.stationary, s.moved, s.plated, s.recalled, s.missing, s.fades, frac * 100.0, if s.redraw { " REDRAW" } else { "" }, t.as_secs_f64() * 1e3);
+                eprintln!("frame {i:6}  psnr {:5.1}  stat {:4} mov {:4} half {:4} plt {:4} rec {:3} miss {:4} fade {:3}  upscaled {:5.1}%{}  {:.1}ms", s.psnr, s.stationary, s.moved, s.moved_half, s.plated, s.recalled, s.missing, s.fades, frac * 100.0, if s.redraw { " REDRAW" } else { "" }, t.as_secs_f64() * 1e3);
             })?;
             let _ = bleed;
             let total = summary.heavy_pixel_fraction + summary.plate_pixel_fraction;
