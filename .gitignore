@@ -36,3 +36,10 @@ node_modules/
 *.webm
 *.y4m
 *.ivf
+
+# egui_kittest snapshot testing: only the committed baseline (*.png without
+# one of these suffixes) belongs in the repo. *.new.png/.diff.png/.old.png
+# are per-run artifacts written on failure or UPDATE_SNAPSHOTS, not fixtures.
+*.new.png
+*.diff.png
+*.old.png

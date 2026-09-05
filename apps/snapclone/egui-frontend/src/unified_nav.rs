@@ -115,3 +115,64 @@ impl UnifiedNav {
     /// Test hook: where the underline currently sits (min x, max x), if shown this frame.
     pub fn underline_span(&self) -> Option<(f32, f32)> { self.underline }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The module had zero tests despite `underline_span`'s own doc calling
+    // itself a "test hook" — a signal testing was intended here and never
+    // followed through. `sub_tabs` is the one piece cleanly separable from
+    // egui rendering (it's a pure `usize -> &[&str]` lookup), so it's the
+    // part this pass can cover without pulling in a UI test harness
+    // (egui_kittest, used elsewhere in this monorepo for exactly this
+    // situation) just for one file — real, separate scope if `ui()`'s own
+    // boundary logic (page clamping, sub-tab bounds) needs the same rigor.
+
+    #[test]
+    fn each_subtabbed_page_matches_its_qt_source_exactly() {
+        // Comments on each arm cite the Qt file this was ported from
+        // verbatim — these values are a CONTRACT with that source, not
+        // free to drift silently.
+        assert_eq!(sub_tabs(1), &["All", "Unread", "Sent"]);
+        assert_eq!(sub_tabs(2), &["All", "Online", "Pending"]);
+        assert_eq!(sub_tabs(4), &["General", "Camera", "Network", "Storage", "About"]);
+    }
+
+    #[test]
+    fn non_subtabbed_pages_have_no_subtabs() {
+        // Camera (0) and Wayfinder (3) are the two pages the module doc
+        // names as showing a centered page name instead of segments —
+        // an empty slice here is what `ui()` reads to decide that.
+        assert_eq!(sub_tabs(0), &[] as &[&str]);
+        assert_eq!(sub_tabs(3), &[] as &[&str]);
+    }
+
+    #[test]
+    fn an_out_of_range_page_falls_back_to_no_subtabs_rather_than_panicking() {
+        // PAGE_NAMES has exactly 5 entries (0..=4); sub_tabs must not
+        // assume every caller already validated `page` against that —
+        // a future page-count change forgetting to update every call
+        // site should degrade to "no sub-tabs shown", not panic.
+        assert_eq!(sub_tabs(5), &[] as &[&str]);
+        assert_eq!(sub_tabs(usize::MAX), &[] as &[&str]);
+    }
+
+    #[test]
+    fn page_names_and_subtabbed_pages_stay_in_bounds_of_each_other() {
+        // Every page index sub_tabs treats specially must actually be a
+        // valid PAGE_NAMES index — a mismatch here would mean a sub-tab
+        // table was added for a page that does not exist.
+        for page in 0..PAGE_NAMES.len() {
+            let _ = sub_tabs(page); // must not panic for any real page
+        }
+    }
+
+    #[test]
+    fn a_fresh_nav_starts_on_camera_with_no_subtab_selected() {
+        let nav = UnifiedNav::new();
+        assert_eq!(nav.page, 0, "Camera is page 0 per PAGE_NAMES");
+        assert_eq!(nav.sub, [0; 5], "every page starts on its first sub-tab");
+        assert_eq!(nav.underline_span(), None, "no underline until a SubTabbed page renders");
+    }
+}

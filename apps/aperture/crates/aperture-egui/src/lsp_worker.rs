@@ -1,0 +1,248 @@
+//! lsp_worker — the concurrency wrapper `aperture_lsp`'s own doc comment
+//! points at: `LspClient`'s methods are blocking (deliberately, until a real
+//! caller existed to prove which calls are actually slow); this is that
+//! real caller, and it answers the question the same way `aperture_complete
+//! ::engine::Engine` already did for AI completions — one worker thread,
+//! one inbox, one outbox, newest-request-wins for completions specifically
+//! (an LSP round trip a person has already kept typing past is not worth
+//! showing).
+//!
+//! Optional and best-effort throughout: no `rust-analyzer` on `PATH`, or a
+//! language with no server configured, means `spawn` returns `Err` and the
+//! shell simply doesn't get this tier — `workspace_symbols`'s local outline
+//! stays the popup's baseline either way (see `aperture_lsp`'s crate doc for
+//! why LSP is an ADDITIONAL tier, not a replacement).
+
+use aperture_lsp::{CompletionItem, Diagnostic, Hover, Location, LspClient};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::time::Duration;
+
+enum Msg {
+    Open { uri: String, text: String },
+    /// `edit`, when present, is a candidate for incremental sync — the
+    /// worker sends it via `did_change_range` ONLY if the server actually
+    /// advertised support (checked here, not by the caller, since only the
+    /// worker thread has the `LspClient` that knows). `text` is always the
+    /// full current document regardless, used as the fallback when `edit`
+    /// is `None` (no diff could be computed, or the caller chose not to)
+    /// or when the server doesn't support incremental sync.
+    ///
+    /// The edit's positions are ALREADY UTF-16-converted (line, utf16_col)
+    /// pairs — this worker has no line-text access to do that conversion
+    /// itself (it only ever sees a whole document string, not a buffer
+    /// with per-line structure), so the caller (which has the real
+    /// `Buffer`) must convert before sending, the same way `request_
+    /// completion`'s caller in `state.rs` already does for its own
+    /// position.
+    Change {
+        uri: String,
+        text: String,
+        edit: Option<(u32, u32, u32, u32, String)>,
+        version: i64,
+    },
+    Complete { uri: String, line: u32, character: u32, generation: u64 },
+    Definition { uri: String, line: u32, character: u32, generation: u64 },
+    HoverAt { uri: String, line: u32, character: u32, generation: u64 },
+}
+
+/// A completed (or failed-and-empty) completion request, tagged with the
+/// generation it was requested under so a caller can discard a stale answer
+/// the same way `aperture_complete::CompletionOutcome` already does.
+pub struct LspOutcome {
+    pub generation: u64,
+    pub items: Vec<CompletionItem>,
+}
+
+/// Same generation-gating shape as `LspOutcome`, for `textDocument/
+/// definition` — a separate type rather than folding into `LspOutcome`
+/// because the two requests answer different questions and a caller
+/// checking "did MY request land" gets confused fastest when two unrelated
+/// answers share one Option<T> and one generation counter.
+pub struct DefinitionOutcome {
+    pub generation: u64,
+    pub locations: Vec<Location>,
+}
+
+/// Same shape again, for `textDocument/hover`.
+pub struct HoverOutcome {
+    pub generation: u64,
+    pub hover: Option<Hover>,
+}
+
+pub struct LspWorker {
+    tx: Sender<Msg>,
+    rx: Receiver<LspOutcome>,
+    diag_rx: Receiver<Vec<Diagnostic>>,
+    def_rx: Receiver<DefinitionOutcome>,
+    hover_rx: Receiver<HoverOutcome>,
+}
+
+impl LspWorker {
+    /// Spawn `cmd` and hand it `root_uri`. Fails exactly when
+    /// `LspClient::spawn` does (the command isn't on `PATH`, or the
+    /// `initialize` handshake itself errors) — there is no separate
+    /// "worker started but client didn't" state to reason about.
+    pub fn spawn(cmd: &str, args: &[&str], root_uri: &str) -> std::io::Result<Self> {
+        let client = LspClient::spawn(cmd, args, root_uri)?;
+        let (tx, worker_rx) = channel::<Msg>();
+        let (out_tx, rx) = channel::<LspOutcome>();
+        let (diag_tx, diag_rx) = channel::<Vec<Diagnostic>>();
+        let (def_tx, def_rx) = channel::<DefinitionOutcome>();
+        let (hover_tx, hover_rx) = channel::<HoverOutcome>();
+        std::thread::Builder::new()
+            .name("aperture-lsp-worker".into())
+            .spawn(move || worker(client, worker_rx, out_tx, diag_tx, def_tx, hover_tx))
+            .expect("spawn LSP worker thread");
+        Ok(LspWorker { tx, rx, diag_rx, def_rx, hover_rx })
+    }
+
+    pub fn open(&self, uri: String, text: String) {
+        let _ = self.tx.send(Msg::Open { uri, text });
+    }
+
+    /// `edit`, when `Some`, is `(start_line, start_utf16_col, end_line,
+    /// end_utf16_col, replacement_text)` — see `Msg::Change`'s own doc for
+    /// why the caller must do the UTF-16 conversion, and why the worker
+    /// (not this call site) decides whether the edit is actually usable.
+    pub fn change(&self, uri: String, text: String, edit: Option<(u32, u32, u32, u32, String)>, version: i64) {
+        let _ = self.tx.send(Msg::Change { uri, text, edit, version });
+    }
+
+    /// Queue a completion request. Never blocks; a request superseded by a
+    /// newer one before the worker gets to it is coalesced away, same rule
+    /// as `Engine::request`.
+    pub fn request_completion(&self, uri: String, line: u32, character: u32, generation: u64) {
+        let _ = self.tx.send(Msg::Complete { uri, line, character, generation });
+    }
+
+    /// Queue a go-to-definition request. Same coalesce-to-newest rule as
+    /// completions — a definition lookup superseded by a later keystroke
+    /// or another lookup isn't worth answering.
+    pub fn request_definition(&self, uri: String, line: u32, character: u32, generation: u64) {
+        let _ = self.tx.send(Msg::Definition { uri, line, character, generation });
+    }
+
+    /// Queue a hover request. Same coalesce-to-newest rule.
+    pub fn request_hover(&self, uri: String, line: u32, character: u32, generation: u64) {
+        let _ = self.tx.send(Msg::HoverAt { uri, line, character, generation });
+    }
+
+    /// Non-blocking; call once per frame.
+    pub fn poll(&self) -> Option<LspOutcome> {
+        self.rx.try_recv().ok()
+    }
+
+    /// Non-blocking; the worker pushes a new list only when it actually
+    /// changed (see `worker`'s own loop), so every value received here is
+    /// a real transition, not a repeat of the same diagnostics each frame.
+    pub fn poll_diagnostics(&self) -> Option<Vec<Diagnostic>> {
+        self.diag_rx.try_recv().ok()
+    }
+
+    /// Non-blocking; call once per frame.
+    pub fn poll_definition(&self) -> Option<DefinitionOutcome> {
+        self.def_rx.try_recv().ok()
+    }
+
+    /// Non-blocking; call once per frame.
+    pub fn poll_hover(&self) -> Option<HoverOutcome> {
+        self.hover_rx.try_recv().ok()
+    }
+}
+
+fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx: Sender<Vec<Diagnostic>>, def_tx: Sender<DefinitionOutcome>, hover_tx: Sender<HoverOutcome>) {
+    // Drain-to-newest before acting, same shape as aperture_complete's own
+    // worker loop: Open/Change messages all apply in order (each is a real,
+    // needed state transition the server must see), but if several
+    // Complete, Definition, or HoverAt requests piled up while a previous
+    // call was in flight, only the LAST one of each kind is worth
+    // answering — the caret has moved on.
+    let mut pending_complete: Option<(String, u32, u32, u64)> = None;
+    let mut pending_definition: Option<(String, u32, u32, u64)> = None;
+    let mut pending_hover: Option<(String, u32, u32, u64)> = None;
+    // The URI diagnostics get checked against — whatever the last Open or
+    // Change named. `publishDiagnostics` is a PUSH, not a reply to
+    // anything this worker asked for, so there is no message to drain for
+    // it; the periodic recv_timeout below is what notices a new one.
+    let mut current_uri: Option<String> = None;
+    let mut last_diagnostics: Vec<Diagnostic> = Vec::new();
+    loop {
+        let msg = match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(m) => Some(m),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => return, // AppState (and its LspWorker) is gone
+        };
+        let mut msg = msg;
+        loop {
+            match msg.take() {
+                Some(Msg::Open { uri, text }) => {
+                    let _ = client.did_open(&uri, "rust", &text, 1);
+                    current_uri = Some(uri);
+                }
+                Some(Msg::Change { uri, text, edit, version }) => {
+                    // Incremental IF both the caller offered a computable
+                    // edit AND the server actually advertised support —
+                    // checked here, once, right before sending, since this
+                    // is the only place that has both pieces of
+                    // information at the same time.
+                    let sent = match &edit {
+                        Some((start_line, start_col, end_line, end_col, replacement))
+                            if client.supports_incremental_sync() =>
+                        {
+                            client.did_change_range(
+                                &uri, *start_line, *start_col, *end_line, *end_col, replacement, version,
+                            )
+                        }
+                        _ => Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no incremental edit")),
+                    };
+                    if sent.is_err() {
+                        let _ = client.did_change(&uri, &text, version);
+                    }
+                    current_uri = Some(uri);
+                }
+                Some(Msg::Complete { uri, line, character, generation }) => {
+                    pending_complete = Some((uri, line, character, generation));
+                }
+                Some(Msg::Definition { uri, line, character, generation }) => {
+                    pending_definition = Some((uri, line, character, generation));
+                }
+                Some(Msg::HoverAt { uri, line, character, generation }) => {
+                    pending_hover = Some((uri, line, character, generation));
+                }
+                None => break,
+            }
+            match rx.try_recv() {
+                Ok(next) => msg = Some(next),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        if let Some((uri, line, character, generation)) = pending_complete.take() {
+            let items = client.completion(&uri, line, character).unwrap_or_default();
+            if tx.send(LspOutcome { generation, items }).is_err() {
+                return; // receiver dropped
+            }
+        }
+        if let Some((uri, line, character, generation)) = pending_definition.take() {
+            let locations = client.goto_definition(&uri, line, character).unwrap_or_default();
+            if def_tx.send(DefinitionOutcome { generation, locations }).is_err() {
+                return; // receiver dropped
+            }
+        }
+        if let Some((uri, line, character, generation)) = pending_hover.take() {
+            let hover = client.hover(&uri, line, character).unwrap_or(None);
+            if hover_tx.send(HoverOutcome { generation, hover }).is_err() {
+                return; // receiver dropped
+            }
+        }
+        if let Some(uri) = &current_uri {
+            let latest = client.diagnostics(uri);
+            if latest != last_diagnostics {
+                last_diagnostics = latest.clone();
+                if diag_tx.send(latest).is_err() {
+                    return; // receiver dropped
+                }
+            }
+        }
+    }
+}

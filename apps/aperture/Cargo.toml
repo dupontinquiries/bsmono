@@ -16,6 +16,7 @@
 members = [
     "crates/aperture-core",
     "crates/aperture-complete",
+    "crates/aperture-lsp",
     "crates/aperture-egui",
     "crates/aperture-scene",
     "crates/aperture-engine",
@@ -27,6 +28,7 @@ resolver = "2"
 egui = "0.34"
 aperture-core = { path = "crates/aperture-core" }
 aperture-complete = { path = "crates/aperture-complete" }
+aperture-lsp = { path = "crates/aperture-lsp" }
 aperture-engine = { path = "crates/aperture-engine" }
 aperture-collab = { path = "crates/aperture-collab" }
 

@@ -73,6 +73,42 @@ pub fn visual_to_char_col(line: &str, target_visual: usize) -> usize {
     line.chars().count()
 }
 
+/// Char column -> UTF-16 code-unit offset, the unit the Language Server
+/// Protocol's `Position.character` actually specifies (inherited from
+/// LSP's origins as a JSON-over-the-wire protocol for editors built on
+/// UTF-16 strings — VS Code's own text model, principally). A DIFFERENT
+/// unit again from `char_col_to_visual`'s visual cells: this one only
+/// diverges from a plain char count for codepoints outside the Basic
+/// Multilingual Plane (most emoji, some CJK extension ideographs), which
+/// need a UTF-16 SURROGATE PAIR — two code units — where `chars()` still
+/// counts them as one `char`. Ordinary BMP text, including CJK, Cyrillic,
+/// and every other non-ASCII script that isn't specifically astral-plane,
+/// has char count == UTF-16 length and this is a no-op for it.
+pub fn char_col_to_utf16(line: &str, char_col: usize) -> u32 {
+    line.chars().take(char_col).map(char::len_utf16).sum::<usize>() as u32
+}
+
+/// The inverse: a UTF-16 offset (as a server's response would report, e.g.
+/// a diagnostic's range) back to a char column this crate's own `Selection`/
+/// `Buffer` API can use. Walks code units rather than chars for the same
+/// astral-plane reason `char_col_to_utf16` does; a `utf16_col` landing
+/// INSIDE a surrogate pair (which a well-behaved server should never send,
+/// but nothing enforces that on the wire) rounds FORWARD to the char after
+/// that pair rather than panicking or landing inside a codepoint that
+/// doesn't exist at the char level — this function only ever returns an
+/// index that is a valid char boundary in `line`.
+pub fn utf16_col_to_char(line: &str, utf16_col: u32) -> usize {
+    let mut units = 0u32;
+    for (i, c) in line.chars().enumerate() {
+        if units >= utf16_col {
+            return i;
+        }
+        units += c.len_utf16() as u32;
+    }
+    line.chars().count()
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +174,55 @@ mod tests {
             assert_eq!(char_col_to_visual_clamped(line, col), char_col_to_visual(line, col));
         }
         assert_eq!(char_col_to_visual_clamped(line, 4), 5, "one char past this line's 3 chars: 4 (in-line) + 1");
+    }
+
+    #[test]
+    fn utf16_matches_char_count_for_ascii_and_ordinary_bmp_text() {
+        // The common case, stated as a test: this conversion is a no-op
+        // for anything that isn't astral-plane.
+        for line in ["let x = 1;", "let 漢字 = 1;", "привет мир"] {
+            for col in 0..=line.chars().count() {
+                assert_eq!(char_col_to_utf16(line, col) as usize, col, "{line:?} col {col}");
+            }
+        }
+    }
+
+    #[test]
+    fn utf16_diverges_from_char_count_for_astral_plane_codepoints() {
+        // An emoji outside the BMP needs a UTF-16 SURROGATE PAIR — two code
+        // units — where `.chars()` still counts it as one `char`. This is
+        // the entire reason this function exists.
+        let line = "a😀b"; // 'a', U+1F600 (astral), 'b' — 3 chars
+        assert_eq!(char_col_to_utf16(line, 0), 0);
+        assert_eq!(char_col_to_utf16(line, 1), 1, "before the emoji: still 1:1");
+        assert_eq!(char_col_to_utf16(line, 2), 3, "past the emoji: +2 UTF-16 units for one char");
+        assert_eq!(char_col_to_utf16(line, 3), 4, "past 'b' too");
+    }
+
+    #[test]
+    fn utf16_col_to_char_is_the_inverse() {
+        let line = "a😀b";
+        assert_eq!(utf16_col_to_char(line, 0), 0);
+        assert_eq!(utf16_col_to_char(line, 1), 1);
+        assert_eq!(utf16_col_to_char(line, 3), 2);
+        assert_eq!(utf16_col_to_char(line, 4), 3);
+    }
+
+    #[test]
+    fn utf16_col_landing_inside_a_surrogate_pair_rounds_forward_rather_than_panicking() {
+        // A malformed server response, in principle — nothing on the wire
+        // enforces that a Position always lands on a code-point boundary.
+        // Rounding FORWARD (to the char after the pair) rather than back
+        // INTO it means this function's result is always a valid char
+        // boundary, never "half of a codepoint."
+        let line = "a😀b";
+        assert_eq!(utf16_col_to_char(line, 2), 2, "inside the emoji's surrogate pair: rounds past it to 'b'");
+    }
+
+    #[test]
+    fn utf16_col_past_the_end_clamps_to_the_lines_length() {
+        let line = "ab";
+        assert_eq!(utf16_col_to_char(line, 999), 2);
     }
 
 }

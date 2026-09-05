@@ -36,6 +36,7 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
         state.show_loop_pane = !state.show_loop_pane;
     }
     state.poll_completions(now_ms);
+    state.poll_lsp(now_ms);
     state.poll_note();
     state.poll_route_ai();
     state.poll_edit_ai(now_ms);
@@ -95,6 +96,9 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
     }
     if state.pending_edit.is_some() {
         edit_review_overlay(ctx, state, &colors);
+    }
+    if state.hover_overlay.is_some() {
+        hover_overlay(ctx, state, &colors);
     }
 }
 
@@ -158,6 +162,51 @@ fn edit_review_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColo
         state.accept_pending_edit();
     } else if reject {
         state.reject_pending_edit();
+    }
+}
+
+/// Ctrl+I's full result, distinct from the one-line status headline
+/// `AppState::poll_lsp` already sets — a real type signature plus doc
+/// comment is often several lines, and this is the space to show all of
+/// it rather than truncate to what fits in the status bar. Dismissed by
+/// `AppState` itself on Escape or the next edit (see `hover_overlay`
+/// field's own doc), not by anything in this function — this is a pure
+/// render of whatever state currently holds, same discipline every other
+/// overlay in this file follows.
+fn hover_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors) {
+    let Some(contents) = state.hover_overlay.clone() else { return };
+    let mut dismiss = false;
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        dismiss = true;
+    }
+    egui::Area::new(Id::new("aperture_hover"))
+        .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 72.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(colors.bg_raised)
+                .stroke(Stroke::new(1.0_f32, colors.border))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.set_width(uikit_egui::dialog::dialog_width(
+                        ui.ctx().content_rect().width(), 520.0));
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("hover").color(colors.text_weak).small());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("×").clicked() {
+                                dismiss = true;
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().id_salt("hover_contents").max_height(240.0).show(ui, |ui| {
+                        ui.label(egui::RichText::new(&contents).monospace().color(colors.text));
+                    });
+                });
+        });
+    if dismiss {
+        state.hover_overlay = None;
     }
 }
 
@@ -469,9 +518,42 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
         }
     }
 
-    // Rows: gutter number + syntax-colored galley. Split the borrows so the
+    // Secondary selections — same fill, drawn for every extra cursor that
+    // isn't a bare caret. A separate loop rather than folding into the block
+    // above: the primary reads `state.editor.sel` directly (it always has,
+    // and every other caller of that field is untouched by multi-cursor), so
+    // duplicating its five lines here is cheaper than threading an iterator
+    // through code that has to keep working for the zero-extra-cursors case.
+    for s in &state.extra_cursors {
+        if s.is_caret() {
+            continue;
+        }
+        let sel_fill = colors.accent.gamma_multiply(0.25);
+        let (a, b) = (s.min(), s.max());
+        let (pa, pb) = (state.editor.buffer.char_to_pos(a), state.editor.buffer.char_to_pos(b));
+        for line in pa.line..=pb.line {
+            if line + 1 < first || line > last {
+                continue;
+            }
+            let c0 = if line == pa.line { pa.col } else { 0 };
+            let c1 = if line == pb.line { pb.col } else { state.editor.buffer.line_len(line) + 1 };
+            let y = rect.top() - scroll + line as f32 * m.line_h
+                + if line >= shift_from { shift_px } else { 0.0 };
+            let text = state.editor.buffer.line(line);
+            let v0 = aperture_core::width::char_col_to_visual_clamped(&text, c0) as f32;
+            let v1 = aperture_core::width::char_col_to_visual_clamped(&text, c1) as f32;
+            painter.rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(content_left + v0 * m.char_w, y),
+                    Vec2::new(((v1 - v0) * m.char_w).max(m.char_w * 0.4), m.line_h),
+                ),
+                2.0,
+                sel_fill,
+            );
+        }
+    }
     // syntax cache can pull line text while we hold the rest of state.
-    let AppState { editor, syntax, find, git_changed, .. } = &mut *state;
+    let AppState { editor, syntax, find, git_changed, lsp_diagnostics, .. } = &mut *state;
     for line in first..last {
         let y = rect.top() - scroll + line as f32 * m.line_h
             + if line >= shift_from { shift_px } else { 0.0 };
@@ -501,6 +583,32 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
                 Rect::from_min_size(Pos2::new(rect.left() + 1.0, y), Vec2::new(3.0, m.line_h)),
                 0.0,
                 Color32::from_rgb(94, 158, 76),
+            );
+        }
+        // LSP diagnostics get a SECOND, separately-positioned gutter bar —
+        // deliberately not sharing the git-diff bar's x position, since an
+        // uncommitted line with a live error is a real, common combination
+        // and the two marks answer different questions ("did I touch this"
+        // vs "is this wrong right now"). Worst severity wins when a line
+        // has more than one diagnostic — a warning shouldn't visually hide
+        // a co-located error.
+        if let Some(d) = lsp_diagnostics.iter()
+            .filter(|d| line as u32 >= d.start_line && line as u32 <= d.end_line)
+            .min_by_key(|d| match d.severity {
+                aperture_lsp::DiagnosticSeverity::Error => 0,
+                aperture_lsp::DiagnosticSeverity::Warning => 1,
+                aperture_lsp::DiagnosticSeverity::Info => 2,
+            })
+        {
+            let color = match d.severity {
+                aperture_lsp::DiagnosticSeverity::Error => Color32::from_rgb(224, 90, 90),
+                aperture_lsp::DiagnosticSeverity::Warning => Color32::from_rgb(224, 180, 90),
+                aperture_lsp::DiagnosticSeverity::Info => Color32::from_rgb(120, 150, 200),
+            };
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(rect.left() + 5.0, y), Vec2::new(3.0, m.line_h)),
+                0.0,
+                color,
             );
         }
         let num = format!("{}", line + 1);
@@ -570,7 +678,7 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     }
 
     // Ghost text — at the caret, when the caret sits at its line's end.
-    if let crate::ghost::Ghost::Shown { text } = &state.ghost {
+    if let crate::ghost::Ghost::Shown { text, .. } = &state.ghost {
         if caret.col == state.editor.buffer.line_len(caret.line) {
             let alpha = ghost_alpha(state, now_ms);
             let gcolor = colors.text_weak.gamma_multiply(0.85 * alpha);
@@ -609,6 +717,26 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     }
     if !moving {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(530));
+    }
+
+    // Secondary carets — static, not blinking: blink timing is a "where is
+    // MY cursor" cue for the one the keyboard follows, and would just be
+    // visual noise multiplied across however many are on screen.
+    for s in &state.extra_cursors {
+        let p = state.editor.buffer.char_to_pos(s.head);
+        if p.line + 1 < first || p.line > last {
+            continue;
+        }
+        let line_text = state.editor.buffer.line(p.line);
+        let vx = aperture_core::width::char_col_to_visual(&line_text, p.col) as f32;
+        let ex = content_left + vx * m.char_w;
+        let ey = rect.top() - scroll + p.line as f32 * m.line_h
+            + if p.line >= shift_from { shift_px } else { 0.0 };
+        painter.rect_filled(
+            Rect::from_min_size(Pos2::new(ex - 1.0, ey + 1.0), Vec2::new(2.0, m.line_h - 2.0)),
+            1.0,
+            colors.accent.gamma_multiply(0.8),
+        );
     }
 
     // Tell the platform's IME candidate window where to appear — without
@@ -924,7 +1052,32 @@ fn status_bar(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, now_ms:
                     .color(Color32::from_rgb(120, 176, 100)),
             );
         }
+        if !state.lsp_diagnostics.is_empty() {
+            let errors = state.lsp_diagnostics.iter()
+                .filter(|d| d.severity == aperture_lsp::DiagnosticSeverity::Error).count();
+            let warnings = state.lsp_diagnostics.iter()
+                .filter(|d| d.severity == aperture_lsp::DiagnosticSeverity::Warning).count();
+            ui.separator();
+            let (text, color) = if errors > 0 {
+                (format!("✕ {errors} error{}", if errors == 1 { "" } else { "s" }),
+                 Color32::from_rgb(224, 90, 90))
+            } else {
+                (format!("⚠ {warnings} warning{}", if warnings == 1 { "" } else { "s" }),
+                 Color32::from_rgb(224, 180, 90))
+            };
+            ui.label(egui::RichText::new(text).color(color));
+        }
 
+        // Measured on the OUTER horizontal, right before the right-aligned
+        // section starts — this is what's actually left after everything
+        // drawn so far on the left (filename, Ln/Col, language, and
+        // whichever of the optional follow/rev/git markers fired). The
+        // right-to-left child ui below does NOT get this number for free:
+        // it lays out from ITS OWN right edge outward, with no awareness of
+        // how far the left-hand cursor already advanced, so on a narrow
+        // window (a phone screen, not just a small desktop window) the two
+        // sides drew on top of each other instead of one giving way.
+        let room = ui.available_width();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some((msg, until)) = &state.status {
                 if now_ms < *until {
@@ -943,8 +1096,17 @@ fn status_bar(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, now_ms:
                 ("ai idle".to_string(), colors.text_weak)
             };
             ui.label(egui::RichText::new(chip).color(color));
-            ui.separator();
-            ui.label(egui::RichText::new("Ctrl+P commands · F2 loop").color(colors.text_weak));
+            // The hint is the single most droppable thing in this bar — a
+            // reminder of a shortcut, not state the person needs to see —
+            // so it is the one thing that gives way when space runs out,
+            // rather than silently overlapping whatever drew first.
+            // 220px comfortably fits "Ctrl+P commands · F2 loop" at the
+            // status bar's font size; below that it would either truncate
+            // mid-word or collide with the chip just drawn.
+            if room > 220.0 {
+                ui.separator();
+                ui.label(egui::RichText::new("Ctrl+P commands · F2 loop").color(colors.text_weak));
+            }
         });
     });
     if state.rev_ix.is_some() && !state.rev_note.is_empty() {
@@ -982,6 +1144,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
     let mut open_path: Option<String> = None;
     let mut open_hit: Option<(std::path::PathBuf, usize)> = None;
     let mut submit_edit: Option<String> = None;
+    let mut submit_voice: Option<String> = None;
 
     // Go-to-route's AI tier: trigger from a tight, self-contained borrow
     // scope (owned String + Vec) so it doesn't overlap the palette borrow
@@ -1024,6 +1187,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                         Mode::WorkspaceSymbol => "symbol name…",
                         Mode::GoToRoute => "describe what you're looking for…",
                         Mode::AiEditPrompt => "instruction for the selection…",
+                        Mode::VoiceCommand => "say a command — \"save\", \"find total\", \"go to line 12\"…",
                     };
                     let edit = egui::TextEdit::singleline(&mut p.input).id_salt("view-p_input")
                         .hint_text(hint)
@@ -1410,6 +1574,16 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 submit_edit = Some(p.input.trim().to_string());
                             }
                         }
+                        Mode::VoiceCommand => {
+                            ui.label(
+                                egui::RichText::new("type what you'd say, then Enter · Esc cancel")
+                                    .color(colors.text_weak)
+                                    .small(),
+                            );
+                            if enter && !p.input.trim().is_empty() {
+                                submit_voice = Some(p.input.trim().to_string());
+                            }
+                        }
                     }
                 });
         });
@@ -1424,6 +1598,14 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
 
     if let Some(instruction) = submit_edit {
         state.request_edit(&instruction, now_ms);
+        state.palette = None;
+        return;
+    }
+
+    if let Some(utterance) = submit_voice {
+        if let Some(clip) = state.run_voice_command(&utterance, now_ms) {
+            ctx.copy_text(clip);
+        }
         state.palette = None;
         return;
     }
@@ -1480,8 +1662,12 @@ fn map_key(key: egui::Key) -> Option<K> {
         EK::H => K::H,
         EK::T => K::T,
         EK::G => K::G,
+        EK::D => K::D,
+        EK::L => K::L,
+        EK::I => K::I,
         EK::F => K::F,
         EK::F3 => K::F3,
+        EK::F12 => K::F12,
         EK::Space => K::Space,
         _ => return None,
     })

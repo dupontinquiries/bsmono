@@ -43,7 +43,7 @@ mkdir -p "$OUT"
 # indistinguishable by name.
 STAMP="$OUT/.${SERIES}-seq"
 last_dir=$(ls "$OUT" 2>/dev/null | sed -n "s/^${SERIES}-\([0-9]\{3\}\)-.*\.bundle$/\1/p" | sort -n | tail -1)
-last_stamp=$(cat "$STAMP" 2>/dev/null | tr -dc '0-9')
+last_stamp=$(cat "$STAMP" 2>/dev/null || true); last_stamp=$(tr -dc '0-9' <<<"$last_stamp")
 last=$(printf '%s\n%s\n' "${last_dir:-0}" "${last_stamp:-0}" | sort -n | tail -1)
 next=$(printf '%03d' $(( 10#${last:-0} + 1 )))
 printf '%s\n' "$next" > "$STAMP"

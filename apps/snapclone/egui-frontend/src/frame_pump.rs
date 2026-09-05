@@ -87,6 +87,20 @@ pub struct FrameSlot {
 impl FrameSlot {
     /// Called from the capture thread. Never blocks, never fails.
     pub fn offer(&mut self, f: RawFrame) {
+        // A frame OLDER than the highest sequence already seen is a late,
+        // reordered arrival — accepting it would overwrite whatever's
+        // waiting (or already shown) with an image from further back in
+        // time, which is exactly the "preview runs behind reality"
+        // failure this module's own doc names as the reason a single
+        // overwritten slot exists at all. Silently dropped, not counted
+        // as a producer gap (that diagnostic is about the producer
+        // SKIPPING sequence numbers forward, a different fault with a
+        // different fix) and not counted as `dropped` either (that's for
+        // a frame we HAD and a paint never reached — this one never had
+        // a chance to begin with).
+        if self.last_seq != 0 && f.seq != 0 && f.seq < self.last_seq {
+            return;
+        }
         if self.last_seq != 0 && f.seq > self.last_seq + 1 {
             // The camera or the compositor skipped. Counted separately from our
             // own drops, because the two have different causes and the fix for
@@ -330,6 +344,30 @@ mod tests {
         s.take();
         s.offer(frame(9, 33));
         assert_eq!(s.producer_gaps, 0);
+    }
+
+    #[test]
+    fn a_late_out_of_order_frame_must_not_regress_the_displayed_image() {
+        // The bug the previous test's own name almost caught, but never
+        // actually checked: it only asserted `producer_gaps` stayed zero,
+        // never what `take()` returns afterward. Offering frame 9 AFTER
+        // frame 10 was already taken currently overwrites `current`
+        // unconditionally — so the NEXT take() hands the paint frame 9,
+        // an image chronologically BEFORE what was already on screen. That
+        // is exactly the "preview runs behind reality" failure this
+        // module's own doc says single-slot-latest-wins exists to
+        // prevent; a naive ordering check closes it by rejecting an
+        // arrival older than the highest sequence already seen.
+        let mut s = FrameSlot::default();
+        s.offer(frame(10, 0));
+        s.take();
+        s.offer(frame(9, 33)); // late, reordered arrival
+        let next = s.take();
+        assert_ne!(
+            next.as_ref().map(|f| f.seq),
+            Some(9),
+            "a frame older than the highest sequence already seen must not reach the paint"
+        );
     }
 
     #[test]

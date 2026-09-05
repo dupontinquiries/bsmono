@@ -298,9 +298,76 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   parser slots in without touching the renderer. Deferred because grammar
   crates churn their `Language`/`LANGUAGE` symbol and version-pair with the
   runtime crate; pin both when adding.
-- **Streaming ghosts**: ollama `stream:true` + a channel of deltas so long
-  completions paint progressively. Engine already coalesces newest-wins;
-  streaming needs a cancel path (drop the TcpStream) added to `Provider`.
+- ~~**Streaming ghosts**: ollama `stream:true` + a channel of deltas so
+  long completions paint progressively~~ **DONE — provider, engine, and
+  shell all built** (`OllamaProvider::complete_streaming` over a real
+  `TcpStream` with a cancel path, `Engine`'s worker sending one
+  `CompletionOutcome` per delta plus one final, `AppState::note_outcome`
+  updating the ghost on every outcome and logging only the final one to
+  the loop pane) — but **it was silently broken**, found by this session
+  while adding a full-stack test rather than trusting the existing
+  coverage.
+
+  `Ghost::on_outcome`'s guard only ever accepted an outcome while the
+  ghost was `Pending`. The first successful delta transitions it to
+  `Shown` — so every LATER delta for that same request, the final one
+  included, silently failed the guard and did nothing. Streaming ghost
+  completions never actually streamed: one fragment appeared, then
+  froze, no matter how many more deltas the server sent. Undetected
+  because every existing test either fed outcomes one at a time by hand
+  (never two for the SAME generation in sequence) or checked only
+  `is_shown()`, which stays true on a frozen ghost and can't tell the
+  difference — a lesson worth stating plainly: a passing test whose
+  assertion is weaker than the behavior it claims to cover is a false
+  sense of coverage, not real coverage.
+
+  Fixed by giving `Ghost::Shown` its own `generation`, so a later delta
+  for the SAME generation still updates it while a genuinely different
+  or stale one is still correctly rejected. 3 new `ghost.rs` tests (the
+  actual bug; a different generation while `Shown` still rejected; a
+  stale generation with the buffer moved on still rejected), plus a
+  strengthened `state.rs` test that now checks the actual text at each
+  step instead of just `is_shown()`.
+
+  Real proof: `streaming_ghost_e2e.rs` — a real `Engine` thread, a real
+  `OllamaProvider`, a real local TCP server sending genuinely separate
+  HTTP chunks with small delays between them (sending everything as one
+  blob would complete before even one `poll_completions()` call, which
+  drains everything queued per call and would hide the bug by only ever
+  showing the final state). Watches the actual `ghost` field over time,
+  asserts it was observed at more than one length and only grew,
+  confirmed to fail with exactly the described symptom against the
+  pre-fix code before the fix went in.
+
+  Found in passing, named rather than fixed (separate scope):
+  `multipass::make_block` trims each block's text, harmless for a
+  complete final answer but dropping meaningful trailing whitespace on
+  an intermediate streaming delta (`"fn "` → `"fn"` until the next delta
+  arrives) — real, but minor and self-correcting by the time the final
+  delta lands.
+
+  `cargo test -p aperture-egui --lib`: 113/113 (was 108). `cargo test -p
+  aperture-complete`: 97/97, unaffected — the bug was entirely one layer
+  above the already-correct provider/engine streaming. Full workspace
+  check clean.
+
+  **A second bug found by checking whether the fix ITSELF introduced a
+  problem** — the fix makes an interaction possible for the first time
+  (streaming was frozen, so nobody could ever accept mid-stream while
+  more deltas were still arriving): accepting part of a streaming
+  suggestion (Ctrl+→) WHILE the server has more coming gets silently
+  reintroduced by the next delta. `on_outcome` replaces the ghost with
+  the server's own running-total text, which has no idea anything was
+  typed out from underneath it — accept "let " from "let x", the next
+  delta arrives with "let x = 1" (the server's own total), and the ghost
+  jumps back to the FULL text rather than the correct remainder.
+  Deliberately NOT fixed — a real fix needs `Shown` to track how many
+  characters were already consumed and strip that prefix before
+  re-running each new delta through `multipass`, and multipass's block-
+  splitting on a SUFFIX rather than the whole reply is its own separate
+  question. Documented with a test written to make the CURRENT
+  (undesirable) behavior explicit and say plainly that a future fix
+  breaking it is the correct outcome, not a regression.
 - **infer-kit extraction**: `aperture-complete/providers.rs` ollama client is
   adapted from `logscope-fan/src/ollama.rs` (adds FIM suffix + de-chunking).
   Two call sites now exist — next co-change, lift `shared/infer-kit`.
@@ -310,21 +377,543 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   project~~ DONE (`project_search.rs`, Ctrl+Shift+F). ~~Go to symbol in
   workspace~~ DONE (`workspace_symbols.rs`, Ctrl+T, name index over every
   file's existing tree-sitter outline — not semantic go-to-def).
-- ~~**Multi-cursor**~~ **DONE, and it had been done for a while.**
-  `aperture-core/src/multicursor.rs` — `Cursors`, `Edit`, `merge_overlaps`,
-  16 tests — implements exactly what this line described, in almost the same
-  words ("milestone 4: `Selection` becomes `Vec<Selection>` and edits fan
-  out"). It had no `mod` declaration, so it was never compiled and its tests
-  never ran, and this entry went on calling it future work. Found by
-  `maintenance/tools/orphan_check.py`; declared 2026-08-22.
-  Still to do: the shell has no keybinding for it, so the capability exists in
-  the core and nothing in the UI reaches it.
-- **CJK/double-width**: caret x assumes monospace `col * char_w`; wide glyphs
-  need galley-measured x (egui does no full shaping — known engine limit).
-- **IME preedit** (`egui::Event::Ime`), **LSP** (own crate behind the same
-  worker pattern as the completion Engine), **egui_kittest** snapshots for the
-  view layer (state layer is already headless-tested), **minimap** on the
-  scrollbar rail.
+- ~~**Multi-cursor**~~ **the core was already done; now wired into the shell.**
+  `aperture-core/src/multicursor.rs` — `Cursors`, `Edit`, `merge_overlaps` —
+  implements exactly what this line described, in almost the same words
+  ("milestone 4: `Selection` becomes `Vec<Selection>` and edits fan out").
+  Found orphaned (no `mod` line, never compiled, its tests never ran) by
+  `maintenance/tools/orphan_check.py`, declared 2026-08-22.
+
+  Fixed a real bug on the way: `after_insert` computed the cursor shift as
+  `text.len()` (bytes) against a crate where every other offset — `Op`,
+  `Buffer`, `Selection` — is char indices. Invisible for ASCII, wrong by the
+  extra-byte count for any non-ASCII insert; no existing test caught it
+  because none used non-ASCII text.
+
+  Added the piece that actually needs the buffer, not just `Selection`
+  values: `find_occurrence`/`all_occurrences`/`word_at` plus the three
+  gestures built on them (`add_next_occurrence` — Ctrl+D, `select_all_
+  occurrences` — Ctrl+Shift+L, `add_vertical` — column cursors). 15 new
+  tests. `cargo test -p aperture-core --features tree-sitter`: 130/130.
+
+  Shell side: `AppState` keeps `editor.sel` as the primary and adds
+  `extra_cursors: Vec<Selection>` for the rest — NOT a rewrite of `Editor` to
+  own `Vec<Selection>` directly, which would touch every one of the ~30
+  existing motion/edit call sites in one commit. `cursors()`/`set_cursors()`
+  are the only crossing points; every pre-existing single-cursor path is
+  unaware the field exists and is provably unchanged (empty `extra_cursors`
+  ⇒ `cursors()` returns exactly the old single-`Selection` case).
+  Ctrl+D, Ctrl+Shift+L, typing, Backspace, Delete, Enter, Tab, arrow/word/
+  doc motion, and Escape (collapse to primary) are wired; `fan_out_ranges`
+  applies per-cursor edits as one undo step using the SAME ascending-shift
+  arithmetic as `Editor::replace_many`, generalized to ranges that aren't
+  the stored selection (backspace deletes text no selection represents).
+  Multi-cursor typing deliberately bypasses ghost completion, auto-pair and
+  the symbol popup rather than guessing a fan-out story for any of them.
+  `view.rs` draws secondary carets (static, not blinking — blink is a
+  "where's MY cursor" cue for the one the keyboard follows) and secondary
+  selection fills. `cargo test -p aperture-egui --lib`: 77/77 (was 64; 13
+  new, 10 of them exercising this).
+
+  Not done: no smooth-camera trailing for secondary carets (they're drawn at
+  their raw position, no interpolation — fine, since only the primary's
+  position feeds the follow-camera).
+
+  Found by running the actual binary under Xvfb, not by `cargo test`:
+  Ctrl+D twice, type "sum" over two selections — both replaced correctly,
+  but Ctrl+Z only undid the last character. `fan_out_*` went through
+  `Editor::replace_many`, which never coalesces (correct for its other
+  caller, find-and-replace-all, wrong for typing). Added `History::
+  record_group_coalescing` / `Editor::replace_many_coalescing` — the
+  multi-cursor analogue of `insert_text`'s single-char coalescing — and
+  wired the three fan-out functions to the same coalesce condition their
+  single-cursor equivalents already use. Also fixed a second bug the same
+  pass turned up: multi-cursor Tab inserted a literal `\t` where the rest
+  of the editor is space-only and tab-stop-aligned per column; now computes
+  each cursor's own stop. Re-verified interactively after the fix: one
+  Ctrl+Z now restores a three-keystroke typed run at both cursors.
+
+  A THIRD bug, same method: after verifying the coalescing fix, the very
+  same undo left no visible secondary cursor on screen — worth noticing
+  rather than assuming was fine. `extra_cursors` was never told when the
+  buffer got mutated or replaced outside the fan-out path: undo, redo,
+  paste, cut, an AI edit landing, opening a different file, and every
+  revision-preview/materialize/branch path (all funnel through
+  `set_preview_text`) left stale offsets sitting there for the next
+  keystroke to fan out to. Added `discard_extra_cursors` as one choke
+  point, wired into all six sites. Verified by immediately typing a
+  character right after undo and confirming it landed exactly once.
+
+  Also wired `add_vertical` (column cursors) to Ctrl+Alt+Up/Down — it
+  existed in core from the start of this work but had never been bound to
+  a key, an orphan at the function level. Verified interactively: three
+  presses built a column across three lines, mixed correctly with an
+  existing selection from Ctrl+D (typing replaced the selection, inserted
+  at the plain carets), one undo restored all three.
+
+  `cargo test -p aperture-core --features tree-sitter`: 134/134.
+  `cargo test -p aperture-egui --lib`: 85/85.
+- ~~**CJK/double-width**~~ **DONE, and TODO.md didn't know it.** This entry
+  said "caret x assumes monospace `col * char_w`" — true of the code this
+  entry described, but `aperture-core/src/width.rs` (`char_col_to_visual`,
+  `visual_to_char_col`, the `_clamped` variant for past-EOL selections) landed
+  in a later merge (`0ff2ab17`) and was never wired back into this note.
+  `view.rs` already runs every column→pixel site (primary caret, click→caret,
+  both selection-fill loops, secondary carets and selections) through it —
+  checked by reading the call sites, not assumed. 7 tests in
+  `aperture-core`'s own suite (`common_cjk_ranges_are_double_width`,
+  `visual_to_char_col_is_the_inverse_and_rounds_inside_wide_glyphs`, …).
+  Verified interactively too: a Rust file with a CJK identifier (`你好`),
+  clicking the pixel position after both glyphs landed the caret at the
+  correct CHAR column (11, not the byte or glyph-index equivalent), and
+  Backspace removed exactly one CJK character, not a partial codepoint or
+  both at once.
+  What's still real: this is `char_w`-scaled (each wide glyph costs exactly
+  2 cells), not font-shaped — egui does no full shaping, so a glyph whose
+  true rendered width isn't a clean multiple of `char_w` (some fonts, some
+  emoji) can still be a few px off. That's an engine limit, not a bug in
+  this table, and not worth chasing further without shaping support egui
+  doesn't have.
+- ~~**IME preedit**~~ **DONE, and this note didn't know it either.**
+  `egui::Event::Ime` → `Ev::Preedit`/`Ev::Text(commit)` is fully wired
+  (`view.rs` translates it, `state.rs` shows composing text with an
+  underline distinct from the ghost, reports `IMEOutput` so the platform's
+  own candidate window appears at the caret) with its own test coverage
+  (`preedit_shows_composing_text_and_dismisses_ghost_and_popup` and
+  siblings). Same pattern as the CJK and minimap entries below: the work
+  landed, the note just never got told.
+- ~~**minimap** on the scrollbar rail~~ **DONE** — `view.rs`'s `scrollbar()`
+  already draws it (its own doc comment says so: "Minimap marks: where in
+  the WHOLE FILE... does something worth noticing sit?"), diff lines and
+  find matches over the full-file scrollbar rail, tested
+  (`scrollbar_marks_reflect_real_uncommitted_lines_and_find_matches`). Marks
+  rather than a literal miniature code render — if a real pixel-preview minimap
+  is what's wanted instead, that is a different, bigger feature, not a
+  follow-up to this one.
+- ~~**egui_kittest** snapshots for the view layer~~ **DONE.** A prior pass
+  proved the harness→render→compare pipeline worked at all with a
+  deliberately text-free solid-rectangle baseline
+  (`tests/kittest_snapshot.rs`), reasoning that a system-font substitution
+  could make a text-bearing snapshot flaky across machines. Checked that
+  assumption before extending it: `view.rs` uses `FontId::monospace`, which
+  resolves to egui's own EMBEDDED font, not a system one — bundled bytes
+  shipped inside the `egui` crate, so two machines on the same `egui`
+  version render identical glyph bitmaps. Added `tests/view_snapshot.rs`:
+  an empty buffer, a small syntax-highlighted Rust file, and a multi-cursor
+  selection (the one piece of this session's multi-cursor work that had
+  only ever been eyeballed in an Xvfb screenshot, now a standing regression
+  test instead of a one-time look). Needed `mesa-vulkan-drivers` (lavapipe)
+  installed in-sandbox for egui_kittest's wgpu-based renderer to have a
+  device at all — undocumented prerequisite, worth knowing for the next
+  session that tries this cold.
+
+  Found a real bug on the way, by looking at what the baseline actually
+  rendered rather than only checking the test passed: at 400px width the
+  status bar's right-to-left "Ctrl+P commands · F2 loop" hint visually
+  overlapped the left-to-right "Rust" language label — mixing writing
+  directions inside one `ui.horizontal` doesn't reserve space between them
+  in egui, so at narrow widths (the mobile-Linux targets this project
+  cares about, not just a small desktop window) the two drew on top of
+  each other. Fixed by measuring remaining width before the right-aligned
+  section and hiding the hint — the single most droppable thing in the
+  bar — when there isn't room for it, rather than letting it collide.
+  Verified both directions with baseline snapshots: hidden and legible at
+  400px, present and legible at 700px.
+
+  `cargo test -p aperture-egui --lib`: 88/88, unaffected (the fix and the
+  new tests are both `view.rs`/integration-test-only).
+- ~~**LSP**~~ **client crate DONE and verified against a real server; not
+  wired into the shell.** New `crates/aperture-lsp`: `rpc.rs` (Content-Length
+  JSON-RPC framing, tested against adversarial byte streams — truncated
+  body, missing header, stray extra header, back-to-back messages — not
+  just its own writer's round-trip), `client.rs` (spawn a server, the
+  `initialize` handshake, `did_open`/`did_change`/`completion`).
+
+  Deliberately BLOCKING per request, not `aperture_complete::engine::
+  Engine`'s worker/inbox/outbox shape — building that concurrency story
+  before this crate had ever been driven against a real server would mean
+  guessing which calls are slow instead of finding out. The seam for an
+  `Engine`-style wrapper is this client's own public methods.
+
+  The real proof, not just unit tests of parsing logic:
+  `tests/rust_analyzer_smoke.rs` downloads and spawns an ACTUAL
+  `rust-analyzer` (no apt package for it in this sandbox; a GitHub release
+  binary) against a real minimal cargo package on disk. Three tests:
+  completing a locally-defined function (the whole handshake → didOpen →
+  completion round trip), a blank-line edge position, and `did_change`
+  actually taking effect (writes a v2 file, sends `didChange`, completes a
+  function that only exists in v2 — would fail if `didChange` were a
+  no-op). Skips rather than fails when `rust-analyzer` isn't on `PATH`.
+  `cargo test -p aperture-lsp`: 17/17 (14 unit + 3 real-server), ~2s,
+  reproducible across repeat runs, no lingering server process after
+  `shutdown()`.
+
+  ~~no wiring into `aperture-egui` at all~~ **DONE, same session,
+  follow-up commit.** `lsp_worker.rs` — the `Engine`-shaped wrapper this
+  crate's own doc pointed at — plus `AppState` fields and a merge into
+  the existing symbol popup. Opening a `.rs` file spawns `rust-analyzer`
+  best-effort (silent if it's not on `PATH`); every edit sends
+  `didChange` unconditionally from `after_edit`; the popup now opens (or
+  gets extra items merged in) from an LSP answer even when the LOCAL
+  tree-sitter-outline tier found nothing — a std or cross-file symbol,
+  which that tier is structurally unable to see (it parses only the
+  currently open buffer, confirmed by reading `gather_symbols`, not
+  guessed).
+
+  Two more real bugs found building the end-to-end proof, not guessed:
+  the first version of the test used a std type (`String`) to prove the
+  LSP tier specifically, and hung for 110s producing nothing —
+  `rustc --print sysroot` showed no `rust-src` component installed in
+  this sandbox, so rust-analyzer genuinely cannot resolve std types here
+  at all. Rewritten around a cross-file symbol instead (same
+  "structurally invisible to the local tier" property, no sysroot
+  needed) — and THAT still failed until a second bug was found: a
+  completion queried immediately after a rapid burst of `didChange`
+  notifications with no pause can race ahead of rust-analyzer's own
+  reanalysis. Confirmed with an isolated repro (identical edit sequence:
+  zero items with no pause, correct items with a 1s pause) before
+  touching the test again. Also bumped `LspClient::CALL_TIMEOUT` from
+  30s to 90s, found too short on this same path.
+
+  `cargo test -p aperture-egui --lib`: 98/98, unaffected. The new
+  `lsp_popup_e2e` test: 1/1, through the REAL `AppState -> LspWorker ->
+  rust-analyzer -> popup` path, reproducible, no lingering process.
+
+  ~~Known limitation~~ **FIXED, one commit later.** LSP `position.
+  character` is a UTF-16 code-unit offset; `caret_pos().col` was a raw
+  char count, wrong for anything needing a UTF-16 surrogate pair
+  (astral-plane codepoints). Added `char_col_to_utf16`/
+  `utf16_col_to_char` to `aperture_core::width` — same module CJK/
+  double-width visual columns live in, same shape of problem (one char
+  isn't always one unit of whatever a consumer counts), different unit.
+  5 new tests. Caught a self-inflicted bug while writing this one too: an
+  earlier `str_replace` had dropped `#[cfg(test)]` off `width.rs`'s test
+  module, so the whole thing was compiling into the production build —
+  found via an "unused import" warning that made no sense for a module
+  whose tests obviously use it, not dismissed as noise.
+
+  ~~diagnostics (`publishDiagnostics` — a server-initiated notification
+  the reader thread still drops on the floor)~~ **client-level piece
+  DONE, one commit later; NOT wired to the shell.** `Diagnostic`/
+  `DiagnosticSeverity`, parsed in `reader_loop` (the notification
+  replaces the FULL list per URI each time, no delta to reconcile), read
+  via `LspClient::diagnostics(uri)` — there's no request/response for
+  diagnostics in the protocol, only a push, so this just reads the reader
+  thread's own cache. 6 new parser unit tests. The real proof: a genuine
+  `&str`-to-`i32` mismatch against a real `rust-analyzer`, checked for
+  the right severity and line.
+
+  Found and fixed a real test bug on the way: `scratch_package()` built
+  its temp directory from `std::process::id()` alone — identical for
+  every test in one binary, and `cargo test` runs them concurrently on
+  separate threads by default, so parallel tests were racing on the same
+  directory and the same rust-analyzer workspace root. Fixed to take a
+  per-test name.
+
+  What did NOT make it in, named rather than hidden: a second test
+  asserting that fixing the error via a follow-up `didChange` clears the
+  diagnostic. An isolated repro showed the SECOND `didChange`'s content
+  genuinely never reflected in a later diagnostics update, even after 40+
+  seconds — the diagnostic stayed pinned to the FIRST version's error.
+  Real client bug, a rust-analyzer version/config quirk, or a sandbox
+  resource limitation — not enough signal yet to know which, and a flaky
+  or wrong test claiming more than is proven would be worse than naming
+  the gap. Follow-up work.
+
+  ~~Still not done: ... wiring diagnostics into the shell at all (no
+  gutter marks, no status count — the client can fetch them, nothing in
+  aperture-egui asks it to yet)~~ **DONE, later commit.** `lsp_worker.rs`
+  wakes on a 200ms `recv_timeout` instead of blocking indefinitely on
+  `rx.recv()` — diagnostics are PUSHED by the server, not requested, and
+  the common case ("type an error, then pause") means the diagnostic
+  arrives AFTER the last edit, exactly when the worker would otherwise
+  have nothing left to wake it. Forwards only when the list actually
+  changed. `AppState.lsp_diagnostics`, a second gutter bar (deliberately
+  not sharing the git-diff bar's x position or color — an uncommitted
+  line with a live error is a common, real combination), and a status-bar
+  error/warning count, measured into the same room-budget check the
+  earlier status-bar overlap fix established so this can't reintroduce
+  that bug. Real proof: `lsp_diagnostics_e2e.rs` opens a genuine
+  `&str`-to-`i32` mismatch against a real `rust-analyzer` and polls
+  `AppState` (not the client) until the error surfaces on the right
+  line — deliberately does NOT test that fixing the error clears it,
+  since the paragraph above already found that unreliable and a second
+  test on the same unstable ground would just be more flakiness, not
+  information. Screenshot-verified afterward too: a real red gutter bar
+  on the mismatched line, "✕ 2 errors" in the status bar, both sourced
+  from a live server process.
+
+  ~~go-to-definition~~ **client-level DONE, one commit later; not wired
+  into the shell.** `LspClient::goto_definition(uri, line, character) ->
+  Vec<Location>` — every location the server names, not collapsed to the
+  first (a trait method can legitimately resolve to several
+  implementations). Handles all three response shapes the spec allows
+  (`null`, a single `Location`, an array, and `LocationLink` — a shape
+  this client doesn't advertise support for but nothing on the wire stops
+  a server from sending anyway), preferring `LocationLink`'s
+  `targetSelectionRange` (the identifier) over `targetRange` (the whole
+  enclosing item) so a jump lands on the name, not the top of a
+  potentially long function body. 10 new unit tests. Real proof:
+  `goto_definition_finds_a_locally_defined_function_through_a_real_
+  rust_analyzer` — a call site and its definition in the same file,
+  checked against what a real server actually resolves. `cargo test -p
+  aperture-lsp`: 29/29 (24 unit + 5 real-server), ~4s.
+
+  ~~wiring go-to-definition into the shell at all (no Ctrl+click, no
+  palette command — client capability only)~~ **DONE, F12.** Third
+  `lsp_worker.rs` outcome channel (`DefinitionOutcome`, its own generation
+  counter — two unrelated answers sharing one `Option<T>` is confusing
+  fastest), same coalesce-to-newest rule as completions. `go_to_definition`
+  converts the caret's char column to UTF-16 via `char_col_to_utf16` (a
+  second real caller for the position fix above); `jump_to_lsp_definition`
+  takes the first location LSP names, opens the target file through the
+  normal `open_file` path if it isn't the current one, converts the
+  response position back with `utf16_col_to_char`. `poll_lsp` now
+  collects definition outcomes into a local `Vec` before processing —
+  applying one can call `open_file`, which reassigns `self.lsp` itself,
+  which can't happen while still holding the `&self.lsp` borrow
+  `poll_definition()` needs.
+
+  Real proof: `lsp_goto_definition_e2e.rs` jumps ACROSS FILES through a
+  real `rust-analyzer` and checks the editor actually landed there.
+  Retries F12 if the first answer comes back empty — the same
+  "server needs a moment right after `didOpen`" finding from completions
+  and diagnostics, confirmed again here with an isolated raw-client repro
+  (identical query: empty on the first attempt, succeeds ~1s later)
+  before assuming a retry was the right fix rather than a symptom of
+  something actually broken.
+
+  ~~hover~~ **client-level DONE, one commit later; not wired into the
+  shell.** `LspClient::hover(uri, line, character) -> Option<Hover>`,
+  flattened to plain text regardless of which of the THREE legal response
+  shapes the server used (a `MarkupContent` object, a bare `MarkedString`,
+  the older `{language, value}` per-block shape, or an array of any of
+  those) — no renderer in this client would benefit from keeping Markdown
+  structure separate. `None` for a `null` response (nothing hoverable, a
+  normal answer) and for an empty-string value (a hover with nothing to
+  say is the same as no hover). 8 new unit tests. Found and fixed a
+  genuine copy-paste bug while writing this — a duplicated `#[test]`
+  attribute that made `cargo test -- --list` report the same test twice
+  under an identical path — traced with `--list | grep -c` rather than
+  dismissed once every individual run still said "ok". Real proof: a
+  real `rust-analyzer`'s hover text for a function call, checked for the
+  function's actual return type. `cargo test -p aperture-lsp`: 36/36 (30
+  unit + 6 real-server), ~4s.
+
+  ~~wiring hover into the shell at all (no hover-on-hover UI, no palette
+  command — client capability only)~~ **DONE, Ctrl+I.** Fourth
+  `lsp_worker.rs` outcome channel, same coalesce-to-newest shape as the
+  other three. Shown as a one-line status-bar message, not a full hover
+  overlay (future work). `hover_headline` picks which line of the
+  flattened hover text to show — NOT just the first line: found
+  interactively that rust-analyzer's hover for a same-crate function
+  commonly puts a bare crate-name annotation line first, and a naive
+  first-line version showed the package name instead of the type
+  signature. Prefers the first line that looks like Rust code (a keyword
+  or `->`), falls back to the first non-blank line otherwise. 4 new unit
+  tests including the exact bug scenario. Real proof: `lsp_hover_e2e.rs`
+  drives Ctrl+I through the real path and checks the status bar for the
+  actual return type; retries on "nothing found" the same way completion
+  and go-to-definition's tests already do. `cargo test -p aperture-egui
+  --lib`: 106/106 (was 102).
+
+  ~~incremental sync (`did_change` always sends the whole document)~~
+  **client-level DONE, one commit later; the shell still uses full sync.**
+  `LspClient::did_change_range(uri, start_line, start_character, end_line,
+  end_character, new_text, version)` for a RANGE-based delta, gated on
+  `supports_incremental_sync()` reading the server's own advertised
+  `capabilities.textDocumentSync` — refuses rather than sending a range
+  delta to a server that only understands full-document sync, which
+  would silently desync its copy of the file. `parse_sync_kind` handles
+  both legal shapes (a bare integer or the modern `{change: N}` object).
+  Real proof: two range-based inserts against a real `rust-analyzer` (a
+  new function, then a call site), confirmed via completion that the
+  incrementally-inserted symbol actually landed. `cargo test -p
+  aperture-lsp`: 40/40 (33 unit + 7 real-server, was 36).
+
+  Two self-inflicted bugs found and fixed while building this: a
+  `str_replace` that landed a struct field inside the wrong function's
+  parameter list (caught immediately by the compiler), and — worth
+  naming since it's a genuine lapse — a duplicated `#[test]` attribute
+  that I INITIALLY misdiagnosed as a harmless test-harness quirk from a
+  symbol-table dump, before `cargo check --workspace`'s own `warning:
+  duplicated attribute` on the very next build showed the source-grep
+  reasoning had been wrong. Left in TODO.md as a lesson, not smoothed
+  over: check the compiler's own warnings before building a case for why
+  something odd "must be" benign.
+
+  ~~Still not done: the worker/shell side still calls the full-document
+  `did_change` unconditionally — this is client capability only. Wiring
+  the shell to prefer `did_change_range` needs an actual text diff
+  between old and new buffer content, which `aperture-core` has no
+  utility for yet~~ **DONE, one commit later.** New `aperture_core::
+  textdiff` module: a common-prefix/common-suffix diff, not a general
+  Myers diff — deliberately, since the one real caller (incremental
+  `didChange`) only ever has ONE contiguous edit to describe at a time
+  (a keystroke, or a single `replace_range`/`replace_many` call), which
+  this finds in O(n). 11 unit tests, including the "middle char of a
+  repeated pattern" case that needs the suffix scan bounded by remaining
+  length rather than by zero, and a multi-byte-codepoint safety test
+  rather than an assumption.
+
+  `lsp_worker.rs`'s `Msg::Change` now carries an optional edit tuple
+  ALREADY UTF-16-converted by the caller (the worker has no line-text
+  access to do that conversion itself); the worker decides whether to
+  actually use it — checking `supports_incremental_sync()`, which only
+  it can call — falling back to full-text sync on any failure.
+  `AppState` tracks `lsp_last_synced_text`, updated unconditionally after
+  every send so the next diff is always against what the server was
+  actually told.
+
+  Real proof: `lsp_incremental_sync_e2e.rs` types a CROSS-FILE symbol
+  character by character (many separate incremental edits), backspaces
+  and retypes part of it, then confirms a real `rust-analyzer` still
+  resolves it via completion. Cross-file specifically — a same-file
+  symbol would let the test pass even if incremental sync silently did
+  nothing, since the local tree-sitter tier alone already knows same-file
+  symbols; caught my own first draft using the weaker same-file version
+  and rewrote it before trusting a pass. `cargo test -p aperture-core
+  --features tree-sitter`: 171/171 (was 160). All four existing LSP e2e
+  tests re-run and still pass, since they all now exercise this path on
+  every keystroke.
+
+  ~~Also still not done: a real hover overlay (currently a one-line
+  status message, not a panel showing the full flattened text)~~ **DONE,
+  one commit later — and building its test uncovered a serious
+  pre-existing bug.** `AppState.hover_overlay` holds the full flattened
+  hover text; a new `view.rs` overlay (modeled on `edit_review_overlay`'s
+  shape) renders it in a scrollable panel, cleared on Escape, on the next
+  edit, or when superseded by a newer answer.
+
+  **The bug found building it**: `type_text`'s SINGLE-CURSOR plain-typing
+  path inlined three of `after_edit`'s six responsibilities and silently
+  never ran the other three — including `notify_lsp_changed`. Concretely:
+  `didChange` was NEVER sent to the LSP server for an ordinary keystroke,
+  only for backspace/delete/enter/tab and the multi-cursor fan-out path.
+  Every LSP e2e test in this whole session happened to still pass despite
+  this, because they all ask for completions at a position whose
+  surrounding SCOPE is already correct from `didOpen` alone — an
+  unfiltered "what's in scope here" answer doesn't need the exact typed
+  prefix to have been communicated to look right. Found only because a
+  test for the overlay's "clear on next edit" behavior failed and the
+  failure didn't match the mental model of what should have been true.
+
+  Verified BOTH directions before trusting the fix: `lsp_typing_sync_
+  regression.rs` defines a brand-new local variable by typing its full
+  declaration character-by-character, then asks for completions against
+  that exact name from a different line — answerable ONLY if the
+  keystrokes were actually synced. Confirmed it fails against the
+  pre-fix code (reverted `state.rs` by hand, ran it, watched it fail)
+  and passes against the fix, in that order, before committing either.
+
+  Also found and fixed a SECOND duplicated `#[test]` attribute while
+  writing tests for this — same bug shape as twice before this session,
+  this time caught immediately via `cargo check --all-targets`'s own
+  warning rather than grep-based reasoning, which is the lesson the
+  previous occurrence was supposed to have already taught.
+
+  `cargo test -p aperture-egui --lib`: 108/108 (was 106). Full workspace
+  check clean, no lingering `rust-analyzer` process.
+  `workspace_symbols`'s local tree-sitter outline and `route`'s
+  keyword-scored candidates stay the fast, dependency-free default tiers;
+  LSP is an ADDITIONAL tier alongside them, never a replacement.
+
+  Interactive Xvfb verification DID happen, one commit later, and found
+  a THIRD real bug the automated test's own code path couldn't have
+  caught: `AppState::new` (what `aperture some_file.rs` — the normal way
+  anyone runs the binary — actually calls) never went through
+  `open_file`, so LSP spawning silently never fired for a file opened
+  from the command line, only via the in-app Ctrl+O dialog. Found by
+  launching the real binary the normal way and watching nothing happen;
+  fixed by calling `start_lsp_for_current_file` from `new()` too.
+  Screenshot-verified afterward: typed a cross-file prefix in a real
+  window, the popup showed `cross_file_only_symbol  fn() -> i32` merged
+  in with the local tier's own candidates.
+- **Voice commands — the text-side half, DONE; the audio half deliberately
+  not attempted.** aperture has no microphone, no ASR, no wake-word
+  detector, and building one from scratch would duplicate `shared/
+  voice-kit` and `apps/voiceterm/egui-frontend/src/voice_routing.rs`'s
+  hallucination-trimming, wake-prefix, and consumer-arbitration work —
+  those own "how do we hear" and "who gets to act"; this session added the
+  piece neither of them does: turning an already-decoded transcript into
+  an EDITOR command.
+
+  `aperture-core/src/voice.rs`: a small, deliberately unforgiving
+  `VoiceCommand` grammar (save, undo/redo, select all, copy/cut/paste,
+  find/search-for, go-to-line, add-cursor/select-all-occurrences, a
+  `type <words>` escape hatch for literal dictated text) — unforgiving
+  because voice_routing.rs's own philosophy is that a near-miss should not
+  execute, and a command vocabulary loose enough to catch every phrasing
+  is also loose enough to fire on ordinary dictated prose. 9 tests.
+
+  `AppState::run_voice_command`: every arm calls an EXISTING method
+  (`save`, `Editor::undo`, `add_next_cursor`, ...) rather than
+  duplicating its logic, so a voice command and its keyboard equivalent
+  can never disagree about what it does. Returns clipboard text for
+  Copy/Cut the same shape `Effects` does from `handle()`, since this
+  headless method has no path to the platform clipboard itself. 10 tests.
+
+  Palette entry "Voice: run command…" — a typed stand-in for what a
+  transcript would say, useful on its own for testing command shapes
+  without a working microphone.
+
+  Two real bugs found by running the actual binary, not by `cargo test`:
+  a first attempt bound this to Ctrl+Shift+V, which silently never fired —
+  traced to egui delivering Ctrl+V-family combos as its own clipboard
+  `Event::Paste`/`Event::Copy` before they become a raw key event, in
+  every environment where that interception applies. Removed the
+  keybinding rather than ship one that quietly does nothing; the palette
+  route is the only entry point now, and it works (verified: "find total"
+  opens the bar seeded and matched, "go to line 3" moves the caret,
+  "save" writes the file and shows "saved" in the status bar). Also found
+  two now-divergent copies of the same "open voice mode, discard stale
+  cursors" logic (the removed keybinding's handler and the palette
+  dispatch) and merged them into one method before they could drift.
+
+  `cargo test -p aperture-core --features tree-sitter`: 143/143 (was
+  134). `cargo test -p aperture-egui --lib`: 98/98 (was 88).
+
+  Not attempted: an actual dictation sink (voice_routing.rs's
+  `Listening::Commands` state is the model to follow — this parser would
+  be the intent matcher it describes as "suspended during dictation," not
+  something that runs on every transcript unconditionally); this needs a
+  real audio pipeline wired to aperture's process model, which is a
+  materially different and larger piece of work than the grammar above.
+
+  **Follow-on, same session: vocabulary buildup + multi-speaker
+  sessions.** `parse_with_vocab` resolves "go to <name>" / "jump to
+  <name>" / "navigate to <name>" against a LIVE vocabulary (a project's
+  own symbol names) rather than a fixed word list — substring/prefix
+  matching, not a general fuzzy scorer, since `uikit_egui::fuzzy` lives
+  in a UI crate `aperture-core` can't depend on without giving up its
+  headless property, and the one transformation actually needed (joining
+  spoken words with underscores, since a recognizer emits pauses as
+  spaces) doesn't need general fuzzy matching to get right. Vocabulary is
+  refreshed from the current outline on every command, not cached — a
+  voice command is rare enough that re-deriving costs nothing, and a
+  stale vocabulary missing a function someone just wrote would be a
+  confusing silent failure.
+
+  `VoiceSession`: per-speaker "again"/"repeat that" history, keyed by a
+  `SiteId`-shaped string matching `aperture_collab`'s existing
+  multi-participant model rather than inventing a second one (though
+  collab itself still isn't wired to the shell either). The one piece of
+  multi-user behavior that's silently wrong by default if missed: Bob
+  saying "again" must replay BOB's own last command, not whoever spoke
+  most recently session-wide. `run_voice_command` now delegates to
+  `run_voice_command_as("local", ...)`; a real multi-participant caller
+  uses `run_voice_command_as` directly.
+
+  `cargo test -p aperture-core --features tree-sitter`: 160/160 (was
+  148). `cargo test -p aperture-egui --lib`: 102/102 (was 98).
+
+  Not done: no audio pipeline (still 100% text-side — an utterance has
+  to arrive as a string from somewhere upstream), no real speaker
+  diarization/voiceprint (speaker identity is an opaque string this
+  layer trusts, not something it derives), no wiring of
+  `aperture-collab`'s actual multi-participant session into
+  `aperture-egui` (`run_voice_command_as` exists and is tested, but
+  nothing in the shell calls it with more than one speaker yet).
 
 ## voiceterm — loop-trimmer off-by-one (fixed at source, 2026-08-19)
 

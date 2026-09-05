@@ -27,6 +27,7 @@ pub enum Mode {
     WorkspaceSymbol,
     GoToRoute,
     AiEditPrompt,
+    VoiceCommand,
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +92,13 @@ impl PaletteState {
     pub fn ai_edit_prompt() -> Self {
         PaletteState { mode: Mode::AiEditPrompt, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new() }
     }
+
+    /// A plain text-entry mode: the typed line IS the utterance, sent to
+    /// `AppState::run_voice_command` on Enter. A typed stand-in for what a
+    /// real transcript would say — see `aperture_core::voice`'s module doc.
+    pub fn voice_command() -> Self {
+        PaletteState { mode: Mode::VoiceCommand, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new() }
+    }
 }
 
 /// Fuzzy-rank `symbols` by name against `query`, capped at `limit`. Same
@@ -111,6 +119,7 @@ pub enum Cmd {
     WorkspaceSymbolMode,
     GoToRouteMode,
     AiEditMode,
+    VoiceCommandMode,
     ToggleAi,
     CompleteNow,
     ToggleLoopPane,
@@ -135,6 +144,7 @@ pub fn command_list() -> Vec<(String, Cmd)> {
         ("Go to Symbol in Workspace… (Ctrl+T)".to_string(), Cmd::WorkspaceSymbolMode),
         ("Go to via Route… (Ctrl+G)".to_string(), Cmd::GoToRouteMode),
         ("AI: Edit Selection…".to_string(), Cmd::AiEditMode),
+        ("Voice: run command…".to_string(), Cmd::VoiceCommandMode),
         ("AI: Toggle ghost completions".to_string(), Cmd::ToggleAi),
         ("AI: Complete now".to_string(), Cmd::CompleteNow),
         ("View: Toggle loop pane".to_string(), Cmd::ToggleLoopPane),
@@ -208,6 +218,10 @@ pub fn apply(cmd: Cmd, s: &mut AppState, now_ms: u64) {
         }
         Cmd::AiEditMode => {
             s.palette = Some(PaletteState::ai_edit_prompt());
+            return; // keep the palette open, in its new mode
+        }
+        Cmd::VoiceCommandMode => {
+            s.open_voice_command();
             return; // keep the palette open, in its new mode
         }
         Cmd::ToggleAi => {

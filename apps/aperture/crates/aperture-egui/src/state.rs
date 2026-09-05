@@ -48,6 +48,7 @@ pub enum K {
     E,
     F,
     F3,
+    F12,
     Space,
     Comma,
     Period,
@@ -56,6 +57,9 @@ pub enum K {
     H,
     T,
     G,
+    D,
+    L,
+    I,
 }
 
 /// Incremental search. Matches are absolute char ranges, kept sorted; the
@@ -428,10 +432,79 @@ pub struct AppState {
     line_map_scratch: aperture_complete::prefixcache::LineMap,
     pub command_line: String,
 
+    /// Multi-cursor: the SECONDARY cursors. `editor.sel` stays the primary.
+    ///
+    /// Not `Cursors` wholesale, and not moved into `Editor`, on purpose. Every
+    /// existing path — motion, find, ghost completion, IME, click, helix — is
+    /// written against one `editor.sel`, and rewriting thirty call sites to be
+    /// cursor-set-aware in one go is how a working editor stops working. With
+    /// this vec empty (the overwhelmingly common case) not one of those paths
+    /// changes behaviour or even branches differently; with it non-empty, the
+    /// handful of paths that fan out consult `cursors()` and go through
+    /// `aperture_core::multicursor`, which owns the offset arithmetic.
+    ///
+    /// The promotion into `Editor` stays available: `cursors()` is the only
+    /// reader, so moving the storage later is a change to two functions rather
+    /// than to the shell.
+    pub extra_cursors: Vec<aperture_core::editor::Selection>,
     pub ghost_since: Option<u64>,
     pub palette: Option<crate::palette_ui::PaletteState>,
     pub theme_id: snapclone_theme::PaletteId,
     pub status: Option<(String, u64)>, // message, expires_at_ms
+    /// `None` until a file recognized as having a configured server is
+    /// opened AND spawning that server succeeds — optional and best-effort
+    /// throughout, per `lsp_worker`'s own doc. Only Rust (`rust-analyzer`)
+    /// is wired up; every other language simply never sets this.
+    lsp: Option<crate::lsp_worker::LspWorker>,
+    lsp_uri: Option<String>,
+    /// The document text as of the LAST successful sync (`didOpen` or
+    /// `didChange`) — `notify_lsp_changed` diffs against this to compute
+    /// an incremental-sync candidate, then updates it to the new text
+    /// unconditionally (even when the worker ends up falling back to full
+    /// sync) so the NEXT diff is still against what the server was told,
+    /// not against some earlier state.
+    lsp_last_synced_text: String,
+    /// LSP's own per-document version counter — required by `didChange`,
+    /// and deliberately NOT `editor.version` (that counts every internal
+    /// mutation including ones the server was never told about, e.g. before
+    /// this file had a worker at all; reusing it would let the two
+    /// disagree about how many changes the server has actually seen).
+    lsp_doc_version: i64,
+    /// Bumped on every popup-refresh that fires an LSP request; an
+    /// arriving [`lsp_worker::LspOutcome`] is applied only if this still
+    /// matches — the same generation-gate `aperture_complete::engine`
+    /// already uses so a slow answer can't land after the caret moved on.
+    lsp_gen: u64,
+    /// The word-start offset the current `lsp_gen` request was made for —
+    /// `poll_lsp` needs this to open a FRESH popup when the local tier
+    /// found nothing but LSP answers anyway (a std type invisible to the
+    /// local single-file outline, for instance).
+    lsp_pending_prefix_start: Option<usize>,
+    /// Bumped on every go-to-definition request; an arriving
+    /// `DefinitionOutcome` is applied only if this still matches — same
+    /// generation-gate `lsp_gen` already is for completions.
+    lsp_definition_gen: u64,
+    /// Bumped on every hover request; an arriving `HoverOutcome` is
+    /// applied only if this still matches.
+    lsp_hover_gen: u64,
+    /// The full flattened hover text for a real overlay panel, distinct
+    /// from the one-line status message: the status headline exists so
+    /// something useful shows up fast without blocking on scroll/dismiss
+    /// interaction, but a real type signature plus doc comment is often
+    /// several lines and deserves more than one line of status text.
+    /// Cleared on Escape, on the next edit, or when a new hover request's
+    /// answer supersedes it (never left showing stale text at a caret
+    /// position the person has since moved away from).
+    pub hover_overlay: Option<String>,
+    /// Latest `publishDiagnostics` for the current file, empty when no LSP
+    /// worker is running or the file is currently clean. Line numbers are
+    /// LSP's own (zero-indexed), matching `git_changed`'s convention.
+    pub lsp_diagnostics: Vec<aperture_lsp::Diagnostic>,
+    /// Vocabulary buildup + per-speaker "again" history for voice commands
+    /// — see `aperture_core::voice::VoiceSession`'s own doc for the honest
+    /// scope (no microphone, no diarization; this is what happens once an
+    /// utterance is already text and already attributed to someone).
+    voice_session: aperture_core::voice::VoiceSession,
 }
 
 /// The strip as it starts: empty recents, a few pinned quick actions.
@@ -554,10 +627,22 @@ impl AppState {
             line_map: aperture_complete::prefixcache::LineMap::new(),
             line_map_scratch: aperture_complete::prefixcache::LineMap::new(),
             command_line: String::new(),
+            extra_cursors: Vec::new(),
             ghost_since: None,
             palette: None,
             theme_id: snapclone_theme::PaletteId::Night,
             status: None,
+            lsp: None,
+            lsp_uri: None,
+            lsp_last_synced_text: String::new(),
+            lsp_doc_version: 1,
+            lsp_gen: 0,
+            lsp_pending_prefix_start: None,
+            lsp_definition_gen: 0,
+            lsp_hover_gen: 0,
+            hover_overlay: None,
+            lsp_diagnostics: Vec::new(),
+            voice_session: aperture_core::voice::VoiceSession::new(),
         };
         if with_engine {
             s.apply_env_provider();
@@ -568,6 +653,13 @@ impl AppState {
             s.revs = gitspace::history(r, rel, 48);
         }
         s.refresh_git();
+        // `open_file` isn't the only way a file gets loaded — the binary's
+        // CLI-argument path (`aperture some_file.rs`) constructs AppState
+        // with a path directly and never calls `open_file` at all. Found
+        // by launching the real binary this way and watching the popup
+        // never gain an LSP-sourced item: `start_lsp_for_current_file`
+        // needs calling from both places, not just the in-app Open dialog.
+        s.start_lsp_for_current_file(&text);
         s
     }
 
@@ -836,6 +928,7 @@ impl AppState {
     pub fn accept_pending_edit(&mut self) {
         let Some(pending) = self.pending_edit.take() else { return };
         let Some(proposed) = pending.proposed else { return };
+        self.discard_extra_cursors(); // replace_range isn't fan-out-aware
         let end = pending.end.min(self.editor.buffer.len_chars());
         let start = pending.start.min(end);
         self.editor.replace_range(start, end, &proposed);
@@ -852,6 +945,7 @@ impl AppState {
     /// fresh parse, caret home, undo stack reset (see `live_text`'s doc).
     fn set_preview_text(&mut self, text: &str) {
         self.editor = Editor::from_str(text);
+        self.discard_extra_cursors(); // a whole new Editor; old offsets mean nothing
         self.syntax = Syntax::new(self.lang);
         self.dirty = false;
         self.popup = None;
@@ -1133,11 +1227,46 @@ impl AppState {
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.label.len().cmp(&b.1.label.len())));
         let items: Vec<PopupItem> = scored.into_iter().map(|(_, i)| i).take(24).collect();
         if items.is_empty() {
+            // The LOCAL tier has nothing, but LSP might — a std type like
+            // "String" is invisible to this file's own tree-sitter outline
+            // by construction, not a matching failure to fix here. Don't
+            // give up on the popup just because this tier came up empty;
+            // request LSP and let `poll_lsp` open the popup itself if an
+            // answer arrives before the person moves on.
             self.popup = None;
+            self.request_lsp_completion(start);
         } else {
             self.ghost.dismiss();
             self.popup = Some(Popup { items, sel: 0, prefix_start: start });
+            self.request_lsp_completion(start);
         }
+    }
+
+    /// Ask the LSP worker (if one is running) for completions at the
+    /// caret, tagged with a fresh generation so a slow answer that lands
+    /// after the popup has moved on gets discarded by `poll_lsp` rather
+    /// than silently appended to (or opening) whatever's showing by then.
+    /// `prefix_start` is remembered alongside the generation so `poll_lsp`
+    /// can construct a FRESH popup from an LSP-only answer, not just merge
+    /// into one the local tier already opened.
+    fn request_lsp_completion(&mut self, prefix_start: usize) {
+        let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) else { return };
+        self.lsp_gen += 1;
+        self.lsp_pending_prefix_start = Some(prefix_start);
+        let p = self.editor.caret_pos();
+        // LSP's `position.character` is a UTF-16 code-unit offset, not a
+        // char column (`caret_pos().col`) — they agree for ASCII and
+        // ordinary BMP text (including CJK, Cyrillic, every script that
+        // isn't specifically astral-plane) and diverge only for
+        // codepoints needing a UTF-16 surrogate pair, which
+        // `char_col_to_utf16` accounts for the same way `width.rs`
+        // already does for on-screen visual columns — a different unit
+        // again, computed by a different function, but the same shape of
+        // fix for the same underlying reason (one char is not always one
+        // unit of whatever the consumer actually counts in).
+        let line_text = self.editor.buffer.line(p.line);
+        let utf16_col = aperture_core::width::char_col_to_utf16(&line_text, p.col);
+        lsp.request_completion(uri.clone(), p.line as u32, utf16_col, self.lsp_gen);
     }
 
     fn popup_accept(&mut self, now_ms: u64) {
@@ -1325,6 +1454,12 @@ impl AppState {
     }
 
     fn open_find_ex(&mut self, with_replace: bool) {
+        // `handle_find` intercepts every event while the bar is open, before
+        // `key()`'s multi-cursor arms ever run — `replace_current`/
+        // `replace_all` mutate the buffer through `Editor` directly, with no
+        // notion of `extra_cursors`. Collapsing here, once, is simpler and
+        // safer than making the whole find/replace bar fan-out-aware.
+        self.discard_extra_cursors();
         let seed = if !self.editor.sel.is_caret() {
             let t = self.editor.selected_text();
             if t.contains('\n') { String::new() } else { t }
@@ -1579,6 +1714,7 @@ impl AppState {
             Ev::Paste(t) => {
                 self.ghost.dismiss();
                 self.debounce.cancel();
+                self.discard_extra_cursors(); // paste isn't fan-out-aware
                 self.editor.insert_text(&t, now_ms);
                 self.after_edit(now_ms);
             }
@@ -1586,6 +1722,7 @@ impl AppState {
             Ev::Cut => {
                 fx.clipboard = self.copy_selection();
                 if !self.editor.sel.is_caret() {
+                    self.discard_extra_cursors(); // cut isn't fan-out-aware
                     let (a, b) = (self.editor.sel.min(), self.editor.sel.max());
                     self.editor.replace_range(a, b, "");
                     self.after_edit(now_ms);
@@ -1615,8 +1752,186 @@ impl AppState {
         fx
     }
 
+    // ── multi-cursor ──────────────────────────────────────────────────────
+    //
+    // `editor.sel` is always the primary; `extra_cursors` holds the rest.
+    // These two are the ONLY place that boundary is crossed — everything
+    // else either reads `editor.sel` (unaware there might be more) or calls
+    // `fan_out_edit` (aware there might be). Assembling/disassembling a
+    // `Cursors` here rather than storing one keeps every pre-existing
+    // single-cursor call site correct by construction: they simply never see
+    // the rest.
+
+    /// Drop the secondary cursors WITHOUT trying to preserve them.
+    ///
+    /// Every command that mutates or replaces the buffer without going
+    /// through `fan_out_ranges` must call this first. Char offsets in
+    /// `extra_cursors` are only meaningful relative to the buffer they were
+    /// computed against; undo, redo, paste, an AI edit landing, a revision
+    /// preview, or opening a different file all change that buffer without
+    /// telling `extra_cursors` anything shifted, so leaving them in place
+    /// would silently fan a LATER edit out to stale, wrong, or (after undo
+    /// shrinks the buffer) merely coincidentally-valid positions instead of
+    /// failing loudly. Collapsing to the primary is the honest fallback: the
+    /// gesture that triggered one of these commands almost never had
+    /// multi-cursor in mind anyway.
+    ///
+    /// Found by running the binary, not by `cargo test`: Ctrl+Shift+L across
+    /// three lines, type a replacement (fans out correctly), Ctrl+Z (buffer
+    /// correctly restored, but `extra_cursors` were never told the buffer
+    /// changed length — the very next keystroke would have fanned out to
+    /// whatever those stale offsets now happened to land on).
+    pub(crate) fn discard_extra_cursors(&mut self) {
+        self.extra_cursors.clear();
+    }
+
+    /// The full cursor set, primary first.
+    fn cursors(&self) -> aperture_core::multicursor::Cursors {
+        if self.extra_cursors.is_empty() {
+            aperture_core::multicursor::Cursors::single(self.editor.sel)
+        } else {
+            let mut sels = vec![self.editor.sel];
+            sels.extend(self.extra_cursors.iter().copied());
+            aperture_core::multicursor::Cursors::new(sels)
+        }
+    }
+
+    /// Split a (possibly reordered, possibly merged) `Cursors` back into
+    /// `editor.sel` + `extra_cursors`. `Cursors::new`'s primary-tracking is
+    /// what makes this safe to call after a merge: the primary index still
+    /// points at the right selection even though the vec was sorted.
+    fn set_cursors(&mut self, c: aperture_core::multicursor::Cursors) {
+        let all = c.all();
+        self.editor.sel = c.primary();
+        self.extra_cursors = all.iter().copied().filter(|s| *s != c.primary()).collect();
+    }
+
+    /// Apply arbitrary per-cursor `(start, end, text)` ranges as one undo
+    /// step, then place a caret at each range's post-edit position.
+    ///
+    /// NOT `Cursors::after_insert`: that method assumes each edit's removed
+    /// span is exactly the corresponding *selection* (`s.max() - s.min()`),
+    /// which is true for typing-over-a-selection but false for backspace,
+    /// where a caret (an empty selection) still removes one character. Ranges
+    /// here are already char index, so the same ascending-shift arithmetic
+    /// applies — it just has to read `removed` from the range instead of
+    /// from the original `Selection`.
+    ///
+    /// `coalesce` is threaded straight to `Editor`'s coalescing choice
+    /// between `replace_many` (a fresh undo step, always) and
+    /// `replace_many_coalescing` (may merge into the previous keystroke's
+    /// group) — the same fork `insert_text`/`backspace` make per character.
+    fn fan_out_ranges(&mut self, ranges: Vec<(usize, usize, String)>, coalesce: bool, now_ms: u64) {
+        let new_carets = Self::carets_after_ranges(&ranges);
+        if coalesce {
+            self.editor.replace_many_coalescing(ranges, true, now_ms);
+        } else {
+            self.editor.replace_many(ranges, now_ms);
+        }
+        self.set_cursors(aperture_core::multicursor::Cursors::new(new_carets));
+    }
+
+    /// Where each cursor ends up after `ranges` is applied — computed
+    /// up front, against the ORIGINAL offsets, the same way `replace_many`
+    /// itself does internally. Kept separate from `Editor` (which has no
+    /// notion of "cursor") rather than derived from `editor.sel` afterward,
+    /// since a fan-out edit leaves only ONE caret in `editor.sel` and the
+    /// rest have to be reconstructed from the ranges regardless.
+    fn carets_after_ranges(ranges: &[(usize, usize, String)]) -> Vec<Selection> {
+        let mut sorted: Vec<&(usize, usize, String)> = ranges.iter().collect();
+        sorted.sort_by_key(|r| r.0);
+        let mut shift: isize = 0;
+        let mut new_carets = Vec::with_capacity(sorted.len());
+        for (start, end, text) in sorted {
+            let grow = text.chars().count() as isize;
+            let removed = (*end as isize) - (*start as isize);
+            let at = (*start as isize + shift + grow).max(0) as usize;
+            new_carets.push(Selection::caret(at));
+            shift += grow - removed;
+        }
+        new_carets
+    }
+
+    /// Tab at every cursor: each pads to ITS OWN next tab stop, not a shared
+    /// literal `\t` — `Editor::insert_tab` never inserts a real tab
+    /// character (the whole file is space-indented; `TAB_WIDTH` is the stop
+    /// distance, not a byte to insert), and two cursors at different columns
+    /// legitimately need a different number of spaces.
+    fn fan_out_insert_tab(&mut self, now_ms: u64) {
+        let c = self.cursors();
+        let ranges: Vec<(usize, usize, String)> = c.all().iter().map(|s| {
+            let col = self.editor.buffer.char_to_pos(s.min()).col;
+            let n = aperture_core::editor::TAB_WIDTH - (col % aperture_core::editor::TAB_WIDTH);
+            (s.min(), s.max(), " ".repeat(n))
+        }).collect();
+        self.fan_out_ranges(ranges, false, now_ms);
+    }
+
+    fn fan_out_insert(&mut self, text: &str, now_ms: u64) {
+        let c = self.cursors();
+        let ranges: Vec<(usize, usize, String)> =
+            c.all().iter().map(|s| (s.min(), s.max(), text.to_string())).collect();
+        // Same rule as `Editor::insert_text`: only a single non-newline
+        // character coalesces with the run before it.
+        let coalesce = text.chars().count() == 1 && text != "\n";
+        self.fan_out_ranges(ranges, coalesce, now_ms);
+    }
+
+    /// Backspace at every cursor: each becomes a one-char-back deletion (or,
+    /// if it already has a selection, that selection).
+    fn fan_out_backspace(&mut self, now_ms: u64) {
+        let c = self.cursors();
+        // Coalescing only when EVERY cursor is a plain caret deleting a
+        // single non-newline character — the same condition `Editor::
+        // backspace` checks for its one cursor. A cursor with a live
+        // selection makes this a "delete selection" gesture instead of a
+        // keystroke, and mixing the two into one fan-out group would let an
+        // unrelated multi-char deletion silently absorb into a typing run.
+        let coalesce = c.all().iter().all(|s| {
+            s.is_caret() && self.editor.buffer.char_at(s.head.saturating_sub(1)) != Some('\n')
+        });
+        let ranges: Vec<(usize, usize, String)> = c.all().iter().map(|s| {
+            if s.is_caret() {
+                let end = s.head;
+                let start = self.editor.buffer.clamp(end.saturating_sub(1));
+                (start, end, String::new())
+            } else {
+                (s.min(), s.max(), String::new())
+            }
+        }).collect();
+        self.fan_out_ranges(ranges, coalesce, now_ms);
+    }
+
+    fn fan_out_delete_forward(&mut self, now_ms: u64) {
+        let c = self.cursors();
+        let ranges: Vec<(usize, usize, String)> = c.all().iter().map(|s| {
+            if s.is_caret() {
+                let start = s.head;
+                let end = self.editor.buffer.clamp(start + 1);
+                (start, end, String::new())
+            } else {
+                (s.min(), s.max(), String::new())
+            }
+        }).collect();
+        // `Editor::delete_forward` never coalesces (`false`, unconditionally)
+        // — matched here rather than given its own rule.
+        self.fan_out_ranges(ranges, false, now_ms);
+    }
+
     fn type_text(&mut self, t: &str, now_ms: u64) {
         self.preedit.clear(); // a real insertion always ends any pending composition
+        if !self.extra_cursors.is_empty() {
+            // Ghost completion, auto-pair and the symbol popup are all keyed
+            // to ONE caret's context — none of the three has a fan-out story,
+            // and guessing one is worse than not having it. Multi-cursor
+            // typing is plain insertion, at every cursor, nothing speculative
+            // shown at any of them.
+            self.ghost.dismiss();
+            self.debounce.cancel();
+            self.fan_out_insert(t, now_ms);
+            self.after_edit(now_ms);
+            return;
+        }
         if self.try_auto_pair(t, now_ms) {
             self.popup = None;
             return;
@@ -1637,9 +1952,23 @@ impl AppState {
         // suggestion. One source of truth beats two that need syncing.
         self.typeout = None;
         self.editor.insert_text(t, now_ms);
-        self.dirty = true;
-        self.syntax.absorb(&mut self.editor.buffer);
-        self.follow_caret = true;
+        // `after_edit`, not the three lines it inlines to be (dirty=true;
+        // syntax.absorb; follow_caret=true) — a REAL, pre-existing bug
+        // found while writing a test for hover_overlay's edit-dismissal
+        // behavior: this branch had drifted out of sync with after_edit as
+        // it gained more responsibilities (notify_lsp_changed,
+        // invalidate_cache_for_edit, clearing hover_overlay) that ORDINARY
+        // TYPING — the single most common edit there is — silently never
+        // ran. Concretely: `didChange` was NEVER sent to the LSP worker
+        // for a plain keystroke, only for backspace/delete/enter/tab and
+        // the multi-cursor fan-out path, which is why every LSP e2e test
+        // so far happened to still pass — completion at a syntactically
+        // valid position inside an unchanged-since-didOpen function body
+        // returns the same in-scope candidates whether or not the typed
+        // prefix was ever communicated, so the tests were unknowingly
+        // exercising "completion works when nothing was typed into the
+        // synced copy" rather than proving sync itself worked for typing.
+        self.after_edit(now_ms);
         if consumed {
             // Ghost absorbed the keystroke: no re-request, no debounce churn.
             self.debounce.cancel();
@@ -1664,7 +1993,159 @@ impl AppState {
         self.syntax.absorb(&mut self.editor.buffer);
         self.follow_caret = true;
         self.invalidate_cache_for_edit();
+        self.notify_lsp_changed();
+        self.hover_overlay = None; // stale the instant the buffer under it changes
         let _ = now_ms;
+    }
+
+    /// `didChange` on every edit, unconditionally — no debounce, unlike the
+    /// AI completion path. A stale server-side document view would answer
+    /// completions against text that no longer exists, which is a worse
+    /// failure than one extra IPC message per keystroke costs; the worker
+    /// thread absorbs the cost off the UI thread regardless (see
+    /// `lsp_worker`'s own doc for why this is safe to call often).
+    fn notify_lsp_changed(&mut self) {
+        let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) else { return };
+        self.lsp_doc_version += 1;
+        let new_text = self.editor.buffer.to_string();
+        // Computed against the LAST text the server was actually told
+        // about, not against some other snapshot — the whole point of
+        // incremental sync is describing what changed since THAT point.
+        let edit = aperture_core::textdiff::diff(&self.lsp_last_synced_text, &new_text).map(|e| {
+            // LSP positions are UTF-16 code units; textdiff's Pos is char-
+            // indexed (see width.rs's own doc on why these differ, and
+            // request_lsp_completion for the same conversion applied to a
+            // single position rather than a range). The line text has to
+            // come from OLD_TEXT's own lines, not the current buffer's —
+            // the edit's start/end are positions WITHIN the old text, and
+            // the current buffer may have since diverged further if
+            // several edits landed before this sync point (unlikely given
+            // this runs from after_edit's own choke point, but the
+            // correctness argument shouldn't depend on that).
+            let old_lines: Vec<&str> = self.lsp_last_synced_text.split('\n').collect();
+            let line_text = |line: usize| old_lines.get(line).copied().unwrap_or("");
+            let start_col = aperture_core::width::char_col_to_utf16(line_text(e.start.line), e.start.col);
+            let end_col = aperture_core::width::char_col_to_utf16(line_text(e.end.line), e.end.col);
+            (e.start.line as u32, start_col, e.end.line as u32, end_col, e.text)
+        });
+        self.lsp_last_synced_text = new_text.clone();
+        lsp.change(uri.clone(), new_text, edit, self.lsp_doc_version);
+    }
+
+    /// Apply an arrived LSP completion outcome to the popup, if it's still
+    /// for the request the popup is actually waiting on. Called once per
+    /// frame from the view's tick, same shape as `poll_completions`.
+    pub fn poll_lsp(&mut self, now_ms: u64) {
+        let Some(lsp) = &self.lsp else { return };
+        // Drained into a local Vec, not processed inline: `jump_to_lsp_
+        // definition` needs `&mut self` (it can call `open_file`, which
+        // reassigns `self.lsp` itself), so it can't run while `lsp` — a
+        // borrow of `self.lsp` — is still alive. Collecting first, then
+        // dropping `lsp` before the second loop, is the whole fix.
+        let mut definition_outcomes = Vec::new();
+        while let Some(outcome) = lsp.poll_definition() {
+            definition_outcomes.push(outcome);
+        }
+        let mut hover_outcomes = Vec::new();
+        while let Some(outcome) = lsp.poll_hover() {
+            hover_outcomes.push(outcome);
+        }
+        while let Some(diags) = lsp.poll_diagnostics() {
+            self.lsp_diagnostics = diags;
+        }
+        while let Some(outcome) = lsp.poll() {
+            if outcome.generation != self.lsp_gen {
+                continue; // superseded by a later request; the caret moved on
+            }
+            match &mut self.popup {
+                Some(popup) => {
+                    let existing: std::collections::HashSet<String> =
+                        popup.items.iter().map(|i| i.label.clone()).collect();
+                    for item in outcome.items {
+                        if existing.contains(&item.label) {
+                            continue; // already offered by the local-symbol tier
+                        }
+                        popup.items.push(PopupItem {
+                            label: item.label,
+                            insert: item.insert_text,
+                            detail: item.detail.unwrap_or_default(),
+                        });
+                    }
+                }
+                None => {
+                    // The local tier had nothing (e.g. a std type this
+                    // file never defines) — LSP answering anyway is reason
+                    // enough to open the popup fresh, provided the person
+                    // hasn't since moved the caret elsewhere.
+                    let Some(prefix_start) = self.lsp_pending_prefix_start else { continue };
+                    if outcome.items.is_empty() {
+                        continue;
+                    }
+                    let items: Vec<PopupItem> = outcome
+                        .items
+                        .into_iter()
+                        .map(|item| PopupItem {
+                            label: item.label,
+                            insert: item.insert_text,
+                            detail: item.detail.unwrap_or_default(),
+                        })
+                        .collect();
+                    self.popup = Some(Popup { items, sel: 0, prefix_start });
+                }
+            }
+        }
+        // `lsp` (borrowed from `self.lsp`) is no longer used past this
+        // point, so `&mut self` calls below are fine — this is why
+        // `definition_outcomes` was collected rather than processed above.
+        for outcome in definition_outcomes {
+            if outcome.generation != self.lsp_definition_gen {
+                continue; // superseded by a later lookup; the caret moved on
+            }
+            match outcome.locations.first().cloned() {
+                Some(loc) => self.jump_to_lsp_definition(&loc, now_ms),
+                None => self.set_status("go to definition: nothing found", now_ms),
+            }
+        }
+        for outcome in hover_outcomes {
+            if outcome.generation != self.lsp_hover_gen {
+                continue; // superseded by a later lookup; the caret moved on
+            }
+            match outcome.hover {
+                Some(h) => {
+                    let headline = Self::hover_headline(&h.contents);
+                    self.set_status(&headline, now_ms);
+                    self.hover_overlay = Some(h.contents);
+                }
+                None => {
+                    self.set_status("hover: nothing found", now_ms);
+                    self.hover_overlay = None;
+                }
+            }
+        }
+    }
+
+    /// Pick the useful line out of a flattened hover text for a single-line
+    /// status message. NOT just the first line: rust-analyzer's own hover
+    /// convention for a function/type commonly puts a bare crate-name
+    /// annotation line first (found by running this exact scenario — a
+    /// hover for a same-crate function came back with the status bar
+    /// showing the crate's own package name, not the signature, because
+    /// the naive "first line" version of this code took it literally).
+    /// Prefers the first line that actually looks like Rust code (a
+    /// keyword or `->` in it); falls back to the first non-empty line if
+    /// nothing matches, so a server with a different convention still
+    /// shows SOMETHING rather than an empty status.
+    fn hover_headline(contents: &str) -> String {
+        const SIGNATURE_MARKERS: &[&str] =
+            &["fn ", "struct ", "enum ", "trait ", "impl ", "type ", "const ", "static ", "let ", "->"];
+        contents
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && *l != "```rust" && *l != "```")
+            .find(|l| SIGNATURE_MARKERS.iter().any(|m| l.contains(m)))
+            .or_else(|| contents.lines().map(str::trim).find(|l| !l.is_empty()))
+            .unwrap_or("")
+            .to_string()
     }
 
     /// Retire cached completions whose context genuinely left the buffer.
@@ -1703,7 +2184,6 @@ impl AppState {
 
     fn key(&mut self, key: K, ctrl: bool, shift: bool, alt: bool, now_ms: u64, fx: &mut Effects) {
         use K::*;
-        let _ = alt;
         // Popup first: an explicit list outranks the speculative ghost.
         if self.popup_key(key, shift, now_ms) {
             return;
@@ -1821,6 +2301,8 @@ impl AppState {
                     self.open_find();
                 } 
             }
+            (F12, false) => self.go_to_definition(now_ms),
+            (I, true) => self.request_hover(now_ms),
             (Space, true) if shift => self.trigger_completion_now(now_ms),
             (Space, true) => self.refresh_popup(1),
             (Left, true) => self.moved(|s, sh| s.editor.move_word(-1, sh), shift),
@@ -1835,9 +2317,16 @@ impl AppState {
             (PageDown, false) => self.moved(|s, sh| s.editor.move_vertical(24, sh), shift),
             (Home, false) => self.moved(|s, sh| s.editor.move_home(sh), shift),
             (End, false) => self.moved(|s, sh| s.editor.move_end(sh), shift),
+            (D, true) => self.add_next_cursor(now_ms),
+            (L, true) if shift => self.select_all_cursor_occurrences(now_ms),
+            (Up, true) if alt => self.add_column_cursor(-1, now_ms),
+            (Down, true) if alt => self.add_column_cursor(1, now_ms),
             (Backspace, _) => {
                 self.ghost.dismiss();
-                if !self.backspace_pair(now_ms) {
+                if !self.extra_cursors.is_empty() {
+                    self.fan_out_backspace(now_ms);
+                    self.after_edit(now_ms);
+                } else if !self.backspace_pair(now_ms) {
                     self.editor.backspace(now_ms);
                     self.after_edit(now_ms);
                 }
@@ -1845,17 +2334,29 @@ impl AppState {
             }
             (Delete, _) => {
                 self.ghost.dismiss();
-                self.editor.delete_forward(now_ms);
+                if !self.extra_cursors.is_empty() {
+                    self.fan_out_delete_forward(now_ms);
+                } else {
+                    self.editor.delete_forward(now_ms);
+                }
                 self.after_edit(now_ms);
             }
             (Enter, _) => {
                 self.ghost.dismiss();
-                self.editor.newline_smart(now_ms);
+                if !self.extra_cursors.is_empty() {
+                    self.fan_out_insert("\n", now_ms);
+                } else {
+                    self.editor.newline_smart(now_ms);
+                }
                 self.after_edit(now_ms);
                 self.arm_completion(now_ms);
             }
             (Tab, false) => {
-                self.editor.insert_tab(now_ms);
+                if !self.extra_cursors.is_empty() {
+                    self.fan_out_insert_tab(now_ms);
+                } else {
+                    self.editor.insert_tab(now_ms);
+                }
                 self.after_edit(now_ms);
             }
             (Escape, _) => {
@@ -1871,10 +2372,14 @@ impl AppState {
                 self.dismiss_menu();
                 self.ghost.dismiss();
                 self.debounce.cancel();
-                // Escape is the way BACK to Normal, which is what makes
-                // Insert safe to enter: there is always one key that
-                // returns you to a known mode.
-                if self.typewriter_mode {
+                self.hover_overlay = None;
+                // Multiple cursors collapse to the primary — the one the
+                // user had before Ctrl+D/Ctrl+Shift+L added the rest — same
+                // as every other editor's Escape, and one keystroke closer
+                // to a known state, which is what Escape is for.
+                if !self.extra_cursors.is_empty() {
+                    self.extra_cursors.clear();
+                } else if self.typewriter_mode {
                     self.helix = aperture_core::helix::Mode::Normal;
                 }
             }
@@ -1883,19 +2388,93 @@ impl AppState {
         let _ = fx;
     }
 
+    /// Ctrl+D: select the word under the caret, or add the next occurrence
+    /// of what's already selected. `None` means the gesture had nothing to
+    /// do (no word under a lone caret, or no further occurrence) — reported
+    /// rather than silently ignored, the same as the palette's "no matches".
+    fn add_next_cursor(&mut self, now_ms: u64) {
+        let c = self.cursors();
+        match aperture_core::multicursor::add_next_occurrence(&self.editor.buffer, &c) {
+            Some(next) => {
+                self.set_cursors(next);
+                self.follow_caret = true;
+                self.ghost.dismiss();
+                self.popup = None; // its accept path isn't fan-out-aware either
+            }
+            None => self.set_status("Ctrl+D: nothing more to select", now_ms),
+        }
+    }
+
+    /// Ctrl+Shift+L: a cursor on every occurrence of the current word or
+    /// selection.
+    fn select_all_cursor_occurrences(&mut self, now_ms: u64) {
+        let c = self.cursors();
+        match aperture_core::multicursor::select_all_occurrences(&self.editor.buffer, &c) {
+            Some(all) => {
+                self.set_cursors(all);
+                self.ghost.dismiss();
+                self.popup = None;
+            }
+            None => self.set_status("Ctrl+Shift+L: no other occurrences", now_ms),
+        }
+    }
+
+    /// Ctrl+Alt+Up / Ctrl+Alt+Down: add a caret one line above/below the
+    /// outermost existing cursor in that direction — holding the key grows
+    /// a column instead of fighting over the same gap each press.
+    fn add_column_cursor(&mut self, dy: isize, now_ms: u64) {
+        let c = self.cursors();
+        match aperture_core::multicursor::add_vertical(&self.editor.buffer, &c, dy) {
+            Some(next) => {
+                self.set_cursors(next);
+                self.follow_caret = true;
+                self.ghost.dismiss();
+                self.popup = None;
+            }
+            None => {
+                let dir = if dy < 0 { "up" } else { "down" };
+                self.set_status(&format!("no line {dir} of the file to add a cursor on"), now_ms);
+            }
+        }
+    }
+
     fn with_dismiss(&mut self, f: impl FnOnce(&mut Self), _now_ms: u64) {
         self.ghost.dismiss();
         self.debounce.cancel();
+        self.discard_extra_cursors(); // undo/redo change the buffer without fanning out
         f(self);
         self.dirty = true;
         self.syntax.absorb(&mut self.editor.buffer);
         self.follow_caret = true;
     }
 
-    fn moved(&mut self, f: impl FnOnce(&mut Self, bool), shift: bool) {
+    /// Run a motion against every cursor, not just the primary.
+    ///
+    /// `f` only ever touches `editor.sel` (that's the whole existing motion
+    /// API), so fanning it out is: run it once per cursor with THAT cursor
+    /// loaded into `editor.sel`, and collect where it ends up. No new motion
+    /// code, no per-cursor duplication of `move_word`/`move_vertical`/etc —
+    /// the single-cursor implementations are reused unmodified.
+    ///
+    /// `Fn`, not `FnOnce`: every existing call site is a closure over nothing
+    /// but a couple of `Copy` primitives, so this costs those sites nothing.
+    fn moved(&mut self, f: impl Fn(&mut Self, bool), shift: bool) {
         self.ghost.dismiss();
         self.debounce.cancel();
-        f(self, shift);
+        if self.extra_cursors.is_empty() {
+            f(self, shift);
+        } else {
+            let extras = std::mem::take(&mut self.extra_cursors);
+            let mut new_sels = Vec::with_capacity(extras.len() + 1);
+            f(self, shift);
+            new_sels.push(self.editor.sel); // the (still-)primary, moved first
+            for e in extras {
+                self.editor.sel = e;
+                f(self, shift);
+                new_sels.push(self.editor.sel);
+            }
+            self.set_cursors(aperture_core::multicursor::Cursors::new(new_sels));
+        }
         self.follow_caret = true;
     }
 
@@ -1924,6 +2503,7 @@ impl AppState {
                 self.lang = Language::from_path(&path);
                 self.syntax.set_language(self.lang);
                 self.editor = Editor::from_str(&text);
+                self.discard_extra_cursors(); // a whole new Editor; old offsets mean nothing
                 self.path = Some(path);
                 self.dirty = false;
                 self.ghost.dismiss();
@@ -1931,9 +2511,115 @@ impl AppState {
                 self.cam.scroll_y.snap(0.0);
                 self.follow_caret = false;
                 self.set_status("opened", now_ms);
+                self.start_lsp_for_current_file(&text);
             }
             Err(e) => self.set_status(&format!("open failed: {e}"), now_ms),
         }
+    }
+
+    /// Absolute `file://` URI for `path` — LSP addresses documents by URI,
+    /// never by a bare path, and a relative one would be ambiguous about
+    /// which directory it's relative TO once it crosses the wire to a
+    /// server process with its own cwd.
+    fn file_uri(path: &std::path::Path) -> String {
+        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        format!("file://{}", abs.display())
+    }
+
+    /// Best-effort: spawn `rust-analyzer` for the just-opened file if it's
+    /// Rust and nothing has already been started for a different file this
+    /// session. Silent on failure (no `rust-analyzer` on `PATH` is the
+    /// overwhelmingly common case in any environment that hasn't installed
+    /// it) — this is an ADDITIONAL tier, never something the editor depends
+    /// on working. Only Rust is wired up; every other language leaves
+    /// `self.lsp` as `None`, same as before this method existed.
+    fn start_lsp_for_current_file(&mut self, text: &str) {
+        if self.lang != Language::Rust {
+            return;
+        }
+        let Some(path) = self.path.clone() else { return };
+        let uri = Self::file_uri(&path);
+        let root_uri = Self::file_uri(&self.workspace_root());
+        if self.lsp.is_none() {
+            match crate::lsp_worker::LspWorker::spawn("rust-analyzer", &[], &root_uri) {
+                Ok(w) => self.lsp = Some(w),
+                Err(_) => return, // no server available — stay on the local-only tier
+            }
+        }
+        self.lsp_doc_version = 1;
+        self.lsp_uri = Some(uri.clone());
+        self.lsp_last_synced_text = text.to_string();
+        if let Some(lsp) = &self.lsp {
+            lsp.open(uri, text.to_string());
+        }
+    }
+
+    /// Inverse of `file_uri` — strips the `file://` prefix this crate's own
+    /// URIs always use. Not a general URI parser (no percent-decoding, no
+    /// handling of a `file://host/path` authority): every URI this method
+    /// ever sees either came from `file_uri` itself or from a server
+    /// answering a request THIS client made with one of those URIs, so the
+    /// simple cases are the only ones that can actually occur here.
+    fn path_from_file_uri(uri: &str) -> Option<std::path::PathBuf> {
+        uri.strip_prefix("file://").map(std::path::PathBuf::from)
+    }
+
+    /// F12: ask the LSP worker where the symbol under the caret is defined.
+    /// No-op, silently, when no worker is running — same "this tier simply
+    /// isn't available" handling every other LSP entry point uses.
+    fn go_to_definition(&mut self, now_ms: u64) {
+        let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) else {
+            self.set_status("go to definition: no language server running", now_ms);
+            return;
+        };
+        self.lsp_definition_gen += 1;
+        let p = self.editor.caret_pos();
+        let line_text = self.editor.buffer.line(p.line);
+        let utf16_col = aperture_core::width::char_col_to_utf16(&line_text, p.col);
+        lsp.request_definition(uri.clone(), p.line as u32, utf16_col, self.lsp_definition_gen);
+    }
+
+    /// Ctrl+I: ask the LSP worker for a type signature / doc summary at
+    /// the caret. Same "silently unavailable" handling as go-to-definition
+    /// when no worker is running.
+    fn request_hover(&mut self, now_ms: u64) {
+        let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) else {
+            self.set_status("hover: no language server running", now_ms);
+            return;
+        };
+        self.lsp_hover_gen += 1;
+        let p = self.editor.caret_pos();
+        let line_text = self.editor.buffer.line(p.line);
+        let utf16_col = aperture_core::width::char_col_to_utf16(&line_text, p.col);
+        lsp.request_hover(uri.clone(), p.line as u32, utf16_col, self.lsp_hover_gen);
+    }
+
+    /// Apply an arrived go-to-definition answer: jump to the FIRST location
+    /// (the common case is exactly one; `Location`'s own doc explains why
+    /// the client returns every one rather than picking for the caller —
+    /// this is the one place in the shell that has to pick, since a caret
+    /// can only go one place at a time. A palette-driven "choose among N"
+    /// for the rare multi-result case is future work, not attempted here).
+    fn jump_to_lsp_definition(&mut self, loc: &aperture_lsp::Location, now_ms: u64) {
+        let Some(target_path) = Self::path_from_file_uri(&loc.uri) else {
+            self.set_status("go to definition: couldn't resolve the target path", now_ms);
+            return;
+        };
+        // Same file: move the caret in the buffer that's ALREADY open,
+        // rather than reopening it — reopening would discard any unsaved
+        // edits, which `open_file` always does (fresh `Editor::from_str`
+        // straight from disk).
+        let same_file = self.path.as_ref().is_some_and(|p| Self::file_uri(p) == loc.uri);
+        if !same_file {
+            self.open_file(target_path, now_ms);
+        }
+        let line = (loc.line as usize).min(self.editor.buffer.len_lines().saturating_sub(1));
+        let line_text = self.editor.buffer.line(line);
+        let col = aperture_core::width::utf16_col_to_char(&line_text, loc.character);
+        let at = self.editor.buffer.pos_to_char(aperture_core::buffer::Pos::new(line, col));
+        self.editor.sel = Selection::caret(at);
+        self.follow_caret = true;
+        self.set_status("jumped to definition", now_ms);
     }
 
     // ── AI wiring, called from the view's frame tick ────────────────────────
@@ -1962,6 +2648,14 @@ impl AppState {
         if act == Act::Pass {
             return false;
         }
+        // The modal engine predates multi-cursor and mutates `Editor`
+        // directly (Delete/Paste/Insert/OpenLine below) with no notion of
+        // `extra_cursors`. Rather than teach every operator to fan out,
+        // collapse once here — pure navigation (`Act::Move`) doesn't
+        // corrupt anything, but there's no user-visible harm in collapsing
+        // for it too, and a narrower "only for mutating acts" condition
+        // would be one more thing to keep in sync as operators are added.
+        self.discard_extra_cursors();
         let extend = self.helix == Mode::Visual;
         match &act {
             Act::Move(m) => match m {
@@ -2292,6 +2986,15 @@ impl AppState {
         if self.ghost.is_shown() && !was_shown {
             self.ghost_since = Some(now_ms);
         }
+        // A completion armed BEFORE Ctrl+D can still land after — `arm_
+        // completion` never fires while multi-cursor typing, but an
+        // already-in-flight request passes the generation gate regardless.
+        // The ghost's own accept path (Tab / Ctrl+Tab / Ctrl+Right) calls
+        // `editor.insert_text` directly, not `fan_out_insert`, so showing it
+        // here would let a later Tab bypass every secondary cursor.
+        if !self.extra_cursors.is_empty() {
+            self.ghost.dismiss();
+        }
         // The loop pane is a history of REQUESTS answered, not a firehose
         // of fragments — a 20-delta streamed completion should read as one
         // row, not twenty near-duplicates burying everything before it.
@@ -2350,6 +3053,138 @@ impl AppState {
         self.debounce.cancel();
     }
 
+    pub(crate) fn open_voice_command(&mut self) {
+        // Same reasoning as `open_find_ex`: almost every VoiceCommand arm
+        // mutates through a single-cursor method (undo, Editor::select_all,
+        // goto_line, ...) with no notion of extra_cursors, so this mode
+        // change is the same kind of fan-out-unaware entry point.
+        self.discard_extra_cursors();
+        self.palette = Some(crate::palette_ui::PaletteState::voice_command());
+        self.ghost.dismiss();
+        self.debounce.cancel();
+    }
+
+    /// Palette entry point for a typed stand-in for a voice transcript —
+    /// see `aperture_core::voice`'s module doc for the honest scope (no
+    /// microphone, no ASR; this is the intent-matching half only). Every
+    /// arm calls an EXISTING method rather than duplicating its logic, so
+    /// "voice save" and Ctrl+S can never disagree about what saving means.
+    ///
+    /// Returns clipboard text for Copy, same shape as `Effects::clipboard`
+    /// from `handle()` — the caller is responsible for actually setting the
+    /// platform clipboard (this crate is headless w.r.t. `arboard`/egui's
+    /// own clipboard, same reason `Effects` exists at all).
+    ///
+    /// Single-speaker convenience: everything from this entry point shares
+    /// one "again"/vocab history bucket, keyed `"local"`. A caller with a
+    /// real multi-participant story (several people voice-driving one
+    /// shared session) should call `run_voice_command_as` directly with
+    /// each person's own identity instead — see that method's doc for why
+    /// "again" specifically needs to know who's asking.
+    pub fn run_voice_command(&mut self, utterance: &str, now_ms: u64) -> Option<String> {
+        self.run_voice_command_as("local", utterance, now_ms)
+    }
+
+    /// Like `run_voice_command`, but attributed to `speaker` — whatever
+    /// upstream identity a real pipeline hands this layer (a `SiteId`-
+    /// shaped string is the natural choice, matching `aperture_collab`'s
+    /// existing multi-participant identity model rather than inventing a
+    /// second one). Two things become per-speaker rather than global:
+    ///
+    /// 1. "again"/"repeat that" replays THAT SPEAKER's own last command,
+    ///    not whoever spoke most recently in the whole session — the one
+    ///    piece of multi-user behavior that is silently wrong by default
+    ///    (Bob saying "again" after Alice's command should not redo
+    ///    Alice's edit under Bob's name).
+    /// 2. The vocabulary itself is shared (everyone benefits from the same
+    ///    project's symbol names being sayable), but resolution still
+    ///    happens per-utterance, so a "go to compute total" ambiguity is
+    ///    never influenced by what a DIFFERENT speaker said earlier.
+    pub fn run_voice_command_as(&mut self, speaker: &str, utterance: &str, now_ms: u64) -> Option<String> {
+        use aperture_core::voice::VoiceCommand as V;
+        // Vocabulary buildup: whatever this file's own outline currently
+        // knows about, refreshed on every command rather than cached —
+        // a voice command is rare enough (a few per minute at most) that
+        // re-deriving from the already-parsed tree costs nothing worth
+        // guarding, and a stale vocabulary (missing a function someone
+        // just wrote) would be a confusing, silent failure to navigate to
+        // exactly the thing they just added.
+        let vocab: Vec<String> = self.gather_symbols().iter().map(|(name, _)| name.clone()).collect();
+        self.voice_session.set_vocab(vocab);
+        match self.voice_session.handle(speaker, utterance) {
+            V::Save => self.save(now_ms),
+            V::Undo => self.editor.undo(),
+            V::Redo => self.editor.redo(),
+            V::SelectAll => self.editor.select_all(),
+            V::Copy => return self.copy_selection(),
+            V::Cut => {
+                let clip = self.copy_selection();
+                if !self.editor.sel.is_caret() {
+                    let (a, b) = (self.editor.sel.min(), self.editor.sel.max());
+                    self.editor.replace_range(a, b, "");
+                    self.after_edit(now_ms);
+                }
+                return clip;
+            }
+            V::Paste => {
+                // No clipboard SOURCE reaches this entry point (the platform
+                // clipboard is read by the view layer's egui::Event::Paste,
+                // not by anything this headless method can call into) — say
+                // so rather than silently doing nothing, same honesty as
+                // the Unknown arm below.
+                self.set_status("voice: paste needs the palette closed — Ctrl+V works normally", now_ms);
+            }
+            V::NewLine => {
+                self.editor.newline_smart(now_ms);
+                self.after_edit(now_ms);
+            }
+            V::Escape => {
+                self.dismiss_menu();
+                self.ghost.dismiss();
+                self.extra_cursors.clear();
+            }
+            V::Find(q) => {
+                self.open_find();
+                if let Some(f) = &mut self.find {
+                    f.query = q;
+                    f.recompute(&self.editor.buffer, self.editor.version);
+                }
+            }
+            V::GoToLine(n) => {
+                self.editor.goto_line(n.saturating_sub(1)); // spoken "line 1" is index 0
+                self.follow_caret = true;
+            }
+            V::GoToSymbol(name) => {
+                // Re-derive the line from the outline directly rather than
+                // threading it through `gather_symbols`'s (name, sig) pairs
+                // — those exist for the completion popup's display text and
+                // were never meant to carry a jump target too; asking them
+                // to would couple two unrelated callers' needs together.
+                let line = self.syntax.outline(&self.editor.buffer).into_iter()
+                    .find(|item| item.name == name)
+                    .map(|item| item.line);
+                match line {
+                    Some(line) => {
+                        self.editor.goto_line(line);
+                        self.follow_caret = true;
+                    }
+                    None => self.set_status(
+                        &format!("voice: \"{name}\" isn't in this file's outline anymore"), now_ms),
+                }
+            }
+            V::AddNextCursor => self.add_next_cursor(now_ms),
+            V::SelectAllOccurrences => self.select_all_cursor_occurrences(now_ms),
+            V::Type(text) => {
+                self.editor.insert_text(&text, now_ms);
+                self.after_edit(now_ms);
+            }
+            V::Unknown(text) => {
+                self.set_status(&format!("voice: didn't understand \"{text}\""), now_ms);
+            }
+        }
+        None
+    }
+
     /// Open `path` (same as `open_file`) and land the caret at `line` (a
     /// 0-based line index — project search's own convention, matching
     /// `Pos::line`/`goto_line`), then aim the camera at it. Used by project
@@ -2404,6 +3239,539 @@ mod tests {
     }
     fn key(s: &mut AppState, k: K, ctrl: bool, t: u64) {
         s.handle(Ev::Key { key: k, ctrl, shift: false, alt: false }, t);
+    }
+    fn key_shift(s: &mut AppState, k: K, ctrl: bool, t: u64) {
+        s.handle(Ev::Key { key: k, ctrl, shift: true, alt: false }, t);
+    }
+
+    // ── multi-cursor ────────────────────────────────────────────────────────
+    //
+    // These test the SHELL's half — `cursors()`/`set_cursors()`/`fan_out_*`
+    // and the keys that reach them — not the arithmetic in
+    // `aperture_core::multicursor`, which has its own suite.
+
+    #[test]
+    fn ctrl_d_selects_the_word_then_the_next_occurrence() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("let total = total + 1;");
+        s.editor.sel = aperture_core::editor::Selection::caret(2); // inside "let"... move to "total"
+        s.editor.sel = aperture_core::editor::Selection::caret(6); // inside first "total"
+
+        key(&mut s, K::D, true, 0);
+        assert!(s.extra_cursors.is_empty(), "first press only selects the word");
+        assert_eq!((s.editor.sel.min(), s.editor.sel.max()), (4, 9));
+
+        key(&mut s, K::D, true, 1);
+        assert_eq!(s.extra_cursors.len(), 1, "second press adds the next occurrence");
+    }
+
+    #[test]
+    fn ctrl_d_with_nothing_further_sets_a_status_and_adds_no_cursor() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("let total = 1;");
+        s.editor.sel = aperture_core::editor::Selection::caret(6);
+        key(&mut s, K::D, true, 0);
+        key(&mut s, K::D, true, 1);
+        assert!(s.extra_cursors.is_empty());
+        let (msg, _) = s.status.clone().expect("a status message explains the no-op");
+        assert!(msg.contains("nothing more"), "{msg}");
+    }
+
+    #[test]
+    fn typing_with_multiple_cursors_inserts_at_every_one_as_one_undo_step() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("total\ntotal\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(6)];
+
+        typed(&mut s, "x", 0);
+        assert_eq!(s.editor.buffer.to_string(), "xtotal\nxtotal\n");
+        // Both carets land right after their own inserted 'x'.
+        assert_eq!(s.editor.sel, aperture_core::editor::Selection::caret(1));
+        assert_eq!(s.extra_cursors, vec![aperture_core::editor::Selection::caret(8)]);
+
+        s.editor.undo();
+        assert_eq!(s.editor.buffer.to_string(), "total\ntotal\n", "one undo removes both inserts");
+    }
+
+    #[test]
+    fn a_typed_run_across_multiple_cursors_undoes_as_one_gesture() {
+        // Caught interactively, not by the test suite: typing "sum" over two
+        // selected occurrences of "total" replaced both correctly, but Ctrl+Z
+        // only removed the LAST character — three keystrokes, three separate
+        // undo groups. Each `fan_out_insert` call was going through
+        // `Editor::replace_many`, which never coalesces, unlike single-cursor
+        // `insert_text`. This is the regression test for the fix
+        // (`replace_many_coalescing`).
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("let total = 1;\nlet total = 2;\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(6); // inside first "total"
+        key(&mut s, K::D, true, 0); // word-select
+        key(&mut s, K::D, true, 10); // add the second "total"
+        assert_eq!(s.extra_cursors.len(), 1);
+
+        typed(&mut s, "s", 20);
+        typed(&mut s, "u", 30);
+        typed(&mut s, "m", 40);
+        assert_eq!(s.editor.buffer.to_string(), "let sum = 1;\nlet sum = 2;\n");
+
+        s.editor.undo();
+        assert_eq!(s.editor.buffer.to_string(), "let total = 1;\nlet total = 2;\n",
+            "one undo for the whole typed run, at both cursors");
+    }
+
+    #[test]
+    fn a_motion_between_keystrokes_seals_the_group_same_as_single_cursor_typing() {
+        // `Editor::set_head` (every motion funnels through it) already calls
+        // `History::seal()` — true for the single-cursor path today, and
+        // fanning a motion out to every cursor (`moved`) calls the same
+        // `set_head` once per cursor, so the seal happens there too without
+        // any multi-cursor-specific code needing to know about it.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("aa\naa\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(3)];
+
+        typed(&mut s, "x", 0);
+        key(&mut s, K::Right, false, 10); // motion seals, via set_head
+        typed(&mut s, "y", 20);
+        assert_eq!(s.editor.buffer.to_string(), "xaya\nxaya\n");
+        s.editor.undo();
+        assert_eq!(s.editor.buffer.to_string(), "xaa\nxaa\n",
+            "the motion sealed the group: only 'y' undoes");
+        s.editor.undo();
+        assert_eq!(s.editor.buffer.to_string(), "aa\naa\n");
+    }
+
+    #[test]
+    fn backspace_with_multiple_cursors_removes_one_char_before_each() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("aXbb\naXbb\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(2); // after the X on line 1
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(7)]; // after the X on line 2
+
+        key(&mut s, K::Backspace, false, 0);
+        assert_eq!(s.editor.buffer.to_string(), "abb\nabb\n");
+    }
+
+    #[test]
+    fn a_multibyte_insert_lands_every_cursor_at_the_right_char_offset() {
+        // The unit bug this session fixed in aperture-core, exercised through
+        // the shell path that actually calls it.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("a\na\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(2)];
+
+        typed(&mut s, "é", 0);
+        assert_eq!(s.editor.buffer.to_string(), "éa\néa\n");
+        assert_eq!(s.editor.sel, aperture_core::editor::Selection::caret(1));
+        assert_eq!(s.extra_cursors, vec![aperture_core::editor::Selection::caret(4)],
+            "a byte-counting shift would have landed this cursor inside the first é");
+    }
+
+    #[test]
+    fn arrow_motion_fans_out_to_every_cursor() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("abcdef\nabcdef\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(7)];
+
+        key(&mut s, K::Right, false, 0);
+        assert_eq!(s.editor.sel, aperture_core::editor::Selection::caret(1));
+        assert_eq!(s.extra_cursors, vec![aperture_core::editor::Selection::caret(8)]);
+    }
+
+    #[test]
+    fn escape_collapses_to_the_primary_and_leaves_the_buffer_untouched() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("total\ntotal\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(6)];
+
+        key(&mut s, K::Escape, false, 0);
+        assert!(s.extra_cursors.is_empty());
+        assert_eq!(s.editor.sel, aperture_core::editor::Selection::caret(0),
+            "Escape returns to the PRIMARY, not the first or the last");
+        assert_eq!(s.editor.buffer.to_string(), "total\ntotal\n");
+    }
+
+    #[test]
+    fn ctrl_shift_l_selects_every_occurrence_of_the_current_word() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("x = 1\ny = 2\nx = 3\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0); // the first "x"
+        key_shift(&mut s, K::L, true, 0);
+        assert_eq!(s.extra_cursors.len(), 1, "one extra cursor: the second x");
+    }
+
+    fn key_alt(s: &mut AppState, k: K, ctrl: bool, alt: bool, t: u64) {
+        s.handle(Ev::Key { key: k, ctrl, shift: false, alt }, t);
+    }
+
+    #[test]
+    fn ctrl_alt_down_adds_a_cursor_one_line_below_the_lowest() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("abcdef\nabcdef\nabcdef\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(3); // line 0, col 3
+        key_alt(&mut s, K::Down, true, true, 0);
+        assert_eq!(s.extra_cursors.len(), 1);
+        // The NEW cursor becomes the primary (`editor.sel`) — the viewport
+        // follows the one just added, same as Ctrl+D — and the original
+        // caret becomes the sole entry in `extra_cursors`.
+        assert_eq!(s.editor.buffer.char_to_pos(s.editor.sel.head),
+            aperture_core::buffer::Pos::new(1, 3));
+        assert_eq!(s.editor.buffer.char_to_pos(s.extra_cursors[0].head),
+            aperture_core::buffer::Pos::new(0, 3));
+
+        // A second press grows from the OUTERMOST cursor (line 1), not back
+        // from the primary — otherwise holding the key just toggles between
+        // two lines instead of building a column.
+        key_alt(&mut s, K::Down, true, true, 10);
+        assert_eq!(s.extra_cursors.len(), 2);
+        let mut lines: Vec<usize> = s.extra_cursors.iter()
+            .map(|c| s.editor.buffer.char_to_pos(c.head).line).collect();
+        lines.push(s.editor.buffer.char_to_pos(s.editor.sel.head).line);
+        lines.sort();
+        assert_eq!(lines, vec![0, 1, 2], "one cursor on each of three consecutive lines");
+    }
+
+    #[test]
+    fn ctrl_alt_up_past_the_first_line_reports_status_and_adds_nothing() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("only one line\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(2);
+        key_alt(&mut s, K::Up, true, true, 0);
+        assert!(s.extra_cursors.is_empty());
+        let (msg, _) = s.status.clone().expect("a status explains the no-op");
+        assert!(msg.contains("no line"), "{msg}");
+    }
+
+    #[test]
+    fn plain_ctrl_up_without_alt_is_unaffected_by_the_column_cursor_binding() {
+        // Regression guard: (Up, true) now has an `if alt` guard ahead of it;
+        // Ctrl+Up alone (no Alt) must fall through to the catch-all, not
+        // silently start adding cursors.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("abc\nabc\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(1);
+        key(&mut s, K::Up, true, 0); // ctrl, no alt
+        assert!(s.extra_cursors.is_empty(), "Ctrl+Up alone must not add a cursor");
+    }
+
+    #[test]
+    fn undo_discards_stale_secondary_cursors_rather_than_leaving_them_dangling() {
+        // The exact bug found interactively: Ctrl+Shift+L across three
+        // lines, type a replacement (fans out correctly), Ctrl+Z restores
+        // the buffer — but with the old code `extra_cursors` was never told
+        // the buffer had changed shape, so it silently carried three now-
+        // meaningless offsets into whatever the NEXT keystroke did.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("x = 1\ny = 2\nx = 3\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        key_shift(&mut s, K::L, true, 0); // two cursors on "x"
+        assert_eq!(s.extra_cursors.len(), 1);
+        typed(&mut s, "n", 10);
+        key(&mut s, K::Z, true, 20); // undo
+        assert!(s.extra_cursors.is_empty(),
+            "undo must drop secondary cursors, not leave stale offsets");
+    }
+
+    #[test]
+    fn paste_discards_stale_secondary_cursors() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("aa\naa\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(3)];
+        s.handle(Ev::Paste("XYZ".into()), 0);
+        assert!(s.extra_cursors.is_empty());
+        assert_eq!(s.editor.buffer.to_string(), "XYZaa\naa\n",
+            "paste still applies at the primary");
+    }
+
+    #[test]
+    fn opening_a_different_file_discards_secondary_cursors() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("aa\naa\n");
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(3)];
+        let dir = std::env::temp_dir().join(format!("ap_test_{}.rs", std::process::id()));
+        std::fs::write(&dir, "fn f() {}\n").unwrap();
+        s.open_file(dir.clone(), 0);
+        assert!(s.extra_cursors.is_empty());
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn opening_find_discards_secondary_cursors() {
+        // `handle_find` intercepts events before `key()`'s multi-cursor arms
+        // ever run — replace_current/replace_all mutate the buffer with no
+        // notion of extra_cursors, so this has to collapse on the way in.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("aa\naa\n");
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(3)];
+        s.open_find();
+        assert!(s.extra_cursors.is_empty());
+    }
+
+    #[test]
+    fn typewriter_mode_normal_commands_discard_secondary_cursors() {
+        // The modal engine predates multi-cursor and mutates Editor directly
+        // (Delete/Paste/Insert/OpenLine) with no fan-out awareness.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("aa\naa\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(3)];
+        s.typewriter_mode = true;
+        s.helix = aperture_core::helix::Mode::Normal;
+        typed(&mut s, "x", 0); // Normal-mode 'x' = delete-under-caret
+        assert!(s.extra_cursors.is_empty());
+    }
+
+    #[test]
+    fn adding_a_cursor_dismisses_a_shown_symbol_popup() {
+        // The popup's accept path (`popup_accept`) calls `Editor::
+        // replace_range` directly, with no notion of `extra_cursors` — if a
+        // popup opened before Ctrl+D and survived, accepting it afterward
+        // would mutate the buffer at the primary alone while stale
+        // secondary cursors kept whatever offsets they had before.
+        let mut s = AppState::new(None, false);
+        s.lang = aperture_core::syntax::Language::Rust;
+        s.syntax.set_language(s.lang);
+        typed(&mut s, "fn compute_total() {}\nfn main() { ", 0);
+        for ch in "comp".chars() {
+            s.handle(Ev::Text(ch.to_string()), 100);
+        }
+        assert!(s.popup.is_some(), "a popup should be showing for this setup");
+        key(&mut s, K::D, true, 200);
+        assert!(s.popup.is_none(), "Ctrl+D must dismiss a stale popup, not just the ghost");
+    }
+
+    // ── voice commands ───────────────────────────────────────────────────
+    //
+    // aperture_core::voice has its own suite for the grammar itself; these
+    // test the SHELL half — that each VoiceCommand actually reaches the
+    // right AppState method, with the right effect on real state.
+
+    #[test]
+    fn voice_save_and_undo_redo_reach_the_real_editor_methods() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("a");
+        s.editor.sel = aperture_core::editor::Selection::caret(1);
+        s.editor.insert_text("b", 0);
+        assert_eq!(s.editor.buffer.to_string(), "ab");
+        s.run_voice_command("undo", 10);
+        assert_eq!(s.editor.buffer.to_string(), "a", "voice undo must call the real Editor::undo");
+        s.run_voice_command("redo", 20);
+        assert_eq!(s.editor.buffer.to_string(), "ab");
+    }
+
+    #[test]
+    fn voice_type_inserts_literal_text_at_the_caret() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("");
+        s.run_voice_command("type hello world", 0);
+        assert_eq!(s.editor.buffer.to_string(), "hello world");
+    }
+
+    #[test]
+    fn voice_go_to_line_is_one_indexed_the_way_a_person_says_it() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("a\nb\nc\n");
+        s.run_voice_command("go to line 2", 0);
+        assert_eq!(s.editor.caret_pos().line, 1, "spoken 'line 2' is index 1");
+    }
+
+    #[test]
+    fn voice_go_to_symbol_navigates_using_this_files_own_outline() {
+        let mut s = AppState::new(None, false);
+        s.lang = aperture_core::syntax::Language::Rust;
+        s.syntax.set_language(s.lang);
+        s.editor = aperture_core::editor::Editor::from_str(
+            "fn compute_total() -> i32 {\n    42\n}\n\nfn main() {\n    compute_total();\n}\n",
+        );
+        s.run_voice_command("go to compute total", 0);
+        assert_eq!(s.editor.caret_pos().line, 0, "compute_total is defined on line 0");
+    }
+
+    #[test]
+    fn voice_go_to_symbol_with_no_match_falls_through_to_the_generic_unknown_message() {
+        // "nothing_defined_here" never matches the vocabulary at all, so
+        // parse_with_vocab returns Unknown before GoToSymbol's own
+        // outline-lookup-failed message is ever reached — that message is
+        // for the narrower case of a name that WAS vocab-matched but can no
+        // longer be found (a stale-outline race), not "no match at all".
+        let mut s = AppState::new(None, false);
+        s.lang = aperture_core::syntax::Language::Rust;
+        s.syntax.set_language(s.lang);
+        s.editor = aperture_core::editor::Editor::from_str("fn main() {}\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(5);
+        s.run_voice_command("go to nothing_defined_here", 0);
+        assert_eq!(s.editor.caret_pos().line, 0, "no jump should have happened");
+        let (msg, _) = s.status.clone().expect("a status should explain the miss");
+        assert!(msg.contains("didn't understand"), "{msg}");
+    }
+
+    #[test]
+    fn voice_vocabulary_grows_as_the_buffer_changes() {
+        // The whole point of "buildup": a function added mid-session
+        // becomes sayable without any extra step reindexing it.
+        let mut s = AppState::new(None, false);
+        s.lang = aperture_core::syntax::Language::Rust;
+        s.syntax.set_language(s.lang);
+        s.editor = aperture_core::editor::Editor::from_str("fn main() {}\n");
+        assert!(s.run_voice_command("go to freshly_added", 0).is_none());
+        assert!(s.status.as_ref().unwrap().0.contains("didn't understand"));
+
+        s.editor = aperture_core::editor::Editor::from_str("fn freshly_added() {}\nfn main() {}\n");
+        s.run_voice_command("go to freshly added", 0);
+        assert_eq!(s.editor.caret_pos().line, 0, "the newly-typed function should now be navigable by voice");
+    }
+
+    #[test]
+    fn two_speakers_sharing_a_session_each_get_their_own_again() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("a\nb\nc\nd\ne\n");
+        s.run_voice_command_as("alice", "go to line 2", 0);
+        s.run_voice_command_as("bob", "go to line 4", 0);
+
+        // Bob's "again" must replay BOB's own last command (line 4), not
+        // Alice's — the one multi-user behavior that's wrong by default.
+        s.run_voice_command_as("bob", "again", 0);
+        assert_eq!(s.editor.caret_pos().line, 3, "bob's again should return to line 4 (index 3)");
+
+        s.run_voice_command_as("alice", "again", 0);
+        assert_eq!(s.editor.caret_pos().line, 1, "alice's again should return to line 2 (index 1)");
+    }
+
+    #[test]
+    fn voice_find_opens_the_bar_and_seeds_the_query() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("let total = 1;\n");
+        s.run_voice_command("find total", 0);
+        let f = s.find.as_ref().expect("find bar should be open");
+        assert_eq!(f.query, "total");
+        assert!(!f.matches.is_empty(), "the seeded query should already be matched");
+    }
+
+    #[test]
+    fn voice_add_next_cursor_and_select_all_occurrences_reuse_the_real_gestures() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("x = 1\ny = 2\nx = 3\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.run_voice_command("select all occurrences", 0);
+        assert_eq!(s.extra_cursors.len(), 1, "two x's total: one primary, one extra");
+    }
+
+    #[test]
+    fn voice_copy_returns_clipboard_text_without_touching_the_buffer() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("hello world");
+        s.editor.sel = aperture_core::editor::Selection { anchor: 0, head: 5 };
+        let clip = s.run_voice_command("copy", 0);
+        assert_eq!(clip, Some("hello".to_string()));
+        assert_eq!(s.editor.buffer.to_string(), "hello world", "copy must not mutate the buffer");
+    }
+
+    #[test]
+    fn voice_cut_returns_clipboard_text_and_removes_the_selection() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("hello world");
+        s.editor.sel = aperture_core::editor::Selection { anchor: 0, head: 6 };
+        let clip = s.run_voice_command("cut", 0);
+        assert_eq!(clip, Some("hello ".to_string()));
+        assert_eq!(s.editor.buffer.to_string(), "world");
+    }
+
+    #[test]
+    fn voice_escape_clears_extra_cursors_same_as_the_keyboard() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("aa\naa\n");
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(3)];
+        s.run_voice_command("escape", 0);
+        assert!(s.extra_cursors.is_empty());
+    }
+
+    #[test]
+    fn an_unrecognized_voice_command_sets_a_status_and_touches_nothing() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("unchanged\n");
+        let clip = s.run_voice_command("please refactor this", 0);
+        assert_eq!(clip, None);
+        assert_eq!(s.editor.buffer.to_string(), "unchanged\n");
+        let (msg, _) = s.status.clone().expect("a status should explain the no-op");
+        assert!(msg.contains("didn't understand"), "{msg}");
+    }
+
+    #[test]
+    fn opening_voice_command_mode_discards_stale_secondary_cursors() {
+        // Same class of bug as find/popup/typewriter earlier this session:
+        // the palette mode change should not leave extra_cursors dangling
+        // for a voice command that isn't fan-out-aware (most of them aren't).
+        let mut s = AppState::new(None, false);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(0)];
+        s.open_voice_command();
+        assert!(s.palette.is_some());
+        assert!(s.extra_cursors.is_empty(),
+            "voice commands mutate through single-cursor methods; stale extras must not survive");
+    }
+
+    #[test]
+    fn hover_headline_skips_a_leading_bare_crate_name_line() {
+        // The exact bug found interactively: rust-analyzer's hover for a
+        // function commonly starts with a bare crate-name annotation line
+        // before the actual signature.
+        let contents = "my_crate\n\n```rust\nfn compute_total() -> i32\n```";
+        assert_eq!(AppState::hover_headline(contents), "fn compute_total() -> i32");
+    }
+
+    #[test]
+    fn hover_headline_finds_a_signature_line_wherever_it_sits() {
+        let contents = "some preamble\nmore preamble\nlet x: i32";
+        assert_eq!(AppState::hover_headline(contents), "let x: i32");
+    }
+
+    #[test]
+    fn hover_headline_falls_back_to_first_nonblank_line_with_no_signature_marker() {
+        let contents = "\n  \njust some plain doc text\nmore text";
+        assert_eq!(AppState::hover_headline(contents), "just some plain doc text");
+    }
+
+    #[test]
+    fn hover_headline_of_empty_contents_is_an_empty_string() {
+        assert_eq!(AppState::hover_headline(""), "");
+        assert_eq!(AppState::hover_headline("   \n  \n"), "");
+    }
+
+    #[test]
+    fn an_edit_clears_a_showing_hover_overlay() {
+        // The overlay is about a caret position that no longer means
+        // anything the instant the buffer under it changes — leaving it
+        // showing would be describing stale code.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("abc");
+        s.hover_overlay = Some("fn foo() -> i32".to_string());
+        typed(&mut s, "x", 0);
+        assert!(s.hover_overlay.is_none());
+    }
+
+    #[test]
+    fn escape_clears_a_showing_hover_overlay() {
+        let mut s = AppState::new(None, false);
+        s.hover_overlay = Some("fn foo() -> i32".to_string());
+        key(&mut s, K::Escape, false, 0);
+        assert!(s.hover_overlay.is_none());
+    }
+
+    #[test]
+    fn a_single_cursor_never_touches_the_fan_out_path() {
+        // The zero-extra-cursors case must be byte-for-byte the old behaviour
+        // — this is the regression the whole feature is not allowed to cause.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("hello");
+        s.editor.sel = aperture_core::editor::Selection::caret(5);
+        typed(&mut s, "!", 0);
+        assert_eq!(s.editor.buffer.to_string(), "hello!");
+        assert!(s.extra_cursors.is_empty());
     }
 
     #[test]
@@ -2499,9 +3867,9 @@ mod tests {
     fn typing_through_the_ghost_keeps_it_alive() {
         let mut s = AppState::new(None, false);
         typed(&mut s, "pr", 0);
-        s.ghost = Ghost::Shown { text: "intln!".into() };
+        s.ghost = Ghost::Shown { text: "intln!".into(), generation: 0 };
         typed(&mut s, "i", 10);
-        assert_eq!(s.ghost, Ghost::Shown { text: "ntln!".into() });
+        assert_eq!(s.ghost, Ghost::Shown { text: "ntln!".into(), generation: 0 });
         assert!(!s.debounce.armed(), "consumed keystroke doesn't re-arm");
         typed(&mut s, "x", 20);
         assert_eq!(s.ghost, Ghost::Idle, "divergence dismissed it");
@@ -2528,10 +3896,84 @@ mod tests {
     }
 
     #[test]
+    fn streamed_partial_outcomes_grow_the_ghost_text_progressively() {
+        // The lower layers (aperture_complete's own engine/provider tests)
+        // prove a streaming provider delivers growing partials then one
+        // final outcome. This is the piece that was genuinely untested:
+        // that AppState's own note_outcome, given that exact sequence,
+        // actually shows the growing text rather than only reacting to
+        // the final one — the behavior the code comment above claims
+        // ("Ghost text updates on EVERY outcome, partial or final") but
+        // nothing exercised.
+        //
+        // Checks the actual TEXT at each step, not just is_shown() — the
+        // first version of this test only checked is_shown(), which would
+        // have passed even with the real bug found while building this
+        // (once Shown, on_outcome's guard silently dropped every later
+        // delta for the same generation; is_shown() alone can't see that
+        // the text stayed frozen).
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "fn main", 0);
+        s.ghost.request_sent(s.editor.version);
+        let generation = s.editor.version;
+        for partial in ["(", "() ", "() {", "() {}"] {
+            s.note_outcome(&CompletionOutcome {
+                generation,
+                provider: "test".into(),
+                latency_ms: 5,
+                result: Ok(partial.to_string()),
+                is_final: false,
+            }, 100);
+            assert_eq!(
+                s.ghost.text(), Some(partial.trim()),
+                "each partial should be the CURRENTLY shown text, not frozen at an earlier one"
+            );
+        }
+        s.note_outcome(&CompletionOutcome {
+            generation,
+            provider: "test".into(),
+            latency_ms: 20,
+            result: Ok("() {}".to_string()),
+            is_final: true,
+        }, 200);
+        assert_eq!(s.ghost.text(), Some("() {}"));
+    }
+
+    #[test]
+    fn streamed_partials_do_not_flood_the_loop_pane_only_the_final_one_logs() {
+        // "a 20-delta streamed completion should read as one row, not
+        // twenty near-duplicates burying everything before it" — stated
+        // as the reason for the `if !out.is_final { return; }` early exit,
+        // but never actually driven with more than one outcome before.
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "fn main", 0);
+        s.ghost.request_sent(s.editor.version);
+        let generation = s.editor.version;
+        for partial in ["(", "() ", "() {", "() {}"] {
+            s.note_outcome(&CompletionOutcome {
+                generation,
+                provider: "test".into(),
+                latency_ms: 5,
+                result: Ok(partial.to_string()),
+                is_final: false,
+            }, 100);
+        }
+        assert_eq!(s.loop_log.len(), 0, "no partial should have logged anything yet");
+        s.note_outcome(&CompletionOutcome {
+            generation,
+            provider: "test".into(),
+            latency_ms: 20,
+            result: Ok("() {}".to_string()),
+            is_final: true,
+        }, 200);
+        assert_eq!(s.loop_log.len(), 1, "exactly one row for the whole streamed generation");
+    }
+
+    #[test]
     fn word_accept_inserts_incrementally() {
         let mut s = AppState::new(None, false);
         typed(&mut s, "x", 0);
-        s.ghost = Ghost::Shown { text: " = compute();".into() };
+        s.ghost = Ghost::Shown { text: " = compute();".into(), generation: 0 };
         key(&mut s, K::Right, true, 100);
         assert_eq!(s.editor.buffer.to_string(), "x =");
         key(&mut s, K::Right, true, 200);
@@ -2547,7 +3989,7 @@ mod tests {
         s.editor.select_all();
         s.trigger_completion_now(0);
         assert!(!s.ghost.is_pending(), "no ghost over a selection");
-        s.ghost = Ghost::Shown { text: "zzz".into() };
+        s.ghost = Ghost::Shown { text: "zzz".into(), generation: 0 };
         key(&mut s, K::Escape, false, 0);
         assert_eq!(s.ghost, Ghost::Idle);
     }

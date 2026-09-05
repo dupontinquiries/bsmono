@@ -70,6 +70,32 @@ impl History {
         self.open = false;
     }
 
+    /// Like [`record_group`], but a multi-cursor typing analogue of
+    /// [`record`]'s single-op coalescing: within the same window, APPENDS
+    /// onto the open group instead of starting a new one, so a run of
+    /// multi-cursor keystrokes undoes as one gesture instead of one per
+    /// keystroke. No `try_merge` char-class check (unlike `record`) — a
+    /// fan-out group interleaves several cursors' ops, so there is no single
+    /// "last op" to compare a class against; appending whole groups is the
+    /// right granularity here; splitting hairs finer than "still typing,
+    /// still in the window" buys nothing a multi-cursor caller needs.
+    pub fn record_group_coalescing(&mut self, ops: Vec<Op>, coalesce: bool, now_ms: u64) {
+        if ops.is_empty() {
+            return;
+        }
+        self.redo.clear();
+        if coalesce && self.open && now_ms.saturating_sub(self.last_ms) <= COALESCE_WINDOW_MS {
+            if let Some(group) = self.undo.last_mut() {
+                group.extend(ops);
+                self.last_ms = now_ms;
+                return;
+            }
+        }
+        self.undo.push(ops);
+        self.open = coalesce;
+        self.last_ms = now_ms;
+    }
+
     /// Close the open coalescing group (cursor moved, command ran, focus lost).
     pub fn seal(&mut self) {
         self.open = false;

@@ -448,6 +448,40 @@ mod tests {
     }
 
     #[test]
+    fn promotion_picks_the_newest_cached_replacement_not_the_oldest() {
+        // The gap the previous test couldn't see: it only ever cached ONE
+        // replacement, so it could not tell "promote the newest" (what
+        // `failed()`'s `self.replacements.pop()` actually does) apart
+        // from "promote the oldest" (a FIFO reading someone could just as
+        // easily have assumed, since `saw()`'s OVERFLOW eviction — full
+        // cache, `remove(0)` — is FIFO-shaped). With three candidates
+        // cached in arrival order, only a test that checks WHICH one
+        // survives can tell the two policies apart.
+        let mut bucket = Bucket::default();
+        let p = fast_params(); // k = 4
+        for i in 0..4u8 {
+            bucket.saw(Contact::new(id_bit(10 + i as usize), addr(i as u16), 100), 100, &p);
+        }
+        let oldest = id_bit(70);
+        let middle = id_bit(71);
+        let newest = id_bit(72);
+        bucket.saw(Contact::new(oldest, addr(70), 110), 110, &p);
+        bucket.saw(Contact::new(middle, addr(71), 111), 111, &p);
+        bucket.saw(Contact::new(newest, addr(72), 112), 112, &p);
+        assert_eq!(bucket.replacement_len(), 3);
+
+        let victim = id_bit(11);
+        bucket.failed(&victim, 112, &p);
+        bucket.failed(&victim, 112, &p); // 2 strikes -> Bad -> promote
+
+        let ids: Vec<NodeId> = bucket.live_contacts().iter().map(|c| c.id).collect();
+        assert!(ids.contains(&newest), "the NEWEST replacement should be promoted");
+        assert!(!ids.contains(&oldest), "the oldest candidate should still be waiting, not promoted");
+        assert!(!ids.contains(&middle), "the middle candidate should still be waiting, not promoted");
+        assert_eq!(bucket.replacement_len(), 2, "one consumed, two still cached");
+    }
+
+    #[test]
     fn table_ignores_self_insert() {
         let local = id([0x55; ID_LEN]);
         let mut rt = RoutingTable::new(local);

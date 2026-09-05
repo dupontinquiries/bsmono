@@ -124,6 +124,7 @@ dependencies = [
  "aperture-complete",
  "aperture-core",
  "aperture-engine",
+ "aperture-lsp",
  "eframe",
  "egui",
  "egui_kittest",
@@ -138,6 +139,14 @@ version = "0.1.0"
 dependencies = [
  "aperture-complete",
  "gpu-gemm",
+]
+
+[[package]]
+name = "aperture-lsp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -305,11 +305,24 @@ impl<'a> P<'a> {
                             let h = self.b.get(self.i..self.i + 4)?;
                             self.i += 4;
                             let n = u32::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()?;
-                            // Lone surrogates are dropped rather than
-                            // substituted: a replacement character inside an
-                            // sc-ID would fail validation anyway, and inside a
-                            // hostname it would be a name nobody can resolve
-                            // that looks like a name.
+                            // A lone surrogate (any \uXXXX in D800-DFFF on its
+                            // own) makes char::from_u32 return None here,
+                            // which the `?` propagates all the way out to
+                            // decode() rejecting the WHOLE datagram, not just
+                            // skipping this one character — verified by
+                            // a_lone_surrogate_escape_rejects_the_whole_
+                            // datagram_not_just_that_character, since the
+                            // wording alone invites the opposite reading.
+                            // Consecutive \u escapes are never recombined
+                            // into a UTF-16 surrogate PAIR either, so even a
+                            // well-formed encoding of an astral-plane
+                            // character (an emoji, say) is rejected the same
+                            // way — see a_well_formed_surrogate_pair_is_not_
+                            // recombined_into_one_astral_character for why
+                            // that's a documented limitation rather than a
+                            // fix: this schema's only string fields are
+                            // sc-IDs and hostnames, neither of which needs
+                            // anything outside the BMP.
                             out.push(char::from_u32(n)?);
                         }
                         _ => return None,
@@ -803,6 +816,42 @@ mod tests {
         assert_eq!(back.host, a.host);
         // and a raw control byte inside a string is not legal JSON
         assert!(decode(b"{\"id\":\"sc-32a51661\",\"host\":\"a\nb\",\"port\":1,\"ts\":1}").is_err());
+    }
+
+    #[test]
+    fn a_lone_surrogate_escape_rejects_the_whole_datagram_not_just_that_character() {
+        // `string()`'s own comment says a lone surrogate is "dropped rather
+        // than substituted" -- true of the CHARACTER (char::from_u32 on a
+        // standalone surrogate value returns None), but the `?` on that
+        // call propagates all the way out of string() -> object() ->
+        // parse_json() -> decode(), rejecting the ENTIRE announce, not
+        // just the one malformed character. Locking in the actual
+        // behavior rather than trusting the comment's wording, which
+        // reads as "skips the character and keeps going."
+        let with_lone_high_surrogate =
+            b"{\"id\":\"sc-32a51661\",\"host\":\"a\\ud800b\",\"port\":1,\"ts\":1}";
+        assert!(decode(with_lone_high_surrogate).is_err(),
+            "a lone surrogate makes the whole datagram Malformed, per the parser's actual behavior");
+    }
+
+    #[test]
+    fn a_well_formed_surrogate_pair_is_not_recombined_into_one_astral_character() {
+        // This parser's own schema (id/host/port/ts/peers) has no free-text
+        // field that would legitimately carry an emoji or other astral-
+        // plane character -- sc-IDs and hostnames are the only strings,
+        // and neither needs it. Documenting the actual limitation rather
+        // than silently having it: a WELL-FORMED UTF-16 surrogate pair
+        // (high surrogate immediately followed by its matching low
+        // surrogate, together encoding one codepoint above the BMP) is
+        // treated here as two INDEPENDENT \u escapes, and the first one
+        // alone is a lone (invalid standalone) surrogate -- so a
+        // technically-legal JSON encoding of, say, an emoji is rejected
+        // as malformed rather than decoded. Real, but not reachable
+        // through this schema's own fields, which is why this is
+        // recorded as a documented limitation rather than fixed.
+        let emoji_via_valid_surrogate_pair =
+            b"{\"id\":\"sc-32a51661\",\"host\":\"\\ud83d\\ude00\",\"port\":1,\"ts\":1}";
+        assert!(decode(emoji_via_valid_surrogate_pair).is_err());
     }
 
     #[test]

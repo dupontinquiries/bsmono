@@ -287,7 +287,7 @@ pub unsafe extern "C" fn sc_decrypt_aes256gcm(
     if key.is_null() || ciphertext.is_null() || plain_out.is_null() || plain_len.is_null() {
         return CryptoError::InvalidInput;
     }
-    if cipher_len <= NONCE_LEN + 16 {
+    if cipher_len < NONCE_LEN + 16 {
         return CryptoError::InvalidInput;
     }
 
@@ -1001,6 +1001,40 @@ mod tests {
                                  tiny.as_mut_ptr(), tiny.len(), &mut ct_len)
         };
         assert_eq!(e, CryptoError::BufferTooSmall);
+    }
+
+    #[test]
+    fn aes_gcm_round_trips_an_empty_plaintext() {
+        // A REAL bug found here: sc_decrypt_aes256gcm rejected
+        // `cipher_len <= NONCE_LEN + 16` (note the `<=`), but a validly
+        // sealed EMPTY plaintext is EXACTLY NONCE_LEN + 16 bytes long —
+        // AES-GCM produces a 16-byte tag and zero ciphertext bytes for an
+        // empty message, which is a legitimate, common case (an empty
+        // snap caption, a keep-alive with no payload). The safe Rust
+        // wrapper's own `open()` in lib.rs already gets this right with
+        // `<` — only the FFI surface had the off-by-one, meaning the
+        // actual C++/Qt consumers this ABI exists for (per the crate's
+        // own doc) could not decrypt an empty message that Rust callers
+        // decrypt just fine.
+        let key = [9u8; KEY_LEN];
+        let pt: &[u8] = b"";
+        let mut ct = vec![0u8; NONCE_LEN + pt.len() + 16];
+        let mut ct_len = 0usize;
+        let e = unsafe {
+            sc_encrypt_aes256gcm(key.as_ptr(), pt.as_ptr(), pt.len(),
+                                 ct.as_mut_ptr(), ct.len(), &mut ct_len)
+        };
+        assert_eq!(e, CryptoError::Ok);
+        assert_eq!(ct_len, NONCE_LEN + 16, "an empty plaintext still produces nonce + tag, no body");
+
+        let mut out = vec![0u8; 1]; // any non-null buffer; 0 bytes are expected back
+        let mut out_len = 1usize; // must be overwritten to 0, not left stale
+        let d = unsafe {
+            sc_decrypt_aes256gcm(key.as_ptr(), ct.as_ptr(), ct_len,
+                                 out.as_mut_ptr(), out.len(), &mut out_len)
+        };
+        assert_eq!(d, CryptoError::Ok, "a validly sealed empty plaintext must decrypt, not be refused as malformed");
+        assert_eq!(out_len, 0);
     }
 
     #[test]

@@ -118,12 +118,32 @@ impl PeerSession {
 /// Minimum gap between SYNC replies to one peer.
 pub const SYNC_REPLY_GAP_MS: u64 = 2_000;
 
+/// Ceiling on distinct peers tracked at once.
+///
+/// Defense in depth, not a response to a confirmed exploit: `Sessions::
+/// entry` is reachable from `negotiate_wire`, which `host.rs` calls
+/// directly off a `HostEvent::WireOffered { peer, .. }` — and this crate
+/// only DEFINES that event, it does not PRODUCE it. Whatever admission
+/// control (if any) gates who gets to trigger one lives entirely outside
+/// this codebase's boundary, in the host process that emits `HostEvent`s.
+/// Rather than assume that layer already bounds it, this one defends
+/// itself too — the same reasoning `gossip_wire`'s parser and
+/// `KnownHashes`'s cap already apply to untrusted input this crate can
+/// see. Sized well above `dht_presence.rs`'s own stated scale ("an
+/// address book of thirty on a phone") so no realistic contact list ever
+/// approaches it.
+pub const MAX_TRACKED_PEERS: usize = 256;
+
 /// All peer sessions.
 ///
 /// One map, so `forget` cannot develop a hole.
 #[derive(Clone, Debug, Default)]
 pub struct Sessions {
     peers: HashMap<String, PeerSession>,
+    /// How many times the cap below has been hit — worth surfacing the
+    /// same way `KnownHashes::clears` is: a session clearing this often
+    /// is either a very unusual amount of real traffic or a flood.
+    pub clears: u32,
 }
 
 impl Sessions {
@@ -131,7 +151,18 @@ impl Sessions {
     pub fn is_empty(&self) -> bool { self.peers.is_empty() }
 
     /// Get or create a peer's session.
+    ///
+    /// A BRAND NEW peer past the cap clears the whole map first — see
+    /// `MAX_TRACKED_PEERS`'s own doc for why this crate cannot assume
+    /// that flood was already prevented upstream. An existing peer's
+    /// entry is never evicted just for being looked up again, so
+    /// ordinary traffic with an already-known peer never pays this cost
+    /// no matter how full the map is.
     pub fn entry(&mut self, peer: &str) -> &mut PeerSession {
+        if !self.peers.contains_key(peer) && self.peers.len() >= MAX_TRACKED_PEERS {
+            self.peers.clear();
+            self.clears += 1;
+        }
         self.peers.entry(peer.to_string()).or_default()
     }
 
@@ -156,6 +187,41 @@ impl Sessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessions_are_capped_and_clear_wholesale_like_known_hashes_does() {
+        // Mirrors snap_expiry::KnownHashes's own cap-then-wholesale-clear
+        // pattern for the same reason: this crate cannot confirm whatever
+        // produces WireOffered already bounds distinct peer IDs (see
+        // MAX_TRACKED_PEERS's own doc), so Sessions defends itself too.
+        let mut s = Sessions::default();
+        for i in 0..MAX_TRACKED_PEERS {
+            s.entry(&format!("peer-{i}")).set_version(3);
+        }
+        assert_eq!(s.len(), MAX_TRACKED_PEERS);
+        assert_eq!(s.clears, 0, "reaching the cap exactly is not yet over it");
+
+        s.entry("one-more-peer");
+        assert_eq!(s.clears, 1, "going past the cap clears once");
+        assert_eq!(s.len(), 1, "only the triggering peer survives the clear");
+    }
+
+    #[test]
+    fn looking_up_an_existing_peer_never_triggers_a_clear_no_matter_how_full() {
+        // The cap must not punish ORDINARY traffic with an already-known
+        // peer — only a genuinely NEW peer past the ceiling should ever
+        // pay this cost, or a session under real (not flooded) load could
+        // clear itself out from under a legitimate, active conversation.
+        let mut s = Sessions::default();
+        for i in 0..MAX_TRACKED_PEERS {
+            s.entry(&format!("peer-{i}")).set_version(3);
+        }
+        for _ in 0..10 {
+            s.entry("peer-0").set_version(3); // re-touching an EXISTING peer
+        }
+        assert_eq!(s.clears, 0);
+        assert_eq!(s.len(), MAX_TRACKED_PEERS);
+    }
 
     #[test]
     fn an_unknown_peer_gets_the_payload_immediately() {
