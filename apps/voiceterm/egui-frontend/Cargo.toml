@@ -67,6 +67,8 @@ uikit-term = { path = "../../../shared/uikit/crates/uikit-term" }
 uikit-web = { path = "../../../shared/uikit/crates/uikit-web" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../shared/settings-kit" }
+# The palace: Vec3 only, from the kit logscope's scenes use.
+scene-kit = { path = "../../../shared/scene-kit" }
 nifty-core = { path = "../../../shared/nifty-core" }
 eframe = { version = "0.34", default-features = false, features = ["glow"], optional = true }
 

@@ -26,6 +26,8 @@ use egui::{Pos2, Rect, Sense, Stroke, Ui, Vec2};
 /// The view's own state: what is focused, how deep, and where we have been.
 #[derive(Debug, Clone)]
 pub struct GraphView {
+    /// The palace, when the graph is being walked instead of looked at.
+    pub palace: Option<crate::palace::Palace>,
     pub focus: String,
     pub depth: usize,
     pub trail: Vec<String>,
@@ -37,7 +39,7 @@ pub struct GraphView {
 
 impl Default for GraphView {
     fn default() -> Self {
-        GraphView { focus: String::new(), depth: 2, trail: Vec::new(),
+        GraphView { palace: None, focus: String::new(), depth: 2, trail: Vec::new(),
                     yaw: 0.0, pitch: 0.0, spread: 1.0 }
     }
 }
@@ -155,6 +157,29 @@ impl GraphView {
 /// Draw the graph. Returns a node if one was clicked.
 pub fn graph_ui(ui: &mut Ui, view: &mut GraphView, topo: &nifty::Topology,
                 colors: &uikit_egui::PaletteColors) -> Option<String> {
+    // The toggle between looking at the graph and standing in it. One
+    // row, so the two views share every other pixel; the palace's own
+    // Esc also comes back here (it queues `Action::Exit`).
+    ui.horizontal(|ui| {
+        let walking = view.palace.is_some();
+        if ui.add(egui::Button::selectable(!walking, "graph")).clicked() { view.palace = None; }
+        if ui.add(egui::Button::selectable(walking, "palace")).on_hover_text("walk the graph: movement keys, helix motions").clicked() && !walking {
+            view.palace = Some(crate::palace::Palace::new(settings_kit::MovementLayout::default()));
+        }
+        if let Some(pal) = &mut view.palace {
+            egui::ComboBox::from_id_salt("palace-layout").selected_text(format!("{:?}", pal.keys.layout)).show_ui(ui, |ui| {
+                for l in [settings_kit::MovementLayout::Wasd, settings_kit::MovementLayout::Dvorak,
+                          settings_kit::MovementLayout::Esdf, settings_kit::MovementLayout::Arrows] {
+                    ui.selectable_value(&mut pal.keys.layout, l, format!("{l:?}"));
+                }
+            });
+        }
+    });
+    if let Some(pal) = &mut view.palace {
+        let opened = crate::palace::palace_ui(ui, pal, topo, &view.focus, view.depth, colors);
+        if pal.pending.iter().any(|a| *a == crate::palace::Action::Exit) { view.palace = None; }
+        return opened;
+    }
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 0.0, colors.bg_base);

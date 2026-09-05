@@ -712,6 +712,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "font8x8"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
+
+[[package]]
 name = "foreign-types"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1385,6 +1391,10 @@ name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
+
+[[package]]
+name = "noise-kit"
+version = "0.1.0"
 
 [[package]]
 name = "num-traits"
@@ -2071,6 +2081,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "scene-kit"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "font8x8",
+ "math-kit",
+ "noise-kit",
+]
+
+[[package]]
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2616,6 +2637,7 @@ dependencies = [
  "pane-kit",
  "peer-handshake",
  "portable-pty",
+ "scene-kit",
  "settings-kit",
  "snapclone-theme",
  "uikit-egui",

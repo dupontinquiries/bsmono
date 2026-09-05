@@ -222,6 +222,7 @@ pub mod mail_view;
 pub mod archived_view;
 pub mod cards_view;
 pub mod graph_view;
+pub mod palace;
 pub mod bars;
 pub mod browser;
 pub mod bookmarks_view;
