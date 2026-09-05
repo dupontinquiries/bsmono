@@ -71,6 +71,8 @@ pub mod views;
 pub mod weather;
 /// Ambient: what the surroundings say about what belongs here.
 pub mod ambient;
+/// Detailing: speckle, relief, trim, feather, ground blend.
+pub mod detail;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.

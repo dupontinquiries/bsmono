@@ -155,6 +155,11 @@ OPS
   form NAME A B [style] [k=v]                    a named form from the dictionary
                                                  (village = several houses, not one)
   weather A B [worn|abandoned|ancient|burnt]     age an EXISTING build: decay, moss, rubble
+  detail KIND A B [block=B] [amount=0.3]         finishing pass over an existing build:
+                                                 speckle (break up a flat face), trim (accent
+                                                 the edges), relief (give a wall depth),
+                                                 feather (dissolve one material into another),
+                                                 blend (spill material around a base)
   views A [depth=N] then front:/side:/top: drawings, then `end`
                                                  DRAW the shape; two views are intersected
   restyle A B FROM TO                            re-theme a box between palettes (A, B are x,y,z)
@@ -173,7 +178,9 @@ BUILD IN PASSES. You will be told which pass this is.
              No windows, no paths, no scatter. Get the silhouette right; everything else waits.
   materials  Change what the massing is made of. Mostly restyle over the structure's box.
              Do not change shape. Do not add detail.
-  detail     Now the small things: A ROOF if the building has none, doors as carved air,
+  detail     Now the small things: A ROOF if the building has none, then a finishing pass:
+             `detail speckle` on any large flat face and `detail trim` on the edges are worth
+             doing on almost every build. Doors as carved air,
              windows, floors for upper storeys, a path to the entrance,
              trim with the accent role, scatter foliage nearby. Many small ops.
              Do not touch the massing.

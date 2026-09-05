@@ -140,6 +140,11 @@ pub enum Op {
     /// reconstructs and reports how faithful the result is.
     Views { views: Vec<(String, String)>, at: (i32, i32), y: Option<i32>,
             depth: i32, block: u16 },
+    /// A detailing pass over an existing region: speckle, relief, trim,
+    /// feather or ground blend. Like `weather`, a transform rather than
+    /// a shape.
+    Detail { kind: String, min: (i32, i32, i32), max: (i32, i32, i32),
+             block: u16, amount: f32, seed: i32 },
     /// Weather an existing region: decay, overgrowth, rubble.
     /// A transform over blocks that already exist, not a shape — which
     /// is why it is an op and not a dictionary form.
@@ -491,6 +496,28 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                             .unwrap_or(&"gable").to_string(),
                     block: blk("oak_planks").unwrap_or(57),
                     overhang: kvi(&t, "overhang", 1).clamp(0, 4) });
+            }
+            "detail" | "finish" => {
+                let kind = t.get(1).map(|s| s.to_lowercase()).unwrap_or_default();
+                const KINDS: &[&str] = &["speckle", "relief", "trim", "feather", "blend"];
+                if !KINDS.contains(&kind.as_str()) {
+                    bad(format!("detail needs one of: {}", KINDS.join(", ")));
+                    continue;
+                }
+                let a = t.get(2).and_then(|s| triple_at(s, anchor).ok().flatten());
+                let b = t.get(3).and_then(|s| triple_at(s, anchor).ok().flatten());
+                match (a, b) {
+                    (Some(mn), Some(mx)) => ops.push(Op::Detail {
+                        kind, min: mn, max: mx,
+                        block: t.iter().skip(2)
+                            .find_map(|s| s.strip_prefix("block="))
+                            .and_then(blk)
+                            .unwrap_or(4),
+                        amount: kv(&t, "amount").and_then(|v| v.parse().ok())
+                            .unwrap_or(0.25f32).clamp(0.0, 1.0),
+                        seed: kvi(&t, "seed", 1) }),
+                    _ => bad("detail needs two x,y,z corners".into()),
+                }
             }
             "weather" | "ruin" | "age" => {
                 let a = t.get(1).and_then(|s| triple_at(s, anchor).ok().flatten());
@@ -852,6 +879,27 @@ pub fn run_plan<W: VoxelWorld>(
                     Some(f) => tools.stamp(&(f.build)(&args)),
                     None => CallResult::err(format!("unknown form '{name}'")),
                 }
+            }
+            Op::Detail { kind, min, max, block, amount, seed } => {
+                use crate::detail;
+                let s = *seed as u64;
+                let changes = match kind.as_str() {
+                    // Variants chosen to be RELATED to what is there:
+                    // a mix of cobble, mossy cobble and andesite reads as
+                    // masonry, while a mix of anything reads as noise.
+                    "speckle" => detail::speckle(tools.world, *min, *max, 0,
+                                                 &[4, 81, 43], *amount, s),
+                    "relief" => detail::relief(tools.world, *min, *max, *amount, s),
+                    "trim" => detail::trim(tools.world, *min, *max, *block, *amount, s),
+                    // Width is the region's own span on the feather axis,
+                    // so the ramp always covers the band asked for.
+                    "feather" => detail::feather(tools.world, *min, *max, 0, min.0,
+                                                 (max.0 - min.0).abs().max(1),
+                                                 *block, None, s),
+                    _ => detail::ground_blend(tools.world, (min.0, min.2), (max.0, max.2),
+                                              min.1, *block, 4, *amount, s),
+                };
+                tools.apply_changes(&changes)
             }
             Op::Weather { min, max, preset, seed } => {
                 let cfg = crate::weather::Weather {
