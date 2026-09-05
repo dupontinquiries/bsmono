@@ -2599,6 +2599,109 @@ impl ChunkManager {
     /// If `local_coord` is at axis 0 or CHUNK_SIZE-1, bump the version
     /// of the neighbor chunk on that axis. Used by `set_block` to
     /// invalidate boundary-affected neighbor meshes.
+    /// Apply many block edits with ONE copy-on-write clone per affected
+    /// chunk, instead of one per block.
+    ///
+    /// `set_block` is correct but is copy-on-write per BLOCK: each call
+    /// does `clone_for_edit` on a whole `CHUNK_SIZE^3` chunk, rebuilds
+    /// the octree, invalidates field overlays and bumps up to three
+    /// neighbours. That is the right shape for a player breaking one
+    /// block. It is the wrong shape for a generated structure: a
+    /// 500-block tower spanning four chunks would clone 500 chunks
+    /// (~16.4M BlockId copies) to change 500 cells. Grouped, the same
+    /// edit is four clones (~131k copies).
+    ///
+    /// `edits` is `(world_x, world_y, world_z, block)`. Edits landing in
+    /// chunks that are not loaded are skipped and counted in the return
+    /// value's second field, matching `set_block`'s `false`.
+    ///
+    /// Returns `(applied, skipped)`.
+    pub fn set_blocks(&self, edits: &[(i32, i32, i32, BlockId)]) -> (usize, usize) {
+        use std::collections::HashMap;
+
+        // Same wild-coordinate refusal as set_block: a NaN position must
+        // not edit the world, and it must name the caller once.
+        let mut grouped: HashMap<ChunkCoord, Vec<(i32, i32, i32, BlockId)>> = HashMap::new();
+        let mut skipped = 0usize;
+        for &(wx, wy, wz, block) in edits {
+            if wx.unsigned_abs() > 30_000_000
+                || wy.unsigned_abs() > 30_000_000
+                || wz.unsigned_abs() > 30_000_000
+            {
+                static TRAP_SBB_ONCE: std::sync::Once = std::sync::Once::new();
+                TRAP_SBB_ONCE.call_once(|| {
+                    log::error!(
+                        "[watchdog] WILD set_blocks at world ({}, {}, {}) block={:?} — producer backtrace:\n{}",
+                        wx, wy, wz, block,
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                });
+                skipped += 1;
+                continue;
+            }
+            let coord = block_to_chunk(wx, wy, wz);
+            grouped.entry(coord).or_default().push((
+                wx.rem_euclid(CHUNK_SIZE),
+                wy.rem_euclid(CHUNK_SIZE),
+                wz.rem_euclid(CHUNK_SIZE),
+                block,
+            ));
+        }
+
+        let mut applied = 0usize;
+        for (coord, locals) in grouped {
+            let Some(entry) = self.chunks.get(&coord) else {
+                skipped += locals.len();
+                continue;
+            };
+            // ONE clone for every edit in this chunk.
+            let mut new_chunk = entry.value().clone_for_edit();
+            for &(lx, ly, lz, block) in &locals {
+                new_chunk.set(lx, ly, lz, block);
+            }
+            drop(entry); // release the dashmap read lock before re-inserting
+
+            // replace_edited_chunk wants a representative local coord for
+            // its dirty-path stamp; the first edit is as good as any and
+            // the octree rebuild covers the whole chunk regardless.
+            let (lx0, ly0, lz0, _) = locals[0];
+            self.replace_edited_chunk(new_chunk, (lx0, ly0, lz0));
+
+            if let Some(state) = &self.fields {
+                if let Some(grid_entry) = state.chunk_grids.get(&coord) {
+                    let mut grid = grid_entry.write();
+                    for &(lx, ly, lz, _) in &locals {
+                        grid.invalidate_for_edit(&state.registry, lx, ly, lz);
+                    }
+                }
+            }
+
+            // Boundary invalidation: dedupe per (axis, direction) so a
+            // wall along a chunk edge bumps each neighbour once rather
+            // than once per block.
+            let mut bumped: [bool; 6] = [false; 6];
+            for &(lx, ly, lz, _) in &locals {
+                for (axis, lc) in [(0usize, lx), (1, ly), (2, lz)] {
+                    let slot = if lc == 0 {
+                        Some(axis * 2)
+                    } else if lc == CHUNK_SIZE - 1 {
+                        Some(axis * 2 + 1)
+                    } else {
+                        None
+                    };
+                    if let Some(i) = slot {
+                        if !bumped[i] {
+                            bumped[i] = true;
+                            self.bump_neighbor_if_edge(coord, axis, lc);
+                        }
+                    }
+                }
+            }
+            applied += locals.len();
+        }
+        (applied, skipped)
+    }
+
     fn bump_neighbor_if_edge(&self, coord: ChunkCoord, axis: usize, local_coord: i32) {
         let delta = if local_coord == 0 {
             -1

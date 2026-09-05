@@ -21,6 +21,34 @@ pub enum FindKind {
     Water,
 }
 
+/// `/anim` reveal profile. Mirrors `voxel_tools::anim::Profile`; kept as
+/// its own enum so this parser stays dependency-free.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AnimProfile {
+    GroundUp,
+    Physics,
+    Random,
+    Instant,
+}
+
+impl AnimProfile {
+    fn keyword(self) -> &'static str {
+        match self {
+            AnimProfile::GroundUp => "ground-up",
+            AnimProfile::Physics => "physics",
+            AnimProfile::Random => "random",
+            AnimProfile::Instant => "instant",
+        }
+    }
+}
+
+/// `/focus` tier adjustment.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FocusAdjust {
+    Bigger,
+    Smaller,
+}
+
 /// Whitelist mutation verb.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WhitelistOp {
@@ -77,6 +105,26 @@ pub enum Command {
     Whitelist { op: WhitelistOp, id: String },
     /// `/give <item> [count]` — grant an item stack (count defaults to 1).
     Give { item: String, count: u32 },
+    /// `/build <prose>` — hand a natural-language build request to the
+    /// LLM paintbrush. The text is kept verbatim (not lower-cased) because
+    /// it is prose, not a keyword. Opens the plan-preview GUI.
+    Build(String),
+    /// `/plan` — show the pending build plan (arithmetic echo + dry run)
+    /// without committing it.
+    ShowPlan,
+    /// `/commit` — apply the pending build plan.
+    CommitPlan,
+    /// `/undo` — reverse the last committed build as a unit.
+    UndoBuild,
+    /// `/focus [bigger|smaller]` — report or adjust the placement focus tier.
+    Focus(Option<FocusAdjust>),
+    /// `/build enableVoice` / `/build disableVoice` — voice live mode.
+    BuildVoice(bool),
+    /// `/anim <ground-up|physics|random|instant>` — how builds reveal.
+    Anim(AnimProfile),
+    /// `/model` — list local models; `/model <name>` — load one. The name
+    /// keeps its case (paths are case-sensitive) and may be partial.
+    Model(Option<String>),
     /// `/gamemode <survival|creative|adventure|spectator>`.
     Gamemode(GameMode),
     /// `/recipes` — open the recipe book GUI.
@@ -138,7 +186,25 @@ fn parse_game_mode(arg: &str) -> Option<GameMode> {
 /// matched case-insensitively, and anything unrecognised yields
 /// [`Command::Unknown`] rather than panicking.
 pub fn parse(line: &str) -> Command {
-    let mut tokens = line.trim().split_whitespace();
+    // `/build` is the one verb whose argument is prose: keep it verbatim,
+    // including case and internal spacing, before the tokenizer runs.
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("/build") {
+        if rest.is_empty() {
+            return Command::Unknown;
+        }
+        if rest.starts_with(char::is_whitespace) {
+            let text = rest.trim();
+            // the two control words are not prose
+            match text.to_ascii_lowercase().as_str() {
+                "" => return Command::Unknown,
+                "enablevoice" => return Command::BuildVoice(true),
+                "disablevoice" => return Command::BuildVoice(false),
+                _ => return Command::Build(text.to_string()),
+            }
+        }
+    }
+    let mut tokens = trimmed.split_whitespace();
     let verb = match tokens.next() {
         Some(v) => v.to_ascii_lowercase(),
         None => return Command::Unknown,
@@ -150,6 +216,33 @@ pub fn parse(line: &str) -> Command {
             [kind] => match parse_find_kind(kind) {
                 Some(k) => Command::Find(k),
                 None => Command::Unknown,
+            },
+            _ => Command::Unknown,
+        },
+        "/plan" => if args.is_empty() { Command::ShowPlan } else { Command::Unknown },
+        "/commit" => if args.is_empty() { Command::CommitPlan } else { Command::Unknown },
+        "/undo" => if args.is_empty() { Command::UndoBuild } else { Command::Unknown },
+        "/focus" => match args.as_slice() {
+            [] => Command::Focus(None),
+            [a] => match a.to_ascii_lowercase().as_str() {
+                "bigger" | "expand" | "up" => Command::Focus(Some(FocusAdjust::Bigger)),
+                "smaller" | "shrink" | "down" => Command::Focus(Some(FocusAdjust::Smaller)),
+                _ => Command::Unknown,
+            },
+            _ => Command::Unknown,
+        },
+        "/model" => match args.as_slice() {
+            [] => Command::Model(None),
+            [name] => Command::Model(Some((*name).to_string())),
+            _ => Command::Unknown,
+        },
+        "/anim" => match args.as_slice() {
+            [p] => match p.to_ascii_lowercase().as_str() {
+                "ground-up" | "groundup" | "ground" => Command::Anim(AnimProfile::GroundUp),
+                "physics" | "fall" => Command::Anim(AnimProfile::Physics),
+                "random" | "shuffle" => Command::Anim(AnimProfile::Random),
+                "instant" | "now" => Command::Anim(AnimProfile::Instant),
+                _ => Command::Unknown,
             },
             _ => Command::Unknown,
         },
@@ -248,7 +341,8 @@ impl Command {
     /// Whether dispatching this command should open an in-game GUI rather than
     /// run headless. The bin uses this to route `/recipes`/`/help` to a panel.
     pub fn opens_gui(&self) -> bool {
-        matches!(self, Command::Recipes | Command::Help)
+        matches!(self, Command::Recipes | Command::Help
+                     | Command::Build(_) | Command::ShowPlan | Command::Model(_))
     }
 
     /// Render the command back to its canonical `/verb args` string. Returns
@@ -262,6 +356,18 @@ impl Command {
             Command::SetTime(t) => Some(format!("/settime {t}")),
             Command::Whitelist { op, id } => Some(format!("/whitelist {} {}", op.keyword(), id)),
             Command::Give { item, count } => Some(format!("/give {item} {count}")),
+            Command::Build(text) => Some(format!("/build {text}")),
+            Command::ShowPlan => Some("/plan".to_string()),
+            Command::CommitPlan => Some("/commit".to_string()),
+            Command::UndoBuild => Some("/undo".to_string()),
+            Command::Focus(None) => Some("/focus".to_string()),
+            Command::Focus(Some(FocusAdjust::Bigger)) => Some("/focus bigger".to_string()),
+            Command::Focus(Some(FocusAdjust::Smaller)) => Some("/focus smaller".to_string()),
+            Command::BuildVoice(true) => Some("/build enableVoice".to_string()),
+            Command::BuildVoice(false) => Some("/build disableVoice".to_string()),
+            Command::Anim(p) => Some(format!("/anim {}", p.keyword())),
+            Command::Model(None) => Some("/model".to_string()),
+            Command::Model(Some(n)) => Some(format!("/model {n}")),
             Command::Gamemode(m) => Some(format!("/gamemode {}", m.keyword())),
             Command::Recipes => Some("/recipes".to_string()),
             Command::Help => Some("/help".to_string()),
@@ -427,5 +533,79 @@ mod tests {
             let b = parse(&line);
             assert_eq!(a, b);
         }
+    }
+
+    #[test]
+    fn build_keeps_prose_verbatim() {
+        // case and spacing inside the request must survive: it is
+        // prose for a model, not a keyword for the tokenizer
+        let c = parse("/build a Small stone tower  with a dome");
+        assert_eq!(c, Command::Build("a Small stone tower  with a dome".to_string()));
+        assert!(c.opens_gui(), "a build request opens the plan preview");
+        assert_eq!(parse("/build"), Command::Unknown, "empty request is not a build");
+        assert_eq!(parse("/buildx"), Command::Unknown, "prefix must be a whole verb");
+    }
+
+    #[test]
+    fn plan_lifecycle_verbs_parse_and_round_trip() {
+        for (line, want) in [
+            ("/plan", Command::ShowPlan),
+            ("/commit", Command::CommitPlan),
+            ("/undo", Command::UndoBuild),
+            ("/focus", Command::Focus(None)),
+            ("/focus bigger", Command::Focus(Some(FocusAdjust::Bigger))),
+            ("/focus SMALLER", Command::Focus(Some(FocusAdjust::Smaller))),
+        ] {
+            let c = parse(line);
+            assert_eq!(c, want, "{line}");
+            let s = c.to_command_string().expect("canonical form");
+            assert_eq!(parse(&s), c, "round trip of {s}");
+        }
+        assert_eq!(parse("/focus sideways"), Command::Unknown);
+        assert_eq!(parse("/commit now"), Command::Unknown, "extra args are not tolerated");
+    }
+
+    #[test]
+    fn build_round_trips_through_its_canonical_string() {
+        let c = Command::Build("three oak trees by the pond".into());
+        let s = c.to_command_string().unwrap();
+        assert_eq!(parse(&s), c);
+    }
+
+    #[test]
+    fn voice_toggle_and_anim_parse_and_round_trip() {
+        assert_eq!(parse("/build enableVoice"), Command::BuildVoice(true));
+        assert_eq!(parse("/build ENABLEVOICE"), Command::BuildVoice(true));
+        assert_eq!(parse("/build disableVoice"), Command::BuildVoice(false));
+        // and a request that merely CONTAINS the word is still prose
+        assert_eq!(parse("/build enableVoice on a hill"),
+                   Command::Build("enableVoice on a hill".to_string()));
+        for (line, want) in [
+            ("/anim physics", Command::Anim(AnimProfile::Physics)),
+            ("/anim GROUND-UP", Command::Anim(AnimProfile::GroundUp)),
+            ("/anim random", Command::Anim(AnimProfile::Random)),
+            ("/anim instant", Command::Anim(AnimProfile::Instant)),
+        ] {
+            let c = parse(line);
+            assert_eq!(c, want, "{line}");
+            assert_eq!(parse(&c.to_command_string().unwrap()), c, "round trip {line}");
+        }
+        assert_eq!(parse("/anim"), Command::Unknown);
+        assert_eq!(parse("/anim sideways"), Command::Unknown);
+        for c in [Command::BuildVoice(true), Command::BuildVoice(false)] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c);
+        }
+    }
+
+    #[test]
+    fn model_verb_lists_or_loads_and_preserves_case() {
+        assert_eq!(parse("/model"), Command::Model(None));
+        // paths are case-sensitive: the name must not be lower-cased
+        assert_eq!(parse("/model Qwen2.5-7B"), Command::Model(Some("Qwen2.5-7B".to_string())));
+        assert_eq!(parse("/model a b"), Command::Unknown, "one name only");
+        for c in [Command::Model(None), Command::Model(Some("qwen".into()))] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c, "round trip");
+        }
+        assert!(Command::Model(None).opens_gui(), "the model list is a panel");
     }
 }

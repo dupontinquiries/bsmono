@@ -1,0 +1,719 @@
+//! The ingest path: English prose -> IR -> validated plan -> batched
+//! writes -> mesher.
+//!
+//! WHY AN IR AT ALL
+//!
+//! The obvious design is prose -> tool calls -> world. It fails in
+//! four specific ways, and each one is a reason for this module:
+//!
+//!  1. **Partial failure leaves rubble.** A model emits forty calls;
+//! ```text
+//!     the twelfth is out of bounds. Without a plan you have twelve
+//!     blocks of a building and no idea what the other twenty-eight
+//!     were going to be. A plan is validated whole, then committed.
+//!  2. **You cannot preview a stream of calls.** Users want "show me
+//!     what that would do" before it touches their world. A plan can
+//!     be dry-run against a shadow copy; a stream of side effects
+//!     cannot.
+//!  3. **Undo needs a unit.** "Undo the tower" means reversing one
+//!     intent, not forty edits the user never saw.
+//!  4. **Animation and meshing need ORDER and GROUPING.** Writing
+//!     blocks in the order a model happened to emit them remeshes
+//!     random chunks repeatedly. Grouping by chunk per animation
+//!     tick turns N remeshes into one per chunk per tick, which is
+//!     the difference between a build that animates and a build that
+//!     stalls the frame.
+//! ```
+//!
+//! WHY A LINE FORMAT AND NOT JSON
+//!
+//! The IR's text form is one op per line. Small local models emit
+//! well-formed lines far more reliably than nested JSON, a truncated
+//! line loses one op rather than the whole document, and the result
+//! is diffable, hand-editable and cacheable. Native tool calling
+//! still works -- `Op` is the same type either way -- but the line
+//! format is what survives a 512-token reply budget.
+//!
+//! ```text
+//!     # tower on the hill
+//!     terraform 20,-10 34,4 smooth block=stone
+//!     path 0,6 27,-3 w=3 block=cobblestone
+//!     cylinder 27,-3 r=4 h=12 block=stone hollow
+//!     tree -12,-8 oak h=8 lean=1,0
+//!     scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
+//! ```
+//!
+//! Coordinates are X,Z pairs; Y comes from the ground unless a `y=`
+//! is given, because guessing Y is the single most common way a model
+//! produces a floating structure.
+
+use crate::{palettes, CallResult, VoxelTools, VoxelWorld};
+
+/// One planned operation. Mirrors the tool set, but as data.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Op {
+    Terraform { min: (i32, i32), max: (i32, i32), delta: i32, smooth: bool, block: u16 },
+    Path { from: (i32, i32), to: (i32, i32), width: i32, block: u16 },
+    Enclose { min: (i32, i32), max: (i32, i32), height: i32, block: u16 },
+    Fill { min: (i32, i32, i32), max: (i32, i32, i32), block: u16, hollow: bool },
+    Cylinder { at: (i32, i32), y: Option<i32>, radius: i32, height: i32, block: u16, hollow: bool },
+    Sphere { at: (i32, i32), y: Option<i32>, radius: i32, block: u16, hollow: bool },
+    Tree { at: (i32, i32), species: String, height: i32, lean: (i32, i32) },
+    Scatter { min: (i32, i32), max: (i32, i32), block: u16, clusters: usize,
+              per: usize, spread: i32, seed: u64 },
+    Restyle { min: (i32, i32, i32), max: (i32, i32, i32), from: String, to: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct BuildPlan {
+    pub name: String,
+    pub ops: Vec<Op>,
+    /// The focus anchor this plan was parsed against, when there was
+    /// one. Carving ops need it: `find_surface` at a door's own x,z
+    /// returns the top of the wall that was just built, so a doorway
+    /// with no explicit `y` would be cut in the sky above the tower.
+    /// The anchor is the ground the player is looking at, which is
+    /// what "at the door" means.
+    pub anchor: Option<(i32, i32, i32)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Severity { Error, Warning }
+
+#[derive(Debug, Clone)]
+pub struct Issue {
+    pub severity: Severity,
+    /// 1-based op index, or 0 for a whole-plan issue.
+    pub op: usize,
+    pub message: String,
+}
+
+/// Resolve a block name to an id. Accepts a palette role
+/// (`oak.primary`) or a bare material name, so a model can write
+/// what it means instead of memorising numbers.
+pub fn resolve_block(name: &str) -> Option<u16> {
+    let n = name.trim().to_lowercase();
+    if let Some((pal, role)) = n.split_once('.') {
+        let pals = palettes();
+        let p = pals.get(pal)?;
+        return Some(match role {
+            "primary" => p.primary,
+            "secondary" => p.secondary,
+            "accent" => p.accent,
+            "foliage" => p.foliage,
+            _ => return None,
+        });
+    }
+    // Full name table, generated against unendlich's BlockId enum in
+    // world/blocks.rs. Aliases follow what a person actually types
+    // into a chat box -- "cobble", "planks", "bricks" -- because the
+    // paintbrush is driven by prose, not by the enum's spelling.
+    Some(match n.as_str() {
+        "air" | "nothing" | "empty" => 0,
+        "stone" => 1,
+        "grass" | "grass_block" => 2,
+        "dirt" => 3,
+        "cobblestone" | "cobble" => 4,
+        "bedrock" => 7,
+        "water" => 9,
+        "lava" => 11,
+        "sand" => 12,
+        "gravel" => 13,
+        "gold_ore" => 14,
+        "iron_ore" => 15,
+        "coal_ore" => 16,
+        "oak_log" | "log" | "oak_wood" | "wood" => 17,
+        "oak_leaves" | "leaves" | "foliage" => 18,
+        "birch_log" | "birch" => 19,
+        "birch_leaves" => 20,
+        "cactus" => 21,
+        "clay" => 22,
+        "moss" => 23,
+        "red_sandstone" => 24,
+        "flower" | "flowers" => 25,
+        "tall_grass" => 26,
+        "fern" => 27,
+        "dead_bush" => 28,
+        "vine" | "vines" => 29,
+        "dripstone" => 30,
+        "ice" => 31,
+        "snow" => 32,
+        "mushroom" => 33,
+        "cobweb" => 34,
+        "lichen" => 35,
+        "limestone" => 36,
+        "marble" => 37,
+        "basalt" => 38,
+        "tuff" => 39,
+        "granite" => 40,
+        "slate" => 41,
+        "calcite" => 42,
+        "andesite" => 43,
+        "schist" => 44,
+        "bone" => 45,
+        "amber" => 46,
+        "crystal" => 47,
+        "sandstone" => 48,
+        "obsidian" => 49,
+        "copper_ore" => 50,
+        "quartz" => 51,
+        "diamond_ore" => 56,
+        "oak_planks" | "planks" | "plank" => 57,
+        "stone_bricks" | "stone_brick" | "bricks_stone" => 58,
+        "bricks" | "brick" => 59,
+        "glass" => 61,
+        "iron_block" | "iron" => 62,
+        "gold_block" | "gold" => 63,
+        "coal_block" => 64,
+        "bookshelf" | "books" => 65,
+        "pumpkin" => 66,
+        "snow_block" => 80,
+        "mossy_cobblestone" | "mossy_cobble" | "mossy" => 81,
+        "polished_stone" | "polished" => 82,
+        "smooth_sandstone" => 83,
+        "terracotta" => 84,
+        "chiseled_stone_bricks" | "chiseled" => 85,
+        "dark_oak_planks" | "dark_oak" => 86,
+        "polished_basalt" => 87,
+        "carrot" | "carrots" => 88,
+        "potato" | "potatoes" => 89,
+        "cabbage" => 90,
+        "sprout" | "sprouts" => 91,
+        "selenite" => 92,
+        "gypsum" => 93,
+        "dolomite" => 94,
+        "sulfur" => 95,
+        "magma" => 96,
+        "glow_crystal" | "glowstone" => 97,
+        _ => return n.parse().ok(),      // numeric ids still accepted
+    })
+}
+
+fn pair(s: &str) -> Option<(i32, i32)> {
+    let (a, b) = s.split_once(',')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+}
+
+/// A coordinate pair that may be focus-relative: `@5,-3` means five
+/// east and three north of the anchor the player is looking at. This
+/// is the IR half of the placement engine -- the model reasons in
+/// "here" and the tool supplies the world coordinates. Returns None if
+/// a relative pair is used with no anchor available.
+fn pair_at(s: &str, anchor: Option<(i32, i32, i32)>) -> Result<Option<(i32, i32)>, &'static str> {
+    if let Some(rest) = s.strip_prefix('@') {
+        let Some(a) = anchor else { return Err("relative coordinate used but no focus anchor") };
+        Ok(pair(rest).map(|(dx, dz)| (a.0 + dx, a.2 + dz)))
+    } else {
+        Ok(pair(s))
+    }
+}
+
+fn triple(s: &str) -> Option<(i32, i32, i32)> {
+    let mut it = s.split(',');
+    let (a, b, c) = (it.next()?, it.next()?, it.next()?);
+    if it.next().is_some() { return None; }
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?, c.trim().parse().ok()?))
+}
+
+/// 3D coordinate, `@dx,dy,dz` fully relative to the anchor (y included,
+/// so "from one below the anchor to fifteen above" is @0,-1,0 @0,15,0).
+fn triple_at(s: &str, anchor: Option<(i32, i32, i32)>) -> Result<Option<(i32, i32, i32)>, &'static str> {
+    if let Some(rest) = s.strip_prefix('@') {
+        let Some(a) = anchor else { return Err("relative coordinate used but no focus anchor") };
+        Ok(triple(rest).map(|(dx, dy, dz)| (a.0 + dx, a.1 + dy, a.2 + dz)))
+    } else {
+        Ok(triple(s))
+    }
+}
+
+fn kv(tokens: &[&str], key: &str) -> Option<String> {
+    tokens.iter().find_map(|t| t.strip_prefix(&format!("{key}="))).map(|v| v.to_string())
+}
+
+fn kvi(tokens: &[&str], key: &str, default: i32) -> i32 {
+    kv(tokens, key).and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Parse the line IR. Unparseable lines become issues rather than
+/// aborting: one bad line should cost one op, not the whole build.
+pub fn parse_plan(src: &str) -> (BuildPlan, Vec<Issue>) {
+    parse_plan_at(src, None)
+}
+
+/// Parse with a focus anchor, so `@dx,dz` coordinates resolve. The
+/// anchor comes from `focus::Focus::anchor` (x, z).
+pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, Vec<Issue>) {
+    let mut ops = Vec::new();
+    let mut issues = Vec::new();
+    let mut name = String::from("build");
+    for (lineno, raw) in src.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            if let Some(c) = raw.trim().strip_prefix("# ") {
+                if lineno == 0 { name = c.trim().to_string(); }
+            }
+            continue;
+        }
+        let t: Vec<&str> = line.split_whitespace().collect();
+        let idx = ops.len() + 1;
+        // Resolve token N as a possibly-relative pair; a bad relative
+        // pair records an issue and yields None so the op is skipped
+        // rather than silently placed at the wrong spot.
+        let rel_err = std::cell::Cell::new(false);
+        let rel = |t: &[&str], i: usize, anchor: Option<(i32, i32, i32)>| -> Option<(i32, i32)> {
+            match t.get(i).map(|s| pair_at(s, anchor)) {
+                Some(Ok(v)) => v,
+                Some(Err(_)) => { rel_err.set(true); None }
+                None => None,
+            }
+        };
+        let mut bad = |m: String| issues.push(Issue { severity: Severity::Error, op: idx, message: m });
+        let blk = |d: &str| resolve_block(&kv(&t, "block").unwrap_or_else(|| d.to_string()));
+        let hollow = t.contains(&"hollow");
+
+        match t[0] {
+            "terraform" => match (rel(&t, 1, anchor), rel(&t, 2, anchor)) {
+                (Some(a), Some(b)) => ops.push(Op::Terraform {
+                    min: a, max: b, delta: kvi(&t, "delta", 0),
+                    smooth: t.contains(&"smooth"),
+                    block: blk("stone").unwrap_or(1) }),
+                _ => bad("terraform needs two x,z pairs".into()),
+            },
+            "path" => match (rel(&t, 1, anchor), rel(&t, 2, anchor)) {
+                (Some(a), Some(b)) => ops.push(Op::Path {
+                    from: a, to: b, width: kvi(&t, "w", 3),
+                    block: blk("cobblestone").unwrap_or(4) }),
+                _ => bad("path needs two x,z pairs".into()),
+            },
+            "enclose" => match (rel(&t, 1, anchor), rel(&t, 2, anchor)) {
+                (Some(a), Some(b)) => ops.push(Op::Enclose {
+                    min: a, max: b, height: kvi(&t, "h", 3),
+                    block: blk("oak_planks").unwrap_or(57) }),
+                _ => bad("enclose needs two x,z pairs".into()),
+            },
+            "cylinder" | "tower" => match rel(&t, 1, anchor) {
+                Some(a) => ops.push(Op::Cylinder {
+                    at: a, y: kv(&t, "y").and_then(|v| v.parse().ok()),
+                    radius: kvi(&t, "r", 4), height: kvi(&t, "h", 10),
+                    block: blk("stone").unwrap_or(1), hollow }),
+                _ => bad("cylinder needs an x,z".into()),
+            },
+            "sphere" | "dome" => match rel(&t, 1, anchor) {
+                Some(a) => ops.push(Op::Sphere {
+                    at: a, y: kv(&t, "y").and_then(|v| v.parse().ok()),
+                    radius: kvi(&t, "r", 5),
+                    block: blk("stone").unwrap_or(1), hollow }),
+                _ => bad("sphere needs an x,z".into()),
+            },
+            "tree" => match rel(&t, 1, anchor) {
+                Some(a) => ops.push(Op::Tree {
+                    at: a,
+                    species: t.get(2).filter(|s| !s.contains('=')).unwrap_or(&"oak").to_string(),
+                    height: kvi(&t, "h", 8),
+                    lean: kv(&t, "lean").and_then(|v| pair(&v)).unwrap_or((0, 0)) }),
+                _ => bad("tree needs an x,z".into()),
+            },
+            "scatter" => match (rel(&t, 1, anchor), rel(&t, 2, anchor)) {
+                (Some(a), Some(b)) => ops.push(Op::Scatter {
+                    min: a, max: b, block: blk("flower").unwrap_or(25),
+                    clusters: kvi(&t, "clusters", 5).max(0) as usize,
+                    per: kvi(&t, "per", 8).max(0) as usize,
+                    spread: kvi(&t, "spread", 3),
+                    seed: kv(&t, "seed").and_then(|v| v.parse().ok()).unwrap_or(1) }),
+                _ => bad("scatter needs two x,z pairs".into()),
+            },
+            "restyle" => {
+                let a = t.get(1).map(|s| triple_at(s, anchor));
+                let b = t.get(2).map(|s| triple_at(s, anchor));
+                match (a, b, t.get(3), t.get(4)) {
+                    (Some(Ok(Some(mn))), Some(Ok(Some(mx))), Some(from), Some(to)) =>
+                        ops.push(Op::Restyle { min: mn, max: mx,
+                                               from: from.to_string(), to: to.to_string() }),
+                    (Some(Err(_)), _, _, _) | (_, Some(Err(_)), _, _) => rel_err.set(true),
+                    _ => bad("restyle needs two x,y,z triples and two palette names".into()),
+                }
+            }
+            "fill" | "box" => {
+                let a = t.get(1).map(|s| triple_at(s, anchor));
+                let b = t.get(2).map(|s| triple_at(s, anchor));
+                match (a, b) {
+                    (Some(Ok(Some(mn))), Some(Ok(Some(mx)))) => ops.push(Op::Fill {
+                        min: mn, max: mx, block: blk("stone").unwrap_or(1), hollow }),
+                    (Some(Err(_)), _) | (_, Some(Err(_))) => rel_err.set(true),
+                    _ => bad("fill needs two x,y,z triples".into()),
+                }
+            }
+            other => issues.push(Issue {
+                severity: Severity::Error, op: idx,
+                message: format!("unknown op '{other}' (line {})", lineno + 1) }),
+        }
+        if rel_err.get() {
+            issues.push(Issue { severity: Severity::Error, op: idx,
+                message: format!("line {}: @relative coordinate but no focus anchor \
+                                  (look at something first)", lineno + 1) });
+        }
+    }
+    (BuildPlan { name, ops, anchor }, issues)
+}
+
+/// Static checks that need no world access.
+pub fn validate(plan: &BuildPlan) -> Vec<Issue> {
+    let mut out = Vec::new();
+    if plan.ops.is_empty() {
+        out.push(Issue { severity: Severity::Error, op: 0, message: "plan has no operations".into() });
+    }
+    for (i, op) in plan.ops.iter().enumerate() {
+        let n = i + 1;
+        // Plain pushes rather than closures: two closures capturing
+        // the same Vec mutably will not compile, and a helper reads
+        // better than fighting the borrow checker over ergonomics.
+        macro_rules! err  { ($m:expr) => { out.push(Issue { severity: Severity::Error,   op: n, message: $m.into() }) } }
+        macro_rules! warn { ($m:expr) => { out.push(Issue { severity: Severity::Warning, op: n, message: $m.into() }) } }
+        match op {
+            Op::Cylinder { radius, height, .. } => {
+                if *radius <= 0 || *height <= 0 { err!("cylinder radius and height must be positive"); }
+                if *radius > 64 { warn!("radius over 64 is very large"); }
+            }
+            Op::Sphere { radius, .. } => {
+                if *radius <= 0 { err!("sphere radius must be positive"); }
+            }
+            Op::Tree { height, species, .. } => {
+                if *height < 3 { warn!("tree shorter than 3 will not look like a tree"); }
+                if !["oak", "birch", "pine", "spruce", "cactus"].contains(&species.as_str()) {
+                    warn!("unknown species; will fall back to oak");
+                }
+            }
+            Op::Path { from, to, width, .. } => {
+                let d = (to.0 - from.0).abs().max((to.1 - from.1).abs());
+                if d == 0 { warn!("path start and end are the same point"); }
+                if *width <= 0 { err!("path width must be positive"); }
+            }
+            Op::Restyle { from, to, .. } => {
+                let p = palettes();
+                if !p.contains_key(from.as_str()) { err!("unknown source palette"); }
+                if !p.contains_key(to.as_str()) { err!("unknown target palette"); }
+            }
+            _ => {}
+        }
+    }
+    // Ordering: terraform after something has been built on that
+    // ground will bury or behead it. Cheap to check, expensive to
+    // discover by eye.
+    let first_build = plan.ops.iter().position(|o| !matches!(o, Op::Terraform { .. }));
+    if let Some(fb) = first_build {
+        for (i, op) in plan.ops.iter().enumerate().skip(fb) {
+            if matches!(op, Op::Terraform { .. }) {
+                out.push(Issue { severity: Severity::Warning, op: i + 1,
+                    message: "terraform after a build op; ground changes may bury or float it".into() });
+            }
+        }
+    }
+    out
+}
+
+/// One animation step: writes that belong to the same chunk, so the
+/// mesher rebuilds each affected chunk once per tick instead of once
+/// per block.
+#[derive(Debug, Clone)]
+pub struct Batch {
+    pub tick: u32,
+    pub chunk: (i32, i32, i32),
+    pub blocks: Vec<(i32, i32, i32, u16)>,
+}
+
+/// Result of running a plan.
+#[derive(Debug)]
+pub struct PlanRun {
+    pub applied: usize,
+    pub failed: usize,
+    pub blocks_changed: usize,
+    pub log: Vec<String>,
+    /// Chunk-grouped animation batches, in commit order.
+    pub batches: Vec<Batch>,
+}
+
+/// Execute a plan. `chunk_size` should match the engine's (32 in
+/// unendlich). `dry_run` applies everything and then reverses it, so
+/// the caller gets the full predicted effect with the world unchanged
+/// -- this is what powers "show me what that would do".
+pub fn run_plan<W: VoxelWorld>(
+    tools: &mut VoxelTools<W>,
+    plan: &BuildPlan,
+    from_y: i32,
+    chunk_size: i32,
+    dry_run: bool,
+) -> PlanRun {
+    let mut run = PlanRun { applied: 0, failed: 0, blocks_changed: 0,
+                            log: Vec::new(), batches: Vec::new() };
+    let first_edit = tools.edits.len();
+
+    for (i, op) in plan.ops.iter().enumerate() {
+        let r: CallResult = match op {
+            Op::Terraform { min, max, delta, smooth, block } =>
+                tools.terraform(*min, *max, *delta, *smooth, *block, from_y),
+            Op::Path { from, to, width, block } =>
+                tools.connect_path(*from, *to, *width, *block, from_y),
+            Op::Enclose { min, max, height, block } =>
+                tools.enclose(*min, *max, *height, *block, from_y),
+            Op::Fill { min, max, block, hollow } =>
+                tools.fill_box(*min, *max, *block, *hollow),
+            Op::Cylinder { at, y, radius, height, block, hollow } => {
+                let base_y = y.unwrap_or_else(|| tools.find_surface(at.0, at.1, from_y)
+                                                    .map(|s| s + 1).unwrap_or(from_y));
+                tools.cylinder((at.0, base_y, at.1), *radius, *height, *block, *hollow)
+            }
+            Op::Sphere { at, y, radius, block, hollow } => {
+                let cy = y.unwrap_or_else(|| {
+                    if *block == 0 {
+                        // Carving: a sphere of air with no explicit y is a
+                        // doorway or a tunnel mouth. Measure from the
+                        // ANCHOR, not from find_surface at the door's own
+                        // column -- by the time a door is cut, that column
+                        // is the wall, and its "surface" is the parapet ten
+                        // blocks up. Two bugs in one line, both only
+                        // visible by running a two-turn session.
+                        let ground = plan.anchor.map(|a| a.1)
+                            .unwrap_or_else(|| tools.find_surface(at.0, at.1, from_y)
+                                                    .unwrap_or(from_y));
+                        ground + radius / 2
+                    } else {
+                        tools.find_surface(at.0, at.1, from_y)
+                            .map(|s| s + radius + 1).unwrap_or(from_y)
+                    }
+                });
+                tools.sphere((at.0, cy, at.1), *radius, *block, *hollow)
+            }
+            Op::Tree { at, species, height, lean } => {
+                let sy = tools.find_surface(at.0, at.1, from_y).map(|s| s + 1).unwrap_or(from_y);
+                tools.place_tree((at.0, sy, at.1), species, *height, *lean)
+            }
+            Op::Scatter { min, max, block, clusters, per, spread, seed } =>
+                tools.scatter_clustered(*min, *max, from_y, *block, *clusters, *per, *spread, *seed),
+            Op::Restyle { min, max, from, to } =>
+                tools.restyle(*min, *max, from, to),
+        };
+        if r.ok {
+            run.applied += 1;
+            run.blocks_changed += r.blocks_changed;
+        } else {
+            run.failed += 1;
+        }
+        run.log.push(format!("{}. {}", i + 1, r.summary));
+    }
+
+    // Group everything this plan wrote into per-chunk batches, in the
+    // order the ops ran. The tick is the op index, so an animation can
+    // reveal the build in the order it was authored.
+    for (op_i, edit) in tools.edits[first_edit..].iter().enumerate() {
+        let mut by_chunk: std::collections::BTreeMap<(i32, i32, i32), Vec<(i32, i32, i32, u16)>> =
+            Default::default();
+        for &(x, y, z, _prev) in &edit.before {
+            let c = (x.div_euclid(chunk_size), y.div_euclid(chunk_size), z.div_euclid(chunk_size));
+            // the NEW block is what the mesher needs; read it back
+            by_chunk.entry(c).or_default().push((x, y, z, 0));
+        }
+        for (chunk, blocks) in by_chunk {
+            run.batches.push(Batch { tick: op_i as u32, chunk, blocks });
+        }
+    }
+
+    if dry_run {
+        // Reverse in creation order, newest first, so the world is
+        // byte-identical afterwards.
+        let ids: Vec<u64> = tools.edits[first_edit..].iter().map(|e| e.id).collect();
+        for id in ids.into_iter().rev() {
+            tools.undo_edit(id);
+        }
+    }
+    run
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    struct Flat { cells: BTreeMap<(i32, i32, i32), u16> }
+    impl Flat { fn new() -> Self { Self { cells: BTreeMap::new() } } }
+    impl VoxelWorld for Flat {
+        fn get(&self, x: i32, y: i32, z: i32) -> u16 {
+            if let Some(&b) = self.cells.get(&(x, y, z)) { return b; }
+            if y <= 64 { 1 } else { 0 }
+        }
+        fn set(&mut self, x: i32, y: i32, z: i32, b: u16) -> bool {
+            self.cells.insert((x, y, z), b); true
+        }
+    }
+
+    const SAMPLE: &str = "\
+# hilltop camp
+terraform 20,-10 34,4 smooth block=stone
+path 0,6 27,-3 w=3 block=cobblestone
+cylinder 27,-3 r=4 h=12 block=stone hollow
+tree -12,-8 oak h=8 lean=1,0
+scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
+";
+
+    #[test]
+    fn parses_the_line_ir() {
+        let (plan, issues) = parse_plan(SAMPLE);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(plan.ops.len(), 5);
+        assert_eq!(plan.name, "hilltop camp");
+        match &plan.ops[2] {
+            Op::Cylinder { radius, height, hollow, .. } => {
+                assert_eq!((*radius, *height, *hollow), (4, 12, true));
+            }
+            other => panic!("expected cylinder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_bad_line_costs_one_op_not_the_plan() {
+        let (plan, issues) = parse_plan("tree 0,0 oak h=6\nfrobnicate the thing\ntree 5,5 birch h=7\n");
+        assert_eq!(plan.ops.len(), 2, "good lines must survive");
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("frobnicate"));
+    }
+
+    #[test]
+    fn block_names_and_palette_roles_resolve() {
+        assert_eq!(resolve_block("cobblestone"), Some(4));
+        assert_eq!(resolve_block("oak.primary"), Some(57));
+        assert_eq!(resolve_block("volcanic.secondary"), Some(49));
+        assert_eq!(resolve_block("58"), Some(58));
+        assert_eq!(resolve_block("nonsense"), None);
+    }
+
+    #[test]
+    fn validation_flags_terraform_after_build() {
+        let (plan, _) = parse_plan("tree 0,0 oak h=6\nterraform 0,0 10,10 delta=3\n");
+        let issues = validate(&plan);
+        assert!(issues.iter().any(|i| i.message.contains("terraform after a build")),
+                "{issues:?}");
+    }
+
+    #[test]
+    fn validation_catches_impossible_geometry() {
+        let (plan, _) = parse_plan("cylinder 0,0 r=0 h=5\n");
+        let issues = validate(&plan);
+        assert!(issues.iter().any(|i| i.severity == Severity::Error), "{issues:?}");
+    }
+
+    #[test]
+    fn dry_run_leaves_the_world_untouched() {
+        let mut w = Flat::new();
+        let before: Vec<u16> = (60..80).map(|y| w.get(27, y, -3)).collect();
+        let (plan, _) = parse_plan(SAMPLE);
+        let run = {
+            let mut t = VoxelTools::new(&mut w);
+            run_plan(&mut t, &plan, 200, 32, true)
+        };
+        assert!(run.blocks_changed > 100, "dry run should still report the effect");
+        let after: Vec<u16> = (60..80).map(|y| w.get(27, y, -3)).collect();
+        assert_eq!(before, after, "dry run must not modify the world");
+    }
+
+    #[test]
+    fn commit_actually_builds() {
+        let mut w = Flat::new();
+        let (plan, _) = parse_plan(SAMPLE);
+        let run = {
+            let mut t = VoxelTools::new(&mut w);
+            run_plan(&mut t, &plan, 200, 32, false)
+        };
+        assert_eq!(run.failed, 0, "{:?}", run.log);
+        // the tower is `hollow`, so its centre is air by design and
+        // the wall sits at radius 3-4 from the axis
+        let shell = (2..=4).any(|dx| w.get(27 + dx, 66, -3) != 0);
+        assert!(shell, "the tower wall should exist after a real run");
+        assert_eq!(w.get(27, 66, -3), 0, "and its interior should be hollow");
+    }
+
+    #[test]
+    fn batches_are_grouped_by_chunk_for_the_mesher() {
+        let mut w = Flat::new();
+        let (plan, _) = parse_plan("cylinder 0,0 r=3 h=40 block=stone\n");
+        let run = {
+            let mut t = VoxelTools::new(&mut w);
+            run_plan(&mut t, &plan, 200, 32, false)
+        };
+        // a 40-tall tower from y=65 crosses a chunk boundary at y=96
+        let chunks: std::collections::BTreeSet<_> =
+            run.batches.iter().map(|b| b.chunk).collect();
+        assert!(chunks.len() >= 2, "tall build should span chunks, got {chunks:?}");
+        // and every batch belongs to exactly one chunk
+        for b in &run.batches {
+            for &(x, y, z, _) in &b.blocks {
+                assert_eq!((x.div_euclid(32), y.div_euclid(32), z.div_euclid(32)), b.chunk);
+            }
+        }
+    }
+
+    #[test]
+    fn y_is_taken_from_the_ground_unless_given() {
+        let mut w = Flat::new();
+        let (plan, _) = parse_plan("cylinder 0,0 r=2 h=4 block=stone\n");
+        {
+            let mut t = VoxelTools::new(&mut w);
+            run_plan(&mut t, &plan, 200, 32, false);
+        }
+        assert_eq!(w.get(0, 65, 0), 1, "should start just above the surface");
+        assert_eq!(w.get(0, 70, 0), 0, "and not float higher up");
+    }
+
+    #[test]
+    fn relative_coords_resolve_against_a_focus_anchor() {
+        let (plan, issues) = parse_plan_at("tower @0,0 r=4 h=12\npath @-5,0 @20,3 w=3\n",
+                                           Some((100, 65, -40)));
+        assert!(issues.is_empty(), "{issues:?}");
+        match &plan.ops[0] {
+            Op::Cylinder { at, .. } => assert_eq!(*at, (100, -40)),
+            o => panic!("{o:?}"),
+        }
+        match &plan.ops[1] {
+            Op::Path { from, to, .. } => {
+                assert_eq!(*from, (95, -40));
+                assert_eq!(*to, (120, -37));
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn relative_coords_without_an_anchor_are_an_error_not_a_guess() {
+        let (plan, issues) = parse_plan_at("tower @0,0 r=4 h=12\n", None);
+        assert!(plan.ops.is_empty(), "the op must not be placed somewhere arbitrary");
+        assert!(issues.iter().any(|i| i.message.contains("focus anchor")), "{issues:?}");
+    }
+
+    #[test]
+    fn absolute_and_relative_can_mix() {
+        let (plan, issues) = parse_plan_at("path 0,0 @10,10 w=2\n", Some((50, 65, 50)));
+        assert!(issues.is_empty(), "{issues:?}");
+        match &plan.ops[0] {
+            Op::Path { from, to, .. } => { assert_eq!(*from, (0, 0)); assert_eq!(*to, (60, 60)); }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn carving_a_doorway_cuts_the_wall_not_the_sky() {
+        let mut w = Flat::new();
+        let (tower, _) = parse_plan_at("cylinder @0,0 r=3 h=10 block=stone_bricks hollow\n",
+                                        Some((0, 65, 0)));
+        { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &tower, 200, 32, false); }
+        assert_ne!(w.get(3, 66, 0), 0, "wall is there before carving");
+        let (door, _) = parse_plan_at("sphere @3,0 r=1 block=air\n", Some((0, 65, 0)));
+        { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &door, 200, 32, false); }
+        assert_eq!(w.get(3, 66, 0), 0, "the doorway must be cut through the wall");
+    }
+
+    #[test]
+    fn a_solid_dome_still_sits_above_the_surface() {
+        let mut w = Flat::new();
+        let (p, _) = parse_plan_at("sphere @0,0 r=3 block=stone\n", Some((0, 65, 0)));
+        { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &p, 200, 32, false); }
+        assert_ne!(w.get(0, 68, 0), 0, "centred at surface + r + 1");
+    }
+}
