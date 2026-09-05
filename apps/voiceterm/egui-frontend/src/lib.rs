@@ -224,6 +224,14 @@ pub mod reading_trainer;
 pub mod archived_view;
 pub mod cards_view;
 pub mod graph_view;
+/// `link_graph.rs` is mounted Qt-free under `graph_view` (see that module's
+/// doc), and its `from_niftyplot` — unused by this port, present because the
+/// file is kept byte-identical to the canonical Qt-side one — refers to
+/// `crate::niftyplot::parse`, which the Qt binary has at ITS crate root. The
+/// parser itself is `nifty_core::niftyplot` (already this crate's dependency
+/// and what the bin's graph pane calls); re-exporting it under the name the
+/// mounted file expects is the one-line fix rather than forking the file.
+pub use nifty_core::niftyplot;
 pub mod palace;
 pub mod bars;
 pub mod browser;

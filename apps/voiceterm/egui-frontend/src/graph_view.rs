@@ -21,7 +21,89 @@
 #[path = "../../src/niftyplot_view.rs"]
 pub mod nifty;
 
+/// Qt-free (0 qmetaobject/QString refs) wikilink extraction and the
+/// [[note]] graph it builds — the ACTUAL zettelkasten, as opposed to
+/// `nifty`'s hand-typed scratch documents. Mounted the same way, for the
+/// same reason: one implementation, and this port's bugs are the Qt
+/// view's bugs too.
+#[path = "../../src/link_graph.rs"]
+pub mod link_graph;
+
 use egui::{Pos2, Rect, Sense, Stroke, Ui, Vec2};
+
+/// Build the real zettelkasten's topology from the notes the deck actually
+/// holds: `(title, body)` pairs, wikilinks extracted from each body via
+/// `link_graph::extract_links`. This is what "a graph view of the
+/// zettelkasten" means, as opposed to `graph_ui`'s other input — a
+/// hand-typed niftyplot document in a scratch buffer, which is a
+/// diagramming tool that happens to share this view, not the notes.
+///
+/// Ids are the notes' own titles (unslugified) where a slug matches a
+/// known note; a link to a title with no matching note is a dangling
+/// link and is dropped, the same rule `LinkGraph::links_from` already
+/// applies — Topology draws graphs of what exists, not of typos.
+pub fn topology_from_notes(notes: &[(String, String)]) -> nifty::Topology {
+    let mut lg = link_graph::LinkGraph::new();
+    for (title, body) in notes {
+        lg.add_document(title, body);
+    }
+    // slug -> the note's own display title, so the drawn graph shows what
+    // a person wrote rather than the slugified key.
+    let title_of: std::collections::BTreeMap<String, String> = notes.iter()
+        .map(|(t, _)| (link_graph::slugify(t), t.clone()))
+        .collect();
+    let ranking = lg.centrality_ranking(); // every known slug, once each
+    let ids: Vec<String> = ranking.iter()
+        .map(|(slug, _)| title_of.get(slug).cloned().unwrap_or_else(|| slug.clone()))
+        .collect();
+    let mut edges: Vec<(String, String)> = Vec::new();
+    for (slug, _) in &ranking {
+        let from = title_of.get(slug).cloned().unwrap_or_else(|| slug.clone());
+        for target_slug in lg.links_from(&from) {
+            if let Some(to) = title_of.get(&target_slug) {
+                edges.push((from.clone(), to.clone()));
+            }
+        }
+    }
+    nifty::Topology::new(&ids, &edges)
+}
+
+#[cfg(test)]
+mod topology_from_notes_tests {
+    use super::*;
+
+    #[test]
+    fn wikilinks_between_real_notes_become_edges_dangling_links_do_not() {
+        let notes = vec![
+            ("Alpha".to_string(), "sees [[Beta]] and a stray [[Nowhere]]".to_string()),
+            ("Beta".to_string(), "no links here".to_string()),
+        ];
+        let topo = topology_from_notes(&notes);
+        let ids = topo.rings("Alpha", 5);
+        assert!(ids.iter().any(|(id, _)| id == "Alpha"));
+        assert!(ids.iter().any(|(id, _)| id == "Beta"));
+        assert!(!ids.iter().any(|(id, _)| id == "Nowhere"), "a dangling link is not a node");
+        assert!(topo.neighbors("Alpha").iter().any(|n| n == "Beta"));
+        assert!(!topo.neighbors("Alpha").iter().any(|n| n == "Nowhere"));
+    }
+
+    #[test]
+    fn an_empty_deck_is_an_empty_topology_not_a_panic() {
+        let topo = topology_from_notes(&[]);
+        assert!(topo.rings("anything", 3).is_empty());
+    }
+
+    #[test]
+    fn titles_survive_round_trip_rather_than_showing_as_slugs() {
+        let notes = vec![("My Great Note".to_string(), "links to [[Other One]]".to_string()),
+                          ("Other One".to_string(), String::new())];
+        let topo = topology_from_notes(&notes);
+        let ids: Vec<String> = topo.rings("My Great Note", 2).into_iter().map(|(id, _)| id).collect();
+        assert!(ids.contains(&"My Great Note".to_string()), "{ids:?}");
+        assert!(ids.contains(&"Other One".to_string()), "{ids:?}");
+    }
+}
+
 
 /// The view's own state: what is focused, how deep, and where we have been.
 #[derive(Debug, Clone)]
