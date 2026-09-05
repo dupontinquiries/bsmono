@@ -1440,13 +1440,46 @@ pub fn leaf_cluster(center: Vec3, r: f32, seed: u32, color: Color32) -> Mesh3 {
 }
 /// LOD variant of `leaf_cluster`: `detail` (≈0.15..1) scales the leaf COUNT so distant clusters cull down to a
 /// few blades while near ones stay dense. Blades are kept SMALL (subdivided foliage) rather than big flat cards.
+/// How many blades to keep at `detail`, and how much bigger each survivor
+/// must be so the crown still LOOKS the same.
+///
+/// Scaling the count alone is what makes distant foliage go bald: at
+/// `detail = 0.14` an 84-blade crown drops to 12 and you can see the sky
+/// through a tree that was opaque a moment earlier. The silhouette is what a
+/// viewer reads at that distance, not the individual leaves — so the leaves
+/// that remain take over the area the dropped ones were covering.
+///
+/// Blade area goes as `len^2`, so holding `count * len^2` constant means
+/// `len *= sqrt(base / kept)`. Returned rather than applied so the caller
+/// keeps control, and so this is testable without building a mesh.
+///
+/// The growth is CAPPED: past about 2.2x a blade stops reading as a leaf and
+/// starts reading as a paddle, which is a worse artefact than a slightly
+/// thinner crown. Beyond the cap the crown does thin — that is the honest
+/// trade at extreme distance, and by then it is a few pixels wide.
+pub const LEAF_GROWTH_CAP: f32 = 2.2;
+/// Never drop a crown below this many blades — under it the shape stops
+/// being a crown at all and no amount of growth rescues it.
+pub const LEAF_MIN: usize = 6;
+
+pub fn leaf_lod(base_count: usize, detail: f32) -> (usize, f32) {
+    let d = detail.clamp(0.0, 1.0);
+    if base_count == 0 { return (0, 1.0); }
+    let kept = ((base_count as f32 * d).round() as usize).clamp(LEAF_MIN.min(base_count), base_count);
+    let growth = (base_count as f32 / kept as f32).sqrt().clamp(1.0, LEAF_GROWTH_CAP);
+    (kept, growth)
+}
+
 pub fn leaf_cluster_lod(center: Vec3, r: f32, seed: u32, color: Color32, detail: f32) -> Mesh3 {
     let (mut verts, mut norms, mut tris) = (Vec::new(), Vec::new(), Vec::new());
     // leaf count: a modest cut everywhere, biggest on small decorations (a 0.3 flower had ~44 blades — absurd)
     // and a lower ceiling on huge crowns, since the tree-heavy scenes are dominated by big-r canopies. Curve:
     // r 0.3→~19, 0.55→~27, 1.0→~41, 1.4→~52, 2.5→~86(cap 88). Net FPS win at high graphics; the dense-canopy
     // look is preserved (big crowns stay near their old density). `detail` still lets callers LOD further.
-    let leaves = tess((((10.0 + r * 24.0).min(84.0)) * detail.clamp(0.15, 1.0)) as usize, 5);
+    // COVERAGE-PRESERVING LOD. The base count is the full-detail crown; `leaf_lod`
+    // decides how many survive and how much each must grow to cover for the rest.
+    let base = tess(((10.0 + r * 24.0).min(84.0)) as usize, 5);
+    let (leaves, blade_growth) = leaf_lod(base, detail);
     // a flat leaf-blade silhouette in (along, across) local coords: pointed tip → rounded body → base
     const BLADE: [(f32, f32); 8] = [(1.0, 0.0), (0.6, 0.22), (0.2, 0.32), (-0.35, 0.30), (-0.95, 0.0), (-0.35, -0.30), (0.2, -0.32), (0.6, -0.22)];
     for k in 0..leaves {
@@ -1454,12 +1487,17 @@ pub fn leaf_cluster_lod(center: Vec3, r: f32, seed: u32, color: Color32, detail:
         let a = hash3(k, seed as i32, 1) * std::f32::consts::TAU;
         let b = (hash3(k, seed as i32, 2) * 2.0 - 1.0).acos(); // even spherical scatter
         let dir = v(b.sin() * a.cos(), b.cos(), b.sin() * a.sin());
-        let rad = r * (0.70 + 0.28 * hash3(k, seed as i32, 3));
+        // OUTER SHELL FIRST. As the crown thins, bias survivors toward its
+        // surface: interior blades are occluded by the ones outside them, so
+        // dropping those costs nothing visible while dropping silhouette
+        // blades costs the outline. At full detail this is a no-op.
+        let shell = 1.0 - detail.clamp(0.0, 1.0);
+        let rad = r * (0.70 + 0.28 * (hash3(k, seed as i32, 3) * (1.0 - shell) + shell));
         let cpt = addv(center, mul(dir, rad));
         let up = if dir.y.abs() < 0.9 { v(0.0, 1.0, 0.0) } else { v(1.0, 0.0, 0.0) };
         let along = norm(cross(dir, up));   // long axis (tip→base)
         let across = cross(dir, along);     // short axis
-        let len = (r * 0.10 * (0.8 + 0.4 * hash3(k, seed as i32, 4))).clamp(0.05, 0.30); // ABSOLUTE-capped small blades — big crowns get MANY small leaves, not few big cards
+        let len = (r * 0.10 * (0.8 + 0.4 * hash3(k, seed as i32, 4)) * blade_growth).clamp(0.05, 0.30 * blade_growth); // ABSOLUTE-capped small blades — big crowns get MANY small leaves, not few big cards
         let curl = len * (0.30 + 0.22 * hash3(k, seed as i32, 5)); // per-leaf cup depth
         let i = verts.len() as u32;
         // raised midrib centre (cup high point) — gives the blade a fold + a non-flat normal field
@@ -1696,6 +1734,48 @@ pub fn rune_cells(seed: u64, grid: usize) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn thinning_a_crown_keeps_its_coverage_until_the_growth_cap() {
+        let base = 84;
+        let full = leaf_lod(base, 1.0);
+        assert_eq!(full, (84, 1.0), "full detail changes nothing");
+        // Coverage is count * blade-area, and area goes as len^2.
+        let cov = |(n, g): (usize, f32)| n as f32 * g * g;
+        let want = cov(full);
+        for d in [0.9_f32, 0.7, 0.5, 0.3] {
+            let got = cov(leaf_lod(base, d));
+            assert!((got - want).abs() / want < 0.06,
+                    "detail {d}: coverage {got:.0} vs {want:.0}");
+        }
+    }
+
+    #[test]
+    fn past_the_cap_it_thins_honestly_rather_than_growing_paddles() {
+        // At extreme distance the maths would want a 2.6x blade; that stops
+        // reading as a leaf, so growth clamps and the crown genuinely thins.
+        let (n, g) = leaf_lod(84, 0.14);
+        assert!(g <= LEAF_GROWTH_CAP + 1e-6, "growth {g}");
+        assert!(n >= LEAF_MIN);
+        assert!(n as f32 * g * g < 84.0, "past the cap coverage does drop");
+    }
+
+    #[test]
+    fn a_crown_never_dissolves_and_the_count_only_falls() {
+        let mut last = usize::MAX;
+        for step in 0..=20 {
+            let d = step as f32 / 20.0;
+            let (n, g) = leaf_lod(84, 1.0 - d);
+            assert!(n >= LEAF_MIN, "detail {}: {n} blades", 1.0 - d);
+            assert!(g.is_finite() && g >= 1.0);
+            assert!(n <= last, "count must not rise as detail falls");
+            last = n;
+        }
+        // Degenerate inputs do not panic or invert.
+        assert_eq!(leaf_lod(0, 0.5), (0, 1.0));
+        assert_eq!(leaf_lod(3, 0.0).0, 3, "a crown smaller than the floor keeps what it has");
+        assert!(leaf_lod(84, -5.0).0 >= LEAF_MIN);
+    }
+
     /// Render a glyph to text art from the same bits `label_cells` reads, so
     /// a wrong font is visible here instead of in a screenshot.
     fn art(ch: char) -> Vec<String> {
