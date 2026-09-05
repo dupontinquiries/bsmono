@@ -915,6 +915,63 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   `aperture-egui` (`run_voice_command_as` exists and is tested, but
   nothing in the shell calls it with more than one speaker yet).
 
+## Reported from device use (2026-09-05) — six, unverified here unless noted
+
+Raised by the operator running the apps; each is marked with how far I got.
+None of these are merge fallout: the two bundles merged this session touched
+only `apps/dandere2x` and `games/blackstar-rs` (checked with
+`git diff --name-only` on both merge commits), so voiceterm, aperture and
+beatspace are untouched by them. Answering that directly because it was
+asked as a question.
+
+- [ ] **voiceterm-egui: Ctrl+C does not kill a running terminal process.**
+  REPORTED; traced through the code here but not reproduced live. The
+  encoder is CORRECT and tested: `pty_input::encode(Key::Char('c'), ctrl)`
+  returns `[0x03]`, with a test for the Ctrl+Shift+C case too. Ctrl+C is not
+  in `uikit_term::keys::is_widget_chord` (that reserves only Ctrl+F/Ctrl+P
+  and Shift+PageUp/Down) and not in `pty_input::chord`, so nothing on the
+  reserved paths eats it.
+
+  PRIME SUSPECT: `pty_input::drain_egui` line ~176 —
+  `if ui.ctx().egui_wants_keyboard_input() { return Vec::new(); }`. That
+  discards the WHOLE event batch, Ctrl+C included, whenever any egui widget
+  wants the keyboard. voiceterm has many text fields (the say box, filters,
+  the graph source, the palette), and if focus is sitting in one — or if the
+  terminal pane itself does not hold egui focus — the interrupt never
+  reaches the PTY. The guard exists for a real reason (typing a search query
+  also typed it into the shell), so the fix is not to delete it: it is to let
+  a small set of control chords through even when a widget has focus, or to
+  ensure the terminal pane takes focus when clicked.
+
+  Reproduce first: `tests/real_pty.rs` drives a real shell and is the place
+  for a failing case (spawn `sleep 41`, send Ctrl+C, assert the child is
+  gone) — note `cargo test --lib` does NOT run it.
+- [ ] **voiceterm-egui: further visual bugs.** REPORTED, unspecified. Known
+  and open from this session: the locator strip costs ~39 px for an 11 px
+  label (measured), and a one-frame panel overlap after a programmatic
+  resize. The demo scaffolding (fake "kesslerd" workspaces, canned
+  transcript) is now behind `VOICETERM_DEMO=1`, so anything still appearing
+  by default is a genuine bug rather than seed data.
+- [ ] **aperture: command palette and sizing.** REPORTED, not investigated.
+  `uikit_egui::command_bar` (new this session) is the intended answer —
+  aperture is a second consumer for it, alongside snapclone.
+- [ ] **dandere2x launches the CLI from gitmind, not the GUI.** REPORTED.
+  The binary is CLI-first with the GUI behind the `app` subcommand
+  (`Cmd::App` in `crates/dandere2x/src/main.rs`) — so a launcher invoking
+  the bare binary gets the CLI usage text. Whatever gitmind's app catalog
+  records for dandere2x needs `app` appended, or dandere2x needs to default
+  to the GUI when run with no subcommand and a display present.
+- [ ] **dandere2x: drag-and-drop onto the input, with a confirmation.**
+  NEW FEATURE. eframe surfaces dropped files via `ctx.input(|i| &i.raw.dropped_files)`;
+  the confirmation matters because a drop replaces the input path and the
+  previous one is not recoverable from the UI.
+- [ ] **beatspace: workspace on desktop vs tabs on mobile.** Started and
+  REVERTED this session — a width-fraction panel was tried, looked at, and
+  traded one clipping for another. The recipe is in commit `0ac14413`:
+  `controls_body` = lines 431-517, `content_body` = the Train branch plus
+  552-632, both in a NEW `impl App` block (not the `eframe::App` one), the
+  `Panel::bottom("scope")` declared first, then `two_pane_ui`.
+
 ## voiceterm — loop-trimmer off-by-one (fixed at source, 2026-08-19)
 
 `apps/voiceterm/src/voice.rs`'s `trim_hallucination_loop` predates the
