@@ -140,6 +140,9 @@ pub enum Op {
     /// reconstructs and reports how faithful the result is.
     Views { views: Vec<(String, String)>, at: (i32, i32), y: Option<i32>,
             depth: i32, block: u16 },
+    /// Stamp a learned template. The vocabulary the player taught it.
+    Place { name: String, at: (i32, i32), y: Option<i32>, turns: u8,
+            mirror: bool, vary: f32, seed: i32, palette: Option<String> },
     /// A change to the world itself, PROPOSED by the model. It is only
     /// applied if the player's own words corroborate it; see
     /// `intent::corroborate`. Carries the verb rather than an effect so
@@ -502,6 +505,26 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     block: blk("oak_planks").unwrap_or(57),
                     overhang: kvi(&t, "overhang", 1).clamp(0, 4) });
             }
+            "place" | "stamp" => {
+                let Some(name) = t.get(1).map(|s| s.to_string()) else {
+                    bad("place needs a template name".into());
+                    continue;
+                };
+                let at = rel(&t, 2, anchor).unwrap_or_else(|| anchor_xz(anchor));
+                ops.push(Op::Place {
+                    name, at,
+                    y: kv(&t, "y").and_then(|v| v.parse().ok()),
+                    // Degrees are what a person says; quarter turns are
+                    // what the code wants.
+                    turns: ((kvi(&t, "rot", 0).rem_euclid(360)) / 90) as u8,
+                    mirror: t.contains(&"mirror") || t.contains(&"flip"),
+                    vary: kv(&t, "vary").and_then(|v| v.parse().ok())
+                        .unwrap_or(0.0f32).clamp(0.0, 0.9),
+                    seed: kvi(&t, "seed", 1),
+                    palette: t.iter().skip(2)
+                        .find_map(|s| s.strip_prefix("palette=")).map(|s| s.to_string()),
+                });
+            }
             "world" => {
                 let verb = t.get(1).map(|s| s.to_lowercase()).unwrap_or_default();
                 if crate::intent::WorldIntent::parse(&verb).is_none() {
@@ -793,6 +816,18 @@ pub fn run_plan<W: VoxelWorld>(
     chunk_size: i32,
     dry_run: bool,
 ) -> PlanRun {
+    run_plan_with(tools, plan, from_y, chunk_size, dry_run, None)
+}
+
+/// As `run_plan`, with the template library so `place` can resolve.
+pub fn run_plan_with<W: VoxelWorld>(
+    tools: &mut VoxelTools<W>,
+    plan: &BuildPlan,
+    from_y: i32,
+    chunk_size: i32,
+    dry_run: bool,
+    library: Option<&crate::template::Library>,
+) -> PlanRun {
     // GROUND SEARCH CEILING.
     //
     // `find_surface` scans DOWN from here, so a fixed value is wrong
@@ -896,6 +931,30 @@ pub fn run_plan<W: VoxelWorld>(
                 match crate::dict::lookup(name) {
                     Some(f) => tools.stamp(&(f.build)(&args)),
                     None => CallResult::err(format!("unknown form '{name}'")),
+                }
+            }
+            Op::Place { name, at, y, turns, mirror, vary, seed, palette } => {
+                match library.and_then(|l| l.get(name)) {
+                    None => CallResult::err(format!(
+                        "no template '{name}'{}",
+                        match library {
+                            Some(l) if !l.is_empty() =>
+                                format!("; known: {}", l.names().join(", ")),
+                            _ => " (capture one first)".into(),
+                        })),
+                    Some(t) => {
+                        let base = y.unwrap_or_else(|| {
+                            tools.find_surface(at.0, at.1, from_y).map(|s| s + 1)
+                                .unwrap_or(from_y)
+                        });
+                        let stamp = crate::template::Stamp {
+                            turns: *turns, mirror: *mirror,
+                            vary: *vary, seed: *seed as u64 };
+                        let pal = palette.clone().unwrap_or_else(|| t.palette.clone());
+                        let changes = crate::template::place(
+                            t, (at.0, base, at.1), &stamp, &pal);
+                        tools.apply_changes(&changes)
+                    }
                 }
             }
             Op::World { verb, arg, at, radius } => {

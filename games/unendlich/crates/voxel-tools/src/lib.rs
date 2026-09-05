@@ -81,6 +81,8 @@ pub mod land;
 pub mod godmode;
 /// Intent: the gate deciding when the world itself may be changed.
 pub mod intent;
+/// Templates: capture a build and reuse it as vocabulary.
+pub mod template;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.

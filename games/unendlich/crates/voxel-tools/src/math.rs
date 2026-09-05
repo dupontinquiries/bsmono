@@ -223,6 +223,14 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                 push(Note::Info, format!("tree height {height}, roughly {} blocks with canopy",
                                           height + 60), None);
             }
+            Op::Place { name, at, turns, vary, .. } => {
+                push(Note::Info,
+                     format!("place '{name}' at {at:?}, rotated {} degrees{}",
+                             *turns as i32 * 90,
+                             if *vary > 0.0 { format!(", {:.0}% varied", vary * 100.0) }
+                             else { String::new() }),
+                     None);
+            }
             Op::World { verb, at, radius, .. } => {
                 push(Note::Suspect,
                      format!("WORLD CHANGE: {verb} within {radius} of {at:?}. \
