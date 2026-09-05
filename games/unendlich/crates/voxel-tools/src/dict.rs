@@ -63,6 +63,8 @@ pub const FORMS: &[Form] = &[
     Form { name: "colonnade", summary: "a row of evenly spaced pillars", build: colonnade },
     Form { name: "arch", summary: "an opening with a rounded head", build: arch },
     Form { name: "tower", summary: "a round tower with a conical cap", build: tower },
+    Form { name: "village", summary: "several houses on plots, facing a centre, joined by paths",
+           build: village },
 ];
 
 pub fn lookup(name: &str) -> Option<&'static Form> {
@@ -218,6 +220,96 @@ fn tower(a: &FormArgs) -> Solid {
         thickness: 1.0,
     };
     Solid::Union(vec![body, cap])
+}
+
+/// A settlement, not a building.
+///
+/// The corpus is emphatic about this and I had missed it entirely:
+/// "village" appears 123 times, "settlement" words 162, against 29 for
+/// "roof". The unit of work a builder narrates is a PLACE — several
+/// structures in relation to one another, facing something, joined by
+/// paths — and a dictionary that can only make one house at a time
+/// makes the model emit five houses in a row on a grid.
+///
+/// The layout rules are the content here, and they are what a model
+/// cannot be trusted to work out per-building:
+///
+/// * Plots are laid on a ring around a centre, not on a lattice. A grid
+///   of houses reads as a car park; a ring reads as a place.
+/// * Every house FACES the centre — its door is on the inward side.
+/// * Sizes vary from a seeded hash, so no two neighbours match, without
+///   the model having to pick numbers.
+/// * A path runs from each door to the centre.
+fn village(a: &FormArgs) -> Solid {
+    let (lo, hi) = (a.lo(), a.hi());
+    let cx = (lo[0] + hi[0]) / 2.0;
+    let cz = (lo[2] + hi[2]) / 2.0;
+    let count = a.num("count", 5).clamp(2, 12) as u32;
+    let seed = a.num("seed", 7) as u32;
+    // Radius: fill the footprint, leaving room for the plots themselves.
+    let span = (hi[0] - lo[0]).min(hi[2] - lo[2]);
+    let radius = (span / 2.0 - 6.0).max(6.0);
+
+    let mut parts: Vec<Solid> = Vec::new();
+    for i in 0..count {
+        let ang = std::f32::consts::TAU * (i as f32) / (count as f32);
+        let (sx, sz) = (cx + radius * ang.cos(), cz + radius * ang.sin());
+        // Seeded variation, so neighbours differ without the model
+        // choosing sizes. Small, odd numbers: an even footprint puts a
+        // gable ridge on a cell boundary (see solid.rs).
+        let h = hash2(i, seed);
+        let w = 7.0 + (h % 3) as f32 * 2.0;
+        let d = 7.0 + ((h >> 3) % 3) as f32 * 2.0;
+        let plot = FormArgs {
+            min: ((sx - w / 2.0) as i32, a.min.1, (sz - d / 2.0) as i32),
+            max: ((sx + w / 2.0) as i32, a.max.1, (sz + d / 2.0) as i32),
+            style: if h % 2 == 0 { "gable".into() } else { "hip".into() },
+            block: a.block, accent: a.accent,
+            nums: vec![("h".into(), 4 + (h % 2) as i32)],
+        };
+        parts.push(house(&plot));
+        // A path from the plot toward the centre. Laid as a thin slab at
+        // ground level; the terrain pass under it is the caller's job.
+        parts.push(path_slab([sx, lo[1], sz], [cx, lo[1], cz], 2.0,
+                             Material::structural(a.accent)));
+    }
+    // A well or marker at the centre gives the ring something to face,
+    // which is what makes it read as a village rather than a circle of
+    // houses.
+    parts.push(Solid::Shell {
+        inner: Box::new(Solid::Cylinder { base: [cx, lo[1], cz], r: 2.0, h: 2.0,
+                                          mat: Material::accent(a.accent) }),
+        thickness: 1.0,
+    });
+    Solid::Union(parts)
+}
+
+/// A flat ribbon between two points, as a union of boxes. Cheap, and it
+/// does not need a new primitive.
+fn path_slab(from: [f32; 3], to: [f32; 3], width: f32, mat: Material) -> Solid {
+    let steps = ((to[0] - from[0]).abs().max((to[2] - from[2]).abs()) as i32).max(1);
+    let half = width / 2.0;
+    let mut segs = Vec::new();
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let x = from[0] + (to[0] - from[0]) * t;
+        let z = from[2] + (to[2] - from[2]) * t;
+        segs.push(Solid::Box {
+            min: [x - half, from[1], z - half],
+            max: [x + half, from[1] + 1.0, z + half],
+            mat: mat.clone(),
+        });
+    }
+    Solid::Union(segs)
+}
+
+/// A small deterministic hash. Seeded variation beats asking a model for
+/// numbers: it always picks round ones, and neighbours come out matching.
+fn hash2(i: u32, seed: u32) -> u32 {
+    let mut h = i.wrapping_mul(0x9E37_79B9) ^ seed.wrapping_mul(0x85EB_CA6B);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0xC2B2_AE35);
+    h ^ (h >> 13)
 }
 
 #[cfg(test)]

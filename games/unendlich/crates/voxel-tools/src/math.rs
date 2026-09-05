@@ -223,6 +223,14 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                 push(Note::Info, format!("tree height {height}, roughly {} blocks with canopy",
                                           height + 60), None);
             }
+            Op::Weather { min, max, preset, .. } => {
+                let vol = span(min.0, max.0) as i64 * span(min.1, max.1) as i64
+                        * span(min.2, max.2) as i64;
+                push(Note::Info,
+                     format!("weather '{preset}' over {vol} cells \
+                              (only exposed blocks change; the core is untouched)"),
+                     None);
+            }
             Op::Views { views, at, depth, .. } => {
                 let names: Vec<&str> = views.iter().map(|(n, _)| n.as_str()).collect();
                 let biggest = views.iter()

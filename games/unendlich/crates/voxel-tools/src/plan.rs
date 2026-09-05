@@ -140,6 +140,10 @@ pub enum Op {
     /// reconstructs and reports how faithful the result is.
     Views { views: Vec<(String, String)>, at: (i32, i32), y: Option<i32>,
             depth: i32, block: u16 },
+    /// Weather an existing region: decay, overgrowth, rubble.
+    /// A transform over blocks that already exist, not a shape — which
+    /// is why it is an op and not a dictionary form.
+    Weather { min: (i32, i32, i32), max: (i32, i32, i32), preset: String, seed: i32 },
     /// ONE verb reaching the whole form dictionary.
     ///
     /// `roof`, `wall`, `house`, `colonnade`, `arch`, `tower` and
@@ -488,6 +492,19 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     block: blk("oak_planks").unwrap_or(57),
                     overhang: kvi(&t, "overhang", 1).clamp(0, 4) });
             }
+            "weather" | "ruin" | "age" => {
+                let a = t.get(1).and_then(|s| triple_at(s, anchor).ok().flatten());
+                let b = t.get(2).and_then(|s| triple_at(s, anchor).ok().flatten());
+                match (a, b) {
+                    (Some(mn), Some(mx)) => ops.push(Op::Weather {
+                        min: mn, max: mx,
+                        preset: t.iter().find(|s| ["worn","abandoned","ancient","burnt"]
+                                                  .contains(s))
+                                 .unwrap_or(&"abandoned").to_string(),
+                        seed: kvi(&t, "seed", 1) }),
+                    _ => bad("weather needs two x,y,z corners".into()),
+                }
+            }
             "mirror" => {
                 let a = t.get(1).and_then(|s| triple_at(s, anchor).ok().flatten());
                 let b = t.get(2).and_then(|s| triple_at(s, anchor).ok().flatten());
@@ -835,6 +852,14 @@ pub fn run_plan<W: VoxelWorld>(
                     Some(f) => tools.stamp(&(f.build)(&args)),
                     None => CallResult::err(format!("unknown form '{name}'")),
                 }
+            }
+            Op::Weather { min, max, preset, seed } => {
+                let cfg = crate::weather::Weather {
+                    seed: *seed as u64, ..crate::weather::Weather::preset(preset) };
+                let changes = crate::weather::plan(
+                    tools.world, *min, *max, &cfg,
+                    /* moss */ 23, /* vine */ 29, /* rubble */ 4);
+                tools.apply_changes(&changes)
             }
             Op::Mirror { min, max, axis, about } => tools.mirror(*min, *max, axis, *about),
             Op::Bridge { from, to, y, width, block, supports } => {

@@ -67,6 +67,8 @@ pub mod solid;
 pub mod dict;
 /// Views: build from 2D elevations, and check the result against them.
 pub mod views;
+/// Weathering: decay, overgrowth and rubble as a transform over blocks.
+pub mod weather;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.
@@ -383,6 +385,20 @@ impl<'w, W: VoxelWorld> VoxelTools<'w, W> {
         for &(x, y, z) in cells { self.write(&mut e, x, y, z, block); }
         let n = e.before.len();
         self.finish(e, format!("views, {n} blocks"))
+    }
+
+    /// Apply a planned set of weathering changes as ONE edit, so a ruin
+    /// undoes as a unit rather than block by block.
+    pub fn apply_changes(&mut self, changes: &[crate::weather::Change]) -> CallResult {
+        if changes.len() > MAX_BLOCKS_PER_CALL {
+            return CallResult::err(format!(
+                "refused: {} changes, over MAX_BLOCKS_PER_CALL={}",
+                changes.len(), MAX_BLOCKS_PER_CALL));
+        }
+        let mut e = self.begin("weather");
+        for c in changes { self.write(&mut e, c.at.0, c.at.1, c.at.2, c.to); }
+        let n = e.before.len();
+        self.finish(e, format!("weathered {n} blocks"))
     }
 
     /// Rasterize a solid into the world.

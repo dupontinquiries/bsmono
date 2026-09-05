@@ -135,6 +135,8 @@ pub const GRAMMAR: &str = "\
 You build voxel structures by replying with a PLAN: one operation per line, nothing else.
 Coordinates are X,Z pairs. Y is found from the ground automatically; never guess it.
 @dx,dz means relative to the FOCUS anchor the player is looking at. Prefer @ coordinates.
+@ is relative on EVERY axis including Y: `@0,60,0` is sixty blocks UP, not y=60.
+Use bare numbers when you mean an absolute height.
 Blocks are names (stone, cobble, planks, mossy, glass) or palette roles (jungle.primary).
 
 OPS
@@ -151,6 +153,8 @@ OPS
   stairs A B [w=N] [block=B]                     rise one block per step from A to B
   mirror A B [x|z] [about=N]                     reflect a region: pillars either side of something
   form NAME A B [style] [k=v]                    a named form from the dictionary
+                                                 (village = several houses, not one)
+  weather A B [worn|abandoned|ancient|burnt]     age an EXISTING build: decay, moss, rubble
   views A [depth=N] then front:/side:/top: drawings, then `end`
                                                  DRAW the shape; two views are intersected
   restyle A B FROM TO                            re-theme a box between palettes (A, B are x,y,z)
