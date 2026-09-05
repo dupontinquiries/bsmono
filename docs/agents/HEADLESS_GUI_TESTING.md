@@ -206,3 +206,33 @@ Poll a long build from separate short tool calls
 (`nohup cargo build > /tmp/build.log 2>&1 &` then `tail -1
 /tmp/build.log`) — a single call that waits for a nine-minute build will
 time out and take the build with it.
+
+## Seeing a logscope SCENE (not the graph on top of it)
+
+Every attempt to check scene geometry this session was defeated by the same
+thing: `scene-view` draws the conversation graph over the world, and with
+the shipped 180-build spine the dots and labels cover most of the frame. Two
+sessions' worth of "not visually confirmed" came from that, not from any
+difficulty with Xvfb.
+
+`LOGSCOPE_CONVO` points at the `.logscope` script the preview loads. Point
+it at a nearly-empty one and the graph goes away:
+
+    printf 'user: hi\n' > /tmp/tiny.logscope
+    LOGSCOPE_CONVO=/tmp/tiny.logscope \
+    LOGSCOPE_THEME=Alley LOGSCOPE_CAM="0.9,0.35,26" \
+    LD_LIBRARY_PATH=$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/lib \
+    DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 ./scene-view &
+
+then `xdotool search --name Logscope` + `xdotool windowmap <id>` (winit
+leaves the window unmapped without a WM), wait 5-8 s for the first llvmpipe
+frame, and `import -window root`.
+
+`LOGSCOPE_CAM="yaw,pitch,dist"` is radians, radians, world units. Finding a
+camera that frames a particular prop is still trial and error — pitch around
+0.3-0.6 and dist 20-40 looks along a lane; small dist puts the eye inside
+geometry.
+
+Also needed on this binary: it is dynamically linked against the toolchain
+libstd, hence the `LD_LIBRARY_PATH` above, or it dies before opening a
+window.
