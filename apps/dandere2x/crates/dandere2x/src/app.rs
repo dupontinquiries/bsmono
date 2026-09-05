@@ -736,6 +736,30 @@ impl Shell {
         });
     }
 
+    /// What the run is costing, over the recent window.
+    fn metrics_pane(&self, ui: &mut egui::Ui) {
+        use d2x_core::jobmetrics::{recent, Frame};
+        if self.rows.is_empty() { return; }
+        let frames: Vec<Frame> = self.rows.iter().map(|r| Frame {
+            analyze_ms: r.analyze_ms, upscale_ms: r.upscale_ms,
+            fraction: r.fraction, redraw: r.redraw,
+        }).collect();
+        let s = recent(&frames);
+        let c = uikit_egui::palette_colors("voice");
+        // `carved::inset` rather than a bare label: a run of numbers loose on
+        // the background reads as debris. See its doc for chip/inset/card.
+        uikit_egui::carved::inset(ui, &c, |ui| {
+            ui.label(egui::RichText::new(s.line()).monospace().small());
+            if let Some(total) = self.frames_total {
+                let left = (total as usize).saturating_sub(self.rows.len());
+                if let Some(eta) = s.eta_secs(left) {
+                    ui.label(egui::RichText::new(
+                        format!("about {eta:.0}s remaining at this rate")).small().weak());
+                }
+            }
+        });
+    }
+
     fn bars(&self, ui: &mut egui::Ui) {
         let desired = egui::vec2(ui.available_width(), 90.0);
         let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
@@ -832,6 +856,13 @@ impl eframe::App for Shell {
                 let done = self_.rows.len() as f32;
                 ui.add(egui::ProgressBar::new((done / total.max(1) as f32).min(1.0)).text(format!("{done} / {total}")));
             }
+            // METRICS PANE. The per-frame costs were already collected and
+            // only ever surfaced in a log line every twenty-five frames,
+            // which does not answer the question people actually ask —
+            // "how long will this take, and what is slow". Windowed, not a
+            // whole-run mean: cost is not stationary, so an average over ten
+            // thousand frames is still describing the title card.
+            self_.metrics_pane(ui);
             self_.bars(ui);
             if let Some(s) = &self_.summary {
                 ui.label(s);

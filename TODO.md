@@ -997,7 +997,9 @@ asked as a question.
   carries `crop_x/crop_y/crop_w/crop_h`, so the shape is there. Do the
   measurement pass on real hardware FIRST; if `overrun_rate()` is near zero
   on the target machine the splitting is not worth its complexity.
-- [ ] **A metrics pane in each app.** `gpu_kit::pace::Metrics::summary()`
+- [~] **A metrics pane in each app.** dandere2x DONE 2026-09-05
+  (`d2x_core::jobmetrics` + `metrics_pane`, rendered in `carved::inset`).
+  Other apps still to do. `gpu_kit::pace::Metrics::summary()`
   renders the line and `overrun_rate()` is the single number worth showing.
   dandere2x can read it today via `gpu_metrics()`; logscope needs the same
   instrumentation around its `glow_scene` draw first.

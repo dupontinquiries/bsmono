@@ -21,6 +21,7 @@
 
 pub mod courtesy;
 pub mod dropped;
+pub mod jobmetrics;
 pub mod batch;
 pub mod blockcache;
 pub mod budget;
