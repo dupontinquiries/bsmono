@@ -128,7 +128,10 @@ pub fn system_prompt_for(ctx: usize, max_reply: usize) -> String {
 /// and worked examples that are themselves valid IR (there is a test
 /// that parses every example line).
 pub fn system_prompt() -> String {
-    format!("{GRAMMAR}\n\n{DISCIPLINE}\n\n{EXAMPLES}")
+    // The world-change rule is generated from `intent`, so the prompt
+    // and the gate that enforces it cannot drift apart.
+    format!("{GRAMMAR}\n\n{DISCIPLINE}\n\n{}\n\n{EXAMPLES}",
+            crate::intent::WORLD_DISCIPLINE)
 }
 
 pub const GRAMMAR: &str = "\

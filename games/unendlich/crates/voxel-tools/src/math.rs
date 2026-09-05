@@ -223,6 +223,13 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                 push(Note::Info, format!("tree height {height}, roughly {} blocks with canopy",
                                           height + 60), None);
             }
+            Op::World { verb, at, radius, .. } => {
+                push(Note::Suspect,
+                     format!("WORLD CHANGE: {verb} within {radius} of {at:?}. \
+                              This alters the land itself, not a build; undo restores \
+                              blocks but not a climate field the sim has settled."),
+                     None);
+            }
             Op::Detail { kind, min, max, amount, .. } => {
                 let vol = span(min.0, max.0) as i64 * span(min.1, max.1) as i64
                         * span(min.2, max.2) as i64;

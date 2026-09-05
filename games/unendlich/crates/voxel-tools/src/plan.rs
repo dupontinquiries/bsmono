@@ -140,6 +140,11 @@ pub enum Op {
     /// reconstructs and reports how faithful the result is.
     Views { views: Vec<(String, String)>, at: (i32, i32), y: Option<i32>,
             depth: i32, block: u16 },
+    /// A change to the world itself, PROPOSED by the model. It is only
+    /// applied if the player's own words corroborate it; see
+    /// `intent::corroborate`. Carries the verb rather than an effect so
+    /// the gate runs against prose the parser cannot see.
+    World { verb: String, arg: Option<i32>, at: (i32, i32), radius: i32 },
     /// A detailing pass over an existing region: speckle, relief, trim,
     /// feather or ground blend. Like `weather`, a transform rather than
     /// a shape.
@@ -496,6 +501,19 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                             .unwrap_or(&"gable").to_string(),
                     block: blk("oak_planks").unwrap_or(57),
                     overhang: kvi(&t, "overhang", 1).clamp(0, 4) });
+            }
+            "world" => {
+                let verb = t.get(1).map(|s| s.to_lowercase()).unwrap_or_default();
+                if crate::intent::WorldIntent::parse(&verb).is_none() {
+                    bad(format!("unknown world verb '{verb}'"));
+                    continue;
+                }
+                ops.push(Op::World {
+                    verb,
+                    arg: t.get(2).and_then(|s| s.parse().ok()),
+                    at: rel(&t, 3, anchor).unwrap_or_else(|| anchor_xz(anchor)),
+                    radius: kvi(&t, "r", 32).clamp(1, 128),
+                });
             }
             "detail" | "finish" => {
                 let kind = t.get(1).map(|s| s.to_lowercase()).unwrap_or_default();
@@ -879,6 +897,42 @@ pub fn run_plan<W: VoxelWorld>(
                     Some(f) => tools.stamp(&(f.build)(&args)),
                     None => CallResult::err(format!("unknown form '{name}'")),
                 }
+            }
+            Op::World { verb, arg, at, radius } => {
+                use crate::godmode;
+                use crate::intent::WorldIntent as I;
+                // By the time an op reaches here the gate has already
+                // passed it; an ungated one would have been removed.
+                let eff = match I::parse(verb) {
+                    Some(I::Hotter) => godmode::temperature(*at, *radius, 0.2),
+                    Some(I::Colder) => godmode::temperature(*at, *radius, -0.2),
+                    Some(I::Wetter) => godmode::humidity(*at, *radius, 0.2),
+                    Some(I::Drier) => godmode::humidity(*at, *radius, -0.2),
+                    Some(I::Flood) => {
+                        let level = arg.unwrap_or_else(|| {
+                            tools.find_surface(at.0, at.1, from_y).unwrap_or(from_y) + 2
+                        });
+                        godmode::flood(tools.world, *at, *radius, level, 9)
+                    }
+                    Some(I::Freeze) =>
+                        godmode::freeze(tools.world, *at, *radius, from_y, 9, 31, 32),
+                    // Unreachable in practice: the parser rejects an
+                    // unknown verb. An empty effect keeps this an
+                    // expression rather than an early return out of the
+                    // whole plan run.
+                    None => godmode::Effect {
+                        note: format!("unknown world verb '{verb}'"), ..Default::default() },
+                };
+                // Blocks are applied; FIELD requests are not ours to
+                // apply and are reported for the game to act on.
+                let mut r = tools.apply_changes(&eff.blocks);
+                let fields: Vec<String> = eff.fields.iter().map(|f| f.describe()).collect();
+                r.summary = if fields.is_empty() {
+                    format!("{}: {}", verb, eff.note)
+                } else {
+                    format!("{}: {} | engine: {}", verb, eff.note, fields.join("; "))
+                };
+                r
             }
             Op::Detail { kind, min, max, block, amount, seed } => {
                 use crate::detail;

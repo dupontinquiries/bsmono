@@ -79,6 +79,8 @@ pub mod scene;
 pub mod land;
 /// Playing god: requests against the engine's own simulated fields.
 pub mod godmode;
+/// Intent: the gate deciding when the world itself may be changed.
+pub mod intent;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.

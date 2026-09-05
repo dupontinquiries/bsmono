@@ -266,6 +266,30 @@ impl ChatSession {
         }
     }
 
+    /// Strip world ops the player did not ask for.
+    ///
+    /// The second key. The model may propose a climate change; only the
+    /// player's own words authorize one. A refused op is REMOVED and
+    /// the rest of the plan still runs, because a good build should not
+    /// be lost to one over-eager line.
+    ///
+    /// Asymmetric on purpose: a refusal costs one rephrase, while an
+    /// unrequested change rewrites the biome the player chose to build
+    /// in -- and undo restores blocks, not a climate field the engine
+    /// has since spread and settled.
+    fn gate_world_ops(&self, plan: &mut BuildPlan, prose: &str) -> Vec<String> {
+        let mut notes = Vec::new();
+        plan.ops.retain(|op| {
+            let Op::World { verb, .. } = op else { return true };
+            let Some(proposed) = crate::intent::WorldIntent::parse(verb) else { return false };
+            match crate::intent::corroborate(prose, proposed) {
+                Ok(_) => true,
+                Err(r) => { notes.push(r.message); false }
+            }
+        });
+        notes
+    }
+
     /// The model has answered with line IR. Parse, validate, dry-run,
     /// and hold it pending. `ir` is the model's reply text.
     pub fn receive_plan<W: VoxelWorld>(&mut self, tools: &mut VoxelTools<W>,
@@ -278,8 +302,18 @@ impl ChatSession {
     pub fn receive_plan_for<W: VoxelWorld>(&mut self, tools: &mut VoxelTools<W>,
                                            gaze: &Gaze, ir: &str,
                                            player_feet: Option<(i32, i32, i32)>) -> Reply {
+        self.receive_plan_gated(tools, gaze, ir, player_feet, "")
+    }
+
+    /// As `receive_plan_for`, with the player's prose so world ops can
+    /// be checked against what was actually asked for.
+    pub fn receive_plan_gated<W: VoxelWorld>(&mut self, tools: &mut VoxelTools<W>,
+                                             gaze: &Gaze, ir: &str,
+                                             player_feet: Option<(i32, i32, i32)>,
+                                             prose: &str) -> Reply {
         let f = self.focus(gaze);
-        let (plan, mut issues) = parse_plan_at(ir, Some(f.anchor));
+        let (mut plan, mut issues) = parse_plan_at(ir, Some(f.anchor));
+        let refusals = self.gate_world_ops(&mut plan, prose);
         issues.extend(validate(&plan));
         let errors: Vec<_> = issues.iter().filter(|i| i.severity == Severity::Error).collect();
         if !errors.is_empty() {
@@ -321,6 +355,9 @@ impl ChatSession {
         }
         for w in issues.iter().filter(|i| i.severity == Severity::Warning) {
             echo.push_str(&format!("\nwarn op {}: {}", w.op, w.message));
+        }
+        for r in &refusals {
+            echo.push_str(&format!("\nREFUSED: {r}"));
         }
         self.pending = Some(Pending {
             plan, feature_id: f.feature_id.clone(), predicted_blocks: dry.blocks_changed,
@@ -747,5 +784,37 @@ mod tests {
         assert!(ctx.contains("TERRAIN"), "a picture of the ground: {ctx}");
         assert!(ctx.contains('@'), "with the player marked");
         assert!(ctx.contains("rises"), "and the slope named in words");
+    }
+
+    #[test]
+    fn an_uninvited_world_change_is_stripped_but_the_build_survives() {
+        // The failure this gate exists to prevent: asked for a garden on
+        // a glacier, warm the glacier. The garden should still be built.
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        let ir = "world hotter r=40\nscatter @-6,-6 @6,6 block=flower clusters=4 per=5\n";
+        match s.receive_plan_gated(&mut t, &g, ir, None, "a garden here") {
+            Reply::Preview { echo, blocks, .. } => {
+                assert!(echo.contains("REFUSED"), "{echo}");
+                assert!(echo.contains("adapt"), "and says why: {echo}");
+                assert!(blocks > 0, "the garden is still built");
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn an_explicitly_requested_world_change_passes_the_gate() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        match s.receive_plan_gated(&mut t, &g, "world hotter r=40\n", None,
+                                   "make it warmer here") {
+            Reply::Preview { echo, .. } => assert!(!echo.contains("REFUSED"), "{echo}"),
+            o => panic!("{o:?}"),
+        }
     }
 }
