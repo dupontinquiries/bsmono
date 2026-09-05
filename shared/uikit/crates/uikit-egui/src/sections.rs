@@ -156,7 +156,10 @@ pub fn picker_ui(ui: &mut egui::Ui, sections: &[Section], active: usize,
     let popup_id = ui.make_persistent_id("section-picker-open");
     let mut chosen = None;
 
-    let h = ui.spacing().interact_size.y.max(28.0);
+    // A fixed touch-height row with two bands: the peek line on top, the
+    // active section below. Fixed rather than growing on hover — a control
+    // that changes height under the pointer shifts everything around it.
+    let h = ui.spacing().interact_size.y.max(crate::tokens::TOUCH_MIN as f32);
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), h), egui::Sense::click_and_drag());
 
@@ -170,13 +173,45 @@ pub fn picker_ui(ui: &mut egui::Ui, sections: &[Section], active: usize,
         }
     }
     let mut open = ui.memory(|m| m.data.get_temp::<bool>(popup_id).unwrap_or(false));
-    if resp.clicked() { open = !open; }
+    // DOUBLE-TAP opens the grid; a SINGLE tap cycles forward.
+    //
+    // This division only works because the single tap acts IMMEDIATELY. The
+    // usual double-tap trap is holding the first tap for ~250ms to see
+    // whether a second arrives, which makes the primary action feel broken.
+    // Here tap one cycles at once and tap two opens the grid over the top —
+    // cycling one section further is harmless and the grid supersedes it, so
+    // nothing has to be delayed or undone.
+    //
+    // The single tap matters because it is the only way to change section
+    // without knowing the swipe exists.
+    if resp.double_clicked() {
+        open = true;
+    } else if resp.clicked() {
+        chosen = Some(Pick::Section(cycle(active, sections.len(), 1)));
+    }
 
     let p = ui.painter_at(rect);
     p.rect_filled(rect, crate::tokens::RADIUS_SM as f32, c.bg_raised);
-    p.text(egui::pos2(rect.left() + 10.0, rect.center().y), egui::Align2::LEFT_CENTER,
+    p.text(egui::pos2(rect.left() + 10.0, rect.center().y + 7.0), egui::Align2::LEFT_CENTER,
            format!("{}  {}", sections[active].label, if open { '\u{25B4}' } else { '\u{25BE}' }),
            egui::FontId::proportional(14.0), c.text);
+    // CAROUSEL PEEK, for a pointer. The neighbouring section names sit faintly
+    // at each edge, so you can see what a slide moves toward before making
+    // it. Deliberately NOT macOS-dock magnification: zoom-on-hover makes the
+    // target move under the cursor, which fights the pointing it is meant to
+    // help, and on a desktop the grouped side nav already shows every
+    // destination. Peek answers the same question without moving anything.
+    if resp.hovered() && sections.len() > 1 {
+        let prev = &sections[cycle(active, sections.len(), -1)].label;
+        let next = &sections[cycle(active, sections.len(), 1)].label;
+        let faint = c.text_weak;
+        let f = egui::FontId::proportional(11.0);
+        p.text(egui::pos2(rect.left() + 10.0, rect.top() + 5.0),
+               egui::Align2::LEFT_TOP, format!("\u{2039} {prev}"), f.clone(), faint);
+        p.text(egui::pos2(rect.right() - 10.0, rect.top() + 5.0),
+               egui::Align2::RIGHT_TOP, format!("{next} \u{203A}"), f, faint);
+    }
+
     // Position dots: which of the three you are on, so the swipe has a
     // visible target and the control says how many there are without
     // being opened.
@@ -184,7 +219,7 @@ pub fn picker_ui(ui: &mut egui::Ui, sections: &[Section], active: usize,
     for i in 0..n {
         let x = rect.right() - 12.0 - (n - 1 - i) as f32 * 12.0;
         let on = i == active;
-        p.circle_filled(egui::pos2(x, rect.center().y), if on { 3.5 } else { 2.5 },
+        p.circle_filled(egui::pos2(x, rect.center().y + 7.0), if on { 3.5 } else { 2.5 },
                         if on { c.accent } else { c.text_weak });
     }
 
