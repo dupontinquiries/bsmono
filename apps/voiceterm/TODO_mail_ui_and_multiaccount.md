@@ -105,3 +105,54 @@ qmetaobject macro-expansion detail my hand-verification couldn't see
   that calls `hub.poll_new_mail(session)` for the active account, feeding
   `mail_notify::notifier_bar_qml`).
 - Full inbox rendering per active account — same SRP dependency.
+
+## Found this session (egui port): opened messages always show "(no message body)"
+
+Confirmed live, right after fixing the merged-inbox bug (see git log —
+the Inbox not showing disk-scanned mail at all): opening ANY message,
+disk-scanned or terminal-harvested, shows "(no message body)" even
+when the source genuinely has one. Grepped: `self.mail.bodies` (a
+`BTreeMap<String, Body>`, "fetched lazily" per `MailView`'s own doc
+comment) is READ once, at open time, and never WRITTEN anywhere in the
+binary. The lazy-fetch this comment describes was never implemented.
+
+The data exists to fix this: `mail_rfc822::parse_message`'s `Parsed`
+struct already has a `body: String` field, and `mail_store::load`
+reads each message file's full text via `std::fs::read_to_string`
+before extracting just the metadata into `Message` — the body is
+sitting right there and gets discarded.
+
+Two ways to wire it, deliberately not attempted this session without
+more room to verify both paths correctly:
+1. Change `mail_store::load`'s return type to also carry bodies (a
+   real public-signature change to an already-tested function — needs
+   its existing tests re-checked, not just extended).
+2. Track message id → source (a file path for Maildir/mbox, a block
+   id for terminal-harvested mail) at the binary level, and fetch the
+   body lazily — genuinely "lazily", matching the field's own doc —
+   only when a message is opened, re-reading the Maildir file or
+   re-scanning the block's output on demand.
+
+(2) matches the original design's own framing better and avoids
+touching a tested function's signature, but needs the SAME lazy-fetch
+to work correctly for both mail sources (disk AND terminal-harvested),
+which are structurally different (a real file vs. a block's captured
+output) — shipping a fetch that only works for one source would be
+the same "half-fixed, looks complete" shape as the bug this note
+follows.
+
+### RESOLVED, same session
+
+Took a variant of (2): rather than re-read on demand, added
+`mail_store::load_bodies`/`mail_rfc822::body_from_text` (additive, no
+existing signature touched) computed ALONGSIDE the existing scans
+(`rescan_mail_store`, `harvest_mail_from_blocks`) rather than on
+open — cheap enough (bodies are read once per scan either way, since
+`load` already reads full file text) that "on scan" vs "on open"
+wasn't worth the extra bookkeeping true laziness would need. Both
+sources wired identically, verified live with a real Maildir message.
+Caught and fixed one real bug in review before it shipped: the mbox
+branch's no-Message-ID fallback id has to match `messages_from_text`'s
+own `"{origin}#{i}"` per-part convention, not a bare shared origin, or
+two id-less messages in one file silently collide onto the same body.
+See the two commits following this note for the full detail.

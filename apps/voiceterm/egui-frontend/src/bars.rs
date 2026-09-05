@@ -48,39 +48,16 @@ pub use bottom_bar::{BarButton, BarButtonKind, BarOption, BottomBar};
 /// their thumb. Changing it in one place now changes it everywhere,
 /// which is the only way that stays true.
 ///
-/// The GESTURE STATE is deliberately NOT shared. `cmdstrip::Hold` is
-/// one button with a threshold; `BarState` below is a bar of buttons
-/// with a fan-out and a hovered option inside it, and collapsing the
-/// richer one into the simpler one would lose the hover — the part that
-/// makes sliding onto an option and off again work. Sharing the timing
-/// and not the state machine is the honest split.
+/// The GESTURE STATE is deliberately NOT shared. `cmdstrip::Hold` is one
+/// button with a threshold; a bar has several, each with its own fan-out
+/// and hovered option, and collapsing the richer shape into the simpler
+/// one would lose the hover — the part that makes sliding onto an option
+/// and off again work. Sharing the timing and not the state machine is
+/// the honest split. (That richer state used to be `BarState` here, a
+/// hand-rolled machine nothing in production ever drove; `bar_ui` below
+/// gets it from `SlideMenu` instead, and real-frame tests replaced the
+/// ones that used to assert against the mock — see the test module.)
 pub use uikit_egui::cmdstrip::HOLD_SECONDS;
-
-/// The bar's live gesture state.
-///
-/// **Vestigial.** `bar_ui` below drives `uikit_egui::slide_menu::SlideMenu`
-/// instead, which implements the same two rules; nothing constructs this in
-/// production and its five methods sit on the dead-API list. It is kept for
-/// one reason: the tests underneath it are the only place in the fleet that
-/// STATES those rules as assertions — SlideMenu's own tests cover geometry,
-/// hit-testing and clamping, and none of them asserts that a tap yields the
-/// primary or that releasing outside yields a cancel.
-///
-/// So deleting it would remove coverage rather than duplication. The right
-/// close is to drive `bar_ui` through real egui frames and assert the
-/// outcomes there — the same move that caught two real bugs in snapclone's
-/// swipe work, because a state machine nobody calls can pass forever. Until
-/// that exists this stays, labelled, rather than being quietly removed or
-/// quietly left to look load-bearing.
-#[derive(Debug, Clone, Default)]
-pub struct BarState {
-    /// Which button is being pressed, and for how long.
-    pressing: Option<(usize, f32)>,
-    /// Which button is fanned out, if any.
-    pub open: Option<usize>,
-    /// Highlighted option within the open fan.
-    pub hover: Option<usize>,
-}
 
 /// What a gesture produced.
 #[derive(Debug, Clone, PartialEq)]
@@ -93,64 +70,13 @@ pub enum BarEvent {
     Cancelled,
 }
 
-impl BarState {
-    pub fn press(&mut self, button: usize) {
-        self.pressing = Some((button, 0.0));
-        self.hover = None;
-    }
-
-    /// Advance the press timer. Returns true when the fan-out just opened, so
-    /// the caller can play the haptic exactly once rather than every frame.
-    pub fn tick(&mut self, dt: f32) -> bool {
-        let Some((b, ref mut t)) = self.pressing else { return false };
-        *t += dt.max(0.0);
-        if *t >= HOLD_SECONDS && self.open != Some(b) {
-            self.open = Some(b);
-            return true;
-        }
-        false
-    }
-
-    pub fn is_open(&self) -> bool { self.open.is_some() }
-
-    /// Move the highlight while fanned out. Ignored when nothing is open, so a
-    /// stray drag across the bar cannot pre-select an option.
-    pub fn hover_option(&mut self, option: Option<usize>) {
-        if self.open.is_some() { self.hover = option; }
-    }
-
-    /// Release. A tap runs the primary; a hold picks the hovered option, or
-    /// cancels if the finger left the fan.
-    pub fn release(&mut self) -> Option<BarEvent> {
-        let (button, held) = self.pressing.take()?;
-        let was_open = self.open.take();
-        let hover = self.hover.take();
-        if was_open.is_some() {
-            return Some(match hover {
-                Some(o) => BarEvent::Option { button, option: o },
-                // Sliding off the list and letting go must select nothing —
-                // otherwise you pick whatever your thumb was over when you gave
-                // up.
-                None => BarEvent::Cancelled,
-            });
-        }
-        // a press that never reached the hold threshold is a tap
-        if held < HOLD_SECONDS { Some(BarEvent::Primary(button)) } else { Some(BarEvent::Cancelled) }
-    }
-
-    /// Abandon without emitting — for a gesture interrupted by something else,
-    /// like the keyboard appearing.
-    pub fn abort(&mut self) { self.pressing = None; self.open = None; self.hover = None; }
-}
-
 /// Draw the bottom bar with a real press-and-hold fan-out, reusing
-/// `uikit_egui::slide_menu::SlideMenu` rather than hand-rolling the gesture
-/// again — `BarState`/`BarEvent` above describe the RULES (a tap is not a
-/// hold; releasing outside the fan cancels) but never got a renderer, and
-/// `SlideMenu` already implements exactly those rules, tested, and used
-/// elsewhere in the kit. Memory-backed (`show_stored`) so callers don't need
-/// to thread a `SlideMenu` through their app state per button — only
-/// `BottomBar` itself is owned by the caller.
+/// `uikit_egui::slide_menu::SlideMenu` rather than hand-rolling the gesture —
+/// this module's header states the RULES (a tap is not a hold; releasing
+/// outside the fan cancels), and `SlideMenu` already implements exactly
+/// those, tested, and used elsewhere in the kit. Memory-backed (`show_stored`)
+/// so callers don't need to thread a `SlideMenu` through their app state per
+/// button — only `BottomBar` itself is owned by the caller.
 ///
 /// Returns the resolved event for the frame the gesture completed, `None`
 /// otherwise (including every frame the menu is still open and being
@@ -164,6 +90,14 @@ pub fn bar_ui(ui: &mut egui::Ui, bar: &BottomBar) -> Option<BarEvent> {
             let label = if b.badge.is_empty() { b.label.clone() }
                         else { format!("{} {}", b.label, b.badge) };
             let host = ui.add_enabled(b.enabled, egui::Button::new(label));
+            // TEST SUPPORT ONLY: stash each button's screen rect in egui's own
+            // temp memory (auto-expiring, standard idiom — see `Memory::data`),
+            // so a test driving real pointer events through `bar_ui` can find
+            // where to send them without re-deriving egui's internal auto-id
+            // scheme. Costs one hashmap write per button per frame; nothing
+            // reads it outside `#[cfg(test)]`.
+            ui.ctx().memory_mut(|m| m.data.insert_temp(
+                egui::Id::new(("voiceterm_bar_rect", b.id.as_str())), host.rect));
             if b.options.is_empty() {
                 // No fan-out possible: a tap is the only gesture this button
                 // has, so SlideMenu (which exists to draw a fan-out) would be
@@ -302,16 +236,6 @@ mod tests {
     }
 
     #[test]
-    fn a_tap_runs_the_primary_and_does_not_fan_out() {
-        // Firing the fan-out on tap makes the primary action unreachable.
-        let mut s = BarState::default();
-        s.press(0);
-        assert!(!s.tick(HOLD_SECONDS * 0.4));
-        assert!(!s.is_open());
-        assert_eq!(s.release(), Some(BarEvent::Primary(0)));
-    }
-
-    #[test]
     fn the_hold_threshold_is_the_kit_s_and_cannot_drift() {
         // Not a tautology now that it is a re-export — it is the guard
         // that keeps it one. If someone re-declares a local constant to
@@ -320,63 +244,163 @@ mod tests {
         assert!(HOLD_SECONDS > 0.0 && HOLD_SECONDS < 1.0, "a plausible long-press: {HOLD_SECONDS}");
     }
 
-    #[test]
-    fn a_hold_fans_out_and_reports_the_moment_it_opens() {
-        // The caller plays a haptic exactly once, not every frame.
-        let mut s = BarState::default();
-        s.press(0);
-        assert!(!s.tick(HOLD_SECONDS * 0.5));
-        assert!(s.tick(HOLD_SECONDS * 0.6), "opened on this tick");
-        assert!(!s.tick(0.1), "and does not report again");
-        assert!(s.is_open());
+    // ── real-frame tests ──────────────────────────────────────────────────
+    //
+    // `bar_ui` used to have a documented gap: the two rules in this module's
+    // header comment (tap-is-not-hold, release-outside-cancels) were stated
+    // as assertions only against `BarState`, a hand-rolled state machine
+    // nothing in production ever constructed. `bar_ui` itself drives the
+    // real gesture through `uikit_egui::slide_menu::SlideMenu`, and nothing
+    // exercised THAT path with real pointer input — a state machine nobody
+    // calls can pass forever, which is exactly what happened here.
+    //
+    // These tests drive `bar_ui` through `egui::Context::run_ui` with
+    // synthetic `PointerButton`/`PointerMoved` events and an explicit
+    // `RawInput.time`, the same context across frames so egui's own
+    // pointer-down and hold-timer state carries over exactly as it would
+    // for a real frontend. The one thing they need that `bar_ui`'s callers
+    // don't — a button's screen rect, to know where to send the pointer —
+    // comes from the temp-memory stash added alongside this test, not from
+    // guessing at egui's internal auto-id scheme.
+    //
+    // The fan-out geometry is not guessed either: `SlideMenu::place_at`
+    // centers the grid on the press point (see `slide_menu.rs`), so for the
+    // two-option "tabs" fixture below (item_size 52, spacing 8, padding 10 —
+    // all `SlideMenu` defaults, since `bar_ui` sets none of them) releasing
+    // exactly on the press point lands in the gutter between the two cells,
+    // and moving 10px either side lands inside one.
+
+    /// One frame: feed `raw` into `ctx`, run `bar_ui`, return what it saw.
+    ///
+    /// Placed at a fixed rect well inside the (very large) default screen —
+    /// not at the natural top-left corner a bare root `ui.horizontal` would
+    /// use. `SlideMenu::place_at` clamps the fan-out into the screen, and a
+    /// button hard against an edge gets its whole grid shifted to fit,
+    /// which would silently invalidate the fixed pixel offsets the
+    /// selection tests below rely on. Found by a failing test, not
+    /// anticipated — see the git history of this comment.
+    fn frame(ctx: &egui::Context, time: f64, events: Vec<egui::Event>, b: &BottomBar) -> Option<BarEvent> {
+        let raw = egui::RawInput { time: Some(time), events, ..Default::default() };
+        let mut seen = None;
+        let _ = ctx.run_ui(raw, |ui| {
+            let rect = egui::Rect::from_min_size(egui::pos2(400.0, 400.0), egui::vec2(600.0, 100.0));
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                seen = bar_ui(ui, b);
+            });
+        });
+        seen
     }
 
-    #[test]
-    fn releasing_outside_the_fan_selects_nothing() {
-        // Otherwise you pick whatever your thumb was over when you gave up.
-        let mut s = BarState::default();
-        s.press(0);
-        s.tick(HOLD_SECONDS + 0.01);
-        s.hover_option(Some(1));
-        s.hover_option(None);          // slid off the list
-        assert_eq!(s.release(), Some(BarEvent::Cancelled));
+    fn button_rect(ctx: &egui::Context, id: &str) -> egui::Rect {
+        ctx.memory(|m| m.data.get_temp(egui::Id::new(("voiceterm_bar_rect", id))))
+            .unwrap_or_else(|| panic!("bar_ui did not stash a rect for {id:?}"))
     }
 
-    #[test]
-    fn choosing_an_option_reports_both_the_button_and_the_option() {
-        let mut s = BarState::default();
-        s.press(0);
-        s.tick(HOLD_SECONDS + 0.01);
-        s.hover_option(Some(1));
-        assert_eq!(s.release(), Some(BarEvent::Option { button: 0, option: 1 }));
-        assert!(!s.is_open(), "and the fan closes");
+    fn down(pos: egui::Pos2) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }
+    }
+    fn up(pos: egui::Pos2) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }
     }
 
+    /// A tap through the REAL path: no options, so `bar_ui` takes the
+    /// early-continue branch and reads `host.clicked()` directly — this is
+    /// the button-with-no-options rule from the module doc, exercised with
+    /// an actual press-then-release rather than asserted against a mock.
     #[test]
-    fn a_drag_across_the_bar_cannot_preselect_before_it_opens() {
-        // Hovering only counts once the fan is out.
-        let mut s = BarState::default();
-        s.press(0);
-        s.hover_option(Some(1));
-        assert_eq!(s.hover, None, "ignored while closed");
-        assert_eq!(s.release(), Some(BarEvent::Primary(0)));
+    fn a_real_tap_on_an_option_less_button_runs_the_primary() {
+        let mut b = BottomBar::new();
+        b.upsert(BarButton::new("solo", "Solo", BarButtonKind::Tabs));
+        let ctx = egui::Context::default();
+
+        assert_eq!(frame(&ctx, 0.0, vec![], &b), None, "layout only");
+        let rect = button_rect(&ctx, "solo");
+        let p = rect.center();
+
+        assert_eq!(frame(&ctx, 0.01, vec![down(p)], &b), None, "still pressed");
+        assert_eq!(frame(&ctx, 0.02, vec![up(p)], &b), Some(BarEvent::Primary(0)),
+                   "a quick press-release on a no-options button is a tap");
     }
 
+    /// The fan-out, driven for real: press past the hold threshold, drag
+    /// into a cell, release — through `SlideMenu`, not a mock of it.
     #[test]
-    fn a_release_without_a_press_emits_nothing() {
-        let mut s = BarState::default();
-        assert_eq!(s.release(), None);
+    fn a_real_hold_and_drag_selects_the_hovered_option() {
+        let b = bar(); // "tabs" button, options t1 (index 0), t2 (index 1)
+        let ctx = egui::Context::default();
+
+        assert_eq!(frame(&ctx, 0.0, vec![], &b), None, "layout only");
+        let rect = button_rect(&ctx, "tabs");
+        let press = rect.center();
+
+        assert_eq!(frame(&ctx, 0.0, vec![down(press)], &b), None, "pressed, not yet held");
+        assert_eq!(frame(&ctx, (HOLD_SECONDS + 0.05) as f64, vec![], &b), None,
+                   "the fan opening is not itself a resolution");
+        // +10px is inside cell 1 (starts 4px right of the press point for this
+        // fixture's geometry) — see the module note above the test section.
+        let hovered = press + egui::vec2(10.0, 0.0);
+        assert_eq!(frame(&ctx, (HOLD_SECONDS + 0.10) as f64, vec![egui::Event::PointerMoved(hovered)], &b),
+                   None, "hovering alone does not resolve — only release does");
+        assert_eq!(frame(&ctx, (HOLD_SECONDS + 0.15) as f64, vec![up(hovered)], &b),
+                   Some(BarEvent::Option { button: 0, option: 1 }));
     }
 
+    /// Same gesture, mirrored: -10px lands in cell 0 instead of cell 1. Two
+    /// tests rather than one parametrised over `[10.0, -10.0]` because the
+    /// asymmetry itself is the thing worth pinning — a bug that only
+    /// mishandled negative offsets would pass a single-direction test.
     #[test]
-    fn an_interrupted_gesture_emits_nothing() {
-        // The keyboard appearing mid-press must not send a command.
-        let mut s = BarState::default();
-        s.press(1);
-        s.tick(HOLD_SECONDS + 0.1);
-        s.abort();
-        assert_eq!(s.release(), None);
-        assert!(!s.is_open());
+    fn a_real_hold_and_drag_the_other_way_selects_the_other_option() {
+        let b = bar();
+        let ctx = egui::Context::default();
+
+        let _ = frame(&ctx, 0.0, vec![], &b);
+        let press = button_rect(&ctx, "tabs").center();
+
+        let _ = frame(&ctx, 0.0, vec![down(press)], &b);
+        let _ = frame(&ctx, (HOLD_SECONDS + 0.05) as f64, vec![], &b);
+        let hovered = press - egui::vec2(10.0, 0.0);
+        let _ = frame(&ctx, (HOLD_SECONDS + 0.10) as f64, vec![egui::Event::PointerMoved(hovered)], &b);
+        assert_eq!(frame(&ctx, (HOLD_SECONDS + 0.15) as f64, vec![up(hovered)], &b),
+                   Some(BarEvent::Option { button: 0, option: 0 }));
+    }
+
+    /// Releasing without ever dragging off the press point lands in the
+    /// gutter between the two cells (see the geometry note above), which is
+    /// the real-path equivalent of "released outside the fan" — this fixture
+    /// makes that reachable without moving the pointer at all.
+    #[test]
+    fn a_real_hold_released_without_dragging_cancels() {
+        let b = bar();
+        let ctx = egui::Context::default();
+
+        let _ = frame(&ctx, 0.0, vec![], &b);
+        let press = button_rect(&ctx, "tabs").center();
+
+        let _ = frame(&ctx, 0.0, vec![down(press)], &b);
+        let _ = frame(&ctx, (HOLD_SECONDS + 0.05) as f64, vec![], &b);
+        assert_eq!(frame(&ctx, (HOLD_SECONDS + 0.1) as f64, vec![up(press)], &b),
+                   Some(BarEvent::Cancelled),
+                   "released on the gutter between two cells, not on either");
+    }
+
+    /// A press that never reaches the hold threshold must not fan out at
+    /// all — releasing early on an OPTIONS button is a tap on the button
+    /// itself, not a resolved fan gesture. `SlideMenu::show_stored` returns
+    /// `Idle` for this case (open never became true), which `bar_ui` reads
+    /// as `host.clicked() && !host.dragged()`.
+    #[test]
+    fn a_real_quick_release_on_an_options_button_does_not_fan_out() {
+        let b = bar();
+        let ctx = egui::Context::default();
+
+        let _ = frame(&ctx, 0.0, vec![], &b);
+        let press = button_rect(&ctx, "tabs").center();
+
+        let _ = frame(&ctx, 0.0, vec![down(press)], &b);
+        // Released well before HOLD_SECONDS.
+        assert_eq!(frame(&ctx, (HOLD_SECONDS * 0.3) as f64, vec![up(press)], &b),
+                   Some(BarEvent::Primary(0)), "a quick tap runs the primary, fan or no fan");
     }
 
     #[test]

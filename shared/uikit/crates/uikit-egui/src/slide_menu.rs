@@ -255,6 +255,19 @@ pub enum SlideOutcome {
     Selected(String, Variant),
 }
 
+/// How the current gesture opened the menu — determines which per-frame
+/// rule drives it while open. A held press and a discrete click have
+/// different lifecycles (still-down vs already-released when the menu
+/// appears), so once open, each needs its OWN commit rule rather than one
+/// trying to imitate the other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OpenedBy {
+    /// Still holding: drag repositions the hover, release commits.
+    Hold,
+    /// Already released: the menu stays open, a SECOND click commits.
+    Tap,
+}
+
 /// Per-gesture state (open + anchor + frozen hover). `Clone`+`Copy` so it can live in egui memory
 /// for stateless callers.
 #[derive(Clone, Copy, Default)]
@@ -272,6 +285,10 @@ struct SlideState {
     /// lifting off drifts, and a fast flick that overshoots and bounces back should still read
     /// as the flick. (FlickBoard's `mostExtremePosFromDown`.)
     peak: Vec2,
+    /// Set when [`SlideMenu::show_hybrid`]/[`SlideMenu::show_stored_hybrid`] opened the menu —
+    /// `None` for every other path, which always means Hold (the only way `show`/`show_stored`
+    /// ever open). Determines which commit rule drives the open menu; see [`OpenedBy`].
+    opened_by: Option<OpenedBy>,
 }
 
 /// A reusable gesture grid menu. Hold one instance per host affordance, OR use
@@ -399,31 +416,37 @@ impl SlideMenu {
             ui.ctx().data_mut(|d| d.insert_temp(id, st));
             return SlideOutcome::Idle;
         }
+        let out = drive_tap(self, id, &mut st, ui, options);
+        ui.ctx().data_mut(|d| d.insert_temp(id, st));
+        out
+    }
 
-        let (cols, _) = layout_dims(options, self.max_cols);
-        let grid_origin = st.origin + Vec2::new(self.padding, self.padding + self.title_h());
-        let cells = cell_rects_opts(grid_origin, options, cols, self.item_size, self.spacing);
-        let panel = self.panel_rect(st.origin, options);
-        let pointer = ui.ctx().pointer_latest_pos();
-        st.hot = pointer.and_then(|p| hit(p, &cells));
-        st.variant = Variant::Single;
+    /// Combines [`SlideMenu::show`] and [`SlideMenu::show_tap`] on one host: a held press still
+    /// opens in drag-follow mode exactly as `show` does (release commits); a plain click opens in
+    /// TAP mode instead (a second click commits, Esc or a click elsewhere cancels) — for mouse
+    /// users, who have no equivalent of "rest a finger and wait" a touchscreen makes natural.
+    /// Whichever way a given press opens it, only THAT gesture's rule drives it until it resolves
+    /// — the two lifecycles never overlap mid-gesture, because a held press and an already-
+    /// released click can't be the same frame.
+    ///
+    /// Safe to add to a host whose bare click currently does nothing (the pipe/brace toolbar
+    /// chips: `run()`'s existing hold-only trigger left a quick click a complete no-op). NOT a
+    /// drop-in replacement for `show`/`show_stored` on a host where a bare click already means
+    /// something else (bar_ui's option buttons: a tap there is the documented primary action,
+    /// and this would silently repurpose it into "open the menu" instead).
+    pub fn show_hybrid(&mut self, ui: &mut Ui, host: &Response, options: &[SlideOption]) -> SlideOutcome {
+        let id = self.id;
+        let mut st = self.state;
+        let out = run_hybrid(self, id, &mut st, ui, host, options);
+        self.state = st;
+        out
+    }
 
-        self.paint(ui, id, &st, options, &cells, panel, false);
-
-        let mut out = SlideOutcome::Idle;
-        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
-        let clicked_at = ui.input(|i| i.pointer.any_click().then(|| i.pointer.interact_pos()).flatten());
-        if esc {
-            st.open = false;
-            out = SlideOutcome::Cancelled;
-        } else if let Some(p) = clicked_at {
-            st.open = false;
-            out = match hit(p, &cells) {
-                Some(i) => SlideOutcome::Selected(options[i].id.clone(), Variant::Single),
-                None => SlideOutcome::Cancelled,
-            };
-        }
-        ui.ctx().request_repaint();
+    /// Memory-backed [`SlideMenu::show_hybrid`] — see [`SlideMenu::show_stored`] for why the
+    /// memory-backed shape exists.
+    pub fn show_stored_hybrid(&self, ui: &mut Ui, id: Id, host: &Response, options: &[SlideOption]) -> SlideOutcome {
+        let mut st = ui.ctx().data_mut(|d| d.get_temp::<SlideState>(id).unwrap_or_default());
+        let out = run_hybrid(self, id, &mut st, ui, host, options);
         ui.ctx().data_mut(|d| d.insert_temp(id, st));
         out
     }
@@ -588,6 +611,85 @@ fn run(menu: &SlideMenu, id: Id, st: &mut SlideState, ui: &mut Ui, host: &Respon
         st.pressed_at = None;
     }
     drive(menu, id, st, ui, options)
+}
+
+/// Opening logic for [`SlideMenu::show_hybrid`]/[`SlideMenu::show_stored_hybrid`]: the same
+/// hold-to-open trigger `run` uses, PLUS a plain click as an alternative that opens in
+/// [`OpenedBy::Tap`] mode instead. Once open, dispatches to whichever per-frame rule matches how
+/// it opened — `drive` (hold) or `drive_tap` (tap) — so the two lifecycles never mix mid-gesture.
+fn run_hybrid(menu: &SlideMenu, id: Id, st: &mut SlideState, ui: &mut Ui, host: &Response, options: &[SlideOption]) -> SlideOutcome {
+    if options.is_empty() {
+        return SlideOutcome::Idle;
+    }
+    if !st.open {
+        if host.is_pointer_button_down_on() {
+            let now = ui.input(|i| i.time);
+            let start = *st.pressed_at.get_or_insert(now);
+            if (now - start) >= menu.hold_secs as f64 {
+                st.open = true;
+                st.opened_by = Some(OpenedBy::Hold);
+                st.hot = None;
+                st.variant = Variant::Single;
+                let press = host.interact_pointer_pos().unwrap_or_else(|| host.rect.center());
+                st.origin = menu.place(ui, host, options, press);
+            }
+            return SlideOutcome::Idle;
+        }
+        st.pressed_at = None;
+        // Not currently held. A click that just completed (press-then-release, without exceeding
+        // egui's own drag distance threshold) opens in TAP mode instead — the alternative a mouse
+        // needs, since it has no equivalent of "rest a finger and wait" to trigger the hold above.
+        if host.clicked() {
+            st.open = true;
+            st.opened_by = Some(OpenedBy::Tap);
+            st.hot = None;
+            st.variant = Variant::Single;
+            let press = host.interact_pointer_pos().unwrap_or_else(|| host.rect.center());
+            st.origin = menu.place(ui, host, options, press);
+        }
+        return SlideOutcome::Idle;
+    }
+    match st.opened_by {
+        Some(OpenedBy::Tap) => drive_tap(menu, id, st, ui, options),
+        // `None` only if state somehow got here without going through the opening branch above
+        // (a stale value from a different call shape sharing the same id) — Hold is the older,
+        // wider-used rule, and the safer of the two to fall back on.
+        _ => drive(menu, id, st, ui, options),
+    }
+}
+
+/// The per-frame rule for a menu opened in [`OpenedBy::Tap`] mode: stays open, tracks hover for
+/// highlight only (nothing is committed by hovering), and a SECOND discrete click (or Esc, or a
+/// click outside every cell) resolves it. Shared by [`SlideMenu::show_tap`] and
+/// [`SlideMenu::show_hybrid`]/[`SlideMenu::show_stored_hybrid`] once tap-opened.
+fn drive_tap(menu: &SlideMenu, id: Id, st: &mut SlideState, ui: &mut Ui, options: &[SlideOption]) -> SlideOutcome {
+    let (cols, _) = layout_dims(options, menu.max_cols);
+    let grid_origin = st.origin + Vec2::new(menu.padding, menu.padding + menu.title_h());
+    let cells = cell_rects_opts(grid_origin, options, cols, menu.item_size, menu.spacing);
+    let panel = menu.panel_rect(st.origin, options);
+    let pointer = ui.ctx().pointer_latest_pos();
+    st.hot = pointer.and_then(|p| hit(p, &cells));
+    st.variant = Variant::Single;
+
+    menu.paint(ui, id, st, options, &cells, panel, false);
+
+    let mut out = SlideOutcome::Idle;
+    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let clicked_at = ui.input(|i| i.pointer.any_click().then(|| i.pointer.interact_pos()).flatten());
+    if esc {
+        st.open = false;
+        st.opened_by = None;
+        out = SlideOutcome::Cancelled;
+    } else if let Some(p) = clicked_at {
+        st.open = false;
+        st.opened_by = None;
+        out = match hit(p, &cells) {
+            Some(i) => SlideOutcome::Selected(options[i].id.clone(), Variant::Single),
+            None => SlideOutcome::Cancelled,
+        };
+    }
+    ui.ctx().request_repaint();
+    out
 }
 
 /// The drag-highlight-release phase, shared by the host-driven paths and the detached one.
@@ -1143,5 +1245,140 @@ mod tests {
         assert!(!beyond_vertical(303.0, 100.0, 300.0)); // within bottom tolerance
         assert!(beyond_vertical(95.0, 100.0, 300.0)); // past the top
         assert!(beyond_vertical(305.0, 100.0, 300.0)); // past the bottom
+    }
+
+    // ── show_hybrid: real frames, both lifecycles on one host ──────────────
+    //
+    // Every test above this point is a pure-function check; none of them
+    // drive a real egui frame. `show_hybrid` is new precisely because a
+    // mouse has no equivalent of "rest a finger and wait" — worth pinning
+    // with the actual pointer-event machinery, not just the state-machine
+    // logic, the same way voiceterm-egui's bar_ui tests do.
+
+    fn opts() -> Vec<SlideOption> {
+        vec![SlideOption::new("a", "A"), SlideOption::new("b", "B")]
+    }
+
+    fn down(pos: Pos2) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }
+    }
+    fn up(pos: Pos2) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }
+    }
+
+    /// One frame: a button host at a fixed rect, driving `show_hybrid` on it. Returns the outcome
+    /// AND the host's real rendered rect — needed because a guessed click position that happens
+    /// to land outside the actual button silently makes every assertion in a test trivially true
+    /// (nothing opens, nothing selects, `Idle` all the way down) rather than failing loudly.
+    fn frame(ctx: &egui::Context, time: f64, events: Vec<egui::Event>, menu: &mut SlideMenu) -> (SlideOutcome, Rect) {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 400.0))),
+            time: Some(time), events, ..Default::default()
+        };
+        let mut out = SlideOutcome::Idle;
+        let mut host_rect = Rect::NOTHING;
+        let _ = ctx.run_ui(raw, |ui| {
+            let rect = Rect::from_min_size(egui::pos2(150.0, 150.0), egui::vec2(600.0, 300.0));
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                let host = ui.button("host");
+                host_rect = host.rect;
+                out = menu.show_hybrid(ui, &host, &opts());
+            });
+        });
+        (out, host_rect)
+    }
+
+    /// A plain click opens in TAP mode: the first click must not itself
+    /// select anything (it only opens), matching `show_tap`'s own contract.
+    ///
+    /// `.hold(0.3)`, not the default 0.0: with a zero hold threshold, a
+    /// single frame of "pointer is down" already satisfies the HOLD branch
+    /// (`now - start >= 0.0`), so a quick press+release would open in Hold
+    /// mode too — indistinguishable from what this test is trying to
+    /// isolate. A real nonzero threshold is what makes "released before the
+    /// hold fires" and "held past it" two different, testable paths.
+    #[test]
+    fn a_click_opens_without_selecting_anything() {
+        let ctx = egui::Context::default();
+        let mut menu = SlideMenu::new("hybrid-test-a").columns(2).hold(0.3);
+        // Frame 1, no events: layout only, to learn the host's real rect —
+        // guessing it (as the first version of this test did) let a
+        // completely missed click pass silently, since a menu that never
+        // opens returns Idle just as validly as one that opened and is
+        // still deciding.
+        let (_, r) = frame(&ctx, 0.0, vec![], &mut menu);
+        assert!(r.is_finite() && r.area() > 0.0, "the host button never rendered at all");
+        let p = r.center();
+        let (out1, _) = frame(&ctx, 0.01, vec![down(p)], &mut menu);
+        assert_eq!(out1, SlideOutcome::Idle);
+        let (out2, _) = frame(&ctx, 0.02, vec![up(p)], &mut menu);
+        assert_eq!(out2, SlideOutcome::Idle,
+                   "the opening click must not also select — only a SECOND click does");
+    }
+
+    /// The second click, on a cell, confirms — the whole point of tap mode.
+    #[test]
+    fn a_second_click_on_a_cell_confirms_tap_mode() {
+        let ctx = egui::Context::default();
+        let mut menu = SlideMenu::new("hybrid-test-b").columns(2).hold(0.3);
+        let (_, r) = frame(&ctx, 0.0, vec![], &mut menu);
+        let p = r.center();
+        let _ = frame(&ctx, 0.01, vec![down(p)], &mut menu);
+        let _ = frame(&ctx, 0.02, vec![up(p)], &mut menu);
+        // The grid centers on the press point (see the module doc on
+        // `place_at`); cell 0 of a 2-column, 1-row, default-sized (52px,
+        // 8px spacing) grid sits 4px+ to the left of that point.
+        let cell = p + egui::vec2(-20.0, 0.0);
+        let (out, _) = frame(&ctx, 0.03, vec![down(cell), up(cell)], &mut menu);
+        assert_eq!(out, SlideOutcome::Selected("a".into(), Variant::Single));
+    }
+
+    /// Esc cancels a tap-opened menu — same as `show_tap`.
+    #[test]
+    fn esc_cancels_a_tap_opened_menu() {
+        let ctx = egui::Context::default();
+        let mut menu = SlideMenu::new("hybrid-test-c").columns(2).hold(0.3);
+        let (_, r) = frame(&ctx, 0.0, vec![], &mut menu);
+        let p = r.center();
+        let _ = frame(&ctx, 0.01, vec![down(p)], &mut menu);
+        let _ = frame(&ctx, 0.02, vec![up(p)], &mut menu);
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 400.0))),
+            time: Some(0.03),
+            events: vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None,
+                pressed: true, repeat: false, modifiers: Default::default() }],
+            ..Default::default()
+        };
+        let mut out = SlideOutcome::Idle;
+        let _ = ctx.run_ui(raw, |ui| {
+            let rect = Rect::from_min_size(egui::pos2(150.0, 150.0), egui::vec2(600.0, 300.0));
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                let host = ui.button("host");
+                out = menu.show_hybrid(ui, &host, &opts());
+            });
+        });
+        assert_eq!(out, SlideOutcome::Cancelled);
+    }
+
+    /// A held press still opens in HOLD (drag-follow) mode, unchanged from
+    /// `show` — hybrid must not have narrowed the existing gesture, only
+    /// added a second way in.
+    #[test]
+    fn a_held_press_still_opens_in_hold_mode_and_drag_release_commits() {
+        let ctx = egui::Context::default();
+        let mut menu = SlideMenu::new("hybrid-test-d").columns(2).hold(0.05);
+        let (_, r) = frame(&ctx, 0.0, vec![], &mut menu);
+        let p = r.center();
+        // Press and hold past hold_secs without releasing.
+        let (out1, _) = frame(&ctx, 0.0, vec![down(p)], &mut menu);
+        assert_eq!(out1, SlideOutcome::Idle, "pressed, not yet past the hold threshold");
+        let (out2, _) = frame(&ctx, 0.1, vec![], &mut menu);
+        assert_eq!(out2, SlideOutcome::Idle, "opening is not itself a resolution");
+        // Still holding — release now commits via the DRAG path, not tap's.
+        let (out3, _) = frame(&ctx, 0.11, vec![up(p)], &mut menu);
+        assert_eq!(out3, SlideOutcome::Cancelled,
+                   "released exactly on the press point — the grid centers there, so this lands \
+                    in the gutter between the two cells, same as bar_ui's own geometry (see \
+                    voiceterm-egui/src/bars.rs's tests for the same reasoning)");
     }
 }

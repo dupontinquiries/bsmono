@@ -40,6 +40,17 @@ of it as though it were settled.
 
 ## 2. What closed, and what the corpus still lists
 
+**CORRECTION, 2026-09-04: everything in this section closed the day after
+it was written.** Commits `0af1ff97` (extended SGR 38/48), `7db662d0`
+(scrolling region — DECSTBM, IL/DL, SU/SD, RI), `6707d23d` (save/restore,
+ESC intermediates, DECALN, wide-glyph tail) and `2accbb2e` (the alternate
+screen, §3 below) all landed 2026-09-03. `KNOWN_GAPS` in
+`uikit-term/tests/vt_corpus.rs` is empty, and `the_whole_corpus_is_enforced`
+passes on the full fixture set — confirmed by running the suite, not by
+reading the commit log. A session that trusted this section as still-open
+would redo finished work. Left the original text below for the record,
+per this file's own §1 about compounding-hypothesis debt.
+
 Closed this session (CHA/HPA, VPA, CNL/CPL, ECH, ICH, DCH — commit
 `31039857`). CHA is the one that most plausibly explains the field report:
 readline redraws an edited line by jumping to an absolute column rather than
@@ -63,6 +74,12 @@ Still listed, roughly in the order I would take them:
    more column than the screen shows.
 
 ## 3. Not done and probably the bigger half of §20: the alternate screen
+
+**CORRECTION, 2026-09-04: also closed, in `2accbb2e` — see §2's note.**
+vim/less/htop now get a real alternate-screen buffer; confirmed live
+under Xvfb (`ls --color` and long-line wrapping render correctly in the
+actual `voiceterm-egui` binary, not just in the corpus test). Original
+text below for the record.
 
 `CSI ?1049h` / `?1047` / `?47` are unhandled, so there is no alternate screen
 buffer. vim, less, htop and anything else full-screen draw over the primary

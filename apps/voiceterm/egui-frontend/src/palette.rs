@@ -79,6 +79,30 @@ pub enum Command {
     SiteFilter(FilterLevel),
     /// Forget this site's rules and follow the globals again.
     SiteReset,
+    /// Switch between touch chrome and voice chrome (`chrome_mode.rs`).
+    ///
+    /// `Chrome::toggle` is documented as "the ONLY way the mode changes on
+    /// purpose", but until this command existed its only caller was the
+    /// escape chord's fallback branch — so the deliberate switch the doc
+    /// describes had no deliberate way to reach it. Ctrl+Shift+M now only
+    /// escapes/resumes; this is how you choose voice chrome in the first
+    /// place, from the palette or by voice like every other mode here.
+    ToggleChrome,
+    /// Show or hide the keycaps/summaries/date/say footer.
+    ///
+    /// Closed by default on desktop now (see the same commit's note on
+    /// `compact_defaults_applied`) — a terminal that always shows five
+    /// rows of chrome under the prompt isn't minimal, so it needed a real
+    /// way back. The pointer path is a click-to-arm handle
+    /// (`SlideMenu::show_tap`, next to it); this is the keyboard/voice one.
+    ToggleKeycaps,
+    /// Clip the current terminal selection into the session's note, with
+    /// provenance — TODO_notes_clip.md's "highlight → card" core, the
+    /// smallest slice its own suggested build order names first: "proves
+    /// the spine end-to-end + immediately useful". `note_clip.rs`'s
+    /// data model has been pure and tested since v0.1.641 with no caller
+    /// anywhere in this frontend before this command existed.
+    ClipSelection,
 }
 
 /// The three filter levels, as a palette-addressable value.
@@ -173,6 +197,12 @@ pub fn vocabulary() -> Vec<Entry> {
                    keywords: &["rail", "hide", "collapse"] });
     v.push(Entry { command: Command::ToggleSettings, title: "Settings".into(),
                    keywords: &["preferences", "config", "options"] });
+    v.push(Entry { command: Command::ToggleChrome, title: "Toggle voice mode".into(),
+                   keywords: &["chrome", "compact", "hide controls", "minimal"] });
+    v.push(Entry { command: Command::ToggleKeycaps, title: "Toggle toolbar".into(),
+                   keywords: &["keycaps", "keys", "footer", "summaries", "show extras"] });
+    v.push(Entry { command: Command::ClipSelection, title: "Clip selection to notes".into(),
+                   keywords: &["clip this", "save this", "note this", "clipping"] });
     v.push(Entry { command: Command::ShowPalette, title: "Open command palette".into(),
                    keywords: &["commands"] });
     v
@@ -268,6 +298,15 @@ pub fn parse_phrase(phrase: &str) -> Option<Command> {
     if p.contains("settings") || p.contains("preferences") {
         return Some(Command::ToggleSettings);
     }
+    if p.contains("voice mode") || p.contains("voice chrome") || p.contains("touch mode") {
+        return Some(Command::ToggleChrome);
+    }
+    if p.contains("toolbar") || p.contains("keycaps") || p.contains("show extras") {
+        return Some(Command::ToggleKeycaps);
+    }
+    if p.contains("clip this") || p.contains("save this") || p.contains("note this") {
+        return Some(Command::ClipSelection);
+    }
     // A view name anywhere in the sentence. Longest label first, so "mail"
     // inside a longer name cannot win over the name itself.
     let mut named: Vec<PaneView> = PaneView::ALL.to_vec();
@@ -349,6 +388,38 @@ mod tests {
         assert_eq!(parse_phrase("new tab"), Some(Command::NewTab));
         assert_eq!(parse_phrase("mail in a new tab"),
                    Some(Command::OpenView { view: PaneView::Mail, target: Target::NewTab }));
+    }
+
+    /// `ToggleChrome` exists precisely because voice mode had no deliberate
+    /// entry point — see the comment on the command. Pin both doors open,
+    /// the same way settings' second door is pinned above.
+    #[test]
+    fn voice_chrome_is_reachable_by_phrase_and_by_palette() {
+        assert_eq!(parse_phrase("switch to voice mode"), Some(Command::ToggleChrome));
+        assert_eq!(parse_phrase("go to touch mode"), Some(Command::ToggleChrome));
+        assert!(vocabulary().iter().any(|e| e.command == Command::ToggleChrome),
+                "voice chrome must appear in the palette list, not only as a phrase");
+    }
+
+    /// The keycaps/summaries/date/say footer defaults closed on desktop now
+    /// (it used to default open — see compact_defaults_applied's comment);
+    /// this is the keyboard/voice door back, alongside the pointer one
+    /// (a click-to-arm SlideMenu handle, in the binary).
+    #[test]
+    fn the_footer_is_reachable_by_phrase_and_by_palette() {
+        assert_eq!(parse_phrase("show me the toolbar"), Some(Command::ToggleKeycaps));
+        assert!(vocabulary().iter().any(|e| e.command == Command::ToggleKeycaps),
+                "the footer toggle must appear in the palette list, not only as a phrase");
+    }
+
+    /// TODO_notes_clip.md's "highlight → card" core needed a way in; this
+    /// pins both doors, same as every other command added this session.
+    #[test]
+    fn clip_selection_is_reachable_by_phrase_and_by_palette() {
+        assert_eq!(parse_phrase("clip this"), Some(Command::ClipSelection));
+        assert_eq!(parse_phrase("save this to my notes"), Some(Command::ClipSelection));
+        assert!(vocabulary().iter().any(|e| e.command == Command::ClipSelection),
+                "clip-to-notes must appear in the palette list, not only as a phrase");
     }
 
     /// A swipe must reach tabs by the same route as the palette and the voice

@@ -613,8 +613,10 @@ impl Workspace {
                 true
             }
             // The web pane opens beside the current one and does NOT steal focus (split_web
-            // keeps the terminal focused, so the pty stays addressable). The URL is filled in
-            // by the reader; the model only needs the pane to exist.
+            // keeps the terminal focused, so the pty stays addressable). Opened BLANK,
+            // deliberately — this is the gesture-triggered path, "webpane", fired before
+            // any URL is known. A caller that already has one (a link tap) wants
+            // `open_web_pane_at` instead, which passes it straight to `split_web`.
             WsCall::OpenWebPane => {
                 self.model.split_web(Dir::Right, "");
                 true
@@ -631,6 +633,20 @@ impl Workspace {
             // Keep the egui strip's naming ("shell 4"), not TermWorkspace's bare ordinal.
             let n = self.model.tabs.len();
             self.model.active_mut().name = format!("shell {n}");
+            true
+        } else if c == "next tab" {
+            // `Command::NextTab`/`PrevTab` (palette.rs) have called
+            // `apply(&WsCall::Command("next tab"))`/`"previous tab"`
+            // since they were written — this `command()` match had no
+            // arm for either string, so both silently fell to `else {
+            // false }` and the palette entries did nothing at all.
+            // `next_tab`/`prev_tab` already exist on the model
+            // (pane-kit, wrap-around, already used by other callers) —
+            // this was a one-line gap, not a missing feature.
+            self.model.next_tab();
+            true
+        } else if c == "previous tab" {
+            self.model.prev_tab();
             true
         } else if let Some(n) = c.strip_prefix("go to tab ").and_then(|n| n.parse::<usize>().ok()) {
             // goto_tab rejects out-of-range rather than clamping, so clamp here to keep the
@@ -675,6 +691,21 @@ impl Workspace {
             all &= self.apply(c);
         }
         all
+    }
+
+    /// Open a NEW web pane already pointed at `url`, and return its id.
+    ///
+    /// `WsCall::OpenWebPane` (bound to the "webpane" swipe gesture) opens one
+    /// blank, because at that point nothing has been aimed yet — its own
+    /// comment used to say "the URL is filled in by the reader", but no
+    /// public method existed to do that, so it never was. This is for the
+    /// other case: a link tap, where the destination is already known when
+    /// the pane is created, so there is no blank moment to fill in later.
+    /// `split_web` already accepts the url directly; this just exposes that.
+    pub fn open_web_pane_at(&mut self, url: &str) -> u64 {
+        let id = self.model.split_web(Dir::Right, url);
+        self.sync();
+        id
     }
 
     /// The focused pane of the active tab.
@@ -990,14 +1021,23 @@ pub enum PaneView {
     Chat,
     Notes,
     Build,
+    /// Read-only, classified view over the terminal's own command blocks —
+    /// TODO_notebook_view.md's "terminal as Jupyter-style cells" idea,
+    /// scoped down: the pure `notebook::classify` core has existed since
+    /// v0.1.608 with zero UI in either frontend. A SEPARATE view rather
+    /// than swapping the live terminal's own render/gesture/input loop in
+    /// place (the TODO's original framing) — that loop is exactly the kind
+    /// of proven, heavily-relied-on path this fleet's own TODOs keep
+    /// warning not to touch for an experimental feature.
+    Notebook,
 }
 
 impl PaneView {
     /// Every view a pane can be given, for a menu.
-    pub const ALL: [PaneView; 11] = [
+    pub const ALL: [PaneView; 12] = [
         PaneView::Terminal, PaneView::Web, PaneView::Mail, PaneView::Graph,
         PaneView::Table, PaneView::Docs, PaneView::Archive, PaneView::Models,
-        PaneView::Chat, PaneView::Notes, PaneView::Build,
+        PaneView::Chat, PaneView::Notes, PaneView::Build, PaneView::Notebook,
     ];
 
     pub fn label(self) -> &'static str {
@@ -1013,6 +1053,7 @@ impl PaneView {
             PaneView::Chat => "Chat",
             PaneView::Notes => "Notes",
             PaneView::Build => "Build",
+            PaneView::Notebook => "Notebook",
         }
     }
 
@@ -1229,6 +1270,33 @@ mod tests {
         assert_eq!(ws.tabs.len(), 1); // the last tab survives
     }
 
+    /// `Command::NextTab`/`PrevTab` in the palette have called
+    /// `apply(&WsCall::Command("next tab"))`/`"previous tab"` since they
+    /// were written — `command()`'s match had no arm for either string
+    /// (only "new tab", "go to tab N", "close tab", "split *", "close
+    /// pane"), so both silently fell to `else { false }` and did nothing
+    /// at all, with nothing anywhere reporting the failure. The
+    /// underlying `next_tab`/`prev_tab` (pane-kit, wrap-around) already
+    /// existed and were already used by other callers — this was a
+    /// missing one-line match arm, not a missing feature.
+    #[test]
+    fn next_and_previous_tab_commands_actually_move_and_wrap() {
+        let mut ws = Workspace::new(&["main", "logs", "build"]);
+        assert_eq!(ws.active, 0);
+        assert!(ws.apply(&WsCall::Command("next tab".into())));
+        assert_eq!(ws.active, 1);
+        assert!(ws.apply(&WsCall::Command("next tab".into())));
+        assert_eq!(ws.active, 2);
+        // wraps forward past the last tab
+        assert!(ws.apply(&WsCall::Command("next tab".into())));
+        assert_eq!(ws.active, 0);
+        // and backward past the first
+        assert!(ws.apply(&WsCall::Command("previous tab".into())));
+        assert_eq!(ws.active, 2);
+        assert!(ws.apply(&WsCall::Command("previous tab".into())));
+        assert_eq!(ws.active, 1);
+    }
+
     #[test]
     fn tab_menu_dispatch_flows_end_to_end_into_the_workspace() {
         let mut ws = Workspace::new(&["main", "logs", "build"]);
@@ -1289,6 +1357,25 @@ mod tests {
         assert_eq!(ws.active_pane_ids().len(), 2);
         // split_web deliberately keeps the terminal focused so the pty stays addressable
         assert_eq!(ws.model().active().focused_pane, focus_before);
+    }
+
+    #[test]
+    fn open_web_pane_at_carries_the_url_and_returns_the_new_id() {
+        // `WsCall::OpenWebPane` above opens one blank, for the gesture path
+        // that fires before any URL is known. This is the other caller: a
+        // link tap, which already has a destination.
+        let mut ws = Workspace::new(&["main"]);
+        let focus_before = ws.focused_pane();
+        let new_id = ws.open_web_pane_at("https://example.test/a");
+        assert_ne!(new_id, focus_before, "a new pane, not a reused one");
+        assert_eq!(ws.active_pane_ids().len(), 2);
+        // Still doesn't steal focus — same invariant as the blank path.
+        assert_eq!(ws.focused_pane(), focus_before);
+        assert_eq!(ws.pane_view(new_id), PaneView::Web);
+        match ws.model().pane_kind(new_id) {
+            Some(PaneKind::Web { url }) => assert_eq!(url, "https://example.test/a"),
+            other => panic!("expected a web pane with the url set, got {other:?}"),
+        }
     }
 
     #[test]

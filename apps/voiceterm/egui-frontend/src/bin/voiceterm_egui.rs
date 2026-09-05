@@ -280,7 +280,14 @@ fn doc(name: &str, title: &str, md: &str) -> voiceterm_egui::manpage_view::Doc {
         } else if t.is_empty() {
             html.push_str("<br>");
         } else {
-            html.push_str(&format!("<p>{}</p>", escape(t)));
+            // INLINE MARKDOWN. This used to be `escape(t)` — every bold span
+            // and every link in a bundled doc came through as literal
+            // asterisks and brackets (`**[vision.md](vision.md)**`, verbatim)
+            // because nothing between the block-level cases above (headers,
+            // fences, blank lines) ever looked at `**`, `` ` `` or `[...](...)`
+            // inside a plain paragraph line. README.md and ROADMAP.md — real
+            // files, `include_str!`'d below — both use all three.
+            html.push_str(&format!("<p>{}</p>", inline_md(t)));
         }
     }
     // An unclosed fence at EOF: close it, or the reader renders the rest of the
@@ -298,6 +305,84 @@ fn doc(name: &str, title: &str, md: &str) -> voiceterm_egui::manpage_view::Doc {
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
+
+/// Inline markdown within one paragraph line: `` `code` ``, `**bold**`, and
+/// `[text](url)`. Plain characters are escaped individually so the two never
+/// fight over the same pass — a naive "escape first, then look for markup"
+/// order would search for `**` after `<`/`>` had already been substituted in,
+/// silently missing anything adjacent to an escaped character.
+///
+/// Single-pass, character-indexed rather than regex: this crate has no regex
+/// dependency, and three fixed delimiters don't need one.
+fn inline_md(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
+            if let Some(end) = find_str(&chars, i + 2, "**") {
+                let inner: String = chars[i + 2..end].iter().collect();
+                out.push_str("<b>");
+                // RECURSE, don't just escape: `**[vision.md](vision.md)**` is
+                // a bold LINK, and README.md writes its file list exactly
+                // that way. A plain `escape(&inner)` here left the link
+                // syntax literal inside the bold tag — passed the first
+                // version of this fix, failed the one test that nested two
+                // spans instead of one.
+                out.push_str(&inline_md(&inner));
+                out.push_str("</b>");
+                i = end + 2;
+                continue;
+            }
+        } else if chars[i] == '`' {
+            if let Some(end) = find_char(&chars, i + 1, '`') {
+                let inner: String = chars[i + 1..end].iter().collect();
+                // NOT recursed: a code span is the one place markdown
+                // convention says formatting inside is suppressed, so
+                // `` `**not bold**` `` must stay literal asterisks.
+                out.push_str("<code>");
+                out.push_str(&escape(&inner));
+                out.push_str("</code>");
+                i = end + 1;
+                continue;
+            }
+        } else if chars[i] == '[' {
+            if let Some(close_bracket) = find_char(&chars, i + 1, ']') {
+                if chars.get(close_bracket + 1) == Some(&'(') {
+                    if let Some(close_paren) = find_char(&chars, close_bracket + 2, ')') {
+                        let text: String = chars[i + 1..close_bracket].iter().collect();
+                        let url: String = chars[close_bracket + 2..close_paren].iter().collect();
+                        out.push_str(&format!(
+                            "<a href=\"{}\">{}</a>", escape(&url), inline_md(&text)));
+                        i = close_paren + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // No markup matched at `i` (or an opening delimiter with no closing
+        // one — a truncated `**bold` at end of line, say): fall through to
+        // one escaped plain character, same as the unmatched-delimiter case
+        // above via `continue` not firing.
+        let mut buf = [0u8; 4];
+        out.push_str(&escape(chars[i].encode_utf8(&mut buf)));
+        i += 1;
+    }
+    out
+}
+
+/// First index at or after `from` where `chars` contains `needle` verbatim.
+fn find_str(chars: &[char], from: usize, needle: &str) -> Option<usize> {
+    let n: Vec<char> = needle.chars().collect();
+    if n.is_empty() || from > chars.len() { return None; }
+    (from..=chars.len().saturating_sub(n.len())).find(|&i| chars[i..i + n.len()] == n[..])
+}
+
+/// First index at or after `from` where `chars` contains `needle`.
+fn find_char(chars: &[char], from: usize, needle: char) -> Option<usize> {
+    (from..chars.len()).find(|&i| chars[i] == needle)
+}
+
 
 struct VoicetermApp {
     app: App,
@@ -336,6 +421,11 @@ struct VoicetermApp {
     /// fetching them — its own header explains why the engine could not be
     /// included here — so the HOST owns which docs exist and the conversion.
     docs: voiceterm_egui::manpage_view::ManpageView,
+    /// `uikit_web::doc::render_page`'s form state for the demo section below
+    /// the manual — see the comment at the call site for why this exists at
+    /// all. Real page state (per open web pane) belongs to whatever fix the
+    /// Web-pane wiring gap gets; this is deliberately not that.
+    page_demo_form: uikit_web::doc::FormState,
     /// The spoken mail phrase, parsed by the selector grammar.
     mail_phrase: String,
     /// A spoken date question — "how many days until christmas". Answered
@@ -475,7 +565,15 @@ struct VoicetermApp {
     /// Document ingest: diagnose a captured page, repair it, confirm or revert.
     ingest: voiceterm_egui::docingest::Ingest,
     mail: voiceterm_egui::mail_view::MailView,
+    /// Global bookmark store, across every page ever opened — not per pane.
+    /// See `browser::Browser`'s doc for why it's this small now.
     browser: voiceterm_egui::browser::Browser,
+    /// Per-open-web-pane transient state (URL, title, actions, filter
+    /// stats), keyed by the pane's id in the tiling model. Used to be
+    /// fields on `Browser` itself, which is why this app could only ever
+    /// show one web page at a time regardless of how many web panes
+    /// existed — every pane read and wrote the same shared state.
+    web_panes: std::collections::HashMap<u64, voiceterm_egui::browser::WebPane>,
     graph: voiceterm_egui::graph_view::GraphView,
     // The real archive surface (archived_view), replacing a bars::ArchiveView
     // that was only ever fed an empty vec — a connected placeholder the
@@ -485,6 +583,20 @@ struct VoicetermApp {
     /// the inbox list draws Message rows, so both live here and are set
     /// together.
     mail_messages: Vec<voiceterm_egui::mail_view::Message>,
+    /// The MERGED (disk + harvested, deduplicated) list `rebuild_mail`
+    /// computes — what `inbox_ui` actually renders. NOT the same thing as
+    /// `mail_messages` above, whatever that field's own comment says:
+    /// `mail_messages` is harvested-from-terminal-blocks ONLY (an INPUT to
+    /// the merge), and disk-scanned mail from `rescan_mail_store` never
+    /// touched it. Before this field existed, `inbox_ui` read
+    /// `mail_messages` directly, so scanning a real Maildir populated
+    /// `self.mail` (which the merge DOES reach, via `set_messages`) while
+    /// the actual on-screen inbox list kept reading the un-merged,
+    /// terminal-only source and stayed empty — confirmed live: created a
+    /// real Maildir message, clicked "rescan mail", the header correctly
+    /// said "1 message(s)" while "Inbox" right below still said "No
+    /// messages."
+    mail_all: Vec<voiceterm_egui::mail_view::Message>,
     /// How many blocks had been scanned for mail last time. The scan walks
     /// closed blocks and parses the email-shaped ones; re-parsing every
     /// block every frame would re-read the whole session's output at frame
@@ -495,6 +607,16 @@ struct VoicetermApp {
     mail_from_disk: Vec<voiceterm_egui::mail_view::Message>,
     /// Where that came from, for the status line and the rescan button.
     mail_store_path: Option<std::path::PathBuf>,
+    /// Body text, keyed by message id, for the lazy-fetch a reader does on
+    /// open — kept apart per source for the same reason `mail_from_disk`/
+    /// `mail_messages` are: a rescan of one must not discard the other.
+    /// `self.mail.bodies` (the cache `message_ui` reads) starts every
+    /// message at `Body::NotLoaded`; these are what a message-open now
+    /// looks up to fill it in, rather than leaving it permanently empty —
+    /// see the commit this field was added in for what "permanently empty"
+    /// looked like before.
+    mail_bodies_disk: std::collections::HashMap<String, String>,
+    mail_bodies_terminal: std::collections::HashMap<String, String>,
     /// The open message id on the Mail view, if any.
     mail_open: Option<String>,
     /// The command audit chain: every submitted line hashed into a tamper-
@@ -598,6 +720,11 @@ struct VoicetermApp {
     /// a THIRD permanent bottom bar stacked under the bar and the session
     /// strip — see `apply_compact_defaults`.
     keycaps_open: bool,
+    /// The session's running note — TODO_notes_clip.md's "active Note"
+    /// that clips accumulate into. One note for the whole session is the
+    /// smallest useful shape; splitting into multiple named notes is real
+    /// future work the TODO itself defers past its first slice.
+    clip_note: voiceterm_egui::note_clip::Note,
     /// Whether the one-time narrow-surface default has been applied. Applied
     /// once rather than every frame, so collapsing is a starting position the
     /// user can override, not a cage that re-shuts whatever they open.
@@ -689,8 +816,30 @@ impl VoicetermApp {
             self.tabbar_open = false;
             self.keycaps_open = false;
         } else {
-            self.keycaps_open = true;
+            // MINIMAL BY DEFAULT ON DESKTOP TOO. This used to open the
+            // keycaps footer (pipe/brace chips, terminal keycap row,
+            // summaries scope, a date field, the say field — five things
+            // stacked, permanently) on anything wide enough to be a
+            // desktop. Compact/mobile already defaulted this closed and
+            // relied on gesture/shortcut access instead (bar_ui below);
+            // desktop had no equivalent restraint. A terminal emulator
+            // that always shows five rows of chrome under the terminal
+            // is not what "minimal" means anywhere else in this app.
+            self.keycaps_open = false;
         }
+    }
+
+    /// The URL of whichever web pane is FOCUSED right now, or empty.
+    ///
+    /// "Ad filter for this site", "web settings", and note capture's source
+    /// URL all mean "whichever page I'm looking at" — and now that web
+    /// state is per-pane (`web_panes`, keyed by pane id) rather than one
+    /// shared `Browser`, that has to mean the focused pane specifically,
+    /// not just any web pane that happens to be open elsewhere in the tab.
+    fn focused_web_url(&self) -> String {
+        let id = self.workspace.focused_pane();
+        if self.workspace.pane_view(id) != PaneView::Web { return String::new(); }
+        self.web_panes.get(&id).map(|p| p.url.clone()).unwrap_or_default()
     }
 
     fn run_command(&mut self, cmd: voiceterm_egui::palette::Command) {
@@ -724,6 +873,40 @@ impl VoicetermApp {
             Command::ToggleRail => { self.tabbar_open = !self.tabbar_open; }
             Command::ToggleSettings => { self.surfaces.toggle(Surface::Settings); }
             Command::ToggleWebSettings => { self.surfaces.toggle(Surface::WebSettings); }
+            // The deliberate switch `Chrome::toggle` was documented as
+            // needing — see the comment on the command itself. The chord
+            // (Ctrl+Shift+M) is now escape/resume only, not entry.
+            Command::ToggleChrome => { self.chrome.toggle(); }
+            Command::ToggleKeycaps => { self.keycaps_open = !self.keycaps_open; }
+            // TODO_notes_clip.md's smallest slice: "Terminal: selection
+            // already works... 'clip this' over a terminal selection".
+            // Attribution is best-effort — there is no link from a
+            // Selection back to the CommandBlock it was made within, so
+            // the most recent block is the closest approximation. True
+            // for the common case (clipping something just seen), not
+            // guaranteed for a selection made further back in scrollback.
+            Command::ClipSelection => {
+                let content = self.app.selection.take().map(|s| s.text);
+                match content {
+                    Some(text) if !text.trim().is_empty() => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs()).unwrap_or(0);
+                        let (command, at) = self.blocks.blocks.last()
+                            .map(|b| (b.command.clone(), b.started_at))
+                            .unwrap_or_else(|| (String::new(), now));
+                        let clip = voiceterm_egui::note_clip::Clip {
+                            kind: voiceterm_egui::note_clip::ClipKind::Text,
+                            content: text,
+                            source: voiceterm_egui::note_clip::Source::Terminal { command, at },
+                            captured_at: now,
+                        };
+                        self.clip_note.push_clip(clip);
+                        self.toasts.success("Clipped to notes", 0.0);
+                    }
+                    _ => { self.toasts.warning("nothing selected to clip", 0.0); }
+                }
+            }
             // A site rule from the palette, without opening a panel: this
             // is what people actually want when a page has eaten its own
             // sidebar or is unreadable through the ads.
@@ -735,7 +918,8 @@ impl VoicetermApp {
                     FilterLevel::Standard => FilterMode::Standard,
                     FilterLevel::Aggressive => FilterMode::Aggressive,
                 };
-                match voiceterm_egui::web_prefs::host_of(&self.browser.url) {
+                let __focused_web_url = self.focused_web_url();
+                match voiceterm_egui::web_prefs::host_of(&__focused_web_url) {
                     Some(h) => {
                         self.web_prefs.site_mut(&h).filter = Some(mode);
                         self.save_web_prefs();
@@ -749,7 +933,8 @@ impl VoicetermApp {
                 }
             }
             Command::SiteReset => {
-                match voiceterm_egui::web_prefs::host_of(&self.browser.url) {
+                let __focused_web_url = self.focused_web_url();
+                match voiceterm_egui::web_prefs::host_of(&__focused_web_url) {
                     Some(h) => {
                         self.web_prefs.sites.retain(|(p, _)| *p != h);
                         self.save_web_prefs();
@@ -924,12 +1109,14 @@ impl VoicetermApp {
         match voiceterm_egui::mail_store::discover() {
             Some((path, _kind)) => {
                 self.mail_from_disk = voiceterm_egui::mail_store::load(&path);
+                self.mail_bodies_disk = voiceterm_egui::mail_store::load_bodies(&path);
                 self.mail_store_path = Some(path);
             }
             None => {
                 // Cleared, not left: a store that has gone away must not
                 // keep showing its last contents as though they were live.
                 self.mail_from_disk.clear();
+                self.mail_bodies_disk.clear();
                 self.mail_store_path = None;
             }
         }
@@ -951,6 +1138,7 @@ impl VoicetermApp {
         let all = voiceterm_egui::mail_store::merge(
             &self.mail_from_disk, &self.mail_messages);
         self.mail.set_messages(&all);
+        self.mail_all = all;
     }
 
     fn harvest_mail_from_blocks(&mut self) {
@@ -960,6 +1148,14 @@ impl VoicetermApp {
         }
         self.mail_scanned_blocks = blocks.len();
         let mut found = Vec::new();
+        // Keyed the SAME way `load_bodies` keys the disk side: per split
+        // part, with `messages_from_text`'s own `"{origin}#{i}"` fallback-id
+        // convention, not a bare per-block origin. A block whose output is
+        // itself mbox-shaped (piped through `cat` on an mbox file, say) can
+        // still contain more than one message with no Message-ID each —
+        // the same collision this session already caught and fixed on the
+        // disk side would reappear here with a bare origin.
+        let mut bodies = std::collections::HashMap::new();
         for b in blocks.iter() {
             // `duration_ms` is the kit's "this block has ended" — `finish`
             // is the only thing that sets it, and it is None while the
@@ -972,9 +1168,15 @@ impl VoicetermApp {
             if !voiceterm_egui::blocks::looks_like_email(b.output.trim_start()) {
                 continue;
             }
-            found.extend(voiceterm_egui::mail_rfc822::messages_from_text(
-                &format!("block:{}", b.id), &b.output));
+            let origin = format!("block:{}", b.id);
+            found.extend(voiceterm_egui::mail_rfc822::messages_from_text(&origin, &b.output));
+            for (i, raw) in voiceterm_egui::mail_rfc822::split_mbox(&b.output).iter().enumerate() {
+                let part_origin = format!("{origin}#{i}");
+                let id = voiceterm_egui::mail_rfc822::message_from_text(&part_origin, raw).id;
+                bodies.insert(id, voiceterm_egui::mail_rfc822::body_from_text(raw));
+            }
         }
+        self.mail_bodies_terminal = bodies;
         // Rebuilt wholesale rather than appended to: a block's output can
         // still change after it closes (a late write), and appending would
         // leave the earlier parse of the same block beside the new one.
@@ -1090,6 +1292,44 @@ impl eframe::App for VoicetermApp {
 
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // WORKSPACE TAB CYCLING. Ctrl+Right / Ctrl+Left. Checked at the very
+        // top of `update()`, before anything else reads `ctx.input()`.
+        //
+        // History worth keeping: this was tried twice before in this same
+        // session and reverted both times as apparently non-functional —
+        // first as Ctrl+Tab (egui/winit reserve plain Tab for widget-focus
+        // internally, so that guess was at least plausible), then as
+        // Ctrl+Right/Left moved to this exact position (which SHOULD have
+        // worked and, it turns out, DID: a diagnostic print confirmed the
+        // key arrives with `mods.command == true` and `repeat == false`,
+        // exactly what `key_pressed` requires). The actual blocker was a
+        // SEPARATE bug fixed one commit prior: `Workspace::command()` had
+        // no match arm for "next tab"/"previous tab" at all, so
+        // `apply(&WsCall::Command("next tab"))` silently returned `false`
+        // and did nothing — regardless of whether the key was ever
+        // detected correctly. It was. This is the same code reverted
+        // last time, restored now that the thing actually blocking it is
+        // fixed.
+        //
+        // Ctrl+Right/Left rather than Ctrl+Tab: the ordinary browser/
+        // editor convention, and NOT the vim-style modeless `{N}b`/`{N}B`
+        // this session found built and tested (count_prefix.rs,
+        // TODO_tab_cycle_shortcut.md) but left unwired — that scheme needs
+        // a reliable "am I in a text field right now" exclusion this
+        // frontend has no established pattern for, and bare 'b'/digit keys
+        // are typed constantly, especially in the terminal. A modifier-
+        // gated arrow combination sidesteps that whole question: Ctrl+
+        // Right is not something typing, in a shell or anywhere else,
+        // ever produces.
+        ctx.input(|i| {
+            if i.modifiers.command && i.key_pressed(egui::Key::ArrowRight) {
+                self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command("next tab".into()));
+            }
+            if i.modifiers.command && i.key_pressed(egui::Key::ArrowLeft) {
+                self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command("previous tab".into()));
+            }
+        });
+
         uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(self.theme));
         // ONCE PER FRAME, shared by every panel that needs it. detect reads
         // the context and asks whether any touch input exists this frame;
@@ -1136,7 +1376,7 @@ impl eframe::App for VoicetermApp {
                                       self.surfaces.is(Surface::WebSettings));
         if web_t > 0.0 {
             let colors = self.colors;
-            let url = self.browser.url.clone();
+            let url = self.focused_web_url();
             let mut dirty = false;
             overlay::show(ctx, Surface::WebSettings, web_t, |ui| {
                 dirty = voiceterm_egui::web_prefs::web_settings_ui(
@@ -1379,9 +1619,17 @@ impl eframe::App for VoicetermApp {
 
         // The escape chord, checked before anything draws: if the recogniser
         // has stopped working, voice mode must not be a room with no door.
+        //
+        // Escape-or-resume ONLY, not entry. It used to fall through to
+        // `toggle()` when there was nothing to escape from, which made this
+        // chord the sole way to ever reach voice mode in the first place —
+        // a panic hatch standing in for a feature nobody could discover.
+        // `Command::ToggleChrome` is the deliberate switch now; a chord that
+        // also chose to enter the mode it exists to escape was the wrong
+        // control wearing two hats.
         if ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift
                          && i.key_pressed(egui::Key::M)) {
-            if !self.chrome.escape() { self.chrome.toggle(); }
+            if !self.chrome.escape() { self.chrome.resume(); }
         }
         self.apply_compact_defaults(ctx);
         let show_chrome = self.chrome.mode().shows_tab_strip();
@@ -1420,7 +1668,16 @@ impl eframe::App for VoicetermApp {
             // with the cursor backed between (see gesture_menus::brace_bytes).
             ui.horizontal(|ui| {
                 let pipe_host = ui.button("|\u{22EF}");
-                if let SlideOutcome::Selected(id, _) = self.pipe_menu.show(ui, &pipe_host, &pipe_menu()) {
+                // MOUSE-ACCESSIBLE NOW: `show_hybrid` instead of `show` — a
+                // held press still opens the fan-out exactly as before
+                // (release commits); a plain click ALSO opens it now
+                // (tap-select: a second click confirms), for the mouse
+                // users the hold gesture serves worse than a touchscreen
+                // does. Safe here specifically because a bare click on this
+                // button was already a complete no-op — `show` only ever
+                // reacted to a HELD press, so there was no existing
+                // "quick tap means X" behavior this could silently replace.
+                if let SlideOutcome::Selected(id, _) = self.pipe_menu.show_hybrid(ui, &pipe_host, &pipe_menu()) {
                     if let Some(ch) = pipe_char(&id) {
                         self.send_input(ch.as_bytes());
                     }
@@ -1473,7 +1730,7 @@ impl eframe::App for VoicetermApp {
                 // hold the palette chip to show all vibes (the settings screenshot's theme grid)
                 let theme_host = ui.button("\u{1F3A8}");
                 if let voiceterm_egui::slide_menu::SlideOutcome::Selected(id, _) =
-                    self.theme_menu.show(ui, &theme_host, &theme_menu())
+                    self.theme_menu.show_hybrid(ui, &theme_host, &theme_menu())
                 {
                     self.theme = snapclone_theme::PaletteId::from_str(&id);
                     self.toasts.info(format!("Theme: {}", self.theme.display_name()), ctx.input(|i| i.time));
@@ -1482,7 +1739,7 @@ impl eframe::App for VoicetermApp {
                     let _ = save_prefs(&self.app.prefs);
                 }
                 let brace_host = ui.button("{\u{22EF}}");
-                if let SlideOutcome::Selected(id, variant) = self.brace_menu.show(ui, &brace_host, &brace_menu()) {
+                if let SlideOutcome::Selected(id, variant) = self.brace_menu.show_hybrid(ui, &brace_host, &brace_menu()) {
                     if let Some(bytes) = brace_bytes(&id, variant) {
                         self.send_input(bytes.as_bytes());
                     }
@@ -1750,8 +2007,45 @@ impl eframe::App for VoicetermApp {
                     self.send_input(send.as_bytes());
                 }
             }
+            // A discoverable way back to minimal: this panel is now closed
+            // by default (see compact_defaults_applied), so once it's open
+            // by request, closing it again needs its own control rather
+            // than becoming permanent again by accident.
+            if ui.small_button("\u{2715} hide").clicked() {
+                self.keycaps_open = false;
+            }
         });
         }  // if show_chrome — the keycap and gesture rows
+
+        // THE REVEAL HANDLE. Closed by default now (desktop used to default
+        // this OPEN — see compact_defaults_applied), so there has to be a
+        // way back that isn't "resize the window past 600px and reopen the
+        // app." A palette command covers the keyboard/voice path
+        // (Command::ToggleKeycaps); this is the pointer path, and
+        // deliberately NOT just a plain toggle button.
+        //
+        // The pipe/brace toolbar and bar_ui both ask for a press-HOLD then
+        // drag — natural on a touchscreen, awkward with a mouse, which has
+        // no equivalent of "rest a finger and wait". `SlideMenu::show_tap`
+        // (already built for the link menu, unused as a second general
+        // input mode until now) opens on a plain click instead and commits
+        // on a second click — the same fan-out, reachable without ever
+        // holding a button down. One cell today; the shape holds if this
+        // handle grows options later without changing how it is driven.
+        if show_chrome && !self.keycaps_open {
+            egui::TopBottomPanel::bottom("footer_handle").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let handle = ui.small_button("\u{22EF}");
+                    let menu = voiceterm_egui::slide_menu::SlideMenu::new("footer_reveal_menu").columns(1);
+                    let opts = [voiceterm_egui::slide_menu::SlideOption::new("show", "Show toolbar")];
+                    if let SlideOutcome::Selected(id, _) =
+                        menu.show_tap(ui, egui::Id::new("footer_reveal"), &handle, &opts)
+                    {
+                        if id == "show" { self.keycaps_open = true; }
+                    }
+                });
+            });
+        }
 
         // the settings screen as the QML has it: settingsPopup (main.qml:27729),
         // a centered modal popup. Resizability went with the panel form; the
@@ -2356,7 +2650,7 @@ impl eframe::App for VoicetermApp {
                         // The inbox proper (mail_panes, ported): rows over the
                         // real Message model, message pane below on open.
                         use voiceterm_egui::mail as mp;
-                        if let Some(act) = mp::inbox_ui(ui, &self.mail_messages, false, &c) {
+                        if let Some(act) = mp::inbox_ui(ui, &self.mail_all, false, &c) {
                             match act {
                                 mp::MailAction::Open(id) => self.mail_open = Some(id),
                                 mp::MailAction::Search(q) => self.mail.query = q,
@@ -2364,7 +2658,26 @@ impl eframe::App for VoicetermApp {
                             }
                         }
                         if let Some(id) = self.mail_open.clone() {
-                            if let Some(m) = self.mail_messages.iter().find(|m| m.id == id) {
+                            // THE LAZY FETCH ITSELF. `self.mail.bodies` is a
+                            // cache — `MailView`'s own doc calls it "fetched
+                            // lazily" — but nothing ever fetched into it, so
+                            // every message showed empty regardless of
+                            // source. Fetch once per id, from whichever
+                            // source map has it (disk first, matching
+                            // `mail_store::merge`'s own precedence), and
+                            // cache the result so re-opening the same
+                            // message doesn't redo the lookup every frame.
+                            if !self.mail.bodies.contains_key(&id) {
+                                let text = self.mail_bodies_disk.get(&id)
+                                    .or_else(|| self.mail_bodies_terminal.get(&id));
+                                let body = match text {
+                                    Some(t) => voiceterm_egui::mail_view::Body::Plain(t.clone()),
+                                    None => voiceterm_egui::mail_view::Body::Failed(
+                                        "no body found for this message".to_string()),
+                                };
+                                self.mail.bodies.insert(id.clone(), body);
+                            }
+                            if let Some(m) = self.mail_all.iter().find(|m| m.id == id) {
                                 let body = self.mail.bodies.get(&id)
                                     .map(|b| b.text().to_string()).unwrap_or_default();
                                 let view = mp::MessageView {
@@ -2382,6 +2695,34 @@ impl eframe::App for VoicetermApp {
                         }
                     }
                     PaneView::Web => {
+                        // PER-PANE NOW. `self.browser` used to carry url/
+                        // title/actions/etc directly, so every web pane in
+                        // the tiling layout read and wrote the SAME state —
+                        // two open at once showed the same page in both.
+                        // `PaneKind::Web{url}` has been per-pane in the model
+                        // since `split_web` was written; this keys the
+                        // presentation state the same way. `or_default`
+                        // rather than pre-seeding at creation time: a pane
+                        // whose kind is already `Web{url}` (opened via
+                        // `open_web_pane_at`) still needs an entry here on
+                        // first render, and starting blank then loading is
+                        // simpler than threading the initial url through a
+                        // second path.
+                        let web_pane_id = self.workspace.focused_pane();
+                        let pane = self.web_panes.entry(web_pane_id).or_default();
+                        // A freshly-opened pane's `PaneKind::Web{url}` may
+                        // already carry a real url (open_web_pane_at) that
+                        // this per-pane entry hasn't seen yet — seed it once,
+                        // the same "not equal, so (re)load" rule the graph
+                        // view's focus-seeding uses.
+                        if let Some(voiceterm_egui::terminal_workspace::PaneKind::Web { url }) = {
+                            use voiceterm_egui::terminal_workspace::TermPanes as _;
+                            self.workspace.model().pane_kind(web_pane_id)
+                        }{
+                            if *url != pane.url && !url.is_empty() {
+                                pane.load(url);
+                            }
+                        }
                         ui.horizontal(|ui| {
                             // THE ONE-CHARACTER BUG. This used to clone
                             // `self.browser.url` into a local every frame, edit
@@ -2392,12 +2733,29 @@ impl eframe::App for VoicetermApp {
                             //
                             // Edit the field itself; commit on Enter or on
                             // focus loss.
-                            let r = ui.add(egui::TextEdit::singleline(&mut self.browser.url).id_salt("voiceterm_egui-self_browser_url"));
+                            let r = ui.add(egui::TextEdit::singleline(&mut pane.url).id_salt("voiceterm_egui-self_browser_url"));
                             let entered = r.lost_focus()
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
                             if entered || r.lost_focus() {
-                                let u = self.browser.url.clone();
-                                self.browser.load(&u);
+                                let u = pane.url.clone();
+                                pane.load(&u);
+                            }
+                            // THE STAR. `Browser::is_bookmarked`/`toggle_bookmark`
+                            // existed with a doc comment saying "drives the
+                            // star's filled state" and no star anywhere — the
+                            // sitemap, the walk player, the connections graph
+                            // and the archived-page browser all read
+                            // `bookmarks.all()` as though pages get saved, and
+                            // nothing in this pane ever called `save`. Disabled
+                            // on an empty URL: starring nothing is not a
+                            // command, it is a blank bookmark waiting to
+                            // confuse the sitemap that reads this list.
+                            let can_star = !pane.url.trim().is_empty();
+                            let starred = pane.is_bookmarked(&self.browser.bookmarks);
+                            let glyph = if starred { "\u{2605}" } else { "\u{2606}" }; // ★ / ☆
+                            if ui.add_enabled(can_star, egui::Button::new(glyph)).clicked() {
+                                let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
+                                pane.toggle_bookmark(&mut self.browser.bookmarks, now_ms);
                             }
                         });
                         // THE SITEMAP, under the URL bar. `explore` holds the
@@ -2432,8 +2790,9 @@ impl eframe::App for VoicetermApp {
                                 .weak().small());
                         }
                         let groups = voiceterm_egui::explore::group_rows(&pages);
+                        let pane = self.web_panes.get_mut(&web_pane_id).expect("seeded above");
                         if let Some(path) = voiceterm_egui::explore::sitemap_ui(ui, &groups, &c) {
-                            self.browser.load(&path);
+                            pane.load(&path);
                         }
 
                         // THE WALK PLAYER. explore's header says session_walk's
@@ -2460,15 +2819,16 @@ impl eframe::App for VoicetermApp {
                             .collect();
                         let session = voiceterm_egui::session_walk::last_session(&walk_pages);
                         self.walk.load(session);
+                        let pane = self.web_panes.get_mut(&web_pane_id).expect("seeded above");
                         if let Some(i) = voiceterm_egui::explore::walk_ui(ui, &mut self.walk, &c) {
                             if let Some(pg) = self.walk.pages().get(i) {
-                                self.browser.load(&pg.url.clone());
+                                pane.load(&pg.url.clone());
                             }
                         }
-                        if let Some(why) = self.browser.empty_reason() {
+                        if let Some(why) = pane.empty_reason() {
                             ui.colored_label(c.text_weak, why);
                         }
-                        for a in self.browser.ranked() {
+                        for a in pane.ranked() {
                             let on = a.actionable();
                             ui.add_enabled(on, egui::Button::new(a.label()));
                             if let Some(r) = a.blocked_reason() {
@@ -2557,7 +2917,43 @@ impl eframe::App for VoicetermApp {
                             let ids: Vec<String> = doc.nodes.iter().map(|n| n.id.clone()).collect();
                             let edges: Vec<(String, String)> = doc.edges.iter()
                                 .map(|e| (e.from.clone(), e.to.clone())).collect();
+                            // SEED THE FOCUS. `GraphView::layout` returns
+                            // nothing at all while `focus` is empty (see its
+                            // early return), and nothing here ever set it —
+                            // so a freshly typed graph rendered "no graph
+                            // loaded" forever, indistinguishable from a parse
+                            // failure, no matter how many nodes it had. Reset
+                            // rather than route through `focus_on` when the
+                            // current focus isn't even IN this graph (a fresh
+                            // one, or the source changed under it): pushing a
+                            // breadcrumb to a node that doesn't exist in the
+                            // topology being drawn is worse than no
+                            // breadcrumb.
+                            if !ids.iter().any(|id| *id == self.graph.focus) {
+                                if let Some(first) = ids.first() {
+                                    self.graph.focus = first.clone();
+                                    self.graph.trail.clear();
+                                }
+                            }
                             let topo = voiceterm_egui::graph_view::nifty::Topology::new(&ids, &edges);
+                            // DEPTH AND BACK. `GraphView::deeper`/`shallower`/
+                            // `back` have been unit-tested since before this
+                            // pane existed (depth_is_capped_because_a_full_
+                            // graph_is_a_hairball, among others) and the
+                            // module's own header lists "depth control" as
+                            // one of four things this view adds over the
+                            // bare ring layout — but nothing here ever called
+                            // them, so a graph past a couple hops had no way
+                            // to narrow, and wandering into it (breadcrumbs
+                            // were already drawn) had no way back.
+                            ui.horizontal(|ui| {
+                                if ui.small_button("−").clicked() { self.graph.shallower(); }
+                                ui.label(format!("depth {}", self.graph.depth));
+                                if ui.small_button("+").clicked() { self.graph.deeper(); }
+                                if !self.graph.trail.is_empty() && ui.small_button("← back").clicked() {
+                                    self.graph.back();
+                                }
+                            });
                             voiceterm_egui::graph_view::graph_ui(ui, &mut self.graph, &topo, &c);
                         }
                     }
@@ -2577,10 +2973,35 @@ impl eframe::App for VoicetermApp {
                         // stack; showing base rows under a "sorted by size"
                         // status is the exact lie this tab used to tell.
                         let shown = self.table_engine.apply();
-                        let line = self.table.input.clone();
-                        if voiceterm_egui::table_view::table_view_ui(
-                            ui, &mut self.table, &shown.headers, &shown.rows, &c).is_some()
+                        if let Some(submitted_line) = voiceterm_egui::table_view::table_view_ui(
+                            ui, &mut self.table, &shown.headers, &shown.rows, &c)
                         {
+                            // THE BUTTONS DISCARDED THEIR OWN RETURN VALUE. The
+                            // "undo"/"reset" buttons return `Some("undo")` /
+                            // `Some("reset")` from `table_view_ui` — but until
+                            // now this call site only checked `.is_some()` and
+                            // then called `submit_with_engine`, which reads
+                            // `self.table.input` (the TEXT FIELD), not the
+                            // string the button actually returned. The field
+                            // is empty after every prior submit, and `submit`
+                            // treats an empty line as "nothing typed" and
+                            // returns immediately — so both buttons silently
+                            // did nothing, while typing "undo" and pressing
+                            // Enter worked, because that path writes the field
+                            // itself before returning the same string.
+                            //
+                            // `submitted_line` is correct for BOTH sources: in
+                            // the typed-Enter case it already equals what's in
+                            // the field (the widget wrote it); in the
+                            // button-click case it's the only place the
+                            // intent lives at all. Write it back before
+                            // submitting so button and typed input go through
+                            // the identical parse path, and capture it now —
+                            // submit() clears the field on success, so this is
+                            // the last point it's readable for the re-parse
+                            // below.
+                            let line = submitted_line.clone();
+                            self.table.input = submitted_line;
                             use voiceterm_egui::table_view::Submitted;
                             match voiceterm_egui::table_view::submit_with_engine(&mut self.table) {
                                 // submit() is generic over op types and throws
@@ -2766,6 +3187,57 @@ impl eframe::App for VoicetermApp {
                                         .chars().take(16).collect::<String>()));
                         });
                         ui.separator();
+                        // PROOF OF LIFE FOR `doc::render_page`. The module's
+                        // own comment on the function: "doc.rs has had the
+                        // page model... and NO RENDERER... the model that
+                        // exists to replace web2qml has never been on
+                        // screen." The renderer exists now (`render_page`,
+                        // `render_page_with`, `FormState`, `submit` — 30
+                        // tests in the kit) and STILL has zero callers
+                        // anywhere in this app: `browser::page_ui_for`, the
+                        // settings bridge for it, is dead too.
+                        //
+                        // This is deliberately NOT wired into the real Web
+                        // pane. That needs the pane-opening gap fixed first
+                        // (LinkAction::Open is a no-op — see the comment
+                        // where it's handled) and a per-pane state decision
+                        // (self.browser is one shared field; the page model
+                        // is per-document by construction). Both are real
+                        // design calls, not a slot-in.
+                        //
+                        // What this answers instead, narrowly: does the
+                        // renderer actually work. `FORMS`-shaped sample
+                        // (login field, checkbox, select, textarea) so a
+                        // form round-trip is visible without touching any
+                        // of that.
+                        ui.collapsing("page renderer preview (doc.rs, not yet wired to Web)", |ui| {
+                            const SAMPLE: &str = r#"<html><body>
+<form action="/submit"><input type="text" name="q" placeholder="Search"><button type="submit">Go</button></form>
+<div><input type="checkbox" name="agree"><label>I agree</label></div>
+<select><option>One</option><option>Two</option></select>
+<textarea>default text</textarea>
+</body></html>"#;
+                            // Parsed once per frame here — fine for a fixed
+                            // demo string; a real caller would parse on load,
+                            // per the crate's own "flatten once" doc.
+                            let page = uikit_web::doc::parse_page(SAMPLE);
+                            match uikit_web::doc::render_page(
+                                ui, &page, &mut self.page_demo_form, &c)
+                            {
+                                Some(uikit_web::doc::PageAction::Submit(s)) => {
+                                    self.toasts.info(
+                                        format!("{} {} → {}", s.method, s.action, s.query),
+                                        ui.input(|i| i.time));
+                                }
+                                Some(uikit_web::doc::PageAction::Follow(href)) => {
+                                    self.toasts.info(format!("follow: {href}"), ui.input(|i| i.time));
+                                }
+                                Some(uikit_web::doc::PageAction::OpenIsland { tag, src }) => {
+                                    self.toasts.info(format!("island: {tag} {src}"), ui.input(|i| i.time));
+                                }
+                                None => {}
+                            }
+                        });
                         if let Some(name) = voiceterm_egui::manpage_view::manpage_ui(
                             ui, &mut self.docs, &c)
                         {
@@ -2928,9 +3400,48 @@ impl eframe::App for VoicetermApp {
                         // no llama.cpp in this crate, so the reply is an
                         // explicit notice rather than a fabricated answer —
                         // an invented assistant turn is worse than none.
-                        if let Some(sent) = self.chat.ui(ui) {
-                            self.chat.reload(&format!(
-                                "user: {sent}\nassistant: (no local model attached in this build)"));
+                        //
+                        // THE WRONG FORMAT, ENTIRELY. This used to build a
+                        // plain-English string ("user: ...\nassistant: ...")
+                        // and hand it to `reload`, which expects the wire
+                        // format `parse_messages` actually parses:
+                        // `M<0x1F><role><0x1F><content>`. A plain-English
+                        // blob matches none of that, so `parse_messages`
+                        // found zero records and `reload` silently emptied
+                        // the transcript on every single send — confirmed
+                        // live: typed a message, pressed Enter, the field
+                        // cleared (the send DID fire) and nothing ever
+                        // appeared, still showing the empty-state placeholder.
+                        //
+                        // `reload` exists to sync from an external backend's
+                        // full-transcript dump — there is no such backend
+                        // here, and `ChatPanel::messages`/`ChatMessage` are
+                        // both public for exactly this reason, so push
+                        // directly instead of round-tripping through a wire
+                        // format built for a backend that doesn't exist in
+                        // this build. Appends, so the conversation persists
+                        // turn to turn — `reload` REPLACES the list, which
+                        // would have erased history on every message even
+                        // once the format matched.
+                        // THE HEADER BUTTONS WERE ALSO DISCARDED. `.ui(ui)`
+                        // is `ui_with(ui).0` — the sent text only, dropping
+                        // `.1`, the `ChatAction` New/Close report. Header
+                        // and buttons render (from the earlier QML-outline
+                        // fix upstream) and looked live, but clicking either
+                        // did nothing: confirmed by clicking "New" here and
+                        // watching the same two messages stay on screen.
+                        // `ui_with` is what actually carries both.
+                        use voiceterm_egui::chat_panel::{ChatAction, ChatMessage, Role};
+                        let (sent, action) = self.chat.ui_with(ui);
+                        if let Some(sent) = sent {
+                            self.chat.messages.push(ChatMessage { role: Role::User, content: sent });
+                            self.chat.messages.push(ChatMessage { role: Role::Assistant,
+                                content: "(no local model attached in this build)".to_string() });
+                        }
+                        match action {
+                            Some(ChatAction::New) => self.chat.messages.clear(),
+                            Some(ChatAction::Close) => { self.workspace.open_view(PaneView::Terminal); }
+                            None => {}
                         }
                     }
                     PaneView::Notes => {
@@ -2948,7 +3459,7 @@ impl eframe::App for VoicetermApp {
                                 .desired_rows(4).desired_width(f32::INFINITY)).changed();
                         if changed {
                             let src = cv::CardSource {
-                                url: self.browser.url.clone(),
+                                url: self.focused_web_url(),
                                 paragraph_id: String::new(),
                             };
                             self.deck.set_cards(cv::note_cards::split_into_cards(
@@ -3066,6 +3577,27 @@ impl eframe::App for VoicetermApp {
                                 }
                             }
                         }
+                        // CLIPS, WITH PROVENANCE. A separate spine from the
+                        // capture/cards/backlinks system above — that one
+                        // splits free-typed prose into cards; this is
+                        // TODO_notes_clip.md's "highlight → card": select
+                        // something in the terminal, run `Command::
+                        // ClipSelection`, and it lands here with a citation
+                        // saying which command produced it. Read-only
+                        // display of `Note::to_markdown()`'s raw output for
+                        // this first slice — a rendered markdown view (the
+                        // same doc.rs/manpage_view pipeline the Docs pane
+                        // uses) is real future work, not attempted here.
+                        if !self.clip_note.blocks.is_empty() {
+                            ui.separator();
+                            ui.label(egui::RichText::new(format!(
+                                "clips — {}", self.clip_note.title)).weak().size(11.0));
+                            egui::ScrollArea::vertical().id_salt("clip_note").max_height(200.0)
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new(
+                                        self.clip_note.to_markdown()).monospace());
+                                });
+                        }
                     }
                     PaneView::Build => {
                         // Compiler output as a navigable list. No cargo is
@@ -3122,6 +3654,98 @@ impl eframe::App for VoicetermApp {
                                 self.toasts.info(hit.one_line(), ui.input(|i| i.time));
                             }
                         }
+                    }
+                    PaneView::Notebook => {
+                        // Step 1 of TODO_notebook_view.md's own sequencing:
+                        // segmented cells, classified, rendered plainly.
+                        // `notebook::classify` has existed since v0.1.608
+                        // with zero UI in either frontend — the pure core
+                        // was built, dogfooding it never happened. Rich
+                        // Table/Map widgets and touch gestures (collapse,
+                        // pin, swipe) are explicitly NOT this step; the
+                        // doc's own advice is "don't build all three before
+                        // dogfooding step 1".
+                        //
+                        // A separate view rather than swapping the live
+                        // terminal's own render/gesture/input loop in place
+                        // (the TODO's original framing) — read-only here,
+                        // over whatever `self.blocks` already has, so there
+                        // is nothing in the terminal's own proven path this
+                        // can regress.
+                        use voiceterm_egui::notebook::Structured;
+                        if self.blocks.blocks.is_empty() {
+                            ui.colored_label(c.text_weak,
+                                "no command blocks yet — run something in the terminal");
+                        }
+                        egui::ScrollArea::vertical().id_salt("notebook").show(ui, |ui| {
+                            for b in &self.blocks.blocks {
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("$ {}", b.command)).strong());
+                                    match b.exit_code {
+                                        Some(0) => { ui.colored_label(
+                                            egui::Color32::from_rgb(90, 180, 100), "●"); }
+                                        Some(code) => { ui.colored_label(c.warning, format!("● {code}")); }
+                                        None => {}
+                                    }
+                                });
+                                match voiceterm_egui::notebook::classify(&b.output) {
+                                    Structured::Plain => {
+                                        ui.label(egui::RichText::new(&b.output).monospace());
+                                    }
+                                    Structured::Table(t) => {
+                                        ui.colored_label(c.text_weak, format!(
+                                            "\u{25A4} table — {} rows \u{d7} {} cols",
+                                            t.rows.len(), t.headers.len()));
+                                        // Step 2 of TODO_notebook_view.md's own
+                                        // sequencing, done narrowly: an aligned
+                                        // read-only grid over TableData's own
+                                        // fields, not raw monospace text dumped
+                                        // as-is. Deliberately NOT the full
+                                        // interactive `table_view_ui` the Table
+                                        // pane uses — that needs a per-instance
+                                        // `TableView` for its sort/filter state,
+                                        // and giving each notebook cell its own
+                                        // persistent state (a HashMap keyed by
+                                        // block id) is real, separate work; a
+                                        // sort button that resets every frame
+                                        // would be worse than no button. This
+                                        // view stays what it's named: read-only.
+                                        egui::Grid::new(("notebook_table", b.id))
+                                            .striped(true).show(ui, |ui| {
+                                            for h in &t.headers {
+                                                ui.label(egui::RichText::new(h).strong().small());
+                                            }
+                                            ui.end_row();
+                                            for row in &t.rows {
+                                                for cell in row {
+                                                    ui.label(egui::RichText::new(cell).small());
+                                                }
+                                                ui.end_row();
+                                            }
+                                        });
+                                    }
+                                    Structured::Map(pairs) => {
+                                        ui.colored_label(c.text_weak,
+                                            format!("key/value — {} pairs", pairs.len()));
+                                        // Bold key, matching the Table
+                                        // branch's bold header row — same
+                                        // "the structure is visually
+                                        // distinct from the values" idea,
+                                        // applied to the other Structured
+                                        // kind rather than left as plain
+                                        // "key: value" text only.
+                                        egui::Grid::new(("notebook_map", b.id)).show(ui, |ui| {
+                                            for (k, v) in &pairs {
+                                                ui.label(egui::RichText::new(k).strong().small());
+                                                ui.label(egui::RichText::new(v).small());
+                                                ui.end_row();
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        });
                     }
                     PaneView::Terminal => {}
                 }
@@ -3684,7 +4308,18 @@ impl eframe::App for VoicetermApp {
             // background rule intact: parked panes are reconciled by id,
             // the focused pane is reconciled by whether it actually has
             // a shell in hand.
-            if voiceterm_egui::pane_host::focused_needs_shell(
+            //
+            // GUARDED ON PANE KIND. `split_web`'s own comment calls web
+            // panes "never focused" as though that were enforced; it is
+            // only a default — `Workspace::focus_pane` has no restriction,
+            // and the unfocused-pane tile loop below calls it unconditionally
+            // on click. Without this check, clicking a web pane's tile would
+            // focus it and this block would spawn it a real shell it has no
+            // use for, on the next frame, unconditionally. That is the actual
+            // invariant "never focused" was protecting — not focus itself.
+            let focused_is_web = self.workspace.pane_view(self.pane_focus)
+                == voiceterm_egui::shell::PaneView::Web;
+            if !focused_is_web && voiceterm_egui::pane_host::focused_needs_shell(
                 self.pty.is_some(),
                 self.pty_spawn_failed.contains(&self.pane_focus),
             ) {
@@ -3883,9 +4518,27 @@ impl eframe::App for VoicetermApp {
                             ctx.copy_text(u);
                             self.toasts.success("Copied URL", ctx.input(|i| i.time));
                         }
-                        // Open/Read/NewTab drive the web pane / reader — on-device wiring, same
-                        // status as the workspace actions above.
-                        Some(LinkAction::Open(_)) | Some(LinkAction::Read(_)) | Some(LinkAction::NewTab(_)) => {}
+                        // Open/Read/NewTab all resolve to the same thing right
+                        // now: open a new pane beside the current one, already
+                        // pointed at the url, and focus it. `open_web_pane_at`
+                        // plus the per-pane `web_panes` state (both added this
+                        // session — see their own doc comments) were the two
+                        // pieces this needed; the Web pane's render arm seeds
+                        // its `WebPane` entry from `PaneKind::Web{url}` on
+                        // first draw, so there's exactly one place that turns
+                        // a model url into presentation state, not two.
+                        //
+                        // Focusing it is new too: `focused_needs_shell`'s
+                        // call site now skips spawning a shell for a focused
+                        // pane whose view is `Web` (see that guard's comment)
+                        // — without it, this would have quietly spawned a
+                        // real shell process for a pane that has no use for
+                        // one, the exact failure `split_web`'s "never
+                        // focused" comment was actually protecting against.
+                        Some(LinkAction::Open(u)) | Some(LinkAction::Read(u)) | Some(LinkAction::NewTab(u)) => {
+                            let new_id = self.workspace.open_web_pane_at(&u);
+                            self.workspace.focus_pane(new_id);
+                        }
                         None => {}
                     }
                 }
@@ -4049,6 +4702,7 @@ fn main() -> eframe::Result<()> {
         Box::new(move |_cc| {
             let mut app = VoicetermApp {
                 keycaps_open: true,
+                clip_note: voiceterm_egui::note_clip::Note::new("Session clips"),
                 compact_defaults_applied: false,
                 ingest: Default::default(),
                 // Discovery once at startup, not per frame: scanning
@@ -4097,6 +4751,7 @@ fn main() -> eframe::Result<()> {
                     ]);
                     v
                 },
+                page_demo_form: uikit_web::doc::FormState::default(),
                 table_engine: voiceterm_egui::table_ops::TableView::new(
                     voiceterm_egui::table_ops::TableData::new(
                         vec!["name".into(), "size".into(), "modified".into()],
@@ -4173,11 +4828,15 @@ fn main() -> eframe::Result<()> {
                 a11y: uikit_egui::a11y::A11yScene::new(),
                 mail: Default::default(),
                 browser: Default::default(),
+                web_panes: Default::default(),
                 graph: Default::default(),
                 archive: Default::default(),
                 mail_messages: Vec::new(),
+                mail_all: Vec::new(),
                 mail_scanned_blocks: 0,
                 mail_from_disk: Vec::new(),
+                mail_bodies_disk: std::collections::HashMap::new(),
+                mail_bodies_terminal: std::collections::HashMap::new(),
                 mail_store_path: None,
                 mail_open: None,
                 audit: Default::default(),
@@ -4226,6 +4885,14 @@ fn main() -> eframe::Result<()> {
                 web_prefs: voiceterm_egui::web_prefs::load(),
                 graph_source: String::new(),
             };
+            // Set once, here, rather than left for the assistant's first
+            // reply to explain (the previous state — see b6e55cf5's commit
+            // message): a limitation worth knowing before typing a
+            // message, not discovered only after sending one. `ChatPanel`
+            // has no way to know its own backend's state; this is the
+            // caller telling it, same as `provider`/`busy`.
+            app.chat.backend_status = Some(
+                "no local model attached in this build — replies are a placeholder, not a real response".to_string());
             // Take the focused pane id FROM THE MODEL rather than
             // hardcoding it.
             //
@@ -4304,3 +4971,78 @@ fn default_command_docs() -> Vec<voiceterm_egui::command_search::CommandDoc> {
     ]
 }
 
+
+#[cfg(test)]
+mod doc_markdown_tests {
+    use super::*;
+
+    #[test]
+    fn plain_text_is_just_escaped() {
+        assert_eq!(inline_md("hello world"), "hello world");
+        assert_eq!(inline_md("a < b & c > d"), "a &lt; b &amp; c &gt; d");
+    }
+
+    #[test]
+    fn bold_renders_as_a_tag_not_literal_asterisks() {
+        assert_eq!(inline_md("**bold**"), "<b>bold</b>");
+        assert_eq!(inline_md("say **this** now"), "say <b>this</b> now");
+    }
+
+    #[test]
+    fn inline_code_renders_as_a_tag() {
+        assert_eq!(inline_md("run `cargo test`"), "run <code>cargo test</code>");
+    }
+
+    #[test]
+    fn a_link_renders_as_an_anchor_not_literal_brackets() {
+        assert_eq!(inline_md("[vision.md](vision.md)"),
+                   "<a href=\"vision.md\">vision.md</a>");
+    }
+
+    /// The exact case observed live: a bold link, which is how README.md
+    /// actually writes its file list. Regression pin for the bug this
+    /// function replaced `escape(t)` to fix.
+    #[test]
+    fn a_bold_link_is_not_left_as_literal_markdown_syntax() {
+        assert_eq!(
+            inline_md("**[vision.md](vision.md)** — long-term goals"),
+            "<b><a href=\"vision.md\">vision.md</a></b> — long-term goals");
+    }
+
+    #[test]
+    fn an_unterminated_delimiter_falls_back_to_literal_text() {
+        // No closing `**`: must not consume or corrupt the rest of the line.
+        assert_eq!(inline_md("this **never closes"), "this **never closes");
+        assert_eq!(inline_md("a `dangling code span"), "a `dangling code span");
+    }
+
+    #[test]
+    fn markup_characters_inside_a_span_are_still_escaped() {
+        // The span content goes through `escape` too, not straight into the
+        // tag — a link label containing `<` must not inject a stray tag.
+        assert_eq!(inline_md("[a < b](x)"), "<a href=\"x\">a &lt; b</a>");
+    }
+
+    #[test]
+    fn a_code_span_suppresses_nested_markdown_but_bold_does_not() {
+        // Markdown convention: code spans have the highest precedence and
+        // switch off formatting inside them; bold and links do not, which
+        // is exactly what the bold-link case above depends on.
+        assert_eq!(inline_md("`**not bold**`"), "<code>**not bold**</code>");
+    }
+
+    #[test]
+    fn a_full_paragraph_line_through_doc_matches_inline_md() {
+        let d = doc("t", "T", "**[vision.md](vision.md)** — goals");
+        assert!(d.html.contains("<b><a href=\"vision.md\">vision.md</a></b>"),
+                "doc() must route paragraph lines through inline_md: {}", d.html);
+    }
+
+    #[test]
+    fn headers_and_fences_are_unaffected() {
+        let d = doc("t", "T", "# Title\n\n```\nlet x = 1;\n```\n\n**bold** after");
+        assert!(d.html.contains("<h1>Title</h1>"));
+        assert!(d.html.contains("<pre>let x = 1;\n</pre>"));
+        assert!(d.html.contains("<p><b>bold</b> after</p>"));
+    }
+}

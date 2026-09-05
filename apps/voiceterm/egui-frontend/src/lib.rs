@@ -296,6 +296,77 @@ pub mod dumb_summary;
 pub mod table_ops;
 #[path = "../../src/table_nlp.rs"]
 pub mod table_nlp;
+/// Structured-output detection for the (still unwired, in this frontend)
+/// notebook view — see TODO_notebook_view.md. Pure and already tested;
+/// depends on table_ops, already above it, so `#[path]` costs nothing new.
+#[path = "../../src/notebook.rs"]
+pub mod notebook;
+/// Zellij voice/assisted control — PURE core (phrase → `zellij action`
+/// argv, zellij-session detection). Fully self-contained (no `use` of any
+/// other module in this crate), tested, and — like notebook.rs above —
+/// has never been re-exported here, so its 12 tests never ran as part of
+/// this crate and the module was unreachable from the egui binary.
+///
+/// NOT wired into the voice pipeline in this commit: `in_zellij_session`
+/// takes the env var as a plain parameter specifically so it stays pure,
+/// but the real question — whether zellij is running inside the PTY's
+/// child shell — isn't something this app's own process env can answer.
+/// A child process's environment doesn't propagate back to its parent;
+/// checking `std::env::var("ZELLIJ")` here would report whether the EGUI
+/// APP is in a zellij session, not whether the shell it's hosting is.
+/// That needs either a real detection mechanism (parsing shell output,
+/// a manual opt-in toggle — the TODO's own "OPTIONAL, opt-in" framing
+/// would fit that) or an accepted approximation, and shipping a
+/// confidently-labeled feature that's silently checking the wrong
+/// process's environment would be exactly the "looks wired, isn't"
+/// shape this session spent most of its time finding and fixing
+/// elsewhere. Filed as the reason to decide before wiring, not silently
+/// worked around.
+#[path = "../../src/zellij_voice.rs"]
+pub mod zellij_voice;
+/// Zettelkasten `[[wiki-link]]` resolution — PURE core (index a set of
+/// note paths by basename, classify + resolve each `[[...]]` token in a
+/// body against that index, rewrite a whole markdown document). 19
+/// tests, self-contained (only `std::collections::HashMap`), never
+/// re-exported here — same shape as notebook.rs and zellij_voice.rs
+/// above.
+///
+/// Backlinks are UNAFFECTED by any of this: `src/backlinks.rs` (already
+/// wired, via `backlinks_view.rs`) does its OWN `[[...]]` extraction
+/// internally to build the "what links here" index — a note that types
+/// `[[Other Note]]` already shows up in Other Note's backlinks today,
+/// with zero help from this module. What zbrackets uniquely adds is
+/// RENDERING: turning `[[Other Note]]` into an actual clickable link
+/// instead of literal bracket text, when a note's body is displayed.
+///
+/// NOT wired into `cards_view::deck_ui`'s body rendering in this commit.
+/// That needs care this pass didn't have room for: `deck_ui` renders
+/// preview bodies for every card in the list (not just the selected
+/// one) via a single `ui.label(RichText::new(body)...)` call per card,
+/// and making `[[...]]` clickable there means restructuring that into a
+/// per-card scan-and-split render (the same technique this session's
+/// `inline_md()` used for the Docs pane's bold/code/link spans) PLUS
+/// deciding how a resolved target (a file path, per zbrackets' own
+/// model) maps back to one of THIS app's in-memory cards, which are
+/// keyed by title, not a real notes-directory path — `deck_ui` is a
+/// small, working, tested widget, and reshaping its rendering contract
+/// deserved more attention than this pass had left to give it correctly
+/// the first time.
+#[path = "../../src/zbrackets.rs"]
+pub mod zbrackets;
+/// Modeless vim-style count-prefix accumulator (`{N}b` = cycle N forward,
+/// `{N}B` = N back) — the state machine behind TODO_tab_cycle_shortcut.md,
+/// fully done and wired in the Qt frontend since v0.1.719. Pure,
+/// self-contained (no `use` of anything), 8 tests, never re-exported here.
+/// Reusable for any modeless count command, not just tab cycling.
+#[path = "../../src/count_prefix.rs"]
+pub mod count_prefix;
+/// Note clipping's data model + markdown serialization — see
+/// TODO_notes_clip.md. Pure and tested since v0.1.641; had no re-export
+/// and no caller in this frontend before now, same shape as notebook.rs
+/// just above.
+#[path = "../../src/note_clip.rs"]
+pub mod note_clip;
 // The GestureHost+SlidePopup replacement (grid gesture menus with QML-parity variants) lives in
 // the shared kit; re-exported under a voiceterm-familiar name.
 pub use uikit_egui::slide_menu;

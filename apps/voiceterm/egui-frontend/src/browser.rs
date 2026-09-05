@@ -154,9 +154,24 @@ impl Action {
     }
 }
 
-/// The browser page's state.
+/// Saved URLs, across every page ever opened. Global — not per-pane —
+/// because a bookmark is a property of a URL forever, not of whichever
+/// pane happened to be looking at it when the star was pressed.
 #[derive(Debug, Clone, Default)]
 pub struct Browser {
+    pub bookmarks: crate::bookmarks_view::Bookmarks,
+}
+
+/// One open web pane's transient state: what it's showing right now.
+///
+/// Used to be fields on `Browser` itself, which is why this app could only
+/// ever have ONE web page open at a time no matter how many web panes
+/// existed in the tiling layout — every pane read and wrote the same
+/// `self.browser.url`. `PaneKind::Web{url}` has been per-pane in the model
+/// since `split_web` was written; this is the presentation-layer half of
+/// that catching up, keyed by pane id at the call site.
+#[derive(Debug, Clone, Default)]
+pub struct WebPane {
     /// Ad and tracker filtering. Mounted from the app's own `ad_filter` rather
     /// than reimplemented — its `classify_tracking_wrapper` exempts semantic
     /// tags (article, section, header) on the grounds that they "carry meaning
@@ -164,10 +179,6 @@ pub struct Browser {
     /// strip real content while claiming to remove ads.
     pub filter_mode: FilterMode,
     pub filter_stats: FilterStats,
-    /// Saved URLs. The star reads from here rather than from a flag on the
-    /// page, so it stays correct when the same URL is reached twice by
-    /// different routes.
-    pub bookmarks: crate::bookmarks_view::Bookmarks,
     pub url: String,
     pub title: String,
     pub actions: Vec<Action>,
@@ -178,7 +189,16 @@ pub struct Browser {
     pub scanned: bool,
 }
 
-impl Browser {
+impl WebPane {
+    /// A pane opened straight at `url` — the shape a link tap needs: no
+    /// separate `load` call between creating the pane and having somewhere
+    /// to put it.
+    pub fn opened_at(url: &str) -> WebPane {
+        let mut p = WebPane::default();
+        p.load(url);
+        p
+    }
+
     /// Actions in the order a person wants them, page order kept within a rank
     /// because the first form on a page is usually the real one and the second
     /// is a newsletter signup.
@@ -211,20 +231,23 @@ impl Browser {
         Some(self.filter_stats.summary())
     }
 
-    /// Is the current page saved? Drives the star's filled state.
-    pub fn is_bookmarked(&self) -> bool { self.bookmarks.is_saved(&self.url) }
+    /// Is the current page saved? Drives the star's filled state. Takes the
+    /// bookmark store explicitly now that it is not this struct's own field.
+    pub fn is_bookmarked(&self, bookmarks: &crate::bookmarks_view::Bookmarks) -> bool {
+        bookmarks.is_saved(&self.url)
+    }
 
     /// Toggle the star. Returns true when it is now saved.
     ///
     /// The page TITLE is passed rather than a derived fallback, and the merge
     /// rule protects a user-edited one — so starring a page twice cannot rename
     /// a bookmark someone named.
-    pub fn toggle_bookmark(&mut self, now_ms: u64) -> bool {
-        if self.is_bookmarked() {
-            self.bookmarks.remove(&self.url);
+    pub fn toggle_bookmark(&self, bookmarks: &mut crate::bookmarks_view::Bookmarks, now_ms: u64) -> bool {
+        if self.is_bookmarked(bookmarks) {
+            bookmarks.remove(&self.url);
             false
         } else {
-            self.bookmarks.save(&self.url, &self.title, &[], now_ms);
+            bookmarks.save(&self.url, &self.title, &[], now_ms);
             true
         }
     }
@@ -318,7 +341,7 @@ mod tests {
 
     #[test]
     fn actions_are_ranked_by_what_a_person_wants() {
-        let b = Browser {
+        let b = WebPane {
             actions: vec![
                 Action::Api { url: "/v1/x".into(), method: "GET".into(),
                               auth: "none".into(), description: "".into() },
@@ -336,7 +359,7 @@ mod tests {
     fn page_order_is_kept_within_a_rank() {
         // The first form on a page is usually the real one; the second is a
         // newsletter signup.
-        let b = Browser {
+        let b = WebPane {
             actions: vec![
                 Action::Login { action: "/real".into(), method: "POST".into(), has_csrf: true },
                 Action::Login { action: "/newsletter".into(), method: "POST".into(), has_csrf: true },
@@ -350,16 +373,17 @@ mod tests {
     fn the_star_reflects_the_saved_set_not_a_page_flag() {
         // A flag on the page goes stale when the same URL is reached twice by
         // different routes — a link, then the history — and the star then lies.
-        let mut b = Browser::default();
+        let mut bm = crate::bookmarks_view::Bookmarks::default();
+        let mut b = WebPane::default();
         b.load("https://x.test/a");
         b.loaded("A", vec![]);
-        assert!(!b.is_bookmarked());
-        assert!(b.toggle_bookmark(100));
-        assert!(b.is_bookmarked());
+        assert!(!b.is_bookmarked(&bm));
+        assert!(b.toggle_bookmark(&mut bm, 100));
+        assert!(b.is_bookmarked(&bm));
         // arrive again by another route
         b.load("https://x.test/a");
-        assert!(b.is_bookmarked(), "still saved");
-        assert!(!b.toggle_bookmark(200), "and unstars");
+        assert!(b.is_bookmarked(&bm), "still saved");
+        assert!(!b.toggle_bookmark(&mut bm, 200), "and unstars");
     }
 
     #[test]
@@ -367,7 +391,7 @@ mod tests {
         // A filter that removes things silently is indistinguishable from a
         // broken page, and the first thing anyone does when a site looks wrong
         // is turn the filter off — so it has to be obvious it was on.
-        let mut b = Browser { filter_mode: FilterMode::Standard, ..Default::default() };
+        let mut b = WebPane { filter_mode: FilterMode::Standard, ..Default::default() };
         assert!(b.filter_summary().is_some());
         b.filter_mode = FilterMode::Off;
         assert_eq!(b.filter_summary(), None, "nothing to report when it is off");
@@ -377,7 +401,7 @@ mod tests {
     fn filter_stats_are_per_page_not_cumulative() {
         // "412 trackers blocked" across a session tells you nothing about the
         // page in front of you.
-        let mut b = Browser { filter_mode: FilterMode::Standard, ..Default::default() };
+        let mut b = WebPane { filter_mode: FilterMode::Standard, ..Default::default() };
         b.filter_stats.filtered_elements = 17;
         b.load("https://elsewhere.test");
         assert_eq!(b.filter_stats.filtered_elements, 0, "reset with the page");
@@ -414,7 +438,7 @@ mod tests {
     fn an_empty_list_says_which_empty_it_is() {
         // Nothing found on a blank page is expected; nothing found on a login
         // page is a bug worth seeing.
-        let mut b = Browser::default();
+        let mut b = WebPane::default();
         assert_eq!(b.empty_reason(), Some("nothing loaded"));
         b.load("https://x.test");
         assert_eq!(b.empty_reason(), Some("loading…"));
@@ -429,7 +453,7 @@ mod tests {
         // Leaving the previous page's login form visible while a new page loads
         // invites acting on the wrong site — for a login form that is a
         // credential sent to a stranger.
-        let mut b = Browser::default();
+        let mut b = WebPane::default();
         b.loaded("Bank", vec![login(true)]);
         assert_eq!(b.actions.len(), 1);
         b.load("https://elsewhere.test");
@@ -457,7 +481,7 @@ mod tests {
                               auth: "bearer".into(), description: "".into() };
         assert!(!a.actionable());
         assert!(a.blocked_reason().unwrap().contains("bearer"));
-        let b = Browser { actions: vec![a], scanned: true, ..Default::default() };
+        let b = WebPane { actions: vec![a], scanned: true, ..Default::default() };
         assert_eq!(b.ranked().len(), 1, "still shown");
         assert!(b.actionable().is_empty(), "but not offered");
     }
