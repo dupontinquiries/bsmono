@@ -379,3 +379,29 @@ mod tests {
         assert_eq!(app.tab, Tab::ALL[Tab::ALL.len() - 1]);
     }
 }
+
+#[cfg(test)]
+mod compact_layout_probe {
+    use super::*;
+
+    /// At phone width the Network page renders BLANK — seen in a screenshot.
+    /// This reports where the space actually goes, so the cause is measured
+    /// rather than guessed.
+    #[test]
+    fn report_where_the_height_goes_at_phone_width() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 790.0));
+        let mut app = App::default();
+        let mut central = egui::Rect::NOTHING;
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                app.ui(ctx);
+                central = ctx.available_rect();
+            });
+        }
+        eprintln!("screen  = {screen:?}");
+        eprintln!("central = {central:?}  (h={})", central.height());
+        assert!(central.height() > 100.0,
+                "the page has no room to draw: central height {}", central.height());
+    }
+}
