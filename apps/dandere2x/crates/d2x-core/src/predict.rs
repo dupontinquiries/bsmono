@@ -42,6 +42,8 @@ pub struct AnalyzeConfig {
     /// this is the cheapest thing that can catch it. Needs an even upscale
     /// factor for the merge to stay an exact copy.
     pub halfpel: bool,
+    /// The interpolant used to evaluate (and mirror) half-pel candidates.
+    pub subpel_filter: SubpelFilter,
     /// Texture thresholds (luma standard deviation, 0–255 units) for routing
     /// missing blocks to cheaper tiers: below `[0]` → tier 2 (bicubic),
     /// below `[1]` → tier 1 (cheap network), else tier 0. Only tiers the
@@ -59,7 +61,7 @@ pub struct AnalyzeConfig {
 
 impl Default for AnalyzeConfig {
     fn default() -> Self {
-        AnalyzeConfig { block_size: 30, bleed: 1, min_psnr: 5.2, redraw_fraction: 0.90, fade: true, halfpel: false, tier_std: [1.0, 4.0], tier_metric: TierMetric::HighFreq, streak_bonus: 0.0 }
+        AnalyzeConfig { block_size: 30, bleed: 1, min_psnr: 5.2, redraw_fraction: 0.90, fade: true, halfpel: false, subpel_filter: SubpelFilter::Bilinear, tier_std: [1.0, 4.0], tier_metric: TierMetric::HighFreq, streak_bonus: 0.0 }
     }
 }
 
@@ -76,6 +78,28 @@ pub struct AnalyzeState {
 /// Upscaled bytes for the `Cached` blocks of one plan, attached by the
 /// analysis stage so eviction between the stages cannot lose them.
 pub type CachedBlocks = std::collections::HashMap<u64, std::sync::Arc<Vec<u8>>>;
+
+/// How a half-pel block of the previous frame is interpolated for the gate
+/// and for the low-res mirror.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubpelFilter {
+    /// Rounded 2-tap box: exactly the box-downsample of a nearest ×2
+    /// upscale read at the odd offset. Soft.
+    #[default]
+    Bilinear,
+    /// H.264's 6-tap `[1, −5, 20, 20, −5, 1] / 32`: a sharp interpolant,
+    /// closer to what a CNN's ×2 output holds at an odd pixel.
+    SixTap,
+}
+
+impl SubpelFilter {
+    pub fn block(self, f: &Frame, sx2: u32, sy2: u32, size: u32) -> Frame {
+        match self {
+            SubpelFilter::Bilinear => f.block_halfpel(sx2, sy2, size),
+            SubpelFilter::SixTap => f.block_halfpel_6tap(sx2, sy2, size),
+        }
+    }
+}
 
 /// Which measure decides a missing block's tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -378,7 +402,7 @@ pub fn analyze_tiered(
                     return BlockMatch::Moved { src_x: c.src_x, src_y: c.src_y };
                 }
                 if cfg.halfpel {
-                    if let Some(h) = refine_halfpel(prev_ro, next, x, y, bs, c, limit) {
+                    if let Some(h) = refine_halfpel(prev_ro, next, x, y, bs, c, limit, cfg.subpel_filter) {
                         return h;
                     }
                 }
@@ -518,7 +542,7 @@ pub fn analyze_tiered(
             BlockMatch::Recalled { r } => working_next.copy_block(older[r as usize], bs, x, y, x, y),
             BlockMatch::Plated { px, py } => working_next.copy_block(plate.expect("Plated without a plate").lo, bs, px, py, x, y),
             BlockMatch::MovedHalf { sx2, sy2 } => {
-                let b = prev_working.block_halfpel(sx2, sy2, bs);
+                let b = cfg.subpel_filter.block(prev_working, sx2, sy2, bs);
                 working_next.copy_block(&b, bs, 0, 0, x, y);
             }
             // Cached blocks are the frame's own content, like Missing.
@@ -533,7 +557,8 @@ pub fn analyze_tiered(
 /// one passes the gate. Bilinear samples of `prev`; `block_sse` against the
 /// materialised sample (eight small blocks per failing block — cheap next
 /// to the JPEG gate, and only paid where the integer search failed).
-fn refine_halfpel(prev: &Frame, next: &Frame, x: u32, y: u32, bs: u32, c: crate::matcher::Candidate, limit: u64) -> Option<BlockMatch> {
+#[allow(clippy::too_many_arguments)]
+fn refine_halfpel(prev: &Frame, next: &Frame, x: u32, y: u32, bs: u32, c: crate::matcher::Candidate, limit: u64, filter: SubpelFilter) -> Option<BlockMatch> {
     let mut best: Option<(u64, u32, u32)> = None;
     for dy2 in -1i64..=1 {
         for dx2 in -1i64..=1 {
@@ -549,7 +574,7 @@ fn refine_halfpel(prev: &Frame, next: &Frame, x: u32, y: u32, bs: u32, c: crate:
             if sx2 / 2 + bs + (sx2 % 2) > prev.width || sy2 / 2 + bs + (sy2 % 2) > prev.height {
                 continue;
             }
-            let b = prev.block_halfpel(sx2, sy2, bs);
+            let b = filter.block(prev, sx2, sy2, bs);
             let lim = best.map_or(limit, |b| b.0);
             if let Some(sse) = block_sse_bounded(next, x, y, &b, 0, 0, bs, lim) {
                 if best.map_or(true, |b| sse < b.0) {

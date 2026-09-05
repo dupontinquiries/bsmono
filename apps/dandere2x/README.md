@@ -273,9 +273,15 @@ What is built:
   offset is an integer offset, so the merge is still an exact copy; the
   low-res mirror is the box-downsample of that copy, bit for bit. SMITE,
   120 frames: 83.3% → 67.9% at q60 (redraws 52 → 19), but only 95.4% →
-  94.6% at q90 — bilinear is too soft to pass a strict gate against sharp
-  edges. A 6-tap sub-pel filter and quarter-pel (fao-codec has the
-  refinement in `v11_plate.rs`) is what would move the q90 number.
+  94.6% at q90. `--halfpel-filter 6tap` (H.264's half-pel filter, sharp)
+  was the obvious suspect and is NOT it: on the same 100 frames at q80,
+  bilinear 93.7% → 90.2% and 6-tap 90.2%, 58 vs 60 half-pel blocks per
+  frame, indistinguishable. The game clip's 3D camera puts every block at
+  an arbitrary sub-pixel phase with per-block perspective; half-pel is not
+  where the content is. Quarter-pel is an exact copy only at ×4; at ×2 it
+  means resampling the CNN output — the trade a DLSS-class accumulator
+  makes on purpose. (The 6-tap sampler is a straightforward closure loop,
+  ~1 s/frame at 1080p on one core; not optimised, since it did not earn it.)
 - **Gate hysteresis** (`--streak-bonus b`, default 0 = off): a block reused
   for `n` consecutive frames gets its threshold scaled by
   `1 + b·min(n,8)/8`, so blocks that keep matching stop flickering out at

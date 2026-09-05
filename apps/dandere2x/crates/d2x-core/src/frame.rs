@@ -199,6 +199,52 @@ impl Frame {
         out
     }
 
+    /// [`block_halfpel`](Self::block_halfpel) with H.264's 6-tap half-pel
+    /// filter `[1, −5, 20, 20, −5, 1] / 32` instead of bilinear; the
+    /// centre position filters the unrounded horizontal intermediates
+    /// vertically (`+512 >> 10`), as the standard does. Taps past the frame
+    /// edge replicate the edge pixel.
+    ///
+    /// Why a second filter: bilinear at half-pel is a 2-tap box, which
+    /// blurs a sharp edge by a full pixel. A CNN's ×2 output read at an odd
+    /// pixel is *sharp* — the network reconstructs the edge — so the
+    /// low-res question "would that copy pass the gate" is answered better
+    /// by the sharpest cheap interpolant than by the softest. This is the
+    /// same filter every video codec uses for the same reason.
+    pub fn block_halfpel_6tap(&self, sx2: u32, sy2: u32, size: u32) -> Frame {
+        let (x0, y0) = (sx2 / 2, sy2 / 2);
+        let (fx, fy) = (sx2 % 2 == 1, sy2 % 2 == 1);
+        if !fx && !fy {
+            return self.crop(x0, y0, size, size);
+        }
+        let (w, h) = (self.width as i64, self.height as i64);
+        let at = |x: i64, y: i64, c: usize| -> i32 {
+            let xi = x.clamp(0, w - 1) as u32;
+            let yi = y.clamp(0, h - 1) as u32;
+            self.data[self.idx(xi, yi) + c] as i32
+        };
+        const T: [i32; 6] = [1, -5, 20, 20, -5, 1];
+        // Horizontal 6-tap at (x + 1/2, y), unrounded.
+        let hsum = |x: i64, y: i64, c: usize| -> i32 { (0..6).map(|k| T[k] * at(x - 2 + k as i64, y, c)).sum() };
+        let mut out = Frame::new(size, size);
+        for j in 0..size as i64 {
+            for i in 0..size as i64 {
+                let (x, y) = (x0 as i64 + i, y0 as i64 + j);
+                let mut px = [0u8; 3];
+                for c in 0..3 {
+                    let v = match (fx, fy) {
+                        (true, false) => (hsum(x, y, c) + 16) >> 5,
+                        (false, true) => ((0..6).map(|k| T[k] * at(x, y - 2 + k as i64, c)).sum::<i32>() + 16) >> 5,
+                        _ => ((0..6).map(|k| T[k] * hsum(x, y - 2 + k as i64, c)).sum::<i32>() + 512) >> 10,
+                    };
+                    px[c] = v.clamp(0, 255) as u8;
+                }
+                out.set_px(i as u32, j as u32, px);
+            }
+        }
+        out
+    }
+
     /// Add uniform noise in `[-strength, strength]` to every channel, clamped.
     /// Deterministic for a given seed (a SplitMix64 stream), so a run is
     /// reproducible and tests can pin outputs.
@@ -317,6 +363,53 @@ pub fn block_sse_bounded(
         }
     }
     Some(sum)
+}
+
+#[cfg(test)]
+mod halfpel_tests {
+    use super::*;
+
+    /// Both filters are exact on a constant and on a linear ramp (the 6-tap
+    /// sums to 32 and is symmetric), and identical to a plain crop at an
+    /// integer position.
+    #[test]
+    fn halfpel_filters_agree_on_ramps_and_integers() {
+        let mut f = Frame::new(24, 24);
+        for y in 0..24 {
+            for x in 0..24 {
+                f.set_px(x, y, [(4 * x) as u8, (2 * y + 10) as u8, 77]);
+            }
+        }
+        for &(sx2, sy2) in &[(8u32, 8u32), (9, 8), (8, 9), (9, 9)] {
+            let a = f.block_halfpel(sx2, sy2, 8);
+            let b = f.block_halfpel_6tap(sx2, sy2, 8);
+            assert_eq!(a, b, "({sx2},{sy2})");
+            // x ramp of slope 4 per pixel: a half-pel shift adds 2.
+            let want_r = (4 * (sx2 / 2) + 2 * (sx2 % 2)) as u8;
+            let want_g = (2 * (sy2 / 2) + (sy2 % 2) + 10) as u8;
+            assert_eq!(a.px(0, 0), [want_r, want_g, 77], "({sx2},{sy2})");
+        }
+        assert_eq!(f.block_halfpel_6tap(8, 8, 8), f.crop(4, 4, 8, 8));
+    }
+
+    /// On a step edge the 6-tap keeps the edge sharper than the 2-tap box:
+    /// its half-pel value overshoots the box's midpoint on both sides.
+    #[test]
+    fn six_tap_is_sharper_than_bilinear_on_an_edge() {
+        let mut f = Frame::new(16, 8);
+        for y in 0..8 {
+            for x in 0..16 {
+                f.set_px(x, y, [if x < 8 { 50 } else { 200 }; 3]);
+            }
+        }
+        let bi = f.block_halfpel(2 * 4 + 1, 0, 8); // columns 4.5 .. 11.5
+        let six = f.block_halfpel_6tap(2 * 4 + 1, 0, 8);
+        assert_eq!(bi.px(3, 0)[0], 125); // the edge midpoint, box
+        assert_eq!(six.px(3, 0)[0], 125); // symmetric: same midpoint
+        assert_eq!((six.px(2, 0)[0], six.px(4, 0)[0]), (31, 219)); // (1000/32, 7000/32)
+        assert!(six.px(2, 0)[0] < bi.px(2, 0)[0], "6-tap undershoots before the edge: {} vs {}", six.px(2, 0)[0], bi.px(2, 0)[0]);
+        assert!(six.px(4, 0)[0] > bi.px(4, 0)[0], "6-tap overshoots after the edge: {} vs {}", six.px(4, 0)[0], bi.px(4, 0)[0]);
+    }
 }
 
 #[cfg(test)]

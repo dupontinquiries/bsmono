@@ -77,5 +77,5 @@ pub(crate) mod testimg {
 pub use frame::Frame;
 pub use pipeline::{run, Event, FrameSink, FrameSource, PipelineConfig, SourceInfo, Summary};
 pub use plan::{FramePlan, FrameStats};
-pub use predict::{AnalyzeConfig, TierMetric};
+pub use predict::{AnalyzeConfig, SubpelFilter, TierMetric};
 pub use upscale::Upscaler;

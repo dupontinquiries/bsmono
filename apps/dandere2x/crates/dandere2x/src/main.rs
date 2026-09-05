@@ -98,6 +98,11 @@ struct Common {
     /// integer matching by construction. Needs an even scale (x2, x4).
     #[arg(long)]
     halfpel: bool,
+    /// Interpolant for --halfpel: bilinear (soft, exact with a box
+    /// downsample) or 6tap (H.264's, sharp — what a CNN's output looks like
+    /// at an odd pixel).
+    #[arg(long, default_value = "bilinear")]
+    halfpel_filter: String,
     /// Host memory the job may hold (e.g. 96G). Default: half of MemAvailable.
     #[arg(long)]
     ram_budget: Option<String>,
@@ -279,6 +284,11 @@ fn job_from(common: &Common, input: PathBuf, output: PathBuf) -> anyhow::Result<
     j.pipeline.plate_min_confidence = common.plate_confidence;
     j.pipeline.mv_seed = common.mv_seed;
     j.pipeline.analyze.halfpel = common.halfpel;
+    j.pipeline.analyze.subpel_filter = match common.halfpel_filter.as_str() {
+        "bilinear" => d2x_core::SubpelFilter::Bilinear,
+        "6tap" => d2x_core::SubpelFilter::SixTap,
+        other => anyhow::bail!("--halfpel-filter must be bilinear|6tap, got {other}"),
+    };
     j.cascade_model = common.cascade.as_ref().map(|c| if c == "default" { None } else { Some(PathBuf::from(c)) });
     j.flat_bypass = common.flat_bypass;
     j.pipeline.tiers = 1 + j.cascade_model.is_some() as usize + j.flat_bypass as usize;
