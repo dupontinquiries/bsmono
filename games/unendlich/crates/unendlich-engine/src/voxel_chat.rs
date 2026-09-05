@@ -62,8 +62,11 @@ impl Paintbrush {
         let mut chatbox = ChatBox::new();
         // Tab-complete model names from the first scan.
         chatbox.set_dynamic_args("/model", models.models.iter().map(|m| m.name.clone()).collect());
+        log::info!("[paintbrush] scanned {} .gguf in {}",
+                   models.models.len(), models.dir.display());
         let mut log = Vec::new();
-        log.push(models.state.message());
+        log.push(format!("{} models in {}", models.models.len(), models.dir.display()));
+        log.push("Enter to chat. Try: /build debug a tower".into());
         Self {
             chatbox,
             session: ChatSession::new(chunk_size, 200),
@@ -114,10 +117,26 @@ impl Paintbrush {
 
     /// Route a parsed command. Returns work for the caller.
     pub fn dispatch(&mut self, cm: &ChunkManager, gaze: &Gaze, cmd: Command) -> Pending {
+        // Trace every command. The first field session produced 14k lines
+        // of log with not one mention of the paintbrush, because every
+        // message went to the in-game chat panel and nothing to `log`.
+        // A feature you cannot diagnose from a log is a feature you
+        // cannot support.
+        log::info!("[paintbrush] dispatch {:?} (chat_open={})", cmd, self.chatbox.open);
         match cmd {
             Command::Build(prose) => {
-                if !self.models.state.is_ready() {
-                    self.say("no model loaded -- /model to list, /model <name> to load");
+                // `/build debug ...` uses the fixture provider, which needs
+                // no weights at all -- gating it on a loaded model defeated
+                // the one command whose job is to prove the pipeline works
+                // before you have a model. It reported "no model loaded"
+                // and stopped, which is exactly what "nothing happened"
+                // looks like from the outside.
+                let is_debug = prose.trim_start().starts_with("debug");
+                log::info!("[paintbrush] /build debug={} ready={} prose={:?}",
+                           is_debug, self.models.state.is_ready(), prose);
+                if !is_debug && !self.models.state.is_ready() {
+                    self.say("no model loaded -- /model to list, /model <name> to load, \
+                              or /build debug <anything> to test without one");
                     return Pending::None;
                 }
                 Pending::Model(prose)
@@ -154,16 +173,27 @@ impl Paintbrush {
                 self.push(r);
                 Pending::None
             }
-            Command::Model(None) => { let l = self.models.listing(); self.say(l); Pending::None }
+            Command::Model(None) => {
+                log::info!("[paintbrush] /model list: {} models in {}",
+                           self.models.models.len(), self.models.dir.display());
+                let l = self.models.listing();
+                self.say(l);
+                Pending::None
+            }
             Command::Model(Some(name)) => match self.models.begin_load(&name) {
                 Ok(m) => {
                     let path = m.path.clone();
+                    log::info!("[paintbrush] loading model {}", path.display());
                     let msg = self.models.state.message();
                     self.say(msg);
                     self.load_started = Some(Instant::now());
                     Pending::LoadModel(path)
                 }
-                Err(e) => { self.say(e); Pending::None }
+                Err(e) => {
+                    log::warn!("[paintbrush] /model {name:?} failed: {e}");
+                    self.say(e);
+                    Pending::None
+                }
             },
             _ => Pending::None,     // not ours; the game's existing arms handle it
         }
@@ -173,6 +203,8 @@ impl Paintbrush {
     pub fn finish_turn(&mut self, cm: &ChunkManager, gaze: &Gaze, raw: &str,
                        player_feet: Option<(i32, i32, i32)>) {
         let ir = voxel_tools::llm::clean_reply(raw);
+        log::info!("[paintbrush] provider returned {} chars -> {} plan lines",
+                   raw.len(), ir.lines().count());
         if ir.trim().is_empty() {
             self.say(format!("the model replied ({} chars) but produced no plan lines", raw.len()));
             return;
@@ -208,6 +240,7 @@ impl Paintbrush {
         }
         let touched = staged.chunks_touched(self.chunk_size);
         let n = staged.pending();
+        log::info!("[paintbrush] commit: {n} blocks across {touched} chunk(s)");
         self.flush_staged(cm, &mut staged);
         if n > 0 {
             self.reveal = self.session.reveal(25);
@@ -221,6 +254,7 @@ impl Paintbrush {
     fn flush_staged(&mut self, cm: &ChunkManager, staged: &mut StagedWorld<'_, WorldView<'_>>) {
         if staged.pending() == 0 { return; }
         let (applied, skipped, _chunks) = flush(cm, staged, self.chunk_size);
+        log::info!("[paintbrush] flush: applied={applied} skipped={skipped}");
         if skipped > 0 {
             self.say(format!("{skipped} block(s) skipped (chunk not loaded)"));
         }

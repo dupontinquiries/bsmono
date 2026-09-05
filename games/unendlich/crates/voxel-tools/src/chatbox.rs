@@ -192,6 +192,18 @@ impl ChatBox {
             Key::PageUp => Action::FocusBigger,
             Key::PageDown => Action::FocusSmaller,
             Key::Tab | Key::ShiftTab => {
+                // A cycle of one whose only candidate is already in the
+                // buffer is exhausted: recompute so the NEXT level of
+                // completion appears. Without this, `/model` + Tab
+                // completed the verb to `/model ` and every further Tab
+                // did nothing at all -- the completion looked broken at
+                // exactly the moment a player first reaches for it.
+                if self.comp_pos.is_some()
+                    && self.completions.len() <= 1
+                    && self.completions.first().map(|(s, _)| s.as_str()) == Some(self.buffer.as_str())
+                {
+                    self.reset_cycle();
+                }
                 if self.comp_pos.is_none() {
                     self.completions = self.complete_all();
                     if self.completions.is_empty() { return Action::Nothing; }
@@ -249,9 +261,19 @@ impl ChatBox {
             if let Some((_, values)) = self.dynamic_args.iter().find(|(v, _)| *v == verb) {
                 if let Some(card) = card_for(verb) {
                     let a = arg.trim_start().to_lowercase();
-                    out.extend(values.iter()
-                        .filter(|v| a.is_empty() || v.to_lowercase().contains(&a))
-                        .map(|v| (format!("{verb} {v}"), card)));
+                    // Prefix matches first, then substring -- the same rule
+                    // `ModelRegistry::complete` uses. Plain substring put
+                    // `Falcon-H1-Tiny` ahead of every Llama for the input
+                    // "l", because "Falcon" contains an l. People type the
+                    // start of the name they mean.
+                    let (mut pre, mut sub) = (Vec::new(), Vec::new());
+                    for v in values {
+                        let lv = v.to_lowercase();
+                        if a.is_empty() || lv.starts_with(&a) { pre.push(v); }
+                        else if lv.contains(&a) { sub.push(v); }
+                    }
+                    pre.extend(sub);
+                    out.extend(pre.into_iter().map(|v| (format!("{verb} {v}"), card)));
                 }
             }
         }
@@ -378,5 +400,32 @@ mod tests {
         type_str(&mut b2, "/model 3b");
         b2.key(Key::Tab);
         assert!(b2.buffer.contains("llama-3.2-3b"), "{}", b2.buffer);
+    }
+
+    #[test]
+    fn tab_does_not_stall_after_completing_a_verb() {
+        let mut b = ChatBox::new();
+        b.set_dynamic_args("/model", vec!["alpha-7b".into(), "beta-3b".into()]);
+        b.key(Key::Enter);
+        type_str(&mut b, "/model");
+        b.key(Key::Tab);
+        assert_eq!(b.buffer, "/model ", "first Tab completes the verb");
+        b.key(Key::Tab);
+        assert_eq!(b.buffer, "/model alpha-7b", "second Tab must offer arguments");
+        b.key(Key::Tab);
+        assert_eq!(b.buffer, "/model beta-3b", "and keep cycling");
+    }
+
+    #[test]
+    fn dynamic_completion_prefers_the_prefix() {
+        let mut b = ChatBox::new();
+        // "Falcon" contains an l; "Llama" starts with one
+        b.set_dynamic_args("/model", vec![
+            "Falcon-H1-Tiny-90M".into(), "Llama-3.2-1B-Instruct".into()]);
+        b.key(Key::Enter);
+        type_str(&mut b, "/model l");
+        b.key(Key::Tab);
+        assert_eq!(b.buffer, "/model Llama-3.2-1B-Instruct",
+                   "a prefix match must beat an incidental substring");
     }
 }
