@@ -8,6 +8,16 @@ mod focusguard;
 use stubs::ChunkManager;
 use bind::{flush, WorldView};
 use voxel_tools::staged::StagedWorld;
+/// The frame loop's polling, condensed: wait for the drone's dry run.
+fn settle(pb: &mut paintbrush::Paintbrush) {
+    let t0 = std::time::Instant::now();
+    while pb.drone.is_some() {
+        pb.poll_drone();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(t0.elapsed().as_secs() < 30, "drone never returned");
+    }
+}
+
 fn main() {
     scenario();
     focus_scenario();
@@ -75,8 +85,10 @@ fn scenario() {
     let (sys, user) = pb.prompt_for(&cm, &gaze, Some("grass"), &prose);
     assert!(sys.contains("BUILD IN PASSES") && user.contains("READ FIRST"));
     let raw = llm.complete(&sys, &user).unwrap();
-    // back on the frame thread
+    // back on the frame thread: the dry run now runs on a DRONE, and
+    // the frame collects it when it lands
     pb.finish_turn(&cm, &gaze, &raw, feet);
+    settle(&mut pb);
     for l in pb.drain_log() { println!("  {}", l.lines().next().unwrap_or("")); }
 
     println!("\n== /commit");
@@ -100,6 +112,7 @@ fn scenario() {
     println!("  pass inferred: detail, referent present");
     let raw = llm.complete(&sys, &user).unwrap();
     pb.finish_turn(&cm, &gaze, &raw, feet);
+    settle(&mut pb);
     let cmd = type_line(&mut pb, "/commit").unwrap();
     pb.dispatch(&cm, &gaze, cmd);
     for l in pb.drain_log() { println!("  {}", l.lines().next().unwrap_or("")); }
@@ -267,7 +280,7 @@ fn macro_scenario() {
     let cmd = line(&mut pb, "/build a base").unwrap();
     if let Pending::Model(p) = pb.dispatch(&cm, &gaze, cmd) {
         pb.start_turn(&cm, &gaze, None, &p, feet);
-        while pb.in_flight.is_some() { pb.poll_turn(&cm); std::thread::sleep(std::time::Duration::from_millis(10)); }
+        while pb.in_flight.is_some() || pb.drone.is_some() { pb.poll_turn(&cm); pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(10)); }
     }
     let cmd = line(&mut pb, "/commit").unwrap();
     pb.dispatch(&cm, &gaze, cmd);

@@ -29,6 +29,19 @@ use voxel_tools::VoxelWorld;
 /// nowhere — it exists so `StagedWorld` has something to read from.
 pub struct WorldView<'a>(pub &'a ChunkManager);
 
+/// The world as a DRONE sees it: an owned, Send read handle. Writes
+/// are refused -- a drone stages into a StagedWorld layered over this,
+/// and the queen applies the result on the frame thread.
+pub struct DroneWorld(pub crate::world::chunk_manager::DroneView);
+
+impl VoxelWorld for DroneWorld {
+    fn get(&self, x: i32, y: i32, z: i32) -> u16 {
+        self.0.block_at(x, y, z) as u8 as u16
+    }
+    fn set(&mut self, _x: i32, _y: i32, _z: i32, _b: u16) -> bool { false }
+    fn y_bounds(&self) -> (i32, i32) { (-4096, 8192) }
+}
+
 impl<'a> VoxelWorld for WorldView<'a> {
     fn get(&self, x: i32, y: i32, z: i32) -> u16 {
         self.0.block_at(x, y, z) as u16

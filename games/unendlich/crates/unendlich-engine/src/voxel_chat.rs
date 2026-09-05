@@ -230,6 +230,26 @@ impl ProviderChoice {
 /// reply when it arrives. The engine handle is `Send + Sync` (aperture
 /// requires it of every `Backend`), so the worker can hold a clone
 /// while the frame thread keeps drawing.
+/// A DRONE in flight: the dry run of a reply, off the frame thread.
+///
+/// The model call was already off-thread. The dry run that followed it
+/// -- parse, validate, and simulate every op against the world -- ran
+/// on the frame, and for a landscape plan that is the whole brush and
+/// layer computation: hundreds of thousands of cell writes into a
+/// staging map, inside one frame. The drone does that against an owned
+/// read view of the chunk store and sends back the session state it
+/// produced; the frame thread swaps it in, which is a move.
+pub struct Drone {
+    rx: std::sync::mpsc::Receiver<(voxel_tools::chat::ChatSession, Vec<Reply>)>,
+    pub started: Instant,
+}
+
+impl Drone {
+    pub fn poll(&self) -> Option<(voxel_tools::chat::ChatSession, Vec<Reply>)> {
+        self.rx.try_recv().ok()
+    }
+}
+
 pub struct PendingTurn {
     rx: std::sync::mpsc::Receiver<Result<String, String>>,
     pub started: Instant,
@@ -362,6 +382,9 @@ pub struct Paintbrush {
     /// Where the player was last frame, for the comb's priorities and
     /// for noticing when they have moved enough to re-sort.
     obs_cache: Option<voxel_tools::hive::Observer>,
+    /// A dry run in flight on a drone. At most one: a second reply
+    /// while one is being simulated waits its turn.
+    pub drone: Option<Drone>,
     /// The resident in-instance engine, if one has been loaded.
     #[cfg(feature = "ai-engine")]
     pub engine: ResidentEngine,
@@ -408,6 +431,7 @@ impl Paintbrush {
             #[cfg(feature = "ai-engine")]
             engine: ResidentEngine::default(),
             in_flight: None,
+            drone: None,
             land: voxel_tools::land::Registry::new(),
             comb: voxel_tools::hive::Comb::new(chunk_size),
             queen: voxel_tools::hive::Queen::new(voxel_tools::hive::Budget::default()),
@@ -722,14 +746,42 @@ impl Paintbrush {
             self.say(format!("the model replied ({} chars) but produced no plan lines", raw.len()));
             return;
         }
-        let view = WorldView(cm);
-        let mut staged = StagedWorld::new(&view);
-        let mut tools = VoxelTools::new(&mut staged);
-        let r = self.session.receive_plan_for(&mut tools, gaze, &ir, player_feet);
-        self.push(r);
-        // A preview must leave nothing staged: receive_plan_for reverses
-        // its own dry run, so this is an assertion, not a cleanup.
-        debug_assert_eq!(staged.pending(), 0, "preview must not stage writes");
+        // Hand the dry run to a DRONE. A clone of the session carries
+        // everything the simulation reads (focus, climate, last build,
+        // budget); it comes back with the pending plan set, and the
+        // frame thread swaps that state in. The session is small; the
+        // clone is cheap. The world is read through an owned view of the
+        // chunk store, so nothing here borrows the frame.
+        let session = self.session.clone();
+        let drone_world = crate::voxel_bind::DroneWorld(cm.drone_view());
+        let gaze = *gaze;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new().name("paintbrush-drone".into()).spawn(move || {
+            let mut session = session;
+            let mut staged = StagedWorld::new(&drone_world);
+            let mut tools = VoxelTools::new(&mut staged);
+            let r = session.receive_plan_for(&mut tools, &gaze, &ir, player_feet);
+            debug_assert_eq!(staged.pending(), 0, "preview must not stage writes");
+            let _ = tx.send((session, vec![r]));
+        }).expect("spawn drone");
+        self.drone = Some(Drone { rx, started: Instant::now() });
+        self.say("simulating the plan ... (the world keeps running)");
+    }
+
+    /// Collect a finished drone: swap in the session state it produced
+    /// and show its reply. Call every frame; cheap when nothing is
+    /// flying.
+    pub fn poll_drone(&mut self) {
+        let Some(d) = &self.drone else { return };
+        let Some((session, replies)) = d.poll() else { return };
+        let took = self.drone.take().map(|d| d.started.elapsed()).unwrap_or_default();
+        log::info!("[paintbrush] drone finished in {:.0} ms", took.as_secs_f32() * 1000.0);
+        // Only the fields the dry run produces move over. Anything the
+        // frame changed meanwhile -- climate, deferred cells, the land
+        // registry -- stays as it is now.
+        self.session.pending = session.pending;
+        self.session.last_salvage = session.last_salvage;
+        for r in replies { self.push(r); }
     }
 
     /// Start a turn on a worker thread. Returns immediately.

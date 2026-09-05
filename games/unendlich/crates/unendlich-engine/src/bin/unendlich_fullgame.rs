@@ -4485,6 +4485,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             // A reply can land on any frame, including with the box shut.
             paintbrush.poll_turn(&chunk_manager);
+            paintbrush.poll_drone();
             // Blocks deferred by an earlier flush place themselves once
             // their chunk streams in.
             paintbrush.retry_deferred(&chunk_manager);

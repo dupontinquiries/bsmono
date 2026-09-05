@@ -240,6 +240,27 @@ fn select_evictions(mut candidates: Vec<(ChunkCoord, i32)>, budget: usize) -> Ve
     candidates.into_iter().map(|(c, _)| c).collect()
 }
 
+/// A read-only, `Send` view of the chunk store for off-thread work.
+/// Reads see whatever the map holds at the moment of the read, which
+/// is the same guarantee `block_at` gives the frame thread.
+#[derive(Clone)]
+pub struct DroneView {
+    chunks: Arc<DashMap<ChunkCoord, Arc<Chunk>>>,
+}
+
+impl DroneView {
+    pub fn block_at(&self, world_x: i32, world_y: i32, world_z: i32) -> BlockId {
+        let coord = block_to_chunk(world_x, world_y, world_z);
+        let lx = world_x.rem_euclid(CHUNK_SIZE);
+        let ly = world_y.rem_euclid(CHUNK_SIZE);
+        let lz = world_z.rem_euclid(CHUNK_SIZE);
+        match self.chunks.get(&coord) {
+            Some(chunk) => chunk.get(lx, ly, lz),
+            None => BlockId::Air,
+        }
+    }
+}
+
 pub struct ChunkManager {
     chunks: Arc<DashMap<ChunkCoord, Arc<Chunk>>>,
     /// v0.24.23 propagation: parallel map of GPU-resident-style sparse
@@ -2268,6 +2289,13 @@ impl ChunkManager {
     /// Direct read access to the chunks DashMap. Use sparingly — most
     /// callers want `block_at` or similar instead. Useful for debug
     /// overlays or systems that need to iterate loaded chunks.
+    /// An OWNED handle to the chunk store, for reading the world from
+    /// another thread. The map is already an Arc; this clones the Arc,
+    /// not the chunks. A drone holds one and never touches the frame.
+    pub fn drone_view(&self) -> DroneView {
+        DroneView { chunks: Arc::clone(&self.chunks) }
+    }
+
     pub fn chunks_arc(&self) -> &dashmap::DashMap<ChunkCoord, Arc<Chunk>> {
         &self.chunks
     }

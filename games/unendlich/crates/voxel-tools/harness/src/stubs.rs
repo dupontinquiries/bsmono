@@ -14,9 +14,18 @@ impl TryFrom<u8> for BlockId {
     }
 }
 /// `set_block`/`set_blocks` take &self: interior mutability via DashMap.
-pub struct ChunkManager { cells: Mutex<HashMap<(i32,i32,i32), BlockId>> }
+pub struct ChunkManager { cells: std::sync::Arc<Mutex<HashMap<(i32,i32,i32), BlockId>>> }
+#[derive(Clone)]
+pub struct DroneView(std::sync::Arc<Mutex<HashMap<(i32,i32,i32), BlockId>>>);
+impl DroneView {
+    pub fn block_at(&self, x: i32, y: i32, z: i32) -> BlockId {
+        self.0.lock().unwrap().get(&(x,y,z)).copied()
+            .unwrap_or(if y <= 64 { BlockId::Stone } else { BlockId::Air })
+    }
+}
 impl ChunkManager {
-    pub fn new() -> Self { Self { cells: Mutex::new(HashMap::new()) } }
+    pub fn new() -> Self { Self { cells: std::sync::Arc::new(Mutex::new(HashMap::new())) } }
+    pub fn drone_view(&self) -> DroneView { DroneView(std::sync::Arc::clone(&self.cells)) }
     pub fn block_at(&self, x: i32, y: i32, z: i32) -> BlockId {
         self.cells.lock().unwrap().get(&(x,y,z)).copied()
             .unwrap_or(if y <= 64 { BlockId::Stone } else { BlockId::Air })

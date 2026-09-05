@@ -72,7 +72,7 @@ pub enum Reply {
 }
 
 #[derive(Debug, Clone)]
-struct Pending {
+pub struct Pending {
     plan: BuildPlan,
     feature_id: String,
     predicted_blocks: usize,
@@ -92,7 +92,7 @@ pub struct LastBuild {
     pub palette_hint: Option<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ChatSession {
     /// Climate at the build site, supplied by the engine each turn.
     /// Defaults to temperate; a game that never sets it behaves exactly
@@ -106,7 +106,8 @@ pub struct ChatSession {
     /// How far the terrain read looks. Bigger is more context and more
     /// tokens; 24 covers a village-sized decision.
     pub scene_radius: i32,
-    pending: Option<Pending>,
+    /// Public so a drone-produced session can hand it back to the live one.
+    pub pending: Option<Pending>,
     /// Edit ids of the last committed plan, within one VoxelTools.
     last_commit: Vec<u64>,
     /// The inverse of the last commit: (x, y, z, previous block).
