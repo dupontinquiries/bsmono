@@ -124,3 +124,16 @@ path = "src/bin/scene-critique.rs"
 name = "status-view"
 path = "src/bin/status-view.rs"
 required-features = ["gpu-scene"]
+
+# Two bins that were auto-discovered with no [[bin]] entry, so no `required-features`, so
+# `--no-default-features` tried to build them against a lib that (correctly) has no `app`,
+# `tabs`, `model` or `analysis` without `gui`. Same shape as mic-pearl-view above.
+[[bin]]
+name = "panels-view"
+path = "src/bin/panels-view.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "shell-view"
+path = "src/bin/shell-view.rs"
+required-features = ["gui"]

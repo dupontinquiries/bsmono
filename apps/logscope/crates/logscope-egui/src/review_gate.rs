@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn the_baseline_round_trips_through_the_checkout() {
-        let dir = std::env::temp_dir().join("logscope-baseline-test");
+        let dir = std::env::temp_dir().join(format!("logscope-baseline-test-{}", std::process::id())); // per-process: two suites may run at once
         let _ = std::fs::remove_dir_all(&dir);
         assert!(read_baseline(&dir).is_none(), "no marker = nothing reviewed");
         write_baseline(&dir, "  deadbeef\n").expect("write");

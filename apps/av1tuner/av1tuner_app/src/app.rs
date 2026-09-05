@@ -1538,6 +1538,10 @@ impl App {
 }
 
 impl eframe::App for App {
+    // eframe 0.34 made `ui` the required method and kept `update` as the override that
+    // owns panels. Same shape as voiceterm-egui's impl: `update` is the app, `ui` is empty.
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_pending_probe();
         self.poll_pending_compare();
@@ -1733,7 +1737,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Resolution policy:");
             let current = self.groups[idx].resolution_policy;
-            egui::ComboBox::from_id_source("respolicy")
+            egui::ComboBox::from_id_salt("respolicy")
                 .selected_text(current.label())
                 .show_ui(ui, |ui| {
                     use av1tuner_core::ResolutionPolicy as RP;
@@ -2068,7 +2072,7 @@ impl App {
             // Sample length slider — kept compact since it's a sub-control.
             ui.add(egui::Slider::new(&mut self.compare_sample_seconds, 2.0..=30.0)
                 .text("sample length (s)")
-                .clamp_to_range(true));
+                .clamping(egui::SliderClamping::Always));
         });
         
         // Prediction analysis row (Phase 0 measurement).
@@ -2097,7 +2101,7 @@ impl App {
             }
             ui.add(egui::Slider::new(&mut self.prediction_sample_seconds, 5.0..=60.0)
                 .text("sample length (s)")
-                .clamp_to_range(true));
+                .clamping(egui::SliderClamping::Always));
         });
         
         // Probing banner.

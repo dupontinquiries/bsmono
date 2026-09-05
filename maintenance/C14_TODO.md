@@ -1389,6 +1389,22 @@ fixes: all but one need the hardware or the host.
   DISABLED" is in the log, so the Asahi driver is in play. A device
   observation, needs the device.
 
+### Fixed after §25 was written (same session, commit after this one)
+
+| what | root cause | fix | verified |
+|---|---|---|---|
+| `compile_grades_real_code` | **`rustc --emit=metadata -o /dev/null` makes its atomic-write scratch dir NEXT TO the output — `/dev/rmetaXXXX` — which only root can create.** The sandbox is root; the device is not. Reproduced as `nobody`. | `verdict::compile()` runs the checker in a per-call scratch dir; `DEFAULT_CHECK` drops `-o /dev/null` | 440 fan tests as root; verdict tests as an unprivileged user |
+| the three VmHWM tests | process-wide high-water mark + parallel test threads | each re-execs the test binary `--exact <self> --test-threads=1` and measures in the child | pass; broken on purpose with a 64 MiB hog → reports 65 MiB |
+| `sandbox::a_FROZEN_posture…` | fixed temp-dir names shared by the two concurrent fleet runs | per-process suffix (4 dirs across sandbox/review_gate/workspace) | pass, lean |
+| `logscope-egui --no-default-features` | `runcard`/`nodelabel` gui-gated but pure; `panels-view`/`shell-view` auto-discovered bins with no `required-features` | ungated both; `[[bin]]` entries with `required-features = ["gui"]` | lean, lean+wgpu-engine, default all check |
+| av1tuner `id_salt` | lone egui 0.28 pin in a 0.34 tree | 0.34; empty `fn ui` per the 0.34 `App` trait (voiceterm-egui's shape); `from_id_salt`; `SliderClamping::Always` | check clean, 97 tests |
+| web2qml `LocalKey::load` | `TABLE_COUNTER` is a `thread_local! Cell`, not an atomic; never compiled | `.get()`; also a doubled `#[test]` in link_graph.rs | **not built here (Qt)**; API proven standalone |
+| bo-suite `speaker_calibration` | global registry + `XDG_DATA_HOME` mutated by 10 parallel tests | `static Mutex<()>` in `with_isolated_xdg` | **not built here (Qt)**; exclusion proven standalone, 8 threads |
+| bot-arena ×2 | `CODEBOT_ARENA_HOME` mutated by 7 tests; `engine::env_test_lock` existed and four tests did not take it | they take it | **not built here (GTK)** |
+| rusty-board | host lacks the layer-shell dev package; the crate's `wayland` feature already gates it | none — `dnf install gtk4-layer-shell-devel` (Debian: `libgtk4-layer-shell-dev`) | — |
+
+Still needing the device: gpu-gemm `window_batching` (Asahi driver), aperture LSP e2e ×2 (rust-analyzer present but silent for 15 s), the doctest `E0463`s.
+
 ### Found while attributing, not a test failure
 
 * **`logscope-egui --no-default-features` does not compile**, and did not at

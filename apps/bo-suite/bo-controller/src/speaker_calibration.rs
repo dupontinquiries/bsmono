@@ -275,7 +275,17 @@ pub fn best_estimate_round_trip(speaker_id: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
+    /// One test at a time through here. The registry is a process global and `XDG_DATA_HOME`
+    /// is process state, so two of these tests on two threads interleave: A clears the global
+    /// and sets XDG to its dir, B records "X" into whatever XDG is current, A's `lookup("X")`
+    /// finds B's sample. Never seen on one core, where the harness serialises by accident;
+    /// the device's 24 cores hit it (`non_finite_correlation_rejected` in the c15 fleet run,
+    /// `label_updates_on_subsequent_calibration_if_empty` in C14_TODO §21 — same cause).
+    /// Poisoning is ignored on purpose: a test that panicked has not left the lock in a state
+    /// the NEXT test cares about, since the next test resets the global anyway.
     fn with_isolated_xdg<F: FnOnce()>(label: &str, f: F) {
+        static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!(
             "bo-spk-cal-test-{}-{}", label,
             std::time::SystemTime::now()

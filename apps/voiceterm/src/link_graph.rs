@@ -488,7 +488,6 @@ mod tests {
     // points at "You") tours from the hub outward. This is "graph walkthrough
     // email integration" exercised end-to-end on the real DSL format.
     #[test]
-    #[test]
     fn from_niftyplot_inbox_graph_walks_from_you() {
         let src = "%kind: graph\n%title: \"Inbox senders\"\n\
                    You: circle \"You\"\n\

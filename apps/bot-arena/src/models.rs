@@ -324,6 +324,7 @@ mod tests {
     use super::*;
     #[test]
     fn registry_scans_gguf_and_local() {
+        let _g = crate::engine::env_test_lock().lock().unwrap_or_else(|e| e.into_inner()); // serialises CODEBOT_ARENA_HOME mutation across tests
         let tmp = std::env::temp_dir().join(format!("mreg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("CODEBOT_ARENA_HOME", &tmp);
@@ -375,6 +376,7 @@ mod tests {
 
     #[test]
     fn delete_local_removes_cached_model() {
+        let _g = crate::engine::env_test_lock().lock().unwrap_or_else(|e| e.into_inner()); // serialises CODEBOT_ARENA_HOME mutation across tests
         let tmp = std::env::temp_dir().join(format!("mdel-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("CODEBOT_ARENA_HOME", &tmp);
@@ -406,6 +408,7 @@ mod tests {
 
     #[test]
     fn download_gguf_lands_in_registry() {
+        let _g = crate::engine::env_test_lock().lock().unwrap_or_else(|e| e.into_inner()); // serialises CODEBOT_ARENA_HOME mutation across tests
         // HF is unreachable in CI/sandbox; exercise the curl plumbing against an allowed
         // domain. Skips (does not fail) if there is no network, so the suite stays green.
         let tmp = std::env::temp_dir().join(format!("dl-{}", std::process::id()));

@@ -5618,6 +5618,55 @@ mod long_horizon_tests {
             .unwrap_or(0)
     }
 
+    /// What a peak-RSS probe hands back: the tool's result when this process IS the isolated
+    /// child, or the child's measured growth when it is the parent that spawned one.
+    enum Probe { Child(ToolResult), Parent { grew_kib: u64 } }
+
+    /// Measure peak-RSS growth of ONE tool call ALONE IN A CHILD PROCESS.
+    ///
+    /// `VmHWM` is process-wide and `cargo test` runs tests on parallel threads, so measured in
+    /// place the number is "whatever every other test allocated during this window". On one core
+    /// that is nothing and the three probes below passed for months; on the 24-core device they
+    /// failed by 51 MiB with `read_range` untouched (C14_TODO §21, §25). The read was never the
+    /// thing growing.
+    ///
+    /// So the probe re-executes this very test binary filtered to this one test
+    /// (`--exact … --test-threads=1`) with the fixture root in `LOGSCOPE_RSS_PROBE`. The child
+    /// takes the measurement with nothing else running, prints it, and runs the test's own
+    /// content assertions; the parent asserts on the number and on the child's exit status.
+    /// Deterministic on any core count, and the only interface between the two is one line of
+    /// stdout.
+    fn probe_alone(test: &str, setup: impl FnOnce() -> PathBuf,
+                   run: impl FnOnce(&mut Workspace) -> ToolResult) -> Probe {
+        if let Some(root) = std::env::var_os("LOGSCOPE_RSS_PROBE") {
+            let mut ws = Workspace::new(Path::new(&root));
+            let before = peak_rss_kib();
+            let r = run(&mut ws);
+            let after = peak_rss_kib();
+            println!("RSS_GREW_KIB={}", after.saturating_sub(before));
+            return Probe::Child(r);
+        }
+        let root = setup();
+        // `module_path!()` is `<crate>::workspace_exec::long_horizon_tests`; libtest filters
+        // want it without the crate.
+        let here = module_path!();
+        let path = here.splitn(2, "::").nth(1).unwrap_or(here);
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args(["--exact", &format!("{path}::{test}"), "--nocapture", "--test-threads=1"])
+            .env("LOGSCOPE_RSS_PROBE", &root)
+            .output().expect("re-exec the test binary as an isolated probe");
+        let _ = std::fs::remove_dir_all(&root);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "isolated probe failed:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        // libtest prints `test <name> ... ` with no newline before the test runs, so the marker
+        // lands mid-line: find it, don't anchor it.
+        let grew_kib = stdout.lines().find_map(|l| l.find("RSS_GREW_KIB=").map(|i| &l[i + "RSS_GREW_KIB=".len()..]))
+            .and_then(|n| n.split_whitespace().next().and_then(|n| n.parse().ok()))
+            .unwrap_or_else(|| panic!("probe child printed no RSS_GREW_KIB line:\n{stdout}"));
+        Probe::Parent { grew_kib }
+    }
+
     /// Write a file of `mib` MiB of plausible source text.
     fn big_file(path: &Path, mib: usize) {
         use std::io::Write;
@@ -5635,36 +5684,39 @@ mod long_horizon_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn reading_a_huge_file_does_not_allocate_it() {
-        let d = tmp("bigread");
-        let f = d.join("src/huge.rs");
-        big_file(&f, 256);
-        let mut ws = Workspace::new(&d);
-        let before = peak_rss_kib();
-        let r = ws.apply(&Tool::ReadFile { path: "src/huge.rs".into() });
-        let after = peak_rss_kib();
-        assert!(r.ok, "{}", r.output);
-        assert!(r.output.len() < 200 * 1024, "output is capped: {} B", r.output.len());
-        assert!(r.output.contains("truncated at"), "and says so: {}", &r.output[r.output.len().saturating_sub(200)..]);
-        let grew_mib = (after.saturating_sub(before)) / 1024;
-        assert!(grew_mib < 16, "reading a 256 MiB file grew peak RSS by {grew_mib} MiB");
-        let _ = std::fs::remove_dir_all(&d);
+        match probe_alone("reading_a_huge_file_does_not_allocate_it",
+            || { let d = tmp("bigread"); big_file(&d.join("src/huge.rs"), 256); d },
+            |ws| ws.apply(&Tool::ReadFile { path: "src/huge.rs".into() }))
+        {
+            Probe::Child(r) => {
+                assert!(r.ok, "{}", r.output);
+                assert!(r.output.len() < 200 * 1024, "output is capped: {} B", r.output.len());
+                assert!(r.output.contains("truncated at"), "and says so: {}", &r.output[r.output.len().saturating_sub(200)..]);
+            }
+            Probe::Parent { grew_kib } => {
+                let grew_mib = grew_kib / 1024;
+                assert!(grew_mib < 16, "reading a 256 MiB file grew peak RSS by {grew_mib} MiB");
+            }
+        }
     }
 
     /// Same for a range read, which had the same whole-file allocation to return sixty lines.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_range_read_of_a_huge_file_does_not_allocate_it() {
-        let d = tmp("bigrange");
-        big_file(&d.join("src/huge.rs"), 256);
-        let mut ws = Workspace::new(&d);
-        let before = peak_rss_kib();
-        let r = ws.apply(&Tool::ReadRange { path: "src/huge.rs".into(), start: 10, end: 40 });
-        let after = peak_rss_kib();
-        assert!(r.ok, "{}", r.output);
-        assert!(r.output.contains("10: //") && r.output.contains("40: //"), "{}", r.output);
-        let grew_mib = (after.saturating_sub(before)) / 1024;
-        assert!(grew_mib < 16, "a 31-line range read of a 256 MiB file grew peak RSS by {grew_mib} MiB");
-        let _ = std::fs::remove_dir_all(&d);
+        match probe_alone("a_range_read_of_a_huge_file_does_not_allocate_it",
+            || { let d = tmp("bigrange"); big_file(&d.join("src/huge.rs"), 256); d },
+            |ws| ws.apply(&Tool::ReadRange { path: "src/huge.rs".into(), start: 10, end: 40 }))
+        {
+            Probe::Child(r) => {
+                assert!(r.ok, "{}", r.output);
+                assert!(r.output.contains("10: //") && r.output.contains("40: //"), "{}", r.output);
+            }
+            Probe::Parent { grew_kib } => {
+                let grew_mib = grew_kib / 1024;
+                assert!(grew_mib < 16, "a 31-line range read of a 256 MiB file grew peak RSS by {grew_mib} MiB");
+            }
+        }
     }
 
     /// Search was the worst of the three: read_to_string on EVERY file in the tree. One large blob
@@ -5672,22 +5724,28 @@ mod long_horizon_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn search_skips_the_blob_instead_of_inhaling_it() {
-        let d = tmp("bigsearch");
-        big_file(&d.join("src/huge.rs"), 256);
-        std::fs::write(d.join("src/small.rs"), "fn find_me() {}\n").unwrap();
-        // a binary that must not be scanned or reported as source
-        std::fs::write(d.join("src/weights.bin"), [0u8, 1, 2, 3].repeat(4096)).unwrap();
-        let mut ws = Workspace::new(&d);
-        let before = peak_rss_kib();
-        let r = ws.apply(&Tool::Search { pattern: "find_me".into(), path: String::new() });
-        let after = peak_rss_kib();
-        assert!(r.ok, "{}", r.output);
-        assert!(r.output.contains("src/small.rs:1"), "the small file is still searched: {}", r.output);
-        assert!(r.output.contains("over 2 MiB skipped"), "the blob is skipped and said so: {}", r.output);
-        assert!(r.output.contains("binary file(s) skipped"), "{}", r.output);
-        let grew_mib = (after.saturating_sub(before)) / 1024;
-        assert!(grew_mib < 16, "searching past a 256 MiB blob grew peak RSS by {grew_mib} MiB");
-        let _ = std::fs::remove_dir_all(&d);
+        match probe_alone("search_skips_the_blob_instead_of_inhaling_it",
+            || {
+                let d = tmp("bigsearch");
+                big_file(&d.join("src/huge.rs"), 256);
+                std::fs::write(d.join("src/small.rs"), "fn find_me() {}\n").unwrap();
+                // a binary that must not be scanned or reported as source
+                std::fs::write(d.join("src/weights.bin"), [0u8, 1, 2, 3].repeat(4096)).unwrap();
+                d
+            },
+            |ws| ws.apply(&Tool::Search { pattern: "find_me".into(), path: String::new() }))
+        {
+            Probe::Child(r) => {
+                assert!(r.ok, "{}", r.output);
+                assert!(r.output.contains("src/small.rs:1"), "the small file is still searched: {}", r.output);
+                assert!(r.output.contains("over 2 MiB skipped"), "the blob is skipped and said so: {}", r.output);
+                assert!(r.output.contains("binary file(s) skipped"), "{}", r.output);
+            }
+            Probe::Parent { grew_kib } => {
+                let grew_mib = grew_kib / 1024;
+                assert!(grew_mib < 16, "searching past a 256 MiB blob grew peak RSS by {grew_mib} MiB");
+            }
+        }
     }
 
     #[test]

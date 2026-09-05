@@ -465,7 +465,7 @@ mod tests {
                          ("dir/b.txt".to_string(), b"world!".to_vec())];
         let bytes = zip_store(&files);
         assert_eq!(&bytes[..4], &0x0403_4b50u32.to_le_bytes()); // PK\x03\x04
-        let path = std::env::temp_dir().join("logscope_zip_selftest.zip");
+        let path = std::env::temp_dir().join(format!("logscope_zip_selftest-{}.zip", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         if let Ok(o) = std::process::Command::new("unzip").arg("-t").arg(&path).output() {
             assert!(o.status.success(), "unzip -t failed: {}", String::from_utf8_lossy(&o.stderr));

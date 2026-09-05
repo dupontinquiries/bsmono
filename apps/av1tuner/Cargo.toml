@@ -34,8 +34,11 @@ env_logger = "0.11"
 # and glow (OpenGL fallback). User can pick at runtime via env var:
 #   AV1TUNER_RENDERER=glow ./av1tuner
 # Default is wgpu.
-eframe = { version = "0.28", default-features = false, features = ["default_fonts", "wgpu", "glow"] }
-egui = "0.28"
+# 0.34, like every other egui crate in this tree (36 of them). This was the lone 0.28 pin, and
+# app.rs was already written against 0.29+ (`TextEdit::id_salt`, six sites) — so the crate did
+# not compile at its own pin, which the c15 fleet run was the first to notice.
+eframe = { version = "0.34", default-features = false, features = ["default_fonts", "wgpu", "glow", "wayland", "x11"] }
+egui = "0.34"
 
 # Process management
 which = "6.0"

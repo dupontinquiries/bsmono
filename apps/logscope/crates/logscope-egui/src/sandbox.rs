@@ -443,7 +443,12 @@ mod tests {
         // the budget wins. Checked through the wrapper rather than by reading it, because the
         // whole failure mode of this gate is being written and never called.
         use crate::review_gate::Posture;
-        let dir = std::env::temp_dir().join("logscope-posture-test");
+        // PER-PROCESS. The fleet runs this crate's suite twice at once (default features and
+        // `+features`), and a shared `logscope-posture-test` made the two runs race on one
+        // checkout: one of them saw the other's half-written tree and graded CompileError while
+        // its sibling graded Pass, which read as the gate leaking network. It was the test
+        // sharing a directory, not the gate. Same pattern as `sbx_dir` above.
+        let dir = std::env::temp_dir().join(format!("logscope-posture-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         // A refusal (no bwrap here) or a real build both prove the routing; what must NOT happen is
         // the frozen run reaching the network, which shows up as a DIFFERENT verdict than offline.
@@ -478,7 +483,7 @@ mod tests {
             eprintln!("skipped: this machine CAN sandbox, so there is no refusal to observe");
             return;
         }
-        let dir = std::env::temp_dir().join("logscope-refuse-test");
+        let dir = std::env::temp_dir().join(format!("logscope-refuse-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let spec = VerifySpec::cargo_build(&dir);
         let res = verify(&spec).expect("verify returns a result, not an error");

@@ -55,16 +55,35 @@ pub fn extract_code(reply: &str) -> String {
 /// (rustc-style). Empty/whitespace code is None (nothing to grade), so it doesn't count against a branch.
 pub fn compile(code: &str, cmd: &str, file: Option<&str>) -> Verdict {
     if code.trim().is_empty() { return Verdict::None; }
-    let path = match file {
-        Some(f) => std::path::PathBuf::from(f),
-        None => std::env::temp_dir().join(format!("logscope_check_{}_{}.rs", std::process::id(), now_nanos())),
+    // A scratch DIRECTORY per call, not a scratch file: the checker's own outputs (rustc's
+    // `.rmeta`, its atomic-write temp dir) go here too, and one `remove_dir_all` cleans up
+    // whatever it left. Only when we own the source path — a caller-supplied `file` keeps the
+    // caller's cwd, since a relative `cmd`/`file` would otherwise stop resolving.
+    let scratch = match file {
+        Some(_) => None,
+        None => {
+            let d = std::env::temp_dir().join(format!("logscope_check_{}_{}", std::process::id(), now_nanos()));
+            if std::fs::create_dir_all(&d).is_err() { return Verdict::None; }
+            Some(d)
+        }
     };
-    if std::fs::write(&path, code).is_err() { return Verdict::None; }
+    let path = match (file, &scratch) {
+        (Some(f), _) => std::path::PathBuf::from(f),
+        (None, Some(d)) => d.join("check.rs"),
+        (None, None) => unreachable!(),
+    };
+    if std::fs::write(&path, code).is_err() {
+        if let Some(d) = &scratch { let _ = std::fs::remove_dir_all(d); }
+        return Verdict::None;
+    }
     let p = path.to_string_lossy().to_string();
     let full = if cmd.contains("{}") { cmd.replace("{}", &p) }
                else if file.is_some() { cmd.to_string() }
                else { format!("{cmd} {p}") };
-    let verdict = match Command::new("sh").arg("-c").arg(&full).output() {
+    let mut sh = Command::new("sh");
+    sh.arg("-c").arg(&full);
+    if let Some(d) = &scratch { sh.current_dir(d); }
+    let verdict = match sh.output() {
         Ok(o) if o.status.success() => Verdict::Pass,
         // Exit 127 is `sh`'s "command not found" — the checker binary itself is missing, not a
         // real compile failure. `sh -c` spawns fine either way, so this can't be caught by the
@@ -76,7 +95,7 @@ pub fn compile(code: &str, cmd: &str, file: Option<&str>) -> Verdict {
         Ok(_) => Verdict::Fail,
         Err(_) => Verdict::None, // couldn't spawn `sh` itself — don't fake a verdict
     };
-    if file.is_none() { let _ = std::fs::remove_file(&path); }
+    if let Some(d) = &scratch { let _ = std::fs::remove_dir_all(d); }
     verdict
 }
 
@@ -85,7 +104,12 @@ fn now_nanos() -> u128 {
 }
 
 /// The default snippet checker — compiles as a lib, no codegen, output discarded.
-pub const DEFAULT_CHECK: &str = "rustc --crate-type lib --edition 2021 --emit=metadata -o /dev/null";
+/// No `-o /dev/null`: since rustc started writing metadata atomically it makes its scratch dir
+/// NEXT TO the output path — `/dev/rmetaXXXX` — which only root may create. Root passed this
+/// check for months (every sandbox session runs as root); the operator's own device, running as
+/// a user, graded every real-code reply Fail. C14_TODO §21/§25. `compile()` now runs the
+/// checker inside a per-call scratch directory, so `--emit=metadata` lands its `.rmeta` there.
+pub const DEFAULT_CHECK: &str = "rustc --crate-type lib --edition 2021 --emit=metadata";
 
 #[cfg(test)]
 mod tests {

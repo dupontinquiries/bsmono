@@ -3010,7 +3010,7 @@ fn merge_versions(a: &str, b: &str, rng: &mut impl Rng) -> String {
 /// Tests that mutate the process-global CODEBOT_ARENA_HOME env var must not run
 /// concurrently or they stomp each other's paths. Serialize them on this lock.
 #[cfg(test)]
-fn env_test_lock() -> &'static std::sync::Mutex<()> {
+pub(crate) fn env_test_lock() -> &'static std::sync::Mutex<()> {
     static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     L.get_or_init(|| std::sync::Mutex::new(()))
 }
@@ -5211,6 +5211,10 @@ mod tests {
 
     #[test]
     fn experience_log_dedups_identical_fixes() {
+        // Sets CODEBOT_ARENA_HOME like the three tests above that already take this lock; this
+        // one did not, and on the 24-core device another test's remove_var landed between
+        // its set_var and its writes (C14_TODO §25).
+        let _g = super::env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("explog-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();

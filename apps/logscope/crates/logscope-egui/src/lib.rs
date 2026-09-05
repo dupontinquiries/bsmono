@@ -125,7 +125,10 @@ pub use logscope_fan::cmdpalette;
 #[cfg(feature = "gui")] pub mod roomtheme;
 #[cfg(feature = "gui")] pub mod prefs;      // the few choices that must survive a restart (via config-kit)
 #[cfg(feature = "gui")] pub mod sysstatus;  // the status light, derived from real signals — every one can veto
-#[cfg(feature = "gui")] pub mod runcard;    // the ACTIVE THREAD card: what the run is doing, as label/value rows
+// UNGATED: pure data (no `use` at all) and `workspace_exec` — which is ungated — builds its
+// `RunState`/`Doing` from it, so the gui gate made `--no-default-features` uncompilable from
+// d218468d5 on. Nothing built the lean configuration in between; the fleet builds defaults.
+pub mod runcard;    // the ACTIVE THREAD card: what the run is doing, as label/value rows
 #[cfg(feature = "gui")] pub mod chords;     // keyboard chords for the quick-action chips, with the collision rules as tests
 #[cfg(feature = "gui")] pub mod ctxcard;    // context-card facts: size line and a topic-match figure with its denominator
 #[cfg(feature = "gui")] pub mod context_probe;
@@ -134,7 +137,10 @@ pub use logscope_fan::cmdpalette;
 #[cfg(feature = "gui")] pub mod queen;
 #[cfg(feature = "gui")] pub mod relief_policy;
 #[cfg(feature = "gui")] pub mod noderole;   // what a node IS (root/fork/pruned/artifact…), for the label above its text
-#[cfg(feature = "gui")] pub mod nodelabel;  // node label text (word-safe elision) and which labels get drawn
+// UNGATED with runcard: `runcard::elide_task` reuses `nodelabel::elide_words` (deliberately, per
+// its comment — a fourth `elide` was the mistake dupscan caught). Its only crate import is
+// `spatial`, which is already ungated pure math.
+pub mod nodelabel;  // node label text (word-safe elision) and which labels get drawn
 #[cfg(feature = "gui")] pub mod navkeys;    // freecam movement keys by keyboard layout (QWERTY WASD / Dvorak .oeu)
 #[cfg(feature = "gui")] pub mod nodetint;   // graph node colours derived from the space, audited for distinguishability  // chrome DERIVED from the room you are standing in, with a legibility audit over all 16
 #[cfg(feature = "gui")] pub mod ui;

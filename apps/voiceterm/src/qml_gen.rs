@@ -3297,7 +3297,10 @@ fn ops_for_tid(tid: &str) -> Vec<crate::table_ops::TableOp> {
 /// the command bar to know whether to show itself and for
 /// disambiguation messaging.
 pub fn current_table_count() -> usize {
-    TABLE_COUNTER.load(std::sync::atomic::Ordering::Relaxed)
+    // `TABLE_COUNTER` is a thread-local `Cell`, not an atomic (see its declaration above); this
+    // was written as if it were, and never compiled — nothing built this bin in the fleet until
+    // the c15 run. `LocalKey<Cell<T>>::get` is the alloc-free read.
+    TABLE_COUNTER.get()
 }
 
 /// Below this width, the renderer switches to stacked-card mode.
