@@ -425,8 +425,10 @@ impl Dataset {
                 f.seek(SeekFrom::Start(offset as u64))?;
                 let mut buf = vec![0u8; frames * n_mels * 4];
                 f.read_exact(&mut buf)?;
-                owned = bytemuck_cast_slice(&buf).to_vec();
-                &owned
+                // Transposed straight out of the read buffer: the `.to_vec()`
+                // that used to sit here copied every disk crop a second time.
+                owned = buf;
+                bytemuck_cast_slice(&owned)
             }
         }; // (frames, n_mels)
 
@@ -444,9 +446,18 @@ impl Dataset {
     pub fn sample_batch(&self, batch: usize, dev: &Device) -> Result<Tensor> {
         let n_mels = self.n_mels;
         let frames = self.time_frames;
+        // The crops in parallel. With the cache on disk each crop is an
+        // open, a seek and a read, and a batch of 32 did them one after
+        // another on the training thread while the GPU waited; the cache
+        // BUILDER next to this has used rayon since the start. Crops are
+        // independent, so this is the same batch assembled by every core.
+        let crops: Vec<Vec<f32>> = (0..batch)
+            .into_par_iter()
+            .map(|_| self.random_crop())
+            .collect::<Result<_>>()?;
         let mut all = Vec::with_capacity(batch * n_mels * frames);
-        for _ in 0..batch {
-            all.extend_from_slice(&self.random_crop()?);
+        for c in &crops {
+            all.extend_from_slice(c);
         }
         let t = Tensor::from_vec(all, (batch, 1, n_mels, frames), dev)?;
         Ok(t)
@@ -530,6 +541,45 @@ fn trim_cache(cfg: &Config, live: &std::collections::HashSet<PathBuf>) -> Result
 
 #[cfg(test)]
 mod tests {
+
+    /// A batch from a DISK-backed cache: the parallel sampler assembles the
+    /// same (batch, 1, n_mels, frames) layout the serial one did, every crop
+    /// transposed to (mel, frame), and a resident clip gives the same bytes
+    /// as its file. Written through the cache format's own header.
+    #[test]
+    fn a_batch_from_disk_has_the_layout_and_the_values() {
+        let dir = std::env::temp_dir().join(format!("bs-sampler-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (n_mels, t, frames) = (4usize, 6usize, 3usize);
+        // (t, n_mels) row-major, value = frame*10 + mel, after a 12-byte header
+        let mut bytes = vec![0u8; 12];
+        let mut data = Vec::new();
+        for fr in 0..t { for m in 0..n_mels { data.push((fr * 10 + m) as f32); } }
+        bytes.extend_from_slice(bytemuck_cast(&data));
+        let path = dir.join("clip.mel");
+        std::fs::write(&path, &bytes).unwrap();
+        let ds = Dataset {
+            clips: vec![
+                ClipMeta { path: path.clone(), t, resident: None },
+                ClipMeta { path: path.clone(), t, resident: Some(std::sync::Arc::new(data.clone())) },
+            ],
+            n_mels, time_frames: frames,
+        };
+        let batch = 16;
+        let tens = ds.sample_batch(batch, &Device::Cpu).unwrap();
+        assert_eq!(tens.dims(), &[batch, 1, n_mels, frames]);
+        let v: Vec<f32> = tens.flatten_all().unwrap().to_vec1().unwrap();
+        for b in 0..batch {
+            let crop = &v[b * n_mels * frames..(b + 1) * n_mels * frames];
+            // out[m * frames + fr] = frame*10 + mel, for some start frame
+            let start = (crop[0] / 10.0) as usize;
+            for m in 0..n_mels { for fr in 0..frames {
+                assert_eq!(crop[m * frames + fr], ((start + fr) * 10 + m) as f32, "batch {b} mel {m} frame {fr}");
+            } }
+            assert!(start + frames <= t);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
 
     fn cfg_in(dir: &Path) -> Config {
