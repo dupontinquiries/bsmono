@@ -99,6 +99,44 @@ pub fn tint_height(m: &mut Mesh3, lo: f32, hi: f32, low: Color32, high: Color32)
     m.vcol = Some(m.verts.iter().map(|p| lerp_c(low, high, ((p.y - lo) / span).clamp(0.0, 1.0))).collect());
 }
 
+/// Darken a prop where it meets the ground — contact shading.
+///
+/// The single cheapest thing that gives a prop DEPTH. A crate lit evenly
+/// top to bottom reads as a sprite pasted on the floor; the same crate with
+/// its lowest few centimetres darkened reads as an object resting on it,
+/// because that gradient is what ambient occlusion looks like and the eye
+/// reads it as contact without being told.
+///
+/// `floor_y` is the surface it stands on and `reach` how far up the
+/// darkening fades — a fraction of the prop's height, not a world constant,
+/// or a lamp post gets the same shadow band as a pebble.
+///
+/// Composes with [`tint_up`] and [`tint_height`]: those set `vcol`, this
+/// multiplies whatever is already there, so a prop can be bark-gradiented
+/// AND grounded. Call it last.
+pub fn contact_shade(m: &mut Mesh3, floor_y: f32, reach: f32, strength: f32) {
+    let reach = reach.max(1e-3);
+    let k = strength.clamp(0.0, 1.0);
+    let base: Vec<Color32> = match m.vcol.take() {
+        Some(v) if v.len() == m.verts.len() => v,
+        _ => vec![m.color; m.verts.len()],
+    };
+    m.vcol = Some(
+        m.verts.iter().zip(base).map(|(p, c)| {
+            // 0 at the floor, 1 by `reach` above it. Anything below the
+            // floor (a prop sunk into terrain) clamps to fully shaded
+            // rather than brightening back up.
+            let t = ((p.y - floor_y) / reach).clamp(0.0, 1.0);
+            let f = 1.0 - k * (1.0 - t) * (1.0 - t); // quadratic: tight to the ground
+            Color32::from_rgb(
+                (c.r() as f32 * f) as u8,
+                (c.g() as f32 * f) as u8,
+                (c.b() as f32 * f) as u8,
+            )
+        }).collect(),
+    );
+}
+
 thread_local! { static TESS_MUL: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) }; }
 /// Global tessellation multiplier for the procedural primitives, driven by the detail variant (1.0 = base).
 /// Set once per frame before building meshes; every primitive below scales its segment counts by it.
@@ -1734,6 +1772,46 @@ pub fn rune_cells(seed: u64, grid: usize) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn contact_shading_darkens_the_base_and_leaves_the_top_alone() {
+        // A prop lit evenly reads as a sprite; darkened at the floor it
+        // reads as resting on it.
+        let mut m = cuboid(v(0.0, 1.0, 0.0), v(1.0, 1.0, 1.0), Color32::from_rgb(200, 200, 200));
+        contact_shade(&mut m, 0.0, 1.0, 0.6);
+        let vc = m.vcol.clone().expect("vcol set");
+        let low = m.verts.iter().zip(&vc).filter(|(p, _)| p.y < 0.1).map(|(_, c)| c.r()).max().unwrap();
+        let high = m.verts.iter().zip(&vc).filter(|(p, _)| p.y > 1.9).map(|(_, c)| c.r()).min().unwrap();
+        assert!(low < high, "base {low} should be darker than top {high}");
+        assert!(high >= 199, "the top must be untouched, got {high}");
+        assert!(low < 120, "the contact band must actually read, got {low}");
+    }
+
+    #[test]
+    fn it_multiplies_an_existing_gradient_rather_than_replacing_it() {
+        // A prop can be bark-gradiented AND grounded; contact_shade last.
+        let mut m = cuboid(v(0.0, 1.0, 0.0), v(1.0, 1.0, 1.0), Color32::WHITE);
+        tint_height(&mut m, 0.0, 2.0, Color32::from_rgb(100, 100, 100), Color32::from_rgb(255, 255, 255));
+        let before: Vec<u8> = m.vcol.clone().unwrap().iter().map(|c| c.r()).collect();
+        contact_shade(&mut m, 0.0, 1.0, 0.5);
+        let after: Vec<u8> = m.vcol.clone().unwrap().iter().map(|c| c.r()).collect();
+        assert_eq!(before.len(), after.len());
+        assert!(after.iter().zip(&before).all(|(a, b)| a <= b), "shading must only darken");
+        assert!(after.iter().zip(&before).any(|(a, b)| a < b), "and must do something");
+    }
+
+    #[test]
+    fn a_prop_sunk_below_the_floor_clamps_instead_of_brightening() {
+        let mut m = cuboid(v(0.0, -3.0, 0.0), v(0.5, 0.5, 0.5), Color32::from_rgb(200, 200, 200));
+        contact_shade(&mut m, 0.0, 1.0, 1.0);
+        for c in m.vcol.clone().unwrap() {
+            assert!(c.r() <= 200, "brightened past the source colour");
+        }
+        // Zero strength and a zero reach are both no-crash no-ops.
+        let mut z = cuboid(v(0.0, 1.0, 0.0), v(0.5, 0.5, 0.5), Color32::WHITE);
+        contact_shade(&mut z, 0.0, 0.0, 0.0);
+        assert!(z.vcol.unwrap().iter().all(|c| c.r() == 255));
+    }
+
     #[test]
     fn thinning_a_crown_keeps_its_coverage_until_the_growth_cap() {
         let base = 84;

@@ -105,8 +105,32 @@ impl Float {
 
 /// A baked environment: parallel meshes + their float motions.
 pub struct Scene { pub meshes: Vec<Mesh3>, floats: Vec<Float>, anchors: Vec<Vec3> }
+/// How dark a prop goes where it touches the ground. Strong enough to read
+/// at a distance, short of looking like a painted-on shadow.
+const CONTACT_STRENGTH: f32 = 0.45;
+
 impl Scene {
     fn new() -> Self { Scene { meshes: Vec::new(), floats: Vec::new(), anchors: Vec::new() } }
+
+    /// Index to hand back to [`Scene::ground_since`] after building a prop.
+    fn mark(&self) -> usize { self.meshes.len() }
+
+    /// Darken everything added since `mark` where it meets the ground.
+    ///
+    /// Props were lit evenly top to bottom, which is what made them read as
+    /// pasted onto the floor rather than resting on it — the operator's
+    /// "props need more depth". `contact_shade` is the cheap half of ambient
+    /// occlusion and the eye reads it as contact without being told.
+    ///
+    /// Applied here rather than inside each prop builder so one call grounds
+    /// a whole prop however many meshes it is made of, and so a builder that
+    /// already tints its vertices keeps that tint — `contact_shade`
+    /// multiplies rather than replaces.
+    fn ground_since(&mut self, mark: usize, floor_y: f32, reach: f32) {
+        for m in &mut self.meshes[mark..] {
+            m3::contact_shade(m, floor_y, reach, CONTACT_STRENGTH);
+        }
+    }
     fn add(&mut self, m: Mesh3, f: Float) {
         // wind only sways FOLIAGE (MOSS) that already floats; for those we cache a centroid anchor so the gust
         // wave can sweep across the scene. Everything else stores a zero anchor (skipped at animate time).
@@ -4631,11 +4655,17 @@ fn alley() -> Scene {
         let bx = -half_len + (k as f32 + 0.3) / ((4.0 * pd * af) as u32).max(1) as f32 * 2.0 * half_len;
         let sgn = if rh(k * 41) > 0.5 { 1.0 } else { -1.0 };
         let bz = sgn * (wz - 1.0);
+        // GROUND THE PROP. The floor here is the terrain height under it,
+        // not y=0 — a bench on a slope has to be shaded against the slope or
+        // the band floats.
+        let floor = gy(bx, bz);
+        let mk = s.mark();
         if rh(k * 43) > 0.45 {
-            bench(&mut s, v(bx, gy(bx, bz), bz), if sgn > 0.0 { -1.57 } else { 1.57 }, 1100 + k, (rh(k * 7) * 3.0) as u32);
+            bench(&mut s, v(bx, floor, bz), if sgn > 0.0 { -1.57 } else { 1.57 }, 1100 + k, (rh(k * 7) * 3.0) as u32);
         } else {
-            bicycle(&mut s, v(bx, gy(bx, bz), bz), if sgn > 0.0 { 3.14 } else { 0.0 }, 1200 + k);
+            bicycle(&mut s, v(bx, floor, bz), if sgn > 0.0 { 3.14 } else { 0.0 }, 1200 + k);
         }
+        s.ground_since(mk, floor, 0.55);
     }
 
 
