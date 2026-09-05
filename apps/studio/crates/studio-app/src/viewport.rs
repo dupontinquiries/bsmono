@@ -44,6 +44,46 @@ pub fn video_at(project: &Project, playhead: Ticks) -> Option<(String, Ticks)> {
 
 /// The coarse cache key: half-second steps, so scrubbing repaints at 2 fps
 /// while a paused playhead costs zero subprocesses per frame.
+/// EVERY video clip under the playhead, one per video track, in track
+/// order — the stack the compositor paints bottom to top. Each carries its
+/// source path, media time, the clip's transform (from a `transform`
+/// effect, identity otherwise) and its blend (from a `blend` effect,
+/// Normal at full opacity otherwise). `video_at` is the first of these;
+/// it stays because the cache key and the caption use it.
+pub fn layers_at(project: &Project, playhead: Ticks) -> Vec<LayerSpec> {
+    let mut out = Vec::new();
+    for t in project.tracks.iter().filter(|t| t.kind == TrackKind::Video) {
+        for c in project.clips.values().filter(|c| c.track == t.id) {
+            if c.pos <= playhead && playhead < c.end() {
+                let Some(src) = project.sources.get(&c.source) else { continue };
+                let media = c.src_in.saturating_add(playhead.saturating_sub(c.pos));
+                let mut transform = studio_fx::Transform::default();
+                let mut mode = studio_fx::compositor::BlendMode::Normal;
+                let mut opacity = 1.0;
+                for fx in c.effects.iter().filter(|f| f.enabled) {
+                    match studio_fx::instantiate(fx, 48_000.0) {
+                        Some(studio_fx::Instance::Transform(t)) => transform = t,
+                        Some(studio_fx::Instance::Blend(m, o)) => { mode = m; opacity = o; }
+                        _ => {}
+                    }
+                }
+                out.push(LayerSpec { path: src.path.clone(), media, transform, mode, opacity });
+                break;
+            }
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone)]
+pub struct LayerSpec {
+    pub path: String,
+    pub media: Ticks,
+    pub transform: studio_fx::Transform,
+    pub mode: studio_fx::compositor::BlendMode,
+    pub opacity: f32,
+}
+
 pub fn coarse(t: Ticks) -> i64 {
     (t.to_seconds() * 2.0).floor() as i64
 }
@@ -70,18 +110,32 @@ pub fn show(ui: &mut egui::Ui, project: &Project, playhead: Ticks,
         });
         return;
     };
-    let key = (path.clone(), coarse(media));
+    let layers = layers_at(project, playhead);
+    // The key names every layer at its coarse time, so a second track
+    // appearing or a blend changing re-composites; one track is the old key.
+    let key = (layers.iter().map(|l| format!("{}@{}:{:?}:{:.2}", l.path, coarse(l.media), l.mode, l.opacity)).collect::<Vec<_>>().join("|"), coarse(media));
     if cache.key.as_ref() != Some(&key) && cache.failed.as_ref() != Some(&key) {
-        match studio_video::frame_rgb(&base.join(&path), media, W, H) {
-            Ok(px) => {
+        let mut frames: Vec<(Vec<u8>, &LayerSpec)> = Vec::new();
+        let mut err = None;
+        for l in &layers {
+            match studio_video::frame_rgb(&base.join(&l.path), l.media, W, H) {
+                Ok(px) => frames.push((px, l)),
+                Err(e) => { err = Some(format!("{e:?}")); break; }
+            }
+        }
+        match err {
+            None => {
+                let stack: Vec<studio_fx::compositor::Layer<'_>> = frames.iter().map(|(px, l)| studio_fx::compositor::Layer {
+                    rgb: px, w: W, h: H, transform: l.transform, mode: l.mode, opacity: l.opacity }).collect();
+                let px = studio_fx::compositor::composite(W, H, [0, 0, 0], &stack);
                 let img = egui::ColorImage::from_rgb([W as usize, H as usize], px.as_slice());
                 cache.tex = Some(ui.ctx().load_texture(
                     "viewport", img, egui::TextureOptions::LINEAR));
                 cache.key = Some(key);
             }
-            Err(e) => {
+            Some(e) => {
                 cache.failed = Some(key);
-                ui.colored_label(c.text_weak, format!("frame unavailable: {e:?}"));
+                ui.colored_label(c.text_weak, format!("frame unavailable: {e}"));
             }
         }
     }
@@ -89,8 +143,12 @@ pub fn show(ui: &mut egui::Ui, project: &Project, playhead: Ticks,
         let avail = ui.available_width().min(W as f32 * 2.0);
         let size = egui::vec2(avail, avail * H as f32 / W as f32);
         ui.add(egui::Image::new(tex).fit_to_exact_size(size));
-        ui.colored_label(c.text_weak,
-            format!("{path} @ {:.1}s — preview at ~2 fps", media.to_seconds()));
+        let n = layers_at(project, playhead).len();
+        ui.colored_label(c.text_weak, if n > 1 {
+            format!("{path} +{} layer{} @ {:.1}s — preview at ~2 fps", n - 1, if n > 2 { "s" } else { "" }, media.to_seconds())
+        } else {
+            format!("{path} @ {:.1}s — preview at ~2 fps", media.to_seconds())
+        });
     }
 }
 
@@ -149,4 +207,35 @@ mod tests {
         assert_ne!(coarse(Ticks::from_seconds(1.4)), coarse(Ticks::from_seconds(1.6)),
                    "crossing it: a new frame");
     }
+    #[test]
+    fn a_second_video_track_is_a_second_layer_with_its_blend_and_transform() {
+        let mut p = Project::default();
+        for (i, name) in ["v1", "v2"].iter().enumerate() {
+            p.apply(&Op::AddTrack { track: Track { id: TrackId(10 + i as u64), kind: TrackKind::Video, name: (*name).into(),
+                muted: false, locked: false, gain: 1.0, route: None }, at: i }).unwrap();
+            p.apply(&Op::AddSource { source: Source { id: SourceId(20 + i as u64), path: format!("{name}.mp4"),
+                len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
+        }
+        let mut blend = std::collections::BTreeMap::new();
+        blend.insert("mode".to_string(), 2.0); // multiply
+        blend.insert("opacity".to_string(), 0.5);
+        let mut xf = std::collections::BTreeMap::new();
+        xf.insert("x".to_string(), 0.25);
+        for (i, fx) in [vec![], vec![
+            studio_core::Effect { kind: "blend".into(), params: blend, enabled: true },
+            studio_core::Effect { kind: "transform".into(), params: xf, enabled: true },
+        ]].into_iter().enumerate() {
+            p.apply(&Op::AddClip { clip: Clip { id: ClipId(30 + i as u64), source: SourceId(20 + i as u64), track: TrackId(10 + i as u64),
+                pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(5.0), gain: 1.0, effects: fx } }).unwrap();
+        }
+        let layers = layers_at(&p, Ticks::from_seconds(1.0));
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].path, "v1.mp4");
+        assert_eq!(layers[0].mode, studio_fx::compositor::BlendMode::Normal);
+        assert_eq!(layers[1].mode, studio_fx::compositor::BlendMode::Multiply);
+        assert!((layers[1].opacity - 0.5).abs() < 1e-6);
+        assert!((layers[1].transform.x - 0.25).abs() < 1e-6);
+        assert!(layers_at(&p, Ticks::from_seconds(7.0)).is_empty());
+    }
+
 }

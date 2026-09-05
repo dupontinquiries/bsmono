@@ -12,6 +12,7 @@
 //! something that runs, or `None` if this build does not know the kind.
 
 pub mod schema;
+pub mod compositor;
 pub mod analysis;
 pub mod playrate;
 pub mod saturation;
@@ -459,6 +460,9 @@ pub enum Instance {
     Crush(voice::Crush),
     Gate(voice::Gate),
     Retime(Retime),
+    /// The clip's blend mode and opacity for the compositor — a pass-through
+    /// for audio, a layer instruction for video.
+    Blend(compositor::BlendMode, f32),
     /// The trap pair — see `playrate`'s module docs for why they carry
     /// their own per-channel buffers inside a per-sample interface.
     /// Live, note-locking pitch correction. Unlike `autotune`'s offline
@@ -487,6 +491,7 @@ impl Instance {
             Instance::Multiband(m) => m.process(x),
             Instance::Saturator(s) => s.process(x),
             Instance::Gain(db) => x * from_db_pub(*db),
+            Instance::Blend(..) => x, // a layer instruction: silence for audio, per the doc above
             Instance::RealTune(t) => t.process(x),
             Instance::AdaptiveSat(a) => a.process(x),
             // Comb and Sub are PARALLEL: they add to the dry rather than
@@ -686,6 +691,7 @@ pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> 
             gain: [p(q, "gain_r", 1.0), p(q, "gain_g", 1.0), p(q, "gain_b", 1.0)],
             saturation: p(q, "saturation", 1.0),
         }),
+        "blend" => { let (m, o) = compositor::blend_of(effect); Instance::Blend(m, o) }
         "retime" => Instance::Retime(Retime {
             from_speed: p(q, "from_speed", 1.0), to_speed: p(q, "to_speed", 1.0),
             preserve_pitch: p(q, "preserve_pitch", 1.0) > 0.5,

@@ -103,6 +103,7 @@ fn int(key: &str, label: &str, min: i32, max: i32, unit: &'static str, default: 
 }
 
 const SAT_PROFILES: &[&str] = &["tube", "tape", "console", "diode"];
+const BLEND_MODES: &[&str] = &["normal", "add", "multiply", "screen", "overlay"];
 const BAND_KINDS: &[&str] = &["peaking", "low shelf", "high shelf", "low pass", "high pass"];
 const SCALE_MODES: &[&str] = &["chromatic", "major", "minor", "pentatonic", "custom"];
 const NOTE_NAMES: &[&str] = &["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -128,6 +129,7 @@ pub const KINDS: &[(&str, &str)] = &[
     ("transform", "position, scale, rotation, opacity (video)"),
     ("color", "lift / gamma / gain / saturation (video)"),
     ("retime", "speed ramp (video)"),
+    ("blend", "blend mode and opacity onto the tracks below (video)"),
 ];
 
 /// The static part of a kind's schema: everything except the repeated
@@ -216,6 +218,10 @@ pub fn schema(kind: &str) -> Option<Vec<ParamSpec>> {
             f("to_speed", "to speed", 0.1, 8.0, "x", 1.0),
             b("preserve_pitch", "preserve pitch", true),
             b("reverse", "reverse", false),
+        ],
+        "blend" => vec![
+            e("mode", "mode", BLEND_MODES, 0),
+            f("opacity", "opacity", 0.0, 1.0, "%", 1.0),
         ],
         _ => return None,
     })
