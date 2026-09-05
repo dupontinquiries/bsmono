@@ -3824,6 +3824,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 WindowEvent::Key(Key::Down, _, Action::Press, _) if chat_focus => {
                     chat_keys.push(voxel_tools::chatbox::Key::Down);
                 }
+                // Catch-all key arm. It must be LAST and it must be guarded:
+                // every key the chat does not explicitly claim lands here,
+                // so without the guard `p` toggled the inventory while
+                // typing. Layout-resolved hotkeys make this worse, not
+                // better -- on Dvorak the LABEL is what matches, so typing
+                // the letter p in a sentence is indistinguishable from the
+                // hotkey unless focus is checked first.
+                WindowEvent::Key(_, _, Action::Press, _) if chat_focus => {}
                 WindowEvent::Key(key, scancode, Action::Press, _) => {
                     // #2 (Dvorak): toggle panel mode on the key LABELED 'p' in the
                     // active keyboard layout — not GLFW's physical `Key::P`, which
@@ -4402,6 +4410,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     "no model loaded -- running the FIXTURE, not a model. \
                                      /model <name> first, or set UNENDLICH_BUILD_PROVIDER.");
                             }
+                            log::info!("[paintbrush] provider choice: script={script} \
+                                        debug={debug} model_ready={}",
+                                       paintbrush.models.state.is_ready());
                             match unendlich_engine::voxel_chat::find_provider(
                                 script, !debug)
                             {
@@ -4468,6 +4479,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     "{} @ {:?}", f.tier.name(), f.anchor));
             }
 
+            // `typing` (used by the C/B/I/P letter-hotkey guards further
+            // down) reads this. The renderer sets it while DRAWING, which
+            // is a frame late; set it from the live focus flag so a
+            // hotkey cannot fire on the first frame of typing.
+            if chat_focus { renderer.ui_wants_keyboard = true; }
             renderer.chat_buffer = paintbrush.chatbox.buffer.clone();
             renderer.chat_card = paintbrush.chatbox.current_card()
                 .map(|c| (c.command.to_string(), c.signature.to_string(), c.summary.to_string()));

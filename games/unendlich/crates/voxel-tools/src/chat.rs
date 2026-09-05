@@ -303,6 +303,19 @@ impl ChatSession {
         Reply::Preview { echo, blocks: dry.blocks_changed, feature_id: f.feature_id }
     }
 
+    /// Drop any pending plan.
+    ///
+    /// Called when a new build TURN STARTS, not when it succeeds. If a
+    /// turn fails -- provider missing, model unreachable, reply
+    /// unparseable -- the previous turn's plan was still sitting in
+    /// `pending`, so the next `/commit` silently rebuilt the OLD thing.
+    /// Reported from the field as "/commit just put another tower
+    /// instead of waiting for the model": it was not waiting, it was
+    /// committing the stale fixture plan.
+    pub fn clear_pending(&mut self) -> bool {
+        self.pending.take().is_some()
+    }
+
     /// `/plan` -- re-show the pending preview.
     pub fn show_plan(&self) -> Reply {
         match &self.pending {
@@ -650,5 +663,22 @@ mod tests {
         }
         drop(t2);
         assert_eq!(w.get(2, 66, 0), 0, "undo restored the world through new tools");
+    }
+
+    #[test]
+    fn a_failed_turn_leaves_nothing_to_commit() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        // turn 1 succeeds and is committed
+        s.receive_plan(&mut t, &g, "tower @0,0 r=2 h=5 block=stone_bricks\n");
+        s.commit(&mut t, &g);
+        // turn 2 starts: clear first, then the provider fails, so no plan
+        assert!(s.clear_pending() == false, "nothing pending after a commit");
+        s.receive_plan(&mut t, &g, "tower @9,9 r=2 h=5\n");
+        assert!(s.clear_pending(), "a fresh preview is pending");
+        // with it cleared, a commit must not resurrect the old plan
+        assert_eq!(s.commit(&mut t, &g), Reply::Say("nothing to commit".into()));
     }
 }

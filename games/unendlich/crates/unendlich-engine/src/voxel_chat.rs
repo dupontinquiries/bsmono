@@ -226,6 +226,12 @@ impl Paintbrush {
                 // before you have a model. It reported "no model loaded"
                 // and stopped, which is exactly what "nothing happened"
                 // looks like from the outside.
+                // Clear any pending plan as the turn STARTS. If this turn
+                // fails, /commit must find nothing -- not the previous
+                // turn's plan, which it would rebuild without a word.
+                if self.session.clear_pending() {
+                    self.say("(replacing the pending plan)");
+                }
                 let is_debug = prose.trim_start().starts_with("debug");
                 log::info!("[paintbrush] /build debug={} ready={} prose={:?}",
                            is_debug, self.models.state.is_ready(), prose);
@@ -279,6 +285,13 @@ impl Paintbrush {
                            self.models.models.len(), self.models.dir.display());
                 let l = self.models.listing();
                 self.say(l);
+                // State line: the single question worth answering after a
+                // load is "will the next /build call a model or the
+                // fixture", and until now that was only inferable.
+                self.say(format!(
+                    "state: {} -> next /build uses {}",
+                    self.models.state.message(),
+                    if self.models.state.is_ready() { "llama-cli.sh" } else { "the FIXTURE" }));
                 Pending::None
             }
             Command::Model(Some(name)) => match self.models.begin_load(&name) {
