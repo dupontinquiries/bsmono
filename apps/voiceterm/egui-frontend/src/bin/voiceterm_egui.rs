@@ -2679,6 +2679,63 @@ impl eframe::App for VoicetermApp {
                             };
                             ui.label(egui::RichText::new(note).weak().size(11.0));
                         });
+                        // THE SECURITY CHECKUP. The mail stack keeps its key in
+                        // a hand-rolled file that no desktop wallet knows about,
+                        // and its PGP engine can decrypt but cannot verify — so
+                        // mail that opens looks authenticated and is not.
+                        // Neither fact was visible anywhere in the UI. This is
+                        // `secret_kit::wizard` saying both, worst first.
+                        {
+                            let env: std::collections::BTreeMap<String, String> =
+                                std::env::vars().collect();
+                            let plan = secret_kit::Plan::detect(&env);
+                            let facts = secret_kit::wizard::Facts {
+                                // Observed, not assumed: nothing in this tree
+                                // talks to a wallet yet, so the file is what is
+                                // actually in use whatever the plan would prefer.
+                                store_in_use: secret_kit::Store::EncryptedFile,
+                                plan: plan.clone(),
+                                can_verify: false,
+                                can_sign: false,
+                                key_expires_in_days: None,
+                                has_revocation_cert: false,
+                                two_password_mode: false,
+                            };
+                            let findings = secret_kit::wizard::checkup(&facts);
+                            let head = secret_kit::wizard::headline(&findings);
+                            let open_id = ui.make_persistent_id("mail-security-checkup");
+                            let title = match head {
+                                Some(f) => format!("Security: {}", f.title),
+                                None => "Security: this setup is sound".to_string(),
+                            };
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new(title).color(match head.map(|f| f.severity) {
+                                    Some(secret_kit::wizard::Severity::Critical) => c.danger,
+                                    Some(secret_kit::wizard::Severity::Warn) => c.warning,
+                                    _ => c.text_weak,
+                                }))
+                                .id_salt(open_id)
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new(plan.explain()).weak().size(11.0));
+                                    ui.add_space(4.0);
+                                    for f in &findings {
+                                        let col = match f.severity {
+                                            secret_kit::wizard::Severity::Critical => c.danger,
+                                            secret_kit::wizard::Severity::Warn => c.warning,
+                                            secret_kit::wizard::Severity::Advice => c.text,
+                                            secret_kit::wizard::Severity::Good => c.success,
+                                        };
+                                        ui.colored_label(col, format!(
+                                            "[{}] {}", f.severity.label(), f.title));
+                                        ui.label(egui::RichText::new(&f.detail).weak().size(11.0));
+                                        if let Some(r) = &f.remedy {
+                                            ui.label(egui::RichText::new(format!("→ {r}"))
+                                                     .size(11.0).color(c.accent));
+                                        }
+                                        ui.add_space(6.0);
+                                    }
+                                });
+                        }
                         if let Some(conv) = voiceterm_egui::mail_view::list_ui(ui, &mut self.mail, &c) {
                             // OPENING A THREAD READS IT. `mark_thread_read`
                             // had no caller, so the unread count and the
