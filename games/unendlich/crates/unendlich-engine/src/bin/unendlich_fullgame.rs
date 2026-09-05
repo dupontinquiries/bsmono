@@ -1874,12 +1874,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         unendlich_engine::constants::CHUNK_SIZE);
     let mut chat_toggle = false;
     let mut chat_key: Option<voxel_tools::chatbox::Key> = None;
-    // Provider: an executable reading <system>\0<user> on stdin.
-    // UNENDLICH_BUILD_PROVIDER overrides; the fixture needs no model.
-    let build_provider: Vec<String> = std::env::var("UNENDLICH_BUILD_PROVIDER")
-        .ok()
-        .map(|v| v.split_whitespace().map(String::from).collect())
-        .unwrap_or_else(|| vec!["games/unendlich/crates/voxel-tools/providers/fixture.sh".to_string()]);
+    // Provider: an executable reading <system>\0<user> on stdin. Located
+    // by `voxel_chat::find_provider`, which is anchored at compile time
+    // rather than to the working directory.
     let mut ui_mouse_down = false;
 
     // Rollback input buffer — captures one InputFrame per simulation
@@ -4296,24 +4293,37 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             // `/build debug ...` skips the model entirely and
                             // uses the fixture provider: proves the whole
                             // path with no weights loaded.
-                            let argv: Vec<String> = if prose.starts_with("debug") {
-                                vec!["games/unendlich/crates/voxel-tools/providers/fixture.sh".into()]
-                            } else {
-                                build_provider.clone()
+                            // `/build debug ...` always uses the fixture;
+                            // anything else honours $UNENDLICH_BUILD_PROVIDER
+                            // and falls back to the fixture so a first run
+                            // never silently does nothing.
+                            let debug = prose.trim_start().starts_with("debug");
+                            let argv = match unendlich_engine::voxel_chat::find_provider(
+                                "fixture.sh", !debug) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    paintbrush.say(e);
+                                    Vec::new()
+                                }
                             };
+                            if argv.is_empty() { continue_after_provider_error = true; }
                             let (sys, user) =
                                 paintbrush.prompt_for(&chunk_manager, &gaze, None, &prose);
+                            let mut continue_after_provider_error = false;
                             // Blocking. A local 7B takes a second or two and
                             // this stalls the frame; the worker-thread version
                             // is the obvious next step, but a stall you can
                             // see beats a loop you cannot test.
-                            let mut prov = voxel_tools::llm::CommandProvider::new(argv);
-                            match voxel_tools::llm::Completer::complete(&mut prov, &sys, &user) {
-                                Ok(raw) => paintbrush.finish_turn(
-                                    &chunk_manager, &gaze, &raw,
-                                    Some((eye.x as i32, eye.y as i32, eye.z as i32))),
-                                Err(e) => paintbrush.say(format!("provider failed: {e}")),
+                            if !continue_after_provider_error {
+                                let mut prov = voxel_tools::llm::CommandProvider::new(argv);
+                                match voxel_tools::llm::Completer::complete(&mut prov, &sys, &user) {
+                                    Ok(raw) => paintbrush.finish_turn(
+                                        &chunk_manager, &gaze, &raw,
+                                        Some((eye.x as i32, eye.y as i32, eye.z as i32))),
+                                    Err(e) => paintbrush.say(format!("provider failed: {e}")),
+                                }
                             }
+                            continue_after_provider_error = false;
                         }
                         Pending::LoadModel(path) => {
                             // No in-process loader: the provider script owns

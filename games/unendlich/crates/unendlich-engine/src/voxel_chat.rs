@@ -44,6 +44,69 @@ pub enum Pending {
     VoiceOff,
 }
 
+/// Locate a provider script without depending on the process working
+/// directory.
+///
+/// The first version hardcoded `games/unendlich/crates/...`, which is
+/// only correct when the game is launched from the monorepo root. Run
+/// from `games/unendlich` -- which is where you actually run it -- and
+/// it fails with `No such file or directory (os error 2)`, reported
+/// once per attempt and impossible to act on without reading the
+/// source.
+///
+/// Resolution order:
+///   1. `$UNENDLICH_BUILD_PROVIDER` (may be a command with arguments)
+///   2. next to the crate, via `CARGO_MANIFEST_DIR` -- correct for
+///      `cargo run` from anywhere in the workspace
+///   3. a few paths relative to the CWD, for a launched binary
+///   4. next to the executable, for an installed build
+pub fn find_provider(name: &str, allow_env: bool) -> Result<Vec<String>, String> {
+    // `/build debug` passes allow_env=false: its whole purpose is to
+    // exercise the pipeline with a known-good canned plan, so an env
+    // override pointing at a real model would defeat it.
+    if allow_env {
+    if let Ok(v) = std::env::var("UNENDLICH_BUILD_PROVIDER") {
+        let argv: Vec<String> = v.split_whitespace().map(String::from).collect();
+        if !argv.is_empty() {
+            return Ok(argv);
+        }
+    }
+    }
+    let mut tried: Vec<String> = Vec::new();
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    // CARGO_MANIFEST_DIR is unendlich-engine/; providers live in the
+    // sibling voxel-tools crate. Baked at compile time, so it does not
+    // care where the binary is started from.
+    candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../voxel-tools/providers").join(name));
+    for rel in [
+        "crates/voxel-tools/providers",
+        "games/unendlich/crates/voxel-tools/providers",
+        "../crates/voxel-tools/providers",
+        "providers",
+    ] {
+        candidates.push(std::path::Path::new(rel).join(name));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("providers").join(name));
+        }
+    }
+    for c in candidates {
+        if c.is_file() {
+            let abs = c.canonicalize().unwrap_or(c);
+            log::info!("[paintbrush] provider: {}", abs.display());
+            return Ok(vec![abs.display().to_string()]);
+        }
+        tried.push(c.display().to_string());
+    }
+    Err(format!(
+        "provider '{name}' not found. Set UNENDLICH_BUILD_PROVIDER to an \
+         executable, or check one of these paths exists:\n  {}",
+        tried.join("\n  ")))
+}
+
 pub struct Paintbrush {
     pub chatbox: ChatBox,
     pub session: ChatSession,
