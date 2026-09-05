@@ -105,14 +105,35 @@ impl Surface {
 pub struct SceneText { pub entry: Surface, pub readback: Surface }
 
 /// Pick surfaces for a named scene.
+/// Names are matched CASE- AND SPACE-INSENSITIVELY against the real scene
+/// list, `mesh3d::SCENE_NAMES`.
+///
+/// The original arms were lower-case sketches — "atlantis", "study",
+/// "library", "hillside" — and not one of them is a scene name. The scenes
+/// are `"Atlantis"`, `"Old Library"`, `"Reading Room"`, `"Slate"`. So every
+/// caller fell through to the default Billboard arm and Atlantis never got
+/// the pearl this module was written to give it. The mapping existed and
+/// could not fire.
 pub fn for_scene(scene: &str) -> SceneText {
-    match scene {
+    let key = scene.trim().to_ascii_lowercase();
+    match key.as_str() {
         // Atlantis: the pearl is already the voice indicator, so it is the natural ENTRY affordance —
         // you speak into it. It cannot be the readback, which is why the billboard is still there.
         "atlantis" => SceneText { entry: Surface::Pearl, readback: Surface::Billboard },
-        "study" | "library" => SceneText { entry: Surface::Page, readback: Surface::Page },
-        "hillside" | "ruins" => SceneText { entry: Surface::Runestone, readback: Surface::Runestone },
+        // Rooms made of paper: what you write and what you read are both pages.
+        "study" | "library" | "old library" | "archive" | "reading room"
+            => SceneText { entry: Surface::Page, readback: Surface::Page },
+        // Rooms made of stone. The existing hillside/ruins decision — both
+        // roles on the runestone — is kept exactly; I changed it to a
+        // billboard readback on a hunch and `overflow_reports_HOW_MUCH...`
+        // failed, which is that test doing its job. The new stone scenes
+        // mirror the decision rather than inventing a second one.
+        "hillside" | "ruins" | "slate" | "recursive citadel" | "fractal spires"
+            => SceneText { entry: Surface::Runestone, readback: Surface::Runestone },
         "alley" | "street" => SceneText { entry: Surface::StreetSign, readback: Surface::Billboard },
+        // Overhead and made of vapour: a puff holds nothing (budget 0), so it
+        // is an entry affordance only and the readback stays a billboard.
+        "cloudscape" | "folding@home" => SceneText { entry: Surface::CloudPuff, readback: Surface::Billboard },
         _ => SceneText { entry: Surface::Billboard, readback: Surface::Billboard },
     }
 }
@@ -198,4 +219,39 @@ mod tests {
         assert_eq!(t.entry, Surface::Billboard);
         assert!(t.readback.holds(1000));
     }
+    #[test]
+    fn every_real_scene_name_resolves_and_case_does_not_matter() {
+        // The bug this covers: the arms were lower-case sketches and the
+        // scenes are Title Case, so every lookup hit the default and the
+        // mapping could never fire in production.
+        assert_eq!(for_scene("Atlantis"), for_scene("atlantis"));
+        assert_eq!(for_scene("  ATLANTIS  ").entry, Surface::Pearl);
+        assert_eq!(for_scene("Old Library").entry, Surface::Page);
+        assert_eq!(for_scene("Reading Room").readback, Surface::Page);
+        assert_eq!(for_scene("Alley").entry, Surface::StreetSign);
+        assert_eq!(for_scene("Slate").entry, Surface::Runestone);
+        assert_eq!(for_scene("Cloudscape").entry, Surface::CloudPuff);
+        // And every name the renderer can actually be given resolves without
+        // panicking, whatever it maps to.
+        for n in crate::mesh3d::SCENE_NAMES {
+            let t = for_scene(n);
+            assert!(t.readback.char_budget() > 0, "{n}: readback holds nothing");
+        }
+    }
+
+    #[test]
+    fn a_surface_that_holds_nothing_is_never_a_readback() {
+        // CloudPuff's budget is 0 — it is an affordance, not a page. Using it
+        // for readback would silently overflow every reply.
+        assert_eq!(Surface::CloudPuff.char_budget(), 0);
+        assert!(!Surface::CloudPuff.holds(1));
+        for n in crate::mesh3d::SCENE_NAMES {
+            assert_ne!(for_scene(n).readback, Surface::CloudPuff, "{n}");
+        }
+        // overflow() reports the excess rather than just refusing.
+        let big = "x".repeat(5000).len();
+        assert!(overflow("Atlantis", big).is_some_and(|o| o > 0));
+        assert_eq!(overflow("Atlantis", 1), None);
+    }
+
 }
