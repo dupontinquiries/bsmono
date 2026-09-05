@@ -136,8 +136,8 @@ const UNCHECKABLE: &[&str] = &[
 /// the runtime has `list_dir`, `git_log` and `run` — so a worker spec naming the real tools was
 /// rejected as UnknownTool while one naming imaginary tools validated clean.
 pub const RUNTIME_TOOLS: &[&str] = &[
-    "write_file", "edit", "read_file", "read_range", "list_dir", "search", "run", "git_log", "doc",
-    "propose", "scratch_code",
+    "write_file", "edit", "read_file", "read_range", "read_near", "list_dir", "search", "run",
+    "git_log", "doc", "propose", "scratch_code",
 ];
 
 impl WorkerSpec {

@@ -110,6 +110,7 @@ pub mod patchcheck;
 pub mod anchor;
 pub mod contextwidth;
 pub mod modelfit;
+pub mod capacity_tree;
 pub mod linearize;
 pub mod mdtable;
 pub mod verifyplan;

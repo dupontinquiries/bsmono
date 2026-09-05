@@ -1406,7 +1406,12 @@ pub struct Chat {
     expanded_msgs: std::collections::HashSet<usize>,
     /// Running backend account shown under the newest message while a reply is generating.
     hud: crate::liaisonhud::Hud,
-    /// The strongest thing the reply in flight may assert.
+    /// Workers known this session — the Queen/worker Delegator's roster (`docs/12-queen-and-
+    /// workers.md`). Seeded, not empty, so `:agent`/`:fan-agent`/`:docs` always have the seed set to
+    /// staff against; `:enlist` grows it when the Queen designs a new one. Session-lifetime only —
+    /// not persisted across restarts, since a worker's memory directory (not this roster entry) is
+    /// what `docs/12-queen-and-workers.md` says should survive a restart.
+    roster: logscope_fan::roster::Roster,    /// The strongest thing the reply in flight may assert.
     ///
     /// Set by the routing matrix when a generation starts. Held so the
     /// reply can be recorded at its real epistemic kind rather than
@@ -1576,6 +1581,7 @@ impl Default for Chat {
             watch_full: String::new(), watch_gist: None,
             expanded_msgs: Default::default(),
             hud: crate::liaisonhud::Hud::new(8), hud_narration: String::new(),
+            roster: logscope_fan::roster::seed_roster(),
             route_ceiling: None,
             workers: crate::workerroster::WorkerRoster::new(),
             route_persona: None,
@@ -2032,6 +2038,17 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                 // Without this the picker is the only record of the model, and it is the record that
                 // is wrong after a failure.
                 self.last_loaded = Some(info.path.clone());
+                // Surface the model's declared architecture gaps through the SAME grounded channel
+                // everything else on this strip uses, rather than leaving them only in the terminal
+                // (`wgpu-engine: ⚠ ...`). `docs/12-queen-and-workers.md`'s liaison audit named this
+                // exact gap: the engine computed it, nothing showed it to the operator.
+                if let Some(status) = &info.model_status {
+                    if !status.is_fully_supported() {
+                        for gap in &status.gaps {
+                            self.hud.observe(format!("{}: {gap}", status.name), "loader");
+                        }
+                    }
+                }
             }
             Evt::Loaded(Err(e)) => {
                 // The banner, not the note. This message carries the arithmetic — host RAM,
@@ -3288,6 +3305,9 @@ reply is framed differently from the turn that produced it.");
                 format!("blocked — the error count stopped falling ({turns} turns; change approach)"),
             crate::workspace_exec::Stop::Stalled => format!("stopped — model was looping ({turns} turns)"),
             crate::workspace_exec::Stop::ModelError(e) => format!("model error: {e}"),
+            crate::workspace_exec::Stop::LaneRefused { lane } => format!(
+                "stopped — every write landed outside this worker's lane ({}); the task needs a \
+different worker or a new one ({turns} turns)", lane.join(", ")),
         };
         // Durable per-repo learning: the pattern report ("survey + checked: reduced errors 3/4
         // times") lands as a shared doc, which `collect_shared_docs` injects into EVERY later run
@@ -3634,6 +3654,61 @@ the repository — a chat turn cannot open files.",
         crate::prefs::save(&p);
     }
 
+    /// Staff `task` against the seed roster's lane rule and, on a match, confine `cfg` to that
+    /// worker's `owns` — the cheap-rule half of the Delegator (`docs/12-queen-and-workers.md`),
+    /// shared by every entry point that starts an agent run so `:agent`, `:fan-agent` and `:docs`
+    /// cannot drift into three different staffing policies. Returns the HUD line to post, if any.
+    fn stage_lane(&self, cfg: &mut crate::workspace_exec::AgentConfig, task: &str) -> Option<String> {
+        match self.roster.staff(task) {
+            logscope_fan::roster::Staffing::Reuse { worker, why } => {
+                if let Some(spec) = self.roster.get(&worker) {
+                    cfg.owns = spec.owns.clone();
+                    return Some(format!("staffed to {worker} ({why})"));
+                }
+                None
+            }
+            // Named rather than silently falling through to an unrestricted run — an operator
+            // running the SAME kind of task repeatedly should notice the roster never grows and
+            // reach for `:queen` instead of every run staying a general, unconfined agent.
+            logscope_fan::roster::Staffing::Ambiguous { candidates } =>
+                Some(format!("ambiguous between {} — running unconfined; :queen this task \
+to have the Queen split it, or name the worker directly", candidates.join(", "))),
+            logscope_fan::roster::Staffing::Create => None,
+        }
+    }
+
+    /// `:enlist` — find the latest assistant reply along the active lineage, parse it as a
+    /// `WorkerSpec` (the Queen's output), and add it to the roster if it validates. Split out of
+    /// `run_command` (which needs an `egui::Ui` this crate has no test harness for constructing) so
+    /// the actual chain-walk + parse + validate + add pipeline is unit-testable end to end, not just
+    /// its pieces individually.
+    fn do_enlist(&mut self) -> String {
+        let mut cur = self.active_leaf;
+        let mut reply: Option<String> = None;
+        while let Some(i) = cur {
+            let Some(m) = self.msgs.get(i) else { break };
+            if m.role == Role::Assistant && !m.text().trim().is_empty() {
+                reply = Some(m.text().to_string());
+                break;
+            }
+            cur = m.parent;
+        }
+        let Some(text) = reply else {
+            return ":enlist — no assistant reply to parse yet; :queen a task and send it first".into();
+        };
+        match logscope_fan::queen::WorkerSpec::parse(&text) {
+            Err(e) => format!(":enlist — the reply didn't parse as a spec: {}", e.correction()),
+            Ok(spec) => match spec.validate(crate::workspace_exec::RUNTIME_TOOLS) {
+                Err(e) => format!(":enlist — {} refused: {}", spec.name, e.correction()),
+                Ok(()) => {
+                    let name = spec.name.clone();
+                    self.roster.add(spec);
+                    format!("👑 enlisted {name} — {} worker(s) on the roster now", self.roster.len())
+                }
+            },
+        }
+    }
+
     fn start_agent_task(&mut self, task: String, via: &str) {
         if task.is_empty() { self.note = format!("{via} needs a task"); return; }
         if self.gitmind_session.is_none() {
@@ -3644,6 +3719,9 @@ the repository — a chat turn cannot open files.",
         let work_dir = self.gitmind_session.as_ref().unwrap().work_dir().to_path_buf();
         let mut cfg = crate::workspace_exec::AgentConfig::default();
         cfg.context = self.agent_context();
+        if let Some(line) = self.stage_lane(&mut cfg, &task) {
+            self.hud.observe(line, "delegator");
+        }
         // Size the run's budgets to the model actually loaded. Without this the workspace resolves
         // to Mid for everything — the harness's "unknown" — so a 1B drowns in reads it cannot hold
         // and a large model gets a transcript bound far below what its window could carry.
@@ -7642,8 +7720,10 @@ an empty result set: nothing was searched.");
                 self.start_agent_task(task.trim().to_string(), ":agent");
             }
             Command::FanAgent(task) => {
-                let cfg = crate::workspace_exec::AgentConfig::default();
-                self.start_fan(task.trim(), cfg, false, "fan-agent");
+                let task = task.trim().to_string();
+                let mut cfg = crate::workspace_exec::AgentConfig::default();
+                if let Some(line) = self.stage_lane(&mut cfg, &task) { self.hud.observe(line, "delegator"); }
+                self.start_fan(&task, cfg, false, "fan-agent");
             }
             Command::Lanes(arg) => {
                 let a = arg.trim();
@@ -7669,8 +7749,10 @@ an empty result set: nothing was searched.");
             Command::DocFan(task) => {
                 // A DOC fan: each branch writes a slice of the docs under the organization convention, so the
                 // outputs merge cleanly (:merge-docs). Doc mode = convention in the prompt, no code-verify.
-                let cfg = crate::workspace_exec::AgentConfig::docs();
-                self.start_fan(task.trim(), cfg, true, "docs");
+                let task = task.trim().to_string();
+                let mut cfg = crate::workspace_exec::AgentConfig::docs();
+                if let Some(line) = self.stage_lane(&mut cfg, &task) { self.hud.observe(line, "delegator"); }
+                self.start_fan(&task, cfg, true, "docs");
             }
             Command::MergeDocs => self.merge_fan_docs(),
             Command::Pick(n) => self.pick_branch(n),
@@ -7781,6 +7863,28 @@ an empty result set: nothing was searched.");
                     None => { self.note = ":why — give two turns to compare, e.g. :why <full-id>,<compacted-id>".into(); }
                 }
             }
+            Command::Capacity => {
+                let tier = logscope::capacity_tree::detect_tier();
+                let tree = logscope::capacity_tree::capacity_tree();
+                let mut lines = logscope::capacity_tree::briefing_for_tier(&tree, tier);
+                if logscope::capacity_tree::physical_ram_gib().is_none() {
+                    lines.push("  (RAM not detected on this platform — showing the middle tier; \
+run :capacity on the target machine for a real reading)".into());
+                }
+                self.note = lines.join("\n");
+            }
+            Command::Queen(task) => {
+                let task = task.trim();
+                if task.is_empty() {
+                    self.note = format!(":queen needs a task — {} worker(s) on the roster already ({})",
+                        self.roster.len(), self.roster.names().join(", "));
+                } else {
+                    self.input = self.roster.queen_request(task);
+                    self.note = "👑 staged the Queen's prompt — pick a model and send; \
+:enlist the reply once it comes back.".into();
+                }
+            }
+            Command::Enlist => { self.note = self.do_enlist(); }
             Command::Help(arg) => {
                 let a = arg.trim();
                 if a.is_empty() {
@@ -11051,5 +11155,163 @@ mod stamp_persistence_tests {
     fn a_backwards_clock_reports_zero_rather_than_a_century() {
         let born = std::time::Instant::now();
         assert_eq!(super::turn_age(2_000, born, 1_000).as_deref(), Some("0s ago"));
+    }
+
+    /// The end-to-end path `:agent`/`:fan-agent`/`:docs` share: staffing must actually confine the
+    /// config, and a task with no docs path must leave every run exactly as unrestricted as before
+    /// this existed.
+    #[test]
+    fn stage_lane_confines_a_docs_task_and_leaves_others_alone() {
+        let chat = Chat::default();
+        let mut cfg = crate::workspace_exec::AgentConfig::default();
+        let line = chat.stage_lane(&mut cfg, "update docs/README.md with the finding");
+        assert!(line.is_some(), "a docs-path task should staff to the seed doc-writer");
+        assert_eq!(cfg.owns, vec!["docs".to_string()]);
+
+        let mut cfg2 = crate::workspace_exec::AgentConfig::default();
+        let line2 = chat.stage_lane(&mut cfg2, "fix the renderer");
+        assert!(line2.is_none(), "prose with no path names nobody, so nothing is staffed");
+        assert!(cfg2.owns.is_empty(), "an unstaffed run must stay unrestricted");
+    }
+
+    /// A cold `Chat` is never actually cold — the Delegator always has the seed set to staff
+    /// against, per `docs/12-queen-and-workers.md`'s open question about who writes the first roster.
+    #[test]
+    fn a_fresh_chat_starts_with_the_seeded_roster() {
+        let chat = Chat::default();
+        assert!(!chat.roster.is_empty(), "the roster must not start genuinely empty");
+        for want in ["reader", "test-runner", "doc-writer"] {
+            assert!(chat.roster.get(want).is_some(), "missing seed worker {want}");
+        }
+    }
+
+    /// The `:enlist` pipeline end to end, minus the message-chain lookup `run_command` does (that
+    /// needs an `egui::Ui` this test module has no harness for) — a valid spec from the Queen
+    /// enlarges the roster, and an invalid one is refused with a correction rather than silently
+    /// added broken or silently dropped.
+    #[test]
+    fn a_queen_designed_spec_enlists_when_valid_and_is_refused_with_a_reason_when_not() {
+        let mut chat = Chat::default();
+        let before = chat.roster.len();
+        let good = "Name: rust-ratatui-coder\n\
+Purpose: build the terminal UI in ratatui\n\
+Owns:\n- crates/logscope-fan/src/tui.rs\n\
+Tools:\n- read_file\n- edit\n\
+Success:\n- cargo test passes cleanly with no warnings\n";
+        let spec = logscope_fan::queen::WorkerSpec::parse(good).expect("parses");
+        spec.validate(crate::workspace_exec::RUNTIME_TOOLS).expect("validates");
+        chat.roster.add(spec);
+        assert_eq!(chat.roster.len(), before + 1);
+        assert!(chat.roster.get("rust-ratatui-coder").is_some());
+
+        // An uncheckable success criterion — the exact failure `validate` exists to catch.
+        let bad = "Name: vague-bee\nPurpose: make things nice\nSuccess:\n- the code is clean\n";
+        let bad_spec = logscope_fan::queen::WorkerSpec::parse(bad).expect("parses");
+        let err = bad_spec.validate(crate::workspace_exec::RUNTIME_TOOLS).unwrap_err();
+        assert!(err.correction().contains("cannot be checked"), "{}", err.correction());
+    }
+
+    /// `do_enlist`, exercised through the ACTUAL chain-walk (not just the parse/validate pieces
+    /// above): a real assistant message on the active lineage, containing a valid spec block, must
+    /// enlist; a message with an invalid spec must be refused with the reason; and an empty history
+    /// must say so rather than silently doing nothing.
+    #[test]
+    fn do_enlist_walks_the_real_lineage_to_the_latest_reply() {
+        let mut c = Chat::default();
+        assert!(c.do_enlist().contains("no assistant reply"), "nothing to enlist from yet");
+
+        let good = "Name: docs-linter\nPurpose: check docs for broken links\nOwns:\n- docs\n\
+Tools:\n- read_file\nSuccess:\n- a report file lists every broken link found\n";
+        c.msgs.push(Msg::user("design a docs-linter worker".into()));       // 0
+        let mut a = Msg::assistant();
+        *a.cur_mut() = good.to_string();
+        a.parent = Some(0);
+        c.msgs.push(a);                                                     // 1
+        c.active_leaf = Some(1);
+
+        let before = c.roster.len();
+        let result = c.do_enlist();
+        assert!(result.contains("enlisted docs-linter"), "{result}");
+        assert_eq!(c.roster.len(), before + 1);
+        assert!(c.roster.get("docs-linter").is_some());
+
+        // A second, later reply with an unchecked-tool spec must be refused, not silently ignored —
+        // and must NOT touch the roster.
+        let mut b = Msg::assistant();
+        *b.cur_mut() = "Name: rogue-bee\nPurpose: do anything\nTools:\n- delete_everything\n\
+Success:\n- cargo test passes\n".to_string();
+        b.parent = Some(1);
+        c.msgs.push(b);                                                     // 2
+        c.active_leaf = Some(2);
+        let before2 = c.roster.len();
+        let result2 = c.do_enlist();
+        assert!(result2.contains("refused"), "{result2}");
+        assert_eq!(c.roster.len(), before2, "a refused spec must not be added");
+    }
+
+    /// Two workers with equally-specific lanes over the same task must not silently run
+    /// unconfined without a trace — `stage_lane` should name the ambiguity and point at `:queen`,
+    /// per the design doc's "genuinely cannot tell → a Queen call, not a coin flip".
+    #[test]
+    fn an_ambiguous_staffing_decision_is_named_not_silently_dropped() {
+        let mut chat = Chat::default();
+        chat.roster.add(logscope_fan::queen::WorkerSpec {
+            name: "a-bee".into(), purpose: "own a/b".into(), owns: vec!["a/b".into()],
+            context: Vec::new(), tools: Vec::new(), constraints: Vec::new(),
+            success: vec!["cargo test passes".into()], persistence: logscope_fan::queen::Persistence::Persistent,
+        });
+        chat.roster.add(logscope_fan::queen::WorkerSpec {
+            name: "b-bee".into(), purpose: "also own a/b".into(), owns: vec!["a/b".into()],
+            context: Vec::new(), tools: Vec::new(), constraints: Vec::new(),
+            success: vec!["cargo test passes".into()], persistence: logscope_fan::queen::Persistence::Persistent,
+        });
+        let mut cfg = crate::workspace_exec::AgentConfig::default();
+        let line = chat.stage_lane(&mut cfg, "fix a/b/file.rs").expect("ambiguity must be reported");
+        assert!(line.contains("a-bee") && line.contains("b-bee") && line.contains("queen"), "{line}");
+        assert!(cfg.owns.is_empty(), "an ambiguous match must not silently pick a lane either");
+    }
+
+    /// The end-to-end path `docs/12-queen-and-workers.md`'s liaison audit asked for: a model with
+    /// declared architecture gaps must produce a HUD line the operator can see, and a model that
+    /// loads clean must not — a fabricated "no gaps" line would be exactly the ungrounded claim
+    /// the Liaison exists to refuse. This exercises `apply_evt` directly rather than the backend
+    /// worker thread, since that's the boundary `Chat` actually owns and can be tested at.
+    #[test]
+    fn a_model_load_with_declared_gaps_reaches_the_hud_and_a_clean_load_does_not() {
+        let mut c = Chat::default();
+        assert!(c.hud.is_empty(), "nothing has loaded yet");
+
+        c.apply_evt(Evt::Loaded(Ok(crate::backend::LoadInfo {
+            path: "gappy.gguf".into(),
+            template: TemplateKind::Llama3,
+            model_status: Some(logscope::liaison::ModelStatus {
+                name: "gemma-4-12b-it".into(),
+                arch: "gemma4".into(),
+                gaps: vec!["gemma4 needs sliding-window attention — NOT implemented".into()],
+            }),
+        })));
+        let hud_text = c.hud.all().iter().map(|s| s.text.clone()).collect::<Vec<_>>().join("\n");
+        assert!(hud_text.contains("gemma-4-12b-it"), "the HUD must name the model: {hud_text}");
+        assert!(hud_text.contains("sliding-window"), "and the actual gap: {hud_text}");
+
+        let mut c2 = Chat::default();
+        c2.apply_evt(Evt::Loaded(Ok(crate::backend::LoadInfo {
+            path: "clean.gguf".into(),
+            template: TemplateKind::Llama3,
+            model_status: Some(logscope::liaison::ModelStatus {
+                name: "Qwen3-Coder".into(),
+                arch: "qwen3moe".into(),
+                gaps: Vec::new(),
+            }),
+        })));
+        assert!(c2.hud.is_empty(), "a fully-supported model must add no HUD line");
+
+        // And a backend with nothing to report (llama.cpp, the daemon path) — None, not a
+        // fabricated "no gaps" ModelStatus — must equally add nothing.
+        let mut c3 = Chat::default();
+        c3.apply_evt(Evt::Loaded(Ok(crate::backend::LoadInfo {
+            path: "llamacpp.gguf".into(), template: TemplateKind::Llama3, model_status: None,
+        })));
+        assert!(c3.hud.is_empty(), "no status to report must not become a claim either way");
     }
 }

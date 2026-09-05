@@ -146,6 +146,7 @@ impl Branch {
     pub fn confidence(mut self, c: f64) -> Self { self.confidence = c.clamp(0.0, 1.0); self }
     pub fn hardware(mut self, h: &str) -> Self { self.hardware.push(h.into()); self }
     pub fn author(mut self, a: &str) -> Self { self.author = a.into(); self }
+    pub fn origin_model(mut self, m: &str) -> Self { self.origin_model = m.into(); self }
     pub fn parent(mut self, p: &str) -> Self { self.parent = Some(p.into()); self }
     pub fn status(mut self, s: Status) -> Self { self.status = s; self }
 
