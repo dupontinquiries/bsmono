@@ -96,6 +96,30 @@ pub struct Save {
     /// hull here (the wizard picks hull first, so cross-checking belongs
     /// there, not in the save format).
     pub berth: usize,
+    /// OVERLOAD/CIRCUIT progress — added ahead of any in-game resume UI,
+    /// same "plumbing only" shape as `wep_mods` above: `circuit.rs`,
+    /// `overload.rs` and `moons.rs` are real and fully tested, but there
+    /// was nowhere to remember a run across a relaunch. Empty
+    /// `circuit_last_stop` means "never entered the facility" —
+    /// `overload.rs` starts a brand-new run from the Dock either way,
+    /// this only lets a results screen or a continue prompt say where
+    /// the player last got to.
+    pub circuit_last_stop: String,
+    /// highest wave number any run has reached, for a results screen.
+    pub circuit_best_wave: i32,
+    /// most laps completed in a single run.
+    pub circuit_best_laps: u32,
+    /// the Dock bank (`docs`'s design brief marks this OPEN — whether
+    /// valence should persist across runs at all — so this is plumbing
+    /// for that decision, not a claim it's been made; nothing writes to
+    /// this yet).
+    pub circuit_bank: i64,
+    /// has this save ever finished the intro cutscene? `false` on a
+    /// brand-new save (and on a mangled one, per the lenient-parse
+    /// contract) — `flow.rs` reads this to decide whether a launch goes
+    /// through the intro and straight into Campaign, or skips both and
+    /// opens on the character hub.
+    pub seen_intro: bool,
 }
 
 impl Default for Save {
@@ -192,6 +216,11 @@ impl Default for Save {
             signature: 0,
             hull: 0,
             berth: 0,
+            circuit_last_stop: String::new(),
+            circuit_best_wave: 0,
+            circuit_best_laps: 0,
+            circuit_bank: 0,
+            seen_intro: false,
         }
     }
 }
@@ -264,6 +293,11 @@ pub fn parse(text: &str) -> (Save, Bindings, Config) {
             "signature" => s.signature = v.parse::<usize>().unwrap_or(s.signature) % crate::content::SIGNATURES.len(),
             "hull" => s.hull = v.parse::<usize>().unwrap_or(s.hull) % crate::ship::HULLS.len(),
             "berth" => s.berth = v.parse::<usize>().unwrap_or(s.berth),
+            "circuit_last_stop" => s.circuit_last_stop = v.to_string(),
+            "circuit_best_wave" => s.circuit_best_wave = v.parse().unwrap_or(s.circuit_best_wave),
+            "circuit_best_laps" => s.circuit_best_laps = v.parse().unwrap_or(s.circuit_best_laps),
+            "circuit_bank" => s.circuit_bank = v.parse().unwrap_or(s.circuit_bank),
+            "seen_intro" => s.seen_intro = v == "1",
             "cfg" => {
                 if let Some((ck, cv)) = v.split_once(' ') {
                     cfg.load_line(ck, cv);
@@ -343,6 +377,21 @@ pub fn render(s: &Save, b: &Bindings, cfg: &Config) -> String {
     let _ = writeln!(out, "signature {}", s.signature);
     let _ = writeln!(out, "hull {}", s.hull);
     let _ = writeln!(out, "berth {}", s.berth);
+    if !s.circuit_last_stop.is_empty() {
+        let _ = writeln!(out, "circuit_last_stop {}", s.circuit_last_stop);
+    }
+    if s.circuit_best_wave > 0 {
+        let _ = writeln!(out, "circuit_best_wave {}", s.circuit_best_wave);
+    }
+    if s.circuit_best_laps > 0 {
+        let _ = writeln!(out, "circuit_best_laps {}", s.circuit_best_laps);
+    }
+    if s.circuit_bank != 0 {
+        let _ = writeln!(out, "circuit_bank {}", s.circuit_bank);
+    }
+    if s.seen_intro {
+        let _ = writeln!(out, "seen_intro 1");
+    }
     b.save_lines(&mut out);
     cfg.save_lines(&mut out);
     out
@@ -426,6 +475,11 @@ mod tests {
             signature: 7,
             hull: 3,
             berth: 4,
+            circuit_last_stop: "tithe".into(),
+            circuit_best_wave: 9,
+            circuit_best_laps: 2,
+            circuit_bank: 1250,
+            seen_intro: true,
         }
     }
 
@@ -479,6 +533,11 @@ mod tests {
         assert_eq!(got.signature, want.signature, "signature");
         assert_eq!(got.hull, want.hull, "hull");
         assert_eq!(got.berth, want.berth, "berth");
+        assert_eq!(got.circuit_last_stop, want.circuit_last_stop, "circuit_last_stop");
+        assert_eq!(got.circuit_best_wave, want.circuit_best_wave, "circuit_best_wave");
+        assert_eq!(got.circuit_best_laps, want.circuit_best_laps, "circuit_best_laps");
+        assert_eq!(got.circuit_bank, want.circuit_bank, "circuit_bank");
+        assert_eq!(got.seen_intro, want.seen_intro, "seen_intro");
     }
 
     /// The guard against the NEXT one: if somebody adds a field to `Save` and

@@ -551,6 +551,16 @@ impl CampaignLog {
     pub fn line(&self) -> String {
         self.cleared.join(",")
     }
+    /// The next mission a player with this log hasn't cleared yet, in
+    /// `Mission::order` sequence — wraps to the FIRST mission once
+    /// everything is cleared, since replaying the campaign is a real
+    /// thing a player can do and "no next mission" isn't a state
+    /// anything downstream should have to handle.
+    pub fn next_mission(&self) -> &'static Mission {
+        let mut sorted: Vec<&'static Mission> = MISSIONS.iter().collect();
+        sorted.sort_by_key(|m| m.order);
+        sorted.iter().find(|m| !self.is_cleared(m.id)).copied().unwrap_or(sorted[0])
+    }
     pub fn record(&mut self, id: &str) -> bool {
         let Some(m) = MISSIONS.iter().find(|m| m.id == id) else { return false };
         if self.cleared.contains(&m.id) {
@@ -654,6 +664,44 @@ impl CampaignLog {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn next_mission_is_the_lowest_order_uncleared_one() {
+        let log = CampaignLog::default();
+        let m = log.next_mission();
+        let min_order = MISSIONS.iter().map(|m| m.order).min().unwrap();
+        assert_eq!(m.order, min_order);
+    }
+
+    #[test]
+    fn next_mission_skips_cleared_missions_in_order() {
+        let mut log = CampaignLog::default();
+        let first = log.next_mission();
+        log.record(first.id);
+        let second = log.next_mission();
+        assert_ne!(second.id, first.id);
+        assert!(second.order > first.order || MISSIONS.iter().filter(|m| m.order == first.order).count() > 1);
+    }
+
+    #[test]
+    fn next_mission_wraps_once_everything_is_cleared() {
+        let mut log = CampaignLog::default();
+        for m in MISSIONS {
+            log.record(m.id);
+        }
+        let mut sorted: Vec<&Mission> = MISSIONS.iter().collect();
+        sorted.sort_by_key(|m| m.order);
+        assert_eq!(log.next_mission().id, sorted[0].id);
+    }
+
+    #[test]
+    fn is_cleared_reflects_record() {
+        let mut log = CampaignLog::default();
+        let m = &MISSIONS[0];
+        assert!(!log.is_cleared(m.id));
+        log.record(m.id);
+        assert!(log.is_cleared(m.id));
+    }
 
     /// The unlock is for playtesters, so its failure modes are the ones that
     /// waste a playtester's session: silently doing nothing, or silently doing
