@@ -716,6 +716,15 @@ struct VoicetermApp {
     /// rather than a fidelity fix, and worth saying plainly because everything
     /// else in this file is measured against the QML.
     tabbar_open: bool,
+    /// The tab column's width when open. egui's `SidePanel` is CONTENT-driven
+    /// (chrome_mode.rs's headless measurement: `default_width` only widens
+    /// the permitted range), so this is what pins it: the column's content
+    /// asks for exactly this width every frame, and the number moves only
+    /// when the user drags the panel edge. Before this the column was as
+    /// wide as its widest row — one letter, most of the time — and re-laid
+    /// itself every time a row's text changed, which is the "things moving
+    /// around in the tabs" report.
+    tabbar_width: f32,
     /// The keycaps/gesture-chip row. Its own toggle because on a phone it is
     /// a THIRD permanent bottom bar stacked under the bar and the session
     /// strip — see `apply_compact_defaults`.
@@ -2299,17 +2308,40 @@ impl eframe::App for VoicetermApp {
         //
         // Resizable only when open: a drag handle on a chevron-width strip is a
         // target the user hits by accident while reaching for the chevron.
+        // The frame is painted EXPLICITLY, in the palette's card colour. With
+        // the style's default panel fill this column was drawn with whatever
+        // `apply_palette` left in `visuals.panel_fill`, and when that was
+        // transparent the collapsed strip showed the window's clear colour —
+        // the black bar the chevron "revealed". A panel that names its own
+        // fill cannot show through to anything.
+        let tabbar_frame = egui::Frame::side_top_panel(&ctx.style()).fill(self.colors.bg_card);
+        let tabbar_id = egui::Id::new("tabbar"); // SidePanel::left("tabbar")'s id, for the resize probe
+        // While the edge is being dragged the content must NOT pin the
+        // width, or a drag narrower than the pinned width is undone by
+        // layout on the same frame. egui names the resize widget
+        // `id.with("__resize")` (panel.rs); dragging it is the only time the
+        // column is allowed to be narrower than `tabbar_width`.
+        let resizing = ctx.is_being_dragged(tabbar_id.with("__resize"));
         let tabbar_panel = if self.tabbar_open {
             egui::SidePanel::left("tabbar")
                 .resizable(true)
-                .default_width(168.0)          // main.qml:4015 termSidebarWidth
-                .width_range(110.0..=340.0)    // main.qml:4685 drag clamp
+                .frame(tabbar_frame)
+                .default_width(self.tabbar_width)  // main.qml:4015 termSidebarWidth
+                .width_range(110.0..=340.0)        // main.qml:4685 drag clamp
         } else {
             egui::SidePanel::left("tabbar")
                 .resizable(false)
+                .frame(tabbar_frame)
                 .exact_width(adaptive.min_touch_target)
         };
-        tabbar_panel.show(ctx, |ui| {
+        let pinned = self.tabbar_width;
+        let tabbar_out = tabbar_panel.show(ctx, |ui| {
+            if self.tabbar_open && !resizing {
+                // The frame's inner margin is inside the panel rect; the
+                // content min is the rest. This is the line that pins the width.
+                let margin = tabbar_frame.inner_margin.sum().x; // the panel's own margin, not the window's
+                ui.set_min_width((pinned - margin).max(0.0));
+            }
             // The chevron points the way the panel will move, which is the
             // convention `rail` already set two panels over.
             if ui.small_button(if self.tabbar_open { "‹" } else { "›" })
@@ -2337,9 +2369,15 @@ impl eframe::App for VoicetermApp {
                 ui.separator();
                 let tabs: Vec<(String, bool)> = self.workspace.tabs.iter().enumerate()
                     .map(|(i, t)| (t.name.clone(), i == self.workspace.active)).collect();
+                // Rows at the OPEN column's pitch (33 = QML's 30 + 3), not 26:
+                // a toggle that keeps every row's y is a column folding, one
+                // that shuffles them is two different lists.
                 for (i, (name, active)) in tabs.iter().enumerate() {
                     let initial = name.chars().next().unwrap_or('\u{2022}').to_string();
-                    if uikit_egui::dock::list_row(ui, &initial, *active, 26.0, &self.colors).clicked() {
+                    if uikit_egui::dock::list_row(ui, &initial, *active, 30.0, &self.colors)
+                        .on_hover_text(name)
+                        .clicked()
+                    {
                         self.workspace.active = i;
                     }
                 }
@@ -2349,7 +2387,7 @@ impl eframe::App for VoicetermApp {
                     ui.separator();
                     for (i, (name, active)) in sessions.iter().enumerate() {
                         let initial = name.chars().next().unwrap_or('\u{2022}').to_string();
-                        if uikit_egui::dock::list_row(ui, &initial, *active, 26.0, &self.colors)
+                        if uikit_egui::dock::list_row(ui, &initial, *active, 30.0, &self.colors)
                             .on_hover_text(name)
                             .clicked()
                         {
@@ -2465,6 +2503,16 @@ impl eframe::App for VoicetermApp {
                 }
             }
         });
+        // Read the width back: after a drag the panel's rect is the new
+        // width, and it becomes the pinned one. Not during the drag itself
+        // (the rect is then wherever the pointer is), and never when
+        // collapsed (the strip's width is the touch target, not a choice).
+        if self.tabbar_open && !resizing {
+            let w = tabbar_out.response.rect.width();
+            if (w - self.tabbar_width).abs() > 0.5 && (110.0..=340.0).contains(&w) {
+                self.tabbar_width = w;
+            }
+        }
         }  // if show_chrome — the tab column follows the sidebar and keycaps
 
         // THE COMMAND PALETTE, above everything. Ctrl+P or "open command
@@ -4872,6 +4920,7 @@ fn main() -> eframe::Result<()> {
             // Open by default: a control the user has not met yet must not
             // start hidden, or the tabs look lost rather than collapsed.
             tabbar_open: true,
+            tabbar_width: 168.0, // main.qml:4015 termSidebarWidth
                 // One page = one tab. 320 px matches the snapclone convention
                 // the layer was written against, so the detent lands where a
                 // thumb expects it on every app in the fleet.

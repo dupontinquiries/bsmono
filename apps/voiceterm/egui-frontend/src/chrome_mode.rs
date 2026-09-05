@@ -477,6 +477,37 @@ mod headless_layout {
         measured
     }
 
+    /// The fix for the above, measured the same way: content that asks for
+    /// the pinned width makes the column that width, whatever its rows say.
+    /// One-letter rows — the screenshot's case — at 168, then at a narrower
+    /// pin, then at one the range clamps. This is what
+    /// `voiceterm_egui.rs`'s tab column does with `tabbar_width`.
+    #[test]
+    fn content_min_width_pins_the_column_where_default_width_could_not() {
+        fn pinned_width(pin: f32) -> f32 {
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 900.0)));
+            let mut measured = 0.0f32;
+            for _ in 0..3 {
+                let _ = ctx.run(input.clone(), |ctx| {
+                    let out = egui::SidePanel::left("tabbar-pinned").resizable(true)
+                        .default_width(pin).width_range(110.0..=340.0)
+                        .show(ctx, |ui| {
+                            let margin = egui::Frame::side_top_panel(ui.style()).inner_margin.sum().x;
+                            ui.set_min_width((pin - margin).max(0.0));
+                            for l in ["m", "k", "k"] { ui.label(l); }
+                        });
+                    measured = out.response.rect.width();
+                });
+            }
+            measured
+        }
+        assert!((pinned_width(168.0) - 168.0).abs() < 1.5, "pinned 168, laid out {}", pinned_width(168.0));
+        assert!((pinned_width(130.0) - 130.0).abs() < 1.5, "pinned 130, laid out {}", pinned_width(130.0));
+        assert!((pinned_width(90.0) - 110.0).abs() < 1.5, "below the range: clamped to 110, laid out {}", pinned_width(90.0));
+    }
+
     /// `default_width` DOES NOT PIN THE WIDTH, which the source reads as if it
     /// does.
     ///
