@@ -4451,6 +4451,14 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
             let tree_branch = (3 + branches / 8).clamp(3, 5); // only genuinely forky chats bushier (branches are obstacles)
             let branch_spread = 0.5 + tfrac(0x75) * 0.35;     // 0.50..0.85 second branching factor: how wide forks splay
             let prop_density = (0.75 + tfrac(0x76) * 0.5 + (n as f32 / 240.0).min(0.35)).clamp(0.7, 1.6); // street props scale with seed + size
+            // THE BOARD SHOWS THE CONVERSATION. `scene3d::build` only ever had
+            // the palette name, so the physical UI panel drew a stand-in in
+            // every world. Segments are the real shape in scope here — a long
+            // stretch of talk gets a wide card — and the scene cache keys on a
+            // bucketed copy, so this churning every frame does not rebuild it.
+            crate::scene3d::set_panel_context(
+                crate::panel_rows::PanelContext::from_rows(
+                    &crate::panel_rows::from_spans(&segs, None)));
             crate::scene3d::set_env_params(crate::scene3d::EnvParams {
                 nodes: n as u32, branches, segments: segs.len() as u32, seed,
                 ext_x: ext_x.ceil() as u32, ext_z: ext_z.ceil() as u32, bear,

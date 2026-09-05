@@ -67,6 +67,37 @@ pub fn from_labels(items: &[(String, bool)]) -> Vec<Row> {
         .collect()
 }
 
+/// Rows from the conversation's own segments — `(start, end)` ranges, as
+/// `convograph::segments()` returns them.
+///
+/// Width tracks a segment's LENGTH against the longest, which is the same
+/// relative rule `from_labels` uses and is real data rather than a stand-in:
+/// a long stretch of talk gets a wide card. `active` marks the segment the
+/// view is in.
+///
+/// This exists because the scene builder has spans in scope and never had
+/// labels — the panel does not need text to be honest about shape.
+pub fn from_spans(spans: &[(usize, usize)], active: Option<usize>) -> Vec<Row> {
+    let taken: Vec<&(usize, usize)> = spans.iter().take(MAX_ROWS).collect();
+    let longest = taken
+        .iter()
+        .map(|(a, b)| b.saturating_sub(*a).max(1))
+        .max()
+        .unwrap_or(1) as f32;
+    taken
+        .iter()
+        .enumerate()
+        .map(|(i, (a, b))| {
+            let frac = b.saturating_sub(*a).max(1) as f32 / longest;
+            Row {
+                width01: (MIN_WIDTH01 + frac * (MAX_WIDTH01 - MIN_WIDTH01))
+                    .clamp(MIN_WIDTH01, MAX_WIDTH01),
+                accent: active == Some(i),
+            }
+        })
+        .collect()
+}
+
 /// The board with nothing on it.
 ///
 /// ONE dim narrow card, not four. An empty context showing four full-width
@@ -125,12 +156,103 @@ pub fn row_glow(light: scene_kit::mesh3d::SceneLight, index: usize, of: usize, s
     scene_kit::mesh3d::modulate_dot(light, gx, gy, seed, t).0
 }
 
+
+/// The live rows, in a form the scene cache can key on.
+///
+/// A fixed-size `Copy` struct rather than a `Vec` because it follows
+/// `EnvParams` exactly: set every frame into a thread-local `Cell`, read by
+/// `scene3d::build`, and bucketed by [`PanelContext::quantized`] for the
+/// cache key. The baked scene is expensive to rebuild and the context list
+/// churns — an exact-equality key on raw widths would rebuild the whole
+/// world every time a filename changed by a character.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PanelContext {
+    rows: [Row; MAX_ROWS],
+    len: u8,
+}
+
+impl Default for PanelContext {
+    /// The stand-in, so a scene built before anyone sets a context still
+    /// has a plausible board rather than an empty one.
+    fn default() -> Self {
+        PanelContext::from_rows(&placeholder())
+    }
+}
+
+impl PanelContext {
+    pub fn from_rows(rows: &[Row]) -> PanelContext {
+        let mut out = [Row { width01: 0.0, accent: false }; MAX_ROWS];
+        let n = rows.len().min(MAX_ROWS);
+        out[..n].copy_from_slice(&rows[..n]);
+        PanelContext { rows: out, len: n as u8 }
+    }
+
+    pub fn rows(&self) -> &[Row] {
+        &self.rows[..self.len as usize]
+    }
+
+    /// Bucketed for the cache key: widths to eighths, which is finer than
+    /// the eye reads a card at this distance and coarse enough that renaming
+    /// one entry does not rebuild the scene.
+    pub fn quantized(self) -> PanelContext {
+        let mut out = self;
+        for r in &mut out.rows {
+            r.width01 = (r.width01 * 8.0).round() / 8.0;
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn items(v: &[(&str, bool)]) -> Vec<(String, bool)> {
         v.iter().map(|(s, a)| ((*s).to_string(), *a)).collect()
+    }
+
+    #[test]
+    fn a_longer_segment_gets_a_wider_card_and_the_active_one_is_marked() {
+        // Real data: spans as convograph reports them.
+        let r = from_spans(&[(0, 3), (3, 20), (20, 25)], Some(1));
+        assert!(r[1].width01 > r[0].width01 && r[1].width01 > r[2].width01);
+        assert!((r[1].width01 - MAX_WIDTH01).abs() < 1e-6);
+        assert!(r[1].accent && !r[0].accent);
+        // Degenerate spans do not vanish or divide by zero.
+        let z = from_spans(&[(5, 5), (5, 5)], None);
+        assert_eq!(z.len(), 2);
+        assert!(z.iter().all(|x| x.width01 >= MIN_WIDTH01));
+        assert!(from_spans(&[], None).is_empty());
+        // Reversed/rubbish spans clamp rather than panic.
+        assert!(from_spans(&[(9, 2)], None)[0].width01 >= MIN_WIDTH01);
+    }
+
+    #[test]
+    fn the_cache_key_survives_a_rename_but_notices_a_real_change() {
+        // The property the scene cache depends on: churn in the context must
+        // not rebuild a 7000-line world, but a genuinely different board must.
+        let a = PanelContext::from_rows(&from_labels(&items(&[
+            ("soil_analysis.pdf", false), ("field_notes.mdx", false)])));
+        let b = PanelContext::from_rows(&from_labels(&items(&[
+            ("soil_analysis.pdf", false), ("field_notes.mdy", false)])));
+        assert_eq!(a.quantized(), b.quantized(), "a one-character rename is not a rebuild");
+        let c = PanelContext::from_rows(&from_labels(&items(&[
+            ("soil_analysis.pdf", false), ("field_notes.mdx", false), ("third.csv", false)])));
+        assert_ne!(a.quantized(), c.quantized(), "a new entry is");
+        let d = PanelContext::from_rows(&from_labels(&items(&[
+            ("soil_analysis.pdf", true), ("field_notes.mdx", false)])));
+        assert_ne!(a.quantized(), d.quantized(), "so is moving the selection");
+    }
+
+    #[test]
+    fn a_context_round_trips_and_caps_without_panicking() {
+        let many: Vec<(String, bool)> = (0..40).map(|i| (format!("e{i}"), false)).collect();
+        let ctx = PanelContext::from_rows(&from_labels(&many));
+        assert_eq!(ctx.rows().len(), MAX_ROWS);
+        assert!(PanelContext::from_rows(&[]).rows().is_empty());
+        // Default is the stand-in, not an empty board: a scene built before
+        // any context arrives should still look like a board.
+        assert_eq!(PanelContext::default().rows().len(), placeholder().len());
     }
 
     #[test]

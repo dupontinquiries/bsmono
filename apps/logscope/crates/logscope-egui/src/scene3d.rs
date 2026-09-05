@@ -5933,7 +5933,7 @@ fn build(palette_name: &str) -> Scene {
         let pz = ep.ext_z as f32 * 0.5 + 3.0;
         let face = (-pz).atan2(-px); // face back toward the graph at the origin
         physical_ui_panel(&mut s, ui_style, v(px, ui_floor, pz), face, 3.4, 2.1, floating, 0x5151,
-                          &crate::panel_rows::placeholder(),
+                          panel_context().rows(),
                           scene_kit::mesh3d::scene_light_for(palette_name));
     }
     // Atlantis is SELF-ENCLOSING (its own ribbed glass dome + perimeter wall + open ocean beyond), so it does
@@ -6141,6 +6141,22 @@ thread_local! { static ENV_PARAMS: std::cell::Cell<EnvParams> = const { std::cel
 pub fn set_env_params(p: EnvParams) { ENV_PARAMS.with(|c| c.set(p)); }
 pub fn env_params() -> EnvParams { ENV_PARAMS.with(|c| c.get()) }
 
+thread_local! {
+    static PANEL_CTX: std::cell::RefCell<crate::panel_rows::PanelContext> =
+        std::cell::RefCell::new(crate::panel_rows::PanelContext::default());
+}
+/// Feed the live context list to the physical UI panel (call before
+/// `with_env`/`render_env`, like `set_env_params`).
+///
+/// This is what the panel had been missing: `build` had only the palette
+/// name in scope, so its board showed a stand-in in every world. Rows in,
+/// board out — and the cache key below is bucketed so the churn of a
+/// growing context does not rebuild the scene.
+pub fn set_panel_context(ctx: crate::panel_rows::PanelContext) {
+    PANEL_CTX.with(|c| *c.borrow_mut() = ctx);
+}
+pub fn panel_context() -> crate::panel_rows::PanelContext { PANEL_CTX.with(|c| *c.borrow()) }
+
 impl EnvParams {
     /// A coarsely-bucketed copy for the scene-cache key. The baked environment is expensive to rebuild, but
     /// `set_env_params` runs every frame and its continuous fields (node count as messages stream, `ext_*` as
@@ -6216,7 +6232,7 @@ fn push_collider(col: Collider) { COLLIDERS.with(|c| c.borrow_mut().push(col)); 
 pub fn env_colliders() -> Vec<Collider> { COLLIDERS.with(|c| c.borrow().clone()) }
 
 // cached baked scene (rebuilt when the palette, detail variant, OR conversation params change); per-frame only floats update.
-thread_local! { static ENV: std::cell::RefCell<Option<(String, u8, EnvParams, Scene, f32)>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { static ENV: std::cell::RefCell<Option<(String, u8, EnvParams, Scene, f32, crate::panel_rows::PanelContext)>> = const { std::cell::RefCell::new(None) }; }
 
 /// Build/cache the themed environment for `palette_name`, float it for `t`, and hand the animated meshes to
 /// `f` (for the GPU path to pack into a vertex buffer). Geometry is cached; only the float offsets update.
@@ -6225,8 +6241,12 @@ pub fn with_env(palette_name: &str, t: f32, f: impl FnOnce(&[Mesh3])) {
         let mut b = cell.borrow_mut();
         let var = crate::theme::variant();
         let pr = env_params().quantized(); // bucketed cache key — rebuild only on meaningful growth
-        if b.as_ref().map_or(true, |(n, v, p, _, _)| n != palette_name || *v != var || *p != pr) {
-            *b = Some((palette_name.to_string(), var, pr, build(palette_name), t)); // record build time for the build-in
+        // The panel's rows are part of the baked geometry, so they belong in
+        // the key too — bucketed the same way, so renaming one context entry
+        // does not rebuild the world.
+        let pc = panel_context().quantized();
+        if b.as_ref().map_or(true, |(n, v, p, _, _, q)| n != palette_name || *v != var || *p != pr || *q != pc) {
+            *b = Some((palette_name.to_string(), var, pr, build(palette_name), t, pc)); // record build time for the build-in
         }
         let entry = b.as_mut().unwrap();
         let bt = entry.4;
@@ -6244,8 +6264,9 @@ pub fn render_env(painter: &egui::Painter, cam: &OrbitCam, cx: f32, cy: f32, sca
         let mut b = cell.borrow_mut();
         let var = crate::theme::variant();
         let pr = env_params().quantized(); // bucketed cache key — rebuild only on meaningful growth
-        if b.as_ref().map_or(true, |(n, v, p, _, _)| n != palette_name || *v != var || *p != pr) {
-            *b = Some((palette_name.to_string(), var, pr, build(palette_name), t));
+        let pc = panel_context().quantized();
+        if b.as_ref().map_or(true, |(n, v, p, _, _, q)| n != palette_name || *v != var || *p != pr || *q != pc) {
+            *b = Some((palette_name.to_string(), var, pr, build(palette_name), t, pc));
         }
         let entry = b.as_mut().unwrap();
         let bt = entry.4;
