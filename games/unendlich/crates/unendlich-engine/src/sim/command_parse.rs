@@ -21,6 +21,17 @@ pub enum FindKind {
     Water,
 }
 
+/// What `/land` was asked to do.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum LandOp {
+    /// Bare `/land`: what is claimed where I stand.
+    Here,
+    Info(String),
+    Add { id: String, player: String },
+    /// `/land claim <name>` — claim the last build.
+    Claim(String),
+}
+
 /// `/anim` reveal profile. Mirrors `voxel_tools::anim::Profile`; kept as
 /// its own enum so this parser stays dependency-free.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -129,6 +140,12 @@ pub enum Command {
     Keys,
     /// `/cancel` — drop a model request in flight.
     Cancel,
+    /// `/land` — list claims here; `/land info <id>`; `/land add <id> <player>`.
+    /// Player names and workset ids keep their case.
+    Land(LandOp),
+    /// `/world <verb> [args]` — drive the engine's own systems:
+    /// hotter, colder, wetter, drier, flood, freeze.
+    World { verb: String, arg: Option<String> },
     /// `/provider` — show the current one; `/provider <spec>` — switch.
     /// Specs: `fixture`, `script`, `ollama[:host[:model]]`,
     /// `openai[:host]`. Case preserved: a model name is data.
@@ -241,6 +258,23 @@ pub fn parse(line: &str) -> Command {
         },
         "/keys" => if args.is_empty() { Command::Keys } else { Command::Unknown },
         "/cancel" => if args.is_empty() { Command::Cancel } else { Command::Unknown },
+        "/land" => match args.as_slice() {
+            [] => Command::Land(LandOp::Here),
+            [sub, rest @ ..] => match (sub.to_ascii_lowercase().as_str(), rest) {
+                ("info", [id]) => Command::Land(LandOp::Info((*id).to_string())),
+                ("add", [id, player]) => Command::Land(LandOp::Add {
+                    id: (*id).to_string(), player: (*player).to_string() }),
+                // A name may have spaces: `/land claim the big hall`.
+                ("claim", n) if !n.is_empty() => Command::Land(LandOp::Claim(n.join(" "))),
+                _ => Command::Unknown,
+            },
+        },
+        "/world" => match args.as_slice() {
+            [v] => Command::World { verb: v.to_ascii_lowercase(), arg: None },
+            [v, a] => Command::World { verb: v.to_ascii_lowercase(),
+                                       arg: Some((*a).to_string()) },
+            _ => Command::Unknown,
+        },
         "/provider" => match args.as_slice() {
             [] => Command::Provider(None),
             [spec] => Command::Provider(Some((*spec).to_string())),
@@ -357,7 +391,8 @@ impl Command {
     /// run headless. The bin uses this to route `/recipes`/`/help` to a panel.
     pub fn opens_gui(&self) -> bool {
         matches!(self, Command::Recipes | Command::Help
-                     | Command::Build(_) | Command::ShowPlan | Command::Model(_))
+                     | Command::Build(_) | Command::ShowPlan | Command::Model(_)
+                     | Command::Land(_))
     }
 
     /// Render the command back to its canonical `/verb args` string. Returns
@@ -383,6 +418,12 @@ impl Command {
             Command::Anim(p) => Some(format!("/anim {}", p.keyword())),
             Command::Keys => Some("/keys".to_string()),
             Command::Cancel => Some("/cancel".to_string()),
+            Command::Land(LandOp::Here) => Some("/land".to_string()),
+            Command::Land(LandOp::Info(id)) => Some(format!("/land info {id}")),
+            Command::Land(LandOp::Add { id, player }) => Some(format!("/land add {id} {player}")),
+            Command::Land(LandOp::Claim(n)) => Some(format!("/land claim {n}")),
+            Command::World { verb, arg: None } => Some(format!("/world {verb}")),
+            Command::World { verb, arg: Some(a) } => Some(format!("/world {verb} {a}")),
             Command::Provider(None) => Some("/provider".to_string()),
             Command::Provider(Some(s)) => Some(format!("/provider {s}")),
             Command::Model(None) => Some("/model".to_string()),
@@ -636,6 +677,41 @@ mod tests {
                    Command::Provider(Some("ollama:127.0.0.1:11434:Qwen2.5-Coder".to_string())));
         assert_eq!(parse("/provider a b"), Command::Unknown, "one spec only");
         for c in [Command::Provider(None), Command::Provider(Some("fixture".into()))] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c);
+        }
+    }
+
+    #[test]
+    fn land_verbs_parse_and_keep_their_case() {
+        // Workset ids and player names are identifiers, not keywords.
+        assert_eq!(parse("/land"), Command::Land(LandOp::Here));
+        assert_eq!(parse("/land info w3"), Command::Land(LandOp::Info("w3".into())));
+        assert_eq!(parse("/land add w3 KesslerD"),
+                   Command::Land(LandOp::Add { id: "w3".into(), player: "KesslerD".into() }));
+        // a claim name may have spaces
+        assert_eq!(parse("/land claim the Big Hall"),
+                   Command::Land(LandOp::Claim("the Big Hall".into())));
+        assert_eq!(parse("/land add w3"), Command::Unknown, "add needs both");
+        assert_eq!(parse("/land wat"), Command::Unknown);
+        for c in [Command::Land(LandOp::Here),
+                  Command::Land(LandOp::Info("w1".into())),
+                  Command::Land(LandOp::Add { id: "w1".into(), player: "Ann".into() }),
+                  Command::Land(LandOp::Claim("big hall".into()))] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c, "round trip");
+        }
+    }
+
+    #[test]
+    fn world_verbs_parse_and_round_trip() {
+        assert_eq!(parse("/world hotter"),
+                   Command::World { verb: "hotter".into(), arg: None });
+        assert_eq!(parse("/world flood 68"),
+                   Command::World { verb: "flood".into(), arg: Some("68".into()) });
+        assert_eq!(parse("/world HOTTER"),
+                   Command::World { verb: "hotter".into(), arg: None }, "verb lower-cased");
+        assert_eq!(parse("/world"), Command::Unknown);
+        for c in [Command::World { verb: "freeze".into(), arg: None },
+                  Command::World { verb: "flood".into(), arg: Some("70".into()) }] {
             assert_eq!(parse(&c.to_command_string().unwrap()), c);
         }
     }

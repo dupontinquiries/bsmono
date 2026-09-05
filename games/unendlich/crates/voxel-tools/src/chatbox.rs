@@ -98,8 +98,19 @@ pub const CARDS: &[Card] = &[
                      Ctrl+C copy line · Ctrl+Shift+C copy log · Ctrl+U clear · \
                      Ctrl+Enter commit · Ctrl+Z undo · PgUp/PgDn focus. \
                      Commands: /build /build debug /plan /commit /undo /focus \
-                     /anim /model /provider /keys",
+                     /anim /model /provider /cancel /land /world /keys",
            example: "/keys", arg_words: &[] },
+    Card { command: "/cancel", signature: "/cancel",
+           summary: "Drop a model request in flight. The worker finishes; its answer is discarded.",
+           example: "/cancel", arg_words: &[] },
+    Card { command: "/land", signature: "/land [info ID | add ID PLAYER | claim NAME]",
+           summary: "What is built here, who owns it, and who else may change it.",
+           example: "/land info w3",
+           arg_words: &["info", "add", "claim"] },
+    Card { command: "/world", signature: "/world <hotter|colder|wetter|drier|flood|freeze> [n]",
+           summary: "Play god: nudge the climate, flood a basin, freeze a surface.",
+           example: "/world flood 68",
+           arg_words: &["hotter", "colder", "wetter", "drier", "flood", "freeze"] },
     Card { command: "/provider", signature: "/provider [engine|ollama|openai|script:CMD|fixture]",
            summary: "Which backend answers /build. 'engine' runs the model in this process on the GPU.",
            example: "/provider engine",
@@ -581,6 +592,7 @@ mod tests {
         const PARSER_VERBS: &[&str] = &[
             "/build", "/plan", "/commit", "/undo", "/focus", "/anim",
             "/model", "/provider", "/keys", "/find", "/locate",
+            "/cancel", "/land", "/world",
         ];
         for v in PARSER_VERBS {
             assert!(card_for(v).is_some(), "{v} has no card, so nobody will find it");

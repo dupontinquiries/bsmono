@@ -75,6 +75,10 @@ pub mod ambient;
 pub mod detail;
 /// Scene: computed ASCII views and terrain vocabulary for the prompt.
 pub mod scene;
+/// Land: worksets, ownership, and the conversation that made a build.
+pub mod land;
+/// Playing god: requests against the engine's own simulated fields.
+pub mod godmode;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.
