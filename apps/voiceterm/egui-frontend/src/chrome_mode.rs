@@ -200,8 +200,23 @@ impl Chrome {
 }
 
 /// Draw the locator line.
+/// The gap the locator leaves beneath itself, in points.
+///
+/// It owns its own trailing space rather than inheriting the surrounding
+/// `item_spacing`. Measured on a 420pt window, the strip was taking 39 px
+/// for an 11 px label — the label plus a touch-scaled gap above and below,
+/// on a control that is one small line of text and is never a touch target.
+/// Its own comment says it costs "fourteen points"; it was costing nearly
+/// three times that.
+pub const LOCATOR_GAP: f32 = 4.0;
+
 pub fn locator_ui(ui: &mut egui::Ui, text: &str, escaped: bool,
                   c: &uikit_egui::PaletteColors) {
+    // Tight INSIDE the row, and the trailing gap is set explicitly below.
+    // uikit's touch defaults inflate `item_spacing` for finger targets,
+    // which is right for buttons and wrong for a status line.
+    let saved = ui.spacing().item_spacing;
+    ui.spacing_mut().item_spacing.y = LOCATOR_GAP;
     ui.horizontal(|ui| {
         ui.colored_label(c.text_weak, egui::RichText::new(text).small());
         if escaped {
@@ -213,6 +228,12 @@ pub fn locator_ui(ui: &mut egui::Ui, text: &str, escaped: bool,
             });
         }
     });
+    // Restore for everything after, then claw back the difference between
+    // the inherited gap and ours — egui emits the spacing when the NEXT
+    // widget is added, so restoring alone would put the tall gap straight
+    // back underneath this row.
+    ui.spacing_mut().item_spacing = saved;
+    ui.add_space(LOCATOR_GAP - saved.y);
 }
 
 #[cfg(test)]

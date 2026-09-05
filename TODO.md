@@ -964,8 +964,10 @@ asked as a question.
   The characterising test asserts today's behaviour, so whichever is chosen
   it will fail loudly and can be updated deliberately.
 - [ ] **voiceterm-egui: further visual bugs.** REPORTED, unspecified. Known
-  and open from this session: the locator strip costs ~39 px for an 11 px
-  label (measured), and a one-frame panel overlap after a programmatic
+  and open from this session: the locator strip was ~39 px for an 11 px
+  label; PARTLY fixed 2026-09-05 (now ~24 px — it owns its trailing gap
+  instead of inheriting the touch-scaled one). The remaining ~13 px is the
+  pane's own top inset, not measured yet. Also a one-frame panel overlap after a programmatic
   resize. The demo scaffolding (fake "kesslerd" workspaces, canned
   transcript) is now behind `VOICETERM_DEMO=1`, so anything still appearing
   by default is a genuine bug rather than seed data.
