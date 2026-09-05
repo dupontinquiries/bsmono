@@ -16,6 +16,15 @@
 //!   edits; the caller flushes them through `ChunkManager::set_blocks`
 //!   (one clone per chunk) and marks the chunks dirty.
 
+// `ai-gpu` must imply `ai-engine`. It did not once, and the failure was
+// silent in the worst way: the describe() line said "in-instance" while
+// every code path was compiled out, so /build returned None instantly
+// and the message told the operator to enable a feature they already
+// had. A build with the GPU linked and the seam missing cannot exist.
+#[cfg(all(feature = "ai-gpu", not(feature = "ai-engine")))]
+compile_error!("feature `ai-gpu` requires `ai-engine`; ai-gpu should list it");
+
+
 use crate::sim::command_parse::{AnimProfile, Command, FocusAdjust};
 use crate::voxel_bind::{flush, WorldView};
 use crate::world::chunk_manager::ChunkManager;
@@ -179,8 +188,14 @@ impl ProviderChoice {
             ProviderChoice::Script(a) => format!("script: {}", a.join(" ")),
             ProviderChoice::Engine { model_path } => {
                 let which = if model_path.is_empty() { "the /model selection" } else { model_path };
+                // Gate on the SAME feature the code is gated on. Checking
+                // a different one is how this reported "in-instance" while
+                // the engine was compiled out.
                 if cfg!(feature = "ai-gpu") {
                     format!("wgpu engine, in-instance ({which})")
+                } else if cfg!(feature = "ai-engine") {
+                    format!("wgpu engine seam present but GPU not linked ({which}) -- \
+                             rebuild with --features ai-gpu")
                 } else {
                     format!("wgpu engine ({which}) -- NOT COMPILED IN: \
                              rebuild with --features ai-gpu")
@@ -595,10 +610,15 @@ impl Paintbrush {
                 voxel_tools::model::LoadState::Loaded { name, .. } => {
                     match self.models.resolve(name) {
                         Ok(m) => m.path.display().to_string(),
-                        Err(e) => { self.say(e); return None; }
+                        Err(e) => {
+                            log::warn!("[paintbrush] engine: cannot resolve model: {e}");
+                            self.say(e);
+                            return None;
+                        }
                     }
                 }
                 _ => {
+                    log::warn!("[paintbrush] engine: no model chosen");
                     self.say("no model chosen -- /model <name> first, \
                               or /provider engine:/path/to/model.gguf");
                     return None;
@@ -609,17 +629,26 @@ impl Paintbrush {
         if self.engine.loaded() != Some(path.as_str()) {
             self.say(format!("loading {path} into the GPU (once) ..."));
         }
+        log::info!("[paintbrush] engine: ensuring {path}");
         match self.engine.ensure(&path, 512) {
-            Ok(inner) => Some(Box::new(EngineCompleter { inner, max_tokens: 512 })),
-            Err(e) => { self.say(format!("engine: {e}")); None }
+            Ok(inner) => {
+                log::info!("[paintbrush] engine ready");
+                Some(Box::new(EngineCompleter { inner, max_tokens: 512 }))
+            }
+            Err(e) => {
+                log::warn!("[paintbrush] engine load failed: {e}");
+                self.say(format!("engine: {e}"));
+                None
+            }
         }
     }
 
     #[cfg(not(feature = "ai-engine"))]
     fn engine_completer(&mut self, _model_path: &str)
         -> Option<Box<dyn voxel_tools::llm::Completer>> {
-        self.say("the in-instance wgpu engine is not compiled in -- \
-                  rebuild with --features ai-gpu, or /provider ollama");
+        log::warn!("[paintbrush] engine requested but ai-engine is not compiled in");
+        self.say("the in-instance wgpu engine is not compiled in (no ai-engine \
+                  feature) -- rebuild with --features ai-gpu, or /provider ollama");
         None
     }
 

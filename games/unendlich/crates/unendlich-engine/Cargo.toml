@@ -80,7 +80,12 @@ libc = "0.2"
 
 [features]
 # The model lives in this process, on the GPU. No server, no subprocess.
-ai-gpu = ["dep:aperture-engine", "aperture-engine/gpu"]
+# ai-gpu IMPLIES ai-engine. It did not, and the result was the worst kind
+# of silent failure: `describe()` checked ai-gpu and said "in-instance",
+# while every code path was gated on ai-engine and compiled out, so
+# /build returned None instantly and told the operator to enable the
+# feature they already had. One feature name for one thing.
+ai-gpu = ["ai-engine", "aperture-engine/gpu"]
 # The seam without the engine: /provider engine reports how to enable it.
 ai-engine = ["dep:aperture-engine"]
 default = ["gpu"]

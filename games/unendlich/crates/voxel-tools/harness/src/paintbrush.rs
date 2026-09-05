@@ -23,6 +23,15 @@ mod log {
     pub(crate) use warn_ as warn;
 }
 
+// `ai-gpu` must imply `ai-engine`. It did not once, and the failure was
+// silent in the worst way: the describe() line said "in-instance" while
+// every code path was compiled out, so /build returned None instantly
+// and the message told the operator to enable a feature they already
+// had. A build with the GPU linked and the seam missing cannot exist.
+#[cfg(all(feature = "ai-gpu", not(feature = "ai-engine")))]
+compile_error!("feature `ai-gpu` requires `ai-engine`; ai-gpu should list it");
+
+
 use crate::stubs::{AnimProfile, Command, FocusAdjust};
 use crate::stubs::parse as parse_command;
 use crate::bind::{flush, WorldView};
@@ -187,8 +196,14 @@ impl ProviderChoice {
             ProviderChoice::Script(a) => format!("script: {}", a.join(" ")),
             ProviderChoice::Engine { model_path } => {
                 let which = if model_path.is_empty() { "the /model selection" } else { model_path };
+                // Gate on the SAME feature the code is gated on. Checking
+                // a different one is how this reported "in-instance" while
+                // the engine was compiled out.
                 if cfg!(feature = "ai-gpu") {
                     format!("wgpu engine, in-instance ({which})")
+                } else if cfg!(feature = "ai-engine") {
+                    format!("wgpu engine seam present but GPU not linked ({which}) -- \
+                             rebuild with --features ai-gpu")
                 } else {
                     format!("wgpu engine ({which}) -- NOT COMPILED IN: \
                              rebuild with --features ai-gpu")
@@ -422,10 +437,17 @@ impl Paintbrush {
                 let is_debug = prose.trim_start().starts_with("debug");
                 log::info!("[paintbrush] /build debug={} ready={} prose={:?}",
                            is_debug, self.models.state.is_ready(), prose);
-                if !is_debug && !self.models.state.is_ready() {
-                    self.say("no model loaded -- /model to list, /model <name> to load, \
-                              or /build debug <anything> to test without one");
-                    return Pending::None;
+                // Ask the PROVIDER whether it can answer, not the model
+                // registry. `/model` is only one of the ways weights get
+                // chosen: `/provider engine:/path.gguf` carries its own,
+                // and an ollama or openai server has its own already
+                // loaded. Gating those on a /model that is irrelevant to
+                // them refused turns that would have worked.
+                if !is_debug {
+                    if let Some(why) = self.provider_not_ready() {
+                        self.say(why);
+                        return Pending::None;
+                    }
                 }
                 Pending::Model(prose)
             }
@@ -538,6 +560,25 @@ impl Paintbrush {
         debug_assert_eq!(staged.pending(), 0, "preview must not stage writes");
     }
 
+    /// Why the current provider cannot answer, or None if it can.
+    /// Cheap and side-effect free: it must not load anything.
+    pub fn provider_not_ready(&self) -> Option<String> {
+        match &self.provider {
+            // These bring their own weights or talk to something that has.
+            ProviderChoice::Fixture => None,
+            ProviderChoice::Script(_) => None,
+            ProviderChoice::Http(_) => None,
+            ProviderChoice::Engine { model_path } => {
+                if !model_path.is_empty() || self.models.state.is_ready() {
+                    None
+                } else {
+                    Some("the engine has no model -- /model <name>, \
+                          or /provider engine:/path/to/model.gguf".into())
+                }
+            }
+        }
+    }
+
     /// Build the completer for a turn. Everything the bin needs to know
     /// about provider selection lives here.
     ///
@@ -577,10 +618,15 @@ impl Paintbrush {
                 voxel_tools::model::LoadState::Loaded { name, .. } => {
                     match self.models.resolve(name) {
                         Ok(m) => m.path.display().to_string(),
-                        Err(e) => { self.say(e); return None; }
+                        Err(e) => {
+                            log::warn!("[paintbrush] engine: cannot resolve model: {e}");
+                            self.say(e);
+                            return None;
+                        }
                     }
                 }
                 _ => {
+                    log::warn!("[paintbrush] engine: no model chosen");
                     self.say("no model chosen -- /model <name> first, \
                               or /provider engine:/path/to/model.gguf");
                     return None;
@@ -591,17 +637,26 @@ impl Paintbrush {
         if self.engine.loaded() != Some(path.as_str()) {
             self.say(format!("loading {path} into the GPU (once) ..."));
         }
+        log::info!("[paintbrush] engine: ensuring {path}");
         match self.engine.ensure(&path, 512) {
-            Ok(inner) => Some(Box::new(EngineCompleter { inner, max_tokens: 512 })),
-            Err(e) => { self.say(format!("engine: {e}")); None }
+            Ok(inner) => {
+                log::info!("[paintbrush] engine ready");
+                Some(Box::new(EngineCompleter { inner, max_tokens: 512 }))
+            }
+            Err(e) => {
+                log::warn!("[paintbrush] engine load failed: {e}");
+                self.say(format!("engine: {e}"));
+                None
+            }
         }
     }
 
     #[cfg(not(feature = "ai-engine"))]
     fn engine_completer(&mut self, _model_path: &str)
         -> Option<Box<dyn voxel_tools::llm::Completer>> {
-        self.say("the in-instance wgpu engine is not compiled in -- \
-                  rebuild with --features ai-gpu, or /provider ollama");
+        log::warn!("[paintbrush] engine requested but ai-engine is not compiled in");
+        self.say("the in-instance wgpu engine is not compiled in (no ai-engine \
+                  feature) -- rebuild with --features ai-gpu, or /provider ollama");
         None
     }
 
