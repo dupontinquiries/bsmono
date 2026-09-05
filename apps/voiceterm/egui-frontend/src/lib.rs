@@ -219,6 +219,8 @@ mod shake_binding_tests {
     }
 }
 pub mod mail_view;
+pub mod mail_login_view;
+pub mod reading_trainer;
 pub mod archived_view;
 pub mod cards_view;
 pub mod graph_view;
