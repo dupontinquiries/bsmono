@@ -58,6 +58,67 @@ impl Pass {
     }
 }
 
+/// Rough token count. Four characters per token is the usual English
+/// approximation and is close enough for budgeting; the point is to
+/// notice a prompt that will not fit, not to be exact.
+pub fn approx_tokens(s: &str) -> usize { s.len() / 4 + 1 }
+
+/// How much room the prompt may take, given the model's context and the
+/// reply budget. Leaves headroom: a prompt that exactly fills the
+/// context leaves no room to generate, and the model emits nothing or
+/// truncates mid-line.
+pub fn prompt_budget_tokens(ctx: usize, max_reply: usize) -> usize {
+    ctx.saturating_sub(max_reply).saturating_sub(128).max(256)
+}
+
+/// A much shorter system prompt, for small models and tight contexts.
+///
+/// A 1B handed the full 3.3k-character prompt continued it by REPEATING
+/// IT — eight lines of the OPS reference came back as a "plan". More
+/// instruction is not more compliance: past some length a small model
+/// treats the reference as the thing to imitate. This keeps one worked
+/// example and the four ops that matter, and drops the discussion.
+pub const COMPACT: &str = "\
+Reply with plan lines only. No prose, no code fences, no explanation.
+@dx,dz is relative to where the player is looking. Y is automatic.
+
+These are real lines. Copy their SHAPE with your own numbers:
+terraform @-5,-5 @5,5 smooth block=stone
+cylinder @0,0 r=4 h=10 block=stone_bricks hollow
+path @4,0 @16,9 w=2 block=cobblestone
+tree @8,3 oak h=7
+sphere @3,0 r=1 block=air
+
+Blocks: stone, cobblestone, stone_bricks, oak_planks, dark_oak_planks, glass, snow.
+A tower 8 blocks wide is r=4, not r=8.
+
+Example -- player: a small watchtower
+# watchtower
+terraform @-5,-5 @5,5 smooth block=stone
+cylinder @0,0 r=3 h=11 block=stone_bricks hollow
+
+Now reply with plan lines only.";
+
+/// Below this context, use the compact prompt. A 1B with a 2k window
+/// given the full 3.3k-character prompt echoed the reference back
+/// instead of answering; the fix is less prompt, not more.
+pub const COMPACT_BELOW_CTX: usize = 8192;
+
+/// Pick a system prompt that fits. `ctx` is the model's context window
+/// in tokens; `max_reply` the generation budget.
+pub fn system_prompt_for(ctx: usize, max_reply: usize) -> String {
+    // Two reasons to go compact, and the first is not about arithmetic:
+    // a small model drowns in a long prompt regardless of whether it
+    // technically fits. Context size is the best proxy available for
+    // "small model" without asking the engine about parameter count.
+    if ctx < COMPACT_BELOW_CTX { return COMPACT.to_string(); }
+    let full = system_prompt();
+    let budget = prompt_budget_tokens(ctx, max_reply);
+    // The per-turn context (region digest, focus line, prose) is roughly
+    // 300 tokens on top of the system prompt.
+    if approx_tokens(&full) + 300 <= budget { full } else { COMPACT.to_string() }
+}
+
 /// The stable system prompt. Contains the grammar, the pass discipline,
 /// and worked examples that are themselves valid IR (there is a test
 /// that parses every example line).
@@ -194,5 +255,76 @@ mod tests {
         let req_at = t.find("player: a hut").unwrap();
         assert!(ctx_at < req_at);
         assert!(t.ends_with("plan:"), "ends where the model should start writing");
+    }
+
+    #[test]
+    fn a_small_context_gets_the_compact_prompt() {
+        // The 1B in the field: ~1000 tokens of prompt into a small ctx,
+        // 512 of reply, and it echoed the reference back.
+        let small = system_prompt_for(2048, 512);
+        assert_eq!(small, COMPACT, "2k ctx must not get the full prompt");
+        let big = system_prompt_for(16384, 512);
+        assert_eq!(big, system_prompt(), "16k ctx has room for the full one");
+        assert!(approx_tokens(&small) < approx_tokens(&big) / 2,
+                "compact must be much smaller: {} vs {}",
+                approx_tokens(&small), approx_tokens(&big));
+    }
+
+    #[test]
+    fn the_budget_always_leaves_room_to_generate() {
+        // a prompt that exactly fills the context leaves nothing to say
+        assert!(prompt_budget_tokens(2048, 512) <= 2048 - 512);
+        assert!(prompt_budget_tokens(512, 512) >= 256, "degenerate input stays usable");
+        assert!(prompt_budget_tokens(0, 0) >= 256);
+    }
+
+    #[test]
+    fn the_compact_examples_are_valid_ir_too() {
+        use crate::plan::parse_plan_at;
+        let plan_lines: Vec<&str> = COMPACT.lines()
+            .skip_while(|l| !l.starts_with("Example"))
+            .skip(1)
+            .take_while(|l| !l.trim().is_empty())
+            .collect();
+        assert!(plan_lines.len() >= 3, "{plan_lines:?}");
+        let (plan, issues) = parse_plan_at(&plan_lines.join("\n"), Some((0, 65, 0)));
+        assert!(issues.is_empty(), "compact example must parse: {issues:?}");
+        assert_eq!(plan.name, "watchtower");
+    }
+
+    #[test]
+    fn the_compact_prompt_carries_no_placeholder_lines() {
+        // It must not itself be echo-bait: if the model copies these
+        // lines they should still be valid IR-shaped, not `A B [x=N]`.
+        for l in COMPACT.lines() {
+            let t = l.trim();
+            if crate::llm::KNOWN_VERBS.iter().any(|v| t.starts_with(v)) {
+                assert!(!t.contains('[') && !t.contains(']'),
+                        "no bracket notation in the compact prompt: {t}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_verb_line_in_the_compact_prompt_is_itself_valid_ir() {
+        // The reference lines are echo-bait by nature -- a small model
+        // copies them. So they must be REAL: if the model returns one
+        // verbatim, it should build something, not fail to parse. The
+        // first version used @X,Z and r=RADIUS, which would have failed
+        // exactly the way the full prompt's `A B [r=N]` did.
+        use crate::plan::parse_plan_at;
+        let mut checked = 0;
+        for l in COMPACT.lines() {
+            let t = l.trim();
+            if !crate::llm::KNOWN_VERBS.iter().any(|v| t.starts_with(&format!("{v} "))) {
+                continue;
+            }
+            assert!(!crate::llm::is_grammar_echo(t), "echo-shaped: {t}");
+            let (plan, issues) = parse_plan_at(t, Some((0, 65, 0)));
+            assert!(issues.is_empty() && plan.ops.len() == 1,
+                    "compact reference line must parse: {t:?} -> {issues:?}");
+            checked += 1;
+        }
+        assert!(checked >= 5, "checked only {checked} reference lines");
     }
 }

@@ -17,7 +17,13 @@
 /// Same shape as `aperture_complete::Provider`: `&mut self`, a name,
 /// and a `Result<String, String>`. Deliberately not async and
 /// deliberately not HTTP -- see `CommandProvider` below for why.
-pub trait Completer {
+/// `Send` because generation runs on a worker thread: a 1B took 22.5
+/// seconds in the field, and doing that on the frame thread is a dead
+/// window, not a pause. Costs nothing in practice — aperture's
+/// `Backend` is already `Send + Sync`, a subprocess handle is Send, and
+/// a TcpStream is Send. The compiler asked for this the moment the work
+/// moved off-thread.
+pub trait Completer: Send {
     fn name(&self) -> &str { "completer" }
     /// Blocking. Call it off the frame thread.
     fn complete(&mut self, system: &str, user: &str) -> Result<String, String>;
@@ -128,19 +134,47 @@ pub fn clean_reply(raw: &str) -> String {
         }
         if !inside.is_empty() { lines = inside; }
     }
-    // Drop lines that cannot be IR: no known verb and not a comment.
+    // Drop lines that cannot be IR: no known verb, or a verb with
+    // placeholder arguments.
     let keep: Vec<&str> = lines.into_iter()
         .filter(|l| {
             let t = l.trim();
             if t.is_empty() { return false; }
             if t.starts_with('#') { return true; }
             let verb = t.split_whitespace().next().unwrap_or("");
-            KNOWN_VERBS.contains(&verb)
+            KNOWN_VERBS.contains(&verb) && !is_grammar_echo(t)
         })
         .collect();
     let mut out = keep.join("\n");
     if !out.is_empty() { out.push('\n'); }
     out
+}
+
+/// Is this line the GRAMMAR echoed back rather than a plan?
+///
+/// A small model handed a long instruction prompt will often continue
+/// it by repeating it. The echoed lines start with a real verb, so a
+/// verb check alone keeps them — and a 1B produced exactly this:
+/// `terraform A B [delta=N] [smooth] [block=B]`, eight of them, which
+/// reached the parser as eight ops and came back as eight "needs two
+/// x,z pairs" errors. The errors were right; the input was never a
+/// plan.
+///
+/// Signatures of the reference form, none of which appear in real IR:
+/// square brackets or angle brackets (optional-argument notation), and
+/// bare uppercase placeholders standing in for coordinates.
+pub fn is_grammar_echo(line: &str) -> bool {
+    if line.contains('[') || line.contains(']') || line.contains('<') || line.contains('>') {
+        return true;
+    }
+    const PLACEHOLDERS: &[&str] = &["A", "B", "N", "X", "Y", "Z", "SPECIES", "FROM", "TO",
+                                    "BLOCK", "PALETTE", "CMD"];
+    line.split_whitespace().skip(1).any(|tok| {
+        let bare = tok.trim_end_matches(',');
+        PLACEHOLDERS.contains(&bare)
+            // `block=B`, `r=N` -- a placeholder on the right of a key
+            || bare.split_once('=').is_some_and(|(_, v)| PLACEHOLDERS.contains(&v))
+    })
 }
 
 /// Verbs the plan parser accepts. Kept here so `clean_reply` and the
@@ -655,5 +689,42 @@ mod tests {
         let e = p.complete("s", "u").unwrap_err();
         assert!(e.contains("cannot reach 127.0.0.1:1"), "{e}");
         assert!(e.contains("is the server running"), "actionable: {e}");
+    }
+
+    #[test]
+    fn the_grammar_echoed_back_is_not_a_plan() {
+        // Exactly what a 1B returned, verbatim from the field log.
+        let raw = "terraform A B [delta=N] [smooth] [block=B]\n\
+                   path A B [w=N] [block=B]\n\
+                   enclose A B [h=N] [block=B]\n\
+                   cylinder A [r=N] [h=N] [block=B] [hollow]\n\
+                   sphere A [r=N] [block=B] [hollow]\n\
+                   tree A SPECIES [h=N] [lean=dx,dz]\n\
+                   scatter A B [block=B] [clusters=N] [per=N]\n\
+                   restyle A B FROM TO\n";
+        assert_eq!(clean_reply(raw), "", "grammar echo must not reach the parser");
+    }
+
+    #[test]
+    fn real_ir_survives_the_echo_filter() {
+        let raw = "# hut\n\
+                   terraform @-5,-5 @5,5 smooth block=stone\n\
+                   cylinder @0,0 r=3 h=9 block=stone_bricks hollow\n\
+                   tree @8,2 oak h=7\n\
+                   restyle @-4,-1,-4 @4,15,4 stone ruined\n";
+        let c = clean_reply(raw);
+        assert_eq!(c.lines().count(), 5, "{c}");
+        let (plan, issues) = crate::plan::parse_plan_at(&c, Some((0, 65, 0)));
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(plan.ops.len(), 4);
+    }
+
+    #[test]
+    fn a_half_echo_keeps_the_real_lines_only() {
+        // models mix the two: some real ops, then it drifts into the reference
+        let raw = "cylinder @0,0 r=3 h=9 block=stone\n\
+                   path A B [w=N] [block=B]\n\
+                   tree @5,5 oak\n";
+        assert_eq!(clean_reply(raw), "cylinder @0,0 r=3 h=9 block=stone\ntree @5,5 oak\n");
     }
 }

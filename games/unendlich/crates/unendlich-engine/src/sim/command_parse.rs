@@ -127,6 +127,8 @@ pub enum Command {
     Model(Option<String>),
     /// `/keys` — print the keybindings into the chat log.
     Keys,
+    /// `/cancel` — drop a model request in flight.
+    Cancel,
     /// `/provider` — show the current one; `/provider <spec>` — switch.
     /// Specs: `fixture`, `script`, `ollama[:host[:model]]`,
     /// `openai[:host]`. Case preserved: a model name is data.
@@ -238,6 +240,7 @@ pub fn parse(line: &str) -> Command {
             _ => Command::Unknown,
         },
         "/keys" => if args.is_empty() { Command::Keys } else { Command::Unknown },
+        "/cancel" => if args.is_empty() { Command::Cancel } else { Command::Unknown },
         "/provider" => match args.as_slice() {
             [] => Command::Provider(None),
             [spec] => Command::Provider(Some((*spec).to_string())),
@@ -379,6 +382,7 @@ impl Command {
             Command::BuildVoice(false) => Some("/build disableVoice".to_string()),
             Command::Anim(p) => Some(format!("/anim {}", p.keyword())),
             Command::Keys => Some("/keys".to_string()),
+            Command::Cancel => Some("/cancel".to_string()),
             Command::Provider(None) => Some("/provider".to_string()),
             Command::Provider(Some(s)) => Some(format!("/provider {s}")),
             Command::Model(None) => Some("/model".to_string()),

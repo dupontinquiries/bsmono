@@ -220,6 +220,43 @@ impl ProviderChoice {
     }
 }
 
+/// A model request running off the frame thread.
+///
+/// The provider call blocks for as long as generation takes -- 22.5
+/// seconds for a 1B in the field log, during which the window is dead:
+/// no camera, no chunk streaming, no way to cancel. That is not a
+/// pause, it is an unresponsive application.
+///
+/// So the turn is split. `start` hands the prompt to a worker and
+/// returns immediately; `poll` is called each frame and returns the
+/// reply when it arrives. The engine handle is `Send + Sync` (aperture
+/// requires it of every `Backend`), so the worker can hold a clone
+/// while the frame thread keeps drawing.
+pub struct PendingTurn {
+    rx: std::sync::mpsc::Receiver<Result<String, String>>,
+    pub started: Instant,
+    pub provider: String,
+    /// The gaze the turn was started with. A reply must be applied
+    /// against the focus it was PLANNED for -- the player will have
+    /// moved during those seconds, and @0,0 means where they were
+    /// looking when they asked, not where they drifted to.
+    pub gaze: Gaze,
+    pub player_feet: Option<(i32, i32, i32)>,
+}
+
+impl PendingTurn {
+    /// Has the reply arrived? None means still working.
+    pub fn poll(&self) -> Option<Result<String, String>> {
+        match self.rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) =>
+                Some(Err("the worker died without answering".into())),
+        }
+    }
+    pub fn elapsed(&self) -> std::time::Duration { self.started.elapsed() }
+}
+
 /// Bridges aperture-engine's `Backend` to voxel-tools' `Completer`.
 ///
 /// Two shapes to reconcile. Aperture's is `generate(prompt, max_tokens)`
@@ -316,6 +353,14 @@ pub struct Paintbrush {
     /// The resident in-instance engine, if one has been loaded.
     #[cfg(feature = "ai-engine")]
     pub engine: ResidentEngine,
+    /// Context window and reply budget, used to size the system prompt.
+    /// 8192/512 unless the engine reports otherwise.
+    pub ctx_tokens: usize,
+    pub max_reply: usize,
+    /// A model request in flight, if any. One at a time: a second
+    /// /build while one is running replaces nothing and is refused,
+    /// because two plans racing to become `pending` is a coin flip.
+    pub in_flight: Option<PendingTurn>,
 }
 
 impl Paintbrush {
@@ -350,6 +395,9 @@ impl Paintbrush {
                 }),
             #[cfg(feature = "ai-engine")]
             engine: ResidentEngine::default(),
+            in_flight: None,
+            ctx_tokens: 8192,
+            max_reply: 512,
         }
     }
 
@@ -501,6 +549,10 @@ impl Paintbrush {
                 }
                 Pending::None
             }
+            Command::Cancel => {
+                if !self.cancel_turn() { self.say("nothing in flight"); }
+                Pending::None
+            }
             Command::Keys => {
                 for c in voxel_tools::chatbox::CARDS {
                     if c.command == "/keys" { self.say(c.summary.replace(" · ", "\n  ")); }
@@ -558,6 +610,88 @@ impl Paintbrush {
         // A preview must leave nothing staged: receive_plan_for reverses
         // its own dry run, so this is an assertion, not a cleanup.
         debug_assert_eq!(staged.pending(), 0, "preview must not stage writes");
+    }
+
+    /// Start a turn on a worker thread. Returns immediately.
+    ///
+    /// `completer_for` runs HERE, on the frame thread, because it may
+    /// load a model and the resident engine is not shareable while
+    /// loading. Generation -- the part that takes twenty seconds --
+    /// runs on the worker.
+    pub fn start_turn(&mut self, cm: &ChunkManager, gaze: &Gaze,
+                      surface: Option<&str>, prose: &str,
+                      player_feet: Option<(i32, i32, i32)>) {
+        if let Some(t) = &self.in_flight {
+            self.say(format!("already asking {} ({:.0}s) -- wait or /cancel",
+                             t.provider, t.elapsed().as_secs_f32()));
+            return;
+        }
+        let debug = prose.trim_start().starts_with("debug");
+        // Same borrow shape as `prompt_for`: the view lives for the
+        // length of this call, which is all a prompt needs -- it reads
+        // the world and never writes.
+        let user = {
+            let view = WorldView(cm);
+            let mut staged = StagedWorld::new(&view);
+            let tools = VoxelTools::new(&mut staged);
+            let (u, _pass) = self.session.user_turn(&tools, gaze, surface, prose, None);
+            u
+        };
+        // Context-sized system prompt: a small model given the long one
+        // echoes it back instead of answering.
+        let system = voxel_tools::prompt::system_prompt_for(self.ctx_tokens, self.max_reply);
+        let Some(mut completer) = self.completer_for(debug) else {
+            self.say("no provider available -- /provider to check");
+            return;
+        };
+        let name = completer.name().to_string();
+        log::info!("[paintbrush] asking {name} ({} + {} chars, ctx {})",
+                   system.len(), user.len(), self.ctx_tokens);
+        self.say(format!("asking {name} ... (the world keeps running)"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = completer.complete(&system, &user);
+            // A closed receiver means the turn was cancelled; nothing to
+            // report and nobody to report to.
+            let _ = tx.send(r);
+        });
+        self.in_flight = Some(PendingTurn {
+            rx, started: Instant::now(), provider: name, gaze: *gaze, player_feet,
+        });
+    }
+
+    /// Call every frame. Applies a reply once the worker has one.
+    pub fn poll_turn(&mut self, cm: &ChunkManager) {
+        let Some(turn) = &self.in_flight else { return };
+        let Some(result) = turn.poll() else { return };
+        let turn = self.in_flight.take().expect("just checked");
+        match result {
+            Ok(raw) => {
+                log::info!("[paintbrush] reply in {:.1}s, {} chars",
+                           turn.elapsed().as_secs_f32(), raw.len());
+                self.finish_turn(cm, &turn.gaze, &raw, turn.player_feet);
+            }
+            Err(e) => {
+                log::warn!("[paintbrush] provider failed: {e}");
+                self.say(format!("provider failed: {e}"));
+            }
+        }
+    }
+
+    /// Drop a request in flight. The worker finishes and its answer is
+    /// discarded -- there is no way to interrupt a generate() mid-token
+    /// through aperture's Backend, and pretending otherwise would leave
+    /// a thread writing into a channel nobody reads.
+    pub fn cancel_turn(&mut self) -> bool {
+        match self.in_flight.take() {
+            Some(t) => {
+                self.say(format!("cancelled after {:.0}s (the worker finishes in the \
+                                  background and its answer is dropped)",
+                                 t.elapsed().as_secs_f32()));
+                true
+            }
+            None => false,
+        }
     }
 
     /// Why the current provider cannot answer, or None if it can.

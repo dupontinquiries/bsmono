@@ -10,6 +10,7 @@ use voxel_tools::staged::StagedWorld;
 fn main() {
     scenario();
     focus_scenario();
+    async_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -42,10 +43,16 @@ fn scenario() {
     for l in pb.drain_log() { println!("  {l}"); }
 
     println!("\n== /build with no model loaded");
+    // The default provider is the fixture, which needs no model, so this
+    // is ALLOWED now. Readiness is a question for the provider, not for
+    // the model registry -- an ollama or an engine with its own path
+    // does not care what /model says.
+    pb.provider = paintbrush::ProviderChoice::Engine { model_path: String::new() };
     if let Some(cmd) = type_line(&mut pb, "/build a watchtower") {
         let p = pb.dispatch(&cm, &gaze, cmd);
-        assert_eq!(p, Pending::None, "must refuse without a model");
+        assert_eq!(p, Pending::None, "the engine with no model must refuse");
     }
+    pb.provider = paintbrush::ProviderChoice::Fixture;
     for l in pb.drain_log() { println!("  {l}"); }
 
     println!("\n== pretend a model loaded");
@@ -188,4 +195,49 @@ fn focus_scenario() {
     assert_eq!(s3.to_movement, vec!['s', ' ', 's', ' '],
                "both drains resume once focus is released");
     println!("  OK");
+}
+
+/// A turn must not stop the frame loop. Uses a provider that sleeps,
+/// standing in for the 22.5-second generation in the field log.
+fn async_scenario() {
+    use paintbrush::Paintbrush;
+    use voxel_tools::focus::{Gaze, GazeHit};
+    println!("\n==== off-thread turn");
+
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    pb.provider = paintbrush::ProviderChoice::Script(vec![
+        "sh".into(), "-c".into(),
+        "cat >/dev/null; sleep 1; printf 'cylinder @0,0 r=2 h=6 block=stone\\n'".into()]);
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0],
+                                     Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    let t0 = std::time::Instant::now();
+    pb.start_turn(&cm, &gaze, None, "a tower", Some((0, 65, -12)));
+    let start_cost = t0.elapsed();
+    println!("  start_turn returned in {:.0}ms (must be ~0)", start_cost.as_millis());
+    assert!(start_cost.as_millis() < 300, "start_turn blocked for {start_cost:?}");
+
+    // "render" frames while the worker generates
+    let mut frames = 0;
+    loop {
+        pb.poll_turn(&cm);
+        if pb.in_flight.is_none() { break; }
+        frames += 1;
+        std::thread::sleep(std::time::Duration::from_millis(16));
+        assert!(t0.elapsed().as_secs() < 20, "worker never answered");
+    }
+    println!("  {frames} frames rendered while it worked (would have been 0)");
+    assert!(frames > 10, "the frame loop must keep running");
+    for l in pb.drain_log() { println!("  {}", l.lines().next().unwrap_or("")); }
+
+    // a second /build while one is in flight is refused, not raced
+    pb.provider = paintbrush::ProviderChoice::Script(vec![
+        "sh".into(), "-c".into(), "cat >/dev/null; sleep 2; echo 'tree @0,0 oak'".into()]);
+    pb.start_turn(&cm, &gaze, None, "one", None);
+    pb.start_turn(&cm, &gaze, None, "two", None);
+    let refused = pb.drain_log().iter().any(|l| l.contains("already asking"));
+    println!("  second build while busy refused: {refused}");
+    assert!(refused);
+    assert!(pb.cancel_turn(), "cancel drops it");
+    println!("  cancelled cleanly");
 }
