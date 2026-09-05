@@ -1,0 +1,24 @@
+[package]
+name = "hap-core"
+version = "0.1.0"
+edition = "2021"
+description = "HomeKit Accessory Protocol, controller side, headless: TLV8, SRP-6a, pair-setup, pair-verify, the encrypted session, and HAP-BLE PDUs over a sync transport seam. No bluetooth crate, no async, no threads."
+
+[dependencies]
+# SRP-6a arithmetic. num-bigint's modpow is constant-time-adjacent enough for a
+# controller that pairs once per plug; the accessory is the party under attack.
+num-bigint = "0.4"
+num-traits = "0.2"
+# HAP's hash everywhere is SHA-512; RFC 5054's published vectors are SHA-1, so
+# the SRP module is generic over `Digest` and the dev-dependency below proves
+# the arithmetic against the RFC before HAP's parameters are trusted.
+sha2 = "0.10"
+digest = "0.10"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[dev-dependencies]
+sha1 = "0.10"

@@ -6,7 +6,7 @@
 # switcheroo-egui owns the frame loop and the radio thread.
 [workspace]
 resolver = "2"
-members = ["crates/switcheroo-core", "crates/switcheroo-egui"]
+members = ["crates/hap-core", "crates/switcheroo-core", "crates/switcheroo-egui"]
 # `cargo build --release` produces the deployable bin and nothing else.
 default-members = ["crates/switcheroo-egui"]
 
