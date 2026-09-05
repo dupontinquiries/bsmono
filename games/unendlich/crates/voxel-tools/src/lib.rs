@@ -65,6 +65,8 @@ pub mod staged;
 pub mod solid;
 /// Named forms as recipes over solids, so a new form is data.
 pub mod dict;
+/// Views: build from 2D elevations, and check the result against them.
+pub mod views;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.
@@ -366,6 +368,21 @@ impl<'w, W: VoxelWorld> VoxelTools<'w, W> {
         }
         let n = e.before.len();
         self.finish(e, format!("{style} roof, {n} blocks"))
+    }
+
+    /// Write a set of cells, all the same block. The views path uses
+    /// this: a hull is already a cell list, so re-deriving a Solid from
+    /// it just to rasterize again would be work for nothing.
+    pub fn stamp_cells(&mut self, cells: &[(i32, i32, i32)], block: u16) -> CallResult {
+        if cells.len() > MAX_BLOCKS_PER_CALL {
+            return CallResult::err(format!(
+                "refused: {} blocks, over MAX_BLOCKS_PER_CALL={}",
+                cells.len(), MAX_BLOCKS_PER_CALL));
+        }
+        let mut e = self.begin("views");
+        for &(x, y, z) in cells { self.write(&mut e, x, y, z, block); }
+        let n = e.before.len();
+        self.finish(e, format!("views, {n} blocks"))
     }
 
     /// Rasterize a solid into the world.

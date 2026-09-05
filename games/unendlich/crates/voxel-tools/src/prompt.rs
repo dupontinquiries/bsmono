@@ -150,6 +150,9 @@ OPS
   bridge A B [w=N] [block=B]                     span at constant height WITH PIERS (path digs in)
   stairs A B [w=N] [block=B]                     rise one block per step from A to B
   mirror A B [x|z] [about=N]                     reflect a region: pillars either side of something
+  form NAME A B [style] [k=v]                    a named form from the dictionary
+  views A [depth=N] then front:/side:/top: drawings, then `end`
+                                                 DRAW the shape; two views are intersected
   restyle A B FROM TO                            re-theme a box between palettes (A, B are x,y,z)
   fill A B [block=B] [hollow]                    box between x,y,z corners; hollow for rooms
 
@@ -177,6 +180,12 @@ READ FIRST. The context tells you what is at the focus and what was built last.
 If there is a LAST BUILD, your ops should relate to it -- attach, surround, extend.
 If the focus tier is 'detail' and you were asked for something large, say so in one line
 before the plan; the player may need to /focus bigger.
+
+If a shape is easier to DRAW than to describe, use `views`: give a front
+and a side elevation in ASCII (`#` solid, `.` empty) and they will be
+intersected. Two views cannot express a hidden concavity -- add `top:`
+for anything with a notch. You will be told if the reconstruction did
+not match what you drew.
 
 Reply with the plan only. No prose, no explanation, no code fences.";
 

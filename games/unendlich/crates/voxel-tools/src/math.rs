@@ -223,6 +223,25 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                 push(Note::Info, format!("tree height {height}, roughly {} blocks with canopy",
                                           height + 60), None);
             }
+            Op::Views { views, at, depth, .. } => {
+                let names: Vec<&str> = views.iter().map(|(n, _)| n.as_str()).collect();
+                let biggest = views.iter()
+                    .map(|(_, a)| crate::views::Mask::parse(a).count()).max().unwrap_or(0);
+                // Upper bound only: the hull is the INTERSECTION, so the
+                // real count is at most one silhouette swept the depth.
+                total += (biggest * *depth as usize) as i64;
+                push(Note::Info,
+                     format!("views [{}] at {:?}, depth {depth}: at most {} blocks \
+                              (the intersection is usually far smaller)",
+                             names.join(", "), at, biggest * *depth as usize),
+                     None);
+                if views.len() < 2 {
+                    push(Note::Suspect,
+                         "one view only: this is a plain extrusion, and any shape that \
+                          varies along the view axis needs a second drawing".into(),
+                         None);
+                }
+            }
             Op::Form { name, min, max, style, nums, .. } => {
                 // The arithmetic echo cannot know a recipe's volume
                 // without building it, and building it here would double

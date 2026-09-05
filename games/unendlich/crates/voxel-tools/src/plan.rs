@@ -136,6 +136,10 @@ pub enum Op {
     Stairs { from: (i32, i32), to: (i32, i32), y: Option<i32>, width: i32, block: u16 },
     /// A storey floor inside a footprint.
     Floor { min: (i32, i32), max: (i32, i32), y: Option<i32>, block: u16 },
+    /// Build from ASCII elevations. The model draws; the tool
+    /// reconstructs and reports how faithful the result is.
+    Views { views: Vec<(String, String)>, at: (i32, i32), y: Option<i32>,
+            depth: i32, block: u16 },
     /// ONE verb reaching the whole form dictionary.
     ///
     /// `roof`, `wall`, `house`, `colonnade`, `arch`, `tower` and
@@ -335,7 +339,10 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
     let mut ops = Vec::new();
     let mut issues = Vec::new();
     let mut name = String::from("build");
-    for (lineno, raw) in src.lines().enumerate() {
+    // Peekable, because `views` is the one construct that spans lines:
+    // it consumes its own drawings up to `end`.
+    let mut lines_iter = src.lines().enumerate().peekable();
+    while let Some((lineno, raw)) = lines_iter.next() {
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             if let Some(c) = raw.trim().strip_prefix("# ") {
@@ -401,6 +408,40 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                 ops.push(Op::Enclose {
                     min: a, max: b, height: kvi(&t, "h", 3).max(1),
                     block: blk("oak_planks").unwrap_or(57) });
+            }
+            // `views` opens a multi-line block: each `front:`/`side:`/
+            // `top:` line is followed by its drawing, ended by `end`.
+            // Parsed here rather than as a normal op because it is the
+            // one construct that spans lines.
+            "views" => {
+                let at = rel(&t, 1, anchor).unwrap_or_else(|| anchor_xz(anchor));
+                let depth = kvi(&t, "depth", 8).max(1);
+                let mut collected: Vec<(String, String)> = Vec::new();
+                let mut current: Option<(String, Vec<String>)> = None;
+                while let Some((_, next)) = lines_iter.next() {
+                    let raw = next.trim_end();
+                    let low = raw.trim().to_lowercase();
+                    if low == "end" { break; }
+                    if let Some(name) = low.strip_suffix(':') {
+                        if let Some((n, art)) = current.take() {
+                            collected.push((n, art.join("\n")));
+                        }
+                        current = Some((name.to_string(), Vec::new()));
+                    } else if let Some((_, art)) = current.as_mut() {
+                        art.push(raw.to_string());
+                    }
+                }
+                if let Some((n, art)) = current.take() {
+                    collected.push((n, art.join("\n")));
+                }
+                if collected.is_empty() {
+                    bad("views needs at least one of front:/side:/top:".into());
+                } else {
+                    ops.push(Op::Views {
+                        views: collected, at,
+                        y: kv(&t, "y").and_then(|v| v.parse().ok()),
+                        depth, block: blk("stone").unwrap_or(1) });
+                }
             }
             // `form <name> A B [style] [k=v ...]` -- the dictionary verb.
             "form" | "build" => {
@@ -742,6 +783,45 @@ pub fn run_plan<W: VoxelWorld>(
                     if top == i32::MIN { from_y } else { top + 1 }
                 });
                 tools.roof((min.0, base, min.1), *max, style, *block, *overhang)
+            }
+            Op::Views { views, at, y, depth, block } => {
+                use crate::views::{check_views, Extrusion, Mask, View};
+                let base = y.unwrap_or_else(|| {
+                    tools.find_surface(at.0, at.1, from_y).map(|s| s + 1).unwrap_or(from_y)
+                });
+                let mut ex = Vec::new();
+                for (name, art) in views {
+                    let mask = Mask::parse(art);
+                    if mask.is_empty() { continue; }
+                    let (view, origin) = match name.as_str() {
+                        "side" => (View::Side, [at.0, base + mask.h as i32 - 1, at.1]),
+                        "top" | "plan" => (View::Top, [at.0, base, at.1]),
+                        _ => (View::Front, [at.0, base + mask.h as i32 - 1, at.1]),
+                    };
+                    ex.push(Extrusion { mask, view, origin, depth: *depth,
+                                        mat: crate::solid::Material::structural(*block) });
+                }
+                if ex.is_empty() {
+                    CallResult::err("no readable drawings in the views block".to_string())
+                } else {
+                    let (cells, checks) = check_views(&ex);
+                    let mut res = tools.stamp_cells(&cells, *block);
+                    // Report fidelity: a hull can only be as tight as the
+                    // silhouettes allow, and the player should hear that
+                    // from the tool rather than from the finished build.
+                    let off: Vec<String> = checks.iter().filter(|c| !c.ok())
+                        .map(|c| format!("{:?} +{} -{}", c.view, c.extra, c.missing))
+                        .collect();
+                    if !off.is_empty() {
+                        // A hull is only as tight as its silhouettes. Say
+                        // so here rather than letting it be discovered by
+                        // looking at the finished build.
+                        res.summary = format!(
+                            "{} | views not exact: {} (add a third view to tighten)",
+                            res.summary, off.join(", "));
+                    }
+                    res
+                }
             }
             Op::Form { name, min, max, y, style, block, accent, nums } => {
                 let base = y.unwrap_or_else(|| {
