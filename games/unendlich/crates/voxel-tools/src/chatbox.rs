@@ -96,8 +96,14 @@ pub const CARDS: &[Card] = &[
     Card { command: "/keys", signature: "/keys",
            summary: "Enter chat · Tab complete · Up/Down history · Ctrl+V paste · \
                      Ctrl+C copy line · Ctrl+Shift+C copy log · Ctrl+U clear · \
-                     Ctrl+Enter commit · Ctrl+Z undo · PgUp/PgDn focus",
+                     Ctrl+Enter commit · Ctrl+Z undo · PgUp/PgDn focus. \
+                     Commands: /build /build debug /plan /commit /undo /focus \
+                     /anim /model /provider /keys",
            example: "/keys", arg_words: &[] },
+    Card { command: "/provider", signature: "/provider [engine|ollama|openai|script:CMD|fixture]",
+           summary: "Which backend answers /build. 'engine' runs the model in this process on the GPU.",
+           example: "/provider engine",
+           arg_words: &["engine", "wgpu", "ollama", "openai", "fixture", "script:"] },
     Card { command: "/model", signature: "/model [name]",
            summary: "List models in ~/models, or load one. Tab completes; partial names work.",
            example: "/model qwen",
@@ -565,5 +571,34 @@ mod tests {
         let mut b = ChatBox::new();
         b.key(Key::Enter);
         assert_eq!(b.key(Key::Copy), Action::Nothing);
+    }
+
+    #[test]
+    fn every_command_the_parser_knows_has_a_card() {
+        // A command with no card is invisible: it never appears in the
+        // dropdown, Tab will not complete it, and the only way to find it
+        // is to read the source. /provider shipped that way.
+        const PARSER_VERBS: &[&str] = &[
+            "/build", "/plan", "/commit", "/undo", "/focus", "/anim",
+            "/model", "/provider", "/keys", "/find", "/locate",
+        ];
+        for v in PARSER_VERBS {
+            assert!(card_for(v).is_some(), "{v} has no card, so nobody will find it");
+        }
+    }
+
+    #[test]
+    fn provider_arguments_tab_complete() {
+        let mut b = ChatBox::new();
+        b.key(Key::Enter);
+        type_str(&mut b, "/provider e");
+        b.key(Key::Tab);
+        assert_eq!(b.buffer, "/provider engine");
+        let mut b2 = ChatBox::new();
+        b2.key(Key::Enter);
+        type_str(&mut b2, "/prov");
+        b2.key(Key::Tab);
+        assert_eq!(b2.buffer, "/provider ");
+        assert_eq!(b2.current_card().unwrap().command, "/provider");
     }
 }
