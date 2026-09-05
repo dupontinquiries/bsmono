@@ -5478,16 +5478,16 @@ mod tests {
                 // * phone / Camera: FIXED. Its controls band was sized for
                 //   three rows while holding seven, and the child had no clip
                 //   rect, so the surplus painted upward over the heading.
-                // * desktop / Friends: the card's chevron runs 4 pt past
-                //   the card on two rows.
-                let (max_overlaps, max_clipped) = match (label, page) {
-                    // phone/Camera was (6, 1) until the controls band was sized
-                    // for the seven rows it actually holds (it was sized for
-                    // three) and given the clip rect it never had. Clean now,
-                    // and held there.
-                    ("desktop", 2) => (0, 2),
-                    _ => (0, 0),
-                };
+                // * desktop / Friends: FIXED. The chevron was laid out at the
+                //   far right of the available width, which includes the
+                //   scrollbar's strip.
+                // NO EXCEPTIONS LEFT. Every page, both form factors, clean.
+                // phone/Camera was (6, 1) until its controls band was sized for
+                // the seven rows it holds rather than three and given the clip
+                // rect it never had; desktop/Friends was (0, 2) until its
+                // chevron stopped being laid out underneath the scrollbar.
+                let (max_overlaps, max_clipped) = (0usize, 0usize);
+                let _ = (label, page);
                 assert!(r.overlaps.len() <= max_overlaps && r.clipped.len() <= max_clipped,
                         "{label}/{}: {} overlaps (≤{max_overlaps}), {} clipped (≤{max_clipped}):\n{}",
                         PAGES[page], r.overlaps.len(), r.clipped.len(), r.describe());

@@ -550,6 +550,15 @@ pub fn friends_ui(ui: &mut egui::Ui, roster: &Roster, acc: &mut Accordion,
                         Standing::Plain => {}
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Reserve the scrollbar. This row lives in a vertical
+                        // ScrollArea, and `right_to_left` puts the chevron at
+                        // the far right of the AVAILABLE width — which includes
+                        // the strip the scrollbar occupies, so the glyph was cut
+                        // by exactly the bar's width (the layout probe: "clipped
+                        // by 4pt" on two desktop/Friends rows). In this layout
+                        // the first thing added is the rightmost, so the space
+                        // goes before the chevron, not after it.
+                        ui.add_space(ui.spacing().scroll.bar_width);
                         ui.colored_label(c.text_weak, card.chevron());
                     });
                 }).response.on_hover_text(f.tooltip());
