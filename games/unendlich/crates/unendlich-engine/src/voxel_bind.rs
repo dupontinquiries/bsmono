@@ -41,9 +41,19 @@ impl<'a> VoxelWorld for WorldView<'a> {
         false
     }
     fn y_bounds(&self) -> (i32, i32) {
-        // Match the engine's world height. Adjust if constants.rs
-        // disagrees; the tools only use this to clamp.
-        (-64, 320)
+        // There is no world-height constant in this engine: the world is
+        // vertically unbounded and `is_sky_chunk` simply declines to load
+        // chunks far above the terrain. The (-64, 320) written here first
+        // was invented, and it would have silently refused every write
+        // above y=320 — a tower on a 300-block peak would place its base
+        // and stop.
+        //
+        // So this is a runaway guard, not a world limit. The real bound
+        // is `set_block`'s wild-coordinate watchdog at 30 million; this
+        // is generous enough never to clip a real build and tight enough
+        // that a model emitting y=900000 is caught here rather than
+        // spending a second in the chunk map first.
+        (-4096, 8192)
     }
 }
 

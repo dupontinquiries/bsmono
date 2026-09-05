@@ -49,6 +49,11 @@
 
 use crate::{palettes, CallResult, VoxelTools, VoxelWorld};
 
+/// How far above the focus anchor to begin scanning for the ground.
+/// Enough to clear the player's own head and a step up, small enough
+/// that a cave roof a few blocks above is not mistaken for terrain.
+pub const GROUND_SEARCH_MARGIN: i32 = 6;
+
 /// One planned operation. Mirrors the tool set, but as data.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
@@ -443,6 +448,26 @@ pub fn run_plan<W: VoxelWorld>(
     chunk_size: i32,
     dry_run: bool,
 ) -> PlanRun {
+    // GROUND SEARCH CEILING.
+    //
+    // `find_surface` scans DOWN from here, so a fixed value is wrong
+    // in both directions and silently so:
+    //
+    //   * on a mountain above the ceiling, every op lands at the
+    //     ceiling — a tower built 50 blocks BELOW the player;
+    //   * in a cave, the scan starts above the roof and finds the
+    //     outdoor surface, so the build appears 100 blocks overhead,
+    //     through the ceiling, out of sight.
+    //
+    // Neither errors. You just look at empty ground and conclude the
+    // feature is broken. Anchoring the search just above the focus —
+    // the block the player is actually looking at — makes "here" mean
+    // here at any altitude, indoors or out. The caller's `from_y` is
+    // only a fallback for plans parsed without an anchor.
+    let from_y = match plan.anchor {
+        Some(a) => a.1 + GROUND_SEARCH_MARGIN,
+        None => from_y,
+    };
     let mut run = PlanRun { applied: 0, failed: 0, blocks_changed: 0,
                             log: Vec::new(), batches: Vec::new() };
     let first_edit = tools.edits.len();
@@ -715,5 +740,47 @@ scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
         let (p, _) = parse_plan_at("sphere @0,0 r=3 block=stone\n", Some((0, 65, 0)));
         { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &p, 200, 32, false); }
         assert_ne!(w.get(0, 68, 0), 0, "centred at surface + r + 1");
+    }
+
+    #[test]
+    fn a_build_lands_at_the_anchor_on_a_mountain_and_in_a_cave() {
+        // The two worlds where a fixed search ceiling silently misplaced
+        // everything: terrain above it, and a cave under it.
+        struct Layered { ground: i32, ceiling: Option<i32>, cells: BTreeMap<(i32,i32,i32), u16> }
+        impl VoxelWorld for Layered {
+            fn get(&self, x: i32, y: i32, z: i32) -> u16 {
+                if let Some(&b) = self.cells.get(&(x,y,z)) { return b; }
+                if y <= self.ground { return 1; }
+                if let Some(c) = self.ceiling { if y >= c && y <= c + 3 { return 1; } }
+                0
+            }
+            fn set(&mut self, x: i32, y: i32, z: i32, b: u16) -> bool {
+                self.cells.insert((x,y,z), b); true
+            }
+            fn y_bounds(&self) -> (i32, i32) { (-64, 512) }
+        }
+        for (ground, ceiling, label) in [
+            (64, None, "surface"),
+            (250, None, "mountain above the old ceiling"),
+            (20, Some(120), "cave under a roof"),
+        ] {
+            let mut w = Layered { ground, ceiling, cells: BTreeMap::new() };
+            let anchor = (0, ground + 1, 0);
+            let (plan, _) = parse_plan_at("cylinder @0,0 r=1 h=3 block=stone_bricks\n",
+                                          Some(anchor));
+            { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &plan, 200, 32, false); }
+            assert_eq!(w.get(0, anchor.1, 0), 58,
+                       "{label}: base must sit at the anchor, not at a fixed altitude");
+            assert_eq!(w.get(0, anchor.1 + 2, 0), 58, "{label}: and rise from there");
+        }
+    }
+
+    #[test]
+    fn without_an_anchor_the_callers_ceiling_is_still_used() {
+        let mut w = Flat::new();
+        let (plan, _) = parse_plan("cylinder 0,0 r=1 h=2 block=stone_bricks\n");
+        assert!(plan.anchor.is_none());
+        { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &plan, 200, 32, false); }
+        assert_eq!(w.get(0, 65, 0), 58, "flat world, fallback path unchanged");
     }
 }
