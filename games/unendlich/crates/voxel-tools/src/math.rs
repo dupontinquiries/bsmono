@@ -223,6 +223,23 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                 push(Note::Info, format!("tree height {height}, roughly {} blocks with canopy",
                                           height + 60), None);
             }
+            Op::Mood { name, min, max, .. } => {
+                let m = crate::mood::lookup(name);
+                push(Note::Info,
+                     format!("mood '{name}' over {}x{}: palette {}, {}, plus fog/light for the engine",
+                             span(min.0, max.0), span(min.1, max.1),
+                             m.map(|m| m.palette).unwrap_or("?"),
+                             m.and_then(|m| m.weather).unwrap_or("no decay")),
+                     None);
+            }
+            Op::Populate { kind, count, min, max, name } => {
+                push(Note::Info,
+                     format!("engine spawn: {count} x '{kind}' ({}) over {}x{}{}",
+                             crate::mood::Disposition::infer(kind).word(),
+                             span(min.0, max.0), span(min.1, max.1),
+                             name.as_ref().map(|n| format!(", named {n}")).unwrap_or_default()),
+                     None);
+            }
             Op::Place { name, at, turns, vary, .. } => {
                 push(Note::Info,
                      format!("place '{name}' at {at:?}, rotated {} degrees{}",

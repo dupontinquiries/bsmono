@@ -128,9 +128,11 @@ pub fn system_prompt_for(ctx: usize, max_reply: usize) -> String {
 /// and worked examples that are themselves valid IR (there is a test
 /// that parses every example line).
 pub fn system_prompt() -> String {
-    // The world-change rule is generated from `intent`, so the prompt
-    // and the gate that enforces it cannot drift apart.
-    format!("{GRAMMAR}\n\n{DISCIPLINE}\n\n{}\n\n{EXAMPLES}",
+    // The world-change rule, the mood list and the form list are all
+    // GENERATED from their tables, so the prompt cannot drift from what
+    // the parser actually accepts.
+    format!("{GRAMMAR}\n\nFORMS (use `form NAME A B`):\n{}\n\n{}\n\n{DISCIPLINE}\n\n{}\n\n{EXAMPLES}",
+            crate::dict::vocabulary(), crate::mood::vocabulary(),
             crate::intent::WORLD_DISCIPLINE)
 }
 
@@ -157,6 +159,10 @@ OPS
   mirror A B [x|z] [about=N]                     reflect a region: pillars either side of something
   form NAME A B [style] [k=v]                    a named form from the dictionary
                                                  (village = several houses, not one)
+  mood NAME A B                                  set the FEEL of a region: palette, decay, clutter,
+                                                 and fog/light/time for the engine (see MOODS)
+  populate KIND A B [count=N] [name=X]           ask the engine for creatures or NPCs; KIND is
+                                                 plain words, the engine picks from its roster
   weather A B [worn|abandoned|ancient|burnt]     age an EXISTING build: decay, moss, rubble
   detail KIND A B [block=B] [amount=0.3]         finishing pass over an existing build:
                                                  speckle (break up a flat face), trim (accent
@@ -222,6 +228,29 @@ EXAMPLE (detail, LAST BUILD = the tower above)
 sphere @3,0 r=1 block=air
 path @3,0 @18,12 w=2 block=cobble
 scatter @-8,-8 @8,8 block=flower clusters=3 per=5 spread=2 seed=11
+
+EXAMPLE (massing, empty site; the request names a MOOD and CREATURES)
+  player: build an eerie forest with horrifying creatures
+  plan:
+# eerie forest
+tree @-14,-12 oak h=9
+tree @-6,-15 oak h=11
+tree @4,-10 oak h=8
+tree @12,-14 oak h=10
+tree @-10,2 oak h=12
+tree @8,6 oak h=9
+tree @-2,12 oak h=10
+tree @14,10 oak h=8
+mood eerie @-18,-18 @18,18
+populate horrifying creatures @-18,-18 @18,18 count=6
+
+EXAMPLE (massing; a lair for a named boss)
+  player: build a fire dragon nest
+  plan:
+# dragon nest
+form nest @-12,-12 @12,12 depth=6 rim=3 block=basalt
+mood fiery @-16,-16 @16,16
+populate fire dragon @-6,-6 @6,6 count=1
 
 EXAMPLE (expand, LAST BUILD = the tower above)
   player: taller, and give it a base
@@ -294,7 +323,7 @@ mod tests {
             assert!(!plan.ops.is_empty(), "example produced no ops:\n{src}");
             n += 1;
         }
-        assert_eq!(n, 4, "expected four worked examples");
+        assert_eq!(n, 6, "expected six worked examples");
     }
 
     #[test]

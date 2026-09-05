@@ -87,6 +87,8 @@ pub mod template;
 pub mod verbs;
 /// Camera: hero framing, orbit, reveal, and fly-through for presenting a build.
 pub mod camera;
+/// Mood and population: the parts of a request that are not blocks.
+pub mod mood;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.
@@ -125,6 +127,7 @@ pub struct Aabb {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct CallResult {
     pub ok: bool,
     pub edit_id: Option<u64>,

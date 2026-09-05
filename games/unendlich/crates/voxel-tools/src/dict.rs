@@ -65,6 +65,10 @@ pub const FORMS: &[Form] = &[
     Form { name: "tower", summary: "a round tower with a conical cap", build: tower },
     Form { name: "village", summary: "several houses on plots, facing a centre, joined by paths",
            build: village },
+    Form { name: "nest", summary: "a ringed crater with a raised rim -- a lair or a bowl",
+           build: nest },
+    Form { name: "cavern", summary: "a carved underground chamber with pillars and an entrance shaft",
+           build: cavern },
 ];
 
 pub fn lookup(name: &str) -> Option<&'static Form> {
@@ -284,6 +288,74 @@ fn village(a: &FormArgs) -> Solid {
     Solid::Union(parts)
 }
 
+/// A crater with a raised rim: the shape of a lair. Carved into the
+/// ground, so `y` is the SURFACE and the bowl goes down from it. Rim
+/// blocks are structural; the bowl is a carve that outranks them.
+fn nest(a: &FormArgs) -> Solid {
+    let (lo, hi) = (a.lo(), a.hi());
+    let cx = (lo[0] + hi[0]) / 2.0;
+    let cz = (lo[2] + hi[2]) / 2.0;
+    let r = ((hi[0] - lo[0]).min(hi[2] - lo[2]) / 2.0).max(4.0);
+    let depth = a.num("depth", (r * 0.5) as i32).max(2) as f32;
+    let rim_h = a.num("rim", 2).max(1) as f32;
+    // The rim: a ring of the structural block, rising above ground.
+    let rim = Solid::Diff(
+        Box::new(Solid::Cylinder { base: [cx, lo[1], cz], r: r + 1.0, h: rim_h,
+                                   mat: Material::structural(a.block) }),
+        Box::new(Solid::Cylinder { base: [cx, lo[1], cz], r: r - 1.5, h: rim_h + 1.0,
+                                   mat: Material::structural(0) }));
+    // The bowl: a sphere of carved air sunk into the ground. Carve
+    // outranks structure, so the bowl wins where they overlap.
+    let bowl = Solid::Sphere { centre: [cx, lo[1] - depth * 0.3, cz], r: r - 0.5,
+                               mat: Material::carved() };
+    // Clip the bowl to below-ground so it does not carve sky.
+    let below = Solid::Box { min: [cx - r - 2.0, lo[1] - depth - 1.0, cz - r - 2.0],
+                             max: [cx + r + 2.0, lo[1] + 0.5, cz + r + 2.0],
+                             mat: Material::carved() };
+    Solid::Union(vec![rim, Solid::Intersect(Box::new(bowl), Box::new(below))])
+}
+
+/// An underground chamber: a hollow carved below the surface with
+/// supporting pillars and a vertical shaft to the entrance. The "dig an
+/// underground city" starting point -- one chamber; a city is several
+/// connected by `path` at depth.
+fn cavern(a: &FormArgs) -> Solid {
+    let (lo, hi) = (a.lo(), a.hi());
+    let h = a.num("h", 7).max(4) as f32;
+    let depth = a.num("depth", 12).max(h as i32 + 2) as f32;
+    let floor_y = lo[1] - depth;
+    let cx = (lo[0] + hi[0]) / 2.0;
+    let cz = (lo[2] + hi[2]) / 2.0;
+    // The chamber: a carved box with a domed ceiling (a sphere clipped
+    // to the box top), so it reads as hollowed rather than mined.
+    let room = Solid::Box { min: [lo[0], floor_y, lo[2]], max: [hi[0], floor_y + h, hi[2]],
+                            mat: Material::carved() };
+    let dome = Solid::Intersect(
+        Box::new(Solid::Sphere { centre: [cx, floor_y + h * 0.4, cz],
+                                 r: ((hi[0] - lo[0]).min(hi[2] - lo[2]) / 2.0) * 0.9 + h * 0.3,
+                                 mat: Material::carved() }),
+        Box::new(Solid::Box { min: [lo[0], floor_y + h, lo[2]],
+                              max: [hi[0], floor_y + h + h * 0.5, hi[2]],
+                              mat: Material::carved() }));
+    // Pillars where a span would be unsupported. Structural, and
+    // declared AFTER the carve so ties go to them; the carve's higher
+    // rank would otherwise remove them.
+    let span = hi[0] - lo[0];
+    let step = 6.0;
+    let count = ((span - 4.0) / step).floor().max(1.0) as u32;
+    let pillar = Solid::Cylinder { base: [lo[0] + 3.0, floor_y, cz], r: 1.0, h,
+                                   mat: Material::new(a.block, 150) };
+    let pillars = Solid::Array { count, step: [step, 0.0, 0.0], inner: Box::new(pillar) };
+    // The shaft: a 2x2 carve from the surface down to the room.
+    let shaft = Solid::Box { min: [cx - 1.0, floor_y + 1.0, lo[2] - 3.0],
+                             max: [cx + 1.0, lo[1] + 1.0, lo[2] - 1.0],
+                             mat: Material::carved() };
+    let shaft_link = Solid::Box { min: [cx - 1.0, floor_y, lo[2] - 3.0],
+                                  max: [cx + 1.0, floor_y + 3.0, lo[2] + 1.0],
+                                  mat: Material::carved() };
+    Solid::Union(vec![room, dome, shaft, shaft_link, pillars])
+}
+
 /// A flat ribbon between two points, as a union of boxes. Cheap, and it
 /// does not need a new primitive.
 fn path_slab(from: [f32; 3], to: [f32; 3], width: f32, mat: Material) -> Solid {
@@ -448,5 +520,36 @@ mod tests {
         let peak = cells.keys().map(|(_, y, _)| *y).max().unwrap();
         assert!(!cells.contains_key(&(6, peak - 1, 4)),
                 "the space under the ridge is an attic, not stone");
+    }
+
+    #[test]
+    fn a_nest_is_a_bowl_with_a_rim() {
+        let mut a = args(21, 21);
+        a.min.1 = 64; a.max.1 = 64;
+        let cells = rasterize(&nest(&a));
+        let rim: Vec<_> = cells.iter().filter(|(_, b)| **b != 0).collect();
+        let bowl: Vec<_> = cells.iter().filter(|(_, b)| **b == 0).collect();
+        assert!(!rim.is_empty(), "a raised rim");
+        assert!(!bowl.is_empty(), "and a carved bowl");
+        assert!(rim.iter().all(|((_, y, _), _)| *y >= 64), "the rim is above ground");
+        assert!(bowl.iter().all(|((_, y, _), _)| *y <= 64), "the bowl is below it");
+        assert!(bowl.iter().any(|((x, _, z), _)| (*x - 10).abs() <= 1 && (*z - 10).abs() <= 1),
+                "the centre is hollow");
+    }
+
+    #[test]
+    fn a_cavern_is_hollow_below_ground_with_a_shaft_up() {
+        let mut a = args(19, 13);
+        a.min.1 = 64; a.max.1 = 64;
+        let s = cavern(&a);
+        let cells = rasterize(&s);
+        let carved: Vec<_> = cells.iter().filter(|(_, b)| **b == 0).map(|(k, _)| *k).collect();
+        let solid: Vec<_> = cells.iter().filter(|(_, b)| **b != 0).map(|(k, _)| *k).collect();
+        assert!(!carved.is_empty());
+        assert!(carved.iter().all(|(_, y, _)| *y <= 65), "everything carved is underground");
+        assert!(carved.iter().any(|(_, y, _)| *y == 64), "the shaft reaches the surface");
+        assert!(!solid.is_empty(), "pillars stand");
+        // pillars survive the carve: they are declared with a higher rank
+        assert!(solid.iter().any(|(_, y, _)| *y < 60), "a pillar in the chamber");
     }
 }

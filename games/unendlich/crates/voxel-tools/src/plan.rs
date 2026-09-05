@@ -140,6 +140,13 @@ pub enum Op {
     /// reconstructs and reports how faithful the result is.
     Views { views: Vec<(String, String)>, at: (i32, i32), y: Option<i32>,
             depth: i32, block: u16 },
+    /// Apply a mood over a region: palette restyle, weathering, clutter,
+    /// and an atmosphere request for the engine.
+    Mood { name: String, min: (i32, i32), max: (i32, i32), y: Option<i32> },
+    /// Ask the engine to spawn creatures. This crate has none; the
+    /// request carries kind, disposition, count and an optional name.
+    Populate { kind: String, count: u32, min: (i32, i32), max: (i32, i32),
+               name: Option<String> },
     /// Stamp a learned template. The vocabulary the player taught it.
     Place { name: String, at: (i32, i32), y: Option<i32>, turns: u8,
             mirror: bool, vary: f32, seed: i32, palette: Option<String> },
@@ -505,6 +512,50 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     block: blk("oak_planks").unwrap_or(57),
                     overhang: kvi(&t, "overhang", 1).clamp(0, 4) });
             }
+            "mood" | "atmosphere" => {
+                let Some(name) = t.get(1).map(|s| s.to_lowercase()) else {
+                    bad("mood needs a name".into()); continue;
+                };
+                if crate::mood::lookup(&name).is_none() {
+                    bad(format!("unknown mood '{name}'; known: {}",
+                        crate::mood::MOODS.iter().map(|m| m.name).collect::<Vec<_>>().join(", ")));
+                    continue;
+                }
+                let shifted: Vec<&str> = std::iter::once("mood")
+                    .chain(t.iter().skip(2).copied()).collect();
+                let Some((a, b, note)) = footprint(&shifted, anchor) else {
+                    rel_err.set(true); continue;
+                };
+                if let Some(n) = note { assumed!(&n); }
+                ops.push(Op::Mood { name, min: a, max: b,
+                                    y: kv(&t, "y").and_then(|v| v.parse().ok()) });
+            }
+            "populate" | "spawn" => {
+                // The kind is PLAIN WORDS and may be several: "horrifying
+                // creatures", "fire dragon". It runs until the first token
+                // that looks like a coordinate or a k=v. Taking only one
+                // word made "creatures" a coordinate and dropped the
+                // adjective that carried the disposition.
+                let is_arg = |s: &str| s.starts_with('@') || s.contains(',') || s.contains('=');
+                let kind_words: Vec<&str> = t.iter().skip(1).take_while(|s| !is_arg(s))
+                    .copied().collect();
+                if kind_words.is_empty() {
+                    bad("populate needs a creature kind".into()); continue;
+                }
+                let kind = kind_words.join(" ");
+                let shifted: Vec<&str> = std::iter::once("populate")
+                    .chain(t.iter().skip(1 + kind_words.len()).copied()).collect();
+                let Some((a, b, note)) = footprint(&shifted, anchor) else {
+                    rel_err.set(true); continue;
+                };
+                if let Some(n) = note { assumed!(&n); }
+                ops.push(Op::Populate {
+                    kind, min: a, max: b,
+                    count: kvi(&t, "count", 3).clamp(1, 32) as u32,
+                    name: t.iter().skip(2).find_map(|s| s.strip_prefix("name="))
+                        .map(|s| s.to_string()),
+                });
+            }
             "place" | "stamp" => {
                 let Some(name) = t.get(1).map(|s| s.to_string()) else {
                     bad("place needs a template name".into());
@@ -795,7 +846,7 @@ pub struct Batch {
 }
 
 /// Result of running a plan.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct PlanRun {
     pub applied: usize,
     pub failed: usize,
@@ -932,6 +983,56 @@ pub fn run_plan_with<W: VoxelWorld>(
                     Some(f) => tools.stamp(&(f.build)(&args)),
                     None => CallResult::err(format!("unknown form '{name}'")),
                 }
+            }
+            Op::Mood { name, min, max, y } => {
+                let Some(m) = crate::mood::lookup(name) else {
+                    // Unreachable: the parser rejects unknown moods.
+                    return PlanRun { log: vec![format!("unknown mood '{name}'")],
+                                     ..Default::default() };
+                };
+                let base = y.unwrap_or_else(|| {
+                    tools.find_surface(min.0, min.1, from_y).unwrap_or(from_y)
+                });
+                let lo = (min.0.min(max.0), base - 4, min.1.min(max.1));
+                let hi = (min.0.max(max.0), base + 24, min.1.max(max.1));
+                let mut n = 0usize;
+                // Restyle toward the mood's palette, from every palette
+                // we know: the build may have been made in any of them.
+                for from in crate::palettes().keys() {
+                    if *from == m.palette { continue; }
+                    n += tools.restyle(lo, hi, from, m.palette).blocks_changed;
+                }
+                if let Some(w) = m.weather {
+                    let cfg = crate::weather::Weather::preset(w);
+                    let ch = crate::weather::plan(tools.world, lo, hi, &cfg, 23, 29, 4);
+                    n += tools.apply_changes(&ch).blocks_changed;
+                }
+                for (block, density) in m.scatter {
+                    let per = ((hi.0 - lo.0) as f32 * (hi.2 - lo.2) as f32 * density * 0.05)
+                        .max(1.0) as usize;
+                    n += tools.scatter_clustered((lo.0, lo.2), (hi.0, hi.2), from_y, *block,
+                                                 (per / 4).max(1), 4, 3, 7).blocks_changed;
+                }
+                let at = m.atmosphere;
+                let mut r = CallResult { ok: true, blocks_changed: n, ..Default::default() };
+                r.summary = format!(
+                    "mood {}: {n} blocks | engine: fog {:.1} light {:.1}{}{}",
+                    m.name, at.fog, at.light,
+                    at.time.map(|t| format!(" time {t:.2}")).unwrap_or_default(),
+                    if at.warmth != 0.0 { format!(" warmth {:+.2}", at.warmth) } else { String::new() });
+                r
+            }
+            Op::Populate { kind, count, min, max, name } => {
+                // Nothing to write: the request is reported for the
+                // engine, which owns the roster. The summary carries every
+                // field so the game can act on it from the run log.
+                let disp = crate::mood::Disposition::infer(kind);
+                let mut r = CallResult { ok: true, ..Default::default() };
+                r.summary = format!(
+                    "engine: spawn {count} x '{kind}' ({}) in {:?}..{:?}{}",
+                    disp.word(), min, max,
+                    name.as_ref().map(|n| format!(" named {n}")).unwrap_or_default());
+                r
             }
             Op::Place { name, at, y, turns, mirror, vary, seed, palette } => {
                 match library.and_then(|l| l.get(name)) {
@@ -1496,5 +1597,22 @@ scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
         { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &plan, 200, 32, false); }
         assert_ne!(w.get(0, 70, 0), 0);
         assert_eq!(w.get(0, 69, 0), 0, "nothing below it");
+    }
+
+    #[test]
+    fn a_multi_word_creature_kind_keeps_its_adjective() {
+        // "horrifying creatures": the adjective is the disposition, and
+        // the first version dropped it by taking one word as the kind.
+        let (plan, issues) = parse_plan_at(
+            "populate horrifying creatures @-8,-8 @8,8 count=6 name=Alex\n", Some((0, 65, 0)));
+        assert!(issues.is_empty(), "{issues:?}");
+        match &plan.ops[0] {
+            Op::Populate { kind, count, name, .. } => {
+                assert_eq!(kind, "horrifying creatures");
+                assert_eq!(*count, 6);
+                assert_eq!(name.as_deref(), Some("Alex"));
+            }
+            o => panic!("{o:?}"),
+        }
     }
 }
