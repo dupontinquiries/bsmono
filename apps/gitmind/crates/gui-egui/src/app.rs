@@ -26,6 +26,22 @@ impl Tab {
     // what you open when a deploy fails, and the tabs either side of it
     // are the ones that just failed.
     pub const ALL: [Tab; 12] = [Tab::Fleet, Tab::Push, Tab::Diagnostics, Tab::Network, Tab::Share, Tab::Apps, Tab::Import, Tab::Branches, Tab::Files, Tab::Artifacts, Tab::Timeline, Tab::Settings];
+    /// The grouping, declared once. Compact nav uses it as a section row;
+    /// the desktop workspace uses the same sections as columns. Indices are
+    /// into `Tab::ALL`, and `sections_cover_every_tab` asserts none is lost
+    /// or duplicated — a tab in no section is unreachable when compact.
+    pub fn sections() -> Vec<uikit_egui::sections::Section> {
+        use uikit_egui::sections::Section;
+        vec![
+            // What you do TO devices.
+            Section::new("Devices", &[0, 3, 4, 1]),
+            // What you do to the repository's content.
+            Section::new("Repository", &[7, 8, 10, 6]),
+            // Everything about this machine and the app itself.
+            Section::new("System", &[5, 9, 2, 11]),
+        ]
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Tab::Fleet => "Fleet",
@@ -143,8 +159,53 @@ impl App {
         let compact = adaptive.is_compact();
 
         if compact {
+            // SECTIONS, not twelve icons. A flat row of twelve wrapped to two
+            // ragged rows of unlabelled glyphs — the bar's height changed with
+            // the window, and three of the icons are round network-ish things
+            // and four are box-ish, so none of them were identifiable. The
+            // grouping is declared once in `Tab::SECTIONS` and drives this row
+            // AND the desktop columns.
             egui::Panel::bottom("nav").show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| self.nav_buttons(ui, true));
+                let secs = Tab::sections();
+                // The index into `Tab::ALL`, NOT `self.tab as usize`. The enum's
+                // declaration order and ALL's order differ (ALL is the nav's
+                // order), so the discriminant pointed at a different tab
+                // entirely: on the Network page the row showed System's
+                // destinations. Caught by looking at it.
+                let here = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
+                let active_sec = uikit_egui::sections::section_of(&secs, here).unwrap_or(0);
+                match uikit_egui::sections::plan(ui.available_width(), &secs, Tab::ALL.len()) {
+                    uikit_egui::sections::Layout::Flat => {
+                        ui.horizontal_wrapped(|ui| self.nav_buttons(ui, true));
+                    }
+                    _ => {
+                        // The active section's destinations, labelled, above
+                        // the section row — so the thing you are choosing
+                        // between sits closer to the thumb than the grouping.
+                        ui.horizontal_wrapped(|ui| {
+                            for &i in &secs[active_sec].items {
+                                let t = Tab::ALL[i];
+                                if ui.selectable_label(self.tab == t,
+                                        format!("{} {}", t.icon(), t.label())).clicked() {
+                                    self.tab = t;
+                                }
+                            }
+                        });
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            for (si, sec) in secs.iter().enumerate() {
+                                if ui.selectable_label(si == active_sec, sec.label).clicked() {
+                                    // Selecting a section moves to its first
+                                    // destination: a section tab that changed
+                                    // nothing visible would read as broken.
+                                    if let Some(&first) = sec.items.first() {
+                                        self.tab = Tab::ALL[first];
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
             });
         } else {
             egui::Panel::left("nav").resizable(false).show(ctx, |ui| {
@@ -383,6 +444,23 @@ mod tests {
 #[cfg(test)]
 mod compact_layout_probe {
     use super::*;
+
+    /// Every tab is in exactly one section. A tab in none is unreachable in
+    /// the compact layout; one in two highlights two section tabs at once.
+    /// Both are silent at runtime, which is why this is a test and not a
+    /// careful reading of the indices.
+    #[test]
+    fn sections_cover_every_tab_exactly_once() {
+        assert_eq!(uikit_egui::sections::covers_exactly(&Tab::sections(), Tab::ALL.len()), Ok(()));
+        // And the labels are the ones the nav will show.
+        let names: Vec<&str> = Tab::sections().iter().map(|s| s.label).collect();
+        assert_eq!(names, vec!["Devices", "Repository", "System"]);
+        // A phone gets the two-level nav; a desktop gets columns.
+        assert_eq!(uikit_egui::sections::plan(400.0, &Tab::sections(), Tab::ALL.len()),
+                   uikit_egui::sections::Layout::TwoLevel);
+        assert!(matches!(uikit_egui::sections::plan(1280.0, &Tab::sections(), Tab::ALL.len()),
+                         uikit_egui::sections::Layout::Columns(3)));
+    }
 
     /// At phone width the Network page renders BLANK — seen in a screenshot.
     /// This reports where the space actually goes, so the cause is measured
