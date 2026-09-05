@@ -3830,7 +3830,14 @@ impl Snapclone {
                 ui.colored_label(c.text_weak, crate::camera_source::describe(cam));
             }
             None => {
-                ui.colored_label(c.warning, "no camera found");
+                // DELIBERATELY SILENT. "no camera found" was already on this
+                // screen twice: the viewfinder draws "no camera" in its centre,
+                // and `hint` raises it as a Blocking hint with the actual
+                // remedy (PipeWire/libcamera on a phone, plug one in on a
+                // desktop) and a jump to Settings. A third copy — a bare label
+                // in a third colour — read as three different problems. This
+                // slot names WHICH camera; when there is none, the two that
+                // can say something useful say it.
             }
         }
         // WHICH camera, and whether both can run at once. camera_select answers
