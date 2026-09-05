@@ -18,14 +18,22 @@ mod ballistics;
 mod bench;
 mod bigbody;
 mod board;
+mod boarding;
 mod botpack;
 mod bots;
+mod roomplan;
 mod roster;
 mod sections;
 mod settlement;
 mod camera;
 mod chassis_traits;
 mod chord;
+mod circuit;
+mod circuit_layout;
+mod circuit_map;
+mod circuit_match;
+mod circuit_shapes;
+mod circuit_wave;
 mod cling;
 mod clinch;
 mod combine;
@@ -47,6 +55,7 @@ mod grandeur;
 mod hardpoints;
 mod foothold;
 mod fleet;
+mod flow;
 mod fx;
 mod gyro;
 mod content;
@@ -54,6 +63,7 @@ mod crawler;
 mod machine;
 mod curriculum;
 mod corruption;
+mod corrupt_body;
 mod cyber;
 mod partcars;
 mod palevector;
@@ -94,10 +104,12 @@ mod hullform;
 mod interior;
 mod menu;
 mod meshgen;
+mod moons;
 mod mixer;
 mod model;
 mod online_screen;
 mod optics;
+mod overload;
 mod physics;
 mod powers;
 mod planetlook;
@@ -1466,6 +1478,42 @@ fn main() {
         space::run(&argv);
         return;
     }
+    if argv.iter().any(|a| a == "--circuit") {
+        circuit::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--overload") {
+        overload::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--flow") {
+        flow::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--boarding") {
+        boarding::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--roomplan") {
+        roomplan::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--circuit-map") {
+        circuit_map::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--circuit-layout") {
+        circuit_layout::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--circuit-wave") {
+        circuit_wave::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--circuit-match") {
+        circuit_match::run();
+        return;
+    }
     if argv.iter().any(|a| a == "--roster") {
         census::run();
         return;
@@ -2096,7 +2144,119 @@ fn main() {
 
     let mut car = Car::new();
     apply_car_dims(&mut car, &cars.models[cars.active], cfg.car.size);
-    let world = World::generate(seed, style0, cars.models[cars.active].half_h, cfg.arena.scale);
+    let mut world = World::generate(seed, style0, cars.models[cars.active].half_h, cfg.arena.scale);
+    // TEMPORARY VISUAL-PROOF HOOK, not gameplay: dumps the CIRCUIT/OVERLOAD
+    // content (circuit_shapes' real Shape output for the Tithe plus one
+    // bridge) into the running world so it can be SEEN and screenshotted
+    // in a real render, rather than only asserted by headless tests. Gated
+    // on an env var so it can never fire in a normal launch. Not a design
+    // decision about how CIRCUIT eventually loads for real (that is
+    // `circuit_map.rs`'s own documented open item) -- purely a look.
+    if std::env::var("CIRCUIT_PREVIEW").is_ok() {
+        let tithe = moons::by_id("tithe").expect("tithe must exist");
+        let placements = circuit_map::layout(&tithe);
+        let offset = Vec3::new(0.0, 0.0, 0.0);
+        for mut s in circuit_shapes::stop_shapes(&placements) {
+            s.mat = Mat4::from_translation(offset) * s.mat;
+            s.pos += offset;
+            world.shapes.push(s);
+        }
+        let bridges = moons::bridges();
+        let spline = circuit_map::bridge_spline(&bridges[3]); // Tithe -> Knead
+        for mut s in circuit_shapes::bridge_rubble_shapes(&bridges[3], &spline) {
+            s.mat = Mat4::from_translation(offset) * s.mat;
+            s.pos += offset;
+            world.shapes.push(s);
+        }
+        eprintln!("[circuit_preview] injected {} CIRCUIT shapes at offset {offset:?}", world.shapes.len());
+    }
+    // TEMPORARY VISUAL-PROOF HOOK, same shape as CIRCUIT_PREVIEW above:
+    // dumps the Bridge's new mode-select scene (`holomap::hub_scene`)
+    // into the running world as real shapes, so the ring/sweep can be
+    // SEEN rather than only asserted by headless tests. Console-table
+    // units (`holomap::HUB_RING_R` is 0.30 m) are scaled up for a
+    // world-space mockup -- this is not the real physical placement,
+    // which belongs to whatever eventually renders the Bridge room's
+    // actual console model.
+    if let Ok(sel_str) = std::env::var("HUB_PREVIEW") {
+        let sel = match sel_str.as_str() {
+            "overload" => flow::HubChoice::Overload,
+            "raid" => flow::HubChoice::Raid,
+            "patrol" => flow::HubChoice::Patrol,
+            _ => flow::HubChoice::Campaign,
+        };
+        let skin = &holomap::SKINS[0];
+        let scene = holomap::hub_scene(sel, skin);
+        let scale = 20.0;
+        let hub_offset = Vec3::new(80.0, 2.0, 0.0);
+        for g in &scene {
+            match g {
+                holomap::Glyph::Body { pos, color, .. } => {
+                    let p = hub_offset + Vec3::new(pos.x, 0.0, pos.z) * scale;
+                    let r = 1.2;
+                    let rot = Quat::IDENTITY;
+                    world.shapes.push(world::Shape {
+                        mesh: world::M_SPHERE,
+                        mat: Mat4::from_scale_rotation_translation(Vec3::splat(r), rot, p),
+                        pos: p,
+                        inv_rot: rot.inverse(),
+                        sdf: world::Sdf::Sphere { r },
+                        color: *color,
+                        emissive: 0.6,
+                        flash: 0.0,
+                        vel: Vec3::ZERO,
+                        omega: Vec3::ZERO,
+                        spec: 0.5,
+                        cut: false,
+                        blend: false,
+                    });
+                }
+                holomap::Glyph::Ring { r, color, .. } => {
+                    let big = r * scale;
+                    let tube = big * 0.03;
+                    let rot = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+                    world.shapes.push(world::Shape {
+                        mesh: world::M_TORUS_THIN,
+                        mat: Mat4::from_scale_rotation_translation(Vec3::splat(big), rot, hub_offset),
+                        pos: hub_offset,
+                        inv_rot: rot.inverse(),
+                        sdf: world::Sdf::Torus { big, tube },
+                        color: *color,
+                        emissive: 0.3,
+                        flash: 0.0,
+                        vel: Vec3::ZERO,
+                        omega: Vec3::ZERO,
+                        spec: 0.4,
+                        cut: false,
+                        blend: true,
+                    });
+                }
+                holomap::Glyph::Sweep { angle, color } => {
+                    let dir = Vec3::new(angle.cos(), 0.0, angle.sin());
+                    let half = (scale * holomap::HUB_RING_R) * 0.5;
+                    let mid = hub_offset + dir * half;
+                    let rot = Quat::from_rotation_arc(Vec3::Y, dir);
+                    world.shapes.push(world::Shape {
+                        mesh: world::M_CAP_TALL,
+                        mat: Mat4::from_scale_rotation_translation(Vec3::splat(0.3), rot, mid),
+                        pos: mid,
+                        inv_rot: rot.inverse(),
+                        sdf: world::Sdf::Capsule { r: 0.3, half },
+                        color: *color,
+                        emissive: 0.8,
+                        flash: 0.0,
+                        vel: Vec3::ZERO,
+                        omega: Vec3::ZERO,
+                        spec: 0.5,
+                        cut: false,
+                        blend: true,
+                    });
+                }
+                _ => {}
+            }
+        }
+        eprintln!("[hub_preview] injected hub scene for {sel:?} at {hub_offset:?}");
+    }
     gpu.replace_mesh(world::M_TERRAIN, &meshgen::MeshData::new()); // chunks draw it now
     let tchunks = terrain_chunks(&mut gpu, &world);
     gpu.set_rcells(&bake_rcells(&world));
@@ -2156,8 +2316,7 @@ fn main() {
         snd,
         pad: gamepad::Pad::new(),
         last_pad: gamepad::PadState::default(),
-        save: sv,
-        binds,
+        save: sv,        binds,
         net: net::Net::new(),
         applied_scale: cfg.arena.scale,
         cfg,
@@ -2267,7 +2426,7 @@ fn main() {
         // gets DRAWN for the outer skin. Picked from the catalog's own
         // `category: "spaceship"` chassis; a big troop-transport shape
         // fits "mobile fortress" better than a small courier or fighter.
-        game.aboard.load_exterior(&mut game.gpu, &bots_dir, "spaceship_warpzone_aka_military_troop_ship");
+        game.aboard.load_exterior(&mut game.gpu, &bots_dir, aboard::EXTERIOR_MODEL);
         // PARK IT AT THE SAME PLACE THE DRAW CALL PUTS IT. Two transforms for
         // one object is how a hull you can see and a hull you can hit end up
         // in different places, so both read `ground_lift` — and this is the
@@ -2361,12 +2520,15 @@ fn main() {
                     match event.state {
                         ElementState::Pressed => {
                             game.analog.note_key(&key, &event.physical_key);
-                            // [ and ] cycle cars in singleplayer, matched on
-                            // BOTH the logical character and the physical key
-                            // position. Dvorak moves the bracket CHARACTERS to
-                            // where QWERTY has - and =, so a player who thinks
-                            // in characters and a player who thinks in key
-                            // positions both get what they reached for.
+                            // [ and ] cycle THE SHIP, matched on both the
+                            // logical character and the physical key
+                            // position. Dvorak moves the bracket CHARACTERS
+                            // to where QWERTY has - and =, so a player who
+                            // thinks in characters and a player who thinks
+                            // in key positions both get what they reached
+                            // for. Shifted brackets ({ }) cycle cars —
+                            // these two were the other way round until the
+                            // ship became the thing worth reaching for.
                             if !event.repeat {
                                 use winit::keyboard::{KeyCode, PhysicalKey};
                                 let ch = match &key {
@@ -2382,16 +2544,17 @@ fn main() {
                                     0
                                 };
                                 if dir != 0 {
-                                    // SHIFTED BRACKETS CYCLE THE SHIP. Read the
-                                    // CHARACTER for the shift, not a modifier
-                                    // state: `{` is what the keyboard sends and
-                                    // it survives every layout that moves the
-                                    // bracket keys, which is the same reason
-                                    // the physical fallback above exists.
+                                    // SHIFTED BRACKETS CYCLE THE CAR. Read
+                                    // the CHARACTER for the shift, not a
+                                    // modifier state: `{` is what the
+                                    // keyboard sends and it survives every
+                                    // layout that moves the bracket keys,
+                                    // which is the same reason the physical
+                                    // fallback above exists.
                                     if ch == "{" || ch == "}" {
-                                        game.cycle_ship(dir);
-                                    } else {
                                         game.cycle_car(dir);
+                                    } else {
+                                        game.cycle_ship(dir);
                                     }
                                 }
                             }
@@ -2823,36 +2986,6 @@ impl Game {
     fn one_shot(&mut self, a: Action) {
         match a {
             Action::Jump => self.jump_edge = true,
-            Action::BallCam => {
-                // three states now, not two. ball_cam is kept in step so the
-                // HUD and the save file, which both predate the enum, still
-                // mean what they meant.
-                // MID-FOLD THE DIRECTOR OWNS THE CAMERA. Cycling here would
-                // stomp `Cinematic`, and `end_cinematic` would then hand
-                // control back to whatever the player just picked instead of
-                // where they actually were — so the key is a no-op for the
-                // ~1.3s the fold shot is running.
-                if self.cam.in_cinematic() {
-                    return;
-                }
-                // the chassis decides whether a gunner seat exists at all
-                let guns = self.gun_mounts();
-                self.cam.gun_seat = guns.seat();
-                self.cam.mode = self.cam.mode.next(guns);
-                self.cam.ball_cam = self.cam.mode == camera::CamMode::Ball;
-                if self.cam.mode != camera::CamMode::First {
-                    self.cam.look_pitch = self.cam.look_pitch.clamp(-0.55, 1.05);
-                }
-                let m = self.cam.mode.label();
-                self.toastf(m);
-            }
-            Action::Toss => self.ball.toss(&self.car),
-            Action::BallFront => self.ball.reset_in_front(&self.car),
-            Action::ResetCar => {
-                self.car.reset(&self.world);
-                let m = self.cars.active;
-                apply_car_dims(&mut self.car, &self.cars.models[m], self.cfg.car.size);
-            }
             Action::Minimap => self.save.minimap = !self.save.minimap,
             Action::Music => {
                 let on = !self.snd.music_on;
@@ -2866,7 +2999,6 @@ impl Game {
                 let v = self.snd.volume + 0.1;
                 self.snd.set_volume(v);
             }
-            Action::FlipVis => self.flip_vis = !self.flip_vis,
             Action::Transform => self.transform(),
             Action::FlightMode => {
                 if self.car.flight {
@@ -2906,9 +3038,6 @@ impl Game {
                 }
                 self.toastf(if self.autotarget { "AUTOTARGET ON" } else { "AUTOTARGET OFF" });
             }
-            Action::Car1 => self.switch_car(0),
-            Action::Car2 => self.switch_car(1),
-            Action::Car3 => self.switch_car(2),
             _ => {}
         }
     }
@@ -5786,6 +5915,13 @@ impl Game {
                     self.toastf(&format!("REPLAY - {}", m.title));
                     return;
                 }
+                // [ and ] swap the spaceship: handled in the winit event
+                // loop above (alongside the physical-key fallback), where
+                // `cycle_ship` does the real regenerate/repark/re-upload.
+                // Deliberately NOT duplicated here — an earlier pass added
+                // a second bracket handler in this match that only printed
+                // a toast, which is the two-answers-to-one-question
+                // mistake `--parity` exists to find.
                 if let Some(a) = self.action_for_key(&key) {
                     self.one_shot(a);
                 }
@@ -8320,11 +8456,38 @@ impl Game {
         self.aboard.hull_slot = None; // force a fresh upload at the new size
         self.aboard.cells_slot = None;
         self.upload_ship_hull();
+        // RELOAD THE EXTERIOR MODEL AT THE NEW SIZE. Without this the swap
+        // is invisible: `load_exterior` bakes `hull_half.z * 2.0` in at
+        // load time and the model is drawn INSTEAD of the procedural skin,
+        // so the hull, the rooms and the collision would all resize behind
+        // an exterior still sitting at whatever size it was first loaded
+        // at. That is a swap that changes everything except the thing you
+        // are looking at — which is indistinguishable from the key not
+        // working, and is what a playtest reported.
+        let bots_dir = assets_dir().join("bots");
+        self.aboard.load_exterior(&mut self.gpu, &bots_dir, aboard::EXTERIOR_MODEL);
         self.step_outside();
-        self.toastf(&format!(
-            "{name} — {:.0} m hull ({:.0} heights): {note}",
+        // THE RAMP IS PART OF THE SWAP. `boarding::RampSpec`/`RampMount`
+        // derive from the hull that just changed, so a ship swap that
+        // did not re-report them would leave the boarding geometry
+        // silently stale on screen and in the toast.
+        let ramp = boarding::RampSpec::for_hull_len(
             self.aboard.ship.hull_half.z * 2.0,
-            heights
+            self.aboard.ship.occupant_h,
+        );
+        let mount = boarding::RampMount::place(
+            &ramp,
+            self.aboard.ship.profile(),
+            self.aboard.ship.deck_y,
+        );
+        self.toastf(&format!(
+            "{name} — {:.0} m hull ({:.0} heights): {note}  |  ramp {:.1} m x {:.1} m, {:.0}°{}",
+            self.aboard.ship.hull_half.z * 2.0,
+            heights,
+            ramp.width_m,
+            mount.slope_len(),
+            ramp.grade_deg,
+            if mount.fits { "" } else { "  (STERN TOO NARROW)" }
         ));
     }
 

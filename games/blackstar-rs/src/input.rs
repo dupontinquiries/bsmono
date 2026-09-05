@@ -20,18 +20,10 @@ pub enum Action {
     Jump,
     Boost,
     Slide,
-    BallCam,
-    Toss,
-    BallFront,
-    ResetCar,
     Minimap,
     Music,
     VolDown,
     VolUp,
-    FlipVis,
-    Car1,
-    Car2,
-    Car3,
     /// vehicle <-> robot, for a blackstar chassis
     Transform,
     /// hand the point-of-interest camera an opponent instead of the ball
@@ -62,7 +54,7 @@ pub enum Action {
     SiegeMode,
 }
 
-pub const ACTIONS: [Action; 30] = [
+pub const ACTIONS: [Action; 22] = [
     Action::Forward,
     Action::Reverse,
     Action::SteerL,
@@ -72,18 +64,10 @@ pub const ACTIONS: [Action; 30] = [
     Action::Jump,
     Action::Boost,
     Action::Slide,
-    Action::BallCam,
-    Action::Toss,
-    Action::BallFront,
-    Action::ResetCar,
     Action::Minimap,
     Action::Music,
     Action::VolDown,
     Action::VolUp,
-    Action::FlipVis,
-    Action::Car1,
-    Action::Car2,
-    Action::Car3,
     Action::Transform,
     Action::AutoTarget,
     Action::Fire,
@@ -107,18 +91,10 @@ impl Action {
             Action::Jump => "JUMP / DODGE",
             Action::Boost => "BOOST",
             Action::Slide => "POWERSLIDE",
-                Action::BallCam => "BALL CAM",
-            Action::Toss => "TOSS BALL",
-            Action::BallFront => "BALL TO FRONT",
-            Action::ResetCar => "RESET CAR",
             Action::Minimap => "MINIMAP",
             Action::Music => "MUSIC",
             Action::VolDown => "VOLUME DOWN",
             Action::VolUp => "VOLUME UP",
-            Action::FlipVis => "FLIP CAR MODEL",
-            Action::Car1 => "CAR: OCTANE",
-            Action::Car2 => "CAR: FENNEC",
-            Action::Car3 => "CAR: DOMINUS",
             Action::Transform => "TRANSFORM (BOT <-> ROBOT)",
             Action::AutoTarget => "AUTOTARGET",
             Action::Fire => "FIRE",
@@ -141,18 +117,10 @@ impl Action {
             Action::Jump => "jump",
             Action::Boost => "boost",
             Action::Slide => "slide",
-            Action::BallCam => "ball_cam",
-            Action::Toss => "toss",
-            Action::BallFront => "ball_front",
-            Action::ResetCar => "reset_car",
             Action::Minimap => "minimap",
             Action::Music => "music",
             Action::VolDown => "vol_down",
             Action::VolUp => "vol_up",
-            Action::FlipVis => "flip_vis",
-            Action::Car1 => "car1",
-            Action::Car2 => "car2",
-            Action::Car3 => "car3",
             Action::Transform => "transform",
             Action::AutoTarget => "autotarget",
             Action::Fire => "fire",
@@ -348,12 +316,6 @@ impl Bindings {
         // different answer for the scheme players actually start on.
         set(&mut b, Fire, vec![Bind::Mouse(MouseButton::Left), Bind::Pad(crate::gamepad::PB_RT)]);
         set(&mut b, CycleForm, vec![Bind::Mouse(MouseButton::Middle), Bind::Pad(crate::gamepad::PB_DUP)]);
-        // CAR1/2/3 ARE UNBOUND BY DEFAULT. 1-9 now drive the hotbar
-        // (`hotbar.rs`'s nine slots); the actions still exist for
-        // anyone who wants to bind them back in the Binds menu.
-        set(&mut b, Car1, vec![]);
-        set(&mut b, Car2, vec![]);
-        set(&mut b, Car3, vec![]);
         b
     }
 
@@ -382,18 +344,10 @@ impl Bindings {
             // controller nothing about boost changes at all.
             (Boost, vec![ch("v"), Bind::Pad(crate::gamepad::PB_EAST), Bind::Pad(crate::gamepad::PB_RB)]),
             (Slide, vec![named(NamedKey::Control), Bind::Pad(crate::gamepad::PB_WEST)]),
-            (BallCam, vec![ch("c"), Bind::Pad(crate::gamepad::PB_NORTH)]),
-            (Toss, vec![ch("t")]),
-            (BallFront, vec![ch("b")]),
-            (ResetCar, vec![ch("r"), Bind::Pad(crate::gamepad::PB_SELECT)]),
             (Minimap, vec![ch("m")]),
             (Music, vec![ch("n")]),
             (VolDown, vec![ch("[")]),
             (VolUp, vec![ch("]")]),
-            (FlipVis, vec![ch("f")]),
-            (Car1, vec![ch("1")]),
-            (Car2, vec![ch("2")]),
-            (Car3, vec![ch("3")]),
             // SHIFT, with G kept as the second binding for anyone already
             // used to it, and L-bumper on a pad.
             (Transform, vec![named(NamedKey::Shift), ch("g"), Bind::Pad(crate::gamepad::PB_LB)]),
@@ -452,7 +406,6 @@ impl Bindings {
         set(&mut b, Action::Jump, false, vec![ch("z"), Bind::Pad(crate::gamepad::PB_SOUTH)]);
         set(&mut b, Action::Boost, false, vec![ch("v"), Bind::Pad(crate::gamepad::PB_EAST)]);
         set(&mut b, Action::Slide, false, vec![ch("a"), Bind::Pad(crate::gamepad::PB_WEST)]);
-        set(&mut b, Action::BallCam, false, vec![Bind::Key(Key::Named(NamedKey::Space)), Bind::Pad(crate::gamepad::PB_NORTH)]);
         b
     }
 
@@ -649,7 +602,12 @@ mod clash_tests {
             .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
             .filter_map(|l| l.strip_suffix(','))
             .collect();
-        assert!(variants.len() >= 25, "only found {} variants; the scan broke", variants.len());
+        // Floor lowered from 25 after removing six skydribble-era actions
+        // (BallCam, ResetCar, Toss, BallFront, FlipVis, Car1/2/3 -- ball/car
+        // artifacts that don't mean anything once the player isn't chasing
+        // a ball in a car) -- 20 is comfortably below the real count (22)
+        // while still catching the scan genuinely breaking (finding ~0).
+        assert!(variants.len() >= 20, "only found {} variants; the scan broke", variants.len());
         assert_eq!(variants.len(), ACTIONS.len(), "Action enum and ACTIONS have different lengths");
         for v in &variants {
             let count = ACTIONS.iter().filter(|a| format!("{a:?}") == *v).count();
@@ -787,9 +745,8 @@ pub fn run(argv: &[String]) {
         let names: Vec<String> = un.iter().map(|a| format!("{a:?}")).collect();
         println!("\n  {} unbound: {}", un.len(), names.join(", "));
         println!(
-            "    (RollL and Car1/2/3 are deliberately unbound -- see default_scheme()'s own \
-             comments: RollL is a real open choice worth a second look, Car1/2/3 aren't -- \
-             1-9 drive the hotbar now, they're legacy actions kept rebindable, not a gap)"
+            "    (RollL is deliberately unbound -- see default_scheme()'s own \
+             comment: a real open choice worth a second look)"
         );
     }
     println!("\n  --keys defaults  to compare against the shipped scheme");

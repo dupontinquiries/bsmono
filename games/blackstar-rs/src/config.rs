@@ -1,8 +1,11 @@
 //! Every live-tunable number in one place: camera feel, arena physics
 //! (gravity / bounce / friction / size), ball mutators, car setup, flip
 //! rules and video. Edited from the in-game SETTINGS menus, persisted as
-//! `cfg key value` lines in the save file, all multipliers of the Rocket
-//! League baselines in physics.rs so 100% always means "stock RL feel".
+//! `cfg key value` lines in the save file, all multipliers of the current
+//! `physics.rs` baselines so 100% means "whatever this project currently
+//! ships as its default feel" — that baseline happens to be inherited from
+//! Rocket League today, but the multiplier scheme itself doesn't assume RL
+//! is the target; retuning the 100% point is exactly what this file is for.
 
 pub struct CamCfg {
     pub fov_deg: f32,   // 55..110, RL default ~76

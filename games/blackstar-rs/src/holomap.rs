@@ -199,6 +199,7 @@ pub const SKINS: &[Skin] = &[
 /// One element of the hologram, in console-local metres (table centre at
 /// the origin, +Y up off the table). The renderer draws these; the sim
 /// rasterises them to characters; the tests count and measure them.
+#[derive(Debug)]
 pub enum Glyph {
     Ring { r: f32, color: [f32; 4], dashed: bool },
     Body { pos: Vec3, size: f32, color: [f32; 4], label: &'static str },
@@ -208,6 +209,79 @@ pub enum Glyph {
     Grid { color: [f32; 4] },
     /// an extrasolar contact at the rim: a bearing, not an orbit
     Beacon { angle: f32, color: [f32; 4], label: &'static str },
+}
+
+/// THE NAVIGATION ROOM — the ship's Bridge, per `content::HUB`'s own
+/// blurb ("Navigation console. Choose where the ship goes next."), is
+/// where a player picks a MODE (`flow::HubChoice`: Campaign, Overload,
+/// Raid, Patrol), not a destination — that's a different decision from
+/// the Starmap's twenty places, and it deliberately does not touch
+/// `CHART`/`ROUTE` or the machine-checked
+/// `every_route_world_is_on_the_chart` test. `Station::Starmap` itself
+/// stays at the airlock for the reason already recorded in `stations.rs`
+/// (the airlock had no console; the Bridge does, and it's currently
+/// `Station::Bridge`'s sortie/valence screen). Rather than relocate
+/// either console — both placements are deliberate, documented
+/// decisions, not oversights — this gives `Station::Bridge` a SECOND
+/// thing to show on the same physical console: the mode choice,
+/// presented in the Holo's own visual grammar (a `Body` per choice on
+/// a small ring, a `Sweep` pointing at whichever is highlighted) so the
+/// Bridge reads as one navigation console with two questions on it
+/// ("which mode" here, "which sortie" in `Station::Bridge`'s existing
+/// screen) instead of two unrelated systems sharing a room.
+///
+/// Four choices, not twenty — this is deliberately its own small ring,
+/// not reusing `CHART`'s AU-scaled orbits or `table_r`'s compression;
+/// four items at even angles needs neither.
+pub const HUB_RING_R: f32 = 0.30;
+
+/// The four `flow::HubChoice`s, in the same fixed order `flow.rs`'s own
+/// `hub_cycle` uses — kept here rather than re-derived, so a UI reading
+/// this scene and a `hub_cycle(1)` press agree on what "next" means.
+pub const HUB_ORDER: [crate::flow::HubChoice; 4] = [
+    crate::flow::HubChoice::Campaign,
+    crate::flow::HubChoice::Overload,
+    crate::flow::HubChoice::Raid,
+    crate::flow::HubChoice::Patrol,
+];
+
+fn hub_label(c: crate::flow::HubChoice) -> &'static str {
+    match c {
+        crate::flow::HubChoice::Campaign => "CAMPAIGN",
+        crate::flow::HubChoice::Overload => "OVERLOAD",
+        crate::flow::HubChoice::Raid => "RAID",
+        crate::flow::HubChoice::Patrol => "PATROL",
+    }
+}
+
+fn hub_angle(c: crate::flow::HubChoice) -> f32 {
+    let i = HUB_ORDER.iter().position(|x| *x == c).unwrap_or(0);
+    (i as f32 / HUB_ORDER.len() as f32) * std::f32::consts::TAU
+}
+
+/// The Bridge's mode-select scene: one `Body` per `HubChoice` on
+/// `HUB_RING_R`, plus a `Sweep` pointing at `sel` — the highlighted
+/// choice is also drawn brighter (alpha 1.0 vs 0.55) so a colour-blind
+/// or greyscale render still shows which one is selected without
+/// relying on the sweep alone. Deterministic in `t` only through the
+/// skin's own idle animation (`Holo::cam` uses `t` for the camera
+/// orbit; the glyphs themselves do not move — a stable ring, not
+/// planets in motion, since these four things don't orbit anything).
+pub fn hub_scene(sel: crate::flow::HubChoice, skin: &Skin) -> Vec<Glyph> {
+    let mut out = Vec::new();
+    if skin.grid {
+        out.push(Glyph::Grid { color: skin.ink[3] });
+    }
+    out.push(Glyph::Ring { r: HUB_RING_R, color: skin.ink[2], dashed: skin.rings_dashed });
+    for &c in &HUB_ORDER {
+        let a = hub_angle(c);
+        let pos = Vec3::new(a.cos() * HUB_RING_R, 0.0, a.sin() * HUB_RING_R);
+        let mut color = skin.ink[1];
+        color[3] = if c == sel { 1.0 } else { 0.55 };
+        out.push(Glyph::Body { pos, size: 0.03, color, label: hub_label(c) });
+    }
+    out.push(Glyph::Sweep { angle: hub_angle(sel), color: skin.ink[2] });
+    out
 }
 
 /// One console's state: which skin, and what the plot is showing.
@@ -390,6 +464,119 @@ fn ascii(h: &Holo, t: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hub_scene_has_one_body_per_hub_choice() {
+        let skin = &SKINS[0];
+        let scene = hub_scene(crate::flow::HubChoice::Campaign, skin);
+        let bodies: Vec<&Glyph> = scene.iter().filter(|g| matches!(g, Glyph::Body { .. })).collect();
+        assert_eq!(bodies.len(), 4);
+    }
+
+    #[test]
+    fn hub_scene_bodies_are_at_distinct_positions() {
+        let skin = &SKINS[0];
+        let scene = hub_scene(crate::flow::HubChoice::Campaign, skin);
+        let positions: Vec<Vec3> = scene
+            .iter()
+            .filter_map(|g| match g {
+                Glyph::Body { pos, .. } => Some(*pos),
+                _ => None,
+            })
+            .collect();
+        for i in 0..positions.len() {
+            for j in (i + 1)..positions.len() {
+                assert!(positions[i].distance(positions[j]) > 0.01, "{i} and {j} coincide");
+            }
+        }
+    }
+
+    #[test]
+    fn hub_scene_bodies_all_sit_on_the_ring_radius() {
+        let skin = &SKINS[0];
+        let scene = hub_scene(crate::flow::HubChoice::Overload, skin);
+        for g in &scene {
+            if let Glyph::Body { pos, .. } = g {
+                let r = (pos.x * pos.x + pos.z * pos.z).sqrt();
+                assert!((r - HUB_RING_R).abs() < 1e-4, "off-ring body at r={r}");
+            }
+        }
+    }
+
+    #[test]
+    fn hub_scene_labels_every_body_correctly() {
+        let skin = &SKINS[0];
+        let scene = hub_scene(crate::flow::HubChoice::Raid, skin);
+        let labels: Vec<&str> = scene
+            .iter()
+            .filter_map(|g| match g {
+                Glyph::Body { label, .. } => Some(*label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 4);
+        for c in HUB_ORDER {
+            assert!(labels.contains(&hub_label(c)), "{c:?} missing a label");
+        }
+    }
+
+    #[test]
+    fn hub_scene_highlights_exactly_the_selected_choice() {
+        let skin = &SKINS[0];
+        for sel in HUB_ORDER {
+            let scene = hub_scene(sel, skin);
+            for g in &scene {
+                if let Glyph::Body { color, label, .. } = g {
+                    let is_selected = *label == hub_label(sel);
+                    assert_eq!(color[3] == 1.0, is_selected, "{label} alpha wrong for selection {sel:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hub_scene_sweep_points_at_the_selection() {
+        let skin = &SKINS[0];
+        for sel in HUB_ORDER {
+            let scene = hub_scene(sel, skin);
+            let sweep = scene.iter().find_map(|g| match g {
+                Glyph::Sweep { angle, .. } => Some(*angle),
+                _ => None,
+            });
+            assert_eq!(sweep, Some(hub_angle(sel)));
+        }
+    }
+
+    #[test]
+    fn hub_scene_is_deterministic() {
+        let skin = &SKINS[0];
+        let a = hub_scene(crate::flow::HubChoice::Patrol, skin);
+        let b = hub_scene(crate::flow::HubChoice::Patrol, skin);
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(format!("{x:?}"), format!("{y:?}"));
+        }
+    }
+
+    #[test]
+    fn hub_order_matches_flow_hub_cycles_own_sequence() {
+        // if `flow::hub_cycle`'s order ever changes, this scene's ring
+        // must not silently disagree with what pressing "next" actually
+        // selects -- checked by walking both the same way and comparing.
+        let mut f = crate::flow::Flow::new();
+        let mut save = crate::save::Save::default();
+        save.seen_intro = true;
+        for _ in 0..2000 {
+            f.update(0.01, &save);
+            if matches!(f.stage, crate::flow::Stage::CharacterHub { .. }) {
+                break;
+            }
+        }
+        for expect in HUB_ORDER {
+            assert_eq!(f.stage_sel(), Some(expect));
+            f.hub_cycle(1);
+        }
+    }
 
     #[test]
     fn every_route_world_is_on_the_chart() {
