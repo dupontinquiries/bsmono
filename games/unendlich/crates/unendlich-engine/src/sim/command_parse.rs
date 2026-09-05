@@ -127,6 +127,10 @@ pub enum Command {
     Model(Option<String>),
     /// `/keys` — print the keybindings into the chat log.
     Keys,
+    /// `/provider` — show the current one; `/provider <spec>` — switch.
+    /// Specs: `fixture`, `script`, `ollama[:host[:model]]`,
+    /// `openai[:host]`. Case preserved: a model name is data.
+    Provider(Option<String>),
     /// `/gamemode <survival|creative|adventure|spectator>`.
     Gamemode(GameMode),
     /// `/recipes` — open the recipe book GUI.
@@ -234,6 +238,11 @@ pub fn parse(line: &str) -> Command {
             _ => Command::Unknown,
         },
         "/keys" => if args.is_empty() { Command::Keys } else { Command::Unknown },
+        "/provider" => match args.as_slice() {
+            [] => Command::Provider(None),
+            [spec] => Command::Provider(Some((*spec).to_string())),
+            _ => Command::Unknown,
+        },
         "/model" => match args.as_slice() {
             [] => Command::Model(None),
             [name] => Command::Model(Some((*name).to_string())),
@@ -370,6 +379,8 @@ impl Command {
             Command::BuildVoice(false) => Some("/build disableVoice".to_string()),
             Command::Anim(p) => Some(format!("/anim {}", p.keyword())),
             Command::Keys => Some("/keys".to_string()),
+            Command::Provider(None) => Some("/provider".to_string()),
+            Command::Provider(Some(s)) => Some(format!("/provider {s}")),
             Command::Model(None) => Some("/model".to_string()),
             Command::Model(Some(n)) => Some(format!("/model {n}")),
             Command::Gamemode(m) => Some(format!("/gamemode {}", m.keyword())),
@@ -611,5 +622,17 @@ mod tests {
             assert_eq!(parse(&c.to_command_string().unwrap()), c, "round trip");
         }
         assert!(Command::Model(None).opens_gui(), "the model list is a panel");
+    }
+
+    #[test]
+    fn provider_verb_parses_and_round_trips() {
+        assert_eq!(parse("/provider"), Command::Provider(None));
+        // a model name is data: case must survive
+        assert_eq!(parse("/provider ollama:127.0.0.1:11434:Qwen2.5-Coder"),
+                   Command::Provider(Some("ollama:127.0.0.1:11434:Qwen2.5-Coder".to_string())));
+        assert_eq!(parse("/provider a b"), Command::Unknown, "one spec only");
+        for c in [Command::Provider(None), Command::Provider(Some("fixture".into()))] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c);
+        }
     }
 }

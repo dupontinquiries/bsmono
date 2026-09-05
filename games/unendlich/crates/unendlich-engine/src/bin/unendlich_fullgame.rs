@@ -4392,64 +4392,59 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             // anything else honours $UNENDLICH_BUILD_PROVIDER
                             // and falls back to the fixture so a first run
                             // never silently does nothing.
-                            // Which script runs, and SAY SO. Without this,
-                            // a plain `/build a castle` with no env var set
-                            // fell back to fixture.sh and returned the same
-                            // canned tower -- you would conclude the model
-                            // worked when it was never called.
+                            // `/build debug` always uses the fixture. Anything
+                            // else uses whatever /provider selected, which
+                            // defaults to $UNENDLICH_BUILD_HTTP or the fixture.
+                            // The choice is ANNOUNCED: a silent fallback to the
+                            // fixture once looked exactly like a working model.
+                            use unendlich_engine::voxel_chat::ProviderChoice;
                             let debug = prose.trim_start().starts_with("debug");
-                            let script = if debug {
-                                "fixture.sh"
-                            } else if paintbrush.models.state.is_ready() {
-                                "llama-cli.sh"
+                            let choice = if debug {
+                                ProviderChoice::Fixture
                             } else {
-                                "fixture.sh"
+                                paintbrush.provider.clone()
                             };
-                            if !debug && script == "fixture.sh" {
-                                paintbrush.say(
-                                    "no model loaded -- running the FIXTURE, not a model. \
-                                     /model <name> first, or set UNENDLICH_BUILD_PROVIDER.");
-                            }
-                            log::info!("[paintbrush] provider choice: script={script} \
-                                        debug={debug} model_ready={}",
-                                       paintbrush.models.state.is_ready());
-                            match unendlich_engine::voxel_chat::find_provider(
-                                script, !debug)
-                            {
-                                // A missing provider is reported and that is
-                                // the end of the turn -- no sentinel flag, no
-                                // empty argv threaded past the failure.
-                                Err(e) => paintbrush.say(e),
-                                Ok(argv) => {
-                                    let (sys, user) = paintbrush
-                                        .prompt_for(&chunk_manager, &gaze, None, &prose);
-                                    // An 8B on CPU can take half a minute and
-                                    // this call blocks the frame. Say so
-                                    // before the window stops responding,
-                                    // rather than after.
-                                    log::info!("[paintbrush] provider {:?}, prompt {} + {} chars",
-                                               argv, sys.len(), user.len());
-                                    paintbrush.say(format!(
-                                        "asking {} ... (the window will freeze until it answers)",
-                                        std::path::Path::new(&argv[0])
-                                            .file_name().map(|s| s.to_string_lossy().into_owned())
-                                            .unwrap_or_else(|| argv[0].clone())));
-                                    // Blocking. A local 7B takes a second or
-                                    // two and this stalls the frame; the
-                                    // worker-thread version is the obvious
-                                    // next step, but a stall you can see beats
-                                    // a loop you cannot test.
-                                    let mut prov =
-                                        voxel_tools::llm::CommandProvider::new(argv);
-                                    match voxel_tools::llm::Completer::complete(
-                                        &mut prov, &sys, &user)
-                                    {
-                                        Ok(raw) => paintbrush.finish_turn(
-                                            &chunk_manager, &gaze, &raw,
-                                            Some((eye.x as i32, eye.y as i32, eye.z as i32))),
-                                        Err(e) => paintbrush
-                                            .say(format!("provider failed: {e}")),
+                            log::info!("[paintbrush] provider choice: {}", choice.describe());
+
+                            let (sys, user) =
+                                paintbrush.prompt_for(&chunk_manager, &gaze, None, &prose);
+
+                            // Build the completer for this turn. HTTP is
+                            // in-process; a script is spawned per request.
+                            let mut completer: Option<Box<dyn voxel_tools::llm::Completer>> =
+                                match &choice {
+                                    ProviderChoice::Http(cfg) => Some(Box::new(
+                                        voxel_tools::llm::HttpProvider::new(cfg.clone()))),
+                                    ProviderChoice::Fixture | ProviderChoice::Script(_) => {
+                                        let script = match &choice {
+                                            ProviderChoice::Script(a) if !a.is_empty() =>
+                                                Ok(a.clone()),
+                                            ProviderChoice::Script(_) =>
+                                                unendlich_engine::voxel_chat::find_provider(
+                                                    "llama-cli.sh", true),
+                                            _ => unendlich_engine::voxel_chat::find_provider(
+                                                    "fixture.sh", !debug),
+                                        };
+                                        match script {
+                                            Ok(argv) => Some(Box::new(
+                                                voxel_tools::llm::CommandProvider::new(argv))),
+                                            Err(e) => { paintbrush.say(e); None }
+                                        }
                                     }
+                                };
+
+                            if let Some(c) = completer.as_mut() {
+                                // Blocking on the frame thread either way; an
+                                // in-process request to a warm server is fast,
+                                // a cold script reload is not.
+                                paintbrush.say(format!(
+                                    "asking {} ... (the window freezes until it answers)",
+                                    c.name()));
+                                match c.complete(&sys, &user) {
+                                    Ok(raw) => paintbrush.finish_turn(
+                                        &chunk_manager, &gaze, &raw,
+                                        Some((eye.x as i32, eye.y as i32, eye.z as i32))),
+                                    Err(e) => paintbrush.say(format!("provider failed: {e}")),
                                 }
                             }
                         }

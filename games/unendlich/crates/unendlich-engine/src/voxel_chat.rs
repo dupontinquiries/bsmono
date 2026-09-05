@@ -116,6 +116,61 @@ pub enum KeyOut {
     None,
 }
 
+/// Which backend answers a `/build`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderChoice {
+    /// The canned fixture script. No model, no server.
+    Fixture,
+    /// A subprocess reading `<system>\0<user>` (aperture's CommandProvider).
+    Script(Vec<String>),
+    /// In-process HTTP to a resident local server. The default worth
+    /// using: a script pays model LOAD on every request, a server loads
+    /// once.
+    Http(voxel_tools::llm::HttpConfig),
+}
+
+impl ProviderChoice {
+    /// Parse a `/provider` spec.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let s = spec.trim();
+        if s.eq_ignore_ascii_case("fixture") { return Ok(ProviderChoice::Fixture); }
+        if let Some(rest) = s.strip_prefix("script:") {
+            let argv: Vec<String> = rest.split_whitespace().map(String::from).collect();
+            if argv.is_empty() { return Err("script: needs a command".into()); }
+            return Ok(ProviderChoice::Script(argv));
+        }
+        if s.eq_ignore_ascii_case("script") {
+            return Ok(ProviderChoice::Script(Vec::new())); // resolved later
+        }
+        // bare `ollama` / `openai` get sensible defaults
+        let spec = match s.to_lowercase().as_str() {
+            "ollama" => "ollama:127.0.0.1:11434",
+            "openai" | "llama" | "llamacpp" => "openai:127.0.0.1:8080",
+            _ => s,
+        };
+        voxel_tools::llm::HttpConfig::parse(spec)
+            .map(ProviderChoice::Http)
+            .ok_or_else(|| format!(
+                "unknown provider '{s}'. Try: fixture | script:<cmd> | \
+                 ollama[:host:port[:model]] | openai[:host:port]"))
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            ProviderChoice::Fixture => "fixture (canned plan, no model)".into(),
+            ProviderChoice::Script(a) if a.is_empty() => "script (auto-located)".into(),
+            ProviderChoice::Script(a) => format!("script: {}", a.join(" ")),
+            ProviderChoice::Http(c) => format!(
+                "{} at {} (model {}) -- in-process, no subprocess",
+                match c.dialect {
+                    voxel_tools::llm::Dialect::Ollama => "ollama",
+                    voxel_tools::llm::Dialect::OpenAi => "openai",
+                },
+                c.host, if c.model.is_empty() { "server default" } else { &c.model }),
+        }
+    }
+}
+
 pub struct Paintbrush {
     pub chatbox: ChatBox,
     pub session: ChatSession,
@@ -126,6 +181,9 @@ pub struct Paintbrush {
     reveal_fps: f32,
     load_started: Option<Instant>,
     chunk_size: i32,
+    /// Current backend. Defaults from $UNENDLICH_BUILD_HTTP if set, so a
+    /// running ollama is picked up without typing anything.
+    pub provider: ProviderChoice,
 }
 
 impl Paintbrush {
@@ -148,6 +206,9 @@ impl Paintbrush {
             reveal_fps: 12.0,
             load_started: None,
             chunk_size,
+            provider: std::env::var("UNENDLICH_BUILD_HTTP").ok()
+                .and_then(|s| ProviderChoice::parse(&s).ok())
+                .unwrap_or(ProviderChoice::Fixture),
         }
     }
 
@@ -272,6 +333,23 @@ impl Paintbrush {
                 };
                 let r = self.session.set_profile(prof);
                 self.push(r);
+                Pending::None
+            }
+            Command::Provider(None) => {
+                self.say(format!("provider: {}", self.provider.describe()));
+                self.say("switch with: /provider ollama | /provider openai:127.0.0.1:8080 \
+                          | /provider script:./my.sh | /provider fixture");
+                Pending::None
+            }
+            Command::Provider(Some(spec)) => {
+                match ProviderChoice::parse(&spec) {
+                    Ok(p) => {
+                        log::info!("[paintbrush] provider -> {}", p.describe());
+                        self.say(format!("provider: {}", p.describe()));
+                        self.provider = p;
+                    }
+                    Err(e) => self.say(e),
+                }
                 Pending::None
             }
             Command::Keys => {

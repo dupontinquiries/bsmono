@@ -150,6 +150,239 @@ pub const KNOWN_VERBS: &[&str] = &[
     "tree", "scatter", "restyle", "fill", "box",
 ];
 
+// ── in-process HTTP: no subprocess, no dependencies ─────────────────
+//
+// Adapted from `aperture_complete::providers::OllamaProvider`, which is
+// itself lifted from logscope-fan's ollama client: raw `TcpStream`,
+// HTTP/1.1 written by hand, targeted string-field extraction rather
+// than a JSON parser, and de-chunking because a local server will use
+// `Transfer-Encoding: chunked` as soon as a reply is non-trivial.
+//
+// Why this and not a subprocess: a script per request pays process
+// start plus MODEL LOAD every time. A 3B reloads in seconds, an 8B in
+// tens of them, and the game is frozen for all of it. A resident
+// server loads once and answers in a fraction of that. The subprocess
+// provider stays for anything exotic; this is the default worth using.
+
+/// Which local server dialect to speak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// ollama: POST /api/generate, fields `system` + `prompt`.
+    Ollama,
+    /// llama.cpp server / any OpenAI-compatible: POST /v1/chat/completions.
+    OpenAi,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HttpConfig {
+    /// `host:port`, e.g. `127.0.0.1:11434` (ollama) or `127.0.0.1:8080`
+    /// (llama-server).
+    pub host: String,
+    pub dialect: Dialect,
+    /// Model name the server knows. Ignored by llama-server, which
+    /// serves whatever it was started with.
+    pub model: String,
+    pub temperature: f32,
+    pub max_tokens: u32,
+    pub timeout: std::time::Duration,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1:11434".into(),
+            dialect: Dialect::Ollama,
+            model: "qwen2.5-coder:7b".into(),
+            temperature: 0.3,
+            max_tokens: 512,
+            // Generous: a cold model on CPU is slow, and a timeout that
+            // fires mid-generation looks identical to a crash.
+            timeout: std::time::Duration::from_secs(180),
+        }
+    }
+}
+
+impl HttpConfig {
+    /// Parse `UNENDLICH_BUILD_HTTP`, e.g.
+    /// `ollama:127.0.0.1:11434:qwen2.5-coder:7b` or
+    /// `openai:127.0.0.1:8080`.
+    pub fn parse(spec: &str) -> Option<Self> {
+        let mut it = spec.splitn(3, ':');
+        let dialect = match it.next()?.to_lowercase().as_str() {
+            "ollama" => Dialect::Ollama,
+            "openai" | "llama" | "llamacpp" => Dialect::OpenAi,
+            _ => return None,
+        };
+        let host_port = it.next()?;
+        let rest = it.next().unwrap_or("");
+        // host may carry the port: `127.0.0.1:11434:model`
+        let (host, model) = match rest.split_once(':') {
+            Some((port, model)) if port.chars().all(|c| c.is_ascii_digit()) =>
+                (format!("{host_port}:{port}"), model.to_string()),
+            _ if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() =>
+                (format!("{host_port}:{rest}"), String::new()),
+            _ => (host_port.to_string(), rest.to_string()),
+        };
+        let mut cfg = HttpConfig { host, dialect, ..Default::default() };
+        if !model.is_empty() { cfg.model = model; }
+        Some(cfg)
+    }
+}
+
+/// Minimal JSON string escaping. Hand-rolled for the same reason
+/// aperture hand-rolls it: one function beats a dependency for the
+/// three fields we send.
+pub fn json_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+/// Build the HTTP/1.1 request text.
+pub fn build_http(cfg: &HttpConfig, system: &str, user: &str) -> String {
+    let (path, body) = match cfg.dialect {
+        Dialect::Ollama => (
+            "/api/generate",
+            format!(
+                "{{\"model\":\"{}\",\"stream\":false,\"system\":\"{}\",\"prompt\":\"{}\",\
+                  \"options\":{{\"temperature\":{},\"num_predict\":{}}}}}",
+                json_escape(&cfg.model), json_escape(system), json_escape(user),
+                cfg.temperature, cfg.max_tokens),
+        ),
+        Dialect::OpenAi => (
+            "/v1/chat/completions",
+            format!(
+                "{{\"model\":\"{}\",\"stream\":false,\"temperature\":{},\
+                  \"max_tokens\":{},\"messages\":[\
+                  {{\"role\":\"system\",\"content\":\"{}\"}},\
+                  {{\"role\":\"user\",\"content\":\"{}\"}}]}}",
+                json_escape(&cfg.model), cfg.temperature, cfg.max_tokens,
+                json_escape(system), json_escape(user)),
+        ),
+    };
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        cfg.host, body.len())
+}
+
+/// Strip HTTP headers and de-chunk. A local server switches to
+/// `Transfer-Encoding: chunked` as soon as the reply is non-trivial,
+/// so relying on the lucky Content-Length case truncates every real
+/// answer.
+pub fn split_body(raw: &str) -> String {
+    let Some((head, body)) = raw.split_once("\r\n\r\n") else { return raw.to_string() };
+    let chunked = head.lines().any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.starts_with("transfer-encoding:") && l.contains("chunked")
+    });
+    if !chunked { return body.to_string(); }
+    // Work in BYTES. Chunk sizes are byte counts and a server may split
+    // anywhere, including inside a multi-byte character -- slicing the
+    // &str at such an index panics, which would crash the game mid-build
+    // on any accented character in a model's reply. Reassemble the bytes
+    // first, then decode once at the end.
+    let mut out: Vec<u8> = Vec::new();
+    let mut rest: &[u8] = body.as_bytes();
+    loop {
+        let Some(nl) = find_crlf(rest) else { break };
+        let Ok(size_line) = std::str::from_utf8(&rest[..nl]) else { break };
+        let Ok(size) = usize::from_str_radix(size_line.trim(), 16) else { break };
+        let tail = &rest[nl + 2..];
+        if size == 0 { break; }
+        if tail.len() < size {
+            out.extend_from_slice(tail);
+            break;
+        }
+        out.extend_from_slice(&tail[..size]);
+        let after = &tail[size..];
+        rest = after.strip_prefix(b"\r\n").unwrap_or(after);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn find_crlf(b: &[u8]) -> Option<usize> {
+    b.windows(2).position(|w| w == b"\r\n")
+}
+
+/// Pull one string field out of a JSON object without a parser.
+/// Handles escaped quotes; returns the unescaped value.
+pub fn find_string_field(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut from = 0usize;
+    while let Some(k) = json[from..].find(&needle) {
+        let after = from + k + needle.len();
+        let rest = &json[after..];
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix(':') else { from = after; continue };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('"') else { from = after; continue };
+        let mut out = String::new();
+        let mut esc = false;
+        for c in rest.chars() {
+            if esc {
+                out.push(match c { 'n' => '\n', 't' => '\t', 'r' => '\r', o => o });
+                esc = false;
+            } else if c == '\\' { esc = true; }
+            else if c == '"' { return Some(out); }
+            else { out.push(c); }
+        }
+        from = after;
+    }
+    None
+}
+
+/// Extract the completion text from either dialect's reply.
+pub fn parse_response(raw: &str) -> Result<String, String> {
+    let body = split_body(raw);
+    if let Some(e) = find_string_field(&body, "error") {
+        return Err(format!("server: {e}"));
+    }
+    // ollama: {"response":"..."}   openai: {...,"message":{"content":"..."}}
+    if let Some(r) = find_string_field(&body, "response") { return Ok(r); }
+    if let Some(c) = find_string_field(&body, "content") { return Ok(c); }
+    let head: String = body.chars().take(200).collect();
+    Err(format!("no completion field in reply: {head}"))
+}
+
+/// In-process provider. Connects, writes, reads, closes.
+pub struct HttpProvider {
+    pub cfg: HttpConfig,
+}
+
+impl HttpProvider {
+    pub fn new(cfg: HttpConfig) -> Self { Self { cfg } }
+}
+
+impl Completer for HttpProvider {
+    fn name(&self) -> &str {
+        match self.cfg.dialect { Dialect::Ollama => "ollama", Dialect::OpenAi => "openai" }
+    }
+    fn complete(&mut self, system: &str, user: &str) -> Result<String, String> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        let req = build_http(&self.cfg, system, user);
+        let mut stream = TcpStream::connect(&self.cfg.host)
+            .map_err(|e| format!("cannot reach {} ({e}) -- is the server running?", self.cfg.host))?;
+        stream.set_read_timeout(Some(self.cfg.timeout)).ok();
+        stream.set_write_timeout(Some(self.cfg.timeout)).ok();
+        stream.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).map_err(|e| format!("read: {e}"))?;
+        parse_response(&String::from_utf8_lossy(&buf))
+    }
+}
+
 /// A scripted completer for tests and for driving the game headlessly.
 /// Returns replies in order; repeats the last one once exhausted, so a
 /// loop that asks twice does not panic.
@@ -317,5 +550,110 @@ mod tests {
             std::path::Path::new("/home/u/models/qwen.gguf"));
         let out = p.complete("s", "u").unwrap();
         assert!(out.contains("/home/u/models/qwen.gguf"), "{out}");
+    }
+
+    #[test]
+    fn ollama_and_openai_requests_are_well_formed() {
+        let mut cfg = HttpConfig::default();
+        let r = build_http(&cfg, "SYS", "USER");
+        assert!(r.starts_with("POST /api/generate HTTP/1.1"), "{r}");
+        assert!(r.contains("Host: 127.0.0.1:11434"));
+        assert!(r.contains(r#""system":"SYS""#) && r.contains(r#""prompt":"USER""#));
+        // Content-Length must match the body exactly or the server hangs
+        let (head, body) = r.split_once("\r\n\r\n").unwrap();
+        let declared: usize = head.lines()
+            .find_map(|l| l.strip_prefix("Content-Length: ")).unwrap().parse().unwrap();
+        assert_eq!(declared, body.len(), "Content-Length must equal the body");
+
+        cfg.dialect = Dialect::OpenAi;
+        let r = build_http(&cfg, "SYS", "USER");
+        assert!(r.starts_with("POST /v1/chat/completions"), "{r}");
+        assert!(r.contains(r#""role":"system""#) && r.contains(r#""role":"user""#));
+    }
+
+    #[test]
+    fn prompts_with_quotes_and_newlines_survive_escaping() {
+        let cfg = HttpConfig::default();
+        let r = build_http(&cfg, "a \"quoted\" line\nnext", "user");
+        assert!(r.contains(r#"a \"quoted\" line\nnext"#), "{r}");
+        let (head, body) = r.split_once("\r\n\r\n").unwrap();
+        let declared: usize = head.lines()
+            .find_map(|l| l.strip_prefix("Content-Length: ")).unwrap().parse().unwrap();
+        assert_eq!(declared, body.len(), "escaping must not desync the length");
+    }
+
+    #[test]
+    fn a_chunked_reply_is_reassembled() {
+        // The case that truncates every real answer if ignored. Chunk
+        // sizes are COMPUTED, not hand-written: my first version of this
+        // test invented the hex lengths and failed against correct code,
+        // which is the least useful kind of red.
+        let parts = [r#"{"response":"tower @0,0 "#, r#"r=3 h=9"}"#];
+        let mut raw = String::from("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+        for p in parts {
+            raw.push_str(&format!("{:x}\r\n{p}\r\n", p.len()));
+        }
+        raw.push_str("0\r\n\r\n");
+        let body = split_body(&raw);
+        assert_eq!(body, r#"{"response":"tower @0,0 r=3 h=9"}"#, "reassembled");
+        assert_eq!(parse_response(&raw).unwrap(), "tower @0,0 r=3 h=9");
+    }
+
+    #[test]
+    fn a_chunk_boundary_inside_a_multibyte_char_does_not_panic() {
+        // A server may split anywhere; slicing on a byte index inside a
+        // UTF-8 sequence would panic, and a crash mid-build is worse
+        // than a garbled character.
+        let text = "caf\u{e9} \u{2014} tower";
+        let bytes = text.as_bytes();
+        let (a, b) = bytes.split_at(4); // lands inside the 2-byte 'é'
+        let mut raw = String::from("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+        raw.push_str(&format!("{:x}\r\n{}\r\n", a.len(), String::from_utf8_lossy(a)));
+        raw.push_str(&format!("{:x}\r\n{}\r\n", b.len(), String::from_utf8_lossy(b)));
+        raw.push_str("0\r\n\r\n");
+        let _ = split_body(&raw); // must not panic
+    }
+
+    #[test]
+    fn both_dialects_reply_shapes_parse() {
+        let ollama = "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n{\"response\":\"cylinder @0,0 r=2 h=6\"}";
+        assert_eq!(parse_response(ollama).unwrap(), "cylinder @0,0 r=2 h=6");
+        let openai = "HTTP/1.1 200 OK\r\n\r\n{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"tree @0,0 oak\"}}]}";
+        assert_eq!(parse_response(openai).unwrap(), "tree @0,0 oak");
+    }
+
+    #[test]
+    fn a_server_error_is_reported_not_swallowed() {
+        let e = parse_response("HTTP/1.1 404\r\n\r\n{\"error\":\"model 'nope' not found\"}").unwrap_err();
+        assert!(e.contains("model 'nope' not found"), "{e}");
+        let e2 = parse_response("HTTP/1.1 200 OK\r\n\r\n{\"unexpected\":1}").unwrap_err();
+        assert!(e2.contains("no completion field"), "{e2}");
+    }
+
+    #[test]
+    fn escaped_quotes_inside_a_value_do_not_end_it_early() {
+        let body = r#"{"response":"say \"hi\" then stop"}"#;
+        assert_eq!(find_string_field(body, "response").unwrap(), r#"say "hi" then stop"#);
+    }
+
+    #[test]
+    fn config_specs_parse() {
+        let c = HttpConfig::parse("ollama:127.0.0.1:11434:qwen2.5-coder:7b").unwrap();
+        assert_eq!(c.host, "127.0.0.1:11434");
+        assert_eq!(c.dialect, Dialect::Ollama);
+        assert_eq!(c.model, "qwen2.5-coder:7b");
+        let c = HttpConfig::parse("openai:127.0.0.1:8080").unwrap();
+        assert_eq!(c.host, "127.0.0.1:8080");
+        assert_eq!(c.dialect, Dialect::OpenAi);
+        assert!(HttpConfig::parse("carrier-pigeon:x").is_none());
+    }
+
+    #[test]
+    fn an_unreachable_server_says_so_plainly() {
+        let mut p = HttpProvider::new(HttpConfig {
+            host: "127.0.0.1:1".into(), ..Default::default() });
+        let e = p.complete("s", "u").unwrap_err();
+        assert!(e.contains("cannot reach 127.0.0.1:1"), "{e}");
+        assert!(e.contains("is the server running"), "actionable: {e}");
     }
 }
