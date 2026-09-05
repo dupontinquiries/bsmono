@@ -156,6 +156,10 @@ pub struct Snapclone {
     pub cam_selection: Option<crate::camera_select::Selection>,
     /// The shutter's gesture state — tap/hold/lock/mode-picker.
     pub shutter: crate::shutter::ShutterButton,
+    /// Which hand holds the phone. Read from `settings_kit` prefs in
+    /// `apply_settings`; drives `uikit_egui::handed` so the primary control
+    /// sits under the thumb. Nothing consumed this preference before.
+    pub prefs_handedness: settings_kit::Handedness,
     /// What the shutter last did, shown under it. Plain state rather than a
     /// toast system: this app has none, and adding one to report a duration
     /// would be the tail wagging the dog.
@@ -716,6 +720,7 @@ impl Snapclone {
             cameras: Vec::new(),
             cam_selection: None,
             shutter: Default::default(),
+            prefs_handedness: settings_kit::Handedness::Right,
             recorder: None,
             shutter_note: String::new(),
             feed_note: String::new(),
@@ -2935,6 +2940,7 @@ impl Snapclone {
     /// Adopt cross-app settings + the swipe feel, and use the palette's background style pref.
     pub fn apply_settings(&mut self, ctx: &egui::Context, prefs: &settings_kit::Prefs) {
         uikit_egui::apply_prefs(ctx, prefs);
+        self.prefs_handedness = prefs.input.handedness;
         *self.gesture.config_mut() = prefs.gesture_config(320.0);
         self.palette = prefs.palette.clone();
     }
@@ -3898,6 +3904,17 @@ impl Snapclone {
         // The camera chrome uses the painted glass buttons, not flat ones: the
         // mottling and the tap-keyed ripple are the two things a stylesheet
         // cannot express, which is why Qt paints them.
+        // THE SHUTTER IS CENTRED, and it leans toward the hand that holds the
+        // phone. This row was a plain left-packed `horizontal`, so the shutter
+        // sat wherever the buttons before it happened to end — visibly left of
+        // centre in a screenshot at 400pt — and `settings_kit`'s handedness
+        // preference, which has had a settings screen and a double-tilt
+        // gesture for as long as it has existed, was read by nothing at all.
+        // `uikit_egui::handed` turns it into the offset; the row width is
+        // captured BEFORE the layout so the spacer is measured against the
+        // whole row rather than what is left of it.
+        let row_w = ui.available_width();
+        let hand = self.prefs_handedness;
         ui.horizontal(|ui| {
             // ROTATE, not swap. This called `flip()`, which changes the front/
             // back CAMERA — a different action, already reachable from the
@@ -3916,7 +3933,14 @@ impl Snapclone {
             // shutter_ui senses DRAG rather than click, because `clicked()`
             // fires on any release however long the press lasted — which is the
             // trap that makes hold-to-record indistinguishable from tap.
-            let resp = crate::shutter::shutter_ui(ui, &self.shutter, 56.0, c);
+            // The gap that puts the shutter at its centred, hand-leaned x.
+            // Measured from what the row has already consumed, so it stays
+            // centred when the buttons before it change size or count.
+            const SHUTTER: f32 = 56.0;
+            let used = row_w - ui.available_width();
+            let want = uikit_egui::handed::centred_x(row_w, SHUTTER, hand);
+            ui.add_space((want - used).max(0.0));
+            let resp = crate::shutter::shutter_ui(ui, &self.shutter, SHUTTER, c);
             let ev = if resp.drag_started() {
                 resp.interact_pointer_pos().and_then(|p| self.shutter.press(p.x, p.y))
             } else if resp.dragged() {

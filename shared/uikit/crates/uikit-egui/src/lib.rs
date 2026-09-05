@@ -78,6 +78,7 @@ pub mod segmented_tabs;
 pub mod responsive_nav;
 pub mod scroll;
 pub mod fuzzy;
+pub mod handed;
 pub mod layout_probe;
 pub mod overlay;
 // Text inputs that cannot be built without an id — see the module docs for
