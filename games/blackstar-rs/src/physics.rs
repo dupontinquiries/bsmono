@@ -1,15 +1,27 @@
-//! Arcade physics with Rocket League's actual tuning where it matters
+//! Arcade physics, currently tuned from Rocket League's own numbers
 //! (100 uu = 1 m): gravity 6.5, max drive 14.1, supersonic cap 23.0, boost
 //! accel 9.92 with 33.3/s drain, jump 2.92 + hold, 1.45 s dodge window, ball
 //! restitution 0.6 with tangential friction on bounce, and the signature
 //! extra "touch" impulse on car→ball contact that makes dribbles carry.
+//!
+//! **These are a starting baseline, not a target.** The bug fixes in this
+//! file (contact resolution, flip-reset edge cases, the numbers that make
+//! `physics::tests` pass) are correctness and should hold regardless of
+//! genre. The RESEMBLANCE to Rocket League specifically — soccar's ball
+//! feel, the car-game camera, "stock RL feel" as a baseline — is not: this
+//! project's direction is a realistic-plus-Transformers pairing of physics
+//! and feel, not fidelity to a fast-paced soccer game, and every number or
+//! mechanic justified ONLY by "this is what Rocket League does" is open to
+//! retuning or removal once there's a real feel target to tune it against.
 //!
 //! v1.3: everything above is now the 100% baseline of a live [`Config`] —
 //! gravity, arena bounce/friction, ball size/bounce/friction/weight, car
 //! size/grip/speed/accel/boost/jump, flip strength — plus real flip rules:
 //! directional flips (the dodge spin), **flip cancels** (hold opposite pitch),
 //! and **flip resets**: touch anything with your wheels while airborne and
-//! the flip comes back, RL-style, which is the whole air-dribble endgame.
+//! the flip comes back, RL-style (kept as the current baseline behaviour,
+//! not because RL-style is itself the goal), which is the whole air-dribble
+//! endgame — for exactly as long as an air-dribble endgame is still wanted.
 
 use glam::{Quat, Vec2, Vec3};
 
