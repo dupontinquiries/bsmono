@@ -232,7 +232,7 @@ fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant, colors: &Colors) -> (
                                 .small()
                                 .color(colors.error()),
                         );
-                    } else if let Some(why) = d.kind.unsupported_reason() {
+                    } else if let Some(why) = d.unsupported_reason() {
                         // Say WHY a plug has no button. An inert row with no
                         // explanation is the worst outcome here — the user
                         // concludes the app is broken.
@@ -243,7 +243,7 @@ fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant, colors: &Colors) -> (
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if d.pending {
                         ui.spinner();
-                    } else if d.kind.is_controllable() {
+                    } else if d.is_controllable() {
                         let (label, tint) = match d.power {
                             Power::On => ("ON", colors.on()),
                             Power::Off => ("OFF", colors.off()),

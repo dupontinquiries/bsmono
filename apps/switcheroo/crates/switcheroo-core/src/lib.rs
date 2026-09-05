@@ -21,6 +21,14 @@
 //! question "what did we actually send, and what came back" has an answer
 //! on screen instead of in a log file on a phone.
 
+
+pub mod fastpath;
+pub mod filter;
+pub mod intent;
+pub mod media;
+pub mod schedule;
+pub mod wifi;
+
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -101,9 +109,9 @@ impl Kind {
         match self {
             Kind::GenericGatt => None,
             Kind::HomeKit => Some(
-                "HomeKit accessories need a HAP pairing handshake (SRP + Ed25519 + \
-                 an encrypted session) before they accept any write. Not implemented \
-                 yet — see HOMEKIT.md.",
+                "HomeKit accessories need a HAP pairing (SRP + Ed25519 + an encrypted \
+                 session) before they accept any write. Pair it with its setup code; \
+                 see HOMEKIT.md.",
             ),
             Kind::Unknown => Some(
                 "No recognised on/off service in this device's advertisement.",
@@ -193,6 +201,9 @@ pub struct Device {
     pub last_error: Option<String>,
     /// User-pinned favourite. Sorts to the top and survives a rescan.
     pub favourite: bool,
+    /// A HomeKit accessory we hold a pairing for (see `hap-core`). Set by
+    /// `Event::Paired`; the backend that reported it owns the record.
+    pub paired: bool,
 }
 
 impl Device {
@@ -213,6 +224,7 @@ impl Device {
             last_seen: now,
             last_error: None,
             favourite: false,
+            paired: false,
         }
     }
 
@@ -221,6 +233,23 @@ impl Device {
     /// and a list that deletes rows out from under a thumb is unusable.
     pub fn is_stale(&self, now: Instant, after: Duration) -> bool {
         now.duration_since(self.last_seen) > after
+    }
+
+    /// Whether a power command has any chance of working on THIS device:
+    /// its kind is switchable outright, or it is a HomeKit accessory we are
+    /// paired with. Replaces `Kind::is_controllable` as the thing the UI
+    /// asks, because pairing is per-device state, not per-kind.
+    pub fn is_controllable(&self) -> bool {
+        self.kind.is_controllable() || (self.kind == Kind::HomeKit && self.paired)
+    }
+
+    /// Why this device can't be toggled right now, if it can't.
+    pub fn unsupported_reason(&self) -> Option<&'static str> {
+        if self.is_controllable() { return None; }
+        match self.kind {
+            Kind::HomeKit => Some("HomeKit accessory: pair it first (needs the 8-digit setup code printed on the plug)."),
+            other => other.unsupported_reason(),
+        }
     }
 }
 
@@ -233,6 +262,12 @@ pub enum Command {
     /// Ask for a device's current power state.
     Refresh(DeviceId),
     SetPower { id: DeviceId, on: bool },
+    /// HomeKit pair-setup with the 8-digit code off the plug. Destructive if
+    /// something else holds the pairing (HOMEKIT.md), so the UI confirms
+    /// loudly before submitting this.
+    Pair { id: DeviceId, setup_code: String },
+    /// Forget our pairing record for this accessory.
+    Unpair(DeviceId),
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +292,13 @@ pub enum Event {
         id: Option<DeviceId>,
         message: String,
     },
+    /// Pair-setup succeeded (or a stored pairing was found at startup).
+    Paired { id: DeviceId },
+    /// Pair-setup failed; `message` is hap-core's error, which names the
+    /// accessory's own error code when it sent one.
+    PairingFailed { id: DeviceId, message: String },
+    /// A pairing was forgotten.
+    Unpaired { id: DeviceId },
 }
 
 /// The radio. See the module docs for why this is sync and dyn-compatible.
@@ -333,6 +375,25 @@ impl Hub {
                         d.last_error = Some(message);
                     }
                 }
+                Event::Paired { id } => {
+                    if let Some(d) = self.devices.get_mut(&id) {
+                        d.paired = true;
+                        d.pending = false;
+                        d.last_error = None;
+                    }
+                }
+                Event::PairingFailed { id, message } => {
+                    if let Some(d) = self.devices.get_mut(&id) {
+                        d.pending = false;
+                        d.last_error = Some(message);
+                    }
+                }
+                Event::Unpaired { id } => {
+                    if let Some(d) = self.devices.get_mut(&id) {
+                        d.paired = false;
+                        d.power = Power::Unknown;
+                    }
+                }
             }
         }
     }
@@ -351,6 +412,9 @@ impl Hub {
                 Some(i) => format!("FAILED {i}: {message}"),
                 None => format!("FAILED: {message}"),
             },
+            Event::Paired { id } => format!("paired {id}"),
+            Event::PairingFailed { id, message } => format!("PAIRING FAILED {id}: {message}"),
+            Event::Unpaired { id } => format!("unpaired {id}"),
         };
         self.journal.push(line);
         if self.journal.len() > JOURNAL_CAP {
@@ -424,6 +488,8 @@ pub struct DemoBackend {
     scanning: bool,
     started: Option<Instant>,
     latency: Duration,
+    /// Fixtures the demo has 'paired' this session.
+    paired: Vec<DeviceId>,
 }
 
 impl Default for DemoBackend {
@@ -439,8 +505,12 @@ impl DemoBackend {
             scanning: false,
             started: None,
             latency: Duration::from_millis(450),
+            paired: Vec::new(),
         }
     }
+
+    /// The one setup code the demo's HomeKit fixture accepts.
+    pub const DEMO_SETUP_CODE: &'static str = "03145154";
 
     fn fixtures() -> Vec<(DeviceId, &'static str, Kind, i16)> {
         vec![
@@ -480,11 +550,29 @@ impl Backend for DemoBackend {
                 self.queue
                     .push((now + self.latency, Event::PowerIs { id, power: Power::Off }));
             }
+            Command::Pair { id, setup_code } => {
+                // The demo accepts exactly one code, so the wrong-code path
+                // is visible in the UI without a plug.
+                let digits: String = setup_code.chars().filter(|c| c.is_ascii_digit()).collect();
+                let ev = if digits.len() != 8 {
+                    Event::PairingFailed { id, message: "setup code must be 8 digits (XXX-XX-XXX)".into() }
+                } else if digits == DemoBackend::DEMO_SETUP_CODE {
+                    self.paired.push(id.clone());
+                    Event::Paired { id }
+                } else {
+                    Event::PairingFailed { id, message: "accessory refused at M4: authentication failed (wrong setup code, or a stale pairing)".into() }
+                };
+                self.queue.push((now + self.latency * 3, ev));
+            }
+            Command::Unpair(id) => {
+                self.paired.retain(|p| *p != id);
+                self.queue.push((now, Event::Unpaired { id }));
+            }
             Command::SetPower { id, on } => {
                 let controllable = Self::fixtures()
                     .into_iter()
                     .find(|(f, _, _, _)| *f == id)
-                    .map(|(_, _, k, _)| k.is_controllable())
+                    .map(|(_, _, k, _)| k.is_controllable() || (k == Kind::HomeKit && self.paired.contains(&id)))
                     .unwrap_or(false);
                 let ev = if controllable {
                     Event::PowerIs {

@@ -11,6 +11,8 @@ required-features = ["app"]
 
 [dependencies]
 switcheroo-core = { path = "../switcheroo-core" }
+# The HomeKit protocol. Headless; only `hap.rs` (behind `ble`) drives it over a radio.
+hap-core = { path = "../hap-core" }
 # THE SHARED KIT. switcheroo was the only egui app in the fleet not on it: no
 # palette, eight hardcoded colours, and — because the symbol fonts are
 # installed by `apply_palette` — its own star and refresh glyphs rendering as

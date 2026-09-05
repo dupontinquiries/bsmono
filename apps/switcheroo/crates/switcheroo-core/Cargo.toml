@@ -5,3 +5,7 @@ edition = "2021"
 description = "Headless core for switcheroo: device model, command/event protocol, and the Backend seam. No egui, no bluetooth, no async."
 
 [dependencies]
+# The acoustic fingerprint for the voice fast path — voiceterm-qt's MFCC
+# pipeline, lifted into a shared kit with no dependencies of its own. Pure
+# math, so it keeps this crate's "no egui, no bluetooth, no async" intact.
+voiceprint-kit = { path = "../../../../shared/voiceprint-kit" }

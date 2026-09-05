@@ -9,7 +9,7 @@
 //! **State of this file, stated plainly:** discovery is real and complete.
 //! Control is real only for [`Kind::GenericGatt`]. HomeKit control is not
 //! implemented and this file does not pretend otherwise — see
-//! `Kind::unsupported_reason` and HOMEKIT.md. None of this has been run
+//! HOMEKIT.md, and since hap-core landed, `crate::hap`. None of this has been run
 //! against a physical device by its author; it is written from btleplug's
 //! documented API and needs a hardware pass.
 
@@ -129,6 +129,7 @@ async fn radio_loop(
         .await
         .unwrap_or_else(|_| "adapter".into());
     let _ = ready_tx.send(Ok(name));
+    let store = crate::hap::Store::open();
 
     let mut events = match central.events().await {
         Ok(e) => e,
@@ -163,7 +164,14 @@ async fn radio_loop(
                     let _ = ev_tx.send(Event::ScanStopped);
                 }
                 Command::Refresh(id) => {
-                    let r = read_power(&central, &id).await;
+                    let r = if kind_of(&central, &id).await == Kind::HomeKit {
+                        hap_read_power(&central, &store, &id).await.map(|(p, trace)| {
+                            for l in trace { let _ = ev_tx.send(Event::Failed { id: None, message: format!("hap {l}") }); }
+                            p
+                        })
+                    } else {
+                        read_power(&central, &id).await
+                    };
                     let _ = ev_tx.send(match r {
                         Ok(p) => Event::PowerIs { id, power: p },
                         Err(m) => Event::Failed {
@@ -173,7 +181,13 @@ async fn radio_loop(
                     });
                 }
                 Command::SetPower { id, on } => {
-                    let r = write_power(&central, &id, on).await;
+                    let r = if kind_of(&central, &id).await == Kind::HomeKit {
+                        hap_write_power(&central, &store, &id, on).await.map(|trace| {
+                            for l in trace { let _ = ev_tx.send(Event::Failed { id: None, message: format!("hap {l}") }); }
+                        })
+                    } else {
+                        write_power(&central, &id, on).await
+                    };
                     let _ = ev_tx.send(match r {
                         Ok(()) => Event::PowerIs {
                             id,
@@ -184,6 +198,24 @@ async fn radio_loop(
                             message: m,
                         },
                     });
+                }
+                Command::Pair { id, setup_code } => {
+                    let r = match find(&central, &id).await {
+                        Ok(p) => crate::hap::pair(p, &store, &id, setup_code).await,
+                        Err(e) => Err(e),
+                    };
+                    let _ = ev_tx.send(match r {
+                        Ok((pairing, trace)) => {
+                            for l in trace { let _ = ev_tx.send(Event::Failed { id: None, message: format!("hap {l}") }); }
+                            let _ = ev_tx.send(Event::Failed { id: None, message: format!("paired with accessory {} (record in {})", pairing.accessory_id, store.dir().display()) });
+                            Event::Paired { id }
+                        }
+                        Err(message) => Event::PairingFailed { id, message },
+                    });
+                }
+                Command::Unpair(id) => {
+                    store.forget(&id);
+                    let _ = ev_tx.send(Event::Unpaired { id });
                 }
             }
         }
@@ -197,12 +229,17 @@ async fn radio_loop(
                     if let Ok(Some(props)) = p.properties().await {
                         let uuids: Vec<String> =
                             props.services.iter().map(|u| u.to_string()).collect();
+                        let id = DeviceId::new(props.address.to_string());
+                        let kind = classify(&uuids);
                         let _ = ev_tx.send(Event::Seen {
-                            id: DeviceId::new(props.address.to_string()),
+                            id: id.clone(),
                             name: props.local_name.unwrap_or_default(),
-                            kind: classify(&uuids),
+                            kind,
                             rssi: props.rssi,
                         });
+                        if kind == Kind::HomeKit && store.has(&id) {
+                            let _ = ev_tx.send(Event::Paired { id });
+                        }
                     }
                 }
             }
@@ -255,13 +292,41 @@ async fn open(
     p.discover_services()
         .await
         .map_err(|e| format!("discover services: {e}"))?;
-    if let Ok(Some(props)) = p.properties().await {
-        let uuids: Vec<String> = props.services.iter().map(|u| u.to_string()).collect();
-        if classify(&uuids) == Kind::HomeKit {
-            return Err(Kind::HomeKit.unsupported_reason().unwrap().to_string());
+    Ok(p)
+}
+
+/// What the advertisement says this device is, from the adapter's cache.
+/// Decides whether a power command goes to the plain GATT path or to HAP.
+async fn kind_of(central: &btleplug::platform::Adapter, id: &DeviceId) -> Kind {
+    if let Ok(p) = find(central, id).await {
+        if let Ok(Some(props)) = p.properties().await {
+            let uuids: Vec<String> = props.services.iter().map(|u| u.to_string()).collect();
+            return classify(&uuids);
         }
     }
-    Ok(p)
+    Kind::Unknown
+}
+
+/// The HAP path for a power write: needs a stored pairing, else says so.
+async fn hap_write_power(
+    central: &btleplug::platform::Adapter,
+    store: &crate::hap::Store,
+    id: &DeviceId,
+    on: bool,
+) -> Result<Vec<String>, String> {
+    let pairing = store.load(id).ok_or_else(|| "HomeKit accessory: pair it first (8-digit setup code on the plug)".to_string())?;
+    let p = find(central, id).await?;
+    crate::hap::set_power(p, pairing, on).await
+}
+
+async fn hap_read_power(
+    central: &btleplug::platform::Adapter,
+    store: &crate::hap::Store,
+    id: &DeviceId,
+) -> Result<(Power, Vec<String>), String> {
+    let pairing = store.load(id).ok_or_else(|| "HomeKit accessory: pair it first (8-digit setup code on the plug)".to_string())?;
+    let p = find(central, id).await?;
+    crate::hap::read_power(p, pairing).await
 }
 
 async fn write_power(

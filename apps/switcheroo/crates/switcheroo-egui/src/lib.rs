@@ -16,6 +16,8 @@ pub mod ui;
 
 #[cfg(feature = "ble")]
 pub mod ble;
+#[cfg(feature = "ble")]
+pub mod hap;
 
 use std::time::{Duration, Instant};
 use switcheroo_core::{Backend, Command, DemoBackend, DeviceId, Hub};
