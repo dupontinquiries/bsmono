@@ -848,6 +848,9 @@ pub struct Batch {
 /// Result of running a plan.
 #[derive(Debug, Default)]
 pub struct PlanRun {
+    /// Dependents withdrawn after a structural failure. Empty when
+    /// nothing failed or nothing depended on what did.
+    pub withdrawn: Vec<crate::recovery::Withdrawal>,
     pub applied: usize,
     pub failed: usize,
     pub blocks_changed: usize,
@@ -900,7 +903,8 @@ pub fn run_plan_with<W: VoxelWorld>(
         None => from_y,
     };
     let mut run = PlanRun { applied: 0, failed: 0, blocks_changed: 0,
-                            log: Vec::new(), batches: Vec::new() };
+                            log: Vec::new(), batches: Vec::new(), withdrawn: Vec::new() };
+    let mut outcomes: Vec<(bool, String, Option<u64>)> = Vec::new();
     let first_edit = tools.edits.len();
 
     for (i, op) in plan.ops.iter().enumerate() {
@@ -1178,8 +1182,27 @@ pub fn run_plan_with<W: VoxelWorld>(
         } else {
             run.failed += 1;
         }
+        outcomes.push((r.ok, r.summary.clone(), r.edit_id));
         run.log.push(format!("{}. {}", i + 1, r.summary));
     }
+
+    // ROLLBACK DEPENDENTS. A wall refused for size used to leave the
+    // roof that came after it floating on nothing, because the run
+    // simply continued. Now a structural failure withdraws every later
+    // op that stood on structure, and says so.
+    let ok: Vec<bool> = outcomes.iter().map(|o| o.0).collect();
+    let why: Vec<String> = outcomes.iter().map(|o| o.1.clone()).collect();
+    let withdrawn = crate::recovery::plan_rollback(&plan.ops, &ok, &why);
+    for w in &withdrawn {
+        for idx in &w.rolled_back {
+            if let Some((_, _, Some(id))) = outcomes.get(idx - 1) {
+                let u = tools.undo_edit(*id);
+                run.blocks_changed = run.blocks_changed.saturating_sub(u.blocks_changed);
+            }
+        }
+        run.log.push(w.message());
+    }
+    run.withdrawn = withdrawn;
 
     // Group everything this plan wrote into per-chunk batches, in the
     // order the ops ran. The tick is the op index, so an animation can

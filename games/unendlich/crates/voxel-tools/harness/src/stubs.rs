@@ -20,6 +20,7 @@ impl ChunkManager {
         self.cells.lock().unwrap().get(&(x,y,z)).copied()
             .unwrap_or(if y <= 64 { BlockId::Stone } else { BlockId::Air })
     }
+    pub fn is_loaded_at(&self, _x: i32, _y: i32, _z: i32) -> bool { true }
     pub fn set_blocks(&self, edits: &[(i32,i32,i32,BlockId)]) -> (usize, usize) {
         let mut c = self.cells.lock().unwrap();
         for &(x,y,z,b) in edits { c.insert((x,y,z), b); }
@@ -36,7 +37,7 @@ pub enum AnimProfile { GroundUp, Physics, Random, Instant }
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Command {
     Build(String), BuildVoice(bool), ShowPlan, CommitPlan, UndoBuild,
-    Focus(Option<FocusAdjust>), Anim(AnimProfile), Model(Option<String>), Keys, Cancel, Provider(Option<String>), Shot { kind: String, id: Option<String> }, Unknown,
+    Focus(Option<FocusAdjust>), Anim(AnimProfile), Model(Option<String>), Keys, Cancel, Repair, Deferred { drop: bool }, Provider(Option<String>), Shot { kind: String, id: Option<String> }, Unknown,
 }
 pub fn parse(line: &str) -> Command {
     let t = line.trim();

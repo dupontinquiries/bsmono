@@ -140,6 +140,10 @@ pub enum Command {
     Keys,
     /// `/cancel` — drop a model request in flight.
     Cancel,
+    /// `/repair` — ask the model to fix only the lines it got wrong.
+    Repair,
+    /// `/deferred [drop]` — blocks waiting for their chunk to load.
+    Deferred { drop: bool },
     /// `/land` — list claims here; `/land info <id>`; `/land add <id> <player>`.
     /// Player names and workset ids keep their case.
     Land(LandOp),
@@ -262,6 +266,12 @@ pub fn parse(line: &str) -> Command {
         },
         "/keys" => if args.is_empty() { Command::Keys } else { Command::Unknown },
         "/cancel" => if args.is_empty() { Command::Cancel } else { Command::Unknown },
+        "/repair" => if args.is_empty() { Command::Repair } else { Command::Unknown },
+        "/deferred" => match args.as_slice() {
+            [] => Command::Deferred { drop: false },
+            [d] if d.eq_ignore_ascii_case("drop") => Command::Deferred { drop: true },
+            _ => Command::Unknown,
+        },
         "/land" => match args.as_slice() {
             [] => Command::Land(LandOp::Here),
             [sub, rest @ ..] => match (sub.to_ascii_lowercase().as_str(), rest) {
@@ -427,6 +437,9 @@ impl Command {
             Command::Anim(p) => Some(format!("/anim {}", p.keyword())),
             Command::Keys => Some("/keys".to_string()),
             Command::Cancel => Some("/cancel".to_string()),
+            Command::Repair => Some("/repair".to_string()),
+            Command::Deferred { drop: false } => Some("/deferred".to_string()),
+            Command::Deferred { drop: true } => Some("/deferred drop".to_string()),
             Command::Land(LandOp::Here) => Some("/land".to_string()),
             Command::Land(LandOp::Info(id)) => Some(format!("/land info {id}")),
             Command::Land(LandOp::Add { id, player }) => Some(format!("/land add {id} {player}")),
@@ -735,6 +748,17 @@ mod tests {
         assert_eq!(parse("/shot"), Command::Unknown);
         for c in [Command::Shot { kind: "frame".into(), id: None },
                   Command::Shot { kind: "fly".into(), id: Some("w2".into()) }] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c);
+        }
+    }
+
+    #[test]
+    fn repair_and_deferred_parse_and_round_trip() {
+        assert_eq!(parse("/repair"), Command::Repair);
+        assert_eq!(parse("/deferred"), Command::Deferred { drop: false });
+        assert_eq!(parse("/deferred DROP"), Command::Deferred { drop: true });
+        assert_eq!(parse("/deferred keep"), Command::Unknown);
+        for c in [Command::Repair, Command::Deferred { drop: true }] {
             assert_eq!(parse(&c.to_command_string().unwrap()), c);
         }
     }

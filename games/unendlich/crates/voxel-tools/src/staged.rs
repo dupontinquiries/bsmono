@@ -66,6 +66,16 @@ impl<'w, W: VoxelWorld> StagedWorld<'w, W> {
         out
     }
 
+    /// Every staged write, without consuming them. The flush path uses
+    /// this to remember what a partial flush could not place.
+    pub fn snapshot(&self) -> Vec<crate::weather::Change> {
+        let mut v: Vec<_> = self.edits.iter()
+            .map(|(&(x, y, z), &(new, _))| crate::weather::Change { at: (x, y, z), to: new })
+            .collect();
+        v.sort_by_key(|c| c.at);
+        v
+    }
+
     /// Previous values, for an undo that does not need the edit log.
     pub fn inverse(&self) -> Vec<(i32, i32, i32, u16)> {
         let mut v: Vec<_> = self.edits.iter().map(|(&(x, y, z), &(_, p))| (x, y, z, p)).collect();

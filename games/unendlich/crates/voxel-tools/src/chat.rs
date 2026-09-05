@@ -120,6 +120,11 @@ pub struct ChatSession {
     last_inverse: Vec<(i32, i32, i32, u16)>,
     /// The referent for follow-up turns.
     pub last_build: Option<LastBuild>,
+    /// Lines the model got wrong on the last turn, for `/repair`.
+    pub last_salvage: Option<crate::recovery::Salvage>,
+    /// Blocks that could not be placed because their chunk was not
+    /// loaded, waiting for a retry.
+    pub deferred: crate::recovery::Deferred,
     /// Batches and ops from the last commit, for the animator. The
     /// reveal must be scheduled from what was actually written, not
     /// from re-running the plan: a seeded scatter re-run changes
@@ -341,7 +346,24 @@ impl ChatSession {
                                              player_feet: Option<(i32, i32, i32)>,
                                              prose: &str) -> Reply {
         let f = self.focus(gaze);
-        let (mut plan, mut issues) = parse_plan_at(ir, Some(f.anchor));
+        let (first_plan, first_issues) = parse_plan_at(ir, Some(f.anchor));
+        // SALVAGE. One bad line used to reject the whole plan; a 1B that
+        // gets eight lines right and one wrong got nothing built. Now
+        // the lines that parse run, the ones that do not are kept for a
+        // repair turn, and only a plan with NO usable line is rejected.
+        let sal = crate::recovery::salvage(ir, &first_issues);
+        self.last_salvage = if sal.bad.is_empty() { None } else { Some(sal.clone()) };
+        let (mut plan, mut issues) = if sal.bad.is_empty() {
+            (first_plan, first_issues)
+        } else if sal.is_total_loss() {
+            self.pending = None;
+            let msg = sal.bad.iter().map(|(n, l, w)| format!("line {n} `{l}`: {w}"))
+                .collect::<Vec<_>>().join("\n");
+            return Reply::Say(format!("plan rejected, no usable lines:\n{msg}\n\
+                                       (/repair asks the model to fix them)"));
+        } else {
+            parse_plan_at(&sal.good, Some(f.anchor))
+        };
         let refusals = self.gate_world_ops(&mut plan, prose);
         issues.extend(validate(&plan));
         let errors: Vec<_> = issues.iter().filter(|i| i.severity == Severity::Error).collect();
@@ -388,10 +410,32 @@ impl ChatSession {
         for r in &refusals {
             echo.push_str(&format!("\nREFUSED: {r}"));
         }
+        if let Some(s) = &self.last_salvage {
+            echo.push_str(&format!("\nSKIPPED {} unusable line(s) -- /repair to have the model fix them:",
+                                   s.bad.len()));
+            for (n, l, w) in &s.bad {
+                echo.push_str(&format!("\n  line {n} `{l}`: {w}"));
+            }
+        }
+        for w in &dry.withdrawn {
+            echo.push_str(&format!("\nWITHDRAWN: {}", w.message()));
+        }
         self.pending = Some(Pending {
             plan, feature_id: f.feature_id.clone(), predicted_blocks: dry.blocks_changed,
         });
         Reply::Preview { echo, blocks: dry.blocks_changed, feature_id: f.feature_id }
+    }
+
+    /// The follow-up turn asking the model to fix only what it got
+    /// wrong, or None if the last turn was clean.
+    pub fn repair_prompt(&self) -> Option<String> {
+        self.last_salvage.as_ref().map(|s| s.repair_prompt())
+    }
+
+    /// Merge a repair reply with the salvaged good lines into a full
+    /// plan, ready for `receive_plan_for`.
+    pub fn merge_repair(&self, fixed: &str) -> Option<String> {
+        self.last_salvage.as_ref().map(|s| s.merge(fixed))
     }
 
     /// Drop any pending plan.
@@ -872,5 +916,42 @@ mod tests {
         assert!(s.macro_ir("fortify my base", &gaze_at(0, 0, 10.0)).is_none(),
                 "no base yet: the model should build one");
         let _ = t;
+    }
+
+    #[test]
+    fn a_plan_with_one_bad_line_still_previews_and_offers_repair() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        let ir = "enclose @-4,-4 @4,4 h=4 block=oak_planks\nfrobnicate the widget\ntree @8,8 oak\n";
+        match s.receive_plan(&mut t, &g, ir) {
+            Reply::Preview { echo, blocks, .. } => {
+                assert!(blocks > 0, "the good lines build");
+                assert!(echo.contains("SKIPPED 1"), "{echo}");
+                assert!(echo.contains("frobnicate"), "{echo}");
+            }
+            o => panic!("{o:?}"),
+        }
+        let rp = s.repair_prompt().expect("a repair turn is available");
+        assert!(rp.contains("frobnicate") && !rp.contains("enclose"));
+        let merged = s.merge_repair("tree @2,2 birch h=6").unwrap();
+        assert!(merged.contains("enclose") && merged.contains("birch"));
+    }
+
+    #[test]
+    fn a_structural_failure_withdraws_its_dependents_in_the_preview() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        // a cylinder too large to place, then a roof that would stand on it
+        let ir = "cylinder @0,0 r=90 h=200 block=stone\nroof @-4,-4 @4,4 gable\n";
+        match s.receive_plan(&mut t, &g, ir) {
+            Reply::Preview { echo, .. } =>
+                assert!(echo.contains("WITHDRAWN"), "the roof is withdrawn: {echo}"),
+            Reply::Say(m) => assert!(m.contains("rejected"), "{m}"),
+            o => panic!("{o:?}"),
+        }
     }
 }

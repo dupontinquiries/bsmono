@@ -89,6 +89,8 @@ pub mod verbs;
 pub mod camera;
 /// Mood and population: the parts of a request that are not blocks.
 pub mod mood;
+/// Recovery: salvage, dependent rollback, deferred retries, journal replay.
+pub mod recovery;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.
@@ -600,6 +602,12 @@ impl<'w, W: VoxelWorld> VoxelTools<'w, W> {
 
     pub fn sphere(&mut self, centre: (i32, i32, i32), radius: i32,
                   block: u16, hollow: bool) -> CallResult {
+        let est = (4.0 / 3.0 * std::f64::consts::PI * (radius as f64 + 0.5).powi(3)) as usize;
+        if est > MAX_BLOCKS_PER_CALL {
+            return CallResult::err(format!(
+                "refused: sphere r={radius} is about {est} blocks, over \
+                 MAX_BLOCKS_PER_CALL={MAX_BLOCKS_PER_CALL}"));
+        }
         if radius <= 0 {
             return CallResult::err("radius must be positive");
         }
@@ -627,6 +635,17 @@ impl<'w, W: VoxelWorld> VoxelTools<'w, W> {
 
     pub fn cylinder(&mut self, base: (i32, i32, i32), radius: i32, height: i32,
                     block: u16, hollow: bool) -> CallResult {
+        // Same cap as fill_box. Without it a model writing r=90 h=200
+        // placed five million blocks and stalled the caller for 57
+        // seconds -- in a test. In the game that is a dead frame, and
+        // the op that should have been refused instead succeeded, so
+        // nothing downstream was withdrawn either.
+        let est = (std::f64::consts::PI * (radius as f64 + 0.5).powi(2) * height as f64) as usize;
+        if est > MAX_BLOCKS_PER_CALL {
+            return CallResult::err(format!(
+                "refused: cylinder r={radius} h={height} is about {est} blocks, over \
+                 MAX_BLOCKS_PER_CALL={MAX_BLOCKS_PER_CALL}"));
+        }
         if radius <= 0 || height <= 0 {
             return CallResult::err("radius and height must be positive");
         }

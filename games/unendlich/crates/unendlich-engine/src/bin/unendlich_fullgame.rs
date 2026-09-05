@@ -4410,6 +4410,22 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             std::env::set_var("VOXEL_MODEL", &path);
                             paintbrush.finish_load(16384);
                         }
+                        Pending::Repair => {
+                            // Same worker path as a build, different prompt:
+                            // only the bad lines, only their fixes.
+                            if let Some(user) = paintbrush.session.repair_prompt() {
+                                let system = voxel_tools::prompt::system_prompt_for(
+                                    paintbrush.ctx_tokens, paintbrush.max_reply);
+                                if let Some(mut c) = paintbrush.completer_for(false) {
+                                    match c.complete(&system, &user) {
+                                        Ok(raw) => paintbrush.finish_repair(
+                                            &chunk_manager, &gaze, &raw,
+                                            Some((eye.x as i32, eye.y as i32, eye.z as i32))),
+                                        Err(e) => paintbrush.say(format!("repair failed: {e}")),
+                                    }
+                                }
+                            }
+                        }
                         Pending::Camera(poses) => {
                             if poses.len() >= 2 { shot = Some((poses, 1, 0.0)); }
                             else if let Some(p) = poses.first() {
@@ -4457,6 +4473,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             // A reply can land on any frame, including with the box shut.
             paintbrush.poll_turn(&chunk_manager);
+            // Blocks deferred by an earlier flush place themselves once
+            // their chunk streams in.
+            paintbrush.retry_deferred(&chunk_manager);
             if let Some(t) = &paintbrush.in_flight {
                 renderer.chat_focus_hint = Some(format!(
                     "asking {} ... {:.0}s", t.provider, t.elapsed().as_secs_f32()));

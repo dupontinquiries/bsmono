@@ -59,6 +59,9 @@ pub enum Pending {
     VoiceGrammar(Vec<Vec<String>>),
     /// Stop listening.
     VoiceOff,
+    /// Run a repair turn: `session.repair_prompt()` is the user
+    /// message; on reply call `finish_repair`.
+    Repair,
     /// Play these camera poses, easing between them with
     /// `camera::lerp`, then return control to the player.
     Camera(Vec<voxel_tools::camera::Pose>),
@@ -598,6 +601,28 @@ impl Paintbrush {
                 log::info!("[paintbrush] shot {kind} of {name}: {} poses", poses.len());
                 Pending::Camera(poses)
             }
+            Command::Repair => {
+                match self.session.repair_prompt() {
+                    None => { self.say("nothing to repair -- the last plan had no bad lines"); Pending::None }
+                    Some(_) => {
+                        // A repair is a model turn with a different user
+                        // prompt; the bin runs it like any other and the
+                        // reply is merged by `finish_repair`.
+                        self.say("asking the model to fix only the lines it got wrong ...");
+                        Pending::Repair
+                    }
+                }
+            }
+            Command::Deferred { drop } => {
+                if drop {
+                    let n = self.session.deferred.len();
+                    self.session.deferred.cells.clear();
+                    self.say(format!("dropped {n} deferred block(s)"));
+                } else {
+                    self.say(self.session.deferred.message());
+                }
+                Pending::None
+            }
             Command::Keys => {
                 for c in voxel_tools::chatbox::CARDS {
                     if c.command == "/keys" { self.say(c.summary.replace(" · ", "\n  ")); }
@@ -717,6 +742,23 @@ impl Paintbrush {
         self.in_flight = Some(PendingTurn {
             rx, started: Instant::now(), provider: name, gaze: *gaze, player_feet,
         });
+    }
+
+    /// The model answered a repair turn with fixed lines. Merge them
+    /// with the salvaged good lines and preview the whole thing.
+    pub fn finish_repair(&mut self, cm: &ChunkManager, gaze: &Gaze, raw: &str,
+                         player_feet: Option<(i32, i32, i32)>) {
+        let fixed = voxel_tools::llm::clean_reply(raw);
+        let Some(merged) = self.session.merge_repair(&fixed) else {
+            self.say("no repair was pending");
+            return;
+        };
+        log::info!("[paintbrush] repair merged: {} fixed line(s)", fixed.lines().count());
+        let view = WorldView(cm);
+        let mut staged = StagedWorld::new(&view);
+        let mut tools = VoxelTools::new(&mut staged);
+        let r = self.session.receive_plan_for(&mut tools, gaze, &merged, player_feet);
+        self.push(r);
     }
 
     /// Call every frame. Applies a reply once the worker has one.
@@ -887,12 +929,42 @@ impl Paintbrush {
 
     fn flush_staged(&mut self, cm: &ChunkManager, staged: &mut StagedWorld<'_, WorldView<'_>>) {
         if staged.pending() == 0 { return; }
+        // Snapshot the cells BEFORE draining: a skipped cell has to be
+        // remembered with its target block, or it is gone.
+        let snapshot: Vec<voxel_tools::weather::Change> = staged.snapshot();
         let (applied, skipped, _chunks) = flush(cm, staged, self.chunk_size);
         log::info!("[paintbrush] flush: applied={applied} skipped={skipped}");
         if skipped > 0 {
-            self.say(format!("{skipped} block(s) skipped (chunk not loaded)"));
+            // Which ones? The ones whose chunk is not loaded. Keep those
+            // and retry when the chunk appears -- previously they were
+            // mentioned once and the build kept its hole forever.
+            let missing: Vec<_> = snapshot.into_iter()
+                .filter(|c| !cm.is_loaded_at(c.at.0, c.at.1, c.at.2))
+                .collect();
+            let n = missing.len();
+            self.session.deferred.cells.extend(missing);
+            self.say(format!("{n} block(s) deferred until their chunk loads \
+                              (they place themselves when you go there; /deferred to see)"));
         }
         let _ = applied;
+    }
+
+    /// Retry deferred cells whose chunk has since loaded. Called every
+    /// frame; cheap when nothing is waiting.
+    pub fn retry_deferred(&mut self, cm: &ChunkManager) {
+        if self.session.deferred.is_empty() { return; }
+        let cs = self.chunk_size;
+        let ready = self.session.deferred.take_ready(cs,
+            &|c| cm.is_loaded_at(c.0 * cs, c.1 * cs, c.2 * cs));
+        if ready.is_empty() { return; }
+        let edits: Vec<(i32, i32, i32, crate::stubs::BlockId)> = ready.iter()
+            .map(|c| (c.at.0, c.at.1, c.at.2, crate::bind::block_from_u16(c.to)))
+            .collect();
+        let (applied, skipped) = cm.set_blocks(&edits);
+        log::info!("[paintbrush] deferred retry: applied={applied} skipped={skipped}");
+        if applied > 0 {
+            self.say(format!("{applied} deferred block(s) placed now that their chunk loaded"));
+        }
     }
 
     /// A voiced `event`. Returns work, exactly like `dispatch`.
