@@ -110,6 +110,11 @@ mod topology_from_notes_tests {
 pub struct GraphView {
     /// The palace, when the graph is being walked instead of looked at.
     pub palace: Option<crate::palace::Palace>,
+    /// Actions the palace resolved that need the NOTES to apply them (Fork,
+    /// Tag). Lifted off `Palace` because leaving them there loses any raised
+    /// in the same frame as Esc — the palace is dropped on Exit, and its
+    /// pending list with it. The host drains this after `graph_ui`.
+    pub pending: Vec<crate::palace::Action>,
     pub focus: String,
     pub depth: usize,
     pub trail: Vec<String>,
@@ -121,7 +126,7 @@ pub struct GraphView {
 
 impl Default for GraphView {
     fn default() -> Self {
-        GraphView { palace: None, focus: String::new(), depth: 2, trail: Vec::new(),
+        GraphView { palace: None, pending: Vec::new(), focus: String::new(), depth: 2, trail: Vec::new(),
                     yaw: 0.0, pitch: 0.0, spread: 1.0 }
     }
 }
@@ -259,7 +264,12 @@ pub fn graph_ui(ui: &mut Ui, view: &mut GraphView, topo: &nifty::Topology,
     });
     if let Some(pal) = &mut view.palace {
         let opened = crate::palace::palace_ui(ui, pal, topo, &view.focus, view.depth, colors);
-        if pal.pending.iter().any(|a| *a == crate::palace::Action::Exit) { view.palace = None; }
+        // Drain BEFORE the Exit check, or an Esc in the same frame as an F
+        // or a committed tag takes the edit down with the palace.
+        let raised = std::mem::take(&mut pal.pending);
+        let exit = raised.iter().any(|a| *a == crate::palace::Action::Exit);
+        view.pending.extend(raised.into_iter().filter(|a| *a != crate::palace::Action::Exit));
+        if exit { view.palace = None; }
         return opened;
     }
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click());

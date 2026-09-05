@@ -3023,6 +3023,66 @@ impl eframe::App for VoicetermApp {
                                 }
                             });
                             voiceterm_egui::graph_view::graph_ui(ui, &mut self.graph, &topo, &c);
+                            // APPLY what the palace resolved. Fork and Tag sat
+                            // in `pending` with nothing reading them, so both
+                            // keys were inert. Only meaningful against the
+                            // notes — a fork of a scratch niftyplot node has
+                            // nowhere to go — so the typed source just clears
+                            // them and says so rather than silently dropping.
+                            let raised = std::mem::take(&mut self.graph.pending);
+                            if !raised.is_empty() {
+                                if self.graph_from_notes {
+                                    use voiceterm_egui::palace::Action;
+                                    let focus = self.graph.focus.clone();
+                                    let now = ui.input(|inp| inp.time);
+                                    let mut touched = false;
+                                    for a in raised {
+                                        match a {
+                                            Action::Fork => {
+                                                match voiceterm_egui::note_edit::fork_note(
+                                                    &mut self.deck.cards, &focus) {
+                                                    Some(t) => {
+                                                        self.toasts.info(&format!("forked {focus} → {t}"), now);
+                                                        self.graph.focus = t;
+                                                        self.graph.trail.clear();
+                                                        touched = true;
+                                                    }
+                                                    None => self.toasts.warning(
+                                                        &format!("no note called {focus} to fork"), now),
+                                                }
+                                            }
+                                            Action::Tag(t) => {
+                                                use voiceterm_egui::note_edit::TagOutcome::*;
+                                                let said = match voiceterm_egui::note_edit::tag_note(
+                                                    &mut self.deck.cards, &focus, &t) {
+                                                    Added(tag) => { touched = true; format!("#{tag} on {focus}") }
+                                                    AlreadyPresent(tag) => format!("{focus} already has #{tag}"),
+                                                    Unusable => format!("{t:?} is not a usable tag"),
+                                                    NoSuchNote => format!("no note called {focus}"),
+                                                };
+                                                self.toasts.info(&said, now);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    if touched {
+                                        // The indexes are rebuilt from the SAME
+                                        // cards, exactly as the capture path
+                                        // does, so backlinks and TF-IDF never
+                                        // describe notes the deck no longer has.
+                                        let notes: Vec<(String, String)> = self.deck.cards.iter()
+                                            .map(|cd| (cd.title.clone(), cd.body.clone())).collect();
+                                        self.backlinks.rebuild(&notes);
+                                        let mut df = voiceterm_egui::nlp::DocFreq::new();
+                                        for (_, body) in &notes { df.add_document(body); }
+                                        self.doc_freq = df;
+                                    }
+                                } else {
+                                    let now = ui.input(|inp| inp.time);
+                                    self.toasts.warning(
+                                        "fork and tag apply to notes — switch the graph source", now);
+                                }
+                            }
                         }
                     }
                     PaneView::Table => {

@@ -224,6 +224,7 @@ pub mod reading_trainer;
 pub mod archived_view;
 pub mod cards_view;
 pub mod graph_view;
+pub mod note_edit;
 /// `link_graph.rs` is mounted Qt-free under `graph_view` (see that module's
 /// doc), and its `from_niftyplot` — unused by this port, present because the
 /// file is kept byte-identical to the canonical Qt-side one — refers to
