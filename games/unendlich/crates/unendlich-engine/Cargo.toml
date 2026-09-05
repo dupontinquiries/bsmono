@@ -6,6 +6,12 @@ build = "build.rs"
 
 [dependencies]
 voxel-tools = { path = "../voxel-tools" }
+# IN-INSTANCE inference: logscope's wgpu engine (gpu-gemm) linked directly,
+# via aperture's Provider wrapper. Optional and OFF by default -- the trait
+# and prompt shaping are pure and cost nothing; turning on `ai-gpu` links
+# wgpu/naga/pollster through gpu-gemm and makes the model resident in the
+# game process, sharing the GPU the renderer already has.
+aperture-engine = { path = "../../../../apps/aperture/crates/aperture-engine", optional = true }
 rodio = { version = "0.19", optional = true }  # spatial music playback; only built with --features audio
 audiopus = { version = "0.2", optional = true }  # opus decode (libopus); audio feature only
 ogg = { version = "0.9", optional = true }  # ogg demux for ogg-opus; audio feature only
@@ -73,6 +79,10 @@ unendlich-ui = { path = "../unendlich-ui", optional = true }
 libc = "0.2"
 
 [features]
+# The model lives in this process, on the GPU. No server, no subprocess.
+ai-gpu = ["dep:aperture-engine", "aperture-engine/gpu"]
+# The seam without the engine: /provider engine reports how to enable it.
+ai-engine = ["dep:aperture-engine"]
 default = ["gpu"]
 gpu = ["ash"]
 # T06-R27 (GLFW_DECOUPLING Approach A): the render module split so it no longer

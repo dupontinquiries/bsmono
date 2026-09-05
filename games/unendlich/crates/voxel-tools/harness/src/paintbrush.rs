@@ -132,9 +132,19 @@ pub enum ProviderChoice {
     /// A subprocess reading `<system>\0<user>` (aperture's CommandProvider).
     Script(Vec<String>),
     /// In-process HTTP to a resident local server. The default worth
-    /// using: a script pays model LOAD on every request, a server loads
-    /// once.
+    /// using when the engine is not compiled in: a script pays model
+    /// LOAD on every request, a server loads once.
     Http(voxel_tools::llm::HttpConfig),
+    /// IN-INSTANCE: logscope's wgpu engine (gpu-gemm) linked into this
+    /// process through aperture-engine. The model is resident, on the
+    /// GPU the renderer already owns. No server, no socket, no second
+    /// copy of the weights.
+    ///
+    /// This is the one to want. HTTP still pays a socket round-trip and
+    /// keeps a second process alive holding its own copy of the model;
+    /// a game that already has a wgpu device and a model file has no
+    /// reason to do either.
+    Engine { model_path: String },
 }
 
 impl ProviderChoice {
@@ -142,6 +152,13 @@ impl ProviderChoice {
     pub fn parse(spec: &str) -> Result<Self, String> {
         let s = spec.trim();
         if s.eq_ignore_ascii_case("fixture") { return Ok(ProviderChoice::Fixture); }
+        // `engine` with no path uses whatever /model selected.
+        if s.eq_ignore_ascii_case("engine") || s.eq_ignore_ascii_case("wgpu") {
+            return Ok(ProviderChoice::Engine { model_path: String::new() });
+        }
+        if let Some(p) = s.strip_prefix("engine:").or_else(|| s.strip_prefix("wgpu:")) {
+            return Ok(ProviderChoice::Engine { model_path: p.trim().to_string() });
+        }
         if let Some(rest) = s.strip_prefix("script:") {
             let argv: Vec<String> = rest.split_whitespace().map(String::from).collect();
             if argv.is_empty() { return Err("script: needs a command".into()); }
@@ -168,6 +185,15 @@ impl ProviderChoice {
             ProviderChoice::Fixture => "fixture (canned plan, no model)".into(),
             ProviderChoice::Script(a) if a.is_empty() => "script (auto-located)".into(),
             ProviderChoice::Script(a) => format!("script: {}", a.join(" ")),
+            ProviderChoice::Engine { model_path } => {
+                let which = if model_path.is_empty() { "the /model selection" } else { model_path };
+                if cfg!(feature = "ai-gpu") {
+                    format!("wgpu engine, in-instance ({which})")
+                } else {
+                    format!("wgpu engine ({which}) -- NOT COMPILED IN: \
+                             rebuild with --features ai-gpu")
+                }
+            }
             ProviderChoice::Http(c) => format!(
                 "{} at {} (model {}) -- in-process, no subprocess",
                 match c.dialect {
@@ -176,6 +202,86 @@ impl ProviderChoice {
                 },
                 c.host, if c.model.is_empty() { "server default" } else { &c.model }),
         }
+    }
+}
+
+/// Bridges aperture-engine's `Backend` to voxel-tools' `Completer`.
+///
+/// Two shapes to reconcile. Aperture's is `generate(prompt, max_tokens)`
+/// on `&self` (the engine is Send+Sync and shared by handle); ours is
+/// `complete(system, user)` on `&mut self`. The system prompt and the
+/// user turn are concatenated the way a base-ish model expects — one
+/// text, no chat template — because that is what `assemble_prompt` does
+/// for the same engine in the editor, and two callers of one engine
+/// disagreeing about prompt shape is how you get output that is subtly
+/// worse for no visible reason.
+#[cfg(feature = "ai-engine")]
+pub struct EngineCompleter {
+    inner: std::sync::Arc<dyn aperture_engine::Backend>,
+    max_tokens: usize,
+}
+
+#[cfg(feature = "ai-engine")]
+impl voxel_tools::llm::Completer for EngineCompleter {
+    fn name(&self) -> &str { "wgpu engine (in-instance)" }
+    fn complete(&mut self, system: &str, user: &str) -> Result<String, String> {
+        self.inner.generate(&format!("{system}\n\n{user}"), self.max_tokens)
+    }
+}
+
+/// The resident engine. Loading a GGUF takes seconds and gigabytes, so it
+/// happens ONCE and the handle is cloned per request. Held here rather
+/// than in the bin so `/provider engine` and `/model` can cooperate.
+#[cfg(feature = "ai-engine")]
+#[derive(Default)]
+pub struct ResidentEngine {
+    handle: Option<std::sync::Arc<dyn aperture_engine::Backend>>,
+    loaded_path: String,
+}
+
+#[cfg(feature = "ai-engine")]
+impl ResidentEngine {
+    /// Load `path` unless it is already the loaded one. Returns a handle.
+    ///
+    /// NOT EXERCISED where this was written: no GPU adapter and no
+    /// checkpoint in that sandbox, exactly as aperture-engine's own
+    /// `load` says of itself. Compile-checked only.
+    pub fn ensure(&mut self, path: &str, max_tokens: usize)
+        -> Result<std::sync::Arc<dyn aperture_engine::Backend>, String> {
+        if let Some(h) = &self.handle {
+            if self.loaded_path == path { return Ok(h.clone()); }
+        }
+        #[cfg(feature = "ai-gpu")]
+        {
+            let cfg = aperture_engine::EngineConfig {
+                model_path: path.to_string(),
+                max_tokens,
+                // A plan is structured output: greedy is right, and it is
+                // what logscope-serve uses for completions.
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                // The failure mode a plan hits is repeating a line
+                // forever; the editor tunes for the same thing.
+                repeat_penalty: 1.15,
+                repeat_last_n: 64,
+                instruction: String::new(),
+            };
+            let engine = aperture_engine::LocalEngine::load(cfg)?;
+            let h = engine.handle();
+            self.handle = Some(h.clone());
+            self.loaded_path = path.to_string();
+            Ok(h)
+        }
+        #[cfg(not(feature = "ai-gpu"))]
+        {
+            let _ = (path, max_tokens);
+            Err("wgpu engine not compiled in -- rebuild with --features ai-gpu".into())
+        }
+    }
+
+    pub fn loaded(&self) -> Option<&str> {
+        self.handle.as_ref().map(|_| self.loaded_path.as_str())
     }
 }
 
@@ -192,6 +298,9 @@ pub struct Paintbrush {
     /// Current backend. Defaults from $UNENDLICH_BUILD_HTTP if set, so a
     /// running ollama is picked up without typing anything.
     pub provider: ProviderChoice,
+    /// The resident in-instance engine, if one has been loaded.
+    #[cfg(feature = "ai-engine")]
+    pub engine: ResidentEngine,
 }
 
 impl Paintbrush {
@@ -216,7 +325,16 @@ impl Paintbrush {
             chunk_size,
             provider: std::env::var("UNENDLICH_BUILD_HTTP").ok()
                 .and_then(|s| ProviderChoice::parse(&s).ok())
-                .unwrap_or(ProviderChoice::Fixture),
+                // With the engine compiled in, in-instance is the right
+                // default: the weights are already on disk and the GPU is
+                // already open.
+                .unwrap_or(if cfg!(feature = "ai-gpu") {
+                    ProviderChoice::Engine { model_path: String::new() }
+                } else {
+                    ProviderChoice::Fixture
+                }),
+            #[cfg(feature = "ai-engine")]
+            engine: ResidentEngine::default(),
         }
     }
 
@@ -345,7 +463,8 @@ impl Paintbrush {
             }
             Command::Provider(None) => {
                 self.say(format!("provider: {}", self.provider.describe()));
-                self.say("switch with: /provider ollama | /provider openai:127.0.0.1:8080 \
+                self.say("switch with: /provider engine (in-instance wgpu, no server) \
+                          | /provider ollama | /provider openai:127.0.0.1:8080 \
                           | /provider script:./my.sh | /provider fixture");
                 Pending::None
             }
@@ -417,6 +536,73 @@ impl Paintbrush {
         // A preview must leave nothing staged: receive_plan_for reverses
         // its own dry run, so this is an assertion, not a cleanup.
         debug_assert_eq!(staged.pending(), 0, "preview must not stage writes");
+    }
+
+    /// Build the completer for a turn. Everything the bin needs to know
+    /// about provider selection lives here.
+    ///
+    /// Returns None with a message already in the log when the choice
+    /// cannot be honoured -- a missing script, an engine that is not
+    /// compiled in, a `/provider engine` with no model chosen.
+    pub fn completer_for(&mut self, debug: bool)
+        -> Option<Box<dyn voxel_tools::llm::Completer>> {
+        use voxel_tools::llm::{CommandProvider, HttpProvider};
+        let choice = if debug { ProviderChoice::Fixture } else { self.provider.clone() };
+        log::info!("[paintbrush] provider choice: {}", choice.describe());
+        match choice {
+            ProviderChoice::Http(cfg) => Some(Box::new(HttpProvider::new(cfg))),
+            ProviderChoice::Fixture | ProviderChoice::Script(_) => {
+                let argv = match &choice {
+                    ProviderChoice::Script(a) if !a.is_empty() => Ok(a.clone()),
+                    ProviderChoice::Script(_) => find_provider("llama-cli.sh", true),
+                    _ => find_provider("fixture.sh", !debug),
+                };
+                match argv {
+                    Ok(a) => Some(Box::new(CommandProvider::new(a))),
+                    Err(e) => { self.say(e); None }
+                }
+            }
+            ProviderChoice::Engine { model_path } => self.engine_completer(&model_path),
+        }
+    }
+
+    #[cfg(feature = "ai-engine")]
+    fn engine_completer(&mut self, model_path: &str)
+        -> Option<Box<dyn voxel_tools::llm::Completer>> {
+        // An empty path means "whatever /model selected", so the two
+        // commands cooperate instead of each holding their own idea of
+        // which weights are in play.
+        let path = if model_path.is_empty() {
+            match &self.models.state {
+                voxel_tools::model::LoadState::Loaded { name, .. } => {
+                    match self.models.resolve(name) {
+                        Ok(m) => m.path.display().to_string(),
+                        Err(e) => { self.say(e); return None; }
+                    }
+                }
+                _ => {
+                    self.say("no model chosen -- /model <name> first, \
+                              or /provider engine:/path/to/model.gguf");
+                    return None;
+                }
+            }
+        } else { model_path.to_string() };
+
+        if self.engine.loaded() != Some(path.as_str()) {
+            self.say(format!("loading {path} into the GPU (once) ..."));
+        }
+        match self.engine.ensure(&path, 512) {
+            Ok(inner) => Some(Box::new(EngineCompleter { inner, max_tokens: 512 })),
+            Err(e) => { self.say(format!("engine: {e}")); None }
+        }
+    }
+
+    #[cfg(not(feature = "ai-engine"))]
+    fn engine_completer(&mut self, _model_path: &str)
+        -> Option<Box<dyn voxel_tools::llm::Completer>> {
+        self.say("the in-instance wgpu engine is not compiled in -- \
+                  rebuild with --features ai-gpu, or /provider ollama");
+        None
     }
 
     /// The context and prompt for the pending turn. Call on the worker
