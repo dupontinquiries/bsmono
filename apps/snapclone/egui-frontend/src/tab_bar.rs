@@ -50,6 +50,22 @@ impl Tab {
         Tab { icon: icon.into(), label: label.into(), badge: 0 }
     }
 
+    /// Is the icon field an actual ICON — one pictographic glyph — rather
+    /// than a word standing in for one?
+    ///
+    /// snapclone constructs its bar with `["camera", "chats", ...]` zipped
+    /// against `PAGE_NAMES`, so every tab was painting the word "camera" at
+    /// 16pt and "Camera" at 10pt underneath it: each label rendered twice,
+    /// and on a phone the second row ran off the bottom of the window. Seen
+    /// in a screenshot. A tab draws its icon only when it has one.
+    pub fn icon_is_glyph(&self) -> bool {
+        let mut chars = self.icon.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => !c.is_alphanumeric() && !c.is_whitespace(),
+            _ => false,
+        }
+    }
+
     /// Badge text, capped.
     ///
     /// The original stops at "9+" because the dot is 7px of font and anything
@@ -232,12 +248,18 @@ pub fn tab_bar_ui(ui: &mut egui::Ui, bar: &mut TabBar, min_touch: f32,
         let x = rect.left() + tw * i as f32;
         let centre = egui::pos2(x + tw / 2.0, rect.center().y);
         let on = i == bar.current();
-        p.text(egui::pos2(centre.x, centre.y - 6.0), egui::Align2::CENTER_CENTER,
-               &tab.icon, egui::FontId::proportional(16.0),
-               if on { c.accent } else { c.text_weak });
-        p.text(egui::pos2(centre.x, centre.y + 10.0), egui::Align2::CENTER_CENTER,
-               &tab.label, egui::FontId::proportional(10.0),
-               if on { c.accent } else { c.text_weak });
+        let col = if on { c.accent } else { c.text_weak };
+        if tab.icon_is_glyph() {
+            p.text(egui::pos2(centre.x, centre.y - 6.0), egui::Align2::CENTER_CENTER,
+                   &tab.icon, egui::FontId::proportional(16.0), col);
+            p.text(egui::pos2(centre.x, centre.y + 10.0), egui::Align2::CENTER_CENTER,
+                   &tab.label, egui::FontId::proportional(10.0), col);
+        } else {
+            // No icon: one centred label at a readable size, rather than the
+            // same word twice at two sizes.
+            p.text(centre, egui::Align2::CENTER_CENTER,
+                   &tab.label, egui::FontId::proportional(13.0), col);
+        }
         if let Some(b) = tab.badge_text() {
             // Offset from the icon rather than the cell edge, so a long label
             // does not push the badge away from the thing it counts.
@@ -461,4 +483,20 @@ mod tests {
         assert!(b.set_current(2));
         assert!(!b.set_current(2), "already there is not a change");
     }
+    #[test]
+    fn a_word_in_the_icon_slot_is_not_treated_as_an_icon() {
+        // The real construction: a word zipped against the page name, which
+        // painted "camera" over "Camera" on every tab.
+        assert!(!Tab::new("camera", "Camera").icon_is_glyph());
+        assert!(!Tab::new("chats", "Inbox").icon_is_glyph());
+        assert!(!Tab::new("", "Camera").icon_is_glyph());
+        assert!(!Tab::new(" ", "Camera").icon_is_glyph());
+        assert!(!Tab::new("ab", "Camera").icon_is_glyph(), "two chars is not a glyph");
+        assert!(!Tab::new("7", "Camera").icon_is_glyph(), "a digit is not a pictograph");
+        // A real single-glyph icon still counts, so adding proper icons later
+        // needs no further change here.
+        assert!(Tab::new("\u{1F4F7}", "Camera").icon_is_glyph(), "camera emoji");
+        assert!(Tab::new("\u{2699}", "Settings").icon_is_glyph(), "gear");
+    }
+
 }
