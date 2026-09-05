@@ -73,6 +73,25 @@ pub fn paragraphs(md: &str) -> Vec<Paragraph> {
     out
 }
 
+/// Which block in `doc` the pacer's `nth` paragraph came from.
+///
+/// `paragraphs_from_html` skips headings, rules and empty blocks, so the
+/// pacer's index is NOT the block index — highlighting block `n` for
+/// paragraph `n` would drift by one per heading and point at the wrong
+/// text on any real manual page.
+pub fn block_index_of(doc: &uikit_web::RichDoc, nth: usize) -> Option<usize> {
+    let mut seen = 0;
+    for (i, b) in doc.blocks.iter().enumerate() {
+        let readable = !matches!(b.kind,
+            uikit_web::BlockKind::Heading(_) | uikit_web::BlockKind::Rule)
+            && b.inlines.iter().any(|x| !x.text.trim().is_empty());
+        if !readable { continue; }
+        if seen == nth { return Some(i); }
+        seen += 1;
+    }
+    None
+}
+
 /// Paragraphs from an ALREADY-PARSED html document — what the manpage view
 /// holds. `Doc` keeps html, not the markdown `paragraphs` expects, and
 /// re-serialising html back to markdown just to re-split it would be two
@@ -290,6 +309,25 @@ mod tests {
         assert!(p.paragraphs.is_empty());
         assert!(p.done(), "an empty pacer is finished, not stuck");
         assert_eq!(p.progress(300.0), 1.0);
+    }
+
+    #[test]
+    fn the_pacers_index_maps_past_headings_to_the_right_block() {
+        // h1, p, h2, pre, p  ->  paragraph 0 is block 1, 1 is block 3, 2 is block 4.
+        let doc = uikit_web::parse_html(
+            "<h1>T</h1><p>first</p><h2>S</h2><pre>code</pre><p>second</p>");
+        assert_eq!(block_index_of(&doc, 0), Some(1));
+        assert_eq!(block_index_of(&doc, 1), Some(3));
+        assert_eq!(block_index_of(&doc, 2), Some(4));
+        assert_eq!(block_index_of(&doc, 3), None, "past the end is None, not a wrong block");
+        // And it agrees with what the pacer actually holds.
+        let ps = paragraphs_from_html(&doc);
+        assert_eq!(ps.len(), 3);
+        for (n, p) in ps.iter().enumerate() {
+            let b = block_index_of(&doc, n).unwrap();
+            let text: String = doc.blocks[b].inlines.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(text.trim(), p.text, "paragraph {n} points at the wrong block");
+        }
     }
 
 }

@@ -227,7 +227,11 @@ pub fn manpage_ui(ui: &mut egui::Ui, v: &mut ManpageView,
                 //
                 // The leading '#' or '/' is stripped: manual cross-refs are
                 // written both ways, and `open` wants a bare name.
-                if let Some(href) = uikit_web::render(ui, &doc, c) {
+                // The paced paragraph, shown rather than only counted.
+                let focus = v.pacer.as_ref()
+                    .filter(|(_, p)| p.running && !p.done())
+                    .and_then(|(_, p)| crate::reading_trainer::block_index_of(&doc, p.current));
+                if let Some(href) = uikit_web::render_with_focus(ui, &doc, c, focus) {
                     let name = href.trim_start_matches(['#', '/']).trim();
                     if !name.is_empty() && v.has(name) {
                         nav = Some(name.to_string());

@@ -774,8 +774,61 @@ fn collapse_ws(s: &str) -> String {
 /// thing a page is for.
 pub fn render(ui: &mut egui::Ui, doc: &RichDoc,
               colors: &uikit_egui::PaletteColors) -> Option<String> {
+    render_with_focus(ui, doc, colors, None)
+}
+
+/// `render`, with one block marked as the one being read.
+///
+/// The reading pacer knows WHICH paragraph it is on and had no way to show
+/// it: `render` draws the whole document and has no notion of a current
+/// block, so a paced reader got "3/11" and a progress bar without ever
+/// being shown where 3 was. `focus` is an index into `doc.blocks`.
+///
+/// The highlight is painted BEHIND the block, not over it, via egui's
+/// placeholder idiom: reserve a shape index before the block is laid out,
+/// then set it once the block's rect is known. Painting afterwards would
+/// put a translucent panel over the text.
+pub fn render_with_focus(ui: &mut egui::Ui, doc: &RichDoc,
+                         colors: &uikit_egui::PaletteColors,
+                         focus: Option<usize>) -> Option<String> {
     let mut followed = None;
-    for block in &doc.blocks {
+    for (bi, block) in doc.blocks.iter().enumerate() {
+        let mark = focus == Some(bi);
+        let slot = mark.then(|| ui.painter().add(egui::Shape::Noop));
+        let before = ui.next_widget_position().y;
+        let out = render_one(ui, block, colors);
+        if followed.is_none() { followed = out; }
+        if let Some(slot) = slot {
+            // The band the block just occupied, full width, with a little
+            // air so the highlight is not flush against the glyphs.
+            let after = ui.next_widget_position().y;
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(ui.max_rect().left(), before - 2.0),
+                egui::pos2(ui.max_rect().right(), after.max(before) + 2.0),
+            );
+            let a = colors.accent;
+            ui.painter().set(slot, egui::Shape::rect_filled(
+                rect, 4.0,
+                egui::Color32::from_rgba_unmultiplied(a.r(), a.g(), a.b(), 38)));
+        }
+    }
+    if doc.blocks_dropped > 0 {
+        // A page that stops half way with no explanation reads as a broken
+        // parser. Saying how much is missing is what tells a reader to open
+        // the original instead of scrolling for something that is not there.
+        ui.label(egui::RichText::new(format!(
+            "{} more block(s) not shown — the page is longer than this view renders",
+            doc.blocks_dropped)).small().color(colors.text_weak));
+    }
+    followed
+}
+
+fn render_one(ui: &mut egui::Ui, block: &Block,
+              colors: &uikit_egui::PaletteColors) -> Option<String> {
+    let mut followed = None;
+    {
+        let doc_blocks = std::slice::from_ref(block);
+        for block in doc_blocks {
         if let BlockKind::Table { has_header } = block.kind {
             if let Some(h) = table_ui(ui, block, has_header, colors) {
                 followed = Some(h);
@@ -833,13 +886,6 @@ pub fn render(ui: &mut egui::Ui, doc: &RichDoc,
             }
         });
     }
-    if doc.blocks_dropped > 0 {
-        // A page that stops half way with no explanation reads as a broken
-        // parser. Saying how much is missing is what tells a reader to open
-        // the original instead of scrolling for something that is not there.
-        ui.label(egui::RichText::new(format!(
-            "{} more block(s) not shown — the page is longer than this view renders",
-            doc.blocks_dropped)).small().color(colors.text_weak));
     }
     followed
 }
