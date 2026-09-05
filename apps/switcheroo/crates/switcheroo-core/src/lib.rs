@@ -22,6 +22,7 @@
 //! on screen instead of in a log file on a phone.
 
 
+pub mod radio;
 pub mod fastpath;
 
 /// Is this a HomeKit setup code — eight digits, dashes and spaces allowed?

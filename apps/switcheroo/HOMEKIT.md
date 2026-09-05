@@ -145,3 +145,72 @@ control without its own pairing ceremony. The `Backend` seam in
 switcheroo-core is already the right shape for this: a fabric-oracle
 backend submits the same `Command`s and returns the same `Event`s as the
 local radio, and the UI does not learn the difference.
+
+# Fairphone hardware: what it can and cannot do (checked 2026-09-05)
+
+The operator asked whether the Fairphone has the hardware. Checked against
+vendor and spec sources rather than assumed, because the two radios involved
+have opposite answers.
+
+| | Fairphone 5 | Fairphone 6 (Gen. 6) |
+|---|---|---|
+| SoC | Qualcomm QCM6490 | Snapdragon 7s Gen 3 (SM7635) |
+| Bluetooth | **5.2 + LE** | **5.4 + LE** |
+| Thread / 802.15.4 | **no** | **no** — Phone Scoop's spec sheet lists `Thread: –` explicitly |
+| NFC | yes | yes |
+
+Fairphone's own Gen 6 spec page lists "Bluetooth 5.4 LE" and no 802.15.4 of
+any kind; the FP5 support pages and manual list "Bluetooth 5.2 + LE".
+
+## What that means for this app
+
+**BLE control works, and that is the path.** The WSP100 is a Thread
+accessory that speaks HAP over BLE when no Thread network is present —
+Belkin's own line is "Bluetooth compatible (used if Thread isn't
+available)". Pair-setup, pair-verify and writing the On characteristic are
+all HAP-over-BLE, and BLE 5.2/5.4 LE is more than enough. Nothing about the
+phone blocks it.
+
+**Thread provisioning does not.** No phone has an 802.15.4 radio — not the
+Fairphones, and not iPhones either; on Apple's side it is the HomePod and
+Apple TV that carry Thread, which is exactly why HomeKit asks for a "home
+hub". Provisioning the plug onto a Thread network means a border router:
+an 802.15.4 dongle (nRF52840 and similar) running OpenThread `otbr`, on the
+phone over USB-OTG or on any other machine on the LAN. The provisioning
+itself still goes over BLE — a write to the Thread Control Point
+characteristic `0x0704` — so switcheroo could drive it once a dataset
+exists, but it cannot manufacture the network.
+
+So: full function over BLE from the phone alone; Thread is an optional
+upgrade that needs one piece of hardware the phone does not have.
+
+## The one-radio consequence, now handled
+
+A phone has ONE Bluetooth radio, and switcheroo runs two BLE stacks:
+`btleplug` for the device scanner and `bluest` (under `hap-controller`) for
+HomeKit. The scanner is a continuous duty cycle by design, and a discovery
+session held while a multi-round pairing runs is how a pairing times out on
+a plug sitting a metre away.
+
+`switcheroo_core::radio` is the arbiter: a non-blocking lease with a
+priority. A pairing PREEMPTS the scanner and the grant reports what it
+interrupted, so the caller restores it afterwards rather than guessing; a
+scan is never allowed to preempt a pairing, because a dropped scan costs a
+stale list for a few seconds and a dropped pairing usually means putting the
+plug back into pairing mode by hand. Advisory rather than a mutex so a
+thirty-second pairing never blocks the UI thread. 6 tests.
+
+## Commands worth running on the device
+
+If you want to confirm the radio end-to-end on the phone rather than trust a
+spec sheet:
+
+    bluetoothctl show                 # adapter present, powered, and its BT version
+    btmon &                           # live HCI trace while pairing
+    bluetoothctl scan on              # does the WSP100 advertise at all
+    hcitool dev                       # adapter listed at the HCI layer
+
+The plug must be blinking white/orange (pairing mode) to advertise its HAP
+service. The earlier field report showed it at **-78 dBm and "out of
+range"** — that is a real signal problem before any protocol question, so
+worth getting within a metre or two first.
