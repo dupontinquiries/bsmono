@@ -200,14 +200,24 @@ pub fn frame(root: &mut Ui, app: &mut App) {
     // faded during flight. (In the classic world this is BASE_ENV — the same
     // golden-hour study as before.)
     let env = app.viewer.current_env();
-    u.sun_col = env.sun_col;
+    // THE LIVING LIGHT: the focused room's kind picks a scene-kit mechanism
+    // and the room breathes with it — exposure and a few degrees of hue —
+    // and its dust thickens with the item's blame age. Deterministic per
+    // name, so the same room always moves the same way.
+    let (breath, hue, dusty) = app.viewer.stations.get(app.viewer.focus)
+        .map(|s| {
+            let (b, h) = crate::rooms::breathe(s.item.kind, &s.item.name, time);
+            (b, h, crate::rooms::dust(s.heat))
+        })
+        .unwrap_or((1.0, 0.0, 1.0));
+    u.sun_col = crate::rooms::hue_rotate(env.sun_col, hue);
     u.sky = env.sky;
     u.ground = [0.23, 0.19, 0.14];
     let (_, _, hour_ambient) = scene_kit::mesh3d::sun_clock_at(hour);
     u.ambient = 0.62 * (hour_ambient / 1.18).clamp(0.55, 1.0); // gentle day/night breathing, never fully dark
-    u.fog = env.fog;
+    u.fog = env.fog * dusty;
     u.fog_col = env.fog_col;
-    u.exposure = env.exposure;
+    u.exposure = env.exposure * breath;
     u.godray_amt = 0.22;
     u.sun_uv = [0.74, 0.16];
     u.opaque = 1.0;

@@ -331,3 +331,98 @@ mod tests {
     }
 
 }
+
+// ── the living light ───────────────────────────────────────────────────────
+//
+// A room's RoomEnv is its still character. This is the part that moves:
+// each kind of code item gets one of scene-kit's physical light mechanisms
+// (the same per-dot functions logscope's scenes use), and the room's whole
+// light breathes with it. Deterministic like everything else here — the
+// mechanism comes from the kind, the phase from the name hash — so a
+// function's plaque always flickers like a reading lamp and a trait's
+// always shifts like refracted light, and you know where you are before
+// you read the name.
+
+use scene_kit::mesh3d::{modulate_dot, SceneLight};
+
+/// The mechanism for a kind of item. Chosen for what the kind IS:
+/// a function is where you read (a lamp); a struct or enum is a fixed
+/// crystalline thing (glints); a trait is many implementations seen
+/// through one interface (the spectrum); an impl is work under a canopy
+/// (dappled); a module is a corridor of openings (shafts); a const is set
+/// in stone (sandstone).
+pub fn room_light(kind: OutlineKind) -> SceneLight {
+    match kind {
+        OutlineKind::Fn => SceneLight::LampFlicker,
+        OutlineKind::Struct | OutlineKind::Enum => SceneLight::CrystalGlint,
+        OutlineKind::Trait => SceneLight::RainbowRefraction,
+        OutlineKind::Impl => SceneLight::DappledCanopy,
+        OutlineKind::Mod => SceneLight::CanopyShafts,
+        OutlineKind::Const => SceneLight::SandstoneShimmer,
+        _ => SceneLight::Uniform,
+    }
+}
+
+/// The room's light at time `t`: (exposure multiplier, hue shift in degrees).
+/// Sampled at the plaque's origin dot, so the whole room breathes as one —
+/// the per-dot texture is the plaque's business, the room's is the mood.
+/// Exposure stays within 0.85..1.05 of the room's own: alive, never dim.
+pub fn breathe(kind: OutlineKind, name: &str, t: f32) -> (f32, f32) {
+    let seed = hash(name);
+    let (b, hue) = modulate_dot(room_light(kind), 0.0, 0.0, seed, t);
+    (0.85 + 0.2 * b, hue * 0.25)
+}
+
+/// Dust with age. `heat` is the station's blame heat (1 = touched now,
+/// 0 = ancient); old rooms hold more fog — the light shafts show in the
+/// dust of a corridor nobody has walked in years — and a room touched
+/// this session is crisp. Multiplier on the room's fog, 1.0..1.8.
+pub fn dust(heat: f32) -> f32 {
+    1.0 + 0.8 * (1.0 - heat.clamp(0.0, 1.0))
+}
+
+/// Rotate an RGB colour's hue by `deg` — a small, cheap approximation
+/// (the YIQ rotation), enough to warm a sun a few degrees.
+pub fn hue_rotate(c: [f32; 3], deg: f32) -> [f32; 3] {
+    let a = deg.to_radians();
+    let (s, co) = a.sin_cos();
+    let y = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+    let i = 0.596 * c[0] - 0.274 * c[1] - 0.322 * c[2];
+    let q = 0.211 * c[0] - 0.523 * c[1] + 0.312 * c[2];
+    let (i2, q2) = (i * co - q * s, i * s + q * co);
+    [(y + 0.956 * i2 + 0.621 * q2).clamp(0.0, 2.0), (y - 0.272 * i2 - 0.647 * q2).clamp(0.0, 2.0), (y - 1.106 * i2 + 1.703 * q2).clamp(0.0, 2.0)]
+}
+
+#[cfg(test)]
+mod living_light_tests {
+    use super::*;
+
+    #[test]
+    fn every_kind_has_a_light_and_the_same_name_breathes_the_same_way() {
+        for k in [OutlineKind::Fn, OutlineKind::Struct, OutlineKind::Enum, OutlineKind::Trait, OutlineKind::Impl, OutlineKind::Mod, OutlineKind::Const] {
+            assert_ne!(room_light(k), SceneLight::Uniform, "{k:?}");
+        }
+        assert_eq!(breathe(OutlineKind::Fn, "parse_header", 2.5), breathe(OutlineKind::Fn, "parse_header", 2.5));
+        let mut lo = f32::MAX; let mut hi = f32::MIN;
+        for k in 0..200 {
+            let (e, h) = breathe(OutlineKind::Fn, "parse_header", k as f32 * 0.05);
+            assert!((0.85..=1.05).contains(&e), "exposure {e}");
+            assert!(h.abs() <= 90.0, "hue {h}");
+            lo = lo.min(e); hi = hi.max(e);
+        }
+        assert!(hi - lo > 0.03, "the lamp does not breathe: {lo}..{hi}");
+    }
+
+    #[test]
+    fn dust_thickens_with_age_and_hue_rotation_is_gentle() {
+        assert!((dust(1.0) - 1.0).abs() < 1e-6);
+        assert!((dust(0.0) - 1.8).abs() < 1e-6);
+        assert!(dust(0.5) > dust(0.9));
+        let sun = [1.0, 0.92, 0.78];
+        let warm = hue_rotate(sun, 9.0);
+        assert!((warm[0] - sun[0]).abs() < 0.15 && (warm[2] - sun[2]).abs() < 0.15, "{warm:?}");
+        // Textbook YIQ constants round-trip to within a percent, which is all a mood needs.
+        assert!(hue_rotate(sun, 0.0).iter().zip(sun.iter()).all(|(a, b)| (*a - *b).abs() < 0.02));
+    }
+}
+
