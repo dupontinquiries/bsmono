@@ -88,3 +88,31 @@ authored mesh is in the right place by construction.
 
 The work already exists for steps 2, 3 and 5; it was built for a derivation that
 turned out to be unnecessary, and it is the right medicine for this instead.
+
+## UPDATE (c15unified session): confirmed still exactly accurate, unchanged
+
+Got the C engine building for the first time in this bundle this session
+(60 files missing from the Makefile's object list — separate commit). With
+a real build in hand, checked directly rather than assumed: is the specific
+bug this document quotes — `base_poses[i].sx = (a.sx + (b.sx-a.sx)*e2) *
+fade;`, the `crimp` compression hack — still live in `game.c`, or has it
+since been addressed?
+
+It's still there, unchanged, same lines, same mechanism (`game.c` ~6931-6938).
+So this document's core technical finding is still exactly correct today,
+not stale — worth stating plainly since this session found several other
+"still open" claims elsewhere in this repo that had quietly stopped being
+true. This one hasn't.
+
+What HAS changed since this doc was written: `rust/foldview` (see
+`TRANSFORM_SYSTEMS.md`'s own update) proved the single-mesh anatomy-based
+approach this overhaul's steps 2-5 depend on actually works, on real
+imported vehicle geometry, not just the procedural bot parts step 1-4 were
+originally scoped around. That derisks steps 2-5; it doesn't touch step 1
+(stop lerping scale in `game.c`), which is still exactly the same
+unattempted rewrite it was when this doc was written — and still not
+something to do blind in this sandbox, since there's no way to see the
+result (Xvfb's built-in GLX can't satisfy this SDL2 app's
+`SDL_GL_ACCELERATED_VISUAL` requirement — confirmed by reading
+`exengine/render/window.c`'s own `SDL_GL_SetAttribute` calls, not just by
+the earlier failed attempts).

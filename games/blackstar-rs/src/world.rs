@@ -1763,7 +1763,7 @@ impl World {
                     }
                     big
                 };
-                let arc = |shapes: &mut Vec<Shape>, grav: &mut Vec<GravNode>, wp: &mut Vec<Vec3>, c: Vec3, u: Vec3, v: Vec3, big_r: f32, a0: f32, a1: f32, r: f32, col: [f32; 4], glow: f32| {
+                let _arc = |shapes: &mut Vec<Shape>, grav: &mut Vec<GravNode>, wp: &mut Vec<Vec3>, c: Vec3, u: Vec3, v: Vec3, big_r: f32, a0: f32, a1: f32, r: f32, col: [f32; 4], glow: f32| {
                     let n = (((a1 - a0).abs() / 0.24).ceil() as usize).max(2);
                     let st = (a1 - a0) / n as f32;
                     let at = |k: usize| {
@@ -2137,7 +2137,7 @@ impl World {
                 // headroom: a 13 m lid made every aerial feel clipped
                 let (hx, hz, wh) = (64.0f32, 58.0f32, 26.0f32);
                 let wallc = mix4(PLINTH, acc, 0.18);
-                let mut wall = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, col: [f32; 4], al: f32| {
+                let wall = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, col: [f32; 4], al: f32| {
                     let i = push(shapes, M_BOX, pos, Quat::IDENTITY, half, Sdf::RBox { half, round: 0.4 }, [col[0], col[1], col[2], al], 0.05, 0.4);
                     shapes[i].blend = true;
                     i
@@ -2245,7 +2245,7 @@ impl World {
                 let rw = 17.0f32; // ramp length up the slope
                 let (cs, sn) = (lean.cos(), lean.sin());
                 let wall_col = mix4(PLINTH, acc, 0.18);
-                let mut ramp = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, rot: Quat| {
+                let ramp = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, rot: Quat| {
                     let i = push(shapes, M_BOX, pos, rot, half, Sdf::RBox { half, round: 0.35 }, wall_col, 0.04, 0.45);
                     shapes[i].blend = true;
                 };
@@ -2687,7 +2687,7 @@ impl World {
                 ] {
                     panel(&mut shapes, Vec3::new(px, g0 + 12.0, pz), Vec3::new(hx, 12.0, hz), white);
                 }
-                let mut mk_portal = |shapes: &mut Vec<Shape>, portals: &mut Vec<Portal>, pos: Vec3, normal: Vec3, up: Vec3, r: f32, warm: bool| -> usize {
+                let mk_portal = |shapes: &mut Vec<Shape>, portals: &mut Vec<Portal>, pos: Vec3, normal: Vec3, up: Vec3, r: f32, warm: bool| -> usize {
                     let n = normal.normalize_or(Vec3::Z);
                     let u = (up - n * up.dot(n)).normalize_or(Vec3::Y);
                     let right = u.cross(n).normalize_or(Vec3::X);
@@ -2772,7 +2772,7 @@ impl World {
                 let g0 = th(0.0, 0.0);
                 let deck = mix4(PLINTH, [1.0; 4], 0.35);
                 let trim = mix4(acc, [1.0; 4], 0.25);
-                let mut slab = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, col: [f32; 4]| -> usize {
+                let slab = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, col: [f32; 4]| -> usize {
                     let i = push(shapes, M_BOX, pos, Quat::IDENTITY, half, Sdf::RBox { half, round: 0.25 }, col, 0.04, 0.5);
                     shapes[i].blend = true;
                     i
@@ -2782,7 +2782,7 @@ impl World {
                     slab(&mut shapes, Vec3::new(px, g0 + 20.0, pz), Vec3::new(hx, 20.0, hz), deck);
                 }
                 // one portal maker, shared: `mount` is the shape it rides
-                let mut mk = |shapes: &mut Vec<Shape>, portals: &mut Vec<Portal>, pos: Vec3, normal: Vec3, up: Vec3, r: f32, warm: bool, mount: Option<usize>| -> usize {
+                let mk = |shapes: &mut Vec<Shape>, portals: &mut Vec<Portal>, pos: Vec3, normal: Vec3, up: Vec3, r: f32, warm: bool, mount: Option<usize>| -> usize {
                     let n = normal.normalize_or(Vec3::Z);
                     let u = (up - n * up.dot(n)).normalize_or(Vec3::Y);
                     let right = u.cross(n).normalize_or(Vec3::X);
@@ -3003,7 +3003,7 @@ impl World {
                     flows.push(Flow { pos: base + Vec3::Z * 7.0, r: 16.0, vel: Vec3::new(0.0, 1.5, 12.0) });
                 }
                 // DRAINS: mouths in the deck feeding pipes that run under it
-                let mut drain = |shapes: &mut Vec<Shape>, grav: &mut Vec<GravNode>, flows: &mut Vec<Flow>, from: Vec3, to: Vec3, r: f32| {
+                let drain = |shapes: &mut Vec<Shape>, grav: &mut Vec<GravNode>, flows: &mut Vec<Flow>, from: Vec3, to: Vec3, r: f32| {
                     for (p, dir) in [(from, Vec3::NEG_Y), (to, Vec3::Y)] {
                         for t in 0..5 {
                             let ci = push(shapes, M_SPHERE, p + dir * (t as f32 * 0.6), Quat::IDENTITY, Vec3::splat(r), Sdf::Sphere { r }, [0.0; 4], 0.0, 0.0);
@@ -4752,7 +4752,7 @@ impl World {
         }
         let (mut b0, mut b1): (Option<(f32, usize)>, Option<(f32, usize)>) = (None, None);
         {
-            let mut consider = |i: usize, b0: &mut Option<(f32, usize)>, b1: &mut Option<(f32, usize)>| {
+            let consider = |i: usize, b0: &mut Option<(f32, usize)>, b1: &mut Option<(f32, usize)>| {
                 let d = self.grav[i].pos.distance(p);
                 if b0.map_or(true, |(bd, _)| d < bd) {
                     *b1 = *b0;

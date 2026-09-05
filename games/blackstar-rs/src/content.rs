@@ -36,6 +36,16 @@ pub struct Chassis {
     /// camera's sweep in `camera::Camera::start_cinematic`
     pub fold_spin: f32,
     pub bulk: f32,
+    /// UNUSED (c15unified, checked rather than guessed): `bulk`/`arm`/`leg`
+    /// all feed `skirmish::fighter`'s stat formula (`hp = 90*bulk + 30*arm`,
+    /// `speed = 7*move_mul*leg`) — the only consumer of chassis proportions
+    /// found anywhere in this crate (abstract campaign/NPC combat math, not
+    /// live visual model scaling — grepped main.rs for any body-scaling use
+    /// of these four fields; none exists either). `height` alone has no
+    /// term in that formula or anywhere else. Not inventing one: whether
+    /// height should trade into evasion, hitbox size, reach, or nothing at
+    /// all is a real balance call, not a wiring gap with one obvious answer
+    /// the way `Arena.note`/`Commander.desc` were.
     pub height: f32,
     pub arm: f32,
     pub leg: f32,
@@ -227,6 +237,67 @@ mod tests {
     /// mission, is a vendor with a backstory — Destiny's three legends standing
     /// in the Tower while the player did the work. If a name is worth putting
     /// in a cutscene slide, it should appear ON SCREEN somewhere in the saga.
+    /// `Commander.desc` — five real, hand-written doctrine lines ("presses
+    /// relentlessly; concentrates on the player and rarely yields ground")
+    /// — had no consumer anywhere in the codebase: `campaign::foe_doctrine`
+    /// picks a live commander id per mission and `skirmish`/`brain` read
+    /// its numeric dials, but nothing ever read what it actually SAYS about
+    /// how that doctrine fights. `main.rs::begin_sortie` — the moment a
+    /// mission is accepted — is the fix.
+    #[test]
+    fn every_commander_has_real_doctrine_text_and_a_sortie_actually_shows_it() {
+        for c in super::COMMANDERS {
+            assert!(c.desc.len() > 15, "{} has a placeholder-length desc: {:?}", c.id, c.desc);
+            assert!(c.desc.chars().any(|c| c == ' '), "{} desc isn't prose: {:?}", c.id, c.desc);
+        }
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains(r#""{chapter}sortie accepted — {} over {} — {foe}""#),
+            "begin_sortie's toast no longer shows the foe commander's doctrine text"
+        );
+    }
+
+    /// `Film.title`/`.subtitle` — every one of the story's films (chapters)
+    /// has both, real authored names -- and neither had any UI consumer:
+    /// `campaign.rs` tracks which film a mission belongs to for progression
+    /// logic, but nothing ever announced a chapter to the player.
+    /// `main.rs::begin_sortie` now prepends the film's title/subtitle to its
+    /// toast, but ONLY on that film's first mission (checked via
+    /// `missions_of`, not a stored flag) -- announcing it on every mission
+    /// of a multi-mission film would just be repetitive chrome, the same
+    /// judgment call `patrol::tick_patrol` made about its combat-event half.
+    #[test]
+    fn every_film_has_real_titles_and_only_its_opening_mission_announces_it() {
+        for f in super::FILMS {
+            assert!(!f.title.is_empty(), "film {} has no title", f.n);
+            assert!(!f.subtitle.is_empty(), "film {} has no subtitle", f.n);
+        }
+        // the actual "only the opening mission" logic, mirrored here rather
+        // than re-run through main.rs (which needs a live Game to call
+        // begin_sortie on) -- if this ever disagrees with main.rs's own
+        // check, that's a real bug this test exists to catch.
+        for f in super::FILMS {
+            let ms: Vec<_> = super::missions_of(f.n).collect();
+            if ms.len() < 2 {
+                continue; // nothing to distinguish "opening" from
+            }
+            assert_ne!(
+                ms[0].id, ms[1].id,
+                "film {} has a duplicate opening mission id, which would break the first-mission check",
+                f.n
+            );
+        }
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("let is_films_first_mission = content::missions_of(s.mission.film)"),
+            "begin_sortie no longer gates the chapter announcement on the film's opening mission"
+        );
+        assert!(
+            src.contains("content::film(s.mission.film).map(|f| format!(\"{} — {} — \", f.title, f.subtitle))"),
+            "begin_sortie no longer builds the chapter announcement from Film's title/subtitle"
+        );
+    }
+
     #[test]
     fn every_character_the_prose_names_is_present_somewhere() {
         let on_screen: std::collections::HashSet<&str> = MISSIONS
@@ -308,6 +379,33 @@ mod tests {
         }
     }
 
+    /// Same property as `every_troop_id_is_unique` below, for the catalog
+    /// troops/loadouts pick a chassis from: `chassis(id)` does the same
+    /// `.find(|c| c.id == id)` lookup, so a duplicate id would silently
+    /// shadow one chassis behind another rather than error. Only 7 entries
+    /// today, small enough a duplicate is unlikely to slip in unnoticed --
+    /// added for the same reason the others were, not because this one
+    /// looked suspicious.
+    #[test]
+    fn every_chassis_id_is_unique() {
+        let ids: std::collections::BTreeSet<_> = CHASSIS.iter().map(|c| c.id).collect();
+        assert_eq!(ids.len(), CHASSIS.len(), "CHASSIS has a duplicate id -- one chassis is unreachable by lookup");
+    }
+
+    /// Same property `stations.rs` checks for `STATIONS`, added there this
+    /// session: `troop(id)` (used by `skirmish::fighter` to build every NPC
+    /// combatant, campaign or raid) does `TROOPS.iter().find(|t| t.id ==
+    /// id)`, so a duplicate id doesn't error -- it just makes the SECOND
+    /// troop with that id permanently unreachable, silently using the
+    /// first one's stats instead. 33 entries is past the point a duplicate
+    /// would be obvious on a read-through, unlike the 5-13-entry catalogs
+    /// (`ELEMENTS`, `VERBS`) checked elsewhere this session.
+    #[test]
+    fn every_troop_id_is_unique() {
+        let ids: std::collections::BTreeSet<_> = TROOPS.iter().map(|t| t.id).collect();
+        assert_eq!(ids.len(), TROOPS.len(), "TROOPS has a duplicate id -- one troop is unreachable by lookup");
+    }
+
     use super::*;
     use crate::patrol;
 
@@ -325,6 +423,22 @@ mod tests {
         }
         for (i, t) in TROOPS.iter().enumerate() {
             assert!(TROOPS.iter().skip(i + 1).all(|o| o.id != t.id), "duplicate troop {}", t.id);
+        }
+        // COMMANDERS and SIGNATURES were missing from this check -- both are
+        // looked up by id the same way CHASSIS/TROOPS are (commander(id),
+        // signature(id), both a plain .find() that would silently return
+        // the FIRST of two same-id entries and hide the second forever).
+        for (i, c) in COMMANDERS.iter().enumerate() {
+            assert!(COMMANDERS.iter().skip(i + 1).all(|o| o.id != c.id), "duplicate commander {}", c.id);
+        }
+        for (i, s) in SIGNATURES.iter().enumerate() {
+            assert!(SIGNATURES.iter().skip(i + 1).all(|o| o.id != s.id), "duplicate signature {}", s.id);
+        }
+        for (i, a) in ABILITIES.iter().enumerate() {
+            assert!(ABILITIES.iter().skip(i + 1).all(|o| o.id != a.id), "duplicate ability {}", a.id);
+        }
+        for (i, r) in HUB.iter().enumerate() {
+            assert!(HUB.iter().skip(i + 1).all(|o| o.id != r.id), "duplicate room {}", r.id);
         }
     }
 

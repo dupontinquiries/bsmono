@@ -210,6 +210,16 @@ mod tests {
         CampaignLog::from_line(&ids.join(","))
     }
 
+    /// Same shape as content.rs/raidcon.rs/ship.rs's id-uniqueness guards:
+    /// `casting::entry`/lookups by id are a plain `.find()`, which would
+    /// silently return the first of two same-id `Castable` entries.
+    #[test]
+    fn castable_ids_are_unique() {
+        for (i, c) in CASTABLE.iter().enumerate() {
+            assert!(CASTABLE.iter().skip(i + 1).all(|o| o.id != c.id), "duplicate castable {}", c.id);
+        }
+    }
+
     #[test]
     fn a_forged_raid_cannot_pre_empt_a_reveal() {
         // The failure that matters most: infinite content running ahead of

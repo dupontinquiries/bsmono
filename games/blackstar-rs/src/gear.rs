@@ -572,6 +572,38 @@ pub fn weapon_item(spec: &WeaponSpec) -> Item {
 mod tests {
     use super::*;
 
+    /// Same guard shape as `weapons.rs`'s
+    /// `every_non_none_element_is_in_elements_exactly_once` and `input.rs`'s
+    /// `every_action_variant_is_in_the_actions_list_exactly_once`: `VERBS`'s
+    /// length is compiler-checked (`[Verb; 13]`), but nothing stops a
+    /// duplicate entry from silently standing in for a real omission at the
+    /// same count. Higher stakes here than most: `VERBS` is what
+    /// `Item::parse` uses to turn a saved weapon's verb name back into a
+    /// `Verb` (`code()`'s inverse) -- an omitted variant wouldn't fail
+    /// loudly, it would make any saved weapon using that verb silently fail
+    /// to parse and vanish from the player's loadout on load.
+    #[test]
+    fn every_verb_variant_is_in_verbs_exactly_once() {
+        let src = include_str!("weapons.rs");
+        let decl = src
+            .split("pub enum Verb {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the Verb enum");
+        let variants: Vec<&str> = decl
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+            .filter_map(|l| l.strip_suffix(','))
+            .collect();
+        assert!(variants.len() >= 10, "only found {} variants; the scan broke", variants.len());
+        assert_eq!(variants.len(), VERBS.len(), "Verb enum and VERBS have different lengths");
+        for v in &variants {
+            let count = VERBS.iter().filter(|x| format!("{x:?}") == *v).count();
+            assert_eq!(count, 1, "Verb::{v} appears {count} times in VERBS, not exactly once");
+        }
+    }
+
     #[test]
     fn a_weapon_with_no_element_round_trips() {
         // Element::None is deliberately absent from weapons::ELEMENTS

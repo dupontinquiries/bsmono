@@ -8,6 +8,48 @@ Build/test baseline throughout: `cargo check`/`cargo test --bin skydribble`
 under `--no-default-features`, `--features audio`, and default. 1256 tests
 throughout. Warning count started at 335 (pre-existing, unrelated to this
 session) and sits at 337 as of the last tooling addition — the +2 are
+
+**Warning-count baseline is stale (c15unified session).** Actual count under
+`--no-default-features` today: **512**, not 337. Broken down by category,
+it's overwhelmingly genuine dead code — 134 unused functions, 69 unused
+constants, 53 never-constructed structs, 40 unused methods, 25 never-read
+fields, 23 unused enums, plus smaller categories — not lint-version noise (a
+newer rustc surfacing warnings an older one didn't); those exist too
+(`mismatched_lifetime_syntaxes` appears once) but don't explain a jump this
+size. **Not attempting a fix**: 175+ warnings accumulated across however many
+commits since 337 was recorded, with no bisection done to find where, and
+this codebase explicitly keeps some code deliberately unwired on purpose
+(`suitability.rs` is named elsewhere in this file as exactly that case) — a
+blanket dead-code sweep risks deleting scaffolding meant to stay. Checked
+specifically whether any of it touches raid/campaign/boss/tread work (this
+session's actual focus): it does not — grepped the warning list for those
+names, zero matches, so campaign.rs/raidcon.rs/raidgen.rs/raidflow.rs/
+raidrun.rs/raidlog.rs/raidforge.rs are warning-clean. Recording the real
+number here so the next session doesn't cite 337 as current; a real cleanup
+pass would want git-blame/bisection to separate "abandoned" from
+"intentionally staged for later," which is a different, bigger task than
+this note.
+
+**Follow-up, same session**: ran `cargo fix --allow-dirty` under all three
+configs — genuinely safe here, since it only applies rustc's own mechanical
+suggestions (drop an unnecessary `mut`, prefix an unused var/param with `_`,
+one explicit lifetime elision) and never deletes a function, struct, or
+field. Reviewed the full diff by hand before trusting it: every change is
+exactly that category, nothing structural. 512 → 490. Full 1592-test suite
+still green on all three configs after. The remaining ~490 are the dead-code
+category (unused functions/structs/constants/fields) cargo fix correctly
+leaves alone — that's the real cleanup, and it's the bisection-first job
+described above, not a `cargo fix` job.
+
+**Re-verified live, this session (c15unified)**: all three configs actually
+built and ran in this sandbox, not just checked for compile errors — 1591/1591
+passing on every one of `--no-default-features`, `--features audio`, and
+default (grown from 1256 across whatever landed between then and now). The
+audio/default builds needed `libasound2-dev`, not present here initially;
+apt's fetch of it failed until an unrelated dead `nodesource.sources` repo
+entry (expired signing key, `deb.nodesource.com` returning 403) was moved
+aside so `apt-get update` could complete at all. Sandbox-environment issue,
+not a code one — recorded here in case the next session hits the same wall.
 `align::diagnose`/`diagnose_unmatched`, dev-tool-only functions not called
 from the shipped binary, same category as the pre-existing 335.
 
@@ -42,6 +84,29 @@ started. Read C13 §0 before trusting any visual claim.
     class; and an active trial/lesson banner and the combo readout can
     still coexist at top-centre. Both want the panel migration, not
     another round of hand-retuned literals.
+
+  - **UPDATE (c15unified session): checked both halves separately —
+    one was already fixed, one wasn't.**
+    - The menu hit-test half is DONE, just never noted here. Every one
+      of pause/garage/tweaks/academy/maps now shares one named constant
+      between its draw code and its hit-test code (`TW_ROW_H`,
+      `GARAGE_ROW_H`, `ACADEMY_ROW_H`, `hit_row`/`hit_row_scrolled`) —
+      structurally can't drift apart, unlike the old duplicated-pitch
+      mirrors. Grepped for the old `size * 2.4` literal: zero live
+      references, only comments describing the historical bug.
+    - The banner/combo overlap was real and still live. `trial_banner`/
+      `lesson_banner` occupy y∈[0.66,0.895] x∈[-0.34,0.34]; the combo
+      label/bar sit at y=0.88 / y∈[0.815,0.823], centred at x=0 —
+      inside that box. Not a mode-exclusivity bug (a Do-a-trick lesson
+      reads `self.combo` into its own progress bar, so both are
+      legitimately active at once) — a screen-space one. Fixed with
+      `HudInfo::banner_active` (`self.lesson.is_some() ||
+      self.trial.is_some()`), gating the combo draw. New test
+      `the_combo_readout_is_suppressed_under_a_trial_or_lesson_banner`,
+      same two-part shape (local redraw + call-site source scan) as the
+      existing watermark test, so it can't pass by a flag that exists
+      but nothing wires. 1592/1592 across all three build configs (was
+      1591 — the +1 is this test). NOT verified on an actual screen.
 
 - **Fold cinematics** (`camera.rs`, `sound.rs`, `main.rs::advance_xform`):
   director's-camera mode (`CamMode::Cinematic`) during a fold, arc speed
@@ -701,6 +766,29 @@ answer:
 the ship-level travel state machine (`ship.rs`, 15 tests) — board, plot a
 course, cruise, descend, arrive.
 
+**UPDATE (c15unified session) — "tested" does not mean "wired," and this
+one wasn't, more completely than this note implied.** Went looking at
+`ship.rs::Hull.transforms` after a dead-field compiler warning, expecting
+another quick single-call-site fix like the arena/destination/commander
+ones this session already found. It wasn't: `Hull::fold_sec()` and
+`Ship::launch()` (the methods that actually read `transforms`) are called
+ONLY from `#[cfg(test)]` code — confirmed by grep, both call sites are
+inside `ship.rs`'s own test module. `main.rs` doesn't reference
+`ship::Ship` at all, doesn't call `.launch()`, `.board()`, or anything else
+that would drive one through the state machine this section calls "done."
+The only `ship::` reference anywhere in `main.rs` is the bare enum variant
+`ship::Phase::Cruise`, passed as an argument to `deck::Deck::open` — and
+`main.rs` has its own comment admitting exactly this: "shell has no live
+`ship::Ship` yet." So the 15 tests are real and the state machine they
+cover is real, but "done" should read as "built and unit-tested in
+isolation, with zero integration into the live game" — a meaningfully
+different and smaller claim. Separately, `survival::Envelope`
+(`vacuum_ok`/`flare_tolerance`/`endurance_s` — real survival mechanics,
+not placeholders) is in the same boat: zero references from `main.rs`,
+likely part of the same unbuilt integration rather than a separate gap.
+Not attempting the integration itself — same reasoning as the section
+below: it's the "genuinely new feature" fork, not a bug fix.
+
 **Does not exist at all:** a player-piloted spaceship. Every instance of
 a ship moving through space in this codebase is either a scripted,
 deterministic flyover (`dropship.rs` — its own doc comment: "canned...
@@ -723,6 +811,46 @@ racer control proposals above, not something to improvise blind.
 
 ---
 
+## `--sim planets`: FAIL, and I'm not confident fixing it is even the right move
+
+Ran a full sweep of every `--sim X` harness in `sim.rs` (c15unified) — ~40
+manual, println!-driven PASS/FAIL checks nobody runs as part of `cargo
+test`. Four came back FAIL: `carsdf`, `glb`, `kuiper`, `planets`. The first
+three were genuine verification-tool staleness (a stale numeric
+expectation after a deliberate gravity fix, a wrong atlas stride in a
+hand-rolled decode, a fix-presence check written against code that was
+later superseded by something better) — fixed all three, confirmed against
+production code before touching anything, full detail in their own commits.
+
+`planets` is different, and I stopped rather than force a fourth
+"corrected" number. The check wants a bouncy Kuiper-field planet to, within
+40 simulated seconds: bounce at least 3 times, squash at least 5%, **return
+to perfectly round** (`squash == 0.0`, which is reachable — `physics.rs`
+resets it to exact zero once 1.4s pass with no new impact — not a float-
+precision bug), and still be moving faster than 1 m/s at the end. Actual
+run: 65 bounces in 40s, 38% peak squash, still moving, but never a full
+1.4s gap between bounces, so `squash` never resets and "returns to round"
+reads false.
+
+What I can't resolve confidently: `physics.rs`'s own comment on this same
+mechanic says "planets keep (almost) everything: **the DVD logo never
+stops**." That reads like perpetual, non-settling bouncing is the
+*intended* behavior for a bouncy planet — in which case a test that
+requires eventual settling within a fixed 40s window may be checking for
+something the feature was deliberately built to never fully do, and 65
+bounces without a quiet gap could be entirely correct physics for this
+seed's particular well arrangement, not a bug. Equally plausible: something
+about the current gravity/collision tuning makes bounces land closer
+together than intended, and a healthy planet should have longer gaps. I
+don't have enough design context to tell those apart, and this feels
+exactly like the trap the process note below already names — so it's
+recorded here, unfixed, rather than guessed at a fourth time in the same
+session.
+
+Repro: `cargo run --bin skydribble --no-default-features -- --sim planets`.
+
+---
+
 ## Process notes for whoever continues this
 
 - This session hit the same failure shape three times: guess a numeric
@@ -738,3 +866,10 @@ racer control proposals above, not something to improvise blind.
   session (no GPU here). Everything above is verified by compiling,
   passing tests, and reproducible CLI tool output — real signal, but not
   a substitute for someone actually looking at and playing the game.
+- Same lesson, different session (c15unified): hit this exact shape again
+  fixing `--sim kuiper` — assumed the far field should read 1.0, wrong;
+  assumed 0.0 next, also wrong; the actual answer (0.25, a documented
+  saturating recovery pull) only showed up after adding `eprintln!`s and
+  reading the real number instead of guessing a third time. Left
+  `--sim planets` unfixed for the same reason rather than repeat it once
+  more — see the section directly above.

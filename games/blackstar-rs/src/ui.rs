@@ -455,7 +455,7 @@ pub fn menu_cmds(
 ) -> Vec<Cmd> {
     use crate::menu::Item;
     let a = s.area();
-    let row_h = size * crate::font::CH;
+    let _row_h = size * crate::font::CH;
     // The title's glyphs descend 1.3 * GH * size from its y; starting just
     // under the top edge keeps them clear of the first row, whose rect top
     // is at a.y1 - 2*row_h + 0.85*row_h.

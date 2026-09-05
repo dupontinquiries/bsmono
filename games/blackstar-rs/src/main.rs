@@ -2750,7 +2750,7 @@ impl Game {
                 };
                 let (blue_home, orange_home) = (home_z(-1.0), home_z(1.0));
                 let bp = self.ball.pos;
-                let mut spawn = |team: u8, k: usize, brain: bots::Brain, sel: &mut Self| {
+                let spawn = |team: u8, k: usize, brain: bots::Brain, sel: &mut Self| {
                     let side = if team == bots::TEAM_BLUE { 1.0 } else { -1.0 };
                     // teammates spawn on the real surface too (a raised
                     // deck would otherwise swallow the whole lineup)
@@ -7689,6 +7689,7 @@ impl Game {
             car_rings: self.car_rings,
             goals: self.goals,
             combo: self.combo,
+            banner_active: self.lesson.is_some() || self.trial.is_some(),
             combo_left: (self.combo_t / COMBO_WINDOW).clamp(0.0, 1.0),
             air_t: self.air_t,
             best_air: self.save.best_air,
@@ -8122,6 +8123,13 @@ impl Game {
         self.set_medium_for(d);
         // the console belongs to the ship you just left
         self.close_deck();
+        // `d.note` — "what the archive says about it" per Destination's own
+        // doc comment, "surfaced on arrival" — had no consumer anywhere in
+        // the codebase before this. `line` is the landing-quality readout
+        // (gravity, miss distance, impact speed); this is the one place
+        // both a mechanical result and the place itself are known at once.
+        let line = format!("{line} — {}", d.note);
+        let line = line.as_str();
         // YARD TIME: berthing at a dock squares the hull away — the one
         // release for the wear that LZ-pinned sorties accumulate
         // (`stations::ship_wear`), so the loop closes: fight from open
@@ -8160,7 +8168,34 @@ impl Game {
                 self.load_map(mapsim::style_for(d), dest_seed(d.id));
                 self.set_medium_for(d);
                 self.close_deck();
-                self.toastf(&format!("sortie accepted — {} over {}", s.mission.id, d.name));
+                // `content::Commander.desc` — real, hand-written doctrine
+                // flavour ("presses relentlessly; concentrates on the
+                // player and rarely yields ground") — had no consumer
+                // anywhere in the codebase. `campaign::foe_doctrine(mission)`
+                // already picks which of the five doctrines actually drives
+                // this mission's opposition (`skirmish::Squad::new` reads
+                // it too), so this is real information about the fight the
+                // player is about to walk into, not decoration.
+                let doctrine = campaign::foe_doctrine(s.mission);
+                let foe = content::commander(doctrine).map(|c| c.desc).unwrap_or("");
+                // `content::Film.title`/`.subtitle` — every film (story
+                // chapter) has both, real authored names, and neither had a
+                // UI consumer: campaign.rs tracks which film a mission
+                // belongs to for progression logic, but nothing ever
+                // announced a chapter to the player. Surfaced once, on that
+                // film's OPENING mission only (checked via
+                // `content::missions_of`, not a new stored flag) rather than
+                // on every mission of it, which would just be repetitive
+                // chrome.
+                let is_films_first_mission = content::missions_of(s.mission.film)
+                    .next()
+                    .is_some_and(|first| first.id == s.mission.id);
+                let chapter = if is_films_first_mission {
+                    content::film(s.mission.film).map(|f| format!("{} — {} — ", f.title, f.subtitle)).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                self.toastf(&format!("{chapter}sortie accepted — {} over {} — {foe}", s.mission.id, d.name));
                 self.raid = None; // one flight at a time
                 let mut s = s;
                 s.set_ride_h(self.car.ride_h.max(self.car.half_h));
@@ -8179,7 +8214,13 @@ impl Game {
                 let a = r.arena();
                 self.arena_map(a);
                 self.close_deck();
-                self.toastf(&format!("the signal is answered — {}", r.boss.name));
+                // arena.note is real, authored lore (10 arenas, one line
+                // each — e.g. "the horizon curves the wrong way; every SYNC
+                // ends here") that had zero UI consumer anywhere in the
+                // codebase before this: constructed once in raidcon.rs and
+                // never read again. This is the moment a player is dropped
+                // into that arena, so it's the natural place for it.
+                self.toastf(&format!("the signal is answered — {} — {}", r.boss.name, a.note));
                 self.sortie = None; // one flight at a time
                 self.raid = Some(r);
             }
@@ -8722,7 +8763,7 @@ impl Game {
         // shrinks it — the oldest contact cue there is. Alpha, so the
         // back-to-front sort draws it over the terrain and under the body.
         {
-            let mut blob = |objs: &mut Vec<ObjDraw>, pos: Vec3, r: f32| {
+            let blob = |objs: &mut Vec<ObjDraw>, pos: Vec3, r: f32| {
                 let gy = self.world.ground_h(pos.x, pos.z);
                 let h = (pos.y - gy).max(0.0);
                 let fade = (1.0 - h / 6.0).clamp(0.12, 1.0);
@@ -8752,7 +8793,7 @@ impl Game {
         // hostile rounds pulled toward a hot red so whose it is reads at a
         // glance, the way Destiny keeps enemy fire on its own palette.
         {
-            let mut tracer = |objs: &mut Vec<ObjDraw>, s: &shots::Live, hostile: bool| {
+            let tracer = |objs: &mut Vec<ObjDraw>, s: &shots::Live, hostile: bool| {
                 let v = s.vel;
                 let speed = v.length();
                 if speed < 1.0 {
@@ -9582,11 +9623,28 @@ mod tweak_reach_tests {
         // a menu nothing links to is a page nobody can open; the STORY menu
         // was one keystroke from being exactly that
         let reach = reachable_menus();
-        // 1..=9, not 1..=8. The bound was a literal and adding DEBUG as menu
-        // 9 left it silently unchecked — a reachability test that stops one
-        // short of the newest menu is exactly the menu most likely to be
-        // unreachable, because it is the one just added.
-        for m in 1u8..=9 {
+        // DERIVED, not a hand-maintained literal: this test's own comment
+        // used to warn "1..=9, not 1..=8" -- a literal bound left the newest
+        // menu (DEBUG, 9) unchecked when it was added, which is exactly
+        // backwards, since the newest menu is the one most likely to still
+        // be unreachable. A literal bound can silently go stale the same
+        // way again the next time a menu is added. Scanning menu_title's
+        // own match arms for numeric patterns can't drift from what menus
+        // actually exist, because it reads the same source that defines them.
+        let src = include_str!("main.rs");
+        let body = src
+            .split("fn menu_title(menu: u8) -> &'static str {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("menu_title's body");
+        let mut menus: Vec<u8> = body
+            .lines()
+            .filter_map(|l| l.trim().split_once(" =>"))
+            .filter_map(|(pat, _)| pat.trim().parse::<u8>().ok())
+            .collect();
+        menus.sort_unstable();
+        assert!(menus.len() >= 9, "only found {} numbered menus; the scan broke", menus.len());
+        for m in menus {
             assert!(
                 reach.contains(&m),
                 "settings menu {m} ({}) cannot be reached from the root",

@@ -16,7 +16,6 @@
 //! — what happened, why, and what it means — lives here and feeds the game's
 //! archaeology layer.
 
-use std::collections::HashMap;
 
 /// Metadata for a single film in the saga.
 #[derive(Debug, Clone)]

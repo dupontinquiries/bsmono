@@ -202,3 +202,101 @@ pub fn progress(skill: Skill, ball_speed: f32, height: f32, combo: u32, trick_hi
         Skill::Combo(n) => (combo as f32 / n as f32).clamp(0.0, 1.0),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Ported from blackstar-rs's `--sim academy` (src/sim.rs), a manual
+    // println!-driven harness nobody runs as part of `cargo test`. Same
+    // discipline as `net.rs`'s sim-mp port: real logic, zero automated
+    // coverage before this, only checked when someone remembered to run
+    // the binary by hand. Split into one #[test] per property instead of
+    // one big function, so a future failure names exactly what broke.
+
+    #[test]
+    fn every_lesson_names_a_real_map_and_has_real_text() {
+        assert!(LESSONS.len() >= 8, "only {} lessons", LESSONS.len());
+        for l in LESSONS {
+            assert!(l.hint.len() > 12, "{}'s hint is too short to teach anything: {:?}", l.name, l.hint);
+            assert!(l.nudge.len() > 12, "{}'s nudge is too short to help: {:?}", l.name, l.nudge);
+        }
+        // map is a world::style() index in the actual game; this crate
+        // doesn't depend on blackstar-rs's world.rs, so this test can only
+        // check for the obviously-wrong case (unset/negative-as-huge via
+        // wraparound), not the real STYLE_COUNT bound -- that half of the
+        // original check has to stay in blackstar-rs's own suite, which
+        // depends on both this crate and world.rs and can check it for real.
+        for l in LESSONS {
+            assert!(l.map < 200, "{}'s map index {} looks like it was never set", l.name, l.map);
+        }
+    }
+
+    #[test]
+    fn the_hardest_tricks_are_taught_and_no_lesson_duplicates_another() {
+        let taught: Vec<Trick> = LESSONS
+            .iter()
+            .filter_map(|l| match l.skill {
+                Skill::Do(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(taught.contains(&Trick::FlipReset), "nothing teaches the flip reset");
+        assert!(taught.contains(&Trick::AirDribble), "nothing teaches the air dribble");
+        let mut u = taught.clone();
+        u.sort_by_key(|t| t.name());
+        u.dedup();
+        assert_eq!(u.len(), taught.len(), "two lessons verify the same trick");
+    }
+
+    #[test]
+    fn a_trick_lesson_is_only_passed_when_the_trick_actually_lands() {
+        // progress must come from the detector, not from time passing --
+        // stuffing in a maxed-out speed/height/combo without trick_hit=true
+        // must still read as zero for a Skill::Do lesson.
+        assert_eq!(progress(Skill::Do(Trick::FlipReset), 99.0, 99.0, 99, false), 0.0);
+        assert_eq!(progress(Skill::Do(Trick::FlipReset), 0.0, 0.0, 0, true), 1.0);
+    }
+
+    #[test]
+    fn measured_lessons_scale_linearly_with_the_measurement() {
+        assert!((progress(Skill::BallSpeed(20.0), 10.0, 0.0, 0, false) - 0.5).abs() < 1e-5);
+        assert_eq!(progress(Skill::BallSpeed(20.0), 40.0, 0.0, 0, false), 1.0, "should clamp at 1.0, not overshoot");
+    }
+
+    #[test]
+    fn height_and_combo_lessons_scale_the_same_way_as_ball_speed() {
+        assert!((progress(Skill::Height(20.0), 0.0, 5.0, 0, false) - 0.25).abs() < 1e-5);
+        assert!((progress(Skill::Combo(4), 0.0, 0.0, 2, false) - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn lessons_that_need_the_ball_up_actually_set_it_up() {
+        // the board has to make the trick POSSIBLE, not just theoretically
+        // reachable -- a flip-reset or air-dribble lesson with the ball on
+        // the ground would be asking for something the setup can't deliver.
+        for l in LESSONS.iter().filter(|l| matches!(l.skill, Skill::Do(Trick::FlipReset) | Skill::Do(Trick::AirDribble))) {
+            assert!(l.setup.up > 2.0 || l.setup.vel.y > 2.0, "{} doesn't actually put the ball up", l.name);
+        }
+    }
+
+    #[test]
+    fn passed_tracks_bits_correctly_and_survives_a_save_round_trip() {
+        let mut p = Passed::default();
+        assert_eq!(p.count(), 0, "a fresh Passed should have nothing learned");
+        p.set(0);
+        p.set(7);
+        assert!(p.has(0) && p.has(7) && !p.has(3));
+        let round = Passed::decode(&p.encode());
+        assert!(round.has(0) && round.has(7));
+        assert_eq!(round.count(), 2);
+    }
+
+    #[test]
+    fn a_mangled_passed_string_decodes_as_nothing_learned_rather_than_failing() {
+        // Passed::decode is fed straight from a save file line -- a hand-
+        // edited or corrupted save shouldn't panic or crash progression.
+        let p = Passed::decode("not a number");
+        assert_eq!(p.count(), 0);
+    }
+}

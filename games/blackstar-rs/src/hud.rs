@@ -44,6 +44,16 @@ pub struct HudInfo<'a> {
     pub goals: u64,
     pub combo: u32,
     pub combo_left: f32, // 0..1 fraction of the combo window remaining
+    /// A trial/lesson banner already owns the top-centre band this frame
+    /// (`draw_hud` draws them before calling here). The combo readout sits
+    /// in that same band (label at y=0.88, bar at 0.815..0.823) and a trial
+    /// run legitimately drives combo — Do-tricks lessons read `self.combo`
+    /// straight into their progress formula — so the two are not mutually
+    /// exclusive in-game, only on screen. Suppress the readout rather than
+    /// relocate it: the banner is the thing the player is meant to be
+    /// reading in that moment, and a combo bar sliding underneath it would
+    /// be more distracting than losing the number for a few seconds.
+    pub banner_active: bool,
     pub air_t: f32,
     pub best_air: f32,
     pub fps: f32,
@@ -1309,7 +1319,10 @@ pub fn hud(ui: &mut Vec<UiVert>, info: &HudInfo, world: &World, car: &Car, ball:
     }
 
     // ---- combo banner: below the scoreboard plate, bar below the text ----
-    if info.combo >= 2 && info.combo_left > 0.0 {
+    // Suppressed while a trial/lesson banner owns the same top-centre band
+    // (see HudInfo::banner_active) — both can be legitimately active at
+    // once, only their screen space collides.
+    if info.combo >= 2 && info.combo_left > 0.0 && !info.banner_active {
         let pulse = 0.0060 + 0.0012 * (info.time * 9.0).sin().max(0.0);
         // at max pulse the glyphs descend from 0.88 to 0.8296, above the
         // window bar at 0.815..0.823
@@ -1944,6 +1957,44 @@ mod tests {
         for bad in ["debug_access: true,", "debug_access: false,"] {
             assert!(!m.contains(bad), "debug_access is hardcoded: {bad}");
         }
+    }
+
+    /// The trial/lesson banner and the combo readout both legitimately want
+    /// the top-centre band at once (a Do-a-trick lesson reads `self.combo`
+    /// straight into its own progress bar), so this isn't "can they both be
+    /// active" — they can — it's "do they draw on top of each other." They
+    /// did: `trial_banner` occupies roughly y∈[0.66,0.895], x∈[-0.34,0.34],
+    /// and the combo label/bar sit at y=0.88 / y∈[0.815,0.823], centred at
+    /// x=0 — squarely inside it. `HudInfo::banner_active` is the fix: same
+    /// two-part shape as the watermark test above, a local redraw plus a
+    /// call-site scan, because a flag that exists but nothing reads or sets
+    /// is worse than no flag — it looks fixed.
+    #[test]
+    fn the_combo_readout_is_suppressed_under_a_trial_or_lesson_banner() {
+        let a = 16.0 / 9.0;
+        let draw = |banner_active: bool| -> Vec<UiVert> {
+            let mut v = Vec::new();
+            if 3 >= 2 && 1.0_f32 > 0.0 && !banner_active {
+                let pulse = 0.0060;
+                label_c(&mut v, 0.88, pulse, a, GOLD, &format!("COMBO X{}", 3));
+            }
+            v
+        };
+        assert!(!draw(false).is_empty(), "a bare combo (no banner) drew nothing");
+        assert!(draw(true).is_empty(), "the combo readout drew through a trial/lesson banner");
+
+        // AND THE CALL SITE — the redraw above would pass even if `hud()`
+        // never checked the flag at all.
+        let src = include_str!("hud.rs");
+        assert!(
+            src.contains("info.combo >= 2 && info.combo_left > 0.0 && !info.banner_active"),
+            "hud()'s combo block no longer gates on banner_active"
+        );
+        let m = include_str!("main.rs");
+        assert!(
+            m.contains("banner_active: self.lesson.is_some() || self.trial.is_some(),"),
+            "main.rs no longer feeds banner_active from lesson/trial state"
+        );
     }
 
     #[test]

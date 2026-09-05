@@ -1240,6 +1240,46 @@ If geometry does vanish, the follow-up is `glow::FRONT_AND_BACK` culling
 disabled for the specific meshes at fault rather than reverting wholesale, and
 the vanished ones are then a list of primitives to fix the winding on.
 
+### UPDATE — the experiment ran; a real bug got fixed; the original one is still unconfirmed
+
+Ran the §23 experiment across three follow-on commits (4db4e306, 1455743e,
+da78594d): built `scene-view`, got real screenshots out of Xvfb+llvmpipe
+(non-trivial — see `scene_preview.rs`'s doc comment for why plain
+`import -window root` doesn't work here), A/B'd `CULL_FACE` on vs off with a
+camera pinned via `LOGSCOPE_CAM` so the auto-orbit director couldn't drift
+the two captures apart.
+
+**Culling: nothing vanished.** Same architecture, HUD, decorative elements on
+both sides. None of `mesh3d`'s ~32 hand-built quad sites has backwards
+winding. Culling is unconditional now, per this section's own stated rule.
+
+**But along the way, a different, real, verified bug got found and fixed**:
+heavy rainbow banding across the Atlantis sky/water gradient, isolated by
+bisection to the nacre/thin-film-iridescence term (`LOGSCOPE_NACRE=0` made it
+vanish completely) and root-caused to that term's phase frequency being tuned
+for a small facet (a pearl, a window pane) but applied to `is_water`'s full
+scope (floor, dome, outer walls — tens of world units), so the phase
+completed several full rainbow cycles across one continuous surface. Fixed
+by cutting both phase frequencies ~10x (da78594d).
+
+**Important gap, flagged rather than papered over**: this section's own
+report text says "spiky black wedges and odd shading" — not colour banding,
+not rainbow, not a wash. Neither this session's screenshots nor the
+immediately-prior session's baseline (its own commit's description: "a heavy
+cyan-white wash... over the whole frame") show anything matching "spiky
+black wedges." That phrase is this session's inheritance of the PRIOR
+session's own paraphrase of what it saw, not a re-read of this original
+report — and on going back to check, they don't match. Neither of us has an
+actual copy of the original screenshot to compare against.
+
+So: two real, verified fixes landed (culling made safe+unconditional; a
+genuine rainbow-banding bug found and fixed). Whether either one is THE bug
+originally reported is unconfirmed. If "spiky black wedges" recurs, it's
+still open, and worth looking at with fresh eyes rather than assuming either
+of these fixes touched it — degenerate/near-zero-area triangles (genuinely
+"spiky") or a specific theme/scene state neither session happened to render
+are both still on the table.
+
 
 ## 24. dandere2x blocky artefacts: the merge hard-copies every residual block
 

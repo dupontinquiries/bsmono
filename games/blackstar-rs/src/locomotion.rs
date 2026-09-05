@@ -173,7 +173,7 @@ pub fn decide(wheels: usize, thrusters: usize, legs: usize, skirt: f32, thrust_a
 /// rather than by prim, because prims do not survive upload as separate
 /// vertex groups — a real per-prim pass through `partdetect::classify` is
 /// the named upgrade, and it belongs here when the geometry does.
-pub fn from_cloud(cloud: &[Vec3], up: Vec3, forward: Vec3, half_h: f32) -> Decision {
+pub fn from_cloud(cloud: &[Vec3], up: Vec3, forward: Vec3, _half_h: f32) -> Decision {
     if cloud.len() < 24 {
         return decide(0, 0, 0, 0.0, 0.0);
     }

@@ -586,7 +586,7 @@ fn contain_shift(lo: Vec3, hi: Vec3, elo: Vec3, ehi: Vec3, core_centre: Vec3) ->
     // how far each axis pokes out, in the direction it pokes
     let over_hi = (hi - ehi).max(Vec3::ZERO);
     let over_lo = (elo - lo).max(Vec3::ZERO);
-    let mut shift = over_lo - over_hi;
+    let shift = over_lo - over_hi;
     // Never push a limb THROUGH the body — but the cap has to be the
     // shift that CENTRES it, not `envelope - span`. For any limb WIDER
     // than the envelope that formula is zero, so the pull is clamped

@@ -372,19 +372,30 @@ impl Renderer {
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(t.scene_fbo));
         gl.viewport(0, 0, t.sw, t.sh);
         gl.enable(glow::DEPTH_TEST); gl.depth_func(glow::LESS);
-        // BACK FACES OFF.
+        // BACK FACES OFF. Verified twice, kept behind one switch.
         //
         // `CULL_FACE` was never enabled here. Depth testing gets the ORDER right, but every back
         // face was still rasterised and shaded — doubling fragment work, and (worse) double-
         // blending every closed surface through the BLEND state enabled below, which is a real
         // brightness bug on top of the fragment cost.
         //
-        // Verified unconditional, not left behind a switch: `render-scene.sh`-style A/B capture
-        // (Atlantis, fixed camera, LOGSCOPE_CULL=0 vs default) shows NO geometry vanishing — the
-        // 32 hand-built triangle pushes in `mesh3d` do wind consistently with the parameterised
-        // primitives — and the culled shot is visibly less washed out, consistent with the
-        // double-blend theory. `LOGSCOPE_CULL=0` is kept as a one-line escape hatch for bisecting
-        // a *future* winding regression, but the default now matches every other renderer here.
+        // Verified unconditional-safe by two sessions independently, each with a fixed-camera
+        // A/B (`LOGSCOPE_CULL=0` vs default; one via `render-scene.sh`, one via `scene-view`
+        // under Xvfb/llvmpipe with a pinned `LOGSCOPE_CAM`): NO geometry vanishes or flips —
+        // same columns, same HUD glyphs, same jellyfish, same tether curve — so the ~32
+        // hand-built triangle pushes in `mesh3d` all wind consistently with the parameterised
+        // primitives, and the culled shot is visibly less washed out (the double-blend theory).
+        //
+        // The two sessions then chose differently: one removed the switch, one kept it. Kept —
+        // it costs one env read per frame and turns a *future* "some geometry disappeared"
+        // into one variable instead of a rebuild. The default matches every other renderer.
+        //
+        // NOT this fix: those A/B captures still show heavy rainbow colour banding across the
+        // sky/water gradient on BOTH sides of the A/B — present with or without culling, so a
+        // separate bug (looks like 8-bit-framebuffer/no-dither banding in the gradient shader,
+        // likely worse under llvmpipe, unconfirmed on a real GPU). That is the "colour banding
+        // and blocky wedges" from the original report and is still open; `LOGSCOPE_NACRE=0`
+        // below bisects it to nacre.
         if std::env::var("LOGSCOPE_CULL").as_deref() != Ok("0") {
             gl.enable(glow::CULL_FACE);
             gl.cull_face(glow::BACK);
@@ -433,7 +444,10 @@ impl Renderer {
         gl.uniform_1_f32(loc("u_fog").as_ref(), u.fog);
         gl.uniform_1_f32(loc("u_caustic").as_ref(), u.caustic);
         gl.uniform_3_f32(loc("u_caustic_col").as_ref(), u.caustic_col[0], u.caustic_col[1], u.caustic_col[2]);
-        gl.uniform_1_f32(loc("u_nacre").as_ref(), u.nacre);
+        // diagnostic: LOGSCOPE_NACRE=0 kills the thin-film iridescence term to bisect the reported
+        // rainbow banding on water-tagged surfaces (dome/walls/floor) without touching the shader.
+        let nacre_val = if std::env::var("LOGSCOPE_NACRE").as_deref() == Ok("0") { 0.0 } else { u.nacre };
+        gl.uniform_1_f32(loc("u_nacre").as_ref(), nacre_val);
         // SHADOW MAP → texture unit 2 (units 0,1 hold the material/normal arrays)
         self.sampler(gl, self.scene, "u_shadow", 2, t.shadow_tex);
         gl.uniform_matrix_4_f32_slice(loc("u_light_viewproj").as_ref(), false, &u.light_viewproj);

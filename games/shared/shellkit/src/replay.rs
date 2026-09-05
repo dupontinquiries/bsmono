@@ -222,3 +222,97 @@ pub fn pose_at(frames: &[Frame], t: f32) -> Option<Frame> {
 pub fn length_seconds(frames: &[Frame]) -> f32 {
     (frames.len().max(1) - 1) as f32 / HZ
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Last of the three sim.rs-to-shellkit ports this session (net.rs,
+    // academy.rs, trials.rs, now replay.rs -- the fourth module named in
+    // this crate's own extraction doc comment, "academy/trials/replay
+    // progression tracking"). Ported from blackstar-rs's `--sim replay`;
+    // zero coverage before this, only the manual binary path.
+
+    #[test]
+    fn the_ring_buffer_stays_bounded_and_keeps_the_most_recent_frames() {
+        let mut r = Recorder::default();
+        for k in 0..(60 * 600) {
+            // ten minutes at 60 Hz push rate
+            let x = k as f32 * 0.01;
+            r.push(1.0 / 60.0, Frame { car: Vec3::new(x, 1.0, 0.0), ball: Vec3::new(x, 2.0, 0.0), ..Default::default() });
+        }
+        let f = r.frames();
+        assert_eq!(f.len(), CAP, "buffer should cap at CAP regardless of how long it's fed");
+        // x started near 0 ten minutes ago -- if the buffer kept OLD frames
+        // instead of recent ones, f[0].car.x would still be near zero.
+        assert!(f[0].car.x > 300.0, "buffer kept old frames instead of recent ones: f[0].x={}", f[0].car.x);
+        assert!(f.last().unwrap().car.x > f[0].car.x + 5.0, "frames should still span forward in time");
+        assert!(f.windows(2).all(|w| w[1].car.x >= w[0].car.x), "frames came out of order");
+    }
+
+    #[test]
+    fn the_rarest_trick_leads_the_highlight_name_and_repeats_dont_spam_it() {
+        let mut r = Recorder::default();
+        for _ in 0..50 {
+            r.push(1.0 / 60.0, Frame::default());
+            r.note(Trick::Aerial);
+        }
+        r.note(Trick::FlipReset);
+        r.note(Trick::AirDribble);
+        let (title, score) = r.moment(6.0);
+        assert!(title.starts_with("FLIP RESET"), "the rarest trick should lead the name, got {title:?}");
+        assert!(title.contains("INTO"), "a second trick should still be mentioned, got {title:?}");
+        assert!(score < 30, "50 repeated Aerials shouldn't inflate the score to 50+, got {score}");
+    }
+
+    #[test]
+    fn a_plain_goal_with_no_tricks_is_just_called_a_goal() {
+        let plain = Recorder::default().moment(6.0);
+        assert_eq!(plain.0, "GOAL");
+    }
+
+    #[test]
+    fn stale_tricks_fall_out_of_the_highlight_window() {
+        let mut r = Recorder::default();
+        r.note(Trick::Ceiling);
+        for _ in 0..(8 * 60) {
+            // push enough frames that Ceiling ages out of a 3s window
+            r.push(1.0 / 60.0, Frame::default());
+        }
+        r.note(Trick::Aerial);
+        assert_eq!(r.moment(3.0).0, "AERIAL", "an old trick outside the window shouldn't still be named");
+    }
+
+    fn orbit_frames() -> Vec<Frame> {
+        (0..120)
+            .map(|k| {
+                let x = k as f32 * 0.5;
+                Frame { car: Vec3::new(x, 2.0, 0.0), ball: Vec3::new(x + 4.0, 6.0, 1.0), ..Default::default() }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_highlight_camera_keeps_its_distance_and_actually_moves() {
+        let frames = orbit_frames();
+        let total = length_seconds(&frames);
+        let (e0, f0) = cinema(&frames, 0.0).unwrap();
+        let (e1, f1) = cinema(&frames, total * 0.5).unwrap();
+        let (e2, _) = cinema(&frames, total).unwrap();
+        assert!((e0 - f0).length() > 12.0, "camera started too close to the action");
+        assert!((e1 - f1).length() > 10.0, "camera got too close mid-clip");
+        assert!((e0 - e1).length() > 8.0, "camera should orbit, not sit still (start->mid)");
+        assert!((e1 - e2).length() > 8.0, "camera should orbit, not sit still (mid->end)");
+        assert!((e2 - f1).length() < (e0 - f0).length() + 30.0, "camera should pull in as the moment lands, not drift away");
+    }
+
+    #[test]
+    fn playback_interpolates_between_samples_and_clamps_past_the_end() {
+        let frames = orbit_frames();
+        let total = length_seconds(&frames);
+        let a = pose_at(&frames, 0.0).unwrap().car.x;
+        let b = pose_at(&frames, 1.0 / HZ * 0.5).unwrap().car.x;
+        assert!(b > a && b < a + 0.5, "half a sample-period in should have moved a little, not jumped or stalled");
+        assert!(pose_at(&frames, total * 5.0).is_some(), "playback should clamp to the last frame, not return None past the end");
+    }
+}

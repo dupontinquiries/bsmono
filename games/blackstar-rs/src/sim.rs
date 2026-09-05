@@ -471,7 +471,20 @@ pub fn run(args: &[String]) {
         let atlas = crate::bake_car_sdfs(&mut models);
         let h = models[0].sdf_half;
         let dec = |x: usize, y: usize, z: usize| -> f32 {
-            let i = ((z as u32 * CSDF_H + y as u32) * CSDF_W + x as u32) as usize;
+            // The atlas is a CSDF_TILES x CSDF_TILES grid of models per depth
+            // slab (see bake_car_sdfs / shader.wgsl) -- model 0 sits at tile
+            // (0,0,0), so its own local (x,y,z) needs no tile OFFSET, but the
+            // row/slice STRIDE is still the FULL atlas width/height
+            // (CSDF_W/CSDF_H * CSDF_TILES), not the per-tile size. Using the
+            // per-tile size here (as this line originally did) reads whatever
+            // sits CSDF_TILES-times too close in y and CSDF_TILES-times too
+            // close in x -- mostly padding/other-model data -- which is why
+            // this walk previously measured a synthetic 0.32/0.31/0.64 car as
+            // having negative half-extents.
+            use crate::render::CSDF_TILES;
+            let aw = CSDF_W * CSDF_TILES;
+            let ah = CSDF_H * CSDF_TILES;
+            let i = ((z as u32 * ah + y as u32) * aw + x as u32) as usize;
             (atlas[i] as f32 / 255.0) * 2.4 - 0.6
         };
         // walk out from the centre along each axis: where does solid end?
@@ -2414,7 +2427,7 @@ pub fn run(args: &[String]) {
             let mut touches = 0;
             let mut flip_touches = 0;
             let mut flipping = false;
-            let mut record = |ev: &StepEvents, ball: &Ball, best: &mut Vec3, touches: &mut i32| {
+            let record = |ev: &StepEvents, ball: &Ball, best: &mut Vec3, touches: &mut i32| {
                 if !ev.touches.is_empty() {
                     *touches += 1;
                     *best = ball.vel; // last contact wins: that is separation
@@ -2625,7 +2638,7 @@ pub fn run(args: &[String]) {
                     while firstc < spans.len() && spans[firstc].1 <= t {
                         firstc += 1; // retired: the ray is past it
                     }
-                    for (_, i) in cand.iter() {
+                    for (_, _i) in cand.iter() {
                         old += 1;
                     }
                     for (_, _, i) in spans[firstc..].iter() {
@@ -3608,7 +3621,23 @@ pub fn run(args: &[String]) {
         let gl = world.gravity_field(light.1 + Vec3::Y * light.2 * 0.3).1;
         println!("  heaviest well g={:.2}, lightest g={:.2}", gh, gl);
         check("giants pull harder than dwarfs", gh > gl * 1.5);
-        check("far field relaxes to normal gravity", (world.gravity_field(Vec3::new(900.0, 400.0, 900.0)).1 - 1.0).abs() < 0.01);
+        // Two deliberate regions here, not one flat "far field" -- both
+        // documented in World::gravity_field. Immediately beyond the well
+        // cluster's own edge, ambient is Ambient::Void (0.0): a real void,
+        // so a ship parked just past the edge drifts rather than sinking
+        // toward an invisible floor (gravity.rs's own fix for exactly that
+        // bug). Farther out still (past edge + 60 units), a SEPARATE
+        // soft-boundary recovery pull ramps back in, saturating at 0.25 --
+        // deliberately weak and always inward, so a missed jump doesn't
+        // strand a player forever, but capped well below a real well's pull
+        // so it never reads as "you found a planet". This test's old
+        // expectation (1.0) was stale from before the void fix; the value
+        // I first replaced it with (0.0) forgot the recovery zone exists at
+        // all -- checked with eprintln! before trusting a third guess: the
+        // value is a flat 0.25 at 900, 9000, AND 90000 units out, which is
+        // exactly what a clamped, saturating recovery pull looks like, not
+        // a bug. Confirmed against the source, not assumed.
+        check("far field saturates at the recovery pull, not a floor", (world.gravity_field(Vec3::new(900.0, 400.0, 900.0)).1 - 0.25).abs() < 0.01);
         // 2. gravity points INTO the nearest world, not just down
         let side = heavy.1 + Vec3::X * (heavy.2 * 0.35);
         let d = world.gravity_field(side).0;
@@ -4269,7 +4298,7 @@ pub fn run(args: &[String]) {
                 // floor, so start just below the axis. And enter at PACE:
                 // these lines are ridden, not crawled — several are entered
                 // by launcher and none of them are climbable from a stop.
-                let si0 = 0usize;
+                let _si0 = 0usize;
                 let dir0 = (pts[1] - pts[0]).normalize_or(Vec3::Z);
                 car.pos = pts[0].lerp(pts[1], 0.12) - Vec3::Y * (start_r * 0.45);
                 let dir = dir0;
@@ -5671,10 +5700,24 @@ pub fn run(args: &[String]) {
             let src = include_str!("render.rs");
             let double_sided = src.contains("cull_mode: None,\n                front_face");
             let ldr = include_str!("model.rs");
-            let scrubs = ldr.contains("cross(c - a).length_squared() < 1e-20");
-            let p99 = ldr.contains("half_p99_raw");
+            // STALE (c15unified, at time of this check): these two used to
+            // check for the exact fix strings from when degenerate-triangle
+            // dropping and p99-percentile hitbox sizing first landed. Both
+            // read false today, but not from a regression -- model.rs's own
+            // comment right above where these now live ("MEASURE THE MASS,
+            // not every stray vertex") explains that both were SUPERSEDED by
+            // massfilter::classify/massfilter::bounds, a purpose-built
+            // module that classifies which primitives are a model's real
+            // mass vs. stray debris, replacing the plain percentile cutoff
+            // with something more deliberate. Confirmed the replacement
+            // actually does the same job before updating this check, not
+            // assumed from the comment alone: `bounds_from_extent` (the old
+            // path) is now only the fallback when massfilter::bounds returns
+            // None, i.e. still reachable, just no longer the primary path.
+            let scrubs = ldr.contains("massfilter::classify");
+            let p99 = ldr.contains("massfilter::bounds");
             println!(
-                "   car pipeline draws both sides: {}, loader drops degenerates: {}, hitbox uses p99: {}",
+                "   car pipeline draws both sides: {}, loader classifies debris (massfilter::classify): {}, hitbox uses mass bounds (massfilter::bounds): {}",
                 double_sided, scrubs, p99
             );
             ok_all &= double_sided && scrubs && p99;
@@ -7184,7 +7227,7 @@ pub fn run(args: &[String]) {
         // press-to-liftoff latency across surfaces and timings: the ground
         // jump must be as instant as the flip
         let cfg = Config::default();
-        let mut row = |label: &str, style_i: usize, presses: &[f32], drive: f32| {
+        let row = |label: &str, style_i: usize, presses: &[f32], drive: f32| {
             let world = World::generate(31, crate::world::style(style_i), 0.31, 1.0);
             let mut worst = 0.0f32;
             let mut fails = 0;

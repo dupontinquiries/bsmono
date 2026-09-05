@@ -627,6 +627,36 @@ pub fn unbound(b: &Bindings) -> Vec<Action> {
 mod clash_tests {
     use super::*;
 
+    /// Guard against the exact bug class `[Action; 30]`'s length check can't
+    /// catch on its own: the array's SIZE is compiler-verified, but nothing
+    /// stops a copy-paste duplicate (two `Action::Jump` entries) silently
+    /// standing in for a real omission (no `Action::SiegeMode` anywhere) —
+    /// same count, same type, one action quietly unreachable from the Binds
+    /// menu forever. Same shape as `save.rs`'s
+    /// `the_round_trip_test_covers_every_field`: scan this file's own
+    /// source for the enum's declared variants, compare against `ACTIONS`.
+    #[test]
+    fn every_action_variant_is_in_the_actions_list_exactly_once() {
+        let src = include_str!("input.rs");
+        let decl = src
+            .split("pub enum Action {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the Action enum");
+        let variants: Vec<&str> = decl
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+            .filter_map(|l| l.strip_suffix(','))
+            .collect();
+        assert!(variants.len() >= 25, "only found {} variants; the scan broke", variants.len());
+        assert_eq!(variants.len(), ACTIONS.len(), "Action enum and ACTIONS have different lengths");
+        for v in &variants {
+            let count = ACTIONS.iter().filter(|a| format!("{a:?}") == *v).count();
+            assert_eq!(count, 1, "Action::{v} appears {count} times in ACTIONS, not exactly once");
+        }
+    }
+
     /// Print the shipped scheme's conflicts, so the report is the test's
     /// failure message rather than something to go and run separately.
     fn report(b: &Bindings) -> String {
@@ -756,7 +786,11 @@ pub fn run(argv: &[String]) {
     if !un.is_empty() {
         let names: Vec<String> = un.iter().map(|a| format!("{a:?}")).collect();
         println!("\n  {} unbound: {}", un.len(), names.join(", "));
-        println!("    (RollL is deliberately unbound; the rest are worth a look)");
+        println!(
+            "    (RollL and Car1/2/3 are deliberately unbound -- see default_scheme()'s own \
+             comments: RollL is a real open choice worth a second look, Car1/2/3 aren't -- \
+             1-9 drive the hotbar now, they're legacy actions kept rebindable, not a gap)"
+        );
     }
     println!("\n  --keys defaults  to compare against the shipped scheme");
 }

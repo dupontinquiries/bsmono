@@ -2,6 +2,10 @@
 #include <math.h>
 #include <string.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 /* neutral default -- an un-styled body; the game overwrites this per-entity */
 ex_body_style_t ex_active_body_style = { 1.0f, 1.0f, 0.0f, 0.0f, 0.5f, 0.0f, 0.4f, 1.0f };
 

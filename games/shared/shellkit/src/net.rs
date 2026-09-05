@@ -613,3 +613,299 @@ impl Net {
         self.status.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal peer at a given position, ready for `smooth()`. `last` is
+    /// `Instant::now()` at construction, so calling `smooth` immediately
+    /// after leaves dead-reckoning's `elapsed()` term at ~0 — this isolates
+    /// the exponential-smoothing half of the function from the dead-
+    /// reckoning half, which needs real wall-clock time to test instead.
+    fn peer_at(pos: Vec3, shown: Vec3) -> PeerCar {
+        PeerCar {
+            name: "peer".into(),
+            car: 0,
+            flip: false,
+            boosting: false,
+            pos,
+            vel: Vec3::ZERO,
+            rot: Quat::IDENTITY,
+            wheel_spin: 0.0,
+            steer_vis: 0.0,
+            shown,
+            last: Instant::now(),
+        }
+    }
+
+    fn net_with_peer(p: PeerCar) -> Net {
+        let mut n = Net::new();
+        n.peers[0] = Some(p);
+        n
+    }
+
+    #[test]
+    fn smoothing_pulls_shown_toward_target_at_the_documented_rate() {
+        // k = (dt * 14.0).min(1.0) is the function's own formula -- this
+        // test would catch a change to either the 14.0 rate or the min(1.0)
+        // clamp, not just "did shown move at all". Distance chosen so the
+        // REMAINING gap after one smoothing step stays under the function's
+        // own 6.0 snap threshold (2.0 * (1 - 0.28) = 1.44) -- a bigger gap
+        // reads as "just teleported" and snaps instead of smoothing, which
+        // is a different behavior this test isn't the one to cover.
+        let mut n = net_with_peer(peer_at(Vec3::new(2.0, 0.0, 0.0), Vec3::ZERO));
+        let dt = 0.02; // k = 0.28
+        n.smooth(dt);
+        let shown = n.peers[0].as_ref().unwrap().shown;
+        let k = (dt * 14.0f32).min(1.0);
+        let expected = Vec3::ZERO + (Vec3::new(2.0, 0.0, 0.0) - Vec3::ZERO) * k;
+        assert!((shown - expected).length() < 1e-4, "shown={shown:?} expected={expected:?}");
+    }
+
+    #[test]
+    fn a_large_dt_clamps_the_smoothing_rate_to_one_not_beyond() {
+        // (dt * 14.0).min(1.0): a dropped-frame-sized dt (e.g. 1.0s) must
+        // not overshoot target, which an unclamped k > 1.0 would do.
+        let mut n = net_with_peer(peer_at(Vec3::new(1.0, 0.0, 0.0), Vec3::ZERO));
+        n.smooth(1.0);
+        let shown = n.peers[0].as_ref().unwrap().shown;
+        assert!((shown - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-4, "overshot or undershot: {shown:?}");
+    }
+
+    #[test]
+    fn a_target_more_than_six_units_away_snaps_instead_of_creeping() {
+        // the function's own anti-rubber-band clause: a peer that jumped
+        // (a respawn, a fold, a network hiccup catching up) should not be
+        // seen crawling across the map at the smoothing rate.
+        let mut n = net_with_peer(peer_at(Vec3::new(50.0, 0.0, 0.0), Vec3::ZERO));
+        n.smooth(0.016);
+        let shown = n.peers[0].as_ref().unwrap().shown;
+        assert_eq!(shown, Vec3::new(50.0, 0.0, 0.0), "should have snapped, not smoothed: {shown:?}");
+    }
+
+    #[test]
+    fn a_target_just_under_six_units_still_smooths() {
+        // the boundary case right next to the snap test above: close
+        // enough that even a slow dt's small step should stay under 6.0
+        // rather than tripping the snap.
+        let mut n = net_with_peer(peer_at(Vec3::new(5.9, 0.0, 0.0), Vec3::ZERO));
+        n.smooth(0.016);
+        let shown = n.peers[0].as_ref().unwrap().shown;
+        assert!(shown.x > 0.0 && shown.x < 5.9, "should have smoothed partway, not snapped: {shown:?}");
+    }
+
+    #[test]
+    fn player_count_is_one_plus_live_peers_not_slot_count() {
+        // MAX_PLAYERS slots exist regardless of how many are filled --
+        // player_count must read occupancy, not Vec length.
+        let mut n = Net::new();
+        assert_eq!(n.player_count(), 1, "just the local player, no peers yet");
+        n.peers[0] = Some(peer_at(Vec3::ZERO, Vec3::ZERO));
+        n.peers[3] = Some(peer_at(Vec3::ZERO, Vec3::ZERO));
+        assert_eq!(n.player_count(), 3, "local + 2 filled slots, not MAX_PLAYERS");
+    }
+
+    #[test]
+    fn peers_iterator_skips_empty_slots() {
+        let mut n = Net::new();
+        n.peers[2] = Some(peer_at(Vec3::new(7.0, 0.0, 0.0), Vec3::ZERO));
+        let positions: Vec<Vec3> = n.peers().map(|p| p.pos).collect();
+        assert_eq!(positions, vec![Vec3::new(7.0, 0.0, 0.0)], "empty slots should not appear");
+    }
+
+    // ---- wire protocol: encode/decode round trips and malformed input ----
+    //
+    // Every real call site into get_v3/get_q/get_f/get_state/get_str already
+    // guards buffer length before calling (checked by hand, not assumed:
+    // MSG_WELCOME/MSG_BALL check `b.len() >=` explicitly, MSG_STATE/MSG_PEERS
+    // go through get_state's own internal length check first) -- so there's
+    // no live panic-on-truncated-packet bug today. These tests exist to keep
+    // it that way: a future message type that skips the length check before
+    // calling get_v3/get_f directly would panic on a short/malicious UDP
+    // packet, and nothing else in this file would catch that regression.
+
+    #[test]
+    fn v3_and_quat_round_trip_through_the_wire_format() {
+        let mut b = Vec::new();
+        let v = Vec3::new(1.5, -2.25, 100.0);
+        let q = Quat::from_xyzw(0.1, 0.2, 0.3, 0.9).normalize();
+        put_v3(&mut b, v);
+        put_q(&mut b, q);
+        let mut o = 0;
+        assert_eq!(get_v3(&b, &mut o), v);
+        let got_q = get_q(&b, &mut o);
+        assert!((got_q.x - q.x).abs() < 1e-5 && (got_q.w - q.w).abs() < 1e-5, "got={got_q:?} want={q:?}");
+        assert_eq!(o, b.len(), "offset should land exactly on the end after reading everything written");
+    }
+
+    #[test]
+    fn a_near_zero_quat_decodes_to_identity_rather_than_nan() {
+        // get_q's own defensive branch: normalizing a (0,0,0,0) quaternion
+        // divides by zero and produces NaN, which would then corrupt a
+        // peer's rotation and everything downstream of it (rendering,
+        // collision) for the rest of the match. Confirms the guard fires
+        // rather than assuming the comment describing it is still true.
+        let mut b = Vec::new();
+        put_q(&mut b, Quat::from_xyzw(0.0, 0.0, 0.0, 0.0));
+        let mut o = 0;
+        let q = get_q(&b, &mut o);
+        assert_eq!(q, Quat::IDENTITY);
+        assert!(!q.x.is_nan() && !q.w.is_nan());
+    }
+
+    #[test]
+    fn state_round_trips_position_velocity_rotation_and_flags() {
+        let mut b = Vec::new();
+        let s = MyState {
+            car: 3,
+            flip: true,
+            boosting: false,
+            pos: Vec3::new(10.0, 0.0, -5.0),
+            vel: Vec3::new(0.0, 9.8, 0.0),
+            rot: Quat::IDENTITY,
+            wheel_spin: 1.25,
+            steer_vis: -0.5,
+        };
+        put_state(&mut b, 4, &s);
+        let mut o = 0;
+        let ws = get_state(&b, &mut o).expect("a full buffer should decode");
+        assert_eq!(ws.slot, 4);
+        assert_eq!(ws.car, 3);
+        assert!(ws.flip && !ws.boosting);
+        assert_eq!(ws.pos, s.pos);
+        assert_eq!(ws.vel, s.vel);
+        assert_eq!(ws.wheel_spin, s.wheel_spin);
+        assert_eq!(ws.steer_vis, s.steer_vis);
+        assert_eq!(o, STATE_BYTES, "get_state should consume exactly what put_state wrote");
+    }
+
+    #[test]
+    fn state_clamps_an_out_of_range_car_index_from_the_wire() {
+        // car is a plain u8 on the wire -- a peer running a build with more
+        // car models (or a corrupted packet) could send an index this
+        // build's own car list can't hold. get_state's own `.min(8)` is the
+        // only thing standing between that and an out-of-bounds car lookup
+        // somewhere downstream.
+        let mut b = Vec::new();
+        let s = MyState {
+            car: 250,
+            flip: false,
+            boosting: false,
+            pos: Vec3::ZERO,
+            vel: Vec3::ZERO,
+            rot: Quat::IDENTITY,
+            wheel_spin: 0.0,
+            steer_vis: 0.0,
+        };
+        put_state(&mut b, 0, &s);
+        let mut o = 0;
+        let ws = get_state(&b, &mut o).unwrap();
+        assert_eq!(ws.car, 8, "an out-of-range wire car index should clamp, not pass through raw");
+    }
+
+    #[test]
+    fn get_state_refuses_a_truncated_buffer_instead_of_panicking() {
+        let mut b = Vec::new();
+        put_state(&mut b, 0, &MyState {
+            car: 0, flip: false, boosting: false,
+            pos: Vec3::ZERO, vel: Vec3::ZERO, rot: Quat::IDENTITY,
+            wheel_spin: 0.0, steer_vis: 0.0,
+        });
+        b.truncate(b.len() - 1); // one byte short of a full state record
+        let mut o = 0;
+        assert!(get_state(&b, &mut o).is_none(), "a short buffer must return None, not panic");
+    }
+
+    #[test]
+    fn string_round_trips_and_truncates_at_24_bytes() {
+        let mut b = Vec::new();
+        put_str(&mut b, "PILOT");
+        let mut o = 0;
+        assert_eq!(get_str(&b, &mut o).as_deref(), Some("PILOT"));
+
+        let mut b2 = Vec::new();
+        let long = "A".repeat(40);
+        put_str(&mut b2, &long);
+        let mut o2 = 0;
+        let got = get_str(&b2, &mut o2).unwrap();
+        assert_eq!(got.len(), 24, "put_str's own truncation limit should have applied on encode");
+    }
+
+    #[test]
+    fn get_str_refuses_a_length_prefix_longer_than_the_buffer() {
+        // a hand-built/malicious packet could claim a 20-byte name while
+        // only supplying 3 bytes after the length prefix.
+        let b = vec![20u8, b'h', b'i', b'!'];
+        let mut o = 0;
+        assert!(get_str(&b, &mut o).is_none(), "should refuse rather than read past the buffer");
+    }
+
+    /// END-TO-END, REAL SOCKETS: two full `Net` stacks in one process share
+    /// a temp `FileStore` (the same control plane `host()`/`join()` use in
+    /// production, just pointed at a test-local path) and run the actual
+    /// UDP data plane on loopback -- real `host_with`/`join_with`, real
+    /// `tick()`, real HELLO/WELCOME/STATE wire traffic, not a mock.
+    ///
+    /// This is the automated form of `blackstar-rs`'s own `--sim mp` sim
+    /// harness (`src/sim.rs`, `if name == "mp"`), which already proved this
+    /// path works (confirmed by running it: "MP LOOPBACK: PASS") but only as
+    /// a manual, println!-driven binary nobody runs by accident -- a
+    /// regression here would sit unnoticed until someone remembered to run
+    /// it by hand. This is that same proof, as a real `assert!` in `cargo
+    /// test`. Kept the loop far shorter (steps-based, not the sim's 3
+    /// wall-clock seconds of `thread::sleep`) since correctness doesn't need
+    /// real-time pacing, only enough ticks for HELLO to reach the host and
+    /// WELCOME/STATE to come back.
+    #[test]
+    fn host_and_join_actually_sync_over_real_loopback_udp() {
+        let store = std::env::temp_dir().join(format!(
+            "shellkit-net-test-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos() // unique across parallel test threads
+        ));
+        let _ = std::fs::remove_dir_all(&store);
+        let mut a = Net::new();
+        let mut b = Net::new();
+        let host_status = a.host_with("ALICE", store.clone());
+        assert!(host_status.starts_with("HOSTING"), "host_with failed: {host_status}");
+        let join_status = b.join_with("BOB", "ALICE", store.clone());
+        assert!(join_status.starts_with("JOINED"), "join_with failed: {join_status}");
+
+        let mut events = Vec::new();
+        let mk = |x: f32| MyState {
+            car: 0,
+            flip: false,
+            boosting: false,
+            pos: Vec3::new(x, 1.0, 0.0),
+            vel: Vec3::ZERO,
+            rot: Quat::IDENTITY,
+            wheel_spin: 0.0,
+            steer_vis: 0.0,
+        };
+        let mut joined = (false, false); // (host saw BOB, client saw HOST)
+        for _ in 0..800 {
+            a.tick(0.016, &mk(-4.0), Vec3::ZERO, Vec3::ZERO, Quat::IDENTITY, 20, 9, &mut events);
+            b.tick(0.016, &mk(4.0), Vec3::ZERO, Vec3::ZERO, Quat::IDENTITY, 20, 9, &mut events);
+            for e in events.drain(..) {
+                if let NetEvent::Joined(n) = e {
+                    if n == "BOB" { joined.0 = true }
+                    if n == "HOST" { joined.1 = true }
+                }
+            }
+            a.smooth(0.016);
+            b.smooth(0.016);
+            std::thread::sleep(std::time::Duration::from_micros(500));
+        }
+        let _ = std::fs::remove_dir_all(&store);
+
+        assert!(joined.0, "host never saw BOB's Joined event");
+        assert!(joined.1, "client never saw HOST's Joined event");
+        assert_eq!(a.player_count(), 2, "host should see itself + 1 peer");
+        assert_eq!(b.player_count(), 2, "client should see itself + 1 peer");
+        let host_peer_x: Vec<f32> = a.peers().map(|p| p.shown.x).collect();
+        let client_peer_x: Vec<f32> = b.peers().map(|p| p.shown.x).collect();
+        assert!((host_peer_x[0] - 4.0).abs() < 1.6, "host's view of the client's x drifted: {host_peer_x:?}");
+        assert!((client_peer_x[0] - -4.0).abs() < 1.6, "client's view of the host's x drifted: {client_peer_x:?}");
+    }
+}

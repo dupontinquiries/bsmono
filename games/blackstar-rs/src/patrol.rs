@@ -575,6 +575,27 @@ impl Patrol {
 mod tests {
     use super::*;
 
+    /// `Destination.note` — "what the archive says about it," per its own
+    /// doc comment, "surfaced on arrival" — had no consumer anywhere in the
+    /// codebase before this: every destination has one, and nothing showed
+    /// it. `main.rs::depart_to` is the single place a player actually
+    /// arrives somewhere (its own doc comment: "the single place that
+    /// parks... you are not at the chartroom any more, you are on Mars"),
+    /// so it's the fix. Same shape as the arena-note test in raidcon.rs:
+    /// the data is real, and the call site really reads it.
+    #[test]
+    fn every_destination_has_real_lore_and_arrival_actually_shows_it() {
+        for d in ROUTE {
+            assert!(d.note.len() > 15, "{} has a placeholder-length note: {:?}", d.id, d.note);
+            assert!(d.note.chars().any(|c| c == ' '), "{} note isn't prose: {:?}", d.id, d.note);
+        }
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains(r#"let line = format!("{line} — {}", d.note);"#),
+            "depart_to no longer shows the destination's own note on arrival"
+        );
+    }
+
     fn run(p: &mut Patrol, secs: f32, at: [f32; 2], night: f32) -> Vec<Tick> {
         let mut v = Vec::new();
         let steps = (secs / (1.0 / 60.0)) as i32;

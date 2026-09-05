@@ -78,7 +78,8 @@ EDEPS  +=$(patsubst %,$(EDIR)/util/%,$(_EDEPS_UT))
 ENGINEOBJ = window.o glad.o mesh.o camera.o texture.o iqm.o \
 pointlight.o scene.o model.o collision.o entity.o octree.o \
 engine.o shader.o input.o sound.o cache.o text.o msdf.o \
-ini.o vga.o renderer.o
+ini.o vga.o renderer.o \
+ability.o absorb.o ally.o arc.o arena.o behavior.o bsgames_handoff.o campaign.o chassis.o coll_chunk.o combat.o combat_json.o commander_ai.o containment.o corrupt.o cyclone.o detail.o element.o encounter.o enemy.o events.o feel.o gates.o graviton.o hive_ai.o keybind.o lore.o mapfsm.o mapgen.o material.o matrix.o menu.o net_transport.o netcode.o pclass.o photon.o pickup.o provenance.o resonance.o robot_parts.o signature.o siphon.o spearcon.o terrain_step.o thorns.o transform.o truce.o tsunami.o turret.o vehicle.o vfx.o voice.o warp_wave.o waves.o weapon.o weaponmod.o
 
 # lib deps
 _PHYSFS_DEPS =physfs_casefolding.h  physfs.h  physfs_internal.h \
