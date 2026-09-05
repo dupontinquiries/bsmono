@@ -88,6 +88,8 @@ cylinder @0,0 r=4 h=10 block=stone_bricks hollow
 path @4,0 @16,9 w=2 block=cobblestone
 tree @8,3 oak h=7
 sphere @3,0 r=1 block=air
+enclose @-5,-5 @5,5 h=5 block=oak_planks
+roof @-5,-5 @5,5 gable block=dark_oak_planks
 
 Blocks: stone, cobblestone, stone_bricks, oak_planks, dark_oak_planks, glass, snow.
 A tower 8 blocks wide is r=4, not r=8.
@@ -96,6 +98,9 @@ Example -- player: a small watchtower
 # watchtower
 terraform @-5,-5 @5,5 smooth block=stone
 cylinder @0,0 r=3 h=11 block=stone_bricks hollow
+roof @-3,-3 @3,3 hip block=dark_oak_planks
+
+A building needs a roof. Add one.
 
 Now reply with plan lines only.";
 
@@ -140,6 +145,11 @@ OPS
   sphere A [r=N] [block=B] [hollow]              dome or boulder; block=air carves
   tree A SPECIES [h=N] [lean=dx,dz]              oak, birch, pine, cactus
   scatter A B [block=B] [clusters=N] [per=N] [spread=N] [seed=N]
+  roof A B [gable|hip|flat|pyramid] [block=B]    pitched roof over a footprint; sits on the walls
+  floor A B [y=N] [block=B]                      a storey slab inside a footprint
+  bridge A B [w=N] [block=B]                     span at constant height WITH PIERS (path digs in)
+  stairs A B [w=N] [block=B]                     rise one block per step from A to B
+  mirror A B [x|z] [about=N]                     reflect a region: pillars either side of something
   restyle A B FROM TO                            re-theme a box between palettes (A, B are x,y,z)
   fill A B [block=B] [hollow]                    box between x,y,z corners; hollow for rooms
 
@@ -156,7 +166,8 @@ BUILD IN PASSES. You will be told which pass this is.
              No windows, no paths, no scatter. Get the silhouette right; everything else waits.
   materials  Change what the massing is made of. Mostly restyle over the structure's box.
              Do not change shape. Do not add detail.
-  detail     Now the small things: doors as carved air, windows, a path to the entrance,
+  detail     Now the small things: A ROOF if the building has none, doors as carved air,
+             windows, floors for upper storeys, a path to the entrance,
              trim with the accent role, scatter foliage nearby. Many small ops.
              Do not touch the massing.
   expand     A massing pass on an existing structure: extend it, add a wing, raise it.
@@ -175,6 +186,7 @@ EXAMPLE (massing, empty site, focus tier structure)
   plan:
 terraform @-5,-5 @5,5 smooth block=stone
 cylinder @0,0 r=3 h=11 block=stone hollow
+roof @-4,-4 @4,4 hip block=dark_oak_planks
 
 EXAMPLE (materials, LAST BUILD = the tower above)
   player: make it look old and mossy

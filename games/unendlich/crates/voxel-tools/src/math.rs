@@ -223,6 +223,46 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                 push(Note::Info, format!("tree height {height}, roughly {} blocks with canopy",
                                           height + 60), None);
             }
+            Op::Roof { min, max, style, overhang, .. } => {
+                let (w, d) = (span(min.0, max.0) + 2 * overhang, span(min.1, max.1) + 2 * overhang);
+                // A pitched roof is roughly the footprint plus its slopes;
+                // close enough to warn about scale, which is the job.
+                let vol = match style.as_str() {
+                    "flat" => w as i64 * d as i64,
+                    _ => (w as i64 * d as i64 * 3) / 2,
+                };
+                total += vol;
+                push(Note::Info,
+                     format!("{style} roof over {w}x{d} (overhang {overhang}), about {vol} blocks"),
+                     None);
+            }
+            Op::Mirror { min, max, axis, about } => {
+                let vol = span(min.0, max.0) as i64 * span(min.1, max.1) as i64
+                        * span(min.2, max.2) as i64;
+                push(Note::Info,
+                     format!("mirror across {axis}={about}, scanning {vol} cells"), None);
+            }
+            Op::Bridge { from, to, width, supports, .. } => {
+                let len = (to.0 - from.0).abs().max((to.1 - from.1).abs()) + 1;
+                let vol = len as i64 * *width as i64;
+                total += vol;
+                push(Note::Info,
+                     format!("bridge {len} long x {width} wide, about {vol} blocks{}",
+                             if *supports { " plus piers" } else { " (no supports)" }),
+                     None);
+            }
+            Op::Stairs { from, to, width, .. } => {
+                let len = (to.0 - from.0).abs().max((to.1 - from.1).abs()) + 1;
+                total += len as i64 * *width as i64;
+                push(Note::Info,
+                     format!("stairs {len} steps, rising {len} blocks, {width} wide"), None);
+            }
+            Op::Floor { min, max, .. } => {
+                let vol = span(min.0, max.0) as i64 * span(min.1, max.1) as i64;
+                total += vol;
+                push(Note::Info, format!("floor {}x{} = {vol} blocks",
+                                          span(min.0, max.0), span(min.1, max.1)), None);
+            }
             Op::Restyle { min, max, .. } => {
                 let vol = span(min.0, max.0) as i64 * span(min.1, max.1) as i64
                         * span(min.2, max.2) as i64;

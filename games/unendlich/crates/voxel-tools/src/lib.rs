@@ -300,6 +300,158 @@ impl<'w, W: VoxelWorld> VoxelTools<'w, W> {
 
     // ---- writes ----------------------------------------------------
 
+    // ---- writes from the build corpus --------------------------------
+    //
+    // Five operations a builder narrates constantly that the IR had no
+    // word for. Counted across 15,721 words of build narration:
+    // bridge/walkway 34, roof 29, storey/floor 25, "either side of" 15,
+    // stairs 7. A model asked for a house produced walls and open sky,
+    // because "roof" was not something it could say.
+
+    /// A pitched roof over a footprint.
+    ///
+    /// `style`: "gable" ridges along the longer axis, "hip" slopes from
+    /// all four sides, "flat" is a slab, "pyramid" meets at a point.
+    /// Overhang extends the eaves past the walls, which is what makes a
+    /// roof read as a roof rather than a lid.
+    pub fn roof(&mut self, min: (i32, i32, i32), max: (i32, i32), style: &str,
+                block: u16, overhang: i32) -> CallResult {
+        let (x0r, y0, z0r) = min;
+        let (x1r, z1r) = max;
+        let (x0, x1) = (x0r.min(x1r) - overhang, x0r.max(x1r) + overhang);
+        let (z0, z1) = (z0r.min(z1r) - overhang, z0r.max(z1r) + overhang);
+        let (w, d) = (x1 - x0, z1 - z0);
+        let mut e = self.begin("roof");
+        match style {
+            "flat" => {
+                for x in x0..=x1 { for z in z0..=z1 { self.write(&mut e, x, y0, z, block); } }
+            }
+            "pyramid" | "hip" => {
+                let steps = (w.min(d) / 2).max(1);
+                for s in 0..=steps {
+                    let (a, b, c, f) = (x0 + s, x1 - s, z0 + s, z1 - s);
+                    if a > b || c > f { break; }
+                    let cap = style == "pyramid" && s == steps;
+                    for x in a..=b { for z in c..=f {
+                        if cap || x == a || x == b || z == c || z == f {
+                            self.write(&mut e, x, y0 + s, z, block);
+                        }
+                    }}
+                }
+            }
+            _ => {
+                // gable: ridge along the LONGER axis, two sloping faces
+                let along_x = w >= d;
+                let steps = ((if along_x { d } else { w }) / 2).max(1);
+                for s in 0..=steps {
+                    if along_x {
+                        let (c, f) = (z0 + s, z1 - s);
+                        if c > f { break; }
+                        for x in x0..=x1 { for z in [c, f] {
+                            self.write(&mut e, x, y0 + s, z, block);
+                        }}
+                    } else {
+                        let (a, b) = (x0 + s, x1 - s);
+                        if a > b { break; }
+                        for z in z0..=z1 { for x in [a, b] {
+                            self.write(&mut e, x, y0 + s, z, block);
+                        }}
+                    }
+                }
+            }
+        }
+        let n = e.before.len();
+        self.finish(e, format!("{style} roof, {n} blocks"))
+    }
+
+    /// Mirror a region across an axis. `axis` is "x" or "z".
+    ///
+    /// The source is read ENTIRELY before anything is written: writing
+    /// as we go would re-read blocks just placed and smear the
+    /// reflection across itself when source and image overlap.
+    pub fn mirror(&mut self, min: (i32, i32, i32), max: (i32, i32, i32),
+                  axis: &str, about: i32) -> CallResult {
+        let (lo, hi) = norm(min, max);
+        let mut src = Vec::new();
+        for x in lo.0..=hi.0 { for y in lo.1..=hi.1 { for z in lo.2..=hi.2 {
+            let b = self.world.get(x, y, z);
+            if b != 0 { src.push((x, y, z, b)); }
+        }}}
+        let mut e = self.begin("mirror");
+        for (x, y, z, b) in src {
+            let (nx, nz) = if axis == "x" { (2 * about - x, z) } else { (x, 2 * about - z) };
+            self.write(&mut e, nx, y, nz, b);
+        }
+        let n = e.before.len();
+        self.finish(e, format!("mirrored {n} blocks across {axis}={about}"))
+    }
+
+    /// A span at constant height with piers. Distinct from `path`, which
+    /// follows the ground and would cut a trench across a ravine.
+    pub fn bridge(&mut self, from: (i32, i32, i32), to: (i32, i32), width: i32,
+                  block: u16, supports: bool) -> CallResult {
+        let (x0, y, z0) = from;
+        let (x1, z1) = to;
+        let steps = (x1 - x0).abs().max((z1 - z0).abs()).max(1);
+        let half = (width - 1).max(0) / 2;
+        let mut e = self.begin("bridge");
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            let x = x0 + ((x1 - x0) as f32 * t).round() as i32;
+            let z = z0 + ((z1 - z0) as f32 * t).round() as i32;
+            for dx in -half..=half { for dz in -half..=half {
+                self.write(&mut e, x + dx, y, z + dz, block);
+            }}
+            // A pier every six blocks. Without them the deck floats, and
+            // the critique pass would rightly flag the whole span.
+            if supports && i % 6 == 0 {
+                // Search from BELOW the deck. Starting at `y` finds the
+                // deck block written moments ago on this same iteration,
+                // reports it as the surface, and builds a pier of zero
+                // height -- so every bridge floated, which is the exact
+                // failure the critique pass exists to catch.
+                if let Some(g) = self.find_surface(x, z, y - 1) {
+                    for py in (g + 1)..y { self.write(&mut e, x, py, z, block); }
+                }
+            }
+        }
+        let n = e.before.len();
+        self.finish(e, format!("bridge, {n} blocks"))
+    }
+
+    /// A staircase rising one block per step, wide across its run.
+    pub fn stairs(&mut self, from: (i32, i32, i32), to: (i32, i32), width: i32,
+                  block: u16) -> CallResult {
+        let (x0, y0, z0) = from;
+        let (x1, z1) = to;
+        let steps = (x1 - x0).abs().max((z1 - z0).abs()).max(1);
+        let half = (width - 1).max(0) / 2;
+        let (px, pz) = if (x1 - x0).abs() >= (z1 - z0).abs() { (0, 1) } else { (1, 0) };
+        let mut e = self.begin("stairs");
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            let x = x0 + ((x1 - x0) as f32 * t).round() as i32;
+            let z = z0 + ((z1 - z0) as f32 * t).round() as i32;
+            for w in -half..=half {
+                self.write(&mut e, x + px * w, y0 + i, z + pz * w, block);
+            }
+        }
+        let n = e.before.len();
+        self.finish(e, format!("stairs, {n} blocks"))
+    }
+
+    /// A storey floor inside a footprint.
+    pub fn floor(&mut self, min: (i32, i32, i32), max: (i32, i32), block: u16) -> CallResult {
+        let (x0, y, z0) = min;
+        let (x1, z1) = max;
+        let mut e = self.begin("floor");
+        for x in x0.min(x1)..=x0.max(x1) { for z in z0.min(z1)..=z0.max(z1) {
+            self.write(&mut e, x, y, z, block);
+        }}
+        let n = e.before.len();
+        self.finish(e, format!("floor, {n} blocks"))
+    }
+
     pub fn set_block(&mut self, x: i32, y: i32, z: i32, block: u16) -> CallResult {
         let mut e = self.begin("set_block");
         self.write(&mut e, x, y, z, block);

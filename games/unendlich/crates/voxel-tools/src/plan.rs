@@ -120,6 +120,22 @@ pub enum Op {
     Terraform { min: (i32, i32), max: (i32, i32), delta: i32, smooth: bool, block: u16 },
     Path { from: (i32, i32), to: (i32, i32), width: i32, block: u16 },
     Enclose { min: (i32, i32), max: (i32, i32), height: i32, block: u16 },
+    /// A pitched roof over a footprint. 29 mentions in the build corpus
+    /// and no word for it in the IR: a model asked for a house made
+    /// walls and left the sky open.
+    Roof { min: (i32, i32), max: (i32, i32), y: Option<i32>, style: String,
+           block: u16, overhang: i32 },
+    /// Reflect a region. "either side of" is how builders describe
+    /// symmetry, and authoring both halves by hand gets them different.
+    Mirror { min: (i32, i32, i32), max: (i32, i32, i32), axis: String, about: i32 },
+    /// A span at constant height with piers -- not a path, which follows
+    /// the ground and would dig a trench across a ravine.
+    Bridge { from: (i32, i32), to: (i32, i32), y: Option<i32>, width: i32,
+             block: u16, supports: bool },
+    /// A staircase rising one block per step.
+    Stairs { from: (i32, i32), to: (i32, i32), y: Option<i32>, width: i32, block: u16 },
+    /// A storey floor inside a footprint.
+    Floor { min: (i32, i32), max: (i32, i32), y: Option<i32>, block: u16 },
     Fill { min: (i32, i32, i32), max: (i32, i32, i32), block: u16, hollow: bool },
     Cylinder { at: (i32, i32), y: Option<i32>, radius: i32, height: i32, block: u16, hollow: bool },
     Sphere { at: (i32, i32), y: Option<i32>, radius: i32, block: u16, hollow: bool },
@@ -378,6 +394,59 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     min: a, max: b, height: kvi(&t, "h", 3).max(1),
                     block: blk("oak_planks").unwrap_or(57) });
             }
+            "roof" => {
+                let Some((a, b, note)) = footprint(&t, anchor) else {
+                    rel_err.set(true); continue;
+                };
+                if let Some(n) = note { assumed!(&n); }
+                ops.push(Op::Roof {
+                    min: a, max: b, y: kv(&t, "y").and_then(|v| v.parse().ok()),
+                    style: t.iter().find(|s| ["gable","hip","flat","pyramid"].contains(s))
+                            .unwrap_or(&"gable").to_string(),
+                    block: blk("oak_planks").unwrap_or(57),
+                    overhang: kvi(&t, "overhang", 1).clamp(0, 4) });
+            }
+            "mirror" => {
+                let a = t.get(1).and_then(|s| triple_at(s, anchor).ok().flatten());
+                let b = t.get(2).and_then(|s| triple_at(s, anchor).ok().flatten());
+                match (a, b) {
+                    (Some(mn), Some(mx)) => ops.push(Op::Mirror {
+                        min: mn, max: mx,
+                        axis: if t.contains(&"z") { "z".into() } else { "x".into() },
+                        about: kvi(&t, "about", if t.contains(&"z") { mn.2 } else { mn.0 }) }),
+                    _ => bad("mirror needs two x,y,z corners".into()),
+                }
+            }
+            "bridge" | "walkway" => {
+                let Some((a, b, note)) = footprint(&t, anchor) else {
+                    rel_err.set(true); continue;
+                };
+                if let Some(n) = note { assumed!(&n); }
+                ops.push(Op::Bridge {
+                    from: a, to: b, y: kv(&t, "y").and_then(|v| v.parse().ok()),
+                    width: kvi(&t, "w", 3).max(1),
+                    block: blk("oak_planks").unwrap_or(57),
+                    supports: !t.contains(&"nosupports") });
+            }
+            "stairs" | "staircase" => {
+                let Some((a, b, note)) = footprint(&t, anchor) else {
+                    rel_err.set(true); continue;
+                };
+                if let Some(n) = note { assumed!(&n); }
+                ops.push(Op::Stairs {
+                    from: a, to: b, y: kv(&t, "y").and_then(|v| v.parse().ok()),
+                    width: kvi(&t, "w", 2).max(1),
+                    block: blk("cobblestone").unwrap_or(4) });
+            }
+            "floor" | "storey" | "story" => {
+                let Some((a, b, note)) = footprint(&t, anchor) else {
+                    rel_err.set(true); continue;
+                };
+                if let Some(n) = note { assumed!(&n); }
+                ops.push(Op::Floor {
+                    min: a, max: b, y: kv(&t, "y").and_then(|v| v.parse().ok()),
+                    block: blk("oak_planks").unwrap_or(57) });
+            }
             "cylinder" | "tower" => match rel(&t, 1, anchor) {
                 Some(a) => ops.push(Op::Cylinder {
                     at: a, y: kv(&t, "y").and_then(|v| v.parse().ok()),
@@ -618,6 +687,39 @@ pub fn run_plan<W: VoxelWorld>(
                 let base_y = y.unwrap_or_else(|| tools.find_surface(at.0, at.1, from_y)
                                                     .map(|s| s + 1).unwrap_or(from_y));
                 tools.cylinder((at.0, base_y, at.1), *radius, *height, *block, *hollow)
+            }
+            Op::Roof { min, max, y, style, block, overhang } => {
+                // Sits on top of the walls: the highest surface under the
+                // footprint, not the ground, or a roof lands in the floor.
+                let base = y.unwrap_or_else(|| {
+                    let mut top = i32::MIN;
+                    for x in [min.0, max.0, (min.0 + max.0) / 2] {
+                        for z in [min.1, max.1, (min.1 + max.1) / 2] {
+                            if let Some(s) = tools.find_surface(x, z, from_y) { top = top.max(s); }
+                        }
+                    }
+                    if top == i32::MIN { from_y } else { top + 1 }
+                });
+                tools.roof((min.0, base, min.1), *max, style, *block, *overhang)
+            }
+            Op::Mirror { min, max, axis, about } => tools.mirror(*min, *max, axis, *about),
+            Op::Bridge { from, to, y, width, block, supports } => {
+                let base = y.unwrap_or_else(|| {
+                    tools.find_surface(from.0, from.1, from_y).map(|s| s + 1).unwrap_or(from_y)
+                });
+                tools.bridge((from.0, base, from.1), *to, *width, *block, *supports)
+            }
+            Op::Stairs { from, to, y, width, block } => {
+                let base = y.unwrap_or_else(|| {
+                    tools.find_surface(from.0, from.1, from_y).map(|s| s + 1).unwrap_or(from_y)
+                });
+                tools.stairs((from.0, base, from.1), *to, *width, *block)
+            }
+            Op::Floor { min, max, y, block } => {
+                let base = y.unwrap_or_else(|| {
+                    tools.find_surface(min.0, min.1, from_y).map(|s| s + 1).unwrap_or(from_y)
+                });
+                tools.floor((min.0, base, min.1), *max, *block)
             }
             Op::Sphere { at, y, radius, block, hollow } => {
                 let cy = y.unwrap_or_else(|| {
@@ -991,5 +1093,88 @@ scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
         let (plan, issues) = parse_plan_at("frobnicate the widget\n", Some((0, 65, 0)));
         assert!(plan.ops.is_empty());
         assert!(issues.iter().any(|i| i.severity == Severity::Error));
+    }
+
+    #[test]
+    fn a_house_now_gets_a_roof() {
+        // The gap the corpus named: "roof" said 29 times, no op for it.
+        // Walls plus a roof must actually close the top.
+        let mut w = Flat::new();
+        let src = "enclose @-4,-4 @4,4 h=5 block=oak_planks\n\
+                   roof @-4,-4 @4,4 gable block=dark_oak_planks\n";
+        let (plan, issues) = parse_plan_at(src, Some((0, 65, 0)));
+        assert!(issues.iter().all(|i| i.severity != Severity::Error), "{issues:?}");
+        let run = { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &plan, 200, 32, false) };
+        assert!(run.blocks_changed > 50);
+        // Walls occupy y=65..69, so the roof starts at 70. A GABLE has
+        // two sloping faces and a ridge: along z=0 (the ridge line) only
+        // the ridge itself is filled, which is what a gable looks like —
+        // my first assertion checked a point that is correctly empty.
+        assert_ne!(w.get(0, 75, 0), 0, "ridge above the walls");
+        assert_ne!(w.get(0, 70, -5), 0, "eaves start at wall top, overhanging the wall line");
+        assert_eq!(w.get(0, 72, 0), 0, "the space under the ridge is open, not solid");
+    }
+
+    #[test]
+    fn mirror_reflects_and_does_not_smear_itself() {
+        let mut w = Flat::new();
+        // a lopsided pillar at x=3
+        let (p1, _) = parse_plan_at("cylinder @3,0 r=1 h=6 block=stone_bricks\n",
+                                    Some((0, 65, 0)));
+        { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &p1, 200, 32, false); }
+        assert_ne!(w.get(3, 67, 0), 0);
+        assert_eq!(w.get(-3, 67, 0), 0, "nothing on the far side yet");
+        // mirror across x=0 -> "either side of"
+        let (p2, issues) = parse_plan_at("mirror @1,0,-3 @6,8,3 x about=0\n",
+                                          Some((0, 65, 0)));
+        assert!(issues.iter().all(|i| i.severity != Severity::Error), "{issues:?}");
+        { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &p2, 200, 32, false); }
+        assert_ne!(w.get(-3, 67, 0), 0, "reflected pillar exists");
+        assert_ne!(w.get(3, 67, 0), 0, "and the original survives");
+    }
+
+    #[test]
+    fn a_bridge_holds_its_height_where_a_path_would_dive() {
+        // Flat world with a trench: a path follows the ground into it,
+        // a bridge spans it. This is why they are different ops.
+        struct Trench(BTreeMap<(i32,i32,i32), u16>);
+        impl VoxelWorld for Trench {
+            fn get(&self, x: i32, y: i32, z: i32) -> u16 {
+                if let Some(&b) = self.0.get(&(x,y,z)) { return b; }
+                let floor = if (4..=10).contains(&x) { 50 } else { 64 };
+                if y <= floor { 1 } else { 0 }
+            }
+            fn set(&mut self, x: i32, y: i32, z: i32, b: u16) -> bool {
+                self.0.insert((x,y,z), b); true
+            }
+        }
+        let mut w = Trench(BTreeMap::new());
+        let (plan, issues) = parse_plan_at(
+            "bridge @0,0 @14,0 w=3 block=oak_planks\n", Some((0, 65, 0)));
+        assert!(issues.iter().all(|i| i.severity != Severity::Error), "{issues:?}");
+        { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &plan, 200, 32, false); }
+        // deck stays at the starting height right across the trench
+        assert_ne!(w.get(7, 65, 0), 0, "deck spans the gap at height");
+        assert_ne!(w.get(6, 60, 0), 0, "and a pier reaches down into it");
+    }
+
+    #[test]
+    fn stairs_rise_one_per_step() {
+        let mut w = Flat::new();
+        let (plan, _) = parse_plan_at("stairs @0,0 @6,0 w=2 block=cobblestone\n",
+                                      Some((0, 65, 0)));
+        { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &plan, 200, 32, false); }
+        assert_ne!(w.get(0, 65, 0), 0, "first tread at the base");
+        assert_ne!(w.get(6, 71, 0), 0, "sixth tread six blocks up");
+    }
+
+    #[test]
+    fn a_floor_makes_a_second_storey() {
+        let mut w = Flat::new();
+        let (plan, _) = parse_plan_at("floor @-3,-3 @3,3 y=70 block=oak_planks\n",
+                                      Some((0, 65, 0)));
+        { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &plan, 200, 32, false); }
+        assert_ne!(w.get(0, 70, 0), 0);
+        assert_eq!(w.get(0, 69, 0), 0, "nothing below it");
     }
 }
