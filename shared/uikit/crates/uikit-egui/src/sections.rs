@@ -119,6 +119,104 @@ pub fn covers_exactly(sections: &[Section], item_count: usize) -> Result<(), Str
     Ok(())
 }
 
+
+/// Move `active` by `dir` sections, wrapping. Wrapping because cycling is a
+/// swipe: a gesture that silently does nothing at the ends feels broken,
+/// and there is no "end" to a ring of three.
+pub fn cycle(active: usize, n: usize, dir: i32) -> usize {
+    if n == 0 { return 0; }
+    let n_i = n as i64;
+    (((active as i64 + dir as i64) % n_i + n_i) % n_i) as usize
+}
+
+/// A one-row section picker: the active section's name, swipeable to cycle
+/// and tappable to list them all.
+///
+/// One row rather than two. A row of section tabs shows everything at once
+/// but costs a line of a phone screen permanently; a plain dropdown saves
+/// the line but makes changing section a two-tap menu. This is both: the
+/// swipe is the one-gesture change for the common case, and the tap is the
+/// discoverable list for when you do not know what exists.
+///
+/// What the picker produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    /// Swiped to another section — the caller decides which destination.
+    Section(usize),
+    /// Tapped a destination in the expanded grid: an index into the app's
+    /// own list, ready to use.
+    Item(usize),
+}
+
+/// Returns what the user picked, if anything.
+pub fn picker_ui(ui: &mut egui::Ui, sections: &[Section], active: usize,
+                 labels: &[&str], c: &crate::PaletteColors) -> Option<Pick> {
+    if sections.is_empty() { return None; }
+    let active = active.min(sections.len() - 1);
+    let popup_id = ui.make_persistent_id("section-picker-open");
+    let mut chosen = None;
+
+    let h = ui.spacing().interact_size.y.max(28.0);
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), h), egui::Sense::click_and_drag());
+
+    // SWIPE to cycle. The threshold is the pager's, so a swipe here and a
+    // swipe between pages commit at the same distance rather than at two
+    // numbers a user has to learn separately.
+    if resp.drag_stopped() {
+        let step = crate::pager::swipe_commits(resp.drag_delta().x, rect.width());
+        if step != 0 {
+            chosen = Some(Pick::Section(cycle(active, sections.len(), step)));
+        }
+    }
+    let mut open = ui.memory(|m| m.data.get_temp::<bool>(popup_id).unwrap_or(false));
+    if resp.clicked() { open = !open; }
+
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, crate::tokens::RADIUS_SM as f32, c.bg_raised);
+    p.text(egui::pos2(rect.left() + 10.0, rect.center().y), egui::Align2::LEFT_CENTER,
+           format!("{}  {}", sections[active].label, if open { '\u{25B4}' } else { '\u{25BE}' }),
+           egui::FontId::proportional(14.0), c.text);
+    // Position dots: which of the three you are on, so the swipe has a
+    // visible target and the control says how many there are without
+    // being opened.
+    let n = sections.len();
+    for i in 0..n {
+        let x = rect.right() - 12.0 - (n - 1 - i) as f32 * 12.0;
+        let on = i == active;
+        p.circle_filled(egui::pos2(x, rect.center().y), if on { 3.5 } else { 2.5 },
+                        if on { c.accent } else { c.text_weak });
+    }
+
+    if open {
+        // EXPANDED IS A GRID OF DESTINATIONS, not a second list of section
+        // names. A list of sections costs a tap and then another to reach
+        // anywhere; a column per section puts the WHOLE app on one panel,
+        // one tap to any of it, still grouped. Drawn below in the same
+        // column rather than in a floating popup, because this control sits
+        // at the bottom of a phone screen where a popup covers what you were
+        // reading.
+        ui.add_space(4.0);
+        ui.columns(sections.len(), |cols| {
+            for (i, sec) in sections.iter().enumerate() {
+                let ui = &mut cols[i];
+                ui.label(egui::RichText::new(sec.label).small().weak());
+                for &item in &sec.items {
+                    if let Some(name) = labels.get(item) {
+                        if ui.selectable_label(false, *name).clicked() {
+                            chosen = Some(Pick::Item(item));
+                        }
+                    }
+                }
+            }
+        });
+        if chosen.is_some() { open = false; }
+    }
+    if chosen.is_some() { open = false; }
+    ui.memory_mut(|m| m.data.insert_temp(popup_id, open));
+    chosen
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +227,19 @@ mod tests {
             Section::new("Repository", &[7, 8, 10, 6]),
             Section::new("System", &[5, 9, 2, 11]),
         ]
+    }
+
+    #[test]
+    fn cycling_wraps_in_both_directions_and_survives_an_empty_list() {
+        assert_eq!(cycle(0, 3, 1), 1);
+        assert_eq!(cycle(2, 3, 1), 0, "forward off the end wraps");
+        assert_eq!(cycle(0, 3, -1), 2, "backward off the start wraps");
+        assert_eq!(cycle(1, 3, 0), 1);
+        assert_eq!(cycle(0, 0, 1), 0, "no sections is not a panic");
+        // A full turn is identity, whichever way.
+        let mut a = 0;
+        for _ in 0..3 { a = cycle(a, 3, 1); }
+        assert_eq!(a, 0);
     }
 
     #[test]

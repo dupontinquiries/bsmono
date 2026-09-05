@@ -192,18 +192,33 @@ impl App {
                             }
                         });
                         ui.separator();
-                        ui.horizontal(|ui| {
-                            for (si, sec) in secs.iter().enumerate() {
-                                if ui.selectable_label(si == active_sec, sec.label).clicked() {
-                                    // Selecting a section moves to its first
-                                    // destination: a section tab that changed
-                                    // nothing visible would read as broken.
-                                    if let Some(&first) = sec.items.first() {
-                                        self.tab = Tab::ALL[first];
-                                    }
+                        // ONE ROW for the section, not a row of tabs: swipe it
+                        // to cycle, tap it to list them. A tab row shows every
+                        // section at once but costs a second line of a phone
+                        // screen permanently; a plain dropdown saves the line
+                        // and makes a section change a two-tap menu. The
+                        // picker is both, and the swipe threshold is the
+                        // pager's so it commits at the same distance as a page
+                        // swipe rather than at a second number to learn.
+                        let names: Vec<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
+                        match uikit_egui::sections::picker_ui(
+                            ui, &secs, active_sec, &names,
+                            &uikit_egui::palette_colors(&self.prefs.palette))
+                        {
+                            // Swiped: move to the new section's first
+                            // destination. A picker that changed nothing
+                            // visible would read as broken.
+                            Some(uikit_egui::sections::Pick::Section(si)) => {
+                                if let Some(&first) = secs[si].items.first() {
+                                    self.tab = Tab::ALL[first];
                                 }
                             }
-                        });
+                            // Tapped a destination in the expanded grid.
+                            Some(uikit_egui::sections::Pick::Item(i)) => {
+                                self.tab = Tab::ALL[i];
+                            }
+                            None => {}
+                        }
                     }
                 }
             });
