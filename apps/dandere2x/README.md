@@ -245,6 +245,37 @@ What is built:
   device. Bit-exact against the CPU reference with three sets over
   five-tile frames on lavapipe; the overlap itself only shows on a real
   GPU.
+- **Plate reference** (`--plate-window N`, default 0 = off): each window of
+  up to N frames (ended early at a scene cut — phase-correlation confidence
+  below `--plate-confidence`, or PSNR below the redraw floor) gets a
+  background plate: fao-codec's v11 plate, a per-pixel temporal median of
+  the frames placed under their global motion, integer placements. The
+  main network upscales it once (`plate` line in the log, cost reported
+  separately in the summary so the reuse number includes it) and every
+  block it explains is a `plt` copy from that upscale. Holds N frames in
+  RAM ahead of analysis and adds N frames of latency. Measured on the two
+  test clips (`analyze`, 240 frames, q90): a net LOSS on both — the film
+  clip's whip pans are 30–46 px/frame with motion blur, and the game clip's
+  3D camera moves every edge by a sub-pixel amount, so an integer, global-
+  translation plate serves ~1% of blocks and costs 4.5% of a frame per
+  frame. `D2X_PLATE_DEBUG=1` prints every pair's motion and every window.
+  The sub-pixel version (`v11_plate::build_plate_sr`, S=2, exact at ×2)
+  and per-layer motion are the next steps, and they should be measured
+  with `analyze` before the GPU is involved.
+- **Motion-seeded search** (`--mv-seed`): the diamond search starts from
+  each frame's global motion (one phase correlation per frame pair), so a
+  pan beyond the search radius is still a copy; a failed seeded walk falls
+  back to the unseeded one. No effect on either test clip (see above:
+  nothing passes the gate at any integer offset).
+- **Half-pel refinement** (`--halfpel`, needs an even scale): when the
+  integer match fails the gate, the eight half-pel neighbours of its best
+  candidate are tried (rounded bilinear). In the ×2 output a half-pel input
+  offset is an integer offset, so the merge is still an exact copy; the
+  low-res mirror is the box-downsample of that copy, bit for bit. SMITE,
+  120 frames: 83.3% → 67.9% at q60 (redraws 52 → 19), but only 95.4% →
+  94.6% at q90 — bilinear is too soft to pass a strict gate against sharp
+  edges. A 6-tap sub-pel filter and quarter-pel (fao-codec has the
+  refinement in `v11_plate.rs`) is what would move the q90 number.
 - **Gate hysteresis** (`--streak-bonus b`, default 0 = off): a block reused
   for `n` consecutive frames gets its threshold scaled by
   `1 + b·min(n,8)/8`, so blocks that keep matching stop flickering out at
