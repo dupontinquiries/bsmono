@@ -226,6 +226,43 @@ EXAMPLE (expand, LAST BUILD = the tower above)
 cylinder @0,0 r=5 h=3 block=stone
 cylinder @0,0 r=3 h=6 y=76 block=stone hollow";
 
+/// The OUTLINE pass: decide what to build, in words, before writing a
+/// single coordinate.
+///
+/// Splitting the model's work in two helps a small model for the same
+/// reason it helps a person: choosing what to build and expressing it
+/// in a formal notation are different jobs, and doing both at once is
+/// where a 1B drops one of them. The outline is short prose, so there
+/// is no grammar to get wrong; the worker pass has a decision already
+/// made, so it only has to translate.
+///
+/// It costs a second round trip. Off by default for that reason —
+/// worth it for "a village" and wasteful for "a tower".
+pub const OUTLINE: &str = "\
+You are planning a build. Do NOT write coordinates or commands yet.
+
+Read the terrain and site notes. Then answer in at most five short
+lines, each naming ONE thing to build and roughly where and how big:
+
+  a stone watchtower on the high ground east, about 7 across, 12 tall
+  a path from its door down to the level ground west
+  three pines scattered on the slope below
+
+Rules:
+- Respect the terrain. Do not put a large flat footprint on a steep
+  slope; either pick the level ground or say the ground must be
+  terraformed first.
+- Use the site palette unless the player asked otherwise.
+- Fewer, larger things beat many small ones.
+
+Answer with the lines only.";
+
+/// Turn an outline into the worker turn.
+pub fn worker_turn(context: &str, outline: &str, prose: &str) -> String {
+    format!("{context}\n\nThe plan you already decided on:\n{outline}\n\n\
+             player: {prose}\nNow write it as plan lines. plan:")
+}
+
 /// Per-turn user message: context first (so the model reads before it
 /// writes), then the pass, then the request.
 pub fn user_turn(context: &str, pass: Pass, prose: &str) -> String {
@@ -358,5 +395,23 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 5, "checked only {checked} reference lines");
+    }
+
+    #[test]
+    fn the_outline_pass_forbids_coordinates() {
+        // Its whole purpose is to make the decision without the
+        // notation; if it starts emitting IR the split has bought
+        // nothing.
+        assert!(OUTLINE.contains("Do NOT write coordinates"));
+        assert!(!OUTLINE.contains('@'), "no coordinate syntax to imitate");
+        assert!(OUTLINE.is_ascii());
+    }
+
+    #[test]
+    fn the_worker_turn_carries_the_decision_forward() {
+        let t = worker_turn("SITE: temperate", "a stone tower on the rise", "a tower");
+        assert!(t.contains("SITE: temperate"), "context survives");
+        assert!(t.contains("a stone tower on the rise"), "and the outline");
+        assert!(t.ends_with("plan:"), "ending where the model should start writing");
     }
 }

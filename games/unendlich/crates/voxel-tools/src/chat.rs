@@ -99,6 +99,13 @@ pub struct ChatSession {
     /// as before.
     pub climate: (f32, f32),
     pub sea_level: i32,
+    /// Run an OUTLINE pass before the worker pass. Two round trips
+    /// instead of one: worth it for a village, wasteful for a tower,
+    /// so it is opt-in.
+    pub two_pass: bool,
+    /// How far the terrain read looks. Bigger is more context and more
+    /// tokens; 24 covers a village-sized decision.
+    pub scene_radius: i32,
     pending: Option<Pending>,
     /// Edit ids of the last committed plan, within one VoxelTools.
     last_commit: Vec<u64>,
@@ -135,7 +142,8 @@ pub struct ChatSession {
 impl ChatSession {
     pub fn new(chunk_size: i32, from_y: i32) -> Self {
         Self { budget: 200_000, chunk_size, from_y, profile: Profile::GroundUp,
-               climate: (0.5, 0.5), sea_level: 64, ..Default::default() }
+               climate: (0.5, 0.5), sea_level: 64, scene_radius: 24, two_pass: false,
+               ..Default::default() }
     }
 
     /// `/build enableVoice` / `disableVoice`. Returns the grammar the
@@ -194,6 +202,11 @@ impl ChatSession {
         let amb = tools.read_ambient(f.anchor.0, f.anchor.2, self.from_y,
                                      self.climate.0, self.climate.1, self.sea_level);
         let site = amb.prompt_line();
+        // Perception is COMPUTED, not asked for. A scene-setting model
+        // pass would spend a third of the latency producing a worse
+        // description than the one the world can just be read for.
+        let scene = crate::scene::read(tools, f.anchor, self.scene_radius,
+                                       self.from_y, 15);
         let last = match &self.last_build {
             Some(lb) => format!(
                 "\nLAST BUILD '{}': box {:?}..{:?}, {} blocks{}. Follow-ups should attach to it; \
@@ -202,7 +215,8 @@ impl ChatSession {
                 lb.palette_hint.as_ref().map(|p| format!(", palette {p}")).unwrap_or_default()),
             None => String::new(),
         };
-        format!("{}\n{site}\n{digest}\n{col}{last}", f.read_hint(surface_name))
+        format!("{}\n{site}\n\n{}\n\n{digest}\n{col}{last}",
+                f.read_hint(surface_name), scene.prompt_block())
     }
 
     /// Does the focus currently sit on or inside the last build? Used
@@ -712,5 +726,26 @@ mod tests {
         let s = ChatSession::new(32, 200);
         let ctx = s.context(&t, &gaze_at(0, 0, 12.0), None);
         assert!(ctx.contains("temperate"), "the default is the middle: {ctx}");
+    }
+
+    #[test]
+    fn the_model_is_shown_the_terrain_not_asked_to_imagine_it() {
+        struct Slope(std::collections::BTreeMap<(i32,i32,i32), u16>);
+        impl VoxelWorld for Slope {
+            fn get(&self, x: i32, y: i32, z: i32) -> u16 {
+                if let Some(&b) = self.0.get(&(x,y,z)) { return b; }
+                if y <= 64 + x / 2 { 1 } else { 0 }
+            }
+            fn set(&mut self, x: i32, y: i32, z: i32, b: u16) -> bool {
+                self.0.insert((x,y,z), b); true
+            }
+        }
+        let mut w = Slope(Default::default());
+        let t = VoxelTools::new(&mut w);
+        let s = ChatSession::new(32, 250);
+        let ctx = s.context(&t, &gaze_at(0, 0, 12.0), None);
+        assert!(ctx.contains("TERRAIN"), "a picture of the ground: {ctx}");
+        assert!(ctx.contains('@'), "with the player marked");
+        assert!(ctx.contains("rises"), "and the slope named in words");
     }
 }

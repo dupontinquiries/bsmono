@@ -73,6 +73,8 @@ pub mod weather;
 pub mod ambient;
 /// Detailing: speckle, relief, trim, feather, ground blend.
 pub mod detail;
+/// Scene: computed ASCII views and terrain vocabulary for the prompt.
+pub mod scene;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.
