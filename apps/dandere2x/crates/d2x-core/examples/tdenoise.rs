@@ -10,6 +10,15 @@
 //!
 //! Usage:
 //!   tdenoise <in.rgb> <out.rgb> <width> <height> [--k 4] [--rmse 12] [--mean|--sharpest] [--seed]
+//!   tdenoise ... --from F [--oracle hi.rgb]
+//!
+//! `--from F` inverts the hunt: one frame F is the source and every other
+//! frame's blocks are REPLACED by their aligned block from F wherever the
+//! alignment passes the gate (alignment is always computed on the input
+//! frames, since that is all a real pipeline has). With `--oracle hi.rgb`
+//! the copied pixels come from the high-bitrate version of F instead: the
+//! upper bound of "restore the one best frame perfectly, then propagate it",
+//! which is what targeting the network at unique frames would achieve.
 //!
 //! `in.rgb` is raw rgb24 frames (ffmpeg -f rawvideo -pix_fmt rgb24). A
 //! neighbour's block is used only if its RMSE against the frame's own block
@@ -37,12 +46,32 @@
 //! per-frame noise: a median has nothing to vote against, and "take the
 //! sharpest aligned block" copies misalignment as if it were detail. The GOP
 //! quality spread is mild (one frame at 40.7 dB, the rest 36–38).
+//!
+//! `--from 6` (the 40.7 dB frame), same clip, PSNR / SSIM vs the 2.5 Mbps encode:
+//!   distance   as-is          from 6 (low)   from 6 + oracle
+//!   ±1         38.2 / 0.979   37.6 / 0.978   39.0 / 0.987   (+0.8 dB, +0.008)
+//!   ±2         37.8 / 0.977   37.1 / 0.975   38.1 / 0.982
+//!   ±3–4       37.3 / 0.975   36.7 / 0.973   37.4 / 0.978   (≈ 0)
+//!   ±6–12      37.5 / 0.974   36.6 / 0.970   37.0 / 0.971   (loss)
+//! Propagating the best LOW frame loses everywhere (its 40.7 dB is lower
+//! low-frequency error, not more detail: HF 1.80 vs neighbours 1.8).
+//! Propagating a perfectly RESTORED frame gains for ±2 frames and the copied
+//! detail is real (HF 1.91–1.95 vs ground truth 1.90–1.98); past ±2 integer
+//! alignment drift eats it. So one restored frame in ~5, propagated ±2, is
+//! the shape that pays; sub-pel alignment is what would widen it.
 
 use d2x_core::frame::{block_sse_bounded, Frame};
 use d2x_core::matcher::{BlockMatcher, Diamond};
 use d2x_core::phase_corr::PhaseCorrelation;
 use d2x_core::predict::block_hf_energy;
 use rayon::prelude::*;
+
+fn read_frames(path: &str, w: u32, h: u32) -> anyhow::Result<Vec<Frame>> {
+    let raw = std::fs::read(path)?;
+    let fb = (w * h * 3) as usize;
+    anyhow::ensure!(raw.len() % fb == 0, "{path}: not a whole number of {w}x{h} rgb24 frames");
+    Ok((0..raw.len() / fb).map(|t| Frame::from_rgb(w, h, raw[t * fb..(t + 1) * fb].to_vec()).unwrap()).collect())
+}
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -53,6 +82,8 @@ fn main() -> anyhow::Result<()> {
     let mut mean = false;
     let mut sharpest = false;
     let mut seed = false;
+    let mut from: Option<usize> = None;
+    let mut oracle: Option<Vec<Frame>> = None;
     let mut i = 5;
     while i < args.len() {
         match args[i].as_str() {
@@ -60,6 +91,8 @@ fn main() -> anyhow::Result<()> {
             "--rmse" => { rmse = args[i + 1].parse()?; i += 1; }
             "--mean" => mean = true,
             "--sharpest" => sharpest = true,
+            "--from" => { from = Some(args[i + 1].parse()?); i += 1; }
+            "--oracle" => { oracle = Some(read_frames(&args[i + 1], w, h)?); i += 1; }
             "--seed" => seed = true,
             a => anyhow::bail!("unknown arg {a}"),
         }
@@ -67,10 +100,9 @@ fn main() -> anyhow::Result<()> {
     }
     let bs = 24u32; // 1920 and 1080 are both multiples of 24
     anyhow::ensure!(w % bs == 0 && h % bs == 0, "frame must be a multiple of {bs}");
-    let raw = std::fs::read(&args[1])?;
-    let fb = (w * h * 3) as usize;
-    let n = raw.len() / fb;
-    let frames: Vec<Frame> = (0..n).map(|t| Frame::from_rgb(w, h, raw[t * fb..(t + 1) * fb].to_vec()).unwrap()).collect();
+    let frames = read_frames(&args[1], w, h)?;
+    let n = frames.len();
+    let raw_len = n * (w * h * 3) as usize;
     eprintln!("{n} frames {w}x{h}, k={k}, rmse<={rmse}, {}, seed={seed}", if sharpest { "sharpest" } else if mean { "mean" } else { "median" });
 
     // Pairwise global motion, accumulated, for seeding.
@@ -87,13 +119,24 @@ fn main() -> anyhow::Result<()> {
     let cols = (w / bs) as usize;
     let rows = (h / bs) as usize;
 
-    let mut out = Vec::with_capacity(raw.len());
+    let mut out = Vec::with_capacity(raw_len);
     let mut used_total = 0u64;
     let mut blocks_total = 0u64;
     for t in 0..n {
         let cur = &frames[t];
-        let lo = t.saturating_sub(k);
-        let hi = (t + k).min(n - 1);
+        let (lo, hi) = match from {
+            Some(f) => (f, f),
+            None => (t.saturating_sub(k), (t + k).min(n - 1)),
+        };
+        if from == Some(t) {
+            // The source frame itself: pass through (or its oracle, which is
+            // "the network restored this one frame perfectly").
+            let src = oracle.as_ref().map_or(cur, |o| &o[t]);
+            out.extend_from_slice(&src.data);
+            blocks_total += (cols * rows) as u64;
+            eprintln!("frame {t:3}: source frame");
+            continue;
+        }
         // Per block: the set of aligned neighbour blocks that pass the RMSE test.
         let per_block: Vec<(Vec<(usize, u32, u32)>, u32)> = (0..cols * rows)
             .into_par_iter()
@@ -128,6 +171,12 @@ fn main() -> anyhow::Result<()> {
             }
             used += 1;
             let (x, y) = (((bi % cols) as u32) * bs, ((bi / cols) as u32) * bs);
+            if from.is_some() {
+                let (s, sx, sy) = srcs[0];
+                let src = oracle.as_ref().map_or(&frames[s], |o| &o[s]);
+                f.copy_block(src, bs, sx, sy, x, y);
+                continue;
+            }
             if sharpest {
                 let own = block_hf_energy(cur, x, y, bs);
                 let best = srcs.iter().map(|&(s, sx, sy)| (block_hf_energy(&frames[s], sx, sy, bs), s, sx, sy)).fold(None, |acc: Option<(f64, usize, u32, u32)>, c| if acc.map_or(true, |a| c.0 > a.0) { Some(c) } else { acc });
