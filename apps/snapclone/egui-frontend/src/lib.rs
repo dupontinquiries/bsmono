@@ -5490,18 +5490,41 @@ mod tests {
     #[test]
     fn every_page_lays_out_without_text_collisions() {
         use egui::{Context, RawInput, Pos2};
-        for (label, size, compact) in [("phone", egui::vec2(360.0, 780.0), true), ("desktop", egui::vec2(1280.0, 800.0), false)] {
+        for (label, size, compact) in [("phone", egui::vec2(360.0, 780.0), true),
+                                       // 400x800 as well: the composer overflow that this
+                                       // test missed was found by screenshot at exactly this
+                                       // width, and a probe that only samples one narrow size
+                                       // can miss a row that happens to fit at the other.
+                                       ("phone400", egui::vec2(400.0, 800.0), true),
+                                       ("desktop", egui::vec2(1280.0, 800.0), false)] {
             for page in 0..PAGES.len() {
                 let ctx = Context::default();
                 let mut app = app();
                 app.nav.go_page(page);
-                let mut adaptive = Adaptive::default();
-                if compact { adaptive.class = uikit_egui::adaptive::DeviceClass::Phone; }
+                // `Adaptive::detect(ctx)`, exactly as the runtime's `update`
+                // does — NOT a hand-built default with `class` overridden.
+                // That was the fixture's flaw: `detect` derives the gutter,
+                // the safe area and the touch target from the real content
+                // rect, and those drive the spacing that decides whether a
+                // row overflows. With a default `Adaptive` the harness laid
+                // the page out differently from the app and reported a
+                // composer overflow as clean. Detected inside the closure
+                // because it needs the ctx.
+                let _ = compact;
                 let screen = egui::Rect::from_min_size(Pos2::ZERO, size);
                 let mut shapes = Vec::new();
                 for _ in 0..3 {
                     let out = ctx.run(RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+                        // The runtime applies the prefs (fonts, spacing,
+                        // palette) BEFORE drawing. Without this the harness
+                        // laid the page out at egui's default text metrics,
+                        // where everything fits — which is why it could not
+                        // see a row that overflows at the app's real ones.
+                        app.apply_settings(ctx, &settings_kit::Prefs::default());
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let adaptive = Adaptive::detect(ctx);
+                            app.ui(ui, &adaptive);
+                        });
                     });
                     shapes = out.shapes;
                 }

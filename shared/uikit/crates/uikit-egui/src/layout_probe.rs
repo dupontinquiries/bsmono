@@ -129,8 +129,24 @@ pub fn analyse(screen: Rect, shapes: &[ClippedShape], compact: bool) -> Report {
         if inter.is_negative() || inter.width() <= 0.0 || inter.height() <= 0.0 {
             // Entirely outside its clip: painted nowhere. Off-screen if
             // also outside the screen, else clipped away whole.
-            if !screen.intersects(a.rect) { r.offscreen.push(a.clone()); }
-            else { r.clipped.push((a.clone(), a.rect.width().max(a.rect.height()))); }
+            // Scrolled out of view — vertically past the viewport, whether
+            // that viewport ends at the window edge or before it — is a
+            // scroll edge in BOTH cases. Deciding "off-screen" purely on the
+            // screen rect called ordinary content below the fold a fault.
+            let x_overlaps = a.rect.min.x < a.clip.max.x && a.rect.max.x > a.clip.min.x;
+            if !screen.intersects(a.rect) && !x_overlaps {
+                r.offscreen.push(a.clone());
+            } else if x_overlaps {
+                // Entirely outside its clip, but its X RANGE still overlaps:
+                // the row is above or below the viewport, i.e. scrolled out.
+                // That is a scroll edge, not a layout fault — the previous
+                // classification reported every row scrolled past the bottom
+                // of a settings page as "clipped", which is a false positive
+                // that would train a reader to ignore the report.
+                r.cut_vertically.push((a.clone(), a.rect.height()));
+            } else {
+                r.clipped.push((a.clone(), a.rect.width().max(a.rect.height())));
+            }
             continue;
         }
         let over_x = a.rect.width() - inter.width();
