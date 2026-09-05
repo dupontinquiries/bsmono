@@ -104,32 +104,37 @@ impl Default for Diamond {
     }
 }
 
-const LDSP: [(i64, i64); 9] = [(0, 0), (2, 0), (-2, 0), (0, 2), (0, -2), (1, 1), (-1, 1), (1, -1), (-1, -1)];
-const SDSP: [(i64, i64); 5] = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
-
-impl BlockMatcher for Diamond {
-    fn search(&self, prev: &Frame, next: &Frame, dst_x: u32, dst_y: u32, size: u32, limit: u64) -> Option<Candidate> {
-        let (ox, oy) = (dst_x as i64, dst_y as i64);
+impl Diamond {
+    /// The walk, over any probe function — `search` hands it the SSE test;
+    /// tests hand it a counter. Every (x, y) is probed AT MOST ONCE: `(0,0)`
+    /// is in the large pattern on every step, and after a move four of the
+    /// nine new points were the previous step's, so without the visited
+    /// list close to half of a moved block's probes were repeats of a
+    /// block SSE already known. `visited` is a flat array (at most
+    /// 9·max_steps + 5 entries) scanned linearly: a scan of a few dozen
+    /// pairs against a 30×30×3 SSE is not a contest.
+    pub fn walk(&self, ox: i64, oy: i64, limit: u64, mut eval: impl FnMut(i64, i64, u64) -> Option<Candidate>) -> Option<Candidate> {
         let r = self.radius as i64;
         let within = |x: i64, y: i64| (x - ox).abs() <= r && (y - oy).abs() <= r;
-
+        let mut visited: Vec<(i64, i64)> = Vec::with_capacity(9 * self.max_steps as usize + 6);
         // The walk follows the error *gradient*, so probes are bounded by
         // the best SSE seen so far — not by the gate's threshold. Bounding
         // by the threshold would return `None` for every step that is
         // merely better than the last, and the walk would never move. The
         // threshold is applied once, to the final answer.
         let (mut cx, mut cy) = (ox, oy);
-        let mut best = test(prev, next, dst_x, dst_y, cx, cy, size, u64::MAX);
+        visited.push((cx, cy));
+        let mut best = eval(cx, cy, u64::MAX);
         let mut lim = best.map_or(u64::MAX, |b| b.sse);
-
-        let probe = |cx: i64, cy: i64, pattern: &[(i64, i64)], best: &mut Option<Candidate>, lim: &mut u64| -> (i64, i64) {
+        let mut probe = |cx: i64, cy: i64, pattern: &[(i64, i64)], best: &mut Option<Candidate>, lim: &mut u64, visited: &mut Vec<(i64, i64)>| -> (i64, i64) {
             let mut arg = (cx, cy);
             for &(dx, dy) in pattern {
                 let (x, y) = (cx + dx, cy + dy);
-                if !within(x, y) {
+                if !within(x, y) || visited.contains(&(x, y)) {
                     continue;
                 }
-                if let Some(c) = test(prev, next, dst_x, dst_y, x, y, size, *lim) {
+                visited.push((x, y));
+                if let Some(c) = eval(x, y, *lim) {
                     if best.map_or(true, |b| c.sse < b.sse) {
                         *lim = c.sse;
                         *best = Some(c);
@@ -139,16 +144,25 @@ impl BlockMatcher for Diamond {
             }
             arg
         };
-
         for _ in 0..self.max_steps {
-            let (nx, ny) = probe(cx, cy, &LDSP, &mut best, &mut lim);
+            let (nx, ny) = probe(cx, cy, &LDSP, &mut best, &mut lim, &mut visited);
             if (nx, ny) == (cx, cy) {
                 break;
             }
             (cx, cy) = (nx, ny);
         }
-        probe(cx, cy, &SDSP, &mut best, &mut lim);
+        probe(cx, cy, &SDSP, &mut best, &mut lim, &mut visited);
         best.filter(|b| b.sse <= limit)
+    }
+}
+
+const LDSP: [(i64, i64); 9] = [(0, 0), (2, 0), (-2, 0), (0, 2), (0, -2), (1, 1), (-1, 1), (1, -1), (-1, -1)];
+const SDSP: [(i64, i64); 5] = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
+
+impl BlockMatcher for Diamond {
+    fn search(&self, prev: &Frame, next: &Frame, dst_x: u32, dst_y: u32, size: u32, limit: u64) -> Option<Candidate> {
+        let eval = |x: i64, y: i64, lim: u64| test(prev, next, dst_x, dst_y, x, y, size, lim);
+        self.walk(dst_x as i64, dst_y as i64, limit, eval)
     }
     fn name(&self) -> &'static str {
         "diamond"
@@ -232,4 +246,29 @@ mod tests {
         }
         assert!(worse <= 3, "diamond worse than exhaustive on {worse}/16 blocks");
     }
+    /// The visited list pays: a block that moved (6, 4) is found with far
+    /// fewer probes than the pattern count would suggest, and no (x, y) is
+    /// ever probed twice. Counted through `walk`'s probe closure on a
+    /// synthetic error surface (SSE = squared distance from the true
+    /// source), so this is the walk's arithmetic and nothing else.
+    #[test]
+    fn the_diamond_walk_never_probes_a_point_twice() {
+        let d = Diamond { max_steps: 16, radius: 32 };
+        let (tx, ty) = (106i64, 84i64); // where the block really came from
+        let mut probes: Vec<(i64, i64)> = Vec::new();
+        let found = d.walk(100, 80, u64::MAX, |x, y, _| {
+            probes.push((x, y));
+            let sse = ((x - tx).pow(2) + (y - ty).pow(2)) as u64 * 10;
+            Some(Candidate { src_x: x as u32, src_y: y as u32, sse })
+        }).unwrap();
+        assert_eq!((found.src_x, found.src_y), (106, 84));
+        let mut sorted = probes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), probes.len(), "a point was probed twice: {probes:?}");
+        // Without the list: 9 per step × 4 steps + 5, plus the centre. With it,
+        // every overlap between consecutive diamonds is skipped.
+        assert!(probes.len() <= 30, "{} probes for a (6,4) move", probes.len());
+    }
+
 }
