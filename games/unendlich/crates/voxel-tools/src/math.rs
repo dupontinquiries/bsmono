@@ -223,6 +223,24 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                 push(Note::Info, format!("tree height {height}, roughly {} blocks with canopy",
                                           height + 60), None);
             }
+            Op::Form { name, min, max, style, nums, .. } => {
+                // The arithmetic echo cannot know a recipe's volume
+                // without building it, and building it here would double
+                // the work. Report the footprint and the parameters --
+                // which is what the player needs to sanity-check scale --
+                // and let the dry run give the exact count.
+                let (w, d) = (span(min.0, max.0), span(min.1, max.1));
+                let params = if nums.is_empty() { String::new() } else {
+                    format!("  {}", nums.iter().map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>().join(" "))
+                };
+                let sty = if style.is_empty() { String::new() } else { format!(" {style}") };
+                total += w as i64 * d as i64 * 2;
+                push(Note::Info,
+                     format!("form '{name}'{sty} over {w}x{d}{params} \
+                              (exact count from the dry run)"),
+                     None);
+            }
             Op::Roof { min, max, style, overhang, .. } => {
                 let (w, d) = (span(min.0, max.0) + 2 * overhang, span(min.1, max.1) + 2 * overhang);
                 // A pitched roof is roughly the footprint plus its slopes;

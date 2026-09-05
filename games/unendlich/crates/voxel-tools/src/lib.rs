@@ -61,6 +61,10 @@ pub mod voice;
 pub mod model;
 /// Staging layer: buffer writes, flush grouped by chunk.
 pub mod staged;
+/// The form layer: continuous solids, CSG, and rasterization to blocks.
+pub mod solid;
+/// Named forms as recipes over solids, so a new form is data.
+pub mod dict;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.
@@ -362,6 +366,28 @@ impl<'w, W: VoxelWorld> VoxelTools<'w, W> {
         }
         let n = e.before.len();
         self.finish(e, format!("{style} roof, {n} blocks"))
+    }
+
+    /// Rasterize a solid into the world.
+    ///
+    /// The bridge between the two layers. Everything above this line is
+    /// continuous and grid-free; everything below is blocks. Conflicts
+    /// were already resolved by `rank` during sampling, so this is a
+    /// plain write -- which is the payoff: the ordering questions that
+    /// plagued op-by-op building were answered one layer up.
+    pub fn stamp(&mut self, solid: &crate::solid::Solid) -> CallResult {
+        let cells = crate::solid::rasterize(solid);
+        if cells.len() > MAX_BLOCKS_PER_CALL {
+            return CallResult::err(format!(
+                "refused: form covers {} blocks, over MAX_BLOCKS_PER_CALL={}",
+                cells.len(), MAX_BLOCKS_PER_CALL));
+        }
+        let mut e = self.begin("form");
+        for ((x, y, z), b) in cells {
+            self.write(&mut e, x, y, z, b);
+        }
+        let n = e.before.len();
+        self.finish(e, format!("form, {n} blocks"))
     }
 
     /// Mirror a region across an axis. `axis` is "x" or "z".

@@ -136,6 +136,14 @@ pub enum Op {
     Stairs { from: (i32, i32), to: (i32, i32), y: Option<i32>, width: i32, block: u16 },
     /// A storey floor inside a footprint.
     Floor { min: (i32, i32), max: (i32, i32), y: Option<i32>, block: u16 },
+    /// ONE verb reaching the whole form dictionary.
+    ///
+    /// `roof`, `wall`, `house`, `colonnade`, `arch`, `tower` and
+    /// everything added later are entries in `dict::FORMS`, not ops.
+    /// Adding `dormer` is a table row: no parser arm, no run arm, no
+    /// math arm, no exhaustiveness break in three files.
+    Form { name: String, min: (i32, i32), max: (i32, i32), y: Option<i32>,
+           style: String, block: u16, accent: u16, nums: Vec<(String, i32)> },
     Fill { min: (i32, i32, i32), max: (i32, i32, i32), block: u16, hollow: bool },
     Cylinder { at: (i32, i32), y: Option<i32>, radius: i32, height: i32, block: u16, hollow: bool },
     Sphere { at: (i32, i32), y: Option<i32>, radius: i32, block: u16, hollow: bool },
@@ -393,6 +401,39 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                 ops.push(Op::Enclose {
                     min: a, max: b, height: kvi(&t, "h", 3).max(1),
                     block: blk("oak_planks").unwrap_or(57) });
+            }
+            // `form <name> A B [style] [k=v ...]` -- the dictionary verb.
+            "form" | "build" => {
+                let Some(name) = t.get(1).map(|s| s.to_string()) else {
+                    bad("form needs a name, e.g. `form house @-6,-6 @6,6`".into());
+                    continue;
+                };
+                if crate::dict::lookup(&name).is_none() {
+                    bad(format!("unknown form '{name}'; known: {}",
+                        crate::dict::FORMS.iter().map(|f| f.name)
+                            .collect::<Vec<_>>().join(", ")));
+                    continue;
+                }
+                // Coordinates start at token 2 for this verb, so shift.
+                let shifted: Vec<&str> = std::iter::once("form")
+                    .chain(t.iter().skip(2).copied()).collect();
+                let Some((a, b, note)) = footprint(&shifted, anchor) else {
+                    rel_err.set(true); continue;
+                };
+                if let Some(n) = note { assumed!(&n); }
+                let nums: Vec<(String, i32)> = t.iter().skip(2)
+                    .filter_map(|s| s.split_once('='))
+                    .filter_map(|(k, v)| v.parse().ok().map(|n| (k.to_string(), n)))
+                    .collect();
+                ops.push(Op::Form {
+                    name, min: a, max: b,
+                    y: kv(&t, "y").and_then(|v| v.parse().ok()),
+                    style: t.iter().skip(2)
+                        .find(|s| !s.contains('=') && !s.contains(',') && !s.starts_with('@'))
+                        .unwrap_or(&"").to_string(),
+                    block: blk("stone").unwrap_or(1),
+                    accent: blk("dark_oak_planks").unwrap_or(86),
+                    nums });
             }
             "roof" => {
                 let Some((a, b, note)) = footprint(&t, anchor) else {
@@ -701,6 +742,19 @@ pub fn run_plan<W: VoxelWorld>(
                     if top == i32::MIN { from_y } else { top + 1 }
                 });
                 tools.roof((min.0, base, min.1), *max, style, *block, *overhang)
+            }
+            Op::Form { name, min, max, y, style, block, accent, nums } => {
+                let base = y.unwrap_or_else(|| {
+                    tools.find_surface(min.0, min.1, from_y).map(|s| s + 1).unwrap_or(from_y)
+                });
+                let args = crate::dict::FormArgs {
+                    min: (min.0, base, min.1), max: (max.0, base, max.1),
+                    style: style.clone(), block: *block, accent: *accent,
+                    nums: nums.clone() };
+                match crate::dict::lookup(name) {
+                    Some(f) => tools.stamp(&(f.build)(&args)),
+                    None => CallResult::err(format!("unknown form '{name}'")),
+                }
             }
             Op::Mirror { min, max, axis, about } => tools.mirror(*min, *max, axis, *about),
             Op::Bridge { from, to, y, width, block, supports } => {
