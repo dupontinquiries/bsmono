@@ -34,16 +34,22 @@ use crate::sim::affinity_access::Fields;
 use crate::sim::bending_charge::Resonance;
 use crate::sim::bending_feedback::{self, Backlash};
 use crate::sim::bending_focus::{focus, FocusItem};
+use crate::sim::bending_information::{self, Signature};
+use crate::sim::elemental::{self, CastProfile, ItemForm};
+use crate::sim::elemental_multiplier;
+use crate::sim::gesture_resolve;
 use crate::sim::bending_heavy_brine::{self, BrineEffect, BrineState, BrineTechnique};
 use crate::sim::bending_stormstrike::{self, Conductor, StrikePlan};
 use crate::sim::bending_targeting::{self, Hit, Target};
 use crate::sim::bending_thermal_phase::{self, Material, Phase};
 use crate::sim::player_bending::{BendInput, Discipline, EffectIntent, PlayerBending};
 
-/// The discipline-specific resolved effect. The three disciplines the brief names
-/// route to their real cores; `Information` and `Elemental` have no effect core
-/// this round and surface as [`DisciplineEffect::Unwired`] (honest scoping — they
-/// are *not* re-implemented here).
+/// The discipline-specific resolved effect. Every discipline routes to its real
+/// core: Information to `bending_information` (sense / disrupt / mask over the
+/// world's signatures), Elemental to `elemental`'s cast profile, form-adjusted and
+/// weighted per hit by `elemental_multiplier` against each target's element.
+/// [`DisciplineEffect::Unwired`] remains for a discipline that has no arm — none
+/// today; it is the honest answer if one is added before its core is.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DisciplineEffect {
     /// `bending_stormstrike::route` — the chained bolt plan.
@@ -53,7 +59,54 @@ pub enum DisciplineEffect {
     /// `bending_thermal_phase` — signed heat to reach `target` + its resonance cost.
     ThermalPhase { heat: f32, cost01: f32, target: Phase },
     /// A committed discipline with no wired effect core this round.
+    /// `bending_information` — what the bender sensed, or did to a signature.
+    Information(InfoEffect),
+    /// `elemental` — the cast's profile (form-adjusted) and each hit's potency
+    /// after the element-vs-element multiplier.
+    Elemental { element: elemental::Element, profile: CastProfile, potency: Vec<(usize, f32)> },
     Unwired(Discipline),
+}
+
+/// What the Information discipline did. Which one is the world's
+/// `info_tech`; the power is what resonance granted.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InfoEffect {
+    /// `(index into world.signatures, confidence)`, ascending index.
+    Sense(Vec<(usize, f32)>),
+    /// The nearest hit's signature, disrupted at this power.
+    Disrupt { target: usize, after: Signature },
+    /// Our own signature, masked at this power.
+    Mask { after: Signature },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum InfoTechnique {
+    #[default]
+    Sense,
+    Disrupt,
+    Mask,
+}
+
+/// gesture_resolve's four elements onto elemental's seven: the bending
+/// gesture is the coarse one; a lightning gesture is a Fire cast at range
+/// and dust is not a gesture anyone makes.
+pub fn elemental_of(e: gesture_resolve::Element) -> elemental::Element {
+    match e {
+        gesture_resolve::Element::Earth => elemental::Element::Earth,
+        gesture_resolve::Element::Water => elemental::Element::Water,
+        gesture_resolve::Element::Fire => elemental::Element::Fire,
+        gesture_resolve::Element::Air => elemental::Element::Air,
+    }
+}
+
+/// `elemental_multiplier` indexes elements as u8 in elemental's declaration
+/// order; a target with no element (`None`) is neutral.
+fn element_index(e: elemental::Element) -> u8 {
+    match e {
+        elemental::Element::Earth => 0, elemental::Element::Dust => 1, elemental::Element::Fire => 2,
+        elemental::Element::Lightning => 3, elemental::Element::Air => 4, elemental::Element::Water => 5,
+        elemental::Element::Wood => 6,
+    }
 }
 
 /// Everything one committed bend resolves to — the data the combat/render/UI
@@ -94,6 +147,16 @@ pub struct BendWorld<'a> {
     // --- Thermal Phase ---
     pub thermal: Material,
     pub thermal_target: Phase,
+    /// Information: our own signature, everyone else's (indexed like `targets`
+    /// where they coincide), the technique, and the range falloff `sense` uses.
+    pub local_signature: Signature,
+    pub signatures: &'a [Signature],
+    pub info_tech: InfoTechnique,
+    pub info_falloff: f32,
+    /// Elemental: the held item's form and each target's element, if it has one
+    /// (indexed like `targets`; shorter is fine — missing is neutral).
+    pub item_form: ItemForm,
+    pub target_elements: &'a [Option<elemental::Element>],
 }
 
 impl<'a> BendWorld<'a> {
@@ -112,6 +175,12 @@ impl<'a> BendWorld<'a> {
             brine_tech: BrineTechnique::Crush,
             thermal: Material { freeze_c: 0.0, boil_c: 100.0, temp_c: 20.0 },
             thermal_target: Phase::Gas,
+            local_signature: Signature::new(1.0, 0, 1.0),
+            signatures: &[],
+            info_tech: InfoTechnique::Sense,
+            info_falloff: 0.0,
+            item_form: ItemForm::Staff,
+            target_elements: &[],
         }
     }
 }
@@ -188,7 +257,29 @@ pub fn resolve_bend(intent: &EffectIntent, world: &BendWorld, resonance: Resonan
             cost01: bending_thermal_phase::technique_cost01(&world.thermal, world.thermal_target),
             target: world.thermal_target,
         },
-        d => DisciplineEffect::Unwired(d),
+        Discipline::Information => DisciplineEffect::Information(match world.info_tech {
+            InfoTechnique::Sense => InfoEffect::Sense(bending_information::sense(&world.local_signature, world.signatures, world.info_falloff)),
+            InfoTechnique::Disrupt => {
+                // The nearest hit's signature, when it has one; else nothing to disrupt → a sense.
+                let nearest = hits.iter().max_by(|a, b| a.strength01.partial_cmp(&b.strength01).unwrap_or(std::cmp::Ordering::Equal));
+                match nearest.and_then(|h| world.signatures.get(h.index).map(|s| (h.index, *s))) {
+                    Some((i, mut sig)) => { bending_information::disrupt(&mut sig, granted); InfoEffect::Disrupt { target: i, after: sig } }
+                    None => InfoEffect::Sense(bending_information::sense(&world.local_signature, world.signatures, world.info_falloff)),
+                }
+            }
+            InfoTechnique::Mask => { let mut me = world.local_signature; bending_information::mask(&mut me, granted); InfoEffect::Mask { after: me } }
+        }),
+        Discipline::Elemental(g) => {
+            let element = elemental_of(g);
+            let profile = elemental::form_adjust(world.item_form, elemental::base_profile(element));
+            let potency = hits.iter().map(|h| {
+                let mult = world.target_elements.get(h.index).copied().flatten()
+                    .map(|d| elemental_multiplier::multiplier(element_index(element), element_index(d)))
+                    .unwrap_or(1.0);
+                (h.index, profile.potency as f32 * granted * h.strength01 * mult)
+            }).collect();
+            DisciplineEffect::Elemental { element, profile, potency }
+        }
     };
 
     // 4. What being wrong / forcing it costs: misprediction (committed aim vs the
@@ -302,7 +393,7 @@ mod tests {
         assert!(matches!(thermal.effect, DisciplineEffect::ThermalPhase { .. }));
 
         let info = resolve_bend(&intent_for(Discipline::Information, Element::Air, [1.0, 0.0, 0.0], 1.0), &world, Resonance::full());
-        assert!(matches!(info.effect, DisciplineEffect::Unwired(Discipline::Information)));
+        assert!(matches!(info.effect, DisciplineEffect::Information(InfoEffect::Sense(_))));
     }
 
     // 3. Stormstrike actually routes through the conductor.
@@ -403,4 +494,49 @@ mod tests {
         assert!(out.backlash.self_damage01 > 0.0 || out.backlash.stagger01 > 0.0);
         assert!(matches!(out.effect, DisciplineEffect::HeavyBrine(_)));
     }
+    #[test]
+    fn information_senses_disrupts_and_masks_through_its_core() {
+        let targets = [Target { pos: [3.0, 0.0, 0.0], radius: 1.0 }, Target { pos: [8.0, 0.0, 0.0], radius: 1.0 }];
+        let sigs = [Signature::new(0.9, 1, 0.8), Signature::new(0.6, 2, 0.9)];
+        let mut world = BendWorld::for_targets([0.0; 3], &targets, &[]);
+        world.signatures = &sigs;
+        let sense = resolve_bend(&intent_for(Discipline::Information, Element::Air, [1.0, 0.0, 0.0], 1.0), &world, Resonance::full());
+        let DisciplineEffect::Information(InfoEffect::Sense(found)) = &sense.effect else { panic!("{:?}", sense.effect) };
+        assert!(!found.is_empty() && found.windows(2).all(|w| w[0].0 < w[1].0), "{found:?}");
+        world.info_tech = InfoTechnique::Disrupt;
+        let dis = resolve_bend(&intent_for(Discipline::Information, Element::Air, [1.0, 0.0, 0.0], 1.0), &world, Resonance::full());
+        let DisciplineEffect::Information(InfoEffect::Disrupt { target, after }) = &dis.effect else { panic!("{:?}", dis.effect) };
+        assert_eq!(*target, 0, "the nearest target's signature");
+        assert!(after.coherence01 < sigs[0].coherence01, "disrupted: {after:?}");
+        world.info_tech = InfoTechnique::Mask;
+        let mask = resolve_bend(&intent_for(Discipline::Information, Element::Air, [1.0, 0.0, 0.0], 1.0), &world, Resonance::full());
+        let DisciplineEffect::Information(InfoEffect::Mask { after }) = &mask.effect else { panic!("{:?}", mask.effect) };
+        assert!(after.strength < world.local_signature.strength || after.coherence01 < world.local_signature.coherence01, "masked: {after:?}");
+    }
+
+    #[test]
+    fn elemental_casts_carry_the_form_adjusted_profile_and_the_matchup_per_hit() {
+        let targets = [Target { pos: [3.0, 0.0, 0.0], radius: 1.0 }, Target { pos: [3.5, 0.5, 0.0], radius: 1.0 }];
+        let elems = [Some(elemental::Element::Wood), Some(elemental::Element::Water)];
+        let mut world = BendWorld::for_targets([0.0; 3], &targets, &[]);
+        world.target_elements = &elems;
+        world.item_form = ItemForm::Blade;
+        let out = resolve_bend(&intent_for(Discipline::Elemental(Element::Fire), Element::Fire, [1.0, 0.0, 0.0], 1.0), &world, Resonance::full());
+        let DisciplineEffect::Elemental { element, profile, potency } = &out.effect else { panic!("{:?}", out.effect) };
+        assert_eq!(*element, elemental::Element::Fire);
+        assert_eq!(*profile, elemental::form_adjust(ItemForm::Blade, elemental::base_profile(elemental::Element::Fire)));
+        assert_eq!(potency.len(), out.hits.len());
+        let of = |i: usize| potency.iter().find(|(k, _)| *k == i).map(|(_, p)| *p).unwrap_or(0.0);
+        // Fire into wood beats fire into water, whatever the exact table says.
+        if out.hits.iter().any(|h| h.index == 0) && out.hits.iter().any(|h| h.index == 1) {
+            let (h0, h1) = (out.hits.iter().find(|h| h.index == 0).unwrap().strength01, out.hits.iter().find(|h| h.index == 1).unwrap().strength01);
+            assert!(of(0) / h0.max(1e-6) > of(1) / h1.max(1e-6), "wood {} vs water {}", of(0), of(1));
+        }
+        // No Unwired discipline remains.
+        for d in [Discipline::Stormstrike, Discipline::HeavyBrine, Discipline::ThermalPhase, Discipline::Information, Discipline::Elemental(Element::Earth)] {
+            let o = resolve_bend(&intent_for(d, Element::Earth, [1.0, 0.0, 0.0], 1.0), &world, Resonance::full());
+            assert!(!matches!(o.effect, DisciplineEffect::Unwired(_)), "{d:?}");
+        }
+    }
+
 }
