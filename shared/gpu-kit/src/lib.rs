@@ -12,6 +12,8 @@
 //! queue` construction lives behind the `wgpu29` feature so it can be pinned and verified
 //! on-device without forcing a version on everyone.
 
+pub mod pace;
+
 /// Adapter power preference — maps 1:1 onto every wgpu version's enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Power {
