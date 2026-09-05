@@ -3765,7 +3765,21 @@ impl Snapclone {
         // being clipped at 200%; `controls_band` clamps it against the frame.
         let band = {
             let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
-            crate::camera::controls_band(vf_rect, row * 3.0 + 16.0)
+            // SEVEN rows, not three. What actually goes in this band is: a
+            // stall/frozen notice, the camera's name, the lens+rotate row, the
+            // timer+colour row, the delivery explanation, the send receipt and
+            // (sometimes) a "nobody to send to" warning. Sized at three, the
+            // surplus did not vanish and did not scroll — the child had a
+            // `max_rect` and NO clip rect, so it was drawn upward, over the
+            // "Camera" heading and the delivery line above the frame. That is
+            // exactly the six text-over-text collisions and the 34-pt clipped
+            // "colour" the layout probe reported at 360x780, and why this page
+            // was ratcheted instead of clean.
+            //
+            // `controls_band` still caps at half the frame, so a short viewport
+            // cannot let the band eat the picture; the clip below is what
+            // guarantees the cap can never again be paid for in overlap.
+            crate::camera::controls_band(vf_rect, row * 7.0 + 16.0)
         };
         {
             let p = ui.painter_at(band);
@@ -3781,6 +3795,10 @@ impl Snapclone {
             }
         }
         let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(band.shrink(6.0)));
+        // The clip is the guarantee. Whatever the band's height works out to on
+        // a given viewport and UI scale, its contents cannot paint outside it
+        // and over the page above.
+        ui.set_clip_rect(band);
         let ui = &mut ui;
         // A FROZEN STREAM IS MARKED rather than silently frozen: the user is
         // about to take a photo based on what this shows, and a still image
@@ -5457,15 +5475,16 @@ mod tests {
                 // THE RATCHET. Measured 2026-09-05 after the text floor and
                 // the Wayfinder fix. Two known remainders, both named so
                 // the next fix lowers a number rather than re-discovers it:
-                // * phone / Camera: the camera page is the one page drawn
-                //   outside the ScrollArea (`if page == 0` in draw_page),
-                //   so its composer row, delivery line and send receipt run
-                //   under the tab bar on a 780-pt screen — six text
-                //   overlaps and "colour" cut by 34 pt.
+                // * phone / Camera: FIXED. Its controls band was sized for
+                //   three rows while holding seven, and the child had no clip
+                //   rect, so the surplus painted upward over the heading.
                 // * desktop / Friends: the card's chevron runs 4 pt past
                 //   the card on two rows.
                 let (max_overlaps, max_clipped) = match (label, page) {
-                    ("phone", 0) => (6, 1),
+                    // phone/Camera was (6, 1) until the controls band was sized
+                    // for the seven rows it actually holds (it was sized for
+                    // three) and given the clip rect it never had. Clean now,
+                    // and held there.
                     ("desktop", 2) => (0, 2),
                     _ => (0, 0),
                 };
