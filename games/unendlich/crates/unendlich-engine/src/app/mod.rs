@@ -20,6 +20,9 @@ pub mod menu_view;
 
 #[cfg(feature = "egui")]
 pub mod live_menu;
+/// In-game build chat panel (body only; the renderer owns the chrome).
+#[cfg(feature = "ui-overlay")]
+pub mod chat_panel;
 
 pub mod multiplayer_svc;
 

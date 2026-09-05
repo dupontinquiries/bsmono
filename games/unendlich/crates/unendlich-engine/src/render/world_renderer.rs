@@ -517,6 +517,24 @@ pub struct WorldRenderer {
     /// r185: true while an egui text field has focus — the bin must not
     /// run letter hotkeys (C/B/I/P...) on typed characters.
     pub ui_wants_keyboard: bool,
+    /// Build chat: open state, input buffer and log. The buffer lives
+    /// here rather than in an egui TextEdit because keys are routed
+    /// through `voxel_tools::chatbox::ChatBox` (history, Tab cycling,
+    /// hotkeys) — two owners of one string is how a caret ends up in
+    /// the wrong place.
+    pub chat_open: bool,
+    pub chat_buffer: String,
+    pub chat_log: Vec<String>,
+    /// Set by the panel when the player clicks "build it" / "cancel";
+    /// drained by the bin, which owns the session.
+    pub chat_commit_clicked: bool,
+    pub chat_cancel_clicked: bool,
+    /// Card + completions for the verb being typed, filled by the bin.
+    pub chat_card: Option<(String, String, String)>,
+    pub chat_matches: Vec<(String, String)>,
+    pub chat_focus_hint: Option<String>,
+    pub chat_pending_blocks: Option<usize>,
+    pub chat_model: Option<String>,
     /// Clicks that collapsed into one frame (press+release same frame);
     /// forwarded to egui as discrete press/release pairs so fast / low-fps
     /// clicks still register on toggles.
@@ -1662,6 +1680,16 @@ impl WorldRenderer {
             #[cfg(feature = "ui-overlay")]
             ui_pointer_down_prev: false,
             ui_text_input: String::new(),
+            chat_open: false,
+            chat_buffer: String::new(),
+            chat_log: Vec::new(),
+            chat_commit_clicked: false,
+            chat_cancel_clicked: false,
+            chat_card: None,
+            chat_matches: Vec::new(),
+            chat_focus_hint: None,
+            chat_pending_blocks: None,
+            chat_model: None,
             ui_backspace: false,
             ui_enter: false,
             ui_wants_keyboard: false,
@@ -3857,6 +3885,44 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                 // Until the blur PostFx texture exists this is a translucent
                 // wash; the blur pass upgrades it via frosted_blur(tex, tint).
                 unendlich_ui::set_surface(c, unendlich_ui::Surface::frosted());
+                // ── Build chat (bottom bar) ──
+                // Anchored bottom-centre like a game chat, above the
+                // hotbar. Drawn before the menu so the pause menu wins
+                // the z-order if both are somehow open.
+                if self.chat_open {
+                    let card = self.chat_card.as_ref()
+                        .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()));
+                    let matches: Vec<(&str, &str)> = self.chat_matches.iter()
+                        .map(|(a, b)| (a.as_str(), b.as_str())).collect();
+                    let st = crate::app::chat_panel::ChatPanelState {
+                        buffer: &self.chat_buffer,
+                        log: &self.chat_log,
+                        card,
+                        matches: &matches,
+                        focus_hint: self.chat_focus_hint.as_deref(),
+                        pending_blocks: self.chat_pending_blocks,
+                        model: self.chat_model.as_deref(),
+                    };
+                    let gt = glass_t(c, "unendlich_chat", true);
+                    let mut out = crate::app::chat_panel::ChatPanelOut::default();
+                    egui::Window::new("unendlich_chat")
+                        .frame(glass_at(gt))
+                        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -48.0))
+                        .collapsible(false)
+                        .resizable(false)
+                        .title_bar(false)
+                        .show(c, |ui| {
+                            unendlich_ui::set_theme(ui.ctx(), unendlich_ui::Theme::DARK);
+                            out = crate::app::chat_panel::chat_panel_body(ui, &st);
+                        });
+                    if out.commit { self.chat_commit_clicked = true; }
+                    if out.cancel { self.chat_cancel_clicked = true; }
+                    if let Some(p) = out.pick { self.chat_buffer = p; }
+                    // While the chat is open the bin must not run letter
+                    // hotkeys on typed characters.
+                    self.ui_wants_keyboard = true;
+                }
+
                 // ── Title / pause menu (unendlich-fullgame) ──
                 if menu_open {
                     {

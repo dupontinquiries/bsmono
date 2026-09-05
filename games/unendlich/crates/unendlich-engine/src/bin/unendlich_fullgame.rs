@@ -1868,6 +1868,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // `p` again (or Esc) to exit. `ui_mouse_down` is the live left-button
     // state we forward to the renderer; tracked from MouseButton events.
     let mut p_pressed = false;
+    // ── Build chat (LLM paintbrush) ──────────────────────────────
+    // T opens it; Enter submits; Esc closes. Held across frames.
+    let mut paintbrush = unendlich_engine::voxel_chat::Paintbrush::new(
+        unendlich_engine::constants::CHUNK_SIZE);
+    let mut chat_toggle = false;
+    let mut chat_key: Option<voxel_tools::chatbox::Key> = None;
+    // Provider: an executable reading <system>\0<user> on stdin.
+    // UNENDLICH_BUILD_PROVIDER overrides; the fixture needs no model.
+    let build_provider: Vec<String> = std::env::var("UNENDLICH_BUILD_PROVIDER")
+        .ok()
+        .map(|v| v.split_whitespace().map(String::from).collect())
+        .unwrap_or_else(|| vec!["games/unendlich/crates/voxel-tools/providers/fixture.sh".to_string()]);
     let mut ui_mouse_down = false;
 
     // Rollback input buffer — captures one InputFrame per simulation
@@ -3706,15 +3718,53 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             match event {
                 WindowEvent::Char(ch) => {
-                    // r181: text input for egui fields (name/seed boxes).
-                    ui_text_frame.push(ch);
+                    // While the build chat is open it owns typed text;
+                    // egui fields never see it, so the two cannot both
+                    // claim a character.
+                    if renderer.chat_open {
+                        chat_key = Some(voxel_tools::chatbox::Key::Char(ch));
+                    } else {
+                        // r181: text input for egui fields (name/seed boxes).
+                        ui_text_frame.push(ch);
+                    }
                 }
                 WindowEvent::Scroll(dx, dy) => {
                     scroll_accum += dy as f32; // r122: consumed below per frame
                     scroll_accum_x += dx as f32; // r318: horizontal (trackpad)
                 }
                 WindowEvent::Key(Key::Escape, _, Action::Press, _) => {
-                    esc_pressed = true;
+                    if renderer.chat_open {
+                        chat_key = Some(voxel_tools::chatbox::Key::Escape);
+                    } else {
+                        esc_pressed = true;
+                    }
+                }
+                // Build chat keys. Enter opens it when closed (and
+                // submits when open) so the reflex from every other
+                // game works; T also opens it.
+                WindowEvent::Key(Key::Enter, _, Action::Press, _)
+                | WindowEvent::Key(Key::KpEnter, _, Action::Press, _) => {
+                    if renderer.chat_open {
+                        chat_key = Some(voxel_tools::chatbox::Key::Enter);
+                    } else {
+                        chat_toggle = true;
+                    }
+                }
+                WindowEvent::Key(Key::Tab, _, Action::Press, mods) if renderer.chat_open => {
+                    chat_key = Some(if mods.contains(glfw::Modifiers::Shift) {
+                        voxel_tools::chatbox::Key::ShiftTab
+                    } else {
+                        voxel_tools::chatbox::Key::Tab
+                    });
+                }
+                WindowEvent::Key(Key::Backspace, _, Action::Press, _) if renderer.chat_open => {
+                    chat_key = Some(voxel_tools::chatbox::Key::Backspace);
+                }
+                WindowEvent::Key(Key::Up, _, Action::Press, _) if renderer.chat_open => {
+                    chat_key = Some(voxel_tools::chatbox::Key::Up);
+                }
+                WindowEvent::Key(Key::Down, _, Action::Press, _) if renderer.chat_open => {
+                    chat_key = Some(voxel_tools::chatbox::Key::Down);
                 }
                 WindowEvent::Key(key, scancode, Action::Press, _) => {
                     // #2 (Dvorak): toggle panel mode on the key LABELED 'p' in the
@@ -4203,6 +4253,110 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 renderer.craft_menu_open = false;
             }
         }
+        // ── Build chat: keys -> commands -> world ────────────────
+        {
+            use unendlich_engine::voxel_chat::Pending;
+            use voxel_tools::chatbox::Key as CK;
+
+            if chat_toggle {
+                chat_toggle = false;
+                // Feed Enter to the box so it opens through the same
+                // state machine the tests drive.
+                paintbrush.key(CK::Enter);
+                renderer.chat_open = paintbrush.captures_input();
+            }
+
+            let mut submitted: Option<unendlich_engine::sim::command_parse::Command> = None;
+            if let Some(k) = chat_key.take() {
+                submitted = paintbrush.key(k);
+                renderer.chat_open = paintbrush.captures_input();
+            }
+
+            if renderer.chat_open || submitted.is_some() {
+                // Gaze: same octree raycast the block-placement path uses,
+                // so "where I'm looking" means exactly what it means for
+                // breaking a block.
+                let fwd = local_player.forward();
+                let hit = chunk_manager
+                    .raycast_octree([pos.x, pos.y, pos.z], [fwd.x, fwd.y, fwd.z], 128.0,
+                                    |b| b.is_solid())
+                    .map(|h| ([h.world_cell.0, h.world_cell.1, h.world_cell.2],
+                              [h.normal.0, h.normal.1, h.normal.2],
+                              h.t));
+                let gaze = unendlich_engine::voxel_chat::Paintbrush::gaze_from(
+                    [pos.x, pos.y, pos.z], [fwd.x, fwd.y, fwd.z], hit);
+
+                if let Some(cmd) = submitted {
+                    match paintbrush.dispatch(&chunk_manager, &gaze, cmd) {
+                        Pending::Model(prose) => {
+                            // `/build debug ...` skips the model entirely and
+                            // uses the fixture provider: proves the whole
+                            // path with no weights loaded.
+                            let argv: Vec<String> = if prose.starts_with("debug") {
+                                vec!["games/unendlich/crates/voxel-tools/providers/fixture.sh".into()]
+                            } else {
+                                build_provider.clone()
+                            };
+                            let (sys, user) =
+                                paintbrush.prompt_for(&chunk_manager, &gaze, None, &prose);
+                            // Blocking. A local 7B takes a second or two and
+                            // this stalls the frame; the worker-thread version
+                            // is the obvious next step, but a stall you can
+                            // see beats a loop you cannot test.
+                            let mut prov = voxel_tools::llm::CommandProvider::new(argv);
+                            match voxel_tools::llm::Completer::complete(&mut prov, &sys, &user) {
+                                Ok(raw) => paintbrush.finish_turn(
+                                    &chunk_manager, &gaze, &raw,
+                                    Some((pos.x as i32, pos.y as i32, pos.z as i32))),
+                                Err(e) => paintbrush.say(format!("provider failed: {e}")),
+                            }
+                        }
+                        Pending::LoadModel(path) => {
+                            // No in-process loader: the provider script owns
+                            // the weights. Record the choice so `$VOXEL_MODEL`
+                            // reaches the child, and report it.
+                            std::env::set_var("VOXEL_MODEL", &path);
+                            paintbrush.finish_load(16384);
+                        }
+                        Pending::VoiceGrammar(_) | Pending::VoiceOff | Pending::None => {}
+                    }
+                }
+
+                // Clicks from the panel.
+                if std::mem::take(&mut renderer.chat_commit_clicked) {
+                    paintbrush.dispatch(&chunk_manager, &gaze,
+                        unendlich_engine::sim::command_parse::Command::CommitPlan);
+                }
+                if std::mem::take(&mut renderer.chat_cancel_clicked) {
+                    paintbrush.say("cancelled");
+                }
+
+                // Push panel state to the renderer.
+                let f = paintbrush.session.focus(&gaze);
+                renderer.chat_focus_hint = Some(format!(
+                    "{} @ {:?}", f.tier.name(), f.anchor));
+            }
+
+            renderer.chat_buffer = paintbrush.chatbox.buffer.clone();
+            renderer.chat_card = paintbrush.chatbox.current_card()
+                .map(|c| (c.command.to_string(), c.signature.to_string(), c.summary.to_string()));
+            renderer.chat_matches = paintbrush.chatbox.matching_cards().iter()
+                .map(|c| (c.command.to_string(), c.summary.to_string())).collect();
+            renderer.chat_model = match &paintbrush.models.state {
+                voxel_tools::model::LoadState::Loaded { name, .. } => Some(name.clone()),
+                _ => None,
+            };
+            for line in paintbrush.drain_log() { renderer.chat_log.push(line); }
+            // Reveal frames are drained but not yet used to animate: the
+            // remesh already happened inside `set_blocks`, which calls
+            // `replace_edited_chunk` (octree rebuild + dirty stamp) and
+            // bumps edge neighbours, once per chunk rather than once per
+            // block. Progressive reveal means holding the frames and
+            // writing them per tick instead of all at commit — the frames
+            // are here and ordered for exactly that.
+            let (_frames, _fps) = paintbrush.take_reveal();
+        }
+
         if renderer.settings_menu_open && esc_pressed {
             renderer.settings_menu_open = false;
             save_settings(&settings_path, &renderer); // r187 sticky
