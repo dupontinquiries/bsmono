@@ -980,8 +980,10 @@ asked as a question.
   the bare binary gets the CLI usage text. Whatever gitmind's app catalog
   records for dandere2x needs `app` appended, or dandere2x needs to default
   to the GUI when run with no subcommand and a display present.
-- [ ] **dandere2x: drag-and-drop onto the input, with a confirmation.**
-  NEW FEATURE. eframe surfaces dropped files via `ctx.input(|i| &i.raw.dropped_files)`;
+- [x] **dandere2x: drag-and-drop onto the input, with a confirmation.**
+  DONE 2026-09-05 (`d2x_core::dropped` + a confirm dialog). Dialog itself
+  not screenshotted — synthesising a real X11 drop needs a drag source.
+  WAS: eframe surfaces dropped files via `ctx.input(|i| &i.raw.dropped_files)`;
   the confirmation matters because a drop replaces the input path and the
   previous one is not recoverable from the UI.
 - [ ] **logscope scenes: ground and leaf textures gone flat (reported with a

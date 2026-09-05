@@ -154,6 +154,10 @@ struct Shell {
     matcher: usize,
     backend: usize,
     input: String,
+    /// A dropped path waiting on confirmation. A drop has no undo — it
+    /// overwrites the input and the old text is gone — so it never takes
+    /// effect on release. See `d2x_core::dropped`.
+    pending_drop: Option<d2x_core::dropped::Pending>,
     output: String,
     /// The last value `suggested_output` put in the box.
     ///
@@ -198,6 +202,7 @@ impl Default for Shell {
             matcher: 1,
             backend: 0,
             input: String::new(),
+            pending_drop: None,
             output: String::new(),
             // Lost by the c14unified-026 merge: it took THEIR app.rs hunk,
             // which predates these two fields, while the struct definition
@@ -757,6 +762,50 @@ impl Shell {
 impl eframe::App for Shell {
     // The house eframe shape: root-Ui entry point.
     fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
+        // DRAG AND DROP. Read once per frame, before anything draws, so a
+        // drop that lands during this frame is classified against the input
+        // as it was — not as some widget below has just edited it.
+        {
+            let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|i| {
+                i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+            });
+            if !dropped.is_empty() {
+                let what = d2x_core::dropped::classify(&dropped, |p| p.is_dir());
+                self.pending_drop = Some(d2x_core::dropped::Pending {
+                    what,
+                    replacing: self.input.clone(),
+                });
+            }
+        }
+        if let Some(p) = self.pending_drop.clone() {
+            let mut close = false;
+            egui::Window::new("Dropped file")
+                .collapsible(false).resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(p.message());
+                    if let Some(note) = p.replacing_note() {
+                        // Say what is being LOST, not only what arrives —
+                        // the old path is about to be unrecoverable.
+                        ui.label(egui::RichText::new(note).small().weak());
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if p.is_acceptable() && ui.button("Use it").clicked() {
+                            if let Some(path) = p.accepted_path() {
+                                self.input = path;
+                            }
+                            close = true;
+                        }
+                        // "Cancel" when there is a choice, "OK" when the
+                        // dialog is only explaining a refusal.
+                        let dismiss = if p.is_acceptable() { "Cancel" } else { "OK" };
+                        if ui.button(dismiss).clicked() { close = true; }
+                    });
+                });
+            if close { self.pending_drop = None; }
+        }
+
         let ctx = ui.ctx().clone();
         if self.catalogue.is_empty() && !self.scanning && self.scan_rx.is_none() {
             self.rescan_models();

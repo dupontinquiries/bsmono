@@ -20,6 +20,7 @@
 //! only ever see these traits.
 
 pub mod courtesy;
+pub mod dropped;
 pub mod batch;
 pub mod blockcache;
 pub mod budget;
