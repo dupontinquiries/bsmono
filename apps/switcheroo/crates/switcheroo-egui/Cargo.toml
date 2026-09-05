@@ -20,6 +20,8 @@ hap-core = { path = "../hap-core" }
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
 snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
 egui = "0.34"
+# Local wall-clock minute for the scheduler; the core takes a Clock value.
+chrono = "0.4"
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
 
 # The radio. btleplug is async (BlueZ over D-Bus on Linux), so it brings

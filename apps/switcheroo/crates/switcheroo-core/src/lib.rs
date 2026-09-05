@@ -23,6 +23,14 @@
 
 
 pub mod fastpath;
+
+/// Is this a HomeKit setup code — eight digits, dashes and spaces allowed?
+/// hap-core normalises to `XXX-XX-XXX`; this is the same rule for a form
+/// to grey its button on, kept here so the core needs no hap-core.
+pub fn setup_code_ok(s: &str) -> bool {
+    let digits = s.chars().filter(|c| c.is_ascii_digit()).count();
+    digits == 8 && s.chars().all(|c| c.is_ascii_digit() || c == '-' || c == ' ')
+}
 pub mod filter;
 pub mod intent;
 pub mod media;

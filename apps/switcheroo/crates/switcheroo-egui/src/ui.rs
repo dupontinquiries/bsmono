@@ -68,7 +68,9 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
     let colors = Colors {
         inner: uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(Default::default())),
     };
-    app.tick(Instant::now());
+    let now = Instant::now();
+    app.tick(now);
+    app.tick_schedules(now);
     // BLE state changes arrive on a background thread, so the UI cannot
     // wait for input to repaint or a toggle would appear to hang.
     ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -78,9 +80,11 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 
     egui::CentralPanel::default().show(ctx, |ui| match app.tab {
         Tab::Devices => devices_pane(app, ui, &colors),
+        Tab::Schedules => crate::panels::schedules_pane(app, ui),
         Tab::Activity => activity_pane(app, ui),
         Tab::About => about_pane(app, ui, &colors),
     });
+    crate::panels::pairing_dialog(ctx, app);
 }
 
 fn top_bar(app: &mut App, ctx: &egui::Context, colors: &Colors) {
@@ -117,11 +121,8 @@ fn bottom_bar(app: &mut App, ctx: &egui::Context) {
     egui::Panel::bottom("switcheroo-bottom").show(ctx, |ui| {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            for (tab, label) in [
-                (Tab::Devices, "outlets"),
-                (Tab::Activity, "activity"),
-                (Tab::About, "about"),
-            ] {
+            for tab in [Tab::Devices, Tab::Schedules, Tab::Activity, Tab::About] {
+                let label = crate::panels::tab_label(tab);
                 if ui
                     .add(egui::Button::selectable(app.tab == tab, label))
                     .clicked()
@@ -135,6 +136,12 @@ fn bottom_bar(app: &mut App, ctx: &egui::Context) {
 }
 
 fn devices_pane(app: &mut App, ui: &mut egui::Ui, colors: &Colors) {
+    // The command box and the player first: both work with an empty list
+    // (music has no outlet), so they must not sit behind the "no outlets"
+    // early return below.
+    crate::panels::command_box(ui, app);
+    crate::panels::media_strip(ui, app);
+    ui.separator();
     if app.hub.is_empty() {
         ui.vertical_centered(|ui| {
             ui.add_space(24.0);
@@ -154,22 +161,27 @@ fn devices_pane(app: &mut App, ui: &mut egui::Ui, colors: &Colors) {
     let mut to_toggle: Option<DeviceId> = None;
     let mut to_refresh: Option<DeviceId> = None;
     let mut to_pin: Option<DeviceId> = None;
+    let mut to_pair: Option<DeviceId> = None;
+    let mut to_unpair: Option<DeviceId> = None;
     let now = Instant::now();
+
+    crate::panels::filter_chips(ui, app);
+    let shown = app.filter.apply(app.hub.sorted().into_iter(), now);
+    let hidden = app.hub.len() - shown.len();
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for d in app.hub.sorted() {
-                let (tog, refr, pin) = device_row(ui, d, now, colors);
-                if tog {
-                    to_toggle = Some(d.id.clone());
-                }
-                if refr {
-                    to_refresh = Some(d.id.clone());
-                }
-                if pin {
-                    to_pin = Some(d.id.clone());
-                }
+            for d in shown {
+                let act = device_row(ui, d, now, colors);
+                if act.toggle { to_toggle = Some(d.id.clone()); }
+                if act.refresh { to_refresh = Some(d.id.clone()); }
+                if act.pin { to_pin = Some(d.id.clone()); }
+                if act.pair { to_pair = Some(d.id.clone()); }
+                if act.unpair { to_unpair = Some(d.id.clone()); }
+            }
+            if hidden > 0 {
+                ui.label(egui::RichText::new(format!("{hidden} hidden by the filter")).small().weak());
             }
             ui.add_space(8.0);
         });
@@ -183,10 +195,21 @@ fn devices_pane(app: &mut App, ui: &mut egui::Ui, colors: &Colors) {
     if let Some(id) = to_pin {
         app.hub.toggle_favourite(&id);
     }
+    if let Some(id) = to_pair {
+        app.pairing = Some(crate::PairingDialog::for_device(id));
+    }
+    if let Some(id) = to_unpair {
+        app.unpair(&id);
+    }
 }
 
-/// One outlet. Returns (toggle_clicked, refresh_clicked, pin_clicked).
-fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant, colors: &Colors) -> (bool, bool, bool) {
+/// What a row's buttons asked for this frame.
+#[derive(Default)]
+struct RowAction { toggle: bool, refresh: bool, pin: bool, pair: bool, unpair: bool }
+
+/// One outlet.
+fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant, colors: &Colors) -> RowAction {
+    let mut act = RowAction::default();
     let stale = d.is_stale(now, STALE_AFTER);
     let mut toggled = false;
     let mut refreshed = false;
@@ -259,13 +282,25 @@ fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant, colors: &Colors) -> (
                         if ui.add_sized([TAP, TAP], egui::Button::new("↻")).on_hover_text("re-read state").clicked() {
                             refreshed = true;
                         }
+                    } else if d.kind == switcheroo_core::Kind::HomeKit {
+                        // The door to pairing is on the row that needs it.
+                        if ui.add(egui::Button::new("pair…").min_size(egui::vec2(72.0, 40.0)))
+                            .on_hover_text("HomeKit pair-setup with the code on the plug").clicked() {
+                            act.pair = true;
+                        }
                     } else {
                         ui.label(egui::RichText::new("no control").small().weak());
+                    }
+                    if d.paired && !d.pending && ui.small_button("unpair").on_hover_text("forget this pairing").clicked() {
+                        act.unpair = true;
                     }
                 });
             });
         });
-    (toggled, refreshed, pinned)
+    act.toggle = toggled;
+    act.refresh = refreshed;
+    act.pin = pinned;
+    act
 }
 
 fn activity_pane(app: &mut App, ui: &mut egui::Ui) {

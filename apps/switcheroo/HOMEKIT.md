@@ -1,4 +1,39 @@
-# Why the Wemo WSP100 can't be switched yet
+# HomeKit in switcheroo
+
+**Status (2026-09-05): pairing is implemented, unverified against hardware.**
+`crates/hap-core` is HAP, controller side: TLV8, SRP-6a (verified against
+RFC 5054's vectors), pair-setup M1–M6, pair-verify M1–M4, the encrypted
+session, HAP-BLE PDUs with fragmentation, all headless and tested against
+an in-process accessory (`hap_core::sim`). `switcheroo-egui/src/hap.rs`
+drives it over btleplug; the pairing record lives in
+`~/.local/share/switcheroo/pairing-<address>.hap` (0600) beside this
+install's controller identity (`controller.hap`). Back that directory up:
+losing it means resetting the plug.
+
+What a real WSP100 will settle: two SRP conventions named in
+`hap_core::srp::Client::process` (`H(g)` unpadded in the client proof,
+`K = H(S)` as the HKDF input). An accessory rejecting M3 — an error at
+state 4 in the journal — points at those two lines and nothing else.
+The BLE fragment size is `SWITCHEROO_HAP_MTU` (default 100) because
+btleplug does not expose the negotiated MTU; raise it if pairing is slow.
+
+In the app: a HomeKit row shows **pair…**, which opens a dialog whose first
+line says what pairing costs (one pairing per accessory; an Apple Home
+loses it; factory reset to get it back), with the setup code and a
+checkbox that must both be right before **Pair** is enabled. Paired rows
+get the same ON/OFF toggle as a GATT switch and an **unpair**. Schedules,
+the command box ("lights off", "turn the lamp on by 9pm", "when I get
+home…") and the media strip are described in `switcheroo-core`'s
+`schedule`, `intent` and `media` modules.
+
+The rest of this file is the reasoning from before the implementation. It
+is kept because the constraints it names — one pairing per accessory, the
+key-loss cost, the fabric-oracle design as the eventual shape — are still
+the constraints.
+
+---
+
+# Why the Wemo WSP100 couldn't be switched (2026-09-01)
 
 switcheroo *finds* the WSP100 and every other HomeKit accessory, and
 identifies it correctly. It cannot turn one on. This file is here so that
