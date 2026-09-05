@@ -762,6 +762,32 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Color32 {
     Color32::from_rgb(((r1 + m) * 255.0) as u8, ((g1 + m) * 255.0) as u8, ((b1 + m) * 255.0) as u8)
 }
 
+/// Smallest a label cell may be drawn, in screen pixels.
+///
+/// `label_cells` builds text from 6x7 grids of quads. When a cell projects to
+/// well under a pixel the glyph does not get small, it gets WRONG —
+/// neighbouring cells collapse and "PARAMS" renders as "TAREHE". This is the
+/// 3D counterpart of the 2D text floor in `uikit_egui::adaptive`: below a
+/// certain size, text stops being text.
+pub const MIN_CELL_PX: f32 = 1.35;
+
+/// The cell scale (world units) a label needs to stay legible at this
+/// projection. `px_per_world` is how many screen pixels one world unit spans
+/// at the label's depth — callers already compute it to size their panels.
+///
+/// Use as a FLOOR: `wanted.max(legible_cell_scale(ppw))`. A label that wants
+/// to be bigger should stay bigger.
+pub fn legible_cell_scale(px_per_world: f32) -> f32 {
+    if px_per_world <= 0.0 || !px_per_world.is_finite() { return 0.0; }
+    MIN_CELL_PX / px_per_world
+}
+
+/// Would `chars` at this cell scale fit `avail_world` wide? Lets a caller
+/// shorten rather than overflow once the floor has been applied.
+pub fn label_fits(chars: usize, cell_scale: f32, avail_world: f32) -> bool {
+    chars as f32 * 6.0 * cell_scale <= avail_world
+}
+
 pub fn label_cells(center: Vec3, right: Vec3, up: Vec3, toward_cam: Vec3, text: &str,
                    scale: f32, t: f32, col: Color32, lit: f32, scroll: f32, anim: TextAnim,
                    scene_light: SceneLight, seed: u32) -> Vec<Mesh3> {
@@ -1670,6 +1696,32 @@ pub fn rune_cells(seed: u64, grid: usize) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_label_cell_never_projects_below_the_floor() {
+        // The fault this is for: at this camera the PARAMS plaque's cells were
+        // 0.010 world units and the panel spans ~40 px/world, so a cell landed
+        // at 0.4 px and the glyphs collapsed into each other.
+        let ppw = 40.0;
+        let wanted = 0.010_f32;
+        assert!(wanted * ppw < MIN_CELL_PX, "the real case is under the floor");
+        let floored = wanted.max(legible_cell_scale(ppw));
+        assert!(floored * ppw >= MIN_CELL_PX - 1e-4, "{}", floored * ppw);
+        // A label already big enough is left alone.
+        let big = 0.5_f32;
+        assert_eq!(big.max(legible_cell_scale(ppw)), big);
+        // Degenerate projections do not force a size on the caller.
+        assert_eq!(legible_cell_scale(0.0), 0.0);
+        assert_eq!(legible_cell_scale(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn fitting_is_measured_in_cells_so_a_floored_label_can_be_shortened() {
+        // 6 cells per char is label_cells' own layout.
+        assert!(label_fits(6, 0.01, 0.36));
+        assert!(!label_fits(7, 0.01, 0.36));
+        assert!(label_fits(0, 1.0, 0.0), "an empty label always fits");
+    }
+
     use super::*;
 
     #[test]

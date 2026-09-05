@@ -5831,7 +5831,15 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
                         plaque.mat = pmat; plaque.emissive = 0.07 * tglow * sheen; m3::set_alpha(&mut plaque, 150); plaque.overlay = ov_p;
                         graph.push(plaque); slab_glint(&mut graph, back_v(-0.06 * ps, plaque_cy), right, up, toward, 0.71 * ps, plaque_h * 0.5, sun, tglow);
                         let title_c = V3::new(panel_c.x - toward.x * 0.30 + up.x * 0.66 * ps, panel_c.y - toward.y * 0.30 + up.y * 0.66 * ps, panel_c.z - toward.z * 0.30 + up.z * 0.66 * ps);
-                        for mut cell in m3::label_cells(title_c, right, up, toward, "PARAMS", 0.010 * ps, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = ov_p + 0.15; graph.push(cell); }
+                        // LEGIBILITY FLOOR. `label_cells` builds glyphs from 6x7 grids of
+                        // quads; at 0.010 * ps a cell projected to well under a screen pixel
+                        // and the letters collapsed into each other — "PARAMS" rendered as
+                        // "TAREHE" in a screenshot, and every dial label with it. The floor is
+                        // the 3D counterpart of the 2D text floor: a label may be bigger than
+                        // legible, never smaller.
+                        let (tppw, _) = px_per_world(&view_cam, title_c, right, up, cx, cy, scale);
+                        let title_cell = (0.010 * ps).max(m3::legible_cell_scale(tppw));
+                        for mut cell in m3::label_cells(title_c, right, up, toward, "PARAMS", title_cell, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim, m3::SceneLight::Uniform, 0) { cell.overlay = ov_p + 0.15; graph.push(cell); }
 
                         let (p_down, p_pressed) = ui.input(|i| (i.pointer.primary_down(), i.pointer.primary_pressed()));
                         let p_pos = ui.input(|i| i.pointer.interact_pos());
