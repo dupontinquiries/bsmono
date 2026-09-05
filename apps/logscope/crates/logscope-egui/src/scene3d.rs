@@ -4835,7 +4835,7 @@ fn alley() -> Scene {
 /// meant to surface, built from the scene's OWN materials instead of a floating window. This is the START of the
 /// physical-UI concept (the frame, stand, material, and a few content "lines" per scene); wiring live node text
 /// onto the surface is future work. style: 0 wood board · 1 stone tablet · 2 glass pane · 3 marble plaque.
-fn physical_ui_panel(s: &mut Scene, style: u32, pos: Vec3, face: f32, w: f32, h: f32, floating: bool, seed: u32) {
+fn physical_ui_panel(s: &mut Scene, style: u32, pos: Vec3, face: f32, w: f32, h: f32, floating: bool, seed: u32, rows: &[crate::panel_rows::Row]) {
     let right = v(-face.sin(), 0.0, face.cos());
     let up = v(0.0, 1.0, 0.0);
     let n = v(face.cos(), 0.0, face.sin()); // surface faces `face`
@@ -4878,14 +4878,20 @@ fn physical_ui_panel(s: &mut Scene, style: u32, pos: Vec3, face: f32, w: f32, h:
     // "Hypotheses / Evidence"-style boxes, rather than a flat stripe painted onto the board.
     let card_back = mix_rgb(surface, c(0x00, 0x00, 0x00), 0.28);
     let ink = if style == 2 { c(0xf0, 0xfa, 0xff) } else { mix_rgb(surface, c(0xff, 0xff, 0xf4), 0.55) };
-    for li in 0..4u32 {
+    // Widths and count come from `rows` — see `crate::panel_rows`. They used
+    // to be `0.74 - li * 0.09` for exactly four cards, identical in every
+    // world and unrelated to anything the app held. An accented row is drawn
+    // brighter and slightly taller: at this distance emphasis has to be size
+    // as well as brightness, or it is lost to the scene's own glow.
+    for (li, row) in rows.iter().enumerate() {
         let ly = h * 0.30 - li as f32 * h * 0.16;
-        let lw = w * (0.74 - li as f32 * 0.09);
-        let lh = h * 0.075;
+        let lw = w * row.width01.clamp(0.05, 0.95);
+        let lh = h * if row.accent { 0.092 } else { 0.075 };
         let center = addv(ctr, addv(mulv(up, ly), mulv(n, 0.015)));
         let mut back = m3::panel(center, right, up, lw + 0.05, lh + 0.03, card_back); back.mat = M::PAPER; back.emissive = emiss * 0.3; s.add(back, Float::STILL);
-        let mut line = m3::panel(addv(center, mulv(n, 0.01)), right, up, lw, lh * 0.6, ink);
-        line.mat = M::PAPER; line.emissive = emiss * 0.6; s.add(line, Float::STILL);
+        let face_col = if row.accent { mix_rgb(ink, c(0xff, 0xe2, 0xac), 0.5) } else { ink };
+        let mut line = m3::panel(addv(center, mulv(n, 0.01)), right, up, lw, lh * 0.6, face_col);
+        line.mat = M::PAPER; line.emissive = emiss * if row.accent { 1.3 } else { 0.6 }; s.add(line, Float::STILL);
     }
     // a small "active" node bead in the corner (the selection marker), warm/glowing
     let mut bead = m3::uv_sphere(addv(ctr, addv(mulv(up, h * 0.34), mulv(right, -w * 0.42))), 0.1, 8, 6, c(0xff, 0xcf, 0x86));
@@ -5917,7 +5923,8 @@ fn build(palette_name: &str) -> Scene {
         let px = -(ep.ext_x as f32 * 0.5 + 5.0);
         let pz = ep.ext_z as f32 * 0.5 + 3.0;
         let face = (-pz).atan2(-px); // face back toward the graph at the origin
-        physical_ui_panel(&mut s, ui_style, v(px, ui_floor, pz), face, 3.4, 2.1, floating, 0x5151);
+        physical_ui_panel(&mut s, ui_style, v(px, ui_floor, pz), face, 3.4, 2.1, floating, 0x5151,
+                          &crate::panel_rows::placeholder());
     }
     // Atlantis is SELF-ENCLOSING (its own ribbed glass dome + perimeter wall + open ocean beyond), so it does
     // NOT get the generic outer room — that second shell was the "giant structure" dominating every overview.

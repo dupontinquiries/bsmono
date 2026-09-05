@@ -220,7 +220,8 @@ pub use scene_kit::spatial;
 // scene-kit's does too, so the curve is unaffected.
 #[cfg(feature = "gui")] pub use scene_kit::mesh3d;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod pearl_input;
-#[cfg(feature = "gui")] #[allow(dead_code)] pub mod scene3d;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod panel_rows;
+pub mod scene3d;
 // MIGRATED to scene-kit — the last of the four, and the only one §18's
 // "genuinely diverged" verdict was right about. It was two-way: scene-kit had
 // the inscription materials (MAT_INSCRIPTION/2), the UV attribute plumbing and
