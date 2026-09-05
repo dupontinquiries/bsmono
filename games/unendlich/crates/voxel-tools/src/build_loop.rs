@@ -151,9 +151,13 @@ mod tests {
         let mut w = Flat::new();
         let mut t = VoxelTools::new(&mut w);
         let mut s = ChatSession::new(32, 200);
-        let mut c = FakeCompleter::new(vec!["cylinder @0,0 r=0 h=5\n".into()]);
+        // `r=0` is now CLAMPED, not rejected -- a fumbled number should
+        // build. What still fails is input with no recoverable meaning.
+        let mut c = FakeCompleter::new(vec!["frobnicate the widget\n".into()]);
         let out = turn(&mut s, &mut t, &mut c, &gaze(), None, "a tower", None, None);
         match &out {
+            // no known verb at all -> clean_reply drops it -> no plan
+            TurnOutcome::NoPlan { .. } => {}
             TurnOutcome::Rejected(why) => assert!(why.contains("rejected"), "{why}"),
             o => panic!("{o:?}"),
         }

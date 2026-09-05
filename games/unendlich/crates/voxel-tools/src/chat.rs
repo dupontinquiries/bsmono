@@ -491,7 +491,7 @@ mod tests {
         let mut w = Flat::new();
         let mut t = VoxelTools::new(&mut w);
         let mut s = ChatSession::new(32, 200);
-        let r = s.receive_plan(&mut t, &gaze_at(0, 0, 10.0), "cylinder @0,0 r=0 h=5\n");
+        let r = s.receive_plan(&mut t, &gaze_at(0, 0, 10.0), "# empty\n");
         match r { Reply::Say(m) => assert!(m.contains("rejected"), "{m}"), o => panic!("{o:?}") }
         assert_eq!(s.show_plan(), Reply::Say("no pending plan; /build something first".into()));
     }

@@ -49,6 +49,66 @@
 
 use crate::{palettes, CallResult, VoxelTools, VoxelWorld};
 
+/// Default footprint half-size when a model gives fewer coordinates
+/// than an op wants.
+pub const ASSUMED_HALF_SPAN: i32 = 6;
+
+/// A size a model gave that cannot work, replaced by one that can.
+///
+/// `r=0` and `h=-3` are not requests to build nothing; they are a model
+/// fumbling a number. Substituting the default and saying so builds the
+/// thing that was asked for. Rejecting the whole plan over it -- which
+/// is what "sphere radius must be positive" did to both a 1B and an 8B
+/// -- builds nothing and teaches the player that the feature is broken.
+fn clamp_size(v: i32, default: i32, notes: &mut Vec<String>, what: &str) -> i32 {
+    if v > 0 { return v; }
+    notes.push(format!("{what} was {v}; used {default}"));
+    default
+}
+
+/// The x,z of the focus anchor, or the origin when there is none.
+fn anchor_xz(anchor: Option<(i32, i32, i32)>) -> (i32, i32) {
+    anchor.map(|a| (a.0, a.2)).unwrap_or((0, 0))
+}
+
+/// Resolve the two corners a footprint op wants, from however many the
+/// model actually supplied.
+///
+/// BE PERMISSIVE HERE. Both a 1B and an 8B failed the same way: verbs
+/// with too few coordinates, rejected wholesale. "terraform needs two
+/// x,z pairs" is technically true and completely useless -- the player
+/// asked for flat ground where they are looking, and that is
+/// reconstructible. A near-miss should build something and SAY what was
+/// assumed; only a request with no recoverable meaning should fail.
+///
+/// Returns the corners and a note when anything was inferred.
+fn footprint(t: &[&str], anchor: Option<(i32, i32, i32)>)
+    -> Option<((i32, i32), (i32, i32), Option<String>)> {
+    let h = ASSUMED_HALF_SPAN;
+    // A token that is PRESENT but unresolvable is not the same as an
+    // absent one. `@5,5` with no focus anchor has no meaning to recover
+    // -- inferring a footprint there would place the build somewhere the
+    // player never indicated. Missing is inferable; broken is an error.
+    for i in [1usize, 2] {
+        if let Some(s) = t.get(i) {
+            if s.starts_with('@') && anchor.is_none() { return None; }
+        }
+    }
+    let get = |i: usize| t.get(i).and_then(|s| pair_at(s, anchor).ok().flatten());
+    Some(match (get(1), get(2)) {
+        (Some(a), Some(b)) => (a, b, None),
+        // One corner: centre a footprint on it.
+        (Some(a), None) => ((a.0 - h, a.1 - h), (a.0 + h, a.1 + h),
+                            Some(format!("one corner given; used {}x{} around it", h * 2, h * 2))),
+        // None at all: the player is looking somewhere. That is the spot.
+        _ => {
+            let a = anchor_xz(anchor);
+            ((a.0 - h, a.1 - h), (a.0 + h, a.1 + h),
+             Some(format!("no coordinates; used {}x{} at the focus", h * 2, h * 2)))
+        }
+    })
+}
+
 /// How far above the focus anchor to begin scanning for the ground.
 /// Enough to clear the player's own head and a step up, small enough
 /// that a cave roof a few blocks above is not mistaken for terrain.
@@ -265,6 +325,13 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
         // pair records an issue and yields None so the op is skipped
         // rather than silently placed at the wrong spot.
         let rel_err = std::cell::Cell::new(false);
+        // Inferences recorded as WARNINGS, not errors: the op still runs,
+        // and the preview tells the player what was filled in, so a wrong
+        // guess is visible before /commit rather than after. Collected
+        // into a local and drained at the end of the line, because a
+        // closure capturing `issues` mutably would conflict with `bad`.
+        let mut notes: Vec<String> = Vec::new();
+        macro_rules! assumed { ($w:expr) => { notes.push($w.to_string()) } }
         let rel = |t: &[&str], i: usize, anchor: Option<(i32, i32, i32)>| -> Option<(i32, i32)> {
             match t.get(i).map(|s| pair_at(s, anchor)) {
                 Some(Ok(v)) => v,
@@ -277,38 +344,76 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
         let hollow = t.contains(&"hollow");
 
         match t[0] {
-            "terraform" => match (rel(&t, 1, anchor), rel(&t, 2, anchor)) {
-                (Some(a), Some(b)) => ops.push(Op::Terraform {
+            "terraform" => {
+                let Some((a, b, note)) = footprint(&t, anchor) else {
+                    rel_err.set(true);
+                    continue;
+                };
+                if let Some(n) = note { assumed!(&n); }
+                ops.push(Op::Terraform {
                     min: a, max: b, delta: kvi(&t, "delta", 0),
-                    smooth: t.contains(&"smooth"),
-                    block: blk("stone").unwrap_or(1) }),
-                _ => bad("terraform needs two x,z pairs".into()),
-            },
-            "path" => match (rel(&t, 1, anchor), rel(&t, 2, anchor)) {
-                (Some(a), Some(b)) => ops.push(Op::Path {
-                    from: a, to: b, width: kvi(&t, "w", 3),
-                    block: blk("cobblestone").unwrap_or(4) }),
-                _ => bad("path needs two x,z pairs".into()),
-            },
-            "enclose" => match (rel(&t, 1, anchor), rel(&t, 2, anchor)) {
-                (Some(a), Some(b)) => ops.push(Op::Enclose {
-                    min: a, max: b, height: kvi(&t, "h", 3),
-                    block: blk("oak_planks").unwrap_or(57) }),
-                _ => bad("enclose needs two x,z pairs".into()),
-            },
+                    // A terraform with no delta and no `smooth` would do
+                    // nothing at all; smoothing is what "flatten this"
+                    // means and is the safe reading.
+                    smooth: t.contains(&"smooth") || kvi(&t, "delta", 0) == 0,
+                    block: blk("stone").unwrap_or(1) });
+            }
+            "path" => {
+                let Some((a, b, note)) = footprint(&t, anchor) else {
+                    rel_err.set(true);
+                    continue;
+                };
+                if let Some(n) = note { assumed!(&n); }
+                ops.push(Op::Path {
+                    from: a, to: b, width: kvi(&t, "w", 3).max(1),
+                    block: blk("cobblestone").unwrap_or(4) });
+            }
+            "enclose" => {
+                let Some((a, b, note)) = footprint(&t, anchor) else {
+                    rel_err.set(true);
+                    continue;
+                };
+                if let Some(n) = note { assumed!(&n); }
+                ops.push(Op::Enclose {
+                    min: a, max: b, height: kvi(&t, "h", 3).max(1),
+                    block: blk("oak_planks").unwrap_or(57) });
+            }
             "cylinder" | "tower" => match rel(&t, 1, anchor) {
                 Some(a) => ops.push(Op::Cylinder {
                     at: a, y: kv(&t, "y").and_then(|v| v.parse().ok()),
-                    radius: kvi(&t, "r", 4), height: kvi(&t, "h", 10),
+                    // Clamp, do not reject. A model that writes r=0 meant
+                    // a tower; "radius must be positive" is a true
+                    // statement that builds nothing.
+                    radius: clamp_size(kvi(&t, "r", 4), 4, &mut notes, "radius"),
+                    height: clamp_size(kvi(&t, "h", 10), 10, &mut notes, "height"),
                     block: blk("stone").unwrap_or(1), hollow }),
-                _ => bad("cylinder needs an x,z".into()),
+                // No coordinate at all means HERE. The player is looking
+                // at a spot and asked for a tower; refusing over a
+                // missing `@0,0` is pedantry, and both a 1B and an 8B
+                // hit exactly this.
+                _ if t.get(1).is_some_and(|s| s.starts_with('@')) && anchor.is_none() => {
+                    rel_err.set(true);
+                }
+                _ => { ops.push(Op::Cylinder {
+                        at: anchor_xz(anchor), y: kv(&t, "y").and_then(|v| v.parse().ok()),
+                        radius: clamp_size(kvi(&t, "r", 4), 4, &mut notes, "radius"),
+                        height: clamp_size(kvi(&t, "h", 10), 10, &mut notes, "height"),
+                        block: blk("stone").unwrap_or(1), hollow });
+                       assumed!("cylinder placed at the focus"); }
             },
             "sphere" | "dome" => match rel(&t, 1, anchor) {
                 Some(a) => ops.push(Op::Sphere {
                     at: a, y: kv(&t, "y").and_then(|v| v.parse().ok()),
-                    radius: kvi(&t, "r", 5),
+                    radius: clamp_size(kvi(&t, "r", 5), 5, &mut notes, "radius"),
                     block: blk("stone").unwrap_or(1), hollow }),
-                _ => bad("sphere needs an x,z".into()),
+                _ if t.get(1).is_some_and(|s| s.starts_with('@')) && anchor.is_none() => {
+                    rel_err.set(true);
+                }
+                _ => { ops.push(Op::Sphere {
+                        at: anchor_xz(anchor), y: kv(&t, "y").and_then(|v| v.parse().ok()),
+                        radius: clamp_size(kvi(&t, "r", 5), 5, &mut notes, "radius"),
+                        block: blk("stone").unwrap_or(1), hollow });
+                       assumed!("sphere placed at the focus"); }
             },
             "tree" => match rel(&t, 1, anchor) {
                 Some(a) => ops.push(Op::Tree {
@@ -316,7 +421,15 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     species: t.get(2).filter(|s| !s.contains('=')).unwrap_or(&"oak").to_string(),
                     height: kvi(&t, "h", 8),
                     lean: kv(&t, "lean").and_then(|v| pair(&v)).unwrap_or((0, 0)) }),
-                _ => bad("tree needs an x,z".into()),
+                _ if t.get(1).is_some_and(|s| s.starts_with('@')) && anchor.is_none() => {
+                    rel_err.set(true);
+                }
+                _ => { ops.push(Op::Tree {
+                        at: anchor_xz(anchor),
+                        species: t.get(1).filter(|s| !s.contains('=') && !s.contains(','))
+                                  .unwrap_or(&"oak").to_string(),
+                        height: kvi(&t, "h", 8), lean: (0, 0) });
+                       assumed!("tree placed at the focus"); }
             },
             "scatter" => match (rel(&t, 1, anchor), rel(&t, 2, anchor)) {
                 (Some(a), Some(b)) => ops.push(Op::Scatter {
@@ -325,7 +438,19 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     per: kvi(&t, "per", 8).max(0) as usize,
                     spread: kvi(&t, "spread", 3),
                     seed: kv(&t, "seed").and_then(|v| v.parse().ok()).unwrap_or(1) }),
-                _ => bad("scatter needs two x,z pairs".into()),
+                _ => {
+                    let Some((a, b, note)) = footprint(&t, anchor) else {
+                        rel_err.set(true);
+                        continue;
+                    };
+                    if let Some(n) = note { assumed!(&n); }
+                    ops.push(Op::Scatter {
+                        min: a, max: b, block: blk("flower").unwrap_or(25),
+                        clusters: kvi(&t, "clusters", 4).max(1) as usize,
+                        per: kvi(&t, "per", 6).max(1) as usize,
+                        spread: kvi(&t, "spread", 3).max(1),
+                        seed: kvi(&t, "seed", 1) as u64 });
+                }
             },
             "restyle" => {
                 let a = t.get(1).map(|s| triple_at(s, anchor));
@@ -352,6 +477,10 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                 severity: Severity::Error, op: idx,
                 message: format!("unknown op '{other}' (line {})", lineno + 1) }),
         }
+        for n in notes.drain(..) {
+            issues.push(Issue { severity: Severity::Warning, op: ops.len().max(1),
+                message: format!("line {}: {n}", lineno + 1) });
+        }
         if rel_err.get() {
             issues.push(Issue { severity: Severity::Error, op: idx,
                 message: format!("line {}: @relative coordinate but no focus anchor \
@@ -376,6 +505,9 @@ pub fn validate(plan: &BuildPlan) -> Vec<Issue> {
         macro_rules! warn { ($m:expr) => { out.push(Issue { severity: Severity::Warning, op: n, message: $m.into() }) } }
         match op {
             Op::Cylinder { radius, height, .. } => {
+                // Clamped at parse time, so this can only fire on a plan
+                // built in code. A model writing r=0 gets a small tower
+                // and a note, not a rejection.
                 if *radius <= 0 || *height <= 0 { err!("cylinder radius and height must be positive"); }
                 if *radius > 64 { warn!("radius over 64 is very large"); }
             }
@@ -620,9 +752,21 @@ scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
 
     #[test]
     fn validation_catches_impossible_geometry() {
-        let (plan, _) = parse_plan("cylinder 0,0 r=0 h=5\n");
+        // r=0 from a LINE is clamped at parse time now, so build the bad
+        // plan directly: validate() is still the backstop for a plan
+        // constructed in code.
+        let plan = BuildPlan {
+            name: "t".into(),
+            ops: vec![Op::Cylinder { at: (0, 0), y: None, radius: 0, height: 5,
+                                     block: 1, hollow: false }],
+            anchor: None,
+        };
         let issues = validate(&plan);
         assert!(issues.iter().any(|i| i.severity == Severity::Error), "{issues:?}");
+        // and from a line, it is repaired rather than refused
+        let (p2, i2) = parse_plan("cylinder 0,0 r=0 h=5\n");
+        assert!(validate(&p2).iter().all(|i| i.severity != Severity::Error));
+        assert!(i2.iter().any(|i| i.message.contains("radius was 0")), "{i2:?}");
     }
 
     #[test]
@@ -782,5 +926,70 @@ scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
         assert!(plan.anchor.is_none());
         { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &plan, 200, 32, false); }
         assert_eq!(w.get(0, 65, 0), 58, "flat world, fallback path unchanged");
+    }
+
+    #[test]
+    fn the_exact_lines_two_local_models_produced_now_build() {
+        // From the field: a 1B and an 8B both had every op rejected.
+        // "terraform needs two x,z pairs", "sphere radius must be
+        // positive", "cylinder radius and height must be positive".
+        // Each is a recoverable near-miss, and refusing them made the
+        // feature look broken rather than imprecise.
+        let cases: &[&str] = &[
+            "terraform",                       // no coordinates at all
+            "terraform @0,0",                  // one corner
+            "sphere @0,0 r=0",                 // zero radius
+            "cylinder @0,0 r=0 h=0",           // both zero
+            "cylinder",                        // bare verb
+            "path @0,0",                       // one end
+            "enclose @2,2 h=-1",               // negative height
+            "tree",                            // bare
+            "scatter",                         // bare
+        ];
+        for line in cases {
+            let (plan, issues) = parse_plan_at(&format!("{line}\n"), Some((10, 65, 20)));
+            let errs: Vec<_> = issues.iter()
+                .filter(|i| i.severity == Severity::Error).collect();
+            assert!(errs.is_empty(), "{line:?} still rejected: {errs:?}");
+            assert_eq!(plan.ops.len(), 1, "{line:?} produced no op");
+            // and it must actually place blocks
+            // Terraform on already-flat ground legitimately changes
+            // nothing; what matters is that it PARSED and ran without
+            // error, not that it moved dirt.
+            let mut w = Flat::new();
+            let run = { let mut t = VoxelTools::new(&mut w);
+                        run_plan(&mut t, &plan, 200, 32, false) };
+            assert_eq!(run.failed, 0, "{line:?} parsed but the op failed");
+            if !line.starts_with("terraform") {
+                assert!(run.blocks_changed > 0, "{line:?} parsed but built nothing");
+            }
+        }
+    }
+
+    #[test]
+    fn an_inference_is_a_warning_the_player_can_see() {
+        let (_, issues) = parse_plan_at("cylinder r=0\n", Some((10, 65, 20)));
+        let warns: Vec<&str> = issues.iter()
+            .filter(|i| i.severity == Severity::Warning)
+            .map(|i| i.message.as_str()).collect();
+        assert!(warns.iter().any(|m| m.contains("at the focus")), "{warns:?}");
+        assert!(warns.iter().any(|m| m.contains("radius was 0")), "{warns:?}");
+    }
+
+    #[test]
+    fn a_bare_verb_lands_at_the_focus_not_the_origin() {
+        let (plan, _) = parse_plan_at("cylinder\n", Some((100, 65, -40)));
+        match &plan.ops[0] {
+            Op::Cylinder { at, .. } => assert_eq!(*at, (100, -40)),
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn genuinely_meaningless_input_is_still_an_error() {
+        // permissive is not the same as credulous
+        let (plan, issues) = parse_plan_at("frobnicate the widget\n", Some((0, 65, 0)));
+        assert!(plan.ops.is_empty());
+        assert!(issues.iter().any(|i| i.severity == Severity::Error));
     }
 }
