@@ -4431,6 +4431,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // is a frame late; set it from the live focus flag so a
             // hotkey cannot fire on the first frame of typing.
             if chat_focus { renderer.ui_wants_keyboard = true; }
+            // Feed the world's own climate to the paintbrush, so a build
+            // in a snowy biome defaults to snow rather than to the same
+            // grey stone everywhere. `WorldModel::temperature` and
+            // `::humidity` are the fields the HUD already prints as
+            // "climate: T=.. H=..".
+            {
+                let m = chunk_manager.model_arc();
+                let p = local_player.view.position;
+                paintbrush.session.climate = (
+                    m.temperature(p.x as f64, p.y as f64, p.z as f64, 0.0) as f32,
+                    m.humidity(p.x as f64, p.y as f64, p.z as f64, 0.0) as f32,
+                );
+                paintbrush.session.sea_level = unendlich_engine::constants::SEA_LEVEL;
+            }
             // A reply can land on any frame, including with the box shut.
             paintbrush.poll_turn(&chunk_manager);
             if let Some(t) = &paintbrush.in_flight {

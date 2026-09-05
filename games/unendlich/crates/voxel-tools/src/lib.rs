@@ -69,6 +69,8 @@ pub mod dict;
 pub mod views;
 /// Weathering: decay, overgrowth and rubble as a transform over blocks.
 pub mod weather;
+/// Ambient: what the surroundings say about what belongs here.
+pub mod ambient;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.
@@ -385,6 +387,38 @@ impl<'w, W: VoxelWorld> VoxelTools<'w, W> {
         for &(x, y, z) in cells { self.write(&mut e, x, y, z, block); }
         let n = e.before.len();
         self.finish(e, format!("views, {n} blocks"))
+    }
+
+    /// Read the ambient conditions at a spot from the world itself.
+    ///
+    /// `temperature` and `humidity` come from the engine and cannot be
+    /// derived here, so they are passed in; everything else is read
+    /// from the blocks. The surface material especially: it is the
+    /// strongest signal available and needs no climate model, because
+    /// the world already decided what this spot is.
+    pub fn read_ambient(&self, x: i32, z: i32, from_y: i32,
+                        temperature: f32, humidity: f32, sea_level: i32)
+        -> crate::ambient::Ambient {
+        let surface_y = self.find_surface(x, z, from_y).unwrap_or(sea_level);
+        let surface_block = self.world.get(x, surface_y, z);
+        // Water fraction over a small ring: "is there water nearby" is a
+        // question about the surroundings, not about one cell.
+        let mut wet = 0;
+        let mut n = 0;
+        for dx in [-8, -4, 0, 4, 8] {
+            for dz in [-8, -4, 0, 4, 8] {
+                n += 1;
+                if let Some(sy) = self.find_surface(x + dx, z + dz, from_y) {
+                    // 9 = water in the block table
+                    if self.world.get(x + dx, sy, z + dz) == 9 { wet += 1; }
+                }
+            }
+        }
+        crate::ambient::Ambient {
+            temperature, humidity, surface_y, sea_level, surface_block,
+            water: wet as f32 / n as f32,
+            time_of_day: 0.0,
+        }
     }
 
     /// Apply a planned set of weathering changes as ONE edit, so a ruin

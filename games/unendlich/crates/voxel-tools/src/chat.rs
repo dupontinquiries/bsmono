@@ -94,6 +94,11 @@ pub struct LastBuild {
 
 #[derive(Debug, Default)]
 pub struct ChatSession {
+    /// Climate at the build site, supplied by the engine each turn.
+    /// Defaults to temperate; a game that never sets it behaves exactly
+    /// as before.
+    pub climate: (f32, f32),
+    pub sea_level: i32,
     pending: Option<Pending>,
     /// Edit ids of the last committed plan, within one VoxelTools.
     last_commit: Vec<u64>,
@@ -129,7 +134,8 @@ pub struct ChatSession {
 
 impl ChatSession {
     pub fn new(chunk_size: i32, from_y: i32) -> Self {
-        Self { budget: 200_000, chunk_size, from_y, profile: Profile::GroundUp, ..Default::default() }
+        Self { budget: 200_000, chunk_size, from_y, profile: Profile::GroundUp,
+               climate: (0.5, 0.5), sea_level: 64, ..Default::default() }
     }
 
     /// `/build enableVoice` / `disableVoice`. Returns the grammar the
@@ -183,6 +189,11 @@ impl ChatSession {
         let (mn, mx) = f.region.bounds();
         let digest = tools.read_region(mn, mx);
         let col = tools.probe_column(f.anchor.0, f.anchor.2, self.from_y, 6);
+        // What the surroundings say belongs here. One line: it competes
+        // for context with the region digest, and a small model drowns.
+        let amb = tools.read_ambient(f.anchor.0, f.anchor.2, self.from_y,
+                                     self.climate.0, self.climate.1, self.sea_level);
+        let site = amb.prompt_line();
         let last = match &self.last_build {
             Some(lb) => format!(
                 "\nLAST BUILD '{}': box {:?}..{:?}, {} blocks{}. Follow-ups should attach to it; \
@@ -191,7 +202,7 @@ impl ChatSession {
                 lb.palette_hint.as_ref().map(|p| format!(", palette {p}")).unwrap_or_default()),
             None => String::new(),
         };
-        format!("{}\n{digest}\n{col}{last}", f.read_hint(surface_name))
+        format!("{}\n{site}\n{digest}\n{col}{last}", f.read_hint(surface_name))
     }
 
     /// Does the focus currently sit on or inside the last build? Used
@@ -680,5 +691,26 @@ mod tests {
         assert!(s.clear_pending(), "a fresh preview is pending");
         // with it cleared, a commit must not resurrect the old plan
         assert_eq!(s.commit(&mut t, &g), Reply::Say("nothing to commit".into()));
+    }
+
+    #[test]
+    fn the_context_tells_the_model_where_it_is() {
+        let mut w = Flat::new();
+        let t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        s.climate = (0.1, 0.8);   // freezing and wet
+        let ctx = s.context(&t, &gaze_at(0, 0, 12.0), Some("grass"));
+        assert!(ctx.contains("SITE:"), "{ctx}");
+        assert!(ctx.contains("freezing"), "climate reaches the prompt: {ctx}");
+        assert!(ctx.contains("snowy"), "and becomes a palette suggestion: {ctx}");
+    }
+
+    #[test]
+    fn a_game_that_never_sets_the_climate_behaves_as_before() {
+        let mut w = Flat::new();
+        let t = VoxelTools::new(&mut w);
+        let s = ChatSession::new(32, 200);
+        let ctx = s.context(&t, &gaze_at(0, 0, 12.0), None);
+        assert!(ctx.contains("temperate"), "the default is the middle: {ctx}");
     }
 }
