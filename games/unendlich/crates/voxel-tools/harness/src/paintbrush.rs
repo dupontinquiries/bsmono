@@ -1,3 +1,4 @@
+
 //! The paintbrush, wired.
 //!
 //! Owns everything that persists between turns — the chat box, the
@@ -15,6 +16,13 @@
 //! * Writes are staged, not applied. `commit` fills a `Vec` of block
 //!   edits; the caller flushes them through `ChunkManager::set_blocks`
 //!   (one clone per chunk) and marks the chunks dirty.
+
+mod log {
+    macro_rules! info { ($($t:tt)*) => { eprintln!($($t)*) } }
+    macro_rules! warn_ { ($($t:tt)*) => { eprintln!($($t)*) } }
+    pub(crate) use info;
+    pub(crate) use warn_ as warn;
+}
 
 use crate::stubs::{AnimProfile, Command, FocusAdjust};
 use crate::stubs::parse as parse_command;
@@ -45,6 +53,78 @@ pub enum Pending {
     VoiceOff,
 }
 
+/// Locate a provider script without depending on the process working
+/// directory.
+///
+/// The first version hardcoded `games/unendlich/crates/...`, which is
+/// only correct when the game is launched from the monorepo root. Run
+/// from `games/unendlich` -- which is where you actually run it -- and
+/// it fails with `No such file or directory (os error 2)`, reported
+/// once per attempt and impossible to act on without reading the
+/// source.
+///
+/// Resolution order:
+///   1. `$UNENDLICH_BUILD_PROVIDER` (may be a command with arguments)
+///   2. next to the crate, via `CARGO_MANIFEST_DIR` -- correct for
+///      `cargo run` from anywhere in the workspace
+///   3. a few paths relative to the CWD, for a launched binary
+///   4. next to the executable, for an installed build
+pub fn find_provider(name: &str, allow_env: bool) -> Result<Vec<String>, String> {
+    // `/build debug` passes allow_env=false: its whole purpose is to
+    // exercise the pipeline with a known-good canned plan, so an env
+    // override pointing at a real model would defeat it.
+    if allow_env {
+    if let Ok(v) = std::env::var("UNENDLICH_BUILD_PROVIDER") {
+        let argv: Vec<String> = v.split_whitespace().map(String::from).collect();
+        if !argv.is_empty() {
+            return Ok(argv);
+        }
+    }
+    }
+    let mut tried: Vec<String> = Vec::new();
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    // CARGO_MANIFEST_DIR is unendlich-engine/; providers live in the
+    // sibling voxel-tools crate. Baked at compile time, so it does not
+    // care where the binary is started from.
+    candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../voxel-tools/providers").join(name));
+    for rel in [
+        "crates/voxel-tools/providers",
+        "games/unendlich/crates/voxel-tools/providers",
+        "../crates/voxel-tools/providers",
+        "providers",
+    ] {
+        candidates.push(std::path::Path::new(rel).join(name));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("providers").join(name));
+        }
+    }
+    for c in candidates {
+        if c.is_file() {
+            let abs = c.canonicalize().unwrap_or(c);
+            log::info!("[paintbrush] provider: {}", abs.display());
+            return Ok(vec![abs.display().to_string()]);
+        }
+        tried.push(c.display().to_string());
+    }
+    Err(format!(
+        "provider '{name}' not found. Set UNENDLICH_BUILD_PROVIDER to an \
+         executable, or check one of these paths exists:\n  {}",
+        tried.join("\n  ")))
+}
+
+/// Outcome of a keystroke: a command to dispatch, text for the
+/// clipboard, or nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyOut {
+    Command(Command),
+    Copy(String),
+    None,
+}
+
 pub struct Paintbrush {
     pub chatbox: ChatBox,
     pub session: ChatSession,
@@ -63,8 +143,11 @@ impl Paintbrush {
         let mut chatbox = ChatBox::new();
         // Tab-complete model names from the first scan.
         chatbox.set_dynamic_args("/model", models.models.iter().map(|m| m.name.clone()).collect());
+        log::info!("[paintbrush] scanned {} .gguf in {}",
+                   models.models.len(), models.dir.display());
         let mut log = Vec::new();
-        log.push(models.state.message());
+        log.push(format!("{} models in {}", models.models.len(), models.dir.display()));
+        log.push("Enter to chat. Try: /build debug a tower".into());
         Self {
             chatbox,
             session: ChatSession::new(chunk_size, 200),
@@ -95,16 +178,39 @@ impl Paintbrush {
         }
     }
 
-    /// Feed a key. Returns the line to parse, if one was submitted, and
-    /// any immediate action (commit/undo/focus come straight from
-    /// hotkeys without going through the parser).
-    pub fn key(&mut self, k: Key) -> Option<Command> {
+    /// What a keystroke produced.
+    ///
+    /// `key()` could only return a Command, which cannot express "put
+    /// this on the clipboard" -- the box knows the text, but only the
+    /// window can set the clipboard. `key_full` is the complete form;
+    /// `key` stays for callers that only care about commands.
+    pub fn key_full(&mut self, k: Key) -> KeyOut {
         match self.chatbox.key(k) {
+            Action::Copy(text) => KeyOut::Copy(text),
+            other => match Self::action_to_command(other) {
+                Some(c) => KeyOut::Command(c),
+                None => KeyOut::None,
+            },
+        }
+    }
+
+    fn action_to_command(a: Action) -> Option<Command> {
+        match a {
             Action::Submit(line) => Some(parse_command(&line)),
             Action::Commit => Some(Command::CommitPlan),
             Action::Undo => Some(Command::UndoBuild),
             Action::FocusBigger => Some(Command::Focus(Some(FocusAdjust::Bigger))),
             Action::FocusSmaller => Some(Command::Focus(Some(FocusAdjust::Smaller))),
+            _ => None,
+        }
+    }
+
+    /// Feed a key, keeping only a resulting command. Kept because most
+    /// callers do not care about the clipboard; `key_full` is the
+    /// complete form. One implementation, so the two cannot drift.
+    pub fn key(&mut self, k: Key) -> Option<Command> {
+        match self.key_full(k) {
+            KeyOut::Command(c) => Some(c),
             _ => None,
         }
     }
@@ -115,10 +221,26 @@ impl Paintbrush {
 
     /// Route a parsed command. Returns work for the caller.
     pub fn dispatch(&mut self, cm: &ChunkManager, gaze: &Gaze, cmd: Command) -> Pending {
+        // Trace every command. The first field session produced 14k lines
+        // of log with not one mention of the paintbrush, because every
+        // message went to the in-game chat panel and nothing to `log`.
+        // A feature you cannot diagnose from a log is a feature you
+        // cannot support.
+        log::info!("[paintbrush] dispatch {:?} (chat_open={})", cmd, self.chatbox.open);
         match cmd {
             Command::Build(prose) => {
-                if !self.models.state.is_ready() {
-                    self.say("no model loaded -- /model to list, /model <name> to load");
+                // `/build debug ...` uses the fixture provider, which needs
+                // no weights at all -- gating it on a loaded model defeated
+                // the one command whose job is to prove the pipeline works
+                // before you have a model. It reported "no model loaded"
+                // and stopped, which is exactly what "nothing happened"
+                // looks like from the outside.
+                let is_debug = prose.trim_start().starts_with("debug");
+                log::info!("[paintbrush] /build debug={} ready={} prose={:?}",
+                           is_debug, self.models.state.is_ready(), prose);
+                if !is_debug && !self.models.state.is_ready() {
+                    self.say("no model loaded -- /model to list, /model <name> to load, \
+                              or /build debug <anything> to test without one");
                     return Pending::None;
                 }
                 Pending::Model(prose)
@@ -155,16 +277,33 @@ impl Paintbrush {
                 self.push(r);
                 Pending::None
             }
-            Command::Model(None) => { let l = self.models.listing(); self.say(l); Pending::None }
+            Command::Keys => {
+                for c in voxel_tools::chatbox::CARDS {
+                    if c.command == "/keys" { self.say(c.summary.replace(" · ", "\n  ")); }
+                }
+                Pending::None
+            }
+            Command::Model(None) => {
+                log::info!("[paintbrush] /model list: {} models in {}",
+                           self.models.models.len(), self.models.dir.display());
+                let l = self.models.listing();
+                self.say(l);
+                Pending::None
+            }
             Command::Model(Some(name)) => match self.models.begin_load(&name) {
                 Ok(m) => {
                     let path = m.path.clone();
+                    log::info!("[paintbrush] loading model {}", path.display());
                     let msg = self.models.state.message();
                     self.say(msg);
                     self.load_started = Some(Instant::now());
                     Pending::LoadModel(path)
                 }
-                Err(e) => { self.say(e); Pending::None }
+                Err(e) => {
+                    log::warn!("[paintbrush] /model {name:?} failed: {e}");
+                    self.say(e);
+                    Pending::None
+                }
             },
             _ => Pending::None,     // not ours; the game's existing arms handle it
         }
@@ -174,6 +313,8 @@ impl Paintbrush {
     pub fn finish_turn(&mut self, cm: &ChunkManager, gaze: &Gaze, raw: &str,
                        player_feet: Option<(i32, i32, i32)>) {
         let ir = voxel_tools::llm::clean_reply(raw);
+        log::info!("[paintbrush] provider returned {} chars -> {} plan lines",
+                   raw.len(), ir.lines().count());
         if ir.trim().is_empty() {
             self.say(format!("the model replied ({} chars) but produced no plan lines", raw.len()));
             return;
@@ -209,6 +350,7 @@ impl Paintbrush {
         }
         let touched = staged.chunks_touched(self.chunk_size);
         let n = staged.pending();
+        log::info!("[paintbrush] commit: {n} blocks across {touched} chunk(s)");
         self.flush_staged(cm, &mut staged);
         if n > 0 {
             self.reveal = self.session.reveal(25);
@@ -222,6 +364,7 @@ impl Paintbrush {
     fn flush_staged(&mut self, cm: &ChunkManager, staged: &mut StagedWorld<'_, WorldView<'_>>) {
         if staged.pending() == 0 { return; }
         let (applied, skipped, _chunks) = flush(cm, staged, self.chunk_size);
+        log::info!("[paintbrush] flush: applied={applied} skipped={skipped}");
         if skipped > 0 {
             self.say(format!("{skipped} block(s) skipped (chunk not loaded)"));
         }

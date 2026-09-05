@@ -1,6 +1,7 @@
 mod stubs;
 mod bind;
 mod paintbrush;
+mod armcheck;
 
 use stubs::ChunkManager;
 use bind::{flush, WorldView};
@@ -24,7 +25,7 @@ fn scenario() {
     let feet = Some((0, 65, -12));
 
     // the model the game would spawn; scripted here
-    let llm = FakeCompleter::new(vec![
+    let mut llm = FakeCompleter::new(vec![
         "Sure! Here's the plan:\n```text\n# watchtower\n         terraform @-5,-5 @5,5 smooth block=stone\n         cylinder @0,0 r=3 h=11 block=stone_bricks hollow\n```\nHope that works!".into(),
         "sphere @3,0 r=1 block=air\npath @3,0 @16,9 w=2 block=cobblestone\n".into(),
     ]);

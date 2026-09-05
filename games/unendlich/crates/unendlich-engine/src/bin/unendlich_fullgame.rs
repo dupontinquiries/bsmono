@@ -4369,32 +4369,34 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             // and falls back to the fixture so a first run
                             // never silently does nothing.
                             let debug = prose.trim_start().starts_with("debug");
-                            let argv = match unendlich_engine::voxel_chat::find_provider(
-                                "fixture.sh", !debug) {
-                                Ok(a) => a,
-                                Err(e) => {
-                                    paintbrush.say(e);
-                                    Vec::new()
-                                }
-                            };
-                            if argv.is_empty() { continue_after_provider_error = true; }
-                            let (sys, user) =
-                                paintbrush.prompt_for(&chunk_manager, &gaze, None, &prose);
-                            let mut continue_after_provider_error = false;
-                            // Blocking. A local 7B takes a second or two and
-                            // this stalls the frame; the worker-thread version
-                            // is the obvious next step, but a stall you can
-                            // see beats a loop you cannot test.
-                            if !continue_after_provider_error {
-                                let mut prov = voxel_tools::llm::CommandProvider::new(argv);
-                                match voxel_tools::llm::Completer::complete(&mut prov, &sys, &user) {
-                                    Ok(raw) => paintbrush.finish_turn(
-                                        &chunk_manager, &gaze, &raw,
-                                        Some((eye.x as i32, eye.y as i32, eye.z as i32))),
-                                    Err(e) => paintbrush.say(format!("provider failed: {e}")),
+                            match unendlich_engine::voxel_chat::find_provider(
+                                "fixture.sh", !debug)
+                            {
+                                // A missing provider is reported and that is
+                                // the end of the turn -- no sentinel flag, no
+                                // empty argv threaded past the failure.
+                                Err(e) => paintbrush.say(e),
+                                Ok(argv) => {
+                                    let (sys, user) = paintbrush
+                                        .prompt_for(&chunk_manager, &gaze, None, &prose);
+                                    // Blocking. A local 7B takes a second or
+                                    // two and this stalls the frame; the
+                                    // worker-thread version is the obvious
+                                    // next step, but a stall you can see beats
+                                    // a loop you cannot test.
+                                    let mut prov =
+                                        voxel_tools::llm::CommandProvider::new(argv);
+                                    match voxel_tools::llm::Completer::complete(
+                                        &mut prov, &sys, &user)
+                                    {
+                                        Ok(raw) => paintbrush.finish_turn(
+                                            &chunk_manager, &gaze, &raw,
+                                            Some((eye.x as i32, eye.y as i32, eye.z as i32))),
+                                        Err(e) => paintbrush
+                                            .say(format!("provider failed: {e}")),
+                                    }
                                 }
                             }
-                            continue_after_provider_error = false;
                         }
                         Pending::LoadModel(path) => {
                             // No in-process loader: the provider script owns

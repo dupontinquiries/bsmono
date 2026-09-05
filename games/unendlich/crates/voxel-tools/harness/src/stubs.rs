@@ -36,7 +36,7 @@ pub enum AnimProfile { GroundUp, Physics, Random, Instant }
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Command {
     Build(String), BuildVoice(bool), ShowPlan, CommitPlan, UndoBuild,
-    Focus(Option<FocusAdjust>), Anim(AnimProfile), Model(Option<String>), Unknown,
+    Focus(Option<FocusAdjust>), Anim(AnimProfile), Model(Option<String>), Keys, Unknown,
 }
 pub fn parse(line: &str) -> Command {
     let t = line.trim();
@@ -60,6 +60,7 @@ pub fn parse(line: &str) -> Command {
         (Some("/anim"), Some(_)) => Command::Anim(AnimProfile::GroundUp),
         (Some("/model"), None) => Command::Model(None),
         (Some("/model"), Some(n)) => Command::Model(Some(n.to_string())),
+        (Some("/keys"), None) => Command::Keys,
         _ => Command::Unknown,
     }
 }
