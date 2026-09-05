@@ -4277,14 +4277,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // so "where I'm looking" means exactly what it means for
                 // breaking a block.
                 let fwd = local_player.forward();
+                // Eye position: `local_player.view.position`. (`pos` is a
+                // local at the block-placement site further down, not a
+                // binding that reaches here.)
+                let eye = local_player.view.position;
                 let hit = chunk_manager
-                    .raycast_octree([pos.x, pos.y, pos.z], [fwd.x, fwd.y, fwd.z], 128.0,
+                    .raycast_octree([eye.x, eye.y, eye.z], [fwd.x, fwd.y, fwd.z], 128.0,
                                     |b| b.is_solid())
                     .map(|h| ([h.world_cell.0, h.world_cell.1, h.world_cell.2],
                               [h.normal.0, h.normal.1, h.normal.2],
                               h.t));
                 let gaze = unendlich_engine::voxel_chat::Paintbrush::gaze_from(
-                    [pos.x, pos.y, pos.z], [fwd.x, fwd.y, fwd.z], hit);
+                    [eye.x, eye.y, eye.z], [fwd.x, fwd.y, fwd.z], hit);
 
                 if let Some(cmd) = submitted {
                     match paintbrush.dispatch(&chunk_manager, &gaze, cmd) {
@@ -4307,7 +4311,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             match voxel_tools::llm::Completer::complete(&mut prov, &sys, &user) {
                                 Ok(raw) => paintbrush.finish_turn(
                                     &chunk_manager, &gaze, &raw,
-                                    Some((pos.x as i32, pos.y as i32, pos.z as i32))),
+                                    Some((eye.x as i32, eye.y as i32, eye.z as i32))),
                                 Err(e) => paintbrush.say(format!("provider failed: {e}")),
                             }
                         }
