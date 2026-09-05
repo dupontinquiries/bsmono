@@ -448,7 +448,33 @@ mod live_tests {
         // not among them, so the ratchet fired into an empty room. The same
         // shape as the tools' scope problem one directory over: what is not
         // measured is not measured, however green everything else looks.
-        const CEILING: usize = 379;
+        // 386, raised from 379 for the c15unified-009 queen/probe series
+        // (context_probe, fan_policy, probe_exec, queen, relief_policy). Found
+        // by the first on-device fleet run after five sibling sessions were
+        // merged — and the merge added NONE of them: the name set at e69a006a
+        // (before any merge) and at the merged tip are the same 386, checked
+        // by building both. The seven are all from that series, whose session
+        // never ran `-p logscope`. Audited one by one, none is an
+        // implementation twice:
+        //
+        //   Enum Bound          specverify (what bounds a speculation)     vs fan_policy (fan-width decision)
+        //   Enum ReliefPolicy   gpu-gemm ctxwin, 2-state engine policy     vs relief_policy, 3-state UI policy
+        //                       — LAYERED, not duplicated: the UI's `Ask` cannot exist at the engine
+        //                       and maps down through `engine_flag()`. Same name across layers is a
+        //                       readability cost worth a doc line, not a fix.
+        //   Fn estimate_tokens  context_probe (a probe's cost)             vs model_selector
+        //   Fn keywords         queen keeps identifier-shaped tokens       vs convograph drops stopwords,
+        //                       keeps English — OPPOSITE filters, one name
+        //   Fn resolved         relief_policy (Ask -> chosen policy)       vs buildpolicy
+        //   Fn slice            probe_exec (file line range, streamed)     vs gguf (tensor slice)
+        //   Struct Finding      context_probe {path, first, last, text}    vs prechecks {line, confidence, what, fix}
+        //
+        // The one thing this audit DID turn up is not a name collision:
+        // ls008's `workspace_exec::read_near` reads the whole file with
+        // `read_to_string` to serve an excerpt, which is the pattern
+        // `probe_exec::slice` in the same crate exists to avoid. Two readers
+        // for one job; see C14_TODO's fleet-run section.
+        const CEILING: usize = 386;
         assert!(d.len() <= CEILING,
             "{} duplicate names, ceiling {CEILING}. A new one appeared — either two ideas sharing a \
 name, which is fine and wants the ceiling raised deliberately, or one idea implemented twice, which \

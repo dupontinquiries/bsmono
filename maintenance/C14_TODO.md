@@ -1347,6 +1347,68 @@ models, which is a bigger discontinuity than the same model applied twice. If
 blending the ring does not settle it, the next question is whether tier
 assignment should be smoothed spatially rather than decided per block.
 
+## 25. Fleet run on 7c82c39c: 3 build / 9 test failures, and what each one is
+
+The first on-device run (Asahi aarch64, Fedora rustc 1.97.1) after the five
+sibling sessions — voiceterm, ls008, aperture/030, studio 0189–0200, v028,
+blackstar — were merged onto the queen/probe series in `53e807f2..7c82c39c`.
+61 crates build, 52 test crates green, 6877 tests passed. Every failure below
+was attributed by checking whether the merge range touched the failing code,
+and by rebuilding the base where a number needed a baseline. Attribution, not
+fixes: all but one need the hardware or the host.
+
+### Not the merge: was failing before it (§21 already lists most)
+
+| where | failure | evidence |
+|---|---|---|
+| beatspace, +features | `gemm-f16`: `instruction requires: fullfp16` | §21; aarch64 codegen flag; `apps/beatspace` untouched in range |
+| bo-suite | `speaker_calibration::non_finite_correlation_rejected` | §21 had a different test in the same module; file untouched in range |
+| bot-arena | `experience_log_dedups_identical_fixes`, `registry_scans_gguf_and_local` ("gguf scanned" — wants a local models dir) | files untouched in range |
+| logscope-fan | `verdict::compile_grades_real_code` — Pass expected, got Fail | §21, "triaged, not root-caused". v028 `114ea3e6e` fixed only the no-rustc case (127 → None); this host HAS rustc, so the cause is different. **Passes on x86_64 rustc 1.96 here.** Cheapest next step, on the device: `echo 'pub fn a(){}' > /tmp/x.rs; rustc --crate-type lib --edition 2021 --emit=metadata -o /dev/null /tmp/x.rs; echo $?` — if that is non-zero, `DEFAULT_CHECK`'s `-o /dev/null` with `--emit=metadata` is what 1.97 or Fedora's build rejects, and the fix is a real temp path. |
+| logscope-egui | `long_horizon_tests::a_range_read_of_a_huge_file_does_not_allocate_it` — 51 MiB RSS growth on a 31-line read of 256 MiB | §21. `read_range` unchanged in range. The device's 16 K pages make RSS deltas coarse; the assertion may need a page-size-aware bound rather than a fixed one. |
+| logscope-egui | `sandbox::a_FROZEN_posture_forces_offline_however_the_caller_asked` — only in the no-features run, green in `+features` | `sandbox.rs` untouched. Both runs share `temp_dir()/logscope-posture-test` and the fleet runs them concurrently ("waiting on 2 test runs"): a test-isolation race, not the gate. Give the dir a per-process suffix. |
+| logscope | `dupscan::duplicate_names_do_not_grow` — 386, ceiling 379 | **Fixed.** Built the ratchet with ceiling 0 at the fork `4af5f6b7` (379), the pre-merge base `e69a006a` (386) and the merged tip (386, identical set). All seven came from the 009 queen/probe series, whose session never ran `-p logscope`; the merge added none. Audited in `dupscan.rs` next to the new ceiling — none is an implementation twice. |
+| av1tuner | `TextEdit::id_salt` ×6 | egui API drift; untouched in range |
+| rusty-board | `gtk4-layer-shell-sys` build script | host lacks the dev package; untouched in range (1 TODO.md line) |
+| voiceterm `web2qml` | `LocalKey<Cell<usize>>::load` | not a method that exists on `LocalKey`; untouched in range, so it did not compile before either |
+| rusty-board-egui, aperture-scene | doctest `E0463 can't find crate` | §21's shape exactly. §21 blamed tmpfs pressure; this run had 94 GiB free in `/dev/shm`, so that theory is weakened. Doctests of path-dep crates under a shared `CARGO_TARGET_DIR` is the pattern to look at next. |
+
+### New tests from the merged work, environment-sensitive
+
+* **aperture** `lsp_incremental_sync_e2e`, `lsp_typing_sync_regression` — both
+  time out at 15 s with `popup: None`. They skip when `rust-analyzer` is not
+  on PATH, so on this host it IS present and did not answer in time. The
+  sender verified them against rust-analyzer; whether this is r-a startup
+  time on aarch64, a version difference, or a real sync bug is not decidable
+  from the log. Run one with `RUST_LOG=debug` and a longer deadline before
+  suspecting the sync.
+* **gpu-gemm** `window_batching_tests::flush_every_bounds_submits_and_does_not_change_results`
+  — expected a flush every ~4 dispatches over 30, got 14 submits. Test
+  unchanged in range; this is the FIRST time gpu-gemm's suite has run to
+  completion on the device (§21: SIGSEGV). "Apple M2 Ultra … subgroup decode
+  DISABLED" is in the log, so the Asahi driver is in play. A device
+  observation, needs the device.
+
+### Found while attributing, not a test failure
+
+* **`logscope-egui --no-default-features` does not compile**, and did not at
+  `e69a006a` either: ungated `workspace_exec.rs` calls `crate::runcard`, which
+  is `#[cfg(feature = "gui")]` (from `d218468d5`, Aug 31). `logscope-cli`
+  cannot build lean. The fleet builds default features so never sees it.
+* **Two readers for one job.** ls008's `workspace_exec::read_near` reads the
+  whole file with `read_to_string` to return an excerpt — it needs the whole
+  file for its brace-depth `#[cfg(test)]` scan — while `probe_exec::slice`
+  in the same crate streams and stops, and its module doc says why. This is
+  the same seam as the two `queen` modules (`logscope_fan::queen` designs
+  workers; `logscope_egui::queen` plans probes): the 008 and 009 sessions
+  built the model-facing and the queen-facing half of "read near X without
+  the whole file" without seeing each other. Unify on the streaming reader
+  when the queens are reconciled.
+* `gpu_kernels::Model` now carries `arch`, `gaps` AND `moe_variant` +
+  `model_gaps()` — two sessions' shapes, superset, see `e0ede4aa`.
+  `archfeat::llama_cache_path_has_no_gaps_to_capture` pins the cache-path
+  default and was broken on purpose once to prove it fires.
+
 ---
 
 # C14_TODO — open threads from the c14 session (blackstar/voice line)
