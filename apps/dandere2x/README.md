@@ -245,6 +245,80 @@ What is built:
   device. Bit-exact against the CPU reference with three sets over
   five-tile frames on lavapipe; the overlap itself only shows on a real
   GPU.
+- **Plate reference** (`--plate-window N`, default 0 = off): each window of
+  up to N frames (ended early at a scene cut — phase-correlation confidence
+  below `--plate-confidence`, or PSNR below the redraw floor) gets a
+  background plate: fao-codec's v11 plate, a per-pixel temporal median of
+  the frames placed under their global motion, integer placements. The
+  main network upscales it once (`plate` line in the log, cost reported
+  separately in the summary so the reuse number includes it) and every
+  block it explains is a `plt` copy from that upscale. Holds N frames in
+  RAM ahead of analysis and adds N frames of latency. Measured on the two
+  test clips (`analyze`, 240 frames, q90): a net LOSS on both — the film
+  clip's whip pans are 30–46 px/frame with motion blur, and the game clip's
+  3D camera moves every edge by a sub-pixel amount, so an integer, global-
+  translation plate serves ~1% of blocks and costs 4.5% of a frame per
+  frame. `D2X_PLATE_DEBUG=1` prints every pair's motion and every window.
+  The sub-pixel version (`v11_plate::build_plate_sr`, S=2, exact at ×2)
+  and per-layer motion are the next steps, and they should be measured
+  with `analyze` before the GPU is involved.
+- **Motion-seeded search** (`--mv-seed`): the diamond search starts from
+  each frame's global motion (one phase correlation per frame pair), so a
+  pan beyond the search radius is still a copy; a failed seeded walk falls
+  back to the unseeded one. No effect on either test clip (see above:
+  nothing passes the gate at any integer offset).
+- **Half-pel refinement** (`--halfpel`, needs an even scale): when the
+  integer match fails the gate, the eight half-pel neighbours of its best
+  candidate are tried (rounded bilinear). In the ×2 output a half-pel input
+  offset is an integer offset, so the merge is still an exact copy; the
+  low-res mirror is the box-downsample of that copy, bit for bit. SMITE,
+  120 frames: 83.3% → 67.9% at q60 (redraws 52 → 19), but only 95.4% →
+  94.6% at q90. `--halfpel-filter 6tap` (H.264's half-pel filter, sharp)
+  was the obvious suspect and is NOT it: on the same 100 frames at q80,
+  bilinear 93.7% → 90.2% and 6-tap 90.2%, 58 vs 60 half-pel blocks per
+  frame, indistinguishable. The game clip's 3D camera puts every block at
+  an arbitrary sub-pixel phase with per-block perspective; half-pel is not
+  where the content is. Quarter-pel is an exact copy only at ×4; at ×2 it
+  means resampling the CNN output — the trade a DLSS-class accumulator
+  makes on purpose. (The 6-tap sampler is a straightforward closure loop,
+  ~1 s/frame at 1080p on one core; not optimised, since it did not earn it.)
+- **Region redraw** (`--region-redraw`, default on; `--redraw-fraction`,
+  default 0.9): when the packed residual would cost more than the redraw
+  fraction, or the bounding rectangle of the missing blocks is cheaper than
+  packing them, that rectangle is upscaled as ONE image with its bleed ring
+  (`REGION WxH` in the log) and blended back; blocks matched outside it —
+  letterbox bars, a static HUD — stay copies. With bleed 8 on 30 px blocks
+  a cell is 2.35× a block, so the old rule redrew the whole frame at ~38%
+  missing and threw those copies away. Lone Ranger AV1, 120 frames, q90:
+  66.7% → 53.6% of pixels through the network.
+- **Anchor propagation** (`--anchor-rmse R`, default 0 = off; `--anchor-max-age N`,
+  default 0 = never): the diamond search also runs against the *anchor* —
+  the last redrawn frame, whose output is a fresh network pass — under a
+  flat RMSE gate instead of the JPEG gate (`anc` column; `RecalledMoved` in
+  the plan, copied from the anchor's upscale). A region redraw covering at
+  least half the frame is an anchor too. `--anchor-max-age N` forces a new
+  anchor every N frames, bounding how far blocks are propagated: the
+  low/high ground-truth measurement (`examples/tdenoise --from --oracle`)
+  gained +0.8 dB / +0.008 SSIM at ±1, +0.3–0.6 dB at ±2, nothing at ±3–4
+  and lost beyond, so 3–5 is the range to sweep. Measured, q90, 120 frames:
+  Lone Ranger 53.6% → 33.3% (`--anchor-rmse 12`), 36.9% with `--anchor-max-age 5`;
+  SMITE 95.9% → 54.5% unbounded, **31.4%** with `--anchor-max-age 5 --halfpel
+  --quarterpel` — fresh anchors are closer, so more blocks pass. The RMSE
+  gate is the quality knob; 8 costs almost nothing over 12 on film (33.6%).
+  Verify with `compare --per-frame` and watch the minimum.
+- **Quarter-pel** (`--quarterpel`, with `--halfpel`; exact copy only at
+  scales that are a multiple of 4 — the x4 models): half-pel becomes a
+  search stage centring a quarter-pel refinement; the mirror is the 4×4 box
+  downsample of the output, bit for bit. SMITE +2.4 points over half-pel.
+- **Restoration training set** (`tools/pair_dataset.py`): a low-bitrate
+  and a high-bitrate encode of the same movie are a frame-aligned training
+  pair. `extract` verifies alignment per timestamp (PSNR to the matching
+  frame must beat its neighbours by a margin) and writes crop pairs;
+  `score` is the PSNR/SSIM judge used for every temporal experiment in
+  `examples/tdenoise`. On the 558 kbps / 2.5 Mbps pair no temporal fusion
+  recovered anything (+0.00 dB) — the artefact is coherent smoothing — so
+  the detail has to come from a prior: train an SRVGG-class net on the
+  crops, export with `tools/pth2st.py`, run it as a cascade tier.
 - **Gate hysteresis** (`--streak-bonus b`, default 0 = off): a block reused
   for `n` consecutive frames gets its threshold scaled by
   `1 + b·min(n,8)/8`, so blocks that keep matching stop flickering out at

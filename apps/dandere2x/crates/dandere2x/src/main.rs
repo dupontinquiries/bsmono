@@ -77,6 +77,54 @@ struct Common {
     /// Shot-start outputs retained as references (cut-backs). Default: from --ram-budget.
     #[arg(long)]
     keyframe_refs: Option<usize>,
+    /// Plate window in frames (0 = off). Each window of up to N frames (ended
+    /// early at a scene cut) gets one background plate — a temporal median of
+    /// the frames placed under their global motion — which the main network
+    /// upscales ONCE and which then serves every block it explains as an exact
+    /// copy. Holds N input frames in RAM ahead of analysis (6.2 MB each at
+    /// 1080p) and adds N frames of latency before the first output.
+    #[arg(long, default_value_t = 0)]
+    plate_window: usize,
+    /// Phase-correlation confidence below which a frame pair's motion is not
+    /// trusted for plate placement (0..1).
+    #[arg(long, default_value_t = 0.2)]
+    plate_confidence: f32,
+    /// Seed the diamond search with each frame's global motion (phase
+    /// correlation), so pans beyond the search radius are still copies.
+    #[arg(long)]
+    mv_seed: bool,
+    /// After an integer motion match fails the gate, try its eight half-pel
+    /// neighbours (bilinear). Sub-pixel camera motion on sharp content fails
+    /// integer matching by construction. Needs an even scale (x2, x4).
+    #[arg(long)]
+    halfpel: bool,
+    /// Interpolant for --halfpel: bilinear (soft, exact with a box
+    /// downsample) or 6tap (H.264's, sharp — what a CNN's output looks like
+    /// at an odd pixel).
+    #[arg(long, default_value = "bilinear")]
+    halfpel_filter: String,
+    /// After half-pel, refine to quarter-pel (needs a scale that is a multiple of 4).
+    #[arg(long)]
+    quarterpel: bool,
+    /// Redraw (whole frame or region) when the packed residual would cover at
+    /// least this fraction of the frame's pixels; with bleed 8 on 30 px blocks
+    /// a cell is 2.35x a block, so 0.9 fires at ~38% missing blocks.
+    #[arg(long, default_value_t = 0.9)]
+    redraw_fraction: f64,
+    /// Upscale the bounding rectangle of missing blocks as one image (with
+    /// bleed) when that is cheaper than packing them or than the whole frame;
+    /// matched blocks outside it are kept. Letterbox bars stay copies.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    region_redraw: bool,
+    /// Motion search against the anchor (last redrawn frame, a fresh network
+    /// pass) with this RMSE gate (8-bit units); 0 = off. 12 was the gate the
+    /// propagation measurement used.
+    #[arg(long, default_value_t = 0.0)]
+    anchor_rmse: f64,
+    /// Force a new anchor (full redraw) every N frames (0 = never). Bounds
+    /// how far blocks are propagated from a restored frame; ±2 measured good.
+    #[arg(long, default_value_t = 0)]
+    anchor_max_age: u32,
     /// Host memory the job may hold (e.g. 96G). Default: half of MemAvailable.
     #[arg(long)]
     ram_budget: Option<String>,
@@ -254,6 +302,20 @@ fn job_from(common: &Common, input: PathBuf, output: PathBuf) -> anyhow::Result<
     j.pipeline.queue_depth = common.batch.max(2) * 2;
     j.pipeline.analyze.tier_std = [common.flat_std, common.smooth_std];
     j.pipeline.analyze.streak_bonus = common.streak_bonus;
+    j.pipeline.plate_window = common.plate_window;
+    j.pipeline.plate_min_confidence = common.plate_confidence;
+    j.pipeline.mv_seed = common.mv_seed;
+    j.pipeline.analyze.halfpel = common.halfpel;
+    j.pipeline.analyze.quarterpel = common.quarterpel;
+    j.pipeline.analyze.redraw_fraction = common.redraw_fraction;
+    j.pipeline.analyze.region_redraw = common.region_redraw;
+    j.pipeline.analyze.anchor_rmse = common.anchor_rmse;
+    j.pipeline.analyze.anchor_max_age = common.anchor_max_age;
+    j.pipeline.analyze.subpel_filter = match common.halfpel_filter.as_str() {
+        "bilinear" => d2x_core::SubpelFilter::Bilinear,
+        "6tap" => d2x_core::SubpelFilter::SixTap,
+        other => anyhow::bail!("--halfpel-filter must be bilinear|6tap, got {other}"),
+    };
     j.cascade_model = common.cascade.as_ref().map(|c| if c == "default" { None } else { Some(PathBuf::from(c)) });
     j.flat_bypass = common.flat_bypass;
     j.pipeline.tiers = 1 + j.cascade_model.is_some() as usize + j.flat_bypass as usize;
@@ -273,12 +335,16 @@ fn print_event(e: &Event) {
             eprintln!("upscaler: {upscaler}\nmatcher: {matcher}, gate: {gate}");
         }
         Event::FrameDone { index, stats, analyze_time, upscale_time, merge_time } => {
-            let kind = if stats.redraw { "REDRAW" } else { "" };
+            let kind = if stats.redraw { "REDRAW".to_string() } else if let Some((_, _, w, h)) = stats.region { format!("REGION {w}x{h}") } else { String::new() };
             eprintln!(
-                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} rec {:3} cache {:3} miss {:4} fade {:3}  residual {} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
+                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} half {:4} q4 {:4} anc {:4} plt {:4} rec {:3} cache {:3} miss {:4} fade {:3}  residual {} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
                 stats.psnr,
                 stats.stationary,
                 stats.moved,
+                stats.moved_half,
+                stats.moved_quarter,
+                stats.anchored,
+                stats.plated,
                 stats.recalled,
                 stats.cached,
                 stats.missing,
@@ -289,8 +355,11 @@ fn print_event(e: &Event) {
                 merge_time.as_secs_f64() * 1e3
             );
         }
-        Event::Finished { frames, elapsed, upscaled_pixel_fraction, .. } => {
-            eprintln!("done: {frames} frames in {:.1}s ({:.2} fps); {:.1}% of pixels went through the network", elapsed.as_secs_f64(), *frames as f64 / elapsed.as_secs_f64().max(1e-9), upscaled_pixel_fraction * 100.0);
+        Event::PlateUpscaled { index, size, frames, area, time } => {
+            eprintln!("plate  {index:6}  {}x{} ({:.2} frames of pixels) for {frames} frames = {:.1}% per frame  U {:7.1}ms", size.0, size.1, area, 100.0 * area / (*frames).max(1) as f64, time.as_secs_f64() * 1e3);
+        }
+        Event::Finished { frames, elapsed, upscaled_pixel_fraction, plate_pixel_fraction, .. } => {
+            eprintln!("done: {frames} frames in {:.1}s ({:.2} fps); {:.1}% of pixels went through the network as residuals + {:.1}% as plates = {:.1}%", elapsed.as_secs_f64(), *frames as f64 / elapsed.as_secs_f64().max(1e-9), upscaled_pixel_fraction * 100.0, plate_pixel_fraction * 100.0, (upscaled_pixel_fraction + plate_pixel_fraction) * 100.0);
         }
     }
 }
@@ -328,10 +397,12 @@ fn main() -> anyhow::Result<()> {
             let (source, _) = job::open_source(&job)?;
             let bleed = job.pipeline.analyze.bleed;
             let summary = d2x_core::pipeline::analyze_only(source, job.pipeline, |i, s, frac, t| {
-                eprintln!("frame {i:6}  psnr {:5.1}  stat {:4} mov {:4} rec {:3} miss {:4} fade {:3}  upscaled {:5.1}%{}  {:.1}ms", s.psnr, s.stationary, s.moved, s.recalled, s.missing, s.fades, frac * 100.0, if s.redraw { " REDRAW" } else { "" }, t.as_secs_f64() * 1e3);
+                let kind = if s.redraw { " REDRAW".to_string() } else if let Some((_, _, w, h)) = s.region { format!(" REGION {w}x{h}") } else { String::new() };
+                eprintln!("frame {i:6}  psnr {:5.1}  stat {:4} mov {:4} half {:4} q4 {:4} anc {:4} plt {:4} rec {:3} miss {:4} fade {:3}  upscaled {:5.1}%{kind}  {:.1}ms", s.psnr, s.stationary, s.moved, s.moved_half, s.moved_quarter, s.anchored, s.plated, s.recalled, s.missing, s.fades, frac * 100.0, t.as_secs_f64() * 1e3);
             })?;
             let _ = bleed;
-            eprintln!("{} frames: {:.1}% of pixels through the main network ({:.1}x fewer than full upscaling), {:.1}% through any network tier", summary.frames, summary.heavy_pixel_fraction * 100.0, 1.0 / summary.heavy_pixel_fraction.max(1e-9), summary.upscaled_pixel_fraction * 100.0);
+            let total = summary.heavy_pixel_fraction + summary.plate_pixel_fraction;
+            eprintln!("{} frames: {:.1}% of pixels through the main network as residuals + {:.1}% as plates = {:.1}% ({:.1}x fewer than full upscaling); {:.1}% through any network tier as residuals", summary.frames, summary.heavy_pixel_fraction * 100.0, summary.plate_pixel_fraction * 100.0, total * 100.0, 1.0 / total.max(1e-9), summary.upscaled_pixel_fraction * 100.0);
         }
         Cmd::Selftest { model, tile, kernel } => {
             #[cfg(feature = "gpu")]

@@ -159,6 +159,123 @@ impl Frame {
         out
     }
 
+    /// The `size`×`size` block whose top-left is at `(sx2 / 2, sy2 / 2)` in
+    /// half-pel units: bilinear where an ordinate is odd, exact copy where
+    /// both are even. Rounded `(a + b + 1) >> 1` / `(a + b + c + d + 2) >> 2`,
+    /// which is exactly the 2×2 box-downsample of a 2× nearest-upscaled
+    /// frame read at that odd output offset — so this is the true low-res
+    /// mirror of what the merge copies, not an approximation of it.
+    /// Requires `sx2 / 2 + size (+1 if odd) <= width` and likewise for y.
+    pub fn block_halfpel(&self, sx2: u32, sy2: u32, size: u32) -> Frame {
+        let (x0, y0) = (sx2 / 2, sy2 / 2);
+        let (fx, fy) = (sx2 % 2 == 1, sy2 % 2 == 1);
+        debug_assert!(x0 + size + fx as u32 <= self.width && y0 + size + fy as u32 <= self.height, "block_halfpel OOB");
+        let mut out = Frame::new(size, size);
+        let rb = (size as usize) * 3;
+        for j in 0..size {
+            let d = out.idx(0, j);
+            let r0 = self.row(y0 + j, x0, x0 + size + fx as u32);
+            let r1 = if fy { self.row(y0 + j + 1, x0, x0 + size + fx as u32) } else { r0 };
+            let o = &mut out.data[d..d + rb];
+            match (fx, fy) {
+                (false, false) => o.copy_from_slice(&r0[..rb]),
+                (true, false) => {
+                    for i in 0..rb {
+                        o[i] = ((r0[i] as u16 + r0[i + 3] as u16 + 1) >> 1) as u8;
+                    }
+                }
+                (false, true) => {
+                    for i in 0..rb {
+                        o[i] = ((r0[i] as u16 + r1[i] as u16 + 1) >> 1) as u8;
+                    }
+                }
+                (true, true) => {
+                    for i in 0..rb {
+                        o[i] = ((r0[i] as u16 + r0[i + 3] as u16 + r1[i] as u16 + r1[i + 3] as u16 + 2) >> 2) as u8;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The block at quarter-pel `(sx4 / 4, sy4 / 4)`: rounded bilinear with
+    /// weights in quarters — exactly the 4×4 box-downsample of a 4× nearest
+    /// upscale read at that output offset, so at scale 4 the merge's integer
+    /// copy and this mirror agree bit for bit. Requires the block plus one
+    /// pixel (where fractional) to be in bounds.
+    pub fn block_quarterpel(&self, sx4: u32, sy4: u32, size: u32) -> Frame {
+        let (x0, y0) = (sx4 / 4, sy4 / 4);
+        let (qx, qy) = (sx4 % 4, sy4 % 4);
+        if qx == 0 && qy == 0 {
+            return self.crop(x0, y0, size, size);
+        }
+        debug_assert!(x0 + size + (qx > 0) as u32 <= self.width && y0 + size + (qy > 0) as u32 <= self.height, "block_quarterpel OOB");
+        let mut out = Frame::new(size, size);
+        let (wx0, wx1, wy0, wy1) = (4 - qx, qx, 4 - qy, qy);
+        for j in 0..size {
+            let r0 = self.row(y0 + j, x0, x0 + size + (qx > 0) as u32);
+            let r1 = if qy > 0 { self.row(y0 + j + 1, x0, x0 + size + (qx > 0) as u32) } else { r0 };
+            for i in 0..size as usize {
+                let mut px = [0u8; 3];
+                for c in 0..3 {
+                    let k = i * 3 + c;
+                    let a = r0[k] as u32 * wx0 + if qx > 0 { r0[k + 3] as u32 * wx1 } else { 0 };
+                    let b = r1[k] as u32 * wx0 + if qx > 0 { r1[k + 3] as u32 * wx1 } else { 0 };
+                    px[c] = ((a * wy0 + b * wy1 + 8) >> 4) as u8;
+                }
+                out.set_px(i as u32, j, px);
+            }
+        }
+        out
+    }
+
+    /// [`block_halfpel`](Self::block_halfpel) with H.264's 6-tap half-pel
+    /// filter `[1, −5, 20, 20, −5, 1] / 32` instead of bilinear; the
+    /// centre position filters the unrounded horizontal intermediates
+    /// vertically (`+512 >> 10`), as the standard does. Taps past the frame
+    /// edge replicate the edge pixel.
+    ///
+    /// Why a second filter: bilinear at half-pel is a 2-tap box, which
+    /// blurs a sharp edge by a full pixel. A CNN's ×2 output read at an odd
+    /// pixel is *sharp* — the network reconstructs the edge — so the
+    /// low-res question "would that copy pass the gate" is answered better
+    /// by the sharpest cheap interpolant than by the softest. This is the
+    /// same filter every video codec uses for the same reason.
+    pub fn block_halfpel_6tap(&self, sx2: u32, sy2: u32, size: u32) -> Frame {
+        let (x0, y0) = (sx2 / 2, sy2 / 2);
+        let (fx, fy) = (sx2 % 2 == 1, sy2 % 2 == 1);
+        if !fx && !fy {
+            return self.crop(x0, y0, size, size);
+        }
+        let (w, h) = (self.width as i64, self.height as i64);
+        let at = |x: i64, y: i64, c: usize| -> i32 {
+            let xi = x.clamp(0, w - 1) as u32;
+            let yi = y.clamp(0, h - 1) as u32;
+            self.data[self.idx(xi, yi) + c] as i32
+        };
+        const T: [i32; 6] = [1, -5, 20, 20, -5, 1];
+        // Horizontal 6-tap at (x + 1/2, y), unrounded.
+        let hsum = |x: i64, y: i64, c: usize| -> i32 { (0..6).map(|k| T[k] * at(x - 2 + k as i64, y, c)).sum() };
+        let mut out = Frame::new(size, size);
+        for j in 0..size as i64 {
+            for i in 0..size as i64 {
+                let (x, y) = (x0 as i64 + i, y0 as i64 + j);
+                let mut px = [0u8; 3];
+                for c in 0..3 {
+                    let v = match (fx, fy) {
+                        (true, false) => (hsum(x, y, c) + 16) >> 5,
+                        (false, true) => ((0..6).map(|k| T[k] * at(x, y - 2 + k as i64, c)).sum::<i32>() + 16) >> 5,
+                        _ => ((0..6).map(|k| T[k] * hsum(x, y - 2 + k as i64, c)).sum::<i32>() + 512) >> 10,
+                    };
+                    px[c] = v.clamp(0, 255) as u8;
+                }
+                out.set_px(i as u32, j as u32, px);
+            }
+        }
+        out
+    }
+
     /// Add uniform noise in `[-strength, strength]` to every channel, clamped.
     /// Deterministic for a given seed (a SplitMix64 stream), so a run is
     /// reproducible and tests can pin outputs.
@@ -277,6 +394,82 @@ pub fn block_sse_bounded(
         }
     }
     Some(sum)
+}
+
+#[cfg(test)]
+mod halfpel_tests {
+    use super::*;
+
+    /// Both filters are exact on a constant and on a linear ramp (the 6-tap
+    /// sums to 32 and is symmetric), and identical to a plain crop at an
+    /// integer position.
+    #[test]
+    fn halfpel_filters_agree_on_ramps_and_integers() {
+        let mut f = Frame::new(24, 24);
+        for y in 0..24 {
+            for x in 0..24 {
+                f.set_px(x, y, [(4 * x) as u8, (2 * y + 10) as u8, 77]);
+            }
+        }
+        for &(sx2, sy2) in &[(8u32, 8u32), (9, 8), (8, 9), (9, 9)] {
+            let a = f.block_halfpel(sx2, sy2, 8);
+            let b = f.block_halfpel_6tap(sx2, sy2, 8);
+            assert_eq!(a, b, "({sx2},{sy2})");
+            // x ramp of slope 4 per pixel: a half-pel shift adds 2.
+            let want_r = (4 * (sx2 / 2) + 2 * (sx2 % 2)) as u8;
+            let want_g = (2 * (sy2 / 2) + (sy2 % 2) + 10) as u8;
+            assert_eq!(a.px(0, 0), [want_r, want_g, 77], "({sx2},{sy2})");
+        }
+        assert_eq!(f.block_halfpel_6tap(8, 8, 8), f.crop(4, 4, 8, 8));
+    }
+
+    /// Quarter-pel bilinear equals the 4×4 box-downsample of a 4× nearest
+    /// upscale read at the same offset, for every phase.
+    #[test]
+    fn quarterpel_is_the_box_downsample_of_nearest_x4() {
+        let f = crate::testimg::smooth(24, 20, 3);
+        let up = crate::upscale::Upscaler::upscale(&mut crate::upscale::NearestUpscaler { scale: 4 }, &f).unwrap();
+        for qy in 0..4u32 {
+            for qx in 0..4u32 {
+                let (sx4, sy4) = (4 * 5 + qx, 4 * 6 + qy);
+                let b = f.block_quarterpel(sx4, sy4, 8);
+                for j in 0..8u32 {
+                    for i in 0..8u32 {
+                        let mut want = [0u8; 3];
+                        for c in 0..3 {
+                            let mut sum = 0u32;
+                            for dy in 0..4 {
+                                for dx in 0..4 {
+                                    sum += up.px(sx4 + 4 * i + dx, sy4 + 4 * j + dy)[c] as u32;
+                                }
+                            }
+                            want[c] = ((sum + 8) >> 4) as u8;
+                        }
+                        assert_eq!(b.px(i, j), want, "phase ({qx},{qy}) px ({i},{j})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// On a step edge the 6-tap keeps the edge sharper than the 2-tap box:
+    /// its half-pel value overshoots the box's midpoint on both sides.
+    #[test]
+    fn six_tap_is_sharper_than_bilinear_on_an_edge() {
+        let mut f = Frame::new(16, 8);
+        for y in 0..8 {
+            for x in 0..16 {
+                f.set_px(x, y, [if x < 8 { 50 } else { 200 }; 3]);
+            }
+        }
+        let bi = f.block_halfpel(2 * 4 + 1, 0, 8); // columns 4.5 .. 11.5
+        let six = f.block_halfpel_6tap(2 * 4 + 1, 0, 8);
+        assert_eq!(bi.px(3, 0)[0], 125); // the edge midpoint, box
+        assert_eq!(six.px(3, 0)[0], 125); // symmetric: same midpoint
+        assert_eq!((six.px(2, 0)[0], six.px(4, 0)[0]), (31, 219)); // (1000/32, 7000/32)
+        assert!(six.px(2, 0)[0] < bi.px(2, 0)[0], "6-tap undershoots before the edge: {} vs {}", six.px(2, 0)[0], bi.px(2, 0)[0]);
+        assert!(six.px(4, 0)[0] > bi.px(4, 0)[0], "6-tap overshoots after the edge: {} vs {}", six.px(4, 0)[0], bi.px(4, 0)[0]);
+    }
 }
 
 #[cfg(test)]

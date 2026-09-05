@@ -10,6 +10,7 @@
 //! - [`gate`]     — the quality gate (JPEG round trip → per-block threshold).
 //! - [`matcher`]  — stationary / diamond / exhaustive block search.
 //! - [`predict`]  — the analysis of one frame transition into a [`plan::FramePlan`].
+//! - [`plate`]    — the per-window background mosaic (fao-codec's v11 plate) used as a reference.
 //! - [`residual`] — residual packing and the merge that inverts it.
 //! - [`upscale`]  — the `Upscaler` trait the GPU implements.
 //! - [`waifu2x`]  — the `upconv_7` model, its loader, tiling, and CPU reference.
@@ -25,8 +26,10 @@ pub mod frame;
 pub mod gate;
 pub mod matcher;
 pub mod net;
+pub mod phase_corr;
 pub mod pipeline;
 pub mod plan;
+pub mod plate;
 pub mod predict;
 pub mod quality;
 pub mod registry;
@@ -74,5 +77,5 @@ pub(crate) mod testimg {
 pub use frame::Frame;
 pub use pipeline::{run, Event, FrameSink, FrameSource, PipelineConfig, SourceInfo, Summary};
 pub use plan::{FramePlan, FrameStats};
-pub use predict::{AnalyzeConfig, TierMetric};
+pub use predict::{AnalyzeConfig, SubpelFilter, TierMetric};
 pub use upscale::Upscaler;

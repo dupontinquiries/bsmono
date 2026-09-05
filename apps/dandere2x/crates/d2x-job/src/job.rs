@@ -602,7 +602,7 @@ impl Upscaler for SharedUpscaler {
 fn segment_stamp(job: &Job, scale: u32) -> String {
     let a = &job.pipeline.analyze;
     format!(
-        "d2x1 in={} scale={} model={} cascade={} flat={} kernel={} q={} block={} bleed={} noise={} matcher={:?} tier={:?} streak={} refs={:?} codec={} crf={} preset={} tenbit={} jobs={}",
+        "d2x1 in={} scale={} model={} cascade={} flat={} kernel={} q={} block={} bleed={} noise={} matcher={:?} tier={:?} streak={} refs={:?} plate={}/{} mvseed={} halfpel={}/{:?} q4={} redraw={} region={} anchor={}/{} codec={} crf={} preset={} tenbit={} jobs={}",
         job.input.display(),
         scale,
         job.model.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
@@ -617,6 +617,16 @@ fn segment_stamp(job: &Job, scale: u32) -> String {
         a.tier_std,
         a.streak_bonus,
         job.refs_override,
+        job.pipeline.plate_window,
+        job.pipeline.plate_min_confidence,
+        job.pipeline.mv_seed,
+        a.halfpel,
+        a.subpel_filter,
+        a.quarterpel,
+        a.redraw_fraction,
+        a.region_redraw,
+        a.anchor_rmse,
+        a.anchor_max_age,
         job.encode.codec,
         job.encode.crf,
         job.encode.preset,
@@ -715,10 +725,12 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     let mut computed_frames = 0u64;
     let mut fraction = 0.0;
     let mut heavy = 0.0;
+    let mut plate = 0.0;
     for h in handles {
         let s = h.join().map_err(|_| anyhow!("segment worker panicked"))??;
         fraction += s.upscaled_pixel_fraction * s.frames as f64;
         heavy += s.heavy_pixel_fraction * s.frames as f64;
+        plate += s.plate_pixel_fraction * s.frames as f64;
         frames += s.frames;
         computed_frames += s.frames;
     }
@@ -750,7 +762,7 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     if reused > 0 {
         eprintln!("resume: {computed_frames} frames computed, {} reused from earlier parts", frames - computed_frames);
     }
-    Ok(Summary { frames, elapsed, upscaled_pixel_fraction: fraction / denom, heavy_pixel_fraction: heavy / denom })
+    Ok(Summary { frames, elapsed, upscaled_pixel_fraction: fraction / denom, heavy_pixel_fraction: heavy / denom, plate_pixel_fraction: plate / denom })
 }
 
 /// Refuse a run this machine cannot finish, before it starts.

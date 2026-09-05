@@ -15,6 +15,8 @@
 use crate::frame::{Frame, Pad};
 use crate::gate::{JpegReference, ReferenceMaker};
 use crate::matcher::{BlockMatcher, Diamond, Exhaustive, Stationary};
+use crate::phase_corr::PhaseCorrelation;
+use crate::plate::Plate;
 use crate::plan::{FramePlan, FrameStats, MAX_TIERS};
 use crate::blockcache::BlockCache;
 use crate::predict::{analyze_tiered, AnalyzeConfig, AnalyzeState, CachedBlocks};
@@ -84,6 +86,19 @@ pub struct PipelineConfig {
     /// Byte budget of the content-keyed block cache (0 = off). Shared
     /// across segment workers when `run_tiered` is given one.
     pub block_cache_bytes: u64,
+    /// Frames per plate window (0 = no plate). Stage A holds a whole window
+    /// before analysing its first frame, so this costs `window · frame`
+    /// bytes of RAM and one window of latency; a window also ends early at
+    /// a scene cut (raw-frame PSNR below `analyze.min_psnr`). Each window's
+    /// plate is upscaled once by the main tier and serves `Plated` blocks.
+    pub plate_window: usize,
+    /// Pairwise phase-correlation confidence below which a frame's motion
+    /// is held rather than accumulated into the plate placement.
+    pub plate_min_confidence: f32,
+    /// Seed the block motion search with each frame's global motion (phase
+    /// correlation, one estimate per frame pair). Lets the diamond search
+    /// reach pans beyond its radius; costs one phase correlation per frame.
+    pub mv_seed: bool,
 }
 
 impl Default for PipelineConfig {
@@ -99,6 +114,9 @@ impl Default for PipelineConfig {
             batch: 4,
             tiers: 1,
             block_cache_bytes: 0,
+            plate_window: 0,
+            plate_min_confidence: 0.2,
+            mv_seed: false,
         }
     }
 }
@@ -108,7 +126,11 @@ pub enum Event {
     Started { info: SourceInfo, padded: (u32, u32), upscaler: String, matcher: &'static str, gate: String },
     /// Emitted by stage B after each output frame is written.
     FrameDone { index: u64, stats: FrameStats, analyze_time: Duration, upscale_time: Duration, merge_time: Duration },
-    Finished { frames: u64, elapsed: Duration, upscaled_pixel_fraction: f64, heavy_pixel_fraction: f64 },
+    /// A window's plate went through the main tier: `frames` is how many
+    /// frames it will serve, `area` its size in frame units, so its cost per
+    /// served frame is `area / frames`.
+    PlateUpscaled { index: u64, size: (u32, u32), frames: u64, area: f64, time: Duration },
+    Finished { frames: u64, elapsed: Duration, upscaled_pixel_fraction: f64, heavy_pixel_fraction: f64, plate_pixel_fraction: f64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -121,6 +143,10 @@ pub struct Summary {
     /// Mean fraction that went through the *main* network (tier 0) — what the
     /// expensive model's time follows.
     pub heavy_pixel_fraction: f64,
+    /// Plate pixels upscaled by the main tier, in frame units, per frame:
+    /// the amortised cost the two fractions above do not include. Total
+    /// main-network work is `heavy_pixel_fraction + plate_pixel_fraction`.
+    pub plate_pixel_fraction: f64,
 }
 
 /// What stage A sends to stage B per frame.
@@ -130,6 +156,9 @@ struct Work {
     residual: Residual,
     cached: CachedBlocks,
     analyze_time: Duration,
+    /// Set on the first frame of a plate window: the plate stage B must
+    /// upscale before merging this and the window's following frames.
+    plate: Option<(Frame, u64)>,
 }
 
 /// The reference bookkeeping both stages mirror, so `Recalled { r }` means
@@ -149,6 +178,10 @@ impl<T: Clone> Ring<T> {
     /// retained shot starts (newest first).
     fn refs(&self) -> Vec<&T> {
         self.recent.iter().chain(self.keyframes.iter()).collect()
+    }
+    /// Index of the newest anchor in `refs()`, if any.
+    fn anchor(&self) -> Option<u8> {
+        if self.keyframes.is_empty() || self.recent.len() >= 255 { None } else { Some(self.recent.len() as u8) }
     }
     /// After a frame is finished: `prev` becomes a recent reference; a redraw
     /// frame is also retained as a shot start.
@@ -171,6 +204,128 @@ fn prepare(frame: Frame, bs: u32, noise: u8, seed: u64) -> Frame {
     let mut f = if (pw, ph) == (frame.width, frame.height) { frame } else { frame.padded_to(pw, ph, 0, 0, Pad::Replicate) };
     f.add_uniform_noise(noise, seed);
     f
+}
+
+/// Reads a source in plate windows: up to `window` prepared frames, ended
+/// early at a scene cut so a plate never straddles two shots. A cut is a
+/// frame pair whose raw PSNR is below `min_psnr` OR whose phase-correlation
+/// confidence is below `min_confidence` — the second catches what the
+/// first misses (a cut between two busy frames of similar statistics), and
+/// the motion it measures is what the plate is placed by, so nothing is
+/// estimated twice. `window <= 1` degenerates to one frame at a time.
+struct WindowReader {
+    source: Box<dyn FrameSource>,
+    window: usize,
+    min_psnr: f64,
+    min_confidence: f32,
+    bs: u32,
+    noise: u8,
+    index: u64,
+    /// First frame of the next window, already prepared, with its motion
+    /// relative to the frame before it (None across a cut).
+    pending: Option<(Frame, Option<(f32, f32)>)>,
+    done: bool,
+    pc: Option<PhaseCorrelation>,
+    /// `D2X_PLATE_DEBUG=1`: print every pair's motion and every window.
+    debug: bool,
+}
+
+/// One window: its first frame's index, its frames, and their frame-0-
+/// relative displacements and pairwise confidences (see `Plate::build_placed`).
+struct Window {
+    start: u64,
+    frames: Vec<Frame>,
+    disp: Vec<(f32, f32)>,
+    confidence: Vec<f32>,
+    /// Each frame's motion relative to its predecessor (`cur[x] ≈
+    /// prev[x − dx]`); `None` for the first frame after a cut or at the
+    /// start of the source.
+    pair: Vec<Option<(f32, f32)>>,
+}
+
+impl Window {
+    /// The block-search hint for frame `i`: where its content sits in the
+    /// previous frame, as a source offset.
+    fn hint(&self, i: usize) -> Option<(i64, i64)> {
+        self.pair[i].map(|(dx, dy)| (-(dx.round() as i64), -(dy.round() as i64)))
+    }
+    fn plate(&self, min_confidence: f32) -> Plate {
+        let refs: Vec<&Frame> = self.frames.iter().collect();
+        let _ = min_confidence; // motion below it already ended the window
+        Plate::build_placed(&refs, &self.disp, self.confidence.clone())
+    }
+}
+
+impl WindowReader {
+    fn new(source: Box<dyn FrameSource>, window: usize, min_psnr: f64, min_confidence: f32, bs: u32, noise: u8) -> Self {
+        let debug = std::env::var("D2X_PLATE_DEBUG").map(|v| v != "0").unwrap_or(false);
+        WindowReader { source, window: window.max(1), min_psnr, min_confidence, bs, noise, index: 0, pending: None, done: false, pc: None, debug }
+    }
+    fn read_one(&mut self) -> anyhow::Result<Option<Frame>> {
+        if self.done {
+            return Ok(None);
+        }
+        match self.source.next_frame()? {
+            Some(raw) => {
+                let f = prepare(raw, self.bs, self.noise, self.index);
+                self.index += 1;
+                Ok(Some(f))
+            }
+            None => {
+                self.done = true;
+                Ok(None)
+            }
+        }
+    }
+    fn next_window(&mut self) -> anyhow::Result<Option<Window>> {
+        let (first, first_pair) = match self.pending.take() {
+            Some(f) => f,
+            None => match self.read_one()? {
+                Some(f) => (f, None),
+                None => return Ok(None),
+            },
+        };
+        let start = self.index - 1;
+        if self.window > 1 && self.pc.is_none() {
+            self.pc = Some(PhaseCorrelation::for_frame(first.width, first.height));
+        }
+        let mut win = Window { start, frames: vec![first], disp: vec![(0.0, 0.0)], confidence: vec![1.0], pair: vec![first_pair] };
+        let (mut ax, mut ay) = (0.0f32, 0.0f32);
+        // Read one frame past the window so the next window's first frame
+        // also gets its motion hint; that frame waits in `pending`.
+        while self.window > 1 {
+            match self.read_one()? {
+                Some(f) => {
+                    let last = win.frames.last().unwrap();
+                    let m = self.pc.as_ref().unwrap().estimate(&f, last);
+                    let cut = m.confidence < self.min_confidence || last.psnr(&f) < self.min_psnr;
+                    if self.debug {
+                        eprintln!("plate: frame {:6} motion ({:+7.2}, {:+7.2}) conf {:.2}{}", self.index - 1, m.dx, m.dy, m.confidence, if cut { "  CUT" } else { "" });
+                    }
+                    if cut {
+                        self.pending = Some((f, None));
+                        break;
+                    }
+                    if win.frames.len() >= self.window {
+                        self.pending = Some((f, Some((m.dx, m.dy))));
+                        break;
+                    }
+                    ax += m.dx;
+                    ay += m.dy;
+                    win.frames.push(f);
+                    win.disp.push((ax, ay));
+                    win.confidence.push(m.confidence);
+                    win.pair.push(Some((m.dx, m.dy)));
+                }
+                None => break,
+            }
+        }
+        if self.debug && self.window > 1 {
+            let (mx, my) = win.disp.iter().fold((0.0f32, 0.0f32), |a, d| (a.0.max(d.0.abs()), a.1.max(d.1.abs())));
+            eprintln!("plate: window {}..{} ({} frames), max |displacement| ({:.1}, {:.1}) px", win.start, win.start + win.frames.len() as u64, win.frames.len(), mx, my);
+        }
+        Ok(Some(win))
+    }
 }
 
 /// Run the whole pipeline with one upscaler. `on_event` is called from the
@@ -203,7 +358,7 @@ pub fn run_tiered(
 
 /// [`run_tiered`] with an explicit (possibly shared) block cache.
 pub fn run_tiered_with_cache(
-    mut source: Box<dyn FrameSource>,
+    source: Box<dyn FrameSource>,
     mut tiers: Vec<Box<dyn Upscaler>>,
     mut sink: Box<dyn FrameSink>,
     cfg: PipelineConfig,
@@ -239,53 +394,70 @@ pub fn run_tiered_with_cache(
     let (recent_refs, keyframe_refs, batch) = (cfg.recent_refs, cfg.keyframe_refs, cfg.batch.max(1));
     let cache_a = cache.clone();
     let cache_b = cache;
+    let (plate_window, plate_conf) = (cfg.plate_window, cfg.plate_min_confidence);
+    // The reader needs pairwise motion for hints even without plates.
+    let reader_window = if plate_window > 1 { plate_window } else if cfg.mv_seed { 2 } else { 1 };
+    let mv_seed = cfg.mv_seed;
 
     // Stage A.
     let analyzer = std::thread::Builder::new().name("d2x-analyze".into()).spawn(move || {
         let reference: &dyn ReferenceMaker = &reference;
-        let mut index: u64 = 0;
         let mut prev_working: Option<Frame> = None;
         let mut ring: Ring<Frame> = Ring::new(recent_refs, keyframe_refs);
-        let mut state = AnalyzeState { streak: Vec::new(), cache: cache_a };
-        loop {
-            let raw = match source.next_frame() {
-                Ok(Some(f)) => f,
+        let mut state = AnalyzeState { streak: Vec::new(), cache: cache_a, anchor: None, since_anchor: 0 };
+        let mut reader = WindowReader::new(source, reader_window, acfg.min_psnr, plate_conf, bs, noise);
+        'windows: loop {
+            let t_win = Instant::now();
+            let win = match reader.next_window() {
+                Ok(Some(w)) => w,
                 Ok(None) => break,
                 Err(e) => {
                     let _ = tx.send(Err(e));
                     break;
                 }
             };
-            let t0 = Instant::now();
-            let frame = prepare(raw, bs, noise, index);
-            let work = match prev_working.take() {
-                None => {
-                    ring.keyframes.push_front(frame.clone());
-                    ring.keyframes.truncate(ring.keyframe_cap);
-                    prev_working = Some(frame.clone());
-                    Work { index, plan: None, residual: Residual::Whole(frame), cached: CachedBlocks::new(), analyze_time: t0.elapsed() }
-                }
-                Some(mut prev) => {
-                    let older = ring.refs();
-                    let r = analyze_tiered(&mut prev, &frame, &older, reference, matcher.as_ref(), &acfg, n_tiers, &mut state);
-                    match r {
-                        Ok((plan, working_next, cached)) => {
-                            let residual = make_residual(&frame, &plan, bleed);
-                            ring.advance(prev, &working_next, plan.redraw);
-                            prev_working = Some(working_next);
-                            Work { index, plan: Some(plan), residual, cached, analyze_time: t0.elapsed() }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
-                            break;
+            let plate = if plate_window > 1 && win.frames.len() > 1 { Some(win.plate(plate_conf)) } else { None };
+            let (start, n_win) = (win.start, win.frames.len() as u64);
+            let hints: Vec<Option<(i64, i64)>> = (0..win.frames.len()).map(|i| if mv_seed { win.hint(i) } else { None }).collect();
+            for (i, frame) in win.frames.into_iter().enumerate() {
+                let t0 = Instant::now();
+                let index = start + i as u64;
+                let hint = hints[i];
+                let plate_msg = if i == 0 { plate.as_ref().map(|p| (p.lo.clone(), n_win)) } else { None };
+                let view = plate.as_ref().map(|p| p.view(i));
+                let mut work = match prev_working.take() {
+                    None => {
+                        ring.keyframes.push_front(frame.clone());
+                        ring.keyframes.truncate(ring.keyframe_cap);
+                        prev_working = Some(frame.clone());
+                        Work { index, plan: None, residual: Residual::Whole(frame), cached: CachedBlocks::new(), analyze_time: t0.elapsed(), plate: plate_msg }
+                    }
+                    Some(mut prev) => {
+                        let older = ring.refs();
+                        state.anchor = ring.anchor();
+                        let r = analyze_tiered(&mut prev, &frame, &older, view, hint, reference, matcher.as_ref(), &acfg, n_tiers, &mut state);
+                        match r {
+                            Ok((plan, working_next, cached)) => {
+                                let residual = make_residual(&frame, &plan, bleed);
+                                ring.advance(prev, &working_next, plan.stats.is_anchor(&plan.grid));
+                                prev_working = Some(working_next);
+                                Work { index, plan: Some(plan), residual, cached, analyze_time: t0.elapsed(), plate: plate_msg }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                                break 'windows;
+                            }
                         }
                     }
+                };
+                if i == 0 {
+                    // The window's read and plate build are this frame's cost.
+                    work.analyze_time = t_win.elapsed();
                 }
-            };
-            if tx.send(Ok(work)).is_err() {
-                break; // stage B went away
+                if tx.send(Ok(work)).is_err() {
+                    break 'windows; // stage B went away
+                }
             }
-            index += 1;
         }
     })?;
 
@@ -298,6 +470,9 @@ pub fn run_tiered_with_cache(
     let mut frames: u64 = 0;
     let mut fraction_sum = 0.0;
     let mut heavy_sum = 0.0;
+    let mut plate_sum = 0.0;
+    let mut plate_up: Option<Frame> = None;
+    let frame_area = (padded.0 as f64) * (padded.1 as f64);
     let mut result: anyhow::Result<()> = Ok(());
 
     'outer: loop {
@@ -339,7 +514,22 @@ pub fn run_tiered_with_cache(
         }
         let upscale_time = t0.elapsed() / (group.len() as u32);
 
-        for work in group {
+        for mut work in group {
+            if let Some((p, n_win)) = work.plate.take() {
+                let t = Instant::now();
+                match tiers[0].upscale(&p) {
+                    Ok(up) => {
+                        let area = (p.width as f64) * (p.height as f64) / frame_area;
+                        plate_sum += area;
+                        on_event(Event::PlateUpscaled { index: work.index, size: (p.width, p.height), frames: n_win, area, time: t.elapsed() });
+                        plate_up = Some(up);
+                    }
+                    Err(e) => {
+                        result = Err(e.context(format!("upscaling the plate for frames {}..", work.index)));
+                        break 'outer;
+                    }
+                }
+            }
             let mut tier_up: [Option<Frame>; MAX_TIERS] = Default::default();
             for t in 0..MAX_TIERS {
                 if work.residual.tier(t).is_some() {
@@ -371,7 +561,7 @@ pub fn run_tiered_with_cache(
                     }
                     let older = ring.refs();
                     let refs: [Option<&Frame>; MAX_TIERS] = [residual_up.as_ref(), tier_up[1].as_ref(), tier_up[2].as_ref()];
-                    match merge_tiered(prev, &older, &refs, &work.cached, plan, scale, bleed) {
+                    match merge_tiered(prev, &older, plate_up.as_ref(), &refs, &work.cached, plan, scale, bleed) {
                         Ok(f) => (f, plan.stats),
                         Err(e) => {
                             result = Err(e.context(format!("merging frame {}", work.index)));
@@ -399,7 +589,8 @@ pub fn run_tiered_with_cache(
             heavy_sum += heavy;
             frames += 1;
             if let Some(p) = prev_up.take() {
-                ring.advance(p, &out, stats.redraw);
+                let anchor = work.plan.as_ref().map_or(true, |pl| pl.stats.is_anchor(&pl.grid));
+                ring.advance(p, &out, anchor);
             }
             prev_up = Some(out);
             on_event(Event::FrameDone { index: work.index, stats, analyze_time: work.analyze_time, upscale_time, merge_time });
@@ -412,15 +603,16 @@ pub fn run_tiered_with_cache(
     let elapsed = started.elapsed();
     let upscaled_pixel_fraction = if frames > 0 { fraction_sum / frames as f64 } else { 0.0 };
     let heavy_pixel_fraction = if frames > 0 { heavy_sum / frames as f64 } else { 0.0 };
-    on_event(Event::Finished { frames, elapsed, upscaled_pixel_fraction, heavy_pixel_fraction });
-    Ok(Summary { frames, elapsed, upscaled_pixel_fraction, heavy_pixel_fraction })
+    let plate_pixel_fraction = if frames > 0 { plate_sum / frames as f64 } else { 0.0 };
+    on_event(Event::Finished { frames, elapsed, upscaled_pixel_fraction, heavy_pixel_fraction, plate_pixel_fraction });
+    Ok(Summary { frames, elapsed, upscaled_pixel_fraction, heavy_pixel_fraction, plate_pixel_fraction })
 }
 
 /// Analysis only: run stage A over the source and report per-frame stats,
 /// never touching an upscaler. This is the `analyze` subcommand and the
 /// cheapest way to see what a block size / quality setting buys on a clip.
 pub fn analyze_only(
-    mut source: Box<dyn FrameSource>,
+    source: Box<dyn FrameSource>,
     cfg: PipelineConfig,
     mut on_frame: impl FnMut(u64, &FrameStats, f64, Duration),
 ) -> anyhow::Result<Summary> {
@@ -436,31 +628,60 @@ pub fn analyze_only(
     let mut index = 0u64;
     let mut fraction_sum = 0.0;
     let mut heavy_sum = 0.0;
-    while let Some(raw) = source.next_frame()? {
-        let t0 = Instant::now();
-        let frame = prepare(raw, bs, cfg.noise, index);
-        match prev.take() {
-            None => {
-                fraction_sum += 1.0;
-                heavy_sum += 1.0;
-                on_frame(index, &FrameStats { redraw: true, psnr: f64::NAN, ..Default::default() }, 1.0, t0.elapsed());
-                ring.keyframes.push_front(frame.clone());
-                prev = Some(frame);
-            }
-            Some(mut p) => {
-                let older = ring.refs();
-                let (plan, next_w, _) = analyze_tiered(&mut p, &frame, &older, &reference, matcher.as_ref(), &cfg.analyze, cfg.tiers.max(1), &mut state)?;
-                let fr = plan.stats.upscaled_fraction(&plan.grid, bleed);
-                fraction_sum += fr;
-                heavy_sum += plan.stats.heavy_fraction(&plan.grid, bleed);
-                on_frame(index, &plan.stats, fr, t0.elapsed());
-                ring.advance(p, &next_w, plan.redraw);
-                prev = Some(next_w);
+    let mut plate_sum = 0.0;
+    let mut frame_area = 0.0;
+    let reader_window = if cfg.plate_window > 1 { cfg.plate_window } else if cfg.mv_seed { 2 } else { 1 };
+    let mut reader = WindowReader::new(source, reader_window, cfg.analyze.min_psnr, cfg.plate_min_confidence, bs, cfg.noise);
+    while let Some(win) = reader.next_window()? {
+        let t_win = Instant::now();
+        if frame_area == 0.0 {
+            frame_area = (win.frames[0].width as f64) * (win.frames[0].height as f64);
+        }
+        let plate = if cfg.plate_window > 1 && win.frames.len() > 1 {
+            let p = win.plate(cfg.plate_min_confidence);
+            plate_sum += (p.lo.width as f64) * (p.lo.height as f64) / frame_area;
+            Some(p)
+        } else {
+            None
+        };
+        let start = win.start;
+        let hints: Vec<Option<(i64, i64)>> = (0..win.frames.len()).map(|i| if cfg.mv_seed { win.hint(i) } else { None }).collect();
+        for (i, frame) in win.frames.into_iter().enumerate() {
+            let t0 = if i == 0 { t_win } else { Instant::now() };
+            index = start + i as u64;
+            let hint = hints[i];
+            match prev.take() {
+                None => {
+                    fraction_sum += 1.0;
+                    heavy_sum += 1.0;
+                    on_frame(index, &FrameStats { redraw: true, psnr: f64::NAN, ..Default::default() }, 1.0, t0.elapsed());
+                    ring.keyframes.push_front(frame.clone());
+                    prev = Some(frame);
+                }
+                Some(mut p) => {
+                    let older = ring.refs();
+                    state.anchor = ring.anchor();
+                    let view = plate.as_ref().map(|pl| pl.view(i));
+                    let (plan, next_w, _) = analyze_tiered(&mut p, &frame, &older, view, hint, &reference, matcher.as_ref(), &cfg.analyze, cfg.tiers.max(1), &mut state)?;
+                    let fr = plan.stats.upscaled_fraction(&plan.grid, bleed);
+                    fraction_sum += fr;
+                    heavy_sum += plan.stats.heavy_fraction(&plan.grid, bleed);
+                    on_frame(index, &plan.stats, fr, t0.elapsed());
+                    ring.advance(p, &next_w, plan.stats.is_anchor(&plan.grid));
+                    prev = Some(next_w);
+                }
             }
         }
         index += 1;
     }
-    Ok(Summary { frames: index, elapsed: started.elapsed(), upscaled_pixel_fraction: if index > 0 { fraction_sum / index as f64 } else { 0.0 }, heavy_pixel_fraction: if index > 0 { heavy_sum / index as f64 } else { 0.0 } })
+    let n = index as f64;
+    Ok(Summary {
+        frames: index,
+        elapsed: started.elapsed(),
+        upscaled_pixel_fraction: if index > 0 { fraction_sum / n } else { 0.0 },
+        heavy_pixel_fraction: if index > 0 { heavy_sum / n } else { 0.0 },
+        plate_pixel_fraction: if index > 0 { plate_sum / n } else { 0.0 },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +729,73 @@ mod tests {
     use crate::testimg::smooth;
     use crate::upscale::NearestUpscaler;
     use std::sync::{Arc, Mutex};
+
+    /// The two-stage pipeline with plate windows: a 20-frame pan over a
+    /// world, a cut, then 6 more frames. Windows must break at the cut, each
+    /// window's plate must be upscaled exactly once, the pan's frames must
+    /// be served from the plate (not re-upscaled), and with nearest
+    /// upscaling every output must equal the upscale of its input frame.
+    /// This is the same code path the GPU backend runs: it only implements
+    /// `Upscaler`, and the plate goes through `upscale` like a redraw frame.
+    #[test]
+    fn plate_windows_are_exact_and_break_at_cuts() {
+        let world = smooth(320, 96, 11);
+        let (fw, fh) = (128u32, 96u32);
+        let mut frames: Vec<Frame> = (0..20u32).map(|i| world.crop(6 * i, 0, fw, fh)).collect();
+        let other = smooth(200, 96, 40);
+        let mut cut = Frame::new(fw, fh);
+        for (i, b) in cut.data.iter_mut().enumerate() {
+            *b = (i * 37 % 253) as u8;
+        }
+        frames.push(cut); // scene cut: unrelated content
+        frames.extend((0..5u32).map(|i| other.crop(4 * i, 0, fw, fh)));
+        let inputs = frames.clone();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let cfg = PipelineConfig {
+            analyze: AnalyzeConfig { block_size: 16, bleed: 1, ..Default::default() },
+            noise: 0,
+            plate_window: 8,
+            recent_refs: 0,
+            keyframe_refs: 0,
+            ..Default::default()
+        };
+        let mut events = Vec::new();
+        let summary = run(
+            Box::new(VecSource::new(frames, (30, 1))),
+            Box::new(NearestUpscaler { scale: 2 }),
+            Box::new(VecSink { frames: out.clone() }),
+            cfg,
+            |e| events.push(e),
+        )
+        .unwrap();
+        assert_eq!(summary.frames, 26);
+        let out = out.lock().unwrap();
+        let mut up = NearestUpscaler { scale: 2 };
+        for (i, f) in inputs.iter().enumerate() {
+            assert_eq!(out[i], up.upscale(f).unwrap(), "frame {i}");
+        }
+        // Windows: [0..8) [8..16) [16..20), then the cut frame alone (it is
+        // unrelated to both neighbours, so it gets no plate), then [21..26).
+        let plates: Vec<(u64, u64)> = events
+            .iter()
+            .filter_map(|e| if let Event::PlateUpscaled { index, frames, .. } = e { Some((*index, *frames)) } else { None })
+            .collect();
+        assert_eq!(plates, vec![(0, 8), (8, 8), (16, 4), (21, 5)]);
+        assert!(summary.plate_pixel_fraction > 0.0);
+        // Inside a pan window every frame after the first is fully plated.
+        let plated: Vec<(u64, u32, u32)> = events
+            .iter()
+            .filter_map(|e| if let Event::FrameDone { index, stats, .. } = e { Some((*index, stats.plated, stats.missing)) } else { None })
+            .collect();
+        for &(i, plated, missing) in &plated {
+            if (1..8).contains(&i) || (9..16).contains(&i) || (17..20).contains(&i) {
+                assert_eq!((plated, missing), (48, 0), "frame {i}");
+            }
+        }
+        // The cut frame is a redraw; the frames after it are plated too.
+        assert!(plated.iter().any(|&(i, p, _)| i == 20 && p == 0));
+        assert!(plated.iter().all(|&(i, p, m)| !(22..26).contains(&i) || (p == 48 && m == 0)), "{plated:?}");
+    }
 
     /// End to end with nearest upscaling and no noise: the output must be
     /// exactly the nearest-upscale of each frame's low-res reconstruction,

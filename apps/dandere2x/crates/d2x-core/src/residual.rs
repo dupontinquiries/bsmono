@@ -42,7 +42,7 @@ pub fn make_residual(next_original: &Frame, plan: &FramePlan, bleed: u32) -> Res
     if plan.redraw {
         return Residual::Whole(next_original.clone());
     }
-    if plan.residuals.is_empty() {
+    if plan.residuals.is_empty() && plan.stats.region.is_none() {
         return Residual::None;
     }
     let bs = plan.grid.block_size;
@@ -69,6 +69,14 @@ pub fn make_residual(next_original: &Frame, plan: &FramePlan, bleed: u32) -> Res
     // Replicate makes the ring an extension of the block's own content, so the
     // CNN sees a plausible continuation instead of a cliff to zero.
     let padded = next_original.padded(bleed, Pad::Replicate);
+    if let Some((rx, ry, rw, rh)) = plan.stats.region {
+        // In padded coordinates the region starts at (rx, ry) and its ring
+        // extends `bleed` beyond it on every side.
+        let img = padded.crop(rx, ry, rw + 2 * bleed, rh + 2 * bleed);
+        let mut imgs: [Option<Frame>; MAX_TIERS] = Default::default();
+        imgs[0] = Some(img);
+        return Residual::Packed(imgs);
+    }
     let mut imgs: [Option<Frame>; MAX_TIERS] = Default::default();
     for (t, img) in imgs.iter_mut().enumerate() {
         let (cols, rows) = plan.stats.residual_tiers[t];
@@ -90,12 +98,12 @@ pub fn make_residual(next_original: &Frame, plan: &FramePlan, bleed: u32) -> Res
 /// upscaled residual (tier 0), and the plan. `scale` is the upscaler's factor.
 pub fn merge(prev_up: &Frame, older_up: &[&Frame], residual_up: Option<&Frame>, plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
     let tiers: [Option<&Frame>; MAX_TIERS] = [residual_up, None, None];
-    merge_tiered(prev_up, older_up, &tiers, &CachedBlocks::new(), plan, scale, bleed)
+    merge_tiered(prev_up, older_up, None, &tiers, &CachedBlocks::new(), plan, scale, bleed)
 }
 
 /// [`merge`] with one upscaled residual image per tier and the bytes of
 /// any `Cached` blocks (`(block·scale)²` RGB each).
-pub fn merge_tiered(prev_up: &Frame, older_up: &[&Frame], residual_up: &[Option<&Frame>; MAX_TIERS], cached: &CachedBlocks, plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
+pub fn merge_tiered(prev_up: &Frame, older_up: &[&Frame], plate_up: Option<&Frame>, residual_up: &[Option<&Frame>; MAX_TIERS], cached: &CachedBlocks, plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
     let bs = plan.grid.block_size;
     let s = scale;
     anyhow::ensure!(
@@ -133,6 +141,24 @@ pub fn merge_tiered(prev_up: &Frame, older_up: &[&Frame], residual_up: &[Option<
                 anyhow::ensure!((old.width, old.height) == (prev_up.width, prev_up.height), "merge: reference {r} size mismatch");
                 out.copy_block(old, bs * s, x * s, y * s, x * s, y * s);
             }
+            BlockMatch::MovedHalf { sx2, sy2 } => {
+                anyhow::ensure!(s % 2 == 0, "merge: half-pel block at scale {s}; half-pel matching needs an even scale");
+                out.copy_block(&faded, bs * s, sx2 * s / 2, sy2 * s / 2, x * s, y * s);
+            }
+            BlockMatch::MovedQuarter { sx4, sy4 } => {
+                anyhow::ensure!(s % 4 == 0, "merge: quarter-pel block at scale {s}; quarter-pel matching needs a multiple of 4");
+                out.copy_block(&faded, bs * s, sx4 * s / 4, sy4 * s / 4, x * s, y * s);
+            }
+            BlockMatch::RecalledMoved { r, src_x, src_y } => {
+                let old = older_up.get(r as usize).ok_or_else(|| anyhow::anyhow!("merge: plan recalls reference {r} but only {} were given", older_up.len()))?;
+                anyhow::ensure!((old.width, old.height) == (prev_up.width, prev_up.height), "merge: reference {r} size mismatch");
+                out.copy_block(old, bs * s, src_x * s, src_y * s, x * s, y * s);
+            }
+            BlockMatch::Plated { px, py } => {
+                let p = plate_up.ok_or_else(|| anyhow::anyhow!("merge: plan uses the plate but no upscaled plate was given"))?;
+                anyhow::ensure!(p.block_in_bounds(px * s, py * s, bs * s), "merge: plated block ({px},{py}) outside the {}x{} upscaled plate", p.width, p.height);
+                out.copy_block(p, bs * s, px * s, py * s, x * s, y * s);
+            }
             BlockMatch::Cached { key } => {
                 let b = cached.get(&key).ok_or_else(|| anyhow::anyhow!("merge: cached block {key:#x} not attached"))?;
                 let side = bs * s;
@@ -144,6 +170,13 @@ pub fn merge_tiered(prev_up: &Frame, older_up: &[&Frame], residual_up: &[Option<
         }
     }
 
+    // 3a. Region redraw: one image, blended back over its bleed ring.
+    if let Some((rx, ry, rw, rh)) = plan.stats.region {
+        let r = residual_up[0].ok_or_else(|| anyhow::anyhow!("merge: plan has a region redraw but no upscaled image for it"))?;
+        anyhow::ensure!(r.width == (rw + 2 * bleed) * s && r.height == (rh + 2 * bleed) * s, "merge: region image {}x{} does not match {}x{} plus bleed at scale {s}", r.width, r.height, rw, rh);
+        blend_rect(&mut out, r, rw * s, rh * s, bleed * s, 0, 0, rx * s, ry * s);
+        return Ok(out);
+    }
     // 3. Residual blocks, from their tier's image.
     let cell = bs + 2 * bleed;
     for t in 0..MAX_TIERS {
@@ -210,19 +243,37 @@ pub fn blend_block(
     dst_x: u32,
     dst_y: u32,
 ) {
+    blend_rect(out, src, block, block, ring, src_cell_x, src_cell_y, dst_x, dst_y)
+}
+
+/// [`blend_block`] for a `bw`×`bh` rectangle.
+#[allow(clippy::too_many_arguments)]
+pub fn blend_rect(
+    out: &mut Frame,
+    src: &Frame,
+    bw: u32,
+    bh: u32,
+    ring: u32,
+    src_cell_x: u32,
+    src_cell_y: u32,
+    dst_x: u32,
+    dst_y: u32,
+) {
+    let (block, _) = (bw, bh);
     // NO `ring == 0` SHORTCUT. I wrote one and could not break it: with
     // `ring = 0` the span is the block, every offset is interior, `ramp`
     // returns 1.0, and the loop writes each pixel exactly — the same bytes
     // `copy_block` would. `a_zero_ring_is_the_old_hard_copy` still pins that,
     // now on the one path that provides it.
     let span = block + 2 * ring;
-    for j in 0..span {
+    let span_y = bh + 2 * ring;
+    for j in 0..span_y {
         // Frame coordinates, skipping anything off the edge.
         let fy = (dst_y + j) as i64 - ring as i64;
         if fy < 0 || fy as u32 >= out.height {
             continue;
         }
-        let wy = ramp(j, ring, block);
+        let wy = ramp(j, ring, bh);
         for i in 0..span {
             let fx = (dst_x + i) as i64 - ring as i64;
             if fx < 0 || fx as u32 >= out.width {
@@ -325,6 +376,185 @@ mod tests {
         roundtrip(&prev, &next, 1, 2, &Diamond::default());
     }
 
+    /// Half-pel matches at scale 2 with nearest upscaling: `next` is `prev`
+    /// shifted by (+1.5, +0.5). The merge copies a half-pel block from the
+    /// upscaled previous frame at an odd output offset; that block is not
+    /// the nearest-upscale of anything (its columns alternate), so the
+    /// invariant is the one that actually holds for every block type: the
+    /// 2×2 box-downsample of the output block equals the low-res mirror,
+    /// bit for bit. Blocks that are not half-pel keep the nearest identity.
+    #[test]
+    fn halfpel_blocks_roundtrip_at_scale_2() {
+        let prev = smooth(96, 64, 5);
+        // next[x, y] = prev sampled at (x + 1.5, y + 0.5) for the 5×3 blocks
+        // whose source fits; the last column and row are unchanged (a
+        // residual there would feather into its neighbour's edge, which is
+        // blend_block doing its job, not what this test measures).
+        let mut next = prev.clone();
+        for by in 0..3u32 {
+            for bx in 0..5u32 {
+                let b = prev.block_halfpel(2 * (bx * 16) + 3, 2 * (by * 16) + 1, 16);
+                next.copy_block(&b, 16, 0, 0, bx * 16, by * 16);
+            }
+        }
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, halfpel: true, fade: false, ..Default::default() };
+        let mut up = NearestUpscaler { scale: 2 };
+        let prev_up = up.upscale(&prev).unwrap();
+        let mut w = prev.clone();
+        let (plan, working_next) = analyze(&mut w, &next, &[], &JpegReference { quality: 97 }, &Diamond::default(), &cfg).unwrap();
+        assert_eq!((plan.stats.moved_half, plan.stats.missing), (15, 0), "{:?}", plan.stats);
+        let res = make_residual(&next, &plan, 1);
+        let res_up = res.frame().map(|f| up.upscale(f).unwrap());
+        let merged = merge(&prev_up, &[], res_up.as_ref(), &plan, 2, 1).unwrap();
+        let expect = up.upscale(&working_next).unwrap();
+        let box2 = |f: &Frame, x: u32, y: u32| -> Frame {
+            let mut o = Frame::new(16, 16);
+            for j in 0..16 {
+                for i in 0..16 {
+                    let mut px = [0u8; 3];
+                    for c in 0..3 {
+                        let (ox, oy) = (x * 2 + i * 2, y * 2 + j * 2);
+                        let sum = f.px(ox, oy)[c] as u16 + f.px(ox + 1, oy)[c] as u16 + f.px(ox, oy + 1)[c] as u16 + f.px(ox + 1, oy + 1)[c] as u16;
+                        px[c] = ((sum + 2) >> 2) as u8;
+                    }
+                    o.set_px(i, j, px);
+                }
+            }
+            o
+        };
+        for (i, m) in plan.matches.iter().enumerate() {
+            let (x, y) = plan.grid.origin(i);
+            match m {
+                BlockMatch::MovedHalf { sx2, sy2 } => {
+                    let (a, b) = (box2(&merged, x, y), working_next.crop(x, y, 16, 16));
+                    if a != b {
+                        let d = a.data.iter().zip(&b.data).position(|(p, q)| p != q).unwrap();
+                        panic!("block {i} at ({x},{y}) from half-pel ({sx2},{sy2}): first diff at byte {d} (px {}, row {}): {} vs {}", (d / 3) % 16, d / 48, a.data[d], b.data[d]);
+                    }
+                    assert_eq!(working_next.crop(x, y, 16, 16), next.crop(x, y, 16, 16), "block {i}: the mirror is the frame");
+                }
+                _ => assert_eq!(merged.crop(x * 2, y * 2, 32, 32), expect.crop(x * 2, y * 2, 32, 32), "block {i}"),
+            }
+        }
+        // Scale 1 cannot represent a half-pel copy and must refuse.
+        assert!(merge(&prev, &[], None, &plan, 1, 1).is_err());
+    }
+
+    /// Region redraw: a dense cluster of changed blocks inside an otherwise
+    /// unchanged frame is upscaled as one rectangle; blocks outside stay
+    /// copies; with nearest upscaling the output is the nearest-upscale of
+    /// the mirror (the ring context equals the surrounding output, so the
+    /// feathered ring blends identical values).
+    #[test]
+    fn region_redraw_roundtrips_and_keeps_the_outside() {
+        let prev = smooth(160, 96, 8);
+        let mut next = prev.clone();
+        for y in 16..64 {
+            for x in 32..112 {
+                next.set_px(x, y, [(x * 3) as u8, (y * 5) as u8, 90]);
+            }
+        }
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 2, region_redraw: true, redraw_fraction: 0.0, fade: false, ..Default::default() };
+        let mut up = NearestUpscaler { scale: 2 };
+        let prev_up = up.upscale(&prev).unwrap();
+        let mut w = prev.clone();
+        let (plan, working_next) = analyze(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg).unwrap();
+        assert!(!plan.redraw);
+        assert_eq!(plan.stats.region, Some((32, 16, 80, 48)), "{:?}", plan.stats);
+        assert_eq!(plan.stats.missing, 15, "{:?}", plan.stats);
+        assert_eq!(plan.stats.region_px, 84 * 52);
+        assert!(plan.residuals.is_empty());
+        let res = make_residual(&next, &plan, 2);
+        let img = res.frame().unwrap();
+        assert_eq!((img.width, img.height), (84, 52));
+        let merged = merge(&prev_up, &[], Some(&up.upscale(img).unwrap()), &plan, 2, 2).unwrap();
+        assert_eq!(merged, up.upscale(&working_next).unwrap());
+        assert_eq!(working_next, next);
+        assert!(!plan.stats.is_anchor(&plan.grid));
+    }
+
+    /// Anchor propagation: the previous frame is unrelated, the anchor (an
+    /// older reference) holds the content shifted; every block comes back
+    /// as RecalledMoved and merges exactly from the anchor's upscale.
+    #[test]
+    fn anchor_blocks_propagate_with_motion() {
+        use crate::predict::{analyze_tiered, AnalyzeState};
+        let anchor = smooth(128, 96, 12);
+        let next = crate::testimg::shifted(&anchor, 10, -6);
+        let mut prev = Frame::new(128, 96);
+        for (i, b) in prev.data.iter_mut().enumerate() {
+            *b = (i * 41 % 249) as u8;
+        }
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, anchor_rmse: 12.0, fade: false, redraw_fraction: 10.0, ..Default::default() };
+        let mut st = AnalyzeState { anchor: Some(0), ..Default::default() };
+        let mut w = prev.clone();
+        let (plan, working_next, cached) = analyze_tiered(&mut w, &next, &[&anchor], None, None, &JpegReference { quality: 97 }, &Diamond::default(), &cfg, 1, &mut st).unwrap();
+        // Interior blocks (source within the anchor) are all anchored; the
+        // wrapped edge strips are the only misses.
+        assert!(plan.stats.anchored >= 30, "{:?}", plan.stats);
+        let mut up = NearestUpscaler { scale: 2 };
+        let prev_up = up.upscale(&prev).unwrap();
+        let anchor_up = up.upscale(&anchor).unwrap();
+        let res = make_residual(&next, &plan, 1);
+        let tiers: [Option<Frame>; MAX_TIERS] = [res.frame().map(|f| up.upscale(f).unwrap()), None, None];
+        let refs: [Option<&Frame>; MAX_TIERS] = [tiers[0].as_ref(), None, None];
+        let merged = merge_tiered(&prev_up, &[&anchor_up], None, &refs, &cached, &plan, 2, 1).unwrap();
+        for (i, m) in plan.matches.iter().enumerate() {
+            if let BlockMatch::RecalledMoved { .. } = m {
+                let (x, y) = plan.grid.origin(i);
+                assert_eq!(merged.crop(x * 2, y * 2, 32, 32), up.upscale(&working_next.crop(x, y, 16, 16)).unwrap(), "block {i}");
+                assert_eq!(working_next.crop(x, y, 16, 16), next.crop(x, y, 16, 16), "block {i}");
+            }
+        }
+    }
+
+    /// Quarter-pel at scale 4: `next` is `prev` sampled at (+0.25, +0.75);
+    /// matches are MovedQuarter, the merge copies at an integer output
+    /// offset, and the 4×4 box-downsample of the output is the mirror.
+    #[test]
+    fn quarterpel_blocks_roundtrip_at_scale_4() {
+        let prev = smooth(96, 64, 5);
+        let mut next = prev.clone();
+        for by in 0..3u32 {
+            for bx in 0..5u32 {
+                let b = prev.block_quarterpel(4 * (bx * 16) + 1, 4 * (by * 16) + 3, 16);
+                next.copy_block(&b, 16, 0, 0, bx * 16, by * 16);
+            }
+        }
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, halfpel: true, quarterpel: true, fade: false, ..Default::default() };
+        let mut up = NearestUpscaler { scale: 4 };
+        let prev_up = up.upscale(&prev).unwrap();
+        let mut w = prev.clone();
+        let (plan, working_next) = analyze(&mut w, &next, &[], &JpegReference { quality: 97 }, &Diamond::default(), &cfg).unwrap();
+        assert!(plan.stats.moved_quarter >= 12, "{:?}", plan.stats);
+        assert_eq!(plan.stats.missing, 0, "{:?}", plan.stats);
+        let res = make_residual(&next, &plan, 1);
+        let res_up = res.frame().map(|f| up.upscale(f).unwrap());
+        let merged = merge(&prev_up, &[], res_up.as_ref(), &plan, 4, 1).unwrap();
+        for (i, m) in plan.matches.iter().enumerate() {
+            if let BlockMatch::MovedQuarter { .. } = m {
+                let (x, y) = plan.grid.origin(i);
+                for j in 0..16 {
+                    for k in 0..16 {
+                        let mut got = [0u8; 3];
+                        for c in 0..3 {
+                            let mut sum = 0u32;
+                            for dy in 0..4 {
+                                for dx in 0..4 {
+                                    sum += merged.px((x + k) * 4 + dx, (y + j) * 4 + dy)[c] as u32;
+                                }
+                            }
+                            got[c] = ((sum + 8) >> 4) as u8;
+                        }
+                        assert_eq!(got, working_next.px(x + k, y + j), "block {i} px ({k},{j})");
+                    }
+                }
+                assert_eq!(working_next.crop(x, y, 16, 16), next.crop(x, y, 16, 16), "block {i}");
+            }
+        }
+        assert!(merge(&prev_up, &[], None, &plan, 2, 1).is_err());
+    }
+
     #[test]
     fn redraw_roundtrips() {
         let prev = smooth(64, 64, 0);
@@ -333,6 +563,49 @@ mod tests {
             *b = (i * 31 % 251) as u8;
         }
         roundtrip(&prev, &next, 1, 2, &Stationary);
+    }
+
+    /// Plated blocks round-trip exactly: a pan over a world, a plate built
+    /// from the whole window, and every frame merged from the plate's
+    /// nearest-neighbour upscale must equal the upscale of its low-res
+    /// reconstruction. Also pins that the pan's leading edge — content the
+    /// previous frame never saw — is Plated, not Missing.
+    #[test]
+    fn plated_blocks_roundtrip_and_explain_the_leading_edge() {
+        use crate::plate::Plate;
+        use crate::predict::{analyze_tiered, AnalyzeState};
+        let world = smooth(240, 96, 6);
+        let (fw, fh) = (128u32, 96u32);
+        let frames: Vec<Frame> = (0..8u32).map(|i| world.crop(8 * i, 0, fw, fh)).collect();
+        let refs: Vec<&Frame> = frames.iter().collect();
+        let plate = Plate::build(&refs, 0.2);
+        assert_eq!(plate.lo.width, 8 * 7 + fw);
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, ..Default::default() };
+        let mut up = NearestUpscaler { scale: 2 };
+        let plate_up = up.upscale(&plate.lo).unwrap();
+        let mut st = AnalyzeState::default();
+        let mut w = frames[0].clone();
+        let mut prev_up = up.upscale(&frames[0]).unwrap();
+        for i in 1..frames.len() {
+            let (plan, working_next, cached) = analyze_tiered(&mut w, &frames[i], &[], Some(plate.view(i)), None, &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+            assert!(!plan.redraw);
+            assert_eq!(plan.stats.missing, 0, "frame {i}: {:?}", plan.stats);
+            // Stationary is impossible under an 8 px pan; everything is Plated.
+            assert_eq!(plan.stats.plated, plan.grid.len() as u32, "frame {i}: {:?}", plan.stats);
+            let res = make_residual(&frames[i], &plan, 1);
+            let tiers: [Option<Frame>; MAX_TIERS] = [res.frame().map(|f| up.upscale(f).unwrap()), None, None];
+            let refs: [Option<&Frame>; MAX_TIERS] = [tiers[0].as_ref(), None, None];
+            let merged = merge_tiered(&prev_up, &[], Some(&plate_up), &refs, &cached, &plan, 2, 1).unwrap();
+            assert_eq!(merged, up.upscale(&working_next).unwrap(), "frame {i}");
+            // And, because the plate is exact here, the output IS the frame.
+            assert_eq!(working_next, frames[i], "frame {i}");
+            prev_up = merged;
+            w = working_next;
+        }
+        // A plan that uses the plate must be refused a merge without one.
+        let (plan, _, _) = analyze_tiered(&mut frames[0].clone(), &frames[1], &[], Some(plate.view(1)), None, &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+        let none: [Option<&Frame>; MAX_TIERS] = [None, None, None];
+        assert!(merge_tiered(&prev_up, &[], None, &none, &CachedBlocks::new(), &plan, 2, 1).is_err());
     }
 
     /// Recalled blocks round-trip exactly through merge with a reference ring.
@@ -382,12 +655,12 @@ mod tests {
         let prev_up = up.upscale(&prev).unwrap();
         let mut w = prev.clone();
         let mut st = AnalyzeState::default();
-        let (plan, working_next, _) = analyze_tiered(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 3, &mut st).unwrap();
+        let (plan, working_next, _) = analyze_tiered(&mut w, &next, &[], None, None, &JpegReference { quality: 97 }, &Stationary, &cfg, 3, &mut st).unwrap();
         assert_eq!(plan.stats.residual_tiers, [(1, 1), (1, 1), (1, 1)]);
         let res = make_residual(&next, &plan, 1);
         let ups: Vec<Option<Frame>> = (0..3).map(|t| res.tier(t).map(|f| up.upscale(f).unwrap())).collect();
         let refs: [Option<&Frame>; 3] = [ups[0].as_ref(), ups[1].as_ref(), ups[2].as_ref()];
-        let merged = merge_tiered(&prev_up, &[], &refs, &CachedBlocks::new(), &plan, 2, 1).unwrap();
+        let merged = merge_tiered(&prev_up, &[], None, &refs, &CachedBlocks::new(), &plan, 2, 1).unwrap();
         assert_eq!(merged, up.upscale(&working_next).unwrap());
     }
 

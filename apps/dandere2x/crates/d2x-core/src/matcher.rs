@@ -23,6 +23,16 @@ pub trait BlockMatcher: Send + Sync {
     /// at `(dst_x, dst_y)`, among candidates with `sse <= limit`. `None`
     /// if nothing qualifies.
     fn search(&self, prev: &Frame, next: &Frame, dst_x: u32, dst_y: u32, size: u32, limit: u64) -> Option<Candidate>;
+    /// [`search`](Self::search) with a motion hint: the block's source is
+    /// expected near `(dst_x + hint.0, dst_y + hint.1)`. A local search
+    /// starts there and, failing that, falls back to the unhinted search
+    /// (a moving actor does not follow the camera). Matchers without a
+    /// notion of a start ignore the hint.
+    #[allow(clippy::too_many_arguments)]
+    fn search_from(&self, prev: &Frame, next: &Frame, dst_x: u32, dst_y: u32, size: u32, limit: u64, hint: (i64, i64)) -> Option<Candidate> {
+        let _ = hint;
+        self.search(prev, next, dst_x, dst_y, size, limit)
+    }
     fn name(&self) -> &'static str;
 }
 
@@ -104,6 +114,9 @@ impl Default for Diamond {
     }
 }
 
+const LDSP: [(i64, i64); 9] = [(0, 0), (2, 0), (-2, 0), (0, 2), (0, -2), (1, 1), (-1, 1), (1, -1), (-1, -1)];
+const SDSP: [(i64, i64); 5] = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
+
 impl Diamond {
     /// The walk, over any probe function — `search` hands it the SSE test;
     /// tests hand it a counter. Every (x, y) is probed AT MOST ONCE: `(0,0)`
@@ -156,11 +169,31 @@ impl Diamond {
     }
 }
 
-const LDSP: [(i64, i64); 9] = [(0, 0), (2, 0), (-2, 0), (0, 2), (0, -2), (1, 1), (-1, 1), (1, -1), (-1, -1)];
-const SDSP: [(i64, i64); 5] = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
-
 impl BlockMatcher for Diamond {
     fn search(&self, prev: &Frame, next: &Frame, dst_x: u32, dst_y: u32, size: u32, limit: u64) -> Option<Candidate> {
+        self.search_from(prev, next, dst_x, dst_y, size, limit, (0, 0))
+    }
+    /// A pan of more than `radius` (or of more than ~8 px on repetitive
+    /// texture) puts the true source outside the basin the unhinted walk
+    /// starts in; a global-motion hint from phase correlation puts the
+    /// start inside it. The hint is one per frame, so it is right for the
+    /// background and wrong for movers — hence the fallback.
+    ///
+    /// MERGE NOTE: the incoming series gave `walk` a start point so a hint
+    /// could seed it; this side had already made `walk` generic over the
+    /// probe function with a visited list so no point is tested twice. They
+    /// compose — `walk`'s `(ox, oy)` IS the start point — so the seeding is
+    /// expressed through the deduped walk rather than either being dropped.
+    fn search_from(&self, prev: &Frame, next: &Frame, dst_x: u32, dst_y: u32, size: u32, limit: u64, hint: (i64, i64)) -> Option<Candidate> {
+        let eval = |x: i64, y: i64, lim: u64| test(prev, next, dst_x, dst_y, x, y, size, lim);
+        if hint != (0, 0) {
+            let (sx, sy) = (dst_x as i64 + hint.0, dst_y as i64 + hint.1);
+            if sx >= 0 && sy >= 0 && prev.block_in_bounds(sx as u32, sy as u32, size) {
+                if let Some(c) = self.walk(sx, sy, limit, eval) {
+                    return Some(c);
+                }
+            }
+        }
         let eval = |x: i64, y: i64, lim: u64| test(prev, next, dst_x, dst_y, x, y, size, lim);
         self.walk(dst_x as i64, dst_y as i64, limit, eval)
     }
@@ -222,6 +255,23 @@ mod tests {
             assert_eq!(d.sse, 0, "diamond missed shift {dx},{dy}: {d:?}");
             assert_eq!((e.src_x, e.src_y), (d.src_x, d.src_y));
         }
+    }
+
+    /// A shift beyond the radius is unreachable unhinted and exact with the
+    /// right hint; a wrong hint falls back to the unhinted answer.
+    #[test]
+    fn diamond_hint_reaches_past_the_radius_and_falls_back() {
+        let prev = smooth(160, 96, 7);
+        let next = shifted(&prev, -40, 3); // next[x] = prev[x + 40]
+        let d = Diamond { max_steps: 16, radius: 8 };
+        assert!(d.search(&prev, &next, 64, 32, 16, u64::MAX).map_or(true, |c| c.sse > 0));
+        let c = d.search_from(&prev, &next, 64, 32, 16, u64::MAX, (40, -3)).unwrap();
+        assert_eq!((c.src_x, c.src_y, c.sse), (104, 29, 0));
+        // Wrong hint: the seeded walk fails the limit, the fallback finds a
+        // small shift the unhinted walk can reach.
+        let next2 = shifted(&prev, 2, 1);
+        let c = d.search_from(&prev, &next2, 64, 32, 16, 0, (40, 0)).unwrap();
+        assert_eq!((c.src_x, c.src_y, c.sse), (62, 31, 0));
     }
 
     /// Diamond never returns something exhaustive would reject, and on a

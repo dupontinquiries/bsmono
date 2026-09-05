@@ -23,6 +23,10 @@ clap = { version = "4", features = ["derive"] }
 wgpu = "29"
 naga = { version = "29", features = ["wgsl-in"] }
 pollster = "0.4"
+# Phase correlation (global motion for the plate reference) — the same pair
+# fao_codec_lib uses; pure Rust, no system deps.
+rustfft = "6.2"
+num-complex = "0.4"
 
 # Compile-speed policy (monorepo-wide, dev only): see apps/beatspace/Cargo.toml.
 [profile.dev]
