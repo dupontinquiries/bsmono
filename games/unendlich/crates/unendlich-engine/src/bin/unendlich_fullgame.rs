@@ -1873,6 +1873,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let mut paintbrush = unendlich_engine::voxel_chat::Paintbrush::new(
         unendlich_engine::constants::CHUNK_SIZE);
     let mut chat_toggle = false;
+    // Authoritative chat-focus flag, updated the instant a key opens or
+    // closes the box -- BEFORE the rest of that same event batch is
+    // dispatched. `renderer.chat_open` is written later in the frame and
+    // is therefore one frame stale; at 150 ms frames that stale window
+    // is wide enough to leak a whole burst of typing into movement,
+    // which is why the drops correlated with lag.
+    let mut chat_focus = false;
     // A QUEUE, not one slot. Several key events arrive in a single frame
     // whenever the frame is long — which is exactly when you are typing
     // during a chunk load — and a single Option kept only the last one.
@@ -3721,7 +3728,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // you walked while typing. Mouse look and cursor motion still
             // pass through, which is what you want — you can aim at where
             // a build should go while describing it.
-            let chat_owns_keys = renderer.chat_open;
+            let chat_owns_keys = chat_focus;
             if let Some(ev) = unendlich_engine::input_codes::input_event_from_glfw(&event) {
                 // Both key variants: an UnknownKey is still a keystroke
                 // the chat is consuming, and letting it through would
@@ -3738,7 +3745,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // While the build chat is open it owns typed text;
                     // egui fields never see it, so the two cannot both
                     // claim a character.
-                    if renderer.chat_open {
+                    if chat_focus {
                         chat_keys.push(voxel_tools::chatbox::Key::Char(ch));
                     } else {
                         // r181: text input for egui fields (name/seed boxes).
@@ -3750,8 +3757,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     scroll_accum_x += dx as f32; // r318: horizontal (trackpad)
                 }
                 WindowEvent::Key(Key::Escape, _, Action::Press, _) => {
-                    if renderer.chat_open {
+                    if chat_focus {
                         chat_keys.push(voxel_tools::chatbox::Key::Escape);
+                        chat_focus = false; // takes effect for the NEXT event, not next frame
                     } else {
                         esc_pressed = true;
                     }
@@ -3761,20 +3769,26 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // game works; T also opens it.
                 WindowEvent::Key(Key::Enter, _, Action::Press, _)
                 | WindowEvent::Key(Key::KpEnter, _, Action::Press, _) => {
-                    if renderer.chat_open {
+                    if chat_focus {
                         chat_keys.push(voxel_tools::chatbox::Key::Enter);
+                        chat_focus = false; // Enter submits and closes
                     } else {
                         chat_toggle = true;
+                        // Claim focus NOW so the rest of this batch types
+                        // instead of walking. On a 150 ms frame the first
+                        // characters after Enter used to reach movement.
+                        chat_focus = true;
+                        input.release_all();
                     }
                 }
-                WindowEvent::Key(Key::Tab, _, Action::Press, mods) if renderer.chat_open => {
+                WindowEvent::Key(Key::Tab, _, Action::Press, mods) if chat_focus => {
                     chat_keys.push(if mods.contains(glfw::Modifiers::Shift) {
                         voxel_tools::chatbox::Key::ShiftTab
                     } else {
                         voxel_tools::chatbox::Key::Tab
                     });
                 }
-                WindowEvent::Key(Key::Backspace, _, Action::Press, _) if renderer.chat_open => {
+                WindowEvent::Key(Key::Backspace, _, Action::Press, _) if chat_focus => {
                     chat_keys.push(voxel_tools::chatbox::Key::Backspace);
                 }
                 // Clipboard. Ctrl+V works with the box shut too (it opens
@@ -3800,14 +3814,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     });
                 }
                 WindowEvent::Key(Key::U, _, Action::Press, mods)
-                    if renderer.chat_open && mods.contains(glfw::Modifiers::Control) =>
+                    if chat_focus && mods.contains(glfw::Modifiers::Control) =>
                 {
                     chat_keys.push(voxel_tools::chatbox::Key::ClearLine);
                 }
-                WindowEvent::Key(Key::Up, _, Action::Press, _) if renderer.chat_open => {
+                WindowEvent::Key(Key::Up, _, Action::Press, _) if chat_focus => {
                     chat_keys.push(voxel_tools::chatbox::Key::Up);
                 }
-                WindowEvent::Key(Key::Down, _, Action::Press, _) if renderer.chat_open => {
+                WindowEvent::Key(Key::Down, _, Action::Press, _) if chat_focus => {
                     chat_keys.push(voxel_tools::chatbox::Key::Down);
                 }
                 WindowEvent::Key(key, scancode, Action::Press, _) => {
@@ -4307,7 +4321,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // Feed Enter to the box so it opens through the same
                 // state machine the tests drive.
                 paintbrush.key(CK::Enter);
-                renderer.chat_open = paintbrush.captures_input();
+                chat_focus = paintbrush.captures_input();
+                renderer.chat_open = chat_focus;
                 if renderer.chat_open {
                     // Drop keys held at the moment focus was taken. GLFW
                     // will not deliver the Release for a key the chat is
@@ -4337,7 +4352,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         unendlich_engine::voxel_chat::KeyOut::None => {}
                     }
                 }
-                renderer.chat_open = paintbrush.captures_input();
+                chat_focus = paintbrush.captures_input();
+                renderer.chat_open = chat_focus;
             }
 
             if renderer.chat_open || submitted.is_some() {
@@ -12826,7 +12842,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // just-pressed set instead of being wiped by end_frame (the
             // "eaten esc / jump / flight" bug).
             if let Some(ev) = unendlich_engine::input_codes::input_event_from_glfw(&event) {
-                input.handle_event_late(&ev);
+                // The late drain had NO chat guard, so every key reached
+                // the movement system through here even while typing.
+                // On Dvorak this is vivid: `.oeu` sit on the physical
+                // E/S/D/F keys, so typing a word walked the player and
+                // space jumped. Withhold key edges while the chat has
+                // focus; mouse and resize still drain as before.
+                let is_key = matches!(ev,
+                    unendlich_engine::input_codes::InputEvent::Key { .. }
+                    | unendlich_engine::input_codes::InputEvent::UnknownKey { .. });
+                if !(chat_focus && is_key) {
+                    input.handle_event_late(&ev);
+                }
             }
         }
         if mouse_captured && input.cursor_delta != (0.0, 0.0) {

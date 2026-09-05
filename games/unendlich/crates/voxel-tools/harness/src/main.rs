@@ -2,12 +2,14 @@ mod stubs;
 mod bind;
 mod paintbrush;
 mod armcheck;
+mod focusguard;
 
 use stubs::ChunkManager;
 use bind::{flush, WorldView};
 use voxel_tools::staged::StagedWorld;
 fn main() {
     scenario();
+    focus_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -150,3 +152,40 @@ fn old_main() {
     println!("reveal: {} frames", frames.len());
 }
 
+
+/// Dvorak `.oeu` sits on physical E/S/D/F; space is jump. Typing must
+/// not move the player, including in the frame Enter opened the box.
+fn focus_scenario() {
+    use focusguard::{Ev, Sim};
+    println!("\n==== focus guard");
+
+    // one long frame: Enter then a burst of typing, all in one batch
+    let mut s = Sim::default();
+    s.frame(&[Ev::Enter,
+              Ev::Key('e'), Ev::Char('.'),
+              Ev::Key('s'), Ev::Char('o'),
+              Ev::Key('d'), Ev::Char('e'),
+              Ev::Key('f'), Ev::Char('u'),
+              Ev::Key(' '), Ev::Char(' ')]);
+    println!("  same frame as Enter: to_movement={:?} to_chat={:?} release_all={}",
+             s.to_movement, s.to_chat.iter().collect::<String>(), s.released_all);
+    assert!(s.to_movement.is_empty(), "typing must not reach movement");
+    assert_eq!(s.to_chat.iter().collect::<String>(), ".oeu ");
+
+    // steady state across frames
+    let mut s2 = Sim::default();
+    s2.frame(&[Ev::Enter]);
+    s2.frame(&[Ev::Key('s'), Ev::Char('o'), Ev::Key(' '), Ev::Char(' ')]);
+    assert!(s2.to_movement.is_empty(), "steady-state typing must not move");
+    println!("  next frame:          to_movement={:?} to_chat={:?}",
+             s2.to_movement, s2.to_chat.iter().collect::<String>());
+
+    // and movement works again after Escape, in the same frame
+    let mut s3 = Sim::default();
+    s3.frame(&[Ev::Enter]);
+    s3.frame(&[Ev::Esc, Ev::Key('s'), Ev::Key(' ')]);
+    println!("  after Esc:           to_movement={:?}", s3.to_movement);
+    assert_eq!(s3.to_movement, vec!['s', ' ', 's', ' '],
+               "both drains resume once focus is released");
+    println!("  OK");
+}
