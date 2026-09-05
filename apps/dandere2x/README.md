@@ -310,6 +310,15 @@ What is built:
   scales that are a multiple of 4 — the x4 models): half-pel becomes a
   search stage centring a quarter-pel refinement; the mirror is the 4×4 box
   downsample of the output, bit for bit. SMITE +2.4 points over half-pel.
+- **Restoration training set** (`tools/pair_dataset.py`): a low-bitrate
+  and a high-bitrate encode of the same movie are a frame-aligned training
+  pair. `extract` verifies alignment per timestamp (PSNR to the matching
+  frame must beat its neighbours by a margin) and writes crop pairs;
+  `score` is the PSNR/SSIM judge used for every temporal experiment in
+  `examples/tdenoise`. On the 558 kbps / 2.5 Mbps pair no temporal fusion
+  recovered anything (+0.00 dB) — the artefact is coherent smoothing — so
+  the detail has to come from a prior: train an SRVGG-class net on the
+  crops, export with `tools/pth2st.py`, run it as a cascade tier.
 - **Gate hysteresis** (`--streak-bonus b`, default 0 = off): a block reused
   for `n` consecutive frames gets its threshold scaled by
   `1 + b·min(n,8)/8`, so blocks that keep matching stop flickering out at
