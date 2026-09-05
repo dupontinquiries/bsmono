@@ -4857,7 +4857,20 @@ fn main() -> eframe::Result<()> {
     // thing and worth keeping: it exercises colour, wrapping and multibyte
     // rendering on the first frame, which is the point of a demo, and it
     // does not pretend to be history.
+    // DEMO CONTENT IS OPT-IN NOW. The comment above explains why the block
+    // tracker stopped being seeded; the same argument applies to everything
+    // else here and was not followed through. A shipped app started with a
+    // fake shell transcript, a fake cwd (`/home/kessler/proj`) and two fake
+    // workspaces called "kesslerd" with invented counts — which is what the
+    // operator saw as "multiple layers of tabs ... scaffolding from the demo
+    // lurking". It was.
+    //
+    // The sample output is still worth HAVING: it exercises colour, wrapping
+    // and multibyte on the first frame, which no empty terminal does. So it
+    // is kept and gated. `VOICETERM_DEMO=1` restores every bit of it.
+    let demo = std::env::var_os("VOICETERM_DEMO").is_some();
     let mut blocks = uikit_term::blocks::BlockTracker::new();
+    if demo {
     blocks.set_cwd("/home/kessler/proj");
     app.terminal.feed("$ ls --color\r\n");
     app.terminal.feed("\x1b[1;34mCargo.toml\x1b[0m  \x1b[1;32mbuild.sh\x1b[0m  \x1b[1;34msrc\x1b[0m  \x1b[1;31mold.bak\x1b[0m\r\n");
@@ -4866,11 +4879,18 @@ fn main() -> eframe::Result<()> {
     app.terminal.feed("$ echo café 🚀 你好\r\n"); // multibyte + emoji + CJK, straight in the source
     app.terminal.feed("café 🚀 你好\r\n");
     app.terminal.feed("$ ");
+    }
     let colors = uikit_egui::palette_colors("voice");
-    let sidebar = Sidebar::new(vec![
-        Session { name: "kesslerd".into(), count: 5 },
-        Session { name: "kesslerd".into(), count: 2 },
-    ]);
+    // No invented workspaces. An empty list is the correct state before the
+    // user has made one, and the sidebar already has a view for it.
+    let sidebar = Sidebar::new(if demo {
+        vec![
+            Session { name: "kesslerd".into(), count: 5 },
+            Session { name: "kesslerd".into(), count: 2 },
+        ]
+    } else {
+        Vec::new()
+    });
     eframe::run_native(
         "voiceterm (egui)",
         eframe::NativeOptions {
