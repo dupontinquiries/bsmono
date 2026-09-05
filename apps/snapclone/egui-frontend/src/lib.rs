@@ -3985,6 +3985,19 @@ impl Snapclone {
             }
         });
         ui.separator();
+        // EVERYTHING BELOW THE VIEWFINDER SCROLLS. The camera page is drawn
+        // outside the page-level ScrollArea on purpose — the viewfinder should
+        // fill its space rather than be a scrolling box — but that left the
+        // controls under it with no scroll and no clip, so once the composer,
+        // the delivery line and the send receipt were taller than what the
+        // hint bar and tab bar left, the last rows were painted UNDER them.
+        // Seen at 400x800: "No recipients / Add someone to this thread" cut in
+        // half by the hint bar. Only the tail scrolls; the viewfinder keeps
+        // the space it had.
+        egui::ScrollArea::vertical()
+            .id_salt("camera-controls-tail")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
         // the composer, over the captured frame
         // WRAPPED, not a fixed row. Reserving room for a known number of
         // trailing controls is brittle: sizing the field to clear "colour"
@@ -4067,6 +4080,7 @@ impl Snapclone {
             // prevent.
             ui.colored_label(c.warning, "nobody in this thread to send to");
         }
+            });
     }
 
     /// Route one action from the requests list. Accept and Decline apply
