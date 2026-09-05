@@ -414,10 +414,17 @@ impl Paintbrush {
                 let is_debug = prose.trim_start().starts_with("debug");
                 log::info!("[paintbrush] /build debug={} ready={} prose={:?}",
                            is_debug, self.models.state.is_ready(), prose);
-                if !is_debug && !self.models.state.is_ready() {
-                    self.say("no model loaded -- /model to list, /model <name> to load, \
-                              or /build debug <anything> to test without one");
-                    return Pending::None;
+                // Ask the PROVIDER whether it can answer, not the model
+                // registry. `/model` is only one of the ways weights get
+                // chosen: `/provider engine:/path.gguf` carries its own,
+                // and an ollama or openai server has its own already
+                // loaded. Gating those on a /model that is irrelevant to
+                // them refused turns that would have worked.
+                if !is_debug {
+                    if let Some(why) = self.provider_not_ready() {
+                        self.say(why);
+                        return Pending::None;
+                    }
                 }
                 Pending::Model(prose)
             }
@@ -528,6 +535,25 @@ impl Paintbrush {
         // A preview must leave nothing staged: receive_plan_for reverses
         // its own dry run, so this is an assertion, not a cleanup.
         debug_assert_eq!(staged.pending(), 0, "preview must not stage writes");
+    }
+
+    /// Why the current provider cannot answer, or None if it can.
+    /// Cheap and side-effect free: it must not load anything.
+    pub fn provider_not_ready(&self) -> Option<String> {
+        match &self.provider {
+            // These bring their own weights or talk to something that has.
+            ProviderChoice::Fixture => None,
+            ProviderChoice::Script(_) => None,
+            ProviderChoice::Http(_) => None,
+            ProviderChoice::Engine { model_path } => {
+                if !model_path.is_empty() || self.models.state.is_ready() {
+                    None
+                } else {
+                    Some("the engine has no model -- /model <name>, \
+                          or /provider engine:/path/to/model.gguf".into())
+                }
+            }
+        }
     }
 
     /// Build the completer for a turn. Everything the bin needs to know
