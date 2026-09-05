@@ -737,22 +737,30 @@ impl eframe::App for Shell {
         if self.running {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
-        egui::Panel::left("settings").resizable(true).default_size(340.0).show_inside(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.settings(ui));
-        });
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            if let Some(total) = self.frames_total {
-                let done = self.rows.len() as f32;
+        // SIDE BY SIDE OR STACKED, not a narrower split. A 340pt settings
+        // column beside the preview is right on a laptop and most of the
+        // screen on a phone. Making the column a fraction is the tempting
+        // fix and it is worse — tried on beatspace, looked at it, and the
+        // controls started clipping while the content was still cramped. A
+        // narrow screen wants a different arrangement, so below the two
+        // panes' minima the settings become a collapsed disclosure above the
+        // content and the preview gets the whole width.
+        uikit_egui::two_pane::two_pane_ui(
+            ui, "dandere-settings", 340.0, 260.0, 320.0, "settings", self,
+            |ui, s| { egui::ScrollArea::vertical().show(ui, |ui| s.settings(ui)); },
+            |ui, self_| {
+            if let Some(total) = self_.frames_total {
+                let done = self_.rows.len() as f32;
                 ui.add(egui::ProgressBar::new((done / total.max(1) as f32).min(1.0)).text(format!("{done} / {total}")));
             }
-            self.bars(ui);
-            if let Some(s) = &self.summary {
+            self_.bars(ui);
+            if let Some(s) = &self_.summary {
                 ui.label(s);
             }
             let avail = ui.available_height();
             let preview_h = (avail * 0.55).max(120.0);
-            if let Some(tex) = &self.preview {
-                let (w, h) = self.preview_size;
+            if let Some(tex) = &self_.preview {
+                let (w, h) = self_.preview_size;
                 let aspect = w as f32 / h.max(1) as f32;
                 let size = egui::vec2((preview_h * aspect).min(ui.available_width()), preview_h);
                 ui.add(egui::Image::new(tex).fit_to_exact_size(size));
@@ -760,8 +768,9 @@ impl eframe::App for Shell {
                 ui.add_space(4.0);
             }
             ui.separator();
-            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| log_view(ui, &self.log));
-        });
+            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| log_view(ui, &self_.log));
+            },
+        );
     }
 }
 

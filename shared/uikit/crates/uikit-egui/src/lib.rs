@@ -80,6 +80,7 @@ pub mod scroll;
 pub mod fuzzy;
 pub mod handed;
 pub mod sections;
+pub mod two_pane;
 pub mod layout_probe;
 pub mod overlay;
 // Text inputs that cannot be built without an id — see the module docs for
