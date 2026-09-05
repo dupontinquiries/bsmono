@@ -114,6 +114,7 @@ pub mod capacity_tree;
 pub mod linearize;
 pub mod mdtable;
 pub mod verifyplan;
+pub mod consult;
 pub mod panelvoice;
 pub mod injecttime;
 pub mod injectfork;
