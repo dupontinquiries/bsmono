@@ -444,6 +444,34 @@ pub enum SceneLight {
     MembraneRipple,
     CrystalGlint,
     RainbowRefraction,
+    /// Forest / Treehouse: the canopy story, wider and higher — bigger
+    /// leaf-cells, slower sway, a brighter floor (more sky gets through).
+    HighCanopy,
+    /// Cloudscape: light breaking through moving cloud gaps. Softer and
+    /// slower than leaves, cooler in the shadow.
+    CloudGaps,
+    /// Mansion Garden: sun through a conservatory's glass — a grid of
+    /// mullion shadows sliding slowly with the sun.
+    WindowPanes,
+    /// Old Library / Archive / Reading Room: lamp flicker. One shared
+    /// flame per label (the room's lamp), a whisper of per-dot variance,
+    /// warm.
+    LampFlicker,
+    /// Slate: chalk dust catching a single raking light — a directional
+    /// bright line drifting across, with dust glints in its wake.
+    RakingLight,
+    /// Alley: a neon sign. Mostly on, sharp, with the occasional stutter
+    /// where a segment drops for a few frames; magenta when lit.
+    NeonBuzz,
+    /// Recursive Citadel: sun on sandstone — a slow warm pulse, with the
+    /// per-dot phase jitter of heat shimmer.
+    SandstoneShimmer,
+    /// Hollow Jungle: canopy-hole shafts — sparse, hard-edged beams,
+    /// dim between them.
+    CanopyShafts,
+    /// Yellow Brick Road: chase lights along the bricks — a bright pulse
+    /// running left to right, brick by brick.
+    BrickChase,
     Uniform,
 }
 
@@ -458,9 +486,27 @@ pub fn scene_light_for(scene_name: &str) -> SceneLight {
         "Folding@home" => SceneLight::MembraneRipple,
         "Fractal Spires" => SceneLight::CrystalGlint,
         "Frozen Bifrost" => SceneLight::RainbowRefraction,
+        "Forest" | "Treehouse" => SceneLight::HighCanopy,
+        "Cloudscape" => SceneLight::CloudGaps,
+        "Mansion Garden" => SceneLight::WindowPanes,
+        "Old Library" | "Archive" | "Reading Room" => SceneLight::LampFlicker,
+        "Slate" => SceneLight::RakingLight,
+        "Alley" => SceneLight::NeonBuzz,
+        "Recursive Citadel" => SceneLight::SandstoneShimmer,
+        "Hollow Jungle" => SceneLight::CanopyShafts,
+        "Yellow Brick Road" => SceneLight::BrickChase,
         _ => SceneLight::Uniform,
     }
 }
+
+/// Every scene name `scene3d::build` dispatches on. The test
+/// `every_named_scene_has_a_mechanism` walks this so a scene added to the
+/// app without a light here is a failing test, not a flat label.
+pub const SCENE_NAMES: &[&str] = &[
+    "Canopy", "Atlantis", "Mistfall", "Folding@home", "Fractal Spires", "Frozen Bifrost",
+    "Forest", "Treehouse", "Cloudscape", "Mansion Garden", "Old Library", "Archive", "Reading Room",
+    "Slate", "Alley", "Recursive Citadel", "Hollow Jungle", "Yellow Brick Road",
+];
 
 /// Per-dot (brightness multiplier, hue-shift-degrees) from the scene's physical process. Brightness
 /// always has a legibility floor (never fully dark) — these are meant to make the text feel alive
@@ -473,8 +519,151 @@ pub fn modulate_dot(light: SceneLight, gx: f32, gy: f32, seed: u32, t: f32) -> (
         SceneLight::MembraneRipple => (membrane_ripple(gx, gy, seed, t), 0.0),
         SceneLight::CrystalGlint => (crystal_glint(gx, gy, seed, t), 0.0),
         SceneLight::RainbowRefraction => rainbow_refraction(gx, gy, t),
+        SceneLight::HighCanopy => (high_canopy(gx, gy, seed, t), 0.0),
+        SceneLight::CloudGaps => cloud_gaps(gx, gy, seed, t),
+        SceneLight::WindowPanes => (window_panes(gx, gy, seed, t), 0.0),
+        SceneLight::LampFlicker => lamp_flicker(gx, gy, seed, t),
+        SceneLight::RakingLight => (raking_light(gx, gy, seed, t), 0.0),
+        SceneLight::NeonBuzz => neon_buzz(gx, gy, seed, t),
+        SceneLight::SandstoneShimmer => sandstone_shimmer(gx, gy, seed, t),
+        SceneLight::CanopyShafts => (canopy_shafts(gx, gy, seed, t), 0.0),
+        SceneLight::BrickChase => (brick_chase(gx, gy, seed, t), 0.0),
         SceneLight::Uniform => (1.0, 0.0),
     }
+}
+
+/// FOREST / TREEHOUSE: the canopy, higher up. Leaf-cells twice the size,
+/// sway two-thirds the speed, and a 0.65 floor — a treehouse sits where
+/// more sky gets through than the forest floor sees.
+fn high_canopy(gx: f32, gy: f32, seed: u32, t: f32) -> f32 {
+    let sway = t * 0.22;
+    let n1 = hash3((gx * 0.65 + sway * 3.0).floor() as i32, (gy * 0.55).floor() as i32, seed as i32);
+    let n2 = hash3((gx * 0.3 - sway * 1.8).floor() as i32, (gy * 0.25 + sway * 0.8).floor() as i32, seed.wrapping_add(131) as i32);
+    let dapple = (n1 * 0.5 + n2 * 0.5).clamp(0.0, 1.0);
+    0.65 + 0.35 * dapple
+}
+
+/// CLOUDSCAPE: gaps in a moving cloud deck. Two very-low-frequency layers
+/// drifting at different speeds make gaps open and close over seconds, not
+/// frames; the shadowed dots cool by 12° of hue (cloud shadow is bluer
+/// than the sun it blocks).
+fn cloud_gaps(gx: f32, gy: f32, seed: u32, t: f32) -> (f32, f32) {
+    let drift = t * 0.12;
+    let a = value_noise((gx * 0.12 + drift, gy * 0.18), seed);
+    let b = value_noise((gx * 0.07 - drift * 0.6, gy * 0.1 + drift * 0.3), seed.wrapping_add(41));
+    let gap = ((a * 0.6 + b * 0.4 - 0.35) * 2.2).clamp(0.0, 1.0);
+    (0.6 + 0.4 * gap, -12.0 * (1.0 - gap))
+}
+
+/// MANSION GARDEN: a conservatory's glazing bars cast a grid of shadow
+/// that slides with the sun. Bars every 7 columns and 3 rows, a bar's
+/// shadow one cell wide, the whole grid creeping a cell per ~8 s. Between
+/// the bars the glass is bright.
+fn window_panes(gx: f32, gy: f32, seed: u32, t: f32) -> f32 {
+    let slide = t * 0.13 + hash3(seed as i32, 3, 0) * 7.0;
+    let u = (gx + slide).rem_euclid(7.0);
+    let v = (gy + slide * 0.35).rem_euclid(3.0);
+    let bar_u = (1.0 - (u - 0.5).abs() * 1.6).clamp(0.0, 1.0);
+    let bar_v = (1.0 - (v - 0.5).abs() * 1.6).clamp(0.0, 1.0);
+    let shadow = bar_u.max(bar_v);
+    0.95 - 0.45 * shadow
+}
+
+/// OLD LIBRARY / ARCHIVE / READING ROOM: one lamp, one flame. The flame is
+/// a shared per-label signal (every dot breathes together, as text under
+/// one lamp does), with a small per-dot term so a page is not a light
+/// switch. Warm: +9° of hue toward amber at the flicker's peak.
+fn lamp_flicker(gx: f32, gy: f32, seed: u32, t: f32) -> (f32, f32) {
+    let flame = 0.5 + 0.5 * ((t * 7.3).sin() * 0.5 + (t * 11.1 + 1.7).sin() * 0.3 + (t * 2.1).sin() * 0.2);
+    let gust = hash3(((t * 0.9).floor()) as i32, seed as i32, 5) * 0.25; // a draught every second or so
+    let cell = ((gx.floor() as i32) << 8) ^ (gy.floor() as i32) ^ seed as i32;
+    let local = hash3(cell, (t * 3.0).floor() as i32, 0) * 0.06;
+    let b = (0.72 + 0.22 * flame - gust * 0.3 + local).clamp(0.5, 1.0);
+    (b, 9.0 * flame)
+}
+
+/// SLATE: a single low light rakes across the board. A bright line at a
+/// shallow angle drifts slowly right; chalk dust glints briefly where the
+/// line has just passed. Dark elsewhere — but never below 0.5, the board
+/// still reads.
+fn raking_light(gx: f32, gy: f32, seed: u32, t: f32) -> f32 {
+    let angle: f32 = 0.35;
+    let along = gx * angle.cos() + gy * angle.sin();
+    let line = (t * 2.2 + hash3(seed as i32, 7, 0) * 20.0).rem_euclid(40.0) - 5.0;
+    let d = along - line;
+    let beam = (1.0 - d.abs() * 0.35).clamp(0.0, 1.0);
+    let cell = ((gx.floor() as i32) << 8) ^ (gy.floor() as i32) ^ seed as i32;
+    // dust in the wake: d in (0, 6) behind the line, sparse, quick
+    let dust = if d > 0.0 && d < 6.0 && hash3(cell, (t * 4.0).floor() as i32, 9) > 0.85 { 0.25 } else { 0.0 };
+    (0.5 + 0.5 * beam + dust).min(1.0)
+}
+
+/// ALLEY: neon. Lit is lit — 0.95, magenta-shifted — and every ~4 s a
+/// tube stutters: a dot's segment drops to the floor for two or three
+/// frames, keyed per column so a stutter runs along a tube, not across
+/// the whole sign.
+fn neon_buzz(gx: f32, gy: f32, seed: u32, t: f32) -> (f32, f32) {
+    let _ = gy;
+    let tube = gx.floor() as i32 / 3;
+    let slot = (t * 12.0).floor() as i32; // 12 slots a second: a stutter is 1-3 slots
+    let cycle = hash3(tube, seed as i32, 11) * 4.0 + 2.0;
+    let phase = (t / cycle).fract();
+    let stutter = phase < 0.06 && hash3(slot, tube, 13) > 0.45;
+    if stutter { (0.55, 0.0) } else { (0.95 + 0.05 * hash3(slot, tube, 17), -40.0) }
+}
+
+/// RECURSIVE CITADEL: sun on sandstone. A slow warm pulse (period ~9 s)
+/// the whole surface shares, and per-dot phase jitter — the heat shimmer —
+/// so the pulse arrives a little early or late at each dot. +6° warm.
+fn sandstone_shimmer(gx: f32, gy: f32, seed: u32, t: f32) -> (f32, f32) {
+    let cell = ((gx.floor() as i32) << 8) ^ (gy.floor() as i32) ^ seed as i32;
+    let jitter = (hash3(cell, 19, 0) - 0.5) * 1.2;
+    let pulse = 0.5 + 0.5 * ((t + jitter) * 0.7).sin();
+    (0.78 + 0.18 * pulse, 6.0 * pulse)
+}
+
+/// HOLLOW JUNGLE: canopy holes. Two or three narrow shafts per label, hard
+/// edges, drifting very slowly; dim between them (0.45 — the deepest floor
+/// of any scene, because the beams are the whole point) but never dark.
+fn canopy_shafts(gx: f32, gy: f32, seed: u32, t: f32) -> f32 {
+    let _ = gy;
+    let mut best: f32 = 0.0;
+    for k in 0..3 {
+        let centre = hash3(seed as i32, k, 23) * 30.0 + t * 0.15 * (1.0 + k as f32 * 0.2);
+        let width = 1.0 + hash3(seed as i32, k, 29) * 1.5;
+        let d = ((gx - centre).rem_euclid(30.0)).min((centre - gx).rem_euclid(30.0));
+        let beam = if d < width { 1.0 } else if d < width + 0.6 { 0.5 } else { 0.0 };
+        best = best.max(beam);
+    }
+    0.45 + 0.55 * best
+}
+
+/// YELLOW BRICK ROAD: chase lights. A bright pulse runs left to right at
+/// four bricks a second on a ten-brick period; each brick flares sharply
+/// as the pulse reaches it and fades over the next two. Rows are bricks
+/// in the same course, so `gy` only staggers the phase like a bond.
+fn brick_chase(gx: f32, gy: f32, seed: u32, t: f32) -> f32 {
+    let stagger = if (gy.floor() as i32).rem_euclid(2) == 0 { 0.0 } else { 0.5 };
+    let brick = gx.floor() + stagger;
+    let head = t * 4.0 + hash3(seed as i32, 31, 0) * 10.0;
+    let behind = (head - brick).rem_euclid(10.0);
+    let flare = (1.0 - behind / 2.5).clamp(0.0, 1.0).powf(1.5);
+    0.6 + 0.4 * flare
+}
+
+/// Smooth value noise on a unit lattice, 0..1. Bilinear between hashed
+/// corners with a smoothstep — the slow-field primitive clouds want and
+/// leaves do not.
+fn value_noise(p: (f32, f32), seed: u32) -> f32 {
+    let (x, y) = p;
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let sx = fx * fx * (3.0 - 2.0 * fx);
+    let sy = fy * fy * (3.0 - 2.0 * fy);
+    let c = |dx: i32, dy: i32| hash3(x0 as i32 + dx, y0 as i32 + dy, seed as i32);
+    let top = c(0, 0) + (c(1, 0) - c(0, 0)) * sx;
+    let bot = c(0, 1) + (c(1, 1) - c(0, 1)) * sx;
+    top + (bot - top) * sy
 }
 
 /// CANOPY: sunlight dappling through swaying leaves — a slow-drifting mottled brightness field.
@@ -1491,9 +1680,10 @@ mod tests {
         assert_eq!(scene_light_for("Folding@home"), SceneLight::MembraneRipple);
         assert_eq!(scene_light_for("Fractal Spires"), SceneLight::CrystalGlint);
         assert_eq!(scene_light_for("Frozen Bifrost"), SceneLight::RainbowRefraction);
-        // scenes without a bespoke mechanism yet — honest Uniform fallback, not a guess
-        for unimplemented in ["Forest", "Treehouse", "Cloudscape", "Old Library", "Islands", "made up name"] {
-            assert_eq!(scene_light_for(unimplemented), SceneLight::Uniform);
+        // Only a name the ledger does not know falls back to Uniform now — the
+        // proposed scenes have their mechanisms (see `scene_light_tests`).
+        for unknown in ["Islands", "made up name"] {
+            assert_eq!(scene_light_for(unknown), SceneLight::Uniform);
         }
     }
 
@@ -1840,4 +2030,76 @@ mod sun_curve_delegation {
         assert!((s - e.strength).abs() < 1e-6 && (w - e.warmth).abs() < 1e-6
                 && (a - e.ambient).abs() < 1e-6);
     }
+}
+
+#[cfg(test)]
+mod scene_light_tests {
+    use super::*;
+
+    #[test]
+    fn every_named_scene_has_a_mechanism() {
+        for name in SCENE_NAMES {
+            assert_ne!(scene_light_for(name), SceneLight::Uniform, "{name} falls through to Uniform");
+        }
+        assert_eq!(scene_light_for("Reading Room"), SceneLight::LampFlicker);
+        assert_eq!(scene_light_for("Treehouse"), SceneLight::HighCanopy);
+    }
+
+    #[test]
+    fn every_mechanism_keeps_the_legibility_floor_and_moves_with_time() {
+        let all = [SceneLight::DappledCanopy, SceneLight::FacetedPearl, SceneLight::RisingMotes, SceneLight::MembraneRipple,
+                   SceneLight::CrystalGlint, SceneLight::RainbowRefraction, SceneLight::HighCanopy, SceneLight::CloudGaps,
+                   SceneLight::WindowPanes, SceneLight::LampFlicker, SceneLight::RakingLight, SceneLight::NeonBuzz,
+                   SceneLight::SandstoneShimmer, SceneLight::CanopyShafts, SceneLight::BrickChase];
+        for light in all {
+            let mut lo = f32::MAX; let mut hi = f32::MIN;
+            let mut varies = false;
+            for seed in [1u32, 77, 9001] {
+                for gy in 0..6 {
+                    for gx in 0..40 {
+                        let mut first: Option<f32> = None;
+                        for k in 0..60 {
+                            let t = k as f32 * 0.13;
+                            let (b, h) = modulate_dot(light, gx as f32, gy as f32, seed, t);
+                            assert!(b.is_finite() && h.is_finite(), "{light:?} produced a NaN");
+                            // 0.3 is the floor the weakest existing scene (Mistfall's motes) already uses.
+                            assert!((0.3..=1.0).contains(&b), "{light:?} brightness {b} at ({gx},{gy},{t})");
+                            assert!((-60.0..=360.0).contains(&h), "{light:?} hue {h}");
+                            lo = lo.min(b); hi = hi.max(b);
+                            // brightness OR hue: the bifrost's brightness is steady by design, its colour moves.
+                            match first { None => first = Some(b + h * 0.01), Some(f) => if (f - (b + h * 0.01)).abs() > 0.02 { varies = true } }
+                        }
+                    }
+                }
+            }
+            assert!(varies, "{light:?} never changes with time");
+            if light != SceneLight::RainbowRefraction { // its life is in hue, asserted above
+                assert!(hi - lo >= 0.15, "{light:?} spans only {lo}..{hi}: not visibly alive");
+            }
+            // determinism: the same inputs give the same light
+            assert_eq!(modulate_dot(light, 3.0, 2.0, 5, 1.25), modulate_dot(light, 3.0, 2.0, 5, 1.25));
+        }
+    }
+
+    #[test]
+    fn the_shared_flame_and_the_grid_shadow_behave_as_described() {
+        // Lamp: two dots under one lamp breathe together (shared flame dominates).
+        let a = |t: f32| lamp_flicker(2.0, 1.0, 4, t).0;
+        let b = |t: f32| lamp_flicker(30.0, 4.0, 4, t).0;
+        let mut agree = 0;
+        for k in 0..40 { let t = k as f32 * 0.11; if ((a(t) - a(t + 0.2)) * (b(t) - b(t + 0.2))) >= 0.0 { agree += 1; } }
+        assert!(agree >= 30, "lamp dots move together {agree}/40");
+        // Panes: a mullion is darker than the glass beside it, at the same instant.
+        let g = |gx: f32| window_panes(gx, 1.0, 0, 0.0);
+        let (mut dark, mut bright) = (f32::MAX, f32::MIN);
+        for i in 0..14 { let v = g(i as f32 * 0.5); dark = dark.min(v); bright = bright.max(v); }
+        assert!(bright - dark > 0.25, "no grid: {dark}..{bright}");
+        // Chase: the flare moves right over time — the brightest brick's index rises.
+        let brightest = |t: f32| (0..10).max_by(|&i, &j| brick_chase(i as f32, 0.0, 0, t).partial_cmp(&brick_chase(j as f32, 0.0, 0, t)).unwrap()).unwrap();
+        let (b0, b1) = (brightest(0.0), brightest(0.5));
+        assert_eq!((b1 as i32 - b0 as i32).rem_euclid(10), 2, "four bricks a second: two bricks in half a second ({b0}→{b1})");
+        // Value noise is continuous: neighbours differ little.
+        assert!((value_noise((3.25, 1.5), 1) - value_noise((3.3, 1.5), 1)).abs() < 0.1);
+    }
+
 }
