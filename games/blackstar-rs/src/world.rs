@@ -4683,18 +4683,18 @@ impl World {
             let t = best.0 / n.r.max(0.01);
             let w = ((1.5 - t) / 0.75).clamp(0.0, 1.0);
             g = amb + (n.g - amb) * w;
-            // INSIDE A TUBE the pull is strongest at the AXIS and eases off
-            // as you reach the wall. A flat pull cannot satisfy both ends:
-            // weak enough not to pin you to the bore (which is what it felt
-            // like) is too weak to plant you in the first place, so a car
-            // flung into a wide pipe simply flew up the middle at constant
-            // speed, never touching anything, until a bend lost it. This
-            // shape plants you quickly and then lets go.
+            // INSIDE A TUBE, spin gravity is `a = ω²r`: ZERO on the axis,
+            // maximum at the wall — the engine used to have this backwards
+            // (see `gravity.rs`'s `true_tube` doc for the full history: a
+            // car flung into a wide pipe correctly flew weightless up the
+            // middle, and that was read as the bug, so the "fix" made the
+            // axis the strongest point instead, which is why it pinned
+            // riders outward at 1.7x). `true_tube` is the tested correct
+            // shape; the 0.50/0.95 envelope is kept as-is so this fixes the
+            // DIRECTION without also relitigating the overall strength.
             if n.tube {
-                let axis_frac = (best.0 / (n.r / 1.45).max(0.01)).clamp(0.0, 1.0);
-                // still strongest at the axis so a car entering a wide bore
-                // gets planted, but the peak comes down: at 1.7x it pinned
-                g *= 0.50 + 0.95 * (1.0 - axis_frac);
+                let wall_frac = crate::gravity::true_tube(best.0, n.r / 1.45);
+                g *= 0.50 + 0.95 * wall_frac;
             }
             // a collapsing node hauls on everything in reach
             if let Some((bi, _)) = self.bh {
