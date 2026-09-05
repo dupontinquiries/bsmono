@@ -4835,7 +4835,7 @@ fn alley() -> Scene {
 /// meant to surface, built from the scene's OWN materials instead of a floating window. This is the START of the
 /// physical-UI concept (the frame, stand, material, and a few content "lines" per scene); wiring live node text
 /// onto the surface is future work. style: 0 wood board · 1 stone tablet · 2 glass pane · 3 marble plaque.
-fn physical_ui_panel(s: &mut Scene, style: u32, pos: Vec3, face: f32, w: f32, h: f32, floating: bool, seed: u32, rows: &[crate::panel_rows::Row]) {
+fn physical_ui_panel(s: &mut Scene, style: u32, pos: Vec3, face: f32, w: f32, h: f32, floating: bool, seed: u32, rows: &[crate::panel_rows::Row], light: scene_kit::mesh3d::SceneLight) {
     let right = v(-face.sin(), 0.0, face.cos());
     let up = v(0.0, 1.0, 0.0);
     let n = v(face.cos(), 0.0, face.sin()); // surface faces `face`
@@ -4891,7 +4891,16 @@ fn physical_ui_panel(s: &mut Scene, style: u32, pos: Vec3, face: f32, w: f32, h:
         let mut back = m3::panel(center, right, up, lw + 0.05, lh + 0.03, card_back); back.mat = M::PAPER; back.emissive = emiss * 0.3; s.add(back, Float::STILL);
         let face_col = if row.accent { mix_rgb(ink, c(0xff, 0xe2, 0xac), 0.5) } else { ink };
         let mut line = m3::panel(addv(center, mulv(n, 0.01)), right, up, lw, lh * 0.6, face_col);
-        line.mat = M::PAPER; line.emissive = emiss * if row.accent { 1.3 } else { 0.6 }; s.add(line, Float::STILL);
+        // THE ROOM LIGHTS THE BOARD. `emissive` was one constant per
+        // material, so a card under a canopy shaft was lit exactly like one
+        // in shade and the panel read as a sticker on the world. The glow
+        // now comes from the same mechanism that drives the graph's dots —
+        // the board is in the same room, so it answers the same question.
+        // Baked, not animated: these meshes are STILL.
+        let glow = crate::panel_rows::row_glow(light, li, rows.len(), seed, 0.0);
+        line.mat = M::PAPER;
+        line.emissive = emiss * glow * if row.accent { 1.3 } else { 0.6 };
+        s.add(line, Float::STILL);
     }
     // a small "active" node bead in the corner (the selection marker), warm/glowing
     let mut bead = m3::uv_sphere(addv(ctr, addv(mulv(up, h * 0.34), mulv(right, -w * 0.42))), 0.1, 8, 6, c(0xff, 0xcf, 0x86));
@@ -5924,7 +5933,8 @@ fn build(palette_name: &str) -> Scene {
         let pz = ep.ext_z as f32 * 0.5 + 3.0;
         let face = (-pz).atan2(-px); // face back toward the graph at the origin
         physical_ui_panel(&mut s, ui_style, v(px, ui_floor, pz), face, 3.4, 2.1, floating, 0x5151,
-                          &crate::panel_rows::placeholder());
+                          &crate::panel_rows::placeholder(),
+                          scene_kit::mesh3d::scene_light_for(palette_name));
     }
     // Atlantis is SELF-ENCLOSING (its own ribbed glass dome + perimeter wall + open ocean beyond), so it does
     // NOT get the generic outer room — that second shell was the "giant structure" dominating every overview.

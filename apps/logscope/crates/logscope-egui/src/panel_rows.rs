@@ -92,12 +92,66 @@ pub fn placeholder() -> Vec<Row> {
     ]
 }
 
+
+/// How brightly a row's card catches the room's light.
+///
+/// The board's `emissive` was one constant per material, so a card under a
+/// canopy shaft was lit exactly like one in the shade and the panel read as
+/// a sticker on the world rather than an object in it. `scene-kit`'s
+/// `modulate_dot` already answers "how bright is this spot, in this scene's
+/// physical process" — it drives the graph's dots — and the board is in the
+/// same room, so it should be asking the same question.
+///
+/// Sampled at `t` and BAKED: `physical_ui_panel` builds static meshes, so
+/// this gives spatial variation across the board, not animation. Making it
+/// breathe needs the renderer to re-evaluate emissive per frame, which is a
+/// different change; the mechanism is per-scene either way.
+///
+/// The returned multiplier keeps `modulate_dot`'s legibility floor — these
+/// make the panel feel lit, never unreadable.
+pub fn row_glow(light: scene_kit::mesh3d::SceneLight, index: usize, of: usize, seed: u32, t: f32) -> f32 {
+    // GRID CELLS, not a 0..1 fraction. The mechanisms `floor()` their
+    // coordinates — `dappled_canopy` hashes `(gx * 1.3).floor()` — so
+    // normalised inputs all land in cell zero and every row comes back
+    // identical. My first version did exactly that and the test caught it:
+    // five rows, one value, 0.827 each.
+    //
+    // Rows step a whole cell down the board, and stride across it too, so a
+    // mechanism with horizontal structure (BrickChase, RakingLight) varies
+    // between rows rather than hitting them all the same.
+    let _ = of;
+    let gy = index as f32;
+    let gx = index as f32 * 1.7;
+    scene_kit::mesh3d::modulate_dot(light, gx, gy, seed, t).0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn items(v: &[(&str, bool)]) -> Vec<(String, bool)> {
         v.iter().map(|(s, a)| ((*s).to_string(), *a)).collect()
+    }
+
+    #[test]
+    fn a_lit_room_varies_the_cards_and_never_puts_one_out() {
+        use scene_kit::mesh3d::{scene_light_for, SceneLight};
+        // A mechanism with real structure lights the rows differently...
+        let dappled = scene_light_for("Canopy");
+        assert_ne!(dappled, SceneLight::Uniform, "Canopy has a mechanism");
+        let g: Vec<f32> = (0..5).map(|i| row_glow(dappled, i, 5, 7, 0.0)).collect();
+        assert!(g.windows(2).any(|w| (w[0] - w[1]).abs() > 1e-3), "{g:?}");
+        // ...but never darkens one past reading, in any scene, anywhere on
+        // the board. This is the property the panel depends on.
+        for name in scene_kit::mesh3d::SCENE_NAMES {
+            let l = scene_light_for(name);
+            for i in 0..MAX_ROWS {
+                let v = row_glow(l, i, MAX_ROWS, 3, 0.0);
+                assert!(v > 0.0 && v.is_finite(), "{name} row {i} = {v}");
+            }
+        }
+        // Deterministic: the same board builds the same way twice.
+        assert_eq!(row_glow(dappled, 2, 5, 7, 0.0), row_glow(dappled, 2, 5, 7, 0.0));
     }
 
     #[test]
