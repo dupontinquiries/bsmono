@@ -574,6 +574,7 @@ dependencies = [
  "d2x-wgpu",
  "eframe",
  "egui",
+ "libc",
  "snapclone-theme",
  "uikit-egui",
 ]

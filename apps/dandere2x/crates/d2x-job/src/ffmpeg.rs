@@ -46,6 +46,25 @@ fn parse_rate(s: &str) -> Option<(u32, u32)> {
     }
 }
 
+
+/// `-threads` for a spawned ffmpeg, from the courtesy policy.
+///
+/// ffmpeg defaults to every core and is the loudest neighbour in this
+/// pipeline — a job that carefully caps its own workers and then lets
+/// ffmpeg help itself has capped nothing. Read from `D2X_POLITENESS`
+/// (`background` / `balanced` / `foreground`) so it can be changed without
+/// a rebuild; balanced by default, which leaves one core for the desktop.
+fn courtesy_threads() -> String {
+    use d2x_core::courtesy::{ffmpeg_threads, Politeness};
+    let p = match std::env::var("D2X_POLITENESS").ok().as_deref() {
+        Some("background") => Politeness::Background,
+        Some("foreground") => Politeness::Foreground,
+        _ => Politeness::Balanced,
+    };
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    ffmpeg_threads(cores, p).to_string()
+}
+
 pub fn probe(path: &Path) -> anyhow::Result<Probe> {
     let out = Command::new("ffprobe")
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,pix_fmt,codec_name,color_primaries,color_transfer,color_space,color_range:format=duration", "-of", "json"])
@@ -173,6 +192,7 @@ impl FfmpegSource {
         }
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+        cmd.args(["-threads", &courtesy_threads()]);
         if seg.start > 0.0 {
             cmd.args(["-ss", &format!("{:.6}", seg.start)]);
         }
@@ -273,6 +293,7 @@ impl FfmpegSink {
         let size = format!("{width}x{height}");
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+        cmd.args(["-threads", &courtesy_threads()]);
         cmd.args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &size, "-r", &fps, "-i", "-"]);
         if let Some(src) = src {
             cmd.arg("-i").arg(src);

@@ -28,3 +28,9 @@ snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme", op
 default = ["gpu", "app"]
 gpu = ["dep:d2x-wgpu", "d2x-job/gpu"]
 app = ["dep:egui", "dep:eframe", "dep:uikit-egui", "dep:snapclone-theme"]
+
+# setpriority for the job thread, so a long upscale does not stutter the
+# desktop — see the courtesy comment in app.rs. Linux-only: lowering
+# priority needs no privileges, and elsewhere the job just runs as before.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

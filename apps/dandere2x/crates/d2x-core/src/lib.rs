@@ -19,6 +19,7 @@
 //! Video I/O (ffmpeg), the wgpu backend, and any UI live in other crates and
 //! only ever see these traits.
 
+pub mod courtesy;
 pub mod batch;
 pub mod blockcache;
 pub mod budget;

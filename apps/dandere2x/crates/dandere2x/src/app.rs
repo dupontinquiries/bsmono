@@ -512,7 +512,34 @@ impl Shell {
         self.running = true;
         let stop = self.stop.clone();
         self.push_log(LogLevel::Info, format!("{} {}", if analyze_only { "analyzing" } else { "upscaling" }, job.input.display()));
-        std::thread::Builder::new().name("d2x-job".into()).spawn(move || run_job(job, analyze_only, tx, stop)).expect("spawn job thread");
+        std::thread::Builder::new().name("d2x-job".into()).spawn(move || {
+            // BE A GOOD NEIGHBOUR. An upscale runs for minutes and will take
+            // every cycle it is given; on the machine someone is also using,
+            // that is why the pointer stutters. `nice` on the worker thread
+            // (Linux applies it per-thread, which is what we want — the UI
+            // thread keeps its priority) costs nothing when the machine is
+            // idle and yields immediately when it is not.
+            //
+            // Best-effort: lowering priority never needs privileges, so the
+            // only failure mode is a platform without setpriority, where the
+            // job simply runs as before.
+            #[cfg(target_os = "linux")]
+            {
+                use d2x_core::courtesy::{nice_value, Politeness};
+                let p = match std::env::var("D2X_POLITENESS").ok().as_deref() {
+                    Some("background") => Politeness::Background,
+                    Some("foreground") => Politeness::Foreground,
+                    _ => Politeness::Balanced,
+                };
+                let n = nice_value(p);
+                if n != 0 {
+                    // SAFETY: setpriority on the calling thread (PRIO_PROCESS
+                    // with who=0 is the caller) with an in-range value.
+                    unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, n); }
+                }
+            }
+            run_job(job, analyze_only, tx, stop)
+        }).expect("spawn job thread");
     }
 
     fn drain(&mut self, ctx: &egui::Context) {
