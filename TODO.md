@@ -972,7 +972,9 @@ asked as a question.
 - [ ] **aperture: command palette and sizing.** REPORTED, not investigated.
   `uikit_egui::command_bar` (new this session) is the intended answer —
   aperture is a second consumer for it, alongside snapclone.
-- [ ] **dandere2x launches the CLI from gitmind, not the GUI.** REPORTED.
+- [x] **dandere2x launches the CLI from gitmind, not the GUI.** FIXED
+  2026-09-05. The subcommand was REQUIRED, so a launcher running the bare
+  binary got clap's usage text and dandere2x looked CLI-only.
   The binary is CLI-first with the GUI behind the `app` subcommand
   (`Cmd::App` in `crates/dandere2x/src/main.rs`) — so a launcher invoking
   the bare binary gets the CLI usage text. Whatever gitmind's app catalog

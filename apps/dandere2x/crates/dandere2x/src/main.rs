@@ -17,8 +17,25 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "dandere2x", version, about)]
 struct Cli {
+    /// OPTIONAL. A bare `dandere2x` with a display present opens the GUI —
+    /// see `wants_gui`. It was required, so a launcher (gitmind's app
+    /// catalog among them) that ran the binary with no arguments got the
+    /// clap usage text and looked like a broken CLI-only tool.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
+}
+
+/// Does a bare invocation mean "open the GUI"?
+///
+/// Only when a display is actually there. On a headless box — CI, a build
+/// server, an ssh session — the right answer to `dandere2x` with no
+/// arguments is still the usage text, because opening a window is either
+/// impossible or is about to fail in a less obvious way.
+///
+/// Takes the environment rather than reading it, so the rule is testable.
+fn wants_gui(display: Option<&str>, wayland: Option<&str>) -> bool {
+    let set = |v: Option<&str>| v.is_some_and(|s| !s.trim().is_empty());
+    set(display) || set(wayland)
 }
 
 #[derive(clap::Args, Clone)]
@@ -366,7 +383,25 @@ fn print_event(e: &Event) {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    match cli.cmd {
+    let Some(cmd) = cli.cmd else {
+        // No subcommand. With a display, that means the app; without one it
+        // means somebody typed the bare name and wants to know the options.
+        // Feature-gated: a `--no-default-features` build has no GUI at all,
+        // and must still print help rather than fail to compile. Caught by
+        // checking that build, not by reading.
+        #[cfg(feature = "app")]
+        if wants_gui(
+            std::env::var("DISPLAY").ok().as_deref(),
+            std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        ) {
+            return app::run();
+        }
+        use clap::CommandFactory;
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+    match cmd {
         Cmd::Upscale { input, output, common, codec, crf, preset, eight_bit, jobs, start, end, resume, keep_parts } => {
             let mut job = job_from(&common, input, output)?;
             job.jobs = jobs;
@@ -540,4 +575,24 @@ fn main() -> anyhow::Result<()> {
         Cmd::App => app::run()?,
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::wants_gui;
+
+    #[test]
+    fn a_bare_launch_opens_the_gui_only_when_a_display_exists() {
+        assert!(wants_gui(Some(":0"), None), "X11");
+        assert!(wants_gui(None, Some("wayland-0")), "wayland");
+        assert!(wants_gui(Some(":0"), Some("wayland-0")));
+        // Headless: CI, a build server, an ssh session without forwarding.
+        // The usage text is the right answer there, not a failed window.
+        assert!(!wants_gui(None, None));
+        // An empty or whitespace variable is not a display — this is how a
+        // stripped systemd or container environment presents, and treating
+        // it as one turns a clear help message into an opaque crash.
+        assert!(!wants_gui(Some(""), Some("")));
+        assert!(!wants_gui(Some("   "), None));
+    }
 }
