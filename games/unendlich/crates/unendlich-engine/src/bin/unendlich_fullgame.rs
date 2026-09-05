@@ -4368,9 +4368,26 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             // anything else honours $UNENDLICH_BUILD_PROVIDER
                             // and falls back to the fixture so a first run
                             // never silently does nothing.
+                            // Which script runs, and SAY SO. Without this,
+                            // a plain `/build a castle` with no env var set
+                            // fell back to fixture.sh and returned the same
+                            // canned tower -- you would conclude the model
+                            // worked when it was never called.
                             let debug = prose.trim_start().starts_with("debug");
+                            let script = if debug {
+                                "fixture.sh"
+                            } else if paintbrush.models.state.is_ready() {
+                                "llama-cli.sh"
+                            } else {
+                                "fixture.sh"
+                            };
+                            if !debug && script == "fixture.sh" {
+                                paintbrush.say(
+                                    "no model loaded -- running the FIXTURE, not a model. \
+                                     /model <name> first, or set UNENDLICH_BUILD_PROVIDER.");
+                            }
                             match unendlich_engine::voxel_chat::find_provider(
-                                "fixture.sh", !debug)
+                                script, !debug)
                             {
                                 // A missing provider is reported and that is
                                 // the end of the turn -- no sentinel flag, no
@@ -4379,6 +4396,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 Ok(argv) => {
                                     let (sys, user) = paintbrush
                                         .prompt_for(&chunk_manager, &gaze, None, &prose);
+                                    // An 8B on CPU can take half a minute and
+                                    // this call blocks the frame. Say so
+                                    // before the window stops responding,
+                                    // rather than after.
+                                    log::info!("[paintbrush] provider {:?}, prompt {} + {} chars",
+                                               argv, sys.len(), user.len());
+                                    paintbrush.say(format!(
+                                        "asking {} ... (the window will freeze until it answers)",
+                                        std::path::Path::new(&argv[0])
+                                            .file_name().map(|s| s.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| argv[0].clone())));
                                     // Blocking. A local 7B takes a second or
                                     // two and this stalls the frame; the
                                     // worker-thread version is the obvious
