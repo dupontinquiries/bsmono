@@ -4488,6 +4488,21 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // Blocks deferred by an earlier flush place themselves once
             // their chunk streams in.
             paintbrush.retry_deferred(&chunk_manager);
+            // THE QUEEN'S FRAME. Committed changes are applied here, a
+            // chunk at a time, within a budget that adapts to how long
+            // the last frame took. Nearest the player first; what you
+            // can see fills first. A frame already over target gets
+            // nothing, so generation never becomes a stutter.
+            {
+                let p = local_player.view.position;
+                let f = local_player.view.forward();
+                let t = paintbrush.tick_hive(&chunk_manager, [p.x, p.y, p.z], [f.x, f.y, f.z],
+                                             frame_dt_s * 1000.0, glfw.get_time());
+                if t.cells > 0 {
+                    log::debug!("[hive] {} cells, {} blocks, {:.2} ms, {} left",
+                                t.cells, t.blocks, t.spent_ms, t.remaining);
+                }
+            }
             if let Some(t) = &paintbrush.in_flight {
                 renderer.chat_focus_hint = Some(format!(
                     "asking {} ... {:.0}s", t.provider, t.elapsed().as_secs_f32()));

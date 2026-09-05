@@ -99,6 +99,8 @@ pub mod brush;
 pub mod layer;
 /// Feature FSMs: rivers and other linear landforms as state machines.
 pub mod feature;
+/// The hive: frame-sovereign scheduling of generation in chunk-sized cells.
+pub mod hive;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.

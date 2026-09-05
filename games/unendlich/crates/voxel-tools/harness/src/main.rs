@@ -13,6 +13,7 @@ fn main() {
     focus_scenario();
     async_scenario();
     macro_scenario();
+    hive_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -316,4 +317,67 @@ fn macro_scenario() {
         println!("  {rung:8} {} -> {}", planned.unwrap_or_default().trim(),
                  built.unwrap_or_default().trim());
     }
+}
+
+/// The hive: a big commit goes to the comb, the queen applies it within
+/// her budget, and a slow frame gets nothing.
+fn hive_scenario() {
+    use paintbrush::{Paintbrush, Pending};
+    use voxel_tools::chatbox::Key;
+    println!("\n==== hive");
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    let fixture = std::fs::canonicalize(concat!(env!("CARGO_MANIFEST_DIR"), "/../providers/fixture.sh"))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "/home/claude/bundle/voxel/providers/fixture.sh".into());
+    pb.provider = paintbrush::ProviderChoice::Script(vec![fixture]);
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0],
+                                     Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    let mut line = |pb: &mut Paintbrush, l: &str| -> Option<stubs::Command> {
+        pb.key(Key::Enter); for c in l.chars() { pb.key(Key::Char(c)); } pb.key(Key::Enter)
+    };
+    // a big landscape plan, straight in as IR (no model)
+    let ir = "brush raise @0,0 by=20 r=60 hill\nlayer boreal @-50,-50 @50,50 density=0.6\n";
+    {
+        let view = bind::WorldView(&cm);
+        let mut staged = voxel_tools::staged::StagedWorld::new(&view);
+        let mut tools = voxel_tools::VoxelTools::new(&mut staged);
+        let r = pb.session.receive_plan_for(&mut tools, &gaze, ir, None);
+        pb.push(r);
+    }
+    let planned = pb.drain_log().iter().find(|l| l.contains("blocks planned")).cloned().unwrap_or_default();
+    println!("  {}", planned.trim());
+    let cmd = line(&mut pb, "/commit").unwrap();
+    pb.dispatch(&cm, &gaze, cmd);
+    let after = pb.drain_log();
+    let queued = after.iter().find(|l| l.contains("chunks queued")).cloned().unwrap_or_default();
+    println!("  commit -> {}", queued.trim());
+    assert!(!queued.is_empty(), "a large commit must go to the comb: {after:?}");
+    let before_world = cm.block_count();
+    println!("  blocks in world right after commit: {before_world} (nothing applied yet)");
+
+    // frames: fast ones apply cells; a slow one hibernates
+    let mut now = 0.0;
+    let mut applied_frames = 0;
+    let mut total_cells = 0;
+    for frame in 0..400 {
+        let slow = frame % 50 == 25;
+        let dt = if slow { 40.0 } else { 8.0 };
+        let t = pb.tick_hive(&cm, [0.0, 70.0, -12.0], [0.0, -0.35, 1.0], dt, now);
+        now += dt as f64 / 1000.0;
+        if slow { assert!(t.hibernated || t.cells == 0, "a 40 ms frame must get nothing"); }
+        if t.cells > 0 { applied_frames += 1; total_cells += t.cells; }
+        assert!(t.spent_ms <= pb.queen.budget.max_ms + pb.queen.budget.cell_cost_ms * 2.0 + 1.0,
+                "frame {frame}: spent {:.2} ms against max {:.2}", t.spent_ms, pb.queen.budget.max_ms);
+        if pb.comb.is_empty() { println!("  drained after {} frames", frame + 1); break; }
+        if frame == 3 {
+            let cmd = line(&mut pb, "/hive").unwrap();
+            pb.dispatch(&cm, &gaze, cmd);
+            for l in pb.drain_log() { println!("  /hive: {l}"); }
+        }
+    }
+    println!("  {total_cells} cells over {applied_frames} frames; world now has {} blocks",
+             cm.block_count());
+    assert!(cm.block_count() > before_world + 10_000, "the landscape actually arrived");
+    assert!(applied_frames > 5, "spread over many frames, not one");
 }

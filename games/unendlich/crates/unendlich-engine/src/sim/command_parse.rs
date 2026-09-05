@@ -142,6 +142,8 @@ pub enum Command {
     Cancel,
     /// `/repair` — ask the model to fix only the lines it got wrong.
     Repair,
+    /// `/hive` — what the background builder is doing and how fast.
+    Hive,
     /// `/refine [rung|all]` — small detail passes over the last build.
     /// No argument lists them.
     Refine(Option<String>),
@@ -270,6 +272,7 @@ pub fn parse(line: &str) -> Command {
         "/keys" => if args.is_empty() { Command::Keys } else { Command::Unknown },
         "/cancel" => if args.is_empty() { Command::Cancel } else { Command::Unknown },
         "/repair" => if args.is_empty() { Command::Repair } else { Command::Unknown },
+        "/hive" => if args.is_empty() { Command::Hive } else { Command::Unknown },
         "/refine" => match args.as_slice() {
             [] => Command::Refine(None),
             [r] => Command::Refine(Some(r.to_ascii_lowercase())),
@@ -446,6 +449,7 @@ impl Command {
             Command::Keys => Some("/keys".to_string()),
             Command::Cancel => Some("/cancel".to_string()),
             Command::Repair => Some("/repair".to_string()),
+            Command::Hive => Some("/hive".to_string()),
             Command::Refine(None) => Some("/refine".to_string()),
             Command::Refine(Some(r)) => Some(format!("/refine {r}")),
             Command::Deferred { drop: false } => Some("/deferred".to_string()),

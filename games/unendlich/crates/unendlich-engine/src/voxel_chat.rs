@@ -350,6 +350,18 @@ pub struct Paintbrush {
     pub provider: ProviderChoice,
     /// Claims, ownership and build history; saved with the world.
     pub land: voxel_tools::land::Registry,
+    /// THE HIVE. Every committed change is sharded into chunk-sized
+    /// cells and applied by the queen within the frame's budget, nearest
+    /// the player first. A 200,000-block commit used to be one flush and
+    /// one remesh of every touched chunk inside a single frame.
+    pub comb: voxel_tools::hive::Comb,
+    pub queen: voxel_tools::hive::Queen,
+    next_job: u32,
+    /// Last frame's total time, fed to the queen so she adapts.
+    pub last_frame_ms: f32,
+    /// Where the player was last frame, for the comb's priorities and
+    /// for noticing when they have moved enough to re-sort.
+    obs_cache: Option<voxel_tools::hive::Observer>,
     /// The resident in-instance engine, if one has been loaded.
     #[cfg(feature = "ai-engine")]
     pub engine: ResidentEngine,
@@ -397,6 +409,11 @@ impl Paintbrush {
             engine: ResidentEngine::default(),
             in_flight: None,
             land: voxel_tools::land::Registry::new(),
+            comb: voxel_tools::hive::Comb::new(chunk_size),
+            queen: voxel_tools::hive::Queen::new(voxel_tools::hive::Budget::default()),
+            next_job: 1,
+            last_frame_ms: 16.0,
+            obs_cache: None,
             ctx_tokens: 8192,
             max_reply: 512,
         }
@@ -634,6 +651,17 @@ impl Paintbrush {
                         Pending::Repair
                     }
                 }
+            }
+            Command::Hive => {
+                if self.comb.is_empty() {
+                    self.say(format!("hive idle; budget {:.1} ms/frame, a cell costs ~{:.2} ms here",
+                                     self.queen.budget.ms, self.queen.budget.cell_cost_ms));
+                } else {
+                    for line in self.comb.dance(self.queen.rate()) { self.say(line); }
+                    self.say(format!("{} chunks waiting; {:.1} ms/frame budget, {:.0} chunks/s",
+                                     self.comb.len(), self.queen.budget.ms, self.queen.rate()));
+                }
+                Pending::None
             }
             Command::Deferred { drop } => {
                 if drop {
@@ -951,6 +979,26 @@ impl Paintbrush {
 
     fn flush_staged(&mut self, cm: &ChunkManager, staged: &mut StagedWorld<'_, WorldView<'_>>) {
         if staged.pending() == 0 { return; }
+        // Small edits go straight in: sharding forty blocks is overhead
+        // for nothing, and the player expects a door to appear NOW.
+        // Anything larger is offered to the comb and the queen applies it
+        // over the coming frames within her budget.
+        const IMMEDIATE: usize = 4_000;
+        if staged.pending() > IMMEDIATE {
+            let changes = staged.snapshot();
+            let name = self.session.last_build.as_ref().map(|b| b.name.clone())
+                .unwrap_or_else(|| "build".into());
+            let job = self.next_job; self.next_job += 1;
+            let cells = voxel_tools::hive::shard(changes, self.chunk_size, job);
+            let n = cells.len();
+            let obs = self.observer();
+            self.comb.offer(&name, cells, &obs);
+            staged.clear();
+            self.say(format!("{n} chunks queued; filling nearest-first without dropping frames \
+                              (/hive for progress)"));
+            log::info!("[hive] job {job} '{name}': {n} cells offered");
+            return;
+        }
         // Snapshot the cells BEFORE draining: a skipped cell has to be
         // remembered with its target block, or it is gone.
         let snapshot: Vec<voxel_tools::weather::Change> = staged.snapshot();
@@ -969,6 +1017,45 @@ impl Paintbrush {
                               (they place themselves when you go there; /deferred to see)"));
         }
         let _ = applied;
+    }
+
+    fn observer(&self) -> voxel_tools::hive::Observer {
+        self.obs_cache.unwrap_or(voxel_tools::hive::Observer {
+            pos: [0.0, 64.0, 0.0], look: [1.0, 0.0, 0.0] })
+    }
+
+    /// The queen's frame. Call once per frame AFTER the renderer has
+    /// been given its frame time, so she adapts to headroom and never
+    /// runs past it. Applies as many cells as fit, nearest first.
+    pub fn tick_hive(&mut self, cm: &ChunkManager, eye: [f32; 3], look: [f32; 3],
+                     last_frame_ms: f32, now: f64) -> voxel_tools::hive::Tick {
+        let obs = voxel_tools::hive::Observer { pos: eye, look };
+        // The SWARM: re-sort when the player has moved a chunk or so.
+        let moved = self.obs_cache.map(|o| {
+            let d = [o.pos[0] - eye[0], o.pos[1] - eye[1], o.pos[2] - eye[2]];
+            d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 24.0 * 24.0
+        }).unwrap_or(true);
+        if moved && !self.comb.is_empty() { self.comb.swarm(&obs); }
+        self.obs_cache = Some(obs);
+        self.last_frame_ms = last_frame_ms;
+        if self.comb.is_empty() { return voxel_tools::hive::Tick::default(); }
+        let cs = self.chunk_size;
+        let mut deferred: Vec<voxel_tools::weather::Change> = Vec::new();
+        let t = self.queen.tick(&mut self.comb, last_frame_ms, now, |cell| {
+            let t0 = std::time::Instant::now();
+            let edits: Vec<(i32, i32, i32, crate::world::blocks::BlockId)> = cell.changes.iter()
+                .map(|c| (c.at.0, c.at.1, c.at.2, crate::voxel_bind::block_from_u16(c.to)))
+                .collect();
+            let (_applied, skipped) = cm.set_blocks(&edits);
+            if skipped > 0 {
+                deferred.extend(cell.changes.iter()
+                    .filter(|c| !cm.is_loaded_at(c.at.0, c.at.1, c.at.2)).cloned());
+            }
+            let _ = cs;
+            t0.elapsed()
+        });
+        if !deferred.is_empty() { self.session.deferred.cells.extend(deferred); }
+        t
     }
 
     /// Retry deferred cells whose chunk has since loaded. Called every
@@ -1036,7 +1123,9 @@ impl Paintbrush {
         (std::mem::take(&mut self.reveal), self.reveal_fps)
     }
 
-    fn push(&mut self, r: Reply) {
+    /// Route a session reply into the log and pending state. Public so
+    /// the harness can drive the paintbrush with hand-written IR.
+    pub fn push(&mut self, r: Reply) {
         match r {
             Reply::Say(m) => self.log.push(m),
             Reply::Preview { echo, blocks, .. } => {

@@ -66,6 +66,11 @@ impl<'w, W: VoxelWorld> StagedWorld<'w, W> {
         out
     }
 
+    /// Drop every staged write without applying it. The hive path takes
+    /// a snapshot and owns the changes from then on; leaving them here
+    /// would apply them a second time on the next flush.
+    pub fn clear(&mut self) { self.edits.clear(); }
+
     /// Every staged write, without consuming them. The flush path uses
     /// this to remember what a partial flush could not place.
     pub fn snapshot(&self) -> Vec<crate::weather::Change> {
