@@ -965,6 +965,40 @@ asked as a question.
   NEW FEATURE. eframe surfaces dropped files via `ctx.input(|i| &i.raw.dropped_files)`;
   the confirmation matters because a drop replaces the input path and the
   previous one is not recoverable from the UI.
+- [ ] **logscope scenes: ground and leaf textures gone flat (reported with a
+  screenshot, 2026-09-05).** NOT REPRODUCED here — at HEAD under llvmpipe the
+  Canopy terrain still shows its texture, so this is environment-dependent
+  rather than a regression in the recent scene-kit commits (leaf LOD, the
+  label floor, textsurface names — none of which touch the material path).
+
+  TRACED TO A MECHANISM, though, and it is a plausible fit. `85ab9670`
+  ("auto-detect weak GPUs, default power down") made `theme::power_mode()`
+  fall back to `perf::suggested_power_for_renderer(GL_RENDERER)` when nothing
+  chose one. Low power then does TWO things that erase fine texture:
+
+  * `glow_scene.rs:126` renders the whole scene at that fraction of
+    resolution (cost goes as scale²) and upscales — quarter power means 25%,
+    which smears out exactly this kind of high-frequency ground/leaf detail.
+  * `theme::effective_variant()` CAPS the baked texture tier: `p <= 0.3`
+    clamps the variant to 3, `p <= 0.6` to 6, "regardless of the chosen
+    quality dial". So the texture arrays themselves are baked smaller.
+
+  Both are silent — nothing in the UI says the quality dial has been
+  overruled, which is why this reads as "the textures disappeared" rather
+  than "power saving is on".
+
+  FIRST THING TO TRY, one line: `LOGSCOPE_POWER=full` in the environment.
+  That branch (`theme.rs:330`) takes priority over the auto-detect entirely.
+  If the textures come back, the auto-detect is firing on that device and the
+  fix is either a better `suggested_power_for_renderer` arm for its
+  `GL_RENDERER` or making the override visible in the UI.
+
+  ALSO WORTH CAPTURING: the app logs its renderer at startup —
+  `[logscope] GL_VENDOR=... GL_RENDERER=...`. That string is what
+  `suggested_power_for_renderer` matches on, and the function'"'"'s own comment
+  says it grows "the next time a specific device is slow and its GL_RENDERER
+  string is in hand, not from a guess about silicon not yet measured". This
+  is that moment.
 - [ ] **beatspace: workspace on desktop vs tabs on mobile.** Started and
   REVERTED this session — a width-fraction panel was tried, looked at, and
   traded one clipping for another. The recipe is in commit `0ac14413`:
