@@ -107,6 +107,15 @@ pub fn find_provider(name: &str, allow_env: bool) -> Result<Vec<String>, String>
         tried.join("\n  ")))
 }
 
+/// Outcome of a keystroke: a command to dispatch, text for the
+/// clipboard, or nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyOut {
+    Command(Command),
+    Copy(String),
+    None,
+}
+
 pub struct Paintbrush {
     pub chatbox: ChatBox,
     pub session: ChatSession,
@@ -160,16 +169,39 @@ impl Paintbrush {
         }
     }
 
-    /// Feed a key. Returns the line to parse, if one was submitted, and
-    /// any immediate action (commit/undo/focus come straight from
-    /// hotkeys without going through the parser).
-    pub fn key(&mut self, k: Key) -> Option<Command> {
+    /// What a keystroke produced.
+    ///
+    /// `key()` could only return a Command, which cannot express "put
+    /// this on the clipboard" -- the box knows the text, but only the
+    /// window can set the clipboard. `key_full` is the complete form;
+    /// `key` stays for callers that only care about commands.
+    pub fn key_full(&mut self, k: Key) -> KeyOut {
         match self.chatbox.key(k) {
+            Action::Copy(text) => KeyOut::Copy(text),
+            other => match Self::action_to_command(other) {
+                Some(c) => KeyOut::Command(c),
+                None => KeyOut::None,
+            },
+        }
+    }
+
+    fn action_to_command(a: Action) -> Option<Command> {
+        match a {
             Action::Submit(line) => Some(crate::sim::command_parse::parse(&line)),
             Action::Commit => Some(Command::CommitPlan),
             Action::Undo => Some(Command::UndoBuild),
             Action::FocusBigger => Some(Command::Focus(Some(FocusAdjust::Bigger))),
             Action::FocusSmaller => Some(Command::Focus(Some(FocusAdjust::Smaller))),
+            _ => None,
+        }
+    }
+
+    /// Feed a key, keeping only a resulting command. Kept because most
+    /// callers do not care about the clipboard; `key_full` is the
+    /// complete form. One implementation, so the two cannot drift.
+    pub fn key(&mut self, k: Key) -> Option<Command> {
+        match self.key_full(k) {
+            KeyOut::Command(c) => Some(c),
             _ => None,
         }
     }
@@ -234,6 +266,12 @@ impl Paintbrush {
                 };
                 let r = self.session.set_profile(prof);
                 self.push(r);
+                Pending::None
+            }
+            Command::Keys => {
+                for c in voxel_tools::chatbox::CARDS {
+                    if c.command == "/keys" { self.say(c.summary.replace(" · ", "\n  ")); }
+                }
                 Pending::None
             }
             Command::Model(None) => {

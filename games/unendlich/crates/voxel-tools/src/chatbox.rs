@@ -14,7 +14,9 @@
 //! `/` and sees eight cards learns the whole vocabulary without a
 //! manual.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Not `Copy`: `Paste` carries the clipboard text. Callers pass keys
+/// by value, so this costs an allocation only on an actual paste.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Key {
     Enter, Escape, Tab, ShiftTab, Up, Down, Backspace,
     /// Ctrl+Enter: commit the pending plan without leaving the box.
@@ -22,6 +24,15 @@ pub enum Key {
     /// Ctrl+Z: undo the last build.
     CtrlZ,
     PageUp, PageDown,
+    /// Ctrl+V. The platform supplies the text; the box decides what a
+    /// paste MEANS in a single-line command field.
+    Paste(String),
+    /// Ctrl+C — copy the current line.
+    Copy,
+    /// Ctrl+Shift+C — copy the visible log, for pasting an error report.
+    CopyLog,
+    /// Ctrl+U — clear the line, the readline reflex.
+    ClearLine,
     Char(char),
 }
 
@@ -43,6 +54,8 @@ pub enum Action {
     FocusSmaller,
     /// Buffer changed; redraw.
     Edited,
+    /// Put this on the system clipboard.
+    Copy(String),
     Nothing,
 }
 
@@ -80,6 +93,11 @@ pub const CARDS: &[Card] = &[
            summary: "How builds reveal: rising walls, falling blocks, scattered, or all at once.",
            example: "/anim physics",
            arg_words: &["ground-up", "physics", "random", "instant"] },
+    Card { command: "/keys", signature: "/keys",
+           summary: "Enter chat · Tab complete · Up/Down history · Ctrl+V paste · \
+                     Ctrl+C copy line · Ctrl+Shift+C copy log · Ctrl+U clear · \
+                     Ctrl+Enter commit · Ctrl+Z undo · PgUp/PgDn focus",
+           example: "/keys", arg_words: &[] },
     Card { command: "/model", signature: "/model [name]",
            summary: "List models in ~/models, or load one. Tab completes; partial names work.",
            example: "/model qwen",
@@ -141,7 +159,14 @@ pub struct ChatBox {
     comp_pos: Option<usize>,
     /// Draft saved when the player starts browsing history.
     draft: String,
+    /// Copy of the visible log, so Ctrl+Shift+C can copy an error
+    /// report without the box reaching into the renderer.
+    pub log_snapshot: Vec<String>,
 }
+
+/// Cap on the input line. Long enough for any sensible build request,
+/// short enough that a mis-paste cannot become a huge prompt.
+pub const MAX_INPUT: usize = 2000;
 
 impl ChatBox {
     pub fn new() -> Self { Self::default() }
@@ -172,6 +197,16 @@ impl ChatBox {
                 Key::CtrlZ => Action::Undo,
                 Key::PageUp => Action::FocusBigger,
                 Key::PageDown => Action::FocusSmaller,
+                // Pasting with the box shut opens it and drops the text
+                // in -- otherwise the first Ctrl+V of a session is lost
+                // and it is not obvious why.
+                Key::Paste(text) => {
+                    self.open = true;
+                    self.buffer.clear();
+                    self.reset_cycle();
+                    return self.key(Key::Paste(text));
+                }
+                Key::CopyLog => Action::Copy(self.log_snapshot.join("\n")),
                 _ => Action::Nothing,
             };
         }
@@ -244,10 +279,40 @@ impl ChatBox {
                 }
             }
             Key::Backspace => { self.buffer.pop(); self.reset_cycle(); Action::Edited }
+            Key::Paste(text) => {
+                // A command line is one line. Pasted newlines become
+                // spaces rather than submitting a partial command or
+                // silently swallowing the rest -- someone pasting a
+                // two-line prose description should get both lines.
+                let flat: String = text.chars()
+                    .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+                    .collect();
+                // Cap it: a stray copy of a whole file should not become
+                // a 2 MB prompt sent to a model.
+                let room = MAX_INPUT.saturating_sub(self.buffer.chars().count());
+                if room == 0 { return Action::Nothing; }
+                let take: String = flat.trim().chars().take(room).collect();
+                if take.is_empty() { return Action::Nothing; }
+                self.buffer.push_str(&take);
+                self.reset_cycle();
+                Action::Edited
+            }
+            Key::Copy => {
+                if self.buffer.is_empty() { return Action::Nothing; }
+                Action::Copy(self.buffer.clone())
+            }
+            Key::CopyLog => Action::Copy(self.log_snapshot.join("\n")),
+            Key::ClearLine => {
+                if self.buffer.is_empty() { return Action::Nothing; }
+                self.buffer.clear();
+                self.reset_cycle();
+                Action::Edited
+            }
             Key::Char(c) => {
                 // a completed verb already ends in a space; swallow a
                 // second one so "/anim  physics" never happens
                 if c == ' ' && self.buffer.ends_with(' ') { return Action::Nothing; }
+                if self.buffer.chars().count() >= MAX_INPUT { return Action::Nothing; }
                 self.buffer.push(c); self.reset_cycle(); Action::Edited
             }
         }
@@ -427,5 +492,78 @@ mod tests {
         b.key(Key::Tab);
         assert_eq!(b.buffer, "/model Llama-3.2-1B-Instruct",
                    "a prefix match must beat an incidental substring");
+    }
+
+    #[test]
+    fn paste_appends_and_flattens_newlines() {
+        let mut b = ChatBox::new();
+        b.key(Key::Enter);
+        type_str(&mut b, "/build ");
+        assert_eq!(b.key(Key::Paste("a stone tower\nwith a dome".into())), Action::Edited);
+        assert_eq!(b.buffer, "/build a stone tower with a dome",
+                   "newlines become spaces, not a truncated command");
+    }
+
+    #[test]
+    fn paste_is_capped_so_a_stray_copy_is_not_a_huge_prompt() {
+        let mut b = ChatBox::new();
+        b.key(Key::Enter);
+        b.key(Key::Paste("x".repeat(MAX_INPUT * 3)));
+        assert_eq!(b.buffer.chars().count(), MAX_INPUT);
+        assert_eq!(b.key(Key::Paste("more".into())), Action::Nothing, "full line rejects more");
+    }
+
+    #[test]
+    fn paste_with_the_box_closed_opens_it() {
+        let mut b = ChatBox::new();
+        assert!(!b.open);
+        let a = b.key(Key::Paste("/model Llama-3.2-1B-Instruct-Q4_K_M".into()));
+        assert_eq!(a, Action::Edited);
+        assert!(b.open, "the first Ctrl+V of a session must not vanish");
+        assert_eq!(b.buffer, "/model Llama-3.2-1B-Instruct-Q4_K_M");
+    }
+
+    #[test]
+    fn copy_returns_the_line_and_copy_log_returns_the_log() {
+        let mut b = ChatBox::new();
+        b.log_snapshot = vec!["provider failed: spawn ...".into(), "no model loaded".into()];
+        b.key(Key::Enter);
+        type_str(&mut b, "/build a hut");
+        assert_eq!(b.key(Key::Copy), Action::Copy("/build a hut".into()));
+        match b.key(Key::CopyLog) {
+            Action::Copy(s) => {
+                assert!(s.contains("provider failed"));
+                assert!(s.contains('\n'), "the whole log, not one line");
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn copy_log_works_with_the_box_closed() {
+        // the case that matters: an error is on screen and the box is shut
+        let mut b = ChatBox::new();
+        b.log_snapshot = vec!["spawn fixture.sh: No such file".into()];
+        match b.key(Key::CopyLog) {
+            Action::Copy(s) => assert!(s.contains("No such file")),
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_u_clears_the_line() {
+        let mut b = ChatBox::new();
+        b.key(Key::Enter);
+        type_str(&mut b, "/build something long");
+        assert_eq!(b.key(Key::ClearLine), Action::Edited);
+        assert!(b.buffer.is_empty());
+        assert_eq!(b.key(Key::ClearLine), Action::Nothing, "already empty");
+    }
+
+    #[test]
+    fn copy_of_an_empty_line_does_nothing() {
+        let mut b = ChatBox::new();
+        b.key(Key::Enter);
+        assert_eq!(b.key(Key::Copy), Action::Nothing);
     }
 }

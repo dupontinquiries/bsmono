@@ -3757,6 +3757,33 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 WindowEvent::Key(Key::Backspace, _, Action::Press, _) if renderer.chat_open => {
                     chat_key = Some(voxel_tools::chatbox::Key::Backspace);
                 }
+                // Clipboard. Ctrl+V works with the box shut too (it opens
+                // it), because the first paste of a session otherwise
+                // vanishes with no explanation. Ctrl+Shift+C copies the
+                // whole visible log, which is what you want when an error
+                // is on screen and you are about to report it.
+                WindowEvent::Key(Key::V, _, Action::Press, mods)
+                    if mods.contains(glfw::Modifiers::Control) =>
+                {
+                    let text = window.get_clipboard_string().unwrap_or_default();
+                    if !text.is_empty() {
+                        chat_key = Some(voxel_tools::chatbox::Key::Paste(text));
+                    }
+                }
+                WindowEvent::Key(Key::C, _, Action::Press, mods)
+                    if mods.contains(glfw::Modifiers::Control) =>
+                {
+                    chat_key = Some(if mods.contains(glfw::Modifiers::Shift) {
+                        voxel_tools::chatbox::Key::CopyLog
+                    } else {
+                        voxel_tools::chatbox::Key::Copy
+                    });
+                }
+                WindowEvent::Key(Key::U, _, Action::Press, mods)
+                    if renderer.chat_open && mods.contains(glfw::Modifiers::Control) =>
+                {
+                    chat_key = Some(voxel_tools::chatbox::Key::ClearLine);
+                }
                 WindowEvent::Key(Key::Up, _, Action::Press, _) if renderer.chat_open => {
                     chat_key = Some(voxel_tools::chatbox::Key::Up);
                 }
@@ -4265,7 +4292,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
 
             let mut submitted: Option<unendlich_engine::sim::command_parse::Command> = None;
             if let Some(k) = chat_key.take() {
-                submitted = paintbrush.key(k);
+                // Keep the box's log copy fresh so Ctrl+Shift+C has
+                // something to hand back.
+                paintbrush.chatbox.log_snapshot = renderer.chat_log.clone();
+                match paintbrush.key_full(k) {
+                    unendlich_engine::voxel_chat::KeyOut::Command(c) => submitted = Some(c),
+                    unendlich_engine::voxel_chat::KeyOut::Copy(text) => {
+                        window.set_clipboard_string(&text);
+                        paintbrush.say(format!("copied {} chars", text.len()));
+                    }
+                    unendlich_engine::voxel_chat::KeyOut::None => {}
+                }
                 renderer.chat_open = paintbrush.captures_input();
             }
 

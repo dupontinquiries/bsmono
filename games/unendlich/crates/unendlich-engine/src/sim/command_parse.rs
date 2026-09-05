@@ -125,6 +125,8 @@ pub enum Command {
     /// `/model` — list local models; `/model <name>` — load one. The name
     /// keeps its case (paths are case-sensitive) and may be partial.
     Model(Option<String>),
+    /// `/keys` — print the keybindings into the chat log.
+    Keys,
     /// `/gamemode <survival|creative|adventure|spectator>`.
     Gamemode(GameMode),
     /// `/recipes` — open the recipe book GUI.
@@ -231,6 +233,7 @@ pub fn parse(line: &str) -> Command {
             },
             _ => Command::Unknown,
         },
+        "/keys" => if args.is_empty() { Command::Keys } else { Command::Unknown },
         "/model" => match args.as_slice() {
             [] => Command::Model(None),
             [name] => Command::Model(Some((*name).to_string())),
@@ -366,6 +369,7 @@ impl Command {
             Command::BuildVoice(true) => Some("/build enableVoice".to_string()),
             Command::BuildVoice(false) => Some("/build disableVoice".to_string()),
             Command::Anim(p) => Some(format!("/anim {}", p.keyword())),
+            Command::Keys => Some("/keys".to_string()),
             Command::Model(None) => Some("/model".to_string()),
             Command::Model(Some(n)) => Some(format!("/model {n}")),
             Command::Gamemode(m) => Some(format!("/gamemode {}", m.keyword())),
