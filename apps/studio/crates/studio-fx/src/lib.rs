@@ -11,6 +11,7 @@
 //! opens. [`instantiate`] is the bridge: it turns that description into
 //! something that runs, or `None` if this build does not know the kind.
 
+pub mod schema;
 pub mod analysis;
 pub mod playrate;
 pub mod saturation;

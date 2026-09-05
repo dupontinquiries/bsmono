@@ -44,6 +44,7 @@ pub mod session;
 pub mod stream;
 pub mod voice;
 pub mod dht;
+pub mod lan;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

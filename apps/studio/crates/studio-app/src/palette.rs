@@ -51,6 +51,13 @@ pub enum ShellVerb {
     /// so none of them can be an `Op`.
     CollabInvite,
     CollabRemove,
+    /// Put this session's id (the carrier key, readable) on the clipboard
+    /// and in the status line, so it can be read to someone.
+    CopySessionId,
+    /// Open the join window: LAN sessions, or an id typed in.
+    JoinSession,
+    /// Select every clip of a composition.
+    SelectGroup(studio_core::GroupId),
     /// Follow a collaborator's viewport. Local only: what I am looking
     /// at is not part of the project, and syncing it would let one
     /// person drag everybody else's screen around.
@@ -123,6 +130,8 @@ pub enum Then {
 /// to enumerate its candidates from the project — no verb invents targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ask {
+    /// Which composition to select whole.
+    SelectGroup,
     /// Which root, then which scale — the two-step the key needs.
     KeyRoot,
     KeyScale(u8),
@@ -188,6 +197,14 @@ pub fn root() -> Vec<Choice> {
         label: label.into(), hint: hint.map(str::to_owned), then };
     vec![
         c("play / pause", Some("space"), Then::Do(Act::Key(' '))),
+        // Sessions: the id is what a friend needs to join; the LAN needs
+        // nothing but the window.
+        c("session id (copy)", None, Then::Do(Act::Shell(ShellVerb::CopySessionId))),
+        c("join session (LAN or by id)", None, Then::Do(Act::Shell(ShellVerb::JoinSession))),
+        // Compositions: make one from the selection (the key the timeline
+        // already has), or select one's clips as a unit.
+        c("group selected clips", Some("g"), Then::Do(Act::Key('g'))),
+        c("select composition's clips", None, Then::Ask(Ask::SelectGroup)),
         // Key and scale — the data flow the roll's guide reads.
         c("set project key", None, Then::Ask(Ask::KeyRoot)),
         c("switch song", None, Then::Ask(Ask::SwitchSong)),
@@ -278,6 +295,10 @@ pub fn root() -> Vec<Choice> {
 pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
     let plain = |label: String, then: Then| Choice { label, hint: None, then };
     match ask {
+        Ask::SelectGroup => project.groups.iter()
+            .map(|(id, g)| plain(format!("{} ({} clips)", g.name, g.clips.len()),
+                                 Then::Do(Act::Shell(ShellVerb::SelectGroup(*id)))))
+            .collect(),
         Ask::KeyRoot => studio_core::PITCH_NAMES.iter().enumerate()
             .map(|(i, n)| plain((*n).to_string(), Then::Ask(Ask::KeyScale(i as u8))))
             .collect(),
@@ -704,4 +725,18 @@ mod tests {
                     "'{}' claims key '{ch}' that nothing handles", c.label);
         }
     }
+    #[test]
+    fn sessions_and_compositions_are_reachable_from_the_root() {
+        let p = Project::default();
+        let got = Palette::resolve(&p, &["session id"]);
+        assert!(matches!(got, Some(Act::Shell(ShellVerb::CopySessionId))), "{got:?}");
+        assert!(matches!(Palette::resolve(&p, &["join session"]), Some(Act::Shell(ShellVerb::JoinSession))));
+        assert!(matches!(Palette::resolve(&p, &["group selected"]), Some(Act::Key('g'))));
+        let p = project_with_groups();
+        let labels: Vec<String> = candidates(Ask::SelectGroup, &p).into_iter().map(|c| c.label).collect();
+        assert_eq!(labels, vec!["Track 1 (1 clips)"]);
+        assert_eq!(Palette::resolve(&p, &["select composition's clips", "Track 1"]),
+                   Some(Act::Shell(ShellVerb::SelectGroup(studio_core::GroupId(1)))), "{labels:?}");
+    }
+
 }

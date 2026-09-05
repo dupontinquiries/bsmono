@@ -351,14 +351,8 @@ fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
             ui.add_space(18.0);
             let mut chain = b.chain.clone();
             let mut changed = false;
-            let mut remove: Option<usize> = None;
-            for (i, fx) in chain.iter().enumerate() {
-                if ui.small_button(format!("{} ✕", fx.kind))
-                    .on_hover_text("remove").clicked() {
-                    remove = Some(i);
-                }
-            }
-            if let Some(i) = remove { chain.remove(i); changed = true; }
+            // Chips open the effect editor (parameters, bypass, remove).
+            crate::fx_editor::chain_chips(ui, s, crate::fx_editor::Target::Bus(b.id), &chain, c);
             ui.menu_button("+ fx", |ui| {
                 for (kind, params) in ADDABLE_FX {
                     if ui.button(*kind).clicked() {

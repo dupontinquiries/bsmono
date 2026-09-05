@@ -23,6 +23,7 @@ pub mod perform;
 pub mod export;
 pub mod upscale;
 pub mod clip_inspector;
+pub mod fx_editor;
 pub mod find;
 pub mod library;
 pub mod midi;
@@ -186,14 +187,41 @@ pub struct Studio {
     /// worth announcing changed.
     last_presence: Option<studio_collab::Presence>,
     last_presence_ms: i64,
+    /// The effect editor, when one is open. View state on `Studio` rather
+    /// than `App` because the clip inspector and the mixer — which only see
+    /// `Studio` — are the two doors that open it.
+    pub fx_editor: Option<fx_editor::FxEditor>,
+    /// A session this device JOINED by id (palette → "join session"), which
+    /// replaces the key derived from our own team + project name. The
+    /// carrier keys its records by [`Studio::carrier_key`], so setting this
+    /// is what "join" means at the wire.
+    pub joined_key: Option<[u8; 20]>,
 }
 
 impl Studio {
+    /// The 20-byte key the carrier publishes and reads under: a joined
+    /// session's, else our own team + project's. One place, so the palette's
+    /// "session id" and the wire agree by construction.
+    pub fn carrier_key(&self) -> [u8; 20] {
+        self.joined_key.unwrap_or_else(|| self.session.key())
+    }
+
+    /// Select every clip of a composition — the group becomes the thing the
+    /// next nudge, delete or effect applies to.
+    pub fn select_group(&mut self, id: studio_core::GroupId) {
+        if let Some(g) = self.session.doc.project.groups.get(&id) {
+            self.selection = g.clips.clone();
+            self.status = format!("selected {} clips of {}", g.clips.len(), g.name);
+        }
+    }
+
     pub fn new(project: Project, site: SiteId, team: Team) -> Studio {
         let name = project.name.clone();
         Studio {
             session: Session::open(team, &name, Doc::new(site, project)),
             transport: Transport::new(48_000),
+            fx_editor: None,
+            joined_key: None,
             view: studio_egui::View::default(),
             song_views: std::collections::BTreeMap::new(),
             active_song: None,
@@ -1867,6 +1895,92 @@ impl Studio {
     }
 }
 
+
+/// The "join session" window's state.
+#[cfg(feature = "app")]
+#[derive(Debug, Default, Clone)]
+pub struct JoinDialog {
+    pub text: String,
+    pub note: String,
+}
+
+#[cfg(feature = "app")]
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+#[cfg(feature = "app")]
+impl App {
+    /// Once per frame: say our session's name on the LAN, hear the others.
+    fn lan_tick(&mut self) {
+        let now = now_ms();
+        let beacon = studio_collab::lan::Beacon {
+            key: self.studio.carrier_key(),
+            project: self.studio.session.doc.project.name.clone(),
+            host: if self.studio.display_name.is_empty() { format!("site {}", self.studio.session.doc.site.0) } else { self.studio.display_name.clone() },
+            site: self.studio.session.doc.site.0,
+        };
+        self.lan.announce(&beacon, now);
+        self.lan.poll(now);
+    }
+
+    /// Type an id, or pick a session the LAN is showing. Joining sets the
+    /// key the carrier uses (`Studio::joined_key`); it does not replace the
+    /// document, which arrives through the carrier's catch-up like any
+    /// other late joiner's.
+    fn join_window(&mut self, ctx: &egui::Context) {
+        let Some(mut d) = self.join.take() else { return };
+        let mut open = true;
+        let mut done = false;
+        let width = Self::dialog_width(ctx.content_rect().width(), 440.0);
+        let own = studio_collab::lan::SessionId(self.studio.carrier_key());
+        let site = self.studio.session.doc.site.0;
+        egui::Window::new("Join session").open(&mut open).resizable(false).collapsible(false)
+            .default_width(width).anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("this session:");
+                    ui.monospace(own.render());
+                    if ui.small_button("copy").clicked() { ctx.copy_text(own.render()); }
+                });
+                ui.separator();
+                ui.label("On this network:");
+                let found: Vec<(String, String, [u8; 20])> = self.lan.sessions(site).iter()
+                    .map(|s| (s.beacon.project.clone(), s.beacon.host.clone(), s.beacon.key)).collect();
+                if found.is_empty() {
+                    match &self.lan.error {
+                        Some(e) => ui.colored_label(egui::Color32::GRAY, format!("LAN discovery unavailable: {e}")),
+                        None => ui.colored_label(egui::Color32::GRAY, "nothing yet — sessions announce once a second"),
+                    };
+                }
+                for (project, host, key) in found {
+                    if ui.button(format!("join {host}'s \"{project}\"  ·  {}", studio_collab::lan::SessionId(key).short())).clicked() {
+                        self.studio.joined_key = Some(key);
+                        self.studio.status = format!("joined {host}'s \"{project}\"");
+                        done = true;
+                    }
+                }
+                ui.separator();
+                ui.label("Or by id:");
+                let edit = ui.add(egui::TextEdit::singleline(&mut d.text).hint_text("xxxx-xxxx-xxxx-…").desired_width(f32::INFINITY));
+                let go = ui.button("join").clicked() || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                if go {
+                    match studio_collab::lan::SessionId::parse(&d.text) {
+                        Some(id) if id == own => d.note = "that is this session".into(),
+                        Some(id) => {
+                            self.studio.joined_key = Some(id.0);
+                            self.studio.status = format!("joined session {}", id.short());
+                            done = true;
+                        }
+                        None => d.note = "not a session id: 32 letters/digits, dashes optional, no 0/1/i/l/o".into(),
+                    }
+                }
+                if !d.note.is_empty() { ui.colored_label(egui::Color32::LIGHT_RED, &d.note); }
+            });
+        if open && !done { self.join = Some(d); }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2219,6 +2333,12 @@ pub struct App {
     /// The command palette, open when `Some`. C-p opens it; it holds the
     /// wizard's position and the current query between frames.
     palette: Option<palette::Palette>,
+    /// "join session": the id being typed, plus what the LAN is showing.
+    join: Option<JoinDialog>,
+    /// Text to hand the clipboard on the next frame (acts run without a ctx).
+    clipboard_pending: Option<String>,
+    /// The LAN beacon: announces our session, collects everyone else's.
+    lan: studio_collab::lan::Discovery,
     /// The voice dialog. Present when voice is engaged; the popup renders
     /// from its state, and utterances run through the SAME palette acts
     /// the keyboard uses — no second command system.
@@ -2384,6 +2504,9 @@ impl Default for App {
               bounce_format,
               mix_pass: None,
               palette: None,
+              join: None,
+              clipboard_pending: None,
+              lan: studio_collab::lan::Discovery::open(),
               voice: None,
               lexicon,
               find_ui: None,
@@ -2965,6 +3088,10 @@ impl eframe::App for App {
             voice::feedback_popup(ctx, d, &colors);
         }
         self.palette_window(ctx);
+        if let Some(t) = self.clipboard_pending.take() { ctx.copy_text(t); }
+        fx_editor::window(ctx, &mut self.studio, &colors);
+        self.lan_tick();
+        self.join_window(ctx);
         self.find_window(ctx);
         self.mix_pass_window(ctx);
         self.archive_window(ctx);
@@ -4341,6 +4468,17 @@ impl App {
                     let n = self.studio.session.roster().len();
                     self.studio.status =
                         format!("invite: {n} in the session — needs a contact picker (C90c)");
+                }
+                palette::ShellVerb::CopySessionId => {
+                    let id = studio_collab::lan::SessionId(self.studio.carrier_key()).render();
+                    self.clipboard_pending = Some(id.clone());
+                    self.studio.status = format!("session id {id} — copied");
+                }
+                palette::ShellVerb::JoinSession => {
+                    self.join = Some(JoinDialog::default());
+                }
+                palette::ShellVerb::SelectGroup(id) => {
+                    self.studio.select_group(id);
                 }
                 palette::ShellVerb::CollabRemove => {
                     let n = self.studio.session.roster().len();

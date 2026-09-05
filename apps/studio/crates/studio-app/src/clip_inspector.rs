@@ -70,19 +70,10 @@ pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
         ui.label("fx:");
         let mut effects = clip.effects.clone();
         let mut changed = false;
-        let mut remove: Option<usize> = None;
-        for (i, fx) in effects.iter_mut().enumerate() {
-            // A disabled effect stays in the chain at its position — the
-            // A/B a person actually wants is "with and without this one",
-            // not "delete it and add it back at the end".
-            let mut on = fx.enabled;
-            if ui.checkbox(&mut on, &fx.kind).changed() {
-                fx.enabled = on;
-                changed = true;
-            }
-            if ui.small_button("✕").clicked() { remove = Some(i); }
-        }
-        if let Some(i) = remove { effects.remove(i); changed = true; }
+        // Each chip opens the editor on that effect: bypass, reset, remove
+        // and every parameter live there, on a sheet or a popup depending on
+        // the width (`fx_editor`'s module doc).
+        crate::fx_editor::chain_chips(ui, s, crate::fx_editor::Target::Clip(id), &effects, c);
         ui.menu_button("+ fx", |ui| {
             for (kind, params) in ADDABLE_FX {
                 if ui.button(*kind).clicked() {
