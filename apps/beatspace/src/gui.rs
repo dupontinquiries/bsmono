@@ -375,59 +375,28 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // FONTS ONLY. beatspace paints with nine hand-picked `Color32`
-        // literals and sets no Visuals, so `apply_palette` would recolour it
-        // — a separate change from giving it its glyphs. Idempotent, so
-        // per-frame costs nothing. See font_install_check.py.
-        uikit_egui::fonts::install(ui.ctx());
-        ui.ctx().request_repaint(); // keep animating
+/// The per-frame snapshot the control column reads, taken once under the
+/// shared lock in `ui()`.
+///
+/// The body used to sit inline and close over these as locals; lifting it
+/// into a method meant they had to travel. Passed as one borrowed struct
+/// rather than five arguments — five positional floats and strings is the
+/// shape that gets silently reordered later.
+struct Snapshot<'a> {
+    current_z: &'a [f32],
+    target_snapshot: &'a [f32],
+    gen_ms: f32,
+    loaded: &'a str,
+    device: &'a str,
+}
 
-        // snapshot shared state
-        let (current_z, target_snapshot, gen_ms, scope, loaded, device) = {
-            let s = self.shared.lock().unwrap();
-            (
-                s.current_z.clone(),
-                s.target_z.clone(),
-                s.gen_ms,
-                s.scope.clone(),
-                s.loaded_label.clone(),
-                s.device_label.clone(),
-            )
-        };
-
-        // advance an active walk A->B
-        if let Some(t) = self.walk_t {
-            let nt = t + self.walk_speed;
-            let mut s = self.shared.lock().unwrap();
-            for i in 0..self.latent {
-                s.target_z[i] = self.z_a[i] + (self.z_b[i] - self.z_a[i]) * nt.min(1.0);
-            }
-            drop(s);
-            self.walk_t = if nt >= 1.0 { None } else { Some(nt) };
-        }
-
-        // Drain whatever the trainer has printed since the last frame.
-        //
-        // try_recv in a loop rather than a blocking read: this runs inside the
-        // frame, and a trainer that has gone quiet must not freeze the UI —
-        // which is the whole reason the run is on a thread.
-        if let Some(rx) = &self.train_rx {
-            let mut lines = Vec::new();
-            while let Ok(l) = rx.try_recv() {
-                lines.push(l);
-            }
-            for l in lines {
-                self.gpu.feed_gpu(&l);
-                self.train.feed(&l);
-            }
-        }
-
-        egui::Panel::left("controls")
-            .resizable(false)
-            .exact_size(250.0)
-            .show(ui, |ui| {
+impl App {
+    /// The control column, lifted out of its panel builder so `two_pane`
+    /// can put it beside the pad or inside a disclosure above it. Body
+    /// unchanged from the fixed 250pt panel it used to live in.
+    fn controls_body(&mut self, ui: &mut egui::Ui, snap: &Snapshot<'_>) {
+        let (current_z, target_snapshot, gen_ms, loaded, device) =
+            (snap.current_z, snap.target_snapshot, snap.gen_ms, snap.loaded, snap.device);
                 ui.add_space(8.0);
                 ui.heading("beatspace");
                 ui.label("latent-space beat morpher");
@@ -462,11 +431,11 @@ impl eframe::App for App {
                 }
                 ui.horizontal(|ui| {
                     if ui.button("Set A").clicked() {
-                        self.z_a = target_snapshot.clone();
+                        self.z_a = target_snapshot.to_vec();
                         self.status = "captured A".into();
                     }
                     if ui.button("Set B").clicked() {
-                        self.z_b = target_snapshot.clone();
+                        self.z_b = target_snapshot.to_vec();
                         self.status = "captured B".into();
                     }
                 });
@@ -515,40 +484,15 @@ impl eframe::App for App {
 
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new(&self.status).italics());
-            });
+    }
 
-        egui::Panel::bottom("scope")
-            .exact_size(90.0)
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("output").small().weak());
-                let (resp, painter) =
-                    ui.allocate_painter(egui::vec2(ui.available_width(), 60.0), egui::Sense::hover());
-                let rect = resp.rect;
-                painter.rect_filled(rect, 4.0, egui::Color32::from_gray(18));
-                if scope.len() > 1 {
-                    let n = scope.len();
-                    let mut pts = Vec::with_capacity(n);
-                    for (i, v) in scope.iter().enumerate() {
-                        let x = rect.left() + rect.width() * (i as f32 / (n - 1) as f32);
-                        let y = rect.center().y - v.clamp(-1.0, 1.0) * (rect.height() * 0.45);
-                        pts.push(egui::pos2(x, y));
-                    }
-                    painter.add(egui::Shape::line(
-                        pts,
-                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(120, 220, 160)),
-                    ));
-                }
-            });
-
+    /// The page under the controls: the training dashboard, or the pad.
+    fn content_body(&mut self, ui: &mut egui::Ui, snap: &Snapshot<'_>) {
+        let current_z = snap.current_z;
         if self.page == Page::Train {
-            egui::CentralPanel::default().show(ui, |ui| {
-                self.train_body(ui);
-            });
+            self.train_body(ui);
             return;
         }
-
-        egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(4.0);
             ui.label("latent pad — X→z₀  Y→z₁  scroll→z₂");
 
@@ -630,7 +574,100 @@ impl eframe::App for App {
                 painter.circle_filled(cur, r, egui::Color32::from_rgba_unmultiplied(120, 230, 170, a));
             }
             painter.circle_filled(cur, 4.0, egui::Color32::from_rgb(140, 255, 190));
-        });
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // FONTS ONLY. beatspace paints with nine hand-picked `Color32`
+        // literals and sets no Visuals, so `apply_palette` would recolour it
+        // — a separate change from giving it its glyphs. Idempotent, so
+        // per-frame costs nothing. See font_install_check.py.
+        uikit_egui::fonts::install(ui.ctx());
+        ui.ctx().request_repaint(); // keep animating
+
+        // snapshot shared state
+        let (current_z, target_snapshot, gen_ms, scope, loaded, device) = {
+            let s = self.shared.lock().unwrap();
+            (
+                s.current_z.clone(),
+                s.target_z.clone(),
+                s.gen_ms,
+                s.scope.clone(),
+                s.loaded_label.clone(),
+                s.device_label.clone(),
+            )
+        };
+
+        // advance an active walk A->B
+        if let Some(t) = self.walk_t {
+            let nt = t + self.walk_speed;
+            let mut s = self.shared.lock().unwrap();
+            for i in 0..self.latent {
+                s.target_z[i] = self.z_a[i] + (self.z_b[i] - self.z_a[i]) * nt.min(1.0);
+            }
+            drop(s);
+            self.walk_t = if nt >= 1.0 { None } else { Some(nt) };
+        }
+
+        // Drain whatever the trainer has printed since the last frame.
+        //
+        // try_recv in a loop rather than a blocking read: this runs inside the
+        // frame, and a trainer that has gone quiet must not freeze the UI —
+        // which is the whole reason the run is on a thread.
+        if let Some(rx) = &self.train_rx {
+            let mut lines = Vec::new();
+            while let Ok(l) = rx.try_recv() {
+                lines.push(l);
+            }
+            for l in lines {
+                self.gpu.feed_gpu(&l);
+                self.train.feed(&l);
+            }
+        }
+
+        let snap = Snapshot {
+            current_z: &current_z, target_snapshot: &target_snapshot,
+            gen_ms, loaded: &loaded, device: &device,
+        };
+        // The scope keeps its own bottom panel and is declared FIRST, so it
+        // reserves its strip before the two panes divide what is left.
+        egui::Panel::bottom("scope")
+            .exact_size(90.0)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("output").small().weak());
+                let (resp, painter) =
+                    ui.allocate_painter(egui::vec2(ui.available_width(), 60.0), egui::Sense::hover());
+                let rect = resp.rect;
+                painter.rect_filled(rect, 4.0, egui::Color32::from_gray(18));
+                if scope.len() > 1 {
+                    let n = scope.len();
+                    let mut pts = Vec::with_capacity(n);
+                    for (i, v) in scope.iter().enumerate() {
+                        let x = rect.left() + rect.width() * (i as f32 / (n - 1) as f32);
+                        let y = rect.center().y - v.clamp(-1.0, 1.0) * (rect.height() * 0.45);
+                        pts.push(egui::pos2(x, y));
+                    }
+                    painter.add(egui::Shape::line(
+                        pts,
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(120, 220, 160)),
+                    ));
+                }
+            });
+
+        // SIDE BY SIDE OR STACKED. A fixed 250pt control column beside the
+        // latent pad is right on a laptop and most of a 400pt phone. Making
+        // it a fraction was tried here first: the pad became usable and the
+        // column's own controls started clipping, so it was reverted.
+        // `two_pane` changes the ARRANGEMENT instead — stacked with the
+        // controls collapsed once neither pane can have its minimum, which
+        // gives the pad the whole width on a phone.
+        uikit_egui::two_pane::two_pane_ui(
+            ui, "beatspace", 250.0, 200.0, 240.0, "controls", self,
+            |ui, s| s.controls_body(ui, &snap),
+            |ui, s| s.content_body(ui, &snap),
+        );
     }
 }
 

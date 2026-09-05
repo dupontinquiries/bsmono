@@ -1018,8 +1018,9 @@ asked as a question.
   says it grows "the next time a specific device is slow and its GL_RENDERER
   string is in hand, not from a guess about silicon not yet measured". This
   is that moment.
-- [ ] **beatspace: workspace on desktop vs tabs on mobile.** Started and
-  REVERTED this session — a width-fraction panel was tried, looked at, and
+- [x] **beatspace: workspace on desktop vs tabs on mobile.** DONE
+  2026-09-05, verified at both widths. Previously started and
+  REVERTED — a width-fraction panel was tried, looked at, and
   traded one clipping for another. The recipe is in commit `0ac14413`:
   `controls_body` = lines 431-517, `content_body` = the Train branch plus
   552-632, both in a NEW `impl App` block (not the `eframe::App` one), the
