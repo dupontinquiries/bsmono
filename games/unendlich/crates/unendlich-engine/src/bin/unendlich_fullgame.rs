@@ -1880,6 +1880,80 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // is wide enough to leak a whole burst of typing into movement,
     // which is why the drops correlated with lag.
     let mut chat_focus = false;
+    // Commands submitted from the late drain, run on the NEXT frame's
+    // chat block. Typing is applied immediately (below); a submitted
+    // command can afford one frame, typing cannot.
+    let mut late_cmds: Vec<unendlich_engine::sim::command_parse::Command> = Vec::new();
+    // Route one GLFW event to the chat box, if it is the chat's. Returns
+    // true if consumed. Used by BOTH event drains: the main one and the
+    // late one. The late drain used to withhold keys from movement while
+    // the chat had focus and then simply DROP them -- every keystroke
+    // landing in that window vanished, which is the "still misses keys"
+    // report. One function, two call sites, no second copy to forget.
+    fn route_chat_key(event: &glfw::WindowEvent, chat_focus: &mut bool,
+                      chat_keys: &mut Vec<voxel_tools::chatbox::Key>,
+                      chat_toggle: &mut bool, esc_pressed: &mut bool,
+                      window: &glfw::Window) -> bool {
+        use glfw::{Action, Key, WindowEvent};
+        use voxel_tools::chatbox::Key as CK;
+        // Repeat counts as a press: holding Backspace must keep deleting,
+        // and holding an arrow must keep moving through history.
+        let pressed = |a: &Action| matches!(a, Action::Press | Action::Repeat);
+        match event {
+            WindowEvent::Char(ch) if *chat_focus => { chat_keys.push(CK::Char(*ch)); true }
+            WindowEvent::Key(Key::Escape, _, a, _) if pressed(a) => {
+                if *chat_focus { chat_keys.push(CK::Escape); *chat_focus = false; true }
+                else { *esc_pressed = true; false }
+            }
+            WindowEvent::Key(Key::Enter, _, a, m) | WindowEvent::Key(Key::KpEnter, _, a, m)
+                if pressed(a) =>
+            {
+                if *chat_focus {
+                    chat_keys.push(if m.contains(glfw::Modifiers::Control) { CK::CtrlEnter }
+                                   else { CK::Enter });
+                    if !m.contains(glfw::Modifiers::Control) { *chat_focus = false; }
+                } else {
+                    *chat_toggle = true;
+                    *chat_focus = true;
+                }
+                true
+            }
+            WindowEvent::Key(Key::Tab, _, a, m) if *chat_focus && pressed(a) => {
+                chat_keys.push(if m.contains(glfw::Modifiers::Shift) { CK::ShiftTab } else { CK::Tab });
+                true
+            }
+            WindowEvent::Key(Key::Backspace, _, a, _) if *chat_focus && pressed(a) => {
+                chat_keys.push(CK::Backspace); true
+            }
+            WindowEvent::Key(Key::Up, _, a, _) if *chat_focus && pressed(a) => {
+                chat_keys.push(CK::Up); true
+            }
+            WindowEvent::Key(Key::Down, _, a, _) if *chat_focus && pressed(a) => {
+                chat_keys.push(CK::Down); true
+            }
+            WindowEvent::Key(Key::V, _, a, m) if pressed(a) && m.contains(glfw::Modifiers::Control) => {
+                let text = window.get_clipboard_string().unwrap_or_default();
+                if !text.is_empty() { chat_keys.push(CK::Paste(text)); }
+                true
+            }
+            WindowEvent::Key(Key::C, _, a, m) if pressed(a) && m.contains(glfw::Modifiers::Control) => {
+                chat_keys.push(if m.contains(glfw::Modifiers::Shift) { CK::CopyLog } else { CK::Copy });
+                true
+            }
+            WindowEvent::Key(Key::U, _, a, m)
+                if *chat_focus && pressed(a) && m.contains(glfw::Modifiers::Control) =>
+            {
+                chat_keys.push(CK::ClearLine); true
+            }
+            WindowEvent::Key(Key::Z, _, a, m) if pressed(a) && m.contains(glfw::Modifiers::Control) => {
+                chat_keys.push(CK::CtrlZ); true
+            }
+            // Any other key while the chat has focus is swallowed here so
+            // it cannot fall through to a hotkey arm.
+            WindowEvent::Key(_, _, a, _) if *chat_focus && pressed(a) => true,
+            _ => false,
+        }
+    }
     // A presentation shot in progress: the poses, which segment, and how
     // far through it. Any key or mouse button returns the camera.
     let mut shot: Option<(Vec<voxel_tools::camera::Pose>, usize, f32)> = None;
@@ -3744,88 +3818,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
             }
             match event {
+                // Chat keys first, through the ONE routing function shared
+                // with the late drain. If it consumed the event, nothing
+                // else sees it.
+                ref ev if route_chat_key(ev, &mut chat_focus, &mut chat_keys,
+                                         &mut chat_toggle, &mut esc_pressed, &window) => {}
                 WindowEvent::Char(ch) => {
-                    // While the build chat is open it owns typed text;
-                    // egui fields never see it, so the two cannot both
-                    // claim a character.
-                    if chat_focus {
-                        chat_keys.push(voxel_tools::chatbox::Key::Char(ch));
-                    } else {
-                        // r181: text input for egui fields (name/seed boxes).
-                        ui_text_frame.push(ch);
-                    }
+                    // Not the chat's: text for egui fields (name/seed boxes).
+                    ui_text_frame.push(ch);
                 }
                 WindowEvent::Scroll(dx, dy) => {
                     scroll_accum += dy as f32; // r122: consumed below per frame
                     scroll_accum_x += dx as f32; // r318: horizontal (trackpad)
-                }
-                WindowEvent::Key(Key::Escape, _, Action::Press, _) => {
-                    if chat_focus {
-                        chat_keys.push(voxel_tools::chatbox::Key::Escape);
-                        chat_focus = false; // takes effect for the NEXT event, not next frame
-                    } else {
-                        esc_pressed = true;
-                    }
-                }
-                // Build chat keys. Enter opens it when closed (and
-                // submits when open) so the reflex from every other
-                // game works; T also opens it.
-                WindowEvent::Key(Key::Enter, _, Action::Press, _)
-                | WindowEvent::Key(Key::KpEnter, _, Action::Press, _) => {
-                    if chat_focus {
-                        chat_keys.push(voxel_tools::chatbox::Key::Enter);
-                        chat_focus = false; // Enter submits and closes
-                    } else {
-                        chat_toggle = true;
-                        // Claim focus NOW so the rest of this batch types
-                        // instead of walking. On a 150 ms frame the first
-                        // characters after Enter used to reach movement.
-                        chat_focus = true;
-                        input.release_all();
-                    }
-                }
-                WindowEvent::Key(Key::Tab, _, Action::Press, mods) if chat_focus => {
-                    chat_keys.push(if mods.contains(glfw::Modifiers::Shift) {
-                        voxel_tools::chatbox::Key::ShiftTab
-                    } else {
-                        voxel_tools::chatbox::Key::Tab
-                    });
-                }
-                WindowEvent::Key(Key::Backspace, _, Action::Press, _) if chat_focus => {
-                    chat_keys.push(voxel_tools::chatbox::Key::Backspace);
-                }
-                // Clipboard. Ctrl+V works with the box shut too (it opens
-                // it), because the first paste of a session otherwise
-                // vanishes with no explanation. Ctrl+Shift+C copies the
-                // whole visible log, which is what you want when an error
-                // is on screen and you are about to report it.
-                WindowEvent::Key(Key::V, _, Action::Press, mods)
-                    if mods.contains(glfw::Modifiers::Control) =>
-                {
-                    let text = window.get_clipboard_string().unwrap_or_default();
-                    if !text.is_empty() {
-                        chat_keys.push(voxel_tools::chatbox::Key::Paste(text));
-                    }
-                }
-                WindowEvent::Key(Key::C, _, Action::Press, mods)
-                    if mods.contains(glfw::Modifiers::Control) =>
-                {
-                    chat_keys.push(if mods.contains(glfw::Modifiers::Shift) {
-                        voxel_tools::chatbox::Key::CopyLog
-                    } else {
-                        voxel_tools::chatbox::Key::Copy
-                    });
-                }
-                WindowEvent::Key(Key::U, _, Action::Press, mods)
-                    if chat_focus && mods.contains(glfw::Modifiers::Control) =>
-                {
-                    chat_keys.push(voxel_tools::chatbox::Key::ClearLine);
-                }
-                WindowEvent::Key(Key::Up, _, Action::Press, _) if chat_focus => {
-                    chat_keys.push(voxel_tools::chatbox::Key::Up);
-                }
-                WindowEvent::Key(Key::Down, _, Action::Press, _) if chat_focus => {
-                    chat_keys.push(voxel_tools::chatbox::Key::Down);
                 }
                 // Catch-all key arm. It must be LAST and it must be guarded:
                 // every key the chat does not explicitly claim lands here,
@@ -4327,6 +4331,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             use unendlich_engine::voxel_chat::Pending;
             use voxel_tools::chatbox::Key as CK;
 
+            // Tick the box's clock BEFORE any key is drained this frame,
+            // so a letter typed now is born now. Ticking after the drain
+            // stamps it with last frame's time, and at 150 ms frames the
+            // letter is already "old" and skips its own pop-in.
+            paintbrush.chatbox.tick(glfw.get_time());
+
             if chat_toggle {
                 chat_toggle = false;
                 // Feed Enter to the box so it opens through the same
@@ -4344,6 +4354,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
 
             let mut submitted: Option<unendlich_engine::sim::command_parse::Command> = None;
+            // A command submitted after last frame's late drain.
+            if let Some(c) = late_cmds.pop() { submitted = Some(c); late_cmds.clear(); }
             if !chat_keys.is_empty() {
                 // Keep the box's log copy fresh so Ctrl+Shift+C has
                 // something to hand back.
@@ -4481,6 +4493,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     "asking {} ... {:.0}s", t.provider, t.elapsed().as_secs_f32()));
             }
             renderer.chat_buffer = paintbrush.chatbox.buffer.clone();
+            renderer.chat_char_ages = paintbrush.chatbox.char_ages();
             renderer.chat_card = paintbrush.chatbox.current_card()
                 .map(|c| (c.command.to_string(), c.signature.to_string(), c.summary.to_string()));
             renderer.chat_matches = paintbrush.chatbox.matching_cards().iter()
@@ -12867,6 +12880,30 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     input.handle_event_late(&ev);
                 }
             }
+            // And to the chat, so nothing arriving in this window is lost.
+            route_chat_key(&event, &mut chat_focus, &mut chat_keys,
+                           &mut chat_toggle, &mut esc_pressed, &window);
+        }
+        // Apply late-drained TYPING now, before this frame draws, so the
+        // letter appears on the frame it was pressed rather than the next
+        // one. Submitted commands are parked for the next chat block.
+        if !chat_keys.is_empty() {
+            paintbrush.chatbox.tick(glfw.get_time());
+            for k in chat_keys.drain(..) {
+                match paintbrush.key_full(k) {
+                    unendlich_engine::voxel_chat::KeyOut::Command(c) => late_cmds.push(c),
+                    unendlich_engine::voxel_chat::KeyOut::Copy(text) => {
+                        window.set_clipboard_string(&text);
+                    }
+                    unendlich_engine::voxel_chat::KeyOut::None => {}
+                }
+            }
+            chat_focus = paintbrush.captures_input();
+            renderer.chat_open = chat_focus;
+            renderer.chat_buffer = paintbrush.chatbox.buffer.clone();
+            renderer.chat_char_ages = paintbrush.chatbox.char_ages();
+            renderer.chat_card = paintbrush.chatbox.current_card()
+                .map(|c| (c.command.to_string(), c.signature.to_string(), c.summary.to_string()));
         }
         // Presentation shot: ease the camera along the poses. Overrides
         // the player's view while it runs; the first key or click ends it

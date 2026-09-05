@@ -535,6 +535,8 @@ pub struct WorldRenderer {
     pub chat_focus_hint: Option<String>,
     pub chat_pending_blocks: Option<usize>,
     pub chat_model: Option<String>,
+    /// Seconds since each buffer char was typed, for the letter pop-in.
+    pub chat_char_ages: Vec<f32>,
     /// Clicks that collapsed into one frame (press+release same frame);
     /// forwarded to egui as discrete press/release pairs so fast / low-fps
     /// clicks still register on toggles.
@@ -1690,6 +1692,7 @@ impl WorldRenderer {
             chat_focus_hint: None,
             chat_pending_blocks: None,
             chat_model: None,
+            chat_char_ages: Vec::new(),
             ui_backspace: false,
             ui_enter: false,
             ui_wants_keyboard: false,
@@ -3902,6 +3905,8 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                         focus_hint: self.chat_focus_hint.as_deref(),
                         pending_blocks: self.chat_pending_blocks,
                         model: self.chat_model.as_deref(),
+                        char_ages: &self.chat_char_ages,
+                        now: c.input(|i| i.time),
                     };
                     let gt = glass_t(c, "unendlich_chat", true);
                     let mut out = crate::app::chat_panel::ChatPanelOut::default();

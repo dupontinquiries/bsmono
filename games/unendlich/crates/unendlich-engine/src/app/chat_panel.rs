@@ -39,6 +39,13 @@ pub struct ChatPanelState<'a> {
     pub pending_blocks: Option<usize>,
     /// Loaded model name, or None.
     pub model: Option<&'a str>,
+    /// Seconds since each character in `buffer` was typed, oldest
+    /// first. Same length as `buffer.chars()` or empty (no animation).
+    /// Drives the pop-in: a fresh letter lands large and bright and
+    /// settles over ~120 ms, the way a block does when it is placed.
+    pub char_ages: &'a [f32],
+    /// Wall-clock seconds, for the cursor blink.
+    pub now: f64,
 }
 
 /// What the player did. The renderer turns these into engine calls.
@@ -100,13 +107,48 @@ pub fn chat_panel_body(ui: &mut egui::Ui, s: &ChatPanelState<'_>) -> ChatPanelOu
     // ── input line ───────────────────────────────────────────────
     ui.separator();
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(">").monospace().strong());
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.label(egui::RichText::new("> ").monospace().strong());
         // The buffer is owned by ChatBox, not by egui: the game already
         // routes keys through a state machine, and two sources of truth
         // for one string is how a cursor ends up in the wrong place.
-        ui.label(egui::RichText::new(s.buffer).monospace());
-        // a blinking-ish caret without needing animation state
-        ui.label(egui::RichText::new("_").monospace().weak());
+        //
+        // Each character is its own label so it can carry its own age:
+        // a fresh letter is drawn larger and brighter and eases to rest,
+        // the way a placed block lands. In the voxel font, which is what
+        // makes it read as this game rather than a terminal.
+        let base = 15.0;
+        for (i, ch) in s.buffer.chars().enumerate() {
+            let age = s.char_ages.get(i).copied().unwrap_or(1.0);
+            let t = (age / 0.12).clamp(0.0, 1.0);
+            let ease = 1.0 - (1.0 - t) * (1.0 - t);          // ease-out
+            let size = base + (1.0 - ease) * 7.0;             // 22 -> 15
+            let bright = (0.75 + 0.25 * ease) as f32;
+            let col = egui::Color32::from_rgb(
+                (255.0 * bright) as u8, (240.0 * bright) as u8, (210.0 * bright) as u8);
+            let mut text = egui::RichText::new(ch.to_string()).size(size).color(col);
+            #[cfg(feature = "unendlich-ui")]
+            { text = text.font(unendlich_ui::menu::blocks_font(size)); }
+            #[cfg(not(feature = "unendlich-ui"))]
+            { text = text.monospace(); }
+            ui.label(text);
+        }
+        // BLOCK cursor, blinking at 2 Hz. A solid cell, because the
+        // caret in this game is a block, not a line.
+        let on = (s.now * 2.0).fract() < 0.6;
+        let cursor = if on {
+            egui::RichText::new("\u{2588}").size(base)
+                .color(egui::Color32::from_rgb(255, 240, 210))
+        } else {
+            egui::RichText::new("\u{2588}").size(base)
+                .color(egui::Color32::from_rgba_unmultiplied(255, 240, 210, 40))
+        };
+        #[cfg(feature = "unendlich-ui")]
+        let cursor = cursor.font(unendlich_ui::menu::blocks_font(base));
+        ui.label(cursor);
+        // Ask for a redraw while the cursor blinks or letters settle:
+        // otherwise egui only repaints on input and the animation stalls.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
     });
 
     // ── card / completions ───────────────────────────────────────
@@ -138,7 +180,7 @@ mod tests {
     fn state<'a>(buffer: &'a str, log: &'a [String]) -> ChatPanelState<'a> {
         ChatPanelState {
             buffer, log, card: None, matches: &[], focus_hint: None,
-            pending_blocks: None, model: None,
+            pending_blocks: None, model: None, char_ages: &[], now: 0.0,
         }
     }
 
@@ -173,9 +215,37 @@ mod tests {
 
     #[test]
     fn the_buffer_is_rendered_verbatim() {
+        // One label per character now, so the text is gathered back
+        // from all of them.
         let log: Vec<String> = Vec::new();
         let (_, full) = run(&state("/build a Small tower", &log));
-        assert!(collect_text(&full).contains("/build a Small tower"), "case preserved");
+        let text: String = collect_text(&full).chars().filter(|c| *c != '\n').collect();
+        assert!(text.contains("/build a Small tower"), "case preserved: {text}");
+    }
+
+    #[test]
+    fn a_fresh_letter_is_drawn_larger_than_a_settled_one() {
+        // The pop-in: age 0 lands large, age 1s is at rest.
+        let log: Vec<String> = Vec::new();
+        let ages = [1.0f32, 0.0];
+        let mut s = state("ab", &log);
+        s.char_ages = &ages;
+        let (_, full) = run(&s);
+        let sizes: Vec<f32> = full.shapes.iter().filter_map(|p| match &p.shape {
+            egui::epaint::Shape::Text(t) if t.galley.text().len() == 1
+                && t.galley.text() != "\u{2588}" => Some(t.galley.rect.height()),
+            _ => None,
+        }).collect();
+        assert!(sizes.len() >= 2, "{sizes:?}");
+        let (old, fresh) = (sizes[sizes.len() - 2], sizes[sizes.len() - 1]);
+        assert!(fresh > old, "fresh {fresh} must be larger than settled {old}");
+    }
+
+    #[test]
+    fn the_cursor_is_a_block() {
+        let log: Vec<String> = Vec::new();
+        let (_, full) = run(&state("", &log));
+        assert!(collect_text(&full).contains('\u{2588}'), "a block, not an underscore");
     }
 
     #[test]

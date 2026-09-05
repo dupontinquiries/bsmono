@@ -195,6 +195,12 @@ pub struct ChatBox {
     /// Copy of the visible log, so Ctrl+Shift+C can copy an error
     /// report without the box reaching into the renderer.
     pub log_snapshot: Vec<String>,
+    /// When each character in `buffer` was typed, as the box's own
+    /// monotonic tick, one per char. Drives the letter pop-in. Kept in
+    /// step with the buffer by every edit path, and a test pins that.
+    births: Vec<f64>,
+    /// Current time, set by the host each frame via `tick`.
+    now: f64,
 }
 
 /// Cap on the input line. Long enough for any sensible build request,
@@ -203,6 +209,27 @@ pub const MAX_INPUT: usize = 2000;
 
 impl ChatBox {
     pub fn new() -> Self { Self::default() }
+
+    /// Advance the clock. Call once per frame with wall-clock seconds.
+    pub fn tick(&mut self, now: f64) { self.now = now; }
+
+    /// Seconds since each character was typed, oldest first. Always the
+    /// same length as `buffer.chars()`, so the panel can index it.
+    pub fn char_ages(&self) -> Vec<f32> {
+        let n = self.buffer.chars().count();
+        (0..n).map(|i| self.births.get(i)
+                .map(|b| (self.now - b).max(0.0) as f32)
+                .unwrap_or(1.0))
+            .collect()
+    }
+
+    /// Keep `births` in step with `buffer` after any edit: new chars at
+    /// the end are born now, removed chars drop their births.
+    fn sync_births(&mut self) {
+        let n = self.buffer.chars().count();
+        self.births.truncate(n);
+        while self.births.len() < n { self.births.push(self.now); }
+    }
 
     /// The card to show beside the box: for the current completion if
     /// cycling, else for whatever verb has been typed so far.
@@ -224,6 +251,12 @@ impl ChatBox {
     }
 
     pub fn key(&mut self, k: Key) -> Action {
+        let a = self.key_inner(k);
+        self.sync_births();
+        a
+    }
+
+    fn key_inner(&mut self, k: Key) -> Action {
         if !self.open {
             return match k {
                 Key::Enter => { self.open = true; self.buffer.clear(); self.reset_cycle(); Action::Opened }
@@ -628,5 +661,42 @@ mod tests {
         b2.key(Key::Tab);
         assert_eq!(b2.buffer, "/provider ");
         assert_eq!(b2.current_card().unwrap().command, "/provider");
+    }
+
+    #[test]
+    fn births_track_the_buffer_through_every_edit() {
+        // If ages and chars fall out of step the panel indexes the wrong
+        // age for a letter and the wrong letter pops. Every path that
+        // edits the buffer must keep them equal in length.
+        let mut b = ChatBox::new();
+        b.tick(10.0);
+        b.key(Key::Enter);
+        type_str(&mut b, "/build");
+        assert_eq!(b.char_ages().len(), 6);
+        b.tick(10.5);
+        b.key(Key::Backspace);
+        assert_eq!(b.char_ages().len(), 5);
+        b.key(Key::Tab);                 // completion rewrites the buffer
+        assert_eq!(b.char_ages().len(), b.buffer.chars().count());
+        b.key(Key::Paste("x y".into()));
+        assert_eq!(b.char_ages().len(), b.buffer.chars().count());
+        b.key(Key::ClearLine);
+        assert!(b.char_ages().is_empty());
+        type_str(&mut b, "/plan");
+        b.key(Key::Up);                  // history swap
+        assert_eq!(b.char_ages().len(), b.buffer.chars().count());
+    }
+
+    #[test]
+    fn a_just_typed_letter_is_younger_than_an_older_one() {
+        let mut b = ChatBox::new();
+        b.tick(0.0);
+        b.key(Key::Enter);
+        b.key(Key::Char('a'));
+        b.tick(0.5);
+        b.key(Key::Char('b'));
+        let ages = b.char_ages();
+        assert!(ages[0] > ages[1], "a is older than b: {ages:?}");
+        assert!(ages[1] < 0.01, "b was just typed");
     }
 }

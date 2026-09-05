@@ -2,6 +2,7 @@ mod stubs;
 mod bind;
 mod paintbrush;
 mod armcheck;
+mod router;
 mod focusguard;
 
 use stubs::ChunkManager;
