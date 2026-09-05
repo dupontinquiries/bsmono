@@ -97,7 +97,7 @@ fn run_job(job: Job, analyze_only: bool, tx: Sender<Msg>, stop: Arc<AtomicBool>)
             let s = d2x_core::pipeline::analyze_only(source, job.pipeline, |i, st, _frac, t| {
                 let _ = tx.send(Msg::Event(Event::FrameDone { index: i, stats: *st, analyze_time: t, upscale_time: Duration::ZERO, merge_time: Duration::ZERO }));
             })?;
-            let _ = tx.send(Msg::Event(Event::Finished { frames: s.frames, elapsed: s.elapsed, upscaled_pixel_fraction: s.upscaled_pixel_fraction, heavy_pixel_fraction: s.heavy_pixel_fraction }));
+            let _ = tx.send(Msg::Event(Event::Finished { frames: s.frames, elapsed: s.elapsed, upscaled_pixel_fraction: s.upscaled_pixel_fraction, heavy_pixel_fraction: s.heavy_pixel_fraction, plate_pixel_fraction: s.plate_pixel_fraction }));
             return Ok(());
         }
         if job.jobs > 1 {
@@ -541,8 +541,11 @@ impl Shell {
                         self.push_log(if stats.redraw { LogLevel::Warn } else { LogLevel::Debug }, format!("frame {index}: psnr {:.1}, stat {} mov {} rec {} miss {} fade {}{}; A {:.1}ms U {:.1}ms M {:.1}ms", stats.psnr, stats.stationary, stats.moved, stats.recalled, stats.missing, stats.fades, if stats.redraw { " REDRAW" } else { "" }, analyze_time.as_secs_f64() * 1e3, upscale_time.as_secs_f64() * 1e3, merge_time.as_secs_f64() * 1e3));
                     }
                 }
-                Msg::Event(Event::Finished { frames, elapsed, upscaled_pixel_fraction, .. }) => {
-                    let s = format!("{frames} frames in {:.1}s ({:.2} fps); {:.1}% of pixels went through the network", elapsed.as_secs_f64(), frames as f64 / elapsed.as_secs_f64().max(1e-9), upscaled_pixel_fraction * 100.0);
+                Msg::Event(Event::PlateUpscaled { index, size, frames, area, time }) => {
+                    self.push_log(LogLevel::Info, format!("plate at frame {index}: {}x{}, {:.2} frames of pixels for {frames} frames, {:.0} ms", size.0, size.1, area, time.as_secs_f64() * 1e3));
+                }
+                Msg::Event(Event::Finished { frames, elapsed, upscaled_pixel_fraction, plate_pixel_fraction, .. }) => {
+                    let s = format!("{frames} frames in {:.1}s ({:.2} fps); {:.1}% of pixels went through the network (+{:.1}% as plates)", elapsed.as_secs_f64(), frames as f64 / elapsed.as_secs_f64().max(1e-9), upscaled_pixel_fraction * 100.0, plate_pixel_fraction * 100.0);
                     self.push_log(LogLevel::Info, s.clone());
                     self.summary = Some(s);
                 }

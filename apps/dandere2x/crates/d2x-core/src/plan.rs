@@ -66,6 +66,9 @@ pub enum BlockMatch {
     /// The block's cell content was upscaled before; the block cache holds
     /// the result under `key`.
     Cached { key: u64 },
+    /// The block at `(px, py)` of the window's plate passes the gate. Plate
+    /// coordinates; the merge reads the plate's upscale at `(px·s, py·s)`.
+    Plated { px: u32, py: u32 },
     /// Nothing in any reference passes; the block must be upscaled.
     Missing,
 }
@@ -108,6 +111,8 @@ pub struct FrameStats {
     pub recalled: u32,
     /// Blocks served from the content-keyed block cache.
     pub cached: u32,
+    /// Blocks served from the window's plate.
+    pub plated: u32,
     /// Residual image size in cells per tier (0×0 if none). Rectangular:
     /// `cols = ceil(sqrt(n))`, `rows = ceil(n / cols)`, so at most `cols − 1`
     /// cells are wasted instead of up to `2·sqrt(n)` for a square.

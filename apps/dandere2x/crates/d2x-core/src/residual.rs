@@ -90,12 +90,12 @@ pub fn make_residual(next_original: &Frame, plan: &FramePlan, bleed: u32) -> Res
 /// upscaled residual (tier 0), and the plan. `scale` is the upscaler's factor.
 pub fn merge(prev_up: &Frame, older_up: &[&Frame], residual_up: Option<&Frame>, plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
     let tiers: [Option<&Frame>; MAX_TIERS] = [residual_up, None, None];
-    merge_tiered(prev_up, older_up, &tiers, &CachedBlocks::new(), plan, scale, bleed)
+    merge_tiered(prev_up, older_up, None, &tiers, &CachedBlocks::new(), plan, scale, bleed)
 }
 
 /// [`merge`] with one upscaled residual image per tier and the bytes of
 /// any `Cached` blocks (`(block·scale)²` RGB each).
-pub fn merge_tiered(prev_up: &Frame, older_up: &[&Frame], residual_up: &[Option<&Frame>; MAX_TIERS], cached: &CachedBlocks, plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
+pub fn merge_tiered(prev_up: &Frame, older_up: &[&Frame], plate_up: Option<&Frame>, residual_up: &[Option<&Frame>; MAX_TIERS], cached: &CachedBlocks, plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
     let bs = plan.grid.block_size;
     let s = scale;
     anyhow::ensure!(
@@ -132,6 +132,11 @@ pub fn merge_tiered(prev_up: &Frame, older_up: &[&Frame], residual_up: &[Option<
                 let old = older_up.get(r as usize).ok_or_else(|| anyhow::anyhow!("merge: plan recalls reference {r} but only {} were given", older_up.len()))?;
                 anyhow::ensure!((old.width, old.height) == (prev_up.width, prev_up.height), "merge: reference {r} size mismatch");
                 out.copy_block(old, bs * s, x * s, y * s, x * s, y * s);
+            }
+            BlockMatch::Plated { px, py } => {
+                let p = plate_up.ok_or_else(|| anyhow::anyhow!("merge: plan uses the plate but no upscaled plate was given"))?;
+                anyhow::ensure!(p.block_in_bounds(px * s, py * s, bs * s), "merge: plated block ({px},{py}) outside the {}x{} upscaled plate", p.width, p.height);
+                out.copy_block(p, bs * s, px * s, py * s, x * s, y * s);
             }
             BlockMatch::Cached { key } => {
                 let b = cached.get(&key).ok_or_else(|| anyhow::anyhow!("merge: cached block {key:#x} not attached"))?;
@@ -335,6 +340,49 @@ mod tests {
         roundtrip(&prev, &next, 1, 2, &Stationary);
     }
 
+    /// Plated blocks round-trip exactly: a pan over a world, a plate built
+    /// from the whole window, and every frame merged from the plate's
+    /// nearest-neighbour upscale must equal the upscale of its low-res
+    /// reconstruction. Also pins that the pan's leading edge — content the
+    /// previous frame never saw — is Plated, not Missing.
+    #[test]
+    fn plated_blocks_roundtrip_and_explain_the_leading_edge() {
+        use crate::plate::Plate;
+        use crate::predict::{analyze_tiered, AnalyzeState};
+        let world = smooth(240, 96, 6);
+        let (fw, fh) = (128u32, 96u32);
+        let frames: Vec<Frame> = (0..8u32).map(|i| world.crop(8 * i, 0, fw, fh)).collect();
+        let refs: Vec<&Frame> = frames.iter().collect();
+        let plate = Plate::build(&refs, 0.2);
+        assert_eq!(plate.lo.width, 8 * 7 + fw);
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, ..Default::default() };
+        let mut up = NearestUpscaler { scale: 2 };
+        let plate_up = up.upscale(&plate.lo).unwrap();
+        let mut st = AnalyzeState::default();
+        let mut w = frames[0].clone();
+        let mut prev_up = up.upscale(&frames[0]).unwrap();
+        for i in 1..frames.len() {
+            let (plan, working_next, cached) = analyze_tiered(&mut w, &frames[i], &[], Some(plate.view(i)), &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+            assert!(!plan.redraw);
+            assert_eq!(plan.stats.missing, 0, "frame {i}: {:?}", plan.stats);
+            // Stationary is impossible under an 8 px pan; everything is Plated.
+            assert_eq!(plan.stats.plated, plan.grid.len() as u32, "frame {i}: {:?}", plan.stats);
+            let res = make_residual(&frames[i], &plan, 1);
+            let tiers: [Option<Frame>; MAX_TIERS] = [res.frame().map(|f| up.upscale(f).unwrap()), None, None];
+            let refs: [Option<&Frame>; MAX_TIERS] = [tiers[0].as_ref(), None, None];
+            let merged = merge_tiered(&prev_up, &[], Some(&plate_up), &refs, &cached, &plan, 2, 1).unwrap();
+            assert_eq!(merged, up.upscale(&working_next).unwrap(), "frame {i}");
+            // And, because the plate is exact here, the output IS the frame.
+            assert_eq!(working_next, frames[i], "frame {i}");
+            prev_up = merged;
+            w = working_next;
+        }
+        // A plan that uses the plate must be refused a merge without one.
+        let (plan, _, _) = analyze_tiered(&mut frames[0].clone(), &frames[1], &[], Some(plate.view(1)), &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+        let none: [Option<&Frame>; MAX_TIERS] = [None, None, None];
+        assert!(merge_tiered(&prev_up, &[], None, &none, &CachedBlocks::new(), &plan, 2, 1).is_err());
+    }
+
     /// Recalled blocks round-trip exactly through merge with a reference ring.
     #[test]
     fn recalled_blocks_roundtrip() {
@@ -382,12 +430,12 @@ mod tests {
         let prev_up = up.upscale(&prev).unwrap();
         let mut w = prev.clone();
         let mut st = AnalyzeState::default();
-        let (plan, working_next, _) = analyze_tiered(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 3, &mut st).unwrap();
+        let (plan, working_next, _) = analyze_tiered(&mut w, &next, &[], None, &JpegReference { quality: 97 }, &Stationary, &cfg, 3, &mut st).unwrap();
         assert_eq!(plan.stats.residual_tiers, [(1, 1), (1, 1), (1, 1)]);
         let res = make_residual(&next, &plan, 1);
         let ups: Vec<Option<Frame>> = (0..3).map(|t| res.tier(t).map(|f| up.upscale(f).unwrap())).collect();
         let refs: [Option<&Frame>; 3] = [ups[0].as_ref(), ups[1].as_ref(), ups[2].as_ref()];
-        let merged = merge_tiered(&prev_up, &[], &refs, &CachedBlocks::new(), &plan, 2, 1).unwrap();
+        let merged = merge_tiered(&prev_up, &[], None, &refs, &CachedBlocks::new(), &plan, 2, 1).unwrap();
         assert_eq!(merged, up.upscale(&working_next).unwrap());
     }
 

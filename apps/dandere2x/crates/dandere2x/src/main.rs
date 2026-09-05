@@ -77,6 +77,18 @@ struct Common {
     /// Shot-start outputs retained as references (cut-backs). Default: from --ram-budget.
     #[arg(long)]
     keyframe_refs: Option<usize>,
+    /// Plate window in frames (0 = off). Each window of up to N frames (ended
+    /// early at a scene cut) gets one background plate — a temporal median of
+    /// the frames placed under their global motion — which the main network
+    /// upscales ONCE and which then serves every block it explains as an exact
+    /// copy. Holds N input frames in RAM ahead of analysis (6.2 MB each at
+    /// 1080p) and adds N frames of latency before the first output.
+    #[arg(long, default_value_t = 0)]
+    plate_window: usize,
+    /// Phase-correlation confidence below which a frame pair's motion is not
+    /// trusted for plate placement (0..1).
+    #[arg(long, default_value_t = 0.2)]
+    plate_confidence: f32,
     /// Host memory the job may hold (e.g. 96G). Default: half of MemAvailable.
     #[arg(long)]
     ram_budget: Option<String>,
@@ -254,6 +266,8 @@ fn job_from(common: &Common, input: PathBuf, output: PathBuf) -> anyhow::Result<
     j.pipeline.queue_depth = common.batch.max(2) * 2;
     j.pipeline.analyze.tier_std = [common.flat_std, common.smooth_std];
     j.pipeline.analyze.streak_bonus = common.streak_bonus;
+    j.pipeline.plate_window = common.plate_window;
+    j.pipeline.plate_min_confidence = common.plate_confidence;
     j.cascade_model = common.cascade.as_ref().map(|c| if c == "default" { None } else { Some(PathBuf::from(c)) });
     j.flat_bypass = common.flat_bypass;
     j.pipeline.tiers = 1 + j.cascade_model.is_some() as usize + j.flat_bypass as usize;
@@ -275,10 +289,11 @@ fn print_event(e: &Event) {
         Event::FrameDone { index, stats, analyze_time, upscale_time, merge_time } => {
             let kind = if stats.redraw { "REDRAW" } else { "" };
             eprintln!(
-                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} rec {:3} cache {:3} miss {:4} fade {:3}  residual {} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
+                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} plt {:4} rec {:3} cache {:3} miss {:4} fade {:3}  residual {} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
                 stats.psnr,
                 stats.stationary,
                 stats.moved,
+                stats.plated,
                 stats.recalled,
                 stats.cached,
                 stats.missing,
@@ -289,8 +304,11 @@ fn print_event(e: &Event) {
                 merge_time.as_secs_f64() * 1e3
             );
         }
-        Event::Finished { frames, elapsed, upscaled_pixel_fraction, .. } => {
-            eprintln!("done: {frames} frames in {:.1}s ({:.2} fps); {:.1}% of pixels went through the network", elapsed.as_secs_f64(), *frames as f64 / elapsed.as_secs_f64().max(1e-9), upscaled_pixel_fraction * 100.0);
+        Event::PlateUpscaled { index, size, frames, area, time } => {
+            eprintln!("plate  {index:6}  {}x{} ({:.2} frames of pixels) for {frames} frames = {:.1}% per frame  U {:7.1}ms", size.0, size.1, area, 100.0 * area / (*frames).max(1) as f64, time.as_secs_f64() * 1e3);
+        }
+        Event::Finished { frames, elapsed, upscaled_pixel_fraction, plate_pixel_fraction, .. } => {
+            eprintln!("done: {frames} frames in {:.1}s ({:.2} fps); {:.1}% of pixels went through the network as residuals + {:.1}% as plates = {:.1}%", elapsed.as_secs_f64(), *frames as f64 / elapsed.as_secs_f64().max(1e-9), upscaled_pixel_fraction * 100.0, plate_pixel_fraction * 100.0, (upscaled_pixel_fraction + plate_pixel_fraction) * 100.0);
         }
     }
 }
@@ -328,10 +346,11 @@ fn main() -> anyhow::Result<()> {
             let (source, _) = job::open_source(&job)?;
             let bleed = job.pipeline.analyze.bleed;
             let summary = d2x_core::pipeline::analyze_only(source, job.pipeline, |i, s, frac, t| {
-                eprintln!("frame {i:6}  psnr {:5.1}  stat {:4} mov {:4} rec {:3} miss {:4} fade {:3}  upscaled {:5.1}%{}  {:.1}ms", s.psnr, s.stationary, s.moved, s.recalled, s.missing, s.fades, frac * 100.0, if s.redraw { " REDRAW" } else { "" }, t.as_secs_f64() * 1e3);
+                eprintln!("frame {i:6}  psnr {:5.1}  stat {:4} mov {:4} plt {:4} rec {:3} miss {:4} fade {:3}  upscaled {:5.1}%{}  {:.1}ms", s.psnr, s.stationary, s.moved, s.plated, s.recalled, s.missing, s.fades, frac * 100.0, if s.redraw { " REDRAW" } else { "" }, t.as_secs_f64() * 1e3);
             })?;
             let _ = bleed;
-            eprintln!("{} frames: {:.1}% of pixels through the main network ({:.1}x fewer than full upscaling), {:.1}% through any network tier", summary.frames, summary.heavy_pixel_fraction * 100.0, 1.0 / summary.heavy_pixel_fraction.max(1e-9), summary.upscaled_pixel_fraction * 100.0);
+            let total = summary.heavy_pixel_fraction + summary.plate_pixel_fraction;
+            eprintln!("{} frames: {:.1}% of pixels through the main network as residuals + {:.1}% as plates = {:.1}% ({:.1}x fewer than full upscaling); {:.1}% through any network tier as residuals", summary.frames, summary.heavy_pixel_fraction * 100.0, summary.plate_pixel_fraction * 100.0, total * 100.0, 1.0 / total.max(1e-9), summary.upscaled_pixel_fraction * 100.0);
         }
         Cmd::Selftest { model, tile, kernel } => {
             #[cfg(feature = "gpu")]
