@@ -121,6 +121,66 @@ void main() {}
 /// and you land on the same pixels as `project`.
 pub struct Camera { view: M4, proj: M4 }
 impl Camera {
+/// The depth range a scene of this size actually needs.
+///
+/// The live camera was built with a hardcoded `(0.3, 400.0)` regardless of
+/// what was being drawn. A perspective depth buffer spends most of its
+/// precision near the eye — resolution falls off as the SQUARE of distance —
+/// so a 1333:1 near/far ratio leaves almost nothing for the far half of the
+/// scene. Two columns a plaza apart then land in the same depth bucket and
+/// flicker against each other, which is what "z-fighting across the spaces"
+/// looks like.
+///
+/// `scene_radius` is how far the furthest geometry sits from the origin
+/// (the environment already knows: `ext_x`/`ext_z`), `cam_dist` how far the
+/// eye is. The far plane is fitted to what exists plus margin instead of a
+/// constant, and the near plane is pushed as far out as it can go while
+/// still not clipping anything the camera could reasonably be close to.
+///
+/// # Why raising NEAR is the lever
+///
+/// Doubling the near plane buys as much precision as halving the far one,
+/// and costs only the ability to put the eye inside geometry. Far-plane
+/// cuts are visible as the world ending; near-plane raises are visible
+/// only if you fly into a wall.
+pub fn depth_range(scene_radius: f32, cam_dist: f32) -> (f32, f32) {
+    let r = scene_radius.max(1.0);
+    let d = cam_dist.max(0.1);
+    // Everything, plus room for the camera to pull back and for geometry
+    // that overhangs the nominal extent.
+    let far = (d + r * 1.6).clamp(20.0, 2000.0);
+    // As far out as we dare: a fraction of the eye distance, so flying
+    // closer tightens it automatically, floored so it never collapses.
+    // Three LOWER bounds, not a range: the desired fraction of eye distance,
+    // the absolute floor, and whatever the ratio cap demands. My first
+    // version wrote this as a clamp and it panicked on a small scene, where
+    // `far / MAX_DEPTH_RATIO` is below `MIN_NEAR` and the "max" argument was
+    // under the "min" one.
+    let near = (d * 0.02)
+        .max(Self::MIN_NEAR)
+        .max(far / Self::MAX_DEPTH_RATIO)
+        .min(far * 0.5);
+    (near, far)
+}
+
+/// Never nearer than this — below it the precision gain stops mattering and
+/// the risk of clipping the thing you leaned in to look at starts.
+pub const MIN_NEAR: f32 = 0.25;
+/// The near/far ratio a 24-bit depth buffer handles without visible fighting
+/// at the far plane. The old hardcoded pair was 1333:1.
+pub const MAX_DEPTH_RATIO: f32 = 800.0;
+
+/// Smallest depth difference resolvable at eye-distance `z`, for a 24-bit
+/// buffer. Two surfaces closer together than this share a bucket and fight.
+///
+/// This is the number the range above exists to control, so it is worth
+/// being able to ask for it directly rather than trusting the ratio.
+pub fn depth_resolution_at(z: f32, near: f32, far: f32) -> f32 {
+    let steps = 16_777_216.0_f32; // 2^24
+    // d(z_ndc)/dz inverted: precision degrades with z^2 / (near*far).
+    (z * z * (far - near)) / (near * far * steps)
+}
+
     pub fn from_orbit(o: &OrbitCam, width: f32, height: f32, scale: f32, znear: f32, zfar: f32) -> Self {
         // view = Rz(roll) · T(0,0,-dist) · Rx(pitch) · Ry(yaw) · T(-target)   (roll = Dutch tilt around view axis)
         let view = mul(&mul(&mul(&mul(&rot_z(o.roll), &translate(0.0, 0.0, -o.dist)), &rot_x(o.pitch)), &rot_y(o.yaw)),
@@ -965,4 +1025,41 @@ mod tests {
             assert!((e[i] + o.dist * d[i] - t).abs() < 1e-3, "axis {i}");
         }
     }
+    #[test]
+    fn the_depth_range_is_fitted_to_the_scene_not_hardcoded() {
+        // A small room and a big plaza should not share a far plane.
+        let (n_small, f_small) = Camera::depth_range(10.0, 12.0);
+        let (n_big, f_big) = Camera::depth_range(120.0, 60.0);
+        assert!(f_big > f_small * 2.0, "{f_small} vs {f_big}");
+        assert!(f_small >= 12.0 + 10.0, "the far plane still covers the scene");
+        // Ratio stays inside what a 24-bit buffer handles — the old pair did not.
+        for (n, f) in [(n_small, f_small), (n_big, f_big)] {
+            assert!(f / n <= Camera::MAX_DEPTH_RATIO + 1e-3, "ratio {}", f / n);
+            assert!(n >= Camera::MIN_NEAR - 1e-6);
+        }
+        assert!(400.0 / 0.3 > Camera::MAX_DEPTH_RATIO, "the hardcoded pair was out of range");
+    }
+
+    #[test]
+    fn precision_at_the_far_field_actually_improves_on_the_old_pair() {
+        // The property, stated as the artefact: how far apart must two
+        // surfaces be at 80 units before they stop sharing a depth bucket?
+        let z = 80.0;
+        let old = Camera::depth_resolution_at(z, 0.3, 400.0);
+        let (n, f) = Camera::depth_range(60.0, 40.0);
+        let new = Camera::depth_resolution_at(z, n, f);
+        assert!(new < old, "old {old:.5} new {new:.5}");
+        // And it is a real margin, not a rounding win.
+        assert!(new < old * 0.5, "old {old:.5} new {new:.5}");
+    }
+
+    #[test]
+    fn degenerate_scenes_and_cameras_do_not_produce_an_inverted_range() {
+        for (r, d) in [(0.0_f32, 0.0_f32), (-5.0, -5.0), (1e6, 1e6), (0.001, 1000.0)] {
+            let (n, f) = Camera::depth_range(r, d);
+            assert!(n > 0.0 && f > n, "r={r} d={d} -> ({n}, {f})");
+            assert!(n.is_finite() && f.is_finite());
+        }
+    }
+
 }

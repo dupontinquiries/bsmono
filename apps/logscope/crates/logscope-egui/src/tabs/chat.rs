@@ -6331,7 +6331,17 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
             // pixel-aligned with the dots/runes because the camera matrix reproduces OrbitCam::project.
             #[cfg(feature = "gpu-scene")]
             {
-                let cam = crate::gpuscene::Camera::from_orbit(&view_cam, rect.width(), rect.height(), scale, 0.3, 400.0);
+                // DEPTH RANGE FITTED TO THE SCENE. This was a hardcoded
+                // (0.3, 400.0) whatever was being drawn — a 1333:1 near/far
+                // ratio, and a perspective depth buffer spends its precision
+                // near the eye, so the far half of a plaza had almost none
+                // left. Columns a distance apart landed in the same depth
+                // bucket and flickered: reported as "cylinder and circle
+                // z-fighting across the spaces".
+                let ep = crate::scene3d::env_params();
+                let scene_r = (ep.ext_x.max(ep.ext_z) as f32) * 0.5 + 8.0;
+                let (znear, zfar) = crate::gpuscene::Camera::depth_range(scene_r, view_cam.dist);
+                let cam = crate::gpuscene::Camera::from_orbit(&view_cam, rect.width(), rect.height(), scale, znear, zfar);
                 let mut verts = Vec::new();
                 // dynamic-LOD screen-size threshold (NDC) for SCENERY: drop meshes too small to read; more
                 // aggressive under battery-saver POWER; tunable via LOGSCOPE_LOD, off via LOGSCOPE_NO_LOD=1.
