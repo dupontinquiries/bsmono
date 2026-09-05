@@ -93,6 +93,12 @@ pub mod mood;
 pub mod recovery;
 /// Refinement: small graduated detail passes after the big plan.
 pub mod refine;
+/// Brushes: heightfield operations with falloff at landscape scale.
+pub mod brush;
+/// Layers: painted regions with rules, baked into blocks; detail packets.
+pub mod layer;
+/// Feature FSMs: rivers and other linear landforms as state machines.
+pub mod feature;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.
@@ -102,6 +108,9 @@ use std::collections::BTreeMap;
 
 /// Cap on writes per call. A model that asks to fill a 500-block cube
 /// gets an error naming the limit, not a stalled frame.
+/// Ceiling for a landscape brush: two million, about a 150-radius raise
+/// of 40. Beyond that the echo has already said "check the scale".
+pub const MAX_BLOCKS_PER_BRUSH: usize = 2_000_000;
 pub const MAX_BLOCKS_PER_CALL: usize = 200_000;
 
 /// Minimal surface the tools need from the engine. unendlich's
@@ -447,7 +456,22 @@ impl<'w, W: VoxelWorld> VoxelTools<'w, W> {
     /// Apply a planned set of weathering changes as ONE edit, so a ruin
     /// undoes as a unit rather than block by block.
     pub fn apply_changes(&mut self, changes: &[crate::weather::Change]) -> CallResult {
-        if changes.len() > MAX_BLOCKS_PER_CALL {
+        self.apply_changes_capped(changes, MAX_BLOCKS_PER_CALL)
+    }
+
+    /// Landscape-scale changes. A brush over r=60 is legitimately
+    /// 200,000 blocks; the per-call cap exists to stop ONE op from
+    /// stalling a frame on a bad number, and a brush's arithmetic echo
+    /// already flags anything over 20k columns as suspect. So brushes
+    /// get a higher ceiling, still finite, and still one edit so the
+    /// stroke undoes as a unit.
+    pub fn apply_changes_large(&mut self, changes: &[crate::weather::Change]) -> CallResult {
+        self.apply_changes_capped(changes, MAX_BLOCKS_PER_BRUSH)
+    }
+
+    fn apply_changes_capped(&mut self, changes: &[crate::weather::Change], cap: usize)
+        -> CallResult {
+        if changes.len() > cap {
             return CallResult::err(format!(
                 "refused: {} changes, over MAX_BLOCKS_PER_CALL={}",
                 changes.len(), MAX_BLOCKS_PER_CALL));

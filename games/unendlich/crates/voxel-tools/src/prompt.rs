@@ -159,6 +159,13 @@ OPS
   mirror A B [x|z] [about=N]                     reflect a region: pillars either side of something
   form NAME A B [style] [k=v]                    a named form from the dictionary
                                                  (village = several houses, not one)
+  brush OP A [by=N|to=Y] [r=N] [hill|mesa|cone|flat]   LANDSCAPE: raise, lower, smooth,
+                                                 flatten, roughen the ground under a radius
+  layer PACKET A B [density=0.6] [radial|gentle]  paint a region: temperate, alpine, boreal,
+                                                 jungle, desert, darkwood, meadow, barren
+  river A [dir=DEG] [len=N]                      a river from a source; the terrain decides
+                                                 the path, pools become lakes with outlets
+  lake A r=N level=Y                             flood a basin to a level
   mood NAME A B                                  set the FEEL of a region: palette, decay, clutter,
                                                  and fog/light/time for the engine (see MOODS)
   populate KIND A B [count=N] [name=X]           ask the engine for creatures or NPCs; KIND is
@@ -244,6 +251,17 @@ tree @14,10 oak h=8
 mood eerie @-18,-18 @18,18
 populate horrifying creatures @-18,-18 @18,18 count=6
 
+EXAMPLE (LANDSCAPE, hundreds of thousands of blocks from a few lines)
+  player: a valley with a forested range on one side and a river down it
+  plan:
+# valley
+brush raise @-60,0 by=30 r=70 hill
+brush raise @70,0 by=18 r=50 mesa
+brush roughen @0,0 by=3 r=120 flat
+layer boreal @-120,-60 @0,60 density=0.7 gentle
+layer meadow @0,-40 @60,40 density=0.4
+river @-50,10 dir=0 len=400
+
 EXAMPLE (massing; a lair for a named boss)
   player: build a fire dragon nest
   plan:
@@ -323,7 +341,7 @@ mod tests {
             assert!(!plan.ops.is_empty(), "example produced no ops:\n{src}");
             n += 1;
         }
-        assert_eq!(n, 6, "expected six worked examples");
+        assert_eq!(n, 7, "expected seven worked examples");
     }
 
     #[test]

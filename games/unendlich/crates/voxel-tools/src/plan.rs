@@ -140,6 +140,17 @@ pub enum Op {
     /// reconstructs and reports how faithful the result is.
     Views { views: Vec<(String, String)>, at: (i32, i32), y: Option<i32>,
             depth: i32, block: u16 },
+    /// A terrain brush: raise/lower/smooth/flatten/roughen with falloff.
+    Brush { op: String, amount: i32, at: (i32, i32), radius: i32, falloff: String, seed: i32 },
+    /// A painted layer baked into blocks: a forest, a meadow, a desert.
+    Layer { packet: String, min: (i32, i32), max: (i32, i32), density: f32,
+            coverage: String, seed: i32 },
+    /// A bounded flood: fill a basin with water to a level. A build op,
+    /// not a world override -- water placed by a plan within a radius,
+    /// which is what a river's pool is.
+    Lake { at: (i32, i32), radius: i32, level: i32 },
+    /// A river run as a state machine from a source.
+    River { at: (i32, i32), dir_deg: i32, max_len: i32, seed: i32 },
     /// Apply a mood over a region: palette restyle, weathering, clutter,
     /// and an atmosphere request for the engine.
     Mood { name: String, min: (i32, i32), max: (i32, i32), y: Option<i32> },
@@ -520,6 +531,67 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                             .unwrap_or(&"gable").to_string(),
                     block: blk("oak_planks").unwrap_or(57),
                     overhang: kvi(&t, "overhang", 1).clamp(0, 4) });
+            }
+            "brush" => {
+                let Some(op) = t.get(1).map(|s| s.to_lowercase()) else {
+                    bad("brush needs an op: raise, lower, smooth, flatten, roughen".into());
+                    continue;
+                };
+                if !["raise", "lower", "smooth", "flatten", "roughen"].contains(&op.as_str()) {
+                    bad(format!("unknown brush op '{op}'")); continue;
+                }
+                let at = rel(&t, 2, anchor).unwrap_or_else(|| anchor_xz(anchor));
+                ops.push(Op::Brush {
+                    op, at,
+                    amount: kvi(&t, "by", kvi(&t, "to", 10)),
+                    radius: kvi(&t, "r", 30).clamp(2, 400),
+                    falloff: t.iter().skip(2)
+                        .find(|s| crate::brush::Falloff::parse(s).is_some())
+                        .unwrap_or(&"smooth").to_string(),
+                    seed: kvi(&t, "seed", 1),
+                });
+            }
+            "layer" | "paint" => {
+                let Some(pk) = t.get(1).map(|s| s.to_lowercase()) else {
+                    bad("layer needs a packet name".into()); continue;
+                };
+                if crate::layer::packet(&pk).is_none() {
+                    bad(format!("unknown packet '{pk}'; known: {}",
+                        crate::layer::PACKETS.iter().map(|p| p.name).collect::<Vec<_>>().join(", ")));
+                    continue;
+                }
+                let shifted: Vec<&str> = std::iter::once("layer")
+                    .chain(t.iter().skip(2).copied()).collect();
+                let Some((a, b, note)) = footprint(&shifted, anchor) else {
+                    rel_err.set(true); continue;
+                };
+                if let Some(n) = note { assumed!(&n); }
+                ops.push(Op::Layer {
+                    packet: pk, min: a, max: b,
+                    density: kv(&t, "density").and_then(|v| v.parse().ok())
+                        .unwrap_or(0.6f32).clamp(0.0, 1.0),
+                    coverage: t.iter().skip(2)
+                        .find(|s| ["full", "radial", "gentle"].contains(s)
+                              || s.starts_with("above=") || s.starts_with("below="))
+                        .unwrap_or(&"full").to_string(),
+                    seed: kvi(&t, "seed", 1),
+                });
+            }
+            "lake" | "pond" => {
+                let at = rel(&t, 1, anchor).unwrap_or_else(|| anchor_xz(anchor));
+                let Some(level) = kv(&t, "level").and_then(|v| v.parse().ok()) else {
+                    bad("lake needs level=Y".into()); continue;
+                };
+                ops.push(Op::Lake { at, radius: kvi(&t, "r", 8).clamp(2, 80), level });
+            }
+            "river" | "stream" => {
+                let at = rel(&t, 1, anchor).unwrap_or_else(|| anchor_xz(anchor));
+                ops.push(Op::River {
+                    at,
+                    dir_deg: kvi(&t, "dir", 0),
+                    max_len: kvi(&t, "len", 200).clamp(10, 2000),
+                    seed: kvi(&t, "seed", 1),
+                });
             }
             "mood" | "atmosphere" => {
                 let Some(name) = t.get(1).map(|s| s.to_lowercase()) else {
@@ -998,6 +1070,77 @@ pub fn run_plan_with<W: VoxelWorld>(
                 match crate::dict::lookup(name) {
                     Some(f) => tools.stamp(&(f.build)(&args)),
                     None => CallResult::err(format!("unknown form '{name}'")),
+                }
+            }
+            Op::Brush { op, amount, at, radius, falloff, seed } => {
+                use crate::brush::{self, Brush, BrushOp, Falloff};
+                let bop = match op.as_str() {
+                    "raise" => BrushOp::Raise(*amount),
+                    "lower" => BrushOp::Lower(*amount),
+                    "smooth" => BrushOp::Smooth((*amount as f32 / 10.0).clamp(0.1, 1.0)),
+                    "flatten" => BrushOp::Flatten(*amount),
+                    _ => BrushOp::Roughen(*amount),
+                };
+                let b = Brush { centre: *at, radius: *radius,
+                                falloff: Falloff::parse(falloff).unwrap_or(Falloff::Smooth),
+                                op: bop, seed: *seed as u64 };
+                let plan = brush::plan(tools.world, &b, from_y, 2);
+                let summary = plan.summary();
+                let mut r = tools.apply_changes_large(&plan.changes);
+                // Keep a refusal VISIBLE. The first version overwrote the
+                // summary unconditionally, so a brush refused for size
+                // reported its full planned count as if placed -- and the
+                // mesa that was not there looked like a rendering bug.
+                if r.ok { r.summary = format!("brush {op}: {summary}"); }
+                else { r.summary = format!("brush {op} REFUSED: {}", r.summary); }
+                r
+            }
+            Op::Layer { packet, min, max, density, coverage, seed } => {
+                use crate::layer::{self, Coverage, Layer};
+                let cov = match coverage.as_str() {
+                    "radial" => Coverage::Radial,
+                    "gentle" => Coverage::Gentle(1.0),
+                    s if s.starts_with("above=") =>
+                        Coverage::Above(s[6..].parse().unwrap_or(from_y)),
+                    s if s.starts_with("below=") =>
+                        Coverage::Below(s[6..].parse().unwrap_or(from_y)),
+                    _ => Coverage::Full,
+                };
+                let l = Layer { name: packet.clone(), min: *min, max: *max,
+                                packet: layer::packet(packet).expect("parser checked"),
+                                density: *density, coverage: cov, seed: *seed as u64 };
+                let baked = layer::bake(tools.world, &l, from_y);
+                // The bake is IR: run it as a nested plan so every tree
+                // goes through the same tree op as a hand-written one.
+                let (sub, _) = parse_plan_at(&baked.ir, None);
+                let sr = run_plan_with(tools, &sub, from_y, chunk_size, dry_run, library);
+                CallResult {
+                    ok: sr.failed == 0, blocks_changed: sr.blocks_changed,
+                    summary: format!("layer {}: {} trees, {} cover, {} rocks, {} repainted \
+                                      -> {} blocks", packet, baked.trees, baked.cover,
+                                     baked.rocks, baked.repainted, sr.blocks_changed),
+                    ..Default::default()
+                }
+            }
+            Op::Lake { at, radius, level } => {
+                let eff = crate::godmode::flood(tools.world, *at, *radius, *level, 9);
+                let mut r = tools.apply_changes_large(&eff.blocks);
+                if r.ok { r.summary = format!("lake: {}", eff.note); }
+                r
+            }
+            Op::River { at, dir_deg, max_len, seed } => {
+                use crate::feature::{Reader, River};
+                let r = Reader::new(tools.world, from_y);
+                let mut river = River::new(at.0, at.1, (*dir_deg as f32).to_radians(), *max_len);
+                river.seed = *seed as u64;
+                let ir = river.run(&r);
+                let desc = river.describe();
+                let (sub, _) = parse_plan_at(&ir, None);
+                let sr = run_plan_with(tools, &sub, from_y, chunk_size, dry_run, library);
+                CallResult {
+                    ok: sr.failed == 0, blocks_changed: sr.blocks_changed,
+                    summary: format!("{desc} -> {} blocks", sr.blocks_changed),
+                    ..Default::default()
                 }
             }
             Op::Mood { name, min, max, y } => {

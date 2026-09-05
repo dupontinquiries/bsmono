@@ -223,6 +223,39 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                 push(Note::Info, format!("tree height {height}, roughly {} blocks with canopy",
                                           height + 60), None);
             }
+            Op::Brush { op, amount, radius, falloff, .. } => {
+                let cols = (std::f64::consts::PI * (*radius as f64).powi(2)) as i64;
+                let est = cols * (*amount as i64).abs().max(1) / 2;
+                total += est;
+                push(if cols > 20_000 { Note::Suspect } else { Note::Info },
+                     format!("brush {op} {amount} over r={radius} ({falloff}): {cols} columns, \
+                              roughly {est} blocks", ),
+                     None);
+            }
+            Op::Layer { packet, min, max, density, coverage, .. } => {
+                let cols = span(min.0, max.0) as i64 * span(min.1, max.1) as i64;
+                let p = crate::layer::packet(packet);
+                let trees = p.map(|p| (cols as f32 * p.tree_rate * density / 100.0) as i64)
+                    .unwrap_or(0);
+                total += trees * 40 + cols / 8;
+                push(Note::Info,
+                     format!("layer {packet} over {cols} columns at {:.0}% ({coverage}): \
+                              about {trees} trees", density * 100.0),
+                     None);
+            }
+            Op::Lake { at, radius, level } => {
+                let cols = (std::f64::consts::PI * (*radius as f64).powi(2)) as i64;
+                total += cols * 3;
+                push(Note::Info, format!("lake at {at:?} r={radius} to y={level}: up to {cols} columns"),
+                     None);
+            }
+            Op::River { at, dir_deg, max_len, .. } => {
+                total += *max_len as i64 * 6;
+                push(Note::Info,
+                     format!("river from {at:?} heading {dir_deg} deg, up to {max_len} long; \
+                              the path is decided by the terrain, not by this plan"),
+                     None);
+            }
             Op::Mood { name, min, max, .. } => {
                 let m = crate::mood::lookup(name);
                 push(Note::Info,
