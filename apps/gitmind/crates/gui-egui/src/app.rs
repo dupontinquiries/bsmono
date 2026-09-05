@@ -212,7 +212,25 @@ impl App {
                 ui.add_space(6.0);
                 ui.heading("gitmind");
                 ui.add_space(6.0);
-                ui.vertical(|ui| self.nav_buttons(ui, false));
+                // GROUPED, by the same `Tab::sections()` the compact nav uses.
+                // Twelve flat entries is a list you read top to bottom every
+                // time; three headed groups of four is one you learn the shape
+                // of. This is what "sections on desktop" means for a nav —
+                // showing several PAGES at once is the pager's job, not this
+                // panel's.
+                ui.vertical(|ui| {
+                    for sec in Tab::sections() {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(sec.label).small().weak());
+                        for &i in &sec.items {
+                            let t = Tab::ALL[i];
+                            if ui.selectable_label(self.tab == t,
+                                    format!("{}  {}", t.icon(), t.label())).clicked() {
+                                self.tab = t;
+                            }
+                        }
+                    }
+                });
             });
         }
 
