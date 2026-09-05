@@ -1873,7 +1873,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let mut paintbrush = unendlich_engine::voxel_chat::Paintbrush::new(
         unendlich_engine::constants::CHUNK_SIZE);
     let mut chat_toggle = false;
-    let mut chat_key: Option<voxel_tools::chatbox::Key> = None;
+    // A QUEUE, not one slot. Several key events arrive in a single frame
+    // whenever the frame is long — which is exactly when you are typing
+    // during a chunk load — and a single Option kept only the last one.
+    // Characters vanished under load and it looked like dropped input
+    // because it was.
+    let mut chat_keys: Vec<voxel_tools::chatbox::Key> = Vec::new();
     // Provider: an executable reading <system>\0<user> on stdin. Located
     // by `voxel_chat::find_provider`, which is anchored at compile time
     // rather than to the working directory.
@@ -3710,8 +3715,23 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 WindowEvent::CursorPos(_, _) => cursor_events += 1,
                 _ => {}
             }
+            // While the chat owns the keyboard the game must not see key
+            // events at all. This call is BEFORE the match below, so
+            // guarding only the match arms left WASD reaching the player:
+            // you walked while typing. Mouse look and cursor motion still
+            // pass through, which is what you want — you can aim at where
+            // a build should go while describing it.
+            let chat_owns_keys = renderer.chat_open;
             if let Some(ev) = unendlich_engine::input_codes::input_event_from_glfw(&event) {
-                input.handle_event(&ev);
+                // Both key variants: an UnknownKey is still a keystroke
+                // the chat is consuming, and letting it through would
+                // bump press counters behind a focused text field.
+                let is_key = matches!(ev,
+                    unendlich_engine::input_codes::InputEvent::Key { .. }
+                    | unendlich_engine::input_codes::InputEvent::UnknownKey { .. });
+                if !(chat_owns_keys && is_key) {
+                    input.handle_event(&ev);
+                }
             }
             match event {
                 WindowEvent::Char(ch) => {
@@ -3719,7 +3739,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // egui fields never see it, so the two cannot both
                     // claim a character.
                     if renderer.chat_open {
-                        chat_key = Some(voxel_tools::chatbox::Key::Char(ch));
+                        chat_keys.push(voxel_tools::chatbox::Key::Char(ch));
                     } else {
                         // r181: text input for egui fields (name/seed boxes).
                         ui_text_frame.push(ch);
@@ -3731,7 +3751,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
                 WindowEvent::Key(Key::Escape, _, Action::Press, _) => {
                     if renderer.chat_open {
-                        chat_key = Some(voxel_tools::chatbox::Key::Escape);
+                        chat_keys.push(voxel_tools::chatbox::Key::Escape);
                     } else {
                         esc_pressed = true;
                     }
@@ -3742,20 +3762,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 WindowEvent::Key(Key::Enter, _, Action::Press, _)
                 | WindowEvent::Key(Key::KpEnter, _, Action::Press, _) => {
                     if renderer.chat_open {
-                        chat_key = Some(voxel_tools::chatbox::Key::Enter);
+                        chat_keys.push(voxel_tools::chatbox::Key::Enter);
                     } else {
                         chat_toggle = true;
                     }
                 }
                 WindowEvent::Key(Key::Tab, _, Action::Press, mods) if renderer.chat_open => {
-                    chat_key = Some(if mods.contains(glfw::Modifiers::Shift) {
+                    chat_keys.push(if mods.contains(glfw::Modifiers::Shift) {
                         voxel_tools::chatbox::Key::ShiftTab
                     } else {
                         voxel_tools::chatbox::Key::Tab
                     });
                 }
                 WindowEvent::Key(Key::Backspace, _, Action::Press, _) if renderer.chat_open => {
-                    chat_key = Some(voxel_tools::chatbox::Key::Backspace);
+                    chat_keys.push(voxel_tools::chatbox::Key::Backspace);
                 }
                 // Clipboard. Ctrl+V works with the box shut too (it opens
                 // it), because the first paste of a session otherwise
@@ -3767,13 +3787,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 {
                     let text = window.get_clipboard_string().unwrap_or_default();
                     if !text.is_empty() {
-                        chat_key = Some(voxel_tools::chatbox::Key::Paste(text));
+                        chat_keys.push(voxel_tools::chatbox::Key::Paste(text));
                     }
                 }
                 WindowEvent::Key(Key::C, _, Action::Press, mods)
                     if mods.contains(glfw::Modifiers::Control) =>
                 {
-                    chat_key = Some(if mods.contains(glfw::Modifiers::Shift) {
+                    chat_keys.push(if mods.contains(glfw::Modifiers::Shift) {
                         voxel_tools::chatbox::Key::CopyLog
                     } else {
                         voxel_tools::chatbox::Key::Copy
@@ -3782,13 +3802,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 WindowEvent::Key(Key::U, _, Action::Press, mods)
                     if renderer.chat_open && mods.contains(glfw::Modifiers::Control) =>
                 {
-                    chat_key = Some(voxel_tools::chatbox::Key::ClearLine);
+                    chat_keys.push(voxel_tools::chatbox::Key::ClearLine);
                 }
                 WindowEvent::Key(Key::Up, _, Action::Press, _) if renderer.chat_open => {
-                    chat_key = Some(voxel_tools::chatbox::Key::Up);
+                    chat_keys.push(voxel_tools::chatbox::Key::Up);
                 }
                 WindowEvent::Key(Key::Down, _, Action::Press, _) if renderer.chat_open => {
-                    chat_key = Some(voxel_tools::chatbox::Key::Down);
+                    chat_keys.push(voxel_tools::chatbox::Key::Down);
                 }
                 WindowEvent::Key(key, scancode, Action::Press, _) => {
                     // #2 (Dvorak): toggle panel mode on the key LABELED 'p' in the
@@ -4288,20 +4308,34 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // state machine the tests drive.
                 paintbrush.key(CK::Enter);
                 renderer.chat_open = paintbrush.captures_input();
+                if renderer.chat_open {
+                    // Drop keys held at the moment focus was taken. GLFW
+                    // will not deliver the Release for a key the chat is
+                    // swallowing, so a W held when the box opens would
+                    // walk the player forever.
+                    input.release_all();
+                }
             }
 
             let mut submitted: Option<unendlich_engine::sim::command_parse::Command> = None;
-            if let Some(k) = chat_key.take() {
+            if !chat_keys.is_empty() {
                 // Keep the box's log copy fresh so Ctrl+Shift+C has
                 // something to hand back.
                 paintbrush.chatbox.log_snapshot = renderer.chat_log.clone();
-                match paintbrush.key_full(k) {
-                    unendlich_engine::voxel_chat::KeyOut::Command(c) => submitted = Some(c),
-                    unendlich_engine::voxel_chat::KeyOut::Copy(text) => {
-                        window.set_clipboard_string(&text);
-                        paintbrush.say(format!("copied {} chars", text.len()));
+                for k in chat_keys.drain(..) {
+                    match paintbrush.key_full(k) {
+                        unendlich_engine::voxel_chat::KeyOut::Command(c) => {
+                            // Enter submitted mid-queue: run this command
+                            // and let the rest of the queue type into the
+                            // now-empty line, rather than discarding it.
+                            submitted = Some(c);
+                        }
+                        unendlich_engine::voxel_chat::KeyOut::Copy(text) => {
+                            window.set_clipboard_string(&text);
+                            paintbrush.say(format!("copied {} chars", text.len()));
+                        }
+                        unendlich_engine::voxel_chat::KeyOut::None => {}
                     }
-                    unendlich_engine::voxel_chat::KeyOut::None => {}
                 }
                 renderer.chat_open = paintbrush.captures_input();
             }
