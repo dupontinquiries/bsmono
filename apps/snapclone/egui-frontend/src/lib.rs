@@ -3979,9 +3979,23 @@ impl Snapclone {
         });
         ui.separator();
         // the composer, over the captured frame
-        ui.horizontal(|ui| {
+        // WRAPPED, not a fixed row. Reserving room for a known number of
+        // trailing controls is brittle: sizing the field to clear "colour"
+        // simply exposed the duration button behind it, cut at the same
+        // edge. Wrapping means whatever does not fit moves to the next line
+        // instead of off the window, however many controls this row grows.
+        ui.horizontal_wrapped(|ui| {
             ui.label("caption");
-            let cap = ui.add(egui::TextEdit::singleline(&mut self.composer.caption).id_salt("lib-self_composer_caption"));
+            // RESERVE THE BUTTON'S ROOM. A singleline TextEdit defaults to the
+            // whole remaining width of the row, so "colour" after it had
+            // nothing left and was drawn past the window's right edge — cut
+            // off mid-word on a phone. Seen in a screenshot; the layout probe
+            // missed it because the galley's clip rect was the full-width
+            // panel, which is now fixed too (clip is intersected with the
+            // screen). 92pt is the button plus the row's spacing.
+            let room = (ui.available_width() - 92.0).max(80.0);
+            let cap = ui.add(egui::TextEdit::singleline(&mut self.composer.caption)
+                .id_salt("lib-self_composer_caption").desired_width(room));
             // THE KEYBOARD INSET, finally fed. apply_keyboard_inset has been
             // written and tested since the port and nothing ever called it —
             // the manifest records the gap as an open on-device task, because

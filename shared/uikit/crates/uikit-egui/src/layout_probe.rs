@@ -116,7 +116,16 @@ pub fn analyse(screen: Rect, shapes: &[ClippedShape], compact: bool) -> Report {
         r.smallest_font_pt = r.smallest_font_pt.min(a.font_pt);
         if compact && a.font_pt < MIN_READABLE_PT { r.tiny.push(a.clone()); }
         // Clipped: the part of the galley outside its clip, worst side.
-        let inter = a.rect.intersect(a.clip);
+        // The EFFECTIVE clip is the clip rect intersected with the screen:
+        // nothing outside the window is visible however generous the clip
+        // rect is. Without this, a galley running off the right edge of the
+        // window was invisible to the probe — its clip was the full-width
+        // panel, so `over_x` was zero, and the off-screen test below only
+        // fired when the rect missed the screen ENTIRELY. A snapclone
+        // screenshot showed "colour" cut at the window edge on a page this
+        // probe was reporting clean, which is how the gap was found.
+        let effective_clip = a.clip.intersect(screen);
+        let inter = a.rect.intersect(effective_clip);
         if inter.is_negative() || inter.width() <= 0.0 || inter.height() <= 0.0 {
             // Entirely outside its clip: painted nowhere. Off-screen if
             // also outside the screen, else clipped away whole.
@@ -235,4 +244,29 @@ mod tests {
         });
         assert!(r.overlaps.is_empty(), "{}", r.describe());
     }
+    #[test]
+    fn text_running_off_the_window_edge_is_caught_even_inside_a_generous_clip() {
+        // The real case: a row laid out wider than the window, clipped only
+        // by a panel that is itself the full width. Visible on screen as a
+        // cut-off word; invisible to a probe that compares the galley only
+        // against its own clip rect.
+        let r = probe(egui::vec2(200.0, 120.0), 2, false, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.painter().text(egui::pos2(178.0, 20.0), egui::Align2::LEFT_TOP,
+                    "colour", egui::FontId::proportional(14.0), egui::Color32::WHITE);
+            });
+        });
+        assert_eq!(r.clipped.len(), 1, "{}", r.describe());
+        assert!(r.clipped[0].0.text.contains("colour"));
+        assert!(!r.clean());
+        // Fully inside is still clean.
+        let ok = probe(egui::vec2(200.0, 120.0), 2, false, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.painter().text(egui::pos2(10.0, 20.0), egui::Align2::LEFT_TOP,
+                    "colour", egui::FontId::proportional(14.0), egui::Color32::WHITE);
+            });
+        });
+        assert!(ok.clean(), "{}", ok.describe());
+    }
+
 }
