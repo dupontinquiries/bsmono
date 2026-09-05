@@ -143,6 +143,10 @@ pub enum Command {
     /// `/land` — list claims here; `/land info <id>`; `/land add <id> <player>`.
     /// Player names and workset ids keep their case.
     Land(LandOp),
+    /// `/shot <frame|orbit|reveal|fly> [id]` — camera presentation of a
+    /// build: the hero framing, an orbit, a pull-back reveal, or a
+    /// fly-through along its paths.
+    Shot { kind: String, id: Option<String> },
     /// `/world <verb> [args]` — drive the engine's own systems:
     /// hotter, colder, wetter, drier, flood, freeze.
     World { verb: String, arg: Option<String> },
@@ -268,6 +272,11 @@ pub fn parse(line: &str) -> Command {
                 ("claim", n) if !n.is_empty() => Command::Land(LandOp::Claim(n.join(" "))),
                 _ => Command::Unknown,
             },
+        },
+        "/shot" => match args.as_slice() {
+            [k] => Command::Shot { kind: k.to_ascii_lowercase(), id: None },
+            [k, id] => Command::Shot { kind: k.to_ascii_lowercase(), id: Some((*id).to_string()) },
+            _ => Command::Unknown,
         },
         "/world" => match args.as_slice() {
             [v] => Command::World { verb: v.to_ascii_lowercase(), arg: None },
@@ -422,6 +431,8 @@ impl Command {
             Command::Land(LandOp::Info(id)) => Some(format!("/land info {id}")),
             Command::Land(LandOp::Add { id, player }) => Some(format!("/land add {id} {player}")),
             Command::Land(LandOp::Claim(n)) => Some(format!("/land claim {n}")),
+            Command::Shot { kind, id: None } => Some(format!("/shot {kind}")),
+            Command::Shot { kind, id: Some(i) } => Some(format!("/shot {kind} {i}")),
             Command::World { verb, arg: None } => Some(format!("/world {verb}")),
             Command::World { verb, arg: Some(a) } => Some(format!("/world {verb} {a}")),
             Command::Provider(None) => Some("/provider".to_string()),
@@ -712,6 +723,18 @@ mod tests {
         assert_eq!(parse("/world"), Command::Unknown);
         for c in [Command::World { verb: "freeze".into(), arg: None },
                   Command::World { verb: "flood".into(), arg: Some("70".into()) }] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c);
+        }
+    }
+
+    #[test]
+    fn shot_verbs_parse_and_round_trip() {
+        assert_eq!(parse("/shot orbit"), Command::Shot { kind: "orbit".into(), id: None });
+        assert_eq!(parse("/shot reveal w3"),
+                   Command::Shot { kind: "reveal".into(), id: Some("w3".into()) });
+        assert_eq!(parse("/shot"), Command::Unknown);
+        for c in [Command::Shot { kind: "frame".into(), id: None },
+                  Command::Shot { kind: "fly".into(), id: Some("w2".into()) }] {
             assert_eq!(parse(&c.to_command_string().unwrap()), c);
         }
     }

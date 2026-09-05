@@ -230,6 +230,35 @@ impl ChatSession {
             && a.2 >= lb.min.2 - pad && a.2 <= lb.max.2 + pad
     }
 
+    /// A macro the prose names, expanded against the last build, so it
+    /// needs no model at all. "Fortify my base" is geometry once the
+    /// base's box is known; asking a 1B to derive nine coordinated
+    /// lines for it is asking for one of them to be wrong.
+    ///
+    /// Returns the IR to feed straight into `receive_plan_for`, or None
+    /// when the prose is not a macro or there is nothing to apply it to.
+    pub fn macro_ir(&self, prose: &str, gaze: &Gaze) -> Option<String> {
+        let verb = crate::verbs::recognize(prose)?;
+        let lb = self.last_build.as_ref()?;
+        // Only when the player is actually looking at the thing: "fortify
+        // my base" while staring at a field is a request for a new base,
+        // and that one the model should handle.
+        if !self.focus_on_last_build(gaze) { return None; }
+        let ws = crate::land::Workset {
+            id: "last".into(), name: lb.name.clone(), owner: String::new(),
+            members: vec![], min: lb.min, max: lb.max, turns: vec![] };
+        let feet = self.focus(gaze).anchor;
+        Some(match verb {
+            crate::verbs::Verb::Fortify =>
+                crate::verbs::fortify(&ws, 3, 5, "stone", "dark_oak_planks", (feet.0, feet.2)),
+            crate::verbs::Verb::Expand(side) => crate::verbs::expand(&ws, &side, 6, "stone"),
+            crate::verbs::Verb::Light => crate::verbs::light(&ws, 4, "glow_crystal"),
+            crate::verbs::Verb::Repair => crate::verbs::repair(&ws, "stone"),
+            // connect needs a second workset the session does not know
+            crate::verbs::Verb::Connect => return None,
+        })
+    }
+
     /// The full user turn for the model: context, inferred pass, prose.
     /// The pass can be forced ("expand" from a /build --expand flag or a
     /// UI button); otherwise it is inferred from the words and from
@@ -816,5 +845,32 @@ mod tests {
             Reply::Preview { echo, .. } => assert!(!echo.contains("REFUSED"), "{echo}"),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn fortify_my_base_needs_no_model_when_looking_at_the_base() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        s.receive_plan(&mut t, &g, "# base\nenclose @-4,-4 @4,4 h=4 block=stone_bricks\n");
+        s.commit(&mut t, &g);
+        let ir = s.macro_ir("fortify my base", &g).expect("a macro, not a model call");
+        assert!(ir.contains("# fortify base"));
+        // and it builds
+        match s.receive_plan(&mut t, &g, &ir) {
+            Reply::Preview { blocks, .. } => assert!(blocks > 100, "walls and towers: {blocks}"),
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn a_macro_with_nothing_to_apply_to_falls_through_to_the_model() {
+        let mut w = Flat::new();
+        let t = VoxelTools::new(&mut w);
+        let s = ChatSession::new(32, 200);
+        assert!(s.macro_ir("fortify my base", &gaze_at(0, 0, 10.0)).is_none(),
+                "no base yet: the model should build one");
+        let _ = t;
     }
 }

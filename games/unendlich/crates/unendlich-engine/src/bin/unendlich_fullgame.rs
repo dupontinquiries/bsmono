@@ -1880,6 +1880,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // is wide enough to leak a whole burst of typing into movement,
     // which is why the drops correlated with lag.
     let mut chat_focus = false;
+    // A presentation shot in progress: the poses, which segment, and how
+    // far through it. Any key or mouse button returns the camera.
+    let mut shot: Option<(Vec<voxel_tools::camera::Pose>, usize, f32)> = None;
     // A QUEUE, not one slot. Several key events arrive in a single frame
     // whenever the frame is long — which is exactly when you are typing
     // during a chunk load — and a single Option kept only the last one.
@@ -4406,6 +4409,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             // reaches the child, and report it.
                             std::env::set_var("VOXEL_MODEL", &path);
                             paintbrush.finish_load(16384);
+                        }
+                        Pending::Camera(poses) => {
+                            if poses.len() >= 2 { shot = Some((poses, 1, 0.0)); }
+                            else if let Some(p) = poses.first() {
+                                // a single frame: cut there and hold
+                                shot = Some((vec![*p, *p], 1, 0.0));
+                            }
                         }
                         Pending::VoiceGrammar(_) | Pending::VoiceOff | Pending::None => {}
                     }
@@ -12837,6 +12847,26 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 if !(chat_focus && is_key) {
                     input.handle_event_late(&ev);
                 }
+            }
+        }
+        // Presentation shot: ease the camera along the poses. Overrides
+        // the player's view while it runs; the first key or click ends it
+        // and hands the view back where it was left.
+        if let Some((poses, seg, t)) = shot.as_mut() {
+            let dt = frame_dt_s.max(0.0001);
+            let cur = &poses[*seg];
+            *t += dt / cur.seconds.max(0.001);
+            if *t >= 1.0 {
+                *seg += 1; *t = 0.0;
+            }
+            if *seg >= poses.len() || key_events > 0 || mouse_events > 0 {
+                shot = None;
+            } else {
+                let p = voxel_tools::camera::lerp(&poses[*seg - 1], &poses[*seg], *t);
+                local_player.view.position = nalgebra_glm::vec3(p.eye[0], p.eye[1], p.eye[2]);
+                let f = p.forward();
+                local_player.view.yaw = f[2].atan2(f[0]);
+                local_player.view.pitch = f[1].asin();
             }
         }
         if mouse_captured && input.cursor_delta != (0.0, 0.0) {

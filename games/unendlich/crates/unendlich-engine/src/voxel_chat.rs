@@ -51,6 +51,9 @@ pub enum Pending {
     VoiceGrammar(Vec<Vec<String>>),
     /// Stop listening.
     VoiceOff,
+    /// Play these camera poses, easing between them with
+    /// `camera::lerp`, then return control to the player.
+    Camera(Vec<voxel_tools::camera::Pose>),
 }
 
 /// Locate a provider script without depending on the process working
@@ -342,6 +345,8 @@ pub struct Paintbrush {
     /// Current backend. Defaults from $UNENDLICH_BUILD_HTTP if set, so a
     /// running ollama is picked up without typing anything.
     pub provider: ProviderChoice,
+    /// Claims, ownership and build history; saved with the world.
+    pub land: voxel_tools::land::Registry,
     /// The resident in-instance engine, if one has been loaded.
     #[cfg(feature = "ai-engine")]
     pub engine: ResidentEngine,
@@ -388,6 +393,7 @@ impl Paintbrush {
             #[cfg(feature = "ai-engine")]
             engine: ResidentEngine::default(),
             in_flight: None,
+            land: voxel_tools::land::Registry::new(),
             ctx_tokens: 8192,
             max_reply: 512,
         }
@@ -545,6 +551,45 @@ impl Paintbrush {
                 if !self.cancel_turn() { self.say("nothing in flight"); }
                 Pending::None
             }
+            Command::Shot { kind, id } => {
+                // Subject: a named workset, else the last build.
+                let subject = match id.as_deref() {
+                    Some(i) => self.land.get(i).map(|w| (w.name.clone(), w.min, w.max)),
+                    None => self.session.last_build.as_ref()
+                        .map(|lb| (lb.name.clone(), lb.min, lb.max)),
+                };
+                let Some((name, min, max)) = subject else {
+                    self.say("nothing to frame -- build something, or /shot <kind> <id>");
+                    return Pending::None;
+                };
+                use voxel_tools::camera::{self, Subject};
+                let subj = Subject { min, max };
+                let eye = [gaze.eye.0, gaze.eye.1, gaze.eye.2];
+                let fov = 1.2;
+                let poses = match kind.as_str() {
+                    "frame" | "hero" => vec![camera::frame(&subj, fov, eye)],
+                    "orbit" => camera::orbit(&subj, fov, 24, 8.0),
+                    "reveal" => camera::reveal(&subj, fov, eye, 4.0),
+                    "fly" => {
+                        // Along the build's own footprint at head height:
+                        // in through the near face, across, and out.
+                        let y = min.1;
+                        let cx = (min.0 + max.0) / 2;
+                        camera::flythrough(&[
+                            (cx, y, min.2 - 6), (cx, y, min.2), (cx, y, (min.2 + max.2) / 2),
+                            (cx, y, max.2), (cx, y, max.2 + 6)], 1.7, 6.0)
+                    }
+                    other => {
+                        self.say(format!("unknown shot '{other}': frame, orbit, reveal, fly"));
+                        return Pending::None;
+                    }
+                };
+                let total: f32 = poses.iter().map(|p| p.seconds).sum();
+                self.say(format!("{kind} of \"{name}\": {} pose(s), {total:.1}s -- \
+                                  press any key to stop", poses.len()));
+                log::info!("[paintbrush] shot {kind} of {name}: {} poses", poses.len());
+                Pending::Camera(poses)
+            }
             Command::Keys => {
                 for c in voxel_tools::chatbox::CARDS {
                     if c.command == "/keys" { self.say(c.summary.replace(" · ", "\n  ")); }
@@ -619,6 +664,20 @@ impl Paintbrush {
             return;
         }
         let debug = prose.trim_start().starts_with("debug");
+        // A recognized macro against the build in focus needs no model:
+        // "fortify my base" is geometry once the base's box is known.
+        if !debug {
+            if let Some(ir) = self.session.macro_ir(prose, gaze) {
+                log::info!("[paintbrush] macro expanded, no model call: {prose:?}");
+                self.say("(expanded without the model)");
+                let view = WorldView(cm);
+                let mut staged = StagedWorld::new(&view);
+                let mut tools = VoxelTools::new(&mut staged);
+                let r = self.session.receive_plan_for(&mut tools, gaze, &ir, player_feet);
+                self.push(r);
+                return;
+            }
+        }
         // Same borrow shape as `prompt_for`: the view lives for the
         // length of this call, which is all a prompt needs -- it reads
         // the world and never writes.

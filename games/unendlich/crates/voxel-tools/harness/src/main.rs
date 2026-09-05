@@ -11,6 +11,7 @@ fn main() {
     scenario();
     focus_scenario();
     async_scenario();
+    macro_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -240,4 +241,62 @@ fn async_scenario() {
     assert!(refused);
     assert!(pb.cancel_turn(), "cancel drops it");
     println!("  cancelled cleanly");
+}
+
+/// "fortify my base" with no model, and a shot of the result.
+fn macro_scenario() {
+    use paintbrush::{Paintbrush, Pending};
+    use voxel_tools::chatbox::Key;
+    println!("\n==== macros and shots");
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    // The harness lives in /tmp, so the fixture is named by absolute path.
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../providers/fixture.sh");
+    let fixture = std::fs::canonicalize(fixture).map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "/home/claude/bundle/voxel/providers/fixture.sh".into());
+    pb.provider = paintbrush::ProviderChoice::Script(vec![fixture]);
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0],
+                                     Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    let feet = Some((0, 65, -12));
+    let mut line = |pb: &mut Paintbrush, l: &str| -> Option<stubs::Command> {
+        pb.key(Key::Enter); for c in l.chars() { pb.key(Key::Char(c)); } pb.key(Key::Enter)
+    };
+    // a base first (the fixture builds a tower)
+    let cmd = line(&mut pb, "/build a base").unwrap();
+    if let Pending::Model(p) = pb.dispatch(&cm, &gaze, cmd) {
+        pb.start_turn(&cm, &gaze, None, &p, feet);
+        while pb.in_flight.is_some() { pb.poll_turn(&cm); std::thread::sleep(std::time::Duration::from_millis(10)); }
+    }
+    let cmd = line(&mut pb, "/commit").unwrap();
+    pb.dispatch(&cm, &gaze, cmd);
+    for l in pb.drain_log() { println!("  after commit: {}", l.lines().next().unwrap_or("")); }
+    println!("  last_build: {:?}", pb.session.last_build.as_ref().map(|b| (b.name.clone(), b.min, b.max)));
+    println!("  looking at it: {}", pb.session.focus_on_last_build(&gaze));
+
+    // now the macro: no provider will be called
+    pb.provider = paintbrush::ProviderChoice::Script(vec!["/bin/false".into()]);
+    pb.start_turn(&cm, &gaze, None, "fortify my base", feet);
+    let log = pb.drain_log();
+    assert!(log.iter().any(|l| l.contains("expanded without the model")), "{log:?}");
+    let planned = log.iter().find(|l| l.contains("blocks planned")).cloned().unwrap_or_default();
+    println!("  fortify: {planned}");
+    let cmd = line(&mut pb, "/commit").unwrap();
+    pb.dispatch(&cm, &gaze, cmd);
+    for l in pb.drain_log() { if l.contains("built") { println!("  {l}"); } }
+
+    // and a shot of it
+    let cmd = line(&mut pb, "/shot reveal").unwrap();
+    match pb.dispatch(&cm, &gaze, cmd) {
+        Pending::Camera(poses) => {
+            let total: f32 = poses.iter().map(|p| p.seconds).sum();
+            println!("  reveal: {} poses over {total:.1}s, from {:.0?} to {:.0?}",
+                     poses.len(), poses[0].eye, poses.last().unwrap().eye);
+            assert!(poses.last().unwrap().eye[1] > poses[0].eye[1], "pulls up and back");
+        }
+        o => panic!("{o:?}"),
+    }
+    let cmd = line(&mut pb, "/shot orbit").unwrap();
+    if let Pending::Camera(poses) = pb.dispatch(&cm, &gaze, cmd) {
+        println!("  orbit: {} poses", poses.len());
+    }
 }

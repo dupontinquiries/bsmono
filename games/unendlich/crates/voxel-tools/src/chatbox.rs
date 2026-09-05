@@ -98,11 +98,17 @@ pub const CARDS: &[Card] = &[
                      Ctrl+C copy line · Ctrl+Shift+C copy log · Ctrl+U clear · \
                      Ctrl+Enter commit · Ctrl+Z undo · PgUp/PgDn focus. \
                      Commands: /build /build debug /plan /commit /undo /focus \
-                     /anim /model /provider /cancel /land /world /keys",
+                     /anim /model /provider /cancel /land /world /shot /keys. \
+                     Phrases that need no model when you are looking at your build: \
+                     fortify my base, make it bigger, light it up, repair it",
            example: "/keys", arg_words: &[] },
     Card { command: "/cancel", signature: "/cancel",
            summary: "Drop a model request in flight. The worker finishes; its answer is discarded.",
            example: "/cancel", arg_words: &[] },
+    Card { command: "/shot", signature: "/shot <frame|orbit|reveal|fly> [id]",
+           summary: "Present a build: hero framing, an orbit, a pull-back reveal, or a fly-through.",
+           example: "/shot reveal",
+           arg_words: &["frame", "orbit", "reveal", "fly"] },
     Card { command: "/land", signature: "/land [info ID | add ID PLAYER | claim NAME]",
            summary: "What is built here, who owns it, and who else may change it.",
            example: "/land info w3",
@@ -592,7 +598,7 @@ mod tests {
         const PARSER_VERBS: &[&str] = &[
             "/build", "/plan", "/commit", "/undo", "/focus", "/anim",
             "/model", "/provider", "/keys", "/find", "/locate",
-            "/cancel", "/land", "/world",
+            "/cancel", "/land", "/world", "/shot",
         ];
         for v in PARSER_VERBS {
             assert!(card_for(v).is_some(), "{v} has no card, so nobody will find it");

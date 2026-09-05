@@ -83,6 +83,10 @@ pub mod godmode;
 pub mod intent;
 /// Templates: capture a build and reuse it as vocabulary.
 pub mod template;
+/// Verbs against an existing build: fortify, expand, light, connect, repair.
+pub mod verbs;
+/// Camera: hero framing, orbit, reveal, and fly-through for presenting a build.
+pub mod camera;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.
