@@ -73,6 +73,30 @@ pub fn paragraphs(md: &str) -> Vec<Paragraph> {
     out
 }
 
+/// Paragraphs from an ALREADY-PARSED html document — what the manpage view
+/// holds. `Doc` keeps html, not the markdown `paragraphs` expects, and
+/// re-serialising html back to markdown just to re-split it would be two
+/// lossy conversions to reach text the parser already has in hand.
+///
+/// Headings and rules are skipped: a heading is a signpost, not something
+/// you read at a pace, and pacing one would spend a paragraph's budget on
+/// three words. Code blocks and quotes keep their slower rate.
+pub fn paragraphs_from_html(doc: &uikit_web::RichDoc) -> Vec<Paragraph> {
+    let mut out = Vec::new();
+    for b in &doc.blocks {
+        let kind = match b.kind {
+            uikit_web::BlockKind::Code => ContentType::Code,
+            uikit_web::BlockKind::Heading(_) | uikit_web::BlockKind::Rule => continue,
+            _ => ContentType::Prose,
+        };
+        let text: String = b.inlines.iter().map(|i| i.text.as_str()).collect::<Vec<_>>().join("");
+        let text = text.trim().to_string();
+        if text.is_empty() { continue; }
+        out.push(Paragraph { text, kind });
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pacer {
     pub paragraphs: Vec<Paragraph>,
@@ -86,6 +110,11 @@ pub enum Outcome { KeptUp, FellBehind }
 
 impl Pacer {
     pub fn new(md: &str) -> Pacer { Pacer { paragraphs: paragraphs(md), current: 0, elapsed: 0.0, running: false } }
+
+    /// The manpage view's path: it already parsed the html to render it.
+    pub fn from_html(doc: &uikit_web::RichDoc) -> Pacer {
+        Pacer { paragraphs: paragraphs_from_html(doc), current: 0, elapsed: 0.0, running: false }
+    }
 
     pub fn done(&self) -> bool { self.current >= self.paragraphs.len() }
 
@@ -128,8 +157,16 @@ pub struct Trainer {
     pub best: f32,
 }
 
+/// Where a reader starts before the trainer has learned anything: roughly
+/// average adult prose reading speed, so the first page is neither a crawl
+/// nor a blur and the adjustment has somewhere to go in both directions.
+pub const START_WPM: f32 = 240.0;
 pub const MIN_WPM: f32 = 80.0;
 pub const MAX_WPM: f32 = 1200.0;
+
+impl Default for Trainer {
+    fn default() -> Self { Trainer::new(START_WPM) }
+}
 
 impl Trainer {
     pub fn new(wpm: f32) -> Trainer { Trainer { wpm: wpm.clamp(MIN_WPM, MAX_WPM), streak: 0, best: 0.0 } }
@@ -217,4 +254,42 @@ mod tests {
         assert_eq!(Trainer::from_line(&t.to_line()).unwrap().wpm.round(), 284.0);
         assert!(Trainer::from_line("junk").is_none());
     }
+    #[test]
+    fn html_blocks_become_paced_paragraphs_and_headings_are_skipped() {
+        let doc = uikit_web::parse_html(
+            "<h1>ls</h1><p>List directory contents.</p><pre>ls -la</pre><hr><p>Last words.</p>");
+        let ps = paragraphs_from_html(&doc);
+        let kinds: Vec<ContentType> = ps.iter().map(|p| p.kind).collect();
+        assert_eq!(kinds, vec![ContentType::Prose, ContentType::Code, ContentType::Prose],
+                   "{:?}", ps.iter().map(|p| &p.text).collect::<Vec<_>>());
+        assert_eq!(ps[0].text, "List directory contents.");
+        assert!(ps.iter().all(|p| !p.text.is_empty()));
+        // Code still reads slower than prose of the same length.
+        let a = Paragraph { text: "one two three".into(), kind: ContentType::Prose };
+        let b = Paragraph { text: "one two three".into(), kind: ContentType::Code };
+        assert!(b.budget_secs(300.0) > a.budget_secs(300.0));
+    }
+
+    #[test]
+    fn a_pacer_from_html_runs_the_same_way_as_one_from_markdown() {
+        let doc = uikit_web::parse_html("<p>a b c d e f g h i j</p><p>k l</p>");
+        let mut p = Pacer::from_html(&doc);
+        assert_eq!(p.paragraphs.len(), 2);
+        assert!(!p.done());
+        p.running = true;
+        assert_eq!(p.tick(1.0, 600.0), Some(Outcome::FellBehind), "10 words at 600 wpm is 1 s");
+        assert_eq!(p.current, 1);
+        assert_eq!(p.next(), Some(Outcome::KeptUp));
+        assert!(p.done());
+    }
+
+    #[test]
+    fn a_document_with_nothing_readable_is_an_empty_pacer_not_a_panic() {
+        let doc = uikit_web::parse_html("<h1>only a heading</h1><hr>");
+        let p = Pacer::from_html(&doc);
+        assert!(p.paragraphs.is_empty());
+        assert!(p.done(), "an empty pacer is finished, not stuck");
+        assert_eq!(p.progress(300.0), 1.0);
+    }
+
 }

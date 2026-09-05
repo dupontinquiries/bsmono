@@ -52,6 +52,13 @@ impl Doc {
 /// The reader.
 #[derive(Debug, Clone, Default)]
 pub struct ManpageView {
+    /// The reading pacer, when the reader has started one. Keyed to the doc
+    /// it was built for, so opening another page does not leave you paced
+    /// through a page you are no longer reading.
+    pub pacer: Option<(String, crate::reading_trainer::Pacer)>,
+    /// Words per minute, and how it has moved. Persists across pages: the
+    /// point of the trainer is that your pace carries.
+    pub trainer: crate::reading_trainer::Trainer,
     docs: Vec<Doc>,
     /// Names visited, oldest first. The last is the current page.
     stack: Vec<String>,
@@ -164,6 +171,53 @@ pub fn manpage_ui(ui: &mut egui::Ui, v: &mut ManpageView,
             // Rendered through the shared document model — the same one the
             // browser view uses, so a manual page and a web page look alike.
             let doc = uikit_web::parse_html(&html);
+            // THE PACER. `reading_trainer` has been tested since it was
+            // written and nothing drove it, so paced reading did not exist.
+            // Built from the html the renderer already parsed, and rebuilt
+            // when the page changes so you are never paced through a page
+            // you have left.
+            let name = v.current_name().unwrap_or_default().to_string();
+            if v.pacer.as_ref().is_some_and(|(n, _)| *n != name) { v.pacer = None; }
+            ui.horizontal(|ui| {
+                let running = v.pacer.as_ref().is_some_and(|(_, p)| p.running && !p.done());
+                if ui.button(if running { "pause" } else { "read" })
+                    .on_hover_text("pace through this page a paragraph at a time")
+                    .clicked()
+                {
+                    match &mut v.pacer {
+                        Some((_, p)) if !p.done() => p.running = !p.running,
+                        _ => {
+                            let mut p = crate::reading_trainer::Pacer::from_html(&doc);
+                            p.running = true;
+                            v.pacer = Some((name.clone(), p));
+                        }
+                    }
+                }
+                if let Some((_, p)) = &mut v.pacer {
+                    if !p.done() {
+                        // Finishing early is the signal the trainer learns
+                        // from — it is the reader saying "faster".
+                        if ui.button("next ›").clicked() {
+                            if let Some(o) = p.next() { v.trainer.record(o); }
+                        }
+                        if ui.button("‹ back").clicked() { p.back(); }
+                        ui.label(format!("{}/{}", p.current + 1, p.paragraphs.len()));
+                        let frac = p.progress(v.trainer.wpm);
+                        ui.add(egui::ProgressBar::new(frac).desired_width(90.0));
+                    } else {
+                        ui.colored_label(c.text_weak, "finished");
+                    }
+                    ui.colored_label(c.text_weak, format!("{:.0} wpm", v.trainer.wpm));
+                }
+            });
+            // Time only passes while the pacer is running and the pointer is
+            // in this pane; a page left open in a background tab must not
+            // teach the trainer that the reader fell behind.
+            if let Some((_, p)) = &mut v.pacer {
+                let dt = ui.input(|i| i.stable_dt);
+                if let Some(o) = p.tick(dt, v.trainer.wpm) { v.trainer.record(o); }
+                if p.running && !p.done() { ui.ctx().request_repaint(); }
+            }
             egui::ScrollArea::vertical().id_salt("manpage").show(ui, |ui| {
                 // A LINK IN A MANUAL PAGE IS A CROSS-REFERENCE. `render`
                 // returns the href now, and here that is the name of
