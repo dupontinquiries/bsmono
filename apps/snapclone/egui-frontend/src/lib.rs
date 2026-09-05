@@ -5516,6 +5516,21 @@ mod tests {
                 // * desktop / Friends: FIXED. The chevron was laid out at the
                 //   far right of the available width, which includes the
                 //   scrollbar's strip.
+                // WHAT THIS TEST DOES NOT COVER — measured, not assumed.
+                // The composer row overflowed the window at 400x800 in the
+                // running app (screenshot), and this harness reported the
+                // Camera page CLEAN throughout. I confirmed it by reverting
+                // the fix and re-running: bug present, probe still clean. So
+                // a green run here is NOT evidence that a page has no
+                // overflow — the fixture drives `app.ui()` inside a bare
+                // CentralPanel, while the runtime installs the hint bar and
+                // tab bar panels first and passes a different `Adaptive`,
+                // and the two lay out differently. CLAUDE.md's rule for
+                // harnesses applies: this one does not load its data the way
+                // the runtime does. Treat it as a ratchet against
+                // REGRESSIONS in what it does see, and use a screenshot for
+                // "does this page fit".
+                //
                 // NO EXCEPTIONS LEFT. Every page, both form factors, clean.
                 // phone/Camera was (6, 1) until its controls band was sized for
                 // the seven rows it holds rather than three and given the clip
