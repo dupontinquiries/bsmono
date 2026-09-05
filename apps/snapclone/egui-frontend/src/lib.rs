@@ -4289,15 +4289,35 @@ impl Snapclone {
     /// The palette: a field, a ranked list, a cursor. Enter runs the
     /// chosen one now or puts it on the schedule; Escape closes.
     fn palette_ui(&mut self, ui: &mut Ui, surface: egui::Rect, now_ms: u64, c: &PaletteColors) {
-        let area = egui::Rect::from_min_size(
-            egui::pos2(surface.min.x + surface.width() * 0.1, surface.min.y + 24.0),
-            egui::vec2(surface.width() * 0.8, 260.0));
-        ui.painter().rect_filled(area, 10.0, c.bg_raised);
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area.shrink(12.0)));
+        // The palette FLOATS: dim the page behind it, or `bg_raised` over
+        // `bg_base` is a few points of luminance and the two fields read as
+        // one crowded surface. The card supplies the border, the shadow, the
+        // padding and the row gap — see `uikit_egui::overlay`.
+        let style = uikit_egui::overlay::CardStyle::default();
+        // Height from the content: a field, a divider, up to seven rows at
+        // the touch height, and the gaps between. The old fixed 260 was too
+        // tall for two matches and too short for seven.
+        let rows = crate::palette::suggest(&self.palette_input, now_ms, 0,
+                                           &self.palette_contacts(),
+                                           self.group_voice.joined, &PAGES).len().min(7);
+        let row_h = 26.0;
+        let content_h = 24.0 + style.gap + 1.0 + style.gap
+            + (rows.max(1) as f32) * (row_h + style.gap);
+        let area = uikit_egui::overlay::fit_on_screen(
+            egui::Rect::from_min_size(
+                egui::pos2(surface.min.x + surface.width() * 0.1, surface.min.y + 24.0),
+                egui::vec2(surface.width() * 0.8, style.outer_size(egui::vec2(0.0, content_h)).y)),
+            surface, 12.0);
+        uikit_egui::overlay::scrim(ui, surface, 0.45);
+        let mut child = uikit_egui::overlay::card(ui, area, c, style);
         let field = child.add(egui::TextEdit::singleline(&mut self.palette_input)
             .hint_text("call at the hour · send ada in 10 min · flip · inbox")
             .desired_width(f32::INFINITY).id_salt("lib-palette_input"));
         if std::mem::take(&mut self.palette_focus) { field.request_focus(); }
+        // A rule between what you typed and what matched: without it the
+        // first result sat one default item-gap under the field and read as
+        // part of it.
+        uikit_egui::overlay::divider(&mut child, c, style.gap);
         let contacts = self.palette_contacts();
         let items = crate::palette::suggest(&self.palette_input, now_ms, 0, &contacts,
                                             self.group_voice.joined, &PAGES);
@@ -4344,11 +4364,22 @@ impl Snapclone {
         ui.painter().rect_stroke(rect, 6.0, egui::Stroke::new(2.0, c.accent), egui::StrokeKind::Outside);
         let what = self.key_labels.get(&id).cloned().unwrap_or_else(|| "activate".into());
         let text = format!("Space / Enter: {what} · Tab: next · Ctrl+K: commands");
-        let pos = egui::pos2(rect.left(), rect.bottom() + 4.0);
         let galley = ui.painter().layout_no_wrap(text, egui::FontId::proportional(11.0), c.text);
-        let bg = egui::Rect::from_min_size(pos, galley.size() + egui::vec2(8.0, 4.0));
-        ui.painter().rect_filled(bg, 4.0, c.bg_raised);
-        ui.painter().galley(pos + egui::vec2(4.0, 2.0), galley, c.text);
+        // Padding on all four sides from the compact style (the old 8×4 was
+        // 4 left / 4 right / 2 top / 2 bottom — tighter than any other
+        // surface in the app), and CLAMPED: a focused widget near the bottom
+        // edge used to draw its caption off the screen.
+        let style = uikit_egui::overlay::CardStyle::compact();
+        let want = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.bottom() + 4.0),
+            style.outer_size(galley.size()));
+        let bg = uikit_egui::overlay::fit_on_screen(want, ui.ctx().content_rect(), 4.0);
+        if style.border {
+            ui.painter().rect_filled(bg, style.radius, c.bg_raised);
+            ui.painter().rect_stroke(bg, style.radius, egui::Stroke::new(1.0, c.border),
+                                     egui::StrokeKind::Inside);
+        }
+        ui.painter().galley(style.inner(bg).min, galley, c.text);
     }
 
     /// What the hint reads. Assembled here so `hint::hint` stays a pure

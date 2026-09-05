@@ -202,7 +202,16 @@ pub fn qr_ui(ui: &mut egui::Ui, s: &mut QrScan,
     let dt = ui.input(|i| i.stable_dt) * 1000.0;
     let mut out = s.tick(dt);
 
+    // Air around the whole pane and between its rows. Without this every
+    // row sat at egui's default 3-pt item spacing: the heading touched the
+    // viewfinder, the status touched the frame, and the manual field and
+    // its button ran together into one band.
+    let pad = uikit_egui::tokens::SPACE_MD as f32;
+    let gap = uikit_egui::tokens::SPACE_SM as f32;
+    ui.add_space(pad);
+    ui.spacing_mut().item_spacing.y = gap;
     ui.vertical_centered(|ui| {
+        ui.spacing_mut().item_spacing.y = gap;
         ui.colored_label(c.text_weak, "SCAN A CODE");
         if s.is_scanning() || matches!(s.phase, Phase::Found { .. }) {
             // The viewfinder: a frame that flashes on a hit. Nothing decodes
@@ -213,6 +222,10 @@ pub fn qr_ui(ui: &mut egui::Ui, s: &mut QrScan,
                 let g = c.success;
                 egui::Color32::from_rgba_unmultiplied(g.r(), g.g(), g.b(), (255.0 * lit) as u8)
             } else { c.border };
+            // The viewfinder gets its own filled well, so the frame reads as
+            // a hole to look through rather than an outline floating on the
+            // page — and so the status line under it has an edge to sit off.
+            ui.painter().rect_filled(rect, 8.0, c.bg_base);
             ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(2.0_f32, border),
                                      egui::StrokeKind::Inside);
         }
@@ -221,16 +234,26 @@ pub fn qr_ui(ui: &mut egui::Ui, s: &mut QrScan,
         } else { c.text_weak };
         ui.colored_label(status_col, s.status());
 
+        // A rule with real air either side, not egui's flush separator: this
+        // is the seam between "point the camera" and "type it instead", and
+        // the two halves were running together.
+        ui.add_space(gap);
         ui.separator();
+        ui.add_space(gap);
         // The manual field is present in BOTH phases, not only the fallback: a
         // camera that will not focus should not stop you adding a contact.
+        ui.colored_label(c.text_weak, "OR TYPE THE CODE");
         ui.add(egui::TextEdit::singleline(&mut s.manual).id_salt("qr-s_manual")
             .hint_text(MANUAL_HINT).desired_width(240.0));
-        if ui.button("Add").clicked() && s.submit_manual() {
+        // The button is its own row at touch height, clear of the field it
+        // submits — they were adjacent at default spacing.
+        if ui.add_sized([240.0, uikit_egui::tokens::TOUCH_MIN as f32],
+                        egui::Button::new("Add")).clicked() && s.submit_manual() {
             if let Phase::Done(cc) = &s.phase { out = Some(cc.clone()); }
         }
         if let Some(e) = &s.error { ui.colored_label(c.danger, e); }
     });
+    ui.add_space(pad);
     out
 }
 
