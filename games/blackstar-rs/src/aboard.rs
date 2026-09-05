@@ -121,6 +121,18 @@ pub const FLEET: &[(&str, f32, &str)] = &[
     ("carrier", 46.0, "you will get lost in this one"),
 ];
 
+/// The exterior model drawn over the procedural hull skin.
+///
+/// One name, in one place: `main.rs` loads it at startup and
+/// `cycle_ship` RELOADS it at the new size on every hull swap. Those
+/// were two different behaviours until the swap was tested — the hull,
+/// the rooms and the collision all resized while the model you actually
+/// SEE stayed at whatever size it was first loaded at, because
+/// `load_exterior` bakes `hull_half.z * 2.0` in at load time. The ship
+/// visibly did not change, which is exactly what a player reports as
+/// "the key does nothing".
+pub const EXTERIOR_MODEL: &str = "spaceship_warpzone_aka_military_troop_ship";
+
 /// The default hull class, by index into `FLEET`.
 pub const FLEET_DEFAULT: usize = 1;
 
@@ -328,6 +340,23 @@ pub fn hull_skin_mesh(ship: &Interior) -> crate::meshgen::MeshData {
                 tri(tip, rings[idx][k], rings[idx][k2]);
             }
         }
+    }
+    // THE BOARDING RAMP, merged into the same skin mesh so a ship swap
+    // cannot leave the ramp behind at the old hull's size — the skin is
+    // rebuilt and re-uploaded on every change, and the ramp rides along.
+    // Its travel comes from the ship's own bay door rather than a second
+    // clock: the ramp IS how you get in, so it should be down exactly
+    // when the ship says the bay is open.
+    {
+        let spec = crate::boarding::RampSpec::for_hull_len(prof.half_z * 2.0, ship.occupant_h);
+        let mount = crate::boarding::RampMount::place(&spec, prof, ship.deck_y);
+        let travel = ship
+            .links
+            .iter()
+            .find(|l| l.door.kind == crate::airlock::Kind::Launch)
+            .map(|l| l.door.travel)
+            .unwrap_or(1.0);
+        crate::meshgen::merge(&mut out, &crate::boarding::ramp_mesh(&spec, &mount, travel));
     }
     out
 }

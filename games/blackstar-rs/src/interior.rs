@@ -122,6 +122,15 @@ pub struct Link {
     pub door: Door,
 }
 
+/// Which doors a `sense_doors_reporting` pass actually moved, by index
+/// into `Interior::links`. Empty on a frame where nothing changed,
+/// which is most of them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DoorReport {
+    pub opened: Vec<usize>,
+    pub closed: Vec<usize>,
+}
+
 /// Cloneable so the camera can hold a probe.
 ///
 /// `camera.rs` takes a closure asking "is this point open volume", and a
@@ -164,6 +173,88 @@ fn axis_box(a: Vec3, b: Vec3, half_w: f32, half_h: f32) -> (Vec3, Vec3) {
 }
 
 impl Interior {
+    /// Build an interior from a `roomplan` plan — the shape-derived path.
+    ///
+    /// `generate` lays out `content::HUB`'s fixed eight rooms scaled by
+    /// one length number, so every ship is the same ship at a different
+    /// size. This takes a plan that already followed the hull's own
+    /// envelope and turns it into real cells, links and doors.
+    ///
+    /// **This does not replace `generate` and nothing calls it yet.**
+    /// Swapping the game's ships over changes every interior at once and
+    /// wants its own pass with eyes on the result — and the smallest
+    /// fleet hull currently plans ZERO rooms (`--roomplan`), which needs
+    /// a fallback decision rather than a silent empty ship. Returns
+    /// `None` for an empty plan rather than an interior you cannot
+    /// stand in.
+    pub fn from_plan(
+        plan: &[crate::roomplan::PlannedRoom],
+        hull_half: Vec3,
+        occupant_h: f32,
+    ) -> Option<Interior> {
+        if plan.is_empty() {
+            return None;
+        }
+        let cells: Vec<Cell> = plan
+            .iter()
+            .map(|r| Cell {
+                // the plan owns its ids as Strings; cells want 'static.
+                // Leaking is what `stations.rs` already does for the same
+                // reason — these live for the process either way.
+                id: Box::leak(r.id.clone().into_boxed_str()),
+                name: Box::leak(r.id.to_uppercase().into_boxed_str()),
+                kind: r.kind,
+                centre: r.centre,
+                half: r.half,
+                fixtures: fixtures_for(r.kind),
+                blurb: "",
+            })
+            .collect();
+
+        // CONNECT EVERY ROOM TO THE SPINE, and the spine to itself is
+        // not a link. A plan is a spine plus rooms beside it, so the
+        // topology is a star rather than HUB's hand-authored graph —
+        // which is the honest shape of a generated plan and keeps every
+        // room reachable without inventing adjacency the plan never
+        // claimed.
+        let spine = cells.iter().position(|c| c.kind == RoomKind::Corridor);
+        let (dw, dh) = drive_half(occupant_h);
+        let drive_clearance = cells.iter().any(|c| c.half.x >= dw && c.half.y >= dh);
+        let mut links = Vec::new();
+        if let Some(s) = spine {
+            for i in 0..cells.len() {
+                if i == s {
+                    continue;
+                }
+                let cw = (cells[i].half.x * 0.5).max(0.3);
+                let ch = (cells[i].half.y * 0.8).max(0.3);
+                let (centre, half) = axis_box(cells[s].centre, cells[i].centre, cw, ch);
+                let touches = |k: RoomKind| cells[i].kind == k || cells[s].kind == k;
+                let gauge = if !drive_clearance {
+                    Gauge::Personnel
+                } else if touches(RoomKind::Hangar) {
+                    Gauge::Launch
+                } else {
+                    Gauge::Vehicle
+                };
+                let kind = if touches(RoomKind::Hangar) { Kind::Launch } else { Kind::Hatch };
+                let door = Door::new(kind, gauge, centre, half * 0.8);
+                links.push(Link { a: s, b: i, centre, half, door });
+            }
+        }
+        let lock = Airlock::new(Vec3::ZERO, Vec3::ONE, Gauge::Personnel);
+        Some(Interior {
+            prof: std::cell::OnceCell::new(),
+            occupant_h,
+            cells,
+            links,
+            hull_half,
+            deck_y: -hull_half.y * 0.25,
+            drive_clearance,
+            lock,
+        })
+    }
+
     /// Lay the plan out inside a hull of this length.
     ///
     /// The plan's own coordinates span roughly 24 units nose to tail, so the
@@ -211,6 +302,26 @@ impl Interior {
             (2.6 * s).max(floor.y).min(cap.y),
             (4.0 * s).max(floor.z).min(cap.z),
         );
+        // SHAPE-DERIVED LAYOUT IS BUILT AND TESTED, AND NOT WIRED HERE
+        // YET — deliberately, and this is the reason.
+        //
+        // `roomplan::plan_named` places this exact roster by hull shape
+        // and keeps every id (`plan_named_keeps_every_roster_id`). It
+        // was wired into this function and then backed out, because
+        // turning it on made `a_shut_door_is_a_wall_and_an_open_one_is_
+        // a_way_through` fail: the planner lets its spine corridor
+        // physically OVERLAP every room it serves, so the interior
+        // becomes one connected void and a shut door stops being a wall.
+        // `roomplan::overlaps` even excludes corridor-room overlap on
+        // purpose, on the reasoning that an overlap is a doorway — true
+        // for one door, false as a layout rule, and the door system is
+        // what proved it.
+        //
+        // Fixing it means rooms ABUT the spine with a door gap rather
+        // than intersecting it, which is a real change to the planner
+        // and wants its own pass. Until then the hand-authored placement
+        // below stays: every ship is the same ship at a different size,
+        // which is worse layout and correct behaviour.
         let cells: Vec<Cell> = HUB
             .iter()
             .map(|r| Cell {
@@ -218,15 +329,8 @@ impl Interior {
                 name: r.name,
                 kind: r.kind,
                 centre: Vec3::new(r.pos[0] * s, deck_y, r.pos[2] * s),
-                // the bridge and hangar are the big rooms; corridors are thin
                 half: match r.kind {
-                    // the big rooms, still inside the skin
                     RoomKind::Bridge | RoomKind::Hangar => (room_half * 1.35).min(cap),
-                    // a corridor is narrow, but never narrower than the
-                    // corridors joining it — the first version made the
-                    // spine of a 110 m ship 2.37 m half-wide while the links
-                    // into it were 2.8, so you could drive between rooms and
-                    // not through the one in the middle
                     RoomKind::Corridor => Vec3::new(
                         (room_half.x * 0.55).max(floor.x),
                         room_half.y,
@@ -376,15 +480,35 @@ impl Interior {
     /// being sized for a different occupant — the same reason
     /// `aboard::HULL_HEIGHTS` exists.
     pub fn sense_doors(&mut self, who: Vec3) {
+        self.sense_doors_reporting(who);
+    }
+
+    /// The same pass, but saying what it CHANGED.
+    ///
+    /// `sense_doors` returns nothing, which is fine for moving the
+    /// doors and useless for reacting to them: a shell that wants to
+    /// play a door's opening sound needs the edge, not the state, or it
+    /// re-fires the cue sixty times a second while you stand in the
+    /// doorway. Only genuine transitions are reported, so this is safe
+    /// to call every frame.
+    pub fn sense_doors_reporting(&mut self, who: Vec3) -> DoorReport {
         let reach = self.hull_half.max_element() * 0.22;
-        for l in self.links.iter_mut() {
+        let mut rep = DoorReport::default();
+        for (i, l) in self.links.iter_mut().enumerate() {
             let near = who.distance(l.centre) < reach;
-            if near {
-                l.door.open();
-            } else {
-                l.door.close();
+            let was_open =
+                matches!(l.door.state, crate::airlock::State::Open | crate::airlock::State::Opening);
+            if near && !was_open {
+                if l.door.open() {
+                    rep.opened.push(i);
+                }
+            } else if !near && was_open {
+                if l.door.close() {
+                    rep.closed.push(i);
+                }
             }
         }
+        rep
     }
 
     pub fn step_doors(&mut self, dt: f32) {
@@ -550,6 +674,99 @@ impl Interior {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_plan_builds_a_connected_interior_from_a_shape_derived_plan() {
+        use crate::roomplan::{plan, Envelope};
+        let occ = 1.9;
+        let env = Envelope::from_extents(19.0, 6.0, 3.4, 0.5);
+        let rooms = plan(&env, occ);
+        assert!(!rooms.is_empty(), "test premise: this hull holds rooms");
+        let hull_half = Vec3::new(env.beam(), 3.4, env.half_z);
+        let i = Interior::from_plan(&rooms, hull_half, occ).expect("a non-empty plan builds");
+        assert_eq!(i.cells.len(), rooms.len());
+        // every room but the spine has a link, so nothing is stranded
+        assert_eq!(i.links.len(), rooms.len() - 1);
+        for c in &i.cells {
+            assert!(c.half.x > 0.0 && c.half.y > 0.0 && c.half.z > 0.0, "{} is degenerate", c.id);
+        }
+    }
+
+    #[test]
+    fn from_plan_refuses_an_empty_plan_rather_than_building_a_hollow_ship() {
+        let i = Interior::from_plan(&[], Vec3::new(3.0, 2.0, 9.0), 1.9);
+        assert!(i.is_none(), "an empty plan must not become an interior you cannot stand in");
+    }
+
+    #[test]
+    fn from_plan_reaches_every_room_through_the_doors_it_made() {
+        use crate::roomplan::{plan, Envelope};
+        let occ = 1.9;
+        let env = Envelope::from_extents(19.0, 6.0, 3.4, 0.5);
+        let rooms = plan(&env, occ);
+        let hull_half = Vec3::new(env.beam(), 3.4, env.half_z);
+        let mut i = Interior::from_plan(&rooms, hull_half, occ).unwrap();
+        i.unseal();
+        let spine = i.cells.iter().find(|c| c.kind == RoomKind::Corridor).unwrap().id;
+        assert_eq!(
+            i.reachable_from(spine).len(),
+            i.cells.len(),
+            "a generated plan left rooms unreachable"
+        );
+    }
+
+    #[test]
+    fn sense_doors_reports_only_real_transitions() {
+        let mut i = Interior::generate(110.0);
+        i.depower();
+        i.step_doors(5.0);
+
+        // stand on a doorway: it should open, and be REPORTED as opening
+        let at = i.links[0].centre;
+        // repower first -- depower leaves hatches unpowered and a dead
+        // door correctly refuses to open for proximity
+        for l in i.links.iter_mut() {
+            l.door.powered = true;
+        }
+        let first = i.sense_doors_reporting(at);
+        assert!(first.opened.contains(&0), "walking onto a door must open it");
+
+        // standing still must NOT re-report it, or a door sound fires
+        // sixty times a second while you stand in the doorway
+        let second = i.sense_doors_reporting(at);
+        assert!(second.opened.is_empty(), "no re-open while standing there");
+        assert!(second.closed.is_empty());
+    }
+
+    #[test]
+    fn walking_away_reports_the_door_shutting() {
+        let mut i = Interior::generate(110.0);
+        for l in i.links.iter_mut() {
+            l.door.powered = true;
+        }
+        let at = i.links[0].centre;
+        i.sense_doors_reporting(at);
+        // a long way off, well past `hull_half.max_element() * 0.22`
+        let away = at + Vec3::splat(i.hull_half.max_element() * 4.0);
+        let rep = i.sense_doors_reporting(away);
+        assert!(rep.closed.contains(&0), "leaving must shut the door behind you");
+    }
+
+    #[test]
+    fn sense_doors_still_moves_doors_the_way_it_always_did() {
+        // the non-reporting wrapper must stay behaviourally identical --
+        // it is what `tick_aboard` already calls every frame.
+        let mut i = Interior::generate(110.0);
+        for l in i.links.iter_mut() {
+            l.door.powered = true;
+        }
+        let at = i.links[0].centre;
+        i.sense_doors(at);
+        assert!(matches!(
+            i.links[0].door.state,
+            crate::airlock::State::Open | crate::airlock::State::Opening
+        ));
+    }
 
     #[test]
     fn losing_power_actually_strands_you() {
