@@ -1,0 +1,7 @@
+[package]
+name = "secret-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Where a secret lives on this machine and who can read it: desktop detection (KDE/GNOME/Phosh/Plasma Mobile/SXMO/headless), the ordered store plan, XDG paths and legacy migration. Pure — no D-Bus, no I/O."
+
+[dependencies]
