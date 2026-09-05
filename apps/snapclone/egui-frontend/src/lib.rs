@@ -4371,45 +4371,73 @@ impl Snapclone {
         // `bg_base` is a few points of luminance and the two fields read as
         // one crowded surface. The card supplies the border, the shadow, the
         // padding and the row gap — see `uikit_egui::overlay`.
-        let style = uikit_egui::overlay::CardStyle::default();
-        // Height from the content: a field, a divider, up to seven rows at
-        // the touch height, and the gaps between. The old fixed 260 was too
-        // tall for two matches and too short for seven.
-        let rows = crate::palette::suggest(&self.palette_input, now_ms, 0,
-                                           &self.palette_contacts(),
-                                           self.group_voice.joined, &PAGES).len().min(7);
-        let row_h = 26.0;
-        let content_h = 24.0 + style.gap + 1.0 + style.gap
-            + (rows.max(1) as f32) * (row_h + style.gap);
-        let area = uikit_egui::overlay::fit_on_screen(
-            egui::Rect::from_min_size(
-                egui::pos2(surface.min.x + surface.width() * 0.1, surface.min.y + 24.0),
-                egui::vec2(surface.width() * 0.8, style.outer_size(egui::vec2(0.0, content_h)).y)),
-            surface, 12.0);
-        uikit_egui::overlay::scrim(ui, surface, 0.45);
-        let mut child = uikit_egui::overlay::card(ui, area, c, style);
-        let field = child.add(egui::TextEdit::singleline(&mut self.palette_input)
-            .hint_text("call at the hour · send ada in 10 min · flip · inbox")
-            .desired_width(f32::INFINITY).id_salt("lib-palette_input"));
-        if std::mem::take(&mut self.palette_focus) { field.request_focus(); }
-        // A rule between what you typed and what matched: without it the
-        // first result sat one default item-gap under the field and read as
-        // part of it.
-        uikit_egui::overlay::divider(&mut child, c, style.gap);
+        // THE PALETTE IS A BOTTOM BAR NOW, not a translucent card mid-page.
+        // The card drew a 45% scrim, which on a dark theme dims near-black to
+        // near-black — so the settings form behind it stayed at full contrast
+        // and the suggestions read as loose text over a form. Reported with a
+        // screenshot. `uikit_egui::command_bar` owns the surface: a bar when
+        // the page is worth keeping visible, a properly-scrimmed pane when it
+        // is not, and the same inline completion either way.
+        use uikit_egui::command_bar as cb;
         let contacts = self.palette_contacts();
         let items = crate::palette::suggest(&self.palette_input, now_ms, 0, &contacts,
                                             self.group_voice.joined, &PAGES);
-        let n = items.len().min(7);
+        let n = items.len().min(cb::MAX_ROWS);
         if n == 0 { self.palette_cursor = 0; } else { self.palette_cursor = self.palette_cursor.min(n - 1); }
+        let mode = cb::mode_for(surface.height(), n);
+        // `wanted_height` is CONTENT height; the card adds its padding around
+        // it. Without this the rows were laid out and then clipped away by
+        // the card's own clip rect — the bar rendered with an input and an
+        // empty strip under it, which a screenshot caught.
+        let h = cb::wanted_height(n) + uikit_egui::overlay::CardStyle::default().pad * 2.0;
+        let area = egui::Rect::from_min_size(
+            egui::pos2(surface.min.x, surface.max.y - h), egui::vec2(surface.width(), h));
+        let area = match mode {
+            cb::Mode::Bar => area,
+            // The pane takes the surface, so nothing behind it competes.
+            cb::Mode::Pane => surface,
+        };
+        if mode == cb::Mode::Pane {
+            uikit_egui::overlay::scrim(ui, surface, cb::SCRIM_PANE);
+        }
+        // OPAQUE, in both modes. A palette you can read the page through is
+        // the fault being fixed; `bg_raised` at full alpha plus the card's
+        // border is what separates it, not a wash.
+        let style = uikit_egui::overlay::CardStyle {
+            radius: if mode == cb::Mode::Bar { 0.0 } else { uikit_egui::tokens::RADIUS_MD as f32 },
+            ..uikit_egui::overlay::CardStyle::default()
+        };
+        let mut child = uikit_egui::overlay::card(ui, area, c, style);
+
+        // The best match, completed inline. The ghost is the part you have
+        // not typed; Tab takes it.
+        let best = items.first().map(|it| it.label.clone());
+        let ghosted = best.as_deref()
+            .and_then(|b| cb::ghost(&self.palette_input, b))
+            .map(str::to_string);
+        child.horizontal(|ui| {
+            let field = ui.add(egui::TextEdit::singleline(&mut self.palette_input)
+                .hint_text("call at the hour · send ada in 10 min · flip · inbox")
+                .desired_width(ui.available_width() * 0.72).id_salt("lib-palette_input"));
+            if std::mem::take(&mut self.palette_focus) { field.request_focus(); }
+            if let Some(g) = &ghosted {
+                ui.colored_label(c.text_weak, egui::RichText::new(format!("{g}  ⇥")).italics());
+            }
+        });
+        if let (true, Some(b)) = (child.input(|i| i.key_pressed(egui::Key::Tab)), best.as_deref()) {
+            self.palette_input = cb::accept(&self.palette_input, b);
+        }
+        uikit_egui::overlay::divider(&mut child, c, style.gap);
         let (up, down, enter, esc) = child.input(|i| (
             i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::ArrowDown),
             i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
-        if up && self.palette_cursor > 0 { self.palette_cursor -= 1; }
-        if down && n > 0 && self.palette_cursor + 1 < n { self.palette_cursor += 1; }
+        if up { self.palette_cursor = cb::move_cursor(self.palette_cursor, n, -1); }
+        if down { self.palette_cursor = cb::move_cursor(self.palette_cursor, n, 1); }
         let mut chosen: Option<usize> = None;
         for (i, it) in items.iter().take(n).enumerate() {
             let on = i == self.palette_cursor;
-            let r = child.selectable_label(on, &it.label);
+            let r = child.add_sized([child.available_width(), cb::ROW_H],
+                                    egui::SelectableLabel::new(on, &it.label));
             if r.clicked() { chosen = Some(i); }
         }
         if n == 0 && !self.palette_input.trim().is_empty() {
