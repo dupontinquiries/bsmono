@@ -283,6 +283,11 @@ pub struct Snapclone {
     pub send_request: Option<crate::send_flow::SendRequest>,
     /// The expanded full-screen view of my code (the C++ showExpandedQr): `Some` while open.
     pub qr_expanded: Option<uikit_egui::qr::Expanded>,
+    /// When the code dialog came on screen, so MY CODE draws itself in from that moment
+    /// (the kit's staggered reveal). Set on the first frame the dialog is drawn.
+    pub qr_shown_at: Option<f64>,
+    /// The SVG of my code, when the expanded view's Save SVG was pressed; drained to the host.
+    pub code_svg_requested: Option<String>,
     /// The unified bottom bar (Qt UnifiedNavBar): page arrows, sub-tab segments, underline
     /// morph, page dots. Owns the page + sub-tab state; `nav` mirrors the page for swipe.
     pub bar: UnifiedNav,
@@ -967,6 +972,8 @@ impl Snapclone {
             send_flow: Default::default(),
             send_request: None,
             qr_expanded: None,
+            qr_shown_at: None,
+            code_svg_requested: None,
             bar: UnifiedNav::new(),
             login_visible: !auto_logged_in,
             nav: Nav::new(PAGES.len()),
@@ -3351,11 +3358,13 @@ impl Snapclone {
                 // shows yours so they can read it back. With only the scanner,
                 // an exchange needs a third device.
                 child.separator();
-                if crate::qr::my_code_ui(&mut child, &self.local_id, &colors) {
+                let shown = *self.qr_shown_at.get_or_insert(ui.input(|i| i.time));
+                if crate::qr::my_code_ui(&mut child, &self.local_id, &colors, Some(shown)) {
                     self.qr_expanded = Some(uikit_egui::qr::Expanded::open(ui.input(|i| i.time)));
                 }
                 if child.button("close").clicked() {
                     self.qr = None;
+                    self.qr_shown_at = None;
                     self.modal.dismiss("qr");
                 }
                 // apply_scan is the EXISTING path — it adds the peer the same
@@ -3584,7 +3593,11 @@ impl Snapclone {
         // MY CODE, expanded: the C++ overlay — scrim, the code at 80% width,
         // the id at 24, Close — on the foreground layer, over every page.
         let layout = crate::qr_render::layout_for(&self.local_id);
-        uikit_egui::qr::expanded_ui(ui.ctx(), &mut self.qr_expanded, &self.local_id, &layout, &colors);
+        let ev = uikit_egui::qr::expanded_ui_with(ui.ctx(), &mut self.qr_expanded, &self.local_id, &layout, &colors);
+        if ev.save_svg {
+            let (bg, fg) = uikit_egui::qr::theme_colors(&colors);
+            self.code_svg_requested = Some(uikit_egui::qr::svg(&layout, 512.0, fg, bg));
+        }
         // THE DIM, painted last so it covers the page rather than being
         // covered by it. dim_overlay_ui returns immediately at zero, so this
         // costs nothing on the overwhelming majority of frames — the phone is

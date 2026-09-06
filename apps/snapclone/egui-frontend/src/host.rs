@@ -222,6 +222,9 @@ pub enum HostEvent {
     /// pressed the shutter is looking at the camera page, and a photo that
     /// silently did not save is the failure they find out about last.
     SnapSaved(Result<String, String>),
+    /// The host wrote (or could not write) my code's SVG. Its own event, NOT `SnapSaved`:
+    /// that one moves the send flow to Compose, and a saved SVG is not a captured photo.
+    CodeSvgSaved(Result<String, String>),
     /// The host encoded the shutter's frame for the wire: the bytes that will
     /// go out. Feeds the pre-send receipt's Size facet, which showed
     /// "Sending 0 B" for every snap because nothing told the app what the
@@ -260,6 +263,9 @@ pub enum HostCommand {
     RetryFailedSends,
     /// Write these snaps out; the user chose to keep them.
     KeepSnap(String),
+    /// Write my code as an SVG — the kit's `qr::svg`, which draws itself in — somewhere
+    /// shareable, and report the path back through `CodeSvgSaved` so the note says where.
+    SaveCodeSvg(String),
     /// Mark as seen in storage.
     MarkViewed(String),
     /// The view window elapsed. Distinct from `MarkViewed`: one is "did they
@@ -451,6 +457,12 @@ impl Snapclone {
                 // whatever the picker holds now.
                 let recipients = self.picker.selected().len() as i32;
                 self.prepare_send(1, 0, bytes as i64, bytes as i64, recipients);
+            }
+            HostEvent::CodeSvgSaved(r) => {
+                self.feed_note = match r {
+                    Ok(p) => format!("my code saved: {}", p.rsplit('/').next().unwrap_or(&p)),
+                    Err(e) => e,
+                };
             }
             HostEvent::SnapSaved(r) => {
                 // Flash only on SUCCESS. The universal camera confirmation
@@ -645,6 +657,7 @@ impl Snapclone {
         let mut out = Vec::new();
         if std::mem::take(&mut self.shutter_pressed) { out.push(HostCommand::CaptureSnap); }
         for id in std::mem::take(&mut self.snaps_saved) { out.push(HostCommand::KeepSnap(id)); }
+        if let Some(svg) = self.code_svg_requested.take() { out.push(HostCommand::SaveCodeSvg(svg)); }
         for id in std::mem::take(&mut self.snaps_viewed) { out.push(HostCommand::MarkViewed(id)); }
         for id in std::mem::take(&mut self.snaps_expired) { out.push(HostCommand::MarkExpired(id)); }
         for (field, text) in std::mem::take(&mut self.dictated) {
@@ -1543,5 +1556,18 @@ mod addr_health_host_tests {
         assert_eq!(s.send_summary.upload_bytes, 16 * 1024);
         assert_eq!(s.send_summary.total_bytes, 16 * 1024, "nothing already shared on this path");
         assert!(!s.can_send(), "and still no recipients");
+    }
+
+    #[test]
+    fn save_svg_becomes_a_command_and_its_answer_a_note_not_a_capture() {
+        let mut s = app();
+        s.code_svg_requested = Some("<svg/>".into());
+        let cmds = s.drain_commands();
+        assert!(cmds.iter().any(|c| matches!(c, HostCommand::SaveCodeSvg(v) if v == "<svg/>")));
+        assert!(s.code_svg_requested.is_none(), "drained once");
+        let before = s.send_flow.step();
+        s.apply(HostEvent::CodeSvgSaved(Ok("/x/snaps/sc-1.svg".into())));
+        assert_eq!(s.feed_note, "my code saved: sc-1.svg");
+        assert_eq!(s.send_flow.step(), before, "an SVG is not a photo: the send flow does not move");
     }
 }

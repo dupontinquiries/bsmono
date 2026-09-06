@@ -1162,6 +1162,19 @@ impl App {
                 // for each: a read receipt to send for Viewed, a file to
                 // delete for Expired.
                 HostCommand::MarkViewed(_) | HostCommand::MarkExpired(_) => {}
+                HostCommand::SaveCodeSvg(svg) => {
+                    // Next to the snaps, named by the id, so it is where the
+                    // export already looks; the note says the path.
+                    let dir = config_kit::data_dir("snapclone").join("snaps");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let path = dir.join(format!("{}.svg", self.snap.local_id));
+                    let r = std::fs::write(&path, svg)
+                        .map(|_| path.display().to_string())
+                        .map_err(|e| format!("could not write {}: {e}", path.display()));
+                    if let Ok(p) = &r { eprintln!("snapclone: my code saved as SVG: {p}"); }
+                    let cmds = self.snap.apply(HostEvent::CodeSvgSaved(r));
+                    self.handle(cmds);
+                }
                 HostCommand::SaveSnapState(st) => {
                     if let Err(e) = snapclone_egui::snap_state::store(&st) {
                         // Loud, because the failure mode is a snap coming
