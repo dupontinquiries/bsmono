@@ -86,6 +86,55 @@ pub fn paint_top_hairline(ui: &Ui, rect: Rect) {
     ui.painter().hline(rect.x_range(), rect.top(), stroke);
 }
 
+/// A glass CARD: a section of a page on its own tinted surface — RADIUS_MD corners, SPACE_MD inside,
+/// the hairline where light catches the top edge — so a page is a few surfaces with room between
+/// them rather than rows split by separators. What snapclone's Friends page grew into once the
+/// backdrop existed: on a live backdrop a separator is a scratch and a card is a thing.
+pub fn card<R>(ui: &mut Ui, bg_card: Color32, add_contents: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
+    let frame = egui::Frame::new()
+        .fill(surface_fill(bg_card))
+        .corner_radius(CornerRadius::same(crate::tokens::RADIUS_MD as u8))
+        .inner_margin(egui::Margin::same(crate::tokens::SPACE_MD as i8))
+        .stroke(Stroke::new(1.0, Color32::from_white_alpha(GlassAlphas::HAIRLINE)));
+    // FULL WIDTH. A card sized to its content makes a page of cards a
+    // staircase — a narrow "connect" beside a wide "find" (seen in the first
+    // screenshot). Every card spans the page; the content decides the height.
+    let r = frame.show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        add_contents(ui)
+    });
+    ui.add_space(crate::tokens::SPACE_SM as f32);
+    r
+}
+
+/// A section heading inside a card: small caps-ish weak text with room under it.
+pub fn card_title(ui: &mut Ui, text: &str, text_weak: Color32) {
+    ui.label(egui::RichText::new(text).small().color(text_weak));
+    ui.add_space(4.0);
+}
+
+/// The PRIMARY action of a card: the accent, solid, a thumb-sized target. One per card.
+pub fn primary_button(ui: &mut Ui, label: &str, accent: Color32, on_accent: Color32) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).strong().color(on_accent))
+            .fill(accent)
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same(crate::tokens::RADIUS_SM as u8))
+            .min_size(egui::vec2(0.0, crate::tokens::TOUCH_MIN as f32)),
+    )
+}
+
+/// A SECONDARY action: a glass key at the same thumb-sized height, so a row of buttons lines up.
+pub fn secondary_button(ui: &mut Ui, label: &str, bg_card: Color32, border: Color32) -> egui::Response {
+    ui.add(
+        egui::Button::new(label)
+            .fill(key_fill(bg_card))
+            .stroke(key_border(border))
+            .corner_radius(CornerRadius::same(crate::tokens::RADIUS_SM as u8))
+            .min_size(egui::vec2(0.0, crate::tokens::TOUCH_MIN as f32)),
+    )
+}
+
 /// Draw a glass-style key: flat tinted fill, hairline border, a solid accent flip when pressed, and the
 /// same instant-feedback behaviour as the CSS (no easing on the fill colour itself — the *response*
 /// object still animates position/scale via the motion kit if a caller wants that, but the glass fill is
@@ -110,6 +159,32 @@ pub fn glass_key(ui: &mut Ui, rect: Rect, label: &str, bg_card: Color32, border:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A card is a tinted surface with room inside, not a separator; both buttons meet the touch floor.
+    #[test]
+    fn a_card_draws_with_its_margin_and_the_buttons_reach_the_touch_floor() {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 600.0)));
+        let c = crate::default_palette();
+        let mut heights = (0.0f32, 0.0f32);
+        let mut card_rect = Rect::NOTHING;
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r = card(ui, c.bg_card, |ui| {
+                    card_title(ui, "connect", c.text_weak);
+                    ui.horizontal(|ui| {
+                        heights.0 = primary_button(ui, "Connect", c.accent, c.bg_base).rect.height();
+                        heights.1 = secondary_button(ui, "Import", c.bg_card, c.border).rect.height();
+                    });
+                });
+                card_rect = r.response.rect;
+            });
+        });
+        assert!(!out.shapes.is_empty());
+        assert!(heights.0 >= crate::tokens::TOUCH_MIN as f32 && heights.1 >= crate::tokens::TOUCH_MIN as f32, "{heights:?}");
+        assert!(card_rect.height() > crate::tokens::TOUCH_MIN as f32 + 2.0 * crate::tokens::SPACE_MD as f32, "the card has its inner margin");
+    }
 
     #[test]
     fn tint_preserves_rgb_and_sets_alpha() {
