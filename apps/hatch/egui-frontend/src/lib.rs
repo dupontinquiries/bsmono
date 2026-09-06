@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Align2, Color32, CornerRadius, FontId, Key, Rect, Sense, Stroke, StrokeKind, Vec2};
 use hatch_core::Launcher;
-use uikit_egui::PaletteColors;
+use uikit_egui::{A11yScene, PaletteColors, Role, Semantics};
 
 /// What the shell must do after a frame. The lib never touches the window —
 /// hiding/quitting is viewport business and stays in the bin.
@@ -81,6 +81,14 @@ pub struct HatchUi {
     /// layer that has to know which tile a swipe began on would use the same
     /// answer rather than recomputing the layout and drifting from it).
     tile_rects: Vec<(String, Rect)>,
+    /// Voice/screen-reader registration for the grid. `sel` (above) stays the
+    /// single source of truth for WHICH tile is selected and how arrow keys
+    /// move it — 2D, row/col, wraps at grid edges — because `A11yScene`'s own
+    /// Next/Prev is linear and would regress that. This scene is re-populated
+    /// every frame from the same tiles `grid()` already draws, and `sel` is
+    /// pushed into it via `set_focus` so the two are never out of sync; it
+    /// does not decide anything, it reports.
+    a11y: A11yScene,
 }
 
 struct PressTrack {
@@ -105,7 +113,22 @@ impl HatchUi {
             grabber_drag: 0.0,
             last_error: None,
             tile_rects: Vec::new(),
+            a11y: A11yScene::new(),
         }
+    }
+
+    /// A stable id for a11y registration, independent of grid position —
+    /// the grid reorders every keystroke (favorites/recents float, a filter
+    /// narrows the set) and `A11yScene` keys focus by id, not index. Reusing
+    /// position as id would make focus visually "stick to a screen slot"
+    /// across a reorder instead of following the app the user actually
+    /// selected. `DefaultHasher` isn't stable across Rust versions/processes,
+    /// which is fine here: ids only need to compare equal within one run.
+    fn a11y_id(entry_id: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        entry_id.hash(&mut h);
+        h.finish()
     }
 
     /// Where a tile was painted last frame, if it was on screen.
@@ -419,6 +442,7 @@ impl HatchUi {
         event: &mut UiEvent,
     ) {
         let count = self.core.result_count();
+        self.a11y.begin_frame(); // before the early return: an empty grid must not keep last frame's items/focus alive
         if count == 0 {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| ui.weak("No matches"));
@@ -451,6 +475,21 @@ impl HatchUi {
                         self.sel = n;
                     }
                     self.tile(ui, rect, &resp, &name, tex, fav, selected, colors);
+                    // Spoken form is always the full app name, regardless of
+                    // how the tile is drawn (icon vs. letter-tile fallback
+                    // paint the same either way) — see gitmind's tab-strip
+                    // comment for why a visual abbreviation must not shrink
+                    // the spoken one too.
+                    self.a11y.add(
+                        Self::a11y_id(&id),
+                        Semantics::new(Role::Button, &name)
+                            .with_value(if fav { "favorite" } else { "" })
+                            .with_hint("long-press to favorite"),
+                        Some(rect),
+                    );
+                    if selected {
+                        self.a11y.set_focus(Some(Self::a11y_id(&id)));
+                    }
 
                     match self.hold(&resp, &id) {
                         Hold::Fired => fav_toggle = Some((id, rect.center())),
@@ -1252,5 +1291,51 @@ mod tests {
         assert_eq!(HatchUi::move_sel(1, 7, cols, Key::ArrowUp), 1, "top row stays");
         assert_eq!(HatchUi::move_sel(6, 7, cols, Key::ArrowUp), 3);
         assert_eq!(HatchUi::move_sel(3, 0, cols, Key::ArrowDown), 0, "empty grid is index 0");
+    }
+
+    #[test]
+    fn a11y_registers_every_tile_and_tracks_selection() {
+        let mut h = Harness::new(some_apps());
+        h.frame(vec![]);
+
+        // Every tile actually painted this frame has a matching spoken
+        // registration, keyed stably by entry id.
+        let registered: std::collections::HashSet<u64> = h
+            .app
+            .tile_rects
+            .iter()
+            .map(|(id, _)| HatchUi::a11y_id(id))
+            .collect();
+        for id in &registered {
+            assert!(
+                h.app.tile_rects.iter().any(|(tid, _)| HatchUi::a11y_id(tid) == *id),
+                "every registered id traces back to a painted tile"
+            );
+        }
+        assert_eq!(registered.len(), h.app.tile_rects.len(), "no id collisions across the painted set");
+
+        // `sel` starts at 0; a11y focus must follow whichever entry that
+        // actually is, not a hardcoded id — the ranking (favorites/recents)
+        // decides that, not this test.
+        let first = h.app.core.result_at(0).expect("some apps").id.clone();
+        assert_eq!(
+            h.app.a11y.focused().map(|it| it.id),
+            Some(HatchUi::a11y_id(&first)),
+            "a11y focus follows `sel`, not a hardcoded id"
+        );
+
+        // Moving selection with the keyboard moves a11y focus the same way —
+        // the sync happens through `grid()` every frame, not once at startup.
+        h.key(Key::ArrowRight);
+        let second = h.app.core.result_at(1).expect("at least two apps").id.clone();
+        assert_eq!(h.app.a11y.focused().map(|it| it.id), Some(HatchUi::a11y_id(&second)));
+    }
+
+    #[test]
+    fn a11y_scene_is_empty_on_a_query_that_matches_nothing() {
+        let mut h = Harness::new(some_apps());
+        h.app.core.set_query("zzz_no_such_app");
+        h.frame(vec![]);
+        assert!(h.app.a11y.focused().is_none(), "no stale focus from before the filter narrowed to zero");
     }
 }
