@@ -319,6 +319,10 @@ pub mod table_nlp;
 pub mod notebook;
 /// The notebook pane's per-cell state: a classification cache and the folds.
 pub mod notebook_cells;
+/// Auto-naming a session from what has been run in it (`TODO_session_autoname.md`).
+#[path = "../../src/session_auto.rs"]
+pub mod session_auto;
+pub mod session_name;
 /// Zellij voice/assisted control — PURE core (phrase → `zellij action`
 /// argv, zellij-session detection). Fully self-contained (no `use` of any
 /// other module in this crate), tested, and — like notebook.rs above —

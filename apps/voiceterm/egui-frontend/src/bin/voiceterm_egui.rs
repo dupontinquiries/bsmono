@@ -680,6 +680,10 @@ struct VoicetermApp {
     /// The notebook pane's per-cell state: classifications cached by block id and
     /// output length, and which cells are folded.
     notebook_cells: voiceterm_egui::notebook_cells::NotebookCells,
+    /// What this session is about (`session_name`), and the block count it was derived
+    /// at — the derivation walks every block and the locator draws every frame.
+    session_name: String,
+    session_name_at: usize,
     /// The find bar's FILES mode. `None` until a file search is started, so
     /// the panel costs no terminal rows in the common case.
     fs_search: voiceterm_egui::fs_results::Search,
@@ -2730,6 +2734,26 @@ impl eframe::App for VoicetermApp {
             {
                 let title = self.workspace.tabs.get(self.workspace.active)
                     .map(|t| t.name.clone()).unwrap_or_default();
+                // WHAT THIS SESSION IS ABOUT, beside where you are.
+                // `session_auto` shipped pure and tested in v0.1.658 and the Qt
+                // build has surfaced it since v0.1.720; this frontend never
+                // referenced the module at all, so the segmenter, the namer and
+                // the proposals were all carried across and none of their output
+                // was. Recomputed only when a command finishes — the derivation
+                // walks every block, and the locator draws every frame.
+                if self.blocks.blocks.len() != self.session_name_at {
+                    self.session_name_at = self.blocks.blocks.len();
+                    self.session_name = voiceterm_egui::session_name::session_name(
+                        self.blocks.blocks.iter().map(|b| {
+                            (b.command.as_str(), b.cwd.as_deref().unwrap_or(""))
+                        }),
+                    );
+                }
+                let title = if self.session_name.is_empty() {
+                    title
+                } else {
+                    format!("{title} \u{b7} {}", self.session_name)
+                };
                 let text = self.chrome.locator(
                     self.workspace.active,
                     self.workspace.tabs.len(),
@@ -5233,6 +5257,8 @@ fn main() -> eframe::Result<()> {
                 pending_confirm: None, zk_share: None,
                 identity: voiceterm_egui::identity::load_or_create("voiceterm"),
                 notebook_cells: Default::default(),
+                session_name: String::new(),
+                session_name_at: usize::MAX,
                 fs_search: Default::default(),
                 cmd_sheet: Default::default(),
                 last_memlog_s: 0.0,

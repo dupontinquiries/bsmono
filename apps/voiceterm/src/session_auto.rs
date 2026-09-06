@@ -163,8 +163,26 @@ fn finish_segment(slice: &[Activity], start: usize, end: usize, ctx: &Ctx) -> Se
 /// the most-edited file (basename), falling back gracefully.
 pub fn name_segment(acts: &[Activity]) -> String {
     if acts.is_empty() { return "session".into(); }
-    let repo = acts.iter().map(|a| repo_of(&a.cwd))
-        .find(|r| !r.is_empty()).unwrap_or("").to_string();
+    // THE DOMINANT cwd, not the first. The first activity in a session is usually the
+    // `cd` INTO the work — run from wherever you were — so taking its cwd named the
+    // session after the directory you left. On the stream this module's own docs quote
+    // (`cd asahi/dcp; hx tracer.py; python tracer.py`) that produced "k · tracer.py",
+    // after `/home/k`, rather than "dcp · tracer.py". Ties go to the earlier cwd, so a
+    // session that spends equal time in two places keeps a stable name.
+    let mut cwd_counts: std::collections::HashMap<&str, (usize, usize)> = Default::default();
+    for (i, a) in acts.iter().enumerate() {
+        let r = repo_of(&a.cwd);
+        if r.is_empty() {
+            continue;
+        }
+        let e = cwd_counts.entry(r).or_insert((0, i));
+        e.0 += 1;
+    }
+    let repo = cwd_counts
+        .into_iter()
+        .max_by(|a, b| a.1 .0.cmp(&b.1 .0).then(b.1 .1.cmp(&a.1 .1)))
+        .map(|(r, _)| r.to_string())
+        .unwrap_or_default();
     // dominant language
     let mut lang_counts: std::collections::HashMap<&str, usize> = Default::default();
     for a in acts { if let Some(l) = a.lang() { *lang_counts.entry(l).or_insert(0) += 1; } }
@@ -323,5 +341,19 @@ mod tests {
         ];
         let n = name_segment(&acts);
         assert!(n.contains("asahi") && n.contains("tracer.py"), "got {}", n);
+    }
+
+    /// The first activity is the `cd` INTO the work, run from wherever you were. Naming
+    /// the session after that cwd named it after the directory you left.
+    #[test]
+    fn the_session_is_named_after_where_the_work_happened_not_where_it_started() {
+        let acts = vec![
+            act(ActivityKind::Cd, "asahi/dcp", "/home/k"),
+            act(ActivityKind::EditorOpen, "tracer.py", "/home/k/asahi/dcp"),
+            act(ActivityKind::Run, "python tracer.py", "/home/k/asahi/dcp"),
+        ];
+        let n = name_segment(&acts);
+        assert!(n.contains("dcp"), "got {n}");
+        assert!(!n.starts_with("k "), "named after the directory it left: {n}");
     }
 }
