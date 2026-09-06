@@ -5357,6 +5357,13 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
                     "Archive"      => ([0xe6, 0xd8, 0xbc], crate::texgen::mat::PAPER, 0.04, 188, [0x4a, 0x32, 0x1c], 0.45), // ink on parchment
                     "Reading Room" => ([0xf0, 0xe8, 0xd6], crate::texgen::mat::PAPER, 0.04, 190, [0x2e, 0x24, 0x18], 0.42), // typewriter ink
                     "Mansion Garden" => ([0xf0, 0xe6, 0xcc], crate::texgen::mat::STONE, 0.14, 150, [0xd8, 0xb4, 0x5c], 0.9), // cream marble + gold veins
+                    // The three reference worlds match their physical board (see `physkin`): iron-bound
+                    // slate with amber text in the cave; dark stained timber with warm cream text in both
+                    // Elmbrook districts — one carpentry, so the message plaque and the dock read as cut
+                    // from the same boards the context panel hangs on.
+                    "Cat Cave"     => ([0x3a, 0x38, 0x36], crate::texgen::mat::STONE, 0.08, 200, [0xf0, 0xc8, 0x84], 1.05), // riveted slate, lantern-lit
+                    "Forest Village" => ([0x3e, 0x30, 0x20], crate::texgen::mat::WOOD_WET, 0.06, 205, [0xf2, 0xe0, 0xb8], 1.0), // rain-dark timber
+                    "Lavarock Way" => ([0x5a, 0x46, 0x30], crate::texgen::mat::WOOD_SMOOTH, 0.05, 205, [0xf6, 0xea, 0xc8], 0.7), // sun-bleached timber
                     // Every OTHER world derives a coherent idiom from its active palette (material + warm
                     // light + cool accent) instead of the old flat-grey quad, so the message panel and the
                     // mic pearl read as belonging to the scene. Dark worlds glow their accent on a dim tinted
