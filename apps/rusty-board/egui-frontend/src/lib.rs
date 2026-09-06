@@ -85,18 +85,89 @@ pub struct Key {
     /// L1-north and R2-north — so identity has to survive as the typed
     /// button id, not be recovered from the committed text afterward).
     pub steno_button: Option<String>,
+    /// What KIND of key this is — the GTK original's `KeyType`, which drives its `.key-normal`
+    /// / `.key-modifier` / `.key-action` / `.key-special` CSS class and therefore its colour.
+    ///
+    /// The egui port had no role at all: `paint_key_face` guessed with
+    /// `key.label.chars().count() > 1`, so "space", "enter", "shift" and "?123" were all one
+    /// look. On the GTK board Enter is accent-filled with white text — it is the key that
+    /// COMMITS, and it is meant to be findable without reading it — and a locked shift is a
+    /// solid accent cap you can see from across the room. Neither existed here.
+    pub role: KeyRole,
+}
+
+/// A key's role, mirroring `board_layouts::KeyType` and the four CSS classes the GTK
+/// stylesheet paints from. Kept as its own enum rather than re-using `KeyType` directly so
+/// the egui board can carry the two shift STATES, which in GTK are extra classes
+/// (`.shift-active`, `.shift-locked`) on a modifier rather than types of their own.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum KeyRole {
+    /// A letter or symbol. `.key-normal`.
+    #[default]
+    Normal,
+    /// Shift, ctrl, the symbols toggle. `.key-modifier` — a touch lighter than the surface,
+    /// bolder text, and it recedes rather than competing with the letters.
+    Modifier,
+    /// Enter, and anything else that commits. `.key-action` — accent fill, white text.
+    Action,
+    /// Backspace, voice, emoji. `.key-special` — faintest of all, still legible.
+    Special,
+}
+
+impl KeyRole {
+    /// From the shared layout crate's type, so a layout file's `key_type` reaches the paint
+    /// code instead of being re-derived from the label.
+    pub fn from_key_type(t: board_layouts::key::KeyType) -> KeyRole {
+        match t {
+            board_layouts::key::KeyType::Normal => KeyRole::Normal,
+            board_layouts::key::KeyType::Modifier => KeyRole::Modifier,
+            board_layouts::key::KeyType::Action => KeyRole::Action,
+            board_layouts::key::KeyType::Special => KeyRole::Special,
+        }
+    }
+
+    /// From a layout file's `key_type` string. An unknown value is Normal rather than an
+    /// error: a newer layout naming a role this build does not have should render as a
+    /// plain key, not fail to load.
+    pub fn from_json(s: &str) -> KeyRole {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "modifier" => KeyRole::Modifier,
+            "action" => KeyRole::Action,
+            "special" => KeyRole::Special,
+            _ => KeyRole::Normal,
+        }
+    }
+
+    /// The role a bare label implies, for the demo layouts that are built in code and have no
+    /// `key_type` to read. Names, not lengths: "space" is a normal key that happens to be
+    /// wide, and guessing by length made it a modifier.
+    pub fn from_label(label: &str) -> KeyRole {
+        let l = label.trim().to_ascii_lowercase();
+        match l.as_str() {
+            "enter" | "return" | "↵" | "⏎" | "go" | "send" | "search" => KeyRole::Action,
+            "shift" | "⇧" | "caps" | "ctrl" | "alt" | "meta" | "fn" | "?123" | "abc" | "=\\<" => KeyRole::Modifier,
+            "backspace" | "⌫" | "del" | "delete" | "tab" | "esc" | "voice" | "🎤" | "emoji" | "☺" => KeyRole::Special,
+            _ => KeyRole::Normal,
+        }
+    }
 }
 
 impl Key {
     pub fn new(label: &str) -> Key {
-        Key { label: label.to_string(), weight: 1.0, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None }
+        Key { label: label.to_string(), weight: 1.0, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None , role: KeyRole::from_label(label) }
     }
     pub fn wide(label: &str, weight: f32) -> Key {
-        Key { label: label.to_string(), weight, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None }
+        Key { label: label.to_string(), weight, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None , role: KeyRole::from_label(label) }
     }
     pub fn emitting(label: &str, emit: &str, weight: f32) -> Key {
-        Key { label: label.to_string(), weight, emit: emit.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None }
+        Key { label: label.to_string(), weight, emit: emit.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None , role: KeyRole::from_label(label) }
     }
+    /// Set the key's role explicitly — for a layout that knows better than the label does.
+    pub fn with_role(mut self, role: KeyRole) -> Key {
+        self.role = role;
+        self
+    }
+
     /// Attach long-press variant characters (each emits itself).
     pub fn with_variants(mut self, vs: &[&str]) -> Key {
         self.variants = vs.iter().map(|s| s.to_string()).collect();
@@ -168,6 +239,12 @@ struct JsonKey {
     width: f32,
     #[serde(default)]
     action: Option<JsonAction>,
+    /// `"modifier"` / `"action"` / `"special"` — the SAME field the GTK app reads to pick a
+    /// key's CSS class. The port parsed everything else in this schema and dropped this one,
+    /// so every key looked the same and Enter was not the accent key it is on the real
+    /// board.
+    #[serde(default)]
+    key_type: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct JsonAction {
@@ -197,7 +274,8 @@ fn layout_from_json(text: &str) -> Result<Layout, serde_json::Error> {
         weight: r.weight,
         keys: r.keys.into_iter().map(|k| {
             let emit = k.action.as_ref().and_then(|a| emit_for_action(&a.kind)).unwrap_or(&k.label).to_string();
-            let mut key = Key { label: k.label, weight: k.width, emit, variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None };
+            let role = k.key_type.as_deref().map(KeyRole::from_json).unwrap_or_else(|| KeyRole::from_label(&k.label));
+            let mut key = Key { role, label: k.label, weight: k.width, emit, variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None };
             if !k.extended.is_empty() { key.variants = k.extended; }
             key
         }).collect(),
@@ -424,8 +502,17 @@ pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, palette: &
     if glass {
         // Glass root surface: high-alpha tinted fill + a single top hairline highlight, matching the
         // ported rusty-board-GTK `.glass-keyboard` recipe (no gradient/blur — see uikit_egui::glass).
+        // `.keyboard-view { border-radius: 16px 16px 0 0 }` — the board's top corners are
+        // rounded and its bottom ones are not, because it is anchored to the screen edge.
+        // The port drew a plain rectangle, which is the one visual difference you notice
+        // before any key: the GTK board reads as a panel that has slid up, this read as a
+        // screen that had been cut in half.
         let board_rect = ui.max_rect();
-        ui.painter().rect_filled(board_rect, 0, uikit_egui::surface_fill(colors.bg_base));
+        ui.painter().rect_filled(
+            board_rect,
+            egui::CornerRadius { nw: BOARD_RADIUS, ne: BOARD_RADIUS, sw: 0, se: 0 },
+            uikit_egui::surface_fill(colors.bg_base),
+        );
         uikit_egui::paint_top_hairline(ui, board_rect);
     }
 
@@ -591,6 +678,18 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
     dispatch_key(ui, key, rect, size, &resp)
 }
 
+/// `.keyboard-view { border-radius: 16px 16px 0 0 }`.
+pub const BOARD_RADIUS: u8 = 16;
+
+/// `.key-button:active { transform: scale(0.94) }` from the GTK stylesheet.
+pub const PRESS_SCALE: f32 = 0.94;
+
+/// Shrink a rect about its own centre, so a pressed key moves without nudging its
+/// neighbours (a layout that reflows under a thumb is worse than one that does not move).
+fn shrink_about_centre(rect: Rect, k: f32) -> Rect {
+    Rect::from_center_size(rect.center(), rect.size() * k)
+}
+
 /// The glyph on the cap: the resting label, or the morph mid-swap.
 ///
 /// One helper rather than the same three lines in each palette branch, because
@@ -639,11 +738,27 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
     let pressed = resp.is_pointer_button_down_on();
     let rounding = CornerRadius::same((size.y * 0.18) as u8);
     let font = FontId::proportional((size.y * 0.42).clamp(11.0, 26.0));
+    // THE PRESS SCALES, as the GTK cap does. `.key-button:active { transform: scale(0.94) }`
+    // with a bouncy release — the port only changed colour, and on a phone a cap that does
+    // not move under the thumb reads as a key that did not register. The rect shrinks about
+    // its own centre so neighbours do not shift.
+    let rect = if pressed { shrink_about_centre(rect, PRESS_SCALE) } else { rect };
     if glass {
-        let modifier = key.label.chars().count() > 1; // "shift"/"space"/"enter" etc. — sit subtly less present
+        // THE ROLE, from the layout file, not from the label's length. `.key-action` is
+        // accent-filled with white text (Enter, the key that commits — findable without
+        // reading it), `.key-modifier` is a touch lighter than the surface, `.key-special`
+        // is fainter still. Guessing `label.chars().count() > 1` made "space", "enter",
+        // "shift" and "?123" one look, and lost the accent cap entirely.
         let (fill, stroke) = if pressed {
             (uikit_egui::glass_tint(c.accent, uikit_egui::GlassAlphas::PRESSED_ACCENT), uikit_egui::key_border(c.border))
-        } else if modifier {
+        } else if key.role == KeyRole::Action {
+            // .key-action: accent at 0.85, going solid on hover.
+            let a = if resp.hovered() { 255 } else { 217 };
+            (
+                egui::Color32::from_rgba_unmultiplied(c.accent.r(), c.accent.g(), c.accent.b(), a),
+                uikit_egui::key_border(c.accent),
+            )
+        } else if key.role == KeyRole::Modifier || key.role == KeyRole::Special {
             (if resp.hovered() { uikit_egui::key_fill_modifier_hover(c.bg_card) } else { uikit_egui::key_fill_modifier(c.bg_card) }, uikit_egui::key_border_soft(c.border))
         } else {
             (if resp.hovered() { uikit_egui::key_fill_hover(c.bg_card) } else { uikit_egui::key_fill(c.bg_card) }, uikit_egui::key_border(c.border))
@@ -652,7 +767,15 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
         if rect.top() <= gutter + 1.0 {
             uikit_egui::paint_top_hairline(ui, rect);
         }
-        let text_color = if pressed { egui::Color32::WHITE } else { c.text };
+        // .key-action's label is white at rest too — that is what makes it read as the
+        // commit key rather than as another grey cap.
+        let text_color = if pressed || key.role == KeyRole::Action {
+            egui::Color32::WHITE
+        } else if key.role == KeyRole::Special {
+            c.text.gamma_multiply(0.85)
+        } else {
+            c.text
+        };
         paint_cap_label(painter, rect, &key.label, morph, font.clone(), text_color);
     } else {
         // Rest→hover→press glides (120ms) instead of snapping — the QML key ColorAnimation feel.
@@ -1414,5 +1537,94 @@ mod swipe_delivery_tests {
         let mut rig = Rig::new(Layout::qwerty(), "system");
         let q = rig.key_rect(0, 0);
         assert_eq!(rig.tap(q.center()), vec!["q".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod gtk_parity_tests {
+    use super::*;
+
+    /// The real layout files carry `key_type`, and the port dropped it — so Enter was not
+    /// the accent key it is on the GTK board, and shift, space and "?123" were all the same
+    /// grey cap as each other.
+    #[test]
+    fn the_real_layout_carries_its_key_roles_through() {
+        let text = include_str!("../../resources/layouts/en_us_qwerty.json");
+        let layout = layout_from_json(text).expect("the shipped layout parses");
+        let find = |label: &str| {
+            layout
+                .rows
+                .iter()
+                .flat_map(|r| &r.keys)
+                .find(|k| k.label == label)
+                .unwrap_or_else(|| panic!("no {label:?} key in the shipped layout"))
+        };
+        assert_eq!(find("⏎").role, KeyRole::Action, "Enter is the commit key");
+        assert_eq!(find("⇧").role, KeyRole::Modifier);
+        assert_eq!(find("?123").role, KeyRole::Modifier);
+        assert_eq!(find("⌫").role, KeyRole::Special);
+        assert_eq!(find("🎤").role, KeyRole::Special);
+        assert_eq!(find("a").role, KeyRole::Normal, "a letter is a plain key");
+        // and the roles are not all the same, which a `key_type` that failed to parse would
+        // silently produce
+        let roles: std::collections::HashSet<KeyRole> =
+            layout.rows.iter().flat_map(|r| &r.keys).map(|k| k.role).collect();
+        assert!(roles.len() >= 4, "only {} distinct roles — key_type is not being read", roles.len());
+    }
+
+    /// A layout built in code has no `key_type`, so the label decides — by NAME, not by
+    /// length. Length is what made "space" a modifier.
+    #[test]
+    fn a_label_implies_its_role_by_name_not_by_length() {
+        assert_eq!(KeyRole::from_label("enter"), KeyRole::Action);
+        assert_eq!(KeyRole::from_label("Return"), KeyRole::Action);
+        assert_eq!(KeyRole::from_label("shift"), KeyRole::Modifier);
+        assert_eq!(KeyRole::from_label("?123"), KeyRole::Modifier);
+        assert_eq!(KeyRole::from_label("backspace"), KeyRole::Special);
+        assert_eq!(KeyRole::from_label("space"), KeyRole::Normal, "wide is not the same as special");
+        assert_eq!(KeyRole::from_label("q"), KeyRole::Normal);
+        // an unknown key_type from a newer layout renders as a plain key rather than failing
+        assert_eq!(KeyRole::from_json("navigation"), KeyRole::Normal);
+        assert_eq!(KeyRole::from_json("ACTION"), KeyRole::Action, "case does not matter");
+    }
+
+    /// The press moves the cap (`transform: scale(0.94)`) about its own centre, so a pressed
+    /// key does not nudge its neighbours.
+    #[test]
+    fn a_pressed_cap_shrinks_about_its_centre() {
+        let r = Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(40.0, 44.0));
+        let p = shrink_about_centre(r, PRESS_SCALE);
+        assert_eq!(p.center(), r.center(), "the cap moved sideways under the thumb");
+        assert!(p.width() < r.width() && p.height() < r.height());
+        assert!((p.width() / r.width() - PRESS_SCALE).abs() < 1e-5);
+        assert!(r.contains_rect(p));
+    }
+
+    /// The board is a panel that slid up from the bottom edge: rounded on top, square below.
+    #[test]
+    fn the_board_is_rounded_on_top_only() {
+        assert_eq!(BOARD_RADIUS, 16, "the GTK stylesheet says 16px 16px 0 0");
+        let board = Board::new();
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 260.0)));
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = keyboard_ui(ui, board.current(), &Adaptive::detect(ctx), "system");
+            });
+        });
+        // the board's own fill is the first rect, and it carries the asymmetric radius
+        let radii: Vec<egui::CornerRadius> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Rect(r) => Some(r.corner_radius),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            radii.iter().any(|r| r.nw == BOARD_RADIUS && r.sw == 0),
+            "no rect with a rounded top and a square bottom was painted"
+        );
     }
 }
