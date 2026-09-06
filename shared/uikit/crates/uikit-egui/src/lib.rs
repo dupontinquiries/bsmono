@@ -62,6 +62,10 @@ pub mod glass;
 pub mod polish;
 /// A theme-aware, custom-drawn QR-shaped identicon and its expanded overlay (`QrCodeRenderer.cpp`, ported).
 pub mod qr;
+/// A strip that says which step of a sequence you are on (snapclone's send flow, extracted).
+pub mod steps;
+/// A row of options with the chosen one filled (the Qt duration selector, extracted).
+pub mod chips;
 pub mod gesture_layer;
 pub mod touch;
 pub mod skin;
