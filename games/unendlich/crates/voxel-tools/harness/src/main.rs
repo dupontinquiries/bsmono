@@ -26,6 +26,7 @@ fn main() {
     hive_scenario();
     connect_scenario();
     plant_scenario();
+    repair_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -481,4 +482,39 @@ fn plant_scenario() {
     let birch = flora.cells.iter().find(|(p, _)| p[0] == -14).unwrap().1;
     assert!(birch.growth01 < 0.1 && birch.stage == 0, "a seedling grows from nothing");
     assert!(pb.drain_plants(&mut flora, 1001) == 0, "drained once");
+}
+
+
+/// /repair runs on the worker and its reply is merged into the plan.
+fn repair_scenario() {
+    use paintbrush::Paintbrush;
+    use voxel_tools::chatbox::Key;
+    println!("\n==== repair on the worker");
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    // a provider that answers any prompt with one fixed line
+    let script = "/tmp/fix_provider.sh";
+    std::fs::write(script, "#!/bin/sh\ncat >/dev/null\necho 'tree @6,6 birch h=6'\n").unwrap();
+    std::process::Command::new("chmod").args(["+x", script]).status().unwrap();
+    pb.provider = paintbrush::ProviderChoice::Script(vec![script.into()]);
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    // a plan with one bad line, previewed on the drone
+    pb.launch_drone(&cm, &gaze, "enclose @-3,-3 @3,3 h=4\nfrobnicate\n".into(), None, "");
+    settle(&mut pb);
+    let log = pb.drain_log();
+    assert!(log.iter().any(|l| l.contains("SKIPPED 1")), "{log:?}");
+    // /repair must NOT run the model on this thread: it returns at once
+    let t0 = std::time::Instant::now();
+    let cmd = { pb.key(Key::Enter); for c in "/repair".chars() { pb.key(Key::Char(c)); } pb.key(Key::Enter) }.unwrap();
+    pb.dispatch(&cm, &gaze, cmd);
+    assert!(t0.elapsed().as_millis() < 50, "dispatch returned in {:?}: the model ran inline", t0.elapsed());
+    assert!(pb.in_flight.is_some(), "a turn is in flight");
+    while pb.in_flight.is_some() || pb.drone.is_some() {
+        pb.poll_turn(&cm); pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let log = pb.drain_log();
+    let planned = log.iter().find(|l| l.contains("blocks planned")).cloned().unwrap_or_default();
+    println!("  after repair: {}", planned.trim());
+    assert!(!log.iter().any(|l| l.contains("SKIPPED")), "the bad line was replaced: {log:?}");
+    assert!(log.iter().any(|l| l.contains("Plan") && l.contains("2 operations")), "wall + the fixed tree: {log:?}");
 }

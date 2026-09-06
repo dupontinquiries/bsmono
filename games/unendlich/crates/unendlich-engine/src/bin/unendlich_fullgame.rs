@@ -2845,6 +2845,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     }
 
     let mut last_frame = Instant::now();
+    // The previous frame's total time, UNCLAMPED, for the hive's queen.
+    // `dt` is capped at 100 ms so a hitch cannot jerk animation; the
+    // queen needs the opposite -- a 1.3 s stall must read as 1.3 s so she
+    // hibernates through it rather than piling generation onto it. Set
+    // at the Update phase, read by the hive tick early in the next frame.
+    let mut hive_last_frame_ms: f32 = 16.0;
     let mut frame_count = 0u64;
     // Reusable buffer for mesh_pool.drain_up_to_into — avoids per-frame Vec alloc.
     let mut drained_buf: Vec<unendlich_engine::render::meshing_pool::MeshResult> = Vec::new();
@@ -4422,22 +4428,6 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             std::env::set_var("VOXEL_MODEL", &path);
                             paintbrush.finish_load(16384);
                         }
-                        Pending::Repair => {
-                            // Same worker path as a build, different prompt:
-                            // only the bad lines, only their fixes.
-                            if let Some(user) = paintbrush.session.repair_prompt() {
-                                let system = voxel_tools::prompt::system_prompt_for(
-                                    paintbrush.ctx_tokens, paintbrush.max_reply);
-                                if let Some(mut c) = paintbrush.completer_for(false) {
-                                    match c.complete(&system, &user) {
-                                        Ok(raw) => paintbrush.finish_repair(
-                                            &chunk_manager, &gaze, &raw,
-                                            Some((eye.x as i32, eye.y as i32, eye.z as i32))),
-                                        Err(e) => paintbrush.say(format!("repair failed: {e}")),
-                                    }
-                                }
-                            }
-                        }
                         Pending::Camera(poses) => {
                             if poses.len() >= 2 { shot = Some((poses, 1, 0.0)); }
                             else if let Some(p) = poses.first() {
@@ -4502,7 +4492,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 let p = local_player.view.position;
                 let f = local_player.view.forward();
                 let t = paintbrush.tick_hive(&chunk_manager, [p.x, p.y, p.z], [f.x, f.y, f.z],
-                                             frame_dt_s * 1000.0, glfw.get_time());
+                                             hive_last_frame_ms, glfw.get_time());
                 if t.cells > 0 {
                     log::debug!("[hive] {} cells, {} blocks, {:.2} ms, {} left",
                                 t.cells, t.blocks, t.spent_ms, t.remaining);
@@ -4889,6 +4879,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         let now = Instant::now();
         let dt = (now - last_frame).as_secs_f32().min(0.1); // cap dt at 100ms
         let dt_ms = (now - last_frame).as_secs_f64() * 1000.0; // UNCLAMPED — for diagnostics/adaptive-rd
+        hive_last_frame_ms = dt_ms as f32;
         // r738: frame_dt_s drives camera smoothing, gait, and animation. It MUST be
         // clamped like `dt` — otherwise a stalled frame (e.g. a 1.3s hitch) advances
         // every animation by 1.3s, jerking the camera/gait on top of the low FPS.

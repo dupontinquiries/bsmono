@@ -61,9 +61,6 @@ pub enum Pending {
     VoiceGrammar(Vec<Vec<String>>),
     /// Stop listening.
     VoiceOff,
-    /// Run a repair turn: `session.repair_prompt()` is the user
-    /// message; on reply call `finish_repair`.
-    Repair,
     /// Play these camera poses, easing between them with
     /// `camera::lerp`, then return control to the player.
     Camera(Vec<voxel_tools::camera::Pose>),
@@ -274,7 +271,14 @@ pub struct PendingTurn {
     /// model's world ops against THIS; without it every world op is
     /// refused, including one the player explicitly asked for.
     pub prose: String,
+    /// What to do with the reply when it lands.
+    pub kind: TurnKind,
 }
+
+/// The kinds of model turn, so the reply is routed without the bin
+/// having to remember which it started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnKind { Build, Repair }
 
 impl PendingTurn {
     /// Has the reply arrived? None means still working.
@@ -309,7 +313,12 @@ pub struct EngineCompleter {
 impl voxel_tools::llm::Completer for EngineCompleter {
     fn name(&self) -> &str { "wgpu engine (in-instance)" }
     fn complete(&mut self, system: &str, user: &str) -> Result<String, String> {
-        self.inner.generate(&format!("{system}\n\n{user}"), self.max_tokens)
+        // The system prompt is the PREFIX and is byte-identical every
+        // turn by construction (prompt.rs keeps it stable and cache-
+        // friendly). The backend keeps its KV; each turn prefills only
+        // the user suffix. On a 1B on a mobile GPU that is the seconds
+        // before the first token, paid once instead of every time.
+        self.inner.generate_prefixed(&format!("{system}\n\n"), user, self.max_tokens)
     }
 }
 
@@ -683,16 +692,10 @@ impl Paintbrush {
                 Pending::None
             }
             Command::Repair => {
-                match self.session.repair_prompt() {
-                    None => { self.say("nothing to repair -- the last plan had no bad lines"); Pending::None }
-                    Some(_) => {
-                        // A repair is a model turn with a different user
-                        // prompt; the bin runs it like any other and the
-                        // reply is merged by `finish_repair`.
-                        self.say("asking the model to fix only the lines it got wrong ...");
-                        Pending::Repair
-                    }
-                }
+                // On the worker, like every model call. The reply is
+                // routed to `finish_repair` by its TurnKind.
+                self.start_repair(gaze, None);
+                Pending::None
             }
             Command::Hive => {
                 if self.comb.is_empty() {
@@ -881,8 +884,20 @@ impl Paintbrush {
             self.say("no provider available -- /provider to check");
             return;
         };
+        self.spawn_turn(completer, system, user, gaze, player_feet, prose, TurnKind::Build);
+    }
+
+    /// Put a model call on the worker thread. The ONE place a completer
+    /// is invoked from the game: every kind of turn -- build, outline,
+    /// repair -- goes through here, so none of them can run the model
+    /// on the frame. The `/repair` handler once called `complete`
+    /// inline in the bin: a twenty-second stall, the exact thing the
+    /// rest of this file exists to prevent.
+    fn spawn_turn(&mut self, mut completer: Box<dyn voxel_tools::llm::Completer>,
+                  system: String, user: String, gaze: &Gaze,
+                  player_feet: Option<(i32, i32, i32)>, prose: &str, kind: TurnKind) {
         let name = completer.name().to_string();
-        log::info!("[paintbrush] asking {name} ({} + {} chars, ctx {})",
+        log::info!("[paintbrush] asking {name} ({} + {} chars, ctx {}, {kind:?})",
                    system.len(), user.len(), self.ctx_tokens);
         self.say(format!("asking {name} ... (the world keeps running)"));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -894,8 +909,27 @@ impl Paintbrush {
         });
         self.in_flight = Some(PendingTurn {
             rx, started: Instant::now(), provider: name, gaze: *gaze, player_feet,
-            prose: prose.to_string(),
+            prose: prose.to_string(), kind,
         });
+    }
+
+    /// Start a repair turn: the model is asked to fix only the lines it
+    /// got wrong, on the worker like any other turn.
+    pub fn start_repair(&mut self, gaze: &Gaze, player_feet: Option<(i32, i32, i32)>) {
+        if self.in_flight.is_some() {
+            self.say("a turn is already in flight -- wait or /cancel");
+            return;
+        }
+        let Some(user) = self.session.repair_prompt() else {
+            self.say("nothing to repair -- the last plan had no bad lines");
+            return;
+        };
+        let system = voxel_tools::prompt::system_prompt_for(self.ctx_tokens, self.max_reply);
+        let Some(completer) = self.completer_for(false) else {
+            self.say("no provider available -- /provider to check");
+            return;
+        };
+        self.spawn_turn(completer, system, user, gaze, player_feet, "", TurnKind::Repair);
     }
 
     /// The model answered a repair turn with fixed lines. Merge them
@@ -920,7 +954,12 @@ impl Paintbrush {
             Ok(raw) => {
                 log::info!("[paintbrush] reply in {:.1}s, {} chars",
                            turn.elapsed().as_secs_f32(), raw.len());
-                self.finish_turn_with(cm, &turn.gaze, &raw, turn.player_feet, &turn.prose);
+                match turn.kind {
+                    TurnKind::Build =>
+                        self.finish_turn_with(cm, &turn.gaze, &raw, turn.player_feet, &turn.prose),
+                    TurnKind::Repair =>
+                        self.finish_repair(cm, &turn.gaze, &raw, turn.player_feet),
+                }
             }
             Err(e) => {
                 log::warn!("[paintbrush] provider failed: {e}");
@@ -1161,6 +1200,7 @@ impl Paintbrush {
             t0.elapsed()
         });
         if !deferred.is_empty() { self.session.deferred.cells.extend(deferred); }
+        if t.cells > 0 { self.session.invalidate_context(); }
         t
     }
 
@@ -1194,6 +1234,7 @@ impl Paintbrush {
         let (applied, skipped) = cm.set_blocks(&edits);
         log::info!("[paintbrush] deferred retry: applied={applied} skipped={skipped}");
         if applied > 0 {
+            self.session.invalidate_context();
             self.say(format!("{applied} deferred block(s) placed now that their chunk loaded"));
         }
     }

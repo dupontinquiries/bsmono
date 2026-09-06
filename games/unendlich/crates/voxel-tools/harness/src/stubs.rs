@@ -79,6 +79,7 @@ pub fn parse(line: &str) -> Command {
         (Some("/model"), None) => Command::Model(None),
         (Some("/model"), Some(n)) => Command::Model(Some(n.to_string())),
         (Some("/keys"), None) => Command::Keys,
+        (Some("/repair"), None) => Command::Repair,
         (Some("/hive"), None) => Command::Hive,
         (Some("/refine"), None) => Command::Refine(None),
         (Some("/refine"), Some(r)) => Command::Refine(Some(r.to_string())),
