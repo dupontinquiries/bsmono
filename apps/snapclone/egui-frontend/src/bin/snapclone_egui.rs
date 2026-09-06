@@ -938,6 +938,11 @@ impl App {
                                 &f, snapclone_egui::media_encode::DEFAULT_QUALITY)
                             {
                                 Ok(enc) => {
+                                    // The receipt learns the size the moment
+                                    // it is known, not from the log.
+                                    let cmds = self.snap.apply(HostEvent::SnapEncoded {
+                                        bytes: enc.bytes.len() as u64 });
+                                    self.handle(cmds);
                                     let ratio = snapclone_egui::media_encode::compression_ratio(
                                         &f, enc.bytes.len());
                                     eprintln!(

@@ -7,7 +7,7 @@
 use crate::send_flow::{SendFlow, Step};
 use uikit_egui::PaletteColors;
 
-/// Four cells in ONE galley: `① Take · img_017.jpg  ›  ② Compose  ›  ③ Choose  ›  ④ Send`.
+/// Four cells in ONE galley: `1 Take · photo  ›  2 Compose  ›  3 Choose  ›  4 Send`.
 /// The current one strong in the accent, the done ones plain, the rest weak.
 ///
 /// One `LayoutJob` rather than a label per cell: the layout probe caught a
@@ -34,7 +34,9 @@ pub fn stepper_strip(ui: &mut egui::Ui, flow: &SendFlow, c: &PaletteColors) {
             );
         }
     }
-    ui.label(job);
+    // A wrapping Label, so a strip that does break onto a second line is
+    // given the height for it instead of painting over the row below.
+    ui.add(egui::Label::new(job).wrap());
     let _ = Step::Capture; // the enum is the strip's contract; keep the import honest
 }
 

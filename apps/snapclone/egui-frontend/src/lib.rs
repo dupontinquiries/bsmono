@@ -3844,6 +3844,14 @@ impl Snapclone {
         // and over the page above.
         ui.set_clip_rect(band);
         let ui = &mut ui;
+        // THE CAMERA'S CHROME — stall marker, capture status, which camera,
+        // the shutter row — belongs to step 1. From Compose on the frame is
+        // frozen on purpose (the Qt composer is a dialog over the captured
+        // image), so "preview stalled" would be a false alarm and the
+        // shutter is "retake" on the panel below; hiding the rows also gives
+        // that panel the height it needs on a phone. Seen at 420x820: the
+        // timer chips and Next were below the fold with the chrome shown.
+        if self.send_flow.step() == crate::send_flow::Step::Capture {
         // A FROZEN STREAM IS MARKED rather than silently frozen: the user is
         // about to take a photo based on what this shows, and a still image
         // that stopped updating is a lie about what the lens sees.
@@ -4058,6 +4066,7 @@ impl Snapclone {
                 self.viewfinder.scan_mode = !self.viewfinder.scan_mode;
             }
         });
+        } // end of the camera's chrome (step 1 only)
         ui.separator();
         // EVERYTHING BELOW THE VIEWFINDER SCROLLS. The camera page is drawn
         // outside the page-level ScrollArea on purpose — the viewfinder should

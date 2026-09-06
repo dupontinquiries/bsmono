@@ -222,6 +222,11 @@ pub enum HostEvent {
     /// pressed the shutter is looking at the camera page, and a photo that
     /// silently did not save is the failure they find out about last.
     SnapSaved(Result<String, String>),
+    /// The host encoded the shutter's frame for the wire: the bytes that will
+    /// go out. Feeds the pre-send receipt's Size facet, which showed
+    /// "Sending 0 B" for every snap because nothing told the app what the
+    /// encoder produced — the number was in the host's log and nowhere else.
+    SnapEncoded { bytes: u64 },
     /// A DHT lookup produced a value.
     DhtValue(Vec<u8>),
     /// A DHT lookup finished. The bool command reports whether this was the
@@ -437,6 +442,15 @@ impl Snapclone {
             }
             HostEvent::SnapsForFeed(entries) => {
                 self.feed.set_entries(self.snap_state.filter_unfinished(entries));
+            }
+            HostEvent::SnapEncoded { bytes } => {
+                // JPEG (format 1 in the strip report's vocabulary), nothing
+                // stripped — a fresh encode carries no camera metadata —
+                // nothing already shared (the dedup line is a mediashare
+                // fact this path does not have), and the recipient count is
+                // whatever the picker holds now.
+                let recipients = self.picker.selected().len() as i32;
+                self.prepare_send(1, 0, bytes as i64, bytes as i64, recipients);
             }
             HostEvent::SnapSaved(r) => {
                 // Flash only on SUCCESS. The universal camera confirmation
@@ -1518,5 +1532,16 @@ mod addr_health_host_tests {
         s.run_action(crate::palette::Action::SendTo { id: "kitchen".into(), name: "Kitchen".into() });
         let cmds = s.drain_commands();
         assert!(cmds.iter().any(|c| matches!(c, HostCommand::SendSnap { to, snap: None } if to == &vec!["kitchen".to_string()])));
+    }
+
+    #[test]
+    fn the_encoded_size_reaches_the_receipt() {
+        // "Sending 0 B" on every snap: the encoder's size lived in the host's
+        // log and the receipt was never told.
+        let mut s = app();
+        s.apply(HostEvent::SnapEncoded { bytes: 16 * 1024 });
+        assert_eq!(s.send_summary.upload_bytes, 16 * 1024);
+        assert_eq!(s.send_summary.total_bytes, 16 * 1024, "nothing already shared on this path");
+        assert!(!s.can_send(), "and still no recipients");
     }
 }

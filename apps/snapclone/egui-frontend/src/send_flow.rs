@@ -235,7 +235,10 @@ impl SendFlow {
 
     fn summary_of(&self, s: Step) -> Option<String> {
         match s {
-            Step::Capture => self.captured.as_ref().map(|c| file_name(&c.path)),
+            // "photo", not the file name: `snap-1788696974124.jpg` is a
+            // sixty-pixel number nobody reads, and it pushed the strip onto a
+            // second line at phone width. The path is still on `captured()`.
+            Step::Capture => self.captured.as_ref().map(|_| "photo".to_string()),
             Step::Compose => self.snap.as_ref().map(|sn| {
                 if sn.caption.is_empty() {
                     format!("{} · no caption", sn.duration.label())
@@ -277,9 +280,10 @@ pub struct StepCell {
 }
 
 impl StepCell {
-    /// `① Take` / `② Compose · 5s · "hi"`.
+    /// `1 Take` / `2 Compose · 5s · "hi"`. Plain digits: the circled ones
+    /// (①②③④) drew as tofu in the app's font under Xvfb.
     pub fn label(&self) -> String {
-        let n = ['①', '②', '③', '④'][(self.step.number() - 1) as usize];
+        let n = self.step.number();
         match &self.summary {
             Some(s) => format!("{n} {} · {s}", self.step.title()),
             None => format!("{n} {}", self.step.title()),
@@ -306,10 +310,6 @@ impl Receipt {
     pub fn all_failed(&self) -> bool {
         self.delivered == 0 && self.pending == 0 && self.failed > 0
     }
-}
-
-fn file_name(path: &str) -> String {
-    path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
 fn shorten(s: &str, max: usize) -> String {
@@ -405,26 +405,26 @@ mod tests {
     fn the_strip_records_what_was_decided_and_marks_the_current_step() {
         let mut f = SendFlow::default();
         let labels = |f: &SendFlow| f.stepper().iter().map(|c| c.label()).collect::<Vec<_>>();
-        assert_eq!(labels(&f), vec!["① Take", "② Compose", "③ Choose", "④ Send"]);
+        assert_eq!(labels(&f), vec!["1 Take", "2 Compose", "3 Choose", "4 Send"]);
         assert!(f.stepper()[0].current && !f.stepper()[1].current);
         f.on_captured(Captured { path: "/data/snaps/img_017.jpg".into(), at_ms: 0 });
-        assert_eq!(labels(&f)[0], "① Take · img_017.jpg");
+        assert_eq!(labels(&f)[0], "1 Take · photo");
         assert!(f.stepper()[0].done && f.stepper()[1].current);
         f.on_composed(snap("a very long caption that will not fit", 10));
-        assert_eq!(labels(&f)[1], "② Compose · 10s · \u{201c}a very long capti…\u{201d}");
+        assert_eq!(labels(&f)[1], "2 Compose · 10s · \u{201c}a very long capti…\u{201d}");
         f.on_send(&["ada".into(), "bob".into()], 0);
-        assert_eq!(labels(&f)[2], "③ Choose · 2 people");
+        assert_eq!(labels(&f)[2], "3 Choose · 2 people");
         assert!(f.stepper()[3].current, "sending is the current step");
         f.on_delivered("ada", 1);
         f.on_delivered("bob", 2);
-        assert_eq!(labels(&f)[3], "④ Send · Snap sent!");
+        assert_eq!(labels(&f)[3], "4 Send · Snap sent!");
         assert!(f.stepper().iter().all(|c| c.done), "after the receipt every step is done");
         let mut one = SendFlow::default();
         one.on_captured(Captured { path: "x".into(), at_ms: 0 });
         one.on_composed(snap("", 0));
         one.on_send(&["ada".into()], 0);
-        assert_eq!(labels(&one)[1], "② Compose · ∞ · no caption");
-        assert_eq!(labels(&one)[2], "③ Choose · ada");
+        assert_eq!(labels(&one)[1], "2 Compose · ∞ · no caption");
+        assert_eq!(labels(&one)[2], "3 Choose · ada");
     }
 
     #[test]
