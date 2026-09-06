@@ -109,6 +109,9 @@ impl Accel for SysfsAccel {
 /// decides what they mean.
 pub struct GloveInput {
     since_poll: f32,
+    /// The last raw reading, for anything that wants the vector itself (the
+    /// code's tilt) rather than the orientation the glove cursor derives.
+    raw: Option<(f32, f32, f32)>,
     /// The last reading, so a caller can show what the sensor says without
     /// reading it again.
     pub last: Option<(Orient, Tilt)>,
@@ -119,7 +122,7 @@ pub struct GloveInput {
 
 impl Default for GloveInput {
     fn default() -> Self {
-        GloveInput { since_poll: 0.0, last: None, enabled: false }
+        GloveInput { since_poll: 0.0, raw: None, last: None, enabled: false }
     }
 }
 
@@ -133,6 +136,9 @@ impl GloveInput {
     /// sensor is read every fourth frame makes a gesture mean different
     /// things at different frame rates, which is how one tuned on a
     /// desktop becomes unusable on a phone.
+    /// The last raw accelerometer vector, if the sensor has produced one.
+    pub fn raw(&self) -> Option<(f32, f32, f32)> { self.raw }
+
     pub fn tick(&mut self, dt_ms: f32, src: &mut dyn Accel)
         -> Option<(Orient, Tilt, f32)> {
         if !self.enabled {
@@ -150,6 +156,7 @@ impl GloveInput {
             // been unplugged. The gesture holds its state instead.
             return None;
         };
+        self.raw = Some((x, y, z));
         let (o, t) = from_accel(x, y, z);
         self.last = Some((o, t));
         Some((o, t, elapsed))

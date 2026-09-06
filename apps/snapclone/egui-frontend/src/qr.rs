@@ -520,7 +520,7 @@ mod input_reality_check {
 /// information. So the caption says so. A square that LOOKS scannable and is
 /// not would have people holding phones at each other until one of them gives
 /// up, and blaming their camera.
-pub fn my_code_ui(ui: &mut egui::Ui, id: &str, c: &uikit_egui::PaletteColors, revealed_at: Option<f64>) -> bool {
+pub fn my_code_ui(ui: &mut egui::Ui, id: &str, c: &uikit_egui::PaletteColors, revealed_at: Option<f64>, tilt: Option<uikit_egui::qr::Tilt>) -> bool {
     use crate::qr_render::layout_for;
     let mut tapped = false;
     ui.vertical_centered(|ui| {
@@ -529,7 +529,14 @@ pub fn my_code_ui(ui: &mut egui::Ui, id: &str, c: &uikit_egui::PaletteColors, re
         // behind the WCAG guard, an integer cell at the device pixel ratio,
         // rounded eyes and dotted modules on the same glass card as the rest
         // of the chrome. A tap opens it full-screen (the C++ showExpandedQr).
-        let r = uikit_egui::qr::qr_ui(ui, &layout_for(id), 168.0, c, revealed_at).on_hover_text("tap to enlarge");
+        // The card leans with the phone (the sensor's tilt) or under the pointer.
+        let (rect, _) = (ui.available_rect_before_wrap(), ());
+        let side = 168.0;
+        let probe = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.top() + side * 0.5), egui::vec2(side, side));
+        let tilt = tilt.unwrap_or_else(|| {
+            ui.input(|i| i.pointer.hover_pos()).map(|p| uikit_egui::qr::Tilt::from_pointer(p, probe)).unwrap_or_default()
+        });
+        let r = uikit_egui::qr::qr_ui_tilted(ui, &layout_for(id), side, c, revealed_at, tilt).on_hover_text("tap to enlarge");
         if r.clicked() { tapped = true; }
         ui.colored_label(c.text_weak, egui::RichText::new(id).monospace().small());
         // The honest caption. See the module docs above.

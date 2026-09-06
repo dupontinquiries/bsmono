@@ -53,8 +53,12 @@ impl CaptureRig {
         let (shared, stop, kill) = (self.shared.clone(), self.stop.clone(), self.kill.clone());
         self.thread = Some(std::thread::spawn(move || {
             if test_pattern() {
-                let opener = |_: &capture::SourceCandidate| -> Result<Box<dyn capture::FrameStream>, String> {
-                    Ok(Box::new(capture::TestPattern::new(w, h)))
+                // SNAPCLONE_TEST_PATTERN_CODE=<sc-id>: the synthetic camera holds a
+                // code up to the lens, so the scanner can be walked without a
+                // second phone.
+                let code = std::env::var("SNAPCLONE_TEST_PATTERN_CODE").ok();
+                let opener = move |_: &capture::SourceCandidate| -> Result<Box<dyn capture::FrameStream>, String> {
+                    Ok(Box::new(capture::TestPattern::new(w, h).with_code(code.clone())))
                 };
                 capture::run(&plan, w, h, opener, &shared, &stop,
                              std::time::Duration::from_millis(500));
@@ -223,6 +227,8 @@ struct App {
     /// with a picture on screen. Seen under Xvfb with the test pattern at
     /// 15 fps; at a camera's 30 fps it was a coin toss per press.
     last_live: Option<snapclone_egui::frame_pump::RawFrame>,
+    /// Frames seen while the scanner is up, for the every-fourth decode throttle.
+    scan_frames: u32,
     /// Sends running on worker threads. A dial can take the full timeout
     /// and must never run on the frame loop.
     sending: Vec<std::thread::JoinHandle<()>>,
@@ -359,7 +365,7 @@ impl App {
         };
 
         Self { snap, snaps_in, accel: None, glove_probed: false,
-               last_snap: None, last_live: None, sending: Vec::new(),
+               last_snap: None, last_live: None, scan_frames: 0, sending: Vec::new(),
                send_results: Arc::new(Mutex::new(Vec::new())),
                voice: VoiceRig::idle(), rig: CaptureRig::idle(),
                nat: snapclone_egui::nat_traversal::Traversal::new(""), nat_id: String::new(),
@@ -515,7 +521,12 @@ impl App {
         let visible = self.snap.nav.page() == camera_page;
         // `screen_on` is not knowable from eframe; `true` defers to focus,
         // which a locked phone drops anyway.
-        let want = snapclone_egui::frame_pump::should_stream(visible, self.focused, true)
+        // THE SCANNER NEEDS THE CAMERA. Scanning happens from the Friends page,
+        // where the camera page is not visible and the stream was stopped — so
+        // "Point at a SnapClone QR code" sat over a viewfinder that could never
+        // see one. A live scanner keeps the stream up wherever it is opened.
+        let scanning = self.snap.qr.as_ref().is_some_and(|q| q.is_scanning());
+        let want = snapclone_egui::frame_pump::should_stream(visible || scanning, self.focused, true)
             && self.snap.camera.is_some();
 
         if want && !self.rig.running() {
@@ -560,6 +571,20 @@ impl App {
         }
         if let Some(f) = self.rig.shared.take_frame() {
             self.last_live = Some(f.clone());
+            // THE DECODER, while the scanner is up: every fourth frame through
+            // the kit's `qr::decode_frame`, and a hit becomes the same
+            // `QrPayload` event a pasted code raises. Nothing fed this
+            // event before; the scanner had a status line and no eyes.
+            if self.snap.qr.as_ref().is_some_and(|q| q.is_scanning()) {
+                self.scan_frames = self.scan_frames.wrapping_add(1);
+                if self.scan_frames % 4 == 0 && f.pixels_plausible() {
+                    if let Some(id) = uikit_egui::qr::decode_frame(&f.rgba, f.width as usize, f.height as usize) {
+                        eprintln!("snapclone: scanned {id}");
+                        let cmds = self.snap.apply(HostEvent::QrPayload(id));
+                        self.handle(cmds);
+                    }
+                }
+            }
             let cmds = self.snap.apply(HostEvent::CameraFrame(f));
             self.handle(cmds);
         }

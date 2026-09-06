@@ -173,11 +173,19 @@ pub struct TestPattern {
     width: u32,
     height: u32,
     frame: u64,
+    /// A code held up to the lens: the kit's layout for this id, drawn into
+    /// every frame on a light card, slowly turning — so the scanner has
+    /// something to find, at an angle, with no second phone.
+    code: Option<uikit_egui::qr::Layout>,
 }
 
 impl TestPattern {
     pub fn new(width: u32, height: u32) -> TestPattern {
-        TestPattern { width, height, frame: 0 }
+        TestPattern { width, height, frame: 0, code: None }
+    }
+    pub fn with_code(mut self, id: Option<String>) -> TestPattern {
+        self.code = id.map(|i| uikit_egui::qr::layout_for(&i));
+        self
     }
 }
 
@@ -208,6 +216,24 @@ impl FrameStream for TestPattern {
                 buf[i + 2] = b;
                 buf[i + 3] = 255;
             }
+        }
+        if let Some(l) = &self.code {
+            // a light card, then the code turning a little either way
+            let side = (h.min(w) as f32) * 0.5;
+            let cell = (side / 21.0).floor().max(2.0);
+            let used = cell * 21.0;
+            let o = ((w as f32 - used) / 2.0, (h as f32 - used) / 2.0);
+            let pad = cell * 2.0;
+            for y in 0..h {
+                for x in 0..w {
+                    if (x as f32) >= o.0 - pad && (x as f32) < o.0 + used + pad && (y as f32) >= o.1 - pad && (y as f32) < o.1 + used + pad {
+                        let i = (y * w + x) * 4;
+                        buf[i..i + 4].copy_from_slice(&[236, 232, 224, 255]);
+                    }
+                }
+            }
+            let rot = (t * 0.7).sin() * 0.35;
+            uikit_egui::qr::rasterize(l, buf, w, h, o, cell, rot, [22, 22, 24]);
         }
         self.frame += 1;
         std::thread::sleep(std::time::Duration::from_millis(66));

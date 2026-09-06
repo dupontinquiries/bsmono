@@ -288,6 +288,10 @@ pub struct Snapclone {
     pub qr_shown_at: Option<f64>,
     /// The SVG of my code, when the expanded view's Save SVG was pressed; drained to the host.
     pub code_svg_requested: Option<String>,
+    /// How the phone leans, smoothed, for the code card's light (the kit's `qr::Tilt`). From
+    /// the accelerometer when there is one (`glove_input.raw()`), else the pointer over the
+    /// card, so a desktop mouse tilts it too.
+    pub tilt: uikit_egui::qr::Tilt,
     /// The unified bottom bar (Qt UnifiedNavBar): page arrows, sub-tab segments, underline
     /// morph, page dots. Owns the page + sub-tab state; `nav` mirrors the page for swipe.
     pub bar: UnifiedNav,
@@ -974,6 +978,7 @@ impl Snapclone {
             qr_expanded: None,
             qr_shown_at: None,
             code_svg_requested: None,
+            tilt: Default::default(),
             bar: UnifiedNav::new(),
             login_visible: !auto_logged_in,
             nav: Nav::new(PAGES.len()),
@@ -3359,7 +3364,8 @@ impl Snapclone {
                 // an exchange needs a third device.
                 child.separator();
                 let shown = *self.qr_shown_at.get_or_insert(ui.input(|i| i.time));
-                if crate::qr::my_code_ui(&mut child, &self.local_id, &colors, Some(shown)) {
+                let tilt = self.glove_input.raw().map(|_| self.tilt);
+                if crate::qr::my_code_ui(&mut child, &self.local_id, &colors, Some(shown), tilt) {
                     self.qr_expanded = Some(uikit_egui::qr::Expanded::open(ui.input(|i| i.time)));
                 }
                 if child.button("close").clicked() {
@@ -3593,7 +3599,15 @@ impl Snapclone {
         // MY CODE, expanded: the C++ overlay — scrim, the code at 80% width,
         // the id at 24, Close — on the foreground layer, over every page.
         let layout = crate::qr_render::layout_for(&self.local_id);
-        let ev = uikit_egui::qr::expanded_ui_with(ui.ctx(), &mut self.qr_expanded, &self.local_id, &layout, &colors);
+        // THE COMPASS TILT. The accelerometer's gravity vector, eased, when the
+        // phone has one; a machine without one hands the overlay `None` and
+        // the pointer over the code stands in.
+        let sensor = self.glove_input.raw().map(|(x, y, z)| uikit_egui::qr::Tilt::from_accel(x, y, z));
+        if let Some(t) = sensor {
+            self.tilt = self.tilt.ease_toward(t, 0.15);
+            if self.qr_expanded.is_some() || self.qr.is_some() { ui.ctx().request_repaint(); }
+        }
+        let ev = uikit_egui::qr::expanded_ui_with(ui.ctx(), &mut self.qr_expanded, &self.local_id, &layout, &colors, sensor.map(|_| self.tilt));
         if ev.save_svg {
             let (bg, fg) = uikit_egui::qr::theme_colors(&colors);
             self.code_svg_requested = Some(uikit_egui::qr::svg(&layout, 512.0, fg, bg));
