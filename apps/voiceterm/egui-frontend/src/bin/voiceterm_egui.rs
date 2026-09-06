@@ -677,6 +677,9 @@ struct VoicetermApp {
     /// with no randomness, and the panel then refuses to open rather than showing a
     /// fabricated one — see `identity`.
     identity: voiceterm_egui::identity::Loaded,
+    /// The notebook pane's per-cell state: classifications cached by block id and
+    /// output length, and which cells are folded.
+    notebook_cells: voiceterm_egui::notebook_cells::NotebookCells,
     /// The find bar's FILES mode. `None` until a file search is started, so
     /// the panel costs no terminal rows in the common case.
     fs_search: voiceterm_egui::fs_results::Search,
@@ -3987,15 +3990,50 @@ impl eframe::App for VoicetermApp {
                         // is nothing in the terminal's own proven path this
                         // can regress.
                         use voiceterm_egui::notebook::Structured;
+                        use voiceterm_egui::notebook_cells::fold_summary;
                         if self.blocks.blocks.is_empty() {
                             ui.colored_label(c.text_weak,
                                 "no command blocks yet — run something in the terminal");
                         }
+                        // Step 3's useful half: FOLDS. The pane had none, so a session
+                        // with a build log in it was a page of scrolling to reach the
+                        // cell you wanted. Folded cells keep their command and a line
+                        // saying what is inside — a fold that hides what it hid is a row
+                        // you have to open to identify.
+                        self.notebook_cells.retain_ids(|id| self.blocks.blocks.iter().any(|b| b.id == id));
+                        if !self.blocks.blocks.is_empty() {
+                            ui.horizontal(|ui| {
+                                let n = self.notebook_cells.folded_count();
+                                if ui.small_button(if n > 0 { "unfold all" } else { "fold all" }).clicked() {
+                                    let ids: Vec<u32> = self.blocks.blocks.iter().map(|b| b.id).collect();
+                                    self.notebook_cells.set_all(ids.into_iter(), n == 0);
+                                }
+                                if n > 0 {
+                                    ui.colored_label(c.text_weak, format!("{n} folded"));
+                                }
+                            });
+                        }
+                        let cells = &mut self.notebook_cells;
                         egui::ScrollArea::vertical().id_salt("notebook").show(ui, |ui| {
                             for b in &self.blocks.blocks {
                                 ui.separator();
+                                // CLASSIFIED ONCE, not once a frame. `classify` tries a
+                                // markdown table, CSV, TSV, aligned columns and two
+                                // key/value forms over the whole output; this loop ran it
+                                // for every block on every repaint.
+                                let what = cells.classify(b.id, &b.output).clone();
+                                let folded = cells.is_folded(b.id);
+                                let mut toggle = false;
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(format!("$ {}", b.command)).strong());
+                                    if ui.small_button(if folded { "\u{25b8}" } else { "\u{25be}" }).clicked() {
+                                        toggle = true;
+                                    }
+                                    if ui.add(egui::Label::new(
+                                        egui::RichText::new(format!("$ {}", b.command)).strong())
+                                        .sense(egui::Sense::click())).clicked()
+                                    {
+                                        toggle = true;
+                                    }
                                     match b.exit_code {
                                         Some(0) => { ui.colored_label(
                                             egui::Color32::from_rgb(90, 180, 100), "●"); }
@@ -4003,7 +4041,14 @@ impl eframe::App for VoicetermApp {
                                         None => {}
                                     }
                                 });
-                                match voiceterm_egui::notebook::classify(&b.output) {
+                                if toggle {
+                                    cells.toggle_fold(b.id);
+                                }
+                                if folded {
+                                    ui.colored_label(c.text_weak, fold_summary(&what, &b.output));
+                                    continue;
+                                }
+                                match what {
                                     Structured::Plain => {
                                         ui.label(egui::RichText::new(&b.output).monospace());
                                     }
@@ -5187,6 +5232,7 @@ fn main() -> eframe::Result<()> {
                 glow: Default::default(),
                 pending_confirm: None, zk_share: None,
                 identity: voiceterm_egui::identity::load_or_create("voiceterm"),
+                notebook_cells: Default::default(),
                 fs_search: Default::default(),
                 cmd_sheet: Default::default(),
                 last_memlog_s: 0.0,

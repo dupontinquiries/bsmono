@@ -317,6 +317,8 @@ pub mod table_nlp;
 /// depends on table_ops, already above it, so `#[path]` costs nothing new.
 #[path = "../../src/notebook.rs"]
 pub mod notebook;
+/// The notebook pane's per-cell state: a classification cache and the folds.
+pub mod notebook_cells;
 /// Zellij voice/assisted control — PURE core (phrase → `zellij action`
 /// argv, zellij-session detection). Fully self-contained (no `use` of any
 /// other module in this crate), tested, and — like notebook.rs above —
