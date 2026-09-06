@@ -537,6 +537,10 @@ pub struct WorldRenderer {
     pub chat_model: Option<String>,
     /// Seconds since each buffer char was typed, for the letter pop-in.
     pub chat_char_ages: Vec<f32>,
+    /// Where the pending plan will land: (name, world position, blocks).
+    /// Drawn as a marker so the player may look anywhere while a model
+    /// works and still know where /commit builds.
+    pub chat_waypoint: Option<(String, [f32; 3], usize)>,
     /// Clicks that collapsed into one frame (press+release same frame);
     /// forwarded to egui as discrete press/release pairs so fast / low-fps
     /// clicks still register on toggles.
@@ -1693,6 +1697,7 @@ impl WorldRenderer {
             chat_pending_blocks: None,
             chat_model: None,
             chat_char_ages: Vec::new(),
+            chat_waypoint: None,
             ui_backspace: false,
             ui_enter: false,
             ui_wants_keyboard: false,
@@ -4884,6 +4889,67 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                             if ui.button("Quit").clicked() {
                                 DEBUG.request_quit.store(true, Relaxed);
                             }
+                        });
+                }
+                // ── pending-build waypoint ──
+                //
+                // A pending plan used to require the player's gaze to
+                // stay on the spot until /commit. It is a waypoint now:
+                // a diamond at the anchor with the distance, or an arrow
+                // at the screen edge pointing toward it when it is out of
+                // view, so the player can wander while the model works.
+                if let Some((name, wp, blocks)) = &self.chat_waypoint {
+                    let vp = view.view_projection(aspect);
+                    let p = vp * glm::vec4(wp[0], wp[1], wp[2], 1.0);
+                    let screen = c.screen_rect();
+                    let eye = view.position;
+                    let dist = ((wp[0] - eye.x).powi(2) + (wp[1] - eye.y).powi(2)
+                                + (wp[2] - eye.z).powi(2)).sqrt();
+                    let label = format!("{name} -- {blocks} blocks, {dist:.0} m -- /commit");
+                    let col = egui::Color32::from_rgb(255, 200, 90);
+                    // In front of the camera and inside the frustum: draw at
+                    // the projected point. The Y flip is already in the
+                    // projection, so ndc y maps straight to screen y.
+                    let (pos, in_view) = if p.w > 0.0 {
+                        let (nx, ny) = (p.x / p.w, p.y / p.w);
+                        let sp = egui::pos2((nx + 1.0) * 0.5 * screen.width(),
+                                            (ny + 1.0) * 0.5 * screen.height());
+                        (sp, nx.abs() <= 1.0 && ny.abs() <= 1.0)
+                    } else {
+                        // behind: point the opposite way
+                        (egui::pos2(screen.width() - (p.x / p.w + 1.0) * 0.5 * screen.width(),
+                                    screen.height() * 0.5), false)
+                    };
+                    let pos = if in_view { pos } else {
+                        // clamp to the edge with a margin, keeping direction
+                        let centre = screen.center();
+                        let d = pos - centre;
+                        let sx = (screen.width() * 0.5 - 40.0) / d.x.abs().max(1e-3);
+                        let sy = (screen.height() * 0.5 - 40.0) / d.y.abs().max(1e-3);
+                        centre + d * sx.min(sy).min(1.0)
+                    };
+                    egui::Area::new(egui::Id::new("unendlich_waypoint"))
+                        .fixed_pos(pos - egui::vec2(8.0, 8.0))
+                        .interactable(false)
+                        .show(c, |ui| {
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            let cx = rect.center();
+                            let pts = vec![cx + egui::vec2(0.0, -8.0), cx + egui::vec2(8.0, 0.0),
+                                           cx + egui::vec2(0.0, 8.0), cx + egui::vec2(-8.0, 0.0)];
+                            if in_view {
+                                ui.painter().add(egui::Shape::convex_polygon(
+                                    pts, col, egui::Stroke::new(1.5, egui::Color32::BLACK)));
+                            } else {
+                                // an arrow: the diamond stretched toward the target
+                                let dir = (pos - screen.center()).normalized();
+                                let tip = cx + dir * 12.0;
+                                let side = egui::vec2(-dir.y, dir.x) * 6.0;
+                                ui.painter().add(egui::Shape::convex_polygon(
+                                    vec![tip, cx - dir * 4.0 + side, cx - dir * 4.0 - side],
+                                    col, egui::Stroke::new(1.5, egui::Color32::BLACK)));
+                            }
+                            ui.label(egui::RichText::new(label).small().color(col)
+                                     .background_color(egui::Color32::from_black_alpha(160)));
                         });
                 }
                 // ── HUD (top-left) ──

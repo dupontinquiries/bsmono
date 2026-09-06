@@ -101,6 +101,8 @@ cylinder @0,0 r=3 h=11 block=stone_bricks hollow
 roof @-3,-3 @3,3 hip block=dark_oak_planks
 
 A building needs a roof. Add one.
+Also: `form house A B`, `form village A B count=6`, `plant A oak tall`,
+`layer boreal A B density=0.6` (a forest), `mood eerie A B`.
 
 Now reply with plan lines only.";
 
@@ -111,6 +113,130 @@ pub const COMPACT_BELOW_CTX: usize = 8192;
 
 /// Pick a system prompt that fits. `ctx` is the model's context window
 /// in tokens; `max_reply` the generation budget.
+/// Which prompt a model gets. Chosen by PARAMETER COUNT first: a 1B
+/// drowns in a long prompt whether or not it fits, and a 70B is wasted
+/// on a short one. Context is the tie-break for models whose size is
+/// unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier { Compact, Medium, Full }
+
+/// ~200 tokens: the shape of a plan and the six ops a small model can
+/// hold. Below this size a model copies the example more than it reads
+/// the rules, so the example does the teaching.
+pub const COMPACT_MAX_B: f32 = 3.5;
+/// ~700 tokens: the ops that matter, the forms list, three examples.
+pub const MEDIUM_MAX_B: f32 = 13.0;
+
+pub fn tier_for(params_billions: Option<f32>, ctx: usize) -> Tier {
+    match params_billions {
+        Some(b) if b > 0.0 && b <= COMPACT_MAX_B => Tier::Compact,
+        Some(b) if b > 0.0 && b <= MEDIUM_MAX_B => Tier::Medium,
+        Some(b) if b > MEDIUM_MAX_B => if ctx >= 8192 { Tier::Full } else { Tier::Medium },
+        // size unknown: fall back on context, which the loader reports
+        _ => if ctx < COMPACT_BELOW_CTX { Tier::Compact }
+             else if ctx < 16384 { Tier::Medium } else { Tier::Full },
+    }
+}
+
+/// The prompt for a model of a known size. This is what the game
+/// should call; `system_prompt_for` is the context-only fallback.
+pub fn system_prompt_for_model(params_billions: Option<f32>, ctx: usize, max_reply: usize) -> String {
+    match tier_for(params_billions, ctx) {
+        Tier::Compact => COMPACT.to_string(),
+        Tier::Medium => medium_prompt(),
+        Tier::Full => system_prompt_for(ctx.max(16384), max_reply),
+    }
+}
+
+/// The middle prompt: a dozen ops, the forms, the world rule, three
+/// examples. Built from the same tables as the full one so it cannot
+/// name a form that does not exist.
+pub fn medium_prompt() -> String {
+    format!("{MEDIUM_HEAD}\n\nFORMS (use `form NAME A B`):\n{}\n\n{MEDIUM_TAIL}",
+            crate::dict::vocabulary())
+}
+
+pub const MEDIUM_HEAD: &str = "\
+You build in a voxel world by writing a PLAN: one operation per line.
+Coordinates: `@dx,dz` is relative to the focus anchor the player is
+looking at (x east, z south; @ is relative on Y too). Bare `x,z` is
+absolute. Blocks by name: stone, cobblestone, stone_bricks, oak_planks,
+dark_oak_planks, oak_log, sand, sandstone, snow, glass, water, air.
+
+OPERATIONS
+  # name                                a comment names the plan
+  enclose A B h=N [block=B]             hollow walls on a footprint
+  fill A B [block=B]                    solid box (A, B are x,y,z)
+  cylinder A r=N h=N [block=B] [hollow] a tower
+  sphere A r=N [block=B]                a dome; block=air carves
+  roof A B [gable|hip|flat] [block=B]   pitched roof over a footprint
+  floor A B [y=N] [block=B]             a storey
+  stairs A B [w=N]                      one block up per step
+  path A B [w=N] [block=B]              follows the ground
+  road A B [w=N]                        cuts, fills, bridges, tunnels itself
+  bridge A B [w=N] [block=B]            level deck with piers
+  tree A oak|birch|pine [h=N]           a fixed tree
+  plant A oak tall ancient bushy ...    a LIVING tree bred toward the words
+  scatter A B block=B clusters=N per=N  ground cover
+  terraform A B smooth|delta=N          flatten or shift the ground
+  brush raise|lower|smooth A by=N r=N [hill|mesa]   landscape scale
+  layer PACKET A B density=0.6          a forest: temperate, alpine, boreal,
+                                        jungle, desert, darkwood, meadow
+  river A dir=DEG len=N                 the terrain decides the path
+  form NAME A B [style]                 a named form (list below)
+  mood NAME A B                         eerie, haunted, cosy, fiery, frozen,
+                                        ancient, sacred, lush
+  populate KIND A B count=N [name=X]    creatures or NPCs for the engine
+  detail speckle|trim|relief A B        finishing passes
+  weather A B abandoned|ancient         decay an existing build
+  def NAME ... end / use NAME @x,z [rot=90]   define once, place many";
+
+pub const MEDIUM_TAIL: &str = "\
+RULES
+- Reply with plan lines only. No prose, no code fences.
+- A building needs a roof. Doors are `sphere A r=1 block=air`.
+- Fewer, larger operations beat many small ones. 4-12 lines.
+- Use the site's palette unless the player names one.
+- Never emit `world ...` unless the player explicitly asked to change
+  the climate or flood something; a build adapts to where it is.
+
+EXAMPLE
+  player: a small stone watchtower
+  plan:
+# watchtower
+terraform @-5,-5 @5,5 smooth block=stone
+cylinder @0,0 r=3 h=11 block=stone_bricks hollow
+roof @-3,-3 @3,3 hip block=dark_oak_planks
+sphere @3,0 r=1 block=air
+path @3,0 @16,9 w=2 block=cobblestone
+
+EXAMPLE
+  player: an eerie forest with creatures
+  plan:
+# eerie forest
+layer darkwood @-30,-30 @30,30 density=0.6
+mood eerie @-30,-30 @30,30
+populate horrifying creatures @-30,-30 @30,30 count=6
+
+EXAMPLE
+  player: a ring of six huts around a well
+  plan:
+# hut ring
+def hut
+enclose @-3,-3 @3,3 h=4 block=oak_planks
+roof @-3,-3 @3,3 gable
+sphere @3,0 r=1 block=air
+end
+use hut @12,0 rot=180
+use hut @0,12 rot=270
+use hut @-12,0
+use hut @0,-12 rot=90
+use hut @9,9 rot=180
+use hut @-9,-9
+cylinder @0,0 r=2 h=2 block=cobblestone hollow
+
+Now reply with plan lines only.";
+
 pub fn system_prompt_for(ctx: usize, max_reply: usize) -> String {
     // Two reasons to go compact, and the first is not about arithmetic:
     // a small model drowns in a long prompt regardless of whether it
@@ -491,5 +617,45 @@ mod tests {
         assert!(t.contains("SITE: temperate"), "context survives");
         assert!(t.contains("a stone tower on the rise"), "and the outline");
         assert!(t.ends_with("plan:"), "ending where the model should start writing");
+    }
+
+    #[test]
+    fn tiers_follow_parameter_count_first() {
+        assert_eq!(tier_for(Some(1.2), 16384), Tier::Compact, "a 1B with a big ctx is still a 1B");
+        assert_eq!(tier_for(Some(3.0), 8192), Tier::Compact);
+        assert_eq!(tier_for(Some(8.0), 16384), Tier::Medium, "an 8B gets the middle prompt");
+        assert_eq!(tier_for(Some(70.0), 32768), Tier::Full);
+        assert_eq!(tier_for(Some(70.0), 4096), Tier::Medium, "a big model in a tiny ctx cannot take the full one");
+        assert_eq!(tier_for(None, 4096), Tier::Compact, "size unknown: context decides");
+        assert_eq!(tier_for(None, 8192), Tier::Medium);
+        assert_eq!(tier_for(None, 32768), Tier::Full);
+    }
+
+    #[test]
+    fn the_medium_prompt_is_a_middle_size_and_parses_its_examples() {
+        let m = medium_prompt();
+        assert!(m.len() > 2000 && m.len() < 5000, "{} chars", m.len());
+        assert!(m.is_ascii());
+        for f in crate::dict::FORMS { assert!(m.contains(f.name), "medium names form '{}'", f.name); }
+        // every example plan in it parses clean
+        for ex in m.split("EXAMPLE").skip(1) {
+            let Some(i) = ex.find("plan:") else { continue };
+            let body: String = ex[i + 5..].lines().map(|l| l.trim())
+                .take_while(|l| !l.starts_with("EXAMPLE") && !l.starts_with("Now reply"))
+                .filter(|l| !l.is_empty()).map(|l| format!("{l}\n")).collect();
+            let (plan, issues) = crate::plan::parse_plan_at(&body, Some((0, 65, 0)));
+            let errs: Vec<_> = issues.iter().filter(|i| i.severity == crate::plan::Severity::Error).collect();
+            assert!(errs.is_empty(), "medium example failed:\n{body}\n{errs:?}");
+            assert!(!plan.ops.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_three_prompts_are_ordered_by_size() {
+        let c = system_prompt_for_model(Some(1.0), 16384, 400).len();
+        let m = system_prompt_for_model(Some(8.0), 16384, 400).len();
+        let f = system_prompt_for_model(Some(70.0), 32768, 400).len();
+        assert!(c < m && m < f, "{c} < {m} < {f}");
+        assert!(c < 1500, "compact stays small: {c}");
     }
 }

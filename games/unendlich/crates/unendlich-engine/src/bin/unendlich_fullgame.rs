@@ -4508,6 +4508,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             renderer.chat_buffer = paintbrush.chatbox.buffer.clone();
             renderer.chat_char_ages = paintbrush.chatbox.char_ages();
+            renderer.chat_waypoint = paintbrush.waypoint();
             renderer.chat_card = paintbrush.chatbox.current_card()
                 .map(|c| (c.command.to_string(), c.signature.to_string(), c.summary.to_string()));
             renderer.chat_matches = paintbrush.chatbox.matching_cards().iter()

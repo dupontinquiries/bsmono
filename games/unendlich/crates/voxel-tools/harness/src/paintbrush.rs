@@ -909,12 +909,29 @@ impl Paintbrush {
         };
         // Context-sized system prompt: a small model given the long one
         // echoes it back instead of answering.
-        let system = voxel_tools::prompt::system_prompt_for(self.ctx_tokens, self.max_reply);
+        let system = self.system_prompt();
         let Some(mut completer) = self.completer_for(debug) else {
             self.say("no provider available -- /provider to check");
             return;
         };
         self.spawn_turn(completer, system, user, gaze, player_feet, prose, TurnKind::Build);
+    }
+
+    /// The system prompt sized for the LOADED model: a 1B gets the
+    /// compact one, an 8B the medium, a 70B the full. The log showed
+    /// 10,338 chars going to a 1B because the choice was by context
+    /// alone and `ctx_tokens` was a constant that never crossed the
+    /// threshold. Size comes from the registry, ctx from the load.
+    fn system_prompt(&self) -> String {
+        let (params, ctx) = match &self.models.state {
+            voxel_tools::model::LoadState::Loaded { name, ctx, .. } => (
+                self.models.resolve(name).ok().map(|m| m.params_billions).filter(|b| *b > 0.0),
+                *ctx as usize),
+            _ => (None, self.ctx_tokens),
+        };
+        let tier = voxel_tools::prompt::tier_for(params, ctx);
+        log::info!("[paintbrush] prompt tier {tier:?} (params {params:?}, ctx {ctx})");
+        voxel_tools::prompt::system_prompt_for_model(params, ctx, self.max_reply)
     }
 
     /// Put a model call on the worker thread. The ONE place a completer
@@ -954,7 +971,7 @@ impl Paintbrush {
             self.say("nothing to repair -- the last plan had no bad lines");
             return;
         };
-        let system = voxel_tools::prompt::system_prompt_for(self.ctx_tokens, self.max_reply);
+        let system = self.system_prompt();
         let Some(completer) = self.completer_for(false) else {
             self.say("no provider available -- /provider to check");
             return;
@@ -1223,6 +1240,22 @@ impl Paintbrush {
         if !deferred.is_empty() { self.session.deferred.cells.extend(deferred); }
         if t.cells > 0 { self.session.invalidate_context(); }
         t
+    }
+
+    /// The pending plan's landing spot for the renderer's marker:
+    /// (name, world position at the anchor's surface, blocks).
+    pub fn waypoint(&self) -> Option<(String, [f32; 3], usize)> {
+        self.session.pending_waypoint().map(|w| {
+            // The marker sits at the centre of the dry run's box when
+            // there is one -- a village's anchor may be a corner of it
+            // -- else at the anchor, a block above the ground.
+            let p = match w.bounds {
+                Some((lo, hi)) => [(lo.0 + hi.0) as f32 / 2.0 + 0.5, hi.1 as f32 + 1.5,
+                                   (lo.2 + hi.2) as f32 / 2.0 + 0.5],
+                None => [w.anchor.0 as f32 + 0.5, w.anchor.1 as f32 + 1.5, w.anchor.2 as f32 + 0.5],
+            };
+            (w.name, p, w.blocks)
+        })
     }
 
     /// The frame loop's call for GPU pacing: refill the governor's

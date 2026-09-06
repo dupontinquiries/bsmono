@@ -71,11 +71,23 @@ pub enum Reply {
     Nothing,
 }
 
+/// Where a pending plan will land.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Waypoint {
+    pub anchor: (i32, i32, i32),
+    pub name: String,
+    pub blocks: usize,
+    /// Bounding box of the dry run, if it touched anything.
+    pub bounds: Option<((i32, i32, i32), (i32, i32, i32))>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Pending {
     plan: BuildPlan,
     feature_id: String,
     predicted_blocks: usize,
+    /// Box of everything the dry run touched, for the waypoint marker.
+    bounds: Option<((i32, i32, i32), (i32, i32, i32))>,
 }
 
 /// What was built last, as the referent for "make it taller", "add a
@@ -502,10 +514,34 @@ impl ChatSession {
         for w in &dry.withdrawn {
             echo.push_str(&format!("\nWITHDRAWN: {}", w.message()));
         }
+        if let Some(a) = plan.anchor {
+            echo.push_str(&format!(
+                "\npending at {:?} -- a marker shows where; /commit from anywhere", a));
+        }
         self.pending = Some(Pending {
             plan, feature_id: f.feature_id.clone(), predicted_blocks: dry.blocks_changed,
+            bounds: {
+                let mut lo = (i32::MAX, i32::MAX, i32::MAX);
+                let mut hi = (i32::MIN, i32::MIN, i32::MIN);
+                for b in &dry.batches { for (x, y, z, _) in &b.blocks {
+                    lo = (lo.0.min(*x), lo.1.min(*y), lo.2.min(*z));
+                    hi = (hi.0.max(*x), hi.1.max(*y), hi.2.max(*z));
+                }}
+                if lo.0 == i32::MAX { None } else { Some((lo, hi)) }
+            },
         });
         Reply::Preview { echo, blocks: dry.blocks_changed, feature_id: f.feature_id }
+    }
+
+    /// Where the pending plan will land, for a marker in the world.
+    /// None when nothing is pending. The anchor is the plan's own, fixed
+    /// at parse time; the box is the dry run's, so a marker can show
+    /// extent as well as centre.
+    pub fn pending_waypoint(&self) -> Option<Waypoint> {
+        let p = self.pending.as_ref()?;
+        let anchor = p.plan.anchor?;
+        Some(Waypoint { anchor, name: p.plan.name.clone(), blocks: p.predicted_blocks,
+                        bounds: p.bounds })
     }
 
     /// Forget the cached context. Call whenever the world under the
@@ -562,18 +598,10 @@ impl ChatSession {
         let Some(p) = self.pending.take() else {
             return Reply::Say("nothing to commit".into());
         };
-        let now = self.focus(gaze);
-        if now.feature_id != p.feature_id {
-            // Refuse rather than build somewhere else. The plan's
-            // @coordinates were resolved against the old anchor at
-            // parse time, so committing it here would place the build
-            // where the player WAS looking, which is surprising in the
-            // worst way.
-            self.pending = Some(p);
-            return Reply::Say(format!(
-                "focus changed since the plan was made ({} -> {}); look back at the spot, \
-                 or /build again from here", now.tier.name(), now.tier.name()));
-        }
+        // No stale-focus guard here either: the ops are absolute, the
+        // plan is a waypoint, and the player may commit from anywhere.
+        // See `pending_waypoint`.
+        let _ = gaze;
         let first = tools.edits.len();
         let run = run_plan(tools, &p.plan, self.from_y, self.chunk_size, false);
         self.invalidate_context();
@@ -707,17 +735,25 @@ mod tests {
     }
 
     #[test]
-    fn commit_refuses_when_focus_moved_away() {
+    fn commit_builds_at_the_planned_spot_from_anywhere() {
+        // The plan is a WAYPOINT. The old guard refused a commit unless
+        // the player was still looking at the spot, which meant staring
+        // at one place for the twenty seconds a model takes -- and a
+        // statue that was planned, previewed and never built because
+        // the player had turned round.
         let mut w = Flat::new();
         let mut t = VoxelTools::new(&mut w);
         let mut s = ChatSession::new(32, 200);
         s.receive_plan(&mut t, &gaze_at(20, 5, 15.0), "tower @0,0 r=3 h=6\n");
-        // player now looks far away: different tier, different feature id
+        let wp = s.pending_waypoint().expect("a waypoint while pending");
+        assert_eq!((wp.anchor.0, wp.anchor.2), (20, 5), "the marker is at the plan's anchor");
+        assert!(wp.bounds.is_some(), "with the dry run's box");
+        // the player has turned round and walked off
         let r = s.commit(&mut t, &gaze_at(300, 300, 80.0));
-        match r { Reply::Say(m) => assert!(m.contains("focus changed"), "{m}"), o => panic!("{o:?}") }
-        assert_eq!(t.world.get(23, 66, 5), 0, "nothing built in the wrong place");
-        assert!(s.show_plan() != Reply::Say("no pending plan; /build something first".into()),
-                "the plan stays pending for when they look back");
+        match r { Reply::Committed { blocks, .. } => assert!(blocks > 0), o => panic!("{o:?}") }
+        assert_ne!(t.world.get(23, 66, 5), 0, "built where it was PLANNED, not where they look");
+        assert_eq!(t.world.get(303, 66, 305), 0, "and nothing at the new gaze");
+        assert!(s.pending_waypoint().is_none(), "the marker goes away once built");
     }
 
     #[test]

@@ -27,6 +27,7 @@ fn main() {
     connect_scenario();
     plant_scenario();
     repair_scenario();
+    waypoint_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -517,4 +518,33 @@ fn repair_scenario() {
     println!("  after repair: {}", planned.trim());
     assert!(!log.iter().any(|l| l.contains("SKIPPED")), "the bad line was replaced: {log:?}");
     assert!(log.iter().any(|l| l.contains("Plan") && l.contains("2 operations")), "wall + the fixed tree: {log:?}");
+}
+
+
+/// The plan is a waypoint: commit lands where it was planned, from
+/// anywhere, and the marker says where until it is built.
+fn waypoint_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== waypoint");
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    let here = Paintbrush::gaze_from([20.0, 70.0, 5.0], [0.0, -1.0, 0.1], Some(([20, 64, 5], [0, 1, 0], 6.0)));
+    pb.launch_drone(&cm, &here, "cylinder @0,0 r=3 h=6 block=stone\n".into(), None, "");
+    settle(&mut pb);
+    let wp = pb.waypoint().expect("a marker while pending");
+    println!("  marker at {:?}: {} blocks, {:?}", wp.1, wp.2, wp.0);
+    assert!((wp.1[0] - 20.5).abs() < 4.0 && (wp.1[2] - 5.5).abs() < 4.0, "near the anchor");
+    // the player turns round and walks 300 blocks away, then commits
+    let away = Paintbrush::gaze_from([320.0, 70.0, 300.0], [1.0, -0.3, 0.0], Some(([330, 64, 300], [0, 1, 0], 12.0)));
+    let cmd = { pb.key(voxel_tools::chatbox::Key::Enter);
+                for c in "/commit".chars() { pb.key(voxel_tools::chatbox::Key::Char(c)); }
+                pb.key(voxel_tools::chatbox::Key::Enter) }.unwrap();
+    pb.dispatch(&cm, &away, cmd);
+    let log = pb.drain_log();
+    assert!(!log.iter().any(|l| l.contains("focus changed")), "no refusal: {log:?}");
+    assert!(log.iter().any(|l| l.contains("built")), "{log:?}");
+    assert!(cm.block_at(23, 66, 5) != stubs::BlockId::Air, "built where it was planned");
+    assert!(cm.block_at(323, 66, 300) == stubs::BlockId::Air, "not where they now look");
+    assert!(pb.waypoint().is_none(), "marker gone once built");
+    println!("  committed from 300 blocks away; tower stands at the plan's anchor");
 }
