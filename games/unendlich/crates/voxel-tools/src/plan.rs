@@ -109,6 +109,85 @@ fn footprint(t: &[&str], anchor: Option<(i32, i32, i32)>)
     })
 }
 
+/// Expand `def NAME` … `end` / `use NAME @x,z [rot=N] [mirror]` into
+/// plain lines. Unknown `use` names are left as-is, so the line loop
+/// reports them as an unknown op with a line number.
+pub fn expand_defs(src: &str) -> String {
+    use std::collections::BTreeMap;
+    let mut defs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut out = String::new();
+    let mut cur: Option<(String, Vec<String>)> = None;
+    for line in src.lines() {
+        let t = line.trim();
+        if let Some((name, body)) = cur.as_mut() {
+            if t.eq_ignore_ascii_case("end") {
+                defs.insert(name.to_lowercase(), std::mem::take(body));
+                cur = None;
+            } else { body.push(line.to_string()); }
+            // a def contributes no lines of its own; keep numbering by
+            // emitting a comment so line numbers in errors still match
+            out.push_str("# def\n");
+            continue;
+        }
+        let mut toks = t.split_whitespace();
+        match toks.next().map(|s| s.to_lowercase()).as_deref() {
+            Some("def") => {
+                let name = toks.next().unwrap_or("").to_string();
+                cur = Some((name, Vec::new()));
+                out.push_str("# def\n");
+            }
+            Some("use") => {
+                let name = toks.next().unwrap_or("").to_lowercase();
+                let Some(body) = defs.get(&name) else { out.push_str(line); out.push('\n'); continue };
+                let rest: Vec<&str> = toks.collect();
+                let (mut dx, mut dz) = (0i32, 0i32);
+                for r in &rest {
+                    if let Some(c) = r.strip_prefix('@') {
+                        if let Some((a, b)) = c.split_once(',') {
+                            dx = a.parse().unwrap_or(0); dz = b.parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let rot = rest.iter().find_map(|r| r.strip_prefix("rot="))
+                    .and_then(|v| v.parse::<i32>().ok()).unwrap_or(0).rem_euclid(360) / 90;
+                let mirror = rest.iter().any(|r| *r == "mirror" || *r == "flip");
+                for bl in body {
+                    out.push_str(&shift_line(bl, dx, dz, rot as u8, mirror));
+                    out.push('\n');
+                }
+            }
+            _ => { out.push_str(line); out.push('\n'); }
+        }
+    }
+    out
+}
+
+/// Rewrite every `@x,z` and `@x,y,z` token in a line: rotate about the
+/// def's origin by quarter turns, mirror across x, then offset.
+fn shift_line(line: &str, dx: i32, dz: i32, turns: u8, mirror: bool) -> String {
+    line.split(' ').map(|tok| {
+        let Some(body) = tok.strip_prefix('@') else { return tok.to_string() };
+        let parts: Vec<&str> = body.split(',').collect();
+        let nums: Vec<Option<i32>> = parts.iter().map(|p| p.parse().ok()).collect();
+        match (nums.len(), nums.as_slice()) {
+            (2, [Some(x), Some(z)]) => {
+                let (x, z) = rot_xz(*x, *z, turns, mirror);
+                format!("@{},{}", x + dx, z + dz)
+            }
+            (3, [Some(x), Some(y), Some(z)]) => {
+                let (x, z) = rot_xz(*x, *z, turns, mirror);
+                format!("@{},{},{}", x + dx, y, z + dz)
+            }
+            _ => tok.to_string(),
+        }
+    }).collect::<Vec<_>>().join(" ")
+}
+
+fn rot_xz(x: i32, z: i32, turns: u8, mirror: bool) -> (i32, i32) {
+    let (x, z) = if mirror { (-x, z) } else { (x, z) };
+    match turns % 4 { 0 => (x, z), 1 => (-z, x), 2 => (-x, -z), _ => (z, -x) }
+}
+
 /// How far above the focus anchor to begin scanning for the ground.
 /// Enough to clear the player's own head and a step up, small enough
 /// that a cave roof a few blocks above is not mistaken for terrain.
@@ -386,6 +465,16 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
     let mut name = String::from("build");
     // Peekable, because `views` is the one construct that spans lines:
     // it consumes its own drawings up to `end`.
+    // SUBSTRUCTURES BY ID. `def NAME` ... `end` captures a block of
+    // lines; `use NAME @x,z [rot=90|180|270] [mirror]` re-emits them
+    // with every @-relative coordinate offset and rotated. A village is
+    // six houses: with this the model writes one house and six `use`
+    // lines -- a sixth of the output tokens, which on a 1B is the
+    // expensive part, and six IDENTICAL houses rather than six
+    // approximations. Expanded here, before the line loop, so every
+    // other op sees plain lines and needs to know nothing about it.
+    let src_owned = expand_defs(src);
+    let src: &str = &src_owned;
     let mut lines_iter = src.lines().enumerate().peekable();
     while let Some((lineno, raw)) = lines_iter.next() {
         let line = raw.split('#').next().unwrap_or("").trim();
@@ -1980,5 +2069,46 @@ scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
         assert_eq!(run.blocks_changed, 1);
         assert!(run.plants[0].growth < 0.1);
         assert!(run.plants[0].genome[crate::flora::FRUITFULNESS] > 0.8, "fruit: {:?}", run.plants[0].genome);
+    }
+
+    #[test]
+    fn a_def_used_six_times_is_six_identical_houses() {
+        let ir = "def hut\n\
+                  enclose @-3,-3 @3,3 h=4 block=oak_planks\n\
+                  roof @-3,-3 @3,3 gable\n\
+                  sphere @3,0 r=1 block=air\n\
+                  end\n\
+                  use hut @0,0\n\
+                  use hut @20,0 rot=90\n\
+                  use hut @40,0 rot=180\n\
+                  use hut @0,20 rot=270\n\
+                  use hut @20,20 mirror\n\
+                  use hut @40,20\n";
+        let (plan, issues) = parse_plan_at(ir, Some((0, 65, 0)));
+        assert!(issues.iter().all(|i| i.severity != Severity::Error), "{issues:?}");
+        assert_eq!(plan.ops.len(), 18, "3 ops x 6 uses");
+        // the door rotates with the hut: at rot=90 the @3,0 door is at @0,3
+        let doors: Vec<(i32, i32)> = plan.ops.iter().filter_map(|o| match o {
+            Op::Sphere { at, .. } => Some(*at), _ => None }).collect();
+        assert!(doors.contains(&(3, 0)), "unrotated door: {doors:?}");
+        assert!(doors.contains(&(20, 3)), "rot=90 door faces +z: {doors:?}");
+        assert!(doors.contains(&(37, 0)), "rot=180 door faces -x: {doors:?}");
+        assert!(doors.contains(&(17, 20)), "mirrored door faces -x: {doors:?}");
+    }
+
+    #[test]
+    fn an_unknown_use_is_a_normal_unknown_op_with_its_line() {
+        let (_, issues) = parse_plan_at("use nothing @0,0\n", Some((0, 65, 0)));
+        let e = issues.iter().find(|i| i.severity == Severity::Error).expect("an error");
+        assert!(e.message.starts_with("line 1:"), "{}", e.message);
+    }
+
+    #[test]
+    fn line_numbers_survive_a_def_block() {
+        // Salvage keys on line numbers; a def must not shift them.
+        let ir = "def a\ncylinder @0,0 r=2\nend\nuse a @0,0\nfrobnicate\n";
+        let (_, issues) = parse_plan_at(ir, Some((0, 65, 0)));
+        let e = issues.iter().find(|i| i.severity == Severity::Error).unwrap();
+        assert!(e.message.starts_with("line 5:"), "the bad line is line 5: {}", e.message);
     }
 }

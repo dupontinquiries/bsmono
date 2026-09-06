@@ -121,6 +121,10 @@ pub struct ChatSession {
     last_inverse: Vec<(i32, i32, i32, u16)>,
     /// The referent for follow-up turns.
     pub last_build: Option<LastBuild>,
+    /// The last context built, keyed by focus feature id and climate.
+    /// A RefCell because `context` is `&self` and callers hold it that
+    /// way; the cache is an implementation detail, not state.
+    pub context_cache: std::cell::RefCell<Option<(String, String)>>,
     /// Living plants placed by commits, awaiting the engine.
     pub planted: Vec<crate::flora::PlantRequest>,
     /// Seed for the refinement ladder, so re-running a rung reproduces
@@ -205,6 +209,30 @@ impl ChatSession {
     /// region digest so the model has actually "read the file".
     pub fn context<W: VoxelWorld>(&self, tools: &VoxelTools<W>, gaze: &Gaze,
                                   surface_name: Option<&str>) -> String {
+        let f = self.focus(gaze);
+        // The terrain read, the ambient reading and the region digest
+        // are a few thousand surface probes -- on the frame thread, in
+        // `prompt_for`. Cached by focus, climate, surface and referent.
+        //
+        // The feature id encodes gaze and tier, NOT what is under them:
+        // it was the same before and after a build, and the first
+        // version of this cache served the pre-build terrain to the
+        // next turn. So the cache is also INVALIDATED explicitly by
+        // commit, undo and the host whenever the world changes.
+        let lb = self.last_build.as_ref().map(|b| format!("{}{:?}{:?}", b.name, b.min, b.max))
+            .unwrap_or_default();
+        let key = format!("{}|{:.2}|{:.2}|{}|{}", f.feature_id, self.climate.0, self.climate.1,
+                          surface_name.unwrap_or(""), lb);
+        if let Some((k, text)) = &*self.context_cache.borrow() {
+            if *k == key { return text.clone(); }
+        }
+        let text = self.context_uncached(tools, gaze, surface_name);
+        *self.context_cache.borrow_mut() = Some((key, text.clone()));
+        text
+    }
+
+    fn context_uncached<W: VoxelWorld>(&self, tools: &VoxelTools<W>, gaze: &Gaze,
+                                       surface_name: Option<&str>) -> String {
         let f = self.focus(gaze);
         let (mn, mx) = f.region.bounds();
         let digest = tools.read_region(mn, mx);
@@ -393,6 +421,13 @@ impl ChatSession {
                                              player_feet: Option<(i32, i32, i32)>,
                                              prose: &str) -> Reply {
         let f = self.focus(gaze);
+        // Expand def/use FIRST, and salvage against the expanded text:
+        // a `use` that becomes three lines shifts every later line
+        // number, and salvage keys on them. Working on the expanded
+        // source keeps numbers honest, and the repair prompt shows the
+        // model concrete lines rather than a macro it has to unfold.
+        let expanded = crate::plan::expand_defs(ir);
+        let ir: &str = &expanded;
         let (first_plan, first_issues) = parse_plan_at(ir, Some(f.anchor));
         // SALVAGE. One bad line used to reject the whole plan; a 1B that
         // gets eight lines right and one wrong got nothing built. Now
@@ -473,6 +508,11 @@ impl ChatSession {
         Reply::Preview { echo, blocks: dry.blocks_changed, feature_id: f.feature_id }
     }
 
+    /// Forget the cached context. Call whenever the world under the
+    /// focus may have changed: commit and undo do it themselves; a host
+    /// applying cells from the hive or deferred queue should too.
+    pub fn invalidate_context(&self) { *self.context_cache.borrow_mut() = None; }
+
     /// Plants committed since the last call, for the engine to register.
     /// None when there are none, so a host can skip the message.
     pub fn take_plants(&mut self) -> Option<Vec<crate::flora::PlantRequest>> {
@@ -536,6 +576,7 @@ impl ChatSession {
         }
         let first = tools.edits.len();
         let run = run_plan(tools, &p.plan, self.from_y, self.chunk_size, false);
+        self.invalidate_context();
         // Plants this commit planted, for the engine to register. Kept
         // on the session until the host takes them, because the tools
         // here are a staging world and know nothing about a lifecycle.
@@ -592,6 +633,7 @@ impl ChatSession {
 
     /// `/undo` -- reverse the last committed plan as a unit.
     pub fn undo<W: VoxelWorld>(&mut self, tools: &mut VoxelTools<W>) -> Reply {
+        self.invalidate_context();
         if self.last_inverse.is_empty() {
             return Reply::Say("nothing to undo".into());
         }
@@ -1069,5 +1111,48 @@ mod tests {
         let p = s.take_plants().expect("the commit's plants");
         assert_eq!(p.len(), 2);
         assert!(s.take_plants().is_none(), "taken once");
+    }
+
+    #[test]
+    fn a_bad_line_after_a_multi_line_use_is_still_salvaged_correctly() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        let ir = "def hut\nenclose @-3,-3 @3,3 h=4\nroof @-3,-3 @3,3\nend\nuse hut @0,0\nfrobnicate\n";
+        match s.receive_plan(&mut t, &g, ir) {
+            Reply::Preview { echo, blocks, .. } => {
+                assert!(blocks > 0, "the hut builds");
+                assert!(echo.contains("SKIPPED 1") && echo.contains("frobnicate"), "{echo}");
+                assert!(!echo.contains("`roof") && !echo.contains("`enclose"),
+                        "the right line was dropped, not a hut line: {echo}");
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn the_context_is_cached_by_focus_and_invalidated_by_a_change() {
+        let mut w = Flat::new();
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        let a = { let t = VoxelTools::new(&mut w); s.context(&t, &g, Some("grass")) };
+        let b = { let t = VoxelTools::new(&mut w); s.context(&t, &g, Some("grass")) };
+        assert_eq!(a, b);
+        assert!(s.context_cache.borrow().is_some(), "served from the cache the second time");
+        // the world changes under the focus. The feature id does NOT
+        // change (it is gaze and tier, not contents), so the host must
+        // invalidate -- and after it does, the new terrain is read.
+        for x in -3..=3 { for z in -3..=3 { w.set(x, 66, z, 1); } }
+        let stale = { let t = VoxelTools::new(&mut w); s.context(&t, &g, Some("grass")) };
+        assert_eq!(stale, a, "without invalidation the cache is served (and would be stale)");
+        s.invalidate_context();
+        let c = { let t = VoxelTools::new(&mut w); s.context(&t, &g, Some("grass")) };
+        assert_ne!(a, c, "after invalidation the build under the focus is read");
+        // and the climate changing invalidates it too
+        s.climate = (0.1, 0.9);
+        let d = { let t = VoxelTools::new(&mut w); s.context(&t, &g, Some("grass")) };
+        assert_ne!(c, d);
+        assert!(d.contains("freezing"));
     }
 }

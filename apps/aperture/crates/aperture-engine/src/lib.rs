@@ -65,6 +65,16 @@ pub trait Backend: Send + Sync {
     /// Generate at most `max_tokens` continuing `prompt`.
     fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, String>;
 
+    /// Generate with a STABLE PREFIX the backend may keep prefilled
+    /// across calls. A chat sends the same system prompt every turn;
+    /// a backend that can hold its KV pays that prefill once. The
+    /// default concatenates and calls `generate`, so a backend that
+    /// cannot is unaffected and never wrong -- only slower.
+    fn generate_prefixed(&self, prefix: &str, suffix: &str, max_tokens: usize)
+        -> Result<String, String> {
+        self.generate(&format!("{prefix}{suffix}"), max_tokens)
+    }
+
     /// Generate, delivering text AS IT ARRIVES.
     ///
     /// `on_piece` returns false to stop — a cancelled completion, a
@@ -375,6 +385,14 @@ mod gpu {
     use gpu_kernels::{gguf, Gpu};
     use std::sync::Arc;
 
+    /// A prefilled prefix the GPU backend keeps between turns.
+    struct PrefixKv {
+        hash: u64,
+        len: usize,
+        cap: usize,
+        cache: gpu_kernels::KvCache,
+    }
+
     pub struct GpuBackend {
         gpu: Arc<Gpu>,
         model: Arc<gpu_kernels::Model>,
@@ -382,6 +400,9 @@ mod gpu {
         eos: Option<u32>,
         adapter: String,
         sampler: gpu_kernels::SamplerParams,
+        /// The last prefix prefilled, kept so the next turn with the
+        /// same one pays only for its suffix.
+        prefix: std::sync::Mutex<Option<PrefixKv>>,
     }
 
     impl GpuBackend {
@@ -448,13 +469,47 @@ mod gpu {
                 repeat_last_n: cfg.repeat_last_n,
                 min_p: 0.0,
             };
-            Ok(GpuBackend { gpu, model, tok, eos, adapter, sampler })
+            Ok(GpuBackend { gpu, model, tok, eos, adapter, sampler, prefix: std::sync::Mutex::new(None) })
         }
     }
 
     impl Backend for GpuBackend {
         fn describe(&self) -> String {
             format!("in-process wgpu ({})", self.adapter)
+        }
+
+        fn generate_prefixed(&self, prefix: &str, suffix: &str, max_tokens: usize)
+            -> Result<String, String> {
+            let phash = {
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                for b in prefix.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100_0000_01b3); }
+                h
+            };
+            let suffix_ids = self.tok.encode(suffix);
+            let mut slot = self.prefix.lock().map_err(|_| "prefix cache poisoned".to_string())?;
+            // Re-prefill the prefix only when it CHANGED or the cache is
+            // too small for this turn. Otherwise the 3k-token system
+            // prompt costs nothing after the first turn.
+            let need = suffix_ids.len() + max_tokens;
+            let fresh = match &*slot {
+                Some(p) if p.hash == phash && p.len + need <= p.cap => false,
+                _ => true,
+            };
+            if fresh {
+                let prefix_ids = self.tok.encode(prefix);
+                let cap = prefix_ids.len() + need.max(512) + 1024;
+                let cache = self.gpu.new_cache_for(&self.model, cap);
+                let _ = self.gpu.prefill_batched(&self.model, &cache, &prefix_ids);
+                *slot = Some(PrefixKv { hash: phash, len: prefix_ids.len(), cap, cache });
+            }
+            let p = slot.as_ref().expect("just filled");
+            let mut rng = 0xC0FFEE_u64;
+            let mut out: Vec<u32> = Vec::new();
+            self.gpu.generate_kv_stream_from(
+                &self.model, &p.cache, p.len, &suffix_ids, max_tokens, self.eos,
+                &self.sampler, &mut rng, &|| false,
+                |t| { out.push(t); true });
+            Ok(self.tok.decode(&out))
         }
 
         fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, String> {

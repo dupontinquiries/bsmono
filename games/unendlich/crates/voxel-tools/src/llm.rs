@@ -288,7 +288,11 @@ pub fn build_http(cfg: &HttpConfig, system: &str, user: &str) -> String {
         Dialect::Ollama => (
             "/api/generate",
             format!(
-                "{{\"model\":\"{}\",\"stream\":false,\"system\":\"{}\",\"prompt\":\"{}\",\
+                // keep_alive holds the model resident between turns, and
+                // ollama reuses the prompt context when the prefix matches;
+                // both are what make the second turn faster than the first.
+                "{{\"model\":\"{}\",\"stream\":false,\"keep_alive\":\"30m\",\
+                  \"system\":\"{}\",\"prompt\":\"{}\",\
                   \"options\":{{\"temperature\":{},\"num_predict\":{}}}}}",
                 json_escape(&cfg.model), json_escape(system), json_escape(user),
                 cfg.temperature, cfg.max_tokens),
@@ -296,7 +300,10 @@ pub fn build_http(cfg: &HttpConfig, system: &str, user: &str) -> String {
         Dialect::OpenAi => (
             "/v1/chat/completions",
             format!(
-                "{{\"model\":\"{}\",\"stream\":false,\"temperature\":{},\
+                // cache_prompt is llama.cpp's server flag for reusing the
+                // KV of a matching prefix; other OpenAI-compatible servers
+                // ignore an unknown field.
+                "{{\"model\":\"{}\",\"stream\":false,\"cache_prompt\":true,\"temperature\":{},\
                   \"max_tokens\":{},\"messages\":[\
                   {{\"role\":\"system\",\"content\":\"{}\"}},\
                   {{\"role\":\"user\",\"content\":\"{}\"}}]}}",
@@ -726,5 +733,13 @@ mod tests {
                    path A B [w=N] [block=B]\n\
                    tree @5,5 oak\n";
         assert_eq!(clean_reply(raw), "cylinder @0,0 r=3 h=9 block=stone\ntree @5,5 oak\n");
+    }
+
+    #[test]
+    fn http_bodies_ask_for_prefix_reuse() {
+        let o = build_http(&HttpConfig { dialect: Dialect::Ollama, ..HttpConfig::default() }, "SYS", "USER");
+        assert!(o.contains("\"keep_alive\":\"30m\""), "{o}");
+        let l = build_http(&HttpConfig { dialect: Dialect::OpenAi, ..HttpConfig::default() }, "SYS", "USER");
+        assert!(l.contains("\"cache_prompt\":true"), "{l}");
     }
 }

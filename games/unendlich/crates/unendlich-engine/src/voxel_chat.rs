@@ -299,7 +299,12 @@ pub struct EngineCompleter {
 impl voxel_tools::llm::Completer for EngineCompleter {
     fn name(&self) -> &str { "wgpu engine (in-instance)" }
     fn complete(&mut self, system: &str, user: &str) -> Result<String, String> {
-        self.inner.generate(&format!("{system}\n\n{user}"), self.max_tokens)
+        // The system prompt is the PREFIX and is byte-identical every
+        // turn by construction (prompt.rs keeps it stable and cache-
+        // friendly). The backend keeps its KV; each turn prefills only
+        // the user suffix. On a 1B on a mobile GPU that is the seconds
+        // before the first token, paid once instead of every time.
+        self.inner.generate_prefixed(&format!("{system}\n\n"), user, self.max_tokens)
     }
 }
 
@@ -1151,6 +1156,7 @@ impl Paintbrush {
             t0.elapsed()
         });
         if !deferred.is_empty() { self.session.deferred.cells.extend(deferred); }
+        if t.cells > 0 { self.session.invalidate_context(); }
         t
     }
 
@@ -1184,6 +1190,7 @@ impl Paintbrush {
         let (applied, skipped) = cm.set_blocks(&edits);
         log::info!("[paintbrush] deferred retry: applied={applied} skipped={skipped}");
         if applied > 0 {
+            self.session.invalidate_context();
             self.say(format!("{applied} deferred block(s) placed now that their chunk loaded"));
         }
     }

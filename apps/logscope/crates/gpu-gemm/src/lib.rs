@@ -17534,6 +17534,43 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         produced
     }
 
+    /// `generate_kv_stream` with a PREFILLED PREFIX reused.
+    ///
+    /// A chat that sends the same 3k-token system prompt every turn pays
+    /// its prefill every turn -- on a 1B on a mobile GPU that is seconds
+    /// before the first output token, and it is the same seconds each
+    /// time. The cache writes at explicit positions and attention at
+    /// `pos` reads only rows before it, so a prefix prefilled once at
+    /// `0..prefix_len` stays valid however many suffixes are written
+    /// after it: each turn prefills only the suffix from `prefix_len`,
+    /// overwriting last turn's tail, and decodes from there.
+    ///
+    /// The caller owns the cache and the invariant that its first
+    /// `prefix_len` rows hold the prefix it thinks they do. Returns the
+    /// count produced, like `generate_kv_stream`.
+    pub fn generate_kv_stream_from(
+        &self, m: &Model, c: &KvCache, prefix_len: usize, suffix: &[u32], n_new: usize,
+        eos: Option<u32>, sampler: &SamplerParams, rng: &mut u64, cancel: &dyn Fn() -> bool,
+        mut on_token: impl FnMut(u32) -> bool,
+    ) -> usize {
+        if cancel() || suffix.is_empty() { return 0; }
+        let mut pos = prefix_len + suffix.len();
+        let mut logits = self.prefill_chunked_from(m, c, suffix, prefix_len, 256);
+        let mut seen: Vec<u32> = suffix.to_vec();
+        let mut produced = 0usize;
+        for _ in 0..n_new {
+            if logits.is_empty() || cancel() { break; }
+            let next = pick(&logits, sampler, &seen, rng);
+            if Some(next) == eos { break; }
+            produced += 1;
+            seen.push(next);
+            if !on_token(next) { break; }
+            logits = self.decode_step(m, c, next, pos);
+            pos += 1;
+        }
+        produced
+    }
+
     // ── multi-session (concurrency) primitives ───────────────────────────────
     /// Allocate a session against a resident model. Only the KV cache is per-session;
     /// the weights stay shared.

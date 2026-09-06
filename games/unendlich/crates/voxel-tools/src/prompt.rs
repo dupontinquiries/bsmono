@@ -157,6 +157,10 @@ OPS
   bridge A B [w=N] [block=B]                     span at constant height WITH PIERS (path digs in)
   stairs A B [w=N] [block=B]                     rise one block per step from A to B
   mirror A B [x|z] [about=N]                     reflect a region: pillars either side of something
+  def NAME ... end / use NAME @x,z [rot=90|180|270] [mirror]
+                                                 define a substructure ONCE, place it many
+                                                 times; six identical huts from one def.
+                                                 rot is quarter turns only
   form NAME A B [style] [k=v]                    a named form from the dictionary
                                                  (village = several houses, not one)
   brush OP A [by=N|to=Y] [r=N] [hill|mesa|cone|flat]   LANDSCAPE: raise, lower, smooth,
@@ -259,6 +263,22 @@ tree @14,10 oak h=8
 mood eerie @-18,-18 @18,18
 populate horrifying creatures @-18,-18 @18,18 count=6
 
+EXAMPLE (a REPEATED substructure: define once, use six times)
+  player: a ring of six identical huts around the well
+  plan:
+# hut ring
+def hut
+enclose @-3,-3 @3,3 h=4 block=oak_planks
+roof @-3,-3 @3,3 gable block=dark_oak_planks
+sphere @3,0 r=1 block=air
+end
+use hut @14,0 rot=180
+use hut @0,14 rot=270
+use hut @-14,0
+use hut @0,-14 rot=90
+use hut @10,10 rot=180
+use hut @-10,-10
+
 EXAMPLE (LANDSCAPE, hundreds of thousands of blocks from a few lines)
   player: a valley with a forested range on one side and a river down it
   plan:
@@ -349,7 +369,7 @@ mod tests {
             assert!(!plan.ops.is_empty(), "example produced no ops:\n{src}");
             n += 1;
         }
-        assert_eq!(n, 7, "expected seven worked examples");
+        assert_eq!(n, 8, "expected eight worked examples");
     }
 
     #[test]
