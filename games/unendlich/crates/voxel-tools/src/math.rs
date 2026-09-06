@@ -239,6 +239,20 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                                             None => format!("evolve '{phrase}' for {gens} generations, {levels} level(s)") }),
                      None);
             }
+            Op::Feature { name, at, radius, seed } => {
+                match crate::feature_place::lookup(name) {
+                    Some(f) => {
+                        let parts = (f.plan)(&crate::feature_place::FeatureArgs {
+                            at: *at, radius: *radius, seed: *seed as u64, ground: 64 });
+                        let est: i64 = parts.iter().map(|p| p.estimate).sum();
+                        total += est;
+                        push(Note::Info, format!("feature '{name}' at {at:?} r={radius}: {} part(s) -- {} -- roughly {est} blocks",
+                                                 parts.len(),
+                                                 parts.iter().map(|p| p.what.as_str()).collect::<Vec<_>>().join(", ")), None);
+                    }
+                    None => push(Note::Error, format!("unknown feature '{name}'"), None),
+                }
+            }
             Op::Carve { kind, a, b, nums, .. } => {
                 let num = |k: &str, d: i32| nums.iter().find(|(n, _)| n == k).map(|(_, v)| *v).unwrap_or(d);
                 let est = match kind.as_str() {

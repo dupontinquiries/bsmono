@@ -225,9 +225,10 @@ OPERATIONS
   layer PACKET A B density=0.6          a forest: temperate, alpine, boreal,
                                         jungle, desert, darkwood, meadow
   river A dir=DEG len=N                 the terrain decides the path
+  feature badlands|gorge|caldera|cliffs|highlands|sinkhole A [r=N]
+                                        a whole PLACE: carves and layers that belong together
   canyon A B / cave A / mesa A / waterfall A / overhang A
-                                        CARVED terrain -- rock removed, so it has a roof.
-                                        w= depth= len= r= branches= dir= floor= wall=
+                                        CARVED terrain, w= depth= len= r= dir= floor= wall=
   form NAME A B [style=NAME] [seed=N]   a named form (list below); style sets
                                         materials, roof and proportions together;
                                         seed varies the details. statue takes
@@ -270,23 +271,6 @@ layer darkwood @-30,-30 @30,30 density=0.6
 mood eerie @-30,-30 @30,30
 populate horrifying creatures @-30,-30 @30,30 count=6
 
-EXAMPLE
-  player: a ring of six huts around a well
-  plan:
-# hut ring
-def hut
-enclose @-3,-3 @3,3 h=4 block=oak_planks
-roof @-3,-3 @3,3 gable
-sphere @3,0 r=1 block=air
-end
-use hut @12,0 rot=180
-use hut @0,12 rot=270
-use hut @-12,0
-use hut @0,-12 rot=90
-use hut @9,9 rot=180
-use hut @-9,-9
-cylinder @0,0 r=2 h=2 block=cobblestone hollow
-
 Now reply with plan lines only.";
 
 pub fn system_prompt_for(ctx: usize, max_reply: usize) -> String {
@@ -309,9 +293,9 @@ pub fn system_prompt() -> String {
     // The world-change rule, the mood list and the form list are all
     // GENERATED from their tables, so the prompt cannot drift from what
     // the parser actually accepts.
-    format!("{GRAMMAR}\n\nFORMS (use `form NAME A B`):\n{}\n{}\n\n{}\n\n{DISCIPLINE}\n\n{}\n\n{EXAMPLES}",
-            crate::dict::vocabulary(), crate::style::vocabulary(), crate::mood::vocabulary(),
-            crate::intent::WORLD_DISCIPLINE)
+    format!("{GRAMMAR}\n\nFORMS (use `form NAME A B`):\n{}\n{}\n\nPLACES (use `feature NAME A r=N`):\n{}\n\n{}\n\n{DISCIPLINE}\n\n{}\n\n{EXAMPLES}",
+            crate::dict::vocabulary(), crate::style::vocabulary(), crate::feature_place::vocabulary(),
+            crate::mood::vocabulary(), crate::intent::WORLD_DISCIPLINE)
 }
 
 pub const GRAMMAR: &str = "\
@@ -348,6 +332,10 @@ OPS
   plant A SPECIES [words...] [seedling]          a LIVING tree bred toward the words -- tall,
                                                  ancient, bushy, sparse, hardy, fruit, wide,
                                                  narrow -- placed grown and kept growing
+  feature NAME A [r=N] [seed=N]                  a PLACE, not an op: several carves and layers
+                                                 that belong together, run in order so each cuts
+                                                 into the last. One word, a hundred thousand
+                                                 cells. Names below.
   canyon A B [w=N] [depth=N] [floor=B] [wall=B]  a carved channel: it wanders, its walls step
                                                  back, its floor falls with the land
   cave A [dir=DEG] [len=N] [r=N] [branches=N]    branching tunnels with chambers. It stays UNDER

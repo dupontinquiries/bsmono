@@ -263,6 +263,10 @@ pub enum Op {
     /// a phrase, then apply the winner. Or run a stated genome.
     Greeble { min: (i32, i32, i32), max: (i32, i32, i32), phrase: String,
               gens: u32, seed: i32, genome: Option<String>, levels: u32 },
+    /// A composite terrain feature: a PLACE made of several carves and
+    /// layers, run part by part so the first appears while the last is
+    /// still being computed.
+    Feature { name: String, at: (i32, i32), radius: i32, seed: i32 },
     /// Carved terrain: canyon, cave, mesa, waterfall, overhang. Removes
     /// rock rather than raising a heightfield, so it can make a roof.
     Carve { kind: String, a: (i32, i32), b: (i32, i32), nums: Vec<(String, i32)>,
@@ -732,6 +736,16 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     genome: t.iter().find_map(|s| s.strip_prefix("genome=")).map(|s| s.to_string()),
                     levels: kvi(&t, "levels", 2).clamp(1, 4) as u32,
                 });
+            }
+            "feature" | "place" if t.get(1).map(|n| crate::feature_place::lookup(n).is_some()).unwrap_or(false) => {
+                let name = t[1].to_lowercase();
+                let at = rel(&t, 2, anchor).unwrap_or_else(|| anchor_xz(anchor));
+                ops.push(Op::Feature { name, at, radius: kvi(&t, "r", 140).clamp(20, 500),
+                                       seed: kvi(&t, "seed", 1) });
+            }
+            "feature" => {
+                bad(format!("unknown feature '{}'; known: {}", t.get(1).unwrap_or(&""),
+                            crate::feature_place::FEATURES.iter().map(|f| f.name).collect::<Vec<_>>().join(", ")));
             }
             "canyon" | "cave" | "mesa" | "waterfall" | "overhang" | "gorge" => {
                 let v = t[0].to_lowercase();
@@ -1409,6 +1423,41 @@ pub fn run_plan_with<W: VoxelWorld>(
                 r
             })(),
             Op::Spec(_) => CallResult { ok: true, summary: "spec noted".into(), ..Default::default() },
+            Op::Feature { name, at, radius, seed } => (|| {
+                let Some(f) = crate::feature_place::lookup(name) else {
+                    return CallResult { ok: false, summary: format!("unknown feature '{name}'"), ..Default::default() };
+                };
+                let ground = tools.find_surface(at.0, at.1, from_y).unwrap_or(from_y);
+                let parts = (f.plan)(&crate::feature_place::FeatureArgs {
+                    at: *at, radius: *radius, seed: *seed as u64, ground });
+                // PART BY PART. A feature is hundreds of thousands of
+                // cells and seconds of work; running it as one list
+                // would hold the drone for all of it and then hand the
+                // hive everything at once. Each part is run and reported
+                // as it finishes, so the first canyon exists while the
+                // third is still being cut.
+                let (mut blocks, mut done, mut failed) = (0usize, Vec::new(), Vec::new());
+                for part in &parts {
+                    let (sub, subissues) = parse_plan_at(&part.ir, plan.anchor);
+                    if subissues.iter().any(|i| i.severity == Severity::Error) || sub.ops.is_empty() {
+                        failed.push(part.what.clone());
+                        continue;
+                    }
+                    let r = run_plan(tools, &sub, from_y, chunk_size, dry_run);
+                    blocks += r.blocks_changed;
+                    // a part that placed nothing is worth saying: the
+                    // site may not suit it
+                    done.push(format!("{} ({})", part.what, r.blocks_changed));
+                }
+                CallResult {
+                    ok: !done.is_empty(), blocks_changed: blocks,
+                    summary: format!("feature '{name}' r={radius}: {} part(s), {blocks} blocks -- {}{}",
+                                     done.len(), done.join(", "),
+                                     if failed.is_empty() { String::new() }
+                                     else { format!("; FAILED: {}", failed.join(", ")) }),
+                    ..Default::default()
+                }
+            })(),
             Op::Carve { kind, a, b, nums, block, floor, water, seed } => (|| {
                 use crate::carve::{self, Carve as CarveOpts};
                 let num = |k: &str, d: i32| nums.iter().find(|(n, _)| n == k).map(|(_, v)| *v).unwrap_or(d);
@@ -1432,7 +1481,12 @@ pub fn run_plan_with<W: VoxelWorld>(
                                         ..Default::default() };
                 }
                 let roofed = carve::roofed(&r.changes, tools.world);
-                let mut res = tools.apply_changes(&r.changes);
+                // A carve is LANDSCAPE scale -- a mesa is 183,000 cells
+                // and a canyon can be more. The per-op ceiling refused
+                // them outright; they get the same ceiling the brushes
+                // do, and the same single edit so the whole feature
+                // undoes as one.
+                let mut res = tools.apply_changes_large(&r.changes);
                 if res.ok {
                     res.summary = format!("{kind}: {}{}", r.summary(),
                                           if roofed > 0 { format!(", {roofed} cell(s) under rock") } else { String::new() });

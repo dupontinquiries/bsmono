@@ -123,6 +123,8 @@ pub mod recipe;
 pub mod scatter;
 /// Carving the land: canyons, caves, mesas, waterfalls, overhangs -- terrain a heightfield cannot express.
 pub mod carve;
+/// Places, not operations: composite terrain features streamed part by part.
+pub mod feature_place;
 /// The review loop: elevations and measurements to the model, a ten-token verdict back.
 pub mod review;
 /// Context under a budget: the conversation chain, folding into summaries, grouped plans.
@@ -506,9 +508,15 @@ impl<'w, W: VoxelWorld> VoxelTools<'w, W> {
     fn apply_changes_capped(&mut self, changes: &[crate::weather::Change], cap: usize)
         -> CallResult {
         if changes.len() > cap {
+            // Name the cap that ACTUALLY applied. This said
+            // MAX_BLOCKS_PER_CALL whichever ceiling was in force, so a
+            // brush refused at two million reported a limit of two
+            // hundred thousand and the number the player was told to
+            // get under was the wrong one by a factor of ten.
             return CallResult::err(format!(
-                "refused: {} changes, over MAX_BLOCKS_PER_CALL={}",
-                changes.len(), MAX_BLOCKS_PER_CALL));
+                "refused: {} changes, over the {} limit of {cap}",
+                changes.len(),
+                if cap >= MAX_BLOCKS_PER_BRUSH { "landscape" } else { "per-op" }));
         }
         let mut e = self.begin("weather");
         for c in changes { self.write(&mut e, c.at.0, c.at.1, c.at.2, c.to); }
