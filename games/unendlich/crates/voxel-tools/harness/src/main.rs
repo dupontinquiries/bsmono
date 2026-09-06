@@ -291,6 +291,7 @@ fn macro_scenario() {
     // now the macro: no provider will be called
     pb.provider = paintbrush::ProviderChoice::Script(vec!["/bin/false".into()]);
     pb.start_turn(&cm, &gaze, None, "fortify my base", feet);
+    settle(&mut pb);
     let log = pb.drain_log();
     assert!(log.iter().any(|l| l.contains("expanded without the model")), "{log:?}");
     let planned = log.iter().find(|l| l.contains("blocks planned")).cloned().unwrap_or_default();
@@ -323,6 +324,7 @@ fn macro_scenario() {
     for rung in ["vary", "trim", "settle"] {
         let cmd = line(&mut pb, &format!("/refine {rung}")).unwrap();
         pb.dispatch(&cm, &gaze, cmd);
+        settle(&mut pb);
         let planned = pb.drain_log().iter().find(|l| l.contains("blocks planned")).cloned();
         let cmd = line(&mut pb, "/commit").unwrap();
         pb.dispatch(&cm, &gaze, cmd);

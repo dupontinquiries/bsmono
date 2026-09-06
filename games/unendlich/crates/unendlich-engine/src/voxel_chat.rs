@@ -260,6 +260,10 @@ pub struct PendingTurn {
     /// looking when they asked, not where they drifted to.
     pub gaze: Gaze,
     pub player_feet: Option<(i32, i32, i32)>,
+    /// What the player asked for, verbatim. The intent gate checks a
+    /// model's world ops against THIS; without it every world op is
+    /// refused, including one the player explicitly asked for.
+    pub prose: String,
 }
 
 impl PendingTurn {
@@ -658,10 +662,8 @@ impl Paintbrush {
                 // A refinement is a plan like any other: previewed,
                 // committed and undone on its own, which is the whole
                 // reason it is a ladder rather than one "finish" button.
-                let mut staged2 = StagedWorld::new(&view);
-                let mut tools2 = VoxelTools::new(&mut staged2);
-                let r = self.session.receive_plan_for(&mut tools2, gaze, &ir, None);
-                self.push(r);
+                // And simulated on a drone like any other.
+                self.launch_drone(cm, gaze, ir, None, "");
                 Pending::None
             }
             Command::Repair => {
@@ -739,6 +741,13 @@ impl Paintbrush {
     /// The model replied. `raw` is the completion text.
     pub fn finish_turn(&mut self, cm: &ChunkManager, gaze: &Gaze, raw: &str,
                        player_feet: Option<(i32, i32, i32)>) {
+        self.finish_turn_with(cm, gaze, raw, player_feet, "")
+    }
+
+    /// As `finish_turn`, with the player's prose so the world-op gate
+    /// can check the model's proposals against what was actually asked.
+    pub fn finish_turn_with(&mut self, cm: &ChunkManager, gaze: &Gaze, raw: &str,
+                            player_feet: Option<(i32, i32, i32)>, prose: &str) {
         let ir = voxel_tools::llm::clean_reply(raw);
         log::info!("[paintbrush] provider returned {} chars -> {} plan lines",
                    raw.len(), ir.lines().count());
@@ -746,26 +755,43 @@ impl Paintbrush {
             self.say(format!("the model replied ({} chars) but produced no plan lines", raw.len()));
             return;
         }
-        // Hand the dry run to a DRONE. A clone of the session carries
-        // everything the simulation reads (focus, climate, last build,
-        // budget); it comes back with the pending plan set, and the
-        // frame thread swaps that state in. The session is small; the
-        // clone is cheap. The world is read through an owned view of the
-        // chunk store, so nothing here borrows the frame.
+        self.launch_drone(cm, gaze, ir, player_feet, prose);
+    }
+
+    /// Hand a dry run to a DRONE. Every path that previews IR goes
+    /// through here -- a model reply, a macro, a refinement rung, a
+    /// repair -- so none of them simulates on the frame thread.
+    ///
+    /// A clone of the session carries everything the simulation reads
+    /// (focus, climate, last build, budget); it comes back with the
+    /// pending plan set, and the frame thread swaps that state in. The
+    /// session is small; the clone is cheap. The world is read through
+    /// an owned view of the chunk store, so nothing borrows the frame.
+    ///
+    /// Refuses while one is already flying: two dry runs racing to set
+    /// `pending` would leave whichever landed last as the plan, which
+    /// might not be the one the player asked for last.
+    pub fn launch_drone(&mut self, cm: &ChunkManager, gaze: &Gaze, ir: String,
+                        player_feet: Option<(i32, i32, i32)>, prose: &str) {
+        if self.drone.is_some() {
+            self.say("still simulating the previous plan -- a moment");
+            return;
+        }
         let session = self.session.clone();
         let drone_world = crate::voxel_bind::DroneWorld(cm.drone_view());
         let gaze = *gaze;
+        let prose = prose.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new().name("paintbrush-drone".into()).spawn(move || {
             let mut session = session;
             let mut staged = StagedWorld::new(&drone_world);
             let mut tools = VoxelTools::new(&mut staged);
-            let r = session.receive_plan_for(&mut tools, &gaze, &ir, player_feet);
+            let r = session.receive_plan_gated(&mut tools, &gaze, &ir, player_feet, &prose);
             debug_assert_eq!(staged.pending(), 0, "preview must not stage writes");
             let _ = tx.send((session, vec![r]));
         }).expect("spawn drone");
         self.drone = Some(Drone { rx, started: Instant::now() });
-        self.say("simulating the plan ... (the world keeps running)");
+        self.say("simulating ... (the world keeps running)");
     }
 
     /// Collect a finished drone: swap in the session state it produced
@@ -805,11 +831,7 @@ impl Paintbrush {
             if let Some(ir) = self.session.macro_ir(prose, gaze) {
                 log::info!("[paintbrush] macro expanded, no model call: {prose:?}");
                 self.say("(expanded without the model)");
-                let view = WorldView(cm);
-                let mut staged = StagedWorld::new(&view);
-                let mut tools = VoxelTools::new(&mut staged);
-                let r = self.session.receive_plan_for(&mut tools, gaze, &ir, player_feet);
-                self.push(r);
+                self.launch_drone(cm, gaze, ir, player_feet, prose);
                 return;
             }
         }
@@ -843,6 +865,7 @@ impl Paintbrush {
         });
         self.in_flight = Some(PendingTurn {
             rx, started: Instant::now(), provider: name, gaze: *gaze, player_feet,
+            prose: prose.to_string(),
         });
     }
 
@@ -856,11 +879,7 @@ impl Paintbrush {
             return;
         };
         log::info!("[paintbrush] repair merged: {} fixed line(s)", fixed.lines().count());
-        let view = WorldView(cm);
-        let mut staged = StagedWorld::new(&view);
-        let mut tools = VoxelTools::new(&mut staged);
-        let r = self.session.receive_plan_for(&mut tools, gaze, &merged, player_feet);
-        self.push(r);
+        self.launch_drone(cm, gaze, merged, player_feet, "");
     }
 
     /// Call every frame. Applies a reply once the worker has one.
@@ -872,7 +891,7 @@ impl Paintbrush {
             Ok(raw) => {
                 log::info!("[paintbrush] reply in {:.1}s, {} chars",
                            turn.elapsed().as_secs_f32(), raw.len());
-                self.finish_turn(cm, &turn.gaze, &raw, turn.player_feet);
+                self.finish_turn_with(cm, &turn.gaze, &raw, turn.player_feet, &turn.prose);
             }
             Err(e) => {
                 log::warn!("[paintbrush] provider failed: {e}");
