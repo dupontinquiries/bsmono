@@ -68,6 +68,8 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
     let colors = Colors {
         inner: uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(Default::default())),
     };
+    // The live backdrop, behind the glass panels: the finish snapclone has.
+    app.backdrop.paint(ctx, &colors.inner);
     let now = Instant::now();
     app.tick(now);
     app.tick_schedules(now);

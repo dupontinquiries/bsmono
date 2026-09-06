@@ -47,6 +47,8 @@ pub enum Tab {
 }
 
 pub struct App {
+    /// The live backdrop behind the glass panels — snapclone's finish, through the kit.
+    pub backdrop: uikit_egui::Backdrop,
     pub hub: Hub,
     pub backend: Box<dyn Backend>,
     pub tab: Tab,
@@ -194,6 +196,7 @@ impl App {
 
     pub fn with_backend(backend: Box<dyn Backend>, fallback_note: Option<String>) -> Self {
         let mut app = App {
+            backdrop: uikit_egui::Backdrop::for_app("switcheroo"),
             hub: Hub::new(),
             backend,
             tab: Tab::Devices,

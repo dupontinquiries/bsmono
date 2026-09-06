@@ -10,12 +10,15 @@ use uikit_egui::Adaptive;
 
 struct App {
     dash: Dashboard,
+    /// The live backdrop behind the glass panels — snapclone's finish, through the kit.
+    backdrop: uikit_egui::Backdrop,
 }
 
 impl eframe::App for App {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(snapclone_theme::PaletteId::Arena));
+        let colors = uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(snapclone_theme::PaletteId::Arena));
+        self.backdrop.paint(ctx, &colors);
         let mut prefs = settings_kit::Prefs::default();
         prefs.palette = "arena".to_string();
         self.dash.apply_settings(ctx, &prefs);
@@ -50,6 +53,6 @@ fn main() -> eframe::Result<()> {
             viewport: uikit_egui::desktop::viewport(APP_ID, "Bot Arena", [900.0, 700.0]),
             ..Default::default()
         },
-        Box::new(|_cc| Ok(Box::new(App { dash: Dashboard::new() }))),
+        Box::new(|_cc| Ok(Box::new(App { dash: Dashboard::new(), backdrop: uikit_egui::Backdrop::for_app("bot-arena") }))),
     )
 }

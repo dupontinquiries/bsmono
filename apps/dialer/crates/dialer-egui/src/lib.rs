@@ -96,6 +96,8 @@ fn now_unix() -> u64 {
 
 /// The whole app state. Public so a future tablet/desktop shell can embed it.
 pub struct Shell {
+    /// The live backdrop behind the glass panels — snapclone's finish, through the kit.
+    backdrop: uikit_egui::Backdrop,
     link: Link,
     /// The Matrix signalling link, when signed in. Its calls carry
     /// "matrix/"-prefixed ids; the shell routes commands on that prefix.
@@ -151,6 +153,7 @@ impl Shell {
         }
 
         Shell {
+            backdrop: uikit_egui::Backdrop::for_app("dialer"),
             link,
             matrix_link,
             matrix_status: None,
@@ -705,6 +708,9 @@ This executes on your device."),
             self.toasts.warning(format!("using simulated modem ({reason})"), now);
         }
         self.drain_events(epoch, now);
+        // The backdrop first, under every panel; the panels are the kit's
+        // glass tint, so the light shows through them as a glow.
+        self.backdrop.paint(ctx, &self.colors);
 
         let adaptive = Adaptive::detect(ctx);
         let foreground = self.session.foreground().cloned();
@@ -715,7 +721,7 @@ This executes on your device."),
         }
 
         egui::Panel::bottom("dialer-bottom")
-            .frame(egui::Frame::new().fill(self.colors.bg_base).inner_margin(6.0))
+            .frame(egui::Frame::new().fill(uikit_egui::glass::surface_fill(self.colors.bg_base)).inner_margin(6.0))
             .show(ctx, |ui| {
                 self.status_line(ui, now);
                 if foreground.is_none() {
@@ -725,7 +731,7 @@ This executes on your device."),
 
         let mut msg_actions: Vec<MsgAction> = Vec::new();
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(self.colors.bg_base).inner_margin(10.0))
+            .frame(egui::Frame::new().fill(uikit_egui::glass::surface_fill(self.colors.bg_base)).inner_margin(10.0))
             .show(ctx, |ui| {
                 match &foreground {
                     // A ringing/active call outranks the wizard: the phone

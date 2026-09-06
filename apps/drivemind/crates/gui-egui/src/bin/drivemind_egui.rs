@@ -7,6 +7,8 @@ use std::sync::mpsc;
 struct App {
     state: ShellState,
     colors: uikit_egui::PaletteColors,
+    /// The live backdrop behind the glass panel — snapclone's finish, through the kit.
+    backdrop: uikit_egui::Backdrop,
 }
 
 impl eframe::App for App {
@@ -18,8 +20,12 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Same CentralPanel form as dialer-egui (the deprecation warning on
         // .show is tree-wide on this pinned eframe and tolerated there too).
+        // The backdrop first, then a GLASS panel over it — the same surface
+        // tint the kit's themed panels use — so the light shows through as a
+        // glow rather than being painted over by an opaque fill.
+        self.backdrop.paint(ctx, &self.colors);
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(self.colors.bg_base).inner_margin(10.0))
+            .frame(egui::Frame::new().fill(uikit_egui::glass::surface_fill(self.colors.bg_base)).inner_margin(10.0))
             .show(ctx, |ui| {
                 drivemind_egui::draw(ui, &mut self.state, &self.colors);
             });
@@ -45,7 +51,7 @@ fn main() -> eframe::Result<()> {
             let (msg_tx, msg_rx) = mpsc::channel();
             let ctx = cc.egui_ctx.clone();
             std::thread::spawn(move || worker(task_rx, msg_tx, move || ctx.request_repaint()));
-            Ok(Box::new(App { state: ShellState::new(task_tx, msg_rx), colors }))
+            Ok(Box::new(App { state: ShellState::new(task_tx, msg_rx), colors, backdrop: uikit_egui::Backdrop::for_app("drivemind") }))
         }),
     )
 }

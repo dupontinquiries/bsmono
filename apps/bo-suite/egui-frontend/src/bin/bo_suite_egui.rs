@@ -11,6 +11,8 @@ use uikit_egui::Adaptive;
 
 struct App {
     controller: Controller,
+    /// The live backdrop behind the glass panels — snapclone's finish, through the kit.
+    backdrop: uikit_egui::Backdrop,
     /// The audio host. The controller returns REQUESTS; this performs them,
     /// which is what keeps the view constructible and testable with no
     /// process table — see `playback::Request`.
@@ -150,6 +152,7 @@ impl App {
         // the user creates one to see it work.
         controller.playlists_page.set(catalog.playlists());
         Self {
+            backdrop: uikit_egui::Backdrop::for_app("bo-suite"),
             controller,
             player: bo_suite_egui::playback::Player::new(),
             last_note: String::new(),
@@ -458,7 +461,8 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(snapclone_theme::PaletteId::Amber));
+        let colors = uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(snapclone_theme::PaletteId::Amber));
+        self.backdrop.paint(ctx, &colors);
         let mut prefs = settings_kit::Prefs::default();
         prefs.palette = "amber".to_string();
         self.controller.apply_settings(ctx, &prefs);
