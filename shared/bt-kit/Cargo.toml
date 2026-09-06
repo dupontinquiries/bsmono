@@ -1,0 +1,22 @@
+[package]
+name = "bt-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Chunked file-transfer framing for a classic-Bluetooth (RFCOMM) byte stream — the codec and resume logic only, no sockets, no bluer, no async, in `protocol` (mirrors nat-kit/dht-kit: pure and testable without hardware). The bluer-backed RFCOMM transport is a thin, feature-gated wrapper in `rfcomm_io`, deliberately kept small enough to audit by eye since it is the one part that cannot be exercised in CI without a real Bluetooth adapter."
+
+[lib]
+name = "bt_kit"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Pulls in bluer + tokio for the real RFCOMM transport. Off by default so
+# anything that only wants the framing/resume logic (tests, a simulator, a
+# future non-Bluetooth transport reusing the same protocol) doesn't drag in
+# a Bluetooth stack it will never call.
+rfcomm = ["dep:bluer", "dep:tokio"]
+
+[dependencies]
+sha2 = "0.10"
+bluer = { version = "0.16", features = ["bluetoothd", "rfcomm"], optional = true }
+tokio = { version = "1", features = ["rt", "io-util"], optional = true }
