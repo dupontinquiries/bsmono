@@ -127,11 +127,20 @@ fn hash2(x: i32, z: i32, seed: u64, salt: u64) -> f32 {
 /// trunks touching — the two things random placement always produces
 /// and no forest ever does.
 pub fn bake<W: VoxelWorld>(w: &W, layer: &Layer, from_y: i32) -> Bake {
-    let (x0, x1) = (layer.min.0.min(layer.max.0), layer.min.0.max(layer.max.0));
-    let (z0, z1) = (layer.min.1.min(layer.max.1), layer.min.1.max(layer.max.1));
+    let (x0, mut x1) = (layer.min.0.min(layer.max.0), layer.min.0.max(layer.max.0));
+    let (z0, mut z1) = (layer.min.1.min(layer.max.1), layer.min.1.max(layer.max.1));
+    // A layer is a region, not a continent. Four million columns of
+    // surface probes is a two-minute stall from one line; clamp the
+    // footprint to 400 a side and say so in the bake.
+    const MAX_SIDE: i32 = 400;
+    let mut clipped = false;
+    if x1 - x0 > MAX_SIDE { x1 = x0 + MAX_SIDE; clipped = true; }
+    if z1 - z0 > MAX_SIDE { z1 = z0 + MAX_SIDE; clipped = true; }
+    let _ = &clipped;
     let p = layer.packet;
     let d = layer.density.clamp(0.0, 1.0);
-    let mut out = Bake { ir: format!("# layer {} ({}, density {:.2})\n", layer.name, p.name, d),
+    let mut out = Bake { ir: format!("# layer {} ({}, density {:.2}){}\n", layer.name, p.name, d,
+                                      if clipped { " -- clipped to 400 a side" } else { "" }),
                          ..Default::default() };
 
     let surface = |x: i32, z: i32| -> Option<i32> {

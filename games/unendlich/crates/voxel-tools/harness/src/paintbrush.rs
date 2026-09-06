@@ -446,6 +446,9 @@ pub struct Paintbrush {
     /// Set by anything that changes land, library or repo; the bin
     /// saves when it sees it.
     pub state_dirty: bool,
+    /// The hive job of the last commit, so an undo can cancel what the
+    /// queen has not yet placed.
+    last_job: Option<u32>,
     /// Who is building, for claims and commits. The bin sets it from
     /// the profile; "player" until then.
     pub player: String,
@@ -520,6 +523,7 @@ impl Paintbrush {
             library: voxel_tools::template::Library::new(),
             repo: voxel_tools::vcs::Repo::new(chunk_size),
             state_dirty: false,
+            last_job: None,
             player: "player".into(),
             pending_plants: Vec::new(),
             comb: voxel_tools::hive::Comb::new(chunk_size),
@@ -638,12 +642,35 @@ impl Paintbrush {
             Command::ShowPlan => { let r = self.session.show_plan(); self.push(r); Pending::None }
             Command::CommitPlan => { self.commit(cm, gaze); Pending::None }
             Command::UndoBuild => {
+                // THE RACE. A large commit is applied by the queen over
+                // many frames. An undo in the middle restored the cells
+                // already placed -- and then the queen kept placing the
+                // rest, so the build came back half-built after being
+                // undone. Cancel the job first, and drop any deferred
+                // cells still waiting for a chunk, so nothing of the
+                // undone build arrives later.
+                if let Some(job) = self.last_job.take() {
+                    self.comb.cancel(job);
+                    log::info!("[hive] undo cancelled job {job}");
+                }
+                if let Some(lb) = self.session.last_build.as_ref() {
+                    let (lo, hi) = (lb.min, lb.max);
+                    let before = self.session.deferred.len();
+                    self.session.deferred.cells.retain(|c| {
+                        !(c.at.0 >= lo.0 && c.at.0 <= hi.0 && c.at.1 >= lo.1 && c.at.1 <= hi.1
+                          && c.at.2 >= lo.2 && c.at.2 <= hi.2)
+                    });
+                    let dropped = before - self.session.deferred.len();
+                    if dropped > 0 { log::info!("[hive] undo dropped {dropped} deferred cell(s)"); }
+                }
                 let view = WorldView(cm);
                 let mut staged = StagedWorld::new(&view);
                 let mut tools = VoxelTools::new(&mut staged);
                 let r = self.session.undo(&mut tools);
                 self.push(r);
-                self.flush_staged(cm, &mut staged);
+                // The undo's own writes go straight in, never to the comb:
+                // an undo that trickles in over frames is not an undo.
+                self.flush_immediate(cm, &mut staged);
                 Pending::None
             }
             Command::Focus(adj) => {
@@ -1282,7 +1309,9 @@ impl Paintbrush {
             let changes = staged.snapshot();
             if let Some(lb) = self.session.last_build.as_ref() {
                 let ir = self.session.last_ir.clone();
-                let anchor = (lb.min.0, lb.min.2);
+                // The GAZE anchor the @coordinates were resolved against,
+                // not the box corner: a rebase replays against it.
+                let anchor = (self.session.last_anchor.0, self.session.last_anchor.2);
                 self.repo.commit_changes_at(&self.player, &lb.name, &ir, anchor, &changes);
                 let cx = (lb.min.0 + lb.max.0) / 2;
                 let cz = (lb.min.2 + lb.max.2) / 2;
@@ -1304,6 +1333,21 @@ impl Paintbrush {
         }
     }
 
+    /// Apply staged writes now, all of them, never via the comb. For
+    /// undo: an undo that trickles in over frames is not an undo.
+    fn flush_immediate(&mut self, cm: &ChunkManager, staged: &mut StagedWorld<'_, WorldView<'_>>) {
+        if staged.pending() == 0 { return; }
+        let snapshot: Vec<voxel_tools::weather::Change> = staged.snapshot();
+        let (applied, skipped, _chunks) = flush(cm, staged, self.chunk_size);
+        log::info!("[paintbrush] immediate flush: applied={applied} skipped={skipped}");
+        if skipped > 0 {
+            let missing: Vec<_> = snapshot.into_iter()
+                .filter(|c| !cm.is_loaded_at(c.at.0, c.at.1, c.at.2)).collect();
+            self.session.deferred.cells.extend(missing);
+        }
+        self.session.invalidate_context();
+    }
+
     fn flush_staged(&mut self, cm: &ChunkManager, staged: &mut StagedWorld<'_, WorldView<'_>>) {
         if staged.pending() == 0 { return; }
         // Small edits go straight in: sharding forty blocks is overhead
@@ -1318,6 +1362,7 @@ impl Paintbrush {
             let name = self.session.last_build.as_ref().map(|b| b.name.clone())
                 .unwrap_or_else(|| "build".into());
             let job = self.next_job; self.next_job += 1;
+            self.last_job = Some(job);
             let cells = voxel_tools::hive::shard(changes, self.chunk_size, job);
             let n = cells.len();
             let obs = self.observer();

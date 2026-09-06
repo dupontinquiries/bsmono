@@ -30,6 +30,7 @@ fn main() {
     waypoint_scenario();
     persist_scenario();
     cancel_scenario();
+    undo_race_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -632,4 +633,38 @@ fn cancel_scenario() {
     println!("  steps at cancel: {at_cancel}, 150 ms later: {after}");
     assert!(after <= at_cancel + 2, "the generator kept running after /cancel: {at_cancel} -> {after}");
     assert!(after < 200, "it never finished the reply");
+}
+
+
+/// Undo while the queen is still placing: nothing of the build may
+/// arrive afterwards.
+fn undo_race_scenario() {
+    use paintbrush::Paintbrush;
+    use voxel_tools::chatbox::Key;
+    println!("\n==== undo during a hive fill");
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    let mut line = |pb: &mut Paintbrush, l: &str| -> Option<stubs::Command> {
+        pb.key(Key::Enter); for c in l.chars() { pb.key(Key::Char(c)); } pb.key(Key::Enter)
+    };
+    pb.launch_drone(&cm, &gaze, "brush raise @0,0 by=16 r=50 hill\n".into(), None, "");
+    settle(&mut pb);
+    let cmd = line(&mut pb, "/commit").unwrap(); pb.dispatch(&cm, &gaze, cmd);
+    assert!(!pb.comb.is_empty(), "a large commit is queued");
+    // a couple of frames of filling, then undo mid-way
+    for i in 0..3 { pb.tick_hive(&cm, [0.0, 70.0, -12.0], [0.0, -0.35, 1.0], 8.0, i as f64 * 0.008); }
+    let placed_before_undo = cm.block_count();
+    let left = pb.comb.len();
+    assert!(left > 0, "still filling: {left} cells left");
+    let cmd = line(&mut pb, "/undo").unwrap(); pb.dispatch(&cm, &gaze, cmd);
+    let after_undo = cm.block_count();
+    // keep ticking: the cancelled job must place nothing more
+    for i in 0..200 { pb.tick_hive(&cm, [0.0, 70.0, -12.0], [0.0, -0.35, 1.0], 8.0, 1.0 + i as f64 * 0.008); }
+    let after_ticks = cm.block_count();
+    println!("  placed before undo: {placed_before_undo}; after undo: {after_undo}; after 200 more frames: {after_ticks}; comb: {}", pb.comb.len());
+    assert!(pb.comb.is_empty(), "the job was cancelled");
+    assert_eq!(after_undo, after_ticks, "nothing of the undone build arrived later");
+    // and the raised ground is back down
+    assert_eq!(cm.block_at(0, 70, 0), stubs::BlockId::Air, "the hill is gone");
 }

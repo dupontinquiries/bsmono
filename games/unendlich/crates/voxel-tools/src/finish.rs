@@ -36,10 +36,12 @@ const WORDS: &[Word] = &[
            lines: &["mood eerie {FA} {FB}", "weather {A} {B} worn seed=3",
                     "greeble {A} {B} gothic symmetric gens=10"],
            because: "creepy: eerie mood, a little decay, gothic detail" },
-    Word { triggers: &["ancient", "old", "ruined", "forgotten", "crumbling", "weathered"],
+    // "old" is NOT here: "make the old tower taller" names a building,
+    // not a treatment, and weathering it would be exactly wrong.
+    Word { triggers: &["ancient", "ruined", "forgotten", "crumbling", "weathered", "aged", "decrepit"],
            lines: &["weather {A} {B} ancient seed=5"],
            because: "ancient: heavy weathering" },
-    Word { triggers: &["overgrown", "mossy", "reclaimed", "wild"],
+    Word { triggers: &["overgrown", "mossy", "reclaimed"],
            lines: &["weather {A} {B} abandoned seed=7", "scatter {FA} {FB} block=moss clusters=6 per=6 spread=3"],
            because: "overgrown: moss and vines" },
     Word { triggers: &["ornate", "detailed", "intricate", "carved", "decorated", "elaborate"],
@@ -165,6 +167,9 @@ mod tests {
     fn stems_match_but_substrings_do_not() {
         // "haunted" matches "haunt"; "gold" must not match "old"
         assert!(!from_prose("a gold tower", &[], BOX).0.contains("weather"));
+        assert!(from_prose("make the old tower taller", &[], BOX).0.is_empty(),
+                "'old' names the building, not a treatment");
+        assert!(from_prose("a wild west saloon", &[], BOX).0.is_empty());
         assert!(from_prose("a haunted tower", &[], BOX).0.contains("mood eerie"));
         assert!(from_prose("something bold and cold", &[], BOX).0.is_empty());
     }

@@ -881,8 +881,13 @@ fn norm(a: (i32, i32, i32), b: (i32, i32, i32)) -> ((i32, i32, i32), (i32, i32, 
 }
 
 fn volume(lo: (i32, i32, i32), hi: (i32, i32, i32)) -> usize {
-    let d = |a: i32, b: i32| (b - a + 1).max(0) as usize;
-    d(lo.0, hi.0) * d(lo.1, hi.1) * d(lo.2, hi.2)
+    // Saturating on purpose. `fill @0,0,0 @2147483647,2147483647,2147483647`
+    // made `b - a + 1` overflow and the product wrap to something that
+    // passed the size cap, and the fill ran until the process died. A
+    // saturated volume fails the cap the way it should.
+    let d = |a: i32, b: i32| (b as i64 - a as i64 + 1).max(0) as u128;
+    let v = d(lo.0, hi.0) * d(lo.1, hi.1) * d(lo.2, hi.2);
+    v.min(usize::MAX as u128) as usize
 }
 
 // ------------------------------------------------------------- schemas

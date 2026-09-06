@@ -161,7 +161,11 @@ pub struct ChatSession {
     /// nothing and would schedule no decoration at all.
     last_batches: Vec<Batch>,
     last_ops: Vec<Op>,
-    last_anchor: (i32, i32, i32),
+    /// The anchor the last committed plan's `@` coordinates were
+    /// resolved against. The PLAN's anchor, not the gaze at commit: a
+    /// commit may now come from anywhere, and both the reveal ordering
+    /// and a rebase replay against this.
+    pub last_anchor: (i32, i32, i32),
     /// Voice live mode: spoken build requests preview immediately and
     /// "build it" commits. Off by default; `/build enableVoice`.
     pub voice_live: bool,
@@ -684,7 +688,12 @@ impl ChatSession {
             .flat_map(|e| e.before.iter().rev().copied())
             .map(|(x, y, z, prev)| (x, y, z, prev))
             .collect();
-        self.last_anchor = self.focus(gaze).anchor;
+        // The plan's own anchor. This used to read the gaze at commit,
+        // which was fine while the guard forced the gaze to stay; with
+        // commits from anywhere it was the player's new spot, and the
+        // reveal ordered itself from there -- and a rebase would have
+        // replayed the IR against a point the player had merely walked to.
+        self.last_anchor = p.plan.anchor.unwrap_or_else(|| self.focus(gaze).anchor);
         Reply::Committed { blocks: run.blocks_changed, batches: run.batches.len(),
                            edit_ids: self.last_commit.clone() }
     }
@@ -1268,5 +1277,24 @@ mod tests {
         s.commit(&mut t, &g);
         assert!(s.last_ir.contains("cylinder"));
         assert_eq!(s.last_prose, "a little tower");
+    }
+
+    #[test]
+    fn the_committed_anchor_is_the_plans_not_the_gaze_at_commit() {
+        // A tower of r=3 at anchor (20,·,5) has its box minimum at
+        // (17,·,2). Replaying `cylinder @0,0` against (17,2) would put
+        // the rebased tower three blocks off -- and replaying against
+        // where the player STOOD at commit would put it anywhere.
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(20, 5, 15.0);
+        s.receive_plan(&mut t, &g, "cylinder @0,0 r=3 h=6\n");
+        // committed from somewhere else entirely
+        s.commit(&mut t, &gaze_at(300, 300, 80.0));
+        let a = s.last_anchor;
+        assert_eq!((a.0, a.2), (20, 5));
+        let lb = s.last_build.as_ref().unwrap();
+        assert_ne!((lb.min.0, lb.min.2), (20, 5), "and it is not the box corner");
     }
 }

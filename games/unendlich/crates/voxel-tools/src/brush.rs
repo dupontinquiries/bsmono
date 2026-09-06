@@ -101,12 +101,16 @@ pub struct BrushPlan {
     pub lowered: usize,
     /// The largest single-column change, for the preview.
     pub max_delta: i32,
+    /// Planning stopped early because the stroke exceeded the brush
+    /// ceiling. The apply would refuse it anyway; say so instead.
+    pub truncated: bool,
 }
 
 impl BrushPlan {
     pub fn summary(&self) -> String {
-        format!("{} columns: {} raised, {} lowered, {} blocks, max {} per column",
-                self.columns, self.raised, self.lowered, self.changes.len(), self.max_delta)
+        format!("{} columns: {} raised, {} lowered, {} blocks, max {} per column{}",
+                self.columns, self.raised, self.lowered, self.changes.len(), self.max_delta,
+                if self.truncated { " -- TOO BIG, reduce r= or by=" } else { "" })
     }
 }
 
@@ -141,9 +145,22 @@ fn value_noise(x: i32, z: i32, scale: i32, seed: u64) -> f32 {
 /// to cut to and what to build up with when the column's own surface
 /// block is unusable (water, air).
 pub fn plan<W: VoxelWorld>(w: &W, b: &Brush, from_y: i32, fill: u16) -> BrushPlan {
-    let r = b.radius.max(1);
+    let r = b.radius.clamp(1, 400);
     let (cx, cz) = b.centre;
     let mut out = BrushPlan::default();
+    // A brush shapes LAND. `by=2147483647` is not a request for a
+    // two-billion-block spike; it is a fumbled number, and without a
+    // clamp it asked for billions of pushes per column. Sixty-four is
+    // a mountain.
+    let clamp_amt = |a: i32| a.clamp(-64, 64);
+    let b = Brush { op: match b.op {
+        BrushOp::Raise(a) => BrushOp::Raise(clamp_amt(a)),
+        BrushOp::Lower(a) => BrushOp::Lower(clamp_amt(a)),
+        BrushOp::Flatten(y) => BrushOp::Flatten(y),
+        BrushOp::Roughen(a) => BrushOp::Roughen(clamp_amt(a).abs().min(16)),
+        o => o,
+    }, ..*b };
+    let b = &b;
 
     // Two passes for smooth: heights first, then the mean, then the
     // pull. Everything else is one pass.
@@ -191,7 +208,7 @@ pub fn plan<W: VoxelWorld>(w: &W, b: &Brush, from_y: i32, fill: u16) -> BrushPla
         let target = match b.op {
             BrushOp::Raise(a) => sy + (a as f32 * wgt).round() as i32,
             BrushOp::Lower(a) => sy - (a as f32 * wgt).round() as i32,
-            BrushOp::Flatten(y) => sy + ((y - sy) as f32 * wgt).round() as i32,
+            BrushOp::Flatten(y) => sy + (((y - sy).clamp(-64, 64)) as f32 * wgt).round() as i32,
             BrushOp::Smooth(s) => {
                 let m = mean.as_ref().and_then(|m| m.get(&(x, z))).copied().unwrap_or(sy);
                 sy + ((m - sy) as f32 * s.clamp(0.0, 1.0) * wgt).round() as i32
@@ -203,6 +220,11 @@ pub fn plan<W: VoxelWorld>(w: &W, b: &Brush, from_y: i32, fill: u16) -> BrushPla
         };
         let delta = target - sy;
         if delta == 0 { continue; }
+        // Bail once the plan is past what any apply will accept: a
+        // flatten toward a bad `to=` can be 64 blocks in every one of
+        // 500,000 columns, and planning 32 million changes that will be
+        // refused is a hang with extra steps.
+        if out.changes.len() > crate::MAX_BLOCKS_PER_BRUSH { out.truncated = true; break; }
         out.max_delta = out.max_delta.max(delta.abs());
         // Build up with the column's own surface block, so a raise on
         // grass is grass and a raise on sand is sand. Fall back on the

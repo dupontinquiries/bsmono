@@ -436,6 +436,15 @@ impl Repo {
     }
 
     pub fn load(text: &str) -> Self {
+        let r = Self::load_inner(text);
+        // A file that is empty, truncated, or from before the tree had
+        // a root has no `main`. Every other method indexes the head
+        // branch and would panic; a fresh repo is the honest result.
+        if r.branches.get(&r.head).map(|h| r.commits.contains_key(h)).unwrap_or(false) { r }
+        else { Self::new(r.chunk_size) }
+    }
+
+    fn load_inner(text: &str) -> Self {
         let mut r = Repo { chunk_size: 32, head: "main".into(), ..Default::default() };
         let mut last_commit: Option<Hash> = None;
         for line in text.lines() {
@@ -718,5 +727,18 @@ mod tests {
         let back = Repo::load(&r.save());
         assert_eq!(back.head_commit().anchor, (120, -40));
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn an_empty_or_truncated_save_loads_as_a_fresh_repo() {
+        // A crash between create and write leaves an empty file; the
+        // first version indexed `branches["main"]` on it and panicked.
+        let r = Repo::load("");
+        assert_eq!(r.head_commit().message, "as generated");
+        let r2 = Repo::load("# unendlich worldtree v1\nchunk 32\nhead main\n");
+        assert_eq!(r2.head_commit().message, "as generated");
+        let r3 = Repo::load("# unendlich worldtree v1\nchunk 16\nhead main\nbranch main deadbeef\n");
+        assert_eq!(r3.chunk_size, 16, "the chunk size is kept");
+        assert_eq!(r3.head_commit().message, "as generated", "a dangling branch is dropped");
     }
 }
