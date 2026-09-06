@@ -886,6 +886,32 @@ impl VoicetermApp {
         self.web_panes.get(&id).map(|p| p.url.clone()).unwrap_or_default()
     }
 
+    /// Rank the session's command blocks against `query` — `recall`'s real scoring, which
+    /// until the query field existed only ever ran with an empty string.
+    fn rank_recall(&self, query: &str) -> Vec<voiceterm_egui::cmd_sheet::RecallHit> {
+        use voiceterm_egui::cmd_sheet::recall;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let items: Vec<recall::RecallItem> = self
+            .blocks
+            .blocks
+            .iter()
+            .filter(|b| !b.command.trim().is_empty())
+            .map(|b| recall::RecallItem {
+                command: b.command.clone(),
+                // Truncated by the caller, as recall's own doc says: the snippet is for
+                // ranking context, and a whole build log would dwarf every command.
+                output_snippet: b.output.chars().take(200).collect(),
+                cwd: b.cwd.clone(),
+                started_at: b.started_at,
+                exit_code: b.exit_code,
+            })
+            .collect();
+        recall::recall(query, &items, now, 40)
+    }
+
     fn run_command(&mut self, cmd: voiceterm_egui::palette::Command) {
         use voiceterm_egui::gesture_menus::WsCall;
         use voiceterm_egui::palette::{Command, Target};
@@ -929,6 +955,11 @@ impl VoicetermApp {
             // the most recent block is the closest approximation. True
             // for the common case (clipping something just seen), not
             // guaranteed for a selection made further back in scrollback.
+            Command::Recall(q) => {
+                let hits = self.rank_recall(&q);
+                self.cmd_sheet.open_asking(&q, hits);
+                self.surfaces.open(Surface::CmdSheet);
+            }
             Command::PeerHandshake => {
                 // REAL VALUES OR NONE. The panel is a trust decision; opening it with
                 // placeholder identity strings would look like proof while being
@@ -1029,6 +1060,19 @@ impl VoicetermApp {
     /// The palette overlay: type to filter, Enter to run, Escape to dismiss.
     fn palette_ui(&mut self, ctx: &egui::Context, open_t: f32) {
         let entries = voiceterm_egui::palette::vocabulary();
+        // TYPED QUESTIONS REACH RECALL TOO, and NOT through the fuzzy matcher. "how did
+        // I fix the nginx config" is not a subsequence of any title — the 'w' of "how"
+        // has nothing after "What did I do" to match — so `search` drops it entirely and
+        // the question fell through to whatever else scored. The same phrase parser the
+        // voice path uses runs over the typed query, and a question is prepended to the
+        // HITS as its own row carrying the stripped words. One grammar, both doors.
+        let asked = voiceterm_egui::palette::recall_query(&self.palette_query)
+            .filter(|q| !q.is_empty())
+            .map(|q| voiceterm_egui::palette::Entry {
+                command: voiceterm_egui::palette::Command::Recall(q.clone()),
+                title: format!("What did I do \u{2014} \u{201c}{q}\u{201d}"),
+                keywords: &[],
+            });
         let mut chosen = None;
         let mut close = false;
         // The QML puts the palette in a right-edge drawer (paletteDrawer,
@@ -1038,7 +1082,10 @@ impl VoicetermApp {
                 // Focused on open, because a palette you have to click into
                 // costs the keystroke it exists to save.
                 resp.request_focus();
-                let hits = voiceterm_egui::palette::search(&entries, &self.palette_query);
+                let mut hits = voiceterm_egui::palette::search(&entries, &self.palette_query);
+                if let Some(a) = asked.as_ref() {
+                    hits.insert(0, a);
+                }
                 if self.palette_sel >= hits.len() { self.palette_sel = 0; }
                 if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                     self.palette_sel = (self.palette_sel + 1).min(hits.len().saturating_sub(1));
@@ -1532,6 +1579,8 @@ impl eframe::App for VoicetermApp {
                 if let Some(a) = voiceterm_egui::cmd_sheet::cmd_sheet_ui(
                     ui, &mut self.cmd_sheet, &colors)
                 {
+                    // (the re-rank happens after the closure — `rank_recall`
+                    // borrows self, and the sheet is already borrowed here)
                     use voiceterm_egui::cmd_sheet::SheetAction as A;
                     match a {
                         // Typed, not run — and here the rule matters most:
@@ -1582,6 +1631,16 @@ impl eframe::App for VoicetermApp {
                     self.fs_search.cancel();
                 }
             });
+        }
+
+        // THE QUERY RE-RANK, outside the draw closure: `rank_recall` reads the
+        // blocks and the closure already holds `self.cmd_sheet`. One frame of
+        // lag on a keystroke, which is invisible and cheaper than cloning the
+        // corpus into the sheet.
+        if self.cmd_sheet.query_dirty {
+            let q = self.cmd_sheet.query.clone();
+            let hits = self.rank_recall(&q);
+            self.cmd_sheet.set_hits(hits);
         }
 
         // THE PEER HANDSHAKE. Modal: it is an identity decision and letting
@@ -1792,26 +1851,11 @@ impl eframe::App for VoicetermApp {
                         // RANKED AT OPEN, not held live: recall scores recency
                         // against frequency, so a list built once at startup
                         // shows the wrong "most recent" an hour later.
-                        use voiceterm_egui::cmd_sheet::recall;
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs()).unwrap_or(0);
-                        let items: Vec<recall::RecallItem> = self.blocks.blocks.iter()
-                            .filter(|b| !b.command.trim().is_empty())
-                            .map(|b| recall::RecallItem {
-                                command: b.command.clone(),
-                                // Truncated by the caller, as recall's own doc
-                                // says: the snippet is for ranking context, and
-                                // a whole build log would dwarf every command.
-                                output_snippet: b.output.chars().take(200).collect(),
-                                cwd: b.cwd.clone(),
-                                started_at: b.started_at,
-                                exit_code: b.exit_code,
-                            })
-                            .collect();
                         // Empty query: no filter, pure recency/frequency rank,
-                        // which is what a history sheet opens on.
-                        let hits = recall::recall("", &items, now, 40);
+                        // which is what a history sheet opens on. Through the
+                        // same ranker the query field and "how did I…" use, so
+                        // the sheet cannot rank two ways.
+                        let hits = self.rank_recall("");
                         self.cmd_sheet.open_with(hits);
                         self.surfaces.open(Surface::CmdSheet);
                     }
