@@ -379,12 +379,16 @@ impl Renderer {
         // blending every closed surface through the BLEND state enabled below, which is a real
         // brightness bug on top of the fragment cost.
         //
-        // Verified unconditional-safe by two sessions independently, each with a fixed-camera
-        // A/B (`LOGSCOPE_CULL=0` vs default; one via `render-scene.sh`, one via `scene-view`
-        // under Xvfb/llvmpipe with a pinned `LOGSCOPE_CAM`): NO geometry vanishes or flips —
-        // same columns, same HUD glyphs, same jellyfish, same tether curve — so the ~32
-        // hand-built triangle pushes in `mesh3d` all wind consistently with the parameterised
-        // primitives, and the culled shot is visibly less washed out (the double-blend theory).
+        // Two sessions independently called this unconditional-safe from a fixed-camera A/B
+        // (`LOGSCOPE_CULL=0` vs default): "NO geometry vanishes or flips — same columns, same
+        // HUD glyphs, same jellyfish, same tether curve". That was wrong. Neither A/B had a
+        // floor in frame: `mesh3d::disc` and logscope's `terrain_disc` wound clockwise from
+        // above, so every disc floor, pond, puddle and terrain in every scene was culled from
+        // above from the day this was enabled, and the physical UI panel (`m3::panel`'s normal
+        // is cross(right, up), which its caller had pointing away from the graph) was culled
+        // from the side it faces. Found rendering the Cat Cave: floor and pond black at every
+        // exposure; `LOGSCOPE_CULL=0` brought them back. Those primitives are fixed at their
+        // source; culling stays on, and the double-blend brightness point stands.
         //
         // The two sessions then chose differently: one removed the switch, one kept it. Kept —
         // it costs one env read per frame and turns a *future* "some geometry disappeared"

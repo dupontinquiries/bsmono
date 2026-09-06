@@ -319,7 +319,7 @@ fn light_shaft(s: &mut Scene, x: f32, z: f32, y_top: f32, y_floor: f32, col: Col
     let mut beam = m3::tube(v(x, y_top, z), v(x, y_floor + 0.08, z), 0.42, 14, col);
     beam.mat = M::MOSS; beam.emissive = 1.0; m3::set_alpha(&mut beam, 60); // soft translucent glow
     s.add(beam, Float { amp: 0.0, speed: 0.3, phase: hash(seed as i32, 1) * 6.28, drift: 0.0 });
-    let mut ap = m3::disc(v(x, y_top, z), 0.5, 20, col); ap.mat = M::MOSS; ap.emissive = 1.9; s.add(ap, Float::STILL);
+    let mut ap = m3::disc_down(v(x, y_top, z), 0.5, 20, col); ap.mat = M::MOSS; ap.emissive = 1.9; s.add(ap, Float::STILL);
     let mut pool = m3::disc(v(x, y_floor + 0.05, z), 0.85, 26, col); m3::set_alpha(&mut pool, 140); pool.mat = M::MOSS; pool.emissive = 0.9;
     s.add(pool, Float { amp: 0.0, speed: 0.4, phase: hash(seed as i32, 2) * 6.28, drift: 0.04 });
 }
@@ -579,7 +579,7 @@ fn mistfall() -> Scene {
     }
     // a dark cavern CEILING the stalactites actually hang from (flat dark roof, faded by the upper mist)
     let ceil_y = 20.0_f32; // raised cavern roof → more headroom so the camera FSM can frame the floating graph without the ceiling between
-    let mut ceil = m3::disc(v(0.0, ceil_y, 0.0), 34.0, 72, c(0x12, 0x18, 0x1c));
+    let mut ceil = m3::disc_down(v(0.0, ceil_y, 0.0), 34.0, 72, c(0x12, 0x18, 0x1c));
     m3::tint_up(&mut ceil, c(0x18, 0x20, 0x24), c(0x0a, 0x0e, 0x12)); ceil.mat = M::STONE;
     for nn in ceil.norms.iter_mut() { nn.x = -nn.x; nn.y = -nn.y; nn.z = -nn.z; } // face DOWN into the cavern
     s.add(ceil, Float::STILL);
@@ -1011,7 +1011,7 @@ fn enclose(s: &mut Scene, wall_mat: f32, wall_lo: Color32, wall_hi: Color32, she
     // (removed: the oculus rim TORUS — that wide overhead ring read as a stray 'concentric' cutting the view.
     //  The bright skylight disc below stays as the bloom/god-ray source.)
     // a bright skylight disc filling the oculus — bloom source + something for the god-ray pass to streak from
-    let mut sky = m3::disc(v(0.0, y0 + h + 0.9, 0.0), r * 0.27, 56, wall_hi);
+    let mut sky = m3::disc_down(v(0.0, y0 + h + 0.9, 0.0), r * 0.27, 56, wall_hi);
     m3::tint_up(&mut sky, wall_hi, wall_hi); sky.mat = wall_mat; sky.emissive = 1.7;
     s.add(sky, Float::STILL);
 }
@@ -1281,7 +1281,7 @@ fn mansion_garden() -> Scene {
     for k in 0..6 {
         let a = hash(k, 160) * TAU + 0.7; let r = (8.0 + hash(k, 161) * 9.0) * sc;
         let (gx, gz) = (a.cos() * r, a.sin() * r); let gr = (1.5 + hash(k, 162) * 1.1) * sc;
-        let mut gdome = m3::dome_cap(v(gx, yf + 0.05, gz), gr, gr, 0.0, 40, 7, c(0xcf, 0xe8, 0xea));
+        let mut gdome = m3::dome_cap_outside(v(gx, yf + 0.05, gz), gr, gr, 0.0, 40, 7, c(0xcf, 0xe8, 0xea));
         gdome.mat = M::STONE; gdome.emissive = 0.05; m3::set_alpha(&mut gdome, 88); s.add(gdome, Float::STILL);
         let mut rim = m3::torus(v(gx, yf + 0.1, gz), gr, 0.08 * sc, 32, 6, mhi); rim.mat = M::STONE; s.add(rim, Float::STILL);
         let mut plant = m3::leaf_cluster(v(gx, yf + 0.6 * sc, gz), gr * 0.5, 170 + k as u32, c(0x4e, 0x82, 0x36));
@@ -1577,7 +1577,7 @@ fn colonnade_ring(s: &mut Scene, count: usize, radius: f32, y_floor: f32, height
         let mut base = m3::tube(v(cx, y_floor, cz), v(cx, y_floor + 0.4, cz), 0.62, 18, hi); base.mat = mat; s.add(base, Float::STILL);
         let mut base_top = m3::disc(v(cx, y_floor + 0.4, cz), 0.62, 18, hi); base_top.mat = mat; s.add(base_top, Float::STILL);
         let mut cap = m3::tube(v(cx, y_cap - 0.4, cz), v(cx, y_cap, cz), 0.62, 18, hi); cap.mat = mat; s.add(cap, Float::STILL);
-        let mut cap_top = m3::disc(v(cx, y_cap, cz), 0.62, 18, hi); cap_top.mat = mat; s.add(cap_top, Float::STILL);
+        let mut cap_top = m3::disc_down(v(cx, y_cap, cz), 0.62, 18, hi); cap_top.mat = mat; s.add(cap_top, Float::STILL);
         let mut collar = m3::torus(v(cx, y_cap - 0.4, cz), 0.52, 0.1, 18, 7, hi); collar.mat = mat; s.add(collar, Float::STILL);
         contact_shadow(s, cx, cz, 1.05, y_floor, 120);
         push_collider(Collider::Pillar { x: cx, z: cz, r: 0.66, y0: y_floor, y1: y_cap });
@@ -1762,7 +1762,7 @@ fn tree_platform(s: &mut Scene, cx: f32, cz: f32, y: f32, r: f32, seed: u32) {
     for k in 0..12 { let a = TAU * k as f32 / 12.0; let (px, pz) = (cx + a.cos() * (r - 0.12), cz + a.sin() * (r - 0.12)); let mut post = m3::tube(v(px, y, pz), v(px, y + 0.72, pz), 0.05, 5, c(0x4a, 0x36, 0x20)); post.mat = M::WOOD; s.add(post, Float::STILL); }
     let mut rail = m3::torus(v(cx, y + 0.72, cz), r - 0.12, 0.05, 32, 6, c(0x60, 0x46, 0x2a)); rail.mat = M::WOOD; s.add(rail, Float::STILL);
     for k in 0..4 { let a = TAU * k as f32 / 4.0 + 0.4; let (px, pz) = (cx + a.cos() * (r * 0.78), cz + a.sin() * (r * 0.78)); let mut sp = m3::tube(v(px, y + 0.72, pz), v(px, y + 2.5, pz), 0.06, 5, c(0x4a, 0x36, 0x20)); sp.mat = M::WOOD; s.add(sp, Float::STILL); }
-    let mut roof = m3::dome_cap(v(cx, y + 2.5, cz), r * 0.95, 1.1, 0.0, 20, 6, c(0x46, 0x32, 0x1e)); roof.mat = M::WOOD; s.add(roof, Float::STILL);
+    let mut roof = m3::dome_cap_outside(v(cx, y + 2.5, cz), r * 0.95, 1.1, 0.0, 20, 6, c(0x46, 0x32, 0x1e)); roof.mat = M::WOOD; s.add(roof, Float::STILL);
     let mut lantern = m3::uv_sphere(v(cx, y + 1.9, cz), 0.17, 10, 8, c(0xff, 0xc8, 0x6a)); lantern.mat = M::MOSS; lantern.emissive = 1.35;
     s.add(lantern, Float { amp: 0.03, speed: 0.6, phase: hash(seed as i32, 3) * 6.28, drift: 0.0 });
     contact_shadow(s, cx, cz, r * 0.9, y - 0.2, 70);
@@ -2412,7 +2412,9 @@ fn seafloor(s: &mut Scene, r_inner: f32, r_outer: f32, y_base: f32, sz: f32, see
     for ri in 0..rings {
         for si in 0..spokes {
             let (a, b, cc, d) = (idx(ri, si), idx(ri, si + 1), idx(ri + 1, si), idx(ri + 1, si + 1));
-            tris.push([a, cc, b]); tris.push([b, cc, d]);
+            // counter-clockwise from ABOVE (was [a, cc, b] / [b, cc, d]: clockwise, so the ground was culled
+            // from above and its computed normals pointed down — lit from underneath). See `mesh3d::disc`.
+            tris.push([a, b, cc]); tris.push([b, d, cc]);
         }
     }
     let mut norms = vec![v(0.0, 0.0, 0.0); verts.len()];
@@ -2465,7 +2467,9 @@ fn terrain_disc(s: &mut Scene, r: f32, y_base: f32, seed: u32, amp: f32, freq: f
     for ri in 0..rings {
         for si in 0..spokes {
             let (a, b, cc, d) = (idx(ri, si), idx(ri, si + 1), idx(ri + 1, si), idx(ri + 1, si + 1));
-            tris.push([a, cc, b]); tris.push([b, cc, d]);
+            // counter-clockwise from ABOVE (was [a, cc, b] / [b, cc, d]: clockwise, so the ground was culled
+            // from above and its computed normals pointed down — lit from underneath). See `mesh3d::disc`.
+            tris.push([a, b, cc]); tris.push([b, d, cc]);
         }
     }
     let mut norms = vec![v(0.0, 0.0, 0.0); verts.len()];
@@ -3001,7 +3005,7 @@ fn atlantis() -> Scene {
         let mut base = m3::tube(v(cx, y_floor, cz), v(cx, y_floor + 0.5, cz), 0.72, 22, stone_hi); base.mat = M::STONE; s.add(base, Float::STILL);
         let mut base_top = m3::disc(v(cx, y_floor + 0.5, cz), 0.72, 22, stone_hi); base_top.mat = M::STONE; s.add(base_top, Float::STILL);
         let mut cap = m3::tube(v(cx, y_cap - 0.5, cz), v(cx, y_cap, cz), 0.72, 22, stone_hi); cap.mat = M::STONE; s.add(cap, Float::STILL);
-        let mut cap_top = m3::disc(v(cx, y_cap, cz), 0.72, 22, stone_hi); cap_top.mat = M::STONE; s.add(cap_top, Float::STILL);
+        let mut cap_top = m3::disc_down(v(cx, y_cap, cz), 0.72, 22, stone_hi); cap_top.mat = M::STONE; s.add(cap_top, Float::STILL);
         let mut collar0 = m3::torus(v(cx, y_floor + 0.5, cz), 0.6, 0.12, 22, 8, stone_hi); collar0.mat = M::STONE; s.add(collar0, Float::STILL);
         let mut collar1 = m3::torus(v(cx, y_cap - 0.5, cz), 0.6, 0.12, 22, 8, stone_hi); collar1.mat = M::STONE; s.add(collar1, Float::STILL);
         push_collider(Collider::Pillar { x: cx, z: cz, r: 0.8, y0: y_floor, y1: y_cap });
@@ -3151,7 +3155,7 @@ fn atlantis() -> Scene {
     m3::tint_up(&mut soffit, stone_hi, stone_lo); soffit.mat = M::STONE; m3::scale_xz(&mut soffit, 1.0, sz);
     for n in soffit.norms.iter_mut() { n.x = -n.x; n.y = -n.y; n.z = -n.z; } // face DOWN (seen from inside)
     s.add(soffit, Float::STILL);
-    let mut sky = m3::disc(v(0.0, y_oc + 0.15, 0.0), r_oc + 0.3, 64, c(0xbf, 0xf4, 0xff));
+    let mut sky = m3::disc_down(v(0.0, y_oc + 0.15, 0.0), r_oc + 0.3, 64, c(0xbf, 0xf4, 0xff));
     sky.mat = M::WATER; sky.emissive = 1.5; m3::scale_xz(&mut sky, 1.0, sz); s.add(sky, Float::STILL);
     let mut halo = m3::torus(v(0.0, y_oc - 0.3, 0.0), r_oc + 1.0, 0.22, 64, 8, c(0x8c, 0xe8, 0xff));
     halo.mat = M::WATER; halo.emissive = 0.7; m3::scale_xz(&mut halo, 1.0, sz); s.add(halo, Float::STILL);
@@ -4026,7 +4030,7 @@ fn cloudscape() -> Scene {
     // MOON + STARS — the night variation: a pale cool disc high up with a soft halo, and faint stars. Reads at
     // night (cool tod light); by day it's just a pale moon in the blue. (Moonlight tint comes from the tod grade.)
     let moon_p = v(9.0, 13.0, -7.0);
-    let mut moon = m3::disc(moon_p, 1.7, 44, c(0xe8, 0xee, 0xf6)); moon.mat = M::STONE; moon.emissive = 1.5; s.add(moon, Float::STILL);
+    let mut moon = m3::disc_down(moon_p, 1.7, 44, c(0xe8, 0xee, 0xf6)); moon.mat = M::STONE; moon.emissive = 1.5; s.add(moon, Float::STILL);
     let mut halo = m3::disc(addv(moon_p, v(0.0, 0.0, 0.1)), 2.6, 44, c(0xbf, 0xd2, 0xf0)); halo.mat = M::STONE; halo.emissive = 0.5; m3::set_alpha(&mut halo, 90); s.add(halo, Float::STILL);
     for k in 0..60 {
         let ki = k as i32 + 400;
@@ -4999,7 +5003,7 @@ fn recurse_citadel(s: &mut Scene, cx: f32, cz: f32, base_y: f32, rad: f32, h: f3
         win.mat = M::PAPER; if lit { win.emissive = 0.6; } s.add(win, Float::STILL);
     }
     if depth == 0 || rad < 0.5 {
-        let mut roof = m3::dome_cap(v(cx, base_y + h, cz), rad * 1.1, rad * 1.6, 0.0, 14, 6, mix_rgb(lo, hi, 0.4)); roof.mat = M::STONE; roof.emissive = 0.06; s.add(roof, Float::STILL);
+        let mut roof = m3::dome_cap_outside(v(cx, base_y + h, cz), rad * 1.1, rad * 1.6, 0.0, 14, 6, mix_rgb(lo, hi, 0.4)); roof.mat = M::STONE; roof.emissive = 0.06; s.add(roof, Float::STILL);
         let ptop = base_y + h + rad * 1.6 + rad * 1.3;
         let mut pole = m3::tube(v(cx, base_y + h + rad * 1.6, cz), v(cx, ptop, cz), 0.04, 3, hi); pole.mat = M::STONE; s.add(pole, Float::STILL);
         let mut pen = m3::panel(v(cx + 0.42, ptop - 0.28, cz), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), 0.8, 0.45, flag); pen.mat = M::PAPER; pen.emissive = 0.22; s.add(pen, Float { amp: 0.08, speed: 0.9, phase: hash(seed, 9) * 6.28, drift: 0.14 });

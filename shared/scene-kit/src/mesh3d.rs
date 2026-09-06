@@ -978,8 +978,22 @@ pub fn disc(center: Vec3, r: f32, segs: usize, color: Color32) -> Mesh3 {
         verts.push(addv(center, v(r * th.cos(), 0.0, r * th.sin())));
         norms.push(v(0.0, 1.0, 0.0));
     }
-    for j in 0..segs as u32 { tris.push([0, j + 1, j + 2]); }
+    // WINDING: counter-clockwise seen from ABOVE, so the face survives back-face culling from where a floor,
+    // a pond, a lily pad or a table top is looked at. It was `[0, j+1, j+2]`, which with this vertex order
+    // (x = cos, z = sin) winds clockwise from above — a normal of -y by the right-hand rule — while the
+    // stored normals said +y. Harmless until the scene pass enabled `CULL_FACE`; then every disc floor in
+    // every scene vanished from above and nobody framed one to notice. `disc_down` is the ceiling variant.
+    for j in 0..segs as u32 { tris.push([0, j + 2, j + 1]); }
     Mesh3 { uvs: None, emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
+}
+
+/// A `disc` meant to be seen from BELOW — a ceiling, a moon, the sky through an oculus, the cap of a column,
+/// the mouth of a light shaft. Winds the other way and carries -y normals.
+pub fn disc_down(center: Vec3, r: f32, segs: usize, color: Color32) -> Mesh3 {
+    let mut m = disc(center, r, segs, color);
+    for t in &mut m.tris { t.swap(1, 2); }
+    for n in &mut m.norms { n.y = -n.y; }
+    m
 }
 
 /// Clock hour (0..24, fractional) driving the day-cycle sun. `SCENE_KIT_HOUR` (or logscope's
@@ -1433,11 +1447,23 @@ pub fn dome_cap(center: Vec3, base_r: f32, rise: f32, oculus_r: f32, segs: usize
         for j in 0..segs {
             let a = (i * row + j) as u32;
             let (b, cc, d) = (a + 1, a + row as u32, a + row as u32 + 1);
-            tris.push([a, cc, b]);
-            tris.push([b, cc, d]);
+            // wound to face INWARD, matching the stored normals: a dome is a roof you stand under
+            // (Atlantis, the conservatory, every enclosed room). Was `[a, cc, b] / [b, cc, d]` — outward —
+            // so with back-face culling every dome vanished from inside. `dome_cap_outside` for huts.
+            tris.push([a, b, cc]);
+            tris.push([b, d, cc]);
         }
     }
     Mesh3 { uvs: None, emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
+}
+
+/// A `dome_cap` meant to be seen from OUTSIDE — a hut roof, a lantern cap, an umbrella, a hood, a
+/// greenhouse. Winds outward and carries outward normals.
+pub fn dome_cap_outside(center: Vec3, base_r: f32, rise: f32, oculus_r: f32, segs: usize, rings: usize, color: Color32) -> Mesh3 {
+    let mut m = dome_cap(center, base_r, rise, oculus_r, segs, rings, color);
+    for t in &mut m.tris { t.swap(1, 2); }
+    for n in &mut m.norms { *n = v(-n.x, -n.y, -n.z); }
+    m
 }
 /// reads as a real folded sheet rather than a flat triangle. `size` is the half-width, `rise` the fold
 /// height. Smooth-averaged normals (the geometry still carries the creases).
