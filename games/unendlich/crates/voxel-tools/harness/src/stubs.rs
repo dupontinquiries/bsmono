@@ -54,7 +54,7 @@ pub enum AnimProfile { GroundUp, Physics, Random, Instant }
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Command {
     Build(String), BuildVoice(bool), ShowPlan, CommitPlan, UndoBuild,
-    Focus(Option<FocusAdjust>), Anim(AnimProfile), Model(Option<String>), Keys, Cancel, Repair, Hive, Refine(Option<String>), Deferred { drop: bool }, Provider(Option<String>), Shot { kind: String, id: Option<String> }, Unknown,
+    Focus(Option<FocusAdjust>), Anim(AnimProfile), Model(Option<String>), Keys, Cancel, Repair, Land(LandOp), Hive, Refine(Option<String>), Deferred { drop: bool }, Provider(Option<String>), Shot { kind: String, id: Option<String> }, Unknown,
 }
 pub fn parse(line: &str) -> Command {
     let t = line.trim();
@@ -63,6 +63,18 @@ pub fn parse(line: &str) -> Command {
             "enablevoice" => Command::BuildVoice(true),
             "disablevoice" => Command::BuildVoice(false),
             _ => Command::Build(rest.trim().to_string()),
+        };
+    }
+    // /land takes the whole remainder: a claim name may have spaces.
+    if let Some(rest) = t.strip_prefix("/land") {
+        let rest = rest.trim();
+        if rest.is_empty() { return Command::Land(LandOp::Here); }
+        let mut it = rest.split_whitespace();
+        return match (it.next(), it.next(), it.next()) {
+            (Some("info"), Some(id), _) => Command::Land(LandOp::Info(id.into())),
+            (Some("add"), Some(id), Some(p)) => Command::Land(LandOp::Add { id: id.into(), player: p.into() }),
+            (Some("claim"), Some(_), _) => Command::Land(LandOp::Claim(rest[5..].trim().into())),
+            _ => Command::Unknown,
         };
     }
     let mut it = t.split_whitespace();
@@ -109,3 +121,6 @@ impl FloraStore {
 
 /// Stub of thread_priority::configure_current_thread(ChunkLoader).
 pub fn deprioritise() {}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum LandOp { Here, Info(String), Add { id: String, player: String }, Claim(String) }

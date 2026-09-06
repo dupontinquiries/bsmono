@@ -28,6 +28,8 @@ fn main() {
     plant_scenario();
     repair_scenario();
     waypoint_scenario();
+    persist_scenario();
+    cancel_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -547,4 +549,87 @@ fn waypoint_scenario() {
     assert!(cm.block_at(323, 66, 300) == stubs::BlockId::Air, "not where they now look");
     assert!(pb.waypoint().is_none(), "marker gone once built");
     println!("  committed from 300 blocks away; tower stands at the plan's anchor");
+}
+
+
+/// Claim, commit, save; a fresh paintbrush loads it all back.
+fn persist_scenario() {
+    use paintbrush::Paintbrush;
+    use voxel_tools::chatbox::Key;
+    println!("\n==== persistence");
+    let dir = std::path::PathBuf::from("/tmp/bindcheck_world");
+    let _ = std::fs::remove_dir_all(&dir);
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    pb.player = "kess".into();
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    let mut line = |pb: &mut Paintbrush, l: &str| -> Option<stubs::Command> {
+        pb.key(Key::Enter); for c in l.chars() { pb.key(Key::Char(c)); } pb.key(Key::Enter)
+    };
+    pb.launch_drone(&cm, &gaze, "cylinder @0,0 r=3 h=8 block=stone\n".into(), None, "a tower");
+    settle(&mut pb);
+    let cmd = line(&mut pb, "/commit").unwrap(); pb.dispatch(&cm, &gaze, cmd);
+    let cmd = line(&mut pb, "/land claim the old tower").unwrap(); pb.dispatch(&cm, &gaze, cmd);
+    let log = pb.drain_log();
+    assert!(log.iter().any(|l| l.contains("claimed w1")), "{log:?}");
+    assert!(pb.state_dirty);
+    pb.save_state(&dir).unwrap();
+    assert!(!pb.state_dirty);
+    // a follow-up commit lands in the claim's journal and the tree
+    pb.launch_drone(&cm, &gaze, "sphere @3,0 r=1 block=air\n".into(), None, "add a door");
+    settle(&mut pb);
+    let cmd = line(&mut pb, "/commit").unwrap(); pb.dispatch(&cm, &gaze, cmd);
+    pb.save_state(&dir).unwrap();
+    let mut fresh = Paintbrush::new(32);
+    fresh.load_state(&dir);
+    let w = fresh.land.get("w1").expect("the claim survived");
+    println!("  reloaded: {}", w.summary());
+    assert_eq!(w.name, "the old tower");
+    assert!(w.turns.iter().any(|t| t.prose == "add a door"), "the follow-up is in the journal: {:?}",
+            w.turns.iter().map(|t| &t.prose).collect::<Vec<_>>());
+    let commits = fresh.repo.log("main", 10);
+    println!("  world tree: {} commit(s) on main", commits.len());
+    assert!(commits.len() >= 3, "root + tower + door");
+    assert!(commits[0].ir.contains("sphere"), "the tree carries the IR: {:?}", commits[0].ir);
+}
+
+/// /cancel stops the generator, not just the listener.
+fn cancel_scenario() {
+    use paintbrush::Paintbrush;
+    use voxel_tools::chatbox::Key;
+    println!("\n==== cancel stops generation");
+    // a provider that streams slowly and honours the control
+    struct Slow { steps: std::sync::Arc<std::sync::atomic::AtomicUsize> }
+    impl voxel_tools::llm::Completer for Slow {
+        fn name(&self) -> &str { "slow" }
+        fn complete(&mut self, _: &str, _: &str) -> Result<String, String> { Ok("cylinder @0,0 r=2\n".into()) }
+        fn complete_with(&mut self, _: &str, _: &str, ctl: &voxel_tools::llm::TurnControl) -> Result<String, String> {
+            let mut text = String::new();
+            for i in 0..200 {
+                if ctl.cancelled() { return Err("cancelled".into()); }
+                text.push_str("cylinder @0,0 r=2\n");
+                ctl.report(i + 1, &text);
+                self.steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(text)
+        }
+    }
+    let steps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    pb.spawn_turn_for_test(Box::new(Slow { steps: steps.clone() }), &gaze);
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let status = pb.status_line().expect("progress while running");
+    println!("  status: {status}");
+    assert!(status.contains("tokens") && status.contains("tok/s"), "{status}");
+    let cmd = { pb.key(Key::Enter); for c in "/cancel".chars() { pb.key(Key::Char(c)); } pb.key(Key::Enter) }.unwrap();
+    pb.dispatch(&cm, &gaze, cmd);
+    let at_cancel = steps.load(std::sync::atomic::Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let after = steps.load(std::sync::atomic::Ordering::Relaxed);
+    println!("  steps at cancel: {at_cancel}, 150 ms later: {after}");
+    assert!(after <= at_cancel + 2, "the generator kept running after /cancel: {at_cancel} -> {after}");
+    assert!(after < 200, "it never finished the reply");
 }

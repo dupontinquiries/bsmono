@@ -88,6 +88,9 @@ pub struct Pending {
     predicted_blocks: usize,
     /// Box of everything the dry run touched, for the waypoint marker.
     bounds: Option<((i32, i32, i32), (i32, i32, i32))>,
+    /// The expanded IR and the prose that produced it.
+    ir: String,
+    prose: String,
 }
 
 /// What was built last, as the referent for "make it taller", "add a
@@ -137,6 +140,11 @@ pub struct ChatSession {
     /// A RefCell because `context` is `&self` and callers hold it that
     /// way; the cache is an implementation detail, not state.
     pub context_cache: std::cell::RefCell<Option<(String, String)>>,
+    /// The IR and prose of the last committed plan, for the journal
+    /// and the world tree. A commit's payload is its IR; without this
+    /// the tree would have blocks and no way to rebase them.
+    pub last_ir: String,
+    pub last_prose: String,
     /// Living plants placed by commits, awaiting the engine.
     pub planted: Vec<crate::flora::PlantRequest>,
     /// Seed for the refinement ladder, so re-running a rung reproduces
@@ -550,6 +558,7 @@ impl ChatSession {
         }
         self.pending = Some(Pending {
             plan, feature_id: f.feature_id.clone(), predicted_blocks: dry.blocks_changed,
+            ir: ir.to_string(), prose: prose.to_string(),
             bounds: {
                 let mut lo = (i32::MAX, i32::MAX, i32::MAX);
                 let mut hi = (i32::MIN, i32::MIN, i32::MIN);
@@ -635,6 +644,8 @@ impl ChatSession {
         let first = tools.edits.len();
         let run = run_plan(tools, &p.plan, self.from_y, self.chunk_size, false);
         self.invalidate_context();
+        self.last_ir = p.ir.clone();
+        self.last_prose = p.prose.clone();
         // Plants this commit planted, for the engine to register. Kept
         // on the session until the host takes them, because the tools
         // here are a staging world and know nothing about a lifecycle.
@@ -1244,5 +1255,18 @@ mod tests {
             }
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn a_commit_remembers_its_ir_and_prose_for_the_journal() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        s.receive_plan_gated(&mut t, &g, "cylinder @0,0 r=2 h=5\n", None, "a little tower");
+        assert!(s.last_ir.is_empty(), "nothing committed yet");
+        s.commit(&mut t, &g);
+        assert!(s.last_ir.contains("cylinder"));
+        assert_eq!(s.last_prose, "a little tower");
     }
 }

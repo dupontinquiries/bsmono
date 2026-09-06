@@ -541,6 +541,8 @@ pub struct WorldRenderer {
     /// Drawn as a marker so the player may look anywhere while a model
     /// works and still know where /commit builds.
     pub chat_waypoint: Option<(String, [f32; 3], usize)>,
+    /// Live progress of a model turn, or None when idle.
+    pub chat_status: Option<String>,
     /// Clicks that collapsed into one frame (press+release same frame);
     /// forwarded to egui as discrete press/release pairs so fast / low-fps
     /// clicks still register on toggles.
@@ -1698,6 +1700,7 @@ impl WorldRenderer {
             chat_model: None,
             chat_char_ages: Vec::new(),
             chat_waypoint: None,
+            chat_status: None,
             ui_backspace: false,
             ui_enter: false,
             ui_wants_keyboard: false,
@@ -3912,6 +3915,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                         model: self.chat_model.as_deref(),
                         char_ages: &self.chat_char_ages,
                         now: c.input(|i| i.time),
+                        status: self.chat_status.as_deref(),
                     };
                     let gt = glass_t(c, "unendlich_chat", true);
                     let mut out = crate::app::chat_panel::ChatPanelOut::default();

@@ -3313,6 +3313,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // r514: load any persisted crop/flora growth state for this world (sparse — only planted
     // cells). It round-trips to flora.json under the world root; absent → empty store.
     session.flora = unendlich_engine::world::flora_store::FloraStore::load(&flora_root);
+    // Claims, templates and the world tree live beside the flora store
+    // and load with it.
+    paintbrush.load_state(&world_root);
     if !session.flora.is_empty() {
         log::info!("[farm] loaded {} persisted crop(s) from disk", session.flora.len());
     }
@@ -4509,6 +4512,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             renderer.chat_buffer = paintbrush.chatbox.buffer.clone();
             renderer.chat_char_ages = paintbrush.chatbox.char_ages();
             renderer.chat_waypoint = paintbrush.waypoint();
+            renderer.chat_status = paintbrush.status_line();
+            // A claim, a capture or a commit marks the state dirty; save
+            // it now, so a crash loses at most the last action.
+            if paintbrush.state_dirty {
+                if let Err(e) = paintbrush.save_state(&world_root) {
+                    log::warn!("[paintbrush] save failed: {e}");
+                }
+            }
             renderer.chat_card = paintbrush.chatbox.current_card()
                 .map(|c| (c.command.to_string(), c.signature.to_string(), c.summary.to_string()));
             renderer.chat_matches = paintbrush.chatbox.matching_cards().iter()

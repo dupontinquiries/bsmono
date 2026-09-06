@@ -74,6 +74,21 @@ pub trait Backend: Send + Sync {
         self.generate_prefixed(&format!("{system}\n\n"), user, max_tokens)
     }
 
+    /// `generate_chat` with a cancel check between steps and a sink
+    /// that receives the whole text so far as it grows. The default
+    /// cannot stream: it generates, sinks once, and honours cancel only
+    /// after the fact. A backend that drives its own decode loop should
+    /// override it, because a reply nobody will read is GPU time taken
+    /// from the renderer for nothing.
+    fn generate_chat_streaming(&self, system: &str, user: &str, max_tokens: usize,
+                               cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str))
+        -> Result<String, String> {
+        let out = self.generate_chat(system, user, max_tokens)?;
+        sink(out.split_whitespace().count(), &out);
+        if cancel() { return Err("cancelled".into()); }
+        Ok(out)
+    }
+
     /// Generate with a STABLE PREFIX the backend may keep prefilled
     /// across calls. A chat sends the same system prompt every turn;
     /// a backend that can hold its KV pays that prefill once. The
@@ -527,7 +542,54 @@ mod gpu {
             Ok(self.family.clean(&out))
         }
 
+        fn generate_chat_streaming(&self, system: &str, user: &str, max_tokens: usize,
+                                   cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str))
+            -> Result<String, String> {
+            let out = self.generate_prefixed_core(&self.family.wrap_system(system),
+                                                  &self.family.wrap_user(user), max_tokens,
+                                                  cancel, sink)?;
+            if cancel() { return Err("cancelled".into()); }
+            Ok(self.family.clean(&out))
+        }
+
+        fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, String> {
+            let ids = self.tok.encode(prompt);
+            let mut rng = 0xC0FFEE_u64;
+            let mut out: Vec<u32> = Vec::new();
+            if let Some(g) = &self.governor { g.acquire(self.tier); }
+            let (gov, tier) = (self.governor.clone(), self.tier);
+            self.gpu.generate_kv_stream(
+                &self.model,
+                &ids,
+                max_tokens,
+                self.eos,
+                &self.sampler,
+                &mut rng,
+                &|| false,
+                |t| {
+                    if self.stops.contains(&t) { return false; }
+                    out.push(t);
+                    if let Some(g) = &gov { g.acquire(tier); }
+                    true
+                },
+            );
+            Ok(self.tok.decode(&out))
+        }
+
         fn generate_prefixed(&self, prefix: &str, suffix: &str, max_tokens: usize)
+            -> Result<String, String> {
+            self.generate_prefixed_core(prefix, suffix, max_tokens, &|| false, &mut |_, _| {})
+        }
+    }
+
+    impl GpuBackend {
+        /// The one decode loop. Cancel is checked before every prefill
+        /// chunk and decode step; the sink gets the accumulated text
+        /// every few tokens, decoded from the start so a byte-level
+        /// token split across a UTF-8 sequence never surfaces as a
+        /// torn character.
+        fn generate_prefixed_core(&self, prefix: &str, suffix: &str, max_tokens: usize,
+                                  cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str))
             -> Result<String, String> {
             let phash = {
                 let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -555,6 +617,7 @@ mod gpu {
                 let chunk = if self.governor.is_some() { 48 } else { 256 };
                 let mut pos = 0;
                 for piece in prefix_ids.chunks(chunk) {
+                    if cancel() { return Err("cancelled".into()); }
                     if let Some(g) = &self.governor { g.acquire(self.tier); }
                     let _ = self.gpu.prefill_chunked_from(&self.model, &cache, piece, pos, chunk);
                     pos += piece.len();
@@ -573,41 +636,22 @@ mod gpu {
             let chunk = if self.governor.is_some() { 48 } else { 256 };
             let pace_gov = self.governor.clone();
             let pace = move || { if let Some(g) = &pace_gov { g.acquire(tier); } };
+            let tok = &self.tok;
             self.gpu.generate_kv_stream_paced(
                 &self.model, &p.cache, p.len, &suffix_ids, max_tokens, self.eos,
-                &self.sampler, &mut rng, &|| false, &pace, chunk,
+                &self.sampler, &mut rng, cancel, &pace, chunk,
                 |t| {
                     if stops.contains(&t) { return false; }
                     out.push(t);
+                    if out.len() % 4 == 0 { sink(out.len(), &tok.decode(&out)); }
                     if let Some(g) = &gov { g.acquire(tier); }
                     true
                 });
-            Ok(self.tok.decode(&out))
+            let text = tok.decode(&out);
+            sink(out.len(), &text);
+            Ok(text)
         }
 
-        fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, String> {
-            let ids = self.tok.encode(prompt);
-            let mut rng = 0xC0FFEE_u64;
-            let mut out: Vec<u32> = Vec::new();
-            if let Some(g) = &self.governor { g.acquire(self.tier); }
-            let (gov, tier) = (self.governor.clone(), self.tier);
-            self.gpu.generate_kv_stream(
-                &self.model,
-                &ids,
-                max_tokens,
-                self.eos,
-                &self.sampler,
-                &mut rng,
-                &|| false,
-                |t| {
-                    if self.stops.contains(&t) { return false; }
-                    out.push(t);
-                    if let Some(g) = &gov { g.acquire(tier); }
-                    true
-                },
-            );
-            Ok(self.tok.decode(&out))
-        }
     }
 }
 

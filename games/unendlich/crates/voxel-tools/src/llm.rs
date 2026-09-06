@@ -23,10 +23,46 @@
 /// `Backend` is already `Send + Sync`, a subprocess handle is Send, and
 /// a TcpStream is Send. The compiler asked for this the moment the work
 /// moved off-thread.
+/// Live control of a turn in flight: a cancel flag the generator
+/// checks between steps, and a progress slot it updates so the chat
+/// can show tokens and rate during a wait that may be minutes long.
+#[derive(Debug, Default)]
+pub struct TurnControl {
+    pub cancel: std::sync::atomic::AtomicBool,
+    /// (tokens so far, text so far). Replaced whole each update, so a
+    /// reader never sees a torn string.
+    pub progress: std::sync::Mutex<(usize, String)>,
+}
+
+impl TurnControl {
+    pub fn cancelled(&self) -> bool { self.cancel.load(std::sync::atomic::Ordering::Relaxed) }
+    pub fn cancel(&self) { self.cancel.store(true, std::sync::atomic::Ordering::Relaxed); }
+    pub fn report(&self, tokens: usize, text: &str) {
+        if let Ok(mut p) = self.progress.lock() { *p = (tokens, text.to_string()); }
+    }
+    pub fn snapshot(&self) -> (usize, String) {
+        self.progress.lock().map(|p| p.clone()).unwrap_or_default()
+    }
+}
+
 pub trait Completer: Send {
     fn name(&self) -> &str { "completer" }
     /// Blocking. Call it off the frame thread.
     fn complete(&mut self, system: &str, user: &str) -> Result<String, String>;
+
+    /// `complete` with live control. The default ignores the control
+    /// and reports once at the end -- correct for a provider that
+    /// cannot stream. A provider that can should check `ctl.cancelled()`
+    /// between steps and `ctl.report()` as text arrives, so /cancel
+    /// actually stops the GPU rather than letting it finish a reply
+    /// nobody will read.
+    fn complete_with(&mut self, system: &str, user: &str, ctl: &TurnControl)
+        -> Result<String, String> {
+        let r = self.complete(system, user);
+        if let Ok(t) = &r { ctl.report(t.split_whitespace().count(), t); }
+        if ctl.cancelled() { return Err("cancelled".into()); }
+        r
+    }
 }
 
 /// Any executable is a model.

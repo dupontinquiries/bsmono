@@ -46,6 +46,8 @@ pub struct ChatPanelState<'a> {
     pub char_ages: &'a [f32],
     /// Wall-clock seconds, for the cursor blink.
     pub now: f64,
+    /// Live progress of a model turn: tokens, rate, lines so far.
+    pub status: Option<&'a str>,
 }
 
 /// What the player did. The renderer turns these into engine calls.
@@ -99,6 +101,12 @@ pub fn chat_panel_body(ui: &mut egui::Ui, s: &ChatPanelState<'_>) -> ChatPanelOu
     });
     ui.separator();
 
+    // ── turn in flight ───────────────────────────────────────────
+    if let Some(st) = s.status {
+        ui.label(egui::RichText::new(st).small().color(egui::Color32::from_rgb(255, 200, 90)));
+        // keep it moving while a turn runs
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+    }
     // ── log tail ─────────────────────────────────────────────────
     let start = s.log.len().saturating_sub(LOG_LINES);
     egui::ScrollArea::vertical()
@@ -128,7 +136,27 @@ pub fn chat_panel_body(ui: &mut egui::Ui, s: &ChatPanelState<'_>) -> ChatPanelOu
         // the way a placed block lands. In the voxel font, which is what
         // makes it read as this game rather than a terminal.
         let base = 15.0;
-        for (i, ch) in s.buffer.chars().enumerate() {
+        // One label per character is what the pop-in needs, and it is
+        // fine for the eighty characters anyone types. A pasted plan is
+        // two thousand, and two thousand labels a frame is a stutter
+        // of its own. Everything but the tail is ONE label; only the
+        // last few dozen characters, the ones that can still be
+        // settling, get their own.
+        const TAIL: usize = 48;
+        let total = s.buffer.chars().count();
+        let head_len = total.saturating_sub(TAIL);
+        if head_len > 0 {
+            let head: String = s.buffer.chars().take(head_len).collect();
+            let mut text = egui::RichText::new(head.clone()).size(base)
+                .color(egui::Color32::from_rgb(255, 240, 210));
+            #[cfg(feature = "unendlich-ui")]
+            { text = if head.chars().all(voxel_font_has) { text.font(unendlich_ui::menu::blocks_font(base)) }
+                     else { text.monospace() }; }
+            #[cfg(not(feature = "unendlich-ui"))]
+            { text = text.monospace(); }
+            ui.label(text);
+        }
+        for (i, ch) in s.buffer.chars().enumerate().skip(head_len) {
             let age = s.char_ages.get(i).copied().unwrap_or(1.0);
             let t = (age / 0.12).clamp(0.0, 1.0);
             let ease = 1.0 - (1.0 - t) * (1.0 - t);          // ease-out
@@ -196,7 +224,7 @@ mod tests {
     fn state<'a>(buffer: &'a str, log: &'a [String]) -> ChatPanelState<'a> {
         ChatPanelState {
             buffer, log, card: None, matches: &[], focus_hint: None,
-            pending_blocks: None, model: None, char_ages: &[], now: 0.0,
+            pending_blocks: None, model: None, char_ages: &[], now: 0.0, status: None,
         }
     }
 
@@ -334,5 +362,24 @@ mod tests {
         for c in ['_', '@', '=', ',', '#', '[', ']', '{', '}', '<', '>'] {
             assert!(!voxel_font_has(c), "{c:?} must fall back to monospace");
         }
+    }
+
+    #[test]
+    fn a_turn_in_flight_shows_its_progress() {
+        let log: Vec<String> = Vec::new();
+        let mut st = state("", &log);
+        st.status = Some("wgpu: 87 tokens, 4.2 tok/s, 3 line(s) so far -- /cancel to stop");
+        let (_, full) = run(&st);
+        assert!(collect_text(&full).contains("87 tokens"));
+    }
+
+    #[test]
+    fn a_long_buffer_is_not_a_label_per_character() {
+        let log: Vec<String> = Vec::new();
+        let long: String = "cylinder @0,0 r=3 h=9 block=stone\n".repeat(40);
+        let (_, full) = run(&state(&long, &log));
+        let labels = full.shapes.iter().filter(|p| matches!(&p.shape, egui::epaint::Shape::Text(_))).count();
+        assert!(labels < 120, "{labels} text shapes for {} chars", long.len());
+        assert!(collect_text(&full).contains("cylinder"), "and the text is still there");
     }
 }

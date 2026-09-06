@@ -34,7 +34,7 @@ mod log {
 compile_error!("feature `ai-gpu` requires `ai-engine`; ai-gpu should list it");
 
 
-use crate::stubs::{AnimProfile, Command, FocusAdjust};
+use crate::stubs::{AnimProfile, Command, FocusAdjust, LandOp};
 use crate::stubs::parse as parse_command;
 use crate::bind::{flush, WorldView};
 use crate::stubs::ChunkManager;
@@ -273,6 +273,8 @@ pub struct PendingTurn {
     pub prose: String,
     /// What to do with the reply when it lands.
     pub kind: TurnKind,
+    /// Cancel flag and live progress, shared with the worker.
+    pub ctl: std::sync::Arc<voxel_tools::llm::TurnControl>,
 }
 
 /// The kinds of model turn, so the reply is routed without the bin
@@ -332,6 +334,20 @@ impl voxel_tools::llm::Completer for EngineCompleter {
         // the system half as a stable, cacheable prefix and stops at the
         // model's end-of-turn token.
         inner.generate_chat(system, user, self.max_tokens)
+    }
+
+    fn complete_with(&mut self, system: &str, user: &str,
+                     ctl: &voxel_tools::llm::TurnControl) -> Result<String, String> {
+        let inner = {
+            let mut eng = self.engine.lock().map_err(|_| "engine lock poisoned".to_string())?;
+            eng.ensure(&self.path, self.max_tokens)?
+        };
+        // Cancel reaches the decode loop between steps; progress leaves
+        // it every few tokens. This is what makes /cancel stop the GPU
+        // rather than let it finish a reply nobody will read.
+        inner.generate_chat_streaming(system, user, self.max_tokens,
+                                      &|| ctl.cancelled(),
+                                      &mut |n, text| ctl.report(n, text))
     }
 }
 
@@ -423,6 +439,16 @@ pub struct Paintbrush {
     pub provider: ProviderChoice,
     /// Claims, ownership and build history; saved with the world.
     pub land: voxel_tools::land::Registry,
+    /// Templates the player captured; saved with the world.
+    pub library: voxel_tools::template::Library,
+    /// The world tree: every commit, branches, merges; saved with the world.
+    pub repo: voxel_tools::vcs::Repo,
+    /// Set by anything that changes land, library or repo; the bin
+    /// saves when it sees it.
+    pub state_dirty: bool,
+    /// Who is building, for claims and commits. The bin sets it from
+    /// the profile; "player" until then.
+    pub player: String,
     /// Living plants a committed plan asked the engine to register.
     /// The bin drains these into the flora store each frame; from then
     /// on the lifecycle owns them and the builder's bred genome is
@@ -491,6 +517,10 @@ impl Paintbrush {
             in_flight: None,
             drone: None,
             land: voxel_tools::land::Registry::new(),
+            library: voxel_tools::template::Library::new(),
+            repo: voxel_tools::vcs::Repo::new(chunk_size),
+            state_dirty: false,
+            player: "player".into(),
             pending_plants: Vec::new(),
             comb: voxel_tools::hive::Comb::new(chunk_size),
             queen: voxel_tools::hive::Queen::new(voxel_tools::hive::Budget::default()),
@@ -748,6 +778,50 @@ impl Paintbrush {
                 }
                 Pending::None
             }
+            Command::Land(op) => {
+                use crate::stubs::LandOp;
+                match op {
+                    LandOp::Here => {
+                        let (x, z) = (gaze.eye.0 as i32, gaze.eye.2 as i32);
+                        // Collect the text first: `at` borrows the registry
+                        // and `say` needs the whole paintbrush.
+                        let lines: Vec<String> = self.land.at(x, z, 8).iter().map(|w| w.summary()).collect();
+                        if lines.is_empty() {
+                            self.say(format!("no claims here ({} in the world); /land claim <name> \
+                                              claims your last build", self.land.len()));
+                        } else {
+                            for l in lines { self.say(l); }
+                        }
+                    }
+                    LandOp::Info(id) => {
+                        let found = self.land.get(&id).map(|w| (w.summary(), w.history_for_prompt(6)));
+                        match found {
+                            Some((a, b)) => { self.say(a); self.say(b); }
+                            None => self.say(format!("no workset '{id}'")),
+                        }
+                    }
+                    LandOp::Add { id, player } => {
+                        let actor = self.player.clone();
+                        match self.land.add_member(&id, &actor, &player) {
+                            Ok(()) => { self.say(format!("{player} may now build on {id}")); self.state_dirty = true; }
+                            Err(e) => self.say(e),
+                        }
+                    }
+                    LandOp::Claim(name) => match self.session.last_build.as_ref() {
+                        Some(lb) => {
+                            let id = self.land.claim(&name, &self.player, lb.min, lb.max);
+                            let ir = self.session.last_ir.clone();
+                            self.land.record(&id, voxel_tools::land::Turn {
+                                player: self.player.clone(), prose: self.session.last_prose.clone(),
+                                ir, blocks: 0 }, lb.min, lb.max);
+                            self.state_dirty = true;
+                            self.say(format!("claimed {id} \"{name}\" at {:?}..{:?}", lb.min, lb.max));
+                        }
+                        None => self.say("nothing to claim -- build something first"),
+                    },
+                }
+                Pending::None
+            }
             Command::Keys => {
                 for c in voxel_tools::chatbox::CARDS {
                     if c.command == "/keys" { self.say(c.summary.replace(" · ", "\n  ")); }
@@ -931,6 +1005,16 @@ impl Paintbrush {
     /// 10,338 chars going to a 1B because the choice was by context
     /// alone and `ctx_tokens` was a constant that never crossed the
     /// threshold. Size comes from the registry, ctx from the load.
+    fn prompt_tier(&self) -> voxel_tools::prompt::Tier {
+        let (params, ctx) = match &self.models.state {
+            voxel_tools::model::LoadState::Loaded { name, ctx, .. } => (
+                self.models.resolve(name).ok().map(|m| m.params_billions).filter(|b| *b > 0.0),
+                *ctx as usize),
+            _ => (None, self.ctx_tokens),
+        };
+        voxel_tools::prompt::tier_for(params, ctx)
+    }
+
     fn system_prompt(&self) -> String {
         let (params, ctx) = match &self.models.state {
             voxel_tools::model::LoadState::Loaded { name, ctx, .. } => (
@@ -957,6 +1041,8 @@ impl Paintbrush {
                    system.len(), self.ctx_tokens);
         self.say(format!("asking {name} ... (the world keeps running)"));
         let (tx, rx) = std::sync::mpsc::channel();
+        let ctl = std::sync::Arc::new(voxel_tools::llm::TurnControl::default());
+        let ctl_w = ctl.clone();
         std::thread::spawn(move || {
             // Same treatment as the chunk loaders: deprioritised and, on
             // a heterogeneous SoC, pinned to the efficiency cores. The
@@ -967,15 +1053,23 @@ impl Paintbrush {
             // The user prompt is built here, on the worker.
             let user = user();
             log::info!("[paintbrush] user prompt {} chars", user.len());
-            let r = completer.complete(&system, &user);
+            let r = completer.complete_with(&system, &user, &ctl_w);
             // A closed receiver means the turn was cancelled; nothing to
             // report and nobody to report to.
             let _ = tx.send(r);
         });
         self.in_flight = Some(PendingTurn {
             rx, started: Instant::now(), provider: name, gaze: *gaze, player_feet,
-            prose: prose.to_string(), kind,
+            prose: prose.to_string(), kind, ctl,
         });
+    }
+
+    /// Test hook: start a build turn with a given completer and a fixed
+    /// prompt, so a harness can drive cancel and progress without a
+    /// provider script.
+    pub fn spawn_turn_for_test(&mut self, completer: Box<dyn voxel_tools::llm::Completer>, gaze: &Gaze) {
+        self.spawn_turn(completer, "system".into(), Box::new(|| "user".into()), gaze, None, "test",
+                        TurnKind::Build);
     }
 
     /// Start a repair turn: the model is asked to fix only the lines it
@@ -1040,8 +1134,12 @@ impl Paintbrush {
     pub fn cancel_turn(&mut self) -> bool {
         match self.in_flight.take() {
             Some(t) => {
-                self.say(format!("cancelled after {:.0}s (the worker finishes in the \
-                                  background and its answer is dropped)",
+                // The flag reaches the decode loop between steps: the GPU
+                // stops within one token. Before this the worker ran the
+                // whole reply out, minutes of paced GPU for nothing.
+                t.ctl.cancel();
+                let (n, _) = t.ctl.snapshot();
+                self.say(format!("cancelled after {:.0}s and {n} tokens; generation stops",
                                  t.elapsed().as_secs_f32()));
                 true
             }
@@ -1128,7 +1226,15 @@ impl Paintbrush {
             self.say(format!("loading {path} into the GPU on the worker (once) ..."));
         }
         // No load here. The completer loads on the worker when it runs.
-        Some(Box::new(EngineCompleter { engine: self.engine.clone(), path, max_tokens: 512 }))
+        // The reply cap follows the prompt tier: a 1B that runs long is
+        // looping, a 70B village needs the room. 512 flat cut an 8B's
+        // hut off mid-plan.
+        let max_tokens = match self.prompt_tier() {
+            voxel_tools::prompt::Tier::Compact => 400,
+            voxel_tools::prompt::Tier::Medium => 900,
+            voxel_tools::prompt::Tier::Full => 1400,
+        };
+        Some(Box::new(EngineCompleter { engine: self.engine.clone(), path, max_tokens }))
     }
 
     #[cfg(not(feature = "ai-engine"))]
@@ -1168,6 +1274,26 @@ impl Paintbrush {
         let touched = staged.chunks_touched(self.chunk_size);
         let n = staged.pending();
         log::info!("[paintbrush] commit: {n} blocks across {touched} chunk(s)");
+        if n > 0 {
+            // THE WORLD TREE: every commit is a commit, with its IR and
+            // anchor, so it can be branched, merged and rebased later.
+            // And the workset journal, when the build is inside a claim,
+            // so "make this larger" has the original request to read.
+            let changes = staged.snapshot();
+            if let Some(lb) = self.session.last_build.as_ref() {
+                let ir = self.session.last_ir.clone();
+                let anchor = (lb.min.0, lb.min.2);
+                self.repo.commit_changes_at(&self.player, &lb.name, &ir, anchor, &changes);
+                let cx = (lb.min.0 + lb.max.0) / 2;
+                let cz = (lb.min.2 + lb.max.2) / 2;
+                if let Some(ws) = self.land.at(cx, cz, 0).first().map(|w| w.id.clone()) {
+                    self.land.record(&ws, voxel_tools::land::Turn {
+                        player: self.player.clone(), prose: self.session.last_prose.clone(),
+                        ir, blocks: n }, lb.min, lb.max);
+                }
+                self.state_dirty = true;
+            }
+        }
         self.flush_staged(cm, &mut staged);
         if n > 0 {
             self.reveal = self.session.reveal(25);
@@ -1260,6 +1386,55 @@ impl Paintbrush {
         if !deferred.is_empty() { self.session.deferred.cells.extend(deferred); }
         if t.cells > 0 { self.session.invalidate_context(); }
         t
+    }
+
+    /// Load claims, templates and the world tree from the world folder.
+    /// Missing files are an empty state, not an error: a world made
+    /// before this existed has nothing to load.
+    pub fn load_state(&mut self, world_root: &std::path::Path) {
+        let dir = world_root.join("paintbrush");
+        if let Ok(t) = std::fs::read_to_string(dir.join("land.txt")) {
+            self.land = voxel_tools::land::Registry::load(&t);
+        }
+        if let Ok(t) = std::fs::read_to_string(dir.join("templates.txt")) {
+            self.library = voxel_tools::template::Library::load(&t);
+        }
+        if let Ok(t) = std::fs::read_to_string(dir.join("worldtree.txt")) {
+            self.repo = voxel_tools::vcs::Repo::load(&t);
+        }
+        log::info!("[paintbrush] loaded {} claim(s), {} template(s), {} branch(es) from {}",
+                   self.land.len(), self.library.len(), self.repo.branches().count(), dir.display());
+        self.state_dirty = false;
+    }
+
+    /// Save them. Called by the bin when `state_dirty` is set -- after a
+    /// commit, a claim, a capture -- so a crash loses at most the last
+    /// action. Small files; a write is cheap.
+    pub fn save_state(&mut self, world_root: &std::path::Path) -> std::io::Result<()> {
+        if !self.state_dirty { return Ok(()); }
+        let dir = world_root.join("paintbrush");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("land.txt"), self.land.save())?;
+        std::fs::write(dir.join("templates.txt"), self.library.save())?;
+        std::fs::write(dir.join("worldtree.txt"), self.repo.save())?;
+        self.state_dirty = false;
+        Ok(())
+    }
+
+    /// One line for the HUD while a turn is in flight: tokens, rate,
+    /// and lines of plan so far. None when idle. A 200-second wait with
+    /// no feedback reads as a hang; this is the difference.
+    pub fn status_line(&self) -> Option<String> {
+        let t = self.in_flight.as_ref()?;
+        let (n, text) = t.ctl.snapshot();
+        let secs = t.elapsed().as_secs_f32().max(0.1);
+        let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
+        Some(if n == 0 {
+            format!("{}: thinking ... {secs:.0}s", t.provider)
+        } else {
+            format!("{}: {n} tokens, {:.1} tok/s, {lines} line(s) so far -- /cancel to stop",
+                    t.provider, n as f32 / secs)
+        })
     }
 
     /// The pending plan's landing spot for the renderer's marker:
