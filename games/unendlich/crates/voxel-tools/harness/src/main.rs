@@ -37,6 +37,7 @@ fn main() {
     referent_scenario();
     bare_words_scenario();
     review_scenario();
+    long_run_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -864,12 +865,14 @@ fn review_scenario() {
     let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let cm = stubs::ChunkManager::new();
     let mut pb = Paintbrush::new(32);
-    pb.review_rounds = 2;
+    // three rounds: plan, a review that changes it, a review that says
+    // done. `review_rounds` is the RUN's limit, and the plan is round one.
+    pb.review_rounds = 3;
     let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
     pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(Scripted { calls: calls.clone() }))));
     pb.start_turn(&cm, &gaze, Some("grass"), "a hall", None);
     let t0 = std::time::Instant::now();
-    while (pb.in_flight.is_some() || pb.drone.is_some() || pb.review_owed() > 0) && t0.elapsed().as_secs() < 20 {
+    while pb.run.as_ref().map(|r| r.is_running()).unwrap_or(false) && t0.elapsed().as_secs() < 20 {
         pb.poll_turn(&cm); pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(5));
     }
     let log = pb.drain_log();
@@ -883,4 +886,58 @@ fn review_scenario() {
     let wp = pb.waypoint().expect("a plan still pending");
     println!("  after the loop: {} blocks pending; last log: {}", wp.2, log.last().unwrap().trim());
     assert!(log.iter().any(|l| l.contains("done")), "{log:?}");
+}
+
+
+/// A dozen rounds: the run converges, the marker shows progress and a
+/// failure, and the blob has shape before anything is committed.
+fn long_run_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== a long run");
+    struct Rounds { n: std::sync::Arc<std::sync::atomic::AtomicUsize> }
+    impl voxel_tools::llm::Completer for Rounds {
+        fn name(&self) -> &str { "rounds" }
+        fn complete(&mut self, _: &str, _: &str) -> Result<String, String> {
+            let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(match i {
+                0 => "spec height=8-12 durability=high\nenclose @-6,-6 @6,6 h=6 block=stone\n".into(),
+                1 => "add roof @-6,-6 @6,6 gable block=dark_oak_planks\n".into(),
+                2 => "add zigurat @0,0\n".into(),          // a bad line: ignored by the parser
+                3 => "add cylinder @-8,-8 r=2 h=9 block=stone\n".into(),
+                4 => "add cylinder @8,8 r=2 h=9 block=stone\n".into(),
+                _ => "done\n".into(),
+            })
+        }
+    }
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    pb.review_rounds = 12;
+    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(Rounds { n: n.clone() }))));
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    pb.start_turn(&cm, &gaze, Some("grass"), "a stone keep", None);
+    let t0 = std::time::Instant::now();
+    let mut statuses: Vec<String> = Vec::new();
+    // the run is the condition: a round may be between its review and
+    // its drone, with neither in flight for an instant
+    while pb.run.as_ref().map(|r| r.is_running()).unwrap_or(false) && t0.elapsed().as_secs() < 60 {
+        pb.poll_turn(&cm); pb.poll_drone();
+        if let Some((s, blob)) = pb.waypoint_progress() {
+            if statuses.last() != Some(&s) { statuses.push(s.clone()); let _ = blob; }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    let run = pb.run.as_ref().expect("a run");
+    println!("  {} model calls, {} rounds, phase {:?}", n.load(std::sync::atomic::Ordering::Relaxed),
+             run.round_no(), run.phase);
+    for l in run.log_lines(8) { println!("  {l}"); }
+    let (status, blob) = pb.waypoint_progress().unwrap();
+    println!("  marker: {status}");
+    println!("  blob: {} boxes", blob.len());
+    assert!(run.round_no() >= 4, "several rounds ran");
+    assert_eq!(run.phase, voxel_tools::session::Phase::Converged, "it converged on 'done'");
+    assert!(statuses.iter().any(|s| s.starts_with("round ")), "the marker showed progress: {statuses:?}");
+    assert!(!blob.is_empty(), "the shape is visible before commit");
+    println!("  distances: {:?}", run.rounds.iter().map(|r| r.distance).collect::<Vec<_>>());
+    assert!(run.rounds.iter().any(|r| r.distance.is_some()), "the spec distance was tracked");
 }

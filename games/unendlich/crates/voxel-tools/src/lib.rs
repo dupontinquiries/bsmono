@@ -121,6 +121,10 @@ pub mod latent;
 pub mod recipe;
 /// The review loop: elevations and measurements to the model, a ten-token verdict back.
 pub mod review;
+/// Context under a budget: the conversation chain, folding into summaries, grouped plans.
+pub mod context;
+/// A long build: dozens of rounds, convergence, and status for the marker.
+pub mod session;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.

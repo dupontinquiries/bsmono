@@ -157,6 +157,9 @@ pub struct ChatSession {
     /// A spec line from `/like`, prepended to the next plan received so
     /// the tuner targets it. Consumed by that plan.
     pub pending_spec: Option<String>,
+    /// The last plan's fatal error, if it had one: what to show on the
+    /// marker when a round fails.
+    pub last_plan_error: Option<String>,
     /// Elite decorator genomes for the session: a second gothic wall
     /// starts where the first finished. Lent to the tools around every
     /// run and taken back after; the host copies it back from a drone.
@@ -203,7 +206,7 @@ impl ChatSession {
     pub fn new(chunk_size: i32, from_y: i32) -> Self {
         Self { budget: 200_000, chunk_size, from_y, profile: Profile::GroundUp,
                climate: (0.5, 0.5), sea_level: 64, scene_radius: 24, two_pass: false,
-               refine_seed: 1, creative_seed: 1,
+               refine_seed: 1, creative_seed: 1, last_plan_error: None,
                ..Default::default() }
     }
 
@@ -730,6 +733,8 @@ impl ChatSession {
         for w in &dry.withdrawn {
             echo.push_str(&format!("\nWITHDRAWN: {}", w.message()));
         }
+        self.last_plan_error = issues.iter().find(|i| i.severity == Severity::Error)
+            .map(|i| i.message.clone());
         if let Some(r) = &recognized_why { echo.push_str(&format!("\n{r}")); }
         for w in &finishing_why {
             echo.push_str(&format!("\nFINISHING ({w})"));
@@ -754,6 +759,24 @@ impl ChatSession {
             },
         });
         Reply::Preview { echo, blocks: dry.blocks_changed, feature_id: f.feature_id }
+    }
+
+    /// The pending plan's numbers for a run's round: blocks, ops, box,
+    /// and the placed cells (for the marker's blob).
+    pub fn pending_detail(&self) -> Option<(usize, usize, Option<((i32, i32, i32), (i32, i32, i32))>, Vec<(i32, i32, i32)>)> {
+        let p = self.pending.as_ref()?;
+        Some((p.predicted_blocks, p.plan.ops.iter().filter(|o| !matches!(o, Op::Spec(_))).count(),
+              p.bounds, p.placed.clone()))
+    }
+
+    /// How far the pending plan is from its own spec, if it has one.
+    pub fn pending_spec_distance(&self) -> Option<f32> {
+        let p = self.pending.as_ref()?;
+        let line = p.plan.ops.iter().find_map(|o| match o { Op::Spec(s) => Some(s.clone()), _ => None })?;
+        let spec = crate::spec::Spec::parse(&line).ok()?;
+        let cells: std::collections::BTreeSet<(i32, i32, i32)> = p.placed.iter().copied().collect();
+        let ground = p.plan.anchor.map(|a| a.1 - 1).unwrap_or(63);
+        Some(crate::spec::distance(&spec, &crate::spec::measure(&cells, ground)))
     }
 
     /// Where the pending plan will land, for a marker in the world.

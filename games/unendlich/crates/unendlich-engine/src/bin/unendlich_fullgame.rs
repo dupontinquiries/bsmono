@@ -4515,6 +4515,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             renderer.chat_char_ages = paintbrush.chatbox.char_ages();
             renderer.chat_waypoint = paintbrush.waypoint();
             renderer.chat_status = paintbrush.status_line();
+            renderer.chat_blob = paintbrush.waypoint_progress();
             // A claim, a capture or a commit marks the state dirty; save
             // it now, so a crash loses at most the last action.
             if paintbrush.state_dirty {

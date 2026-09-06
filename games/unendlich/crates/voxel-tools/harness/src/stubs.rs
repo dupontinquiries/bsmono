@@ -54,7 +54,7 @@ pub enum AnimProfile { GroundUp, Physics, Random, Instant }
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Command {
     Build(String), BuildVoice(bool), ShowPlan, CommitPlan, UndoBuild,
-    Focus(Option<FocusAdjust>), Anim(AnimProfile), Model(Option<String>), Keys, Cancel, Repair, Land(LandOp), Hive, Refine(Option<String>), Deferred { drop: bool }, Provider(Option<String>), Shot { kind: String, id: Option<String> }, Branch(Option<String>), Switch(String), Merge(String), Like(String), Review, Unknown,
+    Focus(Option<FocusAdjust>), Anim(AnimProfile), Model(Option<String>), Keys, Cancel, Repair, Land(LandOp), Hive, Refine(Option<String>), Deferred { drop: bool }, Provider(Option<String>), Shot { kind: String, id: Option<String> }, Branch(Option<String>), Switch(String), Merge(String), Like(String), Review, Rounds(Option<usize>), Unknown,
 }
 pub fn parse(line: &str) -> Command {
     let t = line.trim();

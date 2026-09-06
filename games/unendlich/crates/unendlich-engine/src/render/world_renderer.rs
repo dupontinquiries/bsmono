@@ -543,6 +543,10 @@ pub struct WorldRenderer {
     pub chat_waypoint: Option<(String, [f32; 3], usize)>,
     /// Live progress of a model turn, or None when idle.
     pub chat_status: Option<String>,
+    /// A long build in progress: the marker's status line and the
+    /// shape so far as coarse world boxes, drawn as a translucent
+    /// ghost before anything is committed.
+    pub chat_blob: Option<(String, Vec<((i32, i32, i32), (i32, i32, i32))>)>,
     /// Clicks that collapsed into one frame (press+release same frame);
     /// forwarded to egui as discrete press/release pairs so fast / low-fps
     /// clicks still register on toggles.
@@ -1701,6 +1705,7 @@ impl WorldRenderer {
             chat_char_ages: Vec::new(),
             chat_waypoint: None,
             chat_status: None,
+            chat_blob: None,
             ui_backspace: false,
             ui_enter: false,
             ui_wants_keyboard: false,
@@ -4909,7 +4914,10 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                     let eye = view.position;
                     let dist = ((wp[0] - eye.x).powi(2) + (wp[1] - eye.y).powi(2)
                                 + (wp[2] - eye.z).powi(2)).sqrt();
-                    let label = format!("{name} -- {blocks} blocks, {dist:.0} m -- /commit");
+                    let label = match &self.chat_blob {
+                        Some((status, _)) => format!("{name} -- {status}"),
+                        None => format!("{name} -- {blocks} blocks, {dist:.0} m -- /commit"),
+                    };
                     let col = egui::Color32::from_rgb(255, 200, 90);
                     // In front of the camera and inside the frustum: draw at
                     // the projected point. The Y flip is already in the
@@ -4955,6 +4963,40 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                             ui.label(egui::RichText::new(label).small().color(col)
                                      .background_color(egui::Color32::from_black_alpha(160)));
                         });
+                }
+                // ── the build's ghost: coarse boxes of what is planned
+                // but not yet committed, so a fifteen-minute build is
+                // visible taking shape rather than being fifteen
+                // minutes of nothing.
+                if let Some((_, boxes)) = &self.chat_blob {
+                    if !boxes.is_empty() {
+                        let vp = view.view_projection(aspect);
+                        let screen = c.screen_rect();
+                        let painter = c.layer_painter(egui::LayerId::new(
+                            egui::Order::Background, egui::Id::new("unendlich_blob")));
+                        let ghost = egui::Color32::from_rgba_unmultiplied(255, 200, 90, 40);
+                        for (lo, hi) in boxes.iter().take(64) {
+                            // the box's eight corners, projected; drawn as
+                            // its screen-space bounding rect, which is
+                            // cheap and reads as mass at a distance
+                            let mut min = egui::pos2(f32::MAX, f32::MAX);
+                            let mut max = egui::pos2(f32::MIN, f32::MIN);
+                            let mut behind = false;
+                            for &(x, y, z) in &[(lo.0, lo.1, lo.2), (hi.0 + 1, lo.1, lo.2), (lo.0, hi.1 + 1, lo.2),
+                                                (hi.0 + 1, hi.1 + 1, lo.2), (lo.0, lo.1, hi.2 + 1), (hi.0 + 1, lo.1, hi.2 + 1),
+                                                (lo.0, hi.1 + 1, hi.2 + 1), (hi.0 + 1, hi.1 + 1, hi.2 + 1)] {
+                                let p = vp * glm::vec4(x as f32, y as f32, z as f32, 1.0);
+                                if p.w <= 0.0 { behind = true; break; }
+                                let sp = egui::pos2((p.x / p.w + 1.0) * 0.5 * screen.width(),
+                                                    (p.y / p.w + 1.0) * 0.5 * screen.height());
+                                min = egui::pos2(min.x.min(sp.x), min.y.min(sp.y));
+                                max = egui::pos2(max.x.max(sp.x), max.y.max(sp.y));
+                            }
+                            if behind { continue; }
+                            let rect = egui::Rect::from_min_max(min, max);
+                            if rect.intersects(screen) { painter.rect_filled(rect, 1.0, ghost); }
+                        }
+                    }
                 }
                 // ── HUD (top-left) ──
                 egui::Area::new(egui::Id::new("unendlich_hud"))

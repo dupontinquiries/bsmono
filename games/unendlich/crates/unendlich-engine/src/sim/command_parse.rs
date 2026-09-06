@@ -154,6 +154,8 @@ pub enum Command {
     Like(String),
     /// `/review` — one review round on the pending plan.
     Review,
+    /// `/rounds [n]` — how many review rounds a build runs.
+    Rounds(Option<usize>),
     /// `/refine [rung|all]` — small detail passes over the last build.
     /// No argument lists them.
     Refine(Option<String>),
@@ -295,6 +297,11 @@ pub fn parse(line: &str) -> Command {
         "/merge" => match args.as_slice() { [] => Command::Unknown, n => Command::Merge(n.join(" ")) },
         "/like" => match args.as_slice() { [] => Command::Unknown, n => Command::Like(n.join(" ")) },
         "/review" => if args.is_empty() { Command::Review } else { Command::Unknown },
+        "/rounds" => match args.as_slice() {
+            [] => Command::Rounds(None),
+            [n] => match n.parse::<usize>() { Ok(v) if v <= 200 => Command::Rounds(Some(v)), _ => Command::Unknown },
+            _ => Command::Unknown,
+        },
         "/refine" => match args.as_slice() {
             [] => Command::Refine(None),
             [r] => Command::Refine(Some(r.to_ascii_lowercase())),
@@ -478,6 +485,8 @@ impl Command {
             Command::Merge(n) => Some(format!("/merge {n}")),
             Command::Like(n) => Some(format!("/like {n}")),
             Command::Review => Some("/review".to_string()),
+            Command::Rounds(None) => Some("/rounds".to_string()),
+            Command::Rounds(Some(n)) => Some(format!("/rounds {n}")),
             Command::Refine(None) => Some("/refine".to_string()),
             Command::Refine(Some(r)) => Some(format!("/refine {r}")),
             Command::Deferred { drop: false } => Some("/deferred".to_string()),

@@ -119,7 +119,14 @@ pub const COMPACT_BELOW_CTX: usize = 8192;
 /// on a short one. Context is the tie-break for models whose size is
 /// unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tier { Compact, Medium, Full }
+pub enum Tier { Tiny, Compact, Medium, Full }
+
+/// ~150 tokens: the model CHOOSES rather than writes. A form, a size
+/// word, a style, a spec line. Coordinates are what a 1B gets wrong;
+/// a choice from a list is what it gets right, and the dictionary,
+/// the finishing words, the recognizer and the tuner turn the choice
+/// into a building.
+pub const TINY_MAX_B: f32 = 2.2;
 
 /// ~200 tokens: the shape of a plan and the six ops a small model can
 /// hold. Below this size a model copies the example more than it reads
@@ -130,6 +137,7 @@ pub const MEDIUM_MAX_B: f32 = 13.0;
 
 pub fn tier_for(params_billions: Option<f32>, ctx: usize) -> Tier {
     match params_billions {
+        Some(b) if b > 0.0 && b <= TINY_MAX_B => Tier::Tiny,
         Some(b) if b > 0.0 && b <= COMPACT_MAX_B => Tier::Compact,
         Some(b) if b > 0.0 && b <= MEDIUM_MAX_B => Tier::Medium,
         Some(b) if b > MEDIUM_MAX_B => if ctx >= 8192 { Tier::Full } else { Tier::Medium },
@@ -143,10 +151,43 @@ pub fn tier_for(params_billions: Option<f32>, ctx: usize) -> Tier {
 /// should call; `system_prompt_for` is the context-only fallback.
 pub fn system_prompt_for_model(params_billions: Option<f32>, ctx: usize, max_reply: usize) -> String {
     match tier_for(params_billions, ctx) {
+        Tier::Tiny => tiny_prompt(),
         Tier::Compact => COMPACT.to_string(),
         Tier::Medium => medium_prompt(),
         Tier::Full => system_prompt_for(ctx.max(16384), max_reply),
     }
+}
+
+/// The recipe prompt for the smallest models: choose, don't draw.
+pub fn tiny_prompt() -> String {
+    format!("\
+You place a building by CHOOSING. Reply with two or three lines and nothing else:
+form NAME size=SIZE [style=STYLE]
+spec height=A-B durability=low|mid|high sound=echoing|muffled|airy shelter=low|mid|high
+mood MOOD size=SIZE          (optional)
+
+FORMS: {}
+SIZES: tiny, small, medium, large, huge
+STYLES: {}
+MOODS: eerie, haunted, cosy, fiery, frozen, ancient, sacred, lush
+Statue styles: figure, gargoyle, idol, obelisk, colossus; pose=standing|seated|arms_up|kneeling|lunge;
+hold=bolt|sword|staff|orb|shield; beard=1.
+
+EXAMPLE
+  player: a creepy stone statue
+form statue size=small style=gargoyle
+spec height=12-16 durability=high
+mood eerie size=medium
+
+EXAMPLE
+  player: a cosy village in the snow
+form village size=large style=nordic
+spec durability=mid shelter=high
+mood cosy size=large
+
+Reply with the lines only.",
+        crate::dict::FORMS.iter().map(|f| f.name).collect::<Vec<_>>().join(", "),
+        crate::style::STYLES.iter().map(|s| s.name).collect::<Vec<_>>().join(", "))
 }
 
 /// The middle prompt: a dozen ops, the forms, the world rule, three
@@ -638,7 +679,8 @@ mod tests {
 
     #[test]
     fn tiers_follow_parameter_count_first() {
-        assert_eq!(tier_for(Some(1.2), 16384), Tier::Compact, "a 1B with a big ctx is still a 1B");
+        assert_eq!(tier_for(Some(1.2), 16384), Tier::Tiny, "a 1B chooses rather than draws, whatever its ctx");
+        assert_eq!(tier_for(Some(3.0), 16384), Tier::Compact);
         assert_eq!(tier_for(Some(3.0), 8192), Tier::Compact);
         assert_eq!(tier_for(Some(8.0), 16384), Tier::Medium, "an 8B gets the middle prompt");
         assert_eq!(tier_for(Some(70.0), 32768), Tier::Full);
@@ -674,5 +716,23 @@ mod tests {
         let f = system_prompt_for_model(Some(70.0), 32768, 400).len();
         assert!(c < m && m < f, "{c} < {m} < {f}");
         assert!(c < 1500, "compact stays small: {c}");
+    }
+
+    #[test]
+    fn a_1b_gets_the_tiny_prompt_and_its_examples_parse() {
+        assert_eq!(tier_for(Some(1.0), 16384), Tier::Tiny, "a 1B chooses rather than draws");
+        assert_eq!(tier_for(Some(3.0), 8192), Tier::Compact);
+        let tp = tiny_prompt();
+        assert!(tp.len() < 1200, "{} chars", tp.len());
+        for ex in tp.split("EXAMPLE").skip(1) {
+            let body: String = ex.lines().skip_while(|l| l.trim().is_empty() || l.trim_start().starts_with("player:"))
+                .map(|l| l.trim())
+                .take_while(|l| !l.starts_with("Reply with") && !l.is_empty())
+                .map(|l| format!("{l}\n")).collect();
+            let (plan, issues) = crate::plan::parse_plan_at(&body, Some((0, 65, 0)));
+            assert!(issues.iter().all(|i| i.severity != crate::plan::Severity::Error), "{body}\n{issues:?}");
+            assert!(plan.ops.len() >= 2, "{body}");
+            for l in body.lines() { assert!(crate::plan::line_is_valid_ir(l), "the validator accepts {l:?}"); }
+        }
     }
 }

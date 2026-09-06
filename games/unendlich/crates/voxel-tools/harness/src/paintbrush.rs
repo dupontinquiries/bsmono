@@ -296,6 +296,8 @@ pub struct PendingTurn {
     pub ctl: std::sync::Arc<voxel_tools::llm::TurnControl>,
     /// Lines of the reply already previewed by a partial drone.
     pub previewed_lines: usize,
+    /// The user prompt as sent, so the exchange can join the chain.
+    pub user_sent: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 /// The kinds of model turn, so the reply is routed without the bin
@@ -355,6 +357,22 @@ impl voxel_tools::llm::Completer for EngineCompleter {
         // the system half as a stable, cacheable prefix and stops at the
         // model's end-of-turn token.
         inner.generate_chat(system, user, self.max_tokens)
+    }
+
+    fn complete_chain(&mut self, system: &str, prior: &[(String, String)], user: &str,
+                      ctl: &voxel_tools::llm::TurnControl) -> Result<String, String> {
+        let inner = {
+            let mut eng = self.engine.lock().map_err(|_| "engine lock poisoned".to_string())?;
+            eng.ensure(&self.path, self.max_tokens)?
+        };
+        // The chain: prior exchanges sit in the KV as checkpoints; only
+        // what is new is prefilled. Round five pays for round five.
+        let check = ctl.line_check.unwrap_or(|_| true);
+        let (text, retried) = inner.generate_chat_chain(system, prior, user, self.max_tokens,
+                                                        &|| ctl.cancelled(), &mut |n, t| ctl.report(n, t), &check)?;
+        ctl.retried.store(retried, std::sync::atomic::Ordering::Relaxed);
+        if retried > 0 { log::info!("[paintbrush] {retried} line(s) taken back and resampled"); }
+        Ok(text)
     }
 
     fn complete_with(&mut self, system: &str, user: &str,
@@ -487,6 +505,14 @@ pub struct Paintbrush {
     /// script the model. Shared, so every turn of a scripted session
     /// talks to the same script. None in the game.
     pub test_completer: Option<std::sync::Arc<std::sync::Mutex<Box<dyn voxel_tools::llm::Completer>>>>,
+    /// The last review's verdict, for the round it produced.
+    last_verdict: Option<String>,
+    /// The conversation for the current build: every exchange with the
+    /// model since the last /build, folded under the context budget.
+    /// A new /build starts a new chain; reviews and follow-ups extend
+    /// it, and with the in-instance engine each extension prefills
+    /// only itself.
+    pub chain: voxel_tools::context::Chain,
     /// THE REVIEW LOOP. After a build's preview lands, the model is
     /// shown what it made -- ops by number, spec, measurement, two
     /// elevations, the critique's findings -- and replies with a
@@ -497,6 +523,12 @@ pub struct Paintbrush {
     review_round: usize,
     /// Rounds still owed once the current drone lands.
     review_pending_after_drone: usize,
+    /// The long run in progress: dozens of rounds, convergence, and
+    /// the status the waypoint marker shows. None when idle.
+    pub run: Option<voxel_tools::session::Run>,
+    /// Limits for the next run. `/build` uses one round by default;
+    /// `/refine N` (or review_rounds) raises it.
+    pub run_limits: voxel_tools::session::Limits,
     /// The hive job of the last commit, so an undo can cancel what the
     /// queen has not yet placed.
     last_job: Option<u32>,
@@ -576,9 +608,13 @@ impl Paintbrush {
             latent: voxel_tools::latent::Index::new(),
             state_dirty: false,
             test_completer: None,
+            last_verdict: None,
+            chain: voxel_tools::context::Chain::default(),
             review_rounds: 1,
             review_round: 0,
             review_pending_after_drone: 0,
+            run: None,
+            run_limits: voxel_tools::session::Limits { max_rounds: 1, ..Default::default() },
             last_job: None,
             player: "player".into(),
             pending_plants: Vec::new(),
@@ -933,6 +969,20 @@ impl Paintbrush {
                 }
                 Pending::None
             }
+            Command::Rounds(n) => {
+                match n {
+                    None => self.say(format!("{} review round(s) per build; a long build is /rounds 30 \
+                                              (it may take many minutes -- the marker shows progress)",
+                                             self.review_rounds)),
+                    Some(v) => {
+                        self.review_rounds = v.max(1);
+                        self.run_limits.max_rounds = self.review_rounds;
+                        self.say(format!("builds will run up to {} round(s); the marker shows each one",
+                                         self.review_rounds));
+                    }
+                }
+                Pending::None
+            }
             Command::Review => {
                 self.review_pending_after_drone = 0;
                 self.start_review(gaze, None);
@@ -1122,17 +1172,59 @@ impl Paintbrush {
         // registry -- stays as it is now.
         self.session.pending = session.pending;
         self.session.last_salvage = session.last_salvage;
-        // what the dry run's evolutions learned comes back too
+        // what the dry run's evolutions learned comes back too, and
+        // the error the plan failed with -- the marker shows it
         self.session.archive = session.archive;
+        self.session.last_plan_error = session.last_plan_error;
         if let Some(n) = drone.partial {
             // Label the partial so the log reads as progress, not as a
             // finished plan; the model is still writing.
             self.say(format!("(partial preview: {n} line(s) so far -- the model is still writing)"));
         }
         for r in replies { self.push(r); }
-        if drone.partial.is_none() && self.review_pending_after_drone > 0 && self.in_flight.is_none() {
-            self.review_pending_after_drone -= 1;
+        if drone.partial.is_none() {
+            self.record_round(drone.started.elapsed());
+        }
+        if drone.partial.is_none() && self.review_pending_after_drone > 0 && self.in_flight.is_none()
+            && self.run.as_ref().map(|r| r.is_running()).unwrap_or(false) {
             self.start_review(&drone_gaze, drone_feet);
+        }
+    }
+
+    /// Record what the last drone produced as a round of the run, and
+    /// let the run decide whether to keep going. This is also where
+    /// the marker's blob and status come from.
+    fn record_round(&mut self, took: std::time::Duration) {
+        let Some(run) = self.run.as_mut() else { return };
+        if !run.is_running() { return; }
+        let n = run.round_no() + 1;
+        let (blocks, ops, bounds, placed) = match self.session.pending_detail() {
+            Some(d) => d,
+            None => (0, 0, None, Vec::new()),
+        };
+        let changed = run.rounds.last().map(|r| r.blocks != blocks || r.ops != ops).unwrap_or(true);
+        let error = self.session.last_plan_error.clone();
+        let distance = self.session.pending_spec_distance();
+        log::debug!("[paintbrush] round {n}: {blocks} blocks, {ops} ops, distance {distance:?}");
+        let verdict = self.last_verdict.take().unwrap_or_else(|| if n == 1 { "plan".into() } else { "review".into() });
+        run.bounds = bounds;
+        run.blob = voxel_tools::session::blob(&placed, 4, 48);
+        let phase = run.record(voxel_tools::session::Round { n, verdict, blocks, ops, distance, changed, error, took });
+        // Collect the text before saying it: `run` borrows self.
+        let lines = run.log_lines(1);
+        let status = run.status();
+        for l in lines { self.say(l); }
+        use voxel_tools::session::Phase;
+        match phase {
+            Phase::Converged | Phase::Stopped | Phase::Failed => {
+                self.review_pending_after_drone = 0;
+                self.say(status);
+            }
+            // The RUN decides whether another round happens, not a
+            // countdown: the countdown was set once from review_rounds
+            // and decremented per round, so a run of thirty stopped
+            // after two. `is_running()` is the whole condition.
+            _ => { self.review_pending_after_drone = 1; }
         }
     }
 
@@ -1162,9 +1254,27 @@ impl Paintbrush {
         let view = WorldView(cm);
         let mut staged = StagedWorld::new(&view);
         let mut tools = VoxelTools::new(&mut staged);
-        let (r, changed, review) = self.session.apply_review(&mut tools, gaze, raw, player_feet);
+        let (r, _changed, review) = self.session.apply_review(&mut tools, gaze, raw, player_feet);
+        let changed = _changed;
         log::info!("[paintbrush] review {}: {} ({} ignored line(s)){}", self.review_round, review.summary(),
                    review.ignored, if changed { " -> re-planned" } else { "" });
+        if let Some(e) = self.chain.exchanges.last_mut() {
+            e.outcome = format!("review {}: {}{}", self.review_round, review.summary(),
+                                if changed { ", re-planned" } else { "" });
+        }
+        self.last_verdict = Some(review.summary());
+        // A review re-plans SYNCHRONOUSLY here, on a staged world --
+        // there is no drone to wait for either way. So the round is
+        // recorded here in both cases, and the next round starts here.
+        // The first version recorded only unchanged rounds and waited
+        // for a drone that a changed one never produces: the run stalled
+        // at round two and sat there.
+        self.record_round(std::time::Duration::from_secs(0));
+        if self.review_pending_after_drone > 0 && self.in_flight.is_none()
+            && self.run.as_ref().map(|r| r.is_running()).unwrap_or(false) {
+            let (g, f) = (*gaze, player_feet);
+            self.start_review(&g, f);
+        }
         self.session.training.push(format!("review\t{}\t{}\t{}", self.review_round, review.summary(),
                                            raw.replace(['\t', '\n'], " ")));
         self.push(r);
@@ -1175,8 +1285,8 @@ impl Paintbrush {
         // a changed plan was re-planned synchronously above on a staged
         // world; the next round (if owed) starts from poll_drone's path
         // only after a drone -- so run one round's worth here directly
-        if changed && self.review_pending_after_drone > 0 && self.in_flight.is_none() {
-            self.review_pending_after_drone -= 1;
+        if changed && self.review_pending_after_drone > 0 && self.in_flight.is_none()
+            && self.run.as_ref().map(|r| r.is_running()).unwrap_or(false) {
             let (g, f) = (*gaze, player_feet);
             self.start_review(&g, f);
         }
@@ -1223,6 +1333,21 @@ impl Paintbrush {
         // Same borrow shape as `prompt_for`: the view lives for the
         // length of this call, which is all a prompt needs -- it reads
         // the world and never writes.
+        // A new build starts a RUN: the rounds, their history, and the
+        // status the marker shows.
+        self.run = Some(voxel_tools::session::Run::new(prose, voxel_tools::session::Limits {
+            max_rounds: self.review_rounds.max(1),
+            ..self.run_limits.clone()
+        }));
+        // A new build is a new conversation. Follow-ups that attach to
+        // the last build ("make it taller") keep the chain; a fresh
+        // request starts one.
+        if !self.session.last_build.as_ref().map(|lb| {
+            let p = prose.to_lowercase();
+            p.contains(" it ") || p.starts_with("it ") || p.contains(&lb.name.to_lowercase())
+        }).unwrap_or(false) {
+            self.chain.clear();
+        }
         // Named builds: any claim whose name the prose mentions becomes
         // a referent the context describes with its box. Resolved here
         // against the registry, which the session does not hold.
@@ -1262,6 +1387,24 @@ impl Paintbrush {
     /// 10,338 chars going to a 1B because the choice was by context
     /// alone and `ctx_tokens` was a constant that never crossed the
     /// threshold. Size comes from the registry, ctx from the load.
+    /// The loaded model's context, or the default.
+    fn ctx_for_model(&self) -> usize {
+        match &self.models.state {
+            voxel_tools::model::LoadState::Loaded { ctx, .. } => *ctx as usize,
+            _ => self.ctx_tokens,
+        }
+    }
+
+    /// The reply cap for the tier, as tokens to reserve.
+    fn max_reply_tokens(&self) -> usize {
+        match self.prompt_tier() {
+            voxel_tools::prompt::Tier::Tiny => 300,
+            voxel_tools::prompt::Tier::Compact => 400,
+            voxel_tools::prompt::Tier::Medium => 900,
+            voxel_tools::prompt::Tier::Full => 1400,
+        }
+    }
+
     fn prompt_tier(&self) -> voxel_tools::prompt::Tier {
         let (params, ctx) = match &self.models.state {
             voxel_tools::model::LoadState::Loaded { name, ctx, .. } => (
@@ -1294,6 +1437,16 @@ impl Paintbrush {
                   system: String, user: Box<dyn FnOnce() -> String + Send>, gaze: &Gaze,
                   player_feet: Option<(i32, i32, i32)>, prose: &str, kind: TurnKind) {
         let name = completer.name().to_string();
+        // THE CHAIN. A build's earlier exchanges go along, folded under
+        // the model's context budget: the oldest become a structural
+        // summary segment, the rest ride verbatim as KV checkpoints.
+        let ctx = self.ctx_for_model();
+        let reply_reserve = self.max_reply_tokens();
+        let system_tokens = voxel_tools::context::tokens(&system);
+        let budget = ctx.saturating_sub(reply_reserve).saturating_sub(256);
+        let chain_ref = self.chain.clone();
+        let user_sent = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let user_sent_w = user_sent.clone();
         log::info!("[paintbrush] asking {name} ({} chars system, ctx {}, {kind:?})",
                    system.len(), self.ctx_tokens);
         self.say(format!("asking {name} ... (the world keeps running)"));
@@ -1310,17 +1463,26 @@ impl Paintbrush {
             // phone an AI thread at equal priority was a fifth of the
             // machine taken from the renderer for a minute.
             crate::stubs::deprioritise();
-            // The user prompt is built here, on the worker.
+            // The user prompt is built here, on the worker; then the
+            // chain is packed to the budget around it.
             let user = user();
             log::info!("[paintbrush] user prompt {} chars", user.len());
-            let r = completer.complete_with(&system, &user, &ctl_w);
+            *user_sent_w.lock().unwrap_or_else(|e| e.into_inner()) = user.clone();
+            let mut chain = chain_ref;
+            let (summary, prior) = chain.pack(system_tokens, voxel_tools::context::tokens(&user), budget);
+            let system_full = match summary { Some(sm) => format!("{system}\n\n{sm}"), None => system.clone() };
+            if !prior.is_empty() || system_full.len() != system.len() {
+                log::info!("[paintbrush] chain: {} prior exchange(s) verbatim, {} folded",
+                           prior.len(), chain.folded.len());
+            }
+            let r = completer.complete_chain(&system_full, &prior, &user, &ctl_w);
             // A closed receiver means the turn was cancelled; nothing to
             // report and nobody to report to.
             let _ = tx.send(r);
         });
         self.in_flight = Some(PendingTurn {
             rx, started: Instant::now(), provider: name, gaze: *gaze, player_feet,
-            prose: prose.to_string(), kind, ctl, previewed_lines: 0,
+            prose: prose.to_string(), kind, ctl, previewed_lines: 0, user_sent,
         });
     }
 
@@ -1420,11 +1582,16 @@ impl Paintbrush {
             Ok(raw) => {
                 log::info!("[paintbrush] reply in {:.1}s, {} chars",
                            turn.elapsed().as_secs_f32(), raw.len());
+                // the exchange joins the chain; its outcome is filled in
+                // once the reply has been applied (see finish_* below)
+                let sent = turn.user_sent.lock().map(|s| s.clone()).unwrap_or_default();
+                self.chain.push(sent, raw.clone(), String::new());
                 match turn.kind {
                     TurnKind::Build => {
                         self.finish_turn_with(cm, &turn.gaze, &raw, turn.player_feet, &turn.prose);
-                        // the review loop starts once this build's preview lands
-                        self.review_pending_after_drone = self.review_rounds;
+                        // the review loop starts once this build's preview
+                        // lands; the run decides when it ends
+                        self.review_pending_after_drone = 1;
                         self.review_round = 0;
                     }
                     TurnKind::Repair =>
@@ -1812,6 +1979,14 @@ impl Paintbrush {
 
     /// The pending plan's landing spot for the renderer's marker:
     /// (name, world position at the anchor's surface, blocks).
+    /// The marker's status line and blob, for the renderer. The blob
+    /// is boxes in world coordinates: the shape as it stands, drawn
+    /// before a single block is committed.
+    pub fn waypoint_progress(&self) -> Option<(String, Vec<((i32, i32, i32), (i32, i32, i32))>)> {
+        let run = self.run.as_ref()?;
+        Some((run.status(), run.blob.clone()))
+    }
+
     pub fn waypoint(&self) -> Option<(String, [f32; 3], usize)> {
         self.session.pending_waypoint().map(|w| {
             // The marker sits at the centre of the dry run's box when

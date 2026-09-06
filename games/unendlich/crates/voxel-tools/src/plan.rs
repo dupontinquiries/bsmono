@@ -66,6 +66,17 @@ fn clamp_size(v: i32, default: i32, notes: &mut Vec<String>, what: &str) -> i32 
     default
 }
 
+/// `size=small|medium|large` as a footprint radius. A size word IS a
+/// footprint -- the tiny tier says `form house size=medium` and means
+/// it -- so it must not raise the "no coordinates; used 12x12" warning
+/// that an ABSENT footprint does, which the line validator takes back.
+pub fn size_radius(tokens: &[&str]) -> Option<i32> {
+    tokens.iter().find_map(|s| s.strip_prefix("size=")).map(|sz| match sz.to_lowercase().as_str() {
+        "tiny" => 2, "small" => 4, "medium" | "mid" => 8, "large" | "big" => 14,
+        "huge" | "giant" => 24, _ => 8,
+    })
+}
+
 /// The x,z of the focus anchor, or the origin when there is none.
 fn anchor_xz(anchor: Option<(i32, i32, i32)>) -> (i32, i32) {
     anchor.map(|a| (a.0, a.2)).unwrap_or((0, 0))
@@ -635,9 +646,7 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                 // `size=small|medium|large` stands in for the two corners:
                 // a footprint centred on the anchor. It is what a very
                 // small model writes; coordinates are what it gets wrong.
-                let size_r = t.iter().find_map(|s| s.strip_prefix("size=")).map(|sz| match sz.to_lowercase().as_str() {
-                    "tiny" => 2, "small" => 4, "medium" | "mid" => 8, "large" | "big" => 14,
-                    "huge" | "giant" => 24, _ => 8 });
+                let size_r = size_radius(&t);
                 let sized_a; let sized_b;
                 let shifted: Vec<&str> = match size_r {
                     Some(r) => {
@@ -790,6 +799,22 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     max_len: kvi(&t, "len", 200).clamp(10, 2000),
                     seed: kvi(&t, "seed", 1),
                 });
+            }
+            "mood" | "atmosphere" | "weather"
+                if size_radius(&t).is_some() => {
+                // A size word is the footprint. Rewrite the line with the
+                // corners it means and re-dispatch, so every footprint
+                // verb gets `size=` for free and none of them has to
+                // know about it.
+                let r = size_radius(&t).unwrap();
+                let rest: Vec<&str> = t.iter().skip(1).filter(|s| !s.starts_with("size=")).copied().collect();
+                let (head, tail): (Vec<&str>, Vec<&str>) = rest.iter()
+                    .partition(|s| !s.contains('=') && !s.contains(','));
+                let a = format!("@-{r},-{r}"); let b = format!("@{r},{r}");
+                let line = format!("{} {} {a} {b} {}", t[0], head.join(" "), tail.join(" "));
+                let (sub, subissues) = parse_plan_at(&line, anchor);
+                for i in subissues { if i.severity == Severity::Error { bad(i.message); } }
+                ops.extend(sub.ops);
             }
             "mood" | "atmosphere" => {
                 let Some(name) = t.get(1).map(|s| s.to_lowercase()) else {

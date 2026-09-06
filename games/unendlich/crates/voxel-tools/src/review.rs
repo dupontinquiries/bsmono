@@ -80,8 +80,15 @@ pub struct Variant {
 pub fn prompt(prose: &str, ops: &[Op], spec: Option<&str>, measured: &str, elevation: &str,
               findings: &[String], variants: &[Variant], round: usize) -> String {
     let mut s = format!("REVIEW round {round}. The player asked for: {prose}\n\n");
+    // Beyond a dozen ops the plan is GROUPED -- "8 x house (cottage), 2
+    // x path" -- with detail only for the ops the findings mention. A
+    // model judging a village needs to know there are eight cottages,
+    // not the eighth cottage's line.
+    let mentioned: Vec<usize> = findings.iter().flat_map(|f| f.split(|c: char| !c.is_ascii_digit())
+        .filter_map(|t| t.parse::<usize>().ok())).filter(|n| *n >= 1 && *n <= ops.len()).collect();
     s.push_str("The plan, by number:\n");
-    for (i, op) in ops.iter().enumerate() { s.push_str(&format!("  {}. {}\n", i + 1, crate::math::describe_op(op))); }
+    s.push_str(&crate::context::plan_summary(ops, &mentioned, 12));
+    s.push('\n');
     if let Some(sp) = spec { s.push_str(&format!("\nTarget: {sp}\n")); }
     s.push_str(&format!("Measured: {measured}\n\n{elevation}\n"));
     if !findings.is_empty() {
@@ -179,7 +186,11 @@ pub fn apply(ir: &str, review: &Review) -> String {
             && !["def", "end", "use", "spec", "properties"].contains(&t.split_whitespace().next().unwrap_or("").to_lowercase().as_str())
             && { let (p, issues) = parse_plan_at(&format!("{t}\n"), Some((0, 64, 0)));
                  !p.ops.is_empty() && !issues.iter().any(|i| i.severity == Severity::Error) };
-        if t.to_lowercase().starts_with("spec") && review.spec.is_some() { continue; }   // replaced below
+        // A spec line is KEPT unless the review replaces it. It is not
+        // an op and has no number, so `keep 1 2` must not silently drop
+        // the targets the tuner chases -- the run's distance went to
+        // None after the first review.
+        if t.to_lowercase().starts_with("spec") { if review.spec.is_some() { continue; } out.push_str(line); out.push('\n'); continue; }
         if is_op {
             op_index += 1;
             let kept = review.keep.as_ref().map(|k| k.contains(&op_index)).unwrap_or(true);
@@ -222,6 +233,14 @@ mod tests {
         assert_eq!(parse("keep 9 12", 5).keep, None, "numbers past the plan are not ops");
         assert_eq!(parse("pick 2\n", 3).pick, Some(2));
         assert!(parse("", 3).is_empty());
+    }
+
+    #[test]
+    fn a_spec_survives_a_review_that_does_not_replace_it() {
+        let ir = "spec height=5-7\nenclose @-4,-4 @4,4 h=5\ntree @9,9 oak h=7\n";
+        let out = apply(ir, &parse("keep 1\n", 2));
+        assert!(out.contains("spec height=5-7"), "the targets survive: {out}");
+        assert!(!out.contains("tree"));
     }
 
     #[test]

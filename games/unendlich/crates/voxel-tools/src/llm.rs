@@ -57,6 +57,19 @@ pub trait Completer: Send {
     /// Blocking. Call it off the frame thread.
     fn complete(&mut self, system: &str, user: &str) -> Result<String, String>;
 
+    /// `complete_with` for a CONVERSATION: prior (user, reply) exchanges
+    /// before this user turn. A provider with a KV cache keeps the
+    /// chain's checkpoints and prefills only what is new. The default
+    /// folds the history into the system text, which is correct and
+    /// merely unpaced by any cache.
+    fn complete_chain(&mut self, system: &str, prior: &[(String, String)], user: &str,
+                      ctl: &TurnControl) -> Result<String, String> {
+        if prior.is_empty() { return self.complete_with(system, user, ctl); }
+        let mut sys = system.to_string();
+        for (u, a) in prior { sys.push_str(&format!("\n\nUser: {u}\nAssistant: {a}")); }
+        self.complete_with(&sys, user, ctl)
+    }
+
     /// `complete` with live control. The default ignores the control
     /// and reports once at the end -- correct for a provider that
     /// cannot stream. A provider that can should check `ctl.cancelled()`
@@ -222,9 +235,33 @@ pub fn is_grammar_echo(line: &str) -> bool {
 
 /// Verbs the plan parser accepts. Kept here so `clean_reply` and the
 /// parser cannot drift; there is a test asserting each one parses.
+/// Every verb the parser accepts.
+///
+/// THIS LIST WAS TWELVE VERBS OLD. `clean_reply` drops any line whose
+/// verb is not here, so every op added since -- form, spec, plant,
+/// mood, populate, greeble, road, river, lake, brush, layer, weather,
+/// detail, def/use, place -- was being silently deleted from every
+/// model reply before the plan ever saw it. The spec line in
+/// particular: the tuner had nothing to chase and the run tracked no
+/// distance, which is how it was found.
+///
+/// Kept in one place with a test that every verb the parser knows is
+/// in it, so the next op cannot go missing the same way.
 pub const KNOWN_VERBS: &[&str] = &[
+    // geometry
     "terraform", "path", "enclose", "cylinder", "tower", "sphere", "dome",
-    "tree", "scatter", "restyle", "fill", "box",
+    "tree", "scatter", "restyle", "fill", "box", "roof", "floor", "bridge",
+    "stairs", "mirror",
+    // the dictionary and its axes
+    "form", "build", "place", "stamp", "spec", "properties",
+    // living things and atmosphere
+    "plant", "grow", "mood", "atmosphere", "populate",
+    // surfaces
+    "detail", "weather", "greeble", "decorate", "views",
+    // landscape
+    "brush", "layer", "river", "road", "lake", "world",
+    // substructures
+    "def", "end", "use",
 ];
 
 // ── in-process HTTP: no subprocess, no dependencies ─────────────────
@@ -552,18 +589,48 @@ mod tests {
 
     #[test]
     fn every_known_verb_actually_parses() {
-        // the guard against clean_reply and the parser drifting apart
+        // THE GUARD against clean_reply and the parser drifting apart --
+        // and it caught the drift the other way too: the list was
+        // twelve verbs old, so form, spec, plant and the rest were
+        // being deleted from every reply. A sample per verb, because a
+        // generic `@0,0 r=2 h=4` is not valid for most of them.
         for verb in KNOWN_VERBS {
             let line = match *verb {
-                "terraform" | "path" | "enclose" | "scatter" => format!("{verb} @0,0 @4,4\n"),
-                "restyle" => "restyle @0,0,0 @4,4,4 stone oak\n".to_string(),
+                "terraform" | "path" | "enclose" => format!("{verb} @0,0 @4,4\n"),
+                "scatter" => "scatter @-4,-4 @4,4 block=flower clusters=3 per=4\n".into(),
+                "restyle" => "restyle @0,0,0 @4,4,4 stone oak\n".into(),
                 "fill" | "box" => format!("{verb} @0,0,0 @2,2,2\n"),
-                "tree" => "tree @0,0 oak\n".to_string(),
-                _ => format!("{verb} @0,0 r=2 h=4\n"),
+                "tree" => "tree @0,0 oak\n".into(),
+                "cylinder" | "tower" => format!("{verb} @0,0 r=3 h=9\n"),
+                "sphere" | "dome" => format!("{verb} @0,0 r=3\n"),
+                "roof" => "roof @-3,-3 @3,3 gable\n".into(),
+                "floor" => "floor @-3,-3 @3,3 y=4\n".into(),
+                "bridge" | "stairs" => format!("{verb} @0,0 @9,0\n"),
+                "mirror" => "mirror @0,0,0 @4,4,4 x\n".into(),
+                "form" | "build" => format!("{verb} house @-4,-4 @4,4\n"),
+                "place" | "stamp" => continue,          // needs a captured template
+                "spec" | "properties" => format!("{verb} height=5-7 durability=high\n"),
+                "plant" | "grow" => format!("{verb} @0,0 oak tall\n"),
+                "mood" | "atmosphere" => format!("{verb} eerie @-4,-4 @4,4\n"),
+                "populate" => "populate deer @-9,-9 @9,9 count=3\n".into(),
+                "detail" => "detail speckle @-3,-3,-3 @3,3,3\n".into(),
+                "weather" => "weather @-3,-3,-3 @3,3,3 worn\n".into(),
+                "greeble" | "decorate" => format!("{verb} @-3,-1,-3 @3,5,3 gothic\n"),
+                "views" => continue,                    // a multi-line block
+                "brush" => "brush raise @0,0 by=6 r=20\n".into(),
+                "layer" => "layer boreal @-20,-20 @20,20\n".into(),
+                "river" => "river @0,0 len=40\n".into(),
+                "road" => "road @0,0 @40,40\n".into(),
+                "lake" => "lake @0,0 r=10 level=66\n".into(),
+                "world" => continue,                    // gated on the player's intent
+                "def" | "end" | "use" => continue,      // substructure syntax, not ops
+                other => panic!("KNOWN_VERBS gained '{other}' with no sample line here"),
             };
             let (plan, issues) = parse_plan_at(&line, Some((0, 65, 0)));
-            assert!(issues.is_empty() && plan.ops.len() == 1,
-                    "verb '{verb}' in KNOWN_VERBS does not parse: {line:?} {issues:?}");
+            let errs: Vec<_> = issues.iter().filter(|i| i.severity == crate::plan::Severity::Error).collect();
+            assert!(errs.is_empty() && !plan.ops.is_empty(),
+                    "verb '{verb}' in KNOWN_VERBS does not parse: {line:?} {errs:?}");
+            assert!(clean_reply(line.trim()).contains(*verb), "clean_reply drops '{verb}'");
         }
     }
 
@@ -785,4 +852,5 @@ mod tests {
         let l = build_http(&HttpConfig { dialect: Dialect::OpenAi, ..HttpConfig::default() }, "SYS", "USER");
         assert!(l.contains("\"cache_prompt\":true"), "{l}");
     }
+
 }

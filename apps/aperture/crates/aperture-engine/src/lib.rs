@@ -89,6 +89,20 @@ pub trait Backend: Send + Sync {
         Ok(out)
     }
 
+    /// A CONVERSATION: prior (user, assistant) exchanges before the
+    /// current user turn. A backend with a KV cache keeps checkpoints
+    /// along the chain and prefills only what is new, so round five
+    /// of a review pays for round five, not for the whole transcript.
+    /// The default folds the history into the system text and streams
+    /// with validation -- correct, just unpaced by the cache.
+    fn generate_chat_chain(&self, system: &str, prior: &[(String, String)], user: &str, max_tokens: usize,
+                           cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str),
+                           line_ok: &dyn Fn(&str) -> bool) -> Result<(String, usize), String> {
+        let mut sys = system.to_string();
+        for (u, a) in prior { sys.push_str(&format!("\n\nUser: {u}\nAssistant: {a}")); }
+        self.generate_chat_lines(&sys, user, max_tokens, cancel, sink, line_ok)
+    }
+
     /// `generate_chat_streaming` with a per-line validator: a backend
     /// that drives its own decode loop rejects and resamples lines the
     /// validator refuses, so a small model writing a line language
@@ -435,12 +449,24 @@ mod gpu {
     use gpu_kernels::{gguf, Gpu};
     use std::sync::Arc;
 
-    /// A prefilled prefix the GPU backend keeps between turns.
+    /// A prefilled prefix the GPU backend keeps between turns, as a
+    /// CHAIN of checkpoints: (hash of the text up to here, tokens up
+    /// to here). A new request walks its own segments against the
+    /// checkpoints, keeps the longest run that matches, and prefills
+    /// from there. A conversation that grows by one exchange per turn
+    /// re-uses everything before the new exchange; one that diverges
+    /// at turn two rewinds to turn one -- the cache writes at explicit
+    /// positions, so a rewind is a number.
     struct PrefixKv {
-        hash: u64,
-        len: usize,
+        checkpoints: Vec<(u64, usize)>,
         cap: usize,
         cache: gpu_kernels::KvCache,
+    }
+
+    fn fnv(s: &str, seed: u64) -> u64 {
+        let mut h = seed ^ 0xcbf2_9ce4_8422_2325;
+        for b in s.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100_0000_01b3); }
+        h
     }
 
     pub struct GpuBackend {
@@ -577,9 +603,20 @@ mod gpu {
         fn generate_chat_lines(&self, system: &str, user: &str, max_tokens: usize,
                                cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str),
                                line_ok: &dyn Fn(&str) -> bool) -> Result<(String, usize), String> {
-            let (out, retried) = self.generate_prefixed_core(&self.family.wrap_system(system),
-                                                             &self.family.wrap_user(user), max_tokens,
-                                                             cancel, sink, Some(line_ok))?;
+            self.generate_chat_chain(system, &[], user, max_tokens, cancel, sink, line_ok)
+        }
+
+        fn generate_chat_chain(&self, system: &str, prior: &[(String, String)], user: &str, max_tokens: usize,
+                               cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str),
+                               line_ok: &dyn Fn(&str) -> bool) -> Result<(String, usize), String> {
+            // the segments: system, then each prior exchange as one
+            // segment (user + assistant), then the current user turn
+            let mut segments: Vec<String> = vec![self.family.wrap_system(system)];
+            for (u, a) in prior {
+                segments.push(format!("{}{}", self.family.wrap_user_prior(u), self.family.wrap_assistant(a)));
+            }
+            let (out, retried) = self.generate_chain_core(&segments, &self.family.wrap_user(user), max_tokens,
+                                                          cancel, sink, Some(line_ok))?;
             if cancel() { return Err("cancelled".into()); }
             Ok((self.family.clean(&out), retried))
         }
@@ -625,40 +662,56 @@ mod gpu {
                                   cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str),
                                   line_ok: Option<&dyn Fn(&str) -> bool>)
             -> Result<(String, usize), String> {
-            let phash = {
-                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-                for b in prefix.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100_0000_01b3); }
-                h
-            };
+            self.generate_chain_core(&[prefix.to_string()], suffix, max_tokens, cancel, sink, line_ok)
+        }
+
+        /// The one decode loop, over a CHAIN of prefix segments. The
+        /// cache keeps checkpoints per segment; the longest run of
+        /// segments that matches is kept and the rest prefilled from
+        /// its end. Cancel is checked before every prefill chunk and
+        /// decode step; the sink gets the accumulated text every few
+        /// tokens.
+        fn generate_chain_core(&self, segments: &[String], suffix: &str, max_tokens: usize,
+                               cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str),
+                               line_ok: Option<&dyn Fn(&str) -> bool>)
+            -> Result<(String, usize), String> {
+            // cumulative hashes: checkpoint k is the text of segments 0..=k
+            let mut cum: Vec<u64> = Vec::with_capacity(segments.len());
+            let mut h = 0u64;
+            for seg in segments { h = fnv(seg, h); cum.push(h); }
             let suffix_ids = self.tok.encode(suffix);
-            let mut slot = self.prefix.lock().map_err(|_| "prefix cache poisoned".to_string())?;
-            // Re-prefill the prefix only when it CHANGED or the cache is
-            // too small for this turn. Otherwise the 3k-token system
-            // prompt costs nothing after the first turn.
             let need = suffix_ids.len() + max_tokens;
-            let fresh = match &*slot {
-                Some(p) if p.hash == phash && p.len + need <= p.cap => false,
-                _ => true,
+            let mut slot = self.prefix.lock().map_err(|_| "prefix cache poisoned".to_string())?;
+            // how many leading checkpoints match what is stored
+            let matched = match &*slot {
+                Some(p) => p.checkpoints.iter().zip(&cum).take_while(|((sh, _), ch)| sh == *ch).count(),
+                None => 0,
             };
-            if fresh {
-                let prefix_ids = self.tok.encode(prefix);
-                let cap = prefix_ids.len() + need.max(512) + 1024;
+            let total_ids: usize = segments.iter().map(|s| self.tok.encode(s).len()).sum();
+            let fits = slot.as_ref().map(|p| total_ids + need <= p.cap).unwrap_or(false);
+            if matched == 0 || !fits {
+                // nothing reusable (or too small): a fresh cache sized for the whole chain
+                let cap = total_ids + need.max(512) + 2048;
                 let cache = self.gpu.new_cache_for(&self.model, cap);
-                // The prefix prefill, PACED. Three thousand tokens in one
-                // submission held the GPU for seconds on the first turn;
-                // in governed chunks each one is a frame's worth, and
-                // the frame gets in between them.
-                let chunk = if self.governor.is_some() { 48 } else { 256 };
-                let mut pos = 0;
-                for piece in prefix_ids.chunks(chunk) {
+                *slot = Some(PrefixKv { checkpoints: Vec::new(), cap, cache });
+            }
+            let p = slot.as_mut().expect("just filled");
+            let matched = if matched == 0 || !fits { 0 } else { matched };
+            // rewind to the last matching checkpoint and prefill the rest
+            p.checkpoints.truncate(matched);
+            let mut pos = p.checkpoints.last().map(|(_, n)| *n).unwrap_or(0);
+            let chunk = if self.governor.is_some() { 48 } else { 256 };
+            for (k, seg) in segments.iter().enumerate().skip(matched) {
+                let ids = self.tok.encode(seg);
+                for piece in ids.chunks(chunk) {
                     if cancel() { return Err("cancelled".into()); }
                     if let Some(g) = &self.governor { g.acquire(self.tier); }
-                    let _ = self.gpu.prefill_chunked_from(&self.model, &cache, piece, pos, chunk);
+                    let _ = self.gpu.prefill_chunked_from(&self.model, &p.cache, piece, pos, chunk);
                     pos += piece.len();
                 }
-                *slot = Some(PrefixKv { hash: phash, len: prefix_ids.len(), cap, cache });
+                p.checkpoints.push((cum[k], pos));
             }
-            let p = slot.as_ref().expect("just filled");
+            let p = &*p;
             let mut rng = 0xC0FFEE_u64;
             let mut out: Vec<u32> = Vec::new();
             // The prefill is one submission; the governor gates each
@@ -674,7 +727,8 @@ mod gpu {
             let retried = match line_ok {
                 None => {
                     self.gpu.generate_kv_stream_paced(
-                        &self.model, &p.cache, p.len, &suffix_ids, max_tokens, self.eos,
+                        &self.model, &p.cache, p.checkpoints.last().map(|(_, n)| *n).unwrap_or(0),
+                        &suffix_ids, max_tokens, self.eos,
                         &self.sampler, &mut rng, cancel, &pace, chunk,
                         |t| {
                             if stops.contains(&t) { return false; }
@@ -696,7 +750,8 @@ mod gpu {
                         *m.entry(t).or_insert_with(|| tok.decode(&[t]).contains('\n'))
                     };
                     let (_, retried) = self.gpu.generate_kv_stream_lines(
-                        &self.model, &p.cache, p.len, &suffix_ids, max_tokens, self.eos,
+                        &self.model, &p.cache, p.checkpoints.last().map(|(_, n)| *n).unwrap_or(0),
+                        &suffix_ids, max_tokens, self.eos,
                         &self.sampler, &mut rng, cancel, &pace, chunk, &is_newline, 3,
                         |line| ok(tok.decode(line).trim()),
                         |t| {

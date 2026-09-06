@@ -91,6 +91,33 @@ impl Family {
         }
     }
 
+    /// A completed assistant turn, for a prior exchange that sits in
+    /// the prefix: the model's own reply in its own markers, ended.
+    pub fn wrap_assistant(self, reply: &str) -> String {
+        match self {
+            Family::Llama3 => format!("{reply}<|eot_id|>"),
+            Family::ChatMl => format!("{reply}<|im_end|>\n"),
+            Family::Mistral => format!("{reply}</s>"),
+            Family::Gemma => format!("{reply}<end_of_turn>\n"),
+            Family::Phi => format!("{reply}<|end|>\n"),
+            Family::Raw => format!("{reply}\n\n"),
+        }
+    }
+
+    /// A prior user turn WITHOUT the assistant header: the exchange
+    /// continues, it does not end where the assistant starts writing.
+    pub fn wrap_user_prior(self, user: &str) -> String {
+        match self {
+            Family::Llama3 => format!("<|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|>\
+                                       <|start_header_id|>assistant<|end_header_id|>\n\n"),
+            Family::ChatMl => format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"),
+            Family::Mistral => format!("{user} [/INST]"),
+            Family::Gemma => format!("{user}<end_of_turn>\n<start_of_turn>model\n"),
+            Family::Phi => format!("<|user|>\n{user}<|end|>\n<|assistant|>\n"),
+            Family::Raw => format!("{user}\n"),
+        }
+    }
+
     /// The special-token TEXT that ends the assistant's turn, to be
     /// looked up in the vocabulary. None for Raw: the GGUF's eos is all
     /// there is.
@@ -170,5 +197,15 @@ mod tests {
     #[test]
     fn raw_is_the_old_behaviour_exactly() {
         assert_eq!(format!("{}{}", Family::Raw.wrap_system("S"), Family::Raw.wrap_user("U")), "S\n\nU");
+    }
+
+    #[test]
+    fn a_chain_of_prior_turns_is_the_prefix_of_the_next() {
+        let f = Family::Llama3;
+        let one = format!("{}{}", f.wrap_system("S"), f.wrap_user("U1"));
+        let chain = format!("{}{}{}{}", f.wrap_system("S"), f.wrap_user_prior("U1"), f.wrap_assistant("A1"), f.wrap_user("U2"));
+        assert!(chain.starts_with(&one), "turn two's prefix begins with turn one's whole prompt");
+        assert!(chain.contains("A1<|eot_id|>"));
+        assert!(chain.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
     }
 }
