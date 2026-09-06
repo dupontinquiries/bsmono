@@ -255,8 +255,10 @@ mod parity {
     fn load_spv() -> Vec<u8> {
         // Prefer a build.rs-produced asset; fall back to compiling the source.
         for p in crate::assets::shader_paths("field_diffuse.comp.spv") {
-            if std::path::Path::new(p).exists() {
-                return std::fs::read(p).unwrap();
+            // `shader_paths` returns `PathBuf`s since 22e057fc; this test-only loader still
+            // wrapped them in `Path::new`, which does not compile under `headless` + test.
+            if p.exists() {
+                return std::fs::read(&p).unwrap();
             }
         }
         let src = ["src/shaders/field_diffuse.comp",
