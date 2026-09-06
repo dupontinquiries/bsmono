@@ -58,6 +58,8 @@ pub mod carved;
 pub mod dock;
 pub mod vertical_tabs;
 pub mod glass;
+/// The finish snapclone has, for any app: a live backdrop behind the glass panels, one line a frame.
+pub mod polish;
 pub mod gesture_layer;
 pub mod touch;
 pub mod skin;
@@ -125,6 +127,7 @@ pub use glass::{glass_key, surface_fill, key_fill, key_fill_hover, key_fill_modi
 pub use gesture_layer::{Axis, GestureFrame, GestureLayer};
 pub use skin::Skin;
 pub use livebg::{BgStyle, LiveBackground};
+pub use polish::Backdrop;
 pub use nav::Nav;
 pub use theme_bridge::{apply_palette, filter_color, PaletteColors};
 

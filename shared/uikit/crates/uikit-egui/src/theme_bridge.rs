@@ -111,29 +111,54 @@ pub fn apply_palette(ctx: &Context, p: &Palette) -> PaletteColors {
 /// duplicating this color -> Visuals mapping, and without [`apply_palette`]'s
 /// own public (unfiltered) behavior changing for its existing callers.
 pub(crate) fn build_visuals(c: &PaletteColors) -> Visuals {
+    use crate::glass::{tint, GlassAlphas};
     let mut v = Visuals::dark(); // start dark; pale palettes override below
 
     v.override_text_color = Some(c.text);
-    v.panel_fill = c.bg_base;
-    v.window_fill = c.bg_card;
+    // THE GLASS FINISH, for every themed app at once. snapclone's surfaces are
+    // what the fleet's other egui fronts were being compared against ("it
+    // literally has a shine"), and the difference was never the palette — it
+    // was these: panels that are a high-alpha TINT rather than a flat slab,
+    // so a backdrop (`polish::Backdrop`) shows through them as a glow; windows
+    // and popups on the same glass with a soft, dropped shadow and a hairline
+    // border; widgets as glass keys (0.78 resting, 0.88 hovered, the accent as
+    // a solid flip when pressed) rather than opaque rectangles. The alphas are
+    // `GlassAlphas`, the same table the keyboard and the panels use.
+    v.panel_fill = tint(c.bg_base, GlassAlphas::SURFACE);
+    v.window_fill = tint(c.bg_card, GlassAlphas::SURFACE);
     v.extreme_bg_color = c.bg_base;
-    v.faint_bg_color = c.bg_raised;
+    v.faint_bg_color = tint(c.bg_raised, GlassAlphas::KEY_MODIFIER);
     v.hyperlink_color = c.accent;
     v.selection.bg_fill = c.accent.linear_multiply(0.35);
     v.selection.stroke = Stroke::new(1.0_f32, c.accent);
+    v.window_corner_radius = CornerRadius::same(tokens::RADIUS_MD as u8);
+    v.menu_corner_radius = CornerRadius::same(tokens::RADIUS_MD as u8);
+    v.window_stroke = Stroke::new(1.0_f32, tint(c.border, GlassAlphas::BORDER_SOFT));
+    v.window_shadow = egui::epaint::Shadow {
+        offset: [0, 6],
+        blur: 22,
+        spread: 0,
+        color: Color32::from_black_alpha(96),
+    };
+    v.popup_shadow = egui::epaint::Shadow {
+        offset: [0, 4],
+        blur: 14,
+        spread: 0,
+        color: Color32::from_black_alpha(80),
+    };
 
     let r = CornerRadius::same(tokens::RADIUS_SM as u8);
     let widgets = &mut v.widgets;
-    for (state, fill) in [
-        (&mut widgets.noninteractive, c.bg_card),
-        (&mut widgets.inactive, c.bg_card),
-        (&mut widgets.hovered, c.bg_hover),
-        (&mut widgets.active, c.bg_hover),
-        (&mut widgets.open, c.bg_raised),
+    for (state, fill, alpha) in [
+        (&mut widgets.noninteractive, c.bg_card, GlassAlphas::KEY_MODIFIER),
+        (&mut widgets.inactive, c.bg_card, GlassAlphas::KEY),
+        (&mut widgets.hovered, c.bg_hover, GlassAlphas::KEY_HOVER),
+        (&mut widgets.active, c.bg_hover, GlassAlphas::KEY_HOVER),
+        (&mut widgets.open, c.bg_raised, GlassAlphas::KEY_HOVER),
     ] {
-        state.bg_fill = fill;
-        state.weak_bg_fill = fill;
-        state.bg_stroke = Stroke::new(1.0_f32, c.border);
+        state.bg_fill = tint(fill, alpha);
+        state.weak_bg_fill = tint(fill, alpha);
+        state.bg_stroke = Stroke::new(1.0_f32, tint(c.border, GlassAlphas::BORDER));
         state.fg_stroke = Stroke::new(1.0_f32, c.text);
         state.corner_radius = r;
     }
@@ -166,6 +191,28 @@ pub(crate) fn filter_palette_colors(c: &PaletteColors, d: &settings_kit::Display
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The finish is glass: panels and widgets are high-alpha tints, never opaque slabs, and
+    /// the alphas are the shared `GlassAlphas` table — so a retune there reaches every app.
+    #[test]
+    fn the_visuals_are_glass_not_slab() {
+        use crate::glass::GlassAlphas;
+        let c = crate::default_palette();
+        let v = build_visuals(&c);
+        assert_eq!(v.panel_fill.a(), GlassAlphas::SURFACE, "panel is a tint the backdrop shows through");
+        assert_eq!(v.window_fill.a(), GlassAlphas::SURFACE);
+        assert_eq!(v.widgets.inactive.bg_fill.a(), GlassAlphas::KEY);
+        assert_eq!(v.widgets.hovered.bg_fill.a(), GlassAlphas::KEY_HOVER);
+        assert!(v.window_shadow.blur > 0 && v.window_shadow.offset[1] > 0, "windows drop a soft shadow");
+        assert_eq!(v.window_corner_radius, CornerRadius::same(tokens::RADIUS_MD as u8));
+        // and the tint keeps the palette's colour, so a re-theme still re-themes
+        // (Color32 stores premultiplied; the unmultiplied channels come back within the
+        // rounding of one premultiply/unmultiply round trip)
+        let [r, g, b, _] = v.panel_fill.to_srgba_unmultiplied();
+        for (got, want) in [(r, c.bg_base.r()), (g, c.bg_base.g()), (b, c.bg_base.b())] {
+            assert!(got.abs_diff(want) <= 1, "{got} vs {want}");
+        }
+    }
 
     #[test]
     fn hex_parses_six_and_eight() {
