@@ -145,21 +145,19 @@ pub fn layout_for(id: &str) -> Layout {
         set(6, i, on);
     }
 
-    // Data field, derived from the id. Not an encoding — see the module docs.
+    // THE DATA FIELD ENCODES THE ID — the C++ `makeIdQr` bit scheme, so its scanner
+    // (`QrScanDialog`) and `decode_layout` below both read it back: the id's bytes, LSB
+    // first, one bit per data cell in `data_cells()` order; past the id, the C++'s
+    // `(row ^ col) & 1` parity texture. The first port hashed the id here, which drew a
+    // nice square that nothing could ever decode.
     let bytes = id.as_bytes();
-    if !bytes.is_empty() {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in bytes {
-            h ^= *b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01B3);
-        }
-        for y in 0..MODULES {
-            for x in 0..MODULES {
-                if Layout::is_reserved(x, y) { continue; }
-                h ^= h << 13; h ^= h >> 7; h ^= h << 17;
-                set(x, y, (h >> 33) & 1 == 1);
-            }
-        }
+    for (i, (x, y)) in data_cells().enumerate() {
+        let on = if i / 8 < bytes.len() {
+            (bytes[i / 8] >> (i % 8)) & 1 == 1
+        } else {
+            (y ^ x) & 1 == 1
+        };
+        set(x, y, on);
     }
     Layout { modules: m }
 }
@@ -268,7 +266,7 @@ pub fn qr_ui(ui: &mut Ui, layout: &Layout, side: f32, c: &PaletteColors, reveale
 /// The painter half of [`qr_ui`], for callers that place the rect themselves. `reveal_t` is
 /// seconds since the reveal began, or `None` for the finished code.
 pub fn paint(painter: &egui::Painter, rect: Rect, layout: &Layout, pixels_per_point: f32, c: &PaletteColors, reveal_t: Option<f64>) {
-    let (bg, fg) = theme_colors(c);
+    let (bg, _fg) = theme_colors(c);
     // the card: the rest of the chrome's glass, with the hairline along the top
     painter.rect_filled(rect, CornerRadius::same(CARD_RADIUS), bg);
     painter.rect_stroke(
@@ -277,8 +275,13 @@ pub fn paint(painter: &egui::Painter, rect: Rect, layout: &Layout, pixels_per_po
         egui::Stroke::new(1.0, Color32::from_white_alpha(crate::glass::GlassAlphas::HAIRLINE)),
         egui::StrokeKind::Inside,
     );
+    paint_modules(painter, rect.shrink(CARD_PAD), layout, pixels_per_point, c, reveal_t);
+}
+
+/// The modules alone — eyes, dots, pills, with the reveal — inside `inner`.
+fn paint_modules(painter: &egui::Painter, inner: Rect, layout: &Layout, pixels_per_point: f32, c: &PaletteColors, reveal_t: Option<f64>) {
+    let (bg, fg) = theme_colors(c);
     // an integer cell in PHYSICAL pixels, back to points: the modules land on pixels
-    let inner = rect.shrink(CARD_PAD);
     let ppp = pixels_per_point.max(0.1);
     let cell_px = cell_size(inner.width().min(inner.height()) as u32, ppp);
     let cell = cell_px as f32 / ppp;
@@ -343,6 +346,358 @@ pub fn paint(painter: &egui::Painter, rect: Rect, layout: &Layout, pixels_per_po
             x += 1;
         }
     }
+}
+
+// ── the data field's order, and reading it back ───────────────────────────────────────
+
+/// The data cells in write/read order — the C++ loop: rows top to bottom, columns 8..21,
+/// skipping the two right-hand finder blocks and the left-hand separator column — and,
+/// unlike the C++, skipping the timing row: it let data bits overwrite row 6, which is the
+/// row the scanner checks before it trusts a grid. 180 cells: 22 bytes, room for `sc-` and
+/// 19 hex digits.
+pub fn data_cells() -> impl Iterator<Item = (usize, usize)> {
+    (0..MODULES).flat_map(|row| {
+        (8..MODULES).filter_map(move |col| {
+            let skip = row == 6 || (row < 9 && col < 9) || (row < 9 && col > 12) || (row > 12 && col < 9);
+            (!skip).then_some((col, row))
+        })
+    })
+}
+
+/// Read the id back out of a layout: the data bits as bytes until the first byte that is
+/// not printable ASCII, then the same `sc-…` check the payload parser makes. `None` for a
+/// layout that does not carry one — including one that was hashed rather than encoded.
+pub fn decode_layout(l: &Layout) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut cur = 0u8;
+    for (i, (x, y)) in data_cells().enumerate() {
+        if l.get(x, y) {
+            cur |= 1 << (i % 8);
+        }
+        if i % 8 == 7 {
+            if !(0x20..0x7f).contains(&cur) {
+                break;
+            }
+            bytes.push(cur);
+            cur = 0;
+        }
+    }
+    let s = String::from_utf8(bytes).ok()?;
+    // the same shape parse_payload accepts: `sc-` and a hex run
+    let start = s.find("sc-")?;
+    let after = &s[start + 3..];
+    let hex_len = after.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(after.len());
+    (hex_len >= 4).then(|| format!("sc-{}", &after[..hex_len]))
+}
+
+// ── the scanner: from camera pixels to an id ───────────────────────────────────────────
+//
+// The C++ has `QrScanDialog` doing this over the camera; the egui port had the status line
+// "Point at a SnapClone QR code" over a viewfinder that decoded nothing. This is the
+// decoder: threshold the frame, find the three finder eyes by the 1:1:3:1:1 run the
+// standard uses, take the grid from their centres, sample each module's centre, decode.
+// Handles rotation and scale; not perspective — a phone held roughly square to the code.
+
+/// A finder centre, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Finder {
+    pub x: f32,
+    pub y: f32,
+    /// The module size it implies (the run's total / 7).
+    pub module: f32,
+}
+
+/// Luminance of an RGBA frame, one byte per pixel.
+fn gray(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut g = vec![0u8; w * h];
+    for i in 0..w * h {
+        let p = &rgba[i * 4..i * 4 + 4];
+        g[i] = ((p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29) >> 8) as u8;
+    }
+    g
+}
+
+/// Does a run of five alternating stretches look like a finder (1:1:3:1:1)?
+fn finder_ratio(runs: &[usize; 5]) -> Option<f32> {
+    let total: usize = runs.iter().sum();
+    if total < 7 {
+        return None;
+    }
+    let m = total as f32 / 7.0;
+    let tol = (m * 0.7).max(1.0);
+    let ok = (runs[0] as f32 - m).abs() < tol
+        && (runs[1] as f32 - m).abs() < tol
+        && (runs[2] as f32 - 3.0 * m).abs() < 3.0 * tol
+        && (runs[3] as f32 - m).abs() < tol
+        && (runs[4] as f32 - m).abs() < tol;
+    ok.then_some(m)
+}
+
+/// Find finder candidates by scanning rows for the 1:1:3:1:1 pattern and confirming each
+/// with the same pattern down its column. `dark` is the thresholded frame (true = dark).
+pub fn find_finders(dark: &[bool], w: usize, h: usize) -> Vec<Finder> {
+    let mut found: Vec<Finder> = Vec::new();
+    let at = |x: usize, y: usize| dark[y * w + x];
+    for y in 0..h {
+        // run-length encode the row
+        let mut runs: Vec<(usize, bool, usize)> = Vec::new(); // (start, dark, len)
+        let mut x = 0;
+        while x < w {
+            let d = at(x, y);
+            let start = x;
+            while x < w && at(x, y) == d {
+                x += 1;
+            }
+            runs.push((start, d, x - start));
+        }
+        for i in 0..runs.len().saturating_sub(4) {
+            if !runs[i].1 {
+                continue;
+            }
+            let r = [runs[i].2, runs[i + 1].2, runs[i + 2].2, runs[i + 3].2, runs[i + 4].2];
+            let Some(m) = finder_ratio(&r) else { continue };
+            let cx = runs[i + 2].0 as f32 + runs[i + 2].2 as f32 / 2.0;
+            // confirm down the column through the centre
+            let cxi = cx as usize;
+            let mut up = 0;
+            let mut yy = y;
+            while yy > 0 && at(cxi, yy) { yy -= 1; up += 1; }
+            let mut down = 0;
+            let mut yy = y;
+            while yy + 1 < h && at(cxi, yy) { yy += 1; down += 1; }
+            let core = (up + down).max(1) as f32;
+            if (core - 3.0 * m).abs() > 2.0 * m.max(1.0) {
+                continue;
+            }
+            let cy = (y as f32 - up as f32 + y as f32 + down as f32) / 2.0;
+            // merge with an existing finder near this centre
+            if let Some(f) = found.iter_mut().find(|f| (f.x - cx).abs() < 3.0 * m && (f.y - cy).abs() < 3.0 * m) {
+                f.x = (f.x + cx) / 2.0;
+                f.y = (f.y + cy) / 2.0;
+                f.module = (f.module + m) / 2.0;
+            } else {
+                found.push(Finder { x: cx, y: cy, module: m });
+            }
+        }
+    }
+    found
+}
+
+/// Order three finders as (top-left, top-right, bottom-left) by the right angle at the
+/// corner one, with the handedness that puts top-right clockwise from top-left.
+fn orient(f: &[Finder]) -> Option<(Finder, Finder, Finder)> {
+    if f.len() < 3 {
+        return None;
+    }
+    // the corner finder is the one whose two edges are most nearly perpendicular
+    let mut best: Option<(f32, usize)> = None;
+    for i in 0..3 {
+        let (a, b) = ((i + 1) % 3, (i + 2) % 3);
+        let (ux, uy) = (f[a].x - f[i].x, f[a].y - f[i].y);
+        let (vx, vy) = (f[b].x - f[i].x, f[b].y - f[i].y);
+        let cos = (ux * vx + uy * vy).abs() / ((ux * ux + uy * uy).sqrt() * (vx * vx + vy * vy).sqrt()).max(1e-6);
+        if best.map(|(c, _)| cos < c).unwrap_or(true) {
+            best = Some((cos, i));
+        }
+    }
+    let (_, tl) = best?;
+    let (a, b) = ((tl + 1) % 3, (tl + 2) % 3);
+    let (ux, uy) = (f[a].x - f[tl].x, f[a].y - f[tl].y);
+    let (vx, vy) = (f[b].x - f[tl].x, f[b].y - f[tl].y);
+    // cross > 0 → b is clockwise from a (y down): a is top-right, b bottom-left
+    let cross = ux * vy - uy * vx;
+    if cross > 0.0 {
+        Some((f[tl], f[a], f[b]))
+    } else {
+        Some((f[tl], f[b], f[a]))
+    }
+}
+
+/// Decode an RGBA frame: the id it shows, if a code is in view.
+pub fn decode_frame(rgba: &[u8], w: usize, h: usize) -> Option<String> {
+    if rgba.len() < w * h * 4 || w < 21 || h < 21 {
+        return None;
+    }
+    let g = gray(rgba, w, h);
+    // adaptive-ish threshold: the frame's mean, which separates a code from its card
+    let mean = (g.iter().map(|&v| v as u64).sum::<u64>() / (w * h) as u64) as u8;
+    let dark: Vec<bool> = g.iter().map(|&v| v < mean).collect();
+    let mut finders = find_finders(&dark, w, h);
+    finders.sort_by(|a, b| b.module.partial_cmp(&a.module).unwrap());
+    // try the largest three first, then any three among the first six
+    let n = finders.len().min(6);
+    for i in 0..n {
+        for j in i + 1..n {
+            for k in j + 1..n {
+                let Some((tl, tr, bl)) = orient(&[finders[i], finders[j], finders[k]]) else { continue };
+                // the eye centres are modules (3,3), (17,3), (3,17): 14 modules apart
+                let ux = (tr.x - tl.x) / 14.0;
+                let uy = (tr.y - tl.y) / 14.0;
+                let vx = (bl.x - tl.x) / 14.0;
+                let vy = (bl.y - tl.y) / 14.0;
+                let mut modules = vec![false; MODULES * MODULES];
+                let mut ok = true;
+                for my in 0..MODULES {
+                    for mx in 0..MODULES {
+                        let fx = mx as f32 - 3.0;
+                        let fy = my as f32 - 3.0;
+                        let px = tl.x + fx * ux + fy * vx;
+                        let py = tl.y + fx * uy + fy * vy;
+                        if px < 0.0 || py < 0.0 || px >= w as f32 || py >= h as f32 {
+                            ok = false;
+                            break;
+                        }
+                        modules[my * MODULES + mx] = dark[py as usize * w + px as usize];
+                    }
+                    if !ok {
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let l = Layout { modules };
+                // the timing row is the cheap sanity check before decoding
+                let timing_ok = (8..MODULES - 8).all(|i| l.get(i, 6) == (i % 2 == 0));
+                if !timing_ok {
+                    continue;
+                }
+                if let Some(id) = decode_layout(&l) {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Draw a layout into an RGBA buffer as plain squares — the scanner's own test fixture,
+/// and a fallback renderer for a host without egui. `origin` and `cell` in pixels;
+/// `rot` in radians about the code's centre.
+pub fn rasterize(l: &Layout, rgba: &mut [u8], w: usize, h: usize, origin: (f32, f32), cell: f32, rot: f32, fg: [u8; 3]) {
+    let side = cell * MODULES as f32;
+    let (cx, cy) = (origin.0 + side / 2.0, origin.1 + side / 2.0);
+    let (cs, sn) = (rot.cos(), rot.sin());
+    for py in 0..h {
+        for px in 0..w {
+            // inverse-rotate the pixel into code space
+            let dx = px as f32 + 0.5 - cx;
+            let dy = py as f32 + 0.5 - cy;
+            let lx = cs * dx + sn * dy + side / 2.0;
+            let ly = -sn * dx + cs * dy + side / 2.0;
+            if lx < 0.0 || ly < 0.0 || lx >= side || ly >= side {
+                continue;
+            }
+            let (mx, my) = ((lx / cell) as usize, (ly / cell) as usize);
+            if l.get(mx, my) {
+                let i = (py * w + px) * 4;
+                rgba[i] = fg[0];
+                rgba[i + 1] = fg[1];
+                rgba[i + 2] = fg[2];
+                rgba[i + 3] = 255;
+            }
+        }
+    }
+}
+
+// ── the tilt ───────────────────────────────────────────────────────────────────────────
+//
+// The card is glass, and glass catches the light differently as it moves. `Tilt` is how
+// far the phone leans, from the accelerometer's gravity vector — or, on a machine with
+// none, from the pointer over the card, so a desktop gets the same effect under the mouse.
+// The painter uses it three ways: the modules shift a little against the card (parallax,
+// the eyes deeper than the dots), a highlight slides across the card toward the raised
+// edge, and the edge away from the light darkens. Smoothed, so a jittery sensor does not
+// shiver the code.
+
+/// A tilt, −1..1 on each axis: `x` positive leaning right, `y` positive leaning toward you.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Tilt {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Tilt {
+    /// From an accelerometer reading (any units — the vector is normalised): the gravity
+    /// components along the screen's axes. A face-up phone is (0, 0).
+    pub fn from_accel(ax: f32, ay: f32, az: f32) -> Tilt {
+        let n = (ax * ax + ay * ay + az * az).sqrt();
+        if n < 1e-3 {
+            return Tilt::default();
+        }
+        Tilt { x: (ax / n).clamp(-1.0, 1.0), y: (ay / n).clamp(-1.0, 1.0) }
+    }
+    /// From the pointer's place over `rect`: the centre is flat, the edges full tilt.
+    pub fn from_pointer(p: Pos2, rect: Rect) -> Tilt {
+        let x = ((p.x - rect.center().x) / (rect.width() * 0.5)).clamp(-1.0, 1.0);
+        let y = ((p.y - rect.center().y) / (rect.height() * 0.5)).clamp(-1.0, 1.0);
+        Tilt { x, y }
+    }
+    /// Low-pass toward `target`: `k` is the fraction moved per call (0.15 at 60 Hz settles in
+    /// about a third of a second).
+    pub fn ease_toward(self, target: Tilt, k: f32) -> Tilt {
+        let k = k.clamp(0.0, 1.0);
+        Tilt { x: self.x + (target.x - self.x) * k, y: self.y + (target.y - self.y) * k }
+    }
+    pub fn magnitude(self) -> f32 {
+        (self.x * self.x + self.y * self.y).sqrt().min(1.0)
+    }
+}
+
+/// The parallax, in points, that a layer at `depth` (0 = the card face, 1 = deepest)
+/// shifts under `tilt`: the deeper the layer the more it moves against the frame.
+pub fn parallax(tilt: Tilt, depth: f32, max_pt: f32) -> egui::Vec2 {
+    egui::vec2(-tilt.x, -tilt.y) * max_pt * depth.clamp(0.0, 1.0)
+}
+
+/// [`qr_ui`] with a tilt: the card catches the light. Pass the smoothed tilt from the
+/// sensor, or `Tilt::from_pointer` of the hover position over the card.
+pub fn qr_ui_tilted(ui: &mut Ui, layout: &Layout, side: f32, c: &PaletteColors, revealed_at: Option<f64>, tilt: Tilt) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), Sense::click());
+    let t = revealed_at.map(|t0| ui.input(|i| i.time) - t0);
+    if matches!(t, Some(t) if t < REVEAL_TOTAL_S) {
+        ui.ctx().request_repaint();
+    }
+    paint_tilted(ui.painter(), rect, layout, ui.ctx().pixels_per_point(), c, t, tilt);
+    resp
+}
+
+/// [`paint`] with a tilt.
+pub fn paint_tilted(painter: &egui::Painter, rect: Rect, layout: &Layout, pixels_per_point: f32, c: &PaletteColors, reveal_t: Option<f64>, tilt: Tilt) {
+    let (bg, _fg) = theme_colors(c);
+    // the card, drawn where it is; the modules parallax within it by depth
+    painter.rect_filled(rect, CornerRadius::same(CARD_RADIUS), bg);
+    let max_pt = rect.width() * 0.012;
+    let inner = rect.shrink(CARD_PAD + max_pt);
+    // the modules, shifted as one layer (the eyes a touch deeper via the second pass)
+    let shift = parallax(tilt, 1.0, max_pt);
+    let clip = painter.with_clip_rect(rect);
+    paint_modules(&clip, inner.translate(shift), layout, pixels_per_point, c, reveal_t);
+    // the light: a soft highlight sliding toward the raised edge, and a shade on the far one
+    let m = tilt.magnitude();
+    if m > 0.01 {
+        let dir = egui::vec2(tilt.x, tilt.y) / m;
+        let hi_c = rect.center() - dir * rect.width() * 0.35;
+        soft_light(&clip, hi_c, rect.width() * 0.55, Color32::from_white_alpha((28.0 * m) as u8));
+        let lo_c = rect.center() + dir * rect.width() * 0.45;
+        soft_light(&clip, lo_c, rect.width() * 0.6, Color32::from_black_alpha((40.0 * m) as u8));
+    }
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(CARD_RADIUS),
+        egui::Stroke::new(1.0, Color32::from_white_alpha(crate::glass::GlassAlphas::HAIRLINE)),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// A feathered disc of light or shade (the same mesh the live backgrounds use).
+fn soft_light(painter: &egui::Painter, centre: Pos2, r: f32, tint: Color32) {
+    let a = tint.a();
+    if a == 0 {
+        return;
+    }
+    let [cr, cg, cb, _] = tint.to_srgba_unmultiplied();
+    crate::livebg::soft_disc(painter, centre, r, Color32::from_rgb(cr, cg, cb), a);
 }
 
 // ── the SVG ────────────────────────────────────────────────────────────────────────────
@@ -461,11 +816,12 @@ pub struct ExpandedEvent {
 /// Draw the expanded overlay. `state` is `Some` while open; it is set to `None` on the
 /// frame it closes. Returns whether it closed — see [`expanded_ui_with`] for the SVG button.
 pub fn expanded_ui(ctx: &egui::Context, state: &mut Option<Expanded>, id: &str, layout: &Layout, c: &PaletteColors) -> bool {
-    expanded_ui_with(ctx, state, id, layout, c).closed
+    expanded_ui_with(ctx, state, id, layout, c, None).closed
 }
 
-/// [`expanded_ui`], reporting the Save SVG press as well.
-pub fn expanded_ui_with(ctx: &egui::Context, state: &mut Option<Expanded>, id: &str, layout: &Layout, c: &PaletteColors) -> ExpandedEvent {
+/// [`expanded_ui`], reporting the Save SVG press as well, with a tilt: the sensor's when
+/// the caller has one, else the pointer's over the code (a desktop's mouse tilts it).
+pub fn expanded_ui_with(ctx: &egui::Context, state: &mut Option<Expanded>, id: &str, layout: &Layout, c: &PaletteColors, tilt: Option<Tilt>) -> ExpandedEvent {
     let mut ev = ExpandedEvent::default();
     let Some(ex) = *state else { return ev };
     let now = ctx.input(|i| i.time);
@@ -493,7 +849,10 @@ pub fn expanded_ui_with(ctx: &egui::Context, state: &mut Option<Expanded>, id: &
             egui::vec2(side, side),
         );
         let mut card = ui.new_child(egui::UiBuilder::new().max_rect(code_rect).sense(Sense::click()));
-        let _code = qr_ui(&mut card, layout, side, c, Some(ex.opened_at));
+        let tilt = tilt.unwrap_or_else(|| {
+            ui.input(|i| i.pointer.hover_pos()).map(|p| Tilt::from_pointer(p, code_rect)).unwrap_or_default()
+        });
+        let _code = qr_ui_tilted(&mut card, layout, side, c, Some(ex.opened_at), tilt);
         // fade: paint the base over the top at 1-a, so the whole thing comes up together
         if a < 1.0 {
             ui.painter().rect_filled(window, 0.0, Color32::from_rgba_unmultiplied(c.bg_base.r(), c.bg_base.g(), c.bg_base.b(), (255.0 * (1.0 - a)) as u8));
@@ -644,6 +1003,71 @@ mod tests {
     }
 
     #[test]
+    fn the_id_round_trips_through_the_layout_and_a_hashed_square_does_not_decode() {
+        for id in ["sc-b25a8b59", "sc-0001", "sc-deadbeefcafe"] {
+            let l = layout_for(id);
+            assert_eq!(decode_layout(&l).as_deref(), Some(id), "{id}");
+        }
+        assert_eq!(data_cells().count(), 180);
+        // a square with no id in it — the old hashed data field, or noise
+        let mut noise = layout_for("");
+        for (i, (x, y)) in data_cells().enumerate() {
+            noise.modules[y * MODULES + x] = (i * 7919) % 3 == 0;
+        }
+        assert_eq!(decode_layout(&noise), None);
+    }
+
+    #[test]
+    fn a_rendered_code_is_scanned_back_straight_scaled_and_rotated() {
+        let id = "sc-b25a8b59";
+        let l = layout_for(id);
+        for (cell, rot) in [(6.0f32, 0.0f32), (4.0, 0.0), (7.0, 0.35), (5.0, -1.2), (6.0, 1.57)] {
+            let (w, h) = (320usize, 320usize);
+            let mut rgba = vec![0u8; w * h * 4];
+            // a mid-grey backdrop and a light card, so the threshold has something to split
+            for i in 0..w * h {
+                rgba[i * 4..i * 4 + 4].copy_from_slice(&[150, 150, 150, 255]);
+            }
+            let side = cell * MODULES as f32;
+            let o = ((w as f32 - side) / 2.0, (h as f32 - side) / 2.0);
+            // the card: light, a quiet zone around the modules
+            for py in 0..h {
+                for px in 0..w {
+                    let dx = px as f32 - w as f32 / 2.0;
+                    let dy = py as f32 - h as f32 / 2.0;
+                    if dx.abs() < side * 0.8 && dy.abs() < side * 0.8 {
+                        rgba[(py * w + px) * 4..(py * w + px) * 4 + 4].copy_from_slice(&[235, 232, 226, 255]);
+                    }
+                }
+            }
+            rasterize(&l, &mut rgba, w, h, o, cell, rot, [20, 20, 22]);
+            assert_eq!(decode_frame(&rgba, w, h).as_deref(), Some(id), "cell {cell} rot {rot}");
+        }
+        // an empty frame decodes to nothing
+        let blank = vec![120u8; 64 * 64 * 4];
+        assert_eq!(decode_frame(&blank, 64, 64), None);
+    }
+
+    #[test]
+    fn a_tilt_comes_from_gravity_or_the_pointer_and_settles() {
+        assert_eq!(Tilt::from_accel(0.0, 0.0, 9.8), Tilt::default(), "face up is flat");
+        let t = Tilt::from_accel(4.9, 0.0, 8.5);
+        assert!(t.x > 0.4 && t.x < 0.6 && t.y.abs() < 1e-6);
+        assert_eq!(Tilt::from_accel(0.0, 0.0, 0.0), Tilt::default(), "no reading is flat, not NaN");
+        let r = Rect::from_min_size(Pos2::ZERO, egui::vec2(100.0, 100.0));
+        assert_eq!(Tilt::from_pointer(Pos2::new(50.0, 50.0), r), Tilt::default());
+        assert_eq!(Tilt::from_pointer(Pos2::new(100.0, 0.0), r), Tilt { x: 1.0, y: -1.0 });
+        assert_eq!(Tilt::from_pointer(Pos2::new(500.0, 50.0), r).x, 1.0, "clamped");
+        let mut s = Tilt::default();
+        for _ in 0..30 {
+            s = s.ease_toward(Tilt { x: 1.0, y: 0.0 }, 0.15);
+        }
+        assert!(s.x > 0.98, "settled in half a second at 60 Hz: {}", s.x);
+        assert_eq!(parallax(Tilt { x: 1.0, y: 0.0 }, 1.0, 4.0), egui::vec2(-4.0, 0.0));
+        assert_eq!(parallax(Tilt { x: 1.0, y: 0.0 }, 0.0, 4.0), egui::vec2(0.0, 0.0), "the card face does not move");
+    }
+
+    #[test]
     fn the_small_code_and_the_overlay_draw_headless() {
         let c = crate::default_palette();
         let layout = layout_for("sc-abcdef01");
@@ -655,8 +1079,8 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let r = qr_ui(ui, &layout, 168.0, &c, None);
                 assert!(!r.clicked());
-                // and a reveal that has run its course draws everything too
-                let _ = qr_ui(ui, &layout, 120.0, &c, Some(-REVEAL_TOTAL_S));
+                // and a reveal that has run its course draws everything too, tilted
+                let _ = qr_ui_tilted(ui, &layout, 120.0, &c, Some(-REVEAL_TOTAL_S), Tilt { x: 0.4, y: -0.3 });
             });
             let closed = expanded_ui(ctx, &mut ex, "sc-abcdef01", &layout, &c);
             assert!(!closed, "nothing closes it on a frame with no input");
