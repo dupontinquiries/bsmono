@@ -83,6 +83,8 @@
 #[allow(dead_code)] pub mod pathfan;
 #[allow(dead_code)] pub mod styles;
 #[allow(dead_code)] pub mod reflexive;
+/// The STUN Binding request that turns `reflexive`'s classifier into a measurement.
+pub mod stunwire;
 #[allow(dead_code)] pub mod peerauth;
 #[allow(dead_code)] pub mod natpath;
 #[allow(dead_code)] pub mod rendezvous;
