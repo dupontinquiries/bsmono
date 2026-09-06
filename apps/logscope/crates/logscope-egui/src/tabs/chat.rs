@@ -6338,8 +6338,12 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
                 // left. Columns a distance apart landed in the same depth
                 // bucket and flickered: reported as "cylinder and circle
                 // z-fighting across the spaces".
-                let ep = crate::scene3d::env_params();
-                let scene_r = (ep.ext_x.max(ep.ext_z) as f32) * 0.5 + 8.0;
+                // The far plane has to reach the WORLD's edge. This was `ext/2 + 8` — the graph's extent —
+                // so with any camera nearer than the outer wall the wall, the sky and the boundary ring were
+                // clipped away: a cave whose floor and walls were black past forty units, a pond that was not
+                // there. Found by rendering the Cat Cave; the same cut applies to every scene whose props sit
+                // beyond the graph (all of them). The scene knows its own radius; ask it.
+                let scene_r = crate::scene3d::scene_radius(name).max(20.0);
                 let (znear, zfar) = crate::gpuscene::Camera::depth_range(scene_r, view_cam.dist);
                 let cam = crate::gpuscene::Camera::from_orbit(&view_cam, rect.width(), rect.height(), scale, znear, zfar);
                 let mut verts = Vec::new();

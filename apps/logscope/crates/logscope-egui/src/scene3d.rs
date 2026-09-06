@@ -104,13 +104,27 @@ impl Float {
 }
 
 /// A baked environment: parallel meshes + their float motions.
-pub struct Scene { pub meshes: Vec<Mesh3>, floats: Vec<Float>, anchors: Vec<Vec3> }
+pub struct Scene { pub meshes: Vec<Mesh3>, floats: Vec<Float>, anchors: Vec<Vec3>, radius: std::cell::Cell<f32> }
 /// How dark a prop goes where it touches the ground. Strong enough to read
 /// at a distance, short of looking like a painted-on shadow.
 const CONTACT_STRENGTH: f32 = 0.45;
 
 impl Scene {
-    fn new() -> Self { Scene { meshes: Vec::new(), floats: Vec::new(), anchors: Vec::new() } }
+    fn new() -> Self { Scene { meshes: Vec::new(), floats: Vec::new(), anchors: Vec::new(), radius: std::cell::Cell::new(0.0) } }
+
+    /// How far the furthest vertex sits from the origin — the SCENE's radius, computed once from the geometry
+    /// that was actually built (cached; a scene is baked once per palette). This is what the camera's far plane
+    /// has to reach. It was being fitted to the GRAPH's extent instead, and every scene's outer wall, sky and
+    /// boundary ring vanished the moment the camera came near — see `scene_radius`.
+    pub fn bounding_radius(&self) -> f32 {
+        let cached = self.radius.get();
+        if cached > 0.0 { return cached; }
+        let mut r2 = 1.0f32;
+        for m in &self.meshes { for p in &m.verts { r2 = r2.max(p.x * p.x + p.y * p.y + p.z * p.z); } }
+        let r = r2.sqrt();
+        self.radius.set(r);
+        r
+    }
 
     /// Index to hand back to [`Scene::ground_since`] after building a prop.
     fn mark(&self) -> usize { self.meshes.len() }
@@ -6289,6 +6303,15 @@ pub fn with_env(palette_name: &str, t: f32, f: impl FnOnce(&[Mesh3])) {
         scene.build_reveal(t - bt);
         f(&scene.meshes);
     });
+}
+
+/// The built environment's bounding radius for `palette_name` (builds and caches the scene if needed, exactly
+/// as `with_env` does). For the camera's depth range: the far plane must reach the world's edge, not the graph's.
+pub fn scene_radius(palette_name: &str) -> f32 {
+    let mut r = 0.0;
+    with_env(palette_name, 0.0, |_| {});
+    ENV.with(|cell| { if let Some(e) = cell.borrow().as_ref() { if e.0 == palette_name { r = e.3.bounding_radius(); } } });
+    r
 }
 
 /// Build/cache the themed environment for `palette_name`, float it for time `t`, and paint it through `cam`
