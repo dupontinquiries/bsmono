@@ -115,6 +115,8 @@ pub mod style;
 pub mod spec;
 /// A latent space over the world tree: per-commit vectors cached by hash, nearest, interpolate to a spec.
 pub mod latent;
+/// The recognizer: a build sentence to a form line, without a model.
+pub mod recipe;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.

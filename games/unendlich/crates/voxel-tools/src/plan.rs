@@ -127,10 +127,15 @@ pub fn line_is_valid_ir(line: &str) -> bool {
         "spec" | "properties" => return crate::spec::Spec::parse(t).is_ok(),
         _ => {}
     }
-    let (plan, issues) = parse_plan_at(&format!("{t}\n"), Some((0, 64, 0)));
+    let (plan, mut issues) = parse_plan_at(&format!("{t}\n"), Some((0, 64, 0)));
     if plan.ops.is_empty() { return false; }
-    !issues.iter().any(|i| i.severity == Severity::Error
-                         || i.message.contains("was -") || i.message.contains("was 0"))
+    // Both passes: the parser's clamp notes AND the plan-level checks.
+    // Any WARNING is grounds to take the line back: "radius was -1",
+    // "tree shorter than 3 will not look like a tree", "height was 0".
+    // The first version read one pass and matched two phrasings, and a
+    // 1B's `tree h=-9` walked through on the third.
+    issues.extend(validate(&plan));
+    !issues.iter().any(|i| matches!(i.severity, Severity::Error | Severity::Warning))
 }
 
 /// Expand `def NAME` … `end` / `use NAME @x,z [rot=N] [mirror]` into
@@ -653,6 +658,15 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                             ("pose", "standing") => Some(0), ("pose", "seated") => Some(1),
                             ("pose", "arms_up") | ("pose", "raised") => Some(2),
                             ("pose", "kneeling") | ("pose", "crouched") => Some(3),
+                            ("pose", "lunge") | ("pose", "lunging") | ("pose", "combat") | ("pose", "fighting")
+                                | ("pose", "throwing") => Some(4),
+                            ("hold", "bolt") | ("hold", "lightning") | ("hold", "thunderbolt") => Some(1),
+                            ("hold", "sword") | ("hold", "blade") => Some(2),
+                            ("hold", "staff") | ("hold", "spear") | ("hold", "trident") => Some(3),
+                            ("hold", "orb") | ("hold", "globe") => Some(4),
+                            ("hold", "shield") => Some(5),
+                            ("hold", "nothing") | ("hold", "none") => Some(0),
+                            ("beard", "yes") | ("beard", "true") => Some(1),
                             _ => v.parse().ok(),
                         };
                         n.map(|n| (k.to_string(), n))
@@ -981,7 +995,9 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                 Some(a) => ops.push(Op::Tree {
                     at: a,
                     species: t.get(2).filter(|s| !s.contains('=')).unwrap_or(&"oak").to_string(),
-                    height: kvi(&t, "h", 8),
+                    // Clamped like every other size: a 1B wrote h=-9 and
+                    // the tree op was the one that let it through.
+                    height: { let h = kvi(&t, "h", 8); if h < 3 { clamp_size(-1, 8, &mut notes, "tree height") } else { h } },
                     lean: kv(&t, "lean").and_then(|v| pair(&v)).unwrap_or((0, 0)) }),
                 _ if t.get(1).is_some_and(|s| s.starts_with('@')) && anchor.is_none() => {
                     rel_err.set(true);
@@ -2191,7 +2207,8 @@ scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
             assert!(line_is_valid_ir(good), "{good:?} should pass");
         }
         for bad in ["cylinder @0,0 r=-1 h=-3", "frobnicate @0,0", "cylinder @0,0 r=0",
-                    "spec durability=purple", "use", "def", "Here is a plan:", "```"] {
+                    "spec durability=purple", "use", "def", "Here is a plan:", "```",
+                    "tree @0,0 oak h=-9", "tree @0,0 oak h=1"] {
             assert!(!line_is_valid_ir(bad), "{bad:?} should be taken back");
         }
     }

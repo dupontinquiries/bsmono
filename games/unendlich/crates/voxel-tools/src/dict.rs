@@ -70,7 +70,8 @@ pub const FORMS: &[Form] = &[
     Form { name: "cavern", summary: "a carved underground chamber with pillars and an entrance shaft",
            build: cavern },
     Form { name: "statue", summary: "a figure on a plinth: figure|gargoyle|idol|obelisk|colossus, \
-                                     pose=standing|seated|arms_up|kneeling",
+                                     pose=standing|seated|arms_up|kneeling|lunge, \
+                                     hold=bolt|sword|staff|orb|shield, beard=1",
            build: statue },
     Form { name: "castle", summary: "curtain wall, corner towers, gatehouse and a keep",
            build: castle },
@@ -495,6 +496,11 @@ fn statue(a: &FormArgs) -> Solid {
     let cz = (lo[2] + hi[2]) / 2.0;
     let style = a.style.as_str();
     let pose = a.nums.iter().find(|(k, _)| k == "pose").map(|(_, v)| *v).unwrap_or(0);
+    // What the raised hand holds, and whether the face has a beard:
+    // both from k=v numbers the parser mapped from words (hold=bolt,
+    // beard=1). A statue of somebody is a statue of what they carry.
+    let hold = a.nums.iter().find(|(k, _)| k == "hold").map(|(_, v)| *v).unwrap_or(0);
+    let beard = a.nums.iter().any(|(k, v)| k == "beard" && *v > 0);
     // Height from h= or the footprint: a figure is ~2.4x its footprint.
     let base_w = ((hi[0] - lo[0]).min(hi[2] - lo[2])).max(4.0);
     let scale = if style == "colossus" { 3.0 } else { 1.0 };
@@ -547,6 +553,7 @@ fn statue(a: &FormArgs) -> Solid {
     let leg_h = h * if style == "idol" { 0.15 } else { 0.4 };
     let crouch = style == "gargoyle" || pose == 3;
     let seated = pose == 1;
+    let lunge = pose == 4;
     let leg_h = if crouch || seated { leg_h * 0.5 } else { leg_h };
     let hip_y = ground + leg_h;
     let neck_y = hip_y + torso_h;
@@ -556,6 +563,21 @@ fn statue(a: &FormArgs) -> Solid {
     if seated {
         parts.push(Solid::Box { min: [cx - shoulder_w * 0.5, ground, cz - shoulder_w * 0.7],
                                 max: [cx + shoulder_w * 0.5, hip_y, cz + shoulder_w * 0.3], mat: stone.clone() });
+    } else if lunge {
+        // LUNGE: the front leg (+z, toward the viewer) is bent -- a
+        // thigh sloping forward from the hip and a shin rising from a
+        // foot well ahead; the back leg is straight and trails behind.
+        let stride = shoulder_w * 0.9;
+        let front = [cx - shoulder_w * 0.28, ground, cz + stride];
+        parts.push(Solid::Cylinder { base: front, r: leg_r, h: leg_h * 0.55, mat: stone.clone() });   // shin
+        parts.push(Solid::Wedge { min: [front[0] - leg_r, ground + leg_h * 0.5, cz - leg_r],
+                                  max: [front[0] + leg_r, 0.0, cz + stride + leg_r],
+                                  h: leg_h * 0.55, axis: Axis::X, mat: stone.clone() });               // thigh
+        let back = [cx + shoulder_w * 0.28, ground, cz - stride * 0.7];
+        parts.push(Solid::Cylinder { base: back, r: leg_r, h: leg_h * 0.7, mat: stone.clone() });
+        parts.push(Solid::Wedge { min: [back[0] - leg_r, ground + leg_h * 0.6, cz - stride * 0.7 - leg_r],
+                                  max: [back[0] + leg_r, 0.0, cz + leg_r],
+                                  h: leg_h * 0.45, axis: Axis::X, mat: stone.clone() });
     } else {
         for side in [-1.0, 1.0] {
             parts.push(Solid::Cylinder { base: [cx + side * shoulder_w * 0.28, ground, cz], r: leg_r, h: leg_h,
@@ -572,13 +594,48 @@ fn statue(a: &FormArgs) -> Solid {
     // arms: raised, out, or down
     let arm_r = (shoulder_w * 0.16).max(0.8);
     let arm_len = torso_h * 0.9;
+    let mut hand: Option<[f32; 3]> = None;   // where the raised hand ends up
     for side in [-1.0, 1.0] {
         let sx = cx + side * (shoulder_w * 0.5 + arm_r * 0.5);
         match pose {
-            2 => parts.push(Solid::Cylinder { base: [sx, neck_y - arm_r, cz], r: arm_r, h: arm_len,
-                                              mat: stone.clone() }),          // arms up
+            2 => { parts.push(Solid::Cylinder { base: [sx, neck_y - arm_r, cz], r: arm_r, h: arm_len,
+                                                mat: stone.clone() });          // arms up
+                   if side > 0.0 { hand = Some([sx, neck_y - arm_r + arm_len, cz]); } }
+            4 if side > 0.0 => {
+                // the throwing arm: up and back, a wedge from the shoulder
+                parts.push(Solid::Wedge { min: [sx - arm_r, neck_y - arm_r, cz - arm_len],
+                                          max: [sx + arm_r, 0.0, cz + arm_r],
+                                          h: arm_len, axis: Axis::X, mat: stone.clone() });
+                hand = Some([sx, neck_y - arm_r + arm_len * 0.9, cz - arm_len * 0.8]);
+            }
+            4 => parts.push(Solid::Wedge { min: [sx - arm_r, neck_y - arm_len * 0.6, cz - arm_r],
+                                           max: [sx + arm_r, 0.0, cz + arm_len],
+                                           h: arm_len * 0.6, axis: Axis::X, mat: stone.clone() }),   // the leading arm, forward
             _ => parts.push(Solid::Cylinder { base: [sx, neck_y - arm_len, cz], r: arm_r, h: arm_len,
                                               mat: stone.clone() }),          // arms down
+        }
+    }
+    if let Some(h) = hand {
+        let bright = Material::new(37, 60);   // quartz: what reads as light in stone
+        match hold {
+            1 => {
+                // a LIGHTNING BOLT: a zigzag of five short bars from the hand
+                let mut p = h;
+                for i in 0..5 {
+                    let dx = if i % 2 == 0 { 1.0 } else { -1.0 } * head_r * 0.6;
+                    parts.push(Solid::Box { min: [p[0].min(p[0] + dx) - 0.5, p[1] - 0.5, p[2] - 0.5],
+                                            max: [p[0].max(p[0] + dx) + 0.5, p[1] + 0.5, p[2] + 0.5], mat: bright.clone() });
+                    p = [p[0] + dx, p[1] + head_r * 0.5, p[2]];
+                }
+            }
+            2 => parts.push(Solid::Box { min: [h[0] - 0.5, h[1] - arm_len * 0.3, h[2] - 0.5],
+                                         max: [h[0] + 0.5, h[1] + arm_len * 1.2, h[2] + 0.5], mat: dark.clone() }),   // sword
+            3 => parts.push(Solid::Cylinder { base: [h[0], ground, h[2]], r: 0.5, h: h[1] - ground + head_r * 2.0,
+                                              mat: dark.clone() }),    // staff, to the ground
+            4 => parts.push(Solid::Sphere { centre: [h[0], h[1] + head_r * 0.6, h[2]], r: head_r * 0.6, mat: bright }),  // orb
+            5 => parts.push(Solid::Box { min: [h[0] - head_r, h[1] - head_r, h[2] - 0.5],
+                                         max: [h[0] + head_r, h[1] + head_r, h[2] + 0.5], mat: dark.clone() }),  // shield
+            _ => {}
         }
     }
     // head
@@ -589,6 +646,11 @@ fn statue(a: &FormArgs) -> Solid {
     for ex in [cx - head_r * 0.4, cx + head_r * 0.4] {
         parts.push(Solid::Box { min: [ex - 0.5, head_y, cz + head_r * 0.6], max: [ex + 0.5, head_y + 1.0, cz + head_r + 0.5],
                                 mat: Material::carved() });
+    }
+    if beard {
+        parts.push(Solid::Wedge { min: [cx - head_r * 0.6, head_y - head_r * 1.6, cz + head_r * 0.3],
+                                  max: [cx + head_r * 0.6, 0.0, cz + head_r + 0.5],
+                                  h: head_r * 1.1, axis: Axis::X, mat: dark.clone() });
     }
     if style == "gargoyle" {
         // horns and wings
@@ -987,5 +1049,39 @@ mod tests {
             let gap = (lo_x..=hi_x).any(|x| !row.contains(&x));
             assert!(gap, "{name}: the south course at z={south} has no gap: {row:?}");
         }
+    }
+
+    fn solid_stone_top(cells: &std::collections::BTreeMap<(i32, i32, i32), u16>) -> i32 {
+        cells.iter().filter(|(_, b)| **b == 1).map(|(k, _)| k.1).max().unwrap()
+    }
+
+    #[test]
+    fn a_lunging_colossus_with_a_bolt_reads_as_one() {
+        let a = FormArgs { min: (0, 64, 0), max: (10, 64, 10), style: "colossus".into(),
+                           block: 1, accent: 58, nums: vec![("pose".into(), 4), ("hold".into(), 1), ("beard".into(), 1)] };
+        let cells = rasterize(&statue(&a));
+        let solid: Vec<_> = cells.iter().filter(|(_, b)| **b != 0).map(|(k, _)| *k).collect();
+        // giant: well over the footprint's implied height
+        let top = solid.iter().map(|c| c.1).max().unwrap();
+        assert!(top - 64 >= 40, "a colossus is tall: {}", top - 64);
+        // a lunge: solid reaches well forward (+z) of the plinth's centre at ground level
+        let front_reach = solid.iter().filter(|c| c.1 <= 68).map(|c| c.2).max().unwrap();
+        assert!(front_reach > 8, "the front foot is out ahead: z={front_reach}");
+        // a bolt: bright cells (quartz) high up and off to one side
+        let bolt: Vec<_> = cells.iter().filter(|(_, b)| **b == 37).map(|(k, _)| *k).collect();
+        assert!(bolt.len() >= 5, "a bolt of {} cells", bolt.len());
+        assert!(bolt.iter().map(|c| c.1).min().unwrap() > 64 + 20, "held high");
+        // a beard: accent cells just under the head on the south face
+        // the beard hangs from chin height: head_r ~10 on a colossus, so
+        // it sits 8-26 below the CROWN -- the top of the stone, not the
+        // bolt, which rises twenty blocks above the head
+        let crown = solid_stone_top(&cells);
+        assert!(cells.iter().any(|(k, b)| *b == 58 && k.1 < crown - 8 && k.1 > crown - 26 && k.2 >= 5),
+                "a beard under the chin (crown {crown})");
+        // and it still parses through the form line
+        let (plan, issues) = crate::plan::parse_plan_at(
+            "form statue @-5,-5 @5,5 colossus pose=lunge hold=bolt beard=1\n", Some((0, 64, 0)));
+        assert!(issues.iter().all(|i| i.severity != crate::plan::Severity::Error), "{issues:?}");
+        assert_eq!(plan.ops.len(), 1);
     }
 }

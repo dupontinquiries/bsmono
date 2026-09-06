@@ -506,6 +506,22 @@ impl ChatSession {
         // number, and salvage keys on them. Working on the expanded
         // source keeps numbers honest, and the repair prompt shows the
         // model concrete lines rather than a macro it has to unfold.
+        // THE RECOGNIZER. If the prose names a form the model's plan
+        // does not contain, the recognized form line leads the plan and
+        // the model's lines follow. "A giant stone statue of Zeus" from
+        // a 1B was a tower and a tree; the words were all there, and
+        // reading them is not something a 1B does. The model's reply is
+        // still used -- nothing it wrote is dropped -- but the shape the
+        // player asked for is guaranteed.
+        let recognized = crate::recipe::recognise(prose)
+            .filter(|_| !ir.lines().any(|l| l.trim_start().to_lowercase().starts_with("form ")));
+        let recognized_why = recognized.as_ref().map(|r| format!(
+            "RECOGNIZED {} from '{}': {}", r.form, r.because.join(", "), r.line()));
+        let ir_with_form = match &recognized {
+            Some(r) => format!("# {}\n{}\n{}", r.name.clone().unwrap_or_else(|| r.form.clone()), r.line(), ir),
+            None => ir.to_string(),
+        };
+        let ir: &str = &ir_with_form;
         // A /like spec waiting: prepend it unless the plan has its own.
         let expanded = match self.pending_spec.take() {
             Some(spec) if !ir.lines().any(|l| l.trim_start().starts_with("spec")) =>
@@ -663,6 +679,7 @@ impl ChatSession {
         for w in &dry.withdrawn {
             echo.push_str(&format!("\nWITHDRAWN: {}", w.message()));
         }
+        if let Some(r) = &recognized_why { echo.push_str(&format!("\n{r}")); }
         for w in &finishing_why {
             echo.push_str(&format!("\nFINISHING ({w})"));
         }
@@ -1493,5 +1510,30 @@ mod tests {
         let ctx = { let t = VoxelTools::new(&mut w); s.context(&t, &gaze_at(0, 0, 10.0), None) };
         assert!(ctx.contains("LAST BUILD 'the well'"), "{ctx}");
         assert!(ctx.contains("NAMED BUILD 'the mill': box (40, 65, 40)..(52, 74, 50)"), "{ctx}");
+    }
+
+    #[test]
+    fn the_zeus_sentence_gets_a_statue_even_from_a_tower_and_a_tree() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 400_000);
+        let g = gaze_at(0, 0, 10.0);
+        // exactly what the 1B answered
+        let ir = "cylinder @2,-1 r=2 h=10 block=stone\ntree @6,4 oak h=8\n";
+        match s.receive_plan_gated(&mut t, &g, ir, None,
+                                   "a giant stone statue of Zeus holding a lightning bolt in a lunge combat position") {
+            Reply::Preview { echo, blocks, .. } => {
+                assert!(echo.contains("RECOGNIZED statue"), "{echo}");
+                assert!(echo.contains("pose=lunge") && echo.contains("hold=bolt") && echo.contains("beard=1"), "{echo}");
+                assert!(blocks > 3000, "a colossus, not a pillar: {blocks}");
+                assert!(echo.contains("tower") || echo.contains("cylinder"), "the model's own lines still ran: {echo}");
+            }
+            o => panic!("{o:?}"),
+        }
+        // a plan that already has a form is left alone
+        match s.receive_plan_gated(&mut t, &g, "form statue @-3,-3 @3,3 idol\n", None, "a giant statue") {
+            Reply::Preview { echo, .. } => assert!(!echo.contains("RECOGNIZED"), "{echo}"),
+            o => panic!("{o:?}"),
+        }
     }
 }
