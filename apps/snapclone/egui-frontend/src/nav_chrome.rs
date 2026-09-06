@@ -152,19 +152,34 @@ pub fn peel_ui(ui: &mut egui::Ui, h: &mut PeelHint, rect: egui::Rect,
     let e = h.edges();
     let mid = rect.center().y;
     let p = ui.painter();
+    // A TAB, not a scratch at the edge. The chevron used to sit 2px from the
+    // page edge on nothing — it read as a stray mark, and on the live backdrop
+    // it was lost against the vignette. It is now inside a small glass tab
+    // hugging the edge, inset so it clears the page's margin: the same surface
+    // language as the cards, at fingernail size.
+    let tab_w = 22.0;
+    let tab_h = 72.0;
+    let inset = PEEL_INSET;
+    let fill = egui::Color32::from_rgba_unmultiplied(
+        c.text_weak.r(), c.text_weak.g(), c.text_weak.b(), (a * 26.0) as u8);
+    let mut draw_tab = |x0: f32, dir: f32| {
+        let r = egui::Rect::from_min_size(egui::pos2(x0, mid - tab_h * 0.5), egui::vec2(tab_w, tab_h));
+        p.rect_filled(r, egui::CornerRadius::same(11), fill);
+        let cx = r.center().x - dir * 1.0;
+        let tip = egui::pos2(cx + dir * 3.5, mid);
+        p.line_segment([egui::pos2(cx - dir * 3.5, mid - 10.0), tip], egui::Stroke::new(1.6_f32, col));
+        p.line_segment([tip, egui::pos2(cx - dir * 3.5, mid + 10.0)], egui::Stroke::new(1.6_f32, col));
+    };
     if e.left {
-        p.line_segment([egui::pos2(rect.left() + 2.0, mid - 16.0),
-                        egui::pos2(rect.left() + 8.0, mid)], egui::Stroke::new(2.0_f32, col));
-        p.line_segment([egui::pos2(rect.left() + 8.0, mid),
-                        egui::pos2(rect.left() + 2.0, mid + 16.0)], egui::Stroke::new(2.0_f32, col));
+        draw_tab(rect.left() + inset, -1.0);
     }
     if e.right {
-        p.line_segment([egui::pos2(rect.right() - 2.0, mid - 16.0),
-                        egui::pos2(rect.right() - 8.0, mid)], egui::Stroke::new(2.0_f32, col));
-        p.line_segment([egui::pos2(rect.right() - 8.0, mid),
-                        egui::pos2(rect.right() - 2.0, mid + 16.0)], egui::Stroke::new(2.0_f32, col));
+        draw_tab(rect.right() - inset - tab_w, 1.0);
     }
 }
+
+/// How far the peel tabs sit in from the page edge — inside the page margin, not on the edge.
+pub const PEEL_INSET: f32 = 6.0;
 
 #[cfg(test)]
 mod tests {

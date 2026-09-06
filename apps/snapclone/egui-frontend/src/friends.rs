@@ -588,21 +588,27 @@ pub fn friends_ui(ui: &mut egui::Ui, roster: &Roster, acc: &mut Accordion,
         });
     }
 
-    ui.separator();
-    ui.colored_label(c.text_weak, "Add Peer by Address");
-    ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut form.host).id_salt("friends-form_host")
-            .hint_text("Host / IP  or  DHT ID (sc-...)").desired_width(180.0));
-        ui.add(egui::TextEdit::singleline(&mut form.port).id_salt("friends-form_port")
-            .hint_text("Port").desired_width(56.0));
+    uikit_egui::glass::card(ui, c.bg_card, |ui| {
+        uikit_egui::glass::card_title(ui, "add a peer by address", c.text_weak);
+        ui.horizontal(|ui| {
+            // the host field takes the room; the port keeps its four digits
+            let room = (ui.available_width() - 74.0).max(120.0);
+            ui.add(egui::TextEdit::singleline(&mut form.host).id_salt("friends-form_host")
+                .hint_text("Host / IP  or  DHT ID (sc-...)").desired_width(room));
+            ui.add(egui::TextEdit::singleline(&mut form.port).id_salt("friends-form_port")
+                .hint_text("Port").desired_width(56.0));
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if uikit_egui::glass::primary_button(ui, "Connect", c.accent, c.bg_base).clicked() {
+                if let Some(a) = form.submit() { action = Some(Action::Add(a)); }
+            }
+            if uikit_egui::glass::secondary_button(ui, "📥 Import vCard", c.bg_card, c.border).clicked() {
+                action = Some(Action::ImportVCard);
+            }
+        });
+        if let Some(e) = form.error_text() { ui.colored_label(c.danger, e); }
     });
-    ui.horizontal(|ui| {
-        if ui.button("Connect").clicked() {
-            if let Some(a) = form.submit() { action = Some(Action::Add(a)); }
-        }
-        if ui.button("📥 Import vCard").clicked() { action = Some(Action::ImportVCard); }
-    });
-    if let Some(e) = form.error_text() { ui.colored_label(c.danger, e); }
     action
 }
 

@@ -3496,11 +3496,21 @@ impl Snapclone {
             egui::ScrollArea::vertical()
                 .id_salt(("page", page))
                 .auto_shrink([false, false])
-                .show(ui, |ui| match page {
-                    1 => app.inbox_page(ui, &colors),
-                    2 => app.peers_page(ui, &colors),
-                    3 => app.wayfinder_page(ui, &colors),
-                    _ => app.settings_page(ui, &colors),
+                .show(ui, |ui| {
+                    // THE PAGE MARGIN. Pages drew from the panel's edge, so
+                    // every row started 8px from the window and the peel
+                    // tabs had to sit on the content. SPACE_MD either side
+                    // is room for the tabs and the room a card needs to be
+                    // a card rather than a stripe.
+                    let m = uikit_egui::tokens::SPACE_MD as i8;
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin { left: m, right: m, top: 6, bottom: 14 })
+                        .show(ui, |ui| match page {
+                            1 => app.inbox_page(ui, &colors),
+                            2 => app.peers_page(ui, &colors),
+                            3 => app.wayfinder_page(ui, &colors),
+                            _ => app.settings_page(ui, &colors),
+                        });
                 });
         };
         let draw_pages = |app: &mut Self, ui: &mut Ui| {
@@ -4257,11 +4267,21 @@ impl Snapclone {
                 crate::confirm::Outcome::Pending => {}
             }
         }
-        ui.separator();
+        // THE PAGE IS CARDS NOW, not rows split by separators: on the live
+        // backdrop a separator is a scratch and a card is a thing. The
+        // picker, the reach summary and the send are one surface; the ways to
+        // connect are another; the friends list and the add-peer form are the
+        // list widget's own.
+        //
         // The contact picker, so Friends is a place you DO something rather
         // than a list you look at.
+        let reach_roster = self.peer_roster();
+        uikit_egui::glass::card(ui, c.bg_card, |ui| {
+        uikit_egui::glass::card_title(ui, "find", c.text_weak);
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.picker.query).id_salt("lib-self_picker_query"));
+            let room = (ui.available_width() - 76.0).max(80.0);
+            ui.add(egui::TextEdit::singleline(&mut self.picker.query).id_salt("lib-self_picker_query")
+                .hint_text("search friends").desired_width(room));
             let multi = self.picker.is_multi();
             if ui.selectable_label(multi, "multi").clicked() {
                 self.picker.mode = if multi { crate::contacts::PickMode::Single }
@@ -4280,7 +4300,6 @@ impl Snapclone {
         // Reachability and the pick checkbox are fields on the card row now
         // (`friends::RowInfo`); what is left here is the summary, which is
         // per-page information rather than per-person.
-        let reach_roster = self.peer_roster();
         if !reach_roster.is_empty() {
             ui.colored_label(c.text_weak,
                 format!("{} of {} reachable now", self.sendable_peers(), reach_roster.len()));
@@ -4316,9 +4335,7 @@ impl Snapclone {
         if !chosen.is_empty() {
             let label = if sending { format!("Send snap to {} \u{27a4}", chosen.len()) }
                         else { format!("send to {}", chosen.len()) };
-            if ui.add(egui::Button::new(egui::RichText::new(&label).strong())
-                .min_size(egui::vec2(0.0, if sending { 40.0 } else { 0.0 }))).clicked()
-            {
+            if uikit_egui::glass::primary_button(ui, &label, c.accent, c.bg_base).clicked() {
                 let now = (ui.input(|i| i.time) * 1000.0) as u64;
                 self.send_to(&chosen, now);
             }
@@ -4330,7 +4347,7 @@ impl Snapclone {
         if stuck > 0 {
             ui.colored_label(c.warning, format!("{stuck} send(s) failed — tap to retry"));
         }
-        ui.separator();
+        });
         if let Some(sel) = self.nav.subpage() {
             // subpage: peer detail
             if let Some(p) = self.peers.get(sel) {
@@ -4348,9 +4365,11 @@ impl Snapclone {
                 if self.call_note.contains("no known address") { c.warning } else { c.text_weak },
                 &self.call_note);
         }
+        uikit_egui::glass::card(ui, c.bg_card, |ui| {
+        uikit_egui::glass::card_title(ui, "connect", c.text_weak);
         ui.horizontal(|ui| {
             let joined = self.group_voice.joined;
-            if ui.selectable_label(joined, if joined { "leave channel" } else { "join channel" })
+            if uikit_egui::glass::secondary_button(ui, if joined { "leave channel" } else { "join channel" }, c.bg_card, c.border)
                 .clicked() { self.toggle_voice(); self.call_note.clear(); }
             if joined && ui.selectable_label(self.group_voice.muted, "mute").clicked() {
                 self.group_voice.muted = !self.group_voice.muted;
@@ -4373,12 +4392,13 @@ impl Snapclone {
         // right surface on a machine with no camera and the honest one while
         // the capture pipeline is still unwired.
         ui.horizontal(|ui| {
-            let r = ui.button("Scan code");
+            let r = uikit_egui::glass::primary_button(ui, "Scan code", c.accent, c.bg_base);
             self.key_label(&r, "scan a friend's code with the camera");
             if r.clicked() { self.open_qr_scan(true); }
-            let r = ui.button("Enter code");
+            let r = uikit_egui::glass::secondary_button(ui, "Enter code", c.bg_card, c.border);
             self.key_label(&r, "type a friend's code");
             if r.clicked() { self.open_qr_scan(false); }
+        });
         });
 
         // WHAT DISCOVERY FOUND, and what the app makes of it. Two gaps this
