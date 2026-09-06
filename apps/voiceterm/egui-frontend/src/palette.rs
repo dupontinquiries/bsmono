@@ -103,6 +103,10 @@ pub enum Command {
     /// data model has been pure and tested since v0.1.641 with no caller
     /// anywhere in this frontend before this command existed.
     ClipSelection,
+    /// Share the zettelkasten as a huge QR code — the picker with the
+    /// paintbrush, two confirmation gates, then the code (`zk_share`).
+    /// Reachable from the notes panes' palette like everything else here.
+    ShareNotesQr,
 }
 
 /// The three filter levels, as a palette-addressable value.
@@ -203,6 +207,8 @@ pub fn vocabulary() -> Vec<Entry> {
                    keywords: &["keycaps", "keys", "footer", "summaries", "show extras"] });
     v.push(Entry { command: Command::ClipSelection, title: "Clip selection to notes".into(),
                    keywords: &["clip this", "save this", "note this", "clipping"] });
+    v.push(Entry { command: Command::ShareNotesQr, title: "Share notes as a QR code…".into(),
+                   keywords: &["qr", "share", "zettelkasten", "export", "code", "public"] });
     v.push(Entry { command: Command::ShowPalette, title: "Open command palette".into(),
                    keywords: &["commands"] });
     v
@@ -268,6 +274,9 @@ pub fn parse_phrase(phrase: &str) -> Option<Command> {
         return None;
     }
     // The palette itself, so it is reachable without knowing a shortcut.
+    if (p.contains("share") || p.contains("export")) && (p.contains("qr") || p.contains("notes") || p.contains("zettel")) {
+        return Some(Command::ShareNotesQr);
+    }
     if p.contains("command palette") || p.contains("show commands") {
         return Some(Command::ShowPalette);
     }
@@ -416,6 +425,10 @@ mod tests {
     /// pins both doors, same as every other command added this session.
     #[test]
     fn clip_selection_is_reachable_by_phrase_and_by_palette() {
+        assert_eq!(parse_phrase("share my notes as a qr code"), Some(Command::ShareNotesQr));
+        assert_eq!(parse_phrase("export the zettelkasten"), Some(Command::ShareNotesQr));
+        assert!(vocabulary().iter().any(|e| e.command == Command::ShareNotesQr),
+                "the share is in the typed list too");
         assert_eq!(parse_phrase("clip this"), Some(Command::ClipSelection));
         assert_eq!(parse_phrase("save this to my notes"), Some(Command::ClipSelection));
         assert!(vocabulary().iter().any(|e| e.command == Command::ClipSelection),

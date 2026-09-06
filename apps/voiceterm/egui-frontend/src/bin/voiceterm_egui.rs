@@ -647,6 +647,9 @@ struct VoicetermApp {
     glow: voiceterm_egui::repl_voice_glow::ReplVoiceGlow,
     /// A destructive action awaiting confirmation (confirm_dialog).
     pending_confirm: Option<(String, voiceterm_egui::confirm_dialog::ConfirmDialog)>,
+    /// Sharing the zettelkasten as a huge QR (`zk_share`): the picker, the
+    /// gates, and the codes once shown. `None` when nothing is being shared.
+    zk_share: Option<ZkShareUi>,
     /// The find bar's FILES mode. `None` until a file search is started, so
     /// the panel costs no terminal rows in the common case.
     fs_search: voiceterm_egui::fs_results::Search,
@@ -899,6 +902,10 @@ impl VoicetermApp {
             // the most recent block is the closest approximation. True
             // for the common case (clipping something just seen), not
             // guaranteed for a selection made further back in scrollback.
+            Command::ShareNotesQr => {
+                let share = voiceterm_egui::zk_share::Share::from_cards(&self.deck.cards);
+                self.zk_share = Some(ZkShareUi { share, dialog: None, frames: Vec::new(), shown: None, note: String::new() });
+            }
             Command::ClipSelection => {
                 let content = self.app.selection.take().map(|s| s.text);
                 match content {
@@ -1565,6 +1572,19 @@ impl eframe::App for VoicetermApp {
                 // a decision about this call site, not about the kit.
                 Outcome::Cancelled | Outcome::Discarded => self.pending_confirm = None,
                 Outcome::Pending => {}
+            }
+        }
+        // SHARING THE ZETTELKASTEN AS A QR: picker → gate one → gate two → the
+        // huge view, each its own screen, none skippable.
+        if self.zk_share.is_some() {
+            let colors = self.colors;
+            let cards = self.deck.cards.clone();
+            let mut done = false;
+            if let Some(z) = self.zk_share.as_mut() {
+                done = z.show(ctx, &cards, &colors);
+            }
+            if done {
+                self.zk_share = None;
             }
         }
         // The mic halo follows the router's own state rather than a separate
@@ -5056,7 +5076,7 @@ fn main() -> eframe::Result<()> {
                 wizard: Some(voiceterm_egui::setup_wizard::SetupWizard::new(false)),
                 chat: Default::default(),
                 glow: Default::default(),
-                pending_confirm: None,
+                pending_confirm: None, zk_share: None,
                 fs_search: Default::default(),
                 cmd_sheet: Default::default(),
                 last_memlog_s: 0.0,
@@ -5252,4 +5272,144 @@ mod doc_markdown_tests {
         assert!(d.html.contains("<pre>let x = 1;\n</pre>"));
         assert!(d.html.contains("<p><b>bold</b> after</p>"));
     }
+}
+
+/// The share's screens over the pure `zk_share::Share`: the picker with the paintbrush,
+/// the two gates as the kit's confirm dialogs, the kit's huge view for the codes.
+struct ZkShareUi {
+    share: voiceterm_egui::zk_share::Share,
+    /// The gate on screen, if one is.
+    dialog: Option<voiceterm_egui::confirm_dialog::ConfirmDialog>,
+    /// The encoded frames, built once gate two is passed.
+    frames: Vec<uikit_egui::qrbig::Matrix>,
+    /// The huge view's open state (the identicon's, for the guard and the fade).
+    shown: Option<uikit_egui::qr::Expanded>,
+    /// Why Share was refused, shown on the picker.
+    note: String,
+}
+
+impl ZkShareUi {
+    /// Draw whichever screen the stage calls for. Returns true when the share is over.
+    fn show(&mut self, ctx: &egui::Context, cards: &[voiceterm_egui::cards_view::Card], c: &PaletteColors) -> bool {
+        use voiceterm_egui::confirm_dialog::Outcome;
+        use voiceterm_egui::zk_share::{Brush, Stage};
+        match self.share.stage {
+            Stage::Pick => {
+                let mut close = false;
+                egui::Window::new("Share notes as a QR code")
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_width(420.0)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.label(egui::RichText::new("Tick the notes to share, or paint them: brush down, drag over rows.").small().color(c.text_weak));
+                        ui.horizontal(|ui| {
+                            let (pub_on, priv_on) = (self.share.brush == Brush::Public, self.share.brush == Brush::Private);
+                            if ui.selectable_label(pub_on, "\u{1f58c} paint public").clicked() {
+                                self.share.brush = if pub_on { Brush::Off } else { Brush::Public };
+                            }
+                            if ui.selectable_label(priv_on, "\u{1f58c} paint private").clicked() {
+                                self.share.brush = if priv_on { Brush::Off } else { Brush::Private };
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new(format!("{} public · {:.1} KB · {} code{}",
+                                    self.share.public_count(), self.share.public_bytes() as f32 / 1024.0,
+                                    self.share.frame_count(), if self.share.frame_count() == 1 { "" } else { "s" })).small().color(c.text_weak));
+                            });
+                        });
+                        ui.separator();
+                        let brushing = self.share.brush != Brush::Off && ui.input(|i| i.pointer.primary_down());
+                        let hover = ui.input(|i| i.pointer.hover_pos());
+                        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                            let rows = self.share.rows.clone();
+                            for r in &rows {
+                                let resp = ui.horizontal(|ui| {
+                                    if r.is_heading {
+                                        let mut on = r.public;
+                                        if ui.checkbox(&mut on, "").changed() {
+                                            self.share.set_section(r.index, on);
+                                        }
+                                        ui.label(egui::RichText::new(&r.title).strong());
+                                    } else {
+                                        ui.add_space(18.0);
+                                        let mut on = r.public;
+                                        if ui.checkbox(&mut on, "").changed() {
+                                            self.share.toggle(r.index);
+                                        }
+                                        ui.label(&r.title);
+                                    }
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(egui::RichText::new(if r.public { "public" } else { "private" }).small()
+                                            .color(if r.public { c.accent } else { c.text_weak }));
+                                    });
+                                }).response;
+                                // THE BRUSH: with it down, the row under the pointer takes its mark
+                                if brushing {
+                                    if let Some(p) = hover {
+                                        if resp.rect.contains(p) {
+                                            self.share.brush_over(r.index);
+                                        }
+                                    }
+                                }
+                                if r.public {
+                                    ui.painter().rect_stroke(resp.rect.expand(1.0), 4.0, egui::Stroke::new(1.0, uikit_egui::glass::tint(c.accent, 90)), egui::StrokeKind::Outside);
+                                }
+                            }
+                        });
+                        if !self.note.is_empty() {
+                            ui.colored_label(c.warning, &self.note);
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if uikit_egui::glass::primary_button(ui, "Share\u{2026}", c.accent, c.bg_base).clicked() {
+                                match self.share.go() {
+                                    Ok(()) => self.note.clear(),
+                                    Err(e) => self.note = e,
+                                }
+                            }
+                            if uikit_egui::glass::secondary_button(ui, "Cancel", c.bg_card, c.border).clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+                if brushing_repaint(ctx, self.share.brush) {
+                    ctx.request_repaint();
+                }
+                close
+            }
+            Stage::ConfirmWhat | Stage::ConfirmWho => {
+                let what = self.share.stage == Stage::ConfirmWhat;
+                let share = &self.share;
+                let dlg = self.dialog.get_or_insert_with(|| share.gate().expect("a gate stage has a gate"));
+                match dlg.show(ctx) {
+                    Outcome::Confirmed => {
+                        self.dialog = None;
+                        if what {
+                            self.share.what_confirmed();
+                        } else {
+                            self.share.who_confirmed();
+                            let payload = self.share.payload(cards);
+                            self.frames = uikit_egui::qrbig::frames(&payload).iter().filter_map(|f| uikit_egui::qrbig::encode(f)).collect();
+                            self.shown = Some(uikit_egui::qr::Expanded::open(ctx.input(|i| i.time)));
+                        }
+                    }
+                    Outcome::Cancelled | Outcome::Discarded => {
+                        self.dialog = None;
+                        self.share.back();
+                    }
+                    Outcome::Pending => {}
+                }
+                false
+            }
+            Stage::Showing => {
+                let caption = format!("{} notes · anyone who scans can read them", self.share.public_count());
+                uikit_egui::qrbig::huge_ui(ctx, &mut self.shown, &self.frames, &caption, c)
+            }
+        }
+    }
+}
+
+/// A brush that is down wants a frame per pointer move.
+fn brushing_repaint(ctx: &egui::Context, brush: voiceterm_egui::zk_share::Brush) -> bool {
+    brush != voiceterm_egui::zk_share::Brush::Off && ctx.input(|i| i.pointer.primary_down())
 }

@@ -55,7 +55,7 @@ peer-handshake = { path = "../../../shared/peer-handshake" }
 # exactly what happened when the model was lifted.
 pane-kit = { path = "../../../shared/pane-kit" }
 egui = "0.34"
-uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui", features = ["qrbig"] }
 # The terminal needs an actual shell: pty_host spawns one. Same crate
 # and version the Qt side uses, so behaviour cannot diverge between them.
 portable-pty = "0.8"

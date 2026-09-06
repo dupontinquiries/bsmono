@@ -223,6 +223,8 @@ pub mod mail_login_view;
 pub mod reading_trainer;
 pub mod archived_view;
 pub mod cards_view;
+/// Share the zettelkasten as a huge QR: pick, paint public, two gates, show. Pure.
+pub mod zk_share;
 pub mod graph_view;
 pub mod note_edit;
 /// `link_graph.rs` is mounted Qt-free under `graph_view` (see that module's
