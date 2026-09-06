@@ -39,6 +39,28 @@ use voiceterm_egui::App;
 /// workspace's focused pane, is what makes "the pure core already works" also
 /// mean "and you can see it."
 
+/// A small zettelkasten for `VOICETERM_DEMO`: three sections with notes under them, so the
+/// notes panes and the QR share have something real to show. `[[wiki-links]]` included,
+/// because the backlinks index is one of the things that had nothing to index.
+const DEMO_NOTES: &str = "\
+# Gardens
+
+Compost turns fastest when it is turned weekly; a fortnight is already too long.
+
+Mulch with straw over the beds before the first frost. See [[Frost dates]].
+
+# Frost dates
+
+Last frost here is the second week of May, give or take ten days.
+
+# Kitchen
+
+The sourdough starter wants feeding at the same hour each day more than it wants
+a particular flour.
+
+Salt goes in after the autolyse, not before. See [[Gardens]] for the wheat.
+";
+
 impl VoicetermApp {
     /// The document ingest surface: diagnose, choose, confirm.
     ///
@@ -5081,8 +5103,24 @@ fn main() -> eframe::Result<()> {
                 cmd_sheet: Default::default(),
                 last_memlog_s: 0.0,
                 peer: None,
-                deck: Default::default(),
-                captured: String::new(),
+                // VOICETERM_DEMO also seeds the note deck. The zettelkasten is
+                // empty until someone captures something, which is correct —
+                // and means the notes panes, the graph, the backlinks and the
+                // QR share have nothing to draw on a fresh launch, so none of
+                // them could be looked at without first typing a page of text
+                // into the capture box by hand.
+                deck: {
+                    let mut d: voiceterm_egui::cards_view::Deck = Default::default();
+                    if demo {
+                        let src = voiceterm_egui::cards_view::CardSource {
+                            url: "demo://zettelkasten".into(),
+                            paragraph_id: String::new(),
+                        };
+                        d.set_cards(voiceterm_egui::cards_view::note_cards::split_into_cards(DEMO_NOTES, &src));
+                    }
+                    d
+                },
+                captured: if demo { DEMO_NOTES.to_string() } else { String::new() },
                 backlinks: Default::default(),
                 build: Default::default(),
                 build_input: String::new(),
