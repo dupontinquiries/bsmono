@@ -239,6 +239,18 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                                             None => format!("evolve '{phrase}' for {gens} generations, {levels} level(s)") }),
                      None);
             }
+            Op::ScatterJson { json } => {
+                match crate::scatter::from_json(json, plan.anchor) {
+                    Ok(s) => push(Note::Info,
+                        format!("scatter: up to {} x {} along a {} rail{}", s.count, s.structure,
+                                match s.rail { crate::scatter::Rail::Point { .. } => "point",
+                                    crate::scatter::Rail::Line { .. } => "line", crate::scatter::Rail::Ring { .. } => "ring",
+                                    crate::scatter::Rail::Grid { .. } => "grid", crate::scatter::Rail::Area { .. } => "area",
+                                    crate::scatter::Rail::Path { .. } => "path", crate::scatter::Rail::Contour { .. } => "contour" },
+                                if s.lazy { ", held for the engine" } else { "" }), None),
+                    Err(e) => push(Note::Error, format!("scatter: {e}"), None),
+                }
+            }
             Op::Spec(line) => {
                 push(Note::Info, format!("target: {}",
                      crate::spec::Spec::parse(line).map(|s| s.describe()).unwrap_or_default()), None);

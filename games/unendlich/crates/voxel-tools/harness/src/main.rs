@@ -38,6 +38,7 @@ fn main() {
     bare_words_scenario();
     review_scenario();
     long_run_scenario();
+    scatter_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -940,4 +941,51 @@ fn long_run_scenario() {
     assert!(!blob.is_empty(), "the shape is visible before commit");
     println!("  distances: {:?}", run.rounds.iter().map(|r| r.distance).collect::<Vec<_>>());
     assert!(run.rounds.iter().any(|r| r.distance.is_some()), "the spec distance was tracked");
+}
+
+
+/// A lazy scatter: nothing built at commit, sites held, each realised
+/// when the player walks up -- and they survive a reload.
+fn scatter_scenario() {
+    use paintbrush::Paintbrush;
+    use voxel_tools::chatbox::Key;
+    println!("\n==== scattered structures");
+    let dir = std::path::PathBuf::from("/tmp/bindcheck_scatter");
+    let _ = std::fs::remove_dir_all(&dir);
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    let ir = "scatter_json { \"structure\": \"tower\", \"count\": 8, \"lazy\": true,\n              \"rail\": { \"kind\": \"line\", \"from\": [0, 0], \"to\": [700, 0] },\n              \"rules\": { \"spacing\": 40, \"footprint\": 3 },\n              \"params\": { \"size\": \"small\" } }\n";
+    pb.launch_drone(&cm, &gaze, ir.into(), None, "watchtowers along the road");
+    settle(&mut pb);
+    let cmd = { pb.key(Key::Enter); for c in "/commit".chars() { pb.key(Key::Char(c)); } pb.key(Key::Enter) }.unwrap();
+    pb.dispatch(&cm, &gaze, cmd);
+    let log = pb.drain_log();
+    println!("  {}", log.iter().find(|l| l.contains("held")).cloned().unwrap_or_default().trim());
+    assert_eq!(pb.held.len(), 8, "{log:?}");
+    let placed_at_commit = cm.block_count();
+    // the player is far away: nothing realises
+    pb.realise_held(&cm, [-500.0, 70.0, 0.0]);
+    assert_eq!(cm.block_count(), placed_at_commit, "nothing built until someone is near");
+    // walk along the line: each site builds as it comes into range
+    let mut built = 0;
+    for x in (0..760).step_by(40) {
+        built += pb.realise_held(&cm, [x as f32, 70.0, 0.0]);
+        pb.realise_held(&cm, [x as f32, 70.0, 0.0]);
+    }
+    println!("  walked the road: {built} tower(s) realised, {} left, {} blocks placed",
+             pb.held.len(), cm.block_count() - placed_at_commit);
+    assert!(built >= 6, "most realised on the walk");
+    assert!(cm.block_count() > placed_at_commit, "blocks appeared");
+    // and the rest survive a save/load
+    pb.state_dirty = true;
+    pb.save_state(&dir).unwrap();
+    let mut fresh = Paintbrush::new(32);
+    fresh.load_state(&dir);
+    assert_eq!(fresh.held.len(), pb.held.len(), "held sites persist");
+    if let Some((s, site)) = fresh.held.first() {
+        println!("  reloaded a held site: {s} at {:?} rot {} params {:?}", site.at, site.rot, site.params);
+        assert_eq!(s, "tower");
+        assert_eq!(site.params.get("size").map(String::as_str), Some("small"));
+    }
 }

@@ -263,6 +263,10 @@ pub enum Op {
     /// a phrase, then apply the winner. Or run a stated genome.
     Greeble { min: (i32, i32, i32), max: (i32, i32, i32), phrase: String,
               gens: u32, seed: i32, genome: Option<String>, levels: u32 },
+    /// A JSON scatter: a structure and a rule about where its instances
+    /// go. Resolved against the world at run time into sites; the host
+    /// decides whether to build them now or hold them.
+    ScatterJson { json: String },
     /// A property spec the model emits beside its plan. Does nothing
     /// when run; the session reads it after the dry run and tunes the
     /// build toward it.
@@ -725,6 +729,24 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     levels: kvi(&t, "levels", 2).clamp(1, 4) as u32,
                 });
             }
+            "scatter_json" | "place_many" => {
+                // `scatter_json { ... }` on one line, or opened here and
+                // closed by a line that is just `}`. A model writes JSON
+                // across lines and the line validator sees each alone,
+                // so the block form is collected here.
+                let head = raw.trim().splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim().to_string();
+                let mut json = head;
+                if json.matches('{').count() > json.matches('}').count() || json.is_empty() {
+                    while let Some((_, next)) = lines_iter.next() {
+                        json.push('\n'); json.push_str(next.trim());
+                        if json.matches('{').count() <= json.matches('}').count() && json.contains('}') { break; }
+                    }
+                }
+                match crate::scatter::from_json(&json, anchor) {
+                    Ok(_) => ops.push(Op::ScatterJson { json }),
+                    Err(e) => bad(format!("scatter: {e}")),
+                }
+            }
             "spec" | "properties" => {
                 match crate::spec::Spec::parse(raw.trim()) {
                     Ok(_) => ops.push(Op::Spec(raw.trim().to_string())),
@@ -1171,6 +1193,10 @@ pub struct PlanRun {
     /// Dependents withdrawn after a structural failure. Empty when
     /// nothing failed or nothing depended on what did.
     pub withdrawn: Vec<crate::recovery::Withdrawal>,
+    /// Sites a lazy scatter asks the engine to hold: (structure, site).
+    /// Nothing is built for these; the engine realises each when a
+    /// player comes near.
+    pub sites: Vec<(String, crate::scatter::Site)>,
     /// Living plants this plan asks the engine to register. The crate
     /// placed their current form; the engine owns them from here.
     pub plants: Vec<crate::flora::PlantRequest>,
@@ -1227,9 +1253,11 @@ pub fn run_plan_with<W: VoxelWorld>(
     };
     let mut run = PlanRun { applied: 0, failed: 0, blocks_changed: 0,
                             log: Vec::new(), batches: Vec::new(), withdrawn: Vec::new(),
-                            plants: Vec::new() };
+                            plants: Vec::new(), sites: Vec::new() };
     let mut outcomes: Vec<(bool, String, Option<u64>)> = Vec::new();
     let first_edit = tools.edits.len();
+    // Sites a lazy scatter hands to the engine rather than building.
+    let mut run_sites: Vec<(String, crate::scatter::Site)> = Vec::new();
 
     for (i, op) in plan.ops.iter().enumerate() {
         let r: CallResult = match op {
@@ -1358,6 +1386,43 @@ pub fn run_plan_with<W: VoxelWorld>(
                 r
             })(),
             Op::Spec(_) => CallResult { ok: true, summary: "spec noted".into(), ..Default::default() },
+            Op::ScatterJson { json } => (|| {
+                let s = match crate::scatter::from_json(json, plan.anchor) {
+                    Ok(s) => s,
+                    Err(e) => return CallResult { ok: false, summary: format!("scatter: {e}"), ..Default::default() },
+                };
+                let (found, notes) = crate::scatter::sites(tools.world, &s, from_y);
+                if found.is_empty() {
+                    return CallResult { ok: false, summary: format!("scatter '{}': no site fits -- {}",
+                                                                    s.structure, notes.join("; ")),
+                                        ..Default::default() };
+                }
+                if s.lazy {
+                    // HELD, not built: the engine keeps the sites and
+                    // realises each when a player comes near. Nothing is
+                    // placed now, which is the point of a thousand
+                    // shrines across a continent.
+                    let n = found.len();
+                    run_sites.extend(found.into_iter().map(|site| (s.structure.clone(), site)));
+                    return CallResult { ok: true, blocks_changed: 0,
+                                        summary: format!("scatter '{}': {n} site(s) held for the engine{}",
+                                                         s.structure,
+                                                         if notes.is_empty() { String::new() } else { format!(" ({})", notes.join("; ")) }),
+                                        ..Default::default() };
+                }
+                let ir = crate::scatter::to_ir(&s, &found);
+                let (sub, subissues) = parse_plan_at(&ir, plan.anchor);
+                if subissues.iter().any(|i| i.severity == Severity::Error) {
+                    return CallResult { ok: false, summary: format!("scatter '{}': {:?}", s.structure, subissues),
+                                        ..Default::default() };
+                }
+                let sub_run = run_plan(tools, &sub, from_y, chunk_size, dry_run);
+                CallResult { ok: sub_run.failed == 0, blocks_changed: sub_run.blocks_changed,
+                             summary: format!("scatter '{}': {} instance(s), {} blocks{}",
+                                              s.structure, found.len(), sub_run.blocks_changed,
+                                              if notes.is_empty() { String::new() } else { format!(" ({})", notes.join("; ")) }),
+                             ..Default::default() }
+            })(),
             Op::Brush { op, amount, at, radius, falloff, seed } => {
                 use crate::brush::{self, Brush, BrushOp, Falloff};
                 let bop = match op.as_str() {
@@ -1710,6 +1775,7 @@ pub fn run_plan_with<W: VoxelWorld>(
             tools.undo_edit(id);
         }
     }
+    run.sites = run_sites;
     run
 }
 
@@ -2265,5 +2331,42 @@ scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
         }
         let (mood, _) = parse_plan_at("mood eerie size=large\n", Some((0, 65, 0)));
         assert!(matches!(mood.ops.first(), Some(Op::Mood { .. })), "{:?}", mood.ops);
+    }
+
+    #[test]
+    fn a_scatter_op_builds_many_or_hands_the_sites_over() {
+        let mut w = Flat::new();
+        let eager = "scatter_json { \"structure\": \"tower\", \"count\": 5,\n\
+                     \"rail\": { \"kind\": \"line\", \"from\": [0, 0], \"to\": [80, 0] },\n\
+                     \"rules\": { \"spacing\": 10, \"footprint\": 3 },\n\
+                     \"params\": { \"size\": \"small\" } }\n";
+        let (plan, issues) = parse_plan_at(eager, Some((0, 65, 0)));
+        assert!(issues.iter().all(|i| i.severity != Severity::Error), "{issues:?}");
+        assert_eq!(plan.ops.len(), 1, "one op that expands at run time");
+        let run = { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &plan, 200, 32, false) };
+        assert!(run.blocks_changed > 300, "five small towers: {} blocks", run.blocks_changed);
+        assert!(run.sites.is_empty(), "built, not held");
+        assert!(run.log.iter().any(|l| l.contains("5 instance(s)")), "{:?}", run.log);
+        // the same scatter, lazy: nothing built, sites handed over
+        let mut w2 = Flat::new();
+        let lazy = eager.replace("\"count\": 5", "\"count\": 5, \"lazy\": true");
+        let (plan2, _) = parse_plan_at(&lazy, Some((0, 65, 0)));
+        let run2 = { let mut t = VoxelTools::new(&mut w2); run_plan(&mut t, &plan2, 200, 32, false) };
+        assert_eq!(run2.blocks_changed, 0, "held, not built");
+        assert_eq!(run2.sites.len(), 5);
+        assert!(run2.sites.iter().all(|(s, _)| s == "tower"));
+        assert!(run2.log.iter().any(|l| l.contains("held for the engine")), "{:?}", run2.log);
+        // and each held site knows how to build itself later
+        let (structure, site) = &run2.sites[0];
+        assert!(line_is_valid_ir(&site.to_ir(structure)), "{}", site.to_ir(structure));
+    }
+
+    #[test]
+    fn a_bad_scatter_is_one_error_not_a_broken_plan() {
+        let (_, issues) = parse_plan_at("scatter_json { \"structure\": \"zigurat\", \"rail\": { \"kind\": \"point\", \"at\": [0,0] } }\n",
+                                        Some((0, 65, 0)));
+        let e = issues.iter().find(|i| i.severity == Severity::Error).expect("an error");
+        assert!(e.message.contains("unknown structure 'zigurat'"), "{}", e.message);
+        assert!(!line_is_valid_ir("scatter_json { \"structure\": \"zigurat\" }"), "the validator takes it back");
     }
 }

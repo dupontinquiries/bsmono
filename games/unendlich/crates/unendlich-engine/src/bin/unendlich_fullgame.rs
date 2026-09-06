@@ -4492,6 +4492,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // steps this frame's headroom allows. A late frame stalls
             // generation, never the other way round.
             paintbrush.frame_gpu(hive_last_frame_ms);
+            // Held scatter sites build when the player comes near: a
+            // thousand shrines across a continent cost nothing until
+            // someone walks up to one.
+            {
+                let p = local_player.view.position;
+                paintbrush.realise_held(&chunk_manager, [p.x, p.y, p.z]);
+            }
             // THE QUEEN'S FRAME. Committed changes are applied here, a
             // chunk at a time, within a budget that adapts to how long
             // the last frame took. Nearest the player first; what you

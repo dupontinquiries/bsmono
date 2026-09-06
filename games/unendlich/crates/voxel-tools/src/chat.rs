@@ -149,6 +149,8 @@ pub struct ChatSession {
     /// the tree would have blocks and no way to rebase them.
     pub last_ir: String,
     pub last_prose: String,
+    /// Sites a committed lazy scatter handed over, awaiting the engine.
+    pub held_sites: Vec<(String, crate::scatter::Site)>,
     /// Living plants placed by commits, awaiting the engine.
     pub planted: Vec<crate::flora::PlantRequest>,
     /// Builds the current prose names, resolved by the host from the
@@ -797,6 +799,11 @@ impl ChatSession {
 
     /// Plants committed since the last call, for the engine to register.
     /// None when there are none, so a host can skip the message.
+    /// Sites a lazy scatter handed over, for the engine to hold.
+    pub fn take_sites(&mut self) -> Option<Vec<(String, crate::scatter::Site)>> {
+        if self.held_sites.is_empty() { None } else { Some(std::mem::take(&mut self.held_sites)) }
+    }
+
     pub fn take_plants(&mut self) -> Option<Vec<crate::flora::PlantRequest>> {
         if self.planted.is_empty() { None } else { Some(std::mem::take(&mut self.planted)) }
     }
@@ -859,6 +866,7 @@ impl ChatSession {
         // on the session until the host takes them, because the tools
         // here are a staging world and know nothing about a lifecycle.
         if !run.plants.is_empty() { self.planted.extend(run.plants.iter().cloned()); }
+        if !run.sites.is_empty() { self.held_sites.extend(run.sites.iter().cloned()); }
         self.last_commit = tools.edits[first..].iter().map(|e| e.id).collect();
         // Remember the box for follow-ups. Merge with the previous last
         // build when they overlap, so "taller" then "add a door" keeps

@@ -484,6 +484,13 @@ pub struct Paintbrush {
     pub library: voxel_tools::template::Library,
     /// The world tree: every commit, branches, merges; saved with the world.
     pub repo: voxel_tools::vcs::Repo,
+    /// Sites a lazy scatter handed over: structures to build when a
+    /// player comes near, rather than all at once. A thousand shrines
+    /// across a continent is a thousand of these -- small -- and one
+    /// structure. Saved with the world.
+    pub held: Vec<(String, voxel_tools::scatter::Site)>,
+    /// How near a player must be for a held site to be realised.
+    pub held_radius: i32,
     /// The latent index over the tree: one vector per commit, computed
     /// on first sight and kept for the session. Never persisted; it is
     /// a pure function of the tree.
@@ -596,6 +603,8 @@ impl Paintbrush {
             library: voxel_tools::template::Library::new(),
             repo: voxel_tools::vcs::Repo::new(chunk_size),
             latent: voxel_tools::latent::Index::new(),
+            held: Vec::new(),
+            held_radius: 96,
             state_dirty: false,
             test_completer: None,
             last_verdict: None,
@@ -1740,6 +1749,13 @@ impl Paintbrush {
             let mut tools = VoxelTools::new(&mut staged);
             let r = self.session.commit(&mut tools, gaze);
         // Living plants planted by this commit go to the engine.
+        if let Some(sites) = self.session.take_sites() {
+            let n = sites.len();
+            self.held.extend(sites);
+            self.state_dirty = true;
+            self.say(format!("{n} site(s) held; each builds when someone comes within {} blocks",
+                             self.held_radius));
+        }
         if let Some(plants) = self.session.take_plants() {
             let n = plants.len();
             self.pending_plants.extend(plants);
@@ -1915,8 +1931,20 @@ impl Paintbrush {
         if let Ok(t) = std::fs::read_to_string(dir.join("worldtree.txt")) {
             self.repo = voxel_tools::vcs::Repo::load(&t);
         }
-        log::info!("[paintbrush] loaded {} claim(s), {} template(s), {} branch(es) from {}",
-                   self.land.len(), self.library.len(), self.repo.branches().count(), dir.display());
+        if let Ok(t) = std::fs::read_to_string(dir.join("held.txt")) {
+            self.held = t.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let structure = it.next()?.to_string();
+                let n: Vec<i64> = (0..5).filter_map(|_| it.next()?.parse().ok()).collect();
+                if n.len() < 5 { return None; }
+                let params = it.filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect();
+                Some((structure, voxel_tools::scatter::Site {
+                    at: (n[0] as i32, n[1] as i32, n[2] as i32), rot: n[3] as i32, seed: n[4] as u64,
+                    index: 0, params }))
+            }).collect();
+        }
+        log::info!("[paintbrush] loaded {} claim(s), {} template(s), {} branch(es), {} held site(s) from {}",
+                   self.land.len(), self.library.len(), self.repo.branches().count(), self.held.len(), dir.display());
         self.state_dirty = false;
     }
 
@@ -1947,6 +1975,15 @@ impl Paintbrush {
         std::fs::write(dir.join("land.txt"), self.land.save())?;
         std::fs::write(dir.join("templates.txt"), self.library.save())?;
         std::fs::write(dir.join("worldtree.txt"), self.repo.save())?;
+        // Held sites: one line each, the same dependency-free format as
+        // everything else here.
+        let mut sites = String::from("# held scatter sites v1\n");
+        for (structure, s) in &self.held {
+            sites.push_str(&format!("{structure} {} {} {} {} {}", s.at.0, s.at.1, s.at.2, s.rot, s.seed));
+            for (k, v) in &s.params { sites.push_str(&format!(" {k}={v}")); }
+            sites.push('\n');
+        }
+        std::fs::write(dir.join("held.txt"), sites)?;
         self.state_dirty = false;
         Ok(())
     }
@@ -2017,6 +2054,36 @@ impl Paintbrush {
             flora.plant([p.at.0, p.at.1, p.at.2], fc);
         }
         n
+    }
+
+    /// Build any held site the player has come near. Called each frame
+    /// beside the hive tick; cheap -- a distance check per site, and
+    /// nothing at all when there are none.
+    pub fn realise_held(&mut self, cm: &ChunkManager, at: [f32; 3]) -> usize {
+        if self.held.is_empty() { return 0; }
+        let r = self.held_radius;
+        let near: Vec<usize> = self.held.iter().enumerate()
+            .filter(|(_, (_, s))| (s.at.0 - at[0] as i32).abs() < r && (s.at.2 - at[2] as i32).abs() < r)
+            .map(|(i, _)| i).take(2)    // at most two a frame: the hive spreads the blocks anyway
+            .collect();
+        if near.is_empty() { return 0; }
+        let mut ir = String::new();
+        for &i in near.iter().rev() {
+            let (structure, site) = self.held.remove(i);
+            ir.push_str(&site.to_ir(&structure));
+            ir.push('\n');
+        }
+        let view = WorldView(cm);
+        let mut staged = StagedWorld::new(&view);
+        let n = {
+            let mut tools = VoxelTools::new(&mut staged);
+            let (plan, _) = voxel_tools::plan::parse_plan_at(&ir, None);
+            voxel_tools::plan::run_plan(&mut tools, &plan, self.session.from_y, self.chunk_size, false).blocks_changed
+        };
+        log::info!("[paintbrush] realised {} held site(s), {n} blocks; {} left", near.len(), self.held.len());
+        self.flush_staged(cm, &mut staged);
+        self.state_dirty = true;
+        near.len()
     }
 
     /// Retry deferred cells whose chunk has since loaded. Called every
