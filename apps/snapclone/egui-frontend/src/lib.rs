@@ -20,6 +20,9 @@ pub mod peer_source;
 pub mod contacts;
 pub mod conversation;
 pub mod composer;
+pub mod send_flow; // the four steps of sending a snap, as data both pages read
+pub mod send_flow_ui; // the strip that says which step, and the receipt
+pub mod composer_ui; // SnapComposerDialog's look: caption on the photo, colour A, size, timer chips, Next
 pub mod outbox;
 pub mod group_voice;
 /// The host seam: one typed event in, typed commands out. See `host.rs` —
@@ -270,6 +273,14 @@ pub struct Snapclone {
     /// rather than a direct call because the send happens on a socket the
     /// UI frame must not block on.
     pub send_requested: Vec<String>,
+    /// Where the person is in sending a snap — Take, Compose, Choose, Send — and
+    /// what was decided at each step. The camera page and the picker page both
+    /// draw its strip; `SendSnap` is built from it so the composed snap travels.
+    pub send_flow: crate::send_flow::SendFlow,
+    /// A send the flow built: recipients AND the composed snap. Drained by the
+    /// host into `HostCommand::SendSnap`. `send_requested` stays for the palette's
+    /// bare "send to" action, which has no composition behind it.
+    pub send_request: Option<crate::send_flow::SendRequest>,
     /// The unified bottom bar (Qt UnifiedNavBar): page arrows, sub-tab segments, underline
     /// morph, page dots. Owns the page + sub-tab state; `nav` mirrors the page for swipe.
     pub bar: UnifiedNav,
@@ -951,6 +962,8 @@ impl Snapclone {
             conversation_peer: String::new(),
             call_note: String::new(),
             send_requested: Vec::new(),
+            send_flow: Default::default(),
+            send_request: None,
             bar: UnifiedNav::new(),
             login_visible: !auto_logged_in,
             nav: Nav::new(PAGES.len()),
@@ -3621,7 +3634,16 @@ impl Snapclone {
         // permanently behind — and `should_upload` gates the texture write,
         // which is the expensive step, on there actually being something new.
         let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
-        if crate::frame_pump::should_upload(&self.frames, self.cam_texture.is_some()) {
+        // FROZEN WHILE COMPOSING. From the shutter press until the receipt
+        // clears, the viewfinder holds the frame it had: the Qt composer is a
+        // dialog over the captured image, and a caption drawn over a live
+        // stream is a caption over the wrong picture. Frames are still drained
+        // so the slot does not back up; they are not uploaded.
+        let live = self.send_flow.step() == crate::send_flow::Step::Capture;
+        if !live {
+            let _ = self.frames.take();
+        }
+        if live && crate::frame_pump::should_upload(&self.frames, self.cam_texture.is_some()) {
             if let Some(f) = self.frames.take() {
                 self.last_frame_ms = Some(now_ms);
                 // The ambient driver is told a frame EXISTS; it does not get
@@ -3672,6 +3694,10 @@ impl Snapclone {
             });
             r.response.rect
         };
+        // THE CAPTION ON THE PHOTO, from Compose on — the composer's paintEvent.
+        if self.send_flow.step() >= crate::send_flow::Step::Compose {
+            crate::composer_ui::caption_overlay(&ui.painter_at(vf_rect), vf_rect, &self.composer);
+        }
         // TAP VS LONG-PRESS ON THE VIEWFINDER. The machine distinguishes them
         // (and cancels to a drag past the slop), which matters because they
         // mean different things here: a tap focuses, a hold locks exposure.
@@ -3694,14 +3720,25 @@ impl Snapclone {
                     self.composer.begin_drag(ly / vf_rect.height().max(1.0));
                 }
                 if resp.drag_stopped() && self.composer.end_drag(ly / vf_rect.height().max(1.0)) {
-                    self.picker.mode = crate::contacts::PickMode::Multi { confirm_label: "Send".into() };
-                    self.nav.go_page(2);
+                    // The swipe is the shortcut for step 2's Next: it only means
+                    // "send" while there is a captured frame being composed.
+                    self.advance_to_recipients();
                 }
             }
             let ev = self.press.tick(dt_ms).or_else(|| {
                 if ui.input(|i| i.pointer.any_released()) { self.press.release() } else { None }
             });
             match ev {
+                Some(crate::press_gesture::Event::Tap)
+                    if self.send_flow.step() == crate::send_flow::Step::Compose =>
+                {
+                    // "Tap image to reposition text": while composing, a tap
+                    // on the frame places the caption. Focus and flip are the
+                    // live camera's business, and the camera is frozen.
+                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                        crate::composer_ui::reposition_on_tap(&mut self.composer, pos, vf_rect);
+                    }
+                }
                 Some(crate::press_gesture::Event::Tap) => {
                     if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                         // Two taps: flip the camera. The first still
@@ -4023,89 +4060,97 @@ impl Snapclone {
             .id_salt("camera-controls-tail")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-        // the composer, over the captured frame
-        // WRAPPED, not a fixed row. Reserving room for a known number of
-        // trailing controls is brittle: sizing the field to clear "colour"
-        // simply exposed the duration button behind it, cut at the same
-        // edge. Wrapping means whatever does not fit moves to the next line
-        // instead of off the window, however many controls this row grows.
-        ui.horizontal_wrapped(|ui| {
-            ui.label("caption");
-            // RESERVE THE BUTTON'S ROOM. A singleline TextEdit defaults to the
-            // whole remaining width of the row, so "colour" after it had
-            // nothing left and was drawn past the window's right edge — cut
-            // off mid-word on a phone. Seen in a screenshot; the layout probe
-            // missed it because the galley's clip rect was the full-width
-            // panel, which is now fixed too (clip is intersected with the
-            // screen). 92pt is the button plus the row's spacing.
-            let room = (ui.available_width() - 92.0).max(80.0);
-            let cap = ui.add(egui::TextEdit::singleline(&mut self.composer.caption)
-                .id_salt("lib-self_composer_caption").desired_width(room));
-            // THE KEYBOARD INSET, finally fed. apply_keyboard_inset has been
-            // written and tested since the port and nothing ever called it —
-            // the manifest records the gap as an open on-device task, because
-            // winit and egui 0.34 do not surface the compositor's input-panel
-            // rect and only a maliit / zwp_input_panel listener knows the true
-            // height.
-            //
-            // What IS knowable here is whether a text field has focus, which
-            // is when a panel is showing. egui reports the IME rect when the
-            // platform gives it one; where it does not, 0.45 is the fraction
-            // the module's own test uses and roughly what a phone keyboard
-            // takes. So: the right height when the platform says, a usable one
-            // when it does not, and zero when nothing is focused — instead of
-            // a caption that stays under the keyboard in every case.
-            let visible = cap.has_focus();
-            let fraction = ui
-                .ctx()
-                .input(|i| i.events.iter().find_map(|e| match e {
-                    egui::Event::Ime(_) => Some(0.45),
-                    _ => None,
-                }))
-                .unwrap_or(0.45);
-            self.composer.apply_keyboard_inset(visible, fraction);
-            if ui.button("colour").clicked() { self.composer.cycle_color(); }
-            let d = self.composer.duration;
-            // Say what the timer MEANS before the snap is sent, not after. The
-            // difference between a replicated durable snap and an ephemeral one
-            // is invisible otherwise, and it is the difference that matters.
-            let delivery = crate::outbox::Delivery::of(d);
-            if ui.button(d.label()).clicked() {
-                use crate::composer::Duration;
-                self.composer.duration = match d {
-                    Duration::Seconds(s) if s < 10 => Duration::Seconds(s + 5),
-                    Duration::Seconds(_) => Duration::Unlimited,
-                    Duration::Unlimited => Duration::Seconds(5),
-                };
+        // THE STEPS. Four cells, the current one lit, each decided one carrying
+        // its record (file · timer and caption · who). The Qt predecessor made
+        // every step its own dialog so you always knew where you were; the
+        // port had every control on one page under a live viewfinder and the
+        // send hidden in a swipe. See `send_flow`.
+        let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
+        crate::send_flow_ui::stepper_strip(ui, &self.send_flow, c);
+        let step = self.send_flow.step();
+        match step {
+            crate::send_flow::Step::Capture => {
+                // Nothing to compose yet: the composer's controls wait for a
+                // frame. Drawing a caption field over a live viewfinder invited
+                // typing a caption for a photo that did not exist.
+                ui.colored_label(c.text_weak, step.prompt());
+                return;
             }
-        });
-        // Recomputed here rather than captured: the button above may have just
-        // changed the duration, and showing the PREVIOUS delivery would tell
-        // the user the opposite of what pressing send will do.
-        let delivery = crate::outbox::Delivery::of(self.composer.duration);
-        ui.label(egui::RichText::new(delivery.explain())
-            .color(if delivery.replicates() { c.warning } else { c.text_weak }).small());
-
-        // THE SEND RECEIPT, beside the delivery line it belongs with. The Qt
-        // header calls it "a quiet send receipt for group media — three plain
-        // facts, one line each, that make the snapclone-mediashare guarantees
-        // visible BEFORE you send": metadata stripped, only un-shared bytes go
-        // out, sealed to everyone in the thread.
-        //
-        // send_summary_ui was ported and never called. prepare_send fills all
-        // three facts in one call and can_send gates on blocks_send, and both
-        // were reached only from tests — so the receipt was computed for
-        // nobody and the encryption gate protected nothing.
-        crate::send_summary::send_summary_ui(ui, &self.send_summary, c);
-        if !self.can_send() {
-            // blocks_send is RECIPIENTS == 0 — "sealed to everyone in the
-            // thread" cannot be satisfied when the thread holds nobody. Said
-            // as the reason the send is unavailable rather than left as a
-            // disabled button, which is the failure the receipt exists to
-            // prevent.
-            ui.colored_label(c.warning, "nobody in this thread to send to");
+            crate::send_flow::Step::Recipients => {
+                ui.colored_label(c.text_weak, step.prompt());
+                ui.horizontal(|ui| {
+                    if ui.button("choose recipients").clicked() { self.nav.go_page(2); }
+                    if ui.button("back to compose").clicked() { self.send_flow.back_to_compose(); }
+                });
+                return;
+            }
+            crate::send_flow::Step::Sending | crate::send_flow::Step::Sent => {
+                crate::send_flow_ui::receipt(ui, &self.send_flow, c);
+                if ui.button("new snap").clicked() || self.send_flow.receipt_expired(now_ms) {
+                    self.send_flow.reset();
+                }
+                return;
+            }
+            crate::send_flow::Step::Compose => {
+                ui.colored_label(c.text_weak, step.prompt());
+            }
+        }
+        // the composer's bottom panel, as SnapComposerDialog lays it out
+        let cap_focus = ui.memory(|m| m.focused()).is_some();
+        // THE KEYBOARD INSET, fed by focus: winit/egui 0.34 do not surface the
+        // input panel's rect; 0.45 is the module's own test fraction and about
+        // what a phone keyboard takes. Right when the platform says, usable
+        // when it does not, zero when nothing is focused.
+        let fraction = ui.ctx().input(|i| i.events.iter().find_map(|e| match e {
+            egui::Event::Ime(_) => Some(0.45),
+            _ => None,
+        })).unwrap_or(0.45);
+        self.composer.apply_keyboard_inset(cap_focus, fraction);
+        match crate::composer_ui::compose_controls(ui, &mut self.composer, c) {
+            crate::composer_ui::ComposeAction::Next => self.advance_to_recipients(),
+            crate::composer_ui::ComposeAction::Retake => self.shutter_pressed = true,
+            crate::composer_ui::ComposeAction::Cancel => self.send_flow.cancel(),
+            crate::composer_ui::ComposeAction::None => {}
         }
             });
+    }
+
+    /// Step 3's Send: one watched row per recipient, the send through the
+    /// flow so the composed snap travels, the picker cleared for next time.
+    /// Public so the whole sequence — shutter, compose, choose, send, receipt
+    /// — is driven by tests in `host.rs` and not only by a finger.
+    pub fn send_to(&mut self, chosen: &[String], now_ms: u64) {
+        for who in chosen {
+            // One row PER RECIPIENT. A single row for a multi-send cannot
+            // express the normal case — one person offline, the rest fine —
+            // and would have to report the whole thing failed or the whole
+            // thing sent.
+            //
+            // KEYED BY THE RECIPIENT. The row id was `who:now`, and the host
+            // acks and fails by `who` alone (`SnapDelivered { id }`), so no row
+            // made from the button was ever matched: every real send aged out
+            // as a timeout while the host tests — which pushed `who` — passed.
+            self.sends.push(who, now_ms);
+        }
+        // Through the flow, so the composed snap (timer, caption) travels
+        // with the recipients instead of the bin rebuilding it as duration 0,
+        // which on this wire means never vanishes. A send with no snap being
+        // composed (the palette's bare "send to") keeps the old bare path.
+        match self.send_flow.on_send(chosen, now_ms) {
+            Some(req) => self.send_request = Some(req),
+            None => self.send_requested = chosen.to_vec(),
+        }
+        self.picker.clear();
+    }
+
+    /// Compose is done: bake the composition into the flow and open the
+    /// picker with "Send" armed. Both the Next button and the upward swipe
+    /// land here, so they cannot disagree about what "next" is.
+    pub fn advance_to_recipients(&mut self) {
+        if self.send_flow.on_composed(self.composer.compose()) {
+            self.picker.mode = crate::contacts::PickMode::Multi { confirm_label: "Send".into() };
+            self.nav.go_page(2);
+        }
     }
 
     /// Route one action from the requests list. Accept and Decline apply
@@ -4215,22 +4260,37 @@ impl Snapclone {
         // watches", had no caller at all. Between them the app could choose
         // recipients and never tell you whether anything arrived.
         let chosen: Vec<String> = self.picker.selected().to_vec();
+        // STEP 3, when a snap is waiting. The strip says what is being sent
+        // (file · timer · caption) and the button says it is THE snap, not a
+        // generic "send to N"; with no contacts at all the Qt rule applies —
+        // "Add a friend first" — and the shutter is not left holding a photo
+        // nobody can receive.
+        let sending = self.send_flow.step() == crate::send_flow::Step::Recipients;
+        if sending {
+            crate::send_flow_ui::stepper_strip(ui, &self.send_flow, c);
+            // THE RECEIPT, BEFORE THE SEND, where its facts are known. The Qt
+            // header says it makes the mediashare guarantees visible before
+            // you send; "recipients" is the one fact this step decides, and
+            // the encryption facet goes red — and the gate blocks — when the
+            // thread holds nobody. It used to sit on the camera page, where
+            // recipients are never known, and so was always red.
+            self.send_summary.set_recipients(chosen.len() as i32);
+            crate::send_summary::send_summary_ui(ui, &self.send_summary, c);
+            if self.contact_book.is_empty() {
+                ui.colored_label(c.warning, "Add a friend first — nobody to send this snap to");
+            } else if !self.can_send() {
+                ui.colored_label(c.text_weak, "tick who gets it");
+            }
+            if ui.button("back to compose").clicked() { self.send_flow.back_to_compose(); }
+        }
         if !chosen.is_empty() {
-            let label = format!("send to {}", chosen.len());
-            if ui.button(label).clicked() {
+            let label = if sending { format!("Send snap to {} \u{27a4}", chosen.len()) }
+                        else { format!("send to {}", chosen.len()) };
+            if ui.add(egui::Button::new(egui::RichText::new(&label).strong())
+                .min_size(egui::vec2(0.0, if sending { 40.0 } else { 0.0 }))).clicked()
+            {
                 let now = (ui.input(|i| i.time) * 1000.0) as u64;
-                for who in &chosen {
-                    // One row PER RECIPIENT. A single row for a multi-send
-                    // cannot express the normal case — one person offline, the
-                    // rest fine — and would have to report the whole thing
-                    // failed or the whole thing sent.
-                    self.sends.push(&format!("{who}:{now}"), now);
-                }
-                // AND ACTUALLY SEND. The rows above are what the sender
-                // WATCHES; until now they were the whole of it, so the
-                // button drew a progress row for a transfer that never
-                // started and the row aged out looking like a timeout.
-                self.send_requested = chosen.clone();
+                self.send_to(&chosen, now);
             }
         }
         // Failures surface without being hunted for. needs_attention exists

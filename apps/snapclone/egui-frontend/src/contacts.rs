@@ -161,6 +161,8 @@ impl Picker {
     }
 
     pub fn is_selected(&self, id: &str) -> bool { self.selected.iter().any(|s| s == id) }
+    /// Drop the selection — after a send, so the next snap does not go to last time's people by default.
+    pub fn clear(&mut self) { self.selected.clear(); }
 
     /// Can the multi-select confirm fire?
     ///

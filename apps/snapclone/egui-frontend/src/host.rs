@@ -290,14 +290,22 @@ pub enum HostCommand {
     NatClassified(bool),
     /// A QR payload latched onto an open scanner.
     QrLatched(bool),
-    /// Send the most recent capture to these people.
+    /// Send the most recent capture to these people, with what was composed
+    /// over it.
     ///
-    /// WHO, not what. The app chose the recipients; the host knows which
+    /// WHO, and the composition — not the pixels. The app chose the
+    /// recipients and the caption, colour and TIMER; the host knows which
     /// bytes the last shutter press produced and how to put them on a
     /// socket. Passing the payload through the app would mean the
     /// controller holding a photo in memory for no reason other than to
-    /// hand it straight back.
-    SendSnap { to: Vec<String> },
+    /// hand it straight back — but the composition has to come from here,
+    /// because the host has no other source for it: when the command was
+    /// `{ to }` alone the bin wrote `duration_secs = 0` onto the wire, and on
+    /// this wire zero means the snap never vanishes.
+    ///
+    /// `snap` is `None` for the palette's bare "send to" (no composer behind
+    /// it); the host then sends with the composer's defaults.
+    SendSnap { to: Vec<String>, snap: Option<crate::composer::Snap> },
     /// Write the finished-snap set out; it changed. Carries the value for
     /// the same reason `SaveContacts` does — a host writing from another
     /// thread must not have to borrow the app.
@@ -434,8 +442,14 @@ impl Snapclone {
                 // Flash only on SUCCESS. The universal camera confirmation
                 // should not fire for a capture that produced no file — that
                 // would be a worse lie than the silence it replaces.
-                if r.is_ok() {
+                if let Ok(path) = &r {
                     self.snap_flash = Some(0.0);
+                    // STEP 1 IS DONE: the flow moves to Compose, and the
+                    // composer's controls appear under the frame.
+                    self.send_flow.on_captured(crate::send_flow::Captured {
+                        path: path.clone(),
+                        at_ms: self.now_secs as u64 * 1000,
+                    });
                 }
                 self.shutter_note = match r {
                     // The basename, not the path: a phone's data dir is
@@ -549,6 +563,7 @@ impl Snapclone {
                 self.posture.notify_snap_arrived();
             }
             HostEvent::SnapSendFailed { id, now_ms } => {
+                self.send_flow.on_failed(&id, now_ms);
                 for r in self.sends.rows_mut() {
                     if r.id == id { r.failed(now_ms); }
                 }
@@ -576,6 +591,7 @@ impl Snapclone {
                 // defined, documented, tested, and called by nothing.
                 self.outbox.mark_delivered(&id);
                 self.sends.ack(&id, now_ms);
+                self.send_flow.on_delivered(&id, now_ms);
             }
             HostEvent::ConnectionRequest { id, peer, at } => {
                 self.inbox.connection_request(id, &peer, at)
@@ -623,9 +639,12 @@ impl Snapclone {
         for id in std::mem::take(&mut self.key_conflicts) {
             out.push(HostCommand::PeerKeyChanged(id));
         }
+        if let Some(req) = self.send_request.take() {
+            out.push(HostCommand::SendSnap { to: req.to, snap: Some(req.snap) });
+        }
         let to = std::mem::take(&mut self.send_requested);
         if !to.is_empty() {
-            out.push(HostCommand::SendSnap { to });
+            out.push(HostCommand::SendSnap { to, snap: None });
         }
         if std::mem::take(&mut self.snap_state_dirty) {
             out.push(HostCommand::SaveSnapState(Box::new(self.snap_state.clone())));
@@ -921,7 +940,7 @@ mod tests {
         s.send_requested = vec!["sc-aabbccdd".into()];
         let out = s.drain_commands();
         assert!(out.iter().any(|c| matches!(c,
-            HostCommand::SendSnap { to } if to == &vec!["sc-aabbccdd".to_string()])),
+            HostCommand::SendSnap { to, .. } if to == &vec!["sc-aabbccdd".to_string()])),
             "{out:?}");
         // Drained, not repeated: a flag left set would re-send the photo
         // every frame for the rest of the session.
@@ -1447,5 +1466,57 @@ mod addr_health_host_tests {
         a.apply(HostEvent::SnapSendFailed { id: "sc-unknown".into(), now_ms: 0 });
         assert_eq!(a.addr_health.failures("sc-unknown"), 0);
         assert!(a.addr_health.usable("sc-unknown", 0));
+    }
+
+    /// THE WHOLE SEQUENCE, driven by events rather than a finger: shutter →
+    /// the host's SnapSaved moves the flow to Compose → Next composes with the
+    /// timer the person set → Send builds ONE command carrying who AND what →
+    /// the host's delivered/failed answers settle the receipt. The bug this
+    /// pins: the command carried only `to`, and the bin put `duration 0` —
+    /// never vanishes — on the wire for every snap.
+    #[test]
+    fn a_snap_goes_out_with_its_timer_and_the_receipt_settles() {
+        use crate::send_flow::Step;
+        let mut s = app();
+        assert_eq!(s.send_flow.step(), Step::Capture);
+        s.shutter_pressed = true;
+        assert!(s.drain_commands().contains(&HostCommand::CaptureSnap));
+        s.apply(HostEvent::Tick { now_secs: 1_000 });
+        s.apply(HostEvent::SnapSaved(Ok("/x/snaps/snap-7.jpg".into())));
+        assert_eq!(s.send_flow.step(), Step::Compose, "a saved frame is what moves the flow on");
+        assert_eq!(s.send_flow.captured().unwrap().path, "/x/snaps/snap-7.jpg");
+        s.composer.caption = "  hello  ".into();
+        s.composer.duration = crate::composer::Duration::Seconds(10);
+        s.advance_to_recipients();
+        assert_eq!(s.send_flow.step(), Step::Recipients);
+        assert_eq!(s.nav.page(), 2, "Next opens the picker page");
+        assert!(s.picker.is_multi(), "with Send armed");
+        s.send_to(&["kitchen".into(), "studio".into()], 5_000);
+        assert_eq!(s.send_flow.step(), Step::Sending);
+        let cmds = s.drain_commands();
+        let snap = cmds.iter().find_map(|c| match c {
+            HostCommand::SendSnap { to, snap } if to == &vec!["kitchen".to_string(), "studio".to_string()] => snap.clone(),
+            _ => None,
+        }).expect("one SendSnap for both recipients, with the composed snap riding along");
+        assert_eq!(snap.duration.to_secs(), 10, "THE TIMER TRAVELS");
+        assert_eq!(snap.caption, "hello", "trimmed by compose()");
+        assert!(s.picker.selected().is_empty(), "the selection does not carry to the next snap");
+        assert!(!s.drain_commands().iter().any(|c| matches!(c, HostCommand::SendSnap { .. })), "sent once");
+        // the rows the sender watches are keyed by recipient, so the host's answers reach them
+        s.apply(HostEvent::SnapDelivered { id: "kitchen".into(), now_ms: 6_000 });
+        s.apply(HostEvent::SnapSendFailed { id: "studio".into(), now_ms: 6_500 });
+        assert_eq!(s.send_flow.step(), Step::Sent);
+        assert_eq!(s.send_flow.receipt().headline(), "sent to 1, 1 failed");
+        assert_eq!(s.sends.needs_attention().len(), 1, "the failed row is the one to retry");
+        assert!(s.sends.rows().iter().any(|r| r.id == "kitchen" && r.state == crate::send_state::SendState::Delivered),
+                "the delivered row reached Delivered — it could only age out before");
+    }
+
+    #[test]
+    fn a_bare_palette_send_still_goes_out_without_a_composition() {
+        let mut s = app();
+        s.run_action(crate::palette::Action::SendTo { id: "kitchen".into(), name: "Kitchen".into() });
+        let cmds = s.drain_commands();
+        assert!(cmds.iter().any(|c| matches!(c, HostCommand::SendSnap { to, snap: None } if to == &vec!["kitchen".to_string()])));
     }
 }

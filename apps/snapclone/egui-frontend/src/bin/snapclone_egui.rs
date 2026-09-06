@@ -977,7 +977,26 @@ impl App {
                 // dial to a phone that is asleep costs the whole timeout,
                 // and doing that inline would freeze the UI for twenty
                 // seconds per person.
-                HostCommand::SendSnap { to } => {
+                HostCommand::SendSnap { to, snap } => {
+                    // THE TIMER GOES ON THE WIRE. `duration_secs` was a literal
+                    // 0 here — on this wire "never vanishes" — while the
+                    // composer's timer defaulted to five seconds and was shown
+                    // to the person as what they were sending. The composed
+                    // snap now arrives with the command; a bare palette send
+                    // (no composer behind it) uses the composer's default.
+                    //
+                    // The caption is NOT on the wire yet: `SnapFrame` has no
+                    // text field and the Qt predecessor bakes the caption into
+                    // the image (`renderComposed`) — rasterising text onto the
+                    // JPEG is the next step, in media_encode. Said in the log
+                    // so it is not mistaken for sent.
+                    let (duration_secs, caption) = match &snap {
+                        Some(c) => (c.duration.to_secs().min(u16::MAX as u32) as u16, c.caption.clone()),
+                        None => (snapclone_egui::composer::Composer::default().duration.to_secs() as u16, String::new()),
+                    };
+                    if !caption.is_empty() {
+                        eprintln!("snapclone: caption {caption:?} not on the wire yet (no text field in SnapFrame; bake into the image is the next step)");
+                    }
                     // Open the path first: on a port-preserving NAT the TCP
                     // SYN that follows rides the UDP mapping the volley
                     // makes (the C++ comment on why TCP works afterwards).
@@ -1021,7 +1040,7 @@ impl App {
                         let (seq, ack) = self.snap.frame_ids(&who);
                         let frame = snapclone_egui::snap_wire::SnapFrame::announce(
                             seq, ack, &me, &name, snapclone_egui::snaps::Media::Image,
-                            now_s, 0, bytes.clone());
+                            now_s, duration_secs, bytes.clone());
                         let results = self.send_results.clone();
                         self.sending.push(std::thread::spawn(move || {
                             let out = snapclone_egui::snap_transport::send_snap(addr, &frame);
