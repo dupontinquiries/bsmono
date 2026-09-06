@@ -548,7 +548,17 @@ mod gpu {
                 let prefix_ids = self.tok.encode(prefix);
                 let cap = prefix_ids.len() + need.max(512) + 1024;
                 let cache = self.gpu.new_cache_for(&self.model, cap);
-                let _ = self.gpu.prefill_batched(&self.model, &cache, &prefix_ids);
+                // The prefix prefill, PACED. Three thousand tokens in one
+                // submission held the GPU for seconds on the first turn;
+                // in governed chunks each one is a frame's worth, and
+                // the frame gets in between them.
+                let chunk = if self.governor.is_some() { 48 } else { 256 };
+                let mut pos = 0;
+                for piece in prefix_ids.chunks(chunk) {
+                    if let Some(g) = &self.governor { g.acquire(self.tier); }
+                    let _ = self.gpu.prefill_chunked_from(&self.model, &cache, piece, pos, chunk);
+                    pos += piece.len();
+                }
                 *slot = Some(PrefixKv { hash: phash, len: prefix_ids.len(), cap, cache });
             }
             let p = slot.as_ref().expect("just filled");
@@ -560,9 +570,12 @@ mod gpu {
             if let Some(g) = &self.governor { g.acquire(self.tier); }
             let (gov, tier) = (self.governor.clone(), self.tier);
             let stops = &self.stops;
-            self.gpu.generate_kv_stream_from(
+            let chunk = if self.governor.is_some() { 48 } else { 256 };
+            let pace_gov = self.governor.clone();
+            let pace = move || { if let Some(g) = &pace_gov { g.acquire(tier); } };
+            self.gpu.generate_kv_stream_paced(
                 &self.model, &p.cache, p.len, &suffix_ids, max_tokens, self.eos,
-                &self.sampler, &mut rng, &|| false,
+                &self.sampler, &mut rng, &|| false, &pace, chunk,
                 |t| {
                     if stops.contains(&t) { return false; }
                     out.push(t);

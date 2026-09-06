@@ -17553,9 +17553,34 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         eos: Option<u32>, sampler: &SamplerParams, rng: &mut u64, cancel: &dyn Fn() -> bool,
         mut on_token: impl FnMut(u32) -> bool,
     ) -> usize {
+        self.generate_kv_stream_paced(m, c, prefix_len, suffix, n_new, eos, sampler, rng, cancel,
+                                      &|| {}, 256, on_token)
+    }
+
+    /// `generate_kv_stream_from` with the PREFILL paced too.
+    ///
+    /// Decode steps are one token each and easy to interleave with a
+    /// renderer's frames. A prefill is not: 256 tokens of an 8B in one
+    /// submission is tens of milliseconds of the GPU that a frame
+    /// cannot get in front of. `pace` is called before each prefill
+    /// chunk and `chunk` sets its size, so a host that shares the GPU
+    /// can take the prefill in frame-sized bites. The unpaced caller
+    /// passes a no-op and 256 and gets exactly the old behaviour.
+    pub fn generate_kv_stream_paced(
+        &self, m: &Model, c: &KvCache, prefix_len: usize, suffix: &[u32], n_new: usize,
+        eos: Option<u32>, sampler: &SamplerParams, rng: &mut u64, cancel: &dyn Fn() -> bool,
+        pace: &dyn Fn(), chunk: usize, mut on_token: impl FnMut(u32) -> bool,
+    ) -> usize {
         if cancel() || suffix.is_empty() { return 0; }
-        let mut pos = prefix_len + suffix.len();
-        let mut logits = self.prefill_chunked_from(m, c, suffix, prefix_len, 256);
+        let chunk = chunk.max(1);
+        let mut pos = prefix_len;
+        let mut logits = Vec::new();
+        for piece in suffix.chunks(chunk) {
+            if cancel() { return 0; }
+            pace();
+            logits = self.prefill_chunked_from(m, c, piece, pos, chunk);
+            pos += piece.len();
+        }
         let mut seen: Vec<u32> = suffix.to_vec();
         let mut produced = 0usize;
         for _ in 0..n_new {

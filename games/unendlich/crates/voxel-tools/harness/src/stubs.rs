@@ -106,3 +106,6 @@ impl FloraStore {
     pub fn plant(&mut self, pos: [i32; 3], cell: FloraCell) { self.cells.insert(pos, cell); }
     pub fn len(&self) -> usize { self.cells.len() }
 }
+
+/// Stub of thread_priority::configure_current_thread(ChunkLoader).
+pub fn deprioritise() {}

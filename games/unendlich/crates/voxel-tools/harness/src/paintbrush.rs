@@ -832,6 +832,7 @@ impl Paintbrush {
         let prose = prose.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new().name("paintbrush-drone".into()).spawn(move || {
+            crate::stubs::deprioritise();
             let mut session = session;
             let mut staged = StagedWorld::new(&drone_world);
             let mut tools = VoxelTools::new(&mut staged);
@@ -900,17 +901,25 @@ impl Paintbrush {
         // Same borrow shape as `prompt_for`: the view lives for the
         // length of this call, which is all a prompt needs -- it reads
         // the world and never writes.
-        let user = {
-            let view = WorldView(cm);
-            let mut staged = StagedWorld::new(&view);
+        // The context -- terrain read, ambient, region digest -- is a
+        // few hundred thousand block reads on a fresh focus. It used to
+        // be built HERE, on the frame, at the moment of Enter: a visible
+        // hitch before "asking ..." appeared. It is built on the worker
+        // now, from a clone of the session over an owned view of the
+        // chunk store, immediately before the model call it feeds.
+        let session = self.session.clone();
+        let drone_world = crate::bind::DroneWorld(cm.drone_view());
+        let (gaze_c, surface_c, prose_c) = (*gaze, surface.map(|s| s.to_string()), prose.to_string());
+        let user: Box<dyn FnOnce() -> String + Send> = Box::new(move || {
+            let mut staged = StagedWorld::new(&drone_world);
             let tools = VoxelTools::new(&mut staged);
-            let (u, _pass) = self.session.user_turn(&tools, gaze, surface, prose, None);
+            let (u, _pass) = session.user_turn(&tools, &gaze_c, surface_c.as_deref(), &prose_c, None);
             u
-        };
+        });
         // Context-sized system prompt: a small model given the long one
         // echoes it back instead of answering.
         let system = self.system_prompt();
-        let Some(mut completer) = self.completer_for(debug) else {
+        let Some(completer) = self.completer_for(debug) else {
             self.say("no provider available -- /provider to check");
             return;
         };
@@ -941,14 +950,23 @@ impl Paintbrush {
     /// inline in the bin: a twenty-second stall, the exact thing the
     /// rest of this file exists to prevent.
     fn spawn_turn(&mut self, mut completer: Box<dyn voxel_tools::llm::Completer>,
-                  system: String, user: String, gaze: &Gaze,
+                  system: String, user: Box<dyn FnOnce() -> String + Send>, gaze: &Gaze,
                   player_feet: Option<(i32, i32, i32)>, prose: &str, kind: TurnKind) {
         let name = completer.name().to_string();
-        log::info!("[paintbrush] asking {name} ({} + {} chars, ctx {}, {kind:?})",
-                   system.len(), user.len(), self.ctx_tokens);
+        log::info!("[paintbrush] asking {name} ({} chars system, ctx {}, {kind:?})",
+                   system.len(), self.ctx_tokens);
         self.say(format!("asking {name} ... (the world keeps running)"));
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            // Same treatment as the chunk loaders: deprioritised and, on
+            // a heterogeneous SoC, pinned to the efficiency cores. The
+            // frame thread keeps the performance cores; on a four-core
+            // phone an AI thread at equal priority was a fifth of the
+            // machine taken from the renderer for a minute.
+            crate::stubs::deprioritise();
+            // The user prompt is built here, on the worker.
+            let user = user();
+            log::info!("[paintbrush] user prompt {} chars", user.len());
             let r = completer.complete(&system, &user);
             // A closed receiver means the turn was cancelled; nothing to
             // report and nobody to report to.
@@ -976,7 +994,7 @@ impl Paintbrush {
             self.say("no provider available -- /provider to check");
             return;
         };
-        self.spawn_turn(completer, system, user, gaze, player_feet, "", TurnKind::Repair);
+        self.spawn_turn(completer, system, Box::new(move || user), gaze, player_feet, "", TurnKind::Repair);
     }
 
     /// The model answered a repair turn with fixed lines. Merge them
@@ -1165,8 +1183,10 @@ impl Paintbrush {
         // Small edits go straight in: sharding forty blocks is overhead
         // for nothing, and the player expects a door to appear NOW.
         // Anything larger is offered to the comb and the queen applies it
-        // over the coming frames within her budget.
-        const IMMEDIATE: usize = 4_000;
+        // over the coming frames within her budget. Was 4,000, which is
+        // still four chunks remeshed in one frame; a tower at 300 is
+        // fine immediately, a hut at 800 is a hitch.
+        const IMMEDIATE: usize = 512;
         if staged.pending() > IMMEDIATE {
             let changes = staged.snapshot();
             let name = self.session.last_build.as_ref().map(|b| b.name.clone())
