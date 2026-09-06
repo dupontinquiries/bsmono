@@ -131,6 +131,11 @@ pub fn for_scene(scene: &str) -> SceneText {
         "hillside" | "ruins" | "slate" | "recursive citadel" | "fractal spires"
             => SceneText { entry: Surface::Runestone, readback: Surface::Runestone },
         "alley" | "street" => SceneText { entry: Surface::StreetSign, readback: Surface::Billboard },
+        // The cave's plaques are iron-bound slate: a polished stone face, like the other stone rooms.
+        "cat cave" | "titan's ribcage" => SceneText { entry: Surface::Runestone, readback: Surface::Runestone },
+        // Elmbrook's boards are hung timber signs — a street sign is the object that already carries
+        // words in a town square; the readback stays a billboard, a sign holds sixty characters.
+        "forest village" | "lavarock way" => SceneText { entry: Surface::StreetSign, readback: Surface::Billboard },
         // Overhead and made of vapour: a puff holds nothing (budget 0), so it
         // is an entry affordance only and the readback stays a billboard.
         "cloudscape" | "folding@home" => SceneText { entry: Surface::CloudPuff, readback: Surface::Billboard },

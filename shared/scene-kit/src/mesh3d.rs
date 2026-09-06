@@ -472,7 +472,10 @@ pub fn anim_cell(mode: TextAnim, t: f32, cf: f32, ci: usize, scale: f32) -> (f32
 /// | Recursive Citadel     | proposed: sun on sandstone — slow warm pulse, like heat-shimmer |
 /// | Hollow Jungle         | proposed: canopy-hole shafts — like DappledCanopy but sparser, harder-edged beams |
 /// | Yellow Brick Road     | proposed: literal brick-road glints — sequential left-to-right chase lights |
-/// | Titan's Ribcage       | proposed: bioluminescent pulse along the ribs — a slow heartbeat-timed wave |
+/// | Titan's Ribcage       | BonePulse           | IMPLEMENTED — a slow heartbeat wave along the bone, twin-beat   |
+/// | Cat Cave              | PondCaustics        | IMPLEMENTED — lantern light bounced off a still pond, slow warm |
+/// | Forest Village        | LanternString       | IMPLEMENTED — paper lanterns swaying on a wire, rain-drip flicker|
+/// | Lavarock Way          | StreamCaustics      | IMPLEMENTED — sun off a running stream, quick cool caustic bands|
 /// | Islands (default)     | Uniform — no bespoke scene to key off |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SceneLight {
@@ -510,6 +513,21 @@ pub enum SceneLight {
     /// Yellow Brick Road: chase lights along the bricks — a bright pulse
     /// running left to right, brick by brick.
     BrickChase,
+    /// Titan's Ribcage: a bioluminescent pulse running along the bone — a slow
+    /// heartbeat (lub-dub: two beats then a rest) travelling left to right,
+    /// pale green-yellow at the crest.
+    BonePulse,
+    /// Cat Cave: lantern light bounced off the still pond onto the board —
+    /// slow, warm, interfering ripple bands that never go dark.
+    PondCaustics,
+    /// Forest Village: paper lanterns swaying on a wire across the square.
+    /// Each lantern lights a column of dots; the swing moves them a little,
+    /// and a rain drip on a lantern makes it stutter for a frame.
+    LanternString,
+    /// Lavarock Way: afternoon sun off a running stream — quick, cool,
+    /// small caustic bands sliding one way, brighter and faster than the
+    /// cave's still water.
+    StreamCaustics,
     Uniform,
 }
 
@@ -533,6 +551,10 @@ pub fn scene_light_for(scene_name: &str) -> SceneLight {
         "Recursive Citadel" => SceneLight::SandstoneShimmer,
         "Hollow Jungle" => SceneLight::CanopyShafts,
         "Yellow Brick Road" => SceneLight::BrickChase,
+        "Titan's Ribcage" => SceneLight::BonePulse,
+        "Cat Cave" => SceneLight::PondCaustics,
+        "Forest Village" => SceneLight::LanternString,
+        "Lavarock Way" => SceneLight::StreamCaustics,
         _ => SceneLight::Uniform,
     }
 }
@@ -544,6 +566,9 @@ pub const SCENE_NAMES: &[&str] = &[
     "Canopy", "Atlantis", "Mistfall", "Folding@home", "Fractal Spires", "Frozen Bifrost",
     "Forest", "Treehouse", "Cloudscape", "Mansion Garden", "Old Library", "Archive", "Reading Room",
     "Slate", "Alley", "Recursive Citadel", "Hollow Jungle", "Yellow Brick Road",
+    // Titan's Ribcage was dispatched by `scene3d::build` and absent here, so it fell through to
+    // `Uniform` and the test below could not see it — which is what this list is for.
+    "Titan's Ribcage", "Cat Cave", "Forest Village", "Lavarock Way",
 ];
 
 /// Per-dot (brightness multiplier, hue-shift-degrees) from the scene's physical process. Brightness
@@ -566,6 +591,10 @@ pub fn modulate_dot(light: SceneLight, gx: f32, gy: f32, seed: u32, t: f32) -> (
         SceneLight::SandstoneShimmer => sandstone_shimmer(gx, gy, seed, t),
         SceneLight::CanopyShafts => (canopy_shafts(gx, gy, seed, t), 0.0),
         SceneLight::BrickChase => (brick_chase(gx, gy, seed, t), 0.0),
+        SceneLight::BonePulse => bone_pulse(gx, gy, seed, t),
+        SceneLight::PondCaustics => pond_caustics(gx, gy, seed, t),
+        SceneLight::LanternString => lantern_string(gx, gy, seed, t),
+        SceneLight::StreamCaustics => stream_caustics(gx, gy, seed, t),
         SceneLight::Uniform => (1.0, 0.0),
     }
 }
@@ -687,6 +716,74 @@ fn brick_chase(gx: f32, gy: f32, seed: u32, t: f32) -> f32 {
     let behind = (head - brick).rem_euclid(10.0);
     let flare = (1.0 - behind / 2.5).clamp(0.0, 1.0).powf(1.5);
     0.6 + 0.4 * flare
+}
+
+/// TITAN'S RIBCAGE: a bioluminescent pulse along the bone. A heartbeat is
+/// two beats and a rest (lub-dub, ~72/min), and each beat is a crest that
+/// travels along the text left to right the way light runs down a rib —
+/// pale green-yellow at the crest, dim bone between, never dark.
+fn bone_pulse(gx: f32, gy: f32, seed: u32, t: f32) -> (f32, f32) {
+    let period = 60.0 / 72.0;
+    let phase = (t + hash3(seed as i32, 41, 0) * period).rem_euclid(period) / period;
+    // two beats: crests launched at phase 0.0 and 0.18 of the cycle
+    let mut crest = 0.0f32;
+    for launch in [0.0f32, 0.18] {
+        let age = phase - launch;
+        if age < 0.0 { continue; }
+        let head = age * 48.0; // columns per cycle-fraction: the crest crosses ~40 columns in one beat's travel
+        let d = (head - gx).abs();
+        crest = crest.max((1.0 - d / 4.0).clamp(0.0, 1.0).powi(2));
+    }
+    let marrow = hash3(gx.floor() as i32, gy.floor() as i32, seed as i32) * 0.08; // pitted bone: per-dot grain
+    let b = (0.58 + 0.42 * crest + marrow).clamp(0.5, 1.0);
+    (b, 28.0 * crest) // toward green-yellow at the crest
+}
+
+/// CAT CAVE: lantern light bounced off the still pond onto the board. Two
+/// slow ripple trains interfere; the bands drift, brighten where they
+/// cross, and stay warm. Still water: slow and wide.
+fn pond_caustics(gx: f32, gy: f32, seed: u32, t: f32) -> (f32, f32) {
+    let s0 = hash3(seed as i32, 51, 0) * 6.283;
+    let a = ((gx * 0.38 + gy * 0.21) * 1.0 + t * 0.55 + s0).sin();
+    let b = ((gx * -0.27 + gy * 0.33) * 1.0 - t * 0.41 + s0 * 1.7).sin();
+    let c = ((gx * 0.12 + gy * 0.51) * 1.0 + t * 0.23).sin();
+    let caustic = ((a + b + c) / 3.0 * 0.5 + 0.5).powf(1.6); // interference, sharpened into bright seams
+    let flame = 0.9 + 0.1 * (t * 6.1 + s0).sin() * (t * 2.3).cos(); // the lantern behind it breathes
+    let bb = (0.62 + 0.38 * caustic) * flame;
+    (bb.clamp(0.5, 1.0), 6.0 * caustic) // a touch toward amber in the seams
+}
+
+/// FOREST VILLAGE: paper lanterns on a wire. Every ~6 columns one lantern
+/// hangs; each lights the columns near it, swaying so the pool of light
+/// slides a little; now and then a rain drip lands on one and it stutters
+/// for a frame.
+fn lantern_string(gx: f32, gy: f32, seed: u32, t: f32) -> (f32, f32) {
+    let spacing = 6.0;
+    let sway = (t * 0.9 + hash3(seed as i32, 61, 0) * 6.283).sin() * 0.9;
+    let nearest = ((gx - sway) / spacing).round();
+    let d = ((gx - sway) - nearest * spacing).abs();
+    let pool = (1.0 - d / (spacing * 0.75)).clamp(0.0, 1.0).powf(1.3);
+    let lantern = nearest as i32 ^ seed as i32;
+    // a drip: this lantern, this ~third of a second, one in fourteen chances
+    let drip = if hash3(lantern, (t * 3.0).floor() as i32, 7) < 0.07 { 0.75 } else { 1.0 };
+    let dim_below = 1.0 - gy * 0.02; // the wire is above the text; lower rows a touch dimmer
+    let b = (0.58 + 0.42 * pool) * drip * dim_below;
+    (b.clamp(0.5, 1.0), 4.0 * pool)
+}
+
+/// LAVAROCK WAY: afternoon sun off a running stream. Quick, cool, narrow
+/// caustic bands all sliding one way with the current, brighter and
+/// faster than the cave's still pond, with a small bright fleck riding
+/// each band.
+fn stream_caustics(gx: f32, gy: f32, seed: u32, t: f32) -> (f32, f32) {
+    let s0 = hash3(seed as i32, 71, 0) * 6.283;
+    let flow = t * 2.6; // the current: everything slides one way
+    let a = ((gx * 0.9 + gy * 0.35) - flow + s0).sin();
+    let b = ((gx * 0.55 - gy * 0.62) - flow * 1.3 + s0 * 0.6).sin();
+    let band = ((a * b) * 0.5 + 0.5).powf(2.2); // products give the thin bright seams of moving water
+    let fleck = if hash3((gx + flow).floor() as i32, gy.floor() as i32, seed as i32) > 0.985 { 0.2 } else { 0.0 };
+    let bb = 0.66 + 0.34 * band + fleck;
+    (bb.clamp(0.5, 1.0), -8.0 * band) // toward blue-white where the sun catches the water
 }
 
 /// Smooth value noise on a unit lattice, 0..1. Bilinear between hashed
@@ -2313,7 +2410,8 @@ mod scene_light_tests {
         let all = [SceneLight::DappledCanopy, SceneLight::FacetedPearl, SceneLight::RisingMotes, SceneLight::MembraneRipple,
                    SceneLight::CrystalGlint, SceneLight::RainbowRefraction, SceneLight::HighCanopy, SceneLight::CloudGaps,
                    SceneLight::WindowPanes, SceneLight::LampFlicker, SceneLight::RakingLight, SceneLight::NeonBuzz,
-                   SceneLight::SandstoneShimmer, SceneLight::CanopyShafts, SceneLight::BrickChase];
+                   SceneLight::SandstoneShimmer, SceneLight::CanopyShafts, SceneLight::BrickChase,
+                   SceneLight::BonePulse, SceneLight::PondCaustics, SceneLight::LanternString, SceneLight::StreamCaustics];
         for light in all {
             let mut lo = f32::MAX; let mut hi = f32::MIN;
             let mut varies = false;
