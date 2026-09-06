@@ -298,6 +298,115 @@ pub fn scan_cmake_options(text: &str) -> Vec<CmakeOption> {
 ///
 /// An empty `triple` is a native build and needs nothing: the host `cc` IS the
 /// right linker.
+/// Does this app open a window? A GUI app has a runtime requirement a CLI does not — see
+/// [`gui_env`].
+///
+/// Read from the app's Cargo.toml rather than a list of names: an app that depends on
+/// eframe, winit or egui-winit draws a window, whatever it is called.
+pub fn is_gui_app(toml: &str) -> bool {
+    const WINDOWING: [&str; 4] = ["eframe", "winit", "egui-winit", "egui_winit"];
+    toml.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .any(|l| WINDOWING.iter().any(|w| l.starts_with(w) || l.starts_with(&format!("{w} ")) || l.starts_with(&format!("{w}="))))
+}
+
+/// Extra environment a GUI app needs for a given target.
+///
+/// # A static musl build of a windowed app compiles and cannot start
+///
+/// winit does not link libwayland-client or libX11: it **dlopens** them at run time, which
+/// is what lets one binary work on a Wayland session, an X11 session, or neither. rustc
+/// links musl targets statically by default, and a static binary has no dynamic loader —
+/// `dlopen` returns null for everything. winit then reports `NoWaylandLib`, the X11 backend
+/// fails the same way, and eframe exits with "Failed to initialize any backend". The build
+/// succeeded; the app cannot open a window on any machine, including one with both
+/// libraries installed.
+///
+/// `-C target-feature=-crt-static` makes the musl build dynamic, which restores dlopen.
+/// The binary then needs musl's loader on the device, which is exactly the Alpine /
+/// postmarketOS case this target exists for.
+///
+/// Nothing for gnu targets: they are already dynamic.
+pub fn gui_env(triple: &str) -> Vec<(String, String)> {
+    if !triple.contains("musl") {
+        return Vec::new();
+    }
+    vec![("RUSTFLAGS".to_string(), "-C target-feature=-crt-static".to_string())]
+}
+
+/// The whole environment for one build: cross-compilation plus, for a windowed app, what it
+/// needs to be able to open a window at all.
+///
+/// `RUSTFLAGS` is merged rather than overwritten — an existing value from the operator's
+/// environment would otherwise be silently dropped, and dropping `RUSTFLAGS` changes what
+/// gets built without saying so.
+pub fn build_env(triple: &str, toml: &str, inherited_rustflags: Option<&str>) -> Vec<(String, String)> {
+    let mut env = cross_env(triple);
+    if is_gui_app(toml) {
+        for (k, v) in gui_env(triple) {
+            let merged = match inherited_rustflags.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(existing) if k == "RUSTFLAGS" => format!("{existing} {v}"),
+                _ => v,
+            };
+            env.push((k, merged));
+        }
+    }
+    env
+}
+
+/// Does this ELF have a dynamic loader (a `PT_INTERP` segment)?
+///
+/// `Some(false)` is the failure this whole path exists for: a static binary cannot dlopen,
+/// so a windowed app built that way starts and cannot open a window on any machine. `None`
+/// means "not an ELF64 little-endian file I can read" — an unknown format is not evidence
+/// of anything, and guessing here would fail correct builds.
+///
+/// Only the program-header table is read: 64 bytes of header, then `e_phnum` entries.
+pub fn elf_is_dynamic(bytes: &[u8]) -> Option<bool> {
+    const PT_INTERP: u32 = 3;
+    if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" {
+        return None;
+    }
+    // class 2 = 64-bit, data 1 = little-endian. Anything else: not read.
+    if bytes[4] != 2 || bytes[5] != 1 {
+        return None;
+    }
+    let u16at = |o: usize| -> Option<usize> {
+        Some(u16::from_le_bytes([*bytes.get(o)?, *bytes.get(o + 1)?]) as usize)
+    };
+    let phoff = u64::from_le_bytes(bytes.get(0x20..0x28)?.try_into().ok()?) as usize;
+    let phentsize = u16at(0x36)?;
+    let phnum = u16at(0x38)?;
+    if phentsize < 4 {
+        return None;
+    }
+    for i in 0..phnum {
+        let at = phoff.checked_add(i.checked_mul(phentsize)?)?;
+        let ty = u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?);
+        if ty == PT_INTERP {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// What to tell the operator when a pushed app dies at startup with a backend error.
+///
+/// The runtime message names a missing library, so the obvious reading is "install
+/// libwayland on the device" — which does not help, because the library is there and the
+/// binary cannot dlopen anything. Worth saying once, in the words the failure uses.
+pub fn explain_no_backend(triple: &str) -> Option<&'static str> {
+    triple.contains("musl").then_some(
+        "the app started and could not open a window (NoWaylandLib, or \"Failed to \
+         initialize any backend\"). This is a STATIC musl build: winit dlopens \
+         libwayland-client and libX11 at run time, and a static binary cannot dlopen \
+         anything, so both backends look absent even when they are installed. Rebuild \
+         with RUSTFLAGS=-C target-feature=-crt-static, which gitmind now sets for \
+         windowed apps on musl targets.",
+    )
+}
+
 pub fn cross_env(triple: &str) -> Vec<(String, String)> {
     // No early return for the empty triple: `cross_linker("")` matches no arm
     // and returns None, so the unknown-triple path below already covers it. I
@@ -687,6 +796,78 @@ mod tests {
     }
 
     #[test]
+    /// A windowed app on a static musl target compiles and cannot open a window on any
+    /// machine. This is the flag that makes the build dynamic again.
+    #[test]
+    fn a_windowed_app_on_musl_is_built_dynamic() {
+        let gui = "[dependencies]\neframe = \"0.34\"\nserde = \"1\"\n";
+        let cli = "[dependencies]\nserde = \"1\"\nclap = \"4\"\n";
+        assert!(is_gui_app(gui) && !is_gui_app(cli));
+        assert!(is_gui_app("[dependencies]\nwinit=\"0.30\"\n"), "no space before the =");
+        assert!(!is_gui_app("[dependencies]\n# eframe = \"0.34\"\n"), "a commented-out dep is not a dep");
+
+        let musl = build_env("aarch64-unknown-linux-musl", gui, None);
+        assert!(musl.iter().any(|(k, v)| k == "RUSTFLAGS" && v.contains("-crt-static")));
+        // and the cross linker is still there
+        assert!(musl.iter().any(|(k, _)| k.contains("LINKER")));
+
+        // gnu is already dynamic; a CLI does not open a window at all
+        assert!(!build_env("aarch64-unknown-linux-gnu", gui, None).iter().any(|(k, _)| k == "RUSTFLAGS"));
+        assert!(!build_env("aarch64-unknown-linux-musl", cli, None).iter().any(|(k, _)| k == "RUSTFLAGS"));
+    }
+
+    /// Overwriting the operator's RUSTFLAGS would change what gets built without saying so.
+    #[test]
+    fn inherited_rustflags_are_kept() {
+        let gui = "[dependencies]\neframe = \"0.34\"\n";
+        let env = build_env("aarch64-unknown-linux-musl", gui, Some("-C debuginfo=1"));
+        let flags = env.iter().find(|(k, _)| k == "RUSTFLAGS").map(|(_, v)| v.clone()).unwrap();
+        assert!(flags.contains("-C debuginfo=1") && flags.contains("-crt-static"), "{flags}");
+        // an empty inherited value is not prepended as whitespace
+        let env = build_env("aarch64-unknown-linux-musl", gui, Some("   "));
+        let flags = env.iter().find(|(k, _)| k == "RUSTFLAGS").map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(flags, "-C target-feature=-crt-static");
+    }
+
+    /// The check that turns a runtime mystery into a build-time failure.
+    #[test]
+    fn a_static_elf_is_told_apart_from_a_dynamic_one() {
+        // A minimal ELF64-LE header with one program header.
+        let mut e = vec![0u8; 64 + 56];
+        e[..4].copy_from_slice(b"\x7fELF");
+        e[4] = 2; // 64-bit
+        e[5] = 1; // little-endian
+        e[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        e[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        e[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        // PT_LOAD only → static
+        e[64..68].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(elf_is_dynamic(&e), Some(false));
+        // PT_INTERP → has a loader
+        e[64..68].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(elf_is_dynamic(&e), Some(true));
+        // not an ELF, truncated, or a class this does not read: no opinion, not a failure
+        assert_eq!(elf_is_dynamic(b"#!/bin/sh\n"), None);
+        assert_eq!(elf_is_dynamic(&e[..40]), None);
+        let mut e32 = e.clone();
+        e32[4] = 1;
+        assert_eq!(elf_is_dynamic(&e32), None);
+        // a program-header count that runs off the end is not a crash. (The first entry is
+        // put back to PT_LOAD first: with PT_INTERP still there the answer is Some(true)
+        // before the walk ever reaches the bad offset, which is correct and tests nothing.)
+        let mut over = e.clone();
+        over[64..68].copy_from_slice(&1u32.to_le_bytes());
+        over[0x38..0x3a].copy_from_slice(&999u16.to_le_bytes());
+        assert_eq!(elf_is_dynamic(&over), None);
+    }
+
+    #[test]
+    fn the_backend_failure_is_explained_only_where_it_applies() {
+        let m = explain_no_backend("aarch64-unknown-linux-musl").unwrap();
+        assert!(m.contains("dlopen") && m.contains("crt-static"));
+        assert!(explain_no_backend("aarch64-unknown-linux-gnu").is_none());
+    }
+
     fn triple_normalization_and_native_check() {
         assert_eq!(normalize_native("aarch64-alpine-linux-musl"), "aarch64-unknown-linux-musl");
         assert_eq!(normalize_native("aarch64-unknown-linux-gnu"), "aarch64-unknown-linux-gnu");

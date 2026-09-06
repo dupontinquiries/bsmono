@@ -108,9 +108,10 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 
     // ── fetching ─────────────────────────────────────────────────────
     ui.label("fetch from a peer");
-    ui.horizontal(|ui| {
-        ui.label("address");
-        ui.add(egui::TextEdit::singleline(&mut app.share.peer_addr).id_salt("share-app_share_peer_addr"));
+    // WRAPS, and the field is sized: an unsized TextEdit took the whole row and put
+    // "look up" at x=360.9 on a 360-point screen — a button drawn entirely off the phone.
+    ui.horizontal_wrapped(|ui| {
+        crate::narrow::field(ui, "address", "share-app_share_peer_addr", &mut app.share.peer_addr, 0.5);
         let can = !app.share.peer_addr.trim().is_empty() && !app.task.is_running();
         if ui.add_enabled(can, egui::Button::new("look up")).clicked() {
             match cockpit::netshare::lookup_peer(app.share.peer_addr.trim(),

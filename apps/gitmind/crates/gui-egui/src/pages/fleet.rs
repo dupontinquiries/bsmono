@@ -184,9 +184,7 @@ fn reroll_ui(app: &mut App, ui: &mut egui::Ui) {
     use cockpit::{reroll, roster, runview};
     ui.separator();
     ui.heading("Reroll the fleet");
-    ui.label(egui::RichText::new(
-        "one pass: pair what needs pairing, build once per architecture, install everywhere")
-        .weak().small());
+    crate::narrow::desc(ui, "one pass: pair what needs pairing, build once per architecture, install everywhere");
 
     let st = &mut app.fleet;
 

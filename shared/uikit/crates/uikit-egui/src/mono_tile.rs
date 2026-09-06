@@ -78,6 +78,11 @@ impl Rng {
     }
 }
 
+/// The smallest tile that can carry the ghost layers. Below this, three copies of a glyph
+/// separated by `size * 0.087 * l` are within about two pixels of each other, which is not
+/// depth — it is a blur.
+pub const GHOST_MIN_PX: f32 = 34.0;
+
 /// Paint a deterministic tile for `name` at `size` px (square, clickable). Returns its `Response`.
 pub fn mono_tile(ui: &mut Ui, name: &str, size: f32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
@@ -110,8 +115,14 @@ pub fn mono_tile(ui: &mut Ui, name: &str, size: f32) -> Response {
         painter.add(shape);
     };
 
-    // two hue-shifted ghost layers (l = 2 then 1), offset + rotated, at ~0.32 alpha — the double fade
-    for l in (1..=2).rev() {
+    // TWO GHOST LAYERS, ON A TILE BIG ENOUGH TO HOLD THEM. Offset, rotated and at ~0.32
+    // alpha, they are the QML MonoTile's double fade and they read as depth at desktop
+    // size. At 22 px on a phone the three copies of a one-letter monogram land within a
+    // couple of pixels of each other and the glyph becomes a smear — a photo of gitmind on
+    // a Fairphone shows exactly that, and the layout probe reports it as "G over G" three
+    // deep. Below `GHOST_MIN_PX` the tile draws its one crisp layer instead: the effect is
+    // worth nothing if the letter cannot be read.
+    for l in (1..=2).rev().take(if size >= GHOST_MIN_PX { 2 } else { 0 }) {
         let lf = l as f32;
         let jx = rng.signed() * size * 0.087 * lf;
         let jy = rng.signed() * size * 0.087 * lf;
@@ -129,6 +140,25 @@ pub fn mono_tile(ui: &mut Ui, name: &str, size: f32) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A small tile draws ONE copy of its monogram, a large one draws three. Three copies
+    /// inside 22 px is the smear the phone photo shows.
+    #[test]
+    fn a_phone_sized_tile_does_not_draw_its_glyph_three_times() {
+        let count = |size: f32| {
+            let out = crate::layout_probe::probe(egui::vec2(200.0, 200.0), 2, false, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    mono_tile(ui, "gitmind", size);
+                });
+            });
+            out
+        };
+        let small = count(22.0);
+        assert!(small.overlaps.is_empty(), "a 22px tile smeared its letter: {}", small.describe());
+        let big = count(48.0);
+        assert!(!big.overlaps.is_empty(), "a 48px tile lost its ghost layers — the effect is gone");
+        assert!(GHOST_MIN_PX > 22.0 && GHOST_MIN_PX < 48.0);
+    }
 
     #[test]
     fn seed_and_hue_are_deterministic() {

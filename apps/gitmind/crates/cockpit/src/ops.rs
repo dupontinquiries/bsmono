@@ -206,6 +206,17 @@ pub fn resolve_app_dir(path: &str) -> PathBuf {
 /// UI can show a live build log. Returns the built binary path + size on success.
 /// Build with no cancellation — the original signature, unchanged for callers
 /// that have no flag to offer.
+/// The first `n` bytes of a file. Enough for an ELF header and its program-header table,
+/// without reading a 200 MB debug binary into memory to look at 64 bytes of it.
+fn read_head(path: &Path, n: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; n];
+    let got = f.read(&mut buf)?;
+    buf.truncate(got);
+    Ok(buf)
+}
+
 pub fn build_locally_logged(
     app: &str,
     app_dir: &Path,
@@ -265,11 +276,25 @@ pub fn build_locally_cancellable(
     // name to read at all (the as_bin workspace-root case above, where `app` IS the real bin name).
     let build_id = crate::buildflags::build_id(app, &root_toml);
     let argv = crate::buildflags::cargo_build_argv_kind(&build_id, &cargo_target, feats, no_default, as_bin);
+    // The environment the target needs. For a WINDOWED app on musl this adds
+    // `-C target-feature=-crt-static`, without which the build succeeds and the app cannot
+    // open a window anywhere: winit dlopens libwayland-client and libX11 at run time, and a
+    // static binary cannot dlopen at all, so it dies with NoWaylandLib / "Failed to
+    // initialize any backend" even on a device that has both. See `buildflags::gui_env`.
+    let build_env = crate::buildflags::build_env(
+        &cargo_target,
+        &root_toml,
+        std::env::var("RUSTFLAGS").ok().as_deref(),
+    );
     on_line(&format!("$ cargo {}", argv[1..].join(" ")));
     on_line(&format!("  (in {})", app_dir.display()));
+    for (k, v) in &build_env {
+        on_line(&format!("  {k}={v}"));
+    }
     let mut child = std::process::Command::new(&cargo)
         .args(&argv[1..])
         .current_dir(app_dir)
+        .envs(build_env.iter().map(|(k, v)| (k.clone(), v.clone())))
         .env("PATH", &path_env)
         .env("CARGO_TERM_COLOR", "never")
         .env("CARGO_TARGET_DIR", &build_dir)
@@ -334,6 +359,22 @@ pub fn build_locally_cancellable(
             Ok(m) if m.len() > 0 => {
                 let size = m.len();
                 on_line(&format!("✓ built {} ({} KB)", app, size / 1024));
+                // A WINDOWED APP THAT CANNOT OPEN A WINDOW is a successful build and a
+                // broken install: winit dlopens libwayland-client and libX11 at run time,
+                // and a static binary cannot dlopen, so it dies with NoWaylandLib on a
+                // device that has both libraries. Caught here, where the cause is still
+                // visible, rather than on the phone where it looks like a missing package.
+                if crate::buildflags::is_gui_app(&root_toml) {
+                    if let Ok(head) = read_head(&bin, 4096) {
+                        if crate::buildflags::elf_is_dynamic(&head) == Some(false) {
+                            if let Some(why) = crate::buildflags::explain_no_backend(&cargo_target) {
+                                on_line(&format!("✗ {why}"));
+                                return Err(why.to_string());
+                            }
+                            on_line("⚠ this is a static binary and the app opens a window — it will fail to find a display backend at run time");
+                        }
+                    }
+                }
                 Ok((bin, size))
             }
             _ => {

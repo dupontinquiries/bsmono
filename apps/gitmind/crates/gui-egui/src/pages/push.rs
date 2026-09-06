@@ -134,9 +134,8 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             }
         });
     }
-    ui.horizontal(|ui| {
-        ui.label("target");
-        ui.add(egui::TextEdit::singleline(&mut app.push.target).id_salt("push-app_push_target"));
+    ui.horizontal_wrapped(|ui| {
+        crate::narrow::field(ui, "target", "push-app_push_target", &mut app.push.target, 0.45);
         if ui.button("check strategy").clicked() {
             let host_native = cockpit::buildflags::normalize_native(&cockpit::ops::native_triple_local());
             let path = std::env::var("PATH").unwrap_or_default();
@@ -256,7 +255,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 Err(e) => format!("error: {e}"),
             });
         }
-        ui.label(egui::RichText::new("installs rustup + the target's std on the device (idempotent)").weak().small());
+        crate::narrow::desc(ui, "installs rustup + the target's std on the device (idempotent)");
     });
 
     // Populate the flag grid from the SELECTED app's real cargo features (rescanned on change).

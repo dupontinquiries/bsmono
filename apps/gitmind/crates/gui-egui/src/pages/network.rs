@@ -21,35 +21,35 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.heading("Network");
     ui.separator();
 
-    ui.horizontal(|ui| {
-        ui.label("user");
-        ui.add(egui::TextEdit::singleline(&mut app.net.user).id_salt("network-app_net_user"));
-        ui.label("host");
-        ui.add(egui::TextEdit::singleline(&mut app.net.host).id_salt("network-app_net_host"));
-    });
+    // WRAPS, and both fields are sized. `ui.horizontal()` does not wrap, so on a phone the
+    // `host` field was drawn past the right edge — the photo shows the label with no box
+    // after it. See `narrow`.
+    crate::narrow::field_pair(
+        ui,
+        ("user", "network-app_net_user", &mut app.net.user),
+        ("host", "network-app_net_host", &mut app.net.host),
+    );
     let idle = !app.task.is_running();
     let can = idle && !app.net.host.trim().is_empty();
 
     ui.add_space(6.0);
     ui.label(egui::RichText::new("fleet daemons · by the developer").strong());
-    ui.label(
-        egui::RichText::new("first-party services with core-kit integrations — auto-discovered via the X-Fleet-Integration unit marker")
-            .weak()
-            .small(),
-    );
+    crate::narrow::desc(ui, "first-party services with core-kit integrations — auto-discovered via the X-Fleet-Integration unit marker");
     for d in cockpit::daemons::all() {
-        ui.horizontal(|ui| {
-            ui.label(format!("● {}", d.name));
-            // the developer/integration marker — a coloured chip so first-party daemons read at a glance
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(0x2a, 0x3a, 0x5a))
-                .inner_margin(egui::Margin::symmetric(5, 0))
-                .corner_radius(egui::CornerRadius::same(4))
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new(d.integration).small().color(egui::Color32::from_rgb(0x9a, 0xc2, 0xff)));
-                });
-            ui.label(egui::RichText::new(d.description).weak().small());
-        });
+        // The description is the part that ran off the screen — 447 points of it on a
+        // 360-point phone. On a narrow screen it drops to its own wrapped line under the
+        // name; on a laptop it stays inline. The chip is unchanged.
+        crate::narrow::titled_row(
+            ui,
+            &format!("● {}", d.name),
+            Some((
+                d.integration,
+                egui::Color32::from_rgb(0x2a, 0x3a, 0x5a),
+                egui::Color32::from_rgb(0x9a, 0xc2, 0xff),
+            )),
+            d.description,
+            |_| {},
+        );
         ui.horizontal(|ui| {
             for action in ["start", "stop", "restart"] {
                 if ui.add_enabled(can, egui::Button::new(action).small()).clicked() {
@@ -117,19 +117,10 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     ui.label(egui::RichText::new("other services · third-party").strong());
     if app.net.other_services.is_empty() {
-        ui.label(
-            egui::RichText::new("none discovered — run a scan on a device; services without the fleet marker appear here")
-                .weak()
-                .small(),
-        );
+        crate::narrow::desc(ui, "none discovered — run a scan on a device; services without the fleet marker appear here");
     } else {
-        for (name, desc) in &app.net.other_services {
-            ui.horizontal(|ui| {
-                ui.label(format!("○ {name}"));
-                if !desc.is_empty() {
-                    ui.label(egui::RichText::new(desc).weak().small());
-                }
-            });
+        for (name, description) in &app.net.other_services {
+            crate::narrow::titled_row(ui, &format!("○ {name}"), None, description, |_| {});
         }
     }
 

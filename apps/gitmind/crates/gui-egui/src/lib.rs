@@ -6,6 +6,8 @@ pub mod remote_browse;
 /// The ssh/cargo adapter that lets a fleet reroll execute.
 pub mod ssh_runner;
 pub mod pages;
+/// The layout rules a 360-point screen needs (see the phone photo and `tests/phone_layout.rs`).
+pub mod narrow;
 /// The changed-file list's model: porcelain parsing and stage decisions.
 pub mod device_picker;
 pub mod peek_viewer;

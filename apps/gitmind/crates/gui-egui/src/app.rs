@@ -157,6 +157,11 @@ impl App {
         *self.nav_gesture.config_mut() = self.prefs.gesture_config(320.0);
         let adaptive = uikit_egui::adaptive::Adaptive::detect(ctx);
         let compact = adaptive.is_compact();
+        // THE READABLE FLOOR. egui's `Small` is 9 pt, and every `.small()` label in this
+        // app was drawing at 9 pt on a phone — weak grey, 9 pt, on a dark panel is the
+        // unreadable smear in the photo. The kit has had this since it was written and
+        // one app called it. Idempotent, once a frame, after the palette.
+        uikit_egui::adaptive::apply_text_floor(ctx, &adaptive);
 
         if compact {
             // SECTIONS, not twelve icons. A flat row of twelve wrapped to two
