@@ -235,7 +235,11 @@ pub fn parse(line: &str) -> Command {
     // `/build` is the one verb whose argument is prose: keep it verbatim,
     // including case and internal spacing, before the tokenizer runs.
     let trimmed = line.trim();
-    if let Some(rest) = trimmed.strip_prefix("/build") {
+    // The verb is case-insensitive: the box's display face is capitals,
+    // and a player reading /BUILD on screen may type it that way.
+    let lower_head: String = trimmed.chars().take(6).collect::<String>().to_ascii_lowercase();
+    if lower_head == "/build" {
+        let rest = &trimmed[6..];
         if rest.is_empty() {
             return Command::Unknown;
         }
@@ -820,5 +824,17 @@ mod tests {
                   Command::Like("the mill".into())] {
             assert_eq!(parse(&c.to_command_string().unwrap()), c);
         }
+    }
+
+    #[test]
+    fn the_verb_is_case_insensitive() {
+        // Bare words stay Unknown HERE: this parser serves the whole
+        // game's chat. The paintbrush's own box maps them to a build.
+        assert_eq!(parse("a tower"), Command::Unknown);
+        assert_eq!(parse("/BUILD a tower"), Command::Build("a tower".into()));
+        assert_eq!(parse("/Build a tower"), Command::Build("a tower".into()));
+        assert_eq!(parse("/COMMIT"), Command::CommitPlan);
+        assert_eq!(parse("/build"), Command::Unknown, "a bare verb is still unknown");
+        assert_eq!(parse("/frobnicate"), Command::Unknown);
     }
 }

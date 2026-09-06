@@ -584,7 +584,16 @@ impl Paintbrush {
 
     fn action_to_command(a: Action) -> Option<Command> {
         match a {
-            Action::Submit(line) => Some(crate::sim::command_parse::parse(&line)),
+            // PLAIN WORDS ARE A BUILD, in this box. "a tower" means
+            // /build a tower: it is what a player types when they treat
+            // the box as a chat, and it is one. The game's parser keeps
+            // bare text as Unknown because it serves every chat; the
+            // mapping is ours.
+            Action::Submit(line) => {
+                let bare = line.trim();
+                Some(if !bare.is_empty() && !bare.starts_with('/') { Command::Build(bare.to_string()) }
+                     else { crate::sim::command_parse::parse(&line) })
+            }
             Action::Commit => Some(Command::CommitPlan),
             Action::Undo => Some(Command::UndoBuild),
             Action::FocusBigger => Some(Command::Focus(Some(FocusAdjust::Bigger))),
@@ -980,6 +989,14 @@ impl Paintbrush {
                     Pending::None
                 }
             },
+            Command::Unknown => {
+                // Never silence. The player typed something and pressed
+                // Enter; three Unknowns in a row with nothing said looked
+                // like the chat had broken.
+                self.say("not a command I know. Plain words build (\"a tower\"); /build <what>, /plan, \
+                          /commit, /undo, /model, /provider, /land, /like, /branch; /keys for the rest");
+                Pending::None
+            }
             _ => Pending::None,     // not ours; the game's existing arms handle it
         }
     }

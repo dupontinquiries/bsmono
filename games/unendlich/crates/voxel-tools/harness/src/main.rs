@@ -35,6 +35,7 @@ fn main() {
     validator_scenario();
     progressive_scenario();
     referent_scenario();
+    bare_words_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -814,4 +815,26 @@ fn referent_scenario() {
     println!("  {}", line.trim());
     assert!(line.contains("'the old mill'") && line.contains("(40, 65, 40)"), "{user}");
     assert!(pb.session.referents.is_empty(), "cleared after the turn");
+}
+
+
+/// Plain words in the box are a build; an unknown slash command says so.
+fn bare_words_scenario() {
+    use paintbrush::Paintbrush;
+    use voxel_tools::chatbox::Key;
+    println!("\n==== bare words and unknown commands");
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    let mut line = |pb: &mut Paintbrush, l: &str| -> Option<stubs::Command> {
+        pb.key(Key::Enter); for c in l.chars() { pb.key(Key::Char(c)); } pb.key(Key::Enter)
+    };
+    let cmd = line(&mut pb, "a creepy statue").expect("a command from bare words");
+    assert_eq!(cmd, stubs::Command::Build("a creepy statue".into()));
+    println!("  'a creepy statue' -> {cmd:?}");
+    let cmd = line(&mut pb, "/frobnicate now").expect("a command");
+    pb.dispatch(&cm, &gaze, cmd);
+    let log = pb.drain_log();
+    assert!(log.iter().any(|l| l.contains("not a command I know")), "{log:?}");
+    println!("  '/frobnicate now' -> {}", log.last().unwrap().trim());
 }
