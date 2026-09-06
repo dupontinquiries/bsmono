@@ -988,16 +988,20 @@ asked as a question.
   WAS: eframe surfaces dropped files via `ctx.input(|i| &i.raw.dropped_files)`;
   the confirmation matters because a drop replaces the input path and the
   previous one is not recoverable from the UI.
-- [ ] **Leaf LOD still looks sparse at distance — A/B it.** First look now
+- [x] **Leaf LOD A/B done 2026-09-05 — it works.** First look now
   that the graph can be cleared (`LOGSCOPE_CONVO=/tmp/tiny.logscope`):
   `LOGSCOPE_THEME=Canopy LOGSCOPE_CAM="0.7,0.28,55"` shows crowns as
   scattered specks with gaps you can see through
   (outputs/canopy-leaf-lod-at-distance.png). That is the exact symptom
   `leaf_lod` was written to prevent.
 
-  WHAT I CANNOT SAY: whether it is BETTER than before. The pre-change binary
-  is gone and rebuilding it is ~5 minutes, so there is no A/B. It may be
-  much improved and still not enough.
+  ANSWERED. Same camera, same crop, one binary with a temporary env switch
+  between the two behaviours: outputs/leaf-lod-A-before.png (blades at
+  original size, crowns are fine scattered specks with sky through them)
+  versus outputs/leaf-lod-B-after.png (blades visibly larger, crowns read as
+  continuous foliage). The coverage-preserving growth does what it was
+  written to do. It is not fully dense — 69% coverage is 69% — but the
+  see-through look is gone.
 
   The arithmetic says coverage should hold at ~69% of full at this distance:
   `detail` bottoms out at 0.14, so 84 blades become 12 and growth wants
@@ -1006,8 +1010,11 @@ asked as a question.
   coverage then the cap is the thing to revisit — or the blade `len` clamp
   `.clamp(0.05, 0.30 * blade_growth)` is biting before the growth does.
 
-  DO THE A/B FIRST. Build the parent of the leaf-LOD commit, shoot the same
-  camera, and compare — changing constants without that is guessing.
+  IF MORE DENSITY IS WANTED, the cap is now the known lever and the method
+  is established: a temporary `if std::env::var_os("D2X_LEAF_OLD")` switch
+  in `leaf_lod`, one build, two runs at the same `LOGSCOPE_CAM`. Do not
+  raise `LEAF_GROWTH_CAP` past ~2.2 without looking — that is where blades
+  stop reading as leaves.
 
 - [ ] **Act on the GPU pacing numbers (`gpu_kit::pace`).** The MEASUREMENT is
   wired: `WgpuUpscaler` times both `device.poll` sites (there are two —
