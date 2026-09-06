@@ -383,6 +383,8 @@ pub mod count_prefix;
 /// just above.
 #[path = "../../src/note_clip.rs"]
 pub mod note_clip;
+/// Is a clipped selection code or prose, and in what language? (`TODO_notes_clip.md`.)
+pub mod clip_kind;
 // The GestureHost+SlidePopup replacement (grid gesture menus with QML-parity variants) lives in
 // the shared kit; re-exported under a voiceterm-familiar name.
 pub use uikit_egui::slide_menu;

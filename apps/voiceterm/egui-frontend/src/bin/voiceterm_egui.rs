@@ -1006,8 +1006,14 @@ impl VoicetermApp {
                         let (command, at) = self.blocks.blocks.last()
                             .map(|b| (b.command.clone(), b.started_at))
                             .unwrap_or_else(|| (String::new(), now));
+                        // CODE OR PROSE, decided rather than assumed. This was
+                        // `ClipKind::Text` always, so a clipped diff or function became
+                        // a blockquote — markdown reflows it, eats the leading spaces
+                        // and italicises whatever sits between asterisks.
+                        let kind = voiceterm_egui::clip_kind::detect(
+                            &text, voiceterm_egui::clip_kind::Context::from_command(&command));
                         let clip = voiceterm_egui::note_clip::Clip {
-                            kind: voiceterm_egui::note_clip::ClipKind::Text,
+                            kind,
                             content: text,
                             source: voiceterm_egui::note_clip::Source::Terminal { command, at },
                             captured_at: now,

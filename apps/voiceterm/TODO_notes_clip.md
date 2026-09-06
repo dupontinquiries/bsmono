@@ -75,8 +75,34 @@ src/note_clip.rs — the data model + markdown serialization (the spine):
 4. Suggestions on word-tap (reuse plan_click/recall).
 5. Image crops (needs the crop gesture + save).
 
-## Next pure slice (optional, before wiring)
-A clip-kind detector: given a selection + a little context (is it inside a
-fenced block? does it look like code — braces/indentation/known-keywords?)
-→ ClipKind::Code{lang} vs Text. Pure + testable, removes a guess from the
-clip path. Mirrors notebook::classify's conservative style.
+## Next pure slice (optional, before wiring) — DONE
+
+`egui-frontend/src/clip_kind.rs`. `detect(text, ctx) -> ClipKind`, three
+ranked kinds of evidence, biased toward Text because a paragraph in a
+fence is ugly and lossless while a diff in a blockquote is reflowed,
+de-indented and part-italicised:
+
+1. a fence in the selection (```rust) — the author said so, and the
+   language comes free; outranks everything, including a contradicting
+   command;
+2. the command that produced it — `cat main.rs` / `bat` / `head` name a
+   file and its extension names the language; `git diff|show|log|blame`
+   and `diff` are code whatever the file was; `ls`, `git status` and an
+   `echo` containing a brace imply nothing. A file view passes a path
+   instead;
+3. shape, needing TWO signals of five, since one is a coincidence:
+   statement punctuation at line ends, a declaration opener, sigils prose
+   does not use (`=>`, `::`, `->`), shell block words, and structural
+   indentation (a uniformly indented quote is not code — it has one
+   depth, not several).
+
+The shell needed its own signal: `if [ -f "$f" ]; then / cp … / fi` has
+no semicolon at a line end, no `if (` and no sigil, so it scored zero
+until block words counted. Found by the test for that snippet.
+
+Wired at the one clip site: `ClipSelection` was hardcoded to
+`ClipKind::Text`. 5 tests.
+
+Unknown extensions and files without one fence with NO language rather
+than guessing a grammar — `Code { lang: "" }` is a plain fence, which is
+right for a shell transcript.
