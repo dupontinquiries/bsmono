@@ -19,6 +19,7 @@
 //! software rendering; capturing too early silently "succeeds" with a blank 266-byte black PNG.
 //!
 //! For an A/B comparison (e.g. two env-var settings), fix the camera with `LOGSCOPE_CAM=yaw,pitch,dist`
+//! (or `yaw,pitch,dist,tx,ty,tz` to pivot on a fixed point rather than the graph centroid)
 //! (see below) and use the SAME settle time in both captures — the built-in cinematic director auto-orbits
 //! and auto-targets even with an initial camera set, so two runs left to free-run for different lengths of
 //! time land at different angles and are not comparable, independent of whatever you were trying to test.
@@ -46,6 +47,10 @@ impl Default for ScenePreview {
             let n: Vec<f32> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
             if n.len() == 3 {
                 chat.set_cam(n[0], n[1], n[2]);
+            } else if n.len() == 6 {
+                // "yaw,pitch,dist,tx,ty,tz" — orbit a FIXED point instead of the graph centroid, so a
+                // prop outside the graph's footprint (the physical UI panel) can be framed at all.
+                chat.set_cam_target(n[0], n[1], n[2], crate::spatial::Vec3::new(n[3], n[4], n[5]));
             }
         }
         // Reach the full-screen-spatial composer/action-row panels in a headless screenshot without an

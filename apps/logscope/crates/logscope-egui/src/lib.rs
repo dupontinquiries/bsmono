@@ -62,6 +62,8 @@ pub mod voiceask;
 pub mod voice_intent;
 pub mod imprint;
 pub mod physui;
+/// What the in-scene physical UI PANEL is made of, per scene — board, rim, suspension, lamp. Pure data.
+pub mod physkin;
 pub mod repetition; // pure repetition detection + graded recovery (decode + agent loops)
 #[allow(dead_code)] pub mod tripwire; // pure deterministic scanners over in-progress code → review-point signal
 #[allow(dead_code)] pub mod segment; // detect explain↔code / new-thought seams → pause, branch, checkpoint, predict

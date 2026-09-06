@@ -2356,6 +2356,16 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
         self.spatial_zoomed = true;   // but don't auto-fit the distance — honour `dist`
     }
 
+    /// `set_cam` with a FIXED target: the orbit pivots on `target` instead of following the graph's
+    /// centroid. For headless captures of a prop that is not at the graph's centre — the physical UI
+    /// panel sits outside the graph's footprint, and an orbit around the centroid can only ever put it
+    /// at the edge of frame or behind the camera.
+    pub fn set_cam_target(&mut self, yaw: f32, pitch: f32, dist: f32, target: crate::spatial::Vec3) {
+        self.set_cam(yaw, pitch, dist);
+        self.orbit.target = target;
+        self.spatial_auto = false;
+    }
+
     /// Populate the graph from a `.logscope` script (the uploaded conversation templates): `>` lines are
     /// user turns, `:goto N` forks the next turn off main-line turn N, `:Nca`/`:Nfa`/`:fa` widen with
     /// sibling tips. Assistant turns are synthesized stubs (no model) purely so nodes read as a real tree.

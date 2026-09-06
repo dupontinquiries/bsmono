@@ -4883,85 +4883,361 @@ fn alley() -> Scene {
 /// meant to surface, built from the scene's OWN materials instead of a floating window. This is the START of the
 /// physical-UI concept (the frame, stand, material, and a few content "lines" per scene); wiring live node text
 /// onto the surface is future work. style: 0 wood board · 1 stone tablet · 2 glass pane · 3 marble plaque.
-fn physical_ui_panel(s: &mut Scene, style: u32, pos: Vec3, face: f32, w: f32, h: f32, floating: bool, seed: u32, rows: &[crate::panel_rows::Row], light: scene_kit::mesh3d::SceneLight) {
-    let right = v(-face.sin(), 0.0, face.cos());
+/// The world bearing of conversation branch `i` of `n`: the branch's ACTUAL bearing when chat.rs has plumbed
+/// it (`bear[i] != 0`, a turn fraction in 1..=65535), otherwise an even seeded spread — the same rule
+/// `region_plan` applies to the citadel's wings, so a scene that sets a tree / house / shelf per branch puts
+/// it where that branch actually leaves the graph.
+fn branch_bearing(pr: &EnvParams, i: usize, n: usize, seed: i32) -> f32 {
+    use std::f32::consts::TAU;
+    if i < pr.bear.len() && pr.bear[i] != 0 {
+        (pr.bear[i] as f32 / 65535.0) * TAU
+    } else {
+        (i as f32 + 0.5) / n.max(1) as f32 * TAU + (hash(seed + i as i32, 77) - 0.5) * (TAU / n.max(1) as f32) * 0.45
+    }
+}
+
+/// An iron-caged oil lantern hanging from `top` (the ring the hook goes through): a tapered cage of four
+/// bars between two rings under a small domed cap, a translucent glass body, a flame core that flickers, and
+/// a soft halo. `r` is the cage's base radius (the reference lanterns are ~0.2 in board units). Used by the
+/// physical UI's `Fixture::CagedLantern` and hung in numbers around the Cat Cave.
+fn caged_lantern(s: &mut Scene, top: Vec3, r: f32, lamp: Color32, seed: u32, sway: Float) {
+    let iron = c(0x2c, 0x2a, 0x28);
+    let up = v(0.0, 1.0, 0.0);
+    let h = r * 2.6;
+    let bot = addv(top, mulv(up, -h));
+    for (p, rr) in [(top, r * 0.7), (bot, r)] { let mut ring = m3::torus(p, rr, r * 0.095, 12, 4, iron); ring.mat = M::STONE; s.add(ring, sway); }
+    for i in 0..4 { let a = std::f32::consts::TAU * i as f32 / 4.0 + 0.4;
+        let (ox, oz) = (a.cos(), a.sin());
+        let mut bar = m3::tube(addv(top, v(ox * r * 0.7, 0.0, oz * r * 0.7)), addv(bot, v(ox * r, 0.0, oz * r)), r * 0.075, 4, iron); bar.mat = M::STONE; s.add(bar, sway);
+    }
+    let mut cap = m3::dome_cap_outside(top, r * 0.72, r * 0.5, 0.0, 10, 3, iron); cap.mat = M::STONE; s.add(cap, sway);
+    let core = addv(top, mulv(up, -h * 0.55));
+    let mut glass = m3::uv_sphere(core, r * 0.62, 10, 8, mix_rgb(lamp, c(0xff, 0xff, 0xff), 0.3)); m3::set_alpha(&mut glass, 120); glass.mat = M::WATER; glass.emissive = 0.6; s.add(glass, sway);
+    let flicker = Float { amp: r * 0.06, speed: 7.0 + hash(seed as i32, 1) * 3.0, phase: hash(seed as i32, 2) * 6.28, drift: r * 0.03 };
+    let mut flame = m3::uv_sphere(core, r * 0.3, 8, 6, lamp); flame.mat = M::MOSS; flame.emissive = 2.0; s.add(flame, flicker);
+    let mut halo = m3::uv_sphere(core, r * 1.5, 10, 8, lamp); m3::set_alpha(&mut halo, 34); halo.mat = M::MOSS; halo.emissive = 1.1; s.add(halo, sway);
+}
+
+/// The scene's PHYSICAL UI PANEL — a board in the world that carries the context rows. What it is made of,
+/// how it hangs and what lights it come from `skin` (see `crate::physkin`); this only turns those decisions
+/// into meshes. `w`×`h` is the board face; `pos` is the ground point under its centre; `face` the yaw it
+/// faces; `rows` the content (see `crate::panel_rows`); `light` the scene's own light mechanism, which lights
+/// the rows the same way it lights the graph's dots.
+fn physical_ui_panel(s: &mut Scene, skin: &crate::physkin::PanelSkin, pos: Vec3, face: f32, w: f32, h: f32, seed: u32, rows: &[crate::panel_rows::Row], light: scene_kit::mesh3d::SceneLight) {
+    use crate::physkin::{Board, Fixture, Hang, Rim};
     let up = v(0.0, 1.0, 0.0);
     let n = v(face.cos(), 0.0, face.sin()); // surface faces `face`
-    let stand_h = if floating { 0.0 } else { 1.5 };
-    let ctr = addv(pos, mulv(up, stand_h + h * 0.5));
-    let (surface, frame, fmat, smat, emiss) = match style {
-        1 => (c(0x6e, 0x6a, 0x60), c(0x45, 0x42, 0x3a), M::STONE, M::STONE, 0.05), // stone tablet
-        2 => (c(0x86, 0xb6, 0xc6), c(0x9a, 0xc6, 0xd2), M::WATER, M::STONE, 0.12), // glass pane
-        3 => (c(0xd8, 0xd0, 0xba), c(0xc2, 0x98, 0x40), M::STONE, M::STONE, 0.10), // marble + gold trim
-        _ => (c(0x55, 0x40, 0x2a), c(0x34, 0x26, 0x16), M::WOOD, M::WOOD, 0.06),   // wood board
+    // `right` is the VIEWER's screen-right for someone standing in front of the board looking at it along -n:
+    // cross(up, n). It is also the winding `m3::panel` needs — cross(right, up) == n — so every flat face here
+    // survives back-face culling from the side it faces. The old `right` was the negation of this: the board
+    // was culled from the front (nobody had framed it), and, once that was fixed, its first tab lit at the
+    // viewer's right instead of the left. Verified by rendering the Cat Cave's board from the graph's side.
+    let right = v(face.sin(), 0.0, -face.cos());
+    let hs = |k: i32| hash(seed as i32, k);
+    // How high the board's bottom edge sits above `pos`. A hung board hangs a little higher than a stood one
+    // so its chains have somewhere to go; cairns are lower than a pedestal.
+    let stand_h = match skin.hang {
+        Hang::Floating => 0.0,
+        Hang::Stand => 1.5,
+        Hang::Chains | Hang::Ropes => 1.7,
+        Hang::Cairns => 1.05,
     };
-    // FRAME — a real stepped moulding, not one flat slab. Outer frame (dark, largest), then a
-    // gilt/lit BEVEL ring one step in front and slightly smaller, so the border reads as carved
-    // MATERIAL with actual depth — a picture-frame moulding, not a single flat-color rectangle
-    // behind the surface. This is the 3D counterpart to theme.rs's carved_frame bevel lip.
-    let bevel = mix_rgb(frame, c(0xff, 0xe2, 0xac), 0.42);
+    let ctr = addv(pos, mulv(up, stand_h + h * 0.5));
+    // BOARD MATERIAL — face colour, frame colour, face/frame material, base emissive, and the metal the
+    // bevel + hardware are made of (brass on wood and stone, copper on Elmbrook timber, ember on basalt).
+    let (surface, frame, fmat, smat, emiss, metal) = match skin.board {
+        Board::StoneTablet => (c(0x6e, 0x6a, 0x60), c(0x45, 0x42, 0x3a), M::STONE, M::STONE, 0.05, c(0xff, 0xe2, 0xac)),
+        Board::GlassPane => (c(0x86, 0xb6, 0xc6), c(0x9a, 0xc6, 0xd2), M::WATER, M::STONE, 0.12, c(0xe6, 0xf6, 0xff)),
+        Board::MarbleGilt => (c(0xd8, 0xd0, 0xba), c(0xc2, 0x98, 0x40), M::STONE, M::STONE, 0.10, c(0xff, 0xd9, 0x8a)),
+        Board::IronSlate => (c(0x30, 0x2e, 0x2c), c(0x4a, 0x44, 0x3c), M::STONE, M::STONE, 0.04, c(0xc8, 0xa8, 0x70)),
+        Board::DarkTimber => (c(0x2e, 0x24, 0x18), c(0x4c, 0x3a, 0x26), M::WOOD, M::WOOD, 0.05, c(0xd0, 0x8a, 0x50)),
+        Board::Basalt => (c(0x24, 0x22, 0x22), c(0x3c, 0x34, 0x30), M::STONE, M::STONE, 0.05, c(0xff, 0x8a, 0x40)),
+        Board::WoodBoard => (c(0x55, 0x40, 0x2a), c(0x34, 0x26, 0x16), M::WOOD, M::WOOD, 0.06, c(0xff, 0xe2, 0xac)),
+    };
+    let glass = skin.board == Board::GlassPane;
+    // FRAME — a real stepped moulding, not one flat slab. Outer frame (dark, largest), then a lit BEVEL ring
+    // one step in front and slightly smaller, so the border reads as carved MATERIAL with actual depth — a
+    // picture-frame moulding. This is the 3D counterpart to theme.rs's carved_frame bevel lip.
+    let bevel = mix_rgb(frame, metal, 0.42);
     let mut fr = m3::panel(addv(ctr, mulv(n, -0.06)), right, up, w + 0.34, h + 0.34, frame); fr.mat = fmat; fr.emissive = emiss * 0.5; s.add(fr, Float::STILL);
     let mut bv = m3::panel(addv(ctr, mulv(n, -0.03)), right, up, w + 0.16, h + 0.16, bevel); bv.mat = fmat; bv.emissive = emiss * 0.7 + 0.06; s.add(bv, Float::STILL);
-    // GILT CORNER BRACKETS — an actual L-shaped bracket (two perpendicular bars) at each corner,
-    // not a single bead. This is the 3D counterpart to the flat Panels-mode carved_frame's rune
-    // corners (theme.rs), scaled up to read as real hardware at this distance — the reference
-    // renders show every floating panel with a visible metal/gilt corner bracket, not a dot.
-    let stud_col = mix_rgb(frame, c(0xff, 0xd9, 0x8a), 0.55);
-    let bracket_len = (w.min(h) * 0.22).clamp(0.12, 0.5);
-    let bracket_r = 0.035;
-    for (sx, sy) in [(-1.0f32, 1.0f32), (1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)] {
-        let corner = addv(ctr, addv(mulv(right, sx * (w * 0.5 + 0.14)), addv(mulv(up, sy * (h * 0.5 + 0.14)), mulv(n, -0.07))));
-        let leg_h = addv(corner, mulv(right, -sx * bracket_len));
-        let leg_v = addv(corner, mulv(up, -sy * bracket_len));
-        let mut bh = m3::tube(corner, leg_h, bracket_r, 5, stud_col); bh.mat = fmat; bh.emissive = emiss * 1.5 + 0.18; s.add(bh, Float::STILL);
-        let mut bvv = m3::tube(corner, leg_v, bracket_r, 5, stud_col); bvv.mat = fmat; bvv.emissive = emiss * 1.5 + 0.18; s.add(bvv, Float::STILL);
-        let mut knob = m3::uv_sphere(corner, bracket_r * 1.6, 6, 5, stud_col); knob.mat = fmat; knob.emissive = emiss * 1.6 + 0.2; s.add(knob, Float::STILL);
+    let stud_col = mix_rgb(frame, metal, 0.55);
+    let corner = |sx: f32, sy: f32| addv(ctr, addv(mulv(right, sx * (w * 0.5 + 0.14)), addv(mulv(up, sy * (h * 0.5 + 0.14)), mulv(n, -0.07))));
+    match skin.rim {
+        // GILT CORNER BRACKETS — an actual L-shaped bracket (two perpendicular bars) at each corner. The 3D
+        // counterpart to the flat Panels-mode carved_frame's rune corners (theme.rs).
+        Rim::GiltBrackets => {
+            let bracket_len = (w.min(h) * 0.22).clamp(0.12, 0.5);
+            let bracket_r = 0.035;
+            for (sx, sy) in [(-1.0f32, 1.0f32), (1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)] {
+                let cn = corner(sx, sy);
+                let leg_h = addv(cn, mulv(right, -sx * bracket_len));
+                let leg_v = addv(cn, mulv(up, -sy * bracket_len));
+                let mut bh = m3::tube(cn, leg_h, bracket_r, 5, stud_col); bh.mat = fmat; bh.emissive = emiss * 1.5 + 0.18; s.add(bh, Float::STILL);
+                let mut bvv = m3::tube(cn, leg_v, bracket_r, 5, stud_col); bvv.mat = fmat; bvv.emissive = emiss * 1.5 + 0.18; s.add(bvv, Float::STILL);
+                let mut knob = m3::uv_sphere(cn, bracket_r * 1.6, 6, 5, stud_col); knob.mat = fmat; knob.emissive = emiss * 1.6 + 0.2; s.add(knob, Float::STILL);
+            }
+        }
+        // RIVETS — round bolt heads at the four corners and a run of smaller studs along each edge. Every
+        // reference render fastens its plaques this way; it is what makes the frame read as bolted-on
+        // hardware rather than a painted border.
+        Rim::Rivets => {
+            for (sx, sy) in [(-1.0f32, 1.0f32), (1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)] {
+                let mut bolt = m3::uv_sphere(addv(corner(sx, sy), mulv(n, 0.02)), 0.062, 8, 6, stud_col); bolt.mat = M::STONE; bolt.emissive = emiss * 1.4 + 0.22; s.add(bolt, Float::STILL);
+            }
+            let (nx, ny) = (((w + 0.28) / 0.42).round().max(2.0) as u32, ((h + 0.28) / 0.42).round().max(2.0) as u32);
+            for i in 1..nx { // top + bottom edges
+                let t = i as f32 / nx as f32 - 0.5;
+                for sy in [-1.0f32, 1.0] {
+                    let p = addv(ctr, addv(mulv(right, t * (w + 0.28)), addv(mulv(up, sy * (h * 0.5 + 0.14)), mulv(n, -0.045))));
+                    let mut st = m3::uv_sphere(p, 0.028, 6, 4, stud_col); st.mat = M::STONE; st.emissive = emiss + 0.14; s.add(st, Float::STILL);
+                }
+            }
+            for i in 1..ny { // left + right edges
+                let t = i as f32 / ny as f32 - 0.5;
+                for sx in [-1.0f32, 1.0] {
+                    let p = addv(ctr, addv(mulv(right, sx * (w * 0.5 + 0.14)), addv(mulv(up, t * (h + 0.28)), mulv(n, -0.045))));
+                    let mut st = m3::uv_sphere(p, 0.028, 6, 4, stud_col); st.mat = M::STONE; st.emissive = emiss + 0.14; s.add(st, Float::STILL);
+                }
+            }
+        }
+        // ROPE — a cord lashed round the outside of the frame, knotted at the corners. No metal in this world.
+        Rim::Rope => {
+            let rope = c(0x8a, 0x74, 0x4e);
+            let (hw, hh) = (w * 0.5 + 0.19, h * 0.5 + 0.19);
+            let pts = [corner(-1.0, 1.0), corner(1.0, 1.0), corner(1.0, -1.0), corner(-1.0, -1.0)];
+            for i in 0..4 {
+                let mut cord = m3::tube(pts[i], pts[(i + 1) % 4], 0.04, 5, rope); cord.mat = M::WOOD; cord.emissive = 0.03; s.add(cord, Float::STILL);
+            }
+            for (sx, sy) in [(-1.0f32, 1.0f32), (1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)] {
+                let kc = addv(ctr, addv(mulv(right, sx * hw), addv(mulv(up, sy * hh), mulv(n, -0.07))));
+                let mut knot = m3::torus(kc, 0.07, 0.035, 8, 5, mix_rgb(rope, c(0x40, 0x30, 0x1c), 0.3)); knot.mat = M::WOOD; s.add(knot, Float::STILL);
+            }
+        }
+        Rim::Bare => {}
     }
-    // surface
+    // surface, and a plain back so the board is an object from behind rather than a culled hole in the rigging
     let mut sf = m3::panel(ctr, right, up, w, h, surface); sf.mat = smat; sf.emissive = emiss;
-    if style == 2 { m3::set_alpha(&mut sf, 130); } // glass = translucent
+    if glass { m3::set_alpha(&mut sf, 130); } // glass = translucent
     s.add(sf, Float::STILL);
-    // content CARDS — each line is now a bordered plaque (a darker backing rect + a lighter inset
-    // face), reading as an actual card sitting ON the panel the way the reference renders show
-    // "Hypotheses / Evidence"-style boxes, rather than a flat stripe painted onto the board.
+    let mut bk = m3::panel(addv(ctr, mulv(n, -0.09)), mulv(right, -1.0), up, w + 0.34, h + 0.34, mix_rgb(frame, c(0x00, 0x00, 0x00), 0.2)); bk.mat = fmat;
+    if glass { m3::set_alpha(&mut bk, 90); }
+    s.add(bk, Float::STILL);
     let card_back = mix_rgb(surface, c(0x00, 0x00, 0x00), 0.28);
-    let ink = if style == 2 { c(0xf0, 0xfa, 0xff) } else { mix_rgb(surface, c(0xff, 0xff, 0xf4), 0.55) };
-    // Widths and count come from `rows` — see `crate::panel_rows`. They used
-    // to be `0.74 - li * 0.09` for exactly four cards, identical in every
-    // world and unrelated to anything the app held. An accented row is drawn
-    // brighter and slightly taller: at this distance emphasis has to be size
-    // as well as brightness, or it is lost to the scene's own glow.
+    let ink = if glass { c(0xf0, 0xfa, 0xff) } else { mix_rgb(surface, c(0xff, 0xff, 0xf4), 0.55) };
+    let (fr_, fg_, fb_) = skin.fixture.light_rgb();
+    let lamp = c(fr_, fg_, fb_);
+    // TAB STRIP — a row of small raised plates along the top edge (the reference context panels' FILES /
+    // GRAPH / NOTES / PROMPTS), the first lit as the active one, with a thin rule under them. This is the
+    // physical tab bar: the board is a document with sections, not a single list.
+    let mut row_top = h * 0.30;
+    if skin.tabs > 0 {
+        let nt = skin.tabs as usize;
+        let strip_w = w * 0.84;
+        let tw = strip_w / nt as f32;
+        let ty = h * 0.41;
+        for i in 0..nt {
+            let tx = -strip_w * 0.5 + (i as f32 + 0.5) * tw;
+            let active = i == 0;
+            let tc = addv(ctr, addv(mulv(right, tx), addv(mulv(up, ty), mulv(n, if active { 0.03 } else { 0.018 }))));
+            let mut plate = m3::panel(tc, right, up, tw * 0.86, h * 0.075, if active { mix_rgb(surface, metal, 0.35) } else { card_back });
+            plate.mat = M::PAPER; plate.emissive = if active { emiss * 2.0 + 0.16 } else { emiss * 0.4 }; s.add(plate, Float::STILL);
+            let mut lbl = m3::panel(addv(tc, mulv(n, 0.01)), right, up, tw * 0.5, h * 0.028, if active { mix_rgb(ink, metal, 0.4) } else { mix_rgb(ink, card_back, 0.45) });
+            lbl.mat = M::PAPER; lbl.emissive = if active { emiss * 2.5 + 0.2 } else { emiss * 0.5 }; s.add(lbl, Float::STILL);
+        }
+        let mut rule = m3::panel(addv(ctr, addv(mulv(up, ty - h * 0.055), mulv(n, 0.012))), right, up, w * 0.9, 0.012, mix_rgb(surface, metal, 0.5));
+        rule.mat = M::PAPER; rule.emissive = emiss + 0.1; s.add(rule, Float::STILL);
+        row_top = h * 0.26;
+    }
+    // content CARDS — each row is a bordered plaque (a darker backing rect + a lighter inset face), reading as
+    // an actual card sitting ON the panel the way the reference renders show "Hypotheses / Evidence"-style
+    // boxes, rather than a flat stripe painted onto the board. Widths and count come from `rows`. An accented
+    // row is drawn brighter and slightly taller: at this distance emphasis has to be size as well as brightness.
     for (li, row) in rows.iter().enumerate() {
-        let ly = h * 0.30 - li as f32 * h * 0.16;
+        let ly = row_top - li as f32 * h * 0.15;
+        if ly < -h * 0.44 { break; } // the board is only so tall — the rest scrolls, it does not overflow the frame
         let lw = w * row.width01.clamp(0.05, 0.95);
         let lh = h * if row.accent { 0.092 } else { 0.075 };
         let center = addv(ctr, addv(mulv(up, ly), mulv(n, 0.015)));
         let mut back = m3::panel(center, right, up, lw + 0.05, lh + 0.03, card_back); back.mat = M::PAPER; back.emissive = emiss * 0.3; s.add(back, Float::STILL);
-        let face_col = if row.accent { mix_rgb(ink, c(0xff, 0xe2, 0xac), 0.5) } else { ink };
+        let mut face_col = if row.accent { mix_rgb(ink, metal, 0.5) } else { ink };
+        // THE LAMP LIGHTS THE ROWS NEAREST IT. The fixture hangs at the top-right corner; rows nearer the top
+        // pick up a little of its colour, so the board is visibly lit by the lamp beside it and not by nothing.
+        if skin.fixture != Fixture::None {
+            let fall = 1.0 - li as f32 / rows.len().max(1) as f32;
+            face_col = mix_rgb(face_col, lamp, 0.16 * fall);
+        }
         let mut line = m3::panel(addv(center, mulv(n, 0.01)), right, up, lw, lh * 0.6, face_col);
-        // THE ROOM LIGHTS THE BOARD. `emissive` was one constant per
-        // material, so a card under a canopy shaft was lit exactly like one
-        // in shade and the panel read as a sticker on the world. The glow
-        // now comes from the same mechanism that drives the graph's dots —
-        // the board is in the same room, so it answers the same question.
-        // Baked, not animated: these meshes are STILL.
+        // THE ROOM LIGHTS THE BOARD. The glow comes from the same mechanism that drives the graph's dots —
+        // the board is in the same room, so it answers the same question. Baked, not animated: STILL.
         let glow = crate::panel_rows::row_glow(light, li, rows.len(), seed, 0.0);
         line.mat = M::PAPER;
         line.emissive = emiss * glow * if row.accent { 1.3 } else { 0.6 };
         s.add(line, Float::STILL);
     }
     // a small "active" node bead in the corner (the selection marker), warm/glowing
-    let mut bead = m3::uv_sphere(addv(ctr, addv(mulv(up, h * 0.34), mulv(right, -w * 0.42))), 0.1, 8, 6, c(0xff, 0xcf, 0x86));
-    bead.mat = M::MOSS; bead.emissive = 1.4; s.add(bead, Float { amp: 0.04, speed: 0.7, phase: hash(seed as i32, 2) * 6.28, drift: 0.04 });
-    // STAND per style
-    if floating {
-        let mut mnt = m3::tube(addv(ctr, mulv(up, -h * 0.5)), addv(ctr, mulv(up, -h * 0.5 - 0.5)), 0.05, 4, frame); mnt.mat = fmat; mnt.emissive = emiss; s.add(mnt, Float::STILL);
-    } else {
-        match style {
-            3 => { let mut ped = m3::tube(pos, addv(pos, mulv(up, stand_h)), 0.42, 10, mix_rgb(surface, frame, 0.3)); ped.mat = M::STONE; s.add(ped, Float::STILL); }
-            1 => { let mut pl = m3::tube(pos, addv(pos, mulv(up, stand_h)), 0.36, 6, frame); pl.mat = M::STONE; s.add(pl, Float::STILL); }
-            2 => { for sx in [-1.0f32, 1.0] { let a = addv(pos, mulv(right, sx * w * 0.4)); let mut p = m3::tube(a, addv(a, mulv(up, stand_h)), 0.045, 4, frame); p.mat = M::STONE; p.emissive = 0.25; s.add(p, Float::STILL); } }
-            _ => { for sx in [-1.0f32, 1.0] { let a = addv(pos, mulv(right, sx * w * 0.42)); let mut p = m3::tube(a, addv(a, mulv(up, stand_h + 0.1)), 0.08, 5, c(0x3a, 0x2a, 0x18)); p.mat = M::WOOD; s.add(p, Float::STILL); } }
+    let mut bead = m3::uv_sphere(addv(ctr, addv(mulv(up, row_top + h * 0.04), mulv(right, -w * 0.42))), 0.1, 8, 6, c(0xff, 0xcf, 0x86));
+    bead.mat = M::MOSS; bead.emissive = 1.4; s.add(bead, Float { amp: 0.04, speed: 0.7, phase: hs(2) * 6.28, drift: 0.04 });
+    // SUSPENSION — what holds the board up. A hung board also builds the thing it hangs FROM, because chains
+    // that go up into nothing read as a rendering error rather than as rigging.
+    let top_l = addv(ctr, addv(mulv(right, -w * 0.5 - 0.1), mulv(up, h * 0.5 + 0.17)));
+    let top_r = addv(ctr, addv(mulv(right, w * 0.5 + 0.1), mulv(up, h * 0.5 + 0.17)));
+    match skin.hang {
+        Hang::Floating => {
+            let mut mnt = m3::tube(addv(ctr, mulv(up, -h * 0.5)), addv(ctr, mulv(up, -h * 0.5 - 0.5)), 0.05, 4, frame); mnt.mat = fmat; mnt.emissive = emiss; s.add(mnt, Float::STILL);
+        }
+        Hang::Stand => match skin.board {
+            Board::MarbleGilt => { let mut ped = m3::tube(pos, addv(pos, mulv(up, stand_h)), 0.42, 10, mix_rgb(surface, frame, 0.3)); ped.mat = M::STONE; s.add(ped, Float::STILL); }
+            Board::StoneTablet | Board::IronSlate | Board::Basalt => { let mut pl = m3::tube(pos, addv(pos, mulv(up, stand_h)), 0.36, 6, frame); pl.mat = M::STONE; s.add(pl, Float::STILL); }
+            Board::GlassPane => { for sx in [-1.0f32, 1.0] { let a = addv(pos, mulv(right, sx * w * 0.4)); let mut p = m3::tube(a, addv(a, mulv(up, stand_h)), 0.045, 4, frame); p.mat = M::STONE; p.emissive = 0.25; s.add(p, Float::STILL); } }
+            Board::WoodBoard | Board::DarkTimber => { for sx in [-1.0f32, 1.0] { let a = addv(pos, mulv(right, sx * w * 0.42)); let mut p = m3::tube(a, addv(a, mulv(up, stand_h + 0.1)), 0.08, 5, c(0x3a, 0x2a, 0x18)); p.mat = M::WOOD; s.add(p, Float::STILL); } }
+        },
+        Hang::Chains => {
+            // an iron bar across the top, a lump of the cave's rock above it that the bar is pinned into, and
+            // two chains of alternating links down to the board's top corners
+            let iron = c(0x3a, 0x38, 0x36);
+            let bar_y = h * 0.5 + 1.45;
+            let bl = addv(ctr, addv(mulv(right, -w * 0.5 - 0.5), mulv(up, bar_y)));
+            let br = addv(ctr, addv(mulv(right, w * 0.5 + 0.5), mulv(up, bar_y)));
+            let mut bar = m3::tube(bl, br, 0.06, 6, iron); bar.mat = M::STONE; bar.emissive = 0.03; s.add(bar, Float::STILL);
+            let rc = addv(ctr, addv(mulv(up, bar_y + 0.9), mulv(n, -0.6)));
+            let mut rock = m3::rock(v(0.0, 0.0, 0.0), (w * 0.5 + 0.9).max(1.6), seed.wrapping_mul(7), c(0x3c, 0x38, 0x32));
+            m3::scale3(&mut rock, 1.0, 0.55, 0.8); for p in &mut rock.verts { *p = addv(*p, rc); } // scale3 pivots on the origin
+            m3::tint_up(&mut rock, c(0x4e, 0x4c, 0x44), c(0x28, 0x26, 0x22)); rock.mat = M::STONE; s.add(rock, Float::STILL);
+            for (anchor, sx) in [(top_l, -1.0f32), (top_r, 1.0)] {
+                let hook = addv(ctr, addv(mulv(right, sx * (w * 0.5 + 0.1)), mulv(up, bar_y)));
+                let mut ring = m3::torus(hook, 0.09, 0.025, 8, 5, iron); ring.mat = M::STONE; s.add(ring, Float::STILL);
+                let links = ((bar_y - (h * 0.5 + 0.17)) / 0.17).max(3.0) as u32;
+                for i in 0..links {
+                    let t0 = i as f32 / links as f32; let t1 = (i + 1) as f32 / links as f32;
+                    let a = addv(anchor, mulv(v(hook.x - anchor.x, hook.y - anchor.y, hook.z - anchor.z), t0));
+                    let b = addv(anchor, mulv(v(hook.x - anchor.x, hook.y - anchor.y, hook.z - anchor.z), t1));
+                    let mid = mulv(addv(a, b), 0.5);
+                    // a link ring, built at the origin (scale3 pivots there), flattened a little, alternate
+                    // links turned 90 degrees so the chain reads as interlocked rather than as a row of coins
+                    let mut link = m3::torus(v(0.0, 0.0, 0.0), 0.06, 0.018, 8, 4, mix_rgb(iron, metal, 0.15));
+                    m3::scale3(&mut link, 1.0, 1.15, 1.0);
+                    if i % 2 == 1 { for p in &mut link.verts { *p = v(p.z, p.y, p.x); } for q in &mut link.norms { *q = v(q.z, q.y, q.x); } }
+                    for p in &mut link.verts { *p = addv(*p, mid); }
+                    link.mat = M::STONE; link.emissive = 0.04; s.add(link, Float { amp: 0.006, speed: 0.9, phase: hs(20 + i as i32) * 6.28, drift: 0.008 });
+                }
+            }
+        }
+        Hang::Ropes => {
+            // a timber beam across the top with two braces angling back, and two ropes to the board's corners
+            let timber = c(0x4a, 0x36, 0x22);
+            let rope = c(0x8a, 0x74, 0x4e);
+            let beam_y = h * 0.5 + 1.5;
+            let bl = addv(ctr, addv(mulv(right, -w * 0.5 - 0.7), mulv(up, beam_y)));
+            let br = addv(ctr, addv(mulv(right, w * 0.5 + 0.7), mulv(up, beam_y)));
+            let mut beam = m3::tube(bl, br, 0.09, 4, timber); m3::tint_up(&mut beam, c(0x66, 0x4e, 0x32), c(0x30, 0x22, 0x14)); beam.mat = M::WOOD; s.add(beam, Float::STILL);
+            for sx in [-1.0f32, 1.0] {
+                let e = addv(ctr, addv(mulv(right, sx * (w * 0.5 + 0.7)), mulv(up, beam_y)));
+                let back = addv(e, addv(mulv(n, -1.4), mulv(up, -0.9))); // brace runs back + down into the structure behind
+                let mut brace = m3::tube(e, back, 0.07, 4, timber); brace.mat = M::WOOD; s.add(brace, Float::STILL);
+                let mut peg = m3::uv_sphere(e, 0.1, 6, 5, mix_rgb(timber, metal, 0.4)); peg.mat = M::WOOD; peg.emissive = 0.08; s.add(peg, Float::STILL);
+            }
+            for (anchor, sx) in [(top_l, -1.0f32), (top_r, 1.0)] {
+                let hook = addv(ctr, addv(mulv(right, sx * (w * 0.5 + 0.1)), mulv(up, beam_y)));
+                let mut cord = m3::tube(anchor, hook, 0.03, 5, rope); cord.mat = M::WOOD; cord.emissive = 0.03;
+                s.add(cord, Float { amp: 0.01, speed: 0.6, phase: hs(30) * 6.28, drift: 0.012 });
+                let mut knot = m3::torus(anchor, 0.07, 0.03, 8, 5, mix_rgb(rope, c(0x40, 0x30, 0x1c), 0.3)); knot.mat = M::WOOD; s.add(knot, Float::STILL);
+            }
+        }
+        Hang::Cairns => {
+            for sx in [-1.0f32, 1.0] {
+                let base = addv(pos, mulv(right, sx * w * 0.36));
+                let stone = mix_rgb(frame, c(0x9a, 0x94, 0x88), 0.5);
+                for (i, mut st) in m3::cairn(base, 4, 0.34, seed.wrapping_add((sx > 0.0) as u32 + 3), stone).into_iter().enumerate() {
+                    m3::tint_up(&mut st, mix_rgb(stone, c(0xff, 0xf0, 0xd0), 0.25), mix_rgb(stone, c(0x20, 0x1e, 0x1a), 0.4));
+                    st.mat = M::STONE; st.emissive = 0.02 + i as f32 * 0.005; s.add(st, Float::STILL);
+                }
+                contact_shadow(s, base.x, base.z, 0.5, pos.y, 110);
+            }
+        }
+    }
+    // FIXTURE — the light beside the board. It sits off the top-right corner where a lantern would hang from
+    // the frame, except the candle (a bracket shelf at mid-height), the neon tube (along the top edge) and the
+    // bio-bulb (a stalk rising from the ground beside the stand).
+    let fx = addv(ctr, addv(mulv(right, w * 0.5 + 0.55), mulv(up, h * 0.5 + 0.05)));
+    let flame_float = |k: i32| Float { amp: 0.012, speed: 7.0 + hs(k) * 3.0, phase: hs(k + 1) * 6.28, drift: 0.006 };
+    match skin.fixture {
+        Fixture::None => {}
+        Fixture::CagedLantern => {
+            let iron = c(0x2c, 0x2a, 0x28);
+            // hook off the frame's corner, then the cage hangs from it
+            let hook_a = addv(corner(1.0, 1.0), mulv(n, 0.02));
+            let hook_b = addv(fx, mulv(up, 0.42));
+            let mut arm = m3::tube(hook_a, hook_b, 0.028, 5, iron); arm.mat = M::STONE; s.add(arm, Float::STILL);
+            let mut drop = m3::tube(hook_b, addv(fx, mulv(up, 0.30)), 0.02, 4, iron); drop.mat = M::STONE; s.add(drop, Float::STILL);
+            let sway = Float { amp: 0.01, speed: 0.7, phase: hs(40) * 6.28, drift: 0.02 };
+            caged_lantern(s, addv(fx, mulv(up, 0.3)), 0.19, lamp, seed.wrapping_add(41), sway);
+        }
+        Fixture::PaperLantern => {
+            let paper = mix_rgb(lamp, c(0xff, 0xf6, 0xe6), 0.5);
+            let cord_top = addv(fx, mulv(up, 0.95));
+            let lc = addv(fx, mulv(up, 0.2));
+            let sway = Float { amp: 0.012, speed: 0.55, phase: hs(50) * 6.28, drift: 0.03 };
+            let mut cord = m3::tube(cord_top, addv(lc, mulv(up, 0.3)), 0.016, 4, c(0x3a, 0x2a, 0x1c)); cord.mat = M::WOOD; s.add(cord, sway);
+            let mut body = m3::uv_sphere(v(0.0, 0.0, 0.0), 0.27, 14, 10, paper); m3::scale3(&mut body, 1.0, 0.86, 1.0);
+            for p in &mut body.verts { *p = addv(*p, lc); } // scale3 pivots on the origin: squash, then place
+            body.mat = M::PAPER; body.emissive = 0.95; s.add(body, sway);
+            for k in 0..3 { let ry = lc.y - 0.14 + k as f32 * 0.14; let rr = 0.27 * (1.0 - ((k as f32 - 1.0) * 0.5).powi(2)).sqrt().max(0.5);
+                let mut rib = m3::torus(v(lc.x, ry, lc.z), rr, 0.012, 14, 4, c(0x5a, 0x3e, 0x24)); rib.mat = M::WOOD; s.add(rib, sway); }
+            for (p, l) in [(addv(lc, mulv(up, 0.24)), 0.07), (addv(lc, mulv(up, -0.24)), 0.07)] { let mut cap = m3::tube(p, addv(p, mulv(up, l)), 0.07, 8, c(0x4a, 0x32, 0x1c)); cap.mat = M::WOOD; s.add(cap, sway); }
+            let mut core = m3::uv_sphere(lc, 0.1, 8, 6, lamp); core.mat = M::MOSS; core.emissive = 1.7; s.add(core, flame_float(51));
+            let mut tassel = m3::tube(addv(lc, mulv(up, -0.3)), addv(lc, mulv(up, -0.55)), 0.02, 4, c(0xc0, 0x40, 0x30)); tassel.mat = M::PAPER; s.add(tassel, sway);
+        }
+        Fixture::Candle => {
+            let shelf = addv(ctr, addv(mulv(right, w * 0.5 + 0.42), mulv(up, -h * 0.05)));
+            let mut sh = m3::panel(shelf, right, n, 0.4, 0.3, frame); sh.mat = fmat; s.add(sh, Float::STILL); // a small horizontal bracket shelf
+            let mut br = m3::tube(addv(shelf, addv(mulv(right, -0.2), mulv(up, -0.02))), addv(shelf, addv(mulv(right, -0.36), mulv(up, -0.32))), 0.025, 4, stud_col); br.mat = fmat; s.add(br, Float::STILL);
+            let cb = addv(shelf, mulv(up, 0.02));
+            let mut ck = m3::tube(cb, addv(cb, mulv(up, 0.36)), 0.055, 8, c(0xf0, 0xe4, 0xc8)); m3::tint_up(&mut ck, c(0xfa, 0xf0, 0xd8), c(0xd8, 0xc8, 0xa8)); ck.mat = M::PAPER; ck.emissive = 0.2; s.add(ck, Float::STILL);
+            let mut drip = m3::uv_sphere(addv(cb, addv(mulv(up, 0.3), mulv(right, 0.05))), 0.04, 6, 5, c(0xf4, 0xea, 0xd0)); drip.mat = M::PAPER; drip.emissive = 0.15; s.add(drip, Float::STILL);
+            let ft = addv(cb, mulv(up, 0.46));
+            let mut flame = m3::uv_sphere(ft, 0.045, 8, 6, lamp); flame.mat = M::MOSS; flame.emissive = 2.2; s.add(flame, flame_float(61));
+            let mut halo = m3::disc(addv(ft, mulv(n, 0.02)), 0.24, 12, lamp); m3::set_alpha(&mut halo, 40); halo.mat = M::MOSS; halo.emissive = 1.0; s.add(halo, flame_float(62));
+        }
+        Fixture::Crystal => {
+            let clamp = addv(corner(1.0, 1.0), mulv(n, 0.02));
+            let tip = addv(clamp, addv(mulv(right, 0.34), mulv(up, 0.62)));
+            let mut clamp_m = m3::torus(clamp, 0.08, 0.03, 8, 5, stud_col); clamp_m.mat = M::STONE; clamp_m.emissive = 0.2; s.add(clamp_m, Float::STILL);
+            let pulse = Float { amp: 0.0, speed: 1.3, phase: hs(70) * 6.28, drift: 0.0 };
+            let mut shard = m3::tube(clamp, tip, 0.075, 6, lamp); m3::tint_height(&mut shard, clamp.y, tip.y, mix_rgb(lamp, c(0x40, 0x60, 0x90), 0.5), c(0xf0, 0xff, 0xff)); shard.mat = M::MOSS; shard.emissive = 1.15; m3::set_alpha(&mut shard, 200); s.add(shard, pulse);
+            let mut pt = m3::uv_sphere(tip, 0.05, 6, 5, c(0xf4, 0xff, 0xff)); pt.mat = M::MOSS; pt.emissive = 2.0; s.add(pt, pulse);
+            let mut halo = m3::disc(addv(mulv(addv(clamp, tip), 0.5), mulv(n, 0.03)), 0.32, 12, lamp); m3::set_alpha(&mut halo, 36); halo.mat = M::MOSS; halo.emissive = 0.9; s.add(halo, pulse);
+        }
+        Fixture::NeonTube => {
+            let ty = h * 0.5 + 0.30;
+            let a = addv(ctr, addv(mulv(right, -w * 0.46), addv(mulv(up, ty), mulv(n, 0.02))));
+            let b = addv(ctr, addv(mulv(right, w * 0.46), addv(mulv(up, ty), mulv(n, 0.02))));
+            let buzz = Float { amp: 0.0, speed: 11.0, phase: hs(80) * 6.28, drift: 0.0 };
+            let mut tube = m3::tube(a, b, 0.035, 8, lamp); tube.mat = M::MOSS; tube.emissive = 1.6; s.add(tube, buzz);
+            let mut glow = m3::panel(addv(mulv(addv(a, b), 0.5), mulv(n, -0.01)), right, up, w * 0.96, 0.36, lamp); m3::set_alpha(&mut glow, 30); glow.mat = M::MOSS; glow.emissive = 0.9; s.add(glow, buzz);
+            for p in [a, b] { let mut cap = m3::tube(p, addv(p, mulv(up, -0.16)), 0.045, 6, c(0x2a, 0x28, 0x26)); cap.mat = M::STONE; s.add(cap, Float::STILL); }
+        }
+        Fixture::BioBulb => {
+            let base = addv(pos, mulv(right, w * 0.5 + 0.7));
+            let bulb_c = addv(base, mulv(up, stand_h + h * 0.7));
+            let bob = Float { amp: 0.06, speed: 0.5, phase: hs(90) * 6.28, drift: 0.05 };
+            let mut stalk = m3::tube(base, addv(bulb_c, mulv(up, -0.2)), 0.05, 6, c(0x2a, 0x4e, 0x52)); m3::tint_height(&mut stalk, base.y, bulb_c.y, c(0x1c, 0x34, 0x3a), mix_rgb(lamp, c(0x20, 0x50, 0x58), 0.5)); stalk.mat = M::MOSS; stalk.emissive = 0.3; s.add(stalk, Float { amp: 0.02, speed: 0.5, phase: hs(90) * 6.28, drift: 0.02 });
+            let mut bulb = m3::uv_sphere(bulb_c, 0.26, 14, 10, lamp); m3::set_alpha(&mut bulb, 150); bulb.mat = M::WATER; bulb.emissive = 1.1; s.add(bulb, bob);
+            let mut core = m3::uv_sphere(bulb_c, 0.1, 8, 6, c(0xf0, 0xff, 0xfa)); core.mat = M::MOSS; core.emissive = 2.0; s.add(core, bob);
+            for k in 0..5 { // trailing tendrils
+                let a = std::f32::consts::TAU * k as f32 / 5.0;
+                let from = addv(bulb_c, addv(mulv(right, a.cos() * 0.18), addv(mulv(n, a.sin() * 0.18), mulv(up, -0.2))));
+                let mut t = m3::tube(from, addv(from, addv(mulv(right, a.cos() * 0.08), mulv(up, -0.5 - hs(91 + k) * 0.3))), 0.012, 4, lamp); t.mat = M::MOSS; t.emissive = 0.9; s.add(t, Float { amp: 0.06, speed: 0.6, phase: hs(92 + k) * 6.28, drift: 0.08 });
+            }
+        }
+        Fixture::SunCatcher => {
+            // no lamp lit: a brass disc on a short finial at the corner, catching the daylight
+            let post_a = addv(corner(1.0, 1.0), mulv(n, 0.02));
+            let post_b = addv(post_a, addv(mulv(up, 0.5), mulv(right, 0.12)));
+            let mut post = m3::tube(post_a, post_b, 0.025, 5, stud_col); post.mat = M::STONE; post.emissive = 0.15; s.add(post, Float::STILL);
+            let mut disc = m3::disc(post_b, 0.17, 14, mix_rgb(metal, lamp, 0.4)); // faces up: catches the sun
+            disc.mat = M::STONE; disc.emissive = 0.55; s.add(disc, Float { amp: 0.0, speed: 0.4, phase: hs(95) * 6.28, drift: 0.0 });
+            let mut rim_ = m3::torus(post_b, 0.17, 0.02, 14, 5, metal); rim_.mat = M::STONE; rim_.emissive = 0.4; s.add(rim_, Float::STILL);
         }
     }
 }
@@ -5959,34 +6235,37 @@ fn build(palette_name: &str) -> Scene {
     // physical-UI concept; the graph already renders as physical beads, this gives the reading panel a home too.
     {
         let ep = env_params();
-        let (ui_style, ui_floor, floating) = match palette_name {
-            "Alley" | "Forest" | "Canopy" => (0u32, -3.2f32, false),
-            "Treehouse" => (0, -1.0, true),
-            "Slate" => (1, -4.4, false),
-            "Old Library" => (1, -3.0, false),
-            "Archive" | "Reading Room" => (1, -3.1, false),
-            "Mansion Garden" => (3, -3.4, false),
-            "Atlantis" => (2, -3.0, false),
-            "Fractal Spires" => (1, -3.4, false),
-            "Recursive Citadel" => (1, -3.4, false),
-            "Hollow Jungle" => (0, -3.4, true),
-            "Yellow Brick Road" => (1, -3.4, false),
-            "Frozen Bifrost" => (2, -3.0, true),
-            "Titan's Ribcage" => (1, -3.4, false),
-            "Mistfall" => (2, -1.6, false),
-            "Cloudscape" | "Folding@home" => (2, -0.6, true),
-            _ => (1, -3.0, false),
+        // Where the board's foot sits (each world's floor height), per scene. WHAT the board is — its
+        // material, rim, suspension, lamp, tabs — is `physkin::PanelSkin::for_scene`, one decision per world.
+        let ui_floor = match palette_name {
+            "Alley" | "Forest" | "Canopy" => -3.2f32,
+            "Treehouse" => -1.0,
+            "Slate" => -4.4,
+            "Old Library" | "Atlantis" | "Frozen Bifrost" => -3.0,
+            "Archive" | "Reading Room" => -3.1,
+            "Mansion Garden" | "Fractal Spires" | "Recursive Citadel" | "Hollow Jungle" | "Yellow Brick Road" | "Titan's Ribcage" => -3.4,
+            "Mistfall" => -1.6,
+            "Cloudscape" | "Folding@home" => -0.6,
+            "Cat Cave" => -3.6,
+            "Forest Village" => -3.2,
+            "Lavarock Way" => -3.3,
+            _ => -3.0,
         };
+        let skin = crate::physkin::PanelSkin::for_scene(palette_name);
         let px = -(ep.ext_x as f32 * 0.5 + 5.0);
         let pz = ep.ext_z as f32 * 0.5 + 3.0;
-        let face = (-pz).atan2(-px); // face back toward the graph at the origin
-        physical_ui_panel(&mut s, ui_style, v(px, ui_floor, pz), face, 3.4, 2.1, floating, 0x5151,
+        // FACE THE READER, not the graph. The board used to face the origin, and the default orbit camera
+        // (yaw 0.5, from +z) sits on the far side of it — so the overview showed the board's BACK, which is
+        // culled: a beam, two ropes and a lantern around nothing. It now faces where the default eye is.
+        let (ex, ez) = (-0.5_f32.sin() * map_radius() * 0.6, 0.5_f32.cos() * map_radius() * 0.6);
+        let face = (ez - pz).atan2(ex - px);
+        physical_ui_panel(&mut s, &skin, v(px, ui_floor, pz), face, 3.4, 2.1, 0x5151,
                           panel_context().rows(),
                           scene_kit::mesh3d::scene_light_for(palette_name));
     }
     // Atlantis is SELF-ENCLOSING (its own ribbed glass dome + perimeter wall + open ocean beyond), so it does
     // NOT get the generic outer room — that second shell was the "giant structure" dominating every overview.
-    if palette_name != "Atlantis" && palette_name != "Cloudscape" && palette_name != "Forest" && palette_name != "Treehouse" && palette_name != "Canopy" && palette_name != "Mansion Garden" && palette_name != "Alley" && palette_name != "Fractal Spires" && palette_name != "Recursive Citadel" && palette_name != "Hollow Jungle" && palette_name != "Yellow Brick Road" && palette_name != "Frozen Bifrost" && palette_name != "Titan's Ribcage" {
+    if palette_name != "Atlantis" && palette_name != "Cloudscape" && palette_name != "Forest" && palette_name != "Treehouse" && palette_name != "Canopy" && palette_name != "Mansion Garden" && palette_name != "Alley" && palette_name != "Fractal Spires" && palette_name != "Recursive Citadel" && palette_name != "Hollow Jungle" && palette_name != "Yellow Brick Road" && palette_name != "Frozen Bifrost" && palette_name != "Titan's Ribcage" && palette_name != "Cat Cave" && palette_name != "Forest Village" && palette_name != "Lavarock Way" {
         let (mat, lo, hi, shelf) = match palette_name {
             "Canopy" | "Old Library" => (M::WOOD, c(0x2c, 0x20, 0x12), c(0x5a, 0x44, 0x28), true),
             "Archive" => (M::STONE, c(0x66, 0x5e, 0x4e), c(0xa8, 0x9e, 0x88), false), // cathedral: pale marble shell, no shelves
