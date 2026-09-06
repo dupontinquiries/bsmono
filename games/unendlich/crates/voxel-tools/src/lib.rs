@@ -113,6 +113,8 @@ pub mod finish;
 pub mod style;
 /// Spec-driven tuning: model-emitted property targets, a genetic placer/destroyer pool, a training record.
 pub mod spec;
+/// A latent space over the world tree: per-commit vectors cached by hash, nearest, interpolate to a spec.
+pub mod latent;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.

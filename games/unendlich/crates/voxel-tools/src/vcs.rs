@@ -130,6 +130,9 @@ pub struct MergeReport {
 
 impl MergeReport {
     pub fn summary(&self) -> String {
+        // usize::MAX marks a fast-forward; it printed as a twenty-digit
+        // chunk count before this branch existed.
+        if self.fast_forwarded == usize::MAX { return "fast-forward: nothing to reconcile".into(); }
         format!("{} chunk(s) taken whole, {} merged cell by cell, {} conflict(s){}",
                 self.fast_forwarded, self.merged, self.conflicts.len(),
                 if self.conflicts.is_empty() { String::new() }
@@ -623,6 +626,7 @@ mod tests {
         let (got, rep) = r.merge("b", Policy::Ours, "a").unwrap();
         assert_eq!(got, h, "main now points at b's commit");
         assert_eq!(rep.fast_forwarded, usize::MAX);
+        assert!(rep.summary().starts_with("fast-forward"), "no sentinel in the text: {}", rep.summary());
     }
 
     #[test]

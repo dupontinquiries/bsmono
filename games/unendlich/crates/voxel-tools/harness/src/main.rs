@@ -31,6 +31,7 @@ fn main() {
     persist_scenario();
     cancel_scenario();
     undo_race_scenario();
+    tree_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -667,4 +668,43 @@ fn undo_race_scenario() {
     assert_eq!(after_undo, after_ticks, "nothing of the undone build arrived later");
     // and the raised ground is back down
     assert_eq!(cm.block_at(0, 70, 0), stubs::BlockId::Air, "the hill is gone");
+}
+
+
+/// Branch, build, switch back, merge; then "like the mill but taller".
+fn tree_scenario() {
+    use paintbrush::Paintbrush;
+    use voxel_tools::chatbox::Key;
+    println!("\n==== world tree and latent space");
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    pb.player = "kess".into();
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    let mut line = |pb: &mut Paintbrush, l: &str| -> Option<stubs::Command> {
+        pb.key(Key::Enter); for c in l.chars() { pb.key(Key::Char(c)); } pb.key(Key::Enter)
+    };
+    let build = |pb: &mut Paintbrush, ir: &str, prose: &str| {
+        pb.launch_drone(&cm, &gaze, ir.into(), None, prose); settle(pb);
+        let cmd = { pb.key(Key::Enter); for c in "/commit".chars() { pb.key(Key::Char(c)); } pb.key(Key::Enter) }.unwrap();
+        pb.dispatch(&cm, &gaze, cmd); pb.drain_log();
+    };
+    build(&mut pb, "# the old mill\nenclose @-4,-4 @4,4 h=5 block=oak_planks\nroof @-4,-4 @4,4 gable\n", "the old mill");
+    let cmd = line(&mut pb, "/branch experiments").unwrap(); pb.dispatch(&cm, &gaze, cmd);
+    build(&mut pb, "# a tower\ncylinder @20,0 r=3 h=14 block=stone\n", "a tower");
+    let cmd = line(&mut pb, "/switch main").unwrap(); pb.dispatch(&cm, &gaze, cmd);
+    let log = pb.drain_log();
+    println!("  {}", log.last().cloned().unwrap_or_default());
+    assert!(log.iter().any(|l| l.contains("on 'main'")), "{log:?}");
+    assert!(!pb.comb.is_empty(), "the switch queued the diff for the hive");
+    let cmd = line(&mut pb, "/merge experiments").unwrap(); pb.dispatch(&cm, &gaze, cmd);
+    let log = pb.drain_log();
+    println!("  {}", log.last().cloned().unwrap_or_default());
+    assert!(log.iter().any(|l| l.contains("merged 'experiments'")), "{log:?}");
+    let cmd = line(&mut pb, "/like the mill but taller").unwrap(); pb.dispatch(&cm, &gaze, cmd);
+    let log = pb.drain_log();
+    for l in &log { println!("  {l}"); }
+    assert!(log.iter().any(|l| l.contains("like 'mill', but taller") && l.contains("spec ")), "{log:?}");
+    assert!(pb.session.pending_spec.is_some());
+    println!("  latent index: {} vectors, {} hits, {} misses", pb.latent.len(), pb.latent.hits, pb.latent.misses);
+    assert!(pb.latent.len() >= 3);
 }

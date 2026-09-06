@@ -433,6 +433,10 @@ pub struct Paintbrush {
     pub library: voxel_tools::template::Library,
     /// The world tree: every commit, branches, merges; saved with the world.
     pub repo: voxel_tools::vcs::Repo,
+    /// The latent index over the tree: one vector per commit, computed
+    /// on first sight and kept for the session. Never persisted; it is
+    /// a pure function of the tree.
+    pub latent: voxel_tools::latent::Index,
     /// Set by anything that changes land, library or repo; the bin
     /// saves when it sees it.
     pub state_dirty: bool,
@@ -512,6 +516,7 @@ impl Paintbrush {
             land: voxel_tools::land::Registry::new(),
             library: voxel_tools::template::Library::new(),
             repo: voxel_tools::vcs::Repo::new(chunk_size),
+            latent: voxel_tools::latent::Index::new(),
             state_dirty: false,
             last_job: None,
             player: "player".into(),
@@ -772,6 +777,90 @@ impl Paintbrush {
                 // On the worker, like every model call. The reply is
                 // routed to `finish_repair` by its TurnKind.
                 self.start_repair(gaze, None);
+                Pending::None
+            }
+            Command::Branch(name) => {
+                match name {
+                    None => {
+                        let head = self.repo.head.clone();
+                        let lines: Vec<String> = self.repo.branches()
+                            .map(|(n, h)| format!("{}{} @ {}", if *n == head { "* " } else { "  " }, n,
+                                                  voxel_tools::vcs::short(*h))).collect();
+                        for l in lines { self.say(l); }
+                    }
+                    Some(n) => match self.repo.branch(&n) {
+                        Ok(()) => { let _ = self.repo.switch(&n); self.state_dirty = true;
+                                    self.say(format!("branch '{n}' started here and checked out")); }
+                        Err(e) => self.say(e),
+                    },
+                }
+                Pending::None
+            }
+            Command::Switch(name) => {
+                // Switching does not rewrite the world: it moves HEAD, and
+                // the DIFF to the target tree goes to the hive. A branch
+                // is a place you can go to as well as a line you commit on.
+                let from = self.repo.head_commit().tree;
+                match self.repo.switch(&name) {
+                    Ok(()) => {
+                        let to = self.repo.head_commit().tree;
+                        let diff = self.repo.diff(from, to);
+                        let n = diff.len();
+                        if n > 0 {
+                            let changes: Vec<voxel_tools::weather::Change> = diff.into_iter().map(|(c, _)| c).collect();
+                            let job = self.next_job; self.next_job += 1;
+                            let cells = voxel_tools::hive::shard(changes, self.chunk_size, job);
+                            let obs = self.observer();
+                            self.comb.offer(&format!("switch to {name}"), cells, &obs);
+                        }
+                        self.state_dirty = true;
+                        self.say(format!("on '{name}'; {n} block(s) to bring the world to it"));
+                    }
+                    Err(e) => self.say(e),
+                }
+                Pending::None
+            }
+            Command::Merge(name) => {
+                let from = self.repo.head_commit().tree;
+                let player = self.player.clone();
+                match self.repo.merge(&name, voxel_tools::vcs::Policy::AirWins, &player) {
+                    Ok((_, rep)) => {
+                        let to = self.repo.head_commit().tree;
+                        let diff = self.repo.diff(from, to);
+                        let n = diff.len();
+                        if n > 0 {
+                            let changes: Vec<voxel_tools::weather::Change> = diff.into_iter().map(|(c, _)| c).collect();
+                            let job = self.next_job; self.next_job += 1;
+                            let cells = voxel_tools::hive::shard(changes, self.chunk_size, job);
+                            let obs = self.observer();
+                            self.comb.offer(&format!("merge {name}"), cells, &obs);
+                        }
+                        self.state_dirty = true;
+                        self.say(format!("merged '{name}': {} -- {n} block(s) applying", rep.summary()));
+                    }
+                    Err(e) => self.say(e),
+                }
+                Pending::None
+            }
+            Command::Like(words) => {
+                // Index whatever is not yet embedded, then a spec from the
+                // named build's point, nudged by the words.
+                let head = self.repo.head.clone();
+                let ground = gaze.hit.map(|h| h.block.1).unwrap_or(64);
+                let fresh = self.latent.index_branch(&self.repo, &head, ground);
+                if fresh > 0 { log::info!("[latent] embedded {fresh} commit(s)"); }
+                match voxel_tools::chat::ChatSession::like_spec(&format!("like {words}"), &self.latent) {
+                    Some((line, note)) => {
+                        self.say(format!("{note}: {line}"));
+                        self.say("say /build <what> and it will be tuned to that; or /build with the spec line above");
+                        self.session.pending_spec = Some(line);
+                    }
+                    None => {
+                        let known: Vec<String> = self.latent.nearest(&voxel_tools::latent::Vector([0.5; 16]), 6, None)
+                            .into_iter().map(|(_, _, n)| n).collect();
+                        self.say(format!("no build by that name in the tree; known: {}", known.join(", ")));
+                    }
+                }
                 Pending::None
             }
             Command::Hive => {
@@ -1304,7 +1393,10 @@ impl Paintbrush {
                 // The GAZE anchor the @coordinates were resolved against,
                 // not the box corner: a rebase replays against it.
                 let anchor = (self.session.last_anchor.0, self.session.last_anchor.2);
-                self.repo.commit_changes_at(&self.player, &lb.name, &ir, anchor, &changes);
+                let h = self.repo.commit_changes_at(&self.player, &lb.name, &ir, anchor, &changes);
+                // Into the latent index while the cells are hot; it
+                // stays cached by hash for the session.
+                self.latent.vector(&self.repo, h, lb.min.1 - 1);
                 let cx = (lb.min.0 + lb.max.0) / 2;
                 let cz = (lb.min.2 + lb.max.2) / 2;
                 if let Some(ws) = self.land.at(cx, cz, 0).first().map(|w| w.id.clone()) {

@@ -144,6 +144,14 @@ pub enum Command {
     Repair,
     /// `/hive` — what the background builder is doing and how fast.
     Hive,
+    /// `/branch [name]` — list branches, or start one here.
+    Branch(Option<String>),
+    /// `/switch name` — move HEAD.
+    Switch(String),
+    /// `/merge name` — three-way merge into HEAD.
+    Merge(String),
+    /// `/like name [words]` — a spec from the latent space of the tree.
+    Like(String),
     /// `/refine [rung|all]` — small detail passes over the last build.
     /// No argument lists them.
     Refine(Option<String>),
@@ -273,6 +281,13 @@ pub fn parse(line: &str) -> Command {
         "/cancel" => if args.is_empty() { Command::Cancel } else { Command::Unknown },
         "/repair" => if args.is_empty() { Command::Repair } else { Command::Unknown },
         "/hive" => if args.is_empty() { Command::Hive } else { Command::Unknown },
+        "/branch" => match args.as_slice() {
+            [] => Command::Branch(None),
+            n => Command::Branch(Some(n.join(" "))),
+        },
+        "/switch" => match args.as_slice() { [] => Command::Unknown, n => Command::Switch(n.join(" ")) },
+        "/merge" => match args.as_slice() { [] => Command::Unknown, n => Command::Merge(n.join(" ")) },
+        "/like" => match args.as_slice() { [] => Command::Unknown, n => Command::Like(n.join(" ")) },
         "/refine" => match args.as_slice() {
             [] => Command::Refine(None),
             [r] => Command::Refine(Some(r.to_ascii_lowercase())),
@@ -450,6 +465,11 @@ impl Command {
             Command::Cancel => Some("/cancel".to_string()),
             Command::Repair => Some("/repair".to_string()),
             Command::Hive => Some("/hive".to_string()),
+            Command::Branch(None) => Some("/branch".to_string()),
+            Command::Branch(Some(n)) => Some(format!("/branch {n}")),
+            Command::Switch(n) => Some(format!("/switch {n}")),
+            Command::Merge(n) => Some(format!("/merge {n}")),
+            Command::Like(n) => Some(format!("/like {n}")),
             Command::Refine(None) => Some("/refine".to_string()),
             Command::Refine(Some(r)) => Some(format!("/refine {r}")),
             Command::Deferred { drop: false } => Some("/deferred".to_string()),
@@ -784,6 +804,20 @@ mod tests {
         assert_eq!(parse("/refine ALL"), Command::Refine(Some("all".into())));
         assert_eq!(parse("/refine a b"), Command::Unknown);
         for c in [Command::Refine(None), Command::Refine(Some("vary".into()))] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c);
+        }
+    }
+
+    #[test]
+    fn tree_verbs_parse_and_round_trip() {
+        assert_eq!(parse("/branch"), Command::Branch(None));
+        assert_eq!(parse("/branch friend's mill"), Command::Branch(Some("friend's mill".into())));
+        assert_eq!(parse("/switch main"), Command::Switch("main".into()));
+        assert_eq!(parse("/merge mill"), Command::Merge("mill".into()));
+        assert_eq!(parse("/like the mill but taller"), Command::Like("the mill but taller".into()));
+        assert_eq!(parse("/switch"), Command::Unknown);
+        for c in [Command::Branch(Some("x y".into())), Command::Switch("m".into()), Command::Merge("b".into()),
+                  Command::Like("the mill".into())] {
             assert_eq!(parse(&c.to_command_string().unwrap()), c);
         }
     }

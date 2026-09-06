@@ -105,6 +105,18 @@ pub const CARDS: &[Card] = &[
     Card { command: "/cancel", signature: "/cancel",
            summary: "Drop a model request in flight. The worker finishes; its answer is discarded.",
            example: "/cancel", arg_words: &[] },
+    Card { command: "/branch", signature: "/branch [name]",
+           summary: "List the world tree's branches, or start one here and check it out.",
+           example: "/branch experiments", arg_words: &[] },
+    Card { command: "/switch", signature: "/switch <branch>",
+           summary: "Move to a branch; the world is brought to it by the hive.",
+           example: "/switch main", arg_words: &["main"] },
+    Card { command: "/merge", signature: "/merge <branch>",
+           summary: "Three-way merge a branch into this one; conflicts resolved air-wins and recorded.",
+           example: "/merge experiments", arg_words: &[] },
+    Card { command: "/like", signature: "/like <build> [taller|thicker|wider|open|...]",
+           summary: "A spec from the latent space: like a named build, nudged by the words. The next /build is tuned to it.",
+           example: "/like the mill but taller", arg_words: &[] },
     Card { command: "/hive", signature: "/hive",
            summary: "What the background builder is doing: progress, ETA, and this frame's budget.",
            example: "/hive", arg_words: &[] },
@@ -645,6 +657,7 @@ mod tests {
             "/build", "/plan", "/commit", "/undo", "/focus", "/anim",
             "/model", "/provider", "/keys", "/find", "/locate",
             "/cancel", "/land", "/world", "/shot", "/repair", "/deferred", "/refine", "/hive",
+            "/branch", "/switch", "/merge", "/like",
         ];
         for v in PARSER_VERBS {
             assert!(card_for(v).is_some(), "{v} has no card, so nobody will find it");

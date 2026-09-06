@@ -54,7 +54,7 @@ pub enum AnimProfile { GroundUp, Physics, Random, Instant }
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Command {
     Build(String), BuildVoice(bool), ShowPlan, CommitPlan, UndoBuild,
-    Focus(Option<FocusAdjust>), Anim(AnimProfile), Model(Option<String>), Keys, Cancel, Repair, Land(LandOp), Hive, Refine(Option<String>), Deferred { drop: bool }, Provider(Option<String>), Shot { kind: String, id: Option<String> }, Unknown,
+    Focus(Option<FocusAdjust>), Anim(AnimProfile), Model(Option<String>), Keys, Cancel, Repair, Land(LandOp), Hive, Refine(Option<String>), Deferred { drop: bool }, Provider(Option<String>), Shot { kind: String, id: Option<String> }, Branch(Option<String>), Switch(String), Merge(String), Like(String), Unknown,
 }
 pub fn parse(line: &str) -> Command {
     let t = line.trim();
@@ -77,6 +77,13 @@ pub fn parse(line: &str) -> Command {
             _ => Command::Unknown,
         };
     }
+    for (pfx, mk) in [("/switch ", 0u8), ("/merge ", 1), ("/like ", 2), ("/branch ", 3)] {
+        if let Some(rest) = t.strip_prefix(pfx) {
+            let r = rest.trim().to_string();
+            return match mk { 0 => Command::Switch(r), 1 => Command::Merge(r), 2 => Command::Like(r), _ => Command::Branch(Some(r)) };
+        }
+    }
+    if t == "/branch" { return Command::Branch(None); }
     let mut it = t.split_whitespace();
     match (it.next(), it.next()) {
         (Some("/plan"), None) => Command::ShowPlan,

@@ -147,6 +147,9 @@ pub struct ChatSession {
     pub last_prose: String,
     /// Living plants placed by commits, awaiting the engine.
     pub planted: Vec<crate::flora::PlantRequest>,
+    /// A spec line from `/like`, prepended to the next plan received so
+    /// the tuner targets it. Consumed by that plan.
+    pub pending_spec: Option<String>,
     /// Training records from spec tuning: prose, spec, before, after.
     /// The host appends them to the world's training file.
     pub training: Vec<String>,
@@ -345,6 +348,39 @@ impl ChatSession {
         })
     }
 
+    /// "Something like the mill but taller": a spec from the latent
+    /// space. Finds the named build in the index, nudges its point by
+    /// each adjective that names an axis, and returns the spec line
+    /// the tuner will target -- plus a note of what it is based on.
+    pub fn like_spec(prose: &str, index: &crate::latent::Index) -> Option<(String, String)> {
+        let p = prose.to_lowercase();
+        // "like the mill" at the start of a command has no leading space
+        let rest = if let Some(r) = p.strip_prefix("like ") { r }
+                   else { let i = p.find(" like ")?; &p[i + 6..] };
+        let words: Vec<&str> = rest.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+        // the referent: the first word after "like" (skipping "the", "a", "my") that names a build
+        let mut it = words.iter().skip_while(|w| ["the", "a", "an", "my", "our", "that"].contains(w));
+        let name = it.next()?;
+        let h = index.find_named(name)?;
+        let mut v = index.get(h)?;
+        let mut nudges = Vec::new();
+        for w in &words {
+            if let Some(nv) = crate::latent::nudge(&v, w) { v = nv; nudges.push(w.to_string()); }
+        }
+        let spec = crate::latent::to_spec(&v);
+        let mut line = String::from("spec");
+        if let Some((a, b)) = spec.blocks { line.push_str(&format!(" blocks={a}-{b}")); }
+        if let Some((a, b)) = spec.height { line.push_str(&format!(" height={a}-{b}")); }
+        if let Some(d) = spec.durability { line.push_str(&format!(" durability={}", format!("{d:?}").to_lowercase())); }
+        if let Some(s) = spec.sound { line.push_str(&format!(" sound={}", format!("{s:?}").to_lowercase())); }
+        if let Some(s) = spec.shelter { line.push_str(&format!(" shelter={}", format!("{s:?}").to_lowercase())); }
+        if let Some(s) = spec.symmetry { line.push_str(&format!(" symmetry={s:.2}")); }
+        if let Some(o) = spec.openness { line.push_str(&format!(" openness={o:.2}")); }
+        let note = format!("like '{name}'{}", if nudges.is_empty() { String::new() }
+                           else { format!(", but {}", nudges.join(", ")) });
+        Some((line, note))
+    }
+
     /// "Connect A to B": a road between two named builds. The names are
     /// matched loosely against workset names -- "the mill" finds
     /// "Old Mill" -- because a player will not type an id.
@@ -457,7 +493,12 @@ impl ChatSession {
         // number, and salvage keys on them. Working on the expanded
         // source keeps numbers honest, and the repair prompt shows the
         // model concrete lines rather than a macro it has to unfold.
-        let expanded = crate::plan::expand_defs(ir);
+        // A /like spec waiting: prepend it unless the plan has its own.
+        let expanded = match self.pending_spec.take() {
+            Some(spec) if !ir.lines().any(|l| l.trim_start().starts_with("spec")) =>
+                crate::plan::expand_defs(&format!("{spec}\n{ir}")),
+            _ => crate::plan::expand_defs(ir),
+        };
         let ir: &str = &expanded;
         self.creative_seed = self.creative_seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let (first_plan, first_issues) = parse_plan_at(ir, Some(f.anchor));
@@ -1407,5 +1448,26 @@ mod tests {
         }
         assert_eq!(s.training.len(), 1);
         assert!(s.training[0].starts_with("a bunker\t"));
+    }
+
+    #[test]
+    fn like_the_mill_but_taller_becomes_a_spec() {
+        use crate::vcs::Repo;
+        use crate::weather::Change;
+        let mut repo = Repo::new(32);
+        let hut: Vec<Change> = (0..9).flat_map(|x| (65..70).flat_map(move |y| (0..9).filter_map(move |z| {
+            let wall = x == 0 || x == 8 || z == 0 || z == 8 || y == 69;
+            wall.then(|| Change { at: (x, y, z), to: 57 }) }))).collect();
+        repo.commit_changes("k", "the old mill", "", &hut);
+        let mut idx = crate::latent::Index::new();
+        idx.index_branch(&repo, "main", 64);
+        let (line, note) = ChatSession::like_spec("something like the mill but taller and sturdier", &idx).unwrap();
+        assert!(line.starts_with("spec "), "{line}");
+        assert!(note.contains("mill") && note.contains("taller"), "{note}");
+        let spec = crate::spec::Spec::parse(&line).unwrap();
+        assert!(spec.height.unwrap().0 > 5, "taller than the 5-high mill: {:?}", spec.height);
+        assert!(ChatSession::like_spec("a plain tower", &idx).is_none());
+        assert!(ChatSession::like_spec("like the mill", &idx).is_some(), "at the start of a command");
+        assert!(ChatSession::like_spec("like the cathedral", &idx).is_none(), "no such build");
     }
 }
