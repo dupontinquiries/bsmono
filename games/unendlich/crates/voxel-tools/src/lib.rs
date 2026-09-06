@@ -101,6 +101,8 @@ pub mod layer;
 pub mod feature;
 /// The hive: frame-sovereign scheduling of generation in chunk-sized cells.
 pub mod hive;
+/// A git tree over the world: content-addressed chunk edits, branches, merge, rebase.
+pub mod vcs;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.
