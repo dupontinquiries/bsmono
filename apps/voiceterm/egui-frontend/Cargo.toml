@@ -59,6 +59,13 @@ peer-handshake = { path = "../../../shared/peer-handshake" }
 pane-kit = { path = "../../../shared/pane-kit" }
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui", features = ["qrbig"] }
+# The Bluetooth transfer half of the acoustic handshake: HandshakePayload
+# now carries bt_addr once trusted, and this is what actually moves bytes
+# once it does. "rfcomm" pulls bluer + tokio — isolated to a single spawned
+# thread in bt_send.rs, not made the app's concurrency model; see that
+# file's header for why (pty_host.rs already established std::thread as the
+# pattern here, and one Bluetooth transfer at a time doesn't need more).
+bt-kit = { path = "../../../shared/bt-kit", features = ["rfcomm"] }
 # The terminal needs an actual shell: pty_host spawns one. Same crate
 # and version the Qt side uses, so behaviour cannot diverge between them.
 portable-pty = "0.8"

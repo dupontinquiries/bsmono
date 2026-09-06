@@ -13,6 +13,7 @@
 //! rather than mis-rendered.
 
 pub mod iio_light;
+pub mod bt_send;
 pub mod editor_keys;
 pub mod date_phrase;
 pub mod cmd_risk;
