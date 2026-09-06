@@ -1056,6 +1056,8 @@ impl Paintbrush {
         // registry -- stays as it is now.
         self.session.pending = session.pending;
         self.session.last_salvage = session.last_salvage;
+        // what the dry run's evolutions learned comes back too
+        self.session.archive = session.archive;
         if let Some(n) = drone.partial {
             // Label the partial so the log reads as progress, not as a
             // finished plan; the model is still writing.

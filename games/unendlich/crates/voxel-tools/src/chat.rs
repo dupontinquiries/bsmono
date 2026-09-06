@@ -153,6 +153,10 @@ pub struct ChatSession {
     /// A spec line from `/like`, prepended to the next plan received so
     /// the tuner targets it. Consumed by that plan.
     pub pending_spec: Option<String>,
+    /// Elite decorator genomes for the session: a second gothic wall
+    /// starts where the first finished. Lent to the tools around every
+    /// run and taken back after; the host copies it back from a drone.
+    pub archive: crate::evolve::Archive<crate::gene::Genome>,
     /// Training records from spec tuning: prose, spec, before, after.
     /// The host appends them to the world's training file.
     pub training: Vec<String>,
@@ -568,10 +572,15 @@ impl ChatSession {
         // the critique needs the blocks in the world to test support.
         // Then reverse, exactly as a dry run would.
         let (from_y, chunk_size) = (self.from_y, self.chunk_size);
+        let archive_in = self.archive.clone();
+        let archive_out = std::cell::RefCell::new(archive_in.clone());
         let dry_run = |tools: &mut VoxelTools<W>, plan: &BuildPlan|
             -> (PlanRun, Vec<(i32, i32, i32)>, Vec<critique::Finding>) {
             let first = tools.edits.len();
+            // lend the session's archive to the run; keep what it learned
+            tools.archive = archive_out.borrow().clone();
             let live: PlanRun = run_plan(tools, plan, from_y, chunk_size, false);
+            *archive_out.borrow_mut() = std::mem::take(&mut tools.archive);
             let placed: Vec<(i32, i32, i32)> = tools.edits[first..].iter()
                 .flat_map(|e| e.before.iter().map(|&(x, y, z, _)| (x, y, z))).collect();
             let mut findings = critique::floating(tools.world, &placed);
@@ -653,6 +662,7 @@ impl ChatSession {
             }
         }
         let _ = &placed;
+        self.archive = archive_out.into_inner();
         let mut echo = explain_plan(&plan, self.budget);
         if !findings.is_empty() {
             echo.push_str(&format!("\nCHECK  {}\n", critique::summarise(&findings)));
@@ -773,7 +783,9 @@ impl ChatSession {
         // See `pending_waypoint`.
         let _ = gaze;
         let first = tools.edits.len();
+        tools.archive = self.archive.clone();
         let run = run_plan(tools, &p.plan, self.from_y, self.chunk_size, false);
+        self.archive = std::mem::take(&mut tools.archive);
         self.invalidate_context();
         self.last_ir = p.ir.clone();
         self.last_prose = p.prose.clone();
@@ -1535,5 +1547,22 @@ mod tests {
             Reply::Preview { echo, .. } => assert!(!echo.contains("RECOGNIZED"), "{echo}"),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn the_archive_grows_across_turns_and_seeds_the_next() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 400_000);
+        let g = gaze_at(0, 0, 10.0);
+        assert!(s.archive.is_empty());
+        s.receive_plan_gated(&mut t, &g, "enclose @-5,-5 @5,5 h=6 block=stone\ngreeble @-6,-1,-6 @6,7,6 gothic gens=6 levels=2\n",
+                             None, "a gothic hall");
+        assert!(!s.archive.is_empty(), "the preview's evolution left elites: {}", s.archive.len());
+        assert!(!s.archive.seeds("greeble/gothic/L0").is_empty());
+        let n = s.archive.len();
+        s.receive_plan_gated(&mut t, &g, "enclose @20,-5 @30,5 h=6 block=stone\ngreeble @19,-1,-6 @31,7,6 gothic gens=6 levels=2\n",
+                             None, "another gothic hall");
+        assert!(s.archive.len() >= n.min(6), "kept or grew, capped: {}", s.archive.len());
     }
 }

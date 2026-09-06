@@ -251,7 +251,7 @@ pub enum Op {
     /// Greebles: evolve a decorator FSM for a region's surface against
     /// a phrase, then apply the winner. Or run a stated genome.
     Greeble { min: (i32, i32, i32), max: (i32, i32, i32), phrase: String,
-              gens: u32, seed: i32, genome: Option<String> },
+              gens: u32, seed: i32, genome: Option<String>, levels: u32 },
     /// A property spec the model emits beside its plan. Does nothing
     /// when run; the session reads it after the dry run and tunes the
     /// build toward it.
@@ -713,6 +713,7 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     gens: kvi(&t, "gens", 12).clamp(1, 60) as u32,
                     seed: kvi(&t, "seed", 1),
                     genome: t.iter().find_map(|s| s.strip_prefix("genome=")).map(|s| s.to_string()),
+                    levels: kvi(&t, "levels", 2).clamp(1, 4) as u32,
                 });
             }
             "spec" | "properties" => {
@@ -1286,7 +1287,7 @@ pub fn run_plan_with<W: VoxelWorld>(
                     None => CallResult::err(format!("unknown form '{name}'")),
                 }
             }
-            Op::Greeble { min, max, phrase, gens, seed, genome } => (|| {
+            Op::Greeble { min, max, phrase, gens, seed, genome, levels } => (|| {
                 use crate::gene;
                 let f = gene::faces(tools.world, *min, *max);
                 if f.is_empty() {
@@ -1303,15 +1304,28 @@ pub fn run_plan_with<W: VoxelWorld>(
                                                       ..Default::default() },
                     },
                     None => {
+                        // Levels of detail on the shared engine, seeded
+                        // from the tools' archive so a second wall in the
+                        // same style starts where the first finished.
                         let fit = gene::Fitness::from_phrase(phrase);
-                        let e = gene::evolve(&f, &fit, *seed as u64, 24, *gens as usize);
-                        let m = e.metrics;
-                        (e.changes, format!(
-                            "evolved '{}' over {} faces in {gens} generations: score {:.2}, \
-                             coverage {:.0}%, edges {:.0}%, depth {:.0}%, noise {:.2}, symmetry {:.2}\n{}",
-                            if phrase.is_empty() { "default" } else { phrase }, f.len(), e.score,
-                            m.coverage * 100.0, m.edges * 100.0, m.depth * 100.0, m.noise, m.symmetry,
-                            e.genome.to_text().trim()))
+                        let key = format!("greeble/{}", if phrase.is_empty() { "default" } else { phrase });
+                        let budget = crate::evolve::Budget::evals(24 * *gens as usize, 24);
+                        let mut staging = crate::staged::StagedWorld::new(tools.world);
+                        let mut archive = std::mem::take(&mut tools.archive);
+                        let levels_out = gene::evolve_levels(&mut staging, *min, *max, &fit, *seed as u64,
+                                                             *levels as usize, budget, &mut archive, &key);
+                        tools.archive = archive;
+                        let changes: Vec<crate::weather::Change> = staging.snapshot();
+                        let last = levels_out.last().map(|(_, e)| e.metrics).unwrap_or_default();
+                        let per_level: Vec<String> = levels_out.iter()
+                            .map(|(l, e)| format!("L{l}: {} changes, coverage {:.0}%, rhythm {:.2}, contrast {:.2}",
+                                                  e.changes.len(), e.metrics.coverage * 100.0, e.metrics.rhythm, e.metrics.contrast))
+                            .collect();
+                        (changes, format!(
+                            "evolved '{}' over {} faces, {} level(s): edges {:.0}%, depth {:.0}%, noise {:.2}, \
+                             symmetry {:.2}\n{}",
+                            if phrase.is_empty() { "default" } else { phrase }, f.len(), levels_out.len(),
+                            last.edges * 100.0, last.depth * 100.0, last.noise, last.symmetry, per_level.join("\n")))
                     }
                 };
                 let mut r = tools.apply_changes(&changes);

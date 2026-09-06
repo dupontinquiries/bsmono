@@ -294,6 +294,32 @@ impl Genome {
     }
 }
 
+impl crate::evolve::Genome for Genome {
+    fn mutate(&self, seed: u64) -> Self { Genome::mutate(self, seed) }
+    fn crossover(&self, other: &Self, seed: u64) -> Self { Genome::crossover(self, other, seed) }
+}
+
+/// Each named property's miss as its own objective, plus floating.
+/// Lower is better. The front then holds "closer on height, further on
+/// durability" and its opposite, and the pick is by the spec's own
+/// emphasis rather than one sum.
+pub fn objectives(spec: &Spec, p: &Props) -> Vec<f32> {
+    let miss = |v: f32, lo: f32, hi: f32| if v < lo { (lo - v) / lo.max(1.0) } else if v > hi { (v - hi) / hi.max(1.0) } else { 0.0 };
+    let mut o = Vec::new();
+    if let Some((a, b)) = spec.blocks { o.push(miss(p.blocks as f32, a as f32, b as f32)); }
+    if let Some((a, b)) = spec.height { o.push(miss(p.height as f32, a as f32, b as f32)); }
+    if let Some(l) = spec.durability { o.push((p.durability - l.target()).abs()); }
+    if let Some(s) = spec.sound {
+        let want = match s { Sound::Echoing => (0.85, 0.25), Sound::Muffled => (0.85, 0.08), Sound::Airy => (0.15, 0.4) };
+        o.push((p.enclosure - want.0).abs() + (p.openness - want.1).abs() * 0.5);
+    }
+    if let Some(l) = spec.shelter { o.push((p.shelter - l.target()).abs()); }
+    if let Some(s) = spec.symmetry { o.push((p.symmetry - s).abs()); }
+    if let Some(v) = spec.openness { o.push((p.openness - v).abs()); }
+    o.push(p.floating as f32 * 0.05);
+    o
+}
+
 /// Apply a genome to a cell set within a box, returning the changes
 /// (adds as `to = block`, removals as `to = 0`) and the new set.
 pub fn apply(g: &Genome, cells: &BTreeSet<(i32, i32, i32)>, bounds: ((i32, i32, i32), (i32, i32, i32)),
@@ -385,32 +411,18 @@ pub fn tune(cells: &BTreeSet<(i32, i32, i32)>, bounds: ((i32, i32, i32), (i32, i
     let d0 = distance(spec, &before);
     if d0 < 0.05 { return None; }
     let pop = pop.clamp(6, 48);
-    let mut population: Vec<Genome> = (0..pop).map(|i| Genome::random(hash(seed, 300, i as u64))).collect();
-    let eval = |g: &Genome| { let (ch, set) = apply(g, cells, bounds, block); let p = measure(&set, ground_y); (distance(spec, &p), p, ch) };
-    let mut best: Option<(f32, Genome, Props, Vec<Change>)> = None;
-    let mut used = 0;
-    for gen in 0..gens.max(1) {
-        used = gen + 1;
-        let mut scored: Vec<(f32, usize)> = population.iter().enumerate().map(|(i, g)| (eval(g).0, i)).collect();
-        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        let (top, ti) = scored[0];
-        if best.as_ref().map(|b| top < b.0).unwrap_or(true) {
-            let (d, p, ch) = eval(&population[ti]);
-            best = Some((d, population[ti].clone(), p, ch));
-        }
-        if top < 0.05 { break; }
-        let mut next = vec![population[ti].clone()];
-        let mut k = 0u64;
-        while next.len() < pop {
-            let pick = |k: u64| { let a = scored[(hash(seed, 400 + gen as u64, k) % pop as u64) as usize];
-                                  let b = scored[(hash(seed, 500 + gen as u64, k) % pop as u64) as usize];
-                                  if a.0 <= b.0 { a.1 } else { b.1 } };
-            let child = if k % 2 == 0 { population[pick(k)].crossover(&population[pick(k + 77)], hash(seed, 600 + gen as u64, k)) }
-                        else { population[pick(k)].mutate(hash(seed, 700 + gen as u64, k)) };
-            next.push(child); k += 1;
-        }
-        population = next;
-    }
+    // On the shared engine: Pareto-ranked over the spec's properties,
+    // budgeted by evaluations, the pick by uniform weights (every named
+    // property matters equally; the spec said which ones).
+    let eval = |g: &Genome| { let (_, set) = apply(g, cells, bounds, block); objectives(spec, &measure(&set, ground_y)) };
+    let out = crate::evolve::evolve(seed, crate::evolve::Budget::evals(pop * gens.max(1), pop), &[],
+                                    Genome::random, eval, &[]);
+    let used = out.generations;
+    let best = crate::evolve::pick(&out.front, &[])?;
+    let (changes, set) = apply(&best.genome, cells, bounds, block);
+    let after = measure(&set, ground_y);
+    let d1 = distance(spec, &after);
+    let best: Option<(f32, Genome, Props, Vec<Change>)> = Some((d1, best.genome.clone(), after, changes));
     let (d1, genome, after, changes) = best?;
     let t = Tuned { genome, changes, before, after, distance_before: d0, distance_after: d1, generations: used };
     if t.improved() { Some(t) } else { None }

@@ -314,7 +314,7 @@ OPS
   populate KIND A B [count=N] [name=X]           ask the engine for creatures or NPCs; KIND is
                                                  plain words, the engine picks from its roster
   weather A B [worn|abandoned|ancient|burnt]     age an EXISTING build: decay, moss, rubble
-  greeble A B [words...] [gens=N]                evolve surface detail for a region to match
+  greeble A B [words...] [gens=N] [levels=1-4]   evolve surface detail for a region to match
                                                  the words: industrial, gothic, clean, busy,
                                                  symmetric, rustic (A, B are x,y,z)
   detail KIND A B [block=B] [amount=0.3]         finishing pass over an existing build:

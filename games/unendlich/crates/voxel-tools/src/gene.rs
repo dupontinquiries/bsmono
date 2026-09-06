@@ -231,6 +231,11 @@ fn parse_act(s: &str) -> Result<Act, String> {
     })
 }
 
+impl crate::evolve::Genome for Genome {
+    fn mutate(&self, seed: u64) -> Self { Genome::mutate(self, seed) }
+    fn crossover(&self, other: &Self, seed: u64) -> Self { Genome::crossover(self, other, seed) }
+}
+
 /// A surface cell the walker visits, with what the conditions need.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Face {
@@ -321,6 +326,16 @@ pub struct Metrics {
     pub edges: f32,
     pub depth: f32,
     pub symmetry: f32,
+    /// How REGULAR the decoration is along a course: the best
+    /// autocorrelation of the decorated/undecorated pattern at lags 2-6.
+    /// Studs every third block score high; scatter scores low. Noise
+    /// says whether neighbours differ; rhythm says whether they differ
+    /// in a pattern.
+    pub rhythm: f32,
+    /// Fraction of decorated cells adjacent to an undecorated one: the
+    /// boundary between detail and plain surface. All-over detail has
+    /// no contrast; a moulding does.
+    pub contrast: f32,
 }
 
 /// Measure a result against the faces it was run on.
@@ -369,7 +384,37 @@ pub fn measure(faces: &[Face], changes: &[Change]) -> Metrics {
         if touched.get(&(mx, at.1, at.2)) == Some(b) { sym_ok += 1; }
     }
     let symmetry = if sym_n == 0 { 1.0 } else { sym_ok as f32 / sym_n as f32 };
-    Metrics { coverage, variety, noise, edges, depth, symmetry }
+    // rhythm: per course (same y), the decorated pattern along the
+    // walk; autocorrelation at lags 2..=6, best lag wins
+    let mut courses: std::collections::BTreeMap<i32, Vec<bool>> = std::collections::BTreeMap::new();
+    for f in faces { courses.entry(f.at.1).or_default().push(decorated(f)); }
+    let mut best_ac = 0.0f32; let mut any = false;
+    for (_, c) in &courses {
+        if c.len() < 8 || !c.iter().any(|d| *d) { continue; }
+        any = true;
+        for lag in 2..=6usize {
+            if c.len() <= lag { break; }
+            let m = c.iter().zip(c.iter().skip(lag)).filter(|(a, b)| a == b).count() as f32 / (c.len() - lag) as f32;
+            let on = c.iter().filter(|d| **d).count() as f32 / c.len() as f32;
+            // agreement beyond what a random pattern of the same density gives
+            let chance = on * on + (1.0 - on) * (1.0 - on);
+            let ac = ((m - chance) / (1.0 - chance).max(1e-3)).clamp(0.0, 1.0);
+            best_ac = best_ac.max(ac);
+        }
+    }
+    let rhythm = if any { best_ac } else { 0.0 };
+    let decorated_set: std::collections::BTreeSet<(i32, i32, i32)> = faces.iter().filter(|f| decorated(f)).map(|f| f.at).collect();
+    let (mut dec_n, mut boundary) = (0usize, 0usize);
+    for f in faces {
+        if !decorated_set.contains(&f.at) { continue; }
+        dec_n += 1;
+        let (tx, tz) = (f.normal.2, f.normal.0);
+        let nbrs = [(f.at.0 + tx, f.at.1, f.at.2 + tz), (f.at.0 - tx, f.at.1, f.at.2 - tz),
+                    (f.at.0, f.at.1 + 1, f.at.2), (f.at.0, f.at.1 - 1, f.at.2)];
+        if nbrs.iter().any(|n| face_set.contains_key(n) && !decorated_set.contains(n)) { boundary += 1; }
+    }
+    let contrast = if dec_n == 0 { 0.0 } else { boundary as f32 / dec_n as f32 };
+    Metrics { coverage, variety, noise, edges, depth, symmetry, rhythm, contrast }
 }
 
 /// What the player wants, as weights over the metrics.
@@ -417,6 +462,29 @@ impl Fitness {
         f
     }
 
+    /// The objectives for the shared engine, all "lower is better":
+    /// coverage miss against the cap, noise, edge miss, depth miss,
+    /// symmetry miss, rhythm miss, contrast miss. Kept separate so the
+    /// front holds the trade-offs -- a noisier-but-deeper wall and a
+    /// cleaner-but-flatter one both survive to be chosen between.
+    pub fn objectives(&self, m: &Metrics) -> Vec<f32> {
+        let want_cov = (self.max_coverage * 0.8).clamp(0.05, 0.95);
+        vec![
+            (m.coverage - want_cov).abs() + if m.coverage < 0.02 { 1.0 } else { 0.0 },
+            m.noise * self.noise.abs().max(0.1),
+            (1.0 - m.edges) * self.edges.max(0.0),
+            (1.0 - m.depth) * self.depth.max(0.0),
+            (1.0 - m.symmetry) * self.symmetry.max(0.0),
+            (1.0 - m.rhythm) * 0.5,
+            (0.6 - m.contrast).abs() * 0.5,
+        ]
+    }
+
+    /// Weights over `objectives`, from the same phrase.
+    pub fn weights(&self) -> Vec<f32> {
+        vec![self.coverage.abs().max(0.2), 1.0, 1.0, 1.0, 1.0, 0.6, 0.4]
+    }
+
     pub fn score(&self, m: &Metrics) -> f32 {
         let over = (m.coverage - self.max_coverage).max(0.0) * 3.0;
         self.coverage * m.coverage + self.variety * m.variety + self.noise * m.noise
@@ -434,6 +502,52 @@ pub struct Evolved {
     pub changes: Vec<Change>,
     /// Best score per generation, for the player to see it converge.
     pub history: Vec<f32>,
+}
+
+/// Evolve on the shared engine: Pareto-ranked, budgeted, seeded from
+/// an archive. Returns the front's best by the phrase's weights.
+pub fn evolve_ranked(faces: &[Face], fit: &Fitness, seed: u64, budget: crate::evolve::Budget,
+                     seeds: &[Genome]) -> (Evolved, crate::evolve::Outcome<Genome>) {
+    let eval = |g: &Genome| { let c = run(g, faces, seed); fit.objectives(&measure(faces, &c)) };
+    let out = crate::evolve::evolve(seed, budget, seeds, Genome::random, eval, &fit.weights());
+    let best = crate::evolve::pick(&out.front, &fit.weights()).expect("a front");
+    let changes = run(&best.genome, faces, seed);
+    let metrics = measure(faces, &changes);
+    let e = Evolved { genome: best.genome.clone(), score: fit.score(&metrics), metrics, changes,
+                      history: out.history.clone() };
+    (e, out)
+}
+
+/// LEVELS OF DETAIL. Evolve at three scales in turn -- coarse (edge
+/// emphasis, large rhythm), medium, fine (studs, relief) -- each
+/// level's winner applied before the next level re-reads the surface
+/// it made. Detail on detail: a cornice, then panels between the
+/// cornice's members, then rivets on the panels. One pass could not
+/// do this, because the fine features have nothing to sit on until
+/// the coarse ones exist.
+pub fn evolve_levels<W: crate::VoxelWorld>(w: &mut W, min: (i32, i32, i32), max: (i32, i32, i32),
+                                           fit: &Fitness, seed: u64, levels: usize,
+                                           budget_per_level: crate::evolve::Budget,
+                                           archive: &mut crate::evolve::Archive<Genome>,
+                                           key: &str) -> Vec<(usize, Evolved)> {
+    let mut out = Vec::new();
+    for level in 0..levels.max(1) {
+        let faces = faces(w, min, max);
+        if faces.is_empty() { break; }
+        // each level's fitness leans finer: less edge emphasis, more
+        // rhythm and contrast, a lower coverage cap
+        let mut f = *fit;
+        f.edges *= 1.0 - 0.35 * level as f32;
+        f.max_coverage *= 0.75f32.powi(level as i32);
+        f.depth *= 1.0 + 0.3 * level as f32;
+        let k = format!("{key}/L{level}");
+        let (e, res) = evolve_ranked(&faces, &f, seed.wrapping_add(level as u64 * 7919), budget_per_level,
+                                     &archive.seeds(&k));
+        archive.offer(&k, &res.front);
+        for ch in &e.changes { w.set(ch.at.0, ch.at.1, ch.at.2, ch.to); }
+        out.push((level, e));
+    }
+    out
 }
 
 /// Evolve a decorator for these faces. Deterministic from the seed.
@@ -645,5 +759,44 @@ mod tests {
         let studs = run(&Genome::parse("s0: any -> protrude 58, s0\n").unwrap(), &f, 1);
         let m = measure(&f, &studs);
         assert!(m.coverage > 0.99, "every face has a stud in front of it: {m:?}");
+    }
+
+    #[test]
+    fn rhythm_and_contrast_read_the_way_the_words_do() {
+        let w = hall();
+        let f = faces(&w, (0, 65, 0), (12, 73, 12));
+        let studs = run(&Genome::parse("s0: every3 -> put 58, s0\ns0: any -> skip, s0\n").unwrap(), &f, 1);
+        let m = measure(&f, &studs);
+        assert!(m.rhythm > 0.5, "every third is a rhythm: {m:?}");
+        assert!(m.contrast > 0.8, "each stud borders plain surface: {m:?}");
+        let all = run(&Genome::parse("s0: any -> put 58, s0\n").unwrap(), &f, 1);
+        let m2 = measure(&f, &all);
+        assert!(m2.contrast < 0.3, "all-over has no contrast: {m2:?}");
+    }
+
+    #[test]
+    fn the_ranked_evolution_returns_a_front_with_choices_on_it() {
+        let w = hall();
+        let f = faces(&w, (0, 65, 0), (12, 73, 12));
+        let fit = Fitness::from_phrase("gothic");
+        let (e, out) = evolve_ranked(&f, &fit, 5, crate::evolve::Budget::evals(300, 20), &[]);
+        assert!(e.metrics.coverage > 0.02);
+        assert!(out.front.len() >= 2, "a front, not one answer: {}", out.front.len());
+        let d = crate::evolve::diverse(&out.front, 3);
+        assert!(d.len() >= 2);
+    }
+
+    #[test]
+    fn levels_add_detail_on_detail_and_the_archive_fills() {
+        let mut w = hall();
+        let mut arch = crate::evolve::Archive::default();
+        let fit = Fitness::from_phrase("gothic");
+        let levels = evolve_levels(&mut w, (0, 65, 0), (12, 73, 12), &fit, 3, 3,
+                                   crate::evolve::Budget::evals(160, 16), &mut arch, "hall/gothic");
+        assert_eq!(levels.len(), 3);
+        let total: usize = levels.iter().map(|(_, e)| e.changes.len()).sum();
+        assert!(total > levels[0].1.changes.len(), "later levels added to the first: {total}");
+        assert!(arch.len() >= 3, "each level left elites: {}", arch.len());
+        assert!(!arch.seeds("hall/gothic/L2").is_empty());
     }
 }

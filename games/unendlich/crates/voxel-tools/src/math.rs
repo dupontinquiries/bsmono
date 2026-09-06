@@ -231,12 +231,12 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                              if *mature { "" } else { " (seedling)" }),
                      None);
             }
-            Op::Greeble { min, max, phrase, gens, genome, .. } => {
+            Op::Greeble { min, max, phrase, gens, genome, levels, .. } => {
                 let area = 2 * (span(min.0, max.0) + span(min.2, max.2)) as i64 * span(min.1, max.1) as i64;
                 push(Note::Info,
                      format!("greeble over about {area} faces: {}",
                              match genome { Some(_) => "a stated genome".to_string(),
-                                            None => format!("evolve '{phrase}' for {gens} generations") }),
+                                            None => format!("evolve '{phrase}' for {gens} generations, {levels} level(s)") }),
                      None);
             }
             Op::Spec(line) => {

@@ -103,6 +103,8 @@ pub mod feature;
 pub mod hive;
 /// A git tree over the world: content-addressed chunk edits, branches, merge, rebase.
 pub mod vcs;
+/// The shared genetic engine: Pareto ranking with crowding, budgets, an elite archive.
+pub mod evolve;
 /// Greebles by natural selection: a genome language for decorator FSMs, metrics, evolution.
 pub mod gene;
 /// Plant genetics: the engine's 13-gene genome, bred toward a phrase, placed at its phenotype.
@@ -222,6 +224,10 @@ pub fn palettes() -> BTreeMap<&'static str, Palette> {
 
 pub struct VoxelTools<'w, W: VoxelWorld> {
     pub world: &'w mut W,
+    /// Elite decorator genomes for the session, by phrase and level.
+    /// Set by the host from its session-long archive before a run and
+    /// taken back after; empty otherwise.
+    pub archive: crate::evolve::Archive<crate::gene::Genome>,
     pub edits: Vec<Edit>,
     /// Captured regions, referred to by handle so contents never
     /// enter the model's context.
@@ -232,7 +238,7 @@ pub struct VoxelTools<'w, W: VoxelWorld> {
 
 impl<'w, W: VoxelWorld> VoxelTools<'w, W> {
     pub fn new(world: &'w mut W) -> Self {
-        Self { world, edits: Vec::new(), clips: Vec::new(), next_id: 1, next_clip: 1 }
+        Self { world, archive: Default::default(), edits: Vec::new(), clips: Vec::new(), next_id: 1, next_clip: 1 }
     }
 
     fn begin(&mut self, tool: &str) -> Edit {
