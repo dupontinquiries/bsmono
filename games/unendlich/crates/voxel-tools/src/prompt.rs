@@ -101,8 +101,9 @@ cylinder @0,0 r=3 h=11 block=stone_bricks hollow
 roof @-3,-3 @3,3 hip block=dark_oak_planks
 
 A building needs a roof. Add one.
-Also: `form house A B`, `form village A B count=6`, `plant A oak tall`,
-`layer boreal A B density=0.6` (a forest), `mood eerie A B`.
+Also: `form house A B`, `form village A B count=6`, `form statue A B gargoyle`,
+`plant A oak tall`, `layer boreal A B density=0.6` (a forest), `mood eerie A B`.
+Words like creepy, ancient, ornate add their own finishing; just build the shape.
 
 Now reply with plan lines only.";
 
@@ -183,7 +184,9 @@ OPERATIONS
   layer PACKET A B density=0.6          a forest: temperate, alpine, boreal,
                                         jungle, desert, darkwood, meadow
   river A dir=DEG len=N                 the terrain decides the path
-  form NAME A B [style]                 a named form (list below)
+  form NAME A B [style]                 a named form (list below); statue takes
+                                        figure|gargoyle|idol|obelisk|colossus and
+                                        pose=standing|seated|arms_up|kneeling
   mood NAME A B                         eerie, haunted, cosy, fiery, frozen,
                                         ancient, sacred, lush
   populate KIND A B count=N [name=X]    creatures or NPCs for the engine
@@ -199,6 +202,8 @@ RULES
 - Use the site's palette unless the player names one.
 - Never emit `world ...` unless the player explicitly asked to change
   the climate or flood something; a build adapts to where it is.
+- Adjectives (creepy, ancient, ornate, cosy) add their own finishing
+  passes afterwards. Build the SHAPE; do not spend lines on mood.
 
 EXAMPLE
   player: a small stone watchtower

@@ -476,18 +476,45 @@ impl ChatSession {
         }
         // Dry run, but inspect the placed set BEFORE it is reversed:
         // the critique needs the blocks in the world to test support.
-        let first = tools.edits.len();
-        let live: PlanRun = run_plan(tools, &plan, self.from_y, self.chunk_size, false);
-        let placed: Vec<(i32, i32, i32)> = tools.edits[first..].iter()
-            .flat_map(|e| e.before.iter().map(|&(x, y, z, _)| (x, y, z))).collect();
-        let mut findings = critique::floating(tools.world, &placed);
-        if let Some(feet) = player_feet {
-            if let Some(f) = critique::entombs_player(&placed, feet) { findings.push(f); }
+        // Then reverse, exactly as a dry run would.
+        let (from_y, chunk_size) = (self.from_y, self.chunk_size);
+        let dry_run = |tools: &mut VoxelTools<W>, plan: &BuildPlan|
+            -> (PlanRun, Vec<(i32, i32, i32)>, Vec<critique::Finding>) {
+            let first = tools.edits.len();
+            let live: PlanRun = run_plan(tools, plan, from_y, chunk_size, false);
+            let placed: Vec<(i32, i32, i32)> = tools.edits[first..].iter()
+                .flat_map(|e| e.before.iter().map(|&(x, y, z, _)| (x, y, z))).collect();
+            let mut findings = critique::floating(tools.world, &placed);
+            if let Some(feet) = player_feet {
+                if let Some(f) = critique::entombs_player(&placed, feet) { findings.push(f); }
+            }
+            let ids: Vec<u64> = tools.edits[first..].iter().map(|e| e.id).collect();
+            for id in ids.into_iter().rev() { tools.undo_edit(id); }
+            (live, placed, findings)
+        };
+        let (mut dry, mut placed, mut findings) = dry_run(tools, &plan);
+
+        // FINISHING FROM THE WORDS. "Creepy" from the player and `form
+        // statue` from a 1B: the shape came from the model, the
+        // treatment comes from the adjective, over the box the first
+        // dry run just measured. Then a second dry run so the preview
+        // shows the finished thing and the critique judges it.
+        let mut finishing_why: Vec<String> = Vec::new();
+        if !placed.is_empty() {
+            let lo = placed.iter().fold((i32::MAX, i32::MAX, i32::MAX),
+                |a, p| (a.0.min(p.0), a.1.min(p.1), a.2.min(p.2)));
+            let hi = placed.iter().fold((i32::MIN, i32::MIN, i32::MIN),
+                |a, p| (a.0.max(p.0), a.1.max(p.1), a.2.max(p.2)));
+            let (fin_ir, why) = crate::finish::from_prose(prose, &plan.ops, Some((lo, hi)));
+            if !fin_ir.is_empty() {
+                let (fin_plan, _) = parse_plan_at(&fin_ir, Some(f.anchor));
+                plan.ops.extend(fin_plan.ops);
+                finishing_why = why;
+                let again = dry_run(tools, &plan);
+                dry = again.0; placed = again.1; findings = again.2;
+            }
         }
-        // now reverse, exactly as a dry run would
-        let ids: Vec<u64> = tools.edits[first..].iter().map(|e| e.id).collect();
-        for id in ids.into_iter().rev() { tools.undo_edit(id); }
-        let dry = live;
+        let _ = &placed;
         let mut echo = explain_plan(&plan, self.budget);
         if !findings.is_empty() {
             echo.push_str(&format!("\nCHECK  {}\n", critique::summarise(&findings)));
@@ -513,6 +540,9 @@ impl ChatSession {
         }
         for w in &dry.withdrawn {
             echo.push_str(&format!("\nWITHDRAWN: {}", w.message()));
+        }
+        for w in &finishing_why {
+            echo.push_str(&format!("\nFINISHING ({w})"));
         }
         if let Some(a) = plan.anchor {
             echo.push_str(&format!(
@@ -1190,5 +1220,29 @@ mod tests {
         let d = { let t = VoxelTools::new(&mut w); s.context(&t, &g, Some("grass")) };
         assert_ne!(c, d);
         assert!(d.contains("freezing"));
+    }
+
+    #[test]
+    fn creepy_finishes_a_plain_statue_from_the_adjective() {
+        // The 1B said `form statue`; the player said "creepy". Neither
+        // alone gives a creepy statue.
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        let plain = match s.receive_plan_gated(&mut t, &g, "form statue @0,0 @6,6 gargoyle\n", None,
+                                               "a stone statue") {
+            Reply::Preview { echo, blocks, .. } => { assert!(!echo.contains("FINISHING"), "{echo}"); blocks }
+            o => panic!("{o:?}"),
+        };
+        match s.receive_plan_gated(&mut t, &g, "form statue @0,0 @6,6 gargoyle\n", None,
+                                   "a creepy stone statue") {
+            Reply::Preview { echo, blocks, .. } => {
+                assert!(echo.contains("FINISHING (creepy"), "{echo}");
+                assert!(echo.contains("mood eerie") || echo.contains("mood 'eerie'") || echo.contains("eerie"), "{echo}");
+                assert_ne!(blocks, plain, "the finishing changed the result");
+            }
+            o => panic!("{o:?}"),
+        }
     }
 }

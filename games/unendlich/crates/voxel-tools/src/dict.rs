@@ -69,6 +69,9 @@ pub const FORMS: &[Form] = &[
            build: nest },
     Form { name: "cavern", summary: "a carved underground chamber with pillars and an entrance shaft",
            build: cavern },
+    Form { name: "statue", summary: "a figure on a plinth: figure|gargoyle|idol|obelisk|colossus, \
+                                     pose=standing|seated|arms_up|kneeling",
+           build: statue },
 ];
 
 pub fn lookup(name: &str) -> Option<&'static Form> {
@@ -285,6 +288,139 @@ fn village(a: &FormArgs) -> Solid {
                                           mat: Material::accent(a.accent) }),
         thickness: 1.0,
     });
+    Solid::Union(parts)
+}
+
+/// A figure on a plinth.
+///
+/// A 1B asked for "a creepy stone statue" made a cylinder with a ball
+/// on top, because a statue is not a primitive and it had none to
+/// reach for. This is the primitive: a body with proportions, a pose,
+/// and a style, all from solids, so it can be intersected, mirrored and
+/// greebled like anything else. "Creepy" is not the statue's job -- the
+/// finishing passes do that from the adjective.
+///
+/// Proportions follow the eight-head figure with a blocky exaggeration:
+/// the head is a sphere the width of the shoulders' third, the torso
+/// tapers, limbs are cylinders. Styles change the silhouette --
+/// `gargoyle` adds wings, horns and a crouch; `idol` is a squat totem
+/// with a huge head; `obelisk` is a tapered shaft with a carved face;
+/// `colossus` is the figure at three times the scale on a stepped
+/// base.
+fn statue(a: &FormArgs) -> Solid {
+    let (lo, hi) = (a.lo(), a.hi());
+    let cx = (lo[0] + hi[0]) / 2.0;
+    let cz = (lo[2] + hi[2]) / 2.0;
+    let style = a.style.as_str();
+    let pose = a.nums.iter().find(|(k, _)| k == "pose").map(|(_, v)| *v).unwrap_or(0);
+    // Height from h= or the footprint: a figure is ~2.4x its footprint.
+    let base_w = ((hi[0] - lo[0]).min(hi[2] - lo[2])).max(4.0);
+    let scale = if style == "colossus" { 3.0 } else { 1.0 };
+    let h = a.num("h", (base_w * 2.4 * scale) as i32).max(6) as f32;
+    let stone = Material::structural(a.block);
+    let dark = Material::accent(a.accent);
+    let mut parts: Vec<Solid> = Vec::new();
+
+    // Plinth: a stepped base, one step per 8 blocks of height.
+    let steps = (h / 8.0).ceil().max(1.0) as i32;
+    let mut py = lo[1];
+    for s in 0..steps {
+        let inset = s as f32 * 0.8;
+        parts.push(Solid::Box { min: [lo[0] + inset, py, lo[2] + inset],
+                                max: [hi[0] - inset, py + 1.0, hi[2] - inset], mat: dark.clone() });
+        py += 1.0;
+    }
+    let ground = py;
+
+    if style == "obelisk" {
+        // A tapered shaft: intersect a box with two crossed wedges
+        // upside down (widest at the base), then a carved face.
+        let half = base_w * 0.35;
+        let shaft = Solid::Box { min: [cx - half, ground, cz - half], max: [cx + half, ground + h, cz + half],
+                                 mat: stone.clone() };
+        let taper_x = Solid::Wedge { min: [cx - half - h * 0.02, ground, cz - half],
+                                     max: [cx + half + h * 0.02, 0.0, cz + half],
+                                     h: h * 1.4, axis: Axis::Z, mat: stone.clone() };
+        let taper_z = Solid::Wedge { min: [cx - half, ground, cz - half - h * 0.02],
+                                     max: [cx + half, 0.0, cz + half + h * 0.02],
+                                     h: h * 1.4, axis: Axis::X, mat: stone.clone() };
+        let tapered = Solid::Intersect(Box::new(shaft),
+                                       Box::new(Solid::Intersect(Box::new(taper_x), Box::new(taper_z))));
+        parts.push(tapered);
+        // eyes and a mouth carved into the south face
+        let fy = ground + h * 0.75;
+        for ex in [cx - 1.0, cx + 1.0] {
+            parts.push(Solid::Box { min: [ex - 0.5, fy, cz + half - 1.0], max: [ex + 0.5, fy + 1.0, cz + half + 0.5],
+                                    mat: Material::carved() });
+        }
+        parts.push(Solid::Box { min: [cx - 1.5, fy - 2.0, cz + half - 1.0], max: [cx + 1.5, fy - 1.0, cz + half + 0.5],
+                                mat: Material::carved() });
+        return Solid::Union(parts);
+    }
+
+    // The figure. Units: head_r is the module.
+    let head_r = (h / 8.0 * if style == "idol" { 2.0 } else { 1.0 }).max(1.0);
+    let shoulder_w = head_r * 3.0;
+    let torso_h = h * if style == "idol" { 0.3 } else { 0.35 };
+    let leg_h = h * if style == "idol" { 0.15 } else { 0.4 };
+    let crouch = style == "gargoyle" || pose == 3;
+    let seated = pose == 1;
+    let leg_h = if crouch || seated { leg_h * 0.5 } else { leg_h };
+    let hip_y = ground + leg_h;
+    let neck_y = hip_y + torso_h;
+
+    // legs: two cylinders, or a solid block for seated/kneeling
+    let leg_r = (shoulder_w * 0.22).max(0.9);
+    if seated {
+        parts.push(Solid::Box { min: [cx - shoulder_w * 0.5, ground, cz - shoulder_w * 0.7],
+                                max: [cx + shoulder_w * 0.5, hip_y, cz + shoulder_w * 0.3], mat: stone.clone() });
+    } else {
+        for side in [-1.0, 1.0] {
+            parts.push(Solid::Cylinder { base: [cx + side * shoulder_w * 0.28, ground, cz], r: leg_r, h: leg_h,
+                                         mat: stone.clone() });
+        }
+    }
+    // torso: tapers from shoulders to hips
+    parts.push(Solid::Intersect(
+        Box::new(Solid::Box { min: [cx - shoulder_w * 0.5, hip_y, cz - shoulder_w * 0.28],
+                              max: [cx + shoulder_w * 0.5, neck_y, cz + shoulder_w * 0.28], mat: stone.clone() }),
+        Box::new(Solid::Wedge { min: [cx - shoulder_w * 0.5, hip_y - torso_h, cz - shoulder_w],
+                                max: [cx + shoulder_w * 0.5, 0.0, cz + shoulder_w],
+                                h: torso_h * 2.6, axis: Axis::Z, mat: stone.clone() })));
+    // arms: raised, out, or down
+    let arm_r = (shoulder_w * 0.16).max(0.8);
+    let arm_len = torso_h * 0.9;
+    for side in [-1.0, 1.0] {
+        let sx = cx + side * (shoulder_w * 0.5 + arm_r * 0.5);
+        match pose {
+            2 => parts.push(Solid::Cylinder { base: [sx, neck_y - arm_r, cz], r: arm_r, h: arm_len,
+                                              mat: stone.clone() }),          // arms up
+            _ => parts.push(Solid::Cylinder { base: [sx, neck_y - arm_len, cz], r: arm_r, h: arm_len,
+                                              mat: stone.clone() }),          // arms down
+        }
+    }
+    // head
+    let head_y = neck_y + head_r * 0.8;
+    parts.push(Solid::Sphere { centre: [cx, head_y, cz], r: head_r, mat: stone.clone() });
+    // eyes: two carved sockets on the south face, which is what makes a
+    // head a face and a figure a presence
+    for ex in [cx - head_r * 0.4, cx + head_r * 0.4] {
+        parts.push(Solid::Box { min: [ex - 0.5, head_y, cz + head_r * 0.6], max: [ex + 0.5, head_y + 1.0, cz + head_r + 0.5],
+                                mat: Material::carved() });
+    }
+    if style == "gargoyle" {
+        // horns and wings
+        for side in [-1.0, 1.0] {
+            parts.push(Solid::Cylinder { base: [cx + side * head_r * 0.6, head_y + head_r * 0.6, cz],
+                                         r: 0.6, h: head_r * 1.2, mat: dark.clone() });
+            let wx = cx + side * (shoulder_w * 0.5);
+            let wing = Solid::Wedge {
+                min: [wx.min(wx + side * shoulder_w * 1.5), hip_y + torso_h * 0.3, cz - 1.0],
+                max: [wx.max(wx + side * shoulder_w * 1.5), 0.0, cz + 1.0],
+                h: torso_h * 1.4, axis: Axis::Z, mat: dark.clone() };
+            parts.push(wing);
+        }
+    }
     Solid::Union(parts)
 }
 
@@ -551,5 +687,66 @@ mod tests {
         assert!(!solid.is_empty(), "pillars stand");
         // pillars survive the carve: they are declared with a higher rank
         assert!(solid.iter().any(|(_, y, _)| *y < 60), "a pillar in the chamber");
+    }
+
+    #[test]
+    fn a_statue_has_a_head_a_body_and_stands_on_a_plinth() {
+        let a = FormArgs { min: (0, 64, 0), max: (6, 64, 6), style: "figure".into(),
+                           block: 1, accent: 58, nums: vec![("h".into(), 16)] };
+        let cells = rasterize(&statue(&a));
+        let solid: Vec<_> = cells.iter().filter(|(_, b)| **b != 0).map(|(k, _)| *k).collect();
+        let top = solid.iter().map(|c| c.1).max().unwrap();
+        assert!(top >= 64 + 14, "about as tall as asked: {top}");
+        // narrow at the neck, wide at the shoulders, wide at the plinth
+        let width_at = |y: i32| { let xs: Vec<i32> = solid.iter().filter(|c| c.1 == y).map(|c| c.0).collect();
+            if xs.is_empty() { 0 } else { xs.iter().max().unwrap() - xs.iter().min().unwrap() + 1 } };
+        assert!(width_at(64) >= 6, "plinth spans the footprint");
+        // two legs, not one block: a gap between them at leg height
+        let leg_y = 66;
+        assert!(!solid.contains(&(3, leg_y, 3)), "air between the legs at the centre");
+        assert!(solid.iter().any(|c| c.1 == leg_y && c.0 <= 2), "a left leg");
+        assert!(solid.iter().any(|c| c.1 == leg_y && c.0 >= 4), "a right leg");
+        // eyes carved: some air inside the head's front
+        assert!(cells.values().any(|b| *b == 0), "carved sockets");
+    }
+
+    #[test]
+    fn styles_change_the_silhouette() {
+        let mk = |style: &str| {
+            let a = FormArgs { min: (0, 64, 0), max: (6, 64, 6), style: style.into(),
+                               block: 1, accent: 58, nums: vec![("h".into(), 16)] };
+            rasterize(&statue(&a)).into_iter().filter(|(_, b)| *b != 0).map(|(k, _)| k).collect::<Vec<_>>()
+        };
+        let figure = mk("figure");
+        let gargoyle = mk("gargoyle");
+        let obelisk = mk("obelisk");
+        let idol = mk("idol");
+        let span = |v: &Vec<(i32, i32, i32)>| v.iter().map(|c| c.0).max().unwrap() - v.iter().map(|c| c.0).min().unwrap();
+        assert!(span(&gargoyle) > span(&figure) + 4, "wings: {} vs {}", span(&gargoyle), span(&figure));
+        // an obelisk TAPERS: wider at the base than near the top
+        let ow = |y: i32| { let xs: Vec<i32> = obelisk.iter().filter(|c| c.1 == y).map(|c| c.0).collect();
+            if xs.is_empty() { 0 } else { xs.iter().max().unwrap() - xs.iter().min().unwrap() + 1 } };
+        assert!(ow(67) > ow(76), "tapered: {} at the base, {} near the top", ow(67), ow(76));
+        assert!(span(&obelisk) <= span(&figure), "no shoulders on a shaft");
+        let head_rows = |v: &Vec<(i32, i32, i32)>| v.iter().filter(|c| c.1 >= 64 + 12).count();
+        assert!(head_rows(&idol) > head_rows(&figure), "an idol is mostly head");
+    }
+
+    #[test]
+    fn every_statue_variant_is_valid_and_placed() {
+        for style in ["figure", "gargoyle", "idol", "obelisk", "colossus"] {
+            for pose in 0..4 {
+                let a = FormArgs { min: (0, 64, 0), max: (7, 64, 7), style: style.into(),
+                                   block: 1, accent: 58, nums: vec![("pose".into(), pose)] };
+                let s = statue(&a);
+                let cells = rasterize(&s);
+                assert!(cells.values().filter(|b| **b != 0).count() > 30, "{style} pose {pose}");
+                let (lo, hi) = s.bounds().unwrap();
+                for (x, y, z) in cells.keys() {
+                    assert!(*x >= lo[0] && *x <= hi[0] && *y >= lo[1] && *y <= hi[1] && *z >= lo[2] && *z <= hi[2],
+                            "{style}: cell outside bounds");
+                }
+            }
+        }
     }
 }

@@ -107,6 +107,8 @@ pub mod vcs;
 pub mod gene;
 /// Plant genetics: the engine's 13-gene genome, bred toward a phrase, placed at its phenotype.
 pub mod flora;
+/// Finishing from the words: adjectives add their own passes over the plan's box.
+pub mod finish;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.

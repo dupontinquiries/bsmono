@@ -607,7 +607,16 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                 if let Some(n) = note { assumed!(&n); }
                 let nums: Vec<(String, i32)> = t.iter().skip(2)
                     .filter_map(|s| s.split_once('='))
-                    .filter_map(|(k, v)| v.parse().ok().map(|n| (k.to_string(), n)))
+                    .filter_map(|(k, v)| {
+                        // pose words for statues: a number the recipe reads
+                        let n: Option<i32> = match (k, v) {
+                            ("pose", "standing") => Some(0), ("pose", "seated") => Some(1),
+                            ("pose", "arms_up") | ("pose", "raised") => Some(2),
+                            ("pose", "kneeling") | ("pose", "crouched") => Some(3),
+                            _ => v.parse().ok(),
+                        };
+                        n.map(|n| (k.to_string(), n))
+                    })
                     .collect();
                 ops.push(Op::Form {
                     name, min: a, max: b,
