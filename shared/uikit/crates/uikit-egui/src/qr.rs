@@ -189,16 +189,61 @@ pub const CARD_PAD: f32 = 8.0;
 /// Card corner radius (the C++ `border-radius: 12px`).
 pub const CARD_RADIUS: u8 = 12;
 
+// ── the reveal ─────────────────────────────────────────────────────────────────────────
+//
+// The code does not appear, it DRAWS: the three eyes first, then every pill and dot fades
+// and grows in on its own offset, so the whole thing resolves over about a second the way
+// an SVG with staggered `<animate begin>`s would (and `svg()` below writes exactly that).
+// Offsets are deterministic from the element's place, so the same code always draws the
+// same way — a small signature, like the code itself.
+
+/// How long one element takes to come in.
+pub const REVEAL_ELEMENT_S: f64 = 0.42;
+/// The spread of offsets across the elements: the last one starts this late.
+pub const REVEAL_SPREAD_S: f64 = 0.70;
+/// The eyes lead by this much before the first data element starts.
+pub const REVEAL_LEAD_S: f64 = 0.12;
+/// The whole reveal, first eye to last dot.
+pub const REVEAL_TOTAL_S: f64 = REVEAL_LEAD_S + REVEAL_SPREAD_S + REVEAL_ELEMENT_S;
+
+/// The offset of a data element at (`x`,`y`) — a hash of its place, spread over the window.
+/// Elements near the eyes come early and the far corner late, with jitter, so the reveal
+/// has a direction without being a wipe.
+pub fn reveal_delay(x: usize, y: usize) -> f64 {
+    let h = ((x as f32 * 12.9898 + y as f32 * 78.233).sin() * 43758.547).fract().abs() as f64;
+    let dist = ((x * x + y * y) as f64).sqrt() / ((MODULES * MODULES * 2) as f64).sqrt();
+    REVEAL_LEAD_S + REVEAL_SPREAD_S * (0.55 * dist + 0.45 * h).min(1.0)
+}
+
+/// The offset of eye `i` (0..3): they lead.
+pub fn eye_delay(i: usize) -> f64 {
+    i as f64 * 0.06
+}
+
+/// 0..1 progress of an element that started at `delay` after the reveal began `t` ago,
+/// eased out (fast in, gentle settle).
+pub fn reveal_progress(t: f64, delay: f64) -> f32 {
+    let u = ((t - delay) / REVEAL_ELEMENT_S).clamp(0.0, 1.0) as f32;
+    1.0 - (1.0 - u) * (1.0 - u) * (1.0 - u)
+}
+
 /// Draw the code for `layout` at `side` points on a glass card. Returns the response of
 /// the whole card (`Sense::click`, so the caller can open the expanded view on a tap).
-pub fn qr_ui(ui: &mut Ui, layout: &Layout, side: f32, c: &PaletteColors) -> egui::Response {
+/// `revealed_at` is when the code came on screen; while the reveal runs the elements draw
+/// in and a repaint is requested. `None` draws it complete.
+pub fn qr_ui(ui: &mut Ui, layout: &Layout, side: f32, c: &PaletteColors, revealed_at: Option<f64>) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), Sense::click());
-    paint(ui.painter(), rect, layout, ui.ctx().pixels_per_point(), c);
+    let t = revealed_at.map(|t0| ui.input(|i| i.time) - t0);
+    if matches!(t, Some(t) if t < REVEAL_TOTAL_S) {
+        ui.ctx().request_repaint();
+    }
+    paint(ui.painter(), rect, layout, ui.ctx().pixels_per_point(), c, t);
     resp
 }
 
-/// The painter half of [`qr_ui`], for callers that place the rect themselves.
-pub fn paint(painter: &egui::Painter, rect: Rect, layout: &Layout, pixels_per_point: f32, c: &PaletteColors) {
+/// The painter half of [`qr_ui`], for callers that place the rect themselves. `reveal_t` is
+/// seconds since the reveal began, or `None` for the finished code.
+pub fn paint(painter: &egui::Painter, rect: Rect, layout: &Layout, pixels_per_point: f32, c: &PaletteColors, reveal_t: Option<f64>) {
     let (bg, fg) = theme_colors(c);
     // the card: the rest of the chrome's glass, with the hairline along the top
     painter.rect_filled(rect, CornerRadius::same(CARD_RADIUS), bg);
@@ -218,16 +263,30 @@ pub fn paint(painter: &egui::Painter, rect: Rect, layout: &Layout, pixels_per_po
     let origin = inner.min + egui::vec2((inner.width() - used) * 0.5, (inner.height() - used) * 0.5);
     let at = |x: usize, y: usize| origin + egui::vec2(x as f32 * cell, y as f32 * cell);
 
-    // finder eyes: rounded outer ring, the light ring, a rounded core
-    for (ox, oy) in [(0usize, 0usize), (MODULES - 7, 0), (0, MODULES - 7)] {
-        let outer = Rect::from_min_size(at(ox, oy), egui::vec2(7.0 * cell, 7.0 * cell));
-        painter.rect_filled(outer, CornerRadius::same((cell * 1.6) as u8), fg);
-        let light = Rect::from_min_size(at(ox + 1, oy + 1), egui::vec2(5.0 * cell, 5.0 * cell));
-        painter.rect_filled(light, CornerRadius::same((cell * 1.0) as u8), bg);
-        let core = Rect::from_min_size(at(ox + 2, oy + 2), egui::vec2(3.0 * cell, 3.0 * cell));
-        painter.rect_filled(core, CornerRadius::same((cell * 0.8) as u8), fg);
+    let progress = |delay: f64| match reveal_t {
+        Some(t) => reveal_progress(t, delay),
+        None => 1.0,
+    };
+    let faded = |col: Color32, p: f32| {
+        let [r, g, b, a] = col.to_srgba_unmultiplied();
+        Color32::from_rgba_unmultiplied(r, g, b, (a as f32 * p) as u8)
+    };
+    // finder eyes: rounded outer ring, the light ring, a rounded core — each eye scales in
+    // from its centre as it fades, so it settles rather than pops
+    for (i, (ox, oy)) in [(0usize, 0usize), (MODULES - 7, 0), (0, MODULES - 7)].into_iter().enumerate() {
+        let p = progress(eye_delay(i));
+        if p <= 0.0 {
+            continue;
+        }
+        let k = 0.7 + 0.3 * p;
+        let centre = at(ox, oy) + egui::vec2(3.5 * cell, 3.5 * cell);
+        let sq = |size: f32| Rect::from_center_size(centre, egui::vec2(size * cell * k, size * cell * k));
+        painter.rect_filled(sq(7.0), CornerRadius::same((cell * 1.6 * k) as u8), faded(fg, p));
+        painter.rect_filled(sq(5.0), CornerRadius::same((cell * 1.0 * k) as u8), faded(bg, p));
+        painter.rect_filled(sq(3.0), CornerRadius::same((cell * 0.8 * k) as u8), faded(fg, p));
     }
-    // data + timing modules: dots, with horizontal runs joined into pills
+    // data + timing modules: dots, with horizontal runs joined into pills. A pill grows from
+    // its left end as it fades in — the "line drawing itself" of the SVG version.
     let r = cell * 0.44;
     for y in 0..MODULES {
         let mut x = 0;
@@ -240,17 +299,79 @@ pub fn paint(painter: &egui::Painter, rect: Rect, layout: &Layout, pixels_per_po
             while x + 1 < MODULES && layout.get(x + 1, y) && !in_finder(x + 1, y) {
                 x += 1;
             }
-            let a = at(start, y) + egui::vec2(cell * 0.5, cell * 0.5);
-            let b = at(x, y) + egui::vec2(cell * 0.5, cell * 0.5);
-            if start == x {
-                painter.circle_filled(a, r, fg);
-            } else {
-                let pill = Rect::from_two_pos(a - egui::vec2(r, r), b + egui::vec2(r, r));
-                painter.rect_filled(pill, CornerRadius::same(r as u8), fg);
+            let p = progress(reveal_delay(start, y));
+            if p > 0.0 {
+                let col = faded(fg, p);
+                let a = at(start, y) + egui::vec2(cell * 0.5, cell * 0.5);
+                let b_full = at(x, y) + egui::vec2(cell * 0.5, cell * 0.5);
+                let b = a + (b_full - a) * p;
+                if start == x {
+                    painter.circle_filled(a, r * (0.6 + 0.4 * p), col);
+                } else {
+                    let pill = Rect::from_two_pos(a - egui::vec2(r, r), b + egui::vec2(r, r));
+                    painter.rect_filled(pill, CornerRadius::same(r as u8), col);
+                }
             }
             x += 1;
         }
     }
+}
+
+// ── the SVG ────────────────────────────────────────────────────────────────────────────
+
+/// The code as an SVG with the same eyes and pills, and the same reveal as SMIL: every
+/// element has its own `<animate>` on opacity with the offset `reveal_delay` gives it, and
+/// pills grow from their left end. Opens in a browser drawing itself; dependency-free; for
+/// sharing or saving a code. `side` is the viewBox in user units; colours as `#rrggbb`.
+pub fn svg(layout: &Layout, side: f32, fg: Color32, bg: Color32) -> String {
+    let hex = |c: Color32| {
+        let [r, g, b, _] = c.to_srgba_unmultiplied();
+        format!("#{r:02x}{g:02x}{b:02x}")
+    };
+    let (fg_s, bg_s) = (hex(fg), hex(bg));
+    let inner = side - 2.0 * CARD_PAD;
+    let cell = (inner / (MODULES as f32 + 1.0)).max(1.0);
+    let used = cell * MODULES as f32;
+    let o = CARD_PAD + (inner - used) * 0.5;
+    let at = |x: usize, y: usize| (o + x as f32 * cell, o + y as f32 * cell);
+    let dur = REVEAL_ELEMENT_S;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {side} {side}\" width=\"{side}\" height=\"{side}\">\n<rect width=\"{side}\" height=\"{side}\" rx=\"{CARD_RADIUS}\" fill=\"{bg_s}\"/>\n"
+    ));
+    for (i, (ox, oy)) in [(0usize, 0usize), (MODULES - 7, 0), (0, MODULES - 7)].into_iter().enumerate() {
+        let d = eye_delay(i);
+        let (x, y) = at(ox, oy);
+        out.push_str(&format!("<g opacity=\"0\"><animate attributeName=\"opacity\" from=\"0\" to=\"1\" begin=\"{d:.3}s\" dur=\"{dur:.2}s\" fill=\"freeze\"/>\n"));
+        out.push_str(&format!("<rect x=\"{x:.2}\" y=\"{y:.2}\" width=\"{:.2}\" height=\"{:.2}\" rx=\"{:.2}\" fill=\"{fg_s}\"/>\n", 7.0 * cell, 7.0 * cell, 1.6 * cell));
+        out.push_str(&format!("<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" rx=\"{:.2}\" fill=\"{bg_s}\"/>\n", x + cell, y + cell, 5.0 * cell, 5.0 * cell, 1.0 * cell));
+        out.push_str(&format!("<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" rx=\"{:.2}\" fill=\"{fg_s}\"/>\n</g>\n", x + 2.0 * cell, y + 2.0 * cell, 3.0 * cell, 3.0 * cell, 0.8 * cell));
+    }
+    let r = cell * 0.44;
+    for y in 0..MODULES {
+        let mut x = 0;
+        while x < MODULES {
+            if in_finder(x, y) || !layout.get(x, y) {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            while x + 1 < MODULES && layout.get(x + 1, y) && !in_finder(x + 1, y) {
+                x += 1;
+            }
+            let d = reveal_delay(start, y);
+            let (ax, ay) = at(start, y);
+            let (cx, cy) = (ax + cell * 0.5, ay + cell * 0.5);
+            let w_full = (x - start) as f32 * cell + 2.0 * r;
+            out.push_str(&format!(
+                "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" rx=\"{r:.2}\" fill=\"{fg_s}\" opacity=\"0\"><animate attributeName=\"opacity\" from=\"0\" to=\"1\" begin=\"{d:.3}s\" dur=\"{dur:.2}s\" fill=\"freeze\"/><animate attributeName=\"width\" from=\"{:.2}\" to=\"{w_full:.2}\" begin=\"{d:.3}s\" dur=\"{dur:.2}s\" fill=\"freeze\"/></rect>\n",
+                cx - r, cy - r, w_full, 2.0 * r, 2.0 * r
+            ));
+            x += 1;
+        }
+    }
+    out.push_str("</svg>\n");
+    out
 }
 
 /// Inside one of the three 7×7 finder eyes (drawn as shapes, not as modules).
@@ -297,11 +418,25 @@ impl Expanded {
     }
 }
 
-/// Draw the expanded overlay. `state` is `Some` while open; it is set to `None` — and
-/// `true` returned — on the frame it closes (a tap on the scrim after the guard, Escape,
-/// or Close).
+/// What the expanded overlay asked for this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExpandedEvent {
+    /// Closed this frame (a tap on the scrim after the guard, Escape, or Close).
+    pub closed: bool,
+    /// "Save SVG" pressed: the caller writes [`svg`] of this code somewhere shareable.
+    pub save_svg: bool,
+}
+
+/// Draw the expanded overlay. `state` is `Some` while open; it is set to `None` on the
+/// frame it closes. Returns whether it closed — see [`expanded_ui_with`] for the SVG button.
 pub fn expanded_ui(ctx: &egui::Context, state: &mut Option<Expanded>, id: &str, layout: &Layout, c: &PaletteColors) -> bool {
-    let Some(ex) = *state else { return false };
+    expanded_ui_with(ctx, state, id, layout, c).closed
+}
+
+/// [`expanded_ui`], reporting the Save SVG press as well.
+pub fn expanded_ui_with(ctx: &egui::Context, state: &mut Option<Expanded>, id: &str, layout: &Layout, c: &PaletteColors) -> ExpandedEvent {
+    let mut ev = ExpandedEvent::default();
+    let Some(ex) = *state else { return ev };
     let now = ctx.input(|i| i.time);
     let a = ex.alpha(now);
     if a < 1.0 {
@@ -327,7 +462,7 @@ pub fn expanded_ui(ctx: &egui::Context, state: &mut Option<Expanded>, id: &str, 
             egui::vec2(side, side),
         );
         let mut card = ui.new_child(egui::UiBuilder::new().max_rect(code_rect).sense(Sense::click()));
-        let _code = qr_ui(&mut card, layout, side, c);
+        let _code = qr_ui(&mut card, layout, side, c, Some(ex.opened_at));
         // fade: paint the base over the top at 1-a, so the whole thing comes up together
         if a < 1.0 {
             ui.painter().rect_filled(window, 0.0, Color32::from_rgba_unmultiplied(c.bg_base.r(), c.bg_base.g(), c.bg_base.b(), (255.0 * (1.0 - a)) as u8));
@@ -338,20 +473,25 @@ pub fn expanded_ui(ctx: &egui::Context, state: &mut Option<Expanded>, id: &str, 
         y += 40.0;
         ui.painter().text(Pos2::new(window.center().x, y), egui::Align2::CENTER_TOP, "Tap outside the code or press Close", egui::FontId::proportional(13.0), c.text_weak);
         y += 30.0;
-        let btn_rect = Rect::from_center_size(Pos2::new(window.center().x, (y + CLOSE_HEIGHT * 0.5).min(window.bottom() - margin - CLOSE_HEIGHT * 0.5)), egui::vec2(180.0, CLOSE_HEIGHT));
-        let mut brow = ui.new_child(egui::UiBuilder::new().max_rect(btn_rect));
-        // the C++ button: 48 high, `padding: 12px 24px` — a wide glass key, not a label-sized one
-        let close_resp = brow.add(
-            egui::Button::new("\u{2715}  Close")
+        // two glass keys side by side, 48 high (the C++ `padding: 12px 24px`): Save SVG, Close
+        let row_y = (y + CLOSE_HEIGHT * 0.5).min(window.bottom() - margin - CLOSE_HEIGHT * 0.5);
+        let btn_rect = Rect::from_center_size(Pos2::new(window.center().x, row_y), egui::vec2(300.0, CLOSE_HEIGHT));
+        let mut brow = ui.new_child(egui::UiBuilder::new().max_rect(btn_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        let key = |label: &str| {
+            egui::Button::new(label)
                 .fill(crate::glass::key_fill(c.bg_card))
                 .stroke(crate::glass::key_border(c.border))
                 .corner_radius(CornerRadius::same(CARD_RADIUS))
-                .min_size(btn_rect.size()),
-        );
-        if close_resp.clicked() {
+                .min_size(egui::vec2(140.0, CLOSE_HEIGHT))
+        };
+        if brow.add(key("Save SVG")).on_hover_text("the code as an SVG that draws itself in").clicked() {
+            ev.save_svg = true;
+        }
+        brow.add_space(12.0);
+        if brow.add(key("\u{2715}  Close")).clicked() {
             close = true;
         }
-        // a tap on the scrim, after the guard, and not on the code or the button
+        // a tap on the scrim, after the guard, and not on the code or the buttons
         if scrim.clicked() && ex.can_close(now) {
             if let Some(p) = scrim.interact_pointer_pos() {
                 if !code_rect.contains(p) && !btn_rect.contains(p) {
@@ -366,7 +506,8 @@ pub fn expanded_ui(ctx: &egui::Context, state: &mut Option<Expanded>, id: &str, 
     if close {
         *state = None;
     }
-    close
+    ev.closed = close;
+    ev
 }
 
 #[cfg(test)]
@@ -410,6 +551,42 @@ mod tests {
     }
 
     #[test]
+    fn the_reveal_leads_with_the_eyes_spreads_the_rest_and_settles_in_about_a_second() {
+        assert!(eye_delay(0) < eye_delay(2) && eye_delay(2) < reveal_delay(8, 8), "eyes first");
+        let mut delays: Vec<f64> = Vec::new();
+        for y in 0..MODULES {
+            for x in 0..MODULES {
+                delays.push(reveal_delay(x, y));
+            }
+        }
+        let (lo, hi) = delays.iter().fold((f64::MAX, f64::MIN), |(l, h), d| (l.min(*d), h.max(*d)));
+        assert!(hi - lo > 0.4, "the offsets spread ({lo:.2}..{hi:.2}), not a pop");
+        assert!(hi + REVEAL_ELEMENT_S <= REVEAL_TOTAL_S + 1e-9, "everything is in by the total");
+        assert_eq!(reveal_delay(3, 9), reveal_delay(3, 9), "deterministic: the same code draws the same way");
+        let mut distinct: Vec<i64> = delays.iter().map(|d| (d * 1000.0) as i64).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert!(distinct.len() > 200, "{} distinct offsets — they are unique enough", distinct.len());
+        assert_eq!(reveal_progress(0.0, 0.5), 0.0);
+        assert!((reveal_progress(0.5 + REVEAL_ELEMENT_S, 0.5) - 1.0).abs() < 1e-6);
+        assert!(reveal_progress(0.5 + REVEAL_ELEMENT_S * 0.5, 0.5) > 0.8, "ease-out: most of the way early");
+    }
+
+    #[test]
+    fn the_svg_is_the_same_code_with_a_staggered_smil_reveal() {
+        let layout = layout_for("sc-abcdef01");
+        let s = svg(&layout, 256.0, Color32::from_rgb(230, 225, 215), Color32::from_rgb(28, 27, 25));
+        assert!(s.starts_with("<svg") && s.trim_end().ends_with("</svg>"));
+        assert_eq!(s.matches("<g opacity=\"0\">").count(), 3, "three eyes");
+        let animates = s.matches("<animate ").count();
+        let pills = s.matches("<rect ").count() - 1 - 9; // minus the card and the eyes' nine rects
+        assert_eq!(animates, 3 + 2 * pills, "every pill animates opacity and width; every eye its opacity");
+        assert!(s.contains("fill=\"#e6e1d7\"") && s.contains("fill=\"#1c1b19\""));
+        let begins: std::collections::HashSet<&str> = s.split("begin=\"").skip(1).map(|t| t.split('s').next().unwrap()).collect();
+        assert!(begins.len() > 40, "{} distinct begin offsets", begins.len());
+    }
+
+    #[test]
     fn the_small_code_and_the_overlay_draw_headless() {
         let c = crate::default_palette();
         let layout = layout_for("sc-abcdef01");
@@ -419,8 +596,10 @@ mod tests {
         let mut ex = Some(Expanded::open(0.0));
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                let r = qr_ui(ui, &layout, 168.0, &c);
+                let r = qr_ui(ui, &layout, 168.0, &c, None);
                 assert!(!r.clicked());
+                // and a reveal that has run its course draws everything too
+                let _ = qr_ui(ui, &layout, 120.0, &c, Some(-REVEAL_TOTAL_S));
             });
             let closed = expanded_ui(ctx, &mut ex, "sc-abcdef01", &layout, &c);
             assert!(!closed, "nothing closes it on a frame with no input");
