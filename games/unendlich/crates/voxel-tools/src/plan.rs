@@ -109,6 +109,30 @@ fn footprint(t: &[&str], anchor: Option<(i32, i32, i32)>)
     })
 }
 
+/// Is one line acceptable as it stands? The validator a decode loop
+/// uses to take back a line before the model has moved on. Blank lines
+/// and comments pass; a line passes if it parses with no error AND
+/// asked for no size the parser had to clamp -- a 1B that writes
+/// `r=-1` is resampled rather than clamped, and learns nothing but
+/// produces something. `def`/`end`/`use` and `spec` pass on their own
+/// syntax since they are not ops.
+pub fn line_is_valid_ir(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('#') { return true; }
+    let first = t.split_whitespace().next().unwrap_or("").to_lowercase();
+    match first.as_str() {
+        "def" => return t.split_whitespace().count() == 2,
+        "end" => return true,
+        "use" => return t.split_whitespace().count() >= 3,
+        "spec" | "properties" => return crate::spec::Spec::parse(t).is_ok(),
+        _ => {}
+    }
+    let (plan, issues) = parse_plan_at(&format!("{t}\n"), Some((0, 64, 0)));
+    if plan.ops.is_empty() { return false; }
+    !issues.iter().any(|i| i.severity == Severity::Error
+                         || i.message.contains("was -") || i.message.contains("was 0"))
+}
+
 /// Expand `def NAME` … `end` / `use NAME @x,z [rot=N] [mirror]` into
 /// plain lines. Unknown `use` names are left as-is, so the line loop
 /// reports them as an unknown op with a line number.
@@ -603,8 +627,20 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     continue;
                 }
                 // Coordinates start at token 2 for this verb, so shift.
-                let shifted: Vec<&str> = std::iter::once("form")
-                    .chain(t.iter().skip(2).copied()).collect();
+                // `size=small|medium|large` stands in for the two corners:
+                // a footprint centred on the anchor. It is what a very
+                // small model writes; coordinates are what it gets wrong.
+                let size_r = t.iter().find_map(|s| s.strip_prefix("size=")).map(|sz| match sz.to_lowercase().as_str() {
+                    "tiny" => 2, "small" => 4, "medium" | "mid" => 8, "large" | "big" => 14,
+                    "huge" | "giant" => 24, _ => 8 });
+                let sized_a; let sized_b;
+                let shifted: Vec<&str> = match size_r {
+                    Some(r) => {
+                        sized_a = format!("@-{r},-{r}"); sized_b = format!("@{r},{r}");
+                        vec!["form", sized_a.as_str(), sized_b.as_str()]
+                    }
+                    None => std::iter::once("form").chain(t.iter().skip(2).copied()).collect(),
+                };
                 let Some((a, b, note)) = footprint(&shifted, anchor) else {
                     rel_err.set(true); continue;
                 };
@@ -2145,5 +2181,33 @@ scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
         for plan in [&a, &b] {
             match &plan.ops[0] { Op::Form { style, .. } => assert_eq!(style, "nordic"), o => panic!("{o:?}") }
         }
+    }
+
+    #[test]
+    fn the_line_validator_accepts_good_lines_and_refuses_what_a_1b_writes() {
+        for good in ["cylinder @0,0 r=3 h=9", "# a tower", "", "form statue @0,0 @6,6 gargoyle",
+                     "def hut", "end", "use hut @4,0 rot=90", "spec height=5-7 durability=high",
+                     "plant @0,0 oak tall", "roof @-3,-3 @3,3 gable"] {
+            assert!(line_is_valid_ir(good), "{good:?} should pass");
+        }
+        for bad in ["cylinder @0,0 r=-1 h=-3", "frobnicate @0,0", "cylinder @0,0 r=0",
+                    "spec durability=purple", "use", "def", "Here is a plan:", "```"] {
+            assert!(!line_is_valid_ir(bad), "{bad:?} should be taken back");
+        }
+    }
+
+    #[test]
+    fn a_size_word_is_a_footprint_at_the_anchor() {
+        let (plan, issues) = parse_plan_at("form house size=medium style=nordic\n", Some((10, 65, 20)));
+        assert!(issues.iter().all(|i| i.severity != Severity::Error), "{issues:?}");
+        match &plan.ops[0] {
+            Op::Form { min, max, style, .. } => {
+                assert_eq!((min.0, min.1, max.0, max.1), (2, 12, 18, 28), "centred on the anchor");
+                assert_eq!(style, "nordic");
+            }
+            o => panic!("{o:?}"),
+        }
+        let (mood, _) = parse_plan_at("mood eerie size=large\n", Some((0, 65, 0)));
+        assert!(matches!(mood.ops.first(), Some(Op::Mood { .. })), "{:?}", mood.ops);
     }
 }

@@ -32,6 +32,13 @@ pub struct TurnControl {
     /// (tokens so far, text so far). Replaced whole each update, so a
     /// reader never sees a torn string.
     pub progress: std::sync::Mutex<(usize, String)>,
+    /// A per-line validator. A provider that drives its own decode loop
+    /// rejects and resamples a line this refuses, so a small model
+    /// cannot emit a line that does not parse. A fn pointer, not a
+    /// closure: nothing to box, nothing to send.
+    pub line_check: Option<fn(&str) -> bool>,
+    /// Lines the provider took back and resampled, for the log.
+    pub retried: std::sync::atomic::AtomicUsize,
 }
 
 impl TurnControl {

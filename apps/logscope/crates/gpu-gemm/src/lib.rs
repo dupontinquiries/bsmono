@@ -1051,6 +1051,18 @@ pub fn gpu_counters_reset() {
 /// pipeline rebuilds per token and decode is unusably slow.
 type Pipe = Arc<(wgpu::BindGroupLayout, wgpu::ComputePipeline)>;
 
+/// A hook called before every weight upload, for hosts that pace GPU
+/// work against something else (a renderer's frames). Process-global
+/// because the loader is deep and the hook is rare; set it around a
+/// load and clear it after.
+pub static LOAD_PACER: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+/// Install or clear the load pacer.
+pub fn set_load_pacer(p: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    *LOAD_PACER.lock().unwrap_or_else(|e| e.into_inner()) = p;
+}
+
 pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -3685,6 +3697,13 @@ impl Gpu {
     /// records a CATCHABLE OutOfMemory instead of the fatal get_mapped_range abort a failed map-on-create
     /// gives. The UMA map path is safe because weight loads memplan-preflight the fit before any upload.
     fn upload_bytes(&self, bytes: &[u8], label: &'static str) -> wgpu::Buffer {
+        // THE LOAD PACER. Every weight tensor comes through here, so a
+        // host that shares the GPU with a renderer can take the upload
+        // in frame-sized bites: it installs a hook, and each tensor
+        // waits for a slot before it goes up. Without this a model load
+        // was several seconds of solid uploads that no frame could get
+        // in front of -- the last unpaced thing in the game's pipeline.
+        if let Some(p) = LOAD_PACER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() { p(); }
         let _up_t0 = std::time::Instant::now();
         let _up_n = bytes.len() as u64;
         let _up_guard = UploadTimer { t0: _up_t0, n: _up_n };
@@ -17594,6 +17613,87 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
             pos += 1;
         }
         produced
+    }
+
+    /// `generate_kv_stream_paced` with LINE-LEVEL REJECTION SAMPLING.
+    ///
+    /// A small model writing a line-oriented language gets most lines
+    /// right and some wrong -- a negative radius, an unknown verb. The
+    /// usual answer is a grammar engine at the token level. This is the
+    /// cheaper one: sample a whole line, hand it to `line_ok`, and if
+    /// it is rejected REWIND to where the line began and sample it
+    /// again with a nudged RNG. The cache writes at explicit positions
+    /// and attention reads only below `pos`, so rewinding is setting
+    /// `pos` back and restoring the logits the line started from; the
+    /// rejected tokens' rows are simply overwritten. Up to
+    /// `max_retries` per line, then the line is accepted as-is so a
+    /// model that cannot do better still finishes.
+    ///
+    /// `is_newline(token)` says whether a token ends a line (the caller
+    /// knows its tokenizer). `on_token` sees ACCEPTED tokens only, in
+    /// order, so a streaming sink never shows a line that was taken
+    /// back.
+    pub fn generate_kv_stream_lines(
+        &self, m: &Model, c: &KvCache, prefix_len: usize, suffix: &[u32], n_new: usize,
+        eos: Option<u32>, sampler: &SamplerParams, rng: &mut u64, cancel: &dyn Fn() -> bool,
+        pace: &dyn Fn(), chunk: usize, is_newline: &dyn Fn(u32) -> bool, max_retries: u32,
+        mut line_ok: impl FnMut(&[u32]) -> bool, mut on_token: impl FnMut(u32) -> bool,
+    ) -> (usize, usize) {
+        if cancel() || suffix.is_empty() { return (0, 0); }
+        let chunk = chunk.max(1);
+        let mut pos = prefix_len;
+        let mut logits = Vec::new();
+        for piece in suffix.chunks(chunk) {
+            if cancel() { return (0, 0); }
+            pace();
+            logits = self.prefill_chunked_from(m, c, piece, pos, chunk);
+            pos += piece.len();
+        }
+        let mut seen: Vec<u32> = suffix.to_vec();
+        let mut produced = 0usize;
+        let mut retried = 0usize;
+        // where the current line began: position, logits, repeat window
+        let mut line_start_pos = pos;
+        let mut line_start_logits = logits.clone();
+        let mut line_start_seen = seen.len();
+        let mut line: Vec<u32> = Vec::new();
+        let mut retries = 0u32;
+        let mut stop = false;
+        while produced + line.len() < n_new && !stop {
+            if logits.is_empty() || cancel() { break; }
+            let next = pick(&logits, sampler, &seen, rng);
+            let ended = Some(next) == eos;
+            if !ended {
+                seen.push(next);
+                line.push(next);
+                logits = self.decode_step(m, c, next, pos);
+                pos += 1;
+            }
+            if ended || is_newline(next) {
+                let body: Vec<u32> = if ended { line.clone() } else { line[..line.len() - 1].to_vec() };
+                let ok = body.is_empty() || line_ok(&body);
+                if !ok && retries < max_retries {
+                    // take the line back
+                    retries += 1; retried += 1;
+                    pos = line_start_pos;
+                    logits = line_start_logits.clone();
+                    seen.truncate(line_start_seen);
+                    line.clear();
+                    *rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    continue;
+                }
+                // accept the line
+                for t in line.drain(..) { produced += 1; if !on_token(t) { stop = true; break; } }
+                if ended { break; }
+                retries = 0;
+                line_start_pos = pos;
+                line_start_logits = logits.clone();
+                line_start_seen = seen.len();
+            }
+        }
+        // a trailing partial line (hit n_new) is accepted as-is
+        for t in line.drain(..) { produced += 1; if !on_token(t) { break; } }
+        (produced, retried)
     }
 
     // ── multi-session (concurrency) primitives ───────────────────────────────

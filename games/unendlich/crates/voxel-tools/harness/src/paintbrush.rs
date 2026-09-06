@@ -344,10 +344,22 @@ impl voxel_tools::llm::Completer for EngineCompleter {
         };
         // Cancel reaches the decode loop between steps; progress leaves
         // it every few tokens. This is what makes /cancel stop the GPU
-        // rather than let it finish a reply nobody will read.
-        inner.generate_chat_streaming(system, user, self.max_tokens,
-                                      &|| ctl.cancelled(),
-                                      &mut |n, text| ctl.report(n, text))
+        // rather than let it finish a reply nobody will read. And with
+        // a line check, the loop takes back and resamples any line the
+        // parser would refuse: a 1B cannot emit `r=-1`.
+        match ctl.line_check {
+            Some(check) => {
+                let (text, retried) = inner.generate_chat_lines(
+                    system, user, self.max_tokens, &|| ctl.cancelled(),
+                    &mut |n, t| ctl.report(n, t), &check)?;
+                ctl.retried.store(retried, std::sync::atomic::Ordering::Relaxed);
+                if retried > 0 { log::info!("[paintbrush] {retried} line(s) taken back and resampled"); }
+                Ok(text)
+            }
+            None => inner.generate_chat_streaming(system, user, self.max_tokens,
+                                                  &|| ctl.cancelled(),
+                                                  &mut |n, text| ctl.report(n, text)),
+        }
     }
 }
 
@@ -1157,7 +1169,10 @@ impl Paintbrush {
                    system.len(), self.ctx_tokens);
         self.say(format!("asking {name} ... (the world keeps running)"));
         let (tx, rx) = std::sync::mpsc::channel();
-        let ctl = std::sync::Arc::new(voxel_tools::llm::TurnControl::default());
+        let ctl = std::sync::Arc::new(voxel_tools::llm::TurnControl {
+            line_check: Some(voxel_tools::plan::line_is_valid_ir),
+            ..Default::default()
+        });
         let ctl_w = ctl.clone();
         std::thread::spawn(move || {
             // Same treatment as the chunk loaders: deprioritised and, on
@@ -1583,6 +1598,8 @@ impl Paintbrush {
         let (n, text) = t.ctl.snapshot();
         let secs = t.elapsed().as_secs_f32().max(0.1);
         let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
+        let retried = t.ctl.retried.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = retried;
         Some(if n == 0 {
             format!("{}: thinking ... {secs:.0}s", t.provider)
         } else {

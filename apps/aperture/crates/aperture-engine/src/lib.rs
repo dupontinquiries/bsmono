@@ -89,6 +89,18 @@ pub trait Backend: Send + Sync {
         Ok(out)
     }
 
+    /// `generate_chat_streaming` with a per-line validator: a backend
+    /// that drives its own decode loop rejects and resamples lines the
+    /// validator refuses, so a small model writing a line language
+    /// cannot emit a line that does not parse. The default streams
+    /// without validating -- a remote server cannot take a line back.
+    /// Returns (text, lines retried).
+    fn generate_chat_lines(&self, system: &str, user: &str, max_tokens: usize,
+                           cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str),
+                           _line_ok: &dyn Fn(&str) -> bool) -> Result<(String, usize), String> {
+        self.generate_chat_streaming(system, user, max_tokens, cancel, sink).map(|t| (t, 0))
+    }
+
     /// Generate with a STABLE PREFIX the backend may keep prefilled
     /// across calls. A chat sends the same system prompt every turn;
     /// a backend that can hold its KV pays that prefill once. The
@@ -500,10 +512,20 @@ mod gpu {
             let g = gguf::parse(bytes).map_err(|e| format!("parse gguf: {e}"))?;
             let tok = Arc::new(Tokenizer::from_gguf(&g).map_err(|e| format!("tokenizer: {e}"))?);
             let gpu = Arc::new(Gpu::new());
-            let model = Arc::new(
-                gpu.load_gguf_quantized_parts_static(&[bytes])
-                    .map_err(|e| format!("load model: {e}"))?,
-            );
+            // Pace the weight upload against the host's frames when a
+            // governor is present: every tensor waits for a slot. The
+            // load was the last unpaced thing in the game's pipeline --
+            // several seconds of solid uploads no frame could get in
+            // front of. Cleared after, so a CLI load later in the same
+            // process is unpaced.
+            if let Some(g) = &cfg.governor {
+                let (g2, tier) = (g.clone(), cfg.tier);
+                gpu_kernels::set_load_pacer(Some(Arc::new(move || { g2.acquire(tier); })));
+            }
+            let loaded = gpu.load_gguf_quantized_parts_static(&[bytes])
+                .map_err(|e| format!("load model: {e}"));
+            gpu_kernels::set_load_pacer(None);
+            let model = Arc::new(loaded?);
             gpu.warm(&model);
             // Same eos resolution as logscope-serve: the GGUF's own id,
             // falling back to the llama3 end-of-turn token.
@@ -545,11 +567,21 @@ mod gpu {
         fn generate_chat_streaming(&self, system: &str, user: &str, max_tokens: usize,
                                    cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str))
             -> Result<String, String> {
-            let out = self.generate_prefixed_core(&self.family.wrap_system(system),
-                                                  &self.family.wrap_user(user), max_tokens,
-                                                  cancel, sink)?;
+            let (out, _) = self.generate_prefixed_core(&self.family.wrap_system(system),
+                                                       &self.family.wrap_user(user), max_tokens,
+                                                       cancel, sink, None)?;
             if cancel() { return Err("cancelled".into()); }
             Ok(self.family.clean(&out))
+        }
+
+        fn generate_chat_lines(&self, system: &str, user: &str, max_tokens: usize,
+                               cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str),
+                               line_ok: &dyn Fn(&str) -> bool) -> Result<(String, usize), String> {
+            let (out, retried) = self.generate_prefixed_core(&self.family.wrap_system(system),
+                                                             &self.family.wrap_user(user), max_tokens,
+                                                             cancel, sink, Some(line_ok))?;
+            if cancel() { return Err("cancelled".into()); }
+            Ok((self.family.clean(&out), retried))
         }
 
         fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, String> {
@@ -578,7 +610,8 @@ mod gpu {
 
         fn generate_prefixed(&self, prefix: &str, suffix: &str, max_tokens: usize)
             -> Result<String, String> {
-            self.generate_prefixed_core(prefix, suffix, max_tokens, &|| false, &mut |_, _| {})
+            self.generate_prefixed_core(prefix, suffix, max_tokens, &|| false, &mut |_, _| {}, None)
+                .map(|(t, _)| t)
         }
     }
 
@@ -589,8 +622,9 @@ mod gpu {
         /// token split across a UTF-8 sequence never surfaces as a
         /// torn character.
         fn generate_prefixed_core(&self, prefix: &str, suffix: &str, max_tokens: usize,
-                                  cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str))
-            -> Result<String, String> {
+                                  cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str),
+                                  line_ok: Option<&dyn Fn(&str) -> bool>)
+            -> Result<(String, usize), String> {
             let phash = {
                 let mut h: u64 = 0xcbf2_9ce4_8422_2325;
                 for b in prefix.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100_0000_01b3); }
@@ -637,19 +671,47 @@ mod gpu {
             let pace_gov = self.governor.clone();
             let pace = move || { if let Some(g) = &pace_gov { g.acquire(tier); } };
             let tok = &self.tok;
-            self.gpu.generate_kv_stream_paced(
-                &self.model, &p.cache, p.len, &suffix_ids, max_tokens, self.eos,
-                &self.sampler, &mut rng, cancel, &pace, chunk,
-                |t| {
-                    if stops.contains(&t) { return false; }
-                    out.push(t);
-                    if out.len() % 4 == 0 { sink(out.len(), &tok.decode(&out)); }
-                    if let Some(g) = &gov { g.acquire(tier); }
-                    true
-                });
+            let retried = match line_ok {
+                None => {
+                    self.gpu.generate_kv_stream_paced(
+                        &self.model, &p.cache, p.len, &suffix_ids, max_tokens, self.eos,
+                        &self.sampler, &mut rng, cancel, &pace, chunk,
+                        |t| {
+                            if stops.contains(&t) { return false; }
+                            out.push(t);
+                            if out.len() % 4 == 0 { sink(out.len(), &tok.decode(&out)); }
+                            if let Some(g) = &gov { g.acquire(tier); }
+                            true
+                        });
+                    0
+                }
+                Some(ok) => {
+                    // Which tokens end a line: decoded once per id and
+                    // remembered, since the vocabulary is large and a
+                    // reply asks the question thousands of times.
+                    let memo = std::sync::Mutex::new(std::collections::HashMap::<u32, bool>::new());
+                    let is_newline = |t: u32| -> bool {
+                        if stops.contains(&t) { return true; }
+                        let mut m = memo.lock().unwrap_or_else(|e| e.into_inner());
+                        *m.entry(t).or_insert_with(|| tok.decode(&[t]).contains('\n'))
+                    };
+                    let (_, retried) = self.gpu.generate_kv_stream_lines(
+                        &self.model, &p.cache, p.len, &suffix_ids, max_tokens, self.eos,
+                        &self.sampler, &mut rng, cancel, &pace, chunk, &is_newline, 3,
+                        |line| ok(tok.decode(line).trim()),
+                        |t| {
+                            if stops.contains(&t) { return false; }
+                            out.push(t);
+                            if out.len() % 4 == 0 { sink(out.len(), &tok.decode(&out)); }
+                            if let Some(g) = &gov { g.acquire(tier); }
+                            true
+                        });
+                    retried
+                }
+            };
             let text = tok.decode(&out);
             sink(out.len(), &text);
-            Ok(text)
+            Ok((text, retried))
         }
 
     }

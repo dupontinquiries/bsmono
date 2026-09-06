@@ -32,6 +32,7 @@ fn main() {
     cancel_scenario();
     undo_race_scenario();
     tree_scenario();
+    validator_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -707,4 +708,34 @@ fn tree_scenario() {
     assert!(pb.session.pending_spec.is_some());
     println!("  latent index: {} vectors, {} hits, {} misses", pb.latent.len(), pb.latent.hits, pb.latent.misses);
     assert!(pb.latent.len() >= 3);
+}
+
+
+/// Every turn carries the IR line validator; a provider that can take
+/// lines back sees it.
+fn validator_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== line validator reaches the provider");
+    struct Probe(std::sync::Arc<std::sync::Mutex<Option<bool>>>);
+    impl voxel_tools::llm::Completer for Probe {
+        fn name(&self) -> &str { "probe" }
+        fn complete(&mut self, _: &str, _: &str) -> Result<String, String> { Ok(String::new()) }
+        fn complete_with(&mut self, _: &str, _: &str, ctl: &voxel_tools::llm::TurnControl) -> Result<String, String> {
+            let check = ctl.line_check.expect("a validator was passed");
+            // what a 1B writes, and what the loop would take back
+            let verdicts = (check("cylinder @0,0 r=3 h=9"), check("cylinder @0,0 r=-1 h=-3"), check("Here is a plan:"));
+            *self.0.lock().unwrap() = Some(verdicts == (true, false, false));
+            Ok("cylinder @0,0 r=3 h=9\n".into())
+        }
+    }
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    pb.spawn_turn_for_test(Box::new(Probe(seen.clone())), &gaze);
+    while pb.in_flight.is_some() { pb.poll_turn(&cm); std::thread::sleep(std::time::Duration::from_millis(5)); }
+    settle(&mut pb);
+    let v = seen.lock().unwrap().expect("the completer ran");
+    println!("  validator accepts r=3, refuses r=-1 and prose: {v}");
+    assert!(v);
 }
