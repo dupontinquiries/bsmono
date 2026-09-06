@@ -672,6 +672,11 @@ struct VoicetermApp {
     /// Sharing the zettelkasten as a huge QR (`zk_share`): the picker, the
     /// gates, and the codes once shown. `None` when nothing is being shared.
     zk_share: Option<ZkShareUi>,
+    /// This installation's identity, loaded once at startup: the keypair the peer
+    /// handshake signs with and the fingerprint it shows. `Unavailable` on a system
+    /// with no randomness, and the panel then refuses to open rather than showing a
+    /// fabricated one — see `identity`.
+    identity: voiceterm_egui::identity::Loaded,
     /// The find bar's FILES mode. `None` until a file search is started, so
     /// the panel costs no terminal rows in the common case.
     fs_search: voiceterm_egui::fs_results::Search,
@@ -924,6 +929,38 @@ impl VoicetermApp {
             // the most recent block is the closest approximation. True
             // for the common case (clipping something just seen), not
             // guaranteed for a selection made further back in scrollback.
+            Command::PeerHandshake => {
+                // REAL VALUES OR NONE. The panel is a trust decision; opening it with
+                // placeholder identity strings would look like proof while being
+                // fabricated (TODO_multi_device_share.md's own reason for leaving it
+                // unreachable). Without an identity it says so instead.
+                match self.identity.identity() {
+                    Some(id) => {
+                        let digest = voiceterm_egui::identity::workspace_digest(
+                            self.deck.cards.iter().map(|c| (c.title.as_str(), c.body.as_str())));
+                        self.peer = Some((
+                            voiceterm_egui::peer_panel::PeerPanel {
+                                my_id: id.handle.clone(),
+                                my_key_fp: id.vt_id.clone(),
+                                workspace_digest: digest,
+                                // No voice profile is enrolled in this build, so the
+                                // panel offers no voice step — which it SAYS rather
+                                // than hiding, and which is honest: claiming a
+                                // voiceprint we cannot produce would make the peer
+                                // wait for a step that never comes.
+                                my_voiceprint_ref: String::new(),
+                                verify_msg: String::new(),
+                            },
+                            peer_handshake::HsState::Idle,
+                        ));
+                    }
+                    None => {
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+                        self.toasts.warning(self.identity.note(), now);
+                    }
+                }
+            }
             Command::ShareNotesQr => {
                 let share = voiceterm_egui::zk_share::Share::from_cards(&self.deck.cards);
                 self.zk_share = Some(ZkShareUi { share, dialog: None, frames: Vec::new(), shown: None, note: String::new() });
@@ -5099,6 +5136,7 @@ fn main() -> eframe::Result<()> {
                 chat: Default::default(),
                 glow: Default::default(),
                 pending_confirm: None, zk_share: None,
+                identity: voiceterm_egui::identity::load_or_create("voiceterm"),
                 fs_search: Default::default(),
                 cmd_sheet: Default::default(),
                 last_memlog_s: 0.0,

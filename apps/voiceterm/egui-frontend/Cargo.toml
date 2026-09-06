@@ -45,6 +45,9 @@ app-wayland = ["dep:eframe", "wayland"]
 # XDG resolution. prefs_path() hand-rolled the same logic, with a comment
 # saying "as config-kit uses" — so the fleet had two copies of one rule.
 config-kit = { path = "../../../shared/config-kit" }
+# The device identity's keypair (`identity.rs`) — the prerequisite
+# TODO_multi_device_share.md names for wiring the peer panel.
+crypto-kit = { path = "../../../shared/crypto-kit" }
 # The acoustic handshake state machine, shared with voiceterm's core. It was
 # in the app crate, which has no [lib] and pulls qmetaobject — so reaching a
 # pure state machine would have dragged Qt into this frontend.

@@ -107,6 +107,11 @@ pub enum Command {
     /// paintbrush, two confirmation gates, then the code (`zk_share`).
     /// Reachable from the notes panes' palette like everything else here.
     ShareNotesQr,
+    /// Open the peer handshake — the acoustic identity exchange
+    /// (`peer_panel`) with THIS device's real identity (`identity`).
+    /// The panel has been a complete, tested port with no way in since the
+    /// port; the identity module is what it was waiting for.
+    PeerHandshake,
 }
 
 /// The three filter levels, as a palette-addressable value.
@@ -207,6 +212,8 @@ pub fn vocabulary() -> Vec<Entry> {
                    keywords: &["keycaps", "keys", "footer", "summaries", "show extras"] });
     v.push(Entry { command: Command::ClipSelection, title: "Clip selection to notes".into(),
                    keywords: &["clip this", "save this", "note this", "clipping"] });
+    v.push(Entry { command: Command::PeerHandshake, title: "Pair with a nearby device…".into(),
+                   keywords: &["peer", "handshake", "pair", "dial", "device", "trust", "identity"] });
     v.push(Entry { command: Command::ShareNotesQr, title: "Share notes as a QR code…".into(),
                    keywords: &["qr", "share", "zettelkasten", "export", "code", "public"] });
     v.push(Entry { command: Command::ShowPalette, title: "Open command palette".into(),
@@ -274,6 +281,9 @@ pub fn parse_phrase(phrase: &str) -> Option<Command> {
         return None;
     }
     // The palette itself, so it is reachable without knowing a shortcut.
+    if p.contains("pair") || p.contains("handshake") || (p.contains("dial") && !p.contains("dialog")) {
+        return Some(Command::PeerHandshake);
+    }
     if (p.contains("share") || p.contains("export")) && (p.contains("qr") || p.contains("notes") || p.contains("zettel")) {
         return Some(Command::ShareNotesQr);
     }
@@ -425,6 +435,9 @@ mod tests {
     /// pins both doors, same as every other command added this session.
     #[test]
     fn clip_selection_is_reachable_by_phrase_and_by_palette() {
+        assert_eq!(parse_phrase("pair with a nearby device"), Some(Command::PeerHandshake));
+        assert_eq!(parse_phrase("start a handshake"), Some(Command::PeerHandshake));
+        assert!(vocabulary().iter().any(|e| e.command == Command::PeerHandshake));
         assert_eq!(parse_phrase("share my notes as a qr code"), Some(Command::ShareNotesQr));
         assert_eq!(parse_phrase("export the zettelkasten"), Some(Command::ShareNotesQr));
         assert!(vocabulary().iter().any(|e| e.command == Command::ShareNotesQr),
