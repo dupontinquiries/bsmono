@@ -263,6 +263,10 @@ pub enum Op {
     /// a phrase, then apply the winner. Or run a stated genome.
     Greeble { min: (i32, i32, i32), max: (i32, i32, i32), phrase: String,
               gens: u32, seed: i32, genome: Option<String>, levels: u32 },
+    /// Carved terrain: canyon, cave, mesa, waterfall, overhang. Removes
+    /// rock rather than raising a heightfield, so it can make a roof.
+    Carve { kind: String, a: (i32, i32), b: (i32, i32), nums: Vec<(String, i32)>,
+            block: Option<u16>, floor: Option<u16>, water: Option<i32>, seed: i32 },
     /// A JSON scatter: a structure and a rule about where its instances
     /// go. Resolved against the world at run time into sites; the host
     /// decides whether to build them now or hold them.
@@ -727,6 +731,25 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     seed: kvi(&t, "seed", 1),
                     genome: t.iter().find_map(|s| s.strip_prefix("genome=")).map(|s| s.to_string()),
                     levels: kvi(&t, "levels", 2).clamp(1, 4) as u32,
+                });
+            }
+            "canyon" | "cave" | "mesa" | "waterfall" | "overhang" | "gorge" => {
+                let v = t[0].to_lowercase();
+                let kind = if v == "gorge" { "canyon".to_string() } else { v };
+                let a = rel(&t, 1, anchor).unwrap_or_else(|| anchor_xz(anchor));
+                // canyon and overhang take a second point; the rest take
+                // one and a size
+                let b = rel(&t, 2, anchor).unwrap_or(a);
+                let nums: Vec<(String, i32)> = t.iter().skip(1)
+                    .filter_map(|s| s.split_once('='))
+                    .filter_map(|(k, v)| v.parse().ok().map(|n| (k.to_string(), n)))
+                    .collect();
+                ops.push(Op::Carve {
+                    kind, a, b, nums,
+                    block: t.iter().find_map(|s| s.strip_prefix("wall=")).and_then(blk),
+                    floor: t.iter().find_map(|s| s.strip_prefix("floor=")).and_then(blk),
+                    water: t.iter().find_map(|s| s.strip_prefix("water=")).and_then(|v| v.parse().ok()),
+                    seed: kvi(&t, "seed", 1),
                 });
             }
             "scatter_json" | "place_many" => {
@@ -1386,6 +1409,36 @@ pub fn run_plan_with<W: VoxelWorld>(
                 r
             })(),
             Op::Spec(_) => CallResult { ok: true, summary: "spec noted".into(), ..Default::default() },
+            Op::Carve { kind, a, b, nums, block, floor, water, seed } => (|| {
+                use crate::carve::{self, Carve as CarveOpts};
+                let num = |k: &str, d: i32| nums.iter().find(|(n, _)| n == k).map(|(_, v)| *v).unwrap_or(d);
+                let opts = CarveOpts { air: 0, floor: *floor, water_level: *water, water: 9, wall: *block };
+                let r = match kind.as_str() {
+                    "canyon" => carve::canyon(tools.world, *a, *b, num("w", 14).clamp(2, 200),
+                                              num("depth", 20).clamp(2, 128), *seed as u64, &opts, from_y),
+                    "cave" => carve::cave(tools.world, *a, num("dir", 0), num("len", 80).clamp(4, 600),
+                                          num("r", 4).clamp(1, 24), num("branches", 3).clamp(0, 12) as usize,
+                                          *seed as u64, &opts, from_y),
+                    "mesa" => carve::mesa(tools.world, *a, num("r", 24).clamp(4, 400),
+                                          num("drop", 18).clamp(2, 128), *seed as u64, &opts, from_y),
+                    "waterfall" => carve::waterfall(tools.world, *a, num("dir", 0), num("w", 7).clamp(1, 64),
+                                                    num("h", 16).clamp(3, 128), *seed as u64, &opts, from_y),
+                    _ => carve::overhang(tools.world, *a, num("dir", 0), num("w", 16).clamp(2, 200),
+                                         num("depth", 10).clamp(1, 64), num("h", 6).clamp(2, 40),
+                                         *seed as u64, &opts, from_y),
+                };
+                if r.changes.is_empty() {
+                    return CallResult { ok: false, summary: format!("{kind}: nothing to carve there"),
+                                        ..Default::default() };
+                }
+                let roofed = carve::roofed(&r.changes, tools.world);
+                let mut res = tools.apply_changes(&r.changes);
+                if res.ok {
+                    res.summary = format!("{kind}: {}{}", r.summary(),
+                                          if roofed > 0 { format!(", {roofed} cell(s) under rock") } else { String::new() });
+                }
+                res
+            })(),
             Op::ScatterJson { json } => (|| {
                 let s = match crate::scatter::from_json(json, plan.anchor) {
                     Ok(s) => s,

@@ -121,6 +121,8 @@ pub mod latent;
 pub mod recipe;
 /// Placement rails: where instances of a structure go, as JSON data the engine builds or holds.
 pub mod scatter;
+/// Carving the land: canyons, caves, mesas, waterfalls, overhangs -- terrain a heightfield cannot express.
+pub mod carve;
 /// The review loop: elevations and measurements to the model, a ten-token verdict back.
 pub mod review;
 /// Context under a budget: the conversation chain, folding into summaries, grouped plans.

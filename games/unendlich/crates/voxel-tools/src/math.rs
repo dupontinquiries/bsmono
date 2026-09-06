@@ -239,6 +239,19 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                                             None => format!("evolve '{phrase}' for {gens} generations, {levels} level(s)") }),
                      None);
             }
+            Op::Carve { kind, a, b, nums, .. } => {
+                let num = |k: &str, d: i32| nums.iter().find(|(n, _)| n == k).map(|(_, v)| *v).unwrap_or(d);
+                let est = match kind.as_str() {
+                    "canyon" => { let len = (((b.0 - a.0).pow(2) + (b.1 - a.1).pow(2)) as f32).sqrt() as i64;
+                                  len * num("w", 14) as i64 * num("depth", 20) as i64 / 2 }
+                    "cave" => num("len", 80) as i64 * num("r", 4).pow(2) as i64 * 3,
+                    "mesa" => (num("r", 24) as i64 * 2).pow(2) * num("drop", 18) as i64 / 3,
+                    "waterfall" => num("w", 7) as i64 * num("h", 16) as i64 * 6,
+                    _ => num("w", 16) as i64 * num("depth", 10) as i64 * num("h", 6) as i64,
+                };
+                total += est;
+                push(Note::Info, format!("{kind} at {a:?}: roughly {est} blocks carved"), None);
+            }
             Op::ScatterJson { json } => {
                 match crate::scatter::from_json(json, plan.anchor) {
                     Ok(s) => push(Note::Info,

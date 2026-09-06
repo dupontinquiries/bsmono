@@ -225,6 +225,9 @@ OPERATIONS
   layer PACKET A B density=0.6          a forest: temperate, alpine, boreal,
                                         jungle, desert, darkwood, meadow
   river A dir=DEG len=N                 the terrain decides the path
+  canyon A B / cave A / mesa A / waterfall A / overhang A
+                                        CARVED terrain -- rock removed, so it has a roof.
+                                        w= depth= len= r= branches= dir= floor= wall=
   form NAME A B [style=NAME] [seed=N]   a named form (list below); style sets
                                         materials, roof and proportions together;
                                         seed varies the details. statue takes
@@ -345,6 +348,16 @@ OPS
   plant A SPECIES [words...] [seedling]          a LIVING tree bred toward the words -- tall,
                                                  ancient, bushy, sparse, hardy, fruit, wide,
                                                  narrow -- placed grown and kept growing
+  canyon A B [w=N] [depth=N] [floor=B] [wall=B]  a carved channel: it wanders, its walls step
+                                                 back, its floor falls with the land
+  cave A [dir=DEG] [len=N] [r=N] [branches=N]    branching tunnels with chambers. It stays UNDER
+                                                 the rock -- a cave has a roof, which is what a
+                                                 heightfield cannot say
+  mesa A [r=N] [drop=N]                          the surroundings drop in terraces, leaving the
+                                                 plateau standing
+  waterfall A [dir=DEG] [w=N] [h=N]              a lip, a leaning curtain, a plunge pool, and
+                                                 the space behind the water
+  overhang A [dir=DEG] [w=N] [depth=N] [h=N]     a shelf cut back under itself
   road A B [w=N] [block=B]                       a road that cuts, fills, bridges and tunnels
                                                  as the ground demands; use it between builds
   river A [dir=DEG] [len=N]                      a river from a source; the terrain decides

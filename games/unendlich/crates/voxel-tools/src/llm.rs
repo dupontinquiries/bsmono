@@ -260,6 +260,8 @@ pub const KNOWN_VERBS: &[&str] = &[
     "detail", "weather", "greeble", "decorate", "views",
     // landscape
     "brush", "layer", "river", "road", "lake", "world",
+    // carved terrain: what a heightfield cannot say
+    "canyon", "cave", "mesa", "waterfall", "overhang", "gorge",
     // substructures
     "def", "end", "use",
 ];
@@ -622,6 +624,11 @@ mod tests {
                 "river" => "river @0,0 len=40\n".into(),
                 "road" => "road @0,0 @40,40\n".into(),
                 "lake" => "lake @0,0 r=10 level=66\n".into(),
+                "canyon" | "gorge" => format!("{verb} @0,0 @60,0 w=12 depth=18\n"),
+                "cave" => "cave @0,0 dir=180 len=60 r=4 branches=2\n".into(),
+                "mesa" => "mesa @0,0 r=24 drop=16\n".into(),
+                "waterfall" => "waterfall @0,0 dir=180 w=6 h=14\n".into(),
+                "overhang" => "overhang @0,0 dir=180 w=14 depth=8 h=5\n".into(),
                 "world" => continue,                    // gated on the player's intent
                 "def" | "end" | "use" => continue,      // substructure syntax, not ops
                 other => panic!("KNOWN_VERBS gained '{other}' with no sample line here"),
