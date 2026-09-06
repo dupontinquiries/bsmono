@@ -357,6 +357,20 @@ impl App {
         self.hub.mark_pending(id);
         self.backend.submit(Command::Refresh(id.clone()));
     }
+
+    /// Ask a paired accessory what it is. One round trip that answers "outlet or switch",
+    /// "can it blink", and "is anything plugged in" — see `hap::inspect` for why they go
+    /// together rather than one question per connection.
+    pub fn inspect(&mut self, id: &DeviceId) {
+        self.hub.mark_pending(id);
+        self.backend.submit(Command::Inspect(id.clone()));
+    }
+
+    /// "Which one are you." Not marked pending: the accessory blinks, nothing about the
+    /// row changes, and a spinner over a row whose state is unaffected reads as a hang.
+    pub fn identify(&mut self, id: &DeviceId) {
+        self.backend.submit(Command::Identify(id.clone()));
+    }
 }
 
 impl Default for App {

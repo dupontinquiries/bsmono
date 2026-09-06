@@ -165,6 +165,8 @@ fn devices_pane(app: &mut App, ui: &mut egui::Ui, colors: &Colors) {
     let mut to_pin: Option<DeviceId> = None;
     let mut to_pair: Option<DeviceId> = None;
     let mut to_unpair: Option<DeviceId> = None;
+    let mut to_identify: Option<DeviceId> = None;
+    let mut to_inspect: Option<DeviceId> = None;
     let now = Instant::now();
 
     crate::panels::filter_chips(ui, app);
@@ -181,6 +183,12 @@ fn devices_pane(app: &mut App, ui: &mut egui::Ui, colors: &Colors) {
                 if act.pin { to_pin = Some(d.id.clone()); }
                 if act.pair { to_pair = Some(d.id.clone()); }
                 if act.unpair { to_unpair = Some(d.id.clone()); }
+                if act.identify { to_identify = Some(d.id.clone()); }
+                // ASKED ONCE, on the first frame a paired accessory is on screen. The
+                // probe needs a session, and a session is a Curve25519 exchange plus two
+                // signature round trips — doing it per frame would keep the radio busy
+                // for a label. `abilities` being None is the "not asked yet" marker.
+                if d.paired && d.abilities.is_none() && !d.pending { to_inspect = Some(d.id.clone()); }
             }
             if hidden > 0 {
                 ui.label(egui::RichText::new(format!("{hidden} hidden by the filter")).small().weak());
@@ -203,11 +211,17 @@ fn devices_pane(app: &mut App, ui: &mut egui::Ui, colors: &Colors) {
     if let Some(id) = to_unpair {
         app.unpair(&id);
     }
+    if let Some(id) = to_identify {
+        app.identify(&id);
+    }
+    if let Some(id) = to_inspect {
+        app.inspect(&id);
+    }
 }
 
 /// What a row's buttons asked for this frame.
 #[derive(Default)]
-struct RowAction { toggle: bool, refresh: bool, pin: bool, pair: bool, unpair: bool }
+struct RowAction { toggle: bool, refresh: bool, pin: bool, pair: bool, unpair: bool, identify: bool }
 
 /// One outlet.
 fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant, colors: &Colors) -> RowAction {
@@ -257,6 +271,17 @@ fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant, colors: &Colors) -> R
                                 .small()
                                 .color(colors.error()),
                         );
+                    } else if let Some(a) = &d.abilities {
+                        // WHAT THE ACCESSORY SAID IT IS, not what the advertisement
+                        // implied. "outlet" and "switch" look identical until one of
+                        // them tells you whether a lamp is plugged in.
+                        let line = match d.in_use {
+                            Some(true) => format!("{a} · in use"),
+                            Some(false) => format!("{a} · nothing plugged in"),
+                            None => a.clone(),
+                        };
+                        let tint = if d.in_use == Some(true) { colors.on() } else { colors.inner.text_weak };
+                        ui.label(egui::RichText::new(line).small().color(tint));
                     } else if let Some(why) = d.unsupported_reason() {
                         // Say WHY a plug has no button. An inert row with no
                         // explanation is the worst outcome here — the user
@@ -295,6 +320,17 @@ fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant, colors: &Colors) -> R
                     }
                     if d.paired && !d.pending && ui.small_button("unpair").on_hover_text("forget this pairing").clicked() {
                         act.unpair = true;
+                    }
+                    // WHICH ONE ARE YOU. Three identical plugs are three identical rows,
+                    // and HAP has an answer for exactly that: write Identify and the
+                    // accessory blinks. Drawn only when the probe said the characteristic
+                    // is there and writable — an Identify button that errors is worse
+                    // than none.
+                    if d.can_identify
+                        && !d.pending
+                        && ui.small_button("blink").on_hover_text("ask the accessory to identify itself").clicked()
+                    {
+                        act.identify = true;
                     }
                 });
             });

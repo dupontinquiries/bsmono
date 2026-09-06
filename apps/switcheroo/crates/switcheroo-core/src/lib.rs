@@ -213,6 +213,16 @@ pub struct Device {
     /// A HomeKit accessory we hold a pairing for (see `hap-core`). Set by
     /// `Event::Paired`; the backend that reported it owns the record.
     pub paired: bool,
+    /// What a paired accessory said it can do, in its own words: one line from
+    /// `hap_core::Capabilities::describe` ("outlet · identify"). `None` until it has been
+    /// asked. A row that says "switch" for a plug that reports load is a row that guessed.
+    pub abilities: Option<String>,
+    /// Can this accessory be asked to blink? Only then is the button worth drawing.
+    pub can_identify: bool,
+    /// An OUTLET's load: something is plugged in and drawing. `None` for an accessory that
+    /// does not report it, which is not the same as `Some(false)` — "nothing plugged in"
+    /// and "cannot tell" are different things to show.
+    pub in_use: Option<bool>,
 }
 
 impl Device {
@@ -234,6 +244,9 @@ impl Device {
             last_error: None,
             favourite: false,
             paired: false,
+            abilities: None,
+            can_identify: false,
+            in_use: None,
         }
     }
 
@@ -277,6 +290,11 @@ pub enum Command {
     Pair { id: DeviceId, setup_code: String },
     /// Forget our pairing record for this accessory.
     Unpair(DeviceId),
+    /// Ask a paired accessory what it can do (`hap-core`'s capability probe) and read the
+    /// outlet's load while the session is up. Answered with `Event::Abilities`.
+    Inspect(DeviceId),
+    /// Ask a paired accessory to blink or beep, so a person can tell which row it is.
+    Identify(DeviceId),
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +312,16 @@ pub enum Event {
     PowerIs {
         id: DeviceId,
         power: Power,
+    },
+    /// What a paired accessory reported about itself, from `hap-core`'s capability probe.
+    /// Separate from `PowerIs` because it is asked once per connection and answers a
+    /// different question: not "is it on" but "what is it".
+    Abilities {
+        id: DeviceId,
+        /// `Capabilities::describe`, already rendered — core does not depend on hap-core.
+        describes: String,
+        can_identify: bool,
+        in_use: Option<bool>,
     },
     /// A command failed. Carries the id so the row can show it in place
     /// instead of a global error bar that does not say which plug broke.
@@ -384,6 +412,14 @@ impl Hub {
                         d.last_error = Some(message);
                     }
                 }
+                Event::Abilities { id, describes, can_identify, in_use } => {
+                    if let Some(d) = self.devices.get_mut(&id) {
+                        d.abilities = Some(describes);
+                        d.can_identify = can_identify;
+                        d.in_use = in_use;
+                        d.pending = false;
+                    }
+                }
                 Event::Paired { id } => {
                     if let Some(d) = self.devices.get_mut(&id) {
                         d.paired = true;
@@ -421,6 +457,14 @@ impl Hub {
                 Some(i) => format!("FAILED {i}: {message}"),
                 None => format!("FAILED: {message}"),
             },
+            Event::Abilities { id, describes, in_use, .. } => format!(
+                "{id} is a {describes}{}",
+                match in_use {
+                    Some(true) => " · in use",
+                    Some(false) => " · nothing plugged in",
+                    None => "",
+                }
+            ),
             Event::Paired { id } => format!("paired {id}"),
             Event::PairingFailed { id, message } => format!("PAIRING FAILED {id}: {message}"),
             Event::Unpaired { id } => format!("unpaired {id}"),
@@ -559,6 +603,23 @@ impl Backend for DemoBackend {
                 self.queue
                     .push((now + self.latency, Event::PowerIs { id, power: Power::Off }));
             }
+            // The demo accessory is an OUTLET with nothing plugged into it, which is the
+            // more interesting of the two states to see in the UI: "switch" and "outlet"
+            // look the same until one of them tells you the socket is empty.
+            Command::Inspect(id) => {
+                self.queue.push((
+                    now + self.latency,
+                    Event::Abilities {
+                        id,
+                        describes: "outlet · identify".into(),
+                        can_identify: true,
+                        in_use: Some(false),
+                    },
+                ));
+            }
+            // Nothing to report: the accessory blinks, and the person looking at the
+            // plug is the one who receives the answer.
+            Command::Identify(_) => {}
             Command::Pair { id, setup_code } => {
                 // The demo accepts exactly one code, so the wrong-code path
                 // is visible in the UI without a plug.
@@ -855,5 +916,55 @@ mod tests {
             matches!(evs.first(), Some(Event::Failed { .. })),
             "got {evs:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ability_tests {
+    use super::*;
+
+    fn now() -> Instant { Instant::now() }
+
+    fn hub_with_one() -> (Hub, DeviceId) {
+        let mut h = Hub::new();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF");
+        h.step(vec![Event::Seen { id: id.clone(), name: "plug".into(), kind: Kind::HomeKit, rssi: None }], now());
+        (h, id)
+    }
+
+    /// A row says what the accessory said, and "cannot tell" is not "nothing plugged in".
+    #[test]
+    fn abilities_reach_the_row_and_an_absent_load_sensor_stays_absent() {
+        let (mut h, id) = hub_with_one();
+        let d = h.get(&id).unwrap();
+        assert!(d.abilities.is_none() && !d.can_identify && d.in_use.is_none());
+
+        h.step(vec![Event::Abilities {
+            id: id.clone(),
+            describes: "outlet · identify".into(),
+            can_identify: true,
+            in_use: Some(false),
+        }], now());
+        let d = h.get(&id).unwrap();
+        assert_eq!(d.abilities.as_deref(), Some("outlet · identify"));
+        assert!(d.can_identify);
+        assert_eq!(d.in_use, Some(false), "the plug says nothing is drawing");
+        assert!(!d.pending, "the answer ends the in-flight state");
+
+        // a switch, which has no load sensor at all
+        h.step(vec![Event::Abilities { id: id.clone(), describes: "switch".into(), can_identify: false, in_use: None }], now());
+        let d = h.get(&id).unwrap();
+        assert_eq!(d.in_use, None, "no sensor is not the same as nothing plugged in");
+        assert!(!d.can_identify);
+    }
+
+    #[test]
+    fn the_journal_says_what_was_learned() {
+        let (mut h, id) = hub_with_one();
+        h.step(vec![Event::Abilities { id: id.clone(), describes: "outlet".into(), can_identify: false, in_use: Some(true) }], now());
+        let last = h.journal().last().unwrap();
+        assert!(last.contains("is a outlet") && last.contains("in use"), "{last}");
+        h.step(vec![Event::Abilities { id, describes: "outlet".into(), can_identify: false, in_use: Some(false) }], now());
+        assert!(h.journal().last().unwrap().contains("nothing plugged in"));
     }
 }

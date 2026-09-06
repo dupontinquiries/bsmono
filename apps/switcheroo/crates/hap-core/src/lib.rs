@@ -14,6 +14,9 @@
 //! * [`session`] — the per-direction counters the verified session runs on.
 //! * [`ble`] — HAP-BLE PDUs, fragmentation, the [`ble::Transport`] seam, and
 //!   the [`ble::Controller`] that drives all of the above.
+//! * [`signature`] — `Characteristic-Signature-Read` and a capability probe, so a
+//!   controller offers only the controls the accessory has: an outlet's read-only
+//!   `Outlet In Use`, a light's `Brightness`, `Identify` for "which one are you".
 //! * [`sim`] — an accessory behind that seam, so the whole thing is tested
 //!   without a plug.
 //!
@@ -37,9 +40,12 @@ pub mod keys;
 pub mod pair_setup;
 pub mod pair_verify;
 pub mod session;
+/// Characteristic signatures and the capability probe: what an accessory actually has.
+pub mod signature;
 pub mod sim;
 pub mod srp;
 pub mod tlv8;
 
 pub use ble::{Controller, HapError, Transport, TransportError};
 pub use keys::Pairing;
+pub use signature::{Capabilities, Signature};

@@ -36,6 +36,12 @@ pub enum Fault {
 const IID_PAIR_SETUP: u16 = 0x0A;
 const IID_PAIR_VERIFY: u16 = 0x0B;
 const IID_ON: u16 = 0x0C;
+/// The rest of an OUTLET, which is what a WSP100 is: the load sensor, the blinker and the
+/// owner's name. Simulated so `Controller::probe` is exercised end to end — a probe tested
+/// only against absent characteristics proves the negative and nothing else.
+const IID_OUTLET_IN_USE: u16 = 0x0D;
+const IID_IDENTIFY: u16 = 0x0E;
+const IID_NAME: u16 = 0x0F;
 
 pub struct Accessory {
     pub id: String,
@@ -47,6 +53,13 @@ pub struct Accessory {
     /// Set on a successful pair-setup: (controller id, controller LTPK).
     pub paired_controller: Option<(String, [u8; 32])>,
     pub on: bool,
+    /// Something is plugged in and drawing. Read-only to a controller, as on real
+    /// hardware — the accessory decides, and a UI that offers to set it is lying.
+    pub in_use: bool,
+    /// Set when a controller writes Identify: the blink a person is meant to see.
+    pub identified: u32,
+    /// The owner's name for this accessory.
+    pub name: String,
     // in-flight
     inbound: ble::Reassembler,
     outbound: VecDeque<Vec<u8>>,
@@ -86,6 +99,9 @@ impl Accessory {
             fault: Fault::None,
             paired_controller: None,
             on: false,
+            in_use: false,
+            identified: 0,
+            name: "sim outlet".to_string(),
             inbound: ble::Reassembler::default(),
             outbound: VecDeque::new(),
             session: None,
@@ -135,8 +151,60 @@ impl Accessory {
                 let body = Tlv::new().with(param::VALUE, [self.on as u8]).encode();
                 self.respond(req.tid, status::SUCCESS, body);
             }
+            // ── the rest of the outlet ──
+            (iid, op) if matches!(iid, IID_OUTLET_IN_USE | IID_IDENTIFY | IID_NAME) && self.session.is_none() => {
+                let _ = op;
+                self.respond(req.tid, status::INSUFFICIENT_AUTHENTICATION, Vec::new());
+            }
+            (IID_OUTLET_IN_USE, opcode::CHARACTERISTIC_READ) => {
+                let body = Tlv::new().with(param::VALUE, [self.in_use as u8]).encode();
+                self.respond(req.tid, status::SUCCESS, body);
+            }
+            // READ-ONLY, and the accessory says so rather than accepting the write: a
+            // controller that writes here has misread the signature, and silently
+            // succeeding would hide that.
+            (IID_OUTLET_IN_USE, opcode::CHARACTERISTIC_WRITE) => {
+                self.respond(req.tid, status::INVALID_REQUEST, Vec::new());
+            }
+            (IID_IDENTIFY, opcode::CHARACTERISTIC_WRITE) => {
+                self.identified += 1;
+                self.respond(req.tid, status::SUCCESS, Vec::new());
+            }
+            (IID_NAME, opcode::CHARACTERISTIC_READ) => {
+                let body = Tlv::new().with(param::VALUE, self.name.as_bytes()).encode();
+                self.respond(req.tid, status::SUCCESS, body);
+            }
+            // ── signatures: what each characteristic is ──
+            (iid, opcode::CHARACTERISTIC_SIGNATURE_READ) => {
+                match Self::signature_for(iid) {
+                    Some(body) => self.respond(req.tid, status::SUCCESS, body),
+                    None => self.respond(req.tid, status::INVALID_INSTANCE_ID, Vec::new()),
+                }
+            }
             (_, _) => self.respond(req.tid, status::INVALID_INSTANCE_ID, Vec::new()),
         }
+    }
+
+    /// The signature TLV for one instance, or `None` for an instance with no signature.
+    ///
+    /// Properties match real hardware: `On` reads and writes, `Outlet In Use` only reads,
+    /// `Identify` only writes (a controller cannot ask whether a device is blinking).
+    fn signature_for(iid: u16) -> Option<Vec<u8>> {
+        use crate::signature::{prop, sig};
+        let (ty, props, format) = match iid {
+            IID_ON => (characteristic::ON, prop::SECURE_READ | prop::SECURE_WRITE | prop::NOTIFY_CONNECTED, 0x01u8),
+            IID_OUTLET_IN_USE => (characteristic::OUTLET_IN_USE, prop::SECURE_READ | prop::NOTIFY_CONNECTED, 0x01),
+            IID_IDENTIFY => (characteristic::IDENTIFY, prop::SECURE_WRITE, 0x01),
+            IID_NAME => (characteristic::NAME, prop::SECURE_READ, 0x19),
+            _ => return None,
+        };
+        Some(
+            Tlv::new()
+                .with(sig::CHARACTERISTIC_TYPE, ty.to_le_bytes())
+                .with(sig::PROPERTIES, props.to_le_bytes())
+                .with(sig::FORMAT, [format, 0x00, 0x00])
+                .encode(),
+        )
     }
 
     fn error(state: u8, code: u8) -> Vec<u8> {
@@ -292,6 +360,9 @@ impl Transport for Accessory {
             characteristic::PAIR_SETUP => Ok(IID_PAIR_SETUP),
             characteristic::PAIR_VERIFY => Ok(IID_PAIR_VERIFY),
             characteristic::ON => Ok(IID_ON),
+            characteristic::OUTLET_IN_USE => Ok(IID_OUTLET_IN_USE),
+            characteristic::IDENTIFY => Ok(IID_IDENTIFY),
+            characteristic::NAME => Ok(IID_NAME),
             other => Err(TransportError(format!("accessory has no characteristic {other:#04x}"))),
         }
     }
@@ -311,6 +382,51 @@ mod tests {
         let (id, sk) = new_controller_identity();
         let mut c = Controller::new(acc);
         c.pair_setup(&id, sk, code)
+    }
+
+    /// THE PROBE, against an accessory that has an outlet's characteristics and not a
+    /// light's. What the controller may offer is what the accessory said, not a guess
+    /// from its advertisement.
+    #[test]
+    fn a_probe_learns_the_outlet_and_refuses_to_invent_a_dimmer() {
+        let mut acc = Accessory::new("AA:BB:CC:DD:EE:FF", "031-45-154", 100);
+        acc.name = "desk lamp".into();
+        acc.in_use = true;
+        let pairing = pair(&mut acc, "03145154").expect("pair-setup");
+        let mut c = Controller::new(&mut acc);
+        assert_eq!(c.probe().unwrap_err(), HapError::NotVerified, "a probe is a read like any other");
+        c.pair_verify(&pairing).expect("pair-verify");
+
+        let caps = c.probe().expect("probe");
+        assert!(caps.switchable(), "On is writable");
+        assert!(caps.reports_load(), "an outlet says whether it is loaded");
+        assert!(caps.identifiable());
+        assert!(!caps.dimmable(), "no Brightness on this accessory, and none invented");
+        assert_eq!(caps.describe(), "outlet · identify");
+        assert_eq!(caps.name.as_deref(), Some("desk lamp"));
+        // the read-only one is read-only, and the controller can see that BEFORE writing
+        assert!(!caps.get(crate::ble::characteristic::OUTLET_IN_USE).unwrap().writable());
+
+        assert!(c.outlet_in_use().unwrap(), "something is plugged in");
+        c.identify().expect("identify");
+        drop(c);
+        assert_eq!(acc.identified, 1, "the accessory was asked to blink");
+        // Brightness never reached the accessory: the transport refused it by name, so
+        // the probe skipped it rather than the accessory rejecting a request.
+        assert!(!acc.log.iter().any(|l| l.contains("iid 8")), "{:?}", acc.log);
+    }
+
+    #[test]
+    fn writing_a_read_only_characteristic_is_refused_by_the_accessory() {
+        // The signature is the controller's warning; this is what happens when it is
+        // ignored. A silent success here would make the UI show a value the plug does
+        // not have.
+        let mut acc = Accessory::new("AA:BB:CC:DD:EE:FF", "031-45-154", 100);
+        let pairing = pair(&mut acc, "03145154").unwrap();
+        let mut c = Controller::new(&mut acc);
+        c.pair_verify(&pairing).unwrap();
+        let err = c.write_value(crate::ble::characteristic::OUTLET_IN_USE, &[1]).unwrap_err();
+        assert!(matches!(err, HapError::Status { .. }), "{err:?}");
     }
 
     #[test]

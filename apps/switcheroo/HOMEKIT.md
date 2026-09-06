@@ -17,6 +17,31 @@ state 4 in the journal — points at those two lines and nothing else.
 The BLE fragment size is `SWITCHEROO_HAP_MTU` (default 100) because
 btleplug does not expose the negotiated MTU; raise it if pairing is slow.
 
+**Since 2026-09-06: the controller asks what an accessory IS.**
+`hap_core::signature` reads `Characteristic-Signature-Read` (§7.3.4.13) —
+type, service, properties, format — and `Controller::probe` walks the
+characteristics switcheroo cares about (`On`, `Outlet In Use`,
+`Brightness`, `Identify`, `Name`). That is the difference between a plug
+and a switch: an **outlet** reports whether something is plugged in and
+drawing, and `On` alone cannot say a lamp is unplugged. It also gives the
+controller **Identify** — write 1 and the accessory blinks, which is HAP's
+own answer to "which of these three identical plugs is the lamp" — and the
+owner's **Name**.
+
+Properties are load-bearing, not decoration: `Outlet In Use` is read-only
+on every accessory that has it, so a UI drawing it as a toggle offers a
+control that cannot work. The probe refuses to invent capabilities — a
+characteristic the accessory does not expose is skipped, and a probe run
+before pair-verify is an ERROR rather than an empty answer, because
+"insufficient authentication" from every characteristic would otherwise
+read as "this accessory has no controls".
+
+One session answers all of it (`hap::inspect`): each pair-verify is a
+Curve25519 exchange plus two signature round trips over BLE, so asking
+per question would turn opening a row into four handshakes. The row shows
+"outlet · identify · nothing plugged in" and grows a **blink** button only
+when the probe said Identify is there and writable.
+
 In the app: a HomeKit row shows **pair…**, which opens a dialog whose first
 line says what pairing costs (one pairing per accessory; an Apple Home
 loses it; factory reset to get it back), with the setup code and a

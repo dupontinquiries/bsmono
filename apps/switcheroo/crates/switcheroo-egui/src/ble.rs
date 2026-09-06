@@ -217,6 +217,44 @@ async fn radio_loop(
                     store.forget(&id);
                     let _ = ev_tx.send(Event::Unpaired { id });
                 }
+                // ONE SESSION, three answers: what it is, whether it is on, whether
+                // anything is plugged in. See `hap::inspect` — each pair-verify is a
+                // Curve25519 exchange and two signature round trips over BLE, so asking
+                // separately turns opening a row into four handshakes.
+                Command::Inspect(id) => {
+                    let r = match (store.load(&id), find(&central, &id).await) {
+                        (Some(pairing), Ok(p)) => crate::hap::inspect(p, pairing).await,
+                        (None, _) => Err("no pairing for this accessory".to_string()),
+                        (_, Err(e)) => Err(e),
+                    };
+                    match r {
+                        Ok((caps, power, in_use, trace)) => {
+                            for l in trace { let _ = ev_tx.send(Event::Failed { id: None, message: format!("hap {l}") }); }
+                            let _ = ev_tx.send(Event::Abilities {
+                                id: id.clone(),
+                                describes: caps.describe(),
+                                can_identify: caps.identifiable(),
+                                in_use,
+                            });
+                            // The state came free with the same session; sending it means
+                            // the row does not need a second round trip to stop saying "—".
+                            if power != Power::Unknown {
+                                let _ = ev_tx.send(Event::PowerIs { id, power });
+                            }
+                        }
+                        Err(message) => { let _ = ev_tx.send(Event::Failed { id: Some(id), message }); }
+                    }
+                }
+                Command::Identify(id) => {
+                    let r = match (store.load(&id), find(&central, &id).await) {
+                        (Some(pairing), Ok(p)) => crate::hap::identify(p, pairing).await,
+                        (None, _) => Err("no pairing for this accessory".to_string()),
+                        (_, Err(e)) => Err(e),
+                    };
+                    if let Err(message) = r {
+                        let _ = ev_tx.send(Event::Failed { id: Some(id), message });
+                    }
+                }
             }
         }
 
