@@ -65,6 +65,15 @@ pub trait Backend: Send + Sync {
     /// Generate at most `max_tokens` continuing `prompt`.
     fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, String>;
 
+    /// Generate a chat turn: the backend applies the model's own
+    /// template around `system` and `user`, keeps the system half as a
+    /// cacheable prefix, and stops at the end of the assistant's turn.
+    /// The default is raw concatenation -- what a base model wants and
+    /// what every backend did before templates existed here.
+    fn generate_chat(&self, system: &str, user: &str, max_tokens: usize) -> Result<String, String> {
+        self.generate_prefixed(&format!("{system}\n\n"), user, max_tokens)
+    }
+
     /// Generate with a STABLE PREFIX the backend may keep prefilled
     /// across calls. A chat sends the same system prompt every turn;
     /// a backend that can hold its KV pays that prefill once. The
@@ -388,6 +397,9 @@ impl Provider for EngineProvider {
 /// GPU sharing between engines and the renderer: frame-granted slots.
 /// Pure, so it is present with or without the gpu feature.
 pub mod governor;
+/// Chat templates: an instruct model's own turn markers, detected from
+/// the GGUF. Pure.
+pub mod chat_template;
 
 #[cfg(feature = "gpu")]
 mod gpu {
@@ -418,6 +430,14 @@ mod gpu {
         /// step -- the one seam between submissions that is ours.
         governor: Option<crate::governor::Handle>,
         tier: crate::governor::Tier,
+        /// The model's chat family, from its GGUF template.
+        family: crate::chat_template::Family,
+        /// Every token that ends the assistant's turn: the GGUF's eos
+        /// AND the family's end-of-turn AND the tokenizer's control
+        /// stops. Llama 3 declares `<|end_of_text|>` and ends turns
+        /// with `<|eot_id|>`; stopping only on the former ran on into
+        /// a fabricated next turn.
+        stops: Vec<u32>,
     }
 
     impl GpuBackend {
@@ -475,6 +495,13 @@ mod gpu {
             let eos = g
                 .get_u32("tokenizer.ggml.eos_token_id")
                 .or_else(|| tok.special_id("<|eot_id|>"));
+            let family = crate::chat_template::Family::detect(g.get_str("tokenizer.chat_template"));
+            let mut stops: Vec<u32> = tok.control_stop_ids();
+            if let Some(e) = eos { stops.push(e); }
+            if let Some(t) = family.end_of_turn() {
+                if let Some(id) = tok.special_id(t) { stops.push(id); }
+            }
+            stops.sort_unstable(); stops.dedup();
             let adapter = gpu.adapter_name.clone();
             let sampler = gpu_kernels::SamplerParams {
                 temperature: cfg.temperature,
@@ -485,13 +512,19 @@ mod gpu {
                 min_p: 0.0,
             };
             Ok(GpuBackend { gpu, model, tok, eos, adapter, sampler, prefix: std::sync::Mutex::new(None),
-                            governor: cfg.governor.clone(), tier: cfg.tier })
+                            governor: cfg.governor.clone(), tier: cfg.tier, family, stops })
         }
     }
 
     impl Backend for GpuBackend {
         fn describe(&self) -> String {
-            format!("in-process wgpu ({})", self.adapter)
+            format!("in-process wgpu ({}), {} template", self.adapter, self.family.name())
+        }
+
+        fn generate_chat(&self, system: &str, user: &str, max_tokens: usize) -> Result<String, String> {
+            let out = self.generate_prefixed(&self.family.wrap_system(system),
+                                             &self.family.wrap_user(user), max_tokens)?;
+            Ok(self.family.clean(&out))
         }
 
         fn generate_prefixed(&self, prefix: &str, suffix: &str, max_tokens: usize)
@@ -526,10 +559,16 @@ mod gpu {
             // model, never the other way round.
             if let Some(g) = &self.governor { g.acquire(self.tier); }
             let (gov, tier) = (self.governor.clone(), self.tier);
+            let stops = &self.stops;
             self.gpu.generate_kv_stream_from(
                 &self.model, &p.cache, p.len, &suffix_ids, max_tokens, self.eos,
                 &self.sampler, &mut rng, &|| false,
-                |t| { out.push(t); if let Some(g) = &gov { g.acquire(tier); } true });
+                |t| {
+                    if stops.contains(&t) { return false; }
+                    out.push(t);
+                    if let Some(g) = &gov { g.acquire(tier); }
+                    true
+                });
             Ok(self.tok.decode(&out))
         }
 
@@ -548,6 +587,7 @@ mod gpu {
                 &mut rng,
                 &|| false,
                 |t| {
+                    if self.stops.contains(&t) { return false; }
                     out.push(t);
                     if let Some(g) = &gov { g.acquire(tier); }
                     true

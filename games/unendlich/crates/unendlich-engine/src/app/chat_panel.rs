@@ -64,6 +64,16 @@ pub struct ChatPanelOut {
 pub const LOG_LINES: usize = 8;
 
 /// Draw the panel body. Pure: no engine access, no side effects.
+/// Does the blocky voxel font have a glyph for this character?
+///
+/// It is a display face: letters (drawn as capitals), digits, and the
+/// punctuation a title needs. Underscore, `@`, `=`, `,`, `#` and the
+/// like are not in it and render as "?". Kept as a list rather than
+/// probed from the font so the rule is visible and the test is exact.
+pub fn voxel_font_has(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '-' | '/' | ':' | '!' | '?' | '(' | ')' | '\'')
+}
+
 pub fn chat_panel_body(ui: &mut egui::Ui, s: &ChatPanelState<'_>) -> ChatPanelOut {
     let mut out = ChatPanelOut::default();
     ui.set_min_width(560.0);
@@ -127,8 +137,13 @@ pub fn chat_panel_body(ui: &mut egui::Ui, s: &ChatPanelState<'_>) -> ChatPanelOu
             let col = egui::Color32::from_rgb(
                 (255.0 * bright) as u8, (240.0 * bright) as u8, (210.0 * bright) as u8);
             let mut text = egui::RichText::new(ch.to_string()).size(size).color(col);
+            // The voxel font has letters, digits and a little punctuation.
+            // Anything else it draws as its missing-glyph "?" -- which
+            // turned "Q4_K_M" into "Q4?K?M" and hid the underscores in
+            // every model name. Those characters fall back to monospace.
             #[cfg(feature = "unendlich-ui")]
-            { text = text.font(unendlich_ui::menu::blocks_font(size)); }
+            { text = if voxel_font_has(ch) { text.font(unendlich_ui::menu::blocks_font(size)) }
+                     else { text.monospace() }; }
             #[cfg(not(feature = "unendlich-ui"))]
             { text = text.monospace(); }
             ui.label(text);
@@ -309,5 +324,15 @@ mod tests {
             }
         }
         s
+    }
+
+    #[test]
+    fn characters_the_voxel_font_lacks_fall_back() {
+        // "Q4_K_M" rendered as "Q4?K?M": the underscore is not in the
+        // display face. The rule is explicit so it can be pinned.
+        for c in ['A', 'z', '7', ' ', '.', '-', '/', ':'] { assert!(voxel_font_has(c), "{c:?}"); }
+        for c in ['_', '@', '=', ',', '#', '[', ']', '{', '}', '<', '>'] {
+            assert!(!voxel_font_has(c), "{c:?} must fall back to monospace");
+        }
     }
 }

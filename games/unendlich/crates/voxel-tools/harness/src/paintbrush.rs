@@ -326,12 +326,12 @@ impl voxel_tools::llm::Completer for EngineCompleter {
             let mut eng = self.engine.lock().map_err(|_| "engine lock poisoned".to_string())?;
             eng.ensure(&self.path, self.max_tokens)?
         };
-        // The system prompt is the PREFIX and is byte-identical every
-        // turn by construction (prompt.rs keeps it stable and cache-
-        // friendly). The backend keeps its KV; each turn prefills only
-        // the user suffix. On a 1B on a mobile GPU that is the seconds
-        // before the first token, paid once instead of every time.
-        inner.generate_prefixed(&format!("{system}\n\n"), user, self.max_tokens)
+        // A CHAT turn, in the model's own template. Sent as raw text an
+        // instruct model continued the grammar instead of answering it,
+        // and an 8B came back with no usable line. The backend wraps
+        // the system half as a stable, cacheable prefix and stops at the
+        // model's end-of-turn token.
+        inner.generate_chat(system, user, self.max_tokens)
     }
 }
 
