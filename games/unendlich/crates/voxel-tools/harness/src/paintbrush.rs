@@ -305,7 +305,13 @@ impl PendingTurn {
 /// worse for no visible reason.
 #[cfg(feature = "ai-engine")]
 pub struct EngineCompleter {
-    inner: std::sync::Arc<dyn aperture_engine::Backend>,
+    /// The shared resident engine. Loading happens HERE, in `complete`,
+    /// on the worker thread -- not in `completer_for` on the frame.
+    /// The GGUF load into the GPU is seconds; done on the frame it was
+    /// the block on the first /build that every off-thread change
+    /// before this one failed to remove.
+    engine: std::sync::Arc<std::sync::Mutex<ResidentEngine>>,
+    path: String,
     max_tokens: usize,
 }
 
@@ -313,12 +319,19 @@ pub struct EngineCompleter {
 impl voxel_tools::llm::Completer for EngineCompleter {
     fn name(&self) -> &str { "wgpu engine (in-instance)" }
     fn complete(&mut self, system: &str, user: &str) -> Result<String, String> {
+        // Load if needed. The lock is held only for the load; generation
+        // runs on the handle with the lock released, so a second turn
+        // is not serialised behind this one's decode.
+        let inner = {
+            let mut eng = self.engine.lock().map_err(|_| "engine lock poisoned".to_string())?;
+            eng.ensure(&self.path, self.max_tokens)?
+        };
         // The system prompt is the PREFIX and is byte-identical every
         // turn by construction (prompt.rs keeps it stable and cache-
         // friendly). The backend keeps its KV; each turn prefills only
         // the user suffix. On a 1B on a mobile GPU that is the seconds
         // before the first token, paid once instead of every time.
-        self.inner.generate_prefixed(&format!("{system}\n\n"), user, self.max_tokens)
+        inner.generate_prefixed(&format!("{system}\n\n"), user, self.max_tokens)
     }
 }
 
@@ -415,7 +428,7 @@ pub struct Paintbrush {
     pub drone: Option<Drone>,
     /// The resident in-instance engine, if one has been loaded.
     #[cfg(feature = "ai-engine")]
-    pub engine: ResidentEngine,
+    pub engine: std::sync::Arc<std::sync::Mutex<ResidentEngine>>,
     /// Context window and reply budget, used to size the system prompt.
     /// 8192/512 unless the engine reports otherwise.
     pub ctx_tokens: usize,
@@ -457,7 +470,7 @@ impl Paintbrush {
                     ProviderChoice::Fixture
                 }),
             #[cfg(feature = "ai-engine")]
-            engine: ResidentEngine::default(),
+            engine: std::sync::Arc::new(std::sync::Mutex::new(ResidentEngine::default())),
             in_flight: None,
             drone: None,
             land: voxel_tools::land::Registry::new(),
@@ -1058,21 +1071,12 @@ impl Paintbrush {
             }
         } else { model_path.to_string() };
 
-        if self.engine.loaded() != Some(path.as_str()) {
-            self.say(format!("loading {path} into the GPU (once) ..."));
+        let loaded = self.engine.lock().map(|e| e.loaded() == Some(path.as_str())).unwrap_or(false);
+        if !loaded {
+            self.say(format!("loading {path} into the GPU on the worker (once) ..."));
         }
-        log::info!("[paintbrush] engine: ensuring {path}");
-        match self.engine.ensure(&path, 512) {
-            Ok(inner) => {
-                log::info!("[paintbrush] engine ready");
-                Some(Box::new(EngineCompleter { inner, max_tokens: 512 }))
-            }
-            Err(e) => {
-                log::warn!("[paintbrush] engine load failed: {e}");
-                self.say(format!("engine: {e}"));
-                None
-            }
-        }
+        // No load here. The completer loads on the worker when it runs.
+        Some(Box::new(EngineCompleter { engine: self.engine.clone(), path, max_tokens: 512 }))
     }
 
     #[cfg(not(feature = "ai-engine"))]

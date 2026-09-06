@@ -133,22 +133,23 @@ pub fn chat_panel_body(ui: &mut egui::Ui, s: &ChatPanelState<'_>) -> ChatPanelOu
             { text = text.monospace(); }
             ui.label(text);
         }
-        // BLOCK cursor, blinking at 2 Hz. A solid cell, because the
-        // caret in this game is a block, not a line.
-        let on = (s.now * 2.0).fract() < 0.6;
-        let cursor = if on {
-            egui::RichText::new("\u{2588}").size(base)
-                .color(egui::Color32::from_rgb(255, 240, 210))
-        } else {
-            egui::RichText::new("\u{2588}").size(base)
-                .color(egui::Color32::from_rgba_unmultiplied(255, 240, 210, 40))
-        };
-        #[cfg(feature = "unendlich-ui")]
-        let cursor = cursor.font(unendlich_ui::menu::blocks_font(base));
-        ui.label(cursor);
-        // Ask for a redraw while the cursor blinks or letters settle:
-        // otherwise egui only repaints on input and the animation stalls.
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+        // BLOCK cursor: a PAINTED rectangle, static.
+        //
+        // Not a glyph. U+2588 FULL BLOCK is not in the voxel font, so
+        // it rendered as the font's missing-glyph "?" -- which is what
+        // the screenshot showed. A filled rect needs no glyph and is a
+        // block in every font. And not blinking: a cursor that blinks
+        // is a cursor that is sometimes not there, and the flicker at
+        // this frame rate read as a fault rather than a blink.
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(base * 0.6, base * 1.1),
+                                                egui::Sense::hover());
+        ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(255, 240, 210));
+        // Ask for a redraw only while letters are still settling; a
+        // static cursor needs none, and a standing 33 ms repaint request
+        // is what made the old blink stutter at the game's frame rate.
+        if s.char_ages.iter().any(|a| *a < 0.15) {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+        }
     });
 
     // ── card / completions ───────────────────────────────────────
@@ -233,7 +234,7 @@ mod tests {
         let (_, full) = run(&s);
         let sizes: Vec<f32> = full.shapes.iter().filter_map(|p| match &p.shape {
             egui::epaint::Shape::Text(t) if t.galley.text().len() == 1
-                && t.galley.text() != "\u{2588}" => Some(t.galley.rect.height()),
+                => Some(t.galley.rect.height()),
             _ => None,
         }).collect();
         assert!(sizes.len() >= 2, "{sizes:?}");
@@ -242,10 +243,31 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_is_a_block() {
+    fn the_cursor_is_a_painted_block_not_a_glyph() {
+        // U+2588 is not in the voxel font and rendered as "?"; the
+        // cursor is a filled rect now, which needs no glyph.
         let log: Vec<String> = Vec::new();
-        let (_, full) = run(&state("", &log));
-        assert!(collect_text(&full).contains('\u{2588}'), "a block, not an underscore");
+        let (_, full) = run(&state("ab", &log));
+        let text = collect_text(&full);
+        assert!(!text.contains('\u{2588}') && !text.contains('?') && !text.contains('_'),
+                "no cursor glyph of any kind: {text}");
+        let rects = full.shapes.iter().filter(|p| matches!(&p.shape,
+            egui::epaint::Shape::Rect(r) if r.fill == egui::Color32::from_rgb(255, 240, 210))).count();
+        assert!(rects >= 1, "a filled rect in the cursor colour");
+    }
+
+    #[test]
+    fn the_cursor_does_not_blink() {
+        let log: Vec<String> = Vec::new();
+        let count = |now: f64| {
+            let mut st = state("", &log);
+            st.now = now;
+            let (_, full) = run(&st);
+            full.shapes.iter().filter(|p| matches!(&p.shape,
+                egui::epaint::Shape::Rect(r) if r.fill == egui::Color32::from_rgb(255, 240, 210))).count()
+        };
+        assert_eq!(count(0.0), count(0.3), "same cursor at every instant");
+        assert!(count(0.0) >= 1);
     }
 
     #[test]
