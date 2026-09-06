@@ -246,7 +246,9 @@ pub fn eye_delay(i: usize) -> f64 {
 /// eased out (fast in, gentle settle).
 pub fn reveal_progress(t: f64, delay: f64) -> f32 {
     let u = ((t - delay) / REVEAL_ELEMENT_S).clamp(0.0, 1.0) as f32;
-    1.0 - (1.0 - u) * (1.0 - u) * (1.0 - u)
+    // the kit's curve, not a hand-rolled cubic: one place decides what "eased out" means
+    // here, in `motion`, alongside every other animation in the fleet.
+    crate::motion::ease::out_cubic(u)
 }
 
 /// Draw the code for `layout` at `side` points on a glass card. Returns the response of
@@ -789,7 +791,7 @@ impl Expanded {
     /// 0..1, OutCubic over the fade.
     pub fn alpha(&self, now: f64) -> f32 {
         let t = ((now - self.opened_at) / FADE_S).clamp(0.0, 1.0) as f32;
-        1.0 - (1.0 - t).powi(3)
+        crate::motion::ease::out_cubic(t)
     }
     /// May a release close it yet?
     pub fn can_close(&self, now: f64) -> bool {

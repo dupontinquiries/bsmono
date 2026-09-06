@@ -109,6 +109,8 @@ pub fn reassemble(frames: &[Vec<u8>]) -> Option<Vec<u8>> {
 
 /// How long the viewer shows each frame of a sequence.
 pub const FRAME_DWELL_S: f64 = 1.2;
+/// How long a symbol takes to appear, and how long one frame takes to become the next.
+pub const APPEAR_S: f64 = 0.34;
 
 /// Which frame to show at `t` seconds since the sequence started.
 pub fn frame_at(t: f64, count: usize) -> usize {
@@ -118,9 +120,38 @@ pub fn frame_at(t: f64, count: usize) -> usize {
     ((t / FRAME_DWELL_S).max(0.0) as usize) % count
 }
 
+/// The appearance, eased out: 0..1 over [`APPEAR_S`] from `t`, on the kit's `out_cubic`.
+/// A code that cuts in is a flash on a dark screen; one that eases in is a thing arriving.
+pub fn appear(t: f64) -> f32 {
+    crate::motion::ease::out_cubic((t / APPEAR_S).clamp(0.0, 1.0) as f32)
+}
+
+/// How far through the change from the previous frame to `frame_at(t)`: 1.0 once settled.
+/// Each frame eases in over its first [`APPEAR_S`], so a sequence pulses rather than
+/// stutters — and a scanner still gets a full still for most of the dwell.
+pub fn frame_appear(t: f64, count: usize) -> f32 {
+    if count <= 1 {
+        return appear(t);
+    }
+    let into = (t.max(0.0)) % FRAME_DWELL_S;
+    appear(into.min(t))
+}
+
 /// Draw a symbol into `rect` on the identicon's glass card. Quiet zone of four modules.
 pub fn paint(painter: &egui::Painter, rect: Rect, m: &Matrix, pixels_per_point: f32, c: &PaletteColors) {
+    paint_appearing(painter, rect, m, pixels_per_point, c, 1.0);
+}
+
+/// [`paint`] mid-appearance: `p` is 0..1 from [`appear`]. The card is there from the first
+/// frame (it is the surface the code sits on); the modules fade up and settle from a
+/// slightly smaller scale, so the code arrives rather than flashes.
+pub fn paint_appearing(painter: &egui::Painter, rect: Rect, m: &Matrix, pixels_per_point: f32, c: &PaletteColors, p: f32) {
+    let p = p.clamp(0.0, 1.0);
     let (bg, fg) = crate::qr::theme_colors(c);
+    let fg = {
+        let [r, g, b, a] = fg.to_srgba_unmultiplied();
+        Color32::from_rgba_unmultiplied(r, g, b, (a as f32 * p) as u8)
+    };
     painter.rect_filled(rect, CornerRadius::same(crate::qr::CARD_RADIUS), bg);
     painter.rect_stroke(
         rect,
@@ -134,6 +165,10 @@ pub fn paint(painter: &egui::Painter, rect: Rect, m: &Matrix, pixels_per_point: 
     // an integer cell in physical pixels, converted back to points
     let cell_px = ((side * ppp) / (m.size as f32 + 2.0 * quiet)).floor().max(1.0);
     let cell = cell_px / ppp;
+    // settles from 96% — small enough that a scanner reading mid-appearance still sees a
+    // square grid, large enough that the arrival is visible
+    let k = 0.96 + 0.04 * p;
+    let cell = cell * k;
     let used = cell * m.size as f32;
     let origin = rect.center() - egui::vec2(used, used) * 0.5;
     let at = |x: usize, y: usize| origin + egui::vec2(x as f32 * cell, y as f32 * cell);
@@ -205,7 +240,7 @@ pub fn huge_ui(ctx: &egui::Context, state: &mut Option<crate::qr::Expanded>, fra
             ui.painter().rect_filled(window, 0.0, Color32::from_rgba_unmultiplied(c.bg_base.r(), c.bg_base.g(), c.bg_base.b(), (242.0 * a) as u8));
             let code_rect = Rect::from_center_size(Pos2::new(window.center().x, window.top() + margin + side * 0.5), egui::vec2(side, side));
             if let Some(m) = frames.get(idx) {
-                paint(ui.painter(), code_rect, m, ctx.pixels_per_point(), c);
+                paint_appearing(ui.painter(), code_rect, m, ctx.pixels_per_point(), c, frame_appear(now - ex.opened_at, frames.len()));
             }
             if a < 1.0 {
                 ui.painter().rect_filled(window, 0.0, Color32::from_rgba_unmultiplied(c.bg_base.r(), c.bg_base.g(), c.bg_base.b(), (255.0 * (1.0 - a)) as u8));
@@ -278,6 +313,21 @@ mod tests {
         let mut wrong = fr.clone();
         wrong[1][12] ^= 1;
         assert_eq!(reassemble(&wrong), None, "a corrupt part fails the checksum");
+    }
+
+    #[test]
+    fn a_symbol_eases_in_and_every_frame_of_a_sequence_does_too() {
+        assert_eq!(appear(0.0), 0.0);
+        assert!((appear(APPEAR_S) - 1.0).abs() < 1e-6);
+        assert!(appear(APPEAR_S * 0.5) > 0.8, "out_cubic: most of the way early");
+        assert!(appear(APPEAR_S * 0.5) < 1.0);
+        // a single frame eases once and stays
+        assert!((frame_appear(5.0, 1) - 1.0).abs() < 1e-6);
+        // in a sequence each frame eases over its own first moments
+        assert_eq!(frame_appear(0.0, 3), 0.0);
+        assert!((frame_appear(FRAME_DWELL_S - 0.01, 3) - 1.0).abs() < 1e-6, "settled by the end of a dwell");
+        assert!(frame_appear(FRAME_DWELL_S + 0.001, 3) < 0.2, "the next frame starts from nothing");
+        assert!((frame_appear(FRAME_DWELL_S + APPEAR_S, 3) - 1.0).abs() < 1e-6);
     }
 
     #[test]
