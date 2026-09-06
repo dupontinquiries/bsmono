@@ -30,33 +30,6 @@ Net: 2 of the 6 are real, not 6.
 
 ## Open
 
-- **`hatch-core::anim::Board` is never called from `hatch-egui` — the grid has no motion at all.**
-  This corrects an entry I wrote two revisions ago in this same file (see the strikethrough below)
-  that called the `Board` port "not actually a gap" because its code landed and its own tests
-  pass. That check was incomplete: it confirmed the module exists and works in isolation, and
-  never checked whether the shell actually calls it — the exact distinction
-  `maintenance/tools/reachability.py` exists to draw, and the exact failure shape
-  `UI_STRATEGY.md` names by example (a tested dialog nobody draws). Caught this time by directly
-  grepping `egui-frontend/src/*.rs` for `anim::`, `Board`, and `SlidePattern` — zero hits,
-  confirmed twice. `reachability.py` itself doesn't catch this specific case: it checks
-  reachability *within* a crate, and `Board` is reached — by `hatch-core`'s own tests, in the
-  same crate. Whether the *downstream* crate (`hatch-egui`) ever imports it is a cross-crate
-  question the tool doesn't ask, which is why this needed a manual read rather than a tool run to
-  find.
-
-  `grid()` places every tile with a plain `ui.horizontal`/`allocate_exact_size` loop — tiles snap
-  into their cells every frame; no enter/restack/exit motion happens regardless of `config.anim`
-  or `config.animations`. `LAUNCHER_MERGE.md` marking this port "Done" verified the code landed;
-  it did not verify anyone draws it, which turns out to be the part that decides whether a user
-  ever sees motion.
-
-  Not a quick fix: `grid()`'s current per-frame layout has no persistent tile identity across
-  frames to hand `Board::retarget` (rects are recomputed from scratch every frame from
-  `self.core.results()`, not diffed against a previous frame's positions), so wiring this up means
-  restructuring the layout loop to read positions from `Board::poses()` instead of computing them
-  inline — a real feature change. Not attempted in this pass; flagging with the precise mechanism
-  so whoever picks it up isn't starting from "is this even broken."
-
 - **Per-tile hover/press animation (`iconAnimationStyle`) is not ported — and the original's own
   squish-as-a-hover-style path (id 6) is confirmed dead code, not a missing style.** The QML
   schema comment reads `<!-- 0 none, 1 bounce, 3 wiggle, 6 squish; other legacy ids map to bounce
@@ -107,6 +80,40 @@ Net: 2 of the 6 are real, not 6.
   mechanism now fully named so whoever has the phone can wire the actual number in directly.
 
 ## Closed
+
+- ~~**`hatch-core::anim::Board` is never called from `hatch-egui` — the grid has no motion at
+  all.**~~ Closed — the headline finding of this whole review, now wired. `grid()` no longer
+  lays tiles out with a static row/col loop; it calls `Board::retarget`/`tick` every frame from
+  `self.core.results()`'s live order and paints each tile at its returned `(x, y, scale, alpha)`
+  via `ui.interact(rect, stable_id, sense)` at an absolute position, rather than through egui's
+  layout cursor. `board.config` is read from `core.config.anim` every frame — no extra clamp
+  needed, since `Config::load()` already zeroes every duration when `animations=false`, exactly
+  per that loader's own documented "one code path" intent.
+
+  Required one small, justified addition to `hatch-core`: `Launcher::entry(id)`, a lookup that
+  works regardless of the current query filter — `results()` alone can't find a tile that's mid
+  exit-fade after being filtered out, and the shell still needs its name/icon for those last
+  frames. Tested there directly.
+
+  Two things intentionally simplified, recorded rather than hidden: cell size is now square
+  (`Vec2::splat`, was a 4px-off rectangle) because `GridSpec`/`Board` assume one `cell: f32` for
+  both axes; and `TilePose::rot` (used only by the Scatter slide pattern) is not applied to the
+  painted icon — rotating a `p.image()` needs a transformed mesh, real additional work, and
+  skipping it only mutes one pattern's flourish, not its position or timing.
+
+  Compiled and tested for real: `cargo test` green across all three touched crates —
+  `hatch-core` 71/71 (+1), `uikit-egui` 456/456 (unaffected), `hatch-egui` 29/29 (+3 new tests
+  that directly prove the wiring is genuine rather than decorative: first paint is not already
+  settled, a zero-duration config settles on frame one, a filtered-out tile survives one frame
+  mid-fade before disappearing). Fixed two latent test-staleness bugs this exposed along the way
+  (`open_menu` caching a tile's pre-entrance position; the empty-query test not waiting for the
+  exit-fade) — neither was a production bug, both were tests assuming a static layout that no
+  longer holds. `Harness` gained a synthetic clock (`RawInput.time`, stepped 1/60s per frame)
+  instead of egui's real-wallclock fallback, matching `anim.rs`'s own no-real-sleep testing style.
+
+  Not run on a real display — no GPU/session in this sandbox — so the actual on-screen look
+  (does the stagger read as intended, does the ease feel right) is unverified beyond headless
+  position/scale/alpha assertions.
 
 - ~~**`uikit-egui`'s `a11y.rs` is unused.**~~ Closed. Every tile `grid()` paints now registers a
   `Semantics::button` into an `A11yScene` field on `HatchUi`, keyed by a hash of the entry's own
