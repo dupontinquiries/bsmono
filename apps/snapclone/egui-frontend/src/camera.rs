@@ -21,7 +21,7 @@
 //!
 //! The geometry is pure and tested; the drawing is a thin pass over it.
 
-use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use egui::{Color32, Pos2, Rect, Sense, Ui, Vec2};
 
 /// Which way the camera points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

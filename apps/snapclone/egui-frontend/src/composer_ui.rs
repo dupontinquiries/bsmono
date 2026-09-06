@@ -14,7 +14,7 @@
 //!
 //! Model in `composer.rs`; this only draws it.
 
-use crate::composer::{Composer, Duration, COLORS};
+use crate::composer::{Composer, Duration};
 use uikit_egui::PaletteColors;
 
 /// Timer chips, as the Qt `kDurations[]`: 3s, 5s, 10s, ∞ (zero = unlimited).
@@ -103,23 +103,13 @@ pub fn compose_controls(ui: &mut egui::Ui, composer: &mut Composer, c: &PaletteC
         ui.label(egui::RichText::new("A").size(24.0).color(c.text));
     });
     ui.label(egui::RichText::new("Tap image to reposition text").small().color(c.text_weak));
-    // ── timer chips ──
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Timer:").small().color(c.text_weak));
-        for d in TIMER_CHIPS {
-            let on = composer.duration == d;
-            let chip = egui::Button::new(
-                egui::RichText::new(d.label()).strong().color(if on { c.bg_base } else { c.text }),
-            )
-            .fill(if on { c.accent } else { c.bg_raised })
-            .stroke(egui::Stroke::new(1.0, if on { c.accent } else { c.border }))
-            .corner_radius(6.0)
-            .min_size(egui::vec2(0.0, 32.0));
-            if ui.add(chip).clicked() {
-                composer.duration = d;
-            }
-        }
-    });
+    // ── timer chips, through the kit's chips::row (extracted from here) ──
+    let labels: Vec<String> = TIMER_CHIPS.iter().map(|d| d.label()).collect();
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let selected = TIMER_CHIPS.iter().position(|d| *d == composer.duration).unwrap_or(1);
+    if let Some(i) = uikit_egui::chips::row(ui, Some("Timer:"), &refs, selected, c) {
+        composer.duration = TIMER_CHIPS[i];
+    }
     // what the timer MEANS, said before the send (see outbox::Delivery)
     let delivery = crate::outbox::Delivery::of(composer.duration);
     ui.label(

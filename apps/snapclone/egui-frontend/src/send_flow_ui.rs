@@ -7,36 +7,15 @@
 use crate::send_flow::{SendFlow, Step};
 use uikit_egui::PaletteColors;
 
-/// Four cells in ONE galley: `1 Take · photo  ›  2 Compose  ›  3 Choose  ›  4 Send`.
-/// The current one strong in the accent, the done ones plain, the rest weak.
-///
-/// One `LayoutJob` rather than a label per cell: the layout probe caught a
-/// `horizontal_wrapped` of eight labels painting them on top of one another
-/// at phone width, and a single text run cannot overlap itself.
+/// The strip, through the kit's `steps::strip` (extracted from here): `1 Take · photo  ›
+/// 2 Compose  ›  3 Choose  ›  4 Send`, the current one strong in the accent.
 pub fn stepper_strip(ui: &mut egui::Ui, flow: &SendFlow, c: &PaletteColors) {
-    use egui::text::{LayoutJob, TextFormat};
-    let font = egui::TextStyle::Small.resolve(ui.style());
-    let mut job = LayoutJob::default();
-    job.wrap.max_width = ui.available_width().max(120.0);
-    let cells = flow.stepper();
-    for (i, cell) in cells.iter().enumerate() {
-        let color = if cell.current { c.accent } else if cell.done { c.text } else { c.text_weak };
-        let mut fmt = TextFormat { font_id: font.clone(), color, ..Default::default() };
-        if cell.current {
-            fmt.underline = egui::Stroke::new(1.0, c.accent);
-        }
-        job.append(&cell.label(), 0.0, fmt);
-        if i + 1 < cells.len() {
-            job.append(
-                "  \u{203a}  ",
-                0.0,
-                TextFormat { font_id: font.clone(), color: c.text_weak, ..Default::default() },
-            );
-        }
-    }
-    // A wrapping Label, so a strip that does break onto a second line is
-    // given the height for it instead of painting over the row below.
-    ui.add(egui::Label::new(job).wrap());
+    let cells: Vec<uikit_egui::steps::StepCell> = flow
+        .stepper()
+        .iter()
+        .map(|cell| uikit_egui::steps::StepCell::new(cell.label(), cell.current, cell.done))
+        .collect();
+    uikit_egui::steps::strip(ui, &cells, c);
     let _ = Step::Capture; // the enum is the strip's contract; keep the import honest
 }
 
