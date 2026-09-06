@@ -238,7 +238,18 @@ pub fn to_render(file: &LayoutFile, shift: Shift) -> crate::Layout {
                     } else {
                         (k.label.clone(), action_emit(&k.action, &k.label))
                     };
-                    let mut key = crate::Key::emitting(&label, &emit, k.width);
+                    // THE ROLE AND THE LATCH, from the layout file and the board's state —
+                    // not guessed from the label. `key_type` is a field on the shared
+                    // `board_layouts::Key` and this projection dropped it, so on the REAL
+                    // board (the one the phone runs) Enter was a grey cap like every other
+                    // and a caps lock was invisible.
+                    let mut key = crate::Key::emitting(&label, &emit, k.width)
+                        .with_role(crate::KeyRole::from_key_type(k.key_type))
+                        .with_latch(match (&k.action, shift) {
+                            (KeyAction::Shift, Shift::Once) => crate::Latch::Once,
+                            (KeyAction::Shift, Shift::Caps) => crate::Latch::Locked,
+                            _ => crate::Latch::Off,
+                        });
                     key.variants = if shift.active() && !k.extended_shifted.is_empty() {
                         k.extended_shifted.clone()
                     } else {

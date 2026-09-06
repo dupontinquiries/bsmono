@@ -359,21 +359,70 @@ pub fn candidate_bar(ui: &mut Ui, cands: &[WordCandidate], adaptive: &Adaptive) 
         return None;
     }
     let mut picked = None;
-    ui.horizontal(|ui| {
+    // THE GTK RIBBON: `.suggestions-bar` is a 40px row with 2px/4px padding and ONE
+    // hairline along its bottom edge, holding `.suggestion-pill`s — transparent, no
+    // border, 12px radius, 13px text, tinting on hover and accent-tinting on press. The
+    // port drew default egui Buttons: each candidate came with its own box and border, so
+    // the ribbon read as a second row of keys sitting on top of the keyboard rather than
+    // as a strip of words. Pills are the whole difference between "a word you can tap" and
+    // "a key that happens to say 'the'".
+    let colors = uikit_egui::palette_colors("system");
+    let bar_h = BAR_HEIGHT.max(adaptive.min_touch_target * 0.7);
+    let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), bar_h), egui::Sense::hover());
+    let mut strip = ui.new_child(egui::UiBuilder::new().max_rect(bar_rect.shrink2(Vec2::new(4.0, 2.0))));
+    strip.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = adaptive.gutter;
         for (i, c) in cands.iter().take(5).enumerate() {
             let best = i == 0;
+            // The best candidate is the one that commits on space, so it is the one that
+            // reads first — heavier, not bigger, because a taller pill would make the
+            // ribbon's height jump as candidates change.
             let text = egui::RichText::new(&c.word)
-                .size(if best { 17.0 } else { 15.0 })
+                .size(PILL_FONT_PT)
+                .color(colors.text)
                 .strong();
-            let btn = egui::Button::new(text).min_size(Vec2::new(0.0, adaptive.min_touch_target * 0.7));
-            if ui.add(btn).clicked() {
+            let text = if best { text } else { text.weak() };
+            let btn = egui::Button::new(text)
+                .fill(egui::Color32::TRANSPARENT)
+                .stroke(Stroke::NONE)
+                .corner_radius(egui::CornerRadius::same(PILL_RADIUS))
+                .min_size(Vec2::new(0.0, bar_h - 4.0));
+            let r = ui.add(btn);
+            // `.suggestion-pill:hover` / `:active` — the tint IS the affordance, since the
+            // pill has no border of its own.
+            if r.is_pointer_button_down_on() {
+                ui.painter().rect_filled(
+                    r.rect,
+                    egui::CornerRadius::same(PILL_RADIUS),
+                    egui::Color32::from_rgba_unmultiplied(colors.accent.r(), colors.accent.g(), colors.accent.b(), 38),
+                );
+            } else if r.hovered() {
+                ui.painter().rect_filled(
+                    r.rect,
+                    egui::CornerRadius::same(PILL_RADIUS),
+                    egui::Color32::from_white_alpha(20),
+                );
+            }
+            if r.clicked() {
                 picked = Some(c.word.clone());
             }
         }
     });
+    // `border-bottom: 1px solid alpha(@borders, 0.3)` — one line, under the ribbon, which
+    // is what separates it from the board without giving it a box of its own.
+    ui.painter().hline(
+        bar_rect.x_range(),
+        bar_rect.bottom() - 0.5,
+        Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(colors.border.r(), colors.border.g(), colors.border.b(), 77)),
+    );
     picked
 }
+
+/// `.suggestions-bar { height-request: 40 }`.
+pub const BAR_HEIGHT: f32 = 40.0;
+/// `.suggestion-pill { border-radius: 12px; font-size: 13px }`.
+pub const PILL_RADIUS: u8 = 12;
+pub const PILL_FONT_PT: f32 = 13.0;
 
 #[cfg(test)]
 mod tests {

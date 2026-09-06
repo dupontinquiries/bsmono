@@ -94,6 +94,26 @@ pub struct Key {
     /// COMMITS, and it is meant to be findable without reading it — and a locked shift is a
     /// solid accent cap you can see from across the room. Neither existed here.
     pub role: KeyRole,
+    /// A modifier's LATCH, which GTK carries as the extra CSS classes `.shift-active` and
+    /// `.shift-locked` on the shift key.
+    ///
+    /// The port had no equivalent, so a one-shot shift and a caps lock looked exactly like
+    /// an idle shift: the only way to know which of three states the board was in was to
+    /// type a letter and see what came out. On the GTK board a locked shift is a solid
+    /// accent cap you can read from across the room.
+    pub latch: Latch,
+}
+
+/// A modifier's latch state — `.shift-active` / `.shift-locked` in the stylesheet.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum Latch {
+    #[default]
+    Off,
+    /// Armed for one press. Tinted accent, accent text, accent border.
+    Once,
+    /// Held until turned off. Solid accent, white text — the loudest state on the board,
+    /// because it is the one that silently changes what every other key does.
+    Locked,
 }
 
 /// A key's role, mirroring `board_layouts::KeyType` and the four CSS classes the GTK
@@ -154,14 +174,20 @@ impl KeyRole {
 
 impl Key {
     pub fn new(label: &str) -> Key {
-        Key { label: label.to_string(), weight: 1.0, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None , role: KeyRole::from_label(label) }
+        Key { label: label.to_string(), weight: 1.0, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None , role: KeyRole::from_label(label) , latch: Latch::Off }
     }
     pub fn wide(label: &str, weight: f32) -> Key {
-        Key { label: label.to_string(), weight, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None , role: KeyRole::from_label(label) }
+        Key { label: label.to_string(), weight, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None , role: KeyRole::from_label(label) , latch: Latch::Off }
     }
     pub fn emitting(label: &str, emit: &str, weight: f32) -> Key {
-        Key { label: label.to_string(), weight, emit: emit.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None , role: KeyRole::from_label(label) }
+        Key { label: label.to_string(), weight, emit: emit.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None , role: KeyRole::from_label(label) , latch: Latch::Off }
     }
+    /// Set a modifier's latch — `.shift-active` / `.shift-locked`.
+    pub fn with_latch(mut self, latch: Latch) -> Key {
+        self.latch = latch;
+        self
+    }
+
     /// Set the key's role explicitly — for a layout that knows better than the label does.
     pub fn with_role(mut self, role: KeyRole) -> Key {
         self.role = role;
@@ -275,7 +301,7 @@ fn layout_from_json(text: &str) -> Result<Layout, serde_json::Error> {
         keys: r.keys.into_iter().map(|k| {
             let emit = k.action.as_ref().and_then(|a| emit_for_action(&a.kind)).unwrap_or(&k.label).to_string();
             let role = k.key_type.as_deref().map(KeyRole::from_json).unwrap_or_else(|| KeyRole::from_label(&k.label));
-            let mut key = Key { role, label: k.label, weight: k.width, emit, variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None };
+            let mut key = Key { role, latch: Latch::Off, label: k.label, weight: k.width, emit, variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None };
             if !k.extended.is_empty() { key.variants = k.extended; }
             key
         }).collect(),
@@ -751,6 +777,15 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
         // "shift" and "?123" one look, and lost the accent cap entirely.
         let (fill, stroke) = if pressed {
             (uikit_egui::glass_tint(c.accent, uikit_egui::GlassAlphas::PRESSED_ACCENT), uikit_egui::key_border(c.border))
+        } else if key.latch == Latch::Locked {
+            // .key-modifier.shift-locked: solid accent. The loudest cap on the board.
+            (c.accent, uikit_egui::key_border(c.accent))
+        } else if key.latch == Latch::Once {
+            // .key-modifier.shift-active: accent at 0.25 with an accent border.
+            (
+                egui::Color32::from_rgba_unmultiplied(c.accent.r(), c.accent.g(), c.accent.b(), 64),
+                Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(c.accent.r(), c.accent.g(), c.accent.b(), 128)),
+            )
         } else if key.role == KeyRole::Action {
             // .key-action: accent at 0.85, going solid on hover.
             let a = if resp.hovered() { 255 } else { 217 };
@@ -769,8 +804,10 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
         }
         // .key-action's label is white at rest too — that is what makes it read as the
         // commit key rather than as another grey cap.
-        let text_color = if pressed || key.role == KeyRole::Action {
+        let text_color = if pressed || key.role == KeyRole::Action || key.latch == Latch::Locked {
             egui::Color32::WHITE
+        } else if key.latch == Latch::Once {
+            c.accent
         } else if key.role == KeyRole::Special {
             c.text.gamma_multiply(0.85)
         } else {
@@ -1572,6 +1609,37 @@ mod gtk_parity_tests {
         assert!(roles.len() >= 4, "only {} distinct roles — key_type is not being read", roles.len());
     }
 
+    /// The board the phone actually runs is `real_layout::to_render`, a different projection
+    /// from `layout_from_json` — and it dropped the same field, plus the shift state.
+    #[test]
+    fn the_real_board_carries_roles_and_shows_which_shift_is_on() {
+        use crate::real_layout::{to_render, Shift};
+        let file = crate::real_layout::parse(include_str!("../../resources/layouts/en_us_qwerty.json"))
+            .expect("the shipped layout parses");
+        let find = |l: &crate::Layout, label: &str| {
+            l.rows.iter().flat_map(|r| &r.keys).find(|k| k.label == label).cloned()
+        };
+
+        let off = to_render(&file, Shift::Off);
+        assert_eq!(find(&off, "⏎").unwrap().role, KeyRole::Action, "Enter commits, and looks like it");
+        assert_eq!(find(&off, "⌫").unwrap().role, KeyRole::Special);
+        let shift_off = find(&off, "⇧").unwrap();
+        assert_eq!(shift_off.role, KeyRole::Modifier);
+        assert_eq!(shift_off.latch, Latch::Off);
+
+        // ONE-SHOT and LOCKED are different caps, because they are different states and
+        // the only way to tell them apart before this was to type a letter and look.
+        let once = to_render(&file, Shift::Once);
+        assert_eq!(find(&once, "⇧").unwrap().latch, Latch::Once);
+        let caps = to_render(&file, Shift::Caps);
+        assert_eq!(find(&caps, "⇧").unwrap().latch, Latch::Locked);
+
+        // the latch is on the SHIFT key only — a letter does not light up because caps is on
+        let a = find(&caps, "A").or_else(|| find(&caps, "a")).expect("a letter key");
+        assert_eq!(a.latch, Latch::Off);
+        assert_eq!(a.role, KeyRole::Normal);
+    }
+
     /// A layout built in code has no `key_type`, so the label decides — by NAME, not by
     /// length. Length is what made "space" a modifier.
     #[test]
@@ -1586,6 +1654,51 @@ mod gtk_parity_tests {
         // an unknown key_type from a newer layout renders as a plain key rather than failing
         assert_eq!(KeyRole::from_json("navigation"), KeyRole::Normal);
         assert_eq!(KeyRole::from_json("ACTION"), KeyRole::Action, "case does not matter");
+    }
+
+    /// The ribbon is a strip of words with one hairline under it, not a second row of keys.
+    /// The port drew default egui Buttons: each candidate came with its own box and border.
+    #[test]
+    fn the_suggestion_ribbon_is_pills_and_one_hairline() {
+        use board_gestures::WordCandidate;
+        use crate::swipe::{candidate_bar, BAR_HEIGHT};
+        let cands: Vec<WordCandidate> = ["the", "then", "there"]
+            .iter()
+            .map(|w| WordCandidate { word: (*w).to_string(), score: 1.0 })
+            .collect();
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 200.0)));
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let a = Adaptive { min_touch_target: 44.0, gutter: 4.0, ..Adaptive::default() };
+                let _ = candidate_bar(ui, &cands, &a);
+            });
+        });
+        // No pill paints a border or a fill at rest: a resting ribbon is words on the
+        // surface. (Hover and press tint, but nothing is hovered in a headless frame.)
+        let filled: Vec<&egui::epaint::RectShape> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Rect(r) => Some(r),
+                _ => None,
+            })
+            .filter(|r| r.fill.a() > 0 || r.stroke.width > 0.0)
+            // The panel's own background is a rect too, and it is the full frame; a PILL is
+            // word-sized. Anything smaller than a third of the width inside the ribbon is
+            // one, and there should be none of them at rest.
+            .filter(|r| r.rect.width() < 120.0 && r.rect.height() < 60.0)
+            .collect();
+        assert!(filled.is_empty(), "a resting pill painted a box: {:?}", filled.iter().map(|r| r.rect).collect::<Vec<_>>());
+        // and the three words are there, at the stylesheet's size
+        let texts = uikit_egui::layout_probe::texts(&out.shapes);
+        assert_eq!(texts.len(), 3, "{:?}", texts.iter().map(|t| &t.text).collect::<Vec<_>>());
+        assert!(texts.iter().all(|t| (t.font_pt - crate::swipe::PILL_FONT_PT).abs() < 0.6), "{:?}", texts[0].font_pt);
+        // the hairline: one horizontal line at the ribbon's bottom
+        let lines = out.shapes.iter().filter(|s| matches!(s.shape, egui::Shape::LineSegment { .. })).count();
+        assert_eq!(lines, 1, "expected exactly one hairline under the ribbon, saw {lines}");
+        assert!(BAR_HEIGHT >= 40.0);
     }
 
     /// The press moves the cap (`transform: scale(0.94)`) about its own centre, so a pressed
