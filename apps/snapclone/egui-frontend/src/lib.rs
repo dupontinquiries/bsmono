@@ -281,6 +281,8 @@ pub struct Snapclone {
     /// host into `HostCommand::SendSnap`. `send_requested` stays for the palette's
     /// bare "send to" action, which has no composition behind it.
     pub send_request: Option<crate::send_flow::SendRequest>,
+    /// The expanded full-screen view of my code (the C++ showExpandedQr): `Some` while open.
+    pub qr_expanded: Option<uikit_egui::qr::Expanded>,
     /// The unified bottom bar (Qt UnifiedNavBar): page arrows, sub-tab segments, underline
     /// morph, page dots. Owns the page + sub-tab state; `nav` mirrors the page for swipe.
     pub bar: UnifiedNav,
@@ -964,6 +966,7 @@ impl Snapclone {
             send_requested: Vec::new(),
             send_flow: Default::default(),
             send_request: None,
+            qr_expanded: None,
             bar: UnifiedNav::new(),
             login_visible: !auto_logged_in,
             nav: Nav::new(PAGES.len()),
@@ -2565,8 +2568,12 @@ impl Snapclone {
     pub fn open_qr_scan(&mut self, camera: bool) {
         self.qr = Some(if camera { crate::qr::QrScan::scanning() }
                        else { crate::qr::QrScan::manual_only() });
+        // Sized for what it holds: the scanner (or the manual field), the
+        // typed-code form, MY CODE at 168 with its two lines, and close. The
+        // 340×420 it had was the scanner alone; once my code joined it the
+        // lower half painted below the dialog's own card, over the page.
         self.modal.present_default("qr", crate::modal::Layer::Dialog,
-                                   crate::modal::Rect::new(20.0, 80.0, 340.0, 420.0));
+                                   crate::modal::Rect::new(20.0, 56.0, 380.0, 600.0));
     }
 
     /// A scanned or pasted code becomes a peer, through the SAME path a typed
@@ -3323,9 +3330,19 @@ impl Snapclone {
             if let Some(r) = r {
                 let area = egui::Rect::from_min_size(
                     egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
-                let painter = ui.painter();
-                painter.rect_filled(area, 8.0, colors.bg_base);
-                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area.shrink(12.0)));
+                // ON THE FOREGROUND LAYER. The dialog was painted in the page's
+                // own layer, BEFORE the page — invisible while the page was
+                // transparent rows, and the moment the page became glass cards
+                // the cards painted over it (seen: "SCAN A CODE" under "find").
+                // A dialog is a thing above the page; egui's layer order says
+                // so, not the call order.
+                let layer = egui::LayerId::new(egui::Order::Foreground, ui.id().with("qr-dialog"));
+                let mut child = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(area));
+                child.painter().rect_filled(area, uikit_egui::tokens::RADIUS_MD as f32, colors.bg_card);
+                child.painter().rect_stroke(area, uikit_egui::tokens::RADIUS_MD as f32,
+                    egui::Stroke::new(1.0, egui::Color32::from_white_alpha(uikit_egui::glass::GlassAlphas::HAIRLINE)),
+                    egui::StrokeKind::Inside);
+                let mut child = child.new_child(egui::UiBuilder::new().max_rect(area.shrink(12.0)));
                 let mut scanned = None;
                 if let Some(q) = self.qr.as_mut() {
                     scanned = crate::qr::qr_ui(&mut child, q, &colors);
@@ -3334,7 +3351,9 @@ impl Snapclone {
                 // shows yours so they can read it back. With only the scanner,
                 // an exchange needs a third device.
                 child.separator();
-                crate::qr::my_code_ui(&mut child, &self.local_id, &colors);
+                if crate::qr::my_code_ui(&mut child, &self.local_id, &colors) {
+                    self.qr_expanded = Some(uikit_egui::qr::Expanded::open(ui.input(|i| i.time)));
+                }
                 if child.button("close").clicked() {
                     self.qr = None;
                     self.modal.dismiss("qr");
@@ -3562,6 +3581,10 @@ impl Snapclone {
         // Last, over everything: the keyboard caption.
         self.keyboard_caption(ui, &colors);
 
+        // MY CODE, expanded: the C++ overlay — scrim, the code at 80% width,
+        // the id at 24, Close — on the foreground layer, over every page.
+        let layout = crate::qr_render::layout_for(&self.local_id);
+        uikit_egui::qr::expanded_ui(ui.ctx(), &mut self.qr_expanded, &self.local_id, &layout, &colors);
         // THE DIM, painted last so it covers the page rather than being
         // covered by it. dim_overlay_ui returns immediately at zero, so this
         // costs nothing on the overwhelming majority of frames — the phone is
