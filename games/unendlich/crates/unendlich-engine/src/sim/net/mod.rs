@@ -45,6 +45,7 @@ pub mod world_cmd_wire; // r391-mp: WorldCmd reliable-channel codec + remote app
 pub mod presence_loop; // r392-mp: host re-announce + browser classify/evict over WorldAdvert
 pub mod client_join; // r393-mp: client join driver (mailbox handshake → hole-punch → connected)
 pub mod dht_mailbox;
+pub mod device_session; // multi-device mode over the DHT: session codes, device adverts, the host's device table, the phone's discovery ladder + pairing
 pub mod entity_snapshot; // r330: host-authoritative entity transform replication (§C, item 7)
 pub mod identity;
 pub mod session;

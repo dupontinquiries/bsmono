@@ -39,8 +39,14 @@ pub struct MailboxKey(pub [u8; 32]);
 
 /// Mailbox key for an id: `H(id)`.
 pub fn mailbox_key(id: &UnendlichId) -> MailboxKey {
+    key_of(id.as_str())
+}
+
+/// The key for any label — ids here, `unendlich-session:<code>` and `unendlich-devices:<code>`
+/// in `device_session`. One hash, so two modules cannot disagree about where a key is.
+pub fn key_of(label: &str) -> MailboxKey {
     // FNV-1a expanded across 4 lanes with distinct offsets.
-    let bytes = id.as_str().as_bytes();
+    let bytes = label.as_bytes();
     let mut out = [0u8; 32];
     for lane in 0..4u64 {
         let mut h: u64 = 0xcbf29ce484222325 ^ lane.wrapping_mul(0x100000001b3);
@@ -63,11 +69,16 @@ pub enum MailMsg {
     Accept { from: UnendlichId, assigned_name: String, addr: String },
     /// Host -> requester's mailbox. No address.
     Deny { from: UnendlichId },
+    /// A DEVICE (phone controller / second screen) -> the session's device mailbox
+    /// (`device_session::device_mailbox_key`). `caps` is a `DeviceCaps` bit set. The answer is
+    /// an ordinary `Accept` / `Deny` in the device's own mailbox.
+    DeviceRequest { from: UnendlichId, name: String, caps: u8 },
 }
 
 const TAG_REQUEST: u8 = 1;
 const TAG_ACCEPT: u8 = 2;
 const TAG_DENY: u8 = 3;
+const TAG_DEVICE_REQUEST: u8 = 4;
 const MAX_FIELD: usize = 256; // bound every length-prefixed field
 
 impl MailMsg {
@@ -88,6 +99,12 @@ impl MailMsg {
             MailMsg::Deny { from } => {
                 o.push(TAG_DENY);
                 put_str(&mut o, from.as_str());
+            }
+            MailMsg::DeviceRequest { from, name, caps } => {
+                o.push(TAG_DEVICE_REQUEST);
+                put_str(&mut o, from.as_str());
+                put_str(&mut o, name);
+                o.push(*caps);
             }
         }
         o
@@ -114,6 +131,12 @@ impl MailMsg {
             TAG_DENY => {
                 let from = UnendlichId::new(take_str(b, &mut p)?);
                 Some(MailMsg::Deny { from })
+            }
+            TAG_DEVICE_REQUEST => {
+                let from = UnendlichId::new(take_str(b, &mut p)?);
+                let name = take_str(b, &mut p)?;
+                let caps = *b.get(p)?;
+                Some(MailMsg::DeviceRequest { from, name, caps })
             }
             _ => None,
         }
@@ -276,6 +299,15 @@ pub fn host_deny<D: MailboxDht>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_request_round_trips_and_a_truncated_one_is_refused() {
+        let m = MailMsg::DeviceRequest { from: UnendlichId::new("ABCDEFGHJKMN"), name: "Phone".into(), caps: 0b11 };
+        let b = m.encode();
+        assert_eq!(MailMsg::decode(&b).as_ref(), Some(&m));
+        assert!(MailMsg::decode(&b[..b.len() - 1]).is_none(), "the caps byte is required");
+        assert_eq!(mailbox_key(&UnendlichId::new("ABCDEFGHJKMN")), key_of("ABCDEFGHJKMN"), "one hash for ids and labels");
+    }
     use crate::sim::net::identity::{Mailbox, NameRegistry, Whitelist};
 
     fn id(seed: u64) -> UnendlichId {
