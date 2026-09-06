@@ -332,11 +332,19 @@ OPS
   plant A SPECIES [words...] [seedling]          a LIVING tree bred toward the words -- tall,
                                                  ancient, bushy, sparse, hardy, fruit, wide,
                                                  narrow -- placed grown and kept growing
+  feature NAME find=N [r=N]                      let the GROUND choose where: searches N blocks
+                                                 for a site the place suits -- cliffs want a
+                                                 coast, highlands want relief, badlands want
+                                                 banded rock under flat ground
   feature NAME A [r=N] [seed=N]                  a PLACE, not an op: several carves and layers
                                                  that belong together, run in order so each cuts
                                                  into the last. One word, a hundred thousand
                                                  cells. Names below.
-  canyon A B [w=N] [depth=N] [floor=B] [wall=B]  a carved channel: it wanders, its walls step
+  canyon A B [w=N] [depth=N] [floor=B] [strata=NAME]
+                                                 strata=temperate|sedimentary|desert|volcanic|
+                                                 snowy|coastal dresses the cut face in BANDS
+                                                 that line up across it. A carved channel: it
+                                                 wanders, its walls step
                                                  back, its floor falls with the land
   cave A [dir=DEG] [len=N] [r=N] [branches=N]    branching tunnels with chambers. It stays UNDER
                                                  the rock -- a cave has a roof, which is what a

@@ -53,10 +53,16 @@ pub struct Carve {
     /// Expose this block on freshly cut walls: a stone canyon in
     /// sandstone reads as a canyon because the cut face differs.
     pub wall: Option<u16>,
+    /// Dress the cut face from a STRATA PROFILE instead: each exposed
+    /// cell gets the block its depth calls for, so a canyon shows the
+    /// bands it cut through and they line up across it. Wins over
+    /// `wall`, which paints the whole face one colour -- a wall, not a
+    /// cliff.
+    pub strata: Option<(&'static crate::strata::Profile, u64)>,
 }
 
 impl Default for Carve {
-    fn default() -> Self { Self { air: 0, floor: None, water_level: None, water: 9, wall: None } }
+    fn default() -> Self { Self { air: 0, floor: None, water_level: None, water: 9, wall: None, strata: None } }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -149,7 +155,23 @@ fn cut_column<W: VoxelWorld>(w: &W, r: &mut CarveResult, c: &Carve, x: i32, z: i
     if let Some(f) = c.floor {
         if y0 > 0 && w.get(x, y0 - 1, z) != 0 && !r.push((x, y0 - 1, z), f, false) { return false; }
     }
-    if let Some(wall) = c.wall {
+    if let Some((profile, seed)) = c.strata {
+        // The face, banded. Depth is measured from each column's OWN
+        // surface, not from the cut's rim: the bands belong to the
+        // ground, so they stay level across a cut whose rim is not.
+        for d in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let (nx, nz) = (x + d.0, z + d.1);
+            let ntop = (y1 + 40).min(y1 + 40);
+            let _ = ntop;
+            let surf = (0..=y1 + 40).rev().find(|&yy| w.get(nx, yy, nz) != 0).unwrap_or(y1);
+            for y in y0..=y1 {
+                if w.get(nx, y, nz) == 0 { continue; }
+                if r.index.contains_key(&(nx, y, nz)) { continue; }
+                let block = profile.at(nx, nz, surf - y, seed);
+                if !r.push((nx, y, nz), block, false) { return false; }
+            }
+        }
+    } else if let Some(wall) = c.wall {
         // Only the cells that are actually EXPOSED by this cut: rock
         // whose neighbour toward the channel was removed. Dressing all
         // four sides of every column re-wrote the whole cut face once
@@ -336,7 +358,7 @@ pub fn mesa<W: VoxelWorld>(w: &W, centre: (i32, i32), radius: i32, drop: i32, _s
 /// A waterfall: a lip cut into a height, the fall itself, a plunge
 /// pool below, and the gorge it has worn.
 pub fn waterfall<W: VoxelWorld>(w: &W, at: (i32, i32), heading_deg: i32, width: i32, height: i32,
-                                seed: u64, c: &Carve, from_y: i32) -> CarveResult {
+                                _seed: u64, c: &Carve, from_y: i32) -> CarveResult {
     let mut r = CarveResult::default();
     let h = (heading_deg as f32).to_radians();
     let (ux, uz) = (h.cos(), h.sin());

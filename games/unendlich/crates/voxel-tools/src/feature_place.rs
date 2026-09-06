@@ -99,7 +99,9 @@ fn badlands(a: &FeatureArgs) -> Vec<Part> {
         let from = around(a.at, r / 3, deg);
         let to = around(a.at, r, deg + pick(i + 90, a.seed, -25, 25));
         v.push(Part { what: format!("side canyon {}", i + 1),
-                      ir: format!("canyon {},{} {},{} w={} depth={} floor=sand wall=sandstone seed={}\n",
+                      // strata, not one flat colour: the canyon shows the
+                      // bands it cut, and they line up across it
+                      ir: format!("canyon {},{} {},{} w={} depth={} floor=sand strata=sedimentary seed={}\n",
                                   from.0, from.1, to.0, to.1, pick(i + 7, a.seed, 8, 18),
                                   pick(i + 13, a.seed, 10, 22), a.seed ^ i as u64),
                       estimate: r as i64 * 14 * 16 / 2 });
@@ -107,7 +109,7 @@ fn badlands(a: &FeatureArgs) -> Vec<Part> {
     // a dry wash across the whole thing, shallow and wide
     let (w0, w1) = (around(a.at, r, 200), around(a.at, r, 20));
     v.push(Part { what: "the dry wash".into(),
-                  ir: format!("canyon {},{} {},{} w={} depth=5 floor=sand seed={}\n",
+                  ir: format!("canyon {},{} {},{} w={} depth=5 floor=sand strata=sedimentary seed={}\n",
                               w0.0, w0.1, w1.0, w1.1, r / 8, a.seed ^ 0x5a5a),
                   estimate: r as i64 * 2 * (r / 8) as i64 * 3 });
     v.push(Part { what: "desert cover".into(),
@@ -135,7 +137,7 @@ fn gorge(a: &FeatureArgs) -> Vec<Part> {
     let (from, to) = (around(a.at, r, 190), around(a.at, r, 10));
     let depth = (r / 4).clamp(12, 60);
     v.push(Part { what: "the gorge".into(),
-                  ir: format!("canyon {},{} {},{} w={} depth={} floor=stone seed={}\n",
+                  ir: format!("canyon {},{} {},{} w={} depth={} floor=stone strata=temperate seed={}\n",
                               from.0, from.1, to.0, to.1, (r / 6).clamp(10, 40), depth, a.seed),
                   estimate: r as i64 * 2 * (r / 6) as i64 * depth as i64 / 2 });
     // the river runs along its floor

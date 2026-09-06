@@ -125,6 +125,8 @@ pub mod scatter;
 pub mod carve;
 /// Places, not operations: composite terrain features streamed part by part.
 pub mod feature_place;
+/// Strata: what the ground is made of by depth, and finding a site by what it is made of.
+pub mod strata;
 /// The review loop: elevations and measurements to the model, a ten-token verdict back.
 pub mod review;
 /// Context under a budget: the conversation chain, folding into summaries, grouped plans.

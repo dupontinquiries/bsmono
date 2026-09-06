@@ -239,14 +239,16 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                                             None => format!("evolve '{phrase}' for {gens} generations, {levels} level(s)") }),
                      None);
             }
-            Op::Feature { name, at, radius, seed } => {
+            Op::Feature { name, at, radius, seed, find } => {
                 match crate::feature_place::lookup(name) {
                     Some(f) => {
                         let parts = (f.plan)(&crate::feature_place::FeatureArgs {
-                            at: *at, radius: *radius, seed: *seed as u64, ground: 64 });
+                            at: at.unwrap_or((0, 0)), radius: *radius, seed: *seed as u64, ground: 64 });
                         let est: i64 = parts.iter().map(|p| p.estimate).sum();
                         total += est;
-                        push(Note::Info, format!("feature '{name}' at {at:?} r={radius}: {} part(s) -- {} -- roughly {est} blocks",
+                        push(Note::Info, format!("feature '{name}' {} r={radius}: {} part(s) -- {} -- roughly {est} blocks",
+                                                 match find { Some(r) => format!("(searching {r} for a site)"),
+                                                              None => format!("at {:?}", at.unwrap_or((0, 0))) },
                                                  parts.len(),
                                                  parts.iter().map(|p| p.what.as_str()).collect::<Vec<_>>().join(", ")), None);
                     }

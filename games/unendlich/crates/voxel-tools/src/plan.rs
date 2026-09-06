@@ -266,11 +266,15 @@ pub enum Op {
     /// A composite terrain feature: a PLACE made of several carves and
     /// layers, run part by part so the first appears while the last is
     /// still being computed.
-    Feature { name: String, at: (i32, i32), radius: i32, seed: i32 },
+    Feature { name: String, at: Option<(i32, i32)>, radius: i32, seed: i32,
+              /// Search this far for a site the feature suits, rather
+              /// than taking the coordinate as given.
+              find: Option<i32> },
     /// Carved terrain: canyon, cave, mesa, waterfall, overhang. Removes
     /// rock rather than raising a heightfield, so it can make a roof.
     Carve { kind: String, a: (i32, i32), b: (i32, i32), nums: Vec<(String, i32)>,
-            block: Option<u16>, floor: Option<u16>, water: Option<i32>, seed: i32 },
+            block: Option<u16>, floor: Option<u16>, water: Option<i32>, seed: i32,
+            strata_name: Option<String> },
     /// A JSON scatter: a structure and a rule about where its instances
     /// go. Resolved against the world at run time into sites; the host
     /// decides whether to build them now or hold them.
@@ -739,9 +743,12 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
             }
             "feature" | "place" if t.get(1).map(|n| crate::feature_place::lookup(n).is_some()).unwrap_or(false) => {
                 let name = t[1].to_lowercase();
-                let at = rel(&t, 2, anchor).unwrap_or_else(|| anchor_xz(anchor));
+                let find = t.iter().find_map(|s| s.strip_prefix("find=")).and_then(|v| v.parse::<i32>().ok());
+                let at = if find.is_some() && t.len() > 2 && !t[2].contains(',') && !t[2].starts_with('@') {
+                    None                                    // `feature gorge find=400`: no coordinate
+                } else { rel(&t, 2, anchor).or_else(|| Some(anchor_xz(anchor))) };
                 ops.push(Op::Feature { name, at, radius: kvi(&t, "r", 140).clamp(20, 500),
-                                       seed: kvi(&t, "seed", 1) });
+                                       seed: kvi(&t, "seed", 1), find: find.map(|v| v.clamp(50, 4000)) });
             }
             "feature" => {
                 bad(format!("unknown feature '{}'; known: {}", t.get(1).unwrap_or(&""),
@@ -764,6 +771,7 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     floor: t.iter().find_map(|s| s.strip_prefix("floor=")).and_then(blk),
                     water: t.iter().find_map(|s| s.strip_prefix("water=")).and_then(|v| v.parse().ok()),
                     seed: kvi(&t, "seed", 1),
+                    strata_name: t.iter().find_map(|s| s.strip_prefix("strata=")).map(|s| s.to_string()),
                 });
             }
             "scatter_json" | "place_many" => {
@@ -1423,13 +1431,38 @@ pub fn run_plan_with<W: VoxelWorld>(
                 r
             })(),
             Op::Spec(_) => CallResult { ok: true, summary: "spec noted".into(), ..Default::default() },
-            Op::Feature { name, at, radius, seed } => (|| {
+            Op::Feature { name, at, radius, seed, find } => (|| {
                 let Some(f) = crate::feature_place::lookup(name) else {
                     return CallResult { ok: false, summary: format!("unknown feature '{name}'"), ..Default::default() };
                 };
+                // FIND A SITE, or take the one given. A place belongs
+                // somewhere: cliffs want a coast, highlands want relief,
+                // badlands want banded rock and flat ground. Asking the
+                // ground where a feature fits is better than asking the
+                // model for a coordinate, which is the thing it cannot do.
+                let centre = anchor_xz(plan.anchor);
+                let (at, found_note) = match find {
+                    Some(range) => {
+                        let q = crate::strata::query_for(name);
+                        let prof = crate::strata::for_palette("temperate");
+                        let (sites, notes) = crate::strata::find_sites(
+                            tools.world, (centre.0 - range, centre.1 - range), (centre.0 + range, centre.1 + range),
+                            (range / 12).max(8), *radius, &q, prof, *seed as u64, 1);
+                        match sites.first() {
+                            Some(s) => {
+                                let away = (((s.at.0 - centre.0).pow(2) + (s.at.1 - centre.1).pow(2)) as f32).sqrt() as i32;
+                                (s.at, format!(" (found {away} blocks away, relief {})", s.relief))
+                            }
+                            None => return CallResult { ok: false,
+                                summary: format!("feature '{name}': nowhere within {range} suits it -- {}", notes.join("; ")),
+                                ..Default::default() },
+                        }
+                    }
+                    None => (at.unwrap_or(centre), String::new()),
+                };
                 let ground = tools.find_surface(at.0, at.1, from_y).unwrap_or(from_y);
                 let parts = (f.plan)(&crate::feature_place::FeatureArgs {
-                    at: *at, radius: *radius, seed: *seed as u64, ground });
+                    at, radius: *radius, seed: *seed as u64, ground });
                 // PART BY PART. A feature is hundreds of thousands of
                 // cells and seconds of work; running it as one list
                 // would hold the drone for all of it and then hand the
@@ -1451,17 +1484,22 @@ pub fn run_plan_with<W: VoxelWorld>(
                 }
                 CallResult {
                     ok: !done.is_empty(), blocks_changed: blocks,
-                    summary: format!("feature '{name}' r={radius}: {} part(s), {blocks} blocks -- {}{}",
+                    summary: format!("feature '{name}' r={radius} at {at:?}{found_note}: {} part(s), {blocks} blocks -- {}{}",
                                      done.len(), done.join(", "),
                                      if failed.is_empty() { String::new() }
                                      else { format!("; FAILED: {}", failed.join(", ")) }),
                     ..Default::default()
                 }
             })(),
-            Op::Carve { kind, a, b, nums, block, floor, water, seed } => (|| {
+            Op::Carve { kind, a, b, nums, block, floor, water, seed, strata_name } => (|| {
                 use crate::carve::{self, Carve as CarveOpts};
                 let num = |k: &str, d: i32| nums.iter().find(|(n, _)| n == k).map(|(_, v)| *v).unwrap_or(d);
-                let opts = CarveOpts { air: 0, floor: *floor, water_level: *water, water: 9, wall: *block };
+                // `strata=NAME` dresses the cut face from a rock profile
+                // -- banded, and level across the cut. `wall=` is the one
+                // flat colour it replaced; both still work.
+                let profile = strata_name.as_deref().and_then(crate::strata::lookup);
+                let opts = CarveOpts { air: 0, floor: *floor, water_level: *water, water: 9,
+                                       wall: *block, strata: profile.map(|p| (p, *seed as u64)) };
                 let r = match kind.as_str() {
                     "canyon" => carve::canyon(tools.world, *a, *b, num("w", 14).clamp(2, 200),
                                               num("depth", 20).clamp(2, 128), *seed as u64, &opts, from_y),
@@ -2475,5 +2513,65 @@ scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
         let e = issues.iter().find(|i| i.severity == Severity::Error).expect("an error");
         assert!(e.message.contains("unknown structure 'zigurat'"), "{}", e.message);
         assert!(!line_is_valid_ir("scatter_json { \"structure\": \"zigurat\" }"), "the validator takes it back");
+    }
+
+    #[test]
+    fn a_feature_can_find_its_own_site_and_says_where() {
+        // A world with a lake in the east: cliffs belong there, not at
+        // the anchor.
+        struct Coast;
+        impl VoxelWorld for Coast {
+            fn get(&self, x: i32, y: i32, _z: i32) -> u16 {
+                let h = if x > 200 { 62 } else { 74 };
+                if x > 200 && y == h { return 9; }
+                if y <= h { 1 } else { 0 }
+            }
+            fn set(&mut self, _: i32, _: i32, _: i32, _: u16) -> bool { true }
+        }
+        let (plan, issues) = parse_plan_at("feature cliffs find=400 r=40\n", Some((0, 74, 0)));
+        assert!(issues.iter().all(|i| i.severity != Severity::Error), "{issues:?}");
+        match &plan.ops[0] {
+            Op::Feature { name, at, find, .. } => {
+                assert_eq!(name, "cliffs");
+                assert_eq!(*at, None, "no coordinate: it searches");
+                assert_eq!(*find, Some(400));
+            }
+            o => panic!("{o:?}"),
+        }
+        let mut w = Coast;
+        let run = { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &plan, 200, 32, true) };
+        let log = run.log.join(" ");
+        assert!(log.contains("found") && log.contains("blocks away"), "it says where it went: {log}");
+        // a query nothing satisfies says so rather than building wrongly
+        let (bad, _) = parse_plan_at("feature cliffs find=100 r=40\n", Some((0, 74, 0)));
+        struct Dry;
+        impl VoxelWorld for Dry {
+            fn get(&self, _: i32, y: i32, _: i32) -> u16 { if y <= 74 { 1 } else { 0 } }
+            fn set(&mut self, _: i32, _: i32, _: i32, _: u16) -> bool { true }
+        }
+        let mut d = Dry;
+        let r2 = { let mut t = VoxelTools::new(&mut d); run_plan(&mut t, &bad, 200, 32, true) };
+        assert!(r2.log.join(" ").contains("nowhere within 100 suits it"), "{:?}", r2.log);
+    }
+
+    #[test]
+    fn a_carve_dressed_from_strata_shows_bands_not_one_colour() {
+        struct Flat200;
+        impl VoxelWorld for Flat200 {
+            fn get(&self, _: i32, y: i32, _: i32) -> u16 { if y <= 90 { 1 } else { 0 } }
+            fn set(&mut self, _: i32, _: i32, _: i32, _: u16) -> bool { true }
+        }
+        let mut w = Flat200;
+        let (plan, _) = parse_plan_at("canyon 0,0 60,0 w=10 depth=24 strata=sedimentary seed=3\n", None);
+        let run = { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &plan, 200, 32, true) };
+        assert!(run.blocks_changed > 1000, "{:?}", run.log);
+        // the same carve with a flat wall= for comparison
+        let (flat, _) = parse_plan_at("canyon 0,0 60,0 w=10 depth=24 wall=sandstone seed=3\n", None);
+        let mut w2 = Flat200;
+        let r2 = { let mut t = VoxelTools::new(&mut w2); run_plan(&mut t, &flat, 200, 32, true) };
+        // both carve; the strata one uses several blocks on its face
+        assert!(r2.blocks_changed > 1000);
+        let log = run.log.join(" ");
+        assert!(log.contains("canyon"), "{log}");
     }
 }
