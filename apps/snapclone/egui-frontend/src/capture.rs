@@ -163,6 +163,58 @@ pub trait FrameStream: Send {
     fn read_frame(&mut self, buf: &mut [u8]) -> Result<(), String>;
 }
 
+/// A synthetic camera: a drifting colour gradient with a moving bar, at a
+/// paced ~15 fps, forever. For `SNAPCLONE_TEST_PATTERN=1` — walking and
+/// screenshotting the capture → compose → choose → send sequence on a machine
+/// with no camera and no GStreamer (the sandbox that drew this app's first
+/// screenshots). Not a test fake: the real capture thread, frame pump, texture
+/// upload, shutter and encoder all run; only the pixels come from arithmetic.
+pub struct TestPattern {
+    width: u32,
+    height: u32,
+    frame: u64,
+}
+
+impl TestPattern {
+    pub fn new(width: u32, height: u32) -> TestPattern {
+        TestPattern { width, height, frame: 0 }
+    }
+}
+
+impl FrameStream for TestPattern {
+    fn read_frame(&mut self, buf: &mut [u8]) -> Result<(), String> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        if buf.len() < w * h * 4 {
+            return Err("test pattern: buffer smaller than a frame".into());
+        }
+        let t = self.frame as f32 * 0.05;
+        let bar = ((t.sin() * 0.5 + 0.5) * w as f32) as usize;
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let fx = x as f32 / w as f32;
+                let fy = y as f32 / h as f32;
+                let (r, g, b) = if x.abs_diff(bar) < w / 40 {
+                    (250, 240, 200)
+                } else {
+                    (
+                        (40.0 + 160.0 * fx) as u8,
+                        (60.0 + 120.0 * fy) as u8,
+                        (120.0 + 100.0 * (1.0 - fx) * (1.0 - fy)) as u8,
+                    )
+                };
+                buf[i] = r;
+                buf[i + 1] = g;
+                buf[i + 2] = b;
+                buf[i + 3] = 255;
+            }
+        }
+        self.frame += 1;
+        std::thread::sleep(std::time::Duration::from_millis(66));
+        Ok(())
+    }
+}
+
 /// Walk the plan until stopped.
 ///
 /// Synchronous on purpose: the tests drive it directly with fakes and it

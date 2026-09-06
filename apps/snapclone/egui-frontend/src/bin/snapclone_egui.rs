@@ -11,6 +11,11 @@ use snapclone_egui::audio;
 use snapclone_egui::capture;
 use snapclone_egui::host::{HostCommand, HostEvent};
 use snapclone_egui::Snapclone;
+
+/// `SNAPCLONE_TEST_PATTERN=1`: a synthetic camera in place of the enumerated ones.
+fn test_pattern() -> bool {
+    std::env::var("SNAPCLONE_TEST_PATTERN").map(|v| v == "1").unwrap_or(false)
+}
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use uikit_egui::Adaptive;
@@ -47,6 +52,14 @@ impl CaptureRig {
         self.kill = capture::KillSwitch::new();
         let (shared, stop, kill) = (self.shared.clone(), self.stop.clone(), self.kill.clone());
         self.thread = Some(std::thread::spawn(move || {
+            if test_pattern() {
+                let opener = |_: &capture::SourceCandidate| -> Result<Box<dyn capture::FrameStream>, String> {
+                    Ok(Box::new(capture::TestPattern::new(w, h)))
+                };
+                capture::run(&plan, w, h, opener, &shared, &stop,
+                             std::time::Duration::from_millis(500));
+                return;
+            }
             let opener = capture::gst_opener(w, h, kill);
             capture::run(&plan, w, h, opener, &shared, &stop,
                          std::time::Duration::from_millis(500));
@@ -293,7 +306,21 @@ impl App {
         // Sent once at startup rather than polled: hotplug needs a
         // netlink or inotify watch, which is a bigger change, and a
         // camera present at launch is the case that was broken.
-        snap.apply(HostEvent::CamerasFound(snapclone_egui::camera_enumerate::enumerate()));
+        let cameras = if test_pattern() {
+            // SNAPCLONE_TEST_PATTERN=1: one synthetic device, so the whole
+            // capture path — plan, thread, pump, upload, shutter, encode —
+            // runs with no camera and no GStreamer. See capture::TestPattern.
+            eprintln!("snapclone: SNAPCLONE_TEST_PATTERN — synthetic camera, no device opened");
+            vec![snapclone_egui::camera_select::Device {
+                id: "test-pattern".into(),
+                label: "Test pattern (synthetic)".into(),
+                facing: snapclone_egui::camera_select::Facing::Rear,
+                capture_group: None,
+            }]
+        } else {
+            snapclone_egui::camera_enumerate::enumerate()
+        };
+        snap.apply(HostEvent::CamerasFound(cameras));
         let port = snap.settings.current.network.gossip_port;
         let gossip = match snapclone_egui::gossip_wire::GossipSocket::bind(port) {
             Ok(s) => Some(s),
