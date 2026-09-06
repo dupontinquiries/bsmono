@@ -147,6 +147,9 @@ pub struct ChatSession {
     pub last_prose: String,
     /// Living plants placed by commits, awaiting the engine.
     pub planted: Vec<crate::flora::PlantRequest>,
+    /// Builds the current prose names, resolved by the host from the
+    /// claims before the turn. Cleared by the host after.
+    pub referents: Vec<LastBuild>,
     /// A spec line from `/like`, prepended to the next plan received so
     /// the tuner targets it. Consumed by that plan.
     pub pending_spec: Option<String>,
@@ -254,7 +257,8 @@ impl ChatSession {
         // next turn. So the cache is also INVALIDATED explicitly by
         // commit, undo and the host whenever the world changes.
         let lb = self.last_build.as_ref().map(|b| format!("{}{:?}{:?}", b.name, b.min, b.max))
-            .unwrap_or_default();
+            .unwrap_or_default()
+            + &self.referents.iter().map(|r| format!("|{}{:?}", r.name, r.min)).collect::<String>();
         let key = format!("{}|{:.2}|{:.2}|{}|{}", f.feature_id, self.climate.0, self.climate.1,
                           surface_name.unwrap_or(""), lb);
         if let Some((k, text)) = &*self.context_cache.borrow() {
@@ -281,7 +285,7 @@ impl ChatSession {
         // description than the one the world can just be read for.
         let scene = crate::scene::read(tools, f.anchor, self.scene_radius,
                                        self.from_y, 15);
-        let last = match &self.last_build {
+        let mut last = match &self.last_build {
             Some(lb) => format!(
                 "\nLAST BUILD '{}': box {:?}..{:?}, {} blocks{}. Follow-ups should attach to it; \
                  @0,0,0 is the focus anchor, not this box -- use its coordinates.",
@@ -289,6 +293,15 @@ impl ChatSession {
                 lb.palette_hint.as_ref().map(|p| format!(", palette {p}")).unwrap_or_default()),
             None => String::new(),
         };
+        // NAMED BUILDS the prose mentions, resolved by the host from the
+        // claims: "make the mill taller" gets the mill's box even when
+        // the last build was the well. Without this a name the player
+        // uses is a name the model cannot see.
+        for r in &self.referents {
+            last.push_str(&format!(
+                "\nNAMED BUILD '{}': box {:?}..{:?}, {} blocks. The player refers to it by name; \
+                 use its coordinates.", r.name, r.min, r.max, r.blocks));
+        }
         format!("{}\n{site}\n\n{}\n\n{digest}\n{col}{last}",
                 f.read_hint(surface_name), scene.prompt_block())
     }
@@ -1469,5 +1482,16 @@ mod tests {
         assert!(ChatSession::like_spec("a plain tower", &idx).is_none());
         assert!(ChatSession::like_spec("like the mill", &idx).is_some(), "at the start of a command");
         assert!(ChatSession::like_spec("like the cathedral", &idx).is_none(), "no such build");
+    }
+
+    #[test]
+    fn a_named_build_is_in_the_context_beside_the_last_one() {
+        let mut w = Flat::new();
+        let mut s = ChatSession::new(32, 200);
+        s.last_build = Some(LastBuild { name: "the well".into(), min: (0, 65, 0), max: (2, 67, 2), blocks: 20, palette_hint: None });
+        s.referents.push(LastBuild { name: "the mill".into(), min: (40, 65, 40), max: (52, 74, 50), blocks: 900, palette_hint: None });
+        let ctx = { let t = VoxelTools::new(&mut w); s.context(&t, &gaze_at(0, 0, 10.0), None) };
+        assert!(ctx.contains("LAST BUILD 'the well'"), "{ctx}");
+        assert!(ctx.contains("NAMED BUILD 'the mill': box (40, 65, 40)..(52, 74, 50)"), "{ctx}");
     }
 }

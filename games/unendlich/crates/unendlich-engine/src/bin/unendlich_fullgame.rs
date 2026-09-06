@@ -1115,7 +1115,9 @@ fn main() {
     // alongside the chunk edits (the chunk manager takes ownership of `world_root` next).
     let mut flora_root = world_root.clone();
     let mut chunk_manager = ChunkManager::new(generator, num_workers)
-        .with_storage(world_root)
+        // Cloned: the paintbrush loads and saves its state beside the
+        // flora store from this path for the life of the game.
+        .with_storage(world_root.clone())
         .with_fields(field_registry)
         .with_ticks(tick_registry);
     log::info!("ChunkManager ready ({} workers, render distance {})", num_workers, runtime_render_distance());
@@ -3315,7 +3317,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     session.flora = unendlich_engine::world::flora_store::FloraStore::load(&flora_root);
     // Claims, templates and the world tree live beside the flora store
     // and load with it.
-    paintbrush.load_state(&world_root);
+    paintbrush.load_state(&flora_root);
     if !session.flora.is_empty() {
         log::info!("[farm] loaded {} persisted crop(s) from disk", session.flora.len());
     }
@@ -4516,11 +4518,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // A claim, a capture or a commit marks the state dirty; save
             // it now, so a crash loses at most the last action.
             if paintbrush.state_dirty {
-                if let Err(e) = paintbrush.save_state(&world_root) {
+                if let Err(e) = paintbrush.save_state(&flora_root) {
                     log::warn!("[paintbrush] save failed: {e}");
                 }
             }
-            match paintbrush.flush_training(&world_root) {
+            match paintbrush.flush_training(&flora_root) {
                 Ok(n) if n > 0 => log::info!("[paintbrush] {n} training line(s) appended"),
                 Err(e) => log::warn!("[paintbrush] training record failed: {e}"),
                 _ => {}
@@ -15322,7 +15324,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             // first visit ⇒ a clean, freshly-generated world).
                             let _ = session.flora.save(&flora_root);
                             let _ = whitelist.save(&flora_root);
+                            // The paintbrush's claims, templates and world tree are
+                            // bound to a world the same way the flora store is, and
+                            // would otherwise inherit the previous world's claims at
+                            // stale positions -- the r580 bug, for buildings.
+                            paintbrush.state_dirty = true;
+                            let _ = paintbrush.save_state(&flora_root);
+                            let _ = paintbrush.flush_training(&flora_root);
                             flora_root = new_world_dir;
+                            paintbrush = unendlich_engine::voxel_chat::Paintbrush::new(paintbrush.chunk_size)
+                                .inheriting(&paintbrush);
+                            paintbrush.load_state(&flora_root);
                             session.flora =
                                 unendlich_engine::world::flora_store::FloraStore::load(&flora_root);
                             whitelist =

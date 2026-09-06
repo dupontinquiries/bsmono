@@ -189,7 +189,7 @@ impl LoadState {
 }
 
 /// The model list plus what is loaded.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ModelRegistry {
     pub dir: PathBuf,
     pub models: Vec<LocalModel>,

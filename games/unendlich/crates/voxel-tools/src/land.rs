@@ -132,6 +132,24 @@ impl Registry {
     }
 
     /// Worksets whose box covers a point, nearest-centre first.
+    /// Claims the prose names: any workset whose name shares a word of
+    /// four or more letters with the prose ("mill" in "the old mill"),
+    /// in prose order. The referents a build request can attach to.
+    pub fn named_in(&self, prose: &str) -> Vec<&Workset> {
+        let p = prose.to_lowercase();
+        let words: Vec<&str> = p.split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() >= 4).collect();
+        let mut hits: Vec<(usize, &Workset)> = Vec::new();
+        for w in self.sets.values() {
+            let name = w.name.to_lowercase();
+            let name_words: Vec<&str> = name.split(|c: char| !c.is_alphanumeric()).filter(|x| x.len() >= 4).collect();
+            if let Some(pos) = words.iter().position(|pw| name_words.contains(pw)) {
+                hits.push((pos, w));
+            }
+        }
+        hits.sort_by_key(|(pos, _)| *pos);
+        hits.into_iter().map(|(_, w)| w).collect()
+    }
+
     pub fn at(&self, x: i32, z: i32, pad: i32) -> Vec<&Workset> {
         let mut v: Vec<&Workset> = self.sets.values().filter(|w| w.contains(x, z, pad)).collect();
         // Distance to centre, then AREA. Two concentric claims have the
@@ -444,5 +462,20 @@ mod tests {
         let hits = r.at(50, 50, 0);
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].name, "near", "the tightest claim is the one you meant");
+    }
+
+    #[test]
+    fn named_in_finds_claims_by_a_word_in_prose_order() {
+        let mut r = Registry::new();
+        r.claim("the old mill", "kess", (0, 65, 0), (8, 70, 8));
+        r.claim("north tower", "kess", (40, 65, 0), (46, 80, 6));
+        r.claim("the well", "kess", (20, 65, 20), (22, 66, 22));
+        let hits: Vec<&str> = r.named_in("connect the tower to the mill").iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(hits, ["north tower", "the old mill"], "prose order");
+        assert!(r.named_in("a new barn").is_empty());
+        // four-letter names -- mill, barn, well -- are what buildings are
+        // called; three-letter words (the, and, hut?) are where it stops
+        assert_eq!(r.named_in("look at the well").len(), 1, "a four-letter name matches");
+        assert!(r.named_in("fix the hut").is_empty(), "three letters is too short to be a name");
     }
 }

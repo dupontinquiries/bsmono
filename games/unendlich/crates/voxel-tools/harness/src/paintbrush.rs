@@ -249,6 +249,9 @@ impl ProviderChoice {
 pub struct Drone {
     rx: std::sync::mpsc::Receiver<(voxel_tools::chat::ChatSession, Vec<Reply>)>,
     pub started: Instant,
+    /// A preview of a reply still being written: the lines so far. Its
+    /// result is shown but the final reply's drone replaces it.
+    pub partial: Option<usize>,
 }
 
 impl Drone {
@@ -275,6 +278,8 @@ pub struct PendingTurn {
     pub kind: TurnKind,
     /// Cancel flag and live progress, shared with the worker.
     pub ctl: std::sync::Arc<voxel_tools::llm::TurnControl>,
+    /// Lines of the reply already previewed by a partial drone.
+    pub previewed_lines: usize,
 }
 
 /// The kinds of model turn, so the reply is routed without the bin
@@ -445,7 +450,7 @@ pub struct Paintbrush {
     reveal: Vec<Frame>,
     reveal_fps: f32,
     load_started: Option<Instant>,
-    chunk_size: i32,
+    pub chunk_size: i32,
     /// Current backend. Defaults from $UNENDLICH_BUILD_HTTP if set, so a
     /// running ollama is picked up without typing anything.
     pub provider: ProviderChoice,
@@ -1042,7 +1047,7 @@ impl Paintbrush {
             debug_assert_eq!(staged.pending(), 0, "preview must not stage writes");
             let _ = tx.send((session, vec![r]));
         }).expect("spawn drone");
-        self.drone = Some(Drone { rx, started: Instant::now() });
+        self.drone = Some(Drone { rx, started: Instant::now(), partial: None });
         self.say("simulating ... (the world keeps running)");
     }
 
@@ -1052,13 +1057,19 @@ impl Paintbrush {
     pub fn poll_drone(&mut self) {
         let Some(d) = &self.drone else { return };
         let Some((session, replies)) = d.poll() else { return };
-        let took = self.drone.take().map(|d| d.started.elapsed()).unwrap_or_default();
+        let drone = self.drone.take().expect("just polled");
+        let took = drone.started.elapsed();
         log::info!("[paintbrush] drone finished in {:.0} ms", took.as_secs_f32() * 1000.0);
         // Only the fields the dry run produces move over. Anything the
         // frame changed meanwhile -- climate, deferred cells, the land
         // registry -- stays as it is now.
         self.session.pending = session.pending;
         self.session.last_salvage = session.last_salvage;
+        if let Some(n) = drone.partial {
+            // Label the partial so the log reads as progress, not as a
+            // finished plan; the model is still writing.
+            self.say(format!("(partial preview: {n} line(s) so far -- the model is still writing)"));
+        }
         for r in replies { self.push(r); }
     }
 
@@ -1103,6 +1114,13 @@ impl Paintbrush {
         // Same borrow shape as `prompt_for`: the view lives for the
         // length of this call, which is all a prompt needs -- it reads
         // the world and never writes.
+        // Named builds: any claim whose name the prose mentions becomes
+        // a referent the context describes with its box. Resolved here
+        // against the registry, which the session does not hold.
+        self.session.referents = self.land.named_in(prose).into_iter().map(|w| {
+            voxel_tools::chat::LastBuild { name: w.name.clone(), min: w.min, max: w.max,
+                                           blocks: w.blocks(), palette_hint: None }
+        }).collect();
         // The context -- terrain read, ambient, region digest -- is a
         // few hundred thousand block reads on a fresh focus. It used to
         // be built HERE, on the frame, at the moment of Enter: a visible
@@ -1126,6 +1144,8 @@ impl Paintbrush {
             return;
         };
         self.spawn_turn(completer, system, user, gaze, player_feet, prose, TurnKind::Build);
+        // the clone the worker holds has them; the live session is done with them
+        self.session.referents.clear();
     }
 
     /// The system prompt sized for the LOADED model: a 1B gets the
@@ -1191,7 +1211,7 @@ impl Paintbrush {
         });
         self.in_flight = Some(PendingTurn {
             rx, started: Instant::now(), provider: name, gaze: *gaze, player_feet,
-            prose: prose.to_string(), kind, ctl,
+            prose: prose.to_string(), kind, ctl, previewed_lines: 0,
         });
     }
 
@@ -1201,6 +1221,27 @@ impl Paintbrush {
     pub fn spawn_turn_for_test(&mut self, completer: Box<dyn voxel_tools::llm::Completer>, gaze: &Gaze) {
         self.spawn_turn(completer, "system".into(), Box::new(|| "user".into()), gaze, None, "test",
                         TurnKind::Build);
+    }
+
+    /// Test hook: a build turn with the real prompt path and a given
+    /// completer, so a harness can inspect the user prompt.
+    pub fn start_turn_with_completer(&mut self, cm: &ChunkManager, gaze: &Gaze, surface: Option<&str>,
+                                     prose: &str, player_feet: Option<(i32, i32, i32)>,
+                                     completer: Box<dyn voxel_tools::llm::Completer>) {
+        self.session.referents = self.land.named_in(prose).into_iter().map(|w| {
+            voxel_tools::chat::LastBuild { name: w.name.clone(), min: w.min, max: w.max,
+                                           blocks: w.blocks(), palette_hint: None }
+        }).collect();
+        let session = self.session.clone();
+        let drone_world = crate::bind::DroneWorld(cm.drone_view());
+        let (gaze_c, surface_c, prose_c) = (*gaze, surface.map(|s| s.to_string()), prose.to_string());
+        let user: Box<dyn FnOnce() -> String + Send> = Box::new(move || {
+            let mut staged = StagedWorld::new(&drone_world);
+            let tools = VoxelTools::new(&mut staged);
+            session.user_turn(&tools, &gaze_c, surface_c.as_deref(), &prose_c, None).0
+        });
+        self.spawn_turn(completer, "system".into(), user, gaze, player_feet, prose, TurnKind::Build);
+        self.session.referents.clear();
     }
 
     /// Start a repair turn: the model is asked to fix only the lines it
@@ -1238,7 +1279,30 @@ impl Paintbrush {
     /// Call every frame. Applies a reply once the worker has one.
     pub fn poll_turn(&mut self, cm: &ChunkManager) {
         let Some(turn) = &self.in_flight else { return };
-        let Some(result) = turn.poll() else { return };
+        let Some(result) = turn.poll() else {
+            // PROGRESSIVE PREVIEW. The reply is still being written, but
+            // its accepted lines are already valid IR (the loop takes
+            // back the others). Every few new lines, when no drone is
+            // busy, dry-run what there is so far: blocks appear in the
+            // preview while the model is still on line nine. The final
+            // reply's drone replaces it. Only for build turns; a repair
+            // is merged whole.
+            if turn.kind == TurnKind::Build && self.drone.is_none() {
+                let (_, text) = turn.ctl.snapshot();
+                let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                // the last line may be half-written: preview only whole ones
+                let whole = if text.ends_with('\n') { lines.len() } else { lines.len().saturating_sub(1) };
+                if whole >= turn.previewed_lines + 3 {
+                    let ir: String = lines[..whole].iter().map(|l| format!("{l}\n")).collect();
+                    let (gaze, feet, prose) = (turn.gaze, turn.player_feet, turn.prose.clone());
+                    let n = whole;
+                    self.launch_drone(cm, &gaze, ir, feet, &prose);
+                    if let Some(d) = self.drone.as_mut() { d.partial = Some(n); }
+                    if let Some(t) = self.in_flight.as_mut() { t.previewed_lines = n; }
+                }
+            }
+            return;
+        };
         let turn = self.in_flight.take().expect("just checked");
         match result {
             Ok(raw) => {
@@ -1538,6 +1602,22 @@ impl Paintbrush {
         if !deferred.is_empty() { self.session.deferred.cells.extend(deferred); }
         if t.cells > 0 { self.session.invalidate_context(); }
         t
+    }
+
+    /// A fresh paintbrush for a new world that keeps what belongs to
+    /// the PLAYER rather than the world: provider, model, player name,
+    /// voice and box settings. Everything world-bound -- claims, tree,
+    /// latent index, pending plan, last build -- starts empty and is
+    /// then loaded from the new world's folder.
+    pub fn inheriting(mut self, old: &Paintbrush) -> Self {
+        self.provider = old.provider.clone();
+        self.models = old.models.clone();
+        self.player = old.player.clone();
+        self.ctx_tokens = old.ctx_tokens;
+        self.max_reply = old.max_reply;
+        #[cfg(feature = "ai-engine")]
+        { self.engine = old.engine.clone(); }
+        self
     }
 
     /// Load claims, templates and the world tree from the world folder.

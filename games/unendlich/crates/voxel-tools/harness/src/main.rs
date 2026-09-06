@@ -33,6 +33,8 @@ fn main() {
     undo_race_scenario();
     tree_scenario();
     validator_scenario();
+    progressive_scenario();
+    referent_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -738,4 +740,78 @@ fn validator_scenario() {
     let v = seen.lock().unwrap().expect("the completer ran");
     println!("  validator accepts r=3, refuses r=-1 and prose: {v}");
     assert!(v);
+}
+
+
+/// A slow reply is previewed as it streams: blocks before the model
+/// is done, replaced by the final plan.
+fn progressive_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== progressive preview");
+    struct Slow;
+    impl voxel_tools::llm::Completer for Slow {
+        fn name(&self) -> &str { "slow" }
+        fn complete(&mut self, _: &str, _: &str) -> Result<String, String> { Ok(String::new()) }
+        fn complete_with(&mut self, _: &str, _: &str, ctl: &voxel_tools::llm::TurnControl) -> Result<String, String> {
+            let lines = ["# a hamlet", "form house @0,0 @8,6 style=cottage seed=1", "form house @14,0 @22,6 style=cottage seed=2",
+                         "path @4,7 @18,7 w=2", "form house @28,0 @36,6 style=cottage seed=3", "tree @11,10 oak h=7",
+                         "tree @25,10 oak h=6", "scatter @-2,-2 @38,12 block=flower clusters=5 per=4"];
+            let mut text = String::new();
+            for (i, l) in lines.iter().enumerate() {
+                text.push_str(l); text.push('\n');
+                ctl.report((i + 1) * 9, &text);
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            }
+            Ok(text)
+        }
+    }
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    pb.spawn_turn_for_test(Box::new(Slow), &gaze);
+    let mut partials = 0; let mut first_blocks_at_ms = None;
+    let t0 = std::time::Instant::now();
+    while pb.in_flight.is_some() || pb.drone.is_some() {
+        pb.poll_turn(&cm); pb.poll_drone();
+        for l in pb.drain_log() {
+            if l.contains("partial preview") { partials += 1; }
+            if l.contains("blocks planned") && first_blocks_at_ms.is_none() { first_blocks_at_ms = Some(t0.elapsed().as_millis()); }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let total = t0.elapsed().as_millis();
+    println!("  first preview at {} ms of a {total} ms reply; {partials} partial preview(s), then the final",
+             first_blocks_at_ms.unwrap_or(0));
+    assert!(partials >= 1, "at least one partial preview");
+    assert!(first_blocks_at_ms.unwrap_or(u128::MAX) < total * 3 / 4, "the first preview came before the reply ended");
+    assert!(pb.session.pending_waypoint().is_some(), "the final plan is pending");
+}
+
+
+/// "make the mill taller" names a claim: the model is told its box.
+fn referent_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== named referents");
+    struct Capture(std::sync::Arc<std::sync::Mutex<String>>);
+    impl voxel_tools::llm::Completer for Capture {
+        fn name(&self) -> &str { "capture" }
+        fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            *self.0.lock().unwrap() = user.to_string();
+            Ok("cylinder @0,0 r=2 h=3\n".into())
+        }
+    }
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    pb.land.claim("the old mill", "kess", (40, 65, 40), (52, 74, 50));
+    pb.provider = paintbrush::ProviderChoice::Fixture;
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    pb.start_turn_with_completer(&cm, &gaze, Some("grass"), "make the mill taller", None, Box::new(Capture(seen.clone())));
+    while pb.in_flight.is_some() { pb.poll_turn(&cm); std::thread::sleep(std::time::Duration::from_millis(5)); }
+    settle(&mut pb);
+    let user = seen.lock().unwrap().clone();
+    let line = user.lines().find(|l| l.contains("NAMED BUILD")).unwrap_or("").to_string();
+    println!("  {}", line.trim());
+    assert!(line.contains("'the old mill'") && line.contains("(40, 65, 40)"), "{user}");
+    assert!(pb.session.referents.is_empty(), "cleared after the turn");
 }
