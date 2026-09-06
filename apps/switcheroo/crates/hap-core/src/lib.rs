@@ -22,7 +22,8 @@
 //!
 //! What is NOT here, and why: IP transport (nothing in switcheroo speaks
 //! HAP over IP yet — `session::SecureSession::seal_ip` is the only hook);
-//! the Pairings characteristic (add/remove/list controllers); MFi auth
+//! ADDING a pairing (there is no second controller to hand access to —
+//! [`pairings`] does remove and list, which is what unpairing needs); MFi auth
 //! (`Pair Setup with Auth`), which needs Apple's coprocessor; accessory
 //! discovery from advertisements (switcheroo-core's `classify` does that).
 //!
@@ -39,6 +40,8 @@ pub mod ble;
 pub mod keys;
 pub mod pair_setup;
 pub mod pair_verify;
+/// The Pairings characteristic: removing a pairing so the accessory forgets us too.
+pub mod pairings;
 pub mod session;
 /// Characteristic signatures and the capability probe: what an accessory actually has.
 pub mod signature;

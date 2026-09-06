@@ -42,6 +42,23 @@ per question would turn opening a row into four handshakes. The row shows
 "outlet · identify · nothing plugged in" and grows a **blink** button only
 when the probe said Identify is there and writable.
 
+**Unpairing now tells the accessory.** It used to delete the local record and
+stop, which left the plug paired to a controller that no longer exists:
+still claimed, still refusing pair-setup, recoverable only by the factory
+reset this file warns about — arrived at by pressing a button labelled
+"forget this pairing". `hap_core::pairings` implements Remove Pairing and
+List Pairings (§5.11), and the order is the decision: the accessory is told
+FIRST and the record deleted only on success. The other order cannot be
+recovered from — with the keys gone, the controller cannot ask again. A
+failure leaves both sides paired, which is a state to retry from, and the
+row says so.
+
+Removing your own pairing ends the session in the same breath as the
+reply, so the controller treats a session that vanishes after a good M2 as
+success. The simulator does the same, and the test proves the round trip:
+pair → verify → list (one admin controller) → remove → the stale record no
+longer verifies → the accessory accepts a fresh pair-setup.
+
 In the app: a HomeKit row shows **pair…**, which opens a dialog whose first
 line says what pairing costs (one pairing per accessory; an Apple Home
 loses it; factory reset to get it back), with the setup code and a

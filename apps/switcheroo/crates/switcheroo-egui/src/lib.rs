@@ -315,7 +315,11 @@ impl App {
         self.backend.submit(Command::Pair { id: id.clone(), setup_code: setup_code.to_string() });
     }
 
+    /// Unpair: the accessory is told first and the local record deleted only if it
+    /// answered (see `ble.rs`). Marked pending because it is now a radio round trip, not
+    /// a file delete — the row should not look idle while a handshake is in flight.
     pub fn unpair(&mut self, id: &DeviceId) {
+        self.hub.mark_pending(id);
         self.backend.submit(Command::Unpair(id.clone()));
     }
 

@@ -318,7 +318,7 @@ fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant, colors: &Colors) -> R
                     } else {
                         ui.label(egui::RichText::new("no control").small().weak());
                     }
-                    if d.paired && !d.pending && ui.small_button("unpair").on_hover_text("forget this pairing").clicked() {
+                    if d.paired && !d.pending && ui.small_button("unpair").on_hover_text("tell the accessory to forget this pairing, then delete our record").clicked() {
                         act.unpair = true;
                     }
                     // WHICH ONE ARE YOU. Three identical plugs are three identical rows,

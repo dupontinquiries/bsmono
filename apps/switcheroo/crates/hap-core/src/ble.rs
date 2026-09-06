@@ -416,6 +416,20 @@ impl<'t> Controller<'t> {
         tlv.get(param::VALUE).map(|v| v.to_vec()).ok_or_else(|| HapError::Protocol("pairing reply has no value".into()))
     }
 
+    /// One Pairings round trip: the M1 body in, the M2 body out. Same shape as a pairing
+    /// round because the Pairings characteristic speaks the same write-with-response
+    /// protocol as pair-setup and pair-verify.
+    pub(crate) fn pairings_exchange(&mut self, tlv_bytes: Vec<u8>) -> Result<Vec<u8>, HapError> {
+        self.pairing_round(characteristic::PAIRINGS, tlv_bytes)
+    }
+
+    /// Forget the session without touching the accessory: after a Remove Pairing the
+    /// accessory has already dropped its side, and a controller holding a session it
+    /// cannot use would report `SessionBroken` on the next call instead of `NotVerified`.
+    pub(crate) fn drop_session(&mut self) {
+        self.session = None;
+    }
+
     /// Pair Setup with the accessory's setup code. On success the returned
     /// record must be persisted by the caller — it is the only copy.
     pub fn pair_setup(&mut self, controller_id: &str, controller_ltsk: [u8; 32], setup_code: &str) -> Result<Pairing, HapError> {

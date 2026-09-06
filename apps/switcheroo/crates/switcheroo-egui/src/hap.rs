@@ -234,6 +234,25 @@ pub async fn inspect(p: Peripheral, pairing: Pairing) -> Result<(Capabilities, P
     .map_err(|e| format!("inspect task: {e}"))?
 }
 
+/// Tell the accessory to forget us, then report whether it did.
+///
+/// The caller deletes the local record AFTER this returns, and the order is the whole
+/// point: with the record gone first, a radio failure leaves the controller without the
+/// keys to ask again and the accessory claimed by a pairing nobody holds — recoverable
+/// only by the factory reset the pairing dialog warns about. In this order a failure
+/// leaves both sides paired, which is a state the user can retry from.
+pub async fn remove_pairing(p: Peripheral, pairing: Pairing) -> Result<Vec<String>, String> {
+    let mut t = transport(p).await?;
+    tokio::task::spawn_blocking(move || {
+        let mut c = Controller::new(&mut t);
+        c.pair_verify(&pairing).map_err(|e| e.to_string())?;
+        c.remove_pairing(&pairing.controller_id).map_err(|e| e.to_string())?;
+        Ok(std::mem::take(&mut c.trace))
+    })
+    .await
+    .map_err(|e| format!("remove-pairing task: {e}"))?
+}
+
 /// Ask the accessory to blink or beep — "which of these three plugs are you".
 pub async fn identify(p: Peripheral, pairing: Pairing) -> Result<Vec<String>, String> {
     let mut t = transport(p).await?;

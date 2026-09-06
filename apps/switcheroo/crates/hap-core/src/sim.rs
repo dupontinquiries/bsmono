@@ -42,6 +42,7 @@ const IID_ON: u16 = 0x0C;
 const IID_OUTLET_IN_USE: u16 = 0x0D;
 const IID_IDENTIFY: u16 = 0x0E;
 const IID_NAME: u16 = 0x0F;
+const IID_PAIRINGS: u16 = 0x10;
 
 pub struct Accessory {
     pub id: String,
@@ -174,6 +175,22 @@ impl Accessory {
                 let body = Tlv::new().with(param::VALUE, self.name.as_bytes()).encode();
                 self.respond(req.tid, status::SUCCESS, body);
             }
+            // ── the Pairings characteristic (§5.11): remove and list ──
+            (IID_PAIRINGS, _) if self.session.is_none() => {
+                self.respond(req.tid, status::INSUFFICIENT_AUTHENTICATION, Vec::new());
+            }
+            (IID_PAIRINGS, opcode::CHARACTERISTIC_WRITE) => {
+                let reply = self.pairings_step(value.unwrap_or_default());
+                let body = Tlv::new().with(param::VALUE, reply).encode();
+                self.respond(req.tid, status::SUCCESS, body);
+                // A controller that removed ITSELF has no session any more. Dropped after
+                // the reply is queued, so M2 still goes out sealed — which is what real
+                // hardware does and what makes the controller's "lost session after a
+                // successful M2 is success" rule necessary.
+                if self.paired_controller.is_none() {
+                    self.session = None;
+                }
+            }
             // ── signatures: what each characteristic is ──
             (iid, opcode::CHARACTERISTIC_SIGNATURE_READ) => {
                 match Self::signature_for(iid) {
@@ -182,6 +199,43 @@ impl Accessory {
                 }
             }
             (_, _) => self.respond(req.tid, status::INVALID_INSTANCE_ID, Vec::new()),
+        }
+    }
+
+    /// Remove Pairing / List Pairings. The accessory forgets the controller by identifier,
+    /// which is the half that was missing: a local record deleted alone leaves the
+    /// accessory claimed and only a factory reset gets it back.
+    fn pairings_step(&mut self, bytes: Vec<u8>) -> Vec<u8> {
+        use crate::pairings::method;
+        let tlv = match Tlv::decode(&bytes) { Ok(t) => t, Err(_) => return Self::error(2, tlv8::error_code::UNKNOWN) };
+        if tlv.get_u8(tlv8::TYPE_STATE) != Some(1) {
+            return Self::error(2, tlv8::error_code::UNKNOWN);
+        }
+        match tlv.get_u8(tlv8::TYPE_METHOD) {
+            Some(method::REMOVE_PAIRING) => {
+                let who = tlv.get(tlv8::TYPE_IDENTIFIER).map(|v| String::from_utf8_lossy(v).to_string());
+                match (&self.paired_controller, who) {
+                    (Some((id, _)), Some(w)) if *id == w => {
+                        self.paired_controller = None;
+                        Tlv::new().with(tlv8::TYPE_STATE, [2u8]).encode()
+                    }
+                    // Removing a controller the accessory does not hold is a success per
+                    // the spec — the end state the caller asked for is the end state.
+                    (_, Some(_)) => Tlv::new().with(tlv8::TYPE_STATE, [2u8]).encode(),
+                    (_, None) => Self::error(2, tlv8::error_code::UNKNOWN),
+                }
+            }
+            Some(method::LIST_PAIRINGS) => {
+                let mut t = Tlv::new().with(tlv8::TYPE_STATE, [2u8]);
+                if let Some((id, pk)) = &self.paired_controller {
+                    t = t
+                        .with(tlv8::TYPE_IDENTIFIER, id.as_bytes())
+                        .with(tlv8::TYPE_PUBLIC_KEY, *pk)
+                        .with(tlv8::TYPE_PERMISSIONS, [1u8]);
+                }
+                t.encode()
+            }
+            _ => Self::error(2, tlv8::error_code::UNKNOWN),
         }
     }
 
@@ -363,6 +417,7 @@ impl Transport for Accessory {
             characteristic::OUTLET_IN_USE => Ok(IID_OUTLET_IN_USE),
             characteristic::IDENTIFY => Ok(IID_IDENTIFY),
             characteristic::NAME => Ok(IID_NAME),
+            characteristic::PAIRINGS => Ok(IID_PAIRINGS),
             other => Err(TransportError(format!("accessory has no characteristic {other:#04x}"))),
         }
     }
@@ -427,6 +482,38 @@ mod tests {
         c.pair_verify(&pairing).unwrap();
         let err = c.write_value(crate::ble::characteristic::OUTLET_IN_USE, &[1]).unwrap_err();
         assert!(matches!(err, HapError::Status { .. }), "{err:?}");
+    }
+
+    /// UNPAIRING IS TWO SIDES. The local record is half of it; the accessory has to be
+    /// told, or it stays claimed by a controller that no longer exists and only a factory
+    /// reset frees it.
+    #[test]
+    fn removing_a_pairing_makes_the_accessory_forget_us_too() {
+        let mut acc = Accessory::new("AA:BB:CC:DD:EE:FF", "031-45-154", 100);
+        let pairing = pair(&mut acc, "03145154").expect("pair-setup");
+        assert!(acc.paired_controller.is_some());
+        let me = pairing.controller_id.clone();
+
+        let mut c = Controller::new(&mut acc);
+        assert_eq!(c.remove_pairing(&me).unwrap_err(), HapError::NotVerified, "not before a session");
+        c.pair_verify(&pairing).expect("pair-verify");
+        // it lists us before, and nobody after
+        let before = c.list_pairings().expect("list");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].identifier, me);
+        assert!(before[0].admin);
+
+        c.remove_pairing(&me).expect("remove");
+        assert!(!c.is_secure(), "removing our own pairing ends the session");
+        drop(c);
+        assert!(acc.paired_controller.is_none(), "the accessory forgot us");
+
+        // and the proof it is really unpaired: the old record no longer verifies, so a
+        // fresh pair-setup is possible again rather than the accessory refusing forever.
+        let mut c = Controller::new(&mut acc);
+        assert!(c.pair_verify(&pairing).is_err(), "the stale record must not still work");
+        drop(c);
+        assert!(pair(&mut acc, "03145154").is_ok(), "the accessory can be paired again");
     }
 
     #[test]

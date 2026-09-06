@@ -437,6 +437,14 @@ impl Hub {
                     if let Some(d) = self.devices.get_mut(&id) {
                         d.paired = false;
                         d.power = Power::Unknown;
+                        // Unpairing is a round trip now (the accessory is told before the
+                        // record is deleted), so the row was left pending by `unpair`.
+                        d.pending = false;
+                        // And everything the probe learned goes with the pairing: those
+                        // answers came from a session this controller can no longer open.
+                        d.abilities = None;
+                        d.can_identify = false;
+                        d.in_use = None;
                     }
                 }
             }
@@ -956,6 +964,23 @@ mod ability_tests {
         let d = h.get(&id).unwrap();
         assert_eq!(d.in_use, None, "no sensor is not the same as nothing plugged in");
         assert!(!d.can_identify);
+    }
+
+    /// What the probe learned belongs to the pairing. Keeping "outlet · identify" on a row
+    /// this controller can no longer open a session with would offer a blink button that
+    /// cannot work.
+    #[test]
+    fn unpairing_forgets_what_the_probe_learned() {
+        let (mut h, id) = hub_with_one();
+        h.step(vec![Event::Paired { id: id.clone() }], now());
+        h.step(vec![Event::Abilities { id: id.clone(), describes: "outlet · identify".into(), can_identify: true, in_use: Some(true) }], now());
+        assert!(h.get(&id).unwrap().can_identify);
+        h.mark_pending(&id);
+        h.step(vec![Event::Unpaired { id: id.clone() }], now());
+        let d = h.get(&id).unwrap();
+        assert!(!d.paired && !d.pending);
+        assert!(d.abilities.is_none() && !d.can_identify && d.in_use.is_none());
+        assert_eq!(d.power, Power::Unknown);
     }
 
     #[test]
