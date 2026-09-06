@@ -25,7 +25,7 @@ const TAP: f32 = 44.0;
 
 pub fn filter_chips(ui: &mut egui::Ui, app: &mut App) {
     ui.horizontal_wrapped(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut app.filter.query).hint_text("find…").desired_width(120.0));
+        ui.add(egui::TextEdit::singleline(&mut app.filter.query).id_salt("sw-filter").hint_text("find…").desired_width(120.0));
         ui.toggle_value(&mut app.filter.controllable_only, "switchable");
         ui.toggle_value(&mut app.filter.favourites_only, "★");
         let mut hk = app.filter.kinds.contains(&Kind::HomeKit);
@@ -68,7 +68,7 @@ pub fn media_strip(ui: &mut egui::Ui, app: &mut App) {
 pub fn command_box(ui: &mut egui::Ui, app: &mut App) {
     ui.horizontal(|ui| {
         ui.label("say or type:");
-        let edit = ui.add(egui::TextEdit::singleline(&mut app.command)
+        let edit = ui.add(egui::TextEdit::singleline(&mut app.command).id_salt("sw-command")
             .hint_text("lights off · turn the lamp on by 9pm · next song")
             .desired_width(f32::INFINITY));
         let go = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -129,7 +129,7 @@ pub fn schedules_pane(app: &mut App, ui: &mut egui::Ui) {
         // The world the rules watch.
         ui.horizontal(|ui| {
             ui.label("home network:");
-            if ui.add(egui::TextEdit::singleline(&mut app.home_ssid).hint_text("SSID").desired_width(140.0)).changed() {
+            if ui.add(egui::TextEdit::singleline(&mut app.home_ssid).id_salt("sw-home-ssid").hint_text("SSID").desired_width(140.0)).changed() {
                 app.save_settings();
             }
             let w = app.wifi_now();
@@ -166,7 +166,7 @@ pub fn schedules_pane(app: &mut App, ui: &mut egui::Ui) {
         let f = &mut app.rule_form;
         ui.horizontal(|ui| {
             ui.label("turn");
-            ui.add(egui::TextEdit::singleline(&mut f.target).hint_text("kitchen light / lights / music / everything").desired_width(220.0));
+            ui.add(egui::TextEdit::singleline(&mut f.target).id_salt("sw-rule-target").hint_text("kitchen light / lights / music / everything").desired_width(220.0));
             ui.selectable_value(&mut f.on, true, "on");
             ui.selectable_value(&mut f.on, false, "off");
         });
@@ -176,7 +176,7 @@ pub fn schedules_pane(app: &mut App, ui: &mut egui::Ui) {
             }
         });
         match f.trigger {
-            0 | 1 => { ui.horizontal(|ui| { ui.label("time:"); ui.add(egui::TextEdit::singleline(&mut f.time).desired_width(90.0)); }); }
+            0 | 1 => { ui.horizontal(|ui| { ui.label("time:"); ui.add(egui::TextEdit::singleline(&mut f.time).id_salt("sw-rule-time").desired_width(90.0)); }); }
             4 => { ui.add(egui::Slider::new(&mut f.weak_dbm, -90..=-50).text("below dBm")); }
             _ => {}
         }
@@ -218,7 +218,7 @@ pub fn pairing_dialog(ctx: &egui::Context, app: &mut App) {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.label("setup code");
-                ui.add(egui::TextEdit::singleline(&mut d.code).hint_text("XXX-XX-XXX, printed on the plug").desired_width(160.0));
+                ui.add(egui::TextEdit::singleline(&mut d.code).id_salt("sw-pair-code").hint_text("XXX-XX-XXX, printed on the plug").desired_width(160.0));
             });
             let code_ok = switcheroo_core::setup_code_ok(&d.code);
             if !d.code.is_empty() && !code_ok {

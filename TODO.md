@@ -1016,6 +1016,29 @@ asked as a question.
   raise `LEAF_GROWTH_CAP` past ~2.2 without looking — that is where blades
   stop reading as leaves.
 
+- [~] **One-character entry bug in text fields.** CAUSE FOUND and reproduced
+  2026-09-05: a `TextEdit` with no explicit id gets one derived from its
+  position in the frame, so anything that changes the widget order above it
+  — a conditional row, an error label appearing, a list that grew — gives it
+  a NEW id. egui treats that as a brand new widget, focus and caret are
+  gone, and the person sees one character land and the field go dead.
+
+  NOT what I first assumed. A repeated `request_focus()` was the obvious
+  suspect (and logscope has a comment blaming it), but a two-arm test shows
+  the unguarded version still accepts both characters on this egui version.
+  `focus::focus_once` is still correct practice and is in the kit; it is not
+  the cause.
+
+  FIXED: switcheroo's six fields, all now salted. `uikit_egui::focus::
+  text_field(ui, buf, salt)` makes the salt a required argument so it cannot
+  be forgotten.
+
+  REMAINING UNSALTED (grep `TextEdit::singleline` and filter out
+  `id(`/`id_salt(`): voiceterm 4, snapclone 2, studio 2, logscope 1. Each is
+  only a bug if the widget order above it can change, so they want reading
+  rather than a blind sweep — but salting is harmless, so salting them all
+  is a defensible sweep too.
+
 - [ ] **Act on the GPU pacing numbers (`gpu_kit::pace`).** The MEASUREMENT is
   wired: `WgpuUpscaler` times both `device.poll` sites (there are two —
   instrumenting one would have reported half the GPU time as zero) and

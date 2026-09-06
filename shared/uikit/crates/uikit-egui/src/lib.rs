@@ -79,6 +79,7 @@ pub mod responsive_nav;
 pub mod scroll;
 pub mod fuzzy;
 pub mod command_bar;
+pub mod focus;
 pub mod handed;
 pub mod sections;
 pub mod two_pane;
