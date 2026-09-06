@@ -30,15 +30,53 @@ Net: 2 of the 6 are real, not 6.
 
 ## Open
 
-- **Per-tile hover/press animation (`iconAnimationStyle`) is not ported.** The plasmoid's
-  `ItemGridDelegate.qml` plays a bounce or wiggle on hover/press, driven by
-  `Plasmoid.configuration.iconAnimationStyle`; `anim.rs`'s `Board` only carries the *grid-level*
-  motion (`SlidePattern`: enter/restack/exit, 6 patterns + `None`, fully ported and tested). No
-  file under `egui-frontend/src/` or `hatch-core/src/` references bounce, wiggle, or any per-tile
-  press animation. `LAUNCHER_MERGE.md` describes this system as "eight icon styles" but the
-  delegate's own code comment says only ids `0`, `3`, and `6` are meaningfully distinct now
-  (anything else legacy-coerces to bounce) — confirm the live count with whoever wrote that
-  comment before porting a number that may already be stale in the source of truth itself.
+- **`hatch-core::anim::Board` is never called from `hatch-egui` — the grid has no motion at all.**
+  This corrects an entry I wrote two revisions ago in this same file (see the strikethrough below)
+  that called the `Board` port "not actually a gap" because its code landed and its own tests
+  pass. That check was incomplete: it confirmed the module exists and works in isolation, and
+  never checked whether the shell actually calls it — the exact distinction
+  `maintenance/tools/reachability.py` exists to draw, and the exact failure shape
+  `UI_STRATEGY.md` names by example (a tested dialog nobody draws). Caught this time by directly
+  grepping `egui-frontend/src/*.rs` for `anim::`, `Board`, and `SlidePattern` — zero hits,
+  confirmed twice. `reachability.py` itself doesn't catch this specific case: it checks
+  reachability *within* a crate, and `Board` is reached — by `hatch-core`'s own tests, in the
+  same crate. Whether the *downstream* crate (`hatch-egui`) ever imports it is a cross-crate
+  question the tool doesn't ask, which is why this needed a manual read rather than a tool run to
+  find.
+
+  `grid()` places every tile with a plain `ui.horizontal`/`allocate_exact_size` loop — tiles snap
+  into their cells every frame; no enter/restack/exit motion happens regardless of `config.anim`
+  or `config.animations`. `LAUNCHER_MERGE.md` marking this port "Done" verified the code landed;
+  it did not verify anyone draws it, which turns out to be the part that decides whether a user
+  ever sees motion.
+
+  Not a quick fix: `grid()`'s current per-frame layout has no persistent tile identity across
+  frames to hand `Board::retarget` (rects are recomputed from scratch every frame from
+  `self.core.results()`, not diffed against a previous frame's positions), so wiring this up means
+  restructuring the layout loop to read positions from `Board::poses()` instead of computing them
+  inline — a real feature change. Not attempted in this pass; flagging with the precise mechanism
+  so whoever picks it up isn't starting from "is this even broken."
+
+- **Per-tile hover/press animation (`iconAnimationStyle`) is not ported — and the original's own
+  squish-as-a-hover-style path (id 6) is confirmed dead code, not a missing style.** The QML
+  schema comment reads `<!-- 0 none, 1 bounce, 3 wiggle, 6 squish; other legacy ids map to bounce
+  -->`, but `ItemGridDelegate.qml`'s hover handler only branches on `iconStyle === 1` (bounce) or
+  `=== 3` (wiggle) — `6` matches neither branch, so selecting "squish" as a hover style produces
+  no hover animation at all in the plasmoid itself. Squish already happens unconditionally on
+  *press* (`squishIn`/`squishOut`), independent of `iconStyle` entirely — so porting "four icon
+  styles" would mean porting a selector option that has never done anything in the original. The
+  real, live set is 3: none/bounce/wiggle, hover-triggered.
+
+  Separately: hatch-egui's existing press-scale (`tile()`'s `animate_bool_with_time`-driven
+  `scale = 1.0 - 0.10 * t` over 80ms) already covers squish's job approximately — QML's
+  `squishIn` goes to 0.86 over 70ms then eases back over 90+110ms asymmetric; egui's is a
+  symmetric ease to 0.90 over 80ms. Different curve, same intent, already there. So the actual
+  remaining gap is narrower than originally scoped: **bounce and wiggle, hover-triggered, are the
+  only two behaviors with nothing on the egui side at all.** Not implemented in this pass —
+  deprioritized in favor of the `Board` finding above, which affects every tile on every screen,
+  versus this, which only fires on a hover event a touchscreen mostly won't send (hover is a
+  desktop-only signal via mouse; on the phone target this pair of styles may barely ever trigger,
+  worth weighing against implementation cost before doing the work).
 
 - **No in-app settings UI at all.** The plasmoid's `ConfigGeneral.qml` exposes ~15 user-facing
   options (grid columns/rows, icon sizes, alpha sort, recent ordering, background opacity, custom
@@ -101,9 +139,13 @@ Net: 2 of the 6 are real, not 6.
   doesn't page horizontally. The long-press-to-favorite timer is hand-rolled
   (`resp.is_pointer_button_down_on()`) because it solves a different problem than what
   `gesture_layer` offers — not a missed reuse.
-- ~~**`icontheme.rs`/`anim.rs`/`Board` were only partially ported from `apps/launcher`.**~~ No —
-  `LAUNCHER_MERGE.md`'s steps 1–2 check out: full freedesktop icon-theme resolution (9 tests) and
-  the tick-based animation Board (headless, tested) both landed intact in `hatch-core`.
+- ~~**`icontheme.rs`/`anim.rs`/`Board` were only partially ported from `apps/launcher`.**~~
+  Half-right, corrected above. `LAUNCHER_MERGE.md`'s steps 1–2 do check out as far as they go:
+  full freedesktop icon-theme resolution (9 tests) and the tick-based animation `Board` (headless,
+  tested) both landed intact in `hatch-core`. What this entry got wrong when I first wrote it: it
+  stopped at "the code exists and its tests pass" and never checked whether `hatch-egui` calls
+  it. It doesn't — see the `Board` entry under Open, which replaces this claim rather than sitting
+  next to it.
 
 ## Not verified in-sandbox
 
