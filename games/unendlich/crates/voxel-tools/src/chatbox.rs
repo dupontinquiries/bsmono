@@ -117,6 +117,9 @@ pub const CARDS: &[Card] = &[
     Card { command: "/like", signature: "/like <build> [taller|thicker|wider|open|...]",
            summary: "A spec from the latent space: like a named build, nudged by the words. The next /build is tuned to it.",
            example: "/like the mill but taller", arg_words: &[] },
+    Card { command: "/review", signature: "/review",
+           summary: "Show the model what it made -- elevations, measurement, findings -- and apply its verdict.",
+           example: "/review", arg_words: &[] },
     Card { command: "/hive", signature: "/hive",
            summary: "What the background builder is doing: progress, ETA, and this frame's budget.",
            example: "/hive", arg_words: &[] },
@@ -657,7 +660,7 @@ mod tests {
             "/build", "/plan", "/commit", "/undo", "/focus", "/anim",
             "/model", "/provider", "/keys", "/find", "/locate",
             "/cancel", "/land", "/world", "/shot", "/repair", "/deferred", "/refine", "/hive",
-            "/branch", "/switch", "/merge", "/like",
+            "/branch", "/switch", "/merge", "/like", "/review",
         ];
         for v in PARSER_VERBS {
             assert!(card_for(v).is_some(), "{v} has no card, so nobody will find it");

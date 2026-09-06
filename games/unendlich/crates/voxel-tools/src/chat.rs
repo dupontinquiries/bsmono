@@ -91,6 +91,10 @@ pub struct Pending {
     /// The expanded IR and the prose that produced it.
     ir: String,
     prose: String,
+    /// What the dry run placed, for a review's measurement and picture.
+    placed: Vec<(i32, i32, i32)>,
+    /// The critique's findings, in words, for the review.
+    findings: Vec<String>,
 }
 
 /// What was built last, as the referent for "make it taller", "add a
@@ -363,6 +367,43 @@ impl ChatSession {
             // registry and calls `connect_ir`.
             crate::verbs::Verb::Connect => return None,
         })
+    }
+
+    /// The review prompt for the pending plan: its ops by number, its
+    /// spec, what it measured, two elevations, the critique's findings.
+    /// None when nothing is pending. `round` is 1 for the first review.
+    pub fn review_prompt(&self, round: usize, variants: &[crate::review::Variant]) -> Option<String> {
+        let p = self.pending.as_ref()?;
+        let cells: std::collections::BTreeSet<(i32, i32, i32)> = p.placed.iter().copied().collect();
+        let ground = p.plan.anchor.map(|a| a.1 - 1).unwrap_or(63);
+        let measured = crate::spec::measure(&cells, ground).describe();
+        let elev = crate::review::elevations(&cells, 24, 14);
+        let spec = p.plan.ops.iter().find_map(|o| match o { Op::Spec(s) => Some(s.clone()), _ => None });
+        let ops: Vec<Op> = p.plan.ops.iter().filter(|o| !matches!(o, Op::Spec(_))).cloned().collect();
+        Some(crate::review::prompt(&p.prose, &ops, spec.as_deref(), &measured, &elev, &p.findings, variants, round))
+    }
+
+    /// Apply a review to the pending plan: the verdict edits the plan's
+    /// IR and the result is re-planned (dry run, finishing, tuning) as a
+    /// new pending. Returns the reply to show and whether anything
+    /// changed; `done` or an empty verdict leaves the plan as it is.
+    pub fn apply_review<W: VoxelWorld>(&mut self, tools: &mut VoxelTools<W>, gaze: &Gaze, reply: &str,
+                                       player_feet: Option<(i32, i32, i32)>) -> (Reply, bool, crate::review::Review) {
+        let Some(p) = self.pending.as_ref() else {
+            return (Reply::Say("nothing pending to review".into()), false, Default::default());
+        };
+        let n_ops = p.plan.ops.iter().filter(|o| !matches!(o, Op::Spec(_))).count();
+        let review = crate::review::parse(reply, n_ops);
+        if review.done || review.is_empty() {
+            return (Reply::Say(format!("review: {}", review.summary())), false, review);
+        }
+        let revised = crate::review::apply(&p.ir, &review);
+        if revised.trim() == p.ir.trim() {
+            return (Reply::Say(format!("review: {} -- no change", review.summary())), false, review);
+        }
+        let prose = p.prose.clone();
+        let r = self.receive_plan_gated(tools, gaze, &revised, player_feet, &prose);
+        (r, true, review)
     }
 
     /// "Something like the mill but taller": a spec from the latent
@@ -700,6 +741,8 @@ impl ChatSession {
         self.pending = Some(Pending {
             plan, feature_id: f.feature_id.clone(), predicted_blocks: dry.blocks_changed,
             ir: ir.to_string(), prose: prose.to_string(),
+            placed: placed.clone(),
+            findings: findings.iter().map(|f| f.message.clone()).collect(),
             bounds: {
                 let mut lo = (i32::MAX, i32::MAX, i32::MAX);
                 let mut hi = (i32::MIN, i32::MIN, i32::MIN);
@@ -1564,5 +1607,32 @@ mod tests {
         s.receive_plan_gated(&mut t, &g, "enclose @20,-5 @30,5 h=6 block=stone\ngreeble @19,-1,-6 @31,7,6 gothic gens=6 levels=2\n",
                              None, "another gothic hall");
         assert!(s.archive.len() >= n.min(6), "kept or grew, capped: {}", s.archive.len());
+    }
+
+    #[test]
+    fn a_review_sees_the_build_and_a_verdict_replans_it() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 400_000);
+        let g = gaze_at(0, 0, 10.0);
+        s.receive_plan_gated(&mut t, &g, "enclose @-4,-4 @4,4 h=5 block=stone\ntree @9,9 oak h=7\n", None, "a hall");
+        let p = s.review_prompt(1, &[]).expect("a prompt for the pending plan");
+        assert!(p.contains("REVIEW round 1") && p.contains("The player asked for: a hall"), "{p}");
+        assert!(p.contains("1. ") && p.contains("2. "));
+        assert!(p.contains("FRONT (") && p.contains("SIDE ("));
+        assert!(p.contains("Measured:"));
+        assert!(!p.contains("@-4,-4"), "no coordinates in the review: {p}");
+        // the model drops the tree and adds a roof
+        let before = s.pending_waypoint().unwrap().blocks;
+        let (r, changed, review) = s.apply_review(&mut t, &g, "drop 2\nadd roof @-4,-4 @4,4 gable\n", None);
+        assert!(changed, "{review:?}");
+        match r { Reply::Preview { echo, blocks, .. } => {
+            assert!(!echo.contains("tree"), "the tree is gone: {echo}");
+            assert!(echo.contains("roof") || echo.contains("gable"), "the roof arrived: {echo}");
+            assert_ne!(blocks, before);
+        } o => panic!("{o:?}") }
+        // "done" changes nothing
+        let (_, changed, review) = s.apply_review(&mut t, &g, "done\n", None);
+        assert!(!changed && review.done);
     }
 }

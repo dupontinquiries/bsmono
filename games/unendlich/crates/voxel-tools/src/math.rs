@@ -432,6 +432,14 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
 /// back before committing. The user catches scale errors, and the
 /// model sees its own numbers computed — which is where it usually
 /// notices it meant width and wrote radius.
+/// One op in words, without coordinates the reader would misuse:
+/// the first info note `check_math` writes for it.
+pub fn describe_op(op: &crate::plan::Op) -> String {
+    let plan = BuildPlan { name: String::new(), ops: vec![op.clone()], anchor: None };
+    check_math(&plan, i64::MAX).into_iter().find(|n| n.op == 1)
+        .map(|n| n.message).unwrap_or_else(|| format!("{op:?}"))
+}
+
 pub fn explain_plan(plan: &BuildPlan, budget: i64) -> String {
     let notes = check_math(plan, budget);
     let mut s = format!("Plan '{}' — {} operations\n", plan.name, plan.ops.len());

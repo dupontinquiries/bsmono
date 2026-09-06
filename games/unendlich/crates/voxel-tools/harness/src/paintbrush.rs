@@ -249,6 +249,10 @@ impl ProviderChoice {
 pub struct Drone {
     rx: std::sync::mpsc::Receiver<(voxel_tools::chat::ChatSession, Vec<Reply>)>,
     pub started: Instant,
+    /// The gaze and feet the plan was made with, for a review that
+    /// follows it.
+    pub gaze: Gaze,
+    pub feet: Option<(i32, i32, i32)>,
     /// A preview of a reply still being written: the lines so far. Its
     /// result is shown but the final reply's drone replaces it.
     pub partial: Option<usize>,
@@ -260,6 +264,18 @@ impl Drone {
     }
 }
 
+/// A completer shared across turns by a harness: each turn gets a
+/// handle to the same scripted model.
+pub struct SharedCompleter(pub std::sync::Arc<std::sync::Mutex<Box<dyn voxel_tools::llm::Completer>>>);
+impl voxel_tools::llm::Completer for SharedCompleter {
+    fn name(&self) -> &str { "shared" }
+    fn complete(&mut self, s: &str, u: &str) -> Result<String, String> {
+        self.0.lock().map_err(|_| "poisoned".to_string())?.complete(s, u)
+    }
+    fn complete_with(&mut self, s: &str, u: &str, c: &voxel_tools::llm::TurnControl) -> Result<String, String> {
+        self.0.lock().map_err(|_| "poisoned".to_string())?.complete_with(s, u, c)
+    }
+}
 pub struct PendingTurn {
     rx: std::sync::mpsc::Receiver<Result<String, String>>,
     pub started: Instant,
@@ -285,7 +301,7 @@ pub struct PendingTurn {
 /// The kinds of model turn, so the reply is routed without the bin
 /// having to remember which it started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnKind { Build, Repair }
+pub enum TurnKind { Build, Repair, Review }
 
 impl PendingTurn {
     /// Has the reply arrived? None means still working.
@@ -467,6 +483,20 @@ pub struct Paintbrush {
     /// Set by anything that changes land, library or repo; the bin
     /// saves when it sees it.
     pub state_dirty: bool,
+    /// A completer to use instead of the provider, for harnesses that
+    /// script the model. Shared, so every turn of a scripted session
+    /// talks to the same script. None in the game.
+    pub test_completer: Option<std::sync::Arc<std::sync::Mutex<Box<dyn voxel_tools::llm::Completer>>>>,
+    /// THE REVIEW LOOP. After a build's preview lands, the model is
+    /// shown what it made -- ops by number, spec, measurement, two
+    /// elevations, the critique's findings -- and replies with a
+    /// ten-token verdict that re-plans. Up to `review_rounds` rounds
+    /// per build; stops on `done`, on a verdict that changes nothing,
+    /// or at the limit. `/review` runs a round by hand.
+    pub review_rounds: usize,
+    review_round: usize,
+    /// Rounds still owed once the current drone lands.
+    review_pending_after_drone: usize,
     /// The hive job of the last commit, so an undo can cancel what the
     /// queen has not yet placed.
     last_job: Option<u32>,
@@ -545,6 +575,10 @@ impl Paintbrush {
             repo: voxel_tools::vcs::Repo::new(chunk_size),
             latent: voxel_tools::latent::Index::new(),
             state_dirty: false,
+            test_completer: None,
+            review_rounds: 1,
+            review_round: 0,
+            review_pending_after_drone: 0,
             last_job: None,
             player: "player".into(),
             pending_plants: Vec::new(),
@@ -899,6 +933,11 @@ impl Paintbrush {
                 }
                 Pending::None
             }
+            Command::Review => {
+                self.review_pending_after_drone = 0;
+                self.start_review(gaze, None);
+                Pending::None
+            }
             Command::Hive => {
                 if self.comb.is_empty() {
                     self.say(format!("hive idle; budget {:.1} ms/frame, a cell costs ~{:.2} ms here",
@@ -1064,7 +1103,7 @@ impl Paintbrush {
             debug_assert_eq!(staged.pending(), 0, "preview must not stage writes");
             let _ = tx.send((session, vec![r]));
         }).expect("spawn drone");
-        self.drone = Some(Drone { rx, started: Instant::now(), partial: None });
+        self.drone = Some(Drone { rx, started: Instant::now(), partial: None, gaze, feet: player_feet });
         self.say("simulating ... (the world keeps running)");
     }
 
@@ -1076,6 +1115,7 @@ impl Paintbrush {
         let Some((session, replies)) = d.poll() else { return };
         let drone = self.drone.take().expect("just polled");
         let took = drone.started.elapsed();
+        let (drone_gaze, drone_feet) = (drone.gaze, drone.feet);
         log::info!("[paintbrush] drone finished in {:.0} ms", took.as_secs_f32() * 1000.0);
         // Only the fields the dry run produces move over. Anything the
         // frame changed meanwhile -- climate, deferred cells, the land
@@ -1090,6 +1130,56 @@ impl Paintbrush {
             self.say(format!("(partial preview: {n} line(s) so far -- the model is still writing)"));
         }
         for r in replies { self.push(r); }
+        if drone.partial.is_none() && self.review_pending_after_drone > 0 && self.in_flight.is_none() {
+            self.review_pending_after_drone -= 1;
+            self.start_review(&drone_gaze, drone_feet);
+        }
+    }
+
+    /// Ask the model to review the pending plan. One short prompt, one
+    /// short reply; the drone re-plans on the verdict.
+    pub fn start_review(&mut self, gaze: &Gaze, player_feet: Option<(i32, i32, i32)>) {
+        if self.in_flight.is_some() { self.say("a turn is in flight -- wait or /cancel"); return; }
+        self.review_round += 1;
+        let Some(user) = self.session.review_prompt(self.review_round, &[]) else {
+            self.say("nothing pending to review"); return;
+        };
+        let Some(completer) = self.completer_for(false) else {
+            self.say("no provider available -- /provider to check"); return;
+        };
+        let system = "You are reviewing a voxel build you planned. Judge it from the elevations and \
+                      the measurement against what the player asked for. Reply only in the verdict \
+                      lines described; be brief.".to_string();
+        log::info!("[paintbrush] review round {} ({} chars)", self.review_round, user.len());
+        self.say(format!("review round {}: showing the model what it made ...", self.review_round));
+        self.spawn_turn(completer, system, Box::new(move || user), gaze, player_feet, "", TurnKind::Review);
+    }
+
+    /// A review reply landed: apply the verdict; if it changed the plan,
+    /// the re-plan runs on the drone and another round may follow.
+    fn finish_review(&mut self, cm: &ChunkManager, gaze: &Gaze, raw: &str,
+                     player_feet: Option<(i32, i32, i32)>) {
+        let view = WorldView(cm);
+        let mut staged = StagedWorld::new(&view);
+        let mut tools = VoxelTools::new(&mut staged);
+        let (r, changed, review) = self.session.apply_review(&mut tools, gaze, raw, player_feet);
+        log::info!("[paintbrush] review {}: {} ({} ignored line(s)){}", self.review_round, review.summary(),
+                   review.ignored, if changed { " -> re-planned" } else { "" });
+        self.session.training.push(format!("review\t{}\t{}\t{}", self.review_round, review.summary(),
+                                           raw.replace(['\t', '\n'], " ")));
+        self.push(r);
+        if !changed {
+            // done, or nothing to do: the loop ends here
+            self.review_pending_after_drone = 0;
+        }
+        // a changed plan was re-planned synchronously above on a staged
+        // world; the next round (if owed) starts from poll_drone's path
+        // only after a drone -- so run one round's worth here directly
+        if changed && self.review_pending_after_drone > 0 && self.in_flight.is_none() {
+            self.review_pending_after_drone -= 1;
+            let (g, f) = (*gaze, player_feet);
+            self.start_review(&g, f);
+        }
     }
 
     /// Start a turn on a worker thread. Returns immediately.
@@ -1234,6 +1324,9 @@ impl Paintbrush {
         });
     }
 
+    /// How many review rounds are still owed after the current drone.
+    pub fn review_owed(&self) -> usize { self.review_pending_after_drone }
+
     /// Test hook: start a build turn with a given completer and a fixed
     /// prompt, so a harness can drive cancel and progress without a
     /// provider script.
@@ -1328,10 +1421,16 @@ impl Paintbrush {
                 log::info!("[paintbrush] reply in {:.1}s, {} chars",
                            turn.elapsed().as_secs_f32(), raw.len());
                 match turn.kind {
-                    TurnKind::Build =>
-                        self.finish_turn_with(cm, &turn.gaze, &raw, turn.player_feet, &turn.prose),
+                    TurnKind::Build => {
+                        self.finish_turn_with(cm, &turn.gaze, &raw, turn.player_feet, &turn.prose);
+                        // the review loop starts once this build's preview lands
+                        self.review_pending_after_drone = self.review_rounds;
+                        self.review_round = 0;
+                    }
                     TurnKind::Repair =>
                         self.finish_repair(cm, &turn.gaze, &raw, turn.player_feet),
+                    TurnKind::Review =>
+                        self.finish_review(cm, &turn.gaze, &raw, turn.player_feet),
                 }
             }
             Err(e) => {
@@ -1388,6 +1487,10 @@ impl Paintbrush {
     /// compiled in, a `/provider engine` with no model chosen.
     pub fn completer_for(&mut self, debug: bool)
         -> Option<Box<dyn voxel_tools::llm::Completer>> {
+        if let Some(c) = &self.test_completer {
+            // a scripted model for a harness: every turn gets a handle
+            return Some(Box::new(SharedCompleter(c.clone())));
+        }
         use voxel_tools::llm::{CommandProvider, HttpProvider};
         let choice = if debug { ProviderChoice::Fixture } else { self.provider.clone() };
         log::info!("[paintbrush] provider choice: {}", choice.describe());

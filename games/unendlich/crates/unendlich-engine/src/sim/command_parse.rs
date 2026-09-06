@@ -152,6 +152,8 @@ pub enum Command {
     Merge(String),
     /// `/like name [words]` — a spec from the latent space of the tree.
     Like(String),
+    /// `/review` — one review round on the pending plan.
+    Review,
     /// `/refine [rung|all]` — small detail passes over the last build.
     /// No argument lists them.
     Refine(Option<String>),
@@ -292,6 +294,7 @@ pub fn parse(line: &str) -> Command {
         "/switch" => match args.as_slice() { [] => Command::Unknown, n => Command::Switch(n.join(" ")) },
         "/merge" => match args.as_slice() { [] => Command::Unknown, n => Command::Merge(n.join(" ")) },
         "/like" => match args.as_slice() { [] => Command::Unknown, n => Command::Like(n.join(" ")) },
+        "/review" => if args.is_empty() { Command::Review } else { Command::Unknown },
         "/refine" => match args.as_slice() {
             [] => Command::Refine(None),
             [r] => Command::Refine(Some(r.to_ascii_lowercase())),
@@ -474,6 +477,7 @@ impl Command {
             Command::Switch(n) => Some(format!("/switch {n}")),
             Command::Merge(n) => Some(format!("/merge {n}")),
             Command::Like(n) => Some(format!("/like {n}")),
+            Command::Review => Some("/review".to_string()),
             Command::Refine(None) => Some("/refine".to_string()),
             Command::Refine(Some(r)) => Some(format!("/refine {r}")),
             Command::Deferred { drop: false } => Some("/deferred".to_string()),

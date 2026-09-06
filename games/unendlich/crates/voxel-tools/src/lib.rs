@@ -119,6 +119,8 @@ pub mod spec;
 pub mod latent;
 /// The recognizer: a build sentence to a form line, without a model.
 pub mod recipe;
+/// The review loop: elevations and measurements to the model, a ten-token verdict back.
+pub mod review;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.

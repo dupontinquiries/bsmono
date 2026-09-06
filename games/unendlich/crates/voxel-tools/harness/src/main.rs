@@ -36,6 +36,7 @@ fn main() {
     progressive_scenario();
     referent_scenario();
     bare_words_scenario();
+    review_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -837,4 +838,49 @@ fn bare_words_scenario() {
     let log = pb.drain_log();
     assert!(log.iter().any(|l| l.contains("not a command I know")), "{log:?}");
     println!("  '/frobnicate now' -> {}", log.last().unwrap().trim());
+}
+
+
+/// The loop: a build lands, the model is shown it, its verdict re-plans,
+/// a second review says done.
+fn review_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== review loop");
+    // a scripted "model": first the plan, then a verdict that drops the
+    // tree and adds a roof, then done. It records what it was shown.
+    struct Scripted { calls: std::sync::Arc<std::sync::Mutex<Vec<String>>> }
+    impl voxel_tools::llm::Completer for Scripted {
+        fn name(&self) -> &str { "scripted" }
+        fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            let mut c = self.calls.lock().unwrap();
+            c.push(user.to_string());
+            Ok(match c.len() {
+                1 => "enclose @-4,-4 @4,4 h=5 block=stone\ntree @9,9 oak h=7\n".into(),
+                2 => "drop 2\nadd roof @-4,-4 @4,4 gable block=dark_oak_planks\n".into(),
+                _ => "done\n".into(),
+            })
+        }
+    }
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    pb.review_rounds = 2;
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(Scripted { calls: calls.clone() }))));
+    pb.start_turn(&cm, &gaze, Some("grass"), "a hall", None);
+    let t0 = std::time::Instant::now();
+    while (pb.in_flight.is_some() || pb.drone.is_some() || pb.review_owed() > 0) && t0.elapsed().as_secs() < 20 {
+        pb.poll_turn(&cm); pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let log = pb.drain_log();
+    let c = calls.lock().unwrap();
+    println!("  model calls: {} (plan, review 1, review 2)", c.len());
+    assert_eq!(c.len(), 3, "{log:?}");
+    assert!(c[1].contains("REVIEW round 1") && c[1].contains("FRONT (") && c[1].contains("1. ") && c[1].contains("2. "), "{}", c[1]);
+    assert!(!c[1].contains("@-4,-4"), "the review shows no coordinates");
+    assert!(c[2].contains("REVIEW round 2"));
+    assert!(log.iter().any(|l| l.contains("review: drop") || l.contains("roof") || l.contains("gable")), "{log:?}");
+    let wp = pb.waypoint().expect("a plan still pending");
+    println!("  after the loop: {} blocks pending; last log: {}", wp.2, log.last().unwrap().trim());
+    assert!(log.iter().any(|l| l.contains("done")), "{log:?}");
 }
