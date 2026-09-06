@@ -236,3 +236,28 @@ geometry.
 Also needed on this binary: it is dynamically linked against the toolchain
 libstd, hence the `LD_LIBRARY_PATH` above, or it dies before opening a
 window.
+
+### What the scene renders taught, one session later
+
+`apps/logscope/tools/scene-shot.sh` wraps the recipe above in two halves
+(`start`, then `grab` in the next call) and pins four things every earlier
+render had wrong:
+
+* **`LOGSCOPE_HOUR=14`.** The sandbox clock is UTC 04:00-ish; the sun model
+  follows it, so an unpinned render is a night shot and every scene looks
+  underlit. Three rounds of "brighten the albedo" went to this.
+* **`LOGSCOPE_POWER=full`.** llvmpipe's `GL_RENDERER` trips the weak-GPU
+  trim, which drops props by screen size.
+* **`LOGSCOPE_CAM=yaw,pitch,dist,tx,ty,tz`** — the six-value form orbits a
+  FIXED point. The three-value form can only orbit the graph centroid, which
+  puts a prop outside the graph's footprint (the physical UI panel) at the
+  frame edge or behind the camera. `LOGSCOPE_DEBUG_LABELS=1` dumps every
+  mesh's centroid to `/tmp/scene_labels_<theme>.txt`; grep the prop's
+  emissive or size there to get `tx,ty,tz`.
+* **A/B the renderer switches before the geometry.** Floors black at every
+  albedo were not dark: `LOGSCOPE_CULL=0` brought them back in one frame
+  (every disc floor wound clockwise), and `LOGSCOPE_SHADOWS=0` ruled the
+  shadow map out first. A far plane fitted to the graph's extent cut the
+  world at forty units. All three are fixed at the source now, but the
+  order of suspicion — camera range, culling, shadows, then colour — is the
+  part to keep.
