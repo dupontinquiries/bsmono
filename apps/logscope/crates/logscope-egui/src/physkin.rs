@@ -113,10 +113,12 @@ impl Fixture {
     }
 
     /// Does this fixture read as WARM (flame / paper / sun) rather than cold (crystal / neon /
-    /// bio-glow)? Derived from the colour, not a second table — the hue is the mechanism.
+    /// bio-glow)? Derived from the colour, not a second table — the hue is the mechanism. Warm means
+    /// the red-through-yellow arc: more red than blue AND at least as much green as blue. The first
+    /// version was `r > b` alone, and the test caught it calling magenta neon warm.
     pub fn is_warm(self) -> bool {
-        let (r, _g, b) = self.light_rgb();
-        r > b
+        let (r, g, b) = self.light_rgb();
+        r > b && g >= b
     }
 }
 
