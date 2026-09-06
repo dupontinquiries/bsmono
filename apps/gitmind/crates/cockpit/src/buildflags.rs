@@ -342,7 +342,17 @@ pub fn gui_env(triple: &str) -> Vec<(String, String)> {
 /// environment would otherwise be silently dropped, and dropping `RUSTFLAGS` changes what
 /// gets built without saying so.
 pub fn build_env(triple: &str, toml: &str, inherited_rustflags: Option<&str>) -> Vec<(String, String)> {
-    let mut env = cross_env(triple);
+    build_env_on_path(triple, toml, inherited_rustflags, "")
+}
+
+/// [`build_env`], probing `path_env` for the cross linker.
+pub fn build_env_on_path(
+    triple: &str,
+    toml: &str,
+    inherited_rustflags: Option<&str>,
+    path_env: &str,
+) -> Vec<(String, String)> {
+    let mut env = if path_env.is_empty() { cross_env(triple) } else { cross_env_on_path(triple, path_env) };
     if is_gui_app(toml) {
         for (k, v) in gui_env(triple) {
             let merged = match inherited_rustflags.map(str::trim).filter(|s| !s.is_empty()) {
@@ -407,6 +417,27 @@ pub fn explain_no_backend(triple: &str) -> Option<&'static str> {
     )
 }
 
+/// [`cross_env`], but choosing the linker by what is actually on `path_env` rather than by
+/// what the distro usually calls it.
+///
+/// Nix's cross compilers are prefixed with the FULL triple
+/// (`aarch64-unknown-linux-gnu-gcc`); Debian's are short (`aarch64-linux-gnu-gcc`). Naming
+/// one and hoping is how a machine with a perfectly good cross toolchain gets told the
+/// linker is missing. Falls back to [`cross_linker`]'s fixed name when nothing is found, so
+/// the error still names a variable cargo understands.
+pub fn cross_env_on_path(triple: &str, path_env: &str) -> Vec<(String, String)> {
+    let found = crate::nixtoolchain::pick_linker(triple, |n| crate::nixtoolchain::on_path(n, path_env));
+    let Some(linker) = found.or_else(|| cross_linker(triple).map(str::to_string)) else {
+        return Vec::new();
+    };
+    vec![(linker_var(triple), linker)]
+}
+
+/// `CARGO_TARGET_<TRIPLE>_LINKER`, the variable cargo reads.
+pub fn linker_var(triple: &str) -> String {
+    format!("CARGO_TARGET_{}_LINKER", triple.to_uppercase().replace('-', "_"))
+}
+
 pub fn cross_env(triple: &str) -> Vec<(String, String)> {
     // No early return for the empty triple: `cross_linker("")` matches no arm
     // and returns None, so the unknown-triple path below already covers it. I
@@ -420,11 +451,7 @@ pub fn cross_env(triple: &str) -> Vec<(String, String)> {
         // wanted.
         return Vec::new();
     };
-    let key = format!(
-        "CARGO_TARGET_{}_LINKER",
-        triple.to_uppercase().replace('-', "_")
-    );
-    vec![(key, linker.to_string())]
+    vec![(linker_var(triple), linker.to_string())]
 }
 
 /// The linker binary for a target triple, if this fleet knows one.
@@ -817,6 +844,24 @@ mod tests {
     }
 
     /// Overwriting the operator's RUSTFLAGS would change what gets built without saying so.
+    /// The linker is chosen by what exists, not by what the distro usually calls it — a Nix
+    /// cross compiler is prefixed with the full triple and would otherwise look missing.
+    #[test]
+    fn the_linker_is_found_by_probing_the_path() {
+        let dir = std::env::temp_dir().join(format!("gm-linker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let nixish = dir.join("aarch64-unknown-linux-gnu-gcc");
+        std::fs::write(&nixish, b"#!/bin/sh\n").unwrap();
+        let path = dir.display().to_string();
+        let env = cross_env_on_path("aarch64-unknown-linux-gnu", &path);
+        assert_eq!(env[0].0, "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER");
+        assert_eq!(env[0].1, "aarch64-unknown-linux-gnu-gcc");
+        // nothing on PATH: the fixed name, so the failure still names a real variable
+        let env = cross_env_on_path("aarch64-unknown-linux-gnu", "/nonexistent");
+        assert_eq!(env[0].1, "aarch64-linux-gnu-gcc");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn inherited_rustflags_are_kept() {
         let gui = "[dependencies]\neframe = \"0.34\"\n";

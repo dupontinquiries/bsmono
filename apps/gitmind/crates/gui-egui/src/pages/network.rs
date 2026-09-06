@@ -15,6 +15,24 @@ pub struct State {
     pub health_targets: Vec<(String, String, String)>,
     /// Third-party services discovered on a device (no fleet marker): (name, description).
     pub other_services: Vec<(String, String)>,
+    /// Per-daemon up/down from the last `status` read, and the host it was read from.
+    ///
+    /// `daemons::parse_status` has been pure and tested since the module was written and
+    /// nothing on this page called it: the ● beside each daemon was a decoration, the same
+    /// colour whether the service was running or not, and the only way to learn the truth
+    /// was to press `status` and read a block of raw text at the bottom of the page. A
+    /// control panel whose lights do not mean anything is worse than one with no lights.
+    pub daemon_up: std::collections::HashMap<String, bool>,
+    /// Which host `daemon_up` describes. Cleared when the target changes, because showing
+    /// one device's daemons as the state of another is the failure this guards against.
+    pub status_host: String,
+    /// Set when an action ran that changes what the lights should say, so the page re-reads
+    /// rather than leaving a stale dot next to a service you just started.
+    pub status_stale: bool,
+    /// A status read is in flight, so its result is a status block rather than the output
+    /// of whatever else the shared Task last ran. Without this the page would try to read
+    /// daemon states out of a build log.
+    pub status_pending: bool,
 }
 
 pub fn ui(app: &mut App, ui: &mut egui::Ui) {
@@ -39,9 +57,22 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         // The description is the part that ran off the screen — 447 points of it on a
         // 360-point phone. On a narrow screen it drops to its own wrapped line under the
         // name; on a laptop it stays inline. The chip is unchanged.
+        // THE LIGHT MEANS SOMETHING NOW. Green when the last status read said the service
+        // is up, red when it said down, hollow when nothing has been read for this host.
+        // "Not asked" is drawn differently from "asked and it is down" on purpose: a grey
+        // dot that could mean either is what made the old one useless.
+        let (glyph, tint) = match app.net.daemon_up.get(d.name) {
+            _ if app.net.status_host != app.net.host || app.net.host.trim().is_empty() => {
+                ("○", ui.visuals().weak_text_color())
+            }
+            Some(true) => ("●", egui::Color32::from_rgb(0x6d, 0xc2, 0x7a)),
+            Some(false) => ("●", egui::Color32::from_rgb(0xd0, 0x6b, 0x5e)),
+            None => ("○", ui.visuals().weak_text_color()),
+        };
+        let _ = tint;
         crate::narrow::titled_row(
             ui,
-            &format!("● {}", d.name),
+            &format!("{glyph} {}", d.name),
             Some((
                 d.integration,
                 egui::Color32::from_rgb(0x2a, 0x3a, 0x5a),
@@ -55,6 +86,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 if ui.add_enabled(can, egui::Button::new(action).small()).clicked() {
                     let (u, h, n, a) =
                         (app.net.user.clone(), app.net.host.clone(), d.name.to_string(), action.to_string());
+                    app.net.status_stale = true;
                     app.task.run(move || match cockpit::flow::daemon_control_remote(&u, &h, &n, &a) {
                         Ok(o) => format!("{n} {a}: {o}"),
                         Err(e) => format!("error: {e}"),
@@ -95,6 +127,8 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         if ui.add_enabled(can, egui::Button::new("status")).clicked() {
             let (u, h) = (app.net.user.clone(), app.net.host.clone());
+            app.net.status_pending = true;
+            app.net.status_stale = false;
             app.task.run(move || match cockpit::flow::daemons_status_remote(&u, &h) {
                 Ok(o) => o,
                 Err(e) => format!("error: {e}"),
@@ -170,8 +204,28 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     }
 
     if let Some(r) = app.task.take_result() {
+        // Only a STATUS result feeds the lights. The Task is shared by every button on
+        // this page, so parsing whatever finished would let a log dump or an install
+        // transcript set the dots — `parse_status` skips lines it does not recognise, so
+        // the damage would be silent and partial rather than obvious.
+        if std::mem::take(&mut app.net.status_pending) && !r.starts_with("error:") {
+            app.net.daemon_up = cockpit::daemons::parse_status(&r).into_iter().collect();
+            app.net.status_host = app.net.host.clone();
+        }
         app.net.note = r;
         app.net.streaming_name.clear(); // whatever ran is finished
+    }
+    // A start/stop/restart changed what the lights should say. Re-read once, automatically:
+    // pressing "start" and then having to press "status" to find out whether it worked is
+    // the page asking the operator to do its job.
+    if app.net.status_stale && !app.task.is_running() && !app.net.host.trim().is_empty() {
+        app.net.status_stale = false;
+        app.net.status_pending = true;
+        let (u, h) = (app.net.user.clone(), app.net.host.clone());
+        app.task.run(move || match cockpit::flow::daemons_status_remote(&u, &h) {
+            Ok(o) => o,
+            Err(e) => format!("error: {e}"),
+        });
     }
     if app.task.is_running() {
         ui.ctx().request_repaint();
@@ -190,4 +244,94 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     super::bluetooth::section(app, ui);
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{App, Tab};
+
+    /// Drive the page for one frame at phone size and return the frame's text.
+    fn frame(app: &mut App) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 760.0)));
+        let out = ctx.run(input, |c| app.ui(c));
+        uikit_egui::layout_probe::texts(&out.shapes).into_iter().map(|t| t.text).collect()
+    }
+
+    fn dot_for(texts: &[String], name: &str) -> Option<char> {
+        texts.iter().find(|t| t.contains(name)).and_then(|t| t.chars().next())
+    }
+
+    /// The light beside a daemon says what the last status read said — and says "not
+    /// asked" differently from "asked, and it is down".
+    ///
+    /// `daemons::parse_status` was pure and tested from the day the module was written, and
+    /// this page never called it: every ● was the same colour whether the service was
+    /// running or not.
+    #[test]
+    fn a_daemons_light_reflects_the_last_status_read() {
+        let mut app = App::default();
+        app.tab = Tab::Network;
+        app.net.host = "phone".into();
+
+        // nothing read yet: hollow
+        let t = frame(&mut app);
+        assert_eq!(dot_for(&t, "voiced"), Some('○'), "an unread daemon must not look up OR down");
+
+        // a status block arrives
+        app.net.daemon_up = cockpit::daemons::parse_status("voiced: active\nsharemd: inactive\n")
+            .into_iter()
+            .collect();
+        app.net.status_host = "phone".into();
+        let t = frame(&mut app);
+        assert_eq!(dot_for(&t, "voiced"), Some('●'), "a running daemon is filled");
+        assert_eq!(dot_for(&t, "sharemd"), Some('●'), "a stopped daemon is filled too — the COLOUR differs");
+        // a daemon the block did not mention is unread, not down
+        assert_eq!(dot_for(&t, "settingsd"), Some('○'));
+
+        // POINTING AT ANOTHER DEVICE INVALIDATES THE READING. Showing one phone's daemons
+        // as another's is the mistake this guards: the lights would be confidently wrong.
+        app.net.host = "laptop".into();
+        let t = frame(&mut app);
+        assert_eq!(dot_for(&t, "voiced"), Some('○'), "a stale host's reading must not be shown");
+    }
+
+    /// A control action marks the reading stale so the page re-reads on its own. Pressing
+    /// "start" and then having to press "status" to find out whether it worked is the page
+    /// asking the operator to do its job.
+    #[test]
+    fn starting_a_daemon_schedules_a_fresh_read() {
+        let mut app = App::default();
+        app.tab = Tab::Network;
+        app.net.host = "phone".into();
+        app.net.status_stale = true;
+        assert!(!app.task.is_running());
+        let _ = frame(&mut app);
+        // the page kicked the read itself; `status_pending` marks the result as a status
+        // block rather than whatever else the shared Task might have run
+        assert!(app.net.status_pending, "no re-read was scheduled");
+        assert!(!app.net.status_stale, "the flag must be consumed, or it re-reads every frame");
+    }
+
+    /// The shared Task runs logs, installs and builds too. Only a status result may set the
+    /// lights — `parse_status` skips lines it does not recognise, so feeding it a log would
+    /// corrupt the dots silently and partially.
+    #[test]
+    fn a_log_dump_does_not_set_the_lights() {
+        let mut app = App::default();
+        app.tab = Tab::Network;
+        app.net.host = "phone".into();
+        app.net.daemon_up.insert("voiced".into(), true);
+        app.net.status_host = "phone".into();
+        app.net.status_pending = false;
+        // a plausible log line that parse_status would happily read as `name: state`
+        app.task.run(|| "voiced: stopped by the operator at 14:02\n".to_string());
+        while app.task.is_running() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let _ = frame(&mut app);
+        assert_eq!(app.net.daemon_up.get("voiced"), Some(&true), "a log line set a daemon light");
+    }
 }

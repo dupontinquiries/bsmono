@@ -55,5 +55,7 @@ pub mod pydeps;
 pub mod artifacts;
 pub mod suite;
 pub mod sysdeps;
+/// Cross-compiling when the toolchain came from Nix rather than rustup.
+pub mod nixtoolchain;
 
 pub use ops::*;

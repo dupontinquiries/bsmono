@@ -250,9 +250,34 @@ pub fn build_locally_cancellable(
     let native = native_triple_local();
     let path_env = tool_path_env();
     let cargo_target = if crate::buildflags::is_native_build(target, &native) { String::new() } else { target.to_string() };
+    // WHO OWNS THE TOOLCHAIN decides what "ensure the target" even means. Under rustup it
+    // is `rustup target add`. Under Nix that command is worse than useless: on a machine
+    // with both installed it manages a DIFFERENT toolchain from the cargo about to run, so
+    // it succeeds, changes nothing, and the build still fails with `can't find crate for
+    // std` — with the one diagnostic that could have explained it now reporting success.
+    let toolchain = crate::nixtoolchain::detect_here(&cargo);
     if !cargo_target.is_empty() {
-        on_line(&format!("• ensuring rust target {cargo_target}…"));
-        crate::sysdeps::ensure_rust_target(&cargo_target, &path_env).map_err(|e| format!("cross-build setup: {e}"))?;
+        match toolchain {
+            crate::nixtoolchain::Toolchain::Nix => {
+                let has_std = crate::sysdeps::rust_target_installed(&cargo_target, &path_env);
+                let linker = crate::nixtoolchain::pick_linker(&cargo_target, |n| {
+                    crate::nixtoolchain::on_path(n, &path_env)
+                });
+                if let Some(why) = crate::nixtoolchain::blocker(toolchain, &cargo_target, has_std, linker.as_deref()) {
+                    on_line("• Nix toolchain detected — not calling rustup");
+                    for l in why.lines() {
+                        on_line(l);
+                    }
+                    return Err(format!("cross-build setup: no {cargo_target} toolchain in this Nix environment"));
+                }
+                on_line(&format!("• Nix toolchain has {cargo_target} (linker: {})", linker.unwrap_or_default()));
+            }
+            _ => {
+                on_line(&format!("• ensuring rust target {cargo_target}…"));
+                crate::sysdeps::ensure_rust_target(&cargo_target, &path_env)
+                    .map_err(|e| format!("cross-build setup: {e}"))?;
+            }
+        }
     }
     let want = build_dir_for(app_dir, &path_env);
     let build_dir = if std::fs::create_dir_all(&want).is_ok() {
@@ -281,10 +306,11 @@ pub fn build_locally_cancellable(
     // open a window anywhere: winit dlopens libwayland-client and libX11 at run time, and a
     // static binary cannot dlopen at all, so it dies with NoWaylandLib / "Failed to
     // initialize any backend" even on a device that has both. See `buildflags::gui_env`.
-    let build_env = crate::buildflags::build_env(
+    let build_env = crate::buildflags::build_env_on_path(
         &cargo_target,
         &root_toml,
         std::env::var("RUSTFLAGS").ok().as_deref(),
+        &path_env,
     );
     on_line(&format!("$ cargo {}", argv[1..].join(" ")));
     on_line(&format!("  (in {})", app_dir.display()));
