@@ -31,12 +31,33 @@
 //!    exactly like a plain audio file's, a recorded take's, or a bounced
 //!    pattern's — `mixdown` doesn't know or care which.
 //!
+//! ## The film-production half, which shells out to nothing
+//!
+//! Two things a set needs that have no ffmpeg in them at all, so they are pure and tested:
+//!
+//! * [`timecode`] — SMPTE, including drop-frame. Studio could print a wall clock
+//!   (`H:MM:SS.mmm`); a timecode names a FRAME, which is what a camera stamps and what a
+//!   shot list refers to. Drop-frame skips two frame LABELS a minute (no pictures) so that
+//!   `01:00:00;00` lands on the real hour at 29.97, which means some timecodes name no
+//!   frame at all and a parser that accepts them cuts two frames off.
+//! * [`slate`] — dual-system sound. Sound is recorded on its own machine with its own
+//!   clock, and the clapperboard exists to put one shared transient in both files.
+//!   [`slate::align`] finds it in each and correlates the ENVELOPES around it — different
+//!   microphones disagree about waveforms and agree about energy — reporting a confidence,
+//!   because a periodic signal correlates with itself at many lags and the peak is then
+//!   noise.
+//!
 //! Every function here shells out and inherits `ffmpeg`/`ffprobe`'s own
 //! failure modes: a missing binary is [`VideoError::MissingBinary`], a
 //! subprocess that exits non-zero is [`VideoError::CommandFailed`] carrying
 //! its stderr, and a video with no audio track is `Ok(None)` from
 //! `extract_audio`, not an error — same "this file genuinely doesn't have
 //! that" pattern `probe`'s own `has_audio: false` already uses.
+
+/// SMPTE timecode, including drop-frame. Pure — no ffmpeg in it.
+pub mod timecode;
+/// Dual-system sound: aligning a separately-recorded take to picture by the clap. Pure.
+pub mod slate;
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -125,6 +146,24 @@ fn run(program: &'static str, args: &[&str]) -> Result<Vec<u8>, VideoError> {
 }
 
 /// Probe a video file's format and stream metadata via `ffprobe`.
+impl VideoProbe {
+    /// The named frame rate this file is at, if it is one anybody shoots. `None` for an odd
+    /// rate — which is a real answer: a timecode at a rate with no integer nominal count is
+    /// not a thing, and guessing the nearest would mislabel every frame.
+    pub fn rate(&self) -> Option<timecode::Rate> {
+        timecode::Rate::nearest(self.fps)
+    }
+
+    /// The timecode of a position in this file, counted from `00:00:00:00`.
+    ///
+    /// Drop-frame when the rate has a drop standard, because that is what an NTSC camera
+    /// stamps and what an NLE shows unless told otherwise.
+    pub fn timecode_at(&self, at: Ticks) -> Option<timecode::Timecode> {
+        let r = self.rate()?;
+        Some(timecode::Timecode::from_ticks(at, r, r.can_drop()))
+    }
+}
+
 pub fn probe(path: &Path) -> Result<VideoProbe, VideoError> {
     let path_str = path.to_string_lossy();
     let stdout = run("ffprobe", &["-v", "error", "-print_format", "json", "-show_format", "-show_streams", &path_str])?;
@@ -430,6 +469,20 @@ fixture-backed tests (the audio fixture needs it).");
     #[test]
     fn parse_rational_handles_ntsc_and_whole_number_rates() {
         assert!((parse_rational("30000/1001").unwrap() - 29.97).abs() < 0.01);
+        // and that rational is what a probe turns into a NAMED rate, so a timecode can be
+        // drawn: 29.97 is drop-frame capable and 23.976 is not, and the difference decides
+        // whether `01:00:00;00` is even a legal label.
+        let p = VideoProbe { duration: Ticks::ZERO, width: 1920, height: 1080,
+                             fps: parse_rational("30000/1001").unwrap(), has_audio: true,
+                             audio_channels: Some(2), audio_sample_rate: Some(48_000) };
+        assert_eq!(p.rate(), Some(timecode::Rate::Fps29_97));
+        assert_eq!(p.timecode_at(Ticks::from_seconds(3600.0)).unwrap().format(), "01:00:00;00");
+        let film = VideoProbe { fps: 24.0, ..p };
+        assert_eq!(film.timecode_at(Ticks::from_seconds(3600.0)).unwrap().format(), "01:00:00:00");
+        // an odd rate is not rounded onto a real one — every frame would then be mislabelled
+        let odd = VideoProbe { fps: 48.0, ..p };
+        assert_eq!(odd.rate(), None);
+        assert!(odd.timecode_at(Ticks::ZERO).is_none());
         assert_eq!(parse_rational("25/1"), Some(25.0));
         assert_eq!(parse_rational("0/0"), None, "must not divide by zero into NaN");
         assert_eq!(parse_rational("not-a-fraction"), None);
