@@ -22,6 +22,7 @@ license = "MIT OR Apache-2.0"
 # Dependency-free maths. `lux::sky_at` delegates to `math_kit::daylight` so the
 # panels, scene-kit and logscope all read ONE sun curve — see that module.
 math-kit = { path = "../../../math-kit" }
+qrcodegen = { version = "1.8", optional = true }
 touchkit = { path = "../../../touchkit", features = ["egui"] }
 # `glow` alone leaves winit with NO Linux backend compiled, so the `demo`
 # feature failed to build anywhere on Linux with "The platform you're compiling
@@ -44,6 +45,10 @@ settings-kit = { path = "../../../settings-kit" }
 [features]
 # Runnable eframe demos (examples/); off by default so `cargo test` stays light + headless.
 demo = ["dep:eframe"]
+# A REAL QR encoder (`qrbig`): Nayuki's qrcodegen, no deps of its own. Off by default — the
+# identicon in `qr` is dependency-free and most apps only need that; an app that shares
+# data (voiceterm's zettelkasten) turns this on.
+qrbig = ["dep:qrcodegen"]
 
 [[example]]
 name = "logscope_touch"
