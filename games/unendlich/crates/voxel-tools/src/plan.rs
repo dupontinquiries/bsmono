@@ -140,6 +140,10 @@ pub enum Op {
     /// reconstructs and reports how faithful the result is.
     Views { views: Vec<(String, String)>, at: (i32, i32), y: Option<i32>,
             depth: i32, block: u16 },
+    /// Greebles: evolve a decorator FSM for a region's surface against
+    /// a phrase, then apply the winner. Or run a stated genome.
+    Greeble { min: (i32, i32, i32), max: (i32, i32, i32), phrase: String,
+              gens: u32, seed: i32, genome: Option<String> },
     /// A terrain brush: raise/lower/smooth/flatten/roughen with falloff.
     Brush { op: String, amount: i32, at: (i32, i32), radius: i32, falloff: String, seed: i32 },
     /// A painted layer baked into blocks: a forest, a meadow, a desert.
@@ -534,6 +538,21 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                             .unwrap_or(&"gable").to_string(),
                     block: blk("oak_planks").unwrap_or(57),
                     overhang: kvi(&t, "overhang", 1).clamp(0, 4) });
+            }
+            "greeble" | "decorate" => {
+                let a = t.get(1).and_then(|s| triple_at(s, anchor).ok().flatten());
+                let b = t.get(2).and_then(|s| triple_at(s, anchor).ok().flatten());
+                let (Some(mn), Some(mx)) = (a, b) else {
+                    bad("greeble needs two x,y,z corners".into()); continue;
+                };
+                let phrase: Vec<&str> = t.iter().skip(3)
+                    .filter(|s| !s.contains('=')).copied().collect();
+                ops.push(Op::Greeble {
+                    min: mn, max: mx, phrase: phrase.join(" "),
+                    gens: kvi(&t, "gens", 12).clamp(1, 60) as u32,
+                    seed: kvi(&t, "seed", 1),
+                    genome: t.iter().find_map(|s| s.strip_prefix("genome=")).map(|s| s.to_string()),
+                });
             }
             "brush" => {
                 let Some(op) = t.get(1).map(|s| s.to_lowercase()) else {
@@ -1083,6 +1102,38 @@ pub fn run_plan_with<W: VoxelWorld>(
                     None => CallResult::err(format!("unknown form '{name}'")),
                 }
             }
+            Op::Greeble { min, max, phrase, gens, seed, genome } => (|| {
+                use crate::gene;
+                let f = gene::faces(tools.world, *min, *max);
+                if f.is_empty() {
+                    return CallResult { ok: false, summary: "greeble: no exposed surface in that region".into(),
+                                        ..Default::default() };
+                }
+                let (changes, note) = match genome {
+                    Some(g) => match gene::Genome::parse(&g.replace(';', "\n")) {
+                        Ok(gn) => { let c = gene::run(&gn, &f, *seed as u64);
+                                    let m = gene::measure(&f, &c);
+                                    (c, format!("stated genome: coverage {:.0}%, noise {:.2}",
+                                                m.coverage * 100.0, m.noise)) }
+                        Err(e) => return CallResult { ok: false, summary: format!("greeble: bad genome: {e}"),
+                                                      ..Default::default() },
+                    },
+                    None => {
+                        let fit = gene::Fitness::from_phrase(phrase);
+                        let e = gene::evolve(&f, &fit, *seed as u64, 24, *gens as usize);
+                        let m = e.metrics;
+                        (e.changes, format!(
+                            "evolved '{}' over {} faces in {gens} generations: score {:.2}, \
+                             coverage {:.0}%, edges {:.0}%, depth {:.0}%, noise {:.2}, symmetry {:.2}\n{}",
+                            if phrase.is_empty() { "default" } else { phrase }, f.len(), e.score,
+                            m.coverage * 100.0, m.edges * 100.0, m.depth * 100.0, m.noise, m.symmetry,
+                            e.genome.to_text().trim()))
+                    }
+                };
+                let mut r = tools.apply_changes(&changes);
+                if r.ok { r.summary = format!("greeble: {note}"); }
+                r
+            })(),
             Op::Brush { op, amount, at, radius, falloff, seed } => {
                 use crate::brush::{self, Brush, BrushOp, Falloff};
                 let bop = match op.as_str() {

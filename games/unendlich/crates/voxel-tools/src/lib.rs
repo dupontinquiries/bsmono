@@ -103,6 +103,8 @@ pub mod feature;
 pub mod hive;
 /// A git tree over the world: content-addressed chunk edits, branches, merge, rebase.
 pub mod vcs;
+/// Greebles by natural selection: a genome language for decorator FSMs, metrics, evolution.
+pub mod gene;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.
