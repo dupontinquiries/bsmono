@@ -50,12 +50,23 @@ Net: 2 of the 6 are real, not 6.
   permanent state (power-user tool) or a launcher-blocking gap (phone users won't hand-edit ini
   files) is a product call, not an engineering one — flagging rather than deciding.
 
-- **`uikit-egui`'s `adaptive.rs` is unused.** `Adaptive::detect`/`DeviceClass::from_width`/
-  `.pick(phone, tablet, desktop)` exist specifically for apps that, like hatch, target both
-  `desktop` and `phone` in the manifest. `GridSpec` (`hatch-core/src/grid.rs`) takes `cols`/`cell`
-  as plain values; nothing in the egui-frontend call chain was confirmed to vary them by device
-  class. Not confirmed broken — confirmed unused — so verify actual on-phone tile sizing before
-  treating this as launcher-blocking.
+- **`uikit-egui`'s `adaptive.rs` is unused — mechanism now confirmed, fix deliberately not attempted.**
+  `HatchUi::ui()` sets `cell = Vec2::new(icon_px + 44.0, icon_px + 40.0)` straight from
+  `config.icon_px` (default 64, so a ~108×104pt cell) — no `DeviceClass` branch, no
+  `Adaptive::with_min_touch_target` floor. In practice this is lower-severity than "unused"
+  alone suggested: `icon_px` lives in a per-machine XDG config, so a phone and a desktop running
+  hatch have independent files unless something explicitly syncs dotfiles between them — this
+  isn't one config value silently fighting two screens.
+
+  What's still real: nothing enforces a minimum comfortable touch target on the phone
+  independent of whatever `icon_px` happens to be set to (default or user-changed), and nothing
+  gives phone/desktop different *defaults* the way `Adaptive::pick(phone, tablet, desktop)` exists
+  to do. I'm not fixing this now — picking an actual minimum touch-target size (44pt? 48pt?
+  something FP5-DPI-specific?) is an ergonomics judgment call that wants a real device in hand,
+  not a guess from a sandbox with no display. Wiring `Adaptive::detect`/`with_min_touch_target`
+  in without a real number to give it would just replace an honest fixed constant with a
+  dishonest-looking "adaptive" one that was never tuned against anything. Flagging with the
+  mechanism now fully named so whoever has the phone can wire the actual number in directly.
 
 ## Closed
 
