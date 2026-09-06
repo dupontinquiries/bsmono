@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use egui::{Align2, Color32, CornerRadius, FontId, Key, Rect, Sense, Stroke, StrokeKind, Vec2};
+use hatch_core::anim::{Board, TilePose};
+use hatch_core::grid::GridSpec;
 use hatch_core::Launcher;
 use uikit_egui::{A11yScene, PaletteColors, Role, Semantics};
 
@@ -89,6 +91,13 @@ pub struct HatchUi {
     /// pushed into it via `set_focus` so the two are never out of sync; it
     /// does not decide anything, it reports.
     a11y: A11yScene,
+    /// The grid's per-tile motion — enter/restack/exit — driven every frame
+    /// from `self.core.results()`'s order. Was ported into `hatch-core`
+    /// (headless, tested) and never called from here; see `PARITY.md`. Kept
+    /// as a resident field, not rebuilt per frame, because `Board::retarget`
+    /// diffs against its OWN previous state to know what's new/moved/leaving
+    /// — a fresh `Board` every frame would see every tile as new, every time.
+    board: Board,
 }
 
 struct PressTrack {
@@ -100,6 +109,7 @@ struct PressTrack {
 
 impl HatchUi {
     pub fn new(core: Launcher) -> Self {
+        let board_config = core.config.anim; // captured before `core` moves into the struct below
         HatchUi {
             core,
             query: String::new(),
@@ -114,6 +124,7 @@ impl HatchUi {
             last_error: None,
             tile_rects: Vec::new(),
             a11y: A11yScene::new(),
+            board: Board::new(board_config),
         }
     }
 
@@ -262,7 +273,12 @@ impl HatchUi {
     pub fn ui(&mut self, ui: &mut egui::Ui, colors: &PaletteColors) -> UiEvent {
         let mut event = UiEvent::None;
         let cfg_icon = self.core.config.icon_px as f32;
-        let cell = Vec2::new(cfg_icon + 44.0, cfg_icon + 40.0);
+        // Square, not (icon_px+44, icon_px+40): `GridSpec`/`Board` (hatch-core::anim,
+        // hatch-core::grid) assume square cells — every SlidePattern's offset
+        // math and cell_pos() take one `cell: f32`. The old rectangular cell
+        // predates this wiring and was never exercised against it. Taking the
+        // larger of the two paddings only ever grows the tile, never shrinks it.
+        let cell = Vec2::splat(cfg_icon + 44.0);
 
         // Reserve the bottom stack first so the grid can take the remainder.
         let sys_actions = self.core.system_actions();
@@ -442,68 +458,122 @@ impl HatchUi {
         event: &mut UiEvent,
     ) {
         let count = self.core.result_count();
-        self.a11y.begin_frame(); // before the early return: an empty grid must not keep last frame's items/focus alive
-        if count == 0 {
+        self.a11y.begin_frame(); // before any return: a filtered-to-zero grid must not keep last frame's items/focus alive
+        let now_ms = ui.input(|i| i.time) * 1000.0; // egui's own clock, not Instant::now() — deterministic and feedable in headless tests
+        // `Config::load()` already zeroes every duration in `config.anim` when
+        // `config.animations` is false (see store.rs), so no clamp is needed
+        // here — this is the one code path for both cases, exactly as that
+        // loader's own comment says it should be.
+        self.board.config = self.core.config.anim;
+
+        // GridSpec::rows_for/cell_pos don't read `rows_visible` at all (only
+        // `cols` and `cell`) — it exists on the struct for callers that DO
+        // need a viewport height (none here, since scrolling is the egui
+        // ScrollArea's job, not the Board's). Set honestly rather than
+        // faked: it's the total row count, not a "visible" subset, because
+        // this call site has no cheaper true answer and nothing reads it.
+        let spec = GridSpec { cols, rows_visible: count.div_ceil(cols.max(1)), cell: cell.x };
+
+        // `order` mirrors `self.core.results()` exactly — Board diffs against
+        // its OWN previous call's tiles by key, so calling `retarget` with an
+        // unchanged order every frame is a correct, cheap no-op for anything
+        // that hasn't moved; nothing here needs to detect "did it change".
+        let order: Vec<String> = self.core.results().map(|e| e.id.clone()).collect();
+        let order_refs: Vec<&str> = order.iter().map(String::as_str).collect();
+        // Position within the CURRENT order, for keyboard-selection lookup —
+        // Board's own iteration order appends leaving tiles after live ones,
+        // so `self.board.poses()`'s index is not this.
+        let live_pos: HashMap<&str, usize> =
+            order_refs.iter().enumerate().map(|(n, id)| (*id, n)).collect();
+
+        self.board.retarget(&order_refs, &spec, now_ms);
+        if self.board.tick(now_ms) {
+            ui.ctx().request_repaint(); // still moving — Board's own documented contract for this return value
+        }
+        if count == 0 && self.board.is_empty() {
             ui.add_space(24.0);
             ui.vertical_centered(|ui| ui.weak("No matches"));
             return;
         }
+        // Collected (not iterated live) so the loop below can hold `&mut
+        // self` freely — `self.board.poses()` borrows `self.board`
+        // immutably and every tile below needs `self.core`/`self.a11y`/etc.
+        let poses: Vec<(String, TilePose)> =
+            self.board.poses().map(|(k, p)| (k.to_string(), p)).collect();
+
         let menu_open = self.menu.is_some();
         let mut decode_budget = 3usize; // icons decoded per frame; keeps first paint under a frame
         let side = (ui.available_width() - cols as f32 * cell.x).max(0.0) / 2.0;
-        let rows = count.div_ceil(cols);
         let mut launch: Option<String> = None;
         let mut fav_toggle: Option<(String, egui::Pos2)> = None;
         self.tile_rects.clear();
 
-        for row in 0..rows {
-            ui.horizontal(|ui| {
-                ui.add_space(side);
-                for col in 0..cols {
-                    let n = row * cols + col;
-                    let Some(e) = self.core.result_at(n) else { break };
-                    let id = e.id.clone();
-                    let name = e.name.clone();
-                    let fav = self.core.is_favorite(&id);
-                    let tex = self.texture_for(ui.ctx(), &id, &mut decode_budget);
-                    let selected = n == self.sel;
+        // Reserve the full scrollable content height up front — `Board`
+        // positions tiles at absolute coordinates rather than through egui's
+        // layout cursor, so nothing else advances it, and the ScrollArea
+        // wrapping this call needs a real content size to know how far it
+        // can scroll.
+        let content_h = spec.content_height(count).max(cell.y);
+        let (content_rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), content_h), Sense::hover());
+        let origin = content_rect.min + Vec2::new(side, 0.0);
 
-                    let (rect, resp) =
-                        ui.allocate_exact_size(cell, Sense::click());
-                    self.tile_rects.push((id.clone(), rect));
-                    if resp.hovered() {
-                        self.sel = n;
-                    }
-                    self.tile(ui, rect, &resp, &name, tex, fav, selected, colors);
-                    // Spoken form is always the full app name, regardless of
-                    // how the tile is drawn (icon vs. letter-tile fallback
-                    // paint the same either way) — see gitmind's tab-strip
-                    // comment for why a visual abbreviation must not shrink
-                    // the spoken one too.
-                    self.a11y.add(
-                        Self::a11y_id(&id),
-                        Semantics::new(Role::Button, &name)
-                            .with_value(if fav { "favorite" } else { "" })
-                            .with_hint("long-press to favorite"),
-                        Some(rect),
-                    );
-                    if selected {
-                        self.a11y.set_focus(Some(Self::a11y_id(&id)));
-                    }
+        for (id, pose) in &poses {
+            let Some(e) = self.core.entry(id) else { continue }; // defensive only: Board never carries an id the core has never known
+            let name = e.name.clone();
+            let fav = self.core.is_favorite(id);
+            let leaving = !live_pos.contains_key(id.as_str());
+            let n = live_pos.get(id.as_str()).copied();
+            let selected = n == Some(self.sel);
 
-                    match self.hold(&resp, &id) {
-                        Hold::Fired => fav_toggle = Some((id, rect.center())),
-                        Hold::SwallowClick => {}
-                        Hold::Free => {
-                            if resp.secondary_clicked() {
-                                fav_toggle = Some((id.clone(), rect.center()));
-                            } else if resp.clicked() && !menu_open {
-                                launch = Some(id);
-                            }
-                        }
+            let rect = Rect::from_min_size(origin + Vec2::new(pose.x, pose.y), cell);
+            let tile_id = egui::Id::new(("hatch-tile", id.as_str()));
+            let resp = ui.interact(rect, tile_id, if leaving { Sense::hover() } else { Sense::click() });
+
+            if !leaving {
+                self.tile_rects.push((id.clone(), rect));
+                if resp.hovered() {
+                    self.sel = n.expect("live_pos contains this id, checked above via `leaving`");
+                }
+            }
+
+            let tex = self.texture_for(ui.ctx(), id, &mut decode_budget);
+            self.tile(ui, rect, &resp, &name, tex, fav, selected, pose.scale, pose.alpha, colors);
+
+            // A leaving tile is on its way out and un-selectable — no a11y
+            // registration, no click handling, no favorite toggle. It is
+            // still painted (that's the whole point of an exit fade) and
+            // nothing more.
+            if leaving {
+                continue;
+            }
+
+            // Spoken form is always the full app name, regardless of how the
+            // tile is drawn (icon vs. letter-tile fallback paint the same
+            // either way) — see gitmind's tab-strip comment for why a visual
+            // abbreviation must not shrink the spoken one too.
+            self.a11y.add(
+                Self::a11y_id(id),
+                Semantics::new(Role::Button, &name)
+                    .with_value(if fav { "favorite" } else { "" })
+                    .with_hint("long-press to favorite"),
+                Some(rect),
+            );
+            if selected {
+                self.a11y.set_focus(Some(Self::a11y_id(id)));
+            }
+
+            match self.hold(&resp, id) {
+                Hold::Fired => fav_toggle = Some((id.clone(), rect.center())),
+                Hold::SwallowClick => {}
+                Hold::Free => {
+                    if resp.secondary_clicked() {
+                        fav_toggle = Some((id.clone(), rect.center()));
+                    } else if resp.clicked() && !menu_open {
+                        launch = Some(id.clone());
                     }
                 }
-            });
+            }
         }
         if decode_budget == 0 {
             // More icons still undecoded — come back next frame.
@@ -539,26 +609,37 @@ impl HatchUi {
         tex: Option<egui::TextureId>,
         fav: bool,
         selected: bool,
+        pose_scale: f32,
+        alpha: f32,
         colors: &PaletteColors,
     ) {
         let p = ui.painter();
         let pressed = resp.is_pointer_button_down_on();
         // The QML "squish": egui's animated bool gives the same 80ms feel.
+        // Composed multiplicatively with the Board's arrival/exit scale —
+        // the two are independent effects (one keyed to touch, one to
+        // enter/restack/exit) and either can be 1.0 while the other moves.
         let t = ui.ctx().animate_bool_with_time(resp.id, pressed, 0.08);
-        let scale = 1.0 - 0.10 * t;
+        let press_scale = 1.0 - 0.10 * t;
+        let scale = press_scale * pose_scale;
+        // Rotation (`TilePose::rot`, used by the Scatter slide pattern) is
+        // deliberately not applied here — painting a rotated `p.image()`
+        // needs a transformed mesh, not just a differently-sized rect, and
+        // that's real additional work. Every other pattern's `rot` is 0, so
+        // this only mutes Scatter's flourish, not its position/timing.
 
         if selected || resp.hovered() {
             let a = if selected { 70 } else { 40 };
             p.rect_filled(
                 rect.shrink(3.0),
                 CornerRadius::same(12),
-                colors.accent.gamma_multiply(a as f32 / 255.0),
+                colors.accent.gamma_multiply(a as f32 / 255.0 * alpha),
             );
             if selected {
                 p.rect_stroke(
                     rect.shrink(3.0),
                     CornerRadius::same(12),
-                    Stroke::new(1.0, colors.accent),
+                    Stroke::new(1.0, colors.accent.gamma_multiply(alpha)),
                     StrokeKind::Inside,
                 );
             }
@@ -573,17 +654,18 @@ impl HatchUi {
                     id,
                     icon_rect,
                     Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
+                    Color32::WHITE.gamma_multiply(alpha),
                 );
             }
             None => {
                 // Same deterministic letter tile the rest of the fleet uses.
                 let seed = uikit_egui::mono_tile::seed(name);
                 let hue = uikit_egui::mono_tile::hue(name);
-                let ground = uikit_egui::mono_tile::hsla(hue, 0.45, 0.28, 1.0);
+                let ground = uikit_egui::mono_tile::hsla(hue, 0.45, 0.28, 1.0).gamma_multiply(alpha);
                 p.rect_filled(icon_rect, CornerRadius::same((icon_px * 0.24) as u8), ground);
                 let ini = uikit_egui::mono_tile::initials(name);
-                let bright = uikit_egui::mono_tile::hsla((hue + (seed % 40) as f32) % 360.0, 0.7, 0.8, 1.0);
+                let bright = uikit_egui::mono_tile::hsla((hue + (seed % 40) as f32) % 360.0, 0.7, 0.8, 1.0)
+                    .gamma_multiply(alpha);
                 p.text(
                     icon_rect.center(),
                     Align2::CENTER_CENTER,
@@ -599,7 +681,7 @@ impl HatchUi {
                 Align2::RIGHT_TOP,
                 "★",
                 FontId::proportional(13.0),
-                colors.accent,
+                colors.accent.gamma_multiply(alpha),
             );
         }
 
@@ -612,7 +694,7 @@ impl HatchUi {
             Align2::CENTER_CENTER,
             label,
             font,
-            ui.visuals().text_color(),
+            ui.visuals().text_color().gamma_multiply(alpha),
         );
     }
 
@@ -838,6 +920,14 @@ mod tests {
         /// by its label instead of at a fraction down the popup that quietly
         /// stops being correct the next time the styling moves.
         texts: Vec<(String, Rect)>,
+        /// Synthetic clock fed into `RawInput.time`, seconds. Without this,
+        /// `RawInput.time: None` falls back to egui's own real-wallclock
+        /// timer, and `Board`'s enter/restack/exit durations (hundreds of ms)
+        /// would need real `sleep`s to ever complete in a test — slow, and
+        /// the anti-pattern `anim.rs`'s own Board tests deliberately avoid
+        /// with a synthetic `now_ms`. Advances a fixed 1/60s per `frame()`
+        /// call, independent of how fast the test itself actually runs.
+        time: f64,
     }
 
     /// Walk a frame's shapes for text. egui hands back the laid-out galleys,
@@ -861,19 +951,27 @@ mod tests {
 
     impl Harness {
         fn new(entries: Vec<AppEntry>) -> Harness {
+            Harness::with_config(hatch_core::Config::default(), entries)
+        }
+
+        /// Same as `new`, but with a caller-supplied config — needed for
+        /// tests that exercise `config.anim`/`config.animations` themselves
+        /// rather than accepting the default.
+        fn with_config(config: hatch_core::Config, entries: Vec<AppEntry>) -> Harness {
             // Private config home: the frame driver toggles favorites and
             // records recents, which must not touch a real launcher's state.
             let tmp = std::env::temp_dir().join(format!("hatch-ui-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&tmp);
             std::env::set_var("XDG_CONFIG_HOME", &tmp);
 
-            let core = hatch_core::Launcher::with_entries(hatch_core::Config::default(), entries);
+            let core = hatch_core::Launcher::with_entries(config, entries);
             Harness {
                 ctx: egui::Context::default(),
                 app: HatchUi::new(core),
                 palette: uikit_egui::default_palette(),
                 size: Vec2::new(420.0, 900.0),
                 texts: Vec::new(),
+                time: 0.0,
             }
         }
 
@@ -897,9 +995,11 @@ mod tests {
         fn frame(&mut self, events: Vec<egui::Event>) -> UiEvent {
             let input = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(egui::pos2(0.0, 0.0), self.size)),
+                time: Some(self.time),
                 events,
                 ..Default::default()
             };
+            self.time += 1.0 / 60.0;
             let mut out = UiEvent::None;
             let app = &mut self.app;
             let palette = &self.palette;
@@ -913,6 +1013,25 @@ mod tests {
                 collect_text(&clipped.shape, &mut self.texts);
             }
             out
+        }
+
+        /// Drive frames until `Board` has nothing left animating, bounded —
+        /// same idiom `hatch_core::anim`'s own tests use for convergence.
+        /// Needed before any test reads a tile's position for a LATER,
+        /// separate interaction: the very first frames after entries appear
+        /// are mid-entrance (offset, partly invisible), and a position read
+        /// then would go stale the moment the tile keeps moving.
+        fn settle(&mut self) {
+            for _ in 0..600 {
+                // 600 * 1/60s = 10s of simulated time — generous headroom
+                // over any real BoardConfig default (longest is exit at
+                // 120ms, entrance stagger adds more but nowhere near this).
+                if self.app.board.is_settled() {
+                    return;
+                }
+                self.frame(vec![]);
+            }
+            panic!("grid never settled after 10s of simulated time");
         }
 
         /// Press-and-release at `pos` across two frames, the way a real click
@@ -1072,6 +1191,7 @@ mod tests {
     /// Long-press `entry_id` and leave the menu open.
     fn open_menu(h: &mut Harness, entry_id: &str) -> egui::Pos2 {
         h.frame(vec![]);
+        h.settle(); // else `tile_rect` below can catch the tile mid-entrance, and the position goes stale before the click below even fires
         let rect = h.app.tile_rect(entry_id).expect("tile painted");
         let pos = rect.center();
         h.frame(vec![
@@ -1174,6 +1294,7 @@ mod tests {
         assert!(!h.has_text("Terminal"), "filtered-out apps stop being painted");
 
         h.frame(vec![egui::Event::Text("zzz".into())]);
+        h.settle(); // the filtered-out tiles exit-fade rather than vanish; wait for that to finish
         h.frame(vec![]);
         assert!(h.has_text("No matches"), "the empty state explains itself");
     }
@@ -1337,5 +1458,55 @@ mod tests {
         h.app.core.set_query("zzz_no_such_app");
         h.frame(vec![]);
         assert!(h.app.a11y.focused().is_none(), "no stale focus from before the filter narrowed to zero");
+    }
+
+    #[test]
+    fn the_grid_actually_animates_in_on_first_paint() {
+        // The point of the whole Board-wiring change: it must be genuinely
+        // driven, not decorative. A fresh grid's very first frame should NOT
+        // already show every tile at rest — if it does, nothing is animating.
+        let mut h = Harness::new(some_apps());
+        h.frame(vec![]);
+        assert!(!h.app.board.is_settled(), "the default pattern (FromBelow) must not land everything instantly");
+        h.settle();
+        assert!(h.app.board.is_settled(), "and it must actually converge");
+    }
+
+    #[test]
+    fn zero_duration_config_lands_every_tile_on_the_first_frame() {
+        // Config::load()'s own documented contract: animations=false means
+        // durations of zero, one code path, not a bypass. Exercised at the
+        // SHELL level, not just hatch-core's — the point here is that
+        // hatch-egui actually reads `config.anim` into `Board` every frame.
+        let mut cfg = hatch_core::Config::default();
+        cfg.anim.enter_ms = 0.0;
+        cfg.anim.stagger_ms = 0.0;
+        cfg.anim.restack_ms = 0.0;
+        cfg.anim.restack_stagger_ms = 0.0;
+        cfg.anim.exit_ms = 0.0;
+        let mut h = Harness::with_config(cfg, some_apps());
+        h.frame(vec![]);
+        assert!(h.app.board.is_settled(), "zero durations must settle on the very first frame, no wait needed");
+    }
+
+    #[test]
+    fn filtering_out_a_tile_fades_it_rather_than_vanishing_it_instantly() {
+        let mut h = Harness::new(some_apps());
+        h.frame(vec![]);
+        h.settle();
+        assert!(h.has_text("Terminal"));
+
+        h.frame(vec![egui::Event::Text("fi".into())]); // narrows away Camera and Terminal
+        h.frame(vec![]); // the very next frame: still fading, not yet gone
+        assert!(
+            h.app.board.poses().any(|(k, _)| k == "terminal"),
+            "a filtered-out tile stays on the board mid-fade, not removed the same frame it dropped out of the query"
+        );
+
+        h.settle();
+        assert!(
+            !h.app.board.poses().any(|(k, _)| k == "terminal"),
+            "and is gone once its fade actually finishes"
+        );
     }
 }
