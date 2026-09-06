@@ -116,7 +116,7 @@ pub const MANSION_GARDEN: Palette = Palette {
     maxmark: c(0x9c,0x78,0x2e), whisker: c(0x32,0x2c,0x20),
 };
 
-pub const PALETTES: &[Palette] = &[FOLDING_AT_HOME, READING_ROOM, ARCHIVE, SLATE, LIBRARY, CANOPY, MISTFALL, ATLANTIS, CLOUDSCAPE, FOREST, TREEHOUSE, MANSION_GARDEN, ALLEY, FRACTAL_SPIRES, RECURSIVE_CITADEL, HOLLOW_JUNGLE, YELLOW_BRICK_ROAD, BIFROST, TITAN_RIBCAGE];
+pub const PALETTES: &[Palette] = &[FOLDING_AT_HOME, READING_ROOM, ARCHIVE, SLATE, LIBRARY, CANOPY, MISTFALL, ATLANTIS, CLOUDSCAPE, FOREST, TREEHOUSE, MANSION_GARDEN, ALLEY, FRACTAL_SPIRES, RECURSIVE_CITADEL, HOLLOW_JUNGLE, YELLOW_BRICK_ROAD, BIFROST, TITAN_RIBCAGE, CAT_CAVE, FOREST_VILLAGE, LAVAROCK_WAY];
 
 /// Frozen Bifrost Bunker: a tight circular arena — a raised basalt dais (Nordic knotwork packed with frost) ringed
 /// by sunken glacial-ice trenches, its heart a shattered hexagonal pane of iridescent prismatic glass whose
@@ -144,6 +144,47 @@ pub const TITAN_RIBCAGE: Palette = Palette {
     blue: c(0x52,0x86,0xa0), cyan: c(0x52,0xa8,0x92), violet: c(0x96,0x82,0xb0), green: c(0x6e,0xa0,0x44),
     yellow: c(0xd8,0xc8,0x66), red: c(0xc0,0x66,0x46), red_soft: c(0xd8,0x90,0x6e),
     maxmark: c(0x6e,0xa0,0x44), whisker: c(0x22,0x26,0x16),
+};
+
+/// Cat Cave: a lantern-lit grotto — a still black-teal pond crossed by stepping stones, a waterfall off a ledge,
+/// one shaft of daylight through a round skylight hung with roots, shelves of jars in the rock, caged lanterns on
+/// posts, a writing desk, cats. Near-black stone and amber lamplight; the chrome is iron-bound slate with brass.
+pub const CAT_CAVE: Palette = Palette {
+    name: "Cat Cave", dark: true, material: Material::Stone, lit: true, canopy: false, light: c(0xff,0xb8,0x5a),
+    bg: c(0x0c,0x0b,0x09), window: c(0x1a,0x17,0x12), panel: c(0x1a,0x17,0x12), panel2: c(0x24,0x20,0x18), line: c(0x3a,0x33,0x26),
+    ink: c(0xe6,0xd6,0xb4), dim: c(0xa8,0x96,0x74), faint: c(0x6e,0x62,0x4c), track_bg: c(0x12,0x10,0x0c),
+    amber: c(0xf0,0xb0,0x58), amber_soft: c(0xff,0xd8,0x98), amber_ink: c(0x1c,0x12,0x06),
+    blue: c(0x5a,0x90,0xa4), cyan: c(0x58,0xb8,0xb0), violet: c(0x9a,0x84,0xb8), green: c(0x7a,0xa0,0x5a),
+    yellow: c(0xe6,0xc8,0x6a), red: c(0xd8,0x6a,0x50), red_soft: c(0xe8,0x96,0x7a),
+    maxmark: c(0xb0,0x4a,0x3a), whisker: c(0xff,0xf0,0xd8),
+};
+
+/// Forest Village — Elmbrook, Riverhollow district at dusk: a rain-wet cobbled plaza ringed by enormous trees
+/// carrying a whole town in their branches — stacked timber decks with houses, rope bridges, strings of paper
+/// lanterns across the square, market awnings and café tables with villagers. Blue dusk, warm lantern light,
+/// wet stone; the chrome is dark stained timber with copper rivets.
+pub const FOREST_VILLAGE: Palette = Palette {
+    name: "Forest Village", dark: true, material: Material::Wood, lit: true, canopy: true, light: c(0xff,0xd6,0x8e),
+    bg: c(0x10,0x14,0x1c), window: c(0x1c,0x18,0x12), panel: c(0x1c,0x18,0x12), panel2: c(0x28,0x22,0x18), line: c(0x46,0x3a,0x2a),
+    ink: c(0xe8,0xdc,0xc0), dim: c(0xb0,0xa0,0x82), faint: c(0x74,0x68,0x52), track_bg: c(0x14,0x12,0x0e),
+    amber: c(0xe8,0xb0,0x5a), amber_soft: c(0xff,0xd8,0x9a), amber_ink: c(0x1e,0x14,0x06),
+    blue: c(0x6a,0x9a,0xc0), cyan: c(0x5e,0xb8,0xa8), violet: c(0xa0,0x8a,0xc0), green: c(0x7c,0xa8,0x58),
+    yellow: c(0xe8,0xcc,0x66), red: c(0xd0,0x66,0x50), red_soft: c(0xe6,0x94,0x7a),
+    maxmark: c(0xb0,0x4a,0x3a), whisker: c(0xff,0xf2,0xdc),
+};
+
+/// Lavarock Way — Elmbrook, Riverside district in the afternoon: a path of flat black lava-rock slabs winding
+/// along a stream with ducks, a glass-domed greenhouse, timber houses stepping up a green hillside under broad
+/// trees, café umbrellas by the water, cumulus overhead. Warm daylight; the SAME dark-timber-and-copper chrome as
+/// Riverhollow — one city, one carpentry.
+pub const LAVAROCK_WAY: Palette = Palette {
+    name: "Lavarock Way", dark: false, material: Material::Wood, lit: true, canopy: true, light: c(0xff,0xe8,0xb0),
+    bg: c(0x9c,0xc0,0xd8), window: c(0x2a,0x22,0x18), panel: c(0x2a,0x22,0x18), panel2: c(0x36,0x2c,0x20), line: c(0x50,0x40,0x2c),
+    ink: c(0xf0,0xe4,0xc8), dim: c(0xc0,0xb0,0x90), faint: c(0x84,0x76,0x5e), track_bg: c(0x22,0x1c,0x14),
+    amber: c(0xe6,0xa8,0x4e), amber_soft: c(0xff,0xd4,0x90), amber_ink: c(0x20,0x14,0x06),
+    blue: c(0x5a,0x96,0xc8), cyan: c(0x4e,0xb4,0xa4), violet: c(0x9a,0x80,0xc0), green: c(0x6a,0xa8,0x48),
+    yellow: c(0xe8,0xc8,0x58), red: c(0xd0,0x5e,0x48), red_soft: c(0xe6,0x8e,0x74),
+    maxmark: c(0x6a,0xa8,0x48), whisker: c(0x2c,0x24,0x18),
 };
 
 /// Yellow Brick Road: a storybook Oz world. A recursive yellow-brick road winds and branches across rolling green

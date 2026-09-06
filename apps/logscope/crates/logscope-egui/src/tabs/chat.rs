@@ -6373,6 +6373,8 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
                     "Treehouse" => 0.022, // dusk haze blots distant trees (LOD by fog, not walls)
                     "Folding@home" => 0.014,
                     "Atlantis" => 0.009, // AIR interior reads clear; the water surfaces carry their own depth murk
+                    "Cat Cave" => 0.006, // a cave's air is clear: the dark is where the lanterns do not reach, not haze
+                    "Forest Village" => 0.016, // light rain: the far balconies soften
                     _ => 0.011,           // Archive/Slate/Old Library/Reading Room: light haze only (was 0.017 → grey-out)
                 } * gfogm * std::env::var("LOGSCOPE_FOGM").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0);
                 // warm/cool shift the sun for the grade
@@ -10939,6 +10941,9 @@ fn scene_light(name: &str) -> (egui::Color32, egui::Color32, f32, f32) {
         "Forest"       => (c(0xd0, 0xe2, 0x8a), c(0x2e, 0x3c, 0x1e), 0.86, 1.06), // sunlit woodland green
         "Treehouse"    => (c(0xe2, 0xb0, 0x6e), c(0x1c, 0x26, 0x12), 0.58, 1.0),  // warm dusk canopy (fireflies pop)
         "Mansion Garden" => (c(0xd2, 0xc8, 0xb0), c(0x76, 0x6e, 0x58), 0.54, 0.70), // cream marble — toned further (still too bloomy)
+        "Cat Cave"     => (c(0xd8, 0xb0, 0x7a), c(0x2a, 0x30, 0x2c), 0.70, 0.92), // amber lamplight bounce, cold wet floor
+        "Forest Village" => (c(0xe6, 0xb8, 0x74), c(0x1c, 0x22, 0x2c), 0.60, 0.96), // lantern-warm sky bounce over wet blue stone
+        "Lavarock Way" => (c(0xc8, 0xd8, 0xe8), c(0x2e, 0x40, 0x24), 0.46, 0.60), // bright afternoon — trimmed hard: llvmpipe blew the grass to neon at 0.86
         _              => (c(140, 168, 205),    c(96, 82, 66),       0.74, 1.00),
     }
 }

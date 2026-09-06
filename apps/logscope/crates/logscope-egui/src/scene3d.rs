@@ -11,6 +11,11 @@ use crate::mesh3d::{self as m3, Mesh3, Light};
 use crate::spatial::{OrbitCam, Vec3};
 use crate::texgen::mat as M;
 
+// Bespoke worlds large enough to live in their own file. Child modules of `scene3d`, so they share the
+// private prop vocabulary above without any of it becoming public API.
+mod cat_cave;
+mod elmbrook;
+
 #[inline] fn v(x: f32, y: f32, z: f32) -> Vec3 { Vec3::new(x, y, z) }
 #[inline] fn addv(a: Vec3, b: Vec3) -> Vec3 { v(a.x + b.x, a.y + b.y, a.z + b.z) }
 #[inline] fn mulv(a: Vec3, s: f32) -> Vec3 { v(a.x * s, a.y * s, a.z * s) }
@@ -6223,6 +6228,9 @@ fn build(palette_name: &str) -> Scene {
         "Yellow Brick Road" => oz(),
         "Frozen Bifrost" => bifrost(),
         "Titan's Ribcage" => titan_ribcage(),
+        "Cat Cave" => cat_cave::cat_cave(),
+        "Forest Village" => elmbrook::forest_village(),
+        "Lavarock Way" => elmbrook::lavarock_way(),
         // A procedural room, selected by name from the picker rather than by LOGSCOPE_ROOM. Checked
         // BEFORE the fallback: otherwise every room name silently builds `islands()`.
         other => match room_index(other) {
