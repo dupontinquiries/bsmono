@@ -342,7 +342,9 @@ OPS
                                                  cells. Names below.
   canyon A B [w=N] [depth=N] [floor=B] [strata=NAME]
                                                  strata=temperate|sedimentary|desert|volcanic|
-                                                 snowy|coastal dresses the cut face in BANDS
+                                                 snowy|coastal dresses the cut face in BANDS.
+                                                 spoil=N leaves N% of the rock as a heap beside
+                                                 it; rubble=N scatters debris on the floor.
                                                  that line up across it. A carved channel: it
                                                  wanders, its walls step
                                                  back, its floor falls with the land

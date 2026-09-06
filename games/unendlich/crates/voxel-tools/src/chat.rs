@@ -292,7 +292,10 @@ impl ChatSession {
         // for context with the region digest, and a small model drowns.
         let amb = tools.read_ambient(f.anchor.0, f.anchor.2, self.from_y,
                                      self.climate.0, self.climate.1, self.sea_level);
-        let site = amb.prompt_line();
+        // Positioned: the rock underfoot varies across the world, and
+        // what a builder here would quarry is what the model should
+        // reach for.
+        let site = amb.prompt_line_at(f.anchor.0, f.anchor.2, self.creative_seed);
         // Perception is COMPUTED, not asked for. A scene-setting model
         // pass would spend a third of the latency producing a worse
         // description than the one the world can just be read for.

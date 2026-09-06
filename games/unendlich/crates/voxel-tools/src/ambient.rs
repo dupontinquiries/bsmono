@@ -105,6 +105,17 @@ impl Ambient {
     }
 
     /// What to build with here.
+    /// The suggestion a QUARRY would make: the palette from the rock
+    /// under this spot rather than the block on top of it. Stand on
+    /// grass with stone two down and every real building here is
+    /// stone, because that is what came out of the cellar.
+    pub fn suggest_quarried(&self, x: i32, z: i32, seed: u64) -> Suggestion {
+        let base = self.suggest();
+        let profile = crate::strata::for_palette(base.palette);
+        let q = crate::quarry::quarry_palette(profile, x, z, seed, 14);
+        Suggestion { structure: q.primary, accent: q.secondary, ..base }
+    }
+
     pub fn suggest(&self) -> Suggestion {
         // The surface block is the strongest signal available and it
         // needs no model: it is what the world already chose for this
@@ -168,9 +179,20 @@ impl Ambient {
     /// The line handed to the model. Short: this competes for context
     /// with the region digest, and a small model drowns.
     pub fn prompt_line(&self) -> String {
+        self.prompt_line_at(0, 0, 1)
+    }
+
+    /// The same, naming what the GROUND HERE is made of. A builder
+    /// quarries what is underfoot, so the model is told what is
+    /// underfoot rather than only what the surface looks like.
+    pub fn prompt_line_at(&self, x: i32, z: i32, seed: u64) -> String {
         let s = self.suggest();
-        format!("SITE: {} -- palette {} suits it ({}). Use it unless the player asks otherwise.",
-                self.describe_site(), s.palette, s.because)
+        let profile = crate::strata::for_palette(s.palette);
+        let q = crate::quarry::quarry_palette(profile, x, z, seed, 14);
+        format!("SITE: {} -- palette {} suits it ({}). The rock here is {} over {} \
+                 (block {} and {}); build with it unless the player asks otherwise.",
+                self.describe_site(), s.palette, s.because, profile.name,
+                profile.at(x, z, 12, seed), q.primary, q.secondary)
     }
 }
 
@@ -298,5 +320,26 @@ mod tests {
                         "unknown species '{}'", a.suggest().species);
             }
         }
+    }
+
+    #[test]
+    fn the_prompt_line_names_the_rock_underfoot() {
+        let l = Ambient { surface_block: 2, ..Default::default() }.prompt_line_at(0, 0, 1);
+        assert!(l.contains("The rock here is temperate"), "{l}");
+        assert!(l.contains("build with it"), "{l}");
+        assert!(l.len() < 300, "still short enough for a small model: {} chars", l.len());
+    }
+
+    #[test]
+    fn the_quarried_suggestion_uses_the_rock_not_the_turf() {
+        let grass = Ambient { surface_block: 2, ..Default::default() };
+        let plain = grass.suggest();
+        let quarried = grass.suggest_quarried(0, 0, 1);
+        assert_eq!(quarried.palette, plain.palette, "the same site, the same palette name");
+        assert_eq!(quarried.structure, 1, "stone from below, not the grass on top");
+        assert_ne!(quarried.structure, quarried.accent);
+        // in the desert both agree: the surface IS the rock there
+        let sand = Ambient { surface_block: 12, ..Default::default() };
+        assert_eq!(sand.suggest_quarried(0, 0, 1).structure, 24, "sandstone under the sand");
     }
 }

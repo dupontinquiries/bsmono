@@ -101,7 +101,7 @@ fn badlands(a: &FeatureArgs) -> Vec<Part> {
         v.push(Part { what: format!("side canyon {}", i + 1),
                       // strata, not one flat colour: the canyon shows the
                       // bands it cut, and they line up across it
-                      ir: format!("canyon {},{} {},{} w={} depth={} floor=sand strata=sedimentary seed={}\n",
+                      ir: format!("canyon {},{} {},{} w={} depth={} floor=sand strata=sedimentary spoil=5 seed={}\n",
                                   from.0, from.1, to.0, to.1, pick(i + 7, a.seed, 8, 18),
                                   pick(i + 13, a.seed, 10, 22), a.seed ^ i as u64),
                       estimate: r as i64 * 14 * 16 / 2 });
@@ -137,7 +137,7 @@ fn gorge(a: &FeatureArgs) -> Vec<Part> {
     let (from, to) = (around(a.at, r, 190), around(a.at, r, 10));
     let depth = (r / 4).clamp(12, 60);
     v.push(Part { what: "the gorge".into(),
-                  ir: format!("canyon {},{} {},{} w={} depth={} floor=stone strata=temperate seed={}\n",
+                  ir: format!("canyon {},{} {},{} w={} depth={} floor=stone strata=temperate spoil=3 rubble=25 seed={}\n",
                               from.0, from.1, to.0, to.1, (r / 6).clamp(10, 40), depth, a.seed),
                   estimate: r as i64 * 2 * (r / 6) as i64 * depth as i64 / 2 });
     // the river runs along its floor
@@ -265,7 +265,7 @@ fn sinkhole(a: &FeatureArgs) -> Vec<Part> {
     let mut v = Vec::new();
     // a big cave first: the sinkhole is where its roof fell in
     v.push(Part { what: "the cavern below".into(),
-                  ir: format!("cave {},{} dir={} len={} r={} branches=3 seed={}\n",
+                  ir: format!("cave {},{} dir={} len={} r={} branches=3 rubble=35 seed={}\n",
                               a.at.0, a.at.1, pick(0, a.seed, 0, 359), r * 2, (r / 5).clamp(4, 14), a.seed),
                   estimate: r as i64 * 2 * 100 });
     // the collapse: a shaft down to it

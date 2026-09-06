@@ -1518,16 +1518,37 @@ pub fn run_plan_with<W: VoxelWorld>(
                     return CallResult { ok: false, summary: format!("{kind}: nothing to carve there"),
                                         ..Default::default() };
                 }
+                // SPOIL AND RUBBLE: the rock that came out has to go
+                // somewhere, and a floor with nothing on it reads as a
+                // corridor. Both are opt-in with `spoil=` and
+                // `rubble=`, and both are made of the strata that were
+                // actually cut.
+                let prof = profile.unwrap_or_else(|| crate::strata::for_palette("temperate"));
+                let mut extra: Vec<crate::weather::Change> = Vec::new();
+                let spoil_f = nums.iter().find(|(k, _)| k == "spoil").map(|(_, v)| *v);
+                if let Some(pc) = spoil_f {
+                    let s = crate::quarry::Spoil { fraction: (pc as f32 / 100.0).clamp(0.001, 0.5),
+                                                   seed: *seed as u64, ..Default::default() };
+                    extra.extend(crate::quarry::spoil(tools.world, &r.changes, prof, &s, from_y));
+                }
+                if let Some(pc) = nums.iter().find(|(k, _)| k == "rubble").map(|(_, v)| *v) {
+                    extra.extend(crate::quarry::rubble(tools.world, &r.changes, prof,
+                                                       (pc as f32 / 100.0).clamp(0.0, 1.0), *seed as u64, from_y));
+                }
                 let roofed = carve::roofed(&r.changes, tools.world);
                 // A carve is LANDSCAPE scale -- a mesa is 183,000 cells
                 // and a canyon can be more. The per-op ceiling refused
                 // them outright; they get the same ceiling the brushes
                 // do, and the same single edit so the whole feature
                 // undoes as one.
-                let mut res = tools.apply_changes_large(&r.changes);
+                let all: Vec<crate::weather::Change> =
+                    r.changes.iter().copied().chain(extra.iter().copied()).collect();
+                let n_extra = extra.len();
+                let mut res = tools.apply_changes_large(&all);
                 if res.ok {
-                    res.summary = format!("{kind}: {}{}", r.summary(),
-                                          if roofed > 0 { format!(", {roofed} cell(s) under rock") } else { String::new() });
+                    res.summary = format!("{kind}: {}{}{}", r.summary(),
+                                          if roofed > 0 { format!(", {roofed} cell(s) under rock") } else { String::new() },
+                                          if n_extra > 0 { format!(", {n_extra} of spoil and rubble") } else { String::new() });
                 }
                 res
             })(),
