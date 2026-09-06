@@ -129,6 +129,8 @@ pub mod feature_place;
 pub mod strata;
 /// Quarrying: a palette from the rock underfoot, and the spoil a carve leaves.
 pub mod quarry;
+/// Vertical access: stairs cut into cliffs, switchbacks, shafts, terraces.
+pub mod access;
 /// The review loop: elevations and measurements to the model, a ten-token verdict back.
 pub mod review;
 /// Context under a budget: the conversation chain, folding into summaries, grouped plans.

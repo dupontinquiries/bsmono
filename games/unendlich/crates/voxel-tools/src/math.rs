@@ -239,6 +239,17 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                                             None => format!("evolve '{phrase}' for {gens} generations, {levels} level(s)") }),
                      None);
             }
+            Op::Access { kind, a, nums, .. } => {
+                let num = |k: &str, d: i32| nums.iter().find(|(n, _)| n == k).map(|(_, v)| *v).unwrap_or(d);
+                let est = match kind.as_str() {
+                    "shaft" => (num("r", 2) * 2 + 1).pow(2) as i64 * 30,
+                    "terrace" => num("w", 60) as i64 * num("d", 60) as i64 * 2,
+                    "switchback" => num("leg", 20) as i64 * num("w", 3) as i64 * 24,
+                    _ => num("w", 3) as i64 * 4 * 30,
+                };
+                total += est;
+                push(Note::Info, format!("{kind} at {a:?}: roughly {est} blocks"), None);
+            }
             Op::Feature { name, at, radius, seed, find } => {
                 match crate::feature_place::lookup(name) {
                     Some(f) => {

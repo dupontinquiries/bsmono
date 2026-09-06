@@ -263,6 +263,10 @@ pub enum Op {
     /// a phrase, then apply the winner. Or run a stated genome.
     Greeble { min: (i32, i32, i32), max: (i32, i32, i32), phrase: String,
               gens: u32, seed: i32, genome: Option<String>, levels: u32 },
+    /// Vertical access: a way up or down that the road machine cannot
+    /// make, because the answer to a cliff is not a road.
+    Access { kind: String, a: (i32, i32), b: Option<(i32, i32)>, nums: Vec<(String, i32)>,
+             tread: Option<u16>, rail: Option<u16>, seed: i32 },
     /// A composite terrain feature: a PLACE made of several carves and
     /// layers, run part by part so the first appears while the last is
     /// still being computed.
@@ -739,6 +743,22 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     seed: kvi(&t, "seed", 1),
                     genome: t.iter().find_map(|s| s.strip_prefix("genome=")).map(|s| s.to_string()),
                     levels: kvi(&t, "levels", 2).clamp(1, 4) as u32,
+                });
+            }
+            "cliff_stair" | "stair" | "switchback" | "shaft" | "terrace" => {
+                let v = t[0].to_lowercase();
+                let kind = if v == "stair" { "cliff_stair".to_string() } else { v };
+                let a = rel(&t, 1, anchor).unwrap_or_else(|| anchor_xz(anchor));
+                let b = rel(&t, 2, anchor);
+                let nums: Vec<(String, i32)> = t.iter().skip(1)
+                    .filter_map(|s| s.split_once('='))
+                    .filter_map(|(k, v)| v.parse().ok().map(|n| (k.to_string(), n)))
+                    .collect();
+                ops.push(Op::Access {
+                    kind, a, b, nums,
+                    tread: t.iter().find_map(|s| s.strip_prefix("tread=")).and_then(blk),
+                    rail: t.iter().find_map(|s| s.strip_prefix("rail=")).and_then(blk),
+                    seed: kvi(&t, "seed", 1),
                 });
             }
             "feature" | "place" if t.get(1).map(|n| crate::feature_place::lookup(n).is_some()).unwrap_or(false) => {
@@ -1431,6 +1451,41 @@ pub fn run_plan_with<W: VoxelWorld>(
                 r
             })(),
             Op::Spec(_) => CallResult { ok: true, summary: "spec noted".into(), ..Default::default() },
+            Op::Access { kind, a, b, nums, tread, rail, seed } => (|| {
+                use crate::access::{self, Access as Opts};
+                let _ = seed;
+                let num = |k: &str, d: i32| nums.iter().find(|(n, _)| n == k).map(|(_, v)| *v).unwrap_or(d);
+                let opts = Opts { tread: *tread, rail: rail.or(Some(1)), ..Default::default() };
+                // `to=` is a height; without one, the other end's ground
+                // is the target -- "from the rim down to the floor" said
+                // as two points, which is how a player thinks of it.
+                let target = match (nums.iter().find(|(k, _)| k == "to"), b) {
+                    (Some((_, y)), _) => *y,
+                    (None, Some(p)) => tools.find_surface(p.0, p.1, from_y).unwrap_or(from_y),
+                    (None, None) => from_y,
+                };
+                let dir = match b {
+                    Some(p) => ((p.1 - a.1) as f32).atan2((p.0 - a.0) as f32).to_degrees() as i32,
+                    None => num("dir", 0),
+                };
+                let r = match kind.as_str() {
+                    "switchback" => access::switchback(tools.world, *a, dir, target,
+                                                       num("w", 3), num("leg", 20), &opts, from_y),
+                    "shaft" => access::shaft(tools.world, *a, target, num("r", 2), &opts, from_y),
+                    "terrace" => {
+                        let far = b.unwrap_or((a.0 + num("w", 60), a.1 + num("d", 60)));
+                        access::terrace(tools.world, *a, far, num("step", 4), num("tread", 8), &opts, from_y)
+                    }
+                    _ => access::cliff_stair(tools.world, *a, dir, target, num("w", 3), &opts, from_y),
+                };
+                if r.changes.is_empty() {
+                    return CallResult { ok: false, summary: format!("{kind}: {}", r.notes.join("; ")),
+                                        ..Default::default() };
+                }
+                let mut res = tools.apply_changes_large(&r.changes);
+                if res.ok { res.summary = format!("{kind}: {}", r.summary()); }
+                res
+            })(),
             Op::Feature { name, at, radius, seed, find } => (|| {
                 let Some(f) = crate::feature_place::lookup(name) else {
                     return CallResult { ok: false, summary: format!("unknown feature '{name}'"), ..Default::default() };

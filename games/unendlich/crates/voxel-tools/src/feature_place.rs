@@ -123,6 +123,12 @@ fn badlands(a: &FeatureArgs) -> Vec<Part> {
                                \"params\": {{ \"style\": \"desert\", \"size\": \"small\" }} }}\n",
                               a.seed, a.at.0 - r / 4, a.at.1 - r / 4, a.at.0 + r / 4, a.at.1 + r / 4, r / 12),
                   estimate: 5 * 400 });
+    // A mesa nobody can climb is scenery. A stair cut into its face is
+    // what makes it a place.
+    let up = around(a.at, r / 3, 45);
+    v.push(Part { what: "the stair up the mesa".into(),
+                  ir: format!("cliff_stair {},{} dir=225 to={} w=3\n", up.0, up.1, a.ground),
+                  estimate: 400 });
     v.push(Part { what: "weathering".into(),
                   ir: format!("weather {},{},{} {},{},{} ancient seed={}\n",
                               a.at.0 - r / 4, a.ground, a.at.1 - r / 4,
@@ -153,6 +159,12 @@ fn gorge(a: &FeatureArgs) -> Vec<Part> {
                                   p.0, p.1, (deg + 180) % 360, pick(i, a.seed, 4, 9), depth - 2, a.seed ^ i as u64),
                       estimate: 8 * depth as i64 * 6 });
     }
+    // a way down into the gorge: without one it is a wall with a view
+    let down = around(a.at, r / 4, 90);
+    v.push(Part { what: "the descent".into(),
+                  ir: format!("switchback {},{} dir=270 to={} w=3 leg={}\n",
+                              down.0, down.1, a.ground - depth + 2, (r / 6).clamp(8, 30)),
+                  estimate: r as i64 * 20 });
     // caves into the walls
     for i in 0..2 {
         let deg = if i == 0 { 80 } else { 280 };
@@ -187,6 +199,12 @@ fn caldera(a: &FeatureArgs) -> Vec<Part> {
                                   p.0, p.1, pick(i + 5, a.seed, 0, 359), a.seed ^ i as u64),
                       estimate: 30 * 27 });
     }
+    // over the rim and down to the floor
+    let notch = around(a.at, r, 0);
+    v.push(Part { what: "the pass over the rim".into(),
+                  ir: format!("switchback {},{} dir=180 to={} w=4 leg={}\n",
+                              notch.0, notch.1, a.ground - (r / 5).clamp(6, 40), (r / 5).clamp(8, 24)),
+                  estimate: r as i64 * 24 });
     v.push(Part { what: "a scorched floor".into(),
                   ir: format!("mood fiery {},{} {},{}\n", a.at.0 - r, a.at.1 - r, a.at.0 + r, a.at.1 + r),
                   estimate: 0 });
@@ -218,6 +236,11 @@ fn cliffs(a: &FeatureArgs) -> Vec<Part> {
                   ir: format!("cave {},{} dir=0 len={} r=5 branches=2 seed={}\n",
                               a.at.0, a.at.1, r, a.seed ^ 0xc0a5),
                   estimate: r as i64 * 75 });
+    // a stair down the cliff to the beach: a coast with no way to the
+    // water is a wall
+    v.push(Part { what: "the cliff stair".into(),
+                  ir: format!("cliff_stair {},{} dir=180 to={} w=3\n", a.at.0, a.at.1, a.ground - (r / 5).clamp(6, 30)),
+                  estimate: 500 });
     v.push(Part { what: "the beach".into(),
                   ir: format!("layer barren {},{} {},{} density=0.15\n",
                               a.at.0 - r, a.at.1 - r, a.at.0, a.at.1 + r),
@@ -253,6 +276,12 @@ fn highlands(a: &FeatureArgs) -> Vec<Part> {
                                   a.ground + (r / 6).clamp(4, 30)),
                       estimate: 300 });
     }
+    // terraces on the lee side: a hill nobody can use becomes a hill
+    // covered in fields
+    v.push(Part { what: "terraced fields".into(),
+                  ir: format!("terrace {},{} {},{} step=4 tread=3\n",
+                              a.at.0 - r / 2, a.at.1, a.at.0, a.at.1 + r / 2),
+                  estimate: (r as i64 / 2).pow(2) * 2 });
     v.push(Part { what: "the treeline".into(),
                   ir: format!("layer alpine {},{} {},{} density=0.4 above\n",
                               a.at.0 - r, a.at.1 - r, a.at.0 + r, a.at.1 + r),
@@ -390,5 +419,22 @@ mod tests {
         let v = vocabulary();
         for f in FEATURES { assert!(v.contains(f.name), "{} missing from the prompt", f.name); }
         assert!(v.is_ascii() && v.len() < 700, "{} chars", v.len());
+    }
+
+    #[test]
+    fn every_carving_feature_provides_a_way_in() {
+        // A place you cannot reach is scenery. Each feature that makes
+        // a drop or a height also makes the way to it.
+        for name in ["badlands", "gorge", "caldera", "cliffs", "highlands"] {
+            let parts = (lookup(name).unwrap().plan)(&args());
+            let access = parts.iter().filter(|p| {
+                let v = p.ir.split_whitespace().next().unwrap_or("");
+                ["cliff_stair", "switchback", "shaft", "terrace", "stairs"].contains(&v)
+            }).count();
+            assert!(access >= 1, "{name} has no way in or out");
+        }
+        // the sinkhole's is its stairs, which it already had
+        let s = (lookup("sinkhole").unwrap().plan)(&args());
+        assert!(s.iter().any(|p| p.ir.starts_with("stairs")), "the sinkhole has its way down");
     }
 }

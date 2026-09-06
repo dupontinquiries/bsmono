@@ -227,6 +227,8 @@ OPERATIONS
   river A dir=DEG len=N                 the terrain decides the path
   feature badlands|gorge|caldera|cliffs|highlands|sinkhole A [r=N]
                                         a whole PLACE: carves and layers that belong together
+  cliff_stair A / switchback A / shaft A / terrace A B
+                                        ways UP AND DOWN: to=Y, dir=DEG, w=, leg=, step=
   canyon A B / cave A / mesa A / waterfall A / overhang A
                                         CARVED terrain, w= depth= len= r= dir= floor= wall=
   form NAME A B [style=NAME] [seed=N]   a named form (list below); style sets
@@ -356,6 +358,14 @@ OPS
   waterfall A [dir=DEG] [w=N] [h=N]              a lip, a leaning curtain, a plunge pool, and
                                                  the space behind the water
   overhang A [dir=DEG] [w=N] [depth=N] [h=N]     a shelf cut back under itself
+  cliff_stair A [dir=DEG] [to=Y] [w=N]           steps CUT INTO a face, with a lip on the drop
+                                                 side. The answer to a cliff is not a road.
+  switchback A [dir=DEG] [to=Y] [leg=N]          a zigzag ramp at a grade a cart takes, with a
+                                                 landing at each turn
+  shaft A [to=Y] [r=N]                           a vertical hole with rungs and landings: a mine
+                                                 head, a well, the way into a cavern
+  terrace A B [step=N] [tread=N]                 level steps cut along a hillside, wide enough
+                                                 to build or farm on
   road A B [w=N] [block=B]                       a road that cuts, fills, bridges and tunnels
                                                  as the ground demands; use it between builds
   river A [dir=DEG] [len=N]                      a river from a source; the terrain decides

@@ -264,6 +264,8 @@ pub const KNOWN_VERBS: &[&str] = &[
     "canyon", "cave", "mesa", "waterfall", "overhang", "gorge",
     // composite places
     "feature",
+    // vertical access: the answer to a cliff is not a road
+    "cliff_stair", "stair", "switchback", "shaft", "terrace",
     // substructures
     "def", "end", "use",
 ];
@@ -632,6 +634,10 @@ mod tests {
                 "waterfall" => "waterfall @0,0 dir=180 w=6 h=14\n".into(),
                 "overhang" => "overhang @0,0 dir=180 w=14 depth=8 h=5\n".into(),
                 "feature" => "feature badlands @0,0 r=120\n".into(),
+                "cliff_stair" | "stair" => format!("{verb} @0,0 dir=180 to=64 w=3\n"),
+                "switchback" => "switchback @0,0 dir=0 to=100 w=3 leg=20\n".into(),
+                "shaft" => "shaft @0,0 to=40 r=2\n".into(),
+                "terrace" => "terrace @0,0 @60,60 step=4\n".into(),
                 "strata" => continue,        // a k=v on carves, not a verb
                 "world" => continue,                    // gated on the player's intent
                 "def" | "end" | "use" => continue,      // substructure syntax, not ops
