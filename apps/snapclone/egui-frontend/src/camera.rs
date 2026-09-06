@@ -329,9 +329,13 @@ pub fn viewfinder(ui: &mut Ui, vf: &mut Viewfinder, frame: Option<&egui::Texture
                 img.left_top(), img.right_top(), img.right_bottom(), img.left_bottom(),
             ];
             let mut mesh = egui::Mesh::with_texture(t.id());
+            // Vertices pushed whole. `colored_vertex` is the white-pixel helper
+            // and asserts the mesh has NO texture — a debug_assert, so release
+            // builds on the device drew every frame fine while the first
+            // frame of a debug build panicked "Mesh has an assigned texture".
+            // Found running the app under Xvfb with the test pattern.
             for (i, pos) in corners.iter().enumerate() {
-                mesh.colored_vertex(*pos, Color32::WHITE);
-                mesh.vertices[i].uv = uvs[i];
+                mesh.vertices.push(egui::epaint::Vertex { pos: *pos, uv: uvs[i], color: Color32::WHITE });
             }
             mesh.add_triangle(0, 1, 2);
             mesh.add_triangle(0, 2, 3);

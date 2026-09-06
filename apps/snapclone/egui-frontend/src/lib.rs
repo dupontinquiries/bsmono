@@ -3978,12 +3978,24 @@ impl Snapclone {
             let want = uikit_egui::handed::centred_x(row_w, SHUTTER, hand);
             ui.add_space((want - used).max(0.0));
             let resp = crate::shutter::shutter_ui(ui, &self.shutter, SHUTTER, c);
-            let ev = if resp.drag_started() {
-                resp.interact_pointer_pos().and_then(|p| self.shutter.press(p.x, p.y))
-            } else if resp.dragged() {
-                resp.interact_pointer_pos().and_then(|p| self.shutter.moved(p.x, p.y))
-            } else if resp.drag_stopped() {
-                resp.interact_pointer_pos().and_then(|p| self.shutter.release(p.x, p.y))
+            // DRIVEN BY THE BUTTON STATE, not by egui's drag flags. For a
+            // widget that senses click AND drag, egui only reports
+            // `drag_started`/`drag_stopped` once the pointer is "decidedly
+            // dragging" — moved past the threshold or held — so a clean tap
+            // never reached `press`/`release`, and a tap on the shutter took
+            // no photo in the running app unless the finger wiggled. The
+            // palette's Snap action (which sets `shutter_pressed` directly)
+            // and the tests (which call the FSM) both worked, which is how
+            // it went unnoticed until the app was tapped under Xvfb.
+            let pos = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.latest_pos()));
+            let down_on = resp.is_pointer_button_down_on();
+            let ev = if down_on && !self.shutter.is_down() {
+                pos.and_then(|p| self.shutter.press(p.x, p.y))
+            } else if down_on {
+                pos.and_then(|p| self.shutter.moved(p.x, p.y))
+                    .or_else(|| self.shutter.tick(ui.input(|i| i.stable_dt) * 1000.0))
+            } else if self.shutter.is_down() {
+                pos.and_then(|p| self.shutter.release(p.x, p.y))
             } else {
                 // The hold threshold is a TIMER, so it must be ticked on frames
                 // where the finger has not moved — otherwise a perfectly still

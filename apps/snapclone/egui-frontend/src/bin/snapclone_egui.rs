@@ -202,6 +202,14 @@ struct App {
     /// send. Held by the HOST and not by the app: the controller has no
     /// business carrying a photo in memory purely to hand it back.
     last_snap: Option<Vec<u8>>,
+    /// The frame most recently handed to the pump — what the viewfinder is
+    /// showing. The shutter reads THIS. `peek_frame` on the capture slot
+    /// only sees a frame that arrived since the last `take_frame`, and the
+    /// tick takes every frame into the pump at once, so the slot is empty
+    /// nearly every time the shutter looks: "snap NOT saved: no live frame"
+    /// with a picture on screen. Seen under Xvfb with the test pattern at
+    /// 15 fps; at a camera's 30 fps it was a coin toss per press.
+    last_live: Option<snapclone_egui::frame_pump::RawFrame>,
     /// Sends running on worker threads. A dial can take the full timeout
     /// and must never run on the frame loop.
     sending: Vec<std::thread::JoinHandle<()>>,
@@ -318,7 +326,7 @@ impl App {
         };
 
         Self { snap, snaps_in, accel: None, glove_probed: false,
-               last_snap: None, sending: Vec::new(),
+               last_snap: None, last_live: None, sending: Vec::new(),
                send_results: Arc::new(Mutex::new(Vec::new())),
                voice: VoiceRig::idle(), rig: CaptureRig::idle(),
                nat: snapclone_egui::nat_traversal::Traversal::new(""), nat_id: String::new(),
@@ -518,6 +526,7 @@ impl App {
             self.handle(cmds);
         }
         if let Some(f) = self.rig.shared.take_frame() {
+            self.last_live = Some(f.clone());
             let cmds = self.snap.apply(HostEvent::CameraFrame(f));
             self.handle(cmds);
         }
@@ -879,7 +888,10 @@ impl App {
                 // image tool opens it. The path is printed so the photo is
                 // findable the moment it exists.
                 HostCommand::CaptureSnap => {
-                    let outcome = match self.rig.shared.peek_frame() {
+                    // The frame on screen: the slot if something newer just
+                    // landed, else the one the pump was last given.
+                    let live = self.rig.shared.peek_frame().or_else(|| self.last_live.clone());
+                    let outcome = match live {
                         Some(f) if f.pixels_plausible() => {
                             // ONE ENCODE, used for both the file and the wire.
                             //

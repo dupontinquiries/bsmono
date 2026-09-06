@@ -82,6 +82,8 @@ impl Default for ShutterButton {
 
 impl ShutterButton {
     pub fn recording(&self) -> bool { self.recording }
+    /// Is a finger on the button? What the shell needs to pair a press with its release.
+    pub fn is_down(&self) -> bool { self.down }
     pub fn locked(&self) -> bool { self.locked }
     pub fn record_ms(&self) -> u32 { self.record_ms as u32 }
     pub fn held_ms(&self) -> f32 { self.held_ms }
