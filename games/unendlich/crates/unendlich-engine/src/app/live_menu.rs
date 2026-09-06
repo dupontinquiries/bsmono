@@ -18,13 +18,18 @@
 //!
 //! `menu_pick` codes (the bin's contract — do not renumber): 1 Create World,
 //! 2 Multiplayer/Host, 3 Join, 4 Quit→confirm, 5 Quit-confirmed, 6 Back,
-//! 7 Load, 8 Singleplayer, 9 Bending Tutorial.
+//! 7 Load, 8 Singleplayer, 9 Bending Tutorial, 10 Devices (multi-device session
+//! over the DHT: `sim::net::device_session`), 11 Stop-hosting-devices.
 
 /// Everything the title-menu body reads. Borrowed views over the renderer's
 /// display-state fields.
 pub struct LiveMenuState<'a> {
-    /// Which screen: 0 title, 1 confirm-quit, 2 multiplayer, 3 load, 4 singleplayer.
+    /// Which screen: 0 title, 1 confirm-quit, 2 multiplayer, 3 load, 4 singleplayer,
+    /// 5 devices (the multi-device session: code, QR payload, joined devices).
     pub screen_kind: u8,
+    /// The multi-device session as the menu sees it (`DeviceSession::view` on a render box,
+    /// `DevicesView::searching` on a phone), or `None` when nothing is hosting or searching.
+    pub devices: Option<&'a crate::sim::net::device_session::DevicesView>,
     /// Discovered LAN hosts (display labels), Multiplayer screen.
     pub mp_list: &'a [String],
     /// Saved worlds (display labels), Load screen.
@@ -44,6 +49,8 @@ pub struct LiveMenuState<'a> {
 pub struct LiveMenuOut {
     pub menu_pick: u32,
     pub mp_pick: i32,
+    /// Devices screen: the slot the host asked to kick (−1 = none).
+    pub device_kick: i32,
     pub world_pick: i32,
     pub rollback_peek: i32,
     pub rollback_restore: i32,
@@ -61,6 +68,7 @@ impl Default for LiveMenuOut {
         LiveMenuOut {
             menu_pick: 0,
             mp_pick: -1,
+            device_kick: -1,
             world_pick: -1,
             rollback_peek: -1,
             rollback_restore: -1,
@@ -447,6 +455,15 @@ pub fn live_menu_body(ui: &mut egui::Ui, s: &LiveMenuState) -> LiveMenuOut {
                 if dest_button(ui, "Join Server") {
                     out.menu_pick = 3;
                 }
+                ui.add_space(10.0);
+                // Multi-device: this machine as the render box for its owner's phones and
+                // second screens, found by a six-character code over the DHT.
+                if dest_button(ui, "Devices") {
+                    out.menu_pick = 10;
+                }
+                if let Some(d) = s.devices {
+                    ui.weak(d.status());
+                }
                 ui.add_space(8.0);
                 // r394: LAN hosts discovered via the gossip beacon.
                 ui.separator();
@@ -486,6 +503,9 @@ pub fn live_menu_body(ui: &mut egui::Ui, s: &LiveMenuState) -> LiveMenuOut {
                 if dest_button(ui, "Back") {
                     out.menu_pick = 6;
                 }
+            }
+            5 => {
+                devices_screen(ui, s.devices, &mut out);
             }
             3 => {
                 // r197: LOAD WORLD — list saved worlds. Each row is a button;
@@ -694,6 +714,71 @@ pub fn live_menu_body(ui: &mut egui::Ui, s: &LiveMenuState) -> LiveMenuOut {
     out
 }
 
+/// The DEVICES screen — the multi-device session over the DHT
+/// (`sim::net::device_session`). On the render box: the code to read out or scan, the joined
+/// devices with their slot, capabilities and liveness, a kick per row, and a stop button. On
+/// a phone: which discovery step is running or succeeded. With nothing hosting or searching
+/// it offers to start.
+fn devices_screen(ui: &mut egui::Ui, view: Option<&crate::sim::net::device_session::DevicesView>, out: &mut LiveMenuOut) {
+    use crate::sim::net::device_session::DeviceCaps;
+    ui.label("devices");
+    ui.add_space(6.0);
+    match view {
+        None => {
+            ui.weak("host this machine for your phones and second screens");
+            ui.add_space(8.0);
+            if dest_button(ui, "Start Hosting") {
+                out.menu_pick = 10;
+            }
+        }
+        Some(d) if !d.code.is_empty() => {
+            // the code, big — it is read across a room
+            ui.label(egui::RichText::new(&d.code).size(34.0).strong().monospace());
+            ui.weak("type this on the phone, or scan:");
+            ui.add(egui::Label::new(egui::RichText::new(&d.qr).small().monospace()).wrap());
+            ui.add_space(6.0);
+            ui.separator();
+            ui.weak(d.status());
+            egui::ScrollArea::vertical().id_salt("devices_scroll").max_height(180.0).show(ui, |ui| {
+                for row in &d.rows {
+                    ui.horizontal(|ui| {
+                        let dot = if !row.connected { "\u{25cb}" } else if row.fresh { "\u{25cf}" } else { "\u{25d0}" };
+                        ui.label(format!("{dot} {}  {}", row.slot, row.name));
+                        let what = if row.slot == 0 {
+                            "render box".to_string()
+                        } else if row.caps.is_controller() {
+                            format!("controller: {}", row.caps.label())
+                        } else if row.caps.has(DeviceCaps::DISPLAY) {
+                            format!("screen: {}", row.caps.label())
+                        } else {
+                            row.caps.label()
+                        };
+                        ui.weak(what);
+                        if row.slot != 0 && ui.small_button("kick").clicked() {
+                            out.device_kick = row.slot as i32;
+                        }
+                    });
+                }
+            });
+            ui.add_space(8.0);
+            if dest_button(ui, "Stop Hosting") {
+                out.menu_pick = 11;
+            }
+        }
+        Some(d) => {
+            // a phone looking for its render box
+            ui.label(d.status());
+            if let Some((step, found)) = d.discovery {
+                ui.weak(if found { "connecting" } else { step.label() });
+            }
+        }
+    }
+    ui.add_space(10.0);
+    if dest_button(ui, "Back") {
+        out.menu_pick = 6;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,6 +818,7 @@ mod tests {
                     show_rollbacks: !lists.2.is_empty(),
                     world_delete_ask: -1,
                     dev_mode: false,
+                    devices: None,
                 };
                 let out = live_menu_body(ui, &s);
                 assert_eq!(out, LiveMenuOut::default(), "no clicks → no outputs");
@@ -748,7 +834,7 @@ mod tests {
         let mp = vec!["kessler — Vale (seed 7) @ 192.168.1.10:9878".to_string()];
         let worlds = vec!["Vale  ·  seed 7  ·  creative".to_string()];
         let rb = vec!["#3 · autosave · 12 chunks".to_string()];
-        for kind in [0u8, 1, 2, 3, 4] {
+        for kind in [0u8, 1, 2, 3, 4, 5] {
             let out = run_screen(kind, (&mp, &worlds, &rb));
             assert!(
                 !out.shapes.is_empty(),
@@ -879,6 +965,7 @@ mod tests {
                         show_rollbacks: kind == 3,
                         world_delete_ask: -1,
                         dev_mode: false,
+                        devices: None,
                     };
                     let _ = live_menu_body(ui, &s);
                 });
@@ -911,9 +998,55 @@ mod tests {
                     show_rollbacks: false,
                     world_delete_ask: 5, // stale — beyond the list
                     dev_mode: false,
+                    devices: None,
                 };
                 let _ = live_menu_body(ui, &s);
             });
         });
+    }
+
+    /// The Devices screen draws every view it has — a render box hosting two devices (one
+    /// stale), a phone mid-ladder, and the idle offer — headless, with no output without a
+    /// click. The screen exists so the multi-device session has a face; this is the test that
+    /// the face is wired to the model.
+    #[test]
+    fn devices_screen_draws_every_view_headless() {
+        use crate::sim::net::device_session::{DeviceCaps, DeviceRow, DevicesView, DiscoveryLadder, Step};
+        let hosting = DevicesView {
+            code: "ABC-DEF".into(),
+            qr: "unendlich://join?code=ABCDEF&host=HOSTHOSTHOST".into(),
+            rows: vec![
+                DeviceRow { slot: 0, name: "kessler".into(), caps: DeviceCaps::DISPLAY, fresh: true, connected: true },
+                DeviceRow { slot: 1, name: "Phone".into(), caps: DeviceCaps::TOUCH.with(DeviceCaps::IMU), fresh: true, connected: true },
+                DeviceRow { slot: 2, name: "Tablet".into(), caps: DeviceCaps::DISPLAY.with(DeviceCaps::TOUCH), fresh: false, connected: false },
+            ],
+            max: 4,
+            discovery: None,
+        };
+        let mut ladder = DiscoveryLadder::start(0);
+        ladder.report(Step::Mdns, None, 1);
+        let searching = DevicesView::searching(&ladder);
+        for (label, view) in [("hosting", Some(&hosting)), ("searching", Some(&searching)), ("idle", None)] {
+            let ctx = test_ctx();
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 560.0)));
+            let out = ctx.run(input, |c| {
+                egui::CentralPanel::default().show(c, |ui| {
+                    let s = LiveMenuState {
+                        screen_kind: 5,
+                        mp_list: &[],
+                        world_list: &[],
+                        rollback_list: &[],
+                        show_rollbacks: false,
+                        world_delete_ask: -1,
+                        dev_mode: false,
+                        devices: view,
+                    };
+                    let o = live_menu_body(ui, &s);
+                    assert_eq!(o, LiveMenuOut::default(), "{label}: no clicks → no outputs");
+                });
+            });
+            assert!(!out.shapes.is_empty(), "{label}: the devices screen drew nothing");
+        }
     }
 }

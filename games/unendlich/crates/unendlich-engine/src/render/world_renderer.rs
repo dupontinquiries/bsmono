@@ -3887,6 +3887,11 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                     show_rollbacks: menu_show_rollbacks,
                                     world_delete_ask: menu_world_delete_ask,
                                     dev_mode: dev_mode_on,
+                                    // SEAM: the bin does not run a `DeviceSession` yet — the
+                                    // screen offers to start hosting and reports pick 10/11;
+                                    // wiring the session into the renderer's locals is the
+                                    // on-device step (needs the socket address + a DHT node).
+                                    devices: None,
                                 },
                             );
                             if lm.menu_pick != 0 { menu_pick = lm.menu_pick; }
