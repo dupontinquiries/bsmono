@@ -384,6 +384,11 @@ pub struct Paintbrush {
     pub provider: ProviderChoice,
     /// Claims, ownership and build history; saved with the world.
     pub land: voxel_tools::land::Registry,
+    /// Living plants a committed plan asked the engine to register.
+    /// The bin drains these into the flora store each frame; from then
+    /// on the lifecycle owns them and the builder's bred genome is
+    /// what they grow with.
+    pub pending_plants: Vec<voxel_tools::flora::PlantRequest>,
     /// THE HIVE. Every committed change is sharded into chunk-sized
     /// cells and applied by the queen within the frame's budget, nearest
     /// the player first. A 200,000-block commit used to be one flush and
@@ -447,6 +452,7 @@ impl Paintbrush {
             in_flight: None,
             drone: None,
             land: voxel_tools::land::Registry::new(),
+            pending_plants: Vec::new(),
             comb: voxel_tools::hive::Comb::new(chunk_size),
             queen: voxel_tools::hive::Queen::new(voxel_tools::hive::Budget::default()),
             next_job: 1,
@@ -1056,6 +1062,12 @@ impl Paintbrush {
         {
             let mut tools = VoxelTools::new(&mut staged);
             let r = self.session.commit(&mut tools, gaze);
+        // Living plants planted by this commit go to the engine.
+        if let Some(plants) = self.session.take_plants() {
+            let n = plants.len();
+            self.pending_plants.extend(plants);
+            if n > 0 { self.say(format!("{n} living plant(s) registered with the engine")); }
+        }
             self.push(r);
         }
         let touched = staged.chunks_touched(self.chunk_size);
@@ -1150,6 +1162,22 @@ impl Paintbrush {
         });
         if !deferred.is_empty() { self.session.deferred.cells.extend(deferred); }
         t
+    }
+
+    /// Hand committed plant requests to the flora store. Called by the
+    /// bin each frame with the current frame count for `planted_tick`.
+    pub fn drain_plants(&mut self, flora: &mut crate::stubs::FloraStore, tick: u64) -> usize {
+        let n = self.pending_plants.len();
+        for p in self.pending_plants.drain(..) {
+            let mut fc = crate::stubs::FloraCell::sown(p.species_block as u8, tick);
+            fc.growth01 = p.growth;
+            // a mature placement is already at its final stage
+            fc.stage = if p.growth >= 0.99 { 4 } else { 0 };
+            fc.vigor = 0.5 + p.genome[voxel_tools::flora::GROWTH_RATE] * 0.4;
+            fc.genome = p.genome;
+            flora.plant([p.at.0, p.at.1, p.at.2], fc);
+        }
+        n
     }
 
     /// Retry deferred cells whose chunk has since loaded. Called every

@@ -194,6 +194,9 @@ pub enum Op {
     Cylinder { at: (i32, i32), y: Option<i32>, radius: i32, height: i32, block: u16, hollow: bool },
     Sphere { at: (i32, i32), y: Option<i32>, radius: i32, block: u16, hollow: bool },
     Tree { at: (i32, i32), species: String, height: i32, lean: (i32, i32) },
+    /// A living tree: bred toward a phrase, placed at its phenotype,
+    /// and registered with the engine so it keeps growing.
+    Plant { at: (i32, i32), species: String, phrase: String, seed: i32, mature: bool },
     Scatter { min: (i32, i32), max: (i32, i32), block: u16, clusters: usize,
               per: usize, spread: i32, seed: u64 },
     Restyle { min: (i32, i32, i32), max: (i32, i32, i32), from: String, to: String },
@@ -776,6 +779,17 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     min: a, max: b, y: kv(&t, "y").and_then(|v| v.parse().ok()),
                     block: blk("oak_planks").unwrap_or(57) });
             }
+            "plant" | "grow" => {
+                // `plant @x,z oak tall ancient [seed=N] [seedling]`
+                let at = rel(&t, 1, anchor).unwrap_or_else(|| anchor_xz(anchor));
+                let words: Vec<&str> = t.iter().skip(1)
+                    .filter(|s| !s.contains(',') && !s.contains('=') && !s.starts_with('@')
+                            && **s != "seedling").copied().collect();
+                let species = ["oak", "pine", "spruce", "birch", "jungle", "cactus"].iter()
+                    .find(|sp| words.contains(sp)).unwrap_or(&"oak").to_string();
+                ops.push(Op::Plant { at, species, phrase: words.join(" "),
+                                     seed: kvi(&t, "seed", 1), mature: !t.contains(&"seedling") });
+            }
             "cylinder" | "tower" => match rel(&t, 1, anchor) {
                 Some(a) => ops.push(Op::Cylinder {
                     at: a, y: kv(&t, "y").and_then(|v| v.parse().ok()),
@@ -965,6 +979,9 @@ pub struct PlanRun {
     /// Dependents withdrawn after a structural failure. Empty when
     /// nothing failed or nothing depended on what did.
     pub withdrawn: Vec<crate::recovery::Withdrawal>,
+    /// Living plants this plan asks the engine to register. The crate
+    /// placed their current form; the engine owns them from here.
+    pub plants: Vec<crate::flora::PlantRequest>,
     pub applied: usize,
     pub failed: usize,
     pub blocks_changed: usize,
@@ -1017,7 +1034,8 @@ pub fn run_plan_with<W: VoxelWorld>(
         None => from_y,
     };
     let mut run = PlanRun { applied: 0, failed: 0, blocks_changed: 0,
-                            log: Vec::new(), batches: Vec::new(), withdrawn: Vec::new() };
+                            log: Vec::new(), batches: Vec::new(), withdrawn: Vec::new(),
+                            plants: Vec::new() };
     let mut outcomes: Vec<(bool, String, Option<u64>)> = Vec::new();
     let first_edit = tools.edits.len();
 
@@ -1401,6 +1419,33 @@ pub fn run_plan_with<W: VoxelWorld>(
             Op::Tree { at, species, height, lean } => {
                 let sy = tools.find_surface(at.0, at.1, from_y).map(|s| s + 1).unwrap_or(from_y);
                 tools.place_tree((at.0, sy, at.1), species, *height, *lean)
+            }
+            Op::Plant { at, species, phrase, seed, mature } => {
+                use crate::flora;
+                let sy = tools.find_surface(at.0, at.1, from_y).map(|s| s + 1).unwrap_or(from_y);
+                // Breed toward the words using the engine's own cross,
+                // from wild stock seeded by the position -- so "tall
+                // oaks" here are the tall end of THIS world's oaks.
+                let bred = flora::breed_toward(phrase, *seed as u64 ^ ((at.0 as u64) << 32) ^ at.1 as u64,
+                                               24, 30);
+                let mut r = if *mature {
+                    tools.place_tree_genome((at.0, sy, at.1), species, &bred.genome, *seed as u64)
+                } else {
+                    // a seedling: one sapling block; the lifecycle grows it
+                    tools.set_block(at.0, sy, at.1, 6)
+                };
+                let req = flora::PlantRequest {
+                    at: (at.0, sy, at.1),
+                    species_block: match species.as_str() { "birch" => 19, "cactus" => 21, _ => 17 },
+                    genome: bred.genome.as_array(),
+                    growth: if *mature { 1.0 } else { 0.02 },
+                };
+                run.plants.push(req);
+                if r.ok {
+                    r.summary = format!("{} (bred {} gen(s) toward '{}'; registered with the engine)",
+                                        r.summary, bred.generations, phrase);
+                }
+                r
             }
             Op::Scatter { min, max, block, clusters, per, spread, seed } =>
                 tools.scatter_clustered(*min, *max, from_y, *block, *clusters, *per, *spread, *seed),
@@ -1909,5 +1954,31 @@ scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
         for e in errs {
             assert!(e.message.starts_with("line "), "bare error message: {}", e.message);
         }
+    }
+
+    #[test]
+    fn a_plant_is_placed_at_its_phenotype_and_handed_to_the_engine() {
+        let mut w = Flat::new();
+        let ir = "plant @0,0 oak tall ancient seed=3\nplant @20,0 oak small sparse seed=3\n";
+        let (plan, issues) = parse_plan_at(ir, Some((0, 65, 0)));
+        assert!(issues.iter().all(|i| i.severity != Severity::Error), "{issues:?}");
+        let run = { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &plan, 200, 32, false) };
+        assert_eq!(run.plants.len(), 2, "both registered with the engine");
+        assert!(run.plants[0].genome[crate::flora::MAX_HEIGHT] > 0.75, "tall: {:?}", run.plants[0].genome);
+        assert!(run.plants[1].genome[crate::flora::MAX_HEIGHT] < 0.35, "small: {:?}", run.plants[1].genome);
+        assert!(run.plants.iter().all(|p| p.growth >= 0.99), "placed mature");
+        // and the placed forms differ the way the genomes do
+        let top = |x: i32| (60..120).rev().find(|&y| w.get(x, y, 0) != 0).unwrap();
+        assert!(top(0) - top(20) >= 6, "the tall one is taller: {} vs {}", top(0), top(20));
+    }
+
+    #[test]
+    fn a_seedling_is_one_block_and_a_growth_of_near_zero() {
+        let mut w = Flat::new();
+        let (plan, _) = parse_plan_at("plant @0,0 birch fruit seedling\n", Some((0, 65, 0)));
+        let run = { let mut t = VoxelTools::new(&mut w); run_plan(&mut t, &plan, 200, 32, false) };
+        assert_eq!(run.blocks_changed, 1);
+        assert!(run.plants[0].growth < 0.1);
+        assert!(run.plants[0].genome[crate::flora::FRUITFULNESS] > 0.8, "fruit: {:?}", run.plants[0].genome);
     }
 }

@@ -25,6 +25,7 @@ fn main() {
     macro_scenario();
     hive_scenario();
     connect_scenario();
+    plant_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -438,4 +439,46 @@ fn connect_scenario() {
     println!("  deck over the river at y=65: {over}/10 columns; water still beneath: {wet}/10");
     assert!(over >= 8, "a deck");
     assert!(wet >= 8, "the river survives under it");
+}
+
+
+/// "plant tall ancient oaks": bred, placed at the phenotype, and handed
+/// to the flora store with the genome.
+fn plant_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== living plants");
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
+    let ir = "plant @0,0 oak tall ancient seed=3\nplant @14,0 pine hardy alpine seed=4\nplant @-14,0 birch small fruit seedling\n";
+    {
+        let view = bind::WorldView(&cm);
+        let mut staged = voxel_tools::staged::StagedWorld::new(&view);
+        let mut tools = voxel_tools::VoxelTools::new(&mut staged);
+        let r = pb.session.receive_plan_for(&mut tools, &gaze, ir, None);
+        pb.push(r);
+    }
+    for l in pb.drain_log() { for line in l.lines() { if line.contains("living") { println!("  {}", line.trim()); } } }
+    let cmd = { pb.key(voxel_tools::chatbox::Key::Enter);
+                for c in "/commit".chars() { pb.key(voxel_tools::chatbox::Key::Char(c)); }
+                pb.key(voxel_tools::chatbox::Key::Enter) }.unwrap();
+    pb.dispatch(&cm, &gaze, cmd);
+    let log = pb.drain_log();
+    assert!(log.iter().any(|l| l.contains("3 living plant(s) registered")), "{log:?}");
+    let mut flora = stubs::FloraStore::default();
+    let n = pb.drain_plants(&mut flora, 1000);
+    println!("  {n} plants in the flora store");
+    assert_eq!(flora.len(), 3);
+    for (pos, fc) in &flora.cells {
+        let g = voxel_tools::flora::PlantGenome::from_array(fc.genome);
+        println!("  {:?} block {} growth {:.2} stage {} -- {}", pos, fc.block, fc.growth01, fc.stage, g.describe());
+    }
+    let oak = flora.cells.iter().find(|(p, _)| p[0] == 0).unwrap().1;
+    assert!(oak.genome[voxel_tools::flora::MAX_HEIGHT] > 0.75 && oak.genome[voxel_tools::flora::TRUNK_GIRTH] > 0.75,
+            "tall ancient: {:?}", oak.genome);
+    let pine = flora.cells.iter().find(|(p, _)| p[0] == 14).unwrap().1;
+    assert!(pine.genome[voxel_tools::flora::HARDINESS] > 0.8, "hardy: {:?}", pine.genome);
+    let birch = flora.cells.iter().find(|(p, _)| p[0] == -14).unwrap().1;
+    assert!(birch.growth01 < 0.1 && birch.stage == 0, "a seedling grows from nothing");
+    assert!(pb.drain_plants(&mut flora, 1001) == 0, "drained once");
 }

@@ -223,6 +223,14 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                 push(Note::Info, format!("tree height {height}, roughly {} blocks with canopy",
                                           height + 60), None);
             }
+            Op::Plant { at, species, phrase, mature, .. } => {
+                total += 60;
+                push(Note::Info,
+                     format!("living {species} at {at:?}{}: bred toward '{phrase}', registered \
+                              with the engine so it keeps growing",
+                             if *mature { "" } else { " (seedling)" }),
+                     None);
+            }
             Op::Greeble { min, max, phrase, gens, genome, .. } => {
                 let area = 2 * (span(min.0, max.0) + span(min.2, max.2)) as i64 * span(min.1, max.1) as i64;
                 push(Note::Info,

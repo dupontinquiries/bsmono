@@ -42,24 +42,29 @@ pub struct Packet {
     pub rock: Option<(u16, f32)>,
     /// Surface block to repaint the ground with, if any.
     pub surface: Option<u16>,
+    /// Breeding words for the packet's trees: what a "boreal" tree IS,
+    /// genetically. Each tree in the bake is bred toward these from
+    /// stock seeded by its own position, so a forest varies the way a
+    /// real one does rather than repeating one shape.
+    pub breed: &'static str,
 }
 
 pub const PACKETS: &[Packet] = &[
-    Packet { name: "temperate", tree: "oak", tree_rate: 3.0, tree_h: (6, 10),
+    Packet { name: "temperate", breed: "oak", tree: "oak", tree_rate: 3.0, tree_h: (6, 10),
              cover: &[(25, 1.0), (27, 0.5)], rock: Some((1, 0.3)), surface: None },
-    Packet { name: "alpine", tree: "pine", tree_rate: 2.0, tree_h: (7, 12),
+    Packet { name: "alpine", breed: "pine hardy alpine narrow", tree: "pine", tree_rate: 2.0, tree_h: (7, 12),
              cover: &[(32, 0.4)], rock: Some((1, 1.5)), surface: Some(1) },
-    Packet { name: "boreal", tree: "pine", tree_rate: 4.5, tree_h: (9, 14),
+    Packet { name: "boreal", breed: "pine tall dense evergreen", tree: "pine", tree_rate: 4.5, tree_h: (9, 14),
              cover: &[(33, 0.3), (23, 0.4)], rock: Some((1, 0.4)), surface: None },
-    Packet { name: "jungle", tree: "jungle", tree_rate: 5.0, tree_h: (10, 18),
+    Packet { name: "jungle", breed: "jungle tall wide dense fast", tree: "jungle", tree_rate: 5.0, tree_h: (10, 18),
              cover: &[(27, 1.5), (25, 0.6), (23, 1.0)], rock: None, surface: Some(23) },
-    Packet { name: "desert", tree: "cactus", tree_rate: 0.6, tree_h: (2, 4),
+    Packet { name: "desert", breed: "cactus hardy drought", tree: "cactus", tree_rate: 0.6, tree_h: (2, 4),
              cover: &[(28, 0.4)], rock: Some((48, 0.8)), surface: Some(12) },
-    Packet { name: "darkwood", tree: "oak", tree_rate: 4.0, tree_h: (8, 13),
+    Packet { name: "darkwood", breed: "oak old gnarled sparse", tree: "oak", tree_rate: 4.0, tree_h: (8, 13),
              cover: &[(33, 0.8), (34, 0.3), (28, 0.3)], rock: None, surface: Some(23) },
-    Packet { name: "meadow", tree: "birch", tree_rate: 0.4, tree_h: (5, 8),
+    Packet { name: "meadow", breed: "birch small", tree: "birch", tree_rate: 0.4, tree_h: (5, 8),
              cover: &[(25, 3.0), (27, 0.5)], rock: None, surface: None },
-    Packet { name: "barren", tree: "oak", tree_rate: 0.0, tree_h: (4, 6),
+    Packet { name: "barren", breed: "oak dead sparse hardy", tree: "oak", tree_rate: 0.0, tree_h: (4, 6),
              cover: &[(28, 0.5)], rock: Some((1, 2.0)), surface: Some(13) },
 ];
 
@@ -193,9 +198,12 @@ pub fn bake<W: VoxelWorld>(w: &W, layer: &Layer, from_y: i32) -> Bake {
                 if x >= x0 && x <= x1 && z >= z0 && z <= z1 {
                     let c = cover_at(x, z);
                     if c > 0.0 && hash2(x, z, layer.seed, 4) <= c {
-                        let h = p.tree_h.0 + (hash2(x, z, layer.seed, 5)
-                            * (p.tree_h.1 - p.tree_h.0 + 1) as f32) as i32;
-                        out.ir.push_str(&format!("tree {x},{z} {} h={h}\n", p.tree));
+                        // A LIVING tree, bred toward the packet's words from
+                        // stock seeded by its position: the engine registers
+                        // it and it keeps growing. Height comes from the
+                        // genome now, not from a range.
+                        out.ir.push_str(&format!("plant {x},{z} {} seed={}\n", p.breed,
+                                                 (hash2(x, z, layer.seed, 5) * 1_000_000.0) as i32));
                         out.trees += 1;
                     }
                 }
@@ -287,7 +295,7 @@ mod tests {
         let b = bake(&w, &layer("a", "temperate", 1.0, Coverage::Full), 200);
         let (plan, _) = parse_plan(&b.ir);
         let pts: Vec<(i32, i32)> = plan.ops.iter().filter_map(|o| match o {
-            crate::plan::Op::Tree { at, .. } => Some(*at), _ => None }).collect();
+            crate::plan::Op::Plant { at, .. } => Some(*at), _ => None }).collect();
         for (i, a) in pts.iter().enumerate() {
             for b in &pts[i + 1..] {
                 assert!((a.0 - b.0).abs() + (a.1 - b.1).abs() >= 2, "trunks touching at {a:?}/{b:?}");
@@ -306,7 +314,7 @@ mod tests {
         let b = bake(&w, &layer("a", "boreal", 1.0, Coverage::Radial), 200);
         let (plan, _) = parse_plan(&b.ir);
         let pts: Vec<(i32, i32)> = plan.ops.iter().filter_map(|o| match o {
-            crate::plan::Op::Tree { at, .. } => Some(*at), _ => None }).collect();
+            crate::plan::Op::Plant { at, .. } => Some(*at), _ => None }).collect();
         let inner = pts.iter().filter(|p| p.0.abs() < 15 && p.1.abs() < 15).count();
         let outer = pts.iter().filter(|p| p.0.abs() > 30 || p.1.abs() > 30).count();
         assert!(inner > outer * 2, "dense middle {inner}, sparse rim {outer}");
@@ -318,7 +326,7 @@ mod tests {
         let b = bake(&w, &layer("a", "boreal", 1.0, Coverage::Gentle(1.0)), 200);
         let (plan, _) = parse_plan(&b.ir);
         let on_cliff = plan.ops.iter().filter(|o| matches!(o,
-            crate::plan::Op::Tree { at, .. } if at.0 > 2)).count();
+            crate::plan::Op::Plant { at, .. } if at.0 > 2)).count();
         assert_eq!(on_cliff, 0, "no trees on the 3:1 slope");
         assert!(b.trees > 20, "but plenty on the flat: {}", b.trees);
     }

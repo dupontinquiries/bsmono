@@ -4489,6 +4489,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // Blocks deferred by an earlier flush place themselves once
             // their chunk streams in.
             paintbrush.retry_deferred(&chunk_manager);
+            // Plants a build planted become living plants: the bred genome
+            // goes into the flora store and the lifecycle takes over.
+            let planted = paintbrush.drain_plants(&mut session.flora, frame_count);
+            if planted > 0 { log::info!("[paintbrush] {planted} plant(s) handed to the flora store"); }
             // THE QUEEN'S FRAME. Committed changes are applied here, a
             // chunk at a time, within a budget that adapts to how long
             // the last frame took. Nearest the player first; what you

@@ -121,6 +121,8 @@ pub struct ChatSession {
     last_inverse: Vec<(i32, i32, i32, u16)>,
     /// The referent for follow-up turns.
     pub last_build: Option<LastBuild>,
+    /// Living plants placed by commits, awaiting the engine.
+    pub planted: Vec<crate::flora::PlantRequest>,
     /// Seed for the refinement ladder, so re-running a rung reproduces
     /// it and running the next one does not repeat the last one's noise.
     pub refine_seed: i32,
@@ -471,6 +473,12 @@ impl ChatSession {
         Reply::Preview { echo, blocks: dry.blocks_changed, feature_id: f.feature_id }
     }
 
+    /// Plants committed since the last call, for the engine to register.
+    /// None when there are none, so a host can skip the message.
+    pub fn take_plants(&mut self) -> Option<Vec<crate::flora::PlantRequest>> {
+        if self.planted.is_empty() { None } else { Some(std::mem::take(&mut self.planted)) }
+    }
+
     /// The follow-up turn asking the model to fix only what it got
     /// wrong, or None if the last turn was clean.
     pub fn repair_prompt(&self) -> Option<String> {
@@ -528,6 +536,10 @@ impl ChatSession {
         }
         let first = tools.edits.len();
         let run = run_plan(tools, &p.plan, self.from_y, self.chunk_size, false);
+        // Plants this commit planted, for the engine to register. Kept
+        // on the session until the host takes them, because the tools
+        // here are a staging world and know nothing about a lifecycle.
+        if !run.plants.is_empty() { self.planted.extend(run.plants.iter().cloned()); }
         self.last_commit = tools.edits[first..].iter().map(|e| e.id).collect();
         // Remember the box for follow-ups. Merge with the previous last
         // build when they overlap, so "taller" then "add a door" keeps
@@ -1043,5 +1055,19 @@ mod tests {
         assert!(ChatSession::connect_ir("connect the mill to the tower", &land).is_err());
         let e = ChatSession::connect_ir("connect x to y", &land).unwrap_err();
         assert!(e.contains("Old Mill"), "lists what exists: {e}");
+    }
+
+    #[test]
+    fn committed_plants_reach_the_host_once() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        s.receive_plan(&mut t, &g, "plant @0,0 oak tall\nplant @8,8 birch\n");
+        assert!(s.take_plants().is_none(), "a preview registers nothing");
+        s.commit(&mut t, &g);
+        let p = s.take_plants().expect("the commit's plants");
+        assert_eq!(p.len(), 2);
+        assert!(s.take_plants().is_none(), "taken once");
     }
 }

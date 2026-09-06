@@ -105,6 +105,8 @@ pub mod hive;
 pub mod vcs;
 /// Greebles by natural selection: a genome language for decorator FSMs, metrics, evolution.
 pub mod gene;
+/// Plant genetics: the engine's 13-gene genome, bred toward a phrase, placed at its phenotype.
+pub mod flora;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.
@@ -748,6 +750,58 @@ impl<'w, W: VoxelWorld> VoxelTools<'w, W> {
         }
         let n = e.before.len();
         self.finish(e, format!("{species} tree h={h} at {:?}, {n} blocks", base))
+    }
+
+    /// Place a tree at its GENOME's phenotype. Height, canopy radius,
+    /// leaf density and trunk girth all come from the expressed genes,
+    /// so the tree you see is the tree the engine's lifecycle will keep
+    /// growing -- and two trees bred apart look different rather than
+    /// being the species' one fixed shape.
+    pub fn place_tree_genome(&mut self, base: (i32, i32, i32), species: &str,
+                             genome: &crate::flora::PlantGenome, seed: u64) -> CallResult {
+        let (trunk, leaf) = match species {
+            "birch" => (19u16, 20u16),
+            "pine" | "spruce" => (17, 18),
+            "cactus" => (21, 0),
+            _ => (17, 18),
+        };
+        let p = genome.phenotype();
+        let h = p.height_blocks.clamp(2, 40);
+        let r = if species == "cactus" { 0 } else { p.canopy_radius.clamp(1, 7) };
+        // girth: a thick trunk is 2x2 above a threshold, a great old
+        // tree 3x3
+        let girth = if p.trunk_girth > 0.85 && h > 10 { 3 } else if p.trunk_girth > 0.6 && h > 6 { 2 } else { 1 };
+        let mut e = self.begin("place_tree_genome");
+        for i in 0..h {
+            for gx in 0..girth { for gz in 0..girth {
+                self.write(&mut e, base.0 + gx, base.1 + i, base.2 + gz, trunk);
+            }}
+        }
+        let tip = (base.0 + girth / 2, base.1 + h - 1, base.2 + girth / 2);
+        if r > 0 {
+            // A pine narrows toward the top; an oak is round. Leaf
+            // density thins the canopy by dropping cells from a seeded
+            // hash, so "sparse" and "wispy" read as such.
+            let conical = matches!(species, "pine" | "spruce");
+            let mut k = seed;
+            let mut draw = || { k ^= k << 13; k ^= k >> 7; k ^= k << 17; (k % 1000) as f32 / 1000.0 };
+            let keep = 0.35 + p.leaf_density * 0.65;
+            let span = if conical { r + h / 3 } else { r };
+            for dy in -span..=r {
+                let ry = if conical {
+                    ((r as f32) * (1.0 - (dy + span) as f32 / (span + r + 1) as f32) * 1.6).round() as i32
+                } else { r - dy.abs() / 2 };
+                if ry <= 0 { continue; }
+                for dz in -ry..=ry { for dx in -ry..=ry {
+                    if dx * dx + dz * dz > ry * ry + 1 { continue; }
+                    if draw() > keep { continue; }
+                    let (x, y, z) = (tip.0 + dx, tip.1 + dy, tip.2 + dz);
+                    if self.world.get(x, y, z) == 0 { self.write(&mut e, x, y, z, leaf); }
+                }}
+            }
+        }
+        let n = e.before.len();
+        self.finish(e, format!("{species}: {} at {:?}, {n} blocks", genome.describe(), base))
     }
 
     /// Scatter decorations on the surface within a footprint. Uses a

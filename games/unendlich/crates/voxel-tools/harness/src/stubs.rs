@@ -89,3 +89,19 @@ pub fn parse(line: &str) -> Command {
         _ => Command::Unknown,
     }
 }
+
+/// Mirror of world::flora_store, enough for the paintbrush to register plants.
+#[derive(Clone, Copy, Debug)]
+pub struct FloraCell { pub block: u8, pub growth01: f32, pub stage: u8, pub element: u8,
+                       pub vigor: f32, pub planted_tick: u64, pub genome: [f32; 13] }
+impl FloraCell {
+    pub fn sown(block: u8, tick: u64) -> Self {
+        Self { block, growth01: 0.02, stage: 0, element: 0, vigor: 0.6, planted_tick: tick, genome: [0.5; 13] }
+    }
+}
+#[derive(Default)]
+pub struct FloraStore { pub cells: HashMap<[i32; 3], FloraCell> }
+impl FloraStore {
+    pub fn plant(&mut self, pos: [i32; 3], cell: FloraCell) { self.cells.insert(pos, cell); }
+    pub fn len(&self) -> usize { self.cells.len() }
+}
