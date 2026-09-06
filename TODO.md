@@ -988,6 +988,27 @@ asked as a question.
   WAS: eframe surfaces dropped files via `ctx.input(|i| &i.raw.dropped_files)`;
   the confirmation matters because a drop replaces the input path and the
   previous one is not recoverable from the UI.
+- [ ] **Leaf LOD still looks sparse at distance — A/B it.** First look now
+  that the graph can be cleared (`LOGSCOPE_CONVO=/tmp/tiny.logscope`):
+  `LOGSCOPE_THEME=Canopy LOGSCOPE_CAM="0.7,0.28,55"` shows crowns as
+  scattered specks with gaps you can see through
+  (outputs/canopy-leaf-lod-at-distance.png). That is the exact symptom
+  `leaf_lod` was written to prevent.
+
+  WHAT I CANNOT SAY: whether it is BETTER than before. The pre-change binary
+  is gone and rebuilding it is ~5 minutes, so there is no A/B. It may be
+  much improved and still not enough.
+
+  The arithmetic says coverage should hold at ~69% of full at this distance:
+  `detail` bottoms out at 0.14, so 84 blades become 12 and growth wants
+  `sqrt(84/12) = 2.65` but clamps to `LEAF_GROWTH_CAP = 2.2`, giving
+  `12 * 2.2^2 = 58` of 84. If the crowns still read see-through at 69%
+  coverage then the cap is the thing to revisit — or the blade `len` clamp
+  `.clamp(0.05, 0.30 * blade_growth)` is biting before the growth does.
+
+  DO THE A/B FIRST. Build the parent of the leaf-LOD commit, shoot the same
+  camera, and compare — changing constants without that is guessing.
+
 - [ ] **Act on the GPU pacing numbers (`gpu_kit::pace`).** The MEASUREMENT is
   wired: `WgpuUpscaler` times both `device.poll` sites (there are two —
   instrumenting one would have reported half the GPU time as zero) and
