@@ -844,6 +844,19 @@ impl Paintbrush {
                 self.launch_drone(cm, gaze, ir, player_feet, prose);
                 return;
             }
+            // "Connect the mill to the barn": names resolved against the
+            // land registry, then a ROAD that deals with whatever is in
+            // the way. No model.
+            if matches!(voxel_tools::verbs::recognize(prose), Some(voxel_tools::verbs::Verb::Connect)) {
+                match voxel_tools::chat::ChatSession::connect_ir(prose, &self.land) {
+                    Ok(ir) => {
+                        self.say("(road planned without the model)");
+                        self.launch_drone(cm, gaze, ir, player_feet, prose);
+                        return;
+                    }
+                    Err(e) => { self.say(e); return; }
+                }
+            }
         }
         // Same borrow shape as `prompt_for`: the view lives for the
         // length of this call, which is all a prompt needs -- it reads

@@ -149,6 +149,9 @@ pub enum Op {
     /// not a world override -- water placed by a plan within a radius,
     /// which is what a river's pool is.
     Lake { at: (i32, i32), radius: i32, level: i32 },
+    /// A road from A to B as a state machine: it cuts, fills, bridges,
+    /// tunnels and switchbacks as the ground demands.
+    Road { from: (i32, i32), to: (i32, i32), width: i32, block: u16 },
     /// A river run as a state machine from a source.
     River { at: (i32, i32), dir_deg: i32, max_len: i32, seed: i32 },
     /// Apply a mood over a region: palette restyle, weathering, clutter,
@@ -583,6 +586,14 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     bad("lake needs level=Y".into()); continue;
                 };
                 ops.push(Op::Lake { at, radius: kvi(&t, "r", 8).clamp(2, 80), level });
+            }
+            "road" | "highway" => {
+                let Some((a, b, note)) = footprint(&t, anchor) else {
+                    rel_err.set(true); continue;
+                };
+                if let Some(n) = note { assumed!(&n); }
+                ops.push(Op::Road { from: a, to: b, width: kvi(&t, "w", 3).clamp(1, 7),
+                                    block: blk("cobblestone").unwrap_or(4) });
             }
             "river" | "stream" => {
                 let at = rel(&t, 1, anchor).unwrap_or_else(|| anchor_xz(anchor));
@@ -1127,6 +1138,20 @@ pub fn run_plan_with<W: VoxelWorld>(
                 let mut r = tools.apply_changes_large(&eff.blocks);
                 if r.ok { r.summary = format!("lake: {}", eff.note); }
                 r
+            }
+            Op::Road { from, to, width, block: _ } => {
+                use crate::feature::{Reader, Road};
+                let r = Reader::new(tools.world, from_y);
+                let mut road = Road::new(*from, *to, *width);
+                let ir = road.run(&r);
+                let desc = road.describe();
+                let (sub, _) = parse_plan_at(&ir, None);
+                let sr = run_plan_with(tools, &sub, from_y, chunk_size, dry_run, library);
+                CallResult {
+                    ok: sr.failed == 0 && road.done(), blocks_changed: sr.blocks_changed,
+                    summary: format!("{desc} -> {} blocks", sr.blocks_changed),
+                    ..Default::default()
+                }
             }
             Op::River { at, dir_deg, max_len, seed } => {
                 use crate::feature::{Reader, River};

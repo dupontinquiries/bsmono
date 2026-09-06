@@ -366,6 +366,183 @@ impl River {
     }
 }
 
+// ── road ──────────────────────────────────────────────────────────
+//
+// The second machine on the same Head, Reader and trace. A river goes
+// where the ground takes it; a road goes where it is TOLD and deals
+// with the ground on the way. So the states are about obstacles, not
+// slope-following: straight, cut through a rise, fill across a dip,
+// bridge over water or a ravine, tunnel through a mountain, and a
+// switchback when the grade is too steep to climb directly.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoadState {
+    /// On grade: lay the surface and go.
+    Straight,
+    /// Ground rises too fast: cut a notch through it.
+    Cut,
+    /// Ground drops: fill up to grade.
+    Fill,
+    /// Water or a deep gap ahead: a deck with piers.
+    Bridge,
+    /// A wall of ground far above grade: bore through.
+    Tunnel,
+    /// The grade is too steep to climb even with a cut: turn across the
+    /// slope and gain height sideways.
+    Switchback,
+    Arrived,
+}
+
+#[derive(Debug, Clone)]
+pub struct Road {
+    pub state: RoadState,
+    pub head: Head,
+    pub to: (i32, i32),
+    pub width: i32,
+    pub travelled: f32,
+    pub max_len: f32,
+    pub trace: Vec<Step<RoadState>>,
+    pub surface: &'static str,
+    pub bridge_block: &'static str,
+    /// Blocks of rise per block of run the road will climb directly.
+    pub max_grade: f32,
+}
+
+impl Road {
+    pub fn new(from: (i32, i32), to: (i32, i32), width: i32) -> Self {
+        let dir = ((to.1 - from.1) as f32).atan2((to.0 - from.0) as f32);
+        let len = (((to.0 - from.0).pow(2) + (to.1 - from.1).pow(2)) as f32).sqrt();
+        Self {
+            state: RoadState::Straight,
+            head: Head { x: from.0 as f32, z: from.1 as f32, y: 0, dir },
+            to, width: width.clamp(1, 7), travelled: 0.0,
+            // Room for switchbacks: a road may be twice its crow-flight
+            // length and no more, so a hopeless grade cannot loop.
+            max_len: len * 2.5 + 40.0,
+            trace: Vec::new(), surface: "cobblestone", bridge_block: "oak_planks",
+            max_grade: 0.5,
+        }
+    }
+
+    pub fn done(&self) -> bool { self.state == RoadState::Arrived }
+
+    fn dist_to_goal(&self) -> f32 {
+        ((self.to.0 as f32 - self.head.x).powi(2) + (self.to.1 as f32 - self.head.z).powi(2)).sqrt()
+    }
+
+    pub fn step<W: VoxelWorld>(&mut self, r: &Reader<W>) {
+        if self.done() { return; }
+        const STEP: f32 = 4.0;
+        // Aim at the goal every step: a road is a line with detours,
+        // never a wander.
+        let goal_dir = (self.to.1 as f32 - self.head.z).atan2(self.to.0 as f32 - self.head.x);
+        self.head.dir = goal_dir;
+        let here = r.height(self.head.x, self.head.z);
+        self.head.y = here;
+        let (nx, nz) = (self.head.x + self.head.dir.cos() * STEP, self.head.z + self.head.dir.sin() * STEP);
+        let ahead = r.height(nx, nz);
+        let far = r.height(self.head.x + self.head.dir.cos() * STEP * 4.0,
+                           self.head.z + self.head.dir.sin() * STEP * 4.0);
+        let water = r.is_water(nx, nz);
+        let reading = Reading { slope_ahead: (ahead - here) as f32 / STEP, lowest_dir: goal_dir,
+                                water_ahead: water, height: here };
+        let rise = ahead - here;
+
+        let next = if self.dist_to_goal() <= STEP || self.travelled >= self.max_len {
+            RoadState::Arrived
+        } else if water || rise < -6 {
+            RoadState::Bridge
+        } else if far - here > 14 && rise > 3 {
+            RoadState::Tunnel
+        } else if rise as f32 / STEP > self.max_grade * 2.5 {
+            RoadState::Switchback
+        } else if rise as f32 / STEP > self.max_grade {
+            RoadState::Cut
+        } else if rise < -1 {
+            RoadState::Fill
+        } else {
+            RoadState::Straight
+        };
+
+        let (x, z) = (self.head.x.round() as i32, self.head.z.round() as i32);
+        let (ex, ez) = (nx.round() as i32, nz.round() as i32);
+        let w = self.width;
+        // The grade the deck holds: rise at most max_grade per block.
+        let grade_y = here + ((STEP * self.max_grade) as i32).min(rise.max(0));
+        let ir = match next {
+            RoadState::Straight => format!("path {x},{z} {ex},{ez} w={w} block={}\n", self.surface),
+            RoadState::Cut => format!(
+                // clear a notch two blocks above grade, then lay the deck at grade
+                "fill {},{},{} {},{},{} block=air\n\
+                 stairs {x},{z} {ex},{ez} w={w} block={}\n",
+                x - w, grade_y + 1, z - w, ex + w, ahead + 3, ez + w, self.surface),
+            RoadState::Fill => format!(
+                "fill {},{},{} {},{},{} block={}\n\
+                 path {x},{z} {ex},{ez} w={w} block={}\n",
+                x - w / 2, ahead, z - w / 2, ex + w / 2, here - 1, ez + w / 2, self.surface, self.surface),
+            RoadState::Bridge => {
+                // Span to the far bank: keep going in the goal direction
+                // until land at or near grade.
+                let mut span = STEP;
+                while span < 64.0 {
+                    let (bx, bz) = (self.head.x + self.head.dir.cos() * span,
+                                    self.head.z + self.head.dir.sin() * span);
+                    if !r.is_water(bx, bz) && r.height(bx, bz) >= here - 2 { break; }
+                    span += STEP;
+                }
+                let (bx, bz) = ((self.head.x + self.head.dir.cos() * span).round() as i32,
+                                (self.head.z + self.head.dir.sin() * span).round() as i32);
+                let ir = format!("bridge {x},{z} {bx},{bz} w={w} y={} block={}\n",
+                                 here + 1, self.bridge_block);
+                // the bridge consumes its whole span at once
+                self.head.x += self.head.dir.cos() * (span - STEP);
+                self.head.z += self.head.dir.sin() * (span - STEP);
+                self.travelled += span - STEP;
+                ir
+            }
+            RoadState::Tunnel => format!(
+                "fill {},{},{} {},{},{} block=air\n\
+                 path {x},{z} {ex},{ez} w={w} block={}\n",
+                x - w / 2, here, z - w / 2, ex + w / 2, here + 4, ez + w / 2, self.surface),
+            RoadState::Switchback => {
+                // Turn 60 degrees across the slope for this segment and
+                // climb what the grade allows.
+                let side = if (self.travelled / 20.0) as i32 % 2 == 0 { 1.0 } else { -1.0 };
+                self.head.dir += side * 1.05;
+                let (sx, sz) = ((self.head.x + self.head.dir.cos() * STEP).round() as i32,
+                                (self.head.z + self.head.dir.sin() * STEP).round() as i32);
+                format!("stairs {x},{z} {sx},{sz} w={w} block={}\n", self.surface)
+            }
+            RoadState::Arrived => format!("path {x},{z} {},{} w={w} block={}\n",
+                                          self.to.0, self.to.1, self.surface),
+        };
+        self.trace.push(Step { state: next, head: self.head, reading, ir });
+        self.state = next;
+        if !self.done() {
+            self.head.x += self.head.dir.cos() * STEP;
+            self.head.z += self.head.dir.sin() * STEP;
+            self.travelled += STEP;
+        }
+    }
+
+    pub fn run<W: VoxelWorld>(&mut self, r: &Reader<W>) -> String {
+        let mut guard = 0;
+        while !self.done() && guard < 1000 { self.step(r); guard += 1; }
+        let mut ir = format!("# road to {:?}\n", self.to);
+        for s in &self.trace { ir.push_str(&s.ir); }
+        ir
+    }
+
+    pub fn describe(&self) -> String {
+        let mut counts = std::collections::BTreeMap::new();
+        for s in &self.trace { *counts.entry(format!("{:?}", s.state)).or_insert(0) += 1; }
+        format!("road: {} steps, {:.0} blocks, {}{}",
+                self.trace.len(), self.travelled,
+                if self.done() { "arrived" } else { "gave up" },
+                counts.iter().map(|(k, v)| format!(", {v} {k}")).collect::<String>())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,5 +690,88 @@ mod tests {
             assert!(s.head.dir >= 0.0 && s.head.dir < std::f32::consts::TAU + 1e-3,
                     "dir {} out of range", s.head.dir);
         }
+    }
+
+    // ── road ──
+
+    #[test]
+    fn a_road_on_flat_ground_is_straight_and_arrives() {
+        let w = T { f: |_, _| 64, cells: BTreeMap::new() };
+        let r = Reader::new(&w, 200);
+        let mut road = Road::new((0, 0), (80, 20), 3);
+        road.run(&r);
+        assert!(road.done(), "{}", road.describe());
+        assert!(road.trace.iter().all(|s| matches!(s.state, RoadState::Straight | RoadState::Arrived)),
+                "{}", road.describe());
+        let end = road.trace.last().unwrap().head;
+        assert!((end.x - 80.0).abs() < 6.0 && (end.z - 20.0).abs() < 6.0);
+    }
+
+    #[test]
+    fn a_road_bridges_water_and_reaches_the_far_bank() {
+        let mut w = T { f: |_, _| 64, cells: BTreeMap::new() };
+        for x in 30..50 { for z in -20..20 { w.set(x, 64, z, 9); } }
+        let r = Reader::new(&w, 200);
+        let mut road = Road::new((0, 0), (90, 0), 3);
+        road.run(&r);
+        assert!(road.done());
+        let b = road.trace.iter().find(|s| s.state == RoadState::Bridge).expect("a bridge");
+        assert!(b.ir.starts_with("bridge "), "{}", b.ir);
+        // water is x=30..49; the deck must end on dry ground beyond it
+        let end_x: i32 = b.ir.split_whitespace().nth(2).unwrap()
+            .split(',').next().unwrap().parse().unwrap();
+        assert!(end_x >= 50, "spans to the far bank: {}", b.ir);
+        assert_eq!(road.trace.iter().filter(|s| s.state == RoadState::Bridge).count(), 1,
+                   "one bridge, not one per step: {}", road.describe());
+    }
+
+    #[test]
+    fn a_road_cuts_through_a_moderate_rise_and_tunnels_a_mountain() {
+        let w = T { f: |x, _| if (20..40).contains(&x) { 72 } else { 64 }, cells: BTreeMap::new() };
+        let r = Reader::new(&w, 200);
+        let mut road = Road::new((0, 0), (60, 0), 3);
+        road.run(&r);
+        assert!(road.trace.iter().any(|s| matches!(s.state, RoadState::Cut | RoadState::Switchback)),
+                "an 8-block rise is cut or switchbacked: {}", road.describe());
+        let w2 = T { f: |x, _| if (20..60).contains(&x) { 100 } else { 64 }, cells: BTreeMap::new() };
+        let r2 = Reader::new(&w2, 200);
+        let mut road2 = Road::new((0, 0), (80, 0), 3);
+        road2.run(&r2);
+        assert!(road2.trace.iter().any(|s| s.state == RoadState::Tunnel),
+                "a 36-block wall is tunnelled: {}", road2.describe());
+    }
+
+    #[test]
+    fn a_road_fills_a_dip_rather_than_diving_into_it() {
+        let w = T { f: |x, _| if (20..30).contains(&x) { 60 } else { 64 }, cells: BTreeMap::new() };
+        let r = Reader::new(&w, 200);
+        let mut road = Road::new((0, 0), (50, 0), 3);
+        road.run(&r);
+        assert!(road.trace.iter().any(|s| s.state == RoadState::Fill), "{}", road.describe());
+    }
+
+    #[test]
+    fn a_road_cannot_loop_forever_on_a_hopeless_grade() {
+        // straight up a cliff face: it switchbacks, and gives up within
+        // 2.5x the crow-flight distance
+        let w = T { f: |x, _| 64 + x * 4, cells: BTreeMap::new() };
+        let r = Reader::new(&w, 400);
+        let mut road = Road::new((0, 0), (40, 0), 3);
+        road.run(&r);
+        assert!(road.travelled <= road.max_len + 4.0, "{}", road.describe());
+        assert!(road.trace.len() < 200);
+    }
+
+    #[test]
+    fn a_whole_road_is_valid_ir() {
+        let mut w = T { f: |x, _| if (20..30).contains(&x) { 60 } else { 64 }, cells: BTreeMap::new() };
+        for x in 40..48 { for z in -10..10 { w.set(x, 64, z, 9); } }
+        let r = Reader::new(&w, 200);
+        let mut road = Road::new((0, 0), (70, 5), 3);
+        let ir = road.run(&r);
+        let (plan, issues) = parse_plan(&ir);
+        let errs: Vec<_> = issues.iter().filter(|i| i.severity == Severity::Error).collect();
+        assert!(errs.is_empty(), "{errs:?}\n{ir}");
+        assert!(plan.ops.len() > 10);
     }
 }

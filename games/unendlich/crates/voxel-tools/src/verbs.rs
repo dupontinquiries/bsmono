@@ -116,8 +116,11 @@ pub fn light(w: &Workset, spacing: i32, lantern: &str) -> String {
 pub fn connect(a: &Workset, b: &Workset, width: i32, block: &str, bridge: bool) -> String {
     let ac = ((a.min.0 + a.max.0) / 2, (a.min.2 + a.max.2) / 2);
     let bc = ((b.min.0 + b.max.0) / 2, (b.min.2 + b.max.2) / 2);
-    let verb = if bridge { "bridge" } else { "path" };
-    format!("# connect {} to {}\n{verb} {},{} {},{} w={} block={block}\n",
+    // A ROAD, not a path: the road machine cuts, fills, bridges and
+    // tunnels on its own, so "connect the mill to the barn" across a
+    // river or a ridge needs no one to notice the river or the ridge.
+    let _ = bridge;
+    format!("# connect {} to {}\nroad {},{} {},{} w={} block={block}\n",
             a.name, b.name, ac.0, ac.1, bc.0, bc.1, width.max(1))
 }
 
@@ -232,9 +235,7 @@ mod tests {
     fn connect_runs_centre_to_centre_and_can_bridge() {
         let b = Workset { name: "mill".into(), min: (60, 64, 10), max: (66, 70, 16), ..base() };
         let p = connect(&base(), &b, 2, "cobblestone", false);
-        assert!(p.contains("path 15,14 63,13"), "{p}");
-        let br = connect(&base(), &b, 2, "oak_planks", true);
-        assert!(br.contains("bridge 15,14 63,13"), "{br}");
+        assert!(p.contains("road 15,14 63,13"), "{p}");
     }
 
     #[test]

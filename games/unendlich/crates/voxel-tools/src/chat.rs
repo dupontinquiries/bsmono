@@ -277,9 +277,36 @@ impl ChatSession {
             crate::verbs::Verb::Expand(side) => crate::verbs::expand(&ws, &side, 6, "stone"),
             crate::verbs::Verb::Light => crate::verbs::light(&ws, 4, "glow_crystal"),
             crate::verbs::Verb::Repair => crate::verbs::repair(&ws, "stone"),
-            // connect needs a second workset the session does not know
+            // Connect names two builds; the session knows only the last
+            // one. The paintbrush resolves names against the land
+            // registry and calls `connect_ir`.
             crate::verbs::Verb::Connect => return None,
         })
+    }
+
+    /// "Connect A to B": a road between two named builds. The names are
+    /// matched loosely against workset names -- "the mill" finds
+    /// "Old Mill" -- because a player will not type an id.
+    pub fn connect_ir(prose: &str, land: &crate::land::Registry) -> Result<String, String> {
+        let p = prose.to_lowercase();
+        let mut named: Vec<&crate::land::Workset> = land.all()
+            .filter(|w| {
+                let n = w.name.to_lowercase();
+                !n.is_empty() && n.split_whitespace().any(|word| word.len() > 2 && p.contains(word))
+            })
+            .collect();
+        // Order by where the name appears in the prose, so "connect the
+        // mill to the barn" is mill -> barn, not barn -> mill.
+        named.sort_by_key(|w| w.name.to_lowercase().split_whitespace()
+            .filter_map(|word| p.find(word)).min().unwrap_or(usize::MAX));
+        named.dedup_by(|a, b| a.id == b.id);
+        match named.as_slice() {
+            [a, b, ..] => Ok(crate::verbs::connect(a, b, 3, "cobblestone", true)),
+            [_] => Err("I found one of the two builds; name both, e.g. \
+                        \"connect the mill to the barn\"".into()),
+            [] => Err(format!("no builds by those names; claimed here: {}",
+                               land.all().map(|w| w.name.as_str()).collect::<Vec<_>>().join(", "))),
+        }
     }
 
     /// The full user turn for the model: context, inferred pass, prose.
@@ -1001,5 +1028,20 @@ mod tests {
             .filter(|b| *b != 0).collect();
         assert!(mixed.len() > 1, "the wall is no longer one material: {mixed:?}");
         assert!(before > 0);
+    }
+
+    #[test]
+    fn connect_resolves_two_builds_by_name_in_the_order_spoken() {
+        let mut land = crate::land::Registry::new();
+        land.claim("Old Mill", "kess", (0, 64, 0), (8, 70, 8));
+        land.claim("Red Barn", "kess", (60, 64, 20), (70, 72, 30));
+        land.claim("Well", "kess", (30, 64, 30), (32, 66, 32));
+        let ir = ChatSession::connect_ir("connect the mill to the barn", &land).unwrap();
+        assert!(ir.contains("road 4,4 65,25"), "mill -> barn: {ir}");
+        let ir2 = ChatSession::connect_ir("a road from the barn to the mill", &land).unwrap();
+        assert!(ir2.contains("road 65,25 4,4"), "barn -> mill: {ir2}");
+        assert!(ChatSession::connect_ir("connect the mill to the tower", &land).is_err());
+        let e = ChatSession::connect_ir("connect x to y", &land).unwrap_err();
+        assert!(e.contains("Old Mill"), "lists what exists: {e}");
     }
 }

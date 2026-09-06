@@ -51,7 +51,8 @@ pub fn depends_on_structure(op: &Op) -> bool {
 pub fn is_structural(op: &Op) -> bool {
     matches!(op,
         Op::Fill { .. } | Op::Cylinder { .. } | Op::Enclose { .. } | Op::Sphere { .. }
-        | Op::Form { .. } | Op::Views { .. } | Op::Place { .. } | Op::Bridge { .. })
+        | Op::Form { .. } | Op::Views { .. } | Op::Place { .. } | Op::Bridge { .. }
+        | Op::Road { .. })
 }
 
 /// What was withdrawn after a structural failure, for the chat log.

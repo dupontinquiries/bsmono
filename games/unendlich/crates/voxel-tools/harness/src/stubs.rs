@@ -4,13 +4,13 @@ use std::sync::Mutex;
 // --- stubs mirroring the real signatures ---
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(u8)]
-pub enum BlockId { Air = 0, Stone = 1, Cobblestone = 4, StoneBricks = 58 }
+pub enum BlockId { Air = 0, Stone = 1, Cobblestone = 4, Water = 9, StoneBricks = 58 }
 impl TryFrom<u8> for BlockId {
     type Error = u8;
     fn try_from(v: u8) -> Result<Self, u8> {
         match v { 0 => Ok(BlockId::Air), 1 => Ok(BlockId::Stone),
                   4 => Ok(BlockId::Cobblestone), 58 => Ok(BlockId::StoneBricks),
-                  _ => Ok(BlockId::Stone) }
+                  9 => Ok(BlockId::Water), _ => Ok(BlockId::Stone) }
     }
 }
 /// `set_block`/`set_blocks` take &self: interior mutability via DashMap.

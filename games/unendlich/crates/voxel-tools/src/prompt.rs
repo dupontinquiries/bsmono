@@ -163,6 +163,8 @@ OPS
                                                  flatten, roughen the ground under a radius
   layer PACKET A B [density=0.6] [radial|gentle]  paint a region: temperate, alpine, boreal,
                                                  jungle, desert, darkwood, meadow, barren
+  road A B [w=N] [block=B]                       a road that cuts, fills, bridges and tunnels
+                                                 as the ground demands; use it between builds
   river A [dir=DEG] [len=N]                      a river from a source; the terrain decides
                                                  the path, pools become lakes with outlets
   lake A r=N level=Y                             flood a basin to a level

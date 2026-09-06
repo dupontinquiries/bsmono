@@ -249,6 +249,14 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                 push(Note::Info, format!("lake at {at:?} r={radius} to y={level}: up to {cols} columns"),
                      None);
             }
+            Op::Road { from, to, width, .. } => {
+                let len = (((to.0 - from.0).pow(2) + (to.1 - from.1).pow(2)) as f64).sqrt() as i64;
+                total += len * *width as i64 * 2;
+                push(Note::Info,
+                     format!("road {from:?} -> {to:?}, about {len} long, {width} wide; it will cut, \
+                              fill, bridge or tunnel as the ground demands"),
+                     None);
+            }
             Op::River { at, dir_deg, max_len, .. } => {
                 total += *max_len as i64 * 6;
                 push(Note::Info,

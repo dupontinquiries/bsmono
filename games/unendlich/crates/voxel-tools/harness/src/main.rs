@@ -24,6 +24,7 @@ fn main() {
     async_scenario();
     macro_scenario();
     hive_scenario();
+    connect_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -395,4 +396,46 @@ fn hive_scenario() {
              cm.block_count());
     assert!(cm.block_count() > before_world + 10_000, "the landscape actually arrived");
     assert!(applied_frames > 5, "spread over many frames, not one");
+}
+
+
+/// "connect the mill to the barn" across a river, no model.
+fn connect_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== connect by name");
+    let cm = stubs::ChunkManager::new();
+    // a river between them
+    let edits: Vec<_> = (30..40).flat_map(|x| (-40..40).map(move |z| (x, 64, z, stubs::BlockId::Water)))
+        .collect();
+    cm.set_blocks(&edits);
+    let mut pb = Paintbrush::new(32);
+    pb.provider = paintbrush::ProviderChoice::Script(vec!["/bin/false".into()]);
+    pb.land.claim("Old Mill", "kess", (0, 64, 0), (8, 70, 8));
+    pb.land.claim("Red Barn", "kess", (60, 64, 20), (70, 72, 30));
+    let gaze = Paintbrush::gaze_from([4.0, 70.0, 4.0], [1.0, -0.3, 0.3], Some(([4, 64, 4], [0, 1, 0], 8.0)));
+    pb.start_turn(&cm, &gaze, None, "connect the mill to the barn", Some((4, 65, 4)));
+    settle(&mut pb);
+    let log = pb.drain_log();
+    let planned = log.iter().find(|l| l.contains("blocks planned")).cloned().unwrap_or_default();
+    println!("  {}", planned.trim());
+    assert!(log.iter().any(|l| l.contains("road planned without the model")), "{log:?}");
+    assert!(planned.contains("blocks planned"), "{log:?}");
+    let cmd = { pb.key(voxel_tools::chatbox::Key::Enter);
+                for c in "/commit".chars() { pb.key(voxel_tools::chatbox::Key::Char(c)); }
+                pb.key(voxel_tools::chatbox::Key::Enter) }.unwrap();
+    pb.dispatch(&cm, &gaze, cmd);
+    let built = pb.drain_log();
+    println!("  {}", built.first().cloned().unwrap_or_default().trim());
+    // The proof is in the world: a deck over the water, not a trench
+    // through it, and water still under the deck.
+    // along the road's own line from (4,4) to (65,25): z = 4 + (x-4)*21/61
+    let on_line = |x: i32| 4 + (x - 4) * 21 / 61;
+    let over = (30..40).filter(|&x| {
+        let z = on_line(x);
+        (z - 2..=z + 2).any(|zz| cm.block_at(x, 65, zz) != stubs::BlockId::Air)
+    }).count();
+    let wet = (30..40).filter(|&x| cm.block_at(x, 64, on_line(x)) == stubs::BlockId::Water).count();
+    println!("  deck over the river at y=65: {over}/10 columns; water still beneath: {wet}/10");
+    assert!(over >= 8, "a deck");
+    assert!(wet >= 8, "the river survives under it");
 }
