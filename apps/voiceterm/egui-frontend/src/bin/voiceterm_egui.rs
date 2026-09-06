@@ -2791,6 +2791,17 @@ impl eframe::App for VoicetermApp {
             let view = self.workspace.pane_view(self.workspace.focused_pane());
             if view != PaneView::Terminal {
                 let c = self.colors;
+                // SCOPED TO THE PANE. Every view below gives its widgets a fixed
+                // `id_salt`, which is unique within one instance and identical between
+                // two: `ui.columns` does not scope ids, so two panes showing the same
+                // view would resolve to ONE widget — and for a `TextEdit` that means one
+                // text cursor between them, which reads as "I can only get one character
+                // into this box". Only the focused pane draws its view today, so nothing
+                // collides yet; this is one line that keeps it that way when the others
+                // start drawing. `tests/views_probe.rs` pins the rule by drawing each
+                // view twice in a frame.
+                let pane_scope = self.workspace.focused_pane();
+                ui.push_id(("pane-view", pane_scope), |ui| {
                 match view {
                     PaneView::Mail => {
                         // The spoken selector, above the typed query. "my last
@@ -4132,6 +4143,7 @@ impl eframe::App for VoicetermApp {
                     }
                     PaneView::Terminal => {}
                 }
+                });
                 return;
             }
             // Submitted line (Enter) and the raw BYTES are two different

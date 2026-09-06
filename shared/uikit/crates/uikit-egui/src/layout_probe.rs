@@ -56,16 +56,29 @@ pub struct Report {
     pub offscreen: Vec<Text>,
     pub tiny: Vec<Text>,
     pub smallest_font_pt: f32,
+    /// egui's own ID-clash reports for this frame: two widgets that resolved to the same
+    /// id. For a `TextEdit` that means the two SHARE their text-cursor state, so typing
+    /// into one moves the caret in the other and a keystroke lands in whichever egui
+    /// thinks is current — the "I can only type one character" bug. egui paints a red
+    /// warning at the site; this collects the text of those warnings.
+    pub id_clashes: Vec<String>,
 }
 
 impl Report {
     pub fn clean(&self) -> bool {
-        self.overlaps.is_empty() && self.clipped.is_empty() && self.offscreen.is_empty() && self.tiny.is_empty()
+        self.overlaps.is_empty()
+            && self.clipped.is_empty()
+            && self.offscreen.is_empty()
+            && self.tiny.is_empty()
+            && self.id_clashes.is_empty()
     }
 
     /// One line per finding, for a failing assertion's message.
     pub fn describe(&self) -> String {
         let mut out = Vec::new();
+        for c in &self.id_clashes {
+            out.push(format!("id clash: {c}"));
+        }
         for (a, b, r) in &self.overlaps {
             out.push(format!("overlap {:.0}×{:.0}: {:?} over {:?}", r.width(), r.height(), a.text, b.text));
         }
@@ -111,7 +124,16 @@ fn collect(shape: &Shape, clip: Rect, out: &mut Vec<Text>) {
 /// Analyse one frame's shapes.
 pub fn analyse(screen: Rect, shapes: &[ClippedShape], compact: bool) -> Report {
     let ts = texts(shapes);
-    let mut r = Report { screen, texts: ts.len(), overlaps: Vec::new(), clipped: Vec::new(), cut_vertically: Vec::new(), offscreen: Vec::new(), tiny: Vec::new(), smallest_font_pt: f32::MAX };
+    // egui paints its own ID-clash warning as text at the offending widget ("First use of
+    // [Id] widget here" / "Second use of…"). Reading it back out of the shapes is how a
+    // headless probe sees a clash without egui exposing one — and a clash on a TextEdit is
+    // the "only one character goes in" bug, because the two widgets share a text cursor.
+    let id_clashes: Vec<String> = ts
+        .iter()
+        .filter(|t| t.text.contains("use of ") && t.text.contains("widget"))
+        .map(|t| t.text.replace('\n', " ").trim().to_string())
+        .collect();
+    let mut r = Report { screen, texts: ts.len(), overlaps: Vec::new(), clipped: Vec::new(), cut_vertically: Vec::new(), offscreen: Vec::new(), tiny: Vec::new(), smallest_font_pt: f32::MAX, id_clashes };
     for (i, a) in ts.iter().enumerate() {
         r.smallest_font_pt = r.smallest_font_pt.min(a.font_pt);
         if compact && a.font_pt < MIN_READABLE_PT { r.tiny.push(a.clone()); }
@@ -191,6 +213,33 @@ pub fn probe(size: egui::Vec2, frames: usize, compact: bool, mut draw: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TWO WIDGETS, ONE ID. For a TextEdit that means one text cursor between them: typing
+    /// into either moves the caret in the other, and keystrokes land in whichever egui
+    /// thinks is current — which reads as "I can only get one character into this box".
+    /// egui paints a warning; the probe reads it back so a page test can fail on it.
+    #[test]
+    fn two_widgets_sharing_an_id_are_reported() {
+        let clash = probe(egui::vec2(400.0, 300.0), 2, false, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut a = String::new();
+                let mut b = String::new();
+                ui.add(egui::TextEdit::singleline(&mut a).id_salt("same"));
+                ui.add(egui::TextEdit::singleline(&mut b).id_salt("same"));
+            });
+        });
+        assert!(!clash.id_clashes.is_empty(), "a shared id was not reported: {}", clash.describe());
+        assert!(!clash.clean());
+        let ok = probe(egui::vec2(400.0, 300.0), 2, false, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut a = String::new();
+                let mut b = String::new();
+                ui.add(egui::TextEdit::singleline(&mut a).id_salt("one"));
+                ui.add(egui::TextEdit::singleline(&mut b).id_salt("two"));
+            });
+        });
+        assert!(ok.id_clashes.is_empty(), "{}", ok.describe());
+    }
 
     #[test]
     fn a_tidy_frame_is_clean_and_a_collision_is_named() {
