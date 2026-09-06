@@ -112,6 +112,11 @@ pub trait Backend: Send + Sync {
 /// see and change what the editor asks for.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineConfig {
+    /// The process's GPU governor, if the host has one, and this
+    /// engine's tier on it. With `None` the engine submits unpaced,
+    /// which is right for a CLI and wrong for a game.
+    pub governor: Option<crate::governor::Handle>,
+    pub tier: crate::governor::Tier,
     /// Path to the GGUF. Loaded once, at [`LocalEngine::load`].
     pub model_path: String,
     /// Tokens to generate per completion.
@@ -145,6 +150,8 @@ impl Default for EngineConfig {
             repeat_penalty: 1.15,
             repeat_last_n: 64,
             instruction: "Continue the code exactly from where it stops. Output only the continuation, no prose, no backticks.".into(),
+            governor: None,
+            tier: crate::governor::Tier::Interactive,
         }
     }
 }
@@ -378,6 +385,10 @@ impl Provider for EngineProvider {
 // wants the trait and the prompt shaping) does not build wgpu. The default
 // is OFF for exactly the reason aperture-complete has no dependencies at
 // all: the fast loop stays fast.
+/// GPU sharing between engines and the renderer: frame-granted slots.
+/// Pure, so it is present with or without the gpu feature.
+pub mod governor;
+
 #[cfg(feature = "gpu")]
 mod gpu {
     use super::{Backend, EngineConfig};
@@ -403,6 +414,10 @@ mod gpu {
         /// The last prefix prefilled, kept so the next turn with the
         /// same one pays only for its suffix.
         prefix: std::sync::Mutex<Option<PrefixKv>>,
+        /// Pacing against the renderer. Acquired before every decode
+        /// step -- the one seam between submissions that is ours.
+        governor: Option<crate::governor::Handle>,
+        tier: crate::governor::Tier,
     }
 
     impl GpuBackend {
@@ -469,7 +484,8 @@ mod gpu {
                 repeat_last_n: cfg.repeat_last_n,
                 min_p: 0.0,
             };
-            Ok(GpuBackend { gpu, model, tok, eos, adapter, sampler, prefix: std::sync::Mutex::new(None) })
+            Ok(GpuBackend { gpu, model, tok, eos, adapter, sampler, prefix: std::sync::Mutex::new(None),
+                            governor: cfg.governor.clone(), tier: cfg.tier })
         }
     }
 
@@ -505,10 +521,15 @@ mod gpu {
             let p = slot.as_ref().expect("just filled");
             let mut rng = 0xC0FFEE_u64;
             let mut out: Vec<u32> = Vec::new();
+            // The prefill is one submission; the governor gates each
+            // decode step after it. A frame with no headroom stalls the
+            // model, never the other way round.
+            if let Some(g) = &self.governor { g.acquire(self.tier); }
+            let (gov, tier) = (self.governor.clone(), self.tier);
             self.gpu.generate_kv_stream_from(
                 &self.model, &p.cache, p.len, &suffix_ids, max_tokens, self.eos,
                 &self.sampler, &mut rng, &|| false,
-                |t| { out.push(t); true });
+                |t| { out.push(t); if let Some(g) = &gov { g.acquire(tier); } true });
             Ok(self.tok.decode(&out))
         }
 
@@ -516,6 +537,8 @@ mod gpu {
             let ids = self.tok.encode(prompt);
             let mut rng = 0xC0FFEE_u64;
             let mut out: Vec<u32> = Vec::new();
+            if let Some(g) = &self.governor { g.acquire(self.tier); }
+            let (gov, tier) = (self.governor.clone(), self.tier);
             self.gpu.generate_kv_stream(
                 &self.model,
                 &ids,
@@ -526,6 +549,7 @@ mod gpu {
                 &|| false,
                 |t| {
                     out.push(t);
+                    if let Some(g) = &gov { g.acquire(tier); }
                     true
                 },
             );

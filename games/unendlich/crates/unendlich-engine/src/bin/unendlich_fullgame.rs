@@ -4483,6 +4483,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // goes into the flora store and the lifecycle takes over.
             let planted = paintbrush.drain_plants(&mut session.flora, frame_count);
             if planted > 0 { log::info!("[paintbrush] {planted} plant(s) handed to the flora store"); }
+            // GPU pacing: the in-instance model may submit only the decode
+            // steps this frame's headroom allows. A late frame stalls
+            // generation, never the other way round.
+            paintbrush.frame_gpu(hive_last_frame_ms);
             // THE QUEEN'S FRAME. Committed changes are applied here, a
             // chunk at a time, within a budget that adapts to how long
             // the last frame took. Nearest the player first; what you

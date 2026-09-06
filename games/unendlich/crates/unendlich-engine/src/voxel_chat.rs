@@ -329,10 +329,23 @@ impl voxel_tools::llm::Completer for EngineCompleter {
 /// happens ONCE and the handle is cloned per request. Held here rather
 /// than in the bin so `/provider engine` and `/model` can cooperate.
 #[cfg(feature = "ai-engine")]
-#[derive(Default)]
 pub struct ResidentEngine {
     handle: Option<std::sync::Arc<dyn aperture_engine::Backend>>,
     loaded_path: String,
+    /// The process's GPU governor. Every engine in this process paces
+    /// on it; the frame loop refills it. The game's build model is
+    /// Tier::Background: it takes only the slots an interactive engine
+    /// and the renderer leave.
+    pub governor: aperture_engine::governor::Handle,
+}
+
+#[cfg(feature = "ai-engine")]
+impl Default for ResidentEngine {
+    fn default() -> Self {
+        Self { handle: None, loaded_path: String::new(),
+               governor: aperture_engine::governor::Handle(std::sync::Arc::new(
+                   aperture_engine::governor::Governor::default())) }
+    }
 }
 
 #[cfg(feature = "ai-engine")]
@@ -362,6 +375,10 @@ impl ResidentEngine {
                 repeat_penalty: 1.15,
                 repeat_last_n: 64,
                 instruction: String::new(),
+                // Paced by the game's governor, as a BACKGROUND engine:
+                // the renderer and any interactive engine come first.
+                governor: Some(self.governor.clone()),
+                tier: aperture_engine::governor::Tier::Background,
             };
             let engine = aperture_engine::LocalEngine::load(cfg)?;
             let h = engine.handle();
@@ -1196,6 +1213,16 @@ impl Paintbrush {
         if !deferred.is_empty() { self.session.deferred.cells.extend(deferred); }
         if t.cells > 0 { self.session.invalidate_context(); }
         t
+    }
+
+    /// The frame loop's call for GPU pacing: refill the governor's
+    /// slots from the previous frame's time. Cheap; call every frame
+    /// beside `tick_hive`. A no-op without the in-instance engine.
+    pub fn frame_gpu(&self, last_frame_ms: f32) {
+        #[cfg(feature = "ai-engine")]
+        if let Ok(e) = self.engine.lock() { e.governor.frame(last_frame_ms); }
+        #[cfg(not(feature = "ai-engine"))]
+        let _ = last_frame_ms;
     }
 
     /// Hand committed plant requests to the flora store. Called by the
