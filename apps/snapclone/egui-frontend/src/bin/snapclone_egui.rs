@@ -321,6 +321,12 @@ impl App {
             snapclone_egui::camera_enumerate::enumerate()
         };
         snap.apply(HostEvent::CamerasFound(cameras));
+        // SNAPCLONE_BG=aurora|waves|starfield|gradient|bokeh: pick the live
+        // background at launch, for looking at each one under a display
+        // without walking to Settings every time.
+        if let Ok(b) = std::env::var("SNAPCLONE_BG") {
+            snap.bg.style = uikit_egui::BgStyle::parse(&b);
+        }
         let port = snap.settings.current.network.gossip_port;
         let gossip = match snapclone_egui::gossip_wire::GossipSocket::bind(port) {
             Ok(s) => Some(s),

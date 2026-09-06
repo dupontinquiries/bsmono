@@ -3617,12 +3617,21 @@ impl Snapclone {
             for (i, blob) in self.blobs.blobs().iter().enumerate() {
                 let (fx, fy) = blob.centre();
                 let p = if i % 2 == 0 { a } else { b };
-                let alpha = (blob.opacity() * 90.0).clamp(0.0, 255.0) as u8;
-                ui.painter().circle_filled(
+                // FEATHERED, and under the kit's readability cap. These were
+                // hard-edged discs at alpha 90 — the Qt blobs are blurred
+                // — and they were the "corny" in the first screenshots. The
+                // kit's soft_disc is the glass buttons' off-centre highlight
+                // at page scale; MAX_LIFT is the cap every live background
+                // keeps, so text over the ambient field stays text.
+                let alpha = (blob.opacity() * uikit_egui::livebg::MAX_LIFT as f32 * 0.8)
+                    .clamp(0.0, uikit_egui::livebg::MAX_LIFT as f32) as u8;
+                uikit_egui::livebg::soft_disc(
+                    ui.painter(),
                     egui::pos2(area.left() + fx * area.width(),
                                area.top() + fy * area.height()),
-                    blob.radius(side),
-                    egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], alpha));
+                    blob.radius(side) * 1.6,
+                    egui::Color32::from_rgb(p[0], p[1], p[2]),
+                    alpha);
             }
         }
         // The REAL viewfinder, not a labelled rectangle. Tap-to-focus, the
