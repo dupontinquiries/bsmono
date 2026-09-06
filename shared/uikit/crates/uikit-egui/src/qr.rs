@@ -206,13 +206,37 @@ pub const REVEAL_LEAD_S: f64 = 0.12;
 /// The whole reveal, first eye to last dot.
 pub const REVEAL_TOTAL_S: f64 = REVEAL_LEAD_S + REVEAL_SPREAD_S + REVEAL_ELEMENT_S;
 
-/// The offset of a data element at (`x`,`y`) — a hash of its place, spread over the window.
-/// Elements near the eyes come early and the far corner late, with jitter, so the reveal
-/// has a direction without being a wipe.
+/// The offset of a data element at (`x`,`y`): its place on a FRACTAL guide.
+///
+/// A hash gave every element a different offset but clumped them — three neighbours in a
+/// row would come in together and a corner would wait. This orders the grid by the
+/// bit-reversed Morton (Z-order) index of the cell: the first elements to appear are one
+/// per quadrant, then one per sub-quadrant, then finer, so at every moment of the reveal
+/// what is on screen is an even sample of the whole code — the quadtree filling in level by
+/// level, the way a progressive image loads. Every cell has its own index, so no two
+/// elements share an offset, and the same cell always gets the same one.
 pub fn reveal_delay(x: usize, y: usize) -> f64 {
-    let h = ((x as f32 * 12.9898 + y as f32 * 78.233).sin() * 43758.547).fract().abs() as f64;
-    let dist = ((x * x + y * y) as f64).sqrt() / ((MODULES * MODULES * 2) as f64).sqrt();
-    REVEAL_LEAD_S + REVEAL_SPREAD_S * (0.55 * dist + 0.45 * h).min(1.0)
+    let m = morton(x as u32, y as u32); // 10 bits: 5 per axis, covering 0..32
+    let rev = reverse_bits(m, 10);
+    REVEAL_LEAD_S + REVEAL_SPREAD_S * (rev as f64 / 1023.0)
+}
+
+/// Interleave the low 5 bits of `x` and `y` (x in the even bits).
+fn morton(x: u32, y: u32) -> u32 {
+    let mut m = 0;
+    for b in 0..5 {
+        m |= ((x >> b) & 1) << (2 * b);
+        m |= ((y >> b) & 1) << (2 * b + 1);
+    }
+    m
+}
+
+fn reverse_bits(v: u32, bits: u32) -> u32 {
+    let mut r = 0;
+    for b in 0..bits {
+        r |= ((v >> b) & 1) << (bits - 1 - b);
+    }
+    r
 }
 
 /// The offset of eye `i` (0..3): they lead.
@@ -285,8 +309,9 @@ pub fn paint(painter: &egui::Painter, rect: Rect, layout: &Layout, pixels_per_po
         painter.rect_filled(sq(5.0), CornerRadius::same((cell * 1.0 * k) as u8), faded(bg, p));
         painter.rect_filled(sq(3.0), CornerRadius::same((cell * 0.8 * k) as u8), faded(fg, p));
     }
-    // data + timing modules: dots, with horizontal runs joined into pills. A pill grows from
-    // its left end as it fades in — the "line drawing itself" of the SVG version.
+    // data + timing modules: dots, with horizontal runs joined into pills. A pill grows
+    // from its CENTRE outward as it fades in, a dot from its centre — the appearance is
+    // centred, not a stroke from the left. The offset is the run's centre cell's.
     let r = cell * 0.44;
     for y in 0..MODULES {
         let mut x = 0;
@@ -299,17 +324,20 @@ pub fn paint(painter: &egui::Painter, rect: Rect, layout: &Layout, pixels_per_po
             while x + 1 < MODULES && layout.get(x + 1, y) && !in_finder(x + 1, y) {
                 x += 1;
             }
-            let p = progress(reveal_delay(start, y));
+            let p = progress(reveal_delay((start + x) / 2, y));
             if p > 0.0 {
                 let col = faded(fg, p);
-                let a = at(start, y) + egui::vec2(cell * 0.5, cell * 0.5);
+                let a_full = at(start, y) + egui::vec2(cell * 0.5, cell * 0.5);
                 let b_full = at(x, y) + egui::vec2(cell * 0.5, cell * 0.5);
-                let b = a + (b_full - a) * p;
+                let mid = (a_full + b_full.to_vec2()) * 0.5;
                 if start == x {
-                    painter.circle_filled(a, r * (0.6 + 0.4 * p), col);
+                    painter.circle_filled(a_full, r * (0.5 + 0.5 * p), col);
                 } else {
-                    let pill = Rect::from_two_pos(a - egui::vec2(r, r), b + egui::vec2(r, r));
-                    painter.rect_filled(pill, CornerRadius::same(r as u8), col);
+                    let a = mid + (a_full - mid) * p;
+                    let b = mid + (b_full - mid) * p;
+                    let rr = r * (0.5 + 0.5 * p);
+                    let pill = Rect::from_two_pos(a - egui::vec2(rr, rr), b + egui::vec2(rr, rr));
+                    painter.rect_filled(pill, CornerRadius::same(rr as u8), col);
                 }
             }
             x += 1;
@@ -359,13 +387,16 @@ pub fn svg(layout: &Layout, side: f32, fg: Color32, bg: Color32) -> String {
             while x + 1 < MODULES && layout.get(x + 1, y) && !in_finder(x + 1, y) {
                 x += 1;
             }
-            let d = reveal_delay(start, y);
+            let d = reveal_delay((start + x) / 2, y);
             let (ax, ay) = at(start, y);
-            let (cx, cy) = (ax + cell * 0.5, ay + cell * 0.5);
+            let (cy, ) = (ay + cell * 0.5,);
             let w_full = (x - start) as f32 * cell + 2.0 * r;
+            let x_left = ax + cell * 0.5 - r;
+            let x_mid = x_left + w_full * 0.5;
+            // grows from its centre: x slides left as width grows, so the middle stays put
             out.push_str(&format!(
-                "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" rx=\"{r:.2}\" fill=\"{fg_s}\" opacity=\"0\"><animate attributeName=\"opacity\" from=\"0\" to=\"1\" begin=\"{d:.3}s\" dur=\"{dur:.2}s\" fill=\"freeze\"/><animate attributeName=\"width\" from=\"{:.2}\" to=\"{w_full:.2}\" begin=\"{d:.3}s\" dur=\"{dur:.2}s\" fill=\"freeze\"/></rect>\n",
-                cx - r, cy - r, w_full, 2.0 * r, 2.0 * r
+                "<rect x=\"{x_left:.2}\" y=\"{:.2}\" width=\"{w_full:.2}\" height=\"{:.2}\" rx=\"{r:.2}\" fill=\"{fg_s}\" opacity=\"0\"><animate attributeName=\"opacity\" from=\"0\" to=\"1\" begin=\"{d:.3}s\" dur=\"{dur:.2}s\" fill=\"freeze\"/><animate attributeName=\"x\" from=\"{x_mid:.2}\" to=\"{x_left:.2}\" begin=\"{d:.3}s\" dur=\"{dur:.2}s\" fill=\"freeze\"/><animate attributeName=\"width\" from=\"0\" to=\"{w_full:.2}\" begin=\"{d:.3}s\" dur=\"{dur:.2}s\" fill=\"freeze\"/></rect>\n",
+                cy - r, 2.0 * r
             ));
             x += 1;
         }
@@ -551,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn the_reveal_leads_with_the_eyes_spreads_the_rest_and_settles_in_about_a_second() {
+    fn the_reveal_leads_with_the_eyes_and_every_cell_has_its_own_offset_by_the_total() {
         assert!(eye_delay(0) < eye_delay(2) && eye_delay(2) < reveal_delay(8, 8), "eyes first");
         let mut delays: Vec<f64> = Vec::new();
         for y in 0..MODULES {
@@ -559,17 +590,43 @@ mod tests {
                 delays.push(reveal_delay(x, y));
             }
         }
-        let (lo, hi) = delays.iter().fold((f64::MAX, f64::MIN), |(l, h), d| (l.min(*d), h.max(*d)));
-        assert!(hi - lo > 0.4, "the offsets spread ({lo:.2}..{hi:.2}), not a pop");
+        let hi = delays.iter().cloned().fold(f64::MIN, f64::max);
         assert!(hi + REVEAL_ELEMENT_S <= REVEAL_TOTAL_S + 1e-9, "everything is in by the total");
-        assert_eq!(reveal_delay(3, 9), reveal_delay(3, 9), "deterministic: the same code draws the same way");
-        let mut distinct: Vec<i64> = delays.iter().map(|d| (d * 1000.0) as i64).collect();
+        let mut distinct: Vec<i64> = delays.iter().map(|d| (d * 1e6) as i64).collect();
         distinct.sort_unstable();
         distinct.dedup();
-        assert!(distinct.len() > 200, "{} distinct offsets — they are unique enough", distinct.len());
+        assert_eq!(distinct.len(), MODULES * MODULES, "no two cells share an offset");
+        assert_eq!(reveal_delay(3, 9), reveal_delay(3, 9), "deterministic");
         assert_eq!(reveal_progress(0.0, 0.5), 0.0);
         assert!((reveal_progress(0.5 + REVEAL_ELEMENT_S, 0.5) - 1.0).abs() < 1e-6);
         assert!(reveal_progress(0.5 + REVEAL_ELEMENT_S * 0.5, 0.5) > 0.8, "ease-out: most of the way early");
+    }
+
+    /// THE FRACTAL GUIDE. At any moment the cells already started are an even sample of the
+    /// grid: the earliest tenth lands in every quadrant in near-equal numbers, and so does
+    /// the earliest quarter — the quadtree filling in level by level, not a hash's clumps.
+    #[test]
+    fn the_earliest_cells_are_an_even_sample_of_every_quadrant() {
+        let mut cells: Vec<(usize, usize, f64)> = Vec::new();
+        for y in 0..MODULES {
+            for x in 0..MODULES {
+                cells.push((x, y, reveal_delay(x, y)));
+            }
+        }
+        cells.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+        for frac in [0.10f32, 0.25, 0.5] {
+            let n = (cells.len() as f32 * frac) as usize;
+            let mut quad = [0usize; 4];
+            for (x, y, _) in &cells[..n] {
+                quad[(*x >= 11) as usize + 2 * (*y >= 11) as usize] += 1;
+            }
+            let (lo, hi) = (*quad.iter().min().unwrap(), *quad.iter().max().unwrap());
+            assert!(hi - lo <= n / 8 + 2, "first {frac}: quadrants {quad:?} — not even");
+        }
+        // the very first few are far apart: the coarsest level of the tree
+        let (x0, y0, _) = cells[0];
+        let (x1, y1, _) = cells[1];
+        assert!((x0 as i64 - x1 as i64).abs() + (y0 as i64 - y1 as i64).abs() >= 8, "the first two cells are not neighbours");
     }
 
     #[test]
@@ -580,7 +637,7 @@ mod tests {
         assert_eq!(s.matches("<g opacity=\"0\">").count(), 3, "three eyes");
         let animates = s.matches("<animate ").count();
         let pills = s.matches("<rect ").count() - 1 - 9; // minus the card and the eyes' nine rects
-        assert_eq!(animates, 3 + 2 * pills, "every pill animates opacity and width; every eye its opacity");
+        assert_eq!(animates, 3 + 3 * pills, "every pill animates opacity, x and width (it grows from its centre); every eye its opacity");
         assert!(s.contains("fill=\"#e6e1d7\"") && s.contains("fill=\"#1c1b19\""));
         let begins: std::collections::HashSet<&str> = s.split("begin=\"").skip(1).map(|t| t.split('s').next().unwrap()).collect();
         assert!(begins.len() > 40, "{} distinct begin offsets", begins.len());
