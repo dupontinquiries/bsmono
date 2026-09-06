@@ -5778,6 +5778,13 @@ mod tests {
                         "{label}/{}: {} overlaps (≤{max_overlaps}), {} clipped (≤{max_clipped}):\n{}",
                         PAGES[page], r.overlaps.len(), r.clipped.len(), r.describe());
                 assert!(r.tiny.is_empty() && r.offscreen.is_empty(), "{label}/{}:\n{}", PAGES[page], r.describe());
+                // TWO WIDGETS ON ONE ID. They share their state, and for a TextEdit that
+                // includes the text cursor — typing into either moves the caret in the
+                // other and keystrokes land in whichever egui thinks is current, which
+                // reads as "only one character goes into this box". The desktop layout
+                // draws several pages at once, which is exactly when a fixed `id_salt`
+                // collides, so this belongs on the page probe rather than in a unit test.
+                assert!(r.id_clashes.is_empty(), "{label}/{}:\n{}", PAGES[page], r.describe());
             }
         }
     }

@@ -214,8 +214,76 @@ async fn radio_loop(
                     });
                 }
                 Command::Unpair(id) => {
-                    store.forget(&id);
-                    let _ = ev_tx.send(Event::Unpaired { id });
+                    // TELL THE ACCESSORY FIRST. Deleting the record alone left the plug
+                    // paired to a controller that no longer exists: still claimed, still
+                    // refusing pair-setup, and only a factory reset gets it back — the
+                    // exact cost HOMEKIT.md's dialog warns about, arrived at by pressing
+                    // a button labelled "forget this pairing".
+                    //
+                    // A failure here leaves BOTH sides paired, which the user can retry
+                    // from; the other order cannot be recovered from at all.
+                    let told = match store.load(&id) {
+                        Some(pairing) => match find(&central, &id).await {
+                            Ok(p) => crate::hap::remove_pairing(p, pairing).await,
+                            Err(e) => Err(e),
+                        },
+                        // No record: nothing to tell it, and forgetting is a no-op that
+                        // should still leave the row unpaired.
+                        None => Ok(Vec::new()),
+                    };
+                    match told {
+                        Ok(trace) => {
+                            for l in trace { let _ = ev_tx.send(Event::Failed { id: None, message: format!("hap {l}") }); }
+                            store.forget(&id);
+                            let _ = ev_tx.send(Event::Unpaired { id });
+                        }
+                        Err(message) => {
+                            // The record is KEPT. Saying "unpaired" here would lose the
+                            // only keys that can undo the pairing.
+                            let _ = ev_tx.send(Event::Failed {
+                                id: Some(id),
+                                message: format!("{message} — the pairing was kept; the accessory still holds it"),
+                            });
+                        }
+                    }
+                }
+                // ONE SESSION, three answers: what it is, whether it is on, whether
+                // anything is plugged in. See `hap::inspect` — each pair-verify is a
+                // Curve25519 exchange and two signature round trips over BLE, so asking
+                // separately turns opening a row into four handshakes.
+                Command::Inspect(id) => {
+                    let r = match (store.load(&id), find(&central, &id).await) {
+                        (Some(pairing), Ok(p)) => crate::hap::inspect(p, pairing).await,
+                        (None, _) => Err("no pairing for this accessory".to_string()),
+                        (_, Err(e)) => Err(e),
+                    };
+                    match r {
+                        Ok((caps, power, in_use, trace)) => {
+                            for l in trace { let _ = ev_tx.send(Event::Failed { id: None, message: format!("hap {l}") }); }
+                            let _ = ev_tx.send(Event::Abilities {
+                                id: id.clone(),
+                                describes: caps.describe(),
+                                can_identify: caps.identifiable(),
+                                in_use,
+                            });
+                            // The state came free with the same session; sending it means
+                            // the row does not need a second round trip to stop saying "—".
+                            if power != Power::Unknown {
+                                let _ = ev_tx.send(Event::PowerIs { id, power });
+                            }
+                        }
+                        Err(message) => { let _ = ev_tx.send(Event::Failed { id: Some(id), message }); }
+                    }
+                }
+                Command::Identify(id) => {
+                    let r = match (store.load(&id), find(&central, &id).await) {
+                        (Some(pairing), Ok(p)) => crate::hap::identify(p, pairing).await,
+                        (None, _) => Err("no pairing for this accessory".to_string()),
+                        (_, Err(e)) => Err(e),
+                    };
+                    if let Err(message) = r {
+                        let _ = ev_tx.send(Event::Failed { id: Some(id), message });
+                    }
                 }
             }
         }

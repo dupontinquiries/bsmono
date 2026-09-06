@@ -103,6 +103,19 @@ pub struct CmdSheet {
     pub open: bool,
     /// Ranked history, newest-relevant first.
     pub hits: Vec<RecallHit>,
+    /// What to rank against. Empty is the plain history the sheet opens on; anything else
+    /// runs `recall`'s real scoring — command, then cwd, then output, success-weighted.
+    ///
+    /// This is the half of `recall` that had never run. The sheet opened with `recall("",
+    /// …)`, so ten tests' worth of meaning-ranking — the whole pitch against Ctrl-R —
+    /// scored nothing in the app. `TODO_recall.md` step 2, "query entry".
+    pub query: String,
+    /// Set when the query changed this frame, so the shell re-ranks rather than the sheet
+    /// holding the corpus. The sheet does not own the blocks; the shell does.
+    pub query_dirty: bool,
+    /// True when the sheet should take keyboard focus for the field — after opening from
+    /// a spoken "how did I…", where the person's hands are nowhere near.
+    pub focus_query: bool,
     /// The card currently under a finger.
     pub drag: Option<Drag>,
     /// Commands already starred, so the sheet can mark them rather than
@@ -111,11 +124,28 @@ pub struct CmdSheet {
 }
 
 impl CmdSheet {
-    /// Open with a freshly ranked history.
+    /// Open with a freshly ranked history and no query.
     pub fn open_with(&mut self, hits: Vec<RecallHit>) {
+        self.query.clear();
+        self.query_dirty = false;
+        self.focus_query = false;
         self.hits = hits;
         self.drag = None;
         self.open = true;
+    }
+
+    /// Open already asking something — "how did I fix the nginx config" arrives as a
+    /// query, not as a history to scroll. `hits` is the shell's ranking FOR that query.
+    pub fn open_asking(&mut self, query: &str, hits: Vec<RecallHit>) {
+        self.open_with(hits);
+        self.query = query.to_string();
+        self.focus_query = true;
+    }
+
+    /// The shell answered a re-rank.
+    pub fn set_hits(&mut self, hits: Vec<RecallHit>) {
+        self.hits = hits;
+        self.query_dirty = false;
     }
 
     pub fn close(&mut self) {
@@ -145,13 +175,41 @@ pub fn cmd_sheet_ui(
     let mut act = None;
 
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("recent commands").strong());
+        ui.label(egui::RichText::new(if s.query.trim().is_empty() { "recent commands" } else { "what did I do" }).strong());
         if ui.button("close").clicked() { act = Some(SheetAction::Dismiss); }
     });
+    // THE QUERY. `recall` ranks by command, cwd and output and prefers what succeeded;
+    // with no way to type a query none of that ever ran. Escape clears it rather than
+    // closing the sheet — a query is the thing you back out of first.
+    let field = ui.add(
+        egui::TextEdit::singleline(&mut s.query)
+            .id_salt("cmd_sheet-query")
+            .hint_text("how did I… / the command that…")
+            .desired_width(f32::INFINITY),
+    );
+    if std::mem::take(&mut s.focus_query) {
+        field.request_focus();
+    }
+    if field.changed() {
+        s.query_dirty = true;
+    }
+    if field.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) && !s.query.is_empty() {
+        s.query.clear();
+        s.query_dirty = true;
+    }
     if s.hits.is_empty() {
         // Said rather than shown as an empty sheet: a blank panel reads as a
-        // sheet that failed to load its contents.
-        ui.label(egui::RichText::new("no history yet").small().weak());
+        // sheet that failed to load its contents. Which nothing it is depends on the
+        // query: "no history yet" for an empty session is not "nothing matched".
+        ui.label(
+            egui::RichText::new(if s.query.trim().is_empty() {
+                "no history yet".to_string()
+            } else {
+                format!("nothing matches \u{201c}{}\u{201d}", s.query.trim())
+            })
+            .small()
+            .weak(),
+        );
         return act;
     }
     ui.label(egui::RichText::new("tap to place on the input line · drag up to star")

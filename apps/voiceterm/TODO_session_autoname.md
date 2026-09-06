@@ -91,3 +91,41 @@ can't spare keystrokes for.
 The sessions page (web2qml://sessions) now appends a "Task clusters" section:
 each discovered command group with its label, size, and example commands
 (_cluster_markdown). The R5 work is now visible end-to-end.
+
+## DONE in the egui port — the name is on screen, and one naming bug fixed
+
+The egui frontend never referenced `session_auto` at all: `grep` found
+nothing, so the segmenter, the namer and the proposals were carried
+across and none of their output was.
+
+- `session_name.rs` ports the Qt `_activities_from_blocks` derivation out
+  of its QObject method into a free function over `(command, cwd)` pairs,
+  where it can be tested — it never had a test. Improved on the way:
+  `sudo make install` and `RUST_LOG=debug cargo test` are a Build (the Qt
+  version reads word 0 flat and calls both a Run), a path-qualified
+  editor is still that editor, and an editor's file is the first non-flag
+  argument. Floor of two activities: `cd ~` is not a session about `~`.
+- The name is appended to the LOCATOR line, beside where you are:
+  "1/2 main · dcp · tracer.py". Recomputed when a command finishes, not
+  every frame — the derivation walks every block and the locator draws
+  constantly.
+- BUG FIXED in the shared `name_segment`: it took the repo from the FIRST
+  activity's cwd, and the first activity in a session is the `cd` INTO
+  the work, run from wherever you were. On this module's own quoted
+  stream (`cd asahi/dcp; hx tracer.py; …`) that named the session after
+  the directory it left — the doc's own example output, "me · tracer.py",
+  shows the same artifact. It uses the DOMINANT cwd now, ties to the
+  earlier one so the name is stable.
+
+STILL OPEN: step 1's "cwd from prompt". This frontend's block tracker only
+learns a cwd from `set_cwd`, so the repo half of the name is whatever was
+last set rather than where the command actually ran. The file half works
+regardless. Steps 2–4 (proposals via the assist bubble, accept actions,
+segmentation tuning) are untouched.
+
+### Aside, found while walking this under Xvfb
+A scripted `touch tracer.py` followed by another command produced ONE
+merged block. Not a tracker bug: `touch` is on `cmd_risk::MUTATING`, so
+the Enter was withheld for the confirm dialog and the automation typed
+straight past it. The gate working as designed — recorded here because it
+looks exactly like a lost keystroke.

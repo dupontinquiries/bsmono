@@ -315,7 +315,11 @@ impl App {
         self.backend.submit(Command::Pair { id: id.clone(), setup_code: setup_code.to_string() });
     }
 
+    /// Unpair: the accessory is told first and the local record deleted only if it
+    /// answered (see `ble.rs`). Marked pending because it is now a radio round trip, not
+    /// a file delete — the row should not look idle while a handshake is in flight.
     pub fn unpair(&mut self, id: &DeviceId) {
+        self.hub.mark_pending(id);
         self.backend.submit(Command::Unpair(id.clone()));
     }
 
@@ -356,6 +360,20 @@ impl App {
     pub fn refresh(&mut self, id: &DeviceId) {
         self.hub.mark_pending(id);
         self.backend.submit(Command::Refresh(id.clone()));
+    }
+
+    /// Ask a paired accessory what it is. One round trip that answers "outlet or switch",
+    /// "can it blink", and "is anything plugged in" — see `hap::inspect` for why they go
+    /// together rather than one question per connection.
+    pub fn inspect(&mut self, id: &DeviceId) {
+        self.hub.mark_pending(id);
+        self.backend.submit(Command::Inspect(id.clone()));
+    }
+
+    /// "Which one are you." Not marked pending: the accessory blinks, nothing about the
+    /// row changes, and a spinner over a row whose state is unaffected reads as a hang.
+    pub fn identify(&mut self, id: &DeviceId) {
+        self.backend.submit(Command::Identify(id.clone()));
     }
 }
 

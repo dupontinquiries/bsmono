@@ -87,3 +87,35 @@ Scoped next step, if picked up: a real identity-generation module
 own `sc-eed906fa` identity.conf pattern) is the actual prerequisite —
 not a bigger version of the panel wiring, a different, smaller,
 separable piece of work that the panel then consumes.
+
+## DONE: the prerequisite, and the panel now opens
+
+`egui-frontend/src/identity.rs` is that module, built on snapclone's
+pattern: an Ed25519 keypair from `crypto_kit` minted once and persisted
+as `identity.conf` (chmod 0600 after the write), a `vt-xxxxxxxx`
+fingerprint derived from the public key, an editable handle defaulting
+to it, and an order-independent workspace digest over the deck's notes.
+Parsing refuses a file whose id does not match its own key — a
+hand-edited identity is not one of ours. The secret never appears in a
+Debug line. `Loaded::Unavailable` when the system has no randomness (a
+one-byte /dev/urandom canary before `crypto_kit`, whose `OsRng` panics
+rather than erring). 8 tests.
+
+The palette's "Pair with a nearby device…" (`Command::PeerHandshake`,
+also by voice: "pair with a nearby device", "start a handshake") opens
+`peer_panel` with those REAL values and the deck's digest. With no
+identity it warns instead of opening — the original reason for leaving
+the panel unreachable, kept.
+
+Seen under Xvfb: the panel with `you vt-4e4b441a · 4e4b441a`, the
+workspace digest, "no voice profile enrolled — you cannot offer voice
+verification", and dial/listen; `identity.conf` at 0600; the same id
+after a restart, loaded rather than re-minted.
+
+STILL OPEN, unchanged: the acoustic transport. `dial` and `listen`
+advance the state machine, but `audio_dialup`'s symbols never reach a
+speaker or a microphone — this build has no live audio pipeline (the
+same gap noted for `voice_routing` and `acoustic_cache`). The next
+piece is that pipeline, not more panel. And question A–D above is still
+unanswered: this work is the prerequisite for whichever it turns out to
+be, since all of A, B and C need a device identity first.

@@ -892,7 +892,10 @@ pub fn expanded_ui_with(ctx: &egui::Context, state: &mut Option<Expanded>, id: &
             }
         }
     });
-    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    // CONSUMED, not merely read: the expanded code sits over a terminal, and an Escape that
+    // closes it and ALSO reaches the pty types `^[` at the shell. `consume_key` takes it
+    // off the event list for everyone below. Seen under Xvfb in voiceterm.
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
         close = true;
     }
     if close {

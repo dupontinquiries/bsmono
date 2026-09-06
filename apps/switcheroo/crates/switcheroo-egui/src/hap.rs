@@ -31,7 +31,7 @@
 use btleplug::api::{Characteristic, Peripheral as _, WriteType};
 use btleplug::platform::Peripheral;
 use hap_core::ble::{characteristic as ch, hap_uuid};
-use hap_core::{Controller, Pairing, Transport, TransportError};
+use hap_core::{Capabilities, Controller, Pairing, Transport, TransportError};
 use std::path::PathBuf;
 use switcheroo_core::{DeviceId, Power};
 use tokio::runtime::Handle;
@@ -203,6 +203,67 @@ pub async fn set_power(p: Peripheral, pairing: Pairing, on: bool) -> Result<Vec<
         c.set_on(on).map_err(|e| e.to_string())?;
         Ok(std::mem::take(&mut c.trace))
     }).await.map_err(|e| format!("write task: {e}"))?
+}
+
+/// Verify, then ask the accessory what it has and read the outlet's live state in one
+/// session: the capabilities, whether it is on, and whether anything is plugged in.
+///
+/// One session for all three because each `pair_verify` is a Curve25519 exchange and two
+/// signature round trips over BLE — doing it per question turns opening a row into four
+/// handshakes. The whole thing is one blocking task so the session never crosses an await.
+pub async fn inspect(p: Peripheral, pairing: Pairing) -> Result<(Capabilities, Power, Option<bool>, Vec<String>), String> {
+    let mut t = transport(p).await?;
+    tokio::task::spawn_blocking(move || {
+        let mut c = Controller::new(&mut t);
+        c.pair_verify(&pairing).map_err(|e| e.to_string())?;
+        let caps = c.probe().map_err(|e| e.to_string())?;
+        // Only read what the accessory said it has. Reading On from something whose
+        // signature does not list it is a round trip that can only fail.
+        let power = if caps.get(hap_core::ble::characteristic::ON).is_some_and(|s| s.readable()) {
+            match c.get_on().map_err(|e| e.to_string())? {
+                true => Power::On,
+                false => Power::Off,
+            }
+        } else {
+            Power::Unknown
+        };
+        let in_use = if caps.reports_load() { Some(c.outlet_in_use().map_err(|e| e.to_string())?) } else { None };
+        Ok((caps, power, in_use, std::mem::take(&mut c.trace)))
+    })
+    .await
+    .map_err(|e| format!("inspect task: {e}"))?
+}
+
+/// Tell the accessory to forget us, then report whether it did.
+///
+/// The caller deletes the local record AFTER this returns, and the order is the whole
+/// point: with the record gone first, a radio failure leaves the controller without the
+/// keys to ask again and the accessory claimed by a pairing nobody holds — recoverable
+/// only by the factory reset the pairing dialog warns about. In this order a failure
+/// leaves both sides paired, which is a state the user can retry from.
+pub async fn remove_pairing(p: Peripheral, pairing: Pairing) -> Result<Vec<String>, String> {
+    let mut t = transport(p).await?;
+    tokio::task::spawn_blocking(move || {
+        let mut c = Controller::new(&mut t);
+        c.pair_verify(&pairing).map_err(|e| e.to_string())?;
+        c.remove_pairing(&pairing.controller_id).map_err(|e| e.to_string())?;
+        Ok(std::mem::take(&mut c.trace))
+    })
+    .await
+    .map_err(|e| format!("remove-pairing task: {e}"))?
+}
+
+/// Ask the accessory to blink or beep — "which of these three plugs are you".
+pub async fn identify(p: Peripheral, pairing: Pairing) -> Result<Vec<String>, String> {
+    let mut t = transport(p).await?;
+    tokio::task::spawn_blocking(move || {
+        let mut c = Controller::new(&mut t);
+        c.pair_verify(&pairing).map_err(|e| e.to_string())?;
+        c.identify().map_err(|e| e.to_string())?;
+        Ok(std::mem::take(&mut c.trace))
+    })
+    .await
+    .map_err(|e| format!("identify task: {e}"))?
 }
 
 pub async fn read_power(p: Peripheral, pairing: Pairing) -> Result<(Power, Vec<String>), String> {

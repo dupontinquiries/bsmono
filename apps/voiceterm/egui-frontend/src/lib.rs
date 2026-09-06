@@ -225,6 +225,8 @@ pub mod archived_view;
 pub mod cards_view;
 /// Share the zettelkasten as a huge QR: pick, paint public, two gates, show. Pure.
 pub mod zk_share;
+/// Who this installation is: a persisted keypair, its fingerprint, and the workspace digest.
+pub mod identity;
 pub mod graph_view;
 pub mod note_edit;
 /// `link_graph.rs` is mounted Qt-free under `graph_view` (see that module's
@@ -315,6 +317,12 @@ pub mod table_nlp;
 /// depends on table_ops, already above it, so `#[path]` costs nothing new.
 #[path = "../../src/notebook.rs"]
 pub mod notebook;
+/// The notebook pane's per-cell state: a classification cache and the folds.
+pub mod notebook_cells;
+/// Auto-naming a session from what has been run in it (`TODO_session_autoname.md`).
+#[path = "../../src/session_auto.rs"]
+pub mod session_auto;
+pub mod session_name;
 /// Zellij voice/assisted control — PURE core (phrase → `zellij action`
 /// argv, zellij-session detection). Fully self-contained (no `use` of any
 /// other module in this crate), tested, and — like notebook.rs above —
@@ -381,6 +389,8 @@ pub mod count_prefix;
 /// just above.
 #[path = "../../src/note_clip.rs"]
 pub mod note_clip;
+/// Is a clipped selection code or prose, and in what language? (`TODO_notes_clip.md`.)
+pub mod clip_kind;
 // The GestureHost+SlidePopup replacement (grid gesture menus with QML-parity variants) lives in
 // the shared kit; re-exported under a voiceterm-familiar name.
 pub use uikit_egui::slide_menu;

@@ -39,6 +39,45 @@ src/recall.rs: recall(query, &[RecallItem], now, top_n) -> Vec<RecallHit>.
    append-only log keyed by started_at; recall() already takes `now` and
    weights recency, so it works unchanged over a longer history.
 
+## DONE (egui port): steps 1–3, and the query that had never run
+
+The sheet was already wired to `recall("")` — the plain history — so
+step 1 (BlockTracker → RecallItem, output truncated to 200) shipped with
+it. What had never run was the SCORING: ten tests' worth of
+command/cwd/output ranking with success weighting, the whole pitch
+below, never saw a non-empty query in the app.
+
+- **Query entry, typed**: the sheet has a field ("how did I… / the
+  command that…"). Each keystroke sets `query_dirty`; the shell re-ranks
+  through one `rank_recall` the chip, the field and the voice path all
+  share, so the sheet cannot rank two ways. Escape clears the query
+  rather than closing the sheet — a query is the thing you back out of
+  first. The empty state distinguishes "no history yet" from "nothing
+  matches “x”".
+- **Query entry, spoken**: `palette::recall_query` strips the lead-in
+  ("how did I fix the nginx config" → "fix the nginx config"), longest
+  lead first, and drops a filler verb (do/run/get) while keeping a real
+  one ("how did i compile it" → "compile it"). `Command::Recall(String)`
+  opens the sheet already asking, with the field focused — the hands are
+  nowhere near after a spoken question.
+- **Typed questions reach it too**, and not through the fuzzy matcher:
+  "how did I fix the nginx config" is not a subsequence of any palette
+  title (the 'w' of "how" has nothing to match after "What did I do"), so
+  `search` dropped it and the question fell through to whatever else
+  scored. The parsed question is prepended to the hits as its own row.
+- **Act**: unchanged — tap drops the command on the input line, drag up
+  stars it, exactly as the sheet already did.
+
+Seen under Xvfb: five commands run, then "how did I fix the nginx
+config" typed into the palette → its own row → the sheet ranking `echo
+fixing the nginx config` first (three terms) over the two one-term nginx
+commands.
+
+STILL OPEN: step 4, cross-session. This searches the live session's
+blocks; "last week" needs the append-only log on disk. `recall()` already
+takes `now` and weights recency, so it works unchanged over a longer
+history — the work is the persistence, not the ranking.
+
 ## Why it beats Ctrl-R (the pitch)
 Ctrl-R: exact substring, newest-first, no output/cwd/success awareness,
 single-session. recall(): ranks by meaning across command+output+cwd,

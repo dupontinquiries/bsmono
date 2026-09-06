@@ -107,6 +107,50 @@ pub enum Command {
     /// paintbrush, two confirmation gates, then the code (`zk_share`).
     /// Reachable from the notes panes' palette like everything else here.
     ShareNotesQr,
+    /// Open the peer handshake — the acoustic identity exchange
+    /// (`peer_panel`) with THIS device's real identity (`identity`).
+    /// The panel has been a complete, tested port with no way in since the
+    /// port; the identity module is what it was waiting for.
+    PeerHandshake,
+    /// "how did I fix the nginx config" — open the command history already asking.
+    /// The lead-in is stripped and the rest is `recall`'s query; an empty one is the
+    /// plain history the sheet has always opened on.
+    Recall(String),
+}
+
+/// The recall lead-ins, longest first so "what was the command that" does not match as
+/// "what was" and leave "the command that" in the query.
+const RECALL_LEADS: &[&str] = &[
+    "what was the command that",
+    "what was the command i",
+    "the command that i",
+    "the command i",
+    "what did i do when i",
+    "what did i do",
+    "how did i",
+    "last time i",
+    "what was that",
+    "remind me how i",
+    "remind me what i",
+];
+
+/// Is this a question about what was run before, and if so what is being asked?
+///
+/// Returns the query with the lead-in and its filler removed: "how did I fix the nginx
+/// config" → "fix the nginx config". An empty remainder is still a recall — "what did I
+/// do" is the plain history — so this returns `Some("")` rather than `None`.
+pub fn recall_query(phrase: &str) -> Option<String> {
+    let p = phrase.trim().to_lowercase();
+    let p = p.trim_end_matches(['?', '.', '!']).trim();
+    let lead = RECALL_LEADS.iter().find(|l| p.starts_with(**l))?;
+    let rest = p[lead.len()..].trim();
+    // "how did I fix X" and "how did I do X" ask the same thing; the verb is filler when
+    // it is one of these, and content when it is anything else ("how did I compile it").
+    let rest = ["do ", "run ", "get ", "make it "]
+        .iter()
+        .find_map(|f| rest.strip_prefix(f))
+        .unwrap_or(rest);
+    Some(rest.trim().to_string())
 }
 
 /// The three filter levels, as a palette-addressable value.
@@ -207,6 +251,10 @@ pub fn vocabulary() -> Vec<Entry> {
                    keywords: &["keycaps", "keys", "footer", "summaries", "show extras"] });
     v.push(Entry { command: Command::ClipSelection, title: "Clip selection to notes".into(),
                    keywords: &["clip this", "save this", "note this", "clipping"] });
+    v.push(Entry { command: Command::Recall(String::new()), title: "What did I do…".into(),
+                   keywords: &["recall", "history", "last time", "how did i", "the command that", "remember"] });
+    v.push(Entry { command: Command::PeerHandshake, title: "Pair with a nearby device…".into(),
+                   keywords: &["peer", "handshake", "pair", "dial", "device", "trust", "identity"] });
     v.push(Entry { command: Command::ShareNotesQr, title: "Share notes as a QR code…".into(),
                    keywords: &["qr", "share", "zettelkasten", "export", "code", "public"] });
     v.push(Entry { command: Command::ShowPalette, title: "Open command palette".into(),
@@ -274,6 +322,14 @@ pub fn parse_phrase(phrase: &str) -> Option<Command> {
         return None;
     }
     // The palette itself, so it is reachable without knowing a shortcut.
+    // RECALL, before the other prefixes: "how did I split a pane" is a question about
+    // history, not a request to split one, and the view names would otherwise win.
+    if let Some(q) = recall_query(&p) {
+        return Some(Command::Recall(q));
+    }
+    if p.contains("pair") || p.contains("handshake") || (p.contains("dial") && !p.contains("dialog")) {
+        return Some(Command::PeerHandshake);
+    }
     if (p.contains("share") || p.contains("export")) && (p.contains("qr") || p.contains("notes") || p.contains("zettel")) {
         return Some(Command::ShareNotesQr);
     }
@@ -425,6 +481,18 @@ mod tests {
     /// pins both doors, same as every other command added this session.
     #[test]
     fn clip_selection_is_reachable_by_phrase_and_by_palette() {
+        assert_eq!(recall_query("How did I fix the nginx config?"), Some("fix the nginx config".into()));
+        assert_eq!(recall_query("what was the command that unpacked it"), Some("unpacked it".into()));
+        assert_eq!(recall_query("what did I do"), Some(String::new()), "the plain history is still a recall");
+        assert_eq!(recall_query("how did i do the docker thing"), Some("the docker thing".into()), "filler verb dropped");
+        assert_eq!(recall_query("how did i compile it"), Some("compile it".into()), "a real verb is kept");
+        assert_eq!(recall_query("split the pane"), None);
+        assert_eq!(parse_phrase("how did i split a pane"), Some(Command::Recall("split a pane".into())),
+                   "a question about history is not a request to split one");
+        assert!(vocabulary().iter().any(|e| matches!(e.command, Command::Recall(_))));
+        assert_eq!(parse_phrase("pair with a nearby device"), Some(Command::PeerHandshake));
+        assert_eq!(parse_phrase("start a handshake"), Some(Command::PeerHandshake));
+        assert!(vocabulary().iter().any(|e| e.command == Command::PeerHandshake));
         assert_eq!(parse_phrase("share my notes as a qr code"), Some(Command::ShareNotesQr));
         assert_eq!(parse_phrase("export the zettelkasten"), Some(Command::ShareNotesQr));
         assert!(vocabulary().iter().any(|e| e.command == Command::ShareNotesQr),

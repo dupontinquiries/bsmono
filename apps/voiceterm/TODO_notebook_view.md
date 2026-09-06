@@ -78,3 +78,32 @@ can't regress daily use. Flip it on to try, off to fall back.
   makes results render richly. Revisit after the view exists.
 - Re-running a cell in place (Jupyter's signature move) — needs the
   workflow-recorder replay machinery (TODO_workflow_recorder).
+
+## Done in the egui port (steps 1–2, and step 3's useful half)
+
+The pane iterates BlockTracker's blocks and renders each classified —
+Plain as monospace, Table as an aligned read-only grid over TableData,
+Map as a bold-key grid. Two things were added after dogfooding it:
+
+- **Classified once, not once a frame.** `classify` tries a markdown
+  table, CSV, TSV, aligned columns and two key/value forms over the whole
+  output, and the pane called it for every block inside the scroll loop
+  on every repaint: forty blocks and a few hundred KB of build log
+  re-parsed sixty times a second to draw a list that had not changed.
+  `notebook_cells::NotebookCells` caches by block id and output LENGTH —
+  an appended byte re-classifies, a repaint does not; a finished block's
+  output does not change in place, so hashing it every frame is the cost
+  the cache exists to avoid. Blocks that fall out of the tracker take
+  their entries with them.
+- **Folds** (step 3's collapse, the half worth having). Per block,
+  remembered, with a fold-all/unfold-all in the header. A folded cell
+  keeps its command and gains a line saying what is inside — "table — 2
+  rows × 2 cols", "key/value — 4 pairs", "12 lines" — because a fold that
+  hides what it hid is a row you have to open to identify.
+
+3 tests in `notebook_cells` (the cache recomputes only on growth, folds
+are per block and die with the block, the summary names each kind).
+
+STILL NOT DONE: pin, swipe gestures, and per-cell interactive tables
+(that needs persistent `TableView` state keyed by block id — a sort
+button that resets every frame would be worse than no button).

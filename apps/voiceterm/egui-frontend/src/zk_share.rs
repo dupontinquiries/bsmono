@@ -230,7 +230,15 @@ impl Share {
     pub fn gate(&self) -> Option<uikit_egui::confirm_dialog::ConfirmDialog> {
         use uikit_egui::confirm_dialog::{ConfirmDialog, TimeoutAction};
         match self.stage {
-            Stage::ConfirmWhat => Some(ConfirmDialog::new("Share these notes?", self.what_text(), "Continue")),
+            // 45 s, and CANCEL rather than the dialog's 10-second Discard default: gate one
+            // lists the titles to read, and a reader who takes eleven seconds should find
+            // the picker again, not a share that quietly dropped out of the flow. Seen
+            // under Xvfb — the countdown was already at 9 s in the first screenshot.
+            Stage::ConfirmWhat => Some(
+                ConfirmDialog::new("Share these notes?", self.what_text(), "Continue")
+                    .with_timeout(45.0)
+                    .with_timeout_action(TimeoutAction::Cancel),
+            ),
             Stage::ConfirmWho => Some(
                 ConfirmDialog::new("Anyone can read them", self.who_text(), "Show the code")
                     .with_timeout(60.0)
@@ -324,6 +332,27 @@ mod tests {
         assert!(what.starts_with("3 notes · 0.1 KB · 1 code\n"), "{what}");
         assert!(what.contains("Compost") && what.contains("Sourdough"));
         assert!(s.who_text().contains("not encrypted"));
+    }
+
+    /// A gate that times out must land back at the picker, never onward: the kit's default
+    /// is Discard after ten seconds, which for gate one is "you read too slowly, share
+    /// cancelled" and for gate two would be the difference between asking and not.
+    #[test]
+    fn both_gates_time_out_to_cancel_and_give_a_reader_time() {
+        use uikit_egui::confirm_dialog::TimeoutAction;
+        let cards = deck();
+        let mut s = Share::from_cards(&cards);
+        s.toggle(1);
+        s.go().unwrap();
+        let one = s.gate().unwrap();
+        assert!(one.timeout_secs >= 30.0, "gate one gives time to read the titles");
+        assert_eq!(one.timeout_action, TimeoutAction::Cancel);
+        s.what_confirmed();
+        let two = s.gate().unwrap();
+        assert!(two.timeout_secs >= 30.0);
+        assert_eq!(two.timeout_action, TimeoutAction::Cancel);
+        s.who_confirmed();
+        assert!(s.gate().is_none(), "showing has no gate");
     }
 
     #[test]

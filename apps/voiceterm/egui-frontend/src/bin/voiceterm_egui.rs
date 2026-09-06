@@ -39,6 +39,28 @@ use voiceterm_egui::App;
 /// workspace's focused pane, is what makes "the pure core already works" also
 /// mean "and you can see it."
 
+/// A small zettelkasten for `VOICETERM_DEMO`: three sections with notes under them, so the
+/// notes panes and the QR share have something real to show. `[[wiki-links]]` included,
+/// because the backlinks index is one of the things that had nothing to index.
+const DEMO_NOTES: &str = "\
+# Gardens
+
+Compost turns fastest when it is turned weekly; a fortnight is already too long.
+
+Mulch with straw over the beds before the first frost. See [[Frost dates]].
+
+# Frost dates
+
+Last frost here is the second week of May, give or take ten days.
+
+# Kitchen
+
+The sourdough starter wants feeding at the same hour each day more than it wants
+a particular flour.
+
+Salt goes in after the autolyse, not before. See [[Gardens]] for the wheat.
+";
+
 impl VoicetermApp {
     /// The document ingest surface: diagnose, choose, confirm.
     ///
@@ -650,6 +672,18 @@ struct VoicetermApp {
     /// Sharing the zettelkasten as a huge QR (`zk_share`): the picker, the
     /// gates, and the codes once shown. `None` when nothing is being shared.
     zk_share: Option<ZkShareUi>,
+    /// This installation's identity, loaded once at startup: the keypair the peer
+    /// handshake signs with and the fingerprint it shows. `Unavailable` on a system
+    /// with no randomness, and the panel then refuses to open rather than showing a
+    /// fabricated one — see `identity`.
+    identity: voiceterm_egui::identity::Loaded,
+    /// The notebook pane's per-cell state: classifications cached by block id and
+    /// output length, and which cells are folded.
+    notebook_cells: voiceterm_egui::notebook_cells::NotebookCells,
+    /// What this session is about (`session_name`), and the block count it was derived
+    /// at — the derivation walks every block and the locator draws every frame.
+    session_name: String,
+    session_name_at: usize,
     /// The find bar's FILES mode. `None` until a file search is started, so
     /// the panel costs no terminal rows in the common case.
     fs_search: voiceterm_egui::fs_results::Search,
@@ -859,6 +893,32 @@ impl VoicetermApp {
         self.web_panes.get(&id).map(|p| p.url.clone()).unwrap_or_default()
     }
 
+    /// Rank the session's command blocks against `query` — `recall`'s real scoring, which
+    /// until the query field existed only ever ran with an empty string.
+    fn rank_recall(&self, query: &str) -> Vec<voiceterm_egui::cmd_sheet::RecallHit> {
+        use voiceterm_egui::cmd_sheet::recall;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let items: Vec<recall::RecallItem> = self
+            .blocks
+            .blocks
+            .iter()
+            .filter(|b| !b.command.trim().is_empty())
+            .map(|b| recall::RecallItem {
+                command: b.command.clone(),
+                // Truncated by the caller, as recall's own doc says: the snippet is for
+                // ranking context, and a whole build log would dwarf every command.
+                output_snippet: b.output.chars().take(200).collect(),
+                cwd: b.cwd.clone(),
+                started_at: b.started_at,
+                exit_code: b.exit_code,
+            })
+            .collect();
+        recall::recall(query, &items, now, 40)
+    }
+
     fn run_command(&mut self, cmd: voiceterm_egui::palette::Command) {
         use voiceterm_egui::gesture_menus::WsCall;
         use voiceterm_egui::palette::{Command, Target};
@@ -902,6 +962,43 @@ impl VoicetermApp {
             // the most recent block is the closest approximation. True
             // for the common case (clipping something just seen), not
             // guaranteed for a selection made further back in scrollback.
+            Command::Recall(q) => {
+                let hits = self.rank_recall(&q);
+                self.cmd_sheet.open_asking(&q, hits);
+                self.surfaces.open(Surface::CmdSheet);
+            }
+            Command::PeerHandshake => {
+                // REAL VALUES OR NONE. The panel is a trust decision; opening it with
+                // placeholder identity strings would look like proof while being
+                // fabricated (TODO_multi_device_share.md's own reason for leaving it
+                // unreachable). Without an identity it says so instead.
+                match self.identity.identity() {
+                    Some(id) => {
+                        let digest = voiceterm_egui::identity::workspace_digest(
+                            self.deck.cards.iter().map(|c| (c.title.as_str(), c.body.as_str())));
+                        self.peer = Some((
+                            voiceterm_egui::peer_panel::PeerPanel {
+                                my_id: id.handle.clone(),
+                                my_key_fp: id.vt_id.clone(),
+                                workspace_digest: digest,
+                                // No voice profile is enrolled in this build, so the
+                                // panel offers no voice step — which it SAYS rather
+                                // than hiding, and which is honest: claiming a
+                                // voiceprint we cannot produce would make the peer
+                                // wait for a step that never comes.
+                                my_voiceprint_ref: String::new(),
+                                verify_msg: String::new(),
+                            },
+                            peer_handshake::HsState::Idle,
+                        ));
+                    }
+                    None => {
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs_f64()).unwrap_or(0.0);
+                        self.toasts.warning(self.identity.note(), now);
+                    }
+                }
+            }
             Command::ShareNotesQr => {
                 let share = voiceterm_egui::zk_share::Share::from_cards(&self.deck.cards);
                 self.zk_share = Some(ZkShareUi { share, dialog: None, frames: Vec::new(), shown: None, note: String::new() });
@@ -916,8 +1013,14 @@ impl VoicetermApp {
                         let (command, at) = self.blocks.blocks.last()
                             .map(|b| (b.command.clone(), b.started_at))
                             .unwrap_or_else(|| (String::new(), now));
+                        // CODE OR PROSE, decided rather than assumed. This was
+                        // `ClipKind::Text` always, so a clipped diff or function became
+                        // a blockquote — markdown reflows it, eats the leading spaces
+                        // and italicises whatever sits between asterisks.
+                        let kind = voiceterm_egui::clip_kind::detect(
+                            &text, voiceterm_egui::clip_kind::Context::from_command(&command));
                         let clip = voiceterm_egui::note_clip::Clip {
-                            kind: voiceterm_egui::note_clip::ClipKind::Text,
+                            kind,
                             content: text,
                             source: voiceterm_egui::note_clip::Source::Terminal { command, at },
                             captured_at: now,
@@ -970,6 +1073,19 @@ impl VoicetermApp {
     /// The palette overlay: type to filter, Enter to run, Escape to dismiss.
     fn palette_ui(&mut self, ctx: &egui::Context, open_t: f32) {
         let entries = voiceterm_egui::palette::vocabulary();
+        // TYPED QUESTIONS REACH RECALL TOO, and NOT through the fuzzy matcher. "how did
+        // I fix the nginx config" is not a subsequence of any title — the 'w' of "how"
+        // has nothing after "What did I do" to match — so `search` drops it entirely and
+        // the question fell through to whatever else scored. The same phrase parser the
+        // voice path uses runs over the typed query, and a question is prepended to the
+        // HITS as its own row carrying the stripped words. One grammar, both doors.
+        let asked = voiceterm_egui::palette::recall_query(&self.palette_query)
+            .filter(|q| !q.is_empty())
+            .map(|q| voiceterm_egui::palette::Entry {
+                command: voiceterm_egui::palette::Command::Recall(q.clone()),
+                title: format!("What did I do \u{2014} \u{201c}{q}\u{201d}"),
+                keywords: &[],
+            });
         let mut chosen = None;
         let mut close = false;
         // The QML puts the palette in a right-edge drawer (paletteDrawer,
@@ -979,7 +1095,10 @@ impl VoicetermApp {
                 // Focused on open, because a palette you have to click into
                 // costs the keystroke it exists to save.
                 resp.request_focus();
-                let hits = voiceterm_egui::palette::search(&entries, &self.palette_query);
+                let mut hits = voiceterm_egui::palette::search(&entries, &self.palette_query);
+                if let Some(a) = asked.as_ref() {
+                    hits.insert(0, a);
+                }
                 if self.palette_sel >= hits.len() { self.palette_sel = 0; }
                 if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                     self.palette_sel = (self.palette_sel + 1).min(hits.len().saturating_sub(1));
@@ -1473,6 +1592,8 @@ impl eframe::App for VoicetermApp {
                 if let Some(a) = voiceterm_egui::cmd_sheet::cmd_sheet_ui(
                     ui, &mut self.cmd_sheet, &colors)
                 {
+                    // (the re-rank happens after the closure — `rank_recall`
+                    // borrows self, and the sheet is already borrowed here)
                     use voiceterm_egui::cmd_sheet::SheetAction as A;
                     match a {
                         // Typed, not run — and here the rule matters most:
@@ -1523,6 +1644,16 @@ impl eframe::App for VoicetermApp {
                     self.fs_search.cancel();
                 }
             });
+        }
+
+        // THE QUERY RE-RANK, outside the draw closure: `rank_recall` reads the
+        // blocks and the closure already holds `self.cmd_sheet`. One frame of
+        // lag on a keystroke, which is invisible and cheaper than cloning the
+        // corpus into the sheet.
+        if self.cmd_sheet.query_dirty {
+            let q = self.cmd_sheet.query.clone();
+            let hits = self.rank_recall(&q);
+            self.cmd_sheet.set_hits(hits);
         }
 
         // THE PEER HANDSHAKE. Modal: it is an identity decision and letting
@@ -1733,26 +1864,11 @@ impl eframe::App for VoicetermApp {
                         // RANKED AT OPEN, not held live: recall scores recency
                         // against frequency, so a list built once at startup
                         // shows the wrong "most recent" an hour later.
-                        use voiceterm_egui::cmd_sheet::recall;
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs()).unwrap_or(0);
-                        let items: Vec<recall::RecallItem> = self.blocks.blocks.iter()
-                            .filter(|b| !b.command.trim().is_empty())
-                            .map(|b| recall::RecallItem {
-                                command: b.command.clone(),
-                                // Truncated by the caller, as recall's own doc
-                                // says: the snippet is for ranking context, and
-                                // a whole build log would dwarf every command.
-                                output_snippet: b.output.chars().take(200).collect(),
-                                cwd: b.cwd.clone(),
-                                started_at: b.started_at,
-                                exit_code: b.exit_code,
-                            })
-                            .collect();
                         // Empty query: no filter, pure recency/frequency rank,
-                        // which is what a history sheet opens on.
-                        let hits = recall::recall("", &items, now, 40);
+                        // which is what a history sheet opens on. Through the
+                        // same ranker the query field and "how did I…" use, so
+                        // the sheet cannot rank two ways.
+                        let hits = self.rank_recall("");
                         self.cmd_sheet.open_with(hits);
                         self.surfaces.open(Surface::CmdSheet);
                     }
@@ -2618,6 +2734,26 @@ impl eframe::App for VoicetermApp {
             {
                 let title = self.workspace.tabs.get(self.workspace.active)
                     .map(|t| t.name.clone()).unwrap_or_default();
+                // WHAT THIS SESSION IS ABOUT, beside where you are.
+                // `session_auto` shipped pure and tested in v0.1.658 and the Qt
+                // build has surfaced it since v0.1.720; this frontend never
+                // referenced the module at all, so the segmenter, the namer and
+                // the proposals were all carried across and none of their output
+                // was. Recomputed only when a command finishes — the derivation
+                // walks every block, and the locator draws every frame.
+                if self.blocks.blocks.len() != self.session_name_at {
+                    self.session_name_at = self.blocks.blocks.len();
+                    self.session_name = voiceterm_egui::session_name::session_name(
+                        self.blocks.blocks.iter().map(|b| {
+                            (b.command.as_str(), b.cwd.as_deref().unwrap_or(""))
+                        }),
+                    );
+                }
+                let title = if self.session_name.is_empty() {
+                    title
+                } else {
+                    format!("{title} \u{b7} {}", self.session_name)
+                };
                 let text = self.chrome.locator(
                     self.workspace.active,
                     self.workspace.tabs.len(),
@@ -2655,6 +2791,17 @@ impl eframe::App for VoicetermApp {
             let view = self.workspace.pane_view(self.workspace.focused_pane());
             if view != PaneView::Terminal {
                 let c = self.colors;
+                // SCOPED TO THE PANE. Every view below gives its widgets a fixed
+                // `id_salt`, which is unique within one instance and identical between
+                // two: `ui.columns` does not scope ids, so two panes showing the same
+                // view would resolve to ONE widget — and for a `TextEdit` that means one
+                // text cursor between them, which reads as "I can only get one character
+                // into this box". Only the focused pane draws its view today, so nothing
+                // collides yet; this is one line that keeps it that way when the others
+                // start drawing. `tests/views_probe.rs` pins the rule by drawing each
+                // view twice in a frame.
+                let pane_scope = self.workspace.focused_pane();
+                ui.push_id(("pane-view", pane_scope), |ui| {
                 match view {
                     PaneView::Mail => {
                         // The spoken selector, above the typed query. "my last
@@ -3878,15 +4025,50 @@ impl eframe::App for VoicetermApp {
                         // is nothing in the terminal's own proven path this
                         // can regress.
                         use voiceterm_egui::notebook::Structured;
+                        use voiceterm_egui::notebook_cells::fold_summary;
                         if self.blocks.blocks.is_empty() {
                             ui.colored_label(c.text_weak,
                                 "no command blocks yet — run something in the terminal");
                         }
+                        // Step 3's useful half: FOLDS. The pane had none, so a session
+                        // with a build log in it was a page of scrolling to reach the
+                        // cell you wanted. Folded cells keep their command and a line
+                        // saying what is inside — a fold that hides what it hid is a row
+                        // you have to open to identify.
+                        self.notebook_cells.retain_ids(|id| self.blocks.blocks.iter().any(|b| b.id == id));
+                        if !self.blocks.blocks.is_empty() {
+                            ui.horizontal(|ui| {
+                                let n = self.notebook_cells.folded_count();
+                                if ui.small_button(if n > 0 { "unfold all" } else { "fold all" }).clicked() {
+                                    let ids: Vec<u32> = self.blocks.blocks.iter().map(|b| b.id).collect();
+                                    self.notebook_cells.set_all(ids.into_iter(), n == 0);
+                                }
+                                if n > 0 {
+                                    ui.colored_label(c.text_weak, format!("{n} folded"));
+                                }
+                            });
+                        }
+                        let cells = &mut self.notebook_cells;
                         egui::ScrollArea::vertical().id_salt("notebook").show(ui, |ui| {
                             for b in &self.blocks.blocks {
                                 ui.separator();
+                                // CLASSIFIED ONCE, not once a frame. `classify` tries a
+                                // markdown table, CSV, TSV, aligned columns and two
+                                // key/value forms over the whole output; this loop ran it
+                                // for every block on every repaint.
+                                let what = cells.classify(b.id, &b.output).clone();
+                                let folded = cells.is_folded(b.id);
+                                let mut toggle = false;
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(format!("$ {}", b.command)).strong());
+                                    if ui.small_button(if folded { "\u{25b8}" } else { "\u{25be}" }).clicked() {
+                                        toggle = true;
+                                    }
+                                    if ui.add(egui::Label::new(
+                                        egui::RichText::new(format!("$ {}", b.command)).strong())
+                                        .sense(egui::Sense::click())).clicked()
+                                    {
+                                        toggle = true;
+                                    }
                                     match b.exit_code {
                                         Some(0) => { ui.colored_label(
                                             egui::Color32::from_rgb(90, 180, 100), "●"); }
@@ -3894,7 +4076,14 @@ impl eframe::App for VoicetermApp {
                                         None => {}
                                     }
                                 });
-                                match voiceterm_egui::notebook::classify(&b.output) {
+                                if toggle {
+                                    cells.toggle_fold(b.id);
+                                }
+                                if folded {
+                                    ui.colored_label(c.text_weak, fold_summary(&what, &b.output));
+                                    continue;
+                                }
+                                match what {
                                     Structured::Plain => {
                                         ui.label(egui::RichText::new(&b.output).monospace());
                                     }
@@ -3954,6 +4143,7 @@ impl eframe::App for VoicetermApp {
                     }
                     PaneView::Terminal => {}
                 }
+                });
                 return;
             }
             // Submitted line (Enter) and the raw BYTES are two different
@@ -5077,12 +5267,32 @@ fn main() -> eframe::Result<()> {
                 chat: Default::default(),
                 glow: Default::default(),
                 pending_confirm: None, zk_share: None,
+                identity: voiceterm_egui::identity::load_or_create("voiceterm"),
+                notebook_cells: Default::default(),
+                session_name: String::new(),
+                session_name_at: usize::MAX,
                 fs_search: Default::default(),
                 cmd_sheet: Default::default(),
                 last_memlog_s: 0.0,
                 peer: None,
-                deck: Default::default(),
-                captured: String::new(),
+                // VOICETERM_DEMO also seeds the note deck. The zettelkasten is
+                // empty until someone captures something, which is correct —
+                // and means the notes panes, the graph, the backlinks and the
+                // QR share have nothing to draw on a fresh launch, so none of
+                // them could be looked at without first typing a page of text
+                // into the capture box by hand.
+                deck: {
+                    let mut d: voiceterm_egui::cards_view::Deck = Default::default();
+                    if demo {
+                        let src = voiceterm_egui::cards_view::CardSource {
+                            url: "demo://zettelkasten".into(),
+                            paragraph_id: String::new(),
+                        };
+                        d.set_cards(voiceterm_egui::cards_view::note_cards::split_into_cards(DEMO_NOTES, &src));
+                    }
+                    d
+                },
+                captured: if demo { DEMO_NOTES.to_string() } else { String::new() },
                 backlinks: Default::default(),
                 build: Default::default(),
                 build_input: String::new(),
