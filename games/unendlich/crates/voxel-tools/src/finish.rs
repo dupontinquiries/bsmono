@@ -82,6 +82,93 @@ fn already_has(ops: &[Op], line: &str) -> bool {
     })
 }
 
+/// How boxy a build is: the fraction of its bounding box that is
+/// solid, and whether its skyline is flat. A box is the signature of a
+/// generated building; a real one has a chimney, a turret, a wing --
+/// something that breaks the outline against the sky.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Silhouette {
+    /// solid cells / bounding box volume, 0..1
+    pub fill: f32,
+    /// how often a column's top differs from its neighbour's, 0..1.
+    /// A flat lid is 0; a gable steps on every row; a chimney or turret
+    /// adds edges. Counting DISTINCT heights was the first attempt, and
+    /// a gable has only four across eighty columns.
+    pub skyline_variety: f32,
+    /// the footprint's aspect, longest over shortest
+    pub aspect: f32,
+}
+
+impl Silhouette {
+    /// Boxy: a full box with a flat top. The thresholds are where a
+    /// shape stops reading as designed.
+    pub fn is_boxy(&self) -> bool { self.fill > 0.55 && self.skyline_variety < 0.1 }
+}
+
+pub fn silhouette(placed: &[(i32, i32, i32)]) -> Option<Silhouette> {
+    if placed.is_empty() { return None; }
+    let lo = placed.iter().fold((i32::MAX, i32::MAX, i32::MAX), |a, p| (a.0.min(p.0), a.1.min(p.1), a.2.min(p.2)));
+    let hi = placed.iter().fold((i32::MIN, i32::MIN, i32::MIN), |a, p| (a.0.max(p.0), a.1.max(p.1), a.2.max(p.2)));
+    let vol = ((hi.0 - lo.0 + 1) as f32) * ((hi.1 - lo.1 + 1) as f32) * ((hi.2 - lo.2 + 1) as f32);
+    let mut tops: std::collections::BTreeMap<(i32, i32), i32> = Default::default();
+    for p in placed { let t = tops.entry((p.0, p.2)).or_insert(i32::MIN); *t = (*t).max(p.1); }
+    let (mut pairs, mut steps) = (0usize, 0usize);
+    for ((x, z), t) in &tops {
+        for n in [(x + 1, *z), (*x, z + 1)] {
+            if let Some(nt) = tops.get(&n) { pairs += 1; if nt != t { steps += 1; } }
+        }
+    }
+    let (w, d) = ((hi.0 - lo.0 + 1) as f32, (hi.2 - lo.2 + 1) as f32);
+    Some(Silhouette {
+        fill: placed.len() as f32 / vol.max(1.0),
+        skyline_variety: if pairs == 0 { 0.0 } else { steps as f32 / pairs as f32 },
+        aspect: w.max(d) / w.min(d).max(1.0),
+    })
+}
+
+/// IR that breaks a boxy silhouette: a corner turret or a chimney, and
+/// trim along the roofline, sized to the box. Seeded, so two boxy
+/// builds get different breakers.
+pub fn break_silhouette(bounds: ((i32, i32, i32), (i32, i32, i32)), seed: u64) -> (String, String) {
+    let (lo, hi) = bounds;
+    let w = hi.0 - lo.0 + 1;
+    let d = hi.2 - lo.2 + 1;
+    let h = hi.1 - lo.1 + 1;
+    let pick = (seed % 3) as u8;
+    let corner = match seed / 3 % 4 { 0 => (lo.0, lo.2), 1 => (hi.0, lo.2), 2 => (lo.0, hi.2), _ => (hi.0, hi.2) };
+    let mut ir = String::new();
+    let why = match pick {
+        0 => {
+            // a corner turret, taller than the body, with a conical cap
+            let r = (w.min(d) / 6).clamp(2, 4);
+            ir.push_str(&format!("cylinder {},{} r={r} h={} block=stone_bricks hollow
+", corner.0, corner.1, h + r + 2));
+            ir.push_str(&format!("roof {},{} {},{} pyramid block=dark_oak_planks
+",
+                                 corner.0 - r, corner.1 - r, corner.0 + r, corner.1 + r));
+            "a corner turret"
+        }
+        1 => {
+            // a chimney stack off-centre, rising above the roof
+            let cx = lo.0 + w / 3;
+            let cz = lo.2 + d / 2;
+            ir.push_str(&format!("fill {cx},{},{cz} {},{},{} block=stone_bricks
+", hi.1 - 2, cx + 1, hi.1 + 3, cz + 1));
+            "a chimney"
+        }
+        _ => {
+            // a raised central bay: a second storey over the middle third
+            let (bx0, bx1) = (lo.0 + w / 3, hi.0 - w / 3);
+            ir.push_str(&format!("enclose {bx0},{} {bx1},{} h=3 y={} block=stone_bricks
+", lo.2 + 1, hi.2 - 1, hi.1 + 1));
+            ir.push_str(&format!("roof {bx0},{} {bx1},{} gable block=dark_oak_planks
+", lo.2 + 1, hi.2 - 1));
+            "a raised bay"
+        }
+    };
+    (ir, format!("boxy silhouette: added {why}"))
+}
+
 /// The finishing lines the prose implies, over the box the plan built.
 /// Empty when no word applies, the box is unknown, or the plan already
 /// finishes itself. Returns (IR, reasons).
@@ -186,5 +273,34 @@ mod tests {
             let errs: Vec<_> = issues.iter().filter(|i| i.severity == Severity::Error).collect();
             assert!(errs.is_empty(), "template {line:?}: {errs:?}");
         }
+    }
+
+    #[test]
+    fn a_box_reads_as_boxy_and_a_house_does_not() {
+        let mut solid = Vec::new();
+        for x in 0..10 { for y in 0..6 { for z in 0..8 { solid.push((x, y, z)); } } }
+        let s = silhouette(&solid).unwrap();
+        assert!(s.is_boxy(), "{s:?}");
+        // the same box with a pitched roof and a chimney: varied skyline
+        let mut house = solid.clone();
+        for x in 0..10i32 { for z in 0..8i32 { let ridge = 6 + (4 - (z - 4).abs()).max(0) / 2; for y in 6..ridge { house.push((x, y, z)); } } }
+        for y in 6..12 { house.push((2, y, 4)); }
+        let h = silhouette(&house).unwrap();
+        assert!(!h.is_boxy(), "{h:?}");
+    }
+
+    #[test]
+    fn breakers_are_valid_ir_and_differ_by_seed() {
+        let b = ((0, 65, 0), (11, 70, 7));
+        let mut seen = std::collections::BTreeSet::new();
+        for seed in 0..12u64 {
+            let (ir, why) = break_silhouette(b, seed);
+            let (plan, issues) = parse_plan_at(&ir, Some((0, 65, 0)));
+            assert!(issues.iter().all(|i| i.severity != Severity::Error), "seed {seed}: {issues:?}\n{ir}");
+            assert!(!plan.ops.is_empty());
+            assert!(why.contains("boxy"));
+            seen.insert(why);
+        }
+        assert!(seen.len() >= 3, "turret, chimney and bay all appear: {seen:?}");
     }
 }

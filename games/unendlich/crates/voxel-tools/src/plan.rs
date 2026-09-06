@@ -621,9 +621,15 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                 ops.push(Op::Form {
                     name, min: a, max: b,
                     y: kv(&t, "y").and_then(|v| v.parse().ok()),
-                    style: t.iter().skip(2)
-                        .find(|s| !s.contains('=') && !s.contains(',') && !s.starts_with('@'))
-                        .unwrap_or(&"").to_string(),
+                    // `style=nordic` or a bare word: both name the style.
+                    // Only the bare word was read, so `style=` -- which is
+                    // what the prompt teaches -- reached every form as ""
+                    // and five styles rendered as one.
+                    style: t.iter().skip(2).find_map(|s| s.strip_prefix("style="))
+                        .or_else(|| t.iter().skip(2)
+                            .find(|s| !s.contains('=') && !s.contains(',') && !s.starts_with('@'))
+                            .copied())
+                        .unwrap_or("").to_string(),
                     block: blk("stone").unwrap_or(1),
                     accent: blk("dark_oak_planks").unwrap_or(86),
                     nums });
@@ -2119,5 +2125,14 @@ scatter -20,-20 20,20 block=oak_leaves clusters=6 per=10 spread=3 seed=7
         let (_, issues) = parse_plan_at(ir, Some((0, 65, 0)));
         let e = issues.iter().find(|i| i.severity == Severity::Error).unwrap();
         assert!(e.message.starts_with("line 5:"), "the bad line is line 5: {}", e.message);
+    }
+
+    #[test]
+    fn style_reaches_a_form_both_ways() {
+        let (a, _) = parse_plan_at("form house @0,0 @12,8 style=nordic\n", Some((0, 65, 0)));
+        let (b, _) = parse_plan_at("form house @0,0 @12,8 nordic\n", Some((0, 65, 0)));
+        for plan in [&a, &b] {
+            match &plan.ops[0] { Op::Form { style, .. } => assert_eq!(style, "nordic"), o => panic!("{o:?}") }
+        }
     }
 }

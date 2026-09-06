@@ -147,6 +147,10 @@ pub struct ChatSession {
     pub last_prose: String,
     /// Living plants placed by commits, awaiting the engine.
     pub planted: Vec<crate::flora::PlantRequest>,
+    /// A per-turn creative seed: the same request twice should not give
+    /// the same building. Advanced by every plan received, so "another
+    /// one" varies; a stated `seed=` in the IR still wins.
+    pub creative_seed: u64,
     /// Seed for the refinement ladder, so re-running a rung reproduces
     /// it and running the next one does not repeat the last one's noise.
     pub refine_seed: i32,
@@ -182,7 +186,7 @@ impl ChatSession {
     pub fn new(chunk_size: i32, from_y: i32) -> Self {
         Self { budget: 200_000, chunk_size, from_y, profile: Profile::GroundUp,
                climate: (0.5, 0.5), sea_level: 64, scene_radius: 24, two_pass: false,
-               refine_seed: 1,
+               refine_seed: 1, creative_seed: 1,
                ..Default::default() }
     }
 
@@ -452,6 +456,7 @@ impl ChatSession {
         // model concrete lines rather than a macro it has to unfold.
         let expanded = crate::plan::expand_defs(ir);
         let ir: &str = &expanded;
+        self.creative_seed = self.creative_seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let (first_plan, first_issues) = parse_plan_at(ir, Some(f.anchor));
         // SALVAGE. One bad line used to reject the whole plan; a 1B that
         // gets eight lines right and one wrong got nothing built. Now
@@ -517,7 +522,22 @@ impl ChatSession {
                 |a, p| (a.0.min(p.0), a.1.min(p.1), a.2.min(p.2)));
             let hi = placed.iter().fold((i32::MIN, i32::MIN, i32::MIN),
                 |a, p| (a.0.max(p.0), a.1.max(p.1), a.2.max(p.2)));
-            let (fin_ir, why) = crate::finish::from_prose(prose, &plan.ops, Some((lo, hi)));
+            let (mut fin_ir, mut why) = crate::finish::from_prose(prose, &plan.ops, Some((lo, hi)));
+            // THE SILHOUETTE CRITIC. A box with a flat top is the
+            // signature of a generated building; a real one has
+            // something against the sky. Only for buildings of a size
+            // -- a fence post is a box and should stay one -- and only
+            // when the player did not ask for a box.
+            if let Some(sil) = crate::finish::silhouette(&placed) {
+                let big_enough = (hi.0 - lo.0) >= 5 && (hi.2 - lo.2) >= 5 && (hi.1 - lo.1) >= 3;
+                let asked_for_box = prose.to_lowercase().contains("box") || prose.to_lowercase().contains("cube")
+                    || prose.to_lowercase().contains("plain");
+                if sil.is_boxy() && big_enough && !asked_for_box {
+                    let (b_ir, b_why) = crate::finish::break_silhouette((lo, hi), self.creative_seed);
+                    fin_ir.push_str(&b_ir);
+                    why.push(b_why);
+                }
+            }
             if !fin_ir.is_empty() {
                 let (fin_plan, _) = parse_plan_at(&fin_ir, Some(f.anchor));
                 plan.ops.extend(fin_plan.ops);
@@ -1296,5 +1316,41 @@ mod tests {
         assert_eq!((a.0, a.2), (20, 5));
         let lb = s.last_build.as_ref().unwrap();
         assert_ne!((lb.min.0, lb.min.2), (20, 5), "and it is not the box corner");
+    }
+
+    #[test]
+    fn a_plain_box_gets_its_silhouette_broken_unless_a_box_was_asked_for() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        let ir = "fill @-5,0,-4 @5,6,4 block=stone\n";
+        match s.receive_plan_gated(&mut t, &g, ir, None, "a hall") {
+            Reply::Preview { echo, .. } => assert!(echo.contains("boxy silhouette"), "{echo}"),
+            o => panic!("{o:?}"),
+        }
+        match s.receive_plan_gated(&mut t, &g, ir, None, "a plain stone box") {
+            Reply::Preview { echo, .. } => assert!(!echo.contains("boxy"), "asked for a box: {echo}"),
+            o => panic!("{o:?}"),
+        }
+        // a fence post is a box and stays one
+        match s.receive_plan_gated(&mut t, &g, "fill @0,0,0 @0,3,0 block=oak_log\n", None, "a post") {
+            Reply::Preview { echo, .. } => assert!(!echo.contains("boxy"), "{echo}"),
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn the_same_request_twice_is_not_the_same_building() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        let ir = "fill @-5,0,-4 @5,6,4 block=stone\n";
+        let a = match s.receive_plan_gated(&mut t, &g, ir, None, "a hall") { Reply::Preview { echo, .. } => echo, o => panic!("{o:?}") };
+        let b = match s.receive_plan_gated(&mut t, &g, ir, None, "a hall") { Reply::Preview { echo, .. } => echo, o => panic!("{o:?}") };
+        let c = match s.receive_plan_gated(&mut t, &g, ir, None, "a hall") { Reply::Preview { echo, .. } => echo, o => panic!("{o:?}") };
+        let pick = |e: &str| e.lines().find(|l| l.contains("boxy")).unwrap_or("").to_string();
+        assert!(pick(&a) != pick(&b) || pick(&b) != pick(&c), "the breaker varies across turns:\n{}\n{}\n{}", pick(&a), pick(&b), pick(&c));
     }
 }

@@ -72,6 +72,10 @@ pub const FORMS: &[Form] = &[
     Form { name: "statue", summary: "a figure on a plinth: figure|gargoyle|idol|obelisk|colossus, \
                                      pose=standing|seated|arms_up|kneeling",
            build: statue },
+    Form { name: "castle", summary: "curtain wall, corner towers, gatehouse and a keep",
+           build: castle },
+    Form { name: "temple", summary: "steps, a colonnade, a cella and a domed roof",
+           build: temple },
 ];
 
 pub fn lookup(name: &str) -> Option<&'static Form> {
@@ -148,28 +152,109 @@ fn wall(a: &FormArgs) -> Solid {
 }
 
 fn house(a: &FormArgs) -> Solid {
+    // The style sets materials, roof, storey height and window rhythm
+    // together; the seed decides which of the style's variants this
+    // particular house gets. Two houses from one line differ the way
+    // two houses on one street do: same vernacular, different details.
+    let st = a.nums.iter().find(|(k, _)| k == "style").map(|(_, v)| *v as usize)
+        .and_then(|i| crate::style::STYLES.get(i))
+        .or_else(|| crate::style::lookup(&a.style))
+        .unwrap_or_else(|| crate::style::lookup("cottage").unwrap());
+    let seed = a.num("seed", 1) as u32;
+    let roll = |k: u32| (hash2(k, seed) % 1000) as f32 / 1000.0;
     let (lo, hi) = (a.lo(), a.hi());
-    let h = a.num("h", 5) as f32;
-    let body = wall(a);
-    let floor = Solid::Box { min: lo, max: [hi[0], lo[1] + 1.0, hi[2]],
-                             mat: Material::structural(a.block) };
-    // Windows: an ARRAY along the long wall, spaced by the parameter.
-    // Five of them is one node; in the op world it was five fills the
-    // model had to space by hand, and that arithmetic is exactly what a
-    // small model gets wrong.
+    let storeys = a.num("storeys", 1).clamp(1, 3);
+    let h = (st.storey * storeys) as f32;
+    let wall = Material::structural(if a.block != 1 { a.block } else { st.wall });
+    let trim = Material::accent(st.trim);
+    let mut parts: Vec<Solid> = Vec::new();
+
+    // Body: walls + floor, door on the long side facing -z.
+    let body = Solid::Shell {
+        inner: Box::new(Solid::Box { min: lo, max: [hi[0], lo[1] + h, hi[2]], mat: wall.clone() }),
+        thickness: 1.0 };
+    let cx = (lo[0] + hi[0]) / 2.0;
+    let door = Solid::Box { min: [cx - 1.0, lo[1], lo[2] - 1.0], max: [cx + 1.0, lo[1] + 3.0, lo[2] + 1.0],
+                            mat: Material::carved() };
+    // Windows in the style's rhythm, on both long walls, per storey.
     let span = hi[0] - lo[0];
-    let step = a.num("spacing", 4).max(2) as f32;
+    let step = st.window_every.max(2) as f32;
     let count = ((span - 2.0) / step).floor().max(1.0) as u32;
-    let win = Solid::Box { min: [lo[0] + 1.0, lo[1] + 2.0, hi[2] - 1.0],
-                           max: [lo[0] + 2.0, lo[1] + 4.0, hi[2]],
-                           mat: Material::carved() };
-    let windows = Solid::Array { count, step: [step, 0.0, 0.0], inner: Box::new(win) };
-    let roof_args = FormArgs { min: (a.min.0, (a.min.1 as f32 + h) as i32, a.min.2), ..a.clone() };
-    Solid::Union(vec![
-        floor,
-        Solid::Diff(Box::new(body), Box::new(windows)),
-        roof_shell(&roof_args),
-    ])
+    let mut cuts: Vec<Solid> = vec![door];
+    for s in 0..storeys {
+        let wy = lo[1] + (s * st.storey) as f32 + 2.0;
+        for zf in [lo[2] - 1.0, hi[2] - 1.0] {
+            cuts.push(Solid::Array { count, step: [step, 0.0, 0.0], inner: Box::new(Solid::Box {
+                min: [lo[0] + 1.0, wy, zf], max: [lo[0] + 2.0, wy + 2.0, zf + 2.0], mat: Material::carved() }) });
+        }
+    }
+    parts.push(Solid::Diff(Box::new(body), Box::new(Solid::Union(cuts))));
+    parts.push(Solid::Box { min: lo, max: [hi[0], lo[1] + 1.0, hi[2]], mat: Material::structural(st.floor) });
+    // Storey floors and trim bands between storeys.
+    for s in 1..storeys {
+        let fy = lo[1] + (s * st.storey) as f32;
+        parts.push(Solid::Box { min: [lo[0] + 1.0, fy, lo[2] + 1.0], max: [hi[0] - 1.0, fy + 1.0, hi[2] - 1.0],
+                                mat: Material::structural(st.floor) });
+        parts.push(Solid::Shell { inner: Box::new(Solid::Box { min: [lo[0], fy, lo[2]], max: [hi[0], fy + 1.0, hi[2]],
+                                                               mat: trim.clone() }), thickness: 1.0 });
+    }
+
+    // Roof in the style's shape and pitch.
+    let roof_args = FormArgs { min: (a.min.0, (lo[1] + h) as i32, a.min.2), max: (a.max.0, (lo[1] + h) as i32, a.max.2),
+                               style: st.roof.into(), block: st.roof_block, accent: st.trim,
+                               nums: vec![("h".into(), ((hi[0] - lo[0]).min(hi[2] - lo[2]) * st.pitch).max(2.0) as i32)] };
+    parts.push(roof_shell(&roof_args));
+
+    // VARIANTS, by the style's odds and the house's seed.
+    if roll(1) < st.chimney {
+        // a chimney on the roof, off-centre, one block above the ridge
+        let chx = lo[0] + 2.0 + roll(2) * (span - 4.0);
+        let ridge = lo[1] + h + roof_args.num("h", 3) as f32;
+        parts.push(Solid::Box { min: [chx, lo[1] + h - 1.0, hi[2] - 3.0], max: [chx + 1.0, ridge + 2.0, hi[2] - 2.0],
+                                mat: Material::new(st.trim, 60) });
+    }
+    if roll(3) < st.dormers && st.roof != "flat" {
+        // dormers: two small gabled boxes on the front slope
+        let dy = lo[1] + h;
+        for k in 0..2 {
+            let dx = lo[0] + 2.0 + (k as f32 + 0.5) * (span - 4.0) / 2.0;
+            parts.push(Solid::Box { min: [dx - 1.0, dy, lo[2] - 0.5], max: [dx + 1.0, dy + 2.0, lo[2] + 2.5],
+                                    mat: Material::new(st.wall, 60) });
+            parts.push(Solid::Box { min: [dx - 0.5, dy + 0.5, lo[2] - 1.0], max: [dx + 0.5, dy + 1.5, lo[2] + 0.5],
+                                    mat: Material::new(0, 70) });
+            parts.push(Solid::Wedge { min: [dx - 1.5, dy + 2.0, lo[2] - 0.5], max: [dx + 1.5, 0.0, lo[2] + 2.5],
+                                      h: 2.0, axis: Axis::Z, mat: Material::new(st.roof_block, 60) });
+        }
+    }
+    if roll(4) < st.porch {
+        // a porch: a roof on posts in front of the door
+        let py = lo[1] + 3.0;
+        parts.push(Solid::Box { min: [cx - 3.0, py, lo[2] - 3.0], max: [cx + 3.0, py + 1.0, lo[2]],
+                                mat: Material::new(st.roof_block, 60) });
+        for px in [cx - 2.5, cx + 2.5] {
+            parts.push(Solid::Cylinder { base: [px, lo[1], lo[2] - 2.5], r: 0.5, h: 3.0,
+                                         mat: Material::new(st.trim, 60) });
+        }
+    }
+    if roll(5) < 0.35 && span >= 10.0 {
+        // an L-wing: a smaller body off one end, with its own roof
+        let side = if roll(6) < 0.5 { -1.0 } else { 1.0 };
+        let wx0 = if side < 0.0 { lo[0] } else { hi[0] - span * 0.4 };
+        let wx1 = wx0 + span * 0.4;
+        let wz0 = hi[2] - 1.0;
+        let wz1 = hi[2] + (hi[2] - lo[2]) * 0.6;
+        let wh = st.storey as f32;
+        parts.push(Solid::Shell { inner: Box::new(Solid::Box { min: [wx0, lo[1], wz0], max: [wx1, lo[1] + wh, wz1],
+                                                               mat: wall.clone() }), thickness: 1.0 });
+        parts.push(Solid::Box { min: [wx0 + 1.0, lo[1] + 1.0, wz0 - 0.5], max: [wx1 - 1.0, lo[1] + wh - 1.0, wz0 + 1.5],
+                                mat: Material::carved() });
+        let wing_roof = FormArgs { min: (wx0 as i32, (lo[1] + wh) as i32, wz0 as i32),
+                                   max: (wx1 as i32 - 1, (lo[1] + wh) as i32, wz1 as i32 - 1),
+                                   style: st.roof.into(), block: st.roof_block, accent: st.trim,
+                                   nums: vec![("h".into(), ((wx1 - wx0).min(wz1 - wz0) * st.pitch).max(2.0) as i32)] };
+        parts.push(roof_shell(&wing_roof));
+    }
+    Solid::Union(parts)
 }
 
 fn colonnade(a: &FormArgs) -> Solid {
@@ -288,6 +373,103 @@ fn village(a: &FormArgs) -> Solid {
                                           mat: Material::accent(a.accent) }),
         thickness: 1.0,
     });
+    Solid::Union(parts)
+}
+
+/// A castle: the wall and towers `fortify` makes, with a keep inside
+/// and a gatehouse -- as one form, so a model says the word.
+fn castle(a: &FormArgs) -> Solid {
+    let (lo, hi) = (a.lo(), a.hi());
+    let st = crate::style::lookup(&a.style).unwrap_or_else(|| crate::style::lookup("stone").unwrap());
+    let wall = Material::structural(if a.block != 1 { a.block } else { st.wall });
+    let acc = Material::accent(st.trim);
+    let wh = a.num("h", 7).max(4) as f32;
+    let mut parts: Vec<Solid> = Vec::new();
+    // curtain wall with a walkway
+    parts.push(Solid::Shell { inner: Box::new(Solid::Box { min: lo, max: [hi[0], lo[1] + wh, hi[2]], mat: wall.clone() }),
+                              thickness: 1.5 });
+    // crenellations: a cap ring with every other cell removed
+    parts.push(Solid::Diff(
+        Box::new(Solid::Shell { inner: Box::new(Solid::Box { min: [lo[0], lo[1] + wh, lo[2]], max: [hi[0], lo[1] + wh + 1.0, hi[2]],
+                                                             mat: acc.clone() }), thickness: 1.0 }),
+        Box::new(Solid::Array { count: ((hi[0] - lo[0]) / 2.0) as u32, step: [2.0, 0.0, 0.0],
+                                inner: Box::new(Solid::Box { min: [lo[0] + 1.0, lo[1] + wh, lo[2] - 1.0],
+                                                             max: [lo[0] + 2.0, lo[1] + wh + 1.0, hi[2] + 1.0],
+                                                             mat: Material::carved() }) })));
+    // four corner towers, taller than the wall
+    for (x, z) in [(lo[0], lo[2]), (hi[0], lo[2]), (lo[0], hi[2]), (hi[0], hi[2])] {
+        parts.push(Solid::Shell { inner: Box::new(Solid::Cylinder { base: [x, lo[1], z], r: 3.0, h: wh + 5.0, mat: wall.clone() }),
+                                  thickness: 1.0 });
+        parts.push(Solid::Wedge { min: [x - 4.0, lo[1] + wh + 5.0, z - 4.0], max: [x + 4.0, 0.0, z + 4.0], h: 4.0,
+                                  axis: Axis::X, mat: acc.clone() });
+    }
+    // gatehouse on the south wall: two towers flanking a carved arch
+    let cx = (lo[0] + hi[0]) / 2.0;
+    for gx in [cx - 4.0, cx + 4.0] {
+        parts.push(Solid::Shell { inner: Box::new(Solid::Cylinder { base: [gx, lo[1], lo[2]], r: 2.0, h: wh + 3.0, mat: wall.clone() }),
+                                  thickness: 1.0 });
+    }
+    parts.push(Solid::Union(vec![
+        Solid::Box { min: [cx - 2.0, lo[1], lo[2] - 2.0], max: [cx + 2.0, lo[1] + 4.0, lo[2] + 2.0], mat: Material::carved() },
+        Solid::Cylinder { base: [cx, lo[1] + 4.0, lo[2]], r: 2.0, h: 0.0, mat: Material::carved() },
+        Solid::Sphere { centre: [cx, lo[1] + 4.0, lo[2]], r: 2.0, mat: Material::carved() },
+    ]));
+    // the keep: a squat tower in the centre, with a pyramid roof
+    let cz = (lo[2] + hi[2]) / 2.0;
+    let kr = ((hi[0] - lo[0]).min(hi[2] - lo[2]) * 0.18).max(4.0);
+    let kh = wh * 1.8;
+    parts.push(Solid::Shell { inner: Box::new(Solid::Box { min: [cx - kr, lo[1], cz - kr], max: [cx + kr, lo[1] + kh, cz + kr],
+                                                           mat: wall.clone() }), thickness: 1.0 });
+    parts.push(Solid::Wedge { min: [cx - kr - 1.0, lo[1] + kh, cz - kr - 1.0], max: [cx + kr + 1.0, 0.0, cz + kr + 1.0],
+                              h: kr, axis: Axis::X, mat: acc.clone() });
+    parts.push(Solid::Box { min: [cx - 1.0, lo[1], cz - kr - 1.0], max: [cx + 1.0, lo[1] + 3.0, cz - kr + 1.0],
+                            mat: Material::carved() });
+    Solid::Union(parts)
+}
+
+/// A temple: a stepped base, a colonnade round a cella, a dome.
+fn temple(a: &FormArgs) -> Solid {
+    let (lo, hi) = (a.lo(), a.hi());
+    let st = crate::style::lookup(&a.style).unwrap_or_else(|| crate::style::lookup("elven").unwrap());
+    let stone = Material::structural(if a.block != 1 { a.block } else { 37 });
+    let acc = Material::accent(st.trim);
+    let mut parts: Vec<Solid> = Vec::new();
+    // three steps
+    let mut y = lo[1];
+    for s in 0..3 {
+        let inset = s as f32;
+        parts.push(Solid::Box { min: [lo[0] + inset, y, lo[2] + inset], max: [hi[0] - inset, y + 1.0, hi[2] - inset],
+                                mat: stone.clone() });
+        y += 1.0;
+    }
+    let (ix0, ix1, iz0, iz1) = (lo[0] + 3.0, hi[0] - 3.0, lo[2] + 3.0, hi[2] - 3.0);
+    let ch = a.num("h", 8).max(5) as f32;
+    // colonnade: pillars every 3 along all four sides
+    let (nx, nz) = (((ix1 - ix0) / 3.0) as u32 + 1, ((iz1 - iz0) / 3.0) as u32 + 1);
+    let pillar = |x: f32, z: f32| Solid::Cylinder { base: [x, y, z], r: 0.8, h: ch, mat: stone.clone() };
+    parts.push(Solid::Array { count: nx, step: [3.0, 0.0, 0.0], inner: Box::new(pillar(ix0, iz0)) });
+    parts.push(Solid::Array { count: nx, step: [3.0, 0.0, 0.0], inner: Box::new(pillar(ix0, iz1)) });
+    parts.push(Solid::Array { count: nz, step: [0.0, 0.0, 3.0], inner: Box::new(pillar(ix0, iz0)) });
+    parts.push(Solid::Array { count: nz, step: [0.0, 0.0, 3.0], inner: Box::new(pillar(ix1, iz0)) });
+    // entablature
+    parts.push(Solid::Shell { inner: Box::new(Solid::Box { min: [ix0 - 1.0, y + ch, iz0 - 1.0], max: [ix1 + 1.0, y + ch + 1.0, iz1 + 1.0],
+                                                           mat: acc.clone() }), thickness: 1.0 });
+    // cella: an inner room, with a door at the south
+    let (cx0, cx1, cz0, cz1) = (ix0 + 3.0, ix1 - 3.0, iz0 + 3.0, iz1 - 3.0);
+    parts.push(Solid::Diff(
+        Box::new(Solid::Shell { inner: Box::new(Solid::Box { min: [cx0, y, cz0], max: [cx1, y + ch, cz1], mat: stone.clone() }),
+                                thickness: 1.0 }),
+        Box::new(Solid::Box { min: [(cx0 + cx1) / 2.0 - 1.0, y, cz0 - 1.0], max: [(cx0 + cx1) / 2.0 + 1.0, y + 3.0, cz0 + 1.0],
+                              mat: Material::carved() })));
+    // dome over the cella
+    let cx = (cx0 + cx1) / 2.0;
+    let cz = (cz0 + cz1) / 2.0;
+    let dr = ((cx1 - cx0).min(cz1 - cz0) / 2.0).max(2.0);
+    parts.push(Solid::Intersect(
+        Box::new(Solid::Shell { inner: Box::new(Solid::Sphere { centre: [cx, y + ch, cz], r: dr, mat: acc.clone() }),
+                                thickness: 1.0 }),
+        Box::new(Solid::Box { min: [cx - dr - 1.0, y + ch, cz - dr - 1.0], max: [cx + dr + 1.0, y + ch + dr + 1.0, cz + dr + 1.0],
+                              mat: acc.clone() })));
     Solid::Union(parts)
 }
 
@@ -586,7 +768,8 @@ mod tests {
         let door_open = (65..67).all(|y| cells.get(&(6, y, 0)).map(|b| *b == 0).unwrap_or(true));
         assert!(door_open, "a doorway you can walk through");
         // and the interior is hollow
-        assert!(!cells.contains_key(&(6, 67, 4)) || cells[&(6, 67, 4)] == 0,
+        // y=66: inside the storey (64 floor, 65..67 room, 68 ceiling)
+        assert!(!cells.contains_key(&(6, 66, 4)) || cells[&(6, 66, 4)] == 0,
                 "the inside is a room, not a block of stone");
     }
 
@@ -747,6 +930,62 @@ mod tests {
                             "{style}: cell outside bounds");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn two_houses_from_one_line_differ_by_seed() {
+        let mk = |seed: i32, style: &str| {
+            let a = FormArgs { min: (0, 64, 0), max: (12, 64, 8), style: style.into(),
+                               block: 1, accent: 58, nums: vec![("seed".into(), seed)] };
+            rasterize(&house(&a))
+        };
+        let a = mk(1, "cottage");
+        let b = mk(2, "cottage");
+        let c = mk(3, "cottage");
+        assert!(a != b || b != c, "seeds change the variants");
+        for h in [&a, &b, &c] { assert!(h.values().filter(|v| **v != 0).count() > 200); }
+    }
+
+    #[test]
+    fn styles_change_the_house() {
+        let mk = |style: &str| {
+            let a = FormArgs { min: (0, 64, 0), max: (12, 64, 8), style: style.into(),
+                               block: 1, accent: 58, nums: vec![("seed".into(), 1)] };
+            rasterize(&house(&a))
+        };
+        let nordic = mk("nordic");
+        let desert = mk("desert");
+        let gothic = mk("gothic");
+        let top = |m: &std::collections::BTreeMap<(i32, i32, i32), u16>| m.keys().map(|k| k.1).max().unwrap();
+        assert!(top(&gothic) > top(&desert) + 4, "a gothic pitch is a flat roof's opposite: {} vs {}", top(&gothic), top(&desert));
+        assert!(nordic.values().any(|b| *b == 17), "nordic is log-built");
+        assert!(desert.values().any(|b| *b == 48), "desert is sandstone");
+    }
+
+    #[test]
+    fn castle_and_temple_are_whole_and_bounded() {
+        for (name, w, d) in [("castle", 40, 30), ("temple", 24, 16)] {
+            let a = FormArgs { min: (0, 64, 0), max: (w, 64, d), style: String::new(),
+                               block: 1, accent: 58, nums: vec![] };
+            let s = (lookup(name).unwrap().build)(&a);
+            let cells = rasterize(&s);
+            let n = cells.values().filter(|b| **b != 0).count();
+            assert!(n > 500, "{name}: {n} blocks");
+            let (lo, hi) = s.bounds().unwrap();
+            for (x, y, z) in cells.keys() {
+                assert!(*x >= lo[0] && *x <= hi[0] && *y >= lo[1] && *y <= hi[1] && *z >= lo[2] && *z <= hi[2], "{name}");
+            }
+            // an entrance: a gap in the south wall at ground level. A
+            // Diff leaves ABSENCE, not a zero cell, so look for a wall
+            // course with a hole in it rather than for carved cells.
+            let ground = 64 + if name == "temple" { 3 } else { 0 };
+            let south = cells.keys().filter(|k| k.1 == ground + 1 && *k != &(0, 0, 0)).map(|k| k.2).min().unwrap();
+            let row: Vec<i32> = cells.iter().filter(|(k, b)| **b != 0 && k.1 == ground + 1 && k.2 == south)
+                .map(|(k, _)| k.0).collect();
+            let (lo_x, hi_x) = (*row.iter().min().unwrap(), *row.iter().max().unwrap());
+            let gap = (lo_x..=hi_x).any(|x| !row.contains(&x));
+            assert!(gap, "{name}: the south course at z={south} has no gap: {row:?}");
         }
     }
 }

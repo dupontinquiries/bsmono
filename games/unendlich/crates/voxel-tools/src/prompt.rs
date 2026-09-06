@@ -153,8 +153,8 @@ pub fn system_prompt_for_model(params_billions: Option<f32>, ctx: usize, max_rep
 /// examples. Built from the same tables as the full one so it cannot
 /// name a form that does not exist.
 pub fn medium_prompt() -> String {
-    format!("{MEDIUM_HEAD}\n\nFORMS (use `form NAME A B`):\n{}\n\n{MEDIUM_TAIL}",
-            crate::dict::vocabulary())
+    format!("{MEDIUM_HEAD}\n\nFORMS (use `form NAME A B`):\n{}\n{}\n\n{MEDIUM_TAIL}",
+            crate::dict::vocabulary(), crate::style::vocabulary())
 }
 
 pub const MEDIUM_HEAD: &str = "\
@@ -184,7 +184,9 @@ OPERATIONS
   layer PACKET A B density=0.6          a forest: temperate, alpine, boreal,
                                         jungle, desert, darkwood, meadow
   river A dir=DEG len=N                 the terrain decides the path
-  form NAME A B [style]                 a named form (list below); statue takes
+  form NAME A B [style=NAME] [seed=N]   a named form (list below); style sets
+                                        materials, roof and proportions together;
+                                        seed varies the details. statue takes
                                         figure|gargoyle|idol|obelisk|colossus and
                                         pose=standing|seated|arms_up|kneeling
   mood NAME A B                         eerie, haunted, cosy, fiery, frozen,
@@ -262,8 +264,8 @@ pub fn system_prompt() -> String {
     // The world-change rule, the mood list and the form list are all
     // GENERATED from their tables, so the prompt cannot drift from what
     // the parser actually accepts.
-    format!("{GRAMMAR}\n\nFORMS (use `form NAME A B`):\n{}\n\n{}\n\n{DISCIPLINE}\n\n{}\n\n{EXAMPLES}",
-            crate::dict::vocabulary(), crate::mood::vocabulary(),
+    format!("{GRAMMAR}\n\nFORMS (use `form NAME A B`):\n{}\n{}\n\n{}\n\n{DISCIPLINE}\n\n{}\n\n{EXAMPLES}",
+            crate::dict::vocabulary(), crate::style::vocabulary(), crate::mood::vocabulary(),
             crate::intent::WORLD_DISCIPLINE)
 }
 

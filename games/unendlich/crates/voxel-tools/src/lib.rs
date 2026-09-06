@@ -109,6 +109,8 @@ pub mod gene;
 pub mod flora;
 /// Finishing from the words: adjectives add their own passes over the plan's box.
 pub mod finish;
+/// Styles: an axis every form reads -- materials, roof, proportions, finishing together.
+pub mod style;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.
