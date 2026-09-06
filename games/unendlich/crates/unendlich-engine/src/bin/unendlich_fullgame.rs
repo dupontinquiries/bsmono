@@ -4520,6 +4520,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     log::warn!("[paintbrush] save failed: {e}");
                 }
             }
+            match paintbrush.flush_training(&world_root) {
+                Ok(n) if n > 0 => log::info!("[paintbrush] {n} training line(s) appended"),
+                Err(e) => log::warn!("[paintbrush] training record failed: {e}"),
+                _ => {}
+            }
             renderer.chat_card = paintbrush.chatbox.current_card()
                 .map(|c| (c.command.to_string(), c.signature.to_string(), c.summary.to_string()));
             renderer.chat_matches = paintbrush.chatbox.matching_cards().iter()

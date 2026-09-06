@@ -147,6 +147,9 @@ pub struct ChatSession {
     pub last_prose: String,
     /// Living plants placed by commits, awaiting the engine.
     pub planted: Vec<crate::flora::PlantRequest>,
+    /// Training records from spec tuning: prose, spec, before, after.
+    /// The host appends them to the world's training file.
+    pub training: Vec<String>,
     /// A per-turn creative seed: the same request twice should not give
     /// the same building. Advanced by every plan received, so "another
     /// one" varies; a stated `seed=` in the IR still wins.
@@ -544,6 +547,39 @@ impl ChatSession {
                 finishing_why = why;
                 let again = dry_run(tools, &plan);
                 dry = again.0; placed = again.1; findings = again.2;
+            }
+        }
+        // SPEC TUNING. If the model said what the build should measure
+        // like, a pool of placers and destroyers is evolved toward it
+        // over the placed cells, and the winner's edits join the plan.
+        // The record of prose -> spec -> outcome is the training set.
+        let spec_line = plan.ops.iter().find_map(|o| match o { Op::Spec(s) => Some(s.clone()), _ => None });
+        if let (Some(line), false) = (spec_line, placed.is_empty()) {
+            if let Ok(spec) = crate::spec::Spec::parse(&line) {
+                let set: std::collections::BTreeSet<(i32, i32, i32)> = placed.iter().copied().collect();
+                let lo = placed.iter().fold((i32::MAX, i32::MAX, i32::MAX), |a, p| (a.0.min(p.0), a.1.min(p.1), a.2.min(p.2)));
+                let hi = placed.iter().fold((i32::MIN, i32::MIN, i32::MIN), |a, p| (a.0.max(p.0), a.1.max(p.1), a.2.max(p.2)));
+                let block = crate::plan::resolve_block("stone").unwrap_or(1);
+                match crate::spec::tune(&set, (lo, hi), f.anchor.1 - 1, &spec, block, self.creative_seed, 16, 12) {
+                    Some(t) => {
+                        // the winner's edits as IR: fills and carves the
+                        // plan already knows how to run and undo
+                        let mut ir = String::new();
+                        for ch in &t.changes {
+                            ir.push_str(&format!("fill {},{},{} {},{},{} block={}\n",
+                                ch.at.0, ch.at.1, ch.at.2, ch.at.0, ch.at.1, ch.at.2,
+                                if ch.to == 0 { "air" } else { "stone" }));
+                        }
+                        let (tune_plan, _) = parse_plan_at(&ir, None);
+                        plan.ops.extend(tune_plan.ops);
+                        finishing_why.push(format!("{}; now {}", t.summary(), t.after.describe()));
+                        self.training.push(crate::spec::training_line(prose, &spec, &t));
+                        let again = dry_run(tools, &plan);
+                        dry = again.0; placed = again.1; findings = again.2;
+                    }
+                    None => finishing_why.push(format!("spec {} -- already met, or nothing improved it",
+                                                       spec.describe())),
+                }
             }
         }
         let _ = &placed;
@@ -1352,5 +1388,24 @@ mod tests {
         let c = match s.receive_plan_gated(&mut t, &g, ir, None, "a hall") { Reply::Preview { echo, .. } => echo, o => panic!("{o:?}") };
         let pick = |e: &str| e.lines().find(|l| l.contains("boxy")).unwrap_or("").to_string();
         assert!(pick(&a) != pick(&b) || pick(&b) != pick(&c), "the breaker varies across turns:\n{}\n{}\n{}", pick(&a), pick(&b), pick(&c));
+    }
+
+    #[test]
+    fn a_spec_tunes_the_build_and_writes_a_training_line() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(0, 0, 10.0);
+        // an open box asked to be sealed and durable
+        let ir = "spec durability=high sound=muffled shelter=high\nenclose @-4,-4 @4,4 h=5 block=stone\n";
+        match s.receive_plan_gated(&mut t, &g, ir, None, "a bunker") {
+            Reply::Preview { echo, .. } => {
+                assert!(echo.contains("spec-tuned"), "{echo}");
+                assert!(echo.contains("target:"), "the echo shows the target: {echo}");
+            }
+            o => panic!("{o:?}"),
+        }
+        assert_eq!(s.training.len(), 1);
+        assert!(s.training[0].starts_with("a bunker\t"));
     }
 }

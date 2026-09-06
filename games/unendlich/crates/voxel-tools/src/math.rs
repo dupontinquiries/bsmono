@@ -239,6 +239,10 @@ pub fn check_math(plan: &BuildPlan, budget: i64) -> Vec<MathNote> {
                                             None => format!("evolve '{phrase}' for {gens} generations") }),
                      None);
             }
+            Op::Spec(line) => {
+                push(Note::Info, format!("target: {}",
+                     crate::spec::Spec::parse(line).map(|s| s.describe()).unwrap_or_default()), None);
+            }
             Op::Brush { op, amount, radius, falloff, .. } => {
                 let cols = (std::f64::consts::PI * (*radius as f64).powi(2)) as i64;
                 let est = cols * (*amount as i64).abs().max(1) / 2;

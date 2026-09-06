@@ -1444,6 +1444,23 @@ impl Paintbrush {
         self.state_dirty = false;
     }
 
+    /// Append spec-tuning records to the world's training file: one
+    /// tab-separated line per tuned build -- prose, the spec the model
+    /// wrote, what the plan measured, what the tuned build measured.
+    /// A dataset for fine-tuning the model to write specs its plans
+    /// already meet. Drained from the session; nothing is lost if the
+    /// write fails, only not recorded.
+    pub fn flush_training(&mut self, world_root: &std::path::Path) -> std::io::Result<usize> {
+        if self.session.training.is_empty() { return Ok(0); }
+        let dir = world_root.join("paintbrush");
+        std::fs::create_dir_all(&dir)?;
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("training.tsv"))?;
+        let n = self.session.training.len();
+        for line in self.session.training.drain(..) { writeln!(f, "{line}")?; }
+        Ok(n)
+    }
+
     /// Save them. Called by the bin when `state_dirty` is set -- after a
     /// commit, a claim, a capture -- so a crash loses at most the last
     /// action. Small files; a write is cheap.

@@ -223,6 +223,10 @@ pub enum Op {
     /// a phrase, then apply the winner. Or run a stated genome.
     Greeble { min: (i32, i32, i32), max: (i32, i32, i32), phrase: String,
               gens: u32, seed: i32, genome: Option<String> },
+    /// A property spec the model emits beside its plan. Does nothing
+    /// when run; the session reads it after the dry run and tunes the
+    /// build toward it.
+    Spec(String),
     /// A terrain brush: raise/lower/smooth/flatten/roughen with falloff.
     Brush { op: String, amount: i32, at: (i32, i32), radius: i32, falloff: String, seed: i32 },
     /// A painted layer baked into blocks: a forest, a meadow, a desert.
@@ -660,6 +664,12 @@ pub fn parse_plan_at(src: &str, anchor: Option<(i32, i32, i32)>) -> (BuildPlan, 
                     seed: kvi(&t, "seed", 1),
                     genome: t.iter().find_map(|s| s.strip_prefix("genome=")).map(|s| s.to_string()),
                 });
+            }
+            "spec" | "properties" => {
+                match crate::spec::Spec::parse(raw.trim()) {
+                    Ok(_) => ops.push(Op::Spec(raw.trim().to_string())),
+                    Err(e) => bad(format!("spec: {e}")),
+                }
             }
             "brush" => {
                 let Some(op) = t.get(1).map(|s| s.to_lowercase()) else {
@@ -1256,6 +1266,7 @@ pub fn run_plan_with<W: VoxelWorld>(
                 if r.ok { r.summary = format!("greeble: {note}"); }
                 r
             })(),
+            Op::Spec(_) => CallResult { ok: true, summary: "spec noted".into(), ..Default::default() },
             Op::Brush { op, amount, at, radius, falloff, seed } => {
                 use crate::brush::{self, Brush, BrushOp, Falloff};
                 let bop = match op.as_str() {

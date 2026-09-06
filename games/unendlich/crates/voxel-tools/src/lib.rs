@@ -111,6 +111,8 @@ pub mod flora;
 pub mod finish;
 /// Styles: an axis every form reads -- materials, roof, proportions, finishing together.
 pub mod style;
+/// Spec-driven tuning: model-emitted property targets, a genetic placer/destroyer pool, a training record.
+pub mod spec;
 /// The model seam: Completer trait, reply cleaning, fakes.
 pub mod llm;
 /// One build turn end to end.

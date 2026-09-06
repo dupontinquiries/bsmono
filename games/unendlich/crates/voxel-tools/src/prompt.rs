@@ -194,7 +194,8 @@ OPERATIONS
   populate KIND A B count=N [name=X]    creatures or NPCs for the engine
   detail speckle|trim|relief A B        finishing passes
   weather A B abandoned|ancient         decay an existing build
-  def NAME ... end / use NAME @x,z [rot=90]   define once, place many";
+  def NAME ... end / use NAME @x,z [rot=90]   define once, place many
+  spec durability=high sound=muffled ...   what it should MEASURE like; put it first";
 
 pub const MEDIUM_TAIL: &str = "\
 RULES
@@ -423,6 +424,15 @@ layer boreal @-120,-60 @0,60 density=0.7 gentle
 layer meadow @0,-40 @60,40 density=0.4
 river @-50,10 dir=0 len=400
 
+EXAMPLE (a SPEC first: the model says what the build should measure like)
+  player: a bunker
+  plan:
+# bunker
+spec height=5-7 durability=high sound=muffled shelter=high openness=0.2
+enclose @-6,-6 @6,6 h=5 block=stone
+floor @-6,-6 @6,6 y=6 block=stone
+sphere @6,0 r=1 block=air
+
 EXAMPLE (massing; a lair for a named boss)
   player: build a fire dragon nest
   plan:
@@ -502,7 +512,7 @@ mod tests {
             assert!(!plan.ops.is_empty(), "example produced no ops:\n{src}");
             n += 1;
         }
-        assert_eq!(n, 8, "expected eight worked examples");
+        assert_eq!(n, 9, "expected nine worked examples");
     }
 
     #[test]
