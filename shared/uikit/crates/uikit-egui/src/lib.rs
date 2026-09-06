@@ -60,6 +60,8 @@ pub mod vertical_tabs;
 pub mod glass;
 /// The finish snapclone has, for any app: a live backdrop behind the glass panels, one line a frame.
 pub mod polish;
+/// A theme-aware, custom-drawn QR-shaped identicon and its expanded overlay (`QrCodeRenderer.cpp`, ported).
+pub mod qr;
 pub mod gesture_layer;
 pub mod touch;
 pub mod skin;
