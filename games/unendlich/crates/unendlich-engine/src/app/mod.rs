@@ -22,6 +22,7 @@ pub mod menu_view;
 pub mod live_menu;
 
 pub mod multiplayer_svc;
+pub mod device_svc; // the render box's multi-device session, per tick, answering the Devices screen
 
 use crate::sim::affinity_access::Fields;
 use crate::sim::bending_runtime::{BenderState, BenderTick, GestureInput};
