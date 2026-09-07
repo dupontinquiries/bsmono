@@ -25,6 +25,8 @@ pub mod real_layout;
 pub mod dictation;
 pub mod mic_source;
 pub mod tray;
+/// One-handed compaction: anchor the board to a corner and narrow it.
+pub mod halfboard;
 /// Full / Tray / Dismissed and every way between them (`docs/single-hand-mode.md`).
 pub mod visible_mode;
 pub mod microterm;
@@ -738,11 +740,13 @@ pub struct Style {
     pub opacity: f32,
     /// Show the magnifier bubble on press.
     pub magnifier: bool,
+    /// One-handed compaction: which side the board is anchored to.
+    pub half: crate::halfboard::Side,
 }
 
 impl Default for Style {
     fn default() -> Self {
-        Style { key_radius: None, opacity: 1.0, magnifier: true }
+        Style { key_radius: None, opacity: 1.0, magnifier: true, half: crate::halfboard::Side::Off }
     }
 }
 
@@ -758,6 +762,10 @@ impl Style {
             key_radius: Some((key_radius as f32).clamp(0.0, 24.0)),
             opacity: (opacity as f32).clamp(0.05, 1.0),
             magnifier,
+            // Not persisted: which hand is holding the phone is a right-now fact, not a
+            // preference. A keyboard that comes up compacted to the left because that is
+            // how you held it yesterday is a keyboard you have to un-compact.
+            half: crate::halfboard::Side::Off,
         }
     }
 
@@ -780,7 +788,17 @@ pub fn keyboard_ui_styled(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, pal
     let glass = palette == "system"; // the shared system-utilities look (gitmind/rusty-board): glass keys
     let gutter = adaptive.gutter;
     let key_h = adaptive.min_touch_target; // 44pt touch / 28pt pointer, from the adaptive layer
-    let total_w = ui.available_width();
+    // ONE-HANDED COMPACTION. The keys are laid into a narrower rect anchored to one side;
+    // everything else about the layout is unchanged, so every key keeps its relative place
+    // and the far edge comes within a thumb's reach. `Side::Off` returns the full rect, so
+    // this is a no-op for every caller that has not asked for it. See `halfboard`.
+    let full_rect = ui.max_rect();
+    let keys_rect = style.half.board_rect(full_rect);
+    let total_w = if keys_rect == full_rect { ui.available_width() } else { keys_rect.width() };
+    // The left inset for a right-anchored board. Added at the start of each row rather than
+    // by shrinking the Ui, because the rows compute their key widths from `total_w` and a
+    // shrunken Ui would fight that arithmetic instead of moving it.
+    let row_inset = keys_rect.min.x - full_rect.min.x;
 
     if glass {
         // Glass root surface: high-alpha tinted fill + a single top hairline highlight, matching the
@@ -815,7 +833,7 @@ pub fn keyboard_ui_styled(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, pal
         let total_weight: f32 = row.keys.iter().map(|k| k.weight).sum::<f32>().max(0.001);
         let usable = total_w - gutter * (row.keys.len() as f32 + 1.0);
         ui.horizontal(|ui| {
-            ui.add_space(gutter);
+            ui.add_space(gutter + row_inset);
             for key in &row.keys {
                 let w = (usable * (key.weight / total_weight)).max(8.0);
                 if let Some(e) = paint_key(ui, key, Vec2::new(w, key_h), gutter, &colors, glass, layout.hints, style) {
