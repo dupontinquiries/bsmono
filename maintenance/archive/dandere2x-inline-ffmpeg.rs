@@ -1,10 +1,10 @@
-// ARCHIVED: dandere2x's inline ffmpeg layer, and the CODECS PREFLIGHT its
+// ARCHIVED: bscale's inline ffmpeg layer, and the CODECS PREFLIGHT its
 //           successor does not have.
-// ORIGIN: apps/dandere2x/crates/dandere2x/src/ffmpeg.rs
+// ORIGIN: apps/bscale/crates/bscale/src/ffmpeg.rs
 // REMOVED: 51fc6e766 2026-09-03 — the d2x-job bundle merge promoted this
 //           concern into its own crate and left this file undeclared in src/.
 //           Found by orphan_check.py, not by anyone reading the merge.
-// SUPERSEDED-BY: apps/dandere2x/crates/d2x-job/src/ffmpeg.rs — same
+// SUPERSEDED-BY: apps/bscale/crates/d2x-job/src/ffmpeg.rs — same
 //           concat_parts / keyframe_times / open / open_segment / probe /
 //           segments, plus open_ranged.
 // LAST-KNOWN-GOOD: 5 tests passed at 05dd3c87 (2026-09-03), the last suite run

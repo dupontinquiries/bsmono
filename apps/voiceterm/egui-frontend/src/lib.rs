@@ -391,6 +391,8 @@ pub mod count_prefix;
 pub mod note_clip;
 /// Is a clipped selection code or prose, and in what language? (`TODO_notes_clip.md`.)
 pub mod clip_kind;
+/// Who owns the keyboard when a terminal is on screen (Tab, the arrows, and the sidebar).
+pub mod kbd_focus;
 // The GestureHost+SlidePopup replacement (grid gesture menus with QML-parity variants) lives in
 // the shared kit; re-exported under a voiceterm-familiar name.
 pub use uikit_egui::slide_menu;

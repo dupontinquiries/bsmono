@@ -1,9 +1,9 @@
-// ARCHIVED: dandere2x's inline job layer, and the MODEL SEARCH its successor
+// ARCHIVED: bscale's inline job layer, and the MODEL SEARCH its successor
 //           does not have.
-// ORIGIN: apps/dandere2x/crates/dandere2x/src/job.rs
+// ORIGIN: apps/bscale/crates/bscale/src/job.rs
 // REMOVED: 51fc6e766 2026-09-03 — same merge and same way as the ffmpeg file
 //           beside it.
-// SUPERSEDED-BY: apps/dandere2x/crates/d2x-job/src/job.rs — wider in every
+// SUPERSEDED-BY: apps/bscale/crates/d2x-job/src/job.rs — wider in every
 //           other respect (tiers, memory plans, a batch server, the segment
 //           runner and now resume).
 // LAST-KNOWN-GOOD: compiled at 05dd3c87 (2026-09-03) with no tests of its own.
@@ -107,11 +107,11 @@ impl Default for Job {
 /// So: only the 2.5 MB `realesr-animevideov3` is carried in-tree, as the
 /// working default. Everything else is found, not shipped.
 ///
-/// `DANDERE2X_MODELS` overrides, `~/models` and `~/models/upscale` are the
+/// `BSCALE_MODELS` overrides, `~/models` and `~/models/upscale` are the
 /// conventional homes, then XDG data, then the vendored fallback.
 pub fn model_search_dirs() -> Vec<PathBuf> {
     let mut v = Vec::new();
-    if let Ok(d) = std::env::var("DANDERE2X_MODELS") {
+    if let Ok(d) = std::env::var("BSCALE_MODELS") {
         v.push(PathBuf::from(d));
     }
     if let Ok(home) = std::env::var("HOME") {
@@ -120,9 +120,9 @@ pub fn model_search_dirs() -> Vec<PathBuf> {
         v.push(h.join("models"));
     }
     if let Ok(x) = std::env::var("XDG_DATA_HOME") {
-        v.push(PathBuf::from(x).join("dandere2x/models"));
+        v.push(PathBuf::from(x).join("bscale/models"));
     } else if let Ok(home) = std::env::var("HOME") {
-        v.push(PathBuf::from(home).join(".local/share/dandere2x/models"));
+        v.push(PathBuf::from(home).join(".local/share/bscale/models"));
     }
     // Vendored, last: a checkout's copy should never shadow one the operator
     // deliberately put in their own directory.

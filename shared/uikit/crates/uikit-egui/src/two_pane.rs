@@ -1,6 +1,6 @@
 //! two_pane — a controls column and the thing it controls.
 //!
-//! Two apps in this tree have the same shape and the same fault: dandere2x
+//! Two apps in this tree have the same shape and the same fault: bscale
 //! puts its settings in a 340pt left panel beside a preview, beatspace puts
 //! its morph controls in a 250pt left panel beside the latent pad. Both are
 //! reasonable on a laptop. On a 400pt phone the panel is most of the screen
@@ -95,7 +95,7 @@ pub fn two_pane_ui<T>(
 mod tests {
     use super::*;
 
-    // dandere2x's numbers: a 340pt settings column beside a preview.
+    // bscale's numbers: a 340pt settings column beside a preview.
     const WANT: f32 = 340.0;
     const MIN_C: f32 = 260.0;
     const MIN_V: f32 = 320.0;

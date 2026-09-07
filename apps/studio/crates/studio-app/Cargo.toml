@@ -18,8 +18,8 @@ studio-fx = { path = "../studio-fx" }
 studio-voice = { path = "../studio-voice" }
 studio-media = { path = "../studio-media" }
 studio-video = { path = "../studio-video" }
-# dandere2x as a library job (GPU via wgpu 29 behind its default-on `gpu` feature).
-d2x-job = { path = "../../../dandere2x/crates/d2x-job" }
+# bscale as a library job (GPU via wgpu 29 behind its default-on `gpu` feature).
+d2x-job = { path = "../../../bscale/crates/d2x-job" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 studio-copilot = { path = "../studio-copilot" }

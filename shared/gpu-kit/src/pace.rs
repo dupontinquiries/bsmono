@@ -8,7 +8,7 @@
 //! whole-frame upscale, or a scene with every mesh in one submission —
 //! stalls the entire desktop, not just the app that issued it. Nicing the
 //! process does nothing, because the queue is not scheduled by the CPU
-//! scheduler. That is why it shows up in dandere2x and in logscope-egui
+//! scheduler. That is why it shows up in bscale and in logscope-egui
 //! alike: same shape, two apps.
 //!
 //! The fix is to submit LESS AT A TIME, and the only way to know how much

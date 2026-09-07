@@ -2595,7 +2595,7 @@ should be gone from its output, which is the independent check that the
 de-duplication actually landed.
 
 
-## 81. dandere2x tile seams: pad raised, blending is the real fix
+## 81. bscale tile seams: pad raised, blending is the real fix
 
 Black seams at tile boundaries on ESRGAN footage. Cause is zero-padded convs
 (`pad: 1` throughout the RRDB/SRVGG bodies): at a tile's feature-space edge the
@@ -2881,7 +2881,7 @@ the 134% accounting) all held up and led somewhere.
 - §72's duplications: bo-controller/bo-mux `passby_canceller` (9 shared
   names), bot-arena `fsm.rs` vs its doc copy (7). Both found by the function
   audit, so both are measured rather than inferred.
-- dandere2x CPU-path blending, and the missing high-frequency fixture.
+- bscale CPU-path blending, and the missing high-frequency fixture.
 
 
 ## 91. Merged bo-suite-continued-2 (9 commits, zero overlap)

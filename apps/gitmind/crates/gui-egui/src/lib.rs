@@ -8,6 +8,8 @@ pub mod ssh_runner;
 pub mod pages;
 /// The layout rules a 360-point screen needs (see the phone photo and `tests/phone_layout.rs`).
 pub mod narrow;
+/// What gitmind listens for, over `voiced-core` (registration, grammar, and the action).
+pub mod voice_intents;
 /// The changed-file list's model: porcelain parsing and stage decisions.
 pub mod device_picker;
 pub mod peek_viewer;

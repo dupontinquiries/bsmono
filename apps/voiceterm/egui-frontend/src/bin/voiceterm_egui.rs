@@ -4240,7 +4240,27 @@ impl eframe::App for VoicetermApp {
                 "this host renders session.grid, not the widget's line buffer, \
                  so it must always be the encoder"
             );
+            // THE TERMINAL CLAIMS THE KEYBOARD, so Tab reaches the shell instead of
+            // selecting the next sidebar button. egui decides what Tab MEANS in
+            // `Memory::begin_pass`, before any app code runs, so consuming the key here was
+            // always too late — the fix is a real focusable widget with an event filter.
+            // See `kbd_focus`, which also explains why the old behaviour was intermittent.
+            let term_id = egui::Id::new(("terminal-keyboard", self.workspace.focused_pane()));
+            // The pane's own rect. Registered BEFORE the terminal's own widgets so a click
+            // on something drawn later still reaches it — egui resolves overlapping
+            // interactions in favour of the widget added last.
+            let claim_rect = ui.max_rect();
+            let claim = voiceterm_egui::kbd_focus::claim(
+                ui,
+                term_id,
+                claim_rect,
+                !self.surfaces.captures_input(),
+            );
             let key_outs = if self.surfaces.captures_input() {
+                Vec::new()
+            } else if claim == voiceterm_egui::kbd_focus::Claim::Yielded {
+                // A text field has it — a find bar, the palette, an inline editor. Not the
+                // terminal's keys to read.
                 Vec::new()
             } else {
                 // THE LIVE MODE, NOT THE DEFAULT.

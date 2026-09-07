@@ -70,7 +70,7 @@ def strip_test_mods(text):
 def leaf_crates():
     """Crates with code of their own, under apps/ and system/.
 
-    Workspace roots are skipped: `apps/dandere2x` has no `src/` and all its code
+    Workspace roots are skipped: `apps/bscale` has no `src/` and all its code
     is in `crates/*`, so scanning the root finds nothing and reports a clean
     bill for an app it never looked at.
 

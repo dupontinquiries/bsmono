@@ -32,7 +32,7 @@
 //! # Why JPEG and not AV1
 //!
 //! AVIF at the same visual quality is roughly half the size again, and the
-//! fleet already has AV1 machinery — dandere2x drives `libsvtav1` through
+//! fleet already has AV1 machinery — bscale drives `libsvtav1` through
 //! ffmpeg. But that is a native encoder invoked as a subprocess, and putting a
 //! process spawn on the shutter path costs a hundred milliseconds and a
 //! dependency on an ffmpeg build with the right encoder, which is exactly the

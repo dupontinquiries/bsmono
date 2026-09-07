@@ -199,14 +199,14 @@ suite (reported 102/0) was not re-run, and rusty-board's wayland/GTK and KWin
 script paths are not buildable in this sandbox. Each merge commit says so in
 its own message.
 
-## 8. dandere2x arrived as a SECOND LINEAGE, not a delta — decide before merging
+## 8. bscale arrived as a SECOND LINEAGE, not a delta — decide before merging
 
 `aaaa_tar.zst` carried seven bundles. Six merged (four clean, one with a
 resolvable conflict, and two that were ancestors of a third). The seventh,
-`dandere2x-since-59e520e3.bundle`, is not mergeable as it stands and the
+`bscale-since-59e520e3.bundle`, is not mergeable as it stands and the
 reason is worth writing down rather than rediscovering.
 
-**All 17 conflicts are add/add.** `apps/dandere2x` does not exist at the merge
+**All 17 conflicts are add/add.** `apps/bscale` does not exist at the merge
 base (`59e520e36`). Both sides created the whole app from nothing, and every
 one of the bundle's nine commits collides with files main already has —
 18 of 19 in the first commit, 12 of 12 in the second. There is no additive
@@ -229,7 +229,7 @@ lavapipe for three networks, keyframe-aligned segment parallelism, a difficulty
 cascade, memory budgets, a content-keyed block cache, and a hot-path audit
 tested bit-identical at 2/3/5/8 threads.
 
-**Main-only:** `crates/dandere2x/src/{ffmpeg,job}.rs` — the same two concerns
+**Main-only:** `crates/bscale/src/{ffmpeg,job}.rs` — the same two concerns
 the bundle promoted into `d2x-job` — plus the SEAM WORK. `feather`,
 `overlapped` and `tile_pad` appear in main and in NO bundle file.
 
@@ -335,7 +335,7 @@ are a pattern with a cheap detector.
 | `net::Blender` | 249 lines and its own tests; `write_output_rgba8` still hard-cropped | the commit that ported it said so |
 | `camera::viewfinder_height` | helper with tests, no callers, after its call site changed | noticing the tests were about nothing |
 | snapclone's shutter | fully wired; the FEEDBACK was a text line nobody sees | tracing it end to end instead of believing the report |
-| `crates/dandere2x/src/{ffmpeg,job}.rs` | 861 lines, 5 tests, undeclared in `src/` after a merge | `orphan_check.py` |
+| `crates/bscale/src/{ffmpeg,job}.rs` | 861 lines, 5 tests, undeclared in `src/` after a merge | `orphan_check.py` |
 
 Only the last was caught by a tool. `orphan_check.py` works at FILE
 granularity — a file with no `mod` reaching it — and every other row here is a
@@ -488,7 +488,7 @@ Cheapest route, in order:
    the workspace (photosync). Lossless, maybe 2-3× on photographic RGB. Least
    value, least risk, and does not change what a `.ppm` on disk is.
 2. **JPEG via the `image` crate**, already a dependency of photosync and
-   dandere2x. 15-30×, and `.jpg` is what a user expects a photo to be. Changes
+   bscale. 15-30×, and `.jpg` is what a user expects a photo to be. Changes
    the camera roll's file extension, so `save_ppm` and anything reading the
    directory move with it.
 
@@ -954,7 +954,7 @@ value being a superstring of the right one is the common case, not the rare
 one — a substring assertion there is close to no assertion at all.
 
 
-## 19. dandere2x seam blending: what the frame-resident rewrite costs to restore
+## 19. bscale seam blending: what the frame-resident rewrite costs to restore
 
 Recorded because merging c14unified-026's dandere line (67ed5800) dropped it,
 and the reason it cannot simply be re-applied is architectural rather than a
@@ -1281,7 +1281,7 @@ of these fixes touched it — degenerate/near-zero-area triangles (genuinely
 are both still on the table.
 
 
-## 24. dandere2x blocky artefacts: the merge hard-copies every residual block
+## 24. bscale blocky artefacts: the merge hard-copies every residual block
 
 Reported with a frame showing the block grid plainly: "still blocky artifacts
 but now it's because of the crossover and not a lack of color". The colour half

@@ -28,6 +28,9 @@ cockpit = { path = "../cockpit" }
 peek = { path = "../../../../tools/peek" }
 gitmind-core = { path = "../core" }
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
+# Voice intents: the routing brain apps register with. gitmind is two-handed work
+# (a phone in one hand, a device in the other), which is what voice is for.
+voiced-core = { path = "../../../../shared/voiced-core" }
 touchkit = { path = "../../../../shared/touchkit", features = ["egui"] }
 settings-kit = { path = "../../../../shared/settings-kit" }
 snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }

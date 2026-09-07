@@ -2383,7 +2383,7 @@ pub struct App {
     export_run: Option<export::Run>,
     export_done: Vec<std::path::PathBuf>,
     export_progress: (usize, usize, f32),
-    /// The clip a dandere2x bounce belongs to while its run is in flight;
+    /// The clip a bscale bounce belongs to while its run is in flight;
     /// landed from the tracker's Done.
     upscale_clip: Option<studio_core::ClipId>,
     upscale_settings: upscale::Settings,
@@ -2817,12 +2817,12 @@ impl eframe::App for App {
                         }
                     }
                 }
-                // dandere2x clip bounce: same shape as tune take (a whole-
+                // bscale clip bounce: same shape as tune take (a whole-
                 // clip pass landing a new clip), through the export tracker.
                 if !self.studio.selection.is_empty() && self.export_run.is_none() {
                     let busy = self.export_run.is_some();
                     if ui.add_enabled(!busy, egui::Button::new("upscale clip"))
-                        .on_hover_text("dandere2x: block-matched Real-ESRGAN upscale of the selected clip's range, to a new clip beside it (D2X_MODEL selects the model; default is the fast anime-video net)")
+                        .on_hover_text("bscale: block-matched Real-ESRGAN upscale of the selected clip's range, to a new clip beside it (D2X_MODEL selects the model; default is the fast anime-video net)")
                         .clicked()
                     {
                         let settings = self.upscale_settings.clone();

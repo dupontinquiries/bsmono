@@ -58,6 +58,8 @@ pub mod carved;
 pub mod dock;
 pub mod vertical_tabs;
 pub mod glass;
+/// Text and edges on the device-pixel grid (the "tall blurry font" report).
+pub mod crisp;
 /// The finish snapclone has, for any app: a live backdrop behind the glass panels, one line a frame.
 pub mod polish;
 /// A theme-aware, custom-drawn QR-shaped identicon and its expanded overlay (`QrCodeRenderer.cpp`, ported).

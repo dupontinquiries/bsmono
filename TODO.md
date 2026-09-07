@@ -919,7 +919,7 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
 
 Raised by the operator running the apps; each is marked with how far I got.
 None of these are merge fallout: the two bundles merged this session touched
-only `apps/dandere2x` and `games/blackstar-rs` (checked with
+only `apps/bscale` and `games/blackstar-rs` (checked with
 `git diff --name-only` on both merge commits), so voiceterm, aperture and
 beatspace are untouched by them. Answering that directly because it was
 asked as a question.
@@ -974,15 +974,15 @@ asked as a question.
 - [ ] **aperture: command palette and sizing.** REPORTED, not investigated.
   `uikit_egui::command_bar` (new this session) is the intended answer —
   aperture is a second consumer for it, alongside snapclone.
-- [x] **dandere2x launches the CLI from gitmind, not the GUI.** FIXED
+- [x] **bscale launches the CLI from gitmind, not the GUI.** FIXED
   2026-09-05. The subcommand was REQUIRED, so a launcher running the bare
-  binary got clap's usage text and dandere2x looked CLI-only.
+  binary got clap's usage text and bscale looked CLI-only.
   The binary is CLI-first with the GUI behind the `app` subcommand
-  (`Cmd::App` in `crates/dandere2x/src/main.rs`) — so a launcher invoking
+  (`Cmd::App` in `crates/bscale/src/main.rs`) — so a launcher invoking
   the bare binary gets the CLI usage text. Whatever gitmind's app catalog
-  records for dandere2x needs `app` appended, or dandere2x needs to default
+  records for bscale needs `app` appended, or bscale needs to default
   to the GUI when run with no subcommand and a display present.
-- [x] **dandere2x: drag-and-drop onto the input, with a confirmation.**
+- [x] **bscale: drag-and-drop onto the input, with a confirmation.**
   DONE 2026-09-05 (`d2x_core::dropped` + a confirm dialog). Dialog itself
   not screenshotted — synthesising a real X11 drop needs a drag source.
   WAS: eframe surfaces dropped files via `ctx.input(|i| &i.raw.dropped_files)`;
@@ -1048,11 +1048,11 @@ asked as a question.
   carries `crop_x/crop_y/crop_w/crop_h`, so the shape is there. Do the
   measurement pass on real hardware FIRST; if `overrun_rate()` is near zero
   on the target machine the splitting is not worth its complexity.
-- [~] **A metrics pane in each app.** dandere2x DONE 2026-09-05
+- [~] **A metrics pane in each app.** bscale DONE 2026-09-05
   (`d2x_core::jobmetrics` + `metrics_pane`, rendered in `carved::inset`).
   Other apps still to do. `gpu_kit::pace::Metrics::summary()`
   renders the line and `overrun_rate()` is the single number worth showing.
-  dandere2x can read it today via `gpu_metrics()`; logscope needs the same
+  bscale can read it today via `gpu_metrics()`; logscope needs the same
   instrumentation around its `glow_scene` draw first.
 - [ ] **logscope scene props need more depth.** Reported alongside the
   stutter; not started. The props read as flat next to the reference images.

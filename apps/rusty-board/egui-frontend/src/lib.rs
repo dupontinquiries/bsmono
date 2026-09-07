@@ -763,7 +763,19 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
     let painter = ui.painter();
     let pressed = resp.is_pointer_button_down_on();
     let rounding = CornerRadius::same((size.y * 0.18) as u8);
-    let font = FontId::proportional((size.y * 0.42).clamp(11.0, 26.0));
+    // ON THE PIXEL GRID. A cap font of `key_height * 0.42` is 18.48pt on a 44pt key, and at
+    // a 1.25 or 1.5 desktop scale that is 23.1 or 27.72 DEVICE pixels — a glyph with no
+    // whole-pixel stem in it, which reads as soft and slightly tall. It also made egui
+    // re-rasterise the whole alphabet whenever a key changed height by a fraction, since
+    // its glyph atlas is keyed on the exact size. See `uikit_egui::crisp`.
+    let ppp = ui.ctx().pixels_per_point();
+    let font = FontId::proportional(uikit_egui::crisp::snap_font_pt(
+        (size.y * 0.42).clamp(11.0, 26.0),
+        ppp,
+    ));
+    // And the cap itself: a 1px border at x = 40.3 covers 70% of one column and 30% of the
+    // next — two grey columns instead of one line, on every key at once.
+    let rect = uikit_egui::crisp::snap_rect(rect, ppp);
     // THE PRESS SCALES, as the GTK cap does. `.key-button:active { transform: scale(0.94) }`
     // with a bouncy release — the port only changed colour, and on a phone a cap that does
     // not move under the thumb reads as a key that did not register. The rect shrinks about
@@ -826,7 +838,10 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
     // swipes at rest (FlickBoard/MessagEase draw every direction's glyph in its corner). Only the
     // four cardinals ride the edges; diagonals sit in their corners.
     if hints && !key.cardinal.is_empty() {
-        let hint = FontId::proportional((size.y * 0.22).clamp(8.0, 13.0));
+        let hint = FontId::proportional(uikit_egui::crisp::snap_font_pt(
+            (size.y * 0.22).clamp(8.0, 13.0),
+            ppp,
+        ));
         let hint_color = c.text.gamma_multiply(0.55);
         let inset = size.y * 0.16;
         for (d, s) in &key.cardinal {
@@ -1654,6 +1669,36 @@ mod gtk_parity_tests {
         // an unknown key_type from a newer layout renders as a plain key rather than failing
         assert_eq!(KeyRole::from_json("navigation"), KeyRole::Normal);
         assert_eq!(KeyRole::from_json("ACTION"), KeyRole::Action, "case does not matter");
+    }
+
+    /// The reported desktop fault: tall, blurry caps. Every glyph the board paints must be
+    /// at a size that is a whole number of DEVICE pixels, at whatever scale the desktop is
+    /// running — otherwise the stems land between columns and the text softens.
+    #[test]
+    fn every_cap_label_is_rasterised_on_the_pixel_grid() {
+        let board = Board::new();
+        for ppp in [1.0f32, 1.25, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(ppp);
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(731.0, 263.0)));
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = keyboard_ui(ui, board.current(), &Adaptive::detect(ctx), "system");
+                });
+            });
+            let sizes: Vec<f32> = uikit_egui::layout_probe::texts(&out.shapes).iter().map(|t| t.font_pt).collect();
+            assert!(!sizes.is_empty(), "no labels painted at {ppp}x");
+            for s in &sizes {
+                let px = s * ppp;
+                assert!(
+                    (px - px.round()).abs() < 0.02,
+                    "a cap at {ppp}x is {s}pt = {px} device pixels — a fractional glyph is the blur",
+                );
+            }
+            // and a deliberately awkward width does not change that
+            assert!(sizes.iter().all(|s| *s >= 10.0), "a cap shrank below legibility: {sizes:?}");
+        }
     }
 
     /// The ribbon is a strip of words with one hairline under it, not a second row of keys.

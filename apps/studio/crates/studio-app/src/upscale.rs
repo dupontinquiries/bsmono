@@ -1,6 +1,6 @@
-//! Upscale a clip through dandere2x — print-side, like autotune.
+//! Upscale a clip through bscale — print-side, like autotune.
 //!
-//! dandere2x is sequential: every output frame depends on the previous
+//! bscale is sequential: every output frame depends on the previous
 //! *output* (blocks that passed the quality gate are copied from it), so it
 //! cannot be a chain effect any more than autotune can; a scrub-able
 //! per-frame effect that silently needed the whole clip in order would be a

@@ -11,8 +11,8 @@ path = "src/main.rs"
 [dependencies]
 # Experimental video upscaling. Path deps, optional, so a default build of
 # beatspace neither compiles nor downloads any of it.
-d2x-core = { path = "../dandere2x/crates/d2x-core", optional = true }
-d2x-wgpu = { path = "../dandere2x/crates/d2x-wgpu", optional = true }
+d2x-core = { path = "../bscale/crates/d2x-core", optional = true }
+d2x-wgpu = { path = "../bscale/crates/d2x-wgpu", optional = true }
 # Native folder picker for the training page. xdg-portal so it works under a
 # Wayland compositor on mobile Linux without dragging in GTK — this fleet
 # targets postmarketOS as well as desktops.
@@ -114,7 +114,7 @@ cuda  = ["candle-core/cuda",  "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 # Batched generator inference on the GPU via wgpu (Vulkan on Asahi/Linux).
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
-# Video super-resolution for rendered output, via apps/dandere2x's headless
+# Video super-resolution for rendered output, via apps/bscale's headless
 # engine. OFF BY DEFAULT and deliberately so: it is experimental, it pulls
 # image+rayon, and the useful photo models are 67 MB downloads the operator
 # supplies from ~/models. Off means an upscale request is refused with a

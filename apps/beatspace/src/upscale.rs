@@ -1,6 +1,6 @@
 //! Super-resolution for rendered output, behind the `upscale` feature.
 //!
-//! The engine is `apps/dandere2x`'s headless core — block-matched residual
+//! The engine is `apps/bscale`'s headless core — block-matched residual
 //! upscaling, where only the parts of a frame that changed go through the CNN.
 //! That is the right shape for a visualiser: most of a beatspace frame is
 //! unchanged background between beats, so the residual gate does most of the
@@ -17,7 +17,7 @@
 pub enum Source {
     /// Resolved from the operator's model directory.
     Found(std::path::PathBuf),
-    /// The 2.5 MB default that dandere2x vendors.
+    /// The 2.5 MB default that bscale vendors.
     Vendored(std::path::PathBuf),
 }
 
@@ -40,7 +40,7 @@ impl Unavailable {
             Unavailable::NoModel { looked_in } => format!(
                 "upscaling is available but no model was found. Put a .safetensors model in \
                  ~/models/upscale/ (realesr-animevideov3 is the small default; RealESRGAN_x2 \
-                 is the 67 MB photo model), or set DANDERE2X_MODELS. Looked in: {}",
+                 is the 67 MB photo model), or set BSCALE_MODELS. Looked in: {}",
                 looked_in.join(", ")),
         }
     }
@@ -52,7 +52,7 @@ impl Unavailable {
 /// no-model cases, so a caller has one thing to show the user either way.
 #[cfg(feature = "upscale")]
 pub fn probe() -> Result<Source, Unavailable> {
-    // Model resolution belongs to dandere2x, not here — a second search path
+    // Model resolution belongs to bscale, not here — a second search path
     // would drift from the first, which is the failure this monorepo keeps
     // hitting. Ask it.
     let dirs: Vec<String> = d2x_core::model_search_dirs_display();

@@ -1224,7 +1224,7 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     //
     //   hatch, drivemind, switcheroo, dialer — workspaces whose runnable crate
     //   is a member, the same shape as aperture and cadscope.
-    //   dandere2x — a workspace AND it needs `gpu,app`; the bin is a member
+    //   bscale — a workspace AND it needs `gpu,app`; the bin is a member
     //   with the same name as the workspace, which is what makes a bare entry
     //   look plausible and build nothing.
     let hatch = || crate::suite::SuiteApp {
@@ -1246,15 +1246,15 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
         // The crate is `switcheroo-egui`; its bin is `switcheroo`.
         bin_name: Some("switcheroo".into()),
     };
-    let dandere2x = || crate::suite::SuiteApp {
-        name: "dandere2x".into(),
-        path: "apps/dandere2x/crates/dandere2x".into(),
+    let bscale = || crate::suite::SuiteApp {
+        name: "bscale".into(),
+        path: "apps/bscale/crates/bscale".into(),
         // Its own default is `gpu,app`, but `no_default` elsewhere in this
         // store means a caller can end up with neither; naming them is what
         // the operator's own build line does.
         features: vec!["gpu".into(), "app".into()],
         no_default: false, target: String::new(), run_flags: String::new(),
-        bin_name: Some("dandere2x".into()),
+        bin_name: Some("bscale".into()),
     };
     let dialer = || crate::suite::SuiteApp {
         name: "dialer".into(),
@@ -1283,7 +1283,7 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     // sharing its core — the README's own framing.
     media_group.apps.push(studio());
     media_group.apps.push(unendlich());
-    media_group.apps.push(dandere2x());
+    media_group.apps.push(bscale());
     let mut all_group = group("bigsilicons-apps", "Every BigSilicon app — build all in one go", &all);
     all_group.apps.push(bsettings());
     all_group.apps.push(ambient_learner());
@@ -1291,7 +1291,7 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     all_group.apps.push(switcheroo());
     all_group.apps.push(hatch());
     all_group.apps.push(drivemind());
-    all_group.apps.push(dandere2x());
+    all_group.apps.push(bscale());
     all_group.apps.push(beatspace());
     all_group.apps.push(studio());
     all_group.apps.push(aperture());
@@ -1381,7 +1381,7 @@ mod store_group_tests {
             "bsettings", "studio", "aperture", "cadscope", "simscope", "ambient-learner",
             // Five apps the store did not offer at all until they were added;
             // each is a workspace whose runnable crate is a member.
-            "hatch", "drivemind", "switcheroo", "dialer", "dandere2x",
+            "hatch", "drivemind", "switcheroo", "dialer", "bscale",
         ];
         for a in &all.apps {
             assert!(!a.path.contains('/') || EXPLICIT_PATH.contains(&a.name.as_str()),
