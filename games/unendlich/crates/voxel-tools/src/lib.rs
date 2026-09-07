@@ -123,6 +123,8 @@ pub mod latent;
 pub mod expr;
 /// Parts and relations without coordinates, and the solver that grounds them.
 pub mod sketch;
+/// The architectural brief: a schedule of spaces, an adjacency matrix, and a layout.
+pub mod brief;
 /// Four passes: what is it, what is it made of, where does it go, do it.
 pub mod compose;
 /// Assets built once and repeated, then passes that add or cut: the sculptor's loop.
