@@ -66,6 +66,56 @@ pub struct Typology {
     pub name: &'static str,
     pub summary: &'static str,
     pub sections: Vec<Section>,
+    /// Gross floor area for an ORDINARY one of these, in blocks
+    /// squared. A castle is not a house and "huge" means something
+    /// different to each: a huge house is a manor, a huge castle is a
+    /// fortress. Scale words multiply THIS, so the type sets the
+    /// register and the word sets the degree.
+    pub base_area: i32,
+}
+
+/// What a scale word does to the base. Multiplicative, because scale
+/// is a ratio: "twice as big" is meaningful and "500 bigger" is not.
+///
+/// `share *= 2.4` on a section was the only thing "huge" did before,
+/// which scales one part's slice of a FIXED total -- a huge keep stole
+/// its area from the courtyard and the castle stayed the same size.
+/// The whole never grew, so "a huge fortress" built the same 4,000 as
+/// "a fortress".
+pub fn scale_word(w: &str) -> Option<f32> {
+    Some(match w {
+        "tiny" | "miniature" => 0.15,
+        "small" | "modest" | "little" | "humble" => 0.4,
+        "" | "ordinary" | "normal" => 1.0,
+        "large" | "big" | "grand" | "sizeable" => 2.2,
+        "huge" | "great" | "major" => 4.5,
+        "enormous" | "vast" | "massive" | "immense" => 9.0,
+        "colossal" | "titanic" | "monumental" | "gigantic" => 16.0,
+        _ => return None,
+    })
+}
+
+/// The gross floor area a request implies. The type sets the register,
+/// the scale word sets the degree, and an explicit number beats both.
+pub fn scale_for(request: &str, t: &Typology) -> (i32, String) {
+    let low = request.to_lowercase();
+    let words: Vec<&str> = low.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    // an explicit area wins outright: "a castle of 20000"
+    if let Some(n) = words.iter().enumerate().find_map(|(i, w)| {
+        let n: i32 = w.parse().ok()?;
+        if n < 200 { return None; }
+        // guard against reading a year or a count as an area
+        let prev = i.checked_sub(1).and_then(|j| words.get(j)).copied().unwrap_or("");
+        if ["of", "about", "around", "roughly"].contains(&prev) || n >= 1000 { Some(n) } else { None }
+    }) { return (n.clamp(200, 4_000_000), format!("{n} was asked for outright")); }
+    // the biggest scale word present, so "a large huge castle" is huge
+    let found = words.iter().filter_map(|w| scale_word(w).map(|f| (*w, f)))
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    match found {
+        Some((w, f)) => ((t.base_area as f32 * f).round() as i32,
+                         format!("a {w} {} is {f}x the ordinary {}", t.name, t.base_area)),
+        None => (t.base_area, format!("an ordinary {} is {}", t.name, t.base_area)),
+    }
 }
 
 fn sec(name: &str, need: Need, share: f32, prominence: f32,
@@ -80,7 +130,7 @@ fn sec(name: &str, need: Need, share: f32, prominence: f32,
 /// one is to say what a thing IS.
 pub fn typologies() -> Vec<Typology> {
     vec![
-        Typology { name: "castle", summary: "a wall that encloses, a keep that dominates, a way in",
+        Typology { base_area: 9000, name: "castle", summary: "a wall that encloses, a keep that dominates, a way in",
             sections: vec![
                 sec("curtain wall", Need::Essential, 0.30, 1.5, &["encloses", "perimeter"],
                     &[("wall walk", 200), ("corner tower", 60)]),
@@ -97,7 +147,7 @@ pub fn typologies() -> Vec<Typology> {
                 sec("barracks", Need::Optional, 0.10, 1.0, &["inside"],
                     &[("dormitory", 160), ("armoury", 60)]),
             ] },
-        Typology { name: "temple", summary: "an approach, a threshold, a sanctuary at the end of it",
+        Typology { base_area: 5000, name: "temple", summary: "an approach, a threshold, a sanctuary at the end of it",
             sections: vec![
                 sec("sanctuary", Need::Essential, 0.30, 2.5, &["axial", "tallest"],
                     &[("cella", 180), ("altar", 30)]),
@@ -110,7 +160,7 @@ pub fn typologies() -> Vec<Typology> {
                 sec("treasury", Need::Optional, 0.06, 1.0, &["inside"], &[("strongroom", 60)]),
                 sec("tower", Need::Optional, 0.10, 4.0, &["tallest", "perimeter"], &[("belfry", 40)]),
             ] },
-        Typology { name: "town", summary: "a centre, streets that reach it, edges that end it",
+        Typology { base_area: 22000, name: "town", summary: "a centre, streets that reach it, edges that end it",
             sections: vec![
                 sec("market square", Need::Essential, 0.14, 0.0, &["inside", "ground"],
                     &[("square", 500), ("well", 10)]),
@@ -124,7 +174,7 @@ pub fn typologies() -> Vec<Typology> {
                     &[("quay", 300), ("warehouse", 120)]),
                 sec("temple", Need::Optional, 0.10, 2.0, &["axial"], &[("nave", 150)]),
             ] },
-        Typology { name: "house", summary: "somewhere to be, somewhere to cook, somewhere to sleep",
+        Typology { base_area: 260, name: "house", summary: "somewhere to be, somewhere to cook, somewhere to sleep",
             sections: vec![
                 sec("living", Need::Essential, 0.34, 1.0, &["daylight", "ground"],
                     &[("hall", 40), ("hearth", 10)]),
@@ -136,7 +186,7 @@ pub fn typologies() -> Vec<Typology> {
                 sec("workshop", Need::Optional, 0.16, 1.0, &["ground", "detached"], &[("shop", 40)]),
                 sec("byre", Need::Optional, 0.14, 1.0, &["ground", "detached"], &[("stall", 40)]),
             ] },
-        Typology { name: "tower", summary: "a base, a shaft, something at the top worth climbing to",
+        Typology { base_area: 900, name: "tower", summary: "a base, a shaft, something at the top worth climbing to",
             sections: vec![
                 sec("base", Need::Essential, 0.28, 1.0, &["ground", "perimeter"],
                     &[("entrance", 40), ("store", 60)]),
@@ -149,9 +199,52 @@ pub fn typologies() -> Vec<Typology> {
     ]
 }
 
+/// Other words for the same type. "A huge fortress" found NO typology
+/// at all and the whole chain fell over, because `lookup` matched only
+/// the literal name -- and nobody says "castle" when they mean a
+/// fortress, a citadel or a stronghold.
+const ALIASES: &[(&str, &[&str])] = &[
+    ("castle", &["fortress", "citadel", "stronghold", "fort", "keep", "palace", "chateau"]),
+    ("temple", &["shrine", "cathedral", "church", "basilica", "monastery", "sanctuary", "abbey"]),
+    ("town", &["city", "village", "settlement", "hamlet", "port", "metropolis"]),
+    ("house", &["cottage", "home", "hut", "dwelling", "manor", "farmhouse", "lodge", "cabin"]),
+    ("tower", &["spire", "lighthouse", "watchtower", "minaret", "obelisk", "belfry"]),
+];
+
 pub fn lookup(name: &str) -> Option<Typology> {
     let n = name.trim().to_lowercase();
-    typologies().into_iter().find(|t| n == t.name || n.contains(t.name))
+    let words: Vec<&str> = n.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let has = |w: &str| words.iter().any(|x| *x == w);
+    // the literal name first, then the aliases, and the LONGEST match
+    // wins so "a temple town" is a town rather than a temple only
+    // because "town" appears later -- both are found and the last word
+    // in the request is the head noun
+    // WHOLE WORDS, by position in the word list. `rfind` on the raw
+    // string matched "house" inside "lighthouse" and made a lighthouse
+    // a dwelling. A type name that is a substring of another word is
+    // not a mention of that type.
+    let word_at = |needle: &str| -> Option<usize> {
+        let parts: Vec<&str> = needle.split(' ').collect();
+        (0..words.len()).rev()
+            .find(|i| parts.iter().enumerate().all(|(k, p)| words.get(i + k) == Some(p)))
+    };
+    let mut best: Option<(usize, Typology)> = None;
+    for t in typologies() {
+        let mut at = word_at(t.name);
+        for (base, alts) in ALIASES {
+            if *base != t.name { continue; }
+            for a in *alts {
+                if has(a) {
+                    let p = word_at(a);
+                    if at.map(|x| p.unwrap_or(0) > x).unwrap_or(true) { at = p; }
+                }
+            }
+        }
+        if let Some(p) = at {
+            if best.as_ref().map(|(bp, _)| p > *bp).unwrap_or(true) { best = Some((p, t)); }
+        }
+    }
+    best.map(|(_, t)| t)
 }
 
 pub fn vocabulary() -> String {
@@ -236,6 +329,12 @@ pub fn triage_one(text: &str, t: &Typology) -> Wish {
     if let Some(c) = CONSTRAINTS.iter().find(|c| has(c)) {
         return Wish::Constrain { what: format!("{c}: {}", text.trim()) };
     }
+    // A bare scale word -- "a huge fortress" -- is about the WHOLE, and
+    // `scale_for` has it. Recording it as a modification of nothing, or
+    // as a quality, would double-count it.
+    if words.iter().any(|w| scale_word(w).is_some()) && named.is_none() {
+        return Wish::Constrain { what: format!("scale: {}", text.trim()) };
+    }
     if let Some(q) = QUALITIES.iter().find(|q| has(q)) {
         return Wish::Quality { word: q.to_string() };
     }
@@ -285,6 +384,10 @@ pub fn triage(request: &str, t: &Typology) -> Vec<Wish> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Massing {
     pub typology: &'static str,
+    /// The gross area the request implied, and why. A massing that
+    /// does not carry its own scale gets one invented downstream.
+    pub implied_total: i32,
+    pub scale_note: String,
     pub sections: Vec<Section>,
     pub constraints: Vec<String>,
     pub qualities: Vec<String>,
@@ -302,7 +405,8 @@ impl Massing {
             .collect()
     }
     pub fn summary(&self, total: i32) -> String {
-        let mut s = format!("{}: {} section(s) over {total}\n", self.typology, self.sections.len());
+        let mut s = format!("{}: {} section(s) over {total} ({})\n",
+                            self.typology, self.sections.len(), self.scale_note);
         for (n, a, p) in self.areas(total) {
             s.push_str(&format!("  {n:<16} {a:>6}  prominence {p:.1}\n"));
         }
@@ -314,10 +418,23 @@ impl Massing {
 
 /// Apply triaged wishes to a typology: this is the step that turns
 /// "what the client said" into "what is being built".
+/// Apply wishes AND read the scale from the request. The scale is part
+/// of what the client said, and reading it anywhere else means the
+/// massing carries a number nobody chose.
+pub fn apply_for(request: &str, t: &Typology, wishes: &[Wish]) -> Massing {
+    let mut m = apply(t, wishes);
+    let (total, why) = scale_for(request, t);
+    m.implied_total = total;
+    m.scale_note = why;
+    m
+}
+
 pub fn apply(t: &Typology, wishes: &[Wish]) -> Massing {
     let mut sections: Vec<Section> = t.sections.iter()
         .filter(|s| s.need == Need::Essential).cloned().collect();
-    let mut m = Massing { typology: t.name, sections: Vec::new(), constraints: Vec::new(),
+    let mut m = Massing { typology: t.name, implied_total: t.base_area,
+                          scale_note: format!("an ordinary {} is {}", t.name, t.base_area),
+                          sections: Vec::new(), constraints: Vec::new(),
                           qualities: Vec::new(), unplaced: Vec::new(), log: Vec::new() };
     for w in wishes {
         match w {
@@ -512,7 +629,10 @@ pub fn parse_massing(src: &str, base: &Massing) -> (Massing, i32, Vec<String>) {
             _ => {}
         }
     }
-    if total <= 0 { total = 4000; errs.push("no total given; assumed 4000".into()); }
+    if total <= 0 {
+        total = base.implied_total.max(1);
+        errs.push(format!("no total given; used the {} implied by the request", total));
+    }
     (m, total, errs)
 }
 
@@ -661,10 +781,11 @@ mod tests {
         assert_eq!(m2.sections.iter().find(|s| s.name == "keep").unwrap().share, 0.5);
         assert!(!m2.sections.iter().any(|s| s.name == "courtyard"));
         assert!(m2.sections.iter().any(|s| s.name == "gatehouse"), "the rest is left alone");
-        // a reply with no total says so rather than building at zero
+        // a reply with no total falls back to what the REQUEST implied,
+        // not to a hardcoded number nobody chose
         let (_, t3, e3) = parse_massing("section keep share=0.4\n", &m);
-        assert_eq!(t3, 4000);
-        assert!(e3.iter().any(|e| e.contains("assumed")), "{e3:?}");
+        assert_eq!(t3, m.implied_total);
+        assert!(e3.iter().any(|e| e.contains("implied by the request")), "{e3:?}");
     }
 
     #[test]
@@ -684,5 +805,69 @@ mod tests {
             assert!(r.net > 0);
             assert!(r.ok, "{}: {}", t.name, r.summary());
         }
+    }
+
+    #[test]
+    fn a_huge_fortress_is_really_huge() {
+        let c = lookup("castle").unwrap();
+        let plain = scale_for("a castle", &c).0;
+        let huge = scale_for("a huge fortress", &c).0;
+        let vast = scale_for("a vast fortress", &c).0;
+        let small = scale_for("a small castle", &c).0;
+        assert_eq!(plain, 9000, "an ordinary castle is already substantial");
+        assert!(huge >= 40_000, "a huge fortress is {huge}, and should be tens of thousands");
+        assert!(vast > huge && small < plain, "{small} < {plain} < {huge} < {vast}");
+        // THE TYPE SETS THE REGISTER: a huge house is not a huge castle
+        let h = lookup("house").unwrap();
+        assert!(scale_for("a huge house", &h).0 < scale_for("a castle", &c).0,
+                "a huge house is smaller than an ordinary castle");
+        // and the reason is reported, because a number with no reason
+        // is a number nobody can argue with
+        assert!(scale_for("a huge fortress", &c).1.contains("4.5x"), "{}", scale_for("a huge fortress", &c).1);
+    }
+
+    #[test]
+    fn an_explicit_area_beats_a_scale_word() {
+        let c = lookup("castle").unwrap();
+        assert_eq!(scale_for("a small castle of 30000", &c).0, 30000);
+        assert!(scale_for("a castle of 30000", &c).1.contains("outright"));
+        // but a small number in passing is not an area
+        assert_eq!(scale_for("a castle with 4 towers", &c).0, 9000);
+    }
+
+    #[test]
+    fn the_scale_word_reaches_the_massing_and_the_brief() {
+        let c = lookup("castle").unwrap();
+        let req = "a huge fortress with a chapel";
+        let m = apply_for(req, &c, &triage(req, &c));
+        assert!(m.implied_total >= 40_000, "{}", m.summary(m.implied_total));
+        // it is not ALSO counted as a modification of some section
+        assert!(!m.log.iter().any(|l| l.contains("huge")), "no double counting: {:?}", m.log);
+        // and the brief it produces is that big
+        let (b, errs) = crate::brief::parse(&to_brief(&m, m.implied_total));
+        assert!(errs.is_empty(), "{errs:?}");
+        let r = b.reconcile();
+        assert!(r.gross > 39_000, "the schedule really is that size: {}", r.summary());
+        assert!(r.ok, "{}", r.summary());
+        // every room grew with it, rather than there being more rooms
+        let hall = b.spaces.iter().find(|s| s.name == "great hall").unwrap();
+        let small = crate::brief::parse(&to_brief(&apply_for("a small castle", &c, &[]), 3600)).0;
+        let small_hall = small.spaces.iter().find(|s| s.name == "great hall").unwrap();
+        assert!(hall.area > small_hall.area * 4, "{} vs {}", hall.area, small_hall.area);
+    }
+
+    #[test]
+    fn the_words_people_actually_use_find_a_type() {
+        // "a huge fortress" found NOTHING and the whole chain fell over
+        for (said, want) in [("a huge fortress", "castle"), ("a citadel on a hill", "castle"),
+                             ("a great cathedral", "temple"), ("a fishing village", "town"),
+                             ("a small cottage", "house"), ("a lighthouse", "tower"),
+                             ("a stone keep", "castle"), ("a bustling city", "town")] {
+            assert_eq!(lookup(said).map(|t| t.name), Some(want), "{said}");
+        }
+        // the head noun wins: "a temple town" is a town
+        assert_eq!(lookup("a temple town").map(|t| t.name), Some("town"));
+        assert_eq!(lookup("a town temple").map(|t| t.name), Some("temple"));
+        assert!(lookup("a zigurat").is_none(), "and an unknown word is still unknown");
     }
 }
