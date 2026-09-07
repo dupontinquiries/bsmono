@@ -147,7 +147,7 @@ pub fn play<W: VoxelWorld>(w: &W, start: (i32, i32, i32), min: (i32, i32, i32), 
                            goals: &[Goal], b: &Body, mem: Option<&Memory>) -> Report {
     let mut r = Report::default();
     let doors = reach::openings(w, min, max);
-    let mut walk = |from: (i32, i32, i32), to: (i32, i32, i32), r: &mut Report| -> (bool, usize, i32) {
+    let walk = |from: (i32, i32, i32), to: (i32, i32, i32), r: &mut Report| -> (bool, usize, i32) {
         if let Some(m) = mem {
             if let Some(v) = m.get(from, to, b) { r.hits += 1; return v; }
             r.misses += 1;

@@ -156,7 +156,7 @@ pub fn switchback<W: VoxelWorld>(w: &W, at: (i32, i32), heading_deg: i32, target
     if (start_y - target_y).abs() < 3 { r.notes.push("no height to climb".into()); return r; }
     r.from = Some((at.0, start_y + 1, at.1));
     let base = (heading_deg as f32).to_radians();
-    let (mut fx, mut fz) = (at.0 as f32, at.1 as f32);
+    let (fx, fz) = (at.0 as f32, at.1 as f32);
     let mut y = start_y;
     let mut legs = 0;
     let mut steps = 0usize;

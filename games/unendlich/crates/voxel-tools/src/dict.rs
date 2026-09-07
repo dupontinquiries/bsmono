@@ -505,6 +505,33 @@ fn statue(a: &FormArgs) -> Solid {
     let base_w = ((hi[0] - lo[0]).min(hi[2] - lo[2])).max(4.0);
     let scale = if style == "colossus" { 3.0 } else { 1.0 };
     let h = a.num("h", (base_w * 2.4 * scale) as i32).max(6) as f32;
+    // THE FIGURE MUST FIT ITS FOOTPRINT. Everything below is derived
+    // from `h` -- shoulders are 3/8 of it, a gargoyle's wings another
+    // 1.5 shoulders each side -- and nothing checked that against the
+    // ground the player actually gave. A 5x5 plinth grew a figure
+    // TWENTY BLOCKS WIDE: a pole with arms, standing on a stamp.
+    //
+    // The span is the widest thing the style makes, in units of h:
+    // a plain figure is its shoulders, a gargoyle adds its wings, an
+    // idol is head-heavy. If that exceeds the footprint, h comes down
+    // until it fits -- a smaller statue on the plinth you asked for
+    // rather than a giant one balanced on it.
+    let span_ratio = match style {
+        "gargoyle" => 3.0 / 8.0 * 1.9,      // shoulders + folded wings
+        "idol" => 2.0 / 8.0 * 3.0,          // squat, big head
+        "obelisk" => 0.7,                   // a shaft, no arms
+        _ => 3.0 / 8.0 * 1.6,               // shoulders plus arms
+    };
+    // A COLOSSUS is exempt: "giant" has to mean giant, and a colossus
+    // asked for on a 10x10 anchor is meant to tower over it -- the
+    // plinth is a foot, not a bound. Everything else fits what it was
+    // given.
+    // An explicit `h=` is the player's word and is honoured; the clamp
+    // only governs the height DERIVED from the footprint.
+    let asked_h = a.nums.iter().any(|(k, _)| k == "h");
+    let h = if !asked_h && style != "colossus" && base_w > 0.0 && h * span_ratio > base_w {
+        (base_w / span_ratio).max(6.0)
+    } else { h };
     let stone = Material::structural(a.block);
     let dark = Material::accent(a.accent);
     let mut parts: Vec<Solid> = Vec::new();
@@ -657,12 +684,24 @@ fn statue(a: &FormArgs) -> Solid {
         for side in [-1.0, 1.0] {
             parts.push(Solid::Cylinder { base: [cx + side * head_r * 0.6, head_y + head_r * 0.6, cz],
                                          r: 0.6, h: head_r * 1.2, mat: dark.clone() });
+            // FOLDED WINGS, rising behind the shoulders rather than
+            // spread. Spread wings were 1.5 shoulders of horizontal
+            // reach EACH SIDE -- four times the body's width -- so a
+            // gargoyle came out wider than it was tall, and once the
+            // figure was clamped to its plinth the wings ate the whole
+            // budget and the body shrank to nothing. A perched gargoyle
+            // has its wings up and back; that is why it perches.
+            // The wings sit BEHIND the body (-z) and rise past the
+            // shoulders: folded, as a perched gargoyle's are. Set flush
+            // with the torso they were hidden inside it, which the
+            // silhouette test caught by measuring depth and finding
+            // none.
             let wx = cx + side * (shoulder_w * 0.5);
-            let wing = Solid::Wedge {
-                min: [wx.min(wx + side * shoulder_w * 1.5), hip_y + torso_h * 0.3, cz - 1.0],
-                max: [wx.max(wx + side * shoulder_w * 1.5), 0.0, cz + 1.0],
-                h: torso_h * 1.4, axis: Axis::Z, mat: dark.clone() };
-            parts.push(wing);
+            parts.push(Solid::Wedge {
+                min: [wx.min(wx + side * shoulder_w * 0.5), hip_y + torso_h * 0.1,
+                      cz - torso_h * 0.9 - 2.0],
+                max: [wx.max(wx + side * shoulder_w * 0.5), 0.0, cz - torso_h * 0.2],
+                h: torso_h * 1.8, axis: Axis::X, mat: dark.clone() });
         }
     }
     Solid::Union(parts)
@@ -967,7 +1006,15 @@ mod tests {
         let obelisk = mk("obelisk");
         let idol = mk("idol");
         let span = |v: &Vec<(i32, i32, i32)>| v.iter().map(|c| c.0).max().unwrap() - v.iter().map(|c| c.0).min().unwrap();
-        assert!(span(&gargoyle) > span(&figure) + 4, "wings: {} vs {}", span(&gargoyle), span(&figure));
+        // Folded wings rise BEHIND the shoulders, so they show as DEPTH
+        // and mass, not span. Spread wings gave a gargoyle four times
+        // its body's width, which is why one would not stand on its own
+        // plinth; the silhouette test measured exactly the thing that
+        // was wrong and called it right.
+        let depth = |v: &Vec<(i32, i32, i32)>| v.iter().map(|c| c.2).max().unwrap() - v.iter().map(|c| c.2).min().unwrap();
+        assert!(depth(&gargoyle) > depth(&figure), "folded wings: depth {} vs {}",
+                depth(&gargoyle), depth(&figure));
+        assert!(gargoyle.len() > figure.len(), "and more mass: {} vs {}", gargoyle.len(), figure.len());
         // an obelisk TAPERS: wider at the base than near the top
         let ow = |y: i32| { let xs: Vec<i32> = obelisk.iter().filter(|c| c.1 == y).map(|c| c.0).collect();
             if xs.is_empty() { 0 } else { xs.iter().max().unwrap() - xs.iter().min().unwrap() + 1 } };

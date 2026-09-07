@@ -68,15 +68,37 @@ impl Default for Body {
 
 /// Is this a cell a body can stand in?
 pub fn standable<W: VoxelWorld>(w: &W, at: (i32, i32, i32), b: &Body) -> bool {
-    if w.get(at.0, at.1 - 1, at.2) == 0 { return false; }          // nothing underfoot
+    let floor = w.get(at.0, at.1 - 1, at.2);
+    if floor == 0 { return false; }                                // nothing underfoot
+    // DEEP WATER IS NOT A FLOOR. A flooded canyon read as walkable
+    // ground because water is solid enough to stand ON in this check
+    // and passable enough to stand IN; you can wade a shallow edge,
+    // but two blocks of water over your head is a swim, and a body
+    // that cannot swim should not be told the lake bottom is reachable.
+    // How deep is the water under the feet? A body wades one block and
+    // swims two. The first version asked only about the cell below and
+    // the one below that -- but a body standing ON the surface of a
+    // seven-deep lake has water at -1 and -2 and so does one standing
+    // in a ford, once the ford is a block deep. Count down to the bed.
+    if liquid(floor) {
+        let below = (1..=4).take_while(|k| liquid(w.get(at.0, at.1 - k, at.2))).count();
+        if below >= 2 { return false; }
+    }
+    // And how much water is OVER the head? A body wading a ford has
+    // sky above it; one on the bed of a seven-deep lake has seven
+    // blocks of water, and that is a swim however solid the bed is.
+    // Checking only downward let a body walk the whole lake floor.
+    if liquid(w.get(at.0, at.1, at.2)) || liquid(w.get(at.0, at.1 + 1, at.2)) {
+        let over = (0..=6).take_while(|k| liquid(w.get(at.0, at.1 + k, at.2))).count();
+        if over >= 2 { return false; }
+    }
     (0..b.height).all(|k| passable(w.get(at.0, at.1 + k, at.2)))
 }
 
 /// A block a body can occupy: air, or something you walk through.
-fn passable(block: u16) -> bool { matches!(block, 0 | 31 | 38 | 37 | 175) }
+fn passable(block: u16) -> bool { matches!(block, 0 | 31 | 38 | 37 | 175 | 8 | 9) }
 
-/// Is it liquid? Standing in water is standing; drowning in it is not,
-/// but a body that can swim is a different body.
+/// Is it liquid? Wading is walking; a swim is not.
 fn liquid(block: u16) -> bool { matches!(block, 8 | 9 | 10 | 11) }
 
 /// The cells reachable from a start, and whether the budget ran out.
@@ -456,5 +478,18 @@ mod tests {
         // and nothing when it works
         let clear = W::flat(64);
         assert!(check_access(&clear, (0, 65, 0), (20, 65, 0), "x", &Body::default()).is_none());
+    }
+
+    #[test]
+    fn a_shallow_ford_is_walkable_and_a_lake_is_not() {
+        let mut w = W::flat(64);
+        // a channel two deep, filled: the bottom is at 63
+        w.fill((10, 63, -90), (14, 64, 90), 9);
+        let b = Body::default();
+        // one block of water over a solid bed: a ford
+        assert!(reaches(&w, (0, 65, 0), (20, 65, 0), &b).ok, "you can wade a ford");
+        // dig it deeper and fill it: now it is a lake
+        w.fill((10, 58, -90), (14, 64, 90), 9);
+        assert!(!reaches(&w, (0, 65, 0), (20, 65, 0), &b).ok, "you cannot walk a lake bottom");
     }
 }

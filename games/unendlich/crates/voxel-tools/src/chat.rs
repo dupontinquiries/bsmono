@@ -566,11 +566,27 @@ impl ChatSession {
         // reading them is not something a 1B does. The model's reply is
         // still used -- nothing it wrote is dropped -- but the shape the
         // player asked for is guaranteed.
+        // A recognized recipe leads the plan when the model's own reply
+        // does not already do that kind of thing. For a form that means
+        // "no form line"; for a CARVE it means no carve line -- and the
+        // two are checked separately, or a model that answered a
+        // "carve a schism" with a statue would have its statue accepted
+        // as sufficient. Which is exactly what happened.
+        let has_form = ir.lines().any(|l| l.trim_start().to_lowercase().starts_with("form "));
+        let carve_verbs = ["canyon", "cave", "mesa", "waterfall", "overhang", "gorge", "feature"];
+        let has_carve = ir.lines().any(|l| carve_verbs.iter()
+            .any(|v| l.trim_start().to_lowercase().starts_with(&format!("{v} "))));
         let recognized = crate::recipe::recognise(prose)
-            .filter(|_| !ir.lines().any(|l| l.trim_start().to_lowercase().starts_with("form ")));
+            .filter(|r| if r.carve { !has_carve } else { !has_form });
         let recognized_why = recognized.as_ref().map(|r| format!(
             "RECOGNIZED {} from '{}': {}", r.form, r.because.join(", "), r.line()));
         let ir_with_form = match &recognized {
+            // A carve REPLACES the model's reply rather than leading
+            // it: a statue the model wrote when asked for a canyon is
+            // not a bonus, it is the wrong answer, and leaving it in
+            // puts a gargoyle at the bottom of the rift.
+            Some(r) if r.carve =>
+                format!("# {}\n{}\n", r.form, r.line()),
             Some(r) => format!("# {}\n{}\n{}", r.name.clone().unwrap_or_else(|| r.form.clone()), r.line(), ir),
             None => ir.to_string(),
         };
@@ -1690,5 +1706,28 @@ mod tests {
         // "done" changes nothing
         let (_, changed, review) = s.apply_review(&mut t, &g, "done\n", None);
         assert!(!changed && review.done);
+    }
+
+    #[test]
+    fn asked_to_carve_the_model_does_not_get_to_build_a_statue_instead() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 400_000);
+        let g = gaze_at(0, 0, 10.0);
+        // exactly the 1B's reply from the screenshot
+        let ir = "form statue gargoyle over 5x5 height=18\n";
+        match s.receive_plan_gated(&mut t, &g, ir, None, "carve a great schism into the ground") {
+            Reply::Preview { echo, blocks, .. } => {
+                assert!(echo.contains("RECOGNIZED canyon"), "{echo}");
+                assert!(!echo.to_lowercase().contains("statue"), "the statue is gone: {echo}");
+                assert!(blocks > 5_000, "a schism, not 50 blocks: {blocks}");
+            }
+            o => panic!("{o:?}"),
+        }
+        // and a model that DOES carve is left alone
+        match s.receive_plan_gated(&mut t, &g, "canyon @-40,0 @40,0 w=12 depth=18\n", None, "carve a rift") {
+            Reply::Preview { echo, .. } => assert!(!echo.contains("RECOGNIZED"), "{echo}"),
+            o => panic!("{o:?}"),
+        }
     }
 }

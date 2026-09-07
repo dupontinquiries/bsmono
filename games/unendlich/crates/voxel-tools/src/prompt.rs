@@ -161,8 +161,11 @@ pub fn system_prompt_for_model(params_billions: Option<f32>, ctx: usize, max_rep
 /// The recipe prompt for the smallest models: choose, don't draw.
 pub fn tiny_prompt() -> String {
     format!("\
-You place a building by CHOOSING. Reply with two or three lines and nothing else:
-form NAME size=SIZE [style=STYLE]
+You BUILD or you CARVE, by choosing. Reply with two or three lines and nothing else:
+form NAME size=SIZE [style=STYLE]           to build something
+canyon A B w=N depth=N                      to cut a channel into the ground
+cave A len=N r=N / mesa A r=N drop=N / waterfall A h=N / overhang A
+feature badlands|gorge|caldera|cliffs|highlands|sinkhole A r=N   a whole PLACE
 spec height=A-B durability=low|mid|high sound=echoing|muffled|airy shelter=low|mid|high
 mood MOOD size=SIZE          (optional)
 
@@ -178,6 +181,11 @@ EXAMPLE
 form statue size=small style=gargoyle
 spec height=12-16 durability=high
 mood eerie size=medium
+
+EXAMPLE
+  player: carve a great rift into the ground
+canyon -60,0 60,0 w=20 depth=26
+spec durability=high
 
 EXAMPLE
   player: a cosy village in the snow
@@ -744,7 +752,10 @@ mod tests {
         assert_eq!(tier_for(Some(1.0), 16384), Tier::Tiny, "a 1B chooses rather than draws");
         assert_eq!(tier_for(Some(3.0), 8192), Tier::Compact);
         let tp = tiny_prompt();
-        assert!(tp.len() < 1200, "{} chars", tp.len());
+        // the tier grew when it learned to carve: still a recipe, not a
+        // grammar, and a 1B that cannot carve builds a statue when you
+        // ask for a canyon
+        assert!(tp.len() < 1600, "{} chars", tp.len());
         for ex in tp.split("EXAMPLE").skip(1) {
             let body: String = ex.lines().skip_while(|l| l.trim().is_empty() || l.trim_start().starts_with("player:"))
                 .map(|l| l.trim())

@@ -26,7 +26,10 @@ use crate::dict::FORMS;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Recipe {
+    /// The form name, or the carve/feature kind when `carve` is set.
     pub form: String,
+    /// This is a hole in the ground, not a building.
+    pub carve: bool,
     pub style: Option<String>,
     pub size: String,
     pub block: Option<String>,
@@ -39,6 +42,20 @@ pub struct Recipe {
 impl Recipe {
     /// The IR line the dictionary needs.
     pub fn line(&self) -> String {
+        if self.carve {
+            // sized by the same words a form uses, in blocks
+            let r = match self.size.as_str() {
+                "tiny" => 12, "small" => 30, "large" => 120, "huge" => 260, _ => 60,
+            };
+            return match self.form.as_str() {
+                "canyon" => format!("canyon -{r},0 {r},0 w={} depth={}", (r / 5).max(4), (r / 4).max(5)),
+                "cave" => format!("cave 0,0 len={r} r={} branches=3", (r / 14).clamp(2, 8)),
+                "mesa" => format!("mesa 0,0 r={} drop={}", r / 2, (r / 5).max(5)),
+                "waterfall" => format!("waterfall 0,0 w={} h={}", (r / 8).max(3), (r / 3).max(6)),
+                "overhang" => format!("overhang 0,0 w={} depth={} h={}", (r / 3).max(6), (r / 6).max(4), (r / 10).max(3)),
+                other => format!("feature {other} 0,0 r={}", r.clamp(20, 500)),
+            };
+        }
         let mut s = format!("form {} size={}", self.form, self.size);
         if let Some(st) = &self.style { s.push_str(&format!(" style={st}")); }
         if let Some(b) = &self.block { s.push_str(&format!(" block={b}")); }
@@ -46,6 +63,26 @@ impl Recipe {
         s
     }
 }
+
+/// Nouns that name a CARVE rather than a form: a hole in the ground is
+/// not a building, and the smallest models had no word for one -- a
+/// 1B asked to "carve a great schism into the ground" replied with a
+/// statue, because `form` was the only verb its prompt offered.
+const CARVES: &[(&[&str], &str)] = &[
+    (&["canyon", "gorge", "ravine", "chasm", "rift", "schism", "crevasse", "gully", "trench"], "canyon"),
+    (&["cave", "tunnel", "cavern", "grotto", "burrow", "mine"], "cave"),
+    (&["mesa", "butte", "plateau"], "mesa"),
+    (&["waterfall", "cascade", "falls"], "waterfall"),
+    (&["overhang", "ledge", "shelf"], "overhang"),
+    (&["sinkhole", "crater", "pit"], "sinkhole"),
+    (&["badlands"], "badlands"),
+    (&["caldera", "volcano"], "caldera"),
+    (&["cliffs", "coast", "shore"], "cliffs"),
+    (&["highlands", "moors", "uplands"], "highlands"),
+];
+
+/// Verbs that mean "take material away".
+const CARVE_VERBS: &[&str] = &["carve", "dig", "excavate", "cut", "gouge", "hollow", "sink", "quarry"];
 
 /// Nouns that name a form, with the form they name. Plurals and near
 /// synonyms included; whole-word matched.
@@ -127,6 +164,19 @@ pub fn recognise(prose: &str) -> Option<Recipe> {
     };
     // A form noun; or a figure alone ("a seated king in marble"), which
     // is a statue of that figure.
+    // A CARVE first: "carve a great schism into the ground" is not a
+    // building, and a noun like "cave" appears in both tables. If the
+    // prose names something carved, or uses a carving verb at all, it
+    // wins.
+    if let Some((kind, word)) = first(CARVES) {
+        let mut r = Recipe { form: kind.clone(), size: "medium".into(), carve: true, ..Default::default() };
+        r.because.push(word);
+        if let Some((sz, w)) = first(SIZES) { r.size = sz; r.because.push(w); }
+        if let Some(v) = CARVE_VERBS.iter().find(|v| has(v)) { r.because.push(v.to_string()); }
+        if let Some((b, w)) = first(MATERIALS) { r.block = Some(b); r.because.push(w); }
+        r.because.dedup();
+        return Some(r);
+    }
     let (form, noun) = match first(NOUNS) {
         Some(x) => x,
         None => { let who = FIGURES.iter().find(|(w, _)| has(w))?; ("statue".to_string(), who.0.to_string()) }
@@ -218,5 +268,33 @@ mod tests {
             let r = recognise(prose).expect(prose);
             assert!(crate::plan::line_is_valid_ir(&r.line()), "{prose} -> {}", r.line());
         }
+    }
+
+    #[test]
+    fn a_hole_in_the_ground_is_not_a_building() {
+        // The screenshot: a 1B answered "carve a great schism into the
+        // ground" with a statue, because `form` was the only verb its
+        // prompt offered and `schism` was in no table.
+        let r = recognise("carve a great schism into the ground").expect("recognised");
+        assert!(r.carve, "{r:?}");
+        assert_eq!(r.form, "canyon");
+        let line = r.line();
+        assert!(line.starts_with("canyon "), "{line}");
+        assert!(crate::plan::line_is_valid_ir(&line), "{line}");
+        // it is big, because "great" is a size word
+        assert_eq!(r.size, "large");
+        // the other carve words land on their kinds
+        for (prose, kind) in [("dig a huge canyon", "canyon"), ("a deep cave system", "cave"),
+                              ("carve a sinkhole", "sinkhole"), ("cut a ravine here", "canyon"),
+                              ("a tall mesa", "mesa"), ("a waterfall", "waterfall"),
+                              ("the badlands", "badlands"), ("a volcano", "caldera")] {
+            let g = recognise(prose).unwrap_or_else(|| panic!("{prose}"));
+            assert_eq!(g.form, kind, "{prose}");
+            assert!(g.carve, "{prose}");
+            assert!(crate::plan::line_is_valid_ir(&g.line()), "{prose} -> {}", g.line());
+        }
+        // and a building is still a building
+        let h = recognise("a stone cottage").unwrap();
+        assert!(!h.carve && h.form == "house");
     }
 }
