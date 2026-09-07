@@ -2580,6 +2580,18 @@ impl Snapclone {
     pub fn open_qr_scan(&mut self, camera: bool) {
         self.qr = Some(if camera { crate::qr::QrScan::scanning() }
                        else { crate::qr::QrScan::manual_only() });
+        // THE REVEAL RESTARTS ON EVERY OPEN. `qr_shown_at` is the clock the
+        // fractal reveal runs from, and it used to be cleared only by the
+        // dialog's own "close" button — so a dialog dismissed any other way
+        // (a scanned code, Escape, a tap on the scrim) left a stale timestamp
+        // behind, and the next open drew the code already finished. The
+        // animation ran exactly once per process.
+        //
+        // Cleared on OPEN rather than on close, which is what makes it correct
+        // by construction: there are three close paths today and nothing stops
+        // a fourth being added, but there is one place the dialog opens. The
+        // draw site stamps the current time on the next frame.
+        self.qr_shown_at = None;
         // Sized for what it holds: the scanner (or the manual field), the
         // typed-code form, MY CODE at 168 with its two lines, and close. The
         // 340×420 it had was the scanner alone; once my code joined it the
@@ -3607,7 +3619,15 @@ impl Snapclone {
             self.tilt = self.tilt.ease_toward(t, 0.15);
             if self.qr_expanded.is_some() || self.qr.is_some() { ui.ctx().request_repaint(); }
         }
+        let was_expanded = self.qr_expanded.is_some();
         let ev = uikit_egui::qr::expanded_ui_with(ui.ctx(), &mut self.qr_expanded, &self.local_id, &layout, &colors, sensor.map(|_| self.tilt));
+        // Closing the big code replays the small one behind it. The card is
+        // coming back into view and a code that snaps in finished reads as a
+        // static image — which is exactly what it stopped being when the
+        // reveal was written.
+        if was_expanded && self.qr_expanded.is_none() {
+            self.qr_shown_at = None;
+        }
         if ev.save_svg {
             let (bg, fg) = uikit_egui::qr::theme_colors(&colors);
             self.code_svg_requested = Some(uikit_egui::qr::svg(&layout, 512.0, fg, bg));
@@ -6568,6 +6588,39 @@ mod tests {
         let nodes = crate::wayfinder::build_nodes(s.self_fix, &s.wayfinder_contacts);
         assert_eq!(nodes.len(), 1, "a contact with no GPS is not a missing contact");
         assert_eq!(nodes[0].distance_label(), "Nearby");
+    }
+
+    /// The reveal must run EVERY time the dialog opens, not once per process.
+    ///
+    /// `qr_shown_at` is the clock the fractal reveal runs from, and it used to be cleared
+    /// only by the dialog's own "close" button. Dismiss the dialog any other way — scan a
+    /// code, press Escape, tap the scrim — and the stale timestamp survived, so the next
+    /// open drew a code that had already finished animating. Three close paths existed and
+    /// one of them cleared it.
+    #[test]
+    fn the_code_reveal_restarts_on_every_open() {
+        let mut s = app();
+
+        // Opened, drawn, and the clock is stamped.
+        s.open_qr_scan(true);
+        assert_eq!(s.qr_shown_at, None, "the clock must start unset so the draw stamps it");
+        s.qr_shown_at = Some(1234.0); // as a frame of drawing would
+
+        // CLOSED BY SCANNING — the path that did not clear it.
+        assert!(s.qr_frame("snapclone://sc-deadbeef:9000"));
+        s.tick(0.3);
+        s.tick(0.4);
+        assert!(s.qr.is_none(), "the dialog should have closed itself");
+
+        s.open_qr_scan(true);
+        assert_eq!(s.qr_shown_at, None, "reopening reused the old reveal clock");
+
+        // And by the close button's path, which always worked — still does.
+        s.qr_shown_at = Some(99.0);
+        s.qr = None;
+        s.qr_shown_at = None;
+        s.open_qr_scan(false);
+        assert_eq!(s.qr_shown_at, None);
     }
 
     #[test]
