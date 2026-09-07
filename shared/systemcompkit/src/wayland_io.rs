@@ -23,6 +23,7 @@
 //! is the extent of what's confirmed here. The actual `idled`/`resumed`
 //! round trip against `cosmic-comp` is not verified.
 
+use crate::capture::{CaptureEvent, CaptureSession};
 use crate::idle::{IdleEvent, IdleTracker};
 use crate::layer::{KeyboardInteractivity, Layer, LayerEvent, LayerSurfaceIntent, LayerSurfaceState};
 use crate::toplevel::{ToplevelEvent, ToplevelTracker};
@@ -31,7 +32,9 @@ use cosmic_protocols::toplevel_info::v1::client::{
     zcosmic_toplevel_info_v1::{self, ZcosmicToplevelInfoV1},
 };
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
-use wayland_client::protocol::{wl_compositor::WlCompositor, wl_registry, wl_seat::WlSeat, wl_surface::WlSurface};
+use wayland_client::protocol::{
+    wl_compositor::WlCompositor, wl_output::WlOutput, wl_registry, wl_seat::WlSeat, wl_surface::WlSurface,
+};
 use wayland_client::{event_created_child, Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
     ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
@@ -40,6 +43,14 @@ use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
 use wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notification_v1::{self, ExtIdleNotificationV1},
     ext_idle_notifier_v1::ExtIdleNotifierV1,
+};
+use wayland_protocols::ext::image_capture_source::v1::client::{
+    ext_image_capture_source_v1::ExtImageCaptureSourceV1,
+    ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
+};
+use wayland_protocols::ext::image_copy_capture::v1::client::{
+    ext_image_copy_capture_manager_v1::{self, ExtImageCopyCaptureManagerV1},
+    ext_image_copy_capture_session_v1::{self, ExtImageCopyCaptureSessionV1},
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
@@ -517,6 +528,143 @@ impl ToplevelSession {
     pub fn poll(&mut self) -> &ToplevelTracker {
         let _ = self.queue.dispatch_pending(&mut self.state);
         &self.state.tracker
+    }
+
+    pub fn flush(&self) -> Result<(), String> {
+        self.conn.flush().map_err(|e| e.to_string())
+    }
+}
+
+struct CaptureIoState {
+    session: CaptureSession,
+}
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for CaptureIoState {
+    fn event(_: &mut Self, _: &wl_registry::WlRegistry, _: wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<WlOutput, ()> for CaptureIoState {
+    fn event(_: &mut Self, _: &WlOutput, _: wayland_client::protocol::wl_output::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        // Geometry/mode/name events aren't needed here — this output
+        // handle exists only to be handed to create_source.
+    }
+}
+
+impl Dispatch<ExtOutputImageCaptureSourceManagerV1, ()> for CaptureIoState {
+    fn event(
+        _: &mut Self,
+        _: &ExtOutputImageCaptureSourceManagerV1,
+        _: wayland_protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Factory only (create_source) — no events.
+    }
+}
+
+impl Dispatch<ExtImageCaptureSourceV1, ()> for CaptureIoState {
+    fn event(
+        _: &mut Self,
+        _: &ExtImageCaptureSourceV1,
+        _: wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // No events of its own — an opaque handle passed to create_session.
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureManagerV1, ()> for CaptureIoState {
+    fn event(_: &mut Self, _: &ExtImageCopyCaptureManagerV1, _: ext_image_copy_capture_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        // Factory only (create_session, create_pointer_cursor_session) — no events.
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for CaptureIoState {
+    fn event(
+        state: &mut Self,
+        _: &ExtImageCopyCaptureSessionV1,
+        event: ext_image_copy_capture_session_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let mapped = match event {
+            ext_image_copy_capture_session_v1::Event::BufferSize { width, height } => {
+                Some(CaptureEvent::BufferSize { width, height })
+            }
+            ext_image_copy_capture_session_v1::Event::ShmFormat { format } => Some(CaptureEvent::ShmFormat(format.into())),
+            ext_image_copy_capture_session_v1::Event::Done => Some(CaptureEvent::Done),
+            ext_image_copy_capture_session_v1::Event::Stopped => Some(CaptureEvent::Stopped),
+            // dmabuf_device/dmabuf_format: real GPU-buffer negotiation,
+            // deliberately out of scope here per this module's own header
+            // (buffer allocation is a caller concern, not this crate's).
+            _ => None,
+        };
+        if let Some(ev) = mapped {
+            state.session.apply(ev);
+        }
+    }
+}
+
+/// Negotiates capture parameters for the whole output — see `capture.rs`'s
+/// own header for exactly where this crate's scope ends (buffer-constraint
+/// discovery) and a caller's begins (actually allocating a buffer and
+/// requesting a frame). `CaptureSource::Toplevel` capture is not wired here
+/// yet: it needs `ToplevelSession` extended to retain the real
+/// `ExtForeignToplevelHandleV1` proxies (currently discarded once a
+/// `ToplevelInfo`'s fields are populated), a real, separate piece of work.
+pub struct OutputCaptureSession {
+    conn: Connection,
+    queue: EventQueue<CaptureIoState>,
+    state: CaptureIoState,
+    _source: ExtImageCaptureSourceV1,
+    _capture_session: ExtImageCopyCaptureSessionV1,
+}
+
+impl OutputCaptureSession {
+    /// `paint_cursors`: whether the cursor should be composited into
+    /// captured frames — the protocol's own distinction, passed straight
+    /// through rather than this crate picking a default that hides the
+    /// choice.
+    pub fn connect(paint_cursors: bool) -> Result<Self, ConnectError> {
+        let conn = Connection::connect_to_env().map_err(|e| ConnectError::NoDisplay(e.to_string()))?;
+        let (globals, queue) = registry_queue_init::<CaptureIoState>(&conn)
+            .map_err(|e| ConnectError::NoDisplay(e.to_string()))?;
+        let qh = queue.handle();
+
+        let output: WlOutput =
+            globals.bind(&qh, 1..=4, ()).map_err(|_| ConnectError::MissingGlobal("wl_output"))?;
+        let source_mgr: ExtOutputImageCaptureSourceManagerV1 = globals
+            .bind(&qh, 1..=1, ())
+            .map_err(|_| ConnectError::MissingGlobal("ext_output_image_capture_source_manager_v1"))?;
+        let capture_mgr: ExtImageCopyCaptureManagerV1 = globals
+            .bind(&qh, 1..=1, ())
+            .map_err(|_| ConnectError::MissingGlobal("ext_image_copy_capture_manager_v1"))?;
+
+        let source = source_mgr.create_source(&output, &qh, ());
+        let options = if paint_cursors {
+            ext_image_copy_capture_manager_v1::Options::PaintCursors
+        } else {
+            ext_image_copy_capture_manager_v1::Options::empty()
+        };
+        let capture_session = capture_mgr.create_session(&source, options, &qh, ());
+        conn.flush().map_err(|e| ConnectError::NoDisplay(e.to_string()))?;
+
+        Ok(OutputCaptureSession {
+            conn,
+            queue,
+            state: CaptureIoState { session: CaptureSession::new() },
+            _source: source,
+            _capture_session: capture_session,
+        })
+    }
+
+    pub fn poll(&mut self) -> &CaptureSession {
+        let _ = self.queue.dispatch_pending(&mut self.state);
+        &self.state.session
     }
 
     pub fn flush(&self) -> Result<(), String> {

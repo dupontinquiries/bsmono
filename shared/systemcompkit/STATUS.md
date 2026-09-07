@@ -21,8 +21,9 @@ only whatever becomes the actual shell needs the real thing.
 | `idle` | `ext-idle-notify-v1` | `cosmic-comp`'s own source (`cosmic-idle`'s handling), paired with `wlr-output-power-management` for the screen-off step (that pairing is a caller's job, not this crate's) |
 | `layer` | `wlr-layer-shell-unstable-v1` | real `layer_shell.rs` handler found in `cosmic-comp`'s source |
 | `toplevel` | `ext-foreign-toplevel-list-v1` + COSMIC's `zcosmic_toplevel_info_v1` extension | protocol XML's own text ("it thus extends ext_foreign_toplevel_v1") — **not** `cosmic-protocols`' own shipped example, which uses a path the XML marks `deprecated-since="2"` |
+| `capture` | `ext-image-copy-capture-v1` + `ext-image-capture-source-v1` | confirmed correct at the time `layer`/`toplevel` were built (the earlier "not yet implemented" note was for this exact protocol pair) |
 | (not `toplevel`) | `wlr-foreign-toplevel-management` | deliberately **not** used — confirmed non-interoperable with `cosmic-comp`, which speaks the `ext-`/`zcosmic` family instead. This is the same protocol-family lesson the phosh-vs-KWin research surfaced earlier; recorded here so it isn't re-litigated by someone who only reads this crate in isolation |
-| screenshots/thumbnails | `ext-image-copy-capture-v1` | **not** `wlr-screencopy-unstable-v1` — `cosmic-comp` has moved to the newer standardized protocol. Not yet implemented in this crate; recorded so whoever builds it starts from the right protocol name |
+| (not `capture`) | `wlr-screencopy-unstable-v1` | deliberately **not** used — `cosmic-comp` has moved to the newer standardized protocol above |
 
 ## What's real vs. what's the honest ceiling
 
@@ -63,11 +64,18 @@ hardware.
 
 ## What isn't built yet
 
-- `ext-image-copy-capture-v1` (screenshots/live thumbnails) — table above
-  names the correct protocol; no module exists yet.
 - Nothing consumes this crate. No app in the monorepo depends on
   `systemcompkit` yet — it's infrastructure waiting for a shell to build on
   top of it, not something exercised end-to-end by any real UI.
+- `capture`'s `CaptureSource::Toplevel` path is modeled (same `u64` id space
+  as `toplevel.rs`, by design) but not wired in `wayland_io` — it needs
+  `ToplevelSession` extended to retain the real `ExtForeignToplevelHandleV1`
+  proxies, which are currently discarded once a `ToplevelInfo`'s fields are
+  populated. Only `OutputCaptureSession` (whole-screen) is wired.
+- `capture`'s actual buffer allocation and frame request/read-back —
+  deliberately out of scope everywhere in this crate; see `capture.rs`'s own
+  header for why that's a different kind of work than protocol-state
+  tracking.
 
 ## The actual next decision, not an engineering task
 
