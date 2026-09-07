@@ -155,6 +155,18 @@ pub enum Rel {
     /// ended up nineteen blocks out from a body eleven wide. A limb
     /// needs a joint, not a bounding box.
     Joint { at: f32, out: f32, pair: bool },
+    /// Put it at an OFFSET from the anchor, in blocks. The one
+    /// relation that is a position, and it exists because a solver
+    /// upstream has already decided where things go: a room layout
+    /// computes its own coordinates, and `brief::to_program` had no
+    /// way to say them -- so it emitted every room at the anchor and a
+    /// twelve-room plan carved one pile of overlapping voids in the
+    /// middle. The layout's whole output was being discarded.
+    ///
+    /// Not for a model to write. The prompts do not mention it, and
+    /// the note in `compose.rs` about coordinates still stands: this
+    /// is for code that has solved the positions.
+    Offset { dx: f32, dy: f32, dz: f32 },
     /// Stretch to touch the ground below wherever it ends up. The
     /// part's `len` becomes the distance from its joint to the floor,
     /// so a leg reaches, a pier founds, a column meets its footing.
@@ -316,6 +328,10 @@ pub fn parse(src: &str) -> (Sketch, Vec<String>) {
                         Some(third) => Rel::Between { and: third.to_lowercase() },
                         None => { errs.push(format!("between needs two objects: {line:?}")); continue; }
                     },
+                    "at" | "offset" => Rel::Offset {
+                        dx: kv(&t, "dx").unwrap_or(0.0),
+                        dy: kv(&t, "dy").unwrap_or(0.0),
+                        dz: kv(&t, "dz").unwrap_or(0.0) },
                     "reaches" | "reach" | "touches" | "down_to" => Rel::Reaches,
                     "joint" | "from" | "hangs" | "attach" => Rel::Joint {
                         at: kv(&t, "at").unwrap_or(0.5),        // 0 base, 1 top of the object
@@ -422,6 +438,7 @@ pub fn resolve_grounded(s: &Sketch, anchor: (i32, i32, i32),
             let aext = pa.shape.extent();
             let placed = match rel {
                 Rel::Inside | Rel::Around | Rel::LevelWith => bp,
+                Rel::Offset { dx, dy, dz } => (bp.0 + dx, bp.1 + dy, bp.2 + dz),
                 // `reaches` sets a LENGTH, not a position: applied
                 // after everything is placed, in a second sweep
                 Rel::Reaches => continue,

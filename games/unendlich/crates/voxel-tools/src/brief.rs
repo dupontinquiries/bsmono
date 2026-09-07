@@ -362,20 +362,68 @@ pub fn to_program(l: &Layout, brief: &Brief, wall: &str, floor_y: i32) -> String
     let mut s = String::new();
     s.push_str(&format!("# {} room(s), {} net\n", l.rooms.len(), brief.reconcile().net));
     s.push_str("pass the mass add\n");
+    // centred on the rooms' own middle, not on the anchor: a layout
+    // whose plan is not symmetric about the origin would otherwise be
+    // half outside its own shell
+    let (mx, mz) = ((lo.0 + hi.0) / 2, (lo.1 + hi.1) / 2);
     s.push_str(&format!("  part shell box w={} h={} d={} material={wall}\n",
-                        hi.0 - lo.0 + 2, tallest * storey + 2, hi.1 - lo.1 + 2));
-    s.push_str(&format!("  rel shell above ground by={}\n", (tallest * storey) / 2));
+                        hi.0 - lo.0 + 4, tallest * storey + 2, hi.1 - lo.1 + 4));
+    s.push_str(&format!("  rel shell at ground dx={mx} dy={} dz={mz}\n", (tallest * storey) / 2));
     s.push_str("end\n");
     // each room hollowed out of it
     s.push_str("pass the rooms cut\n");
     for (i, r) in l.rooms.iter().enumerate() {
+        // The room WHERE THE LAYOUT PUT IT. Its centre, offset from
+        // the anchor, and its own floor level from its storey count.
         let (cx, cz) = (r.at.0 + r.size.0 / 2, r.at.1 + r.size.1 / 2);
+        let cy = floor_y + (r.height * storey) / 2;
         s.push_str(&format!("  part r{i} box w={} h={} d={} material={wall}\n",
-                            (r.size.0 - 1).max(1), r.height * storey - 1, (r.size.1 - 1).max(1)));
-        s.push_str(&format!("  rel r{i} above ground by={}\n", floor_y + (r.height * storey) / 2 - 1));
-        let _ = (cx, cz);
+                            (r.size.0 - 1).max(1), (r.height * storey - 1).max(2), (r.size.1 - 1).max(1)));
+        s.push_str(&format!("  rel r{i} at ground dx={cx} dy={cy} dz={cz}\n"));
     }
     s.push_str("end\n");
+    // DOORS. A plan of sealed rooms fails its own reachability check --
+    // ten voids nobody can enter is ten voids. Every MUST adjacency
+    // gets an opening on the wall between the two rooms, and every
+    // room with a perimeter quality gets one to the outside; the rest
+    // reach the world through those.
+    let mut doors = String::new();
+    let mut n = 0;
+    let pair_door = |a: &Room, c: &Room, k: usize| -> Option<String> {
+        // the two must actually share a wall to have a door in it
+        if a.gap(c) > 1.5 { return None; }
+        let (ax, az) = a.centre(); let (cx, cz) = c.centre();
+        let (mx, mz) = (((ax + cx) / 2.0) as i32, ((az + cz) / 2.0) as i32);
+        let along_x = (ax - cx).abs() > (az - cz).abs();
+        Some(format!("  part d{k} box w={} h=4 d={} material={wall}\n\
+                      rel d{k} at ground dx={mx} dy={} dz={mz}\n",
+                     if along_x { 3 } else { 2 }, if along_x { 2 } else { 3 }, floor_y + 2))
+    };
+    for (x, y, how) in &brief.adjacencies {
+        if *how != Adjacency::Must { continue; }
+        for a in l.rooms.iter().filter(|r| &r.name == x) {
+            for c in l.rooms.iter().filter(|r| &r.name == y) {
+                if let Some(d) = pair_door(a, c, n) { doors.push_str(&d); n += 1; }
+            }
+        }
+    }
+    for r in l.rooms.iter().filter(|r| r.qualities.contains("outside_door")) {
+        // out through the nearest face of the shell
+        let (cx, cz) = r.centre();
+        let (dx, dz) = if (cx - mx as f32).abs() > (cz - mz as f32).abs() {
+            (if cx > mx as f32 { hi.0 - lo.0 } else { -(hi.0 - lo.0) }, 0) } else {
+            (0, if cz > mz as f32 { hi.1 - lo.1 } else { -(hi.1 - lo.1) }) };
+        doors.push_str(&format!("  part d{n} box w={} h=4 d={} material={wall}\n\
+                                 rel d{n} at ground dx={} dy={} dz={}\n",
+                                if dz == 0 { 6 } else { 3 }, if dz == 0 { 3 } else { 6 },
+                                cx as i32 + dx / 2, floor_y + 2, cz as i32 + dz / 2));
+        n += 1;
+    }
+    if n > 0 {
+        s.push_str("pass the doors cut\n");
+        s.push_str(&doors);
+        s.push_str("end\n");
+    }
     s
 }
 
@@ -640,7 +688,9 @@ mod tests {
         assert!(src.contains("pass the mass add") && src.contains("pass the rooms cut"), "{src}");
         let (prog, errs) = crate::program::parse(&src);
         assert!(errs.is_empty(), "{src}\n{errs:?}");
-        assert_eq!(prog.passes.len(), 2);
+        // mass, rooms, and doors -- the third arrived when sealed rooms
+        // turned out to fail their own reachability check
+        assert!(prog.passes.len() >= 2, "{}", prog.passes.len());
         assert_eq!(prog.passes[0].polarity, crate::program::Polarity::Add);
         assert_eq!(prog.passes[1].polarity, crate::program::Polarity::Cut,
                    "the rooms are CUT from the mass, which is what a building is");
@@ -671,5 +721,69 @@ mod tests {
         assert!(errs.is_empty(), "{body}\n{errs:?}");
         assert!(b.spaces.len() >= 5 && !b.adjacencies.is_empty());
         assert!(b.reconcile().ok, "the example fits its own budget: {}", b.reconcile().summary());
+    }
+
+    #[test]
+    fn the_geometry_is_where_the_layout_put_it() {
+        // `to_program` computed each room's centre and then THREW IT
+        // AWAY, emitting every room at the anchor: a twelve-room plan
+        // carved one pile of overlapping voids in the middle, and the
+        // layout's whole output was discarded.
+        let b = keep();
+        let l = lay_out(&b, ((-40, -40), (40, 40)), 11, 40);
+        assert!(l.rooms.len() >= 6);
+        let (prog, errs) = crate::program::parse(&to_program(&l, &b, "stone", 0));
+        assert!(errs.is_empty(), "{errs:?}");
+        let r = crate::program::run(&prog, (0, 64, 0));
+        let air: std::collections::BTreeSet<(i32, i32, i32)> =
+            r.changes.iter().filter(|c| c.to == 0).map(|c| c.at).collect();
+        // every room is hollow AT ITS OWN PLACE
+        for room in &l.rooms {
+            let (cx, cz) = (room.at.0 + room.size.0 / 2, room.at.1 + room.size.1 / 2);
+            assert!(air.contains(&(cx, 66, cz)),
+                    "'{}' should be hollow at ({cx}, 66, {cz})", room.name);
+        }
+        // and the voids are SEPARATE: there is solid between two rooms
+        // that are not adjacent, which one pile at the origin could
+        // never produce
+        let spread: std::collections::BTreeSet<i32> = air.iter().map(|c| c.0).collect();
+        assert!(spread.len() > 20, "the voids are spread across the plan: {}", spread.len());
+        let solid_between = l.rooms.windows(2).any(|w| {
+            let mid = ((w[0].at.0 + w[1].at.0) / 2, (w[0].at.1 + w[1].at.1) / 2);
+            !air.contains(&(mid.0, 66, mid.1))
+        });
+        assert!(solid_between, "there are walls between rooms");
+    }
+
+    #[test]
+    fn the_rooms_have_doors_between_them_and_to_the_outside() {
+        // ten voids nobody can enter is ten voids: a plan of sealed
+        // rooms fails its own reachability check
+        let b = keep();
+        let l = lay_out(&b, ((-40, -40), (40, 40)), 11, 40);
+        let src = to_program(&l, &b, "stone", 0);
+        assert!(src.contains("pass the doors cut"), "{src}");
+        let (prog, errs) = crate::program::parse(&src);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(prog.passes.len(), 3, "mass, rooms, doors");
+        let r = crate::program::run(&prog, (0, 64, 0));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(r.log[2].2 > 0, "the doors cut something: {:?}", r.log);
+        // a MUST pair that ended up adjacent has an opening between it
+        let air: std::collections::BTreeSet<(i32, i32, i32)> =
+            r.changes.iter().filter(|c| c.to == 0).map(|c| c.at).collect();
+        let mut found = false;
+        for (x, y, how) in &b.adjacencies {
+            if *how != Adjacency::Must { continue; }
+            for a in l.rooms.iter().filter(|r| &r.name == x) {
+                for c in l.rooms.iter().filter(|r| &r.name == y) {
+                    if a.gap(c) > 1.5 { continue; }
+                    let (ax, az) = a.centre(); let (cx, cz) = c.centre();
+                    let m = (((ax + cx) / 2.0) as i32, ((az + cz) / 2.0) as i32);
+                    if (65..69).any(|yy| air.contains(&(m.0, yy, m.1))) { found = true; }
+                }
+            }
+        }
+        assert!(found, "an opening in the wall between two rooms that must adjoin");
     }
 }
