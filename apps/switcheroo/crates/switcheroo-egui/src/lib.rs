@@ -52,6 +52,11 @@ pub struct App {
     pub hub: Hub,
     pub backend: Box<dyn Backend>,
     pub tab: Tab,
+    /// The background-read scheduler. See `switcheroo_core::refresh`.
+    pub refresher: switcheroo_core::refresh::Refresher,
+    /// The row the operator is looking at, if any — it is read before the others, because
+    /// its staleness is the staleness they can see.
+    pub focused: Option<DeviceId>,
     /// Set when the real radio could not start and we fell back to demo.
     /// Shown persistently — a silently-fake app is a trap.
     pub fallback_note: Option<String>,
@@ -196,6 +201,8 @@ impl App {
 
     pub fn with_backend(backend: Box<dyn Backend>, fallback_note: Option<String>) -> Self {
         let mut app = App {
+            refresher: Default::default(),
+            focused: None,
             backdrop: uikit_egui::Backdrop::for_app("switcheroo"),
             hub: Hub::new(),
             backend,
@@ -328,9 +335,50 @@ impl App {
     pub fn tick(&mut self, now: Instant) {
         let events = self.backend.poll();
         if !events.is_empty() {
+            // TELL THE SCHEDULER HOW EACH READ ENDED, before the hub consumes the events.
+            // Without this the backoff never engages: an unreachable accessory stays stale,
+            // is picked again on the next tick, and holds the radio for as long as it is
+            // out of range — the exact failure the backoff exists to prevent.
+            for e in &events {
+                match e {
+                    switcheroo_core::Event::PowerIs { id, .. } => self.note_refresh_result(id, true, now),
+                    switcheroo_core::Event::Failed { id: Some(id), .. } => self.note_refresh_result(id, false, now),
+                    _ => {}
+                }
+            }
             self.hub.step(events, now);
         }
         self.last_poll = now;
+        self.tick_refresh(now);
+    }
+
+    /// Read one stale accessory, when it is worth the radio.
+    ///
+    /// An advert says a plug changed; acting on it costs a pair-verify and a read, i.e. a
+    /// second of exclusive radio. Doing it on every advert means a house with eight plugs
+    /// reconnects to all eight whenever any one moves and the scanner never runs — worse
+    /// than the polling it replaced. `switcheroo_core::refresh` holds the rules; this is
+    /// the wiring.
+    fn tick_refresh(&mut self, now: Instant) {
+        use switcheroo_core::refresh::{Candidate, Decision};
+        let visible = self.focused.clone();
+        let stale: Vec<Candidate> = self
+            .hub
+            .sorted()
+            .iter()
+            .filter(|d| d.state_stale && d.paired && !d.pending)
+            .map(|d| Candidate {
+                id: d.id.clone(),
+                changed_at: d.last_seen,
+                visible: visible.as_ref() == Some(&d.id),
+            })
+            .collect();
+        // A pairing or a command holds the radio; the scheduler never preempts one.
+        let busy = self.pairing.is_some() || self.hub.sorted().iter().any(|d| d.pending);
+        if let Decision::Refresh(id) = self.refresher.decide(&stale, busy, now) {
+            self.hub.mark_pending(&id);
+            self.backend.submit(Command::Refresh(id));
+        }
     }
 
     pub fn start_scan(&mut self) {
@@ -355,6 +403,12 @@ impl App {
             id: id.clone(),
             on: want_on,
         });
+    }
+
+    /// Tell the scheduler how a background read ended. Called from the event drain so a
+    /// failure backs off rather than being retried immediately.
+    fn note_refresh_result(&mut self, id: &DeviceId, ok: bool, now: Instant) {
+        if ok { self.refresher.succeeded(id, now); } else { self.refresher.failed(id, now); }
     }
 
     pub fn refresh(&mut self, id: &DeviceId) {
@@ -385,6 +439,37 @@ impl Default for App {
 
 #[cfg(test)]
 mod tests {
+
+    /// The loop the scheduler needs closed: a failed read must reach it, or the backoff
+    /// never engages and one unreachable plug holds the radio for as long as it is away.
+    #[test]
+    fn a_failed_background_read_backs_off_instead_of_retrying_forever() {
+        use switcheroo_core::{Event, Kind, Power};
+        let mut app = App::new();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF");
+        let t0 = Instant::now();
+        app.hub.step(vec![
+            Event::Seen { id: id.clone(), name: "plug".into(), kind: Kind::HomeKit, rssi: None },
+            Event::Paired { id: id.clone() },
+            Event::PowerIs { id: id.clone(), power: Power::On },
+        ], t0);
+        // It advertises a change, and settles.
+        app.hub.step(vec![Event::AccessoryChanged { id: id.clone(), reconfigured: false }], t0);
+        assert!(app.hub.get(&id).unwrap().state_stale);
+
+        let settled = t0 + switcheroo_core::refresh::SETTLE * 2;
+        app.tick(settled);
+        assert_eq!(app.refresher.failure_count(&id), 0);
+
+        // The read fails.
+        app.hub.step(vec![Event::Failed { id: Some(id.clone()), message: "out of range".into() }], settled);
+        app.note_refresh_result(&id, false, settled);
+        assert_eq!(app.refresher.failure_count(&id), 1, "the failure never reached the scheduler");
+
+        // A success clears it — a plug that came back is not punished for having been away.
+        app.note_refresh_result(&id, true, settled);
+        assert_eq!(app.refresher.failure_count(&id), 0);
+    }
     use super::*;
     use switcheroo_core::{Device, DeviceId, Event, Kind, Power};
 

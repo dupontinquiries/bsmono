@@ -326,3 +326,40 @@ teaches them the tick means nothing — which is what it would mean by the time 
 `Event::Advertised` carries the flag and the category on every advert. It is deliberately
 NOT journalled: it arrives several times a second and reports no change, so it would drown
 everything else. `AccessoryChanged` is the line worth keeping.
+
+
+## Acting on a change, without saturating the radio
+
+Last step left a stale row waiting for the operator, on purpose: reading a HomeKit accessory
+means taking the radio from the scanner, a Curve25519 pair-verify and a characteristic read —
+about a second of exclusive radio. Doing that on every advert means a house with eight plugs
+reconnects to all eight whenever any one of them moves, and the scanner never runs. That is
+worse than the polling it replaced.
+
+`switcheroo_core::refresh` decides instead. Six rules, each with a reason:
+
+* **One at a time** — the radio is exclusive (`radio::Radio`), so the scheduler picks one and
+  the rest wait.
+* **Never over a session** — a dropped scan costs a stale list; a dropped pairing costs the
+  attempt and usually a trip to the plug to put it back in pairing mode.
+* **The visible row first** — its staleness is the staleness the operator can see. Among the
+  rest, the one stale longest, so no row is starved by newer changes elsewhere.
+* **Settle first** — a wall switch or a dimmer emits several adverts in a second or two, and
+  reading the first one reads a value about to change again.
+* **Back off on failure** — an accessory out of range does not become reachable by being
+  asked more often, and without backoff one absent plug holds the radio for as long as it is
+  away. Doubling from 4s, capped at 5 minutes so an hour-long absence still gets rechecked.
+* **A budget** — 12 background reads a rolling minute. Past it rows stay stale and the
+  operator refreshes by hand, which is the behaviour before any of this existed.
+
+A failed read spends budget too: not counting it would let an unreachable accessory retry
+without limit, which is the case the budget is for. And every reason for doing nothing is
+NAMED (`Idle::RadioBusy`, `Settling`, `BackingOff`, `BudgetSpent`, `InFlight`,
+`NothingStale`) — from outside, "nothing is stale" and "the radio is busy" look identical
+and mean opposite things when something seems stuck.
+
+The loop that had to be closed in the app: read outcomes are fed back to the scheduler from
+the event drain, BEFORE the hub consumes them. Without that the backoff never engages — the
+accessory stays stale, is picked again next tick, and holds the radio.
+
+Pure: every decision takes the clock as an argument. No timers, no radio, no I/O.

@@ -23,6 +23,8 @@
 
 
 pub mod radio;
+/// When a stale accessory is worth spending a connection on.
+pub mod refresh;
 pub mod fastpath;
 
 /// Is this a HomeKit setup code — eight digits, dashes and spaces allowed?
