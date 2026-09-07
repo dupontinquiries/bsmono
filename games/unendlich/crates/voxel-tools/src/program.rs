@@ -230,14 +230,27 @@ pub fn run(prog: &Program, anchor: (i32, i32, i32)) -> Run {
     let mut r = Run { notes: prog.notes.clone(), ..Default::default() };
     let assets: BTreeMap<&str, &Asset> = prog.assets.iter().map(|a| (a.name.as_str(), a)).collect();
     let mut solid: BTreeMap<(i32, i32, i32), u16> = BTreeMap::new();
+    let mut known: BTreeMap<String, (sketch::Shape, (i32, i32, i32))> = BTreeMap::new();
     let mut cut: BTreeSet<(i32, i32, i32)> = BTreeSet::new();
     for pass in &prog.passes {
         let cells: Vec<((i32, i32, i32), u16)> = match &pass.source {
             Source::Sketch(src) => {
-                let (sk, errs) = sketch::parse(src);
-                r.errors.extend(errs.into_iter().map(|e| format!("{}: {e}", pass.name)));
-                let (placed, notes) = sketch::resolve(&sk, anchor);
+                let (mut sk, _) = sketch::parse(src);
+                sk.assume_known = known.keys().cloned().collect();
+                let (_, errs) = sketch::parse(src);
+                let known_names: BTreeSet<String> = known.keys().cloned().collect();
+                r.errors.extend(errs.into_iter()
+                    .filter(|e| !known_names.iter().any(|k| e.contains(&format!("'{k}'"))))
+                    .map(|e| format!("{}: {e}", pass.name)));
+                // PARTS FROM EARLIER PASSES ARE VISIBLE. A builder says
+                // "the ribs hang off the spine" where the spine was the
+                // last pass's work; without this each pass resolved in
+                // isolation and every cross-pass relation silently
+                // anchored at the origin. Earlier parts are carried as
+                // ghosts: they position things and place nothing.
+                let (placed, notes) = sketch::resolve_with(&sk, anchor, &known);
                 r.notes.extend(notes.into_iter().map(|n| format!("{}: {n}", pass.name)));
+                for pl in &placed { known.insert(pl.name.clone(), (pl.shape.clone(), pl.at)); }
                 placed.iter().flat_map(|p| {
                     let b = crate::plan::resolve_block(&p.material).unwrap_or(1);
                     raster(p).into_iter().map(move |c| (c, b))
@@ -365,12 +378,20 @@ pub fn parse(src: &str) -> (Program, Vec<String>) {
                 p.assets.push(a);
             }
             Some("pass") => {
-                let (Some(name), Some(pol)) = (w.get(1), w.get(2)) else {
-                    errs.push(format!("pass needs a name and add|cut: {t:?}")); continue;
-                };
+                // POLARITY IS THE LAST WORD, and the name is everything
+                // between. `pass hollow the ribcage cut` is what a model
+                // writes; taking w[2] as the polarity read "the" and
+                // threw the pass away -- three of five passes lost in
+                // the first real test.
+                if w.len() < 3 { errs.push(format!("pass needs a name and add|cut: {t:?}")); continue; }
+                let pol = w[w.len() - 1];
                 let Some(polarity) = Polarity::parse(pol) else {
-                    errs.push(format!("pass '{name}': '{pol}' is not add or cut")); continue;
+                    errs.push(format!("pass '{}': '{pol}' is not add or cut -- put add or cut LAST",
+                                      w[1..w.len() - 1].join(" ")));
+                    continue;
                 };
+                let name = w[1..w.len() - 1].join(" ");
+                let name = &name.as_str();
                 let body = take_body(&mut lines);
                 // a body of `repeat`/`stamp` lines is asset work; anything
                 // else is a sketch

@@ -47,7 +47,7 @@
 //! No coordinate appears. `r=8` is a size, not a position; `by=6` is
 //! a distance, not a place. Every position comes out of the solver.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A primitive shape. Deliberately few: these compose, and a longer
 /// list is a menu again.
@@ -66,6 +66,16 @@ pub enum Shape {
     Slab { w: f32, d: f32, thickness: f32 },
     /// A straight run between two other parts, resolved by the solver.
     Link { thickness: f32 },
+    /// A sphere swept along a segment: the fundamental ORGANIC form.
+    /// A limb, a neck, a finger, a tail segment. `dir` is where it
+    /// points, in degrees about Y, and `pitch` how far it rises.
+    /// Tapers from `r` at the base to `r2` at the tip -- a limb of
+    /// uniform thickness reads as plumbing.
+    Capsule { r: f32, r2: f32, len: f32, dir: f32, pitch: f32 },
+    /// A chain of capsules following a curve: a spine, a neck, a tail.
+    /// This is what makes a neck a neck rather than a stack of balls --
+    /// the whole reason the reference dragon reads as an animal.
+    Spine { r: f32, r2: f32, len: f32, dir: f32, arch: f32, segments: usize },
 }
 
 impl Shape {
@@ -80,6 +90,26 @@ impl Shape {
             Shape::Helix { r, h, thickness, .. } => [r + thickness, h / 2.0, r + thickness],
             Shape::Slab { w, d, thickness } => [w / 2.0, thickness / 2.0, d / 2.0],
             Shape::Link { thickness } => [*thickness, *thickness, *thickness],
+            // A capsule's extent is its ACTUAL reach in each axis given
+            // where it points, not `len` in all three. Treating a
+            // vertical limb as if it were also `len` wide sent a pair
+            // of arms nineteen blocks out from the body: the offset for
+            // `pair` is half-width plus half-width, and the half-width
+            // was wrong by the whole length.
+            Shape::Capsule { r, r2, len, dir, pitch } => {
+                let rr = r.max(*r2);
+                let (a, p) = (dir.to_radians(), pitch.to_radians());
+                [(len * a.cos() * p.cos()).abs() / 2.0 + rr,
+                 (len * p.sin()).abs() / 2.0 + rr,
+                 (len * a.sin() * p.cos()).abs() / 2.0 + rr]
+            }
+            Shape::Spine { r, r2, len, dir, arch, .. } => {
+                let rr = r.max(*r2);
+                let a = dir.to_radians();
+                [(len * a.cos()).abs() / 2.0 + rr,
+                 (len * arch).abs() / 2.0 + rr,
+                 (len * a.sin()).abs() / 2.0 + rr]
+            }
         }
     }
     pub fn name(&self) -> &'static str {
@@ -88,6 +118,7 @@ impl Shape {
             Shape::Cylinder { .. } => "cylinder", Shape::Torus { .. } => "torus",
             Shape::Cone { .. } => "cone", Shape::Helix { .. } => "helix",
             Shape::Slab { .. } => "slab", Shape::Link { .. } => "link",
+            Shape::Capsule { .. } => "capsule", Shape::Spine { .. } => "spine",
         }
     }
 }
@@ -115,6 +146,24 @@ pub enum Rel {
     RingOf { count: usize, radius: f32 },
     /// Copies of `a` stacked up `b`.
     StackOn { count: usize, gap: f32 },
+    /// The part's ORIGIN sits on `b`'s surface and it swings from
+    /// there. For a limb this is the joint: an arm hangs FROM a
+    /// shoulder, it is not centred beside a torso.
+    ///
+    /// `pair` offsets by half-extents, which for a limb that swings
+    /// means the offset includes its whole reach -- a pair of arms
+    /// ended up nineteen blocks out from a body eleven wide. A limb
+    /// needs a joint, not a bounding box.
+    Joint { at: f32, out: f32, pair: bool },
+    /// A MIRRORED PAIR either side of `b`: one left, one right, the
+    /// second a mirror image of the first.
+    ///
+    /// Without this a model wrote `rel legL below torso` and `rel legR
+    /// below torso` and got both legs in the SAME PLACE -- there was
+    /// no way to say "one on each side", so a statue had one fused leg
+    /// and a slab of arm. Symmetry is the commonest thing in anything
+    /// built or grown, and it had no word.
+    PairAcross { by: f32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +191,9 @@ pub struct Part {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Sketch {
     pub parts: Vec<Part>,
+    /// Names the caller promises exist elsewhere -- parts from an
+    /// earlier pass. Set by `program`, empty for a lone sketch.
+    pub assume_known: BTreeSet<String>,
     /// (subject, relation, object). "ground" is a valid object.
     pub rels: Vec<(String, Rel, String)>,
     pub notes: Vec<String>,
@@ -158,6 +210,10 @@ pub struct Placed {
     pub at: (i32, i32, i32),
     /// Copies, for RingOf and StackOn.
     pub extra: Vec<(i32, i32, i32)>,
+    /// The copies in `extra` are MIRROR images, not translations: a
+    /// right arm reaching forward is a left arm reaching forward, not
+    /// a left arm reaching backward.
+    pub mirror_extra: bool,
     /// For a `link`: the two ends it spans. A link has no size of its
     /// own -- its whole shape is where it goes -- so without this it
     /// resolved to a point and drew nothing.
@@ -207,6 +263,21 @@ pub fn parse(src: &str) -> (Sketch, Vec<String>) {
                         Shape::Slab { w, d: kv(&t, "d").unwrap_or(w),
                                       thickness: kv(&t, "thickness").or(kv(&t, "t")).unwrap_or(1.0) }
                     }
+                    "capsule" | "limb" | "arm" | "leg" | "bone" => {
+                        let r = kv(&t, "r").unwrap_or(1.5);
+                        Shape::Capsule { r, r2: kv(&t, "r2").unwrap_or(r * 0.7),
+                                         len: kv(&t, "len").or(kv(&t, "h")).unwrap_or(8.0),
+                                         dir: kv(&t, "dir").unwrap_or(0.0),
+                                         pitch: kv(&t, "pitch").unwrap_or(-90.0) }
+                    }
+                    "spine" | "neck" | "tail" | "curve" => {
+                        let r = kv(&t, "r").unwrap_or(2.0);
+                        Shape::Spine { r, r2: kv(&t, "r2").unwrap_or(r * 0.4),
+                                       len: kv(&t, "len").or(kv(&t, "h")).unwrap_or(16.0),
+                                       dir: kv(&t, "dir").unwrap_or(0.0),
+                                       arch: kv(&t, "arch").unwrap_or(0.3),
+                                       segments: kv(&t, "segments").unwrap_or(8.0).clamp(2.0, 64.0) as usize }
+                    }
                     "link" | "beam" | "bridge" =>
                         Shape::Link { thickness: kv(&t, "thickness").or(kv(&t, "t")).unwrap_or(1.0) },
                     other => { errs.push(format!("unknown shape '{other}'; known: sphere, box, cylinder, \
@@ -241,6 +312,13 @@ pub fn parse(src: &str) -> (Sketch, Vec<String>) {
                         Some(third) => Rel::Between { and: third.to_lowercase() },
                         None => { errs.push(format!("between needs two objects: {line:?}")); continue; }
                     },
+                    "joint" | "from" | "hangs" | "attach" => Rel::Joint {
+                        at: kv(&t, "at").unwrap_or(0.5),        // 0 base, 1 top of the object
+                        out: kv(&t, "out").unwrap_or(0.8),      // how far toward its edge
+                        pair: t.contains(&"pair") || t.contains(&"both"),
+                    },
+                    "pair" | "either_side" | "eitherside" | "both_sides" =>
+                        Rel::PairAcross { by: kv(&t, "by").unwrap_or(0.0) },
                     "ring_of" | "ringof" | "around_in_a_ring" => Rel::RingOf {
                         count: kv(&t, "count").unwrap_or(6.0).clamp(2.0, 64.0) as usize,
                         radius: kv(&t, "radius").or(kv(&t, "r")).unwrap_or(10.0) },
@@ -259,7 +337,7 @@ pub fn parse(src: &str) -> (Sketch, Vec<String>) {
     let names: Vec<&str> = s.parts.iter().map(|p| p.name.as_str()).collect();
     for (a, r, b) in &s.rels {
         for n in [a, b] {
-            if n != "ground" && !names.contains(&n.as_str()) {
+            if n != "ground" && !names.contains(&n.as_str()) && !s.assume_known.contains(n) {
                 errs.push(format!("relation names '{n}', which is not a part"));
             }
         }
@@ -282,11 +360,25 @@ pub fn parse(src: &str) -> (Sketch, Vec<String>) {
 /// a cycle or a missing relation still builds something rather than
 /// nothing.
 pub fn resolve(s: &Sketch, anchor: (i32, i32, i32)) -> (Vec<Placed>, Vec<String>) {
+    resolve_with(s, anchor, &BTreeMap::new())
+}
+
+/// Resolve with parts from EARLIER passes available as relation
+/// targets. They position things and place nothing.
+pub fn resolve_with(s: &Sketch, anchor: (i32, i32, i32),
+                    prior: &BTreeMap<String, (Shape, (i32, i32, i32))>) -> (Vec<Placed>, Vec<String>) {
     let mut notes = Vec::new();
     let mut pos: BTreeMap<String, (f32, f32, f32)> = BTreeMap::new();
     let mut extra: BTreeMap<String, Vec<(f32, f32, f32)>> = BTreeMap::new();
     let mut spans: BTreeMap<String, ((f32, f32, f32), (f32, f32, f32))> = BTreeMap::new();
+    let mut mirrored: BTreeSet<String> = BTreeSet::new();
     let by_name: BTreeMap<&str, &Part> = s.parts.iter().map(|p| (p.name.as_str(), p)).collect();
+    // prior parts seed the position map, so a relation naming one resolves
+    for (n, (_, at)) in prior {
+        if !by_name.contains_key(n.as_str()) {
+            pos.insert(n.clone(), (at.0 as f32, at.1 as f32, at.2 as f32));
+        }
+    }
     let ground = anchor.1 as f32;
     // A part with no relation at all sits at the anchor, on the ground.
     let unrelated: Vec<&Part> = s.parts.iter()
@@ -305,7 +397,9 @@ pub fn resolve(s: &Sketch, anchor: (i32, i32, i32)) -> (Vec<Placed>, Vec<String>
             let base = if b == "ground" { Some((anchor.0 as f32, ground, anchor.2 as f32)) }
                        else { pos.get(b).copied() };
             let Some(bp) = base else { continue };
-            let bext = by_name.get(b.as_str()).map(|p| p.shape.extent()).unwrap_or([0.0; 3]);
+            let bext = by_name.get(b.as_str()).map(|p| p.shape.extent())
+                .or_else(|| prior.get(b.as_str()).map(|(sh, _)| sh.extent()))
+                .unwrap_or([0.0; 3]);
             let aext = pa.shape.extent();
             let placed = match rel {
                 Rel::Inside | Rel::Around | Rel::LevelWith => bp,
@@ -332,6 +426,30 @@ pub fn resolve(s: &Sketch, anchor: (i32, i32, i32)) -> (Vec<Placed>, Vec<String>
                     let first = copies.remove(0);
                     extra.insert(a.clone(), copies);
                     first
+                }
+                Rel::Joint { at, out, pair } => {
+                    // The joint: up the object by `at`, out toward its
+                    // side by `out`. The limb's own reach is not part of
+                    // the offset -- it swings from here. Since a shape
+                    // is centred on its position, the limb's centre goes
+                    // half its own reach along its heading FROM the
+                    // joint, so its base lands on the joint.
+                    let y = bp.1 - bext[1] + bext[1] * 2.0 * at.clamp(0.0, 1.0) + reach(&pa.shape).1 * 0.5;
+                    let x = bext[0] * out.clamp(-2.0, 2.0);
+                    if *pair {
+                        extra.insert(a.clone(), vec![(bp.0 + x, y, bp.2)]);
+                        mirrored.insert(a.clone());
+                    }
+                    (bp.0 - x, y, bp.2)
+                }
+                Rel::PairAcross { by } => {
+                    // one each side, offset by the two half-widths plus
+                    // the gap; the copy is the mirror
+                    let off = bext[0] + aext[0] + by;
+                    let left = (bp.0 - off, bp.1, bp.2);
+                    extra.insert(a.clone(), vec![(bp.0 + off, bp.1, bp.2)]);
+                    mirrored.insert(a.clone());
+                    left
                 }
                 Rel::StackOn { count, gap } => {
                     let step = aext[1] * 2.0 + gap;
@@ -383,12 +501,41 @@ pub fn resolve(s: &Sketch, anchor: (i32, i32, i32)) -> (Vec<Placed>, Vec<String>
             extra: extra.get(&p.name).map(|v| v.iter()
                 .map(|c| (c.0.round() as i32, c.1.round() as i32, c.2.round() as i32)).collect())
                 .unwrap_or_default(),
+            mirror_extra: mirrored.contains(&p.name),
             span: spans.get(&p.name).map(|(a, b)| (
                 (a.0.round() as i32, a.1.round() as i32, a.2.round() as i32),
                 (b.0.round() as i32, b.1.round() as i32, b.2.round() as i32))),
         }
     }).collect();
     (out, notes)
+}
+
+/// A shape's mirror image about the x axis: its heading reflected.
+fn flip_x(s: &Shape) -> Shape {
+    match s {
+        Shape::Capsule { r, r2, len, dir, pitch } =>
+            Shape::Capsule { r: *r, r2: *r2, len: *len, dir: 180.0 - dir, pitch: *pitch },
+        Shape::Spine { r, r2, len, dir, arch, segments } =>
+            Shape::Spine { r: *r, r2: *r2, len: *len, dir: 180.0 - dir, arch: *arch, segments: *segments },
+        other => other.clone(),
+    }
+}
+
+/// Where a shape's far end lies relative to its centre: the vector
+/// from the middle to the tip. A limb attaches by its base, so the
+/// solver moves it half this from the joint.
+fn reach(s: &Shape) -> (f32, f32, f32) {
+    match s {
+        Shape::Capsule { len, dir, pitch, .. } => {
+            let (a, p) = (dir.to_radians(), pitch.to_radians());
+            (len * a.cos() * p.cos(), len * p.sin(), len * a.sin() * p.cos())
+        }
+        Shape::Spine { len, dir, .. } => {
+            let a = dir.to_radians();
+            (len * a.cos(), 0.0, len * a.sin())
+        }
+        _ => (0.0, 0.0, 0.0),
+    }
 }
 
 fn scale(s: &Shape, f: f32) -> Shape {
@@ -402,6 +549,10 @@ fn scale(s: &Shape, f: f32) -> Shape {
             Shape::Helix { r: r * f, h: h * f, turns: *turns, thickness: thickness.max(1.0) },
         Shape::Slab { w, d, thickness } => Shape::Slab { w: w * f, d: d * f, thickness: thickness.max(1.0) },
         Shape::Link { thickness } => Shape::Link { thickness: *thickness },
+        Shape::Capsule { r, r2, len, dir, pitch } =>
+            Shape::Capsule { r: r * f, r2: r2 * f, len: len * f, dir: *dir, pitch: *pitch },
+        Shape::Spine { r, r2, len, dir, arch, segments } =>
+            Shape::Spine { r: r * f, r2: r2 * f, len: len * f, dir: *dir, arch: *arch, segments: *segments },
     }
 }
 
@@ -447,8 +598,18 @@ pub fn cells(p: &Placed, block: u16) -> Vec<(i32, i32, i32, u16)> {
     // correctly, so only the shapes without an op were affected, which
     // is exactly the shapes this function exists for.
     let mut out = Vec::new();
-    for at in std::iter::once(&p.at).chain(p.extra.iter()) {
-        out.extend(cells_at(p, *at, block));
+    out.extend(cells_at(p, p.at, block));
+    for at in p.extra.iter() {
+        if p.mirror_extra {
+            // reflect the shape's own heading about the x axis, so a
+            // pair faces outward from the body rather than both the
+            // same way
+            let mut m = p.clone();
+            m.shape = flip_x(&p.shape);
+            out.extend(cells_at(&m, *at, block));
+        } else {
+            out.extend(cells_at(p, *at, block));
+        }
     }
     out.sort_unstable();
     out.dedup();
@@ -502,6 +663,52 @@ fn cells_at(p: &Placed, at_i: (i32, i32, i32), block: u16) -> Vec<(i32, i32, i32
                 }}}
             }
         }
+        Shape::Capsule { r, r2, len, dir, pitch } => {
+            let a = dir.to_radians();
+            let p = pitch.to_radians();
+            let (dx, dy, dz) = (a.cos() * p.cos(), p.sin(), a.sin() * p.cos());
+            // CENTRED on `at`, like every other shape. Drawing from the
+            // origin outward while `extent` treated the origin as the
+            // centre put every capsule half a length from where the
+            // solver placed it -- which is why a statue's legs floated
+            // detached below its body.
+            let steps = (len.max(1.0) * 2.0) as i32;
+            let (bx, by, bz) = (at.0 - dx * len * 0.5, at.1 - dy * len * 0.5, at.2 - dz * len * 0.5);
+            for i in 0..=steps {
+                let f = i as f32 / steps as f32;
+                let rr = r + (r2 - r) * f;                     // the taper
+                let (cx, cy, cz) = (bx + dx * len * f, by + dy * len * f, bz + dz * len * f);
+                let ri = rr.ceil() as i32;
+                for ox in -ri..=ri { for oy in -ri..=ri { for oz in -ri..=ri {
+                    if ((ox * ox + oy * oy + oz * oz) as f32).sqrt() <= rr {
+                        push(cx + ox as f32, cy + oy as f32, cz + oz as f32);
+                    }
+                }}}
+            }
+        }
+        Shape::Spine { r, r2, len, dir, arch, segments } => {
+            // A curve, not a line: each segment steps along the heading
+            // and the whole run arches. A neck built as a straight
+            // capsule is a pipe; the arch is the animal.
+            let a = dir.to_radians();
+            let (ux, uz) = (a.cos(), a.sin());
+            let n = (*segments).max(2);
+            let fine = n * 6;
+            let (bx, bz) = (at.0 - ux * len * 0.5, at.2 - uz * len * 0.5);
+            for i in 0..=fine {
+                let f = i as f32 / fine as f32;
+                let rr = r + (r2 - r) * f;
+                let lift = arch * len * (f * std::f32::consts::PI).sin();
+                let (cx, cy, cz) = (bx + ux * len * f, at.1 + lift - arch * len * 0.5,
+                                    bz + uz * len * f);
+                let ri = rr.ceil() as i32;
+                for ox in -ri..=ri { for oy in -ri..=ri { for oz in -ri..=ri {
+                    if ((ox * ox + oy * oy + oz * oz) as f32).sqrt() <= rr {
+                        push(cx + ox as f32, cy + oy as f32, cz + oz as f32);
+                    }
+                }}}
+            }
+        }
         Shape::Link { thickness } => {
             // A link with no ends is a link to nowhere: the sketch said
             // to span something and never said what, so nothing is
@@ -532,7 +739,8 @@ fn cells_at(p: &Placed, at_i: (i32, i32, i32), block: u16) -> Vec<(i32, i32, i32
 /// rasterise them.
 pub fn needs_cells(placed: &[Placed]) -> Vec<&Placed> {
     placed.iter().filter(|p| matches!(p.shape,
-        Shape::Torus { .. } | Shape::Cone { .. } | Shape::Helix { .. } | Shape::Link { .. })).collect()
+        Shape::Torus { .. } | Shape::Cone { .. } | Shape::Helix { .. } | Shape::Link { .. }
+        | Shape::Capsule { .. } | Shape::Spine { .. })).collect()
 }
 
 #[cfg(test)]
