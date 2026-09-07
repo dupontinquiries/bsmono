@@ -1,0 +1,9 @@
+[package]
+name = "vidkit-mp4"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vidkit-core = { path = "../vidkit-core" }
