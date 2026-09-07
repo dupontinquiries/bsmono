@@ -194,7 +194,13 @@ pub enum Source {
     /// `t` bound: `scale=1 + t*0.6` makes each copy larger than the
     /// last. That is the one thing generating code would genuinely buy,
     /// and it costs an expression evaluator rather than an interpreter.
-    Repeat { asset: String, rule: Repeat, vary: Vec<(String, String)>, site: Site },
+    Repeat { asset: String, rule: Repeat, vary: Vec<(String, String)>, site: Site,
+             /// `step` and `count` as written, so they can be
+             /// DIMENSION-RELATIVE: `step=len/30` spaces thirty copies
+             /// along a path whatever its length. Parsed with a plain
+             /// `.parse()` these silently fell back to the default --
+             /// the same silent shrug that `grow=` was.
+             sizing: Vec<(String, String)> },
 }
 
 /// How an asset repeats. Positions are relative to the pass anchor.
@@ -342,12 +348,26 @@ pub fn run_in<W: crate::VoxelWorld>(w: &W, prog: &Program, anchor: (i32, i32, i3
                 at.iter().flat_map(|(p, turns)| a.stamp(
                     (anchor.0 + p.0, anchor.1 + p.1, anchor.2 + p.2), *turns)).collect()
             }
-            Source::Repeat { asset, rule, vary, site } => {
+            Source::Repeat { asset, rule, vary, site, sizing } => {
                 let site = *site;
                 let Some(a) = assets.get(asset.as_str()) else {
                     r.errors.push(format!("{}: no asset '{asset}'", pass.name)); continue;
                 };
-                let spots = places_in(w, rule, a, site, anchor, &prog.frames);
+                // Resolve dimension-relative sizing now that the asset
+                // and the path are both known.
+                let mut rule = rule.clone();
+                if !sizing.is_empty() {
+                    let vars = dim_vars(&rule, a, &prog.frames);
+                    for (k, e) in sizing {
+                        match crate::expr::eval(e, &vars) {
+                            Ok(v) => set_sizing(&mut rule, k, v),
+                            Err(m) => r.errors.push(format!("{}: {k}={e:?}: {m}", pass.name)),
+                        }
+                    }
+                }
+                let mut note = None;
+                let spots = places_in(w, &rule, a, site, anchor, &prog.frames, &mut note);
+                if let Some(n) = note { r.notes.push(format!("{}: {n}", pass.name)); }
                 let n = spots.len();
                 let mut out = Vec::new();
                 for (i, (p, t)) in spots.into_iter().enumerate() {
@@ -425,13 +445,15 @@ pub struct Site {
 }
 
 fn places_in<W: crate::VoxelWorld>(w: &W, rule: &Repeat, a: &Asset, site: Site,
-                                   anchor: (i32, i32, i32), frames: &[Frame])
+                                   anchor: (i32, i32, i32), frames: &[Frame],
+                                   note: &mut Option<String>)
     -> Vec<((i32, i32, i32), u8)> {
     let raw = places_with(rule, a, frames);
     if !site.on_ground && site.max_slope.is_none() && site.jitter == 0 { return raw; }
     let surface = |x: i32, z: i32| (0..=anchor.1 + 160).rev()
         .find(|&y| w.get(x, y, z) != 0);
     let mut out = Vec::new();
+    let mut grounded_attempts = 0usize;
     // The footprint an asset ACTUALLY occupies. `stamp` writes cells at
     // `at + offset` for offset in 0..size, so an asset spans [at,
     // at+size) -- it is not centred on its position. Sampling
@@ -462,6 +484,7 @@ fn places_in<W: crate::VoxelWorld>(w: &W, rule: &Repeat, a: &Asset, site: Site,
             if missing || hi - lo > max { continue; }
         }
         if site.on_ground {
+            grounded_attempts += 1;
             // the LOWEST point under the footprint, so a building rests
             // on the ground rather than having one corner buried
             match (0..fw).step_by(fw.max(1) as usize / 2 + 1)
@@ -475,7 +498,55 @@ fn places_in<W: crate::VoxelWorld>(w: &W, rule: &Repeat, a: &Asset, site: Site,
         }
         out.push((p, t));
     }
+    // A repeat that asked for the ground and found none placed nothing
+    // and said nothing -- which looks identical to a rule that rejected
+    // every spot. Worth distinguishing: usually it means the program
+    // was run against no world at all.
+    if out.is_empty() && grounded_attempts > 0 {
+        note.replace(format!("nothing was placed: `on_ground` found no surface in {grounded_attempts} \
+                              spot(s) -- is there a world here?"));
+    }
     out
+}
+
+/// What a repeat can measure about itself: the path it walks and the
+/// asset it repeats. `len` is the whole path; `w`, `h`, `d` the
+/// asset's size. That is what makes "thirty windows along this wall"
+/// one expression instead of a number the model has to work out.
+fn dim_vars(rule: &Repeat, a: &Asset, frames: &[Frame]) -> BTreeMap<String, f32> {
+    let mut v = BTreeMap::new();
+    v.insert("w".into(), a.size.0 as f32);
+    v.insert("h".into(), a.size.1 as f32);
+    v.insert("d".into(), a.size.2 as f32);
+    let len = match rule {
+        Repeat::Line { from, to, .. } => {
+            let (dx, dy, dz) = ((to.0 - from.0) as f32, (to.1 - from.1) as f32, (to.2 - from.2) as f32);
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        }
+        Repeat::Ring { radius, .. } => *radius as f32 * std::f32::consts::TAU,
+        Repeat::Grid { min, max, .. } => ((max.0 - min.0).max(max.2 - min.2)) as f32,
+        Repeat::Stack { count, step, .. } => (*count as i32 * *step) as f32,
+        Repeat::OnFrame { frame } | Repeat::Along { frame, .. } =>
+            frames.iter().find(|f| &f.name == frame).map(|f| f.points.windows(2).map(|s| {
+                let (a0, b0) = (s[0].1, s[1].1);
+                let (dx, dy, dz) = ((b0.0 - a0.0) as f32, (b0.1 - a0.1) as f32, (b0.2 - a0.2) as f32);
+                (dx * dx + dy * dy + dz * dz).sqrt()
+            }).sum()).unwrap_or(0.0),
+    };
+    v.insert("len".into(), len);
+    v
+}
+
+fn set_sizing(rule: &mut Repeat, key: &str, val: f32) {
+    let i = val.round().max(1.0) as i32;
+    match (rule, key) {
+        (Repeat::Line { step, .. }, "step") | (Repeat::Grid { step, .. }, "step")
+            | (Repeat::Stack { step, .. }, "step") | (Repeat::Along { step, .. }, "step") => *step = i,
+        (Repeat::Ring { count, .. }, "count") | (Repeat::Stack { count, .. }, "count") =>
+            *count = i.clamp(1, 256) as usize,
+        (Repeat::Ring { radius, .. }, "radius") => *radius = i,
+        _ => {}
+    }
 }
 
 fn places_with(rule: &Repeat, a: &Asset, frames: &[Frame]) -> Vec<((i32, i32, i32), u8)> {
@@ -510,15 +581,21 @@ fn places_with(rule: &Repeat, a: &Asset, frames: &[Frame]) -> Vec<((i32, i32, i3
 fn places(rule: &Repeat, _a: &Asset) -> Vec<((i32, i32, i32), u8)> {
     match rule {
         Repeat::Line { from, to, step } => {
-            let step = (*step).max(1);
-            let (dx, dy, dz) = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
-            let len = ((dx * dx + dz * dz) as f32).sqrt().max(1.0);
-            let n = ((len / step as f32).floor() as usize).max(1);
+            // Step EXACTLY, rather than computing a count and
+            // redistributing evenly. Even spacing put the last copy on
+            // `to` and made the real gap `len/n` -- slightly more than
+            // asked -- so an asset spaced by its own width left gaps.
+            // A builder saying "every 3 blocks" means every 3 blocks.
+            let step = (*step).max(1) as f32;
+            let (dx, dy, dz) = ((to.0 - from.0) as f32, (to.1 - from.1) as f32, (to.2 - from.2) as f32);
+            let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1.0);
+            let (ux, uy, uz) = (dx / len, dy / len, dz / len);
+            let n = (len / step).floor() as usize;
             (0..=n).map(|i| {
-                let f = i as f32 / n as f32;
-                (((from.0 as f32 + dx as f32 * f) as i32,
-                  (from.1 as f32 + dy as f32 * f) as i32,
-                  (from.2 as f32 + dz as f32 * f) as i32), 0u8)
+                let t = i as f32 * step;
+                (((from.0 as f32 + ux * t).round() as i32,
+                  (from.1 as f32 + uy * t).round() as i32,
+                  (from.2 as f32 + uz * t).round() as i32), 0u8)
             }).collect()
         }
         Repeat::Ring { centre, radius, count, face_out } => {
@@ -730,7 +807,10 @@ fn parse_asset_use(body: &str) -> Result<Source, String> {
         jitter: num("jitter", 0).clamp(0, 64),
         seed: num("seed", 1) as u64,
     };
-    Ok(Source::Repeat { asset, rule, vary, site })
+    let sizing: Vec<(String, String)> = ["step", "count", "radius"].iter()
+        .filter_map(|k| kv(k).filter(|v| crate::expr::is_expr(v)).map(|v| (k.to_string(), v.to_string())))
+        .collect();
+    Ok(Source::Repeat { asset, rule, vary, site, sizing })
 }
 
 /// The prompt for the pass that decides POLARITY and ASSETS -- the
@@ -1137,5 +1217,81 @@ mod tests {
                             pass p add\n  repeat m frame nosuch\nend\n");
         let r = run(&p, (0, 0, 0));
         assert!(r.changes.is_empty());
+    }
+
+    #[test]
+    fn a_repeat_can_be_spaced_by_the_thing_it_walks() {
+        // "thirty windows along this wall", however long the wall is
+        let mk = |from: i32, to: i32| format!(
+            "asset w\n  part x box w=1 h=2 d=1 material=stone\nend\n\
+             pass p add\n  repeat w line from={from},0,0 to={to},0,0 step=len/30\nend\n");
+        for (a, b) in [(-30, 30), (-150, 150)] {
+            let (prog, errs) = parse(&mk(a, b));
+            assert!(errs.is_empty(), "{errs:?}");
+            let r = run(&prog, (0, 0, 0));
+            assert!(r.errors.is_empty(), "{:?}", r.errors);
+            let xs: BTreeSet<i32> = r.changes.iter().map(|c| c.at.0).collect();
+            // about thirty copies either way -- the spacing scaled with
+            // the wall rather than staying a fixed number of blocks
+            assert!((26..=34).contains(&xs.len()), "{a}..{b}: {} copies", xs.len());
+        }
+    }
+
+    #[test]
+    fn a_ring_can_be_counted_from_its_own_circumference() {
+        // one post every six blocks around, whatever the radius
+        let mk = |r: i32| format!(
+            "asset p\n  part x box w=1 h=4 d=1 material=stone\nend\n\
+             pass a add\n  repeat p ring radius={r} count=len/6\nend\n");
+        let small = run(&parse(&mk(10)).0, (0, 0, 0));
+        let big = run(&parse(&mk(40)).0, (0, 0, 0));
+        let n = |r: &Run| r.changes.iter().map(|c| (c.at.0, c.at.2)).collect::<BTreeSet<_>>().len();
+        assert!(n(&big) > n(&small) * 3, "the bigger ring has more posts: {} vs {}", n(&big), n(&small));
+    }
+
+    #[test]
+    fn an_asset_can_be_spaced_by_its_own_width() {
+        // touching, whatever the asset is: the commonest thing a
+        // builder wants and the one a fixed number always gets wrong
+        for width in [3, 9] {
+            let (prog, _) = parse(&format!(
+                "asset b\n  part x box w={width} h=3 d=3 material=stone\nend\n\
+                 pass a add\n  repeat b line from=-40,0,0 to=40,0,0 step=w\nend\n"));
+            let r = run(&prog, (0, 0, 0));
+            let xs: BTreeSet<i32> = r.changes.iter().map(|c| c.at.0).collect();
+            // an unbroken run: no gaps, because each copy starts where
+            // the last one ended
+            let (lo, hi) = (*xs.iter().min().unwrap(), *xs.iter().max().unwrap());
+            assert_eq!(xs.len() as i32, hi - lo + 1, "width {width} leaves no gaps");
+        }
+    }
+
+    #[test]
+    fn a_sizing_expression_that_cannot_be_read_says_so() {
+        let (prog, _) = parse(
+            "asset w\n  part x box w=1 h=2 d=1 material=stone\nend\n\
+             pass p add\n  repeat w line from=-20,0,0 to=20,0,0 step=nosuch/4\nend\n");
+        let r = run(&prog, (0, 0, 0));
+        assert!(r.errors.iter().any(|e| e.contains("not a known value")), "{:?}", r.errors);
+        assert!(r.errors.iter().any(|e| e.contains("len")), "it lists what IS available: {:?}", r.errors);
+        // and it still built at the default spacing
+        assert!(!r.changes.is_empty());
+    }
+
+    #[test]
+    fn a_repeat_that_wanted_ground_and_found_none_says_so() {
+        // Placing nothing because there is no world looks identical to
+        // placing nothing because every spot was rejected. The first is
+        // usually a program run against no world at all.
+        let (prog, _) = parse(
+            "asset t\n  part s cylinder r=2 h=8 material=stone\nend\n\
+             pass a add\n  repeat t grid min=-20,0,-20 max=20,0,20 step=10 on_ground\nend\n");
+        let empty = run(&prog, (0, 0, 0));
+        assert!(empty.changes.is_empty());
+        assert!(empty.notes.iter().any(|n| n.contains("found no surface")), "{:?}", empty.notes);
+        // and with a world it builds, quietly
+        let with = run_in(&Land, &prog, (0, 64, 0));
+        assert!(!with.changes.is_empty());
+        assert!(!with.notes.iter().any(|n| n.contains("found no surface")));
     }
 }
