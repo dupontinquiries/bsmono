@@ -4598,6 +4598,14 @@ impl eframe::App for VoicetermApp {
                     // shell reporting an exit code — and the method had no
                     // caller, so no block opened here would ever have
                     // closed.
+                    // Feed_pty first: it learns the cwd from OSC 7, and `finish` in the line
+                    // loop below reads tracker state. Not load-bearing for the block's cwd —
+                    // a block is stamped when `submit_command` OPENS it, at Enter, by which
+                    // time the prompt's announcement has long since arrived. (I reordered
+                    // this believing feed_line opened blocks. It does not; it only closes
+                    // them. The order is kept because state-before-consumers is the right
+                    // default, not because it fixes anything.)
+                    self.feed_pty(&out);
                     let text = String::from_utf8_lossy(&out).into_owned();
                     for line in text.split_inclusive(['\n', '\r']) {
                         let clean = line.trim_end_matches(['\n', '\r']);
@@ -4606,7 +4614,6 @@ impl eframe::App for VoicetermApp {
                         // CRLF pair.
                         if !clean.is_empty() { self.blocks.feed_line(clean); }
                     }
-                    self.feed_pty(&out);
                 }
                 if ended {
                     // Say so once. A terminal whose shell has exited but

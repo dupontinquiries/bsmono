@@ -76,3 +76,40 @@ fn awkward_commands_survive_the_file() {
     assert_eq!(back.len(), 3, "a tab or newline ate a row: {back:?}");
     assert_eq!(back.iter().filter(|i| i.command == "echo done").count(), 1);
 }
+
+/// A command started after the shell announced a new directory is stamped with THAT
+/// directory — which is the whole point of reading OSC 7, and the thing that was broken
+/// while `set_cwd` was a hardcoded demo path.
+///
+/// This replaces a test I wrote for an ordering bug that does not exist. I had assumed
+/// `feed_line` opened blocks; it only CLOSES them, and `submit_command` opens one at Enter,
+/// by which time the prompt's announcement has long since arrived. The first version passed
+/// while asserting nothing, and the guard I added against exactly that is what caught it.
+#[test]
+fn a_command_is_stamped_with_the_directory_the_shell_announced() {
+    use uikit_term::blocks::BlockTracker;
+    use voiceterm_egui::osc7;
+
+    let mut t = BlockTracker::new();
+    let mut sc = osc7::Scanner::new();
+
+    // Where we started.
+    t.set_cwd("/home/k/old");
+    t.submit_command("ls", 0);
+    t.finish(Some(0));
+
+    // The shell cds and announces it at the next prompt.
+    if let Some(cwd) = sc.feed(b"\x1b]7;file:///srv/work\x07user@host:/srv/work$ ").pop() {
+        t.set_cwd(&cwd);
+    }
+    t.submit_command("make", 1);
+    t.finish(Some(0));
+
+    let stamped: Vec<Option<String>> = t.blocks.iter().map(|b| b.cwd.clone()).collect();
+    assert_eq!(stamped.len(), 2, "{stamped:?}");
+    assert_eq!(stamped[0].as_deref(), Some("/home/k/old"), "the first block moved with us");
+    assert_eq!(stamped[1].as_deref(), Some("/srv/work"), "the announcement did not reach the block");
+
+    // And `previous_cwd` tracked the move, which is what smart-cd undo reads.
+    assert_eq!(t.previous_cwd.as_deref(), Some("/home/k/old"));
+}
