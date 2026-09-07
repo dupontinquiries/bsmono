@@ -147,16 +147,23 @@ git fetch vidkit
 git subtree add --prefix=crates/vidkit vidkit main --squash
 ```
 
-**The root `Cargo.toml` here declares a workspace.** Nesting it inside another
-workspace makes cargo fail with "workspace member found in multiple
-workspaces". Two ways out, pick one:
+**The root `Cargo.toml` here declares a workspace**, so how it lands depends on
+how the outer one lists its members. All three cases below were tried against a
+stand-in monorepo, not reasoned about:
 
-- Add the subtree path to the outer workspace's `[workspace] exclude`, keeping
-  this an independent workspace that builds on its own. Simplest, but the
-  crates do not share the outer lockfile or target dir.
-- Delete this root `Cargo.toml` after merging and add
-  `crates/vidkit/crates/*` to the outer `[workspace] members`. Better build
-  times and one lockfile; the pins below have to move to the outer manifest.
+- Outer `members` names paths explicitly (`["crates/eguikit", ...]`) —
+  **works as-is**, no change needed. The nested workspace is simply not
+  referenced. It builds on its own from inside `crates/vidkit`.
+- Outer `members` uses a glob (`["crates/*"]`) — **fails** with
+  `multiple workspace roots found in the same workspace`. Fix by adding
+  `exclude = ["crates/vidkit"]` alongside the glob. Verified.
+- Flattening into one workspace — delete this root `Cargo.toml`, add
+  `"crates/vidkit/crates/*"` to the outer `members`, and copy the
+  `[workspace.package]` block (version/edition/rust-version/license) into the
+  outer manifest, because the crates here inherit those with
+  `version.workspace = true`. Without that block cargo errors on the missing
+  inherited keys. Verified. One lockfile and one target dir; the dependency
+  pins travel with `vidkit-vk/Cargo.toml` and keep working.
 
 `Cargo.lock` is committed on purpose. `ash` and `naga` pull `indexmap 2.14`,
 which is edition2024 and unparseable by rustc 1.75; `indexmap = "=2.2.6"` and
