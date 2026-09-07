@@ -290,3 +290,84 @@ means wander by the same half-level the fault test looks for.
 Nothing here is wired in — `seams` is a measurement module and a diagnostic. The next run
 should print `BleedCheck::describe` at startup and `seam_profile` on the first output frame,
 which turns "I see faint lines" into two numbers before anything is changed.
+
+---
+
+# Bidirectional filters: reuse through a fade or a grade (`d2x-core/src/photometric.rs`)
+
+## The observation
+
+Some things a frame does to the previous one are **invertible per pixel**: a fade is a
+multiply, a colour grade is a per-channel gain and offset, an exposure ramp is a gain. The
+content is unchanged; only its photometry moved. The matcher does not know that, so every
+block fails the SSE gate and the whole frame goes through the network — for as long as the
+fade lasts.
+
+**This is the opposite of the case the block cache lost on.** `xref`'s measured negative was
+that the probe set is content genuinely new to the shot, which has no twin anywhere. A fade
+is the reverse: the probe set is the *entire frame*, and every block of it has a twin one
+frame back related by two numbers per channel. The work is redundant and the redundancy is
+cheap to describe. That is the argument for doing this where the cache was not worth it.
+
+## What already shipped, and what it misses
+
+`predict::fade_scalar` estimates **one additive scalar per block, across all three channels
+together**, and `residual::merge` applies it to the upscaled previous frame. The machinery —
+estimate at low res, verify against the gate's own SSE limit, apply at output resolution — is
+right, and `photometric` keeps all of it.
+
+The model misses two things:
+
+* **A fade is multiplicative.** At gain 0.9 a mid-grey pixel moves 13 levels and a near-white
+  one moves 26. One offset cannot cover a block spanning both, so a real fade still blows the
+  gate on most blocks — precisely when the frame is most redundant. Measured on a patterned
+  block: the additive model's residual is **>20× worse** than the fitted `a·x + b`.
+* **A grade is per channel.** Teal-and-orange pushes blue up and red down; summing over three
+  channels averages it toward zero and makes it invisible.
+
+## The honest catch
+
+Reuse serves a block from the previous **upscaled** output, and `N(a·x + b) ≠ a·N(x) + b` for
+a nonlinear network. The gate verifies at low resolution, so it never sees that error.
+
+Three bounds, which are the design rather than a caveat:
+
+1. **Gain clamped to ±0.25.** A CNN is close to locally linear over a small brightness change
+   and is not over a large one; a fade steeper than that per frame is a few frames at the end
+   where the picture is nearly flat and redrawing is cheap.
+2. **The gate keeps headroom.** A gained fit may spend only 60% of the cell's budget; the
+   rest covers the commutation error it cannot measure. The uncertain path is held to a
+   *stricter* standard than the certain one.
+3. **Offset-only is exempt** and gets the full budget, so this cannot regress what ships.
+
+## What the tests found
+
+Three of the six tests failed first, all for the same reason: **clamping at 0/255 makes the
+transform non-linear and non-invertible at the extremes.** A grade pushing a channel past
+white destroys the information, no linear fit recovers it, and the fitted slope is dragged
+*back inside* the sane-gain window by the saturated pixels — so the gain guard does not catch
+it and the residual guard must. That is now its own test, along with a non-clipping fade of
+similar magnitude passing the same budget, so it is refusing the clipping rather than
+refusing brightness changes.
+
+One more test was passing while measuring nothing: a noiseless fade fits to within rounding,
+so a zero residual could not tell a strict budget from a generous one. It has noise now.
+
+## Status and what to do next
+
+`photometric` is written and tested (8 tests, 147 in d2x-core). **`predict` still uses
+`fade_scalar`; nothing calls this yet.** Wiring it means: fit per block in the fade pass,
+carry `Photometric` on `FadeBlock` instead of `scalar: i32`, and have `merge` apply gain as
+well as offset at output resolution — `Frame::add_scalar_block` becomes an affine map.
+
+The measurement that would justify it: `analyze` on a clip with a real fade or a graded
+sequence, reporting the fraction of pixels through the network with and without. A fade to
+black over 24 frames currently costs 24 near-full redraws; if that becomes 24 compensated
+reuses the saving is large and obvious, and if it does not, the reason will be in the
+residuals and worth knowing.
+
+## Not attempted: geometry
+
+A zoom, rotation or warp needs resampling, and resampling an already-upscaled block is a
+quality question a low-resolution gate is not qualified to answer. Global translation is
+already handled by the matcher and `phase_corr`.

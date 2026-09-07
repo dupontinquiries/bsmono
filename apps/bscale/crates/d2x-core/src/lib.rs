@@ -35,6 +35,8 @@ pub mod net;
 pub mod phase_corr;
 pub mod pipeline;
 pub mod plan;
+/// Reuse through a fade, a grade or a lighting change: `a·x + b` per channel.
+pub mod photometric;
 pub mod plate;
 pub mod predict;
 pub mod quality;
