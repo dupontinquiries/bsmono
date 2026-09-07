@@ -813,3 +813,32 @@ remaining GUI piece is a native-log QML view that renders the dots. Real `cargo
 check` runs aren't exercised in the sandbox (verified with stub commands).
 
 Test count: 98 default (core 58 unit + 37 integration, peek 3) + fanotify.
+
+
+## Installing a pushed app (2026-09-07)
+
+`cockpit::installer::push_install_script` writes the launcher on the target. What it does,
+and why each part is there — the fleet targets Plasma Mobile, Plasma desktop, COSMIC and
+GNOME/GTK, and they do not agree about how a new app becomes visible.
+
+* **The icon goes into the icon theme**, `~/.local/share/icons/hicolor/256x256/apps/<app>.png`,
+  and the entry says `Icon=<app>` — a NAME, not a path. It used to land in
+  `~/.cache/gitmind/shots/` with an absolute path, which works until something clears the
+  cache, and then every pushed app loses its icon with no error anywhere.
+* **`StartupWMClass=<app>`** and, on the app side, `ViewportBuilder::with_app_id("gitmind")`.
+  A launcher matches a window by Wayland app_id or X11 WM_CLASS against the .desktop
+  basename. gitmind-egui set neither, so on Plasma (desktop and Mobile) and COSMIC the
+  running window showed as a separate generic entry beside its own pinned launcher. Three
+  names, one string, and they have to agree.
+* **The caches are refreshed**: `kbuildsycoca6`/`5` for Plasma, which reads a compiled cache
+  and will not show the app until it is rebuilt — the single most likely thing to be
+  reported as "the push didn't work" — plus `update-desktop-database` and
+  `gtk-update-icon-cache` for the GTK/COSMIC side. Every one is `command -v`-guarded and
+  `|| true`-swallowed, because the script runs under `set -e` and a missing kbuildsycoca on
+  a GNOME box must not fail an install that already succeeded.
+
+Tested by RUNNING the script in a scratch `$HOME` and inspecting the result: the binary is
+executable, the icon is in the theme, the entry parses, `Exec` is absolute with `$HOME`
+already expanded (a launcher does not run a shell), and no line is indented — the `format!`
+continuations are the easiest thing to get wrong and one leading space makes the whole entry
+unparseable.

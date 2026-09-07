@@ -1,3 +1,8 @@
+/// The Wayland app id, the X11 WM_CLASS, and the .desktop basename — one string, because a
+/// launcher matches a window by comparing them.
+#[cfg(feature = "app")]
+pub const APP_ID: &str = "gitmind";
+
 #[cfg(feature = "app")]
 fn main() -> eframe::Result<()> {
     // RENDERER PINNED, and limits clamped if wgpu is what we get.
@@ -19,8 +24,22 @@ fn main() -> eframe::Result<()> {
     // snapclone's camera-bridge hit exactly this and its comment records
     // the same crash on Asahi; the difference is that crate WANTS wgpu
     // and so clamps the limits, while this one only ever wanted glow.
+    // THE WAYLAND APP ID, which is how a window is matched to its launcher.
+    //
+    // Without it winit uses a default derived from the binary, and it will not equal the
+    // .desktop file's basename — so on Plasma (desktop and Mobile) and on COSMIC the task
+    // switcher shows a generic entry with a fallback icon beside the pinned launcher rather
+    // than lighting the launcher up, and "keep in dock" pins something that does not match
+    // the running window. GNOME/GTK shells behave the same way.
+    //
+    // It must equal the .desktop basename that `cockpit::installer` writes: `gitmind`. The
+    // installer also emits `StartupWMClass=gitmind` for the X11 path, where the match is on
+    // WM_CLASS instead. Two names, one string, and they have to agree.
     let opts = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
+        viewport: egui::ViewportBuilder::default()
+            .with_app_id(APP_ID)
+            .with_title("gitmind"),
         ..Default::default()
     };
     eframe::run_native(
