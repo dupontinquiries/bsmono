@@ -972,6 +972,8 @@ impl Feel {
                         None => self.board.current(),
                     };
                     let mut top_edge = None;
+                    let mut springboard: Vec<String> = Vec::new();
+                    let mut trailing_space = false;
                     // THE TOP EDGE, before the swipe is read as a word. `single-hand-mode.md`
                     // §5/§6 put a digit arc and a minimize fling on the same edge, and its
                     // tie-break is explicit: prefer the digit, because losing your keyboard
@@ -1003,6 +1005,20 @@ impl Feel {
                         // the user picks. Committing automatically would fight the tap that the
                         // same gesture's lift also produces on some touch stacks.
                         ctx.request_repaint();
+                        // EXCEPT the words a springboard crossing already closed. Those are
+                        // finished — the user ended each one by leaving the letters — and
+                        // offering them as candidates would ask for confirmation of a
+                        // decision already made with the thumb. Committed here, the tail
+                        // still goes to the candidate bar.
+                        springboard = std::mem::take(&mut self.swipe.springboard_words);
+                        trailing_space = self.swipe.trailing_space;
+                    }
+                    for w in springboard {
+                        self.emit_text(&w);
+                        self.emit_text(" ");
+                    }
+                    if trailing_space {
+                        self.emit_text(" ");
                     }
                     match top_edge {
                         Some(crate::topedge::TopEdge::Digit(d)) => self.emit_text(&d.to_string()),

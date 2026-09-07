@@ -51,6 +51,13 @@ pub struct SwipeState {
     /// pointer-tracker beside this one would see a slightly different path and disagree
     /// with it about where the finger went. Cleared once read.
     finished: Option<(egui::Pos2, egui::Pos2, f32, u64)>,
+    /// Words closed by a springboard crossing during the last swipe, in order, each already
+    /// decoded. The caller emits these before offering candidates for the tail — they are
+    /// finished, and re-offering them as candidates would ask the user to confirm a word
+    /// they ended deliberately by leaving the letters.
+    pub springboard_words: Vec<String>,
+    /// The last swipe ended outside the letters: append a space after the tail (§3 step 5).
+    pub trailing_space: bool,
 }
 
 impl Default for SwipeState {
@@ -63,6 +70,8 @@ impl SwipeState {
     pub fn new() -> SwipeState {
         SwipeState {
             finished: None,
+            springboard_words: Vec::new(),
+            trailing_space: false,
             path: Vec::new(),
             active: false,
             candidates: Vec::new(),
@@ -201,8 +210,55 @@ impl SwipeState {
             return None;
         }
         let keys = Self::hitboxes(layout, board, adaptive);
-        self.raw = board_gestures::decode_swipe_path(&self.path, &keys);
-        let cands = self.recognizer.recognize(&self.path, &keys);
+
+        // SPRINGBOARD SEGMENTATION. A path that leaves the letter region and comes back
+        // typed a space, so the pieces are separate words rather than one long one. See
+        // `crate::springboard` for the rules; this supplies the geometry and runs the
+        // recognizer per piece.
+        //
+        // The letter region is the board minus its last row: on every layout here that row
+        // is space and the utility keys, not letters. Using the whole board instead would
+        // put the boundary at the screen edge, where a thumb cannot cross it.
+        let letters = Rect::from_min_max(
+            board.min,
+            egui::pos2(board.max.x, (board.max.y - adaptive.min_touch_target).max(board.min.y)),
+        );
+        let pts: Vec<egui::Pos2> =
+            self.path.iter().map(|p| egui::pos2(p.x as f32, p.y as f32)).collect();
+        let seg = crate::springboard::segment(&pts, letters);
+
+        self.springboard_words.clear();
+        self.trailing_space = seg.trailing_space;
+
+        // A path that crossed the TOP belongs to `topedge` — a digit arc or a minimize
+        // fling — and recognising it as well would type whatever it spelled on the way up.
+        if seg.terminated_by_top {
+            self.raw.clear();
+            self.candidates.clear();
+            self.path.clear();
+            return None;
+        }
+
+        let best = |r: &std::ops::Range<usize>, me: &mut Self| -> Option<String> {
+            let slice = &me.path[r.clone()];
+            if slice.len() < 3 {
+                return None;
+            }
+            me.recognizer.recognize(slice, &keys).into_iter().next().map(|c| c.word)
+        };
+        // Every segment but the last is CLOSED: the user ended it by leaving the letters.
+        let closed: Vec<std::ops::Range<usize>> =
+            seg.ranges.iter().take(seg.ranges.len().saturating_sub(1)).cloned().collect();
+        for r in &closed {
+            if let Some(w) = best(r, self) {
+                self.springboard_words.push(w);
+            }
+        }
+
+        let tail = seg.ranges.last().cloned().unwrap_or(0..self.path.len());
+        let tail_path: Vec<SwipePoint> = self.path[tail].to_vec();
+        self.raw = board_gestures::decode_swipe_path(&tail_path, &keys);
+        let cands = self.recognizer.recognize(&tail_path, &keys);
         self.candidates = cands.clone();
         self.path.clear();
         Some(cands)
@@ -688,5 +744,111 @@ mod nudge_wiring_tests {
         let mut s = SwipeState::new();
         s.refresh_nudges(0);
         assert!(s.nudges.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod springboard_wiring_tests {
+    use super::*;
+    use crate::{Adaptive, Layout};
+
+    fn board() -> (Layout, Rect, Adaptive) {
+        let layout = Layout::qwerty();
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(720.0, 300.0));
+        (layout, rect, Adaptive { min_touch_target: 44.0, gutter: 4.0, ..Adaptive::default() })
+    }
+
+    /// Drive a path through `update` the way the pointer would: down for every point, then
+    /// up. The egui `Context` is real, so this exercises the same input reading the app does.
+    fn swipe_through(pts: &[egui::Pos2]) -> SwipeState {
+        let (layout, rect, ad) = board();
+        let mut st = SwipeState::with_dictionary(["hello", "world", "cat", "dog"].iter().map(|s| s.to_string()).collect());
+        let ctx = egui::Context::default();
+        let mut frame = |pos: Option<egui::Pos2>, down: bool, st: &mut SwipeState| {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(720.0, 400.0)));
+            if let Some(p) = pos {
+                input.events.push(egui::Event::PointerMoved(p));
+                input.events.push(egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: down,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = st.update(ui, &layout, rect, &ad);
+                });
+            });
+        };
+        for p in pts {
+            frame(Some(*p), true, &mut st);
+        }
+        frame(pts.last().copied(), false, &mut st);
+        st
+    }
+
+    /// The wiring, end to end: a path that dips below the letters and comes back must
+    /// produce a CLOSED word plus a tail, not one long word. The segmentation is unit-tested
+    /// in `springboard`; this checks `update` actually calls it.
+    #[test]
+    fn a_path_that_leaves_the_letters_closes_a_word() {
+        // The letter region is the board minus its last row: 300 - 44 = 256.
+        let out_and_back = vec![
+            egui::pos2(60.0, 100.0),
+            egui::pos2(120.0, 120.0),
+            egui::pos2(180.0, 140.0),
+            // below 256, and far enough along to clear the 12px hysteresis
+            egui::pos2(200.0, 270.0),
+            egui::pos2(240.0, 275.0),
+            // back into the letters
+            egui::pos2(300.0, 150.0),
+            egui::pos2(360.0, 120.0),
+            egui::pos2(420.0, 110.0),
+        ];
+        let st = swipe_through(&out_and_back);
+        assert_eq!(st.springboard_words.len(), 1, "no word was closed: {:?}", st.springboard_words);
+        assert!(!st.trailing_space, "the path ended inside the letters");
+
+        // A path that stays inside closes nothing — so the test is measuring the crossing.
+        let inside = vec![
+            egui::pos2(60.0, 100.0),
+            egui::pos2(160.0, 120.0),
+            egui::pos2(260.0, 140.0),
+            egui::pos2(360.0, 120.0),
+        ];
+        let st = swipe_through(&inside);
+        assert!(st.springboard_words.is_empty(), "{:?}", st.springboard_words);
+        assert!(!st.trailing_space);
+    }
+
+    /// §3 step 5, through the wiring: a path that ends outside recognises what it has and
+    /// asks for a space after it.
+    #[test]
+    fn a_path_that_ends_outside_asks_for_a_trailing_space() {
+        let st = swipe_through(&[
+            egui::pos2(60.0, 100.0),
+            egui::pos2(160.0, 130.0),
+            egui::pos2(240.0, 160.0),
+            egui::pos2(260.0, 272.0),
+            egui::pos2(300.0, 280.0),
+        ]);
+        assert!(st.trailing_space, "the path ended outside and no space was asked for");
+    }
+
+    /// A path over the top belongs to `topedge`. Recognising it as well would type whatever
+    /// it spelled on the way up to a digit.
+    #[test]
+    fn a_path_over_the_top_recognises_nothing() {
+        let st = swipe_through(&[
+            egui::pos2(200.0, 60.0),
+            egui::pos2(205.0, 30.0),
+            egui::pos2(210.0, -20.0),
+            egui::pos2(212.0, -40.0),
+        ]);
+        assert!(st.candidates.is_empty(), "a digit arc produced word candidates: {:?}", st.candidates);
+        assert!(st.raw.is_empty());
+        assert!(st.springboard_words.is_empty());
     }
 }
