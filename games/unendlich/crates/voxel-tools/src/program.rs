@@ -333,7 +333,11 @@ pub fn run_in<W: crate::VoxelWorld>(w: &W, prog: &Program, anchor: (i32, i32, i3
                     }
                 }
                 sk.assume_known = with_frames.keys().cloned().collect();
-                let (placed, notes) = sketch::resolve_with(&sk, anchor, &with_frames);
+                // the ground is available, so `rel leg reaches ground`
+                // stretches to the real terrain rather than a guess
+                let top = anchor.1 + 160;
+                let ground = |x: i32, z: i32| (0..=top).rev().find(|&y| w.get(x, y, z) != 0);
+                let (placed, notes) = sketch::resolve_grounded(&sk, anchor, &with_frames, Some(&ground));
                 r.notes.extend(notes.into_iter().map(|n| format!("{}: {n}", pass.name)));
                 for pl in &placed { known.insert(pl.name.clone(), (pl.shape.clone(), pl.at)); }
                 placed.iter().flat_map(|p| {

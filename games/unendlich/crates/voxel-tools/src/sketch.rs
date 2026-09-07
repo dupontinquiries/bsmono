@@ -155,6 +155,10 @@ pub enum Rel {
     /// ended up nineteen blocks out from a body eleven wide. A limb
     /// needs a joint, not a bounding box.
     Joint { at: f32, out: f32, pair: bool },
+    /// Stretch to touch the ground below wherever it ends up. The
+    /// part's `len` becomes the distance from its joint to the floor,
+    /// so a leg reaches, a pier founds, a column meets its footing.
+    Reaches,
     /// A MIRRORED PAIR either side of `b`: one left, one right, the
     /// second a mirror image of the first.
     ///
@@ -312,6 +316,7 @@ pub fn parse(src: &str) -> (Sketch, Vec<String>) {
                         Some(third) => Rel::Between { and: third.to_lowercase() },
                         None => { errs.push(format!("between needs two objects: {line:?}")); continue; }
                     },
+                    "reaches" | "reach" | "touches" | "down_to" => Rel::Reaches,
                     "joint" | "from" | "hangs" | "attach" => Rel::Joint {
                         at: kv(&t, "at").unwrap_or(0.5),        // 0 base, 1 top of the object
                         out: kv(&t, "out").unwrap_or(0.8),      // how far toward its edge
@@ -367,6 +372,20 @@ pub fn resolve(s: &Sketch, anchor: (i32, i32, i32)) -> (Vec<Placed>, Vec<String>
 /// targets. They position things and place nothing.
 pub fn resolve_with(s: &Sketch, anchor: (i32, i32, i32),
                     prior: &BTreeMap<String, (Shape, (i32, i32, i32))>) -> (Vec<Placed>, Vec<String>) {
+    resolve_grounded(s, anchor, prior, None)
+}
+
+/// Resolve with a ground height available, so a part can be told to
+/// REACH it rather than being given a length.
+///
+/// A dragon's leg was `len=34` -- a number guessed to look right, and
+/// wrong the moment the body moved or the terrain changed. A leg's
+/// length is not a design decision, it is the distance from the hip to
+/// the floor. Same for a column to a ceiling or a pier to a riverbed.
+pub fn resolve_grounded(s: &Sketch, anchor: (i32, i32, i32),
+                        prior: &BTreeMap<String, (Shape, (i32, i32, i32))>,
+                        ground_at: Option<&dyn Fn(i32, i32) -> Option<i32>>)
+    -> (Vec<Placed>, Vec<String>) {
     let mut notes = Vec::new();
     let mut pos: BTreeMap<String, (f32, f32, f32)> = BTreeMap::new();
     let mut extra: BTreeMap<String, Vec<(f32, f32, f32)>> = BTreeMap::new();
@@ -403,6 +422,9 @@ pub fn resolve_with(s: &Sketch, anchor: (i32, i32, i32),
             let aext = pa.shape.extent();
             let placed = match rel {
                 Rel::Inside | Rel::Around | Rel::LevelWith => bp,
+                // `reaches` sets a LENGTH, not a position: applied
+                // after everything is placed, in a second sweep
+                Rel::Reaches => continue,
                 Rel::On => (bp.0, bp.1 + bext[1] + aext[1], bp.2),
                 Rel::Above { by } => (bp.0, bp.1 + bext[1] + aext[1] + by, bp.2),
                 Rel::Below { by } => (bp.0, bp.1 - bext[1] - aext[1] - by, bp.2),
@@ -479,6 +501,39 @@ pub fn resolve_with(s: &Sketch, anchor: (i32, i32, i32),
             pos.insert(p.name.clone(), (anchor.0 as f32, ground + p.shape.extent()[1], anchor.2 as f32));
         }
     }
+    // STRETCH TO REACH. Done after positions, because a part must know
+    // where it ended up before it can know how far it has to go.
+    let mut stretched: BTreeMap<String, Shape> = BTreeMap::new();
+    let reach_list: Vec<String> = s.rels.iter()
+        .filter(|(_, r, _)| matches!(r, Rel::Reaches)).map(|(a, _, _)| a.clone()).collect();
+    for a in &reach_list {
+        let rel = Rel::Reaches;
+        let (a, rel, _) = (a, &rel, &String::new());
+        let _ = rel;
+        let Some(pa) = by_name.get(a.as_str()) else { continue };
+        let Some(c) = pos.get(a) else { continue };
+        let floor = match ground_at {
+            Some(f) => f(c.0.round() as i32, c.2.round() as i32).map(|y| y as f32),
+            None => Some(anchor.1 as f32),
+        };
+        let Some(floor) = floor else {
+            notes.push(format!("'{a}' was told to reach the ground and there is none below it"));
+            continue;
+        };
+        // The joint is the part's TOP -- it hangs from there. A capsule
+        // is centred on its position, so lengthening it grows both ways
+        // from a centre computed for the OLD length, and the foot ended
+        // up seventeen blocks above the floor it was told to touch. The
+        // centre moves too, keeping the top on the joint.
+        let top = c.1 + reach(&pa.shape).1.abs() * 0.5;
+        let want = (top - floor).max(1.0);
+        stretched.insert(a.clone(), set_len(&pa.shape, want));
+        let new_centre = top - want * 0.5;
+        let drop = new_centre - c.1;
+        pos.insert(a.clone(), (c.0, new_centre, c.2));
+        if let Some(v) = extra.get_mut(a) { for e in v.iter_mut() { e.1 += drop; } }
+        notes.push(format!("'{a}' reaches the ground: length {:.0}", want));
+    }
     // A part INSIDE another must actually fit: shrink it if it does not.
     let mut shrunk: BTreeMap<String, Shape> = BTreeMap::new();
     for (a, rel, b) in &s.rels {
@@ -494,7 +549,9 @@ pub fn resolve_with(s: &Sketch, anchor: (i32, i32, i32),
         let c = pos[&p.name];
         Placed {
             name: p.name.clone(),
-            shape: shrunk.get(&p.name).cloned().unwrap_or_else(|| p.shape.clone()),
+            shape: shrunk.get(&p.name).cloned()
+                .or_else(|| stretched.get(&p.name).cloned())
+                .unwrap_or_else(|| p.shape.clone()),
             material: p.material.clone(),
             hollow: p.hollow,
             at: (c.0.round() as i32, c.1.round() as i32, c.2.round() as i32),
@@ -535,6 +592,18 @@ fn reach(s: &Shape) -> (f32, f32, f32) {
             (len * a.cos(), 0.0, len * a.sin())
         }
         _ => (0.0, 0.0, 0.0),
+    }
+}
+
+/// A shape with a new length, keeping everything else.
+fn set_len(s: &Shape, l: f32) -> Shape {
+    match s {
+        Shape::Capsule { r, r2, dir, pitch, .. } =>
+            Shape::Capsule { r: *r, r2: *r2, len: l, dir: *dir, pitch: *pitch },
+        Shape::Spine { r, r2, dir, arch, segments, .. } =>
+            Shape::Spine { r: *r, r2: *r2, len: l, dir: *dir, arch: *arch, segments: *segments },
+        Shape::Cylinder { r, .. } => Shape::Cylinder { r: *r, h: l },
+        other => other.clone(),
     }
 }
 
@@ -903,5 +972,43 @@ mod tests {
         let (p2, n2) = resolve(&lone, (0, 64, 0));
         assert!(n2.iter().any(|n| n.contains("spans nothing")), "{n2:?}");
         assert!(cells(&p2[0], 1).is_empty());
+    }
+
+    #[test]
+    fn a_leg_reaches_the_ground_rather_than_guessing_a_length() {
+        // A dragon's leg was `len=34`: a number guessed to look right,
+        // and wrong the moment the body moved or the terrain changed.
+        let src = "part body capsule r=6 r2=5 len=30 dir=0 pitch=0 material=stone\n\
+                   part leg capsule r=3 r2=2 len=4 dir=0 pitch=-90 material=stone\n\
+                   rel body above ground by=40\n\
+                   rel leg joint body at=0.2 out=0.8 pair\n\
+                   rel leg reaches ground\n";
+        let (sk, errs) = parse(src);
+        assert!(errs.is_empty(), "{errs:?}");
+        // a flat floor at y=64
+        let floor = |_x: i32, _z: i32| Some(64);
+        let (placed, notes) = resolve_grounded(&sk, (0, 64, 0), &BTreeMap::new(), Some(&floor));
+        assert!(notes.iter().any(|n| n.contains("'leg' reaches the ground")), "{notes:?}");
+        let leg = placed.iter().find(|p| p.name == "leg").unwrap();
+        // it grew from 4 to whatever the drop is
+        match leg.shape { Shape::Capsule { len, .. } => assert!(len > 20.0, "stretched to {len}"),
+                          ref o => panic!("{o:?}") }
+        // and its foot lands ON the floor, not above or through it
+        let cells = cells(leg, 1);
+        let low = cells.iter().map(|c| c.1).min().unwrap();
+        assert!((low - 64).abs() <= 3, "the foot is on the floor: {low}");
+        // both of the pair, since `reaches` applies to the shape
+        assert_eq!(leg.extra.len(), 1);
+        let xs: BTreeSet<i32> = cells.iter().map(|c| c.0).collect();
+        assert!(xs.iter().any(|x| *x < -2) && xs.iter().any(|x| *x > 2), "one each side");
+    }
+
+    #[test]
+    fn reaching_for_a_floor_that_is_not_there_says_so() {
+        let (sk, _) = parse("part leg capsule r=2 len=4 pitch=-90 material=stone\n\
+                             rel leg reaches ground\n");
+        let none = |_x: i32, _z: i32| None;
+        let (_, notes) = resolve_grounded(&sk, (0, 64, 0), &BTreeMap::new(), Some(&none));
+        assert!(notes.iter().any(|n| n.contains("there is none below it")), "{notes:?}");
     }
 }

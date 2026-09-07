@@ -43,10 +43,12 @@ pass the skull add
   rel jaw joint dome at=0.25 out=0.5
 end
 pass the legs add
-  part fore capsule r=4 r2=2.5 len=34 dir=200 pitch=-74 material=stone
-  part hind capsule r=5 r2=3 len=38 dir=200 pitch=-78 material=stone
+  part fore capsule r=4 r2=2.5 len=6 dir=0 pitch=-90 material=stone
+  part hind capsule r=5 r2=3 len=6 dir=0 pitch=-90 material=stone
   rel fore joint chest at=0.5 out=1.8 pair
   rel hind joint hips at=0.5 out=2.0 pair
+  rel fore reaches ground
+  rel hind reaches ground
 end
 pass hollow the ribcage cut
   part cavity capsule r=9 r2=5 len=70 dir=90 pitch=0 material=stone
