@@ -97,6 +97,24 @@ impl Asset {
         (Asset { name: name.to_string(), cells, size }, notes)
     }
 
+    /// Stamped and scaled: each cell's offset multiplied, then the
+    /// gaps filled so a scaled-up asset is solid rather than a lattice
+    /// of its original cells.
+    pub fn stamp_scaled(&self, at: (i32, i32, i32), turns: u8, scale: f32)
+        -> Vec<((i32, i32, i32), u16)> {
+        let base = self.stamp((0, 0, 0), turns);
+        let s = scale.max(0.05);
+        let mut out: BTreeMap<(i32, i32, i32), u16> = BTreeMap::new();
+        let step = if s > 1.0 { s.ceil() as i32 } else { 1 };
+        for ((x, y, z), b) in base {
+            let (bx, by, bz) = ((x as f32 * s) as i32, (y as f32 * s) as i32, (z as f32 * s) as i32);
+            for dx in 0..step { for dy in 0..step { for dz in 0..step {
+                out.insert((at.0 + bx + dx, at.1 + by + dy, at.2 + bz + dz), b);
+            }}}
+        }
+        out.into_iter().collect()
+    }
+
     /// The cells this asset occupies when stamped at `at`, turned
     /// `turns` quarter-turns about Y.
     pub fn stamp(&self, at: (i32, i32, i32), turns: u8) -> Vec<((i32, i32, i32), u16)> {
@@ -171,7 +189,12 @@ pub enum Source {
     Stamp { asset: String, at: Vec<((i32, i32, i32), u8)> },
     /// An asset repeated on a rule: along a line, around a ring, on a
     /// grid. The repetition a builder actually uses.
-    Repeat { asset: String, rule: Repeat },
+    ///
+    /// `vary` is an expression per copy, evaluated with `i`, `n` and
+    /// `t` bound: `scale=1 + t*0.6` makes each copy larger than the
+    /// last. That is the one thing generating code would genuinely buy,
+    /// and it costs an expression evaluator rather than an interpreter.
+    Repeat { asset: String, rule: Repeat, vary: Vec<(String, String)> },
 }
 
 /// How an asset repeats. Positions are relative to the pass anchor.
@@ -263,13 +286,41 @@ pub fn run(prog: &Program, anchor: (i32, i32, i32)) -> Run {
                 at.iter().flat_map(|(p, turns)| a.stamp(
                     (anchor.0 + p.0, anchor.1 + p.1, anchor.2 + p.2), *turns)).collect()
             }
-            Source::Repeat { asset, rule } => {
+            Source::Repeat { asset, rule, vary } => {
                 let Some(a) = assets.get(asset.as_str()) else {
                     r.errors.push(format!("{}: no asset '{asset}'", pass.name)); continue;
                 };
-                places(rule, a).into_iter()
-                    .flat_map(|(p, t)| a.stamp((anchor.0 + p.0, anchor.1 + p.1, anchor.2 + p.2), t))
-                    .collect()
+                let spots = places(rule, a);
+                let n = spots.len();
+                let mut out = Vec::new();
+                for (i, (p, t)) in spots.into_iter().enumerate() {
+                    let vars = crate::expr::repeat_vars(i, n);
+                    // per-copy variation: scale, and an extra lift
+                    let get = |k: &str, d: f32| -> f32 {
+                        match vary.iter().find(|(n, _)| n == k) {
+                            Some((_, e)) => match crate::expr::eval(e, &vars) {
+                                Ok(v) => v,
+                                Err(_) => d,
+                            },
+                            None => d,
+                        }
+                    };
+                    for (name, e) in vary {
+                        if let Err(msg) = crate::expr::eval(e, &vars) {
+                            r.errors.push(format!("{}: {name}={e:?}: {msg}", pass.name));
+                        }
+                    }
+                    let scale = get("scale", 1.0).clamp(0.1, 8.0);
+                    let lift = get("lift", 0.0).round() as i32;
+                    let spin = ((get("rot", 0.0) as i32).rem_euclid(360) / 90) as u8;
+                    let at = (anchor.0 + p.0, anchor.1 + p.1 + lift, anchor.2 + p.2);
+                    if (scale - 1.0).abs() < 0.05 {
+                        out.extend(a.stamp(at, (t + spin) % 4));
+                    } else {
+                        out.extend(a.stamp_scaled(at, (t + spin) % 4, scale));
+                    }
+                }
+                out
             }
         };
         let mut moved = 0usize;
@@ -457,6 +508,24 @@ fn parse_asset_use(body: &str) -> Result<Source, String> {
         if at.is_empty() { return Err("stamp needs at least one position".into()); }
         return Ok(Source::Stamp { asset, at });
     }
+    // Per-copy expressions, and a HARD ERROR on anything unrecognised.
+    // `repeat t ring count=8 grow=1.1` was accepted and silently
+    // ignored -- it built the same eight identical towers and reported
+    // success. A key that does nothing must never look like a key that
+    // works.
+    const KNOWN: &[&str] = &["from", "to", "step", "centre", "center", "radius", "r", "count",
+                             "min", "max", "at", "face_out", "scale", "lift", "rot"];
+    let mut vary = Vec::new();
+    for s in t.iter().skip(3) {
+        let Some((k, v)) = s.split_once('=') else {
+            if *s == "face_out" { continue; }
+            return Err(format!("'{s}' is not a setting; write key=value"));
+        };
+        if !KNOWN.contains(&k) {
+            return Err(format!("'{k}' is not a repeat setting; known: {}", KNOWN.join(", ")));
+        }
+        if ["scale", "lift", "rot"].contains(&k) { vary.push((k.to_string(), v.to_string())); }
+    }
     let rule = match t.get(2).map(|v| v.to_lowercase()).as_deref() {
         Some("line") => Repeat::Line {
             from: kv("from").and_then(triple).ok_or("line needs from=x,y,z")?,
@@ -476,7 +545,7 @@ fn parse_asset_use(body: &str) -> Result<Source, String> {
         other => return Err(format!("unknown repeat rule '{}'; known: line, ring, grid, stack",
                                     other.unwrap_or("(none)"))),
     };
-    Ok(Source::Repeat { asset, rule })
+    Ok(Source::Repeat { asset, rule, vary })
 }
 
 /// The prompt for the pass that decides POLARITY and ASSETS -- the
@@ -703,5 +772,44 @@ mod tests {
         // the schism example is a CUT, which is the entire point
         let (schism, _) = parse("pass rift cut\n  part gash box w=140 h=30 d=18 material=stone\n  rel gash below ground by=0\nend\n");
         assert_eq!(schism.passes[0].polarity, Polarity::Cut);
+    }
+
+    #[test]
+    fn each_copy_can_differ_from_the_last_which_is_what_code_would_have_bought() {
+        let (prog, errs) = parse(
+            "asset t\n  part s cylinder r=2 h=8 material=stone\nend\n\
+             pass ring add\n  repeat t ring radius=24 count=8 scale=1+t*1.5\nend\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        let r = run(&prog, (0, 64, 0));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        // the copies are NOT identical: the last is far bigger than the first
+        let by_x: BTreeMap<i32, usize> = r.changes.iter()
+            .fold(BTreeMap::new(), |mut m, c| { *m.entry(c.at.0 / 8).or_insert(0) += 1; m });
+        let (small, big) = (by_x.values().min().unwrap(), by_x.values().max().unwrap());
+        assert!(*big > small * 2, "the copies vary in size: {small} to {big}");
+    }
+
+    #[test]
+    fn a_setting_that_does_nothing_is_an_error_not_a_shrug() {
+        // `grow=1.1` was ACCEPTED and IGNORED: eight identical towers,
+        // reported as success. That is worse than a parse failure,
+        // because nothing tells the model its instruction was dropped.
+        let (_, errs) = parse(
+            "asset t\n  part s cylinder r=2 h=8 material=stone\nend\n\
+             pass a add\n  repeat t ring radius=20 count=8 grow=1.1\nend\n");
+        assert!(errs.iter().any(|e| e.contains("'grow' is not a repeat setting")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("known: from, to, step")), "it lists what works: {errs:?}");
+    }
+
+    #[test]
+    fn a_bad_expression_is_reported_per_copy_and_the_build_survives() {
+        let (prog, _) = parse(
+            "asset t\n  part s cylinder r=2 h=6 material=stone\nend\n\
+             pass a add\n  repeat t line from=-20,0,0 to=20,0,0 step=10 scale=nosuch*2\nend\n");
+        let r = run(&prog, (0, 64, 0));
+        assert!(r.errors.iter().any(|e| e.contains("not a known value")), "{:?}", r.errors);
+        // and it still built, at the default scale: a bad expression
+        // costs its own effect, not the whole pass
+        assert!(!r.changes.is_empty(), "the build survived a bad expression");
     }
 }
