@@ -27,6 +27,8 @@ pub mod mic_source;
 pub mod tray;
 /// One-handed compaction: anchor the board to a corner and narrow it.
 pub mod halfboard;
+/// The reach polygon and its per-row compaction (`single-hand-mode.md` §1).
+pub mod thumbarc;
 /// The two gestures on the top edge: the digit up-arc and the minimize fling.
 pub mod topedge;
 /// Swipe out of the letters and back to type a space (`single-hand-mode.md` §3).
@@ -746,11 +748,15 @@ pub struct Style {
     pub magnifier: bool,
     /// One-handed compaction: which side the board is anchored to.
     pub half: crate::halfboard::Side,
+    /// Use the REACH POLYGON rather than one uniform inset: rows near the anchor keep
+    /// nearly the full width, rows far from it give more up. `None` falls back to
+    /// `halfboard`'s uniform inset, which is what every existing caller gets.
+    pub arc: bool,
 }
 
 impl Default for Style {
     fn default() -> Self {
-        Style { key_radius: None, opacity: 1.0, magnifier: true, half: crate::halfboard::Side::Off }
+        Style { key_radius: None, opacity: 1.0, magnifier: true, half: crate::halfboard::Side::Off, arc: true }
     }
 }
 
@@ -770,6 +776,7 @@ impl Style {
             // preference. A keyboard that comes up compacted to the left because that is
             // how you held it yesterday is a keyboard you have to un-compact.
             half: crate::halfboard::Side::Off,
+            arc: true,
         }
     }
 
@@ -852,12 +859,37 @@ pub fn keyboard_ui_styled(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, pal
         uikit_egui::paint_top_hairline(ui, board_rect);
     }
 
+    // THE REACH POLYGON, per row. `halfboard` insets every row equally, which brings the
+    // board within reach and gives away the shape — the bottom row loses width it did not
+    // need to. The doc's algorithm is per-ROW ("only the row's outer bounds shift; muscle
+    // memory is preserved"), so each row is laid out inside the polygon's x-range at its own
+    // vertical centre. Off, or with no compaction, this is the uniform inset as before.
+    let arc = if style.arc {
+        style
+            .half
+            .is_on()
+            .then(|| crate::thumbarc::Corner::from_side(style.half))
+            .flatten()
+            .and_then(|c| crate::thumbarc::Arc::default_for(full_rect.width(), c))
+    } else {
+        None
+    };
+    let rows_n = layout.rows.len();
+
     let mut emitted = None;
-    for row in &layout.rows {
+    for (row_i, row) in layout.rows.iter().enumerate() {
         let total_weight: f32 = row.keys.iter().map(|k| k.weight).sum::<f32>().max(0.001);
-        let usable = total_w - gutter * (row.keys.len() as f32 + 1.0);
+        // Per-row bounds when there is an arc; the board-wide inset otherwise.
+        let (row_left, row_w) = match &arc {
+            Some(a) => {
+                let (lo, hi) = a.row_bounds(row_i, rows_n);
+                (full_rect.width() * lo, full_rect.width() * (hi - lo))
+            }
+            None => (row_inset, total_w),
+        };
+        let usable = row_w - gutter * (row.keys.len() as f32 + 1.0);
         ui.horizontal(|ui| {
-            ui.add_space(gutter + row_inset);
+            ui.add_space(gutter + row_left);
             for key in &row.keys {
                 let w = (usable * (key.weight / total_weight)).max(8.0);
                 if let Some(e) = paint_key(ui, key, Vec2::new(w, key_h), gutter, &colors, glass, layout.hints, style) {

@@ -63,7 +63,11 @@ fn a_compacted_board_draws_its_keys_on_the_chosen_side() {
         let ctx = egui::Context::default();
         let mut input = egui::RawInput::default();
         input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size));
-        let style = Style { half: side, ..Style::default() };
+        // The UNIFORM inset, which is what this test was written for. With the reach
+        // polygon on (now the default) the bottom row keeps nearly the full width by
+        // design, so the board's overall span barely moves — correct, and measured by
+        // `the_thumb_arc_widens_the_rows_nearest_the_anchor` instead.
+        let style = Style { half: side, arc: false, ..Style::default() };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let _ = keyboard_ui_styled(
@@ -156,4 +160,57 @@ fn a_delimiter_ripple_is_painted_and_then_expires() {
     let after = circles(&ctx.run(input, |ctx| app.frame(ctx)));
     assert_eq!(after, before, "an expired ripple was still drawn");
     assert!(app.ripples.is_empty(), "expired ripples are not drained");
+}
+
+/// The reach polygon must produce a GRADIENT — rows near the anchor wider than rows far
+/// from it. A uniform inset would pass a "keys moved" test and miss the whole point, which
+/// is why this measures per-row width rather than position.
+#[test]
+fn the_thumb_arc_widens_the_rows_nearest_the_anchor() {
+    let board = Board::new();
+    let size = egui::vec2(720.0, 300.0);
+
+    let row_spans = |style: Style| -> Vec<(f32, f32)> {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size));
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = keyboard_ui_styled(
+                    ui,
+                    board.current(),
+                    &uikit_egui::Adaptive::detect(ctx),
+                    "system",
+                    style,
+                );
+            });
+        });
+        // Group the painted glyphs into rows by y, then take each row's horizontal span.
+        let mut by_row: std::collections::BTreeMap<i32, (f32, f32)> = Default::default();
+        for t in uikit_egui::layout_probe::texts(&out.shapes) {
+            let key = (t.rect.center().y / 10.0) as i32;
+            let e = by_row.entry(key).or_insert((f32::MAX, f32::MIN));
+            e.0 = e.0.min(t.rect.left());
+            e.1 = e.1.max(t.rect.right());
+        }
+        by_row.into_values().collect()
+    };
+
+    let arced = row_spans(Style { half: halfboard::Side::Right, arc: true, ..Style::default() });
+    assert!(arced.len() >= 3, "expected several rows, saw {}", arced.len());
+
+    let width = |r: &(f32, f32)| r.1 - r.0;
+    let first = width(&arced[0]);
+    let last = width(arced.last().unwrap());
+    assert!(last > first, "no gradient: top row {first:.0}pt, bottom row {last:.0}pt");
+
+    // A uniform inset gives every row the same width — so this test can tell them apart.
+    let flat = row_spans(Style { half: halfboard::Side::Right, arc: false, ..Style::default() });
+    let fw: Vec<f32> = flat.iter().map(width).collect();
+    let spread = fw.iter().cloned().fold(f32::MIN, f32::max) - fw.iter().cloned().fold(f32::MAX, f32::min);
+    assert!(
+        (last - first) > spread,
+        "the arc's gradient ({:.0}pt) is no bigger than the uniform inset's ({spread:.0}pt)",
+        last - first
+    );
 }
