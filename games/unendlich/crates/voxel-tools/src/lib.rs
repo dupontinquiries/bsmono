@@ -119,6 +119,10 @@ pub mod style;
 pub mod spec;
 /// A latent space over the world tree: per-commit vectors cached by hash, nearest, interpolate to a spec.
 pub mod latent;
+/// Parts and relations without coordinates, and the solver that grounds them.
+pub mod sketch;
+/// Four passes: what is it, what is it made of, where does it go, do it.
+pub mod compose;
 /// The recognizer: a build sentence to a form line, without a model.
 pub mod recipe;
 /// Placement rails: where instances of a structure go, as JSON data the engine builds or holds.
@@ -1294,6 +1298,36 @@ impl<'w, W: VoxelWorld> VoxelTools<'w, W> {
         self.next_clip += 1;
         self.clips.push(Clip { id, w, h, d, blocks });
         (Some(id), format!("clip {id}: {w}x{h}x{d}"))
+    }
+
+    /// Build a clip from SPARSE cells rather than a region of the
+    /// world. A composed sketch's torus or helix is a scattered set of
+    /// positions, not a box that exists anywhere yet, and `copy_region`
+    /// can only lift what is already built. The clip is the cells'
+    /// bounding box with air everywhere they are not, so pasting it
+    /// with `skip_air` places exactly them.
+    pub fn clip_from_cells(&mut self, cells: &[(i32, i32, i32)], block: u16)
+        -> (Option<u64>, (i32, i32, i32), String) {
+        if cells.is_empty() { return (None, (0, 0, 0), "no cells".into()); }
+        let lo = cells.iter().fold((i32::MAX, i32::MAX, i32::MAX),
+            |a, c| (a.0.min(c.0), a.1.min(c.1), a.2.min(c.2)));
+        let hi = cells.iter().fold((i32::MIN, i32::MIN, i32::MIN),
+            |a, c| (a.0.max(c.0), a.1.max(c.1), a.2.max(c.2)));
+        let (w, h, d) = (hi.0 - lo.0 + 1, hi.1 - lo.1 + 1, hi.2 - lo.2 + 1);
+        let vol = (w as usize) * (h as usize) * (d as usize);
+        if vol > MAX_BLOCKS_PER_CALL {
+            return (None, lo, format!("refused: a {w}x{h}x{d} clip is {vol} blocks"));
+        }
+        let mut blocks = vec![0u16; vol];
+        for c in cells {
+            let i = ((c.1 - lo.1) as usize * d as usize + (c.2 - lo.2) as usize) * w as usize
+                + (c.0 - lo.0) as usize;
+            blocks[i] = block;
+        }
+        let id = self.next_clip;
+        self.next_clip += 1;
+        self.clips.push(Clip { id, w, h, d, blocks });
+        (Some(id), lo, format!("clip {id}: {w}x{h}x{d} from {} cell(s)", cells.len()))
     }
 
     /// Stamp a clip down. `rotate` is 0/90/180/270 about Y, `mirror_x`

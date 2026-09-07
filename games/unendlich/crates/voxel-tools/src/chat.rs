@@ -93,6 +93,10 @@ pub struct Pending {
     prose: String,
     /// What the dry run placed, for a review's measurement and picture.
     placed: Vec<(i32, i32, i32)>,
+    /// Cells from a composed sketch that no IR op can express -- a
+    /// torus, a helix. Applied alongside the plan on commit, so the
+    /// whole composition is one edit and undoes as one.
+    extra_cells: Vec<crate::weather::Change>,
     /// The critique's findings, in words, for the review.
     findings: Vec<String>,
 }
@@ -375,6 +379,60 @@ impl ChatSession {
             // registry and calls `connect_ir`.
             crate::verbs::Verb::Connect => return None,
         })
+    }
+
+    /// A composed sketch, from the four-pass pipeline: parts and
+    /// relations resolved to a plan. The cells are for shapes the IR
+    /// has no op for -- a torus, a helix -- which are applied directly.
+    pub fn receive_sketch<W: VoxelWorld>(&mut self, tools: &mut VoxelTools<W>, gaze: &Gaze,
+                                         sketch: &str, player_feet: Option<(i32, i32, i32)>,
+                                         prose: &str) -> Reply {
+        let f = self.focus(gaze);
+        let anchor = f.anchor;
+        let built = crate::compose::build(sketch, anchor);
+        if built.parts == 0 {
+            return Reply::Say(format!("the sketch had no parts{}",
+                if built.errors.is_empty() { String::new() } else { format!(" -- {}", built.errors.join("; ")) }));
+        }
+        // The plan first: the shapes that have ops go through the whole
+        // existing pipeline -- dry run, finishing, critique,
+        // reachability, hive.
+        let mut r = self.receive_plan_gated(tools, gaze, &built.ir, player_feet, prose);
+        // Then the shapes with NO op -- a torus, a helix, a link. These
+        // are cells and no IR line can say them, so they join the
+        // pending placement directly. They are part of the same preview
+        // and commit, which is what matters: a ring that committed
+        // separately would not undo with its own building.
+        if !built.cells.is_empty() {
+            let changes: Vec<crate::weather::Change> = built.cells.iter()
+                .map(|(x, y, z, m)| crate::weather::Change {
+                    at: (*x, *y, *z), to: crate::plan::resolve_block(m).unwrap_or(1) })
+                .collect();
+            let n = changes.len();
+            if let Some(p) = self.pending.as_mut() {
+                p.placed.extend(changes.iter().map(|c| c.at));
+                p.predicted_blocks += n;
+                p.extra_cells = changes;
+            } else {
+                return Reply::Say("the sketch produced cells but no plan to carry them".into());
+            }
+            // The reply was built before these were added, so its count
+            // was the plan's alone -- a ring reported as 0 blocks and
+            // then appeared on commit, which is the kind of surprise
+            // /commit must never spring.
+            if let Reply::Preview { blocks, echo, .. } = &mut r {
+                *blocks += n;
+                echo.push_str(&format!("\nSKETCH: {n} cell(s) in shapes the IR cannot name"));
+            }
+        }
+        // the sketch's own notes are the interesting part of the echo:
+        // "'core' was too big to sit inside 'shell'; scaled to 60%"
+        if let Reply::Preview { echo, .. } = &mut r {
+            for n in built.notes.iter().chain(built.errors.iter()) {
+                echo.push_str(&format!("\nSKETCH: {n}"));
+            }
+        }
+        r
     }
 
     /// The review prompt for the pending plan: its ops by number, its
@@ -790,6 +848,7 @@ impl ChatSession {
             plan, feature_id: f.feature_id.clone(), predicted_blocks: dry.blocks_changed,
             ir: ir.to_string(), prose: prose.to_string(),
             placed: placed.clone(),
+            extra_cells: Vec::new(),
             findings: findings.iter().map(|f| f.message.clone()).collect(),
             bounds: {
                 let mut lo = (i32::MAX, i32::MAX, i32::MAX);
@@ -900,6 +959,8 @@ impl ChatSession {
         tools.archive = self.archive.clone();
         let run = run_plan(tools, &p.plan, self.from_y, self.chunk_size, false);
         self.archive = std::mem::take(&mut tools.archive);
+        // and the sketch's rasterised shapes, in the same commit
+        if !p.extra_cells.is_empty() { let _ = tools.apply_changes_large(&p.extra_cells); }
         self.invalidate_context();
         self.last_ir = p.ir.clone();
         self.last_prose = p.prose.clone();
@@ -1729,5 +1790,74 @@ mod tests {
             Reply::Preview { echo, .. } => assert!(!echo.contains("RECOGNIZED"), "{echo}"),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn a_water_sphere_becomes_a_water_sphere_and_not_a_house() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 400_000);
+        let g = gaze_at(0, 0, 10.0);
+        // pass 2's output, as a model would write it
+        let sketch = "part shell sphere r=8 material=glass hollow\n\
+                      part water sphere r=7 material=water\n\
+                      part core sphere r=2 material=ice\n\
+                      rel shell above ground by=10\n\
+                      rel water inside shell\n\
+                      rel core inside water\n";
+        match s.receive_sketch(&mut t, &g, sketch, None, "a water sphere") {
+            Reply::Preview { echo, blocks, .. } => {
+                assert!(blocks > 1000, "a sphere of some size: {blocks}");
+                let e = echo.to_lowercase();
+                assert!(!e.contains("house") && !e.contains("cottage"), "no house: {echo}");
+                // the sphere op calls itself a dome in its arithmetic echo
+                assert!(e.contains("sphere") || e.contains("dome"), "{echo}");
+            }
+            o => panic!("{o:?}"),
+        }
+        s.commit(&mut t, &g);
+        drop(t);
+        // it is where it was asked to be: floating, and made of water
+        let mut water = 0; let mut glass = 0;
+        for y in 60..100 { for x in -12..12 { for z in -12..12 {
+            match w.get(x, y, z) { 9 => water += 1, 61 => glass += 1, _ => {} }
+        }}}
+        assert!(water > 500, "{water} water blocks");
+        assert!(glass > 200, "{glass} glass blocks in the shell");
+    }
+
+    #[test]
+    fn a_sketch_with_a_shape_the_ir_cannot_say_still_commits_as_one_edit() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 400_000);
+        let g = gaze_at(0, 0, 10.0);
+        // a torus has no IR op: it rides as cells
+        let sketch = "part shaft cylinder r=2 h=20 material=stone\n\
+                      part ring torus r=9 thickness=1 material=quartz\n\
+                      rel shaft on ground\n\
+                      rel ring around shaft\n";
+        let before = match s.receive_sketch(&mut t, &g, sketch, None, "a ring around a shaft") {
+            Reply::Preview { blocks, .. } => blocks,
+            o => panic!("{o:?}"),
+        };
+        assert!(before > 300, "the ring is counted in the preview: {before}");
+        s.commit(&mut t, &g);
+        let mut quartz = 0;
+        {
+        let ww = &*t.world;
+        for y in 60..95 { for x in -14..14 { for z in -14..14 {
+            if ww.get(x, y, z) == 51 { quartz += 1; }
+        }}}
+        }
+        assert!(quartz > 100, "the ring is really there: {quartz}");
+        // and undo takes the whole thing, ring included
+        s.undo(&mut t);
+        drop(t);
+        let mut left = 0;
+        for y in 65..95 { for x in -14..14 { for z in -14..14 {
+            if w.get(x, y, z) != 0 { left += 1; }
+        }}}
+        assert_eq!(left, 0, "undo removed the ring too: {left} left");
     }
 }
