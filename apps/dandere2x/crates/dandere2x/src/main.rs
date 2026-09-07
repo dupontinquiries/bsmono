@@ -125,6 +125,21 @@ struct Common {
     /// how far blocks are propagated from a restored frame; ±2 measured good.
     #[arg(long, default_value_t = 0)]
     anchor_max_age: u32,
+    /// Harvest the subtiles of every redraw and region redraw into the block
+    /// cache, so a cut back to an earlier shot, a returning overlay or a
+    /// static background that a redraw already paid for is a copy. Needs a
+    /// block cache budget (see --block-cache).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    cache_harvest: bool,
+    /// Probe the block cache approximately: bucket cells by a coarse
+    /// quantised signature and verify the candidate against this frame's
+    /// block under the normal gate. 0 = exact byte match only (which
+    /// measures ~0.1% hits on real footage). 8-24 is the useful range.
+    #[arg(long, default_value_t = 0)]
+    cache_quant: u32,
+    /// Candidates kept per coarse bucket; probe cost is linear in this.
+    #[arg(long, default_value_t = 4)]
+    cache_bucket: usize,
     /// Host memory the job may hold (e.g. 96G). Default: half of MemAvailable.
     #[arg(long)]
     ram_budget: Option<String>,
@@ -311,6 +326,9 @@ fn job_from(common: &Common, input: PathBuf, output: PathBuf) -> anyhow::Result<
     j.pipeline.analyze.region_redraw = common.region_redraw;
     j.pipeline.analyze.anchor_rmse = common.anchor_rmse;
     j.pipeline.analyze.anchor_max_age = common.anchor_max_age;
+    j.pipeline.analyze.harvest = common.cache_harvest;
+    j.pipeline.analyze.cache_quant = common.cache_quant;
+    j.pipeline.analyze.cache_bucket = common.cache_bucket;
     j.pipeline.analyze.subpel_filter = match common.halfpel_filter.as_str() {
         "bilinear" => d2x_core::SubpelFilter::Bilinear,
         "6tap" => d2x_core::SubpelFilter::SixTap,
@@ -393,14 +411,24 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Analyze { input, common } => {
-            let job = job_from(&common, input, PathBuf::new())?;
-            let (source, _) = job::open_source(&job)?;
+            let mut job = job_from(&common, input, PathBuf::new())?;
+            // analyze never allocated a memory plan before, because it never
+            // upscaled anything. It does now: the block cache runs dry (keys
+            // and byte costs, no pixels) so `analyze` can measure hit rates.
+            let (source, info) = job::open_source(&job)?;
+            let (w, h) = info.as_ref().map_or((1920, 1080), |p| (p.info.width, p.info.height));
+            let plan = job::mem_plan(&job, w, h, 2);
+            job::apply_plan(&mut job.pipeline, &plan);
             let bleed = job.pipeline.analyze.bleed;
             let summary = d2x_core::pipeline::analyze_only(source, job.pipeline, |i, s, frac, t| {
                 let kind = if s.redraw { " REDRAW".to_string() } else if let Some((_, _, w, h)) = s.region { format!(" REGION {w}x{h}") } else { String::new() };
                 eprintln!("frame {i:6}  psnr {:5.1}  stat {:4} mov {:4} half {:4} q4 {:4} anc {:4} plt {:4} rec {:3} miss {:4} fade {:3}  upscaled {:5.1}%{kind}  {:.1}ms", s.psnr, s.stationary, s.moved, s.moved_half, s.moved_quarter, s.anchored, s.plated, s.recalled, s.missing, s.fades, frac * 100.0, t.as_secs_f64() * 1e3);
             })?;
             let _ = bleed;
+            let (h, m, ins, by) = summary.cache;
+            if h + m > 0 {
+                eprintln!("block cache: {h} hits / {} probes ({:.1}%), {ins} inserts, {:.0} MB live", h + m, 100.0 * h as f64 / (h + m) as f64, by as f64 / 1e6);
+            }
             let total = summary.heavy_pixel_fraction + summary.plate_pixel_fraction;
             eprintln!("{} frames: {:.1}% of pixels through the main network as residuals + {:.1}% as plates = {:.1}% ({:.1}x fewer than full upscaling); {:.1}% through any network tier as residuals", summary.frames, summary.heavy_pixel_fraction * 100.0, summary.plate_pixel_fraction * 100.0, total * 100.0, 1.0 / total.max(1e-9), summary.upscaled_pixel_fraction * 100.0);
         }

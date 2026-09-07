@@ -319,6 +319,23 @@ What is built:
   recovered anything (+0.00 dB) — the artefact is coherent smoothing — so
   the detail has to come from a prior: train an SRVGG-class net on the
   crops, export with `tools/pth2st.py`, run it as a cascade tier.
+- **Subtile harvesting** (`--cache-harvest`, default on) and **gated cache
+  probes** (`--cache-quant Q`, default 0 = exact only; `--cache-bucket N`):
+  a redraw or region redraw draws hundreds of cells that were previously
+  thrown away after one frame; harvesting puts each one in the block cache
+  keyed like an ordinary cell, so a cut back to an earlier shot or a
+  returning overlay is a copy. `--cache-quant` additionally probes by a
+  coarse quantised signature and verifies the candidate under the frame's
+  own gate, instead of requiring an exact byte match. `analyze` now runs the
+  cache **dry** (keys and byte costs, no pixels) and reports hits/probes, so
+  both can be measured without a GPU.
+  Measured, three clips: harvesting multiplies supply by 3.7× and changes
+  the hit rate not at all (0.2%), and gated probing does not move it either
+  at any quantiser. The bottleneck is the probe set — a cell only reaches
+  the cache after Stationary, motion, the ring, the plate and the anchor
+  have all failed, and what survives that is genuinely new content. See the
+  note at the bottom of `blockcache.rs` for the three things that would
+  change the answer.
 - **Gate hysteresis** (`--streak-bonus b`, default 0 = off): a block reused
   for `n` consecutive frames gets its threshold scaled by
   `1 + b·min(n,8)/8`, so blocks that keep matching stop flickering out at

@@ -122,6 +122,11 @@ pub struct FrameStats {
     pub recalled: u32,
     /// Blocks served from the content-keyed block cache.
     pub cached: u32,
+    /// Cells harvested out of this frame's big upscale into the cache.
+    pub harvested: u32,
+    /// Blocks served by a gated (coarse-bucket + verify) cache probe. These
+    /// are counted in `cached` too.
+    pub cached_gated: u32,
     /// Blocks served from the window's plate.
     pub plated: u32,
     /// Blocks matched at a half-pel offset in the previous frame.
@@ -195,7 +200,39 @@ pub struct FramePlan {
     pub fades: Vec<FadeBlock>,
     /// The whole frame is upscaled and the plan's blocks are ignored.
     pub redraw: bool,
+    /// Cells of this frame that a network will draw as part of a BIGGER
+    /// image (a whole-frame redraw or a region redraw), with the cache key
+    /// of their low-res content: `(key, block_x, block_y)` in frame pixels.
+    ///
+    /// A redraw is the most expensive thing the pipeline does and, before
+    /// this, the only thing it produced was one output frame. Its subtiles
+    /// are network output for hundreds of cells, each of which a later
+    /// frame may need on its own. Harvesting them means a cut back to an
+    /// earlier shot, a returning overlay, or a static background that a
+    /// redraw already paid for is a copy instead of rework.
+    ///
+    /// Blocks harvested this way are *better* than blocks cached from a
+    /// packed residual: they were drawn with their true neighbours around
+    /// them instead of a bleed ring, which is the context variance the
+    /// cache already tolerates.
+    /// In-memory only (stage A hands it to stage B in the same process);
+    /// a serialised plan does not carry it, and a plan replayed from disk
+    /// simply harvests nothing.
+    #[serde(skip)]
+    pub harvest: Vec<HarvestCell>,
     pub stats: FrameStats,
+}
+
+/// A cell of a big upscale to put in the cache: its exact key, its coarse
+/// bucket, where to crop it from the finished output, and the low-res block
+/// a later gated probe verifies against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarvestCell {
+    pub key: u64,
+    pub coarse: u64,
+    pub x: u32,
+    pub y: u32,
+    pub lo: std::sync::Arc<Vec<u8>>,
 }
 
 impl FramePlan {
@@ -207,6 +244,7 @@ impl FramePlan {
             residuals: Vec::new(),
             fades: Vec::new(),
             redraw: true,
+            harvest: Vec::new(),
             stats: FrameStats { psnr, missing: n as u32, redraw: true, ..Default::default() },
         }
     }
