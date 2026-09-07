@@ -43,7 +43,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-pub trait Genome: Clone {
+pub trait Genome: Clone + Send + Sync {
     fn mutate(&self, seed: u64) -> Self;
     fn crossover(&self, other: &Self, seed: u64) -> Self;
 }
@@ -134,7 +134,22 @@ pub fn weighted(obj: &[f32], weights: &[f32]) -> f32 {
 /// are genomes to include in the first population -- the archive's.
 pub fn evolve<G: Genome>(
     seed: u64, budget: Budget, seeds: &[G], random: impl Fn(u64) -> G,
-    eval: impl Fn(&G) -> Vec<f32>, weights: &[f32],
+    eval: impl Fn(&G) -> Vec<f32> + Sync, weights: &[f32],
+) -> Outcome<G> {
+    evolve_par(seed, budget, seeds, random, eval, weights, 1)
+}
+
+/// The same, evaluating each generation's population across `threads`.
+///
+/// Every candidate is scored independently against a world nobody
+/// mutates, so this is the free parallelism: a fixed wall clock spent
+/// four ways is four times the candidates, and more candidates is
+/// directly a better answer. The ORDER of results is preserved, so the
+/// search is bit-identical at one thread or eight -- a seeded search
+/// that is not reproducible is not a search.
+pub fn evolve_par<G: Genome>(
+    seed: u64, budget: Budget, seeds: &[G], random: impl Fn(u64) -> G,
+    eval: impl Fn(&G) -> Vec<f32> + Sync, weights: &[f32], threads: usize,
 ) -> Outcome<G> {
     let pop = budget.pop.clamp(4, 96);
     let t0 = Instant::now();
@@ -144,7 +159,8 @@ pub fn evolve<G: Genome>(
     let mut evals = 0usize;
     let mut gens = 0usize;
     let mut history = Vec::new();
-    let mut scored: Vec<Vec<f32>> = population.iter().map(|g| { evals += 1; eval(g) }).collect();
+    let mut scored: Vec<Vec<f32>> = { evals += population.len();
+                                      crate::par::map(&population, threads, &eval) };
     let over = |evals: usize, t0: Instant| evals >= budget.max_evals
         || budget.deadline.map(|d| t0.elapsed() >= d).unwrap_or(false);
     loop {
@@ -181,8 +197,12 @@ pub fn evolve<G: Genome>(
         elite.truncate(pop / 2);
         let mut next: Vec<G> = elite.iter().map(|&i| population[i].clone()).collect();
         let mut next_scores: Vec<Vec<f32>> = elite.iter().map(|&i| scored[i].clone()).collect();
+        // Breed the whole generation, THEN score it in one parallel
+        // batch. Breeding is cheap and sequential (it reads the ranks);
+        // scoring is the expensive part and is what fans out.
+        let mut fresh: Vec<G> = Vec::new();
         let mut kk = 0u64;
-        while next.len() < pop {
+        while next.len() + fresh.len() < pop {
             let a = better((hash(seed, 100 + gens as u64, kk) % pop as u64) as usize,
                            (hash(seed, 200 + gens as u64, kk) % pop as u64) as usize);
             let child = if kk % 2 == 0 {
@@ -192,12 +212,13 @@ pub fn evolve<G: Genome>(
             } else {
                 population[a].mutate(hash(seed, 600 + gens as u64, kk))
             };
-            evals += 1;
-            next_scores.push(eval(&child));
-            next.push(child);
+            fresh.push(child);
             kk += 1;
-            if over(evals, t0) { break; }
+            if over(evals + fresh.len(), t0) { break; }
         }
+        evals += fresh.len();
+        next_scores.extend(crate::par::map(&fresh, threads, &eval));
+        next.extend(fresh);
         population = next;
         scored = next_scores;
     }

@@ -103,6 +103,8 @@ pub mod feature;
 pub mod hive;
 /// A git tree over the world: content-addressed chunk edits, branches, merge, rebase.
 pub mod vcs;
+/// A small parallel map: more search in a fixed wall clock.
+pub mod par;
 /// The shared genetic engine: Pareto ranking with crowding, budgets, an elite archive.
 pub mod evolve;
 /// Greebles by natural selection: a genome language for decorator FSMs, metrics, evolution.
@@ -133,6 +135,8 @@ pub mod quarry;
 pub mod access;
 /// Reachability: can a walking body actually get there?
 pub mod reach;
+/// A simulated player: goals, a cached memory of its walks, and a score from what it managed.
+pub mod player;
 /// The review loop: elevations and measurements to the model, a ten-token verdict back.
 pub mod review;
 /// Context under a budget: the conversation chain, folding into summaries, grouped plans.
