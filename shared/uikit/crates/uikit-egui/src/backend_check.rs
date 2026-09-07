@@ -32,6 +32,18 @@
 pub struct Session<'a> {
     /// `$WAYLAND_DISPLAY`.
     pub wayland: Option<&'a str>,
+    /// `$XDG_RUNTIME_DIR`.
+    pub runtime_dir: Option<&'a str>,
+    /// Does the socket `connect_to_env` will actually open exist?
+    ///
+    /// `None` when there is no Wayland display to look for. This is the case a
+    /// variables-only check misses: `WAYLAND_DISPLAY` is set, so the environment looks
+    /// healthy, and the socket it names is not there — which is what winit reports as an OS
+    /// "file not found" from `Connection::connect_to_env`.
+    pub socket_present: Option<bool>,
+    /// Sockets that ARE in the runtime dir, for the "you wanted wayland-0 and this is
+    /// wayland-1" case.
+    pub sockets_found: &'a [String],
     /// `$DISPLAY`.
     pub x11: Option<&'a str>,
     /// This binary has no dynamic loader, so `dlopen` cannot succeed for anything.
@@ -60,6 +72,36 @@ pub fn diagnose(s: Session<'_>) -> Option<String> {
              \x20 Session seen: {}.",
             describe_session(s, has_session)
         ));
+    }
+
+    // The socket named by WAYLAND_DISPLAY is not there. Checked BEFORE "no session at all",
+    // because the environment looks perfectly healthy here — the variable is set — and this
+    // is what `Connection::connect_to_env` reports as an OS file-not-found, which reads as
+    // an internal winit fault rather than a session mismatch.
+    if s.socket_present == Some(false) {
+        let want = s.wayland.unwrap_or("");
+        let dir = s.runtime_dir.unwrap_or("<unset>");
+        let found = if s.sockets_found.is_empty() {
+            "none at all".to_string()
+        } else {
+            s.sockets_found.join(", ")
+        };
+        let mut m = format!(
+            "WAYLAND_DISPLAY={want}, but that socket does not exist.\n             \x20 Looked in XDG_RUNTIME_DIR={dir}. Sockets there: {found}.\n"
+        );
+        if s.runtime_dir.is_none() {
+            m.push_str(
+                "\x20 XDG_RUNTIME_DIR is not set, which is usual over ssh or in a plain TTY:                  the variable was inherited and the directory that gives it meaning was not.\n",
+            );
+        } else if s.sockets_found.iter().any(|f| Some(f.as_str()) != s.wayland) {
+            m.push_str(
+                "\x20 A different display IS running there — try WAYLAND_DISPLAY set to one of                  the sockets above.\n",
+            );
+        }
+        m.push_str(
+            "\x20 If you are on another user (sudo, a service), that user has its own runtime              dir and cannot reach this one.",
+        );
+        return Some(m);
     }
 
     if !has_session {
@@ -120,9 +162,14 @@ pub fn maps_show_dynamic_loader(maps: &str) -> bool {
 /// Gather the facts and diagnose. Print the result before opening a window.
 pub fn preflight() -> Option<String> {
     let wayland = std::env::var("WAYLAND_DISPLAY").ok();
+    let runtime = std::env::var("XDG_RUNTIME_DIR").ok();
     let x11 = std::env::var("DISPLAY").ok();
+    let (socket_present, sockets_found) = wayland_socket_state(wayland.as_deref(), runtime.as_deref());
     diagnose(Session {
         wayland: wayland.as_deref(),
+        runtime_dir: runtime.as_deref(),
+        socket_present,
+        sockets_found: &sockets_found,
         x11: x11.as_deref(),
         // Unknown counts as NOT static: a false accusation would send someone rebuilding a
         // binary that is fine.
@@ -130,12 +177,68 @@ pub fn preflight() -> Option<String> {
     })
 }
 
+/// Does the socket exist, and what else is in the runtime dir?
+///
+/// The path rule is `wayland-client`'s own (`Connection::connect_to_env`): an absolute
+/// `WAYLAND_DISPLAY` is the path, otherwise it is joined onto `XDG_RUNTIME_DIR`. Duplicated
+/// here on purpose — a check that guessed a different path could report a socket present
+/// that the client then fails to open, which is worse than not checking.
+///
+/// `WAYLAND_SOCKET` (an inherited fd, how a compositor launches an input method) short
+/// circuits all of this in the client, so this reports "present" for it rather than
+/// hunting for a file that is not involved.
+pub fn wayland_socket_state(
+    wayland: Option<&str>,
+    runtime_dir: Option<&str>,
+) -> (Option<bool>, Vec<String>) {
+    if std::env::var_os("WAYLAND_SOCKET").is_some() {
+        return (Some(true), Vec::new());
+    }
+    let Some(w) = wayland.filter(|v| !v.is_empty()) else { return (None, Vec::new()) };
+    let path = if std::path::Path::new(w).is_absolute() {
+        std::path::PathBuf::from(w)
+    } else {
+        match runtime_dir.filter(|d| !d.is_empty()) {
+            Some(d) => std::path::Path::new(d).join(w),
+            // No runtime dir: the client returns NoCompositor without looking at a file, so
+            // the socket is definitively not reachable.
+            None => return (Some(false), Vec::new()),
+        }
+    };
+    let present = path.exists();
+    let mut found = Vec::new();
+    if let Some(dir) = runtime_dir.filter(|d| !d.is_empty()) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                // The compositor's own socket, not its `.lock` file.
+                if n.starts_with("wayland-") && !n.ends_with(".lock") {
+                    found.push(n);
+                }
+            }
+        }
+        found.sort();
+    }
+    (Some(present), found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const NONE: &[String] = &[];
+
     fn session(w: Option<&'static str>, x: Option<&'static str>, st: bool) -> Session<'static> {
-        Session { wayland: w, x11: x, statically_linked: st }
+        // A session with the socket where it should be — the ordinary case, so the older
+        // tests keep testing what they were written for.
+        Session {
+            wayland: w,
+            runtime_dir: Some("/run/user/1000"),
+            socket_present: w.map(|_| true),
+            sockets_found: NONE,
+            x11: x,
+            statically_linked: st,
+        }
     }
 
     /// The message that was misleading people: the library is INSTALLED and this binary
@@ -168,6 +271,96 @@ mod tests {
         assert_eq!(diagnose(session(Some("wayland-0"), None, false)), None);
         assert_eq!(diagnose(session(None, Some(":0"), false)), None);
         assert_eq!(diagnose(session(Some("wayland-1"), Some(":0"), false)), None);
+    }
+
+    /// THE ERROR THAT ARRIVED: `WinitEventLoop` OS error, file not found, from
+    /// `wayland/event_loop/mod.rs:89` — which is `Connection::connect_to_env()`. The
+    /// environment looks healthy (WAYLAND_DISPLAY is set) and the socket it names is not
+    /// there, so a variables-only check says nothing and the failure reads as an internal
+    /// winit fault.
+    #[test]
+    fn a_missing_socket_is_named_along_with_the_ones_that_do_exist() {
+        let found = vec!["wayland-1".to_string()];
+        let m = diagnose(Session {
+            wayland: Some("wayland-0"),
+            runtime_dir: Some("/run/user/1000"),
+            socket_present: Some(false),
+            sockets_found: &found,
+            x11: None,
+            statically_linked: false,
+        })
+        .expect("a diagnosis");
+        assert!(m.contains("WAYLAND_DISPLAY=wayland-0"), "{m}");
+        assert!(m.contains("does not exist"), "{m}");
+        assert!(m.contains("/run/user/1000"), "it should say where it looked: {m}");
+        assert!(m.contains("wayland-1"), "the socket that IS there is the actionable part: {m}");
+        assert!(m.contains("try WAYLAND_DISPLAY"), "{m}");
+        assert!(m.contains("sudo"), "the other-user case is worth naming: {m}");
+    }
+
+    /// Inherited over ssh or from a TTY: the variable came along and the directory that
+    /// gives it meaning did not.
+    #[test]
+    fn a_missing_runtime_dir_is_called_out_as_such() {
+        let m = diagnose(Session {
+            wayland: Some("wayland-0"),
+            runtime_dir: None,
+            socket_present: Some(false),
+            sockets_found: NONE,
+            x11: None,
+            statically_linked: false,
+        })
+        .expect("a diagnosis");
+        assert!(m.contains("XDG_RUNTIME_DIR is not set"), "{m}");
+        assert!(m.contains("none at all"), "{m}");
+    }
+
+    /// A static binary fails whatever the socket says, so that answer comes first —
+    /// otherwise someone chases a socket while holding a binary that cannot dlopen.
+    #[test]
+    fn static_linking_outranks_a_missing_socket() {
+        let m = diagnose(Session {
+            wayland: Some("wayland-0"),
+            runtime_dir: Some("/run/user/1000"),
+            socket_present: Some(false),
+            sockets_found: NONE,
+            x11: None,
+            statically_linked: true,
+        })
+        .expect("a diagnosis");
+        assert!(m.contains("STATICALLY LINKED"), "{m}");
+    }
+
+    /// The path rule is `wayland-client`'s, and a check that guessed differently could
+    /// report a socket present that the client then fails to open.
+    #[test]
+    fn the_socket_path_follows_the_clients_own_rule() {
+        let dir = std::env::temp_dir().join(format!("uk-wl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("wayland-1"), b"").unwrap();
+        std::fs::write(dir.join("wayland-1.lock"), b"").unwrap();
+        let d = dir.to_str().unwrap();
+
+        // Named socket missing, and the one that exists is listed — without its .lock.
+        let (present, found) = wayland_socket_state(Some("wayland-0"), Some(d));
+        assert_eq!(present, Some(false));
+        assert_eq!(found, vec!["wayland-1".to_string()], "a .lock is not a socket");
+
+        // Named socket present.
+        assert_eq!(wayland_socket_state(Some("wayland-1"), Some(d)).0, Some(true));
+
+        // An ABSOLUTE display is the path itself, runtime dir irrelevant.
+        let abs = dir.join("wayland-1");
+        assert_eq!(wayland_socket_state(Some(abs.to_str().unwrap()), None).0, Some(true));
+
+        // No runtime dir and a relative name: the client gives up without looking.
+        assert_eq!(wayland_socket_state(Some("wayland-0"), None).0, Some(false));
+        // No display at all: nothing to say about a socket.
+        assert_eq!(wayland_socket_state(None, Some(d)).0, None);
+        assert_eq!(wayland_socket_state(Some(""), Some(d)).0, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Read from the maps rather than our own ELF headers: it reflects what actually
