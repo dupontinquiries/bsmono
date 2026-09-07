@@ -1013,6 +1013,56 @@ impl Feel {
                         springboard = std::mem::take(&mut self.swipe.springboard_words);
                         trailing_space = self.swipe.trailing_space;
                     }
+                    // THE SPACE ZONES (§4). `springboard::zones` has computed these since
+                    // the last commit and nothing drew or tapped them, so the strip a
+                    // compacted board frees was a live region with no visible job — and the
+                    // bottom zone, which every board has, was invisible too.
+                    let letters = egui::Rect::from_min_max(
+                        board_rect.min,
+                        egui::pos2(
+                            board_rect.max.x,
+                            (board_rect.max.y - adaptive.min_touch_target).max(board_rect.min.y),
+                        ),
+                    );
+                    let zones = crate::springboard::zones(board_rect, letters, self.style.half);
+                    let swiping = self.swipe.is_active();
+                    {
+                        let colors = uikit_egui::palette_colors(self.board.palette());
+                        let painter = ui.painter();
+                        for z in &zones {
+                            // Faded while suppressed rather than hidden: a strip that
+                            // vanishes mid-swipe reads as the keyboard flickering, and the
+                            // doc asks for "faded out, non-tappable", not gone.
+                            let live = !swiping || z.live_while_swiping;
+                            let a = if live { 26 } else { 10 };
+                            painter.rect_filled(
+                                z.rect,
+                                egui::CornerRadius::same(4),
+                                egui::Color32::from_rgba_unmultiplied(
+                                    colors.accent.r(), colors.accent.g(), colors.accent.b(), a,
+                                ),
+                            );
+                            // The doc's "small ␣ icon at its geometric center" — the mark is
+                            // what teaches the strip is a spacebar rather than dead margin.
+                            painter.text(
+                                z.rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "␣",
+                                egui::FontId::proportional(13.0),
+                                colors.text.gamma_multiply(if live { 0.55 } else { 0.25 }),
+                            );
+                        }
+                    }
+                    // A tap in a live zone is a plain space. Read before the words below so
+                    // a tap and a swipe-commit in the same frame stay in the order they
+                    // happened.
+                    if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                        if ui.input(|i| i.pointer.primary_released())
+                            && crate::springboard::zone_at(&zones, p, swiping).is_some()
+                        {
+                            self.emit_text(" ");
+                        }
+                    }
                     for w in springboard {
                         self.emit_text(&w);
                         self.emit_text(" ");

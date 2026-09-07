@@ -93,3 +93,37 @@ fn a_compacted_board_draws_its_keys_on_the_chosen_side() {
     assert!(rl > fl + 20.0, "a right-anchored board did not move off the left edge: {rl} vs {fl}");
     assert!(rr > lr, "both sides drew in the same place");
 }
+
+/// The space zones must reach the frame. `springboard::zones` computed them for a commit
+/// with nothing drawing them, which is the failure this crate keeps producing — a strip the
+/// user cannot see is not a spacebar.
+#[test]
+fn the_space_zones_are_painted_and_the_compacted_one_appears_beside_the_keys() {
+    let size = egui::vec2(500.0, 300.0);
+
+    // The ␣ mark is the zone's own glyph; no key label uses it.
+    let marks = |side: halfboard::Side| -> Vec<egui::Rect> {
+        let ctx = egui::Context::default();
+        let mut app = demo_app::Feel::new();
+        app.style = Style { half: side, ..app.style };
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size));
+        // Two frames: the first lays the board out, the second draws against real rects.
+        let _ = ctx.run(input.clone(), |ctx| app.frame(ctx));
+        let out = ctx.run(input, |ctx| app.frame(ctx));
+        uikit_egui::layout_probe::texts(&out.shapes)
+            .into_iter()
+            .filter(|t| t.text.trim() == "␣")
+            .map(|t| t.rect)
+            .collect()
+    };
+
+    let full = marks(halfboard::Side::Off);
+    assert_eq!(full.len(), 1, "a full-width board has one space zone, saw {}", full.len());
+
+    let left = marks(halfboard::Side::Left);
+    assert_eq!(left.len(), 2, "a compacted board adds the freed strip, saw {}", left.len());
+    // The added one is the tall thin strip, not a second bottom bar.
+    let strip = left.iter().max_by(|a, b| a.center().x.partial_cmp(&b.center().x).unwrap()).unwrap();
+    assert!(strip.center().x > size.x * 0.6, "the strip is not on the freed side: {strip:?}");
+}
