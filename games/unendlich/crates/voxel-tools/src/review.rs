@@ -111,6 +111,73 @@ pub fn prompt(prose: &str, ops: &[Op], spec: Option<&str>, measured: &str, eleva
     s
 }
 
+/// Apply a verdict to a PROGRAM: drop passes by number, replace them,
+/// append new ones. Frames and assets are untouched -- a review judges
+/// what was built, and the pieces it was built from are not what went
+/// wrong when a pass had the wrong polarity.
+pub fn apply_program(src: &str, review: &Review) -> String {
+    let mut out = String::new();
+    let mut n = 0usize;
+    let mut lines = src.lines().peekable();
+    while let Some(line) = lines.next() {
+        let t = line.trim();
+        let is_pass = t.to_lowercase().starts_with("pass ");
+        // gather this block, whatever it is
+        let mut block = format!("{line}\n");
+        if is_pass || t.to_lowercase().starts_with("asset ") || t.to_lowercase().starts_with("frame ") {
+            for l in lines.by_ref() {
+                block.push_str(l);
+                block.push('\n');
+                if l.trim().eq_ignore_ascii_case("end") { break; }
+            }
+        }
+        if !is_pass { out.push_str(&block); continue; }
+        n += 1;
+        if review.drop.contains(&n) { continue; }
+        match review.passes.iter().find(|(k, _)| *k == Some(n)) {
+            Some((_, replacement)) => {
+                out.push_str(replacement.trim_end());
+                if !replacement.trim_end().to_lowercase().ends_with("end") { out.push_str("\nend"); }
+                out.push('\n');
+            }
+            None => out.push_str(&block),
+        }
+    }
+    for (k, src) in &review.passes {
+        if k.is_some() { continue; }
+        out.push_str(src.trim_end());
+        if !src.trim_end().to_lowercase().ends_with("end") { out.push_str("\nend"); }
+        out.push('\n');
+    }
+    out
+}
+
+/// The review prompt for a PROGRAM. It speaks in passes rather than
+/// numbered ops, because that is what a program has and what a verdict
+/// on one must be able to name.
+pub fn program_prompt(prose: &str, src: &str, passes: &[(String, String, usize)],
+                      measured: &str, elevation: &str, findings: &[String], round: usize) -> String {
+    let mut s = format!("REVIEW round {round}. The player asked for: {prose}\n\nWhat was built, pass by pass:\n");
+    for (i, (name, pol, cells)) in passes.iter().enumerate() {
+        s.push_str(&format!("  {}. {name} ({pol} {cells} cells)\n", i + 1));
+    }
+    s.push_str(&format!("\nMeasured: {measured}\n\n{elevation}\n"));
+    if !findings.is_empty() {
+        s.push_str("Problems found:\n");
+        for f in findings { s.push_str(&format!("  - {f}\n")); }
+    }
+    // The source, so a verdict can rewrite a pass rather than only
+    // deleting it. Capped: a long program crowds out the picture, and
+    // the picture is the thing the model can actually judge.
+    if src.len() < 2000 {
+        s.push_str(&format!("\nThe program:\n{src}\n"));
+    } else {
+        s.push_str(&format!("\n(the program is {} lines, too long to show)\n", src.lines().count()));
+    }
+    s.push_str("\nDoes it match what the player asked for? Reply with ONLY lines of these forms:\n                drop 3                    (a pass number to remove)\n                replace 2 <pass name> add|cut   then its body, then `end`\n                add <pass name> add|cut         then its body, then `end`\n                done                      (it is right; stop)\n\n                A pass that added where it should have cut is the commonest fault: check the\n                polarity of each before anything else.\n\nReply:\n");
+    s
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Review {
     pub keep: Option<Vec<usize>>,
@@ -119,6 +186,9 @@ pub struct Review {
     pub spec: Option<String>,
     pub pick: Option<usize>,
     pub done: bool,
+    /// Whole passes to substitute or append, as (number or None, source).
+    /// A program is edited by rewriting a pass, not by editing a line.
+    pub passes: Vec<(Option<usize>, String)>,
     /// Lines that were none of the forms, for the log.
     pub ignored: usize,
 }
@@ -126,7 +196,7 @@ pub struct Review {
 impl Review {
     pub fn is_empty(&self) -> bool {
         self.keep.is_none() && self.drop.is_empty() && self.add.is_empty() && self.spec.is_none()
-            && self.pick.is_none() && !self.done
+            && self.pick.is_none() && !self.done && self.passes.is_empty()
     }
     pub fn summary(&self) -> String {
         let mut v = Vec::new();
@@ -135,6 +205,11 @@ impl Review {
         if !self.add.is_empty() { v.push(format!("add {}", self.add.len())); }
         if let Some(s) = &self.spec { v.push(format!("spec {}", s.trim_start_matches("spec").trim())); }
         if let Some(p) = self.pick { v.push(format!("pick {p}")); }
+        if !self.passes.is_empty() {
+            let (rep, new): (Vec<_>, Vec<_>) = self.passes.iter().partition(|(k, _)| k.is_some());
+            if !rep.is_empty() { v.push(format!("replace {} pass(es)", rep.len())); }
+            if !new.is_empty() { v.push(format!("add {} pass(es)", new.len())); }
+        }
         if self.done { v.push("done".into()); }
         if v.is_empty() { "no verdict".into() } else { v.join("; ") }
     }
@@ -145,6 +220,40 @@ impl Review {
 /// not one of the forms is counted and ignored.
 pub fn parse(reply: &str, n_ops: usize) -> Review {
     let mut r = Review::default();
+    // A `replace N name add` or `add name cut` line opens a BLOCK that
+    // runs to `end`. Pulled out first, so the line loop below never
+    // sees a pass body and mistakes `part`/`rel` lines for verdicts.
+    let mut body: Option<(Option<usize>, String)> = None;
+    let mut rest = String::new();
+    for line in reply.lines() {
+        let t = line.trim();
+        if let Some((n, _)) = &mut body {
+            if t.eq_ignore_ascii_case("end") {
+                let (n, src) = body.take().unwrap();
+                r.passes.push((n, src));
+            } else {
+                let _ = n;
+                if let Some((_, src)) = body.as_mut() { src.push_str(t); src.push('\n'); }
+            }
+            continue;
+        }
+        let low = t.to_lowercase();
+        if low.starts_with("replace ") || (low.starts_with("add ") && low.split_whitespace().count() >= 3
+            && ["add", "cut"].contains(&low.split_whitespace().last().unwrap_or(""))) {
+            let w: Vec<&str> = t.split_whitespace().collect();
+            let (num, head) = if low.starts_with("replace") {
+                (w.get(1).and_then(|s| s.parse::<usize>().ok()), w[2..].join(" "))
+            } else {
+                (None, w[1..].join(" "))
+            };
+            body = Some((num, format!("pass {head}\n")));
+            continue;
+        }
+        rest.push_str(line);
+        rest.push('\n');
+    }
+    if let Some((n, src)) = body { r.passes.push((n, src)); }   // unterminated block
+    let reply = rest.as_str();
     let nums = |s: &str| -> Vec<usize> {
         s.split(|c: char| !c.is_ascii_digit()).filter(|t| !t.is_empty())
             .filter_map(|t| t.parse::<usize>().ok()).filter(|n| *n >= 1 && *n <= n_ops).collect()
@@ -272,5 +381,68 @@ mod tests {
         let v = vec![Variant { label: "turret".into(), props: "300 blocks".into(), elevation: "  ##\n".into() }];
         let p2 = prompt("a hall", &plan.ops, None, "x", "y", &[], &v, 2);
         assert!(p2.contains("[1] turret") && p2.contains("pick N"));
+    }
+
+    #[test]
+    fn a_program_is_reviewed_in_passes_not_ops() {
+        let passes = vec![("mass".to_string(), "add".to_string(), 2690usize),
+                          ("gate".to_string(), "cut".to_string(), 1420)];
+        let p = program_prompt("a keep", "pass mass add\n  part k box w=10 material=stone\nend\n",
+                               &passes, "2690 blocks", "FRONT:\n ####\n", &[], 1);
+        assert!(p.contains("1. mass (add 2690 cells)"), "{p}");
+        assert!(p.contains("2. gate (cut 1420 cells)"));
+        assert!(p.contains("check the"), "polarity is called out first: {p}");
+        assert!(p.contains("The program:"), "the source is shown so a pass can be rewritten");
+        assert!(!p.contains("keep 1 2 4"), "no op-numbered verdict language");
+        // a long program is summarised rather than shown
+        let long = "pass x add\n".repeat(400);
+        assert!(program_prompt("x", &long, &passes, "m", "e", &[], 1).contains("too long to show"));
+    }
+
+    #[test]
+    fn a_verdict_can_rewrite_a_whole_pass() {
+        let src = "asset t\n  part x box w=2 material=stone\nend\n\
+                   pass mass add\n  part k box w=10 material=stone\nend\n\
+                   pass gate add\n  part d box w=3 material=stone\nend\n";
+        // the commonest fault: a pass that added where it should cut
+        let r = parse("replace 2 gate cut\n  part d box w=3 h=6 d=12 material=stone\n  rel d on ground\nend\n", 2);
+        assert_eq!(r.passes.len(), 1);
+        assert_eq!(r.passes[0].0, Some(2));
+        assert!(r.passes[0].1.starts_with("pass gate cut"), "{:?}", r.passes[0].1);
+        assert!(!r.is_empty());
+        let out = apply_program(src, &r);
+        assert!(out.contains("asset t"), "assets survive a review");
+        assert!(out.contains("pass mass add"), "and the pass that was fine");
+        assert!(out.contains("pass gate cut"), "the polarity is fixed: {out}");
+        assert!(!out.contains("pass gate add"), "and the old one is gone");
+        // the rewritten program still parses
+        let (prog, errs) = crate::program::parse(&out);
+        assert!(errs.is_empty(), "{out}\n{errs:?}");
+        assert_eq!(prog.passes.len(), 2);
+        assert_eq!(prog.passes[1].polarity, crate::program::Polarity::Cut);
+    }
+
+    #[test]
+    fn a_verdict_can_drop_a_pass_or_append_one() {
+        let src = "pass a add\n  part x box w=4 material=stone\nend\n\
+                   pass b add\n  part y box w=4 material=stone\nend\n";
+        let dropped = apply_program(src, &parse("drop 1\n", 2));
+        assert!(!dropped.contains("pass a") && dropped.contains("pass b"), "{dropped}");
+        let added = apply_program(src, &parse("add trim cut\n  part z box w=2 material=stone\nend\n", 2));
+        assert!(added.contains("pass a") && added.contains("pass trim cut"), "{added}");
+        let (prog, errs) = crate::program::parse(&added);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(prog.passes.len(), 3);
+    }
+
+    #[test]
+    fn a_pass_body_is_never_mistaken_for_a_verdict() {
+        // `part` and `rel` lines inside a block must not be read as
+        // verdict lines and counted as ignored
+        let r = parse("replace 1 mass add\n  part k box w=10 material=stone\n  rel k on ground\nend\ndone\n", 3);
+        assert_eq!(r.passes.len(), 1);
+        assert!(r.done);
+        assert_eq!(r.ignored, 0, "the body was not treated as noise");
+        assert!(r.passes[0].1.contains("part k") && r.passes[0].1.contains("rel k on ground"));
     }
 }

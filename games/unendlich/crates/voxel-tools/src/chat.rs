@@ -93,6 +93,11 @@ pub struct Pending {
     prose: String,
     /// What the dry run placed, for a review's measurement and picture.
     placed: Vec<(i32, i32, i32)>,
+    /// The program source, when this pending came from one. A review
+    /// needs it: a program's ops list is empty by construction.
+    program: String,
+    /// Per pass: name, polarity word, cells moved.
+    pass_log: Vec<(String, String, usize)>,
     /// Cells from a composed sketch that no IR op can express -- a
     /// torus, a helix. Applied alongside the plan on commit, so the
     /// whole composition is one edit and undoes as one.
@@ -483,6 +488,8 @@ impl ChatSession {
             ir: src.to_string(),
             prose: prose.to_string(),
             placed,
+            program: src.to_string(),
+            pass_log: run.log.iter().map(|(n, p, c)| (n.clone(), p.word().to_string(), *c)).collect(),
             extra_cells: run.changes,
             findings: Vec::new(),
             bounds,
@@ -503,6 +510,15 @@ impl ChatSession {
         let elev = crate::review::elevations(&cells, 24, 14);
         let spec = p.plan.ops.iter().find_map(|o| match o { Op::Spec(s) => Some(s.clone()), _ => None });
         let ops: Vec<Op> = p.plan.ops.iter().filter(|o| !matches!(o, Op::Spec(_))).cloned().collect();
+        // A PROGRAM has no ops, so a review of one showed the model an
+        // empty plan and asked what to change about it. The most
+        // expressive path was the one path with no feedback. A program
+        // is reviewed in its own terms: passes, their polarity, and how
+        // many cells each moved.
+        if ops.is_empty() && !p.program.is_empty() {
+            return Some(crate::review::program_prompt(
+                &p.prose, &p.program, &p.pass_log, &measured, &elev, &p.findings, round));
+        }
         Some(crate::review::prompt(&p.prose, &ops, spec.as_deref(), &measured, &elev, &p.findings, variants, round))
     }
 
@@ -519,6 +535,16 @@ impl ChatSession {
         let review = crate::review::parse(reply, n_ops);
         if review.done || review.is_empty() {
             return (Reply::Say(format!("review: {}", review.summary())), false, review);
+        }
+        // A PROGRAM is edited by rewriting whole passes, not lines.
+        if !p.program.is_empty() {
+            let revised = crate::review::apply_program(&p.program, &review);
+            if revised.trim() == p.program.trim() {
+                return (Reply::Say(format!("review: {} -- no change", review.summary())), false, review);
+            }
+            let prose = p.prose.clone();
+            let r = self.receive_program(tools, gaze, &revised, player_feet, &prose);
+            return (r, true, review);
         }
         let revised = crate::review::apply(&p.ir, &review);
         if revised.trim() == p.ir.trim() {
@@ -905,6 +931,8 @@ impl ChatSession {
             plan, feature_id: f.feature_id.clone(), predicted_blocks: dry.blocks_changed,
             ir: ir.to_string(), prose: prose.to_string(),
             placed: placed.clone(),
+            program: String::new(),
+            pass_log: Vec::new(),
             extra_cells: Vec::new(),
             findings: findings.iter().map(|f| f.message.clone()).collect(),
             bounds: {
@@ -1975,5 +2003,48 @@ mod tests {
             }
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn a_program_can_be_reviewed_and_its_polarity_fixed() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 400_000);
+        let g = gaze_at(0, 0, 10.0);
+        // the commonest fault: a gate pass that ADDS where it should cut
+        let prog = "pass mass add\n\
+                      part keep box w=20 h=14 d=20 material=stone hollow\n\
+                      rel keep on ground\n\
+                    end\n\
+                    pass gate add\n\
+                      part door box w=4 h=7 d=22 material=stone\n\
+                      rel door on ground\n\
+                    end\n";
+        s.receive_program(&mut t, &g, prog, None, "a keep with a gate through it");
+        // the review sees PASSES, not an empty op list
+        let p = s.review_prompt(1, &[]).expect("a prompt");
+        assert!(p.contains("1. mass (add"), "{p}");
+        assert!(p.contains("2. gate (add"), "{p}");
+        assert!(p.contains("The program:"), "the source, so a pass can be rewritten");
+        assert!(!p.contains("The plan, by number"), "not the op-based prompt");
+        // the model spots the polarity and rewrites the pass
+        let (r, changed, review) = s.apply_review(&mut t, &g,
+            "replace 2 gate cut\n  part door box w=4 h=7 d=22 material=stone\n  rel door on ground\nend\n",
+            None);
+        assert!(changed, "{review:?}");
+        match r {
+            Reply::Preview { echo, .. } => {
+                assert!(echo.contains("gate (cut"), "the gate cuts now: {echo}");
+                assert!(echo.contains("mass (add"), "and the mass is untouched");
+            }
+            o => panic!("{o:?}"),
+        }
+        s.commit(&mut t, &g);
+        drop(t);
+        // there is a hole through the keep where the gate is
+        // the gate cut a hole through the south wall; the shell of a
+        // hollow box is at +-10, so x=9 is interior either way
+        assert_eq!(w.get(0, 67, -10), 0, "the gate is open through the wall");
+        assert_ne!(w.get(10, 67, -10), 0, "and the wall stands beside it");
     }
 }
