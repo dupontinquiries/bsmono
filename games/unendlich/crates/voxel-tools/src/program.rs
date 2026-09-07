@@ -49,6 +49,7 @@ use crate::sketch::{self, Sketch};
 use crate::weather::Change;
 use std::collections::{BTreeMap, BTreeSet};
 
+
 /// Does this pass put material in or take it out?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Polarity { Add, Cut }
@@ -187,6 +188,11 @@ pub enum Source {
     Sketch(String),
     /// An asset, stamped at each of these places.
     Stamp { asset: String, at: Vec<((i32, i32, i32), u8)> },
+    /// Detail attached to what earlier passes built. Its polarity is
+    /// honoured like any other pass, so `pass carving cut` with a
+    /// flair body carves the detail INTO the surface rather than onto
+    /// it -- which is what carving is.
+    Flair { src: String },
     /// An asset repeated on a rule: along a line, around a ring, on a
     /// grid. The repetition a builder actually uses.
     ///
@@ -262,6 +268,12 @@ pub struct Run {
     pub log: Vec<(String, Polarity, usize)>,
     pub notes: Vec<String>,
     pub errors: Vec<String>,
+    /// What each pass left standing, by name. `flair` attaches detail
+    /// to geometry that already exists, and without this the passes
+    /// accumulate into one anonymous set and there is nothing to
+    /// attach to -- "the top edge of the curtain wall" needs to know
+    /// which cells the curtain wall is.
+    pub bodies: crate::flair::Bodies,
 }
 
 impl Run {
@@ -352,6 +364,23 @@ pub fn run_in<W: crate::VoxelWorld>(w: &W, prog: &Program, anchor: (i32, i32, i3
                 at.iter().flat_map(|(p, turns)| a.stamp(
                     (anchor.0 + p.0, anchor.1 + p.1, anchor.2 + p.2), *turns)).collect()
             }
+            Source::Flair { src } => {
+                let (flairs, errs) = crate::flair::parse(src);
+                r.errors.extend(errs.into_iter().map(|e| format!("{}: {e}", pass.name)));
+                // The greebles available are the ASSETS: one vocabulary
+                // for repeated pieces, whether they are placed on a
+                // rule or on a region of something already built.
+                let g: BTreeMap<String, Vec<((i32, i32, i32), u16)>> = prog.assets.iter()
+                    .map(|a| (a.name.clone(), a.cells.clone())).collect();
+                let mut out = Vec::new();
+                for f in &flairs {
+                    let a = crate::flair::apply(f, &r.bodies, &g);
+                    r.notes.extend(a.log.into_iter().map(|l| format!("{}: {l}", pass.name)));
+                    r.notes.extend(a.notes.into_iter().map(|n| format!("{}: {n}", pass.name)));
+                    out.extend(a.changes.into_iter().map(|c| (c.at, c.to)));
+                }
+                out
+            }
             Source::Repeat { asset, rule, vary, site, sizing } => {
                 let site = *site;
                 let Some(a) = assets.get(asset.as_str()) else {
@@ -405,9 +434,11 @@ pub fn run_in<W: crate::VoxelWorld>(w: &W, prog: &Program, anchor: (i32, i32, i3
             }
         };
         let mut moved = 0usize;
+        let mut touched: Vec<(i32, i32, i32)> = Vec::new();
         match pass.polarity {
             Polarity::Add => {
                 for (c, b) in cells {
+                    touched.push(c);
                     // an Add un-cuts: a later pass may restore what an
                     // earlier one removed, which is how a builder fixes
                     // an over-cut without starting again
@@ -423,6 +454,16 @@ pub fn run_in<W: crate::VoxelWorld>(w: &W, prog: &Program, anchor: (i32, i32, i3
                     cut.insert(c);
                     moved += usize::from(!solid.contains_key(&c));
                 }
+            }
+        }
+        // what this pass contributed, as it stands after its own
+        // polarity: an add's cells, or for a cut, nothing (a cut is
+        // not a body, it is the absence of one)
+        if pass.polarity == Polarity::Add {
+            let own: BTreeSet<(i32, i32, i32)> = touched.into_iter()
+                .filter(|c| solid.contains_key(c)).collect();
+            if !own.is_empty() {
+                r.bodies.entry(pass.name.replace(' ', "_")).or_default().extend(own);
             }
         }
         r.log.push((pass.name.clone(), pass.polarity, moved));
@@ -698,6 +739,7 @@ pub fn parse(src: &str) -> (Program, Vec<String>) {
                 // else is a sketch
                 let first = body.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#'));
                 let source = match first.map(|l| l.split_whitespace().next().unwrap_or("")) {
+                    Some("flair") => Source::Flair { src: body },
                     Some("repeat") | Some("stamp") => match parse_asset_use(&body) {
                         Ok(s) => s,
                         Err(e) => { errs.push(format!("pass '{name}': {e}")); continue; }
@@ -723,11 +765,26 @@ pub fn parse(src: &str) -> (Program, Vec<String>) {
     (p, errs)
 }
 
+/// A block body, up to its OWN `end`.
+///
+/// Blocks nest: a `flair ... end` lives inside a `pass ... end`.
+/// Stopping at the first `end` ended the pass at the flair's, leaving
+/// the pass's own `end` to leak out as a stray line -- visible as a
+/// bare "end" in the notes. It worked only because `flair::parse`
+/// tolerates an unterminated block, which is luck rather than design.
 fn take_body<'a>(lines: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>) -> String {
     let mut body = String::new();
+    let mut depth = 0usize;
     for line in lines.by_ref() {
-        if line.trim().eq_ignore_ascii_case("end") { break; }
-        body.push_str(line.trim());
+        let t = line.trim();
+        let head = t.split_whitespace().next().unwrap_or("").to_lowercase();
+        if t.eq_ignore_ascii_case("end") {
+            if depth == 0 { break; }
+            depth -= 1;
+        } else if ["flair", "asset", "frame", "pass"].contains(&head.as_str()) {
+            depth += 1;
+        }
+        body.push_str(t);
         body.push('\n');
     }
     body
@@ -846,6 +903,15 @@ which each pass is.
   end
 
   pass NAME add|cut
+    flair ASSET on BODY ANCHOR [except BODY ANCHOR REACH]
+      every 3 / cull 0.6 / thin 4 / clamp MIN MAX / jitter 1
+    end
+                                detail attached to WHAT AN EARLIER PASS
+                                BUILT. A body is named after its pass,
+                                spaces underscored. Anchors: top_edge,
+                                base_edge, faces, corners, shell, roof.
+                                `except` is how a parapet stops short
+                                of a gate.
     repeat ASSET ring centre=0,8,0 radius=10 count=8 face_out
     repeat ASSET line from=-20,0,0 to=20,0,0 step=6
     repeat ASSET grid min=-20,0,-20 max=20,0,20 step=10
@@ -864,6 +930,25 @@ EXAMPLE
 pass rift cut
   part gash box w=140 h=30 d=18 material=stone
   rel gash below ground by=0
+end
+
+EXAMPLE
+  player: a wall with battlements that stop at the gate
+asset merlon
+  part m box w=1 h=2 d=1 material=stone
+end
+pass curtain wall add
+  part w box w=40 h=10 d=40 material=stone hollow
+  rel w on ground
+end
+pass gatehouse add
+  part g box w=8 h=13 d=8 material=stone
+  rel g beside w dir=south by=-4
+end
+pass battlements add
+  flair merlon on curtain_wall top_edge except gatehouse all 5
+    every 2
+  end
 end
 
 EXAMPLE
@@ -1297,5 +1382,93 @@ mod tests {
         let with = run_in(&Land, &prog, (0, 64, 0));
         assert!(!with.changes.is_empty());
         assert!(!with.notes.iter().any(|n| n.contains("found no surface")));
+    }
+
+    #[test]
+    fn each_pass_leaves_a_named_body_for_flair_to_attach_to() {
+        let (prog, _) = parse(
+            "pass curtain wall add\n  part w box w=30 h=8 d=30 material=stone hollow\n  rel w on ground\nend\n\
+             pass keep add\n  part k box w=10 h=16 d=10 material=stone\n  rel k on ground\nend\n");
+        let r = run(&prog, (0, 64, 0));
+        // named after the pass, spaces underscored so a location can
+        // refer to it in one word
+        assert!(r.bodies.contains_key("curtain_wall"), "{:?}", r.bodies.keys().collect::<Vec<_>>());
+        assert!(r.bodies.contains_key("keep"));
+        // and the bodies are what each pass actually LEFT: the keep is
+        // solid, the wall is a shell
+        assert!(r.bodies["keep"].len() > 1000, "{}", r.bodies["keep"].len());
+        assert!(r.bodies["curtain_wall"].len() < r.bodies["keep"].len() * 3);
+        // a CUT pass leaves no body, because a cut is not a thing
+        let (cutter, _) = parse("pass hole cut\n  part h box w=4 h=4 d=4 material=stone\nend\n");
+        assert!(run(&cutter, (0, 64, 0)).bodies.is_empty(), "a cut is the absence of a body");
+    }
+
+    #[test]
+    fn a_flair_pass_puts_detail_on_what_an_earlier_pass_built() {
+        let (prog, errs) = parse(
+            "asset merlon\n  part m box w=1 h=2 d=1 material=stone\nend\n\
+             pass curtain wall add\n  part w box w=40 h=10 d=40 material=stone hollow\n  rel w on ground\nend\n\
+             pass gatehouse add\n  part g box w=8 h=13 d=8 material=stone\n  rel g beside w dir=south by=-4\nend\n\
+             pass crenellation add\n\
+               flair merlon on curtain_wall top_edge except gatehouse all 5\n\
+                 every 2\n\
+               end\n\
+             end\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        let r = run(&prog, (0, 64, 0));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.log.len(), 3);
+        // the flair pass placed something, and said how much
+        assert!(r.log[2].2 > 20, "the crenellations went on: {}", r.log[2].2);
+        assert!(r.notes.iter().any(|n| n.contains("merlon") && n.contains("placement(s)")), "{:?}", r.notes);
+        // they sit above the wall, not inside it
+        let wall_top = r.bodies["curtain_wall"].iter().map(|c| c.1).max().unwrap();
+        let flair_cells: Vec<&Change> = r.changes.iter().filter(|c| c.at.1 > wall_top).collect();
+        assert!(!flair_cells.is_empty(), "above the parapet");
+    }
+
+    #[test]
+    fn a_flair_pass_can_cut_which_is_what_carving_is() {
+        let (prog, _) = parse(
+            "asset notch\n  part n box w=1 h=2 d=1 material=stone\nend\n\
+             pass block add\n  part b box w=20 h=10 d=20 material=stone\n  rel b on ground\nend\n\
+             pass carving cut\n\
+               flair notch on block top_edge\n  every 3\nend\n\
+             end\n");
+        let r = run(&prog, (0, 64, 0));
+        assert_eq!(r.log[1].1, Polarity::Cut);
+        // the notches removed material rather than adding it
+        let air = r.changes.iter().filter(|c| c.to == 0).count();
+        assert!(air > 0, "carving takes material away: {} air cells", air);
+    }
+
+    #[test]
+    fn a_flair_naming_a_body_that_does_not_exist_says_which_do() {
+        let (prog, _) = parse(
+            "asset m\n  part x box w=1 h=1 d=1 material=stone\nend\n\
+             pass wall add\n  part w box w=10 h=6 d=10 material=stone\n  rel w on ground\nend\n\
+             pass detail add\n  flair m on barbican top_edge\nend\nend\n");
+        let r = run(&prog, (0, 64, 0));
+        assert!(r.notes.iter().any(|n| n.contains("no body called 'barbican'") && n.contains("wall")),
+                "{:?}", r.notes);
+    }
+
+    #[test]
+    fn blocks_nest_so_a_flair_inside_a_pass_does_not_end_it_early() {
+        let (prog, errs) = parse(
+            "asset m\n  part x box w=1 h=2 d=1 material=stone\nend\n\
+             pass a add\n\
+               flair m on b top_edge\n  every 2\nend\n\
+             end\n\
+             pass b add\n  part w box w=10 h=6 d=10 material=stone\n  rel w on ground\nend\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(prog.passes.len(), 2, "the second pass survived: {:?}",
+                   prog.passes.iter().map(|p| &p.name).collect::<Vec<_>>());
+        assert_eq!(prog.passes[1].name, "b", "and it is the one that was written");
+        let r = run(&prog, (0, 64, 0));
+        // no stray `end` arriving as an unrecognised line
+        assert!(!prog.notes.iter().any(|n| n.trim().eq_ignore_ascii_case("end")),
+                "no stray end: {:?}", prog.notes);
+        assert!(!r.changes.is_empty());
     }
 }
