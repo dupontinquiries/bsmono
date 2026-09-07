@@ -837,6 +837,54 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
     dispatch_key(ui, key, rect, size, &resp)
 }
 
+
+/// Does this key deserve a magnifier when pressed?
+///
+/// Character keys only. On a phone your thumb covers the key you are pressing, and the
+/// magnifier is the only way to see what went in — but magnifying "shift" or "?123" tells
+/// you nothing you did not already know from the key you deliberately aimed at, and a
+/// bubble over the space bar is a bubble over half the board.
+pub fn wants_magnifier(key: &Key) -> bool {
+    if key.role != KeyRole::Normal || key.latch != Latch::Off {
+        return false;
+    }
+    let g = key.label.trim();
+    // One visible glyph. A wide key with a word on it ("space") is not a character.
+    !g.is_empty() && g.chars().count() == 1 && !g.chars().all(char::is_whitespace)
+}
+
+/// Where the magnifier sits: centred over the key, floated above it, kept inside `bounds`.
+///
+/// Clamped horizontally because the outermost keys are exactly the ones whose bubble would
+/// otherwise hang off the screen edge — and on a phone the board IS the screen, so there is
+/// nothing beside it to hang over. Clamped upward too: on the top row the bubble would
+/// float off the board, so it is allowed to overlap the key it belongs to rather than
+/// disappear.
+pub fn magnifier_rect(key: Rect, bounds: Rect, ppp: f32) -> Rect {
+    let w = (key.width() * 1.6).max(MAGNIFIER_MIN_W);
+    let h = key.height() * 1.25;
+    let gap = 6.0;
+    let mut r = Rect::from_center_size(
+        egui::pos2(key.center().x, key.top() - gap - h * 0.5),
+        egui::vec2(w, h),
+    );
+    if r.left() < bounds.left() {
+        r = r.translate(egui::vec2(bounds.left() - r.left(), 0.0));
+    }
+    if r.right() > bounds.right() {
+        r = r.translate(egui::vec2(bounds.right() - r.right(), 0.0));
+    }
+    if r.top() < bounds.top() {
+        r = r.translate(egui::vec2(0.0, bounds.top() - r.top()));
+    }
+    uikit_egui::crisp::snap_rect(r, ppp)
+}
+
+/// `.key-magnifier { min-width }` — a bubble narrower than this reads as a tooltip.
+pub const MAGNIFIER_MIN_W: f32 = 48.0;
+/// `.key-magnifier { font-size: 28px }`.
+pub const MAGNIFIER_PT: f32 = 28.0;
+
 /// The mic key's alpha while recording, from the frame clock.
 ///
 /// A full sine between [`LIVE_MIN`] and 255 once per [`LIVE_PERIOD`]. It never reaches zero
@@ -988,6 +1036,42 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
             c.text
         };
         paint_cap_label(painter, rect, &key.label, morph, font.clone(), text_color);
+        // THE MAGNIFIER. On a phone the thumb covers the key it is pressing, so this bubble
+        // is the only way to see what went in — `.key-magnifier` in the GTK stylesheet, and
+        // absent from this port entirely. Drawn on a FOREGROUND layer: at board scale it
+        // overlaps the row above, and a magnifier a neighbouring key can paint over is a
+        // magnifier that vanishes exactly when the board is busiest.
+        if pressed && wants_magnifier(key) {
+            let bounds = ui.clip_rect();
+            let bub = magnifier_rect(rect, bounds, ppp);
+            let top = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                ui.id().with("magnifier"),
+            ));
+            // `box-shadow: 0 4px 12px alpha(black, 0.25)` — painted directly rather than
+            // through egui's popup shadow, which belongs to a Window and this is not one.
+            let shadow = egui::epaint::Shadow {
+                offset: [0, 4],
+                blur: 12,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(64),
+            };
+            top.add(shadow.as_shape(bub, CornerRadius::same(12)));
+            top.rect(
+                bub,
+                CornerRadius::same(12),
+                c.bg_card,
+                Stroke::new(1.0, uikit_egui::key_border(c.border).color),
+                egui::StrokeKind::Inside,
+            );
+            top.text(
+                bub.center(),
+                egui::Align2::CENTER_CENTER,
+                &key.label,
+                FontId::proportional(uikit_egui::crisp::snap_font_pt(MAGNIFIER_PT, ppp)),
+                c.text,
+            );
+        }
     } else {
         // Rest→hover→press glides (120ms) instead of snapping — the QML key ColorAnimation feel.
         let fill = uikit_egui::motion::interactive_fill(ui.ctx(), resp, c.bg_raised, c.bg_hover, c.accent);
@@ -1988,6 +2072,59 @@ mod gtk_parity_tests {
         assert_eq!(b.current().name, "symbols");
         b.toggle_symbols();
         assert_eq!(b.layout_index(), cardinal);
+    }
+
+    /// On a phone your thumb covers the key it is pressing, so the magnifier is the only
+    /// way to see what went in. The GTK board has `.key-magnifier`; this port had nothing.
+    #[test]
+    fn only_character_keys_get_a_magnifier() {
+        let l = Layout::qwerty();
+        let by = |lbl: &str| l.rows.iter().flat_map(|r| &r.keys).find(|k| k.label == lbl)
+            .unwrap_or_else(|| panic!("no {lbl} key"));
+        assert!(wants_magnifier(by("a")));
+        assert!(wants_magnifier(by("q")));
+        // Magnifying a modifier tells you nothing you did not know from the key you aimed
+        // at, and a bubble over the space bar is a bubble over half the board.
+        assert!(!wants_magnifier(by("⇧")));
+        assert!(!wants_magnifier(by("?123")));
+        assert!(!wants_magnifier(by("⏎")), "the commit key is not a character");
+        assert!(!wants_magnifier(by(" ")), "space is not a glyph worth showing");
+        // A latched key is showing its state; a bubble on top of that hides the state.
+        let mut shifted = by("a").clone();
+        shifted.latch = Latch::Once;
+        assert!(!wants_magnifier(&shifted));
+        // A word on a wide key is not a character either.
+        assert!(!wants_magnifier(&Key::wide("space", 5.0)));
+    }
+
+    /// The outermost keys are exactly the ones whose bubble would hang off the edge — and on
+    /// a phone the board IS the screen, so there is nothing beside it to hang over.
+    #[test]
+    fn the_magnifier_stays_on_the_board() {
+        let bounds = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 200.0));
+        let mid = Rect::from_min_size(egui::pos2(160.0, 100.0), egui::vec2(32.0, 44.0));
+        let m = magnifier_rect(mid, bounds, 1.0);
+        assert!(bounds.contains_rect(m), "{m:?} escaped {bounds:?}");
+        assert!(m.bottom() <= mid.top(), "the bubble covered the key it belongs to");
+        assert!((m.center().x - mid.center().x).abs() < 0.6, "not centred over its key");
+
+        // Leftmost and rightmost keys are pushed in rather than clipped.
+        let left = Rect::from_min_size(egui::pos2(0.0, 100.0), egui::vec2(32.0, 44.0));
+        let ml = magnifier_rect(left, bounds, 1.0);
+        assert!(ml.left() >= bounds.left() - 0.01, "{ml:?}");
+        let right = Rect::from_min_size(egui::pos2(328.0, 100.0), egui::vec2(32.0, 44.0));
+        let mr = magnifier_rect(right, bounds, 1.0);
+        assert!(mr.right() <= bounds.right() + 0.01, "{mr:?}");
+
+        // TOP ROW: the bubble would float off the board, so it is allowed to overlap the
+        // key rather than disappear. Visible and slightly in the way beats invisible.
+        let top = Rect::from_min_size(egui::pos2(160.0, 0.0), egui::vec2(32.0, 44.0));
+        let mt = magnifier_rect(top, bounds, 1.0);
+        assert!(mt.top() >= bounds.top() - 0.01, "the bubble floated off the top: {mt:?}");
+        assert!(bounds.contains_rect(mt));
+
+        // Wide enough to read at 28pt even over a narrow key.
+        assert!(m.width() >= MAGNIFIER_MIN_W);
     }
 
     /// A LIVE MICROPHONE MUST BE VISIBLE ON THE SURFACE YOU ARE LOOKING AT. The screen had
