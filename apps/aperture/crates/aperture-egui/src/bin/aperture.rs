@@ -27,6 +27,13 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
+    // Why the window will not open, said before the panic in a dependency does.
+    // `uikit_egui::backend_check`: the usual cause is a static musl build, which cannot
+    // dlopen libwayland-client, and wayland-sys's own message points at a package that is
+    // already installed. Silent when the setup is fine.
+    if let Some(why) = uikit_egui::backend_check::preflight() {
+        eprintln!("{why}");
+    }
     let path = std::env::args().nth(1).map(std::path::PathBuf::from);
     eframe::run_native(
         "aperture",

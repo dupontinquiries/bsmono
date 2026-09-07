@@ -3,6 +3,13 @@ use logscope_egui::app::LogscopeApp;
 use logscope_egui::theme;
 
 fn main() -> eframe::Result {
+    // Why the window will not open, said before the panic in a dependency does.
+    // `uikit_egui::backend_check`: the usual cause is a static musl build, which cannot
+    // dlopen libwayland-client, and wayland-sys's own message points at a package that is
+    // already installed. Silent when the setup is fine.
+    if let Some(why) = uikit_egui::backend_check::preflight() {
+        eprintln!("{why}");
+    }
     // Install the diagnostic writer FIRST, so a crash during setup still produces a report — the runs
     // worth reporting are exactly the ones that do not finish cleanly. Held for the whole of main.
     let _diag = logscope_egui::diag::install();
