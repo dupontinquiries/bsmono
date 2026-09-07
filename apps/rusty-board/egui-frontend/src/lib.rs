@@ -282,13 +282,28 @@ fn one() -> f32 { 1.0 }
 /// ones with an unambiguous single control character; anything else — voice, symbols_toggle, or
 /// no action at all — falls through to emitting the key's own label, matching `Key::new`'s
 /// existing default).
-fn emit_for_action(kind: &str) -> Option<&'static str> {
-    match kind {
-        "backspace" => Some("\u{8}"),
-        "return" => Some("\n"),
-        "space" => Some(" "),
-        _ => None,
-    }
+/// What a JSON layout's `action.kind` emits.
+///
+/// The three text-producing actions emit their character; EVERY OTHER ACTION emits the
+/// `\0act:` token `real_layout` already uses, which `classify` decodes back into a `Press`.
+///
+/// This used to return `None` for anything but those three, and `layout_from_json` then fell
+/// back to the key's LABEL — so on the bundled qwerty the mic key emitted the string "🎤"
+/// and typed an emoji into your document, `?123` typed "?123", and shift typed "⇧". The
+/// three that happened to work were the three listed here. The real-layout path
+/// (`real_layout::to_render`) has always produced the tokens; only this projection dropped
+/// them, and it is the one behind `Layout::qwerty()`, which is the board that comes up
+/// first.
+fn emit_for_action(kind: &str) -> Option<String> {
+    Some(match kind {
+        "backspace" => "\u{8}".to_string(),
+        "return" => "\n".to_string(),
+        "space" => " ".to_string(),
+        // Everything else crosses as a token rather than as its own label. An action this
+        // build does not implement still arrives at `classify` as a named action and is
+        // ignored there — visible and inert, never typed as text.
+        other => format!("{}{other}", real_layout::ACT),
+    })
 }
 
 /// Parse a rusty-board layout JSON string (the real `resources/layouts/*.json` schema) into this
@@ -299,7 +314,11 @@ fn layout_from_json(text: &str) -> Result<Layout, serde_json::Error> {
     let rows = parsed.rows.into_iter().map(|r| Row {
         weight: r.weight,
         keys: r.keys.into_iter().map(|k| {
-            let emit = k.action.as_ref().and_then(|a| emit_for_action(&a.kind)).unwrap_or(&k.label).to_string();
+            let emit = k
+                .action
+                .as_ref()
+                .and_then(|a| emit_for_action(&a.kind))
+                .unwrap_or_else(|| k.label.clone());
             let role = k.key_type.as_deref().map(KeyRole::from_json).unwrap_or_else(|| KeyRole::from_label(&k.label));
             let mut key = Key { role, latch: Latch::Off, label: k.label, weight: k.width, emit, variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None };
             if !k.extended.is_empty() { key.variants = k.extended; }
@@ -355,6 +374,11 @@ impl Layout {
                         // layout files' Voice action crosses the render layer as.
                         Key::emitting("🎤", &real_layout::voice_emit(), 1.0),
                         Key::emitting("space", " ", 3.0),
+                        // BACKSPACE, which this layout did not have. A cardinal board types
+                        // a wrong letter more often than a qwerty one does — that is what a
+                        // swipe-per-glyph board is — so it is the layout that needs the
+                        // correction key most, and it was the one without it.
+                        Key::emitting("⌫", "\u{8}", 1.0),
                         Key::emitting("⏎", "\n", 1.5),
                     ],
                     weight: 1.0,
@@ -433,7 +457,15 @@ impl Layout {
                     weight: 1.0,
                 },
                 Row {
-                    keys: vec![Key::emitting("space", " ", 6.0), Key::emitting("⏎", "\n", 2.0)],
+                    keys: vec![
+                        // THE MIC, on this board too. Dictation is a property of the
+                        // keyboard, not of one layout — a board you have to swipe away
+                        // from in order to talk is a board that makes you stop and think
+                        // about layouts mid-sentence.
+                        Key::emitting("🎤", &real_layout::voice_emit(), 1.0),
+                        Key::emitting("space", " ", 5.0),
+                        Key::emitting("⏎", "\n", 2.0),
+                    ],
                     weight: 1.0,
                 },
             ],
@@ -1669,6 +1701,62 @@ mod gtk_parity_tests {
         // an unknown key_type from a newer layout renders as a plain key rather than failing
         assert_eq!(KeyRole::from_json("navigation"), KeyRole::Normal);
         assert_eq!(KeyRole::from_json("ACTION"), KeyRole::Action, "case does not matter");
+    }
+
+    /// The four keys the GTK board has and this one must: mic, space, backspace, enter —
+    /// on EVERY layout, and doing what they say rather than typing their own label.
+    ///
+    /// The bundled qwerty's mic emitted the string "🎤" and typed an emoji into your
+    /// document, because `emit_for_action` returned `None` for every action but the three
+    /// text-producing ones and the projection then fell back to the key's LABEL. Shift typed
+    /// "⇧" and `?123` typed "?123" the same way. Meanwhile `cardinal` had no backspace at
+    /// all and `symbols` had no mic.
+    #[test]
+    fn every_board_has_the_four_keys_and_they_do_what_they_say() {
+        use crate::real_layout::{classify, Press};
+        let boards = [
+            ("qwerty", Layout::qwerty()),
+            ("symbols", Layout::symbols()),
+            ("cardinal", Layout::cardinal()),
+            ("cardinal8", Layout::cardinal8()),
+        ];
+        for (name, l) in boards {
+            let presses: Vec<Press> =
+                l.rows.iter().flat_map(|r| &r.keys).map(|k| classify(&k.emit)).collect();
+            let has = |p: &Press| presses.iter().any(|q| q == p);
+            assert!(has(&Press::Voice), "{name} has no working mic key");
+            assert!(has(&Press::Backspace) || has(&Press::Text("\u{8}".into())), "{name} has no backspace");
+            assert!(has(&Press::Return) || has(&Press::Text("\n".into())), "{name} has no enter");
+            assert!(has(&Press::Text(" ".into())), "{name} has no space");
+            // and NOTHING types a label that should have been an action
+            for k in l.rows.iter().flat_map(|r| &r.keys) {
+                if let Press::Text(t) = classify(&k.emit) {
+                    assert!(
+                        !matches!(t.as_str(), "🎤" | "⇧" | "?123" | "⌫" | "⏎"),
+                        "{name}: the {t:?} key types its own label"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Specifically the projection that was wrong: a JSON layout's non-text actions must
+    /// cross as tokens, not as labels. `real_layout::to_render` always did this; this one
+    /// did not, and it is the one behind `Layout::qwerty()` — the board that comes up first.
+    #[test]
+    fn a_json_layouts_actions_cross_as_tokens() {
+        use crate::real_layout::{classify, Press};
+        let l = Layout::qwerty();
+        let by_label = |lbl: &str| {
+            l.rows.iter().flat_map(|r| &r.keys).find(|k| k.label == lbl).unwrap_or_else(|| panic!("no {lbl}"))
+        };
+        assert_eq!(classify(&by_label("🎤").emit), Press::Voice);
+        assert_eq!(classify(&by_label("⇧").emit), Press::Shift);
+        assert_eq!(classify(&by_label("?123").emit), Press::SymbolsToggle);
+        // the three that always worked still do, as plain characters
+        assert_eq!(classify(&by_label("⌫").emit), Press::Text("\u{8}".into()));
+        assert_eq!(classify(&by_label("⏎").emit), Press::Text("\n".into()));
+        assert_eq!(classify(&by_label(" ").emit), Press::Text(" ".into()));
     }
 
     /// The reported desktop fault: tall, blurry caps. Every glyph the board paints must be

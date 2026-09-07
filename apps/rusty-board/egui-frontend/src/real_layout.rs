@@ -95,7 +95,10 @@ pub enum Press {
 
 /// Reserved emit-token prefix for action keys crossing the render layer. `\u{0}` can't occur in
 /// layout text, so tokens never collide with real emissions.
-const ACT: &str = "\u{0}act:";
+/// The prefix a non-text key action crosses the render layer as. Public so
+/// `layout_from_json` emits the same tokens this module's `classify` decodes — two
+/// projections of the same layouts must not disagree about what a mic key means.
+pub(crate) const ACT: &str = "\u{0}act:";
 
 /// The render-layer token for a typed action. `Character` never gets a token (it's a text key);
 /// `Literal`/`Keysym` carry their payload as plain text (keysym injection is the wayland side's
