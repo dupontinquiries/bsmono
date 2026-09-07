@@ -20,12 +20,22 @@ path = "src/lib.rs"
 name = "tomescope"
 path = "src/main.rs"
 
+# The command-line companion. ON BY DEFAULT — it is how the library is scripted and
+# inspected headlessly, and a default build should produce it. Gated so a packager who wants
+# only the GUI can say `--no-default-features --features gui`, and so the GUI's own folder
+# management (which made shelfctl OPTIONAL rather than a prerequisite) is not entangled with
+# whether the binary exists.
 [[bin]]
 name = "shelfctl"
 path = "src/bin/shelfctl.rs"
+required-features = ["shelfctl"]
 
 [features]
-default = []
+default = ["shelfctl"]
+# Build the `shelfctl` command-line companion.
+shelfctl = []
+# The GUI alone, for a build that wants no extra binaries.
+gui = []
 # Rasterize PDF pages by shelling out to poppler's pdftoppm (if installed).
 # Text-layer extraction via lopdf works without this; this adds page images.
 poppler-cli = []

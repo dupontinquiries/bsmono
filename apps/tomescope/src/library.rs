@@ -172,6 +172,12 @@ pub struct Library {
     pub sort: Option<SortKey>,
 }
 
+/// A root's canonical form for comparison: the real path where that resolves, so `~/books`
+/// and a symlink to it are one root rather than two that each find every book.
+fn normalize_root(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
 pub struct ScanReport {
     pub added: usize,
     pub updated: usize,
@@ -179,7 +185,83 @@ pub struct ScanReport {
     pub errors: Vec<(PathBuf, String)>,
 }
 
+/// Why a folder could not be added as a library root.
+///
+/// Named cases rather than a string, because the UI says something different for each and a
+/// message it has to parse is a message that goes stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddRootError {
+    /// Nothing at that path.
+    Missing,
+    /// A file, not a directory.
+    NotADirectory,
+    /// Already a root. Not an error worth alarming about — the folder IS in the library,
+    /// which is what the person wanted.
+    AlreadyAdded,
+    /// Inside a root that is already being scanned. Adding it would find every book twice:
+    /// once under each root, with two records for one file.
+    InsideExisting(PathBuf),
+    /// Contains a root that is already being scanned. Same double-count, the other way
+    /// round — and the caller is offered the swap, since scanning the parent is usually what
+    /// was meant.
+    ContainsExisting(PathBuf),
+}
+
 impl Library {
+    /// Add a folder to scan.
+    ///
+    /// The GUI had no way to do this: `Rescan library` walks `scan_roots`, and with an empty
+    /// list it scans nothing and reports "0 added", which reads as a broken scanner. The only
+    /// way to seed a root was `shelfctl scan <dir>` from a terminal — a command-line step
+    /// before a graphical app is usable.
+    ///
+    /// NESTING IS REFUSED, and that is the whole reason this is not two lines at the call
+    /// site. A root inside another root means every book under it is found twice, once per
+    /// root, producing two records for one file — which then diverge as you read, because
+    /// progress is stored per record.
+    pub fn add_root(&mut self, path: &Path) -> Result<PathBuf, AddRootError> {
+        let path = normalize_root(path);
+        if !path.exists() {
+            return Err(AddRootError::Missing);
+        }
+        if !path.is_dir() {
+            return Err(AddRootError::NotADirectory);
+        }
+        for r in &self.scan_roots {
+            let r = normalize_root(r);
+            if r == path {
+                return Err(AddRootError::AlreadyAdded);
+            }
+            if path.starts_with(&r) {
+                return Err(AddRootError::InsideExisting(r));
+            }
+            if r.starts_with(&path) {
+                return Err(AddRootError::ContainsExisting(r));
+            }
+        }
+        self.scan_roots.push(path.clone());
+        Ok(path)
+    }
+
+    /// Stop scanning a folder. Returns whether it was there.
+    ///
+    /// The BOOKS STAY. Removing a root says "stop looking here", not "forget what I have
+    /// read" — progress, highlights and shelf membership live on the records, and dropping
+    /// them because a folder was unmounted would be the worst possible reading of the
+    /// gesture. The next scan marks anything unreachable as missing, which is recoverable.
+    pub fn remove_root(&mut self, path: &Path) -> bool {
+        let path = normalize_root(path);
+        let before = self.scan_roots.len();
+        self.scan_roots.retain(|r| normalize_root(r) != path);
+        self.scan_roots.len() != before
+    }
+
+    /// How many known books live under each root, for the folder list.
+    pub fn books_under(&self, root: &Path) -> usize {
+        let root = normalize_root(root);
+        self.books.iter().filter(|b| b.path.starts_with(&root)).count()
+    }
+
     pub fn get(&self, id: u64) -> Option<&BookRecord> {
         self.books.iter().find(|b| b.id == id)
     }
@@ -474,6 +556,105 @@ pub fn decode_to_color_image(bytes: &[u8], max_dim: u32) -> Option<egui::ColorIm
 
 #[cfg(test)]
 mod tests {
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ts-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The GUI could rescan and could not ADD, so a fresh install scanned nothing, said
+    /// "0 added", and the only way forward was `shelfctl scan` in a terminal.
+    #[test]
+    fn a_folder_can_be_added_and_removed_without_losing_the_books() {
+        let root = scratch("add");
+        let mut lib = Library::default();
+        assert!(lib.scan_roots.is_empty());
+
+        let added = lib.add_root(&root).expect("a real directory");
+        assert_eq!(lib.scan_roots.len(), 1);
+        assert_eq!(added, root.canonicalize().unwrap());
+
+        // Adding it twice is not alarming: the folder IS in the library, which is what was
+        // wanted.
+        assert_eq!(lib.add_root(&root), Err(AddRootError::AlreadyAdded));
+        assert_eq!(lib.scan_roots.len(), 1);
+
+        // Removing says "stop looking here", not "forget what I have read".
+        lib.books.push(BookRecord {
+            id: 1,
+            path: root.join("a.epub"),
+            format: Format::Epub,
+            title: "A".into(),
+            authors: Vec::new(),
+            series: None,
+            year: None,
+            language: None,
+            publisher: None,
+            isbn: None,
+            description: None,
+            tags: Vec::new(),
+            file_size: 1,
+            added_unix: 0,
+            cover_file: None,
+            last_open_unix: None,
+            position: Locus::START,
+            raster_page: 0,
+            percent: 0.0,
+            finished: false,
+            rating: 0,
+        });
+        assert_eq!(lib.books_under(&root), 1);
+        assert!(lib.remove_root(&root));
+        assert!(lib.scan_roots.is_empty());
+        assert_eq!(lib.books.len(), 1, "removing a folder threw away its books");
+        assert!(!lib.remove_root(&root), "removing what is not there is not a change");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A root inside another root finds every book twice — two records for one file, which
+    /// then diverge as you read, because progress lives on the record.
+    #[test]
+    fn nested_roots_are_refused_in_both_directions() {
+        let parent = scratch("nest");
+        let child = parent.join("sub");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let mut lib = Library::default();
+        lib.add_root(&parent).unwrap();
+        match lib.add_root(&child) {
+            Err(AddRootError::InsideExisting(p)) => assert_eq!(p, parent.canonicalize().unwrap()),
+            other => panic!("a nested folder was accepted: {other:?}"),
+        }
+        assert_eq!(lib.scan_roots.len(), 1);
+
+        // And the other way round: adding the parent of an existing root offers the swap
+        // rather than silently double-scanning.
+        let mut lib = Library::default();
+        lib.add_root(&child).unwrap();
+        match lib.add_root(&parent) {
+            Err(AddRootError::ContainsExisting(p)) => assert_eq!(p, child.canonicalize().unwrap()),
+            other => panic!("a containing folder was accepted: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// The messages the UI needs are distinguishable states, not one error string.
+    #[test]
+    fn a_missing_path_and_a_file_are_different_answers() {
+        let mut lib = Library::default();
+        assert_eq!(lib.add_root(Path::new("/definitely/not/here")), Err(AddRootError::Missing));
+
+        let dir = scratch("file");
+        let f = dir.join("book.epub");
+        std::fs::write(&f, b"x").unwrap();
+        assert_eq!(lib.add_root(&f), Err(AddRootError::NotADirectory));
+        assert!(lib.scan_roots.is_empty(), "a failed add must not leave a root behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
 
     fn rec(title: &str, author: &str, pct: f32) -> BookRecord {

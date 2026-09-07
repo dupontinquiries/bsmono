@@ -111,6 +111,8 @@ struct TomeApp {
     shelf_sel: ShelfSel,
     sort_key: SortKey,
     library_query: String,
+    /// The folder being typed in Settings > Library folders.
+    new_root: String,
 
     command_palette_open: bool,
     command_query: String,
@@ -207,6 +209,7 @@ impl TomeApp {
             shelf_sel: ShelfSel::All,
             sort_key: SortKey::RecentlyRead,
             library_query: String::new(),
+            new_root: String::new(),
 
             command_palette_open: false,
             command_query: String::new(),
@@ -762,6 +765,80 @@ impl TomeApp {
 
     fn draw_settings_screen(&mut self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // LIBRARY FOLDERS. `Rescan library` walks `scan_roots`, and there was no way to
+            // put anything in that list from the GUI — so a fresh install scanned nothing,
+            // reported "0 added", and the only way forward was `shelfctl scan <dir>` in a
+            // terminal. A graphical reader that needs a command line before it can show you
+            // a book is not finished.
+            ui.label(egui::RichText::new("Library folders").strong());
+            let mut removed: Option<std::path::PathBuf> = None;
+            if self.library.scan_roots.is_empty() {
+                ui.colored_label(colors.text_weak, "No folders yet — add one below, then Scan.");
+            }
+            for root in self.library.scan_roots.clone() {
+                ui.horizontal(|ui| {
+                    if ui.small_button("Remove").clicked() {
+                        removed = Some(root.clone());
+                    }
+                    // The count is what tells you a folder is the one you meant, before you
+                    // scan it and find out.
+                    ui.label(format!("{}  ({} books)", root.display(), self.library.books_under(&root)));
+                });
+            }
+            if let Some(r) = removed {
+                self.library.remove_root(&r);
+                let _ = tomescope::persist::save_library(&self.library);
+                // Said explicitly, because "remove" is the word people expect to delete
+                // things and this one does not.
+                self.toasts.info("Folder removed. Its books stay in the library.".to_string(), now());
+            }
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.new_root)
+                    .id_salt("settings-new-root")
+                    .desired_width(320.0)
+                    .hint_text("/home/you/Books"));
+                if ui.button("Add folder").clicked() {
+                    let path = std::path::PathBuf::from(self.new_root.trim());
+                    match self.library.add_root(&path) {
+                        Ok(p) => {
+                            self.new_root.clear();
+                            let report = self.library.scan(&tomescope::persist::covers_dir());
+                            let _ = tomescope::persist::save_library(&self.library);
+                            self.toasts.success(
+                                format!("{}: {} added, {} updated", p.display(), report.added, report.updated),
+                                now(),
+                            );
+                        }
+                        Err(e) => {
+                            use tomescope::library::AddRootError as E;
+                            // Each case says what to DO, not just what went wrong.
+                            let msg = match e {
+                                E::Missing => "No such folder.".to_string(),
+                                E::NotADirectory => "That is a file, not a folder.".to_string(),
+                                E::AlreadyAdded => "Already in the library.".to_string(),
+                                E::InsideExisting(p) => format!(
+                                    "Already covered by {} — scanning both would find every book twice.",
+                                    p.display()
+                                ),
+                                E::ContainsExisting(p) => format!(
+                                    "Contains {}, which is already a folder. Remove that one first.",
+                                    p.display()
+                                ),
+                            };
+                            self.toasts.info(msg, now());
+                        }
+                    }
+                }
+                if ui.button("Scan now").clicked() {
+                    let report = self.library.scan(&tomescope::persist::covers_dir());
+                    let _ = tomescope::persist::save_library(&self.library);
+                    self.toasts.success(
+                        format!("Scan complete: {} added, {} updated", report.added, report.updated),
+                        now(),
+                    );
+                }
+            });
+            ui.separator();
             let mut typo_changed = tomescope::settingsui::draw_typography_settings(ui, &mut self.typography, colors);
             typo_changed |= tomescope::settingsui::draw_theme_picker(ui, &mut self.reader_prefs, colors);
             typo_changed |= tomescope::settingsui::draw_palette_picker(ui, &mut self.app_palette, colors);
