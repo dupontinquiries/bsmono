@@ -44,6 +44,13 @@ pub struct SwipeState {
     /// the UNNUDGED decode so this tick's nudges cannot influence the
     /// candidates that produced them.
     pub nudges: crate::nudge::Nudges,
+    /// The last completed gesture's shape: press, release, path length, elapsed ms.
+    ///
+    /// Kept because a gesture can MEAN something other than a word — the top-edge digit and
+    /// the minimize fling are decided from the same path this already tracks, and a second
+    /// pointer-tracker beside this one would see a slightly different path and disagree
+    /// with it about where the finger went. Cleared once read.
+    finished: Option<(egui::Pos2, egui::Pos2, f32, u64)>,
 }
 
 impl Default for SwipeState {
@@ -55,6 +62,7 @@ impl Default for SwipeState {
 impl SwipeState {
     pub fn new() -> SwipeState {
         SwipeState {
+            finished: None,
             path: Vec::new(),
             active: false,
             candidates: Vec::new(),
@@ -121,6 +129,12 @@ impl SwipeState {
 
     /// Feed one frame of pointer state. Returns the decoded candidates when a swipe has just
     /// ENDED this frame (so the caller can commit or show them), `None` otherwise.
+    /// The last completed gesture's shape, once. See the field's note on why this lives
+    /// here rather than in a second tracker.
+    pub fn take_finished(&mut self) -> Option<(egui::Pos2, egui::Pos2, f32, u64)> {
+        self.finished.take()
+    }
+
     pub fn update(
         &mut self,
         ui: &Ui,
@@ -163,6 +177,19 @@ impl SwipeState {
             return None;
         }
         self.active = false;
+        if let (Some(a), Some(b)) = (self.path.first(), self.path.last()) {
+            let len: f64 = self
+                .path
+                .windows(2)
+                .map(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y))
+                .sum();
+            self.finished = Some((
+                egui::pos2(a.x as f32, a.y as f32),
+                egui::pos2(b.x as f32, b.y as f32),
+                len as f32,
+                (time - self.start_ms).max(0.0) as u64,
+            ));
+        }
         let travelled: f64 = self
             .path
             .windows(2)

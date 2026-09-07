@@ -27,6 +27,8 @@ pub mod mic_source;
 pub mod tray;
 /// One-handed compaction: anchor the board to a corner and narrow it.
 pub mod halfboard;
+/// The two gestures on the top edge: the digit up-arc and the minimize fling.
+pub mod topedge;
 /// Full / Tray / Dismissed and every way between them (`docs/single-hand-mode.md`).
 pub mod visible_mode;
 pub mod microterm;

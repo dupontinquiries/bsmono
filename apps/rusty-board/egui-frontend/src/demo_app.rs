@@ -971,11 +971,47 @@ impl Feel {
                         Some(r) => r,
                         None => self.board.current(),
                     };
+                    let mut top_edge = None;
+                    // THE TOP EDGE, before the swipe is read as a word. `single-hand-mode.md`
+                    // §5/§6 put a digit arc and a minimize fling on the same edge, and its
+                    // tie-break is explicit: prefer the digit, because losing your keyboard
+                    // while reaching for `3` is destructive and a stray digit is one
+                    // backspace. `topedge` holds that rule; this supplies the geometry.
+                    if let Some((press, release, len, ms)) = self.swipe.take_finished() {
+                        let m = crate::topedge::Metrics {
+                            top_y: board_rect.top(),
+                            row_h: adaptive.min_touch_target,
+                            screen_top_y: ctx.screen_rect().top(),
+                        };
+                        // Which top-row column the press landed in, by POSITION — the doc's
+                        // rule, so QWERTY and Dvorak need no per-layout digit table.
+                        let col = render.rows.first().and_then(|row| {
+                            if !board_rect.contains(press) || press.y > board_rect.top() + adaptive.min_touch_target {
+                                return None;
+                            }
+                            let n = row.keys.len().max(1);
+                            let frac = ((press.x - board_rect.left()) / board_rect.width()).clamp(0.0, 0.999);
+                            Some((frac * n as f32) as usize)
+                        });
+                        // Decided here, ACTED ON below: `render` borrows `self.board`, and
+                        // emitting text needs `&mut self`. Deciding first and acting after
+                        // the borrow ends keeps both without a clone of the layout.
+                        top_edge = Some(crate::topedge::classify(press, release, len, ms, col, m));
+                    }
                     if self.swipe.update(ui, render, board_rect, &adaptive).is_some() {
                         // A completed swipe suppresses nothing: the candidates appear above and
                         // the user picks. Committing automatically would fight the tap that the
                         // same gesture's lift also produces on some touch stacks.
                         ctx.request_repaint();
+                    }
+                    match top_edge {
+                        Some(crate::topedge::TopEdge::Digit(d)) => self.emit_text(&d.to_string()),
+                        Some(crate::topedge::TopEdge::Minimize) => {
+                            let _ = self.vis.fling_up();
+                            self.tray_open =
+                                self.vis.mode() == crate::visible_mode::VisibleMode::Tray;
+                        }
+                        _ => {}
                     }
                     if self.swipe.is_active() {
                         let colors = uikit_egui::palette_colors(self.board.palette());
