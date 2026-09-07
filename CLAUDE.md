@@ -137,6 +137,32 @@ Run the mutation sweep before trusting a refactor.
   one: YouTube's `n`-parameter throttling drops throughput to ~50 KB/s and
   presents as buffering, not an error.
 
+## Integrating into a monorepo
+
+This ships as a git bundle with real history, so it fetches like a remote:
+
+```sh
+git remote add vidkit /path/to/vidkit.bundle
+git fetch vidkit
+git subtree add --prefix=crates/vidkit vidkit main --squash
+```
+
+**The root `Cargo.toml` here declares a workspace.** Nesting it inside another
+workspace makes cargo fail with "workspace member found in multiple
+workspaces". Two ways out, pick one:
+
+- Add the subtree path to the outer workspace's `[workspace] exclude`, keeping
+  this an independent workspace that builds on its own. Simplest, but the
+  crates do not share the outer lockfile or target dir.
+- Delete this root `Cargo.toml` after merging and add
+  `crates/vidkit/crates/*` to the outer `[workspace] members`. Better build
+  times and one lockfile; the pins below have to move to the outer manifest.
+
+`Cargo.lock` is committed on purpose. `ash` and `naga` pull `indexmap 2.14`,
+which is edition2024 and unparseable by rustc 1.75; `indexmap = "=2.2.6"` and
+`hashbrown = "=0.14.5"` are pinned in `vidkit-vk/Cargo.toml` to hold it back.
+If your toolchain is newer, drop the pins and regenerate.
+
 ## Not built
 
 Fragmented MP4 (`moof`), edit lists, audio track extraction from either
