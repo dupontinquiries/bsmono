@@ -127,3 +127,67 @@ The FSR SDK is MIT. A port of the RCAS kernel is a derivative of MIT-licensed so
 carries AMD's copyright notice; `rcas.rs` names the origin in its module docs. If more of
 `ffx_fsr1.h` is ported (EASU), the same applies and the notice should be made explicit in the
 crate's licence file rather than only in a doc comment.
+
+
+---
+
+# Cross-worker reuse (`d2x-core/src/xref.rs`)
+
+Separate from the FSR work above, and prompted by the same question: where else is this
+pipeline doing work it has already done?
+
+## What already worked
+
+A `-j N` run splits at keyframes, one worker per segment. Two kinds of reuse existed:
+
+* the **reference ring**, per worker — near-matches, accepted by the quality gate on a
+  bounded SSE, confined to that worker's own frames;
+* the **`BlockCache`**, already shared across workers — but **exact bytes only**.
+
+So cross-worker reuse existed and could only fire on an exact repeat.
+
+## The gap
+
+Video repeats *approximately* far more often than exactly: a cut back to the same shot, a
+character against the same wall two minutes later, a slow pan revisiting scenery. Each is a
+near-match the ring would happily take and cannot, because it lives in another segment. On a
+`-j 8` dialogue scene the same two shoulders get upscaled eight times.
+
+## The design, and the one safety argument that matters
+
+`Xref` is keyed by a coarse fingerprint of the low-res cell — 4×4 block luma means quantised
+to 5 bits. **The fingerprint's only job is to make the candidate list short.** The existing
+SSE budget, the same number the reference ring is tested against, decides whether a candidate
+may be used.
+
+That ordering is the safety argument. The gate remains the sole authority, so a cross-worker
+hit is exactly as good as an in-worker one by the measure the user set with `--quality`. This
+cannot make output worse than the gate permits; it can only find more places the gate says
+yes. A fingerprint collision costs one bounded comparison and is rejected.
+
+Deliberately NOT a perceptual hash with its own similarity threshold: a second similarity
+measure that disagreed with the gate would be a second policy, and the failure mode would be
+a block the gate would have rejected being served because something else called it close
+enough.
+
+Entries store the low-res cell as well as the upscaled block, because the gate has to compare
+against something — an upscaled-only store could not verify anything and would be back to
+trusting the hash. At `block=32, bleed=4, scale=2` that is ~4.8 kB in and ~12 kB out per
+entry, so 256 MB holds roughly fifteen thousand distinct cells.
+
+Two bounds, each with a test: FIFO eviction under the byte budget (as `BlockCache`), and a
+per-fingerprint cap, because a flat fingerprint — sky, letterbox, a fade — would otherwise
+collect thousands of near-identical cells and make every lookup against it walk the lot. The
+gate would still be correct; the run would just be slower than not caching at all.
+
+`Stats` counts hits, gate rejections, empty buckets, evictions and **comparisons**, because
+without the cost side the feature is unfalsifiable: more memory, and no way to say what it
+bought. A high compared-to-hits ratio means the fingerprint is too coarse for that content.
+
+## Status
+
+`cfg.xref_bytes` exists and defaults to 0 (off). The store is written and tested; the
+pipeline does not consult it yet, and there is no CLI flag. Wiring is the next step, and the
+number to report afterwards is the one `analyze` already prints — the fraction of pixels
+going through the network — measured on a source with real repeats (a dialogue scene, a
+title sequence) at `-j 1` versus `-j 8`.

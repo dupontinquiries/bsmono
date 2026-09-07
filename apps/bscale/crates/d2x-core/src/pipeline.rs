@@ -86,6 +86,15 @@ pub struct PipelineConfig {
     /// Byte budget of the content-keyed block cache (0 = off). Shared
     /// across segment workers when `run_tiered` is given one.
     pub block_cache_bytes: u64,
+    /// Byte budget of the CROSS-WORKER near-match store (0 = off), shared with the block
+    /// cache across segment workers.
+    ///
+    /// The block cache above is exact-match: a cell whose bytes were upscaled before. This
+    /// one is keyed by a coarse fingerprint and decided by the SAME SSE budget the reference
+    /// ring uses — so a cut back to a shot another segment already rendered can be reused
+    /// even though nothing matches byte for byte. See `crate::xref` for why the fingerprint
+    /// is never allowed to be the authority.
+    pub xref_bytes: u64,
     /// Frames per plate window (0 = no plate). Stage A holds a whole window
     /// before analysing its first frame, so this costs `window · frame`
     /// bytes of RAM and one window of latency; a window also ends early at
@@ -114,6 +123,7 @@ impl Default for PipelineConfig {
             batch: 4,
             tiers: 1,
             block_cache_bytes: 0,
+            xref_bytes: 0,
             plate_window: 0,
             plate_min_confidence: 0.2,
             mv_seed: false,

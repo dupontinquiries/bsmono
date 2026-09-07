@@ -40,6 +40,8 @@ pub mod predict;
 pub mod quality;
 /// Robust Contrast-Adaptive Sharpening, ported from AMD's FSR SDK (see `rcas`).
 pub mod rcas;
+/// Cross-worker near-match reuse: one segment reusing a block another already upscaled.
+pub mod xref;
 pub mod registry;
 pub mod residual;
 pub mod st;
