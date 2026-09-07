@@ -1,0 +1,17 @@
+[package]
+name = "vidkit-egui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "egui front end for vidkit: a Presenter on an egui texture, and a letterboxed video surface with uikit-egui chrome."
+
+[dependencies]
+vidkit-core = { path = "../vidkit-core" }
+egui = "0.34"
+
+# shared/uikit is a separate nested workspace; a path dependency across the two
+# is fine and is how the rest of this tree reaches its kits.
+uikit-egui = { path = "../../../uikit/crates/uikit-egui" }
+uikit-gesture = { path = "../../../uikit/crates/uikit-gesture" }
+snapclone-theme = { path = "../../../uikit/crates/snapclone-theme" }
