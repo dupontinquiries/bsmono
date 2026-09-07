@@ -1,0 +1,11 @@
+[package]
+name = "haptic-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Vibration-pattern playback for a Linux vibrator motor, pure pattern math plus a thin sysfs I/O layer (same shape as light_kit_bridge: /sys/class/leds/*, discovered by name at runtime rather than a hardcoded per-device path). The non-visual feedback channel a screen-off shell needs — a notification landing, a voiced::Scope::Always intent firing, has no way to confirm receipt without one."
+
+[lib]
+name = "haptic_kit"
+path = "src/lib.rs"
+
+[dependencies]
