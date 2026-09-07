@@ -38,6 +38,8 @@ pub mod plan;
 pub mod plate;
 pub mod predict;
 pub mod quality;
+/// Robust Contrast-Adaptive Sharpening, ported from AMD's FSR SDK (see `rcas`).
+pub mod rcas;
 pub mod registry;
 pub mod residual;
 pub mod st;
