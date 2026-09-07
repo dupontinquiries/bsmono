@@ -137,38 +137,30 @@ Run the mutation sweep before trusting a refactor.
   one: YouTube's `n`-parameter throttling drops throughput to ~50 KB/s and
   presents as buffering, not an error.
 
-## Integrating into a monorepo
+## Where this sits in the monorepo
 
-This ships as a git bundle with real history, so it fetches like a remote:
+`shared/vidkit`, a nested workspace, which is the house pattern — there is no
+root cargo workspace in this tree (`LAYOUT.md`: "nested workspaces + C++/cmake
+can't be one"), and `shared/uikit` is laid out the same way. Nothing had to be
+excluded or flattened.
+
+Build it the house way, one crate at a time:
 
 ```sh
-git remote add vidkit /path/to/vidkit.bundle
-git fetch vidkit
-git subtree add --prefix=crates/vidkit vidkit main --squash
+CARGO_TARGET_DIR=/tmp/bd CARGO_BUILD_JOBS=1 \
+  maintenance/tools/cargo-ailite check
 ```
 
-**The root `Cargo.toml` here declares a workspace**, so how it lands depends on
-how the outer one lists its members. All three cases below were tried against a
-stand-in monorepo, not reasoned about:
+**Toolchain.** This tree wants rustc >= 1.91; `shared/uikit`'s `Cargo.lock` is
+lockfile v4, which cargo 1.75 cannot even parse. Ubuntu packages 1.91
+(`apt-get install rustc-1.91 cargo-1.91`, then prepend
+`/usr/lib/rust-1.91/bin` to `PATH`) which is enough for everything here
+including `uikit-egui` — egui 0.34 declares MSRV 1.92 but builds clean on 1.91
+with `--ignore-rust-version`, as `manifest/projects.toml` already records for
+aperture. Verified, not assumed.
 
-- Outer `members` names paths explicitly (`["crates/eguikit", ...]`) —
-  **works as-is**, no change needed. The nested workspace is simply not
-  referenced. It builds on its own from inside `crates/vidkit`.
-- Outer `members` uses a glob (`["crates/*"]`) — **fails** with
-  `multiple workspace roots found in the same workspace`. Fix by adding
-  `exclude = ["crates/vidkit"]` alongside the glob. Verified.
-- Flattening into one workspace — delete this root `Cargo.toml`, add
-  `"crates/vidkit/crates/*"` to the outer `members`, and copy the
-  `[workspace.package]` block (version/edition/rust-version/license) into the
-  outer manifest, because the crates here inherit those with
-  `version.workspace = true`. Without that block cargo errors on the missing
-  inherited keys. Verified. One lockfile and one target dir; the dependency
-  pins travel with `vidkit-vk/Cargo.toml` and keep working.
-
-`Cargo.lock` is committed on purpose. `ash` and `naga` pull `indexmap 2.14`,
-which is edition2024 and unparseable by rustc 1.75; `indexmap = "=2.2.6"` and
-`hashbrown = "=0.14.5"` are pinned in `vidkit-vk/Cargo.toml` to hold it back.
-If your toolchain is newer, drop the pins and regenerate.
+`Cargo.lock` is committed, as everywhere in this tree — see
+`maintenance/tools/lock_check.py` for why a stale one is worse than none.
 
 ## Not built
 

@@ -9,7 +9,3 @@ license.workspace = true
 vidkit-core = { path = "../vidkit-core" }
 ash = "=0.37.3"
 naga = { version = "=0.19.2", features = ["wgsl-in", "spv-out"] }
-
-# Pinned below the edition2024 cutover; rustc 1.75 cannot parse those manifests.
-indexmap = "=2.2.6"
-hashbrown = "=0.14.5"
