@@ -131,6 +131,8 @@ pub mod strata;
 pub mod quarry;
 /// Vertical access: stairs cut into cliffs, switchbacks, shafts, terraces.
 pub mod access;
+/// Reachability: can a walking body actually get there?
+pub mod reach;
 /// The review loop: elevations and measurements to the model, a ten-token verdict back.
 pub mod review;
 /// Context under a budget: the conversation chain, folding into summaries, grouped plans.

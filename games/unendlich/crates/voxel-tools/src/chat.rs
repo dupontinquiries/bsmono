@@ -636,6 +636,28 @@ impl ChatSession {
             if let Some(feet) = player_feet {
                 if let Some(f) = critique::entombs_player(&placed, feet) { findings.push(f); }
             }
+            // REACHABILITY. A build's doors must open onto somewhere a
+            // body can stand, and the player must be able to walk to
+            // it. Every feature in this crate implicitly promises this
+            // and nothing checked it: a village on a canyon rim with no
+            // path down is six correct buildings and one wrong place.
+            if !placed.is_empty() && placed.len() < 400_000 {
+                let lo = placed.iter().fold((i32::MAX, i32::MAX, i32::MAX),
+                    |a, p| (a.0.min(p.0), a.1.min(p.1), a.2.min(p.2)));
+                let hi = placed.iter().fold((i32::MIN, i32::MIN, i32::MIN),
+                    |a, p| (a.0.max(p.0), a.1.max(p.1), a.2.max(p.2)));
+                // from outside the build, at the player's feet if known
+                let outside = player_feet.unwrap_or((lo.0 - 4, hi.1 + 1, lo.2 - 4));
+                let body = crate::reach::Body { budget: 40_000, ..Default::default() };
+                let (bad, total) = crate::reach::unreachable_doors(tools.world, lo, hi, outside, &body);
+                if !bad.is_empty() {
+                    findings.push(critique::Finding {
+                        kind: "unreachable",
+                        message: format!("{} of {total} opening(s) cannot be walked to", bad.len()),
+                        at: bad[0],
+                    });
+                }
+            }
             let ids: Vec<u64> = tools.edits[first..].iter().map(|e| e.id).collect();
             for id in ids.into_iter().rev() { tools.undo_edit(id); }
             (live, placed, findings)
