@@ -24,12 +24,17 @@
 //! round trip against `cosmic-comp` is not verified.
 
 use crate::idle::{IdleEvent, IdleTracker};
+use crate::layer::{KeyboardInteractivity, Layer, LayerEvent, LayerSurfaceIntent, LayerSurfaceState};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
-use wayland_client::protocol::{wl_registry, wl_seat::WlSeat};
+use wayland_client::protocol::{wl_compositor::WlCompositor, wl_registry, wl_seat::WlSeat, wl_surface::WlSurface};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notification_v1::{self, ExtIdleNotificationV1},
     ext_idle_notifier_v1::ExtIdleNotifierV1,
+};
+use wayland_protocols_wlr::layer_shell::v1::client::{
+    zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
+    zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
 };
 
 /// App state for the idle-notify connection. The threshold name is carried
@@ -169,5 +174,184 @@ impl IdleSession {
     /// a wayland-client app to silently do nothing.
     pub fn flush(&self) -> Result<(), String> {
         self.conn.flush().map_err(|e| e.to_string())
+    }
+}
+
+struct LayerIoState {
+    state: LayerSurfaceState,
+}
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for LayerIoState {
+    fn event(_: &mut Self, _: &wl_registry::WlRegistry, _: wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<WlCompositor, ()> for LayerIoState {
+    fn event(_: &mut Self, _: &WlCompositor, _: wayland_client::protocol::wl_compositor::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        // wl_compositor has no events — a factory for surfaces/regions only.
+    }
+}
+
+impl Dispatch<WlSurface, ()> for LayerIoState {
+    fn event(_: &mut Self, _: &WlSurface, _: wayland_client::protocol::wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        // `enter`/`leave` (which output the surface is on) aren't tracked
+        // here — out of scope for "get a surface configured and on
+        // screen", which is as far as this crate's job extends. A caller
+        // that needs per-output scale/placement awareness handles that
+        // itself, same boundary `hatch`'s adaptive.rs work drew between
+        // "the kit provides the primitive" and "the app decides policy".
+    }
+}
+
+impl Dispatch<ZwlrLayerShellV1, ()> for LayerIoState {
+    fn event(_: &mut Self, _: &ZwlrLayerShellV1, _: zwlr_layer_shell_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        // The shell global is a factory only (`get_layer_surface`) — no events.
+    }
+}
+
+impl Dispatch<ZwlrLayerSurfaceV1, ()> for LayerIoState {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let mapped = match event {
+            zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
+                Some(LayerEvent::Configure { serial, width, height })
+            }
+            zwlr_layer_surface_v1::Event::Closed => Some(LayerEvent::Closed),
+            _ => None,
+        };
+        if let Some(ev) = mapped {
+            // Acked HERE, immediately, rather than handed back to the
+            // caller to remember — `layer.rs`'s own header explains why
+            // this is the one thing this protocol punishes silently
+            // (surface never quite appears, no error) rather than loudly.
+            // A caller that wants to know a configure happened (to resize
+            // its own render target, say) still can — `state.state` is
+            // readable via `LayerSurface::configured_size()` below.
+            if let Some(serial) = state.state.apply(ev) {
+                proxy.ack_configure(serial);
+            }
+        }
+    }
+}
+
+/// A layer-shell surface, connected and live. Rendering/buffer-attach is
+/// deliberately NOT this crate's job — `wl_surface`, `wl_buffer`, and
+/// actually drawing something belong to whatever egui/uikit backend sits
+/// on top; this hands back the raw `WlSurface` so that backend can attach
+/// to it, and otherwise only handles the layer-shell protocol's own
+/// configure/ack/closed bookkeeping.
+pub struct LayerSurface {
+    conn: Connection,
+    queue: EventQueue<LayerIoState>,
+    io_state: LayerIoState,
+    surface: WlSurface,
+    layer_surface: ZwlrLayerSurfaceV1,
+}
+
+impl LayerSurface {
+    /// Connects, binds `wl_compositor` + `zwlr_layer_shell_v1`, creates a
+    /// surface, and requests it per `intent`. The surface is not yet
+    /// configured when this returns — call `poll()` at least once (and
+    /// generally every frame) before assuming `configured_size()` is
+    /// `Some`; a compositor sends the first `configure` asynchronously,
+    /// not as part of surface creation itself.
+    pub fn connect(intent: LayerSurfaceIntent, namespace: &str) -> Result<Self, ConnectError> {
+        let conn = Connection::connect_to_env().map_err(|e| ConnectError::NoDisplay(e.to_string()))?;
+        let (globals, queue) = registry_queue_init::<LayerIoState>(&conn)
+            .map_err(|e| ConnectError::NoDisplay(e.to_string()))?;
+        let qh = queue.handle();
+
+        let compositor: WlCompositor =
+            globals.bind(&qh, 1..=6, ()).map_err(|_| ConnectError::MissingGlobal("wl_compositor"))?;
+        let shell: ZwlrLayerShellV1 =
+            globals.bind(&qh, 1..=4, ()).map_err(|_| ConnectError::MissingGlobal("zwlr_layer_shell_v1"))?;
+
+        let surface = compositor.create_surface(&qh, ());
+        let wire_layer = match intent.layer {
+            Layer::Background => zwlr_layer_shell_v1::Layer::Background,
+            Layer::Bottom => zwlr_layer_shell_v1::Layer::Bottom,
+            Layer::Top => zwlr_layer_shell_v1::Layer::Top,
+            Layer::Overlay => zwlr_layer_shell_v1::Layer::Overlay,
+        };
+        let layer_surface = shell.get_layer_surface(&surface, None, wire_layer, namespace.to_string(), &qh, ());
+
+        let mut wire_anchor = zwlr_layer_surface_v1::Anchor::empty();
+        if intent.anchor.top {
+            wire_anchor |= zwlr_layer_surface_v1::Anchor::Top;
+        }
+        if intent.anchor.bottom {
+            wire_anchor |= zwlr_layer_surface_v1::Anchor::Bottom;
+        }
+        if intent.anchor.left {
+            wire_anchor |= zwlr_layer_surface_v1::Anchor::Left;
+        }
+        if intent.anchor.right {
+            wire_anchor |= zwlr_layer_surface_v1::Anchor::Right;
+        }
+        layer_surface.set_anchor(wire_anchor);
+        layer_surface.set_size(intent.size.0, intent.size.1);
+        layer_surface.set_exclusive_zone(intent.exclusive_zone);
+        layer_surface.set_keyboard_interactivity(match intent.keyboard_interactivity {
+            KeyboardInteractivity::None => zwlr_layer_surface_v1::KeyboardInteractivity::None,
+            KeyboardInteractivity::Exclusive => zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive,
+            KeyboardInteractivity::OnDemand => zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand,
+        });
+        // The initial commit with no buffer attached is what actually asks
+        // the compositor to configure this surface — set_* requests alone
+        // are buffered client-side until a commit sends them.
+        surface.commit();
+        conn.flush().map_err(|e| ConnectError::NoDisplay(e.to_string()))?;
+
+        Ok(LayerSurface {
+            conn,
+            queue,
+            io_state: LayerIoState { state: LayerSurfaceState::new() },
+            surface,
+            layer_surface,
+        })
+    }
+
+    /// Non-blocking, same contract as `IdleSession::poll` — call once per
+    /// frame rather than blocking on the compositor's next event.
+    pub fn poll(&mut self) -> LayerSurfaceState {
+        let _ = self.queue.dispatch_pending(&mut self.io_state);
+        self.io_state.state
+    }
+
+    pub fn configured_size(&self) -> Option<(u32, u32)> {
+        self.io_state.state.configured_size
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.io_state.state.closed
+    }
+
+    /// The raw surface, for whatever rendering backend attaches buffers to
+    /// it. Deliberately not wrapped further — see this struct's own header.
+    pub fn wl_surface(&self) -> &WlSurface {
+        &self.surface
+    }
+
+    pub fn flush(&self) -> Result<(), String> {
+        self.conn.flush().map_err(|e| e.to_string())
+    }
+}
+
+impl Drop for LayerSurface {
+    fn drop(&mut self) {
+        // Explicit destroy rather than relying on the connection closing:
+        // per the protocol's own description, a well-behaved client
+        // destroys the layer surface before the underlying wl_surface, and
+        // relying on socket teardown to do this implicitly risks a
+        // compositor briefly seeing a surface with no role before it
+        // notices the connection is gone.
+        self.layer_surface.destroy();
+        self.surface.destroy();
+        let _ = self.conn.flush();
     }
 }
