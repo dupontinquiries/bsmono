@@ -40,16 +40,24 @@ pass hollow the ribcage cut
   rel cavity above ground by=36
 end
 pass towers on the spine add
-  repeat tower line from=-50,38,0 to=50,38,0 step=14
+  repeat tower line from=-50,38,0 to=50,38,0 step=14 scale=1+sin(t*180)*0.6
 end
 pass town in the ribs add
-  repeat hut grid min=-40,20,-14 max=40,20,14 step=11
+  repeat hut grid min=-40,20,-14 max=40,20,14 step=11 on_ground jitter=3 seed=5 scale=1+t*0.4
 end
 ";
     let t0 = Instant::now();
     let (p, errs) = program::parse(src);
     if !errs.is_empty() { for e in &errs { println!("ERR {e}"); } }
-    let r = program::run(&p, (0, 20, 0));
+    struct G;
+    impl voxel_tools::VoxelWorld for G {
+        fn get(&self, x: i32, y: i32, z: i32) -> u16 {
+            let h = 20 + ((x as f32/28.0).sin()*4.0) as i32 + ((z as f32/20.0).cos()*3.0) as i32;
+            if y <= h { 1 } else { 0 }
+        }
+        fn set(&mut self, _: i32, _: i32, _: i32, _: u16) -> bool { false }
+    }
+    let r = program::run_in(&G, &p, (0, 20, 0));
     println!("== a city in a dragon skeleton");
     println!("   {} assets, {}", p.assets.len(), r.summary());
     println!("   built in {:.2}s", t0.elapsed().as_secs_f32());

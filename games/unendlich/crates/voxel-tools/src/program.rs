@@ -194,7 +194,7 @@ pub enum Source {
     /// `t` bound: `scale=1 + t*0.6` makes each copy larger than the
     /// last. That is the one thing generating code would genuinely buy,
     /// and it costs an expression evaluator rather than an interpreter.
-    Repeat { asset: String, rule: Repeat, vary: Vec<(String, String)> },
+    Repeat { asset: String, rule: Repeat, vary: Vec<(String, String)>, site: Site },
 }
 
 /// How an asset repeats. Positions are relative to the pass anchor.
@@ -249,7 +249,27 @@ impl Run {
 /// a doorway works, and the run reports how many cells a cut removed
 /// from its own accumulation versus from the world, because the
 /// difference is the difference between shaping a build and digging.
+/// Run without a world: positions are taken literally and nothing can
+/// consult the ground. Fine for an asset or a test, wrong for a build.
 pub fn run(prog: &Program, anchor: (i32, i32, i32)) -> Run {
+    run_in(&Void, prog, anchor)
+}
+
+/// A world where nothing exists, for `run`.
+struct Void;
+impl crate::VoxelWorld for Void {
+    fn get(&self, _: i32, _: i32, _: i32) -> u16 { 0 }
+    fn set(&mut self, _: i32, _: i32, _: i32, _: u16) -> bool { false }
+}
+
+/// Run against the WORLD, so repeats can sit on the ground and refuse
+/// the places that do not suit them.
+///
+/// Without this a town was a floating regular lattice: every hut at
+/// the same y whatever the terrain did, and evenly spaced whether or
+/// not there was anywhere to stand. Both of those read as generated,
+/// and both are fixed by letting a repeat ask the ground a question.
+pub fn run_in<W: crate::VoxelWorld>(w: &W, prog: &Program, anchor: (i32, i32, i32)) -> Run {
     let mut r = Run { notes: prog.notes.clone(), ..Default::default() };
     let assets: BTreeMap<&str, &Asset> = prog.assets.iter().map(|a| (a.name.as_str(), a)).collect();
     let mut solid: BTreeMap<(i32, i32, i32), u16> = BTreeMap::new();
@@ -286,11 +306,12 @@ pub fn run(prog: &Program, anchor: (i32, i32, i32)) -> Run {
                 at.iter().flat_map(|(p, turns)| a.stamp(
                     (anchor.0 + p.0, anchor.1 + p.1, anchor.2 + p.2), *turns)).collect()
             }
-            Source::Repeat { asset, rule, vary } => {
+            Source::Repeat { asset, rule, vary, site } => {
+                let site = *site;
                 let Some(a) = assets.get(asset.as_str()) else {
                     r.errors.push(format!("{}: no asset '{asset}'", pass.name)); continue;
                 };
-                let spots = places(rule, a);
+                let spots = places_in(w, rule, a, site, anchor);
                 let n = spots.len();
                 let mut out = Vec::new();
                 for (i, (p, t)) in spots.into_iter().enumerate() {
@@ -352,6 +373,72 @@ pub fn run(prog: &Program, anchor: (i32, i32, i32)) -> Run {
         .chain(cut.iter().filter(|c| !solid.contains_key(c)).map(|at| Change { at: *at, to: 0 }))
         .collect();
     r
+}
+
+/// What a repeat asks of the ground before it places anything.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Site {
+    /// Drop each copy onto the surface rather than using the given y.
+    pub on_ground: bool,
+    /// Reject a spot whose surface varies more than this across the
+    /// asset's footprint.
+    pub max_slope: Option<i32>,
+    /// Move each copy by up to this much, seeded: a town is not a grid.
+    pub jitter: i32,
+    pub seed: u64,
+}
+
+fn places_in<W: crate::VoxelWorld>(w: &W, rule: &Repeat, a: &Asset, site: Site,
+                                   anchor: (i32, i32, i32)) -> Vec<((i32, i32, i32), u8)> {
+    let raw = places(rule, a);
+    if !site.on_ground && site.max_slope.is_none() && site.jitter == 0 { return raw; }
+    let surface = |x: i32, z: i32| (0..=anchor.1 + 160).rev()
+        .find(|&y| w.get(x, y, z) != 0);
+    let mut out = Vec::new();
+    // The footprint an asset ACTUALLY occupies. `stamp` writes cells at
+    // `at + offset` for offset in 0..size, so an asset spans [at,
+    // at+size) -- it is not centred on its position. Sampling
+    // symmetrically around `at` tested a box offset from the building
+    // by half its width, and a hut was allowed to straddle a cliff
+    // edge its own front door hung over.
+    let (fw, fd) = (a.size.0.max(1), a.size.2.max(1));
+    for (i, (p, t)) in raw.into_iter().enumerate() {
+        // JITTER first, so the slope test judges where it will land
+        let mut p = p;
+        if site.jitter > 0 {
+            let h = |k: u64| {
+                let mut v = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ site.seed ^ k;
+                v ^= v >> 31; v = v.wrapping_mul(0x7FB5_D329_728E_A185); (v >> 33) as i32
+            };
+            let j = site.jitter;
+            p.0 += h(1) % (j * 2 + 1) - j;
+            p.2 += h(2) % (j * 2 + 1) - j;
+        }
+        let (wx, wz) = (anchor.0 + p.0, anchor.2 + p.2);
+        if let Some(max) = site.max_slope {
+            let mut lo = i32::MAX; let mut hi = i32::MIN;
+            let mut missing = false;
+            for dx in [0, fw / 2, fw - 1] { for dz in [0, fd / 2, fd - 1] {
+                match surface(wx + dx, wz + dz) { Some(y) => { lo = lo.min(y); hi = hi.max(y); }
+                                                  None => missing = true }
+            }}
+            if missing || hi - lo > max { continue; }
+        }
+        if site.on_ground {
+            // the LOWEST point under the footprint, so a building rests
+            // on the ground rather than having one corner buried
+            match (0..fw).step_by(fw.max(1) as usize / 2 + 1)
+                .flat_map(|dx| (0..fd).step_by(fd.max(1) as usize / 2 + 1).map(move |dz| (dx, dz)))
+                .filter_map(|(dx, dz)| surface(wx + dx, wz + dz)).min() {
+                // the asset's own base sits on the surface, so `at` is
+                // the surface plus one, in the anchor's frame
+                Some(y) => p.1 = y + 1 - anchor.1,
+                None => continue,
+            }
+        }
+        out.push((p, t));
+    }
+    out
 }
 
 fn places(rule: &Repeat, _a: &Asset) -> Vec<((i32, i32, i32), u8)> {
@@ -514,11 +601,12 @@ fn parse_asset_use(body: &str) -> Result<Source, String> {
     // success. A key that does nothing must never look like a key that
     // works.
     const KNOWN: &[&str] = &["from", "to", "step", "centre", "center", "radius", "r", "count",
-                             "min", "max", "at", "face_out", "scale", "lift", "rot"];
+                             "min", "max", "at", "face_out", "scale", "lift", "rot",
+                             "on_ground", "max_slope", "jitter", "seed"];
     let mut vary = Vec::new();
     for s in t.iter().skip(3) {
         let Some((k, v)) = s.split_once('=') else {
-            if *s == "face_out" { continue; }
+                if ["face_out", "on_ground"].contains(s) { continue; }
             return Err(format!("'{s}' is not a setting; write key=value"));
         };
         if !KNOWN.contains(&k) {
@@ -545,7 +633,13 @@ fn parse_asset_use(body: &str) -> Result<Source, String> {
         other => return Err(format!("unknown repeat rule '{}'; known: line, ring, grid, stack",
                                     other.unwrap_or("(none)"))),
     };
-    Ok(Source::Repeat { asset, rule, vary })
+    let site = Site {
+        on_ground: t.contains(&"on_ground") || kv("on_ground").is_some(),
+        max_slope: kv("max_slope").and_then(|v| v.parse().ok()),
+        jitter: num("jitter", 0).clamp(0, 64),
+        seed: num("seed", 1) as u64,
+    };
+    Ok(Source::Repeat { asset, rule, vary, site })
 }
 
 /// The prompt for the pass that decides POLARITY and ASSETS -- the
@@ -617,6 +711,8 @@ Write the assets and passes only.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::VoxelWorld;
 
     #[test]
     fn a_cut_pass_removes_what_an_add_pass_put_there() {
@@ -811,5 +907,80 @@ mod tests {
         // and it still built, at the default scale: a bad expression
         // costs its own effect, not the whole pass
         assert!(!r.changes.is_empty(), "the build survived a bad expression");
+    }
+
+    /// A hillside with a cliff in it: flat west, a slope, then a wall.
+    struct Land;
+    impl crate::VoxelWorld for Land {
+        fn get(&self, x: i32, y: i32, _z: i32) -> u16 {
+            let h = if x < 0 { 64 } else if x < 40 { 64 + x / 4 } else { 130 };
+            if y <= h { 1 } else { 0 }
+        }
+        fn set(&mut self, _: i32, _: i32, _: i32, _: u16) -> bool { false }
+    }
+
+    #[test]
+    fn a_repeat_can_sit_on_the_ground_instead_of_floating_at_one_height() {
+        let (prog, errs) = parse(
+            "asset hut\n  part w box w=3 h=3 d=3 material=oak_planks\nend\n\
+             pass town add\n  repeat hut line from=-30,0,0 to=30,0,0 step=10 on_ground\nend\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        let r = run_in(&Land, &prog, (0, 64, 0));
+        // the huts follow the hillside: several distinct heights
+        let ys: BTreeSet<i32> = r.changes.iter().map(|c| c.at.1).collect();
+        assert!(ys.len() > 6, "the town follows the ground: {} heights", ys.len());
+        // and none of them floats
+        for c in r.changes.iter().filter(|c| c.to != 0) {
+            let ground = (0..200).rev().find(|&y| Land.get(c.at.0, y, c.at.2) != 0).unwrap();
+            assert!(c.at.1 > ground - 1 && c.at.1 < ground + 12, "{:?} is not near its ground {ground}", c.at);
+        }
+        // without on_ground it is a flat lattice, which is what it was
+        let (flat, _) = parse(
+            "asset hut\n  part w box w=3 h=3 d=3 material=oak_planks\nend\n\
+             pass town add\n  repeat hut line from=-30,0,0 to=30,0,0 step=10\nend\n");
+        let f = run_in(&Land, &flat, (0, 64, 0));
+        let fys: BTreeSet<i32> = f.changes.iter().map(|c| c.at.1).collect();
+        assert!(fys.len() <= 4, "all at one height: {} -- the old behaviour", fys.len());
+    }
+
+    #[test]
+    fn a_repeat_refuses_the_places_that_do_not_suit_it() {
+        let (prog, _) = parse(
+            "asset hut\n  part w box w=5 h=3 d=5 material=oak_planks\nend\n\
+             pass town add\n  repeat hut line from=-40,0,0 to=60,0,0 step=4 on_ground max_slope=2\nend\n");
+        let r = run_in(&Land, &prog, (0, 64, 0));
+        assert!(!r.changes.is_empty(), "it did build where the ground suits it");
+        // The direct property: FEWER PLACEMENTS survive with the rule
+        // than without it, and the ones dropped are the ones whose own
+        // footprint spans the cliff. Counting placements is the honest
+        // measure -- inferring buildings back out of a cell list merges
+        // neighbours and measures the grouping heuristic instead.
+        let (loose, _) = parse(
+            "asset hut\n  part w box w=5 h=3 d=5 material=oak_planks\nend\n\
+             pass town add\n  repeat hut line from=-40,0,0 to=60,0,0 step=4 on_ground\nend\n");
+        let l = run_in(&Land, &loose, (0, 64, 0));
+        assert!(r.changes.len() < l.changes.len(),
+                "the rule rejected some: {} cells with it, {} without", r.changes.len(), l.changes.len());
+        // and every surviving hut sits within a few blocks of its own
+        // ground, which is what "suits it" means
+        for c in r.changes.iter().filter(|c| c.to != 0) {
+            let g = (0..200).rev().find(|&y| Land.get(c.at.0, y, c.at.2) != 0).unwrap();
+            assert!((c.at.1 - g).abs() < 8, "{:?} sits on ground {g}", c.at);
+        }
+    }
+
+    #[test]
+    fn jitter_makes_a_town_rather_than_a_lattice() {
+        let (prog, _) = parse(
+            "asset hut\n  part w box w=3 h=3 d=3 material=oak_planks\nend\n\
+             pass town add\n  repeat hut grid min=-30,0,-30 max=30,0,30 step=12 jitter=4 seed=7\nend\n");
+        let r = run_in(&Land, &prog, (0, 64, 0));
+        // the x positions are not all multiples of the step
+        let xs: BTreeSet<i32> = r.changes.iter().map(|c| c.at.0).collect();
+        assert!(xs.iter().any(|x| x.rem_euclid(12) != 0), "not a lattice: {:?}",
+                xs.iter().take(8).collect::<Vec<_>>());
+        // and it is deterministic
+        let again = run_in(&Land, &prog, (0, 64, 0));
+        assert_eq!(r.changes, again.changes, "same seed, same town");
     }
 }
