@@ -5,6 +5,15 @@ fn main() {
     // The armature, taken from dragon_forge's own skeleton(): spine from
     // tail to head, four legs, two wings. The city hangs on those bones.
     let src = "\
+frame bones
+  tailtip 0,26,-96
+  tail    0,30,-60
+  hips    0,38,-28
+  spine   0,44,0
+  chest   0,46,22
+  neck    0,52,44
+  head    0,58,64
+end
 asset tower
   part shaft cylinder r=3 h=14 material=stone
   part cap cone r=4 h=5 material=dark_oak_planks
@@ -15,35 +24,39 @@ asset hut
   part roof cone r=4 h=3 material=dark_oak_planks
   rel roof on walls
 end
-pass ribcage add
-  part spine spine r=5 r2=2 len=120 dir=0 arch=0.22 segments=14 material=stone
-  rel spine above ground by=34
+asset vertebra
+  part disc cylinder r=4 h=3 material=stone
 end
-pass skull add
-  part skull sphere r=11 material=stone hollow
-  part jaw capsule r=5 r2=3 len=18 dir=0 pitch=-14 material=stone
-  rel skull above ground by=52
-  rel jaw joint skull at=0.2 out=0.4
+asset rib
+  part bone spine r=2 r2=0.8 len=34 dir=90 arch=0.5 segments=8 material=stone
 end
-pass legs add
-  part fore capsule r=4 r2=2.5 len=40 dir=200 pitch=-72 material=stone
-  part hind capsule r=5 r2=3 len=44 dir=200 pitch=-76 material=stone
-  rel fore joint spine at=0.5 out=1.4 pair
-  rel hind joint spine at=0.5 out=1.6 pair
+pass the spine add
+  repeat vertebra along bones step=5 on_ground
 end
-pass ribs add
-  part rib spine r=2 r2=1 len=30 dir=90 arch=0.55 segments=8 material=stone
-  rel rib joint spine at=0.6 out=0.6 pair
+pass the ribs add
+  repeat rib along bones step=11
+end
+pass the skull add
+  part dome sphere r=13 material=stone hollow
+  part jaw capsule r=6 r2=3 len=22 dir=90 pitch=-16 material=stone
+  rel dome on head
+  rel jaw joint dome at=0.25 out=0.5
+end
+pass the legs add
+  part fore capsule r=4 r2=2.5 len=34 dir=200 pitch=-74 material=stone
+  part hind capsule r=5 r2=3 len=38 dir=200 pitch=-78 material=stone
+  rel fore joint chest at=0.5 out=1.8 pair
+  rel hind joint hips at=0.5 out=2.0 pair
 end
 pass hollow the ribcage cut
-  part cavity capsule r=7 r2=4 len=100 dir=0 pitch=0 material=stone
-  rel cavity above ground by=36
+  part cavity capsule r=9 r2=5 len=70 dir=90 pitch=0 material=stone
+  rel cavity on spine
 end
 pass towers on the spine add
-  repeat tower line from=-50,38,0 to=50,38,0 step=14 scale=1+sin(t*180)*0.6
+  repeat tower along bones step=17 scale=1+sin(t*180)*0.5
 end
 pass town in the ribs add
-  repeat hut grid min=-40,20,-14 max=40,20,14 step=11 on_ground jitter=3 seed=5 scale=1+t*0.4
+  repeat hut grid min=-30,0,-70 max=30,0,50 step=13 on_ground jitter=4 max_slope=3 seed=5
 end
 ";
     let t0 = Instant::now();
@@ -67,11 +80,11 @@ end
     let (lo, hi) = solid.iter().fold(((i32::MAX,i32::MAX,i32::MAX),(i32::MIN,i32::MIN,i32::MIN)),
         |(l,h), c| ((l.0.min(c.0),l.1.min(c.1),l.2.min(c.2)),(h.0.max(c.0),h.1.max(c.1),h.2.max(c.2))));
     println!("   extent {}w x {}h x {}d", hi.0-lo.0+1, hi.1-lo.1+1, hi.2-lo.2+1);
-    // side elevation, collapsing z
-    let step = (((hi.0-lo.0) / 100).max(1), ((hi.1-lo.1) / 34).max(1));
-    for y in (lo.1..=hi.1).rev().step_by(step.1 as usize) {
-        let row: String = (lo.0..=hi.0).step_by(step.0 as usize)
-            .map(|x| if (lo.2..=hi.2).any(|z| solid.contains(&(x,y,z))) { '#' } else { ' ' }).collect();
+    // side elevation: the dragon runs along z, so look along x
+    let sz = (((hi.2-lo.2) / 110).max(1), ((hi.1-lo.1) / 32).max(1));
+    for y in (lo.1..=hi.1).rev().step_by(sz.1 as usize) {
+        let row: String = (lo.2..=hi.2).step_by(sz.0 as usize)
+            .map(|z| if (lo.0..=hi.0).any(|x| solid.contains(&(x,y,z))) { '#' } else { ' ' }).collect();
         println!("   |{row}|");
     }
 }

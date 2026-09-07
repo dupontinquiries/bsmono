@@ -208,6 +208,12 @@ pub enum Repeat {
     Grid { min: (i32, i32, i32), max: (i32, i32, i32), step: i32 },
     /// Up a column.
     Stack { at: (i32, i32, i32), count: usize, step: i32 },
+    /// One copy at every point of a frame -- the armature's own joints.
+    OnFrame { frame: String },
+    /// Along a PATH through a frame's points in order, every `step`
+    /// blocks. A wall following a ridge, a road through a valley: the
+    /// thing `link` could not do because it had only two ends.
+    Along { frame: String, step: i32 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -217,8 +223,26 @@ pub struct Pass {
     pub source: Source,
 }
 
+/// A named set of points: an ARMATURE.
+///
+/// The reference dragon's skeleton is thirteen named joints, and
+/// everything -- limbs, wings, the rig -- binds to them. This program
+/// language had no such thing: a part could relate to another PART,
+/// but there was no way to lay out a structure's bones once and hang
+/// several passes on them. So a dragon skeleton came out as a single
+/// arched spine with everything else guessed relative to it.
+///
+/// A frame is points with names. Parts attach by `rel X at JOINT`, and
+/// repeats walk a frame with `repeat asset frame NAME`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Frame {
+    pub name: String,
+    pub points: Vec<(String, (i32, i32, i32))>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Program {
+    pub frames: Vec<Frame>,
     pub assets: Vec<Asset>,
     pub passes: Vec<Pass>,
     pub notes: Vec<String>,
@@ -279,9 +303,10 @@ pub fn run_in<W: crate::VoxelWorld>(w: &W, prog: &Program, anchor: (i32, i32, i3
         let cells: Vec<((i32, i32, i32), u16)> = match &pass.source {
             Source::Sketch(src) => {
                 let (mut sk, _) = sketch::parse(src);
-                sk.assume_known = known.keys().cloned().collect();
                 let (_, errs) = sketch::parse(src);
-                let known_names: BTreeSet<String> = known.keys().cloned().collect();
+                let known_names: BTreeSet<String> = known.keys().cloned()
+                    .chain(prog.frames.iter().flat_map(|f| f.points.iter().map(|(n, _)| n.clone())))
+                    .collect();
                 r.errors.extend(errs.into_iter()
                     .filter(|e| !known_names.iter().any(|k| e.contains(&format!("'{k}'"))))
                     .map(|e| format!("{}: {e}", pass.name)));
@@ -291,7 +316,18 @@ pub fn run_in<W: crate::VoxelWorld>(w: &W, prog: &Program, anchor: (i32, i32, i3
                 // isolation and every cross-pass relation silently
                 // anchored at the origin. Earlier parts are carried as
                 // ghosts: they position things and place nothing.
-                let (placed, notes) = sketch::resolve_with(&sk, anchor, &known);
+                // a frame's points are relation targets too: `rel skull
+                // at head` puts a part on a named joint
+                let mut with_frames = known.clone();
+                for f in &prog.frames {
+                    for (n, pt) in &f.points {
+                        with_frames.entry(n.clone())
+                            .or_insert((sketch::Shape::Sphere { r: 0.0 },
+                                        (anchor.0 + pt.0, anchor.1 + pt.1, anchor.2 + pt.2)));
+                    }
+                }
+                sk.assume_known = with_frames.keys().cloned().collect();
+                let (placed, notes) = sketch::resolve_with(&sk, anchor, &with_frames);
                 r.notes.extend(notes.into_iter().map(|n| format!("{}: {n}", pass.name)));
                 for pl in &placed { known.insert(pl.name.clone(), (pl.shape.clone(), pl.at)); }
                 placed.iter().flat_map(|p| {
@@ -311,7 +347,7 @@ pub fn run_in<W: crate::VoxelWorld>(w: &W, prog: &Program, anchor: (i32, i32, i3
                 let Some(a) = assets.get(asset.as_str()) else {
                     r.errors.push(format!("{}: no asset '{asset}'", pass.name)); continue;
                 };
-                let spots = places_in(w, rule, a, site, anchor);
+                let spots = places_in(w, rule, a, site, anchor, &prog.frames);
                 let n = spots.len();
                 let mut out = Vec::new();
                 for (i, (p, t)) in spots.into_iter().enumerate() {
@@ -389,8 +425,9 @@ pub struct Site {
 }
 
 fn places_in<W: crate::VoxelWorld>(w: &W, rule: &Repeat, a: &Asset, site: Site,
-                                   anchor: (i32, i32, i32)) -> Vec<((i32, i32, i32), u8)> {
-    let raw = places(rule, a);
+                                   anchor: (i32, i32, i32), frames: &[Frame])
+    -> Vec<((i32, i32, i32), u8)> {
+    let raw = places_with(rule, a, frames);
     if !site.on_ground && site.max_slope.is_none() && site.jitter == 0 { return raw; }
     let surface = |x: i32, z: i32| (0..=anchor.1 + 160).rev()
         .find(|&y| w.get(x, y, z) != 0);
@@ -441,6 +478,35 @@ fn places_in<W: crate::VoxelWorld>(w: &W, rule: &Repeat, a: &Asset, site: Site,
     out
 }
 
+fn places_with(rule: &Repeat, a: &Asset, frames: &[Frame]) -> Vec<((i32, i32, i32), u8)> {
+    match rule {
+        Repeat::OnFrame { frame } => frames.iter().find(|f| &f.name == frame)
+            .map(|f| f.points.iter().map(|(_, p)| (*p, 0u8)).collect()).unwrap_or_default(),
+        Repeat::Along { frame, step } => {
+            let Some(f) = frames.iter().find(|f| &f.name == frame) else { return Vec::new() };
+            let step = (*step).max(1) as f32;
+            let mut out = Vec::new();
+            for seg in f.points.windows(2) {
+                let (a0, b0) = (seg[0].1, seg[1].1);
+                let (dx, dy, dz) = ((b0.0 - a0.0) as f32, (b0.1 - a0.1) as f32, (b0.2 - a0.2) as f32);
+                let len = (dx * dx + dy * dy + dz * dz).sqrt();
+                let n = (len / step).floor().max(1.0) as usize;
+                for i in 0..n {
+                    let t = i as f32 / n as f32;
+                    // each copy turned to face along the segment, so a
+                    // wall follows its path rather than all facing north
+                    let turns = (((dz.atan2(dx).to_degrees() / 90.0).round() as i32).rem_euclid(4)) as u8;
+                    out.push((((a0.0 as f32 + dx * t) as i32, (a0.1 as f32 + dy * t) as i32,
+                               (a0.2 as f32 + dz * t) as i32), turns));
+                }
+            }
+            if let Some((_, last)) = f.points.last() { out.push((*last, 0)); }
+            out
+        }
+        other => places(other, a),
+    }
+}
+
 fn places(rule: &Repeat, _a: &Asset) -> Vec<((i32, i32, i32), u8)> {
     match rule {
         Repeat::Line { from, to, step } => {
@@ -477,6 +543,8 @@ fn places(rule: &Repeat, _a: &Asset) -> Vec<((i32, i32, i32), u8)> {
         }
         Repeat::Stack { at, count, step } =>
             (0..*count).map(|i| ((at.0, at.1 + i as i32 * (*step).max(1), at.2), 0u8)).collect(),
+        // handled by places_with, which has the frames; unreachable here
+        Repeat::OnFrame { .. } | Repeat::Along { .. } => Vec::new(),
     }
 }
 
@@ -505,6 +573,20 @@ pub fn parse(src: &str) -> (Program, Vec<String>) {
         if t.is_empty() || t.starts_with('#') { continue; }
         let w: Vec<&str> = t.split_whitespace().collect();
         match w.first().map(|v| v.to_lowercase()).as_deref() {
+            Some("frame") => {
+                let Some(name) = w.get(1) else { errs.push("frame needs a name".into()); continue };
+                let body = take_body(&mut lines);
+                let mut points = Vec::new();
+                for l in body.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+                    let t: Vec<&str> = l.split_whitespace().collect();
+                    match (t.first(), t.get(1).and_then(|s| triple(s))) {
+                        (Some(n), Some(p)) => points.push((n.to_lowercase(), p)),
+                        _ => errs.push(format!("frame {name}: '{l}' is not `name x,y,z`")),
+                    }
+                }
+                if points.is_empty() { errs.push(format!("frame {name} has no points")); continue; }
+                p.frames.push(Frame { name: name.to_lowercase(), points });
+            }
             Some("asset") => {
                 let Some(name) = w.get(1) else { errs.push("asset needs a name".into()); continue };
                 let body = take_body(&mut lines);
@@ -603,8 +685,12 @@ fn parse_asset_use(body: &str) -> Result<Source, String> {
     const KNOWN: &[&str] = &["from", "to", "step", "centre", "center", "radius", "r", "count",
                              "min", "max", "at", "face_out", "scale", "lift", "rot",
                              "on_ground", "max_slope", "jitter", "seed"];
+    // a frame name is the third token of `repeat X frame NAME`, not a
+    // setting, so it is skipped rather than refused
+    let bare_ok = matches!(t.get(2).map(|v| v.to_lowercase()).as_deref(),
+                           Some("frame") | Some("joints") | Some("along") | Some("path"));
     let mut vary = Vec::new();
-    for s in t.iter().skip(3) {
+    for s in t.iter().skip(if bare_ok { 4 } else { 3 }) {
         let Some((k, v)) = s.split_once('=') else {
                 if ["face_out", "on_ground"].contains(s) { continue; }
             return Err(format!("'{s}' is not a setting; write key=value"));
@@ -627,6 +713,11 @@ fn parse_asset_use(body: &str) -> Result<Source, String> {
             min: kv("min").and_then(triple).ok_or("grid needs min=x,y,z")?,
             max: kv("max").and_then(triple).ok_or("grid needs max=x,y,z")?,
             step: num("step", 8) },
+        Some("frame") | Some("joints") => Repeat::OnFrame {
+            frame: t.get(3).ok_or("frame needs a frame name")?.to_lowercase() },
+        Some("along") | Some("path") => Repeat::Along {
+            frame: t.get(3).ok_or("along needs a frame name")?.to_lowercase(),
+            step: num("step", 4) },
         Some("stack") => Repeat::Stack {
             at: kv("at").and_then(triple).unwrap_or((0, 0, 0)),
             count: num("count", 4).clamp(1, 128) as usize, step: num("step", 5) },
@@ -982,5 +1073,69 @@ mod tests {
         // and it is deterministic
         let again = run_in(&Land, &prog, (0, 64, 0));
         assert_eq!(r.changes, again.changes, "same seed, same town");
+    }
+
+    #[test]
+    fn a_frame_is_an_armature_things_hang_on() {
+        let (prog, errs) = parse(
+            "frame bones\n\
+               hips 0,20,-20\n\
+               spine 0,26,0\n\
+               neck 0,30,16\n\
+               head 0,34,28\n\
+             end\n\
+             asset rib\n  part r box w=1 h=8 d=1 material=stone\nend\n\
+             pass skull add\n\
+               part dome sphere r=6 material=stone hollow\n\
+               rel dome on head\n\
+             end\n\
+             pass ribs add\n  repeat rib along bones step=5\nend\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(prog.frames.len(), 1);
+        assert_eq!(prog.frames[0].points.len(), 4);
+        let r = run(&prog, (0, 0, 0));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        // The skull is at the HEAD joint, not the origin. WIDTH tells
+        // it from the ribs: a sphere spreads in x, a rib is one block.
+        // Height does not -- the armature rises toward the head, so the
+        // ribs near the neck are legitimately as high as the skull.
+        let wide: Vec<(i32,i32,i32)> = r.changes.iter().filter(|c| c.at.0.abs() > 2).map(|c| c.at).collect();
+        assert!(!wide.is_empty(), "the skull sits somewhere");
+        assert!(wide.iter().all(|c| c.2 > 20), "and it is at the head end: {:?}", &wide[..3.min(wide.len())]);
+        // the ribs walk the whole armature, tail to head
+        let zs: BTreeSet<i32> = r.changes.iter().map(|c| c.at.2).collect();
+        assert!(*zs.iter().min().unwrap() < -15 && *zs.iter().max().unwrap() > 25,
+                "ribs run the length of it: {:?}..{:?}", zs.iter().min(), zs.iter().max());
+        // and they rise with the spine rather than sitting at one height
+        let bases: BTreeSet<i32> = r.changes.iter().map(|c| c.at.1).collect();
+        assert!(bases.len() > 10, "the armature has a profile: {} heights", bases.len());
+    }
+
+    #[test]
+    fn one_copy_per_joint_is_different_from_walking_the_path() {
+        let src = |rule: &str| format!(
+            "frame f\n  a 0,0,0\n  b 0,0,30\n  c 0,0,60\nend\n\
+             asset m\n  part x box w=1 h=1 d=1 material=stone\nend\n\
+             pass p add\n  repeat m {rule}\nend\n");
+        let (joints, _) = parse(&src("frame f"));
+        let (along, _) = parse(&src("along f step=5"));
+        let j = run(&joints, (0, 0, 0));
+        let a = run(&along, (0, 0, 0));
+        assert_eq!(j.changes.len(), 3, "one per joint");
+        assert!(a.changes.len() > 10, "the path is sampled: {}", a.changes.len());
+    }
+
+    #[test]
+    fn a_frame_that_is_missing_or_malformed_says_so() {
+        let (_, e1) = parse("frame f\n  notapoint\nend\n");
+        assert!(e1.iter().any(|e| e.contains("is not `name x,y,z`")), "{e1:?}");
+        let (_, e2) = parse("frame f\nend\n");
+        assert!(e2.iter().any(|e| e.contains("has no points")), "{e2:?}");
+        // a repeat naming a frame that does not exist builds nothing
+        // rather than crashing
+        let (p, _) = parse("asset m\n  part x box w=1 h=1 d=1 material=stone\nend\n\
+                            pass p add\n  repeat m frame nosuch\nend\n");
+        let r = run(&p, (0, 0, 0));
+        assert!(r.changes.is_empty());
     }
 }
