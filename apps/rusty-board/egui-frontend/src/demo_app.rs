@@ -717,7 +717,15 @@ impl Feel {
                             // panel does not decide that, so a new setting
                             // cannot arrive with the wrong side effects.
                             let change = crate::settings_model::toggle(setting, &cur);
-                            self.setting_values.insert(setting.key.to_string(), change.value);
+                            self.setting_values.insert(setting.key.to_string(), change.value.clone());
+                            // AND APPLY IT. The panel stored the new value in a map and
+                            // stopped, so picking "Cardinal" or "Stenotype" changed a string
+                            // and nothing else — the board stayed where it was. A setting
+                            // that persists and changes nothing is the failure
+                            // `settings::ready`'s own comment warns about.
+                            if setting.key == "layout.experimental_mode" {
+                                self.board.apply_mode(&change.value);
+                            }
                             if change.broadcast { ctx.request_repaint(); }
                         }
                         // The help line is where the options are EXPLAINED —

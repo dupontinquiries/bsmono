@@ -516,6 +516,45 @@ impl Board {
     pub fn current(&self) -> &Layout {
         &self.layouts[self.idx]
     }
+
+    /// Select the board the SETTINGS ask for.
+    ///
+    /// `layout.experimental_mode` has offered Off / Cardinal / Stenotype / Words since the
+    /// panel was written, and choosing one did nothing: the value went into a `HashMap` and
+    /// no code read it back. A setting that persists and changes nothing is the failure
+    /// `settings::ready`'s own comment warns about, and this is the second field in a row to
+    /// have it.
+    ///
+    /// Returns whether the board actually moved, so a caller can avoid resetting shift or
+    /// re-announcing the layout when nothing changed.
+    pub fn apply_mode(&mut self, mode: &str) -> bool {
+        let want = match mode.trim() {
+            "cardinal" => "cardinal",
+            "stenotype" => "steno",
+            "words" => "cardinal8",
+            // "off", and anything a newer build might write that this one does not know:
+            // the letter board, which is the safe answer. An unknown mode must not leave the
+            // keyboard on whatever was last selected.
+            _ => "en_us_qwerty",
+        };
+        let Some(i) = self.layouts.iter().position(|l| l.name == want) else {
+            // The named board is not in this build. Leave the current one alone rather than
+            // falling to index 0 — silently switching the board out from under someone is
+            // worse than ignoring a setting this build cannot honour.
+            return false;
+        };
+        if i == self.idx {
+            return false;
+        }
+        self.idx = i;
+        // A layout swap ends a one-shot shift: it was armed for a letter on the board you
+        // just left.
+        self.shift = real_layout::Shift::Off;
+        self.before_symbols = None;
+        true
+    }
+
+
     /// Switch layout by a swipe sign (wraps, since there are only a couple). Pure index arithmetic —
     /// used by tests and by whatever drives layout switching (the sidebar's tap, or a future prev/next).
     pub fn swipe(&mut self, sign: i32) {
@@ -2146,6 +2185,55 @@ mod gtk_parity_tests {
         assert_eq!(b.current().name, "symbols");
         b.toggle_symbols();
         assert_eq!(b.layout_index(), cardinal);
+    }
+
+    /// `layout.experimental_mode` has offered Off / Cardinal / Stenotype / Words since the
+    /// settings panel was written, and choosing one did nothing: the value went into a map
+    /// and no code read it back.
+    #[test]
+    fn the_experimental_mode_setting_moves_the_board() {
+        let mut b = Board::new();
+        let start = b.current().name.clone();
+        assert_eq!(start, "en_us_qwerty");
+
+        assert!(b.apply_mode("cardinal"));
+        assert_eq!(b.current().name, "cardinal");
+        assert!(b.apply_mode("words"));
+        assert_eq!(b.current().name, "cardinal8");
+        assert!(b.apply_mode("off"));
+        assert_eq!(b.current().name, "en_us_qwerty");
+
+        // Idempotent: re-applying the mode you are in is not a change, so a caller does not
+        // reset shift or re-announce a layout that did not move.
+        assert!(!b.apply_mode("off"));
+    }
+
+    /// A mode this build cannot honour must not silently switch the board to something
+    /// else. Stenotype has no layout here yet.
+    #[test]
+    fn a_mode_with_no_layout_leaves_the_board_alone() {
+        let mut b = Board::new();
+        assert!(!b.layout_names().contains(&"steno"), "if steno exists now, this test is stale");
+        b.apply_mode("cardinal");
+        assert!(!b.apply_mode("stenotype"), "an unbuildable mode reported a change");
+        assert_eq!(b.current().name, "cardinal", "the board moved for a mode it cannot draw");
+
+        // An unknown value from a newer build falls to the LETTER board rather than staying
+        // wherever it happened to be — an unreadable setting must not leave the keyboard in
+        // an arbitrary state.
+        assert!(b.apply_mode("some-future-mode"));
+        assert_eq!(b.current().name, "en_us_qwerty");
+    }
+
+    /// A layout swap ends a one-shot shift: it was armed for a letter on the board you just
+    /// left.
+    #[test]
+    fn switching_boards_disarms_a_one_shot_shift() {
+        let mut b = Board::new();
+        b.tap_shift();
+        assert_eq!(b.shift(), real_layout::Shift::Once);
+        b.apply_mode("cardinal");
+        assert_eq!(b.shift(), real_layout::Shift::Off, "the shift followed you to another board");
     }
 
     /// `AppearanceConfig` has carried these since the GTK build and `settings::ready`
