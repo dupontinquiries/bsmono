@@ -123,6 +123,8 @@ pub mod latent;
 pub mod expr;
 /// Parts and relations without coordinates, and the solver that grounds them.
 pub mod sketch;
+/// Flair: greebles, locations as regions with negatives, and modifiers over the placed set.
+pub mod flair;
 /// Typology and triage: what a thing is made of, and sorting what the client said.
 pub mod typology;
 /// The architectural brief: a schedule of spaces, an adjacency matrix, and a layout.
