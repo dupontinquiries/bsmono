@@ -918,6 +918,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// EVERY app in the fleet, not the handful I thought were affected.
+    ///
+    /// Thirteen of them keep their frontend outside the root manifest — `egui-frontend/`,
+    /// `crates/*-egui/`, a differently-named root package — so the single-manifest check
+    /// missed all thirteen, not the two that happened to be reported. This walks each app
+    /// tree for ANY manifest declaring a windowing dependency and requires the bounded
+    /// search to agree, which is what turns "the two I heard about" into "the ones that
+    /// exist".
+    #[test]
+    fn no_app_with_a_frontend_is_mistaken_for_a_cli() {
+        let apps = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("the apps directory");
+
+        // A full walk, for the TEST only — the shipping check stays bounded, and this is
+        // what proves the bound is wide enough.
+        fn any_gui_manifest(dir: &std::path::Path, depth: usize) -> bool {
+            if depth > 4 {
+                return false;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else { return false };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if e.file_name() == "target" || e.file_name() == ".git" {
+                        continue;
+                    }
+                    if any_gui_manifest(&p, depth + 1) {
+                        return true;
+                    }
+                } else if e.file_name() == "Cargo.toml"
+                    && super::is_gui_app(&std::fs::read_to_string(&p).unwrap_or_default())
+                {
+                    return true;
+                }
+            }
+            false
+        }
+
+        let mut checked = 0;
+        let mut missed: Vec<String> = Vec::new();
+        for e in std::fs::read_dir(&apps).expect("apps/").flatten() {
+            let dir = e.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            if !any_gui_manifest(&dir, 0) {
+                continue; // genuinely a CLI app or a non-Rust project
+            }
+            checked += 1;
+            if !is_gui_app_dir(&dir) {
+                missed.push(e.file_name().to_string_lossy().into_owned());
+            }
+        }
+        assert!(checked >= 10, "only {checked} app trees found under {apps:?} — the path is wrong");
+        assert!(
+            missed.is_empty(),
+            "these apps have a frontend the bounded search does not find, so they would ship a \
+             static musl binary that cannot dlopen libwayland-client: {missed:?}"
+        );
+    }
+
     /// The real trees, so this cannot regress when an app moves its frontend.
     #[test]
     fn the_shipped_frontends_are_detected_where_they_actually_live() {
