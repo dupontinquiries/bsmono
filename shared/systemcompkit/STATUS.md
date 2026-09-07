@@ -67,11 +67,10 @@ hardware.
 - Nothing consumes this crate. No app in the monorepo depends on
   `systemcompkit` yet — it's infrastructure waiting for a shell to build on
   top of it, not something exercised end-to-end by any real UI.
-- `capture`'s `CaptureSource::Toplevel` path is modeled (same `u64` id space
-  as `toplevel.rs`, by design) but not wired in `wayland_io` — it needs
-  `ToplevelSession` extended to retain the real `ExtForeignToplevelHandleV1`
-  proxies, which are currently discarded once a `ToplevelInfo`'s fields are
-  populated. Only `OutputCaptureSession` (whole-screen) is wired.
+- `capture`'s `CaptureSource::Toplevel` path is now wired (`ToplevelSession::
+  capture_toplevel(id, paint_cursors)`), retaining the real
+  `ExtForeignToplevelHandleV1` proxies specifically for this — the gap
+  named right after this crate's toplevel-wiring commit is closed.
 - `capture`'s actual buffer allocation and frame request/read-back —
   deliberately out of scope everywhere in this crate; see `capture.rs`'s own
   header for why that's a different kind of work than protocol-state

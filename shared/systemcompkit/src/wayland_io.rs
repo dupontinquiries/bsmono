@@ -45,6 +45,7 @@ use wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notifier_v1::ExtIdleNotifierV1,
 };
 use wayland_protocols::ext::image_capture_source::v1::client::{
+    ext_foreign_toplevel_image_capture_source_manager_v1::ExtForeignToplevelImageCaptureSourceManagerV1,
     ext_image_capture_source_v1::ExtImageCaptureSourceV1,
     ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
 };
@@ -380,6 +381,26 @@ struct TopIoState {
     tracker: ToplevelTracker,
     info: Option<ZcosmicToplevelInfoV1>,
     next_id: u64,
+    // Retained specifically for capture: `zcosmic_toplevel_handle_v1`'s own
+    // events (title/app_id/state/closed) are enough for ToplevelTracker,
+    // but requesting a capture source needs the ORIGINAL
+    // ext_foreign_toplevel_handle_v1 proxy itself, per
+    // ext_foreign_toplevel_image_capture_source_manager_v1's own
+    // create_source signature. Without this map, capture_toplevel below
+    // would have nothing to hand it.
+    handles: std::collections::HashMap<u64, ExtForeignToplevelHandleV1>,
+    capture_source_mgr: Option<ExtForeignToplevelImageCaptureSourceManagerV1>,
+    copy_capture_mgr: Option<ExtImageCopyCaptureManagerV1>,
+    captures: std::collections::HashMap<u64, CaptureSession>,
+    // Retained specifically to destroy explicitly on Closed, not for any
+    // event dispatch of their own (both are already inert Dispatch impls
+    // below) — dropping a wayland-client proxy does NOT send a wire
+    // `destroy` request (confirmed: no Drop impl on generated proxy types
+    // in wayland-backend), so without this a capture source/session for
+    // every toplevel ever captured would leak server-side for the whole
+    // life of a long-running shell process, not just until the toplevel closes.
+    capture_sources: std::collections::HashMap<u64, ExtImageCaptureSourceV1>,
+    copy_sessions: std::collections::HashMap<u64, ExtImageCopyCaptureSessionV1>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for TopIoState {
@@ -408,6 +429,7 @@ impl Dispatch<ExtForeignToplevelListV1, ()> for TopIoState {
             if let Some(info) = &state.info {
                 info.get_cosmic_toplevel(&toplevel, qh, id);
             }
+            state.handles.insert(id, toplevel);
             state.tracker.apply(ToplevelEvent::New(id));
         }
     }
@@ -478,8 +500,81 @@ impl Dispatch<ZcosmicToplevelHandleV1, u64> for TopIoState {
                 }
                 state.tracker.apply(ToplevelEvent::StateChanged(id, s));
             }
-            zcosmic_toplevel_handle_v1::Event::Closed => state.tracker.apply(ToplevelEvent::Closed(id)),
+            zcosmic_toplevel_handle_v1::Event::Closed => {
+                // Both the tracker AND everything this session retained
+                // for `id` — a closed toplevel's handle is no longer valid
+                // to request a NEW capture source from, and any capture
+                // negotiation already in flight for it has nothing left to
+                // capture. Explicit destroy on the retained proxies, not
+                // just dropping them from the maps: see this struct's own
+                // field comments for why a drop alone leaks them server-side.
+                state.handles.remove(&id);
+                state.captures.remove(&id);
+                if let Some(session) = state.copy_sessions.remove(&id) {
+                    session.destroy();
+                }
+                if let Some(source) = state.capture_sources.remove(&id) {
+                    source.destroy();
+                }
+                state.tracker.apply(ToplevelEvent::Closed(id));
+            }
             _ => {} // geometry/output/workspace events: not modeled by ToplevelTracker's current fields
+        }
+    }
+}
+
+impl Dispatch<ExtForeignToplevelImageCaptureSourceManagerV1, ()> for TopIoState {
+    fn event(
+        _: &mut Self,
+        _: &ExtForeignToplevelImageCaptureSourceManagerV1,
+        _: wayland_protocols::ext::image_capture_source::v1::client::ext_foreign_toplevel_image_capture_source_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Factory only (create_source) — no events.
+    }
+}
+
+impl Dispatch<ExtImageCaptureSourceV1, ()> for TopIoState {
+    fn event(
+        _: &mut Self,
+        _: &ExtImageCaptureSourceV1,
+        _: wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // No events of its own — an opaque handle passed to create_session.
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureManagerV1, ()> for TopIoState {
+    fn event(_: &mut Self, _: &ExtImageCopyCaptureManagerV1, _: ext_image_copy_capture_manager_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        // Factory only — no events.
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureSessionV1, u64> for TopIoState {
+    fn event(
+        state: &mut Self,
+        _: &ExtImageCopyCaptureSessionV1,
+        event: ext_image_copy_capture_session_v1::Event,
+        id: &u64,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let mapped = match event {
+            ext_image_copy_capture_session_v1::Event::BufferSize { width, height } => {
+                Some(CaptureEvent::BufferSize { width, height })
+            }
+            ext_image_copy_capture_session_v1::Event::ShmFormat { format } => Some(CaptureEvent::ShmFormat(format.into())),
+            ext_image_copy_capture_session_v1::Event::Done => Some(CaptureEvent::Done),
+            ext_image_copy_capture_session_v1::Event::Stopped => Some(CaptureEvent::Stopped),
+            _ => None, // dmabuf negotiation: out of scope, same as OutputCaptureSession
+        };
+        if let (Some(ev), Some(session)) = (mapped, state.captures.get_mut(id)) {
+            session.apply(ev);
         }
     }
 }
@@ -515,8 +610,27 @@ impl ToplevelSession {
         // event fires regardless), just without title/app_id/state ever
         // populating, which callers can already tell from empty strings.
         let info: Option<ZcosmicToplevelInfoV1> = globals.bind(&qh, 1..=3, ()).ok();
+        // Both genuinely optional, same reasoning as `info` above — a
+        // compositor could support toplevel listing without supporting
+        // capturing any of them. Absent means `capture_toplevel` below
+        // always returns `None`, which callers can already distinguish
+        // from "capture negotiation still in progress" (constraints not
+        // yet received) since no CaptureSession ever gets created at all.
+        let capture_source_mgr: Option<ExtForeignToplevelImageCaptureSourceManagerV1> =
+            globals.bind(&qh, 1..=1, ()).ok();
+        let copy_capture_mgr: Option<ExtImageCopyCaptureManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
 
-        let state = TopIoState { tracker: ToplevelTracker::new(), info, next_id: 1 };
+        let state = TopIoState {
+            tracker: ToplevelTracker::new(),
+            info,
+            next_id: 1,
+            handles: std::collections::HashMap::new(),
+            capture_source_mgr,
+            copy_capture_mgr,
+            captures: std::collections::HashMap::new(),
+            capture_sources: std::collections::HashMap::new(),
+            copy_sessions: std::collections::HashMap::new(),
+        };
         // `list` is only needed long enough to have been bound above —
         // toplevel events arrive via the registry-bound object automatically,
         // this function has no further use for the variable itself.
@@ -528,6 +642,41 @@ impl ToplevelSession {
     pub fn poll(&mut self) -> &ToplevelTracker {
         let _ = self.queue.dispatch_pending(&mut self.state);
         &self.state.tracker
+    }
+
+    /// Starts capture negotiation for a specific open toplevel — the live-
+    /// thumbnail case `CaptureSource::Toplevel` names in `capture.rs`.
+    /// `None` if the id isn't currently tracked (already closed, or never
+    /// existed), or if the compositor doesn't support toplevel capture at
+    /// all (checked once at `connect()`, not re-checked per call).
+    /// Idempotent: calling this again for an id already negotiating
+    /// returns the SAME session rather than starting a second, redundant
+    /// negotiation — a caller polling every frame to check on progress
+    /// shouldn't have to remember whether it already called this once.
+    pub fn capture_toplevel(&mut self, id: u64, paint_cursors: bool) -> Option<()> {
+        if self.state.captures.contains_key(&id) {
+            return Some(());
+        }
+        let handle = self.state.handles.get(&id)?;
+        let source_mgr = self.state.capture_source_mgr.as_ref()?;
+        let copy_mgr = self.state.copy_capture_mgr.as_ref()?;
+        let qh = self.queue.handle();
+
+        let source = source_mgr.create_source(handle, &qh, ());
+        let options = if paint_cursors {
+            ext_image_copy_capture_manager_v1::Options::PaintCursors
+        } else {
+            ext_image_copy_capture_manager_v1::Options::empty()
+        };
+        let session = copy_mgr.create_session(&source, options, &qh, id);
+        self.state.capture_sources.insert(id, source);
+        self.state.copy_sessions.insert(id, session);
+        self.state.captures.insert(id, CaptureSession::new());
+        Some(())
+    }
+
+    pub fn capture_state(&self, id: u64) -> Option<&CaptureSession> {
+        self.state.captures.get(&id)
     }
 
     pub fn flush(&self) -> Result<(), String> {
