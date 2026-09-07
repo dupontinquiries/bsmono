@@ -269,6 +269,12 @@ pub fn writer_ui(ui: &mut egui::Ui, w: &mut Writer,
 
 #[cfg(feature = "app")]
 pub fn run(title: &str) -> eframe::Result<()> {
+    // Why the window will not open, said before the panic in a dependency does. The main
+    // here delegates into this function, so the check belongs at the run entry rather than
+    // at `fn main` — see `uikit_egui::backend_check`. Silent when the setup is fine.
+    if let Some(why) = uikit_egui::backend_check::preflight() {
+        eprintln!("{why}");
+    }
     let opts = eframe::NativeOptions {
         // Glow SAID, not left to eframe: its 0.34 defaults include
         // wgpu but not glow, and wgpu's default device descriptor

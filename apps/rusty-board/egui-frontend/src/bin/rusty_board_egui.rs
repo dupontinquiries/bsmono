@@ -9,6 +9,17 @@ fn main() -> eframe::Result<()> {
     // FIRST, before eframe/winit touch Wayland: KWin hands the input-method socket over as
     // WAYLAND_SOCKET, and a toolkit that sees it connects to the wrong socket for rendering.
     rusty_board_egui::platform::capture_inherited_socket();
+    // AFTER the capture, before anything opens a surface. The capture moves
+    // WAYLAND_SOCKET, so a diagnosis run before it would describe an environment that no
+    // longer exists — and this app reaches Wayland twice, through the layer shell and
+    // through eframe, so the check belongs above both rather than beside one.
+    //
+    // `uikit_egui::backend_check`: the usual failure is a static musl build, which cannot
+    // dlopen libwayland-client, and wayland-sys's own panic points at a package that is
+    // already installed. Silent when the setup is fine.
+    if let Some(why) = uikit_egui::backend_check::preflight() {
+        eprintln!("{why}");
+    }
     // Docked first, where the build and the compositor allow it. An explicit
     // RUSTY_BOARD_PLACEMENT=ruled|floating skips the attempt (the eframe shell is the
     // one with a real window to look at in dev).
