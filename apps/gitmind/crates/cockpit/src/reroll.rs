@@ -120,6 +120,29 @@ impl Plan {
         self.steps.iter().filter(|s| matches!(s, Step::Build { .. })).count()
     }
 
+    /// The build steps grouped into batches that may run CONCURRENTLY.
+    ///
+    /// One entry per batch, in plan order, each at most `concurrent` long. Everything else
+    /// in the plan stays sequential: an install depends on the build before it, and a
+    /// rename or an enroll changes the device a later step talks to.
+    ///
+    /// Builds are the only steps that are safe to stack, and only because each is a separate
+    /// cargo invocation in a separate target directory. Two builds of the SAME app and
+    /// triple would share one, so the dedupe in `plan` — one build per (app, triple) — is
+    /// what makes this safe, not the batching.
+    ///
+    /// `concurrent <= 1` gives one build per batch, which is exactly today's sequence.
+    pub fn build_batches(&self, concurrent: u32) -> Vec<Vec<Step>> {
+        let n = concurrent.max(1) as usize;
+        let builds: Vec<Step> = self
+            .steps
+            .iter()
+            .filter(|s| matches!(s, Step::Build { .. }))
+            .cloned()
+            .collect();
+        builds.chunks(n).map(<[Step]>::to_vec).collect()
+    }
+
     pub fn install_count(&self) -> usize {
         self.steps.iter().filter(|s| matches!(s, Step::Install { .. })).count()
     }
@@ -293,6 +316,21 @@ pub trait Runner {
     fn enroll(&mut self, device: &str) -> Result<(), String>;
     /// Build one app for one target.
     fn build(&mut self, app: &str, triple: &str) -> Result<(), String>;
+
+    /// Build several (app, triple) pairs that may run CONCURRENTLY, returning one result
+    /// per input in the same order.
+    ///
+    /// The default runs them one at a time, which is what every existing runner does today
+    /// and what any machine under `buildflags::STACK_RAM_MB` should keep doing. A runner
+    /// with the memory to stack them — see `buildflags::host_build_plan` — overrides this
+    /// and is responsible for giving each build its own `-j`, because `cores × concurrent`
+    /// rustc processes is the thrashing the stacking is meant to avoid.
+    ///
+    /// A default method rather than a second trait so no existing runner has to change, and
+    /// so the sequential behaviour stays the one you get by not thinking about it.
+    fn build_batch(&mut self, batch: &[(String, String)]) -> Vec<Result<(), String>> {
+        batch.iter().map(|(app, triple)| self.build(app, triple)).collect()
+    }
     /// Copy the binary and write the `.desktop` entry.
     fn install(&mut self, app: &str, device: &str) -> Result<(), String>;
     /// Set the device's hostname.
@@ -442,6 +480,49 @@ pub fn run<R: Runner>(plan: &Plan, r: &mut R, on: &mut dyn FnMut(Event)) -> Repo
 
 #[cfg(test)]
 mod tests {
+
+    /// Builds stack; nothing else does. An install depends on the build before it, and a
+    /// rename changes the device a later step talks to.
+    #[test]
+    fn only_builds_are_batched_and_the_batches_keep_plan_order() {
+        let plan = Plan {
+            steps: vec![
+                Step::Enroll { device: "a".into() },
+                Step::Build { app: "one".into(), triple: "aarch64-unknown-linux-gnu".into() },
+                Step::Build { app: "two".into(), triple: "aarch64-unknown-linux-gnu".into() },
+                Step::Build { app: "three".into(), triple: "aarch64-unknown-linux-musl".into() },
+                Step::Install { app: "one".into(), device: "a".into() },
+            ],
+            skipped: Vec::new(),
+        };
+
+        let b = plan.build_batches(2);
+        assert_eq!(b.len(), 2, "three builds at two apiece is two batches: {b:?}");
+        assert_eq!(b[0].len(), 2);
+        assert_eq!(b[1].len(), 1);
+        assert!(
+            b.iter().flatten().all(|s| matches!(s, Step::Build { .. })),
+            "a non-build step was batched: {b:?}"
+        );
+        // Plan order is kept, so a log reads the same way it did.
+        match (&b[0][0], &b[0][1]) {
+            (Step::Build { app: a, .. }, Step::Build { app: c, .. }) => {
+                assert_eq!((a.as_str(), c.as_str()), ("one", "two"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // One at a time is exactly today's sequence — the safe default, and what every
+        // machine under the RAM threshold gets.
+        let one = plan.build_batches(1);
+        assert_eq!(one.len(), 3);
+        assert!(one.iter().all(|b| b.len() == 1));
+        assert_eq!(plan.build_batches(0), one, "zero must not mean 'all at once'");
+
+        // A plan with no builds batches to nothing rather than one empty batch.
+        let empty = Plan { steps: vec![Step::Enroll { device: "a".into() }], skipped: Vec::new() };
+        assert!(empty.build_batches(4).is_empty());
+    }
     use super::*;
 
     fn dev(id: &str, triple: &str, enr: Enrollment, reach: Reach) -> Device {

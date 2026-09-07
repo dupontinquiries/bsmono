@@ -629,6 +629,105 @@ pub fn job_limit(is_remote_device: bool, device_ram_mb: Option<u64>) -> Option<u
     Some(by_ram.min(4))
 }
 
+/// What this HOST can do at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostResources {
+    pub ram_mb: u64,
+    pub cores: u32,
+}
+
+/// How to spend a build machine: how many app builds at once, and how many cargo jobs each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildPlan {
+    /// Builds that may run concurrently. Always at least 1.
+    pub concurrent: u32,
+    /// `-j` for each of them. `None` leaves cargo's default, which is right when only one
+    /// build runs.
+    pub jobs_each: Option<u32>,
+}
+
+/// Below this, one build at a time. See [`host_build_plan`].
+pub const STACK_RAM_MB: u64 = 24 * 1024;
+/// Memory to reserve per concurrent build, beyond the per-job estimate: a linking rustc on
+/// this fleet's larger crates is gigabytes on its own.
+pub const RAM_PER_BUILD_MB: u64 = 8 * 1024;
+
+/// Whether to stack whole builds on this host, and how hard to drive each.
+///
+/// # Why stacking is worth it here, and only above a threshold
+///
+/// A fleet build is many small crates and a few enormous ones, and cargo's parallelism is
+/// per-BUILD: while one app is linking, one rustc is running and the rest of the machine is
+/// idle. Running several app builds side by side fills that, which is where most of the wall
+/// time on a workstation goes.
+///
+/// It is memory that decides whether that is a good idea. Two concurrent builds of the big
+/// crates want gigabytes each on top of their jobs, and a machine that starts swapping is
+/// slower than one building serially — while an OOM kill reports as a signal, not a compile
+/// error, and reads as a toolchain fault. So: nothing changes below [`STACK_RAM_MB`], which
+/// is the "ample RAM" line, and above it the concurrency is bounded by BOTH memory and
+/// cores.
+///
+/// The jobs are then divided among the concurrent builds. Leaving each at cargo's default —
+/// one job per core — would put `cores × concurrent` rustc processes on the machine, which
+/// is the thrashing this is supposed to avoid rather than cause.
+///
+/// Pure over the two facts it needs, so the policy can be argued about without a
+/// workstation to try it on.
+pub fn host_build_plan(res: HostResources) -> BuildPlan {
+    let cores = res.cores.max(1);
+    if res.ram_mb < STACK_RAM_MB {
+        // One at a time, cargo's own job count. This is today's behaviour, unchanged.
+        return BuildPlan { concurrent: 1, jobs_each: None };
+    }
+    let by_ram = (res.ram_mb / RAM_PER_BUILD_MB).max(1) as u32;
+    // At least 2 cores per build, or the jobs division leaves each build serial and the
+    // stacking buys nothing but memory pressure.
+    let by_cores = (cores / 2).max(1);
+    // Four is the ceiling: past it the contention is disk and the linker, which do not
+    // divide, and a build machine that thrashes its page cache is slower than one that did
+    // less at once.
+    let concurrent = by_ram.min(by_cores).min(4);
+    if concurrent <= 1 {
+        return BuildPlan { concurrent: 1, jobs_each: None };
+    }
+    BuildPlan { concurrent, jobs_each: Some((cores / concurrent).max(1)) }
+}
+
+/// Tests are NEVER stacked, whatever the machine has.
+///
+/// A build is a pure function of its inputs; a test suite is not. These suites bind ports,
+/// write into `/tmp` and `$HOME`, spawn a compositor under Xvfb, and read the same fixture
+/// files. Two of them at once do not fail cleanly — they fail intermittently, in whichever
+/// one lost the race, and the failure does not reproduce when it is run alone. That costs
+/// more than the wall time it saves.
+///
+/// Returned as a plan rather than a bare `1` so a caller cannot accidentally reuse the build
+/// plan here: the two questions look identical and have different answers.
+pub fn host_test_plan(_res: HostResources) -> BuildPlan {
+    BuildPlan { concurrent: 1, jobs_each: None }
+}
+
+/// This machine's RAM and cores.
+///
+/// `/proc/meminfo`'s `MemTotal`, which is what the machine HAS rather than what is free
+/// right now — a build that starts when memory happens to be free still has to finish, and
+/// planning against a momentary figure produces a different answer every run.
+pub fn detect_host() -> HostResources {
+    let ram_mb = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<u64>().ok())
+        })
+        .map(|kb| kb / 1024)
+        .unwrap_or(0);
+    let cores = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
+    HostResources { ram_mb, cores }
+}
+
 /// Append `-j` to a build argv when the target warrants it.
 ///
 /// Separate from `cargo_build_argv_kind` rather than folded in, because the
@@ -1089,6 +1188,66 @@ mod tests {
         let m = explain_no_backend("aarch64-unknown-linux-musl").unwrap();
         assert!(m.contains("dlopen") && m.contains("crt-static"));
         assert!(explain_no_backend("aarch64-unknown-linux-gnu").is_none());
+    }
+
+    /// "Ample RAM" is the whole condition. Below the line nothing changes — one build at a
+    /// time, cargo's own job count — because a machine that starts swapping is slower than
+    /// one building serially, and an OOM kill reports as a signal rather than a compile
+    /// error.
+    #[test]
+    fn builds_stack_only_on_a_machine_with_room_for_them() {
+        // A laptop: 16 GB, 8 cores. Unchanged.
+        let laptop = host_build_plan(HostResources { ram_mb: 16 * 1024, cores: 8 });
+        assert_eq!(laptop, BuildPlan { concurrent: 1, jobs_each: None });
+
+        // A phone-sized host, and a machine with plenty of RAM but two cores: also
+        // unchanged, because two builds of one core each is not stacking.
+        assert_eq!(host_build_plan(HostResources { ram_mb: 6 * 1024, cores: 8 }).concurrent, 1);
+        assert_eq!(host_build_plan(HostResources { ram_mb: 64 * 1024, cores: 2 }).concurrent, 1);
+
+        // A workstation: 32 GB, 16 cores. Stacks, and DIVIDES the jobs — leaving each build
+        // at cargo's default would put cores × concurrent rustc processes on the machine,
+        // which is the thrashing this exists to avoid.
+        let ws = host_build_plan(HostResources { ram_mb: 32 * 1024, cores: 16 });
+        assert!(ws.concurrent > 1, "{ws:?}");
+        let jobs = ws.jobs_each.expect("a stacked build must cap its jobs");
+        assert!(jobs * ws.concurrent <= 16, "{} jobs × {} builds oversubscribes 16 cores", jobs, ws.concurrent);
+
+        // Memory bounds it, not just cores: 24 GB and 64 cores is three builds, not thirty.
+        let lopsided = host_build_plan(HostResources { ram_mb: 24 * 1024, cores: 64 });
+        assert_eq!(lopsided.concurrent, 3, "{lopsided:?}");
+
+        // And there is a ceiling however big the machine is: past it the contention is disk
+        // and the linker, which do not divide.
+        let huge = host_build_plan(HostResources { ram_mb: 512 * 1024, cores: 128 });
+        assert_eq!(huge.concurrent, 4, "{huge:?}");
+
+        // Nonsense inputs do not produce a zero: `-j 0` is an error and no builds at all is
+        // a hang.
+        assert!(host_build_plan(HostResources { ram_mb: 0, cores: 0 }).concurrent >= 1);
+        assert!(host_build_plan(HostResources { ram_mb: 64 * 1024, cores: 0 }).concurrent >= 1);
+    }
+
+    /// TESTS ARE NEVER STACKED. A build is a pure function of its inputs; a suite binds
+    /// ports, writes into /tmp and $HOME, and spawns a compositor under Xvfb. Two at once do
+    /// not fail cleanly — they fail intermittently, in whichever lost the race, and do not
+    /// reproduce alone.
+    #[test]
+    fn tests_never_stack_however_big_the_machine() {
+        for res in [
+            HostResources { ram_mb: 8 * 1024, cores: 4 },
+            HostResources { ram_mb: 64 * 1024, cores: 32 },
+            HostResources { ram_mb: 512 * 1024, cores: 128 },
+        ] {
+            let t = host_test_plan(res);
+            assert_eq!(t.concurrent, 1, "tests stacked on {res:?}");
+            assert_eq!(t.jobs_each, None);
+            // The two questions look identical and have different answers, which is why
+            // they are separate functions rather than a flag.
+            if host_build_plan(res).concurrent > 1 {
+                assert_ne!(host_build_plan(res), t);
+            }
+        }
     }
 
     fn triple_normalization_and_native_check() {
