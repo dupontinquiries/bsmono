@@ -4483,7 +4483,12 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
             };
             crate::scene3d::set_panel_context(
                 crate::panel_rows::PanelContext::from_rows(
-                    &crate::panel_rows::from_spans(&segs, None))
+                    // AND WHICH ROW IS LIVE. `active` was `None` at the only call site, so
+                    // no row was ever accented and the renderer's emphasis path — brighter
+                    // AND slightly taller, because at that distance brightness alone does
+                    // not read — was dead code. The last segment is the one still being
+                    // added to, which is the "you are here" a board in the room should show.
+                    &crate::panel_rows::from_spans(&segs, segs.len().checked_sub(1)))
                     .with_active_tab(lit));
             crate::scene3d::set_env_params(crate::scene3d::EnvParams {
                 nodes: n as u32, branches, segments: segs.len() as u32, seed,

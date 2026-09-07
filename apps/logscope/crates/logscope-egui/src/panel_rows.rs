@@ -78,7 +78,15 @@ pub fn from_labels(items: &[(String, bool)]) -> Vec<Row> {
 /// This exists because the scene builder has spans in scope and never had
 /// labels — the panel does not need text to be honest about shape.
 pub fn from_spans(spans: &[(usize, usize)], active: Option<usize>) -> Vec<Row> {
-    let taken: Vec<&(usize, usize)> = spans.iter().take(MAX_ROWS).collect();
+    // THE LAST FIVE, not the first. `segments()` returns topic runs in order and the final
+    // one always ends at the newest node, so taking from the front meant that on any
+    // conversation longer than five topics the board showed the OPENING of the chat and
+    // never the part being talked about — a museum of the beginning, bolted to the wall.
+    //
+    // `active` indexes the FULL span list, and is translated below, so the caller says
+    // "segment k" without knowing which window survived.
+    let skipped = spans.len().saturating_sub(MAX_ROWS);
+    let taken: Vec<&(usize, usize)> = spans.iter().skip(skipped).collect();
     let longest = taken
         .iter()
         .map(|(a, b)| b.saturating_sub(*a).max(1))
@@ -92,7 +100,7 @@ pub fn from_spans(spans: &[(usize, usize)], active: Option<usize>) -> Vec<Row> {
             Row {
                 width01: (MIN_WIDTH01 + frac * (MAX_WIDTH01 - MIN_WIDTH01))
                     .clamp(MIN_WIDTH01, MAX_WIDTH01),
-                accent: active == Some(i),
+                accent: active == Some(i + skipped),
             }
         })
         .collect()
@@ -229,6 +237,48 @@ impl PanelContext {
 
 #[cfg(test)]
 mod tests {
+
+    /// On a conversation longer than the board is tall, the panel showed the OPENING of the
+    /// chat forever — a museum of the beginning, bolted to the wall. The rows a board in the
+    /// room is worth having are the recent ones.
+    #[test]
+    fn a_long_conversation_shows_its_latest_topics_not_its_first() {
+        // Eight topic runs, each a different length so the rows are distinguishable.
+        let spans: Vec<(usize, usize)> = (0..8).map(|i| (i * 10, i * 10 + i + 1)).collect();
+        let rows = from_spans(&spans, None);
+        assert_eq!(rows.len(), MAX_ROWS);
+
+        // The widths come from the LAST five spans (lengths 4..8), so the narrowest row here
+        // is wider in proportion than the first span's would have been.
+        let tail = from_spans(&spans[3..], None);
+        assert_eq!(rows.len(), tail.len());
+        for (a, b) in rows.iter().zip(tail.iter()) {
+            assert!((a.width01 - b.width01).abs() < 1e-6, "the window is not the tail: {rows:?}");
+        }
+
+        // A conversation that fits is unchanged.
+        let short = vec![(0, 3), (3, 9)];
+        assert_eq!(from_spans(&short, None).len(), 2);
+    }
+
+    /// `active` indexes the FULL span list, so the caller says "segment k" without knowing
+    /// which window survived — and the live segment stays accented as the chat grows past
+    /// the board's height.
+    #[test]
+    fn the_accent_follows_the_live_segment_through_the_window() {
+        let spans: Vec<(usize, usize)> = (0..8).map(|i| (i * 10, i * 10 + 4)).collect();
+        let rows = from_spans(&spans, Some(7));
+        assert!(rows.last().unwrap().accent, "the live segment lost its accent: {rows:?}");
+        assert_eq!(rows.iter().filter(|r| r.accent).count(), 1);
+
+        // A segment that scrolled off accents nothing — better than accenting the wrong row.
+        let rows = from_spans(&spans, Some(0));
+        assert!(rows.iter().all(|r| !r.accent), "an off-screen segment accented a visible row");
+
+        // And in a short conversation the index is used directly.
+        let rows = from_spans(&[(0, 3), (3, 9), (9, 12)], Some(1));
+        assert!(rows[1].accent && !rows[0].accent && !rows[2].accent);
+    }
 
     /// The renderer lit `i == 0` unconditionally, so the in-scene board reported Files
     /// however far the app had moved. The tabs are what make the board read as live rather
