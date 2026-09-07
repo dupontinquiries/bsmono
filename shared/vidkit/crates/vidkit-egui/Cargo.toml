@@ -15,3 +15,18 @@ egui = "0.34"
 uikit-egui = { path = "../../../uikit/crates/uikit-egui" }
 uikit-gesture = { path = "../../../uikit/crates/uikit-gesture" }
 snapclone-theme = { path = "../../../uikit/crates/snapclone-theme" }
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
+
+# Off by default so `cargo test` stays light and headless, matching uikit-egui.
+# Backend named explicitly: eframe 0.34's defaults select wgpu, whose default
+# device descriptor asks for max_color_attachments 8 and dies at startup on a
+# GPU that allows 5 -- logscope-egui records exactly that crash on Asahi, which
+# is one of this crate's target platforms. See
+# maintenance/tools/eframe_backend_check.py.
+
+[features]
+demo = ["dep:eframe"]
+
+[[example]]
+name = "video_demo"
+required-features = ["demo"]

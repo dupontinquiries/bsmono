@@ -122,7 +122,9 @@ impl VideoView {
         Self {
             fit: Fit::Contain,
             pixel_aspect: PixelAspect::SQUARE,
-            skin: Skin::default(),
+            // The kit's carved look, not egui's defaults -- the whole point of
+            // building on uikit-egui rather than beside it.
+            skin: Skin::carved(),
             bar: Color32::BLACK,
             gesture: GestureLayer::new(Axis::Horizontal, GestureConfig::default()),
             scrub: None,
