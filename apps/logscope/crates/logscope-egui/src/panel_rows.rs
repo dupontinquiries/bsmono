@@ -47,6 +47,11 @@ pub const MAX_WIDTH01: f32 = 0.82;
 /// board and a panel of long ones does not saturate — the shape stays
 /// informative at any naming convention.
 pub fn from_labels(items: &[(String, bool)]) -> Vec<Row> {
+    // THE FIRST five, unlike `from_spans`, which takes the last — and the difference is
+    // deliberate. A listing's head is its meaningful end: the first files in a directory are
+    // as good as any and usually better sorted. A conversation's is not: its oldest topics
+    // are the least relevant thing it could show, which is why that function takes the tail.
+    // Worth writing down, because the two sit next to each other and look inconsistent.
     let taken: Vec<&(String, bool)> = items.iter().take(MAX_ROWS).collect();
     let longest = taken
         .iter()
@@ -122,9 +127,18 @@ pub fn empty() -> Vec<Row> {
 /// of a plausible context listing (a title, then entries), so the seam is
 /// obvious and a reviewer can see at a glance whether a scene is showing
 /// real data or this.
+/// The stand-in carries NO ACCENT. An accented row means "this is the live topic", and a
+/// board with no conversation behind it has no live topic to point at — the width pattern
+/// says "a board, waiting", which is true, while the accent says "you are here", which is
+/// not. The renderer draws an accented row brighter and taller, so the lie was also the
+/// most eye-catching thing in the scene.
+///
+/// The full-width first row is what still distinguishes this from real data at a glance: a
+/// listing scaled from real spans only leads with a full-width row when its first entry is
+/// the longest.
 pub fn placeholder() -> Vec<Row> {
     vec![
-        Row { width01: MAX_WIDTH01, accent: true },
+        Row { width01: MAX_WIDTH01, accent: false },
         Row { width01: 0.58, accent: false },
         Row { width01: 0.63, accent: false },
         Row { width01: 0.49, accent: false },
@@ -432,8 +446,13 @@ mod tests {
         // it leads with a full-width accented row, which a directory listing
         // scaled from labels only produces if its first entry is the longest.
         let p = placeholder();
-        assert!(p[0].accent && (p[0].width01 - MAX_WIDTH01).abs() < 1e-6);
+        assert!((p[0].width01 - MAX_WIDTH01).abs() < 1e-6, "the stand-in leads full width");
         assert!(p.len() <= MAX_ROWS);
+        // And NOTHING in it is accented. An accent says "this is the live topic", and a
+        // board with no conversation behind it has none to point at — while the renderer
+        // draws an accented row brighter and taller, making the claim the loudest thing in
+        // the scene.
+        assert!(p.iter().all(|r| !r.accent), "the stand-in claimed a live topic: {p:?}");
     }
 }
 
