@@ -25,6 +25,17 @@ fn main() {
     println!("   site {}x{}", side*2, side*2);
     println!("\n== LAYOUT: {}", l.summary());
     for n in l.notes.iter().take(3) { println!("   NOTE {n}"); }
+    // the massing as sections, each its own body
+    let mprog = typology::to_program(&m, total, side * 2, "stone");
+    let (mp, me) = voxel_tools::program::parse(&mprog);
+    for e in &me { println!("   ERR {e}"); }
+    let mrun = voxel_tools::program::run(&mp, (0, 64, 0));
+    println!("\n== SECTIONS: {}", mrun.summary());
+    for (n, cells) in &mrun.bodies {
+        let top = cells.iter().map(|c| c.1).max().unwrap() - 64;
+        let w = cells.iter().map(|c| c.0).max().unwrap() - cells.iter().map(|c| c.0).min().unwrap();
+        println!("   {n:<16} {:>7} cells  {w:>3} wide  {top:>3} tall", cells.len());
+    }
     let prog = brief::to_program(&l, &b, "stone", 0);
     let (p, _) = voxel_tools::program::parse(&prog);
     let run = voxel_tools::program::run(&p, (0, 64, 0));

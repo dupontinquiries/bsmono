@@ -558,6 +558,83 @@ pub fn to_brief(m: &Massing, total: i32) -> String {
     s
 }
 
+/// The massing as a PROGRAM: one pass per section, each honouring its
+/// own constraints.
+///
+/// The constraints were decoration. `encloses`, `tallest`, `perimeter`,
+/// `inside`, `axial`, `detached` were parsed, stored, printed -- and
+/// nothing read them. Meanwhile `brief::to_program` made ONE box for
+/// the whole building and cut rooms out of it, so a castle's curtain
+/// wall and its keep were the same block of stone and the wall
+/// enclosed nothing.
+///
+/// One pass per section means the sections exist as named bodies, so
+/// flair can attach to them, a review can drop one, and a wall marked
+/// `encloses` is actually a ring around the rest.
+pub fn to_program(m: &Massing, total: i32, site: i32, wall: &str) -> String {
+    let mut s = format!("# {}: {} section(s) over {total}\n", m.typology, m.sections.len());
+    let areas: BTreeMap<String, (i32, f32)> = m.areas(total).into_iter()
+        .map(|(n, a, p)| (n, (a, p))).collect();
+    // the enclosing section sets the site; everything else fits inside
+    let half = (site / 2).max(6);
+    // sections are built OUTSIDE-IN: what encloses first, so the rest
+    // has something to be inside of
+    let mut order: Vec<&Section> = m.sections.iter().collect();
+    order.sort_by_key(|s| {
+        if s.constraints.iter().any(|c| c == "encloses") { 0 }
+        else if s.constraints.iter().any(|c| c == "ground") { 1 }
+        else if s.constraints.iter().any(|c| c == "tallest") { 3 }
+        else { 2 }
+    });
+    let storey = 5.0;
+    // what encloses, if anything: perimeter sections attach to it
+    let encloser = m.sections.iter()
+        .find(|s| s.constraints.iter().any(|c| c == "encloses"))
+        .map(|s| s.name.replace(' ', "_"));
+    let encloser = encloser.as_deref();
+    for sec in order {
+        let (area, prom) = areas.get(&sec.name).copied().unwrap_or((100, 1.0));
+        if area < 4 { continue; }
+        let h = ((prom.max(0.3) * storey).round() as i32).clamp(2, 120);
+        let has = |c: &str| sec.constraints.iter().any(|x| x == c);
+        let name = sec.name.replace(' ', "_");
+        s.push_str(&format!("pass {} add\n", sec.name));
+        if has("encloses") {
+            // a ring: the whole site, hollow, so it surrounds
+            s.push_str(&format!("  part {name} box w={} h={h} d={} material={wall} hollow\n",
+                                half * 2, half * 2));
+            s.push_str(&format!("  rel {name} above ground by={}\n", h / 2));
+        } else if prom < 0.5 {
+            // a courtyard or square: a floor, not a volume
+            let side = (area as f32).sqrt().round().max(4.0) as i32;
+            s.push_str(&format!("  part {name} slab w={side} d={side} thickness=1 material={wall}\n"));
+            s.push_str(&format!("  rel {name} on ground\n"));
+        } else {
+            let side = ((area as f32 / h.max(1) as f32 * storey).sqrt()).round().max(4.0) as i32;
+            s.push_str(&format!("  part {name} box w={side} h={h} d={side} material={wall} hollow\n"));
+            // where it sits follows from its constraints
+            if has("perimeter") {
+                // IN the enclosing wall, not beside the ground. `beside
+                // ground` keeps the ground's own height, so a gatehouse
+                // sank half into it and came out shorter than the wall
+                // it is meant to command. Relating it to the enclosure
+                // puts it at the wall's own height, which is also what
+                // a gatehouse IS -- a thickening of the wall, not a
+                // building that happens to be near one.
+                match encloser {
+                    Some(e) => s.push_str(&format!("  rel {name} beside {e} dir=south by=-{}\n",
+                                                   side / 2)),
+                    None => s.push_str(&format!("  rel {name} above ground by={}\n", h / 2)),
+                }
+            } else {
+                s.push_str(&format!("  rel {name} above ground by={}\n", h / 2));
+            }
+        }
+        s.push_str("end\n");
+    }
+    s
+}
+
 /// The prompt for the massing turn -- the one that was missing.
 pub fn massing_prompt(request: &str, t: &Typology, wishes: &[Wish]) -> String {
     let mut s = format!("\
@@ -869,5 +946,64 @@ mod tests {
         assert_eq!(lookup("a temple town").map(|t| t.name), Some("town"));
         assert_eq!(lookup("a town temple").map(|t| t.name), Some("temple"));
         assert!(lookup("a zigurat").is_none(), "and an unknown word is still unknown");
+    }
+
+    #[test]
+    fn each_section_becomes_its_own_named_body() {
+        let c = lookup("castle").unwrap();
+        let req = "a castle with a chapel";
+        let m = apply_for(req, &c, &triage(req, &c));
+        let src = to_program(&m, m.implied_total, 90, "stone");
+        let (prog, errs) = crate::program::parse(&src);
+        assert!(errs.is_empty(), "{src}\n{errs:?}");
+        let r = crate::program::run(&prog, (0, 64, 0));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        // the sections are separate bodies, not one block of stone
+        for want in ["curtain_wall", "keep", "gatehouse", "chapel"] {
+            assert!(r.bodies.contains_key(want), "{want} is its own body: {:?}",
+                    r.bodies.keys().collect::<Vec<_>>());
+        }
+        // so flair can attach to one of them by name
+        assert!(r.bodies["curtain_wall"].len() > 100);
+    }
+
+    #[test]
+    fn the_constraints_are_read_and_not_merely_stored() {
+        let c = lookup("castle").unwrap();
+        let m = apply_for("a castle", &c, &[]);
+        let src = to_program(&m, m.implied_total, 90, "stone");
+        let (prog, _) = crate::program::parse(&src);
+        let r = crate::program::run(&prog, (0, 64, 0));
+        let span = |b: &str| {
+            let s = &r.bodies[b];
+            (s.iter().map(|c| c.0).max().unwrap() - s.iter().map(|c| c.0).min().unwrap(),
+             s.iter().map(|c| c.1).max().unwrap())
+        };
+        // ENCLOSES: the curtain wall is wider than everything it holds
+        let (wall_w, _) = span("curtain_wall");
+        let (keep_w, keep_top) = span("keep");
+        assert!(wall_w > keep_w, "the wall encloses the keep: {wall_w} vs {keep_w}");
+        // TALLEST: the keep dominates, which is what a keep is
+        let (_, gate_top) = span("gatehouse");
+        assert!(keep_top > gate_top, "the keep is taller than the gatehouse: {keep_top} vs {gate_top}");
+        // and a gatehouse COMMANDS the wall it sits in rather than
+        // sinking into the ground beside it
+        let (_, wall_top) = span("curtain_wall");
+        assert!(gate_top >= wall_top, "the gatehouse rises to the wall: {gate_top} vs {wall_top}");
+        // and the courtyard, prominence 0, is a floor rather than a volume
+        let court = &r.bodies["courtyard"];
+        let ch = court.iter().map(|c| c.1).max().unwrap() - court.iter().map(|c| c.1).min().unwrap();
+        assert!(ch <= 2, "a courtyard is a surface, not a box: {ch} tall");
+    }
+
+    #[test]
+    fn what_encloses_is_built_first_so_the_rest_has_something_to_be_inside() {
+        let c = lookup("castle").unwrap();
+        let m = apply_for("a castle", &c, &[]);
+        let (prog, _) = crate::program::parse(&to_program(&m, m.implied_total, 90, "stone"));
+        let names: Vec<&str> = prog.passes.iter().map(|p| p.name.as_str()).collect();
+        let wall = names.iter().position(|n| *n == "curtain wall").unwrap();
+        let keep = names.iter().position(|n| *n == "keep").unwrap();
+        assert!(wall < keep, "outside-in: {names:?}");
     }
 }
