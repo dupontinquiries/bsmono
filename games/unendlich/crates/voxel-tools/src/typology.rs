@@ -91,8 +91,66 @@ pub fn scale_word(w: &str) -> Option<f32> {
         "huge" | "great" | "major" => 4.5,
         "enormous" | "vast" | "massive" | "immense" => 9.0,
         "colossal" | "titanic" | "monumental" | "gigantic" => 16.0,
+        "legendary" | "mythic" | "godlike" | "world" => 40.0,
+        "impossible" | "infinite" | "endless" | "boundless" => 100.0,
         _ => return None,
     })
+}
+
+/// What a size makes POSSIBLE, which is not the same as how big it is.
+///
+/// Scale changes KIND, not just extent. A ten-block statue is a solid
+/// figure. A two-hundred-block one has chambers inside it, a stair up
+/// its spine, and a viewing gallery in its head -- and it needs them,
+/// because a solid mass that size reads as terrain rather than as
+/// something built. The multiplier was doing all the work and nothing
+/// asked what a size UNLOCKS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tier {
+    /// Solid or single-room. Under about 12 blocks a side.
+    Object,
+    /// Worth hollowing: one interior.
+    Inhabited,
+    /// Several rooms, so it needs circulation between them.
+    Compound,
+    /// Tall enough that getting up it is its own problem: stairs in
+    /// the face, landings, a way down.
+    Vertical,
+    /// Big enough to hold a settlement, which needs streets and
+    /// district structure rather than corridors.
+    Landscape,
+}
+
+impl Tier {
+    /// From a section's own area and how tall it stands.
+    pub fn of(area: i32, storeys: f32) -> Tier {
+        let side = (area.max(1) as f32).sqrt();
+        let height = storeys.max(1.0) * 5.0;
+        if side >= 90.0 { Tier::Landscape }
+        else if height >= 40.0 { Tier::Vertical }
+        else if side >= 26.0 { Tier::Compound }
+        else if side >= 12.0 { Tier::Inhabited }
+        else { Tier::Object }
+    }
+
+    /// What this tier requires that the one below does not. These are
+    /// needs, not decorations: a Vertical section without a stair is a
+    /// tower nobody can climb, which the reachability check will say.
+    pub fn requires(self) -> &'static [&'static str] {
+        match self {
+            Tier::Object => &[],
+            Tier::Inhabited => &["interior", "door"],
+            Tier::Compound => &["interior", "door", "circulation"],
+            Tier::Vertical => &["interior", "door", "circulation", "stair", "landings"],
+            Tier::Landscape => &["interior", "door", "streets", "districts", "gates"],
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self { Tier::Object => "object", Tier::Inhabited => "inhabited",
+                     Tier::Compound => "compound", Tier::Vertical => "vertical",
+                     Tier::Landscape => "landscape" }
+    }
 }
 
 /// The gross floor area a request implies. The type sets the register,
@@ -396,6 +454,19 @@ pub struct Massing {
 }
 
 impl Massing {
+    /// Each section's tier at a given total, and what that tier needs
+    /// which the section does not yet have.
+    pub fn tiers(&self, total: i32) -> Vec<(String, Tier, Vec<&'static str>)> {
+        self.areas(total).into_iter().map(|(name, area, prom)| {
+            let t = Tier::of(area, prom);
+            let sec = self.sections.iter().find(|s| s.name == name);
+            let missing: Vec<&'static str> = t.requires().iter().copied()
+                .filter(|r| sec.map(|s| !s.constraints.iter().any(|c| c == r)).unwrap_or(true))
+                .collect();
+            (name, t, missing)
+        }).collect()
+    }
+
     /// The area each section gets, from its share and a total.
     pub fn areas(&self, total: i32) -> Vec<(String, i32, f32)> {
         let sum: f32 = self.sections.iter().map(|s| s.share).sum();
@@ -407,8 +478,11 @@ impl Massing {
     pub fn summary(&self, total: i32) -> String {
         let mut s = format!("{}: {} section(s) over {total} ({})\n",
                             self.typology, self.sections.len(), self.scale_note);
+        let tiers: BTreeMap<String, Tier> = self.tiers(total).into_iter()
+            .map(|(n, t, _)| (n, t)).collect();
         for (n, a, p) in self.areas(total) {
-            s.push_str(&format!("  {n:<16} {a:>6}  prominence {p:.1}\n"));
+            s.push_str(&format!("  {n:<16} {a:>7}  prominence {p:.1}  {}\n",
+                                tiers.get(&n).map(|t| t.word()).unwrap_or("")));
         }
         if !self.qualities.is_empty() { s.push_str(&format!("  throughout: {}\n", self.qualities.join(", "))); }
         for c in &self.constraints { s.push_str(&format!("  constraint: {c}\n")); }
@@ -527,8 +601,15 @@ pub fn to_brief(m: &Massing, total: i32) -> String {
     let net_total = (total as f32 / (1.0 + CIRC) * (1.0 - CONTINGENCY)).floor() as i32;
     let mut s = format!("# {} -- {} section(s), {net_total} net within {total} gross\n",
                         m.typology, m.sections.len());
+    for (n, t, missing) in m.tiers(net_total) {
+        if t != Tier::Object {
+            s.push_str(&format!("# {n} is {} and so needs: {}\n", t.word(),
+                                if missing.is_empty() { "nothing more".into() } else { missing.join(", ") }));
+        }
+    }
     s.push_str(&format!("budget {total}\ncirculation {CIRC}\n"));
     let areas: BTreeMap<String, i32> = m.areas(net_total).into_iter().map(|(n, a, _)| (n, a)).collect();
+    let tiers: BTreeMap<String, Tier> = m.tiers(net_total).into_iter().map(|(n, t, _)| (n, t)).collect();
     for sec in &m.sections {
         let got = areas.get(&sec.name).copied().unwrap_or(0);
         let base: i32 = sec.rooms.iter().map(|(_, a)| *a).sum();
@@ -536,8 +617,26 @@ pub fn to_brief(m: &Massing, total: i32) -> String {
             s.push_str(&format!("space {} area={got}\n", sec.name));
             continue;
         }
+        // WHAT THE SIZE UNLOCKS. A section that has grown past a
+        // threshold does not just get bigger rooms -- it gets rooms it
+        // did not have. A compound needs circulation between its parts;
+        // something vertical needs a stair and landings or it is a
+        // tower nobody can climb; a landscape needs streets. Scaling
+        // the same three rooms to fill a hundred thousand blocks makes
+        // a great hall the size of a village, which is not what a great
+        // hall is.
+        let tier = tiers.get(&sec.name).copied().unwrap_or(Tier::Object);
+        let mut extra: Vec<(&'static str, i32)> = Vec::new();
+        match tier {
+            Tier::Compound => extra.push(("corridor", got / 8)),
+            Tier::Vertical => { extra.push(("stair", got / 10)); extra.push(("landing", got / 14)); }
+            Tier::Landscape => { extra.push(("street", got / 6)); extra.push(("court", got / 9));
+                                 extra.push(("gate", got / 24)); }
+            _ => {}
+        }
+        let base = base + extra.iter().map(|(_, a)| *a).sum::<i32>();
         let f = got as f32 / base as f32;
-        for (room, area) in &sec.rooms {
+        for (room, area) in sec.rooms.iter().chain(extra.iter()) {
             let a = ((*area as f32 * f).round() as i32).max(4);
             let needs: Vec<&str> = sec.constraints.iter()
                 .filter_map(|c| match c.as_str() {
@@ -926,11 +1025,20 @@ mod tests {
         let r = b.reconcile();
         assert!(r.gross > 39_000, "the schedule really is that size: {}", r.summary());
         assert!(r.ok, "{}", r.summary());
-        // every room grew with it, rather than there being more rooms
+        // The rooms grow AND there are more of them. A huge keep is not
+        // one enormous hall: past a threshold it needs circulation
+        // between its parts, so the hall grows by less than the total
+        // does and a corridor appears that the small one has no need
+        // for. That is what "bigger" should mean and the first version
+        // of this test asserted the opposite.
         let hall = b.spaces.iter().find(|s| s.name == "great hall").unwrap();
         let small = crate::brief::parse(&to_brief(&apply_for("a small castle", &c, &[]), 3600)).0;
         let small_hall = small.spaces.iter().find(|s| s.name == "great hall").unwrap();
-        assert!(hall.area > small_hall.area * 4, "{} vs {}", hall.area, small_hall.area);
+        assert!(hall.area > small_hall.area, "the hall grew: {} vs {}", hall.area, small_hall.area);
+        let names: Vec<&str> = b.spaces.iter().map(|s| s.name.as_str()).collect();
+        let small_names: Vec<&str> = small.spaces.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.len() > small_names.len(),
+                "and there are more KINDS of room: {names:?} vs {small_names:?}");
     }
 
     #[test]
@@ -1005,5 +1113,58 @@ mod tests {
         let wall = names.iter().position(|n| *n == "curtain wall").unwrap();
         let keep = names.iter().position(|n| *n == "keep").unwrap();
         assert!(wall < keep, "outside-in: {names:?}");
+    }
+
+    #[test]
+    fn a_size_unlocks_what_it_can_hold() {
+        // scale changes KIND, not just extent
+        assert_eq!(Tier::of(60, 1.0), Tier::Object, "a small thing is solid");
+        assert_eq!(Tier::of(200, 1.0), Tier::Inhabited, "big enough to be hollow");
+        assert_eq!(Tier::of(900, 1.0), Tier::Compound, "several rooms, so it needs corridors");
+        assert_eq!(Tier::of(900, 9.0), Tier::Vertical, "tall enough that climbing it is a problem");
+        assert_eq!(Tier::of(20_000, 1.0), Tier::Landscape, "big enough to hold a settlement");
+        // and each tier needs what the one below does not
+        assert!(Tier::Object.requires().is_empty());
+        assert!(Tier::Vertical.requires().contains(&"stair"),
+                "a vertical section without a stair is a tower nobody can climb");
+        assert!(Tier::Landscape.requires().contains(&"streets"));
+        assert!(Tier::Inhabited < Tier::Vertical);
+    }
+
+    #[test]
+    fn the_bigger_it_is_the_more_it_hosts() {
+        let c = lookup("castle").unwrap();
+        let rooms_of = |req: &str| -> Vec<String> {
+            let m = apply_for(req, &c, &triage(req, &c));
+            let (b, _) = crate::brief::parse(&to_brief(&m, m.implied_total));
+            b.spaces.iter().map(|s| s.name.clone()).collect()
+        };
+        let small = rooms_of("a small castle");
+        let huge = rooms_of("a huge fortress");
+        let mythic = rooms_of("a legendary citadel");
+        assert!(huge.len() > small.len(), "{huge:?} vs {small:?}");
+        assert!(mythic.len() >= huge.len());
+        // the big ones gained the things a big thing NEEDS
+        assert!(huge.iter().any(|r| r == "corridor" || r == "stair"),
+                "a huge fortress has internal circulation: {huge:?}");
+        assert!(mythic.iter().any(|r| r == "street" || r == "gate"),
+                "a legendary citadel is a landscape and has streets: {mythic:?}");
+        assert!(!small.iter().any(|r| r == "street"), "a small castle does not: {small:?}");
+    }
+
+    #[test]
+    fn the_top_of_the_scale_is_millions_of_blocks() {
+        let c = lookup("castle").unwrap();
+        let m = |w: &str| scale_for(&format!("a {w} fortress"), &c).0;
+        assert!(m("legendary") > 300_000, "legendary: {}", m("legendary"));
+        assert!(m("impossible") > 800_000, "impossible: {}", m("impossible"));
+        assert!(m("impossible") > m("legendary") && m("legendary") > m("colossal"));
+        // and the massing reports what each section became
+        let req = "a legendary fortress";
+        let mass = apply_for(req, &c, &triage(req, &c));
+        let tiers = mass.tiers(mass.implied_total);
+        assert!(tiers.iter().any(|(_, t, _)| *t == Tier::Landscape),
+                "at that size a section is a landscape: {:?}",
+                tiers.iter().map(|(n, t, _)| (n, t.word())).collect::<Vec<_>>());
     }
 }
