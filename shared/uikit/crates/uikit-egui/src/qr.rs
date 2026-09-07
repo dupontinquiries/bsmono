@@ -831,7 +831,8 @@ pub fn expanded_ui_with(ctx: &egui::Context, state: &mut Option<Expanded>, id: &
     if a < 1.0 {
         ctx.request_repaint();
     }
-    let window = ctx.screen_rect();
+    // The USABLE area — a code under the status bar cannot be scanned.
+    let window = crate::usable_rect(ctx);
     let (side, margin) = Expanded::qr_side(window);
     let mut close = false;
     // ABOVE EVERYTHING, including the dialog that opened it: a Foreground

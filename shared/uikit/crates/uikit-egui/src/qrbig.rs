@@ -225,7 +225,8 @@ pub fn huge_ui(ctx: &egui::Context, state: &mut Option<crate::qr::Expanded>, fra
     if a < 1.0 || frames.len() > 1 {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
-    let window = ctx.screen_rect();
+    // The USABLE area — a code under the status bar cannot be scanned.
+    let window = crate::usable_rect(ctx);
     let margin = if window.width() < 420.0 { 12.0 } else { 24.0 };
     let side = (window.width() - margin * 2.0).min(window.height() - margin * 2.0 - 110.0).max(64.0);
     let idx = frame_at(now - ex.opened_at, frames.len());

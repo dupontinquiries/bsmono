@@ -231,6 +231,22 @@ pub fn touch_floor_pt(explicit_min_target: f32, surface_pt: f32, ppp: f32) -> f3
     }
 }
 
+/// The area a surface should lay out inside, with the first-frame case handled.
+///
+/// `Context::screen_rect` is deprecated: egui split it into `viewport_rect` (everything,
+/// including what sits under a status bar or a notch) and `content_rect` (the usable part).
+/// Almost everything wants the usable part — a QR code under the status bar is unscannable
+/// and a dialog under it is untappable.
+///
+/// The catch is that `content_rect` is EMPTY on the very first frame, before any layout has
+/// happened. Reading zero there and concluding "narrow" is how an app comes up in its
+/// compact layout on a desktop and then jumps. So: content when it has been established,
+/// the full viewport until then.
+pub fn usable_rect(ctx: &egui::Context) -> egui::Rect {
+    let c = ctx.content_rect();
+    if c.width() > 1.0 && c.height() > 1.0 { c } else { ctx.viewport_rect() }
+}
+
 pub fn apply_prefs(ctx: &egui::Context, prefs: &settings_kit::Prefs) {
     let pid = snapclone_theme::PaletteId::from_str(&prefs.palette);
     let colors = apply_palette(ctx, snapclone_theme::palette_for(pid));
@@ -253,10 +269,7 @@ pub fn apply_prefs(ctx: &egui::Context, prefs: &settings_kit::Prefs) {
     // bars). It is empty on the very first frame, before any layout has
     // happened, so fall back to the raw screen rect rather than reading 0
     // and concluding "narrow".
-    let surface_pt = {
-        let c = ctx.content_rect().width();
-        if c > 1.0 { c } else { ctx.screen_rect().width() }
-    };
+    let surface_pt = usable_rect(ctx).width();
     let floor = touch_floor_pt(prefs.touch.min_target, surface_pt, ctx.pixels_per_point());
     ctx.global_style_mut(|style| {
         // text size across the app

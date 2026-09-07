@@ -253,15 +253,26 @@ mod tests {
             event_type: event::DAEMON_CONTROL.to_string(),
             slots: vec!["voiced".to_string()],
         };
-        let d = reg.route(&intent);
-        assert_eq!(d.len(), 1, "{d:?}");
-        // backgrounded: the Active intent is not delivered, the Always one is
+        let delivered = |ds: &[voiced_core::Dispatch]| {
+            ds.iter().any(|d| matches!(d, voiced_core::Dispatch::Deliver { app, .. } if app == "gitmind"))
+        };
+        assert!(delivered(&reg.route(&intent)), "a focused control intent was not delivered");
+
+        // BACKGROUNDED: the Active intent must not be delivered. Note the shape — the
+        // registry returns `Dispatch::Dropped` rather than an empty list, so "nothing
+        // happened" is a routing OUTCOME with a name and not an absence. Asserting
+        // `is_empty()` here failed, correctly: something was returned, and it was the
+        // refusal.
         reg.set_active("something-else");
-        assert!(reg.route(&intent).is_empty(), "a control intent fired while gitmind was not focused");
+        let bg = reg.route(&intent);
+        assert!(!delivered(&bg), "a control intent fired while gitmind was not focused: {bg:?}");
+        assert!(bg.iter().any(|d| matches!(d, voiced_core::Dispatch::Dropped)), "{bg:?}");
+
+        // The app-named status is Always, so it still arrives.
         let status = voiced_core::Intent::App {
             event_type: event::DAEMON_STATUS.to_string(),
             slots: vec![],
         };
-        assert_eq!(reg.route(&status).len(), 1, "the app-named status should still arrive");
+        assert!(delivered(&reg.route(&status)), "the app-named status did not arrive while backgrounded");
     }
 }

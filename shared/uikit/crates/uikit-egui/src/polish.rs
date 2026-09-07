@@ -60,7 +60,10 @@ impl Backdrop {
     pub fn paint(&mut self, ctx: &Context, colors: &PaletteColors) {
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         self.bg.tick(dt);
-        let rect = ctx.screen_rect();
+        // The FULL viewport, not the usable area: this paints behind everything, and a
+        // background that stops at the status bar leaves a bare strip along the top of a
+        // phone. The one place where `viewport_rect` is the right half of the split.
+        let rect = ctx.viewport_rect();
         let painter = ctx.layer_painter(LayerId::background());
         self.bg.paint(&painter, rect, colors);
         if self.bg.speed > 0.0 && self.fps > 0.0 {
