@@ -5062,6 +5062,17 @@ fn repaint_waker(ctx: &egui::Context) -> voiceterm_egui::pty_host::Waker {
 }
 
 fn main() -> eframe::Result<()> {
+    // WHY THE WINDOW WILL NOT OPEN, said before the panic in a dependency does.
+    //
+    // A build that cannot reach a display server dies inside `wayland-sys`:
+    // `wayland_client_handle()` tries libwayland-client.so.0, then .so, and `.expect()`s the
+    // result. What reaches the user is a panic naming a line in a crate they have never
+    // heard of — on a phone, in a terminal they cannot copy out of — and the message points
+    // the wrong way, because the usual cause is that the library IS installed and this
+    // binary cannot dlopen anything, having been linked statically.
+    if let Some(why) = uikit_egui::backend_check::preflight() {
+        eprintln!("{why}");
+    }
     let mut app = App::new(80, 24);
     // First run (no prefs file yet): voiceterm's Voice identity, NOT settings-kit's generic
     // "Dark" default — Prefs::default() can't know which app it's defaulting for.

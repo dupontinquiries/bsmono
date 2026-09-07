@@ -35,6 +35,12 @@ fn main() -> eframe::Result<()> {
     // It must equal the .desktop basename that `cockpit::installer` writes: `gitmind`. The
     // installer also emits `StartupWMClass=gitmind` for the X11 path, where the match is on
     // WM_CLASS instead. Two names, one string, and they have to agree.
+    // Why the window will not open, before the panic in a dependency does. See
+    // `uikit_egui::backend_check` — the usual cause is a static musl build, and
+    // wayland-sys's own message points at a package that is already installed.
+    if let Some(why) = uikit_egui::backend_check::preflight() {
+        eprintln!("{why}");
+    }
     let opts = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         viewport: egui::ViewportBuilder::default()

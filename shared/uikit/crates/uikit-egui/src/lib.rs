@@ -60,6 +60,8 @@ pub mod vertical_tabs;
 pub mod glass;
 /// Text and edges on the device-pixel grid (the "tall blurry font" report).
 pub mod crisp;
+/// Say why the window will not open, before the panic in a dependency does.
+pub mod backend_check;
 /// The finish snapclone has, for any app: a live backdrop behind the glass panels, one line a frame.
 pub mod polish;
 /// A theme-aware, custom-drawn QR-shaped identicon and its expanded overlay (`QrCodeRenderer.cpp`, ported).
