@@ -78,6 +78,12 @@ impl Adjacency {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Space {
     pub name: String,
+    /// Which section of the typology it belongs to, when the brief
+    /// came from a massing. Rooms were flattened out of their sections
+    /// and everything the section knew -- that it is the perimeter,
+    /// that it is the tallest thing, that it is ruined -- was lost
+    /// before any of it could reach the geometry.
+    pub section: String,
     /// Floor area of ONE of them, in blocks squared.
     pub area: i32,
     pub count: usize,
@@ -178,6 +184,8 @@ impl Brief {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Room {
     pub name: String,
+    /// The section this room is part of, carried from the brief.
+    pub section: String,
     /// Which of the `count` this is, from 1.
     pub index: usize,
     /// Footprint corner and size, in blocks.
@@ -247,15 +255,16 @@ pub fn lay_out(brief: &Brief, bounds: ((i32, i32), (i32, i32)), seed: u64, effor
     let (bw, bd) = (max.0 - min.0, max.1 - min.1);
     if bw < 4 || bd < 4 { l.notes.push("the site is too small to lay anything out".into()); return l; }
     // rooms, biggest first: a great hall placed last has nowhere to go
-    let mut want: Vec<(String, i32, i32, usize, BTreeSet<String>)> = Vec::new();
+    let mut want: Vec<(String, i32, i32, usize, BTreeSet<String>, String)> = Vec::new();
     for s in &brief.spaces {
         for i in 0..s.count.max(1) {
-            want.push((s.name.clone(), s.area, s.height.max(1), i + 1, s.qualities.clone()));
+            want.push((s.name.clone(), s.area, s.height.max(1), i + 1, s.qualities.clone(),
+                       s.section.clone()));
         }
     }
-    want.sort_by_key(|(_, a, _, _, _)| std::cmp::Reverse(*a));
+    want.sort_by_key(|(_, a, _, _, _, _)| std::cmp::Reverse(*a));
     let mut placed: Vec<Room> = Vec::new();
-    for (n, (name, area, height, index, qualities)) in want.into_iter().enumerate() {
+    for (n, (name, area, height, index, qualities, section)) in want.into_iter().enumerate() {
         let (w, d) = footprint(area, seed ^ n as u64);
         if w > bw || d > bd {
             l.notes.push(format!("'{name}' needs {w}x{d} and the site is {bw}x{bd}"));
@@ -267,8 +276,8 @@ pub fn lay_out(brief: &Brief, bounds: ((i32, i32), (i32, i32)), seed: u64, effor
             let h = hash(seed ^ n as u64, k as u64);
             let at = (min.0 + (h % (bw - w + 1).max(1) as u64) as i32,
                       min.1 + ((h >> 20) % (bd - d + 1).max(1) as u64) as i32);
-            let cand = Room { name: name.clone(), index, at, size: (w, d), height,
-                              qualities: qualities.clone() };
+            let cand = Room { name: name.clone(), section: section.clone(), index, at,
+                              size: (w, d), height, qualities: qualities.clone() };
             if placed.iter().any(|p| p.overlaps(&cand)) { continue; }
             let c = cost_of(&cand, &placed, brief, bounds);
             if best.as_ref().map(|(bc, _)| c < *bc).unwrap_or(true) { best = Some((c, cand)); }
@@ -361,6 +370,31 @@ pub fn to_program(l: &Layout, brief: &Brief, wall: &str, floor_y: i32) -> String
     let storey = 5;
     let mut s = String::new();
     s.push_str(&format!("# {} room(s), {} net\n", l.rooms.len(), brief.reconcile().net));
+    // ONE MASS PASS PER SECTION, so the flair layer has bodies to
+    // attach to. A single "the mass" pass produced one anonymous
+    // block: nothing could say "the top edge of the curtain wall"
+    // because nothing knew which cells that was, and every section's
+    // constraints -- perimeter, tallest, ruined -- died with it.
+    let sections: BTreeSet<String> = l.rooms.iter().map(|r| r.section.clone())
+        .filter(|s| !s.is_empty()).collect();
+    if sections.len() > 1 {
+        for sec in &sections {
+            let rooms: Vec<&Room> = l.rooms.iter().filter(|r| &r.section == sec).collect();
+            if rooms.is_empty() { continue; }
+            let slo = rooms.iter().fold((i32::MAX, i32::MAX), |a, r| (a.0.min(r.at.0), a.1.min(r.at.1)));
+            let shi = rooms.iter().fold((i32::MIN, i32::MIN),
+                |a, r| (a.0.max(r.at.0 + r.size.0), a.1.max(r.at.1 + r.size.1)));
+            let tall = rooms.iter().map(|r| r.height).max().unwrap_or(1);
+            s.push_str(&format!("pass {sec} add\n"));
+            s.push_str(&format!("  part m{sec} box w={} h={} d={} material={wall}\n",
+                                shi.0 - slo.0 + 3, tall * storey + 2, shi.1 - slo.1 + 3));
+            s.push_str(&format!("  rel m{sec} at ground dx={} dy={} dz={}\n",
+                                (slo.0 + shi.0) / 2, (tall * storey) / 2, (slo.1 + shi.1) / 2));
+            s.push_str("end\n");
+        }
+        // the rooms and everything after are cut from all of it
+        return finish_program(s, l, brief, wall, floor_y, storey, lo, hi, tallest);
+    }
     s.push_str("pass the mass add\n");
     // centred on the rooms' own middle, not on the anchor: a layout
     // whose plan is not symmetric about the origin would otherwise be
@@ -370,6 +404,14 @@ pub fn to_program(l: &Layout, brief: &Brief, wall: &str, floor_y: i32) -> String
                         hi.0 - lo.0 + 4, tallest * storey + 2, hi.1 - lo.1 + 4));
     s.push_str(&format!("  rel shell at ground dx={mx} dy={} dz={mz}\n", (tallest * storey) / 2));
     s.push_str("end\n");
+    finish_program(s, l, brief, wall, floor_y, storey, lo, hi, tallest)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_program(mut s: String, l: &Layout, brief: &Brief, wall: &str, floor_y: i32,
+                  storey: i32, lo: (i32, i32), hi: (i32, i32), tallest: i32) -> String {
+    let (mx, mz) = ((lo.0 + hi.0) / 2, (lo.1 + hi.1) / 2);
+    let _ = tallest;
     // each room hollowed out of it
     s.push_str("pass the rooms cut\n");
     // STOREYS ARE FLOORS, not one tall void. A three-storey keep cut as
@@ -648,6 +690,7 @@ pub fn parse(src: &str) -> (Brief, Vec<String>) {
                     errs.push(format!("space '{name}' has no area=")); continue;
                 };
                 b.spaces.push(Space {
+                    section: kv("section").unwrap_or("").to_lowercase(),
                     name,
                     area: area.clamp(1, 1_000_000),
                     count: kv("count").and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 200),

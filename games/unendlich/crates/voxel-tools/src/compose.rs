@@ -265,7 +265,26 @@ pub fn programme(request: &str, site: ((i32, i32), (i32, i32)), seed: u64,
     p.rooms = layout.rooms.len();
     p.total = total;
     p.typology = t.name;
+    // and the flair the massing implies, appended: the sections are
+    // passes now, so `on curtain_wall top_edge` has something to mean
     p.src = crate::brief::to_program(&layout, &brief, "stone", 0);
+    // Assets first, then the mass passes, THEN the flair passes -- a
+    // flair attaches to a body an earlier pass left, so it cannot run
+    // before the thing it decorates exists.
+    let flair = crate::typology::to_flair(&m);
+    if !flair.trim().is_empty() {
+        let (assets, passes): (Vec<&str>, Vec<&str>) = {
+            let mut a = Vec::new(); let mut b = Vec::new();
+            let mut in_asset = false;
+            for l in flair.lines() {
+                let t = l.trim();
+                if t.starts_with("asset ") { in_asset = true; }
+                if in_asset { a.push(l); if t == "end" { in_asset = false; } } else { b.push(l); }
+            }
+            (a, b)
+        };
+        p.src = format!("{}\n{}\n{}", assets.join("\n"), p.src, passes.join("\n"));
+    }
     p.massing = m;
     p
 }

@@ -560,6 +560,27 @@ pub fn apply(t: &Typology, wishes: &[Wish]) -> Massing {
             Wish::Unplaced { text } => m.unplaced.push(text.clone()),
         }
     }
+    // A QUALITY THAT HAS A GEOMETRIC MEANING REACHES EVERY SECTION.
+    // Qualities were sorted, carried and reported, and then nothing
+    // used them: "a ruined citadel" collected `ruined` as a quality
+    // and built a pristine one, because only a MODIFICATION of a named
+    // section ever set that constraint. A quality is about the whole,
+    // which means all of it.
+    for q in &m.qualities {
+        let c = match q.as_str() {
+            "ruined" | "abandoned" | "broken" => Some("ruined"),
+            "ancient" | "weathered" => Some("weathered"),
+            "fortified" => Some("perimeter"),
+            "ornate" | "grand" | "wealthy" => Some("ornate"),
+            _ => None,
+        };
+        if let Some(c) = c {
+            for s in sections.iter_mut() {
+                if !s.constraints.iter().any(|x| x == c) { s.constraints.push(c.to_string()); }
+            }
+            m.log.push(format!("'{q}' applies to every section"));
+        }
+    }
     m.sections = sections;
     m
 }
@@ -614,7 +635,8 @@ pub fn to_brief(m: &Massing, total: i32) -> String {
         let got = areas.get(&sec.name).copied().unwrap_or(0);
         let base: i32 = sec.rooms.iter().map(|(_, a)| *a).sum();
         if sec.rooms.is_empty() || base == 0 {
-            s.push_str(&format!("space {} area={got}\n", sec.name));
+            s.push_str(&format!("space {} area={got} section={}\n", sec.name,
+                                sec.name.replace(' ', "_")));
             continue;
         }
         // WHAT THE SIZE UNLOCKS. A section that has grown past a
@@ -642,7 +664,7 @@ pub fn to_brief(m: &Massing, total: i32) -> String {
                 .filter_map(|c| match c.as_str() {
                     "perimeter" => Some("daylight"), "ground" => Some("outside_door"),
                     "tallest" => Some("tall"), _ => None }).collect();
-            s.push_str(&format!("space {room} area={a}"));
+            s.push_str(&format!("space {room} area={a} section={}", sec.name.replace(' ', "_")));
             if sec.prominence >= 2.0 { s.push_str(&format!(" height={}", sec.prominence.round() as i32)); }
             if !needs.is_empty() { s.push_str(&format!(" needs={}", needs.join(","))); }
             s.push('\n');
@@ -732,6 +754,62 @@ pub fn to_program(m: &Massing, total: i32, site: i32, wall: &str) -> String {
         s.push_str("end\n");
     }
     s
+}
+
+/// The flair a massing implies: what each section IS decides what goes
+/// on it. A section marked `perimeter` gets a parapet; `tallest` gets
+/// a finial; `ruined` gets its edges broken. These were carried
+/// through every layer and then dropped at the last one.
+///
+/// The exclusions matter as much as the placements: a parapet runs
+/// along the curtain wall and stops at the gatehouse, which is one
+/// line here and impossible before sections had names.
+pub fn to_flair(m: &Massing) -> String {
+    let body = |s: &Section| s.name.replace(' ', "_");
+    let names: Vec<String> = m.sections.iter().map(body).collect();
+    let mut out = String::new();
+    let mut assets = String::new();
+    let mut have: BTreeMap<&str, bool> = BTreeMap::new();
+    let mut want = |a: &'static str, src: &str, assets: &mut String| {
+        if have.insert(a, true).is_none() { assets.push_str(src); }
+    };
+    for sec in &m.sections {
+        let b = body(sec);
+        let has = |c: &str| sec.constraints.iter().any(|x| x == c);
+        if has("perimeter") || has("encloses") {
+            want("merlon", "asset merlon\n  part m box w=2 h=3 d=2 material=stone\nend\n", &mut assets);
+            // stop at the ways in, which is what a gate is
+            let stops: Vec<String> = m.sections.iter()
+                .filter(|o| o.constraints.iter().any(|c| c == "ground") && body(o) != b)
+                .map(|o| format!(" except {} all 5", body(o))).collect();
+            out.push_str(&format!("pass {b} battlements add\n\
+                                   flair merlon on {b} top_edge{}\n  every 3\nend\nend\n",
+                                  stops.first().cloned().unwrap_or_default()));
+        }
+        if has("tallest") {
+            want("finial", "asset finial\n  part f box w=1 h=4 d=1 material=quartz\nend\n", &mut assets);
+            out.push_str(&format!("pass {b} finials add\n\
+                                   flair finial on {b} corners\n  thin 4\nend\nend\n"));
+        }
+        if has("weathered") {
+            want("pit", "asset pit\n  part p box w=1 h=1 d=1 material=stone\nend\n", &mut assets);
+            out.push_str(&format!("pass {b} weathering cut\n\
+                                   flair pit on {b} shell\n  cull 0.06\n  jitter 1 seed=11\nend\nend\n"));
+        }
+        if has("ornate") {
+            want("boss", "asset boss\n  part o box w=1 h=2 d=1 material=quartz\nend\n", &mut assets);
+            out.push_str(&format!("pass {b} enrichment add\n\
+                                   flair boss on {b} corners\n  every 4\nend\nend\n"));
+        }
+        if has("ruined") {
+            want("chip", "asset chip\n  part c box w=1 h=1 d=1 material=stone\nend\n", &mut assets);
+            // broken edges: a CUT pass, because ruin is material gone
+            out.push_str(&format!("pass {b} ruin cut\n\
+                                   flair chip on {b} top_edge\n  cull 0.45\n  jitter 1 seed=3\nend\nend\n"));
+        }
+    }
+    let _ = names;
+    format!("{assets}{out}")
 }
 
 /// The prompt for the massing turn -- the one that was missing.
@@ -1166,5 +1244,44 @@ mod tests {
         assert!(tiers.iter().any(|(_, t, _)| *t == Tier::Landscape),
                 "at that size a section is a landscape: {:?}",
                 tiers.iter().map(|(n, t, _)| (n, t.word())).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn what_a_section_is_decides_what_goes_on_it() {
+        let c = lookup("castle").unwrap();
+        let m = apply(&c, &[]);
+        let f = to_flair(&m);
+        // the perimeter gets a parapet, and it stops at the way in
+        assert!(f.contains("flair merlon on curtain_wall top_edge"), "{f}");
+        assert!(f.contains("except gatehouse"), "a parapet stops at the gate: {f}");
+        // the tallest thing gets finials
+        assert!(f.contains("flair finial on keep corners"), "{f}");
+        // assets are declared once however many sections use them
+        assert_eq!(f.matches("asset merlon").count(), 1);
+        // and it is a program that parses
+        let (prog, errs) = crate::program::parse(&f);
+        assert!(errs.is_empty(), "{f}\n{errs:?}");
+        assert!(!prog.passes.is_empty() && !prog.assets.is_empty());
+    }
+
+    #[test]
+    fn a_quality_reaches_every_section_rather_than_being_collected_and_ignored() {
+        // "a ruined citadel" collected `ruined` as a quality and built
+        // a PRISTINE one: only a modification of a NAMED section ever
+        // set that constraint, so a quality about the whole reached
+        // nothing at all.
+        let c = lookup("castle").unwrap();
+        let req = "a ruined citadel";
+        let m = apply(&c, &triage(req, &c));
+        assert!(m.qualities.iter().any(|q| q == "ruined"), "{:?}", m.qualities);
+        assert!(m.sections.iter().all(|s| s.constraints.iter().any(|x| x == "ruined")),
+                "every section is ruined, not just one");
+        assert!(m.log.iter().any(|l| l.contains("applies to every section")), "{:?}", m.log);
+        let f = to_flair(&m);
+        assert!(f.contains("ruin cut"), "and ruin is a CUT: material gone, not added");
+        assert!(f.matches("ruin cut").count() >= 3, "one per section: {f}");
+        // an ordinary castle gets none of it
+        let plain = to_flair(&apply(&c, &triage("a castle", &c)));
+        assert!(!plain.contains("ruin"), "{plain}");
     }
 }
