@@ -36,6 +36,11 @@ pub struct Feel {
     /// its terminal and cannot dictate is not the keyboard being shipped, and
     /// the modules existed the whole time.
     tray: crate::tray::Tray,
+    /// Full / Tray / Dismissed. The tray widget was ported and the machine that decides
+    /// when it is on screen was not, so `tray_open` was a bool a debug button set — the
+    /// documented transitions (a long upward fling, a double-activate back) had nowhere to
+    /// live. See `visible_mode`.
+    vis: crate::visible_mode::Machine,
     tray_open: bool,
     microterm: crate::microterm::Microterm,
     /// The dictation SERVICE, not a bare Dictation: it owns the same state
@@ -243,6 +248,7 @@ impl Feel {
             // A starter word list so the demo binary can be swiped immediately; on-device the
             // host loads rusty-board's shipped dictionary into the same recognizer.
             tray: Default::default(),
+            vis: Default::default(),
             tray_open: false,
             microterm: Default::default(),
             // 16kHz: what the transcriber expects, and what the window maths
@@ -391,8 +397,20 @@ impl Feel {
                 // never reached. Placed on the top strip because that is where
                 // the real keyboard puts its chrome, and because a control you
                 // cannot find is the same as a control that does not exist.
+                // Drives the MACHINE, so the debug button and a real upward fling take the
+                // same path and cannot disagree about what state the keyboard is in.
                 if ui.selectable_label(self.tray_open, "▁ tray").clicked() {
-                    self.tray_open = !self.tray_open;
+                    let _ = if self.vis.mode() == crate::visible_mode::VisibleMode::Tray {
+                        self.vis.expand()
+                    } else {
+                        // From Dismissed there is no board to minimize, so make one first —
+                        // the debug button stands in for the IM activate a real session has.
+                        if !self.vis.is_visible() {
+                            let _ = self.vis.activate((ui.input(|i| i.time) * 1000.0) as u64);
+                        }
+                        self.vis.fling_up()
+                    };
+                    self.tray_open = self.vis.mode() == crate::visible_mode::VisibleMode::Tray;
                 }
                 if ui.selectable_label(self.settings_open, "⚙ settings").clicked() {
                     self.settings_open = !self.settings_open;
@@ -718,7 +736,11 @@ impl Feel {
 
                 ui.horizontal(|ui| {
 
-                    if ui.button("expand").clicked() { self.tray.expand(); self.tray_open = false; }
+                    if ui.button("expand").clicked() {
+                        self.tray.expand();
+                        let _ = self.vis.expand();
+                        self.tray_open = false;
+                    }
 
                     // The spacebar carries all three gesture vocabularies: tap for a
 

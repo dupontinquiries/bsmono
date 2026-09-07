@@ -25,6 +25,8 @@ pub mod real_layout;
 pub mod dictation;
 pub mod mic_source;
 pub mod tray;
+/// Full / Tray / Dismissed and every way between them (`docs/single-hand-mode.md`).
+pub mod visible_mode;
 pub mod microterm;
 pub mod voice;
 pub mod steno;
