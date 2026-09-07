@@ -908,6 +908,7 @@ impl Feel {
                                         }
                                     }
                                 }
+                                Some(Press::Arrow(a)) => self.emit_key(a.keysym()),
                                 Some(Press::Voice) => self.toggle_dictation(),
                                 None => {}
                                 Some(_) => {}
@@ -945,6 +946,11 @@ impl Feel {
                             // keys that did nothing — the engine is mounted and tested and
                             // had never had a stroke fed to it from this path.
                             Press::Steno(button, gesture) => self.on_steno(&button, &gesture),
+                            // A spacebar swipe moves the caret. The TRAY has had this since
+                            // it was ported; the full board had not, so the same gesture on
+                            // the same key meant different things depending on whether the
+                            // keyboard was minimized.
+                            Press::Arrow(a) => self.emit_key(a.keysym()),
                         }
                     }
                     // ── swipe typing over whichever board is showing ──────────────────

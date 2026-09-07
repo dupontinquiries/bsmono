@@ -83,6 +83,13 @@ pub enum Press {
     Shift,
     SymbolsToggle,
     Voice,
+    /// A caret move: a cardinal swipe on the spacebar, in any layout.
+    ///
+    /// `docs/single-hand-mode.md` lists it under Full state as "(existing)" — existing in
+    /// GTK. The TRAY's spacebar has carried it since `tray.rs` was ported; the full board's
+    /// had not, so the same gesture on the same key meant different things depending on
+    /// whether the keyboard was minimized.
+    Arrow(Arrow),
     /// A steno key's tap or cardinal swipe. Carries the button id
     /// ("L1"/"L2"/"R1"/"R2") and gesture code ("tap"/"N"/"E"/"S"/"W") —
     /// see `crate::decode_steno_token`'s doc comment for why the
@@ -128,6 +135,65 @@ pub fn voice_emit() -> String {
     action_emit(&KeyAction::Voice, "")
 }
 
+/// A caret direction. Its own type rather than `tray::Dir` so the render layer does not
+/// depend on the tray widget, and rather than a bare string so a typo is a compile error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arrow {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl Arrow {
+    /// The X keysym name the sink emits, matching `emit_key`'s vocabulary.
+    pub fn keysym(self) -> &'static str {
+        match self {
+            Arrow::Left => "Left",
+            Arrow::Right => "Right",
+            Arrow::Up => "Up",
+            Arrow::Down => "Down",
+        }
+    }
+
+    /// The token a spacebar swipe emits.
+    pub fn token(self) -> String {
+        format!("{ACT}{}", match self {
+            Arrow::Left => "left",
+            Arrow::Right => "right",
+            Arrow::Up => "up",
+            Arrow::Down => "down",
+        })
+    }
+}
+
+/// Give a layout's spacebar its four arrow swipes.
+///
+/// "Cardinal swipe on the spacebar in ANY layout" is the doc's wording, so this is applied
+/// to the rendered layout rather than written into each layout's data — five boards with
+/// five copies of the same four gestures is how one of them ends up missing an arrow.
+///
+/// A spacebar that ALREADY has cardinal gestures is left alone: a layout that deliberately
+/// put something else on its space swipes means it, and silently overwriting that would be
+/// this function deciding it knows better than the layout file.
+pub fn attach_space_arrows(layout: &mut crate::Layout) {
+    for row in &mut layout.rows {
+        for k in &mut row.keys {
+            let is_space = classify(&k.emit) == Press::Text(" ".to_string());
+            if !is_space || !k.cardinal.is_empty() {
+                continue;
+            }
+            use uikit_egui::slide_menu::Dir8;
+            k.cardinal = vec![
+                (Dir8::W, Arrow::Left.token()),
+                (Dir8::E, Arrow::Right.token()),
+                (Dir8::N, Arrow::Up.token()),
+                (Dir8::S, Arrow::Down.token()),
+            ];
+        }
+    }
+}
+
 /// Turn a `keyboard_ui` emission back into a typed [`Press`].
 pub fn classify(emit: &str) -> Press {
     if let Some((button, gesture)) = crate::decode_steno_token(emit) {
@@ -141,6 +207,10 @@ pub fn classify(emit: &str) -> Press {
         Some("tab") => Press::Text("\t".to_string()),
         Some("symbols_toggle") => Press::SymbolsToggle,
         Some("voice") => Press::Voice,
+        Some("left") => Press::Arrow(Arrow::Left),
+        Some("right") => Press::Arrow(Arrow::Right),
+        Some("up") => Press::Arrow(Arrow::Up),
+        Some("down") => Press::Arrow(Arrow::Down),
         Some(other) => Press::Text(other.to_string()),
         None => Press::Text(emit.to_string()),
     }
@@ -363,7 +433,12 @@ impl RealBoard {
 
     /// The render layout for the current file + shift state (hand to `keyboard_ui`).
     pub fn render(&self) -> crate::Layout {
-        to_render(self.current(), self.shift)
+        let mut l = to_render(self.current(), self.shift);
+        // Same attachment as the code-built board's. Both projections, one rule — the
+        // alternative is a spacebar whose swipes depend on which of two render paths drew
+        // it, which is the class of difference nobody finds until they switch boards.
+        attach_space_arrows(&mut l);
+        l
     }
 
     fn index_of(&self, name: &str) -> Option<usize> {

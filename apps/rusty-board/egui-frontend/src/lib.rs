@@ -637,10 +637,15 @@ impl Board {
     /// layout that have to be kept in step — and the shifted one is only needed while a
     /// frame is being drawn.
     pub fn rendered(&self) -> std::borrow::Cow<'_, Layout> {
-        if self.shift == real_layout::Shift::Off && !self.voice_active {
-            return std::borrow::Cow::Borrowed(self.current());
-        }
+        // The spacebar's arrow swipes are attached at RENDER time, to whatever board is
+        // showing — "in any layout" is the doc's wording, and five boards with five copies
+        // of the same four gestures is how one of them ends up missing an arrow. Which also
+        // means `rendered` can no longer take the borrowed shortcut.
         let mut l = self.current().clone();
+        real_layout::attach_space_arrows(&mut l);
+        if self.shift == real_layout::Shift::Off && !self.voice_active {
+            return std::borrow::Cow::Owned(l);
+        }
         for row in &mut l.rows {
             for k in &mut row.keys {
                 if k.role == KeyRole::Modifier && crate::real_layout::classify(&k.emit) == real_layout::Press::Shift {
@@ -2207,6 +2212,72 @@ mod gtk_parity_tests {
         assert_eq!(b.current().name, "symbols");
         b.toggle_symbols();
         assert_eq!(b.layout_index(), cardinal);
+    }
+
+    /// "Cardinal swipe on the spacebar in any layout → Arrow key" is in the doc's Full-state
+    /// table. The TRAY had it from the day `tray.rs` was ported; the full board did not, so
+    /// the same gesture on the same key meant different things depending on whether the
+    /// keyboard was minimized.
+    #[test]
+    fn every_board_gives_its_spacebar_the_arrow_swipes() {
+        use crate::real_layout::{classify, Arrow, Press};
+        use uikit_egui::slide_menu::Dir8;
+        let mut b = Board::new();
+        for mode in ["off", "cardinal", "words", "stenotype"] {
+            b.apply_mode(mode);
+            let l = b.rendered();
+            let space = l
+                .rows
+                .iter()
+                .flat_map(|r| &r.keys)
+                .find(|k| classify(&k.emit) == Press::Text(" ".to_string()))
+                .unwrap_or_else(|| panic!("{mode}: no spacebar"));
+            let by = |d: Dir8| space.cardinal.iter().find(|(k, _)| *k == d).map(|(_, s)| s.clone());
+            for (d, want) in [
+                (Dir8::W, Arrow::Left),
+                (Dir8::E, Arrow::Right),
+                (Dir8::N, Arrow::Up),
+                (Dir8::S, Arrow::Down),
+            ] {
+                let got = by(d).unwrap_or_else(|| panic!("{mode}: no {d:?} swipe on space"));
+                assert_eq!(classify(&got), Press::Arrow(want), "{mode} {d:?}");
+            }
+        }
+    }
+
+    /// A layout that deliberately put something else on its space swipes means it, and
+    /// silently overwriting that would be the attacher deciding it knows better than the
+    /// layout file.
+    #[test]
+    fn a_spacebar_that_already_has_gestures_is_left_alone() {
+        use crate::real_layout::{attach_space_arrows, classify, Press};
+        use uikit_egui::slide_menu::Dir8;
+        let mut l = Layout::qwerty();
+        for row in &mut l.rows {
+            for k in &mut row.keys {
+                if classify(&k.emit) == Press::Text(" ".to_string()) {
+                    k.cardinal = vec![(Dir8::N, "custom".to_string())];
+                }
+            }
+        }
+        attach_space_arrows(&mut l);
+        let space = l.rows.iter().flat_map(|r| &r.keys)
+            .find(|k| classify(&k.emit) == Press::Text(" ".to_string())).unwrap();
+        assert_eq!(space.cardinal.len(), 1, "the attacher overwrote a layout's own gestures");
+        assert_eq!(space.cardinal[0].1, "custom");
+    }
+
+    /// The arrows must reach the sink under the names it expects, and be their own Press —
+    /// an arrow that classified as text would type the word "left".
+    #[test]
+    fn an_arrow_token_is_a_press_not_a_word() {
+        use crate::real_layout::{classify, Arrow, Press};
+        for a in [Arrow::Left, Arrow::Right, Arrow::Up, Arrow::Down] {
+            assert_eq!(classify(&a.token()), Press::Arrow(a));
+            assert!(!a.token().contains(a.keysym()), "the token must not be the keysym itself");
+        }
+        assert_eq!(Arrow::Left.keysym(), "Left");
+        assert_eq!(Arrow::Down.keysym(), "Down");
     }
 
     /// The stenotype board's four keys must carry a STENO BUTTON ID. That is what makes
