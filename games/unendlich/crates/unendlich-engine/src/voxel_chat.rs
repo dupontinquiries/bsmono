@@ -1711,15 +1711,13 @@ impl Paintbrush {
             self.say(format!("loading {path} into the GPU on the worker (once) ..."));
         }
         // No load here. The completer loads on the worker when it runs.
-        // The reply cap follows the prompt tier: a 1B that runs long is
-        // looping, a 70B village needs the room. 512 flat cut an 8B's
-        // hut off mid-plan.
-        let max_tokens = match self.prompt_tier() {
-            voxel_tools::prompt::Tier::Compact => 400,
-            voxel_tools::prompt::Tier::Medium => 900,
-            voxel_tools::prompt::Tier::Full => 1400,
-        };
-        Some(Box::new(EngineCompleter { engine: self.engine.clone(), path, max_tokens }))
+        // The reply cap follows the prompt tier -- ONE table, in
+        // `max_reply_tokens`. This was a second copy of it, and when the
+        // Tiny tier arrived the copy stopped compiling: which is the
+        // good outcome, since the alternative was two caps drifting
+        // apart silently.
+        Some(Box::new(EngineCompleter { engine: self.engine.clone(), path,
+                                        max_tokens: self.max_reply_tokens() }))
     }
 
     #[cfg(not(feature = "ai-engine"))]
