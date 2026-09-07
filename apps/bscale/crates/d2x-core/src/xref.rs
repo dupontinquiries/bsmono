@@ -48,6 +48,51 @@
 //! thousand distinct cells. FIFO, like `BlockCache`, for the same reason: repeats are bursty
 //! and cheap to re-learn.
 
+//! ## MEASURED, AND IT DOES NOT PAY YET — read this before wiring it in
+//!
+//! A separate run measured the closely-related subtile/block cache with harvesting and
+//! gated probing on real footage (Lone Ranger AV1, 120 frames, 512 MB): harvesting raised
+//! supply 3.7× — 14,567 inserts to 54,390 — and the hit rate did not move, 0.2% to 0.3%.
+//! Gated probing by a quantised signature was flat at every quantiser and at both 4×4 and
+//! 2×2 signatures: 36 hits in 29,178 probes. On a cut-heavy clip, 60 hits in 88,679. On
+//! SMITE, zero.
+//!
+//! **This module makes the same two mistakes**, and the numbers above are the evidence:
+//!
+//! 1. **A quantised fingerprint is still an exact match, in a coarser space.** The 4×4×5-bit
+//!    key here is 16 numbers that must all land in the same bin, bin boundaries included.
+//!    The measured version used the same idea and got a negligible candidate rate; dropping
+//!    to a 2×2 signature did not help. The right tool is LSH or a small ANN index over block
+//!    descriptors, not a finer or coarser quantiser.
+//!
+//! 2. **The probe set is the bottleneck, and no matcher fixes that.** A cell only reaches
+//!    this store after Stationary, the motion search, the reference ring, the plate and the
+//!    anchor have all failed it. What survives that filter is content genuinely new to the
+//!    shot — and genuinely new content has no twin in a few seconds of cache. The cases this
+//!    was built for (letterbox, static HUD, unchanged background) never arrive, because they
+//!    are Stationary, which is cheaper. For scale: `RecalledMoved` serves ~1238 blocks/frame
+//!    on SMITE; the cache serves 0.3.
+//!
+//! Cross-worker sharing does not change either of those. It widens the store's reach across
+//! segments, which is a real improvement to SUPPLY — and supply was already shown not to be
+//! the binding constraint.
+//!
+//! So this stays at `xref_bytes: 0` and unwired. What would change the answer, in order:
+//!
+//! * **Outlive the shot.** Film cuts back to the same set dozens of times and a FIFO
+//!   discards shot A long before shot A returns. A small on-disk index keyed by a shot
+//!   descriptor matches how film is actually cut — and is the one change that makes the
+//!   cross-worker part matter, since segments are cut at keyframes and a returning shot is
+//!   very likely in a different segment.
+//! * **Probe with motion, not identity.** An ANN index over block descriptors turns "the
+//!   same pixels appeared before" into "these pixels appeared before, somewhere", which is
+//!   what beat identity matching by two orders of magnitude everywhere else in this pipeline.
+//! * **Keep it for animation**, where exact repeats are the norm and where this was aimed.
+//!
+//! The store below is correct and cheap to keep; what it lacks is a reason to be switched
+//! on. Left in place because the shot-descriptor index above needs exactly this structure,
+//! and because a measured negative is worth more than an unmeasured guess.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

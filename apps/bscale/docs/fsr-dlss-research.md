@@ -184,13 +184,36 @@ gate would still be correct; the run would just be slower than not caching at al
 without the cost side the feature is unfalsifiable: more memory, and no way to say what it
 bought. A high compared-to-hits ratio means the fingerprint is too coarse for that content.
 
-## Status
+## Status: measured, and it does not pay yet
 
-`cfg.xref_bytes` exists and defaults to 0 (off). The store is written and tested; the
-pipeline does not consult it yet, and there is no CLI flag. Wiring is the next step, and the
-number to report afterwards is the one `analyze` already prints — the fraction of pixels
-going through the network — measured on a source with real repeats (a dialogue scene, a
-title sequence) at `-j 1` versus `-j 8`.
+`cfg.xref_bytes` defaults to 0 and the pipeline does not consult the store. That is now a
+decision rather than an unfinished step.
+
+A separate measurement of the closely-related subtile/block cache — with harvesting and
+gated probing, on Lone Ranger AV1, 120 frames, 512 MB — found harvesting raised supply 3.7×
+(14,567 inserts to 54,390) **and the hit rate did not move**: 0.2% to 0.3%. Gated probing by
+a quantised signature was flat at every quantiser and at both 4×4 and 2×2 signatures. On a
+cut-heavy clip, 60 hits in 88,679 probes; on SMITE, zero.
+
+`Xref` makes the same two mistakes, and those numbers are the evidence:
+
+1. A quantised fingerprint is **still an exact match, in a coarser space** — 16 numbers that
+   must all land in the same bin. LSH or a small ANN index is the right tool, not a different
+   quantiser.
+2. **The probe set is the bottleneck.** A cell only reaches this store after Stationary, the
+   motion search, the reference ring, the plate and the anchor have all failed it. What
+   survives is content genuinely new to the shot, which by definition has no twin in a few
+   seconds of cache. The cases the cache was built for — letterbox, static HUD, unchanged
+   background — never arrive, because they are Stationary, which is cheaper. `RecalledMoved`
+   serves ~1238 blocks/frame on SMITE; the cache serves 0.3.
+
+Cross-worker sharing widens **supply**, and supply was already shown not to be the binding
+constraint. So the honest read is that the sharing is not the thing that was missing.
+
+What would change the answer, in order: outlive the shot (an on-disk index keyed by a shot
+descriptor — the one change that makes cross-worker sharing matter, since segments are cut at
+keyframes and a returning shot is very likely in another segment); probe with motion rather
+than identity; and keep it for animation, where exact repeats are the norm.
 
 ---
 
