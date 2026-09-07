@@ -240,6 +240,9 @@ pub fn run(title: &str) -> Result<(), LayerError> {
     let mut last_frame = Instant::now();
     // When egui next wants a frame regardless of input (animations, request_repaint_after).
     let mut repaint_at = Instant::now();
+    // Texture uploads owed to the painter, accumulated across frames that ran but were not
+    // painted. See the note at the paint site.
+    let mut pending_textures = egui::TexturesDelta::default();
 
     tracing::info!("layer-shell shell up: {}x{} @{}x, layer {:?}", state.logical_size().0, state.logical_size().1, state.scale, layer_from_env());
 
@@ -307,12 +310,26 @@ pub fn run(title: &str) -> Result<(), LayerError> {
 
         // ---- 3. paint if the compositor has said we may. Every frame that ran is painted
         //         (that is what egui's model expects; frames only run when due).
+        // A SKIPPED FRAME MUST NOT DROP ITS TEXTURE DELTA. Shapes are cheap to lose — the
+        // next frame re-runs the UI and produces them again — but a `TexturesDelta` is an
+        // upload instruction egui issues ONCE. The font atlas goes up in the delta of the
+        // FIRST frame, and the first frame is exactly the one this loop skips: the initial
+        // commit is made without a buffer and painting waits for `configure`.
+        //
+        // Losing it fails quietly. Later frames tessellate correctly and reference a texture
+        // that was never uploaded, so every glyph and every rounded corner samples an empty
+        // atlas — the board renders as a black rectangle that still takes taps, because
+        // input never went through the painter at all.
+        //
+        // So: accumulate across skipped frames and apply on the next paint that happens.
+        pending_textures.append(out.textures_delta);
         if mapped && state.configured && !state.frame_pending {
             let px = state.pixel_size();
             gl.resize_if_needed(px).map_err(LayerError::Runtime)?;
             state.layer.wl_surface().set_buffer_scale(state.scale.max(1));
             let primitives = ctx.tessellate(out.shapes, ppp);
-            gl.paint(px, ppp, &primitives, &out.textures_delta);
+            gl.paint(px, ppp, &primitives, &pending_textures);
+            pending_textures.clear();
             // Throttle to the compositor: no more paints until it says it consumed this one.
             state.layer.wl_surface().frame(&qh, state.layer.wl_surface().clone());
             state.frame_pending = true;
@@ -666,4 +683,50 @@ impl ProvidesRegistryState for State {
         &mut self.registry_state
     }
     registry_handlers![OutputState, SeatState];
+}
+
+#[cfg(test)]
+mod tests {
+    /// A frame that runs but is not painted must hand its texture uploads to the next one.
+    ///
+    /// `TexturesDelta` is an instruction egui issues ONCE. The font atlas goes up in the
+    /// first frame's delta, and the first frame is the one this loop skips — the initial
+    /// commit is made without a buffer and painting waits for `configure`. Dropping it does
+    /// not fail loudly: later frames reference a texture that was never uploaded, every
+    /// glyph and rounded corner samples an empty atlas, and the board is a black rectangle
+    /// that still takes taps, because input never went through the painter at all.
+    #[test]
+    fn skipped_frames_hand_their_texture_uploads_forward() {
+        use egui::epaint::{image::ImageDelta, ColorImage, TextureId};
+        let img = |v: u8| {
+            ImageDelta::full(
+                ColorImage::new([1, 1], vec![egui::Color32::from_gray(v)]),
+                egui::TextureOptions::LINEAR,
+            )
+        };
+        let mut pending = egui::TexturesDelta::default();
+
+        // Frame 1: the font atlas. Not painted — no configure yet.
+        let mut first = egui::TexturesDelta::default();
+        first.set.push((TextureId::Managed(0), img(1)));
+        pending.append(first);
+        assert_eq!(pending.set.len(), 1, "the atlas upload was dropped");
+
+        // Frame 2: also skipped, and adds its own.
+        let mut second = egui::TexturesDelta::default();
+        second.set.push((TextureId::Managed(1), img(2)));
+        pending.append(second);
+        assert_eq!(pending.set.len(), 2, "a second skipped frame lost an upload");
+
+        // Frame 3 paints: everything owed goes up at once, then the slate is clean.
+        assert!(!pending.is_empty());
+        pending.clear();
+        assert!(pending.is_empty(), "the pending set would be re-uploaded every frame");
+
+        // A free is carried too, or a texture leaks for the process's lifetime.
+        let mut freeing = egui::TexturesDelta::default();
+        freeing.free.push(TextureId::Managed(1));
+        pending.append(freeing);
+        assert_eq!(pending.free.len(), 1);
+    }
 }

@@ -480,12 +480,22 @@ pub struct Board {
     idx: usize,
     gesture: uikit_egui::GestureLayer,
     palette: String,
+    /// Off / one-shot / locked, exactly as the real board tracks it.
+    ///
+    /// The code-built boards had no shift state at all. Before the last commit the shift
+    /// key typed the string "⇧"; after it, `Press::Shift` reached the app and fell through
+    /// a `_ => {}`. Better, and still a key you press that does nothing — which on a
+    /// keyboard is its own kind of broken.
+    shift: real_layout::Shift,
+    /// Where the symbols toggle came from, so `?123` and `ABC` are the same key going both
+    /// ways rather than a one-way trip.
+    before_symbols: Option<usize>,
 }
 
 impl Board {
     /// Default board: qwerty + symbols.
     pub fn new() -> Board {
-        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0), palette: "system".to_string() }
+        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0), shift: real_layout::Shift::Off, before_symbols: None, palette: "system".to_string() }
     }
     pub fn current(&self) -> &Layout {
         &self.layouts[self.idx]
@@ -505,6 +515,66 @@ impl Board {
         self.layouts.iter().map(|l| l.name.as_str()).collect()
     }
     pub fn layout_index(&self) -> usize { self.idx }
+
+    /// The shift state, for the caller that needs to draw it.
+    pub fn shift(&self) -> real_layout::Shift { self.shift }
+
+    /// A shift press: Off → Once → Caps → Off, the same cycle as the real board. One
+    /// implementation of that cycle, in `real_layout::Shift`, so the two boards cannot
+    /// disagree about what a second tap means.
+    pub fn tap_shift(&mut self) {
+        self.shift = self.shift.tap();
+    }
+
+    /// After text is emitted, a one-shot shift is spent. Caps is not.
+    pub fn after_text(&mut self) {
+        self.shift = self.shift.after_text();
+    }
+
+    /// `?123` / `ABC`. Returns to the layout it came from, so the key is the same one going
+    /// both ways — a toggle that only goes one way is a trap on a phone, where the way back
+    /// is a swipe nobody has been told about.
+    pub fn toggle_symbols(&mut self) {
+        let symbols = self.layouts.iter().position(|l| l.name == "symbols");
+        match (self.before_symbols.take(), symbols) {
+            (Some(back), _) => self.set_layout(back),
+            (None, Some(sym)) if sym != self.idx => {
+                self.before_symbols = Some(self.idx);
+                self.set_layout(sym);
+            }
+            _ => {}
+        }
+    }
+
+    /// The current layout with the shift state applied: letters uppercased, and the shift
+    /// key itself carrying the latch so the cap shows which of the three states is on.
+    ///
+    /// Built on demand rather than stored, because the alternative is two copies of every
+    /// layout that have to be kept in step — and the shifted one is only needed while a
+    /// frame is being drawn.
+    pub fn rendered(&self) -> std::borrow::Cow<'_, Layout> {
+        if self.shift == real_layout::Shift::Off {
+            return std::borrow::Cow::Borrowed(self.current());
+        }
+        let mut l = self.current().clone();
+        for row in &mut l.rows {
+            for k in &mut row.keys {
+                if k.role == KeyRole::Modifier && crate::real_layout::classify(&k.emit) == real_layout::Press::Shift {
+                    k.latch = match self.shift {
+                        real_layout::Shift::Once => Latch::Once,
+                        real_layout::Shift::Caps => Latch::Locked,
+                        real_layout::Shift::Off => Latch::Off,
+                    };
+                } else if k.role == KeyRole::Normal && k.emit.chars().all(|c| c.is_lowercase()) && !k.emit.is_empty() {
+                    // Only a plain letter is upshifted. A digit, a symbol or an action token
+                    // has no upper case, and uppercasing an action token would corrupt it.
+                    k.label = k.label.to_uppercase();
+                    k.emit = k.emit.to_uppercase();
+                }
+            }
+        }
+        std::borrow::Cow::Owned(l)
+    }
     /// Read a committed swipe from the gesture layer (call each frame with the board rect).
     ///
     /// NOT used by the live app any more (see `vertical_tabs` in feel.rs): a whole-board swipe surface
@@ -1757,6 +1827,107 @@ mod gtk_parity_tests {
         assert_eq!(classify(&by_label("⌫").emit), Press::Text("\u{8}".into()));
         assert_eq!(classify(&by_label("⏎").emit), Press::Text("\n".into()));
         assert_eq!(classify(&by_label(" ").emit), Press::Text(" ".into()));
+    }
+
+    /// Shift and `?123` on the code-built boards. Before the last commit they typed their
+    /// own labels ("⇧", "?123"); after it they arrived as tokens and fell through a
+    /// `_ => {}`. A key you press that does nothing is its own kind of broken.
+    #[test]
+    fn shift_cycles_and_a_one_shot_is_spent_by_the_letter_it_shifted() {
+        use crate::real_layout::Shift;
+        let mut b = Board::new();
+        assert_eq!(b.shift(), Shift::Off);
+        let letter = |l: &Layout| {
+            l.rows.iter().flat_map(|r| &r.keys).find(|k| k.label.eq_ignore_ascii_case("q")).cloned()
+        };
+        assert_eq!(letter(&b.rendered()).unwrap().emit, "q");
+
+        // Off → Once: the letters upshift and the shift cap shows the latch.
+        b.tap_shift();
+        assert_eq!(b.shift(), Shift::Once);
+        let r = b.rendered();
+        assert_eq!(letter(&r).unwrap().emit, "Q");
+        let shift_key = r.rows.iter().flat_map(|x| &x.keys)
+            .find(|k| crate::real_layout::classify(&k.emit) == crate::real_layout::Press::Shift)
+            .expect("a shift key");
+        assert_eq!(shift_key.latch, Latch::Once);
+        drop(r);
+
+        // A letter spends a one-shot.
+        b.after_text();
+        assert_eq!(b.shift(), Shift::Off);
+        assert_eq!(letter(&b.rendered()).unwrap().emit, "q");
+
+        // Once → Caps: NOT spent by text, which is the whole difference between them.
+        b.tap_shift();
+        b.tap_shift();
+        assert_eq!(b.shift(), Shift::Caps);
+        b.after_text();
+        assert_eq!(b.shift(), Shift::Caps, "caps was spent like a one-shot");
+        assert_eq!(letter(&b.rendered()).unwrap().emit, "Q");
+        let r = b.rendered();
+        let shift_key = r.rows.iter().flat_map(|x| &x.keys)
+            .find(|k| crate::real_layout::classify(&k.emit) == crate::real_layout::Press::Shift).unwrap();
+        assert_eq!(shift_key.latch, Latch::Locked);
+        drop(r);
+
+        // Caps → Off closes the cycle.
+        b.tap_shift();
+        assert_eq!(b.shift(), Shift::Off);
+    }
+
+    /// Shift must not corrupt what it does not understand. An action token is bytes, not a
+    /// word, and uppercasing it would break the key.
+    #[test]
+    fn shift_upshifts_letters_and_leaves_everything_else_alone() {
+        let mut b = Board::new();
+        b.tap_shift();
+        let r = b.rendered();
+        for k in r.rows.iter().flat_map(|x| &x.keys) {
+            match crate::real_layout::classify(&k.emit) {
+                crate::real_layout::Press::Text(t) => {
+                    // A letter is upshifted; a space, a digit and punctuation are not.
+                    if t.chars().all(|c| c.is_alphabetic()) && !t.is_empty() {
+                        assert!(t.chars().all(|c| !c.is_lowercase()), "{t:?} was left lower-case");
+                    }
+                }
+                // Every action still decodes as itself — nothing was uppercased into junk.
+                p => assert!(
+                    matches!(p, crate::real_layout::Press::Shift
+                                | crate::real_layout::Press::Voice
+                                | crate::real_layout::Press::SymbolsToggle
+                                | crate::real_layout::Press::Backspace
+                                | crate::real_layout::Press::Return
+                                | crate::real_layout::Press::Steno(..)),
+                    "{p:?} came out of a shifted layout"
+                ),
+            }
+        }
+    }
+
+    /// A toggle that only goes one way is a trap on a phone, where the way back is a swipe
+    /// nobody has been told about.
+    #[test]
+    fn the_symbols_toggle_returns_to_where_it_came_from() {
+        let mut b = Board::new();
+        let start = b.layout_index();
+        // The bundled file's own name. `Layout::qwerty()` parses
+        // `resources/layouts/en_us_qwerty.json`, whose `name` field is `en_us_qwerty` — the
+        // constructor is called `qwerty`, the LAYOUT is not, and asserting the constructor's
+        // name here was asserting something no data says.
+        assert_eq!(b.current().name, "en_us_qwerty");
+        b.toggle_symbols();
+        assert_eq!(b.current().name, "symbols");
+        b.toggle_symbols();
+        assert_eq!(b.layout_index(), start, "?123 was a one-way trip");
+
+        // From a different board it returns THERE, not to qwerty.
+        let cardinal = b.layout_names().iter().position(|n| *n == "cardinal").expect("cardinal exists");
+        b.set_layout(cardinal);
+        b.toggle_symbols();
+        assert_eq!(b.current().name, "symbols");
+        b.toggle_symbols();
+        assert_eq!(b.layout_index(), cardinal);
     }
 
     /// The reported desktop fault: tall, blurry caps. Every glyph the board paints must be

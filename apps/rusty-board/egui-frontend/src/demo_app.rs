@@ -849,7 +849,7 @@ impl Feel {
                                 Some(_) => {}
                             }
                         }
-                    } else if let Some(e) = keyboard_ui(ui, self.board.current(), &adaptive, self.board.palette()) {
+                    } else if let Some(e) = keyboard_ui(ui, &self.board.rendered(), &adaptive, self.board.palette()) {
                         // Same decoder as the real layouts, so a mic key or an action token
                         // on a code-built board means the same thing it means on a JSON one.
                         match crate::real_layout::classify(&e) {
@@ -858,8 +858,18 @@ impl Feel {
                             Press::Voice => self.toggle_dictation(),
                             Press::Text(t) if t == "\u{8}" => self.emit_key("BackSpace"),
                             Press::Text(t) if t == "\n" => self.emit_key("Return"),
-                            Press::Text(t) => self.emit_text(&t),
-                            _ => {}
+                            Press::Text(t) => {
+                                self.emit_text(&t);
+                                // A one-shot shift is spent by the text it shifted. Caps is
+                                // not — that is the whole difference between them.
+                                self.board.after_text();
+                            }
+                            // These arrived as tokens for the first time in the last commit
+                            // and fell through a `_ => {}`: better than typing "⇧", and
+                            // still a key you press that does nothing.
+                            Press::Shift => self.board.tap_shift(),
+                            Press::SymbolsToggle => self.board.toggle_symbols(),
+                            Press::Steno(..) => {}
                         }
                     }
                     // ── swipe typing over whichever board is showing ──────────────────
