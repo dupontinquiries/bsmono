@@ -347,6 +347,22 @@ impl Layout {
             .expect("bundled en_us_qwerty.json must parse — this is a compile-time asset, not user input")
     }
 
+    /// The four-button **stenotype** board, projected from `board_layouts`' own definition.
+    ///
+    /// `steno.rs`'s module docs list "define a Stenotype layout for `to_render` to produce —
+    /// there is currently no render-layer key that carries a steno button id" as the first
+    /// missing piece, and `apply_mode("stenotype")` had nothing to switch to. Both halves
+    /// existed: the layout is `board_layouts::Layout::default_stenotype()` (already used by
+    /// `RealBoard`), and `to_render` already emits the steno tokens `paint_key` decodes.
+    /// Only the demo `Board` did not carry it.
+    ///
+    /// Projected rather than rebuilt in code, so the gesture labels and the phoneme table
+    /// they mirror cannot drift — `default_stenotype`'s own comment says to keep them in
+    /// sync, and two definitions is how that stops happening.
+    pub fn stenotype() -> Layout {
+        real_layout::to_render(&board_layouts::Layout::default_stenotype(), real_layout::Shift::Off)
+    }
+
     /// An experimental MessagEase-style **cardinal** keyboard: a 3×3 of high-frequency letters where a
     /// tap types the center and a swipe in a compass direction types that direction's variant. This is
     /// the flagship user of the shared `slide_menu::show_cardinal` gesture. Reached like any other
@@ -510,7 +526,7 @@ pub struct Board {
 impl Board {
     /// Default board: qwerty + symbols.
     pub fn new() -> Board {
-        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0), voice_active: false,
+        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8(), Layout::stenotype()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0), voice_active: false,
             shift: real_layout::Shift::Off, before_symbols: None, palette: "system".to_string() }
     }
     pub fn current(&self) -> &Layout {
@@ -530,14 +546,18 @@ impl Board {
     pub fn apply_mode(&mut self, mode: &str) -> bool {
         let want = match mode.trim() {
             "cardinal" => "cardinal",
-            "stenotype" => "steno",
+            "stenotype" => "stenotype",
             "words" => "cardinal8",
             // "off", and anything a newer build might write that this one does not know:
             // the letter board, which is the safe answer. An unknown mode must not leave the
             // keyboard on whatever was last selected.
             _ => "en_us_qwerty",
         };
-        let Some(i) = self.layouts.iter().position(|l| l.name == want) else {
+        // Case-insensitive: `to_render` takes the rendered layout's name from the file's
+        // DISPLAY name ("Stenotype"), while the settings value and the code-built boards use
+        // the lower-case one. Matching exactly meant `apply_mode("stenotype")` could not
+        // find the board it had just been given.
+        let Some(i) = self.layouts.iter().position(|l| l.name.eq_ignore_ascii_case(want)) else {
             // The named board is not in this build. Leave the current one alone rather than
             // falling to index 0 — silently switching the board out from under someone is
             // worse than ignoring a setting this build cannot honour.
@@ -1558,10 +1578,12 @@ mod tests {
         assert_eq!(b.current().name, "cardinal"); // experimental cardinal keyboards are in the rotation
         b.swipe(1);
         assert_eq!(b.current().name, "cardinal8");
+        b.swipe(1);
+        assert_eq!(b.current().name, "Stenotype", "the steno board joined the rotation");
         b.swipe(1); // wraps back
         assert_eq!(b.current().name, "en_us_qwerty");
         b.swipe(-1); // wraps backward to the last layout
-        assert_eq!(b.current().name, "cardinal8");
+        assert_eq!(b.current().name, "Stenotype");
     }
 
     #[test]
@@ -2198,6 +2220,10 @@ mod gtk_parity_tests {
 
         assert!(b.apply_mode("cardinal"));
         assert_eq!(b.current().name, "cardinal");
+        assert!(b.apply_mode("stenotype"));
+        // "Stenotype" with a capital: `to_render` names a rendered layout from the file's
+        // DISPLAY name, which is why `apply_mode` matches case-insensitively.
+        assert_eq!(b.current().name, "Stenotype", "the steno board is reachable now");
         assert!(b.apply_mode("words"));
         assert_eq!(b.current().name, "cardinal8");
         assert!(b.apply_mode("off"));
@@ -2213,10 +2239,25 @@ mod gtk_parity_tests {
     #[test]
     fn a_mode_with_no_layout_leaves_the_board_alone() {
         let mut b = Board::new();
-        assert!(!b.layout_names().contains(&"steno"), "if steno exists now, this test is stale");
+        // Every mode this build names now HAS a layout — stenotype was the last one
+        // missing, and adding it made the "known mode, absent layout" branch unreachable
+        // from here. The guard stays (a build could ship without a board), but there is no
+        // honest way to exercise it without a constructor that exists only for a test, so
+        // this covers what is reachable: an unknown value.
         b.apply_mode("cardinal");
-        assert!(!b.apply_mode("stenotype"), "an unbuildable mode reported a change");
-        assert_eq!(b.current().name, "cardinal", "the board moved for a mode it cannot draw");
+        for m in ["off", "cardinal", "stenotype", "words"] {
+            b.apply_mode(m);
+            assert!(
+                b.layout_names().iter().any(|n| n.eq_ignore_ascii_case(match m {
+                    "cardinal" => "cardinal",
+                    "stenotype" => "stenotype",
+                    "words" => "cardinal8",
+                    _ => "en_us_qwerty",
+                })),
+                "the settings offer {m} and this build cannot draw it"
+            );
+        }
+        b.apply_mode("cardinal");
 
         // An unknown value from a newer build falls to the LETTER board rather than staying
         // wherever it happened to be — an unreadable setting must not leave the keyboard in
