@@ -372,14 +372,25 @@ pub fn to_program(l: &Layout, brief: &Brief, wall: &str, floor_y: i32) -> String
     s.push_str("end\n");
     // each room hollowed out of it
     s.push_str("pass the rooms cut\n");
-    for (i, r) in l.rooms.iter().enumerate() {
-        // The room WHERE THE LAYOUT PUT IT. Its centre, offset from
-        // the anchor, and its own floor level from its storey count.
+    // STOREYS ARE FLOORS, not one tall void. A three-storey keep cut as
+    // a single fifteen-block room is a shaft: nothing to stand on above
+    // the ground and no way up. Each storey is cut separately, leaving
+    // the slab between them, and the stair that joins them comes after.
+    let mut n = 0usize;
+    for r in l.rooms.iter() {
         let (cx, cz) = (r.at.0 + r.size.0 / 2, r.at.1 + r.size.1 / 2);
-        let cy = floor_y + (r.height * storey) / 2;
-        s.push_str(&format!("  part r{i} box w={} h={} d={} material={wall}\n",
-                            (r.size.0 - 1).max(1), (r.height * storey - 1).max(2), (r.size.1 - 1).max(1)));
-        s.push_str(&format!("  rel r{i} at ground dx={cx} dy={cy} dz={cz}\n"));
+        for level in 0..r.height.max(1) {
+            // The cut must be SHORTER than the storey, or consecutive
+            // levels touch and the floor between them is zero blocks
+            // thick -- which is one tall void again, wearing a slab's
+            // name. A 5-block storey is 2 of floor and 3 of headroom,
+            // and 3 is enough for a body that needs 2.
+            let cy = floor_y + level * storey + 3;
+            s.push_str(&format!("  part r{n} box w={} h=3 d={} material={wall}\n",
+                                (r.size.0 - 1).max(1), (r.size.1 - 1).max(1)));
+            s.push_str(&format!("  rel r{n} at ground dx={cx} dy={cy} dz={cz}\n"));
+            n += 1;
+        }
     }
     s.push_str("end\n");
     // DOORS. A plan of sealed rooms fails its own reachability check --
@@ -504,6 +515,50 @@ pub fn to_program(l: &Layout, brief: &Brief, wall: &str, floor_y: i32) -> String
     if n > 0 {
         s.push_str("pass the doors cut\n");
         s.push_str(&doors);
+        s.push_str("end\n");
+    }
+    // STAIRS between the storeys of anything with more than one. A room
+    // that is three floors tall and has no way between them is three
+    // rooms, two of which nobody can reach -- and the reachability
+    // check would say so. The stair is a diagonal shaft: a cut that
+    // steps back one block per block of rise, so a body can walk it.
+    let tall: Vec<&Room> = l.rooms.iter().filter(|r| r.height > 1).collect();
+    if !tall.is_empty() {
+        // A STAIR IS NOT A CUT. Cutting a diagonal band through the
+        // floors removes the slabs and leaves nothing to stand on --
+        // the first version did exactly that and produced a shaft with
+        // holes in it. Two passes: cut the WELL through the slabs, then
+        // ADD the treads that climb it.
+        let mut well = String::new();
+        let mut treads = String::new();
+        let (mut wk, mut tk) = (0usize, 0usize);
+        for r in &tall {
+            let run = (r.size.0 - 4).max(4).min(10);
+            let (sx, sz) = (r.at.0 + 2, r.at.1 + 2);
+            let rise = (r.height - 1) * storey;
+            // the well: a slot the width of the run, through every slab
+            well.push_str(&format!("  part w{wk} box w={} h={} d=4 material={wall}\n",
+                                   run + 2, rise + storey));
+            well.push_str(&format!("  rel w{wk} at ground dx={} dy={} dz={sz}\n",
+                                   sx + run / 2, floor_y + (rise + storey) / 2 + 1));
+            wk += 1;
+            // the treads: one block up per block along, so a body can
+            // walk it, switching back at the end of each run
+            for step in 0..=rise {
+                let along = step % run;
+                let leg = step / run;
+                let x = if leg % 2 == 0 { sx + along } else { sx + run - along };
+                treads.push_str(&format!("  part t{tk} box w=1 h=1 d=3 material={wall}\n"));
+                treads.push_str(&format!("  rel t{tk} at ground dx={x} dy={} dz={sz}\n",
+                                         floor_y + step));
+                tk += 1;
+            }
+        }
+        s.push_str("pass the stair wells cut\n");
+        s.push_str(&well);
+        s.push_str("end\n");
+        s.push_str("pass the stairs add\n");
+        s.push_str(&treads);
         s.push_str("end\n");
     }
     s
@@ -847,7 +902,7 @@ mod tests {
         assert!(src.contains("pass the doors cut"), "{src}");
         let (prog, errs) = crate::program::parse(&src);
         assert!(errs.is_empty(), "{errs:?}");
-        assert_eq!(prog.passes.len(), 3, "mass, rooms, doors");
+        assert!(prog.passes.len() >= 3, "mass, rooms, doors, and stairs where anything is tall");
         let r = crate::program::run(&prog, (0, 64, 0));
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         assert!(r.log[2].2 > 0, "the doors cut something: {:?}", r.log);
@@ -891,6 +946,7 @@ mod tests {
         let l = lay_out(&b, ((-16, -16), (16, 16)), 11, 30);
         let (prog, _) = crate::program::parse(&to_program(&l, &b, "stone", 0));
         let r = crate::program::run(&prog, (0, 64, 0));
+        use crate::VoxelWorld as _;
         let mut w = W(Default::default());
         for c in &r.changes { w.set(c.at.0, c.at.1, c.at.2, c.to); }
         let body = crate::reach::Body { budget: 60_000, corridor: Some(80), ..Default::default() };
@@ -904,5 +960,45 @@ mod tests {
             }
         }
         assert!(unreachable.is_empty(), "sealed rooms: {unreachable:?}");
+    }
+
+    #[test]
+    fn a_storey_is_a_floor_and_you_can_walk_up_to_it() {
+        // A three-storey keep cut as one fifteen-block void is a SHAFT:
+        // nothing to stand on above the ground and no way up. This is
+        // the check that catches it, and it is a walk, not a measurement.
+        let b = parse("space keep area=200 height=3\nspace yard area=120\n\
+                       adj keep yard must\n").0;
+        let l = lay_out(&b, ((-20, -20), (20, 20)), 3, 30);
+        let keep = l.rooms.iter().find(|r| r.name == "keep").expect("a keep");
+        assert_eq!(keep.height, 3);
+        let src = to_program(&l, &b, "stone", 0);
+        assert!(src.contains("pass the stair wells cut") && src.contains("pass the stairs add"), "{src}");
+        let (prog, errs) = crate::program::parse(&src);
+        assert!(errs.is_empty(), "{errs:?}");
+        let r = crate::program::run(&prog, (0, 64, 0));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        // build it into a world and WALK IT
+        struct W(std::collections::BTreeMap<(i32, i32, i32), u16>);
+        impl crate::VoxelWorld for W {
+            fn get(&self, x: i32, y: i32, z: i32) -> u16 {
+                if let Some(&v) = self.0.get(&(x, y, z)) { return v; }
+                if y <= 64 { 1 } else { 0 }
+            }
+            fn set(&mut self, x: i32, y: i32, z: i32, v: u16) -> bool { self.0.insert((x, y, z), v); true }
+        }
+        use crate::VoxelWorld as _;
+        let mut w = W(Default::default());
+        for c in &r.changes { w.set(c.at.0, c.at.1, c.at.2, c.to); }
+        // there IS a floor between the storeys: solid at the slab level
+        let (cx, cz) = (keep.at.0 + keep.size.0 / 2, keep.at.1 + keep.size.1 / 2);
+        let slab = (65..85).filter(|y| w.get(cx, *y, cz) != 0).count();
+        assert!(slab >= 2, "floors between the storeys, not one open shaft: {slab}");
+        // and the storeys are reachable from each other by walking
+        let body = crate::reach::Body { budget: 30_000, corridor: None, ..Default::default() };
+        let ground = (keep.at.0 + 2, 66, keep.at.1 + 2);
+        let (seen, _) = crate::reach::flood(&w, ground, &body);
+        let top = seen.iter().map(|c| c.1).max().unwrap_or(0);
+        assert!(top >= 66 + 5, "a body walked up at least one storey: reached {top} from 66");
     }
 }
