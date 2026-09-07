@@ -4288,9 +4288,10 @@ impl eframe::App for VoicetermApp {
                 //
                 // Fourth link in the same chain: encoder, parser, call
                 // site, and now the right parser.
-                voiceterm_egui::pty_input::drain_egui(
+                voiceterm_egui::pty_input::drain_egui_owned(
                     ui, self.app.terminal.grid.key_mode(),
-                    self.workspace.tabs.len() > 1)
+                    self.workspace.tabs.len() > 1,
+                    Some(term_id))
             };
             for out in key_outs
             {

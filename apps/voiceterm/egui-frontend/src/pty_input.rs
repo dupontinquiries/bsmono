@@ -161,6 +161,26 @@ pub fn press(key: Key, m: Mods, mode: TermMode, split_visible: bool) -> Outcome 
 /// Kept separate from `press` so the encoding is testable without an egui
 /// context, which is the only reason any of the above has tests at all.
 pub fn drain_egui(ui: &egui::Ui, mode: TermMode, split_visible: bool) -> Vec<Outcome> {
+    drain_egui_owned(ui, mode, split_visible, None)
+}
+
+/// [`drain_egui`], told which widget id the TERMINAL itself holds.
+///
+/// `egui_wants_keyboard_input()` is true whenever anything has focus — a find bar, the
+/// palette, a sidebar button, and now the terminal's own focus sink. That sink exists so
+/// egui stops treating Tab as focus navigation (see `kbd_focus`), and adding it silently
+/// turned the guard below into "the terminal never receives a key", because the terminal
+/// was the thing holding focus. Typing stopped completely.
+///
+/// So the question the guard has to ask is not "does anything want the keyboard" but "does
+/// something OTHER than the terminal want it". `owner` is the terminal's id; when it is the
+/// focused widget, the keys are ours.
+pub fn drain_egui_owned(
+    ui: &egui::Ui,
+    mode: TermMode,
+    split_visible: bool,
+    owner: Option<egui::Id>,
+) -> Vec<Outcome> {
     // A FOCUSED TEXT WIDGET OWNS THE KEYBOARD.
     //
     // This reads raw context events, so it sees keys that were typed
@@ -173,7 +193,9 @@ pub fn drain_egui(ui: &egui::Ui, mode: TermMode, split_visible: bool) -> Vec<Out
     // `uikit_term::App::handle_input` has always had this guard. The
     // asymmetry was the bug — two readers of one event stream, one of
     // them checking focus.
-    if ui.ctx().egui_wants_keyboard_input() {
+    let focused = ui.memory(|m| m.focused());
+    let ours = matches!((owner, focused), (Some(o), Some(f)) if o == f);
+    if !ours && ui.ctx().egui_wants_keyboard_input() {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -515,6 +537,77 @@ mod headless_tests {
             });
         });
         got.into_inner()
+    }
+
+    /// THE TERMINAL'S OWN FOCUS SINK holds focus, which is the normal state once
+    /// `kbd_focus::claim` runs. Keys must still reach the shell.
+    ///
+    /// This is the regression test for a bug I shipped: adding the sink made
+    /// `egui_wants_keyboard_input()` true every frame, the guard read that as "somebody
+    /// else is typing", and voiceterm stopped accepting input entirely. The existing tests
+    /// all passed, because none of them had a focused widget that was OURS — they had a
+    /// focused TextEdit (someone else's) or nothing focused at all. The missing case was
+    /// the one the app is in all the time.
+    fn drive_with_terminal_focused(events: Vec<egui::Event>, mode: TermMode) -> Vec<Outcome> {
+        let ctx = egui::Context::default();
+        let got = std::cell::RefCell::new(Vec::new());
+        let id = egui::Id::new("terminal-sink");
+        // Frame 1: the sink takes focus, as `kbd_focus::claim` does.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r = ui.interact(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 100.0)),
+                    id,
+                    egui::Sense::click(),
+                );
+                r.request_focus();
+            });
+        });
+        // Frame 2: the keys arrive while we hold focus.
+        let mut raw = egui::RawInput::default();
+        raw.events = events;
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = ui.interact(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 100.0)),
+                    id,
+                    egui::Sense::click(),
+                );
+                *got.borrow_mut() = drain_egui_owned(ui, mode, false, Some(id));
+            });
+        });
+        got.into_inner()
+    }
+
+    /// Typing must work when the terminal itself holds the keyboard — the state the app is
+    /// in from the first frame onward.
+    #[test]
+    fn keys_reach_the_shell_while_the_terminals_own_sink_has_focus() {
+        let text = vec![egui::Event::Text("hi".into())];
+        let out = drive_with_terminal_focused(text, PLAIN);
+        let bytes: Vec<u8> = out.iter().flat_map(|o| o.bytes.clone()).collect();
+        assert_eq!(bytes, b"hi", "the terminal swallowed its own input");
+
+        // Tab too — the key the sink exists for.
+        let tab = vec![egui::Event::Key {
+            key: egui::Key::Tab,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        let out = drive_with_terminal_focused(tab, PLAIN);
+        let bytes: Vec<u8> = out.iter().flat_map(|o| o.bytes.clone()).collect();
+        assert_eq!(bytes, vec![0x09], "Tab did not reach the shell");
+
+        // And the other half still holds: a focused TextEdit is NOT the terminal, so its
+        // keys are not ours to read.
+        let text = vec![egui::Event::Text("x".into())];
+        let out = drive_with_focused_field(text, PLAIN);
+        assert!(
+            out.iter().all(|o| o.bytes.is_empty()),
+            "a keystroke meant for a text field reached the shell"
+        );
     }
 
     /// Same, but with a TextEdit that HAS FOCUS in the frame — the state
