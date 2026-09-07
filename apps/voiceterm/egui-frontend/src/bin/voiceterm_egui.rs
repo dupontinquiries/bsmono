@@ -916,7 +916,33 @@ impl VoicetermApp {
                 exit_code: b.exit_code,
             })
             .collect();
-        recall::recall(query, &items, now, 40)
+
+        // ACROSS SESSIONS, not just this one. `recall.rs` has had
+        // serialize/parse/merge_history since v0.1.660 and the Qt build has used them; this
+        // frontend ranked the LIVE blocks only, so "how did I fix that" after a reboot found
+        // nothing — which is the exact pain the feature was written for.
+        //
+        // Lazy, like the Qt path: load, merge, rank, write back, on each query. No
+        // per-block finalize hook, and live blocks are folded in at query time so history
+        // accrues even if recall is asked rarely. A block typed and never queried before a
+        // crash is lost, which is the trade `TODO_recall.md` already accepted and named.
+        let path = voiceterm_egui::shell::recall_history_path();
+        let persisted = std::fs::read_to_string(&path)
+            .ok()
+            .map(|t| recall::parse_history(&t))
+            .unwrap_or_default();
+        let merged = recall::merge_history(persisted, &items);
+
+        // Written back BEFORE ranking, so a query that panics or a process killed while the
+        // sheet is open still leaves the history it had just learned.
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // Best effort: a read-only config dir must not stop recall from answering. It is
+        // the difference between "no history across reboots" and "no recall at all".
+        let _ = std::fs::write(&path, recall::serialize_history(&merged));
+
+        recall::recall(query, &merged, now, 40)
     }
 
     fn run_command(&mut self, cmd: voiceterm_egui::palette::Command) {

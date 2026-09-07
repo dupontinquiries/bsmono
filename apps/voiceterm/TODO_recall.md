@@ -133,3 +133,34 @@ Verified already fully wired: voice "what did i do / how did i fix X" →
 Intent::RecallCommands → recall_commands qt_method → recallOverlay (tap a row to
 drop the command on the terminal line; ✓/✗ exit-code coloring present). Nothing
 to add.
+
+
+## DONE — cross-session recall in the EGUI frontend too (2026-09-07)
+
+The audit above says COMPLETE, and it was — for the Qt build. `egui-frontend`'s
+`rank_recall` built its item list from `self.blocks.blocks` and nothing else, so
+after a reboot "how did I fix that" found nothing. The pure half had been shared
+all along (`recall.rs` is mounted by `#[path]`); only the load/merge/save was
+missing on this side.
+
+Now: `shell::recall_history_path()` — `recall_history.tsv` beside the prefs,
+through `config_kit::config_dir` for the same reason the prefs are, and a
+separate FILE rather than more kv keys because it is rewritten wholesale on every
+query and a prefs file rewritten that often is one a crash will truncate.
+
+`rank_recall` loads, merges the live blocks in, WRITES BACK, then ranks over the
+union. Written before ranking on purpose: a process killed while the sheet is
+open still leaves the history it had just learned. The write is best-effort — a
+read-only config dir must not stop recall answering, which is the difference
+between "no history across reboots" and "no recall at all".
+
+Lazy, exactly as the Qt path is, and with the same accepted trade: a block typed
+and never queried before a crash is lost.
+
+`tests/recall_persist.rs` drives the round trip a restart performs rather than
+the pieces: a command from a previous session is findable and the live one still
+is; a re-seen command does not duplicate (without the dedup every query grows the
+file by a session); the ring cap keeps the NEWEST, since a history that dropped
+recent commands to keep ancient ones would answer "what did I just do" with last
+month; and commands containing tabs and newlines survive the file, which is the
+corruption that would eat the row AFTER the one that had them.

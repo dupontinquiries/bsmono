@@ -469,6 +469,21 @@ pub fn prefs_path() -> std::path::PathBuf {
 /// the path and any migration — cannot disagree.
 pub const PREFS_APP: &str = "voiceterm-egui";
 pub const PREFS_FILE: &str = "prefs.kv";
+/// Recall's cross-session history, beside the prefs.
+pub const RECALL_FILE: &str = "recall_history.tsv";
+
+/// `$XDG_CONFIG_HOME/voiceterm-egui/recall_history.tsv`.
+///
+/// Through `config_dir` for the same reason the prefs are: two copies of a path rule drift,
+/// and the day one gains a fallback the other does not, a file written by one build stops
+/// being found by the next.
+///
+/// A separate FILE rather than more keys in the kv: this grows to a couple of thousand rows
+/// and is rewritten wholesale, and a prefs file rewritten on every recall query is one that
+/// will eventually be truncated by a crash mid-write.
+pub fn recall_history_path() -> std::path::PathBuf {
+    config_kit::config_dir(PREFS_APP).join(RECALL_FILE)
+}
 
 /// Load prefs from [`prefs_path`]; missing file (or any unreadable line) falls back to defaults —
 /// `Prefs::apply_kv` is tolerant of partial sets by design.
@@ -1675,6 +1690,22 @@ mod tests {
 
 #[cfg(test)]
 mod prefs_path_tests {
+
+    /// Recall's history sits beside the prefs, through the same `config_dir` — two copies of
+    /// a path rule drift, and the day one gains a fallback the other does not, a file
+    /// written by one build stops being found by the next.
+    #[test]
+    fn the_recall_history_lives_beside_the_prefs() {
+        let p = recall_history_path();
+        let prefs = prefs_path();
+        assert_eq!(p.parent(), prefs.parent(), "{p:?} is not beside {prefs:?}");
+        assert_ne!(p, prefs, "recall must not overwrite the prefs");
+        assert_eq!(p.file_name().unwrap(), RECALL_FILE);
+        // A separate FILE, not more keys in the kv: this is rewritten wholesale on every
+        // query, and a prefs file rewritten that often is one a crash will truncate.
+        assert!(RECALL_FILE.ends_with(".tsv"), "{RECALL_FILE}");
+        assert_ne!(RECALL_FILE, PREFS_FILE);
+    }
     use super::*;
 
     #[test]
