@@ -2209,6 +2209,50 @@ mod gtk_parity_tests {
         assert_eq!(b.layout_index(), cardinal);
     }
 
+    /// The stenotype board's four keys must carry a STENO BUTTON ID. That is what makes
+    /// `paint_key` emit a steno token on press instead of typing a letter — the token is
+    /// built at press time from the button and the gesture, so a resting key does not carry
+    /// one. (My first version of this test looked for tokens in `emit` and found none, which
+    /// is correct and proves nothing.)
+    #[test]
+    fn the_steno_board_carries_button_ids_and_no_other_board_does() {
+        let steno = Layout::stenotype();
+        let ids: Vec<&str> = steno
+            .rows
+            .iter()
+            .flat_map(|r| &r.keys)
+            .filter_map(|k| k.steno_button.as_deref())
+            .collect();
+        assert_eq!(ids.len(), 4, "{ids:?}");
+        for b in ["L1", "L2", "R1", "R2"] {
+            assert!(ids.contains(&b), "no {b} key: {ids:?}");
+        }
+
+        // Each of the four carries its swipe alternates, which is where the phonemes are.
+        let with_swipes = steno
+            .rows
+            .iter()
+            .flat_map(|r| &r.keys)
+            .filter(|k| k.steno_button.is_some() && !k.cardinal.is_empty())
+            .count();
+        assert_eq!(with_swipes, 4, "a steno button with no gestures is one phoneme, not five");
+
+        // The utility row is ordinary keys, so the board is escapable — a steno board with
+        // no backspace and no way back to letters is a trap.
+        let labels: Vec<&str> = steno.rows.iter().flat_map(|r| &r.keys).map(|k| k.label.as_str()).collect();
+        assert!(labels.contains(&"⌫"), "{labels:?}");
+        assert!(labels.contains(&"?123"), "{labels:?}");
+
+        // And no OTHER board carries one, or a letter key would feed the engine.
+        for l in [Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8()] {
+            assert!(
+                l.rows.iter().flat_map(|r| &r.keys).all(|k| k.steno_button.is_none()),
+                "{} has a steno button on it",
+                l.name
+            );
+        }
+    }
+
     /// `layout.experimental_mode` has offered Off / Cardinal / Stenotype / Words since the
     /// settings panel was written, and choosing one did nothing: the value went into a map
     /// and no code read it back.

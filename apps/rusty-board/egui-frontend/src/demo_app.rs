@@ -301,6 +301,26 @@ impl Feel {
     /// screen asks for show/hide through `ViewportCommand::Visible` and never touches a window
     /// handle, so which shell is running is invisible from in here.
     #[allow(deprecated)]
+    /// One steno gesture into the engine, and whatever comes back out.
+    ///
+    /// Shared by both dispatch paths — the real-layout board and the code-built one. Two
+    /// copies of this drifted once already (the second was an empty arm), and the
+    /// difference is invisible until someone switches boards and finds the keys dead.
+    ///
+    /// `None` is not an error: most strokes go PENDING and commit later, either from the
+    /// opposite thumb's own `feed` or from `poll_pending` in `update`. A handler that
+    /// treated `None` as a failure would report one on every first half of a chord.
+    fn on_steno(&mut self, button: &str, gesture: &str) {
+        if let Some(commit) = crate::steno::feed(button, gesture) {
+            // Commits verbatim, no auto-space: steno phonemes chain into syllables
+            // (`k`+`a`+`t` → `kat`, not `k a t`), matching GTK's `EngineInput::StenoCommit`.
+            self.emit_text(&commit.text);
+            if let Some(content) = crate::steno::commit_to_microterm(&commit) {
+                self.microterm.set_content(content);
+            }
+        }
+    }
+
     pub fn frame(&mut self, ctx: &egui::Context) {
         apply_theme(ctx);
 
@@ -920,7 +940,11 @@ impl Feel {
                             // still a key you press that does nothing.
                             Press::Shift => self.board.tap_shift(),
                             Press::SymbolsToggle => self.board.toggle_symbols(),
-                            Press::Steno(..) => {}
+                            // THE SAME HANDLER as the real board's. This arm was `{}`, so
+                            // the stenotype board the settings can now reach was four big
+                            // keys that did nothing — the engine is mounted and tested and
+                            // had never had a stroke fed to it from this path.
+                            Press::Steno(button, gesture) => self.on_steno(&button, &gesture),
                         }
                     }
                     // ── swipe typing over whichever board is showing ──────────────────
