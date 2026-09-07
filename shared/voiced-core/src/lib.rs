@@ -17,7 +17,11 @@
 
 pub mod gate;
 
-use ipc_kit::Scope;
+// RE-EXPORTED, not just imported. `Registry::register` takes a `Scope`, so every caller
+// needs the type — and a private `use` made it unnameable: `voiced_core::Scope` did not
+// exist and `ipc_kit` was not necessarily a dependency of the app. gitmind-egui's voice
+// intents failed to compile on exactly this.
+pub use ipc_kit::Scope;
 use std::collections::HashMap;
 
 pub mod grammar;
