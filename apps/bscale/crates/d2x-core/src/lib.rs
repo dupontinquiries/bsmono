@@ -42,6 +42,8 @@ pub mod quality;
 pub mod rcas;
 /// Cross-worker near-match reuse: one segment reusing a block another already upscaled.
 pub mod xref;
+/// Why block boundaries show as thin lines, and how to measure it (`seams`).
+pub mod seams;
 pub mod registry;
 pub mod residual;
 pub mod st;

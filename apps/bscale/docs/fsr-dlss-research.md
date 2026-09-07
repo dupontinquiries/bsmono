@@ -191,3 +191,79 @@ pipeline does not consult it yet, and there is no CLI flag. Wiring is the next s
 number to report afterwards is the one `analyze` already prints — the fraction of pixels
 going through the network — measured on a source with real repeats (a dialogue scene, a
 title sequence) at `-j 1` versus `-j 8`.
+
+---
+
+# Seams: the thin bright/dark grid lines (`d2x-core/src/seams.rs`)
+
+## Three faults look the same and are not the same bug
+
+**1. Residual-packing contamination — a hard 1px rim.** `make_residual` packs cells into a
+small square image with `bleed` pixels of real context each. Beyond that ring sits *the next
+cell*: unrelated content, with a step change at the join. The network reads that step as an
+edge and rings against it, inward by its receptive radius.
+
+`receptive_radius` computes that radius off the op list — every conv here is 3×3, so each adds
+one pixel at its buffer's level. Eight convs reach eight pixels; SRVGGNetCompact's sixteen
+reach sixteen; RRDBNet's twenty-three blocks reach many times that. **The default `bleed` in
+this pipeline is 1.** So the outer pixels of every block are computed partly from unrelated
+content, which is a thin rim at the block pitch — exactly the reported symptom.
+
+The feathered merge cannot fix this. It blends contaminated pixels with their neighbours; the
+contamination happened before any blending.
+
+**Found while writing this:** the codebase already has the right number and does not use it
+here. `Network::pre_pad` is documented as "the overlap that hides tile seams" — Real-ESRGAN
+ships 10, upconv_7 an exact 7 — and the *tiler* uses it while the residual packing uses
+`bleed`. Two numbers for one physical requirement, and the smaller one is the default.
+`BleedCheck::disagrees_with_tiler` flags that.
+
+**2. Level mismatch — a soft step, no rim.** A reused block is a copy of an earlier upscale;
+a fresh one came out of the network. Both pass the gate, because a uniform half-level offset
+over a 32×32 block is a tiny SSE and a visible edge.
+
+**3. Merge rounding — a true 1px line.** The feather ramp is float and rounds per pixel; where
+two blocks' ramps both round just under 1.0 the destination keeps a fraction of what was
+underneath. Invisible on a static background, not over a cut.
+
+## Measuring, and two wrong guesses on the way
+
+`seam_profile` compares the mean luma step across block boundaries with the step at interior
+lines of the same frame. Block boundaries are not special places in a picture, so any excess
+is the pipeline's.
+
+Two things had to be corrected against the tests:
+
+* **One measure is not enough.** On noisy content a one-level block offset is invisible in
+  mean |step| — twenty levels of noise against one of offset — and obvious in the SIGNED
+  mean, where noise cancels and DC does not. A rim is the reverse. Hence `excess_db` and
+  `level_step`, separately.
+* **A rim does not cancel in the signed mean**, which was the first discriminator and was
+  wrong: ringing puts a dark pixel one side of the boundary and a bright one the other, so
+  the step is large and signed exactly like a level offset. What separates them is the
+  NEXT step in — a rim is a local extremum and reverses, a level offset is monotone.
+  `flank_ratio` is that, ~-1 for a rim and ~0 for a level step.
+
+The control fixture had to be corrected too: a `(x + y) % 200` ramp puts its wrap
+discontinuity on some sampled lines and not others, and reported −2.5 dB on a frame with no
+seams. It is deterministic narrow-band noise now — wide noise makes a clean frame's signed
+means wander by the same half-level the fault test looks for.
+
+## What to do about them, in order
+
+1. **Raise `bleed` to the model's `pre_pad`** and measure. One-line change, and the number to
+   watch is `seam_profile` before and after on a frame with a known grid. Costs residual area
+   — a bigger cell per block — so it trades throughput for the rim, which is exactly the kind
+   of trade `compare` exists to price.
+2. **Mirror the cell's own edge into the bleed ring** where real context is unavailable
+   (frame edge), rather than whatever the packing leaves there.
+3. **A gutter between cells in the residual image**, filled by extending each cell's edge, so
+   there is no hard content step for the network to ring against at all. Strictly better than
+   raising bleed for the contamination fault, and cheaper: a gutter is shared between two
+   neighbours, where bleed is paid per cell per side.
+4. **DC-match a reused block to its surroundings** before writing it, for fault 2. This is the
+   one to be careful with: it changes pixels the gate approved, so it needs its own bound.
+
+Nothing here is wired in — `seams` is a measurement module and a diagnostic. The next run
+should print `BleedCheck::describe` at startup and `seam_profile` on the first output frame,
+which turns "I see faint lines" into two numbers before anything is changed.
