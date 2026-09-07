@@ -302,6 +302,9 @@ pub enum TurnKind {
     Interpret,
     /// Pass 2: assets and passes, written against pass 1's reading.
     Compose,
+    /// The massing turn of the architectural chain: the model is shown
+    /// the type's division and the sorted wishes and asked for a diff.
+    Massing,
 }
 
 impl PendingTurn {
@@ -1251,6 +1254,29 @@ impl Paintbrush {
             Box::new(move || p), gaze, player_feet, prose, TurnKind::Compose);
     }
 
+    /// The rest of the chain: brief, layout, geometry.
+    fn finish_massing(&mut self, cm: &ChunkManager, gaze: &Gaze, raw: &str,
+                      player_feet: Option<(i32, i32, i32)>, prose: &str) {
+        let p = voxel_tools::compose::programme(prose, ((0, 0), (0, 0)),
+                                                self.session.creative_seed, Some(raw));
+        for l in &p.log { self.say(format!("  {l}")); }
+        for u in p.unmet.iter().take(3) { self.say(format!("  UNMET {u}")); }
+        for n in p.notes.iter().take(3) { self.say(format!("  note {n}")); }
+        if p.src.is_empty() {
+            self.say("that did not programme -- trying the direct path");
+            self.finish_turn_with(cm, gaze, raw, player_feet, prose);
+            return;
+        }
+        let view = WorldView(cm);
+        let mut staged = StagedWorld::new(&view);
+        let r = {
+            let mut tools = VoxelTools::new(&mut staged);
+            self.session.receive_program(&mut tools, gaze, &p.src, player_feet, prose)
+        };
+        self.push(r);
+        self.flush_staged(cm, &mut staged);
+    }
+
     /// Passes 3 and 4: the program is resolved and run.
     fn finish_compose(&mut self, cm: &ChunkManager, gaze: &Gaze, raw: &str,
                       player_feet: Option<(i32, i32, i32)>, prose: &str) {
@@ -1435,6 +1461,27 @@ impl Paintbrush {
         // request. Pass 1 asks what the thing IS, in prose; pass 2
         // writes assets and passes against that reading. The dictionary
         // path stays one turn, because for a cottage it is better.
+        // The ARCHITECTURAL CHAIN, for a building type big enough to
+        // have an inside worth deciding. One model turn -- the massing
+        // -- and the rest is code that can be checked.
+        if path == voxel_tools::compose::Path::Programme {
+            if let Some(t) = voxel_tools::typology::lookup(prose) {
+                let wishes = voxel_tools::typology::triage(prose, &t);
+                let sorted: Vec<String> = wishes.iter()
+                    .map(|w| format!("{}: {w:?}", w.kind())).collect();
+                log::info!("[paintbrush] programming a {}: {}", t.name, sorted.join("; "));
+                let m = voxel_tools::typology::apply_for(prose, &t, &wishes);
+                self.say(format!("a {} of {} section(s) over {} blocks",
+                                 t.name, m.sections.len(), m.implied_total));
+                for l in m.log.iter().take(4) { self.say(format!("  {l}")); }
+                for u in &m.unplaced { self.say(format!("  could not place: {u}")); }
+                let p = voxel_tools::typology::massing_prompt(prose, &t, &wishes);
+                self.spawn_turn(completer,
+                    "You are an architect deciding how a building divides into sections.".into(),
+                    Box::new(move || p), gaze, player_feet, prose, TurnKind::Massing);
+                return;
+            }
+        }
         if path == voxel_tools::compose::Path::Compose {
             // the site line the ambient makes, so pass 1 knows where it
             // is standing; it is one line by design
@@ -1667,6 +1714,11 @@ impl Paintbrush {
                             self.say(format!("avoiding: {}", reading.pitfalls.join("; ")));
                         }
                         self.start_compose(cm, &turn.gaze, &turn.prose, reading, turn.player_feet);
+                    }
+                    TurnKind::Massing => {
+                        self.finish_massing(cm, &turn.gaze, &raw, turn.player_feet, &turn.prose);
+                        self.review_pending_after_drone = 1;
+                        self.review_round = 0;
                     }
                     TurnKind::Compose => {
                         self.finish_compose(cm, &turn.gaze, &raw, turn.player_feet, &turn.prose);

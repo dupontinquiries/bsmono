@@ -189,15 +189,111 @@ pub enum Path {
     Known,
     /// It does not: four passes.
     Compose,
+    /// It is a BUILDING TYPE at a size worth programming: the
+    /// architectural chain -- typology, triage, massing, brief,
+    /// layout, geometry.
+    ///
+    /// This path existed and was unreachable. `choose_path` knew two
+    /// routes and neither consulted a typology, so "a huge fortress"
+    /// matched the recognizer's `castle` noun and got the DICTIONARY
+    /// castle: one solid form, no rooms, no schedule, no adjacency.
+    /// Every layer above it was dead code from a request's point of
+    /// view.
+    Programme,
 }
 
 /// Choose. The honest signal is whether the recognizer found anything:
 /// it is a table of things the dictionary can actually make, so a miss
 /// means the fast path would be guessing.
 pub fn choose_path(prose: &str) -> Path {
+    // A TYPOLOGY AND ENOUGH SIZE TO WARRANT ONE. Programming a cottage
+    // is ceremony -- the dictionary makes a better one, and a schedule
+    // of four rooms adds nothing. Programming a fortress is the only
+    // way to get rooms into it at all. The threshold is the point
+    // where a building has an INTERIOR worth deciding.
+    if let Some(t) = crate::typology::lookup(prose) {
+        let (area, _) = crate::typology::scale_for(prose, &t);
+        if area >= 1200 { return Path::Programme; }
+    }
     match crate::recipe::recognise(prose) {
         Some(_) => Path::Known,
         None => Path::Compose,
+    }
+}
+
+/// The architectural chain, end to end: a request to program source.
+///
+/// One call, because the six layers below it only mean anything in
+/// order and each has exactly one caller. What a model contributes
+/// here is the massing turn -- `typology::massing_prompt` shows it the
+/// division and the sorted wishes and asks for a diff -- and
+/// everything else is decided by code that can be checked.
+pub fn programme(request: &str, site: ((i32, i32), (i32, i32)), seed: u64,
+                 massing_reply: Option<&str>) -> Programmed {
+    let mut p = Programmed::default();
+    let Some(t) = crate::typology::lookup(request) else {
+        p.notes.push(format!("no building type in {request:?}"));
+        return p;
+    };
+    let wishes = crate::typology::triage(request, &t);
+    let mut m = crate::typology::apply_for(request, &t, &wishes);
+    let mut total = m.implied_total;
+    // the model's turn, if it took one
+    if let Some(reply) = massing_reply {
+        let (m2, t2, errs) = crate::typology::parse_massing(reply, &m);
+        p.notes.extend(errs);
+        m = m2;
+        if t2 > 0 { total = t2; }
+    }
+    p.log.extend(m.log.iter().cloned());
+    p.unplaced.extend(m.unplaced.iter().cloned());
+    p.constraints.extend(m.constraints.iter().cloned());
+    p.qualities.extend(m.qualities.iter().cloned());
+    let (brief, errs) = crate::brief::parse(&crate::typology::to_brief(&m, total));
+    p.notes.extend(errs);
+    let recon = brief.reconcile();
+    p.log.push(recon.summary());
+    // the site, or one sized to the schedule if none was given
+    let site = if site.1 .0 - site.0 .0 >= 8 { site } else {
+        let half = ((total as f32 * 1.6).sqrt() / 2.0).max(8.0) as i32;
+        ((-half, -half), (half, half))
+    };
+    let layout = crate::brief::lay_out(&brief, site, seed, 40);
+    p.log.push(layout.summary());
+    p.notes.extend(layout.notes.iter().cloned());
+    p.unmet.extend(layout.unmet.iter().cloned());
+    p.rooms = layout.rooms.len();
+    p.total = total;
+    p.typology = t.name;
+    p.src = crate::brief::to_program(&layout, &brief, "stone", 0);
+    p.massing = m;
+    p
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Programmed {
+    pub typology: &'static str,
+    pub total: i32,
+    pub rooms: usize,
+    /// Program source, ready for `program::parse`.
+    pub src: String,
+    pub massing: crate::typology::Massing,
+    pub constraints: Vec<String>,
+    pub qualities: Vec<String>,
+    pub unplaced: Vec<String>,
+    pub unmet: Vec<String>,
+    pub log: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+impl Programmed {
+    pub fn summary(&self) -> String {
+        format!("{} of {} over {} blocks, {} room(s){}{}",
+                self.typology, self.massing.sections.len(), self.total, self.rooms,
+                if self.unmet.is_empty() { String::new() }
+                else { format!(", {} adjacency(ies) unmet", self.unmet.len()) },
+                if self.unplaced.is_empty() { String::new() }
+                else { format!(", {} wish(es) unplaced", self.unplaced.len()) })
     }
 }
 
@@ -335,5 +431,66 @@ mod tests {
         let ys: std::collections::BTreeSet<i32> = b.cells.iter().map(|(_, y, _, _)| *y).collect();
         assert!(ys.len() > 5, "spread over height: {} distinct", ys.len());
         assert!(b.ir.contains("cylinder"), "the shaft has an op: {}", b.ir);
+    }
+
+    #[test]
+    fn the_whole_chain_runs_from_a_request_in_one_call() {
+        let p = programme("a huge fortress with a chapel, on a cliff", ((0, 0), (0, 0)), 5, None);
+        assert_eq!(p.typology, "castle");
+        assert!(p.total >= 40_000, "the scale word reached it: {}", p.total);
+        assert!(p.rooms >= 8, "{}", p.summary());
+        assert!(p.massing.sections.iter().any(|s| s.name == "chapel"), "the wish reached the massing");
+        assert!(p.constraints.iter().any(|c| c.contains("cliff")), "and the constraint survived");
+        // the source it produced is a program that runs
+        let (prog, errs) = crate::program::parse(&p.src);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(prog.passes.len() >= 3, "mass, rooms, doors");
+        let r = crate::program::run(&prog, (0, 64, 0));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(r.changes.len() > 100_000, "a fortress: {} cells", r.changes.len());
+        // and it reports what it could not do rather than hiding it
+        assert!(p.log.iter().any(|l| l.contains("budget")), "{:?}", p.log);
+    }
+
+    #[test]
+    fn the_massing_turn_can_change_the_shape_of_it() {
+        let plain = programme("a castle", ((0, 0), (0, 0)), 5, None);
+        let edited = programme("a castle", ((0, 0), (0, 0)), 5,
+                               Some("total 30000\nsection keep share=0.6\ndrop courtyard\n"));
+        assert!(edited.total > plain.total * 2, "{} vs {}", edited.total, plain.total);
+        assert!(!edited.massing.sections.iter().any(|s| s.name == "courtyard"));
+        assert!(edited.rooms > 0);
+        // and a reply that says nothing leaves it as it was
+        let quiet = programme("a castle", ((0, 0), (0, 0)), 5, Some("looks good to me\n"));
+        assert_eq!(quiet.total, plain.total);
+        assert_eq!(quiet.massing.sections.len(), plain.massing.sections.len());
+    }
+
+    #[test]
+    fn a_request_with_no_building_type_says_so_rather_than_guessing() {
+        let p = programme("a water sphere", ((0, 0), (0, 0)), 1, None);
+        assert!(p.src.is_empty());
+        assert!(p.notes.iter().any(|n| n.contains("no building type")), "{:?}", p.notes);
+    }
+
+    #[test]
+    fn a_building_big_enough_to_have_an_inside_gets_programmed() {
+        // this whole path was unreachable: "a huge fortress" matched
+        // the recognizer's `castle` noun and got the DICTIONARY castle,
+        // one solid form with no rooms
+        assert_eq!(choose_path("a huge fortress"), Path::Programme);
+        assert_eq!(choose_path("a castle"), Path::Programme);
+        assert_eq!(choose_path("a cathedral"), Path::Programme);
+        assert_eq!(choose_path("a bustling city"), Path::Programme);
+        // but not a cottage: programming four rooms is ceremony, and
+        // the dictionary makes a better one
+        assert_eq!(choose_path("a small cottage"), Path::Known);
+        assert_eq!(choose_path("a house"), Path::Known);
+        // and a thing with no type still composes
+        assert_eq!(choose_path("a water sphere"), Path::Compose);
+        assert_eq!(choose_path("the sound of a bell, as a building"), Path::Compose);
+        // a huge house crosses the line, because at that size it does
+        // have an inside worth deciding
+        assert_eq!(choose_path("an enormous manor"), Path::Programme);
     }
 }

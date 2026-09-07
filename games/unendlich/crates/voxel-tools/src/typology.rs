@@ -439,7 +439,7 @@ pub fn triage(request: &str, t: &Typology) -> Vec<Wish> {
 }
 
 /// The typology with the client's wishes applied.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Massing {
     pub typology: &'static str,
     /// The gross area the request implied, and why. A massing that

@@ -40,6 +40,7 @@ fn main() {
     long_run_scenario();
     scatter_scenario();
     four_pass_scenario();
+    programme_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -919,7 +920,10 @@ fn long_run_scenario() {
     pb.review_rounds = 12;
     pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(Rounds { n: n.clone() }))));
     let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
-    pb.start_turn(&cm, &gaze, Some("grass"), "a stone keep", None);
+    // "a stone keep" now routes to the architectural chain -- `keep`
+    // is a castle alias. This scenario is about the plan path and its
+    // review loop, so it asks for something the dictionary owns.
+    pb.start_turn(&cm, &gaze, Some("grass"), "a small stone hut", None);
     let t0 = std::time::Instant::now();
     let mut statuses: Vec<String> = Vec::new();
     // the run is the condition: a round may be between its review and
@@ -1041,4 +1045,45 @@ fn four_pass_scenario() {
     println!("  {}", built.trim());
     assert!(built.contains("shell (add") && built.contains("water (add"), "{log:?}");
     assert!(!log.iter().any(|l| l.to_lowercase().contains("house")), "no house anywhere: {log:?}");
+}
+
+
+/// A building type big enough to have an inside: the architectural
+/// chain, from a plain /build request.
+fn programme_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== the architectural chain");
+    struct Arch { seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> }
+    impl voxel_tools::llm::Completer for Arch {
+        fn name(&self) -> &str { "arch" }
+        fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            self.seen.lock().unwrap().push(user.to_string());
+            // the massing turn: make the keep dominate, drop the stables
+            Ok("total 26000\nsection keep share=0.45 prominence=4\ndrop stables\n".into())
+        }
+    }
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(
+        Box::new(Arch { seen: seen.clone() }))));
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -20.0], [0.0, -0.3, 1.0], Some(([0, 64, 0], [0, 1, 0], 21.0)));
+    pb.start_turn(&cm, &gaze, Some("grass"), "a huge fortress with a chapel, on a cliff", None);
+    let t0 = std::time::Instant::now();
+    while pb.run.as_ref().map(|r| r.is_running()).unwrap_or(false) && t0.elapsed().as_secs() < 60 {
+        pb.poll_turn(&cm); pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    let s = seen.lock().unwrap();
+    assert_eq!(s.len(), 1, "ONE model turn: the massing");
+    assert!(s[0].contains("ESSENTIAL") && s[0].contains("curtain wall"), "it saw the division");
+    assert!(s[0].contains("modify") || s[0].contains("add"), "and the sorted wishes: {}", &s[0][..200.min(s[0].len())]);
+    let log = pb.drain_log();
+    for l in log.iter().filter(|l| l.contains("section(s)") || l.contains("budget")
+                               || l.contains("room(s)") || l.contains("pass(es)")) {
+        println!("  {}", l.trim());
+    }
+    assert!(log.iter().any(|l| l.contains("castle of")), "{log:?}");
+    assert!(log.iter().any(|l| l.contains("budget")), "the schedule reconciled: {log:?}");
+    assert!(log.iter().any(|l| l.contains("room(s)")), "it laid out rooms");
+    assert!(log.iter().any(|l| l.contains("the doors")), "and cut doors: {log:?}");
 }
