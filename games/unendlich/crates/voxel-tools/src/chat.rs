@@ -435,6 +435,63 @@ impl ChatSession {
         r
     }
 
+    /// A PROGRAM: assets built once, then passes that add or cut.
+    ///
+    /// This is the path for anything the dictionary cannot say. Unlike
+    /// `receive_sketch` it produces a cell set directly -- passes
+    /// alternate polarity and the accumulation is the answer, so there
+    /// is no IR to run. The result still previews, commits, undoes and
+    /// journals like a plan.
+    pub fn receive_program<W: VoxelWorld>(&mut self, _tools: &mut VoxelTools<W>, gaze: &Gaze,
+                                          src: &str, player_feet: Option<(i32, i32, i32)>,
+                                          prose: &str) -> Reply {
+        let f = self.focus(gaze);
+        let anchor = f.anchor;
+        let (prog, errs) = crate::program::parse(src);
+        if prog.passes.is_empty() {
+            return Reply::Say(format!("the program had no passes{}",
+                if errs.is_empty() { String::new() } else { format!(" -- {}", errs.join("; ")) }));
+        }
+        let run = crate::program::run(&prog, anchor);
+        if run.changes.is_empty() {
+            return Reply::Say(format!("the program moved nothing -- {}", run.summary()));
+        }
+        if run.changes.len() > crate::MAX_BLOCKS_PER_BRUSH {
+            return Reply::Say(format!("refused: {} cells is past the landscape limit", run.changes.len()));
+        }
+        // A program is already a cell set, so it rides as a pending
+        // plan with no ops: an empty plan carrying `extra_cells`. That
+        // keeps every downstream thing -- preview, waypoint, commit,
+        // undo, the world tree -- working unchanged.
+        let placed: Vec<(i32, i32, i32)> = run.changes.iter().map(|c| c.at).collect();
+        let bounds = placed.iter().fold(None::<((i32,i32,i32),(i32,i32,i32))>, |b, p| Some(match b {
+            None => (*p, *p),
+            Some((lo, hi)) => ((lo.0.min(p.0), lo.1.min(p.1), lo.2.min(p.2)),
+                               (hi.0.max(p.0), hi.1.max(p.1), hi.2.max(p.2))),
+        }));
+        let mut echo = format!("Program '{}' -- {}", prose, run.summary());
+        for n in run.notes.iter().chain(run.errors.iter()).chain(errs.iter()) {
+            echo.push_str(&format!("\nPROGRAM: {n}"));
+        }
+        let cut = run.changes.iter().filter(|c| c.to == 0).count();
+        echo.push_str(&format!("\n{} added, {cut} removed", run.changes.len() - cut));
+        let blocks = run.changes.len();
+        self.pending = Some(Pending {
+            plan: BuildPlan { name: "program".into(), ops: Vec::new(), anchor: Some(anchor) },
+            feature_id: f.feature_id.clone(),
+            predicted_blocks: blocks,
+            ir: src.to_string(),
+            prose: prose.to_string(),
+            placed,
+            extra_cells: run.changes,
+            findings: Vec::new(),
+            bounds,
+        });
+        self.invalidate_context();
+        let _ = player_feet;
+        Reply::Preview { echo, blocks, feature_id: f.feature_id }
+    }
+
     /// The review prompt for the pending plan: its ops by number, its
     /// spec, what it measured, two elevations, the critique's findings.
     /// None when nothing is pending. `round` is 1 for the first review.
@@ -1859,5 +1916,64 @@ mod tests {
             if w.get(x, y, z) != 0 { left += 1; }
         }}}
         assert_eq!(left, 0, "undo removed the ring too: {left} left");
+    }
+
+    #[test]
+    fn a_program_carves_where_it_says_cut_and_builds_where_it_says_add() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 400_000);
+        let g = gaze_at(0, 0, 10.0);
+        // the schism, as the new pass would plan it: ONE CUT PASS
+        let prog = "pass rift cut\n\
+                      part gash box w=80 h=24 d=14 material=stone\n\
+                      rel gash below ground by=0\n\
+                    end\n";
+        match s.receive_program(&mut t, &g, prog, None, "carve a great schism into the ground") {
+            Reply::Preview { echo, blocks, .. } => {
+                assert!(blocks > 3000, "a schism: {blocks}");
+                assert!(echo.contains("rift (cut"), "{echo}");
+                assert!(echo.contains("0 added"), "a pure cut adds nothing: {echo}");
+            }
+            o => panic!("{o:?}"),
+        }
+        s.commit(&mut t, &g);
+        drop(t);
+        // the ground below the anchor is gone
+        assert_eq!(w.get(0, 60, 0), 0, "cut through");
+        assert_ne!(w.get(60, 60, 0), 0, "and only where it said");
+    }
+
+    #[test]
+    fn a_program_alternates_passes_over_one_region() {
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 400_000);
+        let g = gaze_at(0, 0, 10.0);
+        // mass, then cut the gate, then add the merlons: three sweeps
+        let prog = "asset merlon\n\
+                      part tooth box w=2 h=3 d=2 material=stone\n\
+                    end\n\
+                    pass mass add\n\
+                      part keep box w=20 h=14 d=20 material=stone hollow\n\
+                      rel keep on ground\n\
+                    end\n\
+                    pass gate cut\n\
+                      part door box w=4 h=6 d=4 material=stone\n\
+                      rel door on ground\n\
+                    end\n\
+                    pass teeth add\n\
+                      repeat merlon line from=-9,7,-10 to=9,7,-10 step=4\n\
+                    end\n";
+        match s.receive_program(&mut t, &g, prog, None, "a keep with a gate and merlons") {
+            Reply::Preview { echo, blocks, .. } => {
+                assert!(blocks > 500, "{blocks}");
+                // all three passes ran, in order, with their polarities
+                assert!(echo.contains("mass (add") && echo.contains("gate (cut")
+                        && echo.contains("teeth (add"), "{echo}");
+                assert!(echo.contains("3 pass(es)"), "{echo}");
+            }
+            o => panic!("{o:?}"),
+        }
     }
 }

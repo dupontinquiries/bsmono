@@ -123,6 +123,8 @@ pub mod latent;
 pub mod sketch;
 /// Four passes: what is it, what is it made of, where does it go, do it.
 pub mod compose;
+/// Assets built once and repeated, then passes that add or cut: the sculptor's loop.
+pub mod program;
 /// The recognizer: a build sentence to a form line, without a model.
 pub mod recipe;
 /// Placement rails: where instances of a structure go, as JSON data the engine builds or holds.
