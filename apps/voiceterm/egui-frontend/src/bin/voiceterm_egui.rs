@@ -191,6 +191,22 @@ impl VoicetermApp {
         // parser that tracks DECCKM. Feeding two was the temporary state
         // while I worked out which one reaches the screen.
         self.app.terminal.feed(&String::from_utf8_lossy(bytes));
+
+        // THE SHELL'S WORKING DIRECTORY, from the stream it is already sending.
+        //
+        // `uikit_term::blocks` records a cwd per block and its doc says the value comes from
+        // "OSC 7 or a PROMPT_COMMAND export, already resolved by the caller". Nobody was that
+        // caller: the only `set_cwd` here is a hardcoded demo path, so every block claimed
+        // `/home/kessler/proj` and `session_name`'s repo half was that string forever.
+        // `TODO_session_autoname.md` records it as step 1's open half.
+        //
+        // Read from the BYTES, before the lossy conversion loses a split multi-byte
+        // sequence, and taking the LAST announcement in the chunk: a script that cds several
+        // times before the terminal is read has moved each time, and where it ended is where
+        // it is.
+        if let Some(cwd) = self.osc7.feed(bytes).pop() {
+            self.blocks.set_cwd(&cwd);
+        }
     }
 
     /// The connections graph over what this app actually holds.
@@ -548,6 +564,8 @@ struct VoicetermApp {
     theme_menu: voiceterm_egui::slide_menu::SlideMenu,
     /// Command blocks (QML blocksDrawer): tracked from what the demo feeds; the
     /// left-edge drawer shows when `surfaces` says `Surface::Blocks`.
+    /// Reads the shell's cwd out of the pty stream. See `osc7`.
+    osc7: voiceterm_egui::osc7::Scanner,
     blocks: uikit_term::blocks::BlockTracker,
     /// Bytes bound for the shell, split into commands as lines complete.
     line_buf: uikit_term::blocks::CommandLines,
@@ -5139,6 +5157,9 @@ fn main() -> eframe::Result<()> {
     let demo = std::env::var_os("VOICETERM_DEMO").is_some();
     let mut blocks = uikit_term::blocks::BlockTracker::new();
     if demo {
+    // A starting value only. Real blocks get theirs from OSC 7 (see `feed_pty`), which
+    // corrects this on the shell's first prompt — before that there is nothing better to
+    // say, and a block with no cwd at all names itself worse than one with a stale guess.
     blocks.set_cwd("/home/kessler/proj");
     app.terminal.feed("$ ls --color\r\n");
     app.terminal.feed("\x1b[1;34mCargo.toml\x1b[0m  \x1b[1;32mbuild.sh\x1b[0m  \x1b[1;34msrc\x1b[0m  \x1b[1;31mold.bak\x1b[0m\r\n");
@@ -5174,6 +5195,7 @@ fn main() -> eframe::Result<()> {
     },
         Box::new(move |_cc| {
             let mut app = VoicetermApp {
+                osc7: Default::default(),
                 keycaps_open: true,
                 clip_note: voiceterm_egui::note_clip::Note::new("Session clips"),
                 compact_defaults_applied: false,

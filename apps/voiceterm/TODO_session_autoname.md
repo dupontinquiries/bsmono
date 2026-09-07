@@ -129,3 +129,40 @@ merged block. Not a tracker bug: `touch` is on `cmd_risk::MUTATING`, so
 the Enter was withheld for the confirm dialog and the automation typed
 straight past it. The gate working as designed — recorded here because it
 looks exactly like a lost keystroke.
+
+
+## DONE — step 1's "cwd from prompt" (2026-09-07)
+
+`uikit_term::blocks` records a cwd per block and its own doc says the value comes from
+"OSC 7 or a PROMPT_COMMAND export, ALREADY RESOLVED BY THE CALLER". Nobody was that caller:
+the only `set_cwd` in this frontend was a hardcoded `/home/kessler/proj`, so every block
+claimed it and `session_name`'s repo half was that string forever.
+
+`osc7::Scanner` reads the announcements out of the pty stream in `feed_pty` — before the
+lossy UTF-8 conversion, so a split multi-byte sequence is not mangled first — and takes the
+LAST in each chunk, because a script that cds several times has moved each time and where it
+ended is where it is.
+
+Read rather than asked. The alternative is running `pwd` in the pty, which injects a command
+into someone's session, races whatever they are typing, and lands in their history. OSC 7 is
+already being sent by bash (PROMPT_COMMAND), zsh (chpwd) and fish (by default).
+
+Four details that would each have been a silent wrong answer:
+
+* **Percent-decoded.** A directory with a space arrives as `%20`, and a tracker told the
+  literal string reports a cwd nothing matches. An invalid escape is kept verbatim — a path
+  is a name, not a URL to fetch, and a wrong path is silently wrong while an odd one is
+  visibly odd.
+* **A remote host is refused, not stripped.** `file://buildbox/home/k` is another machine's
+  directory; accepting it labels local blocks with a path that does not exist here and
+  nothing downstream can tell afterwards.
+* **Split reads are held.** A pty read is an arbitrary byte boundary. The test splits a full
+  sequence at every offset — the first version dropped a lone trailing ESC, which would have
+  lost a cwd update roughly whenever the path crossed a buffer edge and looked like OSC 7
+  working unreliably rather than not at all.
+* **A runaway sequence is dropped** past 4 KB rather than buffered, since the bytes come from
+  whatever program is running.
+
+The hardcoded value stays as a STARTING one and now says so: OSC 7 corrects it on the shell's
+first prompt, and before that a block with no cwd names itself worse than one with a stale
+guess.
