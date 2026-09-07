@@ -651,7 +651,65 @@ pub fn apply_theme(ctx: &egui::Context) {
 /// tapped key (if any). The whole surface adapts: key height is the adaptive touch target
 /// (comfortably large on a phone), spacing is the adaptive gutter, and the board fills the
 /// available width with per-key widths proportional to their weight.
+/// The appearance settings the board actually draws with.
+///
+/// `AppearanceConfig` has carried `key_radius`, `opacity` and `show_magnifier` since the GTK
+/// build, `settings.rs` round-trips them, and the renderer read NONE of them: the radius was
+/// `size.y * 0.18`, the board was opaque, and the magnifier I added last commit ignored its
+/// own switch. A setting that persists and changes nothing is worse than one that is missing,
+/// because the operator concludes the feature is broken rather than absent.
+///
+/// Separate from `AppearanceConfig` so this crate's renderer does not depend on the config
+/// crate's shape, and so `Default` is the look the board had before any of this — which is
+/// what keeps every existing call site drawing exactly what it drew.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Style {
+    /// Key corner radius in points. `None` = the old proportional rule, which is the right
+    /// default: a fixed radius looks wrong when the same board draws at phone and desktop
+    /// key sizes.
+    pub key_radius: Option<f32>,
+    /// Board opacity, 0.05..=1.0.
+    pub opacity: f32,
+    /// Show the magnifier bubble on press.
+    pub magnifier: bool,
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Style { key_radius: None, opacity: 1.0, magnifier: true }
+    }
+}
+
+impl Style {
+    /// From the persisted appearance block.
+    ///
+    /// Clamped, because these arrive from a TOML file a person can edit: a radius of 400
+    /// makes every key a circle with no glyph in it, and an opacity of 0 is a keyboard you
+    /// cannot see but still type on — which is indistinguishable from the app having
+    /// crashed.
+    pub fn from_appearance(key_radius: f64, opacity: f64, magnifier: bool) -> Style {
+        Style {
+            key_radius: Some((key_radius as f32).clamp(0.0, 24.0)),
+            opacity: (opacity as f32).clamp(0.05, 1.0),
+            magnifier,
+        }
+    }
+
+    /// The radius for a key of this height.
+    pub fn radius_for(&self, key_h: f32) -> u8 {
+        match self.key_radius {
+            Some(r) => r.clamp(0.0, key_h * 0.5).round() as u8,
+            None => (key_h * 0.18) as u8,
+        }
+    }
+}
+
 pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, palette: &str) -> Option<String> {
+    keyboard_ui_styled(ui, layout, adaptive, palette, Style::default())
+}
+
+/// [`keyboard_ui`], drawn with explicit [`Style`].
+pub fn keyboard_ui_styled(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, palette: &str, style: Style) -> Option<String> {
     let colors = uikit_egui::palette_colors(palette);
     let glass = palette == "system"; // the shared system-utilities look (gitmind/rusty-board): glass keys
     let gutter = adaptive.gutter;
@@ -667,10 +725,21 @@ pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, palette: &
         // before any key: the GTK board reads as a panel that has slid up, this read as a
         // screen that had been cut in half.
         let board_rect = ui.max_rect();
+        // `--rb-keyboard-opacity`: the board's own fill, not the whole surface. Fading the
+        // KEYS as well would make a translucent keyboard unreadable rather than see-through
+        // — the setting is about letting the app behind show past the board, which is what
+        // the GTK rule does (`alpha(@view_bg_color, var(--rb-keyboard-opacity))`).
+        let base = uikit_egui::surface_fill(colors.bg_base);
+        let base = egui::Color32::from_rgba_unmultiplied(
+            base.r(),
+            base.g(),
+            base.b(),
+            (base.a() as f32 * style.opacity).round().clamp(0.0, 255.0) as u8,
+        );
         ui.painter().rect_filled(
             board_rect,
             egui::CornerRadius { nw: BOARD_RADIUS, ne: BOARD_RADIUS, sw: 0, se: 0 },
-            uikit_egui::surface_fill(colors.bg_base),
+            base,
         );
         uikit_egui::paint_top_hairline(ui, board_rect);
     }
@@ -683,7 +752,7 @@ pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, palette: &
             ui.add_space(gutter);
             for key in &row.keys {
                 let w = (usable * (key.weight / total_weight)).max(8.0);
-                if let Some(e) = paint_key(ui, key, Vec2::new(w, key_h), gutter, &colors, glass, layout.hints) {
+                if let Some(e) = paint_key(ui, key, Vec2::new(w, key_h), gutter, &colors, glass, layout.hints, style) {
                     emitted = Some(e);
                 }
             }
@@ -818,7 +887,7 @@ fn key_deadzone(size: Vec2) -> f32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool, hints: bool) -> Option<String> {
+fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool, hints: bool, style: Style) -> Option<String> {
     // CLICK AND DRAG. This was `Sense::click()`, which is why cardinal swipes
     // did nothing: a key that only senses clicks never sees a drag, so the
     // direction could not be measured however good the classifier was.
@@ -833,7 +902,7 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
     // experimental keyboards": the classifier, the widget and the layouts
     // were all fine, and none of them was being called. A palette chooses
     // how a key LOOKS; it never gets to decide what a gesture MEANS.
-    paint_key_face(ui, key, rect, size, gutter, c, glass, hints, &resp);
+    paint_key_face(ui, key, rect, size, gutter, c, glass, hints, &resp, style);
     dispatch_key(ui, key, rect, size, &resp)
 }
 
@@ -939,7 +1008,7 @@ fn paint_cap_label(
 
 /// The visual half of a key: glass or carved-tile, pressed/hovered/at-rest. No gesture logic.
 #[allow(clippy::too_many_arguments)]
-fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool, hints: bool, resp: &egui::Response) {
+fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool, hints: bool, resp: &egui::Response, style: Style) {
     // What the in-flight swipe (if any) is currently arming. Peeked, not
     // driven: `dispatch_key` still owns the press state, and it runs after
     // this. On the first frame of a press there is nothing to peek yet and the
@@ -959,7 +1028,10 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
     });
     let painter = ui.painter();
     let pressed = resp.is_pointer_button_down_on();
-    let rounding = CornerRadius::same((size.y * 0.18) as u8);
+    // `--rb-key-radius`, when the operator has set one. The proportional default stays
+    // the default: a fixed radius looks wrong when one board draws at both phone and
+    // desktop key sizes.
+    let rounding = CornerRadius::same(style.radius_for(size.y));
     // ON THE PIXEL GRID. A cap font of `key_height * 0.42` is 18.48pt on a 44pt key, and at
     // a 1.25 or 1.5 desktop scale that is 23.1 or 27.72 DEVICE pixels — a glyph with no
     // whole-pixel stem in it, which reads as soft and slightly tall. It also made egui
@@ -1041,7 +1113,7 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
         // absent from this port entirely. Drawn on a FOREGROUND layer: at board scale it
         // overlaps the row above, and a magnifier a neighbouring key can paint over is a
         // magnifier that vanishes exactly when the board is busiest.
-        if pressed && wants_magnifier(key) {
+        if pressed && style.magnifier && wants_magnifier(key) {
             let bounds = ui.clip_rect();
             let bub = magnifier_rect(rect, bounds, ppp);
             let top = ui.ctx().layer_painter(egui::LayerId::new(
@@ -2072,6 +2144,48 @@ mod gtk_parity_tests {
         assert_eq!(b.current().name, "symbols");
         b.toggle_symbols();
         assert_eq!(b.layout_index(), cardinal);
+    }
+
+    /// `AppearanceConfig` has carried these since the GTK build and `settings::ready`
+    /// reported the section live, while the renderer read none of them. A setting that
+    /// persists and changes nothing is worse than one that is missing: the operator
+    /// concludes the feature is broken rather than absent.
+    #[test]
+    fn the_appearance_settings_reach_the_renderer() {
+        // The default is what the board looked like before any of this, so every existing
+        // call site draws exactly what it drew.
+        let d = Style::default();
+        assert_eq!(d.key_radius, None);
+        assert_eq!(d.opacity, 1.0);
+        assert!(d.magnifier);
+        assert_eq!(d.radius_for(44.0), (44.0f32 * 0.18) as u8, "the default is the old rule");
+
+        // A set radius is honoured, and stays proportional-free.
+        let s = Style::from_appearance(4.0, 0.8, false);
+        assert_eq!(s.radius_for(44.0), 4);
+        assert_eq!(s.radius_for(28.0), 4, "a fixed radius is fixed at both key sizes");
+        assert!(!s.magnifier);
+        assert!((s.opacity - 0.8).abs() < 1e-6);
+    }
+
+    /// These arrive from a TOML file a person can edit.
+    #[test]
+    fn absurd_settings_are_clamped_rather_than_obeyed() {
+        // A radius of 400 makes every key a circle with no glyph in it — and half the key
+        // height is the most a rounded rectangle can take before it stops being one.
+        let huge = Style::from_appearance(400.0, 1.0, true);
+        assert_eq!(huge.radius_for(44.0), 22, "a radius past half the height");
+        assert!(huge.key_radius.unwrap() <= 24.0);
+
+        // An opacity of 0 is a keyboard you cannot see but still type on, which is
+        // indistinguishable from the app having crashed.
+        let gone = Style::from_appearance(8.0, 0.0, true);
+        assert!(gone.opacity >= 0.05, "an invisible keyboard was allowed");
+        let over = Style::from_appearance(8.0, 4.0, true);
+        assert_eq!(over.opacity, 1.0);
+        // negatives too, since a hand-edited file can hold them
+        assert!(Style::from_appearance(-5.0, -1.0, true).opacity >= 0.05);
+        assert_eq!(Style::from_appearance(-5.0, 1.0, true).radius_for(44.0), 0);
     }
 
     /// On a phone your thumb covers the key it is pressing, so the magnifier is the only

@@ -10,10 +10,12 @@ use eframe::egui;
 
 use crate::real_layout::{Press, RealBoard};
 use crate::swipe::{candidate_bar, draw_trail_styled, set_trail_debug_styling, trail_debug_styling, SwipeState, TrailStyle};
-use crate::{apply_theme, keyboard_ui, Board};
+use crate::{apply_theme, keyboard_ui_styled, Board};
 use uikit_egui::Adaptive;
 
 pub struct Feel {
+    /// What the board draws with, from the persisted appearance block.
+    pub style: crate::Style,
     /// Which of the three keyboard obligations (no focus, bottom edge, focus-driven show/hide)
     /// this host meets, decided once — see `platform.rs`. Shown in the status strip.
     placement: crate::platform::Placement,
@@ -216,7 +218,19 @@ impl Feel {
     }
 
     pub fn new() -> Feel {
+        // THE APPEARANCE SETTINGS, read once at start. `settings::ready(Appearance)` has
+        // returned true all along — the section claimed to "do what it says" — while
+        // `key_radius`, `opacity` and `show_magnifier` were stored, round-tripped and
+        // ignored by the renderer. A control that silently does nothing is the exact
+        // failure that function's own comment warns about.
+        let cfg = crate::settings::load_or_default();
+        let style = crate::Style::from_appearance(
+            cfg.appearance.key_radius,
+            cfg.appearance.opacity,
+            cfg.appearance.show_magnifier,
+        );
         Feel {
+            style,
             placement: crate::platform::placement(),
             reveal: Default::default(),
             was_visible: false,
@@ -807,7 +821,7 @@ impl Feel {
                         // the real layout files: render via the projection, feed emissions through
                         // the board's state machine (shift/symbols absorbed), act on the rest
                         let render = self.real.render_rc();
-                        if let Some(e) = keyboard_ui(ui, &render, &adaptive, self.board.palette()) {
+                        if let Some(e) = keyboard_ui_styled(ui, &render, &adaptive, self.board.palette(), self.style) {
                             // THROUGH THE SINK, not straight into the
                             // preview string. These wrote to `self.typed`
                             // directly, which is the same bug as the
@@ -855,7 +869,7 @@ impl Feel {
                         // model failure, the sink closing — and a key latched on toggle
                         // would keep pulsing over a microphone that had already closed.
                         self.board.set_voice_active(self.dictation.is_active());
-                        keyboard_ui(ui, &self.board.rendered(), &adaptive, self.board.palette())
+                        keyboard_ui_styled(ui, &self.board.rendered(), &adaptive, self.board.palette(), self.style)
                     } {
                         // Same decoder as the real layouts, so a mic key or an action token
                         // on a code-built board means the same thing it means on a JSON one.
