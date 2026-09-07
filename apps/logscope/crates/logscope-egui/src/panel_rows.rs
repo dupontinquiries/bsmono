@@ -169,6 +169,14 @@ pub fn row_glow(light: scene_kit::mesh3d::SceneLight, index: usize, of: usize, s
 pub struct PanelContext {
     rows: [Row; MAX_ROWS],
     len: u8,
+    /// Which tab plate along the panel's top edge is lit, 0-based.
+    ///
+    /// The renderer hardcoded `active = i == 0`, so the in-scene board always showed the
+    /// FIRST tab lit however far the app had moved — a physical panel that is meant to BE
+    /// the app's context panel as hardware, telling you it is on Files while you are on
+    /// Prompting. A board that reports the wrong state is worse than one with no tabs: the
+    /// tabs are the part that says the board is live rather than scenery.
+    active_tab: u8,
 }
 
 impl Default for PanelContext {
@@ -184,11 +192,27 @@ impl PanelContext {
         let mut out = [Row { width01: 0.0, accent: false }; MAX_ROWS];
         let n = rows.len().min(MAX_ROWS);
         out[..n].copy_from_slice(&rows[..n]);
-        PanelContext { rows: out, len: n as u8 }
+        PanelContext { rows: out, len: n as u8, active_tab: 0 }
     }
 
     pub fn rows(&self) -> &[Row] {
         &self.rows[..self.len as usize]
+    }
+
+    /// Light the tab at `i`. Clamped by the caller's own tab count at read time, so a
+    /// context set by a page this build does not have cannot light a plate that is not
+    /// drawn.
+    pub fn with_active_tab(mut self, i: usize) -> PanelContext {
+        self.active_tab = i.min(u8::MAX as usize) as u8;
+        self
+    }
+
+    /// Which plate is lit, given how many the skin draws. Out of range lights the FIRST,
+    /// which is the old behaviour and the safe one: a panel with no plate lit reads as
+    /// switched off.
+    pub fn active_tab(&self, tabs: usize) -> usize {
+        let t = self.active_tab as usize;
+        if tabs == 0 || t >= tabs { 0 } else { t }
     }
 
     /// Bucketed for the cache key: widths to eighths, which is finer than
@@ -205,6 +229,38 @@ impl PanelContext {
 
 #[cfg(test)]
 mod tests {
+
+    /// The renderer lit `i == 0` unconditionally, so the in-scene board reported Files
+    /// however far the app had moved. The tabs are what make the board read as live rather
+    /// than as scenery, so a wrong one is worse than none.
+    #[test]
+    fn the_lit_tab_follows_the_page_and_never_points_at_a_plate_that_is_not_drawn() {
+        let base = PanelContext::from_rows(&placeholder());
+        assert_eq!(base.active_tab(4), 0, "the default is the first plate");
+
+        for i in 0..4 {
+            assert_eq!(base.with_active_tab(i).active_tab(4), i);
+        }
+
+        // A page beyond the plates the skin draws lights the FIRST rather than an index
+        // that is not there: a panel with no plate lit reads as switched off.
+        assert_eq!(base.with_active_tab(9).active_tab(4), 0);
+        assert_eq!(base.with_active_tab(4).active_tab(4), 0, "0-based: 4 is past four plates");
+        // A skin with no tabs at all cannot light one.
+        assert_eq!(base.with_active_tab(2).active_tab(0), 0);
+        // A skin with fewer plates clamps rather than overflowing.
+        assert_eq!(base.with_active_tab(3).active_tab(2), 0);
+        assert_eq!(base.with_active_tab(1).active_tab(2), 1);
+    }
+
+    /// The scene cache keys on a bucketed copy of this, and the lit tab must survive it —
+    /// otherwise switching pages would light the plate for one frame and lose it on the
+    /// next rebuild.
+    #[test]
+    fn quantizing_keeps_the_lit_tab() {
+        let c = PanelContext::from_rows(&placeholder()).with_active_tab(2);
+        assert_eq!(c.quantized().active_tab(4), 2);
+    }
     use super::*;
 
     fn items(v: &[(&str, bool)]) -> Vec<(String, bool)> {
@@ -329,4 +385,13 @@ mod tests {
         assert!(p[0].accent && (p[0].width01 - MAX_WIDTH01).abs() < 1e-6);
         assert!(p.len() <= MAX_ROWS);
     }
+}
+
+/// The lit tab for the current scene context, given how many plates the skin draws.
+///
+/// A free function because `scene3d` builds the panel deep inside its mesh walk and reaches
+/// for the thread-local context there rather than threading it through eight arguments —
+/// the same way it already reads `panel_context()` for the rows.
+pub fn panel_context_active_tab(tabs: usize) -> usize {
+    crate::scene3d::panel_context().active_tab(tabs)
 }

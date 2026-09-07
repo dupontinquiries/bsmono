@@ -4466,9 +4466,25 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
             // every world. Segments are the real shape in scope here — a long
             // stretch of talk gets a wide card — and the scene cache keys on a
             // bucketed copy, so this churning every frame does not rebuild it.
+            // AND WHICH TAB IS LIT. The plates along the board's top edge are the app's own
+            // right-hand pages rendered as hardware, and the renderer lit the first one
+            // unconditionally — so the board said Files while you were on Prompting. A
+            // panel that reports the wrong state is worse than one with no tabs, because
+            // the tabs are what say the board is live rather than scenery.
+            let lit = match self.right_page {
+                RightPage::Files => 0,
+                RightPage::Graph => 1,
+                RightPage::Context => 2,
+                RightPage::Prompting => 3,
+                // The skin draws four plates; Engine is a fifth page with no plate of its
+                // own, so it lights the one it is nearest — Prompting — rather than an
+                // index that does not exist.
+                RightPage::Engine => 3,
+            };
             crate::scene3d::set_panel_context(
                 crate::panel_rows::PanelContext::from_rows(
-                    &crate::panel_rows::from_spans(&segs, None)));
+                    &crate::panel_rows::from_spans(&segs, None))
+                    .with_active_tab(lit));
             crate::scene3d::set_env_params(crate::scene3d::EnvParams {
                 nodes: n as u32, branches, segments: segs.len() as u32, seed,
                 ext_x: ext_x.ceil() as u32, ext_z: ext_z.ceil() as u32, bear,

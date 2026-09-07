@@ -5041,9 +5041,14 @@ fn physical_ui_panel(s: &mut Scene, skin: &crate::physkin::PanelSkin, pos: Vec3,
         let strip_w = w * 0.84;
         let tw = strip_w / nt as f32;
         let ty = h * 0.41;
+        // WHICH PLATE IS LIT follows the app. This was `i == 0`, so the board reported
+        // Files however far the app had moved — a panel meant to be the context panel as
+        // hardware, saying the wrong thing. The tabs are the part that makes the board read
+        // as live rather than as scenery, so a wrong one is worse than none.
+        let lit = crate::panel_rows::panel_context_active_tab(nt);
         for i in 0..nt {
             let tx = -strip_w * 0.5 + (i as f32 + 0.5) * tw;
-            let active = i == 0;
+            let active = i == lit;
             let tc = addv(ctr, addv(mulv(right, tx), addv(mulv(up, ty), mulv(n, if active { 0.03 } else { 0.018 }))));
             let mut plate = m3::panel(tc, right, up, tw * 0.86, h * 0.075, if active { mix_rgb(surface, metal, 0.35) } else { card_back });
             plate.mat = M::PAPER; plate.emissive = if active { emiss * 2.0 + 0.16 } else { emiss * 0.4 }; s.add(plate, Float::STILL);
