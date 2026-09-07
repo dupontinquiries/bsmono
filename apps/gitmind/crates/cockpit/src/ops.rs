@@ -306,9 +306,16 @@ pub fn build_locally_cancellable(
     // open a window anywhere: winit dlopens libwayland-client and libX11 at run time, and a
     // static binary cannot dlopen at all, so it dies with NoWaylandLib / "Failed to
     // initialize any backend" even on a device that has both. See `buildflags::gui_env`.
-    let build_env = crate::buildflags::build_env_on_path(
+    // GUI-ness from the DIRECTORY, not the one manifest. `apps/voiceterm/Cargo.toml` is the
+    // `web2qml` package and `apps/snapclone` has no top-level manifest at all — both look
+    // like CLI apps to a single-file check, both miss the `-crt-static` flag, and both then
+    // ship a static musl binary that cannot dlopen libwayland-client. That surfaces as a
+    // winit Wayland error on the phone, which sends you looking for a missing system
+    // library that is already installed.
+    let gui = crate::buildflags::is_gui_app_dir(app_dir);
+    let build_env = crate::buildflags::build_env_for(
         &cargo_target,
-        &root_toml,
+        gui,
         std::env::var("RUSTFLAGS").ok().as_deref(),
         &path_env,
     );
@@ -390,7 +397,7 @@ pub fn build_locally_cancellable(
                 // and a static binary cannot dlopen, so it dies with NoWaylandLib on a
                 // device that has both libraries. Caught here, where the cause is still
                 // visible, rather than on the phone where it looks like a missing package.
-                if crate::buildflags::is_gui_app(&root_toml) {
+                if gui {
                     if let Ok(head) = read_head(&bin, 4096) {
                         if crate::buildflags::elf_is_dynamic(&head) == Some(false) {
                             if let Some(why) = crate::buildflags::explain_no_backend(&cargo_target) {

@@ -311,6 +311,46 @@ pub fn is_gui_app(toml: &str) -> bool {
         .any(|l| WINDOWING.iter().any(|w| l.starts_with(w) || l.starts_with(&format!("{w} ")) || l.starts_with(&format!("{w}="))))
 }
 
+/// Does any manifest under `dir` declare a windowing dependency?
+///
+/// [`is_gui_app`] reads ONE manifest, and for two apps in this fleet that is the wrong one:
+///
+/// * `apps/voiceterm/Cargo.toml` is the `web2qml` package; eframe lives in
+///   `apps/voiceterm/egui-frontend/Cargo.toml`.
+/// * `apps/snapclone` has no top-level `Cargo.toml` at all — it is a CMake project with the
+///   egui frontend in a subdirectory — so the read fails and the string is empty.
+///
+/// Both therefore looked like CLI apps, missed the `-crt-static` flag, and shipped a static
+/// musl binary that cannot dlopen libwayland-client. winit reports that as a Wayland error
+/// and it reads as a missing system library on the phone, which is the wrong thing to go
+/// looking for.
+///
+/// Searches the root, every immediate subdirectory, and `crates/*` — the three places this
+/// fleet puts a frontend. Not a full walk: a bounded search that names where it looked is
+/// better than one that wanders into `target/` and takes a minute.
+pub fn is_gui_app_dir(dir: &std::path::Path) -> bool {
+    let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+    if is_gui_app(&read(dir.join("Cargo.toml"))) {
+        return true;
+    }
+    let mut roots = vec![dir.to_path_buf()];
+    if dir.join("crates").is_dir() {
+        roots.push(dir.join("crates"));
+    }
+    for r in roots {
+        let Ok(entries) = std::fs::read_dir(&r) else { continue };
+        for e in entries.flatten() {
+            if !e.path().is_dir() || e.file_name() == "target" {
+                continue;
+            }
+            if is_gui_app(&read(e.path().join("Cargo.toml"))) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Extra environment a GUI app needs for a given target.
 ///
 /// # A static musl build of a windowed app compiles and cannot start
@@ -352,8 +392,19 @@ pub fn build_env_on_path(
     inherited_rustflags: Option<&str>,
     path_env: &str,
 ) -> Vec<(String, String)> {
+    build_env_for(triple, is_gui_app(toml), inherited_rustflags, path_env)
+}
+
+/// [`build_env_on_path`] with the GUI answer already decided — by [`is_gui_app_dir`], when
+/// the caller has a directory rather than one manifest.
+pub fn build_env_for(
+    triple: &str,
+    gui: bool,
+    inherited_rustflags: Option<&str>,
+    path_env: &str,
+) -> Vec<(String, String)> {
     let mut env = if path_env.is_empty() { cross_env(triple) } else { cross_env_on_path(triple, path_env) };
-    if is_gui_app(toml) {
+    if gui {
         for (k, v) in gui_env(triple) {
             let merged = match inherited_rustflags.map(str::trim).filter(|s| !s.is_empty()) {
                 Some(existing) if k == "RUSTFLAGS" => format!("{existing} {v}"),
@@ -823,6 +874,70 @@ mod tests {
     }
 
     #[test]
+    /// THE TWO APPS THAT REPORTED A WAYLAND ERROR. `is_gui_app` reads one manifest, and for
+    /// both of these it is the wrong one — so they missed the `-crt-static` flag, shipped a
+    /// static musl binary that cannot dlopen libwayland-client, and the failure surfaced as
+    /// a winit Wayland error that reads like a missing system library.
+    #[test]
+    fn a_frontend_in_a_subdirectory_is_still_a_gui_app() {
+        let root = std::env::temp_dir().join(format!("gm-gui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // voiceterm's shape: the top-level manifest is a DIFFERENT package, eframe is in a
+        // subdirectory.
+        let vt = root.join("voiceterm");
+        std::fs::create_dir_all(vt.join("egui-frontend")).unwrap();
+        std::fs::write(vt.join("Cargo.toml"), "[package]\nname = \"web2qml\"\n\n[dependencies]\nserde = \"1\"\n").unwrap();
+        assert!(!is_gui_app(&std::fs::read_to_string(vt.join("Cargo.toml")).unwrap()), "the premise");
+        std::fs::write(vt.join("egui-frontend/Cargo.toml"), "[dependencies]\neframe = \"0.34\"\n").unwrap();
+        assert!(is_gui_app_dir(&vt), "voiceterm's frontend was not found");
+
+        // snapclone's shape: NO top-level manifest at all (a CMake project).
+        let sc = root.join("snapclone");
+        std::fs::create_dir_all(sc.join("egui-frontend")).unwrap();
+        std::fs::write(sc.join("CMakeLists.txt"), "project(snapclone)\n").unwrap();
+        std::fs::write(sc.join("egui-frontend/Cargo.toml"), "[dependencies]\neframe = \"0.34\"\n").unwrap();
+        assert!(is_gui_app_dir(&sc), "snapclone's frontend was not found");
+
+        // A frontend under `crates/` too — gitmind's own shape.
+        let gm = root.join("gitmind");
+        std::fs::create_dir_all(gm.join("crates/gui-egui")).unwrap();
+        std::fs::write(gm.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(gm.join("crates/gui-egui/Cargo.toml"), "[dependencies]\neframe = \"0.34\"\n").unwrap();
+        assert!(is_gui_app_dir(&gm), "a crates/ frontend was not found");
+
+        // And a CLI app is still a CLI app: this must not turn every push into a dynamic
+        // musl build, which is a different binary with a different runtime requirement.
+        let cli = root.join("cli");
+        std::fs::create_dir_all(cli.join("src")).unwrap();
+        std::fs::write(cli.join("Cargo.toml"), "[dependencies]\nclap = \"4\"\n").unwrap();
+        assert!(!is_gui_app_dir(&cli));
+        // A directory that does not exist is not a GUI app either.
+        assert!(!is_gui_app_dir(&root.join("nope")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The real trees, so this cannot regress when an app moves its frontend.
+    #[test]
+    fn the_shipped_frontends_are_detected_where_they_actually_live() {
+        let apps = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..") // crates/cockpit -> gitmind -> apps
+            .canonicalize()
+            .expect("the apps directory");
+        let mut checked = 0;
+        for name in ["voiceterm", "snapclone", "rusty-board", "logscope"] {
+            let dir = apps.join(name);
+            if !dir.is_dir() {
+                continue; // a checkout without every app is not a failure
+            }
+            checked += 1;
+            assert!(is_gui_app_dir(&dir), "{name} has an egui frontend and was not detected");
+        }
+        // A test that silently checked nothing is the failure this whole commit is about.
+        assert!(checked >= 2, "found only {checked} app trees under {apps:?} — the path is wrong");
+    }
+
     /// A windowed app on a static musl target compiles and cannot open a window on any
     /// machine. This is the flag that makes the build dynamic again.
     #[test]
