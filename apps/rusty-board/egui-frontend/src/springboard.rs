@@ -1,0 +1,459 @@
+//! springboard — a swipe that leaves the letters and comes back typed a space.
+//!
+//! `docs/single-hand-mode.md` §3. The letter region's perimeter IS the spacebar: swipe a
+//! word, cross the bottom or a side edge, come back, swipe the next word. No lifting, no
+//! reaching for a space key, which is the whole point on a phone held in one hand.
+//!
+//! ## The algorithm, and the two rules that make it usable
+//!
+//! Walk the path; each segment either crosses the letter region's boundary or does not. An
+//! **out** crossing followed by an **in** crossing is one space delimiter, and the path is
+//! cut there — each piece goes to the word recognizer on its own.
+//!
+//! **Hysteresis.** An out-crossing only counts if the path then travels at least
+//! [`MIN_OUT_DWELL`] inside the edge zone before returning. Without it, a swipe that grazes
+//! the boundary between two letters — which happens constantly on the bottom row — inserts
+//! a space in the middle of a word. The doc names 12px; the rejection is the feature.
+//!
+//! **The top edge does not participate.** Crossing it is reserved for the digit arc and the
+//! minimize fling ([`crate::topedge`]), and a swipe that goes up there is terminated rather
+//! than segmented — otherwise reaching for a digit would also type whatever the path
+//! happened to spell on the way.
+//!
+//! ## What this returns, and what it does not do
+//!
+//! [`segment`] returns index ranges into the path plus the crossing points, and nothing
+//! else. It does not run the recognizer (that is `swipe.rs`'s), and it does not draw the
+//! ripple the doc asks for at each delimiter — but it reports where one belongs, because a
+//! delimiter the user cannot see is a space they will not learn to make on purpose.
+
+use egui::{Pos2, Rect};
+
+/// How far inside the edge zone a path must travel for an out-crossing to count (§3).
+pub const MIN_OUT_DWELL: f32 = 12.0;
+
+/// Which edge a crossing happened on. The top is listed so it can be REFUSED by name
+/// rather than by falling through a `_`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    Bottom,
+    Left,
+    Right,
+    /// Reserved for the digit arc and the minimize fling.
+    Top,
+}
+
+impl Edge {
+    /// Does this edge insert a space?
+    pub fn is_springboard(self) -> bool {
+        !matches!(self, Edge::Top)
+    }
+}
+
+/// Where the path left the letter region, for the ripple the doc asks for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Delimiter {
+    pub at: Pos2,
+    pub edge: Edge,
+    /// The path index the following segment starts at.
+    pub resumes: usize,
+}
+
+/// The outcome of segmenting one swipe.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Segments {
+    /// Index ranges into the path, one per word to recognise.
+    pub ranges: Vec<std::ops::Range<usize>>,
+    /// One per delimiter that fired, in order.
+    pub delimiters: Vec<Delimiter>,
+    /// The path ended outside the letters with no closing crossing: recognise what there is
+    /// and append a space (§3, step 5).
+    pub trailing_space: bool,
+    /// The path crossed the TOP edge, so the whole gesture belongs to `topedge` and nothing
+    /// here should be recognised at all.
+    pub terminated_by_top: bool,
+}
+
+impl Segments {
+    /// Nothing to say: one word, no spaces.
+    fn plain(len: usize) -> Segments {
+        Segments {
+            ranges: if len == 0 { Vec::new() } else { vec![0..len] },
+            delimiters: Vec::new(),
+            trailing_space: false,
+            terminated_by_top: false,
+        }
+    }
+}
+
+/// Which edge a point outside `letters` is nearest — or `None` when it is inside.
+pub fn outside_edge(letters: Rect, p: Pos2) -> Option<Edge> {
+    if letters.contains(p) {
+        return None;
+    }
+    // Above the region is the top edge whatever else is true: the digit and minimize
+    // gestures own that direction, and treating a high-and-left point as a side crossing
+    // would let a digit arc also insert a space.
+    if p.y < letters.top() {
+        return Some(Edge::Top);
+    }
+    if p.y > letters.bottom() {
+        return Some(Edge::Bottom);
+    }
+    if p.x < letters.left() {
+        return Some(Edge::Left);
+    }
+    Some(Edge::Right)
+}
+
+/// Segment a completed swipe path.
+pub fn segment(path: &[Pos2], letters: Rect) -> Segments {
+    if path.len() < 2 {
+        return Segments::plain(path.len());
+    }
+    let mut out = Segments::plain(0);
+    let mut seg_start = 0usize;
+    // Where the path left the letters, and how far it has travelled since.
+    let mut exit: Option<(usize, Pos2, Edge, f32)> = None;
+
+    for i in 0..path.len() {
+        let here = path[i];
+        match (outside_edge(letters, here), &mut exit) {
+            // Still inside, and was inside: nothing to do.
+            (None, None) => {}
+            // Left the region.
+            (Some(edge), None) => {
+                if edge == Edge::Top {
+                    // The whole gesture belongs to `topedge`. Reporting the segments so far
+                    // would let a digit arc also type a word.
+                    return Segments {
+                        ranges: Vec::new(),
+                        delimiters: Vec::new(),
+                        trailing_space: false,
+                        terminated_by_top: true,
+                    };
+                }
+                exit = Some((i, here, edge, 0.0));
+            }
+            // Outside, and still outside: accumulate the dwell.
+            (Some(edge), Some((_, _, e, dwell))) => {
+                if edge == Edge::Top {
+                    return Segments {
+                        ranges: Vec::new(),
+                        delimiters: Vec::new(),
+                        trailing_space: false,
+                        terminated_by_top: true,
+                    };
+                }
+                *e = edge;
+                *dwell += (here - path[i - 1]).length();
+            }
+            // Came back in.
+            (None, Some((idx, at, edge, dwell))) => {
+                // HYSTERESIS: a graze is not a delimiter. Without this, a swipe that clips
+                // the boundary between two letters — which happens constantly on the bottom
+                // row — puts a space in the middle of a word.
+                if *dwell >= MIN_OUT_DWELL && edge.is_springboard() {
+                    out.ranges.push(seg_start..*idx);
+                    out.delimiters.push(Delimiter { at: *at, edge: *edge, resumes: i });
+                    seg_start = i;
+                }
+                exit = None;
+            }
+        }
+    }
+
+    // Ended outside with no closing crossing.
+    if let Some((idx, _, edge, dwell)) = exit {
+        if dwell >= MIN_OUT_DWELL && edge.is_springboard() {
+            out.ranges.push(seg_start..idx);
+            out.trailing_space = true;
+            return out;
+        }
+        // A graze at the very end is not a space; the segment runs to the end of the path.
+    }
+    out.ranges.push(seg_start..path.len());
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn letters() -> Rect {
+        Rect::from_min_size(Pos2::new(0.0, 0.0), egui::vec2(400.0, 200.0))
+    }
+
+    fn p(x: f32, y: f32) -> Pos2 {
+        Pos2::new(x, y)
+    }
+
+    /// The gesture the feature exists for: swipe a word, dip below the keys, swipe the next.
+    #[test]
+    fn out_and_back_across_the_bottom_is_one_space() {
+        let l = letters();
+        let path = vec![
+            p(10.0, 100.0),
+            p(60.0, 120.0),
+            // out below the bottom, and far enough along it to count
+            p(80.0, 215.0),
+            p(110.0, 218.0),
+            // back in
+            p(140.0, 150.0),
+            p(180.0, 120.0),
+        ];
+        let s = segment(&path, l);
+        assert_eq!(s.ranges.len(), 2, "{s:?}");
+        assert_eq!(s.ranges[0], 0..2);
+        assert_eq!(s.ranges[1], 4..6);
+        assert_eq!(s.delimiters.len(), 1);
+        assert_eq!(s.delimiters[0].edge, Edge::Bottom);
+        assert_eq!(s.delimiters[0].resumes, 4);
+        assert!(!s.trailing_space && !s.terminated_by_top);
+    }
+
+    /// The hysteresis rule, which is the difference between a usable feature and one that
+    /// puts spaces inside words. A swipe along the bottom row grazes the boundary
+    /// constantly.
+    #[test]
+    fn a_graze_is_not_a_space() {
+        let l = letters();
+        let path = vec![
+            p(10.0, 190.0),
+            p(40.0, 202.0),  // barely out
+            p(44.0, 203.0),  // travels 4px out — under the 12px floor
+            p(70.0, 190.0),  // back in
+            p(120.0, 180.0),
+        ];
+        let s = segment(&path, l);
+        assert_eq!(s.ranges, vec![0..5], "a graze inserted a space: {s:?}");
+        assert!(s.delimiters.is_empty());
+
+        // The same shape with a real excursion IS a delimiter — so the test is measuring
+        // the dwell and not just refusing everything.
+        let path = vec![
+            p(10.0, 190.0),
+            p(40.0, 205.0),
+            p(70.0, 208.0),
+            p(70.0, 190.0),
+            p(120.0, 180.0),
+        ];
+        assert_eq!(segment(&path, l).delimiters.len(), 1);
+    }
+
+    /// "The top edge does NOT participate": crossing it is a digit or a minimize, and
+    /// segmenting it as well would let a digit arc type whatever the path spelled on the
+    /// way up.
+    #[test]
+    fn the_top_edge_terminates_rather_than_segments() {
+        let l = letters();
+        let path = vec![p(100.0, 50.0), p(105.0, 20.0), p(108.0, -30.0), p(110.0, -35.0)];
+        let s = segment(&path, l);
+        assert!(s.terminated_by_top);
+        assert!(s.ranges.is_empty(), "a top crossing produced words: {s:?}");
+        assert!(s.delimiters.is_empty());
+        assert!(!Edge::Top.is_springboard());
+        for e in [Edge::Bottom, Edge::Left, Edge::Right] {
+            assert!(e.is_springboard());
+        }
+        // Above the region is TOP even when it is also left of it, or a digit arc leaving
+        // at an angle would count as a side crossing.
+        assert_eq!(outside_edge(l, p(-20.0, -20.0)), Some(Edge::Top));
+    }
+
+    /// §3 step 5: a path that ends outside recognises what it has and appends a space.
+    #[test]
+    fn ending_outside_the_letters_is_a_trailing_space() {
+        let l = letters();
+        let path = vec![p(10.0, 100.0), p(80.0, 150.0), p(120.0, 215.0), p(150.0, 220.0)];
+        let s = segment(&path, l);
+        assert!(s.trailing_space);
+        assert_eq!(s.ranges, vec![0..2], "the word should stop where the path left: {s:?}");
+
+        // But only if it actually dwelt out there — a path ending on a graze is one word.
+        let path = vec![p(10.0, 100.0), p(80.0, 150.0), p(120.0, 203.0)];
+        let s = segment(&path, l);
+        assert!(!s.trailing_space, "a graze at the end became a space: {s:?}");
+        assert_eq!(s.ranges, vec![0..3]);
+    }
+
+    /// Both side edges work, and two excursions are two spaces.
+    #[test]
+    fn the_sides_are_springboards_too_and_delimiters_accumulate() {
+        let l = letters();
+        let path = vec![
+            p(20.0, 100.0),
+            p(-15.0, 100.0),
+            p(-18.0, 115.0), // dwelt outside the left edge
+            p(30.0, 110.0),  // back in
+            p(200.0, 110.0),
+            p(415.0, 110.0),
+            p(418.0, 125.0), // and out the right
+            p(300.0, 120.0), // back in
+            p(320.0, 130.0),
+        ];
+        let s = segment(&path, l);
+        assert_eq!(s.delimiters.len(), 2, "{s:?}");
+        assert_eq!(s.delimiters[0].edge, Edge::Left);
+        assert_eq!(s.delimiters[1].edge, Edge::Right);
+        assert_eq!(s.ranges.len(), 3);
+    }
+
+    /// A swipe that never leaves the letters is one word, and a degenerate path is not a
+    /// crash.
+    #[test]
+    fn an_ordinary_swipe_is_untouched() {
+        let l = letters();
+        let path = vec![p(10.0, 100.0), p(80.0, 120.0), p(150.0, 90.0)];
+        let s = segment(&path, l);
+        assert_eq!(s.ranges, vec![0..3]);
+        assert!(s.delimiters.is_empty() && !s.trailing_space && !s.terminated_by_top);
+
+        assert!(segment(&[], l).ranges.is_empty());
+        assert_eq!(segment(&[p(1.0, 1.0)], l).ranges, vec![0..1]);
+    }
+}
+
+// ─────────────────────────── the space zones ───────────────────────────
+
+/// A tappable strip outside the letter region that emits a space (§4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Zone {
+    pub rect: Rect,
+    pub edge: Edge,
+    /// Stays tappable during an active swipe. Only the bottom zone does, per the doc: "in
+    /// case the user wants to end mid-swipe". Suppressing the side zones while swiping is
+    /// what stops a word's own path from tapping one on its way past.
+    pub live_while_swiping: bool,
+}
+
+/// `~36px tall` (§4).
+pub const BOTTOM_H: f32 = 36.0;
+/// `~24px wide` (§4).
+pub const SIDE_W: f32 = 24.0;
+
+/// The space zones for a board, given where the letters are and which side (if any) the
+/// board is compacted to.
+///
+/// The bottom zone is always there. A side zone appears only on the side the compaction
+/// FREED — which is the job the freed strip has been waiting for since `halfboard` landed,
+/// and the reason that module returns it rather than leaving a gap.
+///
+/// The doc says "only present in right-handed single-hand mode" for the right zone, and the
+/// mirror for the left. Note which way round that is: a RIGHT-handed board is anchored right
+/// and frees the LEFT, so the reachable strip — the one a right thumb can hit — is on the
+/// left. Following the doc's geometry rather than its wording here, because a space zone
+/// under the palm is not a space zone.
+pub fn zones(board: Rect, letters: Rect, half: crate::halfboard::Side) -> Vec<Zone> {
+    let mut out = vec![Zone {
+        rect: Rect::from_min_max(
+            Pos2::new(board.left(), letters.bottom()),
+            Pos2::new(board.right(), (letters.bottom() + BOTTOM_H).min(board.bottom())),
+        ),
+        edge: Edge::Bottom,
+        live_while_swiping: true,
+    }];
+    if let Some(free) = half.free_zone(board) {
+        let (rect, edge) = match half {
+            // Anchored left: the strip is on the right.
+            crate::halfboard::Side::Left => (
+                Rect::from_min_max(
+                    Pos2::new(free.left(), letters.top()),
+                    Pos2::new((free.left() + SIDE_W).min(free.right()), letters.bottom()),
+                ),
+                Edge::Right,
+            ),
+            crate::halfboard::Side::Right => (
+                Rect::from_min_max(
+                    Pos2::new((free.right() - SIDE_W).max(free.left()), letters.top()),
+                    Pos2::new(free.right(), letters.bottom()),
+                ),
+                Edge::Left,
+            ),
+            crate::halfboard::Side::Off => return out,
+        };
+        out.push(Zone { rect, edge, live_while_swiping: false });
+    }
+    out
+}
+
+/// The zone a tap at `p` lands in, if any. `swiping` suppresses the side zones.
+pub fn zone_at(zones: &[Zone], p: Pos2, swiping: bool) -> Option<Zone> {
+    zones
+        .iter()
+        .find(|z| z.rect.contains(p) && (!swiping || z.live_while_swiping))
+        .copied()
+}
+
+#[cfg(test)]
+mod zone_tests {
+    use super::*;
+    use crate::halfboard::Side;
+
+    fn board() -> Rect {
+        Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 260.0))
+    }
+    fn letters() -> Rect {
+        Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 200.0))
+    }
+
+    /// Full width: one zone, along the bottom, and it survives an active swipe so a word can
+    /// be ended mid-gesture.
+    #[test]
+    fn a_full_width_board_has_one_space_zone() {
+        let z = zones(board(), letters(), Side::Off);
+        assert_eq!(z.len(), 1);
+        assert_eq!(z[0].edge, Edge::Bottom);
+        assert!(z[0].live_while_swiping);
+        assert!((z[0].rect.height() - BOTTOM_H).abs() < 0.01);
+        assert_eq!(z[0].rect.width(), board().width());
+
+        assert!(zone_at(&z, Pos2::new(250.0, 215.0), false).is_some());
+        assert!(zone_at(&z, Pos2::new(250.0, 215.0), true).is_some(), "the bottom stays live");
+        assert!(zone_at(&z, Pos2::new(250.0, 100.0), false).is_none(), "that is a letter");
+    }
+
+    /// The freed strip finally has a job — this is what `halfboard::free_zone` was returning
+    /// it for.
+    #[test]
+    fn compaction_adds_a_side_zone_in_the_freed_strip() {
+        let (b, l) = (board(), letters());
+        for (side, want_edge) in [(Side::Left, Edge::Right), (Side::Right, Edge::Left)] {
+            let keys = side.board_rect(b);
+            let letters_here = Rect::from_min_max(
+                Pos2::new(keys.left(), l.top()),
+                Pos2::new(keys.right(), l.bottom()),
+            );
+            let z = zones(b, letters_here, side);
+            assert_eq!(z.len(), 2, "{side:?}: {z:?}");
+            let strip = z[1];
+            assert_eq!(strip.edge, want_edge);
+            assert!((strip.rect.width() - SIDE_W).abs() < 0.01);
+            assert!(
+                side.free_zone(b).unwrap().contains(strip.rect.center()),
+                "{side:?}: the strip is not in the freed space"
+            );
+            // A right-anchored board frees the LEFT, so the reachable strip is on the left —
+            // a space zone under the palm is not a space zone.
+            match side {
+                Side::Left => assert!(strip.rect.left() > keys.right() - 1.0),
+                Side::Right => assert!(strip.rect.right() < keys.left() + 1.0),
+                Side::Off => unreachable!(),
+            }
+        }
+    }
+
+    /// A side zone is suppressed during a swipe, so a word's own path cannot tap one on its
+    /// way past. The bottom is not, because ending a word there is deliberate.
+    #[test]
+    fn the_side_zone_goes_quiet_while_swiping() {
+        let (b, l) = (board(), letters());
+        let keys = Side::Left.board_rect(b);
+        let letters_here = Rect::from_min_max(Pos2::new(keys.left(), l.top()), Pos2::new(keys.right(), l.bottom()));
+        let z = zones(b, letters_here, Side::Left);
+        let side_point = z[1].rect.center();
+        assert!(zone_at(&z, side_point, false).is_some(), "tappable at rest");
+        assert!(zone_at(&z, side_point, true).is_none(), "a swipe past it tapped it");
+        assert!(zone_at(&z, z[0].rect.center(), true).is_some(), "the bottom stayed live");
+    }
+}

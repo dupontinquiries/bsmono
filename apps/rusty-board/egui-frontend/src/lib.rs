@@ -29,6 +29,8 @@ pub mod tray;
 pub mod halfboard;
 /// The two gestures on the top edge: the digit up-arc and the minimize fling.
 pub mod topedge;
+/// Swipe out of the letters and back to type a space (`single-hand-mode.md` §3).
+pub mod springboard;
 /// Full / Tray / Dismissed and every way between them (`docs/single-hand-mode.md`).
 pub mod visible_mode;
 pub mod microterm;
