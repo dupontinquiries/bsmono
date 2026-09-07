@@ -114,6 +114,15 @@ pub enum Latch {
     /// Held until turned off. Solid accent, white text — the loudest state on the board,
     /// because it is the one that silently changes what every other key does.
     Locked,
+    /// ENGAGED AND RUNNING — the mic key while dictation is recording
+    /// (`.key-special.voice-active` in the GTK stylesheet, which pulses).
+    ///
+    /// A separate state from `Locked` because it pulses, and it pulses because a live
+    /// microphone must be visible on the surface you are looking at. The screen already had
+    /// a "● dictating" label, in a toolbar the layer-shell build does not draw at all: on a
+    /// phone the keyboard IS the surface, so the only indicator that the mic was open was
+    /// off-screen.
+    Live,
 }
 
 /// A key's role, mirroring `board_layouts::KeyType` and the four CSS classes the GTK
@@ -480,6 +489,10 @@ pub struct Board {
     idx: usize,
     gesture: uikit_egui::GestureLayer,
     palette: String,
+    /// The microphone is open. Drawn on the mic key, because on a phone the keyboard is
+    /// the whole surface and the screen's "● dictating" label is in a toolbar the
+    /// layer-shell build never draws.
+    voice_active: bool,
     /// Off / one-shot / locked, exactly as the real board tracks it.
     ///
     /// The code-built boards had no shift state at all. Before the last commit the shift
@@ -495,7 +508,8 @@ pub struct Board {
 impl Board {
     /// Default board: qwerty + symbols.
     pub fn new() -> Board {
-        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0), shift: real_layout::Shift::Off, before_symbols: None, palette: "system".to_string() }
+        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0), voice_active: false,
+            shift: real_layout::Shift::Off, before_symbols: None, palette: "system".to_string() }
     }
     pub fn current(&self) -> &Layout {
         &self.layouts[self.idx]
@@ -518,6 +532,15 @@ impl Board {
 
     /// The shift state, for the caller that needs to draw it.
     pub fn shift(&self) -> real_layout::Shift { self.shift }
+
+    /// Tell the board the microphone is open, so the mic key can show it.
+    pub fn set_voice_active(&mut self, on: bool) {
+        self.voice_active = on;
+    }
+
+    pub fn voice_active(&self) -> bool {
+        self.voice_active
+    }
 
     /// A shift press: Off → Once → Caps → Off, the same cycle as the real board. One
     /// implementation of that cycle, in `real_layout::Shift`, so the two boards cannot
@@ -553,7 +576,7 @@ impl Board {
     /// layout that have to be kept in step — and the shifted one is only needed while a
     /// frame is being drawn.
     pub fn rendered(&self) -> std::borrow::Cow<'_, Layout> {
-        if self.shift == real_layout::Shift::Off {
+        if self.shift == real_layout::Shift::Off && !self.voice_active {
             return std::borrow::Cow::Borrowed(self.current());
         }
         let mut l = self.current().clone();
@@ -565,7 +588,15 @@ impl Board {
                         real_layout::Shift::Caps => Latch::Locked,
                         real_layout::Shift::Off => Latch::Off,
                     };
-                } else if k.role == KeyRole::Normal && k.emit.chars().all(|c| c.is_lowercase()) && !k.emit.is_empty() {
+                } else if self.voice_active
+                    && crate::real_layout::classify(&k.emit) == real_layout::Press::Voice
+                {
+                    k.latch = Latch::Live;
+                } else if self.shift != real_layout::Shift::Off
+                    && k.role == KeyRole::Normal
+                    && k.emit.chars().all(|c| c.is_lowercase())
+                    && !k.emit.is_empty()
+                {
                     // Only a plain letter is upshifted. A digit, a symbol or an action token
                     // has no upper case, and uppercasing an action token would corrupt it.
                     k.label = k.label.to_uppercase();
@@ -806,6 +837,22 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
     dispatch_key(ui, key, rect, size, &resp)
 }
 
+/// The mic key's alpha while recording, from the frame clock.
+///
+/// A full sine between [`LIVE_MIN`] and 255 once per [`LIVE_PERIOD`]. It never reaches zero
+/// — a pulse that fades out entirely reads as a key that has turned OFF at the bottom of
+/// every cycle, which is the opposite of what it is saying.
+pub fn live_pulse(time: f64) -> u8 {
+    let phase = (time / LIVE_PERIOD) * std::f64::consts::TAU;
+    let t = (phase.sin() * 0.5 + 0.5) as f32; // 0..1
+    (LIVE_MIN as f32 + t * (255.0 - LIVE_MIN as f32)).round().clamp(0.0, 255.0) as u8
+}
+
+/// Seconds per pulse. Slow enough to read as breathing rather than blinking.
+pub const LIVE_PERIOD: f64 = 1.6;
+/// The dimmest the mic key gets. Never invisible.
+pub const LIVE_MIN: u8 = 90;
+
 /// `.keyboard-view { border-radius: 16px 16px 0 0 }`.
 pub const BOARD_RADIUS: u8 = 16;
 
@@ -894,6 +941,15 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
         } else if key.latch == Latch::Locked {
             // .key-modifier.shift-locked: solid accent. The loudest cap on the board.
             (c.accent, uikit_egui::key_border(c.accent))
+        } else if key.latch == Latch::Live {
+            // .key-special.voice-active: accent, PULSING. A static highlight is easy to
+            // stop seeing; a live microphone should keep asking to be noticed.
+            let a = live_pulse(ui.input(|i| i.time));
+            ui.ctx().request_repaint();
+            (
+                egui::Color32::from_rgba_unmultiplied(c.accent.r(), c.accent.g(), c.accent.b(), a),
+                uikit_egui::key_border(c.accent),
+            )
         } else if key.latch == Latch::Once {
             // .key-modifier.shift-active: accent at 0.25 with an accent border.
             (
@@ -918,7 +974,11 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
         }
         // .key-action's label is white at rest too — that is what makes it read as the
         // commit key rather than as another grey cap.
-        let text_color = if pressed || key.role == KeyRole::Action || key.latch == Latch::Locked {
+        let text_color = if pressed
+            || key.role == KeyRole::Action
+            || key.latch == Latch::Locked
+            || key.latch == Latch::Live
+        {
             egui::Color32::WHITE
         } else if key.latch == Latch::Once {
             c.accent
@@ -1928,6 +1988,79 @@ mod gtk_parity_tests {
         assert_eq!(b.current().name, "symbols");
         b.toggle_symbols();
         assert_eq!(b.layout_index(), cardinal);
+    }
+
+    /// A LIVE MICROPHONE MUST BE VISIBLE ON THE SURFACE YOU ARE LOOKING AT. The screen had
+    /// a "● dictating" label in a toolbar the layer-shell build never draws — on a phone the
+    /// keyboard is the whole surface, so the only indicator the mic was open was off-screen.
+    #[test]
+    fn the_mic_key_shows_that_the_microphone_is_open() {
+        use crate::real_layout::{classify, Press};
+        let mut b = Board::new();
+        let mic_latch = |b: &Board| {
+            b.rendered()
+                .rows
+                .iter()
+                .flat_map(|r| &r.keys)
+                .find(|k| classify(&k.emit) == Press::Voice)
+                .map(|k| k.latch)
+        };
+        assert_eq!(mic_latch(&b), Some(Latch::Off));
+        b.set_voice_active(true);
+        assert_eq!(mic_latch(&b), Some(Latch::Live), "the mic key does not show a live microphone");
+        b.set_voice_active(false);
+        assert_eq!(mic_latch(&b), Some(Latch::Off), "it kept pulsing after the mic closed");
+
+        // Only the mic. A board where every key looked live would say nothing.
+        b.set_voice_active(true);
+        let others: Vec<Latch> = b
+            .rendered()
+            .rows
+            .iter()
+            .flat_map(|r| &r.keys)
+            .filter(|k| classify(&k.emit) != Press::Voice)
+            .map(|k| k.latch)
+            .collect();
+        assert!(others.iter().all(|l| *l != Latch::Live), "another key latched Live");
+    }
+
+    /// Voice and shift are independent: recording while caps is locked must show both, and
+    /// `rendered`'s early return has to account for either being set.
+    #[test]
+    fn voice_and_shift_do_not_cancel_each_other() {
+        use crate::real_layout::{classify, Press, Shift};
+        let mut b = Board::new();
+        b.set_voice_active(true);
+        b.tap_shift();
+        assert_eq!(b.shift(), Shift::Once);
+        let r = b.rendered();
+        let find = |p: Press| r.rows.iter().flat_map(|x| &x.keys).find(|k| classify(&k.emit) == p).map(|k| k.latch);
+        assert_eq!(find(Press::Voice), Some(Latch::Live));
+        assert_eq!(find(Press::Shift), Some(Latch::Once));
+        // and the letters upshifted, which is the shift half still working
+        assert!(r.rows.iter().flat_map(|x| &x.keys).any(|k| k.label == "A"));
+    }
+
+    /// The pulse breathes rather than blinks, and never fades to nothing — a key that
+    /// reaches zero reads as OFF at the bottom of every cycle, which is the opposite of
+    /// what it is saying.
+    #[test]
+    fn the_live_pulse_never_goes_dark() {
+        let mut min = 255u8;
+        let mut max = 0u8;
+        // A whole period, finely sampled.
+        for i in 0..400 {
+            let a = live_pulse(i as f64 * LIVE_PERIOD / 200.0);
+            min = min.min(a);
+            max = max.max(a);
+        }
+        assert!(min >= LIVE_MIN, "the pulse dipped to {min}, below the floor");
+        assert!(max >= 250, "the pulse never reached full: {max}");
+        assert!(LIVE_PERIOD > 1.0, "faster than this is a blink, not a breath");
+        // It is periodic: the same phase a period later is the same value.
+        for t in [0.0f64, 0.3, 0.9] {
+            assert_eq!(live_pulse(t), live_pulse(t + LIVE_PERIOD));
+        }
     }
 
     /// The reported desktop fault: tall, blurry caps. Every glyph the board paints must be

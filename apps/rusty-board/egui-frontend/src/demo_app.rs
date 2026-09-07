@@ -849,7 +849,14 @@ impl Feel {
                                 Some(_) => {}
                             }
                         }
-                    } else if let Some(e) = keyboard_ui(ui, &self.board.rendered(), &adaptive, self.board.palette()) {
+                    } else if let Some(e) = {
+                        // The mic key shows the microphone. Set every frame rather than on
+                        // toggle, because dictation also stops on its own — a timeout, a
+                        // model failure, the sink closing — and a key latched on toggle
+                        // would keep pulsing over a microphone that had already closed.
+                        self.board.set_voice_active(self.dictation.is_active());
+                        keyboard_ui(ui, &self.board.rendered(), &adaptive, self.board.palette())
+                    } {
                         // Same decoder as the real layouts, so a mic key or an action token
                         // on a code-built board means the same thing it means on a JSON one.
                         match crate::real_layout::classify(&e) {
