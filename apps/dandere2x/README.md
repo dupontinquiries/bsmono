@@ -329,13 +329,17 @@ What is built:
   own gate, instead of requiring an exact byte match. `analyze` now runs the
   cache **dry** (keys and byte costs, no pixels) and reports hits/probes, so
   both can be measured without a GPU.
-  Measured, three clips: harvesting multiplies supply by 3.7× and changes
-  the hit rate not at all (0.2%), and gated probing does not move it either
-  at any quantiser. The bottleneck is the probe set — a cell only reaches
-  the cache after Stationary, motion, the ring, the plate and the anchor
-  have all failed, and what survives that is genuinely new content. See the
-  note at the bottom of `blockcache.rs` for the three things that would
-  change the answer.
+  The cache is probed **before** the redraw decision and a forced anchor
+  takes the normal path, so the frames most likely to repeat already-drawn
+  content are the ones that get probed. That ordering is the whole game:
+  harvesting on its own measured nothing (0.2% hits), and with the probe in
+  the right place the same harvest gives, on Lone Ranger AV1 (120 frames,
+  `--anchor-rmse 12 --anchor-max-age 5`, 512 MB): 38 hits without harvest,
+  **15,710 with** (21.7% of probes), 36.9% → 31.9% of pixels through the
+  network. Transformers 61.5% → 61.3%; SMITE unchanged (a 3D camera repeats
+  nothing exactly). `--cache-quant 16` adds 1,000 hits and 0.3 points for
+  double the probes — a flag, not a default. See the note at the bottom of
+  `blockcache.rs` for what would go further.
 - **Gate hysteresis** (`--streak-bonus b`, default 0 = off): a block reused
   for `n` consecutive frames gets its threshold scaled by
   `1 + b·min(n,8)/8`, so blocks that keep matching stop flickering out at

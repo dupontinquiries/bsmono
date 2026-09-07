@@ -407,7 +407,7 @@ pub fn run_tiered_with_cache(
         let reference: &dyn ReferenceMaker = &reference;
         let mut prev_working: Option<Frame> = None;
         let mut ring: Ring<Frame> = Ring::new(recent_refs, keyframe_refs);
-        let mut state = AnalyzeState { streak: Vec::new(), cache: cache_a, anchor: None, since_anchor: 0 };
+        let mut state = AnalyzeState { streak: Vec::new(), cache: cache_a, anchor: None, since_anchor: 0, force_cut: false };
         let mut reader = WindowReader::new(source, reader_window, acfg.min_psnr, plate_conf, bs, noise);
         'windows: loop {
             let t_win = Instant::now();

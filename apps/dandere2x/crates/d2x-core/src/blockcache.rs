@@ -288,37 +288,40 @@ mod tests {
 
 // MEASURED, so the next person does not repeat it.
 //
-// Subtile harvesting (feeding the cache from every redraw and region redraw
-// instead of only from packed residual cells) works exactly as designed: on
-// Lone Ranger AV1, 120 frames, it took inserts from 14,567 to 54,390 — 3.7x
-// the supply, at no extra network cost, and the harvested blocks have better
-// context than residual ones.
+// Round 1 — harvesting alone: subtile harvesting took inserts on Lone Ranger
+// AV1 (120 frames, 512 MB) from 14,567 to 54,390, 3.7x the supply at no extra
+// network cost, and moved hits from 34 to 41 out of 14,600 probes. Gated
+// probing (coarse bucket + verify) was flat too: 36 hits at every quantiser
+// from 8 to 48, with a 4x4 signature and again with 2x2.
 //
-// It bought nothing. Hits went 34 -> 41 out of ~14,600 probes (0.2%).
+// The cause was not the supply and not the matcher. It was WHERE the probe
+// happened. A frame that was going to be redrawn returned before the cache
+// was ever consulted, and a forced anchor short-circuited even earlier — so
+// the frames most likely to repeat already-drawn content (a cut back to a
+// known shot; a periodic anchor) were the only frames that never probed.
 //
-// Gated probing (coarse bucket + verify under the frame's own gate) was the
-// obvious fix and also bought nothing: 36 hits at every quantiser from 8 to
-// 48, with a 4x4 signature and again with 2x2. Three clips, same answer.
+// Round 2 — probe before deciding to redraw, and let a forced anchor take the
+// normal path (120 frames, --anchor-rmse 12 --anchor-max-age 5, 512 MB):
+//                       hits/probes        main-network pixels
+//   no harvest             38 /  72,240 (0.1%)     36.9%
+//   harvest             15,710 /  72,280 (21.7%)   31.9%
+//   harvest + quant 16  16,718 / 128,927 (13.0%)   31.6%
+// Lone Ranger. The other two clips: Transformers 639 -> 1,129 hits (61.5 ->
+// 61.3%), SMITE 8 -> 1,230 (31.6%, unchanged — a 3D camera repeats nothing
+// exactly). Harvesting is what makes the cache work at all; without it the
+// reordered probe finds 38 hits, with it 15,710.
 //
-// The reason is the probe set, not the supply and not the matcher. A cell is
-// only probed if it is still Missing after the stationary test, the motion
-// search, the reference ring, the plate and the anchor. Those already catch
-// everything that repeats *near* where it was; what survives to the cache is
-// content that is genuinely new to this shot, and genuinely new content does
-// not have a twin sitting in a cache of the last few seconds. The cases the
-// cache was built for — letterbox, a static HUD, an unchanged background —
-// never reach it, because they are Stationary, which is cheaper.
+// Gated probing doubles the probe count for a few percent more hits and a
+// 0.3-point saving: on by default it would not pay, as a flag on a static
+// clip it might. A quantised hash is still an exact match in a coarser space,
+// which is why it adds so little; LSH or a small ANN index over block
+// descriptors is the honest version of that idea.
 //
-// What would change the answer, in the order worth trying:
-//   1. Make the cache outlive the shot. A film cuts back to the same set
-//      dozens of times; this cache holds ~4 seconds at 512 MB and 1080p and
-//      the FIFO throws shot A away before shot A returns. A small on-disk
-//      index keyed by a shot descriptor is the change that fits how film is
-//      actually cut.
-//   2. Probe with motion, not identity. `RecalledMoved` beat the cache by two
-//      orders of magnitude (1238 blocks/frame vs 0.3) because it searches a
-//      *position*. A cache that could be searched the same way — an ANN index
-//      over block descriptors — is the difference between "the same pixels
-//      appeared before" and "these pixels appeared before, somewhere".
-//   3. Give up on live action and keep it for animation, where exact repeats
-//      are the norm. That is what the cache was originally for.
+// Still open, in the order worth trying:
+//   1. Make the cache outlive the shot. It holds ~4 seconds at 512 MB and
+//      1080p, and a film cuts back to the same set for far longer than that;
+//      the FIFO discards shot A before shot A returns. An on-disk index keyed
+//      by a shot descriptor matches how film is actually cut.
+//   2. Probe with motion, not identity — see (LSH/ANN) above. RecalledMoved
+//      serves 1238 blocks/frame on SMITE because it searches a position.
+//   3. Animation, where exact repeats are the norm, is what this was for.
