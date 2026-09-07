@@ -8749,41 +8749,40 @@ if let Some(msg) = self.error_banner.clone() {
                             if snap.is_empty() {
                                 ui.weak("No engine output yet — load a model.");
                             } else {
+                                // GROUPED BY SUBJECT, foldable, copyable. A load emits a run
+                                // of preflight notes, a run of tile overrides and a run of
+                                // dispatch levers — three things said in eighteen lines, with
+                                // the one that matters somewhere in the middle. Failures and
+                                // warnings are never folded: see `loggroup`.
+                                let groups = crate::loggroup::group(&snap, 2);
                                 ui.horizontal(|ui| {
                                     ui.weak(format!("{} line(s)", snap.len()));
                                     if ui.small_button("clear").clicked() { crate::diagfeed::clear(); }
+                                    // The reason anyone reads this panel is to paste it
+                                    // somewhere; the alternative today is a screenshot.
+                                    if ui.small_button("copy all").on_hover_text("every line, with its group headers").clicked() {
+                                        ui.ctx().copy_text(crate::loggroup::all_to_clipboard(&groups));
+                                    }
                                 });
                                 ui.separator();
                                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                                    for e in &snap {
-                                        // Severity by colour, because the ranking alone is invisible
-                                        // once someone scrolls: failures red, warnings amber,
-                                        // measurements plain, provenance dimmed.
-                                        let col = match e.kind {
-                                            crate::diagfeed::Kind::Failure => Some(egui::Color32::from_rgb(235, 110, 100)),
-                                            crate::diagfeed::Kind::Warning => Some(egui::Color32::from_rgb(230, 170, 80)),
-                                            crate::diagfeed::Kind::Performance => None,
-                                            crate::diagfeed::Kind::Context => Some(egui::Color32::from_gray(140)),
-                                        };
-                                        let line = crate::diagfeed::shorten(&e.text, 72);
-                                        let rt = RichText::new(line).small();
-                                        let rt = match col { Some(c) => rt.color(c), None => rt };
-                                        // Full text on hover: shortening keeps the panel readable,
-                                        // and the tail is where the engine explains itself.
-                                        ui.horizontal(|ui| {
-                                            ui.label(rt).on_hover_text(&e.text);
-                                            // A folded line repeated itself — theme::event_pill is the
-                                            // built widget for exactly this (kind + ×count, reddens on
-                                            // spike) and had no callers; count_suffix's plain "  ×N"
-                                            // text is still what a Failure/Warning's own severity
-                                            // colour can't show (HOW OFTEN), so it becomes a pill
-                                            // instead of more inline text. Silent at 1, same as
-                                            // count_suffix always was.
-                                            if e.count > 1 {
-                                                theme::event_pill(ui, e.kind.short_label(), e.count, e.kind == crate::diagfeed::Kind::Failure);
+                                  for g in &groups {
+                                    // A group of one is drawn loose — a header hiding a
+                                    // single line costs a click and saves nothing.
+                                    let folded = !g.open && g.entries.len() > 1;
+                                    if folded {
+                                        let head = format!("{}  ({} lines)", g.label, g.line_count());
+                                        let id = ui.make_persistent_id(("engine-group", &g.label));
+                                        egui::CollapsingHeader::new(head).id_salt(id).default_open(false).show(ui, |ui| {
+                                            if ui.small_button("copy").clicked() {
+                                                ui.ctx().copy_text(g.to_clipboard());
                                             }
+                                            draw_engine_lines(ui, &g.entries);
                                         });
+                                    } else {
+                                        draw_engine_lines(ui, &g.entries);
                                     }
+                                  }
                                 });
                             }
                         }
@@ -11379,5 +11378,33 @@ Success:\n- cargo test passes\n".to_string();
             path: "llamacpp.gguf".into(), template: TemplateKind::Llama3, model_status: None,
         })));
         assert!(c3.hud.is_empty(), "no status to report must not become a claim either way");
+    }
+}
+
+/// One engine diagnostic per row: severity by colour, shortened with the full text on
+/// hover, and a pill when the line folded onto itself.
+///
+/// Lifted out of the Engine page so a grouped section and a loose line draw identically.
+/// Two copies of this would drift, and the difference would read as the grouping changing
+/// what a line means.
+fn draw_engine_lines(ui: &mut egui::Ui, entries: &[crate::diagfeed::Entry]) {
+    for e in entries {
+        let col = match e.kind {
+            crate::diagfeed::Kind::Failure => Some(egui::Color32::from_rgb(235, 110, 100)),
+            crate::diagfeed::Kind::Warning => Some(egui::Color32::from_rgb(230, 170, 80)),
+            crate::diagfeed::Kind::Performance => None,
+            crate::diagfeed::Kind::Context => Some(egui::Color32::from_gray(140)),
+        };
+        let line = crate::diagfeed::shorten(&e.text, 72);
+        let rt = RichText::new(line).small();
+        let rt = match col { Some(c) => rt.color(c), None => rt };
+        ui.horizontal(|ui| {
+            // Full text on hover: shortening keeps the panel readable, and the tail is
+            // where the engine explains itself.
+            ui.label(rt).on_hover_text(&e.text);
+            if e.count > 1 {
+                theme::event_pill(ui, e.kind.short_label(), e.count, e.kind == crate::diagfeed::Kind::Failure);
+            }
+        });
     }
 }

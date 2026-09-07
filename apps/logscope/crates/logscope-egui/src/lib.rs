@@ -40,6 +40,10 @@ pub use logscope_fan::treeexport;
 pub use logscope_fan::bestregion;
 #[allow(dead_code)] pub mod convoprov;
 pub mod diagfeed;
+/// The preflight overrides as described, clamped, UI-toggleable knobs.
+pub mod engine_knobs;
+/// Grouping the engine feed into foldable, copyable sections.
+pub mod loggroup;
 pub mod kvtree;
 #[cfg(feature = "wgpu-engine")] #[allow(dead_code)] pub mod anchorpool; // tiered warm-resume KV pool (Hot f32 / Warm int8 / Cold host-RAM)
 pub use logscope_fan::decompose;
