@@ -25,9 +25,18 @@
 
 use crate::idle::{IdleEvent, IdleTracker};
 use crate::layer::{KeyboardInteractivity, Layer, LayerEvent, LayerSurfaceIntent, LayerSurfaceState};
+use crate::toplevel::{ToplevelEvent, ToplevelTracker};
+use cosmic_protocols::toplevel_info::v1::client::{
+    zcosmic_toplevel_handle_v1::{self, ZcosmicToplevelHandleV1},
+    zcosmic_toplevel_info_v1::{self, ZcosmicToplevelInfoV1},
+};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{wl_compositor::WlCompositor, wl_registry, wl_seat::WlSeat, wl_surface::WlSurface};
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_client::{event_created_child, Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
+    ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
+    ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
+};
 use wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notification_v1::{self, ExtIdleNotificationV1},
     ext_idle_notifier_v1::ExtIdleNotifierV1,
@@ -353,5 +362,164 @@ impl Drop for LayerSurface {
         self.layer_surface.destroy();
         self.surface.destroy();
         let _ = self.conn.flush();
+    }
+}
+
+struct TopIoState {
+    tracker: ToplevelTracker,
+    info: Option<ZcosmicToplevelInfoV1>,
+    next_id: u64,
+}
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for TopIoState {
+    fn event(_: &mut Self, _: &wl_registry::WlRegistry, _: wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+}
+
+impl Dispatch<ExtForeignToplevelListV1, ()> for TopIoState {
+    fn event(
+        state: &mut Self,
+        _: &ExtForeignToplevelListV1,
+        event: ext_foreign_toplevel_list_v1::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let ext_foreign_toplevel_list_v1::Event::Toplevel { toplevel } = event {
+            // The base handle is enough to KNOW a toplevel exists, but
+            // title/app_id/state all come from the COSMIC extension object
+            // (confirmed from the protocol XML: zcosmic_toplevel_handle_v1
+            // carries its own title/app_id/state/closed events directly,
+            // not delegated back to the base handle) -- so every new
+            // toplevel immediately gets one, right here, rather than
+            // waiting for something else to request it.
+            let id = state.next_id;
+            state.next_id += 1;
+            if let Some(info) = &state.info {
+                info.get_cosmic_toplevel(&toplevel, qh, id);
+            }
+            state.tracker.apply(ToplevelEvent::New(id));
+        }
+    }
+
+    event_created_child!(TopIoState, ExtForeignToplevelListV1, [
+        ext_foreign_toplevel_list_v1::EVT_TOPLEVEL_OPCODE => (ExtForeignToplevelHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<ExtForeignToplevelHandleV1, ()> for TopIoState {
+    fn event(_: &mut Self, _: &ExtForeignToplevelHandleV1, _: ext_foreign_toplevel_handle_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        // Deliberately a no-op: this tracker's whole model is sourced from
+        // the zcosmic extension handle instead (see the Toplevel event
+        // handler above) since that's the one authoritative source for
+        // title/app_id/state/closed once obtained. Listening to the base
+        // handle's OWN copies of the same events would mean two paths
+        // that could, in principle, disagree about a single toplevel's
+        // state -- avoided by picking one source of truth rather than
+        // reconciling two.
+    }
+}
+
+impl Dispatch<ZcosmicToplevelInfoV1, ()> for TopIoState {
+    fn event(_: &mut Self, _: &ZcosmicToplevelInfoV1, _: zcosmic_toplevel_info_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        // `done` (batch-commit signal) and the deprecated-since-v2
+        // `toplevel` event both land here; neither is acted on -- this
+        // tracker applies each property change as it arrives rather than
+        // buffering until `done`, a real simplification from the
+        // protocol's own double-buffering intent, recorded rather than
+        // silently assumed correct. `ToplevelTracker`'s own field-by-field
+        // `apply` already tolerates events arriving one at a time, so this
+        // doesn't produce wrong data -- callers just may see a toplevel
+        // "flicker" through a partially-updated state for one dispatch
+        // cycle during a multi-field change, rather than seeing every
+        // field change atomically together.
+    }
+}
+
+impl Dispatch<ZcosmicToplevelHandleV1, u64> for TopIoState {
+    fn event(
+        state: &mut Self,
+        _: &ZcosmicToplevelHandleV1,
+        event: zcosmic_toplevel_handle_v1::Event,
+        id: &u64,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let id = *id;
+        match event {
+            zcosmic_toplevel_handle_v1::Event::Title { title } => state.tracker.apply(ToplevelEvent::Title(id, title)),
+            zcosmic_toplevel_handle_v1::Event::AppId { app_id } => state.tracker.apply(ToplevelEvent::AppId(id, app_id)),
+            zcosmic_toplevel_handle_v1::Event::State { state: raw } => {
+                // Wire form per the protocol: a packed array of u32 (native
+                // endian), each a State enum discriminant, present-if-set --
+                // NOT a bitmask. Mirrors cosmic-protocols' own shipped
+                // example's decode exactly, since getting this wrong (e.g.
+                // treating it as a bitmask) would silently misread every
+                // toplevel's state without any type error to catch it.
+                let mut s = crate::toplevel::ToplevelState::default();
+                for chunk in raw.chunks_exact(4) {
+                    match u32::from_ne_bytes(chunk.try_into().unwrap()) {
+                        0 => s.maximized = true,
+                        1 => s.minimized = true,
+                        2 => s.activated = true,
+                        3 => s.fullscreen = true,
+                        _ => {} // a future state value this crate doesn't model yet -- ignored, not a panic
+                    }
+                }
+                state.tracker.apply(ToplevelEvent::StateChanged(id, s));
+            }
+            zcosmic_toplevel_handle_v1::Event::Closed => state.tracker.apply(ToplevelEvent::Closed(id)),
+            _ => {} // geometry/output/workspace events: not modeled by ToplevelTracker's current fields
+        }
+    }
+}
+
+/// A live connection tracking every open toplevel window — the model an
+/// app-switcher/task-view renders from. See `toplevel.rs`'s own header for
+/// why this targets `ext-foreign-toplevel-list-v1` + COSMIC's
+/// `zcosmic_toplevel_info_v1` extension specifically, confirmed from the
+/// protocol XML's own text ("It thus extends ext_foreign_toplevel_v1") —
+/// not from cosmic-protocols' shipped example, which demonstrates a path
+/// the XML itself marks `deprecated-since="2"`.
+pub struct ToplevelSession {
+    conn: Connection,
+    queue: EventQueue<TopIoState>,
+    state: TopIoState,
+}
+
+impl ToplevelSession {
+    pub fn connect() -> Result<Self, ConnectError> {
+        let conn = Connection::connect_to_env().map_err(|e| ConnectError::NoDisplay(e.to_string()))?;
+        let (globals, queue) = registry_queue_init::<TopIoState>(&conn)
+            .map_err(|e| ConnectError::NoDisplay(e.to_string()))?;
+        let qh = queue.handle();
+
+        let list: ExtForeignToplevelListV1 = globals
+            .bind(&qh, 1..=1, ())
+            .map_err(|_| ConnectError::MissingGlobal("ext_foreign_toplevel_list_v1"))?;
+        // The COSMIC extension is genuinely optional per the base
+        // protocol's own design ("intentionally minimalistic... additional
+        // functionality... implemented in extension protocols") -- a
+        // compositor could advertise the base list without it. Absent
+        // here means every toplevel still gets tracked by id (the `New`
+        // event fires regardless), just without title/app_id/state ever
+        // populating, which callers can already tell from empty strings.
+        let info: Option<ZcosmicToplevelInfoV1> = globals.bind(&qh, 1..=3, ()).ok();
+
+        let state = TopIoState { tracker: ToplevelTracker::new(), info, next_id: 1 };
+        // `list` is only needed long enough to have been bound above —
+        // toplevel events arrive via the registry-bound object automatically,
+        // this function has no further use for the variable itself.
+        drop(list);
+
+        Ok(ToplevelSession { conn, queue, state })
+    }
+
+    pub fn poll(&mut self) -> &ToplevelTracker {
+        let _ = self.queue.dispatch_pending(&mut self.state);
+        &self.state.tracker
+    }
+
+    pub fn flush(&self) -> Result<(), String> {
+        self.conn.flush().map_err(|e| e.to_string())
     }
 }

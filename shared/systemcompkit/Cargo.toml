@@ -15,9 +15,16 @@ default = []
 # reason to link a Wayland client library just to get the pure tracking
 # logic, and only whatever becomes the actual compositor-facing shell needs
 # the real thing.
-wayland_io = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-wlr"]
+wayland_io = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-wlr", "dep:cosmic-protocols"]
 
 [dependencies]
 wayland-client = { version = "0.31", optional = true }
 wayland-protocols = { version = "0.32", features = ["client", "staging"], optional = true }
 wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
+# COSMIC's own toplevel extension (state/title/app_id/closed) layered on
+# the standard ext-foreign-toplevel-list handle -- confirmed from the
+# protocol XML itself, not the crate's own shipped example, which
+# demonstrates a path the XML marks deprecated-since="2". "client" only:
+# default pulls in wayland-server too, which this crate (a client, not a
+# compositor) has no use for.
+cosmic-protocols = { version = "0.2", default-features = false, features = ["client"], optional = true }
