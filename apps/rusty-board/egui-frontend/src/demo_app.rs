@@ -17,6 +17,13 @@ pub struct Feel {
     /// What the board draws with: the persisted appearance block with the panel's values
     /// folded on top.
     pub style: crate::Style,
+    /// Where springboard delimiters fired, and when: `(point, time_ms)`. Drained as they
+    /// expire — see `springboard::ripple`.
+    pub ripples: Vec<(egui::Pos2, f64)>,
+    /// When the last word was committed, for the space zones' pulse.
+    word_at: Option<f64>,
+    /// The last touch position, for the doc's "nearest zone pulses 30% harder".
+    last_touch: Option<egui::Pos2>,
     /// The appearance block alone. Kept so a panel change re-folds from a clean base rather
     /// than accumulating onto whatever the last fold produced.
     base_style: crate::Style,
@@ -241,6 +248,9 @@ impl Feel {
         Feel {
             style,
             base_style: style,
+            ripples: Vec::new(),
+            word_at: None,
+            last_touch: None,
             placement: crate::platform::placement(),
             reveal: Default::default(),
             was_visible: false,
@@ -1012,6 +1022,13 @@ impl Feel {
                         // still goes to the candidate bar.
                         springboard = std::mem::take(&mut self.swipe.springboard_words);
                         trailing_space = self.swipe.trailing_space;
+                        // Where each crossing counted. The doc: "teaches the user that the
+                        // crossing counted" — a springboard space that happens invisibly is
+                        // a feature nobody learns they have.
+                        let now_ms = ui.input(|i| i.time) * 1000.0;
+                        for d in std::mem::take(&mut self.swipe.delimiters) {
+                            self.ripples.push((d, now_ms));
+                        }
                     }
                     // THE SPACE ZONES (§4). `springboard::zones` has computed these since
                     // the last commit and nothing drew or tapped them, so the strip a
@@ -1029,14 +1046,28 @@ impl Feel {
                     {
                         let colors = uikit_egui::palette_colors(self.board.palette());
                         let painter = ui.painter();
-                        for z in &zones {
+                        // The post-word flash: every visible zone pulses, the one nearest
+                        // the last touch harder. "Teaches the multi-anchor design" — the
+                        // zones are only discoverable if something points at them when a
+                        // word lands.
+                        let now_ms = ui.input(|i| i.time) * 1000.0;
+                        let nearest = self
+                            .last_touch
+                            .and_then(|p| crate::springboard::nearest_zone(&zones, p));
+                        for (i, z) in zones.iter().enumerate() {
                             // Faded while suppressed rather than hidden: a strip that
                             // vanishes mid-swipe reads as the keyboard flickering, and the
                             // doc asks for "faded out, non-tappable", not gone.
                             let live = !swiping || z.live_while_swiping;
-                            let a = if live { 26 } else { 10 };
+                            let base = if live { 26.0f32 } else { 10.0 };
+                            let (boost, scale) = self
+                                .word_at
+                                .and_then(|t| crate::springboard::pulse((now_ms - t) as f32, nearest == Some(i)))
+                                .unwrap_or((0.0, 1.0));
+                            let a = (base + boost * 60.0).clamp(0.0, 255.0) as u8;
+                            let rect = egui::Rect::from_center_size(z.rect.center(), z.rect.size() * scale);
                             painter.rect_filled(
-                                z.rect,
+                                rect,
                                 egui::CornerRadius::same(4),
                                 egui::Color32::from_rgba_unmultiplied(
                                     colors.accent.r(), colors.accent.g(), colors.accent.b(), a,
@@ -1053,22 +1084,57 @@ impl Feel {
                             );
                         }
                     }
+                    // The delimiter ripples, drained as they expire.
+                    {
+                        let colors = uikit_egui::palette_colors(self.board.palette());
+                        let now_ms = ui.input(|i| i.time) * 1000.0;
+                        let painter = ui.painter();
+                        self.ripples.retain(|(at, born)| {
+                            match crate::springboard::ripple((now_ms - born) as f32) {
+                                Some((r, alpha)) => {
+                                    painter.circle_stroke(
+                                        *at,
+                                        r,
+                                        egui::Stroke::new(
+                                            2.0,
+                                            egui::Color32::from_rgba_unmultiplied(
+                                                colors.accent.r(),
+                                                colors.accent.g(),
+                                                colors.accent.b(),
+                                                (alpha * 200.0) as u8,
+                                            ),
+                                        ),
+                                    );
+                                    true
+                                }
+                                None => false,
+                            }
+                        });
+                        if !self.ripples.is_empty() {
+                            ctx.request_repaint();
+                        }
+                    }
                     // A tap in a live zone is a plain space. Read before the words below so
                     // a tap and a swipe-commit in the same frame stay in the order they
                     // happened.
                     if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                        self.last_touch = Some(p);
                         if ui.input(|i| i.pointer.primary_released())
                             && crate::springboard::zone_at(&zones, p, swiping).is_some()
                         {
                             self.emit_text(" ");
                         }
                     }
+                    let committed = !springboard.is_empty() || trailing_space;
                     for w in springboard {
                         self.emit_text(&w);
                         self.emit_text(" ");
                     }
                     if trailing_space {
                         self.emit_text(" ");
+                    }
+                    if committed {
+                        self.word_at = Some(ui.input(|i| i.time) * 1000.0);
                     }
                     match top_edge {
                         Some(crate::topedge::TopEdge::Digit(d)) => self.emit_text(&d.to_string()),

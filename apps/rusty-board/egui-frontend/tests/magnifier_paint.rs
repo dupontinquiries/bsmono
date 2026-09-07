@@ -127,3 +127,33 @@ fn the_space_zones_are_painted_and_the_compacted_one_appears_beside_the_keys() {
     let strip = left.iter().max_by(|a, b| a.center().x.partial_cmp(&b.center().x).unwrap()).unwrap();
     assert!(strip.center().x > size.x * 0.6, "the strip is not on the freed side: {strip:?}");
 }
+
+/// A ripple that is computed and never painted teaches nobody anything. This drives the
+/// real screen with a ripple in flight and checks a circle reaches the frame.
+#[test]
+fn a_delimiter_ripple_is_painted_and_then_expires() {
+    let ctx = egui::Context::default();
+    let mut app = demo_app::Feel::new();
+    let size = egui::vec2(500.0, 300.0);
+    let mut input = egui::RawInput::default();
+    input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size));
+
+    let circles = |out: &egui::FullOutput| {
+        out.shapes
+            .iter()
+            .filter(|s| matches!(&s.shape, egui::Shape::Circle(_)))
+            .count()
+    };
+
+    let before = circles(&ctx.run(input.clone(), |ctx| app.frame(ctx)));
+    // A crossing just happened, at the board's bottom edge.
+    app.ripples.push((egui::pos2(250.0, 260.0), 0.0));
+    let during = circles(&ctx.run(input.clone(), |ctx| app.frame(ctx)));
+    assert!(during > before, "no ripple was painted: {before} → {during}");
+
+    // Past its window it is gone, and drained rather than accumulating forever.
+    app.ripples = vec![(egui::pos2(250.0, 260.0), -10_000.0)];
+    let after = circles(&ctx.run(input, |ctx| app.frame(ctx)));
+    assert_eq!(after, before, "an expired ripple was still drawn");
+    assert!(app.ripples.is_empty(), "expired ripples are not drained");
+}

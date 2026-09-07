@@ -457,3 +457,141 @@ mod zone_tests {
         assert!(zone_at(&z, z[0].rect.center(), true).is_some(), "the bottom stayed live");
     }
 }
+
+// ─────────────────────────── visual feedback ───────────────────────────
+//
+// §3's ripple and §4's post-word flash. Both are pure functions of AGE, so the caller keeps
+// a start time and asks; nothing here reads a clock or draws.
+//
+// These are teaching aids, not decoration, and the doc says so of each: the ripple "teaches
+// the user that the crossing counted", the flash "teaches the multi-anchor design". A
+// springboard space that happens invisibly is a feature nobody learns they have — which is
+// the state this port was in for two commits, with the crossings detected and nothing
+// marking them.
+
+/// `~250ms fade-out` (§3).
+pub const RIPPLE_MS: f32 = 250.0;
+/// How far the ripple grows, in points.
+pub const RIPPLE_R: f32 = 22.0;
+/// `150ms growing … 150ms fading back` (§4).
+pub const PULSE_UP_MS: f32 = 150.0;
+pub const PULSE_DOWN_MS: f32 = 150.0;
+/// The zone nearest the last touch pulses `~30%` harder (§4).
+pub const NEAREST_BOOST: f32 = 0.3;
+
+/// A delimiter ripple's radius and alpha at `age_ms`, or `None` once it is over.
+///
+/// Grows while it fades: a circle that only fades reads as a dimming dot, and the growth is
+/// what makes it read as something leaving the crossing point.
+pub fn ripple(age_ms: f32) -> Option<(f32, f32)> {
+    if !(0.0..RIPPLE_MS).contains(&age_ms) {
+        return None;
+    }
+    let t = age_ms / RIPPLE_MS;
+    // Ease out: fast at the start, so the mark appears AT the crossing rather than drifting
+    // away from it.
+    let eased = 1.0 - (1.0 - t) * (1.0 - t);
+    Some((RIPPLE_R * eased, 1.0 - t))
+}
+
+/// A space zone's `(opacity, scale)` at `age_ms` after a word was committed.
+///
+/// `nearest` adds the doc's 30% to the opacity — "hinting this one is closest" — and is
+/// deliberately not applied to the scale: two zones growing by different amounts reads as a
+/// layout glitch, while two at different brightnesses reads as emphasis.
+pub fn pulse(age_ms: f32, nearest: bool) -> Option<(f32, f32)> {
+    let total = PULSE_UP_MS + PULSE_DOWN_MS;
+    if !(0.0..total).contains(&age_ms) {
+        return None;
+    }
+    let t = if age_ms < PULSE_UP_MS {
+        age_ms / PULSE_UP_MS
+    } else {
+        1.0 - (age_ms - PULSE_UP_MS) / PULSE_DOWN_MS
+    };
+    let boost = if nearest { 1.0 + NEAREST_BOOST } else { 1.0 };
+    Some(((t * boost).clamp(0.0, 1.0), 1.0 + 0.1 * t))
+}
+
+/// Which zone is nearest a point, for the pulse's emphasis. `None` when there are none.
+pub fn nearest_zone(zones: &[Zone], to: Pos2) -> Option<usize> {
+    zones
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            let da = a.rect.center().distance(to);
+            let db = b.rect.center().distance(to);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+
+    /// "Flash a small ripple at the crossing point. ~250ms fade-out." It grows while it
+    /// fades — a circle that only fades reads as a dimming dot rather than something
+    /// leaving the crossing.
+    #[test]
+    fn the_ripple_grows_as_it_fades_and_then_stops() {
+        let (r0, a0) = ripple(0.0).expect("alive at birth");
+        let (r1, a1) = ripple(RIPPLE_MS * 0.5).unwrap();
+        let (r2, a2) = ripple(RIPPLE_MS * 0.9).unwrap();
+        assert!(r0 < r1 && r1 < r2, "it did not grow: {r0} {r1} {r2}");
+        assert!(a0 > a1 && a1 > a2, "it did not fade: {a0} {a1} {a2}");
+        assert!((a0 - 1.0).abs() < 1e-6, "it should start at full alpha");
+        assert!(r2 <= RIPPLE_R + 0.01);
+
+        // Over, and never negative-aged.
+        assert_eq!(ripple(RIPPLE_MS), None, "it outlived its window");
+        assert_eq!(ripple(RIPPLE_MS + 100.0), None);
+        assert_eq!(ripple(-1.0), None);
+
+        // Eased out: more than half the growth happens in the first half.
+        assert!(r1 > RIPPLE_R * 0.5, "not eased — the mark drifts away from the crossing");
+    }
+
+    /// "150ms growing to full opacity + 1.1x scale, 150ms fading back."
+    #[test]
+    fn the_pulse_rises_and_falls_symmetrically() {
+        let peak = pulse(PULSE_UP_MS, false).expect("alive at the peak");
+        assert!((peak.0 - 1.0).abs() < 1e-6, "it did not reach full opacity: {peak:?}");
+        assert!((peak.1 - 1.1).abs() < 1e-6, "it did not reach 1.1x: {peak:?}");
+
+        let up = pulse(PULSE_UP_MS * 0.5, false).unwrap();
+        let down = pulse(PULSE_UP_MS + PULSE_DOWN_MS * 0.5, false).unwrap();
+        assert!((up.0 - down.0).abs() < 1e-6, "the rise and fall are not mirror images");
+        assert!(up.0 < peak.0 && down.0 < peak.0);
+
+        assert_eq!(pulse(PULSE_UP_MS + PULSE_DOWN_MS, false), None, "it outlived its window");
+        assert_eq!(pulse(-1.0, false), None);
+    }
+
+    /// "The zone nearest the user's last touch pulses with ~30% extra intensity." Opacity
+    /// only: two zones growing by different amounts reads as a layout glitch, two at
+    /// different brightnesses reads as emphasis.
+    #[test]
+    fn the_nearest_zone_is_brighter_but_not_bigger() {
+        let plain = pulse(PULSE_UP_MS * 0.5, false).unwrap();
+        let near = pulse(PULSE_UP_MS * 0.5, true).unwrap();
+        assert!(near.0 > plain.0, "the boost did nothing");
+        assert!((near.0 / plain.0 - (1.0 + NEAREST_BOOST)).abs() < 1e-5);
+        assert!((near.1 - plain.1).abs() < 1e-6, "the nearest zone grew more than the others");
+        // And it cannot exceed full opacity, or the fill saturates and the emphasis is lost.
+        assert!(pulse(PULSE_UP_MS, true).unwrap().0 <= 1.0);
+    }
+
+    #[test]
+    fn the_nearest_zone_is_the_one_nearest() {
+        let board = Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 260.0));
+        let letters = Rect::from_min_size(Pos2::ZERO, egui::vec2(390.0, 200.0));
+        let z = zones(board, letters, crate::halfboard::Side::Left);
+        assert_eq!(z.len(), 2);
+        // A touch low and central is nearest the bottom bar; one out to the right is
+        // nearest the freed strip.
+        assert_eq!(nearest_zone(&z, Pos2::new(200.0, 215.0)), Some(0));
+        assert_eq!(nearest_zone(&z, Pos2::new(430.0, 100.0)), Some(1));
+        assert_eq!(nearest_zone(&[], Pos2::ZERO), None);
+    }
+}

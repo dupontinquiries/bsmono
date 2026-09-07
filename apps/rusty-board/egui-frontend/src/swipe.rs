@@ -58,6 +58,9 @@ pub struct SwipeState {
     pub springboard_words: Vec<String>,
     /// The last swipe ended outside the letters: append a space after the tail (§3 step 5).
     pub trailing_space: bool,
+    /// Where each springboard delimiter fired, for the ripple the doc asks for at every
+    /// crossing. Reported rather than drawn here — `swipe.rs` owns paths, not chrome.
+    pub delimiters: Vec<egui::Pos2>,
 }
 
 impl Default for SwipeState {
@@ -69,6 +72,7 @@ impl Default for SwipeState {
 impl SwipeState {
     pub fn new() -> SwipeState {
         SwipeState {
+            delimiters: Vec::new(),
             finished: None,
             springboard_words: Vec::new(),
             trailing_space: false,
@@ -229,6 +233,7 @@ impl SwipeState {
 
         self.springboard_words.clear();
         self.trailing_space = seg.trailing_space;
+        self.delimiters = seg.delimiters.iter().map(|d| d.at).collect();
 
         // A path that crossed the TOP belongs to `topedge` — a digit arc or a minimize
         // fling — and recognising it as well would type whatever it spelled on the way up.
