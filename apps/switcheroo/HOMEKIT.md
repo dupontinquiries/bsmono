@@ -256,3 +256,44 @@ The plug must be blinking white/orange (pairing mode) to advertise its HAP
 service. The earlier field report showed it at **-78 dBm and "out of
 range"** — that is a real signal problem before any protocol question, so
 worth getting within a metre or two first.
+
+
+## The advertisement (2026-09-07)
+
+switcheroo learned a plug's state only by connecting: pair-verify, then a read. So a plug
+switched at the wall, by the Home app or by a schedule showed the old state until someone
+pressed ↻. `classify` looked at service UUIDs and nothing looked at the rest of the advert.
+
+But a HAP accessory broadcasts a **Global State Number** and bumps it whenever a
+broadcast-enabled characteristic changes — the accessory telling everyone in radio range
+"something about me is different", passively, with no pairing, no connection and no key.
+`hap_core::advert` parses the regulatory advert (spec §7.4.2.2: device id, category, GSN,
+config number, compatible version, and the not-paired flag) and `GsnTracker` turns a stream
+of them into First / Same / StateChanged / Reconfigured.
+
+Three decisions worth keeping:
+
+* **First sighting is not a change.** Treating it as one refreshes every accessory on every
+  scan, which is the polling this exists to avoid.
+* **Keyed by the advert's HAP device id, not the BLE address.** An accessory that randomises
+  its address is still the same accessory; keying on the address would read as a new one on
+  every rotation, i.e. `First` forever and never a change.
+* **An encrypted notification (type 0x11) is reported, not skipped.** It means an event IS
+  being broadcast and we lack the Broadcast Encryption Key to read it — different
+  information from "no event", and conflating them is how a controller quietly stops
+  noticing changes. Treated as "something changed", which is all the GSN would have said.
+
+In the app: the scanner feeds every manufacturer-data blob through the parser, a change
+emits `Event::AccessoryChanged { id, reconfigured }`, and the hub marks the row's power
+STALE rather than clearing it — "was on, may have changed" is more use than "unknown", and a
+row that blanks on every advert flickers. The row says "changed at the plug — refresh to
+read it" and the next successful read clears it. A `reconfigured` advert (config number
+moved: firmware update or factory reset) additionally drops everything the capability probe
+learned, because it describes a layout that may no longer exist and a reset takes the
+pairing with it.
+
+Not done: reading the encrypted notification itself, which needs the Broadcast Encryption
+Key from the Pairings characteristic and its refresh protocol; and acting on a change
+automatically. Right now a stale row waits for the operator — auto-refreshing on every
+advert would reconnect to every plug in the house whenever any of them moved, which is worse
+than the polling it replaces.

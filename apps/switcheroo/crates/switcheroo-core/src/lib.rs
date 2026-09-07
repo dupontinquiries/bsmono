@@ -223,6 +223,9 @@ pub struct Device {
     /// does not report it, which is not the same as `Some(false)` — "nothing plugged in"
     /// and "cannot tell" are different things to show.
     pub in_use: Option<bool>,
+    /// The accessory advertised a change since the last read, so `power` may be wrong.
+    /// Cleared by the next successful read.
+    pub state_stale: bool,
 }
 
 impl Device {
@@ -247,6 +250,7 @@ impl Device {
             abilities: None,
             can_identify: false,
             in_use: None,
+            state_stale: false,
         }
     }
 
@@ -313,6 +317,15 @@ pub enum Event {
         id: DeviceId,
         power: Power,
     },
+    /// The accessory's advertisement says something changed — its Global State Number
+    /// moved, or it broadcast an encrypted notification we cannot read.
+    ///
+    /// Not a state: a NOTICE. It says a broadcast-enabled characteristic is different, not
+    /// which one or what it now is, so the row goes stale and the app reads once instead of
+    /// polling every accessory on a timer. `reconfigured` means the attribute database
+    /// changed — firmware update or factory reset — so cached instance ids are stale and
+    /// the pairing may be gone with them.
+    AccessoryChanged { id: DeviceId, reconfigured: bool },
     /// What a paired accessory reported about itself, from `hap-core`'s capability probe.
     /// Separate from `PowerIs` because it is asked once per connection and answers a
     /// different question: not "is it on" but "what is it".
@@ -404,12 +417,30 @@ impl Hub {
                         d.pending = false;
                         d.last_error = None;
                         d.last_seen = now;
+                        // A fresh read is what staleness was waiting for.
+                        d.state_stale = false;
                     }
                 }
                 Event::Failed { id, message } => {
                     if let Some(d) = id.and_then(|i| self.devices.get_mut(&i)) {
                         d.pending = false;
                         d.last_error = Some(message);
+                    }
+                }
+                Event::AccessoryChanged { id, reconfigured } => {
+                    if let Some(d) = self.devices.get_mut(&id) {
+                        // The power we last read is no longer trustworthy. Marked stale
+                        // rather than cleared: a row that blanks on every advert flickers,
+                        // and "was on, may have changed" is more use than "unknown".
+                        d.state_stale = true;
+                        if reconfigured {
+                            // The database moved under us. Everything the probe learned is
+                            // about a layout that may no longer exist, and a factory reset
+                            // takes the pairing with it.
+                            d.abilities = None;
+                            d.can_identify = false;
+                            d.in_use = None;
+                        }
                     }
                 }
                 Event::Abilities { id, describes, can_identify, in_use } => {
@@ -465,6 +496,13 @@ impl Hub {
                 Some(i) => format!("FAILED {i}: {message}"),
                 None => format!("FAILED: {message}"),
             },
+            Event::AccessoryChanged { id, reconfigured } => {
+                if *reconfigured {
+                    format!("{id} re-configured (firmware or factory reset) — re-read it")
+                } else {
+                    format!("{id} advertised a change")
+                }
+            }
             Event::Abilities { id, describes, in_use, .. } => format!(
                 "{id} is a {describes}{}",
                 match in_use {
@@ -981,6 +1019,60 @@ mod ability_tests {
         assert!(!d.paired && !d.pending);
         assert!(d.abilities.is_none() && !d.can_identify && d.in_use.is_none());
         assert_eq!(d.power, Power::Unknown);
+    }
+
+    /// A plug switched at the wall advertises it. The row must stop asserting a power it
+    /// has been told is out of date — and must not blank, because "was on, may have
+    /// changed" is more use than "unknown" and a row that clears on every advert flickers.
+    #[test]
+    fn an_advertised_change_makes_the_last_reading_stale_without_erasing_it() {
+        let (mut h, id) = hub_with_one();
+        h.step(vec![Event::PowerIs { id: id.clone(), power: Power::On }], now());
+        let d = h.get(&id).unwrap();
+        assert_eq!(d.power, Power::On);
+        assert!(!d.state_stale);
+
+        h.step(vec![Event::AccessoryChanged { id: id.clone(), reconfigured: false }], now());
+        let d = h.get(&id).unwrap();
+        assert!(d.state_stale, "the advert said it changed and the row did not notice");
+        assert_eq!(d.power, Power::On, "the last reading was erased rather than flagged");
+
+        // A fresh read is what staleness was waiting for.
+        h.step(vec![Event::PowerIs { id: id.clone(), power: Power::Off }], now());
+        let d = h.get(&id).unwrap();
+        assert!(!d.state_stale);
+        assert_eq!(d.power, Power::Off);
+    }
+
+    /// A re-configuration is a different event: the attribute database moved, so everything
+    /// the capability probe learned describes a layout that may no longer exist — and a
+    /// factory reset takes the pairing with it.
+    #[test]
+    fn a_reconfiguration_drops_what_the_probe_learned() {
+        let (mut h, id) = hub_with_one();
+        h.step(vec![Event::Abilities {
+            id: id.clone(),
+            describes: "outlet · identify".into(),
+            can_identify: true,
+            in_use: Some(true),
+        }], now());
+        assert!(h.get(&id).unwrap().can_identify);
+
+        h.step(vec![Event::AccessoryChanged { id: id.clone(), reconfigured: true }], now());
+        let d = h.get(&id).unwrap();
+        assert!(d.abilities.is_none() && !d.can_identify && d.in_use.is_none());
+        assert!(d.state_stale);
+        assert!(h.journal().last().unwrap().contains("re-configured"), "{:?}", h.journal().last());
+
+        // A plain change leaves the capabilities alone — they are still true.
+        h.step(vec![Event::Abilities {
+            id: id.clone(),
+            describes: "outlet".into(),
+            can_identify: false,
+            in_use: Some(false),
+        }], now());
+        h.step(vec![Event::AccessoryChanged { id: id.clone(), reconfigured: false }], now());
+        assert_eq!(h.get(&id).unwrap().abilities.as_deref(), Some("outlet"));
     }
 
     #[test]

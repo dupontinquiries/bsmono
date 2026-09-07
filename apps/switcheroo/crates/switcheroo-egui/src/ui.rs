@@ -271,6 +271,15 @@ fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant, colors: &Colors) -> R
                                 .small()
                                 .color(colors.error()),
                         );
+                    } else if d.state_stale {
+                        // IT TOLD US, so say so. The accessory advertised a change and the
+                        // power beside it is from before that — showing it unqualified is
+                        // asserting something the accessory has already contradicted.
+                        ui.label(
+                            egui::RichText::new("changed at the plug — refresh to read it")
+                                .small()
+                                .color(colors.inner.warning),
+                        );
                     } else if let Some(a) = &d.abilities {
                         // WHAT THE ACCESSORY SAID IT IS, not what the advertisement
                         // implied. "outlet" and "switch" look identical until one of

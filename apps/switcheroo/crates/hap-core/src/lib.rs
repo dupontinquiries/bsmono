@@ -42,6 +42,8 @@ pub mod pair_setup;
 pub mod pair_verify;
 /// The Pairings characteristic: removing a pairing so the accessory forgets us too.
 pub mod pairings;
+/// The HAP BLE advertisement: seeing an accessory change without connecting to it.
+pub mod advert;
 pub mod session;
 /// Characteristic signatures and the capability probe: what an accessory actually has.
 pub mod signature;

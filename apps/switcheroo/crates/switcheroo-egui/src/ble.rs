@@ -142,6 +142,7 @@ async fn radio_loop(
         }
     };
 
+    let mut gsn = hap_core::advert::GsnTracker::new();
     loop {
         // Drain UI commands without blocking the event stream.
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -306,7 +307,49 @@ async fn radio_loop(
                             rssi: props.rssi,
                         });
                         if kind == Kind::HomeKit && store.has(&id) {
-                            let _ = ev_tx.send(Event::Paired { id });
+                            let _ = ev_tx.send(Event::Paired { id: id.clone() });
+                        }
+                        // THE ADVERT ITSELF. A HAP accessory broadcasts a Global State
+                        // Number and bumps it whenever a broadcast-enabled characteristic
+                        // changes — so a plug switched at the wall, by the Home app or by a
+                        // schedule announces it to anyone in radio range, with no pairing,
+                        // no connection and no key. Until now switcheroo learned a plug's
+                        // state only by connecting, so it showed the old one until someone
+                        // pressed ↻.
+                        //
+                        // Keyed by the advert's HAP device id, not the BLE address: an
+                        // accessory that randomises its address is still the same accessory,
+                        // and keying on the address would read as a new one on every
+                        // rotation.
+                        for (company, body) in &props.manufacturer_data {
+                            match hap_core::advert::parse_keyed(*company, body) {
+                                hap_core::advert::Parsed::Regulatory(a) => {
+                                    let change = gsn.observe(&a);
+                                    if matches!(
+                                        change,
+                                        hap_core::advert::Change::StateChanged
+                                            | hap_core::advert::Change::Reconfigured
+                                    ) {
+                                        let _ = ev_tx.send(Event::AccessoryChanged {
+                                            id: id.clone(),
+                                            reconfigured: change == hap_core::advert::Change::Reconfigured,
+                                        });
+                                    }
+                                }
+                                // An encrypted notification means an event IS being
+                                // broadcast and we lack the Broadcast Encryption Key to
+                                // read it. Treated as "something changed" — which is all
+                                // the GSN would have told us anyway — rather than ignored,
+                                // because ignoring it is how a controller quietly stops
+                                // noticing changes.
+                                hap_core::advert::Parsed::EncryptedNotification { .. } => {
+                                    let _ = ev_tx.send(Event::AccessoryChanged {
+                                        id: id.clone(),
+                                        reconfigured: false,
+                                    });
+                                }
+                                hap_core::advert::Parsed::NotHap => {}
+                            }
                         }
                     }
                 }
