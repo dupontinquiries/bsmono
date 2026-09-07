@@ -55,8 +55,13 @@ pub const PROFILES: &[Profile] = &[
               bands: &[b(2, 1, 0.0), b(3, 4, 0.5), b(1, 40, 0.2), b(1, 999, 0.0)] },
     // the banded one: what badlands are for
     Profile { name: "sedimentary", dip: 0.012,
-              bands: &[b(12, 2, 0.4), b(24, 6, 0.6), b(172, 4, 0.5), b(24, 9, 0.4),
-                       b(179, 3, 0.7), b(24, 14, 0.3), b(1, 999, 0.0)] },
+              // EVERY BAND MUST BE A BLOCK THE GAME HAS. 172 and 179 were
+              // terracotta shades that do not exist in this world's block
+              // table, and `block_from_u16` turned them silently into AIR
+              // -- so every sedimentary canyon was cut with gaps where its
+              // banding should be. A test now checks the whole palette.
+              bands: &[b(12, 2, 0.4), b(24, 6, 0.6), b(4, 4, 0.5), b(24, 9, 0.4),
+                       b(13, 3, 0.7), b(24, 14, 0.3), b(1, 999, 0.0)] },
     // desert: sand over sandstone over stone
     Profile { name: "desert", dip: 0.005,
               bands: &[b(12, 4, 0.5), b(24, 18, 0.3), b(1, 999, 0.0)] },
@@ -380,5 +385,22 @@ mod tests {
         // they are not all the same
         assert!(qs.windows(2).any(|w| w[0] != w[1]));
         assert_eq!(query_for("nonesuch"), SiteQuery::default());
+    }
+
+    #[test]
+    fn every_band_is_a_block_the_game_actually_has() {
+        // An id the game does not know became AIR, silently: a canyon
+        // cut with holes exactly where its banding should be. The two
+        // culprits were terracotta shades nobody had checked.
+        const GAME_BLOCKS: &[u16] = &[0,1,2,3,4,7,9,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,
+            26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,56,57,58,
+            59,61,62,63,64,65,66,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97];
+        for p in PROFILES {
+            for band in p.bands {
+                assert!(GAME_BLOCKS.contains(&band.block),
+                        "{}: block {} is not in the game's table and would vanish",
+                        p.name, band.block);
+            }
+        }
     }
 }

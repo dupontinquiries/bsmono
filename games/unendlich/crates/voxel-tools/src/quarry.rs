@@ -38,8 +38,9 @@ pub fn quarry_palette(profile: &Profile, x: i32, z: i32, seed: u64, reach: i32) 
     // softer sedimentaries, then earth. Air and liquids score nothing.
     fn workable(b: u16) -> i32 {
         match b {
-            1 | 4 | 98 => 10,           // stone, cobble, bricks
-            24 | 179 | 172 => 8,        // sandstone, terracotta
+            1 | 98 => 10,               // stone, bricks
+            4 => 9,                     // cobble: workable, coarser
+            24 => 8,                    // sandstone
             87 | 49 => 7,               // netherrack, obsidian: hard but usable
             13 => 4,                    // gravel
             12 => 3,                    // sand
@@ -208,7 +209,9 @@ mod tests {
         // sedimentary: sandstone is the workable one near the surface
         let s = lookup("sedimentary").unwrap();
         let qs = quarry_palette(s, 0, 0, 1, 14);
-        assert!(matches!(qs.primary, 24 | 172 | 179), "a banded rock: {qs:?}");
+        // the sedimentary bands are sandstone, cobble and gravel now:
+        // 172 and 179 were not blocks this game has and became AIR
+        assert!(matches!(qs.primary, 1 | 4 | 24), "a banded rock: {qs:?}");
         assert!(qs.name.starts_with("quarried:sedimentary"));
         // desert: sandstone under the sand
         let d = quarry_palette(lookup("desert").unwrap(), 0, 0, 1, 12);

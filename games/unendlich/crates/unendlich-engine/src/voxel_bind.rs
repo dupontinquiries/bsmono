@@ -79,8 +79,32 @@ impl<'a> VoxelWorld for WorldView<'a> {
 /// become Air rather than panicking: a model can emit anything, and a
 /// bad id should be a missing block, not a crash. The caller sees the
 /// substitution in the skipped count, not in a stack trace.
+/// A crate block id to a game one.
+///
+/// An unknown id used to become AIR, silently. That is the worst
+/// possible fallback: the block does not appear, nothing is logged,
+/// and the structure has a hole exactly where the interesting material
+/// was meant to be. Two of the strata profile's banding colours -- 172
+/// and 179 -- were doing this, so every sedimentary canyon was cut
+/// with gaps in its bands.
+///
+/// Unknown ids become STONE, which is visible, solid and breakable,
+/// and the first few are named in the log so the mapping can be fixed
+/// rather than silently tolerated.
 pub fn block_from_u16(v: u16) -> BlockId {
-    u8::try_from(v).ok().and_then(|b| BlockId::try_from(b).ok()).unwrap_or(BlockId::Air)
+    if v == 0 { return BlockId::Air; }
+    match u8::try_from(v).ok().and_then(|b| BlockId::try_from(b).ok()) {
+        Some(b) => b,
+        None => {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static SAID: AtomicUsize = AtomicUsize::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+                log::warn!("[paintbrush] block id {v} is not a game block; using stone. \
+                            A silent Air here is a hole in the build.");
+            }
+            BlockId::Stone
+        }
+    }
 }
 
 /// Apply everything staged, one chunk clone per affected chunk.
