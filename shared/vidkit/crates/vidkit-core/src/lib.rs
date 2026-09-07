@@ -8,6 +8,7 @@ pub mod audio_clock;
 pub mod caps;
 pub mod clock;
 pub mod codec;
+pub mod convert_cpu;
 pub mod frame;
 pub mod player;
 pub mod queue;
@@ -15,6 +16,7 @@ pub mod traits;
 
 pub use audio_clock::AudioClock;
 pub use caps::{Backend, Cost, DecodeCap, Delivery, DeviceCaps, PlaybackBudget};
+pub use convert_cpu::{frame_to_rgba8, planes_to_rgba8, ConvertError};
 pub use codec::{parse_codec_string, Chroma, Codec, Transfer, VideoProfile};
 pub use frame::{ColorInfo, Frame, FrameData, Matrix, PlaneLayout, Range, RecycleToken};
 pub use queue::{FrameQueue, Poll, Pressure};
