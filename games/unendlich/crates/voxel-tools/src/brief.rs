@@ -390,8 +390,8 @@ pub fn to_program(l: &Layout, brief: &Brief, wall: &str, floor_y: i32) -> String
     let mut doors = String::new();
     let mut n = 0;
     let pair_door = |a: &Room, c: &Room, k: usize| -> Option<String> {
-        // the two must actually share a wall to have a door in it
-        if a.gap(c) > 1.5 { return None; }
+        // near enough to share a wall; a door cannot span a courtyard
+        if a.gap(c) > 3.5 { return None; }
         let (ax, az) = a.centre(); let (cx, cz) = c.centre();
         let (mx, mz) = (((ax + cx) / 2.0) as i32, ((az + cz) / 2.0) as i32);
         let along_x = (ax - cx).abs() > (az - cz).abs();
@@ -399,25 +399,107 @@ pub fn to_program(l: &Layout, brief: &Brief, wall: &str, floor_y: i32) -> String
                       rel d{k} at ground dx={mx} dy={} dz={mz}\n",
                      if along_x { 3 } else { 2 }, if along_x { 2 } else { 3 }, floor_y + 2))
     };
+    // EVERY adjacency that is not `avoid` gets an opening where the two
+    // rooms actually touch -- not just the MUST pairs. Only 7 of 14
+    // rooms could be walked to otherwise: the ones with an outside
+    // door. A room whose brief says it should be near another and is
+    // has no reason to be sealed from it, and a plan of sealed rooms
+    // fails the reachability check the crate already runs.
     for (x, y, how) in &brief.adjacencies {
-        if *how != Adjacency::Must { continue; }
+        if *how == Adjacency::Avoid { continue; }
         for a in l.rooms.iter().filter(|r| &r.name == x) {
             for c in l.rooms.iter().filter(|r| &r.name == y) {
                 if let Some(d) = pair_door(a, c, n) { doors.push_str(&d); n += 1; }
             }
         }
     }
+    // OUT THROUGH THE SHELL WALL ITSELF. This was placed at the room's
+    // centre plus HALF THE BUILDING'S WIDTH, which lands well outside
+    // the shell and cuts a hole in open air -- every room in a
+    // fourteen-room castle was unreachable and the flood could not get
+    // within seventeen blocks of any of them. The door belongs ON the
+    // face, so it is the room's centre projected to the nearest one.
+    let (sx0, sx1) = (mx - (hi.0 - lo.0 + 4) / 2, mx + (hi.0 - lo.0 + 4) / 2);
+    let (sz0, sz1) = (mz - (hi.1 - lo.1 + 4) / 2, mz + (hi.1 - lo.1 + 4) / 2);
     for r in l.rooms.iter().filter(|r| r.qualities.contains("outside_door")) {
-        // out through the nearest face of the shell
-        let (cx, cz) = r.centre();
-        let (dx, dz) = if (cx - mx as f32).abs() > (cz - mz as f32).abs() {
-            (if cx > mx as f32 { hi.0 - lo.0 } else { -(hi.0 - lo.0) }, 0) } else {
-            (0, if cz > mz as f32 { hi.1 - lo.1 } else { -(hi.1 - lo.1) }) };
-        doors.push_str(&format!("  part d{n} box w={} h=4 d={} material={wall}\n\
-                                 rel d{n} at ground dx={} dy={} dz={}\n",
-                                if dz == 0 { 6 } else { 3 }, if dz == 0 { 3 } else { 6 },
-                                cx as i32 + dx / 2, floor_y + 2, cz as i32 + dz / 2));
+        let (cx, cz) = (r.centre().0 as i32, r.centre().1 as i32);
+        // which face is nearest, and where on it
+        let d = [(cx - sx0, (sx0, cz)), (sx1 - cx, (sx1, cz)),
+                 (cz - sz0, (cx, sz0)), (sz1 - cz, (cx, sz1))];
+        let (_, (px, pz)) = d.iter().min_by_key(|(dist, _)| *dist).copied().unwrap();
+        let through_x = px == sx0 || px == sx1;
+        doors.push_str(&format!("  part d{n} box w={} h=5 d={} material={wall}\n\
+                                 rel d{n} at ground dx={px} dy={} dz={pz}\n",
+                                if through_x { 8 } else { 4 }, if through_x { 4 } else { 8 },
+                                floor_y + 2));
         n += 1;
+    }
+    // and a corridor from that door inward to the room, or the door
+    // opens onto solid wall between the shell and the room
+    for r in l.rooms.iter().filter(|r| r.qualities.contains("outside_door")) {
+        let (cx, cz) = (r.centre().0 as i32, r.centre().1 as i32);
+        let d = [(cx - sx0, (sx0, cz)), (sx1 - cx, (sx1, cz)),
+                 (cz - sz0, (cx, sz0)), (sz1 - cz, (cx, sz1))];
+        let (_, (px, pz)) = d.iter().min_by_key(|(dist, _)| *dist).copied().unwrap();
+        let (w2, d2) = ((px - cx).abs().max(3) + 2, (pz - cz).abs().max(3) + 2);
+        doors.push_str(&format!("  part c{n} box w={w2} h=4 d={d2} material={wall}\n\
+                                 rel c{n} at ground dx={} dy={} dz={}\n",
+                                (px + cx) / 2, floor_y + 2, (pz + cz) / 2));
+        n += 1;
+    }
+    // A BUILDING NEEDS A WAY IN, even when no room asked for one. A
+    // brief with no `outside_door` anywhere produced a sealed block:
+    // the circulation tree made every room reachable FROM EACH OTHER
+    // and none of them from outside, which passes an internal check
+    // and fails the only one that matters.
+    if !l.rooms.iter().any(|r| r.qualities.contains("outside_door")) {
+        if let Some(r) = l.rooms.iter().min_by_key(|r| {
+            let (cx, cz) = (r.centre().0 as i32, r.centre().1 as i32);
+            (cx - sx0).min(sx1 - cx).min(cz - sz0).min(sz1 - cz)
+        }) {
+            let (cx, cz) = (r.centre().0 as i32, r.centre().1 as i32);
+            let d = [(cx - sx0, (sx0, cz)), (sx1 - cx, (sx1, cz)),
+                     (cz - sz0, (cx, sz0)), (sz1 - cz, (cx, sz1))];
+            let (_, (px, pz)) = d.iter().min_by_key(|(dist, _)| *dist).copied().unwrap();
+            let (w2, d2) = ((px - cx).abs().max(4) + 3, (pz - cz).abs().max(4) + 3);
+            doors.push_str(&format!("  part e{n} box w={w2} h=4 d={d2} material={wall}\n\
+                                     rel e{n} at ground dx={} dy={} dz={}\n",
+                                    (px + cx) / 2, floor_y + 2, (pz + cz) / 2));
+            n += 1;
+        }
+    }
+    // CIRCULATION, WHICH WAS A NUMBER AND NEVER GEOMETRY. The brief
+    // reserves 30% of the area for corridors and walls, reconciles
+    // against it, reports it -- and then nothing ever cut one. Seven of
+    // fourteen rooms were sealed: the ones with no outside door and no
+    // adjacency, which is most of any real plan.
+    //
+    // A spanning tree over the rooms: each is joined to the nearest one
+    // already connected. That is the minimum circulation that makes
+    // every room reachable, which is the property that matters.
+    if l.rooms.len() > 1 {
+        let mut joined: Vec<usize> = vec![0];
+        let mut left: Vec<usize> = (1..l.rooms.len()).collect();
+        while !left.is_empty() {
+            let (bi, bj) = joined.iter().flat_map(|&i| left.iter().map(move |&j| (i, j)))
+                .min_by(|a, b| l.rooms[a.0].gap(&l.rooms[a.1])
+                    .partial_cmp(&l.rooms[b.0].gap(&l.rooms[b.1])).unwrap_or(std::cmp::Ordering::Equal))
+                .expect("both non-empty");
+            let (a, c) = (&l.rooms[bi], &l.rooms[bj]);
+            let (ax, az) = (a.centre().0 as i32, a.centre().1 as i32);
+            let (cx, cz) = (c.centre().0 as i32, c.centre().1 as i32);
+            // an L: along x, then along z. A diagonal corridor cuts
+            // through everything between, which is worse than a corner.
+            for (x0, z0, x1, z1) in [(ax, az, cx, az), (cx, az, cx, cz)] {
+                let (w2, d2) = ((x1 - x0).abs() + 3, (z1 - z0).abs() + 3);
+                doors.push_str(&format!("  part k{n} box w={w2} h=4 d={d2} material={wall}\n\
+                                         rel k{n} at ground dx={} dy={} dz={}\n",
+                                        (x0 + x1) / 2, floor_y + 2, (z0 + z1) / 2));
+                n += 1;
+            }
+            joined.push(bj);
+            left.retain(|&x| x != bj);
+        }
     }
     if n > 0 {
         s.push_str("pass the doors cut\n");
@@ -785,5 +867,42 @@ mod tests {
             }
         }
         assert!(found, "an opening in the wall between two rooms that must adjoin");
+    }
+
+    #[test]
+    fn every_room_can_be_walked_to_which_is_what_circulation_is_for() {
+        // The brief reserves 30% for circulation, reconciles against
+        // it, reports it -- and nothing ever CUT one. Seven of fourteen
+        // rooms were sealed: the ones with no outside door and no
+        // adjacency, which is most of any real plan.
+        use crate::VoxelWorld;
+        struct W(std::collections::BTreeMap<(i32, i32, i32), u16>);
+        impl VoxelWorld for W {
+            fn get(&self, x: i32, y: i32, z: i32) -> u16 {
+                if let Some(&b) = self.0.get(&(x, y, z)) { return b; }
+                if y <= 64 { 1 } else { 0 }
+            }
+            fn set(&mut self, x: i32, y: i32, z: i32, b: u16) -> bool { self.0.insert((x, y, z), b); true }
+        }
+        // a small brief on a small site: the property is structural, and
+        // a flood over a 80x80 castle takes two minutes to prove it
+        let b = parse("space hall area=90\nspace kitchen area=50\nspace store area=40\n\
+                       space cellar area=40\nadj hall kitchen must\n").0;
+        let l = lay_out(&b, ((-16, -16), (16, 16)), 11, 30);
+        let (prog, _) = crate::program::parse(&to_program(&l, &b, "stone", 0));
+        let r = crate::program::run(&prog, (0, 64, 0));
+        let mut w = W(Default::default());
+        for c in &r.changes { w.set(c.at.0, c.at.1, c.at.2, c.to); }
+        let body = crate::reach::Body { budget: 60_000, corridor: Some(80), ..Default::default() };
+        let outside = (-26, 65, -26);
+        let mut unreachable = Vec::new();
+        for room in &l.rooms {
+            let (cx, cz) = (room.at.0 + room.size.0 / 2, room.at.1 + room.size.1 / 2);
+            // a body stands on the FLOOR, not at the room's centre
+            if !crate::reach::reaches(&w, outside, (cx, 64, cz), &body).ok {
+                unreachable.push(room.name.clone());
+            }
+        }
+        assert!(unreachable.is_empty(), "sealed rooms: {unreachable:?}");
     }
 }
