@@ -39,6 +39,7 @@ fn main() {
     review_scenario();
     long_run_scenario();
     scatter_scenario();
+    four_pass_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -871,7 +872,9 @@ fn review_scenario() {
     pb.review_rounds = 3;
     let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
     pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(Scripted { calls: calls.clone() }))));
-    pb.start_turn(&cm, &gaze, Some("grass"), "a hall", None);
+    // "a hall" is not in the dictionary and now composes; this
+    // scenario is about the PLAN path, so it asks for a house
+    pb.start_turn(&cm, &gaze, Some("grass"), "a stone house", None);
     let t0 = std::time::Instant::now();
     while pb.run.as_ref().map(|r| r.is_running()).unwrap_or(false) && t0.elapsed().as_secs() < 20 {
         pb.poll_turn(&cm); pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(5));
@@ -988,4 +991,54 @@ fn scatter_scenario() {
         assert_eq!(s, "tower");
         assert_eq!(site.params.get("size").map(String::as_str), Some("small"));
     }
+}
+
+
+/// The four passes, end to end: a request the dictionary cannot say,
+/// routed to interpret -> compose -> resolve -> emit.
+fn four_pass_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== the four passes");
+    struct Script { n: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                    seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> }
+    impl voxel_tools::llm::Completer for Script {
+        fn name(&self) -> &str { "script" }
+        fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            self.seen.lock().unwrap().push(user.to_string());
+            let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(match i {
+                // pass 1: what is it?
+                0 => "IT IS: a ball of water held aloft, needing a skin\n                      PARTS: a glass shell; the water within\n                      MATERIALS: glass, water\n                      SCALE: 16\n                      AVOID: a solid blue blob; anything shaped like a building\n".into(),
+                // pass 2: assets and passes
+                1 => "```\n                      pass shell add\n                        part skin sphere r=8 material=glass hollow\n                        rel skin above ground by=10\n                      end\n                      pass water add\n                        part w sphere r=7 material=water\n                        rel w inside skin\n                      end\n                      ```\n".into(),
+                _ => "done\n".into(),
+            })
+        }
+    }
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    pb.review_rounds = 3;
+    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(
+        Box::new(Script { n: n.clone(), seen: seen.clone() }))));
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -14.0], [0.0, -0.3, 1.0], Some(([0, 64, 0], [0, 1, 0], 15.0)));
+    pb.start_turn(&cm, &gaze, Some("grass"), "a water sphere", None);
+    let t0 = std::time::Instant::now();
+    while pb.run.as_ref().map(|r| r.is_running()).unwrap_or(false) && t0.elapsed().as_secs() < 30 {
+        pb.poll_turn(&cm); pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    let s = seen.lock().unwrap();
+    println!("  {} model call(s)", s.len());
+    assert!(s.len() >= 2, "it took the four-pass path");
+    assert!(s[0].contains("WHAT THIS IS"), "pass 1 asked what it is");
+    assert!(!s[0].contains("form house"), "and showed it no menu of forms");
+    assert!(s[1].contains("ASSETS first") && s[1].contains("a ball of water"),
+            "pass 2 carried the reading forward");
+    let log = pb.drain_log();
+    println!("  {}", log.iter().find(|l| l.starts_with("it is:")).cloned().unwrap_or_default().trim());
+    let built = log.iter().find(|l| l.contains("pass(es)")).cloned().unwrap_or_default();
+    println!("  {}", built.trim());
+    assert!(built.contains("shell (add") && built.contains("water (add"), "{log:?}");
+    assert!(!log.iter().any(|l| l.to_lowercase().contains("house")), "no house anywhere: {log:?}");
 }

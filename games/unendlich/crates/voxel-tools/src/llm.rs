@@ -166,6 +166,39 @@ impl Completer for CommandProvider {
 /// conversational sentence, trailing commentary, and blank padding.
 /// Lines that look like IR are kept verbatim -- including comments,
 /// which the parser uses for the plan name.
+/// Strip code fences and obvious prose, WITHOUT the verb filter.
+///
+/// `clean_reply` keeps only lines whose first word is a known IR verb,
+/// which is right for a plan and destroys a program: `part`, `rel`,
+/// `pass`, `asset`, `frame` and `end` are not verbs, and a program run
+/// through it comes back empty. A program's own parser reports what it
+/// cannot read, so the job here is only to remove the wrapper a model
+/// puts around code.
+pub fn strip_fences(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_fence = false;
+    let mut saw_fence = false;
+    for line in raw.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            saw_fence = true;
+            continue;
+        }
+        if in_fence { out.push_str(line); out.push('\n'); }
+    }
+    if saw_fence && !out.trim().is_empty() { return out; }
+    // no fence: keep the lines that could be program source, which is
+    // anything starting with one of its keywords or indented under one
+    raw.lines()
+        .filter(|l| {
+            let t = l.trim().to_lowercase();
+            t.is_empty() || t.starts_with('#')
+                || ["asset", "frame", "pass", "part", "rel", "repeat", "stamp", "end"]
+                    .iter().any(|k| t.starts_with(&format!("{k} ")) || t == *k)
+        })
+        .map(|l| format!("{l}\n")).collect()
+}
+
 pub fn clean_reply(raw: &str) -> String {
     let mut lines: Vec<&str> = Vec::new();
     let mut in_fence = false;
@@ -870,4 +903,40 @@ mod tests {
         assert!(l.contains("\"cache_prompt\":true"), "{l}");
     }
 
+
+    #[test]
+    fn strip_fences_keeps_program_source_where_clean_reply_would_destroy_it() {
+        let reply = "Here is the program:\n\
+                     ```\n\
+                     asset t\n\
+                       part x box w=2 material=stone\n\
+                     end\n\
+                     pass a add\n\
+                       repeat t ring radius=10 count=6\n\
+                     end\n\
+                     ```\n\
+                     Hope that helps!";
+        let s = strip_fences(reply);
+        assert!(s.contains("asset t") && s.contains("pass a add") && s.contains("repeat t"), "{s}");
+        assert!(!s.contains("Hope that helps"));
+        let (prog, errs) = crate::program::parse(&s);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(prog.passes.len(), 1);
+        // And the verb filter really would have destroyed it: `end` is
+        // the only line it keeps, because `end` happens to collide with
+        // an IR verb. Two orphan `end`s parse to no passes at all.
+        let wrecked = clean_reply(reply);
+        assert!(!wrecked.contains("asset") && !wrecked.contains("pass") && !wrecked.contains("part"),
+                "clean_reply keeps no structural line: {wrecked:?}");
+        assert!(crate::program::parse(&wrecked).0.passes.is_empty());
+    }
+
+    #[test]
+    fn strip_fences_works_without_a_fence_and_drops_the_prose() {
+        let s = strip_fences("Sure! I will build it like this.\n                              pass a add\n  part x box w=4 material=stone\nend\n                              Let me know if you want changes.");
+        assert!(s.contains("pass a add") && s.contains("part x"), "{s}");
+        assert!(!s.contains("Sure!") && !s.contains("Let me know"), "{s}");
+        let (prog, _) = crate::program::parse(&s);
+        assert_eq!(prog.passes.len(), 1);
+    }
 }

@@ -293,7 +293,16 @@ pub struct PendingTurn {
 /// The kinds of model turn, so the reply is routed without the bin
 /// having to remember which it started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnKind { Build, Repair, Review }
+pub enum TurnKind {
+    Build,
+    Repair,
+    Review,
+    /// Pass 1 of the four-pass path: what IS this thing? Its answer is
+    /// prose, and it becomes the context for pass 2.
+    Interpret,
+    /// Pass 2: assets and passes, written against pass 1's reading.
+    Compose,
+}
 
 impl PendingTurn {
     /// Has the reply arrived? None means still working.
@@ -1228,6 +1237,43 @@ impl Paintbrush {
         }
     }
 
+    /// Pass 2: the reading becomes assets and passes.
+    fn start_compose(&mut self, cm: &ChunkManager, gaze: &Gaze, prose: &str,
+                     reading: voxel_tools::compose::Reading, player_feet: Option<(i32, i32, i32)>) {
+        let Some(completer) = self.completer_for(false) else {
+            self.say("no provider available -- /provider to check"); return;
+        };
+        let p = voxel_tools::program::plan_prompt(prose, &reading);
+        let _ = cm;
+        self.say("planning the passes ...");
+        self.spawn_turn(completer,
+            "You are a builder planning a voxel build as assets and passes.".into(),
+            Box::new(move || p), gaze, player_feet, prose, TurnKind::Compose);
+    }
+
+    /// Passes 3 and 4: the program is resolved and run.
+    fn finish_compose(&mut self, cm: &ChunkManager, gaze: &Gaze, raw: &str,
+                      player_feet: Option<(i32, i32, i32)>, prose: &str) {
+        let src = voxel_tools::llm::strip_fences(raw);
+        let view = WorldView(cm);
+        let mut staged = StagedWorld::new(&view);
+        let r = {
+            let mut tools = VoxelTools::new(&mut staged);
+            self.session.receive_program(&mut tools, gaze, &src, player_feet, prose)
+        };
+        // A program that produced nothing is worth falling back on: the
+        // dictionary path is worse for a water sphere but better than
+        // nothing at all.
+        if matches!(&r, voxel_tools::chat::Reply::Say(m) if m.contains("no passes")) {
+            log::info!("[paintbrush] the composed program had no passes; using the plan path");
+            self.say("that did not compose -- trying the direct path");
+            self.finish_turn_with(cm, gaze, raw, player_feet, prose);
+            return;
+        }
+        self.push(r);
+        self.flush_staged(cm, &mut staged);
+    }
+
     /// Ask the model to review the pending plan. One short prompt, one
     /// short reply; the drone re-plans on the verdict.
     pub fn start_review(&mut self, gaze: &Gaze, player_feet: Option<(i32, i32, i32)>) {
@@ -1333,6 +1379,14 @@ impl Paintbrush {
         // Same borrow shape as `prompt_for`: the view lives for the
         // length of this call, which is all a prompt needs -- it reads
         // the world and never writes.
+        // WHICH PATH. The dictionary knows a cottage and makes a better
+        // one than four passes of a small model will. It does not know
+        // a water sphere, and asked for one it picks the nearest thing
+        // on its menu -- which is how "a water sphere" became a house.
+        // The recognizer is the honest signal: it is a table of things
+        // the dictionary can actually make, so a miss means the fast
+        // path would be guessing.
+        let path = voxel_tools::compose::choose_path(prose);
         // A new build starts a RUN: the rounds, their history, and the
         // status the marker shows.
         self.run = Some(voxel_tools::session::Run::new(prose, voxel_tools::session::Limits {
@@ -1377,6 +1431,22 @@ impl Paintbrush {
             self.say("no provider available -- /provider to check");
             return;
         };
+        // The four-pass path when the dictionary does not know the
+        // request. Pass 1 asks what the thing IS, in prose; pass 2
+        // writes assets and passes against that reading. The dictionary
+        // path stays one turn, because for a cottage it is better.
+        if path == voxel_tools::compose::Path::Compose {
+            // the site line the ambient makes, so pass 1 knows where it
+            // is standing; it is one line by design
+            let site = surface.map(|s| format!("SITE: standing on {s}.")).unwrap_or_default();
+            let ip = voxel_tools::compose::interpret_prompt(prose, &site);
+            log::info!("[paintbrush] composing: the dictionary has no word for {prose:?}");
+            self.say("thinking about what this is ...");
+            self.spawn_turn(completer,
+                "You are a builder who has made thousands of things in voxel worlds.".into(),
+                Box::new(move || ip), gaze, player_feet, prose, TurnKind::Interpret);
+            return;
+        }
         self.spawn_turn(completer, system, user, gaze, player_feet, prose, TurnKind::Build);
         // the clone the worker holds has them; the live session is done with them
         self.session.referents.clear();
@@ -1588,6 +1658,21 @@ impl Paintbrush {
                 let sent = turn.user_sent.lock().map(|s| s.clone()).unwrap_or_default();
                 self.chain.push(sent, raw.clone(), String::new());
                 match turn.kind {
+                    TurnKind::Interpret => {
+                        // pass 1 answered; carry its reading into pass 2
+                        let reading = voxel_tools::compose::parse_reading(&raw);
+                        log::info!("[paintbrush] reading: {}", reading.essence);
+                        self.say(format!("it is: {}", reading.essence));
+                        if !reading.pitfalls.is_empty() {
+                            self.say(format!("avoiding: {}", reading.pitfalls.join("; ")));
+                        }
+                        self.start_compose(cm, &turn.gaze, &turn.prose, reading, turn.player_feet);
+                    }
+                    TurnKind::Compose => {
+                        self.finish_compose(cm, &turn.gaze, &raw, turn.player_feet, &turn.prose);
+                        self.review_pending_after_drone = 1;
+                        self.review_round = 0;
+                    }
                     TurnKind::Build => {
                         self.finish_turn_with(cm, &turn.gaze, &raw, turn.player_feet, &turn.prose);
                         // the review loop starts once this build's preview
