@@ -226,6 +226,12 @@ pub struct Device {
     /// The accessory advertised a change since the last read, so `power` may be wrong.
     /// Cleared by the next successful read.
     pub state_stale: bool,
+    /// From the advertisement: is this accessory unclaimed and ready for pair-setup?
+    /// `None` until one is heard — an accessory out of range says nothing, and guessing
+    /// either way in the pairing dialog is how it gets to be wrong.
+    pub unpaired: Option<bool>,
+    /// The advertised accessory category (7 = outlet, 8 = switch…), before any pairing.
+    pub category: Option<u16>,
 }
 
 impl Device {
@@ -251,6 +257,8 @@ impl Device {
             can_identify: false,
             in_use: None,
             state_stale: false,
+            unpaired: None,
+            category: None,
         }
     }
 
@@ -317,6 +325,11 @@ pub enum Event {
         id: DeviceId,
         power: Power,
     },
+    /// A HAP accessory's advertisement, every time it is heard.
+    ///
+    /// `unpaired` is the advert's own not-paired flag: the accessory saying whether it is
+    /// claimed. It is the difference between the pairing dialog guessing and knowing.
+    Advertised { id: DeviceId, unpaired: bool, category: u16 },
     /// The accessory's advertisement says something changed — its Global State Number
     /// moved, or it broadcast an encrypted notification we cannot read.
     ///
@@ -427,7 +440,18 @@ impl Hub {
                         d.last_error = Some(message);
                     }
                 }
-                Event::AccessoryChanged { id, reconfigured } => {
+                Event::Advertised { id, unpaired, category } => {
+                    if let Some(d) = self.devices.get_mut(&id) {
+                        d.unpaired = Some(unpaired);
+                        d.category = Some(category);
+                        d.last_seen = now;
+                    }
+                }
+                // Heard on every advert, several times a second. Journaling it would drown
+            // everything else, and it reports no change — `AccessoryChanged` is the line
+            // worth keeping.
+            Event::Advertised { .. } => return,
+            Event::AccessoryChanged { id, reconfigured } => {
                     if let Some(d) = self.devices.get_mut(&id) {
                         // The power we last read is no longer trustworthy. Marked stale
                         // rather than cleared: a row that blanks on every advert flickers,
@@ -496,6 +520,10 @@ impl Hub {
                 Some(i) => format!("FAILED {i}: {message}"),
                 None => format!("FAILED: {message}"),
             },
+            // Heard on every advert, several times a second. Journaling it would drown
+            // everything else, and it reports no change — `AccessoryChanged` is the line
+            // worth keeping.
+            Event::Advertised { .. } => return,
             Event::AccessoryChanged { id, reconfigured } => {
                 if *reconfigured {
                     format!("{id} re-configured (firmware or factory reset) — re-read it")
@@ -1024,6 +1052,25 @@ mod ability_tests {
     /// A plug switched at the wall advertises it. The row must stop asserting a power it
     /// has been told is out of date — and must not blank, because "was on, may have
     /// changed" is more use than "unknown" and a row that clears on every advert flickers.
+    /// The advert reaches the row, and the journal does NOT record it — it arrives several
+    /// times a second and reports no change, so logging it would drown everything else.
+    #[test]
+    fn an_advert_updates_the_row_without_filling_the_journal() {
+        let (mut h, id) = hub_with_one();
+        let before = h.journal().len();
+        for _ in 0..20 {
+            h.step(vec![Event::Advertised { id: id.clone(), unpaired: true, category: 7 }], now());
+        }
+        let d = h.get(&id).unwrap();
+        assert_eq!(d.unpaired, Some(true));
+        assert_eq!(d.category, Some(7));
+        assert_eq!(h.journal().len(), before, "20 adverts wrote {} journal lines", h.journal().len() - before);
+
+        // And the flag tracks the accessory: pairing it flips what the next advert says.
+        h.step(vec![Event::Advertised { id: id.clone(), unpaired: false, category: 7 }], now());
+        assert_eq!(h.get(&id).unwrap().unpaired, Some(false));
+    }
+
     #[test]
     fn an_advertised_change_makes_the_last_reading_stale_without_erasing_it() {
         let (mut h, id) = hub_with_one();
@@ -1083,5 +1130,109 @@ mod ability_tests {
         assert!(last.contains("is a outlet") && last.contains("in use"), "{last}");
         h.step(vec![Event::Abilities { id, describes: "outlet".into(), can_identify: false, in_use: Some(false) }], now());
         assert!(h.journal().last().unwrap().contains("nothing plugged in"));
+    }
+}
+
+
+/// What pairing with this accessory will actually do.
+///
+/// The pairing dialog has always shown one paragraph: "a HomeKit accessory holds ONE
+/// pairing… pairing it here removes it from that Home… getting it back means a factory
+/// reset". That is true in general and wrong about most individual plugs, because a plug
+/// fresh from its box is claimed by nobody and nothing is lost. A warning that is wrong
+/// half the time is a warning people learn to click past — and this one is guarding the
+/// destructive path.
+///
+/// The advertisement answers it. `unpaired` is the accessory's own not-paired flag, so the
+/// plug in front of you says whether it is claimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outlook {
+    /// The accessory is unclaimed. Pairing takes nothing from anyone.
+    Ready,
+    /// We already hold this accessory's pairing. Pairing again replaces OUR record, which
+    /// is recoverable and worth saying, since the generic warning implies otherwise.
+    ReplacesOurs,
+    /// Something else holds it, and it is not us. Pair-setup will be refused by the
+    /// accessory until it is factory reset — the one case where the scary paragraph is the
+    /// truth.
+    ClaimedByAnother,
+    /// No advertisement heard yet. Say so rather than guessing: an accessory out of range
+    /// tells us nothing, and both guesses are wrong somewhere.
+    Unknown,
+}
+
+impl Outlook {
+    /// From the advert's flag and whether we hold a pairing record.
+    pub fn of(unpaired: Option<bool>, we_hold_pairing: bool) -> Outlook {
+        match (unpaired, we_hold_pairing) {
+            (Some(true), _) => Outlook::Ready,
+            (Some(false), true) => Outlook::ReplacesOurs,
+            (Some(false), false) => Outlook::ClaimedByAnother,
+            (None, true) => Outlook::ReplacesOurs,
+            (None, false) => Outlook::Unknown,
+        }
+    }
+
+    /// The line to put in the dialog, in the second person, about THIS plug.
+    pub fn message(self) -> &'static str {
+        match self {
+            Outlook::Ready => "This plug is not paired with anything. Nothing is lost by pairing it here.",
+            Outlook::ReplacesOurs => "You are already paired with this plug. Pairing again replaces your own record; nothing else is affected.",
+            Outlook::ClaimedByAnother => "This plug is already paired with something else — an Apple Home, another controller. It will REFUSE to pair until it is factory reset (hold its button until it blinks), and resetting it removes it from wherever it is set up now.",
+            Outlook::Unknown => "No advertisement heard from this plug yet, so whether it is already paired is unknown. A HomeKit accessory holds one pairing: if it is set up in an Apple Home, pairing here removes it from there.",
+        }
+    }
+
+    /// Is this the destructive case — the one the confirmation exists for?
+    pub fn is_destructive(self) -> bool {
+        matches!(self, Outlook::ClaimedByAnother | Outlook::Unknown)
+    }
+}
+
+#[cfg(test)]
+mod outlook_tests {
+    use super::*;
+
+    /// The dialog's paragraph is true in general and wrong about most individual plugs. A
+    /// warning that is wrong half the time is one people learn to click past — and it is
+    /// guarding the destructive path.
+    #[test]
+    fn the_advert_says_which_warning_is_the_true_one() {
+        // A plug out of its box: claimed by nobody.
+        assert_eq!(Outlook::of(Some(true), false), Outlook::Ready);
+        assert!(!Outlook::Ready.is_destructive());
+        assert!(Outlook::Ready.message().contains("Nothing is lost"));
+
+        // Claimed, and not by us: the case the scary paragraph is actually about.
+        let claimed = Outlook::of(Some(false), false);
+        assert_eq!(claimed, Outlook::ClaimedByAnother);
+        assert!(claimed.is_destructive());
+        assert!(claimed.message().contains("factory reset"));
+
+        // Claimed by US: re-pairing replaces our own record and takes nothing from anyone.
+        assert_eq!(Outlook::of(Some(false), true), Outlook::ReplacesOurs);
+        assert!(!Outlook::ReplacesOurs.is_destructive());
+
+        // Nothing heard: say so. Both guesses are wrong somewhere, and this is the one case
+        // where the general warning is the right thing to show.
+        let unknown = Outlook::of(None, false);
+        assert_eq!(unknown, Outlook::Unknown);
+        assert!(unknown.is_destructive(), "an unknown state must keep the confirmation");
+        assert!(unknown.message().contains("unknown"));
+
+        // Even unheard, a pairing record we hold is evidence enough.
+        assert_eq!(Outlook::of(None, true), Outlook::ReplacesOurs);
+    }
+
+    #[test]
+    fn every_outlook_says_something_specific() {
+        for o in [Outlook::Ready, Outlook::ReplacesOurs, Outlook::ClaimedByAnother, Outlook::Unknown] {
+            assert!(o.message().len() > 40, "{o:?} has no real message");
+        }
+        // and no two say the same thing
+        let msgs: std::collections::HashSet<&str> =
+            [Outlook::Ready, Outlook::ReplacesOurs, Outlook::ClaimedByAnother, Outlook::Unknown]
+                .iter().map(|o| o.message()).collect();
+        assert_eq!(msgs.len(), 4);
     }
 }

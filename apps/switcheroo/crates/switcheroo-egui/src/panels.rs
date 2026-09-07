@@ -209,11 +209,22 @@ pub fn pairing_dialog(ctx: &egui::Context, app: &mut App) {
     egui::Window::new(format!("Pair with {name}")).open(&mut open).collapsible(false).resizable(false)
         .default_width(width).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
-            ui.label(RichText::new("This takes exclusive control of the plug.").strong().size(16.0));
-            ui.label("A HomeKit accessory holds ONE pairing. If this plug is set up in an Apple Home, \
-                      pairing it here removes it from that Home, and getting it back means a factory \
-                      reset of the plug and setting it up again there. If nothing else is paired with it, \
-                      nothing is lost.");
+            // WHAT WILL HAPPEN TO THIS PLUG, from its own advertisement, rather than the
+            // general warning. The paragraph that used to be here is true of HomeKit and
+            // wrong about most individual plugs — a plug out of its box is claimed by
+            // nobody and nothing is lost — and a warning that is wrong half the time is one
+            // people learn to click past. This one guards the destructive path.
+            let outlook = switcheroo_core::Outlook::of(
+                app.hub.get(&d.id).and_then(|x| x.unpaired),
+                app.hub.get(&d.id).map(|x| x.paired).unwrap_or(false),
+            );
+            let head = if outlook.is_destructive() {
+                RichText::new("This takes exclusive control of the plug.").strong().size(16.0)
+            } else {
+                RichText::new("Pair with this plug.").strong().size(16.0)
+            };
+            ui.label(head);
+            ui.label(outlook.message());
             ui.label(RichText::new("The pairing record is stored on this device only. Back it up: losing it means resetting the plug.").small().weak());
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -224,7 +235,14 @@ pub fn pairing_dialog(ctx: &egui::Context, app: &mut App) {
             if !d.code.is_empty() && !code_ok {
                 ui.label(RichText::new("eight digits").small().color(egui::Color32::LIGHT_RED));
             }
-            ui.checkbox(&mut d.confirmed, "I understand this replaces any pairing the plug already has.");
+            // The confirmation is for the destructive case. Asking someone to tick "I
+            // understand this replaces any pairing" about a plug that has none teaches them
+            // the tick means nothing — which is what it would mean by the time it mattered.
+            if outlook.is_destructive() {
+                ui.checkbox(&mut d.confirmed, "I understand this replaces any pairing the plug already has.");
+            } else {
+                d.confirmed = true;
+            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let can = code_ok && d.confirmed;

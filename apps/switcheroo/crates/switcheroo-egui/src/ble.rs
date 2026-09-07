@@ -324,6 +324,15 @@ async fn radio_loop(
                         for (company, body) in &props.manufacturer_data {
                             match hap_core::advert::parse_keyed(*company, body) {
                                 hap_core::advert::Parsed::Regulatory(a) => {
+                                    // Every advert, not only the changed ones: the
+                                    // not-paired flag is what lets the pairing dialog say
+                                    // what will happen to THIS plug instead of reciting the
+                                    // general warning.
+                                    let _ = ev_tx.send(Event::Advertised {
+                                        id: id.clone(),
+                                        unpaired: a.unpaired,
+                                        category: a.category,
+                                    });
                                     let change = gsn.observe(&a);
                                     if matches!(
                                         change,

@@ -297,3 +297,32 @@ Key from the Pairings characteristic and its refresh protocol; and acting on a c
 automatically. Right now a stale row waits for the operator — auto-refreshing on every
 advert would reconnect to every plug in the house whenever any of them moved, which is worse
 than the polling it replaces.
+
+
+## The pairing dialog stops guessing
+
+The dialog showed one paragraph: *a HomeKit accessory holds ONE pairing… pairing it here
+removes it from that Home… getting it back means a factory reset*. True of HomeKit, wrong
+about most individual plugs — one out of its box is claimed by nobody and nothing is lost —
+and a warning that is wrong half the time is one people learn to click past. This one guards
+the destructive path.
+
+The advertisement answers it. The not-paired flag is the accessory's own statement about
+whether it is claimed, so `Outlook::of(unpaired, we_hold_pairing)` gives four cases and each
+says something different:
+
+* **Ready** — unclaimed. Nothing is lost.
+* **ReplacesOurs** — we hold it. Re-pairing replaces our own record; recoverable, and worth
+  saying, since the old paragraph implied otherwise.
+* **ClaimedByAnother** — the one case the scary paragraph is actually about. Pair-setup will
+  be REFUSED until the plug is factory reset.
+* **Unknown** — nothing heard. Say so rather than guess; both guesses are wrong somewhere,
+  and this is where the general warning belongs.
+
+The confirmation tick now appears only for the destructive cases. Asking someone to confirm
+"I understand this replaces any pairing the plug already has" about a plug that has none
+teaches them the tick means nothing — which is what it would mean by the time it mattered.
+
+`Event::Advertised` carries the flag and the category on every advert. It is deliberately
+NOT journalled: it arrives several times a second and reports no change, so it would drown
+everything else. `AccessoryChanged` is the line worth keeping.
