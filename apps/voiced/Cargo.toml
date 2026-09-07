@@ -15,3 +15,9 @@ path = "src/main.rs"
 cli-kit = { path = "../../shared/cli-kit" }
 ipc-kit = { path = "../../shared/ipc-kit" }
 voiced-core = { path = "../../shared/voiced-core" }
+# The haptic confirmation for a Scope::Always delivery to a backgrounded
+# app — see route_and_deliver's own comment in main.rs for exactly when
+# this fires. Deliberately not a dependency of voiced-core itself: that
+# crate's Registry::route stays pure and tested with no I/O of its own;
+# the haptic decision and the real hardware write both live in this bin.
+haptic-kit = { path = "../../shared/haptic-kit" }
