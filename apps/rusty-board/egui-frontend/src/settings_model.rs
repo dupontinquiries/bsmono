@@ -106,6 +106,14 @@ pub const SETTINGS: &[Setting] = &[
         options: &["Normal", "Compact"], values: &["normal", "compact"],
     },
     Setting {
+        key: "layout.hand", label: "One-handed",
+        help: "Compact the board toward one thumb. Off is full width. The freed strip \
+               beside it stays live. GTK's own note says \"a future setting will let the \
+               user choose\" the dominant side — this is that setting.",
+        group: Group::Layout,
+        options: &["Off", "Left", "Right"], values: &["off", "left", "right"],
+    },
+    Setting {
         key: "layout.experimental_mode", label: "Mode",
         help: "Off = normal keyboard. Cardinal = 3×3 swipe grid. \
                Stenotype = 4-button steno (very experimental). \
@@ -271,10 +279,18 @@ mod tests {
         assert_eq!(counted, SETTINGS.len());
     }
 
+    /// Three from `CUSTOMIZATION.md` — letters, geometry, density — plus the one-handed
+    /// anchor, which GTK's `rebuild_view` hardcodes to Right under a comment saying "a
+    /// future setting will let the user choose".
     #[test]
-    fn the_layout_group_holds_the_three_the_doc_names() {
-        assert_eq!(group(Group::Layout).len(), 3);
-        assert_eq!(group(Group::Layout)[0].label, "Letters", "declared order kept");
+    fn the_layout_group_holds_the_doc_three_plus_the_one_handed_anchor() {
+        let g = group(Group::Layout);
+        assert_eq!(g.len(), 4);
+        assert_eq!(g[0].label, "Letters", "declared order kept");
+        let keys: Vec<&str> = g.iter().map(|s| s.key).collect();
+        for k in ["layout.letters", "layout.geometry", "layout.density", "layout.hand"] {
+            assert!(keys.contains(&k), "{k} missing: {keys:?}");
+        }
     }
 
     #[test]

@@ -14,8 +14,12 @@ use crate::{apply_theme, keyboard_ui_styled, Board};
 use uikit_egui::Adaptive;
 
 pub struct Feel {
-    /// What the board draws with, from the persisted appearance block.
+    /// What the board draws with: the persisted appearance block with the panel's values
+    /// folded on top.
     pub style: crate::Style,
+    /// The appearance block alone. Kept so a panel change re-folds from a clean base rather
+    /// than accumulating onto whatever the last fold produced.
+    base_style: crate::Style,
     /// Which of the three keyboard obligations (no focus, bottom edge, focus-driven show/hide)
     /// this host meets, decided once — see `platform.rs`. Shown in the status strip.
     placement: crate::platform::Placement,
@@ -236,6 +240,7 @@ impl Feel {
         );
         Feel {
             style,
+            base_style: style,
             placement: crate::platform::placement(),
             reveal: Default::default(),
             was_visible: false,
@@ -738,14 +743,16 @@ impl Feel {
                             // cannot arrive with the wrong side effects.
                             let change = crate::settings_model::toggle(setting, &cur);
                             self.setting_values.insert(setting.key.to_string(), change.value.clone());
-                            // AND APPLY IT. The panel stored the new value in a map and
-                            // stopped, so picking "Cardinal" or "Stenotype" changed a string
-                            // and nothing else — the board stayed where it was. A setting
-                            // that persists and changes nothing is the failure
-                            // `settings::ready`'s own comment warns about.
+                            // AND APPLY IT — through ONE path, not a growing list of
+                            // special cases at the button. The board's mode is the one
+                            // thing that is not a style, so it stays explicit; everything
+                            // else folds through `Style::with_settings`, which means a new
+                            // setting is applied by being added to that function rather
+                            // than by remembering to add an `if` here.
                             if setting.key == "layout.experimental_mode" {
                                 self.board.apply_mode(&change.value);
                             }
+                            self.style = self.base_style.with_settings(&self.setting_values);
                             if change.broadcast { ctx.request_repaint(); }
                         }
                         // The help line is where the options are EXPLAINED —

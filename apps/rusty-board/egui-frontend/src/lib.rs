@@ -769,6 +769,26 @@ impl Style {
         }
     }
 
+    /// Fold the settings panel's values onto a base style.
+    ///
+    /// One place, so a new setting cannot be half-applied. The panel used to special-case
+    /// `layout.experimental_mode` inline at the button, and a second special case beside it
+    /// is how the two drift — one applied on change, the other only at startup.
+    ///
+    /// Unknown keys and unknown values are ignored rather than reset to a default: a config
+    /// written by a newer build must not silently undo a setting this build does understand.
+    pub fn with_settings(mut self, values: &std::collections::HashMap<String, String>) -> Style {
+        if let Some(h) = values.get("layout.hand") {
+            self.half = match h.as_str() {
+                "left" => crate::halfboard::Side::Left,
+                "right" => crate::halfboard::Side::Right,
+                "off" => crate::halfboard::Side::Off,
+                _ => self.half,
+            };
+        }
+        self
+    }
+
     /// The radius for a key of this height.
     pub fn radius_for(&self, key_h: f32) -> u8 {
         match self.key_radius {
@@ -2408,6 +2428,56 @@ mod gtk_parity_tests {
         assert_eq!(b.shift(), real_layout::Shift::Once);
         b.apply_mode("cardinal");
         assert_eq!(b.shift(), real_layout::Shift::Off, "the shift followed you to another board");
+    }
+
+    /// GTK's own `rebuild_view` hardcodes `DominantSide::Right` under a comment saying "a
+    /// future setting will let the user choose". This is that setting, and it has to reach
+    /// the renderer — the previous three appearance fields did not, which is the whole
+    /// reason this test exists.
+    #[test]
+    fn the_one_handed_setting_reaches_the_style() {
+        use crate::halfboard::Side;
+        let mut v = std::collections::HashMap::new();
+        let base = Style::default();
+        assert_eq!(base.half, Side::Off, "a keyboard must not start having picked a hand");
+
+        v.insert("layout.hand".to_string(), "left".to_string());
+        assert_eq!(base.with_settings(&v).half, Side::Left);
+        v.insert("layout.hand".to_string(), "right".to_string());
+        assert_eq!(base.with_settings(&v).half, Side::Right);
+        v.insert("layout.hand".to_string(), "off".to_string());
+        assert_eq!(base.with_settings(&v).half, Side::Off);
+
+        // The panel offers exactly these three, so a value it can produce is always one the
+        // renderer understands.
+        let s = crate::settings_model::SETTINGS.iter().find(|s| s.key == "layout.hand").expect("offered");
+        for value in s.values {
+            v.insert("layout.hand".to_string(), (*value).to_string());
+            let _ = base.with_settings(&v);
+        }
+        assert_eq!(s.values.len(), 3);
+    }
+
+    /// A config written by a newer build must not silently undo a setting this build does
+    /// understand.
+    #[test]
+    fn unknown_settings_and_values_are_ignored_not_reset() {
+        use crate::halfboard::Side;
+        let mut v = std::collections::HashMap::new();
+        let base = Style { half: Side::Left, ..Style::default() };
+
+        // A value from the future: keep what we had rather than falling to Off.
+        v.insert("layout.hand".to_string(), "arc-bottom-left".to_string());
+        assert_eq!(base.with_settings(&v).half, Side::Left, "an unknown value reset the setting");
+
+        // A key from the future: no effect, and the rest still applies.
+        v.clear();
+        v.insert("layout.thumb_polygon".to_string(), "…".to_string());
+        v.insert("layout.hand".to_string(), "right".to_string());
+        assert_eq!(base.with_settings(&v).half, Side::Right);
+
+        // An empty map changes nothing at all.
+        assert_eq!(base.with_settings(&Default::default()).half, Side::Left);
     }
 
     /// `AppearanceConfig` has carried these since the GTK build and `settings::ready`
