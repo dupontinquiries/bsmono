@@ -101,6 +101,8 @@ pub mod two_pane;
 pub mod layout_probe;
 /// Render a frame to pixels in a test and assert properties of the picture.
 pub mod uiverify;
+/// A UI audit an agent can run in a loop: findings with stable ids, and a fixed/introduced diff.
+pub mod uxaudit;
 pub mod overlay;
 // Text inputs that cannot be built without an id — see the module docs for
 // why this is a kit concern and not a per-app one (the single-character

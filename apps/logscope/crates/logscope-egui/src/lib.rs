@@ -92,6 +92,8 @@ pub mod assets;
 pub mod mediagen;
 /// Image IN: pairing a vision projector with its model, and the command that follows.
 pub mod visionpair;
+/// The UX audit as a tool a worker bee can loop against.
+pub mod uxloop;
 pub mod decode;
 pub mod voice_dict;
 #[macro_use] pub mod log;
