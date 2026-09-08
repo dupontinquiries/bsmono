@@ -156,8 +156,15 @@ pub fn compare(before: &Attempt, after: &Attempt) -> Diff {
         lines.push(format!("asymmetry {:.0}% -> {:.0}%", a.asymmetry * 100.0, b.asymmetry * 100.0));
         // A LITTLE asymmetry is better than none -- perfect mirror
         // symmetry is the stiffness. Too much is a mistake.
+        // WEIGHTED ABOVE THE OTHERS. Asymmetry is the fault that was
+        // named directly -- "the pose is too symmetrical" -- and it is
+        // measured on the whole shape. Silhouette steps is a PROXY for
+        // how much there is to look at, and a noisy one: adding a lean
+        // scored +1 for asymmetry and -1 for steps and came out "about
+        // the same", which is not a judgement anyone would make looking
+        // at the two figures.
         let good = |x: f32| if (0.03..0.35).contains(&x) { 1 } else { 0 };
-        score += good(b.asymmetry) - good(a.asymmetry);
+        score += 2 * (good(b.asymmetry) - good(a.asymmetry));
     }
     if b.steps != a.steps {
         lines.push(format!("silhouette steps {} -> {}", a.steps, b.steps));

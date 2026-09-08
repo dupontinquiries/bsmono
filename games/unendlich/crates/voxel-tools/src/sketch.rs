@@ -173,7 +173,14 @@ pub enum Rel {
     /// means the offset includes its whole reach -- a pair of arms
     /// ended up nineteen blocks out from a body eleven wide. A limb
     /// needs a joint, not a bounding box.
-    Joint { at: f32, out: f32, pair: bool },
+    /// `contra` is CONTRAPPOSTO: how much the second of a pair differs
+    /// from the first. 0 is an exact mirror, which is what a pair
+    /// always was and is the stiffness itself -- the reference
+    /// critique's first complaint about its own statue was "the pose
+    /// is too symmetrical". A real standing figure bears its weight on
+    /// one leg; that hip rides high, the shoulders counter-tilt, and
+    /// nothing about it mirrors.
+    Joint { at: f32, out: f32, pair: bool, contra: f32 },
     /// Put it at an OFFSET from the anchor, in blocks. The one
     /// relation that is a position, and it exists because a solver
     /// upstream has already decided where things go: a room layout
@@ -249,6 +256,10 @@ pub struct Placed {
     /// right arm reaching forward is a left arm reaching forward, not
     /// a left arm reaching backward.
     pub mirror_extra: bool,
+    /// How far the mirrored copy departs from a true mirror. `None` is
+    /// an exact mirror; a value tilts the copy's own heading too, so a
+    /// contrapposto leg does not merely sit higher, it angles.
+    pub lean_extra: Option<f32>,
     /// For a `link`: the two ends it spans. A link has no size of its
     /// own -- its whole shape is where it goes -- so without this it
     /// resolved to a point and drew nothing.
@@ -369,6 +380,7 @@ pub fn parse(src: &str) -> (Sketch, Vec<String>) {
                         at: kv(&t, "at").unwrap_or(0.5),        // 0 base, 1 top of the object
                         out: kv(&t, "out").unwrap_or(0.8),      // how far toward its edge
                         pair: t.contains(&"pair") || t.contains(&"both"),
+                        contra: kv(&t, "contra").unwrap_or(0.0).clamp(-1.0, 1.0),
                     },
                     "pair" | "either_side" | "eitherside" | "both_sides" =>
                         Rel::PairAcross { by: kv(&t, "by").unwrap_or(0.0) },
@@ -439,6 +451,7 @@ pub fn resolve_grounded(s: &Sketch, anchor: (i32, i32, i32),
     let mut extra: BTreeMap<String, Vec<(f32, f32, f32)>> = BTreeMap::new();
     let mut spans: BTreeMap<String, ((f32, f32, f32), (f32, f32, f32))> = BTreeMap::new();
     let mut mirrored: BTreeSet<String> = BTreeSet::new();
+    let mut leaned: BTreeSet<String> = BTreeSet::new();
     let by_name: BTreeMap<&str, &Part> = s.parts.iter().map(|p| (p.name.as_str(), p)).collect();
     // prior parts seed the position map, so a relation naming one resolves
     for (n, (_, at)) in prior {
@@ -498,7 +511,7 @@ pub fn resolve_grounded(s: &Sketch, anchor: (i32, i32, i32),
                     extra.insert(a.clone(), copies);
                     first
                 }
-                Rel::Joint { at, out, pair } => {
+                Rel::Joint { at, out, pair, contra } => {
                     // The joint: up the object by `at`, out toward its
                     // side by `out`. The limb's own reach is not part of
                     // the offset -- it swings from here. Since a shape
@@ -508,8 +521,16 @@ pub fn resolve_grounded(s: &Sketch, anchor: (i32, i32, i32),
                     let y = bp.1 - bext[1] + bext[1] * 2.0 * at.clamp(0.0, 1.0) + reach(&pa.shape).1 * 0.5;
                     let x = bext[0] * out.clamp(-2.0, 2.0);
                     if *pair {
-                        extra.insert(a.clone(), vec![(bp.0 + x, y, bp.2)]);
+                        // CONTRAPPOSTO. The second of the pair is
+                        // raised and drawn in, and the pair is no
+                        // longer a mirror: one hip rides high, one
+                        // shoulder drops. A figure whose halves match
+                        // exactly reads as a diagram of a figure.
+                        let lift = contra * bext[1] * 0.18;
+                        let draw = contra * bext[0] * 0.22;
+                        extra.insert(a.clone(), vec![(bp.0 + x - draw, y + lift, bp.2 + draw * 0.5)]);
                         mirrored.insert(a.clone());
+                        if contra.abs() > 0.01 { leaned.insert(a.clone()); }
                     }
                     (bp.0 - x, y, bp.2)
                 }
@@ -608,6 +629,11 @@ pub fn resolve_grounded(s: &Sketch, anchor: (i32, i32, i32),
                 .map(|c| (c.0.round() as i32, c.1.round() as i32, c.2.round() as i32)).collect())
                 .unwrap_or_default(),
             mirror_extra: mirrored.contains(&p.name),
+            lean_extra: leaned.contains(&p.name).then(|| {
+                s.rels.iter().find_map(|(a, r, _)| match r {
+                    Rel::Joint { contra, .. } if *a == p.name => Some(*contra), _ => None })
+                    .unwrap_or(0.0)
+            }),
             span: spans.get(&p.name).map(|(a, b)| (
                 (a.0.round() as i32, a.1.round() as i32, a.2.round() as i32),
                 (b.0.round() as i32, b.1.round() as i32, b.2.round() as i32))),
@@ -654,6 +680,17 @@ fn set_len(s: &Shape, l: f32) -> Shape {
         Shape::Spine { r, r2, dir, arch, segments, .. } =>
             Shape::Spine { r: *r, r2: *r2, len: l, dir: *dir, arch: *arch, segments: *segments },
         Shape::Cylinder { r, .. } => Shape::Cylinder { r: *r, h: l },
+        other => other.clone(),
+    }
+}
+
+/// A shape's heading nudged by `deg`, for the leaning half of a pair.
+fn tilt(s: &Shape, deg: f32) -> Shape {
+    match s {
+        Shape::Capsule { r, r2, len, dir, pitch } =>
+            Shape::Capsule { r: *r, r2: *r2, len: *len, dir: *dir, pitch: pitch + deg },
+        Shape::Spine { r, r2, len, dir, arch, segments } =>
+            Shape::Spine { r: *r, r2: *r2, len: *len, dir: dir + deg, arch: *arch, segments: *segments },
         other => other.clone(),
     }
 }
@@ -728,6 +765,9 @@ pub fn cells(p: &Placed, block: u16) -> Vec<(i32, i32, i32, u16)> {
             // same way
             let mut m = p.clone();
             m.shape = flip_x(&p.shape);
+            // and tilt its heading, so the copy is posed rather than
+            // reflected: a raised hip carries an angled thigh with it
+            if let Some(c) = p.lean_extra { m.shape = tilt(&m.shape, c * 12.0); }
             out.extend(cells_at(&m, *at, block));
         } else {
             out.extend(cells_at(p, *at, block));
@@ -1239,5 +1279,55 @@ mod tests {
         assert!(fillet(&far_a, &far_b, 4).is_empty());
         // and empty input is not a crash
         assert!(fillet(&[], &far_b, 3).is_empty());
+    }
+
+    #[test]
+    fn contrapposto_breaks_the_mirror_that_made_every_figure_stiff() {
+        // The reference critique's first complaint about its own statue
+        // was "the pose is too symmetrical". `pair` mirrored EXACTLY,
+        // so every figure this crate made scored a perfect zero on the
+        // asymmetry measure and nothing noticed.
+        let src = |c: &str| format!(
+            "part torso capsule r=5 r2=4 len=20 pitch=90 material=stone\n\
+             part leg capsule r=2.5 r2=2 len=22 dir=190 pitch=-84 material=stone\n\
+             rel torso above ground by=22\n\
+             rel leg joint torso at=0.05 out=0.55 pair{c}\n\
+             rel leg reaches ground\n");
+        let cells_of = |c: &str| {
+            let (sk, errs) = parse(&src(c));
+            assert!(errs.is_empty(), "{errs:?}");
+            let (placed, _) = resolve(&sk, (0, 64, 0));
+            let mut set = BTreeSet::new();
+            for p in &placed { for x in cells(p, 1) { set.insert((x.0, x.1, x.2)); } }
+            set
+        };
+        let mirror = cells_of("");
+        let posed = cells_of(" contra=0.6");
+        let asym = |s: &BTreeSet<(i32, i32, i32)>| crate::bench::measure(s).asymmetry;
+        assert!(asym(&mirror) < 0.02, "a plain pair is an exact mirror: {}", asym(&mirror));
+        assert!(asym(&posed) > 0.05, "contrapposto is not: {}", asym(&posed));
+        // and the bench agrees it is an improvement
+        let a = crate::bench::Attempt { label: "mirror".into(), source: String::new(),
+                                        cells: mirror, notes: vec![] };
+        let b = crate::bench::Attempt { label: "posed".into(), source: String::new(),
+                                        cells: posed, notes: vec![] };
+        assert_eq!(crate::bench::compare(&a, &b).better, Some(true),
+                   "{}", crate::bench::compare(&a, &b).summary());
+    }
+
+    #[test]
+    fn contrapposto_of_zero_is_exactly_what_a_pair_always_was() {
+        // nothing that did not ask for a lean changes
+        let base = "part t capsule r=4 r2=4 len=16 pitch=90 material=stone\n\
+                    part arm capsule r=2 r2=1.5 len=10 dir=200 pitch=-50 material=stone\n\
+                    rel t above ground by=10\n\
+                    rel arm joint t at=0.8 out=1.0 pair";
+        let of = |s: &str| {
+            let (sk, _) = parse(&format!("{s}\n"));
+            let (placed, _) = resolve(&sk, (0, 64, 0));
+            placed.iter().flat_map(|p| cells(p, 1)).collect::<Vec<_>>()
+        };
+        assert_eq!(of(base), of(&format!("{base} contra=0")));
+        assert_ne!(of(base), of(&format!("{base} contra=0.5")));
     }
 }

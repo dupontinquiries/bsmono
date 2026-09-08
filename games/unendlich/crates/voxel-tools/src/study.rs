@@ -460,10 +460,22 @@ pub fn to_sketch(st: &Study, height: i32, material: &str) -> String {
 ");
     if neck > 0.01 { out.push_str("rel neck on torso
 "); }
-    out.push_str("rel arm joint torso at=0.88 out=1.3 pair
-");
-    out.push_str("rel leg joint torso at=0.05 out=0.55 pair
-");
+    // CONTRAPPOSTO from the pose. A study that says the weight is on
+    // one leg has described an asymmetric figure, and building it as
+    // an exact mirror throws that away -- which is what made every
+    // figure here stiff.
+    let p = st.pose.join(" ").to_lowercase();
+    let contra = if p.contains("contrapposto") { 0.8 }
+        else if p.contains("weight") || p.contains("bearing") || p.contains("strid")
+             || p.contains("lunge") || p.contains("step") { 0.55 }
+        else if p.contains("symmetric") || p.contains("frontal") || p.contains("rigid") { 0.0 }
+        // a standing figure is never perfectly even; a little is the
+        // honest default, and zero is the thing being fixed
+        else { 0.25 };
+    // the shoulders counter-tilt against the hips, which is what
+    // contrapposto IS -- so the arm's lean is the opposite sign
+    out.push_str(&format!("rel arm joint torso at=0.88 out=1.3 pair contra={:.2}\n", -contra));
+    out.push_str(&format!("rel leg joint torso at=0.05 out=0.55 pair contra={contra:.2}\n"));
     out.push_str("rel leg reaches ground
 ");
     extras = 0;
@@ -980,5 +992,40 @@ mod tests {
             let names: Vec<String> = sk.parts.iter().map(|p| p.name.clone()).collect();
             assert!(shapes.insert(names.join(",")), "{plan:?} is the same shape as another plan");
         }
+    }
+
+    #[test]
+    fn a_pose_that_names_a_bearing_leg_produces_an_asymmetric_figure() {
+        // "weight through the left leg" describes an asymmetric figure,
+        // and building it as an exact mirror throws that away
+        let asym_of = |pose: &str| {
+            let mut s = Study::default();
+            absorb(&mut s, Rung::Subject, "SUBJECT: a standing figure\n");
+            absorb(&mut s, Rung::Anatomy, "PARTS: head 12%; torso 32%; arm 34%; leg 46%\nWIDTH: 26%\n");
+            if !pose.is_empty() { absorb(&mut s, Rung::Pose, &format!("POSE: {pose}\n")); }
+            let (sk, errs) = crate::sketch::parse(&to_sketch(&s, 60, "stone"));
+            assert!(errs.is_empty(), "{pose}: {errs:?}");
+            let (placed, _) = crate::sketch::resolve(&sk, (0, 64, 0));
+            let mut cells = std::collections::BTreeSet::new();
+            for p in &placed { for c in crate::sketch::cells(p, 1) { cells.insert((c.0, c.1, c.2)); } }
+            crate::bench::measure(&cells).asymmetry
+        };
+        let weighted = asym_of("weight through the left leg, striding");
+        let rigid = asym_of("frontal and symmetric, rigid");
+        let plain = asym_of("");
+        assert!(weighted > 0.04, "a bearing leg leans: {weighted}");
+        assert!(rigid < 0.02, "and a pose that asks for rigid symmetry gets it: {rigid}");
+        // Even with no pose stated a standing figure is not a mirror.
+        // Zero is the thing being fixed.
+        assert!(plain > 0.005, "{plain}");
+        // NOT ASSERTED, and worth saying why: that MORE lean gives MORE
+        // measured asymmetry. It does not, reliably. `bench::measure`
+        // mirrors about the bounding box's own centre, and a large
+        // lean MOVES that box -- so the plane re-centres on the leaning
+        // shape and some of the asymmetry measures out. A 0.55 lean
+        // scored 0.098 where a 0.25 lean scored 0.118. The measure is
+        // honest about what it measures; it is the wrong instrument for
+        // ranking degrees of lean, and a mass-centroid plane would be
+        // the right one.
     }
 }
