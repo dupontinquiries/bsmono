@@ -195,6 +195,14 @@ MUTANTS = [
     ("mp4/box-past-limit-allowed", "crates/vidkit-mp4/src/boxes.rs",
      "    if end > limit {", "    if false {"),
 
+    ("battery/caps-ignored", "crates/vidkit-core/src/caps.rs",
+     "        if !self.on_battery {", "        if true {"),
+    ("battery/short-edge-not-scaled", "crates/vidkit-core/src/caps.rs",
+     "        let scaled_short = ((short as u64 * cap as u64) / long as u64).max(1) as u32;",
+     "        let scaled_short = short;"),
+    ("battery/fps-not-capped", "crates/vidkit-core/src/caps.rs",
+     "        (cap, scaled_short, self.display_max_hz.min(self.battery_max_hz))",
+     "        (cap, scaled_short, self.display_max_hz)"),
     # --- battery -------------------------------------------------------------
     ("battery/idle-does-not-stop-repaints", "crates/vidkit-egui/src/presenter.rs",
      "    pub fn idle(&mut self) {\n        self.deadline = None;\n    }", "    pub fn idle(&mut self) {}"),

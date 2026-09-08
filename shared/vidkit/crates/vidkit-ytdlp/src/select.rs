@@ -166,11 +166,12 @@ fn evaluate(f: &RawFormat, caps: &DeviceCaps) -> Verdict {
     // Clamp to the panel. A phone in portrait still plays landscape video, so
     // compare against the larger and smaller dimensions rather than assuming
     // an orientation.
-    let (dl, ds) = {
-        let a = b.display_width.max(b.display_height);
-        let c = b.display_width.min(b.display_height);
-        (a, c)
-    };
+    //
+    // On battery this is the panel as the battery caps see it -- a smaller,
+    // slower screen -- which is where `on_battery` finally does something. It
+    // is applied here rather than as a scoring penalty so it composes with the
+    // clamp instead of fighting it.
+    let (dl, ds, max_hz) = b.effective_display();
     let (sl, ss) = (w.max(h), w.min(h));
     let effective_pixels = (sl.min(dl) as u64) * (ss.min(ds) as u64);
 
@@ -178,7 +179,7 @@ fn evaluate(f: &RawFormat, caps: &DeviceCaps) -> Verdict {
         cost: path.cost,
         effective_pixels,
         source_pixels: (w as u64) * (h as u64),
-        effective_fps: fps.min(b.display_max_hz),
+        effective_fps: fps.min(max_hz),
         bitrate_bps: bps,
         profile,
     })

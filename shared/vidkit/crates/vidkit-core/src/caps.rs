@@ -113,8 +113,22 @@ pub struct PlaybackBudget {
     pub display_max_hz: u32,
     /// Hard ceiling in bits/sec, or `None` for unmetered.
     pub max_bitrate: Option<u64>,
-    /// On battery: weight `Cost` much more heavily than resolution.
+    /// On battery, apply the caps below before scoring.
+    ///
+    /// This used to be a field nobody read, with a doc comment claiming it
+    /// weighted cost over resolution. It did not; selection ignored it
+    /// entirely, so a phone unplugged picked exactly what it picked plugged in.
     pub on_battery: bool,
+    /// Longest edge to fetch when on battery.
+    ///
+    /// Decode cost tracks pixels per second, so this is the biggest lever
+    /// there is: 1080p60 down to 720p30 is a 4.5x cut in pixel throughput, and
+    /// on a hand-held panel most of that resolution is past what the eye
+    /// resolves anyway. 1280 is a defensible default rather than a measured
+    /// one — set it to 854 for the 480p policy, or to u32::MAX to disable.
+    pub battery_max_long_edge: u32,
+    /// Frame rate ceiling when on battery.
+    pub battery_max_hz: u32,
     /// Presenter can display >8 bit / wide gamut end to end.
     pub hdr_capable: bool,
 }
@@ -127,8 +141,35 @@ impl Default for PlaybackBudget {
             display_max_hz: 60,
             max_bitrate: None,
             on_battery: false,
+            battery_max_long_edge: 1280,
+            battery_max_hz: 30,
             hdr_capable: false,
         }
+    }
+}
+
+impl PlaybackBudget {
+    /// The display constraints to score against, after the battery caps.
+    ///
+    /// Returns `(long_edge, short_edge, max_hz)`. Expressed as a clamp on the
+    /// *display* rather than as a penalty in the scoring, so it composes with
+    /// the existing resolution clamp instead of fighting it: on battery the
+    /// player simply behaves as though it had a smaller, slower screen.
+    pub fn effective_display(&self) -> (u32, u32, u32) {
+        let long = self.display_width.max(self.display_height);
+        let short = self.display_width.min(self.display_height);
+        if !self.on_battery {
+            return (long, short, self.display_max_hz);
+        }
+        let cap = self.battery_max_long_edge.max(1);
+        if long <= cap {
+            return (long, short, self.display_max_hz.min(self.battery_max_hz));
+        }
+        // Scale the short edge with the long one, so the aspect the clamp
+        // implies stays the panel's. Scaling only the long edge would let a
+        // portrait phone still ask for full-height video.
+        let scaled_short = ((short as u64 * cap as u64) / long as u64).max(1) as u32;
+        (cap, scaled_short, self.display_max_hz.min(self.battery_max_hz))
     }
 }
 
@@ -231,6 +272,8 @@ pub fn asahi_m_series() -> DeviceCaps {
             display_max_hz: 60,
             max_bitrate: None,
             on_battery: true,
+            battery_max_long_edge: 1280,
+            battery_max_hz: 30,
             hdr_capable: true,
         },
     }
@@ -304,6 +347,8 @@ pub fn fairphone_venus() -> DeviceCaps {
             display_max_hz: 90,
             max_bitrate: Some(6_000_000),
             on_battery: true,
+            battery_max_long_edge: 1280,
+            battery_max_hz: 30,
             hdr_capable: false,
         },
     }
@@ -353,6 +398,8 @@ pub fn desktop_full_hw() -> DeviceCaps {
             display_max_hz: 144,
             max_bitrate: None,
             on_battery: false,
+            battery_max_long_edge: 1280,
+            battery_max_hz: 30,
             hdr_capable: true,
         },
     }
@@ -479,6 +526,100 @@ mod tests {
         let d = fairphone_no_venus();
         assert!(!d.caps.iter().any(|c| c.cost.is_hardware()));
         assert!(d.caps.iter().all(|c| c.delivery == Delivery::CpuPlanes));
+    }
+
+    #[test]
+    fn off_battery_the_panel_is_reported_as_it_is() {
+        let b = PlaybackBudget {
+            display_width: 1080,
+            display_height: 2340,
+            display_max_hz: 90,
+            on_battery: false,
+            ..Default::default()
+        };
+        assert_eq!(b.effective_display(), (2340, 1080, 90));
+    }
+
+    /// The lever: decode cost tracks pixels per second, so unplugging a phone
+    /// should make it behave like a smaller, slower screen.
+    #[test]
+    fn on_battery_the_panel_shrinks_and_slows() {
+        let b = PlaybackBudget {
+            display_width: 1080,
+            display_height: 2340,
+            display_max_hz: 90,
+            on_battery: true,
+            battery_max_long_edge: 1280,
+            battery_max_hz: 30,
+            ..Default::default()
+        };
+        let (long, short, hz) = b.effective_display();
+        assert_eq!(long, 1280);
+        assert_eq!(hz, 30);
+        // The short edge scales with the long one, so the clamp keeps the
+        // panel's aspect. Leaving it alone would let a portrait phone still
+        // ask for full-height video.
+        assert_eq!(short, 1080 * 1280 / 2340);
+
+        // 2340x1080 at 90 Hz against 1280x590 at 30: about a nine-fold cut in
+        // pixels per second, which is the whole point.
+        let before = 2340u64 * 1080 * 90;
+        let after = long as u64 * short as u64 * hz as u64;
+        assert!(before / after >= 8, "only a {}x cut", before / after);
+    }
+
+    #[test]
+    fn a_panel_already_under_the_cap_is_left_alone_but_still_slowed() {
+        let b = PlaybackBudget {
+            display_width: 854,
+            display_height: 480,
+            display_max_hz: 60,
+            on_battery: true,
+            ..Default::default()
+        };
+        assert_eq!(b.effective_display(), (854, 480, 30));
+    }
+
+    /// The 480p policy the caps exist to express.
+    #[test]
+    fn the_cap_is_tunable_down_to_480p() {
+        let b = PlaybackBudget {
+            display_width: 1080,
+            display_height: 2340,
+            on_battery: true,
+            battery_max_long_edge: 854,
+            ..Default::default()
+        };
+        assert_eq!(b.effective_display().0, 854);
+    }
+
+    /// ...and disabling it must be possible, or a plugged-in laptop that
+    /// happens to report battery gets crippled.
+    #[test]
+    fn the_cap_can_be_disabled() {
+        let b = PlaybackBudget {
+            display_width: 3840,
+            display_height: 2160,
+            display_max_hz: 144,
+            on_battery: true,
+            battery_max_long_edge: u32::MAX,
+            battery_max_hz: u32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(b.effective_display(), (3840, 2160, 144));
+    }
+
+    #[test]
+    fn a_zero_cap_does_not_divide_by_zero_or_collapse_to_nothing() {
+        let b = PlaybackBudget {
+            display_width: 1920,
+            display_height: 1080,
+            on_battery: true,
+            battery_max_long_edge: 0,
+            ..Default::default()
+        };
+        let (long, short, _) = b.effective_display();
+        assert!(long >= 1 && short >= 1, "collapsed to {long}x{short}");
     }
 
     #[test]

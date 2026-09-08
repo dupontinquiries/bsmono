@@ -37,7 +37,10 @@ mod tests {
         {"format_id":"137-hi","url":"https://x/137hi","ext":"mp4","vcodec":"avc1.640028",
          "acodec":"none","width":1920,"height":1080,"fps":30,"vbr":8500.0,
          "protocol":"https","dynamic_range":"SDR"},
-        {"format_id":"248","url":"https://x/248","ext":"webm","vcodec":"vp09.00.40.08",
+        {"format_id":"247","url":"https://x/247","ext":"webm","vcodec":"vp09.00.31.08",
+         "acodec":"none","width":1280,"height":720,"fps":30,"vbr":1400.0,
+         "protocol":"https","dynamic_range":"SDR"},
+                {"format_id":"248","url":"https://x/248","ext":"webm","vcodec":"vp09.00.40.08",
          "acodec":"none","width":1920,"height":1080,"fps":30,"vbr":2800.0,
          "protocol":"https","dynamic_range":"SDR"},
         {"format_id":"399","url":"https://x/399","ext":"mp4","vcodec":"av01.0.08M.08",
@@ -65,7 +68,7 @@ mod tests {
     #[test]
     fn fixture_parses() {
         let p = probe_fixture();
-        assert_eq!(p.formats.len(), 11);
+        assert_eq!(p.formats.len(), 12);
         assert_eq!(p.duration, Some(212.0));
     }
 
@@ -149,6 +152,69 @@ mod tests {
             (chosen.width, chosen.height),
             (Some(1920), Some(1080)),
             "clamped to the panel; got {}",
+            s.summary
+        );
+    }
+
+    /// Unplugging the phone must change what it fetches. Before the battery
+    /// caps were wired in, `on_battery` was a field nobody read and this test
+    /// would have found the same format either way.
+    #[test]
+    fn a_phone_on_battery_picks_a_smaller_stream_than_the_same_phone_plugged_in() {
+        let p = probe_fixture();
+
+        let mut plugged = fairphone_venus();
+        plugged.budget.on_battery = false;
+        let a = select(&p, &plugged, None).unwrap();
+
+        let battery = fairphone_venus(); // on_battery is true in the profile
+        assert!(battery.budget.on_battery);
+        let b = select(&p, &battery, None).unwrap();
+
+        let pixels = |s: &Selection| {
+            let f = p
+                .formats
+                .iter()
+                .find(|f| f.format_id == s.video_format_id)
+                .unwrap();
+            (f.width.unwrap_or(0) as u64) * (f.height.unwrap_or(0) as u64)
+        };
+        // Strictly smaller, not merely "not bigger": `<=` is satisfied when the
+        // cap does nothing at all, which is exactly what it did before this
+        // was wired up.
+        //
+        // The mechanism is worth stating. The cap does not penalise big
+        // streams directly -- it shrinks the panel, so 720p and 1080p CLAMP to
+        // the same effective pixels, and the existing source-pixel tiebreak
+        // then prefers the one that costs less to decode.
+        assert!(
+            pixels(&b) < pixels(&a),
+            "on battery it chose the same or a bigger stream: {} vs {}",
+            b.summary,
+            a.summary
+        );
+        assert!(
+            b.score.effective_fps <= 30,
+            "frame rate not capped on battery: {}",
+            b.score.effective_fps
+        );
+    }
+
+    /// The 480p policy, expressed through the same knob.
+    #[test]
+    fn a_480p_battery_cap_rejects_everything_larger() {
+        let p = probe_fixture();
+        let mut d = fairphone_venus();
+        d.budget.on_battery = true;
+        d.budget.battery_max_long_edge = 854;
+
+        let s = select(&p, &d, None).unwrap();
+        // Everything is clamped to the 854-wide budget, so the chosen stream
+        // cannot score above that many effective pixels.
+        assert!(
+            s.score.effective_pixels <= 854 * 480,
+            "effective pixels {} exceed the 480p cap: {}",
+            s.score.effective_pixels,
             s.summary
         );
     }
