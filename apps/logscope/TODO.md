@@ -3235,3 +3235,53 @@ actually consumed to allocate a real `wgpu::Buffer`, and check whether that call
 inside something shaped like a retry loop under a different name (possible — this codebase has
 already found a couple of "ported twice, wired once" cases this session) before assuming
 `load_with_downgrade` needs to be threaded in fresh.
+
+---
+
+## Open after the 2026-09-08 session
+
+### chat.rs is still 10,388 lines
+Six cuts done (tests, scene/slab, save format, formatters, dock, `mic_shape`), each verified
+by the test count staying at exactly 1422. What remains needs judgement rather than a script,
+because each couples to `Chat`:
+
+- [ ] `run_command`'s match — the biggest single block, and the one most likely to want a
+      `chat_commands.rs` with the handlers as free functions taking `&mut Chat`.
+- [ ] The message store and `Msg`'s impls.
+- [ ] The remaining physui glue that did not move with the dock.
+
+Do them one at a time with the tests run in between. The false start worth not repeating: my
+first cut took "everything after the first `#[cfg(test)]` past line 10,000" and swept up
+`graph_path` and `scene_light`, which are live functions defined BELOW a test module.
+
+### Animations
+Done: right-page cross-fade, engine-log line stagger, engine-badge flash on change, and (in
+the kit, so every app gets them) `cross_fade`, `stagger`, `dropdown_in`, `flash_on_change`,
+`reduce_motion`/`dur`.
+
+- [ ] Chat message entrance. The transcript's draw loop is deep in `chat.rs` and I did not
+      want to guess at the seam; doing the `run_command` split above will surface it.
+- [ ] Code-block reveal.
+- [ ] Tab-strip selection glide. `selectable_label` paints its own background, so this needs
+      custom painting rather than a wrapper.
+- [ ] NOT the streaming reply's tokens: `reveal_shown_len` / `reveal_held_ms` already pace
+      that, and a second mechanism animating the same text would fight it.
+
+### Padding and spacing
+- [ ] Named constants for the panel spacings, as its own pass. It was deliberately not
+      smuggled in beside the animation work.
+
+### engine_knobs
+- [ ] `apply` on reload is still unwired; the panel section draws but changes need a
+      settings-kit store to persist.
+
+### The uiverify / menu_ui disagreement
+- [ ] `bleed_through` reports 100% of `menu_ui`'s ink bounds changing with the background,
+      while `menu_ui` draws through `egui::Frame::popup`, which should occlude. Either the
+      popup frame is not opaque in this style or the rasteriser mishandles the `Area`'s
+      layer. The two-pixel probe that settles it is described in `uikit-egui/src/menu.rs`.
+
+### UX audit loop
+`uxloop` is built (stable finding ids, fixed/introduced diff, a baseline in the state dir).
+- [ ] Point it at real logscope surfaces and check the findings are worth acting on before
+      handing it to a worker bee. A tool whose first output is noise gets ignored.

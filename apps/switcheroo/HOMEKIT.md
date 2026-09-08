@@ -363,3 +363,39 @@ the event drain, BEFORE the hub consumes them. Without that the backoff never en
 accessory stays stale, is picked again next tick, and holds the radio.
 
 Pure: every decision takes the clock as an argument. No timers, no radio, no I/O.
+
+---
+
+## STILL TO DO — switching a Wemo plug on and off (2026-09-08)
+
+Asked directly: *"keep enabling homekit wemo plugs on and off via BLE"*. Reading is wired —
+adverts, GSN change detection, pairing, and the refresh scheduler above. WRITING is not, and
+the gap is one specific piece.
+
+### The blocker: the Broadcast Encryption Key
+
+A HomeKit BLE characteristic write is encrypted with a session key derived after pairing.
+`hap-core` parses adverts and tracks GSN; it does not derive that key, and the derivation
+(HKDF over the pairing result, with the nonce discipline that goes with it) needs the spec
+open beside it. Guessing at an HKDF salt produces writes the accessory silently ignores,
+which is indistinguishable from a plug that is out of range — so this is not a thing to
+approximate.
+
+### The order to do it in
+
+- [ ] Derive the Broadcast Encryption Key from the pairing, with the spec open. Test against
+      a known vector before touching a radio.
+- [ ] Nonce handling: the GSN is part of it, and `GsnTracker` already has the number.
+      Reusing a nonce is worse than failing to write.
+- [ ] One characteristic write, to the on/off characteristic of a paired plug.
+- [ ] Feed the result back through `Refresher` the way reads already are — a write that
+      changes state should mark the row fresh, not leave it stale until the next poll.
+- [ ] Only then: the UI affordance. A toggle that writes optimistically and cannot tell
+      whether the write landed is worse than a row that says "changed at the plug — refresh
+      to read it", which is what exists today.
+
+### Why the read path is the right foundation
+
+`Event::AccessoryChanged` already marks a row stale when the plug is switched at the wall.
+Once writes land, the SAME signal confirms one worked — the accessory bumps its GSN and
+advertises, which the tracker already notices. Nothing new is needed on the read side.
