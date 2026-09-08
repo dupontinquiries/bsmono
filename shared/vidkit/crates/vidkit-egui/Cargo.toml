@@ -32,6 +32,9 @@ vidkit-webm = { path = "../vidkit-webm", features = ["fixtures"] }
 
 [features]
 demo = ["dep:eframe"]
+# NV12 upload + shader conversion through an egui_glow paint callback. Needs
+# eframe for its glow/egui_glow re-exports, same as scene-kit's `glow` feature.
+glow-upload = ["dep:eframe"]
 
 [[example]]
 name = "video_demo"

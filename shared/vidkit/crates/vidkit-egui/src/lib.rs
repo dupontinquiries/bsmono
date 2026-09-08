@@ -25,6 +25,10 @@
 
 pub mod bar;
 pub mod fit;
+/// GPU upload path: NV12 planes plus a conversion shader, 2.7x less bus
+/// traffic than the RGBA8 upload in [`presenter`]. Needs a glow context.
+#[cfg(feature = "glow-upload")]
+pub mod glow_present;
 pub mod gestures;
 pub mod presenter;
 pub mod view;
