@@ -40,6 +40,80 @@
 
 use std::collections::BTreeMap;
 
+/// How a body is arranged. The proportions say how big the parts are;
+/// this says where they go, and it is the question that was never
+/// asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BodyPlan {
+    /// Upright, two legs under a torso, arms at the shoulders, head on
+    /// top. A person, a god, a statue of either.
+    #[default]
+    Biped,
+    /// Four legs splayed from a low horizontal body, head at the front.
+    /// A frog, a horse, a lion, a dog.
+    Quadruped,
+    /// A long body with no legs: a snake, a worm, a dragon in flight.
+    Serpentine,
+    /// A body with wings as the dominant feature.
+    Winged,
+    /// No body plan at all -- a mass with features on it. A face in a
+    /// cliff, an object, a machine.
+    Mass,
+}
+
+impl BodyPlan {
+    pub fn parse(s: &str) -> Option<BodyPlan> {
+        let l = s.to_lowercase();
+        let has = |w: &str| l.split(|c: char| !c.is_alphanumeric()).any(|x| x == w);
+        // ORDER MATTERS: a winged quadruped is winged, and a serpentine
+        // dragon with wings is winged before it is serpentine, because
+        // the dominant feature is what a silhouette shows.
+        if has("winged") || has("wings") || has("bird") || has("wing") { return Some(BodyPlan::Winged); }
+        if has("serpentine") || has("snake") || has("serpent") || has("worm") || has("eel") {
+            return Some(BodyPlan::Serpentine);
+        }
+        if has("quadruped") || has("four") || has("fourlegged") || has("squat")
+            || has("crouching") || has("beast") || has("animal") {
+            return Some(BodyPlan::Quadruped);
+        }
+        if has("biped") || has("upright") || has("standing") || has("human")
+            || has("humanoid") || has("person") { return Some(BodyPlan::Biped); }
+        if has("mass") || has("object") || has("none") { return Some(BodyPlan::Mass); }
+        None
+    }
+    pub fn name(self) -> &'static str {
+        match self { BodyPlan::Biped => "biped", BodyPlan::Quadruped => "quadruped",
+                     BodyPlan::Serpentine => "serpentine", BodyPlan::Winged => "winged",
+                     BodyPlan::Mass => "mass" }
+    }
+}
+
+/// The body plan a subject implies, from its own words. A fallback for
+/// when the model does not answer the PLAN line, and the reason a frog
+/// is not a man even if the anatomy turn says nothing useful.
+pub fn plan_from_subject(subject: &str) -> BodyPlan {
+    let l = subject.to_lowercase();
+    let has = |w: &str| l.split(|c: char| !c.is_alphanumeric()).any(|x| x == w || x == &format!("{w}s"));
+    for w in ["frog", "toad", "horse", "lion", "dog", "wolf", "cat", "bear", "bull", "ox",
+              "deer", "boar", "tiger", "elephant", "cow", "ram", "goat", "sphinx", "beast"] {
+        if has(w) { return BodyPlan::Quadruped; }
+    }
+    for w in ["snake", "serpent", "worm", "eel", "hydra", "leviathan", "naga"] {
+        if has(w) { return BodyPlan::Serpentine; }
+    }
+    for w in ["eagle", "bird", "griffin", "phoenix", "angel", "harpy", "raven", "owl", "hawk"] {
+        if has(w) { return BodyPlan::Winged; }
+    }
+    // a dragon is winged unless it is said not to be
+    if has("dragon") || has("wyvern") {
+        return if l.contains("wingless") { BodyPlan::Serpentine } else { BodyPlan::Winged };
+    }
+    for w in ["orb", "sphere", "cube", "monolith", "obelisk", "machine", "engine", "skull", "head"] {
+        if has(w) { return BodyPlan::Mass; }
+    }
+    BodyPlan::Biped
+}
+
 /// One rung.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Rung { Subject, Anatomy, Pose, Voxelise }
@@ -58,6 +132,13 @@ impl Rung {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Study {
     pub subject: String,
+    /// HOW THE BODY IS ARRANGED. `to_sketch` assumed a standing human
+    /// -- one torso, one head above it, an arm pair at the shoulders,
+    /// a leg pair below -- and built that for everything. Asked for a
+    /// giant frog it produced a man. A frog is squat, four-legged and
+    /// splayed, and no amount of correct PROPORTIONS fixes a body plan
+    /// that is wrong.
+    pub plan: BodyPlan,
     pub facts: BTreeMap<String, String>,
     /// Parts with proportions, as (name, fraction of total height).
     pub parts: Vec<(String, f32)>,
@@ -149,6 +230,8 @@ pub fn absorb(study: &mut Study, rung: Rung, reply: &str) {
                     if !name.is_empty() { study.parts.push((name, frac)); }
                 }
             }
+            "PLAN" | "BODY" | "BODY PLAN" | "ARRANGEMENT" =>
+                if let Some(p) = BodyPlan::parse(rest) { study.plan = p; },
             "POSE" | "ACTION" | "STANCE" => study.pose.extend(parse_pairs(rest)),
             "SILHOUETTE" | "OUTLINE" => study.silhouette = rest.to_string(),
             "KEEP" | "SURVIVES" | "READS" => study.keep.extend(parse_pairs(rest)),
@@ -164,6 +247,12 @@ pub fn absorb(study: &mut Study, rung: Rung, reply: &str) {
         let each = ((1.0 - spoken).max(0.1)) / unpriced as f32;
         for (_, f) in study.parts.iter_mut().filter(|(_, f)| *f <= 0.0) { *f = each; }
         study.notes.push(format!("{unpriced} part(s) had no proportion; shared the remainder"));
+    }
+    // If the model did not say, the SUBJECT says: a frog is a frog
+    // whatever the anatomy turn answered, and defaulting to a man is
+    // how "a giant frog statue" became a giant man.
+    if rung == Rung::Anatomy && study.plan == BodyPlan::Biped {
+        study.plan = plan_from_subject(&study.subject);
     }
     study.parts.truncate(14);
     study.pose.truncate(8);
@@ -197,6 +286,11 @@ Give the PARTS with their PROPORTIONS, as a percentage of the total height. A st
 human figure is about eight heads tall, shoulders two heads across; say what is true of
 THIS subject, which may not be human and may not be standing.
 
+SAY THE BODY PLAN FIRST. A frog is a QUADRUPED -- squat, four legs splayed from a low
+wide body, head at the front, no neck. Building it as a standing human with correct
+proportions still gives a man.
+
+PLAN: <biped, quadruped, serpentine, winged or mass -- how the body is ARRANGED>
 PARTS: head 12%; neck 3%; torso 30%; arm 34%; leg 47%; ...
 WIDTH: <shoulders and hips, as a fraction of the height>
 MASS: <where the weight sits: chest-heavy, long-limbed, squat>
@@ -306,6 +400,15 @@ pub fn to_sketch(st: &Study, height: i32, material: &str) -> String {
     let seg = |span: f32, r: f32| (span - 2.0 * r).max(1.0);
     let stack = head + torso + leg;
     let overlap = ((stack - 1.0).max(0.0) * h).round().max(0.0);
+    // THE BODY PLAN DECIDES THE ARRANGEMENT. A quadruped's torso lies
+    // HORIZONTAL with four legs under it and the head at the front; a
+    // serpent has no legs at all. Emitting an upright torso with an
+    // arm pair for everything is how a giant frog came out a giant
+    // man, and no correction to the proportions could have fixed it.
+    if st.plan != BodyPlan::Biped {
+        return to_sketch_nonhuman(st, height, material, torso_r, blocks(head), blocks(torso),
+                                  blocks(leg), blocks(arm));
+    }
     out.push_str(&format!("part torso capsule r={:.1} r2={:.1} len={} dir=0 pitch=90 material={material}
 ",
                           torso_r, torso_r * 0.78, seg(blocks(torso), torso_r)));
@@ -384,6 +487,100 @@ pub fn to_sketch(st: &Study, height: i32, material: &str) -> String {
     }
     out
 }
+/// Bodies that are not standing people.
+fn to_sketch_nonhuman(st: &Study, height: i32, material: &str, r: f32,
+                      head: f32, torso: f32, leg: f32, arm: f32) -> String {
+    let mut o = format!("# {} ({}) at {height} blocks\n", st.subject, st.plan.name());
+    let seg = |span: f32, rr: f32| (span - 2.0 * rr).max(1.0);
+    match st.plan {
+        BodyPlan::Quadruped => {
+            // A LOW HORIZONTAL BODY. The torso lies along z, the head
+            // is at the FRONT rather than on top, and four legs splay
+            // from it -- the two pairs at different heights on the
+            // body, which is what makes a crouch read as a crouch.
+            let squat = st.pose.join(" ").to_lowercase().contains("squat")
+                || st.pose.join(" ").to_lowercase().contains("crouch")
+                || st.subject.to_lowercase().contains("frog");
+            let leg_r = (r * 0.4).max(1.0);
+            let leg_len = if squat { leg * 0.5 } else { leg };
+            o.push_str(&format!("part body capsule r={:.1} r2={:.1} len={:.0} dir=90 pitch=0 material={material}\n",
+                                r, r * 0.85, seg(torso.max(head * 2.0), r)));
+            o.push_str(&format!("part head sphere r={:.1} material={material}\n", (head / 2.0).max(1.0)));
+            // splayed: a frog's legs go OUT before they go down, which
+            // is the whole silhouette of a frog
+            o.push_str(&format!("part foreleg capsule r={:.1} r2={:.1} len={:.0} dir=215 pitch=-{} material={material}\n",
+                                leg_r, leg_r * 0.7, leg_len, if squat { 45 } else { 78 }));
+            o.push_str(&format!("part hindleg capsule r={:.1} r2={:.1} len={:.0} dir=215 pitch=-{} material={material}\n",
+                                leg_r * 1.25, leg_r * 0.8, leg_len * 1.15, if squat { 38 } else { 80 }));
+            o.push_str(&format!("rel body above ground by={:.0}\n", leg_len * 0.75));
+            o.push_str("rel head joint body at=0.5 out=1.15\n");
+            o.push_str("rel foreleg joint body at=0.35 out=0.9 pair\n");
+            o.push_str("rel hindleg joint body at=0.35 out=0.9 pair\n");
+            o.push_str("rel foreleg reaches ground\nrel hindleg reaches ground\n");
+            let _ = arm;
+        }
+        BodyPlan::Serpentine => {
+            // one long arching body and a head at its end; no limbs
+            o.push_str(&format!("part body spine r={:.1} r2={:.1} len={:.0} dir=90 arch=0.35 segments=10 material={material}\n",
+                                r, r * 0.35, (torso + leg).max(height as f32 * 0.8)));
+            o.push_str(&format!("part head sphere r={:.1} material={material}\n", (head / 2.0).max(1.0)));
+            o.push_str(&format!("rel body above ground by={:.0}\n", r));
+            o.push_str("rel head joint body at=0.95 out=0.9\n");
+        }
+        BodyPlan::Winged => {
+            // an upright body whose WINGS are the silhouette: they are
+            // the thing it is known by, so they are built large and
+            // swept back rather than as an afterthought
+            let wing = st.parts.iter().find(|(n, _)| n.to_lowercase().contains("wing"))
+                .map(|(_, f)| *f * height as f32).unwrap_or(height as f32 * 0.55);
+            o.push_str(&format!("part body capsule r={:.1} r2={:.1} len={:.0} pitch=90 material={material}\n",
+                                r, r * 0.8, seg(torso, r)));
+            o.push_str(&format!("part head sphere r={:.1} material={material}\n", (head / 2.0).max(1.0)));
+            o.push_str(&format!("part wing capsule r={:.1} r2={:.1} len={wing:.0} dir=200 pitch=25 material={material}\n",
+                                (r * 0.5).max(1.0), (r * 0.2).max(0.8)));
+            o.push_str(&format!("part leg capsule r={:.1} r2={:.1} len={leg:.0} dir=190 pitch=-80 material={material}\n",
+                                (r * 0.35).max(1.0), (r * 0.25).max(0.8)));
+            o.push_str(&format!("rel body above ground by={leg:.0}\n"));
+            o.push_str("rel head on body\n");
+            o.push_str("rel wing joint body at=0.75 out=1.0 pair\n");
+            o.push_str("rel leg joint body at=0.05 out=0.5 pair\n");
+            o.push_str("rel leg reaches ground\n");
+        }
+        _ => {
+            // a mass with its features on it, and nothing pretending
+            // to be anatomy
+            // A mass still needs to STAND on something: a lone sphere
+            // floating at head height is not an object, it is a
+            // balloon. A plinth is what a monolith or a carved head
+            // sits on, and it is what makes it read as placed.
+            o.push_str(&format!("part mass sphere r={:.1} material={material}\n",
+                                (height as f32 * 0.35).max(2.0)));
+            o.push_str(&format!("part plinth box w={:.0} h={:.0} d={:.0} material={material}\n",
+                                (height as f32 * 0.55).max(3.0), (height as f32 * 0.18).max(2.0),
+                                (height as f32 * 0.55).max(3.0)));
+            o.push_str("rel plinth on ground\n");
+            o.push_str("rel mass on plinth\n");
+        }
+    }
+    // whatever else the study named, on the body
+    let core = ["head", "torso", "body", "leg", "arm", "wing", "neck", "chest"];
+    let mut extras = 0;
+    for (n, f) in &st.parts {
+        let low = n.to_lowercase();
+        if core.iter().any(|c| low.contains(c)) { continue; }
+        if extras >= 3 { break; }
+        let clean: String = low.chars().filter(|c| c.is_alphanumeric()).collect();
+        if clean.is_empty() { continue; }
+        let boost = if st.keep.iter().any(|k| k.to_lowercase().contains(&clean)) { 1.8 } else { 1.0 };
+        o.push_str(&format!("part {clean} sphere r={:.1} material={material}\n",
+                            (f * height as f32 * 0.2 * boost).max(1.0)));
+        o.push_str(&format!("rel {clean} joint {} at=0.6 out=1.0\n",
+                            if st.plan == BodyPlan::Mass { "mass" } else { "body" }));
+        extras += 1;
+    }
+    o
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,6 +901,84 @@ mod tests {
             // Fixing either alone leaves the other.
             assert!((got - want).abs() * 100 / want <= 12,
                     "asked for {want}, built {got} ({}% out)", (got - want) * 100 / want);
+        }
+    }
+
+    #[test]
+    fn a_frog_is_not_a_man() {
+        // "create a giant emerald frog statue" built a HUMAN, because
+        // `to_sketch` emitted one upright torso, a head on top, an arm
+        // pair and a leg pair for everything. Correct proportions on
+        // the wrong body plan is still the wrong creature.
+        let mut s = Study::default();
+        absorb(&mut s, Rung::Subject, "SUBJECT: a giant frog, squat and wide\n");
+        absorb(&mut s, Rung::Anatomy, "PARTS: head 22%; torso 40%; leg 45%\nWIDTH: 60%\n");
+        assert_eq!(s.plan, BodyPlan::Quadruped, "the subject says so even if the model did not");
+        let src = to_sketch(&s, 60, "emerald");
+        let (sk, errs) = crate::sketch::parse(&src);
+        assert!(errs.is_empty(), "{src}\n{errs:?}");
+        let names: Vec<&str> = sk.parts.iter().map(|p| p.name.as_str()).collect();
+        assert!(!names.contains(&"arm"), "a frog has no arms: {names:?}");
+        assert!(names.contains(&"foreleg") && names.contains(&"hindleg"), "{names:?}");
+        // the body is HORIZONTAL, not upright: that is the silhouette
+        let body = sk.parts.iter().find(|p| p.name == "body").unwrap();
+        match body.shape {
+            crate::sketch::Shape::Capsule { pitch, .. } =>
+                assert!(pitch.abs() < 30.0, "a frog's body lies down: pitch {pitch}"),
+            ref o => panic!("{o:?}"),
+        }
+        // and it is wider than it is tall, which a standing man is not
+        let (placed, _) = crate::sketch::resolve(&sk, (0, 64, 0));
+        let cells: Vec<(i32, i32, i32, u16)> = placed.iter()
+            .flat_map(|p| crate::sketch::cells(p, 1)).collect();
+        let w = cells.iter().map(|c| c.0).max().unwrap() - cells.iter().map(|c| c.0).min().unwrap();
+        let d = cells.iter().map(|c| c.2).max().unwrap() - cells.iter().map(|c| c.2).min().unwrap();
+        let ht = cells.iter().map(|c| c.1).max().unwrap() - cells.iter().map(|c| c.1).min().unwrap();
+        assert!(w.max(d) > ht, "squat: {}x{} across, {ht} tall", w, d);
+    }
+
+    #[test]
+    fn the_subject_decides_the_plan_when_the_model_does_not_say() {
+        for (subject, want) in [("a giant frog", BodyPlan::Quadruped),
+                                ("a rearing horse", BodyPlan::Quadruped),
+                                ("a coiled serpent", BodyPlan::Serpentine),
+                                ("an eagle with spread wings", BodyPlan::Winged),
+                                ("a dragon", BodyPlan::Winged),
+                                ("a wingless dragon", BodyPlan::Serpentine),
+                                ("Zeus, king of the gods", BodyPlan::Biped),
+                                ("a monolith", BodyPlan::Mass)] {
+            assert_eq!(plan_from_subject(subject), want, "{subject}");
+        }
+        // and an explicit PLAN line beats the guess
+        let mut s = Study::default();
+        absorb(&mut s, Rung::Subject, "SUBJECT: a giant frog\n");
+        absorb(&mut s, Rung::Anatomy, "PLAN: winged\nPARTS: head 20%; torso 40%\n");
+        assert_eq!(s.plan, BodyPlan::Winged, "the model overrides the guess");
+    }
+
+    #[test]
+    fn every_plan_builds_something_and_none_of_them_is_the_same_shape() {
+        let mut shapes = std::collections::BTreeSet::new();
+        for plan in [BodyPlan::Biped, BodyPlan::Quadruped, BodyPlan::Serpentine,
+                     BodyPlan::Winged, BodyPlan::Mass] {
+            let mut s = Study::default();
+            s.subject = "a thing".into();
+            s.plan = plan;
+            absorb(&mut s, Rung::Anatomy, "PARTS: head 15%; torso 35%; leg 40%; wing 50%\nWIDTH: 30%\n");
+            s.plan = plan;   // absorb's fallback must not undo it
+            let src = to_sketch(&s, 50, "stone");
+            let (sk, errs) = crate::sketch::parse(&src);
+            assert!(errs.is_empty(), "{plan:?}: {src}\n{errs:?}");
+            // count through the PROGRAM, because `sketch::cells` only
+            // draws the shapes with no IR op -- a sphere has one, so a
+            // plan made of spheres rasterises to nothing here
+            let prog_src = format!("pass a add\n{src}end\n");
+            let (prog, perrs) = crate::program::parse(&prog_src);
+            assert!(perrs.is_empty(), "{plan:?}: {perrs:?}");
+            let run = crate::program::run(&prog, (0, 64, 0));
+            assert!(run.changes.len() > 100, "{plan:?} built {} cells", run.changes.len());
+            let names: Vec<String> = sk.parts.iter().map(|p| p.name.clone()).collect();
+            assert!(shapes.insert(names.join(",")), "{plan:?} is the same shape as another plan");
         }
     }
 }

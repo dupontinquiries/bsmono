@@ -202,7 +202,23 @@ pub fn resolve(loc: &Location, bodies: &Bodies) -> (Vec<(i32, i32, i32)>, Vec<St
         // by column, because an exclusion is usually a plan-view idea:
         // "not over the gate" means not above it either
         let cols: BTreeSet<(i32, i32)> = mask.iter().map(|c| (c.0, c.2)).collect();
-        cells.retain(|c| !cols.iter().any(|(x, z)| (c.0 - x).abs() <= r && (c.2 - z).abs() <= r));
+        let kept: Vec<(i32, i32, i32)> = cells.iter().copied()
+            .filter(|c| !cols.iter().any(|(x, z)| (c.0 - x).abs() <= r && (c.2 - z).abs() <= r))
+            .collect();
+        // AN EXCLUSION THAT REMOVES EVERYTHING IS NOT AN EXCLUSION.
+        // Observed in a real build: "gatehouse battlements: 44 of 44
+        // excluded" and then "'merlon' had nowhere to go" -- the
+        // gatehouse overlaps its own parapet, so excluding a radius
+        // around it deleted the whole run and the pass silently placed
+        // nothing. Better to keep the detail and say the exclusion did
+        // not apply than to build a bare wall and report success.
+        if kept.is_empty() {
+            notes.push(format!("'{name}' would exclude ALL {} site(s); ignored, since a pass \
+                                that places nothing is worse than one that overlaps",
+                               cells.len()));
+        } else {
+            cells = kept;
+        }
     }
     if cells.len() < before {
         notes.push(format!("{} of {before} excluded", before - cells.len()));
@@ -651,5 +667,27 @@ mod tests {
             let a = apply(one, &b, &g2);
             assert!(!a.changes.is_empty() || !a.notes.is_empty(), "{one:?} did nothing and said nothing");
         }
+    }
+
+    #[test]
+    fn an_exclusion_that_removes_everything_is_ignored() {
+        // From a real build: "gatehouse battlements: 44 of 44 excluded"
+        // then "'merlon' had nowhere to go". A section's parapet
+        // excluded around the section itself deletes the whole run, and
+        // the pass placed nothing while reporting success.
+        let b = scene();
+        // exclude the gatehouse from the GATEHOUSE's own parapet
+        let self_excluded = Location { on: "gatehouse".into(), anchor: Anchor::TopEdge,
+                                       except: vec![("gatehouse".into(), Anchor::All, 5)] };
+        let (cells, notes) = resolve(&self_excluded, &b);
+        assert!(!cells.is_empty(), "the detail survives: {notes:?}");
+        assert!(notes.iter().any(|n| n.contains("would exclude ALL")), "{notes:?}");
+        // and a real exclusion still works
+        let real = Location { on: "curtain_wall".into(), anchor: Anchor::TopEdge,
+                              except: vec![("gatehouse".into(), Anchor::All, 3)] };
+        let (c2, n2) = resolve(&real, &b);
+        assert!(!c2.is_empty());
+        assert!(n2.iter().any(|n| n.contains("excluded")) && !n2.iter().any(|n| n.contains("ALL")),
+                "{n2:?}");
     }
 }
