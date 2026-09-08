@@ -126,6 +126,16 @@ impl<T: HttpTransport> HttpByteSource<T> {
         self.expired
     }
 
+    /// Swap the transport.
+    ///
+    /// A re-resolved URL may be on a different host, so the connection behind
+    /// it is not necessarily reusable. Kept separate from `rebind` because a
+    /// caller that pools connections per host may well want to keep the old
+    /// one.
+    pub fn replace_transport(&mut self, transport: T) {
+        self.transport = transport;
+    }
+
     /// Point at a freshly resolved URL after an expiry.
     ///
     /// The cached window is kept: it is bytes of the same media, and a URL
@@ -137,10 +147,18 @@ impl<T: HttpTransport> HttpByteSource<T> {
         self.expired = false;
     }
 
-    fn fetch_window(&mut self, start: u64) -> Result<()> {
+    /// Fetch a window at `start` covering at least `need` bytes.
+    ///
+    /// `need` matters because `read_exact_at` -- which is what both demuxers
+    /// use for every table -- does not retry a short read. A window sized only
+    /// by the chunk policy makes any read that straddles its end fail, so a
+    /// sample table larger than the remaining window makes the file
+    /// unopenable. Sizing to the request keeps `read_at` total.
+    fn fetch_window(&mut self, start: u64, need: usize) -> Result<()> {
+        let span = self.policy.chunk_bytes.max(need as u64).max(1);
         let end = match self.total {
-            Some(t) if t > 0 => (start + self.policy.chunk_bytes - 1).min(t - 1),
-            _ => start + self.policy.chunk_bytes - 1,
+            Some(t) if t > 0 => (start + span - 1).min(t - 1),
+            _ => start + span - 1,
         };
         if end < start {
             self.window = (start, Vec::new());
@@ -215,7 +233,7 @@ impl<T: HttpTransport> ByteSource for HttpByteSource<T> {
         }
 
         if !self.window_covers(offset, buf.len()) {
-            self.fetch_window(offset)?;
+            self.fetch_window(offset, buf.len())?;
         }
 
         let (start, ref data) = self.window;
@@ -386,24 +404,50 @@ mod tests {
         assert_eq!(s.read_at(500, &mut buf).unwrap(), 0);
     }
 
+    /// A read is served whole even when it is larger than the window: the
+    /// window grows to the request rather than the read being truncated.
     #[test]
-    fn a_read_straddling_the_window_end_is_served_short() {
+    fn a_read_straddling_the_window_end_is_served_whole() {
         let mut s = source(body(4096), 64);
         let mut buf = [0u8; 100];
         let n = s.read_at(0, &mut buf).unwrap();
-        assert_eq!(n, 64, "a short read is how the caller learns to ask again");
+        assert_eq!(n, 100, "read was truncated at the window edge");
     }
 
-    /// `read_exact_at` is what the demuxers use, and it must still work over a
-    /// window smaller than the read.
+    /// `read_exact_at` is what both demuxers use for every table, and it does
+    /// NOT retry a short read.
+    ///
+    /// The first version of this test asserted the opposite -- that a read
+    /// spanning a window boundary errors -- and called that honest. It made
+    /// HttpByteSource unusable with the demuxers: any sample table larger than
+    /// the remaining window made the file unopenable. Nothing caught it,
+    /// because nothing had tried to put the two together yet.
     #[test]
     fn read_exact_at_works_across_window_boundaries() {
         let data = body(4096);
         let mut s = source(data.clone(), 64);
-        let got = vidkit_core::io::read_exact_at(&mut s, 30, 200);
-        // A single short read is not enough for read_exact_at, which is
-        // honest: it reports truncation rather than looping invisibly.
-        assert!(got.is_err(), "a short read should surface, not be hidden");
+        let got = vidkit_core::io::read_exact_at(&mut s, 30, 200).expect("read across windows");
+        assert_eq!(got, data[30..230], "wrong bytes across the boundary");
+    }
+
+    /// A read larger than the whole chunk policy must still be served.
+    #[test]
+    fn a_read_larger_than_the_chunk_size_is_served_whole() {
+        let data = body(4096);
+        let mut s = source(data.clone(), 64);
+        let got = vidkit_core::io::read_exact_at(&mut s, 0, 1000).expect("large read");
+        assert_eq!(got, data[..1000]);
+        assert_eq!(s.requests, 1, "a single read should not fan out");
+    }
+
+    /// ...but a read past the end still comes back short rather than
+    /// inventing bytes.
+    #[test]
+    fn a_read_past_the_end_is_still_short() {
+        let mut s = source(body(100), 64);
+        let mut buf = [0u8; 200];
+        let n = s.read_at(50, &mut buf).unwrap();
+        assert_eq!(n, 50, "should stop at the end of the object");
     }
 
     // ---- failure paths ---------------------------------------------------

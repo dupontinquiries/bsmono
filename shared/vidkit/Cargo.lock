@@ -2568,6 +2568,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vidkit-stream"
+version = "0.1.0"
+dependencies = [
+ "vidkit-core",
+ "vidkit-mp4",
+ "vidkit-webm",
+ "vidkit-ytdlp",
+]
+
+[[package]]
 name = "vidkit-v4l2"
 version = "0.1.0"
 dependencies = [

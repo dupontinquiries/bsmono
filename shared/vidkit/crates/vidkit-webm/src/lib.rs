@@ -102,6 +102,15 @@ impl<S: ByteSource> WebmDemuxer<S> {
         })
     }
 
+    /// The underlying byte source.
+    ///
+    /// Exists so a network source can rebind an expired URL without rebuilding
+    /// the demuxer — the cluster index and the read position are still valid,
+    /// only the socket's address changed.
+    pub fn source_mut(&mut self) -> &mut S {
+        &mut self.src
+    }
+
     pub fn track(&self) -> &VideoTrack {
         &self.track
     }
