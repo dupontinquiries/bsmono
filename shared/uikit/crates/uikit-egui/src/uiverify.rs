@@ -218,6 +218,126 @@ impl Frame {
     }
 }
 
+/// Does anything behind this region show through it?
+///
+/// A popup, a menu or a tooltip is supposed to OCCLUDE what it covers. Drawn without a
+/// backdrop it still lays out correctly, still passes every shape check, and still reads as
+/// two things on top of each other — the text of the page showing between the letters of the
+/// menu. Nothing in a layout tree can see that, because from the tree's point of view both
+/// were drawn exactly where they were asked to be.
+///
+/// The test is a comparison, not a threshold: draw the same widget over two DIFFERENT
+/// backgrounds and look inside its rect. With a real backdrop the two are identical. Without
+/// one, whatever is behind changes the pixels — and the fraction that changed is exactly how
+/// much is leaking.
+///
+/// This is why it takes a closure rather than a frame: one render cannot answer the question,
+/// because a popup over a plain background looks the same either way.
+pub fn bleed_through(
+    size: Vec2,
+    region: Rect,
+    mut draw: impl FnMut(&egui::Context, Color32),
+) -> f32 {
+    // Two busy-enough backdrops. Solid colours, so any difference inside the region comes
+    // from the backdrop showing through rather than from the backdrop's own texture.
+    let a = render(size, Color32::from_rgb(10, 10, 12), |ctx| draw(ctx, Color32::from_rgb(10, 10, 12)));
+    let b = render(size, Color32::from_rgb(240, 30, 200), |ctx| draw(ctx, Color32::from_rgb(240, 30, 200)));
+    // THE INTERIOR, inset past the corners. A rounded panel legitimately shows the background
+    // at its corners — an 8px radius on a small popup is 3% of its area, which would either
+    // fail every well-drawn panel or force a threshold so loose it stopped catching anything.
+    // The corners are geometry we know about, not noise to tolerate, so they are excluded by
+    // construction and the threshold stays tight enough to mean something.
+    let inner = region.shrink(CORNER_ALLOWANCE);
+    let (x0, y0, x1, y1) = clamp_rect(inner, a.w.min(b.w), a.h.min(b.h));
+    let mut n = 0usize;
+    let mut total = 0usize;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            total += 1;
+            let (p, q) = (a.get(x, y), b.get(x, y));
+            if !near(p, q, 8) {
+                n += 1;
+            }
+        }
+    }
+    if total == 0 { 0.0 } else { n as f32 / total as f32 }
+}
+
+/// How much of a popup may show what is behind it before it is a fault.
+///
+/// Small, because the corners are already excluded — what is left is the panel's interior,
+/// where a proper backdrop lets NOTHING through. What remains to tolerate is antialiasing on
+/// an inner edge, not geometry. A missing backdrop shows through wherever the widget did not
+/// paint, which is typically most of it, so there is a wide gap between the two cases.
+pub const MAX_BLEED: f32 = 0.01;
+
+/// How far in from a region's edge the backdrop check looks.
+///
+/// Bigger than the corner radii this fleet uses (4–8px), so a rounded panel's corners never
+/// enter the measurement.
+pub const CORNER_ALLOWANCE: f32 = 10.0;
+
+/// Ink outside `region` but within `margin` of it.
+///
+/// The other half of the same family: a control whose CONTENTS are bigger than it is. The
+/// widget is where it should be, its own rect is right, and the text runs out over its
+/// neighbours — which a layout tree cannot see either, because the overflowing text was never
+/// a separate widget with a rect of its own.
+///
+/// A band rather than the whole frame, so a neighbour drawn legitimately further away does
+/// not count as spill.
+pub fn spill(f: &Frame, region: Rect, margin: f32, bg: Color32) -> f32 {
+    let outer = region.expand(margin);
+    let (ox0, oy0, ox1, oy1) = clamp_rect(outer, f.w, f.h);
+    let mut n = 0usize;
+    let mut total = 0usize;
+    for y in oy0..oy1 {
+        for x in ox0..ox1 {
+            let p = egui::pos2(x as f32 + 0.5, y as f32 + 0.5);
+            if region.contains(p) {
+                continue;
+            }
+            total += 1;
+            if !near(f.get(x, y), bg, 12) {
+                n += 1;
+            }
+        }
+    }
+    if total == 0 { 0.0 } else { n as f32 / total as f32 }
+}
+
+impl Frame {
+    /// Panic if this region's contents run outside it.
+    #[track_caller]
+    pub fn assert_contained(&self, what: &str, region: Rect, margin: f32, bg: Color32) {
+        let s = spill(self, region, margin, bg);
+        assert!(
+            s <= 0.005,
+            "{what}: contents run outside {region:?} — {:.1}% of the {margin}px band around it \
+             is inked. The widget is where it should be and what is inside it does not fit.",
+            s * 100.0
+        );
+    }
+}
+
+/// Panic if what is behind `region` shows through it.
+#[track_caller]
+pub fn assert_backdrop(
+    what: &str,
+    size: Vec2,
+    region: Rect,
+    draw: impl FnMut(&egui::Context, Color32),
+) {
+    let b = bleed_through(size, region, draw);
+    assert!(
+        b <= MAX_BLEED,
+        "{what}: no backdrop — {:.1}% of {region:?} changes with what is behind it. A popup \
+         without an opaque panel lays out correctly and reads as two things on top of each \
+         other.",
+        b * 100.0
+    );
+}
+
 /// Rasterise a frame's shapes.
 ///
 /// Flat-shaded triangles with per-vertex colour interpolation and alpha blending. No texture
@@ -460,6 +580,84 @@ mod tests {
 
     fn blankish(f: &Frame, r: Rect) -> bool {
         f.look(r, BG).ink < MIN_INK
+    }
+
+    /// A popup drawn without an opaque panel lays out correctly, passes every shape check,
+    /// and reads as two things on top of each other. Nothing in a layout tree can see it,
+    /// because from the tree's view both were drawn exactly where they were asked to be.
+    #[test]
+    fn a_popup_without_a_backdrop_is_caught() {
+        let size = Vec2::new(120.0, 80.0);
+        let popup = Rect::from_min_size(egui::pos2(20.0, 20.0), Vec2::new(70.0, 40.0));
+
+        // WITH a panel: what is behind cannot change a pixel inside it.
+        let good = bleed_through(size, popup, |ctx, _bg| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                let p = ui.painter();
+                p.rect_filled(popup, 0.0, Color32::from_rgb(45, 45, 55));
+                p.rect_filled(
+                    Rect::from_min_size(egui::pos2(28.0, 32.0), Vec2::new(50.0, 12.0)),
+                    0.0,
+                    Color32::from_rgb(240, 240, 245),
+                );
+            });
+        });
+        assert!(good <= MAX_BLEED, "a panelled popup reported {:.3} bleed", good);
+
+        // WITHOUT one: only the text is painted, and the background shows between it.
+        let bad = bleed_through(size, popup, |ctx, _bg| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                ui.painter().rect_filled(
+                    Rect::from_min_size(egui::pos2(28.0, 32.0), Vec2::new(50.0, 12.0)),
+                    0.0,
+                    Color32::from_rgb(240, 240, 245),
+                );
+            });
+        });
+        assert!(bad > MAX_BLEED * 5.0, "a backdrop-less popup reported only {:.3} bleed", bad);
+
+        // The threshold is not zero on purpose: a rounded corner legitimately lets the
+        // background through at the very edge, and a rule of exactly zero would fail every
+        // well-drawn panel in the fleet.
+        let rounded = bleed_through(size, popup, |ctx, _bg| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                ui.painter().rect_filled(popup, 8.0, Color32::from_rgb(45, 45, 55));
+            });
+        });
+        // The corners are excluded by construction rather than tolerated by a loose
+        // threshold: an 8px radius on a popup this size is over 3% of its area, which would
+        // either fail every well-drawn panel or need a threshold too loose to catch a real
+        // fault.
+        assert!(rounded <= MAX_BLEED, "a rounded panel failed the rule: {rounded}");
+    }
+
+    /// The other half: a control whose CONTENTS are bigger than it is. Its own rect is right,
+    /// and the text runs out over its neighbours — which a layout tree cannot see either,
+    /// because the overflow was never a widget with a rect of its own.
+    #[test]
+    fn contents_that_outgrow_their_control_are_caught() {
+        let size = Vec2::new(200.0, 60.0);
+        let button = Rect::from_min_size(egui::pos2(20.0, 20.0), Vec2::new(60.0, 24.0));
+        let draw = |w: f32| {
+            render(size, BG, move |ctx| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                    let p = ui.painter();
+                    p.rect_filled(button, 4.0, Color32::from_rgb(45, 45, 55));
+                    // The "label": starts inside the button, `w` wide.
+                    p.rect_filled(
+                        Rect::from_min_size(egui::pos2(26.0, 26.0), Vec2::new(w, 12.0)),
+                        0.0,
+                        Color32::from_rgb(240, 240, 245),
+                    );
+                });
+            })
+        };
+
+        draw(45.0).assert_contained("button", button, 30.0, BG);
+
+        let over = draw(120.0);
+        let s = spill(&over, button, 30.0, BG);
+        assert!(s > 0.02, "an overflowing label reported only {:.3} spill", s);
     }
 
     /// The numbers people quote, so a threshold in a test means what a designer thinks it

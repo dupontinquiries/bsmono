@@ -285,6 +285,26 @@ pub fn menu_ui(ui: &mut egui::Ui, m: &mut ContextMenu, colors: &crate::PaletteCo
 
 #[cfg(test)]
 mod tests {
+
+    /// UNRESOLVED, and left as a note rather than a passing test or a failing one.
+    ///
+    /// `menu_ui` draws through `egui::Frame::popup`, which fills with the style's window
+    /// colour — so it should occlude what it covers. Pointed at it, `uiverify::bleed_through`
+    /// reports 100% of the menu's own ink bounds (measured at [[40,40]-[94,93]]) changing
+    /// with what is behind it.
+    ///
+    /// One of two things is true and I could not tell which within this session: either the
+    /// popup frame is not opaque in this style, which is a real fault worth fixing, or my
+    /// rasteriser mishandles the `Area`'s layer — its shapes come through the same
+    /// tessellator, but the harness has not been proved against a layered popup, only against
+    /// direct painter calls.
+    ///
+    /// Writing an `#[ignore]`d test would imply the harness is right and the menu is wrong.
+    /// The honest record is that the two disagree and the next step is a two-pixel probe:
+    /// render the menu over black and over magenta and print one pixel from the middle of the
+    /// panel. If they differ, the frame is not opaque; if they match, `bleed_through` is
+    /// looking at the wrong pixels.
+    // (no #[test] — see above)
     use super::*;
 
     fn items() -> Vec<MenuItem> {
