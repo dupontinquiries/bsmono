@@ -252,6 +252,26 @@ MUTANTS = [
      "let ix = yi * stride + (xi * comps + comp) * fmt.bytes();",
      "let ix = yi * stride + (xi * comps + comp);"),
 
+    # --- command palette ------------------------------------------------------
+    ("pal/ties-not-broken-on-length", "crates/vidkit-egui/src/palette.rs",
+     "            .then(a.command.name.len().cmp(&b.command.name.len()))", ""),
+    ("pal/word-matches-demoted", "crates/vidkit-egui/src/palette.rs",
+     "    if name.split_whitespace().any(|w| w.starts_with(query)) {", "    if false {"),
+    ("pal/unavailable-commands-offered", "crates/vidkit-egui/src/palette.rs",
+     "            Action::PlayClipboard => clipboard.playable,", "            Action::PlayClipboard => true,"),
+
+    # --- selective section streaming ------------------------------------------
+    ("range/straddling-sample-twice", "crates/vidkit-relevance/src/ranges.rs",
+     "        if keep.iter().any(|r| s.start >= r.start && s.start < r.end) {",
+     "        if keep.iter().any(|r| s.start >= r.start && s.start <= r.end) {"),
+    ("range/unsorted-not-merged", "crates/vidkit-relevance/src/ranges.rs",
+     "    raw.sort_by_key(|r| r.start);", ""),
+    ("range/no-lead-in", "crates/vidkit-relevance/src/ranges.rs",
+     "        r.start = r.start.saturating_sub(policy.lead_in);", ""),
+    ("range/lead-in-overlap-unmerged", "crates/vidkit-relevance/src/ranges.rs",
+     "            Some(last) if last.end >= r.start => last.end = last.end.max(r.end),",
+     "            _unused if false => {},"),
+
     # --- relevance / section scrubbing --------------------------------------
     ("relev/unanalysed-gets-skipped", "crates/vidkit-relevance/src/lib.rs",
      "            Score::Pending => 1.0,", "            Score::Pending => 0.0,"),

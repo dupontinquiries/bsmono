@@ -25,6 +25,7 @@
 
 pub mod bar;
 pub mod fit;
+pub mod palette;
 /// GPU upload path: NV12 planes plus a conversion shader, 2.7x less bus
 /// traffic than the RGBA8 upload in [`presenter`]. Needs a glow context.
 #[cfg(feature = "glow-upload")]
@@ -38,6 +39,7 @@ pub use gestures::{
     GestureRouter, Intent, ViewLock, Zone,
 };
 pub use bar::{bottom_bar, fit_label, next_fit, BarAction};
+pub use palette::{available, commands, search, Action, ClipboardState, Command, Hit, MatchKind};
 pub use fit::{fit_rect, surface_to_frame, Fit, PixelAspect};
 pub use presenter::EguiPresenter;
 pub use view::{format_time, progress, scrub_fraction, scrub_target, Transport, VideoView, ViewAction};

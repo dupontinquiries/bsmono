@@ -31,6 +31,8 @@
 //! and — worse — they cannot tell it happened. Everything below is arranged so
 //! that a model that never answers degrades to playing the whole video.
 
+pub mod ranges;
+
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
