@@ -288,33 +288,27 @@ pub fn to_sketch(st: &Study, height: i32, material: &str) -> String {
     let mut out = String::new();
     // torso: a tapering capsule, upright, the trunk of the thing
     let torso_r = (blocks(width) / 2.0).max(1.5);
-    // THE HEIGHT ASKED FOR IS THE HEIGHT BUILT. Two things made a
-    // 40-block figure 50 tall and neither was noticed:
+    // A PERCENTAGE IS A SPAN, and a capsule spans `len + 2r`.
     //
-    // A model's percentages describe parts that OVERLAP. "leg 47%"
-    // means the leg SPANS nearly half the figure, not that it owns the
-    // bottom 47% with nothing else there -- head, torso and leg stack
-    // to 91% and then each is placed end to end.
+    // "leg 47%" means the leg occupies nearly half the figure, caps
+    // and all. Passing that percentage straight in as `len` made every
+    // part longer than the model asked by its two radii -- a torso of
+    // length 13 and radius 5 is 23 tall, not 13 -- so a 40-block
+    // figure came out 50 and nothing noticed. The segment is the span
+    // MINUS the caps.
     //
-    // And a CAPSULE SPANS `len + 2r`: its round caps stick out past
-    // the segment, so a torso of length 13 and radius 5 is 23 tall.
-    // The caps come out of the budget before anything is scaled.
-    // THE PARTS OVERLAP, they do not stack. A model's percentages
-    // describe SPANS -- "leg 47%" means the leg spans nearly half the
-    // figure -- and head, torso and leg sum to over 90% because the
-    // hip joint is INSIDE the torso and the neck is inside the
-    // shoulders. Placing them end to end made a 40-block figure 50
-    // tall. Scaling the percentages instead would honour the total and
-    // break the proportions, which is the wrong half to give up: the
-    // proportions are what the model actually decided.
-    //
-    // So the torso sits DOWN into the legs by the overlap the sum
-    // implies, and the percentages are left exactly as given.
+    // The parts also overlap rather than stacking: the hip joint is
+    // inside the torso and the neck inside the shoulders, which is why
+    // head, torso and leg sum to over 90% and are still a whole
+    // figure. The torso sits down into the legs by that surplus. Both
+    // corrections are needed and neither substitutes for the other.
+    let leg_r = (torso_r * 0.45).max(1.2);
+    let seg = |span: f32, r: f32| (span - 2.0 * r).max(1.0);
     let stack = head + torso + leg;
     let overlap = ((stack - 1.0).max(0.0) * h).round().max(0.0);
     out.push_str(&format!("part torso capsule r={:.1} r2={:.1} len={} dir=0 pitch=90 material={material}
 ",
-                          torso_r, torso_r * 0.78, blocks(torso)));
+                          torso_r, torso_r * 0.78, seg(blocks(torso), torso_r)));
     out.push_str(&format!("part head sphere r={:.1} material={material}
 ",
                           (blocks(head) / 2.0).max(1.0)));
@@ -332,7 +326,7 @@ pub fn to_sketch(st: &Study, height: i32, material: &str) -> String {
                           if raised { 200 } else { 190 }, if raised { 35 } else { -70 }));
     out.push_str(&format!("part leg capsule r={:.1} r2={:.1} len={} dir=190 pitch={} material={material}
 ",
-                          (torso_r * 0.45).max(1.2), (torso_r * 0.34).max(1.0), blocks(leg),
+                          leg_r, (torso_r * 0.34).max(1.0), seg(blocks(leg), leg_r),
                           if seated { -40 } else { -85 }));
     // anything else the model named, as a mass on the torso: a
     // thunderbolt, a beard, an eagle. Not a limb, and not droppable.
@@ -534,9 +528,14 @@ mod tests {
         let head = sk.parts.iter().find(|p| p.name == "head").unwrap();
         match head.shape { crate::sketch::Shape::Sphere { r } =>
             assert!((r - 6.0).abs() < 1.5, "head radius {r} for 12% of 100"), ref o => panic!("{o:?}") }
+        // The percentage is the part's SPAN, caps included -- `len` is
+        // the segment between the caps, and asserting on it was the
+        // very confusion that made every figure a quarter too tall.
         let leg = sk.parts.iter().find(|p| p.name == "leg").unwrap();
-        match leg.shape { crate::sketch::Shape::Capsule { len, .. } =>
-            assert!((len - 48.0).abs() < 2.0, "leg {len} for 48% of 100"), ref o => panic!("{o:?}") }
+        match leg.shape { crate::sketch::Shape::Capsule { len, r, .. } =>
+            assert!((len + 2.0 * r - 48.0).abs() < 3.0,
+                    "leg spans {} for 48% of 100 (len {len}, r {r})", len + 2.0 * r),
+            ref o => panic!("{o:?}") }
         // and it resolves to a connected figure of about the right height
         let (placed, _) = crate::sketch::resolve(&sk, (0, 64, 0));
         let cells: Vec<(i32, i32, i32, u16)> = placed.iter()
@@ -695,26 +694,16 @@ mod tests {
                 for c in crate::sketch::cells(p, 1) { lo = lo.min(c.1); hi = hi.max(c.1); }
             }
             let got = hi - lo + 1;
-            // KNOWN AND MEASURED: the figure runs about a quarter over
-            // the height asked for, and this test pins the size of the
-            // error rather than pretending it is not there. Three
-            // causes, all established:
-            //   * the parts OVERLAP but are placed end to end -- the
-            //     hip joint belongs inside the torso
-            //   * a capsule spans `len + 2r`, so a torso of length 13
-            //     and radius 5 is 23 tall
-            //   * `reaches ground` re-stretches the leg after the
-            //     placement, undoing any correction made before it
-            // Scaling the percentages down fixes the total and breaks
-            // the proportions, which is the wrong half to give up: the
-            // proportions are what the model actually decided. The fix
-            // is for the legs to be placed from the hip rather than
-            // stretched from the torso's underside, and that is a
-            // change to `reaches`, not to this arithmetic.
-            assert!(got > want, "it is over, not under: {got} vs {want}");
-            assert!((got - want) * 100 / want <= 35,
-                    "asked for {want}, built {got} ({}% over -- the known overshoot is ~25%)",
-                    (got - want) * 100 / want);
+            // The height asked for is the height built, within a
+            // block or two of rounding. It ran a QUARTER OVER until
+            // two things were separated: a percentage is a part's
+            // SPAN and a capsule spans `len + 2r`, so passing the
+            // percentage in as `len` made every part longer than
+            // asked by its two radii; and the parts OVERLAP rather
+            // than stacking, because a hip joint is inside the torso.
+            // Fixing either alone leaves the other.
+            assert!((got - want).abs() * 100 / want <= 12,
+                    "asked for {want}, built {got} ({}% out)", (got - want) * 100 / want);
         }
     }
 }
