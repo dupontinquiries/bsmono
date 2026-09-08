@@ -251,6 +251,120 @@ pub fn to_guidance(s: &Study, height: i32) -> String {
     out
 }
 
+/// The study as GEOMETRY: parts and relations at the proportions the
+/// model gave.
+///
+/// The ladder gathered "head 12%, torso 32%, leg 48%, bolt 18%" and
+/// then handed off to `form statue`, which draws the same figure it
+/// always draws. Every number was collected and discarded. This is
+/// where the proportions become a body.
+///
+/// Parts are matched by NAME to a role, because a model writes "leg"
+/// and "legs" and "left leg" and means the same thing. An unrecognised
+/// part becomes a mass attached to the torso rather than being
+/// dropped -- a thunderbolt is not a limb and still has to exist.
+pub fn to_sketch(st: &Study, height: i32, material: &str) -> String {
+    let h = height.max(4) as f32;
+    let blocks = |f: f32| (f * h).round().max(1.0);
+    let find = |keys: &[&str]| -> Option<f32> {
+        st.parts.iter().find(|(n, _)| {
+            let n = n.to_lowercase();
+            keys.iter().any(|k| n.split_whitespace().any(|w| w == *k) || n == *k)
+        }).map(|(_, f)| *f)
+    };
+    // The core proportions, with fallbacks that are a human figure --
+    // a model that answered half the question still gets a body.
+    let head = find(&["head", "skull"]).unwrap_or(0.12);
+    let torso = find(&["torso", "body", "chest", "trunk"]).unwrap_or(0.32);
+    let leg = find(&["leg", "legs", "thigh"]).unwrap_or(0.47);
+    let arm = find(&["arm", "arms"]).unwrap_or(0.36);
+    let neck = find(&["neck"]).unwrap_or(0.03);
+    let width = st.facts.get("WIDTH").and_then(|v| v.split_whitespace()
+        .find_map(|w| w.trim_end_matches('%').parse::<f32>().ok()))
+        .map(|v| if v > 1.0 { v / 100.0 } else { v }).unwrap_or(0.24);
+    let pose = st.pose.join(" ").to_lowercase();
+    let raised = pose.contains("raised") || pose.contains("aloft") || pose.contains("up");
+    let seated = pose.contains("seated") || pose.contains("sitting") || pose.contains("enthroned");
+    let mut out = String::new();
+    // torso: a tapering capsule, upright, the trunk of the thing
+    let torso_r = (blocks(width) / 2.0).max(1.5);
+    out.push_str(&format!("part torso capsule r={:.1} r2={:.1} len={} dir=0 pitch=90 material={material}
+",
+                          torso_r, torso_r * 0.78, blocks(torso)));
+    out.push_str(&format!("part head sphere r={:.1} material={material}
+",
+                          (blocks(head) / 2.0).max(1.0)));
+    if neck > 0.01 {
+        out.push_str(&format!("part neck capsule r={:.1} r2={:.1} len={} pitch=90 material={material}
+",
+                              (torso_r * 0.4).max(1.0), (torso_r * 0.4).max(1.0), blocks(neck)));
+    }
+    // limbs: a PAIR each, hanging from a joint. Without the pair both
+    // legs land in the same place, which is what a figure did before
+    // the relation existed.
+    out.push_str(&format!("part arm capsule r={:.1} r2={:.1} len={} dir={} pitch={} material={material}
+",
+                          (torso_r * 0.35).max(1.0), (torso_r * 0.26).max(0.8), blocks(arm),
+                          if raised { 200 } else { 190 }, if raised { 35 } else { -70 }));
+    out.push_str(&format!("part leg capsule r={:.1} r2={:.1} len={} dir=190 pitch={} material={material}
+",
+                          (torso_r * 0.45).max(1.2), (torso_r * 0.34).max(1.0), blocks(leg),
+                          if seated { -40 } else { -85 }));
+    // anything else the model named, as a mass on the torso: a
+    // thunderbolt, a beard, an eagle. Not a limb, and not droppable.
+    let core = ["head", "skull", "torso", "body", "chest", "trunk", "leg", "legs", "thigh",
+                "arm", "arms", "neck"];
+    let mut extras = 0;
+    for (n, f) in &st.parts {
+        let low = n.to_lowercase();
+        if core.iter().any(|c| low.split_whitespace().any(|w| w == *c) || low == *c) { continue; }
+        if extras >= 4 { break; }
+        let clean: String = low.chars().filter(|c| c.is_alphanumeric()).collect();
+        if clean.is_empty() { continue; }
+        // KEEP says what to exaggerate so it reads at this size
+        let boost = if st.keep.iter().any(|k| k.to_lowercase().contains(&clean)) { 1.8 } else { 1.0 };
+        out.push_str(&format!("part {clean} capsule r={:.1} r2={:.1} len={} dir=0 pitch=20 material={material}
+",
+                              (blocks(*f) * 0.16 * boost).max(1.0),
+                              (blocks(*f) * 0.10 * boost).max(0.8), blocks(*f)));
+        extras += 1;
+    }
+    // and the relations
+    out.push_str("rel torso above ground by=");
+    out.push_str(&format!("{}
+", blocks(leg).round() as i32));
+    out.push_str("rel head on torso
+");
+    if neck > 0.01 { out.push_str("rel neck on torso
+"); }
+    out.push_str("rel arm joint torso at=0.88 out=1.3 pair
+");
+    out.push_str("rel leg joint torso at=0.05 out=0.55 pair
+");
+    out.push_str("rel leg reaches ground
+");
+    extras = 0;
+    for (n, _) in &st.parts {
+        let low = n.to_lowercase();
+        if core.iter().any(|c| low.split_whitespace().any(|w| w == *c) || low == *c) { continue; }
+        if extras >= 4 { break; }
+        let clean: String = low.chars().filter(|c| c.is_alphanumeric()).collect();
+        if clean.is_empty() { continue; }
+        // held things go to the hand, worn things to the torso, things
+        // at the feet to the ground
+        let at_feet = st.facts.get("WITH").map(|v| v.to_lowercase().contains(&clean)).unwrap_or(false);
+        if at_feet {
+            out.push_str(&format!("rel {clean} beside torso dir=west by=2
+"));
+        } else {
+            out.push_str(&format!("rel {clean} joint arm at=0.9 out=0.4
+"));
+        }
+        extras += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +487,91 @@ mod tests {
         let mut s = Study::default();
         absorb(&mut s, Rung::Subject, "He's the king of the gods, bearded and holding a bolt.\n");
         assert!(s.subject.contains("king of the gods"), "{:?}", s.subject);
+    }
+
+    #[test]
+    fn the_proportions_become_a_body_rather_than_being_discarded() {
+        // the ladder gathered "head 12%, torso 32%, leg 48%" and then
+        // handed off to `form statue`, which draws the same figure it
+        // always draws. Every number was collected and thrown away.
+        let st = zeus();
+        let src = to_sketch(&st, 100, "stone");
+        let (sk, errs) = crate::sketch::parse(&src);
+        assert!(errs.is_empty(), "{src}\n{errs:?}");
+        // the parts the model named are all there
+        let names: Vec<&str> = sk.parts.iter().map(|p| p.name.as_str()).collect();
+        for want in ["torso", "head", "arm", "leg"] {
+            assert!(names.contains(&want), "{want} missing from {names:?}");
+        }
+        assert!(names.iter().any(|n| *n == "bolt" || *n == "beard" || *n == "eagle"),
+                "the things that make it Zeus: {names:?}");
+        // AT THE PROPORTIONS GIVEN: 12% of 100 is a head about 6 across
+        let head = sk.parts.iter().find(|p| p.name == "head").unwrap();
+        match head.shape { crate::sketch::Shape::Sphere { r } =>
+            assert!((r - 6.0).abs() < 1.5, "head radius {r} for 12% of 100"), ref o => panic!("{o:?}") }
+        let leg = sk.parts.iter().find(|p| p.name == "leg").unwrap();
+        match leg.shape { crate::sketch::Shape::Capsule { len, .. } =>
+            assert!((len - 48.0).abs() < 2.0, "leg {len} for 48% of 100"), ref o => panic!("{o:?}") }
+        // and it resolves to a connected figure of about the right height
+        let (placed, _) = crate::sketch::resolve(&sk, (0, 64, 0));
+        let cells: Vec<(i32, i32, i32, u16)> = placed.iter()
+            .flat_map(|p| crate::sketch::cells(p, 1)).collect();
+        assert!(!cells.is_empty());
+        let (lo, hi) = (cells.iter().map(|c| c.1).min().unwrap(), cells.iter().map(|c| c.1).max().unwrap());
+        assert!((hi - lo) > 60, "a figure of some height: {}", hi - lo);
+        // limbs came in PAIRS, so it is not one-legged
+        let placed_leg = placed.iter().find(|p| p.name == "leg").unwrap();
+        assert_eq!(placed_leg.extra.len(), 1, "one leg each side");
+        assert_eq!(placed.iter().find(|p| p.name == "arm").unwrap().extra.len(), 1);
+        let xs: std::collections::BTreeSet<i32> = cells.iter().map(|c| c.0).collect();
+        assert!(xs.iter().any(|x| *x < -3) && xs.iter().any(|x| *x > 3), "it has two sides");
+    }
+
+    #[test]
+    fn a_different_proportion_gives_a_different_body() {
+        // the whole point: the numbers must change the shape
+        let mut squat = Study::default();
+        absorb(&mut squat, Rung::Anatomy, "PARTS: head 20%; torso 45%; leg 25%; arm 30%\nWIDTH: shoulders 45%\n");
+        let mut lanky = Study::default();
+        absorb(&mut lanky, Rung::Anatomy, "PARTS: head 8%; torso 25%; leg 62%; arm 45%\nWIDTH: shoulders 16%\n");
+        let one = crate::sketch::parse(&to_sketch(&squat, 60, "stone")).0;
+        let two = crate::sketch::parse(&to_sketch(&lanky, 60, "stone")).0;
+        let leg = |s: &crate::sketch::Sketch| match s.parts.iter().find(|p| p.name == "leg").unwrap().shape {
+            crate::sketch::Shape::Capsule { len, .. } => len, _ => 0.0 };
+        let torso_r = |s: &crate::sketch::Sketch| match s.parts.iter().find(|p| p.name == "torso").unwrap().shape {
+            crate::sketch::Shape::Capsule { r, .. } => r, _ => 0.0 };
+        assert!(leg(&two) > leg(&one) * 2.0, "the lanky one has long legs: {} vs {}", leg(&two), leg(&one));
+        assert!(torso_r(&one) > torso_r(&two) * 2.0, "and the squat one is broad");
+    }
+
+    #[test]
+    fn the_pose_changes_the_arms_and_a_seat_changes_the_legs() {
+        let mut raised = Study::default();
+        absorb(&mut raised, Rung::Anatomy, "PARTS: torso 32%; arm 36%; leg 47%\n");
+        absorb(&mut raised, Rung::Pose, "POSE: the right arm raised high\n");
+        let mut sat = Study::default();
+        absorb(&mut sat, Rung::Anatomy, "PARTS: torso 32%; arm 36%; leg 47%\n");
+        absorb(&mut sat, Rung::Pose, "POSE: enthroned, seated on a great chair\n");
+        let pitch = |src: &str, part: &str| {
+            let s = crate::sketch::parse(src).0;
+            match s.parts.iter().find(|p| p.name == part).unwrap().shape {
+                crate::sketch::Shape::Capsule { pitch, .. } => pitch, _ => 0.0 }
+        };
+        assert!(pitch(&to_sketch(&raised, 50, "stone"), "arm") > 0.0, "a raised arm points UP");
+        assert!(pitch(&to_sketch(&sat, 50, "stone"), "arm") < 0.0, "an ordinary one hangs");
+        assert!(pitch(&to_sketch(&sat, 50, "stone"), "leg")
+                > pitch(&to_sketch(&raised, 50, "stone"), "leg"), "a seated leg is not vertical");
+    }
+
+    #[test]
+    fn a_study_that_answered_almost_nothing_still_makes_a_figure() {
+        let mut thin = Study::default();
+        absorb(&mut thin, Rung::Subject, "SUBJECT: a guardian\n");
+        let src = to_sketch(&thin, 40, "stone");
+        let (sk, errs) = crate::sketch::parse(&src);
+        assert!(errs.is_empty(), "{src}\n{errs:?}");
+        assert!(sk.parts.len() >= 4, "the fallbacks are a human figure: {}", sk.parts.len());
+        let (placed, _) = crate::sketch::resolve(&sk, (0, 64, 0));
+        assert!(placed.iter().flat_map(|p| crate::sketch::cells(p, 1)).count() > 100);
     }
 }

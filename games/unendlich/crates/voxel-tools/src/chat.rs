@@ -122,6 +122,9 @@ pub struct LastBuild {
 
 #[derive(Debug, Default, Clone)]
 pub struct ChatSession {
+    /// Set while a composed sketch or program is being built: the
+    /// shape is decided and the recognizer must not add another.
+    pub suppress_recognizer: bool,
     /// What the study ladder learned, if it was climbed. Carried to
     /// the REVIEW, so a verdict is judged against what the figure was
     /// supposed to read as rather than against nothing.
@@ -399,6 +402,7 @@ impl ChatSession {
         let f = self.focus(gaze);
         let anchor = f.anchor;
         let built = crate::compose::build(sketch, anchor);
+        self.suppress_recognizer = true;
         if built.parts == 0 {
             return Reply::Say(format!("the sketch had no parts{}",
                 if built.errors.is_empty() { String::new() } else { format!(" -- {}", built.errors.join("; ")) }));
@@ -407,6 +411,7 @@ impl ChatSession {
         // existing pipeline -- dry run, finishing, critique,
         // reachability, hive.
         let mut r = self.receive_plan_gated(tools, gaze, &built.ir, player_feet, prose);
+        self.suppress_recognizer = false;
         // Then the shapes with NO op -- a torus, a helix, a link. These
         // are cells and no IR line can say them, so they join the
         // pending placement directly. They are part of the same preview
@@ -729,8 +734,15 @@ impl ChatSession {
         let carve_verbs = ["canyon", "cave", "mesa", "waterfall", "overhang", "gorge", "feature"];
         let has_carve = ir.lines().any(|l| carve_verbs.iter()
             .any(|v| l.trim_start().to_lowercase().starts_with(&format!("{v} "))));
-        let recognized = crate::recipe::recognise(prose)
-            .filter(|r| if r.carve { !has_carve } else { !has_form });
+        // A SKETCH IS ALREADY THE SHAPE. Its IR is spheres and cell
+        // stamps and has no `form` line, so the recognizer concluded
+        // nothing had been built and added a dictionary statue ON TOP
+        // of the studied body -- two figures in the same place, and the
+        // bland one drawn last.
+        let recognized = if self.suppress_recognizer { None } else {
+            crate::recipe::recognise(prose)
+                .filter(|r| if r.carve { !has_carve } else { !has_form })
+        };
         let recognized_why = recognized.as_ref().map(|r| format!(
             "RECOGNIZED {} from '{}': {}", r.form, r.because.join(", "), r.line()));
         let ir_with_form = match &recognized {
@@ -2058,5 +2070,33 @@ mod tests {
         // hollow box is at +-10, so x=9 is interior either way
         assert_eq!(w.get(0, 67, -10), 0, "the gate is open through the wall");
         assert_ne!(w.get(10, 67, -10), 0, "and the wall stands beside it");
+    }
+
+    #[test]
+    fn a_sketch_does_not_also_get_a_dictionary_statue_on_top_of_it() {
+        // a sketch's IR is spheres and cell stamps with no `form` line,
+        // so the recognizer concluded nothing had been built and added
+        // one: two figures in the same place, the bland one last
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 400_000);
+        let g = gaze_at(0, 0, 10.0);
+        let sketch = "part torso capsule r=4 r2=3 len=18 pitch=90 material=stone\n\
+                      part head sphere r=3 material=stone\n\
+                      rel torso above ground by=16\n\
+                      rel head on torso\n";
+        match s.receive_sketch(&mut t, &g, sketch, None, "a colossal statue of Zeus") {
+            Reply::Preview { echo, .. } => {
+                assert!(!echo.contains("RECOGNIZED"), "the sketch is the shape: {echo}");
+                assert!(!echo.contains("form 'statue'"), "{echo}");
+            }
+            o => panic!("{o:?}"),
+        }
+        // and the flag does not stick: a plain build still recognises
+        assert!(!s.suppress_recognizer, "the suppression is scoped to the sketch");
+        match s.receive_plan_gated(&mut t, &g, "sphere 0,0 r=2 block=stone\n", None, "a stone house") {
+            Reply::Preview { echo, .. } => assert!(echo.contains("RECOGNIZED"), "{echo}"),
+            o => panic!("{o:?}"),
+        }
     }
 }

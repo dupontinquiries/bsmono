@@ -1137,4 +1137,10 @@ fn study_scenario() {
     }
     assert!(log.iter().any(|l| l.contains("Zeus")), "{log:?}");
     assert!(log.iter().any(|l| l.contains("triangle")), "the silhouette reached the player");
+    // and the PROPORTIONS became a body, not `form statue`
+    let built = log.iter().find(|l| l.contains("blocks") || l.contains("Plan") || l.contains("sphere"))
+        .cloned().unwrap_or_default();
+    println!("  {}", built.trim().lines().next().unwrap_or(""));
+    assert!(!log.iter().any(|l| l.contains("form statue")),
+            "the dictionary statue was NOT used: {log:?}");
 }

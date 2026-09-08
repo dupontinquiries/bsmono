@@ -1293,18 +1293,32 @@ impl Paintbrush {
         let Some(st) = self.study.take() else { return };
         log::info!("[paintbrush] study done: {}", st.summary());
         let guidance = voxel_tools::study::to_guidance(&st, self.study_height);
-        // The recognizer still writes the form line -- it is good at
-        // that -- and the study says what to make big enough to see.
-        // The two are complementary: one decides the shape, the other
-        // decides what the shape must READ as.
-        let mut ir = voxel_tools::recipe::recognise(prose)
-            .map(|r| r.line()).unwrap_or_else(|| format!("form statue size=medium h={}", self.study_height));
-        if let Some(h) = Some(self.study_height) {
-            if !ir.contains(" h=") { ir.push_str(&format!(" h={h}")); }
-        }
         for line in guidance.lines().take(3) { self.say(format!("  {}", line.trim())); }
         self.session.study_note = Some(guidance);
-        self.finish_turn_with(cm, gaze, &ir, player_feet, prose);
+        // THE PROPORTIONS BECOME A BODY. Handing off to `form statue`
+        // here drew the same figure it always draws, so every number
+        // the ladder gathered -- head 12%, torso 32%, leg 47% -- was
+        // collected over four turns and thrown away at the last step.
+        let material = voxel_tools::recipe::recognise(prose)
+            .and_then(|r| r.block).unwrap_or_else(|| "stone".into());
+        let src = voxel_tools::study::to_sketch(&st, self.study_height, &material);
+        let view = WorldView(cm);
+        let mut staged = StagedWorld::new(&view);
+        let r = {
+            let mut tools = VoxelTools::new(&mut staged);
+            self.session.receive_sketch(&mut tools, gaze, &src, player_feet, prose)
+        };
+        // A sketch that resolved to nothing falls back to the
+        // dictionary: a plain statue beats no statue.
+        if matches!(&r, voxel_tools::chat::Reply::Say(_)) {
+            log::info!("[paintbrush] the studied sketch produced nothing; using the form");
+            let ir = voxel_tools::recipe::recognise(prose).map(|x| x.line())
+                .unwrap_or_else(|| format!("form statue size=medium h={}", self.study_height));
+            self.finish_turn_with(cm, gaze, &ir, player_feet, prose);
+            return;
+        }
+        self.push(r);
+        self.flush_staged(cm, &mut staged);
         self.review_pending_after_drone = 1;
         self.review_round = 0;
     }
