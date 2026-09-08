@@ -106,6 +106,13 @@ struct Player {
 
 impl Player {
     fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>) -> Self {
+        // Explicit, though `vidkit_egui::install` calls it too. Two reasons:
+        // fonts are process-wide state and an app should not depend on a
+        // library's side effect for them, and font_install_check.py greps for
+        // this call -- an app reaching it only transitively looks identical to
+        // switcheroo, which shipped with star and refresh glyphs rendering as
+        // boxes. Idempotent, so the double call costs nothing.
+        uikit_egui::fonts::install(&cc.egui_ctx);
         let colors = vidkit_egui::install(&cc.egui_ctx, snapclone_theme::palette_by_id("dark"));
         let opened = file.map(|p| open_local(&p));
 
