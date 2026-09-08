@@ -349,12 +349,51 @@ impl Palace {
 /// Paint the palace and read its keys. Returns the node to OPEN when the
 /// user asks (the same contract as `graph_ui`'s return); Fork and Tag
 /// wait in `palace.pending` for the host.
+/// The characters a frame's events typed.
+///
+/// Pulled out of `palace_ui` so it can be tested: the bug it exists for is invisible from
+/// outside — the palace's response to a letter is movement, and asserting on movement would
+/// test the walker rather than the reading.
+///
+/// AN ON-SCREEN KEYBOARD COMMITS ITS LETTERS. Plasma's virtual keyboard and Maliit are
+/// Wayland text-input clients: they commit a string for ordinary characters and send real key
+/// events only for the editing keys. Reading `Event::Text` alone drops every letter while
+/// backspace and enter keep working — the same split that made the terminal look like it had
+/// a broken keymap, and this surface had it too.
+///
+/// Preedit is NOT typed: it is what an IME shows while composing, and taking it would walk
+/// the palace on every intermediate guess and then again on the committed word.
+pub fn typed_chars(events: &[egui::Event]) -> Vec<char> {
+    let mut typed = Vec::new();
+    for ev in events {
+        match ev {
+            egui::Event::Text(t) => typed.extend(t.chars()),
+            egui::Event::Ime(egui::ImeEvent::Commit(t)) => typed.extend(t.chars()),
+            _ => {}
+        }
+    }
+    typed
+}
+
 pub fn palace_ui(ui: &mut Ui, palace: &mut Palace, topo: &Topology, focus: &str, depth: usize,
                  colors: &uikit_egui::PaletteColors) -> Option<String> {
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 0.0, colors.bg_base);
     let dt = ui.input(|i| i.stable_dt).min(0.1);
+
+    // ASK FOR A KEYBOARD. This is a typing surface with no `TextEdit` in it, and egui asks
+    // the platform for IME only on behalf of a focused TextEdit — so on a phone the on-screen
+    // keyboard had no reason to appear here at all, and its commits had nowhere to go.
+    //
+    // The whole pane as the area, its bottom edge as the cursor rect: there is no caret to
+    // point at, and a compositor that puts its keyboard away from the bottom of a full-screen
+    // pane has nowhere better to put it.
+    crate::kbd_focus::request_ime(
+        ui.ctx(),
+        rect,
+        egui::Rect::from_min_size(rect.left_bottom(), egui::vec2(1.0, 1.0)),
+    );
 
     // Keys. Chars come from text events (layout-aware); held movement from
     // keys_down, which egui exposes as physical Keys — mapped back to the
@@ -365,10 +404,7 @@ pub fn palace_ui(ui: &mut Ui, palace: &mut Palace, topo: &Topology, focus: &str,
         for k in &i.keys_down {
             if let Some(ch) = key_char(*k) { held.push(ch); }
         }
-        let mut typed = Vec::new();
-        for ev in &i.events {
-            if let egui::Event::Text(t) = ev { typed.extend(t.chars()); }
-        }
+        let typed = typed_chars(&i.events);
         (held, typed,
          i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Backspace),
          [i.key_down(egui::Key::ArrowUp), i.key_down(egui::Key::ArrowLeft), i.key_down(egui::Key::ArrowDown), i.key_down(egui::Key::ArrowRight)])
@@ -454,6 +490,39 @@ fn key_char(k: egui::Key) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Both typing surfaces in this app read raw events, and both had the same gap: an
+    /// on-screen keyboard COMMITS its letters and sends key events only for the editing keys,
+    /// so reading `Event::Text` alone drops every letter while backspace and enter work.
+    #[test]
+    fn an_on_screen_keyboards_letters_are_typed_and_its_guesses_are_not() {
+        use egui::{Event, ImeEvent};
+        // A physical keyboard: unchanged.
+        assert_eq!(typed_chars(&[Event::Text("wa".into())]), vec!['w', 'a']);
+
+        // A virtual keyboard: commits.
+        assert_eq!(typed_chars(&[Event::Ime(ImeEvent::Commit("s".into()))]), vec!['s']);
+
+        // Composing text is not input. Taking it would walk the palace on every intermediate
+        // guess and then again on the committed word.
+        assert!(typed_chars(&[Event::Ime(ImeEvent::Preedit("ni".into()))]).is_empty());
+        assert_eq!(
+            typed_chars(&[
+                Event::Ime(ImeEvent::Preedit("n".into())),
+                Event::Ime(ImeEvent::Preedit("ni".into())),
+                Event::Ime(ImeEvent::Commit("d".into())),
+            ]),
+            vec!['d'],
+            "the composed character should arrive once"
+        );
+
+        // Order is kept across both kinds — a frame can carry either.
+        assert_eq!(
+            typed_chars(&[Event::Text("a".into()), Event::Ime(ImeEvent::Commit("b".into()))]),
+            vec!['a', 'b']
+        );
+        assert!(typed_chars(&[]).is_empty());
+    }
     use super::*;
 
     fn inp<'a>(held: &'a [char], typed: &'a [char]) -> Input<'a> {
