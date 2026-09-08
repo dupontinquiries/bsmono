@@ -80,9 +80,9 @@ trusting them.
 ## Commands
 
 ```sh
-cargo test --ignore-rust-version            # 342 tests
+cargo test --ignore-rust-version            # 352 tests
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json cargo test -p vidkit-vk
-python3 tools/mutate.py                     # 134 mutants, all must be killed
+python3 tools/mutate.py                     # 143 mutants, all must be killed
 python3 tools/mutate.py shader              # just the WGSL ones
 ```
 
@@ -189,6 +189,29 @@ skip most.
 **The structural fix is not built:** upload NV12 planes and convert in a shader
 through an egui paint callback. That is the 2.7x, and it needs glow access the
 kit does not currently take.
+
+## Battery is the mobile constraint, and it fails silently
+
+Two things cost a phone real power and are invisible on a desktop:
+
+**A paused player used to redraw at full rate.** The presenter's deadline was
+set per produced frame and never cleared on pause; `saturating_duration_since`
+on a past instant is zero, so egui was asked to repaint *immediately*, forever,
+for a frame that had not changed. `EguiPresenter::idle()` is the fix and a
+one-second staleness cutoff is the backstop — the cost is silent and continuous
+and shows up in no screenshot, so it fails closed.
+
+**`on_battery` did nothing at all** until it was wired to
+`PlaybackBudget::effective_display()`, despite a doc comment promising it
+weighted cost over resolution. It now clamps the panel to a smaller, slower one
+and selection scores against that. Indirectly: the cap does not penalise big
+streams, it makes 720p and 1080p clamp to the *same* effective pixels so the
+source-pixel tiebreak prefers the cheaper decode. `battery_max_long_edge = 854`
+is the 480p policy; `u32::MAX` disables it.
+
+The GPU upload path (`glow-upload`) is the third lever — 1.5 bytes a pixel
+against 4 — and is verified pixel-identical to the CPU path on llvmpipe, but
+not on turnip or AGX.
 
 ## Invariants that are easy to break
 

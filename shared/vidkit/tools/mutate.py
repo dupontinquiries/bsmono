@@ -49,7 +49,7 @@ MUTANTS = [
     ("select/prefer-higher-bitrate", "crates/vidkit-ytdlp/src/select.rs",
      ".then(other.bitrate_bps.cmp(&self.bitrate_bps))", ".then(self.bitrate_bps.cmp(&other.bitrate_bps))"),
     ("select/no-fps-clamp", "crates/vidkit-ytdlp/src/select.rs",
-     "effective_fps: fps.min(b.display_max_hz),", "effective_fps: fps,"),
+     "effective_fps: fps.min(max_hz),", "effective_fps: fps,"),
     ("select/no-resolution-clamp", "crates/vidkit-ytdlp/src/select.rs",
      "let effective_pixels = (sl.min(dl) as u64) * (ss.min(ds) as u64);",
      "let effective_pixels = (sl as u64) * (ss as u64);"),
