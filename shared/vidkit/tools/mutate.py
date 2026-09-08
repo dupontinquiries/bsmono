@@ -23,6 +23,12 @@ import pathlib
 # mutants below are actually executed rather than quietly surviving.
 LVP_ICD = "/usr/share/vulkan/icd.d/lvp_icd.json"
 
+# This tree wants rustc >= 1.91 (shared/uikit's lockfile is v4, which cargo
+# 1.75 cannot parse) and egui 0.34 declares MSRV 1.92 while building fine on
+# 1.91. Prefer a packaged 1.91 when the default toolchain is older, so the
+# sweep does not report every mutant as "did not compile".
+RUST_1_91_BIN = "/usr/lib/rust-1.91/bin"
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # (id, relative path, find, replace)
@@ -189,6 +195,81 @@ MUTANTS = [
     ("mp4/box-past-limit-allowed", "crates/vidkit-mp4/src/boxes.rs",
      "    if end > limit {", "    if false {"),
 
+    # --- gesture routing ---------------------------------------------------
+    ("gest/zone-midline-flipped", "crates/vidkit-egui/src/gestures.rs",
+     "    if at.x >= surface.center().x {", "    if at.x < surface.center().x {"),
+    ("gest/no-axis-lock", "crates/vidkit-egui/src/gestures.rs",
+     "            if a.total.length() < cfg.axis_lock_px {\n                return out;\n            }", ""),
+    ("gest/axis-choice-inverted", "crates/vidkit-egui/src/gestures.rs",
+     "            a.axis = Some(if a.total.x.abs() >= a.total.y.abs() {",
+     "            a.axis = Some(if a.total.x.abs() < a.total.y.abs() {"),
+    ("gest/zone-recomputed-mid-drag", "crates/vidkit-egui/src/gestures.rs",
+     "            (Some(DragAxis::Vertical), zone) => {",
+     "            (Some(DragAxis::Vertical), _) => {\n                let zone = zone_at(surface, to, &cfg);"),
+    ("gest/scrub-speed-inverted", "crates/vidkit-egui/src/gestures.rs",
+     "    let from_bottom = ((surface.max.y - at.y) / h).clamp(0.0, 1.0) as f64;",
+     "    let from_bottom = ((at.y - surface.min.y) / h).clamp(0.0, 1.0) as f64;"),
+    ("gest/scrub-height-ignored", "crates/vidkit-egui/src/gestures.rs",
+     "    cfg.scrub_span_at_bottom + (cfg.scrub_span_at_top - cfg.scrub_span_at_bottom) * from_bottom",
+     "    let _ = from_bottom; cfg.scrub_span_at_bottom"),
+    ("gest/detent-residue-dropped", "crates/vidkit-egui/src/gestures.rs",
+     "                a.detent_residue += delta.y;\n                let mut emit",
+     "                a.detent_residue = delta.y;\n                let mut emit"),
+    ("gest/volume-direction-flipped", "crates/vidkit-egui/src/gestures.rs",
+     "                while a.detent_residue <= -cfg.detent_px {\n                    a.detent_residue += cfg.detent_px;\n                    emit(1, &mut out);",
+     "                while a.detent_residue <= -cfg.detent_px {\n                    a.detent_residue += cfg.detent_px;\n                    emit(-1, &mut out);"),
+    ("gest/rotate-too-sensitive", "crates/vidkit-egui/src/gestures.rs",
+     "                while a.detent_residue >= cfg.rotate_px {", "                while a.detent_residue >= 1.0 {"),
+    ("gest/edge-strip-swallows-horizontal", "crates/vidkit-egui/src/gestures.rs",
+     "            (Some(DragAxis::Horizontal), _) => {",
+     "            (Some(DragAxis::Horizontal), Zone::RightEdge) => {}\n            (Some(DragAxis::Horizontal), _) => {"),
+    ("gest/drag-also-taps", "crates/vidkit-egui/src/gestures.rs",
+     "        if was_drag {\n            Vec::new()\n        } else {\n            vec![Intent::TogglePlay]\n        }",
+     "        let _ = was_drag;\n        vec![Intent::TogglePlay]"),
+    ("gest/no-scrub-commit", "crates/vidkit-egui/src/gestures.rs",
+     "                out.push(Intent::ScrubCommit(a.scrub_seconds));", ""),
+    ("gest/speed-not-quantised", "crates/vidkit-egui/src/gestures.rs",
+     "    let stepped = (current * 20.0).round() as i32 + steps;\n    (stepped as f64 / 20.0).clamp(0.25, 4.0)",
+     "    (current + steps as f64 * 0.05).clamp(0.25, 4.0)"),
+    ("gest/volume-unclamped", "crates/vidkit-egui/src/gestures.rs",
+     "    (stepped as f32 / 20.0).clamp(0.0, 1.0)", "    stepped as f32 / 20.0"),
+    ("gest/rotation-no-wrap", "crates/vidkit-egui/src/gestures.rs",
+     "    (current + quarter_turns).rem_euclid(4)", "    current + quarter_turns"),
+    ("gest/pinch-never-locks", "crates/vidkit-egui/src/gestures.rs",
+     "        if self.pinch_scale >= self.cfg.lock_zoom_in {", "        if false {"),
+
+    # --- view / bar ---------------------------------------------------------
+    ("view/lock-keeps-stale-zoom", "crates/vidkit-egui/src/view.rs",
+     "            Intent::LockView(lock) => {\n                t.zoom = 1.0;",
+     "            Intent::LockView(lock) => {"),
+    ("view/scrub-accumulator-not-reset", "crates/vidkit-egui/src/view.rs",
+     "                let target = offset_position(t.position, t.duration, s);\n                self.scrub_seconds = 0.0;",
+     "                let target = offset_position(t.position, t.duration, s);"),
+    ("view/scrub-not-clamped", "crates/vidkit-egui/src/view.rs",
+     "    Duration::from_secs_f64(target.clamp(0.0, hi.max(0.0)))",
+     "    Duration::from_secs_f64(target.max(0.0))"),
+    ("view/widget-changes-playback-itself", "crates/vidkit-egui/src/view.rs",
+     "            Intent::TogglePlay => {\n                action.toggle_play = true;",
+     "            Intent::TogglePlay => {\n                action.toggle_play = true;\n                t.playing = !t.playing;"),
+    ("view/rotation-ignored-by-fit", "crates/vidkit-egui/src/view.rs",
+     "    if quarter.rem_euclid(4) % 2 == 1 {\n        Vec2::new(raw.y, raw.x)\n    } else {\n        raw\n    }",
+     "    let _ = quarter; raw"),
+    ("bar/phone-layout-same-as-desktop", "crates/vidkit-egui/src/bar.rs",
+     "            DeviceClass::Phone => Self {\n                // Dropping two words is worth a whole row here.\n                word_labels: false,",
+     "            DeviceClass::Phone => Self {\n                word_labels: true,"),
+    ("bar/fit-cycle-incomplete", "crates/vidkit-egui/src/bar.rs",
+     "        Fit::Cover => Fit::Stretch,", "        Fit::Cover => Fit::Contain,"),
+    ("bar/percent-truncates", "crates/vidkit-egui/src/bar.rs",
+     '    format!("{}%", (v * 100.0).round() as i64)', '    format!("{}%", (v * 100.0) as i64)'),
+    ("fit/rotation-aspect-lost", "crates/vidkit-egui/src/fit.rs",
+     "    let display_w = frame_size.x * par.ratio();", "    let display_w = frame_size.x;"),
+    ("presenter/token-released-immediately", "crates/vidkit-egui/src/presenter.rs",
+     "        let previous = self.held.take();\n        self.held = frame.recycle.take();\n        Ok(previous)",
+     "        Ok(frame.recycle.take())"),
+    ("presenter/failed-frame-drops-buffer", "crates/vidkit-egui/src/presenter.rs",
+     "                self.drops += 1;\n                self.last_error = Some(e.to_string());",
+     "                self.drops += 1;\n                self.last_error = Some(e.to_string());\n                return Ok(None);"),
+
     # --- convert shader (needs a Vulkan device; lavapipe is enough) --------
     ("shader/cb-cr-swapped", "crates/vidkit-vk/shaders/convert.wgsl",
      "        cb = c.r;\n        cr = c.g;", "        cb = c.g;\n        cr = c.r;"),
@@ -287,6 +368,10 @@ def test_env():
     env = dict(os.environ)
     if "VK_ICD_FILENAMES" not in env and pathlib.Path(LVP_ICD).exists():
         env["VK_ICD_FILENAMES"] = LVP_ICD
+    if pathlib.Path(RUST_1_91_BIN).is_dir():
+        env["PATH"] = RUST_1_91_BIN + os.pathsep + env.get("PATH", "")
+    # One crate at a time: parallel rustc on this box is killed silently.
+    env.setdefault("CARGO_BUILD_JOBS", "1")
     return env
 
 
@@ -294,16 +379,62 @@ def have_vulkan():
     return "VK_ICD_FILENAMES" in test_env()
 
 
+class OutOfDisk(Exception):
+    """The build ran out of disk, which is not a test result."""
+
+
+def free_mb():
+    st = os.statvfs("/tmp")
+    return st.f_bavail * st.f_frsize // (1024 * 1024)
+
+
 def run_tests():
     r = subprocess.run(
-        ["cargo", "test", "--quiet", "--offline"],
+        ["cargo", "test", "--quiet", "--ignore-rust-version"],
         cwd=ROOT, capture_output=True, text=True, timeout=900, env=test_env(),
     )
+    # A full disk is the failure mode this sandbox actually hits, and cargo
+    # reports it as a compile error -- which read as "baseline FAILING, fix the
+    # suite" and sent a session looking for a broken test that did not exist.
+    # It is worth its own exception: every mutant after it would be
+    # misclassified as caught.
+    blob = (r.stdout or "") + (r.stderr or "")
+    if "No space left on device" in blob or "os error 28" in blob:
+        raise OutOfDisk(f"{free_mb()} MB free on /tmp")
     return r.returncode == 0
+
+
+INFLIGHT = ROOT / ".mutate-inflight"
+
+
+def restore_inflight():
+    """Put back a mutant stranded by a killed run.
+
+    A mutation sweep that is killed mid-mutant -- a timed-out harness call, a
+    Ctrl-C, an OOM -- leaves the source mutated, because `finally` never runs.
+    That is worse than a failed run: the next command sees a broken tree and
+    blames the tests, and in the worst case the mutation gets committed. So the
+    original is written to disk BEFORE the edit and replayed on the next start.
+    """
+    if not INFLIGHT.exists():
+        return
+    import json
+
+    try:
+        rec = json.loads(INFLIGHT.read_text())
+        target = ROOT / rec["path"]
+        target.write_text(rec["original"])
+        print(f"recovered a stranded mutant: restored {rec['path']} "
+              f"(from {rec['id']})\n")
+    except Exception as e:
+        print(f"WARNING: could not replay {INFLIGHT}: {e}")
+    finally:
+        INFLIGHT.unlink(missing_ok=True)
 
 
 def main():
     pattern = sys.argv[1] if len(sys.argv) > 1 else ""
+    restore_inflight()
     selected = [m for m in MUTANTS if pattern in m[0]]
 
     if not have_vulkan():
@@ -311,10 +442,15 @@ def main():
               "cannot be killed because their tests will skip\n")
 
     print(f"baseline: ", end="", flush=True)
-    if not run_tests():
+    try:
+        ok = run_tests()
+    except OutOfDisk as e:
+        print(f"OUT OF DISK ({e}) — free space and rerun; this is not a test failure")
+        return 3
+    if not ok:
         print("FAILING — fix the suite before mutating")
         return 2
-    print("green\n")
+    print(f"green  ({free_mb()} MB free)\n")
 
     survived, killed, broken = [], [], []
 
@@ -330,11 +466,20 @@ def main():
             print(f"  ????  {mid}  (pattern matches {original.count(find)}x — ambiguous)")
             continue
 
+        import json
+        INFLIGHT.write_text(json.dumps({"id": mid, "path": rel, "original": original}))
         path.write_text(original.replace(find, repl, 1))
         try:
             passed = run_tests()
+        except OutOfDisk as e:
+            path.write_text(original)
+            print(f"\nABORTED at {mid}: out of disk ({e}).")
+            print("Every remaining mutant would be reported as killed for the "
+                  "wrong reason, so the run stops here.")
+            return 3
         finally:
             path.write_text(original)
+            INFLIGHT.unlink(missing_ok=True)
 
         if passed:
             if mid in EXPECTED_SURVIVORS:
