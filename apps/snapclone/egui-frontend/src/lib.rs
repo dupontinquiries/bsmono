@@ -4128,7 +4128,54 @@ impl Snapclone {
                             // tested all along with nothing supplying their probes;
                             // `video_probe` is the probes.
                             let why = match crate::video_probe::status(false) {
-                                Ok(b) => format!("encoder available: {}", b.name()),
+                                Ok(b) => {
+                                    // THE COMMAND THAT WOULD RUN, not just the backend's
+                                    // name. `av1_encode::command` turns the recorder's own
+                                    // `Plan` into an argv and has had no caller — so the
+                                    // policy decided how to encode and nothing ever asked
+                                    // it. Printed rather than spawned, which is the module's
+                                    // own reason: "for a step that consumes a recording the
+                                    // user cannot get back", a command you can read beats
+                                    // one that already ran.
+                                    //
+                                    // It also cannot run yet, and that is worth being
+                                    // precise about: the recorder COUNTS frames, it does not
+                                    // write them, so there is no input for ffmpeg to read.
+                                    // The argv is what to run once frames land on disk.
+                                    let plan = r.plan(snapclone_av1policy::Tier::Standard);
+                                    // THE FRAMES' OWN SIZE. The recorder takes it from the
+                                    // first frame and rejects any that disagree, so it is the
+                                    // real one — a hardcoded 720x1280 would produce an argv
+                                    // that looks right and encodes a stretched clip on every
+                                    // other sensor. No size means no frame was ever accepted,
+                                    // which is a different thing from a missing encoder and
+                                    // says so.
+                                    match r.size() {
+                                        None => format!(
+                                            "{} ready, but no frame was accepted \u{2014}                                              nothing to encode",
+                                            b.name()
+                                        ),
+                                        Some((w, h)) => {
+                                            let src = crate::av1_encode::Source::RawStdin {
+                                                width: w,
+                                                height: h,
+                                                fps: r
+                                                    .measured_fps()
+                                                    .map(|f| f.round() as u32)
+                                                    .unwrap_or(30),
+                                                pix_fmt: "yuv420p".to_string(),
+                                            };
+                                            match crate::av1_encode::command(&src, &plan, "snap.mkv") {
+                                                Ok(argv) => format!(
+                                                    "{} ready \u{2014} would run: {}",
+                                                    b.name(),
+                                                    crate::av1_encode::display(&argv)
+                                                ),
+                                                Err(e) => format!("{}: {e}", b.name()),
+                                            }
+                                        }
+                                    }
+                                }
                                 Err(missing) => missing.join("; "),
                             };
                             format!(
