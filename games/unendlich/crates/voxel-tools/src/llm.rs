@@ -174,6 +174,31 @@ impl Completer for CommandProvider {
 /// through it comes back empty. A program's own parser reports what it
 /// cannot read, so the job here is only to remove the wrapper a model
 /// puts around code.
+/// Did this reply run out of room rather than finish?
+///
+/// A reply that hits its token cap stops MID-LINE, and nothing
+/// detected it: the half-written program failed to parse and the
+/// player was told "produced no plan lines", which is true and
+/// useless. The tells are structural -- an unclosed block, a line with
+/// no newline after it, a trailing key with no value.
+pub fn looks_truncated(raw: &str) -> bool {
+    let t = raw.trim_end();
+    if t.is_empty() { return false; }
+    // ended in the middle of a word or a key=value
+    if t.ends_with('=') || t.ends_with(',') || t.ends_with('{') { return true; }
+    // a block was opened and never closed
+    let opens = t.lines().filter(|l| {
+        let h = l.trim().split_whitespace().next().unwrap_or("").to_lowercase();
+        ["asset", "frame", "pass", "flair"].contains(&h.as_str())
+    }).count();
+    let closes = t.lines().filter(|l| l.trim().eq_ignore_ascii_case("end")).count();
+    if opens > closes { return true; }
+    // the last line looks like the start of a statement that needs more
+    let last = t.lines().last().unwrap_or("").trim().to_lowercase();
+    ["part", "rel", "repeat", "space", "adj", "section"].iter()
+        .any(|k| last == *k || (last.starts_with(k) && last.split_whitespace().count() < 3))
+}
+
 pub fn strip_fences(raw: &str) -> String {
     let mut out = String::new();
     let mut in_fence = false;
@@ -938,5 +963,24 @@ mod tests {
         assert!(!s.contains("Sure!") && !s.contains("Let me know"), "{s}");
         let (prog, _) = crate::program::parse(&s);
         assert_eq!(prog.passes.len(), 1);
+    }
+
+    #[test]
+    fn a_reply_that_ran_out_of_room_is_detectable() {
+        // it stops MID-LINE, and the half-written program fails to
+        // parse: the player was told "produced no plan lines", which is
+        // true and useless
+        for cut in ["pass mass add\n  part body box w=20 h=10 d=",
+                    "asset merlon\n  part m box w=2 h=3 d=2 material=stone\nend\npass a add\n  part x",
+                    "pass a add\n  part x box w=4 material=stone\n",
+                    "part"] {
+            assert!(looks_truncated(cut), "{cut:?} should look cut off");
+        }
+        // and a complete one does not
+        for whole in ["pass a add\n  part x box w=4 material=stone\n  rel x on ground\nend\n",
+                      "IT IS: a giant tree\nMATERIALS: oak\n",
+                      "done\n", ""] {
+            assert!(!looks_truncated(whole), "{whole:?} is complete");
+        }
     }
 }

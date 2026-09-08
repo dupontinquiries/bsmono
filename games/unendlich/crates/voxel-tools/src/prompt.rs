@@ -118,6 +118,47 @@ pub const COMPACT_BELOW_CTX: usize = 8192;
 /// drowns in a long prompt whether or not it fits, and a 70B is wasted
 /// on a short one. Context is the tie-break for models whose size is
 /// unknown.
+/// What a turn is being asked to WRITE, which decides how much room it
+/// needs. A reply cap set by model tier alone is wrong in both
+/// directions: a one-line carve gets 1400 tokens it will not use, and
+/// a castle program gets 300 and is cut off mid-line.
+///
+/// A truncated reply is worse than a short one. It does not parse, and
+/// nothing detected it -- "the model replied but produced no plan
+/// lines" was, at least sometimes, a program cut in half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Job {
+    /// One or two lines: a carve, a form, a verdict.
+    Line,
+    /// Prose about what a thing is: a study rung, a reading.
+    Answer,
+    /// A plan of a few ops.
+    Plan,
+    /// A program with assets, passes and flair. The long one.
+    Program,
+}
+
+impl Job {
+    /// Tokens to allow. The FLOOR is what the job needs, not what the
+    /// tier can afford: a small model asked for a program and given
+    /// 300 tokens produces a broken program, which is worse than a
+    /// small model given room and producing a short one.
+    pub fn tokens(self, tier: Tier) -> usize {
+        let head = match tier {
+            Tier::Tiny => 1.0, Tier::Compact => 1.3, Tier::Medium => 2.0, Tier::Full => 3.0,
+        };
+        let base = match self {
+            Job::Line => 200.0,
+            Job::Answer => 500.0,
+            Job::Plan => 900.0,
+            // A castle is 15 passes, 4 assets and flair: 80-120 lines
+            // at ~30 tokens each. 1400 was less than half of one.
+            Job::Program => 2600.0,
+        };
+        (base * head) as usize
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier { Tiny, Compact, Medium, Full }
 
@@ -766,5 +807,28 @@ mod tests {
             assert!(plan.ops.len() >= 2, "{body}");
             for l in body.lines() { assert!(crate::plan::line_is_valid_ir(l), "the validator accepts {l:?}"); }
         }
+    }
+
+    #[test]
+    fn the_budget_fits_the_job_not_only_the_model() {
+        // 300/400/900/1400 by tier alone: a one-line carve got 1400 it
+        // would not use, and a castle program got 300 and was cut off
+        // mid-line. A truncated program does not parse, and nothing
+        // detected it -- "produced no plan lines" was sometimes a
+        // program cut in half.
+        for tier in [Tier::Tiny, Tier::Compact, Tier::Medium, Tier::Full] {
+            let line = Job::Line.tokens(tier);
+            let prog = Job::Program.tokens(tier);
+            assert!(prog > line * 6, "{tier:?}: a program needs far more than a line: {prog} vs {line}");
+            // even the smallest model gets room for a real program:
+            // roughly 80 lines at 30 tokens
+            assert!(prog >= 2400, "{tier:?} program budget {prog} is under 80 lines");
+            assert!(line <= 700, "{tier:?} wastes {line} on one line");
+            // and the order is always the same
+            assert!(Job::Answer.tokens(tier) > line);
+            assert!(Job::Plan.tokens(tier) > Job::Answer.tokens(tier));
+        }
+        // a bigger model gets more room for the same job
+        assert!(Job::Program.tokens(Tier::Full) > Job::Program.tokens(Tier::Tiny) * 2);
     }
 }

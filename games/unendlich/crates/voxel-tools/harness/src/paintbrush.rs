@@ -545,6 +545,9 @@ pub struct Paintbrush {
     review_round: usize,
     /// Rounds still owed once the current drone lands.
     review_pending_after_drone: usize,
+    /// What the next turn is being asked to write, so its reply budget
+    /// fits the job. Set beside every `spawn_turn`.
+    pending_job: voxel_tools::prompt::Job,
     /// What pass 1 decided the thing IS. Kept past the turn, because a
     /// later pass failing does not make the reading wrong.
     last_reading: Option<voxel_tools::compose::Reading>,
@@ -645,6 +648,7 @@ impl Paintbrush {
             review_rounds: 1,
             review_round: 0,
             review_pending_after_drone: 0,
+            pending_job: voxel_tools::prompt::Job::Plan,
             last_reading: None,
             study: None,
             study_rungs: Vec::new(),
@@ -1155,6 +1159,11 @@ impl Paintbrush {
             // is a report nobody can act on -- not the player, and not
             // me reading the log afterwards. The reply is the evidence.
             log::warn!("[paintbrush] no plan lines from {} chars. The reply was:\n{raw}", raw.len());
+            if voxel_tools::llm::looks_truncated(raw) {
+                self.say(format!("the reply was CUT OFF at the {}-token limit -- \
+                                  a bigger model or a smaller request will finish it",
+                                 self.max_reply_tokens()));
+            }
             self.say(format!("the model replied ({} chars) but produced no plan lines: {:?}",
                              raw.len(), raw.trim().chars().take(90).collect::<String>()));
             // NOTHING IS THE WORST ANSWER. A player who typed a request
@@ -1297,6 +1306,8 @@ impl Paintbrush {
         let p = voxel_tools::program::plan_prompt(prose, &reading);
         let _ = cm;
         self.say("planning the passes ...");
+        // the long one: a program with assets, passes and flair
+        self.pending_job = voxel_tools::prompt::Job::Program;
         self.spawn_turn(completer,
             "You are a builder planning a voxel build as assets and passes.".into(),
             Box::new(move || p), gaze, player_feet, prose, TurnKind::Compose);
@@ -1309,6 +1320,7 @@ impl Paintbrush {
         let st = self.study.clone().unwrap_or_default();
         let h = self.study_height;
         let p = voxel_tools::study::prompt(rung, prose, h, &st);
+        self.pending_job = voxel_tools::prompt::Job::Answer;
         self.spawn_turn(completer,
             "You are a sculptor describing a subject precisely enough to build it.".into(),
             Box::new(move || p), gaze, player_feet, prose, TurnKind::Study);
@@ -1382,6 +1394,17 @@ impl Paintbrush {
         // If it asked, answer and let it plan again with the answers;
         // if it asked AND planned, use the plan and keep the answers
         // for the next turn.
+        // A PROGRAM CUT IN HALF does not parse, and the player was told
+        // "produced no plan lines" -- true and useless. Say which it
+        // was, and keep whatever passes did complete rather than
+        // throwing the whole reply away.
+        if voxel_tools::llm::looks_truncated(raw) {
+            let done = voxel_tools::program::parse(&voxel_tools::llm::strip_fences(raw)).0.passes.len();
+            log::warn!("[paintbrush] the reply was truncated at {} tokens; {done} pass(es) survived",
+                       self.max_reply_tokens());
+            self.say(format!("the reply ran out of room at {} tokens; using the {done} pass(es) \
+                              that finished", self.max_reply_tokens()));
+        }
         let (asks, remainder) = voxel_tools::probe::take_asks(raw);
         if !asks.is_empty() {
             for (q, a) in &asks {
@@ -1614,6 +1637,7 @@ impl Paintbrush {
                 for l in m.log.iter().take(4) { self.say(format!("  {l}")); }
                 for u in &m.unplaced { self.say(format!("  could not place: {u}")); }
                 let p = voxel_tools::typology::massing_prompt(prose, &t, &wishes);
+                self.pending_job = voxel_tools::prompt::Job::Plan;
                 self.spawn_turn(completer,
                     "You are an architect deciding how a building divides into sections.".into(),
                     Box::new(move || p), gaze, player_feet, prose, TurnKind::Massing);
@@ -1627,6 +1651,7 @@ impl Paintbrush {
             let ip = voxel_tools::compose::interpret_prompt(prose, &site);
             log::info!("[paintbrush] composing: the dictionary has no word for {prose:?}");
             self.say("thinking about what this is ...");
+            self.pending_job = voxel_tools::prompt::Job::Answer;
             self.spawn_turn(completer,
                 "You are a builder who has made thousands of things in voxel worlds.".into(),
                 Box::new(move || ip), gaze, player_feet, prose, TurnKind::Interpret);
@@ -1651,13 +1676,19 @@ impl Paintbrush {
     }
 
     /// The reply cap for the tier, as tokens to reserve.
+    /// Room for the reply, sized to WHAT IS BEING ASKED FOR.
+    ///
+    /// Was 300/400/900/1400 by model tier alone, which is wrong in both
+    /// directions: a one-line carve got 1400 it would not use, and a
+    /// castle program -- 15 passes, 4 assets and flair, 80 to 120 lines
+    /// at about 30 tokens each -- got 300 and stopped mid-line. Twelve
+    /// lines was never going to describe a thousand blocks of detail.
     fn max_reply_tokens(&self) -> usize {
-        match self.prompt_tier() {
-            voxel_tools::prompt::Tier::Tiny => 300,
-            voxel_tools::prompt::Tier::Compact => 400,
-            voxel_tools::prompt::Tier::Medium => 900,
-            voxel_tools::prompt::Tier::Full => 1400,
-        }
+        self.reply_tokens_for(self.pending_job)
+    }
+
+    fn reply_tokens_for(&self, job: voxel_tools::prompt::Job) -> usize {
+        job.tokens(self.prompt_tier())
     }
 
     fn prompt_tier(&self) -> voxel_tools::prompt::Tier {
