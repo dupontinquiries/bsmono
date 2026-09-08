@@ -2,10 +2,12 @@
 //! Spawning the `yt-dlp` process lives in the source implementation, not here,
 //! so the policy is testable with fixtures.
 
+pub mod http;
 pub mod probe;
 pub mod resolve;
 pub mod select;
 
+pub use http::{ChunkPolicy, HttpByteSource, HttpError, HttpTransport, RangeRequest};
 pub use probe::{parse, Probe, RawFormat};
 pub use resolve::{build_args, url_expiry, CommandRunner, ResolveError, ResolveOptions, Resolved, Resolver, RunError};
 pub use select::{select, Reject, SelectError, Selection, Verdict};

@@ -195,6 +195,19 @@ MUTANTS = [
     ("mp4/box-past-limit-allowed", "crates/vidkit-mp4/src/boxes.rs",
      "    if end > limit {", "    if false {"),
 
+    # --- http byte source ---------------------------------------------------
+    ("http/range-header-off-by-one", "crates/vidkit-ytdlp/src/http.rs",
+     'format!("bytes={}-{}", self.start, self.end)',
+     'format!("bytes={}-{}", self.start, self.end + 1)'),
+    ("http/headers-dropped", "crates/vidkit-ytdlp/src/http.rs",
+     "            headers: self.headers.clone(),", "            headers: Default::default(),"),
+    ("http/range-ignored-not-checked", "crates/vidkit-ytdlp/src/http.rs",
+     "                    if bytes.len() > wanted {", "                    if false {"),
+    ("http/expired-source-keeps-reading", "crates/vidkit-ytdlp/src/http.rs",
+     '        if self.expired {\n            return Err(Error::Io("media URL expired; re-resolve and rebind".into()));\n        }', ""),
+    ("http/window-never-reused", "crates/vidkit-ytdlp/src/http.rs",
+     "        if !self.window_covers(offset, buf.len()) {", "        if true {"),
+
     # --- cross-crate seams (only the pipeline test sees these) --------------
     ("seam/player-seek-skips-decoder-flush", "crates/vidkit-core/src/player.rs",
      "        self.decoder.flush()?;", ""),
