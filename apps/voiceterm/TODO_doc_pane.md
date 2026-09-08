@@ -70,3 +70,32 @@ common wrapper forms (sudo CMD, nice -n N CMD, env VAR=x CMD) work.
 Implicit-mode flow now: extract_query(foreground/last-command) -> resolve
 -> spawn. Remaining = the build-gated spawn wiring (availability hookup +
 zellij new-pane / app doc panel).
+
+
+## DONE in the egui frontend (2026-09-07)
+
+"Implicit-mode flow now: extract_query(foreground/last-command) -> resolve -> spawn. Remaining
+= the build-gated spawn wiring." `doc_resolver` — 11 tests, probe-driven, three real bugs
+caught by its own probes — had never been mounted in this frontend, so there was no resolve
+step here at all. Mounting it brought those tests into the crate.
+
+`doc_avail` answers the resolver's three questions from what this build holds, and is separate
+because the resolver takes CLOSURES precisely so it can be tested without a filesystem.
+
+* **tldr** comes from the command index the app already carries, matched case-insensitively.
+* **on PATH** uses the index's own flag when it has one and walks `$PATH` otherwise. A command
+  with no tldr page is exactly where this question decides between `--help` and a web search,
+  so answering "no" for everything unindexed would send every unindexed tool to the browser. A
+  name containing a separator is refused rather than probed — `resolve` hands us the head of a
+  command line, and a query should not decide which file gets stat-ed.
+* **bundled man** is ALWAYS FALSE, and that is a fact rather than a stub. The corpus is in
+  `manpages.rs`, whose Qt-free half shares a file with `to_qml`; `manpage_view` records why
+  the split has not happened. False is the CORRECT answer — `resolve` then prefers tldr,
+  system man or `--help`, all reachable here, where true would route a query to an in-app
+  renderer with nothing to render.
+
+`Command::DocsForLastCommand` runs the flow. The three sources that mean "run something" are
+STAGED, not executed: `man` on the wrong page is a keystroke from being fixed, and that is the
+contract every other suggestion in this app keeps. `BundledManPage` is matched by name rather
+than swept into a fallthrough, so the day the corpus is mountable it is the one line that
+changes.

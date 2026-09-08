@@ -1230,6 +1230,48 @@ impl VoicetermApp {
                 let share = voiceterm_egui::zk_share::Share::from_cards(&self.deck.cards);
                 self.zk_share = Some(ZkShareUi { share, dialog: None, frames: Vec::new(), shown: None, note: String::new() });
             }
+            Command::DocsForLastCommand => {
+                use voiceterm_egui::doc_resolver::{self as dr, DocSource};
+                // The query is the last command's SUBJECT, not the whole line.
+                // `extract_query` strips env assignments, wrapper commands and the pipeline
+                // tail, and keeps the subcommand for tools that dispatch on one — 11 tests,
+                // three real bugs caught by its own probes, and no caller in this frontend
+                // until now.
+                let line = self.blocks.blocks.last().map(|b| b.command.clone()).unwrap_or_default();
+                let Some(query) = dr::extract_query(&line) else {
+                    self.toasts.info("nothing to look up yet", 0.0);
+                    return;
+                };
+                let facts = voiceterm_egui::doc_avail::Facts { docs: &self.cmd_docs };
+                let source = dr::resolve(
+                    &query,
+                    &dr::Availability {
+                        bundled_man: &|k| facts.bundled_man(k),
+                        has_tldr: &|n| facts.has_tldr(n),
+                        on_path: &|n| facts.on_path(n),
+                    },
+                );
+                match source {
+                    // The two that RUN something are staged, not executed — the contract
+                    // every other suggestion here keeps, and `man` on the wrong page is a
+                    // keystroke from being fixed.
+                    DocSource::SystemMan(arg) => self.stage_command(&format!("man {arg}")),
+                    DocSource::HelpFlag(cmd) => self.stage_command(&format!("{cmd} --help")),
+                    // tldr is a command here too: this build indexes tldr pages for search
+                    // but does not render one, so staging it is honest where opening a
+                    // renderer that does not exist would not be.
+                    DocSource::Tldr(name) => self.stage_command(&format!("tldr {name}")),
+                    // Not reachable in this build — see `doc_avail::bundled_man` — but
+                    // matched by name so the day the corpus is mountable this is the one
+                    // line that changes.
+                    DocSource::BundledManPage(key) => {
+                        self.toasts.info(&format!("no bundled page for {key} in this build"), 0.0)
+                    }
+                    DocSource::WebSearch(q) => {
+                        self.toasts.info(&format!("no local docs for {q:?} — try the web pane"), 0.0)
+                    }
+                }
+            }
             Command::OpenInEditor(phrase) => {
                 use voiceterm_egui::editor_open as eo;
                 match eo::parse_open_request(&phrase) {

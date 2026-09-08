@@ -387,6 +387,13 @@ pub mod count_prefix;
 /// the Qt build since v0.1.719 and never mounted here — the other half of `count_prefix`.
 #[path = "../../src/tab_cycle.rs"]
 pub mod tab_cycle;
+/// Which documentation a command should open: bundled man page, system man, tldr, `--help`,
+/// or a web search. 11 tests, probe-driven, and never mounted here
+/// (`TODO_doc_pane.md`'s "implicit-mode brain").
+#[path = "../../src/doc_resolver.rs"]
+pub mod doc_resolver;
+/// The availability facts `doc_resolver` asks for, answered from what this frontend holds.
+pub mod doc_avail;
 /// Note clipping's data model + markdown serialization — see
 /// TODO_notes_clip.md. Pure and tested since v0.1.641; had no re-export
 /// and no caller in this frontend before now, same shape as notebook.rs

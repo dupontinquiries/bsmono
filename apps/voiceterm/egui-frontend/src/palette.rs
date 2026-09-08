@@ -115,6 +115,9 @@ pub enum Command {
     /// `editor_open` has been pure and tested since v0.1.654 and wired into the Qt build; it
     /// was never mounted in this frontend.
     OpenInEditor(String),
+    /// Docs for whatever the terminal last ran — `TODO_doc_pane.md`'s implicit mode:
+    /// `extract_query(last command) -> resolve -> open or stage`.
+    DocsForLastCommand,
     /// Share the zettelkasten as a huge QR code — the picker with the
     /// paintbrush, two confirmation gates, then the code (`zk_share`).
     /// Reachable from the notes panes' palette like everything else here.
