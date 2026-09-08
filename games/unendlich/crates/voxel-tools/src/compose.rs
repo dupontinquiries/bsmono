@@ -348,6 +348,51 @@ impl Programmed {
     }
 }
 
+/// Build SOMETHING from what pass 1 established, when the model could
+/// not write a program.
+///
+/// Observed with a 1B: pass 1 answered well -- "it is: A giant tree
+/// from Avatar" -- pass 2 returned 264 characters containing no
+/// passes, the plan fallback produced no lines either, and NOTHING WAS
+/// BUILT. The player typed a request, waited through two model turns,
+/// and got an apology.
+///
+/// A reading is enough to build from. It has a subject, a scale, and
+/// usually some parts; `profile` can make a mass with a silhouette out
+/// of almost anything, and a tree, a tower, a mushroom and a monument
+/// are all a stalk and a crown. This will not be what they imagined,
+/// but it is the shape of the right thing in the right place, and it
+/// can be reviewed into something better. Nothing cannot.
+pub fn last_resort(reading: &Reading, request: &str) -> String {
+    let h = reading.scale.unwrap_or(24).clamp(4, 400);
+    let words: Vec<String> = format!("{} {}", reading.essence, request).to_lowercase()
+        .split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 2)
+        .map(|s| s.to_string()).collect();
+    let has = |w: &str| words.iter().any(|x| x == w);
+    // The silhouette, guessed from the words. Crude on purpose: a
+    // wrong silhouette in the right place beats nothing at all.
+    let (radii, material) = if has("tree") || has("mushroom") || has("canopy") {
+        ("2,1.6,1.4,1.3,1.5,6,9,7,3", "oak_log")
+    } else if has("tower") || has("spire") || has("obelisk") || has("column") {
+        ("5,4.5,4,3.5,3,2.5,1.5", "stone")
+    } else if has("dome") || has("hill") || has("mound") {
+        ("9,8.5,7.5,6,4,2", "stone")
+    } else if has("arch") || has("gate") || has("bridge") {
+        ("6,5,4,4,5,6", "stone")
+    } else if has("crystal") || has("shard") || has("spike") {
+        ("4,3,2,1", "quartz")
+    } else {
+        // a plinth and a mass: the shape of a monument, which is what
+        // an unrecognised noun asked for at size usually is
+        ("6,5,4,5,6,5,3", "stone")
+    };
+    let material = reading.materials.first().map(|m| m.as_str()).unwrap_or(material);
+    let safe: String = material.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+    format!("# last resort: {}\npass mass add\n               part body profile r={radii} h={h} material={}\n               rel body on ground\nend\n",
+            reading.essence.chars().take(60).collect::<String>(),
+            if safe.is_empty() { "stone".to_string() } else { safe })
+}
+
 /// Passes 3 and 4: a composed sketch to IR and cells.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Built {
@@ -567,5 +612,44 @@ mod tests {
         // and a castle still programmes, a water sphere still composes
         assert_eq!(choose_path("a huge fortress"), Path::Programme);
         assert_eq!(choose_path("a water sphere"), Path::Compose);
+    }
+
+    #[test]
+    fn something_is_always_built_from_what_pass_one_established() {
+        // Observed with a 1B: pass 1 answered "it is: A giant tree from
+        // Avatar", pass 2 returned 264 characters with no passes, the
+        // plan fallback produced no lines, and NOTHING WAS BUILT. The
+        // player waited through two model turns for an apology.
+        for (essence, request, hint) in [
+            ("A giant tree from Avatar", "a giant tree", "oak_log"),
+            ("a tall watchtower", "a tower on the hill", "stone"),
+            ("a crystal shard", "a crystal", "quartz"),
+            ("something nobody has a word for", "a florbnax", "stone")] {
+            let mut r = Reading { essence: essence.into(), ..Default::default() };
+            r.scale = Some(30);
+            let src = last_resort(&r, request);
+            let (prog, errs) = crate::program::parse(&src);
+            assert!(errs.is_empty(), "{request}: {src}\n{errs:?}");
+            assert_eq!(prog.passes.len(), 1);
+            let run = crate::program::run(&prog, (0, 64, 0));
+            assert!(run.errors.is_empty(), "{request}: {:?}", run.errors);
+            assert!(run.changes.len() > 200, "{request} built {} cells", run.changes.len());
+            let _ = hint;
+        }
+        // it is the size asked for
+        let mut big = Reading { essence: "a tower".into(), ..Default::default() };
+        big.scale = Some(90);
+        let (p, _) = crate::program::parse(&last_resort(&big, "a huge tower"));
+        let run = crate::program::run(&p, (0, 64, 0));
+        let ys: std::collections::BTreeSet<i32> = run.changes.iter().map(|c| c.at.1).collect();
+        assert!(ys.len() > 70, "a 90-block tower is tall: {} levels", ys.len());
+        // a tree is not a tower: the silhouette differs
+        let mut t = Reading { essence: "a giant tree".into(), ..Default::default() };
+        t.scale = Some(40);
+        let tree = last_resort(&t, "a tree");
+        let mut w = Reading { essence: "a watchtower".into(), ..Default::default() };
+        w.scale = Some(40);
+        assert_ne!(tree, last_resort(&w, "a tower"));
+        assert!(tree.contains("oak_log"), "a tree is wood: {tree}");
     }
 }

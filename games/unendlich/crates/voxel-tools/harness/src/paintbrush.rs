@@ -545,6 +545,9 @@ pub struct Paintbrush {
     review_round: usize,
     /// Rounds still owed once the current drone lands.
     review_pending_after_drone: usize,
+    /// What pass 1 decided the thing IS. Kept past the turn, because a
+    /// later pass failing does not make the reading wrong.
+    last_reading: Option<voxel_tools::compose::Reading>,
     /// The study ladder, while it is being climbed.
     study: Option<voxel_tools::study::Study>,
     study_rungs: Vec<voxel_tools::study::Rung>,
@@ -642,6 +645,7 @@ impl Paintbrush {
             review_rounds: 1,
             review_round: 0,
             review_pending_after_drone: 0,
+            last_reading: None,
             study: None,
             study_rungs: Vec::new(),
             study_at: 0,
@@ -1147,7 +1151,30 @@ impl Paintbrush {
         log::info!("[paintbrush] provider returned {} chars -> {} plan lines",
                    raw.len(), ir.lines().count());
         if ir.trim().is_empty() {
-            self.say(format!("the model replied ({} chars) but produced no plan lines", raw.len()));
+            // WHAT DID IT ACTUALLY SAY? "264 chars but no plan lines"
+            // is a report nobody can act on -- not the player, and not
+            // me reading the log afterwards. The reply is the evidence.
+            log::warn!("[paintbrush] no plan lines from {} chars. The reply was:\n{raw}", raw.len());
+            self.say(format!("the model replied ({} chars) but produced no plan lines: {:?}",
+                             raw.len(), raw.trim().chars().take(90).collect::<String>()));
+            // NOTHING IS THE WORST ANSWER. A player who typed a request
+            // and waited through two model turns should not get an
+            // apology. If pass 1 established what the thing IS, that is
+            // enough to build a mass of the right size in the right
+            // place, which can then be reviewed into something better.
+            if let Some(reading) = self.last_reading.clone() {
+                let src = voxel_tools::compose::last_resort(&reading, prose);
+                log::info!("[paintbrush] last resort from the reading: {src}");
+                self.say("building the shape of it, so there is something to correct");
+                let view = WorldView(cm);
+                let mut staged = StagedWorld::new(&view);
+                let r = {
+                    let mut tools = VoxelTools::new(&mut staged);
+                    self.session.receive_program(&mut tools, gaze, &src, player_feet, prose)
+                };
+                self.push(r);
+                self.flush_staged(cm, &mut staged);
+            }
             return;
         }
         self.launch_drone(cm, gaze, ir, player_feet, prose);
@@ -1819,6 +1846,9 @@ impl Paintbrush {
                         // pass 1 answered; carry its reading into pass 2
                         let reading = voxel_tools::compose::parse_reading(&raw);
                         log::info!("[paintbrush] reading: {}", reading.essence);
+                        // kept so a later failure still has something
+                        // to build from
+                        self.last_reading = Some(reading.clone());
                         self.say(format!("it is: {}", reading.essence));
                         if !reading.pitfalls.is_empty() {
                             self.say(format!("avoiding: {}", reading.pitfalls.join("; ")));

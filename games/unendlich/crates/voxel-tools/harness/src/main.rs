@@ -42,6 +42,7 @@ fn main() {
     four_pass_scenario();
     programme_scenario();
     study_scenario();
+    floor_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -1143,4 +1144,47 @@ fn study_scenario() {
     println!("  {}", built.trim().lines().next().unwrap_or(""));
     assert!(!log.iter().any(|l| l.contains("form statue")),
             "the dictionary statue was NOT used: {log:?}");
+}
+
+
+/// The 1B failure: pass 1 answers, pass 2 is garbage, and something
+/// must still get built.
+fn floor_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== the floor under a failing model");
+    struct Weak { n: std::sync::Arc<std::sync::atomic::AtomicUsize> }
+    impl voxel_tools::llm::Completer for Weak {
+        fn name(&self) -> &str { "weak" }
+        fn complete(&mut self, _: &str, _: &str) -> Result<String, String> {
+            let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(if i == 0 {
+                "IT IS: A giant tree from Avatar\nMATERIALS: oak_log\nSCALE: 40\n".into()
+            } else {
+                // exactly the shape of the observed failure: fluent
+                // prose, no program, no plan lines
+                "Sure! I would build this as a tall structure with roots spreading out at \
+                 the bottom and a wide canopy up top, using natural materials throughout \
+                 to give it an organic feel that fits the landscape nicely.".into()
+            })
+        }
+    }
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(Weak { n }))));
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -14.0], [0.0, -0.3, 1.0], Some(([0, 64, 0], [0, 1, 0], 15.0)));
+    pb.start_turn(&cm, &gaze, Some("grass"), "a giant tree from avatar", None);
+    let t0 = std::time::Instant::now();
+    while pb.run.as_ref().map(|r| r.is_running()).unwrap_or(false) && t0.elapsed().as_secs() < 40 {
+        pb.poll_turn(&cm); pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    let log = pb.drain_log();
+    for l in log.iter().filter(|l| l.contains("it is:") || l.contains("no plan lines")
+                               || l.contains("shape of it") || l.contains("cells")) {
+        println!("  {}", l.trim().chars().take(120).collect::<String>());
+    }
+    assert!(log.iter().any(|l| l.contains("A giant tree")), "pass 1 worked: {log:?}");
+    // THE POINT: something got built anyway
+    assert!(log.iter().any(|l| l.contains("cells")), "something was built: {log:?}");
+    assert!(log.iter().any(|l| l.contains("shape of it")), "and it said so: {log:?}");
 }
