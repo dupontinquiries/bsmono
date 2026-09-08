@@ -86,10 +86,21 @@ pub enum ViewLock {
 #[derive(Copy, Clone, Debug)]
 pub struct GestureConfig {
     /// Movement needed before the axis locks, in points.
+    ///
+    /// Also up 5%, for the same reason: the threshold that decides whether a
+    /// gesture happened at all should move with the one that decides how much.
     pub axis_lock_px: f32,
     /// Width of the rotate strip, as a fraction of the surface. 0 disables it.
     pub rotate_edge_fraction: f32,
     /// Vertical travel per volume/speed detent, in points.
+    ///
+    /// Raised 5% from the original 28 to 29.4: the steps stay 5% of the value,
+    /// the finger has to move slightly further to earn one.
+    ///
+    /// Taken literally from "less sensitive by 5%", and 5% is a small change --
+    /// about 1.4 points, which is under a millimetre on a phone. If the intent
+    /// was "noticeably less twitchy", this is the one number: 40 needs a
+    /// deliberate drag, 28 responds to a nudge.
     pub detent_px: f32,
     /// Vertical travel per rotation, in points.
     pub rotate_px: f32,
@@ -113,9 +124,9 @@ pub struct GestureConfig {
 impl Default for GestureConfig {
     fn default() -> Self {
         Self {
-            axis_lock_px: 8.0,
+            axis_lock_px: 8.4,
             rotate_edge_fraction: 0.10,
-            detent_px: 28.0,
+            detent_px: 29.4,
             rotate_px: 90.0,
             zoom_detent: 0.05,
             lock_zoom_in: 2.5,
@@ -592,6 +603,25 @@ mod tests {
     }
 
     /// Detents, not a continuous stream: a 10-pixel twitch must do nothing.
+    /// The sensitivity change, pinned so it cannot drift back silently. A
+    /// movement that used to earn a detent at 28 points must not at 29.4.
+    #[test]
+    fn the_detent_is_five_percent_less_sensitive_than_28() {
+        let cfg = GestureConfig::default();
+        assert!(
+            (cfg.detent_px - 29.4).abs() < 0.01,
+            "detent is {}, expected 29.4",
+            cfg.detent_px
+        );
+        // A 29-point drag was one detent at the old threshold and is none now.
+        let mut r = GestureRouter::new(cfg);
+        let out = drag(&mut r, pos2(100.0, 300.0), vec![vec2(0.0, -9.0), vec2(0.0, -20.0)]);
+        assert!(
+            out.is_empty(),
+            "29 points still fired a detent: {out:?}"
+        );
+    }
+
     #[test]
     fn small_movements_do_not_fire_a_detent() {
         let mut r = router();

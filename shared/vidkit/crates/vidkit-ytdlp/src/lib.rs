@@ -3,11 +3,13 @@
 //! so the policy is testable with fixtures.
 
 pub mod http;
+pub mod paste;
 pub mod probe;
 pub mod resolve;
 pub mod select;
 
 pub use http::{ChunkPolicy, HttpByteSource, HttpError, HttpTransport, RangeRequest};
+pub use paste::{classify, related_from_json, Paste, Related, RelatedEntry};
 pub use probe::{parse, Probe, RawFormat};
 pub use resolve::{build_args, url_expiry, CommandRunner, ResolveError, ResolveOptions, Resolved, Resolver, RunError};
 pub use select::{select, Reject, SelectError, Selection, Verdict};

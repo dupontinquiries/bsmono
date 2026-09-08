@@ -22,6 +22,17 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use vidkit_core::caps::DeviceCaps;
 
+/// `M:SS` or `H:MM:SS`, for listing durations next to titles.
+pub fn fmt_secs(secs: f64) -> String {
+    let total = secs.max(0.0) as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
 /// Runs `yt-dlp`. Behind a trait so the policy above it is testable.
 pub trait CommandRunner {
     /// Returns stdout on success. Implementations must not interpret the

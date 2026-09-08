@@ -252,6 +252,19 @@ MUTANTS = [
      "let ix = yi * stride + (xi * comps + comp) * fmt.bytes();",
      "let ix = yi * stride + (xi * comps + comp);"),
 
+    # --- clipboard / related ------------------------------------------------
+    ("paste/playlist-beats-video", "crates/vidkit-ytdlp/src/paste.rs",
+     'if let Some(v) = query_param(t, "v") {', 'if let Some(v) = query_param(t, "list_never") {'),
+    ("paste/prose-accepted", "crates/vidkit-ytdlp/src/paste.rs",
+     "if t.split_whitespace().count() > 1 {", "if false {"),
+    ("paste/flat-entry-has-no-url", "crates/vidkit-ytdlp/src/paste.rs",
+     "        self.id\n            .as_ref()\n            .map(|id| format!(\"https://www.youtube.com/watch?v={id}\"))",
+     "        None"),
+    ("paste/odd-json-panics", "crates/vidkit-ytdlp/src/paste.rs",
+     "serde_json::from_str(json).unwrap_or_default()", 'serde_json::from_str(json).expect("json")'),
+    ("gest/sensitivity-reverted", "crates/vidkit-egui/src/gestures.rs",
+     "            detent_px: 29.4,", "            detent_px: 28.0,"),
+
     # --- http byte source ---------------------------------------------------
     ("http/range-header-off-by-one", "crates/vidkit-ytdlp/src/http.rs",
      'format!("bytes={}-{}", self.start, self.end)',
