@@ -35,12 +35,16 @@ Do not treat that grep as evidence.
 
 - `vidkit-core` — types, traits, capability model, sync policy, frame queue,
   clocks, player loop. No GPU, no toolkit, no process spawning. All pure.
+  `io` holds `ByteSource`: a `read_at`, not a `Read + Seek`, because the two
+  real sources are a file and an HTTP server answering range requests, and a
+  range request *is* a `read_at`.
 - `vidkit-ytdlp` — `yt-dlp -J` parsing, format selection, and the resolve/
-  refresh lifecycle. Process invocation is behind `CommandRunner`.
-- `vidkit-mp4` — ISOBMFF demuxer. Also owns `ByteSource` and the shared IO
-  error type.
-- `vidkit-webm` — Matroska/EBML demuxer. Depends on `vidkit-mp4` for
-  `ByteSource` so the two cannot disagree about what a truncated file is.
+  refresh lifecycle. Process invocation is behind `CommandRunner`. `http` is a
+  `ByteSource` over range requests, with the socket behind `HttpTransport` so
+  the cache and the 403 path are tested with no network — the real transport
+  is a thin wrapper this crate deliberately does not depend on.
+- `vidkit-mp4` — ISOBMFF demuxer.
+- `vidkit-webm` — Matroska/EBML demuxer.
 - `vidkit-v4l2` — stateful decoder state machine, uAPI structs, device layer.
 - `vidkit-vk` — convert shader plus a headless harness that runs it; DMA-BUF
   import path.
@@ -58,6 +62,11 @@ opened, not even `vicodec`. The struct layouts underneath it are verified,
 which removes the largest failure class, but the mmap/EXPBUF/QBUF sequencing
 against a live driver is untested. Expect first-run failures.
 
+**Exists but is not wired:** `HttpByteSource`. Nothing joins `Resolver` to it
+to a demuxer yet, so yt-dlp output still cannot reach playback. The pieces are
+each tested and untested TOGETHER, which is the gap `tests/pipeline.rs` exists
+for.
+
 **Unverified entirely:** the DMA-BUF import path in `vidkit-vk::import`.
 Lavapipe does not expose `VK_EXT_image_drm_format_modifier`, so the harness
 uploads planes through a staging buffer instead. The modifier, disjoint-plane,
@@ -71,9 +80,9 @@ trusting them.
 ## Commands
 
 ```sh
-cargo test --ignore-rust-version            # 308 tests
+cargo test --ignore-rust-version            # 322 tests
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json cargo test -p vidkit-vk
-python3 tools/mutate.py                     # 121 mutants, all must be killed
+python3 tools/mutate.py                     # 126 mutants, all must be killed
 python3 tools/mutate.py shader              # just the WGSL ones
 ```
 
