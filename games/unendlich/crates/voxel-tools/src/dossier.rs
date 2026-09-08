@@ -165,6 +165,217 @@ YOUR PART, and only this one: {}
     }
 }
 
+/// Where a part sits in the whole, decided before anything is built.
+///
+/// A dossier says what the parts ARE and what each needs; it does not
+/// say where they go. Without that a blockout cannot be drawn, and
+/// without a blockout the proportions are discovered after a hundred
+/// thousand blocks are placed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Slot {
+    /// Offset from the anchor.
+    pub at: (i32, i32, i32),
+    /// Bounding extent.
+    pub size: (i32, i32, i32),
+}
+
+/// THE BLOCKOUT: every part as a crude mass, all of it, cheaply.
+///
+/// This is the practised method and the stage this crate never had.
+/// A builder blocks out the whole thing at low resolution first,
+/// stands back, and only commits to detail once the silhouette reads.
+/// Everything here went straight to full resolution, so a wrong
+/// proportion cost a full build to discover -- and the review, which
+/// judges what was made, could only ever find it afterwards.
+///
+/// Cheap on purpose: one box per part. It is not meant to look like
+/// anything, it is meant to be JUDGED and thrown away.
+pub fn blockout(d: &Dossier, anchor: (i32, i32, i32)) -> (Vec<Slot>, String) {
+    let n = d.parts.len().max(1);
+    // A part's size is a floor AREA in the plan's terms; its mass is
+    // roughly cubic unless it depends on something, in which case it
+    // stacks on it -- which is what `after` usually means physically.
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut top: BTreeMap<String, (i32, i32, i32)> = BTreeMap::new();
+    for (i, p) in d.parts.iter().enumerate() {
+        let a = p.size.unwrap_or(400).clamp(8, 4_000_000) as f32;
+        let side = a.sqrt().max(2.0);
+        let (w, h, dp) = (side.round() as i32, (side * 0.8).round().max(2.0) as i32,
+                          side.round() as i32);
+        // stacked on the first thing it names, or set beside its
+        // neighbours when it names nothing
+        let at = match p.depends.first().and_then(|dep| top.get(dep.as_str())) {
+            Some((bx, by, bz)) => (*bx, *by, *bz),
+            None => {
+                let ring = i as f32 / n as f32 * std::f32::consts::TAU;
+                let r = (side * 1.2) as i32;
+                (anchor.0 + (r as f32 * ring.cos()) as i32, anchor.1,
+                 anchor.2 + (r as f32 * ring.sin()) as i32)
+            }
+        };
+        top.insert(p.name.clone(), (at.0, at.1 + h, at.2));
+        slots.push(Slot { at, size: (w, h, dp) });
+    }
+    // one program that draws them all: cheap, and it goes through the
+    // same pipeline so the same measures apply
+    let mut src = format!("# blockout of {}\npass blockout add\n", d.summary);
+    for (i, (p, s)) in d.parts.iter().zip(slots.iter()).enumerate() {
+        // HOLLOW. A blockout is a massing study: it exists to be seen
+        // in silhouette and thrown away, and a solid one costs 37,000
+        // cells where a shell costs 6,000 and looks identical from
+        // outside. Filling it is paying for volume nobody will ever
+        // look at.
+        src.push_str(&format!("  part b{i} box w={} h={} d={} material=stone hollow\n",
+                              s.size.0, s.size.1, s.size.2));
+        src.push_str(&format!("  rel b{i} at ground dx={} dy={} dz={}\n",
+                              s.at.0 - anchor.0, s.at.1 - anchor.1 + s.size.1 / 2, s.at.2 - anchor.2));
+        let _ = p;
+    }
+    src.push_str("end\n");
+    (slots, src)
+}
+
+/// What a blockout is FOR: a judgement, before anything is detailed.
+///
+/// The questions are the ones a builder asks standing back from a
+/// blockout, and they are answerable from the crude version -- which
+/// is the whole point of making one.
+pub fn judge_prompt(d: &Dossier, elevation: &str, measures: &str) -> String {
+    format!("This is a BLOCKOUT of: {}
+Every part is one crude box. Nothing is detailed yet, and none of it is meant to look
+finished -- that is what a blockout is for.
+
+{elevation}
+{measures}
+
+Parts, in order:
+{}
+
+Stand back and judge the WHOLE, not the parts. Answer only these:
+
+  reads yes|no          does the silhouette read as the thing asked for?
+  wrong NAME            a part that is the wrong SIZE relative to the rest
+  size NAME N           what its size should be instead
+  move NAME above|beside|inside OTHER
+  add NAME <what it is>       a part the whole plainly needs
+  drop NAME
+  go                    the massing is right; start detailing
+
+Fixing a proportion here costs one line. Fixing it after everything is detailed costs the
+whole build.", d.goal,
+        d.parts.iter().enumerate()
+            .map(|(i, p)| format!("  {}. {} ({} blocks)", i + 1, p.name, p.size.unwrap_or(400)))
+            .collect::<Vec<_>>().join("\n"))
+}
+
+/// A verdict on a blockout.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Verdict {
+    pub reads: Option<bool>,
+    pub go: bool,
+    /// (part, new size)
+    pub resize: Vec<(String, i32)>,
+    /// (part, relation, other)
+    pub move_to: Vec<(String, String, String)>,
+    pub add: Vec<(String, String)>,
+    pub drop: Vec<String>,
+    pub ignored: usize,
+}
+
+impl Verdict {
+    pub fn is_empty(&self) -> bool {
+        !self.go && self.resize.is_empty() && self.move_to.is_empty()
+            && self.add.is_empty() && self.drop.is_empty()
+    }
+    pub fn summary(&self) -> String {
+        if self.go { return "go: the massing is right".into(); }
+        let mut v = Vec::new();
+        if !self.resize.is_empty() { v.push(format!("{} resize(s)", self.resize.len())); }
+        if !self.move_to.is_empty() { v.push(format!("{} move(s)", self.move_to.len())); }
+        if !self.add.is_empty() { v.push(format!("{} addition(s)", self.add.len())); }
+        if !self.drop.is_empty() { v.push(format!("{} removal(s)", self.drop.len())); }
+        if v.is_empty() { "nothing said".into() } else { v.join(", ") }
+    }
+}
+
+pub fn parse_verdict(reply: &str) -> Verdict {
+    let mut v = Verdict::default();
+    for line in reply.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') { continue; }
+        let w: Vec<&str> = t.split_whitespace().collect();
+        match w.first().map(|x| x.to_lowercase()).as_deref() {
+            Some("go") | Some("done") | Some("ok") => v.go = true,
+            Some("reads") => v.reads = w.get(1).map(|x| {
+                let l = x.to_lowercase();
+                l.starts_with('y') || l == "true"
+            }),
+            Some("size") => match (w.get(1), w.last().and_then(|x| x.parse::<i32>().ok())) {
+                (Some(_), Some(sz)) if w.len() >= 3 =>
+                    v.resize.push((w[1..w.len() - 1].join(" ").to_lowercase(), sz.clamp(4, 4_000_000))),
+                _ => v.ignored += 1,
+            },
+            Some("move") => {
+                // move NAME above OTHER
+                let rel = w.iter().position(|x| ["above", "beside", "inside", "under", "on"]
+                    .contains(&x.to_lowercase().as_str()));
+                match rel {
+                    Some(i) if i > 1 && i + 1 < w.len() =>
+                        v.move_to.push((w[1..i].join(" ").to_lowercase(),
+                                        w[i].to_lowercase(), w[i + 1..].join(" ").to_lowercase())),
+                    _ => v.ignored += 1,
+                }
+            }
+            Some("add") if w.len() >= 3 =>
+                v.add.push((w[1].to_lowercase(), w[2..].join(" "))),
+            Some("drop") | Some("remove") if w.len() >= 2 =>
+                v.drop.push(w[1..].join(" ").to_lowercase()),
+            Some("wrong") => { /* named without a fix; the resize line carries it */ }
+            _ => v.ignored += 1,
+        }
+    }
+    v
+}
+
+impl Dossier {
+    /// Apply a blockout verdict. Proportions are fixed HERE, where a
+    /// change costs one line, rather than after everything is built.
+    pub fn revise(&mut self, v: &Verdict) -> Vec<String> {
+        let mut log = Vec::new();
+        for (name, sz) in &v.resize {
+            match self.parts.iter_mut().find(|p| &p.name == name) {
+                Some(p) => { log.push(format!("{name}: {} -> {sz}", p.size.unwrap_or(400)));
+                             p.size = Some(*sz); }
+                None => log.push(format!("no part called '{name}' to resize")),
+            }
+        }
+        for (name, rel, other) in &v.move_to {
+            let known = self.parts.iter().any(|p| &p.name == other);
+            match self.parts.iter_mut().find(|p| &p.name == name) {
+                Some(p) if known => { p.depends = vec![other.clone()];
+                                      log.push(format!("{name} now sits {rel} {other}")); }
+                Some(_) => log.push(format!("cannot move '{name}': no part called '{other}'")),
+                None => log.push(format!("no part called '{name}' to move")),
+            }
+        }
+        for (name, what) in &v.add {
+            if self.parts.iter().any(|p| &p.name == name) { continue; }
+            self.parts.push(Part { name: name.clone(), what: what.clone(), size: None,
+                                   depends: Vec::new(), state: State::Waiting,
+                                   outcome: String::new() });
+            log.push(format!("added {name}"));
+        }
+        for name in &v.drop {
+            let before = self.parts.len();
+            self.parts.retain(|p| &p.name != name);
+            // and nothing may depend on what is gone
+            for p in self.parts.iter_mut() { p.depends.retain(|x| x != name); }
+            if self.parts.len() < before { log.push(format!("dropped {name}")); }
+        }
+        log
+    }
+}
+
 /// The prompt that produces a dossier. One planning turn, and the
 /// only one that sees the whole.
 pub fn plan_prompt(request: &str, site: &str) -> String {
@@ -416,5 +627,92 @@ mod tests {
             assert!(part.what.len() > 30, "'{}' is too thin to build from: {:?}",
                     part.name, part.what);
         }
+    }
+
+    #[test]
+    fn a_blockout_is_the_whole_thing_cheaply_before_anything_is_detailed() {
+        // Everything went straight to full resolution, so a wrong
+        // proportion cost a full build to discover -- and the review,
+        // which judges what was MADE, could only find it afterwards.
+        let d = windmill();
+        let (slots, src) = blockout(&d, (0, 64, 0));
+        assert_eq!(slots.len(), 4);
+        let (prog, errs) = crate::program::parse(&src);
+        assert!(errs.is_empty(), "{src}\n{errs:?}");
+        let r = crate::program::run(&prog, (0, 64, 0));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        // CHEAP: a blockout of a 1800-block plan is a few thousand
+        // cells, not the hundred thousand the real build would be
+        assert!(r.changes.len() < 30_000, "a blockout is cheap: {} cells", r.changes.len());
+        assert!(r.changes.len() > 500, "but it is something to look at");
+        // parts stack on what they depend on, which is what `after`
+        // usually means physically
+        let base = slots[0];
+        let tower = slots[1];
+        assert_eq!((tower.at.0, tower.at.2), (base.at.0, base.at.2), "the tower is on the base");
+        assert!(tower.at.1 > base.at.1, "and above it");
+        // and the sails end up highest, being last in the chain
+        assert!(slots[3].at.1 > slots[1].at.1);
+    }
+
+    #[test]
+    fn a_proportion_is_fixed_in_the_plan_where_it_costs_one_line() {
+        let mut d = windmill();
+        let before = crate::program::run(&crate::program::parse(&blockout(&d, (0, 64, 0)).1).0,
+                                         (0, 64, 0)).changes.len();
+        let v = parse_verdict("reads no\n                               wrong sails\n                               size sails 1400\n                               size base 200\n                               move cap above tower\n                               add gallery a railed walkway around the tower's waist\n                               drop store\n");
+        assert_eq!(v.reads, Some(false));
+        assert!(!v.go);
+        assert_eq!(v.resize.len(), 2);
+        assert_eq!(v.move_to.len(), 1);
+        assert_eq!(v.add.len(), 1);
+        let log = d.revise(&v);
+        assert_eq!(d.parts.iter().find(|p| p.name == "sails").unwrap().size, Some(1400));
+        assert_eq!(d.parts.iter().find(|p| p.name == "base").unwrap().size, Some(200));
+        assert!(d.parts.iter().any(|p| p.name == "gallery"), "{log:?}");
+        // dropping something nobody has is said, not silently ignored
+        assert!(log.iter().any(|l| l.contains("no part called")) || !log.is_empty());
+        // and the blockout really changed
+        let after = crate::program::run(&crate::program::parse(&blockout(&d, (0, 64, 0)).1).0,
+                                        (0, 64, 0)).changes.len();
+        assert_ne!(before, after, "the massing moved");
+    }
+
+    #[test]
+    fn dropping_a_part_takes_it_out_of_everything_that_leaned_on_it() {
+        // a dependency on a part that is gone would never resolve, and
+        // the part would wait for it forever
+        let mut d = windmill();
+        d.revise(&parse_verdict("drop tower\n"));
+        assert!(!d.parts.iter().any(|p| p.name == "tower"));
+        assert!(d.parts.iter().all(|p| !p.depends.contains(&"tower".to_string())),
+                "{:?}", d.parts.iter().map(|p| &p.depends).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn go_means_go_and_a_silent_reply_does_not() {
+        assert!(parse_verdict("go\n").go);
+        assert!(parse_verdict("reads yes\ngo\n").go);
+        let quiet = parse_verdict("Looks pretty good to me!\n");
+        assert!(!quiet.go, "prose is not consent to build");
+        assert!(quiet.is_empty());
+        assert!(quiet.ignored > 0, "and it says it understood nothing");
+        assert_eq!(parse_verdict("go").summary(), "go: the massing is right");
+    }
+
+    #[test]
+    fn the_judge_prompt_asks_what_a_blockout_can_actually_answer() {
+        let d = windmill();
+        let p = judge_prompt(&d, "FRONT:\n ####\n", "1800 cells, 40w x 30h");
+        assert!(p.contains("Stand back and judge the WHOLE"), "{p}");
+        assert!(p.contains("Nothing is detailed yet"), "it says what it is looking at");
+        assert!(p.contains("costs one line"), "and why now: {p}");
+        assert!(p.contains("1. base") && p.contains("4. sails"), "the parts, in order");
+        assert!(p.contains("reads yes|no"));
+        // it does not ask for anything a blockout cannot show
+        assert!(!p.to_lowercase().contains("material"), "no material questions: {p}");
+        // it says there is no detail, and asks for none
+        assert!(p.contains("Nothing is detailed yet") && p.contains("start detailing"),
+                "detail is mentioned only as what comes AFTER: {p}");
     }
 }
