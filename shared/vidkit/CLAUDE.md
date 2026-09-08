@@ -80,9 +80,9 @@ trusting them.
 ## Commands
 
 ```sh
-cargo test --ignore-rust-version            # 352 tests
+cargo test --ignore-rust-version            # 363 tests
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json cargo test -p vidkit-vk
-python3 tools/mutate.py                     # 143 mutants, all must be killed
+python3 tools/mutate.py                     # 145 mutants, all must be killed
 python3 tools/mutate.py shader              # just the WGSL ones
 ```
 
@@ -212,6 +212,26 @@ is the 480p policy; `u32::MAX` disables it.
 The GPU upload path (`glow-upload`) is the third lever — 1.5 bytes a pixel
 against 4 — and is verified pixel-identical to the CPU path on llvmpipe, but
 not on turnip or AGX.
+
+## Battery: the drains are all "forgot to stop"
+
+Three so far, and every one was something continuing after it should have
+ended rather than something being too expensive while it ran:
+
+- **A paused player repainted at full rate.** The deadline was never cleared,
+  and `request_repaint_after(0)` means *now*. `EguiPresenter::idle()` clears it;
+  a deadline more than a second stale is treated as abandoned, as a backstop.
+- **A wake lock held past playback** keeps the screen — the biggest draw on a
+  phone — awake indefinitely. `wakelock.rs` is arranged around the exits, with
+  `Drop` as the last one. Acquiring is rate limited; releasing never is.
+- **Audio-only must not hold the display.** Music with the screen off is the
+  point of music.
+
+Selection already reads `on_battery`: it behaves as though the panel were
+smaller and slower rather than penalising in the scoring, so it composes with
+the resolution clamp instead of fighting it.
+
+All of these are invisible on a desk and none of them shows up in a screenshot.
 
 ## Invariants that are easy to break
 
