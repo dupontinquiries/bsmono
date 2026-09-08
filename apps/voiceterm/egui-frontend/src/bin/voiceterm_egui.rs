@@ -5085,10 +5085,15 @@ impl eframe::App for VoicetermApp {
                 //
                 // Fourth link in the same chain: encoder, parser, call
                 // site, and now the right parser.
-                voiceterm_egui::pty_input::drain_egui_owned(
+                // WITH THE SELECTION, which decides who gets Ctrl+C. egui-winit converts it
+                // to `Event::Copy` before any key event exists, so the terminal never saw it
+                // — with text selected that keystroke is a copy, and with nothing selected it
+                // is the interrupt a shell user reaches for when something is wrong.
+                voiceterm_egui::pty_input::drain_egui_owned_sel(
                     ui, self.app.terminal.grid.key_mode(),
                     self.workspace.tabs.len() > 1,
-                    Some(term_id))
+                    Some(term_id),
+                    self.app.selection.is_some())
             };
             for out in key_outs
             {

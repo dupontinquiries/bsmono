@@ -181,6 +181,22 @@ pub fn drain_egui_owned(
     split_visible: bool,
     owner: Option<egui::Id>,
 ) -> Vec<Outcome> {
+    drain_egui_owned_sel(ui, mode, split_visible, owner, false)
+}
+
+/// [`drain_egui_owned`] told whether the terminal has a SELECTION.
+///
+/// It decides who gets Ctrl+C: with text selected that keystroke is a copy, and with nothing
+/// selected it is the interrupt. Threaded as an argument rather than read from a global
+/// because this module is pure over its inputs — that is what makes the encoder testable, and
+/// a selection is exactly the sort of state that would otherwise leak in through the back.
+pub fn drain_egui_owned_sel(
+    ui: &egui::Ui,
+    mode: TermMode,
+    split_visible: bool,
+    owner: Option<egui::Id>,
+    has_selection: bool,
+) -> Vec<Outcome> {
     // A FOCUSED TEXT WIDGET OWNS THE KEYBOARD.
     //
     // This reads raw context events, so it sees keys that were typed
@@ -219,6 +235,27 @@ pub fn drain_egui_owned(
                 // the reported symptom and reads like a broken keymap rather than a missing
                 // event. A physical keyboard sends `Event::Text` and was never affected,
                 // which is why this survived every test and every desktop run.
+                // CTRL+C NEVER ARRIVES AS A KEY. egui-winit turns it into `Event::Copy` and
+                // RETURNS — `is_copy_command` matches `modifiers.command && Key::C`, and the
+                // `Event::Key` push below it never runs. So a terminal that only reads key
+                // events cannot see Ctrl+C at all, and the reported "C-c does not cancel" is
+                // not the encoder failing but the keystroke never reaching it. Same for
+                // Ctrl+X, which is `Event::Cut`.
+                //
+                // A terminal has to send the interrupt: that is the one keystroke a shell
+                // user reaches for when something is wrong, and "select some text first" is
+                // not an answer when a runaway process is filling the screen.
+                //
+                // COPY STILL WORKS when there is a selection — the widget handles that before
+                // this drain runs, and this only sees what was left over. With nothing
+                // selected there is nothing to copy, so spending the event on the interrupt
+                // costs nothing.
+                egui::Event::Copy if !has_selection => {
+                    out.push(press(Key::Char('c'), Mods { ctrl: true, alt: false, shift: false }, mode, split_visible));
+                }
+                egui::Event::Cut if !has_selection => {
+                    out.push(press(Key::Char('x'), Mods { ctrl: true, alt: false, shift: false }, mode, split_visible));
+                }
                 egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
                     for ch in t.chars() {
                         out.push(press(Key::Char(ch), Mods::none(), mode, split_visible));
@@ -559,6 +596,48 @@ mod headless_tests {
             });
         });
         got.into_inner()
+    }
+
+    /// THE REPORTED BUG: C-c does not cancel a running process.
+    ///
+    /// Not the encoder — `ctrl_byte_of('c')` has always produced 0x03. egui-winit converts
+    /// Ctrl+C into `Event::Copy` and RETURNS, so the `Event::Key` push never runs and the
+    /// keystroke never reaches this drain at all. A terminal that only reads key events
+    /// cannot see it.
+    ///
+    /// Ctrl+C is the one keystroke a shell user reaches for when something is wrong, and
+    /// "select some text first" is not an answer while a runaway process fills the screen.
+    #[test]
+    fn ctrl_c_sends_the_interrupt_when_nothing_is_selected() {
+        let bytes: Vec<u8> = drive(vec![egui::Event::Copy], PLAIN)
+            .iter()
+            .flat_map(|o| o.bytes.clone())
+            .collect();
+        assert_eq!(bytes, vec![0x03], "Ctrl+C did not reach the shell as an interrupt");
+
+        // Ctrl+X likewise: egui-winit turns it into `Event::Cut` by the same path.
+        let bytes: Vec<u8> = drive(vec![egui::Event::Cut], PLAIN)
+            .iter()
+            .flat_map(|o| o.bytes.clone())
+            .collect();
+        assert_eq!(bytes, vec![0x18], "Ctrl+X did not reach the shell");
+    }
+
+    /// With a SELECTION, Ctrl+C is a copy and must not also interrupt — killing someone's
+    /// build because they copied an error message is worse than the bug being fixed.
+    #[test]
+    fn ctrl_c_with_a_selection_is_left_to_the_copy() {
+        let ctx = egui::Context::default();
+        let mut out = Vec::new();
+        let mut input = egui::RawInput::default();
+        input.events = vec![egui::Event::Copy];
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                out = drain_egui_owned_sel(ui, PLAIN, false, None, /*has_selection=*/ true);
+            });
+        });
+        let bytes: Vec<u8> = out.iter().flat_map(|o| o.bytes.clone()).collect();
+        assert!(bytes.is_empty(), "a copy also interrupted the process: {bytes:?}");
     }
 
     /// THE REPORTED BUG: on Plasma's virtual keyboard and on Maliit, the editing keys worked
