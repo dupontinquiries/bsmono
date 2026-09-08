@@ -5,6 +5,18 @@
 # runtime: kde | gnome | freedesktop | none | tbd   (Flatpak runtime)
 # targets: subset of manifest/targets.toml ids; "all" = every linux target
 
+[apps.vidkit-player]
+path = "apps/vidkit-player"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # pure egui/glow (wayland/x11), same convention as the other -egui apps
+targets = ["desktop", "phone"]
+bin = "vidkit-player"
+primary = true            # the only surface; shared/vidkit is the kit behind it
+notes = "video player on shared/vidkit: `vidkit-player FILE` demuxes a local MP4 or WebM (container SNIFFED, not taken from the extension) and reports codec/size/duration; with no argument it shows a test pattern. Gesture-driven surface from vidkit-egui -- drag to scrub with the rate set by pointer height, left half volume, right half speed, right edge rotate, pinch zoom -- on an adaptive uikit-egui bar. `cargo build --release` in apps/vidkit-player gives the bin (`app` feature default-on). HONEST STATE: there is no decoder in this tree yet, so an opened file is parsed and described but the picture shown is the test pattern; the app says so on screen rather than showing a black window. Registered as role=app because shared/vidkit is role=shared-lib and ships no [[bin]], so gitmind's catalogue correctly refused to offer it -- an app nobody can start is indistinguishable from one that does not work."
+
 [apps.voiceterm]
 path = "apps/voiceterm"
 kind = "cargo"            # qmetaobject cdylib (Rust↔Qt, not Rust↔C++)
