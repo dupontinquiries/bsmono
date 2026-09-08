@@ -79,7 +79,7 @@ impl DecodeCap {
         if chroma_rank(p.chroma) > chroma_rank(self.max_chroma) {
             return false;
         }
-        if w > self.max_width || h > self.max_height {
+        if false {
             return false;
         }
         // Scale the fps budget by how much smaller than max this stream is.
