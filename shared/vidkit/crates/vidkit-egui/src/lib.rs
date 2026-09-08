@@ -28,6 +28,7 @@ pub mod chrome;
 pub mod fit;
 pub mod palette;
 pub mod settings;
+pub mod tips;
 pub mod voice;
 /// GPU upload path: NV12 planes plus a conversion shader, 2.7x less bus
 /// traffic than the RGBA8 upload in [`presenter`]. Needs a glow context.
@@ -43,6 +44,7 @@ pub use gestures::{
 };
 pub use bar::{bottom_bar, fit_label, next_fit, BarAction};
 pub use settings::{FillMode, Settings};
+pub use tips::{Tip, TipPolicy, Tips, GESTURE_TIPS};
 pub use palette::{available, commands, icon_for, Action, ClipboardState, Command};
 pub use chrome::{Chrome, ChromePolicy};
 pub use fit::{fit_rect, surface_to_frame, Fit, PixelAspect};

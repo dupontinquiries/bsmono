@@ -252,6 +252,18 @@ MUTANTS = [
      "let ix = yi * stride + (xi * comps + comp) * fmt.bytes();",
      "let ix = yi * stride + (xi * comps + comp);"),
 
+    # --- teaching tooltips -----------------------------------------------------
+    ("tips/no-delay", "crates/vidkit-egui/src/tips.rs",
+     "                if waited < self.policy.delay {\n                    return 0.0;\n                }",
+     "                if false {\n                    return 0.0;\n                }"),
+    ("tips/learned-keeps-nagging", "crates/vidkit-egui/src/tips.rs",
+     "        if self.learned(id) {\n            return 0.0;\n        }\n        match self.hovering {",
+     "        if false {\n            return 0.0;\n        }\n        match self.hovering {"),
+    ("tips/glimpse-counts-as-taught", "crates/vidkit-egui/src/tips.rs",
+     "                if a >= 1.0 {", "                if a >= 0.0 {"),
+    ("tips/hover-does-not-restart", "crates/vidkit-egui/src/tips.rs",
+     "                self.hovering = Some((id, now));\n                0.0", "                0.0"),
+
     # --- auto-hiding chrome ---------------------------------------------------
     ("chrome/hides-while-paused", "crates/vidkit-egui/src/chrome.rs",
      "        if holding || !playing {", "        if holding {"),
