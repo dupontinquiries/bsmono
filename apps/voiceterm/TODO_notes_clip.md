@@ -273,5 +273,21 @@ arithmetic that would split a codepoint.
 "No notes about X" is a real answer and is said: a silent tap is indistinguishable from one
 that missed.
 
-STILL OPEN: "create card / search" as actions on the result — the tap answers, and there is
-nothing yet to DO with the answer beyond reading it.
+### The answer leads somewhere — DONE the same day
+
+The tap's result is HELD in a strip above the notebook rather than toasted. A toast names the
+related notes and then takes them away; the answer to "what does this belong with" is only
+useful if you can go there, and three seconds to read a title and act on it is not an action.
+
+Each hit is a button that opens that note in the docs reader. "No notes about this" is said
+plainly, because nothing is a real answer and silence is indistinguishable from a tap that
+missed. A × dismisses.
+
+ONE ORDERING BUG WORTH RECORDING: `manpage_view::open` refuses a document the reader does not
+hold, and the reader only learned about saved notes when the DOCS pane drew. So a hit clicked
+from the notebook did nothing while the identical click from the docs pane worked — a
+difference nobody reports as a bug, they just stop using the feature. `refresh_note_docs` is
+now called before either.
+
+STILL OPEN: "create card" — searching answers, and there is still no action that makes a new
+card from the word.

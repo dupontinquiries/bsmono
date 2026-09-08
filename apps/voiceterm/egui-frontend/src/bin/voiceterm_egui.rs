@@ -800,6 +800,9 @@ struct VoicetermApp {
     /// Jot mode: spoken text goes into the note rather than to the command parser. Ended by
     /// saying one of `jot::EXIT_PHRASES`.
     jotting: bool,
+    /// The last word tapped in a notebook cell and what the notes said about it. Held until
+    /// dismissed or acted on — see the note at the tap site.
+    word_ask: Option<(String, Vec<voiceterm_egui::note_search::Hit>)>,
     /// Whether the one-time narrow-surface default has been applied. Applied
     /// once rather than every frame, so collapsing is a starting position the
     /// user can override, not a cage that re-shuts whatever they open.
@@ -916,6 +919,33 @@ impl VoicetermApp {
     /// state is per-pane (`web_panes`, keyed by pane id) rather than one
     /// shared `Browser`, that has to mean the focused pane specifically,
     /// not just any web pane that happens to be open elsewhere in the tab.
+    /// Put the saved notes into the docs reader, if the set has changed.
+    ///
+    /// Called before the docs pane draws AND before anything opens a note by name: `open`
+    /// refuses a document the reader does not hold, so a hit clicked from the notebook would
+    /// silently do nothing while the same click from the docs pane worked. That is the kind
+    /// of difference nobody reports as a bug, they just stop using the feature.
+    ///
+    /// Only when the count has changed. `set_docs` prunes the reader's navigation stack
+    /// against the new list, so replacing it every frame would drop the page being read the
+    /// moment a note was saved.
+    fn refresh_note_docs(&mut self) {
+        let notes = voiceterm_egui::note_store::documents();
+        let have = self.docs.docs().iter().filter(|d| d.name.starts_with("note:")).count();
+        if notes.len() == have {
+            return;
+        }
+        let mut all: Vec<voiceterm_egui::manpage_view::Doc> = self
+            .docs
+            .docs()
+            .iter()
+            .filter(|d| !d.name.starts_with("note:"))
+            .cloned()
+            .collect();
+        all.extend(notes.iter().map(|(n, t, md)| doc(n, t, md)));
+        self.docs.set_docs(all);
+    }
+
     /// What the focused pane can say about where a clip came from.
     ///
     /// `note_clip::Source` has had four variants since v0.1.641 and this app produced ONE:
@@ -3881,22 +3911,7 @@ impl eframe::App for VoicetermApp {
                         // reader's navigation stack against the new list, so replacing it
                         // every frame would drop the page being read the moment a note was
                         // saved.
-                        {
-                            let notes = voiceterm_egui::note_store::documents();
-                            let have: usize =
-                                self.docs.docs().iter().filter(|d| d.name.starts_with("note:")).count();
-                            if notes.len() != have {
-                                let mut all: Vec<voiceterm_egui::manpage_view::Doc> = self
-                                    .docs
-                                    .docs()
-                                    .iter()
-                                    .filter(|d| !d.name.starts_with("note:"))
-                                    .cloned()
-                                    .collect();
-                                all.extend(notes.iter().map(|(n, t, md)| doc(n, t, md)));
-                                self.docs.set_docs(all);
-                            }
-                        }
+                        self.refresh_note_docs();
                         if let Some(name) = voiceterm_egui::manpage_view::manpage_ui(
                             ui, &mut self.docs, &c)
                         {
@@ -4355,6 +4370,50 @@ impl eframe::App for VoicetermApp {
                                 }
                             });
                         }
+                        // WHAT THE NOTES SAID about the last word tapped, with somewhere to
+                        // go. Each hit is a button that opens that note in the docs reader —
+                        // the answer is only worth having if it leads somewhere.
+                        // Decided inside the closure, acted on after it: the strip's buttons
+                        // touch `self.docs` and `self.workspace`, which the closure cannot.
+                        let mut open_note: Option<String> = None;
+                        let mut dismiss_ask = false;
+                        if let Some((word, hits)) = self.word_ask.clone() {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(c.text_weak, format!("\u{201c}{word}\u{201d}"));
+                                if hits.is_empty() {
+                                    // A real answer, and said plainly. "Nothing" is
+                                    // information; silence is indistinguishable from a tap
+                                    // that missed.
+                                    ui.colored_label(c.text_weak, "\u{2014} no notes about this");
+                                }
+                                for h in &hits {
+                                    if ui.small_button(&h.title)
+                                        .on_hover_text("open this note")
+                                        .clicked()
+                                    {
+                                        open_note = Some(h.name.clone());
+                                    }
+                                }
+                                if ui.small_button("\u{d7}").on_hover_text("dismiss").clicked() {
+                                    dismiss_ask = true;
+                                }
+                            });
+                        }
+                        if let Some(name) = open_note {
+                            // Refreshed FIRST: `open` refuses a document the reader does not
+                            // hold, and the reader only learns about notes when the DOCS pane
+                            // draws — so this click, made from the notebook, would silently do
+                            // nothing while the same click from the docs pane worked. That is
+                            // a difference nobody reports; they just stop using the feature.
+                            self.refresh_note_docs();
+                            if self.docs.open(&name) {
+                                self.workspace.open_view(PaneView::Docs);
+                            }
+                            self.word_ask = None;
+                        }
+                        if dismiss_ask {
+                            self.word_ask = None;
+                        }
                         let cells = &mut self.notebook_cells;
                         // THE WAY BACK, above everything. A dismissal with no visible undo
                         // is indistinguishable from output going missing — and the block is
@@ -4442,19 +4501,12 @@ impl eframe::App for VoicetermApp {
                                 if let Some(w) = word_tap {
                                     let corpus = voiceterm_egui::note_store::documents();
                                     let hits = voiceterm_egui::note_search::search(&w, &corpus, 3);
-                                    // NAMED, and nothing is a real answer. "no notes about
-                                    // cargo" is information; a silent tap is indistinguishable
-                                    // from a tap that missed.
-                                    let msg = if hits.is_empty() {
-                                        format!("no notes about \u{201c}{w}\u{201d}")
-                                    } else {
-                                        format!(
-                                            "\u{201c}{w}\u{201d}: {}",
-                                            hits.iter().map(|h| h.title.clone())
-                                                .collect::<Vec<_>>().join(", ")
-                                        )
-                                    };
-                                    self.toasts.info(&msg, 0.0);
+                                    // HELD, not toasted. A toast names the related notes and
+                                    // then takes them away — the answer to "what does this
+                                    // belong with" is only useful if you can go there, and a
+                                    // three-second window to read a title and act on it is
+                                    // not an action.
+                                    self.word_ask = Some((w, hits));
                                 }
                                 if let Some(dx) = swipe_dx {
                                     if cells.drag_cell(b.id, dx) {
@@ -5625,6 +5677,7 @@ fn main() -> eframe::Result<()> {
                 clip_note: voiceterm_egui::note_clip::Note::new("Session clips"),
                 clip_note_path: None,
                 jotting: false,
+                word_ask: None,
                 compact_defaults_applied: false,
                 ingest: Default::default(),
                 // Discovery once at startup, not per frame: scanning
