@@ -252,6 +252,18 @@ MUTANTS = [
      "let ix = yi * stride + (xi * comps + comp) * fmt.bytes();",
      "let ix = yi * stride + (xi * comps + comp);"),
 
+    # --- relevance / section scrubbing --------------------------------------
+    ("relev/unanalysed-gets-skipped", "crates/vidkit-relevance/src/lib.rs",
+     "            Score::Pending => 1.0,", "            Score::Pending => 0.0,"),
+    ("relev/tiny-skips-survive", "crates/vidkit-relevance/src/lib.rs",
+     "        if !s.keep && s.duration() < policy.min_skip {", "        if false {"),
+    ("relev/no-ceiling-on-cuts", "crates/vidkit-relevance/src/lib.rs",
+     "    if total > 0.0 && (skipped / total) as f32 >= policy.max_skipped_fraction {", "    if false {"),
+    ("relev/confident-windows-still-ask", "crates/vidkit-relevance/src/lib.rs",
+     "        if lex <= lo || lex >= hi {", "        if false {"),
+    ("relev/requeues-the-same-window", "crates/vidkit-relevance/src/lib.rs",
+     "        if self.queued.insert(key) {", "        if true {"),
+
     # --- clipboard / related ------------------------------------------------
     ("paste/playlist-beats-video", "crates/vidkit-ytdlp/src/paste.rs",
      'if let Some(v) = query_param(t, "v") {', 'if let Some(v) = query_param(t, "list_never") {'),

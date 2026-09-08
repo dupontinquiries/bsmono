@@ -1,0 +1,11 @@
+[package]
+name = "vidkit-relevance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Scores transcript minutes against a prompt and plans which sections to skip. Two-tier, after aperture's route_ai: deterministic first, model second, no worker thread."
+
+# Zero dependencies, deliberately, for the same reason aperture-complete has
+# none: this is decision logic and it must be testable without a provider.
+[dependencies]
