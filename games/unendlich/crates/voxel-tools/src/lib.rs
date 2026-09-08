@@ -123,6 +123,8 @@ pub mod latent;
 pub mod expr;
 /// Parts and relations without coordinates, and the solver that grounds them.
 pub mod sketch;
+/// The block catalogue: colour, hardness, family, and what to use when one is missing.
+pub mod palette;
 /// A ladder of narrow questions: subject, anatomy, pose, voxelisation.
 pub mod study;
 /// Flair: greebles, locations as regions with negatives, and modifiers over the placed set.

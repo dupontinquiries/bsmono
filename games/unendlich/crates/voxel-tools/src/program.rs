@@ -78,10 +78,15 @@ pub struct Asset {
 impl Asset {
     /// Build an asset from a sketch, in its own space.
     pub fn from_sketch(name: &str, s: &Sketch) -> (Asset, Vec<String>) {
-        let (placed, notes) = sketch::resolve(s, (0, 0, 0));
+        let (placed, mut notes) = sketch::resolve(s, (0, 0, 0));
         let mut cells: BTreeMap<(i32, i32, i32), u16> = BTreeMap::new();
         for p in &placed {
-            let block = crate::plan::resolve_block(&p.material).unwrap_or(1);
+            // An unknown material is a DESCRIPTION, not a failure. It
+            // used to become stone silently, which loses the intent and
+            // is why a build made of "weathered granite" came out the
+            // same as one made of "stone".
+            let (block, why) = crate::palette::resolve_or_suggest(&p.material);
+            if let Some(w) = why { notes.push(w); }
             // shapes with an op are rasterised here too: an asset is
             // cells, not IR, because it will be stamped rather than run
             for c in raster(p) { cells.insert(c, block); }
@@ -316,6 +321,7 @@ pub fn run_in<W: crate::VoxelWorld>(w: &W, prog: &Program, anchor: (i32, i32, i3
     let assets: BTreeMap<&str, &Asset> = prog.assets.iter().map(|a| (a.name.as_str(), a)).collect();
     let mut solid: BTreeMap<(i32, i32, i32), u16> = BTreeMap::new();
     let mut known: BTreeMap<String, (sketch::Shape, (i32, i32, i32))> = BTreeMap::new();
+    let mut subs: Vec<String> = Vec::new();
     let mut cut: BTreeSet<(i32, i32, i32)> = BTreeSet::new();
     for pass in &prog.passes {
         let cells: Vec<((i32, i32, i32), u16)> = match &pass.source {
@@ -352,8 +358,13 @@ pub fn run_in<W: crate::VoxelWorld>(w: &W, prog: &Program, anchor: (i32, i32, i3
                 let (placed, notes) = sketch::resolve_grounded(&sk, anchor, &with_frames, Some(&ground));
                 r.notes.extend(notes.into_iter().map(|n| format!("{}: {n}", pass.name)));
                 for pl in &placed { known.insert(pl.name.clone(), (pl.shape.clone(), pl.at)); }
+                // An unknown material is a DESCRIPTION, not a failure. It
+                // became stone silently, which loses the intent: a build
+                // asked for in "weathered granite" came out identical to
+                // one asked for in "stone", and nothing said why.
                 placed.iter().flat_map(|p| {
-                    let b = crate::plan::resolve_block(&p.material).unwrap_or(1);
+                    let (b, why) = crate::palette::resolve_or_suggest(&p.material);
+                    if let Some(w) = why { subs.push(w); }
                     raster(p).into_iter().map(move |c| (c, b))
                 }).collect()
             }
@@ -470,6 +481,8 @@ pub fn run_in<W: crate::VoxelWorld>(w: &W, prog: &Program, anchor: (i32, i32, i3
     }
     // the final write: everything solid, plus air where a cut reached
     // ground the build never occupied
+    subs.sort(); subs.dedup();
+    r.notes.extend(subs);
     r.changes = solid.iter().map(|(at, to)| Change { at: *at, to: *to })
         .chain(cut.iter().filter(|c| !solid.contains_key(c)).map(|at| Change { at: *at, to: 0 }))
         .collect();
@@ -1470,5 +1483,30 @@ mod tests {
         assert!(!prog.notes.iter().any(|n| n.trim().eq_ignore_ascii_case("end")),
                 "no stray end: {:?}", prog.notes);
         assert!(!r.changes.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_material_is_substituted_and_reported() {
+        // "weathered granite" became stone SILENTLY, so a build asked
+        // for in it came out identical to one asked for in stone and
+        // nothing said why
+        let (prog, errs) = parse(
+            "pass a add\n  part x box w=6 h=6 d=6 material=deepslate\n  rel x on ground\nend\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        let r = run(&prog, (0, 64, 0));
+        assert!(!r.changes.is_empty());
+        assert!(r.notes.iter().any(|n| n.contains("deepslate") && n.contains("used")),
+                "it says what it used instead: {:?}", r.notes);
+        // a description resolves to something that fits it
+        let (dark, _) = parse(
+            "pass a add\n  part x box w=4 h=4 d=4 material=dark_polished_stone\n  rel x on ground\nend\n");
+        let rd = run(&dark, (0, 64, 0));
+        let block = rd.changes.iter().find(|c| c.to != 0).map(|c| c.to);
+        assert_eq!(block, Some(49), "dark and polished is obsidian: {:?}", rd.notes);
+        // and a real material is silent
+        let (plain, _) = parse(
+            "pass a add\n  part x box w=4 h=4 d=4 material=sandstone\n  rel x on ground\nend\n");
+        let rp = run(&plain, (0, 64, 0));
+        assert!(!rp.notes.iter().any(|n| n.contains("used")), "no noise: {:?}", rp.notes);
     }
 }
