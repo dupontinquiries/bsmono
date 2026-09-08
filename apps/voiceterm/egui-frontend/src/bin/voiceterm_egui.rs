@@ -1143,6 +1143,10 @@ impl VoicetermApp {
                         // and italicises whatever sits between asterisks.
                         let kind = voiceterm_egui::clip_kind::detect(
                             &text, voiceterm_egui::clip_kind::Context::from_command(&command));
+                        // Kept for the related-notes query below: `text` moves into the
+                        // clip, and searching the rendered markdown afterwards would search
+                        // the citation too.
+                        let clipped_text = text.clone();
                         let clip = voiceterm_egui::note_clip::Clip {
                             kind,
                             content: text,
@@ -1169,8 +1173,35 @@ impl VoicetermApp {
                                 self.clip_note_path = Some(p);
                             }),
                         };
+                        // WHAT THIS BELONGS WITH. `TODO_notes_clip.md` step 4 wants related
+                        // clips from a word; this is the moment the question answers itself,
+                        // because the text was just selected and the corpus is on disk.
+                        //
+                        // The note being written is excluded: it now CONTAINS the clip, so it
+                        // would always be the top hit and always be useless.
+                        let related = {
+                            let corpus = voiceterm_egui::note_store::documents();
+                            let mine = self
+                                .clip_note_path
+                                .as_ref()
+                                .and_then(|p| p.file_stem())
+                                .map(|s| format!("note:{}", s.to_string_lossy()));
+                            let corpus: Vec<_> = corpus
+                                .into_iter()
+                                .filter(|(n, _, _)| Some(n) != mine.as_ref())
+                                .collect();
+                            voiceterm_egui::note_search::search(&clipped_text, &corpus, 1)
+                        };
                         match saved {
-                            Ok(_) => self.toasts.success("Clipped to notes", 0.0),
+                            Ok(_) => {
+                                // Named, not counted. "3 related notes" is a number you
+                                // cannot act on; a title is one you can go and open.
+                                match related.first() {
+                                    Some(h) => self.toasts.success(
+                                        &format!("Clipped \u{2014} related: {}", h.title), 0.0),
+                                    None => self.toasts.success("Clipped to notes", 0.0),
+                                }
+                            }
                             // Said out loud. A silent write failure leaves someone clipping
                             // into a void for an afternoon.
                             Err(e) => self

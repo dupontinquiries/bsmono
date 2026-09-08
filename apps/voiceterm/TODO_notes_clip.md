@@ -223,3 +223,37 @@ Three details that would each be a confident wrong answer:
 The web half is wired through `clip_focus` — the file half needs a pane that reports a path
 and a selection line, which this build does not yet have, so `Focus::File` is built and
 tested and not yet produced.
+
+
+## PARTLY DONE — step 4, related notes (2026-09-07)
+
+The step names `plan_click` as "the bucketing brain; point it at the note corpus". I did not.
+That planner scores UI ELEMENTS — it takes a zone, a colour and a shape — and a note has none
+of those, so pointing it at the corpus means filling four fields with blanks and reading the
+result as if it meant something. `note_search` scores what a note actually has: a title and a
+body.
+
+WHOLE WORDS, not `contains`. Substring matching finds "cargo" inside "supercargo" and "arg"
+in every note that mentions a flag; a suggestion list built from substring hits is mostly
+noise, and noise reads as "this feature does not work" where an empty list reads as "nothing
+related".
+
+The TITLE counts triple. A note called "Linker notes" is about linkers in a way one that
+mentions the word once is not — weighted rather than filtered, so a body-only match still
+surfaces when nothing better exists.
+
+COVERAGE OVER REPETITION: a note hitting two of your words beats one hitting the same word
+four times, because repetition is often just a long note.
+
+Stop words and two-character fragments are not query terms — "the" and "and" appear in every
+note and would rank the corpus by length.
+
+Wired at the moment a clip lands, which is when the question answers itself: the text was
+just selected and the corpus is on disk. The note being written is excluded — it now CONTAINS
+the clip, so it would always be the top hit and always be useless. The toast NAMES the
+related note rather than counting them: "3 related notes" is a number you cannot act on, a
+title is one you can go and open.
+
+STILL OPEN: the word-TAP itself, and "create card / search" as actions. What exists answers
+"what does this belong with" for a clip; it does not yet answer it for a word you point at in
+rendered content, which needs a hit-test on the rendered document.

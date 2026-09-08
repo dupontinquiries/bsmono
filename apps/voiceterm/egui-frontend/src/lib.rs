@@ -395,6 +395,8 @@ pub mod note_store;
 pub mod jot;
 /// Which `note_clip::Source` a clip should be filed under.
 pub mod clip_source;
+/// Finding the notes a piece of text belongs with.
+pub mod note_search;
 /// Is a clipped selection code or prose, and in what language? (`TODO_notes_clip.md`.)
 pub mod clip_kind;
 /// Who owns the keyboard when a terminal is on screen (Tab, the arrows, and the sidebar).
