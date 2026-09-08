@@ -1134,6 +1134,51 @@ mod tests {
     }
 
     #[test]
+    /// THE SAME FAULT, SEEN IN PIXELS. The galley test above proves the label fits its cell
+    /// as a measurement; this proves the picture is readable, which is the thing the report
+    /// was actually about.
+    ///
+    /// It is the pairing worth having: `fit_label` could be correct and the label still
+    /// invisible if it were painted in the background colour, and a size assertion would not
+    /// notice. `uiverify` renders and asks about contrast and ink.
+    #[test]
+    fn an_open_menus_labels_are_actually_legible() {
+        use crate::uiverify;
+        let bg = Color32::from_rgb(18, 18, 22);
+        let size = egui::Vec2::new(240.0, 120.0);
+        let cell = Rect::from_min_size(egui::pos2(20.0, 20.0), Vec2::splat(52.0));
+
+        let f = uiverify::render(size, bg, move |ctx| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                let p = ui.painter();
+                p.rect_filled(cell, 6.0, Color32::from_rgb(40, 40, 48));
+                let g = fit_label(p, "export log", cell, Color32::from_rgb(235, 235, 240));
+                p.galley(cell.center() - (g.size() * 0.5), g, Color32::WHITE);
+            });
+        });
+
+        // Something was drawn — a menu that renders nothing passes every shape-level check
+        // there is.
+        assert!(f.ink_in(cell, bg) > 0.05, "the cell is blank: {}", f.ink_in(cell, bg));
+
+        // And it is readable against what is actually behind it, not against what the theme
+        // says is behind it.
+        let c = f.contrast_in(cell);
+        assert!(c > 4.5, "the label is below the AA threshold at {c}:1");
+
+        // NOTHING SPILLS. The gutter to the right of the cell must be background — this is
+        // the overflow itself, measured in pixels rather than in galley widths.
+        let gutter = Rect::from_min_size(
+            egui::pos2(cell.right() + 2.0, cell.top()),
+            Vec2::new(60.0, cell.height()),
+        );
+        assert!(
+            f.ink_in(gutter, bg) < 0.01,
+            "the label ran outside its cell: {} of the gutter is inked",
+            f.ink_in(gutter, bg)
+        );
+    }
+
     /// The reported fault: with the menu open, the labels were hard to read because each
     /// one needed more space than its section had.
     ///
