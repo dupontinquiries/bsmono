@@ -393,6 +393,8 @@ pub mod note_clip;
 pub mod note_store;
 /// Jot mode: dictation into the note instead of the command parser.
 pub mod jot;
+/// Which `note_clip::Source` a clip should be filed under.
+pub mod clip_source;
 /// Is a clipped selection code or prose, and in what language? (`TODO_notes_clip.md`.)
 pub mod clip_kind;
 /// Who owns the keyboard when a terminal is on screen (Tab, the arrows, and the sidebar).

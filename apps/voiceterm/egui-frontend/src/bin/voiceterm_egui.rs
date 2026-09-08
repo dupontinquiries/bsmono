@@ -916,6 +916,30 @@ impl VoicetermApp {
     /// state is per-pane (`web_panes`, keyed by pane id) rather than one
     /// shared `Browser`, that has to mean the focused pane specifically,
     /// not just any web pane that happens to be open elsewhere in the tab.
+    /// What the focused pane can say about where a clip came from.
+    ///
+    /// `note_clip::Source` has had four variants since v0.1.641 and this app produced ONE:
+    /// every clip was `Terminal { command, at }` with whatever had run last, so a paragraph
+    /// clipped from a documentation page cited itself as `cargo build`. A citation naming the
+    /// wrong source is worse than none — the note looks sourced, and the provenance is the
+    /// reason to clip rather than retype.
+    fn clip_focus(&self) -> voiceterm_egui::clip_source::Focus {
+        use voiceterm_egui::clip_source::Focus;
+        let id = self.workspace.focused_pane();
+        if self.workspace.pane_view(id) == PaneView::Web {
+            if let Some(p) = self.web_panes.get(&id) {
+                return Focus::Web { url: p.url.clone(), title: p.title.clone() };
+            }
+        }
+        // The terminal is the fallback rather than the default: a pane with no provenance to
+        // offer becomes `Manual`, which cites as "(typed)" — true — instead of an empty
+        // command, which cites as an empty backtick pair and reads as a bug.
+        match self.blocks.blocks.last() {
+            Some(b) => Focus::Terminal { command: b.command.clone(), at: b.started_at },
+            None => Focus::Other,
+        }
+    }
+
     fn focused_web_url(&self) -> String {
         let id = self.workspace.focused_pane();
         if self.workspace.pane_view(id) != PaneView::Web { return String::new(); }
@@ -1101,9 +1125,18 @@ impl VoicetermApp {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs()).unwrap_or(0);
-                        let (command, at) = self.blocks.blocks.last()
-                            .map(|b| (b.command.clone(), b.started_at))
-                            .unwrap_or_else(|| (String::new(), now));
+                        // WHERE IT CAME FROM, decided rather than assumed — see
+                        // `clip_focus`. This was always `Source::Terminal` with the last
+                        // command, whatever pane was focused.
+                        let focus = self.clip_focus();
+                        let source = voiceterm_egui::clip_source::of(&focus);
+                        // The classifier still wants a command for its context guess; a web
+                        // page has none, and `Context::from_command("")` is the neutral
+                        // answer rather than a wrong one.
+                        let command = match &focus {
+                            voiceterm_egui::clip_source::Focus::Terminal { command, .. } => command.clone(),
+                            _ => String::new(),
+                        };
                         // CODE OR PROSE, decided rather than assumed. This was
                         // `ClipKind::Text` always, so a clipped diff or function became
                         // a blockquote — markdown reflows it, eats the leading spaces
@@ -1113,7 +1146,7 @@ impl VoicetermApp {
                         let clip = voiceterm_egui::note_clip::Clip {
                             kind,
                             content: text,
-                            source: voiceterm_egui::note_clip::Source::Terminal { command, at },
+                            source,
                             captured_at: now,
                         };
                         self.clip_note.push_clip(clip);

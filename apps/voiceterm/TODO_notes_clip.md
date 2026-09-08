@@ -195,3 +195,31 @@ silently swallows your next sentence into a note is worse than one that never ex
 
 Not yet covered: the other surfaces a transcript can arrive at. This build routes one — the
 spoken-phrase box — and the rest still go to the command parser.
+
+
+## DONE — step 3's real gap: the clip's SOURCE (2026-09-07)
+
+`Source` has had four variants since v0.1.641 — Web, File, Terminal, Manual — and the app
+produced exactly one. Every clip was `Terminal { command, at }` with whatever had run last,
+so a paragraph clipped from a documentation page cited itself as `cargo build`.
+
+A citation naming the wrong source is worse than none: the note LOOKS sourced, and the
+provenance is the reason to clip rather than retype.
+
+`clip_source::of` decides from what the focused pane is: a web pane cites its url and title,
+a file cites its path with an `L12` anchor, the terminal cites its command. Pure, so the
+decision is testable without a pane.
+
+Three details that would each be a confident wrong answer:
+
+* A url with NO TITLE falls back to the url. It still cites better than a command that had
+  nothing to do with it.
+* An anchor of `L0` is dropped. Editors count from 1, and L0 sends someone to the wrong place
+  with confidence.
+* An unnameable origin is `Manual`, not a Terminal clip with an empty command. `Manual` cites
+  as "(typed)", which is true; an empty command cites as an empty backtick pair, which reads
+  as a bug.
+
+The web half is wired through `clip_focus` — the file half needs a pane that reports a path
+and a selection line, which this build does not yet have, so `Focus::File` is built and
+tested and not yet produced.
