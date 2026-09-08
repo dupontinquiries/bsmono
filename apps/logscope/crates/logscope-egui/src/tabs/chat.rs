@@ -26,6 +26,18 @@ use std::time::Instant;
 mod chat_slab;
 use chat_slab::*;
 
+// The autosave's on-disk shape lives in `chat_save.rs` — the serialised structs and the two
+// conversions, which are what you read together when the format changes.
+#[path = "chat_save.rs"]
+mod chat_save;
+use chat_save::*;
+
+// The transcript's formatting helpers live in `chat_fmt.rs` — timestamps, ages, label
+// wrapping, progress summaries. Glob-imported so the call sites read as they did.
+#[path = "chat_fmt.rs"]
+mod chat_fmt;
+use chat_fmt::*;
+
 /// The mic pearl's SHAPE — a SECOND per-scene derivative (beyond the colour idiom) so the in-scene voice
 /// indicator matches each world's physical substance, not just its tint. Kept a FREE derivative (no bespoke
 /// per-world table): it falls out of the palette `Material` plus a small crystalline/watery name set —
@@ -186,74 +198,7 @@ enum Role { User, Assistant }
 /// scrolling (jk / impakt-cam glide) rather than being truncated with a trailing "…".
 const PLAQUE_WINDOW: usize = 4;
 
-/// Summarize the LATEST activity from an in-flight assistant reply for a temporary progress line —
-/// so a long or quiet turn (a coordinator "add more blocks" run that thinks before emitting visible
-/// prose) still shows what it's doing. Pure + heuristic (no second model): prefers the most recent
-/// structural signal in the tail — a ⏸ STEP marker, a markdown heading, a `// file:` path, a fenced
-/// block's language, or a `- `/`* ` bullet — else the last non-trivial sentence, trimmed to ~64 chars.
-/// Returns None if there's nothing meaningful yet (pure whitespace / still inside an empty think block).
-fn summarize_progress(text: &str) -> Option<String> {
-    let clip = |s: &str| -> String {
-        let s = s.trim();
-        let mut out: String = s.chars().take(64).collect();
-        if s.chars().count() > 64 { out.push('…'); }
-        out
-    };
-    for line in text.lines().rev() {
-        let l = line.trim();
-        if l.is_empty() { continue; }
-        if (l.contains('⏸') || l.starts_with("STEP")) && l.contains("STEP") {
-            if let Some((_, rest)) = l.split_once("STEP") { return Some(clip(&format!("step{rest}"))); }
-        }
-        if let Some(h) = l.strip_prefix('#') {
-            return Some(clip(h.trim_start_matches('#').trim()));
-        }
-        if let Some(idx) = l.find("// file:").or_else(|| l.find("file:")) {
-            return Some(clip(&format!("writing {}", l[idx..].trim_start_matches("// ").trim_start_matches("file:").trim())));
-        }
-        if let Some(lang) = l.strip_prefix("```") {
-            let lang = lang.trim();
-            if !lang.is_empty() { return Some(clip(&format!("writing {lang}"))); }
-        }
-        if let Some(item) = l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")) {
-            return Some(clip(item));
-        }
-        if l.len() > 3 && l != "```" {
-            return Some(clip(l));
-        }
-    }
-    None
-}
 
-fn wrap_label(text: &str, cols: usize, max_lines: usize) -> Vec<String> {
-    let cols = cols.max(1);
-    let mut lines: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut truncated = false;
-    'outer: for word in text.split_whitespace() {
-        let mut word = word;
-        // hard-split words longer than a line
-        while word.chars().count() > cols {
-            if !cur.is_empty() { lines.push(std::mem::take(&mut cur)); if lines.len() >= max_lines { truncated = true; break 'outer; } }
-            let head: String = word.chars().take(cols).collect();
-            lines.push(head);
-            if lines.len() >= max_lines { truncated = true; break 'outer; }
-            let skip = cols; word = &word[word.char_indices().nth(skip).map(|(i, _)| i).unwrap_or(word.len())..];
-        }
-        if cur.is_empty() { cur = word.to_string(); }
-        else if cur.chars().count() + 1 + word.chars().count() <= cols { cur.push(' '); cur.push_str(word); }
-        else { lines.push(std::mem::take(&mut cur)); if lines.len() >= max_lines { truncated = true; break; } cur = word.to_string(); }
-    }
-    if !truncated && !cur.is_empty() && lines.len() < max_lines { lines.push(cur); }
-    else if !cur.is_empty() { truncated = true; }
-    if truncated {
-        if let Some(last) = lines.last_mut() {
-            while last.chars().count() >= cols { last.pop(); }
-            last.push('…');
-        }
-    }
-    lines
-}
 
 /// A translucent "frosted glass" frame for chrome (top control bar, bottom read-out) floating OVER the
 /// full-bleed scene — a dark semi-transparent fill + a faint light rim so it reads as a panel of smoked
@@ -281,64 +226,8 @@ fn glass_frame() -> egui::Frame {
 /// minute ago.
 struct Msg { role: Role, variants: Vec<String>, cur: usize, born: std::time::Instant, at: u64, editing: bool, edit_buf: String, think_open: bool, parent: Option<usize>, model: Option<String> }
 
-/// How long ago a turn happened, for the list — `3s ago`, `12m ago`, `2h ago`.
-///
-/// WHICH CLOCK, AND WHY IT MATTERS. `Msg` carries two: `born`, a monotonic `Instant`, and `at`,
-/// unix seconds. `born` is the obvious choice and is wrong for the case that matters — it cannot
-/// survive a save, so on a reopened conversation every turn is stamped at load time and a
-/// three-day-old exchange reads as seconds old. A relative time that confidently lies about an
-/// archived session is worse than no relative time.
-///
-/// So the wall clock wins when it exists, `born` covers the live session, and a turn from before
-/// `at` was recorded gets NOTHING rather than a guess. That last case is real: the field was added
-/// later and older saves carry `0`.
-///
-/// `now` is passed in rather than read here so the boundaries are testable.
-fn turn_age(at: u64, born: std::time::Instant, now_unix: u64) -> Option<String> {
-    let d = if at > 0 {
-        // A clock that has moved backwards (NTP step, a save from a machine set ahead) would
-        // underflow into a nonsense duration; saturating_sub reports "0s" instead.
-        std::time::Duration::from_secs(now_unix.saturating_sub(at))
-    } else if born.elapsed() >= std::time::Duration::from_secs(1) {
-        // No wall clock recorded. Only trust `born` once it has measured something: a freshly
-        // loaded old message has an elapsed of ~0, which is exactly the lie above.
-        born.elapsed()
-    } else {
-        return None;
-    };
-    Some(format!("{} ago", logscope_fan::sessiontime::compact(d)))
-}
 
-/// `YYYY-MM-DD HH:MM UTC` from unix seconds, without pulling a date crate into
-/// a frontend that has none.
-///
-/// UTC rather than local: a transcript is a file that gets read on another
-/// machine, and a bare local time with no offset is the one format that cannot
-/// be corrected later.
-fn stamp_utc(secs: u64) -> String {
-    if secs == 0 { return "unknown".into() }
-    let days = secs / 86_400;
-    let tod = secs % 86_400;
-    // Civil-from-days (Howard Hinnant's algorithm), integer-only.
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", tod / 3600, (tod % 3600) / 60)
-}
 
-/// Wall-clock seconds. Falls back to 0 rather than panicking: a clock before
-/// the epoch is a broken machine, not a reason to lose the message.
-fn wall_now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs()).unwrap_or(0)
-}
 impl Msg {
     fn user(text: String) -> Self { Self { role: Role::User, variants: vec![text], cur: 0, born: Instant::now(), at: wall_now(), editing: false, edit_buf: String::new(), think_open: true, parent: None, model: None } }
     fn assistant() -> Self { Self { role: Role::Assistant, variants: vec![String::new()], cur: 0, born: Instant::now(), at: wall_now(), editing: false, edit_buf: String::new(), think_open: true, parent: None, model: None } }
@@ -563,56 +452,6 @@ impl logscope::msgview::MessageStore for MsgSlice<'_> {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct MsgSave {
-    role: u8,
-    variants: Vec<String>,
-    cur: usize,
-    /// Wall-clock seconds when the turn happened.
-    ///
-    /// `#[serde(default)]` for the same reason `replicator` below has one: an
-    /// autosave that refuses to parse costs the operator the conversation,
-    /// which is a far worse failure than a lost timestamp. Saves written before
-    /// this field load with `0`, which renders as "unknown" rather than as a
-    /// precise wrong date.
-    #[serde(default)]
-    at: u64,
-}
-/// A named, restorable snapshot of the whole conversation.
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct Checkpoint { label: String, at_unix: u64, msgs: Vec<MsgSave> }
-/// What gets written to disk on every turn — the live conversation plus its checkpoints — so a
-/// crash (e.g. an OOM mid-generation) loses nothing and the user can reopen and recover.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct ChatSave {
-    msgs: Vec<MsgSave>,
-    checkpoints: Vec<Checkpoint>,
-    /// The replicator fan, when one is open. `#[serde(default)]` so every save written before this
-    /// field existed still loads — an autosave that refuses to parse costs the operator the
-    /// conversation, which is a far worse failure than a lost fan.
-    #[serde(default)]
-    replicator: Option<logscope::replicator::ReplicatorSave>,
-}
-
-fn msg_to_save(m: &Msg) -> MsgSave { MsgSave { role: if m.role == Role::User { 0 } else { 1 }, variants: m.variants.clone(), cur: m.cur, at: m.at } }
-fn save_to_msg(s: &MsgSave) -> Msg {
-    let variants = if s.variants.is_empty() { vec![String::new()] } else { s.variants.clone() };
-    let cur = s.cur.min(variants.len() - 1);
-    // THE STORED STAMP, not `wall_now()`.
-    //
-    // This is what makes the clock survive a reload. Taking the current time
-    // here would restamp every turn of a week-old conversation to the moment it
-    // was opened, so the transcript's "Started" line would say today, the
-    // between-turn gaps would all collapse to zero, and the prompt's time line
-    // would report a long session as brand new — the exact question it was
-    // added to answer.
-    //
-    // `0` for a save written before this field existed. `stamp_utc` renders
-    // that as "unknown" and the gap logic skips it, which is the honest
-    // outcome: those turns have no recorded time and inventing one would make
-    // an old transcript look precisely dated.
-    Msg { role: if s.role == 0 { Role::User } else { Role::Assistant }, variants, cur, born: Instant::now(), at: s.at, editing: false, edit_buf: String::new(), think_open: true, parent: None , model: None }
-}
 fn now_unix() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
 
 /// Build a fenced attachment block from a file's bytes for the composer. Bounded (text only). Three things
