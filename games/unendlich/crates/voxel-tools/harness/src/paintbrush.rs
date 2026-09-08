@@ -312,6 +312,9 @@ pub enum TurnKind {
     Interpret,
     /// Pass 2: assets and passes, written against pass 1's reading.
     Compose,
+    /// One rung of the study ladder. Which rung is on the session, so
+    /// the reply knows what it was answering.
+    Study,
     /// The massing turn of the architectural chain: the model is shown
     /// the type's division and the sorted wishes and asked for a diff.
     Massing,
@@ -542,6 +545,11 @@ pub struct Paintbrush {
     review_round: usize,
     /// Rounds still owed once the current drone lands.
     review_pending_after_drone: usize,
+    /// The study ladder, while it is being climbed.
+    study: Option<voxel_tools::study::Study>,
+    study_rungs: Vec<voxel_tools::study::Rung>,
+    study_at: usize,
+    study_height: i32,
     /// The long run in progress: dozens of rounds, convergence, and
     /// the status the waypoint marker shows. None when idle.
     pub run: Option<voxel_tools::session::Run>,
@@ -634,6 +642,10 @@ impl Paintbrush {
             review_rounds: 1,
             review_round: 0,
             review_pending_after_drone: 0,
+            study: None,
+            study_rungs: Vec::new(),
+            study_at: 0,
+            study_height: 40,
             run: None,
             run_limits: voxel_tools::session::Limits { max_rounds: 1, ..Default::default() },
             last_job: None,
@@ -1263,6 +1275,40 @@ impl Paintbrush {
             Box::new(move || p), gaze, player_feet, prose, TurnKind::Compose);
     }
 
+    /// Ask the rung the ladder is standing on.
+    fn ask_next_rung(&mut self, completer: Box<dyn voxel_tools::llm::Completer>, gaze: &Gaze,
+                     player_feet: Option<(i32, i32, i32)>, prose: &str) {
+        let Some(&rung) = self.study_rungs.get(self.study_at) else { return };
+        let st = self.study.clone().unwrap_or_default();
+        let h = self.study_height;
+        let p = voxel_tools::study::prompt(rung, prose, h, &st);
+        self.spawn_turn(completer,
+            "You are a sculptor describing a subject precisely enough to build it.".into(),
+            Box::new(move || p), gaze, player_feet, prose, TurnKind::Study);
+    }
+
+    /// The ladder is climbed: build with what it learned.
+    fn finish_study(&mut self, cm: &ChunkManager, gaze: &Gaze,
+                    player_feet: Option<(i32, i32, i32)>, prose: &str) {
+        let Some(st) = self.study.take() else { return };
+        log::info!("[paintbrush] study done: {}", st.summary());
+        let guidance = voxel_tools::study::to_guidance(&st, self.study_height);
+        // The recognizer still writes the form line -- it is good at
+        // that -- and the study says what to make big enough to see.
+        // The two are complementary: one decides the shape, the other
+        // decides what the shape must READ as.
+        let mut ir = voxel_tools::recipe::recognise(prose)
+            .map(|r| r.line()).unwrap_or_else(|| format!("form statue size=medium h={}", self.study_height));
+        if let Some(h) = Some(self.study_height) {
+            if !ir.contains(" h=") { ir.push_str(&format!(" h={h}")); }
+        }
+        for line in guidance.lines().take(3) { self.say(format!("  {}", line.trim())); }
+        self.session.study_note = Some(guidance);
+        self.finish_turn_with(cm, gaze, &ir, player_feet, prose);
+        self.review_pending_after_drone = 1;
+        self.review_round = 0;
+    }
+
     /// The rest of the chain: brief, layout, geometry.
     fn finish_massing(&mut self, cm: &ChunkManager, gaze: &Gaze, raw: &str,
                       player_feet: Option<(i32, i32, i32)>, prose: &str) {
@@ -1470,6 +1516,22 @@ impl Paintbrush {
         // request. Pass 1 asks what the thing IS, in prose; pass 2
         // writes assets and passes against that reading. The dictionary
         // path stays one turn, because for a cottage it is better.
+        // THE STUDY LADDER, for a figure big enough for detail to land.
+        // Four narrow questions instead of one wide one: the dictionary
+        // makes a statue in one turn and it is the same statue every
+        // time.
+        if let voxel_tools::compose::Path::Study { height } = path {
+            self.study = Some(voxel_tools::study::Study::default());
+            self.study_height = height;
+            self.study_rungs = voxel_tools::study::rungs_for(height);
+            self.study_at = 0;
+            log::info!("[paintbrush] studying {prose:?} at {height} blocks, {} rung(s)",
+                       self.study_rungs.len());
+            self.say(format!("studying this: {} question(s) before building",
+                             self.study_rungs.len()));
+            self.ask_next_rung(completer, gaze, player_feet, prose);
+            return;
+        }
         // The ARCHITECTURAL CHAIN, for a building type big enough to
         // have an inside worth deciding. One model turn -- the massing
         // -- and the rest is code that can be checked.
@@ -1722,6 +1784,35 @@ impl Paintbrush {
                             self.say(format!("avoiding: {}", reading.pitfalls.join("; ")));
                         }
                         self.start_compose(cm, &turn.gaze, &turn.prose, reading, turn.player_feet);
+                    }
+                    TurnKind::Study => {
+                        let rung = self.study_rungs[self.study_at.min(self.study_rungs.len() - 1)];
+                        if let Some(st) = self.study.as_mut() {
+                            voxel_tools::study::absorb(st, rung, &raw);
+                        }
+                        // say the one line that shows it is working
+                        if let Some(st) = &self.study {
+                            match rung {
+                                voxel_tools::study::Rung::Subject =>
+                                    self.say(format!("subject: {}", st.subject)),
+                                voxel_tools::study::Rung::Anatomy =>
+                                    self.say(format!("{} part(s) with proportions", st.parts.len())),
+                                voxel_tools::study::Rung::Pose if !st.silhouette.is_empty() =>
+                                    self.say(format!("silhouette: {}", st.silhouette)),
+                                voxel_tools::study::Rung::Voxelise if !st.drop.is_empty() =>
+                                    self.say(format!("will not attempt: {}", st.drop.join("; "))),
+                                _ => {}
+                            }
+                        }
+                        self.study_at += 1;
+                        if self.study_at < self.study_rungs.len() {
+                            let Some(c) = self.completer_for(false) else {
+                                self.say("no provider available"); return;
+                            };
+                            self.ask_next_rung(c, &turn.gaze, turn.player_feet, &turn.prose);
+                        } else {
+                            self.finish_study(cm, &turn.gaze, turn.player_feet, &turn.prose);
+                        }
                     }
                     TurnKind::Massing => {
                         self.finish_massing(cm, &turn.gaze, &raw, turn.player_feet, &turn.prose);

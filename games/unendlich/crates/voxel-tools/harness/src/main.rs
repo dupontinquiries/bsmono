@@ -41,6 +41,7 @@ fn main() {
     scatter_scenario();
     four_pass_scenario();
     programme_scenario();
+    study_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -1086,4 +1087,54 @@ fn programme_scenario() {
     assert!(log.iter().any(|l| l.contains("budget")), "the schedule reconciled: {log:?}");
     assert!(log.iter().any(|l| l.contains("room(s)")), "it laid out rooms");
     assert!(log.iter().any(|l| l.contains("the doors")), "and cut doors: {log:?}");
+}
+
+
+/// A figure big enough for detail: the study ladder, four rungs.
+fn study_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== the study ladder");
+    struct Sculptor { n: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                      seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> }
+    impl voxel_tools::llm::Completer for Sculptor {
+        fn name(&self) -> &str { "sculptor" }
+        fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            self.seen.lock().unwrap().push(user.to_string());
+            let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(match i {
+                0 => "SUBJECT: Zeus, king of the gods, striding\n                      DRESS: a himation over the left shoulder\n                      CARRIES: a thunderbolt in the raised right hand\n                      WITH: an eagle at the left foot\n                      KNOWN BY: the beard and the raised bolt\n".into(),
+                1 => "PARTS: head 12%; beard 6%; torso 32%; arm 36%; leg 48%; bolt 18%\n                      WIDTH: shoulders 26%\n".into(),
+                2 => "POSE: right arm raised; left arm low, forward; left leg bearing\n                      SILHOUETTE: a broad triangle broken by the raised bolt\n".into(),
+                _ => "KEEP: the beard as one mass; the bolt at twice scale\n                      DROP: fingers -- the hand is one block\n".into(),
+            })
+        }
+    }
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(
+        Box::new(Sculptor { n: n.clone(), seen: seen.clone() }))));
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -30.0], [0.0, -0.2, 1.0], Some(([0, 64, 0], [0, 1, 0], 31.0)));
+    pb.start_turn(&cm, &gaze, Some("grass"), "a colossal statue of Zeus", None);
+    let t0 = std::time::Instant::now();
+    while pb.run.as_ref().map(|r| r.is_running()).unwrap_or(false) && t0.elapsed().as_secs() < 60 {
+        pb.poll_turn(&cm); pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    let s = seen.lock().unwrap();
+    println!("  {} model turn(s)", s.len());
+    assert!(s.len() >= 4, "four rungs, not one: {}", s.len());
+    assert!(s[0].contains("KNOWN BY"), "rung 1 asked for the identifying detail");
+    assert!(s[1].contains("Zeus") && s[1].contains("eight heads"),
+            "rung 2 carried the subject and asked for proportions");
+    assert!(s[2].contains("head 12%"), "rung 3 got the anatomy");
+    assert!(s[3].contains("triangle") && s[3].contains("1/160"),
+            "rung 4 got the silhouette and the block size");
+    let log = pb.drain_log();
+    for l in log.iter().filter(|l| l.starts_with("subject:") || l.starts_with("silhouette:")
+                               || l.contains("part(s) with") || l.contains("will not attempt")) {
+        println!("  {}", l.trim());
+    }
+    assert!(log.iter().any(|l| l.contains("Zeus")), "{log:?}");
+    assert!(log.iter().any(|l| l.contains("triangle")), "the silhouette reached the player");
 }

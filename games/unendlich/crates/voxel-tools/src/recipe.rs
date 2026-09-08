@@ -32,6 +32,10 @@ pub struct Recipe {
     pub carve: bool,
     pub style: Option<String>,
     pub size: String,
+    /// An explicit height in blocks, when a word implies one the
+    /// `size` bucket cannot express. A colossus is always a medium
+    /// FOOTPRINT, so its scale word has nowhere else to go.
+    pub height: Option<i32>,
     pub block: Option<String>,
     pub kv: Vec<(String, String)>,
     pub name: Option<String>,
@@ -57,6 +61,7 @@ impl Recipe {
             };
         }
         let mut s = format!("form {} size={}", self.form, self.size);
+        if let Some(h) = self.height { s.push_str(&format!(" h={h}")); }
         if let Some(st) = &self.style { s.push_str(&format!(" style={st}")); }
         if let Some(b) = &self.block { s.push_str(&format!(" block={b}")); }
         for (k, v) in &self.kv { s.push_str(&format!(" {k}={v}")); }
@@ -130,7 +135,8 @@ const SIZES: &[(&[&str], &str)] = &[
     (&["tiny", "little"], "tiny"),
     (&["small", "modest"], "small"),
     (&["large", "big", "grand", "great"], "large"),
-    (&["huge", "giant", "colossal", "enormous", "vast", "sprawling", "gigantic", "massive"], "huge"),
+    (&["huge", "giant", "colossal", "enormous", "vast", "sprawling", "gigantic", "massive",
+       "titanic", "monumental", "immense"], "huge"),
 ];
 
 const MATERIALS: &[(&[&str], &str)] = &[
@@ -187,9 +193,20 @@ pub fn recognise(prose: &str) -> Option<Recipe> {
     if let Some((sz, w)) = first(SIZES) { r.size = sz; r.because.push(w); }
     if form == "statue" {
         if let Some((st, w)) = first(STATUE_STYLES) { r.style = Some(st); r.because.push(w); }
-        // a giant statue is a colossus of medium footprint, not a
-        // medium statue on a huge plinth
-        if r.style.as_deref() == Some("colossus") { r.size = "medium".into(); }
+        // A giant statue is a colossus of MEDIUM FOOTPRINT, not a
+        // medium statue on a huge plinth -- that part was right. But
+        // throwing the size word away entirely made "huge", "giant"
+        // and "colossal" produce THE IDENTICAL STATUE, with no
+        // gradation at all between them. The footprint stays modest
+        // and the word sets the HEIGHT instead.
+        if r.style.as_deref() == Some("colossus") {
+            r.height = Some(match r.size.as_str() {
+                "large" => 60, "huge" => 110, _ => 40,
+            });
+            // and the biggest words go further than "huge" alone
+            if has("colossal") || has("titanic") || has("monumental") { r.height = Some(160); }
+            r.size = "medium".into();
+        }
     } else if let Some(st) = crate::style::from_prose(prose) {
         r.style = Some(st.name.to_string()); r.because.push(st.name.to_string());
     }
@@ -232,7 +249,16 @@ mod tests {
         assert!(r.kv.contains(&("beard".into(), "1".into())), "{:?}", r.kv);
         assert_eq!(r.name.as_deref(), Some("zeus"));
         let line = r.line();
-        assert!(line.starts_with("form statue size=medium style=colossus block=stone"), "{line}");
+        // the height comes from the scale word now: "huge", "giant" and
+        // "colossal" used to produce the IDENTICAL statue
+        assert!(line.starts_with("form statue size=medium h="), "{line}");
+        assert!(line.contains("style=colossus") && line.contains("block=stone"), "{line}");
+        assert_eq!(r.height, Some(110), "a huge colossus");
+        // and the words really do differ from each other
+        let colossal = recognise("a colossal statue of Zeus").unwrap();
+        let large = recognise("a large statue of Zeus").unwrap();
+        assert!(colossal.height.unwrap() > r.height.unwrap(), "colossal beats huge");
+        assert!(large.height.unwrap_or(0) < r.height.unwrap(), "and huge beats large");
         let (plan, issues) = crate::plan::parse_plan_at(&format!("{line}\n"), Some((0, 65, 0)));
         assert!(issues.iter().all(|i| i.severity != crate::plan::Severity::Error), "{issues:?}");
         assert_eq!(plan.ops.len(), 1);

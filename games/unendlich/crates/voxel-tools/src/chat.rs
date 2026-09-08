@@ -122,6 +122,10 @@ pub struct LastBuild {
 
 #[derive(Debug, Default, Clone)]
 pub struct ChatSession {
+    /// What the study ladder learned, if it was climbed. Carried to
+    /// the REVIEW, so a verdict is judged against what the figure was
+    /// supposed to read as rather than against nothing.
+    pub study_note: Option<String>,
     /// Climate at the build site, supplied by the engine each turn.
     /// Defaults to temperate; a game that never sets it behaves exactly
     /// as before.
@@ -519,7 +523,15 @@ impl ChatSession {
             return Some(crate::review::program_prompt(
                 &p.prose, &p.program, &p.pass_log, &measured, &elev, &p.findings, round));
         }
-        Some(crate::review::prompt(&p.prose, &ops, spec.as_deref(), &measured, &elev, &p.findings, variants, round))
+        let mut base = crate::review::prompt(&p.prose, &ops, spec.as_deref(), &measured, &elev,
+                                            &p.findings, variants, round);
+        // What the study decided this must READ as. Without it a review
+        // of a figure judges a shape against nothing and says "looks
+        // fine", which is how a bland statue survives every round.
+        if let Some(note) = &self.study_note {
+            base = format!("{note}\n{base}");
+        }
+        Some(base)
     }
 
     /// Apply a review to the pending plan: the verdict edits the plan's

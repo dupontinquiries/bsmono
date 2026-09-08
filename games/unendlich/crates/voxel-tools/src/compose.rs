@@ -189,6 +189,10 @@ pub enum Path {
     Known,
     /// It does not: four passes.
     Compose,
+    /// It is a FIGURE big enough for detail to land: climb the study
+    /// ladder -- subject, anatomy, pose, voxelisation -- before
+    /// building anything.
+    Study { height: i32 },
     /// It is a BUILDING TYPE at a size worth programming: the
     /// architectural chain -- typology, triage, massing, brief,
     /// layout, geometry.
@@ -206,6 +210,17 @@ pub enum Path {
 /// it is a table of things the dictionary can actually make, so a miss
 /// means the fast path would be guessing.
 pub fn choose_path(prose: &str) -> Path {
+    // A FIGURE AT SIZE. The dictionary makes a statue in one turn and
+    // it is the same statue every time, because one interpret turn
+    // asks one wide question. Above the size where features can land,
+    // four narrow questions are worth four turns.
+    if let Some(r) = crate::recipe::recognise(prose) {
+        if r.form == "statue" {
+            let h = r.height.unwrap_or(match r.size.as_str() {
+                "tiny" => 6, "small" => 12, "large" => 30, "huge" => 60, _ => 20 });
+            if crate::study::depth_for(h) >= 3 { return Path::Study { height: h }; }
+        }
+    }
     // A TYPOLOGY AND ENOUGH SIZE TO WARRANT ONE. Programming a cottage
     // is ceremony -- the dictionary makes a better one, and a schedule
     // of four rooms adds nothing. Programming a fortress is the only
@@ -511,5 +526,29 @@ mod tests {
         // a huge house crosses the line, because at that size it does
         // have an inside worth deciding
         assert_eq!(choose_path("an enormous manor"), Path::Programme);
+    }
+
+    #[test]
+    fn a_figure_big_enough_for_detail_climbs_the_ladder() {
+        // one interpret turn asks one wide question, so every statue
+        // came out the same statue
+        assert!(matches!(choose_path("a colossal statue of Zeus"), Path::Study { .. }));
+        assert!(matches!(choose_path("a huge statue of a seated king"), Path::Study { .. }));
+        // and the height it carries is the one the words implied
+        match choose_path("a colossal statue of Zeus") {
+            Path::Study { height } => assert_eq!(height, 160),
+            o => panic!("{o:?}"),
+        }
+        match choose_path("a huge statue of Zeus") {
+            Path::Study { height } => assert_eq!(height, 110),
+            o => panic!("{o:?}"),
+        }
+        // a small one does not: three extra turns buy nothing at six
+        // blocks, where there is no room for a beard let alone an eagle
+        assert_eq!(choose_path("a small statue"), Path::Known);
+        assert_eq!(choose_path("a tiny statue"), Path::Known);
+        // and a castle still programmes, a water sphere still composes
+        assert_eq!(choose_path("a huge fortress"), Path::Programme);
+        assert_eq!(choose_path("a water sphere"), Path::Compose);
     }
 }
