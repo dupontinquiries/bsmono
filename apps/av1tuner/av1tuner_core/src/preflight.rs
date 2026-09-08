@@ -462,3 +462,38 @@ mod tests {
         assert_eq!(c.status, CheckStatus::Pass);
     }
 }
+
+
+/// The wgpu limit that stopped this app opening on Asahi, recorded where preflight lives.
+///
+/// `wgpu::DeviceDescriptor::default()` requests `Limits::default()`, which wants
+/// `max_color_attachments: 8`. Apple silicon under honeykrisp allows 5, so device creation
+/// fails before a window exists:
+///
+/// ```text
+/// WGPU error: Limit 'max_color_attachments' value 8 is better than allowed 5
+/// ```
+///
+/// egui needs ONE colour attachment. The eight was never a requirement — it is a default in a
+/// descriptor nobody filled in. `main.rs` now requests the adapter's own limits, which are
+/// satisfiable by construction.
+///
+/// Kept as a function rather than a comment so the reasoning is greppable from the error
+/// text: the next person to see that message will search for the limit's name.
+pub fn wgpu_limits_note() -> &'static str {
+    "av1tuner requests the adapter's own wgpu limits. Asking for wgpu's defaults wants \
+     max_color_attachments=8; Asahi/honeykrisp allows 5 and device creation fails before a \
+     window opens. egui needs one attachment; the eight was a default, not a requirement."
+}
+
+#[cfg(test)]
+mod wgpu_limit_tests {
+    /// The note has to name the limit and the number, because it exists to be found by
+    /// someone searching the error text.
+    #[test]
+    fn the_note_names_the_limit_from_the_error() {
+        let n = super::wgpu_limits_note();
+        assert!(n.contains("max_color_attachments"), "{n}");
+        assert!(n.contains('5') && n.contains('8'), "{n}");
+    }
+}
