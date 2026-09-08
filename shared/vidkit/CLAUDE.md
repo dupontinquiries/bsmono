@@ -71,9 +71,9 @@ trusting them.
 ## Commands
 
 ```sh
-cargo test --ignore-rust-version            # 304 tests
+cargo test --ignore-rust-version            # 308 tests
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json cargo test -p vidkit-vk
-python3 tools/mutate.py                     # 119 mutants, all must be killed
+python3 tools/mutate.py                     # 121 mutants, all must be killed
 python3 tools/mutate.py shader              # just the WGSL ones
 ```
 
@@ -135,11 +135,20 @@ nothing decodes in this sandbox, and the codec is not what the seams are about.
 Its MP4 comes from `vidkit_mp4::build`, public behind a default-off `fixtures`
 feature, so there is one fixture writer rather than two free to drift.
 
+Both demuxers are covered, and WebM is the one that matters most: it is the
+Fairphone's path (YouTube VP9 is WebM, and VP9 is what Venus decodes in
+hardware), and it answers the player with entirely different mechanisms —
+nanosecond timestamps scaled by `TimestampScale` rather than timescale ticks, a
+block timestamp that is its *cluster's* plus a signed offset, keyframes from a
+flag byte rather than an `stss` table, and no Annex-B rewrite at all.
+
 Every layer here was green in isolation long before this existed. Breaking
-three seams found the test caught only one of them on the first attempt, and
-both misses were fixtures in which the constraint could not bind — seeking to a
-time that happened to be a keyframe, and seeking after the decoder queue had
-already drained. The `seam/` mutants keep that honest.
+three MP4 seams found the test caught only one of them on the first attempt,
+and both misses were fixtures in which the constraint could not bind — seeking
+to a time that happened to be a keyframe, and seeking after the decoder queue
+had already drained. The WebM round then caught four of four, because those
+fixtures were written already knowing the shape. The `seam/` mutants keep it
+honest.
 
 ## Invariants that are easy to break
 
