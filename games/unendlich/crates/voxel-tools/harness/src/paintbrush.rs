@@ -1397,6 +1397,25 @@ impl Paintbrush {
         let layout = voxel_tools::brief::lay_out(&brief, ((-half, -half), (half, half)),
                                                  self.session.creative_seed, 40);
         self.say(format!("  {}", layout.summary()));
+        // THE GROUND FIRST, before a single wall. A building dropped
+        // onto whatever ground was there sits in a trench on one side
+        // and on stilts on the other.
+        {
+            let view = WorldView(cm);
+            let mut staged = StagedWorld::new(&view);
+            let ground = {
+                let tools = VoxelTools::new(&mut staged);
+                let at = gaze.hit.map(|h| h.block).unwrap_or((0, 64, 0));
+                voxel_tools::brief::ground_for(tools.world, &layout, at, 1)
+            };
+            if !ground.is_empty() {
+                self.say(format!("  levelling and blending the ground: {} block(s)", ground.len()));
+                let mut tools = VoxelTools::new(&mut staged);
+                let _ = tools.apply_changes_large(&ground);
+                drop(tools);
+                self.flush_staged(cm, &mut staged);
+            }
+        }
         let mut src = voxel_tools::brief::to_program(&layout, &brief, "stone", 0);
         let flair = voxel_tools::typology::to_flair(&m);
         if !flair.trim().is_empty() {

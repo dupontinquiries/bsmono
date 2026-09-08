@@ -36,6 +36,7 @@
 //! questions and a model answers each better alone than all at once.
 //! `role_prompt` gives each its own turn.
 
+use crate::weather::Change;
 use std::collections::BTreeSet;
 
 /// How badly two spaces want to be together.
@@ -354,6 +355,63 @@ fn cost_of(r: &Room, others: &[Room], brief: &Brief, bounds: ((i32, i32), (i32, 
 
 // ── from a layout to a program ───────────────────────────────────────
 
+/// Prepare the ground a layout will stand on: level its footprint, then
+/// FEATHER the edge outward so the cut does not read as a cut.
+///
+/// TrixyBlox's Winterfell begins by levelling the landscape and
+/// blending it into the surroundings before a single wall goes up, and
+/// that ordering is not a stylistic preference. A building dropped
+/// onto whatever ground was there sits in a trench on one side and on
+/// stilts on the other, and no amount of detail on the building fixes
+/// it. Nothing in this chain touched the terrain at all.
+///
+/// The feathering is the part usually skipped. A platform with a hard
+/// edge is a platform; a platform whose edge dissolves over ten blocks
+/// is ground.
+pub fn ground_for<W: crate::VoxelWorld>(w: &W, l: &Layout, anchor: (i32, i32, i32),
+                                        fill: u16) -> Vec<Change> {
+    if l.rooms.is_empty() { return Vec::new(); }
+    let lo = l.rooms.iter().fold((i32::MAX, i32::MAX), |a, r| (a.0.min(r.at.0), a.1.min(r.at.1)));
+    let hi = l.rooms.iter().fold((i32::MIN, i32::MIN),
+        |a, r| (a.0.max(r.at.0 + r.size.0), a.1.max(r.at.1 + r.size.1)));
+    let (pad, reach) = (2, ((hi.0 - lo.0).max(hi.1 - lo.1) / 4).clamp(4, 24));
+    let surface = |x: i32, z: i32| (anchor.1 - 40..=anchor.1 + 60).rev()
+        .find(|&y| w.get(x, y, z) != 0);
+    // the level to cut to: the MEDIAN of the footprint, so a single
+    // outcrop does not raise the whole platform and a single hollow
+    // does not sink it
+    let mut heights: Vec<i32> = Vec::new();
+    for x in (lo.0..=hi.0).step_by(3) { for z in (lo.1..=hi.1).step_by(3) {
+        if let Some(y) = surface(anchor.0 + x, anchor.2 + z) { heights.push(y); }
+    }}
+    if heights.is_empty() { return Vec::new(); }
+    heights.sort_unstable();
+    let level = heights[heights.len() / 2];
+    let mut out = Vec::new();
+    for x in lo.0 - pad - reach..=hi.0 + pad + reach {
+        for z in lo.1 - pad - reach..=hi.1 + pad + reach {
+            let (wx, wz) = (anchor.0 + x, anchor.2 + z);
+            let Some(here) = surface(wx, wz) else { continue };
+            // how far outside the platform this column is, 0 inside
+            let out_by = (lo.0 - pad - x).max(x - (hi.0 + pad))
+                .max(lo.1 - pad - z).max(z - (hi.1 + pad)).max(0);
+            if out_by > reach { continue; }
+            // inside: flat. outside: eased back to the real ground, so
+            // the platform's edge dissolves rather than ending
+            let t = out_by as f32 / reach.max(1) as f32;
+            let ease = t * t * (3.0 - 2.0 * t);        // smoothstep
+            let want = (level as f32 + (here - level) as f32 * ease).round() as i32;
+            if want == here { continue; }
+            if want > here {
+                for y in here + 1..=want { out.push(Change { at: (wx, y, wz), to: fill }); }
+            } else {
+                for y in want + 1..=here { out.push(Change { at: (wx, y, wz), to: 0 }); }
+            }
+        }
+    }
+    out
+}
+
 /// Emit the layout as program source: one pass raising the mass, one
 /// cutting the rooms out of it, one cutting the doors between rooms
 /// that must adjoin.
@@ -395,6 +453,19 @@ pub fn to_program(l: &Layout, brief: &Brief, wall: &str, floor_y: i32) -> String
         // the rooms and everything after are cut from all of it
         return finish_program(s, l, brief, wall, floor_y, storey, lo, hi, tallest);
     }
+    // (the terrain pass is emitted by `ground_program`, which needs the
+    // world; `to_program` alone cannot know what height to level to)
+    // THE GROUND FIRST. TrixyBlox's Winterfell begins by levelling the
+    // landscape and BLENDING IT into the surroundings before a single
+    // wall goes up, and that ordering is not a stylistic preference --
+    // a building dropped onto whatever ground was there sits in a
+    // trench on one side and on stilts on the other, and no amount of
+    // detail on the building fixes it.
+    //
+    // Two things, and the second is the one that is usually skipped:
+    // LEVEL the footprint to one height, then FEATHER the edge outward
+    // so the cut does not read as a cut. A platform with a hard edge
+    // is a platform; a platform whose edge dissolves is ground.
     s.push_str("pass the mass add\n");
     // centred on the rooms' own middle, not on the anchor: a layout
     // whose plan is not symmetric about the origin would otherwise be
@@ -1043,5 +1114,62 @@ mod tests {
         let (seen, _) = crate::reach::flood(&w, ground, &body);
         let top = seen.iter().map(|c| c.1).max().unwrap_or(0);
         assert!(top >= 66 + 5, "a body walked up at least one storey: reached {top} from 66");
+    }
+
+    #[test]
+    fn the_ground_is_levelled_and_then_blended_into_what_is_around_it() {
+        // Nothing in this chain touched the terrain. A building dropped
+        // onto whatever ground was there sits in a trench on one side
+        // and on stilts on the other, and no amount of detail on the
+        // building fixes it.
+        use crate::VoxelWorld;
+        struct Slope;
+        impl VoxelWorld for Slope {
+            fn get(&self, x: i32, y: i32, _z: i32) -> u16 {
+                if y <= 64 + x / 3 { 1 } else { 0 }
+            }
+            fn set(&mut self, _: i32, _: i32, _: i32, _: u16) -> bool { false }
+        }
+        let b = keep();
+        let l = lay_out(&b, ((-20, -20), (20, 20)), 3, 30);
+        let ch = ground_for(&Slope, &l, (0, 64, 0), 1);
+        assert!(!ch.is_empty(), "a slope needs work to build on");
+        // apply it and check the footprint really is flat
+        let mut world: std::collections::BTreeMap<(i32, i32, i32), u16> = Default::default();
+        for c in &ch { world.insert(c.at, c.to); }
+        let top = |x: i32, z: i32| (20..140).rev().find(|&y| {
+            match world.get(&(x, y, z)) { Some(0) => false, Some(_) => true,
+                                          None => y <= 64 + x / 3 }
+        });
+        let inside: Vec<i32> = (-10..=10).step_by(4)
+            .filter_map(|x| top(x, 0)).collect();
+        assert!(inside.len() > 3);
+        let (lo, hi) = (inside.iter().min().unwrap(), inside.iter().max().unwrap());
+        assert!(hi - lo <= 1, "the footprint is level: {inside:?}");
+        // AND THE EDGE DISSOLVES. Far outside, the ground is untouched;
+        // in between it eases. A platform with a hard edge is a
+        // platform; one whose edge dissolves is ground.
+        let far = top(90, 0).expect("ground out there");
+        assert_eq!(far, 64 + 90 / 3, "untouched beyond the reach");
+        let mid = top(34, 0).expect("ground");
+        assert!(mid > *hi && mid < far, "the edge eases: platform {hi}, mid {mid}, far {far}");
+    }
+
+    #[test]
+    fn flat_ground_needs_no_preparation() {
+        // and a build on the flat should not churn the terrain for
+        // nothing
+        use crate::VoxelWorld;
+        struct Flat;
+        impl VoxelWorld for Flat {
+            fn get(&self, _: i32, y: i32, _: i32) -> u16 { if y <= 64 { 1 } else { 0 } }
+            fn set(&mut self, _: i32, _: i32, _: i32, _: u16) -> bool { false }
+        }
+        let b = keep();
+        let l = lay_out(&b, ((-20, -20), (20, 20)), 3, 30);
+        assert!(ground_for(&Flat, &l, (0, 64, 0), 1).is_empty(),
+                "nothing to do on the flat");
+        // and an empty layout is not a panic
+        assert!(ground_for(&Flat, &Layout::default(), (0, 64, 0), 1).is_empty());
     }
 }

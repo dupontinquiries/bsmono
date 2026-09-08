@@ -341,6 +341,7 @@ pub fn programme(request: &str, site: ((i32, i32), (i32, i32)), seed: u64,
     // and the flair the massing implies, appended: the sections are
     // passes now, so `on curtain_wall top_edge` has something to mean
     p.src = crate::brief::to_program(&layout, &brief, "stone", 0);
+    p.layout = layout.clone();
     // Assets first, then the mass passes, THEN the flair passes -- a
     // flair attaches to a body an earlier pass left, so it cannot run
     // before the thing it decorates exists.
@@ -364,6 +365,10 @@ pub fn programme(request: &str, site: ((i32, i32), (i32, i32)), seed: u64,
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Programmed {
+    /// The layout, kept so the caller can prepare the GROUND before
+    /// building on it -- levelling and blending needs the world, which
+    /// this function does not have.
+    pub layout: crate::brief::Layout,
     pub typology: &'static str,
     pub total: i32,
     pub rooms: usize,
