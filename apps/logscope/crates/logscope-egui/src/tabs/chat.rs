@@ -38,42 +38,12 @@ use chat_save::*;
 mod chat_fmt;
 use chat_fmt::*;
 
-/// The mic pearl's SHAPE — a SECOND per-scene derivative (beyond the colour idiom) so the in-scene voice
-/// indicator matches each world's physical substance, not just its tint. Kept a FREE derivative (no bespoke
-/// per-world table): it falls out of the palette `Material` plus a small crystalline/watery name set —
-///   * `Pearl`  — smooth orb: watery/airy worlds (Atlantis, Cloudscape) and paper worlds (a wafer).
-///   * `Gem`    — faceted iridescent crystal: the crystalline worlds (Fractal Spires, Recursive Citadel,
-///                Frozen Bifrost) — the pass-67 "faceted gem vs smooth pearl" second axis.
-///   * `Stone`  — weathered/carved stone bead: rock & marble & cave/mist worlds (Slate, Titan's Ribcage,
-///                Mistfall, Mansion Garden…).
-///   * `Bead`   — chunky turned wooden bead: the wood-board worlds (Old Library, Archive, Alley…).
-///   * `Leaf`   — a backlit leaf blade: the foliage worlds (Forest, Canopy, Treehouse, Hollow Jungle) — the
-///                signature "leaves instead of the pearl" object.
-/// Rendering maps these onto existing mesh primitives (uv_sphere / cracked_pearl / rock / leaf_single).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MicShape { Pearl, Gem, Stone, Bead, Leaf }
+// The physical dock's panel and control mapping live in `chat_dock.rs` — the four pieces that
+// have to agree about what each knob is.
+#[path = "chat_dock.rs"]
+mod chat_dock;
+use chat_dock::*;
 
-/// Derive the mic pearl shape for a scene from its name + palette material (see `MicShape`). Pure so it can
-/// be unit-tested without a renderer (the GUI verification path is headless render; this is the logic gate).
-pub fn mic_shape(scene: &str, material: theme::Material) -> MicShape {
-    use theme::Material::*;
-    match scene {
-        // foliage worlds → a backlit LEAF blade (the signature "leaves instead of the pearl" object).
-        "Forest" | "Canopy" | "Treehouse" | "Hollow Jungle" => MicShape::Leaf,
-        // crystalline worlds → a faceted gem (the shape derivative the pass-67 note calls for).
-        "Fractal Spires" | "Recursive Citadel" | "Frozen Bifrost" => MicShape::Gem,
-        // cave / carved-rune / mist worlds → weathered stone (the "caves → stones" idiom).
-        "Mistfall" => MicShape::Stone,
-        // watery / airy worlds → a smooth pearl regardless of their (stone) material.
-        "Atlantis" | "Cloudscape" => MicShape::Pearl,
-        // everything else follows its physical material.
-        _ => match material {
-            Wood => MicShape::Bead,          // a turned wooden bead
-            Paper | None => MicShape::Pearl, // a paper wafer reads as a smooth bead
-            Stone | Marble => MicShape::Stone,
-        },
-    }
-}
 
 
 // ── PHYSICAL CONTROL DOCK ────────────────────────────────────────────────────────────────────────
@@ -113,67 +83,9 @@ const MODEL_SEL: usize = 622;   // ModelState::items — dynamic count
 /// Which job the selected model does: Liaison / Disciple / Thinker (see logscope::modelroles).
 const ROLE_SEL: usize = 623;
 
-/// Read a `Ctx` field as an f32 by its physical-dial id (for syncing the dial handle to the live value).
-fn ctx_get(ctx: &Ctx, id: usize) -> f32 {
-    match id {
-        PARAM_TEMP => ctx.temperature,
-        PARAM_NCTX => ctx.n_ctx as f32,
-        PARAM_MAXTOK => ctx.max_tokens as f32,
-        PARAM_REPEAT => ctx.repeat_penalty,
-        PARAM_MINP => ctx.min_p,
-        _ => 0.0,
-    }
-}
-/// Write a `Ctx` field from a dragged dial value (rounding the integer params).
-fn ctx_set(ctx: &mut Ctx, id: usize, v: f32) {
-    match id {
-        PARAM_TEMP => ctx.temperature = v,
-        PARAM_NCTX => ctx.n_ctx = v.round() as u32,
-        PARAM_MAXTOK => ctx.max_tokens = v.round() as u32,
-        PARAM_REPEAT => ctx.repeat_penalty = v,
-        PARAM_MINP => ctx.min_p = v,
-        _ => {}
-    }
-}
 
-/// Build the in-scene control dock: every scene control is a physical object — Overview/Prune/Unprune
-/// momentary, Tour/Freecam toggles — plus the Context panel's sampling sliders as physical Dials.
-fn phys_dock() -> crate::physui::Panel {
-    use crate::physui::{ControlKind, Panel};
-    let mut p = Panel::new();
-    p.add(DOCK_OVERVIEW, ControlKind::Momentary, false);
-    p.add(DOCK_TOUR, ControlKind::Toggle, false);
-    p.add(DOCK_FREECAM, ControlKind::Toggle, false);
-    p.add(DOCK_PRUNE, ControlKind::Momentary, false);
-    p.add(DOCK_UNPRUNE, ControlKind::Momentary, false);
-    let cd = Ctx::default();
-    for &(id, _, lo, hi, _) in &PARAM_DIALS { p.add_dial(id, lo, hi, ctx_get(&cd, id)); }
-    p.add_selector(BACKEND_SEL, BackendKind::ALL.len(), 0);
-    p.add_selector(PERSONA_SEL, PERSONAS.len(), 0);
-    p.add_selector(MODEL_SEL, 1, 0); // real count set each frame via set_selector_count once known
-    p.add_selector(ROLE_SEL, 3, 2);  // default Thinker: the safe assumption is that a model is authoritative
-    p
-}
 
-/// The camera/context change a physical-dock actuation implies. Pure + testable so the button→action
-/// mapping (and the fact that non-dock events are ignored) is locked without a live scene; the field
-/// mutations that apply it mirror the controls the (now-removed) 2D toolbar used to expose.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum DockAction { Overview, Tour(bool), Freecam(bool), Prune, Unprune }
 
-/// Map a [`physui::ControlEvent`] from the dock to its [`DockAction`], or `None` for events that aren't
-/// one of the dock's controls (unknown ids, dial adjusts, etc.).
-fn dock_action(ev: crate::physui::ControlEvent) -> Option<DockAction> {
-    use crate::physui::ControlEvent::*;
-    match ev {
-        Fired(DOCK_OVERVIEW) => Some(DockAction::Overview),
-        Toggled(DOCK_TOUR, on) => Some(DockAction::Tour(on)),
-        Toggled(DOCK_FREECAM, on) => Some(DockAction::Freecam(on)),
-        Fired(DOCK_PRUNE) => Some(DockAction::Prune),
-        Fired(DOCK_UNPRUNE) => Some(DockAction::Unprune),
-        _ => None,
-    }
-}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Role { User, Assistant }

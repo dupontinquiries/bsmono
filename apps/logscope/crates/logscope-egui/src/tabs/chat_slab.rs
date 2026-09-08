@@ -5,11 +5,52 @@
 //! separable at all — and being buried between the command dispatch and the message store is
 //! why the projection maths was hard to find when the slab was wrong.
 //!
+//! `mic_shape` and `MicShape` joined this file rather than getting a sixth: they are scene
+//! presentation like the rest of it, and a module per function is not a split, it is a
+//! filing cabinet.
+//!
 //! `pub(super)` rather than `pub`: they are `chat`'s internals that happen to live in another
 //! file, not a new public surface. A child module, so `use super::*` reaches `chat`'s types
 //! (`Ctx`, `MicShape`) without re-importing each one.
 
 use super::*;
+
+/// The mic pearl's SHAPE — a SECOND per-scene derivative (beyond the colour idiom) so the in-scene voice
+/// indicator matches each world's physical substance, not just its tint. Kept a FREE derivative (no bespoke
+/// per-world table): it falls out of the palette `Material` plus a small crystalline/watery name set —
+///   * `Pearl`  — smooth orb: watery/airy worlds (Atlantis, Cloudscape) and paper worlds (a wafer).
+///   * `Gem`    — faceted iridescent crystal: the crystalline worlds (Fractal Spires, Recursive Citadel,
+///                Frozen Bifrost) — the pass-67 "faceted gem vs smooth pearl" second axis.
+///   * `Stone`  — weathered/carved stone bead: rock & marble & cave/mist worlds (Slate, Titan's Ribcage,
+///                Mistfall, Mansion Garden…).
+///   * `Bead`   — chunky turned wooden bead: the wood-board worlds (Old Library, Archive, Alley…).
+///   * `Leaf`   — a backlit leaf blade: the foliage worlds (Forest, Canopy, Treehouse, Hollow Jungle) — the
+///                signature "leaves instead of the pearl" object.
+/// Rendering maps these onto existing mesh primitives (uv_sphere / cracked_pearl / rock / leaf_single).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MicShape { Pearl, Gem, Stone, Bead, Leaf }
+
+/// Derive the mic pearl shape for a scene from its name + palette material (see `MicShape`). Pure so it can
+/// be unit-tested without a renderer (the GUI verification path is headless render; this is the logic gate).
+pub fn mic_shape(scene: &str, material: theme::Material) -> MicShape {
+    use theme::Material::*;
+    match scene {
+        // foliage worlds → a backlit LEAF blade (the signature "leaves instead of the pearl" object).
+        "Forest" | "Canopy" | "Treehouse" | "Hollow Jungle" => MicShape::Leaf,
+        // crystalline worlds → a faceted gem (the shape derivative the pass-67 note calls for).
+        "Fractal Spires" | "Recursive Citadel" | "Frozen Bifrost" => MicShape::Gem,
+        // cave / carved-rune / mist worlds → weathered stone (the "caves → stones" idiom).
+        "Mistfall" => MicShape::Stone,
+        // watery / airy worlds → a smooth pearl regardless of their (stone) material.
+        "Atlantis" | "Cloudscape" => MicShape::Pearl,
+        // everything else follows its physical material.
+        _ => match material {
+            Wood => MicShape::Bead,          // a turned wooden bead
+            Paper | None => MicShape::Pearl, // a paper wafer reads as a smooth bead
+            Stone | Marble => MicShape::Stone,
+        },
+    }
+}
 
 /// Project a billboarded in-scene UI slab (centre + right/up basis, size w×h in world units) to its
 /// screen-space bounding Rect. This is the basis for making in-scene panels/buttons INTERACTIVE and
