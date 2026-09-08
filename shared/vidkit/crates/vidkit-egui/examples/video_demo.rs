@@ -25,7 +25,7 @@ use eframe::egui;
 use vidkit_core::frame::{ColorInfo, CpuPlanes, Frame, FrameData, PlaneLayout};
 use vidkit_core::traits::Presenter;
 use vidkit_egui::{bottom_bar, next_fit, EguiPresenter, Fit, Transport, VideoView};
-use uikit_egui::{skin::Skin, PaletteColors};
+use uikit_egui::{adaptive::Adaptive, skin::Skin, PaletteColors};
 
 const W: usize = 640;
 const H: usize = 360;
@@ -143,7 +143,15 @@ impl eframe::App for Demo {
         self.presenter.schedule_repaint();
 
         egui::TopBottomPanel::bottom("transport").show(ctx, |ui| {
-            let act = bottom_bar(ui, &mut self.transport, self.view.fit, &self.colors, &self.skin);
+            let adaptive = Adaptive::detect(ui.ctx());
+            let act = bottom_bar(
+                ui,
+                &mut self.transport,
+                self.view.fit,
+                &self.colors,
+                &self.skin,
+                &adaptive,
+            );
             if act.toggle_play {
                 self.transport.playing = !self.transport.playing;
             }
@@ -162,6 +170,7 @@ impl eframe::App for Demo {
             }
         });
 
+        if !Adaptive::detect(ctx).is_compact() {
         egui::TopBottomPanel::bottom("hints").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.small("drag ↔ scrub (higher = faster)");
@@ -177,6 +186,7 @@ impl eframe::App for Demo {
                 ui.small("tap: play/pause");
             });
         });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let (_r, action) = self.view.show(ui, &self.presenter, &mut self.transport);

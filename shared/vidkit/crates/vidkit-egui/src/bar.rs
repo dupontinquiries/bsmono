@@ -13,6 +13,8 @@ use egui::{Color32, Ui};
 use uikit_egui::skin::Skin;
 use uikit_egui::PaletteColors;
 
+use uikit_egui::adaptive::{Adaptive, DeviceClass};
+
 use crate::fit::Fit;
 use crate::gestures::{apply_speed_step, apply_volume_step};
 use crate::view::{format_time, progress, Transport};
@@ -31,6 +33,50 @@ pub struct BarAction {
 impl BarAction {
     pub fn is_empty(&self) -> bool {
         self == &BarAction::default()
+    }
+}
+
+/// Which elements the bar shows at a given device class.
+///
+/// The DECISION is separated from the drawing so it can be tested: at 420
+/// points -- the Fairphone target -- the full bar wraps to three rows and eats
+/// a fifth of the screen, and a screenshot is a slow way to find that out
+/// again after every edit.
+#[derive(Clone, PartialEq, Debug)]
+pub struct BarLayout {
+    /// Word labels before the +/- controls ("speed", "vol").
+    pub word_labels: bool,
+    /// Desired progress bar width in points.
+    pub progress_width: f32,
+    /// The codec/decode-path status line.
+    pub status: bool,
+    /// Total duration alongside the position.
+    pub duration: bool,
+}
+
+impl BarLayout {
+    pub fn for_class(class: DeviceClass) -> Self {
+        match class {
+            DeviceClass::Phone => Self {
+                // Dropping two words is worth a whole row here.
+                word_labels: false,
+                progress_width: 90.0,
+                status: false,
+                duration: true,
+            },
+            DeviceClass::Tablet => Self {
+                word_labels: true,
+                progress_width: 150.0,
+                status: false,
+                duration: true,
+            },
+            _ => Self {
+                word_labels: true,
+                progress_width: 200.0,
+                status: true,
+                duration: true,
+            },
+        }
     }
 }
 
@@ -64,7 +110,9 @@ pub fn bottom_bar(
     fit: Fit,
     colors: &PaletteColors,
     skin: &Skin,
+    adaptive: &Adaptive,
 ) -> BarAction {
+    let layout = BarLayout::for_class(adaptive.class);
     let mut act = BarAction::default();
 
     // Wrapped, not a single row. A phone surface is about 400 points wide and
@@ -82,14 +130,16 @@ pub fn bottom_bar(
         }
 
         ui.label(format_time(transport.position));
-        if let Some(d) = transport.duration {
-            ui.label(format!("/ {}", format_time(d)));
+        if layout.duration {
+            if let Some(d) = transport.duration {
+                ui.label(format!("/ {}", format_time(d)));
+            }
         }
 
         if let Some(p) = progress(transport.position, transport.duration) {
             let bar = ui.add(
                 egui::ProgressBar::new(p)
-                    .desired_width(200.0)
+                    .desired_width(layout.progress_width)
                     .desired_height(10.0),
             );
             // Click-to-seek: the bar is the one place a precise absolute jump
@@ -108,7 +158,9 @@ pub fn bottom_bar(
 
         // Speed. The same 5% steps the right-half gesture uses, so the two
         // controls cannot land on different values.
-        ui.label("speed");
+        if layout.word_labels {
+            ui.label("speed");
+        }
         if ui.small_button("−").clicked() {
             transport.speed = apply_speed_step(transport.speed, -1);
         }
@@ -119,7 +171,10 @@ pub fn bottom_bar(
 
         ui.separator();
 
-        ui.label("vol");
+        // The speaker glyph carries the meaning when the word is dropped;
+        // uikit-egui's fonts::install is what makes it render as a glyph
+        // rather than a box.
+        ui.label(if layout.word_labels { "vol" } else { "🔊" });
         if ui.small_button("−").clicked() {
             transport.volume = apply_volume_step(transport.volume, -1);
         }
@@ -147,7 +202,7 @@ pub fn bottom_bar(
         // Plain flow, not a right-to-left sub-layout: that one claims the
         // remaining width and paints over whatever was already there when the
         // row is full, which is exactly what it did.
-        if !transport.status.is_empty() {
+        if layout.status && !transport.status.is_empty() {
             ui.colored_label(Color32::from_gray(150), &transport.status);
         }
     });
@@ -196,6 +251,35 @@ mod tests {
     fn bar_steps_match_gesture_steps() {
         assert_eq!(apply_speed_step(1.0, 1), 1.05);
         assert_eq!(apply_volume_step(0.5, -1), 0.45);
+    }
+
+    /// The compact layout must actually be smaller, in every dimension that
+    /// costs a row. Asserting only "phone != desktop" would pass on a layout
+    /// that changed something irrelevant.
+    #[test]
+    fn the_phone_layout_is_strictly_lighter_than_the_desktop_one() {
+        let phone = BarLayout::for_class(DeviceClass::Phone);
+        let desktop = BarLayout::for_class(DeviceClass::Desktop);
+        assert!(!phone.word_labels && desktop.word_labels);
+        assert!(!phone.status && desktop.status);
+        assert!(phone.progress_width < desktop.progress_width);
+    }
+
+    #[test]
+    fn the_tablet_layout_sits_between_the_two() {
+        let p = BarLayout::for_class(DeviceClass::Phone);
+        let t = BarLayout::for_class(DeviceClass::Tablet);
+        let d = BarLayout::for_class(DeviceClass::Desktop);
+        assert!(p.progress_width < t.progress_width && t.progress_width < d.progress_width);
+    }
+
+    /// Position is the one readout that survives every breakpoint: a player
+    /// that cannot tell you where you are is not a player.
+    #[test]
+    fn the_duration_readout_survives_every_class() {
+        for c in [DeviceClass::Phone, DeviceClass::Tablet, DeviceClass::Desktop] {
+            assert!(BarLayout::for_class(c).duration, "{c:?} dropped the duration");
+        }
     }
 
     #[test]
