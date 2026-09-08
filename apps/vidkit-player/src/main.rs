@@ -26,6 +26,8 @@ use vidkit_core::io::MemorySource;
 use vidkit_core::traits::{MediaSource, Presenter};
 use vidkit_egui::{bottom_bar, next_fit, EguiPresenter, Fit, Transport, VideoView};
 
+mod filepick;
+mod palette;
 mod pattern;
 
 /// What we managed to learn about the file the user named.
@@ -102,6 +104,64 @@ struct Player {
     /// `Err` is shown rather than swallowed: a player that opens nothing and
     /// says nothing is the failure this whole binary exists to avoid.
     opened: Option<Result<Opened, String>>,
+    palette: palette::Palette,
+    picker: Option<Picker>,
+    /// The file currently open, so the picker reopens beside it.
+    path: Option<PathBuf>,
+    quit: bool,
+}
+
+/// File-picker state. Navigation is uikit-egui's PathPicker; the file list and
+/// the filter are ours, because `Listing` carries directories only.
+struct Picker {
+    dir: PathBuf,
+    entries: Vec<filepick::Entry>,
+    query: String,
+    selected: usize,
+    show_hidden: bool,
+    error: Option<String>,
+    just_opened: bool,
+}
+
+impl Picker {
+    fn at(dir: PathBuf, show_hidden: bool) -> Self {
+        let (entries, error) = match filepick::read_dir(&dir, show_hidden) {
+            Ok(v) => (v, None),
+            // A directory that cannot be read leaves the previous listing
+            // empty and SAYS so; silently showing nothing reads as an empty
+            // folder, which is a different fact.
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        Self {
+            dir,
+            entries,
+            query: String::new(),
+            selected: 0,
+            show_hidden,
+            error,
+            just_opened: true,
+        }
+    }
+
+    fn visible(&self) -> Vec<filepick::Entry> {
+        filepick::filter(&self.entries, &self.query)
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        let n = self.visible().len();
+        if n == 0 {
+            self.selected = 0;
+            return;
+        }
+        let cur = self.selected.min(n - 1) as i32;
+        self.selected = (cur + delta).rem_euclid(n as i32) as usize;
+    }
+
+    fn reload(&mut self) {
+        let d = self.dir.clone();
+        let h = self.show_hidden;
+        *self = Picker::at(d, h);
+    }
 }
 
 impl Player {
@@ -114,7 +174,7 @@ impl Player {
         // boxes. Idempotent, so the double call costs nothing.
         uikit_egui::fonts::install(&cc.egui_ctx);
         let colors = vidkit_egui::install(&cc.egui_ctx, snapclone_theme::palette_by_id("dark"));
-        let opened = file.map(|p| open_local(&p));
+        let opened = file.as_ref().map(|p| open_local(p));
 
         let status = match &opened {
             Some(Ok(_)) => "NV12 · CPU convert".to_string(),
@@ -139,6 +199,10 @@ impl Player {
             skin: Skin::carved(),
             started: Instant::now(),
             opened,
+            palette: palette::Palette::default(),
+            picker: None,
+            path: file,
+            quit: false,
         }
     }
 
@@ -158,6 +222,11 @@ impl eframe::App for Player {
 
     #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
+        if self.quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        self.handle_keys(ctx);
+
         if self.transport.playing {
             let t = self.started.elapsed().as_secs_f64() * self.transport.speed;
             if let Some(d) = self.transport.duration {
@@ -247,6 +316,371 @@ impl eframe::App for Player {
                 self.transport.position = to;
             }
         });
+
+        // Overlays after the page, so they draw on top of it.
+        self.palette_ui(ctx);
+        self.picker_ui(ctx);
+    }
+}
+
+impl Player {
+    /// Keyboard entry points.
+    ///
+    /// Read before the panels so a keystroke that opens an overlay takes
+    /// effect on the same frame -- otherwise Ctrl+P feels like it dropped the
+    /// first press.
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        let (cmd_p, cmd_o, cmd_q, esc, space) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(egui::Key::P),
+                i.modifiers.command && i.key_pressed(egui::Key::O),
+                i.modifiers.command && i.key_pressed(egui::Key::Q),
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Space),
+            )
+        });
+
+        if cmd_q {
+            self.quit = true;
+        }
+        if esc {
+            // One Escape closes one thing, innermost first: closing both at
+            // once loses the palette the picker was opened from.
+            if self.picker.is_some() {
+                self.picker = None;
+            } else {
+                self.palette.close();
+            }
+        }
+        if cmd_p {
+            if self.palette.open {
+                self.palette.close();
+            } else {
+                self.palette.open();
+            }
+        }
+        if cmd_o {
+            self.open_picker();
+        }
+        // Space only when no overlay has the keyboard, or it types a space
+        // into the query instead of toggling playback.
+        if space && !self.palette.open && self.picker.is_none() {
+            self.transport.playing = !self.transport.playing;
+        }
+    }
+
+    fn open_picker(&mut self) {
+        self.palette.close();
+        let dir = filepick::start_dir(self.path.as_deref());
+        self.picker = Some(Picker::at(dir, false));
+    }
+
+    fn run(&mut self, c: palette::Command) {
+        use palette::Command as C;
+        match c {
+            C::OpenFile => self.open_picker(),
+            C::PlayPause => self.transport.playing = !self.transport.playing,
+            C::Rotate => {
+                self.transport.rotation = vidkit_egui::apply_rotation(self.transport.rotation, 1)
+            }
+            C::CycleFit => self.view.fit = next_fit(self.view.fit),
+            C::ResetView => {
+                self.transport.zoom = 1.0;
+                self.transport.rotation = 0;
+            }
+            // The same 5% steps the gestures and the bar use, so the three
+            // controls cannot land on different values.
+            C::SpeedUp => {
+                self.transport.speed = vidkit_egui::apply_speed_step(self.transport.speed, 1)
+            }
+            C::SpeedDown => {
+                self.transport.speed = vidkit_egui::apply_speed_step(self.transport.speed, -1)
+            }
+            C::VolumeUp => {
+                self.transport.volume = vidkit_egui::apply_volume_step(self.transport.volume, 1)
+            }
+            C::VolumeDown => {
+                self.transport.volume = vidkit_egui::apply_volume_step(self.transport.volume, -1)
+            }
+            C::Quit => self.quit = true,
+        }
+    }
+
+    fn load(&mut self, path: PathBuf) {
+        let result = open_local(&path);
+        self.transport.duration = match &result {
+            Ok(o) => o.duration,
+            Err(_) => None,
+        };
+        self.transport.position = Duration::ZERO;
+        self.started = Instant::now();
+        self.path = Some(path);
+        self.opened = Some(result);
+    }
+
+    /// Dim the page behind an overlay.
+    ///
+    /// Without this the palette floats over moving colour bars and its rows
+    /// are unreadable -- which a screenshot showed immediately and no test
+    /// could. uikit-egui's `command_bar` defines SCRIM_PANE for exactly this
+    /// and notes that a scrim which only works on one theme is the bug it
+    /// exists to stop repeating, so the value comes from there rather than
+    /// from a number picked here.
+    fn scrim(&self, ctx: &egui::Context) {
+        let alpha = (uikit_egui::command_bar::SCRIM_PANE * 255.0) as u8;
+        egui::Area::new(egui::Id::new("vidkit-scrim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let r = ui.ctx().screen_rect();
+                ui.painter()
+                    .rect_filled(r, 0.0, egui::Color32::from_black_alpha(alpha));
+                ui.allocate_rect(r, egui::Sense::click());
+            });
+    }
+
+    /// An opaque frame for overlay windows.
+    ///
+    /// egui's default window fill is translucent; over video that is not a
+    /// style choice, it is illegible.
+    fn overlay_frame(&self) -> egui::Frame {
+        egui::Frame::window(&egui::Style::default())
+            .fill(self.colors.bg_card)
+            .stroke(egui::Stroke::new(1.0, self.colors.border))
+    }
+
+    fn palette_ui(&mut self, ctx: &egui::Context) {
+        if !self.palette.open {
+            return;
+        }
+        let (up, down, enter) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::Enter),
+            )
+        });
+        if up {
+            self.palette.move_selection(-1);
+        }
+        if down {
+            self.palette.move_selection(1);
+        }
+
+        self.scrim(ctx);
+        let mut chosen = None;
+        egui::Window::new("Command palette")
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 60.0])
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .frame(self.overlay_frame())
+            .show(ctx, |ui| {
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.palette.query)
+                        .hint_text("type a command…")
+                        .desired_width(f32::INFINITY),
+                );
+                if self.palette.just_opened {
+                    edit.request_focus();
+                    self.palette.just_opened = false;
+                }
+                if edit.changed() {
+                    // Narrowing can leave the highlight past the end; Enter
+                    // would then run nothing, or the wrong row.
+                    self.palette.on_query_changed();
+                }
+
+                ui.separator();
+                let matches = self.palette.matches();
+                if matches.is_empty() {
+                    ui.weak("no matching command");
+                }
+                // Capped at the kit's MAX_ROWS: past that a palette stops
+                // being a shortcut and becomes a list you read.
+                for (i, c) in matches
+                    .iter()
+                    .take(uikit_egui::command_bar::MAX_ROWS)
+                    .enumerate()
+                {
+                    let sel = i == self.palette.selected;
+                    // Label and shortcut on ONE row, the shortcut pushed right.
+                    // Stacking them made every command look like two entries.
+                    let mut r = None;
+                    ui.horizontal(|ui| {
+                        r = Some(ui.selectable_label(sel, c.label()));
+                        if let Some(k) = c.shortcut() {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.weak(k);
+                                },
+                            );
+                        }
+                    });
+                    if r.map(|r| r.clicked()).unwrap_or(false) {
+                        chosen = Some(*c);
+                    }
+                }
+            });
+
+        if enter {
+            chosen = self.palette.chosen();
+        }
+        if let Some(c) = chosen {
+            self.palette.close();
+            self.run(c);
+        }
+    }
+
+    fn picker_ui(&mut self, ctx: &egui::Context) {
+        let Some(p) = self.picker.as_mut() else {
+            return;
+        };
+        let (up, down, enter) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::Enter),
+            )
+        });
+        if up {
+            p.move_selection(-1);
+        }
+        if down {
+            p.move_selection(1);
+        }
+
+        let mut go_to: Option<PathBuf> = None;
+        let mut play: Option<PathBuf> = None;
+        let mut close = false;
+        let mut toggle_hidden = false;
+
+        let frame = self.overlay_frame();
+        self.scrim(ctx);
+        let p = self.picker.as_mut().expect("checked above");
+        egui::Window::new("Open file")
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .default_width(560.0)
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("⬆ up").clicked() {
+                        if let Some(parent) = p.dir.parent() {
+                            go_to = Some(parent.to_path_buf());
+                        }
+                    }
+                    // Elided from the LEFT, as uikit's picker does: the end of
+                    // a path is the part that identifies it.
+                    ui.label(
+                        egui::RichText::new(uikit_egui::path_picker::elide_left(
+                            &p.dir.display().to_string(),
+                            52,
+                        ))
+                        .monospace()
+                        .small(),
+                    );
+                    if ui.checkbox(&mut p.show_hidden, "hidden").changed() {
+                        toggle_hidden = true;
+                    }
+                });
+
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut p.query)
+                        .hint_text("filter…")
+                        .desired_width(f32::INFINITY),
+                );
+                if p.just_opened {
+                    edit.request_focus();
+                    p.just_opened = false;
+                }
+                if edit.changed() {
+                    p.selected = 0;
+                }
+
+                ui.separator();
+                if let Some(e) = &p.error {
+                    ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
+                }
+
+                let visible = p.visible();
+                if visible.is_empty() && p.error.is_none() {
+                    // Distinguishes "nothing here" from "nothing matches",
+                    // which are different problems with different fixes.
+                    ui.weak(if p.query.trim().is_empty() {
+                        "no playable files or folders here"
+                    } else {
+                        "nothing matches that filter"
+                    });
+                }
+
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for (i, e) in visible.iter().enumerate() {
+                        let label = if e.is_dir {
+                            format!("📁 {}", e.name)
+                        } else {
+                            format!("🎞 {}", e.name)
+                        };
+                        let r = ui.selectable_label(i == p.selected, label);
+                        if r.clicked() {
+                            p.selected = i;
+                        }
+                        if r.double_clicked() {
+                            let path = p.dir.join(&e.name);
+                            if e.is_dir {
+                                go_to = Some(path);
+                            } else {
+                                play = Some(path);
+                            }
+                        }
+                    }
+                });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("open").clicked() {
+                        if let Some(e) = visible.get(p.selected) {
+                            let path = p.dir.join(&e.name);
+                            if e.is_dir {
+                                go_to = Some(path);
+                            } else {
+                                play = Some(path);
+                            }
+                        }
+                    }
+                    if ui.button("cancel").clicked() {
+                        close = true;
+                    }
+                    ui.weak("Enter opens · Esc cancels");
+                });
+            });
+
+        if enter {
+            if let Some(e) = p.visible().get(p.selected).cloned() {
+                let path = p.dir.join(&e.name);
+                if e.is_dir {
+                    go_to = Some(path);
+                } else {
+                    play = Some(path);
+                }
+            }
+        }
+        if toggle_hidden {
+            p.reload();
+        }
+        if let Some(d) = go_to {
+            let hidden = p.show_hidden;
+            self.picker = Some(Picker::at(d, hidden));
+        }
+        if let Some(f) = play {
+            self.picker = None;
+            self.load(f);
+        }
+        if close {
+            self.picker = None;
+        }
     }
 }
 
