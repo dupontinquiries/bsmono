@@ -97,6 +97,35 @@ pub fn candidates() -> Vec<PathBuf> {
     out
 }
 
+/// Why the mail pane is empty, in the user's terms.
+///
+/// "no mail" is what the list said, and it is indistinguishable from "this feature is
+/// broken": nothing on screen said that a maildir was looked for, where, or that a REMOTE
+/// account is a different thing this build cannot reach. Someone with mail in
+/// `~/.local/share/mail` had no way to learn that only four paths are tried.
+///
+/// `None` when a store WAS found — then an empty list means an empty inbox, which needs no
+/// explanation.
+pub fn empty_reason() -> Option<String> {
+    if discover().is_some() {
+        return None;
+    }
+    let looked = candidates();
+    if looked.is_empty() {
+        // No HOME, no USER, no MAIL. Almost certainly a service or a container.
+        return Some(
+            "No mail store: neither $MAIL nor $HOME is set, so there was nowhere to look."
+                .to_string(),
+        );
+    }
+    let list: Vec<String> = looked.iter().map(|p| p.display().to_string()).collect();
+    Some(format!(
+        "No local mail store. Looked in: {}.\nSet $MAIL to a maildir or mbox to read it here. \
+         Signing in to a remote account is a separate thing this build does not do.",
+        list.join(", ")
+    ))
+}
+
 /// The first candidate that holds mail, if any.
 pub fn discover() -> Option<(PathBuf, Kind)> {
     candidates().into_iter()
@@ -243,6 +272,37 @@ pub fn load_bodies(path: &Path) -> std::collections::HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// "no mail" is indistinguishable from "this feature is broken". Nothing said that a
+    /// maildir was looked for, where, or that a remote account is a different thing this
+    /// build cannot reach.
+    #[test]
+    fn an_empty_pane_says_where_it_looked() {
+        let dir = std::env::temp_dir().join(format!("vt-mail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev_home = std::env::var_os("HOME");
+        let prev_mail = std::env::var_os("MAIL");
+        // SAFETY: single-threaded test; restored below.
+        unsafe {
+            std::env::set_var("HOME", &dir);
+            std::env::remove_var("MAIL");
+        }
+
+        let why = empty_reason().expect("no store, so a reason");
+        assert!(why.contains("Looked in"), "{why}");
+        assert!(why.contains(&dir.join("Maildir").display().to_string()), "{why}");
+        // The remote case is named, because "no mail" reads as "your mail is missing" to
+        // someone who has an account somewhere and no local store at all.
+        assert!(why.contains("remote"), "{why}");
+        assert!(why.contains("$MAIL"), "the way out should be in the message: {why}");
+
+        unsafe {
+            match prev_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
+            if let Some(v) = prev_mail { std::env::set_var("MAIL", v) }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {

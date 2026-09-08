@@ -275,8 +275,27 @@ pub fn list_ui(ui: &mut egui::Ui, view: &mut MailView,
     if rows.is_empty() {
         ui.vertical_centered(|ui| {
             ui.add_space(20.0);
-            ui.label(egui::RichText::new(if view.query.is_empty() {
-                "no mail" } else { "nothing matches" }).weak());
+            if !view.query.is_empty() {
+                // A filter hiding everything is not a missing store, and saying so would
+                // send someone hunting for a maildir they already have.
+                ui.label(egui::RichText::new("nothing matches").weak());
+                return;
+            }
+            // WHY, not just "no mail" — which is indistinguishable from "this feature is
+            // broken". `mail_store::empty_reason` names the paths that were tried and says
+            // that a remote account is a separate thing this build does not reach.
+            match crate::mail_store::empty_reason() {
+                Some(why) => {
+                    ui.label(egui::RichText::new("no mail").weak());
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(why).weak().small());
+                }
+                // A store WAS found and is empty. That is an empty inbox and needs no
+                // explanation.
+                None => {
+                    ui.label(egui::RichText::new("no mail").weak());
+                }
+            }
         });
         return None;
     }

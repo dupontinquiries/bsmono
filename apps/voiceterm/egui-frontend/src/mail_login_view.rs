@@ -15,6 +15,24 @@
 //! the host owns the retry, and re-prompting is cheaper than a password
 //! sitting in a widget's state for the rest of the session.
 
+//! ## NOT WIRED, and why (2026-09-07)
+//!
+//! This form has no caller in the egui frontend, and wiring it would be theatre. `submit`
+//! yields `Credentials` for "the host to hand to the bridge (`mail_login`)" — and this
+//! frontend has no bridge. The Qt build's `mail_login` goes to a `mail_hub`, which is gated
+//! behind the `mail-crypto` feature and refuses with "this build can't sign in to Proton yet"
+//! when it is absent (`TODO_mail_srp_login.md`).
+//!
+//! So a login screen here would collect a password, validate it, and drop it. That is worse
+//! than no login screen: a form that looks like it works is how someone concludes their
+//! credentials were wrong.
+//!
+//! What the mail pane does instead is SAY so. `mail_store::empty_reason` names the maildir
+//! paths that were tried and states that a remote account is a separate thing this build does
+//! not reach — which is the true version of what this form would have implied.
+//!
+//! The form stays: it is tested, and it is the surface to reach for the day a hub exists here.
+
 use uikit_egui::PaletteColors;
 
 #[derive(Clone, PartialEq, Eq)]
