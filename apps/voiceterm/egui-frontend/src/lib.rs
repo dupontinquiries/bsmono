@@ -397,6 +397,13 @@ pub mod jot;
 pub mod clip_source;
 /// Finding the notes a piece of text belongs with.
 pub mod note_search;
+/// Command clustering: k-means over behavioural features, measured to 1.00 purity on the
+/// planted set (`TODO_command_clustering.md`). Wired in the Qt build since v0.1.720 and
+/// never mounted here.
+#[path = "../../src/cmd_cluster.rs"]
+pub mod cmd_cluster;
+/// The dominant cluster label for a session, for naming it.
+pub mod session_cluster;
 /// Is a clipped selection code or prose, and in what language? (`TODO_notes_clip.md`.)
 pub mod clip_kind;
 /// Who owns the keyboard when a terminal is on screen (Tab, the arrows, and the sidebar).

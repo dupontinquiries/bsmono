@@ -702,6 +702,9 @@ struct VoicetermApp {
     /// at — the derivation walks every block and the locator draws every frame.
     session_name: String,
     session_name_at: usize,
+    /// What kind of work this session mostly is, from `cmd_cluster`. `None` until there is
+    /// enough to say.
+    session_cluster: Option<String>,
     /// What `session_auto` suggests doing next, if anything. Surfaced in the locator, never
     /// applied — the module's own doc calls these "surfaced (never auto-applied)", and a
     /// terminal that opened tabs on its own guesses would be worse than one that never
@@ -3037,6 +3040,28 @@ impl eframe::App for VoicetermApp {
                     //
                     // Computed on the same edge as the name, for the same reason: the
                     // derivation walks every block and the locator draws every frame.
+                    // AND WHAT KIND OF WORK IT IS. `cmd_cluster` was measured to 1.00
+                    // purity on the planted set, wired into the Qt build in v0.1.720, and
+                    // never mounted in this frontend at all —
+                    // `TODO_command_clustering.md`'s "REMAINING (QML): feeding the dominant
+                    // cluster label into session_autoname".
+                    //
+                    // On the same edge as the name and the proposal, for the same reason:
+                    // k-means over every block is not a per-frame cost.
+                    self.session_cluster = {
+                        let cmds: Vec<(String, String)> = self
+                            .blocks
+                            .blocks
+                            .iter()
+                            .filter(|b| !b.command.trim().is_empty())
+                            .map(|b| (b.command.clone(), b.cwd.clone().unwrap_or_default()))
+                            .collect();
+                        // A fixed seed: k-means starts from a random pick, and a label that
+                        // changed every time a command ran would read as the app being
+                        // unsure rather than the session changing.
+                        voiceterm_egui::session_cluster::describes(
+                            &cmds, 0x5eed, voiceterm_egui::session_cluster::MIN_SHARE)
+                    };
                     self.session_proposal = {
                         use voiceterm_egui::session_proposals as sp;
                         let pairs: Vec<(String, String)> = self
@@ -3087,6 +3112,12 @@ impl eframe::App for VoicetermApp {
                 } else {
                     format!("{title} \u{b7} {}", self.session_name)
                 };
+                // The cluster label sits beside the name, not instead of it: the name says
+                // WHERE (repo, file), the label says WHAT KIND of work, and neither answers
+                // the other's question.
+                if let Some(k) = &self.session_cluster {
+                    title = format!("{title} \u{b7} {k}");
+                }
                 // The suggestion, as a question rather than an action. It sits in the
                 // locator because that line is already about "where am I" — and it is
                 // phrased with a `?` because nothing here will do it for you.
@@ -5905,6 +5936,7 @@ fn main() -> eframe::Result<()> {
                 notebook_cells: Default::default(),
                 session_name: String::new(),
                 session_name_at: usize::MAX,
+                session_cluster: None,
                 session_proposal: None,
                 fs_search: Default::default(),
                 cmd_sheet: Default::default(),

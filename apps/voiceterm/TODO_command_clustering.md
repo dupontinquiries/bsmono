@@ -113,3 +113,40 @@ representation question is RESOLVED + measured.
 - _dominant_cluster_label() picks the largest cluster's label (gated: >1 cmd and
   >1/3 of the stream, so a noisy split doesn't mislabel) and session_autoname
   appends it. The "cluster labels could NAME sessions" pairing, realized.
+
+
+## DONE — the egui frontend feeds the label into the session line (2026-09-07)
+
+"REMAINING (QML): a 'task clusters' view / branch-label surfacing; and feeding the dominant
+cluster label into session_autoname. Backend ready." The backend was ready and this frontend
+had never mounted `cmd_cluster` at all.
+
+`session_cluster::dominant` runs featurize → k-means → `cluster_labels` over the session's
+blocks and returns the largest cluster's label with the share it covers. `describes` adds the
+share floor.
+
+Decisions, each with a test:
+
+* **Under six commands it says nothing.** Two commands always split into two clusters and the
+  "dominant" one is a coin toss; a session that short is better named by what it ran.
+* **k is `~sqrt(n)` clamped 2..=6**, the Qt method's rule, kept so the two builds agree about
+  what a session's clusters are.
+* **A thin majority does not get to name the session.** A label covering a fifth of what you
+  did is not what the session is about, and a locator claiming it is teaches the reader to
+  ignore the locator.
+* **A `clusterN` fallback label is refused.** `cluster_labels` produces it when a cluster has
+  no distinctive token, and putting it in a session name is worse than putting nothing.
+* **A fixed seed.** k-means starts from a random pick, and a label that changed every time a
+  command ran would read as the app being unsure rather than the session changing.
+
+### Worth knowing before reading a label
+The label is the most DISTINCTIVE token in the dominant cluster, not the common verb. A
+cluster of git commands is labelled by what separates it from the others — "diff", "status" —
+not by "git", which they all share. I asserted `contains("git")` first and got "diff"; that is
+the distinctiveness score doing exactly its job, and a name like "diff" in the locator looks
+wrong until you know why.
+
+Shown beside the session name, not instead of it: the name says WHERE (repo, file), the label
+says WHAT KIND of work, and neither answers the other's question.
+
+Still open: the "task clusters" VIEW — this surfaces one label, not the cluster structure.
