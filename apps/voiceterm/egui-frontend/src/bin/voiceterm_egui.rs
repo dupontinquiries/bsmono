@@ -3762,6 +3762,32 @@ impl eframe::App for VoicetermApp {
                                 None => {}
                             }
                         });
+                        // THE SAVED NOTES JOIN THE SHIPPED DOCS, refreshed here rather than
+                        // at startup: a note written this session would otherwise not appear
+                        // until the app was restarted, and "add to the web" means opening
+                        // the note in the thing that already renders markdown rather than a
+                        // second viewer that renders it slightly differently.
+                        //
+                        // Only when the set has actually changed. `set_docs` prunes the
+                        // reader's navigation stack against the new list, so replacing it
+                        // every frame would drop the page being read the moment a note was
+                        // saved.
+                        {
+                            let notes = voiceterm_egui::note_store::documents();
+                            let have: usize =
+                                self.docs.docs().iter().filter(|d| d.name.starts_with("note:")).count();
+                            if notes.len() != have {
+                                let mut all: Vec<voiceterm_egui::manpage_view::Doc> = self
+                                    .docs
+                                    .docs()
+                                    .iter()
+                                    .filter(|d| !d.name.starts_with("note:"))
+                                    .cloned()
+                                    .collect();
+                                all.extend(notes.iter().map(|(n, t, md)| doc(n, t, md)));
+                                self.docs.set_docs(all);
+                            }
+                        }
                         if let Some(name) = voiceterm_egui::manpage_view::manpage_ui(
                             ui, &mut self.docs, &c)
                         {

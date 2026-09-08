@@ -140,6 +140,19 @@ looks like the save failed.
 A write failure is said out loud ("clipped, but not saved: …"). A silent one leaves someone
 clipping into a void for an afternoon.
 
-Still open from this section: the note PICKER and "add to the web" opening a saved note —
-`note_store::list` is there for it, newest first, names and paths only so a picker of a
-hundred notes is not a hundred file reads.
+### And the picker / "add to the web" — DONE the same day
+
+Saved notes join the SHIPPED DOCS in `manpage_view`, so the picker is the reader's own list
+and "add to the web" is opening the note in the thing that already renders markdown, rather
+than a second viewer that renders it slightly differently.
+
+Refreshed when the docs pane draws, not at startup: a note written this session would
+otherwise not appear until the app was restarted. Only when the count has CHANGED, because
+`set_docs` prunes the reader's navigation stack against the new list and replacing it every
+frame would drop the page being read the moment a note was saved.
+
+Names are prefixed `note:` so a note called "readme" cannot displace the shipped README in a
+view keyed by name. Titles come from the note's own first heading — the file name is a slug,
+and showing "build-notes" when the note says "Build notes" is a worse label than the one it
+carries. A note that cannot be read is skipped rather than listed as an entry that fails when
+opened.

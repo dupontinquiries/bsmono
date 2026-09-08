@@ -139,6 +139,44 @@ pub fn list() -> Vec<(String, std::path::PathBuf)> {
     list_in(&notes_dir())
 }
 
+/// Every saved note as `(name, title, markdown)`, newest first.
+///
+/// For a reader that wants documents rather than a list — the notes join the shipped docs in
+/// the same view, so "add to the web" is opening a note in the thing that already renders
+/// markdown rather than a second viewer that renders it slightly differently.
+///
+/// A note that cannot be read is SKIPPED, not surfaced as an entry that fails when opened: a
+/// file removed between the listing and the read is ordinary, and a reader offering a
+/// document it cannot show is worse than one that does not offer it.
+///
+/// The name is prefixed so a note called "readme" cannot displace the shipped README in a
+/// view keyed by name.
+pub fn documents_in(dir: &std::path::Path) -> Vec<(String, String, String)> {
+    list_in(dir)
+        .into_iter()
+        .filter_map(|(name, path)| {
+            let md = load_markdown(&path).ok()?;
+            Some((format!("note:{name}"), title_of(&md).unwrap_or(name), md))
+        })
+        .collect()
+}
+
+/// The notes in [`notes_dir`], as documents.
+pub fn documents() -> Vec<(String, String, String)> {
+    documents_in(&notes_dir())
+}
+
+/// A note's own title, from its first markdown heading.
+///
+/// The file name is a slug — lower-cased and hyphenated — and showing "build-notes" in a
+/// reader when the note says "Build notes" is a worse label than the one the note carries.
+pub fn title_of(md: &str) -> Option<String> {
+    md.lines()
+        .find_map(|l| l.strip_prefix("# ").map(str::trim))
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
 /// A saved note's markdown, as text.
 ///
 /// Text, not a `Note`: see the module docs. Reconstructing the tree would need a markdown
@@ -258,6 +296,42 @@ mod tests {
         // A directory that does not exist is an empty list, not an error: a first run has no
         // notes and that is not a failure.
         assert!(list_in(&dir.join("nope")).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reader shows documents, not paths. A note that cannot be read is skipped rather
+    /// than offered as an entry that fails when opened.
+    #[test]
+    fn notes_become_documents_with_their_own_titles() {
+        let dir = scratch("docs");
+        let mut n = Note::new("Build notes");
+        n.push_prose("the linker again");
+        save_in(&dir, &n).unwrap();
+
+        let docs = documents_in(&dir);
+        assert_eq!(docs.len(), 1);
+        let (name, title, md) = &docs[0];
+        // Prefixed, so a note called "readme" cannot displace the shipped README in a view
+        // keyed by name.
+        assert!(name.starts_with("note:"), "{name}");
+        // The note's OWN title, not the slug: showing "build-notes" when the note says
+        // "Build notes" is a worse label than the one it carries.
+        assert_eq!(title, "Build notes");
+        assert!(md.contains("the linker again"));
+
+        // Something that is not a note is not a document.
+        std::fs::write(dir.join("stray.png"), b"x").unwrap();
+        assert_eq!(documents_in(&dir).len(), 1);
+
+        // A title-less note falls back to its file name rather than showing nothing.
+        std::fs::write(dir.join("untitled.md"), b"just some text\n").unwrap();
+        let docs = documents_in(&dir);
+        assert!(docs.iter().any(|(_, t, _)| t == "untitled"), "{docs:?}");
+
+        assert_eq!(title_of("# Hello\n\nbody"), Some("Hello".to_string()));
+        assert_eq!(title_of("no heading"), None);
+        assert_eq!(title_of("#  \n"), None, "an empty heading is not a title");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
