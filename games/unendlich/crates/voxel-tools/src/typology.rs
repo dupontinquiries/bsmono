@@ -301,8 +301,13 @@ courtyard, and those four are what make it a castle rather than a manor house.
   constraints  encloses, inside, perimeter, tallest, ground, axial, detached
   rooms        what it holds, and roughly how many blocks of floor each
 
-Name only the sections that MATTER. Four to seven is right; twelve is a list of details and
-two is not a division.
+HOW MANY SECTIONS depends on how big it is. A hut has three. A town of a hundred thousand
+blocks has fifteen, and giving it four is why it comes out as four grey masses. Say every
+section that would be a distinct thing to walk into or around.
+
+And give each one ROOMS. A section with no rooms becomes ONE undivided space of its whole
+area -- a market of nine thousand blocks is a nine-thousand-block room, which is a
+warehouse. Rooms are what make an interior; without them the whole thing is a shell.
 
 EXAMPLE
   a ziggurat
@@ -368,8 +373,12 @@ pub fn parse_typology(name: &'static str, src: &str) -> (Option<Typology>, Vec<S
         return (None, errs);
     }
     if sections.len() > 12 {
-        errs.push("more than twelve sections is a list of details".into());
-        sections.truncate(12);
+        errs.push("more than twenty-four sections; the rest were dropped".into());
+        // Was twelve, and that was a cap on RICHNESS. A town has more
+        // parts than a hut and the number should follow the build, not
+        // a constant I picked. Twenty-four is a real ceiling rather
+        // than a stylistic preference.
+        sections.truncate(24);
     }
     let sum: f32 = sections.iter().filter(|s| s.need == Need::Essential)
         .map(|s| s.share).sum();
@@ -1503,7 +1512,15 @@ mod tests {
     fn the_proposal_prompt_asks_for_a_division_not_a_description() {
         let p = propose_prompt("ziggurat", "a great stone ziggurat");
         assert!(p.contains("never heard of a ziggurat"));
-        assert!(p.contains("Four to seven is right"), "it bounds the answer: {p}");
+        // The ask SCALES with the build. "Four to seven is right" was a
+        // cap on richness: a town of a hundred thousand blocks given
+        // four sections comes out as four grey masses, which is exactly
+        // what was observed.
+        assert!(p.contains("depends on how big it is"), "the ask scales: {p}");
+        assert!(p.contains("A hut has three") && p.contains("has fifteen"), "{p}");
+        // and it asks for ROOMS, without which a section is one
+        // undivided space of its whole area
+        assert!(p.contains("A section with no rooms becomes ONE undivided space"), "{p}");
         assert!(p.contains("come to about 1.0"), "and states the one arithmetic rule");
         // it asks for a DIVISION, not geometry -- shapes and positions
         // are a later question and mixing them makes both worse

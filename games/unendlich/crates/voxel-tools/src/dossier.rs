@@ -393,7 +393,10 @@ building anything: no shapes, no coordinates.
      cannot see the rest of the plan could build it>
   end
 
-Between three and eight parts. Each will be built in its OWN turn, by someone who sees
+HOW MANY PARTS follows the build, not a number I picked. A hut is three. A walled town is
+fifteen, and giving it four is why it comes out as four grey masses.
+
+Each will be built in its OWN turn, by someone who sees
 only the line above, that part, and the results of the parts it lists in `after`. So:
 
   * name in `after` only what your part must physically MEET -- a roof needs its walls,

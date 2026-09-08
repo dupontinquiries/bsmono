@@ -139,6 +139,49 @@ pub enum Job {
 }
 
 impl Job {
+    /// Tokens to allow GIVEN HOW FAST THE MODEL ACTUALLY IS.
+    ///
+    /// Sizing a budget in tokens alone was half an answer, and raising
+    /// it made things WORSE on a slow model. Observed: an 8B at 0.1
+    /// tok/s -- eight tokens in 132 seconds. A 2,600-token program
+    /// budget at that rate is SEVEN HOURS, and the player sees "1 line
+    /// so far" and cancels.
+    ///
+    /// A budget is a promise about how long the player waits. So the
+    /// token count is whatever fits in `seconds`, floored at enough to
+    /// say something and capped at what the job needs. A slow model
+    /// gets a SMALL job, not a long wait.
+    pub fn tokens_in(self, tier: Tier, tok_per_sec: f32, seconds: f32) -> usize {
+        let want = self.tokens(tier);
+        if tok_per_sec <= 0.0 { return want; }
+        let affordable = (tok_per_sec * seconds.max(5.0)) as usize;
+        // never below what makes a REPLY rather than a fragment: under
+        // this the turn cannot say anything and the wait buys nothing
+        affordable.clamp(120, want)
+    }
+
+    /// Is this job hopeless at this speed? A program needs a few
+    /// hundred tokens to be a program at all, and a model that cannot
+    /// produce them inside the wait should be given a smaller job
+    /// rather than a truncated one.
+    pub fn hopeless_at(self, tok_per_sec: f32, seconds: f32) -> bool {
+        tok_per_sec > 0.0 && (tok_per_sec * seconds) < self.floor() as f32
+    }
+
+    /// The least this job can be done in.
+    pub fn floor(self) -> usize {
+        match self { Job::Line => 40, Job::Answer => 80, Job::Plan => 150, Job::Program => 400 }
+    }
+
+    /// A job this speed CAN do in the time: fall back down the ladder
+    /// rather than asking for something that will be cut off.
+    pub fn affordable(self, tok_per_sec: f32, seconds: f32) -> Job {
+        for j in [self, Job::Plan, Job::Answer, Job::Line] {
+            if !j.hopeless_at(tok_per_sec, seconds) { return j; }
+        }
+        Job::Line
+    }
+
     /// Tokens to allow. The FLOOR is what the job needs, not what the
     /// tier can afford: a small model asked for a program and given
     /// 300 tokens produces a broken program, which is worse than a
@@ -149,11 +192,16 @@ impl Job {
         };
         let base = match self {
             Job::Line => 200.0,
-            Job::Answer => 500.0,
-            Job::Plan => 900.0,
+            Job::Answer => 900.0,
+            // A `Plan` is a SCHEDULE now, not a handful of ops: fifteen
+            // sections with their rooms is 1,200 tokens before a
+            // modifier is written. 900 bought four sections, which is
+            // why a hundred-thousand-block town came out as four grey
+            // masses.
+            Job::Plan => 2400.0,
             // A castle is 15 passes, 4 assets and flair: 80-120 lines
             // at ~30 tokens each. 1400 was less than half of one.
-            Job::Program => 2600.0,
+            Job::Program => 4000.0,
         };
         (base * head) as usize
     }
@@ -822,7 +870,11 @@ mod tests {
             assert!(prog > line * 6, "{tier:?}: a program needs far more than a line: {prog} vs {line}");
             // even the smallest model gets room for a real program:
             // roughly 80 lines at 30 tokens
-            assert!(prog >= 2400, "{tier:?} program budget {prog} is under 80 lines");
+            assert!(prog >= 3600, "{tier:?} program budget {prog} is too thin for assets, \
+                     passes and flair");
+            // and a plan is a SCHEDULE: fifteen sections with rooms
+            assert!(Job::Plan.tokens(tier) >= 2000, "{tier:?} plan budget {} is under a \
+                     fifteen-section schedule", Job::Plan.tokens(tier));
             assert!(line <= 700, "{tier:?} wastes {line} on one line");
             // and the order is always the same
             assert!(Job::Answer.tokens(tier) > line);
@@ -830,5 +882,29 @@ mod tests {
         }
         // a bigger model gets more room for the same job
         assert!(Job::Program.tokens(Tier::Full) > Job::Program.tokens(Tier::Tiny) * 2);
+    }
+
+    #[test]
+    fn a_budget_is_a_promise_about_how_long_the_player_waits() {
+        // Observed: an 8B at 0.1 tok/s -- eight tokens in 132 seconds.
+        // A 2,600-token program budget at that rate is SEVEN HOURS, and
+        // the player sees "1 line so far" and cancels. Raising the
+        // token count made this WORSE.
+        let slow = 0.1;
+        let quick = 40.0;
+        let wait = 60.0;
+        assert!(Job::Program.tokens_in(Tier::Medium, quick, wait) > 1000,
+                "a fast model gets the whole budget");
+        let s = Job::Program.tokens_in(Tier::Medium, slow, wait);
+        assert!(s <= 200, "a slow one is not asked for hours of work: {s}");
+        assert!(s >= 120, "but is still asked for enough to say something: {s}");
+        // and the job itself steps down rather than being truncated
+        assert_eq!(Job::Program.affordable(slow, wait), Job::Line,
+                   "at 0.1 tok/s a minute buys six tokens: only a line is possible");
+        assert_eq!(Job::Program.affordable(3.0, wait), Job::Plan, "3 tok/s in a minute is a plan");
+        assert_eq!(Job::Program.affordable(quick, wait), Job::Program);
+        // an unknown speed changes nothing, so nothing breaks before
+        // the first measurement
+        assert_eq!(Job::Program.tokens_in(Tier::Full, 0.0, wait), Job::Program.tokens(Tier::Full));
     }
 }
