@@ -58,3 +58,28 @@ backend already takes any step, so this is a QML-only addition.
   accept — let the key through).
 - Verify it does NOT steal digits/b from the URL bar or page forms.
 Keep Alt+b as the always-safe fallback.
+
+
+## DONE in the egui frontend (2026-09-07)
+
+Both halves — `count_prefix` (the accumulator) and `tab_cycle` (`cycle_target`) — have been
+pure, tested and wired in the Qt build since v0.1.719. `count_prefix` was mounted in this
+frontend and referenced by nothing; `tab_cycle` was not mounted at all. Mounting both brought
+their tests into this crate for the first time.
+
+WEB PANES ONLY, which is what the first line of this file says and also the only place it can
+go: `b` typed into the terminal has to reach the shell. Suppressed further while any text
+field has the keyboard, or the address bar would stop accepting the letter b.
+
+The pending count is SHOWN as it accumulates. A modeless count with no feedback is a mode you
+cannot see you are in — the reason vim puts it in the corner.
+
+The move goes through the workspace's own "next tab" call, like every other tab move here,
+rather than setting an index: a second route is a second place for the two to disagree. The
+loop stops if the workspace refuses to move, so a count larger than the tab list cannot spin.
+
+`cycle_target` does the arithmetic including the case a hand-rolled modulo gets wrong: `5b` on
+3 tabs is 2 steps, not 5, and a stale index is clamped into range.
+
+The key reading takes IME commits as well as `Event::Text` — an on-screen keyboard commits its
+letters, which is the same gap the terminal had.

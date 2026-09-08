@@ -809,6 +809,9 @@ struct VoicetermApp {
     /// The line the tapped word sat on, with the command that produced it — the body and the
     /// provenance of the card "make a card" would create.
     word_ask_line: Option<(String, String, u64)>,
+    /// Vim-style `{N}b` / `{N}B` tab cycling. `count_prefix` and `tab_cycle` have both been
+    /// pure, tested and wired in the Qt build since v0.1.719, and neither was mounted here.
+    counts: voiceterm_egui::count_prefix::CountPrefix,
     /// Whether the one-time narrow-surface default has been applied. Applied
     /// once rather than every frame, so collapsing is a starting position the
     /// user can override, not a cage that re-shuts whatever they open.
@@ -925,6 +928,50 @@ impl VoicetermApp {
     /// state is per-pane (`web_panes`, keyed by pane id) rather than one
     /// shared `Browser`, that has to mean the focused pane specifically,
     /// not just any web pane that happens to be open elsewhere in the tab.
+    /// A key from the chrome (not the terminal): `{N}b` cycles N tabs forward, `{N}B` back.
+    ///
+    /// Returns whether the key was CONSUMED. The distinction is the whole point of
+    /// `count_prefix`: a digit that is building a count must not also be typed, and a key
+    /// that is not ours must pass through untouched or every text field in the app would
+    /// start eating `b`.
+    ///
+    /// `cycle_target` does the arithmetic, including the case a hand-rolled modulo gets
+    /// wrong: `5b` on 3 tabs is 2 steps, not 5, and a stale index is clamped into range
+    /// rather than panicking.
+    fn feed_tab_count(&mut self, ch: char) -> bool {
+        use voiceterm_egui::count_prefix::CountAction;
+        match self.counts.feed(ch) {
+            CountAction::Absorbed(n) => {
+                // Shown, because a modeless count with no feedback is a mode you cannot see
+                // you are in — the reason vim puts it in the corner.
+                self.toasts.info(&format!("{n}"), 0.0);
+                true
+            }
+            CountAction::Fire { cmd, count } => {
+                let n = self.workspace.tabs.len();
+                let target = voiceterm_egui::tab_cycle::cycle_target(
+                    self.workspace.active,
+                    n,
+                    count as usize,
+                    cmd == 'b',
+                );
+                // Through the workspace's own call, like every other tab move here: a second
+                // route would be a second place for the two to disagree.
+                while self.workspace.active != target && n > 1 {
+                    let before = self.workspace.active;
+                    self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command(
+                        if cmd == 'b' { "next tab".into() } else { "previous tab".into() },
+                    ));
+                    if self.workspace.active == before {
+                        break; // the workspace refused; do not spin
+                    }
+                }
+                true
+            }
+            CountAction::PassThrough => false,
+        }
+    }
+
     /// Clip one line into the note, with the command that produced it.
     ///
     /// The card path and the clip path are the SAME path: cards in this app are derived from
@@ -3399,6 +3446,36 @@ impl eframe::App for VoicetermApp {
                         }
                     }
                     PaneView::Web => {
+                        // `{N}b` / `{N}B` — the vim-style tab cycle, on WEB panes only.
+                        //
+                        // `b` typed into the terminal has to reach the shell, so this cannot
+                        // be a global binding, and the Qt build scopes it the same way: the
+                        // TODO's first line is "a count-prefixed tab cycle for WEB tabs".
+                        //
+                        // Only when no text field has the keyboard, or the address bar would
+                        // stop accepting the letter b.
+                        if !self.surfaces.captures_input()
+                            && !ui.ctx().wants_keyboard_input()
+                        {
+                            let typed: Vec<char> = ui.input(|i| {
+                                i.events
+                                    .iter()
+                                    .filter_map(|e| match e {
+                                        egui::Event::Text(t) => Some(t.chars().collect::<Vec<_>>()),
+                                        // An on-screen keyboard commits rather than sending
+                                        // key events — the same gap the terminal had.
+                                        egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
+                                            Some(t.chars().collect())
+                                        }
+                                        _ => None,
+                                    })
+                                    .flatten()
+                                    .collect()
+                            });
+                            for ch in typed {
+                                let _consumed = self.feed_tab_count(ch);
+                            }
+                        }
                         // PER-PANE NOW. `self.browser` used to carry url/
                         // title/actions/etc directly, so every web pane in
                         // the tiling layout read and wrote the SAME state —
@@ -5843,6 +5920,9 @@ fn main() -> eframe::Result<()> {
                 jotting: false,
                 word_ask: None,
                 word_ask_line: None,
+                // `b` forward, `B` back, capped so a long digit run cannot produce an
+                // absurd count — 999 tabs is not a request, it is a stuck key.
+                counts: voiceterm_egui::count_prefix::CountPrefix::new(&['b', 'B'], 999),
                 compact_defaults_applied: false,
                 ingest: Default::default(),
                 // Discovery once at startup, not per frame: scanning

@@ -383,6 +383,10 @@ pub mod zbrackets;
 /// Reusable for any modeless count command, not just tab cycling.
 #[path = "../../src/count_prefix.rs"]
 pub mod count_prefix;
+/// Where `{N}b` lands: `cycle_target(current, count, step, forward)`. Pure, tested, wired in
+/// the Qt build since v0.1.719 and never mounted here — the other half of `count_prefix`.
+#[path = "../../src/tab_cycle.rs"]
+pub mod tab_cycle;
 /// Note clipping's data model + markdown serialization — see
 /// TODO_notes_clip.md. Pure and tested since v0.1.641; had no re-export
 /// and no caller in this frontend before now, same shape as notebook.rs
