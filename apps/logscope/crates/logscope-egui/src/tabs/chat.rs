@@ -8765,6 +8765,26 @@ if let Some(msg) = self.error_banner.clone() {
                         });
                     }
                 }
+                // PAGE TRANSITION. Switching the right page snapped — the old content gone and
+                // the new one present in the same frame, which reads as a redraw glitch rather
+                // than as navigation: there is no moment that says "this replaced that".
+                //
+                // A cross-fade over OPACITY, not a slide: these pages are dense text, a sliding
+                // wall of it is harder to read mid-move, and an opacity ramp leaves everything
+                // where the eye expects it. `motion::cross_fade` also survives a mid-flight
+                // switch, so Files→Graph→Context reads as one movement instead of snapping
+                // back through Graph, and it is zero-duration under `UIKIT_REDUCE_MOTION`.
+                //
+                // The INCOMING page only. Drawing both would need each to lay out in the same
+                // rect, and two dense text pages overlapping at half opacity is less readable
+                // than either — fading the arrival is the honest half.
+                let (_leaving, page_t) = uikit_egui::motion::cross_fade(
+                    ui.ctx(),
+                    egui::Id::new("logscope-right-page"),
+                    &self.right_page,
+                    0.16,
+                );
+                ui.set_opacity(page_t.max(0.05));
                 egui::ScrollArea::vertical().id_salt("right_page").auto_shrink([false, false]).show(ui, |ui| {
                     match self.right_page {
                         RightPage::Engine => {
@@ -11555,7 +11575,24 @@ Success:\n- cargo test passes\n".to_string();
 /// Two copies of this would drift, and the difference would read as the grouping changing
 /// what a line means.
 fn draw_engine_lines(ui: &mut egui::Ui, entries: &[crate::diagfeed::Entry]) {
-    for e in entries {
+    // STAGGERED. A group that appears as one block reads as the pane redrawing; arriving in
+    // order reads as lines being reported, which is what they are — the engine emits them one
+    // at a time and the pane was the only thing that made them look simultaneous.
+    //
+    // Keyed on the group's first line so a group that is unchanged does not replay its
+    // entrance on every repaint, which would be a pane that never settles.
+    let key = entries.first().map(|e| e.text.clone()).unwrap_or_default();
+    let id = ui.id().with(("engine-lines", &key));
+    let born: f64 = ui.ctx().data_mut(|d| *d.get_temp_mut_or_insert_with(id, || ui.input(|i| i.time)));
+    let elapsed = (ui.input(|i| i.time) - born) as f32;
+    for (i, e) in entries.iter().enumerate() {
+        // 40ms apart, 140ms each, and the whole run capped at 300ms: past that a stagger
+        // stops being legible and becomes a wait for the last line.
+        let t = uikit_egui::motion::stagger(elapsed, i, 0.04, 0.14, 0.30);
+        if t < 1.0 {
+            ui.ctx().request_repaint();
+        }
+        ui.set_opacity(t.max(0.02));
         let col = match e.kind {
             crate::diagfeed::Kind::Failure => Some(egui::Color32::from_rgb(235, 110, 100)),
             crate::diagfeed::Kind::Warning => Some(egui::Color32::from_rgb(230, 170, 80)),

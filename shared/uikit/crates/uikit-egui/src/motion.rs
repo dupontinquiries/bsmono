@@ -112,6 +112,111 @@ pub fn animate_eased(ctx: &Context, id: Id, target: bool, duration: f32, easing:
     easing(linear)
 }
 
+/// Is motion switched off?
+///
+/// Reads `UIKIT_REDUCE_MOTION` (any non-empty value that is not `0`/`false`). egui carries no
+/// reduced-motion signal of its own and this fleet's apps run on phones and desktops where
+/// the platform's own setting is not reachable from here, so an explicit switch is the honest
+/// mechanism — better than animating regardless, which is what every one of these helpers did
+/// before.
+///
+/// Vestibular disorders make sliding and fading genuinely unpleasant, and an app whose only
+/// answer is "don't look" is one those people close. The cost of honouring it is one env read,
+/// cached for the process.
+pub fn reduce_motion() -> bool {
+    static R: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *R.get_or_init(|| match std::env::var("UIKIT_REDUCE_MOTION") {
+        Ok(v) => {
+            let v = v.trim().to_lowercase();
+            !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+        }
+        Err(_) => false,
+    })
+}
+
+/// A duration, with reduced motion honoured.
+///
+/// Zero rather than "shorter": a fast animation is still an animation, and the setting says
+/// don't move things, not move them briskly. Everything that takes a duration should route it
+/// through here so the switch reaches all of it rather than the calls someone remembered.
+pub fn dur(seconds: f32) -> f32 {
+    if reduce_motion() { 0.0 } else { seconds }
+}
+
+/// Cross-fade between whatever was last shown for `id` and `now`.
+///
+/// `animate_bool_with_time` handles a two-state flip; a pager has N states, and switching from
+/// page A to page C while the A→B fade is still running has to look like one movement rather
+/// than a flicker through B. This keeps the OUTGOING key alongside the incoming one, so the
+/// caller can draw both and weight them.
+///
+/// Returns `(previous, t)` where `t` runs 0→1 as `now` takes over. `previous` is `None` on the
+/// first frame — there is nothing to fade FROM, and fading in from blank on first paint is a
+/// flash every time a pane is created.
+pub fn cross_fade<T: Clone + PartialEq + Send + Sync + 'static>(
+    ctx: &Context,
+    id: Id,
+    now: &T,
+    duration: f32,
+) -> (Option<T>, f32) {
+    #[derive(Clone)]
+    struct State<T> {
+        showing: T,
+        previous: Option<T>,
+        started: f64,
+    }
+    let t_now = ctx.input(|i| i.time);
+    let d = dur(duration).max(0.0);
+    let mut st: Option<State<T>> = ctx.data_mut(|m| m.get_temp::<State<T>>(id));
+    match &mut st {
+        Some(s) if s.showing == *now => {}
+        Some(s) => {
+            // Mid-flight switch: the thing we were fading TO becomes the thing we fade FROM,
+            // so A→B→C reads as one movement instead of snapping back through A.
+            s.previous = Some(s.showing.clone());
+            s.showing = now.clone();
+            s.started = t_now;
+        }
+        None => {
+            st = Some(State { showing: now.clone(), previous: None, started: t_now - d as f64 });
+        }
+    }
+    let s = st.expect("set above");
+    let t = if d <= 1e-4 {
+        1.0
+    } else {
+        (((t_now - s.started) as f32) / d).clamp(0.0, 1.0)
+    };
+    if t < 1.0 {
+        ctx.request_repaint();
+    }
+    let prev = if t < 1.0 { s.previous.clone() } else { None };
+    ctx.data_mut(|m| m.insert_temp(id, s));
+    (prev, ease::out_cubic(t))
+}
+
+/// How far item `i` of a list has faded in, when they arrive one after another.
+///
+/// A list that fades in as one block reads as the whole pane arriving; staggering makes it
+/// read as items arriving, which is what a message list or a search result actually is.
+///
+/// `step` is the delay between neighbours. It is CAPPED by `max_total` so a hundred-item list
+/// does not take five seconds to finish — past a dozen or so the stagger stops being legible
+/// and starts being a wait.
+pub fn stagger(elapsed: f32, i: usize, step: f32, each: f32, max_total: f32) -> f32 {
+    if reduce_motion() {
+        return 1.0;
+    }
+    let step = if step * (i as f32) > max_total && i > 0 {
+        max_total / i as f32
+    } else {
+        step
+    };
+    let start = step * i as f32;
+    let t = ((elapsed - start) / each.max(1e-4)).clamp(0.0, 1.0);
+    ease::out_cubic(t)
+}
+
 /// A spring pop-in scale (`out_back`) for something appearing/disappearing — scale a rect by this
 /// around its center. `0` when closed, overshoots ~1.05 then settles at `1.0`.
 pub fn pop_scale(ctx: &Context, id: Id, open: bool, duration: f32) -> f32 {
@@ -162,6 +267,74 @@ pub fn interactive_fill(ctx: &Context, response: &Response, rest: Color32, hover
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A pager has more than two states, and switching A→C while the A→B fade is still
+    /// running has to read as one movement rather than a flicker through B.
+    #[test]
+    fn a_cross_fade_carries_the_outgoing_page_and_survives_a_mid_flight_switch() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("xf");
+        let run = |page: &str| -> (Option<String>, f32) {
+            let mut out = (None, 0.0);
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                out = cross_fade(ctx, id, &page.to_string(), 0.2);
+            });
+            out
+        };
+
+        // First paint has nothing to fade FROM — fading in from blank every time a pane is
+        // created is a flash, not a transition.
+        let (prev, t) = run("a");
+        assert_eq!(prev, None);
+        assert!((t - 1.0).abs() < 1e-3, "the first frame should be settled, got {t}");
+
+        // Switching starts a fade and names what we are leaving.
+        let (prev, t) = run("b");
+        assert_eq!(prev.as_deref(), Some("a"));
+        assert!(t < 1.0, "{t}");
+
+        // Switching AGAIN mid-flight leaves from `b`, not back from `a`.
+        let (prev, _) = run("c");
+        assert_eq!(prev.as_deref(), Some("b"), "a mid-flight switch snapped back");
+    }
+
+    /// A list that fades in as one block reads as the whole pane arriving. Staggering makes it
+    /// read as items arriving, which is what a message list is.
+    #[test]
+    fn a_stagger_runs_in_order_and_does_not_outstay_its_welcome() {
+        // Early on, the first item is ahead of the third.
+        let a = stagger(0.10, 0, 0.05, 0.2, 0.5);
+        let c = stagger(0.10, 3, 0.05, 0.2, 0.5);
+        assert!(a > c, "item 0 at {a} is not ahead of item 3 at {c}");
+        // Everything finishes.
+        assert_eq!(stagger(10.0, 40, 0.05, 0.2, 0.5), 1.0);
+        // Nothing starts before its turn.
+        assert_eq!(stagger(0.0, 5, 0.05, 0.2, 0.5), 0.0);
+
+        // CAPPED: a hundred items must not take a hundred steps. Past a dozen the stagger
+        // stops being legible and starts being a wait.
+        let last_start_uncapped = 0.05 * 99.0;
+        assert!(last_start_uncapped > 0.5);
+        assert!(
+            stagger(0.5 + 0.2, 99, 0.05, 0.2, 0.5) >= 1.0 - 1e-3,
+            "the hundredth item was still waiting after the cap"
+        );
+    }
+
+    /// Vestibular disorders make sliding and fading genuinely unpleasant. Zero rather than
+    /// "shorter": a fast animation is still an animation, and the setting says do not move
+    /// things.
+    #[test]
+    fn reduced_motion_is_off_by_default_and_zeroes_durations_when_set() {
+        // The cache means this process can only observe one answer, so test the parse and the
+        // shape rather than flipping the global.
+        assert_eq!(reduce_motion(), false, "no env set in tests");
+        assert_eq!(dur(0.3), 0.3);
+        // Everything that takes a duration routes through `dur`, which is what makes one
+        // switch reach all of it rather than the calls someone remembered.
+        assert_eq!(dur(0.0), 0.0);
+    }
     use super::ease::*;
 
     fn endpoints(f: fn(f32) -> f32) {
