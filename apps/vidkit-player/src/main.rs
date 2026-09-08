@@ -117,8 +117,9 @@ struct Player {
     /// fast one can rot untested and nobody finds out.
     gpu_error: Option<String>,
     /// `cmd_` because `palette` is already the colour palette.
-    cmd_palette: vidkit_egui::palette::PaletteState,
     chrome: vidkit_egui::Chrome,
+    settings: vidkit_egui::Settings,
+    settings_open: bool,
 }
 
 /// File-picker state. Navigation is uikit-egui's PathPicker; the file list and
@@ -230,8 +231,9 @@ impl Player {
             quit: false,
             gpu,
             gpu_error,
-            cmd_palette: Default::default(),
             chrome: Default::default(),
+            settings: Default::default(),
+            settings_open: false,
         }
     }
 
@@ -282,6 +284,17 @@ impl eframe::App for Player {
         }
         self.presenter.schedule_repaint();
 
+        // Settings are pushed into the live config every frame rather than on
+        // an Apply button: every control is reversible and cheap, and seeing
+        // the change while dragging the slider is the point of having one.
+        self.chrome.policy = self.settings.chrome_policy();
+        *self.view.gestures() = self.settings.gesture_config();
+        self.view.fit = self.settings.fit();
+        self.transport.rotation = self.settings.rotation;
+
+        let settings_open = self.settings_open;
+        vidkit_egui::settings::show(ctx, &mut self.settings_open, &mut self.settings);
+
         // Any pointer activity wakes the chrome. A modal open holds it up, as
         // does being paused -- both are moments the viewer is using the UI.
         let now = Instant::now();
@@ -298,25 +311,21 @@ impl eframe::App for Player {
             self.chrome.wake(now);
         }
         self.chrome
-            .update(now, self.transport.playing, self.cmd_palette.open);
+            .update(now, self.transport.playing, settings_open);
         if let Some(after) = self.chrome.next_repaint() {
             ctx.request_repaint_after(after);
         }
         let chrome_alpha = self.chrome.alpha();
 
-        // Ctrl+P, and a button in the bar for anyone who does not know that.
-        // A palette reachable only by a shortcut is a palette most people never
-        // find.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
-            self.cmd_palette.toggle();
-        }
-        if let Some(action) = vidkit_egui::palette::show(
-            ctx,
-            &mut self.cmd_palette,
-            true,
-            &self.colors,
-        ) {
-            self.run_action(action);
+        // NOTE: this player already had its own command palette (src/palette.rs)
+        // and file picker before vidkit-egui grew one. The kit module is kept
+        // because the voice router shares its `Action` set -- two lists of
+        // commands would drift -- but it is NOT wired here, or Ctrl+P opens two
+        // palettes and only the first one sees the key. Migrating the app's
+        // palette onto the kit's actions is the follow-up; adding a second was
+        // the mistake.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+            self.settings_open = !self.settings_open;
         }
 
         if !self.chrome.hidden() {
@@ -338,13 +347,16 @@ impl eframe::App for Player {
                 self.transport.position = to;
             }
             if act.rotate {
-                self.transport.rotation = vidkit_egui::apply_rotation(self.transport.rotation, 1);
+                // Through settings, not straight onto the transport: two
+                // places holding rotation means the popup shows one value and
+                // the picture another.
+                self.settings.rotation = (self.settings.rotation + 1).rem_euclid(4);
             }
             if act.cycle_fit {
-                self.view.fit = next_fit(self.view.fit);
+                self.settings.fill = vidkit_egui::FillMode::from_fit(next_fit(self.view.fit));
             }
-            if ui.small_button("⌘").on_hover_text("command palette (Ctrl+P)").clicked() {
-                self.cmd_palette.toggle();
+            if ui.small_button("⚙").on_hover_text("settings (Ctrl+,)").clicked() {
+                self.settings_open = !self.settings_open;
             }
             if act.reset_view {
                 self.transport.zoom = 1.0;
@@ -841,14 +853,16 @@ impl Player {
             A::SeekTo(t) => self.transport.position = t,
             A::SetSpeed(v) => self.transport.speed = v,
             A::SetVolume(v) => self.transport.volume = v,
-            A::Rotate => {
-                self.transport.rotation = vidkit_egui::apply_rotation(self.transport.rotation, 1)
+            A::Rotate => self.settings.rotation = (self.settings.rotation + 1).rem_euclid(4),
+            A::CycleFit => {
+                self.settings.fill =
+                    vidkit_egui::FillMode::from_fit(vidkit_egui::next_fit(self.view.fit))
             }
-            A::CycleFit => self.view.fit = vidkit_egui::next_fit(self.view.fit),
             A::ResetView => {
                 self.transport.zoom = 1.0;
-                self.transport.rotation = 0;
+                self.settings.rotation = 0;
             }
+            A::OpenSettings => self.settings_open = true,
             A::Quit => self.quit = true,
             other => {
                 self.gpu_error = Some(format!("{other:?} is not wired up yet"));
