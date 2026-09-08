@@ -4204,6 +4204,10 @@ impl eframe::App for VoicetermApp {
                                 let pinned = cells.is_pinned(b.id);
                                 let mut toggle = false;
                                 let mut pin = false;
+                                // Which header was clicked, decided inside the draw and
+                                // acted on after: `cells` is borrowed for the table's own
+                                // state while the grid draws.
+                                let mut sort_col: Option<usize> = None;
                                 ui.horizontal(|ui| {
                                     if ui.small_button(if folded { "\u{25b8}" } else { "\u{25be}" }).clicked() {
                                         toggle = true;
@@ -4238,6 +4242,25 @@ impl eframe::App for VoicetermApp {
                                         },
                                     );
                                 });
+                                if let Some(col) = sort_col {
+                                    // `usize::MAX` is the clear button — a sentinel rather
+                                    // than a second flag, since both are "the operator
+                                    // touched the table's controls" and they cannot both
+                                    // happen in one frame.
+                                    let v = cells.table_mut(b.id, Default::default);
+                                    if col == usize::MAX {
+                                        v.clear_ops();
+                                    } else {
+                                        // One sort at a time: pushing a second would stack
+                                        // it under the first and look like the click did
+                                        // nothing.
+                                        v.clear_ops();
+                                        v.push_op(voiceterm_egui::table_ops::TableOp::Sort {
+                                            column: col,
+                                            ascending: true,
+                                        });
+                                    }
+                                }
                                 if pin {
                                     // Pinning UNFOLDS: a pinned cell showing "42 lines
                                     // hidden" is the wrong kind of pin. Unpinning leaves it
@@ -4256,30 +4279,52 @@ impl eframe::App for VoicetermApp {
                                         ui.label(egui::RichText::new(&b.output).monospace());
                                     }
                                     Structured::Table(t) => {
-                                        ui.colored_label(c.text_weak, format!(
-                                            "\u{25A4} table — {} rows \u{d7} {} cols",
-                                            t.rows.len(), t.headers.len()));
-                                        // Step 2 of TODO_notebook_view.md's own
-                                        // sequencing, done narrowly: an aligned
-                                        // read-only grid over TableData's own
-                                        // fields, not raw monospace text dumped
-                                        // as-is. Deliberately NOT the full
-                                        // interactive `table_view_ui` the Table
-                                        // pane uses — that needs a per-instance
-                                        // `TableView` for its sort/filter state,
-                                        // and giving each notebook cell its own
-                                        // persistent state (a HashMap keyed by
-                                        // block id) is real, separate work; a
-                                        // sort button that resets every frame
-                                        // would be worse than no button. This
-                                        // view stays what it's named: read-only.
+                                        // SORTABLE NOW. The comment that was here said this
+                                        // stayed read-only because "giving each notebook
+                                        // cell its own persistent state (a HashMap keyed by
+                                        // block id) is real, separate work; a sort button
+                                        // that resets every frame would be worse than no
+                                        // button". `NotebookCells::table_mut` is that state,
+                                        // so the reason is gone.
+                                        //
+                                        // Still not the full `table_view_ui`: that carries a
+                                        // command line and a status area meant for a whole
+                                        // pane, and a notebook cell is one output among
+                                        // dozens. A header you can click to sort is the part
+                                        // that earns its space here.
+                                        let base = t.clone();
+                                        let view = cells.table_mut(b.id, || base);
+                                        let shown = view.apply();
+                                        let depth = view.ops.len();
+                                        ui.horizontal(|ui| {
+                                            ui.colored_label(c.text_weak, format!(
+                                                "\u{25A4} table \u{2014} {} rows \u{d7} {} cols",
+                                                shown.rows.len(), shown.headers.len()));
+                                            // Only when there is something to clear: a
+                                            // button that does nothing teaches that buttons
+                                            // here do nothing.
+                                            if depth > 0
+                                                && ui.small_button("clear")
+                                                    .on_hover_text("drop the sort")
+                                                    .clicked()
+                                            {
+                                                sort_col = Some(usize::MAX);
+                                            }
+                                        });
                                         egui::Grid::new(("notebook_table", b.id))
                                             .striped(true).show(ui, |ui| {
-                                            for h in &t.headers {
-                                                ui.label(egui::RichText::new(h).strong().small());
+                                            for (i, h) in shown.headers.iter().enumerate() {
+                                                if ui.add(egui::Label::new(
+                                                    egui::RichText::new(h).strong().small())
+                                                    .sense(egui::Sense::click()))
+                                                    .on_hover_text("sort by this column")
+                                                    .clicked()
+                                                {
+                                                    sort_col = Some(i);
+                                                }
                                             }
                                             ui.end_row();
-                                            for row in &t.rows {
+                                            for row in &shown.rows {
                                                 for cell in row {
                                                     ui.label(egui::RichText::new(cell).small());
                                                 }

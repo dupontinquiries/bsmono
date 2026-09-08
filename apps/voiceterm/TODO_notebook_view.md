@@ -104,7 +104,7 @@ Map as a bold-key grid. Two things were added after dogfooding it:
 3 tests in `notebook_cells` (the cache recomputes only on growth, folds
 are per block and die with the block, the summary names each kind).
 
-STILL NOT DONE: swipe gestures, and per-cell interactive tables
+STILL NOT DONE: swipe gestures
 (that needs persistent `TableView` state keyed by block id — a sort
 button that resets every frame would be worse than no button).
 
@@ -131,3 +131,31 @@ recent choice); pinning unfolds and unpinning does not re-fold, and pinning twic
 and a pin dies with its block while an unrelated fold does not.
 
 The control is a 📌 on the right of each cell's header row.
+
+
+## DONE — per-cell table sort (2026-09-07)
+
+The reason this waited is in the code it replaces: "giving each notebook cell its own
+persistent state (a HashMap keyed by block id) is real, separate work; a sort button that
+resets every frame would be worse than no button". `NotebookCells::table_mut` is that state,
+so the reason is gone.
+
+Keyed by block id and dropped by `retain_ids`, beside the folds and the pins. A sort belongs
+to the block it sorted; one surviving into a reused id would silently reorder somebody else's
+output, which is the worst kind of bug here because the table still looks plausible.
+
+`base` is a CLOSURE, called only on creation. The pane re-derives the table from the block's
+text every frame, and taking that value each time would rebuild the view and throw the ops
+away with it — the resetting sort this exists to prevent.
+
+Not the full `table_view_ui`: that carries a command line and a status area meant for a whole
+pane, and a notebook cell is one output among dozens. A clickable header is the part that
+earns its space.
+
+One sort at a time — a second is cleared first, because pushing it would stack under the
+first and look like the click did nothing — and the "clear" button appears only when there is
+something to clear, since a button that does nothing teaches that the buttons here do
+nothing.
+
+Two tests: the ops survive a frame where `base` is re-derived (and one block's state does not
+leak into another's), and the state dies with its block while a neighbour's does not.

@@ -49,6 +49,17 @@ pub struct NotebookCells {
     /// to be stable, while a `HashSet` would reshuffle them whenever the map rehashed —
     /// which looks like the pane losing track of what you pinned.
     pinned: Vec<u32>,
+    /// Per-cell table state: the ops stack a sort or a filter builds up.
+    ///
+    /// `TODO_notebook_view.md` names the reason this had to exist before the buttons could:
+    /// "a sort button that resets every frame would be worse than no button". The engine's
+    /// `TableView` is per-table state held by the caller, and in a pane that redraws every
+    /// block every frame there was no caller to hold it.
+    ///
+    /// Keyed by block id and dropped by `retain_ids`, like the folds and the pins — a sort
+    /// belongs to the block it sorted, and one surviving into a reused id would silently
+    /// reorder somebody else's output.
+    tables: std::collections::HashMap<u32, crate::table_ops::TableView>,
     /// How many times a classification was computed rather than reused, for the test that
     /// pins the cache actually caching.
     misses: u64,
@@ -84,6 +95,29 @@ impl NotebookCells {
         // the block it points at would leave the pane offering to show a cell that no
         // longer exists.
         self.pinned.retain(|id| live(*id));
+        self.tables.retain(|id, _| live(*id));
+    }
+
+    /// The table state for block `id`, created from `base` the first time it is asked for.
+    ///
+    /// `base` is only used on creation. Re-deriving it every frame would rebuild the table
+    /// from the block's text and throw the ops away with it, which is the resetting sort
+    /// this exists to prevent — so a caller that parses the output each frame still gets a
+    /// stable stack.
+    pub fn table_mut(
+        &mut self,
+        id: u32,
+        base: impl FnOnce() -> crate::table_ops::TableData,
+    ) -> &mut crate::table_ops::TableView {
+        self.tables
+            .entry(id)
+            .or_insert_with(|| crate::table_ops::TableView::new(base()))
+    }
+
+    /// Whether this block has any table ops stacked — for a "clear" affordance that should
+    /// not appear when there is nothing to clear.
+    pub fn table_depth(&self, id: u32) -> usize {
+        self.tables.get(&id).map(|t| t.ops.len()).unwrap_or(0)
     }
 
     pub fn is_pinned(&self, id: u32) -> bool {
@@ -166,6 +200,51 @@ pub fn fold_summary(what: &Structured, output: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// "A sort button that resets every frame would be worse than no button"
+    /// (`TODO_notebook_view.md`). The engine's `TableView` is per-table state held by the
+    /// caller, and in a pane that redraws every block every frame there was no caller to
+    /// hold it — which is why the notebook's tables stayed read-only.
+    #[test]
+    fn a_cells_table_ops_survive_the_next_frame() {
+        use crate::table_ops::{TableData, TableOp};
+        let data = || TableData {
+            headers: vec!["a".into(), "b".into()],
+            rows: vec![vec!["2".into(), "x".into()], vec!["1".into(), "y".into()]],
+        };
+        let mut c = NotebookCells::new();
+
+        // Frame 1: the operator sorts.
+        c.table_mut(3, data).push_op(TableOp::Sort { column: 0, ascending: true });
+        assert_eq!(c.table_depth(3), 1);
+
+        // Frame 2: the pane redraws and asks again, deriving `base` afresh as it must — the
+        // ops are still there, and the sort still applies.
+        let sorted = c.table_mut(3, data).apply();
+        assert_eq!(c.table_depth(3), 1, "the ops were rebuilt away with the base");
+        assert_eq!(sorted.rows[0][0], "1", "the sort did not survive: {sorted:?}");
+
+        // A different block has its own, untouched.
+        assert_eq!(c.table_depth(4), 0);
+        assert_eq!(c.table_mut(4, data).apply().rows[0][0], "2", "state leaked between blocks");
+    }
+
+    /// A sort belongs to the block it sorted. One surviving into a reused id would silently
+    /// reorder somebody else's output — the worst kind of bug here, because the table still
+    /// looks plausible.
+    #[test]
+    fn a_cells_table_state_dies_with_its_block() {
+        use crate::table_ops::{TableData, TableOp};
+        let data = || TableData { headers: vec!["a".into()], rows: vec![vec!["1".into()]] };
+        let mut c = NotebookCells::new();
+        c.table_mut(1, data).push_op(TableOp::Sort { column: 0, ascending: true });
+        c.table_mut(2, data).push_op(TableOp::Sort { column: 0, ascending: false });
+        assert_eq!((c.table_depth(1), c.table_depth(2)), (1, 1));
+
+        c.retain_ids(|id| id != 1);
+        assert_eq!(c.table_depth(1), 0, "a sort survived its block");
+        assert_eq!(c.table_depth(2), 1, "an unrelated block's sort was dropped");
+    }
 
     /// Pins are the operator's sequence, so they keep the order they were made in — a
     /// `HashSet` would reshuffle them on a rehash, which looks like the pane losing track.
