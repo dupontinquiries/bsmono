@@ -166,3 +166,33 @@ Four details that would each have been a silent wrong answer:
 The hardcoded value stays as a STARTING one and now says so: OSC 7 corrects it on the shell's
 first prompt, and before that a block with no cwd names itself worse than one with a stale
 guess.
+
+
+## DONE — steps 2's proposals reach this frontend (2026-09-07)
+
+`session_auto::propose` shipped pure and tested in v0.1.658; the Qt build surfaced it in
+v0.1.720; this frontend never called it. Two reasons, and both are now gone:
+
+* it wants an ACTIVITY (kind, target, cwd) and this side only had command blocks —
+  `session_proposals` is that adapter;
+* it wants a real current repo, which every block claiming one hardcoded path could never
+  supply. The OSC 7 work above is what made the `Cd` branch able to fire at all.
+
+The adapter claims as little as it can. `cd` is unambiguous, a known editor with a file
+argument is an `EditorOpen`, `make`/`cargo`/`ninja` are Build — with `cargo test` split out
+as Test, since matching on `cargo` alone would swallow both — and everything else is `Run`,
+which `propose` ignores. A wrong proposal costs more attention than a missing one.
+
+A fixed editor list rather than "any command with a file argument": `cat foo.rs` and
+`rm foo.rs` both take one and neither opens an editing session, and proposing a tab for them
+would train someone to ignore the proposals.
+
+A REBOOT IS NEVER INFERRED from a command line. `reboot` typed in a terminal is a request,
+not an event, and the session that comes back is a different process — that signal belongs to
+the app's startup, not to a parser. Tested, so nobody adds it as an obvious-looking
+improvement.
+
+Surfaced in the locator as a QUESTION ("new session for rusty-board?"), never applied. The
+module's own doc says these are "surfaced (never auto-applied)", and a terminal that opened
+tabs on its own guesses would be worse than one that never suggested anything. The accept
+action (step 3) is still open, and is now a UI question rather than a plumbing one.

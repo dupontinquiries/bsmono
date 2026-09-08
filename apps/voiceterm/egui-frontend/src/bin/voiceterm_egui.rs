@@ -702,6 +702,11 @@ struct VoicetermApp {
     /// at — the derivation walks every block and the locator draws every frame.
     session_name: String,
     session_name_at: usize,
+    /// What `session_auto` suggests doing next, if anything. Surfaced in the locator, never
+    /// applied — the module's own doc calls these "surfaced (never auto-applied)", and a
+    /// terminal that opened tabs on its own guesses would be worse than one that never
+    /// suggested anything.
+    session_proposal: Option<voiceterm_egui::session_auto::Proposal>,
     /// The find bar's FILES mode. `None` until a file search is started, so
     /// the panel costs no terminal rows in the common case.
     fs_search: voiceterm_egui::fs_results::Search,
@@ -2787,17 +2792,77 @@ impl eframe::App for VoicetermApp {
                 // walks every block, and the locator draws every frame.
                 if self.blocks.blocks.len() != self.session_name_at {
                     self.session_name_at = self.blocks.blocks.len();
+                    // AND WHAT TO DO ABOUT IT. `session_auto::propose` shipped pure and
+                    // tested in v0.1.658 and has had no caller here since — it wants an
+                    // ACTIVITY, and this side only had command blocks, and it wants a real
+                    // current repo, which every block claiming one hardcoded path could
+                    // never supply. `session_proposals` is the adapter; OSC 7 supplied the
+                    // repo.
+                    //
+                    // Computed on the same edge as the name, for the same reason: the
+                    // derivation walks every block and the locator draws every frame.
+                    self.session_proposal = {
+                        use voiceterm_egui::session_proposals as sp;
+                        let pairs: Vec<(String, String)> = self
+                            .blocks
+                            .blocks
+                            .iter()
+                            .map(|b| (b.command.clone(), b.cwd.clone().unwrap_or_default()))
+                            .collect();
+                        // The LAST block is the candidate; everything before it is context.
+                        // A proposal is about what just happened, not about the run as a
+                        // whole.
+                        match pairs.split_last() {
+                            Some(((cmd, cwd), before)) => {
+                                let acts = sp::activities(
+                                    before.iter().map(|(c, d)| (c.as_str(), d.as_str())),
+                                );
+                                let repo = self
+                                    .blocks
+                                    .current_cwd
+                                    .as_deref()
+                                    .unwrap_or("")
+                                    .trim_end_matches('/')
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or("")
+                                    .to_string();
+                                sp::activity_of(cmd, cwd).and_then(|next| {
+                                    voiceterm_egui::session_auto::propose(
+                                        &sp::open_files(&acts),
+                                        sp::dominant_lang(&acts),
+                                        &repo,
+                                        &next,
+                                        "hx",
+                                    )
+                                })
+                            }
+                            None => None,
+                        }
+                    };
                     self.session_name = voiceterm_egui::session_name::session_name(
                         self.blocks.blocks.iter().map(|b| {
                             (b.command.as_str(), b.cwd.as_deref().unwrap_or(""))
                         }),
                     );
                 }
-                let title = if self.session_name.is_empty() {
+                let mut title = if self.session_name.is_empty() {
                     title
                 } else {
                     format!("{title} \u{b7} {}", self.session_name)
                 };
+                // The suggestion, as a question rather than an action. It sits in the
+                // locator because that line is already about "where am I" — and it is
+                // phrased with a `?` because nothing here will do it for you.
+                if let Some(p) = &self.session_proposal {
+                    use voiceterm_egui::session_auto::Proposal;
+                    let hint = match p {
+                        Proposal::NewSessionForRepo { repo } => format!("new session for {repo}?"),
+                        Proposal::NewTabForFile { path, .. } => format!("new tab for {path}?"),
+                        Proposal::ReentryAfterReboot { restore } => format!("restore {restore}?"),
+                    };
+                    title = format!("{title} \u{b7} {hint}");
+                }
                 let text = self.chrome.locator(
                     self.workspace.active,
                     self.workspace.tabs.len(),
@@ -5358,6 +5423,7 @@ fn main() -> eframe::Result<()> {
                 notebook_cells: Default::default(),
                 session_name: String::new(),
                 session_name_at: usize::MAX,
+                session_proposal: None,
                 fs_search: Default::default(),
                 cmd_sheet: Default::default(),
                 last_memlog_s: 0.0,

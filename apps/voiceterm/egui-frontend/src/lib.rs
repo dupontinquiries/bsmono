@@ -395,6 +395,8 @@ pub mod clip_kind;
 pub mod kbd_focus;
 /// Learning the shell's working directory from OSC 7 in the pty stream.
 pub mod osc7;
+/// Turning this terminal's blocks into `session_auto`'s activity vocabulary.
+pub mod session_proposals;
 // The GestureHost+SlidePopup replacement (grid gesture menus with QML-parity variants) lives in
 // the shared kit; re-exported under a voiceterm-familiar name.
 pub use uikit_egui::slide_menu;
