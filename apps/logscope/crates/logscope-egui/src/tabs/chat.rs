@@ -1182,6 +1182,10 @@ pub struct Chat {
     fix_mode: bool,    // step-up submode: emit a concrete fix (file/diff) for the log/code
     show_context: bool, // right sidebar open/closed
     right_page: RightPage, // active sidebar subpage
+    /// What the operator has set in the Engine panel's tuning section, keyed by the
+    /// environment variable the engine reads. Empty means "all defaults"; a knob the
+    /// environment owns is never written here — see `engine_knobs`.
+    engine_knob_values: std::collections::HashMap<String, crate::engine_knobs::Value>,
     coord_mode: crate::coordinator::Mode, // prompting mode (barebones / coordinator / aggressive)
     /// Hand-picked engineering profiles. Empty = autopilot (`engprofile::suggest` from the task).
     profiles_manual: Vec<crate::engprofile::ProfileId>,
@@ -1486,7 +1490,8 @@ impl Default for Chat {
             planned_q: std::cell::RefCell::new(None),
             planned_why: std::cell::RefCell::new(Vec::new()),
             threading: true, show_context: false, attach_log: true, fix_mode: false,
-            right_page: RightPage::Prompting, coord_mode: crate::coordinator::Mode::Barebones,
+            right_page: RightPage::Prompting,
+            engine_knob_values: Default::default(), coord_mode: crate::coordinator::Mode::Barebones,
             // PERSISTED CHOICES, restored here rather than defaulted. A Dvorak user re-selecting
             // their layout every launch is the accessibility bug returning in a slower form.
             profiles_manual: saved_prefs.profiles.clone(),
@@ -8763,6 +8768,147 @@ if let Some(msg) = self.error_banner.clone() {
                 egui::ScrollArea::vertical().id_salt("right_page").auto_shrink([false, false]).show(ui, |ui| {
                     match self.right_page {
                         RightPage::Engine => {
+                            // THE TUNABLES, above the log they explain. `engine_knobs` has
+                            // described these since it was written and nothing drew them, so
+                            // the only way to try `LOGSCOPE_MATVEC_SG=1` was to know the
+                            // variable existed, know its spelling, and restart from a
+                            // terminal.
+                            //
+                            // Folded by default: this is a panel someone opens to read a
+                            // failure, and a wall of toggles above the failure is in the way
+                            // of the thing they came for.
+                            let knobs = crate::engine_knobs::all();
+                            let resolved: Vec<(&crate::engine_knobs::Knob, crate::engine_knobs::Resolved)> =
+                                knobs
+                                    .iter()
+                                    .map(|k| {
+                                        let ui_val = self.engine_knob_values.get(k.env);
+                                        (k, crate::engine_knobs::resolve(k, ui_val, |n| std::env::var(n).ok()))
+                                    })
+                                    .collect();
+                            let header = format!("tuning — {}", crate::engine_knobs::summary(&resolved));
+                            egui::CollapsingHeader::new(header)
+                                .id_salt("engine-knobs")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    for (k, r) in &resolved {
+                                        let editable = crate::engine_knobs::editable(r);
+                                        ui.horizontal(|ui| {
+                                            match &r.value {
+                                                crate::engine_knobs::Value::Flag(on) => {
+                                                    let mut v = *on;
+                                                    // DISABLED, not hidden, when the
+                                                    // environment owns it: a control that
+                                                    // vanished would look like the setting
+                                                    // did, and the operator needs to see
+                                                    // that their shell is winning.
+                                                    if ui
+                                                        .add_enabled(
+                                                            editable,
+                                                            egui::Checkbox::new(&mut v, k.label),
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        self.engine_knob_values.insert(
+                                                            k.env.to_string(),
+                                                            crate::engine_knobs::Value::Flag(v),
+                                                        );
+                                                    }
+                                                }
+                                                crate::engine_knobs::Value::Count(n) => {
+                                                    let mut v = *n;
+                                                    ui.label(k.label);
+                                                    if ui
+                                                        .add_enabled(
+                                                            editable,
+                                                            egui::DragValue::new(&mut v)
+                                                                .range(k.range.0..=k.range.1),
+                                                        )
+                                                        .changed()
+                                                    {
+                                                        // Clamped by the KNOB, not just by
+                                                        // the widget: a value can also arrive
+                                                        // from a hand-edited settings file.
+                                                        self.engine_knob_values.insert(
+                                                            k.env.to_string(),
+                                                            k.clamp(crate::engine_knobs::Value::Count(v)),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            match r.source {
+                                                crate::engine_knobs::Source::Env => {
+                                                    ui.colored_label(
+                                                        theme::active().amber,
+                                                        format!("{} set in the environment", k.env),
+                                                    );
+                                                }
+                                                crate::engine_knobs::Source::EnvUnparsed => {
+                                                    // A typo is otherwise indistinguishable
+                                                    // from not setting it at all.
+                                                    ui.colored_label(
+                                                        theme::active().amber,
+                                                        format!(
+                                                            "{}={:?} unreadable, ignored",
+                                                            k.env,
+                                                            r.raw.clone().unwrap_or_default()
+                                                        ),
+                                                    );
+                                                }
+                                                _ => {}
+                                            }
+                                            if k.risk == crate::engine_knobs::Risk::Fragile {
+                                                ui.colored_label(theme::active().amber, "fragile");
+                                            }
+                                        });
+                                        ui.label(egui::RichText::new(k.help).small().weak());
+                                    }
+                                    // AND THE VALUES REACH THE ENGINE. It reads these from
+                                    // the ENVIRONMENT at load (`std::env::var
+                                    // ("LOGSCOPE_PREFILL_CHUNK")` and friends), so the panel
+                                    // writes them there — anything else would be a second
+                                    // source of truth for the same setting.
+                                    //
+                                    // Written on every frame the section is open rather than
+                                    // on change: it is a handful of setenv calls on a folded
+                                    // panel, and a "changed" edge that missed once would
+                                    // leave a knob showing one value while the engine used
+                                    // another, which is the failure this whole module exists
+                                    // to avoid.
+                                    //
+                                    // `env_to_apply` refuses to write over anything the
+                                    // environment already set, so a shell override stays the
+                                    // winner.
+                                    let ui_vals: Vec<(&'static str, crate::engine_knobs::Value)> =
+                                        knobs
+                                            .iter()
+                                            .filter_map(|k| {
+                                                self.engine_knob_values
+                                                    .get(k.env)
+                                                    .map(|v| (k.env, v.clone()))
+                                            })
+                                            .collect();
+                                    for (name, value) in
+                                        crate::engine_knobs::env_to_apply(&ui_vals, |n| std::env::var(n).ok())
+                                    {
+                                        // The engine reads these only while loading a model,
+                                        // and the panel says changes apply at the next load,
+                                        // so the window where a worker could observe a
+                                        // half-written set is one the operator is told about.
+                                        std::env::set_var(name, value);
+                                    }
+                                    // Applies at the next LOAD, said once rather than per
+                                    // knob: a change that appears to do nothing is how
+                                    // someone concludes the toggles are broken.
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "changes apply when a model is next loaded",
+                                        )
+                                        .small()
+                                        .weak(),
+                                    );
+                                });
+                            ui.separator();
                             // The engine's own diagnostics, ranked and folded (diagfeed). Until now
                             // these existed only on stderr, which is why diagnosing a refusal meant
                             // running the app from a terminal.
