@@ -305,6 +305,14 @@ MUTANTS = [
     ("relev/requeues-the-same-window", "crates/vidkit-relevance/src/lib.rs",
      "        if self.queued.insert(key) {", "        if true {"),
 
+    # --- selective streaming, wired --------------------------------------------
+    ("stream/read-ahead-not-clipped", "crates/vidkit-ytdlp/src/http.rs",
+     "            Some(r) => want_end.min(r.end.saturating_sub(1)).max(floor),", "            Some(r) => want_end,"),
+    ("stream/clip-truncates-request", "crates/vidkit-ytdlp/src/http.rs",
+     "        let floor = start + (need.max(1) as u64) - 1;", "        let floor = 0;"),
+    ("stream/out-of-plan-not-counted", "crates/vidkit-ytdlp/src/http.rs",
+     "                self.plan_misses += 1;", "                "),
+
     # --- clipboard / related ------------------------------------------------
     ("paste/playlist-beats-video", "crates/vidkit-ytdlp/src/paste.rs",
      'if let Some(v) = query_param(t, "v") {', 'if let Some(v) = query_param(t, "list_never") {'),

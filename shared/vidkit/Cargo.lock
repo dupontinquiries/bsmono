@@ -2637,6 +2637,7 @@ dependencies = [
  "serde",
  "serde_json",
  "vidkit-core",
+ "vidkit-relevance",
 ]
 
 [[package]]

@@ -20,6 +20,7 @@
 
 use std::collections::BTreeMap;
 use vidkit_core::io::{ByteSource, Error, Result};
+use vidkit_relevance::ranges::ByteRange;
 
 /// One range request.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -90,6 +91,17 @@ pub struct HttpByteSource<T: HttpTransport> {
     /// The cached window: the byte offset it starts at, and its contents.
     window: (u64, Vec<u8>),
     total: Option<u64>,
+    /// Byte ranges worth fetching, or `None` to fetch anything asked for.
+    ///
+    /// This is the half of section skipping that saves DATA rather than time.
+    /// Seeking past a section still downloads it when the window reads ahead,
+    /// so a plan that only moves the playhead saves the viewer's minutes and
+    /// none of their allowance -- on a metered phone that is the wrong half.
+    plan: Option<Vec<ByteRange>>,
+    /// Reads that fell outside the plan. Never refused -- see `read_at` -- but
+    /// counted, because a non-zero value means the plan and the demuxer
+    /// disagree about what is needed and the saving is not what it claims.
+    pub plan_misses: u32,
     /// Set when the server said 403. The caller re-resolves and calls
     /// `rebind`; reads fail until it does, rather than silently returning
     /// short data that a demuxer would read as a truncated file.
@@ -107,6 +119,8 @@ impl<T: HttpTransport> HttpByteSource<T> {
             window: (0, Vec::new()),
             total: None,
             expired: false,
+            plan: None,
+            plan_misses: 0,
             requests: 0,
         }
     }
@@ -114,6 +128,49 @@ impl<T: HttpTransport> HttpByteSource<T> {
     pub fn with_policy(mut self, policy: ChunkPolicy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Fetch only these ranges ahead of the playhead.
+    ///
+    /// Empty means "nothing is worth fetching", which is not the same as
+    /// `None`: a caller that computed a plan and got no ranges has said
+    /// something, and silently treating that as "fetch everything" would hide
+    /// a bug in the planner behind a working download.
+    pub fn set_plan(&mut self, plan: Option<Vec<ByteRange>>) {
+        // Not sorted. `clip_to_plan` scans for the range CONTAINING the offset,
+        // which does not care about order -- a mutation sweep showed removing
+        // the sort broke nothing, because nothing depended on it. Ordering
+        // added "just in case" is work that looks load-bearing and is not.
+        self.plan = plan;
+    }
+
+    pub fn plan(&self) -> Option<&[ByteRange]> {
+        self.plan.as_deref()
+    }
+
+    /// Clip a window to the plan.
+    ///
+    /// Returns the end offset the fetch may reach. A window starting inside a
+    /// kept range stops at that range's end rather than reading on into the
+    /// skipped bytes after it -- which is the entire saving. A window starting
+    /// in a gap is not clipped at all: correctness first, and the miss is
+    /// counted instead.
+    fn clip_to_plan(&self, start: u64, want_end: u64, need: usize) -> u64 {
+        let Some(plan) = &self.plan else {
+            return want_end;
+        };
+        // The floor is what the caller actually asked for. The plan clips
+        // READ-AHEAD, never the request: clipping the request truncates the
+        // read, `read_exact_at` reports a short file, and a bandwidth
+        // optimisation becomes a corrupt-stream error. A section boundary
+        // falling inside a real read is normal -- the last sample of a kept
+        // section straddles it.
+        let floor = start + (need.max(1) as u64) - 1;
+        match plan.iter().find(|r| start >= r.start && start < r.end) {
+            // `end` is exclusive, the range header is inclusive.
+            Some(r) => want_end.min(r.end.saturating_sub(1)).max(floor),
+            None => want_end,
+        }
     }
 
     pub fn with_total(mut self, total: u64) -> Self {
@@ -161,6 +218,14 @@ impl<T: HttpTransport> HttpByteSource<T> {
             _ => start + span - 1,
         };
         if end < start {
+            self.window = (start, Vec::new());
+            return Ok(());
+        }
+
+        let end = self.clip_to_plan(start, end, need);
+        if end < start {
+            // The kept range is shorter than one byte at this offset; nothing
+            // to ask for.
             self.window = (start, Vec::new());
             return Ok(());
         }
@@ -232,6 +297,16 @@ impl<T: HttpTransport> ByteSource for HttpByteSource<T> {
             }
         }
 
+        if let Some(plan) = &self.plan {
+            if !plan.iter().any(|r| offset >= r.start && offset < r.end) {
+                // Outside the plan. NOT refused: the demuxer needs headers and
+                // index tables that no relevance plan covers, and a source that
+                // returns nothing for them turns a bandwidth optimisation into
+                // a file that will not open. Counted, so a plan that is wrong
+                // about what is needed is visible rather than merely slower.
+                self.plan_misses += 1;
+            }
+        }
         if !self.window_covers(offset, buf.len()) {
             self.fetch_window(offset, buf.len())?;
         }
@@ -514,6 +589,117 @@ mod tests {
             format!("{e}").contains("ignored the range"),
             "unhelpful error: {e}"
         );
+    }
+
+    // ---- section plans ---------------------------------------------------
+
+    fn planned(body: Vec<u8>, chunk: u64, ranges: Vec<(u64, u64)>) -> HttpByteSource<MockServer> {
+        let mut s = source(body, chunk);
+        s.set_plan(Some(
+            ranges
+                .into_iter()
+                .map(|(start, end)| ByteRange { start, end })
+                .collect(),
+        ));
+        s
+    }
+
+    /// The saving: read-ahead inside a kept section must stop at its end
+    /// rather than running on into the skipped bytes after it.
+    #[test]
+    fn a_window_is_clipped_to_the_end_of_its_section() {
+        let mut s = planned(body(10_000), 4096, vec![(1000, 1500), (8000, 9000)]);
+        let mut buf = [0u8; 8];
+        s.read_at(1000, &mut buf).unwrap();
+
+        let req = s.transport.seen.last().unwrap();
+        assert_eq!(req.start, 1000);
+        assert_eq!(
+            req.end, 1499,
+            "the window ran past the section into skipped bytes: {req:?}"
+        );
+    }
+
+    /// Without a plan the same read pulls the whole chunk, which is what the
+    /// clip is saving. Asserting the clipped case alone would pass against a
+    /// source that never reads ahead at all.
+    #[test]
+    fn the_clip_is_what_saves_the_bytes() {
+        let mut unplanned = source(body(10_000), 4096);
+        let mut buf = [0u8; 8];
+        unplanned.read_at(1000, &mut buf).unwrap();
+        let wide = unplanned.transport.seen.last().unwrap().end;
+
+        let mut s = planned(body(10_000), 4096, vec![(1000, 1500)]);
+        s.read_at(1000, &mut buf).unwrap();
+        let narrow = s.transport.seen.last().unwrap().end;
+
+        assert!(
+            narrow < wide,
+            "planned fetch ({narrow}) was no smaller than unplanned ({wide})"
+        );
+    }
+
+    /// A demuxer needs headers and index tables no relevance plan covers. A
+    /// source that returns nothing for them turns a bandwidth optimisation
+    /// into a file that will not open, so the read is served and counted.
+    #[test]
+    fn a_read_outside_the_plan_is_served_and_counted() {
+        let data = body(10_000);
+        let mut s = planned(data.clone(), 4096, vec![(8000, 9000)]);
+        let mut buf = [0u8; 16];
+
+        let n = s.read_at(0, &mut buf).unwrap();
+        assert_eq!(n, 16, "a header read outside the plan was refused");
+        assert_eq!(&buf[..], &data[0..16], "wrong bytes for an out-of-plan read");
+        assert_eq!(s.plan_misses, 1);
+
+        // Inside the plan does not count as a miss.
+        s.read_at(8000, &mut buf).unwrap();
+        assert_eq!(s.plan_misses, 1);
+    }
+
+    /// An empty plan is a statement, not an absence: a caller whose planner
+    /// produced nothing has said something, and treating that as "fetch
+    /// everything" would hide the bug behind a working download.
+    #[test]
+    fn an_empty_plan_is_not_the_same_as_no_plan() {
+        let mut none = source(body(10_000), 4096);
+        none.set_plan(None);
+        assert!(none.plan().is_none());
+
+        let mut empty = source(body(10_000), 4096);
+        empty.set_plan(Some(Vec::new()));
+        assert_eq!(empty.plan().map(|p| p.len()), Some(0));
+
+        let mut buf = [0u8; 8];
+        empty.read_at(0, &mut buf).unwrap();
+        assert_eq!(empty.plan_misses, 1, "every read is outside an empty plan");
+    }
+
+    /// Order is not significant, and this pins that rather than pretending
+    /// the source sorts: a caller assembling a plan by hand gets the same
+    /// clipping either way.
+    #[test]
+    fn plan_order_does_not_matter() {
+        let mut s = planned(body(10_000), 4096, vec![(8000, 9000), (1000, 1500)]);
+        let mut buf = [0u8; 8];
+        s.read_at(1000, &mut buf).unwrap();
+        assert_eq!(
+            s.transport.seen.last().unwrap().end,
+            1499,
+            "clipping used the wrong range"
+        );
+    }
+
+    /// The plan clips read-ahead; it must not truncate the data a caller
+    /// actually asked for.
+    #[test]
+    fn a_read_larger_than_its_section_still_returns_what_it_asked_for() {
+        let data = body(10_000);
+        let mut s = planned(data.clone(), 64, vec![(1000, 1010)]);
+        let got = vidkit_core::io::read_exact_at(&mut s, 1000, 200).expect("read across the edge");
+        assert_eq!(got, data[1000..1200], "the plan truncated a real read");
     }
 
     #[test]
