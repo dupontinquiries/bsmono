@@ -196,3 +196,37 @@ Surfaced in the locator as a QUESTION ("new session for rusty-board?"), never ap
 module's own doc says these are "surfaced (never auto-applied)", and a terminal that opened
 tabs on its own guesses would be worse than one that never suggested anything. The accept
 action (step 3) is still open, and is now a UI question rather than a plumbing one.
+
+
+## DONE — step 3, the accept action (2026-09-07)
+
+Last commit drew the proposal into the locator TEXT, which made it a question nobody could
+answer. A suggestion you cannot accept is a nag with extra steps.
+
+`locator_ui_with_action` puts a tappable chip on the end of the line, accented — it is the
+one thing there that does anything when touched, and a suggestion in the same weak grey as
+the tab count reads as more status. A separate function from `locator_ui`, so every existing
+call site draws exactly what it drew and the no-proposal path allocates no interactive widget
+at all.
+
+The chip's label is the proposal's own words. A chip reading "accept" would make the user
+look up what they were accepting.
+
+Accepting opens a NEW TAB in every case — the proposals are about keeping separate work
+separate, and a tab is the unit this app already has for that — and then STAGES the command
+rather than running it. `stage_command` puts `cd <repo>` or `<editor> <path>` on the shell's
+line and the user presses Enter. That is the contract every other suggestion in this app
+keeps, and the one that makes an accidental tap survivable.
+
+The proposal is consumed before the action runs, so a second click cannot open two tabs for
+one suggestion.
+
+`ReentryAfterReboot` is matched by name and does nothing: this frontend does not observe a
+reboot (see `session_proposals`, which refuses to infer one from a command line). Named
+rather than left to a fallthrough, so the next person sees it is unhandled on purpose.
+
+### Note on a test I cut
+The first version counted egui layer ids to prove "an interactive widget appeared". That
+measures nothing — layers are not widgets. What remains asserts the two things that are
+true and checkable: the chip draws its label, and it reports a click only when clicked (a
+chip that returned true every frame would open a tab per frame).

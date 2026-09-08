@@ -212,13 +212,40 @@ pub const LOCATOR_GAP: f32 = 4.0;
 
 pub fn locator_ui(ui: &mut egui::Ui, text: &str, escaped: bool,
                   c: &uikit_egui::PaletteColors) {
+    locator_ui_with_action(ui, text, escaped, None, c);
+}
+
+/// [`locator_ui`] with a tappable suggestion chip on the end.
+///
+/// `session_auto`'s proposals were drawn into the locator TEXT, which made them a question
+/// nobody could answer — and a suggestion you cannot accept is a nag with extra steps. The
+/// chip is the accept.
+///
+/// It is a separate function rather than a changed signature so every existing call site
+/// keeps drawing exactly what it drew, and so the no-proposal path cannot accidentally
+/// allocate an interactive widget where there is nothing to interact with.
+///
+/// Returns whether it was clicked.
+pub fn locator_ui_with_action(ui: &mut egui::Ui, text: &str, escaped: bool,
+                              proposal: Option<&str>,
+                              c: &uikit_egui::PaletteColors) -> bool {
     // Tight INSIDE the row, and the trailing gap is set explicitly below.
     // uikit's touch defaults inflate `item_spacing` for finger targets,
     // which is right for buttons and wrong for a status line.
     let saved = ui.spacing().item_spacing;
     ui.spacing_mut().item_spacing.y = LOCATOR_GAP;
+    let mut clicked = false;
     ui.horizontal(|ui| {
         ui.colored_label(c.text_weak, egui::RichText::new(text).small());
+        if let Some(p) = proposal {
+            // ACCENTED, unlike the rest of the line: this is the one thing here that does
+            // something when touched, and a suggestion drawn in the same weak grey as the
+            // tab count reads as more status.
+            clicked = ui
+                .add(egui::Button::new(egui::RichText::new(p).small().color(c.accent)).frame(false))
+                .on_hover_text("accept this suggestion")
+                .clicked();
+        }
         if escaped {
             // Says WHY the chrome is back, so the user does not think the
             // setting was lost.
@@ -234,6 +261,7 @@ pub fn locator_ui(ui: &mut egui::Ui, text: &str, escaped: bool,
     // back underneath this row.
     ui.spacing_mut().item_spacing = saved;
     ui.add_space(LOCATOR_GAP - saved.y);
+    clicked
 }
 
 #[cfg(test)]
@@ -241,6 +269,46 @@ mod tests {
     use super::*;
 
     #[test]
+    /// A suggestion you cannot accept is a nag with extra steps. The chip is the accept, so
+    /// it has to be a real interactive widget rather than more text in the status line.
+    #[test]
+    fn the_proposal_chip_is_clickable_and_absent_when_there_is_nothing_to_accept() {
+        let colors = uikit_egui::palette_colors("system");
+        let ctx = egui::Context::default();
+
+        // Nothing clicked means nothing reported — the return value is an EVENT, and a
+        // chip that reported true on every frame it was drawn would open a tab per frame.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let clicked = locator_ui_with_action(
+                    ui, "1/1 shell", false, Some("new session for rusty-board"), &colors);
+                assert!(!clicked, "a chip nobody touched reported a click");
+            });
+        });
+
+        // The text-only path is unchanged: `locator_ui` still draws and returns nothing, so
+        // every existing call site is untouched.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                locator_ui(ui, "1/1 shell", false, &colors);
+            });
+        });
+
+        // And the chip's label is the proposal's own words — a chip reading "accept" would
+        // make the user look up what they were accepting.
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = locator_ui_with_action(ui, "1/1 shell", false, Some("new tab for a.rs"), &colors);
+            });
+        });
+        let texts = uikit_egui::layout_probe::texts(&out.shapes);
+        assert!(
+            texts.iter().any(|t| t.text.contains("new tab for a.rs")),
+            "the chip did not draw its label: {:?}",
+            texts.iter().map(|t| &t.text).collect::<Vec<_>>()
+        );
+    }
+
     fn the_locator_is_actually_drawn() {
         // shows_locator() is true in both modes and this module was ported
         // with the escape chord, the reclaimed-rows maths and its tests — and

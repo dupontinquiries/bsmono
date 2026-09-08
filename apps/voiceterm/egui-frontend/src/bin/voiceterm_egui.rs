@@ -968,6 +968,31 @@ impl VoicetermApp {
         recall::recall(query, &merged, now, 40)
     }
 
+    /// Do what a session proposal suggested.
+    ///
+    /// A new TAB in every case, not a new window or a silent cd: the proposals are about
+    /// keeping separate work separate, and a tab is the unit this app already has for that.
+    /// The proposal is consumed by the caller before this runs, so a second click cannot
+    /// open two tabs for one suggestion.
+    fn accept_proposal(&mut self, p: voiceterm_egui::session_auto::Proposal) {
+        use voiceterm_egui::gesture_menus::WsCall;
+        use voiceterm_egui::session_auto::Proposal;
+        self.workspace.apply(&WsCall::Command("new tab".into()));
+        match p {
+            // The repo is a DIRECTORY the user is already in — the proposal fired on a `cd`
+            // — so the new tab needs to go there itself. Typed rather than executed: the
+            // command lands on the line and the user presses Enter, which is the same
+            // contract every other suggestion in this app keeps.
+            Proposal::NewSessionForRepo { repo } => self.stage_command(&format!("cd {repo}")),
+            Proposal::NewTabForFile { path, editor } => {
+                self.stage_command(&format!("{editor} {path}"))
+            }
+            // Not produced here: a reboot is an event this frontend does not yet observe
+            // (see `session_proposals`). Left as a name rather than a silent fallthrough.
+            Proposal::ReentryAfterReboot { .. } => {}
+        }
+    }
+
     fn run_command(&mut self, cmd: voiceterm_egui::palette::Command) {
         use voiceterm_egui::gesture_menus::WsCall;
         use voiceterm_egui::palette::{Command, Target};
@@ -2854,23 +2879,32 @@ impl eframe::App for VoicetermApp {
                 // The suggestion, as a question rather than an action. It sits in the
                 // locator because that line is already about "where am I" — and it is
                 // phrased with a `?` because nothing here will do it for you.
-                if let Some(p) = &self.session_proposal {
+                let _ = &mut title;
+                // The suggestion as a TAPPABLE chip, not a sentence in the status line. It
+                // was drawn into the locator text last commit, which made it a question
+                // nobody could answer — a suggestion you cannot accept is a nag with extra
+                // steps.
+                let hint = self.session_proposal.as_ref().map(|p| {
                     use voiceterm_egui::session_auto::Proposal;
-                    let hint = match p {
-                        Proposal::NewSessionForRepo { repo } => format!("new session for {repo}?"),
-                        Proposal::NewTabForFile { path, .. } => format!("new tab for {path}?"),
-                        Proposal::ReentryAfterReboot { restore } => format!("restore {restore}?"),
-                    };
-                    title = format!("{title} \u{b7} {hint}");
-                }
+                    match p {
+                        Proposal::NewSessionForRepo { repo } => format!("new session for {repo}"),
+                        Proposal::NewTabForFile { path, .. } => format!("new tab for {path}"),
+                        Proposal::ReentryAfterReboot { restore } => format!("restore {restore}"),
+                    }
+                });
                 let text = self.chrome.locator(
                     self.workspace.active,
                     self.workspace.tabs.len(),
                     &title,
                     self.workspace.active_pane_ids().len(),
                 );
-                voiceterm_egui::chrome_mode::locator_ui(
-                    ui, &text, self.chrome.escaped(), &self.colors);
+                let accepted = voiceterm_egui::chrome_mode::locator_ui_with_action(
+                    ui, &text, self.chrome.escaped(), hint.as_deref(), &self.colors);
+                if accepted {
+                    if let Some(p) = self.session_proposal.take() {
+                        self.accept_proposal(p);
+                    }
+                }
             }
 
             // SWIPE BETWEEN TABS. The surface is the whole central area, and
