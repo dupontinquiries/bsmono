@@ -1,0 +1,41 @@
+[workspace]
+members = ["."]
+
+[package]
+name = "vidkit-player"
+version = "0.1.0"
+edition = "2021"
+description = "Video player on shared/vidkit: yt-dlp or local file, gesture-driven, egui shell."
+
+[[bin]]
+name = "vidkit-player"
+path = "src/main.rs"
+required-features = ["app"]
+
+[dependencies]
+egui = "0.34"
+# Backend named explicitly: eframe 0.34's defaults select wgpu, whose default
+# device descriptor asks for max_color_attachments 8 and dies at startup on a
+# GPU that allows 5 -- logscope-egui records exactly that on Asahi, which is
+# one of this player's two target platforms. See
+# maintenance/tools/eframe_backend_check.py.
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
+
+vidkit-core = { path = "../../shared/vidkit/crates/vidkit-core" }
+vidkit-egui = { path = "../../shared/vidkit/crates/vidkit-egui" }
+vidkit-mp4 = { path = "../../shared/vidkit/crates/vidkit-mp4" }
+vidkit-webm = { path = "../../shared/vidkit/crates/vidkit-webm" }
+uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
+snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
+
+[features]
+# Default-on, matching the other -egui apps: `cargo build --release` in this
+# directory produces the deployable binary with no feature incantation. Off is
+# for a headless build that only wants the library half.
+default = ["app"]
+app = ["dep:eframe"]
+
+# Monorepo-wide dev policy: full DWARF is the biggest artifact and link cost,
+# and the sandbox boxes are disk-starved.
+[profile.dev]
+debug = "line-tables-only"
