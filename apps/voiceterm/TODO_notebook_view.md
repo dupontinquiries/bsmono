@@ -104,7 +104,7 @@ Map as a bold-key grid. Two things were added after dogfooding it:
 3 tests in `notebook_cells` (the cache recomputes only on growth, folds
 are per block and die with the block, the summary names each kind).
 
-STILL NOT DONE: swipe gestures
+STILL NOT DONE: (nothing from step 3 — see below)
 (that needs persistent `TableView` state keyed by block id — a sort
 button that resets every frame would be worse than no button).
 
@@ -159,3 +159,36 @@ nothing.
 
 Two tests: the ops survive a frame where `base` is re-derived (and one block's state does not
 leak into another's), and the state dies with its block while a neighbour's does not.
+
+
+## DONE — swipe to dismiss (2026-09-07)
+
+Step 3 finished. "Swipe a cell → dismiss/clear it from the notebook view (doesn't kill the
+underlying block, just hides in notebook mode)" — so this is a view filter and nothing else:
+the block, its output and its scrollback are untouched.
+
+ACCUMULATED, not judged per frame. egui reports a drag in per-frame deltas, and a threshold
+applied to one of those fires on a fast flick and never on a slow drag of the same distance.
+96pt, comfortably past a thumb's wobble: a notebook is scrolled vertically far more often
+than swiped, and a cell that vanishes because a scroll drifted sideways is worse than one
+that needs a deliberate push.
+
+The travel is FORGOTTEN when a drag ends short. Without that a cell accumulates distance
+across separate gestures and dismisses itself on some later, unrelated touch.
+
+EITHER DIRECTION. A one-way swipe means half the attempts do nothing, and there is no second
+action to put on the other side of a terminal cell.
+
+A pin gives way to a dismissal — a pin says "this one matters", and keeping it would leave
+the strip pointing at something the pane will not draw.
+
+THE WAY BACK is at the top of the pane whenever anything is hidden: "N cell(s) dismissed"
+and "show all". A dismissal with no visible undo is indistinguishable from output going
+missing, and the doc is explicit that the block survives, so the view must not pretend
+otherwise.
+
+The command line is the swipe handle as well as the fold toggle — `click_and_drag` gives
+both, and a separate grab strip would be one more thing to aim at on a phone.
+
+Three tests: a wobble does nothing and a slow full-distance drag does; the other direction
+works and a pin gives way; hiding is reversible and dies with the block.

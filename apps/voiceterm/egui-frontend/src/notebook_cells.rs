@@ -39,6 +39,13 @@ struct Cached {
 }
 
 /// Per-cell state for the notebook pane.
+/// How far a cell must travel horizontally to be dismissed, in points.
+///
+/// Comfortably past a thumb's wobble while scrolling — a notebook is scrolled vertically far
+/// more often than swiped, and a cell that vanishes because a scroll drifted sideways is
+/// worse than one that needs a deliberate push.
+pub const SWIPE_DISMISS_PT: f32 = 96.0;
+
 #[derive(Debug, Default)]
 pub struct NotebookCells {
     cache: std::collections::HashMap<u32, Cached>,
@@ -60,6 +67,14 @@ pub struct NotebookCells {
     /// belongs to the block it sorted, and one surviving into a reused id would silently
     /// reorder somebody else's output.
     tables: std::collections::HashMap<u32, crate::table_ops::TableView>,
+    /// Cells swiped out of the notebook view.
+    ///
+    /// `TODO_notebook_view.md`: "swipe a cell → dismiss/clear it from the notebook view
+    /// (doesn't kill the underlying block, just hides in notebook mode)". The block, its
+    /// output and its scrollback are untouched; this is a view filter and nothing else.
+    hidden: std::collections::HashSet<u32>,
+    /// Horizontal travel accumulated per cell during a drag, reset when it ends.
+    drag: std::collections::HashMap<u32, f32>,
     /// How many times a classification was computed rather than reused, for the test that
     /// pins the cache actually caching.
     misses: u64,
@@ -96,6 +111,62 @@ impl NotebookCells {
         // longer exists.
         self.pinned.retain(|id| live(*id));
         self.tables.retain(|id, _| live(*id));
+        self.hidden.retain(|id| live(*id));
+        self.drag.retain(|id, _| live(*id));
+    }
+
+    pub fn is_hidden(&self, id: u32) -> bool {
+        self.hidden.contains(&id)
+    }
+
+    pub fn hidden_count(&self) -> usize {
+        self.hidden.len()
+    }
+
+    /// Put every hidden cell back.
+    ///
+    /// The only way back, and the pane is expected to offer it whenever `hidden_count` is
+    /// non-zero. A dismissal with no visible undo is indistinguishable from output going
+    /// missing, and this hides a block the operator may need later — the doc is explicit
+    /// that the block itself survives, so the view must not pretend otherwise.
+    pub fn unhide_all(&mut self) {
+        self.hidden.clear();
+    }
+
+    /// Feed a frame's horizontal drag for a cell; `true` when it has travelled far enough to
+    /// count as a dismissal.
+    ///
+    /// Accumulated rather than judged per frame: egui reports a drag in per-frame deltas, and
+    /// a threshold applied to one of those fires on a fast flick and never on a slow drag of
+    /// the same distance.
+    ///
+    /// EITHER DIRECTION. A one-way swipe means half the attempts do nothing, and on a
+    /// terminal cell there is no second action to put on the other side.
+    pub fn drag_cell(&mut self, id: u32, dx: f32) -> bool {
+        let acc = self.drag.entry(id).or_default();
+        *acc += dx;
+        if acc.abs() >= SWIPE_DISMISS_PT {
+            self.drag.remove(&id);
+            self.hidden.insert(id);
+            // A pin is a statement that this one matters; dismissing it drops that rather
+            // than leaving the strip pointing at something the pane will not draw.
+            self.pinned.retain(|p| *p != id);
+            return true;
+        }
+        false
+    }
+
+    /// The drag ended without reaching the threshold: forget it.
+    ///
+    /// Without this a cell would accumulate travel across separate gestures and dismiss
+    /// itself on some later, unrelated touch.
+    pub fn drag_release(&mut self, id: u32) {
+        self.drag.remove(&id);
+    }
+
+    /// How far a cell has been dragged, for drawing it following the finger.
+    pub fn drag_offset(&self, id: u32) -> f32 {
+        self.drag.get(&id).copied().unwrap_or(0.0)
     }
 
     /// The table state for block `id`, created from `base` the first time it is asked for.
@@ -200,6 +271,71 @@ pub fn fold_summary(what: &Structured, output: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A notebook is scrolled vertically far more often than swiped. A cell that vanishes
+    /// because a scroll drifted sideways is worse than one that needs a deliberate push.
+    #[test]
+    fn a_cell_is_dismissed_only_by_a_deliberate_swipe() {
+        let mut c = NotebookCells::new();
+
+        // A wobble: nowhere near, and nothing happens.
+        assert!(!c.drag_cell(1, 12.0));
+        assert!(!c.is_hidden(1));
+
+        // The drag ends short. That travel must NOT carry into the next gesture, or a cell
+        // dismisses itself on some later, unrelated touch.
+        c.drag_release(1);
+        assert_eq!(c.drag_offset(1), 0.0);
+        assert!(!c.drag_cell(1, 12.0), "travel leaked across gestures");
+
+        // ACCUMULATED, not judged per frame: egui reports a drag in per-frame deltas, and a
+        // threshold on one delta fires on a flick and never on a slow drag of the same
+        // distance.
+        c.drag_release(1);
+        let mut fired = false;
+        for _ in 0..(SWIPE_DISMISS_PT as i32 / 8 + 1) {
+            fired |= c.drag_cell(1, 8.0);
+        }
+        assert!(fired, "a slow drag the full distance never dismissed");
+        assert!(c.is_hidden(1));
+        assert_eq!(c.hidden_count(), 1);
+    }
+
+    /// Either direction. A one-way swipe means half the attempts do nothing, and there is no
+    /// second action to put on the other side of a terminal cell.
+    #[test]
+    fn swiping_the_other_way_works_too_and_a_pin_gives_way() {
+        let mut c = NotebookCells::new();
+        assert!(c.drag_cell(2, -SWIPE_DISMISS_PT));
+        assert!(c.is_hidden(2));
+
+        // A pin says "this one matters"; dismissing it drops the pin rather than leaving the
+        // strip pointing at something the pane will not draw.
+        c.toggle_pin(3);
+        assert!(c.is_pinned(3));
+        c.drag_cell(3, SWIPE_DISMISS_PT);
+        assert!(c.is_hidden(3));
+        assert!(!c.is_pinned(3), "a hidden cell was still pinned");
+    }
+
+    /// A dismissal with no visible undo is indistinguishable from output going missing — and
+    /// the doc is explicit that the block survives, so the view must not pretend otherwise.
+    #[test]
+    fn hiding_is_reversible_and_dies_with_the_block() {
+        let mut c = NotebookCells::new();
+        c.drag_cell(1, 200.0);
+        c.drag_cell(2, 200.0);
+        assert_eq!(c.hidden_count(), 2);
+
+        c.unhide_all();
+        assert_eq!(c.hidden_count(), 0);
+        assert!(!c.is_hidden(1) && !c.is_hidden(2), "unhide left something hidden");
+
+        // And like every other per-cell state here, it goes when the block does.
+        c.drag_cell(1, 200.0);
+        c.retain_ids(|id| id != 1);
+        assert_eq!(c.hidden_count(), 0);
+    }
 
     /// "A sort button that resets every frame would be worse than no button"
     /// (`TODO_notebook_view.md`). The engine's `TableView` is per-table state held by the

@@ -4192,8 +4192,25 @@ impl eframe::App for VoicetermApp {
                             });
                         }
                         let cells = &mut self.notebook_cells;
+                        // THE WAY BACK, above everything. A dismissal with no visible undo
+                        // is indistinguishable from output going missing — and the block is
+                        // still there, so the view must not pretend otherwise.
+                        if cells.hidden_count() > 0 {
+                            let n = cells.hidden_count();
+                            ui.horizontal(|ui| {
+                                ui.colored_label(c.text_weak, format!("{n} cell(s) dismissed"));
+                                if ui.small_button("show all").clicked() {
+                                    cells.unhide_all();
+                                }
+                            });
+                        }
                         egui::ScrollArea::vertical().id_salt("notebook").show(ui, |ui| {
                             for b in &self.blocks.blocks {
+                                // Swiped out of the view. The block, its output and its
+                                // scrollback are untouched: this is a view filter.
+                                if cells.is_hidden(b.id) {
+                                    continue;
+                                }
                                 ui.separator();
                                 // CLASSIFIED ONCE, not once a frame. `classify` tries a
                                 // markdown table, CSV, TSV, aligned columns and two
@@ -4208,15 +4225,28 @@ impl eframe::App for VoicetermApp {
                                 // acted on after: `cells` is borrowed for the table's own
                                 // state while the grid draws.
                                 let mut sort_col: Option<usize> = None;
+                                let mut swipe_dx: Option<f32> = None;
+                                let mut swipe_end = false;
                                 ui.horizontal(|ui| {
                                     if ui.small_button(if folded { "\u{25b8}" } else { "\u{25be}" }).clicked() {
                                         toggle = true;
                                     }
-                                    if ui.add(egui::Label::new(
+                                    // The command line is the swipe handle as well as the
+                                    // fold toggle: `click_and_drag` gives both, and a
+                                    // separate grab strip would be one more thing to aim at
+                                    // on a phone.
+                                    let r = ui.add(egui::Label::new(
                                         egui::RichText::new(format!("$ {}", b.command)).strong())
-                                        .sense(egui::Sense::click())).clicked()
-                                    {
+                                        .sense(egui::Sense::click_and_drag()));
+                                    if r.clicked() {
                                         toggle = true;
+                                    }
+                                    if r.dragged() {
+                                        swipe_dx = Some(r.drag_delta().x);
+                                    } else if r.drag_stopped() {
+                                        // Short of the threshold: forget the travel, or the
+                                        // cell dismisses itself on a later unrelated touch.
+                                        swipe_end = true;
                                     }
                                     match b.exit_code {
                                         Some(0) => { ui.colored_label(
@@ -4242,6 +4272,16 @@ impl eframe::App for VoicetermApp {
                                         },
                                     );
                                 });
+                                if let Some(dx) = swipe_dx {
+                                    if cells.drag_cell(b.id, dx) {
+                                        // Hidden as of this frame; nothing below would draw
+                                        // anything useful for it.
+                                        continue;
+                                    }
+                                }
+                                if swipe_end {
+                                    cells.drag_release(b.id);
+                                }
                                 if let Some(col) = sort_col {
                                     // `usize::MAX` is the clear button — a sentinel rather
                                     // than a second flag, since both are "the operator
