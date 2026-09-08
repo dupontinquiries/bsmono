@@ -237,12 +237,33 @@ mod tests {
     }
 
     /// The readout must not show 104% for a value the gesture set to 1.05.
+    /// The readout must not show 104% for a value the gesture set to 1.05.
+    ///
+    /// The f32 case is the one that bites and the one the first version of
+    /// this test missed: no multiple of 0.05 differs between rounding and
+    /// truncation in f64, so asserting on f64 literals could not fail. Volume
+    /// and zoom are f32, and `1.05f32 as f64` is 1.04999995 -- which truncates
+    /// to 104. Found by a mutation sweep, which reported the truncating
+    /// version as surviving.
     #[test]
     fn percentages_round_rather_than_truncate() {
         assert_eq!(percent(1.05), "105%");
         assert_eq!(percent(0.95), "95%");
         assert_eq!(percent(1.0), "100%");
         assert_eq!(percent(0.0), "0%");
+
+        // The real call sites: f32 state widened to f64.
+        for steps in 1..=20 {
+            let v = apply_volume_step(0.0, steps);
+            let expect = format!("{}%", steps * 5);
+            assert_eq!(
+                percent(v as f64),
+                expect,
+                "f32 volume {v} rendered wrong"
+            );
+        }
+        let z = crate::gestures::apply_zoom_step(1.0, 1);
+        assert_eq!(percent(z as f64), "105%", "f32 zoom {z} rendered wrong");
     }
 
     /// The bar's buttons and the gestures must move the same values by the

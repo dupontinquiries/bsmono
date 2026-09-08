@@ -248,11 +248,7 @@ impl VideoView {
                 // rotation is letterboxed as if it were still landscape.
                 let raw = presenter.frame_size();
                 let quarter = transport.rotation.rem_euclid(4);
-                let effective = if quarter % 2 == 1 {
-                    Vec2::new(raw.y, raw.x)
-                } else {
-                    raw
-                };
+                let effective = rotated_size(raw, quarter);
                 let mut r = fit_rect(surface, effective, self.pixel_aspect, self.fit);
                 if transport.zoom != 1.0 {
                     r = Rect::from_center_size(r.center(), r.size() * transport.zoom);
@@ -398,6 +394,22 @@ fn paint_rotated(painter: &egui::Painter, tex: egui::TextureId, r: Rect, quarter
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(0, 2, 3);
     painter.add(egui::Shape::mesh(mesh));
+}
+
+/// The frame's dimensions after `quarter` turns.
+///
+/// Pulled out of `show` so it can be tested: it lives on the painting path,
+/// which needs a live context, and a mutation sweep found that dropping the
+/// swap entirely killed no test. Getting it wrong letterboxes a rotated
+/// portrait picture as though it were still landscape -- the picture is
+/// correct and the bars are wrong, which reads as a fit bug rather than a
+/// rotation one.
+pub fn rotated_size(raw: Vec2, quarter: i32) -> Vec2 {
+    if quarter.rem_euclid(4) % 2 == 1 {
+        Vec2::new(raw.y, raw.x)
+    } else {
+        raw
+    }
 }
 
 /// Offset a position by seconds, clamped to the media.
@@ -621,6 +633,50 @@ mod apply_tests {
             let (_, _, _, hud) = run(&[i]);
             assert!(!hud.is_empty(), "{i:?} produced no feedback");
         }
+    }
+}
+
+#[cfg(test)]
+mod rotate_tests {
+    use super::*;
+
+    #[test]
+    fn quarter_turns_swap_the_dimensions_and_half_turns_do_not() {
+        let raw = Vec2::new(1920.0, 1080.0);
+        assert_eq!(rotated_size(raw, 0), raw);
+        assert_eq!(rotated_size(raw, 1), Vec2::new(1080.0, 1920.0));
+        assert_eq!(rotated_size(raw, 2), raw);
+        assert_eq!(rotated_size(raw, 3), Vec2::new(1080.0, 1920.0));
+    }
+
+    /// Rotation state is user-driven and can be negative or out of range.
+    #[test]
+    fn out_of_range_turns_normalise() {
+        let raw = Vec2::new(1920.0, 1080.0);
+        assert_eq!(rotated_size(raw, -1), Vec2::new(1080.0, 1920.0));
+        assert_eq!(rotated_size(raw, 4), raw);
+        assert_eq!(rotated_size(raw, 7), Vec2::new(1080.0, 1920.0));
+    }
+
+    /// The consequence the swap exists for: a rotated landscape frame must be
+    /// PILLARboxed in a wide surface, not letterboxed as if it were still
+    /// landscape.
+    #[test]
+    fn a_rotated_frame_is_pillarboxed_not_letterboxed() {
+        let surface = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(800.0, 600.0));
+        let raw = Vec2::new(1920.0, 1080.0);
+
+        let flat = fit_rect(surface, rotated_size(raw, 0), PixelAspect::SQUARE, Fit::Contain);
+        assert!(flat.width() > flat.height(), "unrotated should be wide");
+
+        let turned = fit_rect(surface, rotated_size(raw, 1), PixelAspect::SQUARE, Fit::Contain);
+        assert!(
+            turned.height() > turned.width(),
+            "rotated frame was fitted as landscape: {}x{}",
+            turned.width(),
+            turned.height()
+        );
+        assert!(turned.height() <= surface.height() + 0.01);
     }
 }
 

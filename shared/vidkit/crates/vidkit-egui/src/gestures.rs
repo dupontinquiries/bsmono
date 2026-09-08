@@ -635,9 +635,14 @@ mod tests {
     fn a_horizontal_drag_from_the_edge_strip_still_scrubs() {
         let mut r = router();
         let out = drag(&mut r, pos2(770.0, 200.0), vec![vec2(-80.0, 0.0)]);
+        // Assert something was emitted BEFORE asserting what it was: `all()`
+        // is true of an empty vec, so the original version passed against an
+        // edge strip that swallowed the gesture entirely. A mutation sweep
+        // found it; reading the test did not.
+        assert!(!out.is_empty(), "edge strip swallowed the scrub completely");
         assert!(
             out.iter().all(|i| matches!(i, Intent::ScrubBy(_))),
-            "edge strip swallowed a scrub: {out:?}"
+            "edge strip turned a scrub into something else: {out:?}"
         );
     }
 
@@ -735,16 +740,46 @@ mod tests {
     }
 
     /// Repeated steps must not drift into 1.0499999 and display "104%".
+    ///
+    /// Asserting only the round trip (20 up, 20 down, back to 1.0) is not
+    /// enough: naive repeated addition is symmetric and lands on 1.0 too, so
+    /// that version passed against an unquantised implementation. The claim is
+    /// that EVERY intermediate value is an exact multiple of 5%, so that is
+    /// what gets asserted.
     #[test]
-    fn repeated_speed_steps_do_not_accumulate_float_drift() {
+    fn every_speed_step_lands_exactly_on_a_five_percent_multiple() {
         let mut s = 1.0;
-        for _ in 0..20 {
+        for i in 0..20 {
             s = apply_speed_step(s, 1);
+            let twentieths = s * 20.0;
+            assert_eq!(
+                twentieths,
+                twentieths.round(),
+                "step {i} left {s} off the 5% grid"
+            );
         }
-        for _ in 0..20 {
+        for _ in 0..40 {
             s = apply_speed_step(s, -1);
+            let twentieths = s * 20.0;
+            assert_eq!(twentieths, twentieths.round(), "{s} off the grid");
         }
-        assert_eq!(s, 1.0, "drifted to {s}");
+        assert_eq!(s, 0.25, "should have clamped at the floor");
+    }
+
+    /// Volume and zoom are f32 and feed a percentage readout, so they need the
+    /// same guarantee.
+    #[test]
+    fn volume_and_zoom_steps_stay_on_the_grid() {
+        let mut v = 0.0f32;
+        for _ in 0..20 {
+            v = apply_volume_step(v, 1);
+            assert_eq!((v * 20.0).round(), v * 20.0, "volume {v} off the grid");
+        }
+        let mut z = 1.0f32;
+        for _ in 0..10 {
+            z = apply_zoom_step(z, 1);
+            assert_eq!((z * 20.0).round(), z * 20.0, "zoom {z} off the grid");
+        }
     }
 
     #[test]
