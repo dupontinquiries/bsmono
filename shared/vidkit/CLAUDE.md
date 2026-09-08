@@ -80,9 +80,9 @@ trusting them.
 ## Commands
 
 ```sh
-cargo test --ignore-rust-version            # 322 tests
+cargo test --ignore-rust-version            # 342 tests
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json cargo test -p vidkit-vk
-python3 tools/mutate.py                     # 126 mutants, all must be killed
+python3 tools/mutate.py                     # 134 mutants, all must be killed
 python3 tools/mutate.py shader              # just the WGSL ones
 ```
 
@@ -158,6 +158,37 @@ to a time that happened to be a keyframe, and seeking after the decoder queue
 had already drained. The WebM round then caught four of four, because those
 fixtures were written already knowing the shape. The `seam/` mutants keep it
 honest.
+
+## Bit depth is the one that looks like a decoder fault
+
+P010 stores its 10 bits in the **high** bits of each 16-bit sample; I420_10LE
+in the **low** bits. Read either with the other's scale and the picture is a
+sixteenth as bright, or clipped — and both look like a broken decoder rather
+than a scaling bug, which sends the next session hunting in the wrong crate.
+`SampleFormat` is an enum for this reason and `convert.wgsl` documents the same
+trap. I420_10LE's top six bits are undefined padding and are masked; a decoder
+that leaves them set would otherwise clip every highlight.
+
+The GPU parity test covers 10-bit for the same reason: each implementation's
+picture is individually plausible, so a disagreement about where the
+significant bits live is invisible until the two are compared.
+
+## The upload path costs four bytes a pixel
+
+`EguiPresenter` converts on the CPU and uploads RGBA8, where the decoder
+produced 1.5 bytes per pixel. At 1080p60 that is roughly 500 MB/s against
+187 MB/s for the source planes. `uploaded_bytes()` reports it.
+
+Two wastes are already gone: the conversion writes into a reused buffer rather
+than allocating 8 MB a frame, and a submit matching the frame already on screen
+is a no-op — the player re-submits on any repaint, so a paused surface was
+doing full-rate work to show a still image. The skipped path still recycles,
+because a skip that forgets to bleeds the pool dry on exactly the surfaces that
+skip most.
+
+**The structural fix is not built:** upload NV12 planes and convert in a shader
+through an egui paint callback. That is the 2.7x, and it needs glow access the
+kit does not currently take.
 
 ## Invariants that are easy to break
 
