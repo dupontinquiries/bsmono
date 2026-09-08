@@ -4390,6 +4390,9 @@ impl eframe::App for VoicetermApp {
                                 // state while the grid draws.
                                 let mut sort_col: Option<usize> = None;
                                 let mut swipe_dx: Option<f32> = None;
+                                // The word a tap landed on, acted on after the draw: the
+                                // search reads the note corpus and `cells` is borrowed here.
+                                let mut word_tap: Option<String> = None;
                                 let mut swipe_end = false;
                                 ui.horizontal(|ui| {
                                     if ui.small_button(if folded { "\u{25b8}" } else { "\u{25be}" }).clicked() {
@@ -4436,6 +4439,23 @@ impl eframe::App for VoicetermApp {
                                         },
                                     );
                                 });
+                                if let Some(w) = word_tap {
+                                    let corpus = voiceterm_egui::note_store::documents();
+                                    let hits = voiceterm_egui::note_search::search(&w, &corpus, 3);
+                                    // NAMED, and nothing is a real answer. "no notes about
+                                    // cargo" is information; a silent tap is indistinguishable
+                                    // from a tap that missed.
+                                    let msg = if hits.is_empty() {
+                                        format!("no notes about \u{201c}{w}\u{201d}")
+                                    } else {
+                                        format!(
+                                            "\u{201c}{w}\u{201d}: {}",
+                                            hits.iter().map(|h| h.title.clone())
+                                                .collect::<Vec<_>>().join(", ")
+                                        )
+                                    };
+                                    self.toasts.info(&msg, 0.0);
+                                }
                                 if let Some(dx) = swipe_dx {
                                     if cells.drag_cell(b.id, dx) {
                                         // Hidden as of this frame; nothing below would draw
@@ -4480,7 +4500,32 @@ impl eframe::App for VoicetermApp {
                                 }
                                 match what {
                                     Structured::Plain => {
-                                        ui.label(egui::RichText::new(&b.output).monospace());
+                                        // TAP A WORD → what does it belong with. Step 4 of
+                                        // TODO_notes_clip.md. The pointer gives a position;
+                                        // egui's galley turns that into a character index,
+                                        // and `note_search::word_at` turns THAT into a word
+                                        // — the part that has to agree with the matcher's
+                                        // idea of a boundary, or a tap on "cargo-build"
+                                        // searches for something the matcher cannot find.
+                                        let job = egui::text::LayoutJob::simple(
+                                            b.output.clone(),
+                                            egui::FontId::monospace(
+                                                ui.style().text_styles[&egui::TextStyle::Body].size),
+                                            c.text,
+                                            ui.available_width(),
+                                        );
+                                        let galley = ui.painter().layout_job(job);
+                                        let r = ui.add(
+                                            egui::Label::new(galley.clone())
+                                                .sense(egui::Sense::click()));
+                                        if r.clicked() {
+                                            if let Some(p) = r.interact_pointer_pos() {
+                                                let cur = galley.cursor_from_pos(p - r.rect.min);
+                                                word_tap = voiceterm_egui::note_search::word_at(
+                                                    &b.output, cur.index)
+                                                    .map(str::to_string);
+                                            }
+                                        }
                                     }
                                     Structured::Table(t) => {
                                         // SORTABLE NOW. The comment that was here said this

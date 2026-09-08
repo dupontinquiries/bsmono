@@ -83,6 +83,49 @@ pub fn has_word(haystack: &str, word: &str) -> bool {
     false
 }
 
+/// The word at a character offset in `text`, if that offset is inside one.
+///
+/// Step 4's word-TAP needs a word before it can search for one, and the only thing the UI can
+/// report is where the pointer landed: egui gives a character index into the laid-out text
+/// and nothing more. This is the rest.
+///
+/// Boundaries match [`has_word`]'s, deliberately — a tap that picked "cargo-build" as one
+/// word and then searched for it with a matcher that treats the hyphen as a boundary would
+/// find nothing, and the failure would look like an empty corpus rather than a disagreement
+/// about what a word is.
+///
+/// `None` for an offset on whitespace or punctuation: tapping the gap between two words is
+/// not a request to search for either of them, and picking the nearer one guesses at
+/// something the tap did not say.
+pub fn word_at(text: &str, char_index: usize) -> Option<&str> {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    // Byte offsets for the character positions, since the text may not be ASCII and slicing
+    // by character index would split a codepoint.
+    let mut bounds: Vec<(usize, char)> = text.char_indices().collect();
+    bounds.push((text.len(), ' '));
+    let (start_byte, ch) = *bounds.get(char_index)?;
+    if !is_word(ch) {
+        return None;
+    }
+    let mut lo = start_byte;
+    for (b, c) in text[..start_byte].char_indices().rev() {
+        if is_word(c) {
+            lo = b;
+        } else {
+            break;
+        }
+    }
+    let mut hi = start_byte;
+    for (b, c) in text[start_byte..].char_indices() {
+        if is_word(c) {
+            hi = start_byte + b + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    (hi > lo).then(|| &text[lo..hi])
+}
+
 /// Rank a corpus of `(name, title, markdown)` against `query`, best first.
 ///
 /// Notes matching NOTHING are dropped rather than returned with a zero score: a suggestion
@@ -195,6 +238,47 @@ mod tests {
         // A query of nothing but stop words finds nothing rather than everything.
         assert!(search("the and was", &corpus(), 5).is_empty());
         assert!(search("", &corpus(), 5).is_empty());
+    }
+
+    /// The word-tap needs a word, and the only thing the UI can report is where the pointer
+    /// landed. Boundaries match `has_word`'s on purpose: a tap that picked "cargo-build" as
+    /// one word and searched for it with a matcher that splits on the hyphen would find
+    /// nothing, and that reads as an empty corpus rather than a disagreement about words.
+    #[test]
+    fn a_tap_picks_the_word_under_it() {
+        let t = "the linker was broken";
+        assert_eq!(word_at(t, 0), Some("the"));
+        assert_eq!(word_at(t, 4), Some("linker"));
+        assert_eq!(word_at(t, 9), Some("linker"), "mid-word");
+        assert_eq!(word_at(t, 20), Some("broken"), "the last character");
+
+        // Hyphens split, matching `has_word`.
+        assert_eq!(word_at("run cargo-build now", 4), Some("cargo"));
+        assert_eq!(word_at("run cargo-build now", 10), Some("build"));
+        // Underscores do not — an identifier is one word to someone pointing at it.
+        assert_eq!(word_at("fn read_to_string()", 3), Some("read_to_string"));
+    }
+
+    /// Tapping the gap between two words is not a request to search for either. Picking the
+    /// nearer one guesses at something the tap did not say.
+    #[test]
+    fn a_tap_on_nothing_picks_nothing() {
+        let t = "the linker was broken";
+        assert_eq!(word_at(t, 3), None, "the space");
+        assert_eq!(word_at("a, b", 1), None, "the comma");
+        assert_eq!(word_at(t, 999), None, "past the end");
+        assert_eq!(word_at("", 0), None);
+        // Past the last character is the end, not the last word.
+        assert_eq!(word_at("hi", 2), None);
+    }
+
+    /// Text is not ASCII. Slicing by character index would split a codepoint and panic.
+    #[test]
+    fn a_word_with_an_accent_survives_the_pick() {
+        let t = "le café était";
+        assert_eq!(word_at(t, 3), Some("café"));
+        assert_eq!(word_at(t, 6), Some("café"), "inside the accented character");
+        assert_eq!(word_at(t, 8), Some("était"));
     }
 
     /// A list padded to a fixed length with unrelated notes teaches that the suggestions are

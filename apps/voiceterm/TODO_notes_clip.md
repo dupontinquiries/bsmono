@@ -254,6 +254,24 @@ the clip, so it would always be the top hit and always be useless. The toast NAM
 related note rather than counting them: "3 related notes" is a number you cannot act on, a
 title is one you can go and open.
 
-STILL OPEN: the word-TAP itself, and "create card / search" as actions. What exists answers
-"what does this belong with" for a clip; it does not yet answer it for a word you point at in
-rendered content, which needs a hit-test on the rendered document.
+### The word-tap — DONE the same day
+
+A tap on a notebook cell's plain output now asks the corpus about the word under it. The
+pointer gives a position, egui's galley turns that into a character index, and
+`note_search::word_at` turns that into a word.
+
+Boundaries match `has_word`'s DELIBERATELY. A tap that picked "cargo-build" as one word and
+searched with a matcher that splits on the hyphen would find nothing, and that reads as an
+empty corpus rather than as two halves of the same feature disagreeing about what a word is.
+Underscores do not split — an identifier is one word to someone pointing at it.
+
+A tap on whitespace or punctuation picks NOTHING. Tapping the gap between two words is not a
+request to search for either, and choosing the nearer one guesses at something the tap did
+not say. Text with accents is handled by byte-aware slicing rather than by character
+arithmetic that would split a codepoint.
+
+"No notes about X" is a real answer and is said: a silent tap is indistinguishable from one
+that missed.
+
+STILL OPEN: "create card / search" as actions on the result — the tap answers, and there is
+nothing yet to DO with the answer beyond reading it.
