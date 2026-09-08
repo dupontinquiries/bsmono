@@ -94,8 +94,18 @@ impl BodyPlan {
 pub fn plan_from_subject(subject: &str) -> BodyPlan {
     let l = subject.to_lowercase();
     let has = |w: &str| l.split(|c: char| !c.is_alphanumeric()).any(|x| x == w || x == &format!("{w}s"));
+    // Observed: "a gorilla statue" built a MAN, because a gorilla was
+    // in no list and the default is biped. Any animal not named here
+    // becomes a person, which is the wrong default for a word this
+    // table has never seen -- so the list is wider, and the fallback
+    // below asks whether it is an animal at all.
     for w in ["frog", "toad", "horse", "lion", "dog", "wolf", "cat", "bear", "bull", "ox",
-              "deer", "boar", "tiger", "elephant", "cow", "ram", "goat", "sphinx", "beast"] {
+              "deer", "boar", "tiger", "elephant", "cow", "ram", "goat", "sphinx", "beast",
+              "gorilla", "ape", "monkey", "chimp", "baboon", "rhino", "hippo", "camel",
+              "donkey", "mule", "stag", "bison", "buffalo", "panther", "leopard", "jaguar",
+              "lynx", "fox", "hound", "badger", "otter", "beaver", "rat", "mouse", "hare",
+              "rabbit", "turtle", "tortoise", "lizard", "crocodile", "alligator", "salamander",
+              "mammoth", "sloth", "armadillo", "boarhound", "wolfhound", "cerberus", "chimera"] {
         if has(w) { return BodyPlan::Quadruped; }
     }
     for w in ["snake", "serpent", "worm", "eel", "hydra", "leviathan", "naga"] {
@@ -111,6 +121,14 @@ pub fn plan_from_subject(subject: &str) -> BodyPlan {
     for w in ["orb", "sphere", "cube", "monolith", "obelisk", "machine", "engine", "skull", "head"] {
         if has(w) { return BodyPlan::Mass; }
     }
+    // A CREATURE WORD THIS TABLE HAS NEVER SEEN. Defaulting to biped
+    // makes every unknown animal a person; defaulting to quadruped
+    // makes every unknown object a beast. The tell is whether anything
+    // in the description is anatomical at all -- and when nothing is,
+    // a mass is the honest answer rather than a guess at a skeleton.
+    let anatomical = ["creature", "animal", "beast", "monster", "hound", "wyrm", "drake",
+                      "behemoth", "leviathan", "titan"].iter().any(|w| has(w));
+    if anatomical { return BodyPlan::Quadruped; }
     BodyPlan::Biped
 }
 
@@ -254,7 +272,10 @@ pub fn absorb(study: &mut Study, rung: Rung, reply: &str) {
     if rung == Rung::Anatomy && study.plan == BodyPlan::Biped {
         study.plan = plan_from_subject(&study.subject);
     }
-    study.parts.truncate(14);
+    // Was 14. A figure needs more parts than a skeleton has: five is a
+    // head, a body and three sticks, which is what "basic, a few
+    // shapes" looked like when it was reported.
+    study.parts.truncate(24);
     study.pose.truncate(8);
     study.keep.truncate(8);
     study.drop.truncate(8);
@@ -294,6 +315,12 @@ PLAN: <biped, quadruped, serpentine, winged or mass -- how the body is ARRANGED>
 PARTS: head 12%; neck 3%; torso 30%; arm 34%; leg 47%; ...
 WIDTH: <shoulders and hips, as a fraction of the height>
 MASS: <where the weight sits: chest-heavy, long-limbed, squat>
+
+NAME EVERY PART THAT WOULD BE VISIBLE AT THIS SIZE, not just the five a skeleton has.
+Five parts is a mannequin: a head, a body and three sticks. At {height} blocks a
+gorilla has a brow ridge, a muzzle, a chest, a shoulder mass, a belly, a rump, hands,
+feet -- and the ones that make it recognisable at a glance matter most. Twelve to
+eighteen parts is a figure; five is a diagram of one.
 
 Percentages need not sum to 100 -- limbs overlap the torso's span."),
 

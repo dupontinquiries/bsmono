@@ -141,6 +141,8 @@ pub mod flair;
 pub mod typology;
 /// The architectural brief: a schedule of spaces, an adjacency matrix, and a layout.
 pub mod brief;
+/// The routing turn: ask what kind of thing this is, instead of matching words.
+pub mod route;
 /// Four passes: what is it, what is it made of, where does it go, do it.
 pub mod compose;
 /// Assets built once and repeated, then passes that add or cut: the sculptor's loop.

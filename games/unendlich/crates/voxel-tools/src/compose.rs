@@ -260,6 +260,44 @@ pub fn names_several(prose: &str) -> bool {
     after >= 1
 }
 
+/// The path a MODEL's reading implies. This is the real router; the
+/// string-matching one below is what happens when there is no model or
+/// its answer was unusable.
+///
+/// The tables hold 1,296 literal words and every routing failure
+/// reported has been one of them being wrong -- `arch` matched inside
+/// a yard, `vines` taken as a subject, `gorilla` absent from an animal
+/// list. Adding words is not generalising. There is no list of every
+/// noun, and a model does not need one.
+pub fn path_for(r: &crate::route::Reading) -> Path {
+    use crate::route::Kind;
+    match r.kind {
+        Kind::Several => Path::Parts,
+        Kind::Figure => {
+            let h = r.height.unwrap_or(24);
+            if crate::study::depth_for(h) >= 3 { Path::Study { height: h } } else { Path::Known }
+        }
+        Kind::Building => {
+            // a type this world knows keeps its own chain; one it does
+            // not gets its definition asked for -- and the SUBJECT is
+            // the model's, not the last noun in the sentence
+            match crate::typology::lookup(&r.subject) {
+                Some(t) => {
+                    let (area, _) = crate::typology::scale_for(&r.subject, &t);
+                    if area >= 1200 { Path::Programme } else { Path::Known }
+                }
+                None => Path::Propose { noun: r.subject.clone() },
+            }
+        }
+        Kind::Landscape => Path::Known,
+        Kind::Object => {
+            // an object with a name this world knows is a form; one
+            // without is composed from parts and relations
+            if crate::recipe::recognise(&r.subject).is_some() { Path::Known } else { Path::Compose }
+        }
+    }
+}
+
 pub fn choose_path(prose: &str) -> Path {
     // SEVERAL THINGS IS NOT ONE THING, and this must be asked FIRST.
     // The recognizer matches a single noun ANYWHERE in a sentence, so
@@ -808,5 +846,33 @@ mod tests {
         // one thing is still one thing
         assert_eq!(choose_path("a small cottage"), Path::Known);
         assert_eq!(choose_path("a water sphere"), Path::Compose);
+    }
+
+    #[test]
+    fn a_reading_routes_where_the_words_could_not() {
+        use crate::route::{Kind, Reading};
+        let r = |kind, subject: &str, height| Reading {
+            subject: subject.into(), kind, height, parts: vec![], notes: vec![] };
+        // "a giant tree with vines" took `vines` as the subject and
+        // asked what a VINE is made of. The model says: object, tree.
+        assert_eq!(path_for(&r(Kind::Object, "tree", Some(40))), Path::Compose);
+        // "a gorilla statue" was a biped because `gorilla` was in no
+        // list. The model says: figure, gorilla, 20 blocks.
+        assert!(matches!(path_for(&r(Kind::Figure, "gorilla", Some(30))), Path::Study { .. }));
+        // "a walled yard with a hall and a gate" matched `arch` and
+        // built one arch. The model says: several.
+        let mut several = r(Kind::Several, "yard", None);
+        several.parts = vec!["yard".into(), "hall".into(), "gate".into()];
+        assert_eq!(path_for(&several), Path::Parts);
+        // a building this world knows keeps its own chain
+        assert_eq!(path_for(&r(Kind::Building, "castle", None)), Path::Programme);
+        // and one it does not gets its definition asked for, using the
+        // MODEL's subject rather than the last noun in the sentence
+        match path_for(&r(Kind::Building, "windmill", None)) {
+            Path::Propose { noun } => assert_eq!(noun, "windmill"),
+            o => panic!("{o:?}"),
+        }
+        // a small figure does not climb the ladder
+        assert_eq!(path_for(&r(Kind::Figure, "gnome", Some(6))), Path::Known);
     }
 }

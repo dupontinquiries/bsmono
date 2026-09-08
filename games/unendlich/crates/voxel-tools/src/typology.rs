@@ -426,11 +426,29 @@ pub fn unknown_noun(request: &str) -> Option<String> {
                             "create", "giant", "huge", "small", "tiny", "large", "colossal",
                             "massive", "enormous", "vast", "big", "tall", "wide", "old", "new",
                             "stone", "wooden", "iron", "glass", "some", "that", "this", "very"];
-    // the LAST substantial noun is the head of the phrase: "a huge
-    // stone ziggurat" is a ziggurat
-    request.to_lowercase().split(|c: char| !c.is_alphanumeric())
+    // The last substantial noun is the head of the phrase -- "a huge
+    // stone ziggurat" is a ziggurat -- but ONLY UP TO THE FIRST `with`.
+    // Everything after it is a modifier, not the subject: "a giant tree
+    // with vines" asked what a VINE is made of, and got a typology for
+    // the decoration instead of the tree. The same for "on", "in",
+    // "under" and "beside", which introduce a place rather than a
+    // subject.
+    let low = request.to_lowercase();
+    let head = ["with", " and ", " on ", " in ", " under ", " beside ", " over ", " near ",
+                " around ", " covered ", " full of ", " made of "]
+        .iter()
+        .filter_map(|m| low.find(m))
+        .min()
+        .map(|i| &low[..i])
+        .unwrap_or(&low);
+    head.split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.len() > 3 && !SKIP.contains(w))
-        .last().map(|s| s.to_string())
+        .last()
+        .map(|s| s.to_string())
+        // a request that is ONLY modifiers still names something
+        .or_else(|| low.split(|c: char| !c.is_alphanumeric())
+                 .filter(|w| w.len() > 3 && !SKIP.contains(w))
+                 .last().map(|s| s.to_string()))
 }
 
 pub fn lookup(name: &str) -> Option<Typology> {
@@ -1534,5 +1552,23 @@ mod tests {
         let (ty, errs) = parse_typology("ziggurat", &body);
         assert!(errs.is_empty(), "{body}\n{errs:?}");
         assert!(ty.is_some());
+    }
+
+    #[test]
+    fn the_subject_is_what_comes_before_with_not_after_it() {
+        // "a giant tree with vines" asked what a VINE is made of, and
+        // got a typology for the decoration instead of the tree
+        assert_eq!(unknown_noun("a giant tree with vines").as_deref(), Some("tree"));
+        assert_eq!(unknown_noun("a windmill with four sails").as_deref(), Some("windmill"));
+        assert_eq!(unknown_noun("a bunker under the hill").as_deref(), Some("bunker"));
+        assert_eq!(unknown_noun("a treehouse in the canopy").as_deref(), Some("treehouse"));
+        assert_eq!(unknown_noun("an observatory on the ridge").as_deref(), Some("observatory"));
+        // and the plain case is unchanged: the head is still the last
+        // noun when nothing introduces a modifier
+        assert_eq!(unknown_noun("a great stone ziggurat").as_deref(), Some("ziggurat"));
+        // a known type is still not an unknown noun
+        assert_eq!(unknown_noun("a huge fortress with a chapel"), None);
+        // and a request that is only modifiers still names something
+        assert!(unknown_noun("with vines").is_some());
     }
 }

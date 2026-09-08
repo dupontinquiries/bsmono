@@ -586,9 +586,19 @@ pub fn resolve_grounded(s: &Sketch, anchor: (i32, i32, i32),
             Some(f) => f(c.0.round() as i32, c.2.round() as i32).map(|y| y as f32),
             None => Some(anchor.1 as f32),
         };
-        let Some(floor) = floor else {
-            notes.push(format!("'{a}' was told to reach the ground and there is none below it"));
-            continue;
+        // NO GROUND IS NOT A REASON TO FLOAT. Observed: a gorilla
+        // statue built four blocks in the air, because the run had no
+        // world under it, `reaches` found no floor and gave up -- and
+        // giving up leaves the figure wherever the proportions happened
+        // to put it. The anchor is where the player is standing and
+        // pointing, so it is the floor of last resort. A statue on the
+        // wrong ground is a statue; one hanging in the air is a bug.
+        let floor = match floor {
+            Some(f) => f,
+            None => {
+                notes.push(format!("'{a}' found no ground; standing it on the anchor instead"));
+                anchor.1 as f32
+            }
         };
         // The joint is the part's TOP -- it hangs from there. A capsule
         // is centred on its position, so lengthening it grows both ways
@@ -1174,8 +1184,17 @@ mod tests {
         let (sk, _) = parse("part leg capsule r=2 len=4 pitch=-90 material=stone\n\
                              rel leg reaches ground\n");
         let none = |_x: i32, _z: i32| None;
-        let (_, notes) = resolve_grounded(&sk, (0, 64, 0), &BTreeMap::new(), Some(&none));
-        assert!(notes.iter().any(|n| n.contains("there is none below it")), "{notes:?}");
+        let (placed, notes) = resolve_grounded(&sk, (0, 64, 0), &BTreeMap::new(), Some(&none));
+        // NO GROUND IS NOT A REASON TO FLOAT. This used to give up,
+        // and giving up left the figure wherever the proportions put it
+        // -- a gorilla statue four blocks in the air. The anchor is
+        // where the player is standing and pointing, so it is the floor
+        // of last resort.
+        assert!(notes.iter().any(|n| n.contains("standing it on the anchor")), "{notes:?}");
+        let leg = placed.iter().find(|p| p.name == "leg").expect("a leg");
+        let cells = cells(leg, 1);
+        let lowest = cells.iter().map(|c| c.1).min().unwrap();
+        assert!((lowest - 64).abs() <= 2, "it stands on the anchor, not above it: {lowest}");
     }
 
     #[test]
