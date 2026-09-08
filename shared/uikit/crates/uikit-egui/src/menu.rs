@@ -263,9 +263,21 @@ pub fn menu_ui(ui: &mut egui::Ui, m: &mut ContextMenu, colors: &crate::PaletteCo
 
     let items = m.items().to_vec();
     let cursor = m.cursor();
+    // ENTRANCE. A menu that appears fully formed in one frame reads as a glitch; one that
+    // fades in over its last few pixels of travel reads as something arriving from the control
+    // that opened it. `dropdown_in` keeps the type at its final size throughout — a scale-from
+    // -nothing makes the first frames unreadable, which costs more on a phone than the
+    // flourish gains — and is zero-duration under `UIKIT_REDUCE_MOTION`.
+    let (alpha, dy) = crate::motion::dropdown_in(
+        ui.ctx(),
+        egui::Id::new("uikit_context_menu_anim"),
+        true,
+        crate::motion::DROPDOWN_TRAVEL,
+    );
     egui::Area::new(egui::Id::new("uikit_context_menu"))
-        .fixed_pos(egui::pos2(m.at().0, m.at().1))
+        .fixed_pos(egui::pos2(m.at().0, m.at().1 + dy))
         .show(ui.ctx(), |ui| {
+            ui.set_opacity(alpha);
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 for (i, item) in items.iter().enumerate() {
                     if item.separator { ui.separator(); continue; }

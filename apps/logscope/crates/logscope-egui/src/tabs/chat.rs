@@ -8360,8 +8360,23 @@ if let Some(msg) = self.error_banner.clone() {
                     {
                         let n = crate::diagfeed::attention();
                         let lbl = crate::diagfeed::tab_label(n);
-                        let txt = if n > 0 { RichText::new(lbl).small().color(egui::Color32::from_rgb(230, 170, 80)) }
-                                  else { RichText::new(lbl).small() };
+                        // A NEW WARNING FLASHES. The count changing from 2 to 3 is silent
+                        // otherwise, and this badge exists precisely to be noticed — while a
+                        // badge that is permanently loud is one people learn to ignore, which
+                        // is why the CHANGE is highlighted rather than the badge. Keyed on the
+                        // count, so first sight does not flash: lighting up because the panel
+                        // was opened would be crying wolf on frame one.
+                        let f = uikit_egui::motion::flash_on_change(
+                            ui.ctx(), egui::Id::new("logscope-engine-badge"), &n, 0.6);
+                        let warn = egui::Color32::from_rgb(230, 170, 90);
+                        let base = if n > 0 { warn } else { theme::DIM() };
+                        // Toward white at the peak, back to the resting colour as it decays.
+                        let col = egui::Color32::from_rgb(
+                            base.r().max((255.0 * f) as u8),
+                            base.g().max((255.0 * f) as u8),
+                            base.b().max((255.0 * f) as u8),
+                        );
+                        let txt = RichText::new(lbl).small().color(col);
                         if ui.selectable_label(self.right_page == RightPage::Engine, txt).clicked() {
                             self.right_page = RightPage::Engine;
                         }

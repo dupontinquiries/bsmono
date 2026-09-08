@@ -217,6 +217,76 @@ pub fn stagger(elapsed: f32, i: usize, step: f32, each: f32, max_total: f32) -> 
     ease::out_cubic(t)
 }
 
+/// A dropdown's entrance: how visible it is, and how far it still has to fall.
+///
+/// Returns `(alpha, dy)` — multiply the panel's opacity by the first and offset it down by the
+/// second. A menu that appears fully formed in one frame reads as a glitch; one that fades in
+/// while settling the last few pixels reads as something arriving from the control that opened
+/// it.
+///
+/// DOWNWARD ONLY, and only a few pixels. A dropdown that flies in from far away draws the eye
+/// away from the control the user just pressed, and one that scales from nothing makes the
+/// first frames unreadable while the text is still small — this keeps the type at its final
+/// size throughout, which matters more on a phone than the flourish does.
+///
+/// The alpha leads the movement: it is fully opaque before it stops moving, so the last of the
+/// travel happens on something the eye can already read rather than on a ghost.
+pub fn dropdown_in(ctx: &Context, id: Id, open: bool, travel: f32) -> (f32, f32) {
+    let t = animate_eased(ctx, id, open, dur(0.12), ease::out_cubic);
+    // Opacity reaches 1 at t=0.7, movement at t=1.
+    let alpha = (t / 0.7).clamp(0.0, 1.0);
+    (alpha, (1.0 - t) * travel)
+}
+
+/// Travel for [`dropdown_in`], in points.
+///
+/// Six: enough to read as movement at 60fps, small enough that the panel never covers
+/// something it will not be covering when it settles.
+pub const DROPDOWN_TRAVEL: f32 = 6.0;
+
+/// How recently a value changed, 1.0 at the moment of change decaying to 0.
+///
+/// For the counter that quietly went from 2 to 3. A number that updates silently is a number
+/// nobody notices, and the badge exists precisely to be noticed — so the change itself gets a
+/// brief highlight rather than the badge being permanently loud, which is how a badge becomes
+/// something people learn to ignore.
+///
+/// Keyed on the VALUE, not on a bool: the caller has a number and does not have to work out
+/// whether it changed. First sight of a value does not flash — a badge that lit up because a
+/// panel was opened for the first time would be crying wolf on frame one.
+pub fn flash_on_change<T: Clone + PartialEq + Send + Sync + 'static>(
+    ctx: &Context,
+    id: Id,
+    value: &T,
+    duration: f32,
+) -> f32 {
+    #[derive(Clone)]
+    struct S<T> {
+        last: T,
+        at: f64,
+    }
+    let now = ctx.input(|i| i.time);
+    let d = dur(duration).max(0.0);
+    let mut st: Option<S<T>> = ctx.data_mut(|m| m.get_temp::<S<T>>(id));
+    match &mut st {
+        Some(s) if s.last == *value => {}
+        Some(s) => {
+            s.last = value.clone();
+            s.at = now;
+        }
+        // Never seen: record it as already finished. A badge that lit up because its panel was
+        // opened for the first time would be crying wolf on frame one.
+        None => st = Some(S { last: value.clone(), at: now - d as f64 - 1.0 }),
+    }
+    let s = st.expect("set above");
+    let t = if d <= 1e-4 { 1.0 } else { (((now - s.at) as f32) / d).clamp(0.0, 1.0) };
+    ctx.data_mut(|m| m.insert_temp(id, s));
+    if t < 1.0 {
+        ctx.request_repaint();
+    }
+    1.0 - ease::out_cubic(t)
+}
+
 /// A spring pop-in scale (`out_back`) for something appearing/disappearing — scale a rect by this
 /// around its center. `0` when closed, overshoots ~1.05 then settles at `1.0`.
 pub fn pop_scale(ctx: &Context, id: Id, open: bool, duration: f32) -> f32 {
@@ -268,6 +338,89 @@ pub fn interactive_fill(ctx: &Context, response: &Response, rest: Color32, hover
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A menu that appears fully formed in one frame reads as a glitch. The alpha LEADS the
+    /// movement so the last of the travel happens on something already readable rather than on
+    /// a ghost.
+    #[test]
+    fn a_dropdown_fades_in_before_it_finishes_moving() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("dd");
+        let step = |open: bool| -> (f32, f32) {
+            let mut out = (0.0, 0.0);
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                out = dropdown_in(ctx, id, open, DROPDOWN_TRAVEL);
+            });
+            out
+        };
+
+        // Closed: invisible and displaced by the full travel.
+        let (a, dy) = step(false);
+        assert_eq!(a, 0.0);
+        assert!((dy - DROPDOWN_TRAVEL).abs() < 0.01, "{dy}");
+
+        // Opening: alpha climbs faster than the movement finishes.
+        let mut last = (0.0f32, DROPDOWN_TRAVEL);
+        for _ in 0..4 {
+            let now = step(true);
+            assert!(now.0 >= last.0 - 1e-3, "alpha went backwards: {last:?} → {now:?}");
+            assert!(now.1 <= last.1 + 1e-3, "it moved back up: {last:?} → {now:?}");
+            last = now;
+        }
+        // At any point before it settles, opacity is ahead of position.
+        let progress_alpha = last.0;
+        let progress_move = 1.0 - last.1 / DROPDOWN_TRAVEL;
+        assert!(progress_alpha >= progress_move - 1e-3, "movement outran the fade: {last:?}");
+
+        // Settled.
+        for _ in 0..40 {
+            last = step(true);
+        }
+        assert!((last.0 - 1.0).abs() < 1e-3 && last.1.abs() < 0.01, "{last:?}");
+    }
+
+    /// Downward and only a few points: a dropdown that flies in from far away pulls the eye
+    /// off the control that opened it, and one that scales from nothing is unreadable while
+    /// the type is still small.
+    #[test]
+    fn the_travel_is_short_and_the_type_never_shrinks() {
+        assert!(DROPDOWN_TRAVEL > 0.0 && DROPDOWN_TRAVEL <= 8.0, "{DROPDOWN_TRAVEL}");
+    }
+
+    /// A number that updates silently is a number nobody notices — and a badge that is
+    /// permanently loud is one people learn to ignore. The CHANGE gets the highlight.
+    #[test]
+    fn a_counter_flashes_when_it_changes_and_not_when_it_appears() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("badge");
+        let step = |v: u32| -> f32 {
+            let mut out = 0.0;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                out = flash_on_change(ctx, id, &v, 0.4);
+            });
+            out
+        };
+
+        // First sight: no flash. A badge lighting up because its panel was opened for the
+        // first time is crying wolf on frame one.
+        assert_eq!(step(2), 0.0, "it flashed on first sight");
+        assert_eq!(step(2), 0.0, "an unchanged value flashed");
+
+        // It changed: full brightness, then decaying.
+        let first = step(3);
+        assert!(first > 0.9, "a change barely registered: {first}");
+        let mut prev = first;
+        for _ in 0..3 {
+            let now = step(3);
+            assert!(now <= prev + 1e-3, "the flash brightened again: {prev} → {now}");
+            prev = now;
+        }
+        // And it goes out rather than lingering.
+        for _ in 0..60 {
+            prev = step(3);
+        }
+        assert!(prev < 0.05, "the flash never faded: {prev}");
+    }
 
     /// A pager has more than two states, and switching A→C while the A→B fade is still
     /// running has to read as one movement rather than a flicker through B.
