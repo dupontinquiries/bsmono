@@ -794,6 +794,9 @@ struct VoicetermApp {
     /// smallest useful shape; splitting into multiple named notes is real
     /// future work the TODO itself defers past its first slice.
     clip_note: voiceterm_egui::note_clip::Note,
+    /// Where this session's note was first written, so later clips rewrite it rather than
+    /// creating a new file each time.
+    clip_note_path: Option<std::path::PathBuf>,
     /// Whether the one-time narrow-surface default has been applied. Applied
     /// once rather than every frame, so collapsing is a starting position the
     /// user can override, not a cage that re-shuts whatever they open.
@@ -1100,7 +1103,33 @@ impl VoicetermApp {
                             captured_at: now,
                         };
                         self.clip_note.push_clip(clip);
-                        self.toasts.success("Clipped to notes", 0.0);
+                        // AND ON TO DISK. `Note::to_markdown` has been pure and tested since
+                        // v0.1.641 and nothing wrote its output anywhere, so every clip died
+                        // with the process — a clipping tool that loses the clips is the one
+                        // failure it cannot have.
+                        //
+                        // Saved on every clip rather than on quit: a terminal is closed by
+                        // closing its window, and a note that only survives a graceful exit
+                        // does not survive the way this app is actually ended.
+                        // The note GROWS: each clip appends a block and the whole thing is
+                        // re-rendered, so the path is chosen once and rewritten after.
+                        // Saving afresh each time would scatter one note across
+                        // `build-notes.md`, `-2`, `-3` — one file per clip, each a prefix of
+                        // the next.
+                        let saved = match &self.clip_note_path {
+                            Some(p) => voiceterm_egui::note_store::save_to(p, &self.clip_note),
+                            None => voiceterm_egui::note_store::save(&self.clip_note).map(|p| {
+                                self.clip_note_path = Some(p);
+                            }),
+                        };
+                        match saved {
+                            Ok(_) => self.toasts.success("Clipped to notes", 0.0),
+                            // Said out loud. A silent write failure leaves someone clipping
+                            // into a void for an afternoon.
+                            Err(e) => self
+                                .toasts
+                                .warning(&format!("clipped, but not saved: {e}"), 0.0),
+                        }
                     }
                     _ => { self.toasts.warning("nothing selected to clip", 0.0); }
                 }
@@ -5414,6 +5443,7 @@ fn main() -> eframe::Result<()> {
                 osc7: Default::default(),
                 keycaps_open: true,
                 clip_note: voiceterm_egui::note_clip::Note::new("Session clips"),
+                clip_note_path: None,
                 compact_defaults_applied: false,
                 ingest: Default::default(),
                 // Discovery once at startup, not per frame: scanning

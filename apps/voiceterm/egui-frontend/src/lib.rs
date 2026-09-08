@@ -389,6 +389,8 @@ pub mod count_prefix;
 /// just above.
 #[path = "../../src/note_clip.rs"]
 pub mod note_clip;
+/// Clipped notes on disk, as the markdown they already render to.
+pub mod note_store;
 /// Is a clipped selection code or prose, and in what language? (`TODO_notes_clip.md`.)
 pub mod clip_kind;
 /// Who owns the keyboard when a terminal is on screen (Tab, the arrows, and the sidebar).

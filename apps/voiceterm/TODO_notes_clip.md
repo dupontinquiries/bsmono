@@ -106,3 +106,40 @@ Wired at the one clip site: `ClipSelection` was hardcoded to
 Unknown extensions and files without one fence with NO language rather
 than guessing a grammar — `Code { lang: "" }` is a plain fence, which is
 right for a shell transcript.
+
+
+## DONE — persist (2026-09-07)
+
+"Notes saved as .md under a notes dir; the web view already renders markdown → 'add to the
+web' = open the note's .md". The data model and `Note::to_markdown` have been pure and tested
+since v0.1.641 and nothing ever wrote the result anywhere, so every clip died with the
+process — the one failure a clipping tool cannot have.
+
+`note_store` writes them to `$XDG_DATA_HOME/voiceterm-egui/notes/`. DATA, not config: a
+clipped note is something the operator made, and config directories get hand-edited, synced
+and reset in ways nobody expects their notes to follow.
+
+Markdown for the doc's own reason — the web view already renders it, so a saved note is
+readable by the thing that would show it, by any editor, and by `grep`. The cost is that a
+note read back is markdown rather than the `Note` tree, so `load_markdown` returns a String
+rather than pretending to parse one back: a round trip that is nearly right is worse than one
+that is honestly one-way.
+
+Saved ON EVERY CLIP, not on quit. A terminal is closed by closing its window, and a note that
+only survives a graceful exit does not survive the way this app is actually ended.
+
+The path is chosen ONCE and rewritten after. A note grows — each clip appends a block and the
+whole thing is re-rendered — and saving afresh each time would scatter one note across
+`build-notes.md`, `-2`, `-3`: one file per clip, each a prefix of the next. That has its own
+test.
+
+Two notes with the same title get a suffix rather than one overwriting the other, and an
+unusable title ("???") becomes `note.md` rather than `.md`, which is hidden on every unix and
+looks like the save failed.
+
+A write failure is said out loud ("clipped, but not saved: …"). A silent one leaves someone
+clipping into a void for an afternoon.
+
+Still open from this section: the note PICKER and "add to the web" opening a saved note —
+`note_store::list` is there for it, newest first, names and paths only so a picker of a
+hundred notes is not a hundred file reads.
