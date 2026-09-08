@@ -2558,6 +2558,7 @@ dependencies = [
  "vidkit-core",
  "vidkit-mp4",
  "vidkit-webm",
+ "vidkit-ytdlp",
 ]
 
 [[package]]

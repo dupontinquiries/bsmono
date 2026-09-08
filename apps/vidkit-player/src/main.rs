@@ -116,6 +116,8 @@ struct Player {
     /// Reported, never swallowed. A silent fallback to the CPU path means the
     /// fast one can rot untested and nobody finds out.
     gpu_error: Option<String>,
+    /// `cmd_` because `palette` is already the colour palette.
+    cmd_palette: vidkit_egui::palette::PaletteState,
 }
 
 /// File-picker state. Navigation is uikit-egui's PathPicker; the file list and
@@ -227,6 +229,7 @@ impl Player {
             quit: false,
             gpu,
             gpu_error,
+            cmd_palette: Default::default(),
         }
     }
 
@@ -277,6 +280,21 @@ impl eframe::App for Player {
         }
         self.presenter.schedule_repaint();
 
+        // Ctrl+P, and a button in the bar for anyone who does not know that.
+        // A palette reachable only by a shortcut is a palette most people never
+        // find.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
+            self.cmd_palette.toggle();
+        }
+        if let Some(action) = vidkit_egui::palette::show(
+            ctx,
+            &mut self.cmd_palette,
+            true,
+            &self.colors,
+        ) {
+            self.run_action(action);
+        }
+
         egui::TopBottomPanel::bottom("transport").show(ctx, |ui| {
             let adaptive = Adaptive::detect(ui.ctx());
             let act = bottom_bar(
@@ -298,6 +316,9 @@ impl eframe::App for Player {
             }
             if act.cycle_fit {
                 self.view.fit = next_fit(self.view.fit);
+            }
+            if ui.small_button("⌘").on_hover_text("command palette (Ctrl+P)").clicked() {
+                self.cmd_palette.toggle();
             }
             if act.reset_view {
                 self.transport.zoom = 1.0;
@@ -768,4 +789,38 @@ fn main() -> eframe::Result<()> {
         opts,
         Box::new(|cc| Ok(Box::new(Player::new(cc, file)))),
     )
+}
+
+impl Player {
+    /// Apply a palette choice.
+    ///
+    /// Actions with no implementation yet are recorded in `gpu_error`'s banner
+    /// slot rather than silently doing nothing -- a palette entry that appears
+    /// to work and does not is worse than one that says it is unfinished.
+    fn run_action(&mut self, action: vidkit_egui::Action) {
+        use vidkit_egui::Action as A;
+        match action {
+            A::TogglePlay => self.transport.playing = !self.transport.playing,
+            A::SeekBy(d) => {
+                let now = self.transport.position.as_secs_f64();
+                let to = (now + d as f64).max(0.0);
+                self.transport.position = Duration::from_secs_f64(to);
+            }
+            A::SeekTo(t) => self.transport.position = t,
+            A::SetSpeed(v) => self.transport.speed = v,
+            A::SetVolume(v) => self.transport.volume = v,
+            A::Rotate => {
+                self.transport.rotation = vidkit_egui::apply_rotation(self.transport.rotation, 1)
+            }
+            A::CycleFit => self.view.fit = vidkit_egui::next_fit(self.view.fit),
+            A::ResetView => {
+                self.transport.zoom = 1.0;
+                self.transport.rotation = 0;
+            }
+            A::Quit => self.quit = true,
+            other => {
+                self.gpu_error = Some(format!("{other:?} is not wired up yet"));
+            }
+        }
+    }
 }

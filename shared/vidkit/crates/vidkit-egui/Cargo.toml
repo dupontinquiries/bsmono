@@ -8,6 +8,8 @@ description = "egui front end for vidkit: a Presenter on an egui texture, and a 
 
 [dependencies]
 vidkit-core = { path = "../vidkit-core" }
+# For clipboard URL classification in the palette.
+vidkit-ytdlp = { path = "../vidkit-ytdlp" }
 egui = "0.34"
 
 # shared/uikit is a separate nested workspace; a path dependency across the two
