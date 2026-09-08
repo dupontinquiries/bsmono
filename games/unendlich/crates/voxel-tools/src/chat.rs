@@ -122,6 +122,11 @@ pub struct LastBuild {
 
 #[derive(Debug, Default, Clone)]
 pub struct ChatSession {
+    /// Every attempt this build has made, so a review can show the
+    /// model whether its last edit HELPED. Without it each round shows
+    /// the current shape and nothing else, and a model editing blind
+    /// repeats itself and undoes its own improvements.
+    pub bench: crate::bench::Bench,
     /// Answers to whatever the model asked the world last turn, kept
     /// so a second attempt has them. A model that asks "what does
     /// water do" and is not told is no better off than one that never
@@ -508,6 +513,10 @@ impl ChatSession {
             findings: Vec::new(),
             bounds,
         });
+        // every preview is an attempt on the bench, so the next review
+        // can say whether it improved
+        self.bench.push(prose, src, self.pending.as_ref().map(|p| p.placed.iter().copied().collect())
+                        .unwrap_or_default(), Vec::new());
         self.invalidate_context();
         let _ = player_feet;
         Reply::Preview { echo, blocks, feature_id: f.feature_id }
@@ -540,6 +549,18 @@ impl ChatSession {
         // fine", which is how a bland statue survives every round.
         if let Some(note) = &self.study_note {
             base = format!("{note}\n{base}");
+        }
+        // and what changed since last round, which is the only thing
+        // that answers "did my edit help"
+        if self.bench.attempts.len() > 1 {
+            let last = &self.bench.attempts[self.bench.attempts.len() - 1];
+            let prev = &self.bench.attempts[self.bench.attempts.len() - 2];
+            let d = crate::bench::compare(prev, last);
+            base = format!("SINCE YOUR LAST CHANGE: {}\n{}{base}", d.summary(),
+                           if self.bench.plateaued() {
+                               "It has not improved for three rounds. Try something different \
+                                in kind, not another adjustment.\n"
+                           } else { "" });
         }
         Some(base)
     }

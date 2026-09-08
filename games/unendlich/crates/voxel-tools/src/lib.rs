@@ -123,6 +123,8 @@ pub mod latent;
 pub mod expr;
 /// Parts and relations without coordinates, and the solver that grounds them.
 pub mod sketch;
+/// A bench: try, measure, compare, and see whether it improved.
+pub mod bench;
 /// A JSON probe: what a block does, and what happens if you place it.
 pub mod probe;
 /// The block catalogue: colour, hardness, family, and what to use when one is missing.

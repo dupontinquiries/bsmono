@@ -884,10 +884,8 @@ fn cells_at(p: &Placed, at_i: (i32, i32, i32), block: u16) -> Vec<(i32, i32, i32
 /// from a body rather than glued to it.
 ///
 /// Ported in spirit from `cad-kernel`'s SDF `blend`, which is the
-/// polynomial smooth minimum:
-///
-///     h = clamp(0.5 + 0.5*(db - da)/k, 0, 1)
-///     db + (da - db)*h - k*h*(1 - h)
+/// polynomial smooth minimum: `h = clamp(0.5 + 0.5*(db - da)/k, 0, 1)`
+/// then `db + (da - db)*h - k*h*(1 - h)`.
 ///
 /// That needs distance fields, and this crate resolves to cell sets.
 /// The discrete equivalent of a smooth union is the same idea by
