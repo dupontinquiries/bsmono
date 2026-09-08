@@ -17,7 +17,9 @@ pub mod traits;
 
 pub use audio_clock::AudioClock;
 pub use caps::{Backend, Cost, DecodeCap, Delivery, DeviceCaps, PlaybackBudget};
-pub use convert_cpu::{frame_to_rgba8, planes_to_rgba8, ConvertError};
+pub use convert_cpu::{
+    frame_to_rgba8, frame_to_rgba8_into, planes_to_rgba8, planes_to_rgba8_into, ConvertError,
+};
 pub use codec::{parse_codec_string, Chroma, Codec, Transfer, VideoProfile};
 pub use io::{read_exact_at, ByteSource, MemorySource};
 pub use frame::{ColorInfo, Frame, FrameData, Matrix, PlaneLayout, Range, RecycleToken};

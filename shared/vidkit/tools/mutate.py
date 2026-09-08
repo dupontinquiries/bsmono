@@ -195,6 +195,18 @@ MUTANTS = [
     ("mp4/box-past-limit-allowed", "crates/vidkit-mp4/src/boxes.rs",
      "    if end > limit {", "    if false {"),
 
+    # --- upload efficiency ---------------------------------------------------
+    ("upload/redundant-not-skipped", "crates/vidkit-egui/src/presenter.rs",
+     "        if self.shown_pts == Some(frame.pts) && self.texture.is_some() {", "        if false {"),
+    ("upload/skipped-path-leaks-buffer", "crates/vidkit-egui/src/presenter.rs",
+     "            self.skipped_uploads += 1;\n            let mut frame = frame;\n            let previous = self.held.take();\n            self.held = frame.recycle.take();\n            return Ok(previous);",
+     "            self.skipped_uploads += 1;\n            return Ok(None);"),
+    ("upload/cost-not-counted", "crates/vidkit-egui/src/presenter.rs",
+     "                self.uploaded_bytes += (w * h * 4) as u64;", ""),
+    ("upload/scratch-reallocated", "crates/vidkit-core/src/convert_cpu.rs",
+     "    out.clear();\n    out.resize(width * height * 4, 0);",
+     "    *out = vec![0u8; width * height * 4];"),
+
     # --- 10-bit sample handling ---------------------------------------------
     ("depth/p010-read-as-low-bits", "crates/vidkit-core/src/convert_cpu.rs",
      "        PlaneLayout::P010 => SampleFormat::U16HighBits,",

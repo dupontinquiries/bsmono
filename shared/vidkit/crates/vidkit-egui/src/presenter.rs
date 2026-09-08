@@ -38,6 +38,13 @@ pub struct EguiPresenter {
     deadline: Option<Instant>,
     drops: u32,
     uploads: u64,
+    /// Reused conversion target. See `planes_to_rgba8_into` for why.
+    scratch: Vec<u8>,
+    /// PTS of the frame currently in the texture, so a re-submit of the same
+    /// frame costs nothing.
+    shown_pts: Option<std::time::Duration>,
+    uploaded_bytes: u64,
+    skipped_uploads: u64,
     last_error: Option<String>,
 }
 
@@ -51,6 +58,10 @@ impl EguiPresenter {
             deadline: None,
             drops: 0,
             uploads: 0,
+            scratch: Vec::new(),
+            shown_pts: None,
+            uploaded_bytes: 0,
+            skipped_uploads: 0,
             last_error: None,
         }
     }
@@ -70,6 +81,23 @@ impl EguiPresenter {
     /// Frames uploaded since construction, for a stats overlay.
     pub fn upload_count(&self) -> u64 {
         self.uploads
+    }
+
+    /// Bytes pushed to the GPU since construction.
+    ///
+    /// Worth showing in a stats overlay, because it is the number this path
+    /// costs: RGBA8 is 4 bytes a pixel where the decoder produced 1.5, so a
+    /// 1080p60 stream uploads about 500 MB/s here against 187 MB/s for the
+    /// planes it came from. Uploading NV12 and converting in a shader is the
+    /// structural fix and needs a paint callback; this counter is what would
+    /// show it working.
+    pub fn uploaded_bytes(&self) -> u64 {
+        self.uploaded_bytes
+    }
+
+    /// Submissions that cost nothing because the frame was already on screen.
+    pub fn skipped_uploads(&self) -> u64 {
+        self.skipped_uploads
     }
 
     /// The last conversion failure, if any.
@@ -108,9 +136,22 @@ impl Presenter for EguiPresenter {
     fn submit(&mut self, frame: Frame) -> core_traits::Result<Option<RecycleToken>> {
         let (w, h) = (frame.width as usize, frame.height as usize);
 
-        match vidkit_core::frame_to_rgba8(&frame) {
-            Ok(rgba) => {
-                let image = ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+        // A frame already on screen is a no-op. The player re-submits when a
+        // repaint happens for some other reason -- a resize, a gesture, a
+        // hover -- and converting and re-uploading the same pixels for that is
+        // pure waste, which on a paused phone is the difference between idle
+        // and warm.
+        if self.shown_pts == Some(frame.pts) && self.texture.is_some() {
+            self.skipped_uploads += 1;
+            let mut frame = frame;
+            let previous = self.held.take();
+            self.held = frame.recycle.take();
+            return Ok(previous);
+        }
+
+        match vidkit_core::frame_to_rgba8_into(&frame, &mut self.scratch) {
+            Ok(()) => {
+                let image = ColorImage::from_rgba_unmultiplied([w, h], &self.scratch);
                 match &mut self.texture {
                     // Reusing the handle keeps the same texture id, so a widget
                     // that cached it does not end up painting a stale frame.
@@ -125,6 +166,8 @@ impl Presenter for EguiPresenter {
                 }
                 self.frame_size = Vec2::new(w as f32, h as f32);
                 self.uploads += 1;
+                self.uploaded_bytes += (w * h * 4) as u64;
+                self.shown_pts = Some(frame.pts);
                 self.last_error = None;
             }
             Err(e) => {
@@ -169,7 +212,16 @@ mod tests {
         ctx
     }
 
+    /// Distinct timestamps by default: real frames have them, and a helper
+    /// that hands out pts=0 forever hides the redundant-upload skip.
     fn frame(token: Option<u32>, layout: PlaneLayout) -> Frame {
+        frame_at(token, layout, Duration::from_millis(NEXT_PTS.fetch_add(33, Ordering::SeqCst)))
+    }
+
+    static NEXT_PTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    use std::sync::atomic::Ordering;
+
+    fn frame_at(token: Option<u32>, layout: PlaneLayout, pts: Duration) -> Frame {
         let planes = match layout {
             PlaneLayout::Nv12 => CpuPlanes {
                 data: vec![vec![126u8; 4], vec![128, 128]],
@@ -186,7 +238,7 @@ mod tests {
             height: 2,
             layout,
             color: ColorInfo::default(),
-            pts: Duration::ZERO,
+            pts,
             duration: None,
             recycle: token.map(RecycleToken),
         }
@@ -276,6 +328,55 @@ mod tests {
         let first = p.texture().unwrap().id();
         p.submit(frame(None, PlaneLayout::Nv12)).unwrap();
         assert_eq!(p.texture().unwrap().id(), first);
+    }
+
+    /// Re-submitting the frame already on screen must cost nothing. The
+    /// player re-submits on any repaint -- a resize, a hover, a gesture -- and
+    /// converting and uploading the same pixels for that is pure waste.
+    #[test]
+    fn resubmitting_the_same_frame_uploads_nothing() {
+        let ctx = ctx();
+        let mut p = EguiPresenter::new(&ctx);
+        let pts = Duration::from_millis(500);
+
+        p.submit(frame_at(None, PlaneLayout::Nv12, pts)).unwrap();
+        let after_first = p.uploaded_bytes();
+        assert!(after_first > 0, "the first frame must actually upload");
+
+        for _ in 0..10 {
+            p.submit(frame_at(None, PlaneLayout::Nv12, pts)).unwrap();
+        }
+        assert_eq!(p.uploaded_bytes(), after_first, "re-uploaded an unchanged frame");
+        assert_eq!(p.upload_count(), 1);
+        assert_eq!(p.skipped_uploads(), 10);
+
+        // ...but a NEW frame still uploads.
+        p.submit(frame_at(None, PlaneLayout::Nv12, Duration::from_millis(533)))
+            .unwrap();
+        assert!(p.uploaded_bytes() > after_first, "a new frame was skipped");
+    }
+
+    /// A skipped upload must still return the previous buffer, or the pool
+    /// bleeds out on any paused surface.
+    #[test]
+    fn a_skipped_upload_still_recycles() {
+        let ctx = ctx();
+        let mut p = EguiPresenter::new(&ctx);
+        let pts = Duration::from_millis(500);
+        p.submit(frame_at(Some(1), PlaneLayout::Nv12, pts)).unwrap();
+        let returned = p.submit(frame_at(Some(2), PlaneLayout::Nv12, pts)).unwrap();
+        assert_eq!(returned, Some(RecycleToken(1)), "skipped path leaked a buffer");
+        assert_eq!(p.skipped_uploads(), 1);
+    }
+
+    /// The measured cost of this path, so a change to it is visible rather
+    /// than argued about: RGBA8 is four bytes a pixel.
+    #[test]
+    fn uploaded_bytes_tracks_the_real_cost() {
+        let ctx = ctx();
+        let mut p = EguiPresenter::new(&ctx);
+        p.submit(frame(None, PlaneLayout::Nv12)).unwrap();
+        assert_eq!(p.uploaded_bytes(), 2 * 2 * 4);
     }
 
     #[test]

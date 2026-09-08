@@ -223,6 +223,22 @@ pub fn frame_to_rgba8(frame: &Frame) -> Result<Vec<u8>, ConvertError> {
     )
 }
 
+/// [`frame_to_rgba8`] into a caller-owned buffer.
+pub fn frame_to_rgba8_into(frame: &Frame, out: &mut Vec<u8>) -> Result<(), ConvertError> {
+    let planes = match &frame.data {
+        FrameData::Cpu(p) => p,
+        FrameData::DmaBuf(_) => return Err(ConvertError::NotCpuPlanes),
+    };
+    planes_to_rgba8_into(
+        planes,
+        frame.layout,
+        frame.color,
+        frame.width as usize,
+        frame.height as usize,
+        out,
+    )
+}
+
 /// The conversion proper, split out so tests can drive it without building a
 /// whole `Frame`.
 pub fn planes_to_rgba8(
@@ -232,6 +248,26 @@ pub fn planes_to_rgba8(
     width: usize,
     height: usize,
 ) -> Result<Vec<u8>, ConvertError> {
+    let mut out = Vec::new();
+    planes_to_rgba8_into(planes, layout, color, width, height, &mut out)?;
+    Ok(out)
+}
+
+/// The same conversion, writing into a caller-owned buffer.
+///
+/// A player converts a frame every 16 ms forever. Returning a fresh `Vec` each
+/// time means allocating and freeing 8 MB per frame at 1080p — 500 MB/s of
+/// allocator traffic that does no work, and on a phone that is heat. The buffer
+/// is resized once and reused after that; `out.capacity()` stops growing after
+/// the first frame, which is what `the_scratch_buffer_is_reused` asserts.
+pub fn planes_to_rgba8_into(
+    planes: &CpuPlanes,
+    layout: PlaneLayout,
+    color: ColorInfo,
+    width: usize,
+    height: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), ConvertError> {
     let want = layout.plane_count();
     if planes.data.len() < want {
         return Err(ConvertError::PlaneCount {
@@ -271,7 +307,8 @@ pub fn planes_to_rgba8(
     }) as usize;
     let c1_stride = planes.strides.get(2).copied().unwrap_or((cw * bps) as u32) as usize;
 
-    let mut out = vec![0u8; width * height * 4];
+    out.clear();
+    out.resize(width * height * 4, 0);
 
     for py in 0..height {
         for px in 0..width {
@@ -332,7 +369,7 @@ pub fn planes_to_rgba8(
             out[o + 3] = 255;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -423,6 +460,49 @@ mod tests {
             assert_eq!(out[0], out[1], "{matrix:?} tinted");
             assert_eq!(out[1], out[2], "{matrix:?} tinted");
         }
+    }
+
+    /// A player converts a frame every 16 ms forever, so the buffer must be
+    /// reused rather than reallocated. Capacity is the observable: it settles
+    /// after the first frame and never grows again.
+    #[test]
+    fn the_scratch_buffer_is_reused() {
+        let c = sdr709(Range::Limited);
+        let p = planes_nv12(126, 128, 128);
+        // Deliberately over-allocated. A 2x2 frame needs 16 bytes, and a
+        // reallocating implementation lands on capacity 16 too -- identical to
+        // a reusing one, so the check cannot bind. Starting large means reuse
+        // KEEPS the capacity and reallocation drops it.
+        let mut buf = Vec::with_capacity(4096);
+
+        planes_to_rgba8_into(&p, PlaneLayout::Nv12, c, 2, 2, &mut buf).unwrap();
+        let settled = buf.capacity();
+        assert!(
+            settled >= 4096,
+            "capacity fell to {settled}: the buffer was reallocated, not reused"
+        );
+
+        for _ in 0..50 {
+            planes_to_rgba8_into(&p, PlaneLayout::Nv12, c, 2, 2, &mut buf).unwrap();
+            assert_eq!(
+                buf.capacity(),
+                settled,
+                "the buffer reallocated: 50 frames means 50 allocations"
+            );
+        }
+        assert_eq!(buf.len(), 2 * 2 * 4, "output length is still correct");
+    }
+
+    /// The in-place form must produce exactly what the allocating one does,
+    /// or the fast path quietly renders something else.
+    #[test]
+    fn in_place_and_allocating_conversion_agree() {
+        let c = sdr709(Range::Limited);
+        let p = planes_nv12(120, 90, 200);
+        let owned = planes_to_rgba8(&p, PlaneLayout::Nv12, c, 2, 2).unwrap();
+        let mut buf = vec![0xAAu8; 999]; // deliberately dirty and wrong-sized
+        planes_to_rgba8_into(&p, PlaneLayout::Nv12, c, 2, 2, &mut buf).unwrap();
+        assert_eq!(owned, buf, "in-place output differs, or stale bytes survived");
     }
 
     #[test]
