@@ -1091,8 +1091,14 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     // refused when the source was missing; nothing noticed when one appeared by
     // deletion instead. `every_store_entry_resolves_to_a_real_directory` is now
     // the thing that notices.
+    // vidkit-player: a plain package at apps/vidkit-player, so `resolve_app_dir`
+    // finds it from the bare name. Registering it in manifest/projects.toml is
+    // NOT enough to reach this list -- the manifest feeds the catalogue parser
+    // and build/build.sh, while THIS is what the fleet store offers -- which is
+    // why it was buildable from the command line and invisible in the GUI. See
+    // `every_registered_app_is_offered_in_the_store`.
     let media = ["av1tuner", "snapclone", "paperbound", "snapshot-cam",
-                 "photosync"];
+                 "photosync", "vidkit-player"];
     // beatspace is a CUSTOM entry below (it needs run_flags), so it is not in
     // this simple list — being in both would put it in the group twice.
     let music = ["krapper", "bo-suite", "fao-codec"];
@@ -2105,6 +2111,79 @@ mod launch_consistency_tests {
     /// device it is installed to, so this is a hard failure rather than a
     /// warning.
     #[test]
+    /// The mirror of the phantom-entry check: an app registered in the
+    /// manifest must actually be OFFERED by the fleet store.
+    ///
+    /// `every_store_entry_resolves_to_a_real_directory` catches a store entry
+    /// with no directory. This catches the opposite and equally silent case: a
+    /// real, registered, buildable app that the GUI never lists, because
+    /// `store_groups()` is hand-maintained and nothing tied it to the manifest.
+    /// `vidkit-player` was in exactly that state -- registered, `role = "app"`,
+    /// buildable from `build/build.sh`, and absent from the store, so it was
+    /// invisible in gitmind-egui. Registering an app is two edits, and nothing
+    /// said so.
+    ///
+    /// "Offered" means reachable, not necessarily named: nine of the
+    /// `*-egui` ports are reached through their PARENT, which `fleet.rs`
+    /// discovers by prefix-matching the manifest path. So a port under an
+    /// offered app counts, and only a top-level app with no offered ancestor
+    /// is a real gap.
+    #[test]
+    fn every_registered_app_is_offered_in_the_store() {
+        let root = crate::ops::repo_root();
+        let text = match std::fs::read_to_string(root.join("manifest/projects.toml")) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let entries = crate::appcatalog::parse_manifest(&text);
+        let registered: Vec<_> = entries
+            .iter()
+            .filter(|e| e.role == "app" && e.primary)
+            .collect();
+        // A filter that matched nothing passes everything below it.
+        assert!(
+            registered.len() >= 10,
+            "only {} registered primary apps: the manifest or parser changed shape",
+            registered.len()
+        );
+
+        // Every path the store can reach, repo-relative.
+        let mut offered: Vec<String> = Vec::new();
+        for g in store_groups() {
+            for a in &g.apps {
+                let dir = crate::ops::resolve_app_dir(&a.path);
+                if let Ok(rel) = dir.strip_prefix(&root) {
+                    offered.push(rel.display().to_string());
+                }
+            }
+        }
+        assert!(!offered.is_empty(), "the store resolved no paths at all");
+
+        let mut unreachable = Vec::new();
+        for e in &registered {
+            // Either direction counts. A port sits UNDER its parent
+            // (apps/voiceterm/egui-frontend under apps/voiceterm), but a
+            // custom store entry names the runnable crate INSIDE a workspace
+            // (apps/cadscope/crates/cadscope-egui for a manifest entry at
+            // apps/cadscope). Both are reachable from the store; only an app
+            // with no relationship to any offered path is a gap.
+            let reachable = offered.iter().any(|o| {
+                e.path == *o
+                    || e.path.starts_with(&format!("{o}/"))
+                    || o.starts_with(&format!("{}/", e.path))
+            });
+            if !reachable {
+                unreachable.push(format!("{} ({})", e.app_id, e.path));
+            }
+        }
+        assert!(
+            unreachable.is_empty(),
+            "registered apps the fleet store never offers -- add them to \
+             store_groups(), registering in the manifest is not enough:\n  {}",
+            unreachable.join("\n  ")
+        );
+    }
+
     fn every_store_entry_resolves_to_a_real_directory() {
         let groups = store_groups();
         // A list that came back empty would pass every assertion below it.
