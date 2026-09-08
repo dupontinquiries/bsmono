@@ -258,3 +258,92 @@ fn chroma_upsampling_agrees_across_an_edge() {
         }
     }
 }
+
+
+/// 10-bit, both layouts, against the GPU.
+///
+/// The CPU side gained P010 and I420_10LE handling; the shader has always taken
+/// 10-bit planes as R16/R16G16. If the two disagree on where the significant
+/// bits live, one of them renders a sixteenth as bright and the parity check is
+/// the only thing that notices — the pictures are individually plausible.
+#[test]
+fn ten_bit_agrees_between_cpu_and_gpu() {
+    let h = device!();
+    let color = ColorInfo {
+        matrix: Matrix::Bt2020Ncl,
+        transfer: Transfer::Sdr,
+        range: Range::Limited,
+    };
+
+    let mut checked = 0;
+    for (y, cb, cr) in [
+        (64u16, 512u16, 512u16),   // black
+        (940, 512, 512),           // white
+        (500, 512, 512),           // mid grey
+        (400, 300, 800),           // arbitrary chroma
+    ] {
+        // The GPU takes P010: 10 bits in the high bits of each 16-bit sample,
+        // which R16_UNORM reads back pre-scaled.
+        let hi = |v: u16| -> [u8; 2] {
+            let s = v << 6;
+            [(s & 0xFF) as u8, (s >> 8) as u8]
+        };
+        let mut luma = Vec::new();
+        for _ in 0..4 {
+            luma.extend_from_slice(&hi(y));
+        }
+        let mut chroma = Vec::new();
+        chroma.extend_from_slice(&hi(cb));
+        chroma.extend_from_slice(&hi(cr));
+
+        let gpu = h
+            .run_convert(
+                Params {
+                    width: 2,
+                    height: 2,
+                    plane_count: 2,
+                    matrix_id: 2,
+                    ..Default::default()
+                },
+                &[
+                    PlaneData {
+                        width: 2,
+                        height: 2,
+                        format: ash::vk::Format::R16_UNORM,
+                        bytes: luma.clone(),
+                    },
+                    PlaneData {
+                        width: 1,
+                        height: 1,
+                        format: ash::vk::Format::R16G16_UNORM,
+                        bytes: chroma.clone(),
+                    },
+                ],
+            )
+            .expect("gpu convert");
+
+        let cpu = vidkit_core::planes_to_rgba8(
+            &CpuPlanes {
+                data: vec![luma, chroma],
+                strides: vec![4, 4],
+            },
+            PlaneLayout::P010,
+            color,
+            2,
+            2,
+        )
+        .expect("cpu convert");
+
+        for c in 0..3 {
+            let g = (gpu[0][c].clamp(0.0, 1.0) * 255.0 + 0.5) as i32;
+            let p = cpu[c] as i32;
+            assert!(
+                (g - p).abs() <= TOL,
+                "10-bit ({y},{cb},{cr}) channel {c}: gpu {g}, cpu {p} — the two \
+                 implementations disagree about where the significant bits are"
+            );
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 4, "the sweep did not run");
+}

@@ -9,3 +9,6 @@ license.workspace = true
 vidkit-core = { path = "../vidkit-core" }
 ash = "=0.37.3"
 naga = { version = "=0.19.2", features = ["wgsl-in", "spv-out"] }
+
+[dev-dependencies]
+ash = "=0.37.3"

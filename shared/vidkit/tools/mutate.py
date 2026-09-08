@@ -195,6 +195,19 @@ MUTANTS = [
     ("mp4/box-past-limit-allowed", "crates/vidkit-mp4/src/boxes.rs",
      "    if end > limit {", "    if false {"),
 
+    # --- 10-bit sample handling ---------------------------------------------
+    ("depth/p010-read-as-low-bits", "crates/vidkit-core/src/convert_cpu.rs",
+     "        PlaneLayout::P010 => SampleFormat::U16HighBits,",
+     "        PlaneLayout::P010 => SampleFormat::U16LowBits10,"),
+    ("depth/i420-10le-read-as-high-bits", "crates/vidkit-core/src/convert_cpu.rs",
+     "        PlaneLayout::I420_10le => SampleFormat::U16LowBits10,",
+     "        PlaneLayout::I420_10le => SampleFormat::U16HighBits,"),
+    ("depth/padding-bits-not-masked", "crates/vidkit-core/src/convert_cpu.rs",
+     "((lo | (hi << 8)) & 0x03FF) as f32 / 1023.0", "(lo | (hi << 8)) as f32 / 1023.0"),
+    ("depth/sample-size-ignored-in-index", "crates/vidkit-core/src/convert_cpu.rs",
+     "let ix = yi * stride + (xi * comps + comp) * fmt.bytes();",
+     "let ix = yi * stride + (xi * comps + comp);"),
+
     # --- http byte source ---------------------------------------------------
     ("http/range-header-off-by-one", "crates/vidkit-ytdlp/src/http.rs",
      'format!("bytes={}-{}", self.start, self.end)',

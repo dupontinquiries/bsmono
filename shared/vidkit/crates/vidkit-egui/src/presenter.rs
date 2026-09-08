@@ -236,8 +236,15 @@ mod tests {
         let mut p = EguiPresenter::new(&ctx);
         p.submit(frame(Some(1), PlaneLayout::Nv12)).unwrap();
 
-        // P010 is 10-bit; the CPU converter refuses it rather than misreading.
-        let returned = p.submit(frame(Some(2), PlaneLayout::P010)).unwrap();
+        // A frame whose plane list is short for its layout. This used to be a
+        // P010 frame, on the grounds that the converter refused 10-bit -- it
+        // now handles it, so that stopped being an unconvertible case and the
+        // test was asserting against a frame that converts fine.
+        let mut broken = frame(Some(2), PlaneLayout::I420);
+        if let FrameData::Cpu(planes) = &mut broken.data {
+            planes.data.truncate(1);
+        }
+        let returned = p.submit(broken).unwrap();
         assert_eq!(returned, Some(RecycleToken(1)), "buffer must still return");
         assert_eq!(p.take_drop_count(), 1);
         assert_eq!(p.take_drop_count(), 0, "drop count must reset when read");

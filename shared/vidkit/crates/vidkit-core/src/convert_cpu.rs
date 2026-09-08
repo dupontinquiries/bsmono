@@ -88,7 +88,61 @@ pub const REFERENCE_WHITE_NITS: f32 = 203.0;
 /// free. Doing nearest-neighbour here instead would be cheaper and would
 /// disagree with the shader on every chroma edge, which is exactly the drift
 /// the parity test is looking for.
-fn sample_bilinear(data: &[u8], stride: usize, w: usize, h: usize, comps: usize, comp: usize, u: f32, v: f32) -> f32 {
+/// How a plane's samples are stored.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum SampleFormat {
+    /// One byte per sample.
+    U8,
+    /// Two bytes little-endian, 10 significant bits in the HIGH bits — P010's
+    /// layout. The value is already left-shifted, so dividing by 65535 gives
+    /// the right normalised result with no correction.
+    U16HighBits,
+    /// Two bytes little-endian, 10 significant bits in the LOW bits —
+    /// I420_10LE. Dividing by 65535 here would render the picture at about a
+    /// sixteenth brightness, which reads as "the decoder is broken" rather
+    /// than as a scaling bug. Divide by 1023.
+    U16LowBits10,
+}
+
+impl SampleFormat {
+    pub fn bytes(self) -> usize {
+        match self {
+            SampleFormat::U8 => 1,
+            _ => 2,
+        }
+    }
+
+    fn read(self, data: &[u8], byte_index: usize) -> f32 {
+        match self {
+            SampleFormat::U8 => data.get(byte_index).copied().unwrap_or(0) as f32 / 255.0,
+            SampleFormat::U16HighBits => {
+                let lo = data.get(byte_index).copied().unwrap_or(0) as u16;
+                let hi = data.get(byte_index + 1).copied().unwrap_or(0) as u16;
+                (lo | (hi << 8)) as f32 / 65535.0
+            }
+            SampleFormat::U16LowBits10 => {
+                let lo = data.get(byte_index).copied().unwrap_or(0) as u16;
+                let hi = data.get(byte_index + 1).copied().unwrap_or(0) as u16;
+                // Mask: the top six bits are undefined padding in this layout,
+                // and a decoder that leaves them set would otherwise blow the
+                // value past 1.0 and clip every highlight.
+                ((lo | (hi << 8)) & 0x03FF) as f32 / 1023.0
+            }
+        }
+    }
+}
+
+fn sample_bilinear(
+    data: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    comps: usize,
+    comp: usize,
+    fmt: SampleFormat,
+    u: f32,
+    v: f32,
+) -> f32 {
     if w == 0 || h == 0 {
         return 0.0;
     }
@@ -107,8 +161,8 @@ fn sample_bilinear(data: &[u8], stride: usize, w: usize, h: usize, comps: usize,
     let y1i = clampi(y0 + 1.0, h);
 
     let at = |xi: usize, yi: usize| -> f32 {
-        let ix = yi * stride + xi * comps + comp;
-        data.get(ix).copied().unwrap_or(0) as f32 / 255.0
+        let ix = yi * stride + (xi * comps + comp) * fmt.bytes();
+        fmt.read(data, ix)
     };
 
     let top = at(x0i, y0i) * (1.0 - fx) + at(x1i, y0i) * fx;
@@ -178,9 +232,6 @@ pub fn planes_to_rgba8(
     width: usize,
     height: usize,
 ) -> Result<Vec<u8>, ConvertError> {
-    if matches!(layout, PlaneLayout::P010 | PlaneLayout::I420_10le) {
-        return Err(ConvertError::UnsupportedDepth(layout));
-    }
     let want = layout.plane_count();
     if planes.data.len() < want {
         return Err(ConvertError::PlaneCount {
@@ -189,18 +240,36 @@ pub fn planes_to_rgba8(
         });
     }
 
+    // The bit-depth gotcha, in one place: P010 puts its 10 bits in the HIGH
+    // bits of each 16-bit sample and I420_10LE in the LOW bits. Reading either
+    // with the other's scale is a picture that is uniformly too dark or
+    // blindingly clipped, and it looks like a decoder fault rather than a
+    // scaling one.
+    let fmt = match layout {
+        PlaneLayout::Nv12 | PlaneLayout::I420 => SampleFormat::U8,
+        PlaneLayout::P010 => SampleFormat::U16HighBits,
+        PlaneLayout::I420_10le => SampleFormat::U16LowBits10,
+    };
+
     let (cw, ch) = chroma_dims(layout, width, height);
     let coeffs = matrix_coeffs(color.matrix);
     let interleaved_chroma = matches!(layout, PlaneLayout::Nv12 | PlaneLayout::P010);
 
-    let y_stride = planes.strides.first().copied().unwrap_or(width as u32) as usize;
-    let c0_stride = planes
+    // Strides are in BYTES, so the fallbacks scale with the sample size. A
+    // 10-bit plane whose stride is guessed as its pixel width is read at half
+    // scale and skews every row after the first.
+    let bps = fmt.bytes();
+    let y_stride = planes
         .strides
-        .get(1)
+        .first()
         .copied()
-        .unwrap_or(if interleaved_chroma { cw as u32 * 2 } else { cw as u32 })
-        as usize;
-    let c1_stride = planes.strides.get(2).copied().unwrap_or(cw as u32) as usize;
+        .unwrap_or((width * bps) as u32) as usize;
+    let c0_stride = planes.strides.get(1).copied().unwrap_or(if interleaved_chroma {
+        (cw * 2 * bps) as u32
+    } else {
+        (cw * bps) as u32
+    }) as usize;
+    let c1_stride = planes.strides.get(2).copied().unwrap_or((cw * bps) as u32) as usize;
 
     let mut out = vec![0u8; width * height * 4];
 
@@ -211,16 +280,16 @@ pub fn planes_to_rgba8(
             let u = (px as f32 + 0.5) / width as f32;
             let v = (py as f32 + 0.5) / height as f32;
 
-            let y_raw = sample_bilinear(&planes.data[0], y_stride, width, height, 1, 0, u, v);
+            let y_raw = sample_bilinear(&planes.data[0], y_stride, width, height, 1, 0, fmt, u, v);
             let (cb_raw, cr_raw) = if interleaved_chroma {
                 (
-                    sample_bilinear(&planes.data[1], c0_stride, cw, ch, 2, 0, u, v),
-                    sample_bilinear(&planes.data[1], c0_stride, cw, ch, 2, 1, u, v),
+                    sample_bilinear(&planes.data[1], c0_stride, cw, ch, 2, 0, fmt, u, v),
+                    sample_bilinear(&planes.data[1], c0_stride, cw, ch, 2, 1, fmt, u, v),
                 )
             } else {
                 (
-                    sample_bilinear(&planes.data[1], c0_stride, cw, ch, 1, 0, u, v),
-                    sample_bilinear(&planes.data[2], c1_stride, cw, ch, 1, 0, u, v),
+                    sample_bilinear(&planes.data[1], c0_stride, cw, ch, 1, 0, fmt, u, v),
+                    sample_bilinear(&planes.data[2], c1_stride, cw, ch, 1, 0, fmt, u, v),
                 )
             };
 
@@ -365,13 +434,119 @@ mod tests {
         }
     }
 
+    /// A 10-bit sample written into a P010 plane: value in the HIGH bits.
+    fn p010_planes(y: u16, cb: u16, cr: u16) -> CpuPlanes {
+        let hi = |v: u16| -> [u8; 2] {
+            let shifted = v << 6; // 10 bits into the top of 16
+            [(shifted & 0xFF) as u8, (shifted >> 8) as u8]
+        };
+        let mut luma = Vec::new();
+        for _ in 0..4 {
+            luma.extend_from_slice(&hi(y));
+        }
+        let mut chroma = Vec::new();
+        chroma.extend_from_slice(&hi(cb));
+        chroma.extend_from_slice(&hi(cr));
+        CpuPlanes {
+            data: vec![luma, chroma],
+            strides: vec![4, 4],
+        }
+    }
+
+    /// The same values in I420_10LE: value in the LOW bits, three planes.
+    fn i420_10_planes(y: u16, cb: u16, cr: u16) -> CpuPlanes {
+        let lo = |v: u16| -> [u8; 2] { [(v & 0xFF) as u8, (v >> 8) as u8] };
+        let mut luma = Vec::new();
+        for _ in 0..4 {
+            luma.extend_from_slice(&lo(y));
+        }
+        CpuPlanes {
+            data: vec![luma, lo(cb).to_vec(), lo(cr).to_vec()],
+            strides: vec![4, 2, 2],
+        }
+    }
+
+    /// 10-bit limited range: black is 64, white is 940 (16 and 235 scaled by 4).
     #[test]
-    fn ten_bit_layouts_are_refused_rather_than_misread() {
-        let p = planes_nv12(126, 128, 128);
-        assert!(matches!(
-            planes_to_rgba8(&p, PlaneLayout::P010, sdr709(Range::Limited), 2, 2),
-            Err(ConvertError::UnsupportedDepth(_))
-        ));
+    fn p010_black_and_white_land_on_zero_and_one() {
+        let c = sdr709(Range::Limited);
+        let black = planes_to_rgba8(&p010_planes(64, 512, 512), PlaneLayout::P010, c, 2, 2).unwrap();
+        assert_eq!(&black[0..3], &[0, 0, 0], "10-bit black is not black");
+        let white =
+            planes_to_rgba8(&p010_planes(940, 512, 512), PlaneLayout::P010, c, 2, 2).unwrap();
+        assert!(
+            white[0] > 252 && white[1] > 252 && white[2] > 252,
+            "10-bit white came out {:?}",
+            &white[0..3]
+        );
+    }
+
+    /// The gotcha this whole SampleFormat split exists for: the same 10-bit
+    /// values stored in the two layouts must produce the SAME picture.
+    ///
+    /// Reading I420_10LE with P010's scale renders it at about a sixteenth
+    /// brightness -- a near-black frame that looks like a broken decoder rather
+    /// than a scaling bug.
+    #[test]
+    fn p010_and_i420_10le_agree_on_the_same_values() {
+        let c = sdr709(Range::Limited);
+        for (y, cb, cr) in [(64u16, 512u16, 512u16), (940, 512, 512), (500, 400, 700)] {
+            let a =
+                planes_to_rgba8(&p010_planes(y, cb, cr), PlaneLayout::P010, c, 2, 2).unwrap();
+            let b = planes_to_rgba8(
+                &i420_10_planes(y, cb, cr),
+                PlaneLayout::I420_10le,
+                c,
+                2,
+                2,
+            )
+            .unwrap();
+            for i in 0..3 {
+                assert!(
+                    (a[i] as i32 - b[i] as i32).abs() <= 1,
+                    "layouts disagree at ({y},{cb},{cr}) channel {i}: P010 {} vs I420_10LE {}",
+                    a[i],
+                    b[i]
+                );
+            }
+        }
+    }
+
+    /// 10-bit and 8-bit must agree on the same colour, or a stream that
+    /// switches representation shifts hue mid-playback.
+    #[test]
+    fn ten_bit_matches_eight_bit_for_the_same_colour() {
+        let c = sdr709(Range::Limited);
+        let eight = convert(&planes_nv12(126, 128, 128), PlaneLayout::Nv12, c);
+        let ten =
+            planes_to_rgba8(&p010_planes(126 * 4, 128 * 4, 128 * 4), PlaneLayout::P010, c, 2, 2)
+                .unwrap();
+        for i in 0..3 {
+            assert!(
+                (eight[i] as i32 - ten[i] as i32).abs() <= 2,
+                "8-bit {} vs 10-bit {} on channel {i}",
+                eight[i],
+                ten[i]
+            );
+        }
+    }
+
+    /// I420_10LE's top six bits are undefined padding. A decoder that leaves
+    /// them set must not blow the value past 1.0 and clip every highlight.
+    #[test]
+    fn undefined_high_bits_in_i420_10le_are_masked_off() {
+        let c = sdr709(Range::Limited);
+        let clean = planes_to_rgba8(&i420_10_planes(500, 512, 512), PlaneLayout::I420_10le, c, 2, 2)
+            .unwrap();
+        let dirty = planes_to_rgba8(
+            &i420_10_planes(500 | 0xFC00, 512 | 0xFC00, 512 | 0xFC00),
+            PlaneLayout::I420_10le,
+            c,
+            2,
+            2,
+        )
+        .unwrap();
+        assert_eq!(&clean[0..3], &dirty[0..3], "padding bits reached the picture");
     }
 
     #[test]
