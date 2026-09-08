@@ -502,13 +502,23 @@ impl Player {
         match c {
             C::OpenFile => self.open_picker(),
             C::PlayPause => self.transport.playing = !self.transport.playing,
-            C::Rotate => {
-                self.transport.rotation = vidkit_egui::apply_rotation(self.transport.rotation, 1)
+            // Through `settings`, not straight onto the transport: two places
+            // holding rotation means the popup shows one value and the picture
+            // another.
+            C::Rotate => self.settings.rotation = (self.settings.rotation + 1).rem_euclid(4),
+            C::CycleFit => {
+                self.settings.fill = vidkit_egui::FillMode::from_fit(next_fit(self.view.fit))
             }
-            C::CycleFit => self.view.fit = next_fit(self.view.fit),
             C::ResetView => {
                 self.transport.zoom = 1.0;
-                self.transport.rotation = 0;
+                self.settings.rotation = 0;
+            }
+            C::Settings => self.settings_open = true,
+            // Unimplemented rows say so rather than doing nothing: an entry
+            // that appears to work and does not is worse than one that admits
+            // it is unfinished.
+            C::Subtitles | C::ScrubToSections | C::PlayClipboard => {
+                self.gpu_error = Some(format!("{:?} is not wired up yet", c));
             }
             // The same 5% steps the gestures and the bar use, so the three
             // controls cannot land on different values.

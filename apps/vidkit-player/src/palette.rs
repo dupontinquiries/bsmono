@@ -28,6 +28,10 @@ pub enum Command {
     SpeedDown,
     VolumeUp,
     VolumeDown,
+    Settings,
+    Subtitles,
+    ScrubToSections,
+    PlayClipboard,
     Quit,
 }
 
@@ -46,6 +50,10 @@ impl Command {
         Command::SpeedDown,
         Command::VolumeUp,
         Command::VolumeDown,
+        Command::Settings,
+        Command::Subtitles,
+        Command::ScrubToSections,
+        Command::PlayClipboard,
         Command::Quit,
     ];
 
@@ -60,6 +68,10 @@ impl Command {
             Command::SpeedDown => "Speed −5%",
             Command::VolumeUp => "Volume +5%",
             Command::VolumeDown => "Volume −5%",
+            Command::Settings => "Settings…",
+            Command::Subtitles => "Subtitles",
+            Command::ScrubToSections => "Scrub to sections…",
+            Command::PlayClipboard => "Play from clipboard",
             Command::Quit => "Quit",
         }
     }
@@ -69,6 +81,7 @@ impl Command {
         match self {
             Command::OpenFile => Some("Ctrl+O"),
             Command::PlayPause => Some("Space"),
+            Command::Settings => Some("Ctrl+,"),
             Command::Quit => Some("Ctrl+Q"),
             _ => None,
         }
@@ -84,12 +97,16 @@ impl Command {
             Command::OpenFile => "load browse choose path",
             Command::PlayPause => "pause resume stop toggle",
             Command::Rotate => "turn orientation portrait landscape",
-            Command::CycleFit => "zoom scale fill contain stretch letterbox",
+            Command::CycleFit => "zoom scale fill contain stretch letterbox bleed",
             Command::ResetView => "restore default original",
             Command::SpeedUp => "faster rate tempo",
             Command::SpeedDown => "slower rate tempo",
             Command::VolumeUp => "louder audio sound",
             Command::VolumeDown => "quieter audio sound mute",
+            Command::Settings => "options preferences config gestures sensitivity power",
+            Command::Subtitles => "captions cc transcribe transcript",
+            Command::ScrubToSections => "find search skip prompt relevant jump",
+            Command::PlayClipboard => "paste url link youtube open video",
             Command::Quit => "exit close",
         }
     }
@@ -327,5 +344,87 @@ mod tests {
             assert!(!c.aliases().is_empty(), "{c:?} has no aliases");
         }
         assert!(Command::ALL.len() >= 8, "the command set shrank unexpectedly");
+    }
+}
+
+
+/// The shared action a command stands for.
+///
+/// The palette keeps its own enum because it owns row labels, shortcuts and
+/// aliases, which are presentation. What it must NOT own is the set of things
+/// that can happen -- that lives in `vidkit_egui::Action`, which the voice
+/// router also targets. Two lists of capabilities drift, and a command added
+/// to one and forgotten in the other is invisible until somebody reaches for
+/// it and nothing happens.
+impl Command {
+    pub fn action(self) -> vidkit_egui::Action {
+        use vidkit_egui::Action as A;
+        match self {
+            Command::OpenFile => A::OpenFile,
+            Command::PlayPause => A::TogglePlay,
+            Command::Rotate => A::Rotate,
+            Command::CycleFit => A::CycleFit,
+            Command::ResetView => A::ResetView,
+            // The bar and the gestures move in 5% steps; the palette says so
+            // on the row and must move by the same amount.
+            Command::SpeedUp => A::SetSpeed(f64::NAN),
+            Command::SpeedDown => A::SetSpeed(f64::NAN),
+            Command::VolumeUp => A::SetVolume(f32::NAN),
+            Command::VolumeDown => A::SetVolume(f32::NAN),
+            Command::Settings => A::OpenSettings,
+            Command::Subtitles => A::ToggleSubtitles,
+            Command::ScrubToSections => A::ScrubToSections,
+            Command::PlayClipboard => A::PlayClipboard,
+            Command::Quit => A::Quit,
+        }
+    }
+}
+
+#[cfg(test)]
+mod action_bridge_tests {
+    use super::*;
+
+    /// Every palette row maps to a shared action, so nothing in the palette is
+    /// a capability the rest of the app has never heard of.
+    #[test]
+    fn every_command_maps_to_an_action() {
+        for c in Command::ALL {
+            let _ = c.action();
+        }
+    }
+
+    /// And every shared action a video player can perform is reachable from
+    /// the palette -- this is the direction that rots, because a new Action
+    /// arrives in the kit and nothing here fails.
+    #[test]
+    fn every_shared_action_has_a_palette_row() {
+        use vidkit_egui::Action as A;
+        let rows: Vec<A> = Command::ALL.iter().map(|c| c.action()).collect();
+        let has = |a: &A| rows.iter().any(|r| std::mem::discriminant(r) == std::mem::discriminant(a));
+        for a in [
+            A::TogglePlay, A::Rotate, A::CycleFit, A::ResetView, A::OpenFile,
+            A::SetSpeed(1.0), A::SetVolume(1.0), A::OpenSettings,
+            A::ToggleSubtitles, A::ScrubToSections, A::PlayClipboard, A::Quit,
+        ] {
+            assert!(has(&a), "{a:?} has no palette row");
+        }
+    }
+
+    /// The new rows need aliases, or they are only findable by their exact
+    /// wording -- which is the thing `aliases()` exists to prevent.
+    #[test]
+    fn the_new_commands_are_findable_by_other_words() {
+        for (query, want) in [
+            ("options", Command::Settings),
+            ("captions", Command::Subtitles),
+            ("paste", Command::PlayClipboard),
+            ("find", Command::ScrubToSections),
+        ] {
+            let ranked = rank(query);
+            assert!(
+                ranked.contains(&want),
+                "{query:?} did not find {want:?}: {ranked:?}"
+            );
+        }
     }
 }

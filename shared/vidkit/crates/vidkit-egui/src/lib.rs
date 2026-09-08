@@ -43,7 +43,7 @@ pub use gestures::{
 };
 pub use bar::{bottom_bar, fit_label, next_fit, BarAction};
 pub use settings::{FillMode, Settings};
-pub use palette::{available, commands, search, Action, ClipboardState, Command, Hit, MatchKind};
+pub use palette::{available, commands, icon_for, Action, ClipboardState, Command};
 pub use chrome::{Chrome, ChromePolicy};
 pub use fit::{fit_rect, surface_to_frame, Fit, PixelAspect};
 pub use presenter::EguiPresenter;
