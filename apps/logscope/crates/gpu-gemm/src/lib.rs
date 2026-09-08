@@ -167,6 +167,9 @@ pub mod wgsl_validate; // in-process WGSL fitness gate (naga parse + validate)
 #[allow(dead_code)] pub mod llada2;
 #[allow(dead_code)] pub mod quant_mix;
 #[allow(dead_code)] pub mod archcfg; // scratchwork: multi-architecture config registry (qwen2/gemma2…)
+/// Which checkpoint will actually run on this machine — weights, KV cache and headroom,
+/// filtered through `archcfg` so nothing is offered for an arch the loader refuses.
+pub mod modelpick;
 #[allow(dead_code)] pub mod moe;     // mixture-of-experts routing (Qwen4/Llama4 decode): top-k + weights
 #[allow(dead_code)] pub mod mla;     // Multi-head Latent Attention (DeepSeek/GLM) compressed-KV — CPU reference
 #[allow(dead_code)] pub mod dsa;     // DeepSeek Sparse Attention lightning indexer — CPU reference
