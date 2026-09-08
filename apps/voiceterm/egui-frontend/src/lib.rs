@@ -391,6 +391,8 @@ pub mod count_prefix;
 pub mod note_clip;
 /// Clipped notes on disk, as the markdown they already render to.
 pub mod note_store;
+/// Jot mode: dictation into the note instead of the command parser.
+pub mod jot;
 /// Is a clipped selection code or prose, and in what language? (`TODO_notes_clip.md`.)
 pub mod clip_kind;
 /// Who owns the keyboard when a terminal is on screen (Tab, the arrows, and the sidebar).

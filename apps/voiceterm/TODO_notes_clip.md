@@ -156,3 +156,42 @@ view keyed by name. Titles come from the note's own first heading — the file n
 and showing "build-notes" when the note says "Build notes" is a worse label than the one it
 carries. A note that cannot be read is skipped rather than listed as an entry that fails when
 opened.
+
+
+## DONE — step 2, voice jot mode (2026-09-07)
+
+"Route transcription straight into the active Note as `Block::Prose` (append), instead of
+through the command intent parser… this just changes the SINK." So the whole feature is a
+decision about where a transcript goes, and `jot::route` is that decision — nothing in it
+speaks, listens or writes a file.
+
+THE EXIT PHRASE IS THE HARD PART. A person finishing a thought says "…and that fixed it,
+done jotting" in one breath. If the phrase only counted as a whole utterance, that transcript
+would be filed as prose ending in "done jotting" and the mode would stay on — so the NEXT
+sentence, meant as a command, gets filed too. Handling it only at the end of an utterance is
+the difference between a mode you can leave and one you have to remember to leave twice.
+
+So the phrase is matched at the END: the text before it is kept, the mode ends, and an
+utterance that is only the phrase files nothing. NOT in the middle — "I was done jotting
+notes about the parser" is prose about jotting, and ending from mid-sentence would truncate
+the note at a word the speaker used as content.
+
+Several phrasings, because a speaker does not remember one exact form and a mode that will
+not exit on "stop jotting" is one you have to kill the app to leave. Punctuation-insensitive,
+because whisper punctuates and a mode that stayed on because the transcriber added a full
+stop would be maddening in a way nobody would think to report.
+
+The kept prose comes from the ORIGINAL text, so capitals, punctuation and accents survive and
+nothing is cut mid-codepoint; `normalise` is for matching only.
+
+Wired at the spoken-phrase box, ahead of `voice_prefix::normalise` — jot mode takes the
+transcript before the command parser sees it, which is the sink change the doc describes.
+Jotted prose is saved with the same path rule as a clip: the note grows and rewrites its own
+file, because a jotted thought lost to a window close is the same failure a clip would be.
+
+`Command::ToggleJotMode` enters it. A mode you could only ENTER by voice is unreachable the
+moment the microphone mishears its own trigger. Both edges are announced: a mode that
+silently swallows your next sentence into a note is worse than one that never existed.
+
+Not yet covered: the other surfaces a transcript can arrive at. This build routes one — the
+spoken-phrase box — and the rest still go to the command parser.

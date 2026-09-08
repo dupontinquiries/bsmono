@@ -103,6 +103,12 @@ pub enum Command {
     /// data model has been pure and tested since v0.1.641 with no caller
     /// anywhere in this frontend before this command existed.
     ClipSelection,
+    /// Toggle jot mode: spoken text goes into the note as prose instead of to the command
+    /// parser, until one of `jot::EXIT_PHRASES` is said. `TODO_notes_clip.md` step 2.
+    ///
+    /// A command rather than only a spoken phrase, because a mode you can only ENTER by
+    /// voice is unreachable the moment the microphone mishears its own trigger.
+    ToggleJotMode,
     /// Share the zettelkasten as a huge QR code — the picker with the
     /// paintbrush, two confirmation gates, then the code (`zk_share`).
     /// Reachable from the notes panes' palette like everything else here.

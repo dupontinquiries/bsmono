@@ -797,6 +797,9 @@ struct VoicetermApp {
     /// Where this session's note was first written, so later clips rewrite it rather than
     /// creating a new file each time.
     clip_note_path: Option<std::path::PathBuf>,
+    /// Jot mode: spoken text goes into the note rather than to the command parser. Ended by
+    /// saying one of `jot::EXIT_PHRASES`.
+    jotting: bool,
     /// Whether the one-time narrow-surface default has been applied. Applied
     /// once rather than every frame, so collapsing is a starting position the
     /// user can override, not a cage that re-shuts whatever they open.
@@ -1079,6 +1082,17 @@ impl VoicetermApp {
             Command::ShareNotesQr => {
                 let share = voiceterm_egui::zk_share::Share::from_cards(&self.deck.cards);
                 self.zk_share = Some(ZkShareUi { share, dialog: None, frames: Vec::new(), shown: None, note: String::new() });
+            }
+            Command::ToggleJotMode => {
+                self.jotting = !self.jotting;
+                // Said out loud both ways. A mode that silently swallows your next sentence
+                // into a note is worse than one that never existed, and the exit phrase is
+                // no use to someone who does not know they are in it.
+                if self.jotting {
+                    self.toasts.info("jotting — say \"done jotting\" to stop", 0.0);
+                } else {
+                    self.toasts.info("done jotting", 0.0);
+                }
             }
             Command::ClipSelection => {
                 let content = self.app.selection.take().map(|s| s.text);
@@ -2142,6 +2156,37 @@ impl eframe::App for VoicetermApp {
                     // "the file you saved" contains "you" as content), while
                     // this strips politeness bounded against a transcript of
                     // nothing but "please please please".
+                    // JOT MODE takes the transcript before the command parser sees it —
+                    // that is the whole feature: "route transcription straight into the
+                    // active Note as Block::Prose, instead of through the command intent
+                    // parser… this just changes the SINK".
+                    if self.jotting {
+                        use voiceterm_egui::jot::Jotted;
+                        let said = std::mem::take(&mut self.editor_phrase);
+                        let (prose, exit) = match voiceterm_egui::jot::route(&said) {
+                            Jotted::Append(t) => (Some(t), false),
+                            Jotted::AppendAndExit(t) => (t, true),
+                        };
+                        if let Some(t) = prose {
+                            self.clip_note.push_prose(&t);
+                            // Saved with the same path rule as a clip: the note grows and
+                            // rewrites its own file. A jotted thought lost to a window
+                            // close is the same failure a clip would be.
+                            let saved = match &self.clip_note_path {
+                                Some(p) => voiceterm_egui::note_store::save_to(p, &self.clip_note),
+                                None => voiceterm_egui::note_store::save(&self.clip_note)
+                                    .map(|p| self.clip_note_path = Some(p)),
+                            };
+                            if let Err(e) = saved {
+                                self.toasts.warning(&format!("jotted, but not saved: {e}"), 0.0);
+                            }
+                        }
+                        if exit {
+                            self.jotting = false;
+                            self.toasts.info("done jotting", 0.0);
+                        }
+                        return;
+                    }
                     let spoken = voiceterm_egui::voice_prefix::normalise(&self.editor_phrase);
                     // The early return exits this ui.horizontal closure only —
                     // the rest of the frame still draws. Worth stating because
@@ -5470,6 +5515,7 @@ fn main() -> eframe::Result<()> {
                 keycaps_open: true,
                 clip_note: voiceterm_egui::note_clip::Note::new("Session clips"),
                 clip_note_path: None,
+                jotting: false,
                 compact_defaults_applied: false,
                 ingest: Default::default(),
                 // Discovery once at startup, not per frame: scanning
