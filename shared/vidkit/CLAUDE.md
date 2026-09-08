@@ -71,16 +71,30 @@ trusting them.
 ## Commands
 
 ```sh
-cargo test                                  # 206 tests
+cargo test --ignore-rust-version            # 299 tests
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json cargo test -p vidkit-vk
-python3 tools/mutate.py                     # 89 mutants, all must be killed
+python3 tools/mutate.py                     # 116 mutants, all must be killed
 python3 tools/mutate.py shader              # just the WGSL ones
 ```
 
 `tools/mutate.py` injects one realistic bug at a time and reports which the
 suite fails to notice. It sets `VK_ICD_FILENAMES` to lavapipe itself when
 nothing else is configured, because the Vulkan tests skip without a device and
-a skipped test kills no mutant.
+a skipped test kills no mutant, and it puts a packaged rustc 1.91 on PATH when
+one exists.
+
+**Run it detached.** A full sweep outlives a five-minute harness call, and a
+killed run used to leave the source mutated. It now records the original in
+`.mutate-inflight` before editing and replays it on the next start, but
+`nohup setsid python3 tools/mutate.py > /tmp/sweep.log 2>&1 &` and polling the
+log is still the way to run it.
+
+**A full disk is not a test failure.** It used to report as `baseline FAILING`
+and, worse, as mutants *killed* — cargo failing to compile looks exactly like a
+test catching something, and one gesture sweep reported 16/16 while sitting
+against the disk wall when two of those genuinely survived. The runner now
+raises on `os error 28` and stops. If a sweep reports a suspiciously perfect
+score, check `df -h /` before believing it.
 
 Deliberate survivors live in `EXPECTED_SURVIVORS` with a written reason.
 Anything else that survives is untested behaviour: write a test or delete the
@@ -88,7 +102,7 @@ code.
 
 ## Why mutation testing is not optional here
 
-Six tests in this repo have passed for the wrong reason at some point. The
+Nine tests in this repo have passed for the wrong reason at some point. The
 recurring shapes:
 
 - Asserting only `is_err()`. The broken code usually still errors, just later
@@ -100,6 +114,16 @@ recurring shapes:
   "did not run ahead" bound is never exercised.
 - Recycle-token leaks are invisible on software decode (`recycle: None`) and
   only appear as a freeze minutes into hardware playback. Tests count buffers.
+- `iter().all(...)` is true of an empty iterator. Assert the collection is
+  non-empty *first*, then assert what is in it. A gesture test passed against a
+  handler that emitted nothing at all.
+- A symmetric round trip does not test quantisation: twenty steps up and twenty
+  down returns to the start under naive float addition too. Assert the
+  invariant at every intermediate value, not at the endpoints.
+- Assert on the type the call sites use. A percentage test written against f64
+  literals could not fail, because no multiple of 0.05 differs between rounding
+  and truncation in f64. The real values are f32, where `1.05f32 as f64`
+  truncates to 104.
 
 Run the mutation sweep before trusting a refactor.
 
@@ -161,6 +185,51 @@ aperture. Verified, not assumed.
 
 `Cargo.lock` is committed, as everywhere in this tree — see
 `maintenance/tools/lock_check.py` for why a stale one is worse than none.
+
+## The egui surface
+
+`vidkit-egui` is the front end, on `shared/uikit`. `EguiPresenter` converts on
+the CPU and uploads an egui texture — portable to the glow backend everything
+in this tree uses; the zero-copy DMA-BUF path is `vidkit-vk` and needs wgpu.
+`VideoView` paints it letterboxed with the kit's carved skin, and the bottom
+bar adapts through `uikit_egui::adaptive`.
+
+Gestures are routed by a pure state machine (`gestures.rs`): pointer positions
+in, `Intent`s out, no playback state, so the rules are tested without a frame.
+
+```
+horizontal drag anywhere    scrub, rate set by pointer HEIGHT (higher = faster)
+left half, vertical         in-app volume, 5% detents
+right half, vertical        playback speed, 5% detents
+right EDGE strip, vertical  rotate 90 degrees
+pinch                       5% zoom detents; far enough snaps to fit/fill
+tap                         play/pause
+```
+
+Two rules stop them fighting, both tested: the **zone is decided at press**,
+not continuously, so a drag that wanders across the midline does not change
+what it controls; and the **axis locks once**, after 8px, with nothing emitted
+before it.
+
+Two readings of the original request are encoded as single knobs, in case
+either was wrong. `rotate_edge_fraction = 0.0` removes the rotate strip if
+"right side" meant the same thing as "right half". Swapping
+`scrub_span_at_bottom` and `..._at_top` inverts the scrub ramp to match mpv and
+VLC, which give *finer* control further from the bar.
+
+**Look at it, do not just compile it.** `docs/agents/HEADLESS_GUI_TESTING.md`
+applies:
+
+```sh
+cargo run -p vidkit-egui --features demo --example video_demo --ignore-rust-version
+```
+
+Screenshots caught three things no test did: the bar painting over itself,
+rotation panicking on first use (`Mesh::colored_vertex` asserts the mesh has no
+texture, and painting needs a live context so nothing headless reached it), and
+the compact layout needing to exist at all. Resize the running window with
+`xdotool windowsize` and check BOTH breakpoints — a layout that is always
+compact looks correct in a single screenshot.
 
 ## Not built
 
