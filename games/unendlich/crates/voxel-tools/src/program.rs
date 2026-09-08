@@ -891,6 +891,7 @@ fn parse_asset_use(body: &str) -> Result<Source, String> {
 /// thing that had no pass at all, which is why "carve a schism" came
 /// back as a statue.
 pub fn plan_prompt(request: &str, reading: &crate::compose::Reading) -> String {
+    let ask = crate::probe::prompt_lines();
     format!("\
 The player asked for: {request}
 
@@ -931,6 +932,8 @@ which each pass is.
     repeat ASSET stack at=0,0,0 count=5 step=6
     stamp ASSET 4,0,-8 rot=90
   end
+
+{ask}
 
 THE FIRST QUESTION FOR EVERY PASS: is this pass putting material in, or taking it out?
 A canyon is one cut pass. A castle is a mass pass, then cut passes for the gate and the

@@ -122,6 +122,11 @@ pub struct LastBuild {
 
 #[derive(Debug, Default, Clone)]
 pub struct ChatSession {
+    /// Answers to whatever the model asked the world last turn, kept
+    /// so a second attempt has them. A model that asks "what does
+    /// water do" and is not told is no better off than one that never
+    /// asked.
+    pub probe_answers: Vec<String>,
     /// Set while a composed sketch or program is being built: the
     /// shape is decided and the recognizer must not add another.
     pub suppress_recognizer: bool,

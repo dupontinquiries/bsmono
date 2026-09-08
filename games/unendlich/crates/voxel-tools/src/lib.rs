@@ -123,6 +123,8 @@ pub mod latent;
 pub mod expr;
 /// Parts and relations without coordinates, and the solver that grounds them.
 pub mod sketch;
+/// A JSON probe: what a block does, and what happens if you place it.
+pub mod probe;
 /// The block catalogue: colour, hardness, family, and what to use when one is missing.
 pub mod palette;
 /// A ladder of narrow questions: subject, anatomy, pose, voxelisation.

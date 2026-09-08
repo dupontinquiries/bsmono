@@ -1340,7 +1340,33 @@ impl Paintbrush {
     /// Passes 3 and 4: the program is resolved and run.
     fn finish_compose(&mut self, cm: &ChunkManager, gaze: &Gaze, raw: &str,
                       player_feet: Option<(i32, i32, i32)>, prose: &str) {
-        let src = voxel_tools::llm::strip_fences(raw);
+        // THE MODEL MAY HAVE ASKED. A block's behaviour -- that water
+        // flows, that sand falls, that glass is see-through -- was in
+        // the table and never visible to the thing choosing materials.
+        // If it asked, answer and let it plan again with the answers;
+        // if it asked AND planned, use the plan and keep the answers
+        // for the next turn.
+        let (asks, remainder) = voxel_tools::probe::take_asks(raw);
+        if !asks.is_empty() {
+            for (q, a) in &asks {
+                log::info!("[paintbrush] ASK {q} -> {a}");
+                self.say(format!("asked: {}", a.chars().take(140).collect::<String>()));
+            }
+            self.session.probe_answers = asks.iter()
+                .map(|(q, a)| format!("{q} -> {a}")).collect();
+            // nothing but questions: ask again, now with the answers
+            if voxel_tools::program::parse(&remainder).0.passes.is_empty() {
+                if let Some(c) = self.completer_for(false) {
+                    let ctx = self.session.probe_answers.join("\n");
+                    let again = format!("You asked, and these are the answers:\n{ctx}\n\n                                         Now write the assets and passes.");
+                    self.say("answered -- planning with that");
+                    self.spawn_turn(c, "You are a builder planning a voxel build.".into(),
+                        Box::new(move || again), gaze, player_feet, prose, TurnKind::Compose);
+                    return;
+                }
+            }
+        }
+        let src = voxel_tools::llm::strip_fences(&remainder);
         let view = WorldView(cm);
         let mut staged = StagedWorld::new(&view);
         let r = {
