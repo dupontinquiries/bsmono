@@ -195,6 +195,15 @@ MUTANTS = [
     ("mp4/box-past-limit-allowed", "crates/vidkit-mp4/src/boxes.rs",
      "    if end > limit {", "    if false {"),
 
+    # --- battery -------------------------------------------------------------
+    ("battery/idle-does-not-stop-repaints", "crates/vidkit-egui/src/presenter.rs",
+     "    pub fn idle(&mut self) {\n        self.deadline = None;\n    }", "    pub fn idle(&mut self) {}"),
+    ("battery/stale-deadline-still-schedules", "crates/vidkit-egui/src/presenter.rs",
+     "                if now.saturating_duration_since(at) > STALE_DEADLINE {", "                if false {"),
+    ("battery/staleness-cutoff-too-tight", "crates/vidkit-egui/src/presenter.rs",
+     "const STALE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);",
+     "const STALE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1);"),
+
     # --- upload efficiency ---------------------------------------------------
     ("upload/redundant-not-skipped", "crates/vidkit-egui/src/presenter.rs",
      "        if self.shown_pts == Some(frame.pts) && self.texture.is_some() {", "        if false {"),

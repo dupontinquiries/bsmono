@@ -119,10 +119,24 @@ impl EguiPresenter {
     ///
     /// Call once per UI frame. Returns whether a repaint was scheduled, so a
     /// shell can tell "playing" from "idle" without duplicating the logic.
-    pub fn schedule_repaint(&self) -> bool {
+    pub fn schedule_repaint(&mut self) -> bool {
         match self.deadline {
             Some(at) => {
                 let now = Instant::now();
+                // A deadline far in the past means nobody set a new one --
+                // playback stopped and the caller forgot to say so. Without
+                // this, `saturating_duration_since` returns zero, egui is asked
+                // to repaint IMMEDIATELY, and a paused player redraws at full
+                // rate forever showing the same still frame. On a phone that is
+                // the whole screen and GPU awake for nothing, and it is
+                // invisible on a desktop.
+                //
+                // No legitimate deadline survives this long: the player sets a
+                // new one every frame it produces.
+                if now.saturating_duration_since(at) > STALE_DEADLINE {
+                    self.deadline = None;
+                    return false;
+                }
                 let after = at.saturating_duration_since(now);
                 self.ctx.request_repaint_after(after);
                 true
@@ -130,7 +144,21 @@ impl EguiPresenter {
             None => false,
         }
     }
+
+    /// Playback stopped; stop asking for repaints.
+    ///
+    /// The explicit call is the correct fix and the staleness guard above is
+    /// the backstop, because "forgot to clear the deadline" costs battery
+    /// silently and is not visible in any screenshot.
+    pub fn idle(&mut self) {
+        self.deadline = None;
+    }
 }
+
+/// How far past its deadline a frame can be before the schedule is treated as
+/// abandoned rather than late. Generous: a stalled decoder should still get a
+/// repaint when it recovers.
+const STALE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Presenter for EguiPresenter {
     fn submit(&mut self, frame: Frame) -> core_traits::Result<Option<RecycleToken>> {
@@ -391,11 +419,40 @@ mod tests {
 
     /// A deadline already in the past must still schedule -- saturating to zero
     /// rather than underflowing into a very long sleep.
+    /// The battery bug: a paused player must stop asking for repaints. Without
+    /// this it redraws at full rate forever, showing the same still frame.
+    #[test]
+    fn an_idle_presenter_schedules_nothing() {
+        let ctx = ctx();
+        let mut p = EguiPresenter::new(&ctx);
+        p.set_deadline(Some(Instant::now() + Duration::from_millis(40)));
+        assert!(p.schedule_repaint());
+
+        p.idle();
+        assert!(!p.schedule_repaint(), "a paused presenter kept waking the GPU");
+        assert!(p.next_deadline().is_none());
+    }
+
+    /// The backstop for a caller that forgets `idle()`. A deadline nobody has
+    /// refreshed for a second is abandoned, not merely late.
+    #[test]
+    fn an_abandoned_deadline_stops_scheduling() {
+        let ctx = ctx();
+        let mut p = EguiPresenter::new(&ctx);
+        p.set_deadline(Some(Instant::now() - Duration::from_secs(5)));
+        assert!(
+            !p.schedule_repaint(),
+            "a five-second-old deadline still requested a repaint"
+        );
+        assert!(p.next_deadline().is_none(), "the stale deadline was not cleared");
+    }
+
     #[test]
     fn a_past_deadline_schedules_immediately() {
         let ctx = ctx();
         let mut p = EguiPresenter::new(&ctx);
-        p.set_deadline(Some(Instant::now() - Duration::from_secs(5)));
-        assert!(p.schedule_repaint());
+        // Recently past -- a late frame, which must still repaint.
+        p.set_deadline(Some(Instant::now() - Duration::from_millis(50)));
+        assert!(p.schedule_repaint(), "a late frame must still be drawn");
     }
 }

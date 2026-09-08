@@ -267,6 +267,13 @@ impl eframe::App for Player {
                 self.transport.position = Duration::from_secs_f64(t % d.as_secs_f64().max(1.0));
             }
             self.produce(_f);
+        } else {
+            // Paused: stop asking for repaints. Without this the deadline from
+            // the last played frame stays set, egui is asked to redraw
+            // immediately, and a paused player burns the GPU at full rate to
+            // show a still image -- which on a phone is most of the battery
+            // this app can waste, and looks like nothing at all on a desktop.
+            self.presenter.idle();
         }
         self.presenter.schedule_repaint();
 
