@@ -4874,6 +4874,24 @@ impl eframe::App for VoicetermApp {
                 claim_rect,
                 !self.surfaces.captures_input(),
             );
+            // ASK FOR IME while the terminal has the keyboard. winit only delivers IME
+            // events after `set_ime_allowed(true)`, and eframe calls that from
+            // `PlatformOutput::ime`, which egui sets only for a focused TextEdit. The
+            // terminal is not one, so nothing ever asked — and an on-screen keyboard had no
+            // reason to send its commits here. Letters arrive as commits; the editing keys
+            // arrive as real key events, which is why backspace worked and `a` did not.
+            if matches!(claim, voiceterm_egui::kbd_focus::Claim::Held) {
+                // The cursor's own row, so the compositor's keyboard and candidate window do
+                // not cover the line being typed.
+                let ch_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                let cur_y = claim_rect.top()
+                    + (self.app.terminal.grid.cur_row as f32 * ch_h).min(claim_rect.height());
+                let cursor = egui::Rect::from_min_size(
+                    egui::pos2(claim_rect.left(), cur_y),
+                    egui::vec2(1.0, ch_h),
+                );
+                voiceterm_egui::kbd_focus::request_ime(ui.ctx(), claim_rect, cursor);
+            }
             let key_outs = if self.surfaces.captures_input() {
                 Vec::new()
             } else if claim == voiceterm_egui::kbd_focus::Claim::Yielded {

@@ -73,6 +73,22 @@ pub enum Claim {
 /// Call once per frame, before draining input. `id` must be stable across frames and unique
 /// per pane — focus is tracked BY id, and two panes sharing one would hand the keyboard back
 /// and forth every frame.
+/// Ask the platform for IME while the terminal holds the keyboard.
+///
+/// winit only delivers IME events when `set_ime_allowed(true)` has been called, and eframe
+/// calls it from `PlatformOutput::ime` — which egui sets only for a focused `TextEdit`. The
+/// terminal is not a TextEdit, so nothing ever asked, and an on-screen keyboard had no reason
+/// to send its commits here (or, on some compositors, to appear at all).
+///
+/// The rect is where the compositor puts its candidate window and its keyboard: the terminal
+/// itself, with the cursor's own line as the thin rect. Handing it the whole screen would
+/// have the keyboard cover the text being typed on some shells.
+pub fn request_ime(ctx: &egui::Context, area: egui::Rect, cursor: egui::Rect) {
+    ctx.output_mut(|o| {
+        o.ime = Some(egui::output::IMEOutput { rect: area, cursor_rect: cursor });
+    });
+}
+
 pub fn claim(ui: &mut Ui, id: Id, rect: egui::Rect, visible: bool) -> Claim {
     if !visible {
         return Claim::Absent;

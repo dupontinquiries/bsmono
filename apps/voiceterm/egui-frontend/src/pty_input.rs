@@ -207,6 +207,28 @@ pub fn drain_egui_owned(
                         out.push(press(Key::Char(ch), Mods::none(), mode, split_visible));
                     }
                 }
+                // AN ON-SCREEN KEYBOARD DOES NOT SEND KEYS FOR LETTERS.
+                //
+                // Plasma's virtual keyboard and Maliit are Wayland text-input clients:
+                // `zwp_text_input_v3` COMMITS a string for ordinary characters, and
+                // synthesises real key events only for the editing keys — backspace, enter,
+                // arrows. winit surfaces the commit as an IME event and egui passes it
+                // through as `Ime::Commit`, which this match did not have an arm for.
+                //
+                // So every letter was dropped and every editing key worked, which is exactly
+                // the reported symptom and reads like a broken keymap rather than a missing
+                // event. A physical keyboard sends `Event::Text` and was never affected,
+                // which is why this survived every test and every desktop run.
+                egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
+                    for ch in t.chars() {
+                        out.push(press(Key::Char(ch), Mods::none(), mode, split_visible));
+                    }
+                }
+                // Preedit is the composing text an IME shows before it commits — a
+                // half-typed CJK syllable, or a swipe keyboard's candidate. It is NOT input
+                // yet, and sending it would type every intermediate guess and then the
+                // final word on top of them.
+                egui::Event::Ime(_) => {}
                 egui::Event::Key { key, pressed: true, modifiers, .. } => {
                     let m = Mods { ctrl: modifiers.ctrl || modifiers.command,
                                    alt: modifiers.alt, shift: modifiers.shift };
@@ -537,6 +559,59 @@ mod headless_tests {
             });
         });
         got.into_inner()
+    }
+
+    /// THE REPORTED BUG: on Plasma's virtual keyboard and on Maliit, the editing keys worked
+    /// and letters did nothing.
+    ///
+    /// Those are Wayland text-input clients: `zwp_text_input_v3` COMMITS a string for
+    /// ordinary characters and synthesises real key events only for backspace, enter and the
+    /// arrows. winit surfaces the commit as an IME event, egui passes it as `Ime::Commit`,
+    /// and this drain had no arm for it — so every letter was dropped and every editing key
+    /// worked, which reads like a broken keymap rather than a missing event.
+    ///
+    /// A physical keyboard sends `Event::Text`, which is why this survived every test and
+    /// every desktop run.
+    #[test]
+    fn an_on_screen_keyboards_letters_reach_the_shell() {
+        let commit = vec![egui::Event::Ime(egui::ImeEvent::Commit("ls".into()))];
+        let bytes: Vec<u8> = drive(commit, PLAIN).iter().flat_map(|o| o.bytes.clone()).collect();
+        assert_eq!(bytes, b"ls", "an IME commit did not reach the shell");
+
+        // The editing keys still arrive as key events, and still work — this must not trade
+        // one half of the keyboard for the other.
+        let bs = vec![egui::Event::Key {
+            key: egui::Key::Backspace,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        assert!(!drive(bs, PLAIN).is_empty(), "backspace stopped working");
+
+        // A physical keyboard's Text is unchanged.
+        let typed = vec![egui::Event::Text("hi".into())];
+        let bytes: Vec<u8> = drive(typed, PLAIN).iter().flat_map(|o| o.bytes.clone()).collect();
+        assert_eq!(bytes, b"hi");
+    }
+
+    /// PREEDIT IS NOT INPUT. It is what an IME shows while composing — a half-typed CJK
+    /// syllable, a swipe keyboard's running guess — and sending it would type every
+    /// intermediate state and then the final word on top of them.
+    #[test]
+    fn composing_text_is_not_typed_until_it_is_committed() {
+        let pre = vec![egui::Event::Ime(egui::ImeEvent::Preedit("ni".into()))];
+        let bytes: Vec<u8> = drive(pre, PLAIN).iter().flat_map(|o| o.bytes.clone()).collect();
+        assert!(bytes.is_empty(), "a preedit was typed: {bytes:?}");
+
+        // …and the commit that follows it types once.
+        let seq = vec![
+            egui::Event::Ime(egui::ImeEvent::Preedit("ni".into())),
+            egui::Event::Ime(egui::ImeEvent::Preedit("nih".into())),
+            egui::Event::Ime(egui::ImeEvent::Commit("\u{4f60}".into())),
+        ];
+        let bytes: Vec<u8> = drive(seq, PLAIN).iter().flat_map(|o| o.bytes.clone()).collect();
+        assert_eq!(bytes, "\u{4f60}".as_bytes(), "the composed word did not arrive once");
     }
 
     /// THE TERMINAL'S OWN FOCUS SINK holds focus, which is the normal state once
