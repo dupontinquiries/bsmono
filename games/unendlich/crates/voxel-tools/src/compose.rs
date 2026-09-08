@@ -216,6 +216,10 @@ pub enum Path {
     /// where a division is worth having. Ask the model what it is made
     /// of, then programme it like any other type.
     Propose { noun: String },
+    /// Several distinct things in one request: plan it into parts,
+    /// block it out, judge the massing, then build each part with a
+    /// prompt containing only that part.
+    Parts,
     /// It is a BUILDING TYPE at a size worth programming: the
     /// architectural chain -- typology, triage, massing, brief,
     /// layout, geometry.
@@ -232,7 +236,54 @@ pub enum Path {
 /// Choose. The honest signal is whether the recognizer found anything:
 /// it is a table of things the dictionary can actually make, so a miss
 /// means the fast path would be guessing.
+/// Does the request name SEVERAL distinct things?
+///
+/// Counted on the joining words a person actually uses. Two or more
+/// joins means the request has parts, and a single-noun match on one
+/// of them is not a plan for the whole.
+pub fn names_several(prose: &str) -> bool {
+    let l = prose.to_lowercase();
+    let joins = l.matches(" with ").count() + l.matches(" and ").count()
+        + l.matches(',').count() + l.matches(" plus ").count();
+    if joins < 2 { return false; }
+    // ...unless the joins only describe ONE thing: "a tall and narrow
+    // tower" is two adjectives, not two parts. A part needs a noun
+    // after the join.
+    let after: usize = ["with", "and", "plus"].iter().map(|j| {
+        l.split(&format!(" {j} ")).skip(1)
+            .filter(|rest| rest.split_whitespace().take(3)
+                .any(|w| !["a", "an", "the", "very", "quite", "some", "tall", "wide", "narrow",
+                           "big", "small", "huge", "long", "short", "dark", "light", "old",
+                           "new", "stone", "wooden", "grand"].contains(&w)))
+            .count()
+    }).sum();
+    after >= 1
+}
+
 pub fn choose_path(prose: &str) -> Path {
+    // SEVERAL THINGS IS NOT ONE THING, and this must be asked FIRST.
+    // The recognizer matches a single noun ANYWHERE in a sentence, so
+    // "a walled yard with a hall and a gate" found `arch` and built one
+    // arch -- a three-part request collapsed to a two-op plan, because
+    // the Known path was decided before anything counted the parts.
+    //
+    // A known TYPE still wins: a castle has a typology with sections,
+    // shares and a schedule that reconciles, which is strictly better
+    // than a generic "break it into parts". This is only for structure
+    // no typology covers.
+    if names_several(prose) {
+        // A known TYPE still wins -- a castle has a typology with
+        // sections, shares and a schedule that reconciles, which beats
+        // a generic "break it into parts". But it must be checked HERE,
+        // before the recognizer: "a cathedral with a tower and a crypt"
+        // matched `tower` and came back Known, which is the same
+        // single-noun bug one level down.
+        if let Some(t) = crate::typology::lookup(prose) {
+            let (area, _) = crate::typology::scale_for(prose, &t);
+            if area >= 1200 { return Path::Programme; }
+        }
+        return Path::Parts;
+    }
     // A FIGURE AT SIZE. The dictionary makes a statue in one turn and
     // it is the same statue every time, because one interpret turn
     // asks one wide question. Above the size where features can land,
@@ -726,5 +777,36 @@ mod tests {
         assert_eq!(choose_path("a huge fortress"), Path::Programme);
         assert_eq!(choose_path("a small cottage"), Path::Known);
         assert!(matches!(choose_path("a colossal statue of Zeus"), Path::Study { .. }));
+    }
+
+    #[test]
+    fn several_things_is_not_one_thing_and_is_asked_first() {
+        // The recognizer matches a single noun ANYWHERE in a sentence,
+        // so "a walled yard with a hall and a gate" found `arch` and
+        // built ONE ARCH -- a three-part request collapsed to a two-op
+        // plan, because Known was decided before anything counted parts.
+        assert_eq!(choose_path("a walled yard with a hall and a gate, in stone"), Path::Parts);
+        assert_eq!(choose_path("a mill, a bakery and a row of cottages"), Path::Parts);
+        assert_eq!(choose_path("a bridge with a gatehouse at each end, and a toll booth"),
+                   Path::Parts);
+        // ADJECTIVES ARE NOT PARTS: "tall and narrow" is one thing
+        assert_ne!(choose_path("a tall and narrow stone tower"), Path::Parts);
+        assert_ne!(choose_path("a small, dark hut"), Path::Parts);
+        // and a KNOWN TYPE keeps its own chain, which is better than a
+        // generic plan: a castle has sections, shares and a schedule
+        assert_eq!(choose_path("a huge fortress with a chapel, on a cliff"), Path::Programme);
+        // NOT ASSERTED: that "a cathedral with a tower and a crypt" is
+        // Programme. It comes back Parts, because `lookup` takes the
+        // LAST type-word and that is `tower`, whose 900-block base is
+        // under the programming threshold. The head-noun rule is right
+        // for "a temple town" and wrong here, and no positional rule
+        // gets both -- which subject a sentence is ABOUT is a question
+        // for the model, not for a table. Parts is a reasonable answer
+        // either way: it plans, blocks out and judges.
+        assert!(matches!(choose_path("a cathedral with a tower and a crypt"),
+                         Path::Parts | Path::Programme));
+        // one thing is still one thing
+        assert_eq!(choose_path("a small cottage"), Path::Known);
+        assert_eq!(choose_path("a water sphere"), Path::Compose);
     }
 }

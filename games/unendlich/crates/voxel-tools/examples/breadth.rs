@@ -52,6 +52,7 @@ fn main() {
                 (program::run_in(&Flat, &prog, (0,64,0)).changes.len(), format!("study h={height}"))
             }
             compose::Path::Propose { ref noun } => (0, format!("would ask what a {noun} is")),
+            compose::Path::Parts => (0, "planned into parts".into()),
             compose::Path::Compose => (0, "needs a model".into()),
         };
         if cells > 0 { built += 1; sizes.push(cells); } else { empty += 1; fails.push((req, note.clone())); }

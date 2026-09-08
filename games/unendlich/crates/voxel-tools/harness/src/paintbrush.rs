@@ -315,6 +315,15 @@ pub enum TurnKind {
     /// One rung of the study ladder. Which rung is on the session, so
     /// the reply knows what it was answering.
     Study,
+    /// Planning the build into a DOSSIER: the parts, before any of
+    /// them is built. The only turn that sees the whole.
+    Dossier,
+    /// Judging the blockout: is the massing right, before anything is
+    /// detailed?
+    Judge,
+    /// Building ONE part of the dossier, with a prompt that contains
+    /// only that part. No conversation.
+    PartBuild,
     /// The model is being asked what a thing this world has never
     /// heard of is MADE OF. Its answer becomes a typology and goes
     /// through the same chain as a built-in one.
@@ -554,6 +563,15 @@ pub struct Paintbrush {
     pending_job: voxel_tools::prompt::Job,
     /// The noun whose definition is being asked for.
     proposed_noun: Option<String>,
+    /// The build plan, while it is being executed part by part.
+    dossier: Option<voxel_tools::dossier::Dossier>,
+    /// Which part is being built.
+    part_at: usize,
+    /// Cells the whole build has laid down, for the lighting pass at
+    /// the end -- which needs the finished thing, not one part.
+    built_cells: std::collections::BTreeSet<(i32, i32, i32)>,
+    /// Rounds spent judging the blockout, so it cannot loop.
+    judged: usize,
     /// What pass 1 decided the thing IS. Kept past the turn, because a
     /// later pass failing does not make the reading wrong.
     last_reading: Option<voxel_tools::compose::Reading>,
@@ -656,6 +674,10 @@ impl Paintbrush {
             review_pending_after_drone: 0,
             pending_job: voxel_tools::prompt::Job::Plan,
             proposed_noun: None,
+            dossier: None,
+            part_at: 0,
+            built_cells: Default::default(),
+            judged: 0,
             last_reading: None,
             study: None,
             study_rungs: Vec::new(),
@@ -1381,6 +1403,91 @@ impl Paintbrush {
         self.review_round = 0;
     }
 
+
+    /// Draw the massing and ask whether it reads, before anything is
+    /// detailed. Fixing a proportion here costs one line; fixing it
+    /// after everything is built costs the build.
+    fn show_blockout(&mut self, cm: &ChunkManager, gaze: &Gaze,
+                     player_feet: Option<(i32, i32, i32)>, prose: &str) {
+        let Some(d) = self.dossier.clone() else { return };
+        let anchor = self.session.focus(gaze).anchor;
+        let (_, src) = voxel_tools::dossier::blockout(&d, anchor);
+        let view = WorldView(cm);
+        let mut staged = StagedWorld::new(&view);
+        let cells = {
+            let mut tools = VoxelTools::new(&mut staged);
+            let r = self.session.receive_program(&mut tools, gaze, &src, player_feet, prose);
+            let n = if let voxel_tools::chat::Reply::Preview { blocks, .. } = &r { *blocks } else { 0 };
+            self.push(r);
+            n
+        };
+        // the blockout is a PREVIEW to look at, never committed: it
+        // exists to be judged and thrown away
+        self.session.cancel();
+        let _ = staged;
+        self.say(format!("blockout: {cells} cells -- judging the massing before detailing"));
+        let Some(c) = self.completer_for(false) else {
+            self.say("no provider for the massing judgement"); return;
+        };
+        let elev = self.session.pending_elevation().unwrap_or_default();
+        let p = voxel_tools::dossier::judge_prompt(&d, &elev, &format!("{cells} cells"));
+        self.pending_job = voxel_tools::prompt::Job::Line;
+        self.spawn_turn(c, "You are a builder standing back from a blockout.".into(),
+                        Box::new(move || p), gaze, player_feet, prose, TurnKind::Judge);
+    }
+
+    /// The next part, with a prompt containing only that part.
+    fn build_next_part(&mut self, cm: &ChunkManager, gaze: &Gaze,
+                       player_feet: Option<(i32, i32, i32)>, prose: &str) {
+        let Some(d) = self.dossier.clone() else { return };
+        if self.part_at >= d.parts.len() {
+            self.finish_dossier(cm, gaze, player_feet, prose);
+            return;
+        }
+        let Some(c) = self.completer_for(false) else {
+            self.say("no provider available"); return;
+        };
+        let vocab = voxel_tools::bench::levels_prompt();
+        let Some(p) = d.part_prompt(self.part_at, vocab) else {
+            self.finish_dossier(cm, gaze, player_feet, prose); return;
+        };
+        self.say(format!("building {} ({} of {}) ...", d.parts[self.part_at].name,
+                         self.part_at + 1, d.parts.len()));
+        self.pending_job = voxel_tools::prompt::Job::Program;
+        self.spawn_turn(c, "You are building one part of a larger build.".into(),
+                        Box::new(move || p), gaze, player_feet, prose, TurnKind::PartBuild);
+    }
+
+    /// The stages a build video cuts, done last because they need the
+    /// finished thing: light the inside, and say what was left out.
+    fn finish_dossier(&mut self, cm: &ChunkManager, gaze: &Gaze,
+                      player_feet: Option<(i32, i32, i32)>, prose: &str) {
+        let Some(d) = self.dossier.take() else { return };
+        self.say(d.status());
+        // LIGHT THE INSIDE. Every interior this crate has ever built
+        // was pitch black: a building nobody can use, and mobs spawn
+        // in it. It is the most-cut stage in any build video and it
+        // costs about a fifth of one percent of the blocks.
+        if !self.built_cells.is_empty() {
+            let dark = voxel_tools::unshown::plan_lights(&self.built_cells, 7, 2);
+            if !dark.places.is_empty() {
+                let ch = voxel_tools::unshown::light_changes(&dark, "glowstone");
+                self.say(format!("lighting: {}", dark.summary()));
+                let view = WorldView(cm);
+                let mut staged = StagedWorld::new(&view);
+                {
+                    let mut tools = VoxelTools::new(&mut staged);
+                    let _ = tools.apply_changes_large(&ch);
+                }
+                self.flush_staged(cm, &mut staged);
+            }
+        }
+        let _ = (player_feet, prose);
+        self.built_cells.clear();
+        self.review_pending_after_drone = 1;
+        self.review_round = 0;
+    }
+
     /// A typology in hand -- built in or just invented -- becomes a
     /// building by the same chain either way.
     fn build_from_typology(&mut self, cm: &ChunkManager, gaze: &Gaze,
@@ -1687,6 +1794,22 @@ impl Paintbrush {
         // request. Pass 1 asks what the thing IS, in prose; pass 2
         // writes assets and passes against that reading. The dictionary
         // path stays one turn, because for a cottage it is better.
+        // THE DOSSIER PATH. Plan into a document, block it out, judge
+        // the massing, then build each part with a prompt that contains
+        // only that part. Used where a build has real structure: a
+        // request that names several things, or one big enough that a
+        // single turn cannot describe it.
+        if path == voxel_tools::compose::Path::Parts {
+            let site = surface.map(|s| format!("SITE: standing on {s}.")).unwrap_or_default();
+            let p = voxel_tools::dossier::plan_prompt(prose, &site);
+            log::info!("[paintbrush] planning {prose:?} into parts");
+            self.say("planning this into parts ...");
+            self.pending_job = voxel_tools::prompt::Job::Plan;
+            self.spawn_turn(completer,
+                "You are a builder breaking a build into parts that can each be made alone.".into(),
+                Box::new(move || p), gaze, player_feet, prose, TurnKind::Dossier);
+            return;
+        }
         // A NOUN THIS WORLD HAS NO TYPOLOGY FOR. Five built-in types is
         // a menu, and a menu is what turned a water sphere into a
         // house. Ask the model what a windmill is made of rather than
@@ -2012,6 +2135,72 @@ impl Paintbrush {
                         } else {
                             self.finish_study(cm, &turn.gaze, turn.player_feet, &turn.prose);
                         }
+                    }
+                    TurnKind::Dossier => {
+                        let (d, errs) = voxel_tools::dossier::parse(&raw);
+                        for e in errs.iter().take(3) { self.say(format!("  {e}")); }
+                        if d.parts.is_empty() {
+                            self.say("that did not plan into parts -- building it directly");
+                            self.finish_compose(cm, &turn.gaze, &raw, turn.player_feet, &turn.prose);
+                        } else {
+                            self.say(format!("{}", d.status()));
+                            for p in &d.parts {
+                                self.say(format!("  {} ({} blocks)", p.name, p.size.unwrap_or(400)));
+                            }
+                            self.dossier = Some(d);
+                            self.part_at = 0;
+                            self.judged = 0;
+                            self.built_cells.clear();
+                            self.show_blockout(cm, &turn.gaze, turn.player_feet, &turn.prose);
+                        }
+                    }
+                    TurnKind::Judge => {
+                        let v = voxel_tools::dossier::parse_verdict(&raw);
+                        self.judged += 1;
+                        self.say(format!("massing: {}", v.summary()));
+                        if let Some(d) = self.dossier.as_mut() {
+                            for l in d.revise(&v).into_iter().take(5) { self.say(format!("  {l}")); }
+                        }
+                        // GO, or nothing more to say, or it has been
+                        // round twice -- a blockout that cannot be
+                        // settled in two rounds is a plan problem, and
+                        // looping on it spends turns on a box.
+                        if v.go || v.is_empty() || self.judged >= 2 {
+                            self.say("massing settled -- building it part by part");
+                            self.build_next_part(cm, &turn.gaze, turn.player_feet, &turn.prose);
+                        } else {
+                            self.show_blockout(cm, &turn.gaze, turn.player_feet, &turn.prose);
+                        }
+                    }
+                    TurnKind::PartBuild => {
+                        let src = voxel_tools::llm::strip_fences(&raw);
+                        let (prog, errs) = voxel_tools::program::parse(&src);
+                        let name = self.dossier.as_ref()
+                            .and_then(|d| d.parts.get(self.part_at))
+                            .map(|p| p.name.clone()).unwrap_or_default();
+                        let mut built = 0usize;
+                        if !prog.passes.is_empty() {
+                            let view = WorldView(cm);
+                            let mut staged = StagedWorld::new(&view);
+                            let r = {
+                                let mut tools = VoxelTools::new(&mut staged);
+                                self.session.receive_program(&mut tools, &turn.gaze, &src,
+                                                             turn.player_feet, &turn.prose)
+                            };
+                            if let voxel_tools::chat::Reply::Preview { blocks, .. } = &r { built = *blocks; }
+                            if let Some(p) = self.session.pending_cells() {
+                                self.built_cells.extend(p);
+                            }
+                            self.push(r);
+                            self.flush_staged(cm, &mut staged);
+                        }
+                        let outcome = if built > 0 { format!("built as planned") }
+                                      else if !errs.is_empty() { errs[0].clone() }
+                                      else { "the model wrote no passes".into() };
+                        if let Some(d) = self.dossier.as_mut() { d.finish(self.part_at, built, &outcome); }
+                        self.say(format!("  {name}: {outcome}"));
+                        self.part_at += 1;
+                        self.build_next_part(cm, &turn.gaze, turn.player_feet, &turn.prose);
                     }
                     TurnKind::Propose => {
                         let noun = self.proposed_noun.clone().unwrap_or_else(|| "thing".into());

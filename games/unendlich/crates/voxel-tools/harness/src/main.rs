@@ -44,6 +44,7 @@ fn main() {
     study_scenario();
     floor_scenario();
     propose_scenario();
+    dossier_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -1230,4 +1231,59 @@ fn propose_scenario() {
     assert!(log.iter().any(|l| l.contains("carrying sails")), "the definition arrived: {log:?}");
     assert!(log.iter().any(|l| l.contains("budget")), "it reconciled a schedule: {log:?}");
     assert!(log.iter().any(|l| l.contains("pass(es)")), "and built: {log:?}");
+}
+
+
+/// Plan into parts, block out, judge, build each with fresh context,
+/// then light it.
+fn dossier_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== the dossier loop");
+    struct Team { n: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                  seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> }
+    impl voxel_tools::llm::Completer for Team {
+        fn name(&self) -> &str { "team" }
+        fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            self.seen.lock().unwrap().push(user.to_string());
+            let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(match i {
+                0 => "is a walled yard with a hall inside and a gate to the south\n\
+                      part walls size=900\n  A square stone wall around the yard.\nend\n\
+                      part hall size=500 after=walls\n  A timber hall in the middle of the yard.\nend\n\
+                      part gate size=200 after=walls\n  A stone arch through the south wall.\nend\n".into(),
+                1 => "reads yes\nsize hall 700\ngo\n".into(),
+                _ => "pass mass add\n  part m box w=14 h=8 d=14 material=stone hollow\n                        rel m on ground\nend\n".into(),
+            })
+        }
+    }
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(
+        Box::new(Team { n, seen: seen.clone() }))));
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -20.0], [0.0, -0.3, 1.0], Some(([0, 64, 0], [0, 1, 0], 21.0)));
+    pb.start_turn(&cm, &gaze, Some("grass"), "a walled yard with a hall and a gate, in stone", None);
+    let t0 = std::time::Instant::now();
+    while pb.run.as_ref().map(|r| r.is_running()).unwrap_or(false) && t0.elapsed().as_secs() < 90 {
+        pb.poll_turn(&cm); pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    let s = seen.lock().unwrap();
+    println!("  {} model turn(s): plan, judge, then one per part", s.len());
+    assert!(s.len() >= 5, "plan + judge + 3 parts: {}", s.len());
+    assert!(s[0].contains("built in its OWN turn"), "turn 1 planned");
+    assert!(s[1].contains("BLOCKOUT"), "turn 2 judged the massing: {}", &s[1][..80.min(s[1].len())]);
+    // THE POINT: the part prompts do not grow
+    let parts: Vec<usize> = s[2..].iter().map(|x| x.len()).collect();
+    let spread = parts.iter().max().unwrap() - parts.iter().min().unwrap();
+    println!("  part prompts: {parts:?} (spread {spread})");
+    assert!(spread < 500, "part prompts stay about the same size: {parts:?}");
+    let log = pb.drain_log();
+    for l in log.iter().filter(|l| l.contains("blockout") || l.contains("massing")
+                               || l.contains("lighting") || l.contains("done,")) {
+        println!("  {}", l.trim().chars().take(120).collect::<String>());
+    }
+    assert!(log.iter().any(|l| l.contains("blockout")), "it blocked out first: {log:?}");
+    assert!(log.iter().any(|l| l.contains("massing")), "and judged it");
+    assert!(log.iter().any(|l| l.contains("lighting")), "and lit the inside: {log:?}");
 }

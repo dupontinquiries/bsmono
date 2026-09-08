@@ -522,6 +522,25 @@ impl ChatSession {
         Reply::Preview { echo, blocks, feature_id: f.feature_id }
     }
 
+    /// Drop the pending plan without building it. A blockout is a
+    /// preview to be JUDGED and thrown away, so it must never reach
+    /// the world.
+    pub fn cancel(&mut self) { self.pending = None; }
+
+    /// The cells the pending plan would place. The dossier's lighting
+    /// pass needs the FINISHED thing, and a build made part by part is
+    /// only whole once every part has landed.
+    pub fn pending_cells(&self) -> Option<Vec<(i32, i32, i32)>> {
+        self.pending.as_ref().map(|p| p.placed.clone())
+    }
+
+    /// The pending plan's elevations, for a judgement made by looking.
+    pub fn pending_elevation(&self) -> Option<String> {
+        let p = self.pending.as_ref()?;
+        let cells: std::collections::BTreeSet<(i32, i32, i32)> = p.placed.iter().copied().collect();
+        Some(crate::review::elevations(&cells, 30, 16))
+    }
+
     /// The review prompt for the pending plan: its ops by number, its
     /// spec, what it measured, two elevations, the critique's findings.
     /// None when nothing is pending. `round` is 1 for the first review.
