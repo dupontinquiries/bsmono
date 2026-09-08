@@ -456,3 +456,231 @@ fn the_first_packet_across_the_seam_carries_its_parameter_sets() {
         "SPS missing from the first packet"
     );
 }
+
+// ---------------------------------------------------------------------------
+// the same seams, over WebM
+// ---------------------------------------------------------------------------
+//
+// Not a copy of the MP4 cases for symmetry's sake. WebM is the FAIRPHONE's
+// path -- YouTube's VP9 renditions are WebM and VP9 is what Venus decodes in
+// hardware -- and it reaches the player through a completely different set of
+// answers: nanosecond timestamps scaled by TimestampScale rather than
+// timescale ticks, keyframe flags read from a SimpleBlock header rather than
+// an stss table, and no Annex-B rewrite at all because VP9 frames pass through
+// untouched. Every one of those is a place the two demuxers could disagree
+// with the player, and only one of them had ever been driven by it.
+
+mod webm_pipeline {
+    use super::*;
+    use vidkit_webm::build as w;
+    use vidkit_webm::ebml::id;
+    use vidkit_webm::WebmDemuxer;
+
+    /// `n` VP9 frames, 33ms apart, every third a keyframe, split across two
+    /// clusters so the cluster-timestamp arithmetic is exercised rather than
+    /// bypassed.
+    fn synthetic_webm(n: u32) -> Vec<u8> {
+        let per_cluster = 4u32;
+        let mut clusters = Vec::new();
+        let mut i = 0u32;
+        while i < n {
+            let base = (i as u64) * 33;
+            let mut body = w::uint(id::TIMESTAMP, base);
+            for k in 0..per_cluster {
+                if i + k >= n {
+                    break;
+                }
+                let idx = i + k;
+                let data = vec![0xB0 | (idx as u8 & 0x0F); 6];
+                body.extend_from_slice(&w::simple_block(
+                    1,
+                    (k as i16) * 33,
+                    idx % 3 == 0,
+                    &data,
+                ));
+            }
+            clusters.push(w::elem(id::CLUSTER, &body));
+            i += per_cluster;
+        }
+
+        let video = w::elem(
+            id::VIDEO,
+            &w::cat(&[
+                w::uint(id::PIXEL_WIDTH, W as u64),
+                w::uint(id::PIXEL_HEIGHT, H as u64),
+            ]),
+        );
+        let entry = w::cat(&[
+            w::uint(id::TRACK_NUMBER, 1),
+            w::uint(id::TRACK_TYPE, 1),
+            w::string(id::CODEC_ID, "V_VP9"),
+            video,
+        ]);
+        let info = w::cat(&[
+            w::uint(id::TIMESTAMP_SCALE, 1_000_000),
+            w::float64(id::DURATION, (n as f64) * 33.0),
+        ]);
+        let body = w::cat(&[
+            w::elem(id::INFO, &info),
+            w::elem(id::TRACKS, &w::elem(id::TRACK_ENTRY, &entry)),
+            w::cat(&clusters),
+        ]);
+        w::cat(&[
+            w::elem(id::EBML_HEADER, &[0x42, 0x86, 0x81, 0x01]),
+            w::elem(id::SEGMENT, &body),
+        ])
+    }
+
+    struct WebmHandle(WebmDemuxer<vidkit_mp4::MemorySource>);
+
+    impl MediaSource for WebmHandle {
+        fn video_profile(&self) -> Option<vidkit_core::VideoProfile> {
+            self.0.video_profile()
+        }
+        fn dimensions(&self) -> (u32, u32) {
+            self.0.dimensions()
+        }
+        fn nominal_fps(&self) -> u32 {
+            self.0.nominal_fps()
+        }
+        fn duration(&self) -> Option<Duration> {
+            self.0.duration()
+        }
+        fn seekable(&self) -> bool {
+            self.0.seekable()
+        }
+        fn next_packet(&mut self) -> Result<Option<Packet>> {
+            self.0.next_packet()
+        }
+        fn seek(&mut self, to: Duration) -> Result<()> {
+            self.0.seek(to)
+        }
+    }
+
+    fn webm_rig(n: u32) -> Rig {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+
+        let demux = WebmDemuxer::open(vidkit_mp4::MemorySource(synthetic_webm(n)))
+            .expect("open webm");
+        assert_eq!(demux.block_count(), n as usize, "fixture is wrong");
+
+        let dec = Arc::new(Mutex::new(DecoderState {
+            free: (0..POOL).collect(),
+            ..Default::default()
+        }));
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let now = Arc::new(Mutex::new(Duration::ZERO));
+
+        Rig {
+            player: Player::new(
+                Box::new(WebmHandle(demux)),
+                Box::new(StubDecoder(dec.clone())),
+                Box::new(PresenterHandle {
+                    inner: EguiPresenter::new(&ctx),
+                    shown: shown.clone(),
+                }),
+                Box::new(FakeClock(now.clone())),
+                60,
+                3,
+            ),
+            dec,
+            shown,
+            now,
+        }
+    }
+
+    #[test]
+    fn a_real_webm_plays_through_the_whole_stack() {
+        let mut r = webm_rig(12);
+        run(&mut r, 600, |_| false);
+
+        let shown = r.shown.lock().unwrap().clone();
+        assert!(shown.len() >= 6, "only {} frames presented", shown.len());
+
+        let mut sorted = shown.clone();
+        sorted.sort();
+        assert_eq!(shown, sorted, "frames presented out of order");
+
+        // Nanosecond timestamps scaled by TimestampScale, not raw ticks. A
+        // unit mix-up shows up here as a factor of a million.
+        assert_eq!(shown[0], Duration::ZERO);
+        assert_eq!(
+            shown[1],
+            Duration::from_millis(33),
+            "second frame at {:?}: TimestampScale is not being applied",
+            shown[1]
+        );
+    }
+
+    /// The cluster boundary is the arithmetic worth checking: a block's
+    /// timestamp is its cluster's plus a signed relative offset, so a demuxer
+    /// that forgets the cluster base restarts the timeline every four frames
+    /// and the frame queue drops everything after the first cluster.
+    #[test]
+    fn timestamps_keep_climbing_across_a_cluster_boundary() {
+        let mut r = webm_rig(12);
+        run(&mut r, 600, |_| false);
+        let shown = r.shown.lock().unwrap().clone();
+
+        // Four blocks per cluster, so index 4 is the first of cluster two.
+        assert!(shown.len() > 5, "not enough frames to cross a cluster");
+        assert!(
+            shown[4] > shown[3],
+            "timeline restarted at the cluster boundary: {:?} then {:?}",
+            shown[3],
+            shown[4]
+        );
+        assert_eq!(shown[4], Duration::from_millis(132));
+    }
+
+    /// VP9 needs no Annex-B rewrite. The demuxer must hand the frame over
+    /// byte-identical; "helpfully" prefixing a start code corrupts it.
+    #[test]
+    fn vp9_frames_cross_the_seam_untouched() {
+        let mut demux =
+            WebmDemuxer::open(vidkit_mp4::MemorySource(synthetic_webm(3))).unwrap();
+        let p = demux.next_packet().unwrap().unwrap();
+        assert_eq!(p.data, vec![0xB0u8; 6], "VP9 payload was rewritten");
+        assert!(p.is_keyframe);
+    }
+
+    #[test]
+    fn seeking_a_webm_lands_on_a_keyframe_and_resumes() {
+        let mut r = webm_rig(24);
+
+        let mut pending = 0;
+        for _ in 0..300 {
+            r.player.tick().expect("tick");
+            if let Event::Idle { wake_in: Some(d) } = r.player.tick().expect("tick") {
+                *r.now.lock().unwrap() += d;
+            }
+            pending = r.dec.lock().unwrap().ready.len();
+            if pending > 0 && r.shown.lock().unwrap().len() >= 2 {
+                break;
+            }
+        }
+        assert!(pending > 0, "decoder queue empty: the flush check cannot bind");
+
+        // 330ms is block 10, NOT a keyframe -- blocks 0/3/6/9 are. Seeking to
+        // a keyframe would let correct and broken behaviour agree.
+        r.player.seek(Duration::from_millis(330)).expect("seek");
+        assert_eq!(
+            r.dec.lock().unwrap().free.len(),
+            POOL as usize,
+            "seek left buffers outstanding across the crate boundary"
+        );
+
+        r.shown.lock().unwrap().clear();
+        run(&mut r, 600, |_| false);
+        let after = r.shown.lock().unwrap().clone();
+        assert!(!after.is_empty(), "playback did not resume");
+        assert_eq!(
+            after[0],
+            Duration::from_millis(297),
+            "resumed at {:?}: expected the keyframe at 297ms -- later means no \
+             rewind, earlier means stale frames survived the flush",
+            after[0]
+        );
+    }
+}

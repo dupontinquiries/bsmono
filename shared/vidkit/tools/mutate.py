@@ -205,6 +205,12 @@ MUTANTS = [
      "            ticks.saturating_mul(1_000_000_000) / self.timescale.max(1) as u64,",
      "            ticks.saturating_mul(1_000_000),"),
 
+    ("seam/webm-seek-ignores-keyframes", "crates/vidkit-webm/src/lib.rs",
+     "self.cursor = self.keyframe_at_or_before(to.as_nanos() as u64);",
+     "self.cursor = self.blocks.iter().position(|b| b.timestamp_ns >= to.as_nanos() as u64).unwrap_or(0);"),
+    ("seam/webm-forgets-cluster-timestamp", "crates/vidkit-webm/src/segment.rs",
+     "        cluster_ts.saturating_add(rel as u64)", "        rel as u64"),
+
     # --- gesture routing ---------------------------------------------------
     ("gest/zone-midline-flipped", "crates/vidkit-egui/src/gestures.rs",
      "    if at.x >= surface.center().x {", "    if at.x < surface.center().x {"),

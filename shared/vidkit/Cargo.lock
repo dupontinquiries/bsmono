@@ -2557,6 +2557,7 @@ dependencies = [
  "uikit-gesture",
  "vidkit-core",
  "vidkit-mp4",
+ "vidkit-webm",
 ]
 
 [[package]]

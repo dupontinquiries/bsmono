@@ -192,9 +192,13 @@ pub fn open_bytes(data: Vec<u8>) -> Result<WebmDemuxer<MemorySource>> {
     WebmDemuxer::open(MemorySource(data))
 }
 
-#[cfg(test)]
-mod build {
-    //! EBML writer, so tests run against files whose every byte is known.
+/// EBML writer, so tests run against files whose every byte is known.
+///
+/// Public behind the `fixtures` feature (off by default) for the same reason
+/// as `vidkit_mp4::build`: the cross-crate pipeline test needs a real WebM,
+/// and a second writer would be free to drift from the parser it exercises.
+#[cfg(any(test, feature = "fixtures"))]
+pub mod build {
 
     /// Encode a value as a size VINT of the narrowest sufficient width.
     pub fn vint(value: u64) -> Vec<u8> {
