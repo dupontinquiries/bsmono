@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use vidkit_core::frame::{ColorInfo, CpuPlanes, Frame, FrameData, PlaneLayout};
 use vidkit_core::traits::Presenter;
-use vidkit_egui::{EguiPresenter, Fit, Transport, VideoView};
+use vidkit_egui::{bottom_bar, next_fit, EguiPresenter, Fit, Transport, VideoView};
+use uikit_egui::{skin::Skin, PaletteColors};
 
 const W: usize = 640;
 const H: usize = 360;
@@ -91,12 +92,13 @@ struct Demo {
     view: VideoView,
     transport: Transport,
     started: Instant,
-    installed: bool,
+    colors: PaletteColors,
+    skin: Skin,
 }
 
 impl Demo {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        vidkit_egui::install(&cc.egui_ctx, snapclone_theme::palette_by_id("dark"));
+        let colors = vidkit_egui::install(&cc.egui_ctx, snapclone_theme::palette_by_id("dark"));
         Self {
             presenter: EguiPresenter::new(&cc.egui_ctx),
             view: {
@@ -112,11 +114,12 @@ impl Demo {
             transport: Transport {
                 duration: Some(Duration::from_secs(212)),
                 playing: true,
-                status: "NV12 640x360 · synthetic · CPU convert".into(),
+                status: "NV12 640x360 · CPU convert".into(),
                 ..Default::default()
             },
             started: Instant::now(),
-            installed: true,
+            colors,
+            skin: Skin::carved(),
         }
     }
 }
@@ -127,7 +130,6 @@ impl eframe::App for Demo {
 
     #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
-        let _ = self.installed;
         let t = self.started.elapsed().as_secs_f32();
 
         if self.transport.playing {
@@ -141,42 +143,43 @@ impl eframe::App for Demo {
         self.presenter.schedule_repaint();
 
         egui::TopBottomPanel::bottom("transport").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui
-                    .button(if self.transport.playing { "pause" } else { "play" })
-                    .clicked()
-                {
-                    self.transport.playing = !self.transport.playing;
-                }
-                ui.label(vidkit_egui::format_time(self.transport.position));
-                if let Some(d) = self.transport.duration {
-                    ui.label(format!("/ {}", vidkit_egui::format_time(d)));
-                }
-                if let Some(p) = vidkit_egui::progress(self.transport.position, self.transport.duration)
-                {
-                    ui.add(egui::ProgressBar::new(p).desired_width(220.0));
-                }
-                ui.label(&self.transport.status);
-                ui.label(format!("uploads {}", self.presenter.upload_count()));
+            let act = bottom_bar(ui, &mut self.transport, self.view.fit, &self.colors, &self.skin);
+            if act.toggle_play {
+                self.transport.playing = !self.transport.playing;
+            }
+            if let Some(to) = act.seek_to {
+                self.transport.position = to;
+            }
+            if act.rotate {
+                self.transport.rotation = vidkit_egui::apply_rotation(self.transport.rotation, 1);
+            }
+            if act.cycle_fit {
+                self.view.fit = next_fit(self.view.fit);
+            }
+            if act.reset_view {
+                self.transport.zoom = 1.0;
+                self.transport.rotation = 0;
+            }
+        });
+
+        egui::TopBottomPanel::bottom("hints").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.small("drag ↔ scrub (higher = faster)");
+                ui.separator();
+                ui.small("left ↕ volume");
+                ui.separator();
+                ui.small("right ↕ speed");
+                ui.separator();
+                ui.small("right edge ↕ rotate");
+                ui.separator();
+                ui.small("pinch: 5% zoom, far = fit/fill");
+                ui.separator();
+                ui.small("tap: play/pause");
             });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let dbg_surface = ui.available_rect_before_wrap();
-            let dbg_fit = vidkit_egui::fit_rect(
-                dbg_surface,
-                self.presenter.frame_size(),
-                vidkit_egui::PixelAspect::SQUARE,
-                vidkit_egui::Fit::Contain,
-            );
-            let (_r, action) = self.view.show(ui, &self.presenter, &self.transport);
-            self.transport.status = format!(
-                "surface {:.0}x{:.0} -> image {:.0}x{:.0} (aspect {:.3}, want {:.3})",
-                dbg_surface.width(), dbg_surface.height(),
-                dbg_fit.width(), dbg_fit.height(),
-                dbg_fit.width() / dbg_fit.height().max(1.0),
-                W as f32 / H as f32,
-            );
+            let (_r, action) = self.view.show(ui, &self.presenter, &mut self.transport);
             if action.toggle_play {
                 self.transport.playing = !self.transport.playing;
             }

@@ -23,10 +23,17 @@
 //! surface in this tree — switcheroo shipped with `★`, `☆` and `↻` rendering as
 //! boxes because it was the one app that skipped it.
 
+pub mod bar;
 pub mod fit;
+pub mod gestures;
 pub mod presenter;
 pub mod view;
 
+pub use gestures::{
+    apply_rotation, apply_speed_step, apply_volume_step, apply_zoom_step, DragAxis, GestureConfig,
+    GestureRouter, Intent, ViewLock, Zone,
+};
+pub use bar::{bottom_bar, fit_label, next_fit, BarAction};
 pub use fit::{fit_rect, surface_to_frame, Fit, PixelAspect};
 pub use presenter::EguiPresenter;
 pub use view::{format_time, progress, scrub_fraction, scrub_target, Transport, VideoView, ViewAction};
