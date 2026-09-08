@@ -72,6 +72,20 @@ pub enum Shape {
     /// Tapers from `r` at the base to `r2` at the tip -- a limb of
     /// uniform thickness reads as plumbing.
     Capsule { r: f32, r2: f32, len: f32, dir: f32, pitch: f32 },
+    /// A SILHOUETTE SPUN AROUND A VERTICAL AXIS: radius at each height,
+    /// from the base up. The single most general shape there is, and
+    /// the one that was missing.
+    ///
+    /// A breadth test over 43 ordinary requests found 27 with no
+    /// scaffolding at all -- a mushroom, an hourglass, a chess piece, a
+    /// lantern, a pagoda, a vase. Every one of them is a profile: the
+    /// mushroom narrow then flaring, the hourglass wide-pinch-wide, the
+    /// chess piece a stack of discs. Adding a form for each is a bigger
+    /// menu; adding the profile is the generalisation.
+    ///
+    /// And it is what a small model CAN write. Not code, not a body
+    /// plan -- a list of numbers.
+    Profile { radii: Vec<f32>, h: f32, square: bool },
     /// A chain of capsules following a curve: a spine, a neck, a tail.
     /// This is what makes a neck a neck rather than a stack of balls --
     /// the whole reason the reference dragon reads as an animal.
@@ -103,6 +117,10 @@ impl Shape {
                  (len * p.sin()).abs() / 2.0 + rr,
                  (len * a.sin() * p.cos()).abs() / 2.0 + rr]
             }
+            Shape::Profile { radii, h, .. } => {
+                let m = radii.iter().cloned().fold(1.0f32, f32::max);
+                [m, h / 2.0, m]
+            }
             Shape::Spine { r, r2, len, dir, arch, .. } => {
                 let rr = r.max(*r2);
                 let a = dir.to_radians();
@@ -119,6 +137,7 @@ impl Shape {
             Shape::Cone { .. } => "cone", Shape::Helix { .. } => "helix",
             Shape::Slab { .. } => "slab", Shape::Link { .. } => "link",
             Shape::Capsule { .. } => "capsule", Shape::Spine { .. } => "spine",
+            Shape::Profile { .. } => "profile",
         }
     }
 }
@@ -278,6 +297,19 @@ pub fn parse(src: &str) -> (Sketch, Vec<String>) {
                         let w = kv(&t, "w").or(kv(&t, "size")).unwrap_or(10.0);
                         Shape::Slab { w, d: kv(&t, "d").unwrap_or(w),
                                       thickness: kv(&t, "thickness").or(kv(&t, "t")).unwrap_or(1.0) }
+                    }
+                    "profile" | "revolve" | "lathe" | "silhouette" => {
+                        let radii: Vec<f32> = t.iter()
+                            .find_map(|x| x.strip_prefix("r=").or_else(|| x.strip_prefix("radii=")))
+                            .map(|v| v.split(',').filter_map(|n| n.trim().parse().ok())
+                                 .filter(|x: &f32| *x >= 0.0 && *x < 600.0).collect())
+                            .unwrap_or_default();
+                        if radii.len() < 2 {
+                            errs.push(format!("profile needs at least two radii, as r=2,6,3: {line:?}"));
+                            continue;
+                        }
+                        Shape::Profile { radii, h: kv(&t, "h").unwrap_or(16.0).clamp(2.0, 512.0),
+                                         square: t.contains(&"square") }
                     }
                     "capsule" | "limb" | "arm" | "leg" | "bone" => {
                         let r = kv(&t, "r").unwrap_or(1.5);
@@ -615,6 +647,8 @@ fn reach(s: &Shape) -> (f32, f32, f32) {
 /// A shape with a new length, keeping everything else.
 fn set_len(s: &Shape, l: f32) -> Shape {
     match s {
+        Shape::Profile { radii, square, .. } =>
+            Shape::Profile { radii: radii.clone(), h: l, square: *square },
         Shape::Capsule { r, r2, dir, pitch, .. } =>
             Shape::Capsule { r: *r, r2: *r2, len: l, dir: *dir, pitch: *pitch },
         Shape::Spine { r, r2, dir, arch, segments, .. } =>
@@ -635,6 +669,8 @@ fn scale(s: &Shape, f: f32) -> Shape {
             Shape::Helix { r: r * f, h: h * f, turns: *turns, thickness: thickness.max(1.0) },
         Shape::Slab { w, d, thickness } => Shape::Slab { w: w * f, d: d * f, thickness: thickness.max(1.0) },
         Shape::Link { thickness } => Shape::Link { thickness: *thickness },
+        Shape::Profile { radii, h, square } =>
+            Shape::Profile { radii: radii.iter().map(|r| r * f).collect(), h: h * f, square: *square },
         Shape::Capsule { r, r2, len, dir, pitch } =>
             Shape::Capsule { r: r * f, r2: r2 * f, len: len * f, dir: *dir, pitch: *pitch },
         Shape::Spine { r, r2, len, dir, arch, segments } =>
@@ -749,6 +785,29 @@ fn cells_at(p: &Placed, at_i: (i32, i32, i32), block: u16) -> Vec<(i32, i32, i32
                 }}}
             }
         }
+        Shape::Profile { radii, h, square } => {
+            // Radii are keyed to the profile's own height and
+            // INTERPOLATED between, so five numbers describe a smooth
+            // vase rather than five discs. A model gives the shape, not
+            // the resolution.
+            let hi = h.max(2.0);
+            let n = radii.len().max(2);
+            let base = at.1 - hi / 2.0;
+            for k in 0..=(hi as i32) {
+                let f = k as f32 / hi;
+                let pos = f * (n - 1) as f32;
+                let i = (pos.floor() as usize).min(n - 2);
+                let t = pos - i as f32;
+                let rr = radii[i] + (radii[i + 1] - radii[i]) * t;
+                if rr < 0.4 { continue; }
+                let ri = rr.ceil() as i32;
+                for dx in -ri..=ri { for dz in -ri..=ri {
+                    let inside = if *square { dx.abs() as f32 <= rr && dz.abs() as f32 <= rr }
+                                 else { ((dx * dx + dz * dz) as f32).sqrt() <= rr };
+                    if inside { push(at.0 + dx as f32, base + k as f32, at.2 + dz as f32); }
+                }}
+            }
+        }
         Shape::Capsule { r, r2, len, dir, pitch } => {
             let a = dir.to_radians();
             let p = pitch.to_radians();
@@ -826,7 +885,7 @@ fn cells_at(p: &Placed, at_i: (i32, i32, i32), block: u16) -> Vec<(i32, i32, i32
 pub fn needs_cells(placed: &[Placed]) -> Vec<&Placed> {
     placed.iter().filter(|p| matches!(p.shape,
         Shape::Torus { .. } | Shape::Cone { .. } | Shape::Helix { .. } | Shape::Link { .. }
-        | Shape::Capsule { .. } | Shape::Spine { .. })).collect()
+        | Shape::Capsule { .. } | Shape::Spine { .. } | Shape::Profile { .. })).collect()
 }
 
 #[cfg(test)]
@@ -1027,5 +1086,68 @@ mod tests {
         let none = |_x: i32, _z: i32| None;
         let (_, notes) = resolve_grounded(&sk, (0, 64, 0), &BTreeMap::new(), Some(&none));
         assert!(notes.iter().any(|n| n.contains("there is none below it")), "{notes:?}");
+    }
+
+    #[test]
+    fn a_profile_is_the_shape_that_covers_the_things_with_no_form() {
+        // A breadth test over 43 ordinary requests found 27 with no
+        // scaffolding at all. A mushroom, an hourglass, a chess piece,
+        // a lantern, a pagoda: every one is a profile.
+        let cases = [
+            ("mushroom",  "part m profile r=1.5,1.2,1,7,5,0.5 h=20 material=stone"),
+            ("hourglass", "part g profile r=7,4,1,1,4,7 h=24 material=glass"),
+            ("chess",     "part p profile r=6,5,2.5,2,4,3,2.5,4 h=30 material=quartz"),
+            ("vase",      "part v profile r=3,6,7,5,3,4 h=18 material=sandstone"),
+            ("silo",      "part s profile r=8,8,8,8,7,4 h=40 material=stone square"),
+        ];
+        for (name, line) in cases {
+            let (sk, errs) = parse(&format!("{line}\n"));
+            assert!(errs.is_empty(), "{name}: {errs:?}");
+            let (placed, _) = resolve(&sk, (0, 64, 0));
+            let cells = cells(&placed[0], 1);
+            assert!(!cells.is_empty(), "{name} built nothing");
+            // it is the height asked for
+            let h = cells.iter().map(|c| c.1).max().unwrap() - cells.iter().map(|c| c.1).min().unwrap();
+            let want: i32 = line.split("h=").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+            assert!((h - want).abs() <= 2, "{name}: {h} tall, asked {want}");
+        }
+        // AND THE SILHOUETTE IS THE ONE DESCRIBED. A mushroom is narrow
+        // low down and wide at the top; an hourglass is the opposite of
+        // itself in the middle.
+        let width_at = |line: &str, frac: f32| -> i32 {
+            let (sk, _) = parse(&format!("{line}\n"));
+            let (placed, _) = resolve(&sk, (0, 64, 0));
+            let c = cells(&placed[0], 1);
+            let (lo, hi) = (c.iter().map(|x| x.1).min().unwrap(), c.iter().map(|x| x.1).max().unwrap());
+            let y = lo + ((hi - lo) as f32 * frac) as i32;
+            let at: Vec<i32> = c.iter().filter(|x| x.1 == y).map(|x| x.0).collect();
+            if at.is_empty() { 0 } else { at.iter().max().unwrap() - at.iter().min().unwrap() }
+        };
+        let m = cases[0].1;
+        assert!(width_at(m, 0.8) > width_at(m, 0.3) * 2, "a mushroom flares: {} vs {}",
+                width_at(m, 0.8), width_at(m, 0.3));
+        let g = cases[1].1;
+        assert!(width_at(g, 0.5) < width_at(g, 0.1) / 2, "an hourglass pinches: {} vs {}",
+                width_at(g, 0.5), width_at(g, 0.1));
+        // square makes a tower, not a silo
+        let round = cells(&resolve(&parse("part s profile r=8,8 h=10 material=stone\n").0,
+                                  (0, 64, 0)).0[0], 1).len();
+        let sq = cells(&resolve(&parse("part s profile r=8,8 h=10 material=stone square\n").0,
+                                (0, 64, 0)).0[0], 1).len();
+        assert!(sq > round, "a square profile fills its corners: {sq} vs {round}");
+    }
+
+    #[test]
+    fn a_profile_needs_enough_radii_to_be_a_shape() {
+        let (_, errs) = parse("part x profile h=10 material=stone\n");
+        assert!(errs.iter().any(|e| e.contains("at least two radii")), "{errs:?}");
+        let (_, e2) = parse("part x profile r=5 h=10 material=stone\n");
+        assert!(e2.iter().any(|e| e.contains("at least two radii")), "{e2:?}");
+        // and a zero radius is a gap, not an error: an hourglass may
+        // pinch to nothing
+        let (sk, e3) = parse("part x profile r=6,0,6 h=12 material=stone\n");
+        assert!(e3.is_empty(), "{e3:?}");
+        let (placed, _) = resolve(&sk, (0, 64, 0));
+        assert!(!cells(&placed[0], 1).is_empty());
     }
 }

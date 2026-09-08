@@ -157,7 +157,18 @@ for you. Sizes are fine; positions are not.
   rel NAME RELATION OTHER [by=N] [dir=north|south|east|west] [count=N] [radius=N] [gap=N]
 
 SHAPES: sphere, box, cylinder, torus (a ring), cone, helix (a spiral), slab, link (a beam
-between two parts)
+between two parts), capsule (a limb), profile
+
+PROFILE IS THE MOST USEFUL ONE. It is a silhouette spun around an upright axis: give the
+radius at each height from the base up, and the shape is filled in between.
+
+  part cap profile r=1.5,1.2,1,7,5,0.5 h=20 material=oak    a mushroom: narrow, then flaring
+  part g profile r=7,4,1,1,4,7 h=24 material=glass          an hourglass: wide, pinched, wide
+  part p profile r=6,5,2.5,2,4,3,4 h=30 material=quartz     a chess piece
+  part s profile r=8,8,8,7,4 h=40 material=stone square     a square tower, tapering
+
+Reach for it whenever the thing has a silhouette: a vase, a bell, a lantern, a pagoda, a
+silo, a tree, a fountain, a dome, a spire. Draw the outline in numbers.
 
 RELATIONS: inside, around, on, above, below, beside, level, between A B, ring_of (copies on
 a circle), stack (copies stacked up)
@@ -171,6 +182,12 @@ part core sphere r=2 material=ice
 rel shell above ground by=10
 rel water inside shell
 rel core inside water
+
+EXAMPLE
+part stalk profile r=2,1.6,1.5,1.6,2 h=14 material=oak_planks
+part cap profile r=1,9,8,5,1 h=8 material=stone
+rel stalk on ground
+rel cap on stalk
 
 EXAMPLE
 part shaft cylinder r=2 h=40 material=stone
