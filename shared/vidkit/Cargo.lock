@@ -387,6 +387,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-kit"
+version = "0.1.0"
+
+[[package]]
 name = "crc32fast"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1065,6 +1069,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipc-kit"
+version = "0.1.0"
+dependencies = [
+ "net-kit",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1305,6 +1316,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "models-kit"
+version = "0.1.0"
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1387,6 +1402,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "net-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
 ]
 
 [[package]]
@@ -2559,6 +2581,7 @@ dependencies = [
  "vidkit-mp4",
  "vidkit-webm",
  "vidkit-ytdlp",
+ "voiced-core",
 ]
 
 [[package]]
@@ -2614,6 +2637,21 @@ dependencies = [
  "serde",
  "serde_json",
  "vidkit-core",
+]
+
+[[package]]
+name = "voice-kit"
+version = "0.1.0"
+dependencies = [
+ "models-kit",
+]
+
+[[package]]
+name = "voiced-core"
+version = "0.1.0"
+dependencies = [
+ "ipc-kit",
+ "voice-kit",
 ]
 
 [[package]]

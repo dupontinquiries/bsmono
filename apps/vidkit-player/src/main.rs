@@ -118,6 +118,7 @@ struct Player {
     gpu_error: Option<String>,
     /// `cmd_` because `palette` is already the colour palette.
     cmd_palette: vidkit_egui::palette::PaletteState,
+    chrome: vidkit_egui::Chrome,
 }
 
 /// File-picker state. Navigation is uikit-egui's PathPicker; the file list and
@@ -230,6 +231,7 @@ impl Player {
             gpu,
             gpu_error,
             cmd_palette: Default::default(),
+            chrome: Default::default(),
         }
     }
 
@@ -280,6 +282,28 @@ impl eframe::App for Player {
         }
         self.presenter.schedule_repaint();
 
+        // Any pointer activity wakes the chrome. A modal open holds it up, as
+        // does being paused -- both are moments the viewer is using the UI.
+        let now = Instant::now();
+        // Sampled BEFORE waking. `wake` makes the chrome interactive again in
+        // the same frame, so asking afterwards always says "act" and the tap
+        // that was meant to reveal also toggles playback -- which is exactly
+        // what happened, and only a screenshot showed it: the policy had the
+        // rule and the player never asked.
+        let tap_only_reveals = self.chrome.tap_reveals();
+        let moved = ctx.input(|i| {
+            i.pointer.velocity().length() > 0.5 || i.pointer.any_down() || !i.events.is_empty()
+        });
+        if moved {
+            self.chrome.wake(now);
+        }
+        self.chrome
+            .update(now, self.transport.playing, self.cmd_palette.open);
+        if let Some(after) = self.chrome.next_repaint() {
+            ctx.request_repaint_after(after);
+        }
+        let chrome_alpha = self.chrome.alpha();
+
         // Ctrl+P, and a button in the bar for anyone who does not know that.
         // A palette reachable only by a shortcut is a palette most people never
         // find.
@@ -295,7 +319,9 @@ impl eframe::App for Player {
             self.run_action(action);
         }
 
+        if !self.chrome.hidden() {
         egui::TopBottomPanel::bottom("transport").show(ctx, |ui| {
+            ui.set_opacity(chrome_alpha);
             let adaptive = Adaptive::detect(ui.ctx());
             let act = bottom_bar(
                 ui,
@@ -325,9 +351,11 @@ impl eframe::App for Player {
                 self.transport.rotation = 0;
             }
         });
+        }
 
-        if !Adaptive::detect(ctx).is_compact() {
+        if !Adaptive::detect(ctx).is_compact() && !self.chrome.hidden() {
             egui::TopBottomPanel::bottom("hints").show(ctx, |ui| {
+                ui.set_opacity(chrome_alpha);
                 ui.horizontal_wrapped(|ui| {
                     ui.small("drag ↔ scrub (higher = faster)");
                     ui.separator();
@@ -387,7 +415,11 @@ impl eframe::App for Player {
                 return;
             }
             let (_r, action) = self.view.show(ui, &self.presenter, &mut self.transport);
-            if action.toggle_play {
+            if action.toggle_play && tap_only_reveals {
+                // Consumed by bringing the chrome back. Doing both means the
+                // viewer asks to see the controls and gets a pause they have to
+                // undo.
+            } else if action.toggle_play {
                 self.transport.playing = !self.transport.playing;
             }
             if let Some(to) = action.seek_to {

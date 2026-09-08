@@ -252,6 +252,27 @@ MUTANTS = [
      "let ix = yi * stride + (xi * comps + comp) * fmt.bytes();",
      "let ix = yi * stride + (xi * comps + comp);"),
 
+    # --- auto-hiding chrome ---------------------------------------------------
+    ("chrome/hides-while-paused", "crates/vidkit-egui/src/chrome.rs",
+     "        if holding || !playing {", "        if holding {"),
+    ("chrome/hides-with-modal-open", "crates/vidkit-egui/src/chrome.rs",
+     "        if holding || !playing {", "        if false {"),
+    ("chrome/first-tap-acts", "crates/vidkit-egui/src/chrome.rs",
+     "    pub fn tap_reveals(&self) -> bool {\n        !self.interactive()\n    }",
+     "    pub fn tap_reveals(&self) -> bool {\n        false\n    }"),
+    ("chrome/settled-keeps-repainting", "crates/vidkit-egui/src/chrome.rs",
+     "        if (self.current - self.target).abs() > 0.001 {", "        if true {"),
+
+    # --- voice routing ---------------------------------------------------------
+    ("voice/speed-unclamped", "crates/vidkit-egui/src/voice.rs",
+     "Some(v) => Command::Do(Action::SetSpeed(v.clamp(0.25, 4.0))),",
+     "Some(v) => Command::Do(Action::SetSpeed(v)),"),
+    ("voice/volume-percentage-misread", "crates/vidkit-egui/src/voice.rs",
+     "                let f = if v > 1.0 { v / 100.0 } else { v };", "                let f = v;"),
+    ("voice/back-seeks-forwards", "crates/vidkit-egui/src/voice.rs",
+     "Command::Do(Action::SeekBy(-(parse_number(slot).unwrap_or(10.0) as i64)))",
+     "Command::Do(Action::SeekBy(parse_number(slot).unwrap_or(10.0) as i64))"),
+
     # --- command palette ------------------------------------------------------
     ("pal/ties-not-broken-on-length", "crates/vidkit-egui/src/palette.rs",
      "            .then(a.command.name.len().cmp(&b.command.name.len()))", ""),
