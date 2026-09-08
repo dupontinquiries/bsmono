@@ -71,9 +71,9 @@ trusting them.
 ## Commands
 
 ```sh
-cargo test --ignore-rust-version            # 299 tests
+cargo test --ignore-rust-version            # 304 tests
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json cargo test -p vidkit-vk
-python3 tools/mutate.py                     # 116 mutants, all must be killed
+python3 tools/mutate.py                     # 119 mutants, all must be killed
 python3 tools/mutate.py shader              # just the WGSL ones
 ```
 
@@ -126,6 +126,20 @@ recurring shapes:
   truncates to 104.
 
 Run the mutation sweep before trusting a refactor.
+
+## The seams are tested, not just the layers
+
+`crates/vidkit-egui/tests/pipeline.rs` runs the real `Mp4Demuxer` through the
+real `Player` into the real `EguiPresenter`, with only the codec stubbed —
+nothing decodes in this sandbox, and the codec is not what the seams are about.
+Its MP4 comes from `vidkit_mp4::build`, public behind a default-off `fixtures`
+feature, so there is one fixture writer rather than two free to drift.
+
+Every layer here was green in isolation long before this existed. Breaking
+three seams found the test caught only one of them on the first attempt, and
+both misses were fixtures in which the constraint could not bind — seeking to a
+time that happened to be a keyframe, and seeking after the decoder queue had
+already drained. The `seam/` mutants keep that honest.
 
 ## Invariants that are easy to break
 
