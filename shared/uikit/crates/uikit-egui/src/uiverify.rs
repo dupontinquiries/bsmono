@@ -169,6 +169,55 @@ pub fn contrast(a: Color32, b: Color32) -> f32 {
     (hi + 0.05) / (lo + 0.05)
 }
 
+/// What a region looks like, as the three numbers a test wants.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Look {
+    pub ink: f32,
+    pub contrast: f32,
+    /// The region's effective background — the colour the contrast was measured against.
+    pub bg: Color32,
+}
+
+/// The AA threshold for body text. Below this is not "a bit low": it is text someone squints
+/// at or misses, which is the failure this module exists to catch.
+pub const MIN_CONTRAST: f32 = 4.5;
+
+/// Enough ink to be sure something drew. A couple of stray antialiased pixels from a
+/// neighbour should not count as content.
+pub const MIN_INK: f32 = 0.01;
+
+impl Frame {
+    /// Measure a region.
+    pub fn look(&self, r: Rect, bg: Color32) -> Look {
+        Look { ink: self.ink_in(r, bg), contrast: self.contrast_in(r), bg: self.dominant(r) }
+    }
+
+    /// Panic with a readable reason if a region is blank or illegible.
+    ///
+    /// One call, because a test that has to spell out both checks tends to spell out one. The
+    /// two faults stay DISTINCT in the message: nothing-drawn is not drawn-and-invisible, and
+    /// conflating them would send someone hunting a missing widget that is right there in the
+    /// wrong colour. The numbers go in the message too — "assertion failed" tells whoever
+    /// hits this in six months nothing they can act on.
+    #[track_caller]
+    pub fn assert_legible(&self, what: &str, r: Rect, bg: Color32) {
+        let l = self.look(r, bg);
+        assert!(
+            l.ink >= MIN_INK,
+            "{what}: nothing drawn in {r:?} — {:.3} ink against {bg:?}. A pane that renders \
+             nothing passes every shape-level check there is.",
+            l.ink
+        );
+        assert!(
+            l.contrast >= MIN_CONTRAST,
+            "{what}: illegible in {r:?} — {:.2}:1 against its own background {:?}, below the \
+             {MIN_CONTRAST}:1 AA threshold.",
+            l.contrast,
+            l.bg
+        );
+    }
+}
+
 /// Rasterise a frame's shapes.
 ///
 /// Flat-shaded triangles with per-vertex colour interpolation and alpha blending. No texture
@@ -371,6 +420,46 @@ mod tests {
         let bottom = Rect::from_min_size(egui::pos2(0.0, 50.0), Vec2::new(100.0, 50.0));
         assert!(f.ink_in(top, BG) > 0.9, "{}", f.ink_in(top, BG));
         assert!(f.ink_in(bottom, BG) < 0.05, "{}", f.ink_in(bottom, BG));
+    }
+
+    /// The two faults are different and `look` separates them. Reporting an invisible widget
+    /// as "nothing drawn" would send someone hunting something that is right there.
+    #[test]
+    fn look_tells_a_blank_pane_from_an_invisible_one() {
+        let size = Vec2::new(80.0, 40.0);
+        let r = Rect::from_min_size(egui::pos2(0.0, 0.0), size);
+        let bar = |c: Color32| {
+            render(size, BG, move |ctx| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                    ui.painter().rect_filled(
+                        Rect::from_min_size(egui::pos2(10.0, 10.0), Vec2::new(40.0, 15.0)),
+                        0.0,
+                        c,
+                    );
+                });
+            })
+        };
+
+        // Nothing drawn: no ink. The fault a shape-level check cannot see at all.
+        assert!(blankish(&render(size, BG, |ctx| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |_ui| {});
+        }), r));
+
+        // Drawn and unreadable: INK IS PRESENT, contrast is not. Note the colour has to
+        // differ from the background by more than `ink`'s tolerance to count as drawn at all
+        // — a bar within two levels of the background IS background, and reporting it as ink
+        // would be the harness lying in the other direction.
+        let l = bar(Color32::from_rgb(58, 58, 68)).look(r, BG);
+        assert!(l.ink >= MIN_INK, "the bar left no ink: {l:?}");
+        assert!(l.contrast < MIN_CONTRAST, "an unreadable bar passed: {l:?}");
+
+        // Legible: both.
+        let good = bar(Color32::from_rgb(240, 240, 245));
+        good.assert_legible("pane", r, BG);
+    }
+
+    fn blankish(f: &Frame, r: Rect) -> bool {
+        f.look(r, BG).ink < MIN_INK
     }
 
     /// The numbers people quote, so a threshold in a test means what a designer thinks it
