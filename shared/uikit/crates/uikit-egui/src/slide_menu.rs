@@ -570,7 +570,20 @@ impl SlideMenu {
                 painter.rect_filled(rect, radius, fill);
                 painter.rect_stroke(rect, radius, Stroke::new(1.0_f32, vis.widgets.noninteractive.bg_stroke.color), StrokeKind::Inside);
                 let text_col = if hot_i { Color32::WHITE } else { vis.text_color() };
-                painter.text(rect.center(), Align2::CENTER_CENTER, &opt.label, FontId::proportional(18.0), text_col);
+                // FITTED, not just centred. This painted the label at a fixed 18pt with no
+                // wrap and no clip, so anything wider than the 52pt cell — "export log",
+                // "build all", any two-word action — ran out over its neighbours and the
+                // whole grid read as overlapping text. It got worse the moment the readable
+                // text floor raised sizes on a phone, which is where it was reported.
+                //
+                // Wrap first, shrink second: a two-word label reads better on two lines at
+                // full size than on one line at half of it.
+                let g = fit_label(painter, &opt.label, rect, text_col);
+                painter.galley(
+                    rect.center() - (g.size() * 0.5),
+                    g,
+                    text_col,
+                );
                 // Directional/deadband hint glyph at the cell's bottom edge (QML variant indicator).
                 if hot_i {
                     let hint = st.variant.hint();
@@ -589,6 +602,54 @@ impl SlideMenu {
         ui.ctx().request_repaint();
     }
 }
+
+/// Lay a cell's label out so it stays inside the cell.
+///
+/// Wrap to the cell's width first, then step the size down until the wrapped text also fits
+/// the cell's HEIGHT. In that order because a two-word label reads better on two lines at
+/// full size than on one line at half of it.
+///
+/// The floor is real: below it a label is present but unreadable, which is worse than an
+/// elided one, so the last step ELIDES rather than shrinking further — a reader can tell that
+/// "export…" is cut, and cannot tell that 6pt text says anything at all.
+pub fn fit_label(
+    painter: &egui::Painter,
+    label: &str,
+    cell: Rect,
+    color: Color32,
+) -> std::sync::Arc<egui::Galley> {
+    // Padding so the text does not touch the cell's stroke.
+    let (w, h) = (cell.width() - LABEL_PAD * 2.0, cell.height() - LABEL_PAD * 2.0);
+    let mut pt = LABEL_PT;
+    loop {
+        let g = painter.layout(label.to_string(), FontId::proportional(pt), color, w.max(1.0));
+        if g.size().y <= h || pt <= LABEL_MIN_PT {
+            if g.size().y <= h {
+                return g;
+            }
+            break;
+        }
+        pt -= 1.0;
+    }
+    // At the floor and still too tall: elide. A reader can tell "export…" is cut; they cannot
+    // tell that unreadably small text says anything.
+    let mut job = egui::text::LayoutJob::simple(
+        label.to_string(),
+        FontId::proportional(LABEL_MIN_PT),
+        color,
+        w.max(1.0),
+    );
+    job.wrap.max_rows = ((h / (LABEL_MIN_PT * 1.3)).floor() as usize).max(1);
+    job.wrap.break_anywhere = false;
+    painter.layout_job(job)
+}
+
+/// Label size before any shrinking.
+pub const LABEL_PT: f32 = 18.0;
+/// Below this a label is present but unreadable, which is worse than an elided one.
+pub const LABEL_MIN_PT: f32 = 11.0;
+/// Space between the text and the cell's stroke.
+pub const LABEL_PAD: f32 = 4.0;
 
 /// The shared press-drag-release gesture logic used by `show` and `show_stored`.
 fn run(menu: &SlideMenu, id: Id, st: &mut SlideState, ui: &mut Ui, host: &Response, options: &[SlideOption]) -> SlideOutcome {
@@ -1073,6 +1134,80 @@ mod tests {
     }
 
     #[test]
+    /// The reported fault: with the menu open, the labels were hard to read because each
+    /// one needed more space than its section had.
+    ///
+    /// It painted at a fixed 18pt with NO WRAP and NO CLIP into a 52pt square, so anything
+    /// wider than the cell — "export log", "build all", any two-word action — ran out over
+    /// its neighbours. The readable-text floor raising sizes on a phone is what made it
+    /// unmissable.
+    #[test]
+    fn a_long_label_stays_inside_its_cell() {
+        let ctx = egui::Context::default();
+        let cell = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::splat(52.0));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let p = ui.painter();
+                for label in ["export log", "build all", "copy", "test all", "copy last log"] {
+                    let g = fit_label(p, label, cell, Color32::WHITE);
+                    assert!(
+                        g.size().x <= cell.width() - LABEL_PAD,
+                        "{label:?} is {}pt wide in a {}pt cell",
+                        g.size().x,
+                        cell.width()
+                    );
+                    assert!(
+                        g.size().y <= cell.height() - LABEL_PAD,
+                        "{label:?} is {}pt tall in a {}pt cell",
+                        g.size().y,
+                        cell.height()
+                    );
+                }
+            });
+        });
+    }
+
+    /// Wrap first, shrink second: a two-word label reads better on two lines at full size
+    /// than on one line at half of it.
+    #[test]
+    fn a_two_word_label_wraps_before_it_shrinks() {
+        let ctx = egui::Context::default();
+        let cell = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::splat(52.0));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let p = ui.painter();
+                let two = fit_label(p, "build all", cell, Color32::WHITE);
+                assert!(two.rows.len() >= 2, "it shrank instead of wrapping");
+                // A short label needs neither and keeps the full size.
+                let one = fit_label(p, "copy", cell, Color32::WHITE);
+                assert_eq!(one.rows.len(), 1);
+                assert!(
+                    one.size().y >= two.size().y / 2.0,
+                    "a label that fits should not have been shrunk"
+                );
+            });
+        });
+    }
+
+    /// A single word longer than the cell cannot wrap. It must not shrink to nothing: below
+    /// the floor a label is present and unreadable, which is worse than an elided one — a
+    /// reader can tell "export…" is cut and cannot tell that 6pt text says anything.
+    #[test]
+    fn an_unwrappable_word_is_elided_rather_than_shrunk_to_nothing() {
+        let ctx = egui::Context::default();
+        let cell = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::splat(52.0));
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let p = ui.painter();
+                let g = fit_label(p, "supercalifragilistic", cell, Color32::WHITE);
+                assert!(g.size().y <= cell.height(), "{}", g.size().y);
+                // Still readable: nothing was rendered below the floor.
+                let smallest = g.rows.iter().map(|r| r.height()).fold(f32::MAX, f32::min);
+                assert!(smallest >= LABEL_MIN_PT * 0.9, "rendered at {smallest}pt");
+            });
+        });
+    }
+
     fn grid_dims_caps_columns_and_wraps_rows() {
         assert_eq!(grid_dims(0, 3), (0, 0));
         assert_eq!(grid_dims(2, 3), (2, 1));
