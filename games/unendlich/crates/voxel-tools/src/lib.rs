@@ -123,6 +123,8 @@ pub mod latent;
 pub mod expr;
 /// Parts and relations without coordinates, and the solver that grounds them.
 pub mod sketch;
+/// The stages a timelapse edits out: lighting, site prep, the palette trial.
+pub mod unshown;
 /// A dossier: plan once into a document, execute each part with fresh context.
 pub mod dossier;
 /// A bench: try, measure, compare, and see whether it improved.
