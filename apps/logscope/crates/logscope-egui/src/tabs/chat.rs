@@ -6761,6 +6761,43 @@ to have the Queen split it, or name the worker directly", candidates.join(", "))
     /// The binary comes from LOGSCOPE_SD_CLI, or `sd-cli` on PATH. Resolution failures are
     /// reported the way the fleet reports refusals: named, in the transcript, with the thing to
     /// fix — a silent no-op here would be indistinguishable from a broken build.
+    /// `:vision <image> <prompt>` — the image-IN half of the media pipeline.
+    ///
+    /// `model_kind` has recognised a vision projector since it was written and its guidance
+    /// ends at "load the VLM and point --mmproj at this", leaving the user to work out WHICH
+    /// vlm from a directory of similarly-named files. `visionpair` does the pairing; this is
+    /// the command that uses it.
+    ///
+    /// Staged as a note rather than spawned, which is what `:image` earned the hard way: the
+    /// argv is pure and pinned by tests, and a command you can read before it takes the GPU
+    /// for a minute is worth more than one that already started.
+    fn start_vision(&mut self, args: &str) {
+        let mut it = args.trim().splitn(2, char::is_whitespace);
+        let (Some(img), Some(prompt)) = (it.next().filter(|s| !s.is_empty()), it.next()) else {
+            self.note = "usage: :vision <image> <prompt> \u{2014} e.g. :vision shot.png what is on the screen".into();
+            return;
+        };
+        let models = logscope::llm_backend::default_models_dir();
+        let files: Vec<std::path::PathBuf> = std::fs::read_dir(&models)
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        let pairs = crate::visionpair::pairs(&files);
+        let Some(pair) = pairs.into_iter().next() else {
+            // NAMED, not just refused. "no vision model" leaves someone unable to tell
+            // whether they have the wrong files or the wrong directory.
+            self.note = format!(
+                ":vision needs a model with its mmproj beside it in {} \u{2014} found none. A projector                  alone is not enough: it pairs with the model it was trained with, and this refuses to                  guess.",
+                models.display()
+            );
+            return;
+        };
+        let bin = std::env::var_os("LOGSCOPE_MTMD_CLI")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("llama-mtmd-cli"));
+        let run = crate::visionpair::VisionRun::new(bin, pair, std::path::PathBuf::from(img), prompt);
+        self.note = format!("would run: {}", run.argv().join(" "));
+    }
+
     fn start_image(&mut self, prompt: &str) {
         let prompt = prompt.trim().to_string();
         if prompt.is_empty() {
@@ -7034,6 +7071,7 @@ an empty result set: nothing was searched.");
             Command::Branch => { if let Some(f) = self.walk_focus { self.branch_from = Some(f); } }
             Command::Attach(p) => self.attach_path(&p, ui),
             Command::Image(prompt) => self.start_image(&prompt),
+            Command::Vision(args) => self.start_vision(&args),
             Command::Goto(n) => {
                 let i = n.saturating_sub(1).min(self.msgs.len().saturating_sub(1));
                 // Glide along the graph's shortest path (like clicking a node) AND zoom in, so a voice "go to

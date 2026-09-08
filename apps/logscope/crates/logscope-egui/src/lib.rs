@@ -90,6 +90,8 @@ pub mod docorg; // document-organization convention: front-matter, generated ind
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod plaque_scroll;
 pub mod assets;
 pub mod mediagen;
+/// Image IN: pairing a vision projector with its model, and the command that follows.
+pub mod visionpair;
 pub mod decode;
 pub mod voice_dict;
 #[macro_use] pub mod log;

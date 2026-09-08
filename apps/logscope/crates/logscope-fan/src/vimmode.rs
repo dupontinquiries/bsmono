@@ -58,6 +58,9 @@ pub enum Command {
     /// Empty prompt is still an Image("") rather than Unknown: the handler says what is missing,
     /// which is a better error than "unknown command".
     Image(String),
+    /// `:vision <image> <prompt>` — ask a vision-language model about a picture. The image-IN
+    /// half of the media pipeline; `Image` above is image-out.
+    Vision(String),
     Goto(usize),       // :<N> / :goto <N>     — focus turn N (1-based as shown in the UI)
     Prune,             // :prune / :p          — prune the focused turn
     Unprune,           // :unprune / :up
@@ -477,6 +480,9 @@ pub fn parse_command(line: &str) -> Command {
         "b" | "branch" => Command::Branch,
         "a" | "add" | "attach" => Command::Attach(arg.to_string()),
         "image" | "img" | "draw" => Command::Image(arg.to_string()),
+        // Image IN. `see` and `look` because "vision" is the mechanism and the other two are
+        // what someone reaches for when they want the model to look at something.
+        "vision" | "see" | "look" => Command::Vision(arg.to_string()),
         "goto" => arg.parse::<usize>().ok().map(Command::Goto).unwrap_or_else(|| Command::Unknown(line.into())),
         "prune" | "p" => Command::Prune,
         "unprune" | "up" => Command::Unprune,
@@ -675,6 +681,13 @@ mod tests {
         assert_eq!(parse_command(":draw x"), Command::Image("x".into()));
         assert_eq!(parse_command(":image"), Command::Image(String::new()),
                    "an empty prompt reaches the handler, which can say what is missing");
+        // Image IN, beside image OUT: the two halves of the media pipeline, and the aliases
+        // someone actually types.
+        assert_eq!(parse_command(":vision shot.png what is this"),
+                   Command::Vision("shot.png what is this".into()));
+        assert_eq!(parse_command(":see a.png read the error"),
+                   Command::Vision("a.png read the error".into()));
+        assert_eq!(parse_command(":look b.png"), Command::Vision("b.png".into()));
         assert_eq!(parse_command(":attach /tmp/x.txt"), Command::Attach("/tmp/x.txt".into()));
         assert_eq!(parse_command(":add a.md"), Command::Attach("a.md".into()));
         assert_eq!(parse_command(":goto 12"), Command::Goto(12));
