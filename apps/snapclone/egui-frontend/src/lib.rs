@@ -82,6 +82,8 @@ pub mod face_consent;
 pub mod frame_pump;
 pub mod media_encode;
 pub mod video_backend;
+/// Asking the system which encoders it has, so `video_backend`'s decision has inputs.
+pub mod video_probe;
 pub mod video_record;
 pub mod firewall_backend;
 pub mod gossip;
@@ -4118,12 +4120,24 @@ impl Snapclone {
                     // would be the same lie `EncoderReady(true)` tells on the
                     // voice path — §14 — and this one is avoidable today.
                     self.shutter_note = match self.recorder.take() {
-                        Some(r) => format!(
-                            "would record {:.1}s — {} frames at {:.0} fps, no encoder linked yet",
-                            r.duration_secs(),
-                            r.frames(),
-                            r.measured_fps().unwrap_or(0.0),
-                        ),
+                        Some(r) => {
+                            // AND WHICH ENCODER IS MISSING. "no encoder linked yet" was true
+                            // and unactionable: nobody could tell whether the build lacked
+                            // support or the machine lacked a package.
+                            // `video_backend::choose`/`unavailable_report` have been pure and
+                            // tested all along with nothing supplying their probes;
+                            // `video_probe` is the probes.
+                            let why = match crate::video_probe::status(false) {
+                                Ok(b) => format!("encoder available: {}", b.name()),
+                                Err(missing) => missing.join("; "),
+                            };
+                            format!(
+                                "would record {:.1}s \u{2014} {} frames at {:.0} fps; {why}",
+                                r.duration_secs(),
+                                r.frames(),
+                                r.measured_fps().unwrap_or(0.0),
+                            )
+                        }
                         None => format!("recorded {:.1}s", duration_ms as f32 / 1000.0),
                     };
                 }
