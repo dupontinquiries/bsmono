@@ -14,11 +14,16 @@ pub use boxes::{ByteSource, Error, MemorySource, Result};
 pub use demux::Mp4Demuxer;
 pub use moov::{Sample, VideoTrack};
 
-#[cfg(test)]
-mod build {
-    //! A tiny MP4 writer, so the tests exercise the parser against files whose
-    //! every byte is known. Building the fixtures here rather than checking in
-    //! a binary means a failing test says which field is wrong.
+/// A tiny MP4 writer, so tests exercise the parser against files whose every
+/// byte is known. Building fixtures here rather than checking in a binary
+/// means a failing test says which field is wrong.
+///
+/// Public behind the `fixtures` feature (off by default, so ordinary builds do
+/// not carry it) because the cross-crate pipeline test needs a real MP4 too,
+/// and a second copy of this would be free to drift from the parser it is
+/// meant to exercise.
+#[cfg(any(test, feature = "fixtures"))]
+pub mod build {
 
     pub fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
         let mut v = Vec::with_capacity(payload.len() + 8);

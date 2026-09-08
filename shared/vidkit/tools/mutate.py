@@ -195,6 +195,16 @@ MUTANTS = [
     ("mp4/box-past-limit-allowed", "crates/vidkit-mp4/src/boxes.rs",
      "    if end > limit {", "    if false {"),
 
+    # --- cross-crate seams (only the pipeline test sees these) --------------
+    ("seam/player-seek-skips-decoder-flush", "crates/vidkit-core/src/player.rs",
+     "        self.decoder.flush()?;", ""),
+    ("seam/mp4-seek-ignores-keyframes", "crates/vidkit-mp4/src/demux.rs",
+     "self.cursor = self.track.sync_sample_at_or_before(ticks);",
+     "self.cursor = self.track.samples.iter().position(|s| s.dts >= ticks).unwrap_or(0);"),
+    ("seam/mp4-timescale-ignored", "crates/vidkit-mp4/src/moov.rs",
+     "            ticks.saturating_mul(1_000_000_000) / self.timescale.max(1) as u64,",
+     "            ticks.saturating_mul(1_000_000),"),
+
     # --- gesture routing ---------------------------------------------------
     ("gest/zone-midline-flipped", "crates/vidkit-egui/src/gestures.rs",
      "    if at.x >= surface.center().x {", "    if at.x < surface.center().x {"),

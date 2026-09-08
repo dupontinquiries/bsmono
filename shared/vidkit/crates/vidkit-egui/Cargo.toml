@@ -24,6 +24,11 @@ eframe = { version = "0.34", optional = true, default-features = false, features
 # is one of this crate's target platforms. See
 # maintenance/tools/eframe_backend_check.py.
 
+[dev-dependencies]
+# The cross-crate pipeline test drives the real demuxer through the real
+# player; `fixtures` exposes the same MP4 writer the demuxer's own tests use.
+vidkit-mp4 = { path = "../vidkit-mp4", features = ["fixtures"] }
+
 [features]
 demo = ["dep:eframe"]
 
