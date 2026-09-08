@@ -18,6 +18,7 @@
 //! from the file — and it beats a black window that cannot say why.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -109,6 +110,12 @@ struct Player {
     /// The file currently open, so the picker reopens beside it.
     path: Option<PathBuf>,
     quit: bool,
+    /// The GPU upload path, when `VIDKIT_GPU=1`: NV12 planes plus a conversion
+    /// shader, 1.5 bytes a pixel against the CPU path's 4.
+    gpu: Option<Arc<Mutex<vidkit_egui::glow_present::Nv12Gpu>>>,
+    /// Reported, never swallowed. A silent fallback to the CPU path means the
+    /// fast one can rot untested and nobody finds out.
+    gpu_error: Option<String>,
 }
 
 /// File-picker state. Navigation is uikit-egui's PathPicker; the file list and
@@ -174,6 +181,21 @@ impl Player {
         // boxes. Idempotent, so the double call costs nothing.
         uikit_egui::fonts::install(&cc.egui_ctx);
         let colors = vidkit_egui::install(&cc.egui_ctx, snapclone_theme::palette_by_id("dark"));
+
+        // Opt-in while it is unproven on hardware. The glow context is handed
+        // over HERE, in CreationContext -- not in `update` -- which is the
+        // detail that stalled the first attempt at this.
+        let (gpu, gpu_error) = if std::env::var("VIDKIT_GPU").as_deref() == Ok("1") {
+            match cc.gl.as_ref() {
+                Some(gl) => match unsafe { vidkit_egui::glow_present::Nv12Gpu::new(gl) } {
+                    Ok(g) => (Some(Arc::new(Mutex::new(g))), None),
+                    Err(e) => (None, Some(format!("GPU path unavailable: {e}"))),
+                },
+                None => (None, Some("no glow context (is the backend wgpu?)".into())),
+            }
+        } else {
+            (None, None)
+        };
         let opened = file.as_ref().map(|p| open_local(p));
 
         let status = match &opened {
@@ -203,15 +225,27 @@ impl Player {
             picker: None,
             path: file,
             quit: false,
+            gpu,
+            gpu_error,
         }
     }
 
     /// Feed the presenter. Until a decoder exists this is the test pattern —
     /// stated on screen rather than implied.
-    fn produce(&mut self) {
+    fn produce(&mut self, eframe_frame: &eframe::Frame) {
         let t = self.started.elapsed().as_secs_f32();
         let frame = pattern::bars(t * 0.25);
-        let _ = self.presenter.submit(frame);
+
+        if let (Some(gpu), Some(gl)) = (&self.gpu, eframe_frame.gl()) {
+            if let Ok(mut g) = gpu.lock() {
+                // SAFETY: eframe's glow context is current on the UI thread.
+                if let Err(e) = unsafe { g.upload(gl, &frame) } {
+                    self.gpu_error = Some(e);
+                }
+            }
+        } else {
+            let _ = self.presenter.submit(frame);
+        }
         self.presenter
             .set_deadline(Some(Instant::now() + Duration::from_millis(33)));
     }
@@ -232,7 +266,7 @@ impl eframe::App for Player {
             if let Some(d) = self.transport.duration {
                 self.transport.position = Duration::from_secs_f64(t % d.as_secs_f64().max(1.0));
             }
-            self.produce();
+            self.produce(_f);
         }
         self.presenter.schedule_repaint();
 
@@ -308,6 +342,22 @@ impl eframe::App for Player {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            if let Some(gpu) = self.gpu.clone() {
+                let surface = ui.available_rect_before_wrap();
+                let (w, h) = gpu.lock().map(|g| g.size()).unwrap_or((0, 0));
+                ui.painter()
+                    .rect_filled(surface, 0.0, egui::Color32::from_rgb(28, 24, 38));
+                let r = vidkit_egui::fit_rect(
+                    surface,
+                    egui::Vec2::new(w as f32, h as f32),
+                    vidkit_egui::PixelAspect::SQUARE,
+                    self.view.fit,
+                );
+                if r.width() > 0.0 {
+                    ui.painter().add(vidkit_egui::glow_present::callback(r, gpu));
+                }
+                return;
+            }
             let (_r, action) = self.view.show(ui, &self.presenter, &mut self.transport);
             if action.toggle_play {
                 self.transport.playing = !self.transport.playing;

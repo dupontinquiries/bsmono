@@ -2443,6 +2443,7 @@ version = "0.1.0"
 name = "vidkit-egui"
 version = "0.1.0"
 dependencies = [
+ "eframe",
  "egui",
  "snapclone-theme",
  "uikit-egui",
