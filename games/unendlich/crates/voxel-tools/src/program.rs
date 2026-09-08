@@ -362,11 +362,36 @@ pub fn run_in<W: crate::VoxelWorld>(w: &W, prog: &Program, anchor: (i32, i32, i3
                 // became stone silently, which loses the intent: a build
                 // asked for in "weathered granite" came out identical to
                 // one asked for in "stone", and nothing said why.
-                placed.iter().flat_map(|p| {
+                // SMOOTH THE JOINTS. Parts related by a `joint` are
+                // limbs meeting a body, and hard-unioning them leaves a
+                // visible seam -- which is most of why a figure reads
+                // as assembled rather than sculpted. `sketch::fillet`
+                // is `cad-kernel`'s SDF blend by another route.
+                let mut out: Vec<((i32, i32, i32), u16)> = placed.iter().flat_map(|p| {
                     let (b, why) = crate::palette::resolve_or_suggest(&p.material);
                     if let Some(w) = why { subs.push(w); }
                     raster(p).into_iter().map(move |c| (c, b))
-                }).collect()
+                }).collect();
+                let jointed: Vec<(&String, &String)> = sk.rels.iter()
+                    .filter(|(_, r, _)| matches!(r, sketch::Rel::Joint { .. }))
+                    .map(|(a, _, b)| (a, b)).collect();
+                if !jointed.is_empty() && out.len() < 400_000 {
+                    let of = |n: &str| placed.iter().find(|p| p.name == n)
+                        .map(|p| raster(p)).unwrap_or_default();
+                    for (a, b) in jointed {
+                        let (ca, cb) = (of(a), of(b));
+                        if ca.is_empty() || cb.is_empty() { continue; }
+                        let block = placed.iter().find(|p| &p.name == b)
+                            .and_then(|p| crate::plan::resolve_block(&p.material)).unwrap_or(1);
+                        let f = sketch::fillet(&ca, &cb, 2);
+                        if !f.is_empty() {
+                            r.notes.push(format!("{}: {} joint(s) smoothed at {}/{}",
+                                                 pass.name, f.len(), a, b));
+                            out.extend(f.into_iter().map(|c| (c, block)));
+                        }
+                    }
+                }
+                out
             }
             Source::Stamp { asset, at } => {
                 let Some(a) = assets.get(asset.as_str()) else {

@@ -880,6 +880,58 @@ fn cells_at(p: &Placed, at_i: (i32, i32, i32), block: u16) -> Vec<(i32, i32, i32
     out
 }
 
+/// Fill the crevice where two parts meet, so a limb reads as GROWING
+/// from a body rather than glued to it.
+///
+/// Ported in spirit from `cad-kernel`'s SDF `blend`, which is the
+/// polynomial smooth minimum:
+///
+///     h = clamp(0.5 + 0.5*(db - da)/k, 0, 1)
+///     db + (da - db)*h - k*h*(1 - h)
+///
+/// That needs distance fields, and this crate resolves to cell sets.
+/// The discrete equivalent of a smooth union is the same idea by
+/// another route: a cell close to BOTH surfaces is inside the blend
+/// even when it is inside neither shape. So the fillet is every empty
+/// cell within `k` of both parts, which fills exactly the crevice the
+/// smooth-min would have rounded.
+///
+/// This is why figures looked stiff and assembled. Every part was
+/// hard-unioned, so an arm met a torso at a seam you could see, and no
+/// amount of correct proportion or pose fixes a seam.
+pub fn fillet(a: &[(i32, i32, i32)], b: &[(i32, i32, i32)], k: i32) -> Vec<(i32, i32, i32)> {
+    let k = k.clamp(0, 6);
+    if k == 0 || a.is_empty() || b.is_empty() { return Vec::new(); }
+    let sa: BTreeSet<(i32, i32, i32)> = a.iter().copied().collect();
+    let sb: BTreeSet<(i32, i32, i32)> = b.iter().copied().collect();
+    // Only look near where the two actually come close: the whole of
+    // both bounding boxes is most of the figure, and a fillet applied
+    // everywhere is just a fatter figure.
+    let bounds = |s: &BTreeSet<(i32, i32, i32)>| s.iter().fold(
+        ((i32::MAX, i32::MAX, i32::MAX), (i32::MIN, i32::MIN, i32::MIN)),
+        |(l, h), c| ((l.0.min(c.0), l.1.min(c.1), l.2.min(c.2)),
+                     (h.0.max(c.0), h.1.max(c.1), h.2.max(c.2))));
+    let (alo, ahi) = bounds(&sa);
+    let (blo, bhi) = bounds(&sb);
+    let lo = (alo.0.max(blo.0) - k, alo.1.max(blo.1) - k, alo.2.max(blo.2) - k);
+    let hi = (ahi.0.min(bhi.0) + k, ahi.1.min(bhi.1) + k, ahi.2.min(bhi.2) + k);
+    if lo.0 > hi.0 || lo.1 > hi.1 || lo.2 > hi.2 { return Vec::new(); }
+    let near = |s: &BTreeSet<(i32, i32, i32)>, c: (i32, i32, i32)| {
+        for dx in -k..=k { for dy in -k..=k { for dz in -k..=k {
+            if dx * dx + dy * dy + dz * dz > k * k { continue; }
+            if s.contains(&(c.0 + dx, c.1 + dy, c.2 + dz)) { return true; }
+        }}}
+        false
+    };
+    let mut out = Vec::new();
+    for x in lo.0..=hi.0 { for y in lo.1..=hi.1 { for z in lo.2..=hi.2 {
+        let c = (x, y, z);
+        if sa.contains(&c) || sb.contains(&c) { continue; }
+        if near(&sa, c) && near(&sb, c) { out.push(c); }
+    }}}
+    out
+}
+
 /// Which parts `to_ir` could not express, so the caller knows to
 /// rasterise them.
 pub fn needs_cells(placed: &[Placed]) -> Vec<&Placed> {
@@ -1149,5 +1201,45 @@ mod tests {
         assert!(e3.is_empty(), "{e3:?}");
         let (placed, _) = resolve(&sk, (0, 64, 0));
         assert!(!cells(&placed[0], 1).is_empty());
+    }
+
+    #[test]
+    fn a_fillet_fills_the_crevice_where_two_parts_meet() {
+        // Every part was hard-unioned, so an arm met a torso at a seam
+        // you could see -- and no amount of correct proportion or pose
+        // fixes a seam. This is `cad-kernel`'s SDF blend by another
+        // route: a cell close to BOTH surfaces is inside the smooth
+        // union even when it is inside neither shape.
+        let (sk, _) = parse("part torso capsule r=5 r2=5 len=20 pitch=90 material=stone\n\
+                             part arm capsule r=2 r2=2 len=12 dir=0 pitch=-30 material=stone\n\
+                             rel torso above ground by=10\n\
+                             rel arm joint torso at=0.8 out=1.0\n");
+        let (placed, _) = resolve(&sk, (0, 64, 0));
+        let t: Vec<(i32, i32, i32)> = cells(&placed[0], 1).into_iter().map(|c| (c.0, c.1, c.2)).collect();
+        let a: Vec<(i32, i32, i32)> = cells(&placed[1], 1).into_iter().map(|c| (c.0, c.1, c.2)).collect();
+        let f = fillet(&t, &a, 3);
+        assert!(!f.is_empty(), "there is a crevice to fill");
+        // it fills BETWEEN them, not inside either
+        let ts: BTreeSet<_> = t.iter().copied().collect();
+        let as_: BTreeSet<_> = a.iter().copied().collect();
+        for c in &f {
+            assert!(!ts.contains(c) && !as_.contains(c), "{c:?} was already solid");
+        }
+        // and it is a modest amount: a fillet is a smoothing, not a
+        // second body
+        assert!(f.len() < t.len() / 2, "{} fillet cells against {} torso", f.len(), t.len());
+        // a bigger k fills more
+        assert!(fillet(&t, &a, 4).len() > f.len());
+        assert!(fillet(&t, &a, 0).is_empty(), "k=0 is a hard union, as before");
+    }
+
+    #[test]
+    fn parts_that_are_nowhere_near_each_other_get_no_fillet() {
+        // a fillet applied everywhere is just a fatter figure
+        let far_a = vec![(0, 64, 0), (0, 65, 0)];
+        let far_b = vec![(60, 64, 0), (60, 65, 0)];
+        assert!(fillet(&far_a, &far_b, 4).is_empty());
+        // and empty input is not a crash
+        assert!(fillet(&[], &far_b, 3).is_empty());
     }
 }
