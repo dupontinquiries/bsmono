@@ -2,7 +2,7 @@
 
 use crate::ebml::*;
 use vidkit_core::codec::{Chroma, Codec, VideoProfile};
-use vidkit_mp4::boxes::{read_exact_at, ByteSource, Error, Result};
+use vidkit_core::io::{read_exact_at, ByteSource, Error, Result};
 
 /// Default `TimestampScale` when Info omits it: one millisecond in
 /// nanoseconds. Assuming a different default silently scales the whole

@@ -19,7 +19,7 @@ use segment::{find_segment, index_cluster, parse_info, parse_video_track, BlockR
 use std::time::Duration;
 use vidkit_core::codec::VideoProfile;
 use vidkit_core::traits::{self as core_traits, MediaSource, Packet};
-use vidkit_mp4::boxes::{read_exact_at, ByteSource, Error, MemorySource, Result};
+use vidkit_core::io::{read_exact_at, ByteSource, Error, MemorySource, Result};
 
 pub struct WebmDemuxer<S: ByteSource> {
     src: S,

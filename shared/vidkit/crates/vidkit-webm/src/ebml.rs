@@ -13,7 +13,7 @@
 //!   and often unknown-size Clusters. An unknown size is not a corrupt file and
 //!   must not be read as a huge number.
 
-use vidkit_mp4::boxes::{ByteSource, Error, Result};
+use vidkit_core::io::{ByteSource, Error, Result};
 
 pub mod id {
     pub const EBML_HEADER: u32 = 0x1A45_DFA3;
@@ -221,7 +221,7 @@ pub fn read_uint<S: ByteSource + ?Sized>(src: &mut S, at: u64, len: u64) -> Resu
     if len == 0 || len > 8 {
         return Err(Error::Malformed(format!("uint of {len} bytes at {at}")));
     }
-    let buf = vidkit_mp4::boxes::read_exact_at(src, at, len as usize)?;
+    let buf = vidkit_core::io::read_exact_at(src, at, len as usize)?;
     let mut v = 0u64;
     for b in buf {
         v = (v << 8) | b as u64;
@@ -231,7 +231,7 @@ pub fn read_uint<S: ByteSource + ?Sized>(src: &mut S, at: u64, len: u64) -> Resu
 
 /// EBML floats are 4 or 8 bytes.
 pub fn read_float<S: ByteSource + ?Sized>(src: &mut S, at: u64, len: u64) -> Result<f64> {
-    let buf = vidkit_mp4::boxes::read_exact_at(src, at, len as usize)?;
+    let buf = vidkit_core::io::read_exact_at(src, at, len as usize)?;
     Ok(match len {
         4 => f32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as f64,
         8 => f64::from_be_bytes([

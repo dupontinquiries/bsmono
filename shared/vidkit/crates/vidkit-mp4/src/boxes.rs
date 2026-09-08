@@ -1,61 +1,11 @@
 //! ISOBMFF box traversal.
 //!
-//! Everything reads through [`ByteSource`], which is a random-access
-//! `read_at`, not a `Read + Seek`. That is deliberate: the two real sources
-//! are a local file and an HTTP server that supports range requests, and the
-//! range request is naturally a `read_at`. Modelling it as a cursor would mean
-//! inventing a seek position for something that has none, and would hide how
-//! many requests the demuxer actually makes.
+//! The byte-source seam moved to `vidkit_core::io`; it is re-exported here so
+//! existing paths keep working.
+
+pub use vidkit_core::io::{read_exact_at, ByteSource, Error, MemorySource, Result};
 
 use std::fmt;
-
-#[derive(Debug)]
-pub enum Error {
-    Io(String),
-    /// Ran off the end of the data.
-    Truncated { at: u64, wanted: usize },
-    /// Structurally invalid, with a note about where.
-    Malformed(String),
-    Unsupported(String),
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Io(s) => write!(f, "io: {s}"),
-            Error::Truncated { at, wanted } => {
-                write!(f, "truncated at {at}, wanted {wanted} bytes")
-            }
-            Error::Malformed(s) => write!(f, "malformed: {s}"),
-            Error::Unsupported(s) => write!(f, "unsupported: {s}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-pub type Result<T> = std::result::Result<T, Error>;
-
-/// Random access to the media bytes.
-pub trait ByteSource {
-    /// Fill `buf` from `offset`. Short reads are only allowed at end of data.
-    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize>;
-    /// Total length, when known. `None` for a stream of unknown size.
-    fn size(&self) -> Option<u64>;
-}
-
-/// Read exactly `len` bytes, or fail.
-pub fn read_exact_at<S: ByteSource + ?Sized>(src: &mut S, offset: u64, len: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; len];
-    let n = src.read_at(offset, &mut buf)?;
-    if n != len {
-        return Err(Error::Truncated {
-            at: offset,
-            wanted: len,
-        });
-    }
-    Ok(buf)
-}
 
 /// A four-character box type, kept as bytes so unknown types round-trip in
 /// error messages instead of turning into replacement characters.
@@ -254,20 +204,3 @@ pub fn be_u64(b: &[u8], at: usize) -> Result<u64> {
         .ok_or_else(|| Error::Malformed(format!("u64 read past end at {at}")))
 }
 
-/// In-memory source, for tests and for small files read up front.
-pub struct MemorySource(pub Vec<u8>);
-
-impl ByteSource for MemorySource {
-    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let start = offset as usize;
-        if start >= self.0.len() {
-            return Ok(0);
-        }
-        let n = buf.len().min(self.0.len() - start);
-        buf[..n].copy_from_slice(&self.0[start..start + n]);
-        Ok(n)
-    }
-    fn size(&self) -> Option<u64> {
-        Some(self.0.len() as u64)
-    }
-}
