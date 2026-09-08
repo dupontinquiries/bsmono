@@ -126,6 +126,23 @@ pub fn word_at(text: &str, char_index: usize) -> Option<&str> {
     (hi > lo).then(|| &text[lo..hi])
 }
 
+/// The whole line containing a character offset.
+///
+/// "Create a card from this word" cannot mean a card whose body is one word — a card is an
+/// atomic note and a bare noun is not one. The line the word sits on is the smallest thing
+/// around it that carries a claim, and it is what the reader was looking at.
+///
+/// Trailing whitespace is trimmed but leading is KEPT: an indented line in program output is
+/// indented for a reason, and a card that silently de-indents a stack frame or a diff line
+/// has changed what it says.
+pub fn line_at(text: &str, char_index: usize) -> Option<&str> {
+    let byte = text.char_indices().nth(char_index).map(|(b, _)| b)?;
+    let start = text[..byte].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let end = text[byte..].find('\n').map(|i| byte + i).unwrap_or(text.len());
+    let line = text[start..end].trim_end();
+    (!line.trim().is_empty()).then_some(line)
+}
+
 /// Rank a corpus of `(name, title, markdown)` against `query`, best first.
 ///
 /// Notes matching NOTHING are dropped rather than returned with a zero score: a suggestion
@@ -279,6 +296,27 @@ mod tests {
         assert_eq!(word_at(t, 3), Some("café"));
         assert_eq!(word_at(t, 6), Some("café"), "inside the accented character");
         assert_eq!(word_at(t, 8), Some("était"));
+    }
+
+    /// A card whose body is one word is not an atomic note — a bare noun carries no claim.
+    /// The line the word sits on is the smallest thing around it that does, and it is what
+    /// the reader was looking at.
+    #[test]
+    fn the_line_around_a_word_is_what_becomes_a_card() {
+        let t = "first line\n  indented second\nthird";
+        assert_eq!(line_at(t, 0), Some("first line"));
+        assert_eq!(line_at(t, 15), Some("  indented second"), "leading space is meaning");
+        assert_eq!(line_at(t, 31), Some("third"), "the last line has no newline after it");
+
+        // A blank line has nothing to say, so it is not a card.
+        assert_eq!(line_at("a\n\nb", 2), None);
+        assert_eq!(line_at("   \n", 1), None);
+        assert_eq!(line_at("", 0), None);
+        assert_eq!(line_at("abc", 99), None);
+
+        // Trailing whitespace goes; leading stays. A card that de-indents a stack frame or a
+        // diff line has changed what it says.
+        assert_eq!(line_at("  x   \ny", 2), Some("  x"));
     }
 
     /// A list padded to a fixed length with unrelated notes teaches that the suggestions are

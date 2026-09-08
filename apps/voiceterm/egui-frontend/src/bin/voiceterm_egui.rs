@@ -803,6 +803,9 @@ struct VoicetermApp {
     /// The last word tapped in a notebook cell and what the notes said about it. Held until
     /// dismissed or acted on — see the note at the tap site.
     word_ask: Option<(String, Vec<voiceterm_egui::note_search::Hit>)>,
+    /// The line the tapped word sat on, with the command that produced it — the body and the
+    /// provenance of the card "make a card" would create.
+    word_ask_line: Option<(String, String, u64)>,
     /// Whether the one-time narrow-surface default has been applied. Applied
     /// once rather than every frame, so collapsing is a starting position the
     /// user can override, not a cage that re-shuts whatever they open.
@@ -919,6 +922,46 @@ impl VoicetermApp {
     /// state is per-pane (`web_panes`, keyed by pane id) rather than one
     /// shared `Browser`, that has to mean the focused pane specifically,
     /// not just any web pane that happens to be open elsewhere in the tab.
+    /// Clip one line into the note, with the command that produced it.
+    ///
+    /// The card path and the clip path are the SAME path: cards in this app are derived from
+    /// the note by `split_into_cards`, and the deck is rebuilt from it. Pushing a card
+    /// straight into the deck would put it somewhere the next rebuild drops.
+    ///
+    /// Shares the classifier and the save rule with `ClipSelection` rather than repeating
+    /// them — a line clipped this way must look identical to the same line clipped by
+    /// selecting it, or the note would carry two kinds of clip that differ by which button
+    /// made them.
+    fn clip_line(&mut self, line: &str, command: &str, at: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let kind = voiceterm_egui::clip_kind::detect(
+            line,
+            voiceterm_egui::clip_kind::Context::from_command(command),
+        );
+        self.clip_note.push_clip(voiceterm_egui::note_clip::Clip {
+            kind,
+            content: line.to_string(),
+            source: voiceterm_egui::note_clip::Source::Terminal {
+                command: command.to_string(),
+                at,
+            },
+            captured_at: now,
+        });
+        let saved = match &self.clip_note_path {
+            Some(p) => voiceterm_egui::note_store::save_to(p, &self.clip_note),
+            None => voiceterm_egui::note_store::save(&self.clip_note).map(|p| {
+                self.clip_note_path = Some(p);
+            }),
+        };
+        match saved {
+            Ok(()) => self.toasts.success("card added to the note", 0.0),
+            Err(e) => self.toasts.warning(&format!("clipped, but not saved: {e}"), 0.0),
+        }
+    }
+
     /// Put the saved notes into the docs reader, if the set has changed.
     ///
     /// Called before the docs pane draws AND before anything opens a note by name: `open`
@@ -4377,6 +4420,7 @@ impl eframe::App for VoicetermApp {
                         // touch `self.docs` and `self.workspace`, which the closure cannot.
                         let mut open_note: Option<String> = None;
                         let mut dismiss_ask = false;
+                        let mut make_card = false;
                         if let Some((word, hits)) = self.word_ask.clone() {
                             ui.horizontal(|ui| {
                                 ui.colored_label(c.text_weak, format!("\u{201c}{word}\u{201d}"));
@@ -4393,6 +4437,17 @@ impl eframe::App for VoicetermApp {
                                     {
                                         open_note = Some(h.name.clone());
                                     }
+                                }
+                                // MAKE A CARD from the line, not the word. Cards in this app
+                                // come from the note — `split_into_cards` runs over it — so
+                                // this appends a clip rather than pushing a card into a deck
+                                // that is rebuilt from the note anyway and would drop it.
+                                if self.word_ask_line.is_some()
+                                    && ui.small_button("+ card")
+                                        .on_hover_text("clip this line into the note")
+                                        .clicked()
+                                {
+                                    make_card = true;
                                 }
                                 if ui.small_button("\u{d7}").on_hover_text("dismiss").clicked() {
                                     dismiss_ask = true;
@@ -4411,8 +4466,16 @@ impl eframe::App for VoicetermApp {
                             }
                             self.word_ask = None;
                         }
+                        if make_card {
+                            if let Some((line, command, at)) = self.word_ask_line.clone() {
+                                self.clip_line(&line, &command, at);
+                            }
+                            self.word_ask = None;
+                            self.word_ask_line = None;
+                        }
                         if dismiss_ask {
                             self.word_ask = None;
+                            self.word_ask_line = None;
                         }
                         let cells = &mut self.notebook_cells;
                         // THE WAY BACK, above everything. A dismissal with no visible undo
@@ -4452,6 +4515,7 @@ impl eframe::App for VoicetermApp {
                                 // The word a tap landed on, acted on after the draw: the
                                 // search reads the note corpus and `cells` is borrowed here.
                                 let mut word_tap: Option<String> = None;
+                                let mut word_line: Option<(String, String, u64)> = None;
                                 let mut swipe_end = false;
                                 ui.horizontal(|ui| {
                                     if ui.small_button(if folded { "\u{25b8}" } else { "\u{25be}" }).clicked() {
@@ -4507,6 +4571,7 @@ impl eframe::App for VoicetermApp {
                                     // three-second window to read a title and act on it is
                                     // not an action.
                                     self.word_ask = Some((w, hits));
+                                    self.word_ask_line = word_line;
                                 }
                                 if let Some(dx) = swipe_dx {
                                     if cells.drag_cell(b.id, dx) {
@@ -4576,6 +4641,14 @@ impl eframe::App for VoicetermApp {
                                                 word_tap = voiceterm_egui::note_search::word_at(
                                                     &b.output, cur.index)
                                                     .map(str::to_string);
+                                                // The LINE too, kept for "make a card": a
+                                                // card whose body is one word is not an
+                                                // atomic note, and the line is what the
+                                                // reader was actually looking at.
+                                                word_line = voiceterm_egui::note_search::line_at(
+                                                    &b.output, cur.index)
+                                                    .map(str::to_string)
+                                                    .map(|l| (l, b.command.clone(), b.started_at));
                                             }
                                         }
                                     }
@@ -5678,6 +5751,7 @@ fn main() -> eframe::Result<()> {
                 clip_note_path: None,
                 jotting: false,
                 word_ask: None,
+                word_ask_line: None,
                 compact_defaults_applied: false,
                 ingest: Default::default(),
                 // Discovery once at startup, not per frame: scanning

@@ -289,5 +289,22 @@ from the notebook did nothing while the identical click from the docs pane worke
 difference nobody reports as a bug, they just stop using the feature. `refresh_note_docs` is
 now called before either.
 
-STILL OPEN: "create card" — searching answers, and there is still no action that makes a new
-card from the word.
+### create card — DONE the same day
+
+"+ card" on the word strip clips the LINE the word sat on, not the word. A card whose body is
+one word is not an atomic note — a bare noun carries no claim — and the line is the smallest
+thing around it that does, and what the reader was looking at.
+
+Leading whitespace is kept and trailing trimmed: an indented line in program output is
+indented for a reason, and a card that silently de-indents a stack frame or a diff line has
+changed what it says.
+
+It goes through the CLIP path, not into the deck. Cards here are derived from the note by
+`split_into_cards` and the deck is rebuilt from it, so a card pushed into the deck lands
+somewhere the next rebuild drops. `clip_line` shares the classifier and the save rule with
+`ClipSelection` rather than repeating them — a line clipped this way must look identical to
+the same line clipped by selecting it, or the note carries two kinds of clip that differ by
+which button made them.
+
+Step 4 is finished: related notes, opening one, and making a card. Step 5 (image crops)
+remains.
