@@ -1183,6 +1183,48 @@ impl VoicetermApp {
                 let share = voiceterm_egui::zk_share::Share::from_cards(&self.deck.cards);
                 self.zk_share = Some(ZkShareUi { share, dialog: None, frames: Vec::new(), shown: None, note: String::new() });
             }
+            Command::OpenInEditor(phrase) => {
+                use voiceterm_egui::editor_open as eo;
+                match eo::parse_open_request(&phrase) {
+                    Some(req) => {
+                        // The host, against the real ssh config plus whatever this session
+                        // has been talking to. Config first — see `known_hosts`.
+                        let hosts = voiceterm_egui::editor_open_env::known_hosts(
+                            &voiceterm_egui::editor_open_env::ssh_config_hosts(),
+                            &[],
+                        );
+                        let host = req
+                            .host
+                            .as_deref()
+                            .and_then(|h| eo::resolve_host(h, &hosts))
+                            .map(|(h, _)| h);
+                        // A host that was ASKED FOR and did not resolve is refused rather
+                        // than silently opened locally: "edit the config on the build box"
+                        // run against this machine edits the wrong file, and the command
+                        // would look like it worked.
+                        if req.host.is_some() && host.is_none() {
+                            self.toasts.warning(
+                                &format!("no host matching {:?}", req.host.unwrap_or_default()),
+                                0.0,
+                            );
+                            return;
+                        }
+                        let spec = eo::OpenSpec {
+                            editor: req.editor.unwrap_or_else(
+                                voiceterm_egui::editor_open_env::default_editor),
+                            path: req.thing.clone(),
+                            line: req.line,
+                            host,
+                        };
+                        // STAGED, never run — the Qt build's contract, and the one every
+                        // other suggestion here keeps. A fuzzy path resolved to the wrong
+                        // file is a keystroke away from being fixed, and a keystroke past
+                        // being opened.
+                        self.stage_command(&eo::build_open_argv(&spec).join(" "));
+                    }
+                    None => self.toasts.warning("nothing to open in that", 0.0),
+                }
+            }
             Command::ToggleJotMode => {
                 self.jotting = !self.jotting;
                 // Said out loud both ways. A mode that silently swallows your next sentence

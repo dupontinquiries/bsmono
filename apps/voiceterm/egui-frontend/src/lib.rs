@@ -404,6 +404,12 @@ pub mod note_search;
 pub mod cmd_cluster;
 /// The dominant cluster label for a session, for naming it.
 pub mod session_cluster;
+/// "open <thing> on <host> at line N in <editor>" — slot parser, ssh-config hosts, argv.
+/// Pure and tested since v0.1.654, wired into the Qt build, never mounted here.
+#[path = "../../src/editor_open.rs"]
+pub mod editor_open;
+/// The I/O around `editor_open`: known hosts from ~/.ssh/config, and a default editor.
+pub mod editor_open_env;
 /// Is a clipped selection code or prose, and in what language? (`TODO_notes_clip.md`.)
 pub mod clip_kind;
 /// Who owns the keyboard when a terminal is on screen (Tab, the arrows, and the sidebar).

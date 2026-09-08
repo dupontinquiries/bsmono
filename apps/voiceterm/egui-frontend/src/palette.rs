@@ -109,6 +109,12 @@ pub enum Command {
     /// A command rather than only a spoken phrase, because a mode you can only ENTER by
     /// voice is unreachable the moment the microphone mishears its own trigger.
     ToggleJotMode,
+    /// "open <thing> [on <host>] [at line N] [in vim|helix]" — slot-parse the phrase, resolve
+    /// the host against ~/.ssh/config, and STAGE the editor command on the terminal line.
+    ///
+    /// `editor_open` has been pure and tested since v0.1.654 and wired into the Qt build; it
+    /// was never mounted in this frontend.
+    OpenInEditor(String),
     /// Share the zettelkasten as a huge QR code — the picker with the
     /// paintbrush, two confirmation gates, then the code (`zk_share`).
     /// Reachable from the notes panes' palette like everything else here.

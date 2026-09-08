@@ -78,3 +78,38 @@ src/editor_open.rs (9 tests, in harness, compile gate green):
 - Default editor when unspecified is currently vim; could honor $EDITOR /
   detect_editor. Small follow-up.
 - Optional: spawn in a NEW zellij pane instead of the current line.
+
+
+## DONE in the egui frontend (2026-09-07)
+
+`editor_open` was pure, tested (16 tests) and wired into the Qt build since v0.1.654 — and
+never mounted in this frontend at all. Mounting it brought those 16 tests into this crate for
+the first time.
+
+Item 1 of "STILL TO WIRE" — the ssh-config read and the recent-hosts merge — is
+`editor_open_env`, kept separate so the parser stays testable without a home directory.
+
+CONFIG HOSTS OUTRANK RECENT ONES, and that order is the whole point: `resolve_host` ranks
+over the list, and a host recorded as `buildbox` while configured as `build-box` must resolve
+to the CONFIGURED spelling or the ssh fails with a name error after everything else went
+right. Deduped case-insensitively.
+
+A missing or unreadable config is an empty list, not a failure. Plenty of people have no ssh
+config, and "open it on the build box" simply has no host to resolve then.
+
+Item 4 — the default editor — is `$VISUAL` before `$EDITOR`, the conventional order (VISUAL
+being the full-screen editor), reading the basename because `$EDITOR` is often a path with
+flags. An editor this build cannot drive falls back rather than erroring: `$EDITOR=micro` is a
+real setting, and the honest answer is "not one I can spell an argv for", not a complaint
+about someone's environment. `nvim` maps to Vim because `build_open_argv`'s `+N` is what nvim
+takes too.
+
+A HOST THAT WAS ASKED FOR AND DID NOT RESOLVE IS REFUSED, not silently opened locally: "edit
+the config on the build box" run against this machine edits the wrong file, and the command
+would look like it worked.
+
+Staged, never run — the Qt build's contract. A fuzzy path resolved to the wrong file is a
+keystroke away from being fixed, and a keystroke past being opened.
+
+Still open here: item 2, the voice intent that produces the phrase (the command takes one;
+nothing speaks it yet), and item 3, spawning into a pane rather than staging on the line.
