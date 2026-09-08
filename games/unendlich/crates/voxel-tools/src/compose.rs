@@ -200,7 +200,9 @@ Write the parts and relations only.
 }
 
 /// Which path a request should take.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+//  carries a noun, so this is no longer Copy. Every caller
+// matches on it rather than storing it, so the clone costs nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Path {
     /// The dictionary knows this: one turn, a form line, done.
     Known,
@@ -210,6 +212,10 @@ pub enum Path {
     /// ladder -- subject, anatomy, pose, voxelisation -- before
     /// building anything.
     Study { height: i32 },
+    /// It NAMES something this crate has no typology for, at a size
+    /// where a division is worth having. Ask the model what it is made
+    /// of, then programme it like any other type.
+    Propose { noun: String },
     /// It is a BUILDING TYPE at a size worth programming: the
     /// architectural chain -- typology, triage, massing, brief,
     /// layout, geometry.
@@ -249,7 +255,42 @@ pub fn choose_path(prose: &str) -> Path {
     }
     match crate::recipe::recognise(prose) {
         Some(_) => Path::Known,
-        None => Path::Compose,
+        None => {
+            // A NOUN THE CRATE DOES NOT KNOW is not a reason to give
+            // up on structure. The model knows what a ziggurat is; it
+            // does not know what this crate can build. Ask it for the
+            // division and check the answer, rather than handing it the
+            // sketch language and hoping.
+            //
+            // SIZE IS THE WRONG GATE, which measuring showed: it moved
+            // three of twenty-seven, because people write "a windmill"
+            // and not "a huge windmill". What decides whether a
+            // proposal is worth a turn is whether the noun names a KIND
+            // OF THING WITH PARTS -- and that is precisely what cannot
+            // be known without asking, which is the argument for
+            // asking.
+            //
+            // So the gate is the other way round: everything with a
+            // head noun is asked about, EXCEPT the words that plainly
+            // name a shape, a substance or a phenomenon rather than a
+            // thing. A proposal that comes back with fewer than three
+            // sections is refused by `parse_typology` and falls through
+            // to Compose, which is the cost of being wrong: one turn.
+            const NOT_A_KIND: &[&str] = &["sphere", "cube", "orb", "ball", "blob", "shape",
+                                          "form", "mass", "cloud", "mist", "fog", "smoke",
+                                          "light", "sound", "colour", "color", "feeling",
+                                          "idea", "dream", "pattern", "texture", "field",
+                                          // generic words that name no kind: "as a building"
+                                          // is a framing, not a type
+                                          "building", "structure", "thing", "object", "place",
+                                          "space", "area", "scene", "world"];
+            if let Some(noun) = crate::typology::unknown_noun(prose) {
+                if !NOT_A_KIND.contains(&noun.as_str()) {
+                    return Path::Propose { noun };
+                }
+            }
+            Path::Compose
+        }
     }
 }
 
@@ -447,7 +488,10 @@ mod tests {
         // the failing case, and the kind of thing the pipeline is for
         assert_eq!(choose_path("a water sphere"), Path::Compose);
         assert_eq!(choose_path("the sound of a bell, as a building"), Path::Compose);
-        assert_eq!(choose_path("a spiral staircase to the sky"), Path::Compose);
+        // a staircase IS a kind of thing with parts -- treads, a
+        // newel, landings -- so it is asked about now rather than
+        // handed the sketch language
+        assert!(matches!(choose_path("a spiral staircase to the sky"), Path::Propose { .. }));
     }
 
     #[test]
@@ -651,5 +695,31 @@ mod tests {
         w.scale = Some(40);
         assert_ne!(tree, last_resort(&w, "a tower"));
         assert!(tree.contains("oak_log"), "a tree is wood: {tree}");
+    }
+
+    #[test]
+    fn a_noun_the_crate_does_not_know_is_asked_about_rather_than_given_up_on() {
+        // 27 of 43 ordinary requests fell through to "here is the
+        // sketch language, good luck"
+        match choose_path("a great stone ziggurat") {
+            Path::Propose { noun } => assert_eq!(noun, "ziggurat"),
+            o => panic!("{o:?}"),
+        }
+        assert!(matches!(choose_path("a huge amphitheatre"), Path::Propose { .. }));
+        assert!(matches!(choose_path("a colossal windmill"), Path::Propose { .. }));
+        // SIZE IS THE WRONG GATE. People write "a windmill", not "a
+        // huge windmill", and a windmill has real structure either way.
+        assert!(matches!(choose_path("a windmill"), Path::Propose { .. }));
+        assert!(matches!(choose_path("a treehouse"), Path::Propose { .. }));
+        assert!(matches!(choose_path("a beehive"), Path::Propose { .. }));
+        // but a word that names a SHAPE or a phenomenon is not a kind
+        // of thing with parts, and asking wastes a turn
+        assert_eq!(choose_path("a water sphere"), Path::Compose);
+        assert_eq!(choose_path("a giant orb"), Path::Compose);
+        assert_eq!(choose_path("the sound of a bell as a building"), Path::Compose);
+        // and the known paths are untouched
+        assert_eq!(choose_path("a huge fortress"), Path::Programme);
+        assert_eq!(choose_path("a small cottage"), Path::Known);
+        assert!(matches!(choose_path("a colossal statue of Zeus"), Path::Study { .. }));
     }
 }

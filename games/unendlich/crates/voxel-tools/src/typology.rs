@@ -269,6 +269,161 @@ const ALIASES: &[(&str, &[&str])] = &[
     ("tower", &["spire", "lighthouse", "watchtower", "minaret", "obelisk", "belfry"]),
 ];
 
+/// Ask the model what a type IS, when this crate has never heard of it.
+///
+/// `typologies()` is five building types I WROTE, with sections and
+/// area shares I invented. A ziggurat, a windmill, an amphitheatre, a
+/// bathhouse: none of them exist, and a breadth test found 27 of 43
+/// ordinary requests falling through to "here is the sketch language,
+/// good luck". Writing fifty more is not the answer -- it is a bigger
+/// menu, and a bigger menu is what turned a water sphere into a house.
+///
+/// The model knows what a ziggurat is. It does not know what this
+/// crate can build, what an area share means here, or that the
+/// essentials should account for the whole. So the division of labour
+/// is: THE MODEL SAYS WHAT THE THING IS MADE OF, and the code checks
+/// that the answer is buildable, normalises the shares, and reconciles
+/// the areas. Neither half can do the other's job.
+pub fn propose_prompt(name: &str, request: &str) -> String {
+    format!("\
+This world has never heard of a {name}. The player asked for: {request}
+
+Describe what a {name} IS MADE OF, as sections. A section is a part of the whole big enough
+to decide separately -- a castle divides into a curtain wall, a keep, a gatehouse and a
+courtyard, and those four are what make it a castle rather than a manor house.
+
+  what <one line: what a {name} is, in the way a builder would say it>
+  section NAME essential|optional share=N prominence=N [constraints=a,b] [rooms=name:area,...]
+
+  share        its portion of the whole. The ESSENTIAL sections should come to about 1.0
+               between them; optional ones are extra on top.
+  prominence   how many storeys tall, relative. 0 is open ground, 1 ordinary, 3 dominates.
+  constraints  encloses, inside, perimeter, tallest, ground, axial, detached
+  rooms        what it holds, and roughly how many blocks of floor each
+
+Name only the sections that MATTER. Four to seven is right; twelve is a list of details and
+two is not a division.
+
+EXAMPLE
+  a ziggurat
+what a stepped mountain of terraces climbing to a shrine at the top
+section terraces essential share=0.55 prominence=3 constraints=tallest,ground rooms=terrace:600,ramp:120
+section shrine essential share=0.15 prominence=2 constraints=tallest,axial rooms=cella:120,altar:30
+section precinct essential share=0.22 prominence=0 constraints=encloses,ground rooms=court:500
+section stair essential share=0.08 prominence=1 constraints=axial,ground rooms=processional:150
+section vault optional share=0.10 prominence=1 constraints=inside rooms=chamber:80
+
+Write the `what` line and the sections only.")
+}
+
+/// Read a proposed typology. Checked, not trusted: a division that
+/// does not add up is not buildable, and the checks are exactly the
+/// things a model has no way to know.
+pub fn parse_typology(name: &'static str, src: &str) -> (Option<Typology>, Vec<String>) {
+    let mut sections = Vec::new();
+    let mut what = String::new();
+    let mut errs = Vec::new();
+    for line in src.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') { continue; }
+        let w: Vec<&str> = t.split_whitespace().collect();
+        match w.first().map(|v| v.to_lowercase()).as_deref() {
+            Some("what") | Some("is") => what = w[1..].join(" "),
+            Some("section") => {
+                let kv_at = w.iter().position(|s| s.contains('=')).unwrap_or(w.len());
+                if kv_at <= 1 { errs.push(format!("section needs a name: {t:?}")); continue; }
+                // the need word sits between the name and the settings
+                let mut words: Vec<&str> = w[1..kv_at].to_vec();
+                let need = match words.last().map(|s| s.to_lowercase()) {
+                    Some(ref x) if x == "essential" || x == "required" => { words.pop(); Need::Essential }
+                    Some(ref x) if x == "optional" || x == "extra" => { words.pop(); Need::Optional }
+                    _ => Need::Essential,
+                };
+                if words.is_empty() { errs.push(format!("section needs a name: {t:?}")); continue; }
+                let kv = |k: &str| w[kv_at..].iter().find_map(|s| s.strip_prefix(&format!("{k}=")));
+                let rooms: Vec<(String, i32)> = kv("rooms").map(|v| v.split(',')
+                    .filter_map(|r| { let (n, a) = r.split_once(':')?;
+                        Some((n.trim().to_lowercase(), a.trim().parse().ok()?)) }).collect())
+                    .unwrap_or_default();
+                sections.push(ProposedSection {
+                    name: words.join(" ").to_lowercase(),
+                    need,
+                    share: kv("share").and_then(|v| v.parse().ok()).unwrap_or(0.15_f32).clamp(0.01, 5.0),
+                    prominence: kv("prominence").and_then(|v| v.parse().ok()).unwrap_or(1.0_f32).clamp(0.0, 12.0),
+                    constraints: kv("constraints").map(|v| v.split(',')
+                        .map(|c| c.trim().to_lowercase()).filter(|c| !c.is_empty()).collect())
+                        .unwrap_or_default(),
+                    rooms,
+                });
+            }
+            _ => {}
+        }
+    }
+    // THE CHECKS. Each is something the model cannot know and the code
+    // can, which is the whole reason this is a division of labour and
+    // not just a prompt.
+    let n_ess = sections.iter().filter(|s| s.need == Need::Essential).count();
+    if n_ess < 3 {
+        errs.push(format!("only {n_ess} essential section(s); two is not a division"));
+        return (None, errs);
+    }
+    if sections.len() > 12 {
+        errs.push("more than twelve sections is a list of details".into());
+        sections.truncate(12);
+    }
+    let sum: f32 = sections.iter().filter(|s| s.need == Need::Essential)
+        .map(|s| s.share).sum();
+    if !(0.6..1.6).contains(&sum) {
+        errs.push(format!("the essential shares come to {sum:.2}; normalised to 1"));
+    }
+    let f = if sum > 0.0 { 1.0 / sum } else { 1.0 };
+    let out: Vec<Section> = sections.iter().map(|p| Section {
+        name: p.name.clone(),
+        need: p.need,
+        share: if p.need == Need::Essential { p.share * f } else { p.share },
+        prominence: p.prominence,
+        constraints: p.constraints.clone(),
+        // leaked to 'static so a proposed type is interchangeable with
+        // a built-in one; a session proposes a handful, not thousands
+        rooms: p.rooms.iter()
+            .map(|(n, a)| (&*Box::leak(n.clone().into_boxed_str()), *a)).collect(),
+    }).collect();
+    if out.iter().all(|s| s.rooms.is_empty()) {
+        errs.push("no section named any rooms; the brief will have nothing to schedule".into());
+    }
+    (Some(Typology {
+        name,
+        summary: Box::leak(if what.is_empty() { format!("a {name}") } else { what }.into_boxed_str()),
+        sections: out,
+        base_area: 4000,
+    }), errs)
+}
+
+#[derive(Debug, Clone)]
+struct ProposedSection {
+    name: String,
+    need: Need,
+    share: f32,
+    prominence: f32,
+    constraints: Vec<String>,
+    rooms: Vec<(String, i32)>,
+}
+
+/// The noun a request is asking for, when no known type matches. What
+/// to ask the model about.
+pub fn unknown_noun(request: &str) -> Option<String> {
+    if lookup(request).is_some() { return None; }
+    const SKIP: &[&str] = &["the", "and", "with", "for", "into", "onto", "over", "make", "build",
+                            "create", "giant", "huge", "small", "tiny", "large", "colossal",
+                            "massive", "enormous", "vast", "big", "tall", "wide", "old", "new",
+                            "stone", "wooden", "iron", "glass", "some", "that", "this", "very"];
+    // the LAST substantial noun is the head of the phrase: "a huge
+    // stone ziggurat" is a ziggurat
+    request.to_lowercase().split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 3 && !SKIP.contains(w))
+        .last().map(|s| s.to_string())
+}
+
 pub fn lookup(name: &str) -> Option<Typology> {
     let n = name.trim().to_lowercase();
     let words: Vec<&str> = n.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
@@ -1283,5 +1438,84 @@ mod tests {
         // an ordinary castle gets none of it
         let plain = to_flair(&apply(&c, &triage("a castle", &c)));
         assert!(!plain.contains("ruin"), "{plain}");
+    }
+
+    #[test]
+    fn the_model_can_describe_a_type_this_crate_never_heard_of() {
+        // `typologies()` is five types I WROTE. A ziggurat, a windmill,
+        // an amphitheatre: none exist, and 27 of 43 ordinary requests
+        // fell through. Writing fifty more is a bigger menu, and a
+        // bigger menu is what turned a water sphere into a house.
+        assert!(lookup("a great ziggurat").is_none(), "it is not a type here");
+        assert_eq!(unknown_noun("a great stone ziggurat").as_deref(), Some("ziggurat"),
+                   "the head noun, not the adjectives");
+        let reply = "what a stepped mountain of terraces climbing to a shrine\n\
+                     section terraces essential share=0.55 prominence=3 constraints=tallest,ground rooms=terrace:600,ramp:120\n\
+                     section shrine essential share=0.15 prominence=2 constraints=tallest,axial rooms=cella:120\n\
+                     section precinct essential share=0.22 prominence=0 constraints=encloses,ground rooms=court:500\n\
+                     section stair essential share=0.08 prominence=1 constraints=axial rooms=processional:150\n\
+                     section vault optional share=0.10 prominence=1 constraints=inside rooms=chamber:80\n";
+        let (ty, errs) = parse_typology("ziggurat", reply);
+        assert!(errs.is_empty(), "{errs:?}");
+        let ty = ty.expect("a buildable typology");
+        assert_eq!(ty.sections.len(), 5);
+        assert!(ty.summary.contains("stepped mountain"));
+        assert_eq!(ty.sections.iter().filter(|s| s.need == Need::Essential).count(), 4);
+        // and it is INTERCHANGEABLE with a built-in one: the whole
+        // chain below runs on it unchanged
+        let m = apply_for("a great ziggurat", &ty, &triage("a great ziggurat", &ty));
+        assert!(m.sections.len() >= 4);
+        let (b, be) = crate::brief::parse(&to_brief(&m, 8000));
+        assert!(be.is_empty(), "{be:?}");
+        assert!(b.spaces.iter().any(|s| s.name == "terrace"), "{:?}",
+                b.spaces.iter().map(|s| &s.name).collect::<Vec<_>>());
+        assert!(b.reconcile().ok, "{}", b.reconcile().summary());
+        let l = crate::brief::lay_out(&b, ((-40, -40), (40, 40)), 3, 30);
+        assert!(!l.rooms.is_empty());
+        let (prog, pe) = crate::program::parse(&crate::brief::to_program(&l, &b, "stone", 0));
+        assert!(pe.is_empty(), "{pe:?}");
+        assert!(crate::program::run(&prog, (0, 64, 0)).changes.len() > 5000);
+    }
+
+    #[test]
+    fn a_proposal_is_checked_not_trusted() {
+        // Each check is something the MODEL cannot know and the CODE
+        // can, which is the whole reason this is a division of labour
+        // and not just a prompt.
+        let (none, e) = parse_typology("thing", "section a essential share=0.5\nsection b essential share=0.5\n");
+        assert!(none.is_none());
+        assert!(e.iter().any(|x| x.contains("two is not a division")), "{e:?}");
+        // shares that do not add up are normalised, and it says so
+        let (ty, e2) = parse_typology("thing",
+            "section a essential share=3 rooms=x:100\nsection b essential share=3 rooms=y:100\n\
+             section c essential share=3 rooms=z:100\n");
+        let ty = ty.expect("still buildable");
+        assert!(e2.iter().any(|x| x.contains("normalised")), "{e2:?}");
+        let sum: f32 = ty.sections.iter().filter(|s| s.need == Need::Essential).map(|s| s.share).sum();
+        assert!((sum - 1.0).abs() < 0.01, "the essentials come to {sum}");
+        // a division with no rooms cannot be scheduled, and is told so
+        let (_, e3) = parse_typology("thing",
+            "section a essential share=0.4\nsection b essential share=0.3\nsection c essential share=0.3\n");
+        assert!(e3.iter().any(|x| x.contains("nothing to schedule")), "{e3:?}");
+    }
+
+    #[test]
+    fn the_proposal_prompt_asks_for_a_division_not_a_description() {
+        let p = propose_prompt("ziggurat", "a great stone ziggurat");
+        assert!(p.contains("never heard of a ziggurat"));
+        assert!(p.contains("Four to seven is right"), "it bounds the answer: {p}");
+        assert!(p.contains("come to about 1.0"), "and states the one arithmetic rule");
+        // it asks for a DIVISION, not geometry -- shapes and positions
+        // are a later question and mixing them makes both worse
+        assert!(!p.contains("part NAME") && !p.contains("rel NAME") && !p.contains("material="),
+                "it does not ask for geometry: that is a later question");
+        // its own example parses and builds
+        let ex = p.split("EXAMPLE").nth(1).unwrap();
+        let body: String = ex.lines().skip(2)
+            .take_while(|l| l.starts_with("what") || l.starts_with("section"))
+            .map(|l| format!("{l}\n")).collect();
+        let (ty, errs) = parse_typology("ziggurat", &body);
+        assert!(errs.is_empty(), "{body}\n{errs:?}");
+        assert!(ty.is_some());
     }
 }

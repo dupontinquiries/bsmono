@@ -30,7 +30,8 @@ fn main() {
     let mut fails: Vec<(&str, String)> = Vec::new();
     for req in CORPUS {
         let path = compose::choose_path(req);
-        *by_path.entry(format!("{path:?}").split(' ').next().unwrap().to_string()).or_insert(0) += 1;
+        *by_path.entry(format!("{path:?}").split([' ', '{']).next().unwrap().trim().to_string())
+            .or_insert(0) += 1;
         // what would it actually build, with no model in the loop?
         let (cells, note) = match path {
             compose::Path::Known => {
@@ -50,6 +51,7 @@ fn main() {
                 let (prog, _) = program::parse(&format!("pass a add\n{src}end\n"));
                 (program::run_in(&Flat, &prog, (0,64,0)).changes.len(), format!("study h={height}"))
             }
+            compose::Path::Propose { ref noun } => (0, format!("would ask what a {noun} is")),
             compose::Path::Compose => (0, "needs a model".into()),
         };
         if cells > 0 { built += 1; sizes.push(cells); } else { empty += 1; fails.push((req, note.clone())); }
