@@ -315,6 +315,10 @@ pub enum TurnKind {
     /// One rung of the study ladder. Which rung is on the session, so
     /// the reply knows what it was answering.
     Study,
+    /// The model is being asked what a thing this world has never
+    /// heard of is MADE OF. Its answer becomes a typology and goes
+    /// through the same chain as a built-in one.
+    Propose,
     /// The massing turn of the architectural chain: the model is shown
     /// the type's division and the sorted wishes and asked for a diff.
     Massing,
@@ -548,6 +552,8 @@ pub struct Paintbrush {
     /// What the next turn is being asked to write, so its reply budget
     /// fits the job. Set beside every `spawn_turn`.
     pending_job: voxel_tools::prompt::Job,
+    /// The noun whose definition is being asked for.
+    proposed_noun: Option<String>,
     /// What pass 1 decided the thing IS. Kept past the turn, because a
     /// later pass failing does not make the reading wrong.
     last_reading: Option<voxel_tools::compose::Reading>,
@@ -649,6 +655,7 @@ impl Paintbrush {
             review_round: 0,
             review_pending_after_drone: 0,
             pending_job: voxel_tools::prompt::Job::Plan,
+            proposed_noun: None,
             last_reading: None,
             study: None,
             study_rungs: Vec::new(),
@@ -1171,7 +1178,19 @@ impl Paintbrush {
             // apology. If pass 1 established what the thing IS, that is
             // enough to build a mass of the right size in the right
             // place, which can then be reviewed into something better.
-            if let Some(reading) = self.last_reading.clone() {
+            // THE FLOOR MUST NOT DEPEND ON WHICH PATH FAILED. It read
+            // `last_reading`, which only the interpret turn sets -- so a
+            // request that took the propose path and failed got nothing,
+            // which is the exact hole this fallback exists to close. The
+            // prose is always available and is enough.
+            let reading = self.last_reading.clone().unwrap_or_else(|| {
+                let mut r = voxel_tools::compose::Reading {
+                    essence: prose.to_string(), ..Default::default()
+                };
+                r.scale = Some(24);
+                r
+            });
+            {
                 let src = voxel_tools::compose::last_resort(&reading, prose);
                 log::info!("[paintbrush] last resort from the reading: {src}");
                 self.say("building the shape of it, so there is something to correct");
@@ -1356,6 +1375,49 @@ impl Paintbrush {
             self.finish_turn_with(cm, gaze, &ir, player_feet, prose);
             return;
         }
+        self.push(r);
+        self.flush_staged(cm, &mut staged);
+        self.review_pending_after_drone = 1;
+        self.review_round = 0;
+    }
+
+    /// A typology in hand -- built in or just invented -- becomes a
+    /// building by the same chain either way.
+    fn build_from_typology(&mut self, cm: &ChunkManager, gaze: &Gaze,
+                           t: &voxel_tools::typology::Typology,
+                           player_feet: Option<(i32, i32, i32)>, prose: &str) {
+        let wishes = voxel_tools::typology::triage(prose, t);
+        let m = voxel_tools::typology::apply_for(prose, t, &wishes);
+        let total = m.implied_total;
+        self.say(format!("{} section(s) over {} blocks", m.sections.len(), total));
+        let (brief, errs) = voxel_tools::brief::parse(&voxel_tools::typology::to_brief(&m, total));
+        for e in errs.iter().take(2) { self.say(format!("  {e}")); }
+        self.say(format!("  {}", brief.reconcile().summary()));
+        let half = ((total as f32 * 1.6).sqrt() / 2.0).max(8.0) as i32;
+        let layout = voxel_tools::brief::lay_out(&brief, ((-half, -half), (half, half)),
+                                                 self.session.creative_seed, 40);
+        self.say(format!("  {}", layout.summary()));
+        let mut src = voxel_tools::brief::to_program(&layout, &brief, "stone", 0);
+        let flair = voxel_tools::typology::to_flair(&m);
+        if !flair.trim().is_empty() {
+            let (assets, passes): (Vec<&str>, Vec<&str>) = {
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                let mut in_asset = false;
+                for l in flair.lines() {
+                    let t = l.trim();
+                    if t.starts_with("asset ") { in_asset = true; }
+                    if in_asset { a.push(l); if t == "end" { in_asset = false; } } else { b.push(l); }
+                }
+                (a, b)
+            };
+            src = format!("{}\n{}\n{}", assets.join("\n"), src, passes.join("\n"));
+        }
+        let view = WorldView(cm);
+        let mut staged = StagedWorld::new(&view);
+        let r = {
+            let mut tools = VoxelTools::new(&mut staged);
+            self.session.receive_program(&mut tools, gaze, &src, player_feet, prose)
+        };
         self.push(r);
         self.flush_staged(cm, &mut staged);
         self.review_pending_after_drone = 1;
@@ -1606,6 +1668,23 @@ impl Paintbrush {
         // request. Pass 1 asks what the thing IS, in prose; pass 2
         // writes assets and passes against that reading. The dictionary
         // path stays one turn, because for a cottage it is better.
+        // A NOUN THIS WORLD HAS NO TYPOLOGY FOR. Five built-in types is
+        // a menu, and a menu is what turned a water sphere into a
+        // house. Ask the model what a windmill is made of rather than
+        // dropping it to a bare sketch with no scaffolding, which is
+        // what 63% of ordinary requests were getting.
+        if let voxel_tools::compose::Path::Propose { noun } = &path {
+            let noun = noun.clone();
+            log::info!("[paintbrush] no typology for {noun:?}; asking what one is made of");
+            self.say(format!("I have no definition for a {noun} -- asking what one is made of"));
+            self.proposed_noun = Some(noun.clone());
+            let p = voxel_tools::typology::propose_prompt(&noun, prose);
+            self.pending_job = voxel_tools::prompt::Job::Plan;
+            self.spawn_turn(completer,
+                "You are an architect describing what a kind of building is made of.".into(),
+                Box::new(move || p), gaze, player_feet, prose, TurnKind::Propose);
+            return;
+        }
         // THE STUDY LADDER, for a figure big enough for detail to land.
         // Four narrow questions instead of one wide one: the dictionary
         // makes a statue in one turn and it is the same statue every
@@ -1913,6 +1992,27 @@ impl Paintbrush {
                             self.ask_next_rung(c, &turn.gaze, turn.player_feet, &turn.prose);
                         } else {
                             self.finish_study(cm, &turn.gaze, turn.player_feet, &turn.prose);
+                        }
+                    }
+                    TurnKind::Propose => {
+                        let noun = self.proposed_noun.clone().unwrap_or_else(|| "thing".into());
+                        let leaked: &'static str = Box::leak(noun.clone().into_boxed_str());
+                        let (t, errs) = voxel_tools::typology::parse_typology(leaked, &raw);
+                        for e in errs.iter().take(3) { self.say(format!("  {e}")); }
+                        match t {
+                            Some(t) => {
+                                self.say(format!("a {} is {}", t.name, t.summary));
+                                for s in &t.sections {
+                                    self.say(format!("  {} ({:.0}%)", s.name, s.share * 100.0));
+                                }
+                                self.build_from_typology(cm, &turn.gaze, &t, turn.player_feet, &turn.prose);
+                            }
+                            None => {
+                                // it could not say either: the sketch
+                                // path is worse but it is not nothing
+                                self.say("could not get a definition -- composing it directly");
+                                self.finish_compose(cm, &turn.gaze, &raw, turn.player_feet, &turn.prose);
+                            }
                         }
                     }
                     TurnKind::Massing => {

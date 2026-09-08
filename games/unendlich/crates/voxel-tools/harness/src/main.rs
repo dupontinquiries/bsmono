@@ -43,6 +43,7 @@ fn main() {
     programme_scenario();
     study_scenario();
     floor_scenario();
+    propose_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -1187,4 +1188,46 @@ fn floor_scenario() {
     // THE POINT: something got built anyway
     assert!(log.iter().any(|l| l.contains("cells")), "something was built: {log:?}");
     assert!(log.iter().any(|l| l.contains("shape of it")), "and it said so: {log:?}");
+}
+
+
+/// A noun this world has no typology for: the model supplies one.
+fn propose_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== a typology the model invents");
+    struct Arch { seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> }
+    impl voxel_tools::llm::Completer for Arch {
+        fn name(&self) -> &str { "arch" }
+        fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            self.seen.lock().unwrap().push(user.to_string());
+            Ok("is a tower carrying sails, with the machinery below and a store beneath that\n\
+                ordinary 700\n\
+                section tower essential share=0.44 prominence=3 constraints=tallest,axial\n\
+                section sails essential share=0.18 prominence=4 constraints=tallest\n\
+                section machinery essential share=0.20 prominence=1 constraints=inside\n\
+                section store essential share=0.18 prominence=1 constraints=ground,perimeter\n".into())
+        }
+    }
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(
+        Box::new(Arch { seen: seen.clone() }))));
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -20.0], [0.0, -0.3, 1.0], Some(([0, 64, 0], [0, 1, 0], 21.0)));
+    pb.start_turn(&cm, &gaze, Some("grass"), "a huge windmill", None);
+    let t0 = std::time::Instant::now();
+    while pb.run.as_ref().map(|r| r.is_running()).unwrap_or(false) && t0.elapsed().as_secs() < 60 {
+        pb.poll_turn(&cm); pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    let s = seen.lock().unwrap();
+    assert_eq!(s.len(), 1, "one turn: what is a windmill made of");
+    assert!(s[0].contains("never heard of a windmill"), "{}", &s[0][..120.min(s[0].len())]);
+    let log = pb.drain_log();
+    for l in log.iter().filter(|l| l.contains("windmill is") || l.contains("section(s) over")
+                               || l.contains("budget") || l.contains("room(s)") || l.contains("pass(es)")) {
+        println!("  {}", l.trim().chars().take(130).collect::<String>());
+    }
+    assert!(log.iter().any(|l| l.contains("carrying sails")), "the definition arrived: {log:?}");
+    assert!(log.iter().any(|l| l.contains("budget")), "it reconciled a schedule: {log:?}");
+    assert!(log.iter().any(|l| l.contains("pass(es)")), "and built: {log:?}");
 }
