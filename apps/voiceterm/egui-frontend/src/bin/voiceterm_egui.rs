@@ -4201,7 +4201,9 @@ impl eframe::App for VoicetermApp {
                                 // for every block on every repaint.
                                 let what = cells.classify(b.id, &b.output).clone();
                                 let folded = cells.is_folded(b.id);
+                                let pinned = cells.is_pinned(b.id);
                                 let mut toggle = false;
+                                let mut pin = false;
                                 ui.horizontal(|ui| {
                                     if ui.small_button(if folded { "\u{25b8}" } else { "\u{25be}" }).clicked() {
                                         toggle = true;
@@ -4218,7 +4220,30 @@ impl eframe::App for VoicetermApp {
                                         Some(code) => { ui.colored_label(c.warning, format!("● {code}")); }
                                         None => {}
                                     }
+                                    // THE PIN, on the right of the row. `retain_ids` already
+                                    // drops it with the block, so a pinned cell that scrolls
+                                    // out of history takes its pin with it rather than
+                                    // leaving the strip pointing at nothing.
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let on = pinned;
+                                            if ui
+                                                .selectable_label(on, "\u{1f4cc}")
+                                                .on_hover_text(if on { "unpin" } else { "pin: keep this one in view" })
+                                                .clicked()
+                                            {
+                                                pin = true;
+                                            }
+                                        },
+                                    );
                                 });
+                                if pin {
+                                    // Pinning UNFOLDS: a pinned cell showing "42 lines
+                                    // hidden" is the wrong kind of pin. Unpinning leaves it
+                                    // open — see `notebook_cells`.
+                                    if pinned { cells.toggle_pin(b.id); } else { cells.pin_and_show(b.id); }
+                                }
                                 if toggle {
                                     cells.toggle_fold(b.id);
                                 }

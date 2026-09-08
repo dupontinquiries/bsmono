@@ -104,6 +104,30 @@ Map as a bold-key grid. Two things were added after dogfooding it:
 3 tests in `notebook_cells` (the cache recomputes only on growth, folds
 are per block and die with the block, the summary names each kind).
 
-STILL NOT DONE: pin, swipe gestures, and per-cell interactive tables
+STILL NOT DONE: swipe gestures, and per-cell interactive tables
 (that needs persistent `TableView` state keyed by block id — a sort
 button that resets every frame would be worse than no button).
+
+
+## DONE — pin (2026-09-07)
+
+`NotebookCells` holds the pins beside the folds and the classification cache, so all three
+share one lifetime rule.
+
+A `Vec`, not a `HashSet`. Pins are the operator's SEQUENCE — the order they chose things in
+is the information, and block order they already have from the pane itself. A set would
+reshuffle on a rehash, which reads as the pane losing track of what you pinned.
+
+PINNING UNFOLDS. A pinned-and-folded cell is a row saying "42 lines hidden" in the one place
+meant for what matters. Unpinning does NOT re-fold: it was open when they pinned it, and
+putting it back would undo a state they may have changed since.
+
+A pin dies with its block, through the same `retain_ids` the folds use. Scrollback is finite,
+and a pin outliving its block would leave the pane offering to show a cell that no longer
+exists.
+
+Three tests: the order survives pin/unpin/re-pin (re-pinning goes to the END, being the most
+recent choice); pinning unfolds and unpinning does not re-fold, and pinning twice is one pin;
+and a pin dies with its block while an unrelated fold does not.
+
+The control is a 📌 on the right of each cell's header row.

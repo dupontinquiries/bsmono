@@ -43,6 +43,12 @@ struct Cached {
 pub struct NotebookCells {
     cache: std::collections::HashMap<u32, Cached>,
     folded: std::collections::HashSet<u32>,
+    /// Blocks the operator pinned, in the order they were pinned.
+    ///
+    /// A `Vec`, not a set: pins are shown together at the top of the pane and the order has
+    /// to be stable, while a `HashSet` would reshuffle them whenever the map rehashed —
+    /// which looks like the pane losing track of what you pinned.
+    pinned: Vec<u32>,
     /// How many times a classification was computed rather than reused, for the test that
     /// pins the cache actually caching.
     misses: u64,
@@ -74,6 +80,42 @@ impl NotebookCells {
     pub fn retain_ids(&mut self, live: impl Fn(u32) -> bool) {
         self.cache.retain(|id, _| live(*id));
         self.folded.retain(|id| live(*id));
+        // A pin dies with its block, like a fold. Scrollback is finite, and a pin surviving
+        // the block it points at would leave the pane offering to show a cell that no
+        // longer exists.
+        self.pinned.retain(|id| live(*id));
+    }
+
+    pub fn is_pinned(&self, id: u32) -> bool {
+        self.pinned.contains(&id)
+    }
+
+    /// Pin or unpin. A newly pinned block goes to the END, so the pinned strip reads in the
+    /// order they were chosen rather than in block order — the operator's sequence is the
+    /// information, and block order they already have from the pane itself.
+    pub fn toggle_pin(&mut self, id: u32) {
+        match self.pinned.iter().position(|p| *p == id) {
+            Some(i) => {
+                self.pinned.remove(i);
+            }
+            None => self.pinned.push(id),
+        }
+    }
+
+    /// The pinned blocks, oldest pin first.
+    pub fn pinned(&self) -> &[u32] {
+        &self.pinned
+    }
+
+    /// PINNING UNFOLDS. A pinned cell is one the operator wants to keep looking at, and a
+    /// pinned-and-folded cell is a row that says only "42 lines hidden" in the one place
+    /// meant for what matters. Unpinning does NOT re-fold: it was open when they pinned it
+    /// and putting it back would undo a state they may have changed since.
+    pub fn pin_and_show(&mut self, id: u32) {
+        if !self.is_pinned(id) {
+            self.pinned.push(id);
+        }
+        self.folded.remove(&id);
     }
 
     pub fn is_folded(&self, id: u32) -> bool {
@@ -124,6 +166,69 @@ pub fn fold_summary(what: &Structured, output: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// Pins are the operator's sequence, so they keep the order they were made in — a
+    /// `HashSet` would reshuffle them on a rehash, which looks like the pane losing track.
+    #[test]
+    fn pins_keep_the_order_they_were_made_in() {
+        let mut c = NotebookCells::new();
+        c.toggle_pin(7);
+        c.toggle_pin(2);
+        c.toggle_pin(9);
+        assert_eq!(c.pinned(), &[7, 2, 9], "block order, not pin order");
+        assert!(c.is_pinned(2) && !c.is_pinned(3));
+
+        // Unpinning removes just that one and leaves the rest in order.
+        c.toggle_pin(2);
+        assert_eq!(c.pinned(), &[7, 9]);
+        // And re-pinning puts it at the END: it is the most recent choice.
+        c.toggle_pin(2);
+        assert_eq!(c.pinned(), &[7, 9, 2]);
+    }
+
+    /// A pinned-and-folded cell is a row saying "42 lines hidden" in the one place meant for
+    /// what matters.
+    #[test]
+    fn pinning_unfolds_and_unpinning_does_not_refold() {
+        let mut c = NotebookCells::new();
+        c.toggle_fold(4);
+        assert!(c.is_folded(4));
+
+        c.pin_and_show(4);
+        assert!(c.is_pinned(4));
+        assert!(!c.is_folded(4), "a pinned cell showing nothing is the wrong kind of pin");
+
+        // Unpinning leaves it open. It was open when they pinned it, and re-folding would
+        // undo a state they may have changed since.
+        c.toggle_pin(4);
+        assert!(!c.is_pinned(4));
+        assert!(!c.is_folded(4), "unpinning re-folded a cell the operator had opened");
+
+        // Pinning twice is not two pins.
+        c.pin_and_show(5);
+        c.pin_and_show(5);
+        assert_eq!(c.pinned(), &[5]);
+    }
+
+    /// Scrollback is finite. A pin outliving its block would leave the pane offering to show
+    /// a cell that no longer exists.
+    #[test]
+    fn a_pin_dies_with_its_block() {
+        let mut c = NotebookCells::new();
+        c.toggle_pin(1);
+        c.toggle_pin(2);
+        c.toggle_fold(2);
+        c.classify(2, "a\tb\n");
+
+        // Block 1 scrolled out of history.
+        c.retain_ids(|id| id != 1);
+        assert_eq!(c.pinned(), &[2], "a pin survived its block");
+        assert!(c.is_folded(2), "an unrelated fold was dropped");
+
+        // Everything gone.
+        c.retain_ids(|_| false);
+        assert!(c.pinned().is_empty() && c.folded_count() == 0);
+    }
     use super::*;
 
     #[test]
