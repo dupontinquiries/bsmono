@@ -944,6 +944,12 @@ pub struct WorldRenderer {
     /// is available to callers like `sim::submit_schedule` without waiting
     /// for a spike. 0.0 until the first frame's GPU query results land.
     last_gpu_total_ms: f64,
+    /// Watches frame GPU time against the driver's watchdog and sheds
+    /// load, or stops the process, rather than letting a submission
+    /// take the whole device down. See `voxel_tools::gpu_guard`.
+    gpu_guard: voxel_tools::gpu_guard::Guard,
+    /// What the guard has given up so far. The passes consult this.
+    shed_level: voxel_tools::gpu_guard::Shed,
 
     /// Resources awaiting deferred destruction (chunks evicted since last
     /// frame). Drained at the top of each frame.
@@ -1828,6 +1834,8 @@ impl WorldRenderer {
             cached_frustum_key: None,
             last_wait_fences_ms: 0.0,
             last_gpu_total_ms: 0.0,
+            gpu_guard: voxel_tools::gpu_guard::Guard::default(),
+            shed_level: voxel_tools::gpu_guard::Shed::Nothing,
             pending_destroy: Vec::new(),
             mesh_cache: HashMap::new(),
             mesh_cache_capacity: std::env::var("UNENDLICH_MESH_CACHE_SIZE")
@@ -5654,6 +5662,42 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
         if let Some((collected_idx, per_zone_us)) = self.gpu_timer.take_last_frame() {
             if let Some(&total_us) = per_zone_us.get("total") {
                 self.last_gpu_total_ms = total_us as f64 / 1000.0;
+                // MEASURING A FATAL CONDITION AND THEN PROCEEDING INTO
+                // IT is the actual defect here. This block has been
+                // logging eleven-second frames and submitting another
+                // one; on Asahi the firmware watchdog then kills the
+                // GPU, and that takes down every other client on the
+                // machine -- compositor included -- until a reboot.
+                //
+                // The guard sheds load as frames approach the watchdog
+                // and aborts deliberately if there is nothing left to
+                // shed. Crashing this process costs one session;
+                // letting the submission through costs the desktop.
+                let cost = voxel_tools::gpu_guard::FrameCost {
+                    total_us,
+                    main_us:   per_zone_us.get("main").copied().unwrap_or(0),
+                    shadow_us: per_zone_us.get("shadow").copied().unwrap_or(0),
+                    froxel_us: per_zone_us.get("froxel").copied().unwrap_or(0),
+                    cull_us:   per_zone_us.get("cull").copied().unwrap_or(0),
+                };
+                match self.gpu_guard.frame(cost) {
+                    voxel_tools::gpu_guard::Verdict::Fine => {}
+                    voxel_tools::gpu_guard::Verdict::ShedNow { level, why } => {
+                        log::warn!("[gpu-guard] {why}");
+                        unendlich_shared::events::record("gpu_shed", serde_json::json!({
+                            "level": level.name(), "why": why, "total_us": total_us,
+                        }));
+                        self.shed_level = level;
+                    }
+                    voxel_tools::gpu_guard::Verdict::Abort { why } => {
+                        log::error!("[gpu-guard] {why}");
+                        unendlich_shared::events::record("gpu_abort", serde_json::json!({
+                            "why": why, "total_us": total_us,
+                        }));
+                        eprintln!("\nunendlich stopped itself: {why}\n");
+                        std::process::exit(70);
+                    }
+                }
                 if total_us > 100_000 {
                     unendlich_shared::events::record(
                         "gpu_spike",
@@ -5795,9 +5839,14 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
         // r157: the panel's "disable shadows" toggle — force the CLEAR
         // variant of the pass (an empty shadow map reads as fully lit; the
         // image/barrier contract is untouched) and skip the chunk draws.
+        // The operator's switch, OR the guard having shed shadows to
+        // stay under the driver watchdog. Shadows are the first thing
+        // given up because they are about a fifth of the frame and the
+        // least missed.
         let shadows_disabled = crate::debug_settings::DEBUG
             .disable_shadows
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || self.shed_level >= voxel_tools::gpu_guard::Shed::Shadows;
         // r175: re-enabling must invalidate the reuse cache, or the
         // cleared map is "reused" forever (operator: shadows never return).
         if self.prev_shadows_disabled && !shadows_disabled {
