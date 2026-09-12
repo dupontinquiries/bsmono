@@ -120,6 +120,7 @@ pub mod spec;
 /// A latent space over the world tree: per-commit vectors cached by hash, nearest, interpolate to a spec.
 pub mod latent;
 /// Arithmetic over a repeat index: the smallest thing code generation would buy.
+pub mod capability;
 pub mod expr;
 /// Parts and relations without coordinates, and the solver that grounds them.
 pub mod sketch;

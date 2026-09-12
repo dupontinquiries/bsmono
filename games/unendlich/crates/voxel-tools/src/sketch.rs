@@ -402,11 +402,22 @@ pub fn parse(src: &str) -> (Sketch, Vec<String>) {
                         }
                     }
                     "profile" | "revolve" | "lathe" | "silhouette" => {
-                        let radii: Vec<f32> = t.iter()
+                        // A PIECEWISE RADIUS IS ALSO A LIST. `r=at
+                        // 0:2, 0.35:7, 1:1` says WHERE each value
+                        // falls; sampling it makes the evenly spaced
+                        // list every shape here already takes, so the
+                        // higher rung costs the geometry nothing.
+                        let radii: Vec<f32> = if let Some(p) =
+                            crate::capability::parse_piecewise(&line.replace(' ', " ")) {
+                            if line.contains("at ") || line.contains(':') { p.sample(11) }
+                            else { Vec::new() }
+                        } else { Vec::new() };
+                        let radii: Vec<f32> = if !radii.is_empty() { radii } else {
+                            t.iter()
                             .find_map(|x| x.strip_prefix("r=").or_else(|| x.strip_prefix("radii=")))
                             .map(|v| v.split(',').filter_map(|n| n.trim().parse().ok())
                                  .filter(|x: &f32| *x >= 0.0 && *x < 600.0).collect())
-                            .unwrap_or_default();
+                            .unwrap_or_default() };
                         if radii.len() < 2 {
                             errs.push(format!("profile needs at least two radii, as r=2,6,3: {line:?}"));
                             continue;
@@ -1588,5 +1599,32 @@ mod tests {
         assert!(e3.is_empty(), "{e3:?}");
         let (placed, _) = resolve(&sk, (0, 64, 0));
         assert!(!cells(&placed[0], 1).is_empty());
+    }
+
+    #[test]
+    fn a_profile_takes_a_piecewise_radius_and_the_geometry_does_not_notice() {
+        // saying WHERE each value falls is the rung above a bare list,
+        // and sampling it makes the evenly spaced list every shape here
+        // already takes
+        let (sk, errs) = parse("part v profile r=at 0:2, 0.35:8, 1:1 h=24 material=stone\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        let (placed, _) = resolve(&sk, (0, 64, 0));
+        let c = cells(&placed[0], 1);
+        assert!(!c.is_empty());
+        // THE SWELLING IS WHERE IT WAS ASKED FOR: about a third up, not
+        // halfway, which an evenly spaced list of three could not say
+        let (lo, hi) = (c.iter().map(|p| p.1).min().unwrap(), c.iter().map(|p| p.1).max().unwrap());
+        let width_at = |f: f32| {
+            let y = lo + ((hi - lo) as f32 * f) as i32;
+            let at: Vec<i32> = c.iter().filter(|p| p.1 == y).map(|p| p.0).collect();
+            if at.is_empty() { 0 } else { at.iter().max().unwrap() - at.iter().min().unwrap() }
+        };
+        assert!(width_at(0.35) > width_at(0.7), "widest low down: {} vs {}",
+                width_at(0.35), width_at(0.7));
+        assert!(width_at(0.35) > width_at(0.05), "and not at the very base");
+        // a plain list still works exactly as before
+        let (plain, e2) = parse("part v profile r=2,8,1 h=24 material=stone\n");
+        assert!(e2.is_empty(), "{e2:?}");
+        assert!(!cells(&resolve(&plain, (0, 64, 0)).0[0], 1).is_empty());
     }
 }
