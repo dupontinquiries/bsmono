@@ -16,7 +16,9 @@
 //! the content is what you came for and the controls are a thing you open,
 //! change and close.
 //!
-//! The decision is pure and tested; [`two_pane_ui`] applies it.
+//! The decision is pure and tested; [`two_pane_ui`] applies it. The
+//! side-by-side column is a [`crate::sidebar::Sidebar`], so its width is
+//! the user's and its rows cannot widen it.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TwoPane {
@@ -71,10 +73,18 @@ pub fn two_pane_ui<T>(
     let arrangement = plan(ui.available_width(), want_controls, min_controls, min_content);
     match arrangement {
         TwoPane::SideBySide { controls_w } => {
-            egui::Panel::left(egui::Id::new(("two_pane", id)))
-                .resizable(true)
-                .default_size(controls_w)
-                .show_inside(ui, |ui| controls(ui, state));
+            // A `sidebar::Sidebar`, not `egui::Panel::left(..).resizable(true)`:
+            // the latter takes its width from its widest row and re-wraps its
+            // text around whatever that comes to — see the sidebar module
+            // docs. The column's width is loaded from egui memory under this
+            // page's id, so a drag is remembered, and its ceiling keeps
+            // `min_content` for the pane beside it. `remember` is on, so the
+            // struct is rebuilt each frame from memory rather than owned.
+            let mut bar = crate::sidebar::Sidebar::new(crate::sidebar::Side::Left, controls_w)
+                .min_width(min_controls)
+                .reserve(min_content)
+                .max_fraction(1.0);
+            bar.show_inside(ui, ("two_pane", id), |ui| controls(ui, state));
             egui::CentralPanel::default().show_inside(ui, |ui| content(ui, state));
         }
         TwoPane::Stacked => {
