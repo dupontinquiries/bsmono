@@ -5,6 +5,11 @@
 //! little damping means it loses energy and settles into a heap on its own. Pure
 //! and deterministic; the bin builds nodes/sticks from a creature's anatomy when
 //! it dies and renders the parts at the node positions.
+//!
+//! This file is the solver only and has NO crate dependencies, so a rustc-only
+//! harness can include it by path (games/unendlich/harness/rig). The
+//! `Creature`/`Anatomy` constructors live in [`crate::sim::ragdoll_bridge`];
+//! the service-registry registration in [`crate::sim::ragdoll_service`].
 
 /// Gravity (blocks/s²), matching the leap/airborne model.
 pub const GRAVITY: f32 = 20.0;
@@ -201,30 +206,6 @@ pub fn from_limbs(
     (nodes, sticks)
 }
 
-/// Build a ragdoll from a live [`crate::creature::Creature`], plus an extra
-/// `impulse` (blocks/s) to add on top of the body's own velocity — e.g. the
-/// knockback direction of the killing blow. Call on death/knockout, then drive
-/// the returned skeleton with [`step`] each frame and render each part at its
-/// node position. The body's current velocity is included automatically so a
-/// creature killed mid-run tumbles forward.
-pub fn from_creature_with_impulse(
-    c: &crate::creature::Creature,
-    impulse: [f32; 3],
-    dt: f32,
-) -> (Vec<Node>, Vec<Stick>) {
-    let he = c.body.half_extents;
-    let body_radius = (he[0] + he[1] + he[2]) / 3.0;
-    let v = c.body.velocity;
-    let launch = [v[0] + impulse[0], v[1] + impulse[1], v[2] + impulse[2]];
-    let limbs: Vec<([f32; 3], [f32; 3])> =
-        c.limbs.iter().map(|l| (l.offset, l.half_extents)).collect();
-    from_limbs(c.body.position, c.yaw, body_radius, &limbs, launch, dt)
-}
-
-/// Build a ragdoll from a creature with no extra impulse (just its own motion).
-pub fn from_creature(c: &crate::creature::Creature, dt: f32) -> (Vec<Node>, Vec<Stick>) {
-    from_creature_with_impulse(c, [0.0, 0.0, 0.0], dt)
-}
 
 #[cfg(test)]
 mod tests {
@@ -384,32 +365,3 @@ mod tests {
         }
     }
 }
-
-// ── service_registry wiring (S2) ───────────────────────────────────
-// ragdoll exposes a free `step(nodes, sticks, ...)`; the service owns a
-// minimal two-node, one-stick chain over flat ground and relaxes it each
-// tick. Proves the solver wiring is panic-free.
-use crate::sim::service_registry::{Service, ServiceCtx, ServiceEntry, SERVICES};
-use linkme::distributed_slice;
-
-struct RagdollService {
-    nodes: Vec<Node>,
-    sticks: Vec<Stick>,
-}
-impl Service for RagdollService {
-    fn name(&self) -> &'static str {
-        "ragdoll"
-    }
-    fn tick(&mut self, ctx: &ServiceCtx) {
-        step(&mut self.nodes, &self.sticks, 0.0, ctx.dt, 4);
-    }
-}
-#[distributed_slice(SERVICES)]
-static RAGDOLL_SERVICE: ServiceEntry = ServiceEntry {
-    name: "ragdoll",
-    make: || {
-        let nodes = vec![Node::new([0.0, 2.0, 0.0], 0.25), Node::new([0.0, 1.0, 0.0], 0.25)];
-        let sticks = vec![Stick::between(&nodes, 0, 1)];
-        Box::new(RagdollService { nodes, sticks })
-    },
-};

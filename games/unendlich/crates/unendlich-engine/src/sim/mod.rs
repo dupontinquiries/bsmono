@@ -137,7 +137,16 @@ pub mod spatial_audio;
 pub mod voxel_text;
 pub mod turning;
 pub mod deform;
+/// Creature-vs-creature melee loop: strike timing, reach, hit/damage/
+/// knockback, and the strike progress the rig animates. Pure.
+pub mod melee;
 pub mod ragdoll;
+/// `Creature`/`Anatomy` -> ragdoll skeleton, and nodes -> body-local sample for
+/// `anim_rig`. Split from `ragdoll.rs` so the solver stays crate-free.
+pub mod ragdoll_bridge;
+/// The service-registry registration for the ragdoll solver (was inline in
+/// `ragdoll.rs`; moved so that file has no `linkme` dependency).
+pub mod ragdoll_service;
 pub mod liveliness;
 pub mod rest_cycle;
 pub mod locomotion_sim;
