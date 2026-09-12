@@ -127,6 +127,8 @@ pub mod sketch;
 pub mod unshown;
 /// A dossier: plan once into a document, execute each part with fresh context.
 pub mod dossier;
+/// Verbs that act on a finished build: melting, overgrown, collapsing.
+pub mod transform;
 /// Three takes, not one answer: a build is a choice.
 pub mod takes;
 /// A bench: try, measure, compare, and see whether it improved.
