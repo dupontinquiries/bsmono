@@ -53,3 +53,32 @@ worked on in `/home/claude`, likely never bundled at all.
 unendlich (merged). `card-diagnoser` needs prerequisite `c7339651` — and that hash appears in
 the "compositor-maybe-gitmind-work" session, which is where the nfc-kit work lives, so the
 re-export has to come from that machine.
+
+---
+
+## Merge attempt log: blackstar-024-delta (2026-09-08)
+
+Attempted, ABORTED, tree left clean. Recorded so the next attempt starts ahead of this one.
+
+49 commits, 32 files, 8 touched on both sides, 3 conflicts:
+
+| file | conflicts | shape |
+|---|---|---|
+| `games/blackstar-rs/src/main.rs` | 1 | two independent CLI flags (`--vo` vs `--cine`) added at the same spot — **keep both**, resolved cleanly |
+| `games/shared/worldhost-unendlich/src/lib.rs` | 3 | **not uniform** — see below |
+| `unendlich-engine/src/world/gpu_mesher_vk.rs` | 0 | auto-merged |
+
+**The trap.** The first conflict in `worldhost-unendlich/src/lib.rs` is a doc comment where
+their side is strictly better: a `Status (2026-09-02): COMPILES` block and a KNOWN LIMITS
+section written after a real compile, which is newer evidence than the prose on this side and
+must not be dropped. I applied "keep both" to all three on that basis and it broke the build —
+`unclosed delimiter`, because at least one of the other two is inside
+`impl<S: VoxelSource> WorldHost for Host<'_, S>` and is CODE, where keeping both sides
+duplicates or orphans a brace.
+
+So: resolve the first by keeping both, and read the other two individually. Do not batch them.
+
+`cargo check -p worldhost-unendlich` is the gate — it caught this in one run.
+
+The branch is fetched locally as `refs/remotes/z2-c14unified-024-delta/head`; nothing needs
+re-uploading.
