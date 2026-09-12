@@ -233,6 +233,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aperture-complete"
+version = "0.1.0"
+
+[[package]]
+name = "aperture-engine"
+version = "0.1.0"
+dependencies = [
+ "aperture-complete",
+ "gpu-gemm",
+]
+
+[[package]]
 name = "approx"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1711,6 +1723,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fdf242682df893b86f33a73828fb09ca4b2d3bb6cc95249707fc684d27484b91"
 dependencies = [
  "bitflags 2.13.0",
+]
+
+[[package]]
+name = "gpu-gemm"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "libc",
+ "memmap2",
+ "naga",
+ "pollster",
+ "wgpu",
 ]
 
 [[package]]
@@ -4169,6 +4193,7 @@ dependencies = [
 name = "unendlich-engine"
 version = "0.99.9999996-r746-recipe-build-itemid-fix"
 dependencies = [
+ "aperture-engine",
  "ash 0.37.3+1.3.251",
  "audiopus",
  "crossbeam-channel",
@@ -4196,6 +4221,7 @@ dependencies = [
  "unendlich-shared",
  "unendlich-ui",
  "vk-sys",
+ "voxel-tools",
  "winit 0.29.15",
 ]
 
@@ -4321,6 +4347,10 @@ name = "vk-sys"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36f5fd4a7d6d5d19808610583131c0aed271556527cad4cb71c436831a28e059"
+
+[[package]]
+name = "voxel-tools"
+version = "0.1.0"
 
 [[package]]
 name = "walkdir"
