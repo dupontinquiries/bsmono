@@ -414,7 +414,7 @@ impl eframe::App for Player {
                 self.transport.playing = !self.transport.playing;
             }
             if let Some(to) = act.seek_to {
-                self.transport.position = to;
+                self.seek_to(to);
             }
             if act.rotate {
                 // Through settings, not straight onto the transport: two
@@ -509,7 +509,7 @@ impl eframe::App for Player {
                 self.transport.playing = !self.transport.playing;
             }
             if let Some(to) = action.seek_to {
-                self.transport.position = to;
+                self.seek_to(to);
             }
         });
 
@@ -1113,5 +1113,24 @@ impl Player {
         self.transport.playing = true;
         self.gpu_error = None;
         Ok(())
+    }
+}
+
+impl Player {
+    /// Move the playhead AND the decoder.
+    ///
+    /// Setting the transport position alone moved the scrub bar and left the
+    /// picture where it was — the gesture looked like it worked and did
+    /// nothing, which is worse than a control that is visibly disabled.
+    fn seek_to(&mut self, to: Duration) {
+        self.transport.position = to;
+        if let Some(frames) = self.frames.as_mut() {
+            if let Err(e) = frames.seek(to) {
+                // A failed seek leaves the decoder where it was rather than
+                // killing playback: the film carries on from the old position,
+                // which is a better outcome than a black window.
+                self.gpu_error = Some(format!("seek failed: {e}"));
+            }
+        }
     }
 }

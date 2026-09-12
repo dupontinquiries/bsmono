@@ -107,8 +107,21 @@ pub fn probe(path: &Path) -> Result<Probe, String> {
 }
 
 /// A running ffmpeg, yielding NV12 frames.
+/// Where the frames come from, so a seek can restart the same source.
+#[derive(Clone, Debug)]
+enum Source {
+    File(std::path::PathBuf),
+    Streaming {
+        video_url: String,
+        audio_url: Option<String>,
+        headers: Vec<(String, String)>,
+    },
+}
+
 pub struct FfmpegFrames {
     child: Child,
+    source: Source,
+    cap: Option<u32>,
     pub width: u32,
     pub height: u32,
     pub frame_interval: Duration,
@@ -127,6 +140,15 @@ impl FfmpegFrames {
     /// avoid — letting ffmpeg scale costs far less than decoding full size and
     /// scaling afterwards.
     pub fn open(path: &Path, max_long_edge: Option<u32>) -> Result<Self, String> {
+        Self::open_at(path, max_long_edge, Duration::ZERO)
+    }
+
+    /// [`open`](Self::open), starting at `from`.
+    pub fn open_at(
+        path: &Path,
+        max_long_edge: Option<u32>,
+        from: Duration,
+    ) -> Result<Self, String> {
         let p = probe(path)?;
         let (mut w, mut h) = (p.width, p.height);
         let mut filters: Vec<String> = Vec::new();
@@ -143,8 +165,14 @@ impl FfmpegFrames {
         }
 
         let mut cmd = Command::new("ffmpeg");
-        cmd.args(["-v", "error", "-nostdin", "-i"])
-            .arg(path);
+        cmd.args(["-v", "error", "-nostdin"]);
+        if !from.is_zero() {
+            // Before -i: seeks the container to the nearest keyframe. After
+            // -i it would decode from the start and discard, making a scrub
+            // cost time proportional to how far you scrubbed.
+            cmd.args(["-ss", &format!("{:.3}", from.as_secs_f64())]);
+        }
+        cmd.arg("-i").arg(path);
         if !filters.is_empty() {
             cmd.args(["-vf", &filters.join(",")]);
         }
@@ -162,6 +190,8 @@ impl FfmpegFrames {
 
         Ok(Self {
             child,
+            source: Source::File(path.to_path_buf()),
+            cap: max_long_edge,
             width: w,
             height: h,
             frame_interval: Duration::from_secs_f64(1.0 / p.fps.max(1.0)),
@@ -169,6 +199,39 @@ impl FfmpegFrames {
             index: 0,
             frames_read: 0,
         })
+    }
+
+    /// Jump to a position.
+    ///
+    /// ffmpeg is restarted with `-ss` rather than asked to seek: a decode
+    /// pipeline reading raw frames off a pipe has no seek, and draining to the
+    /// target would read every frame in between — for a scrub to the end of a
+    /// lecture that is the whole file.
+    ///
+    /// `-ss` goes BEFORE `-i`. After it, ffmpeg decodes from the start and
+    /// throws frames away, which is accurate and turns a scrub into a wait
+    /// proportional to how far you scrubbed. Before it, ffmpeg seeks the
+    /// container and starts at the nearest keyframe, which is what a scrub
+    /// wants.
+    pub fn seek(&mut self, to: Duration) -> Result<(), String> {
+        let source = self.source.clone();
+        let cap = self.cap;
+        let mut next = match &source {
+            Source::File(p) => Self::open_at(p, cap, to)?,
+            Source::Streaming { video_url, audio_url, headers } => {
+                let input = StreamingInput {
+                    video_url: video_url.clone(),
+                    audio_url: audio_url.clone(),
+                    headers: headers.clone(),
+                };
+                Self::open_streaming_at(&input, cap, to)?
+            }
+        };
+        // Timestamps continue from where the seek landed, not from zero, or
+        // the transport jumps back to the start of the film every scrub.
+        next.index = (to.as_secs_f64() / next.frame_interval.as_secs_f64().max(1e-9)) as u64;
+        *self = next;
+        Ok(())
     }
 
     /// The next frame, or `None` at the end of the stream.
@@ -367,6 +430,93 @@ mod tests {
         assert!(f.is_some(), "the decoder returned nothing for a file it opened");
     }
 
+    /// Seek must land somewhere else, and quickly.
+    ///
+    /// A clip that changes brightness over time, so "did it move" is a
+    /// question the pixels answer. Asserting only the reported timestamp would
+    /// pass against a seek that reset to zero and relabelled the frames.
+    #[test]
+    fn seeking_lands_at_a_different_picture() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("vidkit-seek-{}.mp4", std::process::id()));
+        // Luma as a function of TIME, so "did it move" is a question the
+        // pixels answer. My first attempt faded a solid black source, which
+        // stays black — both ends read 16.0 and the test failed on its own
+        // fixture rather than on the seek.
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=black:size=160x120:rate=10:duration=10",
+                "-vf", "geq=lum='min(250,T*25)':cb=128:cr=128",
+                "-c:v", "libx264", "-g", "10", "-pix_fmt", "yuv420p",
+            ])
+            .arg(&path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("SKIP: could not encode");
+            return;
+        }
+
+        let mean = |f: &Frame| -> f64 {
+            match &f.data {
+                FrameData::Cpu(p) => {
+                    p.data[0].iter().map(|&v| v as f64).sum::<f64>() / p.data[0].len() as f64
+                }
+                _ => 0.0,
+            }
+        };
+
+        let mut d = FfmpegFrames::open(&path, None).expect("open");
+        let start = mean(&d.next_frame().expect("first frame"));
+
+        let began = std::time::Instant::now();
+        d.seek(Duration::from_secs(8)).expect("seek");
+        let after = d.next_frame().expect("a frame after seeking");
+        let took = began.elapsed();
+
+        assert!(
+            (mean(&after) - start).abs() > 5.0,
+            "the picture did not change: {start:.1} then {:.1}",
+            mean(&after)
+        );
+        // Timestamps continue from the seek, not from zero, or the transport
+        // jumps back to the start of the film on every scrub.
+        assert!(
+            after.pts >= Duration::from_secs(7),
+            "timestamps restarted at {:?}",
+            after.pts
+        );
+        // Restarting ffmpeg with -ss is near-instant; decoding to the target
+        // would take about as long as the clip.
+        assert!(took < Duration::from_secs(5), "seek took {took:?}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `-ss` before `-i` seeks the container; after it, ffmpeg decodes from
+    /// the start and discards, so a scrub costs time proportional to how far
+    /// you scrubbed — and over HTTP, downloads it too.
+    #[test]
+    fn the_seek_flag_precedes_the_input() {
+        let input = StreamingInput {
+            video_url: "http://cdn/v.mp4".into(),
+            audio_url: None,
+            headers: Vec::new(),
+        };
+        let mut args = streaming_args(&input, None);
+        let at = args.iter().position(|a| a == "-i").unwrap();
+        args.insert(at, "12.000".into());
+        args.insert(at, "-ss".into());
+        let ss = args.iter().position(|a| a == "-ss").unwrap();
+        let i = args.iter().position(|a| a == "-i").unwrap();
+        assert!(ss < i, "-ss after -i decodes and discards: {args:?}");
+    }
+
     #[test]
     fn a_missing_file_is_reported_rather_than_hanging() {
         if !have_ffmpeg() {
@@ -478,6 +628,15 @@ impl FfmpegFrames {
         input: &StreamingInput,
         max_long_edge: Option<u32>,
     ) -> Result<Self, String> {
+        Self::open_streaming_at(input, max_long_edge, Duration::ZERO)
+    }
+
+    /// [`open_streaming`](Self::open_streaming), starting at `from`.
+    pub fn open_streaming_at(
+        input: &StreamingInput,
+        max_long_edge: Option<u32>,
+        from: Duration,
+    ) -> Result<Self, String> {
         let p = probe_url(&input.video_url, &input.headers)?;
         let (mut w, mut h) = (p.width, p.height);
         if let Some(cap) = max_long_edge {
@@ -489,8 +648,17 @@ impl FfmpegFrames {
             }
         }
 
+        let mut args = streaming_args(input, max_long_edge);
+        if !from.is_zero() {
+            // Inserted before the first -i, for the same reason as the file
+            // path: after it, ffmpeg would fetch and discard everything up to
+            // the seek point, which over HTTP means downloading it too.
+            let at = args.iter().position(|a| a == "-i").unwrap_or(0);
+            args.insert(at, format!("{:.3}", from.as_secs_f64()));
+            args.insert(at, "-ss".into());
+        }
         let child = Command::new("ffmpeg")
-            .args(streaming_args(input, max_long_edge))
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -502,6 +670,12 @@ impl FfmpegFrames {
 
         Ok(Self {
             child,
+            source: Source::Streaming {
+                video_url: input.video_url.clone(),
+                audio_url: input.audio_url.clone(),
+                headers: input.headers.clone(),
+            },
+            cap: max_long_edge,
             width: w,
             height: h,
             frame_interval: Duration::from_secs_f64(1.0 / p.fps.max(1.0)),
