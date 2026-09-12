@@ -1,3 +1,4 @@
+mod real_commands;
 mod stubs;
 mod bind;
 mod paintbrush;

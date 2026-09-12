@@ -527,6 +527,12 @@ impl Command {
             Command::Gamemode(m) => Some(format!("/gamemode {}", m.keyword())),
             Command::Recipes => Some("/recipes".to_string()),
             Command::Help => Some("/help".to_string()),
+            // The canonical form must RE-PARSE EQUAL, which is what
+            // the round-trip property test pins down: `/takes 3 a
+            // watchtower` parses back to the same count and request, so
+            // the count is always rendered even when it was defaulted.
+            Command::Takes(n, request) => Some(format!("/takes {n} {request}")),
+            Command::Pick(n) => Some(format!("/pick {n}")),
             Command::Unknown => None,
         }
     }
