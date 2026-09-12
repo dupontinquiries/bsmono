@@ -13,6 +13,7 @@ struct FrameData {
     sun_col: vec4<f32>,  // rgb sun colour*intensity, w cloud cover
     weather: vec4<f32>,  // x rain, y snow, z wetness, w lightning
     wind: vec4<f32>,
+    event: vec4<f32>,    // x flood rise, y quake shake, z fire glow, w unused
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameData;
@@ -166,6 +167,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             col = mix(col, vec3(0.05, 0.05, 0.06), 0.85);
         }
     }
+
+    // --- wildfire: smoke stains the low sky orange-brown
+    col = mix(col, vec3(0.45, 0.25, 0.12), frame.event.z * 0.5 * smoothstep(0.4, -0.05, h));
 
     // --- lightning: the whole sky flashes, brightest toward the horizon
     col = col + vec3(0.7, 0.72, 0.95) * flash * (0.35 + 0.65 * smoothstep(0.6, 0.0, h));

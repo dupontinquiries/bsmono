@@ -168,7 +168,7 @@ impl Wild {
             let r = 26.0 + rng.f32() * (ARENA_RADIUS - 40.0);
             let x = a.cos() * r;
             let z = a.sin() * r;
-            if lane_clearance(x, z) > 7.0 && river_dist(x, z) > 8.0 {
+            if lane_clearance(x, z) > 7.0 && river_dist(x, z) > 8.0 && !crate::bosses::in_pit(x, z) {
                 return Some(Vec3::new(x, 0.0, z));
             }
         }

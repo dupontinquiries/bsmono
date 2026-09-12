@@ -394,6 +394,29 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
         if g.blessing_t > 0.0 {
             line = format!("{}   ·   RIVERBLESSED {:.0}s", line, g.blessing_t);
         }
+        for b in &game.bosses.list {
+            let short = match b.kind { crate::bosses::BossKind::Boar => "BOAR", crate::bosses::BossKind::Drake => "DRAKE" };
+            if b.alive {
+                line = format!("{}   ·   {} {:.0}%", line, short, b.hp / b.max_hp * 100.0);
+            } else {
+                let left = (b.spawn_t - game.t).max(0.0);
+                line = format!("{}   ·   {} {}:{:02}", line, short, (left / 60.0) as u32, (left % 60.0) as u32);
+            }
+        }
+        let ti = g.team as usize;
+        if game.bosses.bounty_t[ti] > 0.0 {
+            line = format!("{}   ·   BOUNTY {:.0}s", line, game.bosses.bounty_t[ti]);
+        }
+        if game.bosses.stormfire_t[ti] > 0.0 {
+            line = format!("{}   ·   STORMFIRE {:.0}s", line, game.bosses.stormfire_t[ti]);
+        }
+        if let Some(a) = &game.disasters.active {
+            line = format!("{}   ·   ⚠ {} {:.0}s", line, a.kind.name(), (a.until - game.t).max(0.0));
+        } else if let Some((k, at)) = game.disasters.scheduled {
+            if game.disasters.warned {
+                line = format!("{}   ·   ⚠ {} in {:.0}s", line, k.name(), (at - game.t).max(0.0));
+            }
+        }
         egui::Area::new(egui::Id::new("skychip")).anchor(egui::Align2::CENTER_TOP, [0.0, 8.0]).show(ctx, |ui| {
             let (r, _) = ui.allocate_exact_size(Vec2::new(line.len() as f32 * 7.4 + 24.0, 22.0), Sense::hover());
             ui.painter().rect_filled(r, 6.0, Color32::from_rgba_premultiplied(12, 12, 18, 170));
@@ -492,6 +515,32 @@ fn draw_minimap(ctx: &egui::Context, game: &Game, player: usize) {
                 p.circle_filled(s, 6.5, col(tt.team));
                 p.circle_stroke(s, 6.5, Stroke::new(2.0_f32, GOLD));
             }
+        }
+        // objectives: a diamond at each pit, filled while the beast is up
+        for b in &game.bosses.list {
+            let s = to_map(b.home);
+            let c = b.kind.color();
+            let cc = Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8);
+            let pts = vec![s + Vec2::new(0.0, -7.0), s + Vec2::new(7.0, 0.0), s + Vec2::new(0.0, 7.0), s + Vec2::new(-7.0, 0.0)];
+            if b.alive {
+                p.add(egui::Shape::convex_polygon(pts, cc, Stroke::new(1.5_f32, Color32::BLACK)));
+            } else {
+                p.add(egui::Shape::closed_line(pts, Stroke::new(1.5_f32, cc.gamma_multiply(0.6))));
+            }
+        }
+        // catastrophes: fire cells, fissures, the funnel
+        for f in &game.disasters.fire {
+            p.circle_filled(to_map(f.pos), 3.0, Color32::from_rgb(255, 120, 30));
+        }
+        for c in &game.disasters.charred {
+            p.circle_filled(to_map(*c), 2.5, Color32::from_rgb(40, 32, 28));
+        }
+        for f in &game.disasters.fissures {
+            let c = if f.heat > 0.5 { Color32::from_rgb(255, 90, 40) } else { Color32::from_rgb(50, 40, 40) };
+            p.line_segment([to_map(f.a), to_map(f.b)], Stroke::new(2.0_f32, c));
+        }
+        if let Some(t) = &game.disasters.tornado {
+            p.circle_stroke(to_map(t.pos), 6.0, Stroke::new(2.0_f32, Color32::from_rgb(200, 200, 210)));
         }
         // minions
         for m in &game.minions {

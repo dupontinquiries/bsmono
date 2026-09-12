@@ -134,6 +134,11 @@ impl Game {
                         hits.push(TargetRef::Titan(tt.team));
                     }
                 }
+                for (bi, b) in self.bosses.list.iter().enumerate() {
+                    if b.alive && point_segment_dist(b.pos + Vec3::Y * 2.0, pos_y, end) <= width + 2.0 {
+                        hits.push(TargetRef::Boss(bi));
+                    }
+                }
                 for h in hits {
                     self.deal_damage(h, d, true, Some(gi), pen_pct, pen_flat);
                 }
@@ -283,6 +288,11 @@ impl Game {
             let tt = &self.titans[t];
             if tt.team != team && tt.pos.distance(center) <= radius + 2.5 {
                 out.push(TargetRef::Titan(tt.team));
+            }
+        }
+        for (bi, b) in self.bosses.list.iter().enumerate() {
+            if b.alive && b.pos.distance(center) <= radius + 2.0 {
+                out.push(TargetRef::Boss(bi));
             }
         }
         out

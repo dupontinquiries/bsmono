@@ -752,11 +752,16 @@ fn render(s: &mut AppState) {
             }
         }
         Screen::Playing => {
-            let player = &s.game.as_ref().unwrap().gods[0];
+            let g = s.game.as_ref().unwrap();
+            let player = &g.gods[0];
             let dir = cam_dir(s.cam_yaw, s.cam_pitch);
-            let target = player.pos + Vec3::Y * 1.5;
+            // the ground moves: an earthquake (or a nearby boar slam) jolts the camera
+            let shake = g.disasters.shake;
+            let tt = s.last_frame.elapsed().as_secs_f32() * 60.0 + g.t * 47.0;
+            let jolt = Vec3::new((tt * 1.7).sin(), (tt * 2.3).cos() * 0.6, (tt * 1.1).sin()) * shake * 0.35;
+            let target = player.pos + Vec3::Y * 1.5 + jolt;
             Camera {
-                eye: target - dir * s.cam_dist,
+                eye: target - dir * s.cam_dist + jolt * 0.5,
                 target,
                 fov_y: 0.95,
             }
@@ -774,6 +779,10 @@ fn render(s: &mut AppState) {
     // world draws (+ this frame's sky state)
     if let Some(g) = s.game.as_ref() {
         s.renderer.atmosphere = g.weather.atmosphere();
+        // catastrophe uniforms: flood rise, shake, fire glow near the player
+        let near_fire = g.disasters.fire.iter().map(|f| f.pos.distance(g.gods[0].pos)).fold(f32::MAX, f32::min);
+        let glow = if near_fire < 40.0 { (1.0 - near_fire / 40.0).clamp(0.0, 1.0) } else { 0.0 };
+        s.renderer.event = (g.disasters.flood_rise, g.disasters.shake, glow);
         let mut vfx = std::mem::take(&mut s.vfx);
         scene.draw(&mut s.renderer, g, &mut vfx, cam);
         s.vfx = vfx;

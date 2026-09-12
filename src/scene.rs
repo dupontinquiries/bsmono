@@ -29,6 +29,8 @@ pub struct Scene {
     pub hare: u64,
     pub stag: u64,
     pub glowfish: u64,
+    pub boar: u64,
+    pub drake: u64,
     pub heal_tree: u64,
     pub heal_fruit: u64,
     pub orb: u64,
@@ -137,6 +139,11 @@ impl Scene {
         let fish_m = models::build_glowfish();
         total += fish_m.inst.len();
         let glowfish = r.upload_mesh(&fish_m);
+        let boar_m = models::build_boar();
+        let drake_m = models::build_drake();
+        total += boar_m.inst.len() + drake_m.inst.len();
+        let boar = r.upload_mesh(&boar_m);
+        let drake = r.upload_mesh(&drake_m);
         let (tree_m, fruit_m) = models::build_heal_tree();
         total += hare_m.inst.len() + stag_m.inst.len() + tree_m.inst.len() + fruit_m.inst.len();
         let hare = r.upload_mesh(&hare_m);
@@ -164,6 +171,8 @@ impl Scene {
             hare,
             stag,
             glowfish,
+            boar,
+            drake,
             heal_tree,
             heal_fruit,
             orb,
@@ -182,10 +191,37 @@ impl Scene {
         let frost = atm.snow * 0.55 + game.weather.wetness * atm.snow * 0.25;
         let chunk_tint = [1.0 + frost * 0.35, 1.0 + frost * 0.42, 1.0 + frost * 0.55, 1.0];
         let vp = cam.view_proj(r.width as f32 / r.height.max(1) as f32);
+        let any_char = !game.disasters.charred.is_empty();
         for ch in &self.chunks {
             if sphere_in_frustum(&vp, ch.center, ch.radius) {
-                r.queue_draw(ch.mesh, Mat4::IDENTITY, chunk_tint, 0.0, ch.vsize, false);
+                // burnt jungle: the flora in a charred chunk goes black-brown
+                let tint = if any_char {
+                    let c = game.disasters.char_near(ch.center, ch.radius.max(8.0));
+                    [chunk_tint[0] * (1.0 - c * 0.8), chunk_tint[1] * (1.0 - c * 0.85), chunk_tint[2] * (1.0 - c * 0.88), 1.0]
+                } else {
+                    chunk_tint
+                };
+                r.queue_draw(ch.mesh, Mat4::IDENTITY, tint, 0.0, ch.vsize, false);
             }
+        }
+
+        // objectives: the beasts in their pits, breathing when idle, lunging when angry
+        for b in &game.bosses.list {
+            if !b.alive {
+                continue;
+            }
+            let (mesh, vs) = match b.kind {
+                crate::bosses::BossKind::Boar => (self.boar, models::BOAR_VOXEL),
+                crate::bosses::BossKind::Drake => (self.drake, models::DRAKE_VOXEL),
+            };
+            let breathe = (b.anim * 0.7).sin() * 0.03;
+            let lunge = b.atk_anim * 0.8;
+            let hover = if b.kind == crate::bosses::BossKind::Drake { 0.4 + (b.anim * 0.5).sin() * 0.25 } else { 0.0 };
+            let fwd = Vec3::new(b.yaw.cos(), 0.0, b.yaw.sin());
+            let m = Mat4::from_translation(b.pos + fwd * lunge + Vec3::Y * (breathe + hover))
+                * Mat4::from_axis_angle(Vec3::Y, -b.yaw + std::f32::consts::FRAC_PI_2)
+                * Mat4::from_scale(Vec3::splat(1.0 + breathe));
+            r.queue_draw(mesh, m, [1.0; 4], if b.kind == crate::bosses::BossKind::Drake { 0.25 } else { 0.0 }, vs, false);
         }
 
         // heal trees: the crown frosts like the rest, the fruit glows —
@@ -404,7 +440,7 @@ fn jungle_spot(rng: &mut Rng, min_clear: f32) -> Option<(f32, f32)> {
         let r = 22.0 + rng.f32() * (ARENA_RADIUS - 30.0);
         let x = a.cos() * r;
         let z = a.sin() * r;
-        if consts::lane_clearance(x, z) > min_clear && consts::river_dist(x, z) > 9.5 {
+        if consts::lane_clearance(x, z) > min_clear && consts::river_dist(x, z) > 9.5 && !crate::bosses::in_pit(x, z) {
             return Some((x, z));
         }
     }
@@ -552,6 +588,32 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh) {
         }
         v += 1;
     }
+    // --- the objective pits: a ring of boulders and old pillars with two
+    // gaps facing the lanes, a stone floor pad in the middle
+    for (k, pit) in crate::bosses::pit_positions().iter().enumerate() {
+        let n = 18;
+        for i in 0..n {
+            let a = i as f32 / n as f32 * TAU + k as f32 * 0.3;
+            // gaps: toward the map centre and away from it
+            let facing = (a.cos() * pit.x.signum()).abs();
+            if facing > 0.93 {
+                continue;
+            }
+            let rr = crate::bosses::PIT_RADIUS + 1.5;
+            let (x, z) = (pit.x + a.cos() * rr, pit.z + a.sin() * rr);
+            if i % 4 == 0 {
+                put!(props::ruin_pillar(1.0, i as i32 + k as i32 * 5), x, z, 0.0, (i % 4) as u8, V_MED);
+            } else {
+                put!(props::boulder_cluster(1.1 + (i % 3) as f32 * 0.25, i as i32), x, z, 0.0, (i % 4) as u8, V_MED);
+            }
+        }
+        put!(props::lane_pad(), pit.x, pit.z, -0.05, 0, V_MED);
+        for i in 0..3 {
+            let a = i as f32 * 2.1 + k as f32;
+            put!(props::brazier(), pit.x + a.cos() * 6.0, pit.z + a.sin() * 6.0, 0.0, 0, V_BRAZ);
+        }
+    }
+
     // vine curtains strung between the trees
     for _ in 0..34 {
         if let Some((x, z)) = jungle_spot(&mut rng, 6.5) {

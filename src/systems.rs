@@ -57,6 +57,10 @@ impl Game {
         self.atmosphere_tick(dt);
         // 6c. the living jungle: heal trees + prey (wild.rs)
         self.wild_tick(dt);
+        // 6d. objectives (bosses.rs)
+        self.bosses_tick(dt);
+        // 6e. catastrophes (disasters.rs)
+        self.disasters_tick(dt);
 
         // 7. regen / timers
         self.timers_tick(dt);
@@ -336,6 +340,7 @@ impl Game {
             TargetRef::Minion(i) => self.minions[i].pos,
             TargetRef::Tower(i) => self.towers[i].pos,
             TargetRef::Titan(team) => self.titans[team as usize].pos,
+            TargetRef::Boss(bi) => self.bosses.list[bi].pos,
         }
     }
 
@@ -424,6 +429,7 @@ impl Game {
                 }
                 TargetRef::Tower(ti) => self.deal_damage(TargetRef::Tower(ti), dmg, false, None, 0.0, 0.0),
                 TargetRef::Titan(team) => self.deal_damage(TargetRef::Titan(team), dmg, false, None, 0.0, 0.0),
+                TargetRef::Boss(_) => {} // minions never fight the beasts
             }
         }
     }
@@ -662,6 +668,14 @@ impl Game {
                     }
                 }
             }
+            if hit.is_none() {
+                for (bi, b) in self.bosses.list.iter().enumerate() {
+                    if b.alive && (b.pos + Vec3::Y * 2.0 - p.pos).length() < p.radius + 2.2 {
+                        hit = Some(TargetRef::Boss(bi));
+                        break;
+                    }
+                }
+            }
             if let Some(h) = hit {
                 let (pdmg, ppen, ppf, powner, ppos, pcolor) = {
                     let p = &self.projectiles[pi];
@@ -705,6 +719,11 @@ impl Game {
             let tt = &self.titans[t];
             if tt.team != team && tt.pos.distance(center) <= radius + 2.5 {
                 hits.push(TargetRef::Titan(tt.team));
+            }
+        }
+        for (bi, b) in self.bosses.list.iter().enumerate() {
+            if b.alive && b.pos.distance(center) <= radius + 2.0 {
+                hits.push(TargetRef::Boss(bi));
             }
         }
         for h in hits {

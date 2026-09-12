@@ -19,9 +19,9 @@ fn all_shaders_validate() {
     check("post", include_str!("../shaders/post.wgsl"));
 }
 
-/// The frame uniform must be exactly the size WGSL expects (3 mat4 + 7 vec4).
+/// The frame uniform must be exactly the size WGSL expects (3 mat4 + 8 vec4).
 #[test]
 fn frame_uniform_matches_wgsl_layout() {
-    assert_eq!(std::mem::size_of::<clawbound::render::FrameUniform>(), 3 * 64 + 7 * 16);
+    assert_eq!(std::mem::size_of::<clawbound::render::FrameUniform>(), 3 * 64 + 8 * 16);
     assert_eq!(std::mem::size_of::<clawbound::render::DrawData>(), 64 + 32);
 }

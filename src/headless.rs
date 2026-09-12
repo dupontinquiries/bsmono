@@ -258,6 +258,7 @@ pub fn run() -> Result<(), String> {
         };
 
         renderer.atmosphere = game.weather.atmosphere();
+        renderer.event = (game.disasters.flood_rise, game.disasters.shake, 0.0);
         scene.draw(&mut renderer, &game, &mut vfx, cam);
         renderer.render_frame(&view, cam, sim_time);
 

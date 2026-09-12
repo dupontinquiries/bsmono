@@ -363,6 +363,100 @@ pub fn build_glowfish() -> VoxelMesh {
 }
 
 // ---------------------------------------------------------------------------
+// Objectives — the Elder Boar (voxel 0.09, ~3.2u at the crest) and the Storm
+// Drake (voxel 0.1, ~4.5u to the horn tips, wings spread). Both face +Z.
+// ---------------------------------------------------------------------------
+
+pub const BOAR_VOXEL: f32 = 0.09;
+pub const DRAKE_VOXEL: f32 = 0.10;
+
+pub fn build_boar() -> VoxelMesh {
+    let mut g = Grid::new(20, 36, 40);
+    let (cx, cz) = (10, 20);
+    let (cxf, czf) = (cx as f32, cz as f32);
+    let hide = [0.36, 0.26, 0.18];
+    let dark = [0.2, 0.14, 0.1];
+    let bristle = [0.55, 0.42, 0.28];
+    let tusk = [0.95, 0.9, 0.78];
+    // legs, thick
+    for (sx, sz) in [(-5, 10), (5, 10), (-5, -10), (5, -10)] {
+        g.filled_box(cx + sx - 2, 0, cz + sz - 2, cx + sx + 2, 14, cz + sz + 2, solid(hide));
+        g.filled_box(cx + sx - 2, 0, cz + sz - 2, cx + sx + 2, 2, cz + sz + 2, solid(dark));
+    }
+    // barrel body, humped shoulders
+    g.ellipsoid(cxf, 20.0, czf - 4.0, 8.5, 8.0, 14.0, solid(hide));
+    g.ellipsoid(cxf, 24.0, czf + 6.0, 8.0, 7.0, 9.0, solid(hide));
+    g.ellipsoid(cxf, 16.0, czf, 6.5, 3.0, 12.0, solid(mix(hide, bristle, 0.4)));
+    // bristle crest along the spine
+    for z in (cz - 12..=cz + 12).step_by(2) {
+        let h = if (z - cz).abs() < 6 { 4 } else { 2 };
+        g.filled_box(cx, 29, z, cx, 29 + h, z, solid(bristle));
+        g.set(cx - 1, 30, z, solid(bristle));
+    }
+    // head + snout + ears + tusks + eyes
+    g.ellipsoid(cxf, 22.0, czf + 15.0, 6.0, 6.0, 6.0, solid(hide));
+    g.ellipsoid(cxf, 19.5, czf + 20.0, 3.5, 3.0, 4.0, solid(dark));
+    for sx in [-1i32, 1] {
+        g.filled_box(cx + sx * 4, 26, cz + 13, cx + sx * 5, 30, cz + 14, solid(hide));
+        for i in 0..6 {
+            g.set(cx + sx * (3 + i / 3), 19 + i, cz + 22 + (i % 2), solid(tusk));
+        }
+        g.set(cx + sx * 3, 24, cz + 20, solid([0.9, 0.2, 0.1]));
+    }
+    g.mesh(BOAR_VOXEL, true)
+}
+
+pub fn build_drake() -> VoxelMesh {
+    let mut g = Grid::new(44, 46, 40);
+    let (cx, cz) = (22, 20);
+    let (cxf, czf) = (cx as f32, cz as f32);
+    let scale = [0.26, 0.32, 0.42];
+    let belly = [0.55, 0.6, 0.66];
+    let wing = [0.35, 0.4, 0.6];
+    let bone = [0.85, 0.85, 0.8];
+    let glow = [0.6, 0.75, 1.0];
+    // legs
+    for (sx, sz) in [(-5, 6), (5, 6), (-5, -8), (5, -8)] {
+        g.filled_box(cx + sx - 1, 0, cz + sz - 1, cx + sx + 1, 12, cz + sz + 1, solid(scale));
+        g.filled_box(cx + sx - 2, 0, cz + sz - 1, cx + sx + 2, 1, cz + sz + 3, solid(bone));
+    }
+    // body, belly, tail
+    g.ellipsoid(cxf, 18.0, czf, 6.5, 6.0, 15.0, solid(scale));
+    g.ellipsoid(cxf, 15.0, czf, 4.5, 3.0, 12.0, solid(belly));
+    for i in 0..16 {
+        let t = i as f32;
+        g.ellipsoid(cxf + (t * 0.4).sin() * 2.0, 17.0 + t * 0.5, czf - 14.0 - t * 1.2, 2.2 - t * 0.1, 2.2 - t * 0.1, 1.5, solid(scale));
+    }
+    // neck + head + horns + jaw
+    for i in 0..8 {
+        g.ellipsoid(cxf, 20.0 + i as f32 * 2.0, czf + 12.0 + i as f32 * 1.4, 3.2, 3.0, 3.5, solid(scale));
+    }
+    g.ellipsoid(cxf, 36.0, czf + 25.0, 4.0, 3.5, 6.5, solid(scale));
+    g.ellipsoid(cxf, 34.0, czf + 30.0, 2.5, 1.6, 3.5, solid(belly));
+    for sx in [-1i32, 1] {
+        for i in 0..8 {
+            g.set(cx + sx * (3 + i / 2), 38 + i, cz + 22 - i / 3, solid(bone));
+        }
+        g.set(cx + sx * 2, 37, cz + 30, solid(glow));
+    }
+    // wings: membrane fans on two bones each
+    for sx in [-1i32, 1] {
+        for i in 0..16 {
+            let x = cx + sx * (4 + i);
+            let y = 24 + (i as f32 * 0.9) as i32 - (i * i) as i32 / 30;
+            g.filled_box(x, y, cz - 2, x, y + 1, cz - 1, solid(bone));
+            let span = (14 - i).max(2);
+            g.filled_box(x, y - 1, cz - 2 - span, x, y - 1, cz - 3, solid(wing));
+        }
+    }
+    // spine glow ridge
+    for z in (cz - 12..=cz + 10).step_by(3) {
+        g.set(cx, 25, z, solid(glow));
+    }
+    g.mesh(DRAKE_VOXEL, true)
+}
+
+// ---------------------------------------------------------------------------
 // Heal Tree — Clawbound's sanctuary tree: pale bark, a wide low crown, and
 // glowing seed-fruit that read as a beacon (drawn with emissive).
 // ---------------------------------------------------------------------------

@@ -32,8 +32,10 @@ pub struct FrameUniform {
     pub sun_col: [f32; 4],
     /// x rain, y snow, z wetness, w lightning
     pub weather: [f32; 4],
-    /// xyz wind (world u/s), w unused
+    /// xyz wind (world u/s), w gust
     pub wind: [f32; 4],
+    /// x flood rise (u), y quake shake, z fire glow near camera, w unused
+    pub event: [f32; 4],
 }
 
 #[repr(C)]
@@ -107,6 +109,9 @@ pub struct Renderer {
     water_vbuf: wgpu::Buffer,
     water_ibuf: wgpu::Buffer,
     water_count: u32,
+    flood_vbuf: wgpu::Buffer,
+    flood_ibuf: wgpu::Buffer,
+    flood_count: u32,
 
     post_sampler: wgpu::Sampler,
     post_params: wgpu::Buffer,
@@ -125,6 +130,8 @@ pub struct Renderer {
     pub exposure: f32,
     /// Sky state for this frame — set by the caller each frame (see weather.rs).
     pub atmosphere: crate::weather::Atmosphere,
+    /// (flood rise, quake shake, fire glow) — set by the caller (disasters.rs).
+    pub event: (f32, f32, f32),
 }
 
 impl Renderer {
@@ -566,6 +573,18 @@ impl Renderer {
             usage: wgpu::BufferUsages::INDEX,
         });
         let water_count = wi.len() as u32;
+        let (fv, fi) = build_flood_plane();
+        let flood_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("flood vbuf"),
+            contents: bytemuck::cast_slice(&fv),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let flood_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("flood ibuf"),
+            contents: bytemuck::cast_slice(&fi),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let flood_count = fi.len() as u32;
 
         let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("post sampler"),
@@ -615,6 +634,9 @@ impl Renderer {
             water_vbuf,
             water_ibuf,
             water_count,
+            flood_vbuf,
+            flood_ibuf,
+            flood_count,
             post_sampler,
             post_params,
             hdr_msaa: None,
@@ -629,6 +651,7 @@ impl Renderer {
             time: 0.0,
             exposure: 0.92,
             atmosphere: crate::weather::Weather::new().atmosphere(),
+            event: (0.0, 0.0, 0.0),
         };
         r.resize(width, height);
         r
@@ -766,6 +789,7 @@ impl Renderer {
             sun_col: [atm.sun_col[0], atm.sun_col[1], atm.sun_col[2], atm.cloud_cover],
             weather: [atm.rain, atm.snow, atm.wetness, atm.lightning],
             wind: [atm.wind.x, atm.wind.y, atm.wind.z, atm.gust],
+            event: [self.event.0, self.event.1, self.event.2, 0.0],
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 
@@ -917,6 +941,12 @@ impl Renderer {
                 rp.set_vertex_buffer(0, self.water_vbuf.slice(..));
                 rp.set_index_buffer(self.water_ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 rp.draw_indexed(0..self.water_count, 0, 0..1);
+                // the flood: a second sheet over the whole floor, only while it rises
+                if self.event.0 > 0.01 && self.flood_count > 0 {
+                    rp.set_vertex_buffer(0, self.flood_vbuf.slice(..));
+                    rp.set_index_buffer(self.flood_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..self.flood_count, 0, 0..1);
+                }
             }
 
             // transparent voxels + particles
@@ -1029,6 +1059,7 @@ impl Renderer {
             sun_col: [1.14, 1.0, 0.84, 0.1],
             weather: [0.0; 4],
             wind: [0.0; 4],
+            event: [0.0; 4],
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 
@@ -1434,6 +1465,40 @@ fn build_water() -> (Vec<WaterVert>, Vec<u32>) {
                     idx.extend_from_slice(&[a, c, b, b, c, d]);
                 }
             }
+        }
+    }
+    (verts, idx)
+}
+
+/// Flood sheet: the playable floor at WATER_LEVEL (the shader lifts it by
+/// the flood rise), 2 u cells, skipping the river strips the normal water
+/// mesh already covers.
+fn build_flood_plane() -> (Vec<WaterVert>, Vec<u32>) {
+    use crate::consts::{river_dist, ARENA_RADIUS, RIVER_HALF_WIDTH, WATER_LEVEL};
+    const STEP: f32 = 2.0;
+    let half = ARENA_RADIUS + 10.0;
+    let n = (half * 2.0 / STEP) as usize + 1;
+    let mut verts = Vec::with_capacity(n * n);
+    let mut idx = Vec::new();
+    for iz in 0..n {
+        let z = -half + iz as f32 * STEP;
+        for ix in 0..n {
+            let x = -half + ix as f32 * STEP;
+            verts.push(WaterVert { pos: [x, WATER_LEVEL, z], bed: terrain_height(x, z), flow: [0.0, -1.0], uv: [x * 0.05, z * 0.05] });
+        }
+    }
+    for iz in 0..n - 1 {
+        for ix in 0..n - 1 {
+            let a = (ix + n * iz) as u32;
+            let b = (ix + 1 + n * iz) as u32;
+            let c = (ix + n * (iz + 1)) as u32;
+            let d = (ix + 1 + n * (iz + 1)) as u32;
+            let v = &verts[a as usize];
+            let r = (v.pos[0] * v.pos[0] + v.pos[2] * v.pos[2]).sqrt();
+            if r > half - 2.0 || river_dist(v.pos[0], v.pos[2]) < RIVER_HALF_WIDTH + 5.0 {
+                continue;
+            }
+            idx.extend_from_slice(&[a, c, b, b, c, d]);
         }
     }
     (verts, idx)

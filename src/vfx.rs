@@ -447,6 +447,71 @@ impl Vfx {
                         self.spawn_spark(*pos + Vec3::Y * 0.9, [1.0, 0.85, 0.35], 1.6);
                     }
                 }
+                Event::BossSpawn { kind, pos } => {
+                    let c = kind.color();
+                    for i in 0..80 {
+                        let a = i as f32 * 0.0785;
+                        self.particles.push(Particle {
+                            pos: *pos + Vec3::new(a.cos() * 2.0, 0.5, a.sin() * 2.0),
+                            vel: Vec3::new(a.cos() * 6.0, 6.0 + (i % 5) as f32, a.sin() * 6.0),
+                            life: 1.8,
+                            max_life: 1.8,
+                            size: 0.32,
+                            color: c,
+                            alpha: 1.0,
+                            gravity: 6.0,
+                            drag: 0.8,
+                        });
+                    }
+                    self.rings.push(Ring { pos: *pos, r0: 1.0, r1: crate::bosses::PIT_RADIUS, until: 1.6, dur: 1.6, color: c, thick: 0.4 });
+                }
+                Event::BossDown { kind, pos, .. } => {
+                    let c = kind.color();
+                    for _ in 0..120 {
+                        self.spawn_spark(*pos + Vec3::Y * 2.0, c, 6.0);
+                    }
+                    self.rings.push(Ring { pos: *pos, r0: 1.0, r1: 22.0, until: 2.2, dur: 2.2, color: c, thick: 0.5 });
+                }
+                Event::FireIgnite { pos } => {
+                    for _ in 0..12 {
+                        self.spawn_spark(*pos + Vec3::Y * 0.5, [1.0, 0.6, 0.15], 3.0);
+                    }
+                }
+                Event::FissureOpen { a, b } => {
+                    // dust and shards thrown up along the tear
+                    let n = ((*b - *a).length() * 2.0) as usize;
+                    for i in 0..n {
+                        let t = i as f32 / n.max(1) as f32;
+                        let p = *a + (*b - *a) * t;
+                        self.particles.push(Particle {
+                            pos: p + Vec3::Y * 0.2,
+                            vel: Vec3::new(rnd_jitter(t * 9.0) * 2.0, 5.0 + rnd_jitter(t * 5.0).abs() * 4.0, rnd_jitter(t * 7.0) * 2.0),
+                            life: 1.4,
+                            max_life: 1.4,
+                            size: 0.24,
+                            color: [0.45, 0.4, 0.34],
+                            alpha: 0.9,
+                            gravity: 8.0,
+                            drag: 0.5,
+                        });
+                    }
+                }
+                Event::TornadoDebris { pos } => {
+                    for i in 0..14 {
+                        let a = i as f32 * 0.45 + self.time;
+                        self.particles.push(Particle {
+                            pos: *pos + Vec3::new(a.cos() * 4.0, 2.0 + i as f32 * 0.6, a.sin() * 4.0),
+                            vel: Vec3::new(a.cos() * 9.0, 4.0, a.sin() * 9.0),
+                            life: 2.5,
+                            max_life: 2.5,
+                            size: 0.3,
+                            color: if i % 3 == 0 { [0.3, 0.2, 0.1] } else { [0.24, 0.36, 0.12] },
+                            alpha: 1.0,
+                            gravity: 5.0,
+                            drag: 0.6,
+                        });
+                    }
+                }
                 Event::MapEventStart { kind, pos, radius } => {
                     use crate::map_events::MapEventKind as K;
                     let c = kind.color();
@@ -556,6 +621,9 @@ impl Vfx {
 
         // --- the rivers: gelatin blobs, wading splashes, fish, dragonflies --
         self.river_life(&mut out, cam_eye, game, &atm);
+
+        // --- catastrophes ----------------------------------------------------
+        self.disaster_visuals(&mut out, cam_eye, game);
 
         // --- ground birds ----------------------------------------------------
         for f in &self.flocks {
@@ -797,6 +865,99 @@ impl Vfx {
 }
 
 impl Vfx {
+    /// Fire cells (flames, smoke, embers), ash over charred ground, glowing
+    /// fissures, the tornado funnel. All hashed from state each frame.
+    fn disaster_visuals(&self, out: &mut Vec<VoxInst>, eye: Vec3, game: &Game) {
+        use crate::disasters::FIRE_CELL;
+        let t = self.time;
+        let d = &game.disasters;
+        let wind = game.weather.atmosphere().wind;
+        // flames: only cells within sight
+        for f in &d.fire {
+            if f.pos.distance(eye) > 90.0 {
+                continue;
+            }
+            let heat = (f.burn / crate::disasters::FIRE_BURN_SECS).clamp(0.2, 1.0);
+            let n = (26.0 * heat) as usize;
+            for i in 0..n {
+                let s = i as f32 + f.pos.x * 0.37 + f.pos.z * 0.91;
+                let ph = (t * (1.6 + rnd_jitter(s).abs()) + rnd_jitter(s * 3.0) * 4.0).fract();
+                let x = f.pos.x + rnd_jitter(s * 1.7) * FIRE_CELL * 0.45 + wind.x * 0.06 * ph * 3.0;
+                let z = f.pos.z + rnd_jitter(s * 2.3) * FIRE_CELL * 0.45 + wind.z * 0.06 * ph * 3.0;
+                let y = 0.2 + ph * (2.2 + rnd_jitter(s * 5.1).abs() * 2.0);
+                let col = if ph < 0.5 { [1.0, 0.55 + ph * 0.5, 0.1] } else { [1.0, 0.35, 0.08] };
+                let size = 0.32 * (1.0 - ph * 0.7) * heat + 0.06;
+                out.push(VoxInst { off_ao: [x, y, z, 1.0], color: [col[0], col[1], col[2], 1.0 - ph * 0.6], misc: [size, 0.0, 0.0, 0.0] });
+            }
+            // smoke column leaning downwind
+            for i in 0..10 {
+                let s = i as f32 * 1.3 + f.pos.z * 0.2;
+                let ph = (t * 0.35 + rnd_jitter(s) * 2.0).fract();
+                let y = 2.5 + ph * 12.0;
+                let x = f.pos.x + wind.x * 0.25 * ph * 8.0 + rnd_jitter(s * 2.0) * 1.2;
+                let z = f.pos.z + wind.z * 0.25 * ph * 8.0 + rnd_jitter(s * 3.0) * 1.2;
+                out.push(VoxInst { off_ao: [x, y, z, 1.0], color: [0.22, 0.2, 0.19, 0.5 * (1.0 - ph)], misc: [0.6 + ph * 1.2, 0.0, 0.0, 0.0] });
+            }
+            // embers riding up and off
+            for i in 0..6 {
+                let s = i as f32 * 4.1 + f.pos.x;
+                let ph = (t * 0.9 + rnd_jitter(s) * 3.0).fract();
+                out.push(VoxInst { off_ao: [f.pos.x + rnd_jitter(s * 2.0) * 3.0 + wind.x * 0.3 * ph * 6.0, 1.0 + ph * 9.0, f.pos.z + rnd_jitter(s * 3.0) * 3.0 + wind.z * 0.3 * ph * 6.0, 1.0], color: [1.0, 0.7, 0.3, 0.9 * (1.0 - ph)], misc: [0.07, 0.0, 0.0, 0.0] });
+            }
+        }
+        // ash drifting over charred ground near the camera
+        for c in &d.charred {
+            if c.distance(eye) > 45.0 {
+                continue;
+            }
+            for i in 0..3 {
+                let s = i as f32 * 2.7 + c.x * 0.13 + c.z * 0.29;
+                let ph = (t * 0.2 + rnd_jitter(s) * 3.0).fract();
+                out.push(VoxInst { off_ao: [c.x + rnd_jitter(s * 2.0) * 3.0, 0.3 + ph * 3.0, c.z + rnd_jitter(s * 3.0) * 3.0, 1.0], color: [0.5, 0.48, 0.46, 0.5 * (1.0 - ph)], misc: [0.09, 0.0, 0.0, 0.0] });
+            }
+        }
+        // fissures: a jagged line of dark stone with a molten core while hot
+        for f in &d.fissures {
+            if f.a.distance(eye) > 110.0 && f.b.distance(eye) > 110.0 {
+                continue;
+            }
+            let n = ((f.b - f.a).length() * 2.2) as usize;
+            for i in 0..=n {
+                let tt = i as f32 / n.max(1) as f32;
+                let jag = Vec3::new(rnd_jitter(tt * 13.0 + f.a.x), 0.0, rnd_jitter(tt * 17.0 + f.a.z)) * 0.5;
+                let p = f.a + (f.b - f.a) * tt + jag;
+                out.push(VoxInst { off_ao: [p.x, 0.06, p.z, 1.0], color: [0.12, 0.1, 0.1, 1.0], misc: [0.55, 0.0, 0.0, 0.0] });
+                if f.heat > 0.05 {
+                    let pulse = 0.6 + 0.4 * (t * 3.0 + tt * 6.0).sin();
+                    out.push(VoxInst { off_ao: [p.x, 0.12, p.z, 1.0], color: [1.0, 0.45 * pulse, 0.1, f.heat], misc: [0.3 * f.heat + 0.05, 0.0, 0.0, 0.0] });
+                    if f.heat > 0.5 && i % 3 == 0 {
+                        let ph = (t * 1.2 + tt * 5.0).fract();
+                        out.push(VoxInst { off_ao: [p.x, 0.3 + ph * 2.0, p.z, 1.0], color: [1.0, 0.6, 0.2, (1.0 - ph) * f.heat], misc: [0.08, 0.0, 0.0, 0.0] });
+                    }
+                }
+            }
+        }
+        // the funnel: a spiral of dust widening upward, debris in the outer band
+        if let Some(tn) = &d.tornado {
+            for i in 0..260 {
+                let s = i as f32;
+                let h = (s / 260.0) * 26.0;
+                let r = 1.2 + h * 0.28 + rnd_jitter(s * 1.3).abs() * 0.8;
+                let a = tn.spin * (1.0 + h * 0.02) + s * 0.37;
+                let p = tn.pos + Vec3::new(a.cos() * r, h + 0.2, a.sin() * r);
+                let grey = 0.4 + (h / 26.0) * 0.3;
+                out.push(VoxInst { off_ao: [p.x, p.y, p.z, 1.0], color: [grey, grey * 0.95, grey * 0.9, 0.55 - h * 0.012], misc: [0.35 + h * 0.03, 0.0, 0.0, 0.0] });
+            }
+            // ground skirt
+            for i in 0..60 {
+                let s = i as f32;
+                let a = tn.spin * 1.4 + s * 0.105;
+                let r = 4.0 + rnd_jitter(s).abs() * 6.0;
+                out.push(VoxInst { off_ao: [tn.pos.x + a.cos() * r, 0.3 + rnd_jitter(s * 2.0).abs() * 1.5, tn.pos.z + a.sin() * r, 1.0], color: [0.45, 0.38, 0.3, 0.6], misc: [0.3, 0.0, 0.0, 0.0] });
+            }
+        }
+    }
+
     /// River life near the camera: translucent gelatin blobs riding the
     /// surface (the "liquid" read of the water), splash rings around waders,
     /// dark fish silhouettes under the surface with the odd leap, and

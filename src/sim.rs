@@ -59,6 +59,14 @@ pub enum Event {
     MapEventStart { kind: crate::map_events::MapEventKind, pos: Vec3, radius: f32 },
     MapEventEnd { kind: crate::map_events::MapEventKind },
     PreyCaught { pos: Vec3, kind: crate::wild::PreyKind, gold: f32 },
+    BossSpawn { kind: crate::bosses::BossKind, pos: Vec3 },
+    DisasterWarning { kind: crate::disasters::DisasterKind },
+    DisasterStart { kind: crate::disasters::DisasterKind },
+    DisasterEnd { kind: crate::disasters::DisasterKind },
+    FireIgnite { pos: Vec3 },
+    FissureOpen { a: Vec3, b: Vec3 },
+    TornadoDebris { pos: Vec3 },
+    BossDown { kind: crate::bosses::BossKind, pos: Vec3, team: Option<Team> },
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +84,8 @@ pub enum TargetRef {
     Minion(usize),
     Tower(usize),
     Titan(Team),
+    /// neutral objective (bosses.rs)
+    Boss(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -245,6 +255,8 @@ pub struct Game {
     pub weather: crate::weather::Weather,
     pub map_events: crate::map_events::MapEvents,
     pub wild: crate::wild::Wild,
+    pub bosses: crate::bosses::Bosses,
+    pub disasters: crate::disasters::Disasters,
 }
 
 impl Game {
@@ -362,6 +374,8 @@ impl Game {
             weather: crate::weather::Weather::new(),
             map_events: crate::map_events::MapEvents::new(),
             wild,
+            bosses: crate::bosses::Bosses::new(),
+            disasters: crate::disasters::Disasters::default(),
         };
         // starter items for AI gods (player buys via shop)
         for i in 0..10 {
@@ -447,9 +461,9 @@ impl Game {
         let bless = if g.blessing_t > 0.0 { BLESSING_MS } else { 0.0 };
         let base = def.move_speed * (1.0 + g.ms_bonus + g.buff_ms + bless);
         // wading: the rivers are slow going unless you were born to them
-        let depth = water_depth(g.pos.x, g.pos.z);
+        let depth = self.water_depth_now(g.pos.x, g.pos.z);
         let wade = if g.blessing_t > 0.0 || crate::wild::is_riverborn(def) { 1.0 } else { wade_speed_mul(depth) };
-        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade
+        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul()
     }
 
     pub fn auto_interval(&self, i: usize) -> f32 {
@@ -471,7 +485,20 @@ impl Game {
             return;
         }
         let _ = magic;
+        // Stormfire: the Drake's blessing multiplies everything its holders deal
+        if let Some(s) = source {
+            if s < self.gods.len() {
+                let team = self.gods[s].team;
+                dmg *= self.bosses.dmg_mul(team);
+                if matches!(target, TargetRef::Tower(_) | TargetRef::Titan(_)) {
+                    dmg += self.bosses.struct_bonus(team);
+                }
+            }
+        }
         match target {
+            TargetRef::Boss(bi) => {
+                self.boss_take_damage(bi, dmg, source);
+            }
             TargetRef::God(ti) => {
                 let g = &mut self.gods[ti];
                 if g.respawn_t > 0.0 {
@@ -558,7 +585,8 @@ impl Game {
         // gold to last hitter (if a god), xp shared
         if let Some(killer) = m.last_hit {
             if killer < self.gods.len() && self.gods[killer].team != m.team {
-                self.gods[killer].gold += gold * self.map_events.gold_mul();
+                let team = self.gods[killer].team;
+                self.gods[killer].gold += gold * self.map_events.gold_mul() * self.bosses.gold_mul(team);
                 self.add_stacks(killer, StackKind::MinionKill, 1.0);
             }
         }
@@ -623,7 +651,8 @@ impl Game {
             if k < self.gods.len() && self.gods[k].team != team {
                 let kg = &mut self.gods[k];
                 kg.kills += 1;
-                kg.gold += GOLD_GOD * self.map_events.gold_mul();
+                let kt = kg.team;
+                kg.gold += GOLD_GOD * self.map_events.gold_mul() * self.bosses.gold_mul(kt);
                 self.add_stacks(k, StackKind::GodKill, 1.0);
                 self.grant_xp(k, XP_GOD);
                 kill_text = format!("{} slew {}", self.god_name(k), name);

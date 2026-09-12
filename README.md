@@ -34,6 +34,28 @@ no third-party trademarks or assets.
   **Thunder Front** (lightning strikes the lanes, hurts whoever it lands on),
   **The Long Winter** (snow; everyone slows 12 % except Snowhush),
   **Elder's Bounty** (kill gold ×2). A HUD chip shows the sky + active event.
+- **Major objectives** (`src/bosses.rs`) — two neutral beasts in sheltered
+  pits (boulder-and-pillar rings with gaps, braziers, a stone floor) in the
+  west and east jungle at the map's equator. **The Elder Boar** (up at 3:00,
+  respawns 3:30; tusk bites + a ground slam that shoves): the killing team
+  takes +250 gold each and **the Wallow's Bounty** (kill/last-hit gold ×1.5,
+  90 s). **The Storm Drake** (up at 6:00, respawns 4:00; lightning bites at
+  range + a breath cone): **Stormfire** (+18 % to all damage dealt, autos hit
+  structures +80, 90 s). Both are neutral, turn on whoever hurt them last,
+  and mend fast when left alone — half-done objectives get stolen or reset.
+  AI ancestors contest them and rally to a beast their team is already on.
+  Minimap diamonds + timers in the sky chip.
+- **Catastrophes** (`src/disasters.rs`) — rolled once at 1:30 (45 %), at most
+  one per match, with a 12 s warning: **Wildfire** (spreads downwind cell to
+  cell through the flora, sears anyone inside, rain douses it, burnt cells
+  stay charred — darkened flora, ash, prey avoid them), **Tempest** (a black
+  storm, lightning every half-second hunting the ancestors, gale gusts, and
+  strikes that can start fires), **Earthquake** (camera shake, global slow,
+  fissures tearing open that burn while hot then cool into scars),
+  **Flood** (the rivers spill: the whole floor becomes wading water, the
+  channels drown, silt-brown water, then it recedes), **Tornado** (a funnel
+  walks in from the rim, pulls everything within 16 u, throws debris and
+  animals, tears the canopy). All hurt players; all leave the map changed.
 - **The living jungle** (`src/wild.rs`) — six **Heal Trees** (rest 4 s out of
   combat beneath one to mend HP + mana; Sweetrain doubles it; the fruit glows
   while it works). **Hares and stags** graze in groups, bolt when noticed, and
@@ -95,10 +117,11 @@ ALSA headers (`libasound2-dev`) at build time — or build with
 
 ```bash
 cargo run --release          # windowed game
-cargo test                   # 40 tests: roster, items, lanes, sim, weather, map events, wildlife,
+cargo test                   # 49 tests: roster, items, lanes, sim, weather, map events, wildlife,
                              #   plus offline WGSL validation of every shader with naga
 cargo run -- --screenshot    # headless demo: renders PNG screenshots (no window)
-cargo run --example simdbg   # 120 s AI-only match trace (economy, events, weather, hunt tally)
+cargo run --example simdbg 3 # 12-minute AI-only match trace for a seed (economy, events,
+                             #   weather, hunt, objectives, catastrophes)
 ```
 
 On minimal-X systems winit may also need `libxkbcommon-x11` + `libxcb-xkb`.
@@ -168,6 +191,8 @@ src/
 ├── weather.rs     weather state machine → `Atmosphere` sample (plain numbers)
 ├── map_events.rs  event scheduler + effects; `speed_mul` / `gold_mul` hooks
 ├── wild.rs        heal trees, prey (hare / stag / glowfish), the hunt, Riverblessing
+├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss
+├── disasters.rs   wildfire / tempest / earthquake / flood / tornado + map scars
 ├── audio.rs       acoustics_at(pos) → howl/reverb voicing; WindSynth DSP; cpal shell
 ├── input.rs       Action / Bind / Bindings (schemes, capture, config file), InputState, resolve()
 ├── gamepad.rs     PB_* codes, PadState, gilrs shell (feature `gamepad`)

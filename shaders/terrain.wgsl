@@ -11,6 +11,7 @@ struct FrameData {
     sun_col: vec4<f32>,  // rgb sun colour*intensity, w cloud cover
     weather: vec4<f32>,  // x rain, y snow, z wetness, w lightning
     wind: vec4<f32>,
+    event: vec4<f32>,    // x flood rise, y quake shake, z fire glow, w unused
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameData;
@@ -141,6 +142,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     var hemi = sky * (0.55 + 0.35 * (N.y * 0.5 + 0.5));
     let flash = frame.weather.w;
     hemi = hemi + vec3(0.9, 0.9, 1.2) * flash;
+    // a nearby wildfire throws orange light from below the canopy
+    hemi = hemi + vec3(1.0, 0.45, 0.12) * frame.event.z * 0.5;
     // sky fills the shadows so they read blue, not grey; slopes facing away
     // from the sun get a touch of the anti-sun sky
     let sun_col = frame.sun_col.xyz * 1.02;

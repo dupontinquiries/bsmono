@@ -11,6 +11,7 @@ struct FrameData {
     sun_col: vec4<f32>,  // rgb sun colour*intensity, w cloud cover
     weather: vec4<f32>,  // x rain, y snow, z wetness, w lightning
     wind: vec4<f32>,     // xyz wind (u/s), w gust front 0..1
+    event: vec4<f32>,    // x flood rise, y quake shake, z fire glow, w unused
 };
 
 fn hash21(p: vec2<f32>) -> f32 {
@@ -148,6 +149,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let up = N.y * 0.5 + 0.5;
     var hemi = mix(ground, sky, up) * 0.78;
     hemi = hemi + vec3(0.9, 0.9, 1.2) * flash * up;
+    hemi = hemi + vec3(1.0, 0.45, 0.12) * frame.event.z * 0.45 * (1.0 - up * 0.5);
 
     // key: wrap-lit so the terminator isn't a hard grey line; warm the wrap
     let wrap = clamp((dot(N, sun) + 0.25) / 1.25, 0.0, 1.0);

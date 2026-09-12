@@ -18,6 +18,8 @@ pub mod props;
 pub mod weather;
 pub mod map_events;
 pub mod wild;
+pub mod bosses;
+pub mod disasters;
 pub mod audio;
 pub mod input;
 pub mod gamepad;

@@ -239,6 +239,31 @@ pub fn think(game: &mut Game, gi: usize) {
         }
     }
 
+    // objectives: a boss is up, we're healthy and unthreatened → go fight it
+    // (bolder ancestors from further away). Inside the pit it becomes the target.
+    if state == AiState::Push {
+        let enemy_near = (0..game.gods.len()).any(|j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(g.pos) < 14.0);
+        if !enemy_near {
+            if let Some(bi) = game.contestable_boss(g.pos, team, hp_frac) {
+                let b = &game.bosses.list[bi];
+                let engaged = b.last_hit_team == Some(team) && t - b.last_dmg_t < 6.0;
+                let reach_ok = engaged || b.pos.distance(g.pos) < 28.0 + g.ai.as_ref().unwrap().aggression * 20.0;
+                if reach_ok {
+                    let d = Vec3::new(b.pos.x - g.pos.x, 0.0, b.pos.z - g.pos.z);
+                    if d.length() > def.auto_range * 0.8 {
+                        move_dir = d.normalize_or_zero();
+                    } else {
+                        move_dir = Vec3::ZERO;
+                    }
+                    target = Some(TargetRef::Boss(bi));
+                    if cast_req.is_none() {
+                        cast_req = choose_cast(game, gi, TargetRef::Boss(bi), d.length());
+                    }
+                }
+            }
+        }
+    }
+
     // the hunt: hurt, with no enemy ancestor in sight and prey close by,
     // an ancestor breaks off to chase it (a mouthful of health + gold). If a
     // dash is off cooldown and the animal is in range, pounce with it.

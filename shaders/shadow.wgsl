@@ -11,6 +11,7 @@ struct FrameData {
     sun_col: vec4<f32>,  // rgb sun colour*intensity, w cloud cover
     weather: vec4<f32>,  // x rain, y snow, z wetness, w lightning
     wind: vec4<f32>,     // xyz wind (u/s), w gust front 0..1
+    event: vec4<f32>,    // x flood rise, y quake shake, z fire glow, w unused
 };
 
 struct DrawData {

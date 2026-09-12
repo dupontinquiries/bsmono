@@ -15,6 +15,7 @@ struct FrameData {
     sun_col: vec4<f32>,  // rgb sun colour*intensity, w cloud cover
     weather: vec4<f32>,  // x rain, y snow, z wetness, w lightning
     wind: vec4<f32>,
+    event: vec4<f32>,    // x flood rise, y quake shake, z fire glow, w unused
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameData;
@@ -68,12 +69,13 @@ fn wave_h(p: vec2<f32>, flow: vec2<f32>, t: f32) -> f32 {
 @vertex
 fn vs_main(in: VSIn) -> VSOut {
     let t = frame.params.x;
-    let depth = max(in.pos.y - in.bed, 0.0);
+    let rise = frame.event.x;
+    let depth = max(in.pos.y + rise - in.bed, 0.0);
     // shallow water barely moves; the channel swells
     let amp = smoothstep(0.0, 0.8, depth);
     let h = wave_h(in.pos.xz, in.flow, t) * amp;
     var p = in.pos;
-    p.y = p.y + h;
+    p.y = p.y + h + rise;
     // finite-difference normal of the wave field
     let e = 0.35;
     let hx = wave_h(in.pos.xz + vec2(e, 0.0), in.flow, t) * amp;
@@ -119,8 +121,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
     // --- depth shading: clear shallows -> teal channel
     let d = in.depth;
-    let shallow = vec3(0.30, 0.62, 0.62);
-    let deep = vec3(0.03, 0.18, 0.24);
+    // a flood runs brown: silt in the water
+    let silt = clamp(frame.event.x / 0.9, 0.0, 1.0);
+    let shallow = mix(vec3(0.30, 0.62, 0.62), vec3(0.42, 0.38, 0.26), silt);
+    let deep = mix(vec3(0.03, 0.18, 0.24), vec3(0.16, 0.13, 0.08), silt);
     var col = mix(shallow, deep, smoothstep(0.0, 1.6, d));
     // the bed shows through the shallows: fade alpha with depth (Beer-ish)
     var alpha = 1.0 - exp(-d * 1.9) * 0.85;

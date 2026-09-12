@@ -98,6 +98,12 @@ impl Team {
             Team::Red => Vec3::new(0.0, 0.0, 82.0 * MAP_SCALE),
         }
     }
+    pub fn name(self) -> &'static str {
+        match self {
+            Team::Blue => "ORDER",
+            Team::Red => "CHAOS",
+        }
+    }
     pub fn rgb(self) -> [f32; 3] {
         match self {
             Team::Blue => [0.25, 0.55, 1.0],
