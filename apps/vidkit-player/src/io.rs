@@ -559,24 +559,21 @@ pub fn open_direct_url(url: &str) -> Result<OpenedUrl, String> {
     let container = vidkit_stream::detect_container(&head[..n])
         .ok_or_else(|| format!("{url}: not an MP4 or WebM stream"))?;
 
+    // The count comes from the INDEX, not from walking the samples.
+    //
+    // Counting by iteration reads every packet, which over HTTP downloads the
+    // whole video just to describe it -- the opposite of what the range
+    // fetching is for. A real 1440p clip reported 29530 packets, which is
+    // 29530 reads before a single frame was shown. Both containers already
+    // know the count from the header they have parsed.
     let (kind, profile, dims, dur, packets) = match container {
         vidkit_stream::Container::Mp4 => {
-            let mut d = vidkit_mp4::Mp4Demuxer::open(src).map_err(|e| format!("{url}: {e}"))?;
-            let (p, dims, dur) = (d.video_profile(), d.dimensions(), d.duration());
-            let mut n = 0;
-            while matches!(d.next_packet(), Ok(Some(_))) {
-                n += 1;
-            }
-            ("MP4", p, dims, dur, n)
+            let d = vidkit_mp4::Mp4Demuxer::open(src).map_err(|e| format!("{url}: {e}"))?;
+            ("MP4", d.video_profile(), d.dimensions(), d.duration(), d.sample_count())
         }
         vidkit_stream::Container::WebM => {
-            let mut d = vidkit_webm::WebmDemuxer::open(src).map_err(|e| format!("{url}: {e}"))?;
-            let (p, dims, dur) = (d.video_profile(), d.dimensions(), d.duration());
-            let mut n = 0;
-            while matches!(d.next_packet(), Ok(Some(_))) {
-                n += 1;
-            }
-            ("WebM", p, dims, dur, n)
+            let d = vidkit_webm::WebmDemuxer::open(src).map_err(|e| format!("{url}: {e}"))?;
+            ("WebM", d.video_profile(), d.dimensions(), d.duration(), d.block_count())
         }
     };
 
@@ -587,8 +584,10 @@ pub fn open_direct_url(url: &str) -> Result<OpenedUrl, String> {
 
     Ok(OpenedUrl {
         label: format!(
-            "{name} · {kind} · {codec} · {}x{} · {packets} packets · over HTTP",
-            dims.0, dims.1
+            "{name} · {kind} · {codec} · {}x{}{} · {packets} packets · over HTTP",
+            dims.0,
+            dims.1,
+            dur.map(|d| format!(" · {}", fmt_duration(d))).unwrap_or_default()
         ),
         duration: dur,
         dimensions: dims,
@@ -671,6 +670,71 @@ mod url_tests {
 
     /// A URL that serves something else must say so, not fail obscurely deep in
     /// a parser.
+    /// Describing a file must not download it.
+    ///
+    /// The count used to come from walking every packet, so a 1440p clip with
+    /// 29530 samples meant 29530 reads before a frame was shown — over HTTP,
+    /// the entire video fetched to fill in a label. The index already knows.
+    /// Asserting the COUNT alone cannot see this: it is the same number either
+    /// way. Counting the server's requests is what makes it visible.
+    #[test]
+    fn describing_a_url_does_not_download_the_whole_file() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let body = crate::io::tests_support::sample_mp4_n(300);
+        let total = body.len();
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..512 {
+                let Ok((mut sock, _)) = listener.accept() else { break };
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (start, end) = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .and_then(|l| l.split('=').nth(1).map(str::trim).map(str::to_string))
+                    .and_then(|r| {
+                        let (a, b) = r.split_once('-')?;
+                        Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+                    })
+                    .unwrap_or((0, body.len() - 1));
+                if start >= body.len() {
+                    let _ = sock.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n\r\n");
+                    continue;
+                }
+                let slice = &body[start..=end.min(body.len() - 1)];
+                counter.fetch_add(slice.len(), Ordering::SeqCst);
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                    start + slice.len() - 1, body.len(), slice.len()
+                );
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(slice);
+            }
+        });
+
+        let opened = open_direct_url(&format!("http://127.0.0.1:{port}/big.mp4"))
+            .expect("open");
+        assert_eq!(opened.packets, 300, "the index count is wrong");
+
+        let bytes = served.load(Ordering::SeqCst);
+        assert!(
+            bytes < total,
+            "describing the file fetched {bytes} of {total} bytes — it walked the samples"
+        );
+    }
+
     #[test]
     fn a_url_serving_html_is_reported_clearly() {
         use std::io::{Read, Write};
@@ -742,9 +806,21 @@ pub(crate) mod tests_support {
     /// A two-sample AV1 MP4, from vidkit-mp4's own fixture writer rather than a
     /// second copy that could drift from the parser it exercises.
     pub fn sample_mp4() -> Vec<u8> {
+        sample_mp4_sized(2, 6)
+    }
+
+    pub fn sample_mp4_n(n: u32) -> Vec<u8> {
+        // 1 KB payloads, deliberately. At 6 bytes a sample a 300-sample file
+        // is under 5 KB, which fits inside one 64 KB read window -- so "did it
+        // walk the samples" is unobservable and the test that asks cannot
+        // fail. The file has to be bigger than a window for the question to
+        // mean anything.
+        sample_mp4_sized(n, 1024)
+    }
+
+    pub fn sample_mp4_sized(n: u32, payload: usize) -> Vec<u8> {
         use vidkit_mp4::build::*;
-        let n = 2u32;
-        let payloads: Vec<Vec<u8>> = (0..n).map(|_| vec![0xA0u8; 6]).collect();
+        let payloads: Vec<Vec<u8>> = (0..n).map(|_| vec![0xA0u8; payload]).collect();
         let sizes: Vec<u32> = payloads.iter().map(|p| p.len() as u32).collect();
         let mut mdat_body = Vec::new();
         let mut offs = Vec::new();
@@ -1099,16 +1175,11 @@ pub fn open_page_url_capped<R: vidkit_ytdlp::CommandRunner + Send>(
         .unwrap_or_else(|| "unknown codec".into());
     let container = source.container();
 
-    let mut packets = 0usize;
-    // Bounded. A live stream has no end, and counting to it is a hang rather
-    // than a slow open.
-    while packets < max_packets {
-        match source.next_packet() {
-            Ok(Some(_)) => packets += 1,
-            Ok(None) => break,
-            Err(e) => return Err(format!("{url}: {e:?}")),
-        }
-    }
+    // From the index, not by iteration -- see `open_direct_url`. A resolved
+    // stream is where walking every packet costs most, because each read is a
+    // range request over the network. `max_packets` is now only a reported
+    // ceiling, not a walk.
+    let packets = source.packet_count().min(max_packets);
 
     Ok(OpenedUrl {
         label: format!(
@@ -1481,5 +1552,20 @@ mod real_tls_tests {
             vidkit_stream::detect_container(&head[..n]).is_none(),
             "a gzip was sniffed as a video container"
         );
+    }
+}
+
+/// `H:MM:SS` or `M:SS` for a description line.
+///
+/// The duration was already computed and simply not shown. "29530 packets"
+/// tells a viewer nothing; the length of the thing they are about to watch
+/// tells them a great deal.
+pub fn fmt_duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{sec:02}")
+    } else {
+        format!("{m}:{sec:02}")
     }
 }

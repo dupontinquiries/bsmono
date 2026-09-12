@@ -158,6 +158,19 @@ impl<R: CommandRunner, T: HttpTransport> StreamSource<R, T> {
         })
     }
 
+    /// How many packets the index says there are.
+    ///
+    /// From the header, not by walking the samples. Counting by iteration
+    /// reads every packet, which on a resolved stream means a range request
+    /// per packet -- downloading the whole video to describe it, which is the
+    /// opposite of what the range fetching exists for.
+    pub fn packet_count(&self) -> usize {
+        match &self.demux {
+            Demux::Mp4(d) => d.sample_count(),
+            Demux::WebM(d) => d.block_count(),
+        }
+    }
+
     pub fn container(&self) -> Container {
         self.container
     }
