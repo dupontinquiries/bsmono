@@ -22,6 +22,21 @@ use std::process::Command;
 /// The command seam. `GitRunner` shells out; tests hand back strings.
 pub trait Runner {
     fn run(&self, args: &[&str]) -> Result<String, String>;
+
+    /// The same, with something on stdin. Exactly one caller needs it —
+    /// `git hash-object -w --stdin`, which is how a bucket's text becomes
+    /// an object without a temp file on disk.
+    ///
+    /// Defaulted to a refusal rather than added as a required method:
+    /// every canned test runner in this crate answers by matching argv,
+    /// which is a shape stdin has nothing to do with, and making them all
+    /// implement a method they will never be asked for would be noise in
+    /// exchange for nothing. A runner that cannot do it says so and the
+    /// caller reports it; it is not a silent no-op.
+    fn run_stdin(&self, args: &[&str], input: &str) -> Result<String, String> {
+        let _ = (args, input);
+        Err("this runner cannot pass stdin".to_string())
+    }
 }
 
 pub struct GitRunner {
@@ -36,6 +51,31 @@ impl Runner for GitRunner {
             .args(args)
             .output()
             .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn run_stdin(&self, args: &[&str], input: &str) -> Result<String, String> {
+        use std::io::Write;
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        // Take the pipe and drop it before waiting. A child reading to EOF
+        // (which hash-object does) never exits while we still hold the
+        // write end, and `wait_with_output` would then block forever.
+        {
+            let mut si = child.stdin.take().ok_or("no stdin pipe")?;
+            si.write_all(input.as_bytes()).map_err(|e| e.to_string())?;
+        }
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
         if !out.status.success() {
             return Err(String::from_utf8_lossy(&out.stderr).into_owned());
         }
@@ -307,6 +347,92 @@ pub fn mark_visited(r: &dyn Runner, rel: &str, oid: &str) -> Result<(), String> 
 /// Where you left off, if you ever marked it.
 pub fn last_visited(r: &dyn Runner, rel: &str) -> Option<String> {
     r.run(&["rev-parse", "--verify", &visited_ref(rel)]).ok().map(|s| s.trim().to_string())
+}
+
+/// `refs/aperture/bucket/<slug>` — a bucket's text, stored as a git blob
+/// with a ref holding it alive.
+///
+/// The same reasoning as `visited` above, one step further: `visited`
+/// needs a ref pointing at a COMMIT that already exists, a bucket needs a
+/// ref pointing at content of its own. A ref may point at any object, so
+/// the content becomes a blob (`hash-object -w`) and the ref names it.
+/// No new file format, no gitignore entry, nothing to back up separately,
+/// and `git gc` keeps it because a ref is a reachability root.
+///
+/// **Measured, not assumed** (a scratch repo, git 2.x):
+/// * `git gc --prune=now` keeps the blob. `git fsck` is silent about it.
+/// * `git rev-list --all` skips the ref rather than failing on a
+///   non-commit, so nothing that walks history trips over it.
+/// * `git bundle create --all` DOES include it —
+///   `git bundle list-heads` lists the ref — but a plain `git clone` of
+///   that bundle does not create it locally, because clone only takes
+///   heads and tags. It is fetched the same way notes are:
+///   `git fetch <remote> 'refs/aperture/*:refs/aperture/*'`. That is
+///   exactly the rule `CLAUDE.md` §1 already states for
+///   `refs/notes/toolcalls`, and it is worth stating again here because
+///   the failure mode is identical: buckets look silently absent in a
+///   fresh clone rather than looking un-fetched.
+fn bucket_ref(slug: &str) -> String {
+    format!("refs/aperture/bucket/{slug}")
+}
+
+/// Buckets kept as git refs. See [`bucket_ref`].
+///
+/// Holds a `&dyn Runner` rather than a `GitRunner` so the hermetic test
+/// and any future `GitCli` from gitmind-core both fit — the same seam
+/// reasoning as the rest of this module.
+pub struct GitStore<'a> {
+    pub runner: &'a dyn Runner,
+}
+
+impl<'a> GitStore<'a> {
+    pub fn new(runner: &'a dyn Runner) -> GitStore<'a> {
+        GitStore { runner }
+    }
+}
+
+impl crate::bucket::Store for GitStore<'_> {
+    fn list(&self) -> Vec<String> {
+        let out = match self.runner.run(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/aperture/bucket/",
+        ]) {
+            Ok(s) => s,
+            // No refs, or no repo. Both mean "no buckets", which is a
+            // normal state and not worth surfacing as an error.
+            Err(_) => return Vec::new(),
+        };
+        out.lines()
+            .filter_map(|l| l.trim().strip_prefix("refs/aperture/bucket/"))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn load(&self, slug: &str) -> Option<String> {
+        self.runner.run(&["cat-file", "blob", &bucket_ref(slug)]).ok()
+    }
+
+    fn save(&self, slug: &str, text: &str) -> Result<(), String> {
+        let oid = self.runner.run_stdin(&["hash-object", "-w", "--stdin"], text)?;
+        let oid = oid.trim();
+        if oid.is_empty() {
+            return Err("hash-object wrote nothing".to_string());
+        }
+        self.runner.run(&["update-ref", &bucket_ref(slug), oid]).map(|_| ())
+    }
+
+    fn delete(&self, slug: &str) -> Result<(), String> {
+        // `-d` on a ref that is already gone is an error from git and a
+        // success from the caller's point of view. The blob itself is
+        // left for gc, which is what gc is for.
+        match self.runner.run(&["update-ref", "-d", &bucket_ref(slug)]) {
+            Ok(_) => Ok(()),
+            Err(_) if self.load(slug).is_none() => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Group time-sorted (newest-first, `history()`'s own order) revisions into
@@ -622,4 +748,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Buckets through a REAL repo: save, list, load, round-trip the
+    /// text, survive `gc --prune=now`, delete. The `gc` step is the one
+    /// worth having — a ref pointing at a blob keeping that blob alive is
+    /// the assumption the whole storage choice rests on, and "refs are
+    /// reachability roots" is a claim about git, not about this code.
+    #[test]
+    fn buckets_live_in_refs_and_survive_gc() {
+        use crate::bucket::{Bucket, Entry, Store};
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-gitspace-buckets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+
+        let r = GitRunner { root: dir.clone() };
+        let store = GitStore::new(&r);
+        assert!(store.list().is_empty(), "a fresh repo has no buckets");
+
+        let mut b = Bucket::new("Collision investigation");
+        b.add(Entry::symbol("src/physics.rs", "resolve_collision"));
+        b.add(Entry { note: Some("the caller".into()), ..Entry::symbol("src/player.rs", "update") });
+        store.save(&b.slug(), &b.to_text()).unwrap();
+        store.save("rendering", &Bucket::new("Rendering").to_text()).unwrap();
+
+        let mut slugs = store.list();
+        slugs.sort();
+        assert_eq!(slugs, ["collision-investigation", "rendering"]);
+
+        // The ref really is a ref, and it really points at a blob.
+        let listed = git(&["for-each-ref", "--format=%(refname) %(objecttype)", "refs/aperture/bucket/"]);
+        assert!(
+            listed.contains("refs/aperture/bucket/collision-investigation blob"),
+            "expected a blob ref, got: {listed}"
+        );
+
+        // gc is the real question.
+        git(&["gc", "--prune=now", "-q"]);
+        let back = crate::bucket::parse(&store.load(&b.slug()).expect("still there after gc")).unwrap();
+        assert_eq!(back, b, "the bucket round-trips through a git object");
+
+        store.delete(&b.slug()).unwrap();
+        assert_eq!(store.list(), ["rendering"]);
+        assert!(store.load(&b.slug()).is_none(), "a deleted bucket does not load");
+        store.delete(&b.slug()).unwrap(); // deleting it twice is not an error
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The default `run_stdin` refuses rather than pretending. A canned
+    /// runner reaching the save path is a bug in the caller, and it has
+    /// to be visible as one.
+    #[test]
+    fn a_runner_without_stdin_refuses_to_save_a_bucket() {
+        use crate::bucket::{Bucket, Store};
+        let r = Canned(vec![]);
+        let err = GitStore::new(&r).save("x", &Bucket::new("x").to_text()).unwrap_err();
+        assert!(err.contains("stdin"), "the refusal names the reason: {err}");
+    }
 }

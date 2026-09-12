@@ -241,6 +241,15 @@ not a rewrite.
 
 ## aperture (apps/aperture) — follow-ups
 
+> **Entities, buckets and paths**: see
+> `apps/aperture/TODO_entities_buckets_paths.md` — the reconciliation of the
+> 2026-09-11 spatial-editor design conversation, Kess's inline-TODO patch,
+> and what is actually in the tree, with a dependency-ordered queue. Five of
+> its items have landed (`aperture_core::{bucket, entity, nav, edgesrc}`,
+> the caret policy, the Ctrl+D complement); the verification boundary is in
+> `apps/aperture/HANDOFF_entities_session.md`, and it matters — the
+> aperture-egui half of two of those patches has never been compiled.
+
 Session scope was: rope core + invertible-Op history, line-lexer syntax,
 ghost-text completion loop (ollama FIM / subprocess / demo), smooth-camera
 egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:

@@ -707,16 +707,20 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     let cx = origin.x + state.cam.caret_x.pos;
     let cy = rect.top() - scroll + state.cam.caret_y.pos;
     let moving = !state.cam.caret_x.settled() || !state.cam.caret_y.settled();
-    let blink_on = moving || (now_ms / 530) % 2 == 0;
-    if blink_on {
+    // The caret's look AND its frame budget come from one policy — see
+    // `camera::CaretPolicy`, which exists because the two lines this
+    // replaced asked for a repaint every 530 ms forever, focused or not.
+    let focused = ui.ctx().input(|i| i.focused);
+    let cd = state.caret.draw(now_ms, state.last_input_ms, focused, moving);
+    if cd.alpha > 0.0 {
         painter.rect_filled(
             Rect::from_min_size(Pos2::new(cx - 1.0, cy + 1.0), Vec2::new(2.0, m.line_h - 2.0)),
             1.0,
-            colors.accent,
+            colors.accent.gamma_multiply(cd.alpha),
         );
     }
-    if !moving {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(530));
+    if let Some(ms) = cd.repaint_in_ms {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(ms));
     }
 
     // Secondary carets — static, not blinking: blink timing is a "where is
@@ -1663,6 +1667,7 @@ fn map_key(key: egui::Key) -> Option<K> {
         EK::T => K::T,
         EK::G => K::G,
         EK::D => K::D,
+        EK::U => K::U,
         EK::L => K::L,
         EK::I => K::I,
         EK::F => K::F,

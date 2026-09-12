@@ -241,6 +241,14 @@ decode/asset side; nothing wires them into `library.rs`'s add-flow yet.
 
 ## 7. aperture / aperture-view: a semantic-navigation and marker system
 
+> **Superseded, not dropped.** This section is the seed of what is now
+> `apps/aperture/TODO_entities_buckets_paths.md`, which reconciles it with a
+> later design conversation and with the code that has since landed. The
+> marker requirement stated below — "must survive the function moving in the
+> file" — is the literal spec `entity::EntityId` and `bucket::Entry` were
+> built to. Read this for the original reasoning; read the addendum for the
+> current queue.
+
 Design ask, not started. Two related asks:
 
 - **`apps/aperture` (aperture, the tool):**
