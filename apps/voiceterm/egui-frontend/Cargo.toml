@@ -42,6 +42,10 @@ app-x11 = ["dep:eframe", "x11"]
 app-wayland = ["dep:eframe", "wayland"]
 
 [dependencies]
+# Pulled in by the voice-intent chain (`security`, `token_stats`).
+libc = "0.2"
+aho-corasick = "1"
+flate2 = "1"
 # XDG resolution. prefs_path() hand-rolled the same logic, with a comment
 # saying "as config-kit uses" — so the fleet had two copies of one rule.
 config-kit = { path = "../../../shared/config-kit" }

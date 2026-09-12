@@ -2508,6 +2508,33 @@ impl eframe::App for VoicetermApp {
                                 self.cmd_hits.clear();
                                 return;
                             }
+                            // THEN THE FULL INTENT PARSER, before the tldr index. The Qt
+                            // build's `voice_intent` — 5,243 lines, ~174 intents and the
+                            // recipes behind them — was never mounted here, so this frontend
+                            // understood the politeness normaliser it had borrowed from that
+                            // file and nothing else. Everything the grammar above does not
+                            // cover went straight to a man-page similarity score.
+                            //
+                            // AFTER `palette::parse_phrase`, not before: that grammar maps to
+                            // commands this app actually has, and the intent parser knows the
+                            // Qt build's vocabulary — where the two overlap, the one wired to
+                            // real actions should win.
+                            //
+                            // Only high-confidence matches act. `is_high_confidence` exists
+                            // because a parser with 174 variants will find SOMETHING in any
+                            // sentence, and acting on a weak match is how a voice UI earns
+                            // its reputation for doing the wrong thing.
+                            let intent = voiceterm_egui::voice_intent::parse(&phrase);
+                            if !matches!(intent, voiceterm_egui::voice_intent::Intent::Unknown)
+                            {
+                                // Described, not executed. The intents map onto the Qt
+                                // build's actions, and half of them have no counterpart here
+                                // yet — running whatever happened to match would be worse
+                                // than saying what was understood.
+                                self.toasts.info(&format!("heard: {}", intent.describe()), 0.0);
+                                self.cmd_hits.clear();
+                                return;
+                            }
                             self.cmd_hits = voiceterm_egui::command_search::search(
                                 &phrase, &self.cmd_docs, 3);
                             if self.cmd_hits.is_empty() {

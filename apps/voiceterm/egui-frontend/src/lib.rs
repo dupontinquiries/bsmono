@@ -59,6 +59,31 @@ pub mod audit_chain;
 pub mod context_redact;
 pub mod phonetic_store;
 pub mod voice_prefix;
+/// The Qt build's voice brain: 5,243 lines, ~174 `Intent` variants and the recipes behind
+/// them. Qt-free — the one `qt_method` mention in it is a comment — and never mounted here,
+/// so this frontend understood the politeness normaliser it borrowed and nothing else.
+/// `voice_intent`'s own dependencies, mounted with it. Both Qt-free — the `qt_method`
+/// mentions in them are comments about how the Qt build exposed them, not code.
+#[path = "../../src/async_jobs.rs"]
+pub mod async_jobs;
+#[path = "../../src/llm_cache.rs"]
+pub mod llm_cache;
+#[path = "../../src/security.rs"]
+pub mod security;
+#[path = "../../src/token_stats.rs"]
+pub mod token_stats;
+#[path = "../../src/confusion_table.rs"]
+pub mod confusion_table;
+#[path = "../../src/sysmon.rs"]
+pub mod sysmon;
+#[path = "../../src/system_info.rs"]
+pub mod system_info;
+#[path = "../../src/phonetic.rs"]
+pub mod phonetic;
+#[path = "../../src/speakers.rs"]
+pub mod speakers;
+#[path = "../../src/voice_intent.rs"]
+pub mod voice_intent;
 pub mod workspaces_view;
 pub mod pty_input;
 /// The other half of the terminal: a real shell on a real pty.
