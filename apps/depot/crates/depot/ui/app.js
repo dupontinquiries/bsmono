@@ -225,6 +225,114 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "X-Filename: rustc-1.96.0-aarch
     async decisions() { return '<div class="md">' + md(await api('/api/decisions.md')) + '</div>'; },
   };
 
+  // ── code blocks: copy on every rendered <pre>, and "run" when a terminal
+  //    is open. A Fairphone user taps instead of typing. ───────────────────────
+  const termState = { open: false, id: null, from: 0, poll: null, cols: 80, rows: 24 };
+  function decorateCodeBlocks() {
+    main.querySelectorAll('pre').forEach((pre) => {
+      if (pre.dataset.decorated) return; pre.dataset.decorated = '1';
+      pre.classList.add('has-copy');
+      const bar = document.createElement('div'); bar.className = 'codebar';
+      const copy = document.createElement('button'); copy.type = 'button'; copy.className = 'copy'; copy.textContent = 'copy';
+      copy.addEventListener('click', async () => { try { await navigator.clipboard.writeText(codeText(pre)); copy.textContent = 'copied'; setTimeout(() => (copy.textContent = 'copy'), 1200); } catch (_) { copy.textContent = 'select + Ctrl-C'; } });
+      bar.appendChild(copy);
+      // "run" appears only for shell-ish blocks and only while a terminal is open.
+      if (termState.open && looksRunnable(codeText(pre))) {
+        const run = document.createElement('button'); run.type = 'button'; run.className = 'copy run'; run.textContent = 'run ▸';
+        run.addEventListener('click', () => { openTerminalPanel(); runLines(codeText(pre)); });
+        bar.appendChild(run);
+      }
+      pre.appendChild(bar);
+    });
+  }
+  // Strip leading "$ " and comment-only lines so "run" sends the command, not the prompt.
+  const codeText = (pre) => pre.querySelector('code') ? pre.querySelector('code').textContent : pre.textContent;
+  const looksRunnable = (t) => /(^|\n)\s*(sudo |dnf |cargo |depot |curl |sh |systemctl |ip |firewall-cmd|nix |rustc |echo |ls |cat |mkdir|sed )/.test(t);
+  function runnableLines(t) {
+    return t.split('\n').map((l) => l.replace(/^\s*\$\s?/, '')).filter((l) => { const s = l.trim(); return s && !s.startsWith('#'); });
+  }
+
+  // ── the terminal panel: a slide-up shell over the current view ──────────────
+  async function openTerminalPanel() {
+    if (document.getElementById('termpanel')) { document.getElementById('termpanel').classList.add('show'); return; }
+    const panel = document.createElement('div'); panel.id = 'termpanel'; panel.className = 'show';
+    panel.innerHTML = `
+      <div class="termhead">
+        <span>terminal — a shell on <code>${esc(base().replace(/^https?:\/\//, ''))}</code></span>
+        <span class="spacer"></span>
+        <button type="button" id="termclose" class="secondary">close</button>
+      </div>
+      <pre id="termscreen" class="termscreen" tabindex="0" aria-label="terminal output"></pre>
+      <div class="keycaps" id="keycaps"></div>
+      <div class="row"><input type="text" id="termline" placeholder="type a command, Enter to send" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"><button type="button" id="termsend">send</button></div>`;
+    document.body.appendChild(panel);
+    KEYCAPS.forEach((k) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'keycap'; b.textContent = k.label; b.addEventListener('click', () => sendBytes(k.send)); document.getElementById('keycaps').appendChild(b); });
+    $('#termclose').addEventListener('click', closeTerminalPanel);
+    const line = $('#termline');
+    line.addEventListener('keydown', (e) => { if (e.key === 'Enter') { sendBytes(line.value + '\n'); line.value = ''; } });
+    $('#termsend').addEventListener('click', () => { sendBytes(line.value + '\n'); line.value = ''; });
+    await ensureSession();
+  }
+  function closeTerminalPanel() {
+    const p = document.getElementById('termpanel'); if (p) p.classList.remove('show');
+    if (termState.poll) { clearInterval(termState.poll); termState.poll = null; }
+    if (termState.id) { authFetch(`/api/term/close/${termState.id}`, { method: 'POST' }).catch(() => {}); }
+    termState.open = false; termState.id = null; termState.from = 0;
+  }
+  const authFetch = (u, o = {}) => { o.headers = Object.assign({ Authorization: 'Bearer ' + token() }, o.headers || {}); return fetch(u, o); };
+  async function ensureSession() {
+    if (termState.id) return;
+    if (!token()) { termScreen('No admin token set. Open the Sync tab, paste the output of `depot admin-token`, then reopen.\n'); return; }
+    const scr = $('#termscreen'); termState.cols = Math.max(20, Math.floor(scr.clientWidth / 8.4)) || 80; termState.rows = 24;
+    try {
+      const r = await authFetch(`/api/term/open?cols=${termState.cols}&rows=${termState.rows}`, { method: 'POST' });
+      if (r.status === 404) { termScreen('The terminal is disabled on this depot.\nSet [terminal] enabled = true in depot.toml and restart.\n'); return; }
+      if (r.status === 401) { termScreen('Unauthorized — the admin token is wrong. Re-enter it on the Sync tab.\n'); return; }
+      if (!r.ok) { termScreen('open failed: ' + r.status + '\n'); return; }
+      termState.id = (await r.json()).id; termState.from = 0; termState.open = true;
+      termState.poll = setInterval(pollOnce, 150); decorateCodeBlocks();
+    } catch (e) { termScreen('open error: ' + e.message + '\n'); }
+  }
+  async function pollOnce() {
+    if (!termState.id) return;
+    try {
+      const r = await authFetch(`/api/term/poll/${termState.id}?from=${termState.from}`);
+      if (r.status === 404) { termScreen('\n[session ended]\n'); clearInterval(termState.poll); termState.poll = null; termState.id = null; return; }
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d.resynced) $('#termscreen').textContent = '';
+      if (d.b64) appendScreen(atob(d.b64));
+      termState.from = d.next;
+      if (!d.running) { termScreen('\n[shell exited]\n'); clearInterval(termState.poll); termState.poll = null; }
+    } catch (_) {}
+  }
+  const enc = (s) => new TextEncoder().encode(s);
+  async function sendBytes(str) { if (!termState.id) { await ensureSession(); } if (!termState.id) return; try { await authFetch(`/api/term/input/${termState.id}`, { method: 'POST', body: enc(str) }); } catch (_) {} }
+  async function runLines(t) { for (const l of runnableLines(t)) { await sendBytes(l + '\n'); await new Promise((r) => setTimeout(r, 120)); } }
+  // Minimal VT handling: honour \r, \b and strip the CSI/OSC escapes a shell
+  // emits (colours, cursor moves) so the panel shows readable text without a
+  // full terminal emulator. Good enough for tapping package commands; not a
+  // replacement for the egui term grid.
+  function appendScreen(bytes) {
+    const scr = $('#termscreen'); let txt = scr.textContent;
+    // eslint-disable-next-line no-control-regex
+    const clean = bytes.replace(/\x1b\][^\x07]*\x07/g, '').replace(/\x1b[\[\]][0-9;?]*[ -\/]*[@-~]/g, '').replace(/\x1b[=>()][A-Za-z0-9]?/g, '').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, (c) => (c === '\x07' ? '' : ''));
+    // Normalise CRLF to LF first so a line ending does not wipe its own line;
+    // a BARE \r (progress bars, prompts redrawing) still does a carriage return.
+    const norm = clean.replace(/\r\n/g, '\n');
+    for (const ch of norm) { if (ch === '\r') { txt = txt.replace(/[^\n]*$/, ''); } else if (ch === '\n') { txt += '\n'; } else { txt += ch; } }
+    const lines = txt.split('\n'); if (lines.length > 400) txt = lines.slice(-400).join('\n');
+    scr.textContent = txt; scr.scrollTop = scr.scrollHeight;
+  }
+  const termScreen = (m) => { const s = $('#termscreen'); if (s) { s.textContent += m; s.scrollTop = s.scrollHeight; } };
+
+  // voiceterm-egui's TERMINAL_KEYCAPS, verbatim byte sequences.
+  const KEYCAPS = [
+    { label: 'Esc', send: '\x1b' }, { label: 'Tab', send: '\t' },
+    { label: '↑', send: '\x1b[A' }, { label: '↓', send: '\x1b[B' }, { label: '←', send: '\x1b[D' }, { label: '→', send: '\x1b[C' },
+    { label: 'C-c', send: '\x03' }, { label: 'C-d', send: '\x04' }, { label: 'C-z', send: '\x1a' }, { label: 'C-l', send: '\x0c' },
+  ];
+
   // ── router ─────────────────────────────────────────────────────────────────
   async function route() {
     // /manual, /decisions, /tutorials as plain URLs land on the matching view.
@@ -282,16 +390,19 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "X-Filename: rustc-1.96.0-aarch
         say.textContent = 'stop'; window.speechSynthesis.speak(u);
       });
     }
-    main.querySelectorAll('.step-body pre').forEach((pre) => {
-      const b = document.createElement('button'); b.type = 'button'; b.className = 'copy'; b.textContent = 'copy';
-      b.addEventListener('click', async () => { try { await navigator.clipboard.writeText(pre.textContent); b.textContent = 'copied'; setTimeout(() => (b.textContent = 'copy'), 1200); } catch (_) { b.textContent = 'select + Ctrl-C'; } });
-      pre.appendChild(b);
-    });
+    decorateCodeBlocks();
     $('#savetok')?.addEventListener('click', () => { sessionStorage.setItem('depot-token', $('#tok').value.trim()); $('#savetok').textContent = 'saved'; });
     $('#verify')?.addEventListener('click', async () => { $('#verifyout').textContent = 'hashing…'; try { const r = await api('/api/verify'); $('#verifyout').innerHTML = r.corrupt.length ? `<span class="bad">${r.corrupt.length} corrupt: ${esc(r.corrupt.join(', '))}</span>` : '<span class="ok">every object hashes to its name</span>'; } catch (e) { $('#verifyout').textContent = e.message; } });
   }
 
   window.addEventListener('hashchange', route);
-  api('/api/status').then((s) => { $('#foot').textContent = `${s.root} · ${s.objects} objects · ${human(s.bytes)}`; }).catch(() => {});
+  api('/api/status').then((s) => {
+    $('#foot').textContent = `${s.root} · ${s.objects} objects · ${human(s.bytes)}`;
+    if (s.terminal) {
+      const b = document.createElement('button'); b.id = 'openterm'; b.type = 'button'; b.textContent = '⌨ terminal';
+      b.title = 'a shell on this depot host'; b.addEventListener('click', openTerminalPanel);
+      document.querySelector('header').appendChild(b);
+    }
+  }).catch(() => {});
   route();
 })();

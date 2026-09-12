@@ -30,6 +30,22 @@ pub struct Config {
     pub rpm: Rpm,
     pub crates: Crates,
     pub nix: Nix,
+    pub terminal: Terminal,
+}
+
+/// The in-browser terminal: a shell ON THE DEPOT HOST, opened from the UI.
+/// Off by default because it is remote code execution over the LAN; when on,
+/// every request needs the admin token, and the sensible deployment is the
+/// one where the box serving the page is the box you are holding (a phone
+/// that is its own depot). See DECISIONS.md §17.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Terminal {
+    pub enabled: bool,
+    /// Shell to run; "" = $SHELL, else /bin/sh.
+    pub shell: String,
+    /// A session with no reads or writes for this long is killed.
+    pub idle_timeout_s: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,7 +98,7 @@ pub struct Nix {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { server: Server::default(), rpm: Rpm::default(), crates: Crates::default(), nix: Nix::default() }
+        Config { server: Server::default(), rpm: Rpm::default(), crates: Crates::default(), nix: Nix::default(), terminal: Terminal::default() }
     }
 }
 impl Default for Server {
@@ -103,6 +119,11 @@ impl Default for Crates {
 impl Default for Nix {
     fn default() -> Self {
         Nix { store_dir: "/nix/store".into(), priority: 30 }
+    }
+}
+impl Default for Terminal {
+    fn default() -> Self {
+        Terminal { enabled: false, shell: String::new(), idle_timeout_s: 900 }
     }
 }
 
@@ -158,6 +179,17 @@ registry_name = "{reg}"
 store_dir = "{store}"
 # Lower wins; cache.nixos.org is 40.
 priority = {prio}
+
+[terminal]
+# A shell on THIS machine, in the browser. Off by default: it is remote
+# code execution over plain HTTP. When on, it needs the admin token, and
+# it only makes sense where the depot runs on the device you are holding
+# (a phone that is its own depot, over USB or wifi). Under the hardened
+# systemd unit it runs as the unprivileged service user with no sudo.
+enabled = {term_enabled}
+# "" = $SHELL of the depot process, else /bin/sh
+shell = "{term_shell}"
+idle_timeout_s = {term_idle}
 "#,
             bind = d.server.bind,
             tok = d.server.admin_token_file,
@@ -169,6 +201,9 @@ priority = {prio}
             reg = d.crates.registry_name,
             store = d.nix.store_dir,
             prio = d.nix.priority,
+            term_enabled = d.terminal.enabled,
+            term_shell = d.terminal.shell,
+            term_idle = d.terminal.idle_timeout_s,
         )
     }
 }
@@ -220,6 +255,8 @@ mod tests {
         assert_eq!(c.server.bind, "0.0.0.0:8000");
         assert_eq!(c.rpm.compression, "gz");
         assert_eq!(c.nix.priority, 30);
+        assert!(!c.terminal.enabled, "terminal is off by default");
+        assert_eq!(c.terminal.idle_timeout_s, 900);
         assert_eq!(c.crates.registry_name, "depot");
     }
 

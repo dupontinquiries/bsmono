@@ -68,3 +68,24 @@ a { color: var(--accent); }
 .niftyplot { --nifty-node: var(--panel); --nifty-line: var(--fg); --nifty-text: var(--fg); --nifty-edge: var(--muted); --nifty-bg: var(--bg); --nifty-plane: var(--bg); --nifty-planeline: var(--line); --nifty-muted: var(--muted); }
 .check { border-left: 3px solid var(--ok); padding: .4rem .8rem; background: var(--panel); border-radius: 0 8px 8px 0; margin: .6rem 0; font-size: .92rem; }
 .check.todo { border-left-color: var(--accent); }
+
+/* code blocks: copy/run bar */
+pre.has-copy { position: relative; }
+.codebar { position: absolute; top: .35rem; right: .35rem; display: flex; gap: .3rem; }
+.codebar .copy { position: static; }
+.copy.run { background: var(--accent); color: #111; border-color: var(--accent); font-weight: 600; }
+
+/* header terminal launcher */
+#openterm { margin-left: auto; }
+
+/* the terminal panel */
+#termpanel { position: fixed; left: 0; right: 0; bottom: 0; max-height: 72vh; display: flex; flex-direction: column; background: var(--panel); border-top: 2px solid var(--accent); box-shadow: 0 -8px 24px rgba(0,0,0,.35); transform: translateY(100%); transition: transform .18s ease; z-index: 10; }
+#termpanel.show { transform: translateY(0); }
+.termhead { display: flex; align-items: center; gap: .5rem; padding: .5rem .8rem; border-bottom: 1px solid var(--line); font-size: .9rem; }
+.termhead .spacer { flex: 1; }
+.termscreen { flex: 1; overflow: auto; margin: 0; padding: .6rem .8rem; background: var(--bg); color: var(--fg); font-family: var(--mono); font-size: 13px; line-height: 1.35; white-space: pre-wrap; word-break: break-word; min-height: 30vh; border: 0; border-radius: 0; }
+.keycaps { display: flex; flex-wrap: wrap; gap: .3rem; padding: .5rem .8rem; border-top: 1px solid var(--line); }
+.keycap { background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: .45rem .7rem; font-family: var(--mono); font-size: .9rem; min-width: 2.6rem; }
+.keycap:active { background: var(--accent); color: #111; }
+#termpanel .row { padding: .5rem .8rem; gap: .4rem; }
+#termpanel #termline { flex: 1; font-family: var(--mono); }

@@ -3,6 +3,7 @@
 
 mod checks;
 mod clientcfg;
+mod terminal;
 mod tutorial;
 mod web;
 
@@ -423,17 +424,24 @@ fn serve(cli: &Cli) -> Result<(), String> {
     let bind = cli.opt("bind").map(String::from).unwrap_or_else(|| depot.config.server.bind.clone());
     let workers = depot.config.server.workers;
     let log = depot.config.server.log && !cli.flag("quiet");
+    let terminals = if depot.config.terminal.enabled {
+        Some(terminal::Terminals::new(depot.config.terminal.shell.clone(), depot.config.terminal.idle_timeout_s, r.clone()))
+    } else {
+        None
+    };
+    let term_on = terminals.is_some();
     let app = web::App {
         pub_dir: depot.store.pub_dir(),
         root: r.clone(),
         public_url: depot.config.server.public_url.clone(),
         token_file: r.join(&depot.config.server.admin_token_file),
+        terminals,
         depot: Arc::new(Mutex::new(depot)),
     };
     let writes = app.token_file.is_file();
     let server = depot_httpd::Server::bind(&bind, app).map_err(|e| format!("bind {bind}: {e}"))?.workers(workers).log(log);
     let addr = server.local_addr().map_err(|e| e.to_string())?;
-    eprintln!("depot serving {} on http://{addr}/  (HTTP writes {})", r.display(), if writes { "enabled" } else { "disabled" });
+    eprintln!("depot serving {} on http://{addr}/  (HTTP writes {}, terminal {})", r.display(), if writes { "enabled" } else { "disabled" }, if term_on { "ENABLED" } else { "off" });
     // Shutdown: systemd sends SIGTERM (Ctrl-C sends SIGINT). The handler
     // only sets a flag; the accept loop sees it within 100 ms, stops
     // accepting, closes the work channel and joins the workers, so responses

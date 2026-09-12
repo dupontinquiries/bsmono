@@ -19,5 +19,7 @@ cli-kit = { path = "../../../../shared/cli-kit" }
 net-kit = { path = "../../../../shared/net-kit" }
 # niftyplot diagrams in tutorials/manual: parse + layout + the SVG backend
 nifty-core = { path = "../../../../shared/nifty-core" }
+# in-browser terminal: a real shell behind a pty (same crate voiceterm uses)
+portable-pty = "0.8"
 # Only for signal(2): std has no signal API. Bindings, not C code.
 libc = "0.2"

@@ -34,6 +34,8 @@ pub struct App {
     pub root: PathBuf,
     pub public_url: String,
     pub token_file: PathBuf,
+    /// Present only when [terminal] is enabled; None means the endpoints 404.
+    pub terminals: Option<crate::terminal::Terminals>,
 }
 
 impl App {
@@ -194,6 +196,7 @@ impl App {
                     .collect();
                 ok_json(&json!({"tutorials": list}))
             }
+            (m, seg) if seg.first() == Some(&"term") => return self.terminal(m, &seg[1..], req),
             ("POST", ["niftyplot"]) => {
                 // Diagram source in, SVG out. Rendering is pure; the only
                 // guard is the body size.
@@ -210,7 +213,11 @@ impl App {
             ("GET", ["status"]) => {
                 let d = self.depot.lock().unwrap();
                 match d.status() {
-                    Ok(s) => ok_json(&s),
+                    Ok(s) => {
+                        let mut v = serde_json::to_value(&s).unwrap_or_else(|_| json!({}));
+                        v["terminal"] = json!(self.terminals.is_some());
+                        ok_json(&v)
+                    }
                     Err(e) => err(500, e),
                 }
             }
@@ -426,10 +433,73 @@ impl App {
     }
 }
 
+impl App {
+    /// /api/term/* — the in-browser shell. Every endpoint requires the admin
+    /// token AND [terminal] enabled; a disabled depot 404s so the feature is
+    /// invisible rather than merely forbidden.
+    fn terminal(&self, method: &str, seg: &[&str], req: &mut Request<'_>) -> Response {
+        let Some(terms) = &self.terminals else {
+            return Response::text(404, "terminal is disabled on this depot (set [terminal] enabled = true and restart)\n");
+        };
+        if let Err(r) = self.authorize(req) {
+            return r;
+        }
+        let dim = |req: &Request<'_>, k: &str, d: u16| req.query_param(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+        match (method, seg) {
+            ("POST", ["open"]) => match terms.open(dim(req, "cols", 80), dim(req, "rows", 24)) {
+                Ok(id) => ok_json(&json!({"id": id})),
+                Err(e) => err(500, e),
+            },
+            ("POST", ["input", id]) => {
+                let body = match req.read_body(64 * 1024) {
+                    Ok(b) => b,
+                    Err(e) => return Response::text(413, format!("{e}\n")),
+                };
+                match terms.input(id, &body) {
+                    Some(()) => Response::new(204),
+                    None => Response::not_found(),
+                }
+            }
+            ("POST", ["resize", id]) => match terms.resize(id, dim(req, "cols", 80), dim(req, "rows", 24)) {
+                Some(()) => Response::new(204),
+                None => Response::not_found(),
+            },
+            ("GET", ["poll", id]) => {
+                let from: u64 = req.query_param("from").and_then(|v| v.parse().ok()).unwrap_or(0);
+                match terms.poll(id, from) {
+                    // Output is base64 so arbitrary control bytes survive JSON.
+                    Some(c) => ok_json(&json!({"next": c.next, "running": c.running, "resynced": c.resynced, "b64": b64(&c.data)})),
+                    None => Response::not_found(),
+                }
+            }
+            ("POST", ["close", id]) => {
+                terms.close(id);
+                Response::new(204)
+            }
+            _ => Response::not_found(),
+        }
+    }
+}
+
 impl depot_httpd::Handler for App {
     fn handle(&self, req: &mut Request<'_>) -> Response {
         self.handle_inner(req)
     }
+}
+
+/// Minimal standard base64 (no dep). Terminal output only.
+fn b64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut o = String::with_capacity((data.len() + 2) / 3 * 4);
+    for c in data.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        o.push(T[(n >> 18 & 63) as usize] as char);
+        o.push(T[(n >> 12 & 63) as usize] as char);
+        o.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        o.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    o
 }
 
 fn ok_json<T: serde::Serialize>(v: &T) -> Response {

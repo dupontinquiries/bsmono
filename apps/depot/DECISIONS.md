@@ -256,3 +256,36 @@ nothing that varies. The *shape* is reused, on purpose, and named here so
 the next person sees the lineage. Likewise no image files: a diagram is
 text in the same file as the prose, diffable, and rendered by the same
 binary that serves it.
+
+## 17. An in-browser terminal, off by default, short-polled
+
+**Rests on:** the same `portable-pty` voiceterm uses, and the same keycap byte
+sequences (`Esc`=\x1b, `C-c`=\x03, arrows=`\x1b[A`…). A step in a tutorial
+that says `sudo dnf install …` is only useful on a Fairphone if the user can
+run it *there*; the terminal is a shell on the depot host, opened from the UI,
+so the phone that IS its own depot needs no second machine.
+
+Three deliberate limits. It is **off** unless `[terminal] enabled = true` —
+it is remote code execution over plain HTTP, and most depots are shared LAN
+mirrors where that is wrong; the sensible deployment is the device you hold.
+It requires the **admin token** on every endpoint, like any write. And under
+the hardened unit it is the unprivileged `DynamicUser` with no sudo and a
+filesystem view restricted to the depot, so "a shell" is a small blast radius.
+
+**Short-poll, not a websocket or SSE.** `depot-httpd`'s `Body` is a finished
+buffer; streaming would mean handing a handler the raw socket, which is the
+one thing the `Handler` seam exists to prevent (see §11). So the browser POSTs
+the bytes you type and GETs "output since offset N" a few times a second.
+Output is a byte ring addressed by absolute offset: a client that fell behind
+the retained window is told to resync. The cost is ~150 ms of latency,
+invisible for tapping commands and impossible to wedge the server with. A
+websocket transport would slot in behind the same `Terminals` API if a
+desktop ever wants a snappier version — the session model does not change.
+
+**Not taken:** a full VT emulator in the browser. The panel strips CSI/OSC
+escapes and honours `\r`/`\n`/`\b` — enough to read a `dnf` transaction and
+answer `y`, not enough to run vim. voiceterm-egui's `term_grid` is the real
+emulator; depot's panel is a glovebox, not a workstation. (The one screen
+subtlety that bit: `\r\n` is a line break, so a bare `\r`'s carriage-return
+must not fire on it — a jsdom test of the actual client screen logic caught
+that; a server-side API test could not have.)

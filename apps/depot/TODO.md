@@ -40,3 +40,9 @@ Unverified or unbuilt, in the order they matter.
 - [ ] apk repositories for postmarketOS/Alpine (fifth projection:
       `APKINDEX.tar.gz` from `.apk` control segments).
 - [ ] HTTPS listener behind `depot_httpd::Handler` if a fleet wants it.
+- [ ] Terminal: a websocket/SSE transport for lower latency (the `Terminals`
+      API would not change); a fuller VT parser if editing on-device is
+      wanted (voiceterm-egui's `term_grid` is the reference). Today it is a
+      short-poll glovebox, deliberately.
+- [ ] Terminal: not tested on a phone (touch keycaps, on-screen keyboard
+      overlap) or as the unprivileged systemd user — only x86_64 /bin/sh here.

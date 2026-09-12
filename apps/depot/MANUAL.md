@@ -427,6 +427,7 @@ Reads are open; writes need `Authorization: Bearer <admin token>`.
 | GET | `/api/verify` | | `{"corrupt":[…]}` |
 | GET | `/api/tutorials` · `/api/tutorials/<slug>.md` | | tutorials as steps (JSON, each with its live check outcome) / raw markdown |
 | POST | `/api/niftyplot` | diagram source | SVG (`image/svg+xml`) |
+| POST | `/api/term/open?cols=&rows=` · `/input/<id>` · `/resize/<id>` · `/close/<id>` · GET `/poll/<id>?from=` | | in-browser shell (admin token; `[terminal] enabled`) |
 | GET | `/bootstrap.sh?…` · `/crates/index/config.json` · `/toolchains/install.sh` | | generated per request |
 
 Everything under `/crates/`, `/rpm/`, `/nix/`, `/toolchains/` is a static
@@ -457,6 +458,29 @@ priority = 30                  # lower wins; cache.nixos.org is 40
 ```
 
 ---
+
+## 8b. The in-browser terminal (optional)
+
+A shell on the depot host, opened from the UI's **⌨ terminal** button —
+for a phone that is its own depot, so you can `dnf install` or edit a file
+without finding a laptop. Off by default; turn it on only where the depot
+runs on a device you hold:
+
+```toml
+[terminal]
+enabled = true
+# shell = ""   # "" = the depot process's $SHELL, else /bin/sh
+# idle_timeout_s = 900
+```
+
+It needs the admin token (set it on the Sync tab, or it will say so), and
+under the systemd unit it runs as the unprivileged service user — no sudo,
+no access outside the depot. Every ` ```sh ` block in the tutorials grows a
+**run ▸** button while the terminal is open, and every code block anywhere
+in the UI has **copy**. The keycap row (Esc, Tab, arrows, C-c/C-d/C-z/C-l)
+sends the control bytes a touch keyboard cannot. It is a glovebox, not a
+full terminal: enough to drive a `dnf` transaction and answer `y`, not to
+run an editor — use SSH for that.
 
 ## 9. Troubleshooting
 

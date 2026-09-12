@@ -24,6 +24,7 @@ crates/depot-core    headless: store, catalog, the four projections, signed pack
 crates/depot         the binary: CLI + `depot serve` (routes in web.rs) + embedded UI (ui/)
 tutorials/           markdown, one `## ` per step, optional `%check:` and niftyplot fences; parsed by crates/depot/src/tutorial.rs
 crates/depot/src/checks.rs   the live check keys (initialised, public_url_set, rpm_keys, trusted_any, …)
+crates/depot/src/terminal.rs the pty session manager behind the in-browser terminal (opt-in)
 tools/ui-test.js     executes the UI under jsdom against a live server (27 checks)
 systemd/             hardened unit: DynamicUser + StateDirectory=depot, port 8000, no capabilities
 flake.nix            nix build (unverified here — no nix in the sandbox)
@@ -78,6 +79,11 @@ Built and tested in a sandbox with the offline Rust 1.96 drop, `rpm`,
 - **Diagrams** rasterised with `rsvg-convert` and viewed: the SVG backend's
   output is correct outside a browser too (first cut was not — `var()`
   only — and that is recorded in the nifty-core commit).
+- **In-browser terminal** (opt-in `[terminal]`): a real shell behind a pty on
+  the depot host, admin-token-gated, short-polled; verified end to end over
+  HTTP (`uname`/`whoami`/`exit`, resize, reap) and under jsdom
+  (`tools/ui-term-test.js`, 8 checks: launcher, session, keycap, run/copy
+  buttons, close). Reuses voiceterm's `portable-pty` and keycap sequences.
 - **SIGTERM** mid-download: the download completes, the process exits.
 - curl: ETag/304, Range/206, HEAD, traversal refused, writes refused without
   the admin token.
