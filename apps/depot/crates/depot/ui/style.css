@@ -42,3 +42,20 @@ button.secondary { background: var(--panel); color: var(--fg); border: 1px solid
 .md blockquote { margin: .6rem 0; padding: .2rem .8rem; border-left: 3px solid var(--line); color: var(--muted); }
 a { color: var(--accent); }
 .pill { display: inline-block; padding: 0 .5em; border-radius: 999px; background: var(--panel); border: 1px solid var(--line); font-size: .8em; }
+
+/* tutorials: step view */
+.tut-list .card { margin-bottom: .6rem; }
+.tut-list .card h3 { margin: 0 0 .2rem; }
+.progress { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin: .4rem 0 1rem; }
+.progress > div { height: 100%; background: var(--accent); transition: width .2s; }
+.stepnav { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: 1rem 0; }
+.stepnav .spacer { flex: 1; }
+.steps-toc { list-style: none; padding: 0; margin: .5rem 0 1rem; display: flex; flex-wrap: wrap; gap: .3rem; }
+.steps-toc li { font-size: .85rem; }
+.steps-toc a { display: inline-block; padding: .15rem .5rem; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); text-decoration: none; }
+.steps-toc a.current { border-color: var(--accent); color: var(--fg); }
+.steps-toc a.done { color: var(--ok); border-color: var(--ok); }
+.step-body { position: relative; }
+.step-body pre { position: relative; }
+.copy { position: absolute; top: .35rem; right: .35rem; font-size: .75rem; padding: .15rem .45rem; background: var(--bg); color: var(--muted); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
+.copy:hover { color: var(--fg); }

@@ -11,6 +11,10 @@
   const base = () => location.origin;
   const token = () => sessionStorage.getItem('depot-token') || '';
 
+  // ── tutorial progress: localStorage, per tutorial, this browser only ────────
+  const progress = (slug) => { try { const p = JSON.parse(localStorage.getItem('depot-tut-' + slug) || '{}'); return { at: p.at || 0, done: Array.isArray(p.done) ? p.done : [] }; } catch (_) { return { at: 0, done: [] }; } };
+  const saveProgress = (slug, p) => { try { localStorage.setItem('depot-tut-' + slug, JSON.stringify(p)); } catch (_) {} };
+
   // ── tiny markdown (enough for MANUAL.md / DECISIONS.md) ─────────────────────
   function md(src) {
     const lines = src.split('\n'); let out = ''; let i = 0;
@@ -172,20 +176,59 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "X-Filename: rustc-1.96.0-aarch
       <div id="snips"></div>`;
     },
 
+    async tutorials() {
+      const d = await api('/api/tutorials');
+      return `<h1>Tutorials</h1>
+      <p class="muted">Step by step, one step on screen at a time, with the commands to run and what you should see. Progress is kept in this browser. Also: <code>depot tutorial NAME</code> prints one as text.</p>
+      <div class="tut-list">${d.tutorials.map((t) => { const p = progress(t.slug); const done = p.done.length; return `<div class="card"><h3><a href="#tutorial/${esc(t.slug)}">${esc(t.title)}</a></h3><div class="muted">${esc(t.intro.split('\n\n')[0])}</div><div class="progress"><div style="width:${Math.round(100 * done / t.steps.length)}%"></div></div><div class="muted">${t.steps.length} steps · ${done ? done + ' done' : 'not started'}${done && done < t.steps.length ? ` · <a href="#tutorial/${esc(t.slug)}/${p.at}">continue</a>` : ''}</div></div>`; }).join('')}</div>`;
+    },
+
+    async tutorial(slug, stepArg) {
+      const d = await api('/api/tutorials');
+      const t = d.tutorials.find((x) => x.slug === slug);
+      if (!t) return '<p class="bad">no such tutorial</p>';
+      const p = progress(slug);
+      const n = t.steps.length;
+      let i = stepArg != null && stepArg !== '' ? Math.max(0, Math.min(n - 1, parseInt(stepArg, 10) || 0)) : p.at;
+      if (Number.isNaN(i)) i = 0;
+      p.at = i; saveProgress(slug, p);
+      const step = t.steps[i];
+      const isDone = p.done.includes(i);
+      const toc = t.steps.map((s, k) => `<li><a href="#tutorial/${esc(slug)}/${k}" class="${k === i ? 'current' : ''} ${p.done.includes(k) ? 'done' : ''}" title="${esc(s.title)}">${k + 1}</a></li>`).join('');
+      return `<p><a href="#tutorials">← all tutorials</a></p>
+      <h1>${esc(t.title)}</h1>
+      ${i === 0 ? '<div class="md">' + md(t.intro) + '</div>' : ''}
+      <div class="muted">Step ${i + 1} of ${n} · ${p.done.length} done</div>
+      <div class="progress"><div style="width:${Math.round(100 * p.done.length / n)}%"></div></div>
+      <ul class="steps-toc">${toc}</ul>
+      <h2>${i + 1}. ${esc(step.title)}</h2>
+      <div class="md step-body">${md(step.body)}</div>
+      <div class="stepnav">
+        ${i > 0 ? `<a href="#tutorial/${esc(slug)}/${i - 1}"><button class="secondary" type="button">← previous</button></a>` : ''}
+        <span class="spacer"></span>
+        <button type="button" id="markdone" class="${isDone ? 'secondary' : ''}">${isDone ? 'done ✓ (undo)' : 'mark done'}</button>
+        ${i < n - 1 ? `<a href="#tutorial/${esc(slug)}/${i + 1}"><button type="button">next →</button></a>` : `<a href="#tutorials"><button type="button">finish</button></a>`}
+      </div>`;
+    },
+
     async manual() { return '<div class="md">' + md(await api('/api/manual.md')) + '</div>'; },
     async decisions() { return '<div class="md">' + md(await api('/api/decisions.md')) + '</div>'; },
   };
 
   // ── router ─────────────────────────────────────────────────────────────────
   async function route() {
-    const h = location.hash.slice(1) || 'overview';
+    // /manual, /decisions, /tutorials as plain URLs land on the matching view.
+    const fromPath = { '/manual': 'manual', '/decisions': 'decisions', '/tutorials': 'tutorials' }[location.pathname];
+    const h = location.hash.slice(1) || fromPath || 'overview';
     const [view, ...rest] = h.split('/');
     const arg = rest.map(decodeURIComponent);
-    document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('active', a.getAttribute('href') === '#' + view || (view === 'crate' && a.getAttribute('href') === '#crates')));
+    const navOf = { crate: 'crates', tutorial: 'tutorials' }[view] || view;
+    document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('active', a.getAttribute('href') === '#' + navOf));
     try {
       const q = new URLSearchParams(location.search).get('q') || '';
       let html;
       if (view === 'crate') html = await views.crate(arg[0]);
+      else if (view === 'tutorial') html = await views.tutorial(arg[0], arg[1]);
       else if (view === 'rpm') html = await views.rpm(arg[0], q);
       else if (views[view]) html = await views[view](q);
       else html = '<p class="bad">no such view</p>';
@@ -205,6 +248,17 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "X-Filename: rustc-1.96.0-aarch
       if (!token()) { alert('Set the admin token on the Sync tab first.'); return; }
       try { await api(`/api/crates/${encodeURIComponent(name)}/${encodeURIComponent(vers)}/${action}`, { method: 'POST', headers: { Authorization: 'Bearer ' + token() } }); route(); } catch (e) { alert(e.message); }
     }));
+    $('#markdone')?.addEventListener('click', () => {
+      const [, slug, at] = location.hash.slice(1).split('/');
+      const p = progress(slug); const i = parseInt(at, 10) || p.at || 0;
+      p.done = p.done.includes(i) ? p.done.filter((k) => k !== i) : p.done.concat(i).sort((a, b) => a - b);
+      saveProgress(slug, p); route();
+    });
+    main.querySelectorAll('.step-body pre').forEach((pre) => {
+      const b = document.createElement('button'); b.type = 'button'; b.className = 'copy'; b.textContent = 'copy';
+      b.addEventListener('click', async () => { try { await navigator.clipboard.writeText(pre.textContent); b.textContent = 'copied'; setTimeout(() => (b.textContent = 'copy'), 1200); } catch (_) { b.textContent = 'select + Ctrl-C'; } });
+      pre.appendChild(b);
+    });
     $('#savetok')?.addEventListener('click', () => { sessionStorage.setItem('depot-token', $('#tok').value.trim()); $('#savetok').textContent = 'saved'; });
     $('#verify')?.addEventListener('click', async () => { $('#verifyout').textContent = 'hashing…'; try { const r = await api('/api/verify'); $('#verifyout').innerHTML = r.corrupt.length ? `<span class="bad">${r.corrupt.length} corrupt: ${esc(r.corrupt.join(', '))}</span>` : '<span class="ok">every object hashes to its name</span>'; } catch (e) { $('#verifyout').textContent = e.message; } });
   }

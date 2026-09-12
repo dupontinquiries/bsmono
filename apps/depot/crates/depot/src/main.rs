@@ -2,6 +2,7 @@
 //! CLI that operators and scripts use on either side of the air gap.
 
 mod clientcfg;
+mod tutorial;
 mod web;
 
 use cli_kit::Cli;
@@ -54,6 +55,7 @@ MAINTENANCE
   verify                           re-hash every object
   gc [--delete]                    list (or delete) objects nothing references
   manual | decisions               print the manual / the design decisions
+  tutorial [NAME]                  list the step-by-step tutorials, or print one
 ";
 
 fn main() -> ExitCode {
@@ -299,6 +301,21 @@ fn run(cli: &Cli) -> Result<(), String> {
         }
         "decisions" => {
             print!("{}", web::DECISIONS_MD);
+            Ok(())
+        }
+        "tutorial" => {
+            match args.first() {
+                None => {
+                    for t in tutorial::all() {
+                        println!("{:<16} {}  ({} steps)", t.slug, t.title, t.steps.len());
+                    }
+                    println!("\ndepot tutorial NAME   — or open http://<depot>:8000/#tutorials for the step view");
+                }
+                Some(slug) => {
+                    let src = tutorial::find(slug).ok_or_else(|| format!("no tutorial {slug:?}; `depot tutorial` lists them"))?;
+                    print!("{}", src.text);
+                }
+            }
             Ok(())
         }
         other => Err(format!("unknown command {other:?}\n{USAGE}")),

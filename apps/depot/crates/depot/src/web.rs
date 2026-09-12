@@ -12,6 +12,7 @@
 //! `/toolchains/install.sh`, `/bootstrap.sh`.
 
 use crate::clientcfg::{self, Want};
+use crate::tutorial;
 use depot_core::pack::Select;
 use depot_core::Depot;
 use depot_httpd::{dir_listing, safe_join, serve_file, Body, Request, Response};
@@ -115,7 +116,7 @@ impl App {
 
         // ── UI ───────────────────────────────────────────────────────────────
         match (method, path.as_str()) {
-            ("GET" | "HEAD", "/") | ("GET" | "HEAD", "/manual") | ("GET" | "HEAD", "/decisions") => return Response::html(INDEX_HTML).with_header("Cache-Control", "no-cache"),
+            ("GET" | "HEAD", "/") | ("GET" | "HEAD", "/manual") | ("GET" | "HEAD", "/decisions") | ("GET" | "HEAD", "/tutorials") => return Response::html(INDEX_HTML).with_header("Cache-Control", "no-cache"),
             ("GET" | "HEAD", "/app.js") => return Response::bytes(200, "application/javascript; charset=utf-8", APP_JS.as_bytes().to_vec()),
             ("GET" | "HEAD", "/style.css") => return Response::bytes(200, "text/css; charset=utf-8", STYLE_CSS.as_bytes().to_vec()),
             ("GET" | "HEAD", "/api/manual.md") => return Response::bytes(200, "text/markdown; charset=utf-8", MANUAL_MD.as_bytes().to_vec()),
@@ -172,6 +173,11 @@ impl App {
     fn api(&self, method: &str, rest: &str, req: &mut Request<'_>) -> Response {
         let segs: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
         match (method, segs.as_slice()) {
+            ("GET", ["tutorials"]) => ok_json(&json!({"tutorials": tutorial::all()})),
+            ("GET", ["tutorials", name]) => match name.strip_suffix(".md").and_then(tutorial::find) {
+                Some(src) => Response::bytes(200, "text/markdown; charset=utf-8", src.text.as_bytes().to_vec()),
+                None => Response::not_found(),
+            },
             ("GET", ["status"]) => {
                 let d = self.depot.lock().unwrap();
                 match d.status() {

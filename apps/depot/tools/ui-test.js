@@ -10,12 +10,15 @@
 //                                          testdata fixtures + a pack-rust set)
 //   depot serve --root /tmp/d1 --bind 127.0.0.1:8123 --quiet &
 //   mkdir /tmp/uitest && cd /tmp/uitest && npm install jsdom@24
-//   node /path/to/ui-test.js               -> "18 passed, 0 failed"
+//   node /path/to/ui-test.js               -> "27 passed, 0 failed"
 //
 // Two harness lessons, paid for: (1) do NOT dispatch hashchange by hand -
 // jsdom fires it on `location.hash =`, and a manual dispatch renders every
 // view twice so clicks land on detached elements; (2) settle on text unique
-// to the view you navigated to, not on a wrapper both views share.
+// to the view you navigated to, not on a wrapper both views share. (3) The
+// verify step re-hashes every object on the server: one timeout was seen on
+// the first run after a server start with the default 4 s budget; it gets
+// 15 s. Three runs after that were clean.
 const { JSDOM } = require('jsdom');
 const BASE = 'http://127.0.0.1:8123';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -63,7 +66,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   d.querySelector('#tok').value = 'abc'; d.querySelector('#savetok').click();
   check('token saved to sessionStorage', w.sessionStorage.getItem('depot-token') === 'abc');
   d.querySelector('#verify').click();
-  const v = await settle((h) => /every object hashes|corrupt/.test(h));
+  const v = await settle((h) => /every object hashes|corrupt/.test(h), 15000); // hashes every object; depends on the server's disk
   check('verify button calls /api/verify and reports', /every object hashes to its name/.test(v));
 
   h = await go('#clients', (h) => h.includes('Client configuration'));
@@ -78,6 +81,30 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('manual renders headings/tables/code', /<h2 id="[^"]*">/.test(h) && h.includes('<table>') && h.includes('<pre><code>') && !h.includes('```'));
   h = await go('#decisions', (h) => h.includes('Data root:'));
   check('decisions renders 15 numbered sections', (h.match(/<h2 /g) || []).length >= 15);
+  h = await go('#tutorials', (h) => h.includes('<h1>Tutorials</h1>'));
+  check('tutorials list shows six with step counts', (h.match(/class="card"/g) || []).length === 6 && /10 steps/.test(h) && h.includes('#tutorial/usb-link'));
+  h = await go('#tutorial/sync', (h) => h.includes('Step 1 of 7'));
+  check('stepper opens at step 1 with intro, toc, body, copy buttons', h.includes('How a pack works') && (h.match(/steps-toc/g) || []).length === 1 && d.querySelectorAll('.step-body .copy').length >= 1 && !h.includes('previous'));
+  d.querySelector('#markdone').click();
+  h = await settle((h) => /1 done/.test(h));
+  check('mark done updates progress and persists', /done ✓/.test(h) && JSON.parse(w.localStorage.getItem('depot-tut-sync')).done.includes(0));
+  h = await go('#tutorial/sync/1', (h) => h.includes('Step 2 of 7'));
+  check('next step: previous button appears, intro hidden, toc marks step 1 done', h.includes('previous') && !h.includes('Two depots: one that can see') && /class="[^"]*done[^"]*"/.test(h));
+  h = await go('#tutorial/sync/6', (h) => h.includes('Step 7 of 7'));
+  check('last step offers finish', h.includes('finish') && !h.includes('next →'));
+  h = await go('#tutorials', (h) => h.includes('<h1>Tutorials</h1>'));
+  check('list shows progress and a continue link at the remembered step', /1 done/.test(h) && h.includes('#tutorial/sync/6'));
+  h = await go('#tutorial/does-not-exist', (h) => /no such tutorial/.test(h));
+  check('unknown tutorial reports', true);
+  check('/api/tutorials/sync.md is the raw file', (await (await fetch(BASE + '/api/tutorials/sync.md')).text()).startsWith('# Move content'));
+  // Path-based entry: /tutorials with no hash lands on the tutorials view.
+  {
+    const dom2 = new JSDOM(await (await fetch(BASE + '/tutorials')).text(), { url: BASE + '/tutorials', runScripts: 'dangerously', resources: 'usable', pretendToBeVisual: true,
+      beforeParse(win) { win.fetch = (u, o) => fetch(new URL(String(u), BASE).href, o); win.CSS = { escape: (x) => x }; } });
+    const t0 = Date.now(); let ok = false;
+    while (Date.now() - t0 < 4000) { if (dom2.window.document.querySelector('#main').innerHTML.includes('<h1>Tutorials</h1>')) { ok = true; break; } await sleep(50); }
+    check('/tutorials as a plain URL opens the tutorials view', ok);
+  }
   h = await go('#nope', (h) => /no such view/.test(h));
   check('unknown route reports', true);
   console.log(`\n${pass} passed, ${fail} failed`);

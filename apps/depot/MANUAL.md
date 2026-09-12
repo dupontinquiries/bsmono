@@ -11,7 +11,11 @@ read with `ls`, `cat` and `sha256sum`.
 
 This manual is served by the running depot at `/manual`, and printed by
 `depot manual`. The reasoning behind the defaults is in `DECISIONS.md`
-(`/decisions`, `depot decisions`).
+(`/decisions`, `depot decisions`). If you would rather be walked through
+it, the **Tutorials** tab (`/tutorials`, `depot tutorial`) has six
+step-by-step guides — Linux basics, setting up the server, filling it,
+syncing across the air gap, preparing clients, serving over USB — each
+step with the commands to run and what you should see.
 
 ---
 
@@ -390,6 +394,7 @@ pattern: `APKINDEX.tar.gz` derived from the `.apk` control segments).
 | rotate the token | delete the file, run `--new` again; takes effect immediately |
 | back up | `rsync -a <root>/{catalog.json,objects,keys,trust,depot.toml} …` (pub/ and tmp/ are derived) |
 | logs | `journalctl -u depot` — one line per request: method, path, status, bytes, ms |
+| learn / teach | `depot tutorial` lists the guides; `depot tutorial server-setup` prints one; the UI shows them a step at a time |
 
 Nothing in depot needs the clock to be right (offline boxes often have it
 wrong): timestamps are informational, signatures have no expiry, and dnf's
@@ -416,6 +421,7 @@ Reads are open; writes need `Authorization: Bearer <admin token>`.
 | PUT | `/api/packs[?allow_unsigned=1]` | a pack | unpack |
 | GET | `/api/client-config?crates=1&rpm=<id>&nix=1&toolchain=1` or `?all=1` | | snippets as JSON |
 | GET | `/api/verify` | | `{"corrupt":[…]}` |
+| GET | `/api/tutorials` · `/api/tutorials/<slug>.md` | | tutorials as steps (JSON) / raw markdown |
 | GET | `/bootstrap.sh?…` · `/crates/index/config.json` · `/toolchains/install.sh` | | generated per request |
 
 Everything under `/crates/`, `/rpm/`, `/nix/`, `/toolchains/` is a static

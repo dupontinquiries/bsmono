@@ -9,6 +9,9 @@ between the online and offline sides as signed, content-deduplicated packs.
   `/manual` and printed by `depot manual`.
 - **Why it is built this way:** [DECISIONS.md](DECISIONS.md) — the Linux
   and ecosystem defaults each choice rests on (`/decisions`, `depot decisions`).
+- **Tutorials:** [tutorials/](tutorials/) — six step-by-step guides (Linux
+  basics, server setup, filling the depot, sync, clients, USB link), shown
+  one step at a time in the UI with progress (`/tutorials`, `depot tutorial`).
 
 ## Layout
 
@@ -16,6 +19,8 @@ between the online and offline sides as signed, content-deduplicated packs.
 crates/depot-httpd   std-only threaded HTTP/1.1 — the transport seam (hyper/TLS would slot in here)
 crates/depot-core    headless: store, catalog, the four projections, signed packs
 crates/depot         the binary: CLI + `depot serve` (routes in web.rs) + embedded UI (ui/)
+tutorials/           markdown, one `## ` per step; embedded and parsed by crates/depot/src/tutorial.rs
+tools/ui-test.js     executes the UI under jsdom against a live server (27 checks)
 systemd/             hardened unit: DynamicUser + StateDirectory=depot, port 8000, no capabilities
 flake.nix            nix build (unverified here — no nix in the sandbox)
 ```
@@ -62,7 +67,9 @@ Built and tested in a sandbox with the offline Rust 1.96 drop, `rpm`,
   the CLI path's), junk as a crate → 422 and the object is removed, wrong
   token → 401. Uploads stream into the store without the catalog lock.
 - **UI executed** under jsdom against the live server (`tools/ui-test.js`):
-  18 checks across every view, including the Clients tab's live refresh.
+  27 checks across every view, including the Clients tab's live refresh and
+  the tutorial stepper (progress, mark-done, next/previous, `/tutorials` as
+  a plain URL).
 - **SIGTERM** mid-download: the download completes, the process exits.
 - curl: ETag/304, Range/206, HEAD, traversal refused, writes refused without
   the admin token.
