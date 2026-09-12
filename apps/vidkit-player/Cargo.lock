@@ -2512,6 +2512,7 @@ dependencies = [
  "vidkit-core",
  "vidkit-egui",
  "vidkit-mp4",
+ "vidkit-stream",
  "vidkit-webm",
  "vidkit-ytdlp",
 ]
@@ -2519,6 +2520,16 @@ dependencies = [
 [[package]]
 name = "vidkit-relevance"
 version = "0.1.0"
+
+[[package]]
+name = "vidkit-stream"
+version = "0.1.0"
+dependencies = [
+ "vidkit-core",
+ "vidkit-mp4",
+ "vidkit-webm",
+ "vidkit-ytdlp",
+]
 
 [[package]]
 name = "vidkit-webm"

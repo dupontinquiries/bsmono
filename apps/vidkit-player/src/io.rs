@@ -490,3 +490,292 @@ mod tests {
         assert_eq!(e, HttpError::Forbidden, "a 403 arrived as {e:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// opening a URL
+// ---------------------------------------------------------------------------
+
+/// Builds a transport per resolved URL, for `StreamSource`.
+pub struct TcpFactory;
+
+impl vidkit_stream::TransportFactory<TcpTransport> for TcpFactory {
+    fn open(&mut self, _url: &str) -> TcpTransport {
+        TcpTransport::default()
+    }
+}
+
+/// Is this a link straight to a media file, or a page that needs an extractor?
+///
+/// Worth branching on. A direct `.mp4` needs no yt-dlp at all, and running an
+/// extractor on one is a spawned Python interpreter and several seconds to
+/// learn what the URL already said. It also means a local or LAN file over
+/// HTTP works on a machine with no yt-dlp installed, which is most of them.
+pub fn is_direct_media(url: &str) -> bool {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    ["mp4", "m4v", "mov", "webm", "mkv"]
+        .iter()
+        .any(|e| path.ends_with(&format!(".{e}")))
+}
+
+/// What a URL turned out to be.
+#[derive(Debug)]
+pub struct OpenedUrl {
+    pub label: String,
+    pub duration: Option<std::time::Duration>,
+    pub dimensions: (u32, u32),
+    pub packets: usize,
+}
+
+/// Open a direct media URL: fetch over HTTP, sniff, demux, describe.
+///
+/// No extractor and no resolution — the URL is the media. Errors carry the URL,
+/// because "connection refused" with no address is a message that sends someone
+/// looking in the wrong place.
+pub fn open_direct_url(url: &str) -> Result<OpenedUrl, String> {
+    use vidkit_core::io::ByteSource;
+    use vidkit_core::traits::MediaSource;
+    use vidkit_ytdlp::http::{ChunkPolicy, HttpByteSource};
+
+    let mut src = HttpByteSource::new(TcpTransport::default(), url, Default::default())
+        .with_policy(ChunkPolicy {
+            // Smaller than the default: the header walk is the only thing read
+            // before we know whether this is even a video, and pulling 256 KB
+            // to find out is rude on a metered link.
+            chunk_bytes: 64 * 1024,
+            retries: 1,
+        });
+
+    let mut head = [0u8; 16];
+    let n = src
+        .read_at(0, &mut head)
+        .map_err(|e| format!("{url}: {e}"))?;
+    let container = vidkit_stream::detect_container(&head[..n])
+        .ok_or_else(|| format!("{url}: not an MP4 or WebM stream"))?;
+
+    let (kind, profile, dims, dur, packets) = match container {
+        vidkit_stream::Container::Mp4 => {
+            let mut d = vidkit_mp4::Mp4Demuxer::open(src).map_err(|e| format!("{url}: {e}"))?;
+            let (p, dims, dur) = (d.video_profile(), d.dimensions(), d.duration());
+            let mut n = 0;
+            while matches!(d.next_packet(), Ok(Some(_))) {
+                n += 1;
+            }
+            ("MP4", p, dims, dur, n)
+        }
+        vidkit_stream::Container::WebM => {
+            let mut d = vidkit_webm::WebmDemuxer::open(src).map_err(|e| format!("{url}: {e}"))?;
+            let (p, dims, dur) = (d.video_profile(), d.dimensions(), d.duration());
+            let mut n = 0;
+            while matches!(d.next_packet(), Ok(Some(_))) {
+                n += 1;
+            }
+            ("WebM", p, dims, dur, n)
+        }
+    };
+
+    let codec = profile
+        .map(|p| format!("{} {}-bit", p.codec, p.bit_depth))
+        .unwrap_or_else(|| "unknown codec".into());
+    let name = url.rsplit('/').next().unwrap_or(url);
+
+    Ok(OpenedUrl {
+        label: format!(
+            "{name} · {kind} · {codec} · {}x{} · {packets} packets · over HTTP",
+            dims.0, dims.1
+        ),
+        duration: dur,
+        dimensions: dims,
+        packets,
+    })
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    #[test]
+    fn direct_media_links_are_recognised() {
+        assert!(is_direct_media("http://h/a/clip.mp4"));
+        assert!(is_direct_media("http://h/CLIP.WEBM"));
+        assert!(is_direct_media("http://h/v.mkv?token=1"));
+        // A page is not a media link.
+        assert!(!is_direct_media("https://www.youtube.com/watch?v=abc"));
+        assert!(!is_direct_media("http://h/index.html"));
+        // ...and a query must not be mistaken for an extension.
+        assert!(!is_direct_media("http://h/watch?file=x.mp4"));
+    }
+
+    /// Serve a real MP4 over a real socket and open it end to end: transport,
+    /// windowed reads, container sniff, demux. Nothing is mocked below the URL.
+    #[test]
+    fn a_direct_url_opens_over_http() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let body = crate::io::tests_support::sample_mp4();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+
+        let served = body.clone();
+        std::thread::spawn(move || {
+            // The demuxer makes several range requests; serve until it stops.
+            for _ in 0..64 {
+                let Ok((mut sock, _)) = listener.accept() else { break };
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (start, end) = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .and_then(|l| l.split('=').nth(1).map(str::trim).map(str::to_string))
+                    .and_then(|r| {
+                        let (a, b) = r.split_once('-')?;
+                        Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+                    })
+                    .unwrap_or((0, served.len() - 1));
+                if start >= served.len() {
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n\r\n",
+                    );
+                    continue;
+                }
+                let slice = &served[start..=end.min(served.len() - 1)];
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                    start + slice.len() - 1,
+                    served.len(),
+                    slice.len()
+                );
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(slice);
+            }
+        });
+
+        let opened = open_direct_url(&format!("http://127.0.0.1:{port}/clip.mp4"))
+            .expect("open over http");
+        assert_eq!(opened.dimensions, (64, 64));
+        assert_eq!(opened.packets, 2, "wrong packet count over the wire");
+        assert!(opened.label.contains("MP4"), "{}", opened.label);
+        assert!(opened.label.contains("over HTTP"), "{}", opened.label);
+    }
+
+    /// A URL that serves something else must say so, not fail obscurely deep in
+    /// a parser.
+    #[test]
+    fn a_url_serving_html_is_reported_clearly() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept() else { break };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let body = b"<!DOCTYPE html><html>nope</html>";
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                    body.len() - 1, body.len(), body.len()
+                );
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(body);
+            }
+        });
+
+        let e = open_direct_url(&format!("http://127.0.0.1:{port}/x.mp4")).unwrap_err();
+        assert!(e.contains("not an MP4 or WebM"), "unhelpful: {e}");
+        // The address belongs in the message: "connection refused" with no
+        // address sends someone looking in the wrong place.
+        assert!(e.contains("127.0.0.1"), "the URL was dropped: {e}");
+    }
+
+    /// A server error surfaces through `read_at`, which is a different path
+    /// from a refused connection or an unrecognised container -- both of which
+    /// already carry the address for their own reasons. Without this the
+    /// `map_err` that adds the URL to a read failure was untested.
+    #[test]
+    fn a_server_error_reports_the_url_too() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((mut sock, _)) = listener.accept() else { break };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let _ = sock
+                    .write_all(b"HTTP/1.1 500 Server Error\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/clip.mp4");
+        let e = open_direct_url(&url).unwrap_err();
+        assert!(
+            e.contains(&format!("127.0.0.1:{port}")),
+            "the URL was dropped from a read failure: {e}"
+        );
+    }
+
+    #[test]
+    fn a_dead_host_reports_the_url() {
+        // Port 1 is reserved and nothing listens on it.
+        let e = open_direct_url("http://127.0.0.1:1/clip.mp4").unwrap_err();
+        assert!(e.contains("127.0.0.1:1"), "the URL was dropped: {e}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    /// A two-sample AV1 MP4, from vidkit-mp4's own fixture writer rather than a
+    /// second copy that could drift from the parser it exercises.
+    pub fn sample_mp4() -> Vec<u8> {
+        use vidkit_mp4::build::*;
+        let n = 2u32;
+        let payloads: Vec<Vec<u8>> = (0..n).map(|_| vec![0xA0u8; 6]).collect();
+        let sizes: Vec<u32> = payloads.iter().map(|p| p.len() as u32).collect();
+        let mut mdat_body = Vec::new();
+        let mut offs = Vec::new();
+        for p in &payloads {
+            offs.push(mdat_body.len());
+            mdat_body.extend_from_slice(p);
+        }
+        let mdat = bx(b"mdat", &mdat_body);
+        let ftyp = bx(b"ftyp", b"isom\0\0\x02\0isomiso2av01mp41");
+        let av1c = bx(b"av1C", &[0x81, 0x00, 0x00, 0x00]);
+        let make = |at: u64| {
+            let stco = table(
+                b"stco",
+                &offs.iter().map(|o| u32b((at + *o as u64) as u32)).collect::<Vec<_>>(),
+            );
+            let stbl = bx(
+                b"stbl",
+                &cat(&[
+                    stsd(visual_entry(b"av01", 64, 64, av1c.clone())),
+                    table(b"stts", &[cat(&[u32b(n), u32b(1000)])]),
+                    table(b"stsc", &[cat(&[u32b(1), u32b(1), u32b(1)])]),
+                    stsz(&sizes),
+                    stco,
+                ]),
+            );
+            let minf = bx(b"minf", &cat(&[bx(b"vmhd", &[0u8; 12]), stbl]));
+            let mdia = bx(b"mdia", &cat(&[mdhd(30_000, n * 1000), hdlr(b"vide"), minf]));
+            let trak = bx(b"trak", &cat(&[tkhd(1, 64, 64), mdia]));
+            bx(b"moov", &cat(&[bx(b"mvhd", &[0u8; 100]), trak]))
+        };
+        let probe = make(0);
+        let at = (ftyp.len() + probe.len() + 8) as u64;
+        let moov = make(at);
+        assert_eq!(moov.len(), probe.len());
+        cat(&[ftyp, moov, mdat])
+    }
+}

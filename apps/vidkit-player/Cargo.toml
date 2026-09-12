@@ -24,6 +24,7 @@ eframe = { version = "0.34", optional = true, default-features = false, features
 vidkit-core = { path = "../../shared/vidkit/crates/vidkit-core" }
 # The IO wrappers in src/io.rs implement its CommandRunner and HttpTransport.
 vidkit-ytdlp = { path = "../../shared/vidkit/crates/vidkit-ytdlp" }
+vidkit-stream = { path = "../../shared/vidkit/crates/vidkit-stream" }
 vidkit-egui = { path = "../../shared/vidkit/crates/vidkit-egui", features = ["glow-upload"] }
 vidkit-mp4 = { path = "../../shared/vidkit/crates/vidkit-mp4" }
 vidkit-webm = { path = "../../shared/vidkit/crates/vidkit-webm" }
@@ -41,3 +42,7 @@ app = ["dep:eframe"]
 # and the sandbox boxes are disk-starved.
 [profile.dev]
 debug = "line-tables-only"
+
+[dev-dependencies]
+# The URL test serves a real MP4 from the demuxer's own fixture writer.
+vidkit-mp4 = { path = "../../shared/vidkit/crates/vidkit-mp4", features = ["fixtures"] }

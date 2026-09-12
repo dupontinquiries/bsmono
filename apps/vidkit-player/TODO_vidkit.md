@@ -67,8 +67,11 @@ untestable wrapper would have looked like progress.
    HTTPS-only, so this is what stands between the finished `StreamSource` and
    actually playing a URL. It is a change to `TcpTransport::fetch` and nothing
    else. *verified*
-3. **Wire the two into the app.** `ProcessRunner` and `TcpTransport` exist and
-   nothing constructs them; `StreamSource::open` wants both. *verified*
+3. **Page URLs through the extractor.** Direct media links now open over HTTP
+   end to end (`io::open_direct_url`, wired to the palette's "play from
+   clipboard"). A YouTube *page* URL still needs `StreamSource` + `ProcessRunner`
+   + a TLS transport, so it reports what is missing instead of failing
+   obscurely. Blocked on item 2. *verified*
 4. **Tooltip fade-in.** Asked for and done — see below — but only the shared
    helper; individual controls still need `.on_hover_text` replaced. *verified*
 5. **`Inhibitor` impl.** wlr idle-inhibit on Phosh, `org.freedesktop.ScreenSaver`

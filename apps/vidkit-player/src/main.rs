@@ -121,6 +121,12 @@ struct Player {
     chrome: vidkit_egui::Chrome,
     settings: vidkit_egui::Settings,
     settings_open: bool,
+    /// The most recent text pasted into the window. egui delivers `Event::Paste`
+    /// on Ctrl+V, which is how the clipboard is read without a clipboard
+    /// dependency and, on Wayland, without a protocol this app has no business
+    /// knowing about. The cost is honest: "play from clipboard" works after a
+    /// paste, not before one.
+    last_paste: Option<String>,
 }
 
 /// File-picker state. Navigation is uikit-egui's PathPicker; the file list and
@@ -235,6 +241,7 @@ impl Player {
             chrome: Default::default(),
             settings: Default::default(),
             settings_open: false,
+            last_paste: None,
         }
     }
 
@@ -284,6 +291,14 @@ impl eframe::App for Player {
             self.presenter.idle();
         }
         self.presenter.schedule_repaint();
+
+        ctx.input(|i| {
+            for e in &i.events {
+                if let egui::Event::Paste(t) = e {
+                    self.last_paste = Some(t.clone());
+                }
+            }
+        });
 
         // Settings are pushed into the live config every frame rather than on
         // an Apply button: every control is reversible and cheap, and seeing
@@ -518,7 +533,8 @@ impl Player {
             // Unimplemented rows say so rather than doing nothing: an entry
             // that appears to work and does not is worse than one that admits
             // it is unfinished.
-            C::Subtitles | C::ScrubToSections | C::PlayClipboard => {
+            C::PlayClipboard => self.play_clipboard(),
+            C::Subtitles | C::ScrubToSections => {
                 self.gpu_error = Some(format!("{:?} is not wired up yet", c));
             }
             // The same 5% steps the gestures and the bar use, so the three
@@ -878,6 +894,62 @@ impl Player {
             other => {
                 self.gpu_error = Some(format!("{other:?} is not wired up yet"));
             }
+        }
+    }
+}
+
+impl Player {
+    /// Play whatever was last pasted in.
+    ///
+    /// A direct media link is opened straight over HTTP with no extractor: a
+    /// spawned Python interpreter and several seconds to learn what the URL
+    /// already said is a poor trade, and it means a LAN file works on a machine
+    /// with no yt-dlp. A page URL needs the extractor, and that path needs TLS
+    /// this build does not have, so it says so rather than failing obscurely.
+    fn play_clipboard(&mut self) {
+        let Some(text) = self.last_paste.clone() else {
+            self.gpu_error = Some("nothing pasted yet — press Ctrl+V first".into());
+            return;
+        };
+        let what = vidkit_ytdlp::classify(&text);
+        let url = match &what {
+            vidkit_ytdlp::Paste::Video { url, .. } => url.clone(),
+            vidkit_ytdlp::Paste::LocalFile(p) => {
+                self.opened = Some(open_local(p));
+                self.path = Some(p.clone());
+                self.apply_opened();
+                return;
+            }
+            other => {
+                self.gpu_error = Some(format!("{} — not playable yet", other.label()));
+                return;
+            }
+        };
+
+        if !io::is_direct_media(&url) {
+            self.gpu_error = Some(format!(
+                "{url} needs yt-dlp and an HTTPS client; this build has neither"
+            ));
+            return;
+        }
+        match io::open_direct_url(&url) {
+            Ok(o) => {
+                self.transport.duration = o.duration;
+                self.transport.status = "NV12 · CPU convert".into();
+                self.opened = Some(Ok(Opened {
+                    label: o.label,
+                    duration: o.duration,
+                }));
+                self.gpu_error = None;
+            }
+            Err(e) => self.gpu_error = Some(e),
+        }
+    }
+
+    /// Push a freshly opened file into the transport.
+    fn apply_opened(&mut self) {
+        if let Some(Ok(o)) = &self.opened {
+            self.transport.duration = o.duration;
         }
     }
 }
