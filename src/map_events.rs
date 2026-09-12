@@ -298,6 +298,10 @@ mod tests {
     #[test]
     fn events_fire_in_sequence() {
         let mut g = game();
+        // nobody fights, so the match can't end early and cut the schedule short
+        for u in g.gods.iter_mut() {
+            u.ai = None;
+        }
         let mut seen = Vec::new();
         for _ in 0..(420 * 30) {
             g.tick(1.0 / 30.0);

@@ -829,6 +829,10 @@ impl Game {
                         g.buff_ms = 0.0;
                     }
                 }
+                if g.blessing_t > 0.0 {
+                    g.blessing_t -= dt;
+                    g.mana = (g.mana + g.max_mana * BLESSING_MP_PER_S * dt).min(g.max_mana);
+                }
                 if g.slow_t > 0.0 {
                     g.slow_t -= dt;
                     if g.slow_t <= 0.0 {

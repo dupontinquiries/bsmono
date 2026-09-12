@@ -88,6 +88,7 @@ pub struct Renderer {
     voxel_alpha_pipe: wgpu::RenderPipeline,
     shadow_pipe: wgpu::RenderPipeline,
     terrain_pipe: wgpu::RenderPipeline,
+    water_pipe: wgpu::RenderPipeline,
     sky_pipe: wgpu::RenderPipeline,
     post_pipe: wgpu::RenderPipeline,
 
@@ -103,6 +104,9 @@ pub struct Renderer {
     terrain_vbuf: wgpu::Buffer,
     terrain_ibuf: wgpu::Buffer,
     terrain_count: u32,
+    water_vbuf: wgpu::Buffer,
+    water_ibuf: wgpu::Buffer,
+    water_count: u32,
 
     post_sampler: wgpu::Sampler,
     post_params: wgpu::Buffer,
@@ -254,6 +258,10 @@ impl Renderer {
             label: Some("terrain.wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/terrain.wgsl").into()),
         });
+        let water_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("water"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/water.wgsl").into()),
+        });
         let sky_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sky.wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/sky.wgsl").into()),
@@ -281,12 +289,24 @@ impl Renderer {
             ],
         };
         let terrain_vbl = wgpu::VertexBufferLayout {
-            array_stride: 36,
+            array_stride: 40,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 24, shader_location: 2 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 36, shader_location: 3 },
+            ],
+        };
+        // water surface: position + bed height (for depth) + flow direction
+        let water_vbl = wgpu::VertexBufferLayout {
+            array_stride: 32,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 12, shader_location: 1 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 16, shader_location: 2 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 24, shader_location: 3 },
             ],
         };
 
@@ -389,6 +409,25 @@ impl Renderer {
             }),
             primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
             depth_stencil: Some(depth_state_write.clone()),
+            multisample: msaa,
+            multiview: None,
+        });
+
+        let water_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("water"),
+            layout: Some(&main_pl),
+            vertex: wgpu::VertexState { module: &water_module, entry_point: "vs_main", buffers: &[water_vbl] },
+            fragment: Some(wgpu::FragmentState {
+                module: &water_module,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(depth_state_ro.clone()),
             multisample: msaa,
             multiview: None,
         });
@@ -515,6 +554,18 @@ impl Renderer {
             usage: wgpu::BufferUsages::INDEX,
         });
         let terrain_count = ti.len() as u32;
+        let (wv, wi) = build_water();
+        let water_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("water vbuf"),
+            contents: bytemuck::cast_slice(&wv),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let water_ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("water ibuf"),
+            contents: bytemuck::cast_slice(&wi),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let water_count = wi.len() as u32;
 
         let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("post sampler"),
@@ -547,6 +598,7 @@ impl Renderer {
             voxel_alpha_pipe,
             shadow_pipe,
             terrain_pipe,
+            water_pipe,
             sky_pipe,
             post_pipe,
             frame_buf,
@@ -560,6 +612,9 @@ impl Renderer {
             terrain_vbuf,
             terrain_ibuf,
             terrain_count,
+            water_vbuf,
+            water_ibuf,
+            water_count,
             post_sampler,
             post_params,
             hdr_msaa: None,
@@ -836,6 +891,15 @@ impl Renderer {
                 }
             }
 
+            // water surface (after the opaque world so the bed shows through)
+            if self.water_count > 0 {
+                rp.set_pipeline(&self.water_pipe);
+                rp.set_bind_group(0, &self.main_bind, &[0]);
+                rp.set_vertex_buffer(0, self.water_vbuf.slice(..));
+                rp.set_index_buffer(self.water_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..self.water_count, 0, 0..1);
+            }
+
             // transparent voxels + particles
             rp.set_pipeline(&self.voxel_alpha_pipe);
             rp.set_vertex_buffer(0, self.cube_vbuf.slice(..));
@@ -1076,6 +1140,9 @@ struct TerrainVert {
     pos: [f32; 3],
     normal: [f32; 3],
     color: [f32; 3],
+    /// material id for the detail shader: 0 grass, 1 dirt lane, 2 riverbed,
+    /// 3 sand bank, 4 hill outcrop, 5 mountain rock, 6 moss
+    mat: f32,
 }
 
 fn hash2(x: i32, z: i32) -> f32 {
@@ -1119,7 +1186,7 @@ fn lane_distance(x: f32, z: f32) -> f32 {
 /// beyond the arena bounds, a mountain rim at the horizon, and river valleys
 /// that dip under the lanes (roads stay solid — bridges span the crossings).
 pub fn terrain_height(x: f32, z: f32) -> f32 {
-    use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, ARENA_RADIUS};
+    use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, RIVER_DEPTH, ARENA_RADIUS};
     let r = (x * x + z * z).sqrt();
     let mut h = 0.0f32;
     // rolling jungle hills outside the playable floor
@@ -1141,8 +1208,10 @@ pub fn terrain_height(x: f32, z: f32) -> f32 {
     if rd < river_reach {
         let ld = lane_distance(x, z);
         let mask = smoothstep(4.0, 9.5, ld);
-        let depth = (1.0 - (rd / river_reach).clamp(0.0, 1.0)).powf(1.4) * 1.5;
-        h -= depth * mask;
+        // banks slope down past the water line, then the channel bowls out
+        let t = (rd / river_reach).clamp(0.0, 1.0);
+        let depth = (1.0 - t).powf(1.25) * (RIVER_DEPTH + 0.6) - 0.3;
+        h -= depth.max(0.0) * mask;
     }
     h
 }
@@ -1166,7 +1235,9 @@ pub fn sphere_in_frustum(vp: &Mat4, center: Vec3, radius: f32) -> bool {
 fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
     use crate::consts::{river_dist, GROUND_HALF, RIVER_HALF_WIDTH, ARENA_RADIUS};
     const HALF: f32 = GROUND_HALF;
-    const STEP: f32 = 3.2;
+    // 1.6 u grid (was 3.2): ~80k verts, fine enough for the river channels
+    // and lane edges to read; the fragment shader adds the sub-metre detail.
+    const STEP: f32 = 1.6;
     const N: usize = ((HALF * 2.0) / STEP) as usize + 1;
 
     let mut verts = Vec::with_capacity(N * N);
@@ -1191,16 +1262,21 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
             let ld = lane_distance(x, z);
 
             let mut color;
+            let mut mat = 0.0f32;
             if r > 175.0 && h > 14.0 {
                 // mountain rim: dark jungle rock with forest ledges
                 let rock = [0.24 + n1 * 0.05, 0.24 + n2 * 0.04, 0.22 + n1 * 0.03];
                 let forest = [0.085 + n1 * 0.03, 0.17 + n2 * 0.05, 0.075];
-                color = if slope > 0.10 || n2 > 0.62 { rock } else { forest };
+                let is_rock = slope > 0.10 || n2 > 0.62;
+                mat = if is_rock { 5.0 } else { 0.0 };
+                color = if is_rock { rock } else { forest };
                 color = [color[0] * (0.85 + n1 * 0.3), color[1] * (0.85 + n1 * 0.3), color[2] * (0.85 + n1 * 0.3)];
             } else if r > ARENA_RADIUS {
                 // overgrown hills ring
                 let g = [0.075 + n1 * 0.035, 0.175 + n2 * 0.06, 0.07 + n2 * 0.02];
-                color = if slope > 0.16 || (n2 > 0.7 && h > 4.0) {
+                let outcrop = slope > 0.16 || (n2 > 0.7 && h > 4.0);
+                mat = if outcrop { 4.0 } else { 0.0 };
+                color = if outcrop {
                     [0.30 + n1 * 0.05, 0.28 + n2 * 0.04, 0.25] // outcrop
                 } else {
                     g
@@ -1216,9 +1292,11 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
                     // dense moss patches
                     let t = smoothstep(0.62, 0.85, nm) * 0.55;
                     g = [g[0] * (1.0 - t * 0.45), g[1] * (1.0 - t * 0.1), g[2] * (1.0 - t * 0.35)];
+                    mat = 6.0;
                 }
                 // dirt lane with worn edges + subtle checker
                 if ld < 5.4 {
+                    mat = 1.0;
                     let t = (1.0 - ld / 5.4).clamp(0.0, 1.0);
                     let dirt = [0.42, 0.345, 0.26];
                     g = [g[0] + (dirt[0] - g[0]) * t, g[1] + (dirt[1] - g[1]) * t, g[2] + (dirt[2] - g[2]) * t];
@@ -1229,20 +1307,21 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
                     let t = (1.0 - (ld - 5.4) / 1.6) * 0.25;
                     g = [g[0] * (1.0 - t * 0.4), g[1] * (1.0 - t * 0.25), g[2] * (1.0 - t * 0.5)];
                 }
-                // rivers: dark water, sandy banks
-                if rd < RIVER_HALF_WIDTH {
-                    let t = 1.0 - rd / RIVER_HALF_WIDTH;
+                // rivers: a pebbled bed under the water (the surface is its own
+                // mesh, see build_water), sandy banks above the water line
+                let wet_bed = h < crate::consts::WATER_LEVEL + 0.05 && rd < RIVER_HALF_WIDTH + 7.0;
+                if wet_bed {
+                    mat = 2.0;
+                    let t = (1.0 - rd / (RIVER_HALF_WIDTH + 2.0)).clamp(0.0, 1.0);
                     g = [
-                        0.075 + n2 * 0.02,
-                        0.16 + n1 * 0.04 - t * 0.04,
-                        0.15 + n2 * 0.03,
+                        0.30 + n2 * 0.06 - t * 0.08,
+                        0.30 + n1 * 0.05 - t * 0.06,
+                        0.24 + n2 * 0.04 - t * 0.02,
                     ];
-                    if n1 > 0.72 {
-                        g = [g[0] + 0.10, g[1] + 0.12, g[2] + 0.10]; // sparkle
-                    }
-                } else if rd < RIVER_HALF_WIDTH + 3.2 {
-                    let t = 1.0 - (rd - RIVER_HALF_WIDTH) / 3.2;
-                    g = [g[0] + (0.40 - g[0]) * t * 0.8, g[1] + (0.34 - g[1]) * t * 0.8, g[2] + (0.22 - g[2]) * t * 0.8];
+                } else if rd < RIVER_HALF_WIDTH + 5.0 && ld > 5.4 {
+                    mat = 3.0;
+                    let t = (1.0 - (rd - RIVER_HALF_WIDTH) / 5.0).clamp(0.0, 1.0);
+                    g = [g[0] + (0.46 - g[0]) * t * 0.85, g[1] + (0.40 - g[1]) * t * 0.85, g[2] + (0.27 - g[2]) * t * 0.85];
                 }
                 // team base tints
                 for (bz, c) in [
@@ -1261,6 +1340,7 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
                 pos: [x, h, z],
                 normal: n.to_array(),
                 color,
+                mat,
             });
         }
     }
@@ -1273,6 +1353,68 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
             let c = (ix + N * (iz + 1)) as u32;
             let d = (ix + 1 + N * (iz + 1)) as u32;
             idx.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+    (verts, idx)
+}
+
+// ---------------------------------------------------------------------------
+// Water surface — two strips (one per river) at WATER_LEVEL, 1.0 u cells.
+// Each vertex carries the bed height under it so the shader can shade by
+// depth, and the local flow direction (river tangent, pointing south).
+// Lanes carve the bed flat above the water line, so the surface simply ends
+// up under the road there and the depth test hides it.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct WaterVert {
+    pos: [f32; 3],
+    bed: f32,
+    flow: [f32; 2],
+    uv: [f32; 2],
+}
+
+fn build_water() -> (Vec<WaterVert>, Vec<u32>) {
+    use crate::consts::{river_x, GROUND_HALF, RIVER_HALF_WIDTH, WATER_LEVEL};
+    const STEP: f32 = 1.0;
+    let half_w = RIVER_HALF_WIDTH + 6.0;
+    let nx = (half_w * 2.0 / STEP) as usize + 1;
+    let nz = (GROUND_HALF * 2.0 / STEP) as usize + 1;
+    let mut verts = Vec::with_capacity(nx * nz * 2);
+    let mut idx = Vec::new();
+    for side in [-1.0f32, 1.0] {
+        let base = verts.len() as u32;
+        for iz in 0..nz {
+            let z = -GROUND_HALF + iz as f32 * STEP;
+            let cx = river_x(side, z);
+            // tangent of the centreline, pointing -z (downstream = south)
+            let dz = 0.5;
+            let tx = river_x(side, z - dz) - river_x(side, z + dz);
+            let flow = glam::Vec2::new(tx, -2.0 * dz).normalize();
+            for ix in 0..nx {
+                let x = cx - half_w + ix as f32 * STEP;
+                let bed = terrain_height(x, z);
+                verts.push(WaterVert {
+                    pos: [x, WATER_LEVEL, z],
+                    bed,
+                    flow: flow.to_array(),
+                    uv: [(x - cx) / half_w, z * 0.05],
+                });
+            }
+        }
+        for iz in 0..nz - 1 {
+            for ix in 0..nx - 1 {
+                let a = base + (ix + nx * iz) as u32;
+                let b = base + (ix + 1 + nx * iz) as u32;
+                let c = base + (ix + nx * (iz + 1)) as u32;
+                let d = base + (ix + 1 + nx * (iz + 1)) as u32;
+                // skip cells that are entirely dry (bed above water) to save fill
+                let dry = [a, b, c, d].iter().all(|&i| verts[i as usize].bed > WATER_LEVEL + 0.15);
+                if !dry {
+                    idx.extend_from_slice(&[a, c, b, b, c, d]);
+                }
+            }
         }
     }
     (verts, idx)

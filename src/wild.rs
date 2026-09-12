@@ -9,11 +9,21 @@
 //                a mouthful of health, and a kill-feed line. AI ancestors
 //                catch prey they blunder into; the player hunts on purpose.
 //   Prey Run     A map event: a great herd of stags pours down the rivers.
+//   Glowfish     One per river, rare and quick, swimming the channel. Catch
+//                it (dash in, or wade fast) for the Riverblessing — the
+//                jungle-camp buff of this map: speed, attack speed, mana
+//                regen, and the rivers stop slowing you for 45 s.
 //
 // Everything here is data + arithmetic on the game rng — no render types —
 // so it runs under `cargo test`. Rendering reads `Game::wild` directly.
 
-use crate::consts::{lane_clearance, river_dist, river_x, Team, ARENA_RADIUS, MAP_SCALE};
+use crate::consts::{lane_clearance, river_dist, river_x, water_depth, Team, ARENA_RADIUS, BLESSING_SECS, MAP_SCALE};
+use crate::gods::GodDef;
+
+/// Rainspots and Riptail were born to the rivers: no wading penalty.
+pub fn is_riverborn(def: &GodDef) -> bool {
+    matches!(def.name, "Rainspots" | "Riptail")
+}
 use crate::sim::{Event, Game, Rng};
 use glam::Vec3;
 
@@ -69,6 +79,7 @@ pub fn heal_tree_positions() -> [Vec3; 6] {
 pub enum PreyKind {
     Hare,
     Stag,
+    Glowfish,
 }
 
 impl PreyKind {
@@ -76,24 +87,28 @@ impl PreyKind {
         match self {
             PreyKind::Hare => 22.0,
             PreyKind::Stag => 55.0,
+            PreyKind::Glowfish => 40.0,
         }
     }
     pub fn heal_frac(self) -> f32 {
         match self {
             PreyKind::Hare => 0.05,
             PreyKind::Stag => 0.11,
+            PreyKind::Glowfish => 0.06,
         }
     }
     pub fn speed(self) -> f32 {
         match self {
             PreyKind::Hare => 10.5,
             PreyKind::Stag => 12.5,
+            PreyKind::Glowfish => 8.5,
         }
     }
     pub fn name(self) -> &'static str {
         match self {
             PreyKind::Hare => "a hare",
             PreyKind::Stag => "a stag",
+            PreyKind::Glowfish => "the glowfish",
         }
     }
 }
@@ -115,6 +130,7 @@ pub struct Prey {
 }
 
 pub const PREY_NOTICE: f32 = 9.0;
+pub const GLOWFISH_RESPAWN: f32 = 75.0;
 pub const PREY_POUNCE: f32 = 1.7;
 pub const MAX_PREY: usize = 26;
 pub const PREY_RUN_COUNT: usize = 14;
@@ -126,6 +142,8 @@ pub struct Wild {
     pub next_spawn_t: f32,
     /// total animals caught, per team (for the scoreboard)
     pub caught: [u32; 2],
+    /// per river (west, east): when the next glowfish surfaces
+    pub glowfish_t: [f32; 2],
 }
 
 impl Wild {
@@ -135,6 +153,7 @@ impl Wild {
             prey: Vec::new(),
             next_spawn_t: 12.0,
             caught: [0, 0],
+            glowfish_t: [40.0, 55.0],
         };
         // a few groups already grazing when the match opens
         for _ in 0..4 {
@@ -177,6 +196,23 @@ impl Wild {
                 graze_t: rng.range(1.0, 4.0),
             });
         }
+    }
+
+    /// A glowfish surfaces mid-channel on river `side` (-1 west, 1 east).
+    pub fn spawn_glowfish(&mut self, rng: &mut Rng, side: f32) {
+        let z = rng.range(-60.0, 60.0);
+        let x = river_x(side, z);
+        self.prey.push(Prey {
+            kind: PreyKind::Glowfish,
+            pos: Vec3::new(x, 0.0, z),
+            vel: Vec3::ZERO,
+            yaw: 0.0,
+            fear: 0.0,
+            home: Vec3::new(x, 0.0, z),
+            anim: rng.f32() * 6.0,
+            run: None,
+            graze_t: 0.0,
+        });
     }
 
     /// The Prey Run: a herd of stags enters at the north end of each river
@@ -246,6 +282,19 @@ impl Game {
             }
         }
 
+        for (k, side) in [-1.0f32, 1.0].iter().enumerate() {
+            if self.t >= self.wild.glowfish_t[k] {
+                self.wild.glowfish_t[k] = self.t + GLOWFISH_RESPAWN;
+                let alive = self.wild.prey.iter().any(|p| p.kind == PreyKind::Glowfish && (p.pos.x.signum() == side.signum()));
+                if !alive {
+                    let mut wild = std::mem::take(&mut self.wild);
+                    wild.spawn_glowfish(&mut self.rng, *side);
+                    self.wild = wild;
+                    self.events.push(Event::Announce { text: "A GLOWFISH SURFACES — the river blesses whoever catches it".to_string() });
+                }
+            }
+        }
+
         let hunters: Vec<(usize, Vec3, bool, Team)> = self
             .gods
             .iter()
@@ -283,7 +332,20 @@ impl Game {
                     desired = away * p.kind.speed();
                 }
             }
-            if p.fear <= 0.0 {
+            if p.kind == PreyKind::Glowfish {
+                // swim the channel: drift along the flow, dart when frightened,
+                // always pulled back toward the centreline
+                let side = p.home.x.signum();
+                let cx = river_x(side, p.pos.z);
+                let dir = if p.fear > 0.0 { desired.z.signum() } else { ((p.anim * 0.15).sin()).signum() };
+                let ahead = p.pos.z + dir * 6.0;
+                let target = Vec3::new(river_x(side, ahead), 0.0, ahead);
+                let speed = if p.fear > 0.0 { p.kind.speed() } else { 2.2 };
+                desired = (target - p.pos).normalize_or_zero() * speed + Vec3::new((cx - p.pos.x) * 0.8, 0.0, 0.0);
+                if p.pos.z.abs() > 95.0 {
+                    p.anim += 20.0; // turn around at the ends of the channel
+                }
+            } else if p.fear <= 0.0 {
                 if let Some(side) = p.run {
                     // the run: hug the river, head south, leave the map
                     let ahead = p.pos.z - 14.0;
@@ -307,7 +369,10 @@ impl Game {
             let k = if p.fear > 0.0 { 9.0 } else { 2.5 };
             p.vel += (desired - p.vel) * (k * dt).min(1.0);
             let next = p.pos + p.vel * dt;
-            let blocked = p.run.is_none() && river_dist(next.x, next.z) < 6.5;
+            let blocked = match p.kind {
+                PreyKind::Glowfish => water_depth(next.x, next.z) < 0.25,
+                _ => p.run.is_none() && river_dist(next.x, next.z) < 6.5,
+            };
             if !blocked && next.length() < ARENA_RADIUS + 60.0 {
                 p.pos = next;
             } else {
@@ -331,11 +396,19 @@ impl Game {
                 let g = &mut self.gods[hi];
                 g.gold += gold;
                 g.hp = (g.hp + g.max_hp * p.kind.heal_frac()).min(g.max_hp);
+                if p.kind == PreyKind::Glowfish {
+                    g.blessing_t = BLESSING_SECS;
+                }
             }
             self.wild.caught[team as usize] += 1;
             self.events.push(Event::PreyCaught { pos: p.pos, kind: p.kind, gold });
-            if p.kind == PreyKind::Stag {
-                self.events.push(Event::Kill { killer: name.to_string(), victim: "a stag".to_string(), victim_team: team.other(), is_god: false });
+            match p.kind {
+                PreyKind::Stag => self.events.push(Event::Kill { killer: name.to_string(), victim: "a stag".to_string(), victim_team: team.other(), is_god: false }),
+                PreyKind::Glowfish => {
+                    self.events.push(Event::Kill { killer: name.to_string(), victim: "the glowfish".to_string(), victim_team: team.other(), is_god: false });
+                    self.events.push(Event::Announce { text: format!("{} carries the RIVERBLESSING", name) });
+                }
+                PreyKind::Hare => {}
             }
         }
 
@@ -406,6 +479,50 @@ mod tests {
         assert!(g.wild.prey.len() < n, "pounce range catches (a whole huddle can go at once)");
         assert!(g.gods[0].gold > gold);
         assert!(g.events.iter().any(|e| matches!(e, Event::PreyCaught { .. })));
+    }
+
+    #[test]
+    fn glowfish_swims_the_river_and_blesses_its_catcher() {
+        let mut g = game();
+        for gg in g.gods.iter_mut() {
+            gg.ai = None;
+            gg.pos = Vec3::new(0.0, 0.0, 0.0);
+        }
+        let mut wild = std::mem::take(&mut g.wild);
+        wild.spawn_glowfish(&mut g.rng, 1.0);
+        g.wild = wild;
+        let fi = g.wild.prey.iter().position(|p| p.kind == PreyKind::Glowfish).unwrap();
+        for _ in 0..(20 * 30) {
+            g.prey_tick(1.0 / 30.0);
+            let p = &g.wild.prey[fi];
+            assert!(water_depth(p.pos.x, p.pos.z) > 0.2, "the glowfish must stay in the water: {}", p.pos);
+        }
+        let p = g.wild.prey[fi].pos;
+        g.gods[0].pos = p;
+        g.prey_tick(1.0 / 30.0);
+        assert!(g.gods[0].blessing_t > 0.0, "catching it grants the Riverblessing");
+        // blessed: no wading penalty
+        let slow = g.move_speed(0);
+        g.gods[0].blessing_t = 0.0;
+        let unblessed = g.move_speed(0);
+        assert!(slow > unblessed, "the blessing should carry you through the river: {slow} vs {unblessed}");
+    }
+
+    #[test]
+    fn rivers_slow_wading_but_not_the_riverborn() {
+        let mut g = game();
+        let z = 10.0;
+        let x = river_x(1.0, z);
+        assert!(water_depth(x, z) > 1.0, "mid-channel should be deep: {}", water_depth(x, z));
+        let dry = g.move_speed(0);
+        g.gods[0].pos = Vec3::new(x, 0.0, z);
+        let wading = g.move_speed(0);
+        assert!(wading < dry * 0.75, "wading should cost real speed: {wading} vs {dry}");
+        // put Riptail in slot 0 (the seeded 5v5 may not have picked them)
+        let rip = crate::gods::ROSTER.iter().find(|d| d.name == "Riptail").unwrap().id;
+        g.gods[0].def_id = rip;
+        let born = g.move_speed(0);
+        assert!((born - crate::gods::god(rip).move_speed).abs() < 1e-3, "Riptail wades free: {born}");
     }
 
     #[test]

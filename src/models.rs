@@ -341,6 +341,27 @@ pub fn build_stag() -> VoxelMesh {
     g.mesh(STAG_VOXEL, true)
 }
 
+pub const FISH_VOXEL: f32 = 0.05;
+
+/// The glowfish: a hand-long, lantern-bright river fish (drawn emissive).
+pub fn build_glowfish() -> VoxelMesh {
+    let mut g = Grid::new(8, 8, 16);
+    let (cx, cz) = (4, 8);
+    let body = [0.55, 0.95, 0.85];
+    let fin = [0.35, 0.8, 0.9];
+    g.ellipsoid(cx as f32, 3.5, cz as f32, 1.6, 2.0, 5.0, solid(body));
+    g.ellipsoid(cx as f32, 3.5, cz as f32 + 3.0, 1.2, 1.4, 2.5, solid([0.75, 1.0, 0.9]));
+    // tail fin + dorsal
+    for i in 0..3 {
+        g.set(cx, 2 + i, cz - 6 - i / 2, solid(fin));
+        g.set(cx, 4 + i, cz - 6 - i / 2, solid(fin));
+    }
+    g.filled_box(cx, 5, cz - 2, cx, 6, cz + 1, solid(fin));
+    g.set(cx - 1, 4, cz + 4, solid([0.1, 0.2, 0.2]));
+    g.set(cx + 1, 4, cz + 4, solid([0.1, 0.2, 0.2]));
+    g.mesh(FISH_VOXEL, true)
+}
+
 // ---------------------------------------------------------------------------
 // Heal Tree — Clawbound's sanctuary tree: pale bark, a wide low crown, and
 // glowing seed-fruit that read as a beacon (drawn with emissive).

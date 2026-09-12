@@ -28,6 +28,7 @@ pub struct Scene {
     pub bird: u64,
     pub hare: u64,
     pub stag: u64,
+    pub glowfish: u64,
     pub heal_tree: u64,
     pub heal_fruit: u64,
     pub orb: u64,
@@ -133,6 +134,9 @@ impl Scene {
         let orb = r.upload_mesh(&orb);
         let hare_m = models::build_hare();
         let stag_m = models::build_stag();
+        let fish_m = models::build_glowfish();
+        total += fish_m.inst.len();
+        let glowfish = r.upload_mesh(&fish_m);
         let (tree_m, fruit_m) = models::build_heal_tree();
         total += hare_m.inst.len() + stag_m.inst.len() + tree_m.inst.len() + fruit_m.inst.len();
         let hare = r.upload_mesh(&hare_m);
@@ -159,6 +163,7 @@ impl Scene {
             bird,
             hare,
             stag,
+            glowfish,
             heal_tree,
             heal_fruit,
             orb,
@@ -192,14 +197,23 @@ impl Scene {
             r.queue_draw(self.heal_fruit, m, [1.0; 4], glow, models::HEAL_TREE_VOXEL, false);
         }
 
-        // prey: hares hop, stags trot; both lean into their turns
+        // prey: hares hop, stags trot, the glowfish wriggles just under the
+        // surface and lights the water around it
         for p in &game.wild.prey {
             let speed = p.vel.length();
+            if p.kind == crate::wild::PreyKind::Glowfish {
+                let y = consts::WATER_LEVEL - 0.22 + (p.anim * 1.5).sin() * 0.06;
+                let m = Mat4::from_translation(Vec3::new(p.pos.x, y, p.pos.z))
+                    * Mat4::from_axis_angle(Vec3::Y, -p.yaw + std::f32::consts::FRAC_PI_2 + (p.anim * 3.0).sin() * 0.25)
+                    * Mat4::from_axis_angle(Vec3::Z, (p.anim * 3.0).cos() * 0.15);
+                r.queue_draw(self.glowfish, m, [1.0; 4], 1.4 + (vfx.time * 3.0).sin() * 0.3, models::FISH_VOXEL, false);
+                continue;
+            }
             let (mesh, vsize, hop) = match p.kind {
                 crate::wild::PreyKind::Hare => (self.hare, models::HARE_VOXEL, if speed > 0.5 { (p.anim * 1.6).sin().abs() * 0.22 } else { 0.0 }),
-                crate::wild::PreyKind::Stag => (self.stag, models::STAG_VOXEL, if speed > 0.5 { (p.anim * 1.2).sin().abs() * 0.12 } else { 0.0 }),
+                _ => (self.stag, models::STAG_VOXEL, if speed > 0.5 { (p.anim * 1.2).sin().abs() * 0.12 } else { 0.0 }),
             };
-            let pos = Vec3::new(p.pos.x, crate::render::terrain_height(p.pos.x, p.pos.z).max(0.0) + hop, p.pos.z);
+            let pos = Vec3::new(p.pos.x, crate::render::terrain_height(p.pos.x, p.pos.z).max(consts::WATER_LEVEL - 0.6) + hop, p.pos.z);
             let m = Mat4::from_translation(pos)
                 * Mat4::from_axis_angle(Vec3::Y, -p.yaw + std::f32::consts::FRAC_PI_2)
                 * Mat4::from_axis_angle(Vec3::X, -(speed * 0.02).min(0.25));
@@ -298,7 +312,9 @@ impl Scene {
             let lean = if moving { (g.walk_anim * 2.0).sin() * 0.045 } else { 0.0 };
             let lunge = g.atk_anim * 0.45;
             let fwd = Vec3::new(g.yaw.cos(), 0.0, g.yaw.sin());
-            let pos = g.pos + fwd * lunge + Vec3::Y * bob;
+            // wading: sink toward the bed (capped so the head stays clear)
+            let sink = consts::water_depth(g.pos.x, g.pos.z).min(0.9);
+            let pos = g.pos + fwd * lunge + Vec3::Y * (bob - sink);
             let base = Mat4::from_translation(pos)
                 * Mat4::from_axis_angle(Vec3::Y, g.yaw - std::f32::consts::FRAC_PI_2)
                 * Mat4::from_axis_angle(Vec3::Z, lean);
@@ -505,9 +521,33 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh) {
         }
         v += 1;
     }
-    for _ in 0..22 {
+    for _ in 0..46 {
         if let Some((x, z)) = jungle_spot(&mut rng, 7.0) {
             put!(props::rock(0.7 + rng.f32() * 0.6), x, z, 0.0, 0, V_MED);
+        }
+        v += 1;
+    }
+    // boulder clusters: in the jungle, and worn ones along the river banks
+    for _ in 0..18 {
+        if let Some((x, z)) = jungle_spot(&mut rng, 8.0) {
+            put!(props::boulder_cluster(0.8 + rng.f32() * 0.5, v), x, z, 0.0, (v % 4) as u8, V_MED);
+        }
+        v += 1;
+    }
+    for _ in 0..40 {
+        let a = rng.f32() * std::f32::consts::TAU;
+        let r = 20.0 + rng.f32() * (ARENA_RADIUS - 30.0);
+        let (x, z) = (a.cos() * r, a.sin() * r);
+        let rd = consts::river_dist(x, z);
+        if rd > 6.5 && rd < 10.5 && consts::lane_clearance(x, z) > 7.0 {
+            put!(props::boulder_cluster(0.55 + rng.f32() * 0.4, v), x, z, terrain_height(x, z) - 0.3, (v % 4) as u8, V_MED);
+        }
+        v += 1;
+    }
+    // vine curtains strung between the trees
+    for _ in 0..34 {
+        if let Some((x, z)) = jungle_spot(&mut rng, 6.5) {
+            put!(props::vine_curtain(v), x, z, 0.0, (v % 4) as u8, V_MED);
         }
         v += 1;
     }

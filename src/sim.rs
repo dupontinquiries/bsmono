@@ -123,6 +123,9 @@ pub struct GodUnit {
     pub buff_atkspd: f32,
     pub buff_ms: f32,
     pub buff_t: f32,
+    /// Riverblessing (from a glowfish): seconds left. Grants speed, attack
+    /// speed, mana regen, and free passage through the rivers.
+    pub blessing_t: f32,
     pub slow: f32,
     pub slow_t: f32,
     pub respawn_t: f32,
@@ -293,6 +296,7 @@ impl Game {
                 buff_atkspd: 0.0,
                 buff_ms: 0.0,
                 buff_t: 0.0,
+                blessing_t: 0.0,
                 slow: 0.0,
                 slow_t: 0.0,
                 respawn_t: 0.0,
@@ -440,13 +444,18 @@ impl Game {
     pub fn move_speed(&self, i: usize) -> f32 {
         let g = &self.gods[i];
         let def = self.def(i);
-        let base = def.move_speed * (1.0 + g.ms_bonus + g.buff_ms);
-        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id)
+        let bless = if g.blessing_t > 0.0 { BLESSING_MS } else { 0.0 };
+        let base = def.move_speed * (1.0 + g.ms_bonus + g.buff_ms + bless);
+        // wading: the rivers are slow going unless you were born to them
+        let depth = water_depth(g.pos.x, g.pos.z);
+        let wade = if g.blessing_t > 0.0 || crate::wild::is_riverborn(def) { 1.0 } else { wade_speed_mul(depth) };
+        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade
     }
 
     pub fn auto_interval(&self, i: usize) -> f32 {
         let g = &self.gods[i];
-        self.def(i).auto_cd / (1.0 + g.atk_speed + g.buff_atkspd)
+        let bless = if g.blessing_t > 0.0 { BLESSING_AS } else { 0.0 };
+        self.def(i).auto_cd / (1.0 + g.atk_speed + g.buff_atkspd + bless)
     }
 
     pub fn auto_damage(&self, i: usize) -> f32 {

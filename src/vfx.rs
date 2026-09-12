@@ -55,6 +55,19 @@ pub struct Vfx {
     leaves: Vec<Particle>,
     leaf_spots: Vec<Vec3>,
     seeded: bool,
+    /// ground-bird flocks that flush when an ancestor comes close
+    flocks: Vec<Flock>,
+}
+
+/// A handful of small birds pecking at a jungle spot. When flushed they burst
+/// upward, wheel once, and settle at a new spot.
+pub struct Flock {
+    pub anchor: Vec3,
+    pub next_anchor: Vec3,
+    pub n: usize,
+    /// 0 = grounded; rises to 1 on flush and decays as they land
+    pub flight: f32,
+    pub phase: f32,
 }
 
 impl Vfx {
@@ -84,6 +97,17 @@ impl Vfx {
                 continue;
             }
             self.leaf_spots.push(Vec3::new(x, 0.0, z));
+        }
+        let mut tries = 0usize;
+        while self.flocks.len() < 9 && tries < 400 {
+            tries += 1;
+            let a = rng.f32() * std::f32::consts::TAU;
+            let r = 24.0 + rng.f32() * 100.0;
+            let p = Vec3::new(a.cos() * r, 0.0, a.sin() * r);
+            if crate::consts::lane_clearance(p.x, p.z) < 7.0 || crate::consts::river_dist(p.x, p.z) < 7.0 {
+                continue;
+            }
+            self.flocks.push(Flock { anchor: p, next_anchor: p, n: 4 + (rng.next_u() % 4) as usize, flight: 0.0, phase: rng.f32() * 6.0 });
         }
         for i in 0..26 {
             let spot = self.leaf_spots[i % self.leaf_spots.len().max(1)];
@@ -120,6 +144,34 @@ impl Vfx {
                     lf.pos = spot + Vec3::new(0.0, 4.5 + (i % 5) as f32 * 1.3, 0.0);
                 }
                 lf.life = 8.0 + (i % 7) as f32;
+            }
+        }
+
+        // ground birds: flush when anything comes within 6 u, land elsewhere
+        for (k, f) in self.flocks.iter_mut().enumerate() {
+            f.phase += dt;
+            let threatened = game.gods.iter().any(|g| g.respawn_t <= 0.0 && g.pos.distance(f.anchor) < 6.0)
+                || game.wild.prey.iter().any(|p| p.fear > 0.0 && p.pos.distance(f.anchor) < 4.0);
+            if threatened && f.flight <= 0.0 {
+                f.flight = 1.0;
+                // pick a landing spot a little way off, clear of lanes and water
+                let mut best = f.anchor + Vec3::new(9.0, 0.0, 6.0);
+                for j in 0..8 {
+                    let a = (k * 7 + j) as f32 * 0.9 + self.time;
+                    let cand = f.anchor + Vec3::new(a.cos(), 0.0, a.sin()) * 14.0;
+                    if crate::consts::lane_clearance(cand.x, cand.z) > 6.0 && crate::consts::river_dist(cand.x, cand.z) > 6.0 && cand.length() < 140.0 {
+                        best = cand;
+                        break;
+                    }
+                }
+                f.next_anchor = best;
+            }
+            if f.flight > 0.0 {
+                f.flight -= dt * 0.22;
+                if f.flight <= 0.0 {
+                    f.flight = 0.0;
+                    f.anchor = f.next_anchor;
+                }
             }
         }
 
@@ -470,6 +522,55 @@ impl Vfx {
         let atm = game.weather.atmosphere();
         self.precipitation(&mut out, cam_eye, &atm);
 
+        // --- the rivers: gelatin blobs, wading splashes, fish, dragonflies --
+        self.river_life(&mut out, cam_eye, game, &atm);
+
+        // --- ground birds ----------------------------------------------------
+        for f in &self.flocks {
+            let fl = f.flight;
+            // arc: up fast, wheel, glide down to the next anchor
+            let t = 1.0 - fl; // 0 at flush, 1 at landing
+            let ease = t * t * (3.0 - 2.0 * t);
+            let centre = f.anchor.lerp(f.next_anchor, ease);
+            let lift = if fl > 0.0 { (t * std::f32::consts::PI).sin() * 7.0 } else { 0.0 };
+            for i in 0..f.n {
+                let s = i as f32;
+                let (px, pz, py, flap) = if fl > 0.0 {
+                    let a = self.time * 2.4 + s * 1.3;
+                    (a.cos() * (1.6 + s * 0.2), a.sin() * (1.6 + s * 0.2), lift + (a * 2.0).sin() * 0.5 + s * 0.15, (self.time * 18.0 + s).sin())
+                } else {
+                    // pecking: tiny hops
+                    let hop = ((self.time * 3.0 + f.phase + s * 0.7).sin() * 0.5 + 0.5).powf(6.0) * 0.25;
+                    ((s * 1.7).cos() * 1.2, (s * 2.3).sin() * 1.2, 0.1 + hop, 0.0)
+                };
+                let p = Vec3::new(centre.x + px, crate::render::terrain_height(centre.x + px, centre.z + pz).max(0.0) + py, centre.z + pz);
+                let dark = [0.12, 0.1, 0.09, 1.0];
+                out.push(VoxInst { off_ao: [p.x, p.y, p.z, 1.0], color: dark, misc: [0.16, 0.0, 0.0, 0.0] });
+                // wings: two cubes that beat when flying
+                let w = 0.14 + flap.abs() * 0.1;
+                out.push(VoxInst { off_ao: [p.x - 0.16, p.y + flap * 0.08, p.z, 1.0], color: dark, misc: [w, 0.0, 0.0, 0.0] });
+                out.push(VoxInst { off_ao: [p.x + 0.16, p.y + flap * 0.08, p.z, 1.0], color: dark, misc: [w, 0.0, 0.0, 0.0] });
+                // a red-breasted one per flock
+                if i == 0 {
+                    out.push(VoxInst { off_ao: [p.x, p.y - 0.04, p.z + 0.08, 1.0], color: [0.85, 0.3, 0.2, 1.0], misc: [0.1, 0.0, 0.0, 0.0] });
+                }
+            }
+        }
+
+        // --- glow-moths around the heal trees (denser at night) --------------
+        for (ti, tree) in game.wild.trees.iter().enumerate() {
+            let n = 6 + (atm.night * 10.0) as usize;
+            for i in 0..n {
+                let s = (ti * 31 + i) as f32;
+                let a = self.time * (0.5 + (s * 0.37).fract() * 0.4) + s;
+                let r = 2.5 + (s * 0.61).fract() * 3.5;
+                let y = 3.0 + (self.time * 1.3 + s).sin() * 1.2 + (s * 0.23).fract() * 3.0;
+                let p = tree.pos + Vec3::new(a.cos() * r, y, a.sin() * r);
+                let pulse = 0.5 + 0.5 * (self.time * 4.0 + s).sin();
+                out.push(VoxInst { off_ao: [p.x, p.y, p.z, 1.0], color: [1.0, 0.92, 0.6, 0.55 + pulse * 0.4], misc: [0.11, 0.0, 0.0, 0.0] });
+            }
+        }
+
         // --- Sweetrain: a slow ring of rain-light marking the mended ground
         if let Some(a) = &game.map_events.active {
             use crate::map_events::MapEventKind as K;
@@ -664,6 +765,128 @@ impl Vfx {
 }
 
 impl Vfx {
+    /// River life near the camera: translucent gelatin blobs riding the
+    /// surface (the "liquid" read of the water), splash rings around waders,
+    /// dark fish silhouettes under the surface with the odd leap, and
+    /// dragonflies stitching the air above the channel. All stateless.
+    fn river_life(&self, out: &mut Vec<VoxInst>, eye: Vec3, game: &Game, atm: &crate::weather::Atmosphere) {
+        use crate::consts::{river_x, water_depth, WATER_LEVEL};
+        let t = self.time;
+        // only the river nearest the camera, only the stretch in view range
+        let side = if eye.x < 0.0 { -1.0 } else { 1.0 };
+        let z0 = eye.z - 42.0;
+        // gelatin blobs: one every ~1.4 u of channel, jittered across it,
+        // bobbing on a wave phase, squashing as they crest
+        let mut k = 0;
+        let mut z = z0;
+        while z < eye.z + 42.0 {
+            let s = k as f32 + (z0 / 1.4).floor() * 0.0; // stable per-cell seed
+            let cellz = (z / 1.4).floor();
+            let h1 = rnd_jitter(cellz * 1.37);
+            let h2 = rnd_jitter(cellz * 2.91 + 5.0);
+            let cx = river_x(side, z);
+            let x = cx + h1 * 3.6;
+            let zz = cellz * 1.4 + h2 * 0.6;
+            let depth = water_depth(x, zz);
+            if depth > 0.15 {
+                let wave = (zz * 1.6 - t * 2.6).sin() * 0.06 + (x * 1.3 + zz * 0.7 - t * 1.7).sin() * 0.04;
+                let y = WATER_LEVEL + wave + 0.08;
+                let sq = 0.22 + wave * 1.2; // crests flatten, troughs bead up
+                let a = 0.32 + 0.2 * (t * 1.9 + h1 * 9.0).sin().abs();
+                let col = [0.55, 0.85, 0.95, a * (1.0 - atm.night * 0.5)];
+                out.push(VoxInst { off_ao: [x, y, zz, 1.0], color: col, misc: [sq, 0.0, 0.0, 0.0] });
+                // a smaller bead trailing downstream
+                out.push(VoxInst { off_ao: [x + h2 * 0.3, y - 0.04, zz - 0.35, 1.0], color: [0.7, 0.95, 1.0, a * 0.7], misc: [sq * 0.6, 0.0, 0.0, 0.0] });
+                // fish: every 4th cell, a dark sliver swimming with the flow
+                if k % 4 == 0 {
+                    let fz = zz - ((t * 2.2 + h1 * 10.0) % 8.0) + 4.0;
+                    let fx = river_x(side, fz) + h2 * 2.0;
+                    if water_depth(fx, fz) > 0.6 {
+                        // the leap: once every ~12 s per fish, a short arc above the surface
+                        let leap_ph = (t * 0.083 + h1 * 3.0).fract();
+                        let jump = if leap_ph < 0.09 { (leap_ph / 0.09 * std::f32::consts::PI).sin() * 1.1 } else { 0.0 };
+                        let fy = WATER_LEVEL - 0.35 + jump + (t * 3.0 + h2).sin() * 0.05;
+                        let fc = if jump > 0.0 { [0.75, 0.8, 0.7, 0.95] } else { [0.05, 0.12, 0.12, 0.55] };
+                        out.push(VoxInst { off_ao: [fx, fy, fz, 1.0], color: fc, misc: [0.14, 0.0, 0.0, 0.0] });
+                        out.push(VoxInst { off_ao: [fx + h2 * 0.05, fy, fz - 0.16, 1.0], color: fc, misc: [0.12, 0.0, 0.0, 0.0] });
+                        out.push(VoxInst { off_ao: [fx, fy + 0.02, fz - 0.3, 1.0], color: fc, misc: [0.09, 0.0, 0.0, 0.0] });
+                        if jump > 0.9 {
+                            // splash droplets at the top of the leap
+                            for j in 0..4 {
+                                let a = j as f32 * 1.57 + t;
+                                out.push(VoxInst { off_ao: [fx + a.cos() * 0.3, WATER_LEVEL + 0.2 + (a * 2.0).sin().abs() * 0.3, fz + a.sin() * 0.3, 1.0], color: [0.8, 0.9, 1.0, 0.7], misc: [0.07, 0.0, 0.0, 0.0] });
+                            }
+                        }
+                    }
+                }
+                // dragonflies: every 7th cell, darting above the water by day
+                if k % 7 == 3 && atm.night < 0.6 && atm.rain < 0.3 {
+                    let dart = ((t * 0.7 + h2 * 4.0).sin() * 0.5 + 0.5).powf(3.0);
+                    let dx = x + (t * 1.1 + h1 * 6.0).sin() * 2.0 * dart;
+                    let dz = zz + (t * 0.9 + h2 * 6.0).cos() * 2.5 * dart;
+                    let dy = WATER_LEVEL + 1.1 + (t * 2.7 + h1).sin() * 0.3;
+                    let body = [0.2, 0.55, 0.75, 0.95];
+                    out.push(VoxInst { off_ao: [dx, dy, dz, 1.0], color: body, misc: [0.07, 0.0, 0.0, 0.0] });
+                    out.push(VoxInst { off_ao: [dx, dy, dz - 0.12, 1.0], color: body, misc: [0.05, 0.0, 0.0, 0.0] });
+                    let wing = [0.8, 0.9, 1.0, 0.35 + (t * 40.0).sin().abs() * 0.2];
+                    out.push(VoxInst { off_ao: [dx - 0.12, dy + 0.02, dz, 1.0], color: wing, misc: [0.14, 0.0, 0.0, 0.0] });
+                    out.push(VoxInst { off_ao: [dx + 0.12, dy + 0.02, dz, 1.0], color: wing, misc: [0.14, 0.0, 0.0, 0.0] });
+                }
+                let _ = s;
+            }
+            k += 1;
+            z += 1.4;
+        }
+
+        // wading: rings of beads around anyone in the water, faster when moving
+        for g in game.gods.iter().chain(std::iter::empty()) {
+            if g.respawn_t > 0.0 {
+                continue;
+            }
+            let d = water_depth(g.pos.x, g.pos.z);
+            if d < 0.15 {
+                continue;
+            }
+            let moving = g.move_dir.length_squared() > 0.01;
+            let n = if moving { 14 } else { 8 };
+            let spread = if moving { 1.4 } else { 0.9 };
+            for i in 0..n {
+                let a = i as f32 / n as f32 * std::f32::consts::TAU + t * 0.8;
+                let ph = (t * (if moving { 3.5 } else { 1.6 }) + i as f32 * 0.9).fract();
+                let r = 0.5 + ph * spread;
+                let y = WATER_LEVEL + 0.05 + (1.0 - ph) * 0.12;
+                out.push(VoxInst { off_ao: [g.pos.x + a.cos() * r, y, g.pos.z + a.sin() * r, 1.0], color: [0.8, 0.95, 1.0, (1.0 - ph) * 0.6], misc: [0.12 + (1.0 - ph) * 0.08, 0.0, 0.0, 0.0] });
+            }
+            // a spray of beads kicked up ahead when moving
+            if moving {
+                let f = g.move_dir.normalize_or_zero();
+                for i in 0..5 {
+                    let ph = (t * 4.0 + i as f32 * 0.37).fract();
+                    let p = g.pos + f * (0.6 + ph * 0.8) + Vec3::Y * (WATER_LEVEL - g.pos.y + 0.1 + (ph * std::f32::consts::PI).sin() * 0.6);
+                    out.push(VoxInst { off_ao: [p.x + rnd_jitter(i as f32 + 3.0) * 0.3, p.y, p.z, 1.0], color: [0.85, 0.95, 1.0, 0.7 * (1.0 - ph)], misc: [0.1, 0.0, 0.0, 0.0] });
+                }
+            }
+        }
+        // prey wading too (the run pours down the river)
+        for p in &game.wild.prey {
+            if p.kind == crate::wild::PreyKind::Glowfish {
+                // its own halo of beads
+                for i in 0..6 {
+                    let a = i as f32 * 1.047 + t * 1.5;
+                    out.push(VoxInst { off_ao: [p.pos.x + a.cos() * 0.6, WATER_LEVEL + 0.06, p.pos.z + a.sin() * 0.6, 1.0], color: [0.6, 1.0, 0.9, 0.5], misc: [0.09, 0.0, 0.0, 0.0] });
+                }
+                continue;
+            }
+            if water_depth(p.pos.x, p.pos.z) > 0.15 && p.vel.length_squared() > 1.0 {
+                for i in 0..4 {
+                    let ph = (t * 3.0 + i as f32 * 0.5).fract();
+                    let a = i as f32 * 1.57 + t;
+                    out.push(VoxInst { off_ao: [p.pos.x + a.cos() * (0.3 + ph * 0.6), WATER_LEVEL + 0.1, p.pos.z + a.sin() * (0.3 + ph * 0.6), 1.0], color: [0.8, 0.95, 1.0, 0.5 * (1.0 - ph)], misc: [0.1, 0.0, 0.0, 0.0] });
+                }
+            }
+        }
+    }
+
     /// Stateless rain / snow: drops are hashed from (cell, time) in a box
     /// around the camera. Rain: two stacked slivers per drop, leaning with the
     /// wind, falling fast. Snow: single flakes, drifting on the wind.

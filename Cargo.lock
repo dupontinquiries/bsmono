@@ -316,6 +316,7 @@ dependencies = [
  "egui-winit",
  "glam",
  "image",
+ "naga",
  "pollster",
  "wgpu",
  "winit",

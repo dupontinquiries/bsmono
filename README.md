@@ -34,6 +34,23 @@ no third-party trademarks or assets.
   **Thunder Front** (lightning strikes the lanes, hurts whoever it lands on),
   **The Long Winter** (snow; everyone slows 12 % except Snowhush),
   **Elder's Bounty** (kill gold ×2). A HUD chip shows the sky + active event.
+- **The living jungle** (`src/wild.rs`) — six **Heal Trees** (rest 4 s out of
+  combat beneath one to mend HP + mana; Sweetrain doubles it; the fruit glows
+  while it works). **Hares and stags** graze in groups, bolt when noticed, and
+  are *caught* by getting within pounce range — dashes are the hunting tool —
+  for gold and a mouthful of health. AI ancestors hunt when hurt and
+  unthreatened. The **glowfish** surfaces once a minute per river; catch it for
+  the **Riverblessing** (+12 % speed, +10 % attack speed, mana regen, and free
+  passage through the rivers for 45 s) — this map's jungle-camp buff.
+- **Rivers you can feel** — a stylized liquid surface (`shaders/water.wgsl`):
+  flow-aligned wave trains, depth-shaded from clear shallows to a dark
+  channel, bank foam, sparkling sun glints, rain rings. Voxel "gelatin" beads
+  ride the surface, waders throw splash rings, fish leap, dragonflies stitch
+  the air. Wading costs up to 40 % speed by depth; Rainspots and Riptail are
+  riverborn and wade free.
+- **Ambient life** — ground-bird flocks that flush when you come near and
+  settle elsewhere, glow-moths around the heal trees at night, fireflies that
+  come out under cloud, sky birds that scatter at lightning and roost at night.
 - **100-item shop** in 8 stat categories, three tiers, 8 stacking items. AI
   ancestors auto-buy role-appropriate builds.
 - **Character select** with live offscreen-rendered voxel portraits, legend,
@@ -41,10 +58,13 @@ no third-party trademarks or assets.
 - **Full HUD**: ability bar with cooldown sweeps, HP/MP/XP bars, gold + 6 item
   slots, kill feed, announcements, floating damage numbers, world-space HP
   bars, 3-lane minimap, hold-Tab scoreboard, death/victory/defeat screens.
-- **Rendering**: MSAA×4, PCF shadow maps that follow the (weather-driven) sun,
-  heightmap cliff bowl, decorative props, weather sky with stars and moon,
-  fog, bloom, ACES tonemap + vignette + grain. Ancestor bodies are meshed at
-  0.05 u voxels (2× the linear density of the previous humanoids).
+- **Rendering**: MSAA×4, PCF shadow maps that follow the (weather-driven,
+  slowly arcing) sun, a 1.6 u heightmap with per-material fragment detail
+  (grass tufts, cracked dirt with pebbles and ruts, pebbled riverbed with
+  algae, rippled sand, strata rock), snow cover, boulder clusters and vine
+  curtains among the flora, weather sky with stars and moon, fog, bloom, ACES
+  tonemap + vignette + grain. Ancestor bodies are meshed at 0.05 u voxels
+  (2× the linear density of the previous humanoids).
 
 ## Build & Run
 
@@ -52,8 +72,10 @@ Requirements: Rust 1.75+, a GPU with Vulkan (or GL).
 
 ```bash
 cargo run --release          # windowed game
-cargo test                   # headless game-logic suite (roster, items, lanes, sim, weather, map events)
+cargo test                   # 25 tests: roster, items, lanes, sim, weather, map events, wildlife,
+                             #   plus offline WGSL validation of every shader with naga
 cargo run -- --screenshot    # headless demo: renders PNG screenshots (no window)
+cargo run --example simdbg   # 120 s AI-only match trace (economy, events, weather, hunt tally)
 ```
 
 On minimal-X systems winit may also need `libxkbcommon-x11` + `libxcb-xkb`.
@@ -97,6 +119,7 @@ src/
 ├── items.rs       the 100-item catalog, stat model, stacking rules, AI builds
 ├── weather.rs     weather state machine → `Atmosphere` sample (plain numbers)
 ├── map_events.rs  event scheduler + effects; `speed_mul` / `gold_mul` hooks
+├── wild.rs        heal trees, prey (hare / stag / glowfish), the hunt, Riverblessing
 ├── sim.rs         entities, economy, damage pipeline, kills
 ├── systems.rs     tick: waves, movement, auto-attacks, projectiles, zones, sky
 ├── abilities.rs   cast execution for all 13 archetypes
@@ -107,22 +130,24 @@ src/
 ├── props.rs       trees, rocks, crystals, gates, fountains, pedestals
 ├── vfx.rs         events → voxel particles; stateless rain/snow; event visuals
 ├── scene.rs       uploads meshes once, records per-frame draw calls
-├── render.rs      wgpu pipelines: shadow → HDR MSAA scene → bloom/ACES post
+├── render.rs      wgpu pipelines: shadow → HDR MSAA scene (terrain, water) → post
 ├── ui.rs          egui: menus, ancestor select, HUD, sky chip, minimap, shop
 ├── app.rs         winit window + pointer-lock controls + fixed-step sim
 └── headless.rs    windowless screenshot harness (CI / software Vulkan)
-shaders/           voxel, shadow, terrain, sky, post (WGSL) — all read the
-                   weather block of the frame uniform
-tests/             catalog, roster, lanes, mitigation, Elder gate, 120s sim
+shaders/           voxel, shadow, terrain, water, sky, post (WGSL) — all read
+                   the weather block of the frame uniform
+tests/             catalog, roster, lanes, mitigation, Elder gate, 120s sim,
+                   naga validation of every shader + uniform layout sizes
 ```
 
 Rendering pipeline per frame:
 
 1. **Shadow pass** — every opaque voxel draw into a 2048² depth map from the
    current sun direction.
-2. **Scene pass** (HDR, RGBA16F, MSAA×4) — sky → terrain (wet-ground specular,
-   puddles) → opaque voxels → transparent voxels + up to 48k dynamic VFX cubes
-   (including the weather field around the camera).
+2. **Scene pass** (HDR, RGBA16F, MSAA×4) — sky → terrain (material detail,
+   wet-ground specular, puddles, snow) → opaque voxels → water surface (alpha,
+   depth read-only) → transparent voxels + up to 48k dynamic VFX cubes
+   (weather field, river life, birds, moths).
 3. **Post pass** — 24-tap single-pass bloom, lightning flash, ACES tonemap,
    night grade, lens rain, vignette, grain.
 4. **egui pass** — HUD/menus over the frame.

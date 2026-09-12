@@ -36,6 +36,29 @@ pub fn river_dist(x: f32, z: f32) -> f32 {
     (x - river_x(-1.0, z)).abs().min((x - river_x(1.0, z)).abs())
 }
 
+/// Still-water surface height. The riverbed dips below it (see
+/// `render::terrain_height`); the banks rise above it.
+pub const WATER_LEVEL: f32 = -0.30;
+/// Deepest the bed goes below the water, mid-channel.
+pub const RIVER_DEPTH: f32 = 2.1;
+
+/// How deep the water is at (x, z), in world units (0 on dry ground).
+pub fn water_depth(x: f32, z: f32) -> f32 {
+    (WATER_LEVEL - crate::render::terrain_height(x, z)).max(0.0)
+}
+
+/// Riverblessing: what a caught glowfish grants, and for how long.
+pub const BLESSING_SECS: f32 = 45.0;
+pub const BLESSING_MS: f32 = 0.12;
+pub const BLESSING_AS: f32 = 0.10;
+pub const BLESSING_MP_PER_S: f32 = 0.01; // fraction of max mana
+
+/// Movement multiplier for wading: waist-deep water costs ~40 %. Riverborn
+/// ancestors and anyone carrying the Riverblessing ignore it.
+pub fn wade_speed_mul(depth: f32) -> f32 {
+    1.0 - 0.40 * (depth / 1.2).clamp(0.0, 1.0)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Team {
     Blue = 0,

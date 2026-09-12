@@ -391,6 +391,9 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
             let left = (a.until - game.t).max(0.0);
             line = format!("{}   ·   {} {:.0}s", line, a.kind.name(), left);
         }
+        if g.blessing_t > 0.0 {
+            line = format!("{}   ·   RIVERBLESSED {:.0}s", line, g.blessing_t);
+        }
         egui::Area::new(egui::Id::new("skychip")).anchor(egui::Align2::CENTER_TOP, [0.0, 8.0]).show(ctx, |ui| {
             let (r, _) = ui.allocate_exact_size(Vec2::new(line.len() as f32 * 7.4 + 24.0, 22.0), Sense::hover());
             ui.painter().rect_filled(r, 6.0, Color32::from_rgba_premultiplied(12, 12, 18, 170));
@@ -647,6 +650,7 @@ pub fn draw_scoreboard(ctx: &egui::Context, game: &Game) {
             ui.heading(egui::RichText::new("SCOREBOARD").size(20.0).color(GOLD));
             for team in [Team::Blue, Team::Red] {
                 ui.label(egui::RichText::new(if team == Team::Blue { "— ORDER (BLUE) —" } else { "— CHAOS (RED) —" }).size(15.0).color(col(team)));
+                ui.label(egui::RichText::new(format!("hunt: {} animals caught", game.wild.caught[team as usize])).size(12.0).color(Color32::from_rgb(170, 168, 158)));
                 egui::Grid::new(format!("grid{}", team as usize)).num_columns(7).spacing([14.0, 3.0]).show(ui, |ui| {
                     ui.monospace("Ancestor");
                     ui.monospace("Lv");

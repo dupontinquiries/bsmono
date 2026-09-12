@@ -27,6 +27,7 @@ struct VSIn {
     @location(0) pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
+    @location(3) mat: f32,
 };
 
 struct VSOut {
@@ -35,7 +36,66 @@ struct VSOut {
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
     @location(3) shadow_pos: vec4<f32>,
+    @location(4) mat: f32,
 };
+
+fn noise2(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = hash21(i);
+    let b = hash21(i + vec2(1.0, 0.0));
+    let c = hash21(i + vec2(0.0, 1.0));
+    let d = hash21(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// Per-material sub-metre detail. Returns an albedo multiplier (around 1)
+// and a small normal perturbation so the detail catches the sun.
+// mat: 0 grass, 1 dirt lane, 2 riverbed, 3 sand, 4 outcrop, 5 mountain, 6 moss
+fn detail(p: vec2<f32>, m: f32, dist: f32) -> vec4<f32> {
+    // fade the detail out with distance so it never shimmers
+    let fade = smoothstep(120.0, 20.0, dist);
+    var mul = 1.0;
+    var bump = vec2(0.0);
+    if (m < 0.5 || m > 5.5) {
+        // grass / moss: fine blade speckle + broad tuft variation
+        let n1 = noise2(p * 3.1);
+        let n2 = noise2(p * 11.0 + 4.0);
+        let n3 = noise2(p * 0.55 + 9.0);
+        mul = 0.86 + n1 * 0.16 + (n2 - 0.5) * 0.14 + (n3 - 0.5) * 0.12;
+        bump = vec2(n2 - 0.5, noise2(p * 11.0 + 21.0) - 0.5) * 0.10;
+    } else if (m < 1.5) {
+        // dirt: cracks (thin dark lines from a cellular-ish noise), pebbles, ruts
+        let n1 = noise2(p * 1.7);
+        let crack = smoothstep(0.02, 0.0, abs(n1 - 0.5) - 0.01) * 0.35;
+        let peb = step(0.965, hash21(floor(p * 6.0))) * 0.22;
+        let rut = (noise2(vec2(p.x * 0.9, p.y * 0.2) + 3.0) - 0.5) * 0.14;
+        mul = 0.94 - crack + peb + rut + (noise2(p * 5.0) - 0.5) * 0.10;
+        bump = vec2(noise2(p * 5.0 + 1.0) - 0.5, noise2(p * 5.0 + 2.0) - 0.5) * 0.12 + vec2(peb, peb) * 0.3;
+    } else if (m < 2.5) {
+        // riverbed: rounded pebbles, darker between, a green algae film
+        let cell = floor(p * 2.6);
+        let cc = (cell + 0.5 + vec2(hash21(cell), hash21(cell + 7.0)) * 0.5 - 0.25) / 2.6;
+        let dd = distance(p, cc);
+        let pebble = smoothstep(0.19, 0.11, dd);
+        let algae = smoothstep(0.55, 0.8, noise2(p * 0.8 + 13.0)) * 0.3;
+        mul = 0.78 + pebble * 0.42 - algae;
+        bump = normalize(p - cc + vec2(0.0001)) * pebble * 0.35;
+    } else if (m < 3.5) {
+        // sand: ripples along the bank + grain
+        let rip = sin(p.x * 5.0 + noise2(p * 0.7) * 6.0) * 0.5 + 0.5;
+        mul = 0.92 + rip * 0.12 + (noise2(p * 14.0) - 0.5) * 0.10;
+        bump = vec2(cos(p.x * 5.0) * 0.08, 0.0);
+    } else {
+        // rock: strata + chips
+        let strata = sin(p.y * 2.0 + noise2(p * 0.9) * 4.0) * 0.5 + 0.5;
+        let chip = step(0.94, hash21(floor(p * 4.0))) * 0.25;
+        mul = 0.85 + strata * 0.2 + chip + (noise2(p * 7.0) - 0.5) * 0.12;
+        bump = vec2(noise2(p * 7.0 + 5.0) - 0.5, noise2(p * 7.0 + 6.0) - 0.5) * 0.2;
+    }
+    return vec4(mix(1.0, mul, fade), bump * fade, 0.0);
+}
 
 @vertex
 fn vs_main(in: VSIn) -> VSOut {
@@ -46,12 +106,15 @@ fn vs_main(in: VSIn) -> VSOut {
     out.normal = in.normal;
     out.color = in.color;
     out.shadow_pos = frame.light_view_proj * w;
+    out.mat = in.mat;
     return out;
 }
 
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
-    let N = normalize(in.normal);
+    let cam_d = distance(in.world, frame.cam_pos.xyz);
+    let det = detail(in.world.xz, in.mat, cam_d);
+    let N = normalize(in.normal + vec3(det.y, 0.0, det.z));
     let sun = normalize(frame.sun_dir.xyz);
     let ndl = max(dot(N, sun), 0.0);
 
@@ -86,7 +149,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let wet = frame.weather.z;
     let pud = smoothstep(0.55, 0.8, hash21(floor(in.world.xz * 0.35)) * 0.5 + 0.5 * hash21(floor(in.world.xz * 0.9 + 3.1)));
     let wetness = wet * (0.55 + 0.45 * pud);
-    var albedo = in.color * (1.0 - 0.32 * wetness);
+    var albedo = in.color * det.x * (1.0 - 0.32 * wetness);
     // snow cover settles on up-facing ground, patchy by the same noise as the puddles
     let snow = frame.weather.y;
     let snow_cov = snow * smoothstep(0.35, 0.9, N.y) * (0.6 + 0.4 * (1.0 - pud));

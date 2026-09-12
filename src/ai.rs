@@ -239,6 +239,36 @@ pub fn think(game: &mut Game, gi: usize) {
         }
     }
 
+    // the hunt: hurt, with no enemy ancestor in sight and prey close by,
+    // an ancestor breaks off to chase it (a mouthful of health + gold). If a
+    // dash is off cooldown and the animal is in range, pounce with it.
+    if hp_frac < 0.6 && state != AiState::Fight {
+        let enemy_near = (0..game.gods.len()).any(|j| game.gods[j].team != team && game.gods[j].respawn_t <= 0.0 && game.gods[j].pos.distance(g.pos) < 16.0);
+        if !enemy_near {
+            let mut best: Option<(f32, Vec3)> = None;
+            for p in &game.wild.prey {
+                let d = p.pos.distance(g.pos);
+                let reach = if p.kind == crate::wild::PreyKind::Glowfish { 14.0 } else { 9.0 };
+                if d < reach && best.map_or(true, |(bd, _)| d < bd) {
+                    best = Some((d, p.pos));
+                }
+            }
+            if let Some((d, pp)) = best {
+                let lead = pp + Vec3::new(pp.x - g.pos.x, 0.0, pp.z - g.pos.z).normalize_or_zero() * 1.5;
+                move_dir = Vec3::new(lead.x - g.pos.x, 0.0, lead.z - g.pos.z).normalize_or_zero();
+                if cast_req.is_none() {
+                    for slot in 0..4u32 {
+                        if let crate::gods::Archetype::Dash { dist, .. } = def.abilities[slot as usize].arch {
+                            if game.gods[gi].cds[slot as usize] <= 0.0 && d < dist * 0.9 && d > 2.5 && !def.abilities[slot as usize].ult {
+                                cast_req = Some((slot, lead));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // avoid enemy fountain when retreating through
     let enemy_f = team.other().fountain();
     if g.pos.distance(enemy_f) < FOUNTAIN_RADIUS + 6.0 {

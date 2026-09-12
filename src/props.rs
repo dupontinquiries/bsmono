@@ -42,6 +42,59 @@ pub fn rock(s: f32) -> VoxelMesh {
     g.mesh(0.6, true)
 }
 
+/// A cluster of river-worn boulders: three rounded stones, wet-dark at the
+/// base, lichen on the shoulders.
+pub fn boulder_cluster(s: f32, variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(18, 10, 18);
+    let stone = [0.44, 0.42, 0.40];
+    let dark = [0.30, 0.29, 0.30];
+    let lichen = [0.55, 0.58, 0.36];
+    let offs = [(6.0, 6.0, 1.0), (11.0, 9.0, 0.8), (7.5, 12.0, 0.65), (12.5, 4.5, 0.5)];
+    for (i, (x, z, sc)) in offs.iter().enumerate() {
+        if (variant + i as i32) % 5 == 4 {
+            continue;
+        }
+        let r = 3.6 * sc * s;
+        g.ellipsoid(*x, r * 0.75, *z, r, r * 0.8, r * 1.1, solid(stone));
+        g.ellipsoid(*x, r * 0.3, *z, r * 1.05, r * 0.35, r * 1.15, solid(dark));
+        g.ellipsoid(*x + 0.6, r * 1.4, *z - 0.4, r * 0.55, 0.6, r * 0.55, solid(lichen));
+    }
+    g.mesh(0.6, true)
+}
+
+/// A curtain of hanging vines from a canopy branch, with leaves and a few
+/// trumpet flowers — two poles hold the branch so it reads on its own.
+pub fn vine_curtain(variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(20, 30, 8);
+    let bark = [0.30, 0.215, 0.125];
+    let vine = [0.16, 0.42, 0.16];
+    let vine_d = [0.12, 0.32, 0.13];
+    let leaf = [0.30, 0.55, 0.20];
+    let bloom = if variant % 2 == 0 { [0.95, 0.45, 0.55] } else { [0.95, 0.75, 0.3] };
+    // branch across the top, on two crooked poles
+    g.filled_box(1, 24, 3, 18, 25, 4, solid(bark));
+    g.filled_box(1, 0, 3, 2, 24, 4, solid(bark));
+    g.filled_box(17, 0, 3, 18, 24, 4, solid(bark));
+    for k in 0..9 {
+        let x = 2 + k * 2 + (variant + k) % 2;
+        let len = 8 + ((variant * 7 + k * 13) % 14);
+        for i in 0..len {
+            let y = 24 - i;
+            let sway = ((i as f32 * 0.5 + k as f32).sin() * 1.2) as i32;
+            let z = 3 + sway;
+            g.set(x, y, z, solid(if i % 3 == 0 { vine_d } else { vine }));
+            if i % 4 == 2 {
+                g.set(x + 1, y, z, solid(leaf));
+                g.set(x - 1, y - 1, z + 1, solid(leaf));
+            }
+        }
+        if (variant + k) % 3 == 0 {
+            g.ellipsoid(x as f32, (24 - len) as f32, 3.5, 1.2, 1.0, 1.2, solid(bloom));
+        }
+    }
+    g.mesh(0.55, true)
+}
+
 pub fn crystal(team: [f32; 3]) -> VoxelMesh {
     let mut g = Grid::new(8, 18, 8);
     let glow = mix(team, [1.0, 1.0, 1.0], 0.3);
