@@ -725,6 +725,11 @@ struct VoicetermApp {
     /// state rather than a mirror of it — the QML kept a hand-copied string
     /// and a hand-copied enum is one that drifts.
     peer: Option<(voiceterm_egui::peer_panel::PeerPanel, peer_handshake::HsState)>,
+    /// Set while `handshake_audio::capture_modem_samples` is running on its
+    /// own thread after `HsEvent::StartListen` — polled each frame with
+    /// `try_recv()`; a result feeds `HsEvent::SymbolsCaptured` back into
+    /// `peer_handshake::step`. `None` when no capture is in flight.
+    peer_capture: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
     /// The note-card deck: captured text split into atomic cards.
     deck: voiceterm_egui::cards_view::Deck,
     /// What the user has captured so far, re-split on change. Held because
@@ -2060,11 +2065,67 @@ impl eframe::App for VoicetermApp {
                 Some(voiceterm_egui::peer_panel::Action::Event(ev)) => {
                     // The ENGINE advances the state. The panel only says which
                     // event a press means — see the test in peer_panel that
-                    // asserts the view never calls step itself.
+                    // asserts the view never calls step itself. Side effects
+                    // (actually playing/capturing sound) happen HERE, driven
+                    // by which transition just occurred — not inside step()
+                    // itself, which stays a pure (state, event) -> state
+                    // function with no I/O of its own.
+                    if matches!(ev, peer_handshake::HsEvent::StartDial) {
+                        let payload = peer_handshake::HandshakePayload {
+                            peer_id: panel.my_id.clone(),
+                            key_fp: panel.my_key_fp.clone(),
+                            workspace_hash: panel.workspace_digest.clone(),
+                            voiceprint_ref: panel.my_voiceprint_ref.clone(),
+                            // No Bluetooth pairing/address-selection flow exists
+                            // yet (bt-kit and bt_send.rs can send once THIS
+                            // exists, but nothing produces a real address to
+                            // offer here) — empty is the documented "no
+                            // transport offered" value, not a placeholder
+                            // standing in for a real one.
+                            bt_addr: String::new(),
+                        };
+                        let samples = peer_handshake::audio_dialup::symbols_to_samples(&payload.to_symbols());
+                        voiceterm_egui::handshake_audio::play_modem(samples, peer_handshake::audio_dialup::SAMPLE_RATE);
+                    }
+                    if matches!(ev, peer_handshake::HsEvent::StartListen) {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        self.peer_capture = Some(rx);
+                        std::thread::spawn(move || {
+                            // A modem frame is short; 6s covers the actual
+                            // frame plus room for the two devices' "press
+                            // listen" moments not being perfectly aligned.
+                            let samples = voiceterm_egui::handshake_audio::capture_modem_samples(6_000)
+                                .unwrap_or_default();
+                            let symbols = peer_handshake::audio_dialup::samples_to_symbols(&samples);
+                            // An empty/failed capture still sends an (empty)
+                            // symbol stream rather than nothing: `step` already
+                            // handles a frame that fails to decode by moving to
+                            // `Rejected("could not decode peer handshake")` —
+                            // reusing that existing, tested path rather than
+                            // inventing a second "capture failed" state here.
+                            let _ = tx.send(symbols);
+                        });
+                    }
                     *state = peer_handshake::step(state.clone(), ev);
                 }
-                Some(voiceterm_egui::peer_panel::Action::Dismiss) => self.peer = None,
+                Some(voiceterm_egui::peer_panel::Action::Dismiss) => {
+                    self.peer = None;
+                    self.peer_capture = None;
+                }
                 None => {}
+            }
+            // A capture in flight is polled once per frame — try_recv is a
+            // non-blocking check, matching this app's immediate-mode redraw
+            // model rather than blocking the render thread on the capture
+            // thread finishing.
+            if let Some(rx) = &self.peer_capture {
+                if let Ok(symbols) = rx.try_recv() {
+                    self.peer_capture = None;
+                    if let Some((_, state)) = &mut self.peer {
+                        *state = peer_handshake::step(state.clone(), peer_handshake::HsEvent::SymbolsCaptured(symbols));
+                    }
+                    ctx.request_repaint();
+                }
             }
             // A trusted handshake is NOT auto-dismissed. The panel shows the
             // peer's fingerprint and a Close button, and closing it the moment
@@ -6156,6 +6217,7 @@ fn main() -> eframe::Result<()> {
                 cmd_sheet: Default::default(),
                 last_memlog_s: 0.0,
                 peer: None,
+                peer_capture: None,
                 // VOICETERM_DEMO also seeds the note deck. The zettelkasten is
                 // empty until someone captures something, which is correct —
                 // and means the notes panes, the graph, the backlinks and the

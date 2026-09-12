@@ -195,6 +195,17 @@ impl Launcher {
         self.results.get(n).map(|&i| &self.entries[i])
     }
 
+    /// Any known entry by id, regardless of the current query filter.
+    ///
+    /// `results()`/`result_at()` only see what the current query matched —
+    /// exactly wrong for a shell painting a tile mid-exit-fade after a query
+    /// change filtered it OUT of the result set. The tile is still leaving
+    /// the screen; the shell still needs its name and icon for those last
+    /// frames, and `results()` has already forgotten it existed.
+    pub fn entry(&self, id: &str) -> Option<&AppEntry> {
+        self.entries.iter().find(|e| e.id == id)
+    }
+
     pub fn is_favorite(&self, id: &str) -> bool {
         self.favorites.iter().any(|f| f == id)
     }
@@ -408,6 +419,16 @@ mod tests {
 
         std::env::remove_var("XDG_DATA_HOME");
         std::env::remove_var("XDG_DATA_DIRS");
+    }
+
+    #[test]
+    fn entry_finds_by_id_even_when_the_query_has_filtered_it_out() {
+        let (mut l, _guard) = fresh();
+        l.set_query("fi"); // narrows to Files, Firefox — Camera and Terminal drop out
+        assert_eq!(l.result_count(), 2, "sanity: the filter actually narrowed");
+        assert!(l.entry("camera").is_some(), "still findable — a shell mid-exit-fade needs this");
+        assert_eq!(l.entry("camera").unwrap().name, "Camera");
+        assert!(l.entry("no-such-id").is_none());
     }
 
     #[test]

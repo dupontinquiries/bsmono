@@ -13,6 +13,9 @@
 //! rather than mis-rendered.
 
 pub mod iio_light;
+pub mod bt_send;
+pub mod light_kit_bridge;
+pub mod handshake_audio;
 pub mod editor_keys;
 pub mod date_phrase;
 pub mod cmd_risk;

@@ -14050,6 +14050,12 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
             key_fp: key_fp.to_string(),
             workspace_hash: workspace_hash.to_string(),
             voiceprint_ref: voiceprint_ref.to_string(),
+            // This QML bridge doesn't take a Bluetooth address parameter
+            // yet — that's a real gap, not silently swallowed: exposing it
+            // means updating the QML call site too, which is outside what
+            // this change touches. Empty here means "no Bluetooth transport
+            // offered", the same as any older peer's payload.
+            bt_addr: String::new(),
         };
         QString::from(p.to_wire().as_str())
     }

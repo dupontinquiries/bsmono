@@ -1,0 +1,30 @@
+[package]
+name = "systemcompkit"
+version = "0.1.0"
+edition = "2021"
+description = "Compositor-integration state-tracking, pure and hardware-free-testable, for a shell built with eguikit over cosmic-comp: toplevel list (app-switcher), idle/lock timing, layer-shell surface intent. Mirrors bt-kit's own split (see that crate's description): the actual wayland-client/wayland-protocols wiring is a thin, feature-gated layer in `wayland_io`, off by default, so nothing in the monorepo that only wants the tracking logic pays smithay/wayland-client's compile cost."
+
+[lib]
+name = "systemcompkit"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Pulls in wayland-client + the real protocol bindings. Off by default for
+# the same reason bt-kit's "rfcomm" feature is: most of the monorepo has no
+# reason to link a Wayland client library just to get the pure tracking
+# logic, and only whatever becomes the actual compositor-facing shell needs
+# the real thing.
+wayland_io = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-wlr", "dep:cosmic-protocols"]
+
+[dependencies]
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols = { version = "0.32", features = ["client", "staging"], optional = true }
+wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
+# COSMIC's own toplevel extension (state/title/app_id/closed) layered on
+# the standard ext-foreign-toplevel-list handle -- confirmed from the
+# protocol XML itself, not the crate's own shipped example, which
+# demonstrates a path the XML marks deprecated-since="2". "client" only:
+# default pulls in wayland-server too, which this crate (a client, not a
+# compositor) has no use for.
+cosmic-protocols = { version = "0.2", default-features = false, features = ["client"], optional = true }

@@ -11,6 +11,10 @@ name = "core-kit"
 version = "0.1.0"
 
 [[package]]
+name = "haptic-kit"
+version = "0.1.0"
+
+[[package]]
 name = "ipc-kit"
 version = "0.1.0"
 dependencies = [
@@ -40,6 +44,7 @@ name = "voiced"
 version = "0.1.0"
 dependencies = [
  "cli-kit",
+ "haptic-kit",
  "ipc-kit",
  "voiced-core",
 ]

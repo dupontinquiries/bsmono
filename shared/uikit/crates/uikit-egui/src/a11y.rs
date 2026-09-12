@@ -284,6 +284,28 @@ impl A11yScene {
         focused
     }
 
+    /// Set focus directly, bypassing `apply(Action::Next/Prev)`.
+    ///
+    /// Every existing caller (gitmind's tab strip, bo-suite's ANC chip) lets
+    /// this scene own focus movement entirely — `apply` is the only thing
+    /// that ever changes `focus_id`. That stops working the moment an app
+    /// already has its OWN notion of "current selection" it cannot give up:
+    /// hatch's launcher grid, for one, needs 2D arrow-key movement (up/down
+    /// moves a row, wrapping at grid edges) that `apply`'s linear Next/Prev
+    /// cannot express, so the app keeps driving its own index and this
+    /// becomes the one-way sync from that index into the spoken/voice layer
+    /// — the app's keyboard handling doesn't change at all.
+    ///
+    /// `None` clears focus (nothing spoken, no ring painted) rather than
+    /// leaving a stale id from a previous frame's item that may not have
+    /// been re-registered this frame — an unregistered focus_id is silently
+    /// inert everywhere it's read (`focused()`, `paint_focus_ring`), so this
+    /// isn't strictly required for correctness, but a caller that resets
+    /// selection (e.g. on a query change) should be able to say so plainly.
+    pub fn set_focus(&mut self, id: Option<u64>) {
+        self.focus_id = id;
+    }
+
     fn focus_index(&self) -> Option<usize> {
         self.focus_id.and_then(|id| self.items.iter().position(|it| it.id == id))
     }
@@ -664,6 +686,30 @@ mod tests {
         s.add(10, Semantics::button("A"), None);
         s.add(20, Semantics::button("B"), None);
         assert_eq!(s.focused().map(|it| it.id), Some(20), "focus follows the id, not the index");
+    }
+
+    #[test]
+    fn set_focus_drives_the_scene_without_apply() {
+        let mut s = A11yScene::new();
+        s.begin_frame();
+        let was_focused_a = s.add(10, Semantics::button("A"), None);
+        let was_focused_b = s.add(20, Semantics::button("B"), None);
+        assert!(!was_focused_a && !was_focused_b, "nothing focused before set_focus");
+
+        s.set_focus(Some(20));
+        assert_eq!(s.focused().map(|it| it.id), Some(20));
+
+        // A caller with its own selection index re-asserts focus every
+        // frame, same as `add` is called every frame — this must not need
+        // `apply` at all, since the app's own keyboard handling is what
+        // decided B is selected, not Next/Prev.
+        s.begin_frame();
+        let refocused_a = s.add(10, Semantics::button("A"), None);
+        let refocused_b = s.add(20, Semantics::button("B"), None);
+        assert!(!refocused_a && refocused_b);
+
+        s.set_focus(None);
+        assert!(s.focused().is_none(), "None clears focus");
     }
 
     #[test]

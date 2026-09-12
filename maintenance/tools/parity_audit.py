@@ -44,6 +44,9 @@ PORTS = [
     # real ports went unmeasured for the same reason ambient-learner did.
     ("gitmind",     "apps/gitmind"),
     ("logscope",    "apps/logscope"),
+    # Original is a QML plasmoid (apps/hatch/qml), not a Qt/GTK app — same
+    # egui-frontend/ convention as everything else, so it costs nothing to add.
+    ("hatch",       "apps/hatch"),
 ]
 
 def surfaces(app_dir):

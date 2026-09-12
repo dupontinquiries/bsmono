@@ -217,6 +217,7 @@ mod tests {
             key_fp: "deadbeefcafe1234".into(),
             workspace_hash: "0011223344556677".into(),
             voiceprint_ref: vp.into(),
+            bt_addr: String::new(),
         }
     }
 

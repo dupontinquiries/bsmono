@@ -27,19 +27,32 @@ pub struct HandshakePayload {
     /// id of the voice profile the peer will speak with, for the voice-print
     /// verification step. Empty = no voice binding.
     pub voiceprint_ref: String,
+    /// Where to reach this peer for the actual data transfer once trusted —
+    /// a Bluetooth RFCOMM address (`XX:XX:XX:XX:XX:XX` form), or empty if
+    /// this peer isn't offering one (audio-only handshake, no follow-up
+    /// transfer planned). Deliberately a plain `String`, not a `bluer`
+    /// type: this crate stays transport-agnostic per its own header, and a
+    /// caller wiring this to `bt-kit` parses it into whatever `bluer`
+    /// needs. The acoustic channel is far too slow to carry the file
+    /// itself (see `audio_dialup.rs`'s header: ~5 bytes/sec) — its actual
+    /// job, once this field exists, is telling both sides where to find
+    /// each other for the transport that can.
+    pub bt_addr: String,
 }
 
 impl HandshakePayload {
     /// Compact, human-inspectable wire form: `k=v;k=v;…`. (Values can't contain
     /// ';' or '='; they're ids/hex so that's safe.)
     pub fn to_wire(&self) -> String {
-        format!("v=1;id={};fp={};wh={};vp={}",
+        format!("v=1;id={};fp={};wh={};vp={};bt={}",
             sanitize(&self.peer_id), sanitize(&self.key_fp),
-            sanitize(&self.workspace_hash), sanitize(&self.voiceprint_ref))
+            sanitize(&self.workspace_hash), sanitize(&self.voiceprint_ref),
+            sanitize(&self.bt_addr))
     }
 
     pub fn from_wire(s: &str) -> Option<HandshakePayload> {
         let mut id = None; let mut fp = None; let mut wh = None; let mut vp = None;
+        let mut bt = None;
         let mut version_ok = false;
         for kv in s.split(';') {
             let mut it = kv.splitn(2, '=');
@@ -49,6 +62,7 @@ impl HandshakePayload {
                 (Some("fp"), Some(v)) => fp = Some(v.to_string()),
                 (Some("wh"), Some(v)) => wh = Some(v.to_string()),
                 (Some("vp"), Some(v)) => vp = Some(v.to_string()),
+                (Some("bt"), Some(v)) => bt = Some(v.to_string()),
                 _ => {}
             }
         }
@@ -57,6 +71,11 @@ impl HandshakePayload {
             peer_id: id?, key_fp: fp?,
             workspace_hash: wh.unwrap_or_default(),
             voiceprint_ref: vp.unwrap_or_default(),
+            // `unwrap_or_default()`, same as `wh`/`vp` above: a peer running
+            // code from before this field existed sends a wire string with
+            // no `bt=` segment at all, and that MUST still parse — not
+            // reject the whole handshake over a field that didn't exist yet.
+            bt_addr: bt.unwrap_or_default(),
         })
     }
 
@@ -191,6 +210,7 @@ mod tests {
             key_fp: "ab12cd34".into(),
             workspace_hash: "deadbeef".into(),
             voiceprint_ref: "spk_001".into(),
+            bt_addr: "AA:BB:CC:DD:EE:FF".into(),
         }
     }
 
@@ -203,16 +223,42 @@ mod tests {
     }
 
     #[test]
-    fn wire_rejects_no_version() {
-        assert_eq!(HandshakePayload::from_wire("id=x;fp=y"), None);
+    fn a_peer_offering_no_bluetooth_transport_round_trips_with_an_empty_field() {
+        let mut p = sample();
+        p.bt_addr = String::new();
+        let w = p.to_wire();
+        assert!(w.contains("bt=;") || w.ends_with("bt="), "the empty field is still present, just empty");
+        assert_eq!(HandshakePayload::from_wire(&w), Some(p));
     }
 
     #[test]
-    fn acoustic_payload_roundtrip() {
-        // payload → tones-symbols → payload (through the modem framing).
+    fn a_wire_string_from_before_bt_addr_existed_still_parses() {
+        // Exactly what an old peer sends: no `bt=` segment at all, because
+        // its code was compiled before this field existed. This MUST parse
+        // — rejecting it would mean this field breaks compatibility with
+        // every device that hasn't updated yet, which defeats the entire
+        // point of a handshake meant to work between two arbitrary devices.
+        let old_wire = "v=1;id=alice;fp=ab12cd34;wh=deadbeef;vp=spk_001";
+        let p = HandshakePayload::from_wire(old_wire).expect("must still parse without bt=");
+        assert_eq!(p.bt_addr, "", "missing field defaults to empty, not an error");
+        assert_eq!(p.peer_id, "alice", "and everything else still comes through");
+    }
+
+    #[test]
+    fn acoustic_payload_roundtrip_carries_the_bluetooth_address_too() {
+        // payload → tones-symbols → payload (through the modem framing) —
+        // confirms the new field survives the ACTUAL bottleneck (audio
+        // encoding), not just to_wire/from_wire, since that's the one step
+        // that's easy to get subtly wrong (a longer payload changes symbol
+        // count, frame length, CRC input) without a test catching it.
         let p = sample();
         let syms = p.to_symbols();
         assert_eq!(HandshakePayload::from_symbols(&syms), Some(p));
+    }
+
+    #[test]
+    fn wire_rejects_no_version() {
+        assert_eq!(HandshakePayload::from_wire("id=x;fp=y"), None);
     }
 
     #[test]

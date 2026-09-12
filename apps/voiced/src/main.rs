@@ -18,6 +18,55 @@ use ipc_kit::{serve_hub, ConnId, Message, Scope, Service};
 use std::collections::HashMap;
 use voiced_core::{Dispatch, Intent, Match, Matcher, Registry};
 
+/// Pure: true if any dispatch in this routing round delivered to an app
+/// other than the currently active one — pulled out of
+/// `route_and_deliver` specifically so this decision is unit-testable
+/// directly. Real haptic firing can't be observed in a build sandbox (no
+/// vibrator, no way to check one buzzed); this at least confirms the
+/// DECISION of when it would fire is correct, independent of the I/O it
+/// triggers.
+fn is_backgrounded_delivery(dispatches: &[Dispatch], active: Option<&str>) -> bool {
+    dispatches.iter().any(|d| matches!(d, Dispatch::Deliver { app, .. } if Some(app.as_str()) != active))
+}
+
+/// Plays a haptic pattern on its own thread — a daemon's message-handling
+/// loop cannot block for a pattern's whole duration (haptic-kit's own
+/// `PatternPlayer` is pollable specifically so nothing has to), and this
+/// is fire-and-forget: nothing here reports back to the caller, matching
+/// `bt_send.rs`/`handshake_audio.rs`'s own reasoning elsewhere in this
+/// fleet for isolating real hardware I/O onto its own thread rather than
+/// running it inline. A device with no discoverable vibrator (most build
+/// environments, some hardware) silently plays nothing — this is a
+/// confirmation nicety, not something that should ever fail intent
+/// routing itself.
+fn play_haptic_async(pattern: haptic_kit::Pattern) {
+    std::thread::spawn(move || {
+        let motor = match haptic_kit::Motor::discover() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let total = pattern.total_duration_ms();
+        let mut elapsed = 0u32;
+        let mut last_state = None;
+        // 5ms polling granularity: coarse enough to be cheap on a
+        // background thread, fine enough that no real pulse boundary
+        // (the shortest defined pattern pulse is 15ms) gets missed.
+        while elapsed <= total {
+            let state = haptic_kit::PatternPlayer::state_at(&pattern, elapsed);
+            if Some(state) != last_state {
+                let _ = motor.set(if state == haptic_kit::MotorState::On { 1.0 } else { 0.0 });
+                last_state = Some(state);
+            }
+            if state == haptic_kit::MotorState::Finished {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            elapsed += 5;
+        }
+        let _ = motor.off(); // regardless of how the loop above exited, never leave the motor running
+    });
+}
+
 struct VoiceService {
     reg: Registry,
     matcher: Matcher,
@@ -28,6 +77,22 @@ struct VoiceService {
 impl VoiceService {
     fn new() -> Self {
         VoiceService { reg: Registry::new(), matcher: Matcher::new(), app_of: HashMap::new(), conn_of: HashMap::new() }
+    }
+
+    /// Routes an intent and delivers it, firing a haptic confirmation if
+    /// (and only if) any resulting delivery went to an app OTHER than the
+    /// currently active one — the `Scope::Always`-while-backgrounded case
+    /// haptic-kit exists for, not every single intent regardless of
+    /// whether the user is already looking right at the app that handled
+    /// it. `deliver()` itself stays exactly as it was: pure, tested,
+    /// message-building only — the haptic decision and the real I/O it
+    /// triggers both live here, one layer up, not inside it.
+    fn route_and_deliver(&mut self, intent: &Intent) -> Vec<(ConnId, Message)> {
+        let dispatches = self.reg.route(intent);
+        if is_backgrounded_delivery(&dispatches, self.reg.active()) {
+            play_haptic_async(haptic_kit::Pattern::notification());
+        }
+        self.deliver(dispatches)
     }
 
     /// Turn a routing decision into an addressed message to the target app's connection.
@@ -93,31 +158,21 @@ impl Service for VoiceService {
             "intent" => {
                 let event_type = a(0);
                 let slots: Vec<String> = msg.args.iter().skip(1).cloned().collect();
-                let dispatches = self.reg.route(&Intent::App { event_type, slots });
-                self.deliver(dispatches)
+                self.route_and_deliver(&Intent::App { event_type, slots })
             }
             "transcript" => {
                 // the audio stage's cleaned/finalized transcript → match → route
                 let text = msg.args.join(" ");
                 match self.matcher.match_utterance(&text) {
-                    Match::System(intent) => {
-                        let dispatches = self.reg.route(&intent);
-                        self.deliver(dispatches)
-                    }
-                    Match::App { event_type, slots } => {
-                        let dispatches = self.reg.route(&Intent::App { event_type, slots });
-                        self.deliver(dispatches)
-                    }
+                    Match::System(intent) => self.route_and_deliver(&intent),
+                    Match::App { event_type, slots } => self.route_and_deliver(&Intent::App { event_type, slots }),
                     Match::None => vec![],
                 }
             }
             "say" => {
                 let utterance = msg.args.join(" ");
                 match Intent::parse_system(&utterance) {
-                    Some(intent) => {
-                        let dispatches = self.reg.route(&intent);
-                        self.deliver(dispatches)
-                    }
+                    Some(intent) => self.route_and_deliver(&intent),
                     None => vec![], // real NL is the apps' grammars; nothing system-level matched
                 }
             }
@@ -201,6 +256,53 @@ mod tests {
     use super::*;
     use ipc_kit::Client;
     use std::time::Duration;
+
+    #[test]
+    fn a_delivery_to_the_active_app_needs_no_haptic() {
+        let dispatches = vec![Dispatch::Deliver {
+            app: "logscope".into(),
+            event_type: "next_page".into(),
+            slots: vec![],
+        }];
+        assert!(!is_backgrounded_delivery(&dispatches, Some("logscope")));
+    }
+
+    #[test]
+    fn a_delivery_to_a_backgrounded_app_needs_haptic() {
+        let dispatches = vec![Dispatch::Deliver {
+            app: "voiceterm".into(),
+            event_type: "mail_incoming".into(),
+            slots: vec![],
+        }];
+        assert!(is_backgrounded_delivery(&dispatches, Some("logscope")));
+    }
+
+    #[test]
+    fn no_active_app_at_all_still_counts_any_delivery_as_backgrounded() {
+        // No app has ever called `focus` yet — every delivery is, by
+        // definition, not to "the active app" because there isn't one.
+        let dispatches = vec![Dispatch::Deliver { app: "voiceterm".into(), event_type: "x".into(), slots: vec![] }];
+        assert!(is_backgrounded_delivery(&dispatches, None));
+    }
+
+    #[test]
+    fn non_deliver_dispatches_never_trigger_haptic_on_their_own() {
+        let dispatches = vec![Dispatch::Focus { app: "logscope".into() }, Dispatch::Dropped];
+        assert!(!is_backgrounded_delivery(&dispatches, Some("something-else")));
+    }
+
+    #[test]
+    fn a_mixed_batch_with_even_one_backgrounded_delivery_needs_haptic() {
+        // Real routing can produce several dispatches from one intent
+        // (Scope::Active to the focused app AND Scope::Always to another) —
+        // one backgrounded delivery among several must not get averaged
+        // away or require ALL of them to be backgrounded.
+        let dispatches = vec![
+            Dispatch::Deliver { app: "logscope".into(), event_type: "x".into(), slots: vec![] },
+            Dispatch::Deliver { app: "voiceterm".into(), event_type: "x".into(), slots: vec![] },
+        ];
+        assert!(is_backgrounded_delivery(&dispatches, Some("logscope")), "the SECOND delivery is backgrounded");
+    }
 
     fn hello_register(name: &str, app: &str, event: &str, scope: &str) -> Client {
         let mut c = Client::connect(name).expect("connect");

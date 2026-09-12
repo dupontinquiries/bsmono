@@ -1,0 +1,28 @@
+[package]
+name = "card-diagnoser"
+version = "0.1.0"
+edition = "2021"
+description = "Hold a card/ring/tag near a PC/SC reader, see what contactless protocol it speaks and copy the summary to clipboard — built for walking a store's shelf of NFC-capable products and checking what's actually buyable locally, not just documented online."
+
+[lib]
+name = "card_diagnoser"
+path = "src/lib.rs"
+
+[[bin]]
+name = "card-diagnoser"
+path = "src/bin/card_diagnoser.rs"
+
+[dependencies]
+nfc-kit = { path = "../../shared/nfc-kit" }
+uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
+egui = "0.34"
+eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+# Real reader I/O — see reader.rs's own header for what this crate does and
+# doesn't attempt (card-presence polling and ATR/UID retrieval only; no
+# card-specific authenticated reads).
+pcsc = "2"
+# The pulsing ring animation is genuinely SVG, not procedural egui shapes —
+# generated fresh each frame as markup (radius/opacity as a function of
+# elapsed time) and rasterized via resvg, the same pipeline hatch-egui
+# already uses for its own icons.
+resvg = { version = "0.45", default-features = false }

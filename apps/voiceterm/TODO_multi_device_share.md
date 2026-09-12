@@ -119,3 +119,43 @@ same gap noted for `voice_routing` and `acoustic_cache`). The next
 piece is that pipeline, not more panel. And question A–D above is still
 unanswered: this work is the prerequisite for whichever it turns out to
 be, since all of A, B and C need a device identity first.
+
+## RESOLVED: the acoustic transport, and a transfer layer this doc never named
+
+The previous section is now stale in its own main claim — correcting
+it here rather than editing it away, so the history of what was
+actually open when stays visible.
+
+`handshake_audio.rs` (egui-frontend) closes it: `play_modem` (cpal
+output, WAV-file-via-system-player fallback) and
+`capture_modem_samples` (bounded one-shot cpal input, NOT a port of
+`voice.rs`'s always-on `ensure_capture_running` — that function feeds
+two OTHER features, background voice-fingerprinting and corpus
+recording, from the same callback, which this had no reason to drag in
+just to reach a microphone). Wired into `voiceterm_egui.rs`'s existing
+peer-handshake driver: `StartDial` now actually plays the encoded
+payload, `StartListen` spawns a capture thread and feeds
+`SymbolsCaptured` back once it returns. Not verified against real room
+acoustics — nothing in a build sandbox can confirm that — but the
+pipeline itself is real, not absent.
+
+Also now exists, and changes the shape of options A–D above: a real
+transport for the actual bytes, once two devices trust each other.
+`HandshakePayload` gained a `bt_addr` field (classic Bluetooth RFCOMM
+address, empty meaning "none offered"), and `shared/bt-kit` is a new
+crate — chunked, resumable file transfer over RFCOMM (`bluer`), with a
+pure, hardware-free-testable framing/reassembly core and a thin,
+type-checked-but-unverified-on-real-hardware transport wrapper.
+`bt_send.rs` connects the two: once `Trusted`, it can open an RFCOMM
+stream and send bytes to the peer's `bt_addr`.
+
+This doesn't answer A–D — it couldn't, that's a product decision about
+WHAT to share, not a networking one. What it does: whichever of
+A (speaker DB), C (learned-data DBs), or a version of D that outgrew
+session-local handoff turns out to be the answer, the transport to
+carry that payload between two trusted devices now exists and is
+tested as far as a build sandbox can test it. Nothing calls `bt_send`
+from the actual panel yet — no button, no automatic "send the
+workspace once trusted" — because THAT decision is still exactly the
+open question this file has asked since it was written. The acoustic
+handshake is no longer the blocker; the product decision is.
