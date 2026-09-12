@@ -28,6 +28,7 @@ use vidkit_core::traits::{MediaSource, Presenter};
 use vidkit_egui::{bottom_bar, next_fit, EguiPresenter, Fit, Transport, VideoView};
 
 mod filepick;
+mod decode;
 mod io;
 mod palette;
 mod pattern;
@@ -127,6 +128,10 @@ struct Player {
     /// knowing about. The cost is honest: "play from clipboard" works after a
     /// paste, not before one.
     last_paste: Option<String>,
+    /// Real decoded frames, when ffmpeg could be started for the open file.
+    /// `None` falls back to the test pattern, which is what every build before
+    /// this one did for everything.
+    frames: Option<decode::FfmpegFrames>,
 }
 
 /// File-picker state. Navigation is uikit-egui's PathPicker; the file list and
@@ -209,6 +214,18 @@ impl Player {
         };
         let opened = file.as_ref().map(|p| open_local(p));
 
+        // Try to decode it for real. A failure is not fatal: the file still
+        // opens, is described, and falls back to the test pattern -- which is
+        // what this player did for everything until now.
+        let mut frames = None;
+        let mut decode_error = None;
+        if let Some(p) = &file {
+            match decode::FfmpegFrames::open(p, Some(1920)) {
+                Ok(f) => frames = Some(f),
+                Err(e) => decode_error = Some(format!("no decode: {e}")),
+            }
+        }
+
         let status = match &opened {
             Some(Ok(_)) => "NV12 · CPU convert".to_string(),
             Some(Err(_)) => "not playing".to_string(),
@@ -237,7 +254,8 @@ impl Player {
             path: file,
             quit: false,
             gpu,
-            gpu_error,
+            gpu_error: gpu_error.or(decode_error),
+            frames,
             chrome: Default::default(),
             settings: Default::default(),
             settings_open: false,
@@ -248,8 +266,15 @@ impl Player {
     /// Feed the presenter. Until a decoder exists this is the test pattern —
     /// stated on screen rather than implied.
     fn produce(&mut self, eframe_frame: &eframe::Frame) {
-        let t = self.started.elapsed().as_secs_f32();
-        let frame = pattern::bars(t * 0.25);
+        // A real frame if there is one, the test pattern otherwise. The
+        // pattern is no longer the only thing this player can show.
+        let frame = match self.frames.as_mut().and_then(|f| f.next_frame()) {
+            Some(f) => f,
+            None => {
+                let t = self.started.elapsed().as_secs_f32();
+                pattern::bars(t * 0.25)
+            }
+        };
 
         if let (Some(gpu), Some(gl)) = (&self.gpu, eframe_frame.gl()) {
             if let Ok(mut g) = gpu.lock() {
