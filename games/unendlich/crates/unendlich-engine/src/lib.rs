@@ -130,6 +130,10 @@ pub mod creature_viewer_ui;
 pub mod air;
 pub mod fabric;
 pub mod pose;
+/// Oriented per-part posing (legs pivot at the hip, squash/stretch, breath,
+/// tail S-curve, strike lunge, settle, ragdoll blend). Pure; supersedes the
+/// offset-only `pose::animate` on the rigged entity path.
+pub mod anim_rig;
 pub mod collision;
 pub mod inventory;
 pub mod action_queue;
