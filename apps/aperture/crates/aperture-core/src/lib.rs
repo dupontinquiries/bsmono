@@ -58,6 +58,11 @@ pub mod helix;
 /// ("`Selection` is already value-based; becomes `Vec<Selection>` + edit
 /// fan-out with offset fixup"). The work was done; nothing reached it.
 pub mod multicursor;
+/// Ordered packs of places in the codebase, with an attention horizon —
+/// the working unit above a file and below the whole tree. Stored as git
+/// refs (`gitspace::GitStore`) or plain files, and resolved by SYMBOL
+/// NAME so an entry survives its function moving.
+pub mod bucket;
 pub mod gitspace;
 pub mod history;
 pub mod op;
