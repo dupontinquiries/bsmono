@@ -1614,8 +1614,61 @@ impl Paintbrush {
         };
         self.push(r);
         self.flush_staged(cm, &mut staged);
+        // AND PUT SOMETHING IN THE ROOMS. Until now the layout named
+        // fourteen rooms and left fourteen empty boxes: a "kitchen" was
+        // a kitchen only because a data structure said so. The layout
+        // is the one place that knows which rectangle is which room, so
+        // it is the only place furnishing can happen.
+        // The program was built with its floor at 0, which is relative
+        // to the anchor -- so the furnishing must use the same origin,
+        // or it lands at absolute y=1 and the whole thing is buried.
+        let anchor = self.session.focus(gaze).anchor;
+        self.furnish_rooms(cm, gaze, &layout, anchor);
         self.review_pending_after_drone = 1;
         self.review_round = 0;
+    }
+
+    /// Furnish and stock every room the layout named.
+    fn furnish_rooms(&mut self, cm: &ChunkManager, gaze: &Gaze,
+                     layout: &voxel_tools::brief::Layout, anchor: (i32, i32, i32)) {
+        let view = WorldView(cm);
+        let mut staged = StagedWorld::new(&view);
+        let (mut cells, mut chests) = (0usize, 0usize);
+        let seed = self.session.creative_seed;
+        for room in &layout.rooms {
+            let mut floor = std::collections::BTreeSet::new();
+            for x in room.at.0..room.at.0 + room.size.0 {
+                for z in room.at.1..room.at.1 + room.size.1 {
+                    floor.insert((anchor.0 + x, anchor.1 + 1, anchor.2 + z));
+                }
+            }
+            // which floor cells sit on the building's own edge: a
+            // hearth needs an OUTSIDE wall for its flue
+            let outer: std::collections::BTreeSet<(i32, i32, i32)> = floor.iter().copied()
+                .filter(|c| c.0 == anchor.0 + room.at.0
+                         || c.0 == anchor.0 + room.at.0 + room.size.0 - 1
+                         || c.2 == anchor.2 + room.at.1
+                         || c.2 == anchor.2 + room.at.1 + room.size.1 - 1)
+                .collect();
+            let r = voxel_tools::contents::Room { name: room.name.clone(), floor, outer };
+            let f = voxel_tools::contents::furnish(&r, seed);
+            if f.changes.is_empty() { continue; }
+            let loot = voxel_tools::contents::stock(&room.name, &f.containers, seed);
+            cells += f.changes.len();
+            chests += loot.len();
+            log::info!("[paintbrush] {}", voxel_tools::contents::describe(&f, &loot));
+            for l in &loot {
+                log::debug!("[paintbrush]   {} at {:?}: {}", l.container, l.at, l.items.join(", "));
+            }
+            let mut tools = VoxelTools::new(&mut staged);
+            let _ = tools.apply_changes_large(&f.changes);
+        }
+        if cells > 0 {
+            self.say(format!("furnished {} room(s): {cells} blocks, {chests} container(s)",
+                             layout.rooms.len()));
+            self.flush_staged(cm, &mut staged);
+        }
+        let _ = gaze;
     }
 
     /// The rest of the chain: brief, layout, geometry.
