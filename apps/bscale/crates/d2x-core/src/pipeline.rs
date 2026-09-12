@@ -18,7 +18,7 @@ use crate::matcher::{BlockMatcher, Diamond, Exhaustive, Stationary};
 use crate::phase_corr::PhaseCorrelation;
 use crate::plate::Plate;
 use crate::plan::{FramePlan, FrameStats, MAX_TIERS};
-use crate::blockcache::BlockCache;
+use crate::blockcache::{BlockCache, Entry};
 use crate::predict::{analyze_tiered, AnalyzeConfig, AnalyzeState, CachedBlocks};
 use std::sync::{Arc, Mutex};
 use crate::residual::{make_residual, merge_tiered, Residual};
@@ -157,6 +157,8 @@ pub struct Summary {
     /// the amortised cost the two fractions above do not include. Total
     /// main-network work is `heavy_pixel_fraction + plate_pixel_fraction`.
     pub plate_pixel_fraction: f64,
+    /// Block cache at the end of the run: hits, misses, inserts, live bytes.
+    pub cache: (u64, u64, u64, u64),
 }
 
 /// What stage A sends to stage B per frame.
@@ -405,6 +407,7 @@ pub fn run_tiered_with_cache(
     let cache_a = cache.clone();
     let cache_b = cache;
     let (plate_window, plate_conf) = (cfg.plate_window, cfg.plate_min_confidence);
+    let (gated, bucket) = (cfg.analyze.cache_quant, cfg.analyze.cache_bucket);
     // The reader needs pairwise motion for hints even without plates.
     let reader_window = if plate_window > 1 { plate_window } else if cfg.mv_seed { 2 } else { 1 };
     let mv_seed = cfg.mv_seed;
@@ -414,7 +417,7 @@ pub fn run_tiered_with_cache(
         let reference: &dyn ReferenceMaker = &reference;
         let mut prev_working: Option<Frame> = None;
         let mut ring: Ring<Frame> = Ring::new(recent_refs, keyframe_refs);
-        let mut state = AnalyzeState { streak: Vec::new(), cache: cache_a, anchor: None, since_anchor: 0 };
+        let mut state = AnalyzeState { streak: Vec::new(), cache: cache_a, anchor: None, since_anchor: 0, force_cut: false };
         let mut reader = WindowReader::new(source, reader_window, acfg.min_psnr, plate_conf, bs, noise);
         'windows: loop {
             let t_win = Instant::now();
@@ -586,6 +589,28 @@ pub fn run_tiered_with_cache(
             };
             let merge_time = t1.elapsed();
 
+            // Harvest the subtiles of a big upscale. `out` is the finished
+            // frame, so the block at (x·s, y·s) is exactly what the network
+            // drew: for a whole redraw the upscaled frame, for a region the
+            // rectangle's interior (full weight — only its bleed ring is
+            // feathered, and no harvested cell touches the ring).
+            if let (Some(c), Some(plan)) = (&cache_b, &work.plan) {
+                if !plan.harvest.is_empty() {
+                    let side = bs * scale;
+                    let mut c = c.lock().unwrap();
+                    for hc in &plan.harvest {
+                        if !out.block_in_bounds(hc.x * scale, hc.y * scale, side) {
+                            continue;
+                        }
+                        let up = Arc::new(out.crop(hc.x * scale, hc.y * scale, side, side).data);
+                        c.insert(hc.key, up.clone());
+                        if gated > 0 {
+                            c.insert_gated(hc.coarse, hc.key, Entry { up, lo: hc.lo.clone() }, bucket);
+                        }
+                    }
+                }
+            }
+
             let visible = if (out.width, out.height) == (crop_w, crop_h) { out.clone() } else { out.crop(0, 0, crop_w, crop_h) };
             if let Err(e) = sink.write(&visible) {
                 result = Err(e.context(format!("writing frame {}", work.index)));
@@ -614,8 +639,12 @@ pub fn run_tiered_with_cache(
     let upscaled_pixel_fraction = if frames > 0 { fraction_sum / frames as f64 } else { 0.0 };
     let heavy_pixel_fraction = if frames > 0 { heavy_sum / frames as f64 } else { 0.0 };
     let plate_pixel_fraction = if frames > 0 { plate_sum / frames as f64 } else { 0.0 };
+    let cache_stats = cache_b.map_or((0, 0, 0, 0), |c| {
+        let c = c.lock().unwrap();
+        (c.hits, c.misses, c.inserts, c.bytes())
+    });
     on_event(Event::Finished { frames, elapsed, upscaled_pixel_fraction, heavy_pixel_fraction, plate_pixel_fraction });
-    Ok(Summary { frames, elapsed, upscaled_pixel_fraction, heavy_pixel_fraction, plate_pixel_fraction })
+    Ok(Summary { frames, elapsed, upscaled_pixel_fraction, heavy_pixel_fraction, plate_pixel_fraction, cache: cache_stats })
 }
 
 /// Analysis only: run stage A over the source and report per-frame stats,
@@ -634,7 +663,14 @@ pub fn analyze_only(
     let mut prev: Option<Frame> = None;
     let mut ring: Ring<Frame> = Ring::new(cfg.recent_refs, cfg.keyframe_refs);
     let mut state = AnalyzeState::default();
-    // analyze_only never produces upscaled blocks, so a cache can't fill; skip it.
+    // analyze_only never produces upscaled pixels, so the cache runs DRY:
+    // keys and byte costs only. That is enough to measure the hit rate and
+    // the eviction behaviour of a real run, harvested subtiles included.
+    // Block bytes are charged at scale 2 (the usual factor); the shape of
+    // the answer does not depend on it, the budget does.
+    let dry = (cfg.block_cache_bytes > 0).then(|| Arc::new(Mutex::new(BlockCache::new_dry(cfg.block_cache_bytes))));
+    state.cache = dry.clone();
+    let up_block_bytes = (bs * 2) as u64 * (bs * 2) as u64 * 3;
     let mut index = 0u64;
     let mut fraction_sum = 0.0;
     let mut heavy_sum = 0.0;
@@ -677,6 +713,19 @@ pub fn analyze_only(
                     fraction_sum += fr;
                     heavy_sum += plan.stats.heavy_fraction(&plan.grid, bleed);
                     on_frame(index, &plan.stats, fr, t0.elapsed());
+                    if let Some(c) = &dry {
+                        let mut c = c.lock().unwrap();
+                        for hc in &plan.harvest {
+                            c.insert_sized(hc.key, up_block_bytes);
+                            if cfg.analyze.cache_quant > 0 {
+                                c.insert_gated(hc.coarse, hc.key, Entry { up: Arc::new(Vec::new()), lo: hc.lo.clone() }, cfg.analyze.cache_bucket);
+                            }
+                        }
+                        // What stage B would insert from the packed residual.
+                        for rv in plan.residuals.iter().filter(|rv| rv.tier < 2) {
+                            c.insert_sized(rv.key, up_block_bytes);
+                        }
+                    }
                     ring.advance(p, &next_w, plan.stats.is_anchor(&plan.grid));
                     prev = Some(next_w);
                 }
@@ -685,12 +734,17 @@ pub fn analyze_only(
         index += 1;
     }
     let n = index as f64;
+    let cache = dry.map_or((0, 0, 0, 0), |c| {
+        let c = c.lock().unwrap();
+        (c.hits, c.misses, c.inserts, c.bytes())
+    });
     Ok(Summary {
         frames: index,
         elapsed: started.elapsed(),
         upscaled_pixel_fraction: if index > 0 { fraction_sum / n } else { 0.0 },
         heavy_pixel_fraction: if index > 0 { heavy_sum / n } else { 0.0 },
         plate_pixel_fraction: if index > 0 { plate_sum / n } else { 0.0 },
+        cache,
     })
 }
 

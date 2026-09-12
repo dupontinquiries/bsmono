@@ -13,7 +13,8 @@
 //! of the original; here redraw keeps the original so the two domains
 //! never disagree.
 
-use crate::blockcache::{hash_cell, BlockCache};
+use crate::blockcache::{coarse_key, hash_cell, BlockCache};
+use crate::plan::HarvestCell;
 use crate::frame::{block_sse, block_sse_bounded, Frame, Pad};
 use crate::gate::{ReferenceMaker, ThresholdMap};
 use crate::matcher::BlockMatcher;
@@ -63,6 +64,16 @@ pub struct AnalyzeConfig {
     /// frames from a restored anchor and lost past ±4; this bounds the
     /// distance blocks are propagated over, at one network pass per N frames.
     pub anchor_max_age: u32,
+    /// Harvest the subtiles of every big upscale (redraw, region redraw)
+    /// into the block cache. Needs a cache budget to do anything.
+    pub harvest: bool,
+    /// Probe the cache by coarse bucket and verify the candidate against the
+    /// frame's own block under the gate, instead of requiring an exact byte
+    /// match. 0 = exact only; otherwise the quantisation step of the coarse
+    /// key (8–24 is the useful range; larger buckets, more candidates).
+    pub cache_quant: u32,
+    /// Candidates kept per coarse bucket (probe cost is linear in this).
+    pub cache_bucket: usize,
     /// Texture thresholds (luma standard deviation, 0–255 units) for routing
     /// missing blocks to cheaper tiers: below `[0]` → tier 2 (bicubic),
     /// below `[1]` → tier 1 (cheap network), else tier 0. Only tiers the
@@ -80,7 +91,7 @@ pub struct AnalyzeConfig {
 
 impl Default for AnalyzeConfig {
     fn default() -> Self {
-        AnalyzeConfig { block_size: 30, bleed: 1, min_psnr: 5.2, redraw_fraction: 0.90, fade: true, halfpel: false, subpel_filter: SubpelFilter::Bilinear, quarterpel: false, region_redraw: false, anchor_rmse: 0.0, anchor_max_age: 0, tier_std: [1.0, 4.0], tier_metric: TierMetric::HighFreq, streak_bonus: 0.0 }
+        AnalyzeConfig { block_size: 30, bleed: 1, min_psnr: 5.2, redraw_fraction: 0.90, fade: true, halfpel: false, subpel_filter: SubpelFilter::Bilinear, quarterpel: false, region_redraw: false, anchor_rmse: 0.0, anchor_max_age: 0, harvest: true, cache_quant: 0, cache_bucket: 4, tier_std: [1.0, 4.0], tier_metric: TierMetric::HighFreq, streak_bonus: 0.0 }
     }
 }
 
@@ -98,6 +109,9 @@ pub struct AnalyzeState {
     pub anchor: Option<u8>,
     /// Frames since the last anchor (full redraw or ≥ half-frame region).
     pub since_anchor: u32,
+    /// Set by the wrapper when `anchor_max_age` forces a new anchor: the
+    /// match pass is skipped, the cache probe is not.
+    pub force_cut: bool,
 }
 
 /// Upscaled bytes for the `Cached` blocks of one plan, attached by the
@@ -350,17 +364,17 @@ pub fn analyze_tiered(
     state: &mut AnalyzeState,
 ) -> anyhow::Result<(FramePlan, Frame, CachedBlocks)> {
     state.since_anchor = state.since_anchor.saturating_add(1);
-    if cfg.anchor_max_age > 0 && state.since_anchor > cfg.anchor_max_age {
-        let grid = Grid::new(next.width, next.height, cfg.block_size);
-        if state.streak.len() != grid.len() {
-            state.streak = vec![0; grid.len()];
-        }
-        state.streak.iter_mut().for_each(|s| *s = 0);
-        state.since_anchor = 0;
-        return Ok((FramePlan::redraw(grid, prev_working.psnr(next)), next.clone(), CachedBlocks::new()));
-    }
+    // A forced anchor does NOT short-circuit into a whole-frame redraw. It
+    // marks every block missing and lets the normal path run: the cache is
+    // probed, and whatever it cannot explain becomes a region or a packed
+    // residual. Short-circuiting here was measured to cost the cache most of
+    // its hits, because a forced anchor is one of the frames most likely to
+    // repeat content the job has already drawn.
+    let forced = cfg.anchor_max_age > 0 && state.since_anchor > cfg.anchor_max_age;
+    state.force_cut = forced;
     let r = analyze_tiered_inner(prev_working, next, older, plate, mv_hint, reference, matcher, cfg, tiers, state)?;
-    if r.0.stats.is_anchor(&r.0.grid) {
+    state.force_cut = false;
+    if forced || r.0.stats.is_anchor(&r.0.grid) {
         state.since_anchor = 0;
     }
     Ok(r)
@@ -394,9 +408,13 @@ fn analyze_tiered_inner(
     if state.streak.len() != grid.len() {
         state.streak = vec![0; grid.len()];
     }
-    if psnr < cfg.min_psnr {
+    // A scene cut: nothing in the previous frame explains this one, so the
+    // match pass is skipped. Not an early return any more — the cache still
+    // gets its probe below, because a cut is precisely when a job may be
+    // returning to a shot it has already paid for.
+    let cut = psnr < cfg.min_psnr || state.force_cut;
+    if cut {
         state.streak.iter_mut().for_each(|s| *s = 0);
-        return Ok((FramePlan::redraw(grid, psnr), next.clone(), CachedBlocks::new()));
     }
 
     let degraded = reference.degrade(next)?;
@@ -409,7 +427,8 @@ fn analyze_tiered_inner(
 
     // --- fade pass: evaluated in parallel on the untouched prev, applied after.
     let mut fades: Vec<FadeBlock> = Vec::new();
-    if cfg.fade {
+    let do_fade = cfg.fade && !cut;
+    if do_fade {
         let prev_ro: &Frame = prev_working;
         fades = (0..grid.len())
             .into_par_iter()
@@ -434,6 +453,9 @@ fn analyze_tiered_inner(
     let matches: Vec<BlockMatch> = (0..grid.len())
         .into_par_iter()
         .map(|i| {
+            if cut {
+                return BlockMatch::Missing;
+            }
             let (x, y) = grid.origin(i);
             let limit = thresholds.get(i);
             if block_sse_bounded(next, x, y, prev_ro, x, y, bs, limit).is_some() {
@@ -512,6 +534,63 @@ fn analyze_tiered_inner(
         }
     }
 
+    // --- content hashes of missing cells (block + bleed ring, black beyond
+    // the frame, exactly what make_residual packs), and cache lookups.
+    //
+    // This runs BEFORE the redraw decision, not after. The frame that would
+    // be redrawn whole is exactly the frame a cache can help most — a cut
+    // back to a shot this job has already drawn — and deciding to redraw
+    // first meant those cells were never probed at all. Measured: harvesting
+    // tripled the supply and changed nothing while the probe happened after
+    // the decision. Now the three-way cost (packed / region / whole) is
+    // computed on what is missing *after* the cache has been consulted, so
+    // harvested subtiles can shrink a redraw into a region, or a region into
+    // a packed residual.
+    let cell_px = bs + 2 * cfg.bleed;
+    let padded = next.padded(cfg.bleed, Pad::Black);
+    let keys: Vec<u64> = (0..grid.len())
+        .into_par_iter()
+        .map(|i| {
+            if matches[i] != BlockMatch::Missing {
+                return 0;
+            }
+            let (x, y) = grid.origin(i);
+            hash_cell(&padded, x, y, cell_px)
+        })
+        .collect();
+    let mut cached_blocks = CachedBlocks::new();
+    let mut matches = matches;
+    if let Some(cache) = &state.cache {
+        let mut c = cache.lock().unwrap();
+        if c.enabled() {
+            for i in 0..grid.len() {
+                if matches[i] != BlockMatch::Missing {
+                    continue;
+                }
+                if let Some(b) = c.get(keys[i]) {
+                    cached_blocks.insert(keys[i], b);
+                    matches[i] = BlockMatch::Cached { key: keys[i] };
+                    stats.cached += 1;
+                    stats.missing -= 1;
+                    continue;
+                }
+                if cfg.cache_quant > 0 {
+                    let (x, y) = grid.origin(i);
+                    let ck = coarse_key(&padded, x, y, cell_px, cfg.cache_quant);
+                    let limit = thresholds.get(i);
+                    let hit = c.get_gated(ck, bs, |lo| block_sse_bounded(next, x, y, lo, 0, 0, bs, limit));
+                    if let Some((k, e)) = hit {
+                        cached_blocks.insert(k, e.up);
+                        matches[i] = BlockMatch::Cached { key: k };
+                        stats.cached += 1;
+                        stats.cached_gated += 1;
+                        stats.missing -= 1;
+                    }
+                }
+            }
+        }
+    }
+
     // Redraw when the packed residual would cover at least `redraw_fraction`
     // of the frame's pixels. Counted in pixels, not blocks: with bleed the
     // residual cells are bigger than blocks, so a mostly-missing frame packs
@@ -568,11 +647,13 @@ fn analyze_tiered_inner(
             }
             stats.region = Some((rx, ry, rw, rh));
             stats.region_px = rpx;
+            let harvest = harvest_for(next, cfg, &grid, Some((rx, ry, rw, rh)), state);
+            stats.harvested = harvest.len() as u32;
             for (s, m) in state.streak.iter_mut().zip(&matches) {
                 *s = if *m == BlockMatch::Missing { 0 } else { s.saturating_add(1) };
             }
             let working_next = reconstruct(next, prev_working, older, plate, cfg, &grid, &matches);
-            return Ok((FramePlan { grid, matches, residuals: Vec::new(), fades, redraw: false, stats }, working_next, CachedBlocks::new()));
+            return Ok((FramePlan { grid, matches, residuals: Vec::new(), fades, redraw: false, harvest, stats }, working_next, cached_blocks));
         }
     }
     if !packed_ok {
@@ -584,42 +665,12 @@ fn analyze_tiered_inner(
         state.streak.iter_mut().for_each(|s| *s = 0);
         let mut plan = FramePlan::redraw(grid, psnr);
         plan.stats.fades = 0;
+        plan.harvest = harvest_for(next, cfg, &plan.grid, None, state);
+        plan.stats.harvested = plan.harvest.len() as u32;
         return Ok((plan, next.clone(), CachedBlocks::new()));
     }
     for (s, m) in state.streak.iter_mut().zip(&matches) {
         *s = if *m == BlockMatch::Missing { 0 } else { s.saturating_add(1) };
-    }
-
-    // --- content hashes of missing cells (block + bleed ring, black beyond
-    // the frame, exactly what make_residual packs), and cache lookups.
-    let cell_px = bs + 2 * cfg.bleed;
-    let padded = next.padded(cfg.bleed, Pad::Black);
-    let keys: Vec<u64> = (0..grid.len())
-        .into_par_iter()
-        .map(|i| {
-            if matches[i] != BlockMatch::Missing {
-                return 0;
-            }
-            let (x, y) = grid.origin(i);
-            hash_cell(&padded, x, y, cell_px)
-        })
-        .collect();
-    let mut cached_blocks = CachedBlocks::new();
-    let mut matches = matches;
-    if let Some(cache) = &state.cache {
-        let mut c = cache.lock().unwrap();
-        if c.enabled() {
-            for i in 0..grid.len() {
-                if matches[i] == BlockMatch::Missing {
-                    if let Some(b) = c.get(keys[i]) {
-                        cached_blocks.insert(keys[i], b);
-                        matches[i] = BlockMatch::Cached { key: keys[i] };
-                        stats.cached += 1;
-                        stats.missing -= 1;
-                    }
-                }
-            }
-        }
     }
 
     // --- route missing blocks to tiers by texture, then pack per tier.
@@ -673,7 +724,47 @@ fn analyze_tiered_inner(
     // --- low-res reconstruction of next: matched blocks come from prev.
     let working_next = reconstruct(next, prev_working, older, plate, cfg, &grid, &matches);
 
-    Ok((FramePlan { grid, matches, residuals, fades, redraw: false, stats }, working_next, cached_blocks))
+    Ok((FramePlan { grid, matches, residuals, fades, redraw: false, harvest: Vec::new(), stats }, working_next, cached_blocks))
+}
+
+/// Cache keys for the cells a big upscale will draw: every cell for a whole
+/// redraw, the cells inside the rectangle for a region redraw. Same key
+/// function and same padding as the lookup path, so a harvested block is
+/// found by a later frame's ordinary cache probe.
+fn harvest_for(next: &Frame, cfg: &AnalyzeConfig, grid: &Grid, region: Option<(u32, u32, u32, u32)>, state: &AnalyzeState) -> Vec<HarvestCell> {
+    if !cfg.harvest {
+        return Vec::new();
+    }
+    match &state.cache {
+        Some(c) if c.lock().unwrap().enabled() => harvest_keys(next, cfg, grid, region),
+        _ => Vec::new(),
+    }
+}
+
+fn harvest_keys(next: &Frame, cfg: &AnalyzeConfig, grid: &Grid, region: Option<(u32, u32, u32, u32)>) -> Vec<HarvestCell> {
+    let cell_px = cfg.block_size + 2 * cfg.bleed;
+    let padded = next.padded(cfg.bleed, Pad::Black);
+    (0..grid.len())
+        .into_par_iter()
+        .filter_map(|i| {
+            let (x, y) = grid.origin(i);
+            if let Some((rx, ry, rw, rh)) = region {
+                // Only cells wholly inside the rectangle: those are the ones
+                // the merge writes at full weight, so the block in the output
+                // is exactly the network's, not a feathered blend.
+                if x < rx || y < ry || x + cfg.block_size > rx + rw || y + cfg.block_size > ry + rh {
+                    return None;
+                }
+            }
+            Some(HarvestCell {
+                key: hash_cell(&padded, x, y, cell_px),
+                coarse: coarse_key(&padded, x, y, cell_px, cfg.cache_quant.max(1)),
+                x,
+                y,
+                lo: std::sync::Arc::new(next.crop(x, y, cfg.block_size, cfg.block_size).data),
+            })
+        })
+        .collect()
 }
 
 /// The low-res mirror of what the merge will output: matched blocks from
@@ -987,7 +1078,7 @@ mod cache_tests {
             }
         };
         let cache = Arc::new(Mutex::new(BlockCache::new(1 << 20)));
-        let mut st = AnalyzeState { streak: Vec::new(), cache: Some(cache.clone()), anchor: None, since_anchor: 0 };
+        let mut st = AnalyzeState { streak: Vec::new(), cache: Some(cache.clone()), anchor: None, since_anchor: 0, force_cut: false };
         // Frame 1: the stamp at (16,16), with a black bleed ring? No — bleed
         // ring comes from the surrounding smooth image, so use a frame where
         // the ring is identical both times: put the stamp fully inside a

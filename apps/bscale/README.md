@@ -124,6 +124,12 @@ truncated render would otherwise score well on the frames that exist.
 
 ## Numbers and where the time goes
 
+Every reuse experiment — what worked, what did not, and the clip-by-clip
+numbers behind the flags described above — is recorded in
+[`docs/REUSE_FINDINGS.md`](docs/REUSE_FINDINGS.md). Read it before adding a
+new block source: most of the obvious ideas have been measured and several
+of them lose.
+
 - The engine is 8-bit RGB. 10-bit sources are dithered to 8 on decode; the
   output is 10-bit AV1 carrying 8-bit-precision content. Real-ESRGAN is
   8-bit-trained, so only reused blocks would gain from a 16-bit path.
@@ -320,6 +326,27 @@ What is built:
   recovered anything (+0.00 dB) — the artefact is coherent smoothing — so
   the detail has to come from a prior: train an SRVGG-class net on the
   crops, export with `tools/pth2st.py`, run it as a cascade tier.
+- **Subtile harvesting** (`--cache-harvest`, default on) and **gated cache
+  probes** (`--cache-quant Q`, default 0 = exact only; `--cache-bucket N`):
+  a redraw or region redraw draws hundreds of cells that were previously
+  thrown away after one frame; harvesting puts each one in the block cache
+  keyed like an ordinary cell, so a cut back to an earlier shot or a
+  returning overlay is a copy. `--cache-quant` additionally probes by a
+  coarse quantised signature and verifies the candidate under the frame's
+  own gate, instead of requiring an exact byte match. `analyze` now runs the
+  cache **dry** (keys and byte costs, no pixels) and reports hits/probes, so
+  both can be measured without a GPU.
+  The cache is probed **before** the redraw decision and a forced anchor
+  takes the normal path, so the frames most likely to repeat already-drawn
+  content are the ones that get probed. That ordering is the whole game:
+  harvesting on its own measured nothing (0.2% hits), and with the probe in
+  the right place the same harvest gives, on Lone Ranger AV1 (120 frames,
+  `--anchor-rmse 12 --anchor-max-age 5`, 512 MB): 38 hits without harvest,
+  **15,710 with** (21.7% of probes), 36.9% → 31.9% of pixels through the
+  network. Transformers 61.5% → 61.3%; SMITE unchanged (a 3D camera repeats
+  nothing exactly). `--cache-quant 16` adds 1,000 hits and 0.3 points for
+  double the probes — a flag, not a default. See the note at the bottom of
+  `blockcache.rs` for what would go further.
 - **Gate hysteresis** (`--streak-bonus b`, default 0 = off): a block reused
   for `n` consecutive frames gets its threshold scaled by
   `1 + b·min(n,8)/8`, so blocks that keep matching stop flickering out at
