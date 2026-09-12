@@ -126,6 +126,42 @@ pub mod build {
 
 #[cfg(test)]
 mod tests {
+    /// Two AV1 samples, both sync, with the given av1C payload.
+    fn av1_file(av1c_payload: &[u8]) -> Vec<u8> {
+        use crate::build::*;
+        let n = 2u32;
+        let payloads: Vec<Vec<u8>> = (0..n).map(|_| vec![0xA0u8; 6]).collect();
+        let sizes: Vec<u32> = payloads.iter().map(|p| p.len() as u32).collect();
+        let mut mdat_body = Vec::new();
+        let mut offs = Vec::new();
+        for p in &payloads {
+            offs.push(mdat_body.len());
+            mdat_body.extend_from_slice(p);
+        }
+        let mdat = bx(b"mdat", &mdat_body);
+        let ftyp = bx(b"ftyp", b"isom\0\0\x02\0isomiso2av01mp41");
+        let av1c = bx(b"av1C", av1c_payload);
+        let make = |at: u64| {
+            let stco = table(b"stco", &offs.iter().map(|o| u32b((at + *o as u64) as u32)).collect::<Vec<_>>());
+            let stbl = bx(b"stbl", &cat(&[
+                stsd(visual_entry(b"av01", 64, 64, av1c.clone())),
+                table(b"stts", &[cat(&[u32b(n), u32b(1000)])]),
+                table(b"stsc", &[cat(&[u32b(1), u32b(1), u32b(1)])]),
+                stsz(&sizes),
+                stco,
+            ]));
+            let minf = bx(b"minf", &cat(&[bx(b"vmhd", &[0u8; 12]), stbl]));
+            let mdia = bx(b"mdia", &cat(&[mdhd(30_000, n * 1000), hdlr(b"vide"), minf]));
+            let trak = bx(b"trak", &cat(&[tkhd(1, 64, 64), mdia]));
+            bx(b"moov", &cat(&[bx(b"mvhd", &[0u8; 100]), trak]))
+        };
+        let probe = make(0);
+        let at = (ftyp.len() + probe.len() + 8) as u64;
+        let moov = make(at);
+        assert_eq!(moov.len(), probe.len());
+        cat(&[ftyp, moov, mdat])
+    }
+
     use super::build::*;
     use super::*;
     use crate::annexb::{parse_avcc, to_annex_b, START_CODE};
@@ -621,6 +657,69 @@ mod tests {
     }
 
     /// AV1 samples are already OBUs; touching them would corrupt the stream.
+    /// The AV1 sequence header lives in `av1C` and, for a great many MP4
+    /// encoders, nowhere else. A decoder handed frames without it produces
+    /// nothing and no error -- the same silent black screen as a missing start
+    /// code, by a different route.
+    #[test]
+    fn the_av1_sequence_header_reaches_the_first_keyframe() {
+        let seq: &[u8] = &[0x0A, 0x0E, 0x00];
+        let mut av1c = vec![0x81, 0x00, 0x00, 0x00];
+        av1c.extend_from_slice(seq);
+        let file = av1_file(&av1c);
+
+        let mut d = Mp4Demuxer::open(MemorySource(file)).expect("open av1");
+        let first = d.next_packet().unwrap().unwrap();
+        assert!(first.is_keyframe);
+        assert_eq!(
+            &first.data[..seq.len()],
+            seq,
+            "the sequence header never reached the decoder"
+        );
+
+        // ...and NOT on every frame: a sequence header mid-sequence resets the
+        // decoder, so repeating it corrupts the stream rather than wasting
+        // bytes.
+        let second = d.next_packet().unwrap().unwrap();
+        assert_ne!(&second.data[..seq.len().min(second.data.len())], seq);
+    }
+
+    /// After a seek the decoder has been flushed and needs it again.
+    #[test]
+    fn the_sequence_header_is_re_emitted_after_a_seek() {
+        let seq: &[u8] = &[0x0A, 0x0E, 0x00];
+        let mut av1c = vec![0x81, 0x00, 0x00, 0x00];
+        av1c.extend_from_slice(seq);
+        let mut d = Mp4Demuxer::open(MemorySource(av1_file(&av1c))).unwrap();
+        while d.next_packet().unwrap().is_some() {}
+
+        d.seek(std::time::Duration::ZERO).unwrap();
+        let after = d.next_packet().unwrap().unwrap();
+        assert_eq!(
+            &after.data[..seq.len()],
+            seq,
+            "a flushed decoder was given frames with no sequence header"
+        );
+    }
+
+    /// An encoder that put the sequence header in the samples leaves configOBUs
+    /// empty; the samples must then pass through untouched.
+    #[test]
+    fn an_empty_av1_config_leaves_samples_alone() {
+        let mut d = Mp4Demuxer::open(MemorySource(av1_file(&[0x81, 0x00, 0x00, 0x00]))).unwrap();
+        let p = d.next_packet().unwrap().unwrap();
+        assert_eq!(p.data, vec![0xA0; 6], "an empty config still altered the frame");
+    }
+
+    /// A malformed av1C must not make the file unopenable: the samples may
+    /// carry their own header, and refusing turns a recoverable oddity into an
+    /// unplayable file.
+    #[test]
+    fn a_broken_av1c_still_opens() {
+        let d = Mp4Demuxer::open(MemorySource(av1_file(&[0x00, 0x00])));
+        assert!(d.is_ok(), "a bad av1C made the file unopenable");
+    }
+
     #[test]
     fn av1_samples_pass_through_unconverted() {
         // av1C: marker/version, seq_profile|level, then the bit-depth flags.

@@ -302,6 +302,77 @@ pub mod build {
 
 #[cfg(test)]
 mod tests {
+
+    /// Matroska in a `.mkv` opens exactly like WebM.
+    ///
+    /// `apps/vidkit-player`'s picker excluded `.mkv` with a comment saying the
+    /// demuxer "would very likely read it, but that is a claim to test rather
+    /// than assume". This is that test. The two containers share EBML and the
+    /// element IDs; the difference is the `DocType` string and which codecs are
+    /// permitted, and this parser reads neither -- it finds the track by ID and
+    /// the codec by `CodecID`, so a `matroska` DocType carrying VP9 parses
+    /// identically.
+    ///
+    /// The honest limit: Matroska permits codecs WebM does not (H.264, HEVC,
+    /// audio in formats we do not handle). Those fail later at the codec, with
+    /// a clear message, rather than here.
+    #[test]
+    fn a_matroska_doctype_parses_the_same_as_webm() {
+        use crate::build as w;
+        use crate::ebml::id;
+
+        let mk = |doctype: &str| {
+            let header = w::cat(&[
+                w::uint(0x4286, 1),                       // EBMLVersion
+                w::string(0x4282, doctype),               // DocType
+            ]);
+            let video = w::elem(
+                id::VIDEO,
+                &w::cat(&[w::uint(id::PIXEL_WIDTH, 320), w::uint(id::PIXEL_HEIGHT, 240)]),
+            );
+            let entry = w::cat(&[
+                w::uint(id::TRACK_NUMBER, 1),
+                w::uint(id::TRACK_TYPE, 1),
+                w::string(id::CODEC_ID, "V_VP9"),
+                video,
+            ]);
+            let info = w::cat(&[
+                w::uint(id::TIMESTAMP_SCALE, 1_000_000),
+                w::float64(id::DURATION, 66.0),
+            ]);
+            let cluster = w::elem(
+                id::CLUSTER,
+                &w::cat(&[
+                    w::uint(id::TIMESTAMP, 0),
+                    w::simple_block(1, 0, true, &[0xB0; 4]),
+                    w::simple_block(1, 33, false, &[0xB1; 4]),
+                ]),
+            );
+            let body = w::cat(&[
+                w::elem(id::INFO, &info),
+                w::elem(id::TRACKS, &w::elem(id::TRACK_ENTRY, &entry)),
+                cluster,
+            ]);
+            w::cat(&[w::elem(id::EBML_HEADER, &header), w::elem(id::SEGMENT, &body)])
+        };
+
+        let read = |bytes: Vec<u8>| {
+            let mut d = WebmDemuxer::open(vidkit_core::io::MemorySource(bytes)).expect("open");
+            let dims = d.dimensions();
+            let mut pts = Vec::new();
+            while let Ok(Some(p)) = d.next_packet() {
+                pts.push((p.pts, p.is_keyframe, p.data.clone()));
+            }
+            (dims, pts)
+        };
+
+        let webm = read(mk("webm"));
+        let mkv = read(mk("matroska"));
+        assert_eq!(webm.0, (320, 240));
+        assert!(!webm.1.is_empty(), "the fixture produced no packets");
+        assert_eq!(mkv, webm, "matroska parsed differently from webm");
+    }
+
     use super::build::*;
     use super::ebml::id;
     use super::*;

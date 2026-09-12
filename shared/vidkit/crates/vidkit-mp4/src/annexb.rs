@@ -182,3 +182,113 @@ pub fn to_annex_b(sample: &[u8], cfg: &NalConfig, prepend_parameter_sets: bool) 
     }
     Ok(out)
 }
+
+/// The sequence header held in `av1C`.
+///
+/// AV1 needs no start codes — samples are already OBUs — but it has the same
+/// out-of-band problem in a different shape. An `av1C` box carries
+/// `configOBUs` after its four-byte header, and for MP4 that is very often the
+/// **only** place the sequence header appears: encoders are permitted to omit
+/// it from the samples because the container is supposed to supply it.
+///
+/// A decoder handed frames with no sequence header produces nothing and, on
+/// dav1d, no error either — the same silent black screen as a missing start
+/// code, arriving by a different route. So the config OBUs are prepended to
+/// the first keyframe and to the first keyframe after a seek, exactly as the
+/// parameter sets are for H.264.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Av1Config {
+    /// `configOBUs`, verbatim. Empty when the encoder put the sequence header
+    /// in the samples instead, which is legal and needs no help from us.
+    pub config_obus: Vec<u8>,
+}
+
+/// Parse `av1C`.
+///
+/// Layout: `marker(1)|version(7)`, `seq_profile(3)|seq_level_idx_0(5)`,
+/// `seq_tier_0(1)|high_bitdepth(1)|twelve_bit(1)|monochrome(1)|
+/// chroma_subsampling_x(1)|_y(1)|chroma_sample_position(2)`,
+/// then a reserved/delay byte, then `configOBUs` to the end of the box.
+pub fn parse_av1c(data: &[u8]) -> Result<Av1Config> {
+    if data.len() < 4 {
+        return Err(Error::Malformed(format!("av1C is {} bytes", data.len())));
+    }
+    // marker must be 1 and version 1; anything else is a box we do not
+    // understand, and guessing at its layout would hand the decoder garbage
+    // that looks like a sequence header.
+    let marker = data[0] >> 7;
+    let version = data[0] & 0x7F;
+    if marker != 1 || version != 1 {
+        return Err(Error::Malformed(format!(
+            "av1C marker/version {marker}/{version}, expected 1/1"
+        )));
+    }
+    Ok(Av1Config {
+        config_obus: data[4..].to_vec(),
+    })
+}
+
+/// Prepend the config OBUs to a sample.
+///
+/// Returns the sample unchanged when there is nothing to add, so the common
+/// case allocates nothing extra.
+pub fn with_av1_config(sample: &[u8], cfg: &Av1Config, include: bool) -> Vec<u8> {
+    if !include || cfg.config_obus.is_empty() {
+        return sample.to_vec();
+    }
+    let mut out = Vec::with_capacity(cfg.config_obus.len() + sample.len());
+    out.extend_from_slice(&cfg.config_obus);
+    out.extend_from_slice(sample);
+    out
+}
+
+#[cfg(test)]
+mod av1_tests {
+    use super::*;
+
+    fn av1c(obus: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x81, 0x00, 0x00, 0x00];
+        v.extend_from_slice(obus);
+        v
+    }
+
+    #[test]
+    fn config_obus_are_everything_after_the_header() {
+        let c = parse_av1c(&av1c(&[0x0A, 0x0B, 0x00])).unwrap();
+        assert_eq!(c.config_obus, vec![0x0A, 0x0B, 0x00]);
+    }
+
+    /// An encoder that put the sequence header in the samples leaves this
+    /// empty, which is legal and needs no help.
+    #[test]
+    fn an_empty_config_is_not_an_error() {
+        let c = parse_av1c(&av1c(&[])).unwrap();
+        assert!(c.config_obus.is_empty());
+    }
+
+    /// Guessing at the layout of a box we do not understand would hand the
+    /// decoder garbage that looks like a sequence header.
+    #[test]
+    fn a_wrong_marker_or_version_is_refused() {
+        assert!(parse_av1c(&[0x01, 0, 0, 0]).is_err(), "marker 0 accepted");
+        assert!(parse_av1c(&[0x82, 0, 0, 0]).is_err(), "version 2 accepted");
+        assert!(parse_av1c(&[0x81, 0x00]).is_err(), "truncated box accepted");
+    }
+
+    #[test]
+    fn the_config_goes_in_front_of_the_frame() {
+        let cfg = Av1Config { config_obus: vec![0xAA, 0xBB] };
+        let out = with_av1_config(&[0x01, 0x02], &cfg, true);
+        assert_eq!(out, vec![0xAA, 0xBB, 0x01, 0x02]);
+    }
+
+    /// Prepending on every frame would corrupt the stream, not merely waste
+    /// bytes: a sequence header mid-sequence resets the decoder.
+    #[test]
+    fn nothing_is_prepended_when_not_asked_for() {
+        let cfg = Av1Config { config_obus: vec![0xAA] };
+        assert_eq!(with_av1_config(&[0x01], &cfg, false), vec![0x01]);
+        let empty = Av1Config::default();
+        assert_eq!(with_av1_config(&[0x01], &empty, true), vec![0x01]);
+    }
+}

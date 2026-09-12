@@ -1,6 +1,6 @@
 //! The `MediaSource` over a parsed MP4.
 
-use crate::annexb::{parse_config, to_annex_b, NalConfig};
+use crate::annexb::{parse_av1c, parse_config, to_annex_b, with_av1_config, Av1Config, NalConfig};
 use crate::boxes::*;
 use crate::moov::{parse_video_track, VideoTrack};
 use std::time::Duration;
@@ -11,6 +11,8 @@ pub struct Mp4Demuxer<S: ByteSource> {
     src: S,
     track: VideoTrack,
     nal_config: Option<NalConfig>,
+    /// AV1's sequence header, which lives in `av1C` and often nowhere else.
+    av1_config: Option<Av1Config>,
     cursor: usize,
     /// Samples whose Annex-B conversion should carry the parameter sets. Set
     /// after every seek and at start, cleared once a keyframe has carried them.
@@ -31,11 +33,20 @@ impl<S: ByteSource> Mp4Demuxer<S> {
 
         let track = parse_video_track(&mut src, &moov)?;
         let nal_config = parse_config(track.profile.codec, &track.codec_config)?;
+        // A malformed av1C is not fatal: the samples may carry their own
+        // sequence header, and refusing to open the file would turn a
+        // recoverable oddity into an unplayable one.
+        let av1_config = if track.profile.codec == vidkit_core::codec::Codec::Av1 {
+            parse_av1c(&track.codec_config).ok()
+        } else {
+            None
+        };
 
         Ok(Self {
             src,
             track,
             nal_config,
+            av1_config,
             cursor: 0,
             needs_parameter_sets: true,
         })
@@ -106,7 +117,17 @@ impl<S: ByteSource + Send> MediaSource for Mp4Demuxer<S> {
                 }
                 out
             }
-            None => raw,
+            None => match &self.av1_config {
+                Some(cfg) => {
+                    let with_seq = s.is_sync && self.needs_parameter_sets;
+                    let out = with_av1_config(&raw, cfg, with_seq);
+                    if with_seq {
+                        self.needs_parameter_sets = false;
+                    }
+                    out
+                }
+                None => raw,
+            },
         };
 
         Ok(Some(Packet {

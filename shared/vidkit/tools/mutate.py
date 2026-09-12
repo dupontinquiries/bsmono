@@ -321,6 +321,18 @@ MUTANTS = [
     ("stream/out-of-plan-not-counted", "crates/vidkit-ytdlp/src/http.rs",
      "                self.plan_misses += 1;", "                "),
 
+    # --- av1 sequence header ----------------------------------------------------
+    ("av1/sequence-header-never-emitted", "crates/vidkit-mp4/src/demux.rs",
+     "                    let with_seq = s.is_sync && self.needs_parameter_sets;",
+     "                    let with_seq = false;"),
+    ("av1/header-repeated-every-frame", "crates/vidkit-mp4/src/demux.rs",
+     "                    if with_seq {\n                        self.needs_parameter_sets = false;\n                    }",
+     "                    "),
+    ("av1/empty-config-still-prepended", "crates/vidkit-mp4/src/annexb.rs",
+     "    if !include || cfg.config_obus.is_empty() {", "    if false {"),
+    ("av1/unknown-av1c-version-accepted", "crates/vidkit-mp4/src/annexb.rs",
+     "    if marker != 1 || version != 1 {", "    if false {"),
+
     # --- clipboard / related ------------------------------------------------
     ("paste/playlist-beats-video", "crates/vidkit-ytdlp/src/paste.rs",
      'if let Some(v) = query_param(t, "v") {', 'if let Some(v) = query_param(t, "list_never") {'),

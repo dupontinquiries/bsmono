@@ -7,7 +7,7 @@ guess).
 
 Two pieces:
 
-- `shared/vidkit` — the kit. Nested workspace, 462 tests, 177 mutants.
+- `shared/vidkit` — the kit. Nested workspace, 472 tests, 181 mutants.
 - `apps/vidkit-player` — the app. Registered in `manifest/projects.toml` as
   `role = "app"` and offered in gitmind's fleet store.
 

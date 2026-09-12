@@ -80,9 +80,9 @@ trusting them.
 ## Commands
 
 ```sh
-cargo test --ignore-rust-version            # 462 tests
+cargo test --ignore-rust-version            # 472 tests
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json cargo test -p vidkit-vk
-python3 tools/mutate.py                     # 177 mutants, all must be killed
+python3 tools/mutate.py                     # 181 mutants, all must be killed
 python3 tools/mutate.py shader              # just the WGSL ones
 ```
 

@@ -2516,6 +2516,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vidkit-relevance"
+version = "0.1.0"
+
+[[package]]
 name = "vidkit-webm"
 version = "0.1.0"
 dependencies = [
@@ -2530,6 +2534,7 @@ dependencies = [
  "serde",
  "serde_json",
  "vidkit-core",
+ "vidkit-relevance",
 ]
 
 [[package]]

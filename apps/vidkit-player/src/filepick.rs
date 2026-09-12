@@ -18,9 +18,18 @@ use uikit_egui::fuzzy;
 /// Deliberately short. Listing `.mkv` or `.avi` because they are video would
 /// be a lie: nothing here parses them, and a file that appears in the picker
 /// and then fails to open is a worse experience than one that never appeared.
-/// `.mkv` IS Matroska and the WebM demuxer would very likely read it, but that
-/// is a claim to test rather than assume, so it stays out until it is.
-pub const PLAYABLE: &[&str] = &["mp4", "m4v", "mov", "webm"];
+/// `.mkv` is now in, and it was a claim to TEST rather than assume:
+/// `a_matroska_doctype_parses_the_same_as_webm` in `vidkit-webm` builds the
+/// same file twice with `DocType` "webm" and "matroska" and asserts the
+/// demuxer produces byte-identical packets. It does -- the two share EBML and
+/// the element IDs, and the parser reads neither the DocType nor a codec
+/// allow-list.
+///
+/// The honest limit, which is why the test says so too: Matroska permits
+/// codecs WebM does not (H.264, HEVC, audio we do not handle). Those now fail
+/// at the codec with a clear message instead of being hidden behind a picker
+/// that never showed the file. That is the better failure.
+pub const PLAYABLE: &[&str] = &["mp4", "m4v", "mov", "webm", "mkv"];
 
 /// Does this filename look playable?
 pub fn is_playable(name: &str) -> bool {
@@ -127,7 +136,11 @@ mod tests {
         for ok in ["clip.mp4", "a.webm", "B.MP4", "x.MOV", "y.m4v"] {
             assert!(is_playable(ok), "{ok} should be playable");
         }
-        for no in ["notes.txt", "clip.mkv", "image.png", "mp4", "", "archive.mp4.gz"] {
+        // .mkv moved to the playable list once
+        // `a_matroska_doctype_parses_the_same_as_webm` proved the demuxer
+        // reads it; it was excluded on an assumption, not a measurement.
+        assert!(is_playable("clip.mkv"));
+        for no in ["notes.txt", "image.png", "mp4", "", "archive.mp4.gz"] {
             assert!(!is_playable(no), "{no} should not be playable");
         }
     }
@@ -138,7 +151,7 @@ mod tests {
     fn the_playable_list_only_names_formats_a_demuxer_handles() {
         for ext in PLAYABLE {
             assert!(
-                matches!(*ext, "mp4" | "m4v" | "mov" | "webm"),
+                matches!(*ext, "mp4" | "m4v" | "mov" | "webm" | "mkv"),
                 "{ext} is offered but no demuxer here reads it"
             );
         }
