@@ -186,6 +186,71 @@ struct Roamer {
     graze_cell: (i32, i32),
     /// r300: `roamer_tick` value at the last graze scan (cadence gate).
     graze_scan_tick: u32,
+    /// r-rig: everything the oriented entity path (`anim_rig`) and the melee
+    /// loop read about this creature. One field so the five constructors
+    /// each add one line; `Default` is a standing, idle, unhurt body.
+    rig: RoamerRig,
+}
+
+/// r-rig: per-roamer animation / physics / combat state for
+/// `creature_to_vertices_rigged` and `sim::melee`.
+#[derive(Debug, Clone, Default)]
+struct RoamerRig {
+    /// Horizontal speed this tick (blocks/s), smoothed. Roamers move by
+    /// setting their position and never wrote `body.velocity`, so the old
+    /// entity path saw speed 0 and its legs never swung (this is why walking
+    /// creatures slid).
+    speed: f32,
+    /// Bedded-down amount `[0,1]`, eased toward `resting`.
+    settle: f32,
+    resting: bool,
+    /// Landing squash `[0,1]`, set on touchdown, decays.
+    impact: f32,
+    /// Normalised yaw rate `[-1,1]` (tail swings out of the turn).
+    turn01: f32,
+    prev_yaw: f32,
+    /// Position at the previous tick (speed is a position delta: roamers
+    /// never write `body.velocity`). `None` until the first tick.
+    prev_pos: Option<[f32; 3]>,
+    /// The melee loop (predators hunting); `strike01` feeds the lunge.
+    bout: unendlich_engine::sim::melee::Bout,
+    strike01: f32,
+    /// Set on death: the ragdoll takes the body for `DEATH_LINGER` seconds
+    /// while the pose blends toward it, then the roamer is removed.
+    dying: Option<Dying>,
+}
+
+/// r-rig: a dead roamer's ragdoll (`sim::ragdoll_bridge::from_anatomy`).
+#[derive(Debug, Clone)]
+struct Dying {
+    nodes: Vec<unendlich_engine::sim::ragdoll::Node>,
+    sticks: Vec<unendlich_engine::sim::ragdoll::Stick>,
+    /// Seconds since death.
+    t: f32,
+}
+
+/// r-rig: how long a corpse lies before the roamer is removed.
+const DEATH_LINGER: f32 = 6.0;
+/// r-rig: `Dying` progress reaches 1 (pure ragdoll) this long after death.
+const DEATH_BLEND: f32 = 0.6;
+
+/// r-rig: begin a roamer's death: build the ragdoll from its anatomy with
+/// the killing blow's `impulse`, keep the roamer for `DEATH_LINGER`. A
+/// creature without anatomy (a forge dragon renders its own model) has no
+/// parts to land on nodes, so it is removed at once as before.
+fn begin_death(roamers: &mut Vec<Roamer>, i: usize, impulse: [f32; 3], dt: f32) {
+    let Some(r) = roamers.get_mut(i) else { return };
+    if r.rig.dying.is_some() {
+        return;
+    }
+    let Some(anat) = r.creature.anatomy.as_ref() else {
+        roamers.swap_remove(i);
+        return;
+    };
+    let (nodes, sticks) = unendlich_engine::sim::ragdoll_bridge::from_anatomy(&r.creature, anat, impulse, dt.max(1e-3));
+    r.rig.dying = Some(Dying { nodes, sticks, t: 0.0 });
+    r.rig.strike01 = 0.0;
+    r.rig.resting = false;
 }
 
 /// r666: build a wild, persistent [`Roamer`] of `kind` at `pos`, seeded by
@@ -268,6 +333,7 @@ fn build_roamer(kind: unendlich_engine::item::CreatureKind, pos: [f32; 3], wseed
         graze_target: None,
         graze_cell: (i32::MIN, i32::MIN),
         graze_scan_tick: 0,
+                        rig: RoamerRig::default(),
     }
 }
 
@@ -5619,6 +5685,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         graze_target: None,
                         graze_cell: (i32::MIN, i32::MIN),
                         graze_scan_tick: 0,
+                        rig: RoamerRig::default(),
                     });
                     log::info!(
                         "[director] {:?} spawned at ({:.0},{:.0}) — {} (phase {:.2})",
@@ -6582,6 +6649,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         graze_target: None,
                         graze_cell: (i32::MIN, i32::MIN),
                         graze_scan_tick: 0,
+                        rig: RoamerRig::default(),
                     });
                     hatched += 1;
                 }
@@ -8584,6 +8652,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             graze_target: None,
                             graze_cell: (i32::MIN, i32::MIN),
                             graze_scan_tick: 0,
+                        rig: RoamerRig::default(),
                         });
                     }
                 }
@@ -8629,9 +8698,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         unendlich_engine::item::CreatureKind::Dragon => 2u8,
                         _ => 0u8,
                     };
-                    (k, r.creature.body.position, r.creature.mass)
+                    // r-rig: a corpse is not prey (kind 255 matches nothing)
+                    (if r.rig.dying.is_some() { 255u8 } else { k }, r.creature.body.position, r.creature.mass)
                 })
                 .collect();
+            // r-rig: prey hp for the melee loop (a Fighter needs the defender's hp),
+            // and the blows landed this tick, applied after the loop.
+            let herd_hp: Vec<i32> = roamers.iter().map(|r| r.hp).collect();
+            let mut prey_hits: Vec<(usize, f32, [f32; 3], f32)> = Vec::new();
             let mut prey_killed: Vec<usize> = Vec::new();
             // r166: HIDING — sneaking inside tall flora conceals you:
             // creature SIGHT fails (hearing still works at reduced loudness,
@@ -8784,9 +8858,32 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     graze_cell,
                     graze_scan_tick,
                     home, // r693: den anchor for dragon territorial defense
+                    rig,
                     ..
                 } = r;
                 let self_xz = (cr.body.position[0], cr.body.position[2]);
+                // r-rig: per-tick bookkeeping from the previous tick's motion:
+                // speed and yaw rate from deltas (smoothed), landing squash
+                // decay, and the bedded-down ease toward `resting`.
+                {
+                    let p = cr.body.position;
+                    let inst = match rig.prev_pos {
+                        Some(q) if dt > 1e-4 => ((p[0] - q[0]).powi(2) + (p[2] - q[2]).powi(2)).sqrt() / dt,
+                        _ => 0.0,
+                    };
+                    rig.speed += (inst.min(12.0) - rig.speed) * (dt * 8.0).min(1.0);
+                    let dyaw = {
+                        use std::f32::consts::{PI, TAU};
+                        (cr.yaw - rig.prev_yaw + PI).rem_euclid(TAU) - PI
+                    };
+                    let rate = if dt > 1e-4 { (dyaw / dt) / turn_rate.max(0.1) } else { 0.0 };
+                    rig.turn01 += (rate.clamp(-1.0, 1.0) - rig.turn01) * (dt * 6.0).min(1.0);
+                    rig.prev_pos = Some(p);
+                    rig.prev_yaw = cr.yaw;
+                    rig.impact *= (-6.0 * dt).exp();
+                    let target = if rig.resting { 1.0 } else { 0.0 };
+                    rig.settle += (target - rig.settle) * (dt * 1.5).min(1.0);
+                }
                 // Advance the forge idle clock. It was never ticked, so anim_time
                 // stayed 0 for every live creature and the forge's idle animations
                 // (breathing, wing beat, jaw, head idle-scan) were frozen — only
@@ -8895,6 +8992,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     }
                 };
 
+                // r-rig: a dead creature is a ragdoll now — step it, keep it on
+                // the ground it died on, and skip every living behaviour.
+                if let Some(d) = rig.dying.as_mut() {
+                    d.t += dt;
+                    let ground = surface_at(cr.body.position[0], cr.body.position[2])
+                        .map(|t| (t + 1) as f32)
+                        .unwrap_or(cr.body.position[1] - 1.0);
+                    unendlich_engine::sim::ragdoll::step(&mut d.nodes, &d.sticks, ground, dt.max(1e-3), 4);
+                    rig.speed = 0.0;
+                    continue;
+                }
+
                 // --- Airborne: integrate a leap arc, then everything else waits ---
                 if let Some((v, aloft0)) = *airborne {
                     let mut v = v;
@@ -8933,6 +9042,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             cr.body.position[1] = cr.grounded_y((t + 1) as f32);
                         }
                         *airborne = None;
+                        // r-rig: touchdown → landing squash, scaled by the fall speed
+                        rig.impact = (nvy.abs() / 12.0).clamp(0.0, 1.0).max(rig.impact);
                     }
                     continue; // skip normal movement while in the air
                 }
@@ -9205,7 +9316,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             unendlich_engine::sim::behavior_arbiter::Drives {
                                 threat: tdn,
                                 hunger: (1.0 - vitality.energy).clamp(0.0, 1.0),
-                                fatigue: 0.0, // (rest_cycle wiring is a later refinement)
+                                // r-rig: the rest urge (species rhythm × time of day ×
+                                // hunger-as-fatigue × rain), so Rest can win the argmax
+                                fatigue: unendlich_engine::sim::rest_cycle::rest_urge(
+                                    unendlich_engine::sim::rest_cycle::rhythm_for(*kind),
+                                    sky_state.day_phase(),
+                                    1.0 - vitality.energy.clamp(0.0, 1.0),
+                                    0.3 * precip01,
+                                ),
                                 aggression: eff_aggression,
                                 health_frac: (*hp as f32 / 40.0).clamp(0.0, 1.0),
                             }
@@ -9469,19 +9587,72 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         })
                         .collect();
                     if let ppm::Act::Hunt(prey_idx) = ppm::decide(&me, &others) {
-                        let (_, tp, _) = herd_snapshot[prey_idx];
+                        let (_, tp, tsize) = herd_snapshot[prey_idx];
                         let ddx = tp[0] - mypos[0];
                         let ddz = tp[2] - mypos[2];
                         let dd = (ddx * ddx + ddz * ddz).sqrt();
-                        if dd > 1.5 {
-                            // chase overrides wander heading at sprint pace
-                            rdx = ddx / dd * 3.2;
-                            rdz = ddz / dd * 3.2;
-                        } else {
-                            prey_killed.push(prey_idx);
-                            vitality.feed(0.5);
-                            log::info!("[ecology] Dinosaur brought down prey at ({:.0},{:.0})", tp[0], tp[2]);
+                        // r-rig: the kill is no longer instant at 1.5 blocks. The REAL
+                        // sim::melee loop runs: close, wind up, the bite lands on the
+                        // frame the lunge peaks (strike01 feeds anim_rig), recover,
+                        // repeat until a blow is lethal. Prey with more hp survives
+                        // a bite and can be knocked back.
+                        use unendlich_engine::sim::melee;
+                        let body_len = cr.body.half_extents[0].max(cr.body.half_extents[2]);
+                        let att = melee::Fighter {
+                            hp: (*hp).max(0) as f32,
+                            max_hp: 40.0,
+                            mass: cr.mass.max(0.5),
+                            reach: 0.8 + body_len,
+                            power: 8.0 + 2.0 * cr.mass,
+                            accuracy: 1.0,
+                            evasion: 0.5,
+                            armor: 0.0,
+                            left_hp: 20.0,
+                            right_hp: 20.0,
+                        };
+                        let def = melee::Fighter {
+                            hp: herd_hp.get(prey_idx).copied().unwrap_or(40).max(0) as f32,
+                            max_hp: 40.0,
+                            mass: tsize.max(0.5),
+                            evasion: 0.7,
+                            ..Default::default()
+                        };
+                        let roll = {
+                            let sd = (frame_count as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(prey_idx as u64 * 977);
+                            ((sd >> 40) & 0xFFFF) as f32 / 65535.0
+                        };
+                        let prey_radius = 0.5 * tsize.max(0.5);
+                        let (mv, blow) = melee::tick(&mut rig.bout, &att, &def, prey_radius, dd, 0.5, dt, roll);
+                        rig.strike01 = rig.bout.strike01(att.mass);
+                        match mv {
+                            melee::Move::Close => {
+                                // chase overrides wander heading at sprint pace
+                                rdx = ddx / dd.max(0.01) * 3.2;
+                                rdz = ddz / dd.max(0.01) * 3.2;
+                            }
+                            melee::Move::Hold | melee::Move::Back => {
+                                rdx = 0.0;
+                                rdz = 0.0;
+                                w.heading = ddz.atan2(ddx);
+                            }
                         }
+                        if let Some(e) = blow {
+                            if e.hit {
+                                let dir = [ddx / dd.max(0.01), 0.0, ddz / dd.max(0.01)];
+                                prey_hits.push((prey_idx, e.damage, dir, e.knockback));
+                                if e.lethal {
+                                    prey_killed.push(prey_idx);
+                                    vitality.feed(0.5);
+                                    log::info!("[ecology] Dinosaur brought down prey at ({:.0},{:.0}) — {:.1} dmg, overkill {:.1}", tp[0], tp[2], e.damage, e.overkill);
+                                } else {
+                                    log::info!("[ecology] Dinosaur bites prey for {:.1} (hp {:.0} left)", e.damage, e.defender_hp);
+                                }
+                            } else {
+                                log::info!("[ecology] Dinosaur's bite misses");
+                            }
+                        }
+                    } else {
+                        rig.strike01 = 0.0;
                     }
                 }
                 _t_herdscan_us += _t_hs.elapsed().as_micros() as u64;
@@ -9489,14 +9660,19 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // Diurnal fauna bed down at night, Nocturnal listeners by day,
                 // Crepuscular at the extremes, dragons (Cathemeral) rarely.
                 // Threat overrides rest; fatigue = hunger here.
+                if threat.is_some() {
+                    rig.resting = false;
+                }
                 if threat.is_none() {
                     let rhythm = unendlich_engine::sim::rest_cycle::rhythm_for(*kind);
                     let fatigue = 1.0 - vitality.energy.clamp(0.0, 1.0);
                     // r156: storms drive shelter-seeking — precipitation
                     // biases the urge so the herd hunkers down in the rain.
-                    if unendlich_engine::sim::rest_cycle::wants_rest(
+                    let resting_now = unendlich_engine::sim::rest_cycle::wants_rest(
                         rhythm, sky_state.day_phase(), fatigue, 0.3 * precip01,
-                    ) {
+                    );
+                    rig.resting = resting_now;
+                    if resting_now {
                         rdx = 0.0;
                         rdz = 0.0;
                         if frame_count % 1800 == 0 && rest_log_budget > 0 {
@@ -10191,6 +10367,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 graze_target: None,
                                 graze_cell: (i32::MIN, i32::MIN),
                                 graze_scan_tick: 0,
+                        rig: RoamerRig::default(),
                             });
                         }
                     }
@@ -10199,12 +10376,30 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // r141: resolve predator kills (deferred — indices were into the
             // pre-loop snapshot; remove highest-first so swap_remove is safe,
             // and only while the index still points at a non-persistent prey).
+            // r-rig: apply this tick's landed bites: hp, a shove along the bite,
+            // and a flinch if the prey was mid-strike itself.
+            for (pi, dmg, dir, kb) in prey_hits {
+                if let Some(pr) = roamers.get_mut(pi) {
+                    if pr.rig.dying.is_some() { continue; }
+                    pr.hp -= dmg.round().max(1.0) as i32;
+                    let v = &mut pr.creature.body.velocity;
+                    v[0] += dir[0] * kb;
+                    v[1] += 0.6;
+                    v[2] += dir[2] * kb;
+                    pr.creature.body.position[0] += dir[0] * kb * 0.08;
+                    pr.creature.body.position[2] += dir[2] * kb * 0.08;
+                    pr.rig.bout.flinch(dmg, 40.0);
+                    pr.rig.impact = (kb / 10.0).clamp(0.0, 0.6).max(pr.rig.impact);
+                }
+            }
             prey_killed.sort_unstable_by(|a, b| b.cmp(a));
             prey_killed.dedup();
             for pi in prey_killed {
                 if pi < roamers.len() && !roamers[pi].persistent {
                     let p = roamers[pi].creature.body.position;
-                    roamers.swap_remove(pi);
+                    // r-rig: the corpse stays as a ragdoll (see begin_death); the
+                    // meat drops now as before.
+                    begin_death(&mut roamers, pi, [0.0, 1.5, 0.0], dt);
                     fg_app.drops_mut().spawn(
                         unendlich_engine::items::ItemStack {
                             item: unendlich_engine::items::ItemId(MEAT_ITEM),
@@ -10216,6 +10411,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     );
                 }
             }
+            // r-rig: corpses that have lain for DEATH_LINGER are gone.
+            roamers.retain(|r| r.rig.dying.as_ref().map_or(true, |d| d.t < DEATH_LINGER));
             }
         }
 
@@ -10887,7 +11084,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 log::info!("[loot] …and an egg");
                             }
                             log::info!("[loot] {} meat (tier {})", meat_n, tier);
-                            roamers.swap_remove(ri);
+                            // r-rig: the body falls as a ragdoll, carrying the blow's
+                            // knockback, instead of vanishing on the hit frame.
+                            let kb = 3.0 * player_stature.knockback_dealt;
+                            begin_death(
+                                &mut roamers,
+                                ri,
+                                [cam_forward.x * kb, 2.0, cam_forward.z * kb],
+                                dt,
+                            );
                         }
                         last_block_action = Instant::now();
                         creature_hit = true;
@@ -13712,9 +13917,40 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
             }
             // Append the streamed ambient roamers.
+            // r-rig: through the oriented rig (creature_to_vertices_rigged): legs
+            // pivot and plant at the roamer's real speed, the tail bends out of
+            // turns, a landing squashes, a resting creature beds down, a hunting
+            // predator lunges, and a dead one lies where its ragdoll put it.
             for r in &roamers {
                 let cr = &r.creature;
-                let (cv, ci) = creature_to_vertices(cr);
+                use unendlich_engine::sim::liveliness::MotionState;
+                let (state, progress) = match r.rig.dying.as_ref() {
+                    Some(d) => (MotionState::Dying, (d.t / DEATH_BLEND).min(1.0)),
+                    None if r.rig.settle > 0.5 => (MotionState::Resting, 0.0),
+                    None if r.rig.speed > 0.2 => (MotionState::Walking, 0.0),
+                    None => (MotionState::Idle, 0.0),
+                };
+                let motion = unendlich_engine::anim_rig::MotionInput {
+                    gait_phase: cr.gait_phase,
+                    speed: r.rig.speed,
+                    flying: r.flying,
+                    fly_power: if r.flying { 1.0 } else { 0.0 },
+                    turn: r.rig.turn01,
+                    gaze_yaw: cr.gaze_yaw,
+                    gaze_pitch: cr.gaze_pitch,
+                    state,
+                    progress,
+                    time: cr.anim_time,
+                    impact: r.rig.impact,
+                    settle: r.rig.settle,
+                    strike: r.rig.strike01,
+                    ..Default::default()
+                };
+                let sample = r.rig.dying.as_ref().map(|d| {
+                    unendlich_engine::sim::ragdoll_bridge::sample_body_local(&d.nodes, cr.body.position, cr.yaw)
+                });
+                let rd = sample.as_ref().map(|(body, parts)| unendlich_engine::anim_rig::RagdollSample { body: *body, parts });
+                let (cv, ci) = unendlich_engine::world::entity::creature_to_vertices_rigged(cr, &motion, rd.as_ref(), 0.0);
                 let base = everts.len() as u32;
                 everts.extend(cv);
                 eindices.extend(ci.iter().map(|i| i + base));
