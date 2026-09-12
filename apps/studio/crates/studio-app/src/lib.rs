@@ -1123,6 +1123,55 @@ impl Studio {
     /// played — `split_on_grid_ops`'s promises. Cutting by the grid rather
     /// than by ear is also the answer to editing over a Bluetooth link,
     /// where the ear is a few hundred milliseconds late.
+    /// Set every delay's `time` to a note length at the working tempo:
+    /// `sixteenths` sixteenth-notes (3 = the dotted eighth, 2 = an eighth,
+    /// 1 = a sixteenth, 4 = a quarter). Every bus chain, and the
+    /// effect chains of the selected clips. `instantiate` has a rate and
+    /// no tempo, so this is where sync lives — as ops, so it undoes and
+    /// travels. The tempo is the active song's map at the playhead when
+    /// it has one (the ruler's own lookup), else the rack's — the clock
+    /// the grid splits use.
+    pub fn sync_delays_to_tempo(&mut self, sixteenths: u8) -> usize {
+        let p = &self.session.doc.project;
+        let bpm = self.active_song
+            .and_then(|id| p.groups.get(&id))
+            .and_then(|g| g.tempo.as_ref())
+            .map(|m| m.bpm_at(self.playhead()))
+            .unwrap_or(self.rack.tempo_bpm);
+        let ms = studio_fx::space::beats_to_ms(bpm, sixteenths as f32 / 4.0);
+        let retime = |chain: &[studio_core::Effect]| -> Option<Vec<studio_core::Effect>> {
+            if !chain.iter().any(|e| e.kind == "delay") { return None; }
+            Some(chain.iter().map(|e| {
+                let mut e = e.clone();
+                if e.kind == "delay" { e.params.insert("time".into(), ms); }
+                e
+            }).collect())
+        };
+        let mut ops = Vec::new();
+        for b in p.busses.values() {
+            if let Some(chain) = retime(&b.chain) {
+                ops.push(studio_core::Op::SetBusChain { id: b.id, chain });
+            }
+        }
+        for id in &self.selection {
+            if let Some(c) = p.clips.get(id) {
+                if let Some(effects) = retime(&c.effects) {
+                    ops.push(studio_core::Op::SetEffects { id: *id, effects });
+                }
+            }
+        }
+        let n = ops.len();
+        for op in ops { self.edit(op, "sync delay"); }
+        self.status = if n == 0 {
+            "sync delay: no delay on any bus or selected clip".into()
+        } else {
+            format!("sync delay: {n} chain(s) set to {ms:.1} ms ({} at {bpm:.0} BPM)",
+                    match sixteenths { 1 => "a sixteenth", 2 => "an eighth", 3 => "a dotted eighth",
+                                       4 => "a quarter", _ => "the note" })
+        };
+        n
+    }
+
     pub fn split_selection_on_grid(&mut self, steps: i64) {
         if self.selection.is_empty() {
             self.status = "split on grid: nothing selected".into();
@@ -4652,6 +4701,7 @@ impl App {
                     self.studio.new_curve_on_selection(t);
                 }
                 palette::ShellVerb::SplitOnGrid(steps) => self.studio.split_selection_on_grid(steps as i64),
+                palette::ShellVerb::SyncDelay(n) => { self.studio.sync_delays_to_tempo(n); }
                 palette::ShellVerb::Overlap(policy) => {
                     let track = self.studio.selection.first()
                         .and_then(|c| self.studio.session.doc.project.clips.get(c)).map(|c| c.track);
@@ -5662,6 +5712,33 @@ mod mixer_tests {
         let peak = |v: &[f32]| v[..9600].iter().fold(0f32, |a, s| a.max(s.abs()));
         assert!(peak(&both) > 0.5, "kick present unsolo'd: {}", peak(&both));
         assert!(peak(&solo) < 0.35, "solo'd to the pad, kick gone: {}", peak(&solo));
+    }
+
+    #[test]
+    fn a_delay_syncs_to_the_tempo_as_an_op_and_undoes() {
+        let mut s = Studio::demo();
+        s.rack.tempo_bpm = 140.0;
+        let bus = studio_core::BusId(77);
+        s.edit(studio_core::Op::AddBus { bus: studio_core::Bus {
+            id: bus, name: "verb".into(), parent: None, gain: 1.0,
+            chain: vec![mixer_panel::effect("delay", &[("time", 100.0), ("feedback", 0.4)]),
+                        mixer_panel::effect("gain", &[("db", 0.0)])],
+            sends: vec![], muted: false } }, "bus");
+        let before = s.session.doc.history().len();
+        assert_eq!(s.sync_delays_to_tempo(3), 1, "one chain had a delay");
+        let chain = &s.session.doc.project.busses[&bus].chain;
+        assert!((chain[0].params["time"] - 321.428).abs() < 0.01, "dotted eighth at 140: {}", chain[0].params["time"]);
+        assert_eq!(chain[0].params["feedback"], 0.4, "the other params are kept");
+        assert_eq!(chain[1].kind, "gain", "and the rest of the chain is untouched");
+        assert_eq!(s.session.doc.history().len(), before + 1, "one op, so one undo");
+        assert!(s.status.contains("321.4 ms"), "{}", s.status);
+        s.key(studio_egui::keys::Key::c('u'));
+        assert_eq!(s.session.doc.project.busses[&bus].chain[0].params["time"], 100.0, "undo restores");
+        assert_eq!(s.sync_delays_to_tempo(1), 1);
+        assert!((s.session.doc.project.busses[&bus].chain[0].params["time"] - 107.14).abs() < 0.01, "a sixteenth");
+        s.edit(studio_core::Op::SetBusChain { id: bus, chain: vec![] }, "clear");
+        assert_eq!(s.sync_delays_to_tempo(2), 0, "nothing to sync says so");
+        assert!(s.status.contains("no delay"), "{}", s.status);
     }
 
     #[test]

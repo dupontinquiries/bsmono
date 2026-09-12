@@ -87,6 +87,9 @@ pub enum ShellVerb {
     NewCurve,
     /// Cut the selection on the rack grid every N steps (4 = beat, 16 = bar).
     SplitOnGrid(u8),
+    /// Every delay's time to N sixteenths at the working tempo — the
+    /// sync `instantiate` cannot do, since it has a rate and no tempo.
+    SyncDelay(u8),
     /// The strip's binding gets its own copy of its curve.
     MakeCurveUnique,
     /// Overlap policy for the selected clip's track (every track with none selected).
@@ -276,6 +279,12 @@ pub fn root() -> Vec<Choice> {
         c("automation curve on selected clips", None, Then::Do(Act::Shell(ShellVerb::NewCurve))),
         c("split selection on beats", None, Then::Do(Act::Shell(ShellVerb::SplitOnGrid(4)))),
         c("split selection on bars", None, Then::Do(Act::Shell(ShellVerb::SplitOnGrid(16)))),
+        // Delay sync: the four lengths a producer reaches for, the trap
+        // default first.
+        c("sync delay to tempo: dotted eighth", None, Then::Do(Act::Shell(ShellVerb::SyncDelay(3)))),
+        c("sync delay to tempo: eighth", None, Then::Do(Act::Shell(ShellVerb::SyncDelay(2)))),
+        c("sync delay to tempo: quarter", None, Then::Do(Act::Shell(ShellVerb::SyncDelay(4)))),
+        c("sync delay to tempo: sixteenth", None, Then::Do(Act::Shell(ShellVerb::SyncDelay(1)))),
         c("make curve unique (strip's binding)", None, Then::Do(Act::Shell(ShellVerb::MakeCurveUnique))),
         c("overlap: newest wins (trim what it lands on)", None, Then::Do(Act::Shell(ShellVerb::Overlap(studio_core::Overlap::Trim)))),
         c("overlap: shadow lane (a track beside it, same bus)", None, Then::Do(Act::Shell(ShellVerb::Overlap(studio_core::Overlap::Lane)))),
