@@ -3240,17 +3240,31 @@ already found a couple of "ported twice, wired once" cases this session) before 
 
 ## Open after the 2026-09-08 session
 
-### The file is 10,441 lines and ONE METHOD is 6,492 of them
+### CORRECTION to the sizes published earlier
 
-`spatial_ui` is 62% of the file. That is the real problem, not the file's length: the
-remaining top-level items are small and findable, and everything hard to navigate is inside
-one method. Its first block (drag-and-drop ingest) is only 26 lines, so there is no single
-big lump to lift — it is a long sequence of inline sections, and splitting it safely wants
-more room than a session's tail end. Starting and stopping halfway leaves it worse than
-either end.
+The figures in the previous entry ("`spatial_ui` 6492") were WRONG. The script that produced
+them counted `{` and `}` in string literals and comments, so every function looked longer
+than it is and `spatial_ui` appeared to run 4,000 lines past its actual end. Re-measured with
+a scanner that skips strings, chars, line comments and block comments:
 
-Sizes, for whoever picks it up: `spatial_ui` 6492, `ui` 2235, `run_command` 711,
-`apply_evt` 379.
+    spatial_ui 2707   ui 2236   run_command 712   apply_evt 380   modal_banner 152
+
+The mistake mattered: I sliced the file at the bad offset first and cut `spatial_ui` in half,
+which the compiler caught as an unclosed `impl`. A naive brace count is not good enough to
+cut a file with.
+
+### The methods, after the seventh cut
+
+`spatial_ui` (2,707) is now in `chat_spatial.rs` — moved WHOLE, not decomposed. Those are
+different jobs and only one is safe mechanically: the compiler proves a move, and it cannot
+prove that a block lifted out of the middle did not depend on a local three hundred lines
+above it.
+
+Still to do, in size order:
+- [ ] Decompose `spatial_ui` itself — the scene, the drop ingest, the panels and the
+      transcript are four things in one function.
+- [ ] `ui` (2,236) — same treatment: move it out first, decompose after.
+- [ ] `run_command` (712).
 
 ### chat.rs is still 10,441 lines
 Six cuts done (tests, scene/slab, save format, formatters, dock, `mic_shape`), each verified
