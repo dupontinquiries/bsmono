@@ -84,6 +84,7 @@ fn main() {
     floor_scenario();
     propose_scenario();
     dossier_scenario();
+    verb_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -1358,4 +1359,40 @@ fn dossier_scenario() {
     assert!(log.iter().any(|l| l.contains("blockout")), "it blocked out first: {log:?}");
     assert!(log.iter().any(|l| l.contains("massing")), "and judged it");
     assert!(log.iter().any(|l| l.contains("lighting")), "and lit the inside: {log:?}");
+}
+
+
+/// A verb read off the request and applied when the build lands.
+fn verb_scenario() {
+    use paintbrush::Paintbrush;
+    println!("\n==== a verb applied to a build");
+    struct M;
+    impl voxel_tools::llm::Completer for M {
+        fn name(&self) -> &str { "m" }
+        fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            if let Some(r) = route_answer(user) { return Ok(r); }
+            Ok("form tower size=medium block=stone\n".into())
+        }
+    }
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(M))));
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -14.0], [0.0, -0.3, 1.0], Some(([0, 64, 0], [0, 1, 0], 15.0)));
+    pb.start_turn(&cm, &gaze, Some("grass"), "a half-built stone tower", None);
+    let t0 = std::time::Instant::now();
+    while pb.run.as_ref().map(|r| r.is_running()).unwrap_or(false) && t0.elapsed().as_secs() < 40 {
+        pb.poll_turn(&cm); pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    use voxel_tools::chatbox::Key;
+    pb.key(Key::Enter);
+    for c in "/commit".chars() { pb.key(Key::Char(c)); }
+    if let Some(cmd) = pb.key(Key::Enter) { pb.dispatch(&cm, &gaze, cmd); }
+    for _ in 0..40 { pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(4)); }
+    let log = pb.drain_log();
+    for l in log.iter().filter(|l| l.contains("half-built") || l.contains("removed")) {
+        println!("  {}", l.trim().chars().take(110).collect::<String>());
+    }
+    assert!(log.iter().any(|l| l.contains("it is half-built")), "the verb was read: {log:?}");
+    assert!(log.iter().any(|l| l.contains("half-built:") && l.contains("removed")),
+            "and applied when the build landed: {log:?}");
 }

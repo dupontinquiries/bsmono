@@ -62,7 +62,17 @@ impl Verb {
     /// these are the verbs themselves, and there are nine.
     pub fn parse(s: &str) -> Option<Verb> {
         let l = s.to_lowercase();
-        let has = |w: &str| l.split(|c: char| !c.is_alphanumeric()).any(|x| x == w);
+        // HYPHENS ARE HOW PEOPLE WRITE THESE. "half-built" split into
+        // `half` and `built` and matched neither -- the verb went
+        // unread and the build came out whole. The joined form is
+        // checked too, so "half-built", "half built" and "halfbuilt"
+        // are the same word.
+        // spaces too: "half built" is the same word written a third way
+        let joined = l.replace(['-', '_', ' '], "");
+        let has = |w: &str| l.split(|c: char| !c.is_alphanumeric()).any(|x| x == w)
+            // a joined run contains the word rather than equalling it,
+            // since the whole request is now one string
+            || (w.len() > 5 && joined.contains(w));
         for (v, words) in [
             (Verb::Melting, &["melting", "melted", "thawing", "dripping", "slumping"][..]),
             // "abandoned" was here AND under half-built, and whichever
@@ -444,5 +454,16 @@ mod tests {
         for verb in Verb::all() {
             assert!(v.contains(verb.describes()), "{} has no description", verb.name());
         }
+    }
+
+    #[test]
+    fn a_hyphen_does_not_hide_a_verb() {
+        // "half-built" split into `half` and `built`, matched neither,
+        // and the build came out whole
+        for said in ["a half-built tower", "a half built tower", "a halfbuilt tower"] {
+            assert_eq!(read(said).map(|(v, _)| v), Some(Verb::HalfBuilt), "{said}");
+        }
+        assert_eq!(read("a burnt-out manor").map(|(v, _)| v), Some(Verb::Burnt));
+        assert_eq!(read("an ice-bound keep").map(|(v, _)| v), Some(Verb::Frozen));
     }
 }

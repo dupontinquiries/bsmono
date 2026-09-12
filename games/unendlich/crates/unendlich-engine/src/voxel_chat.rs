@@ -562,6 +562,8 @@ pub struct Paintbrush {
     /// Set when the routing turn could not answer, so the restart uses
     /// the tables rather than asking again forever.
     route_failed: bool,
+    /// A verb read off the request, applied once the build lands.
+    pending_verb: Option<(voxel_tools::transform::Verb, f32)>,
     /// The noun whose definition is being asked for.
     proposed_noun: Option<String>,
     /// The build plan, while it is being executed part by part.
@@ -675,6 +677,7 @@ impl Paintbrush {
             review_pending_after_drone: 0,
             pending_job: voxel_tools::prompt::Job::Plan,
             last_surface: None,
+            pending_verb: None,
             routed: None,
             route_failed: false,
             proposed_noun: None,
@@ -1415,8 +1418,8 @@ impl Paintbrush {
     /// through every branch below it.
     fn restart_after_routing(&mut self, cm: &ChunkManager, gaze: &Gaze,
                              player_feet: Option<(i32, i32, i32)>, prose: &str) {
-        let surface = self.last_surface.clone();
-        self.start_turn(cm, gaze, surface.as_deref(), prose, player_feet);
+        // into the BUILD, not the top: setup already happened
+        self.begin(cm, gaze, prose, player_feet, false);
     }
 
     /// Draw the massing and ask whether it reads, before anything is
@@ -1761,18 +1764,36 @@ impl Paintbrush {
         // the dictionary can actually make, so a miss means the fast
         // path would be guessing.
         self.last_surface = surface.map(|s| s.to_string());
-        // THE RUN MUST EXIST BEFORE THE FIRST TURN, not after the
-        // routing branch. It was created further down, so a build that
-        // paused to ask what kind of thing it was had NO RUN -- and
-        // anything watching `is_running` saw the build end the instant
-        // it began. The routing turn is part of the build, so the run
-        // starts with it.
-        if self.run.is_none() {
-            self.run = Some(voxel_tools::session::Run::new(prose, voxel_tools::session::Limits {
-                max_rounds: self.review_rounds.max(1),
-                ..self.run_limits.clone()
-            }));
+        // SETUP HAPPENS ONCE. The routing turn used to answer a
+        // question asked here at the top, so its answer arrived by
+        // calling this function AGAIN -- and everything above the
+        // routing branch ran twice. The run guard was a patch over
+        // exactly that hazard, and there was no reason to think it was
+        // the only one.
+        //
+        // Setup is now here and the build is in `begin`, which the
+        // routing turn resumes into directly. Nothing runs twice.
+        self.run = Some(voxel_tools::session::Run::new(prose, voxel_tools::session::Limits {
+            max_rounds: self.review_rounds.max(1),
+            ..self.run_limits.clone()
+        }));
+        // A VERB READ OFF THE REQUEST, remembered until the build lands.
+        // "A melting cathedral" is a cathedral plus a thing that has
+        // happened to it, and the transform runs last because it acts
+        // on cells rather than on a plan.
+        self.pending_verb = voxel_tools::transform::read(prose);
+        if let Some((v, st)) = &self.pending_verb {
+            self.say(format!("...and it is {} ({:.0}%)", v.name(), st * 100.0));
         }
+        self.begin(cm, gaze, prose, player_feet, debug);
+    }
+
+    /// The build itself, once setup has happened. The routing turn
+    /// resumes here rather than at the top of `start_turn`, so nothing
+    /// is set twice.
+    fn begin(&mut self, cm: &ChunkManager, gaze: &Gaze, prose: &str,
+             player_feet: Option<(i32, i32, i32)>, debug: bool) {
+        let surface: Option<&str> = self.last_surface.as_deref();
         // ASK WHAT KIND OF THING THIS IS, before anything else.
         //
         // The word tables get one build in three wrong -- `arch` inside
@@ -1846,7 +1867,7 @@ impl Paintbrush {
         // chunk store, immediately before the model call it feeds.
         let session = self.session.clone();
         let drone_world = crate::voxel_bind::DroneWorld(cm.drone_view());
-        let (gaze_c, surface_c, prose_c) = (*gaze, surface.map(|s| s.to_string()), prose.to_string());
+        let (gaze_c, surface_c, prose_c) = (*gaze, self.last_surface.clone(), prose.to_string());
         let user: Box<dyn FnOnce() -> String + Send> = Box::new(move || {
             let mut staged = StagedWorld::new(&drone_world);
             let tools = VoxelTools::new(&mut staged);
@@ -1870,7 +1891,8 @@ impl Paintbrush {
         // request that names several things, or one big enough that a
         // single turn cannot describe it.
         if path == voxel_tools::compose::Path::Parts {
-            let site = surface.map(|s| format!("SITE: standing on {s}.")).unwrap_or_default();
+            let site = self.last_surface.as_ref()
+                .map(|s| format!("SITE: standing on {s}.")).unwrap_or_default();
             let p = voxel_tools::dossier::plan_prompt(prose, &site);
             log::info!("[paintbrush] planning {prose:?} into parts");
             self.say("planning this into parts ...");
@@ -1938,7 +1960,8 @@ impl Paintbrush {
         if path == voxel_tools::compose::Path::Compose {
             // the site line the ambient makes, so pass 1 knows where it
             // is standing; it is one line by design
-            let site = surface.map(|s| format!("SITE: standing on {s}.")).unwrap_or_default();
+            let site = self.last_surface.as_ref()
+                .map(|s| format!("SITE: standing on {s}.")).unwrap_or_default();
             let ip = voxel_tools::compose::interpret_prompt(prose, &site);
             log::info!("[paintbrush] composing: the dictionary has no word for {prose:?}");
             self.say("thinking about what this is ...");
@@ -2086,7 +2109,7 @@ impl Paintbrush {
         }).collect();
         let session = self.session.clone();
         let drone_world = crate::voxel_bind::DroneWorld(cm.drone_view());
-        let (gaze_c, surface_c, prose_c) = (*gaze, surface.map(|s| s.to_string()), prose.to_string());
+        let (gaze_c, surface_c, prose_c) = (*gaze, self.last_surface.clone(), prose.to_string());
         let user: Box<dyn FnOnce() -> String + Send> = Box::new(move || {
             let mut staged = StagedWorld::new(&drone_world);
             let tools = VoxelTools::new(&mut staged);
@@ -2475,11 +2498,34 @@ impl Paintbrush {
     }
 
     fn commit(&mut self, cm: &ChunkManager, gaze: &Gaze) {
+        // WHAT THE BUILD IS ABOUT TO BE, so a verb can act on it. A
+        // transform is a function over CELLS and there are none until
+        // the plan is about to land, which is why it runs here and not
+        // in the planner.
+        let about_to_place: std::collections::BTreeSet<(i32, i32, i32)> =
+            self.session.pending_cells().unwrap_or_default().into_iter().collect();
         let view = WorldView(cm);
         let mut staged = StagedWorld::new(&view);
         {
             let mut tools = VoxelTools::new(&mut staged);
             let r = self.session.commit(&mut tools, gaze);
+        // AND THE VERB, if the request carried one. "A melting
+        // cathedral" is a cathedral that something has happened to, and
+        // this is the moment there is something for it to happen to.
+        if let Some((v, strength)) = self.pending_verb.take() {
+            if !about_to_place.is_empty() {
+                let blocks: std::collections::BTreeMap<(i32, i32, i32), u16> =
+                    about_to_place.iter().map(|c| (*c, 1u16)).collect();
+                let a = voxel_tools::transform::apply(v, &about_to_place, &blocks,
+                                                      strength, self.session.creative_seed);
+                if !a.changes.is_empty() {
+                    let mut t2 = VoxelTools::new(&mut staged);
+                    let _ = t2.apply_changes_large(&a.changes);
+                    self.say(a.note.clone());
+                    log::info!("[paintbrush] transform {}", a.note);
+                }
+            }
+        }
         // Living plants planted by this commit go to the engine.
         if let Some(sites) = self.session.take_sites() {
             let n = sites.len();
