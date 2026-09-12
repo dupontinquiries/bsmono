@@ -80,12 +80,48 @@ untestable wrapper would have looked like progress.
    helper; individual controls still need `.on_hover_text` replaced. *verified*
 5. **`Inhibitor` impl.** wlr idle-inhibit on Phosh, `org.freedesktop.ScreenSaver`
    elsewhere. The policy is written and tested. *read*
-6. **480p + optical flow interpolation.** Never started. `apps/bscale`'s
-   `d2x-core` has block **matchers**, and block matching *is* motion estimation
-   — if they expose per-block displacement rather than burying it in the
-   residual path, most of an interpolation front end already exists with a CPU
-   reference to check against. **I never opened that code.** *assumed* — verify
-   before planning around it.
+6. **480p + interpolation. The motion search exists; the interpolation does
+   not.** *verified* — I finally read `apps/bscale/crates/d2x-core/src/`
+   instead of guessing, having marked this "assumed" five times.
+
+   What is there and is directly reusable:
+
+   - `matcher::BlockMatcher` — `search(prev, next, dst_x, dst_y, size, limit)
+     -> Option<Candidate { src_x, src_y, sse }>`. The motion vector is
+     `(dst_x - src_x, dst_y - src_y)` and `sse` is a usable confidence. Three
+     implementations: `Diamond` (fast), `Exhaustive` (reference), `Stationary`
+     (zero-motion baseline).
+   - `search_from(.., hint)` takes a motion hint and falls back to the unhinted
+     search — predictive/hierarchical estimation for free, and the doc already
+     notes why the fallback matters: "a moving actor does not follow the
+     camera".
+   - `phase_corr::PhaseCorrelation` — global sub-pixel translation with a
+     confidence where 0 means "scene cut or content too uniform", which is
+     exactly the signal an interpolator needs to stop interpolating.
+     Convention pinned in its docs: `estimate(cur, prev)` gives
+     `cur[x] ≈ prev[x - dx]`.
+
+   What is NOT there, and is most of the work:
+
+   - Bidirectional vectors and occlusion handling. Block matching gives
+     backward vectors only; a synthesised intermediate frame needs both
+     directions and something to do about holes.
+   - Sub-pixel per-block motion. `Candidate` is integer; only the GLOBAL
+     estimate is sub-pixel, and 24→90 needs fractional positions.
+   - Any motion-compensated blend at all.
+   - These take `d2x_core::Frame` (RGB); vidkit has NV12 planes.
+
+   **Layering blocker.** `d2x-core` is an app crate. `shared/vidkit` depending
+   on `apps/bscale` inverts the layering. `phase_corr.rs`'s own header already
+   says the house pattern is to lift it into a `shared/` kit and points both
+   consumers at it, and says that lift has not been done — vidkit would be the
+   third consumer, which is the argument for doing it. **That lift is the
+   prerequisite, and it is a separate mechanical commit touching fao-codec and
+   bscale.**
+
+   No measurement exists for whether 480p block matching sustains the frame
+   budget for 24→90 on a phone. Do not plan around it until someone times it.
+
 7. **Migrate the app palette's widget onto `uikit_egui::command_bar`** more
    fully, and reconsider whether `vidkit-egui::palette` should exist at all now
    that it is only an action set. *read*
