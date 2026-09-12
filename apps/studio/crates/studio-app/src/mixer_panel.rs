@@ -87,7 +87,7 @@ pub fn effect(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
 /// gated to a vocal clip is the structural sidechain), or bound always
 /// when nothing is selected. What Gemini's read of FL called the
 /// "context-menu parameter binding": the knob is where automation starts.
-fn automate_menu(resp: &egui::Response, s: &mut Studio, target: studio_core::AutoTarget) {
+pub(crate) fn automate_menu(resp: &egui::Response, s: &mut Studio, target: studio_core::AutoTarget) {
     resp.context_menu(|ui| {
         if ui.button("automate: show lane").clicked() {
             s.auto_target = Some(target);

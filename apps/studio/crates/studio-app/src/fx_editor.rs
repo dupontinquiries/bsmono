@@ -210,7 +210,24 @@ pub fn window(ctx: &egui::Context, s: &mut Studio, c: &PaletteColors) {
                         ui.label(RichText::new(g).strong().color(c.text_weak));
                     }
                 }
-                if let Some(v) = control(ui, fx, spec, &mut ed.drag, narrow) {
+                let mut resp = None;
+                let committed = control(ui, fx, spec, &mut ed.drag, narrow, &mut resp);
+                // The knob is where automation starts (the fader's own
+                // rule): a right-click / long-press on a control the
+                // effect can move live offers the lane and the curve.
+                // The target is the effect's INDEX in this chain — see
+                // `AutoTarget`'s docs for why there is no effect id.
+                if let (Some(resp), Some(key)) = (resp.as_ref(), studio_core::ParamKey::new(&spec.key)) {
+                    if studio_fx::Instance::is_live_param(&fx.kind, &spec.key) {
+                        let effect = ed.index.min(u8::MAX as usize) as u8;
+                        let target = match ed.target {
+                            Target::Bus(id) => studio_core::AutoTarget::BusParam { bus: id, effect, key },
+                            Target::Clip(id) => studio_core::AutoTarget::ClipParam { clip: id, effect, key },
+                        };
+                        crate::mixer_panel::automate_menu(resp, s, target);
+                    }
+                }
+                if let Some(v) = committed {
                     let mut ch = chain.clone();
                     ch[ed.index].params.insert(spec.key.clone(), spec.clamp(v));
                     // Dropping a count drops the params of the bands past it,
@@ -239,7 +256,10 @@ pub fn window(ctx: &egui::Context, s: &mut Studio, c: &PaletteColors) {
 
 /// One control. Returns a value to COMMIT (release or click), else `None`;
 /// the live drag value is kept in `drag`.
-fn control(ui: &mut egui::Ui, fx: &studio_core::Effect, spec: &ParamSpec, drag: &mut Option<(String, f32)>, narrow: bool) -> Option<f32> {
+/// `resp_out` receives the slider's response for Float and Int kinds, so
+/// the caller can hang a context menu on the control it does not draw.
+fn control(ui: &mut egui::Ui, fx: &studio_core::Effect, spec: &ParamSpec, drag: &mut Option<(String, f32)>, narrow: bool,
+           resp_out: &mut Option<egui::Response>) -> Option<f32> {
     let stored = schema::value(fx, spec);
     let mut commit = None;
     match &spec.kind {
@@ -252,15 +272,17 @@ fn control(ui: &mut egui::Ui, fx: &studio_core::Effect, spec: &ParamSpec, drag: 
             if *scale == Scale::Log { slider = slider.logarithmic(true); }
             if *step > 0.0 { slider = slider.step_by(*step as f64); }
             let resp = ui.add(slider);
-            if resp.double_clicked() { *drag = None; return Some(spec.default); }
+            if resp.double_clicked() { *drag = None; *resp_out = Some(resp); return Some(spec.default); }
             if resp.dragged() { *drag = Some((spec.key.clone(), shown)); }
             if resp.drag_stopped() { *drag = None; commit = Some(shown); }
             else if resp.changed() && !resp.dragged() { commit = Some(shown); }
+            *resp_out = Some(resp);
         }
         Kind::Int { min, max, .. } => {
             let mut v = stored.round() as i32;
             let resp = ui.add(egui::Slider::new(&mut v, *min..=*max).text(&spec.label).clamping(egui::SliderClamping::Always));
             if resp.drag_stopped() || (resp.changed() && !resp.dragged()) { commit = Some(v as f32); }
+            *resp_out = Some(resp);
         }
         Kind::Bool => {
             let mut on = stored > 0.5;

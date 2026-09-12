@@ -6907,6 +6907,45 @@ mod curve_shell_tests {
     }
 
     #[test]
+    fn a_curve_minted_on_an_effect_parameter_is_the_structural_sidechain_on_a_knob() {
+        // A reverb return bus; select the vocal clip; mint a curve on the
+        // reverb's MIX gated to that clip. The clip's presence now drives
+        // the knob — what the fader's menu did for gain, on a parameter.
+        use studio_core::{BusId, ParamKey};
+        let mut s = Studio::demo();
+        let bus = BusId(40);
+        s.edit(Op::AddBus { bus: studio_core::Bus { id: bus, name: "verb".into(), parent: None, gain: 1.0,
+            chain: vec![mixer_panel::effect("reverb", &[("mix", 1.0)])], sends: vec![], muted: false } }, "bus");
+        let clip = studio_core::ClipId(1);
+        s.selection = vec![clip];
+        let target = AutoTarget::BusParam { bus, effect: 0, key: ParamKey::new("mix").unwrap() };
+        s.new_curve_on_selection(Some(target));
+        let p = &s.session.doc.project;
+        let (bid, b) = p.bindings.iter().next().expect("bound");
+        assert_eq!(b.target, target);
+        assert_eq!(b.gate, Gate::Clip(clip));
+        assert_eq!(s.auto_binding, Some(*bid), "the strip shows the new binding");
+        assert!(s.status.contains("bound to 1 target"), "{}", s.status);
+        // The render's question answers with it, and the target is live.
+        assert_eq!(p.bus_param_targets(bus).len(), 1);
+        assert!(studio_fx::Instance::is_live_param("reverb", "mix"));
+        // Duplicating the clip re-aims a binding at the copy (the
+        // curves module's promise, unchanged by the target's kind).
+        s.key(Key::c('y'));
+        s.transport.set_position(Ticks::from_seconds(100.0));
+        s.key(Key::c('p'));
+        let p = &s.session.doc.project;
+        assert_eq!(p.bindings.len(), 2);
+        assert!(p.bindings.values().all(|b| b.target == target), "both bindings aim at the same knob");
+        assert_eq!(p.bus_param_targets(bus).len(), 1, "one target, two gates — deduplicated");
+        // Undo the paste, then the mint: the bus is back to a plain reverb.
+        s.key(Key::c('u'));
+        s.key(Key::c('u'));
+        assert!(s.session.doc.project.bindings.is_empty());
+        assert!(s.session.doc.project.bus_param_targets(bus).is_empty());
+    }
+
+    #[test]
     fn yank_then_paste_copies_the_clip_with_its_binding_as_one_undo() {
         let (mut s, clip, curve) = with_bound_clip();
         let track = s.session.doc.project.clips[&clip].track;
