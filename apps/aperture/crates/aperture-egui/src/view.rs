@@ -1667,6 +1667,7 @@ fn map_key(key: egui::Key) -> Option<K> {
         EK::T => K::T,
         EK::G => K::G,
         EK::D => K::D,
+        EK::U => K::U,
         EK::L => K::L,
         EK::I => K::I,
         EK::F => K::F,

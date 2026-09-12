@@ -60,6 +60,7 @@ pub enum K {
     D,
     L,
     I,
+    U,
 }
 
 /// Incremental search. Matches are absolute char ranges, kept sorted; the
@@ -2337,7 +2338,12 @@ impl AppState {
             (PageDown, false) => self.moved(|s, sh| s.editor.move_vertical(24, sh), shift),
             (Home, false) => self.moved(|s, sh| s.editor.move_home(sh), shift),
             (End, false) => self.moved(|s, sh| s.editor.move_end(sh), shift),
+            // ORDER MATTERS and the compiler will not warn: a bare
+            // `(D, true)` above this would swallow Ctrl+Shift+D, and the
+            // symptom is a second cursor going the wrong way, not an error.
+            (D, true) if shift => self.add_prev_cursor(now_ms),
             (D, true) => self.add_next_cursor(now_ms),
+            (U, true) => self.pop_cursor(now_ms),
             (L, true) if shift => self.select_all_cursor_occurrences(now_ms),
             (Up, true) if alt => self.add_column_cursor(-1, now_ms),
             (Down, true) if alt => self.add_column_cursor(1, now_ms),
@@ -2422,6 +2428,43 @@ impl AppState {
                 self.popup = None; // its accept path isn't fan-out-aware either
             }
             None => self.set_status("Ctrl+D: nothing more to select", now_ms),
+        }
+    }
+
+    /// Ctrl+Shift+D: the mirror of Ctrl+D, walking backward through the
+    /// document. Kess's note was that Ctrl+D had no complement; his
+    /// suggested binding (B) is taken by `branch_from_here`, so this went
+    /// on Shift+D, where it sits next to the gesture it mirrors.
+    fn add_prev_cursor(&mut self, now_ms: u64) {
+        let c = self.cursors();
+        match aperture_core::multicursor::add_prev_occurrence(&self.editor.buffer, &c) {
+            Some(next) => {
+                self.set_cursors(next);
+                self.follow_caret = true;
+                self.ghost.dismiss();
+                self.popup = None;
+            }
+            None => self.set_status("Ctrl+Shift+D: nothing earlier to select", now_ms),
+        }
+    }
+
+    /// Ctrl+U: drop the cursor the last Ctrl+D or Ctrl+Shift+D added.
+    ///
+    /// The other half of Kess's note, which reads two ways — "add the
+    /// previous occurrence" and "undo the last cursor" are different
+    /// operations and both were missing. Overshooting a run of Ctrl+D is
+    /// the common case and Escape (collapse to one) is far too big a hammer
+    /// for it.
+    fn pop_cursor(&mut self, now_ms: u64) {
+        let c = self.cursors();
+        match aperture_core::multicursor::pop_cursor(&c) {
+            Some(next) => {
+                self.set_cursors(next);
+                self.follow_caret = true;
+                self.ghost.dismiss();
+                self.popup = None;
+            }
+            None => self.set_status("Ctrl+U: only one cursor", now_ms),
         }
     }
 
@@ -3283,6 +3326,43 @@ mod tests {
 
         key(&mut s, K::D, true, 1);
         assert_eq!(s.extra_cursors.len(), 1, "second press adds the next occurrence");
+    }
+
+    #[test]
+    fn ctrl_shift_d_is_not_swallowed_by_the_plain_ctrl_d_arm() {
+        // The arm-ordering hazard, asserted rather than trusted: a bare
+        // `(D, true)` placed above the shift guard compiles without a
+        // warning and silently turns Ctrl+Shift+D into Ctrl+D.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("q a q b q");
+        s.editor.sel = aperture_core::editor::Selection::caret(8); // the LAST q
+        key_shift(&mut s, K::D, true, 0); // promote to the word
+        assert!(s.extra_cursors.is_empty(), "first press only selects");
+        key_shift(&mut s, K::D, true, 1);
+        assert_eq!(s.extra_cursors.len(), 1, "a second cursor appeared");
+        let mins: Vec<usize> = std::iter::once(s.editor.sel.min())
+            .chain(s.extra_cursors.iter().map(|c| c.min()))
+            .collect();
+        assert!(mins.iter().any(|m| *m == 4), "it went BACKWARD to the middle q: {mins:?}");
+        assert!(!mins.iter().any(|m| *m == 0), "not forward-wrapped to the first: {mins:?}");
+    }
+
+    #[test]
+    fn ctrl_u_removes_the_cursor_ctrl_d_just_added() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("let total = total + total;");
+        s.editor.sel = aperture_core::editor::Selection::caret(6);
+        key(&mut s, K::D, true, 0);
+        key(&mut s, K::D, true, 1);
+        key(&mut s, K::D, true, 2);
+        assert_eq!(s.extra_cursors.len(), 2);
+        key(&mut s, K::U, true, 3);
+        assert_eq!(s.extra_cursors.len(), 1, "one press, one cursor gone");
+        key(&mut s, K::U, true, 4);
+        assert!(s.extra_cursors.is_empty());
+        key(&mut s, K::U, true, 5);
+        let (msg, _) = s.status.clone().expect("the no-op explains itself");
+        assert!(msg.contains("only one cursor"), "{msg}");
     }
 
     #[test]

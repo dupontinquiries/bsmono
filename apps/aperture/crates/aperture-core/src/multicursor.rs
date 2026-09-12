@@ -212,6 +212,37 @@ pub fn find_occurrence(buf: &Buffer, needle: &str, from: usize) -> Option<usize>
         .map(|b| doc[..b].chars().count())
 }
 
+/// The last occurrence of `needle` STARTING strictly before `before`,
+/// wrapping to the end of the document. The complement of
+/// [`find_occurrence`].
+///
+/// Written as a forward scan keeping the best candidate rather than as
+/// `doc[..before].rfind(needle)`, which looks like the obvious answer and is
+/// wrong twice: a match that starts before the cut and ends after it does
+/// not fit in the slice and would be missed, and widening the slice by the
+/// needle's length to compensate can land mid-codepoint and panic. Scanning
+/// costs one pass over a string we already materialised, and it cannot be
+/// wrong about either.
+pub fn find_occurrence_back(buf: &Buffer, needle: &str, before: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let doc = buf.to_string();
+    let cut = char_to_byte(&doc, before);
+    let (mut best_before, mut best_any) = (None, None);
+    let mut at = 0usize;
+    let step = needle.chars().next().map(char::len_utf8).unwrap_or(1);
+    while let Some(rel) = doc[at..].find(needle) {
+        let b = at + rel;
+        if b < cut {
+            best_before = Some(b);
+        }
+        best_any = Some(b);
+        at = b + step;
+    }
+    best_before.or(best_any).map(|b| doc[..b].chars().count())
+}
+
 /// Every occurrence of `needle`, as selections, in document order.
 pub fn all_occurrences(buf: &Buffer, needle: &str) -> Vec<Selection> {
     if needle.is_empty() {
@@ -288,6 +319,72 @@ pub fn add_next_occurrence(buf: &Buffer, c: &Cursors) -> Option<Cursors> {
     // otherwise Ctrl+D silently adds cursors off-screen.
     let mut sels = vec![fresh];
     sels.extend(c.all().iter().copied());
+    Some(Cursors::new(sels))
+}
+
+/// `Ctrl+Shift+D`: the mirror of [`add_next_occurrence`], searching backward.
+///
+/// Kess's note on the key dispatcher was that Ctrl+D "has no complement",
+/// and suggested binding it to B — which is already `branch_from_here`. The
+/// note also reads two ways: "add the previous occurrence" and "undo the
+/// last cursor I added" are different operations and both are missing. This
+/// is the first; [`pop_cursor`] is the second.
+pub fn add_prev_occurrence(buf: &Buffer, c: &Cursors) -> Option<Cursors> {
+    let p = c.primary();
+    if p.is_caret() {
+        // Same first-press rule as forward: promote the caret to a word and
+        // stop. Two things on one keystroke is how you lose track of where
+        // you are, and that reasoning does not change direction.
+        let w = word_at(buf, p.head);
+        if w.is_caret() {
+            return None;
+        }
+        let mut sels = vec![w];
+        sels.extend(c.all().iter().skip(1).copied());
+        return Some(Cursors::new(sels));
+    }
+    let needle = buf.slice_to_string(p.min(), p.max());
+    let first_start = c.all().iter().map(|s| s.min()).min().unwrap_or(p.min());
+    let at = find_occurrence_back(buf, &needle, first_start)?;
+    if c.all().iter().any(|s| s.min() == at) {
+        return None; // wrapped onto a cursor we already have
+    }
+    let fresh = Selection { anchor: at, head: at + needle.chars().count() };
+    let mut sels = vec![fresh];
+    sels.extend(c.all().iter().copied());
+    Some(Cursors::new(sels))
+}
+
+/// `Ctrl+U`: drop the primary cursor and hand the role to its nearest
+/// neighbour — undo for a cursor you did not mean to add.
+///
+/// Removes the PRIMARY rather than "the last one added", because a
+/// `Cursors` is sorted and does not remember insertion order. It comes to
+/// the same thing in the case that matters: `add_next_occurrence` and
+/// `add_prev_occurrence` both make the fresh cursor primary, so pressing
+/// this straight after either one removes exactly the cursor it added.
+///
+/// The role goes to the neighbour BEFORE the removed cursor when there is
+/// one. After a run of Ctrl+D that went one too far, the cursor you were on
+/// before the overshoot is the one behind you, and the viewport should walk
+/// back rather than jump to the far end of the file.
+///
+/// `None` when there is only one cursor left: collapsing to zero is not a
+/// state, and "Ctrl+U with one cursor" should do nothing rather than
+/// something surprising.
+pub fn pop_cursor(c: &Cursors) -> Option<Cursors> {
+    if c.len() < 2 {
+        return None;
+    }
+    let all = c.all();
+    let gone = all.iter().position(|s| *s == c.primary()).unwrap_or(0);
+    let keep: Vec<Selection> =
+        all.iter().enumerate().filter(|(i, _)| *i != gone).map(|(_, s)| *s).collect();
+    // `Cursors::new` takes its primary from the head of the list, so put the
+    // intended one there and let the constructor re-sort.
+    let next = if gone > 0 { gone - 1 } else { 0 };
+    let mut sels = vec![keep[next]];
+    sels.extend(keep.iter().enumerate().filter(|(i, _)| *i != next).map(|(_, s)| *s));
     Some(Cursors::new(sels))
 }
 
@@ -507,6 +604,123 @@ mod tests {
         let next = add_next_occurrence(&b, &c).expect("a word is under the caret");
         assert_eq!(next.len(), 1);
         assert_eq!((next.all()[0].min(), next.all()[0].max()), (4, 9));
+    }
+
+    #[test]
+    fn backward_search_finds_the_nearest_earlier_match_and_wraps() {
+        let b = Buffer::from_str("x foo y foo z foo");
+        //                        0123456789...
+        assert_eq!(find_occurrence_back(&b, "foo", 14), Some(8), "nearest earlier, not the first");
+        assert_eq!(find_occurrence_back(&b, "foo", 8), Some(2));
+        assert_eq!(find_occurrence_back(&b, "foo", 2), Some(14), "wraps to the last in the document");
+        assert_eq!(find_occurrence_back(&b, "foo", 0), Some(14));
+        assert_eq!(find_occurrence_back(&b, "nope", 10), None);
+        assert_eq!(find_occurrence_back(&b, "", 10), None);
+    }
+
+    #[test]
+    fn backward_search_counts_in_chars_not_bytes() {
+        // The unit bug this file has already had once, in the other
+        // direction. Every char before the second "café" is multi-byte, so a
+        // byte count and a char count cannot agree.
+        let b = Buffer::from_str("café — café — café");
+        let all = all_occurrences(&b, "café");
+        let starts: Vec<usize> = all.iter().map(|s| s.min()).collect();
+        assert_eq!(starts.len(), 3);
+        assert_eq!(find_occurrence_back(&b, "café", starts[2]), Some(starts[1]));
+        assert_eq!(find_occurrence_back(&b, "café", starts[0]), Some(starts[2]), "wrap");
+        // And the found index really is a char index into this buffer.
+        let at = find_occurrence_back(&b, "café", starts[2]).unwrap();
+        assert_eq!(b.slice_to_string(at, at + 4), "café");
+    }
+
+    #[test]
+    fn a_match_straddling_the_cut_is_still_found() {
+        // The reason this is a scan and not `doc[..cut].rfind`: the match at
+        // 2 does not fit inside the slice ending at 4, and rfind would skip
+        // it and wrongly report the wrap-around one instead.
+        let b = Buffer::from_str("x abcdef x abcdef");
+        assert_eq!(find_occurrence_back(&b, "abcdef", 4), Some(2));
+    }
+
+    #[test]
+    fn ctrl_shift_d_walks_backward_and_ctrl_d_walks_back_over_it() {
+        let b = Buffer::from_str("foo\nbar foo\nfoo baz");
+        let all = all_occurrences(&b, "foo");
+        assert_eq!(all.len(), 3);
+        // Start on the LAST occurrence and walk backwards.
+        let c = Cursors::single(all[2]);
+        let c = add_prev_occurrence(&b, &c).expect("one before it");
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.primary().min(), all[1].min(), "the viewport follows the new one");
+        let c = add_prev_occurrence(&b, &c).expect("and the one before that");
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.primary().min(), all[0].min());
+        // Every occurrence is now taken, so it refuses rather than wrapping
+        // onto a cursor that already exists.
+        assert!(add_prev_occurrence(&b, &c).is_none());
+    }
+
+    #[test]
+    fn the_first_press_of_ctrl_shift_d_only_promotes_the_caret_to_a_word() {
+        let b = Buffer::from_str("let total = total + 1");
+        let c = Cursors::single(Selection::caret(9)); // just past "total"
+        let out = add_prev_occurrence(&b, &c).expect("a word is under the caret");
+        assert_eq!(out.len(), 1, "promote only — no jump on the same keystroke");
+        assert_eq!((out.all()[0].min(), out.all()[0].max()), (4, 9));
+    }
+
+    #[test]
+    fn pop_undoes_exactly_the_cursor_the_last_add_created() {
+        let b = Buffer::from_str("foo bar foo baz foo");
+        let start = Cursors::single(all_occurrences(&b, "foo")[0]);
+        let two = add_next_occurrence(&b, &start).expect("second");
+        let three = add_next_occurrence(&b, &two).expect("third");
+        assert_eq!(three.len(), 3);
+
+        let back = pop_cursor(&three).expect("more than one cursor");
+        assert_eq!(back.len(), 2);
+        // Not just the same SET — the same state, primary included. Undo
+        // that leaves the viewport somewhere the previous step never had it
+        // is not undo.
+        assert_eq!(back, two, "pop restores the state the previous add produced");
+        assert_eq!(back.primary().min(), two.primary().min());
+
+        let back = pop_cursor(&back).expect("still two");
+        assert_eq!(back.all(), start.all());
+        assert!(pop_cursor(&back).is_none(), "one cursor is the floor");
+    }
+
+    #[test]
+    fn popping_a_middle_cursor_hands_the_role_backward() {
+        // The case that actually pins the direction. When the primary is the
+        // LAST cursor, "the one before it" and "clamp to the end" are the
+        // same index, so a test that only pops the last one passes whichever
+        // way the rule is written — found by breaking it and watching
+        // nothing fail. Ctrl+Shift+D followed by Ctrl+D leaves the primary in
+        // the middle, which is how a person gets here.
+        let b = Buffer::from_str("q a q b q");
+        let all = all_occurrences(&b, "q");
+        let c = Cursors::new(vec![all[1], all[0], all[2]]); // primary is the middle
+        assert_eq!(c.primary().min(), all[1].min());
+        let back = pop_cursor(&c).expect("three cursors");
+        assert_eq!(back.len(), 2);
+        assert_eq!(back.primary().min(), all[0].min(), "the role walks back, not forward");
+    }
+
+    #[test]
+    fn forward_and_backward_are_inverses_over_a_full_lap() {
+        let b = Buffer::from_str("a q b q c q d");
+        let mut c = Cursors::single(all_occurrences(&b, "q")[0]);
+        for _ in 0..2 {
+            c = add_next_occurrence(&b, &c).expect("grows");
+        }
+        assert_eq!(c.len(), 3);
+        for _ in 0..2 {
+            c = pop_cursor(&c).expect("shrinks");
+        }
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.all(), Cursors::single(all_occurrences(&b, "q")[0]).all());
     }
 
     #[test]
