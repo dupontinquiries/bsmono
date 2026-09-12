@@ -1,0 +1,31 @@
+# depot — an offline package mirror for a fleet that is not on the internet:
+# cargo crates (sparse registry), Fedora RPMs (dnf repodata), a Nix binary
+# cache, and Rust toolchain bundles, all projected from ONE content-addressed
+# object store and moved between the online and offline sides as signed,
+# deduplicated packs.
+#
+# Same shape as drivemind / gitmind: a pure core, a transport layer that is the
+# only thing likely to be swapped, and one binary that is both CLI and server.
+# No async runtime, no web framework — threads over std TcpListener, so the
+# dependency tree stays small enough that depot can itself be built from the
+# mirror it serves (a bootstrap property, not a style preference).
+
+[workspace]
+members = ["crates/depot-core", "crates/depot-httpd", "crates/depot"]
+default-members = ["crates/depot-core", "crates/depot-httpd", "crates/depot"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true        # the phone target does not need symbols; -30% binary
+panic = "abort"     # a mirror with a corrupted invariant should die and let systemd restart it

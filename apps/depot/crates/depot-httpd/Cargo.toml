@@ -1,0 +1,10 @@
+[package]
+name = "depot-httpd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "std-only threaded HTTP/1.1 file+API server: streaming bodies, single-range requests, ETag/304, gzip for text, path-traversal-safe static roots. The transport seam under depot; swap for hyper+rustls here if TLS or HTTP/2 is ever needed."
+
+[dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

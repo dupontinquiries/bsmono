@@ -1,0 +1,19 @@
+[package]
+name = "depot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The offline package mirror, one binary: `depot serve` is the web server + UI, everything else is the CLI (init, ingest, pack, unpack, client-config, keygen, have, status)."
+
+[[bin]]
+name = "depot"
+path = "src/main.rs"
+
+[dependencies]
+depot-core = { path = "../depot-core" }
+depot-httpd = { path = "../depot-httpd" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+cli-kit = { path = "../../../../shared/cli-kit" }
+net-kit = { path = "../../../../shared/net-kit" }

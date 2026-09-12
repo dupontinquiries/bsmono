@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<otherdata xmlns="http://linux.duke.edu/metadata/other" packages="1">
+<package pkgid="9199a13d65f7a3c2df569ecf7639d500d58f349745adc1c7424419a844ce9dfe" name="edge" arch="noarch">
+  <version epoch="3" ver="1.2.3" rel="4.fc42"/>
+  <changelog author="Someone Else &lt;else@example.invalid&gt; - 3:1.2.3-2" date="1756555200">- oldest entry</changelog>
+  <changelog author="Depot &lt;depot@example.invalid&gt; - 3:1.2.3-3" date="1756641600">- older entry</changelog>
+  <changelog author="Depot &lt;depot@example.invalid&gt; - 3:1.2.3-4" date="1756728000">- newest entry with "quotes" &amp; &lt;tags&gt;</changelog>
+</package>
+</otherdata>
