@@ -1941,16 +1941,15 @@ impl Paintbrush {
         // hitch before "asking ..." appeared. It is built on the worker
         // now, from a clone of the session over an owned view of the
         // chunk store, immediately before the model call it feeds.
-        // USE THE SURFACE WE WERE GIVEN. When `begin` was split out of
-        // `start_turn` I moved the surface onto `self.last_surface` for
-        // the routing turn to resume with -- and this path, which takes
-        // its own `surface` argument, silently started ignoring it. The
-        // compiler called it an unused variable; it was a caller's
-        // argument being dropped on the floor.
-        self.last_surface = surface.map(|s| s.to_string());
+        // `begin` has no `surface` argument: `start_turn` stored the
+        // caller's surface on `self.last_surface` so the routing turn
+        // can resume here with it. (The previous commit pasted the
+        // `start_turn_with_completer` fix into this function too, and
+        // referenced a `surface` that does not exist in this scope --
+        // the engine did not compile.)
         let session = self.session.clone();
         let drone_world = crate::voxel_bind::DroneWorld(cm.drone_view());
-        let (gaze_c, surface_c, prose_c) = (*gaze, surface.map(|s| s.to_string()), prose.to_string());
+        let (gaze_c, surface_c, prose_c) = (*gaze, self.last_surface.clone(), prose.to_string());
         let user: Box<dyn FnOnce() -> String + Send> = Box::new(move || {
             let mut staged = StagedWorld::new(&drone_world);
             let tools = VoxelTools::new(&mut staged);
