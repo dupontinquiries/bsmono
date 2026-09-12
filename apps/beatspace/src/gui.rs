@@ -22,9 +22,10 @@ use std::time::Instant;
 use candle_core::Device;
 use eframe::egui;
 
-use crate::config::Config;
+use crate::config::{Config, Playback};
 use crate::dsp::{GlState, Mel};
 use crate::model::{load_generator, Generator};
+use crate::stream::{Conductor, LatentWalk, Streamer};
 use crate::{audio_io, player};
 
 struct Shared {
@@ -111,6 +112,12 @@ pub fn run(cfg: Config) -> Result<()> {
 // ----------------------------------------------------------------------------
 
 fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> Result<()> {
+    // A conditional renderer cannot be looped — every window needs the one
+    // before it — so the stream loop is the only sensible playback for it,
+    // whatever the config says; and a legacy model streams fine.
+    if cfg.playback == Playback::Stream || cfg.conditional() {
+        return stream_loop(cfg, shared, stop);
+    }
     let dev = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
     {
         let mut s = shared.lock().unwrap();
@@ -260,6 +267,124 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
         // tracks playback instead of spinning the CPU.
         if let Some(rem) = target_period.checked_sub(loop_start.elapsed()) {
             std::thread::sleep(rem);
+        }
+    }
+    Ok(())
+}
+
+/// The stream: windows that continue each other, paced by the audio queue.
+///
+/// Where `gen_loop` renders a beat from the latent and crossfades into it
+/// from the top, this asks the conductor for a step, the streamer for the
+/// window after the last one, and the player to overlap-add it; then it
+/// waits until the queue is short enough to need another. Generation is
+/// driven by how far ahead of the playhead it is, not by a timer, so a slow
+/// render eats into the lead rather than into the beat grid.
+///
+/// The conductor is `LatentWalk` — the same 0.9/0.1 glide, with a beat
+/// clock — behind the `Conductor` trait. A learned one replaces it here and
+/// nowhere else.
+fn stream_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> Result<()> {
+    let dev = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+    {
+        let mut s = shared.lock().unwrap();
+        s.device_label = format!("{dev:?} · stream");
+    }
+
+    let mut g = Generator::new(&cfg, &dev)?;
+    let latest = cfg.ckpt_dir.join("gen_latest.safetensors");
+    if latest.exists() {
+        if let Err(e) = load_generator(&mut g, &latest, &dev) {
+            eprintln!("[gui] failed to load {latest:?}: {e}");
+        } else {
+            shared.lock().unwrap().loaded_label = latest.display().to_string();
+        }
+    }
+    let mut streamer = Streamer::new(&cfg, g, dev.clone());
+    let mut walk = LatentWalk::new(&cfg);
+
+    let (_stream, audio) = player::start(cfg.sr)?;
+
+    // Keep two windows of lead. Less and a slow render is a dropout; more
+    // and a pad move takes that much longer to be heard.
+    let advance = cfg.window_stride() * cfg.hop;
+    let low_water = 2 * advance;
+
+    while !stop.load(Ordering::Relaxed) {
+        let (target, weights_req, save_req) = {
+            let mut s = shared.lock().unwrap();
+            (s.target_z.clone(), s.weights_request.take(), s.save_request.take())
+        };
+
+        if let Some(path) = weights_req {
+            // The config.json next to the checkpoint is the authority on the
+            // conditional geometry — stems, context, phase planes — which
+            // `g.fc.w` alone cannot say. A checkpoint without one is loaded
+            // into the running config's shape, and a mismatch is reported by
+            // name rather than rebuilt around.
+            let sibling = path.parent().map(|d| d.join("config.json"));
+            let build_cfg = match sibling.filter(|p| p.exists()).and_then(|p| Config::load_json(&p).ok()) {
+                Some(saved) => match cfg.shape_compatible_with(&saved) {
+                    Ok(()) => cfg.clone(),
+                    Err(why) => {
+                        eprintln!(
+                            "[gui] {} was trained with a different model shape ({why}); \
+restart the GUI with --ckpt-dir pointing at its directory",
+                            path.display()
+                        );
+                        continue;
+                    }
+                },
+                None => cfg.clone(),
+            };
+            match Generator::new(&build_cfg, &dev).and_then(|mut ng| load_generator(&mut ng, &path, &dev).map(|_| ng)) {
+                Ok(ng) => {
+                    streamer.set_generator(ng);
+                    shared.lock().unwrap().loaded_label = path.display().to_string();
+                }
+                Err(e) => eprintln!("[gui] load weights {path:?}: {e}"),
+            }
+        }
+
+        let (gain, stopped) = {
+            let s = shared.lock().unwrap();
+            (s.gain, s.stopped)
+        };
+        let queued = {
+            let mut p = audio.lock().unwrap();
+            p.set_gain(gain);
+            p.set_stopped(stopped);
+            p.queued_src_samples()
+        };
+        if queued >= low_water && save_req.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        }
+
+        let t0 = Instant::now();
+        let window = {
+            let step = walk.step(&target);
+            streamer.next_window(&step, cfg.griffin_iters_rt)?
+        };
+        let gen_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        audio.lock().unwrap().push_window(&window.audio, window.advance);
+
+        if let Some(path) = save_req {
+            match streamer.render_last_hq(cfg.griffin_iters) {
+                Some(hq) => match audio_io::save_wav(&path, &hq, cfg.sr) {
+                    Ok(()) => println!("[gui] saved {path:?} ({} iters)", cfg.griffin_iters),
+                    Err(e) => eprintln!("[gui] save wav {path:?}: {e}"),
+                },
+                None => eprintln!("[gui] nothing rendered yet to save"),
+            }
+        }
+
+        let scope = audio.lock().unwrap().scope_snapshot();
+        {
+            let mut s = shared.lock().unwrap();
+            s.current_z = walk.current().to_vec();
+            s.gen_ms = gen_ms;
+            s.scope = scope;
         }
     }
     Ok(())
@@ -925,6 +1050,18 @@ at. Off starts over and overwrites.\n\nWeights resume exactly; the optimizer's m
                 // checkpoint's, so a bad combination reports a named reason in
                 // the log pane rather than failing inside a tensor assignment.
                 .arg("--time-frames").arg(time_frames.to_string())
+                // The dynamic-track shape, from the config this GUI is
+                // playing, so the trainer builds what the stream loop will
+                // load. Without these a run launched from here would train
+                // the legacy model into a directory whose config.json says
+                // otherwise.
+                .arg("--stems").arg(cfg.stems.to_string())
+                .arg("--ctx-frames").arg(cfg.ctx_frames.to_string())
+                .arg("--ctx-dim").arg(cfg.ctx_dim.to_string())
+                .arg("--beat-phase").arg(cfg.beat_phase.to_string())
+                .arg("--seq-windows").arg(cfg.seq_windows.to_string())
+                .arg("--overlap-frames").arg(cfg.overlap_frames.to_string())
+                .args(if cfg.rollout { &[][..] } else { &["--no-rollout"][..] })
                 .args(if resume { &["--resume"][..] } else { &[][..] })
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())

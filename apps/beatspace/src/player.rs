@@ -1,11 +1,21 @@
 //! Realtime audio output with seamless crossfades.
 //!
-//! The generator thread produces one short "beat" buffer at a time and calls
-//! `Player::push`. The cpal callback pulls one sample at a time via
-//! `Player::next_sample`, looping the current beat until a new one arrives and
-//! equal-power crossfading (cos/sin) into it so morphs through latent space are
-//! click-free. Generated audio is at the model sample rate; we resample to the
-//! output device rate on push so the callback stays trivial.
+//! Two modes, chosen by which push the generator thread calls:
+//!
+//! * LOOP (`push`): one short "beat" buffer at a time. The callback loops the
+//!   current beat until a new one arrives and equal-power crossfades (cos/sin)
+//!   into it from its first sample, so morphs through latent space are
+//!   click-free. The v6 behaviour.
+//! * STREAM (`push_window`): each buffer is a continuation that starts
+//!   `advance` samples after the previous one; the overlap is crossfaded in
+//!   place and playback never restarts. `queued_src_samples` tells the
+//!   generator thread how far ahead it is, so it paces to the audio clock.
+//!   The sample-level work is `stream::OverlapAdd`, which has no cpal in it
+//!   and is tested on its own.
+//!
+//! Generated audio is at the model sample rate; we resample to the output
+//! device rate on push so the callback stays trivial. The callback takes the
+//! lock ONCE per buffer and fills a block.
 
 use anyhow::{anyhow, Result};
 use std::sync::{Arc, Mutex};
@@ -13,8 +23,11 @@ use std::sync::{Arc, Mutex};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::audio_io::resample_linear;
+use crate::stream::OverlapAdd;
 
 pub struct Player {
+    /// Stream mode, once `push_window` has been called.
+    stream: Option<OverlapAdd>,
     cur: Vec<f32>,
     pos: usize,
     next: Option<Vec<f32>>,
@@ -40,6 +53,7 @@ pub struct Player {
 impl Player {
     fn new(src_sr: u32, out_sr: u32) -> Self {
         Self {
+            stream: None,
             cur: Vec::new(),
             pos: 0,
             next: None,
@@ -76,7 +90,56 @@ impl Player {
         self.next = Some(res);
     }
 
-    /// Produce one output sample.
+    /// Hand the player the next window of a STREAM (mono, at the model sample
+    /// rate). `advance` is how many source samples after the previous
+    /// window's start this one starts; the overlap is crossfaded.
+    pub fn push_window(&mut self, buf: &[f32], advance: usize) {
+        let res = resample_linear(buf, self.src_sr, self.out_sr);
+        if res.is_empty() {
+            return;
+        }
+        let adv = (advance as u64 * self.out_sr as u64 / self.src_sr.max(1) as u64) as usize;
+        self.stream.get_or_insert_with(OverlapAdd::new).push(&res, adv);
+    }
+
+    /// Stream mode: samples queued ahead of the playhead, in SOURCE-rate
+    /// samples so the generator thread can compare against window lengths.
+    pub fn queued_src_samples(&self) -> usize {
+        match &self.stream {
+            Some(oa) => (oa.queued() as u64 * self.src_sr as u64 / self.out_sr.max(1) as u64) as usize,
+            None => 0,
+        }
+    }
+
+    /// Fill a mono block. Loop mode goes sample by sample through
+    /// `next_sample`; stream mode pulls a block from the overlap-add queue,
+    /// which is why the callback asks for blocks — draining a Vec one sample
+    /// at a time would move the whole queue per sample.
+    pub fn fill(&mut self, out: &mut [f32]) {
+        let Some(oa) = self.stream.as_mut() else {
+            for o in out.iter_mut() {
+                *o = self.next_sample();
+            }
+            return;
+        };
+        if self.stopped {
+            for o in out.iter_mut() {
+                *o = 0.0;
+            }
+        } else {
+            oa.pull(out);
+            for o in out.iter_mut() {
+                *o *= self.gain;
+            }
+        }
+        // The scope shows what LEFT the player, gain included, and shows
+        // silence when stopped rather than freezing.
+        let n = out.len().min(self.scope_cap);
+        let drop = (self.scope.len() + n).saturating_sub(self.scope_cap);
+        self.scope.drain(..drop);
+        self.scope.extend_from_slice(&out[out.len() - n..]);
+    }
+
     /// Set the output gain. Clamped, because a gain above 1 clips on a signal
     /// that is already normalised and the distortion sounds like a broken model.
     pub fn set_gain(&mut self, g: f32) {
@@ -210,20 +273,22 @@ where
 {
     let channels = config.channels as usize;
     let err_fn = |e| eprintln!("[audio] stream error: {e}");
+    // One mono scratch block, grown on the first callback and reused: no
+    // allocation on the audio thread after that.
+    let mut mono: Vec<f32> = Vec::new();
     let stream = device.build_output_stream(
         *config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            if let Ok(mut p) = player.lock() {
-                for frame in data.chunks_mut(channels) {
-                    let v = p.next_sample();
-                    let s: T = T::from_sample(v);
-                    for d in frame.iter_mut() {
-                        *d = s;
-                    }
-                }
-            } else {
-                for d in data.iter_mut() {
-                    *d = T::from_sample(0.0f32);
+            let frames = data.len() / channels.max(1);
+            mono.resize(frames, 0.0);
+            match player.lock() {
+                Ok(mut p) => p.fill(&mut mono),
+                Err(_) => mono.iter_mut().for_each(|m| *m = 0.0),
+            }
+            for (frame, &v) in data.chunks_mut(channels).zip(mono.iter()) {
+                let s: T = T::from_sample(v);
+                for d in frame.iter_mut() {
+                    *d = s;
                 }
             }
         },

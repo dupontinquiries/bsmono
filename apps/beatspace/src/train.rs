@@ -13,9 +13,11 @@ use std::path::Path;
 use crate::config::Config;
 use crate::dataset;
 use crate::model::{
-    bce_with_logits, load_discriminator, load_generator, save_discriminator, save_generator,
-    Discriminator, Generator,
+    bce_with_logits, load_discriminator, load_generator, load_seq_discriminator,
+    save_discriminator, save_generator, save_seq_discriminator, Discriminator, Generator,
+    SeqDiscriminator,
 };
+use crate::seqstep::{self, SeqModels};
 
 pub fn run(cfg: &Config, resume: bool) -> Result<()> {
     // DEVICE, AND WHY.
@@ -58,6 +60,20 @@ pub fn run(cfg: &Config, resume: bool) -> Result<()> {
     // --- models ---
     let mut g = Generator::new(cfg, &dev)?;
     let mut d = Discriminator::new(cfg, &dev)?;
+    let mut sd = if cfg.sequential() { Some(SeqDiscriminator::new(cfg, &dev)?) } else { None };
+    if cfg.sequential() {
+        println!(
+            "[train] sequence path: {} windows per sample at stride {} ({} stems, ctx {} frames, \
+beat phase {}, rollout {})",
+            cfg.seq_windows, cfg.window_stride(), cfg.stems, cfg.ctx_frames, cfg.beat_phase, cfg.rollout
+        );
+    } else if cfg.conditional() {
+        anyhow::bail!(
+            "ctx_frames / beat_phase are set but seq_windows is {}: a conditional renderer \
+needs consecutive windows to learn from. Set --seq-windows 2 or more (or --dynamic).",
+            cfg.seq_windows
+        );
+    }
 
     let mut start_epoch = 0usize;
     if resume {
@@ -66,6 +82,15 @@ pub fn run(cfg: &Config, resume: bool) -> Result<()> {
         if gp.exists() && dp.exists() {
             load_generator(&mut g, &gp, &dev)?;
             load_discriminator(&mut d, &dp, &dev)?;
+            if let Some(sd) = &mut sd {
+                let sp = cfg.ckpt_dir.join("seqd_latest.safetensors");
+                if sp.exists() {
+                    load_seq_discriminator(sd, &sp, &dev)?;
+                } else {
+                    println!("[train] no seqd_latest.safetensors — the sequence discriminator \
+starts fresh against a trained generator; expect its loss to fall quickly");
+                }
+            }
             match read_resume_epoch(cfg) {
                 Some(e) => {
                     start_epoch = e;
@@ -112,8 +137,16 @@ moments private). Expect ~1000 steps of re-warming; the weights themselves are e
             },
         )?)
     };
-    let mut opt_g = adam(g.trainable_vars())?;
-    let mut opt_d = adam(d.trainable_vars())?;
+    let opt_g = adam(g.trainable_vars())?;
+    let opt_d = adam(d.trainable_vars())?;
+    // The networks and their optimisers, owned by whichever path runs them.
+    let mut nets = match sd.take() {
+        Some(sd) => {
+            let opt_sd = adam(sd.trainable_vars())?;
+            Nets::Seq(SeqModels { g, d, sd, opt_g, opt_d, opt_sd })
+        }
+        None => Nets::Legacy { g, d, opt_g, opt_d },
+    };
 
     let b = cfg.batch_size;
     let latent = cfg.latent;
@@ -162,10 +195,34 @@ Raise --epochs to continue.", cfg.epochs);
             if step > 0 && stop_requested(cfg) {
                 println!("[train] stop requested mid-epoch at step {step}/{} — checkpointing",
                          cfg.steps_per_epoch);
-                checkpoint(&g, &d, cfg, epoch)?;
+                checkpoint(&nets, cfg, epoch)?;
                 let _ = fs::remove_file(stop_path(cfg));
                 return Ok(());
             }
+
+            let (g, d, opt_g, opt_d) = match &mut nets {
+                Nets::Seq(m) => {
+                    // ---- the sequence path: one call, three networks ----
+                    let t0 = std::time::Instant::now();
+                    let batch = ds.sample_sequence_batch(b, cfg.seq_windows, &dev)?;
+                    t_sample += t0.elapsed().as_secs_f64();
+                    let t1 = std::time::Instant::now();
+                    let l = seqstep::step(cfg, &dev, &batch, m, |n| {
+                        Ok(Tensor::randn(0f32, 1f32, (n, latent), &dev)?)
+                    })?;
+                    // Attributed to G bwd on the phase line: the step is not
+                    // split into phases yet, and that is the column an
+                    // operator reading the legacy line takes as "the model".
+                    t_gstep += t1.elapsed().as_secs_f64();
+                    if !l.finite() {
+                        anyhow::bail!("epoch {epoch} step {step}: a loss went non-finite ({l:?})");
+                    }
+                    d_running += l.d + l.sd;
+                    g_running += l.g;
+                    continue;
+                }
+                Nets::Legacy { g, d, opt_g, opt_d } => (g, d, opt_g, opt_d),
+            };
 
             // real batch
             let t0 = std::time::Instant::now();
@@ -258,7 +315,7 @@ reaches G, which is why it is many times the G forward.",
         // having saved. The check costs one stat per epoch.
         let asked_to_stop = stop_requested(cfg);
         if (epoch + 1) % cfg.ckpt_every == 0 || last || asked_to_stop {
-            checkpoint(&g, &d, cfg, epoch + 1)?;
+            checkpoint(&nets, cfg, epoch + 1)?;
         }
         if asked_to_stop {
             // Removed on the way out, or the next run stops at epoch one and
@@ -273,7 +330,19 @@ reaches G, which is why it is many times the G forward.",
     Ok(())
 }
 
-fn checkpoint(g: &Generator, d: &Discriminator, cfg: &Config, epoch: usize) -> Result<()> {
+/// The networks a run owns. The legacy path is the v6 DCGAN pair; the
+/// sequence path adds the sequence discriminator and moves the step into
+/// `seqstep`, which the smoke test drives with the same struct.
+enum Nets {
+    Legacy { g: Generator, d: Discriminator, opt_g: AdamW, opt_d: AdamW },
+    Seq(SeqModels),
+}
+
+fn checkpoint(nets: &Nets, cfg: &Config, epoch: usize) -> Result<()> {
+    let (g, d, sd): (&Generator, &Discriminator, Option<&SeqDiscriminator>) = match nets {
+        Nets::Legacy { g, d, .. } => (g, d, None),
+        Nets::Seq(m) => (&m.g, &m.d, Some(&m.sd)),
+    };
     let dir: &Path = &cfg.ckpt_dir;
     let gp = dir.join(format!("gen_{epoch:06}.safetensors"));
     let dp = dir.join(format!("disc_{epoch:06}.safetensors"));
@@ -282,6 +351,10 @@ fn checkpoint(g: &Generator, d: &Discriminator, cfg: &Config, epoch: usize) -> R
     // rolling "latest" so the GUI can always find the newest weights
     save_generator(g, &dir.join("gen_latest.safetensors"))?;
     save_discriminator(d, &dir.join("disc_latest.safetensors"))?;
+    if let Some(sd) = sd {
+        save_seq_discriminator(sd, &dir.join(format!("seqd_{epoch:06}.safetensors")))?;
+        save_seq_discriminator(sd, &dir.join("seqd_latest.safetensors"))?;
+    }
     // WHICH EPOCH THOSE WEIGHTS ARE. Without it `--resume` reloaded the weights
     // and restarted the counter at zero, so gen_000000 was overwritten on every
     // resume, `ckpt_every` re-triggered from the beginning, and the log claimed

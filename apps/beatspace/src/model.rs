@@ -6,17 +6,27 @@
 //! mean/var, which the GUI needs at eval time and which candle_nn's BatchNorm
 //! keeps in a place that `VarMap::save` would silently drop.
 //!
-//! Shapes (B = batch):
-//!   Generator:     z (B,128)             -> mel (B,1,n_mels,time_frames) in [-1,1]
-//!   Discriminator: mel (B,1,n_mels,time_frames)   -> logit (B,)
+//! Shapes (B = batch, C = stems):
+//!   Generator:     z (B,128) [+ context, + beat phase] -> mel (B,C,n_mels,time_frames) in [-1,1]
+//!   Discriminator: mel (B,C,n_mels,time_frames)   -> logit (B,)
+//!   SeqDiscriminator: mel (B,C,n_mels,W) -> logits (B, W/16), one per time column
 //!
 //! Generator stack (g_filters f = 256):
-//!   fc: latent -> (n_mels/16)*(time_frames/16)*f, reshape (B,f,h0,w0)
+//!   [ctx encoder: (B,C,n_mels,ctx_frames) -> (B,ctx_dim), concatenated to z]
+//!   fc: latent(+ctx_dim) -> (n_mels/16)*(time_frames/16)*f, reshape (B,f,h0,w0)
 //!   4x ConvTranspose2d k4 s2 p1 (f->f/2), BatchNorm, ReLU      256->128->64->32
-//!   final ConvTranspose2d -> 1 channel, Tanh                   -> (B,1,n_mels,time_frames)
+//!   [beat phase: sin/cos planes appended before the final deconv]
+//!   final ConvTranspose2d -> C channels, Tanh                   -> (B,C,n_mels,time_frames)
+//!
+//! Every bracketed part is config-gated (`ctx_frames`, `beat_phase`, `stems`)
+//! and OFF in `Config::default()`, under which this is byte-for-byte the v6
+//! model and its checkpoints load. `Config::dynamic()` turns them all on.
 //!
 //! Discriminator stack (d_filters = 64), 4x SparseBlock stride 2:
-//!   1->64->128->256->512, AdaptiveAvgPool -> Linear(512,1) -> (B,)
+//!   C->64->128->256->512, AdaptiveAvgPool -> Linear(512,1) -> (B,)
+//! The sequence discriminator is the same stack with the pool over frequency
+//! only, so a bad transition is scored where it happens rather than averaged
+//! away.
 
 use candle_core::{DType, Device, Result, Tensor, Var, D};
 use std::collections::HashMap;
@@ -374,6 +384,65 @@ pub struct GenParams {
     pub deconvs: Vec<GpuDeconv>,
 }
 
+/// What the conditional renderer is given besides `z`.
+///
+/// Both parts are optional individually, and a generator built with a part
+/// disabled ignores it; a generator built with it ENABLED refuses to run
+/// without it, because a silently-zeroed context would train a model that
+/// looks conditional and is not.
+#[derive(Default)]
+pub struct Cond {
+    /// `(B, stems, n_mels, ctx_frames)`: the tail of the previous window.
+    pub ctx: Option<Tensor>,
+    /// `(B, time_frames)`: beat phase of each output column, in [0, 1).
+    pub phase: Option<Tensor>,
+}
+
+/// Reduces the previous window's tail to a vector the renderer conditions on.
+///
+/// Two strided 3x3 convolutions, mean-pooled, then a linear map with tanh.
+/// Deliberately small: its job is "what was playing", not a reconstruction —
+/// the discriminators judge whether the continuation fits, and gradient
+/// reaches here through the renderer.
+pub struct CtxEncoder {
+    c0: Conv2d,
+    c1: Conv2d,
+    fc: Linear,
+}
+
+impl CtxEncoder {
+    fn new(stems: usize, ctx_dim: usize, dev: &Device) -> Result<Self> {
+        Ok(Self {
+            c0: Conv2d::new(stems, 16, 3, 2, 1, 1, dev)?,
+            c1: Conv2d::new(16, 32, 3, 2, 1, 1, dev)?,
+            fc: Linear::new(32, ctx_dim, dev)?,
+        })
+    }
+    /// `(B, stems, n_mels, ctx_frames)` -> `(B, ctx_dim)`.
+    fn forward(&self, ctx: &Tensor) -> Result<Tensor> {
+        let leaky = |x: Tensor| -> Result<Tensor> { x.maximum(&(&x * 0.2)?) };
+        let x = leaky(self.c0.forward(ctx)?)?;
+        let x = leaky(self.c1.forward(&x)?)?;
+        let x = x.mean(D::Minus1)?.mean(D::Minus1)?; // (B, 32)
+        self.fc.forward(&x)?.tanh()
+    }
+    fn vars(&self, out: &mut Vec<Var>) {
+        self.c0.vars(out);
+        self.c1.vars(out);
+        self.fc.vars(out);
+    }
+    fn collect(&self, p: &str, m: &mut HashMap<String, Tensor>) {
+        self.c0.collect(&format!("{p}.c0"), m);
+        self.c1.collect(&format!("{p}.c1"), m);
+        self.fc.collect(&format!("{p}.fc"), m);
+    }
+    fn load(&mut self, p: &str, m: &HashMap<String, Tensor>) -> Result<()> {
+        self.c0.load(&format!("{p}.c0"), m)?;
+        self.c1.load(&format!("{p}.c1"), m)?;
+        self.fc.load(&format!("{p}.fc"), m)
+    }
+}
+
 pub struct Generator {
     fc: Linear,
     deconvs: Vec<ConvT2d>,
@@ -381,6 +450,11 @@ pub struct Generator {
     f0: usize,             // channels after fc reshape (= g_filters)
     h0: usize,             // 8
     w0: usize,             // 16
+    /// Present when `ctx_frames > 0`.
+    ctx_enc: Option<CtxEncoder>,
+    /// Two extra input planes on the last deconvolution when `beat_phase`.
+    phase_planes: bool,
+    stems: usize,
 }
 
 impl Generator {
@@ -388,17 +462,28 @@ impl Generator {
         let f = cfg.g_filters; // 256
         let h0 = cfg.n_mels / 16; // 128/16 = 8
         let w0 = cfg.time_frames / 16; // 256/16 = 16
-        let fc = Linear::new(cfg.latent, f * h0 * w0, dev)?;
+        let ctx_enc = if cfg.ctx_frames > 0 {
+            Some(CtxEncoder::new(cfg.stems, cfg.ctx_dim, dev)?)
+        } else {
+            None
+        };
+        let fc_in = cfg.latent + if ctx_enc.is_some() { cfg.ctx_dim } else { 0 };
+        let fc = Linear::new(fc_in, f * h0 * w0, dev)?;
 
         // Deconv channel schedule: 256 -> 128 -> 64 -> 32 (BN+ReLU each),
-        // then a final 32 -> 1 layer with Tanh.
-        let stage_out = [f / 2, f / 4, f / 8, 1]; // 128,64,32,1
+        // then a final 32 -> stems layer with Tanh. The final layer also
+        // reads the two beat-phase planes when they are on — at that point
+        // the grid is n_mels/2 by time_frames/2, one column per two frames,
+        // which is fine enough to place a kick on a beat.
+        let stage_out = [f / 2, f / 4, f / 8, cfg.stems]; // 128,64,32,C
         let mut deconvs = Vec::new();
         let mut bns = Vec::new();
         let mut cin = f;
         for (i, &cout) in stage_out.iter().enumerate() {
-            deconvs.push(ConvT2d::new(cin, cout, 4, 2, 1, 0, dev)?);
-            if i < stage_out.len() - 1 {
+            let last = i == stage_out.len() - 1;
+            let extra = if last && cfg.beat_phase { 2 } else { 0 };
+            deconvs.push(ConvT2d::new(cin + extra, cout, 4, 2, 1, 0, dev)?);
+            if !last {
                 bns.push(BatchNorm2d::new(cout, dev)?);
             }
             cin = cout;
@@ -410,15 +495,62 @@ impl Generator {
             f0: f,
             h0,
             w0,
+            ctx_enc,
+            phase_planes: cfg.beat_phase,
+            stems: cfg.stems,
         })
     }
 
-    fn forward(&self, z: &Tensor, train: bool) -> Result<Tensor> {
+    /// Is this generator conditional at all? The legacy entry points refuse
+    /// to run one that is.
+    pub fn conditional(&self) -> bool {
+        self.ctx_enc.is_some() || self.phase_planes
+    }
+
+    pub fn stems(&self) -> usize {
+        self.stems
+    }
+
+    /// Beat phase `(B, T)` in [0, 1) -> sin/cos planes `(B, 2, h, w)` where
+    /// `w = T/2`, each column the mean of two frames' sin and cos. Averaged
+    /// on the circle rather than on the phase value: the mean of 0.99 and
+    /// 0.01 is not 0.5.
+    fn phase_planes(phase: &Tensor, h: usize, w: usize) -> Result<Tensor> {
+        let (b, t) = phase.dims2()?;
+        if t != 2 * w {
+            candle_core::bail!("beat phase has {t} columns, the last stage wants {}", 2 * w);
+        }
+        let ang = (phase * (2.0 * std::f64::consts::PI))?;
+        let mut planes = Vec::with_capacity(2);
+        for p in [ang.sin()?, ang.cos()?] {
+            let p = p.reshape((b, w, 2))?.mean(D::Minus1)?; // (B, w)
+            planes.push(p.reshape((b, 1, 1, w))?.broadcast_as((b, 1, h, w))?.contiguous()?);
+        }
+        Tensor::cat(&planes, 1)
+    }
+
+    fn forward(&self, z: &Tensor, cond: Option<&Cond>, train: bool) -> Result<Tensor> {
         let b = z.dim(0)?;
-        let mut x = self.fc.forward(z)?; // (B, f*h0*w0)
+        let zin = match &self.ctx_enc {
+            Some(enc) => {
+                let ctx = cond.and_then(|c| c.ctx.as_ref()).ok_or_else(|| {
+                    candle_core::Error::Msg("this generator was built with ctx_frames > 0 and needs Cond::ctx".into())
+                })?;
+                Tensor::cat(&[z, &enc.forward(ctx)?], 1)?
+            }
+            None => z.clone(),
+        };
+        let mut x = self.fc.forward(&zin)?; // (B, f*h0*w0)
         x = x.reshape((b, self.f0, self.h0, self.w0))?;
         let n = self.deconvs.len();
         for i in 0..n {
+            if i == n - 1 && self.phase_planes {
+                let phase = cond.and_then(|c| c.phase.as_ref()).ok_or_else(|| {
+                    candle_core::Error::Msg("this generator was built with beat_phase and needs Cond::phase".into())
+                })?;
+                let (_, _, h, w) = x.dims4()?;
+                x = Tensor::cat(&[&x, &Self::phase_planes(phase, h, w)?], 1)?;
+            }
             x = self.deconvs[i].forward(&x)?;
             if i < n - 1 {
                 x = self.bns[i].forward(&x, train)?;
@@ -427,17 +559,26 @@ impl Generator {
                 x = x.tanh()?; // final layer -> [-1,1]
             }
         }
-        Ok(x) // (B,1,n_mels,time_frames)
+        Ok(x) // (B,stems,n_mels,time_frames)
     }
 
+    /// The legacy unconditional entry points. They fail loudly on a
+    /// conditional generator rather than fabricating a context.
     pub fn forward_train(&self, z: &Tensor) -> Result<Tensor> {
-        self.forward(z, true)
+        self.forward(z, None, true)
     }
     pub fn forward_eval(&self, z: &Tensor) -> Result<Tensor> {
-        self.forward(z, false)
+        self.forward(z, None, false)
+    }
+    pub fn forward_train_cond(&self, z: &Tensor, cond: &Cond) -> Result<Tensor> {
+        self.forward(z, Some(cond), true)
+    }
+    pub fn forward_eval_cond(&self, z: &Tensor, cond: &Cond) -> Result<Tensor> {
+        self.forward(z, Some(cond), false)
     }
 
     /// Convenience for the GUI: one latent row -> mel as a flat (n_mels*T) Vec.
+    /// Unconditional, one stem — the loop player's contract.
     pub fn generate(&self, z: &[f32], dev: &Device) -> Result<(Vec<f32>, usize, usize)> {
         let latent = z.len();
         let zt = Tensor::from_vec(z.to_vec(), (1, latent), dev)?;
@@ -448,10 +589,52 @@ impl Generator {
         Ok((flat, n_mels, t))
     }
 
+    /// One window of a stream: `z`, the previous window's planes (from which
+    /// the last `ctx_frames` columns are taken) and the beat phase of each
+    /// new column. Returns `stems` planes of `(n_mels x T)` laid end to end,
+    /// plus `(n_mels, t)`.
+    pub fn generate_next(
+        &self,
+        z: &[f32],
+        prev: Option<&[f32]>,
+        ctx_frames: usize,
+        phase: Option<&[f32]>,
+        n_mels: usize,
+        t: usize,
+        dev: &Device,
+    ) -> Result<(Vec<f32>, usize, usize)> {
+        let zt = Tensor::from_vec(z.to_vec(), (1, z.len()), dev)?;
+        let mut cond = Cond::default();
+        if self.ctx_enc.is_some() {
+            let prev = prev.ok_or_else(|| candle_core::Error::Msg("generate_next needs the previous window".into()))?;
+            let full = Tensor::from_vec(prev.to_vec(), (1, self.stems, n_mels, t), dev)?;
+            cond.ctx = Some(full.narrow(3, t - ctx_frames, ctx_frames)?.contiguous()?);
+        }
+        if self.phase_planes {
+            let ph = phase.ok_or_else(|| candle_core::Error::Msg("generate_next needs a beat phase".into()))?;
+            cond.phase = Some(Tensor::from_vec(ph.to_vec(), (1, t), dev)?);
+        }
+        let mel = self.forward_eval_cond(&zt, &cond)?; // (1,stems,n_mels,t)
+        let flat = mel.flatten_all()?.to_vec1::<f32>()?;
+        Ok((flat, n_mels, t))
+    }
+
     /// Flatten all weights (folding eval-time BatchNorm into per-channel
     /// scale/shift) for an external GPU forward pass. CPU-side; cheap.
     #[cfg(feature = "gpu")]
     pub fn export_params(&self) -> Result<GenParams> {
+        // The wgpu path implements fc + four deconvolutions on one latent.
+        // A context encoder, phase planes on the last stage and a multi-stem
+        // output are three shader changes it does not have, and it cannot be
+        // validated here (no GPU), so it says so rather than exporting a
+        // model whose weights it would then read wrong.
+        if self.conditional() || self.stems != 1 {
+            candle_core::bail!(
+                "the GPU generator path only supports the unconditional one-stem model; \
+this one has ctx {} / beat_phase {} / stems {}",
+                self.ctx_enc.is_some(), self.phase_planes, self.stems
+            );
+        }
         let (f0, latent) = self.fc.w.as_tensor().dims2()?;
         let fc_w = self.fc.w.as_tensor().flatten_all()?.to_vec1::<f32>()?;
         let fc_b = self.fc.b.as_tensor().flatten_all()?.to_vec1::<f32>()?;
@@ -514,6 +697,9 @@ impl Generator {
         for b in &self.bns {
             b.vars(&mut v);
         }
+        if let Some(e) = &self.ctx_enc {
+            e.vars(&mut v);
+        }
         v
     }
 
@@ -526,6 +712,9 @@ impl Generator {
         for (i, b) in self.bns.iter().enumerate() {
             b.collect(&format!("g.bn{i}"), &mut m);
         }
+        if let Some(e) = &self.ctx_enc {
+            e.collect("g.ctx", &mut m);
+        }
         m
     }
 
@@ -536,6 +725,12 @@ impl Generator {
         }
         for (i, b) in self.bns.iter_mut().enumerate() {
             b.load(&format!("g.bn{i}"), m)?;
+        }
+        if let Some(e) = &mut self.ctx_enc {
+            if !m.contains_key("g.ctx.fc.w") {
+                candle_core::bail!("checkpoint has no context encoder (g.ctx.*) but this run has ctx_frames > 0");
+            }
+            e.load("g.ctx", m)?;
         }
         Ok(())
     }
@@ -760,16 +955,22 @@ pub struct Discriminator {
     head: Linear, // (512 -> 1)
 }
 
+/// The four stride-2 SparseBlocks both discriminators share.
+fn sparse_stack(cfg: &Config, dev: &Device) -> Result<Vec<SparseBlock>> {
+    let d = cfg.d_filters; // 64
+    // stems -> 64 -> 128 -> 256 -> 512
+    let chans = [(cfg.stems, d), (d, d * 2), (d * 2, d * 4), (d * 4, d * 8)];
+    let mut blocks = Vec::new();
+    for &(cin, cout) in chans.iter() {
+        blocks.push(SparseBlock::new(cin, cout, 2, cfg.sparse_threshold, dev)?);
+    }
+    Ok(blocks)
+}
+
 impl Discriminator {
     pub fn new(cfg: &Config, dev: &Device) -> Result<Self> {
-        let d = cfg.d_filters; // 64
-        // 1 -> 64 -> 128 -> 256 -> 512
-        let chans = [(1usize, d), (d, d * 2), (d * 2, d * 4), (d * 4, d * 8)];
-        let mut blocks = Vec::new();
-        for &(cin, cout) in chans.iter() {
-            blocks.push(SparseBlock::new(cin, cout, 2, cfg.sparse_threshold, dev)?);
-        }
-        let head = Linear::new(d * 8, 1, dev)?;
+        let blocks = sparse_stack(cfg, dev)?;
+        let head = Linear::new(cfg.d_filters * 8, 1, dev)?;
         Ok(Self { blocks, head })
     }
 
@@ -813,6 +1014,71 @@ impl Discriminator {
 }
 
 // ----------------------------------------------------------------------------
+// Sequence discriminator
+// ----------------------------------------------------------------------------
+
+/// Scores a run of adjacent windows, one logit per time column.
+///
+/// The window discriminator ends in a global average pool, so it sees a
+/// window as texture and cannot tell a seam from a bar of music: a bad
+/// transition is a few columns' worth of evidence averaged into nothing.
+/// This one pools over FREQUENCY only and puts a linear head on every
+/// remaining column, so it answers "is the audio around here real" at each
+/// point along the join — PatchGAN along time. Same SparseBlocks, so what it
+/// has learned about texture is not learned twice.
+pub struct SeqDiscriminator {
+    blocks: Vec<SparseBlock>,
+    head: Linear, // (512 -> 1), applied per column
+}
+
+impl SeqDiscriminator {
+    pub fn new(cfg: &Config, dev: &Device) -> Result<Self> {
+        let blocks = sparse_stack(cfg, dev)?;
+        let head = Linear::new(cfg.d_filters * 8, 1, dev)?;
+        Ok(Self { blocks, head })
+    }
+
+    /// mel `(B, stems, n_mels, W)` -> logits `(B, W/16)`.
+    pub fn forward(&self, x: &Tensor, train: bool) -> Result<Tensor> {
+        let mut x = x.clone();
+        for b in &self.blocks {
+            x = b.forward(&x, train)?;
+        }
+        let x = x.mean(2)?; // (B, 512, W')
+        let (b, c, w) = x.dims3()?;
+        // One matmul for every column of every sample rather than a batched
+        // broadcast: (B*W', 512) @ (512, 1).
+        let cols = x.transpose(1, 2)?.contiguous()?.reshape((b * w, c))?;
+        self.head.forward(&cols)?.reshape((b, w))
+    }
+
+    pub fn trainable_vars(&self) -> Vec<Var> {
+        let mut v = Vec::new();
+        for b in &self.blocks {
+            b.vars(&mut v);
+        }
+        self.head.vars(&mut v);
+        v
+    }
+
+    pub fn state_dict(&self) -> HashMap<String, Tensor> {
+        let mut m = HashMap::new();
+        for (i, b) in self.blocks.iter().enumerate() {
+            b.collect(&format!("sd.block{i}"), &mut m);
+        }
+        self.head.collect("sd.head", &mut m);
+        m
+    }
+
+    pub fn load_state(&mut self, m: &HashMap<String, Tensor>) -> Result<()> {
+        for (i, b) in self.blocks.iter_mut().enumerate() {
+            b.load(&format!("sd.block{i}"), m)?;
+        }
+        self.head.load("sd.head", m)
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Numerically-stable BCE with logits
 //   loss = mean( max(x,0) - x*z + log(1 + exp(-|x|)) )
 // candle's built-in does sigmoid-then-log which can NaN at saturation.
@@ -842,6 +1108,16 @@ pub fn save_discriminator(d: &Discriminator, path: &std::path::Path) -> Result<(
     candle_core::safetensors::save(&m, path)
 }
 
+pub fn save_seq_discriminator(d: &SeqDiscriminator, path: &std::path::Path) -> Result<()> {
+    let m = d.state_dict();
+    candle_core::safetensors::save(&m, path)
+}
+
+pub fn load_seq_discriminator(d: &mut SeqDiscriminator, path: &std::path::Path, dev: &Device) -> Result<()> {
+    let m = candle_core::safetensors::load(path, dev)?;
+    d.load_state(&m)
+}
+
 /// What geometry a checkpoint was trained with, read from the checkpoint.
 ///
 /// `g.fc.w` is `[g_filters * h0 * w0, latent]`, and `h0`/`w0` are
@@ -859,6 +1135,12 @@ pub struct CkptShape {
 /// with. Returns `None` when `g.fc.w` is absent or does not decompose —
 /// in which case candle's own error is the honest thing to show, because
 /// the file is not the shape this function assumes.
+///
+/// A conditional checkpoint's `g.fc.w` is `[.., latent + ctx_dim]`, and the
+/// file carries `g.ctx.fc.w` of `[ctx_dim, 32]` to say so; the ctx width is
+/// read from there and subtracted. The `config.json` next to a checkpoint is
+/// still the authority on everything else (stems, beat_phase), which is why
+/// the GUI prefers it when present.
 pub fn checkpoint_shape(
     m: &std::collections::HashMap<String, candle_core::Tensor>,
     g_filters: usize,
@@ -866,7 +1148,9 @@ pub fn checkpoint_shape(
 ) -> Option<CkptShape> {
     let t = m.get("g.fc.w")?;
     let dims = t.dims();
-    let (rows, latent) = (*dims.first()?, *dims.get(1)?);
+    let (rows, fc_in) = (*dims.first()?, *dims.get(1)?);
+    let ctx_dim = m.get("g.ctx.fc.w").and_then(|w| w.dims().first().copied()).unwrap_or(0);
+    let latent = fc_in.checked_sub(ctx_dim)?;
     let h0 = n_mels / 16;
     let per_frame_block = g_filters.checked_mul(h0)?;
     if per_frame_block == 0 || rows % per_frame_block != 0 {
@@ -1248,5 +1532,156 @@ been fixed upstream, which would retire the BEATSPACE_DENSE_D flag");
             assert!(worst < 1e-4,
                     "c_in{c_in} c_out{c_out} s{stride} p{pad}: worst {worst}");
         }
+    }
+}
+
+#[cfg(test)]
+mod conditional_tests {
+    use super::*;
+    use candle_core::Device;
+
+    /// A tiny dynamic config: the smoke test's sizes with every conditional
+    /// part on.
+    fn tiny_dynamic() -> Config {
+        Config {
+            n_mels: 32, time_frames: 32, latent: 16, g_filters: 64, d_filters: 32,
+            batch_size: 4, n_fft: 256, hop: 64, sr: 8_000, fmax: 4_000.0,
+            ..Config::dynamic()
+        }
+    }
+
+    fn cond(cfg: &Config, b: usize, seed: f32) -> Cond {
+        let dev = Device::Cpu;
+        let ctx = Tensor::randn(seed, 0.5f32, (b, cfg.stems, cfg.n_mels, cfg.ctx_frames), &dev).unwrap();
+        let phase: Vec<f32> = (0..b * cfg.time_frames).map(|i| ((i as f32 * 0.07 + seed) % 1.0).abs()).collect();
+        Cond {
+            ctx: Some(ctx),
+            phase: Some(Tensor::from_vec(phase, (b, cfg.time_frames), &dev).unwrap()),
+        }
+    }
+
+    #[test]
+    fn the_default_config_builds_the_legacy_generator_with_the_legacy_keys() {
+        let dev = Device::Cpu;
+        let cfg = Config { n_mels: 32, time_frames: 32, latent: 16, g_filters: 64, ..Config::default() };
+        let g = Generator::new(&cfg, &dev).unwrap();
+        assert!(!g.conditional());
+        let keys: Vec<String> = g.state_dict().keys().cloned().collect();
+        assert!(keys.iter().all(|k| !k.starts_with("g.ctx")), "{keys:?}");
+        let sd = g.state_dict();
+        assert_eq!(sd["g.fc.w"].dims(), &[64 * 2 * 2, 16]);
+        assert_eq!(sd["g.deconv3.w"].dims(), &[8, 1, 4, 4], "last deconv is 8 -> 1, no phase planes");
+        // And the legacy entry points run.
+        let z = Tensor::zeros((2, 16), candle_core::DType::F32, &dev).unwrap();
+        assert_eq!(g.forward_eval(&z).unwrap().dims(), &[2, 1, 32, 32]);
+    }
+
+    #[test]
+    fn the_dynamic_generator_has_the_shapes_the_design_says() {
+        let dev = Device::Cpu;
+        let cfg = tiny_dynamic();
+        let g = Generator::new(&cfg, &dev).unwrap();
+        assert!(g.conditional());
+        let sd = g.state_dict();
+        assert_eq!(sd["g.fc.w"].dims(), &[64 * 2 * 2, 16 + cfg.ctx_dim], "fc reads z and the context");
+        assert_eq!(sd["g.deconv3.w"].dims(), &[8 + 2, 2, 4, 4], "last deconv reads two phase planes, emits two stems");
+        assert_eq!(sd["g.ctx.c0.w"].dims(), &[16, 2, 3, 3]);
+        assert_eq!(sd["g.ctx.fc.w"].dims(), &[cfg.ctx_dim, 32]);
+        let z = Tensor::zeros((3, 16), candle_core::DType::F32, &dev).unwrap();
+        let out = g.forward_eval_cond(&z, &cond(&cfg, 3, 0.1)).unwrap();
+        assert_eq!(out.dims(), &[3, 2, 32, 32]);
+        // The unconditional entry point refuses rather than zero-filling.
+        let err = g.forward_eval(&z).unwrap_err().to_string();
+        assert!(err.contains("Cond::ctx"), "{err}");
+    }
+
+    #[test]
+    fn the_context_and_the_phase_each_change_the_output() {
+        // Structural, not learned: at random init a different input on
+        // either path must reach the output, or training could never make
+        // the model use it.
+        let dev = Device::Cpu;
+        let cfg = tiny_dynamic();
+        let g = Generator::new(&cfg, &dev).unwrap();
+        let z = Tensor::randn(0f32, 1f32, (2, 16), &dev).unwrap();
+        let a = cond(&cfg, 2, 0.1);
+        let base = g.forward_eval_cond(&z, &a).unwrap();
+        let mut other_ctx = cond(&cfg, 2, 0.9);
+        other_ctx.phase = a.phase.clone();
+        let mut other_phase = cond(&cfg, 2, 0.1);
+        other_phase.phase = Some((a.phase.as_ref().unwrap() + 0.5).unwrap());
+        let diff = |t: &Tensor| (t - &base).unwrap().abs().unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap();
+        // Strictly positive rather than a threshold: at N(0, 0.02) init the
+        // context reaches the output through five small layers and lands
+        // around 1e-6, but a DISCONNECTED path gives exactly zero, and that
+        // is the failure this catches.
+        assert!(diff(&g.forward_eval_cond(&z, &other_ctx).unwrap()) > 0.0, "context is ignored");
+        assert!(diff(&g.forward_eval_cond(&z, &other_phase).unwrap()) > 0.0, "phase is ignored");
+        // And gradient reaches the context encoder: every one of its
+        // parameters must appear in the trainable set.
+        let n_ctx = g.trainable_vars().len() - Generator::new(&Config { ctx_frames: 0, ..cfg.clone() }, &dev).unwrap().trainable_vars().len();
+        assert_eq!(n_ctx, 4, "c0.w, c1.w, fc.w, fc.b");
+    }
+
+    #[test]
+    fn phase_planes_average_on_the_circle() {
+        // Two adjacent columns at 0.99 and 0.01 straddle the wrap; their
+        // sin mean is ~0 and cos mean is ~1, not the sin/cos of 0.5.
+        let dev = Device::Cpu;
+        let phase = Tensor::from_vec(vec![0.99f32, 0.01, 0.25, 0.25], (1, 4), &dev).unwrap();
+        let planes = Generator::phase_planes(&phase, 3, 2).unwrap();
+        assert_eq!(planes.dims(), &[1, 2, 3, 2]);
+        let v: Vec<f32> = planes.flatten_all().unwrap().to_vec1().unwrap();
+        // layout: [sin plane (3x2)] [cos plane (3x2)]
+        assert!(v[0].abs() < 0.1, "sin across the wrap: {}", v[0]);
+        assert!(v[6] > 0.99, "cos across the wrap: {}", v[6]);
+        assert!((v[1] - 1.0).abs() < 1e-5 && v[7].abs() < 1e-5, "sin/cos of 0.25");
+        // Every row is the same column vector: the planes are broadcast over
+        // frequency.
+        assert_eq!(v[0], v[2]);
+        assert_eq!(v[1], v[5]);
+    }
+
+    #[test]
+    fn the_sequence_discriminator_scores_one_logit_per_time_column() {
+        let dev = Device::Cpu;
+        let cfg = tiny_dynamic();
+        let sd = SeqDiscriminator::new(&cfg, &dev).unwrap();
+        // A pair of windows joined at the overlap: 2T - overlap wide.
+        let w = 2 * cfg.time_frames - cfg.overlap_frames;
+        let x = Tensor::randn(0f32, 0.5f32, (3, cfg.stems, cfg.n_mels, w), &dev).unwrap();
+        let out = sd.forward(&x, true).unwrap();
+        // Four stride-2 blocks with padding 1: ceil(w/2) four times.
+        let mut cols = w;
+        for _ in 0..4 { cols = (cols + 1) / 2; }
+        assert_eq!(out.dims(), &[3, cols]);
+        // The window discriminator reads the same stems and pools to one.
+        let d = Discriminator::new(&cfg, &dev).unwrap();
+        let win = Tensor::randn(0f32, 0.5f32, (3, cfg.stems, cfg.n_mels, cfg.time_frames), &dev).unwrap();
+        assert_eq!(d.forward(&win, true).unwrap().dims(), &[3]);
+        // Round trip through its own state dict.
+        let mut sd2 = SeqDiscriminator::new(&cfg, &dev).unwrap();
+        sd2.load_state(&sd.state_dict()).unwrap();
+        let again = sd2.forward(&x, false).unwrap();
+        let _ = again;
+    }
+
+    #[test]
+    fn a_conditional_checkpoint_reports_its_latent_without_the_context_width() {
+        let dev = Device::Cpu;
+        let cfg = tiny_dynamic();
+        let g = Generator::new(&cfg, &dev).unwrap();
+        let sh = checkpoint_shape(&g.state_dict(), cfg.g_filters, cfg.n_mels).unwrap();
+        assert_eq!(sh, CkptShape { latent: 16, time_frames: 32 });
+    }
+
+    #[test]
+    fn a_legacy_checkpoint_does_not_load_into_a_conditional_generator_silently() {
+        let dev = Device::Cpu;
+        let cfg = tiny_dynamic();
+        let legacy = Generator::new(&Config { ctx_frames: 0, beat_phase: false, stems: 1, ..cfg.clone() }, &dev).unwrap();
+        let mut g = Generator::new(&cfg, &dev).unwrap();
+        let err = g.load_state(&legacy.state_dict()).unwrap_err().to_string();
+        assert!(err.contains("shape") || err.contains("g.ctx"), "{err}");
     }
 }

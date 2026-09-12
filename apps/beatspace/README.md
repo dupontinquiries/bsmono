@@ -99,6 +99,23 @@ Resume from the latest checkpoint with `--resume`.
 Useful flags: `--steps-per-epoch`, `--ckpt-every`, `--batch-size`. Run
 `cargo run --release -- train --help` for the full list.
 
+### 2b. Train a dynamic track model
+
+```bash
+cargo run --release -- train --dynamic --data-dir ./data --ckpt-dir ./checkpoints-dynamic
+```
+
+`--dynamic` trains a renderer that CONTINUES its own output instead of
+emitting independent loops: two mel stems (harmonic/percussive, split at cache
+time), an 8-frame context from the previous window, a beat-phase input, and a
+second discriminator that scores adjacent windows across their join. The cache
+format changes (`BSP2`), so use a fresh `--cache-dir` or let it rebuild. Each
+of the preset's parts has its own flag (`--stems`, `--ctx-frames`,
+`--beat-phase`, `--seq-windows`, `--overlap-frames`, `--no-rollout`); a
+checkpoint's `config.json` records them and the GUI streams rather than loops
+when it reads one. `smoke --dynamic` is the structural check for this path.
+A step costs roughly three to four legacy steps at `--seq-windows 3`.
+
 ### 3. Explore in the GUI
 
 ```bash
