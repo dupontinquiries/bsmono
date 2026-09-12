@@ -1,0 +1,16 @@
+[package]
+name = "vidkit-webm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vidkit-core = { path = "../vidkit-core" }
+# For ByteSource and the shared Error type. The two demuxers read bytes the
+# same way and should not disagree about what a truncated file is.
+vidkit-mp4 = { path = "../vidkit-mp4" }
+
+[features]
+# Expose the EBML fixture writer to other crates' tests. Off by default.
+fixtures = []

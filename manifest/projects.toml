@@ -5,6 +5,18 @@
 # runtime: kde | gnome | freedesktop | none | tbd   (Flatpak runtime)
 # targets: subset of manifest/targets.toml ids; "all" = every linux target
 
+[apps.vidkit-player]
+path = "apps/vidkit-player"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # pure egui/glow (wayland/x11), same convention as the other -egui apps
+targets = ["desktop", "phone"]
+bin = "vidkit-player"
+primary = true            # the only surface; shared/vidkit is the kit behind it
+notes = "video player on shared/vidkit: `vidkit-player FILE` demuxes a local MP4 or WebM (container SNIFFED, not taken from the extension) and reports codec/size/duration; with no argument it shows a test pattern. Gesture-driven surface from vidkit-egui -- drag to scrub with the rate set by pointer height, left half volume, right half speed, right edge rotate, pinch zoom -- on an adaptive uikit-egui bar. `cargo build --release` in apps/vidkit-player gives the bin (`app` feature default-on). HONEST STATE: there is no decoder in this tree yet, so an opened file is parsed and described but the picture shown is the test pattern; the app says so on screen rather than showing a black window. Registered as role=app because shared/vidkit is role=shared-lib and ships no [[bin]], so gitmind's catalogue correctly refused to offer it -- an app nobody can start is indistinguishable from one that does not work."
+
 [apps.voiceterm]
 path = "apps/voiceterm"
 kind = "cargo"            # qmetaobject cdylib (Rust↔Qt, not Rust↔C++)
@@ -303,6 +315,16 @@ runtime = "none"
 targets = ["desktop", "phone", "x86"]   # pure Rust → cross-clean
 notes = "link-time registry kit (linkme distributed slices); generalizes unendlich's service_registry; FIRST crate in shared/"
 
+[shared.vidkit]
+path = "shared/vidkit"
+kind = "cargo"
+role = "shared-lib"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone", "x86"]
+notes = "video playback kit, nested workspace: headless core (device capability model, format selection, A/V sync, frame queue, player loop), yt-dlp resolve/refresh, MP4 and WebM demuxers, a V4L2 stateful decoder state machine, a Vulkan convert shader, and vidkit-egui -- a Presenter + letterboxed VideoView on shared/uikit. The load-bearing idea is that Asahi and the Fairphone have OPPOSITE codec preferences (dav1d AV1 beats software VP9 on M-series; Venus fixed-function VP9 beats dav1d AV1 on a phone), so codec choice resolves against runtime-probed DeviceCaps rather than cfg branches -- same shape as device-kit's source_plan, and for the same reason. Needs rustc >= 1.91; `cargo test` with VK_ICD_FILENAMES set to lavapipe or the shader tests silently skip. tools/mutate.py is a mutation sweep (116 mutants) and must stay at 0 unexplained survivors; run it DETACHED, it outlives a five-minute call. vidkit-egui is the front end on shared/uikit: a CPU-convert Presenter, a letterboxed VideoView, an adaptive bottom bar, and a gesture router (scrub/volume/speed/rotate/zoom) that is a pure state machine. `cargo run -p vidkit-egui --features demo --example video_demo` under Xvfb is not optional -- three defects reached a green build and were caught by a screenshot. NOT verified: vidkit-v4l2's device.rs compiles but has never opened a driver, and the DMA-BUF import path needs VK_EXT_image_drm_format_modifier, which lavapipe does not expose."
+
 [shared.core-kit]
 path = "shared/core-kit"
 kind = "cargo"
@@ -499,19 +521,6 @@ bin = "cadscope-egui"     # crates/cadscope-egui is the shell; logic lives in th
 primary = true            # egui-first from birth; no Qt/GTK surface exists to archive
 notes = "parametric CAD: forge Doc -> kernel Model -> cad-view draws the viewport through one egui_wgpu::Callback (skydribble-parity pass, Depth32Float). Was MISSING from this manifest entirely, so gitmind's app catalogue could not see or build it; added 2026-09-01 along with the wgpu device-limit clamp that fixes startup on phone GPUs (max_color_attachments 8 > 5)."
 
-[apps.bscale]
-path = "apps/bscale"
-kind = "cargo"
-role = "app"
-daemon = false
-flatpak = false
-runtime = "none"          # egui shell behind the `app` feature; CLI otherwise
-targets = ["desktop"]     # NOT phone: the CNN needs a GPU budget a Fairphone does not have,
-                          # and the useful models are 67 MB downloads
-bin = "bscale"         # crates/bscale is the CLI + egui shell
-primary = true            # egui-first; no other surface exists
-notes = "Block-matched residual video super-resolution (Real-ESRGAN RRDBNet / SRVGGNetCompact / waifu2x upconv_7) on wgpu, with an AV1 pipeline. Only the changed parts of a frame go through the CNN. Three crates: d2x-core is headless (gate, matchers, residual/merge, the Network op-list model layer with a CPU reference) and depends only on image/rayon/serde; d2x-wgpu is the GPU Network runner; bscale is the CLI+shell. EXPERIMENTAL. Models are DATA and are resolved from ~/models/upscale then ~/models before the vendored copy (d2x_core::model_search_dirs) — only the 2.5 MB realesr-animevideov3 is in-tree; the 10.6 MB waifu2x JSON was removed and the 67 MB RRDB photo models were never vendored. beatspace consumes d2x-core behind its off-by-default `upscale` / `upscale-gpu` features."
-
 [apps.switcheroo]
 path = "apps/switcheroo"
 kind = "cargo"
@@ -636,8 +645,9 @@ daemon = false
 flatpak = false
 runtime = "none"          # egui/glow shell (wayland/x11) + CLI; GPU via wgpu 29 (Vulkan on Asahi)
 targets = ["desktop"]
+bin = "bscale"           # crates/bscale is the CLI + egui shell
 primary = true
-notes = "Rust port of bscale (block-matched residual video super-resolution) with a native wgpu conv-net runner (Real-ESRGAN RRDB/SRVGG, waifu2x upconv_7 as op lists) and an ffmpeg AV1 pipeline (libdav1d in, libsvtav1 10-bit out, keyframe-aligned segment parallelism, audio remux). Workspace: crates/d2x-core (headless engine, 38 tests), crates/d2x-wgpu (GPU bit-exact vs CPU on lavapipe for all three nets), crates/bscale (CLI + `app` feature egui shell, both default-on; `--no-default-features --features gpu` is the CI build). Model weights: tools/pth2st.py converts PyTorch .pth without torch; models/ vendors realesr-animevideov3 only (RRDB photo models are 67 MB each, download separately). Verified end to end here on a synthetic 10-bit AV1 clip with lavapipe; not yet run on Honeykrisp."
+notes = "Rust port of bscale (block-matched residual video super-resolution) with a native wgpu conv-net runner (Real-ESRGAN RRDB/SRVGG, waifu2x upconv_7 as op lists) and an ffmpeg AV1 pipeline (libdav1d in, libsvtav1 10-bit out, keyframe-aligned segment parallelism, audio remux). Workspace: crates/d2x-core (headless engine, 38 tests), crates/d2x-wgpu (GPU bit-exact vs CPU on lavapipe for all three nets), crates/bscale (CLI + `app` feature egui shell, both default-on; `--no-default-features --features gpu` is the CI build). Model weights: tools/pth2st.py converts PyTorch .pth without torch; models/ vendors realesr-animevideov3 only (RRDB photo models are 67 MB each, download separately). Verified end to end here on a synthetic 10-bit AV1 clip with lavapipe; not yet run on Honeykrisp. Merged from a duplicate [apps.bscale] entry: models are DATA, resolved from ~/models/upscale then ~/models before the vendored copy (d2x_core::model_search_dirs); the 10.6 MB waifu2x JSON was removed and the 67 MB RRDB photo models were never vendored. beatspace consumes d2x-core behind its off-by-default `upscale`/`upscale-gpu` features. NOT phone: the CNN needs a GPU budget a Fairphone does not have."
 
 [apps.echelon]
 path = "games/echelon"

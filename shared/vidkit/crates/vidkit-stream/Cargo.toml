@@ -1,0 +1,16 @@
+[package]
+name = "vidkit-stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Joins Resolver, HttpByteSource and the container demuxers into a MediaSource."
+
+[dependencies]
+vidkit-core = { path = "../vidkit-core" }
+vidkit-ytdlp = { path = "../vidkit-ytdlp" }
+vidkit-mp4 = { path = "../vidkit-mp4" }
+vidkit-webm = { path = "../vidkit-webm" }
+
+[dev-dependencies]
+vidkit-mp4 = { path = "../vidkit-mp4", features = ["fixtures"] }

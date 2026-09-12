@@ -1,0 +1,666 @@
+//! CPU YUV -> RGBA, for presenters that cannot sample a DMA-BUF.
+//!
+//! **This mirrors `vidkit-vk/shaders/convert.wgsl` and must stay in step with
+//! it.** Two copies of colour maths is a drift hazard, so
+//! `vidkit-vk/tests/parity.rs` runs both over the same inputs and fails on any
+//! disagreement — the same arrangement `maintenance/tools/voiceprint_parity_check.py`
+//! exists for elsewhere in this tree. If you change one, the test tells you
+//! about the other.
+//!
+//! Why a second implementation exists at all: egui's glow backend samples
+//! ordinary textures, so a frame reaches the screen as an RGBA upload. The
+//! zero-copy path — import the decoder's DMA-BUF and convert on the GPU — needs
+//! the wgpu backend and `wgpu_hal` access, which is a separate presenter. This
+//! is the portable one, and on a phone playing 1080p it is also the one that
+//! costs measurable battery, so prefer the GPU path where it exists.
+
+use crate::frame::{ColorInfo, CpuPlanes, Frame, FrameData, Matrix, PlaneLayout, Range};
+use crate::codec::Transfer;
+
+/// Column-major YUV->RGB coefficients, matching `yuv_to_rgb_matrix` in the
+/// shader. `[y, cb, cr]` contribution per output channel.
+fn matrix_coeffs(m: Matrix) -> [[f32; 3]; 3] {
+    match m {
+        // r = y + 1.59603*cr, g = y - 0.39176*cb - 0.81297*cr, b = y + 2.01723*cb
+        Matrix::Bt601 => [
+            [1.0, 0.0, 1.59603],
+            [1.0, -0.39176, -0.81297],
+            [1.0, 2.01723, 0.0],
+        ],
+        Matrix::Bt709 => [
+            [1.0, 0.0, 1.57480],
+            [1.0, -0.18732, -0.46812],
+            [1.0, 1.85560, 0.0],
+        ],
+        Matrix::Bt2020Ncl => [
+            [1.0, 0.0, 1.47460],
+            [1.0, -0.16455, -0.57135],
+            [1.0, 1.88140, 0.0],
+        ],
+    }
+}
+
+/// SMPTE ST 2084 EOTF, normalised so 1.0 == 10000 nits. Mirrors `pq_eotf`.
+fn pq_eotf(e: f32) -> f32 {
+    const M1: f32 = 0.1593017578125;
+    const M2: f32 = 78.84375;
+    const C1: f32 = 0.8359375;
+    const C2: f32 = 18.8515625;
+    const C3: f32 = 18.6875;
+    let ep = e.max(0.0).powf(1.0 / M2);
+    let num = (ep - C1).max(0.0);
+    let den = C2 - C3 * ep;
+    (num / den.max(1e-6)).powf(1.0 / M1)
+}
+
+/// ARIB STD-B67 inverse OETF. Mirrors `hlg_eotf`.
+fn hlg_eotf(e: f32) -> f32 {
+    const A: f32 = 0.17883277;
+    const B: f32 = 0.28466892;
+    const C: f32 = 0.55991073;
+    if e <= 0.5 {
+        (e * e) / 3.0
+    } else {
+        (((e - C) / A).exp() + B) / 12.0
+    }
+}
+
+/// Soft-knee roll-off. Mirrors `tonemap`; see that function for why plain
+/// Reinhard is wrong here (it puts reference white at 0.5).
+fn tonemap(x: f32, peak: f32) -> f32 {
+    const KNEE: f32 = 0.8;
+    let v = x / peak.max(1.0);
+    if v <= KNEE {
+        v
+    } else {
+        let e = v - KNEE;
+        KNEE + (1.0 - KNEE) * (e / (e + (1.0 - KNEE)))
+    }
+}
+
+/// Luminance the tonemap treats as SDR white, in nits. ITU reference white.
+pub const REFERENCE_WHITE_NITS: f32 = 203.0;
+
+/// Sample a plane with bilinear filtering at normalised coordinates, matching
+/// what `textureSampleLevel` does in the shader.
+///
+/// The chroma planes are half resolution, and the GPU sampler upscales them for
+/// free. Doing nearest-neighbour here instead would be cheaper and would
+/// disagree with the shader on every chroma edge, which is exactly the drift
+/// the parity test is looking for.
+/// How a plane's samples are stored.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum SampleFormat {
+    /// One byte per sample.
+    U8,
+    /// Two bytes little-endian, 10 significant bits in the HIGH bits — P010's
+    /// layout. The value is already left-shifted, so dividing by 65535 gives
+    /// the right normalised result with no correction.
+    U16HighBits,
+    /// Two bytes little-endian, 10 significant bits in the LOW bits —
+    /// I420_10LE. Dividing by 65535 here would render the picture at about a
+    /// sixteenth brightness, which reads as "the decoder is broken" rather
+    /// than as a scaling bug. Divide by 1023.
+    U16LowBits10,
+}
+
+impl SampleFormat {
+    pub fn bytes(self) -> usize {
+        match self {
+            SampleFormat::U8 => 1,
+            _ => 2,
+        }
+    }
+
+    fn read(self, data: &[u8], byte_index: usize) -> f32 {
+        match self {
+            SampleFormat::U8 => data.get(byte_index).copied().unwrap_or(0) as f32 / 255.0,
+            SampleFormat::U16HighBits => {
+                let lo = data.get(byte_index).copied().unwrap_or(0) as u16;
+                let hi = data.get(byte_index + 1).copied().unwrap_or(0) as u16;
+                (lo | (hi << 8)) as f32 / 65535.0
+            }
+            SampleFormat::U16LowBits10 => {
+                let lo = data.get(byte_index).copied().unwrap_or(0) as u16;
+                let hi = data.get(byte_index + 1).copied().unwrap_or(0) as u16;
+                // Mask: the top six bits are undefined padding in this layout,
+                // and a decoder that leaves them set would otherwise blow the
+                // value past 1.0 and clip every highlight.
+                ((lo | (hi << 8)) & 0x03FF) as f32 / 1023.0
+            }
+        }
+    }
+}
+
+fn sample_bilinear(
+    data: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    comps: usize,
+    comp: usize,
+    fmt: SampleFormat,
+    u: f32,
+    v: f32,
+) -> f32 {
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    // Texel-space coordinate of the sample point, offset to texel centres.
+    let x = u * w as f32 - 0.5;
+    let y = v * h as f32 - 0.5;
+    let x0 = x.floor();
+    let y0 = y.floor();
+    let fx = x - x0;
+    let fy = y - y0;
+
+    let clampi = |i: f32, n: usize| -> usize { (i.max(0.0) as usize).min(n.saturating_sub(1)) };
+    let x0i = clampi(x0, w);
+    let y0i = clampi(y0, h);
+    let x1i = clampi(x0 + 1.0, w);
+    let y1i = clampi(y0 + 1.0, h);
+
+    let at = |xi: usize, yi: usize| -> f32 {
+        let ix = yi * stride + (xi * comps + comp) * fmt.bytes();
+        fmt.read(data, ix)
+    };
+
+    let top = at(x0i, y0i) * (1.0 - fx) + at(x1i, y0i) * fx;
+    let bot = at(x0i, y1i) * (1.0 - fx) + at(x1i, y1i) * fx;
+    top * (1.0 - fy) + bot * fy
+}
+
+/// Chroma plane dimensions for a layout at a given luma size.
+fn chroma_dims(layout: PlaneLayout, w: usize, h: usize) -> (usize, usize) {
+    match layout {
+        // 4:2:0, rounded up: odd dimensions are legal and truncating loses the
+        // last row and column of chroma.
+        PlaneLayout::Nv12 | PlaneLayout::P010 | PlaneLayout::I420 | PlaneLayout::I420_10le => {
+            (w.div_ceil(2), h.div_ceil(2))
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ConvertError {
+    /// The frame is a DMA-BUF; this converter only handles CPU planes.
+    NotCpuPlanes,
+    /// 10-bit CPU planes are not handled yet, because nothing produces them on
+    /// the software-decode path we have. Refusing beats silently reading the
+    /// low byte of every sample and rendering a noise field.
+    UnsupportedDepth(PlaneLayout),
+    /// Plane count did not match the layout.
+    PlaneCount { want: usize, got: usize },
+}
+
+impl std::fmt::Display for ConvertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConvertError::NotCpuPlanes => write!(f, "frame is a DMA-BUF, not CPU planes"),
+            ConvertError::UnsupportedDepth(l) => write!(f, "layout {l:?} is not 8-bit"),
+            ConvertError::PlaneCount { want, got } => {
+                write!(f, "expected {want} planes, got {got}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConvertError {}
+
+/// Convert one frame to tightly packed RGBA8, row-major, top-left origin —
+/// the layout `egui::ColorImage` wants.
+pub fn frame_to_rgba8(frame: &Frame) -> Result<Vec<u8>, ConvertError> {
+    let planes = match &frame.data {
+        FrameData::Cpu(p) => p,
+        FrameData::DmaBuf(_) => return Err(ConvertError::NotCpuPlanes),
+    };
+    planes_to_rgba8(
+        planes,
+        frame.layout,
+        frame.color,
+        frame.width as usize,
+        frame.height as usize,
+    )
+}
+
+/// [`frame_to_rgba8`] into a caller-owned buffer.
+pub fn frame_to_rgba8_into(frame: &Frame, out: &mut Vec<u8>) -> Result<(), ConvertError> {
+    let planes = match &frame.data {
+        FrameData::Cpu(p) => p,
+        FrameData::DmaBuf(_) => return Err(ConvertError::NotCpuPlanes),
+    };
+    planes_to_rgba8_into(
+        planes,
+        frame.layout,
+        frame.color,
+        frame.width as usize,
+        frame.height as usize,
+        out,
+    )
+}
+
+/// The conversion proper, split out so tests can drive it without building a
+/// whole `Frame`.
+pub fn planes_to_rgba8(
+    planes: &CpuPlanes,
+    layout: PlaneLayout,
+    color: ColorInfo,
+    width: usize,
+    height: usize,
+) -> Result<Vec<u8>, ConvertError> {
+    let mut out = Vec::new();
+    planes_to_rgba8_into(planes, layout, color, width, height, &mut out)?;
+    Ok(out)
+}
+
+/// The same conversion, writing into a caller-owned buffer.
+///
+/// A player converts a frame every 16 ms forever. Returning a fresh `Vec` each
+/// time means allocating and freeing 8 MB per frame at 1080p — 500 MB/s of
+/// allocator traffic that does no work, and on a phone that is heat. The buffer
+/// is resized once and reused after that; `out.capacity()` stops growing after
+/// the first frame, which is what `the_scratch_buffer_is_reused` asserts.
+pub fn planes_to_rgba8_into(
+    planes: &CpuPlanes,
+    layout: PlaneLayout,
+    color: ColorInfo,
+    width: usize,
+    height: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), ConvertError> {
+    let want = layout.plane_count();
+    if planes.data.len() < want {
+        return Err(ConvertError::PlaneCount {
+            want,
+            got: planes.data.len(),
+        });
+    }
+
+    // The bit-depth gotcha, in one place: P010 puts its 10 bits in the HIGH
+    // bits of each 16-bit sample and I420_10LE in the LOW bits. Reading either
+    // with the other's scale is a picture that is uniformly too dark or
+    // blindingly clipped, and it looks like a decoder fault rather than a
+    // scaling one.
+    let fmt = match layout {
+        PlaneLayout::Nv12 | PlaneLayout::I420 => SampleFormat::U8,
+        PlaneLayout::P010 => SampleFormat::U16HighBits,
+        PlaneLayout::I420_10le => SampleFormat::U16LowBits10,
+    };
+
+    let (cw, ch) = chroma_dims(layout, width, height);
+    let coeffs = matrix_coeffs(color.matrix);
+    let interleaved_chroma = matches!(layout, PlaneLayout::Nv12 | PlaneLayout::P010);
+
+    // Strides are in BYTES, so the fallbacks scale with the sample size. A
+    // 10-bit plane whose stride is guessed as its pixel width is read at half
+    // scale and skews every row after the first.
+    let bps = fmt.bytes();
+    let y_stride = planes
+        .strides
+        .first()
+        .copied()
+        .unwrap_or((width * bps) as u32) as usize;
+    let c0_stride = planes.strides.get(1).copied().unwrap_or(if interleaved_chroma {
+        (cw * 2 * bps) as u32
+    } else {
+        (cw * bps) as u32
+    }) as usize;
+    let c1_stride = planes.strides.get(2).copied().unwrap_or((cw * bps) as u32) as usize;
+
+    out.clear();
+    out.resize(width * height * 4, 0);
+
+    for py in 0..height {
+        for px in 0..width {
+            // Same normalised sample point the shader computes, so the bilinear
+            // chroma upscale lands identically.
+            let u = (px as f32 + 0.5) / width as f32;
+            let v = (py as f32 + 0.5) / height as f32;
+
+            let y_raw = sample_bilinear(&planes.data[0], y_stride, width, height, 1, 0, fmt, u, v);
+            let (cb_raw, cr_raw) = if interleaved_chroma {
+                (
+                    sample_bilinear(&planes.data[1], c0_stride, cw, ch, 2, 0, fmt, u, v),
+                    sample_bilinear(&planes.data[1], c0_stride, cw, ch, 2, 1, fmt, u, v),
+                )
+            } else {
+                (
+                    sample_bilinear(&planes.data[1], c0_stride, cw, ch, 1, 0, fmt, u, v),
+                    sample_bilinear(&planes.data[2], c1_stride, cw, ch, 1, 0, fmt, u, v),
+                )
+            };
+
+            let (yv, cb, cr) = match color.range {
+                Range::Limited => (
+                    (y_raw - 16.0 / 255.0) * (255.0 / 219.0),
+                    (cb_raw - 128.0 / 255.0) * (255.0 / 224.0),
+                    (cr_raw - 128.0 / 255.0) * (255.0 / 224.0),
+                ),
+                Range::Full => (y_raw, cb_raw - 0.5, cr_raw - 0.5),
+            };
+
+            let mut rgb = [
+                coeffs[0][0] * yv + coeffs[0][1] * cb + coeffs[0][2] * cr,
+                coeffs[1][0] * yv + coeffs[1][1] * cb + coeffs[1][2] * cr,
+                coeffs[2][0] * yv + coeffs[2][1] * cb + coeffs[2][2] * cr,
+            ];
+
+            match color.transfer {
+                Transfer::Pq => {
+                    for c in rgb.iter_mut() {
+                        *c = tonemap(pq_eotf(*c) * 10000.0, REFERENCE_WHITE_NITS);
+                    }
+                }
+                Transfer::Hlg => {
+                    for c in rgb.iter_mut() {
+                        *c = hlg_eotf(*c);
+                    }
+                }
+                // SDR stays gamma-encoded, as in the shader: the swapchain is
+                // non-linear sRGB and converting to linear and back would only
+                // add rounding.
+                Transfer::Sdr => {}
+            }
+
+            let o = (py * width + px) * 4;
+            for c in 0..3 {
+                out[o + c] = (rgb[c].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
+            out[o + 3] = 255;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn planes_nv12(y: u8, cb: u8, cr: u8) -> CpuPlanes {
+        CpuPlanes {
+            data: vec![vec![y; 4], vec![cb, cr]],
+            strides: vec![2, 2],
+        }
+    }
+
+    fn convert(p: &CpuPlanes, layout: PlaneLayout, color: ColorInfo) -> Vec<u8> {
+        planes_to_rgba8(p, layout, color, 2, 2).unwrap()
+    }
+
+    fn sdr709(range: Range) -> ColorInfo {
+        ColorInfo {
+            matrix: Matrix::Bt709,
+            transfer: Transfer::Sdr,
+            range,
+        }
+    }
+
+    #[test]
+    fn limited_range_black_and_white() {
+        let c = sdr709(Range::Limited);
+        let black = convert(&planes_nv12(16, 128, 128), PlaneLayout::Nv12, c);
+        assert_eq!(&black[0..4], &[0, 0, 0, 255]);
+        let white = convert(&planes_nv12(235, 128, 128), PlaneLayout::Nv12, c);
+        assert_eq!(&white[0..4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn full_range_differs_from_limited() {
+        let lim = convert(&planes_nv12(16, 128, 128), PlaneLayout::Nv12, sdr709(Range::Limited));
+        let full = convert(&planes_nv12(16, 128, 128), PlaneLayout::Nv12, sdr709(Range::Full));
+        assert_eq!(lim[0], 0);
+        // A range, not a point: 16/255 scaled back by 255 lands on 16.5 in
+        // f32, so the rounding can go either way. Both directions are
+        // failures -- 0 would mean the range flag was ignored, and anything
+        // near 128 would mean the wrong expansion ran.
+        assert!(
+            (15..=18).contains(&full[0]),
+            "full-range 16 should stay dark grey, got {}",
+            full[0]
+        );
+    }
+
+    #[test]
+    fn bt709_red() {
+        let out = convert(&planes_nv12(63, 102, 240), PlaneLayout::Nv12, sdr709(Range::Limited));
+        assert!(out[0] > 250, "red channel {}", out[0]);
+        assert!(out[1] < 8 && out[2] < 8, "leak: {:?}", &out[0..3]);
+    }
+
+    #[test]
+    fn nv12_and_i420_agree() {
+        let c = sdr709(Range::Limited);
+        let a = convert(&planes_nv12(120, 90, 200), PlaneLayout::Nv12, c);
+        let i = CpuPlanes {
+            data: vec![vec![120u8; 4], vec![90], vec![200]],
+            strides: vec![2, 1, 1],
+        };
+        let b = convert(&i, PlaneLayout::I420, c);
+        assert_eq!(a, b);
+    }
+
+    /// Cb and Cr are not interchangeable; swapping them turns skin tones green.
+    #[test]
+    fn cb_cr_are_not_interchangeable() {
+        let c = sdr709(Range::Limited);
+        let a = convert(&planes_nv12(120, 90, 200), PlaneLayout::Nv12, c);
+        let b = convert(&planes_nv12(120, 200, 90), PlaneLayout::Nv12, c);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn every_matrix_keeps_neutral_chroma_grey() {
+        for matrix in [Matrix::Bt601, Matrix::Bt709, Matrix::Bt2020Ncl] {
+            let c = ColorInfo {
+                matrix,
+                transfer: Transfer::Sdr,
+                range: Range::Limited,
+            };
+            let out = convert(&planes_nv12(126, 128, 128), PlaneLayout::Nv12, c);
+            assert_eq!(out[0], out[1], "{matrix:?} tinted");
+            assert_eq!(out[1], out[2], "{matrix:?} tinted");
+        }
+    }
+
+    /// A player converts a frame every 16 ms forever, so the buffer must be
+    /// reused rather than reallocated. Capacity is the observable: it settles
+    /// after the first frame and never grows again.
+    #[test]
+    fn the_scratch_buffer_is_reused() {
+        let c = sdr709(Range::Limited);
+        let p = planes_nv12(126, 128, 128);
+        // Deliberately over-allocated. A 2x2 frame needs 16 bytes, and a
+        // reallocating implementation lands on capacity 16 too -- identical to
+        // a reusing one, so the check cannot bind. Starting large means reuse
+        // KEEPS the capacity and reallocation drops it.
+        let mut buf = Vec::with_capacity(4096);
+
+        planes_to_rgba8_into(&p, PlaneLayout::Nv12, c, 2, 2, &mut buf).unwrap();
+        let settled = buf.capacity();
+        assert!(
+            settled >= 4096,
+            "capacity fell to {settled}: the buffer was reallocated, not reused"
+        );
+
+        for _ in 0..50 {
+            planes_to_rgba8_into(&p, PlaneLayout::Nv12, c, 2, 2, &mut buf).unwrap();
+            assert_eq!(
+                buf.capacity(),
+                settled,
+                "the buffer reallocated: 50 frames means 50 allocations"
+            );
+        }
+        assert_eq!(buf.len(), 2 * 2 * 4, "output length is still correct");
+    }
+
+    /// The in-place form must produce exactly what the allocating one does,
+    /// or the fast path quietly renders something else.
+    #[test]
+    fn in_place_and_allocating_conversion_agree() {
+        let c = sdr709(Range::Limited);
+        let p = planes_nv12(120, 90, 200);
+        let owned = planes_to_rgba8(&p, PlaneLayout::Nv12, c, 2, 2).unwrap();
+        let mut buf = vec![0xAAu8; 999]; // deliberately dirty and wrong-sized
+        planes_to_rgba8_into(&p, PlaneLayout::Nv12, c, 2, 2, &mut buf).unwrap();
+        assert_eq!(owned, buf, "in-place output differs, or stale bytes survived");
+    }
+
+    #[test]
+    fn output_is_tightly_packed_rgba_with_opaque_alpha() {
+        let out = convert(&planes_nv12(126, 128, 128), PlaneLayout::Nv12, sdr709(Range::Limited));
+        assert_eq!(out.len(), 2 * 2 * 4);
+        for px in out.chunks(4) {
+            assert_eq!(px[3], 255);
+        }
+    }
+
+    /// A 10-bit sample written into a P010 plane: value in the HIGH bits.
+    fn p010_planes(y: u16, cb: u16, cr: u16) -> CpuPlanes {
+        let hi = |v: u16| -> [u8; 2] {
+            let shifted = v << 6; // 10 bits into the top of 16
+            [(shifted & 0xFF) as u8, (shifted >> 8) as u8]
+        };
+        let mut luma = Vec::new();
+        for _ in 0..4 {
+            luma.extend_from_slice(&hi(y));
+        }
+        let mut chroma = Vec::new();
+        chroma.extend_from_slice(&hi(cb));
+        chroma.extend_from_slice(&hi(cr));
+        CpuPlanes {
+            data: vec![luma, chroma],
+            strides: vec![4, 4],
+        }
+    }
+
+    /// The same values in I420_10LE: value in the LOW bits, three planes.
+    fn i420_10_planes(y: u16, cb: u16, cr: u16) -> CpuPlanes {
+        let lo = |v: u16| -> [u8; 2] { [(v & 0xFF) as u8, (v >> 8) as u8] };
+        let mut luma = Vec::new();
+        for _ in 0..4 {
+            luma.extend_from_slice(&lo(y));
+        }
+        CpuPlanes {
+            data: vec![luma, lo(cb).to_vec(), lo(cr).to_vec()],
+            strides: vec![4, 2, 2],
+        }
+    }
+
+    /// 10-bit limited range: black is 64, white is 940 (16 and 235 scaled by 4).
+    #[test]
+    fn p010_black_and_white_land_on_zero_and_one() {
+        let c = sdr709(Range::Limited);
+        let black = planes_to_rgba8(&p010_planes(64, 512, 512), PlaneLayout::P010, c, 2, 2).unwrap();
+        assert_eq!(&black[0..3], &[0, 0, 0], "10-bit black is not black");
+        let white =
+            planes_to_rgba8(&p010_planes(940, 512, 512), PlaneLayout::P010, c, 2, 2).unwrap();
+        assert!(
+            white[0] > 252 && white[1] > 252 && white[2] > 252,
+            "10-bit white came out {:?}",
+            &white[0..3]
+        );
+    }
+
+    /// The gotcha this whole SampleFormat split exists for: the same 10-bit
+    /// values stored in the two layouts must produce the SAME picture.
+    ///
+    /// Reading I420_10LE with P010's scale renders it at about a sixteenth
+    /// brightness -- a near-black frame that looks like a broken decoder rather
+    /// than a scaling bug.
+    #[test]
+    fn p010_and_i420_10le_agree_on_the_same_values() {
+        let c = sdr709(Range::Limited);
+        for (y, cb, cr) in [(64u16, 512u16, 512u16), (940, 512, 512), (500, 400, 700)] {
+            let a =
+                planes_to_rgba8(&p010_planes(y, cb, cr), PlaneLayout::P010, c, 2, 2).unwrap();
+            let b = planes_to_rgba8(
+                &i420_10_planes(y, cb, cr),
+                PlaneLayout::I420_10le,
+                c,
+                2,
+                2,
+            )
+            .unwrap();
+            for i in 0..3 {
+                assert!(
+                    (a[i] as i32 - b[i] as i32).abs() <= 1,
+                    "layouts disagree at ({y},{cb},{cr}) channel {i}: P010 {} vs I420_10LE {}",
+                    a[i],
+                    b[i]
+                );
+            }
+        }
+    }
+
+    /// 10-bit and 8-bit must agree on the same colour, or a stream that
+    /// switches representation shifts hue mid-playback.
+    #[test]
+    fn ten_bit_matches_eight_bit_for_the_same_colour() {
+        let c = sdr709(Range::Limited);
+        let eight = convert(&planes_nv12(126, 128, 128), PlaneLayout::Nv12, c);
+        let ten =
+            planes_to_rgba8(&p010_planes(126 * 4, 128 * 4, 128 * 4), PlaneLayout::P010, c, 2, 2)
+                .unwrap();
+        for i in 0..3 {
+            assert!(
+                (eight[i] as i32 - ten[i] as i32).abs() <= 2,
+                "8-bit {} vs 10-bit {} on channel {i}",
+                eight[i],
+                ten[i]
+            );
+        }
+    }
+
+    /// I420_10LE's top six bits are undefined padding. A decoder that leaves
+    /// them set must not blow the value past 1.0 and clip every highlight.
+    #[test]
+    fn undefined_high_bits_in_i420_10le_are_masked_off() {
+        let c = sdr709(Range::Limited);
+        let clean = planes_to_rgba8(&i420_10_planes(500, 512, 512), PlaneLayout::I420_10le, c, 2, 2)
+            .unwrap();
+        let dirty = planes_to_rgba8(
+            &i420_10_planes(500 | 0xFC00, 512 | 0xFC00, 512 | 0xFC00),
+            PlaneLayout::I420_10le,
+            c,
+            2,
+            2,
+        )
+        .unwrap();
+        assert_eq!(&clean[0..3], &dirty[0..3], "padding bits reached the picture");
+    }
+
+    #[test]
+    fn a_short_plane_list_is_an_error() {
+        let p = CpuPlanes {
+            data: vec![vec![126u8; 4]],
+            strides: vec![2],
+        };
+        assert!(matches!(
+            planes_to_rgba8(&p, PlaneLayout::I420, sdr709(Range::Limited), 2, 2),
+            Err(ConvertError::PlaneCount { .. })
+        ));
+    }
+
+    /// Strides are not widths. A padded plane read as if tightly packed skews
+    /// every row after the first.
+    #[test]
+    fn a_padded_luma_stride_is_honoured() {
+        let c = sdr709(Range::Limited);
+        // 2x2 luma in a plane with stride 4: row 0 is [235,235,pad,pad],
+        // row 1 is [16,16,pad,pad].
+        let padded = CpuPlanes {
+            data: vec![vec![235, 235, 7, 7, 16, 16, 7, 7], vec![128, 128]],
+            strides: vec![4, 2],
+        };
+        let out = planes_to_rgba8(&padded, PlaneLayout::Nv12, c, 2, 2).unwrap();
+        // Top row white, bottom row black. Bilinear sampling at texel centres
+        // of a 2x2 image hits the texels exactly.
+        assert!(out[0] > 250, "top-left should be white, got {}", out[0]);
+        let bottom_left = (1 * 2 + 0) * 4;
+        assert!(
+            out[bottom_left] < 5,
+            "bottom-left should be black, got {}",
+            out[bottom_left]
+        );
+    }
+}

@@ -1,0 +1,45 @@
+[package]
+name = "vidkit-egui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "egui front end for vidkit: a Presenter on an egui texture, and a letterboxed video surface with uikit-egui chrome."
+
+[dependencies]
+vidkit-core = { path = "../vidkit-core" }
+# For clipboard URL classification in the palette.
+vidkit-ytdlp = { path = "../vidkit-ytdlp" }
+# The voice grammar/matcher, rather than a second one here.
+voiced-core = { path = "../../../voiced-core" }
+egui = "0.34"
+
+# shared/uikit is a separate nested workspace; a path dependency across the two
+# is fine and is how the rest of this tree reaches its kits.
+uikit-egui = { path = "../../../uikit/crates/uikit-egui" }
+uikit-gesture = { path = "../../../uikit/crates/uikit-gesture" }
+snapclone-theme = { path = "../../../uikit/crates/snapclone-theme" }
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
+
+# Off by default so `cargo test` stays light and headless, matching uikit-egui.
+# Backend named explicitly: eframe 0.34's defaults select wgpu, whose default
+# device descriptor asks for max_color_attachments 8 and dies at startup on a
+# GPU that allows 5 -- logscope-egui records exactly that crash on Asahi, which
+# is one of this crate's target platforms. See
+# maintenance/tools/eframe_backend_check.py.
+
+[dev-dependencies]
+# The cross-crate pipeline test drives the real demuxer through the real
+# player; `fixtures` exposes the same MP4 writer the demuxer's own tests use.
+vidkit-mp4 = { path = "../vidkit-mp4", features = ["fixtures"] }
+vidkit-webm = { path = "../vidkit-webm", features = ["fixtures"] }
+
+[features]
+demo = ["dep:eframe"]
+# NV12 upload + shader conversion through an egui_glow paint callback. Needs
+# eframe for its glow/egui_glow re-exports, same as scene-kit's `glow` feature.
+glow-upload = ["dep:eframe"]
+
+[[example]]
+name = "video_demo"
+required-features = ["demo"]

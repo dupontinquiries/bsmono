@@ -1,0 +1,13 @@
+[package]
+name = "vidkit-ytdlp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vidkit-core = { path = "../vidkit-core" }
+# ByteRange, so the section planner and the fetcher agree on one type.
+vidkit-relevance = { path = "../vidkit-relevance" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

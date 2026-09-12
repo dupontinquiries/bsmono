@@ -1,0 +1,65 @@
+[workspace]
+members = ["."]
+
+[package]
+name = "vidkit-player"
+version = "0.1.0"
+edition = "2021"
+description = "Video player on shared/vidkit: yt-dlp or local file, gesture-driven, egui shell."
+
+[[bin]]
+name = "vidkit-player"
+path = "src/main.rs"
+required-features = ["app"]
+
+[dependencies]
+egui = "0.34"
+# Backend named explicitly: eframe 0.34's defaults select wgpu, whose default
+# device descriptor asks for max_color_attachments 8 and dies at startup on a
+# GPU that allows 5 -- logscope-egui records exactly that on Asahi, which is
+# one of this player's two target platforms. See
+# maintenance/tools/eframe_backend_check.py.
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
+
+vidkit-core = { path = "../../shared/vidkit/crates/vidkit-core" }
+# The runtime device probe, which replaces a target-triple guess.
+vidkit-v4l2 = { path = "../../shared/vidkit/crates/vidkit-v4l2" }
+# The IO wrappers in src/io.rs implement its CommandRunner and HttpTransport.
+vidkit-ytdlp = { path = "../../shared/vidkit/crates/vidkit-ytdlp" }
+vidkit-stream = { path = "../../shared/vidkit/crates/vidkit-stream" }
+# HTTPS. Same crate and major version voiceterm, snapclone and bo-suite already
+# use, so it is house-approved and already in the cargo cache; rustls rather
+# than native-tls keeps the build free of an OpenSSL system dependency, which
+# is the thing that has blocked other apps in this tree from building here.
+# `native-certs`, not the bundled webpki-roots.
+#
+# The bundled root set ignores the system trust store, so any TLS-intercepting
+# proxy -- corporate, school, or the one in this sandbox -- fails with
+# UnknownIssuer while curl on the same machine works. Found by pointing the
+# transport at a real HTTPS host: with default features it could not connect at
+# all. Reading /etc/ssl/certs is also what every other Linux client does.
+ureq = { version = "2", optional = true, features = ["native-certs"] }
+vidkit-egui = { path = "../../shared/vidkit/crates/vidkit-egui", features = ["glow-upload"] }
+vidkit-mp4 = { path = "../../shared/vidkit/crates/vidkit-mp4" }
+vidkit-webm = { path = "../../shared/vidkit/crates/vidkit-webm" }
+uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
+snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
+
+[features]
+# Default-on, matching the other -egui apps: `cargo build --release` in this
+# directory produces the deployable binary with no feature incantation. Off is
+# for a headless build that only wants the library half.
+default = ["app", "https"]
+app = ["dep:eframe"]
+# HTTPS range fetching. Separate from `app` so a headless build that only wants
+# the demuxers does not pull rustls.
+https = ["dep:ureq"]
+
+# Monorepo-wide dev policy: full DWARF is the biggest artifact and link cost,
+# and the sandbox boxes are disk-starved.
+[profile.dev]
+debug = "line-tables-only"
+
+[dev-dependencies]
+# The URL test serves a real MP4 from the demuxer's own fixture writer.
+vidkit-mp4 = { path = "../../shared/vidkit/crates/vidkit-mp4", features = ["fixtures"] }

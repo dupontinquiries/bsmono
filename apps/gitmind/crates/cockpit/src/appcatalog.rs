@@ -666,4 +666,162 @@ kind = "cargo"
         assert!(non.contains(&"aperture"), "a non-daemon project was marked as one");
     }
 
+
+    /// Does this directory, or any crate under it, build a binary?
+    ///
+    /// Shallow on purpose: cargo workspaces in this tree put members one or two
+    /// levels down (`crates/*`, `*/`), and walking deeper would start finding
+    /// vendored code and example crates that are not the project's output.
+    fn declares_a_binary(dir: &std::path::Path) -> bool {
+        fn here(d: &std::path::Path) -> bool {
+            let toml = std::fs::read_to_string(d.join("Cargo.toml")).unwrap_or_default();
+            toml.contains("[[bin]]") || d.join("src/main.rs").is_file()
+        }
+        if here(dir) {
+            return true;
+        }
+        for depth1 in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = depth1.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if here(&p) {
+                return true;
+            }
+            for depth2 in std::fs::read_dir(&p).into_iter().flatten().flatten() {
+                let q = depth2.path();
+                if q.is_dir() && here(&q) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Every entry the catalogue will OFFER must actually build something you
+    /// can start.
+    ///
+    /// This exists because the failure it catches is silent from both ends. An
+    /// entry registered `role = "app"` whose crate ships no binary gets a build
+    /// button that produces nothing runnable, and the user is left wondering
+    /// why -- the `settings-egui` case this module's `role` field was added
+    /// for. The mirror image is just as quiet: a project with a real GUI
+    /// registered as a library is never offered at all, and an app nobody can
+    /// start looks exactly like an app that does not work. vidkit was in that
+    /// second state until `apps/vidkit-player` was added.
+    ///
+    /// So: for each runnable entry, its path must exist and must declare a
+    /// binary -- a `[[bin]]` section or a `src/main.rs`.
+    #[test]
+    fn every_runnable_manifest_entry_has_a_binary() {
+        let root = crate::ops::repo_root();
+        let text = match std::fs::read_to_string(root.join("manifest/projects.toml")) {
+            Ok(t) => t,
+            // Running outside a checkout is not a failure of this claim.
+            Err(_) => return,
+        };
+        let entries = parse_manifest(&text);
+
+        let runnable: Vec<&ManifestEntry> = entries.iter().filter(|e| e.is_runnable()).collect();
+        // A scan that matched nothing passes every assertion below it.
+        assert!(
+            runnable.len() > 10,
+            "only {} runnable entries: the manifest or the parser changed shape",
+            runnable.len()
+        );
+
+        // Entries already in this state when the check was written, with the
+        // reason. Same convention as `font_install_check.py`'s KNOWN_MISSES:
+        // the point is to stop NEW ones appearing, not to block on a fix that
+        // is somebody else's project.
+        //
+        // `tadpole` is registered role=app but `apps/tadpole/egui-frontend` is
+        // a `[lib]` with no `[[bin]]`, no `src/main.rs` and no eframe
+        // dependency -- so gitmind offers a build button that produces nothing
+        // startable. It needs a shell binary, the way `apps/vidkit-player` was
+        // added for shared/vidkit.
+        const KNOWN_MISSES: &[&str] = &["tadpole"];
+
+        let mut missing = Vec::new();
+        for e in runnable {
+            if KNOWN_MISSES.contains(&e.app_id.as_str()) {
+                continue;
+            }
+            let dir = root.join(&e.path);
+            if !dir.is_dir() {
+                missing.push(format!("{}: path {} does not exist", e.app_id, e.path));
+                continue;
+            }
+            let manifest = dir.join("Cargo.toml");
+            // Only cargo projects can be checked this way; cmake and hybrid
+            // projects declare their outputs elsewhere.
+            if !manifest.is_file() {
+                continue;
+            }
+            // Nested workspaces are the house pattern here, so a root that
+            // declares no binary itself is normal -- but exempting every
+            // workspace makes the check vacuous, which a break test showed:
+            // pointing an app entry at `shared/vidkit` (a workspace whose
+            // members ship no binary at all) sailed through. So look INSIDE.
+            if !declares_a_binary(&dir) {
+                missing.push(format!(
+                    "{} is role={} but {} declares no [[bin]] and has no src/main.rs",
+                    e.app_id, e.role, e.path
+                ));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "runnable entries that build nothing startable:\n  {}",
+            missing.join("\n  ")
+        );
+
+        // A known miss that has been fixed should leave the list, or it goes on
+        // silently excusing something that is now fine -- and the next real
+        // instance hides behind it.
+        for id in KNOWN_MISSES {
+            let e = entries.iter().find(|e| e.app_id == *id);
+            if let Some(e) = e {
+                let dir = root.join(&e.path);
+                let still_missing = !declares_a_binary(&dir);
+                assert!(
+                    still_missing,
+                    "{id} now builds a binary: remove it from KNOWN_MISSES"
+                );
+            }
+        }
+    }
+
+    /// The specific claim: vidkit's player is registered and offerable, and the
+    /// kit behind it is not.
+    ///
+    /// Both halves matter. `shared/vidkit` ships no binary, so offering it
+    /// would be the `settings-egui` mistake; `apps/vidkit-player` is the
+    /// surface, and before it existed the whole kit was unreachable from here.
+    #[test]
+    fn the_vidkit_player_is_offerable_and_its_kit_is_not() {
+        let root = crate::ops::repo_root();
+        let text = match std::fs::read_to_string(root.join("manifest/projects.toml")) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let entries = parse_manifest(&text);
+
+        let player = entries
+            .iter()
+            .find(|e| e.app_id == "vidkit-player")
+            .expect("vidkit-player is not in the catalogue");
+        assert_eq!(player.role, "app");
+        assert!(player.is_runnable(), "the player would not be offered");
+        assert_eq!(player.path, "apps/vidkit-player");
+
+        let kit = entries
+            .iter()
+            .find(|e| e.app_id == "vidkit")
+            .expect("shared/vidkit is not in the catalogue");
+        assert!(
+            !kit.is_runnable(),
+            "the kit ships no binary; offering it produces nothing startable"
+        );
+    }
 }

@@ -1,0 +1,14 @@
+[package]
+name = "vidkit-mp4"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vidkit-core = { path = "../vidkit-core" }
+
+[features]
+# Expose the MP4 fixture writer (src/lib.rs `build`) to other crates' tests.
+# Off by default: no ordinary build carries a file writer it does not use.
+fixtures = []
