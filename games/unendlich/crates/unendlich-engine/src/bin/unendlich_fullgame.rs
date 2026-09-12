@@ -400,6 +400,30 @@ fn equipped_weapon(
     Some(unendlich_engine::sim::legendary_weapon::forge(DEFAULT_INSTANCE_SEED, class, 0, 0))
 }
 
+/// r-item-models: the boxes the hero holds (`item_model`), from the same
+/// sources `equipped_weapon` reads so the hand shows the item combat swings:
+/// creative = the picked catalog item; survival = the selected slot's forged
+/// instance, else the survival id (meat, ingot, block) through
+/// `item_model_for_id`. `None` = empty hand (the legacy `held_color` path
+/// still runs when this is `None`, so nothing that drew before goes missing).
+fn held_item_model(
+    survival_mode: bool,
+    creative_place_item: Option<unendlich_engine::item::ItemKind>,
+    hand_item: Option<unendlich_engine::items::ItemId>,
+    app: &unendlich_engine::app::App,
+    selected_palette_idx: usize,
+) -> Option<unendlich_engine::item_model::ItemModel> {
+    if !survival_mode {
+        return creative_place_item.map(|k| k.model());
+    }
+    if let Some(stack) = app.inventory().slot(selected_palette_idx) {
+        if let Some(spec) = stack.weapon_instance {
+            return Some(unendlich_engine::item::ItemKind::Legendary(spec).model());
+        }
+    }
+    hand_item.map(|h| unendlich_engine::item::item_model_for_id(h.0))
+}
+
 /// r-swing: f32 (0..1) counterpart to `LegendarySpec::display_color`'s u8
 /// palette, for render call sites (hero_forge's held-item box) that work in
 /// float color space rather than u8. Same element table, same tier brighten
@@ -13078,6 +13102,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     color: d.color,
                                     name: d.name,
                                     count: st.count as u32,
+                                    icon: unendlich_engine::render::world_renderer::item_icon(
+                                        &unendlich_engine::item::item_model_for_id(st.item.0),
+                                    ),
                                 },
                             );
                         }
@@ -13096,6 +13123,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 color: d.color,
                                 name: d.name,
                                 count: st.count as u32,
+                                icon: unendlich_engine::render::world_renderer::item_icon(
+                                    &unendlich_engine::item::item_model_for_id(st.item.0),
+                                ),
                             }
                         }));
                     }
@@ -13106,6 +13136,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         color: d.color,
                         name: d.name,
                         count: st.count as u32,
+                        icon: unendlich_engine::render::world_renderer::item_icon(
+                            &unendlich_engine::item::item_model_for_id(st.item.0),
+                        ),
                     }
                 });
                 let game_secs = (8 * 3600 + (world_clock_elapsed as u64) * 60) % 86_400;
@@ -13471,6 +13504,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             walk_amp: hero_gait_amp,
                             anim_t: start.elapsed().as_secs_f32(),
                             held_color,
+                            held: held_item_model(
+                                survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
+                            ),
                             airborne: hero_airborne01,
                             vertical_vel: vvel,
                             land_crouch: hero_land_crouch,

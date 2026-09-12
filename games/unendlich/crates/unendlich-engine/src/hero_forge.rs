@@ -519,7 +519,9 @@ fn dress(kind: HeroKind, b: &mut Body, w: &[Xf; NPIV], dim: &HeroDims, col: &Her
 }
 
 /// r549/r550: per-frame hero pose/anim inputs. Copy so `build` can read it freely.
-#[derive(Clone, Copy, Debug)]
+// r-item-models: no longer `Copy` — `held` carries the item's box list. Every
+// caller already passes `&HeroPose`.
+#[derive(Clone, Debug)]
 pub struct HeroPose {
     pub yaw: f32,
     pub gaze_pitch: f32,
@@ -531,6 +533,12 @@ pub struct HeroPose {
     pub anim_t: f32,
     /// equipped item colour to show in the hand; `None` = empty-handed.
     pub held_color: Option<[f32; 3]>,
+    /// r-item-models: the boxes of the held item (`item_model`), drawn at the
+    /// right hand in place of the single `held_color` box. When `Some`, the
+    /// model's own colours are used and `held_color` is ignored; when `None`
+    /// the legacy one-box path runs, so callers that only know a colour still
+    /// draw exactly what they drew before.
+    pub held: Option<crate::item_model::ItemModel>,
     /// r570: 0 = grounded … 1 = fully airborne (drives a fall tuck — knees up,
     /// arms out for balance).
     pub airborne: f32,
@@ -556,7 +564,7 @@ pub struct HeroPose {
 
 impl Default for HeroPose {
     fn default() -> Self {
-        HeroPose { yaw: 0.0, gaze_pitch: 0.0, walk_phase: 0.0, walk_amp: 0.0, anim_t: 0.0, held_color: None,
+        HeroPose { yaw: 0.0, gaze_pitch: 0.0, walk_phase: 0.0, walk_amp: 0.0, anim_t: 0.0, held_color: None, held: None,
             airborne: 0.0, vertical_vel: 0.0, land_crouch: 0.0, flight01: 0.0, bank: 0.0, swing01: 0.0 }
     }
 }
@@ -758,7 +766,22 @@ pub fn build(
     dress(kind, &mut body, &world, &dim, &col, pose);
 
     // held item in the right hand (engine forward +X of the hand), tracks the arm.
-    if let Some(hc) = pose.held_color {
+    // r-item-models: a full item model when the caller has one (blade, guard,
+    // grip; pick head on a haft; an egg), else the legacy single box.
+    if let Some(model) = pose.held.as_ref() {
+        // The model's grip origin sits where the legacy box's centre did; its
+        // frame is already three-space hand-local (+Y along the item, +Z
+        // forward), so a box centre only needs the voxel→world unit.
+        let grip = [0.0, -0.10, ff_depth(&dim)];
+        for b in &model.boxes {
+            body.part(
+                &world[HAR],
+                b.size,
+                b.color,
+                [grip[0] + b.center[0] * U, grip[1] + b.center[1] * U, grip[2] + b.center[2] * U],
+            );
+        }
+    } else if let Some(hc) = pose.held_color {
         body.part(&world[HAR], [1.7, 5.2, 1.7], hc, [0.0, -0.10, ff_depth(&dim)]);
     }
 

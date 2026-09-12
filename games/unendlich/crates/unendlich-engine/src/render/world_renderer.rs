@@ -411,6 +411,19 @@ pub struct InvSlotView {
     pub color: [u8; 3],
     pub name: String,
     pub count: u32,
+    /// r-item-models: the slot's icon quads (`item_icon`); empty = draw the
+    /// flat `color` swatch as before.
+    pub icon: Vec<unendlich_ui::IconQuad>,
+}
+
+/// r-item-models: an item's icon as the UI crate's quads — the seam between
+/// `item_model::icon_quads` (engine, pure) and `unendlich_ui::paint_item_icon`
+/// (egui). Tilted by the class's conventional icon angle.
+pub fn item_icon(model: &crate::item_model::ItemModel) -> Vec<unendlich_ui::IconQuad> {
+    crate::item_model::icon_quads(model, crate::item_model::icon_tilt(model.class), 0.08)
+        .into_iter()
+        .map(|q| unendlich_ui::IconQuad { pts: q.pts, color: q.color })
+        .collect()
 }
 
 pub struct WorldRenderer {
@@ -5100,8 +5113,12 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                     let draw_slot = |ui: &mut egui::Ui, rect: egui::Rect, view: Option<&InvSlotView>| {
                                         let p = ui.painter();
                                         if let Some(s) = view {
-                                            let [r, g, b] = s.color;
-                                            p.rect_filled(rect.shrink(8.0), egui::CornerRadius::same(2), egui::Color32::from_rgb(r, g, b));
+                                            if s.icon.is_empty() {
+                                                let [r, g, b] = s.color;
+                                                p.rect_filled(rect.shrink(8.0), egui::CornerRadius::same(2), egui::Color32::from_rgb(r, g, b));
+                                            } else {
+                                                unendlich_ui::paint_item_icon(p, rect.shrink(5.0), &s.icon, 1.0);
+                                            }
                                             if s.count > 1 {
                                                 p.text(
                                                     rect.right_top() + egui::vec2(-4.0, 2.0),
@@ -5157,8 +5174,12 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                                 pp + egui::vec2(16.0, 16.0),
                                                 egui::vec2(26.0, 26.0),
                                             );
-                                            let [rr, gg, bb] = cur.color;
-                                            p.rect_filled(r, egui::CornerRadius::same(3), egui::Color32::from_rgb(rr, gg, bb));
+                                            if cur.icon.is_empty() {
+                                                let [rr, gg, bb] = cur.color;
+                                                p.rect_filled(r, egui::CornerRadius::same(3), egui::Color32::from_rgb(rr, gg, bb));
+                                            } else {
+                                                unendlich_ui::paint_item_icon(p, r, &cur.icon, 1.0);
+                                            }
                                             if cur.count > 1 {
                                                 p.text(
                                                     r.right_bottom(),
@@ -5181,9 +5202,8 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                         ui, "creative_backpack", 27, 56.0, 6.0, accent,
                                         |ui, i, rect| {
                                             if let Some(Some(it)) = inv_snapshot.get(i) {
-                                                let [r, g, b] = it.display_color();
                                                 let p = ui.painter();
-                                                p.rect_filled(rect.shrink(8.0), egui::CornerRadius::same(2), egui::Color32::from_rgb(r, g, b));
+                                                unendlich_ui::paint_item_icon(p, rect.shrink(5.0), &item_icon(&it.model()), 1.0);
                                                 let short: String = it.display_name().chars().take(6).collect();
                                                 p.text(
                                                     rect.center_bottom() - egui::vec2(0.0, 3.0),
@@ -5207,16 +5227,13 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                     |ui, i, rect| {
                                         let name = items[i].display_name();
                                         let short: String = name.chars().take(6).collect();
-                                        let [r, g, b] = items[i].display_color();
-                                        // colour swatch (a small filled inset),
-                                        // brighter when this is the selected slot
-                                        let sw = egui::Color32::from_rgb(r, g, b);
-                                        let inset = rect.shrink(8.0);
+                                        // r-item-models: the item's box model as an icon
+                                        // (was a flat colour swatch), dimmed unless selected
+                                        let inset = rect.shrink(5.0);
                                         let p = ui.painter();
-                                        p.rect_filled(
-                                            inset,
-                                            egui::CornerRadius::same(2),
-                                            if i == selected { sw } else { sw.gamma_multiply(0.7) },
+                                        unendlich_ui::paint_item_icon(
+                                            p, inset, &item_icon(&items[i].model()),
+                                            if i == selected { 1.0 } else { 0.7 },
                                         );
                                         if i == selected {
                                             p.rect_stroke(
@@ -5287,12 +5304,9 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                             egui::Color32::from_rgba_unmultiplied(20, 24, 30, 200),
                                         );
                                         if let Some(it) = assigned {
-                                            let [r, g, b] = it.display_color();
-                                            let sw = egui::Color32::from_rgb(r, g, b);
-                                            p.rect_filled(
-                                                rect.shrink(5.0),
-                                                egui::CornerRadius::same(2),
-                                                if i == creative_hotbar_sel { sw } else { sw.gamma_multiply(0.65) },
+                                            unendlich_ui::paint_item_icon(
+                                                p, rect.shrink(4.0), &item_icon(&it.model()),
+                                                if i == creative_hotbar_sel { 1.0 } else { 0.65 },
                                             );
                                         }
                                         if i == creative_hotbar_sel {
@@ -5428,9 +5442,12 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                 let [r, g, b] = it.display_color();
                                 egui::Color32::from_rgb(r, g, b)
                             });
+                            // r-item-models: the slot draws the item's box model; the
+                            // flat swatch remains the fallback inside slot_icon.
+                            let icon = shown.map(|it| item_icon(&it.model())).unwrap_or_default();
                             // Dvorak home-row key that fast-selects this slot.
                             let key = crate::hotbar::slot_homerow_key(i).map(|c| c.to_string());
-                            let resp = unendlich_ui::slot_swatch(ui, 44.0, i == creative_hotbar_sel, sw, key.as_deref());
+                            let resp = unendlich_ui::slot_icon(ui, 44.0, i == creative_hotbar_sel, &icon, sw, key.as_deref());
                             // r657: click a hotbar slot to make it active; if it
                             // holds an item, that becomes the item to place.
                             if resp.clicked() {
