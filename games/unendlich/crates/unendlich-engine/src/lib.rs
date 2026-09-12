@@ -137,6 +137,9 @@ pub mod inventory_screen;
 pub mod ui_feel;
 pub mod emblem;
 pub mod item;
+/// Procedural voxel-box models per item class (the hand and the slot draw
+/// the same boxes). Pure; the `ItemKind`/`ItemId` adapters live in `item.rs`.
+pub mod item_model;
 pub mod spawn;
 pub mod mob;
 pub mod loot;
