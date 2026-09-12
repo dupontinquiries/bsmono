@@ -159,6 +159,18 @@ for you. Sizes are fine; positions are not.
 SHAPES: sphere, box, cylinder, torus (a ring), cone, helix (a spiral), slab, link (a beam
 between two parts), capsule (a limb), profile
 
+SWEEP IS THE MOST GENERAL ONE. A cross-section carried along a path, its radius
+changing as it goes. Give the path as points and the radii as numbers along it.
+
+  part horn sweep path=0,0,0;2,7,1;7,12,4;14,13,9 r=3,2,1,0.5     a horn that curves
+  part pipe sweep path=0,0,0;20,0,0;20,0,18 r=3 section=square    a corridor turning a corner
+  part hook sweep path=0,0,0;0,12,0;3,16,0;6,13,0 r=1.5           a hook
+  part tube sweep path=0,0,0;0,14,0 r=4 section=hollow            a pipe
+
+Sections: circle, square, diamond, cross, hollow. Reach for a sweep whenever the thing
+BENDS, or runs along something: a branch, a horn, a claw, a river, a tunnel, a rib, a
+tail, a road, a vine, a tentacle, a banister. Anything a straight shape cannot follow.
+
 PROFILE IS THE MOST USEFUL ONE. It is a silhouette spun around an upright axis: give the
 radius at each height from the base up, and the shape is filled in between.
 

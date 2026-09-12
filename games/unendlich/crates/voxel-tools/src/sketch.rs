@@ -51,6 +51,37 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// A primitive shape. Deliberately few: these compose, and a longer
 /// list is a menu again.
+/// The cross-section a sweep carries. Few on purpose: the SHAPE of a
+/// section matters far less than the path and the radii, and a long
+/// list of sections is a menu inside a generalisation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section { Circle, Square, Diamond, Cross, Hollow }
+
+impl Section {
+    pub fn parse(s: &str) -> Option<Section> {
+        Some(match s.to_lowercase().as_str() {
+            "circle" | "round" | "circular" => Section::Circle,
+            "square" | "box" | "rect" => Section::Square,
+            "diamond" | "rhombus" => Section::Diamond,
+            "cross" | "plus" | "x" => Section::Cross,
+            "hollow" | "tube" | "pipe" | "ring" => Section::Hollow,
+            _ => return None,
+        })
+    }
+    /// Is this offset inside the section at radius `r`?
+    fn holds(self, dx: f32, dy: f32, r: f32) -> bool {
+        let d = (dx * dx + dy * dy).sqrt();
+        match self {
+            Section::Circle => d <= r,
+            Section::Square => dx.abs() <= r && dy.abs() <= r,
+            Section::Diamond => dx.abs() + dy.abs() <= r,
+            Section::Cross => (dx.abs() <= r * 0.4 && dy.abs() <= r)
+                           || (dy.abs() <= r * 0.4 && dx.abs() <= r),
+            Section::Hollow => d <= r && d >= (r - 1.5).max(0.0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Shape {
     Sphere { r: f32 },
@@ -72,6 +103,30 @@ pub enum Shape {
     /// Tapers from `r` at the base to `r2` at the tip -- a limb of
     /// uniform thickness reads as plumbing.
     Capsule { r: f32, r2: f32, len: f32, dir: f32, pitch: f32 },
+    /// A SECTION SWEPT ALONG A PATH: the most general shape here, and
+    /// the one the others are special cases of.
+    ///
+    /// `profile` revolves a silhouette around a FIXED VERTICAL AXIS, so
+    /// it makes a vase, a chess piece, a tower -- and nothing that
+    /// bends. A sweep takes a path through space and carries a
+    /// cross-section along it, its radius varying as it goes.
+    ///
+    ///   profile  = a sweep along a straight vertical path
+    ///   spine    = a sweep with two radii and a circular section
+    ///   capsule  = a sweep along one segment
+    ///   torus    = a sweep along a circle
+    ///   helix    = a sweep along a helix
+    ///
+    /// And it adds what none of them can do: a horn that curves, a
+    /// river that meanders, a branch, a claw, a hook, a corridor that
+    /// turns a corner, a boat hull.
+    ///
+    /// WHY THIS IS THE ANSWER TO "how do you represent any object".
+    /// Not because it can express everything -- it cannot -- but
+    /// because it is the most general thing a MODEL CAN WRITE. A model
+    /// cannot write `f(x,y,z) < 0`; it writes a list of numbers, and a
+    /// path with radii along it is a list of numbers.
+    Sweep { path: Vec<(f32, f32, f32)>, radii: Vec<f32>, section: Section },
     /// A SILHOUETTE SPUN AROUND A VERTICAL AXIS: radius at each height,
     /// from the base up. The single most general shape there is, and
     /// the one that was missing.
@@ -117,6 +172,15 @@ impl Shape {
                  (len * p.sin()).abs() / 2.0 + rr,
                  (len * a.sin() * p.cos()).abs() / 2.0 + rr]
             }
+            Shape::Sweep { path, radii, .. } => {
+                let m = radii.iter().cloned().fold(1.0f32, f32::max);
+                let f = |g: fn(&(f32, f32, f32)) -> f32| {
+                    let lo = path.iter().map(g).fold(f32::MAX, f32::min);
+                    let hi = path.iter().map(g).fold(f32::MIN, f32::max);
+                    (hi - lo) / 2.0 + m
+                };
+                [f(|p| p.0), f(|p| p.1), f(|p| p.2)]
+            }
             Shape::Profile { radii, h, .. } => {
                 let m = radii.iter().cloned().fold(1.0f32, f32::max);
                 [m, h / 2.0, m]
@@ -137,7 +201,7 @@ impl Shape {
             Shape::Cone { .. } => "cone", Shape::Helix { .. } => "helix",
             Shape::Slab { .. } => "slab", Shape::Link { .. } => "link",
             Shape::Capsule { .. } => "capsule", Shape::Spine { .. } => "spine",
-            Shape::Profile { .. } => "profile",
+            Shape::Profile { .. } => "profile", Shape::Sweep { .. } => "sweep",
         }
     }
 }
@@ -308,6 +372,34 @@ pub fn parse(src: &str) -> (Sketch, Vec<String>) {
                         let w = kv(&t, "w").or(kv(&t, "size")).unwrap_or(10.0);
                         Shape::Slab { w, d: kv(&t, "d").unwrap_or(w),
                                       thickness: kv(&t, "thickness").or(kv(&t, "t")).unwrap_or(1.0) }
+                    }
+                    "sweep" | "swept" | "along" | "extrude" => {
+                        let nums = |v: &str| -> Vec<f32> {
+                            v.split(',').filter_map(|n| n.trim().parse().ok()).collect()
+                        };
+                        let path: Vec<(f32, f32, f32)> = t.iter()
+                            .find_map(|x| x.strip_prefix("path="))
+                            .map(|v| v.split(';').filter_map(|p| {
+                                let c = nums(p);
+                                match c.len() { 3 => Some((c[0], c[1], c[2])),
+                                                2 => Some((c[0], c[1], 0.0)), _ => None }
+                            }).collect())
+                            .unwrap_or_default();
+                        if path.len() < 2 {
+                            errs.push(format!("sweep needs a path of at least two points, as \
+                                               path=0,0,0;4,8,0: {line:?}"));
+                            continue;
+                        }
+                        let radii: Vec<f32> = t.iter().find_map(|x| x.strip_prefix("r="))
+                            .map(|v| nums(v).into_iter().filter(|r| *r >= 0.0 && *r < 400.0).collect())
+                            .unwrap_or_else(|| vec![2.0]);
+                        if radii.is_empty() { errs.push(format!("sweep needs r=: {line:?}")); continue; }
+                        Shape::Sweep {
+                            path,
+                            radii,
+                            section: t.iter().find_map(|x| x.strip_prefix("section="))
+                                .and_then(Section::parse).unwrap_or(Section::Circle),
+                        }
                     }
                     "profile" | "revolve" | "lathe" | "silhouette" => {
                         let radii: Vec<f32> = t.iter()
@@ -716,6 +808,9 @@ fn scale(s: &Shape, f: f32) -> Shape {
             Shape::Helix { r: r * f, h: h * f, turns: *turns, thickness: thickness.max(1.0) },
         Shape::Slab { w, d, thickness } => Shape::Slab { w: w * f, d: d * f, thickness: thickness.max(1.0) },
         Shape::Link { thickness } => Shape::Link { thickness: *thickness },
+        Shape::Sweep { path, radii, section } => Shape::Sweep {
+            path: path.iter().map(|p| (p.0 * f, p.1 * f, p.2 * f)).collect(),
+            radii: radii.iter().map(|r| r * f).collect(), section: *section },
         Shape::Profile { radii, h, square } =>
             Shape::Profile { radii: radii.iter().map(|r| r * f).collect(), h: h * f, square: *square },
         Shape::Capsule { r, r2, len, dir, pitch } =>
@@ -833,6 +928,54 @@ fn cells_at(p: &Placed, at_i: (i32, i32, i32), block: u16) -> Vec<(i32, i32, i32
                         push(cx + dx as f32, cy + dy as f32, cz + dz as f32);
                     }
                 }}}
+            }
+        }
+        Shape::Sweep { path, radii, section } => {
+            // Walk the path, carrying the section. Radii are keyed to
+            // the whole run and interpolated between, so three numbers
+            // describe a smooth taper over a twelve-point path.
+            let n = path.len();
+            let total: f32 = path.windows(2)
+                .map(|w| ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)
+                          + (w[1].2 - w[0].2).powi(2)).sqrt()).sum::<f32>().max(1.0);
+            let steps = (total * 2.0).ceil() as i32;
+            let radius_at = |t: f32| -> f32 {
+                if radii.len() == 1 { return radii[0]; }
+                let pos = t * (radii.len() - 1) as f32;
+                let i = (pos.floor() as usize).min(radii.len() - 2);
+                radii[i] + (radii[i + 1] - radii[i]) * (pos - i as f32)
+            };
+            for k in 0..=steps {
+                let t = k as f32 / steps as f32;
+                // where on the path
+                let seg = t * (n - 1) as f32;
+                let i = (seg.floor() as usize).min(n - 2);
+                let f = seg - i as f32;
+                let (a, b) = (path[i], path[i + 1]);
+                let p = (at.0 + a.0 + (b.0 - a.0) * f,
+                         at.1 + a.1 + (b.1 - a.1) * f,
+                         at.2 + a.2 + (b.2 - a.2) * f);
+                // the section lies ACROSS the path: a sweep whose
+                // section stayed axis-aligned would flatten wherever
+                // the path turned
+                let (dx, dy, dz) = (b.0 - a.0, b.1 - a.1, b.2 - a.2);
+                let len = (dx * dx + dy * dy + dz * dz).sqrt().max(0.001);
+                let (ux, uy, uz) = (dx / len, dy / len, dz / len);
+                // two vectors perpendicular to the heading
+                let (rx, ry, rz) = if uy.abs() < 0.9 { (0.0, 1.0, 0.0) } else { (1.0, 0.0, 0.0) };
+                let (e1x, e1y, e1z) = (uy * rz - uz * ry, uz * rx - ux * rz, ux * ry - uy * rx);
+                let m1 = (e1x * e1x + e1y * e1y + e1z * e1z).sqrt().max(0.001);
+                let (e1x, e1y, e1z) = (e1x / m1, e1y / m1, e1z / m1);
+                let (e2x, e2y, e2z) = (uy * e1z - uz * e1y, uz * e1x - ux * e1z, ux * e1y - uy * e1x);
+                let r = radius_at(t);
+                if r < 0.4 { continue; }
+                let ri = r.ceil() as i32;
+                for a1 in -ri..=ri { for a2 in -ri..=ri {
+                    if !section.holds(a1 as f32, a2 as f32, r) { continue; }
+                    push(p.0 + e1x * a1 as f32 + e2x * a2 as f32,
+                         p.1 + e1y * a1 as f32 + e2y * a2 as f32,
+                         p.2 + e1z * a1 as f32 + e2z * a2 as f32);
+                }}
             }
         }
         Shape::Profile { radii, h, square } => {
@@ -985,7 +1128,8 @@ pub fn fillet(a: &[(i32, i32, i32)], b: &[(i32, i32, i32)], k: i32) -> Vec<(i32,
 pub fn needs_cells(placed: &[Placed]) -> Vec<&Placed> {
     placed.iter().filter(|p| matches!(p.shape,
         Shape::Torus { .. } | Shape::Cone { .. } | Shape::Helix { .. } | Shape::Link { .. }
-        | Shape::Capsule { .. } | Shape::Spine { .. } | Shape::Profile { .. })).collect()
+        | Shape::Capsule { .. } | Shape::Spine { .. } | Shape::Profile { .. }
+        | Shape::Sweep { .. })).collect()
 }
 
 #[cfg(test)]
@@ -1348,5 +1492,101 @@ mod tests {
         };
         assert_eq!(of(base), of(&format!("{base} contra=0")));
         assert_ne!(of(base), of(&format!("{base} contra=0.5")));
+    }
+
+    #[test]
+    fn a_sweep_is_the_shape_the_others_are_special_cases_of() {
+        // `profile` revolves around a FIXED VERTICAL AXIS, so it makes
+        // a vase, a tower, and nothing that bends
+        let cases = [
+            ("a bending horn", "part h sweep path=0,0,0;2,7,1;7,12,4;14,13,9 r=3,2,1,0.5"),
+            ("a corridor turning a corner", "part c sweep path=0,0,0;20,0,0;20,0,18 r=3 section=square"),
+            ("a hook", "part k sweep path=0,0,0;0,12,0;3,16,0;6,13,0 r=1.5"),
+            ("a pipe", "part p sweep path=0,0,0;0,14,0 r=4 section=hollow"),
+            ("a straight taper, which is what profile does",
+             "part t sweep path=0,0,0;0,20,0 r=6,4,2"),
+        ];
+        for (what, line) in cases {
+            let (sk, errs) = parse(&format!("{line}\n"));
+            assert!(errs.is_empty(), "{what}: {errs:?}");
+            let (placed, _) = resolve(&sk, (0, 64, 0));
+            let c = cells(&placed[0], 1);
+            assert!(!c.is_empty(), "{what} built nothing");
+            assert!(c.len() > 40, "{what}: only {} cells", c.len());
+        }
+        // A BENT PATH REALLY BENDS: the far end is nowhere near the
+        // near end in more than one axis, which no profile can do
+        let (sk, _) = parse("part h sweep path=0,0,0;2,7,1;7,12,4;14,13,9 r=3,2,1,0.5\n");
+        let (placed, _) = resolve(&sk, (0, 64, 0));
+        let c = cells(&placed[0], 1);
+        let spread = |g: fn(&(i32, i32, i32, u16)) -> i32| {
+            c.iter().map(g).max().unwrap() - c.iter().map(g).min().unwrap() };
+        assert!(spread(|p| p.0) > 8 && spread(|p| p.1) > 8 && spread(|p| p.2) > 6,
+                "it runs in all three axes: {} {} {}",
+                spread(|p| p.0), spread(|p| p.1), spread(|p| p.2));
+        // and it TAPERS: the far end is thinner than the near end
+        // measured against the shape's OWN extent: a shape is centred
+        // on its position, so absolute y values are not where a guess
+        // puts them
+        let (ylo, yhi) = (c.iter().map(|p| p.1).min().unwrap(), c.iter().map(|p| p.1).max().unwrap());
+        let (q1, q3) = (ylo + (yhi - ylo) / 4, yhi - (yhi - ylo) / 4);
+        let near: Vec<&(i32, i32, i32, u16)> = c.iter().filter(|p| p.1 < q1).collect();
+        let far: Vec<&(i32, i32, i32, u16)> = c.iter().filter(|p| p.1 > q3).collect();
+        assert!(!near.is_empty() && !far.is_empty(), "{ylo}..{yhi}");
+        // COUNT, not extent. The path itself moves in z as it rises,
+        // so a z-extent measures where the path went and not how thick
+        // the section is. Cells per band is proportional to section
+        // area, which is what tapering means.
+        assert!(near.len() > far.len() * 2,
+                "thick to thin: {} cells near, {} far", near.len(), far.len());
+    }
+
+    #[test]
+    fn the_section_lies_across_the_path_and_not_along_an_axis() {
+        // a sweep whose section stayed axis-aligned would FLATTEN
+        // wherever the path turned, which is the whole difficulty
+        let (sk, _) = parse("part d sweep path=0,0,0;14,14,0 r=4 section=circle\n");
+        let (placed, _) = resolve(&sk, (0, 64, 0));
+        let c = cells(&placed[0], 1);
+        // measure the run's thickness ACROSS its diagonal heading: it
+        // should be about 2r everywhere, not collapsed
+        let mid: Vec<&(i32, i32, i32, u16)> = c.iter().filter(|p| (p.0 - 7).abs() < 2).collect();
+        assert!(!mid.is_empty());
+        let thick = mid.iter().map(|p| p.2).max().unwrap() - mid.iter().map(|p| p.2).min().unwrap();
+        assert!(thick >= 6, "the section stayed round on a diagonal: {thick}");
+    }
+
+    #[test]
+    fn every_section_makes_a_different_solid() {
+        let of = |sec: &str| {
+            let (sk, errs) = parse(&format!("part s sweep path=0,0,0;0,16,0 r=5 section={sec}\n"));
+            assert!(errs.is_empty(), "{sec}: {errs:?}");
+            let (placed, _) = resolve(&sk, (0, 64, 0));
+            cells(&placed[0], 1).len()
+        };
+        let (circle, square, diamond, cross, hollow) =
+            (of("circle"), of("square"), of("diamond"), of("cross"), of("hollow"));
+        assert!(square > circle, "a square fills its corners: {square} vs {circle}");
+        assert!(diamond < circle, "a diamond is inside the circle: {diamond} vs {circle}");
+        // A CROSS IS NOT SMALLER THAN A DIAMOND, which I asserted
+        // without doing the arithmetic: two arms of 0.8r by 2r overlap
+        // in the middle, about 2.6r squared, where a diamond is 2r
+        // squared. It is smaller than the SQUARE, which is the true
+        // statement.
+        assert!(cross < square, "a cross is mostly gap next to a square: {cross} vs {square}");
+        assert!(hollow < circle && hollow > 0, "a tube is a rind: {hollow}");
+    }
+
+    #[test]
+    fn a_sweep_needs_a_path_and_says_so() {
+        let (_, e) = parse("part x sweep r=3\n");
+        assert!(e.iter().any(|m| m.contains("at least two points")), "{e:?}");
+        let (_, e2) = parse("part x sweep path=0,0,0 r=3\n");
+        assert!(e2.iter().any(|m| m.contains("at least two points")), "{e2:?}");
+        // a two-dimensional point is read as flat, not refused
+        let (sk, e3) = parse("part x sweep path=0,0;0,12 r=2\n");
+        assert!(e3.is_empty(), "{e3:?}");
+        let (placed, _) = resolve(&sk, (0, 64, 0));
+        assert!(!cells(&placed[0], 1).is_empty());
     }
 }
