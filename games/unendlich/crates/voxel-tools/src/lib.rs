@@ -145,6 +145,8 @@ pub mod study;
 pub mod flair;
 /// Typology and triage: what a thing is made of, and sorting what the client said.
 pub mod typology;
+/// What is in a room: furnishings and loot from what the room is for.
+pub mod contents;
 /// The architectural brief: a schedule of spaces, an adjacency matrix, and a layout.
 pub mod brief;
 /// The routing turn: ask what kind of thing this is, instead of matching words.
