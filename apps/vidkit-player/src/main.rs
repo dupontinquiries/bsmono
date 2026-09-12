@@ -309,7 +309,21 @@ impl eframe::App for Player {
         self.transport.rotation = self.settings.rotation;
 
         let settings_open = self.settings_open;
-        vidkit_egui::settings::show(ctx, &mut self.settings_open, &mut self.settings);
+        // The video frame is the backdrop, so the blur samples the actual
+        // picture. `full_uv` because the panel floats over the whole surface
+        // rather than a crop of it.
+        let backdrop = self.presenter.texture().map(|t| {
+            (
+                t.id(),
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            )
+        });
+        vidkit_egui::settings::show_over(
+            ctx,
+            &mut self.settings_open,
+            &mut self.settings,
+            backdrop,
+        );
 
         // Any pointer activity wakes the chrome. A modal open holds it up, as
         // does being paused -- both are moments the viewer is using the UI.

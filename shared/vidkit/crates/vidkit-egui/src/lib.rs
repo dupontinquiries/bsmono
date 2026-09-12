@@ -26,6 +26,7 @@
 pub mod bar;
 pub mod chrome;
 pub mod fit;
+pub mod glass;
 pub mod palette;
 pub mod settings;
 pub mod tips;
@@ -47,6 +48,7 @@ pub use settings::{FillMode, Settings};
 pub use tips::{Tip, TipPolicy, Tips, GESTURE_TIPS};
 pub use palette::{available, commands, icon_for, Action, ClipboardState, Command};
 pub use chrome::{Chrome, ChromePolicy};
+pub use glass::{contrast_ratio, GlassStyle};
 pub use fit::{fit_rect, surface_to_frame, Fit, PixelAspect};
 pub use presenter::EguiPresenter;
 pub use view::{format_time, progress, scrub_fraction, scrub_target, Transport, VideoView, ViewAction};

@@ -340,13 +340,44 @@ mod tests {
 /// reversible and cheap, so a preview you can see while dragging beats a
 /// confirmation step.
 pub fn show(ctx: &egui::Context, open: &mut bool, s: &mut Settings) -> bool {
+    show_over(ctx, open, s, None)
+}
+
+/// As [`show`], drawing a blurred copy of `backdrop` behind the panel.
+///
+/// The texture is the video frame; without one the tint alone is drawn, which
+/// is right rather than a fallback -- there is nothing to blur.
+pub fn show_over(
+    ctx: &egui::Context,
+    open: &mut bool,
+    s: &mut Settings,
+    backdrop: Option<(egui::TextureId, egui::Rect)>,
+) -> bool {
     if !*open {
         return false;
     }
+    let glass = crate::glass::GlassStyle::default();
     let mut still_open = true;
 
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
         still_open = false;
+    }
+
+    // Blur behind the window, painted first so the window sits on top of it.
+    // egui has no backdrop filter, so this redraws the frame texture a few
+    // times at small offsets -- see `glass.rs`.
+    if let Some((tex, uv)) = backdrop {
+        let screen = ctx.screen_rect();
+        let panel = egui::Rect::from_center_size(
+            screen.center(),
+            egui::vec2(400.0, (screen.height() - 120.0).clamp(200.0, 620.0)),
+        );
+        egui::Area::new(egui::Id::new("settings_glass"))
+            .order(egui::Order::Middle)
+            .fixed_pos(panel.min)
+            .show(ctx, |ui| {
+                crate::glass::draw(ui, panel, &glass, Some((tex, uv)));
+            });
     }
 
     egui::Window::new("settings")
@@ -358,11 +389,11 @@ pub fn show(ctx: &egui::Context, open: &mut bool, s: &mut Settings) -> bool {
         // semi-transparent against a dark backdrop, and over a bright test
         // pattern the controls became unreadable -- the video showed straight
         // through the radio buttons.
-        .frame(
-            egui::Frame::window(&ctx.style())
-                .fill(egui::Color32::from_rgb(22, 20, 28))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(70))),
-        )
+        // The glass frame, whose opacity is set by the contrast test in
+        // `glass.rs` rather than by eye -- a panel that reads well over a dark
+        // clip and vanishes over a snow scene is the usual outcome of choosing
+        // it by looking.
+        .frame(crate::glass::window_frame(&glass))
         .open(&mut still_open)
         .show(ctx, |ui| {
             // Bounded and scrollable: the panel is taller than a phone in
