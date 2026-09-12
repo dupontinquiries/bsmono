@@ -11,7 +11,7 @@
 //! Gemma2 (geglu + dual soft-cap + a norm tweak), then Phi-3 (fused QKV / partial-rotary).
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Arch { Llama, Qwen2, Qwen3, Qwen35, Qwen3Moe, Qwen4, Llama4, Gemma2, Gemma3, DiffusionGemma, Phi3, Glm4Moe, DeepseekV3, MuseGlimmer, Unknown }
+pub enum Arch { Glm4Dense, Llama, Qwen2, Qwen3, Qwen35, Qwen3Moe, Qwen4, Llama4, Gemma2, Gemma3, DiffusionGemma, Phi3, Glm4Moe, DeepseekV3, MuseGlimmer, Unknown }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Norm { /// x/rms(x) · w
@@ -293,6 +293,33 @@ never on the fixture",
             supported: false, dense_supported: false,
             note: "fused qkv tensor + partial-rotary RoPE; needs a split + partial-dim rope kernel",
         },
+        // GLM-4 DENSE (`general.architecture = "chatglm"`, which is what llama.cpp writes for
+        // GLM-4-9B and the GLM-4-0414 line; "glm4" appears on some conversions).
+        //
+        // The MoE sibling below has been supported since it was written and the DENSE one —
+        // by far the more common local model — resolved to Unknown and was sent to the
+        // llama.cpp backend. Nothing structural was missing; the entry simply was not here.
+        //
+        // Shape: GQA, RMS norm, SwiGLU, qkv BIAS (GLM carries it), no per-head QK-norm, NEOX
+        // rope. PARTIAL ROPE is the one thing that makes GLM look exotic — only the first half
+        // of each head's dims rotate — and it needs no flag here: the loader reads
+        // `{pfx}.rope.dimension_count` from the file and `rope_dims` drives the kernel, which
+        // is per-MODEL rather than per-architecture and already exercised by Qwen3.8.
+        "chatglm" | "glm4" | "glm" => ArchConfig {
+            arch: Arch::Glm4Dense, prefix: "chatglm", attn_qkv_bias: true, attn_qk_norm: false,
+            norm: Norm::Rms, act: Act::SwiGlu,
+            rope_interleaved: false, moe: false, moe_shared_expert: false,
+            interleaved_nope: false, logit_softcap: None, attn_softcap: None,
+            tied_embed_default: false,
+            // Declared UNSUPPORTED until a real checkpoint is run through it. The registry's
+            // own discipline: `glm-dsa` sits at false for the same reason with its kernels
+            // written. A flag that says "supported" on reasoning alone is the one thing this
+            // table must not contain, because everything downstream trusts it.
+            supported: false, dense_supported: false,
+            note: "GLM-4 dense (chatglm): GQA + qkv bias + SwiGLU + NEOX rope, partial rope \
+                   read from rope.dimension_count. Registry entry added; unverified against a \
+                   checkpoint, so still routed to llama.cpp.",
+        },
         // GLM-4-MoE (general.architecture = "glm4moe"). Two sub-forms exist; this registry entry is the
         // STANDARD-attention one (GQA + per-head QK-Norm + qkv bias, like Qwen3, plus shared-expert MoE).
         // The MLA sub-form is detected by tensor presence in the loader and refused there. NEOX rope.
@@ -521,6 +548,46 @@ pub fn qk_norm_tensors(cfg: &ArchConfig, layer: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The MoE sibling was supported and the DENSE model — by far the more common local one
+    /// — resolved to `Unknown` and was sent to llama.cpp. Nothing structural was missing; the
+    /// entry was not there.
+    #[test]
+    fn dense_glm4_is_recognised_under_the_names_it_actually_ships_as() {
+        // `chatglm` is what llama.cpp writes for GLM-4-9B and the 0414 line.
+        for name in ["chatglm", "glm4", "glm"] {
+            let c = for_arch(name);
+            assert_ne!(c.arch, Arch::Unknown, "{name} still unknown");
+            assert_eq!(c.prefix, "chatglm", "{name} should normalise to one prefix");
+            assert!(c.attn_qkv_bias, "GLM carries qkv bias: {name}");
+            assert!(!c.attn_qk_norm, "GLM-4 dense has no per-head QK-norm: {name}");
+            assert!(!c.moe, "{name} is the dense entry");
+        }
+
+        // DECLARED UNSUPPORTED until a checkpoint has actually run. Same discipline as
+        // `glm-dsa`, whose kernels are written and whose flag is still false — a flag that
+        // says "supported" on reasoning alone is the one thing this table must not contain,
+        // because everything downstream trusts it.
+        assert!(!is_supported("chatglm", 0), "not verified against a real file yet");
+        assert!(for_arch("chatglm").note.contains("unverified"), "the note must say so");
+
+        // And it is NOT the MoE entry — they are different models and sharing a config would
+        // route a 9B dense through shared-expert code.
+        assert_ne!(for_arch("chatglm").arch, for_arch("glm4moe").arch);
+        assert!(for_arch("glm4moe").moe && !for_arch("chatglm").moe);
+    }
+
+    /// Partial RoPE is what makes GLM look exotic, and it needs no flag: the loader reads
+    /// `rope.dimension_count` from the FILE, so it is per-model rather than per-architecture
+    /// and is already exercised by Qwen3.8. Recorded as a test so nobody adds a
+    /// `partial_rope: bool` that would then have to be kept in step with the file.
+    #[test]
+    fn partial_rope_is_a_file_property_not_an_arch_flag() {
+        let c = for_arch("chatglm");
+        assert!(!c.rope_interleaved, "GLM is NEOX, not interleaved");
+        // Nothing in the config claims a rotated-dim count; that comes from the gguf.
+        assert!(c.note.contains("rope.dimension_count"), "{}", c.note);
+    }
 
     #[test]
     fn an_unverified_arch_can_never_verify_ITSELF_without_an_opt_in() {

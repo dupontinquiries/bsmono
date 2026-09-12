@@ -162,6 +162,12 @@ pub fn catalog() -> Vec<Model> {
         Model { name: "Gemma3-12B", arch: "gemma3", params_b: 12.2, active_b: 12.2, layers: 48, kv_heads: 8, head_dim: 256 },
         Model { name: "Llama-3.2-3B", arch: "llama", params_b: 3.2, active_b: 3.2, layers: 28, kv_heads: 8, head_dim: 128 },
         Model { name: "Llama-3.1-8B", arch: "llama", params_b: 8.0, active_b: 8.0, layers: 32, kv_heads: 8, head_dim: 128 },
+        // GLM-4, with the shapes from its own config so the catalogue is ready — and filtered
+        // out by `is_supported` until the arch is verified. The recommender asks the engine
+        // rather than carrying its own opinion, which is what stops it offering a model the
+        // loader would refuse.
+        Model { name: "GLM-4-9B", arch: "chatglm", params_b: 9.4, active_b: 9.4, layers: 40, kv_heads: 2, head_dim: 128 },
+        Model { name: "GLM-4-32B-0414", arch: "chatglm", params_b: 32.6, active_b: 32.6, layers: 61, kv_heads: 2, head_dim: 128 },
     ]
 }
 
@@ -173,6 +179,23 @@ mod tests {
 
     /// A recommender with its own idea of what runs is a second source of truth, and the
     /// first time the two disagree someone downloads a model the loader refuses.
+    /// The catalogue can list a model before the engine can run it, and the filter is what
+    /// keeps that from becoming a bad recommendation. GLM-4 is in the table with its real
+    /// shapes and is NOT offered, because `archcfg` says the arch is unverified.
+    #[test]
+    fn a_catalogued_but_unsupported_model_is_not_offered() {
+        assert!(catalog().iter().any(|m| m.arch == "chatglm"), "GLM should be catalogued");
+        assert!(!crate::archcfg::is_supported("chatglm", 0), "the premise");
+        let out = recommend(&catalog(), 64_000.0, 4096, QUANTS);
+        assert!(
+            !out.iter().any(|f| f.model.arch == "chatglm"),
+            "an unverified arch was recommended: {:?}",
+            out.iter().map(|f| f.model.name).collect::<Vec<_>>()
+        );
+        // The day `chatglm` is verified it appears here with no change to this file, which is
+        // the point of asking the engine instead of keeping a second list.
+    }
+
     #[test]
     fn nothing_is_recommended_for_an_architecture_the_engine_cannot_run() {
         let unsupported = Model {
