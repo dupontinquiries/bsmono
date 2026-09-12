@@ -1703,3 +1703,332 @@ mod clipboard_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// fetching a page URL to a temp file
+// ---------------------------------------------------------------------------
+
+/// A downloaded file that deletes itself.
+///
+/// A film left in `/tmp` is gigabytes, and a player that leaks one per watch
+/// fills the disk of exactly the small device this targets.
+pub struct TempMedia {
+    dir: std::path::PathBuf,
+    pub file: std::path::PathBuf,
+}
+
+impl TempMedia {
+    pub fn path(&self) -> &std::path::Path {
+        &self.file
+    }
+}
+
+impl Drop for TempMedia {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The `-f` selector for a height ceiling.
+///
+/// Three alternatives separated by `/`, and all three are needed:
+///
+/// - `bv*[height<=N]+ba` is the DASH case — YouTube serves video-only and
+///   audio-only streams and yt-dlp muxes them.
+/// - `b[height<=N]` is a progressive stream that already has both, which is
+///   what most non-YouTube sites give.
+/// - `b` is the last resort. Without it, a video whose only rendition is above
+///   the ceiling fails outright rather than playing bigger than asked — and
+///   "it refused to play at all because you wanted 720p" is a worse outcome
+///   than a stream one size up.
+pub fn format_selector(max_height: Option<u32>) -> String {
+    match max_height {
+        Some(h) => format!("bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"),
+        None => "bv*+ba/b".to_string(),
+    }
+}
+
+/// Arguments for the download, kept pure so the flags are testable without
+/// spawning anything.
+pub fn download_args(url: &str, out_template: &str, max_height: Option<u32>) -> Vec<String> {
+    vec![
+        // Quiet, but not silent about failure.
+        "--no-warnings".into(),
+        "--no-playlist".into(),
+        // Progress on stderr would be captured and discarded; there is no
+        // terminal to draw it on.
+        "--no-progress".into(),
+        "-f".into(),
+        format_selector(max_height),
+        // Remux rather than re-encode when the container needs changing: a
+        // re-encode of a whole film before the first frame is minutes.
+        "--remux-video".into(),
+        "mp4".into(),
+        "-o".into(),
+        out_template.into(),
+        url.into(),
+    ]
+}
+
+/// Download a page URL to a temporary file.
+///
+/// yt-dlp does the muxing. That is the point of this path: YouTube serves
+/// video and audio as separate streams, and joining them is exactly what
+/// yt-dlp is good at — reimplementing it over our own range fetcher would mean
+/// a DASH muxer in this repo.
+///
+/// The cost is honest and worth stating: this waits for the whole file. First
+/// frame comes after the download, not during it. Progressive play would need
+/// ffmpeg reading a file that is still growing, which is a real thing to build
+/// and not this.
+pub fn fetch_to_temp<R: vidkit_ytdlp::CommandRunner>(
+    runner: &mut R,
+    url: &str,
+    max_height: Option<u32>,
+) -> Result<TempMedia, String> {
+    let dir = std::env::temp_dir().join(format!(
+        "vidkit-dl-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+
+    // A fixed stem, not the video's title: a title can contain slashes,
+    // newlines and characters that are illegal on the filesystem, and yt-dlp's
+    // own sanitising still leaves something unpredictable to find afterwards.
+    let template = dir.join("media.%(ext)s");
+    let args = download_args(url, &template.to_string_lossy(), max_height);
+
+    runner.run("yt-dlp", &args).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&dir);
+        format!("{url}: {e:?}")
+    })?;
+
+    // Find what it actually wrote. The extension depends on the remux and on
+    // what the site served, so globbing beats guessing.
+    let file = std::fs::read_dir(&dir)
+        .ok()
+        .and_then(|rd| {
+            let mut files: Vec<std::path::PathBuf> =
+                rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+            files.sort();
+            // Largest wins: yt-dlp can leave a `.part` or a thumbnail behind.
+            files.into_iter().max_by_key(|p| {
+                std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+            })
+        })
+        .ok_or_else(|| {
+            let _ = std::fs::remove_dir_all(&dir);
+            format!("{url}: yt-dlp wrote no file")
+        })?;
+
+    Ok(TempMedia { dir, file })
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+
+    /// Serve fixed bytes over HTTP, honouring Range because yt-dlp probes with
+    /// one before downloading.
+    fn serve_bytes(body: Vec<u8>) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..64 {
+                let Ok((mut sock, _)) = listener.accept() else { break };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 { continue; }
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let head_only = req.starts_with("HEAD");
+                let rng = req.lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .and_then(|l| l.split('=').nth(1).map(str::trim).map(str::to_string));
+                let (start, end) = rng
+                    .and_then(|r| {
+                        let (a, b) = r.split_once('-')?;
+                        Some((a.parse::<usize>().ok()?, b.parse::<usize>().unwrap_or(body.len() - 1)))
+                    })
+                    .unwrap_or((0, body.len().saturating_sub(1)));
+                if start >= body.len() {
+                    let _ = sock.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n\r\n");
+                    continue;
+                }
+                let slice = &body[start..=end.min(body.len() - 1)];
+                let partial = slice.len() != body.len();
+                let head = if partial {
+                    format!("HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Type: video/mp4\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                        start + slice.len() - 1, body.len(), slice.len())
+                } else {
+                    format!("HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\n\r\n", body.len())
+                };
+                let _ = sock.write_all(head.as_bytes());
+                if !head_only { let _ = sock.write_all(slice); }
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn the_selector_falls_back_past_the_height_cap() {
+        let s = format_selector(Some(720));
+        assert!(s.starts_with("bv*[height<=720]+ba"), "{s}");
+        assert!(s.contains("/b[height<=720]"), "no progressive fallback: {s}");
+        // The last resort matters: a video whose only rendition is above the
+        // cap must still play rather than refusing because you asked for 720p.
+        assert!(s.ends_with("/b"), "no last resort: {s}");
+    }
+
+    #[test]
+    fn no_cap_still_asks_for_video_plus_audio() {
+        let s = format_selector(None);
+        assert!(s.contains("bv*+ba"), "{s}");
+        assert!(!s.contains("height"), "an uncapped selector mentions height: {s}");
+    }
+
+    /// YouTube serves video and audio separately; a selector that does not ask
+    /// for both gets a silent film.
+    #[test]
+    fn the_selector_always_asks_for_audio() {
+        for cap in [None, Some(480), Some(1080)] {
+            assert!(
+                format_selector(cap).contains("+ba"),
+                "no audio requested for {cap:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_arguments_carry_the_url_and_the_output_template() {
+        let a = download_args("https://site/watch?v=1", "/tmp/x/media.%(ext)s", Some(480));
+        assert_eq!(a.last().unwrap(), "https://site/watch?v=1");
+        assert!(a.iter().any(|x| x == "/tmp/x/media.%(ext)s"));
+        assert!(a.iter().any(|x| x == "--no-playlist"), "a playlist URL would fetch all of it");
+        assert!(a.iter().any(|x| x.contains("height<=480")));
+    }
+
+    /// Remux, never re-encode. Re-encoding a whole film before the first frame
+    /// is minutes of waiting.
+    #[test]
+    fn it_remuxes_rather_than_re_encoding() {
+        let a = download_args("u", "o", None);
+        assert!(a.iter().any(|x| x == "--remux-video"));
+        assert!(!a.iter().any(|x| x == "--recode-video"), "that re-encodes");
+    }
+
+    /// The temp directory goes away with the handle. A film left in /tmp is
+    /// gigabytes and fills the disk of the device this targets.
+    #[test]
+    fn the_temp_directory_is_removed_on_drop() {
+        let dir = std::env::temp_dir().join(format!("vidkit-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("media.mp4");
+        std::fs::write(&file, b"x").unwrap();
+        {
+            let _t = TempMedia { dir: dir.clone(), file };
+            assert!(dir.exists());
+        }
+        assert!(!dir.exists(), "the download was left behind");
+    }
+
+    /// yt-dlp leaves `.part` files and thumbnails around; the media is the
+    /// biggest thing in the directory.
+    #[test]
+    fn the_largest_file_is_taken_as_the_media() {
+        struct Fake(std::path::PathBuf);
+        impl vidkit_ytdlp::CommandRunner for Fake {
+            fn run(&mut self, _p: &str, a: &[String]) -> Result<Vec<u8>, vidkit_ytdlp::RunError> {
+                // Write what yt-dlp would: the media plus some litter.
+                let tmpl = a.iter().find(|x| x.contains("media.")).unwrap();
+                let dir = std::path::Path::new(tmpl).parent().unwrap();
+                std::fs::write(dir.join("media.mp4"), vec![0u8; 4096]).unwrap();
+                std::fs::write(dir.join("media.jpg"), vec![0u8; 16]).unwrap();
+                let _ = &self.0;
+                Ok(Vec::new())
+            }
+        }
+        let mut f = Fake(std::path::PathBuf::new());
+        let got = fetch_to_temp(&mut f, "https://site/v", Some(720)).expect("fetch");
+        assert_eq!(
+            got.path().extension().and_then(|e| e.to_str()),
+            Some("mp4"),
+            "picked the thumbnail: {}", got.path().display()
+        );
+    }
+
+    /// The whole new path against the REAL yt-dlp: download to a temp file,
+    /// then decode it. No YouTube needed — the generic extractor handles a
+    /// plain HTTP URL, which exercises the same download-then-play flow.
+    #[test]
+    fn a_real_download_produces_a_decodable_file() {
+        let have = std::process::Command::new("yt-dlp")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !have {
+            eprintln!("SKIP: no yt-dlp");
+            return;
+        }
+
+        // A real encoded clip, served over HTTP.
+        let clip = std::env::temp_dir().join(format!("vidkit-src-{}.mp4", std::process::id()));
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=0x20C040:size=320x240:rate=10:duration=2",
+                "-pix_fmt", "yuv420p", "-c:v", "libx264",
+            ])
+            .arg(&clip)
+            .status();
+        if !made.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        let body = std::fs::read(&clip).unwrap();
+        let port = serve_bytes(body);
+
+        let mut runner = ProcessRunner::default();
+        let media = fetch_to_temp(
+            &mut runner,
+            &format!("http://127.0.0.1:{port}/clip.mp4"),
+            Some(720),
+        )
+        .expect("download");
+        assert!(media.path().is_file(), "no file at {}", media.path().display());
+
+        let mut dec = crate::decode::FfmpegFrames::open(media.path(), None)
+            .expect("decode the download");
+        let f = dec.next_frame().expect("a frame from the downloaded file");
+        assert_eq!((f.width, f.height), (320, 240));
+
+        let _ = std::fs::remove_file(&clip);
+    }
+
+    /// A failing yt-dlp must not leave its directory behind either.
+    #[test]
+    fn a_failed_download_cleans_up_after_itself() {
+        struct Failing;
+        impl vidkit_ytdlp::CommandRunner for Failing {
+            fn run(&mut self, _p: &str, _a: &[String]) -> Result<Vec<u8>, vidkit_ytdlp::RunError> {
+                Err(vidkit_ytdlp::RunError::Io("nope".into()))
+            }
+        }
+        let before = std::fs::read_dir(std::env::temp_dir())
+            .map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("vidkit-dl-")).count())
+            .unwrap_or(0);
+        assert!(fetch_to_temp(&mut Failing, "https://site/v", None).is_err());
+        let after = std::fs::read_dir(std::env::temp_dir())
+            .map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("vidkit-dl-")).count())
+            .unwrap_or(0);
+        assert_eq!(after, before, "a failed download left its directory behind");
+    }
+}

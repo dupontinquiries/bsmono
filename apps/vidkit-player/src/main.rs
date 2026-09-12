@@ -132,6 +132,9 @@ struct Player {
     /// `None` falls back to the test pattern, which is what every build before
     /// this one did for everything.
     frames: Option<decode::FfmpegFrames>,
+    /// Kept alive so the downloaded file outlives the decoder reading it.
+    /// Dropping it deletes the file, and ffmpeg is still holding it open.
+    downloaded: Option<io::TempMedia>,
 }
 
 /// File-picker state. Navigation is uikit-egui's PathPicker; the file list and
@@ -258,6 +261,7 @@ impl Player {
             gpu,
             gpu_error: gpu_error.or(decode_error),
             frames,
+            downloaded: None,
             chrome: Default::default(),
             settings: Default::default(),
             settings_open: false,
@@ -996,6 +1000,34 @@ impl Player {
         // spawning a Python interpreter to learn what the URL already said is
         // seconds of latency for nothing.
         if !io::is_direct_media(&url) {
+            // A page: let yt-dlp fetch and MUX it, then play the file.
+            //
+            // YouTube serves video and audio as separate streams. Joining them
+            // over our own range fetcher would mean a DASH muxer in this repo;
+            // yt-dlp already does it well. The cost is stated rather than
+            // hidden: this waits for the whole download, so the first frame
+            // comes after it rather than during.
+            let cap = self.settings.quality.max_long_edge();
+            match io::fetch_to_temp(&mut io::ProcessRunner::default(), &url, cap) {
+                Ok(media) => {
+                    match decode::FfmpegFrames::open(media.path(), Some(1920)) {
+                        Ok(f) => {
+                            self.opened = Some(open_local(&media.file));
+                            self.frames = Some(f);
+                            // Held so the file outlives the decoder reading it.
+                            self.downloaded = Some(media);
+                            self.transport.playing = true;
+                            self.gpu_error = None;
+                        }
+                        Err(e) => self.gpu_error = Some(format!("downloaded, but {e}")),
+                    }
+                }
+                Err(e) => self.gpu_error = Some(e),
+            }
+            return;
+        }
+        #[allow(unreachable_code)]
+        if false {
             match io::open_page_url(io::ProcessRunner::default(), &url, io::assumed_caps()) {
                 Ok(o) => self.accept_opened(o),
                 // Reported verbatim. The resolver's message names which of the
