@@ -10,7 +10,7 @@
 //                                          testdata fixtures + a pack-rust set)
 //   depot serve --root /tmp/d1 --bind 127.0.0.1:8123 --quiet &
 //   mkdir /tmp/uitest && cd /tmp/uitest && npm install jsdom@24
-//   node /path/to/ui-test.js               -> "31 passed, 0 failed"
+//   node /path/to/ui-test.js               -> "32 passed, 0 failed"
 //
 // Two harness lessons, paid for: (1) do NOT dispatch hashchange by hand -
 // jsdom fires it on `location.hash =`, and a manual dispatch renders every
@@ -78,7 +78,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('bootstrap one-liner reflects the ticks', d.querySelector('#boot').textContent.includes('nix=1') && d.querySelector('#boot').textContent.includes('rpm=test-repo'));
 
   h = await go('#manual', (h) => h.includes('<div class="md">'));
-  check('manual renders headings/tables/code', /<h2 id="[^"]*">/.test(h) && h.includes('<table>') && h.includes('<pre><code>') && !h.includes('```'));
+  check('manual renders headings/tables/code', /<h2 id="[^"]*">/.test(h) && h.includes('<table>') && h.includes('<pre') && h.includes('<code>') && !h.includes('```'));
+  await settle(() => d.querySelectorAll('.codebar .copy').length > 0);
+  check('every code block in the manual gets a copy button', d.querySelectorAll('pre').length > 0 && d.querySelectorAll('.codebar .copy').length === d.querySelectorAll('pre').length);
   h = await go('#decisions', (h) => h.includes('Data root:'));
   check('decisions renders 15 numbered sections', (h.match(/<h2 /g) || []).length >= 15);
   h = await go('#tutorials', (h) => h.includes('<h1>Tutorials</h1>'));
