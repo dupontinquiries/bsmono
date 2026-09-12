@@ -540,7 +540,10 @@ pub fn open_direct_url(url: &str) -> Result<OpenedUrl, String> {
     use vidkit_core::traits::MediaSource;
     use vidkit_ytdlp::http::{ChunkPolicy, HttpByteSource};
 
-    let mut src = HttpByteSource::new(TcpTransport::default(), url, Default::default())
+    // The scheme picks the transport, so an https URL works here and a LAN
+    // file over plain http does not start requiring TLS it will never have.
+    let transport = transport_for(url)?;
+    let mut src = HttpByteSource::new(transport, url, Default::default())
         .with_policy(ChunkPolicy {
             // Smaller than the default: the header walk is the only thing read
             // before we know whether this is even a video, and pulling 256 KB
@@ -777,5 +780,174 @@ pub(crate) mod tests_support {
         let moov = make(at);
         assert_eq!(moov.len(), probe.len());
         cat(&[ftyp, moov, mdat])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// https
+// ---------------------------------------------------------------------------
+
+/// Range fetching over HTTPS.
+///
+/// `ureq` with rustls — the same crate and major version voiceterm, snapclone
+/// and bo-suite already use, so it is house-approved and already in the cargo
+/// cache. rustls rather than native-tls keeps the build free of an OpenSSL
+/// system dependency, which is exactly what has stopped other apps in this tree
+/// from building in this sandbox.
+///
+/// Everything that decides anything still lives above the trait: the read
+/// window, the retry policy, the expiry handling and the section plan are in
+/// `vidkit-ytdlp` and tested there. This only moves bytes.
+#[cfg(feature = "https")]
+pub struct TlsTransport {
+    agent: ureq::Agent,
+    content_length: Option<u64>,
+}
+
+#[cfg(feature = "https")]
+impl Default for TlsTransport {
+    fn default() -> Self {
+        Self {
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(10))
+                .timeout_read(Duration::from_secs(20))
+                // Redirects are followed: CDNs redirect range requests
+                // routinely, and a client that does not follow them reports a
+                // 302 as a failure on a URL that works in any browser.
+                .redirects(5)
+                .build(),
+            content_length: None,
+        }
+    }
+}
+
+#[cfg(feature = "https")]
+impl HttpTransport for TlsTransport {
+    fn fetch(&mut self, req: &RangeRequest) -> Result<Vec<u8>, HttpError> {
+        let mut r = self.agent.get(&req.url).set("Range", &req.header_value());
+        // The caller's headers go last so a signed URL's own User-Agent wins:
+        // a CDN that checks it answers 403, and that looks exactly like an
+        // expired URL.
+        for (k, v) in &req.headers {
+            r = r.set(k, v);
+        }
+
+        let resp = match r.call() {
+            Ok(resp) => resp,
+            // ureq models a non-2xx as an error, so the status has to be dug
+            // back out or every HTTP error becomes an opaque transport one and
+            // the recoverable 403 stops being recoverable.
+            Err(ureq::Error::Status(code, _)) => {
+                return Err(match code {
+                    401 | 403 => HttpError::Forbidden,
+                    other => HttpError::Status(other),
+                })
+            }
+            Err(e) => return Err(HttpError::Transport(format!("{}: {e}", req.url))),
+        };
+
+        if let Some(cr) = resp.header("Content-Range") {
+            if let Some(total) = cr.rsplit_once('/').and_then(|(_, t)| t.trim().parse().ok()) {
+                self.content_length = Some(total);
+            }
+        }
+
+        // Bounded by what was asked for, plus a little slack. An unbounded
+        // read_to_end on a server that ignored the Range header pulls the whole
+        // film into memory, and on a phone that is the process being killed
+        // rather than an error anyone can act on.
+        let wanted = (req.end.saturating_sub(req.start) + 1) as usize;
+        let cap = wanted.saturating_add(64 * 1024);
+        let mut body = Vec::with_capacity(wanted.min(1 << 20));
+        resp.into_reader()
+            .take(cap as u64)
+            .read_to_end(&mut body)
+            .map_err(|e| HttpError::Transport(format!("{}: {e}", req.url)))?;
+        Ok(body)
+    }
+
+    fn known_length(&self) -> Option<u64> {
+        self.content_length
+    }
+}
+
+/// Pick a transport for a URL: TLS for `https://`, plain TCP otherwise.
+///
+/// Boxed rather than an enum because the choice is made once per source and
+/// never again; an enum would put a match on every range request to save an
+/// indirection that no profile has ever shown to matter.
+pub fn transport_for(url: &str) -> Result<Box<dyn HttpTransport + Send>, String> {
+    if url.starts_with("https://") {
+        #[cfg(feature = "https")]
+        {
+            return Ok(Box::new(TlsTransport::default()));
+        }
+        #[cfg(not(feature = "https"))]
+        {
+            return Err(format!("{url}: this build has no HTTPS support"));
+        }
+    }
+    if url.starts_with("http://") {
+        return Ok(Box::new(TcpTransport::default()));
+    }
+    Err(format!("{url}: not an http or https URL"))
+}
+
+#[cfg(test)]
+mod transport_choice_tests {
+    use super::*;
+
+    #[test]
+    fn the_scheme_chooses_the_transport() {
+        assert!(transport_for("https://example.org/v.mp4").is_ok());
+        assert!(transport_for("http://example.org/v.mp4").is_ok());
+        // `dyn HttpTransport` is not Debug, so the error cases are matched
+        // rather than unwrapped.
+        // A scheme we do not speak is refused with the URL in the message
+        // rather than attempted as something else.
+        let e = match transport_for("ftp://example.org/v.mp4") {
+            Err(e) => e,
+            Ok(_) => panic!("ftp was accepted"),
+        };
+        assert!(e.contains("ftp://example.org"), "{e}");
+        assert!(transport_for("example.org/v.mp4").is_err());
+    }
+
+    /// The plain transport must still be used for http, or a LAN file starts
+    /// requiring TLS it will never have.
+    #[cfg(feature = "https")]
+    #[test]
+    fn plain_http_does_not_go_through_tls() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else { return };
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+            let body = b"0123456789";
+            let head = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-9/10\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(body);
+        });
+
+        let mut t = match transport_for(&format!("http://127.0.0.1:{port}/x.mp4")) {
+            Ok(t) => t,
+            Err(e) => panic!("no transport for plain http: {e}"),
+        };
+        let got = t
+            .fetch(&RangeRequest {
+                url: format!("http://127.0.0.1:{port}/x.mp4"),
+                headers: Default::default(),
+                start: 0,
+                end: 9,
+            })
+            .expect("plain http through the chosen transport");
+        assert_eq!(got, b"0123456789");
     }
 }

@@ -927,8 +927,12 @@ impl Player {
         };
 
         if !io::is_direct_media(&url) {
+            // A page URL still needs the extractor to turn it into a media URL.
+            // HTTPS itself is no longer the blocker -- a direct https link
+            // plays -- so the message names the actual missing piece rather
+            // than the one that used to be missing.
             self.gpu_error = Some(format!(
-                "{url} needs yt-dlp and an HTTPS client; this build has neither"
+                "{url} is a page, not a media file — that needs yt-dlp, which is not wired up yet"
             ));
             return;
         }

@@ -25,6 +25,11 @@ vidkit-core = { path = "../../shared/vidkit/crates/vidkit-core" }
 # The IO wrappers in src/io.rs implement its CommandRunner and HttpTransport.
 vidkit-ytdlp = { path = "../../shared/vidkit/crates/vidkit-ytdlp" }
 vidkit-stream = { path = "../../shared/vidkit/crates/vidkit-stream" }
+# HTTPS. Same crate and major version voiceterm, snapclone and bo-suite already
+# use, so it is house-approved and already in the cargo cache; rustls rather
+# than native-tls keeps the build free of an OpenSSL system dependency, which
+# is the thing that has blocked other apps in this tree from building here.
+ureq = { version = "2", optional = true }
 vidkit-egui = { path = "../../shared/vidkit/crates/vidkit-egui", features = ["glow-upload"] }
 vidkit-mp4 = { path = "../../shared/vidkit/crates/vidkit-mp4" }
 vidkit-webm = { path = "../../shared/vidkit/crates/vidkit-webm" }
@@ -35,8 +40,11 @@ snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
 # Default-on, matching the other -egui apps: `cargo build --release` in this
 # directory produces the deployable binary with no feature incantation. Off is
 # for a headless build that only wants the library half.
-default = ["app"]
+default = ["app", "https"]
 app = ["dep:eframe"]
+# HTTPS range fetching. Separate from `app` so a headless build that only wants
+# the demuxers does not pull rustls.
+https = ["dep:ureq"]
 
 # Monorepo-wide dev policy: full DWARF is the biggest artifact and link cost,
 # and the sandbox boxes are disk-starved.

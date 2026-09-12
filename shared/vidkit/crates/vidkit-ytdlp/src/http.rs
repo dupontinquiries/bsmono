@@ -64,6 +64,18 @@ pub trait HttpTransport {
     }
 }
 
+/// So a caller that picks its transport at runtime -- plain TCP for `http`,
+/// TLS for `https` -- can hand the box straight to `HttpByteSource` without
+/// the source becoming generic over a choice it does not care about.
+impl HttpTransport for Box<dyn HttpTransport + Send> {
+    fn fetch(&mut self, req: &RangeRequest) -> std::result::Result<Vec<u8>, HttpError> {
+        (**self).fetch(req)
+    }
+    fn known_length(&self) -> Option<u64> {
+        (**self).known_length()
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct ChunkPolicy {
     /// Bytes fetched per request. Large enough that a box-header walk is one

@@ -28,7 +28,7 @@ keep:
 | seam | trait | real impl lives | status |
 |---|---|---|---|
 | yt-dlp process | `CommandRunner` | `src/io.rs` | ✅ written, tested — *verified* |
-| HTTP range fetch | `HttpTransport` | `src/io.rs` | ✅ written, tested over a real socket — **plain HTTP only, no TLS** — *verified* |
+| HTTP range fetch | `HttpTransport` | `src/io.rs` | ✅ plain TCP + `ureq`/rustls for https, picked by scheme — *verified* over a real socket for http, *read* for TLS |
 | V4L2 decode | `V4l2Api` | `vidkit-v4l2::device` | compiles, never run — *verified* it builds, *assumed* it works |
 | transcription | `Transcriber` (voiced-core) | app | **not written** |
 | relevance model | `Analyzer::take_pending`/`fulfill` | app | **not written** |
@@ -60,18 +60,14 @@ untestable wrapper would have looked like progress.
    up yet". `voice-kit` already does the post-processing and
    `voiced-core::grammar` already does the matching; only the mic and the model
    are missing. *read*
-2. **A TLS client.** `TcpTransport` in `src/io.rs` fetches ranges over a real
-   socket and is tested against a local server, but speaks `http://` only —
-   the monorepo has no TLS client, and `net-kit`'s is plain TCP whose
-   `roundtrip` returns a `String` that would mangle a binary body. YouTube is
-   HTTPS-only, so this is what stands between the finished `StreamSource` and
-   actually playing a URL. It is a change to `TcpTransport::fetch` and nothing
-   else. *verified*
-3. **Page URLs through the extractor.** Direct media links now open over HTTP
-   end to end (`io::open_direct_url`, wired to the palette's "play from
-   clipboard"). A YouTube *page* URL still needs `StreamSource` + `ProcessRunner`
-   + a TLS transport, so it reports what is missing instead of failing
-   obscurely. Blocked on item 2. *verified*
+2. **`ProcessRunner` into `StreamSource`.** The runner exists and is tested;
+   nothing constructs it, so a page URL cannot be resolved. This is the last
+   piece of "paste a YouTube link and it plays". *verified*
+
+3. **Exercise the TLS path against a real server.** `TlsTransport` compiles and
+   its scheme selection is tested, but no test has made an actual HTTPS
+   request — the sandbox has no reachable TLS origin. Treat "https works" as
+   *read*, not *verified*, until someone points it at a real URL. *read*
 4. **Tooltip fade-in.** Asked for and done — see below — but only the shared
    helper; individual controls still need `.on_hover_text` replaced. *verified*
 5. **`Inhibitor` impl.** wlr idle-inhibit on Phosh, `org.freedesktop.ScreenSaver`
