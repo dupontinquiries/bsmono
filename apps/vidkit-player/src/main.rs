@@ -222,7 +222,9 @@ impl Player {
         if let Some(p) = &file {
             match decode::FfmpegFrames::open(p, Some(1920)) {
                 Ok(f) => frames = Some(f),
-                Err(e) => decode_error = Some(format!("no decode: {e}")),
+                Err(e) => {
+                    decode_error = Some(format!("no decode: {e}"));
+                }
             }
         }
 
@@ -271,6 +273,15 @@ impl Player {
         let frame = match self.frames.as_mut().and_then(|f| f.next_frame()) {
             Some(f) => f,
             None => {
+                // End of stream. The decoder is dropped rather than left to
+                // fall back to the test pattern every frame: silently
+                // reverting to the pattern at the end of a clip is what
+                // convinced me for an hour that decoding was broken, when a
+                // six-second clip had simply finished before I looked.
+                if self.frames.is_some() {
+                    self.frames = None;
+                    self.transport.playing = false;
+                }
                 let t = self.started.elapsed().as_secs_f32();
                 pattern::bars(t * 0.25)
             }
@@ -456,7 +467,11 @@ impl eframe::App for Player {
                     ui.separator();
                     // Said plainly rather than left to be inferred from a
                     // picture that does not match the file's dimensions.
-                    ui.small("no decoder yet — showing the test pattern");
+                    ui.small(if self.frames.is_some() {
+                        "decoding via ffmpeg"
+                    } else {
+                        "not decoding — showing the test pattern"
+                    });
                 });
             }
             None => {
