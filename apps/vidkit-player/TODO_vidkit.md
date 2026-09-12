@@ -71,7 +71,11 @@ untestable wrapper would have looked like progress.
 
 ## Open, in the order I would do them
 
-1. **`Transcriber` impl (whisper-rs).** The ONLY thing missing for lecture
+1. **`Transcriber` impl (whisper-rs).** Resolve the model through
+   `shared/models-kit` — `models_kit::find("whisper", name)` — and NOT with a
+   path of its own. `~/models/<kind>/<name>` is the canonical store and
+   models-kit already knows the legacy locations, so a machine that has a
+   model for voiceterm has one for vidkit. Do not add a sixth directory. The ONLY thing missing for lecture
    watching now: `vidkit_relevance::sections` already turns cues into chapters
    and answers "where did they discuss X" with a timestamp, and it needs no
    model — but it needs cues, and nothing produces them. Also unblocks

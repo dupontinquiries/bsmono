@@ -1296,8 +1296,17 @@ enum ModelTier { Tiny, Base, HighAccuracy }
 /// variant if it exists (faster, same accuracy), else falls back to fp16.
 /// Returns None if no file exists for this tier.
 fn model_file(tier: ModelTier) -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var("HOME").unwrap_or("/tmp".into()))
+    // The canonical store first, then this app's historical directory.
+    //
+    // These had drifted apart INSIDE ONE APP: voice-kit resolves through
+    // models-kit (`~/models/whisper`) and this function looked only in
+    // `~/.config/web2qml/models`, so a model sitting in the canonical store
+    // was invisible here and the app would offer to download one it already
+    // had. The legacy directory stays on the search path -- an existing
+    // install must keep working -- but it is no longer the only place looked.
+    let legacy = PathBuf::from(std::env::var("HOME").unwrap_or("/tmp".into()))
         .join(".config/web2qml/models");
+    let dir = legacy;
     // v0.1.652: language-aware model selection. The .en models are
     // English-ONLY — they ignore a non-"en" language request and
     // transcribe other languages phonetically as English (e.g. Spanish
@@ -1318,7 +1327,12 @@ fn model_file(tier: ModelTier) -> Option<PathBuf> {
         ],
     };
     for name in candidates {
-        let p = dir.join(name);
+        // models-kit's search path first (canonical `~/models/whisper`, plus
+        // the legacy spots it knows about), then this app's own directory.
+        let p = match models_kit::find("whisper", name) {
+            Some(found) => found,
+            None => dir.join(name),
+        };
         if p.exists() {
             // warn if a non-English language ends up on an English-only model
             if non_english && name.contains(".en") {
@@ -1356,8 +1370,10 @@ pub fn model_path() -> PathBuf {
     if let Some(p) = model_file(ModelTier::Base) { return p; }
     if let Some(p) = model_file(ModelTier::Tiny) { return p; }
     // No file — return a guess so callers can format an error message.
-    PathBuf::from(std::env::var("HOME").unwrap_or("/tmp".into()))
-        .join(".config/web2qml/models/ggml-base.en.bin")
+    // The guess names the CANONICAL location, because this string ends up in
+    // an error telling someone where to put a model. Pointing them at the
+    // legacy directory teaches the wrong convention to every new install.
+    models_kit::resolve("whisper", "ggml-base.en.bin")
 }
 
 /// Check if voice input is available

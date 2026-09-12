@@ -49,6 +49,10 @@ pub fn search_dirs(kind: &str) -> Vec<PathBuf> {
         format!("{home}/.cache/gitmind/models"),
         format!("{home}/.local/share/models"),
         format!("{home}/.{kind}"),
+        // voiceterm downloaded whisper models here for a long time and still
+        // does; a user who has one already should not be told to fetch it
+        // again because the canonical store is empty.
+        format!("{home}/.config/web2qml/models"),
     ] {
         dirs.push(PathBuf::from(legacy));
     }
@@ -106,5 +110,69 @@ mod tests {
             assert_eq!(dirs[1], Path::new("/m"));
             assert!(dirs.len() > 2, "legacy fallbacks included for migration");
         });
+    }
+}
+
+#[cfg(test)]
+mod convention_tests {
+    use super::*;
+
+    /// `~/models` is the canonical root, and the layout is `<kind>/<name>`.
+    #[test]
+    fn the_root_is_home_models() {
+        let root = models_root();
+        assert!(
+            root.ends_with("models"),
+            "the canonical root moved: {}",
+            root.display()
+        );
+        assert_eq!(
+            resolve("whisper", "ggml-base.en.bin"),
+            root.join("whisper").join("ggml-base.en.bin")
+        );
+    }
+
+    /// The override wins, so a machine with weights on another volume does not
+    /// have to symlink a home directory.
+    #[test]
+    fn the_env_override_wins_and_blank_does_not_count() {
+        // A blank override is someone exporting an empty variable, which must
+        // not silently relocate every model lookup to the filesystem root.
+        std::env::set_var("GITMIND_MODELS", "   ");
+        assert!(models_root().ends_with("models"));
+        std::env::set_var("GITMIND_MODELS", "/tmp/elsewhere");
+        assert_eq!(models_root(), std::path::PathBuf::from("/tmp/elsewhere"));
+        std::env::remove_var("GITMIND_MODELS");
+    }
+
+    /// The canonical directory must be searched BEFORE any legacy one, or a
+    /// stale copy in an old location shadows the current model forever.
+    #[test]
+    fn the_canonical_dir_is_searched_first() {
+        let dirs = search_dirs("whisper");
+        let canonical = models_root().join("whisper");
+        assert_eq!(dirs.first(), Some(&canonical), "{dirs:?}");
+    }
+
+    /// voiceterm's historical directory stays discoverable: a user who already
+    /// has a model there should not be told to download it again.
+    #[test]
+    fn the_legacy_voiceterm_directory_is_still_searched() {
+        let dirs = search_dirs("whisper");
+        assert!(
+            dirs.iter().any(|d| d.ends_with(".config/web2qml/models")),
+            "voiceterm's existing installs became invisible: {dirs:?}"
+        );
+    }
+
+    /// Every legacy entry is read-only by convention; only the canonical root
+    /// is ever written to. Nothing enforces that mechanically, so this at
+    /// least pins that the first entry — the one a writer would pick — is the
+    /// canonical one.
+    #[test]
+    fn a_writer_taking_the_first_dir_writes_canonically() {
+        for kind in ["whisper", "yolo", "beatspace"] {
+            assert_eq!(search_dirs(kind).first(), Some(&models_root().join(kind)));
+        }
     }
 }

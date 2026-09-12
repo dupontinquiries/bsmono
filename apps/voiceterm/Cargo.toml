@@ -32,6 +32,9 @@ irc-kit = { path = "../../shared/irc-kit" }
 qmetaobject = "0.2"
 scraper = "0.14"
 ureq = { version = "2", features = ["gzip"] }
+# The canonical `~/models` store, so this app and voice-kit agree where
+# weights live. Zero-dependency path crate.
+models-kit = { path = "../../shared/models-kit" }
 # v0.1.727: gzip for compressing persisted stores (decision_cache). Already in
 # the build tree transitively via ureq's gzip feature — direct dep = zero extra
 # compile cost, just brings flate2 into crate scope.

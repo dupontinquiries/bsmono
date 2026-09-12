@@ -20,6 +20,7 @@ not exist in the tree; tracked as C9-7c rather than silently dropped.
 | share-kit | the MAILBOX over snapcore + crypto-kit (DHT-as-host two-layer) | ✅ v0.1, 7 tests |
 | audio-kit | DSP primitives: level / goertzel+spectrogram / pitch / window / gen | ✅ v0.1, 25 tests |
 | voice-kit | whisper post-proc: hallucination filtering (union) + ggml model resolution | ✅ v0.1, 10 tests |
+| models-kit | the canonical `~/models` store: `<kind>/<name>`, `GITMIND_MODELS` override, legacy dirs searched read-only | ✅ 7 tests; every model consumer resolves through it — do not add a sixth directory |
 | core-kit | foundational leaf utils: time / hex / rng (SplitMix64) | ✅ v0.1, 12 tests; share-kit repointed |
 | vidkit | video playback: caps model / MP4+WebM demux / player loop / egui surface | ✅ v0.1, 472 tests, 181 mutants; see `apps/vidkit-player/TODO_vidkit.md` |
 
