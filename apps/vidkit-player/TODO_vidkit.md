@@ -28,7 +28,7 @@ keep:
 | seam | trait | real impl lives | status |
 |---|---|---|---|
 | yt-dlp process | `CommandRunner` | `src/io.rs` | ✅ written, wired, tested with a scripted extractor — *verified*; never run against real yt-dlp — *assumed* |
-| HTTP range fetch | `HttpTransport` | `src/io.rs` | ✅ plain TCP + `ureq`/rustls for https, picked by scheme — *verified* over a real socket for http, *read* for TLS |
+| HTTP range fetch | `HttpTransport` | `src/io.rs` | ✅ plain TCP + `ureq`/rustls, picked by scheme — *verified* for both, TLS against a real HTTPS origin |
 | V4L2 decode | `V4l2Api` | `vidkit-v4l2::device` | compiles, never run — *verified* it builds, *assumed* it works |
 | transcription | `Transcriber` (voiced-core) | app | **not written** |
 | relevance model | `Analyzer::take_pending`/`fulfill` | app | **not written** |
@@ -76,11 +76,6 @@ untestable wrapper would have looked like progress.
    up yet". `voice-kit` already does the post-processing and
    `voiced-core::grammar` already does the matching; only the mic and the model
    are missing. *read*
-2. **Exercise the TLS path against a real server.** `TlsTransport` compiles and
-   its scheme selection is tested, but no test has made an actual HTTPS
-   request — this sandbox has no reachable TLS origin. "https works" is *read*,
-   not *verified*. *read*
-
 4. **Tooltip fade-in.** Asked for and done — see below — but only the shared
    helper; individual controls still need `.on_hover_text` replaced. *verified*
 5. **`Inhibitor` impl.** wlr idle-inhibit on Phosh, `org.freedesktop.ScreenSaver`

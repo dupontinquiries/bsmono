@@ -1368,3 +1368,118 @@ mod real_ytdlp_tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "https"))]
+mod real_tls_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// A real HTTPS origin on the sandbox allowlist that honours Range.
+    /// Immutable by policy — a published crate file never changes — so the
+    /// bytes are stable to assert against.
+    const URL: &str = "https://static.crates.io/crates/serde/serde-1.0.0.crate";
+
+    /// Skip rather than fail with no network. A suite that goes red on a
+    /// machine that is merely offline teaches people to ignore red.
+    fn online() -> bool {
+        std::net::TcpStream::connect_timeout(
+            &("static.crates.io", 443)
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut a| a.next())
+                .unwrap_or_else(|| ([0, 0, 0, 0], 0).into()),
+            Duration::from_secs(5),
+        )
+        .is_ok()
+    }
+    use std::net::ToSocketAddrs;
+
+    /// TLS against a real server, which nothing had ever done.
+    ///
+    /// `TlsTransport` compiled and its scheme selection was tested, but no test
+    /// had made an actual HTTPS request — the TODO carried "https works" as
+    /// *read*, not *verified*. This is the difference.
+    #[test]
+    fn the_tls_transport_fetches_a_real_range() {
+        if !online() {
+            eprintln!("SKIP: no network");
+            return;
+        }
+        let mut t = TlsTransport::default();
+        let got = t
+            .fetch(&RangeRequest {
+                url: URL.to_string(),
+                headers: BTreeMap::new(),
+                start: 0,
+                end: 99,
+            })
+            .expect("https fetch");
+
+        assert_eq!(got.len(), 100, "the server did not honour the range");
+        // A .crate file is a gzip stream; the magic is a cheap check that these
+        // are the FIRST bytes of the object rather than some other slice.
+        assert_eq!(&got[..2], &[0x1f, 0x8b], "not the start of the object");
+
+        let total = t.known_length().expect("Content-Range should give a total");
+        assert!(total > 1000, "implausible total {total}");
+    }
+
+    /// A range from the middle must differ from the start, or the server is
+    /// ignoring Range and the test above would pass on the whole file.
+    #[test]
+    fn a_middle_range_is_not_the_start_of_the_file() {
+        if !online() {
+            eprintln!("SKIP: no network");
+            return;
+        }
+        let mut t = TlsTransport::default();
+        let mk = |t: &mut TlsTransport, start: u64| {
+            t.fetch(&RangeRequest {
+                url: URL.to_string(),
+                headers: BTreeMap::new(),
+                start,
+                end: start + 63,
+            })
+            .expect("fetch")
+        };
+        let head = mk(&mut t, 0);
+        let mid = mk(&mut t, 4096);
+        assert_eq!(head.len(), 64);
+        assert_eq!(mid.len(), 64);
+        assert_ne!(head, mid, "the server returned the same bytes for both ranges");
+    }
+
+    /// The whole stack over real TLS: transport, windowed reads, and the
+    /// container sniff refusing something that is not video. A .crate is a
+    /// gzip, so this checks the refusal path rather than playback.
+    #[test]
+    fn the_byte_source_reads_over_real_tls() {
+        if !online() {
+            eprintln!("SKIP: no network");
+            return;
+        }
+        use vidkit_core::io::ByteSource;
+        use vidkit_ytdlp::http::{ChunkPolicy, HttpByteSource};
+
+        let transport = transport_for(URL).expect("tls transport");
+        let mut src = HttpByteSource::new(transport, URL, Default::default())
+            .with_policy(ChunkPolicy { chunk_bytes: 8192, retries: 1 });
+
+        let mut head = [0u8; 16];
+        let n = src.read_at(0, &mut head).expect("read over tls");
+        assert_eq!(n, 16);
+        assert_eq!(&head[..2], &[0x1f, 0x8b]);
+        assert_eq!(src.size().map(|s| s > 1000), Some(true), "no length learned");
+
+        // A second read inside the same window must not hit the network again.
+        let before = src.requests;
+        let mut more = [0u8; 16];
+        src.read_at(32, &mut more).expect("cached read");
+        assert_eq!(src.requests, before, "the window was not reused over TLS");
+
+        assert!(
+            vidkit_stream::detect_container(&head[..n]).is_none(),
+            "a gzip was sniffed as a video container"
+        );
+    }
+}

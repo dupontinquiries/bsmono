@@ -31,7 +31,14 @@ vidkit-stream = { path = "../../shared/vidkit/crates/vidkit-stream" }
 # use, so it is house-approved and already in the cargo cache; rustls rather
 # than native-tls keeps the build free of an OpenSSL system dependency, which
 # is the thing that has blocked other apps in this tree from building here.
-ureq = { version = "2", optional = true }
+# `native-certs`, not the bundled webpki-roots.
+#
+# The bundled root set ignores the system trust store, so any TLS-intercepting
+# proxy -- corporate, school, or the one in this sandbox -- fails with
+# UnknownIssuer while curl on the same machine works. Found by pointing the
+# transport at a real HTTPS host: with default features it could not connect at
+# all. Reading /etc/ssl/certs is also what every other Linux client does.
+ureq = { version = "2", optional = true, features = ["native-certs"] }
 vidkit-egui = { path = "../../shared/vidkit/crates/vidkit-egui", features = ["glow-upload"] }
 vidkit-mp4 = { path = "../../shared/vidkit/crates/vidkit-mp4" }
 vidkit-webm = { path = "../../shared/vidkit/crates/vidkit-webm" }
