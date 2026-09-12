@@ -263,6 +263,19 @@ pub struct AppState {
     /// convergence while on so the move reads as a camera dolly, not a
     /// scroll.
     pub typewriter_mode: bool,
+    /// How the caret presents itself at rest, and — the part that matters
+    /// off a wall socket — whether it asks for frames while doing it. See
+    /// `camera::CaretPolicy`.
+    pub caret: crate::camera::CaretPolicy,
+    /// When the person last did anything. The caret's animation phase is
+    /// anchored to this rather than to the clock, so it is fully lit the
+    /// instant you type; it is also what decides when the caret has been
+    /// left alone long enough to stop animating entirely.
+    ///
+    /// Deliberately "input", not "edit": scrolling and clicking are a
+    /// person being present, and a caret that settles while someone is
+    /// reading with the mouse is settling too eagerly.
+    pub last_input_ms: u64,
     /// Text motion: when an edit changes the line count, lines below the
     /// edit slide from where they WERE into where they ARE. Measured in
     /// LINES (unit-agnostic, so detection is headless-testable); the view
@@ -558,6 +571,8 @@ impl AppState {
             find: None,
             follow_mode: false,
             typewriter_mode: false,
+            caret: crate::camera::CaretPolicy::default(),
+            last_input_ms: 0,
             line_shift: crate::camera::Smooth::new(0.0, 14.0),
             line_shift_from: 0,
             last_motion_version: 0,
@@ -1674,6 +1689,11 @@ impl AppState {
 
     pub fn handle(&mut self, ev: Ev, now_ms: u64) -> Effects {
         let mut fx = Effects::default();
+        // Every event that reaches here is the person being present. One
+        // site, at the top, before any early return — the alternative is
+        // remembering to touch it in forty match arms, and the failure
+        // mode of forgetting one is a caret that settles mid-session.
+        self.last_input_ms = now_ms;
         if self.find.is_some() {
             if let Some(fx) = self.handle_find(&ev, now_ms) {
                 return fx;

@@ -126,6 +126,7 @@ pub enum Cmd {
     ToggleFollow,
     ToggleTypewriter,
     ToggleCmdStrip,
+    SetCaretStyle(crate::camera::CaretStyle),
     SetScope(aperture_complete::scope::Scope),
     OlderRevision,
     NewerRevision,
@@ -152,6 +153,12 @@ pub fn command_list() -> Vec<(String, Cmd)> {
         ("View: Typewriter camera (center the caret line)".to_string(), Cmd::ToggleTypewriter),
         ("View: Bottom command strip (recents + quick actions)".to_string(), Cmd::ToggleCmdStrip),
     ];
+    // One entry per caret style, generated rather than listed, for the same
+    // reason `Scope::ALL` is below: a new variant cannot be added and
+    // silently have no way to reach it.
+    for st in crate::camera::CaretStyle::ALL {
+        v.push((format!("View: Caret — {} ({})", st.label(), st.hint()), Cmd::SetCaretStyle(*st)));
+    }
     // One entry per scope, generated from Scope::ALL so a new variant
     // cannot be added and silently have no way to reach it.
     for sc in aperture_complete::scope::Scope::ALL {
@@ -241,6 +248,10 @@ pub fn apply(cmd: Cmd, s: &mut AppState, now_ms: u64) {
             s.set_status(if on { "command strip: on" } else { "command strip: off" }, now_ms);
         }
         Cmd::SetScope(sc) => s.set_scope(sc, now_ms),
+        Cmd::SetCaretStyle(st) => {
+            s.caret.style = st;
+            s.set_status(&format!("caret: {}", st.label()), now_ms);
+        }
         Cmd::OlderRevision => s.rev_step(1, now_ms),
         Cmd::NewerRevision => s.rev_step(-1, now_ms),
         Cmd::BranchFromHere => s.branch_from_here(now_ms),
