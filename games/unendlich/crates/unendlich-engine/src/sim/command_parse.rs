@@ -21,6 +21,45 @@ pub enum FindKind {
     Water,
 }
 
+/// What `/land` was asked to do.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum LandOp {
+    /// Bare `/land`: what is claimed where I stand.
+    Here,
+    Info(String),
+    Add { id: String, player: String },
+    /// `/land claim <name>` — claim the last build.
+    Claim(String),
+}
+
+/// `/anim` reveal profile. Mirrors `voxel_tools::anim::Profile`; kept as
+/// its own enum so this parser stays dependency-free.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AnimProfile {
+    GroundUp,
+    Physics,
+    Random,
+    Instant,
+}
+
+impl AnimProfile {
+    fn keyword(self) -> &'static str {
+        match self {
+            AnimProfile::GroundUp => "ground-up",
+            AnimProfile::Physics => "physics",
+            AnimProfile::Random => "random",
+            AnimProfile::Instant => "instant",
+        }
+    }
+}
+
+/// `/focus` tier adjustment.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FocusAdjust {
+    Bigger,
+    Smaller,
+}
+
 /// Whitelist mutation verb.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WhitelistOp {
@@ -77,6 +116,70 @@ pub enum Command {
     Whitelist { op: WhitelistOp, id: String },
     /// `/give <item> [count]` — grant an item stack (count defaults to 1).
     Give { item: String, count: u32 },
+    /// `/build <prose>` — hand a natural-language build request to the
+    /// LLM paintbrush. The text is kept verbatim (not lower-cased) because
+    /// it is prose, not a keyword. Opens the plan-preview GUI.
+    Build(String),
+    /// `/plan` — show the pending build plan (arithmetic echo + dry run)
+    /// without committing it.
+    ShowPlan,
+    /// `/commit` — apply the pending build plan.
+    CommitPlan,
+    /// `/undo` — reverse the last committed build as a unit.
+    UndoBuild,
+    /// `/focus [bigger|smaller]` — report or adjust the placement focus tier.
+    Focus(Option<FocusAdjust>),
+    /// `/build enableVoice` / `/build disableVoice` — voice live mode.
+    BuildVoice(bool),
+    /// `/anim <ground-up|physics|random|instant>` — how builds reveal.
+    Anim(AnimProfile),
+    /// `/model` — list local models; `/model <name>` — load one. The name
+    /// keeps its case (paths are case-sensitive) and may be partial.
+    Model(Option<String>),
+    /// `/keys` — print the keybindings into the chat log.
+    Keys,
+    /// `/cancel` — drop a model request in flight.
+    Cancel,
+    /// `/repair` — ask the model to fix only the lines it got wrong.
+    Repair,
+    /// `/hive` — what the background builder is doing and how fast.
+    Hive,
+    /// `/branch [name]` — list branches, or start one here.
+    Branch(Option<String>),
+    /// `/switch name` — move HEAD.
+    Switch(String),
+    /// `/merge name` — three-way merge into HEAD.
+    Merge(String),
+    /// `/like name [words]` — a spec from the latent space of the tree.
+    Like(String),
+    /// `/review` — one review round on the pending plan.
+    Review,
+    /// `/rounds [n]` — how many review rounds a build runs.
+    Rounds(Option<usize>),
+    /// Build the same request several ways and offer the results, so a
+    /// build is a choice rather than an answer.
+    Takes(usize, String),
+    /// Keep one of the takes that were offered.
+    Pick(usize),
+    /// `/refine [rung|all]` — small detail passes over the last build.
+    /// No argument lists them.
+    Refine(Option<String>),
+    /// `/deferred [drop]` — blocks waiting for their chunk to load.
+    Deferred { drop: bool },
+    /// `/land` — list claims here; `/land info <id>`; `/land add <id> <player>`.
+    /// Player names and workset ids keep their case.
+    Land(LandOp),
+    /// `/shot <frame|orbit|reveal|fly> [id]` — camera presentation of a
+    /// build: the hero framing, an orbit, a pull-back reveal, or a
+    /// fly-through along its paths.
+    Shot { kind: String, id: Option<String> },
+    /// `/world <verb> [args]` — drive the engine's own systems:
+    /// hotter, colder, wetter, drier, flood, freeze.
+    World { verb: String, arg: Option<String> },
+    /// `/provider` — show the current one; `/provider <spec>` — switch.
+    /// Specs: `fixture`, `script`, `ollama[:host[:model]]`,
+    /// `openai[:host]`. Case preserved: a model name is data.
+    Provider(Option<String>),
     /// `/gamemode <survival|creative|adventure|spectator>`.
     Gamemode(GameMode),
     /// `/recipes` — open the recipe book GUI.
@@ -138,7 +241,29 @@ fn parse_game_mode(arg: &str) -> Option<GameMode> {
 /// matched case-insensitively, and anything unrecognised yields
 /// [`Command::Unknown`] rather than panicking.
 pub fn parse(line: &str) -> Command {
-    let mut tokens = line.trim().split_whitespace();
+    // `/build` is the one verb whose argument is prose: keep it verbatim,
+    // including case and internal spacing, before the tokenizer runs.
+    let trimmed = line.trim();
+    // The verb is case-insensitive: the box's display face is capitals,
+    // and a player reading /BUILD on screen may type it that way.
+    let lower_head: String = trimmed.chars().take(6).collect::<String>().to_ascii_lowercase();
+    if lower_head == "/build" {
+        let rest = &trimmed[6..];
+        if rest.is_empty() {
+            return Command::Unknown;
+        }
+        if rest.starts_with(char::is_whitespace) {
+            let text = rest.trim();
+            // the two control words are not prose
+            match text.to_ascii_lowercase().as_str() {
+                "" => return Command::Unknown,
+                "enablevoice" => return Command::BuildVoice(true),
+                "disablevoice" => return Command::BuildVoice(false),
+                _ => return Command::Build(text.to_string()),
+            }
+        }
+    }
+    let mut tokens = trimmed.split_whitespace();
     let verb = match tokens.next() {
         Some(v) => v.to_ascii_lowercase(),
         None => return Command::Unknown,
@@ -150,6 +275,103 @@ pub fn parse(line: &str) -> Command {
             [kind] => match parse_find_kind(kind) {
                 Some(k) => Command::Find(k),
                 None => Command::Unknown,
+            },
+            _ => Command::Unknown,
+        },
+        "/plan" => if args.is_empty() { Command::ShowPlan } else { Command::Unknown },
+        "/commit" => if args.is_empty() { Command::CommitPlan } else { Command::Unknown },
+        "/undo" => if args.is_empty() { Command::UndoBuild } else { Command::Unknown },
+        "/focus" => match args.as_slice() {
+            [] => Command::Focus(None),
+            [a] => match a.to_ascii_lowercase().as_str() {
+                "bigger" | "expand" | "up" => Command::Focus(Some(FocusAdjust::Bigger)),
+                "smaller" | "shrink" | "down" => Command::Focus(Some(FocusAdjust::Smaller)),
+                _ => Command::Unknown,
+            },
+            _ => Command::Unknown,
+        },
+        "/keys" => if args.is_empty() { Command::Keys } else { Command::Unknown },
+        "/cancel" => if args.is_empty() { Command::Cancel } else { Command::Unknown },
+        "/repair" => if args.is_empty() { Command::Repair } else { Command::Unknown },
+        "/hive" => if args.is_empty() { Command::Hive } else { Command::Unknown },
+        "/branch" => match args.as_slice() {
+            [] => Command::Branch(None),
+            n => Command::Branch(Some(n.join(" "))),
+        },
+        "/switch" => match args.as_slice() { [] => Command::Unknown, n => Command::Switch(n.join(" ")) },
+        "/merge" => match args.as_slice() { [] => Command::Unknown, n => Command::Merge(n.join(" ")) },
+        "/like" => match args.as_slice() { [] => Command::Unknown, n => Command::Like(n.join(" ")) },
+        // BUILD IT SEVERAL WAYS AND CHOOSE. `/takes 3 a lighthouse`
+        // runs the same request with different leans; `/pick 2` keeps
+        // one. A build is a choice rather than an answer.
+        "/takes" => match args.as_slice() {
+            [] => Command::Unknown,
+            [n, tail @ ..] if n.parse::<usize>().is_ok() && !tail.is_empty() =>
+                Command::Takes(n.parse::<usize>().unwrap().clamp(2, 4), tail.join(" ")),
+            other => Command::Takes(3, other.join(" ")),
+        },
+        "/pick" => match args.as_slice() {
+            [n] => match n.parse::<usize>() {
+                Ok(v) if (1..=4).contains(&v) => Command::Pick(v),
+                _ => Command::Unknown,
+            },
+            _ => Command::Unknown,
+        },
+        "/review" => if args.is_empty() { Command::Review } else { Command::Unknown },
+        "/rounds" => match args.as_slice() {
+            [] => Command::Rounds(None),
+            [n] => match n.parse::<usize>() { Ok(v) if v <= 200 => Command::Rounds(Some(v)), _ => Command::Unknown },
+            _ => Command::Unknown,
+        },
+        "/refine" => match args.as_slice() {
+            [] => Command::Refine(None),
+            [r] => Command::Refine(Some(r.to_ascii_lowercase())),
+            _ => Command::Unknown,
+        },
+        "/deferred" => match args.as_slice() {
+            [] => Command::Deferred { drop: false },
+            [d] if d.eq_ignore_ascii_case("drop") => Command::Deferred { drop: true },
+            _ => Command::Unknown,
+        },
+        "/land" => match args.as_slice() {
+            [] => Command::Land(LandOp::Here),
+            [sub, rest @ ..] => match (sub.to_ascii_lowercase().as_str(), rest) {
+                ("info", [id]) => Command::Land(LandOp::Info((*id).to_string())),
+                ("add", [id, player]) => Command::Land(LandOp::Add {
+                    id: (*id).to_string(), player: (*player).to_string() }),
+                // A name may have spaces: `/land claim the big hall`.
+                ("claim", n) if !n.is_empty() => Command::Land(LandOp::Claim(n.join(" "))),
+                _ => Command::Unknown,
+            },
+        },
+        "/shot" => match args.as_slice() {
+            [k] => Command::Shot { kind: k.to_ascii_lowercase(), id: None },
+            [k, id] => Command::Shot { kind: k.to_ascii_lowercase(), id: Some((*id).to_string()) },
+            _ => Command::Unknown,
+        },
+        "/world" => match args.as_slice() {
+            [v] => Command::World { verb: v.to_ascii_lowercase(), arg: None },
+            [v, a] => Command::World { verb: v.to_ascii_lowercase(),
+                                       arg: Some((*a).to_string()) },
+            _ => Command::Unknown,
+        },
+        "/provider" => match args.as_slice() {
+            [] => Command::Provider(None),
+            [spec] => Command::Provider(Some((*spec).to_string())),
+            _ => Command::Unknown,
+        },
+        "/model" => match args.as_slice() {
+            [] => Command::Model(None),
+            [name] => Command::Model(Some((*name).to_string())),
+            _ => Command::Unknown,
+        },
+        "/anim" => match args.as_slice() {
+            [p] => match p.to_ascii_lowercase().as_str() {
+                "ground-up" | "groundup" | "ground" => Command::Anim(AnimProfile::GroundUp),
+                "physics" | "fall" => Command::Anim(AnimProfile::Physics),
+                "random" | "shuffle" => Command::Anim(AnimProfile::Random),
+                "instant" | "now" => Command::Anim(AnimProfile::Instant),
+                _ => Command::Unknown,
             },
             _ => Command::Unknown,
         },
@@ -248,7 +470,9 @@ impl Command {
     /// Whether dispatching this command should open an in-game GUI rather than
     /// run headless. The bin uses this to route `/recipes`/`/help` to a panel.
     pub fn opens_gui(&self) -> bool {
-        matches!(self, Command::Recipes | Command::Help)
+        matches!(self, Command::Recipes | Command::Help
+                     | Command::Build(_) | Command::ShowPlan | Command::Model(_)
+                     | Command::Land(_))
     }
 
     /// Render the command back to its canonical `/verb args` string. Returns
@@ -262,9 +486,53 @@ impl Command {
             Command::SetTime(t) => Some(format!("/settime {t}")),
             Command::Whitelist { op, id } => Some(format!("/whitelist {} {}", op.keyword(), id)),
             Command::Give { item, count } => Some(format!("/give {item} {count}")),
+            Command::Build(text) => Some(format!("/build {text}")),
+            Command::ShowPlan => Some("/plan".to_string()),
+            Command::CommitPlan => Some("/commit".to_string()),
+            Command::UndoBuild => Some("/undo".to_string()),
+            Command::Focus(None) => Some("/focus".to_string()),
+            Command::Focus(Some(FocusAdjust::Bigger)) => Some("/focus bigger".to_string()),
+            Command::Focus(Some(FocusAdjust::Smaller)) => Some("/focus smaller".to_string()),
+            Command::BuildVoice(true) => Some("/build enableVoice".to_string()),
+            Command::BuildVoice(false) => Some("/build disableVoice".to_string()),
+            Command::Anim(p) => Some(format!("/anim {}", p.keyword())),
+            Command::Keys => Some("/keys".to_string()),
+            Command::Cancel => Some("/cancel".to_string()),
+            Command::Repair => Some("/repair".to_string()),
+            Command::Hive => Some("/hive".to_string()),
+            Command::Branch(None) => Some("/branch".to_string()),
+            Command::Branch(Some(n)) => Some(format!("/branch {n}")),
+            Command::Switch(n) => Some(format!("/switch {n}")),
+            Command::Merge(n) => Some(format!("/merge {n}")),
+            Command::Like(n) => Some(format!("/like {n}")),
+            Command::Review => Some("/review".to_string()),
+            Command::Rounds(None) => Some("/rounds".to_string()),
+            Command::Rounds(Some(n)) => Some(format!("/rounds {n}")),
+            Command::Refine(None) => Some("/refine".to_string()),
+            Command::Refine(Some(r)) => Some(format!("/refine {r}")),
+            Command::Deferred { drop: false } => Some("/deferred".to_string()),
+            Command::Deferred { drop: true } => Some("/deferred drop".to_string()),
+            Command::Land(LandOp::Here) => Some("/land".to_string()),
+            Command::Land(LandOp::Info(id)) => Some(format!("/land info {id}")),
+            Command::Land(LandOp::Add { id, player }) => Some(format!("/land add {id} {player}")),
+            Command::Land(LandOp::Claim(n)) => Some(format!("/land claim {n}")),
+            Command::Shot { kind, id: None } => Some(format!("/shot {kind}")),
+            Command::Shot { kind, id: Some(i) } => Some(format!("/shot {kind} {i}")),
+            Command::World { verb, arg: None } => Some(format!("/world {verb}")),
+            Command::World { verb, arg: Some(a) } => Some(format!("/world {verb} {a}")),
+            Command::Provider(None) => Some("/provider".to_string()),
+            Command::Provider(Some(s)) => Some(format!("/provider {s}")),
+            Command::Model(None) => Some("/model".to_string()),
+            Command::Model(Some(n)) => Some(format!("/model {n}")),
             Command::Gamemode(m) => Some(format!("/gamemode {}", m.keyword())),
             Command::Recipes => Some("/recipes".to_string()),
             Command::Help => Some("/help".to_string()),
+            // The canonical form must RE-PARSE EQUAL, which is what
+            // the round-trip property test pins down: `/takes 3 a
+            // watchtower` parses back to the same count and request, so
+            // the count is always rendered even when it was defaulted.
+            Command::Takes(n, request) => Some(format!("/takes {n} {request}")),
+            Command::Pick(n) => Some(format!("/pick {n}")),
             Command::Unknown => None,
         }
     }
@@ -427,5 +695,186 @@ mod tests {
             let b = parse(&line);
             assert_eq!(a, b);
         }
+    }
+
+    #[test]
+    fn build_keeps_prose_verbatim() {
+        // case and spacing inside the request must survive: it is
+        // prose for a model, not a keyword for the tokenizer
+        let c = parse("/build a Small stone tower  with a dome");
+        assert_eq!(c, Command::Build("a Small stone tower  with a dome".to_string()));
+        assert!(c.opens_gui(), "a build request opens the plan preview");
+        assert_eq!(parse("/build"), Command::Unknown, "empty request is not a build");
+        assert_eq!(parse("/buildx"), Command::Unknown, "prefix must be a whole verb");
+    }
+
+    #[test]
+    fn plan_lifecycle_verbs_parse_and_round_trip() {
+        for (line, want) in [
+            ("/plan", Command::ShowPlan),
+            ("/commit", Command::CommitPlan),
+            ("/undo", Command::UndoBuild),
+            ("/focus", Command::Focus(None)),
+            ("/focus bigger", Command::Focus(Some(FocusAdjust::Bigger))),
+            ("/focus SMALLER", Command::Focus(Some(FocusAdjust::Smaller))),
+        ] {
+            let c = parse(line);
+            assert_eq!(c, want, "{line}");
+            let s = c.to_command_string().expect("canonical form");
+            assert_eq!(parse(&s), c, "round trip of {s}");
+        }
+        assert_eq!(parse("/focus sideways"), Command::Unknown);
+        assert_eq!(parse("/commit now"), Command::Unknown, "extra args are not tolerated");
+    }
+
+    #[test]
+    fn build_round_trips_through_its_canonical_string() {
+        let c = Command::Build("three oak trees by the pond".into());
+        let s = c.to_command_string().unwrap();
+        assert_eq!(parse(&s), c);
+    }
+
+    #[test]
+    fn voice_toggle_and_anim_parse_and_round_trip() {
+        assert_eq!(parse("/build enableVoice"), Command::BuildVoice(true));
+        assert_eq!(parse("/build ENABLEVOICE"), Command::BuildVoice(true));
+        assert_eq!(parse("/build disableVoice"), Command::BuildVoice(false));
+        // and a request that merely CONTAINS the word is still prose
+        assert_eq!(parse("/build enableVoice on a hill"),
+                   Command::Build("enableVoice on a hill".to_string()));
+        for (line, want) in [
+            ("/anim physics", Command::Anim(AnimProfile::Physics)),
+            ("/anim GROUND-UP", Command::Anim(AnimProfile::GroundUp)),
+            ("/anim random", Command::Anim(AnimProfile::Random)),
+            ("/anim instant", Command::Anim(AnimProfile::Instant)),
+        ] {
+            let c = parse(line);
+            assert_eq!(c, want, "{line}");
+            assert_eq!(parse(&c.to_command_string().unwrap()), c, "round trip {line}");
+        }
+        assert_eq!(parse("/anim"), Command::Unknown);
+        assert_eq!(parse("/anim sideways"), Command::Unknown);
+        for c in [Command::BuildVoice(true), Command::BuildVoice(false)] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c);
+        }
+    }
+
+    #[test]
+    fn model_verb_lists_or_loads_and_preserves_case() {
+        assert_eq!(parse("/model"), Command::Model(None));
+        // paths are case-sensitive: the name must not be lower-cased
+        assert_eq!(parse("/model Qwen2.5-7B"), Command::Model(Some("Qwen2.5-7B".to_string())));
+        assert_eq!(parse("/model a b"), Command::Unknown, "one name only");
+        for c in [Command::Model(None), Command::Model(Some("qwen".into()))] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c, "round trip");
+        }
+        assert!(Command::Model(None).opens_gui(), "the model list is a panel");
+    }
+
+    #[test]
+    fn provider_verb_parses_and_round_trips() {
+        assert_eq!(parse("/provider"), Command::Provider(None));
+        // a model name is data: case must survive
+        assert_eq!(parse("/provider ollama:127.0.0.1:11434:Qwen2.5-Coder"),
+                   Command::Provider(Some("ollama:127.0.0.1:11434:Qwen2.5-Coder".to_string())));
+        assert_eq!(parse("/provider a b"), Command::Unknown, "one spec only");
+        for c in [Command::Provider(None), Command::Provider(Some("fixture".into()))] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c);
+        }
+    }
+
+    #[test]
+    fn land_verbs_parse_and_keep_their_case() {
+        // Workset ids and player names are identifiers, not keywords.
+        assert_eq!(parse("/land"), Command::Land(LandOp::Here));
+        assert_eq!(parse("/land info w3"), Command::Land(LandOp::Info("w3".into())));
+        assert_eq!(parse("/land add w3 KesslerD"),
+                   Command::Land(LandOp::Add { id: "w3".into(), player: "KesslerD".into() }));
+        // a claim name may have spaces
+        assert_eq!(parse("/land claim the Big Hall"),
+                   Command::Land(LandOp::Claim("the Big Hall".into())));
+        assert_eq!(parse("/land add w3"), Command::Unknown, "add needs both");
+        assert_eq!(parse("/land wat"), Command::Unknown);
+        for c in [Command::Land(LandOp::Here),
+                  Command::Land(LandOp::Info("w1".into())),
+                  Command::Land(LandOp::Add { id: "w1".into(), player: "Ann".into() }),
+                  Command::Land(LandOp::Claim("big hall".into()))] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c, "round trip");
+        }
+    }
+
+    #[test]
+    fn world_verbs_parse_and_round_trip() {
+        assert_eq!(parse("/world hotter"),
+                   Command::World { verb: "hotter".into(), arg: None });
+        assert_eq!(parse("/world flood 68"),
+                   Command::World { verb: "flood".into(), arg: Some("68".into()) });
+        assert_eq!(parse("/world HOTTER"),
+                   Command::World { verb: "hotter".into(), arg: None }, "verb lower-cased");
+        assert_eq!(parse("/world"), Command::Unknown);
+        for c in [Command::World { verb: "freeze".into(), arg: None },
+                  Command::World { verb: "flood".into(), arg: Some("70".into()) }] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c);
+        }
+    }
+
+    #[test]
+    fn shot_verbs_parse_and_round_trip() {
+        assert_eq!(parse("/shot orbit"), Command::Shot { kind: "orbit".into(), id: None });
+        assert_eq!(parse("/shot reveal w3"),
+                   Command::Shot { kind: "reveal".into(), id: Some("w3".into()) });
+        assert_eq!(parse("/shot"), Command::Unknown);
+        for c in [Command::Shot { kind: "frame".into(), id: None },
+                  Command::Shot { kind: "fly".into(), id: Some("w2".into()) }] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c);
+        }
+    }
+
+    #[test]
+    fn repair_and_deferred_parse_and_round_trip() {
+        assert_eq!(parse("/repair"), Command::Repair);
+        assert_eq!(parse("/deferred"), Command::Deferred { drop: false });
+        assert_eq!(parse("/deferred DROP"), Command::Deferred { drop: true });
+        assert_eq!(parse("/deferred keep"), Command::Unknown);
+        for c in [Command::Repair, Command::Deferred { drop: true }] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c);
+        }
+    }
+
+    #[test]
+    fn refine_parses_and_round_trips() {
+        assert_eq!(parse("/refine"), Command::Refine(None));
+        assert_eq!(parse("/refine trim"), Command::Refine(Some("trim".into())));
+        assert_eq!(parse("/refine ALL"), Command::Refine(Some("all".into())));
+        assert_eq!(parse("/refine a b"), Command::Unknown);
+        for c in [Command::Refine(None), Command::Refine(Some("vary".into()))] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c);
+        }
+    }
+
+    #[test]
+    fn tree_verbs_parse_and_round_trip() {
+        assert_eq!(parse("/branch"), Command::Branch(None));
+        assert_eq!(parse("/branch friend's mill"), Command::Branch(Some("friend's mill".into())));
+        assert_eq!(parse("/switch main"), Command::Switch("main".into()));
+        assert_eq!(parse("/merge mill"), Command::Merge("mill".into()));
+        assert_eq!(parse("/like the mill but taller"), Command::Like("the mill but taller".into()));
+        assert_eq!(parse("/switch"), Command::Unknown);
+        for c in [Command::Branch(Some("x y".into())), Command::Switch("m".into()), Command::Merge("b".into()),
+                  Command::Like("the mill".into())] {
+            assert_eq!(parse(&c.to_command_string().unwrap()), c);
+        }
+    }
+
+    #[test]
+    fn the_verb_is_case_insensitive() {
+        // Bare words stay Unknown HERE: this parser serves the whole
+        // game's chat. The paintbrush's own box maps them to a build.
+        assert_eq!(parse("a tower"), Command::Unknown);
+        assert_eq!(parse("/BUILD a tower"), Command::Build("a tower".into()));
+        assert_eq!(parse("/Build a tower"), Command::Build("a tower".into()));
+        assert_eq!(parse("/COMMIT"), Command::CommitPlan);
+        assert_eq!(parse("/build"), Command::Unknown, "a bare verb is still unknown");
+        assert_eq!(parse("/frobnicate"), Command::Unknown);
     }
 }

@@ -65,6 +65,66 @@ pub trait Backend: Send + Sync {
     /// Generate at most `max_tokens` continuing `prompt`.
     fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, String>;
 
+    /// Generate a chat turn: the backend applies the model's own
+    /// template around `system` and `user`, keeps the system half as a
+    /// cacheable prefix, and stops at the end of the assistant's turn.
+    /// The default is raw concatenation -- what a base model wants and
+    /// what every backend did before templates existed here.
+    fn generate_chat(&self, system: &str, user: &str, max_tokens: usize) -> Result<String, String> {
+        self.generate_prefixed(&format!("{system}\n\n"), user, max_tokens)
+    }
+
+    /// `generate_chat` with a cancel check between steps and a sink
+    /// that receives the whole text so far as it grows. The default
+    /// cannot stream: it generates, sinks once, and honours cancel only
+    /// after the fact. A backend that drives its own decode loop should
+    /// override it, because a reply nobody will read is GPU time taken
+    /// from the renderer for nothing.
+    fn generate_chat_streaming(&self, system: &str, user: &str, max_tokens: usize,
+                               cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str))
+        -> Result<String, String> {
+        let out = self.generate_chat(system, user, max_tokens)?;
+        sink(out.split_whitespace().count(), &out);
+        if cancel() { return Err("cancelled".into()); }
+        Ok(out)
+    }
+
+    /// A CONVERSATION: prior (user, assistant) exchanges before the
+    /// current user turn. A backend with a KV cache keeps checkpoints
+    /// along the chain and prefills only what is new, so round five
+    /// of a review pays for round five, not for the whole transcript.
+    /// The default folds the history into the system text and streams
+    /// with validation -- correct, just unpaced by the cache.
+    fn generate_chat_chain(&self, system: &str, prior: &[(String, String)], user: &str, max_tokens: usize,
+                           cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str),
+                           line_ok: &dyn Fn(&str) -> bool) -> Result<(String, usize), String> {
+        let mut sys = system.to_string();
+        for (u, a) in prior { sys.push_str(&format!("\n\nUser: {u}\nAssistant: {a}")); }
+        self.generate_chat_lines(&sys, user, max_tokens, cancel, sink, line_ok)
+    }
+
+    /// `generate_chat_streaming` with a per-line validator: a backend
+    /// that drives its own decode loop rejects and resamples lines the
+    /// validator refuses, so a small model writing a line language
+    /// cannot emit a line that does not parse. The default streams
+    /// without validating -- a remote server cannot take a line back.
+    /// Returns (text, lines retried).
+    fn generate_chat_lines(&self, system: &str, user: &str, max_tokens: usize,
+                           cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str),
+                           _line_ok: &dyn Fn(&str) -> bool) -> Result<(String, usize), String> {
+        self.generate_chat_streaming(system, user, max_tokens, cancel, sink).map(|t| (t, 0))
+    }
+
+    /// Generate with a STABLE PREFIX the backend may keep prefilled
+    /// across calls. A chat sends the same system prompt every turn;
+    /// a backend that can hold its KV pays that prefill once. The
+    /// default concatenates and calls `generate`, so a backend that
+    /// cannot is unaffected and never wrong -- only slower.
+    fn generate_prefixed(&self, prefix: &str, suffix: &str, max_tokens: usize)
+        -> Result<String, String> {
+        self.generate(&format!("{prefix}{suffix}"), max_tokens)
+    }
+
     /// Generate, delivering text AS IT ARRIVES.
     ///
     /// `on_piece` returns false to stop — a cancelled completion, a
@@ -102,6 +162,11 @@ pub trait Backend: Send + Sync {
 /// see and change what the editor asks for.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineConfig {
+    /// The process's GPU governor, if the host has one, and this
+    /// engine's tier on it. With `None` the engine submits unpaced,
+    /// which is right for a CLI and wrong for a game.
+    pub governor: Option<crate::governor::Handle>,
+    pub tier: crate::governor::Tier,
     /// Path to the GGUF. Loaded once, at [`LocalEngine::load`].
     pub model_path: String,
     /// Tokens to generate per completion.
@@ -135,6 +200,8 @@ impl Default for EngineConfig {
             repeat_penalty: 1.15,
             repeat_last_n: 64,
             instruction: "Continue the code exactly from where it stops. Output only the continuation, no prose, no backticks.".into(),
+            governor: None,
+            tier: crate::governor::Tier::Interactive,
         }
     }
 }
@@ -368,12 +435,39 @@ impl Provider for EngineProvider {
 // wants the trait and the prompt shaping) does not build wgpu. The default
 // is OFF for exactly the reason aperture-complete has no dependencies at
 // all: the fast loop stays fast.
+/// GPU sharing between engines and the renderer: frame-granted slots.
+/// Pure, so it is present with or without the gpu feature.
+pub mod governor;
+/// Chat templates: an instruct model's own turn markers, detected from
+/// the GGUF. Pure.
+pub mod chat_template;
+
 #[cfg(feature = "gpu")]
 mod gpu {
     use super::{Backend, EngineConfig};
     use gpu_kernels::tokenizer::Tokenizer;
     use gpu_kernels::{gguf, Gpu};
     use std::sync::Arc;
+
+    /// A prefilled prefix the GPU backend keeps between turns, as a
+    /// CHAIN of checkpoints: (hash of the text up to here, tokens up
+    /// to here). A new request walks its own segments against the
+    /// checkpoints, keeps the longest run that matches, and prefills
+    /// from there. A conversation that grows by one exchange per turn
+    /// re-uses everything before the new exchange; one that diverges
+    /// at turn two rewinds to turn one -- the cache writes at explicit
+    /// positions, so a rewind is a number.
+    struct PrefixKv {
+        checkpoints: Vec<(u64, usize)>,
+        cap: usize,
+        cache: gpu_kernels::KvCache,
+    }
+
+    fn fnv(s: &str, seed: u64) -> u64 {
+        let mut h = seed ^ 0xcbf2_9ce4_8422_2325;
+        for b in s.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100_0000_01b3); }
+        h
+    }
 
     pub struct GpuBackend {
         gpu: Arc<Gpu>,
@@ -382,6 +476,21 @@ mod gpu {
         eos: Option<u32>,
         adapter: String,
         sampler: gpu_kernels::SamplerParams,
+        /// The last prefix prefilled, kept so the next turn with the
+        /// same one pays only for its suffix.
+        prefix: std::sync::Mutex<Option<PrefixKv>>,
+        /// Pacing against the renderer. Acquired before every decode
+        /// step -- the one seam between submissions that is ours.
+        governor: Option<crate::governor::Handle>,
+        tier: crate::governor::Tier,
+        /// The model's chat family, from its GGUF template.
+        family: crate::chat_template::Family,
+        /// Every token that ends the assistant's turn: the GGUF's eos
+        /// AND the family's end-of-turn AND the tokenizer's control
+        /// stops. Llama 3 declares `<|end_of_text|>` and ends turns
+        /// with `<|eot_id|>`; stopping only on the former ran on into
+        /// a fabricated next turn.
+        stops: Vec<u32>,
     }
 
     impl GpuBackend {
@@ -429,16 +538,33 @@ mod gpu {
             let g = gguf::parse(bytes).map_err(|e| format!("parse gguf: {e}"))?;
             let tok = Arc::new(Tokenizer::from_gguf(&g).map_err(|e| format!("tokenizer: {e}"))?);
             let gpu = Arc::new(Gpu::new());
-            let model = Arc::new(
-                gpu.load_gguf_quantized_parts_static(&[bytes])
-                    .map_err(|e| format!("load model: {e}"))?,
-            );
+            // Pace the weight upload against the host's frames when a
+            // governor is present: every tensor waits for a slot. The
+            // load was the last unpaced thing in the game's pipeline --
+            // several seconds of solid uploads no frame could get in
+            // front of. Cleared after, so a CLI load later in the same
+            // process is unpaced.
+            if let Some(g) = &cfg.governor {
+                let (g2, tier) = (g.clone(), cfg.tier);
+                gpu_kernels::set_load_pacer(Some(Arc::new(move || { g2.acquire(tier); })));
+            }
+            let loaded = gpu.load_gguf_quantized_parts_static(&[bytes])
+                .map_err(|e| format!("load model: {e}"));
+            gpu_kernels::set_load_pacer(None);
+            let model = Arc::new(loaded?);
             gpu.warm(&model);
             // Same eos resolution as logscope-serve: the GGUF's own id,
             // falling back to the llama3 end-of-turn token.
             let eos = g
                 .get_u32("tokenizer.ggml.eos_token_id")
                 .or_else(|| tok.special_id("<|eot_id|>"));
+            let family = crate::chat_template::Family::detect(g.get_str("tokenizer.chat_template"));
+            let mut stops: Vec<u32> = tok.control_stop_ids();
+            if let Some(e) = eos { stops.push(e); }
+            if let Some(t) = family.end_of_turn() {
+                if let Some(id) = tok.special_id(t) { stops.push(id); }
+            }
+            stops.sort_unstable(); stops.dedup();
             let adapter = gpu.adapter_name.clone();
             let sampler = gpu_kernels::SamplerParams {
                 temperature: cfg.temperature,
@@ -448,19 +574,59 @@ mod gpu {
                 repeat_last_n: cfg.repeat_last_n,
                 min_p: 0.0,
             };
-            Ok(GpuBackend { gpu, model, tok, eos, adapter, sampler })
+            Ok(GpuBackend { gpu, model, tok, eos, adapter, sampler, prefix: std::sync::Mutex::new(None),
+                            governor: cfg.governor.clone(), tier: cfg.tier, family, stops })
         }
     }
 
     impl Backend for GpuBackend {
         fn describe(&self) -> String {
-            format!("in-process wgpu ({})", self.adapter)
+            format!("in-process wgpu ({}), {} template", self.adapter, self.family.name())
+        }
+
+        fn generate_chat(&self, system: &str, user: &str, max_tokens: usize) -> Result<String, String> {
+            let out = self.generate_prefixed(&self.family.wrap_system(system),
+                                             &self.family.wrap_user(user), max_tokens)?;
+            Ok(self.family.clean(&out))
+        }
+
+        fn generate_chat_streaming(&self, system: &str, user: &str, max_tokens: usize,
+                                   cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str))
+            -> Result<String, String> {
+            let (out, _) = self.generate_prefixed_core(&self.family.wrap_system(system),
+                                                       &self.family.wrap_user(user), max_tokens,
+                                                       cancel, sink, None)?;
+            if cancel() { return Err("cancelled".into()); }
+            Ok(self.family.clean(&out))
+        }
+
+        fn generate_chat_lines(&self, system: &str, user: &str, max_tokens: usize,
+                               cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str),
+                               line_ok: &dyn Fn(&str) -> bool) -> Result<(String, usize), String> {
+            self.generate_chat_chain(system, &[], user, max_tokens, cancel, sink, line_ok)
+        }
+
+        fn generate_chat_chain(&self, system: &str, prior: &[(String, String)], user: &str, max_tokens: usize,
+                               cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str),
+                               line_ok: &dyn Fn(&str) -> bool) -> Result<(String, usize), String> {
+            // the segments: system, then each prior exchange as one
+            // segment (user + assistant), then the current user turn
+            let mut segments: Vec<String> = vec![self.family.wrap_system(system)];
+            for (u, a) in prior {
+                segments.push(format!("{}{}", self.family.wrap_user_prior(u), self.family.wrap_assistant(a)));
+            }
+            let (out, retried) = self.generate_chain_core(&segments, &self.family.wrap_user(user), max_tokens,
+                                                          cancel, sink, Some(line_ok))?;
+            if cancel() { return Err("cancelled".into()); }
+            Ok((self.family.clean(&out), retried))
         }
 
         fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String, String> {
             let ids = self.tok.encode(prompt);
             let mut rng = 0xC0FFEE_u64;
             let mut out: Vec<u32> = Vec::new();
+            if let Some(g) = &self.governor { g.acquire(self.tier); }
+            let (gov, tier) = (self.governor.clone(), self.tier);
             self.gpu.generate_kv_stream(
                 &self.model,
                 &ids,
@@ -470,12 +636,139 @@ mod gpu {
                 &mut rng,
                 &|| false,
                 |t| {
+                    if self.stops.contains(&t) { return false; }
                     out.push(t);
+                    if let Some(g) = &gov { g.acquire(tier); }
                     true
                 },
             );
             Ok(self.tok.decode(&out))
         }
+
+        fn generate_prefixed(&self, prefix: &str, suffix: &str, max_tokens: usize)
+            -> Result<String, String> {
+            self.generate_prefixed_core(prefix, suffix, max_tokens, &|| false, &mut |_, _| {}, None)
+                .map(|(t, _)| t)
+        }
+    }
+
+    impl GpuBackend {
+        /// The one decode loop. Cancel is checked before every prefill
+        /// chunk and decode step; the sink gets the accumulated text
+        /// every few tokens, decoded from the start so a byte-level
+        /// token split across a UTF-8 sequence never surfaces as a
+        /// torn character.
+        fn generate_prefixed_core(&self, prefix: &str, suffix: &str, max_tokens: usize,
+                                  cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str),
+                                  line_ok: Option<&dyn Fn(&str) -> bool>)
+            -> Result<(String, usize), String> {
+            self.generate_chain_core(&[prefix.to_string()], suffix, max_tokens, cancel, sink, line_ok)
+        }
+
+        /// The one decode loop, over a CHAIN of prefix segments. The
+        /// cache keeps checkpoints per segment; the longest run of
+        /// segments that matches is kept and the rest prefilled from
+        /// its end. Cancel is checked before every prefill chunk and
+        /// decode step; the sink gets the accumulated text every few
+        /// tokens.
+        fn generate_chain_core(&self, segments: &[String], suffix: &str, max_tokens: usize,
+                               cancel: &dyn Fn() -> bool, sink: &mut dyn FnMut(usize, &str),
+                               line_ok: Option<&dyn Fn(&str) -> bool>)
+            -> Result<(String, usize), String> {
+            // cumulative hashes: checkpoint k is the text of segments 0..=k
+            let mut cum: Vec<u64> = Vec::with_capacity(segments.len());
+            let mut h = 0u64;
+            for seg in segments { h = fnv(seg, h); cum.push(h); }
+            let suffix_ids = self.tok.encode(suffix);
+            let need = suffix_ids.len() + max_tokens;
+            let mut slot = self.prefix.lock().map_err(|_| "prefix cache poisoned".to_string())?;
+            // how many leading checkpoints match what is stored
+            let matched = match &*slot {
+                Some(p) => p.checkpoints.iter().zip(&cum).take_while(|((sh, _), ch)| sh == *ch).count(),
+                None => 0,
+            };
+            let total_ids: usize = segments.iter().map(|s| self.tok.encode(s).len()).sum();
+            let fits = slot.as_ref().map(|p| total_ids + need <= p.cap).unwrap_or(false);
+            if matched == 0 || !fits {
+                // nothing reusable (or too small): a fresh cache sized for the whole chain
+                let cap = total_ids + need.max(512) + 2048;
+                let cache = self.gpu.new_cache_for(&self.model, cap);
+                *slot = Some(PrefixKv { checkpoints: Vec::new(), cap, cache });
+            }
+            let p = slot.as_mut().expect("just filled");
+            let matched = if matched == 0 || !fits { 0 } else { matched };
+            // rewind to the last matching checkpoint and prefill the rest
+            p.checkpoints.truncate(matched);
+            let mut pos = p.checkpoints.last().map(|(_, n)| *n).unwrap_or(0);
+            let chunk = if self.governor.is_some() { 48 } else { 256 };
+            for (k, seg) in segments.iter().enumerate().skip(matched) {
+                let ids = self.tok.encode(seg);
+                for piece in ids.chunks(chunk) {
+                    if cancel() { return Err("cancelled".into()); }
+                    if let Some(g) = &self.governor { g.acquire(self.tier); }
+                    let _ = self.gpu.prefill_chunked_from(&self.model, &p.cache, piece, pos, chunk);
+                    pos += piece.len();
+                }
+                p.checkpoints.push((cum[k], pos));
+            }
+            let p = &*p;
+            let mut rng = 0xC0FFEE_u64;
+            let mut out: Vec<u32> = Vec::new();
+            // The prefill is one submission; the governor gates each
+            // decode step after it. A frame with no headroom stalls the
+            // model, never the other way round.
+            if let Some(g) = &self.governor { g.acquire(self.tier); }
+            let (gov, tier) = (self.governor.clone(), self.tier);
+            let stops = &self.stops;
+            let chunk = if self.governor.is_some() { 48 } else { 256 };
+            let pace_gov = self.governor.clone();
+            let pace = move || { if let Some(g) = &pace_gov { g.acquire(tier); } };
+            let tok = &self.tok;
+            let retried = match line_ok {
+                None => {
+                    self.gpu.generate_kv_stream_paced(
+                        &self.model, &p.cache, p.checkpoints.last().map(|(_, n)| *n).unwrap_or(0),
+                        &suffix_ids, max_tokens, self.eos,
+                        &self.sampler, &mut rng, cancel, &pace, chunk,
+                        |t| {
+                            if stops.contains(&t) { return false; }
+                            out.push(t);
+                            if out.len() % 4 == 0 { sink(out.len(), &tok.decode(&out)); }
+                            if let Some(g) = &gov { g.acquire(tier); }
+                            true
+                        });
+                    0
+                }
+                Some(ok) => {
+                    // Which tokens end a line: decoded once per id and
+                    // remembered, since the vocabulary is large and a
+                    // reply asks the question thousands of times.
+                    let memo = std::sync::Mutex::new(std::collections::HashMap::<u32, bool>::new());
+                    let is_newline = |t: u32| -> bool {
+                        if stops.contains(&t) { return true; }
+                        let mut m = memo.lock().unwrap_or_else(|e| e.into_inner());
+                        *m.entry(t).or_insert_with(|| tok.decode(&[t]).contains('\n'))
+                    };
+                    let (_, retried) = self.gpu.generate_kv_stream_lines(
+                        &self.model, &p.cache, p.checkpoints.last().map(|(_, n)| *n).unwrap_or(0),
+                        &suffix_ids, max_tokens, self.eos,
+                        &self.sampler, &mut rng, cancel, &pace, chunk, &is_newline, 3,
+                        |line| ok(tok.decode(line).trim()),
+                        |t| {
+                            if stops.contains(&t) { return false; }
+                            out.push(t);
+                            if out.len() % 4 == 0 { sink(out.len(), &tok.decode(&out)); }
+                            if let Some(g) = &gov { g.acquire(tier); }
+                            true
+                        });
+                    retried
+                }
+            };
+            let text = tok.decode(&out);
+            sink(out.len(), &text);
+            Ok((text, retried))
+        }
+
     }
 }
 

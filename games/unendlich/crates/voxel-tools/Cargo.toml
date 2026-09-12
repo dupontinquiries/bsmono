@@ -1,0 +1,15 @@
+[package]
+name = "voxel-tools"
+version = "0.1.0"
+edition = "2021"
+
+# No dependencies. Everything here is std, so `cargo run` works on a
+# fresh machine with no network.
+
+[lib]
+name = "voxel_tools"
+path = "src/lib.rs"
+
+[[bin]]
+name = "voxel-demo"
+path = "src/main.rs"

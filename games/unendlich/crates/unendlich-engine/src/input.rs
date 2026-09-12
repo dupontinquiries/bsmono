@@ -202,6 +202,27 @@ impl InputCache {
         self.scroll_delta = 0.0;
     }
 
+    /// Drop every held key and button.
+    ///
+    /// Needed when a modal text field takes the keyboard: the player may
+    /// be holding W when the chat opens, and GLFW will not send a
+    /// Release the field is swallowing — so the character walks forever.
+    /// Clearing the held state at the moment focus is taken is the fix;
+    /// a key genuinely still down produces a fresh Press on the next
+    /// repeat or on the next real press after focus returns.
+    pub fn release_all(&mut self) {
+        self.key_states.clear();
+        self.prev_key_states.clear();
+        self.just_pressed_keys.clear();
+        self.late_presses.clear();
+        self.press_counts.clear();
+        self.mouse_button_states.clear();
+        self.prev_mouse_button_states.clear();
+        self.just_pressed_buttons.clear();
+        self.late_buttons.clear();
+        self.scroll_delta = 0.0;
+    }
+
     pub fn is_key_pressed(&self, key: Key) -> bool {
         matches!(self.key_states.get(&key), Some(Action::Press) | Some(Action::Repeat))
     }
@@ -325,5 +346,22 @@ mod touch_integration_tests {
         assert!(c.move_axes()[0] > 0.9);
         c.handle_event(&t(1, 200.0, 500.0, TouchPhase::End));
         assert_eq!(c.move_axes(), [0.0, 0.0], "the player kept walking after the thumb lifted");
+    }
+
+    #[test]
+    fn release_all_drops_held_keys_so_focus_change_cannot_walk_forever() {
+        // The bug: the player holds W, the chat takes the keyboard, GLFW
+        // never delivers the Release (the field swallowed it), and the
+        // character walks until you press and release W again.
+        let mut c = InputCache::default();
+        c.handle_event(&InputEvent::Key { code: Key::W, action: Action::Press });
+        assert!(c.is_key_pressed(Key::W));
+        c.release_all();
+        assert!(!c.is_key_pressed(Key::W), "held key must be dropped");
+        assert!(!c.is_key_just_pressed(Key::W), "and its press-edge too");
+        assert_eq!(c.presses_this_frame(Key::W), 0);
+        // and a genuine press afterwards still registers
+        c.handle_event(&InputEvent::Key { code: Key::W, action: Action::Press });
+        assert!(c.is_key_pressed(Key::W));
     }
 }

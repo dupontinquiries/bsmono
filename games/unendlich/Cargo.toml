@@ -8,6 +8,7 @@ members = [
     "crates/unendlich-analyze",
     "crates/unendlich-dash",
     "crates/unendlich-ui",
+    "crates/voxel-tools",
 ]
 
 # Shared profile config — applied to all member crates.

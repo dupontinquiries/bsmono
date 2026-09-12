@@ -517,6 +517,36 @@ pub struct WorldRenderer {
     /// r185: true while an egui text field has focus — the bin must not
     /// run letter hotkeys (C/B/I/P...) on typed characters.
     pub ui_wants_keyboard: bool,
+    /// Build chat: open state, input buffer and log. The buffer lives
+    /// here rather than in an egui TextEdit because keys are routed
+    /// through `voxel_tools::chatbox::ChatBox` (history, Tab cycling,
+    /// hotkeys) — two owners of one string is how a caret ends up in
+    /// the wrong place.
+    pub chat_open: bool,
+    pub chat_buffer: String,
+    pub chat_log: Vec<String>,
+    /// Set by the panel when the player clicks "build it" / "cancel";
+    /// drained by the bin, which owns the session.
+    pub chat_commit_clicked: bool,
+    pub chat_cancel_clicked: bool,
+    /// Card + completions for the verb being typed, filled by the bin.
+    pub chat_card: Option<(String, String, String)>,
+    pub chat_matches: Vec<(String, String)>,
+    pub chat_focus_hint: Option<String>,
+    pub chat_pending_blocks: Option<usize>,
+    pub chat_model: Option<String>,
+    /// Seconds since each buffer char was typed, for the letter pop-in.
+    pub chat_char_ages: Vec<f32>,
+    /// Where the pending plan will land: (name, world position, blocks).
+    /// Drawn as a marker so the player may look anywhere while a model
+    /// works and still know where /commit builds.
+    pub chat_waypoint: Option<(String, [f32; 3], usize)>,
+    /// Live progress of a model turn, or None when idle.
+    pub chat_status: Option<String>,
+    /// A long build in progress: the marker's status line and the
+    /// shape so far as coarse world boxes, drawn as a translucent
+    /// ghost before anything is committed.
+    pub chat_blob: Option<(String, Vec<((i32, i32, i32), (i32, i32, i32))>)>,
     /// Clicks that collapsed into one frame (press+release same frame);
     /// forwarded to egui as discrete press/release pairs so fast / low-fps
     /// clicks still register on toggles.
@@ -1662,6 +1692,20 @@ impl WorldRenderer {
             #[cfg(feature = "ui-overlay")]
             ui_pointer_down_prev: false,
             ui_text_input: String::new(),
+            chat_open: false,
+            chat_buffer: String::new(),
+            chat_log: Vec::new(),
+            chat_commit_clicked: false,
+            chat_cancel_clicked: false,
+            chat_card: None,
+            chat_matches: Vec::new(),
+            chat_focus_hint: None,
+            chat_pending_blocks: None,
+            chat_model: None,
+            chat_char_ages: Vec::new(),
+            chat_waypoint: None,
+            chat_status: None,
+            chat_blob: None,
             ui_backspace: false,
             ui_enter: false,
             ui_wants_keyboard: false,
@@ -3857,6 +3901,47 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                 // Until the blur PostFx texture exists this is a translucent
                 // wash; the blur pass upgrades it via frosted_blur(tex, tint).
                 unendlich_ui::set_surface(c, unendlich_ui::Surface::frosted());
+                // ── Build chat (bottom bar) ──
+                // Anchored bottom-centre like a game chat, above the
+                // hotbar. Drawn before the menu so the pause menu wins
+                // the z-order if both are somehow open.
+                if self.chat_open {
+                    let card = self.chat_card.as_ref()
+                        .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()));
+                    let matches: Vec<(&str, &str)> = self.chat_matches.iter()
+                        .map(|(a, b)| (a.as_str(), b.as_str())).collect();
+                    let st = crate::app::chat_panel::ChatPanelState {
+                        buffer: &self.chat_buffer,
+                        log: &self.chat_log,
+                        card,
+                        matches: &matches,
+                        focus_hint: self.chat_focus_hint.as_deref(),
+                        pending_blocks: self.chat_pending_blocks,
+                        model: self.chat_model.as_deref(),
+                        char_ages: &self.chat_char_ages,
+                        now: c.input(|i| i.time),
+                        status: self.chat_status.as_deref(),
+                    };
+                    let gt = glass_t(c, "unendlich_chat", true);
+                    let mut out = crate::app::chat_panel::ChatPanelOut::default();
+                    egui::Window::new("unendlich_chat")
+                        .frame(glass_at(gt))
+                        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -48.0))
+                        .collapsible(false)
+                        .resizable(false)
+                        .title_bar(false)
+                        .show(c, |ui| {
+                            unendlich_ui::set_theme(ui.ctx(), unendlich_ui::Theme::DARK);
+                            out = crate::app::chat_panel::chat_panel_body(ui, &st);
+                        });
+                    if out.commit { self.chat_commit_clicked = true; }
+                    if out.cancel { self.chat_cancel_clicked = true; }
+                    if let Some(p) = out.pick { self.chat_buffer = p; }
+                    // While the chat is open the bin must not run letter
+                    // hotkeys on typed characters.
+                    self.ui_wants_keyboard = true;
+                }
+
                 // ── Title / pause menu (unendlich-fullgame) ──
                 if menu_open {
                     {
@@ -4819,6 +4904,104 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                 DEBUG.request_quit.store(true, Relaxed);
                             }
                         });
+                }
+                // ── pending-build waypoint ──
+                //
+                // A pending plan used to require the player's gaze to
+                // stay on the spot until /commit. It is a waypoint now:
+                // a diamond at the anchor with the distance, or an arrow
+                // at the screen edge pointing toward it when it is out of
+                // view, so the player can wander while the model works.
+                if let Some((name, wp, blocks)) = &self.chat_waypoint {
+                    let vp = view.view_projection(aspect);
+                    let p = vp * glm::vec4(wp[0], wp[1], wp[2], 1.0);
+                    let screen = c.screen_rect();
+                    let eye = view.position;
+                    let dist = ((wp[0] - eye.x).powi(2) + (wp[1] - eye.y).powi(2)
+                                + (wp[2] - eye.z).powi(2)).sqrt();
+                    let label = match &self.chat_blob {
+                        Some((status, _)) => format!("{name} -- {status}"),
+                        None => format!("{name} -- {blocks} blocks, {dist:.0} m -- /commit"),
+                    };
+                    let col = egui::Color32::from_rgb(255, 200, 90);
+                    // In front of the camera and inside the frustum: draw at
+                    // the projected point. The Y flip is already in the
+                    // projection, so ndc y maps straight to screen y.
+                    let (pos, in_view) = if p.w > 0.0 {
+                        let (nx, ny) = (p.x / p.w, p.y / p.w);
+                        let sp = egui::pos2((nx + 1.0) * 0.5 * screen.width(),
+                                            (ny + 1.0) * 0.5 * screen.height());
+                        (sp, nx.abs() <= 1.0 && ny.abs() <= 1.0)
+                    } else {
+                        // behind: point the opposite way
+                        (egui::pos2(screen.width() - (p.x / p.w + 1.0) * 0.5 * screen.width(),
+                                    screen.height() * 0.5), false)
+                    };
+                    let pos = if in_view { pos } else {
+                        // clamp to the edge with a margin, keeping direction
+                        let centre = screen.center();
+                        let d = pos - centre;
+                        let sx = (screen.width() * 0.5 - 40.0) / d.x.abs().max(1e-3);
+                        let sy = (screen.height() * 0.5 - 40.0) / d.y.abs().max(1e-3);
+                        centre + d * sx.min(sy).min(1.0)
+                    };
+                    egui::Area::new(egui::Id::new("unendlich_waypoint"))
+                        .fixed_pos(pos - egui::vec2(8.0, 8.0))
+                        .interactable(false)
+                        .show(c, |ui| {
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            let cx = rect.center();
+                            let pts = vec![cx + egui::vec2(0.0, -8.0), cx + egui::vec2(8.0, 0.0),
+                                           cx + egui::vec2(0.0, 8.0), cx + egui::vec2(-8.0, 0.0)];
+                            if in_view {
+                                ui.painter().add(egui::Shape::convex_polygon(
+                                    pts, col, egui::Stroke::new(1.5, egui::Color32::BLACK)));
+                            } else {
+                                // an arrow: the diamond stretched toward the target
+                                let dir = (pos - screen.center()).normalized();
+                                let tip = cx + dir * 12.0;
+                                let side = egui::vec2(-dir.y, dir.x) * 6.0;
+                                ui.painter().add(egui::Shape::convex_polygon(
+                                    vec![tip, cx - dir * 4.0 + side, cx - dir * 4.0 - side],
+                                    col, egui::Stroke::new(1.5, egui::Color32::BLACK)));
+                            }
+                            ui.label(egui::RichText::new(label).small().color(col)
+                                     .background_color(egui::Color32::from_black_alpha(160)));
+                        });
+                }
+                // ── the build's ghost: coarse boxes of what is planned
+                // but not yet committed, so a fifteen-minute build is
+                // visible taking shape rather than being fifteen
+                // minutes of nothing.
+                if let Some((_, boxes)) = &self.chat_blob {
+                    if !boxes.is_empty() {
+                        let vp = view.view_projection(aspect);
+                        let screen = c.screen_rect();
+                        let painter = c.layer_painter(egui::LayerId::new(
+                            egui::Order::Background, egui::Id::new("unendlich_blob")));
+                        let ghost = egui::Color32::from_rgba_unmultiplied(255, 200, 90, 40);
+                        for (lo, hi) in boxes.iter().take(64) {
+                            // the box's eight corners, projected; drawn as
+                            // its screen-space bounding rect, which is
+                            // cheap and reads as mass at a distance
+                            let mut min = egui::pos2(f32::MAX, f32::MAX);
+                            let mut max = egui::pos2(f32::MIN, f32::MIN);
+                            let mut behind = false;
+                            for &(x, y, z) in &[(lo.0, lo.1, lo.2), (hi.0 + 1, lo.1, lo.2), (lo.0, hi.1 + 1, lo.2),
+                                                (hi.0 + 1, hi.1 + 1, lo.2), (lo.0, lo.1, hi.2 + 1), (hi.0 + 1, lo.1, hi.2 + 1),
+                                                (lo.0, hi.1 + 1, hi.2 + 1), (hi.0 + 1, hi.1 + 1, hi.2 + 1)] {
+                                let p = vp * glm::vec4(x as f32, y as f32, z as f32, 1.0);
+                                if p.w <= 0.0 { behind = true; break; }
+                                let sp = egui::pos2((p.x / p.w + 1.0) * 0.5 * screen.width(),
+                                                    (p.y / p.w + 1.0) * 0.5 * screen.height());
+                                min = egui::pos2(min.x.min(sp.x), min.y.min(sp.y));
+                                max = egui::pos2(max.x.max(sp.x), max.y.max(sp.y));
+                            }
+                            if behind { continue; }
+                            let rect = egui::Rect::from_min_max(min, max);
+                            if rect.intersects(screen) { painter.rect_filled(rect, 1.0, ghost); }
+                        }
+                    }
                 }
                 // ── HUD (top-left) ──
                 egui::Area::new(egui::Id::new("unendlich_hud"))

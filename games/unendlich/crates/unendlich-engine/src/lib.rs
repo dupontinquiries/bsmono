@@ -158,6 +158,11 @@ pub mod wind;
 pub mod water_field;
 pub mod util; // r193: helper libraries (llm_helper_library_guide)
 pub mod world;
+/// Binding for the voxel-tools LLM paintbrush: VoxelWorld over
+/// ChunkManager, plus the staged-write flush path.
+pub mod voxel_bind;
+/// The LLM paintbrush: chat box, session, model registry, dispatch.
+pub mod voxel_chat;
 pub mod sim;        // [applied onto 88b5542] simulation subsystem
 #[cfg(feature = "audio")]
 pub mod audio; // spatial music playback (rodio); pure mixer lives in sim::spatial_audio

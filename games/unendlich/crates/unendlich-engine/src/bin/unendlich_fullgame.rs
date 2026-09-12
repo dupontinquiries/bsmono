@@ -1115,7 +1115,9 @@ fn main() {
     // alongside the chunk edits (the chunk manager takes ownership of `world_root` next).
     let mut flora_root = world_root.clone();
     let mut chunk_manager = ChunkManager::new(generator, num_workers)
-        .with_storage(world_root)
+        // Cloned: the paintbrush loads and saves its state beside the
+        // flora store from this path for the life of the game.
+        .with_storage(world_root.clone())
         .with_fields(field_registry)
         .with_ticks(tick_registry);
     log::info!("ChunkManager ready ({} workers, render distance {})", num_workers, runtime_render_distance());
@@ -1868,6 +1870,104 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // `p` again (or Esc) to exit. `ui_mouse_down` is the live left-button
     // state we forward to the renderer; tracked from MouseButton events.
     let mut p_pressed = false;
+    // ── Build chat (LLM paintbrush) ──────────────────────────────
+    // T opens it; Enter submits; Esc closes. Held across frames.
+    let mut paintbrush = unendlich_engine::voxel_chat::Paintbrush::new(
+        unendlich_engine::constants::CHUNK_SIZE);
+    let mut chat_toggle = false;
+    // Authoritative chat-focus flag, updated the instant a key opens or
+    // closes the box -- BEFORE the rest of that same event batch is
+    // dispatched. `renderer.chat_open` is written later in the frame and
+    // is therefore one frame stale; at 150 ms frames that stale window
+    // is wide enough to leak a whole burst of typing into movement,
+    // which is why the drops correlated with lag.
+    let mut chat_focus = false;
+    // Commands submitted from the late drain, run on the NEXT frame's
+    // chat block. Typing is applied immediately (below); a submitted
+    // command can afford one frame, typing cannot.
+    let mut late_cmds: Vec<unendlich_engine::sim::command_parse::Command> = Vec::new();
+    // Route one GLFW event to the chat box, if it is the chat's. Returns
+    // true if consumed. Used by BOTH event drains: the main one and the
+    // late one. The late drain used to withhold keys from movement while
+    // the chat had focus and then simply DROP them -- every keystroke
+    // landing in that window vanished, which is the "still misses keys"
+    // report. One function, two call sites, no second copy to forget.
+    fn route_chat_key(event: &glfw::WindowEvent, chat_focus: &mut bool,
+                      chat_keys: &mut Vec<voxel_tools::chatbox::Key>,
+                      chat_toggle: &mut bool, esc_pressed: &mut bool,
+                      window: &glfw::Window) -> bool {
+        use glfw::{Action, Key, WindowEvent};
+        use voxel_tools::chatbox::Key as CK;
+        // Repeat counts as a press: holding Backspace must keep deleting,
+        // and holding an arrow must keep moving through history.
+        let pressed = |a: &Action| matches!(a, Action::Press | Action::Repeat);
+        match event {
+            WindowEvent::Char(ch) if *chat_focus => { chat_keys.push(CK::Char(*ch)); true }
+            WindowEvent::Key(Key::Escape, _, a, _) if pressed(a) => {
+                if *chat_focus { chat_keys.push(CK::Escape); *chat_focus = false; true }
+                else { *esc_pressed = true; false }
+            }
+            WindowEvent::Key(Key::Enter, _, a, m) | WindowEvent::Key(Key::KpEnter, _, a, m)
+                if pressed(a) =>
+            {
+                if *chat_focus {
+                    chat_keys.push(if m.contains(glfw::Modifiers::Control) { CK::CtrlEnter }
+                                   else { CK::Enter });
+                    if !m.contains(glfw::Modifiers::Control) { *chat_focus = false; }
+                } else {
+                    *chat_toggle = true;
+                    *chat_focus = true;
+                }
+                true
+            }
+            WindowEvent::Key(Key::Tab, _, a, m) if *chat_focus && pressed(a) => {
+                chat_keys.push(if m.contains(glfw::Modifiers::Shift) { CK::ShiftTab } else { CK::Tab });
+                true
+            }
+            WindowEvent::Key(Key::Backspace, _, a, _) if *chat_focus && pressed(a) => {
+                chat_keys.push(CK::Backspace); true
+            }
+            WindowEvent::Key(Key::Up, _, a, _) if *chat_focus && pressed(a) => {
+                chat_keys.push(CK::Up); true
+            }
+            WindowEvent::Key(Key::Down, _, a, _) if *chat_focus && pressed(a) => {
+                chat_keys.push(CK::Down); true
+            }
+            WindowEvent::Key(Key::V, _, a, m) if pressed(a) && m.contains(glfw::Modifiers::Control) => {
+                let text = window.get_clipboard_string().unwrap_or_default();
+                if !text.is_empty() { chat_keys.push(CK::Paste(text)); }
+                true
+            }
+            WindowEvent::Key(Key::C, _, a, m) if pressed(a) && m.contains(glfw::Modifiers::Control) => {
+                chat_keys.push(if m.contains(glfw::Modifiers::Shift) { CK::CopyLog } else { CK::Copy });
+                true
+            }
+            WindowEvent::Key(Key::U, _, a, m)
+                if *chat_focus && pressed(a) && m.contains(glfw::Modifiers::Control) =>
+            {
+                chat_keys.push(CK::ClearLine); true
+            }
+            WindowEvent::Key(Key::Z, _, a, m) if pressed(a) && m.contains(glfw::Modifiers::Control) => {
+                chat_keys.push(CK::CtrlZ); true
+            }
+            // Any other key while the chat has focus is swallowed here so
+            // it cannot fall through to a hotkey arm.
+            WindowEvent::Key(_, _, a, _) if *chat_focus && pressed(a) => true,
+            _ => false,
+        }
+    }
+    // A presentation shot in progress: the poses, which segment, and how
+    // far through it. Any key or mouse button returns the camera.
+    let mut shot: Option<(Vec<voxel_tools::camera::Pose>, usize, f32)> = None;
+    // A QUEUE, not one slot. Several key events arrive in a single frame
+    // whenever the frame is long — which is exactly when you are typing
+    // during a chunk load — and a single Option kept only the last one.
+    // Characters vanished under load and it looked like dropped input
+    // because it was.
+    let mut chat_keys: Vec<voxel_tools::chatbox::Key> = Vec::new();
+    // Provider: an executable reading <system>\0<user> on stdin. Located
+    // by `voxel_chat::find_provider`, which is anchored at compile time
+    // rather than to the working directory.
     let mut ui_mouse_down = false;
 
     // Rollback input buffer — captures one InputFrame per simulation
@@ -2747,6 +2847,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     }
 
     let mut last_frame = Instant::now();
+    // The previous frame's total time, UNCLAMPED, for the hive's queen.
+    // `dt` is capped at 100 ms so a hitch cannot jerk animation; the
+    // queen needs the opposite -- a 1.3 s stall must read as 1.3 s so she
+    // hibernates through it rather than piling generation onto it. Set
+    // at the Update phase, read by the hive tick early in the next frame.
+    let mut hive_last_frame_ms: f32 = 16.0;
     let mut frame_count = 0u64;
     // Reusable buffer for mesh_pool.drain_up_to_into — avoids per-frame Vec alloc.
     let mut drained_buf: Vec<unendlich_engine::render::meshing_pool::MeshResult> = Vec::new();
@@ -3209,6 +3315,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // r514: load any persisted crop/flora growth state for this world (sparse — only planted
     // cells). It round-trips to flora.json under the world root; absent → empty store.
     session.flora = unendlich_engine::world::flora_store::FloraStore::load(&flora_root);
+    // Claims, templates and the world tree live beside the flora store
+    // and load with it.
+    paintbrush.load_state(&flora_root);
     if !session.flora.is_empty() {
         log::info!("[farm] loaded {} persisted crop(s) from disk", session.flora.len());
     }
@@ -3701,21 +3810,46 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 WindowEvent::CursorPos(_, _) => cursor_events += 1,
                 _ => {}
             }
+            // While the chat owns the keyboard the game must not see key
+            // events at all. This call is BEFORE the match below, so
+            // guarding only the match arms left WASD reaching the player:
+            // you walked while typing. Mouse look and cursor motion still
+            // pass through, which is what you want — you can aim at where
+            // a build should go while describing it.
+            let chat_owns_keys = chat_focus;
             if let Some(ev) = unendlich_engine::input_codes::input_event_from_glfw(&event) {
-                input.handle_event(&ev);
+                // Both key variants: an UnknownKey is still a keystroke
+                // the chat is consuming, and letting it through would
+                // bump press counters behind a focused text field.
+                let is_key = matches!(ev,
+                    unendlich_engine::input_codes::InputEvent::Key { .. }
+                    | unendlich_engine::input_codes::InputEvent::UnknownKey { .. });
+                if !(chat_owns_keys && is_key) {
+                    input.handle_event(&ev);
+                }
             }
             match event {
+                // Chat keys first, through the ONE routing function shared
+                // with the late drain. If it consumed the event, nothing
+                // else sees it.
+                ref ev if route_chat_key(ev, &mut chat_focus, &mut chat_keys,
+                                         &mut chat_toggle, &mut esc_pressed, &window) => {}
                 WindowEvent::Char(ch) => {
-                    // r181: text input for egui fields (name/seed boxes).
+                    // Not the chat's: text for egui fields (name/seed boxes).
                     ui_text_frame.push(ch);
                 }
                 WindowEvent::Scroll(dx, dy) => {
                     scroll_accum += dy as f32; // r122: consumed below per frame
                     scroll_accum_x += dx as f32; // r318: horizontal (trackpad)
                 }
-                WindowEvent::Key(Key::Escape, _, Action::Press, _) => {
-                    esc_pressed = true;
-                }
+                // Catch-all key arm. It must be LAST and it must be guarded:
+                // every key the chat does not explicitly claim lands here,
+                // so without the guard `p` toggled the inventory while
+                // typing. Layout-resolved hotkeys make this worse, not
+                // better -- on Dvorak the LABEL is what matches, so typing
+                // the letter p in a sentence is indistinguishable from the
+                // hotkey unless focus is checked first.
+                WindowEvent::Key(_, _, Action::Press, _) if chat_focus => {}
                 WindowEvent::Key(key, scancode, Action::Press, _) => {
                     // #2 (Dvorak): toggle panel mode on the key LABELED 'p' in the
                     // active keyboard layout — not GLFW's physical `Key::P`, which
@@ -4203,6 +4337,223 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 renderer.craft_menu_open = false;
             }
         }
+        // ── Build chat: keys -> commands -> world ────────────────
+        {
+            use unendlich_engine::voxel_chat::Pending;
+            use voxel_tools::chatbox::Key as CK;
+
+            // Tick the box's clock BEFORE any key is drained this frame,
+            // so a letter typed now is born now. Ticking after the drain
+            // stamps it with last frame's time, and at 150 ms frames the
+            // letter is already "old" and skips its own pop-in.
+            paintbrush.chatbox.tick(glfw.get_time());
+
+            if chat_toggle {
+                chat_toggle = false;
+                // Feed Enter to the box so it opens through the same
+                // state machine the tests drive.
+                paintbrush.key(CK::Enter);
+                chat_focus = paintbrush.captures_input();
+                renderer.chat_open = chat_focus;
+                if renderer.chat_open {
+                    // Drop keys held at the moment focus was taken. GLFW
+                    // will not deliver the Release for a key the chat is
+                    // swallowing, so a W held when the box opens would
+                    // walk the player forever.
+                    input.release_all();
+                }
+            }
+
+            let mut submitted: Option<unendlich_engine::sim::command_parse::Command> = None;
+            // A command submitted after last frame's late drain.
+            if let Some(c) = late_cmds.pop() { submitted = Some(c); late_cmds.clear(); }
+            if !chat_keys.is_empty() {
+                // Keep the box's log copy fresh so Ctrl+Shift+C has
+                // something to hand back.
+                paintbrush.chatbox.log_snapshot = renderer.chat_log.clone();
+                for k in chat_keys.drain(..) {
+                    match paintbrush.key_full(k) {
+                        unendlich_engine::voxel_chat::KeyOut::Command(c) => {
+                            // Enter submitted mid-queue: run this command
+                            // and let the rest of the queue type into the
+                            // now-empty line, rather than discarding it.
+                            submitted = Some(c);
+                        }
+                        unendlich_engine::voxel_chat::KeyOut::Copy(text) => {
+                            window.set_clipboard_string(&text);
+                            paintbrush.say(format!("copied {} chars", text.len()));
+                        }
+                        unendlich_engine::voxel_chat::KeyOut::None => {}
+                    }
+                }
+                chat_focus = paintbrush.captures_input();
+                renderer.chat_open = chat_focus;
+            }
+
+            if renderer.chat_open || submitted.is_some() {
+                // Gaze: same octree raycast the block-placement path uses,
+                // so "where I'm looking" means exactly what it means for
+                // breaking a block.
+                let fwd = local_player.forward();
+                // Eye position: `local_player.view.position`. (`pos` is a
+                // local at the block-placement site further down, not a
+                // binding that reaches here.)
+                let eye = local_player.view.position;
+                let hit = chunk_manager
+                    .raycast_octree([eye.x, eye.y, eye.z], [fwd.x, fwd.y, fwd.z], 128.0,
+                                    |b| b.is_solid())
+                    .map(|h| ([h.world_cell.0, h.world_cell.1, h.world_cell.2],
+                              [h.normal.0, h.normal.1, h.normal.2],
+                              h.t));
+                let gaze = unendlich_engine::voxel_chat::Paintbrush::gaze_from(
+                    [eye.x, eye.y, eye.z], [fwd.x, fwd.y, fwd.z], hit);
+
+                if let Some(cmd) = submitted {
+                    match paintbrush.dispatch(&chunk_manager, &gaze, cmd) {
+                        Pending::Model(prose) => {
+                            // `/build debug ...` skips the model entirely and
+                            // uses the fixture provider: proves the whole
+                            // path with no weights loaded.
+                            // `/build debug ...` always uses the fixture;
+                            // anything else honours $UNENDLICH_BUILD_PROVIDER
+                            // and falls back to the fixture so a first run
+                            // never silently does nothing.
+                            // Off the frame thread. `start_turn` returns at
+                            // once; `poll_turn` below applies the reply when
+                            // the worker has one, so a 22-second generation no
+                            // longer freezes the window.
+                            paintbrush.start_turn(
+                                &chunk_manager, &gaze, None, &prose,
+                                Some((eye.x as i32, eye.y as i32, eye.z as i32)));
+                        }
+                        Pending::LoadModel(path) => {
+                            // No in-process loader: the provider script owns
+                            // the weights. Record the choice so `$VOXEL_MODEL`
+                            // reaches the child, and report it.
+                            std::env::set_var("VOXEL_MODEL", &path);
+                            paintbrush.finish_load(16384);
+                        }
+                        Pending::Camera(poses) => {
+                            if poses.len() >= 2 { shot = Some((poses, 1, 0.0)); }
+                            else if let Some(p) = poses.first() {
+                                // a single frame: cut there and hold
+                                shot = Some((vec![*p, *p], 1, 0.0));
+                            }
+                        }
+                        Pending::VoiceGrammar(_) | Pending::VoiceOff | Pending::None => {}
+                    }
+                }
+
+                // Clicks from the panel.
+                if std::mem::take(&mut renderer.chat_commit_clicked) {
+                    paintbrush.dispatch(&chunk_manager, &gaze,
+                        unendlich_engine::sim::command_parse::Command::CommitPlan);
+                }
+                if std::mem::take(&mut renderer.chat_cancel_clicked) {
+                    paintbrush.say("cancelled");
+                }
+
+                // Push panel state to the renderer.
+                let f = paintbrush.session.focus(&gaze);
+                renderer.chat_focus_hint = Some(format!(
+                    "{} @ {:?}", f.tier.name(), f.anchor));
+            }
+
+            // `typing` (used by the C/B/I/P letter-hotkey guards further
+            // down) reads this. The renderer sets it while DRAWING, which
+            // is a frame late; set it from the live focus flag so a
+            // hotkey cannot fire on the first frame of typing.
+            if chat_focus { renderer.ui_wants_keyboard = true; }
+            // Feed the world's own climate to the paintbrush, so a build
+            // in a snowy biome defaults to snow rather than to the same
+            // grey stone everywhere. `WorldModel::temperature` and
+            // `::humidity` are the fields the HUD already prints as
+            // "climate: T=.. H=..".
+            {
+                let m = chunk_manager.model_arc();
+                let p = local_player.view.position;
+                paintbrush.session.climate = (
+                    m.temperature(p.x as f64, p.y as f64, p.z as f64, 0.0) as f32,
+                    m.humidity(p.x as f64, p.y as f64, p.z as f64, 0.0) as f32,
+                );
+                paintbrush.session.sea_level = unendlich_engine::constants::SEA_LEVEL;
+            }
+            // A reply can land on any frame, including with the box shut.
+            paintbrush.poll_turn(&chunk_manager);
+            paintbrush.poll_drone();
+            // Blocks deferred by an earlier flush place themselves once
+            // their chunk streams in.
+            paintbrush.retry_deferred(&chunk_manager);
+            // Plants a build planted become living plants: the bred genome
+            // goes into the flora store and the lifecycle takes over.
+            let planted = paintbrush.drain_plants(&mut session.flora, frame_count);
+            if planted > 0 { log::info!("[paintbrush] {planted} plant(s) handed to the flora store"); }
+            // GPU pacing: the in-instance model may submit only the decode
+            // steps this frame's headroom allows. A late frame stalls
+            // generation, never the other way round.
+            paintbrush.frame_gpu(hive_last_frame_ms);
+            // Held scatter sites build when the player comes near: a
+            // thousand shrines across a continent cost nothing until
+            // someone walks up to one.
+            {
+                let p = local_player.view.position;
+                paintbrush.realise_held(&chunk_manager, [p.x, p.y, p.z]);
+            }
+            // THE QUEEN'S FRAME. Committed changes are applied here, a
+            // chunk at a time, within a budget that adapts to how long
+            // the last frame took. Nearest the player first; what you
+            // can see fills first. A frame already over target gets
+            // nothing, so generation never becomes a stutter.
+            {
+                let p = local_player.view.position;
+                let f = local_player.view.forward();
+                let t = paintbrush.tick_hive(&chunk_manager, [p.x, p.y, p.z], [f.x, f.y, f.z],
+                                             hive_last_frame_ms, glfw.get_time());
+                if t.cells > 0 {
+                    log::debug!("[hive] {} cells, {} blocks, {:.2} ms, {} left",
+                                t.cells, t.blocks, t.spent_ms, t.remaining);
+                }
+            }
+            if let Some(t) = &paintbrush.in_flight {
+                renderer.chat_focus_hint = Some(format!(
+                    "asking {} ... {:.0}s", t.provider, t.elapsed().as_secs_f32()));
+            }
+            renderer.chat_buffer = paintbrush.chatbox.buffer.clone();
+            renderer.chat_char_ages = paintbrush.chatbox.char_ages();
+            renderer.chat_waypoint = paintbrush.waypoint();
+            renderer.chat_status = paintbrush.status_line();
+            renderer.chat_blob = paintbrush.waypoint_progress();
+            // A claim, a capture or a commit marks the state dirty; save
+            // it now, so a crash loses at most the last action.
+            if paintbrush.state_dirty {
+                if let Err(e) = paintbrush.save_state(&flora_root) {
+                    log::warn!("[paintbrush] save failed: {e}");
+                }
+            }
+            match paintbrush.flush_training(&flora_root) {
+                Ok(n) if n > 0 => log::info!("[paintbrush] {n} training line(s) appended"),
+                Err(e) => log::warn!("[paintbrush] training record failed: {e}"),
+                _ => {}
+            }
+            renderer.chat_card = paintbrush.chatbox.current_card()
+                .map(|c| (c.command.to_string(), c.signature.to_string(), c.summary.to_string()));
+            renderer.chat_matches = paintbrush.chatbox.matching_cards().iter()
+                .map(|c| (c.command.to_string(), c.summary.to_string())).collect();
+            renderer.chat_model = match &paintbrush.models.state {
+                voxel_tools::model::LoadState::Loaded { name, .. } => Some(name.clone()),
+                _ => None,
+            };
+            for line in paintbrush.drain_log() { renderer.chat_log.push(line); }
+            // Reveal frames are drained but not yet used to animate: the
+            // remesh already happened inside `set_blocks`, which calls
+            // `replace_edited_chunk` (octree rebuild + dirty stamp) and
+            // bumps edge neighbours, once per chunk rather than once per
+            // block. Progressive reveal means holding the frames and
+            // writing them per tick instead of all at commit — the frames
+            // are here and ordered for exactly that.
+            let (_frames, _fps) = paintbrush.take_reveal();
+        }
+
         if renderer.settings_menu_open && esc_pressed {
             renderer.settings_menu_open = false;
             save_settings(&settings_path, &renderer); // r187 sticky
@@ -4559,6 +4910,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         let now = Instant::now();
         let dt = (now - last_frame).as_secs_f32().min(0.1); // cap dt at 100ms
         let dt_ms = (now - last_frame).as_secs_f64() * 1000.0; // UNCLAMPED — for diagnostics/adaptive-rd
+        hive_last_frame_ms = dt_ms as f32;
         // r738: frame_dt_s drives camera smoothing, gait, and animation. It MUST be
         // clamped like `dt` — otherwise a stalled frame (e.g. a 1.3s hitch) advances
         // every animation by 1.3s, jerking the camera/gait on top of the low FPS.
@@ -12557,7 +12909,62 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // just-pressed set instead of being wiped by end_frame (the
             // "eaten esc / jump / flight" bug).
             if let Some(ev) = unendlich_engine::input_codes::input_event_from_glfw(&event) {
-                input.handle_event_late(&ev);
+                // The late drain had NO chat guard, so every key reached
+                // the movement system through here even while typing.
+                // On Dvorak this is vivid: `.oeu` sit on the physical
+                // E/S/D/F keys, so typing a word walked the player and
+                // space jumped. Withhold key edges while the chat has
+                // focus; mouse and resize still drain as before.
+                let is_key = matches!(ev,
+                    unendlich_engine::input_codes::InputEvent::Key { .. }
+                    | unendlich_engine::input_codes::InputEvent::UnknownKey { .. });
+                if !(chat_focus && is_key) {
+                    input.handle_event_late(&ev);
+                }
+            }
+            // And to the chat, so nothing arriving in this window is lost.
+            route_chat_key(&event, &mut chat_focus, &mut chat_keys,
+                           &mut chat_toggle, &mut esc_pressed, &window);
+        }
+        // Apply late-drained TYPING now, before this frame draws, so the
+        // letter appears on the frame it was pressed rather than the next
+        // one. Submitted commands are parked for the next chat block.
+        if !chat_keys.is_empty() {
+            paintbrush.chatbox.tick(glfw.get_time());
+            for k in chat_keys.drain(..) {
+                match paintbrush.key_full(k) {
+                    unendlich_engine::voxel_chat::KeyOut::Command(c) => late_cmds.push(c),
+                    unendlich_engine::voxel_chat::KeyOut::Copy(text) => {
+                        window.set_clipboard_string(&text);
+                    }
+                    unendlich_engine::voxel_chat::KeyOut::None => {}
+                }
+            }
+            chat_focus = paintbrush.captures_input();
+            renderer.chat_open = chat_focus;
+            renderer.chat_buffer = paintbrush.chatbox.buffer.clone();
+            renderer.chat_char_ages = paintbrush.chatbox.char_ages();
+            renderer.chat_card = paintbrush.chatbox.current_card()
+                .map(|c| (c.command.to_string(), c.signature.to_string(), c.summary.to_string()));
+        }
+        // Presentation shot: ease the camera along the poses. Overrides
+        // the player's view while it runs; the first key or click ends it
+        // and hands the view back where it was left.
+        if let Some((poses, seg, t)) = shot.as_mut() {
+            let dt = frame_dt_s.max(0.0001);
+            let cur = &poses[*seg];
+            *t += dt / cur.seconds.max(0.001);
+            if *t >= 1.0 {
+                *seg += 1; *t = 0.0;
+            }
+            if *seg >= poses.len() || key_events > 0 || mouse_events > 0 {
+                shot = None;
+            } else {
+                let p = voxel_tools::camera::lerp(&poses[*seg - 1], &poses[*seg], *t);
+                local_player.view.position = nalgebra_glm::vec3(p.eye[0], p.eye[1], p.eye[2]);
+                let f = p.forward();
+                local_player.view.yaw = f[2].atan2(f[0]);
+                local_player.view.pitch = f[1].asin();
             }
         }
         if mouse_captured && input.cursor_delta != (0.0, 0.0) {
@@ -14925,7 +15332,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             // first visit ⇒ a clean, freshly-generated world).
                             let _ = session.flora.save(&flora_root);
                             let _ = whitelist.save(&flora_root);
+                            // The paintbrush's claims, templates and world tree are
+                            // bound to a world the same way the flora store is, and
+                            // would otherwise inherit the previous world's claims at
+                            // stale positions -- the r580 bug, for buildings.
+                            paintbrush.state_dirty = true;
+                            let _ = paintbrush.save_state(&flora_root);
+                            let _ = paintbrush.flush_training(&flora_root);
                             flora_root = new_world_dir;
+                            paintbrush = unendlich_engine::voxel_chat::Paintbrush::new(paintbrush.chunk_size)
+                                .inheriting(&paintbrush);
+                            paintbrush.load_state(&flora_root);
                             session.flora =
                                 unendlich_engine::world::flora_store::FloraStore::load(&flora_root);
                             whitelist =
