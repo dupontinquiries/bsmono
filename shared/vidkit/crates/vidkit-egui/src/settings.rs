@@ -66,6 +66,10 @@ impl FillMode {
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Settings {
+    /// Quality as an intent. See `vidkit_core::quality` — this moves the
+    /// selector's ceiling rather than naming a stream.
+    pub quality: vidkit_core::Quality,
+    pub fps_cap: vidkit_core::FpsCap,
     pub fill: FillMode,
     /// In-app rotation in quarter turns, 0..=3. Separate from the device's own
     /// orientation: a phone lying flat has no useful orientation to follow, and
@@ -90,6 +94,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            quality: Default::default(),
+            fps_cap: Default::default(),
             fill: FillMode::Fit,
             rotation: 0,
             hide_after_secs: 3.0,
@@ -161,6 +167,11 @@ impl Settings {
         }
     }
 
+    /// The budget to select against, with the viewer's intent applied.
+    pub fn budget(&self, device: &vidkit_core::caps::PlaybackBudget) -> vidkit_core::caps::PlaybackBudget {
+        vidkit_core::quality::apply(device, self.quality, self.fps_cap)
+    }
+
     pub fn fit(&self) -> Fit {
         self.fill.to_fit()
     }
@@ -169,6 +180,31 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The setting must actually reach the selector, and only ever tighten it.
+    #[test]
+    fn the_quality_setting_lowers_the_budget_it_is_given() {
+        let device = vidkit_core::caps::desktop_full_hw().budget;
+        let auto = Settings::default();
+        assert_eq!(auto.budget(&device), device, "Automatic changed the budget");
+
+        let saver = Settings {
+            quality: vidkit_core::Quality::DataSaver,
+            ..Default::default()
+        };
+        let b = saver.budget(&device);
+        assert!(b.display_width.max(b.display_height) < device.display_width.max(device.display_height));
+    }
+
+    #[test]
+    fn an_fps_cap_reaches_the_budget() {
+        let device = vidkit_core::caps::desktop_full_hw().budget;
+        let s = Settings {
+            fps_cap: vidkit_core::FpsCap::Cap30,
+            ..Default::default()
+        };
+        assert_eq!(s.budget(&device).display_max_hz, 30);
+    }
 
     #[test]
     fn fill_modes_round_trip_through_fit() {
@@ -335,6 +371,26 @@ pub fn show(ctx: &egui::Context, open: &mut bool, s: &mut Settings) -> bool {
             // unreachable at 800px tall.
             let max = (ctx.screen_rect().height() - 120.0).max(200.0);
             egui::ScrollArea::vertical().max_height(max).show(ui, |ui| {
+            ui.label("quality");
+            egui::ComboBox::from_label("stream")
+                .selected_text(s.quality.label())
+                .show_ui(ui, |ui| {
+                    for q in vidkit_core::Quality::ALL {
+                        ui.selectable_value(&mut s.quality, q, q.label())
+                            .on_hover_text(q.hint());
+                    }
+                });
+            ui.small(s.quality.hint());
+            egui::ComboBox::from_label("frame rate")
+                .selected_text(s.fps_cap.label())
+                .show_ui(ui, |ui| {
+                    for f in vidkit_core::FpsCap::ALL {
+                        ui.selectable_value(&mut s.fps_cap, f, f.label());
+                    }
+                });
+            ui.small("a lower frame rate costs less than a lower resolution, and text stays sharp");
+
+            ui.separator();
             ui.label("picture");
             for m in FillMode::ALL {
                 ui.radio_value(&mut s.fill, m, m.label());

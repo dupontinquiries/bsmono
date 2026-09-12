@@ -1027,6 +1027,25 @@ pub fn assumed_caps() -> vidkit_core::caps::DeviceCaps {
     }
 }
 
+/// Why the direct-media branch exists, measured rather than argued.
+///
+/// yt-dlp 2026.08.19 against a local server, median of five runs: `-J` takes
+/// **650 ms**, and `--no-check-formats`, `--flat-playlist` and `--print` are
+/// all within noise of it (648–703 ms). The cost is the Python interpreter
+/// starting, not the JSON, so there is no flag that makes resolution cheap.
+///
+/// Worse, and the reason `--http-chunk-size` is not the answer to "fetch less":
+/// the generic extractor issues a **full GET with no Range header** to probe
+/// the file. Running yt-dlp on a direct media URL therefore downloads the whole
+/// object before we have read a byte ourselves. Our own path does ranged reads
+/// and never does that.
+///
+/// `--http-chunk-size` configures yt-dlp's own downloader, which this player
+/// does not use at all — it resolves, and every byte after that comes through
+/// `HttpByteSource`. So the efficient move is not a chunking flag; it is not
+/// calling yt-dlp when the URL already says what it is, which is what
+/// [`is_direct_media`] decides.
+///
 /// Resolve a page URL with an extractor and open what it points at.
 ///
 /// Generic over the runner so the whole path — resolution, format selection,

@@ -13,6 +13,7 @@ pub mod frame;
 pub mod io;
 pub mod player;
 pub mod queue;
+pub mod quality;
 pub mod traits;
 pub mod wakelock;
 
@@ -25,6 +26,7 @@ pub use codec::{parse_codec_string, Chroma, Codec, Transfer, VideoProfile};
 pub use io::{read_exact_at, ByteSource, MemorySource};
 pub use frame::{ColorInfo, Frame, FrameData, Matrix, PlaneLayout, Range, RecycleToken};
 pub use queue::{FrameQueue, Poll, Pressure};
+pub use quality::{FpsCap, Quality};
 pub use wakelock::{Activity, Inhibitor, Lock, WakeLock};
 pub use traits::{
     Clock, DecodeOutput, Decoder, DecoderFactory, Error, MediaSource, Packet, Presenter, Result,
