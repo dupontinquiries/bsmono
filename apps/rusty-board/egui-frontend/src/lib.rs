@@ -29,6 +29,8 @@ pub mod tray;
 pub mod halfboard;
 /// The reach polygon and its per-row compaction (`single-hand-mode.md` §1).
 pub mod thumbarc;
+/// Measuring the operator's thumb reach: anchor, sweep, confirm.
+pub mod thumbcal;
 /// The two gestures on the top edge: the digit up-arc and the minimize fling.
 pub mod topedge;
 /// Swipe out of the letters and back to type a space (`single-hand-mode.md` §3).
