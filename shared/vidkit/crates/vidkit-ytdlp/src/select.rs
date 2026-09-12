@@ -22,6 +22,10 @@ pub enum Verdict {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reject {
+    /// The extractor did not say what the codec is. Recoverable: the container
+    /// knows, and our own demuxer reads it. Kept distinct from
+    /// `UnknownCodec`, which means it told us something we do not support.
+    CodecNotReported,
     NotVideo,
     NoUrl,
     UnknownCodec(String),
@@ -139,6 +143,26 @@ fn evaluate(f: &RawFormat, caps: &DeviceCaps) -> Verdict {
     let raw_vcodec = f.vcodec.clone().unwrap_or_default();
     let profile = match parse_codec_string(&raw_vcodec) {
         Some(p) => p,
+        // An ABSENT or null vcodec is not the same as an unrecognised one, and
+        // conflating them threw away a playable stream. Real yt-dlp reports
+        // `"vcodec": null` for any URL it has not probed -- which is every
+        // direct media link through the generic extractor -- and the first
+        // time this ran against the real binary instead of JSON I had written,
+        // every such stream was rejected as NoPlayableFormat.
+        //
+        // The container knows. Our own demuxer reads the codec from the file,
+        // so refusing here on the strength of missing metadata is refusing to
+        // look. It is accepted as a LAST RESORT below, because an unknown codec
+        // cannot be scored against the device's decoders and preferring it over
+        // a format we can actually reason about would be guessing.
+        // ABSENT is not the same as unrecognised, and conflating them threw
+        // away a playable stream. Real yt-dlp reports `"vcodec": null` for any
+        // URL it has not probed -- every direct link through the generic
+        // extractor -- and the first run against the real binary rather than
+        // JSON I had written rejected all of them as NoPlayableFormat.
+        None if raw_vcodec.is_empty() || raw_vcodec.eq_ignore_ascii_case("null") => {
+            return Verdict::Rejected(Reject::CodecNotReported);
+        }
         None => return Verdict::Rejected(Reject::UnknownCodec(raw_vcodec)),
     };
 

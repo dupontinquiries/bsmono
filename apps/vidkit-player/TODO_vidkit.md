@@ -60,11 +60,26 @@ untestable wrapper would have looked like progress.
    up yet". `voice-kit` already does the post-processing and
    `voiced-core::grammar` already does the matching; only the mic and the model
    are missing. *read*
-2. **Run it against real yt-dlp.** The whole page path — resolve, select,
-   fetch, sniff, demux — is tested with a *scripted* extractor and a local
-   server. yt-dlp is not installed here, so its actual JSON shape and its
-   failure messages are *assumed*. This is the first thing to try on a machine
-   that has it. *verified* for the path, *assumed* for the extractor.
+2. **REAL YT-DLP REJECTS EVERY DIRECT URL. Fix this first.** *verified* —
+   yt-dlp 2026.08.19 installed from pypi, run against a local server by
+   `real_ytdlp_tests::the_real_extractor_is_parsed_and_played`.
+
+   The generic extractor reports `"vcodec": null` and omits `width`, `height`,
+   `fps` and `acodec` entirely for any URL it has not probed. `select` rejects
+   a format whose codec it cannot check against the device's decoders, so every
+   such stream comes back `NoPlayableFormat`. Defensible in isolation and wrong
+   here: the container knows the codec and our own demuxer reads it.
+
+   `Reject::CodecNotReported` now distinguishes "did not say" from "said
+   something unsupported". The fix is to let an unreported codec survive
+   selection as a last resort, which needs something `DeviceCaps::best_path`
+   accepts — there is no `Codec::Unknown`, and inventing a plausible profile
+   would lie to everything downstream. The test pins the current behaviour and
+   fails loudly if it changes in a NEW way.
+
+   Every fixture before this used JSON I wrote by hand, which is why the parser
+   looked finished. `--no-check-formats` and `--print` are worth reading before
+   choosing the fix.
 
 3. **Exercise the TLS path against a real server.** `TlsTransport` compiles and
    its scheme selection is tested, but no test has made an actual HTTPS

@@ -1233,3 +1233,127 @@ mod page_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod real_ytdlp_tests {
+    use super::*;
+
+    /// Is the real extractor available? These tests skip rather than fail
+    /// without it, the same way the Vulkan tests skip with no ICD — a suite
+    /// that fails on a machine missing an optional tool trains people to
+    /// ignore failures.
+    fn have_ytdlp() -> bool {
+        std::process::Command::new("yt-dlp")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn serve_file(body: Vec<u8>) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..128 {
+                let Ok((mut sock, _)) = listener.accept() else { break };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let head_only = req.starts_with("HEAD");
+                let range = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .and_then(|l| l.split('=').nth(1).map(str::trim).map(str::to_string));
+                let (start, end) = range
+                    .and_then(|r| {
+                        let (a, b) = r.split_once('-')?;
+                        let s: usize = a.parse().ok()?;
+                        let e: usize = b.parse().unwrap_or(body.len() - 1);
+                        Some((s, e))
+                    })
+                    .unwrap_or((0, body.len().saturating_sub(1)));
+                if start >= body.len() {
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 416 Range Not Satisfiable\r\nAccept-Ranges: bytes\r\nContent-Length: 0\r\n\r\n",
+                    );
+                    continue;
+                }
+                let slice = &body[start..=end.min(body.len() - 1)];
+                let partial = slice.len() != body.len();
+                let head = if partial {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Type: video/mp4\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                        start + slice.len() - 1, body.len(), slice.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    )
+                };
+                let _ = sock.write_all(head.as_bytes());
+                if !head_only {
+                    let _ = sock.write_all(slice);
+                }
+            }
+        });
+        port
+    }
+
+    /// The whole path against the REAL extractor.
+    ///
+    /// Everything before this used JSON I wrote, which meant the parser was
+    /// only ever tested against my idea of what yt-dlp emits. It is not the
+    /// same shape: the generic extractor returns a format with no `width`, no
+    /// `height`, no `fps` and no `acodec` at all -- fields my fixtures always
+    /// supplied.
+    #[test]
+    fn the_real_extractor_is_parsed_and_played() {
+        if !have_ytdlp() {
+            eprintln!("SKIP: yt-dlp not installed");
+            return;
+        }
+        let port = serve_file(crate::io::tests_support::sample_mp4());
+        let page = format!("http://127.0.0.1:{port}/clip.mp4");
+
+        let opened = open_page_url(
+            ProcessRunner::default(),
+            &page,
+            vidkit_core::caps::desktop_full_hw(),
+        );
+
+        // KNOWN FAILURE, documented rather than asserted away. Real yt-dlp
+        // reports `"vcodec": null` for a URL it has not probed, and the
+        // selector rejects a format whose codec it cannot check against the
+        // device's decoders. That is defensible in isolation and wrong here:
+        // the container knows the codec and our own demuxer reads it.
+        //
+        // Fixing it properly needs an "unreported" codec that survives
+        // `DeviceCaps::best_path`, which is real surgery. Until then this test
+        // pins the CURRENT behaviour so the fix is visible when it lands, and
+        // names what to expect afterwards. Asserting success here would have
+        // meant deleting the test or faking the input, which is how a known
+        // bug becomes an unknown one.
+        match opened {
+            Ok(o) => {
+                // The fix landed. Tighten this into a real assertion.
+                assert_eq!(o.dimensions, (64, 64), "wrong dimensions: {}", o.label);
+                assert!(o.packets > 0, "no packets: {}", o.label);
+            }
+            Err(e) => {
+                assert!(
+                    e.contains("NoPlayableFormat"),
+                    "real yt-dlp failed in a NEW way, which is worth looking at: {e}"
+                );
+                eprintln!("KNOWN: real yt-dlp reports a null vcodec and the selector rejects it");
+            }
+        }
+    }
+}
