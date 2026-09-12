@@ -125,8 +125,10 @@ pub fn render_index(entries: &[ToolchainEntry]) -> String {
 pub const INSTALL_SH: &str = r#"#!/bin/sh
 # depot toolchain installer. Usage:
 #   sh install.sh [VERSION] [PREFIX]
-# Env: DEPOT (base URL, default derived from how this script was fetched),
-#      COMPONENTS (default "rustc cargo rust-std").
+# Env: DEPOT      base URL (default: the depot this script was fetched from)
+#      COMPONENTS (default "rustc cargo rust-std")
+#      TRIPLE     override the detected host triple — e.g. install rust-std for
+#                 a cross target: COMPONENTS=rust-std TRIPLE=aarch64-unknown-linux-musl
 # Installs into PREFIX (default /usr/local; use $HOME/.local without root).
 set -eu
 DEPOT="${DEPOT:-__DEPOT_URL__}"
@@ -147,7 +149,7 @@ case "$cpu" in
   riscv64) cpu=riscv64gc ;;
   *) echo "unsupported CPU: $cpu" >&2; exit 1 ;;
 esac
-triple="$cpu-$os"
+triple="${TRIPLE:-$cpu-$os}"
 
 fetch() { # url dest
   if command -v curl >/dev/null 2>&1; then curl -fsSL -o "$2" "$1";
@@ -185,8 +187,8 @@ for c in $COMPONENTS; do
 done
 [ "$n" -gt 0 ] || { echo "nothing installed" >&2; exit 1; }
 echo
-"$PREFIX/bin/rustc" --version
-"$PREFIX/bin/cargo" --version
+[ -x "$PREFIX/bin/rustc" ] && "$PREFIX/bin/rustc" --version
+[ -x "$PREFIX/bin/cargo" ] && "$PREFIX/bin/cargo" --version
 echo "OK. Make sure $PREFIX/bin is on PATH."
 "#;
 
