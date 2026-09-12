@@ -95,6 +95,52 @@ pub fn is_supported(arch: &str, variant: u32) -> bool {
 /// runtime surprise, and can be deleted once every entry has been reconciled.
 pub fn declared_supported(arch: &str) -> bool { for_arch(arch).supported }
 
+/// What to tell someone whose architecture is not in the table.
+///
+/// "unknown architecture — use the llama.cpp backend" was the same sentence for two different
+/// situations, and the registry already draws that distinction elsewhere: a `gemma4` entry
+/// exists precisely so the loader can say "recognised, unverified" rather than "unknown",
+/// because *one means send a file and the other means write a kernel*. The unknown case
+/// deserves the same care.
+///
+/// Three answers, and which one you get changes what you would do about it:
+///
+/// * A TRANSFORMER llama.cpp knows and this engine has not got to — the fallback will run it,
+///   and adding it here is a registry entry rather than new kernels. Worth saying, because
+///   someone reading "unknown" reasonably assumes the model is exotic.
+/// * A NON-TRANSFORMER (mamba, rwkv, jamba, t5, bert…). These are not missing entries; they
+///   are different machines. The fallback may still run them; this engine will not, and no
+///   amount of registry work changes that.
+/// * GENUINELY UNRECOGNISED — a typo, a private conversion, or something newer than this
+///   table.
+///
+/// Names, not shapes: this claims only that llama.cpp has an arch by that name, which is
+/// checkable from its source, and says nothing about tensors it has not seen.
+pub fn unknown_note(name: &str) -> &'static str {
+    const NON_TRANSFORMER: &[&str] = &[
+        "mamba", "mamba2", "jamba", "rwkv6", "rwkv7", "t5", "t5encoder", "bert", "nomic-bert",
+        "wavtokenizer-dec", "falcon-h1",
+    ];
+    const KNOWN_TRANSFORMER: &[&str] = &[
+        "phi2", "starcoder", "starcoder2", "olmo", "olmo2", "granite", "granitemoe", "cohere2",
+        "command-r", "exaone", "internlm2", "minicpm", "minicpm3", "nemotron", "falcon",
+        "stablelm", "bitnet", "hunyuan-moe", "ernie4_5", "ernie4_5-moe", "smollm3", "seed_oss",
+        "dots1", "plm", "bailingmoe", "arcee", "openelm", "gptneox", "gpt2", "gptj", "bloom",
+        "baichuan", "xverse", "orion", "dbrx", "mpt", "refact", "codeshell", "plamo", "grok",
+        "deci", "arctic", "chameleon", "jais", "qwen", "qwen2moe", "gemma",
+    ];
+    let n = name.trim().to_ascii_lowercase();
+    if NON_TRANSFORMER.iter().any(|k| *k == n) {
+        return "not a transformer (state-space / encoder family) — this engine will not run it \
+                whatever is added to the registry; the llama.cpp backend may";
+    }
+    if KNOWN_TRANSFORMER.iter().any(|k| *k == n) {
+        return "a transformer llama.cpp knows and this engine has no entry for — running it \
+                needs a registry entry, not new kernels; the llama.cpp backend runs it today";
+    }
+    "unknown architecture — use the llama.cpp backend"
+}
+
 pub fn for_arch(arch: &str) -> ArchConfig {
     match arch {
         "" | "llama" => ArchConfig {
@@ -412,7 +458,7 @@ what flips this flag, never a synthetic",
         _ => ArchConfig {
             arch: Arch::Unknown, prefix: "", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: true, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
-            supported: false, dense_supported: false, note: "unknown architecture — use the llama.cpp backend",
+            supported: false, dense_supported: false, note: unknown_note(arch),
         },
     }
 }
@@ -548,6 +594,47 @@ pub fn qk_norm_tensors(cfg: &ArchConfig, layer: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "unknown architecture" was one sentence for two different situations. The registry
+    /// already draws the distinction elsewhere — `gemma4` exists so the loader can say
+    /// "recognised, unverified" rather than "unknown", because ONE MEANS SEND A FILE AND THE
+    /// OTHER MEANS WRITE A KERNEL. The unknown case deserves the same care.
+    #[test]
+    fn an_unknown_arch_says_which_kind_of_unknown_it_is() {
+        // A transformer llama.cpp knows: the fallback runs it today, and adding it here is a
+        // registry entry rather than kernel work. Someone reading a bare "unknown" reasonably
+        // concludes their model is exotic.
+        for n in ["olmo2", "granite", "exaone", "starcoder2", "nemotron"] {
+            let note = for_arch(n).note;
+            assert!(note.contains("registry entry"), "{n}: {note}");
+            assert!(!note.contains("not a transformer"), "{n}: {note}");
+        }
+
+        // A different machine entirely. No registry work will ever make this engine run it,
+        // and saying "unknown" invites someone to try.
+        for n in ["mamba", "rwkv7", "jamba", "bert"] {
+            let note = for_arch(n).note;
+            assert!(note.contains("not a transformer"), "{n}: {note}");
+        }
+
+        // Genuinely unrecognised — a typo, a private conversion, or newer than this table.
+        let note = for_arch("definitely-not-an-arch").note;
+        assert!(note.starts_with("unknown architecture"), "{note}");
+
+        // All three are still UNSUPPORTED. The message changed; the gate did not, and a
+        // clearer explanation must not read as permission.
+        for n in ["olmo2", "mamba", "definitely-not-an-arch"] {
+            assert!(!is_supported(n, 0), "{n} became supported by being described");
+            assert_eq!(for_arch(n).arch, Arch::Unknown);
+        }
+    }
+
+    /// Case and stray whitespace come from metadata written by other tools.
+    #[test]
+    fn the_unknown_note_is_not_fooled_by_case_or_spacing() {
+        assert_eq!(unknown_note(" OLMo2 "), unknown_note("olmo2"));
+        assert_eq!(unknown_note("MAMBA"), unknown_note("mamba"));
+    }
 
     /// The MoE sibling was supported and the DENSE model — by far the more common local one
     /// — resolved to `Unknown` and was sent to llama.cpp. Nothing structural was missing; the
