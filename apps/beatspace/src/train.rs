@@ -389,7 +389,13 @@ fn write_resume_state(cfg: &Config, epoch: usize) -> Result<()> {
 /// bookkeeping sidecar is malformed — turns a cosmetic problem into a stopped
 /// run, and the weights are still perfectly loadable.
 pub fn read_resume_epoch(cfg: &Config) -> Option<usize> {
-    let raw = fs::read_to_string(resume_state_path(cfg)).ok()?;
+    read_resume_epoch_in(&cfg.ckpt_dir)
+}
+
+/// The same, for any checkpoint directory — the GUI loads weights from
+/// paths that are not its own `ckpt_dir` and wants the epoch beside them.
+pub fn read_resume_epoch_in(dir: &Path) -> Option<usize> {
+    let raw = fs::read_to_string(dir.join("resume.json")).ok()?;
     let after = raw.split(r#""epoch""#).nth(1)?;
     let digits: String = after.trim_start_matches([':', ' '])
         .chars().take_while(|c| c.is_ascii_digit()).collect();

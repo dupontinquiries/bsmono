@@ -102,6 +102,14 @@ impl Player {
         self.stream.get_or_insert_with(OverlapAdd::new).push(&res, adv);
     }
 
+    /// Stream mode: drop everything queued. The next `push_window` starts
+    /// the track over at the playhead.
+    pub fn clear_stream(&mut self) {
+        if let Some(oa) = self.stream.as_mut() {
+            oa.clear();
+        }
+    }
+
     /// Stream mode: samples queued ahead of the playhead, in SOURCE-rate
     /// samples so the generator thread can compare against window lengths.
     pub fn queued_src_samples(&self) -> usize {

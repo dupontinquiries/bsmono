@@ -507,10 +507,6 @@ impl Generator {
         self.ctx_enc.is_some() || self.phase_planes
     }
 
-    pub fn stems(&self) -> usize {
-        self.stems
-    }
-
     /// Beat phase `(B, T)` in [0, 1) -> sin/cos planes `(B, 2, h, w)` where
     /// `w = T/2`, each column the mean of two frames' sin and cos. Averaged
     /// on the circle rather than on the phase value: the mean of 0.99 and
@@ -580,6 +576,9 @@ impl Generator {
     /// Convenience for the GUI: one latent row -> mel as a flat (n_mels*T) Vec.
     /// Unconditional, one stem — the loop player's contract.
     pub fn generate(&self, z: &[f32], dev: &Device) -> Result<(Vec<f32>, usize, usize)> {
+        if self.conditional() {
+            candle_core::bail!("generate() is the loop player's entry point; this generator is conditional and needs generate_next()");
+        }
         let latent = z.len();
         let zt = Tensor::from_vec(z.to_vec(), (1, latent), dev)?;
         let mel = self.forward_eval(&zt)?; // (1,1,n_mels,time_frames)

@@ -81,6 +81,18 @@ impl LatentWalk {
         let c = Config { bpm, ..cfg.clone() };
         self.beats_per_window = c.beats_per_window();
     }
+
+    /// How far toward the target each window moves, in (0, 1]. 0.1 is the
+    /// glide the pad always had; 1.0 is "jump there now".
+    pub fn set_smoothing(&mut self, a: f32) {
+        self.smoothing = a.clamp(0.001, 1.0);
+    }
+
+    /// Back to the downbeat. For a track restart; the latent is kept, so
+    /// the sound picks up where it was and only the grid resets.
+    pub fn reset_phase(&mut self) {
+        self.phase = 0.0;
+    }
 }
 
 impl Conductor for LatentWalk {
@@ -132,10 +144,6 @@ impl Streamer {
     /// previous planes still stand as context, and the phase state carries.
     pub fn set_generator(&mut self, g: Generator) {
         self.g = g;
-    }
-
-    pub fn generator(&self) -> &Generator {
-        &self.g
     }
 
     /// Forget the previous window and the phase state. The next window

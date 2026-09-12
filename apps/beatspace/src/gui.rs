@@ -28,6 +28,94 @@ use crate::model::{load_generator, Generator};
 use crate::stream::{Conductor, LatentWalk, Streamer};
 use crate::{audio_io, player};
 
+/// What the generator thread is doing, written by it once per window and
+/// read by the control column. The GUI's own `cfg` is what the NEXT training
+/// run will build; this is what is playing now, which can differ once a
+/// checkpoint has been loaded from elsewhere.
+#[derive(Clone, Default)]
+struct PlaybackInfo {
+    /// Stream (continuing windows) or loop (crossfaded beats).
+    stream: bool,
+    stems: usize,
+    ctx_frames: usize,
+    beat_phase: bool,
+    time_frames: usize,
+    stride_frames: usize,
+    overlap_frames: usize,
+    hop: usize,
+    sr: u32,
+    /// Stream: tempo the conductor is advancing at, and where in the beat
+    /// the next window starts.
+    bpm: f32,
+    phase: f32,
+    /// Stream: audio queued ahead of the playhead, in seconds.
+    lead_secs: f32,
+    /// Stream: windows rendered since the last (re)start.
+    windows: u64,
+    /// The epoch recorded beside the loaded checkpoint, when there is one.
+    epoch: Option<usize>,
+    /// Stream: the next window continues the previous one (false right
+    /// after a restart, when it starts from silence).
+    continuing: bool,
+}
+
+impl PlaybackInfo {
+    fn from_cfg(cfg: &Config, stream: bool) -> Self {
+        Self {
+            stream,
+            stems: cfg.stems,
+            ctx_frames: cfg.ctx_frames,
+            beat_phase: cfg.beat_phase,
+            time_frames: cfg.time_frames,
+            stride_frames: cfg.window_stride(),
+            overlap_frames: cfg.overlap_frames,
+            hop: cfg.hop,
+            sr: cfg.sr,
+            bpm: cfg.bpm,
+            ..Default::default()
+        }
+    }
+    fn secs(&self, frames: usize) -> f32 {
+        (frames * self.hop) as f32 / self.sr.max(1) as f32
+    }
+    /// One line saying what the listener will hear next.
+    fn headline(&self) -> String {
+        if !self.stream {
+            return format!(
+                "loop — one {:.0} ms beat, crossfaded into the next as the latent moves",
+                self.secs(self.time_frames) * 1000.0
+            );
+        }
+        let stems = if self.stems >= 2 { "drums + instruments" } else { "one mixed stem" };
+        let how = if self.ctx_frames > 0 {
+            if self.continuing { "continuing the previous window" } else { "starting from silence" }
+        } else {
+            "independent windows, phase-continued"
+        };
+        format!(
+            "stream — {stems}, {how}; {:.0} ms windows every {:.0} ms",
+            self.secs(self.time_frames) * 1000.0,
+            self.secs(self.stride_frames) * 1000.0
+        )
+    }
+}
+
+/// Knobs the control column turns on the stream. Read by the stream loop
+/// before each window; ignored by the loop player, which has none of them.
+#[derive(Clone)]
+struct StreamControls {
+    bpm: f32,
+    /// Conductor glide per window, (0, 1].
+    smoothing: f32,
+    /// Windows of audio to keep queued ahead of the playhead.
+    lead_windows: usize,
+    /// Griffin-Lim iterations per window at playback.
+    gl_iters: usize,
+    /// One-shot: forget the previous window and the beat grid, drop the
+    /// queue, start over.
+    restart: bool,
+}
+
 struct Shared {
     target_z: Vec<f32>,
     current_z: Vec<f32>,
@@ -37,6 +125,8 @@ struct Shared {
     weights_request: Option<PathBuf>,
     loaded_label: String,
     device_label: String,
+    playback: PlaybackInfo,
+    stream_ctl: StreamControls,
     /// Output gain the generator thread applies to its player, 0..1.
     ///
     /// Routed through Shared rather than by handing the GUI an Arc<Player>: the
@@ -60,6 +150,14 @@ pub fn run(cfg: Config) -> Result<()> {
         weights_request: None,
         loaded_label: "(none)".into(),
         device_label: "?".into(),
+        playback: PlaybackInfo::from_cfg(&cfg, cfg.playback == Playback::Stream || cfg.conditional()),
+        stream_ctl: StreamControls {
+            bpm: cfg.bpm,
+            smoothing: 0.1,
+            lead_windows: 2,
+            gl_iters: cfg.griffin_iters_rt,
+            restart: false,
+        },
         gain: 1.0,
         stopped: false,
     }));
@@ -135,7 +233,9 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
         if let Err(e) = load_generator(&mut g, &latest, &dev) {
             eprintln!("[gui] failed to load {latest:?}: {e}");
         } else {
-            shared.lock().unwrap().loaded_label = latest.display().to_string();
+            let mut s = shared.lock().unwrap();
+            s.loaded_label = latest.display().to_string();
+            s.playback.epoch = crate::train::read_resume_epoch_in(&cfg.ckpt_dir);
         }
     }
 
@@ -213,6 +313,8 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
                     cur_latent = lat;
                     let mut s = shared.lock().unwrap();
                     s.loaded_label = format!("{} ({frames}f)", path.display());
+                    s.playback.time_frames = frames;
+                    s.playback.epoch = path.parent().and_then(crate::train::read_resume_epoch_in);
                 }
                 Err(e) => eprintln!("[gui] load weights {path:?}: {e}"),
             }
@@ -297,24 +399,38 @@ fn stream_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -
         if let Err(e) = load_generator(&mut g, &latest, &dev) {
             eprintln!("[gui] failed to load {latest:?}: {e}");
         } else {
-            shared.lock().unwrap().loaded_label = latest.display().to_string();
+            let mut s = shared.lock().unwrap();
+            s.loaded_label = latest.display().to_string();
+            s.playback.epoch = crate::train::read_resume_epoch_in(&cfg.ckpt_dir);
         }
     }
     let mut streamer = Streamer::new(&cfg, g, dev.clone());
     let mut walk = LatentWalk::new(&cfg);
+    let mut windows: u64 = 0;
 
     let (_stream, audio) = player::start(cfg.sr)?;
 
-    // Keep two windows of lead. Less and a slow render is a dropout; more
-    // and a pad move takes that much longer to be heard.
+    // Lead: how many windows of audio to keep queued. Less and a slow
+    // render is a dropout; more and a pad move takes that much longer to
+    // be heard. Set from the control column.
     let advance = cfg.window_stride() * cfg.hop;
-    let low_water = 2 * advance;
 
     while !stop.load(Ordering::Relaxed) {
-        let (target, weights_req, save_req) = {
+        let (target, weights_req, save_req, ctl) = {
             let mut s = shared.lock().unwrap();
-            (s.target_z.clone(), s.weights_request.take(), s.save_request.take())
+            let ctl = s.stream_ctl.clone();
+            s.stream_ctl.restart = false;
+            (s.target_z.clone(), s.weights_request.take(), s.save_request.take(), ctl)
         };
+        let low_water = ctl.lead_windows.max(1) * advance;
+        walk.set_bpm(&cfg, ctl.bpm);
+        walk.set_smoothing(ctl.smoothing);
+        if ctl.restart {
+            streamer.reset();
+            walk.reset_phase();
+            audio.lock().unwrap().clear_stream();
+            windows = 0;
+        }
 
         if let Some(path) = weights_req {
             // The config.json next to the checkpoint is the authority on the
@@ -340,7 +456,9 @@ restart the GUI with --ckpt-dir pointing at its directory",
             match Generator::new(&build_cfg, &dev).and_then(|mut ng| load_generator(&mut ng, &path, &dev).map(|_| ng)) {
                 Ok(ng) => {
                     streamer.set_generator(ng);
-                    shared.lock().unwrap().loaded_label = path.display().to_string();
+                    let mut s = shared.lock().unwrap();
+                    s.loaded_label = path.display().to_string();
+                    s.playback.epoch = path.parent().and_then(crate::train::read_resume_epoch_in);
                 }
                 Err(e) => eprintln!("[gui] load weights {path:?}: {e}"),
             }
@@ -357,17 +475,25 @@ restart the GUI with --ckpt-dir pointing at its directory",
             p.queued_src_samples()
         };
         if queued >= low_water && save_req.is_none() {
+            // Nothing to render; keep the lead reading live while waiting.
+            shared.lock().unwrap().playback.lead_secs = queued as f32 / cfg.sr as f32;
             std::thread::sleep(std::time::Duration::from_millis(5));
             continue;
         }
 
+        let continuing = streamer.last_planes().is_some();
         let t0 = Instant::now();
         let window = {
             let step = walk.step(&target);
-            streamer.next_window(&step, cfg.griffin_iters_rt)?
+            streamer.next_window(&step, ctl.gl_iters.max(1))?
         };
         let gen_ms = t0.elapsed().as_secs_f32() * 1000.0;
-        audio.lock().unwrap().push_window(&window.audio, window.advance);
+        windows += 1;
+        let queued = {
+            let mut p = audio.lock().unwrap();
+            p.push_window(&window.audio, window.advance);
+            p.queued_src_samples()
+        };
 
         if let Some(path) = save_req {
             match streamer.render_last_hq(cfg.griffin_iters) {
@@ -385,6 +511,13 @@ restart the GUI with --ckpt-dir pointing at its directory",
             s.current_z = walk.current().to_vec();
             s.gen_ms = gen_ms;
             s.scope = scope;
+            let p = &mut s.playback;
+            p.stream = true;
+            p.bpm = ctl.bpm;
+            p.phase = walk.beat_phase();
+            p.lead_secs = queued as f32 / cfg.sr as f32;
+            p.windows = windows;
+            p.continuing = continuing;
         }
     }
     Ok(())
@@ -448,6 +581,10 @@ struct App {
     ckpt_text: String,
     save_text: String,
     status: String,
+    /// Whether the model shape in `cfg` (what the next run builds) matches
+    /// the checkpoint directory's config.json. Refreshed on the cache timer
+    /// rather than per frame; `None` when there is no checkpoint to compare.
+    shape_note: Option<Result<(), String>>,
 }
 
 const RANGE: f32 = 3.0; // pad maps to [-RANGE, RANGE]
@@ -486,6 +623,7 @@ impl App {
             ckpt_text,
             save_text: "beat.wav".into(),
             status: "drag on the pad to morph".into(),
+            shape_note: None,
         }
     }
 
@@ -513,6 +651,7 @@ struct Snapshot<'a> {
     gen_ms: f32,
     loaded: &'a str,
     device: &'a str,
+    playback: &'a PlaybackInfo,
 }
 
 impl App {
@@ -575,17 +714,38 @@ impl App {
                 );
 
                 ui.separator();
+                self.playback_section(ui, snap.playback);
+
+                ui.separator();
                 ui.label("Generator weights:");
                 ui.add(egui::TextEdit::singleline(&mut self.ckpt_text).id_salt("gui-self_ckpt_text").desired_width(230.0));
-                if ui.button("Load weights").clicked() {
-                    let p = PathBuf::from(self.ckpt_text.trim());
-                    if p.exists() {
-                        self.shared.lock().unwrap().weights_request = Some(p);
-                        self.status = "loading weights…".into();
-                    } else {
-                        self.status = "weights path not found".into();
+                ui.horizontal(|ui| {
+                    if ui.button("Load weights").clicked() {
+                        let p = PathBuf::from(self.ckpt_text.trim());
+                        if p.exists() {
+                            self.shared.lock().unwrap().weights_request = Some(p);
+                            self.status = "loading weights…".into();
+                        } else {
+                            self.status = "weights path not found".into();
+                        }
                     }
-                }
+                    // The common case while a run is going in the other
+                    // page: hear the newest checkpoint without retyping
+                    // its path.
+                    if ui.button("↻ latest")
+                        .on_hover_text("reload gen_latest.safetensors from the checkpoint directory")
+                        .clicked()
+                    {
+                        let p = self.cfg.ckpt_dir.join("gen_latest.safetensors");
+                        if p.exists() {
+                            self.ckpt_text = p.display().to_string();
+                            self.shared.lock().unwrap().weights_request = Some(p);
+                            self.status = "reloading latest…".into();
+                        } else {
+                            self.status = "no gen_latest.safetensors yet".into();
+                        }
+                    }
+                });
                 ui.label(egui::RichText::new(format!("loaded: {loaded}")).small().weak());
 
                 ui.separator();
@@ -702,6 +862,105 @@ impl App {
     }
 }
 
+impl App {
+    /// What will be played back, and the knobs on it.
+    ///
+    /// The headline is one sentence the listener can act on — "stream,
+    /// drums + instruments, continuing" — and the details under it are the
+    /// numbers behind that sentence. The controls are only the ones the
+    /// stream has; the loop player has none, and the section says so
+    /// rather than showing sliders that do nothing.
+    fn playback_section(&mut self, ui: &mut egui::Ui, p: &PlaybackInfo) {
+        egui::CollapsingHeader::new("playback")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(p.headline()).strong());
+
+                let ms = |frames: usize| p.secs(frames) * 1000.0;
+                let mut lines = vec![format!(
+                    "window {} frames ({:.0} ms) · stride {} ({:.0} ms) · overlap {} ({:.0} ms)",
+                    p.time_frames, ms(p.time_frames),
+                    p.stride_frames, ms(p.stride_frames),
+                    p.overlap_frames, ms(p.overlap_frames),
+                )];
+                lines.push(format!(
+                    "model: {} · context {} · beat phase {}",
+                    if p.stems >= 2 { "2 stems (harmonic/percussive)" } else { "1 stem (mixed)" },
+                    if p.ctx_frames > 0 { format!("{} frames", p.ctx_frames) } else { "none".into() },
+                    if p.beat_phase { "on" } else { "off" },
+                ));
+                if let Some(e) = p.epoch {
+                    lines.push(format!("checkpoint epoch {e}"));
+                }
+                if p.stream {
+                    lines.push(format!(
+                        "lead {:.2} s queued · {} windows since start · beat phase {:.2} at {:.0} BPM",
+                        p.lead_secs, p.windows, p.phase, p.bpm
+                    ));
+                }
+                for l in lines {
+                    ui.label(egui::RichText::new(l).small().weak());
+                }
+
+                if !p.stream {
+                    ui.label(egui::RichText::new(
+                        "loop playback has no tempo or lead: train with the dynamic preset \
+(train page → model) to get a stream").small().italics());
+                    return;
+                }
+
+                // The controls. Each writes to Shared; the stream loop reads
+                // them before the next window, so a change is heard within
+                // one lead's worth of audio.
+                let (mut ctl, changed_before) = {
+                    let s = self.shared.lock().unwrap();
+                    (s.stream_ctl.clone(), s.stream_ctl.clone())
+                };
+                let beat_on = p.beat_phase;
+                ui.add_enabled(beat_on,
+                    egui::Slider::new(&mut ctl.bpm, 60.0..=200.0).text("BPM"))
+                    .on_hover_text(if beat_on {
+                        "tempo the conductor advances the beat phase at; the renderer was trained \
+to put its beats where this says"
+                    } else {
+                        "this model has no beat phase input, so tempo has nothing to drive"
+                    });
+                ui.add(egui::Slider::new(&mut ctl.smoothing, 0.01..=1.0).logarithmic(true).text("glide"))
+                    .on_hover_text("fraction of the way to the pad position each window moves: \
+0.1 is the original glide, 1.0 jumps");
+                ui.add(egui::Slider::new(&mut ctl.lead_windows, 1..=6).text("lead (windows)"))
+                    .on_hover_text("audio kept queued ahead of the playhead. More survives a slow \
+render; less makes the pad respond sooner");
+                ui.add(egui::Slider::new(&mut ctl.gl_iters, 1..=16).text("phase iters"))
+                    .on_hover_text("Griffin-Lim iterations per window: fewer is faster and rougher");
+                ui.horizontal(|ui| {
+                    if ui.button("↺ restart track")
+                        .on_hover_text("forget the previous window and the beat grid, drop the \
+queue, and start again from silence at the current pad position")
+                        .clicked()
+                    {
+                        ctl.restart = true;
+                        self.status = "restarting the track".into();
+                    }
+                    if ui.button("reset knobs").clicked() {
+                        ctl.bpm = self.cfg.bpm;
+                        ctl.smoothing = 0.1;
+                        ctl.lead_windows = 2;
+                        ctl.gl_iters = self.cfg.griffin_iters_rt;
+                    }
+                });
+                let changed = ctl.bpm != changed_before.bpm
+                    || ctl.smoothing != changed_before.smoothing
+                    || ctl.lead_windows != changed_before.lead_windows
+                    || ctl.gl_iters != changed_before.gl_iters
+                    || ctl.restart;
+                if changed {
+                    self.shared.lock().unwrap().stream_ctl = ctl;
+                }
+            });
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // FONTS ONLY. beatspace paints with nine hand-picked `Color32`
@@ -712,7 +971,7 @@ impl eframe::App for App {
         ui.ctx().request_repaint(); // keep animating
 
         // snapshot shared state
-        let (current_z, target_snapshot, gen_ms, scope, loaded, device) = {
+        let (current_z, target_snapshot, gen_ms, scope, loaded, device, playback) = {
             let s = self.shared.lock().unwrap();
             (
                 s.current_z.clone(),
@@ -721,6 +980,7 @@ impl eframe::App for App {
                 s.scope.clone(),
                 s.loaded_label.clone(),
                 s.device_label.clone(),
+                s.playback.clone(),
             )
         };
 
@@ -753,7 +1013,7 @@ impl eframe::App for App {
 
         let snap = Snapshot {
             current_z: &current_z, target_snapshot: &target_snapshot,
-            gen_ms, loaded: &loaded, device: &device,
+            gen_ms, loaded: &loaded, device: &device, playback: &playback,
         };
         // The scope keeps its own bottom panel and is declared FIRST, so it
         // reserves its strip before the two panes divide what is left.
@@ -922,6 +1182,8 @@ at. Off starts over and overwrites.\n\nWeights resume exactly; the optimizer's m
 (candle keeps it private), so expect roughly a thousand steps of re-warming.");
         });
 
+        self.model_options(ui, running);
+
         if !running {
             if ui.button("▶  start training").clicked() {
                 self.start_training();
@@ -977,6 +1239,7 @@ at. Off starts over and overwrites.\n\nWeights resume exactly; the optimizer's m
                          else { Some(self.cfg.cache_batches * self.cfg.batch_size.max(1)) };
             self.cache = crate::trainpage::read_cache(&self.cfg.cache_dir, budget);
             self.cache_checked = Some(std::time::Instant::now());
+            self.refresh_shape_note();
         }
         ui.separator();
         ui.label(egui::RichText::new("cache").small());
@@ -1015,6 +1278,137 @@ at. Off starts over and overwrites.\n\nWeights resume exactly; the optimizer's m
             ui.ctx().copy_text(self.train.summary());
             self.status = "summary copied".into();
         }
+    }
+
+    /// The model shape the next run builds: the dynamic-track preset and
+    /// its parts. Written straight into `self.cfg`, which is what
+    /// `start_training` passes on, so what the page shows is what the
+    /// trainer gets.
+    fn model_options(&mut self, ui: &mut egui::Ui, running: bool) {
+        ui.separator();
+        ui.label(egui::RichText::new("model").small());
+
+        let is_dynamic = self.cfg.stems == 2 && self.cfg.ctx_frames > 0
+            && self.cfg.beat_phase && self.cfg.seq_windows >= 2;
+        let mut dynamic = is_dynamic;
+        if ui.add_enabled(!running, egui::Checkbox::new(&mut dynamic, "dynamic tracks"))
+            .on_hover_text(
+                "Train a renderer that CONTINUES its own output instead of emitting \
+independent loops: two mel stems (drums / instruments, split at cache time), a context of \
+the previous window, a beat-phase input, and a second discriminator scoring adjacent windows \
+across their join. Playback streams instead of looping.\n\nChanges the MODEL SHAPE and the \
+cache format, so it cannot resume a legacy checkpoint and rebuilds the mel cache. About \
+three to four times the cost of a legacy step.")
+            .changed()
+        {
+            if dynamic {
+                let d = Config::dynamic();
+                self.cfg.stems = d.stems;
+                self.cfg.ctx_frames = d.ctx_frames;
+                self.cfg.beat_phase = d.beat_phase;
+                self.cfg.seq_windows = d.seq_windows;
+                self.cfg.overlap_frames = d.overlap_frames;
+                self.cfg.rollout = d.rollout;
+                self.cfg.playback = Playback::Stream;
+            } else {
+                let d = Config::default();
+                self.cfg.stems = d.stems;
+                self.cfg.ctx_frames = d.ctx_frames;
+                self.cfg.beat_phase = d.beat_phase;
+                self.cfg.seq_windows = d.seq_windows;
+                self.cfg.playback = Playback::Loop;
+            }
+            self.refresh_shape_note();
+        }
+
+        // The parts, for anyone who wants one without the others. Each is
+        // a flag on the trainer; the preset is just all of them at once.
+        egui::CollapsingHeader::new("parts")
+            .id_salt("gui-model-parts")
+            .default_open(false)
+            .show(ui, |ui| {
+                let before = (self.cfg.stems, self.cfg.ctx_frames, self.cfg.beat_phase,
+                              self.cfg.seq_windows, self.cfg.overlap_frames, self.cfg.rollout);
+                ui.horizontal(|ui| {
+                    ui.label("stems");
+                    ui.add_enabled_ui(!running, |ui| {
+                        ui.selectable_value(&mut self.cfg.stems, 1, "1 mixed");
+                        ui.selectable_value(&mut self.cfg.stems, 2, "2 harm/perc");
+                    });
+                }).response.on_hover_text(
+                    "Two splits the spectrogram into harmonic and percussive planes (median \
+filtering, no model) so the generator emits drums and instruments as separate channels that \
+share one trunk.");
+                ui.add_enabled(!running,
+                    egui::Slider::new(&mut self.cfg.ctx_frames, 0..=self.cfg.time_frames.min(64)).text("context frames"))
+                    .on_hover_text("Frames of the previous window the renderer sees. 0 is the \
+unconditional generator; anything else makes every window a continuation.");
+                ui.add_enabled(!running, egui::Checkbox::new(&mut self.cfg.beat_phase, "beat phase input"))
+                    .on_hover_text("Feed the renderer where in the beat each column falls, \
+estimated per clip at cache time. Playback then has a tempo control.");
+                ui.add_enabled(!running,
+                    egui::Slider::new(&mut self.cfg.seq_windows, 1..=6).text("windows per sample"))
+                    .on_hover_text("Consecutive windows per training sample. 2 or more turns on \
+the sequence discriminator; a conditional renderer needs at least 2.");
+                ui.add_enabled(!running,
+                    egui::Slider::new(&mut self.cfg.overlap_frames, 2..=self.cfg.time_frames.saturating_sub(1).max(2))
+                        .text("overlap frames"))
+                    .on_hover_text("Frames adjacent windows share, in training and playback: the \
+crossfade region.");
+                ui.add_enabled(!running, egui::Checkbox::new(&mut self.cfg.rollout, "free-running rollout"))
+                    .on_hover_text("Also score the renderer continuing ITSELF for a few windows, \
+which is what playback asks of it. Off is faster and drifts.");
+                let after = (self.cfg.stems, self.cfg.ctx_frames, self.cfg.beat_phase,
+                             self.cfg.seq_windows, self.cfg.overlap_frames, self.cfg.rollout);
+                if before != after {
+                    // Playback mode follows the shape: a conditional model
+                    // cannot be looped.
+                    self.cfg.playback = if self.cfg.conditional() { Playback::Stream } else { self.cfg.playback };
+                    self.refresh_shape_note();
+                }
+            });
+
+        // What "start" will do, in one line, and whether the checkpoint
+        // directory agrees. Said before the button rather than by the
+        // trainer refusing after it.
+        let c = &self.cfg;
+        let mut what = vec![format!("{} stem{}", c.stems, if c.stems == 1 { "" } else { "s" })];
+        if c.ctx_frames > 0 { what.push(format!("ctx {}", c.ctx_frames)); }
+        if c.beat_phase { what.push("beat phase".into()); }
+        if c.seq_windows >= 2 {
+            what.push(format!("{}-window sequences{}", c.seq_windows, if c.rollout { " + rollout" } else { "" }));
+        }
+        what.push(format!("plays as {}", if c.playback == Playback::Stream || c.conditional() { "stream" } else { "loop" }));
+        ui.label(egui::RichText::new(format!("will train: {}", what.join(" · "))).small());
+        if c.conditional() && c.seq_windows < 2 {
+            ui.colored_label(egui::Color32::from_rgb(220, 120, 60),
+                "a conditional renderer needs windows per sample ≥ 2 — the trainer will refuse");
+        }
+        if let Err(why) = &c.validate() {
+            ui.colored_label(egui::Color32::from_rgb(220, 120, 60), format!("invalid: {why}"));
+        }
+        match &self.shape_note {
+            Some(Err(why)) if self.train_resume => {
+                ui.colored_label(egui::Color32::from_rgb(220, 120, 60),
+                    format!("differs from the checkpoint ({why}) — resume will be refused; \
+untick resume or use another checkpoint dir"));
+            }
+            Some(Err(_)) => {
+                ui.label(egui::RichText::new(
+                    "shape differs from the checkpoint in this directory: a fresh run overwrites it").small());
+            }
+            _ => {}
+        }
+    }
+
+    /// Compare `cfg`'s shape with the checkpoint directory's config.json.
+    fn refresh_shape_note(&mut self) {
+        let saved = self.cfg.ckpt_dir.join("config.json");
+        self.shape_note = if saved.exists() {
+            Config::load_json(&saved).ok().map(|prev| self.cfg.shape_compatible_with(&prev))
+        } else {
+            None
+        };
     }
 
     /// Spawn a trainer and pipe its output into the page.
