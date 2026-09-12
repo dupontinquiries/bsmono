@@ -46,8 +46,8 @@
 use std::fmt;
 use std::path::Path;
 
-#[cfg(feature = "opus")]
 pub mod flac;
+#[cfg(feature = "opus")]
 mod opus;
 
 use studio_audio::SourceAudio;
