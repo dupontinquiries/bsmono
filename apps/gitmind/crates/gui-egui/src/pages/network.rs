@@ -93,6 +93,22 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     });
                 }
             }
+            // ENABLE AT BOOT. Start/stop/restart all last until the phone is rebooted, and
+            // nothing on this page said so — someone who fixed a dead daemon and pocketed the
+            // phone found it dead again. `daemons::enable_cmd` has existed since the module
+            // was written with no caller anywhere.
+            if ui
+                .add_enabled(can, egui::Button::new("enable").small())
+                .on_hover_text("start now AND at boot")
+                .clicked()
+            {
+                let (u, h, n) = (app.net.user.clone(), app.net.host.clone(), d.name.to_string());
+                app.net.status_stale = true;
+                app.task.run(move || match cockpit::flow::daemon_enable_remote(&u, &h, &n) {
+                    Ok(o) => format!("{n} enabled at boot: {o}"),
+                    Err(e) => format!("error: {e}"),
+                });
+            }
             if ui.add_enabled(can, egui::Button::new("logs").small()).clicked() {
                 let (u, h, n) = (app.net.user.clone(), app.net.host.clone(), d.name.to_string());
                 app.task.run(move || match cockpit::flow::daemon_logs_remote(&u, &h, &n, 200) {

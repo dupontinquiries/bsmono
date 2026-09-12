@@ -454,6 +454,29 @@ pub fn install_daemons_script(bin_dir: &str, home: &str, init: InitSystem) -> St
 
 #[cfg(test)]
 mod tests {
+
+    /// The distinction the page was missing: start/stop/restart last until a reboot, and
+    /// `enable` is what survives one. Someone who fixed a dead daemon and pocketed the phone
+    /// found it dead again, with nothing having suggested there was a difference.
+    #[test]
+    fn enable_starts_now_and_at_boot_on_both_init_systems() {
+        let d = &all()[0];
+        let sd = enable_cmd(d, InitSystem::Systemd);
+        // ONE command, not enable-then-start: two round trips can half-succeed and leave a
+        // daemon enabled and down, which is the state hardest to notice.
+        assert!(sd.contains("enable"), "{sd}");
+        assert!(sd.contains("--now"), "systemd should start it too: {sd}");
+
+        let rc = enable_cmd(d, InitSystem::OpenRc);
+        assert!(rc.contains("rc-update add"), "{rc}");
+        assert!(rc.contains("rc-service"), "OpenRC needs the start as well: {rc}");
+        assert!(rc.contains("&&"), "the start must be conditional on the add: {rc}");
+
+        // And it is a DIFFERENT command from a plain start, or the button would be a
+        // duplicate of one already there.
+        assert_ne!(sd, control_cmd(d, InitSystem::Systemd, DaemonAction::Start));
+        assert_ne!(rc, control_cmd(d, InitSystem::OpenRc, DaemonAction::Start));
+    }
     use super::*;
 
     #[test]

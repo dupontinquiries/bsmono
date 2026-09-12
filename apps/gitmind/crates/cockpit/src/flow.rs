@@ -1911,6 +1911,24 @@ pub fn daemon_control_remote(user: &str, host: &str, name: &str, action: &str) -
     crate::deploy::remote_capture(user, host, &cmd)
 }
 
+/// Enable a daemon AT BOOT on a target, and start it now.
+///
+/// `daemons::enable_cmd` has existed since the module was written and had no caller anywhere:
+/// the page could start, stop and restart, all of which last until the phone is rebooted.
+/// Someone who fixed a dead daemon and put the phone in their pocket found it dead again, with
+/// nothing on the page having suggested there was a difference between "running" and "will run
+/// next time".
+///
+/// Both init systems enable and start in one command — `systemctl --user enable --now` and
+/// `rc-update add` followed by `rc-service start` — so this is a single round trip rather than
+/// enable-then-start, which could half-succeed and leave a daemon enabled and down.
+pub fn daemon_enable_remote(user: &str, host: &str, name: &str) -> Result<String, String> {
+    let d = crate::daemons::find(name).ok_or_else(|| format!("unknown daemon {name}"))?;
+    let init = detect_init_remote(user, host);
+    let cmd = crate::daemons::enable_cmd(d, init);
+    crate::deploy::remote_capture(user, host, &cmd)
+}
+
 /// Stream a daemon's logs live from a target, calling `on_line` per line until `cancel` is set.
 /// A watcher thread kills the ssh child when `cancel` flips, so the blocking read returns promptly
 /// instead of hanging on `journalctl -f`. Runs on a worker thread (the GUI feeds lines into a Job).
