@@ -28,6 +28,40 @@ The Transformers pair is the only **ground truth** in the set: same source,
 two bitrates, frame-aligned (37 dB to the matching frame, 25 dB to its
 neighbours). It is what makes quality claims possible at all. Keep it.
 
+## Tiny fixtures
+
+`tools/make_tiny_clips.sh <out-dir> <src.mkv> [start] [seconds] [width]`
+derives a few-MB 640x360 clip from a full-size source (light blur by default,
+`noblur` to keep detail; run it twice with the same start and length on two
+bitrates to keep an aligned pair). A 6–8 s fixture lands around 0.3–0.7 MB
+and `analyze` runs 120 frames in seconds instead of minutes.
+
+They are for iterating and for A/B-ing a change against itself. They are not
+the clips a number in this document comes from, for three reasons:
+
+- **The block-to-scene ratio changes.** A 30 px block at 1080p is a 10 px
+  block at 640x360, and a 40 px/frame pan becomes 13 px/frame — inside a
+  diamond search that could not reach it at full size. Pass `--block-size 10`
+  to keep the geometry comparable, and expect the numbers still to differ.
+- **Re-encoding replaces the artefacts.** Anything about codec artefacts,
+  denoising or restoration must use the original file.
+- **The blur removes what a network reconstructs.** Fine for planner counts,
+  useless for quality scoring.
+
+How far they drift, same flags (`-q 90 --anchor-rmse 12 --anchor-max-age 5`,
+120 frames), % of pixels through the main network:
+
+| | full 1080p | tiny, `--block-size 30` | tiny, `--block-size 10` |
+|---|---|---|---|
+| lone-ranger | 31.9 | 40.5 | 42.3 |
+| smite | 31.6 | 32.2 | 37.6 |
+| transformers (fight) | 61.3 | 70.3 | 71.1 |
+
+Consistently pessimistic by 1–10 points and in the same order, so a
+*direction* transfers and a *level* does not. The cache lever holds up well
+(20.0% hit rate on the tiny lone-ranger against 21.7% at full size), which
+makes these useful for the cache and anchor work specifically.
+
 ## Summary — what pays
 
 Measured on `analyze`, q90, 120 frames, as % of pixels through the main
