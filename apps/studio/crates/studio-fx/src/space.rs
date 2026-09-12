@@ -199,6 +199,18 @@ impl Reverb {
         x * (1.0 - self.mix) + wet * self.mix
     }
 
+    /// Live: the comb feedback is read per sample; changing it mid-tail
+    /// lengthens or shortens the tail from here, no click.
+    pub fn set_size(&mut self, size: f32) {
+        let feedback = size.clamp(0.0, 1.0) * ROOM_SCALE + ROOM_OFFSET;
+        for r in &mut self.rooms { for c in &mut r.combs { c.feedback = feedback; } }
+    }
+    /// Live, for the same reason.
+    pub fn set_damp(&mut self, damp: f32) {
+        let damp = damp.clamp(0.0, 1.0) * DAMP_SCALE;
+        for r in &mut self.rooms { for c in &mut r.combs { c.damp = damp; } }
+    }
+
     pub fn clear(&mut self) {
         for r in &mut self.rooms {
             for c in &mut r.combs { c.line.clear(); c.filter = 0.0; }
@@ -247,6 +259,15 @@ impl Delay {
             ping_pong: ping_pong && channels > 1,
             channels, phase: 0, last_out: vec![0.0; channels], last_in: vec![0.0; channels],
         }
+    }
+
+    /// Live. The time is NOT: it is the line's length, and changing it
+    /// means reallocating or reading across a discontinuity — a real
+    /// tape-style time glide is its own feature, not a setter.
+    pub fn set_feedback(&mut self, fb: f32) { self.feedback = fb.clamp(0.0, 0.98); }
+    /// Live: the loop filter's coefficient is read per sample.
+    pub fn set_damp_hz(&mut self, rate: f32, damp_hz: f32) {
+        self.lp_coeff = (-2.0 * std::f32::consts::PI * damp_hz.clamp(20.0, rate * 0.49) / rate).exp();
     }
 
     pub fn process(&mut self, x: f32) -> f32 {

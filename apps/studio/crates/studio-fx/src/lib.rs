@@ -126,16 +126,46 @@ impl Biquad {
     }
 
     pub fn reset(&mut self) { self.x1 = 0.0; self.x2 = 0.0; self.y1 = 0.0; self.y2 = 0.0; }
+    /// These coefficients with `old`'s memory — a redesign that does not
+    /// restart the filter.
+    pub fn with_state_of(mut self, old: &Biquad) -> Biquad {
+        self.x1 = old.x1; self.x2 = old.x2; self.y1 = old.y1; self.y2 = old.y2;
+        self
+    }
 }
 
-/// A stack of bands.
+/// What a band was designed from, kept so it can be redesigned live.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BandDesign { pub kind: BandKind, pub freq: f32, pub q: f32, pub gain_db: f32 }
+
+/// A stack of bands. `designs` and `rate` are filled by `instantiate` so
+/// a band can be redesigned in place (`set_band`); an `Eq` built by hand
+/// from biquads has neither and cannot be ridden, which is fine — the
+/// automation path only ever sees instantiated ones.
 #[derive(Debug, Clone, Default)]
-pub struct Eq { pub bands: Vec<Biquad> }
+pub struct Eq {
+    pub bands: Vec<Biquad>,
+    pub designs: Vec<BandDesign>,
+    pub rate: f32,
+}
 
 impl Eq {
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
         self.bands.iter_mut().fold(x, |acc, b| b.process(acc))
+    }
+    /// Redesign band `i` around one changed value, keeping the filter's
+    /// memory: a transposed-direct-form biquad takes new coefficients
+    /// mid-stream without a click, which is what makes a cutoff sweep
+    /// a ride and not a series of restarts.
+    pub fn set_band(&mut self, i: usize, freq: Option<f32>, q: Option<f32>, gain_db: Option<f32>) -> bool {
+        let (Some(d), Some(b)) = (self.designs.get_mut(i), self.bands.get_mut(i)) else { return false };
+        if let Some(f) = freq { d.freq = f; }
+        if let Some(v) = q { d.q = v; }
+        if let Some(g) = gain_db { d.gain_db = g; }
+        let fresh = Biquad::design(d.kind, self.rate, d.freq, d.q, d.gain_db);
+        *b = fresh.with_state_of(b);
+        true
     }
     pub fn magnitude_db(&self, rate: f32, freq: f32) -> f32 {
         self.bands.iter().map(|b| b.magnitude_db(rate, freq)).sum()
@@ -515,6 +545,100 @@ impl Instance {
             Instance::Transform(_) | Instance::Color(_) | Instance::Retime(_) => x,
         }
     }
+
+    /// Whether `set_param` would accept `key` on an instance of `kind` —
+    /// the static answer, for a UI deciding whether to offer "automate"
+    /// on a control, and the table the live-set test pins `set_param`
+    /// against. The digit-suffixed EQ keys are live for any band index.
+    pub fn is_live_param(kind: &str, key: &str) -> bool {
+        let stem = key.trim_end_matches(|c: char| c.is_ascii_digit());
+        let live: &[&str] = match kind {
+            "gain" => &["db"],
+            "eq" => return key != stem && matches!(stem, "freq" | "q" | "gain"),
+            "compressor" => &["threshold", "ratio", "knee", "makeup"],
+            "limiter" => &["ceiling"],
+            "saturation" | "adaptivesat" => &["drive", "bias", "mix"],
+            "comb" | "sub" => &["mix"],
+            "crush" => &["bits"],
+            "gate" => &["threshold"],
+            "reverb" => &["mix", "width", "size", "damp"],
+            "delay" => &["mix", "feedback", "damp"],
+            "blend" => &["opacity"],
+            _ => &[],
+        };
+        live.contains(&key)
+    }
+
+    /// Change one parameter on a running instance without losing its
+    /// state — the automation path. Returns whether the key is one this
+    /// kind can move live; the caller ignores a `false` (a ride on a
+    /// parameter the effect cannot change mid-stream does nothing, rather
+    /// than restarting the effect at every point). What can move: the
+    /// things read per sample (gains, thresholds, mixes, feedback,
+    /// damping, a filter's design with its memory kept); what cannot: a
+    /// delay's time, a limiter's lookahead, a grain length, a channel
+    /// count — buffer sizes, not values. `rate` is needed only by the
+    /// delay's damping; every other setter is rate-free.
+    pub fn set_param(&mut self, key: &str, v: f32, rate: f32) -> bool {
+        match self {
+            Instance::Gain(db) => { if key == "db" { *db = v; true } else { false } }
+            Instance::Eq(eq) => {
+                let (which, i) = match key.find(|c: char| c.is_ascii_digit()) {
+                    Some(n) => (&key[..n], key[n..].parse::<usize>().ok()),
+                    None => (key, None),
+                };
+                let Some(i) = i else { return false };
+                match which {
+                    "freq" => eq.set_band(i, Some(v), None, None),
+                    "q" => eq.set_band(i, None, Some(v), None),
+                    "gain" => eq.set_band(i, None, None, Some(v)),
+                    _ => false,
+                }
+            }
+            Instance::Compressor(c) => match key {
+                "threshold" => { c.threshold_db = v; true }
+                "ratio" => { c.ratio = v.max(1.0); true }
+                "knee" => { c.knee_db = v.max(0.0); true }
+                "makeup" => { c.makeup_db = v; true }
+                _ => false,
+            },
+            Instance::Limiter(l) => { if key == "ceiling" { l.ceiling_db = v; true } else { false } }
+            Instance::Saturator(s) => match key {
+                "drive" => { s.drive = v.clamp(0.0, 1.0); true }
+                "bias" => { s.bias = v; true }
+                "mix" => { s.mix = v.clamp(0.0, 1.0); true }
+                _ => false,
+            },
+            Instance::AdaptiveSat(a) => match key {
+                "drive" => { a.base_drive = v.clamp(0.0, 1.0); true }
+                "bias" => { a.sat.bias = v; true }
+                "mix" => { a.sat.mix = v.clamp(0.0, 1.0); true }
+                _ => false,
+            },
+            Instance::Comb(_, mix) | Instance::Sub(_, mix) => {
+                if key == "mix" { *mix = v; true } else { false }
+            }
+            Instance::Crush(c) => { if key == "bits" { c.set_bits(v.round().clamp(1.0, 16.0) as u8); true } else { false } }
+            Instance::Gate(g) => { if key == "threshold" { g.set_threshold_db(v); true } else { false } }
+            Instance::Reverb(r) => match key {
+                "mix" => { r.mix = v.clamp(0.0, 1.0); true }
+                "width" => { r.width = v.clamp(0.0, 1.0); true }
+                "size" => { r.set_size(v); true }
+                "damp" => { r.set_damp(v); true }
+                _ => false,
+            },
+            Instance::Delay(d) => match key {
+                "mix" => { d.mix = v.clamp(0.0, 1.0); true }
+                "feedback" => { d.set_feedback(v); true }
+                "damp" => { d.set_damp_hz(rate, v); true }
+                _ => false,
+            },
+            Instance::Blend(_, opacity) => { if key == "opacity" { *opacity = v.clamp(0.0, 1.0); true } else { false } }
+            Instance::Multiband(_) | Instance::Shift(_) | Instance::RealTune(_)
+            | Instance::TapeStop(_) | Instance::Halftime(_)
+            | Instance::Transform(_) | Instance::Color(_) | Instance::Retime(_) => false,
+        }
+    }
 }
 
 /// Build a running effect from a project's stored description, or `None` when
@@ -538,19 +662,20 @@ pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> 
     Some(match effect.kind.as_str() {
         "eq" => {
             let n = p(q, "bands", 1.0).clamp(1.0, 8.0) as usize;
-            let mut eq = Eq::default();
+            let mut eq = Eq { rate, ..Eq::default() };
             for i in 0..n {
-                eq.bands.push(Biquad::design(
-                    match p(q, &format!("kind{i}"), 0.0) as i32 {
+                let d = BandDesign {
+                    kind: match p(q, &format!("kind{i}"), 0.0) as i32 {
                         1 => BandKind::LowShelf, 2 => BandKind::HighShelf,
                         3 => BandKind::LowPass, 4 => BandKind::HighPass,
                         _ => BandKind::Peaking,
                     },
-                    rate,
-                    p(q, &format!("freq{i}"), 1000.0),
-                    p(q, &format!("q{i}"), 0.707),
-                    p(q, &format!("gain{i}"), 0.0),
-                ));
+                    freq: p(q, &format!("freq{i}"), 1000.0),
+                    q: p(q, &format!("q{i}"), 0.707),
+                    gain_db: p(q, &format!("gain{i}"), 0.0),
+                };
+                eq.bands.push(Biquad::design(d.kind, rate, d.freq, d.q, d.gain_db));
+                eq.designs.push(d);
             }
             Instance::Eq(eq)
         }
@@ -1050,6 +1175,101 @@ mod tests {
         let effect = studio_core::Effect { kind: "gain".into(), params: Default::default(), enabled: true };
         let mut inst = instantiate(&effect, RATE).unwrap();
         assert_eq!(inst.process_audio(0.37), 0.37);
+    }
+}
+
+#[cfg(test)]
+mod live_param_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn fx(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
+        studio_core::Effect {
+            kind: kind.into(),
+            params: params.iter().map(|(k, v)| ((*k).to_string(), *v)).collect::<BTreeMap<_, _>>(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn the_static_live_table_and_set_param_agree_on_every_schema_key() {
+        // `is_live_param` is what a UI offers "automate" on; `set_param`
+        // is what the render calls. They must be the same set, and the
+        // rest must refuse quietly. Every kind, every expanded key (an
+        // EQ with three bands, so the digit rule is exercised past 0).
+        let mut live_seen = 0;
+        for (kind, _) in schema::KINDS {
+            let mut params = schema::defaults(kind);
+            if *kind == "eq" { params.insert("bands".into(), 3.0); }
+            let e = studio_core::Effect { kind: (*kind).into(), params, enabled: true };
+            let mut inst = instantiate(&e, 48_000.0).expect(kind);
+            for spec in schema::expand(&e).unwrap() {
+                let ok = inst.set_param(&spec.key, spec.default, 48_000.0);
+                assert_eq!(ok, Instance::is_live_param(kind, &spec.key),
+                           "{kind}.{}: set_param={ok}, is_live_param says otherwise", spec.key);
+                if ok { live_seen += 1; }
+            }
+            assert!(!inst.set_param("no-such-key", 1.0, 48_000.0), "{kind}: an unknown key is refused");
+            assert!(!Instance::is_live_param(kind, "no-such-key"));
+            // A set to the default changed nothing audible: the instance
+            // still runs and stays finite.
+            for i in 0..200 { assert!(inst.process_audio((i as f32 * 0.1).sin() * 0.5).is_finite()); }
+        }
+        assert!(live_seen >= 30, "the live set is not a handful: {live_seen}");
+        assert!(!Instance::is_live_param("eq", "freq"), "an EQ key needs its band index");
+        assert!(!Instance::is_live_param("eq", "kind0"), "a band's TYPE is a redesign from scratch, not a ride");
+        assert!(Instance::is_live_param("eq", "gain7"));
+    }
+
+    #[test]
+    fn an_eq_sweep_keeps_the_filters_memory_where_a_reinstantiate_would_not() {
+        // A low-pass swept 200 Hz → 4 kHz over a 200 Hz tone, redesigned
+        // every 64 samples. Redesigning in place keeps x1/x2/y1/y2; the
+        // alternative (build a fresh instance per block) restarts the
+        // filter from zero and puts a step in the output every block.
+        let rate = 48_000.0;
+        let tone = |i: usize| (2.0 * std::f32::consts::PI * 200.0 * i as f32 / rate).sin() * 0.5;
+        let params = [("bands", 1.0), ("kind0", 3.0), ("freq0", 200.0), ("q0", 0.707), ("gain0", 0.0)];
+        let mut live = instantiate(&fx("eq", &params), rate).unwrap();
+        let mut out_live = Vec::new();
+        let mut out_restart = Vec::new();
+        let blocks = 150;
+        for b in 0..blocks {
+            let freq = 200.0 + (4000.0 - 200.0) * b as f32 / blocks as f32;
+            assert!(live.set_param("freq0", freq, rate));
+            let mut p = params.to_vec();
+            p[2] = ("freq0", freq);
+            let mut fresh = instantiate(&fx("eq", &p), rate).unwrap();
+            for i in 0..64 {
+                let x = tone(b * 64 + i);
+                out_live.push(live.process_audio(x));
+                out_restart.push(fresh.process_audio(x));
+            }
+        }
+        let max_step = |o: &[f32]| o.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        // A 200 Hz tone at 48k moves at most ~0.013 per sample; the live
+        // sweep stays near that, the restart path jumps by an order more.
+        let (live_step, restart_step) = (max_step(&out_live), max_step(&out_restart));
+        assert!(live_step < 0.03, "live redesign: no clicks ({live_step})");
+        assert!(restart_step > live_step * 3.0, "a restart per block clicks ({restart_step} vs {live_step})");
+        assert!(out_live.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn a_room_shrunk_mid_tail_decays_faster_from_there() {
+        let rate = 48_000.0;
+        let mut r = instantiate(&fx("reverb", &[("size", 1.0), ("damp", 0.0), ("mix", 1.0), ("channels", 1.0)]), rate).unwrap();
+        let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
+        let mut tail: Vec<f32> = (0..48_000).map(|i| r.process_audio(if i == 0 { 1.0 } else { 0.0 })).collect();
+        let before = rms(&tail[40_000..48_000]);
+        assert!(r.set_param("size", 0.0, rate));
+        tail.clear();
+        tail.extend((0..24_000).map(|_| r.process_audio(0.0)));
+        let after = rms(&tail[16_000..24_000]);
+        assert!(after < before * 0.1, "size 1 → 0 mid-tail: the room empties ({before} → {after})");
+        // The mix can be ridden to zero and the dry comes straight through.
+        assert!(r.set_param("mix", 0.0, rate));
+        assert_eq!(r.process_audio(0.25), 0.25);
     }
 }
 
