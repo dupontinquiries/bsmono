@@ -321,6 +321,18 @@ MUTANTS = [
     ("stream/out-of-plan-not-counted", "crates/vidkit-ytdlp/src/http.rs",
      "                self.plan_misses += 1;", "                "),
 
+    # --- device profiles ---------------------------------------------------------
+    ("caps/m3-claims-a-gpu", "crates/vidkit-core/src/caps.rs",
+     "        gpu: GpuClass::Unaccelerated,", "        gpu: GpuClass::Vulkan,"),
+    ("caps/every-gpu-imports-dmabuf", "crates/vidkit-core/src/caps.rs",
+     "    pub fn can_import_dmabuf(self) -> bool {\n        matches!(self, GpuClass::Vulkan)\n    }",
+     "    pub fn can_import_dmabuf(self) -> bool {\n        true\n    }"),
+    ("caps/m3-loses-hardware-av1", "crates/vidkit-core/src/caps.rs",
+     "            mk(Codec::Av1, 10, 3840, 2160, 60),", "            // removed"),
+    ("caps/cpu-copy-never-reported", "crates/vidkit-core/src/caps.rs",
+     "            Some(c) => c.delivery == Delivery::DmaBuf && !self.gpu.can_import_dmabuf(),",
+     "            Some(_) => false,"),
+
     # --- av1 sequence header ----------------------------------------------------
     ("av1/sequence-header-never-emitted", "crates/vidkit-mp4/src/demux.rs",
      "                    let with_seq = s.is_sync && self.needs_parameter_sets;",

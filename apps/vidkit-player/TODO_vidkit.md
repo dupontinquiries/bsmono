@@ -42,8 +42,16 @@ untestable wrapper would have looked like progress.
 ## Done and verified
 
 - Container demuxing, MP4 and WebM, incl. Annex-B conversion — *verified*
-- Format selection against runtime `DeviceCaps`; Asahi prefers AV1, Fairphone
-  prefers VP9 — *verified* by test, *assumed* on real hardware
+- Format selection against `DeviceCaps`. Three profiles with genuinely opposed
+  preferences, each pinned by a test: Fairphone/QCM6490 Venus (VP9 fixed-
+  function, no AV1), Asahi M1/M2 (neither in hardware; AV1 fastest in software
+  via dav1d), Asahi M3 (**AV1 fixed-function**, and no usable GPU). *verified*
+  by test, *assumed* on real hardware — the M3 resolution/fps limits in
+  particular are placeholders, since the announcement says AV1 works and not to
+  what limits
+- `GpuClass`: hardware decode does NOT imply a usable GPU. M3 decodes AV1 into
+  DMA-BUFs with no driver to import them, so every frame is mapped and
+  converted on the CPU — `frames_need_cpu_copy` reports it. *verified*
 - 10-bit (P010 + I420_10LE) — *verified*, incl. GPU/CPU parity on lavapipe
 - Player loop, A/V sync, frame queue, buffer recycling — *verified*
 - Gestures: scrub / volume / speed / rotate / pinch — *verified* by xdotool

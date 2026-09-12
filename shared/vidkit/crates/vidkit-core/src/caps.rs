@@ -173,12 +173,55 @@ impl PlaybackBudget {
     }
 }
 
+/// What the GPU can be relied on for.
+///
+/// Separate from [`Delivery`], which says how the DECODER hands frames over.
+/// This says whether there is a GPU worth converting and presenting on, and
+/// the two are independent: Asahi M3 decodes AV1 in fixed-function hardware
+/// straight into DMA-BUFs and has no usable GPU to import them with.
+///
+/// That combination is the reason this exists. Before M3 every profile with
+/// hardware decode also had a working Vulkan driver, so "has a decoder" and
+/// "has a GPU" were the same question and nothing had to ask the second one.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum GpuClass {
+    /// No GPU driver at all; everything is CPU.
+    None,
+    /// A driver exists but is not something to lean on -- llvmpipe, or a
+    /// bring-up driver that works and is neither fast nor power-efficient.
+    /// Asahi's own words for M3 are "do not expect performant or
+    /// power-efficient 3D acceleration right now".
+    Unaccelerated,
+    /// A real Vulkan driver: convert and present on it.
+    Vulkan,
+}
+
+impl GpuClass {
+    /// Should the colour conversion run on the GPU?
+    ///
+    /// Only for a real driver. On an unaccelerated one the shader path costs
+    /// more than the CPU converter and burns battery doing it -- the upload is
+    /// still 1.5 bytes a pixel, but the shader runs on the CPU anyway and the
+    /// round trip is added for nothing.
+    pub fn worth_converting_on(self) -> bool {
+        matches!(self, GpuClass::Vulkan)
+    }
+
+    /// Can a decoder's DMA-BUF be imported rather than copied?
+    pub fn can_import_dmabuf(self) -> bool {
+        matches!(self, GpuClass::Vulkan)
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct DeviceCaps {
     /// Free-form, for logs and the "why did it pick that" UI panel.
     pub name: String,
     pub caps: Vec<DecodeCap>,
     pub budget: PlaybackBudget,
+    /// What the GPU is good for. See [`GpuClass`] -- hardware decode does not
+    /// imply a usable GPU, and on Asahi M3 it explicitly does not.
+    pub gpu: GpuClass,
 }
 
 impl DeviceCaps {
@@ -193,6 +236,19 @@ impl DeviceCaps {
     pub fn can_decode(&self, p: &VideoProfile, w: u32, h: u32, fps: u32) -> bool {
         self.best_path(p, w, h, fps).is_some()
     }
+
+    /// Will a decoded frame have to be copied through the CPU to be shown?
+    ///
+    /// True when the decoder hands back DMA-BUFs and there is no GPU to import
+    /// them -- the M3 case. Worth knowing before choosing a stream: a 4K frame
+    /// that must be mapped and converted on the CPU every 16ms is a very
+    /// different budget from one imported as a texture.
+    pub fn frames_need_cpu_copy(&self, p: &VideoProfile, w: u32, h: u32, fps: u32) -> bool {
+        match self.best_path(p, w, h, fps) {
+            Some(c) => c.delivery == Delivery::DmaBuf && !self.gpu.can_import_dmabuf(),
+            None => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +262,11 @@ impl DeviceCaps {
 
 /// Apple M1/M2 under Asahi.
 ///
-/// The important fact: **there is no VP9 or AV1 hardware decode here.** The AGX
+/// The important fact for M1 AND M2: **there is no VP9 or AV1 hardware decode
+/// here.** M3 is different and has its own profile — see [`asahi_m3`], where
+/// AV1 IS fixed-function and the GPU is the part that is missing instead.
+///
+/// The original fact, for M1/M2: The AGX
 /// video block (AVD) is driven by the `apple,avd` V4L2 stateless driver and, as
 /// of my knowledge, exposes H.264 only. Honeykrisp does not expose
 /// `VK_KHR_video_decode_*`. So VP9 and AV1 are CPU work — but on Firestorm/Avalanche
@@ -218,6 +278,7 @@ impl DeviceCaps {
 pub fn asahi_m_series() -> DeviceCaps {
     DeviceCaps {
         name: "Apple M-series (Asahi)".into(),
+        gpu: GpuClass::Vulkan,
         caps: vec![
             DecodeCap {
                 codec: Codec::H264,
@@ -289,10 +350,86 @@ pub fn asahi_m_series() -> DeviceCaps {
 ///
 /// Caveat worth its own line: mainline Venus on these SoCs needs signed
 /// firmware present and the right `venus` DT node. If probing finds no
+/// Asahi on an M3-series Mac.
+///
+/// From the Asahi announcement that merged M3 support into the installer:
+/// "hardware accelerated video decoding including support for AV1" works, and
+/// separately "the only major exceptions remain full DCP support and the GPU
+/// ... Do not expect performant or power-efficient 3D acceleration right now."
+///
+/// **That inverts the M1/M2 reasoning twice over and is why this is its own
+/// profile rather than a tweak to the other one.**
+///
+/// On M1/M2 the AVD does H.264 and HEVC only, so VP9 and AV1 are dav1d on the
+/// big cores, and the model prefers AV1 because dav1d beats ffvp9. Here AV1 is
+/// FIXED-FUNCTION: it stops being the best software option and becomes the
+/// cheapest option outright, by a margin nothing in software approaches.
+///
+/// And there is no GPU worth using. Every other hardware-decode profile pairs
+/// a decoder with a Vulkan driver, so the frame lands in a DMA-BUF and is
+/// imported as a texture. Here it lands in a DMA-BUF and has to be mapped and
+/// converted on the CPU, which is a real cost at 4K and the reason
+/// `frames_need_cpu_copy` exists.
+///
+/// *ASSUMED*, and flagged as such: the AV1 decode limits below are a guess.
+/// The announcement says AV1 works and does not say to what resolution or
+/// frame rate, and nobody has run this against an M3. Treat the numbers as
+/// placeholders to be replaced by a runtime probe, not as measurements.
+pub fn asahi_m3() -> DeviceCaps {
+    let mk = |codec: Codec, depth: u8, w: u32, h: u32, fps: u32| DecodeCap {
+        codec,
+        max_bit_depth: depth,
+        max_chroma: Chroma::Yuv420,
+        max_width: w,
+        max_height: h,
+        max_fps_at_max_size: fps,
+        cost: Cost::Fixed,
+        delivery: Delivery::DmaBuf,
+        backend: Backend::V4l2Stateless,
+    };
+    DeviceCaps {
+        name: "Asahi (M3)".into(),
+        gpu: GpuClass::Unaccelerated,
+        caps: vec![
+            // The headline: AV1 in fixed-function silicon.
+            mk(Codec::Av1, 10, 3840, 2160, 60),
+            mk(Codec::H264, 8, 3840, 2160, 60),
+            mk(Codec::Hevc, 10, 3840, 2160, 60),
+            // VP9 is still software here -- the AVD does not do it, and that is
+            // the opposite of the Fairphone, where VP9 is the hardware path and
+            // AV1 is not.
+            DecodeCap {
+                codec: Codec::Vp9,
+                max_bit_depth: 10,
+                max_chroma: Chroma::Yuv420,
+                max_width: 1920,
+                max_height: 1080,
+                max_fps_at_max_size: 60,
+                cost: Cost::SoftwareSimd,
+                delivery: Delivery::CpuPlanes,
+                backend: Backend::Dav1d,
+            },
+        ],
+        budget: PlaybackBudget {
+            display_width: 3024,
+            display_height: 1964,
+            display_max_hz: 120,
+            hdr_capable: true,
+            max_bitrate: None,
+            on_battery: true,
+            battery_max_long_edge: 1920,
+            // AV1 in hardware makes 60 affordable on battery here, unlike
+            // the software-decode profiles that drop to 30.
+            battery_max_hz: 60,
+        },
+    }
+}
+
 /// `/dev/video*` M2M decoder, fall back to `fairphone_no_venus()`.
 pub fn fairphone_venus() -> DeviceCaps {
     DeviceCaps {
         name: "Fairphone (Qualcomm Venus, postmarketOS)".into(),
+        gpu: GpuClass::Vulkan,
         caps: vec![
             DecodeCap {
                 codec: Codec::H264,
@@ -386,6 +523,7 @@ pub fn desktop_full_hw() -> DeviceCaps {
     };
     DeviceCaps {
         name: "Desktop (VAAPI, full fixed-function)".into(),
+        gpu: GpuClass::Vulkan,
         caps: vec![
             mk(Codec::H264, 8),
             mk(Codec::Hevc, 10),
@@ -461,10 +599,103 @@ mod tests {
     /// profiles above list one path per codec, which meant `best_path`'s
     /// preference for the cheapest was never actually exercised: with one
     /// candidate, picking the min and picking the max are the same thing.
+    fn av1(depth: u8) -> VideoProfile {
+        VideoProfile {
+            codec: Codec::Av1,
+            profile: Some(0),
+            bit_depth: depth,
+            chroma: Chroma::Yuv420,
+            level: None,
+        }
+    }
+
+    fn vp9(depth: u8) -> VideoProfile {
+        VideoProfile {
+            codec: Codec::Vp9,
+            profile: Some(0),
+            bit_depth: depth,
+            chroma: Chroma::Yuv420,
+            level: None,
+        }
+    }
+
+    /// The headline change: on M3 the AVD decodes AV1 in fixed-function
+    /// silicon. On M1/M2 the same codec is dav1d on the big cores.
+    #[test]
+    fn m3_decodes_av1_in_hardware_and_m1_does_not() {
+        let m3 = asahi_m3();
+        let older = asahi_m_series();
+        let p = av1(10);
+
+        let m3_path = m3.best_path(&p, 1920, 1080, 60).expect("m3 must decode av1");
+        assert_eq!(m3_path.cost, Cost::Fixed, "m3 av1 is not fixed-function");
+
+        let old_path = older
+            .best_path(&p, 1920, 1080, 60)
+            .expect("m1 must still decode av1");
+        assert!(
+            !old_path.cost.is_hardware(),
+            "m1/m2 av1 became hardware, which would make this profile wrong"
+        );
+    }
+
+    /// And the preference inverts against the Fairphone, which is the whole
+    /// reason the capability model exists: VP9 is the hardware path on Venus
+    /// and the software one here, and AV1 is the reverse.
+    #[test]
+    fn m3_and_venus_disagree_about_which_codec_is_cheap() {
+        let m3 = asahi_m3();
+        let fp = fairphone_venus();
+
+        let m3_av1 = m3.best_path(&av1(8), 1920, 1080, 30).unwrap().cost;
+        let m3_vp9 = m3.best_path(&vp9(8), 1920, 1080, 30).unwrap().cost;
+        assert!(m3_av1 < m3_vp9, "m3 should prefer av1: {m3_av1:?} vs {m3_vp9:?}");
+
+        let fp_vp9 = fp.best_path(&vp9(8), 1920, 1080, 30).unwrap().cost;
+        let fp_av1 = fp.best_path(&av1(8), 1920, 1080, 30).map(|c| c.cost);
+        assert!(
+            fp_av1.map(|c| fp_vp9 < c).unwrap_or(true),
+            "the fairphone should prefer vp9: {fp_vp9:?} vs {fp_av1:?}"
+        );
+    }
+
+    /// The combination nothing in the model could express before: hardware
+    /// decode into DMA-BUFs with no GPU to import them, so every frame is
+    /// mapped and converted on the CPU.
+    #[test]
+    fn m3_decodes_in_hardware_and_still_copies_through_the_cpu() {
+        let m3 = asahi_m3();
+        assert!(!m3.gpu.can_import_dmabuf(), "m3 has no usable GPU");
+        assert!(!m3.gpu.worth_converting_on(), "m3 should convert on the CPU");
+        assert!(
+            m3.frames_need_cpu_copy(&av1(10), 1920, 1080, 60),
+            "a DMA-BUF with no importer must be reported as a CPU copy"
+        );
+    }
+
+    /// ...and the profiles with a real driver must not be dragged along with
+    /// it, or the GPU path is switched off everywhere.
+    #[test]
+    fn a_real_driver_imports_rather_than_copies() {
+        for d in [asahi_m_series(), desktop_full_hw(), fairphone_venus()] {
+            assert!(
+                d.gpu.can_import_dmabuf(),
+                "{} lost its GPU path",
+                d.name
+            );
+            assert!(
+                !d.frames_need_cpu_copy(&vp9(8), 1280, 720, 30) || d.gpu == GpuClass::Unaccelerated,
+                "{} reported a needless CPU copy",
+                d.name
+            );
+        }
+    }
+
     #[test]
     fn among_two_paths_for_one_codec_the_cheaper_wins() {
         let d = DeviceCaps {
             name: "hw + sw fallback for the same codec".into(),
+            gpu: GpuClass::Vulkan,
             caps: vec![
                 DecodeCap {
                     codec: Codec::Vp9,

@@ -1012,6 +1012,11 @@ impl vidkit_stream::TransportFactory<Box<dyn HttpTransport + Send>> for SchemeFa
 /// the decoder cannot manage, so it is one function to replace rather than a
 /// choice scattered through the app.
 pub fn assumed_caps() -> vidkit_core::caps::DeviceCaps {
+    // aarch64 covers at least three shapes with opposite preferences: Venus
+    // (VP9 in hardware, no AV1), Asahi M1/M2 (neither in hardware, AV1 fastest
+    // in software) and Asahi M3 (AV1 in hardware, no usable GPU). Guessing one
+    // from the triple is wrong for two of them, which is why the probe is the
+    // real fix and this is one function.
     if cfg!(target_arch = "aarch64") {
         // Could equally be Asahi, whose preferences are the opposite way round
         // — AV1 in software beats VP9 there, and the reverse on Venus. Guessing
