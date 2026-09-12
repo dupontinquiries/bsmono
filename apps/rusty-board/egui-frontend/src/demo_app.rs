@@ -1010,7 +1010,7 @@ impl Feel {
                         // the borrow ends keeps both without a clone of the layout.
                         top_edge = Some(crate::topedge::classify(press, release, len, ms, col, m));
                     }
-                    if self.swipe.update(ui, render, board_rect, &adaptive).is_some() {
+                    if self.swipe.update_half(ui, render, board_rect, &adaptive, self.style.half).is_some() {
                         // A completed swipe suppresses nothing: the candidates appear above and
                         // the user picks. Committing automatically would fight the tap that the
                         // same gesture's lift also produces on some touch stacks.

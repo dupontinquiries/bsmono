@@ -155,6 +155,25 @@ impl SwipeState {
         board: Rect,
         adaptive: &Adaptive,
     ) -> Option<Vec<WordCandidate>> {
+        self.update_half(ui, layout, board, adaptive, crate::halfboard::Side::Off)
+    }
+
+    /// [`Self::update`] told which side the half keyboard is on.
+    ///
+    /// The letter region has to SHRINK with the keys. In half-keyboard mode the rows are
+    /// compacted to one side and the freed strip carries a space zone — but this function
+    /// built its letter rect from the full board width, so the strip was inside "letters" and
+    /// a swipe into it never registered as leaving them. The zone could be tapped and could
+    /// not be swiped through, which is the half that makes it a springboard rather than a
+    /// button.
+    pub fn update_half(
+        &mut self,
+        ui: &Ui,
+        layout: &Layout,
+        board: Rect,
+        adaptive: &Adaptive,
+        half: crate::halfboard::Side,
+    ) -> Option<Vec<WordCandidate>> {
         let (down, pos, time) = ui.input(|i| {
             (
                 i.pointer.primary_down(),
@@ -223,9 +242,16 @@ impl SwipeState {
         // The letter region is the board minus its last row: on every layout here that row
         // is space and the utility keys, not letters. Using the whole board instead would
         // put the boundary at the screen edge, where a thumb cannot cross it.
+        // The keys' own rect, not the board's: `halfboard` compacts the rows to one side and
+        // the freed strip is not letters. Using the board width here left the strip inside the
+        // letter region, so a path into it was still "inside" and delimited nothing.
+        let keys_rect = half.board_rect(board);
         let letters = Rect::from_min_max(
-            board.min,
-            egui::pos2(board.max.x, (board.max.y - adaptive.min_touch_target).max(board.min.y)),
+            keys_rect.min,
+            egui::pos2(
+                keys_rect.max.x,
+                (keys_rect.max.y - adaptive.min_touch_target).max(keys_rect.min.y),
+            ),
         );
         let pts: Vec<egui::Pos2> =
             self.path.iter().map(|p| egui::pos2(p.x as f32, p.y as f32)).collect();

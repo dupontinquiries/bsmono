@@ -413,6 +413,50 @@ mod zone_tests {
         assert!(zone_at(&z, Pos2::new(250.0, 100.0), false).is_none(), "that is a letter");
     }
 
+    /// THE STRIP HAS TO BE OUTSIDE THE LETTERS, or a swipe through it delimits nothing.
+    ///
+    /// `zones` puts a space zone in the strip `halfboard` frees, and it could be TAPPED —
+    /// but `SwipeState::update` built its letter region from the full board width, so a path
+    /// into the strip was still "inside the letters" and never produced an exit. The zone was
+    /// a button, not a springboard, which is the half that matters: the whole point is
+    /// swiping a word, brushing the strip, and swiping the next one without lifting.
+    #[test]
+    fn a_path_into_the_freed_strip_delimits_a_word() {
+        let board = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0));
+        let side = crate::halfboard::Side::Left;
+        let keys = side.board_rect(board);
+        let strip = side.free_zone(board).expect("a left half frees a right strip");
+        assert!(strip.min.x >= keys.max.x - 1.0, "the strip should be beside the keys");
+
+        // The letter region as `update_half` computes it: the KEYS' rect, minus the last row.
+        let letters = Rect::from_min_max(
+            keys.min,
+            egui::pos2(keys.max.x, keys.max.y - 40.0),
+        );
+
+        // A swipe: inside the keys, out through the strip, back into the keys.
+        let path = vec![
+            egui::pos2(keys.min.x + 20.0, keys.min.y + 20.0),
+            egui::pos2(keys.max.x - 10.0, keys.min.y + 20.0),
+            // TWO points inside the strip, not one. `dwell` accumulates between consecutive
+            // OUTSIDE samples, so a single point out there is a graze by construction and the
+            // hysteresis correctly refuses it — a real finger crossing an 88pt strip is
+            // sampled several times. My first version of this test had one point and failed,
+            // which was the test being unrealistic rather than the code being wrong.
+            egui::pos2(strip.min.x + 10.0, keys.min.y + 25.0),
+            egui::pos2(strip.center().x, keys.min.y + 30.0),
+            egui::pos2(keys.max.x - 10.0, keys.min.y + 40.0),
+            egui::pos2(keys.min.x + 20.0, keys.min.y + 40.0),
+        ];
+        let seg = segment(&path, letters);
+        assert_eq!(seg.ranges.len(), 2, "the strip did not split the swipe: {seg:?}");
+        assert_eq!(seg.delimiters[0].edge, Edge::Right, "{seg:?}");
+
+        // And with the FULL BOARD as the letter region — the bug — the same path is one word.
+        let whole = Rect::from_min_max(board.min, egui::pos2(board.max.x, board.max.y - 40.0));
+        assert_eq!(segment(&path, whole).ranges.len(), 1, "the premise: the old rect swallowed it");
+    }
+
     /// The freed strip finally has a job — this is what `halfboard::free_zone` was returning
     /// it for.
     #[test]
