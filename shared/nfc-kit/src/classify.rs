@@ -21,13 +21,18 @@
 //! mapping from a specific 2-byte code to a specific chip family. Section
 //! 3.1.3.2.3.2 says outright that "its Standard and Card Name describing
 //! bytes must be interpreted according to the Part 3 Supplemental
-//! Document, maintained by PC/SC" — a separate document, not this one, and
-//! not something available to check in this session either. So
-//! `card_name_family`'s specific code→chip entries remain exactly as
-//! uncertain as before: populated from values widely and consistently
-//! cited across libnfc/pcsc community references, not independently
-//! verified against that Supplemental Document. An unrecognized code, or
-//! an ATR that doesn't follow this structural convention at all (a real
+//! Document, maintained by PC/SC" — a separate document, still not
+//! available to check directly in this session. `card_name_family`'s
+//! entries are instead sourced from `pcsc-tools`' `smartcard_list.txt`
+//! (maintained by Ludovic Rousseau, who also maintains `pcsc-lite` itself),
+//! whose entries are each labeled "as per PCSC std part3" — a strong,
+//! named, checkable secondary source, not the vaguer "widely cited
+//! community references" this module relied on before. It caught a real
+//! error in the process: an earlier hand-picked entry claimed MIFARE
+//! DESFire used code `0x0344`, which doesn't appear anywhere in the
+//! verified table — DESFire mostly doesn't use this synthetic ATR
+//! convention at all (see `classify`'s fallback case). An unrecognized
+//! code, or an ATR that doesn't follow this structural convention at all (a real
 //! ISO 7816 contact card, or a reader that doesn't synthesize this
 //! format), falls back honestly to "unrecognized", never a guessed
 //! specific chip name.
@@ -70,24 +75,80 @@ pub struct CardProfile {
 /// piece of this ATR convention that IS a truly fixed byte string.
 const PCSC_STORAGE_RID: [u8; 5] = [0xA0, 0x00, 0x00, 0x03, 0x06];
 
+/// Card-name codes for the PC/SC storage-card ATR convention (Table 3-6).
+/// Sourced from `pcsc-tools`' `smartcard_list.txt` (maintained by Ludovic
+/// Rousseau, who also maintains `pcsc-lite` itself — about as authoritative
+/// a secondary source as exists for this), whose own entries are each
+/// labeled "as per PCSC std part3". This replaces an earlier, much smaller
+/// hand-picked table built from memory of community references — that
+/// version had at least one confirmed wrong entry: a fabricated `0x0344`
+/// code for MIFARE DESFire, which doesn't actually appear in the verified
+/// table at all. Checked against real pcsc-tools examples: DESFire mostly
+/// doesn't use this synthetic ATR convention in the first place (see
+/// `classify`'s fallback case, and the `desfire_real_atr` test fixture).
 fn card_name_family(code: u16) -> Option<(&'static str, &'static [&'static str])> {
-    // Widely-cited values, not independently verified against the primary
-    // spec in this session — see this module's own header. Extend rather
-    // than trust blindly if precision matters for a specific purchase
-    // decision.
     match code {
+        0x0000 => Some(("Storage card (name not given by reader)", &["ISO/IEC 14443 or 15693 (exact variant unspecified)"])),
         0x0001 => Some(("MIFARE Classic 1K", &["ISO/IEC 14443-3A", "MIFARE Classic (Crypto1)"])),
         0x0002 => Some(("MIFARE Classic 4K", &["ISO/IEC 14443-3A", "MIFARE Classic (Crypto1)"])),
         0x0003 => Some(("MIFARE Ultralight", &["ISO/IEC 14443-3A", "MIFARE Ultralight (no crypto)"])),
+        0x0004 => Some(("Infineon SLE55R_XXXX", &["ISO/IEC 14443-2/3"])),
+        0x0006 => Some(("STMicroelectronics SR176", &["ISO/IEC 14443-2/3B"])),
+        0x0007 => Some(("STMicroelectronics SRI X4K", &["ISO/IEC 14443-2/3B"])),
+        0x0008 => Some(("Atmel AT88RF020", &["ISO/IEC 14443, memory tag"])),
+        0x0009 => Some(("Atmel AT88SC0204CRF", &["ISO/IEC 14443, memory tag"])),
+        0x000A => Some(("Atmel AT88SC0808CRF", &["ISO/IEC 14443, memory tag"])),
+        0x000B => Some(("Atmel AT88SC1616CRF", &["ISO/IEC 14443, memory tag"])),
+        0x000C => Some(("Atmel AT88SC3216CRF", &["ISO/IEC 14443, memory tag"])),
+        0x000D => Some(("Atmel AT88SC6416CRF", &["ISO/IEC 14443, memory tag"])),
+        0x000E => Some(("STMicroelectronics SRF55V10P", &["ISO/IEC 14443-2/3B"])),
+        0x000F => Some(("STMicroelectronics SRF55V02P", &["ISO/IEC 14443-2/3B"])),
+        0x0010 => Some(("STMicroelectronics SRF55V10S", &["ISO/IEC 14443-2/3B"])),
+        0x0011 => Some(("STMicroelectronics SRF55V02S", &["ISO/IEC 14443-2/3B"])),
+        0x0012 => Some(("Tag-it (Texas Instruments)", &["ISO/IEC 15693"])),
+        0x0013 => Some(("NXP LRI512", &["ISO/IEC 15693"])),
+        0x0014 => Some(("NXP ICODE SLI", &["ISO/IEC 15693"])),
+        0x0015 => Some(("NXP TEMPSENS", &["ISO/IEC 15693, temperature-sensing tag"])),
+        0x0016 => Some(("NXP I-CODE1", &["ISO/IEC 15693-adjacent (proprietary)"])),
+        0x0017 => Some(("Inside Secure PicoPass 2K", &["ISO/IEC 15693 (HID iCLASS family)"])),
+        0x0018 => Some(("Inside Secure PicoPass 2KS", &["ISO/IEC 15693 (HID iCLASS family)"])),
+        0x0019 => Some(("Inside Secure PicoPass 16K", &["ISO/IEC 15693 (HID iCLASS family)"])),
+        0x001A => Some(("Inside Secure PicoPass 16Ks", &["ISO/IEC 15693 (HID iCLASS family)"])),
+        0x001B => Some(("Inside Secure PicoPass 16K (8x2)", &["ISO/IEC 15693 (HID iCLASS family)"])),
+        0x001C => Some(("Inside Secure PicoPass 16KS (8x2)", &["ISO/IEC 15693 (HID iCLASS family)"])),
+        0x001D => Some(("Inside Secure PicoPass 32KS (16+16)", &["ISO/IEC 15693 (HID iCLASS family)"])),
+        0x001E => Some(("Inside Secure PicoPass 32KS (16+8x2)", &["ISO/IEC 15693 (HID iCLASS family)"])),
+        0x001F => Some(("Inside Secure PicoPass 32KS (8x2+16)", &["ISO/IEC 15693 (HID iCLASS family)"])),
+        0x0020 => Some(("Inside Secure PicoPass 32KS (8x2+8x2)", &["ISO/IEC 15693 (HID iCLASS family)"])),
+        0x0021 => Some(("NXP LRI64", &["ISO/IEC 15693"])),
+        0x0022 => Some(("NXP I-CODE UID", &["ISO/IEC 15693"])),
+        0x0023 => Some(("NXP I-CODE EPC", &["ISO/IEC 15693"])),
+        0x0024 => Some(("NXP LRI12", &["ISO/IEC 15693"])),
+        0x0025 => Some(("NXP LRI128", &["ISO/IEC 15693"])),
         0x0026 => Some(("MIFARE Mini", &["ISO/IEC 14443-3A", "MIFARE Classic (Crypto1)"])),
-        0x0036 => Some(("MIFARE Plus 2K (SL1)", &["ISO/IEC 14443-3A", "MIFARE Classic-compatible"])),
-        0x0037 => Some(("MIFARE Plus 4K (SL1)", &["ISO/IEC 14443-3A", "MIFARE Classic-compatible"])),
-        0x0038 => Some(("MIFARE Plus 2K (SL2)", &["ISO/IEC 14443-4", "MIFARE Plus (AES)"])),
-        0x0039 => Some(("MIFARE Plus 4K (SL2)", &["ISO/IEC 14443-4", "MIFARE Plus (AES)"])),
-        0x0344 => Some(("MIFARE DESFire", &["ISO/IEC 14443-4", "MIFARE DESFire (AES/3DES)"])),
-        0xF004 => Some(("Topaz/Jewel", &["ISO/IEC 14443-3A (NFC Type 1 Tag)"])),
-        0xF011 => Some(("FeliCa 212K", &["JIS X 6319-4 (FeliCa)"])),
-        0xF012 => Some(("FeliCa 424K", &["JIS X 6319-4 (FeliCa)"])),
+        0x0027 => Some(("Infineon my-d move (SLE 66R01P)", &["ISO/IEC 14443-3A"])),
+        0x0028 => Some(("Infineon my-d NFC (SLE 66RxxP)", &["ISO/IEC 14443-3A"])),
+        0x0029 => Some(("Infineon my-d proximity 2 (SLE 66RxxS)", &["ISO/IEC 14443-3A"])),
+        0x002A => Some(("Infineon my-d proximity enhanced (SLE 55RxxE)", &["ISO/IEC 14443-3A"])),
+        0x002B => Some(("Infineon my-d light (SRF 55V01P)", &["ISO/IEC 14443-2/3B"])),
+        0x002C => Some(("Infineon PJM Stack Tag (SRF 66V10ST)", &["ISO/IEC 14443-2/3B"])),
+        0x002D => Some(("Infineon PJM Item Tag (SRF 66V10IT)", &["ISO/IEC 14443-2/3B"])),
+        0x002E => Some(("Infineon PJM Light (SRF 66V01ST)", &["ISO/IEC 14443-2/3B"])),
+        0x002F => Some(("Jewel Tag", &["ISO/IEC 14443-3A (NFC Type 1 Tag)"])),
+        0x0030 => Some(("Topaz NFC Tag", &["ISO/IEC 14443-3A (NFC Type 1 Tag)"])),
+        0x0031 => Some(("Atmel AT88SC0104CRF", &["ISO/IEC 14443, memory tag"])),
+        0x0032 => Some(("Atmel AT88SC0404CRF", &["ISO/IEC 14443, memory tag"])),
+        0x0033 => Some(("Atmel AT88RF01C", &["ISO/IEC 14443, memory tag"])),
+        0x0034 => Some(("Atmel AT88RF04C", &["ISO/IEC 14443, memory tag"])),
+        0x0035 => Some(("NXP i-Code SL2", &["ISO/IEC 15693"])),
+        0x0036 => Some(("MIFARE Plus SL1 2K", &["ISO/IEC 14443-3A", "MIFARE Classic-compatible (Security Level 1)"])),
+        0x0037 => Some(("MIFARE Plus SL1 4K", &["ISO/IEC 14443-3A", "MIFARE Classic-compatible (Security Level 1)"])),
+        0x0038 => Some(("MIFARE Plus SL2 2K", &["ISO/IEC 14443-4", "MIFARE Plus (AES, Security Level 2)"])),
+        0x0039 => Some(("MIFARE Plus SL2 4K", &["ISO/IEC 14443-4", "MIFARE Plus (AES, Security Level 2)"])),
+        0x003A => Some(("MIFARE Ultralight C", &["ISO/IEC 14443-3A", "MIFARE Ultralight C (3DES)"])),
+        0x003B => Some(("FeliCa", &["JIS X 6319-4 (FeliCa)"])),
+        0x003C => Some(("Melexis Sensor Tag (MLX90129)", &["ISO/IEC 15693, sensor tag"])),
+        0x003D => Some(("MIFARE Ultralight EV1", &["ISO/IEC 14443-3A", "MIFARE Ultralight EV1 (no crypto)"])),
         _ => None,
     }
 }
@@ -160,17 +221,11 @@ pub fn classify(atr: &[u8], uid: Option<&[u8]>) -> CardProfile {
 
     if let Some(code) = locate_card_name_code(atr) {
         if let Some((family, protocols)) = card_name_family(code) {
-            let mut notes = Vec::new();
-            if matches!(code, 0x0344) {
-                notes.push(
-                    "DESFire cards commonly randomize their anticollision UID for privacy — the same physical card can report a different UID on separate taps unless read past this layer via a card-specific GetCardUID command.".to_string(),
-                );
-            }
             return CardProfile {
                 family: family.to_string(),
                 protocols: protocols.iter().map(|s| s.to_string()).collect(),
                 confidence: Confidence::High,
-                notes,
+                notes: Vec::new(),
                 uid_hex,
                 atr_hex,
             };
@@ -189,7 +244,9 @@ pub fn classify(atr: &[u8], uid: Option<&[u8]>) -> CardProfile {
         family: "Unrecognized".to_string(),
         protocols: vec![],
         confidence: Confidence::Low,
-        notes: vec!["Doesn't match the PC/SC synthetic storage-card ATR shape — could be a real ISO 7816 contact card, a reader that doesn't synthesize this convention, or an unsupported card type.".to_string()],
+        notes: vec![
+            "Doesn't match the PC/SC synthetic storage-card ATR shape. This is EXPECTED, not a failure, for many ISO 14443-4 cards — MIFARE DESFire in particular usually presents a genuine ATS-derived ATR (PC/SC Part 3 Table 3-5, \"Contactless Smart Card\") rather than the synthetic storage-card format this classifier reads (Table 3-6). A card that never appears with a family name above may simply be one this tool doesn't parse yet, not an unknown chip.".to_string(),
+        ],
         uid_hex,
         atr_hex,
     }
@@ -245,8 +302,15 @@ mod tests {
         synthetic_atr(0x0001, &[])
     }
 
-    fn desfire_atr() -> Vec<u8> {
-        synthetic_atr(0x0344, &[])
+    /// A real, verified example from pcsc-tools' database (line 6456) of
+    /// how an actual DESFire/DESFire EV1 card presents: a short, raw
+    /// ATS-derived ATR that does NOT follow the synthetic storage-card
+    /// convention at all — confirming this classifier's own honest
+    /// fallback note. Replaces an earlier fixture that pretended DESFire
+    /// had a synthetic card-name code (0x0344); it doesn't, and that
+    /// fabricated code was never real.
+    fn desfire_real_atr() -> Vec<u8> {
+        vec![0x3B, 0x81, 0x80, 0x01, 0x80, 0x80]
     }
 
     #[test]
@@ -284,10 +348,15 @@ mod tests {
     }
 
     #[test]
-    fn a_desfire_atr_carries_the_uid_randomization_note() {
-        let p = classify(&desfire_atr(), None);
-        assert_eq!(p.family, "MIFARE DESFire");
-        assert!(p.notes.iter().any(|n| n.contains("randomize")), "the privacy caveat must be surfaced, not silently omitted");
+    fn a_real_desfire_atr_correctly_falls_back_to_low_confidence_with_the_iso14443_4_explanation() {
+        // The important negative result: DESFire does NOT match the
+        // synthetic storage-card shape (verified against a real example,
+        // not assumed) — so Low confidence here is the classifier working
+        // correctly, not a gap in the lookup table. The fallback note
+        // must say so explicitly rather than leave that ambiguous.
+        let p = classify(&desfire_real_atr(), None);
+        assert_eq!(p.confidence, Confidence::Low);
+        assert!(p.notes.iter().any(|n| n.contains("DESFire")), "the explanation must name DESFire specifically, not just say \"unrecognized\"");
     }
 
     #[test]
@@ -314,12 +383,24 @@ mod tests {
 
     #[test]
     fn copy_summary_includes_every_fact_and_every_note() {
-        let p = classify(&desfire_atr(), Some(&[0x01, 0x02]));
+        let p = classify(&desfire_real_atr(), Some(&[0x01, 0x02]));
         let s = copy_summary(&p);
-        assert!(s.contains("MIFARE DESFire"));
+        assert!(s.contains("Unrecognized"));
         assert!(s.contains("01 02"));
-        assert!(s.contains("randomize"));
+        assert!(s.contains("DESFire"));
         assert!(s.contains(&p.atr_hex));
+    }
+
+    #[test]
+    fn spot_checks_on_the_newly_verified_table_beyond_mifare_classic() {
+        // A handful of entries from the pcsc-tools rewrite that weren't in
+        // the original hand-picked table at all — confirms the whole
+        // replacement table is actually wired up, not just the two
+        // entries the other tests happen to exercise.
+        assert_eq!(classify(&synthetic_atr(0x003B, &[]), None).family, "FeliCa");
+        assert_eq!(classify(&synthetic_atr(0x0017, &[]), None).family, "Inside Secure PicoPass 2K");
+        assert_eq!(classify(&synthetic_atr(0x003D, &[]), None).family, "MIFARE Ultralight EV1");
+        assert_eq!(classify(&synthetic_atr(0x0000, &[]), None).confidence, Confidence::High, "code 0 is itself a defined, real entry (\"name not given\"), not a gap");
     }
 
     #[test]
