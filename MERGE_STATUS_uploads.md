@@ -57,3 +57,38 @@ to have an unrelated history, check what refs it actually carries first.
 `blackstar-film-files-v5--files.zip` (a nested `blackstar-film-vault-v5.zip` plus MORPHER_MODE
 and ELEMENTS docs) and the loose `.mkv` clips in the FAO zip are assets and prose, not commits.
 Left where they are.
+
+
+---
+
+## Second pass, with two more uploads (2026-09-08)
+
+### `compositor-full-session.bundle` — MERGED, and it unblocked another
+
+This carries `c7339651`, the prerequisite `card-diagnoser.bundle` was missing. That was the
+whole reason card-diagnoser could not be opened: not a corrupt bundle, just an incremental one
+whose base lived in a session that had not been shipped yet.
+
+With it present, card-diagnoser verifies — and turns out not to need merging separately, because
+`git merge-base --is-ancestor` shows it is CONTAINED in this line. One merge got both.
+
+24 commits: nfc-kit's `memory.rs` (READ BINARY / UPDATE BINARY, the ClaimTicket), a verified
+card-name table replacing a hand-picked one, and a real false-negative bug found by checking
+that table rather than trusting it.
+
+The single conflict was `Cargo.lock`. Taken as ours and left to cargo, which reconciled it on
+the next check — hand-merging a lockfile is how a tree ends up pinned to versions neither side
+ever built. voiceterm-egui went 1584 -> 1605 tests.
+
+### `aperture-todos-buckets-all--files-no-full.zip` — ALREADY LANDED
+
+Both bundles inside (`aperture-entities.bundle` and `aperture-entities-since-eccca.bundle`)
+have the same tip, `1e86c97f5`, which is an ancestor of HEAD — it was merged in the previous
+pass. Checked past the hash as well: `entity.rs`, `nav.rs` and `bucket.rs` are all in the tree,
+and the zip's `TODO_entities_buckets_paths.md` is byte-identical to the in-tree copy. Nothing
+to do.
+
+### Still blocked, and now precisely
+`voiceterm-013-since-010-partial` was re-verified with `c7339651` present and STILL lacks its
+prerequisites — a different missing base, not the same gap. It needs a re-export from whichever
+session holds `c15unified-010`.
