@@ -65,6 +65,12 @@ pub enum ShellVerb {
     CollabUnfollow,
     /// Ask peers for the full op log again.
     CollabResync,
+    /// The voice call over the session's wire: join/leave, mute, and
+    /// push-to-talk mode. Shell verbs like the rest of collaboration —
+    /// who can hear whom is not a fact about the music.
+    CallToggle,
+    CallMute,
+    CallPushToTalk,
     RecordTake,
     /// Show or hide the out-of-key dimming in the piano roll.
     ToggleKeyGuide,
@@ -234,6 +240,13 @@ pub fn root() -> Vec<Choice> {
           Then::Do(Act::Shell(ShellVerb::CollabUnfollow))),
         c("resync with collaborators", Some("re-request the op log"),
           Then::Do(Act::Shell(ShellVerb::CollabResync))),
+        // The call. "collaborator" again, so the group stays one search.
+        c("call collaborators (join / leave the voice call)", None,
+          Then::Do(Act::Shell(ShellVerb::CallToggle))),
+        c("mute / unmute the call microphone", None,
+          Then::Do(Act::Shell(ShellVerb::CallMute))),
+        c("push-to-talk on the call (hold the talk button)", None,
+          Then::Do(Act::Shell(ShellVerb::CallPushToTalk))),
         c("find in the timeline", None, Then::Ask(Ask::FindHow)),
         c("jump to marker", None, Then::Ask(Ask::JumpMarker)),
         c("delete all markers", None, Then::Do(Act::Ops(vec![Op::ClearMarkers]))),

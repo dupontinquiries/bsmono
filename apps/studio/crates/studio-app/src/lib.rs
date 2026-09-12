@@ -79,6 +79,14 @@ pub struct Studio {
     /// and rack syncs — waiting for whatever carrier exists to drain them.
     /// The shell is transport-agnostic on purpose: this Vec IS the seam.
     outbox: Vec<studio_collab::wire::Packet>,
+    /// Voice frames received, waiting for the shell's [`call::Call`] to
+    /// take them. `Studio` owns the document and the wire's integration;
+    /// it does not own the sink or the microphone, which is where a
+    /// voice frame is going. Handing frames across this Vec keeps
+    /// `integrate_packet` a pure function of the document, testable
+    /// without a device — the same seam `outbox` is, pointing the other
+    /// way.
+    pub voice_inbox: Vec<studio_collab::wire::Packet>,
     /// Manifests for sources whose bytes this peer can serve.
     manifests: std::collections::BTreeMap<studio_core::SourceId, studio_collab::assets::Manifest>,
     /// The content-addressed chunk store — shared across sources on purpose:
@@ -232,6 +240,7 @@ impl Studio {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             outbox: Vec::new(),
+            voice_inbox: Vec::new(),
             manifests: Default::default(),
             chunk_store: Default::default(),
             pending_assets: Default::default(),
@@ -884,10 +893,13 @@ impl Studio {
                 }
                 replies
             }
-            // Voice is for the jitter buffer and the sink, not the Doc;
-            // the receive half is not wired yet, so a frame is dropped
-            // here on purpose rather than half-handled.
-            Packet::Voice { .. } => Vec::new(),
+            // Voice is for the jitter buffer and the sink, not the Doc:
+            // it goes to the call through `voice_inbox`, never into the
+            // history, and earns no reply.
+            Packet::Voice { site, seq, frame } => {
+                self.voice_inbox.push(Packet::Voice { site, seq, frame });
+                Vec::new()
+            }
         }
     }
 
@@ -2357,6 +2369,9 @@ pub struct App {
     /// drag everybody else's screen around.
     follow: Option<String>,
     mic: Box<dyn capture::Capture>,
+    /// The in-house voice link: off until joined, pumped every frame the
+    /// wire is polled. See `call`.
+    call: call::Call,
     /// Where the take started, so it lands where it was sung.
     take_from: studio_core::Ticks,
     settings_open: bool,
@@ -2512,6 +2527,7 @@ impl Default for App {
               lexicon,
               find_ui: None,
               mic: capture::open_capture(),
+              call: call::Call::new(),
               take_from: studio_core::Ticks::ZERO,
               settings_open: false, library_open: ws.library_open,
               rebinds: rebinds::Rebinds::decode(&ws.rebinds), rebind_capture: None,
@@ -2928,6 +2944,34 @@ impl eframe::App for App {
                     self.toggle_take();
                 }
                 if live { ctx.request_repaint(); } // the counter must tick
+                // The call. One button to join or leave, and while on it,
+                // mute and a HOLD-to-talk control — a button you hold is
+                // the one push-to-talk that works on a phone, where there
+                // is no key to hold.
+                let on_call = self.call.on();
+                let call_btn = egui::Button::new(if on_call { "☎ on call" } else { "☎" })
+                    .fill(if on_call { egui::Color32::from_rgb(40, 110, 60) }
+                          else { ui.visuals().widgets.inactive.bg_fill });
+                if ui.add(call_btn)
+                    .on_hover_text(if on_call { "leave the call" }
+                                   else { "join the session's voice call" })
+                    .clicked() {
+                    self.toggle_call();
+                }
+                if on_call && self.call.listen_only().is_none() {
+                    let muted = self.call.muted();
+                    if ui.add(egui::Button::selectable(muted, "mute"))
+                        .on_hover_text("send silence (the far side's meter reads no loss)")
+                        .clicked() {
+                        self.call.set_muted(!muted);
+                    }
+                    if self.call.push_to_talk() {
+                        let held = ui.add(egui::Button::new("hold to talk"))
+                            .on_hover_text("push-to-talk: heard while this is held")
+                            .is_pointer_button_down_on();
+                        self.call.set_talking(held);
+                    }
+                }
                 if ui.button("⏮").on_hover_text("playhead to start (g g)").clicked() {
                     self.studio.transport.set_position(studio_core::Ticks::ZERO);
                     self.studio.status = "playhead at start".into();
@@ -2956,6 +3000,8 @@ impl eframe::App for App {
                 ui.label(&self.studio.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("{} clips", self.studio.session.doc.project.clips.len()));
+                    let call = self.call.describe(&*self.mic);
+                    if !call.is_empty() { ui.separator(); ui.label(call); }
                 });
             });
         });
@@ -3215,6 +3261,18 @@ impl eframe::App for App {
             for p in self.studio.drain_outbox() {
                 carrier.send(p);
             }
+            // The call: frames that arrived go to the link, the tap's
+            // audio goes out, and the sink's stream is topped up. Only
+            // here, inside the wire block — a call with no carrier has
+            // nobody on it, and the verb says so instead of opening a
+            // microphone for no one.
+            for p in self.studio.voice_inbox.drain(..) {
+                self.call.receive(&p);
+            }
+            let site = self.studio.session.doc.site;
+            for p in self.call.pump(&mut *self.mic, &mut *self.sink, site) {
+                carrier.send(p);
+            }
             // Our own presence: the sending half of what integrate_packet
             // merges. Rate-limited and heartbeat'd inside; called every
             // frame, sends when it should.
@@ -3226,11 +3284,17 @@ impl eframe::App for App {
             for ev in self.studio.session.sweep(now_ms) {
                 if let studio_collab::session::Event::TimedOut(site) = ev {
                     self.studio.status = format!("site {} timed out", site.0);
+                    // Their last words must not replay when they are back
+                    // on a fresh sequence.
+                    self.call.forget(site);
                 }
             }
             // Packets arrive between frames; a connected shell keeps frames
             // coming so a peer's edit shows without waiting for a local one.
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            // A call needs the pump more often than that: its stream depth
+            // is the stall budget, and 50 ms is half of it.
+            ctx.request_repaint_after(std::time::Duration::from_millis(
+                if self.call.on() { 20 } else { 50 }));
         }
 
         // ── the controller ────────────────────────────────────────────────
@@ -4515,6 +4579,19 @@ impl App {
                     self.studio.status = format!("resync requested — {n} ops locally");
                 }
                 palette::ShellVerb::RecordTake => { self.toggle_take(); }
+                palette::ShellVerb::CallToggle => { self.toggle_call(); }
+                palette::ShellVerb::CallMute => {
+                    let m = !self.call.muted();
+                    self.call.set_muted(m);
+                    self.studio.status = if m { "call: microphone muted" }
+                                         else { "call: microphone open" }.into();
+                }
+                palette::ShellVerb::CallPushToTalk => {
+                    let p = !self.call.push_to_talk();
+                    self.call.set_push_to_talk(p);
+                    self.studio.status = if p { "call: push-to-talk — hold the talk button" }
+                                         else { "call: microphone open (push-to-talk off)" }.into();
+                }
                 palette::ShellVerb::ToggleKeyGuide => {
                     self.studio.key_guide = !self.studio.key_guide;
                     self.studio.status = format!("out-of-key dimming {}",
@@ -4667,6 +4744,24 @@ impl App {
         };
         self.library_open = l.library_open;
         self.studio.status = format!("workspace: {}", l.name);
+    }
+
+    /// Join or leave the call. Refuses without a carrier: the call rides
+    /// the same wire the ops do, and with no wire there is nobody on it.
+    fn toggle_call(&mut self) {
+        if self.carrier.is_none() && !self.call.on() {
+            self.studio.status =
+                "no session wire — start with STUDIO_LISTEN or STUDIO_CONNECT to call".into();
+            return;
+        }
+        self.call.toggle(&mut *self.mic);
+        self.studio.status = if self.call.on() {
+            match self.call.listen_only() {
+                Some(why) => format!("joined the call, listen-only: {why}"),
+                None => format!("joined the call from {} at {} Hz — headphones avoid echo",
+                                self.mic.device_name(), self.mic.rate()),
+            }
+        } else { "left the call".into() };
     }
 
     fn toggle_take(&mut self) {
@@ -5600,6 +5695,18 @@ mod collab_tests {
         (a, b)
     }
 
+    #[test]
+    fn a_voice_frame_goes_to_the_inbox_and_nowhere_near_the_history() {
+        let (_, mut b) = pair();
+        let before = b.session.doc.history().len();
+        let v = studio_collab::wire::Packet::Voice { site: SiteId(1), seq: 7, frame: vec![1, 2, 3] };
+        let replies = b.integrate_packet(v.clone(), 0);
+        assert!(replies.is_empty(), "a voice frame earns no reply");
+        assert_eq!(b.voice_inbox, vec![v], "and waits in the inbox for the call");
+        assert_eq!(b.session.doc.history().len(), before, "never an op");
+        assert!(b.drain_outbox().is_empty(), "and nothing to broadcast");
+    }
+
     fn pipe(from: &mut Studio, to: &mut Studio) {
         for p in from.drain_outbox() {
             to.integrate_packet(p, 0);
@@ -5939,6 +6046,56 @@ mod tcp_carrier_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("projects never converged over the socket");
+    }
+
+    #[test]
+    fn a_word_crosses_the_socket_and_comes_out_of_the_far_sink() {
+        // The call end to end with the ONLY thing faked being the two
+        // devices: A's Call encodes (Opus, if this build has it) into
+        // packets, A's carrier ships them, B's Studio integrates them into
+        // its inbox, B's Call decodes them into B's sink. The document is
+        // untouched by all of it.
+        use crate::call::fakes::{FakeMic, FakeSink, sine};
+        use studio_collab::voice::FRAME;
+        let mut a = Studio::demo();
+        let mut b = Studio::new(a.session.doc.project.clone(), SiteId(2),
+                                Team::from_contacts("duo", &["sc-b".into()]));
+        let ca = StreamPeer::listen("127.0.0.1:0").expect("bind");
+        let cb = StreamPeer::connect(ca.local.unwrap()).expect("dial");
+        let (mut call_a, mut call_b) = (call::Call::new(), call::Call::new());
+        let (mut mic_a, mut sink_a) = (FakeMic::new(48_000), FakeSink::new(48_000));
+        let (mut mic_b, mut sink_b) = (FakeMic::new(48_000), FakeSink::new(48_000));
+        call_a.start(&mut mic_a);
+        call_b.start(&mut mic_b);
+        let history = b.session.doc.history().len();
+        mic_a.say(&sine(FRAME * 20, 440.0, 48_000, 0.5));
+        let mut inbox_b = 0;
+        for _ in 0..400 {
+            // A's microphone keeps running after the word — a real tap
+            // yields room tone every frame, and a peer that goes silent
+            // on the wire is what concealment is for, not this.
+            mic_a.say(&[0.0; FRAME]);
+            // Exactly the shell's order: wire → integrate → inbox → call → wire.
+            pump(&mut a, &ca);
+            for p in a.voice_inbox.drain(..) { call_a.receive(&p); }
+            for p in call_a.pump(&mut mic_a, &mut sink_a, a.session.doc.site) { ca.send(p); }
+            pump(&mut b, &cb);
+            for p in b.voice_inbox.drain(..) { inbox_b += 1; call_b.receive(&p); }
+            // B's device plays one frame per turn; the pump refills one slot.
+            sink_b.consume(FRAME);
+            for p in call_b.pump(&mut mic_b, &mut sink_b, b.session.doc.site) { cb.send(p); }
+            if inbox_b >= 40 && sink_b.played.len() >= FRAME * 30 { break; }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(inbox_b >= 20, "B's Studio handed {inbox_b} voice frames to the call");
+        let peak = sink_b.played.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(peak > 0.3, "A's tone came out of B's sink over TCP: peak {peak}");
+        let m = call_b.meter();
+        assert_eq!((m.peers, m.playing, m.unknown), (1, 1, 0), "{m:?}");
+        assert!(m.lost <= 1, "a steady sender over loopback needs no concealment: {m:?}");
+        assert_eq!(b.session.doc.history().len(), history, "the call never touched the document");
+        assert_eq!(a.session.doc.project, b.session.doc.project);
+        assert!(call_b.describe(&mic_b).starts_with("call ("), "{}", call_b.describe(&mic_b));
     }
 }
 
