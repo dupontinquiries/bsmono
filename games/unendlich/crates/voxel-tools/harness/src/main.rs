@@ -18,6 +18,42 @@ fn settle(pb: &mut paintbrush::Paintbrush) {
     }
 }
 
+/// EVERY QUESTION THE ENGINE ASKS ON ITS OWN BEHALF, answered in one
+/// place.
+///
+/// The engine has grown turns a scenario never asked for -- routing,
+/// then a capability probe -- and each time I patched the scripted
+/// completers one by one. Fourteen of seventeen got the last shim and
+/// three did not, which is how a build reply ended up answering "what
+/// can you write" and failing it.
+///
+/// A scenario's script should describe what that scenario is about.
+/// Anything the engine asks for its own reasons belongs here, and
+/// wrapping is the only way that stays true when the engine grows
+/// another turn.
+struct Ambient<C>(C);
+
+impl<C: voxel_tools::llm::Completer> voxel_tools::llm::Completer for Ambient<C> {
+    fn name(&self) -> &str { self.0.name() }
+    fn complete(&mut self, sys: &str, user: &str) -> Result<String, String> {
+        if let Some(r) = probe_answer(user) { return Ok(r); }
+        if let Some(r) = route_answer(user) { return Ok(r); }
+        self.0.complete(sys, user)
+    }
+}
+
+/// Answer the CAPABILITY PROBE from the prompt itself. A probe that a
+/// scripted model answers with its build reply both fails the probe
+/// and consumes a call the scenario was counting.
+fn probe_answer(prompt: &str) -> Option<String> {
+    if prompt.contains("equals 8 when t is 0") { return Some("lerp(8,4,t)".into()); }
+    if prompt.contains("swell to 7 halfway") { return Some("at 0:2, 0.5:7, 1:1".into()); }
+    if prompt.contains("asset called `tooth`") {
+        return Some("asset tooth\n  part t box w=2 h=3 d=2 material=stone\nend\n                     pass teeth add\n  repeat tooth ring count=6 radius=5\nend\n".into());
+    }
+    None
+}
+
 /// Answer the routing turn from the prompt itself, so a scripted model
 /// does not have to. Returns None for any other prompt.
 fn route_answer(prompt: &str) -> Option<String> {
@@ -659,6 +695,7 @@ fn cancel_scenario() {
     impl voxel_tools::llm::Completer for Slow {
         fn name(&self) -> &str { "slow" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            if let Some(r) = probe_answer(user) { return Ok(r); }
             if let Some(r) = route_answer(user) { return Ok(r); } Ok("cylinder @0,0 r=2\n".into()) }
         fn complete_with(&mut self, _: &str, _: &str, ctl: &voxel_tools::llm::TurnControl) -> Result<String, String> {
             let mut text = String::new();
@@ -774,6 +811,7 @@ fn validator_scenario() {
     impl voxel_tools::llm::Completer for Probe {
         fn name(&self) -> &str { "probe" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            if let Some(r) = probe_answer(user) { return Ok(r); }
             if let Some(r) = route_answer(user) { return Ok(r); } Ok(String::new()) }
         fn complete_with(&mut self, _: &str, _: &str, ctl: &voxel_tools::llm::TurnControl) -> Result<String, String> {
             let check = ctl.line_check.expect("a validator was passed");
@@ -805,6 +843,7 @@ fn progressive_scenario() {
     impl voxel_tools::llm::Completer for Slow {
         fn name(&self) -> &str { "slow" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            if let Some(r) = probe_answer(user) { return Ok(r); }
             if let Some(r) = route_answer(user) { return Ok(r); } Ok(String::new()) }
         fn complete_with(&mut self, _: &str, _: &str, ctl: &voxel_tools::llm::TurnControl) -> Result<String, String> {
             let lines = ["# a hamlet", "form house @0,0 @8,6 style=cottage seed=1", "form house @14,0 @22,6 style=cottage seed=2",
@@ -850,10 +889,6 @@ fn referent_scenario() {
     impl voxel_tools::llm::Completer for Capture {
         fn name(&self) -> &str { "capture" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
-            // The routing turn now precedes any build the tables are
-            // not certain of. A scripted model must answer it, or its
-            // first build reply is consumed as a route.
-            if let Some(r) = route_answer(user) { return Ok(r); }
             *self.0.lock().unwrap() = user.to_string();
             Ok("cylinder @0,0 r=2 h=3\n".into())
         }
@@ -908,10 +943,6 @@ fn review_scenario() {
     impl voxel_tools::llm::Completer for Scripted {
         fn name(&self) -> &str { "scripted" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
-            // The routing turn now precedes any build the tables are
-            // not certain of. A scripted model must answer it, or its
-            // first build reply is consumed as a route.
-            if let Some(r) = route_answer(user) { return Ok(r); }
             let mut c = self.calls.lock().unwrap();
             c.push(user.to_string());
             Ok(match c.len() {
@@ -928,7 +959,7 @@ fn review_scenario() {
     // done. `review_rounds` is the RUN's limit, and the plan is round one.
     pb.review_rounds = 3;
     let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
-    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(Scripted { calls: calls.clone() }))));
+    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(Ambient(Scripted { calls: calls.clone() })))));
     // "a hall" is not in the dictionary and now composes; this
     // scenario is about the PLAN path, so it asks for a house
     pb.start_turn(&cm, &gaze, Some("grass"), "a stone house", None);
@@ -959,7 +990,6 @@ fn long_run_scenario() {
     impl voxel_tools::llm::Completer for Rounds {
         fn name(&self) -> &str { "rounds" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
-            if let Some(r) = route_answer(user) { return Ok(r); }
             let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(match i {
                 0 => "spec height=8-12 durability=high\nenclose @-6,-6 @6,6 h=6 block=stone\n".into(),
@@ -975,7 +1005,7 @@ fn long_run_scenario() {
     let cm = stubs::ChunkManager::new();
     let mut pb = Paintbrush::new(32);
     pb.review_rounds = 12;
-    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(Rounds { n: n.clone() }))));
+    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(Ambient(Rounds { n: n.clone() })))));
     let gaze = Paintbrush::gaze_from([0.0, 70.0, -12.0], [0.0, -0.35, 1.0], Some(([0, 64, 0], [0, 1, 0], 13.0)));
     // "a stone keep" now routes to the architectural chain -- `keep`
     // is a castle alias. This scenario is about the plan path and its
@@ -1065,10 +1095,6 @@ fn four_pass_scenario() {
     impl voxel_tools::llm::Completer for Script {
         fn name(&self) -> &str { "script" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
-            // The routing turn now precedes any build the tables are
-            // not certain of. A scripted model must answer it, or its
-            // first build reply is consumed as a route.
-            if let Some(r) = route_answer(user) { return Ok(r); }
             self.seen.lock().unwrap().push(user.to_string());
             let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(match i {
@@ -1086,7 +1112,7 @@ fn four_pass_scenario() {
     let mut pb = Paintbrush::new(32);
     pb.review_rounds = 3;
     pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(
-        Box::new(Script { n: n.clone(), seen: seen.clone() }))));
+        Box::new(Ambient(Script { n: n.clone(), seen: seen.clone() })))));
     let gaze = Paintbrush::gaze_from([0.0, 70.0, -14.0], [0.0, -0.3, 1.0], Some(([0, 64, 0], [0, 1, 0], 15.0)));
     pb.start_turn(&cm, &gaze, Some("grass"), "a water sphere", None);
     let t0 = std::time::Instant::now();
@@ -1118,10 +1144,6 @@ fn programme_scenario() {
     impl voxel_tools::llm::Completer for Arch {
         fn name(&self) -> &str { "arch" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
-            // The routing turn now precedes any build the tables are
-            // not certain of. A scripted model must answer it, or its
-            // first build reply is consumed as a route.
-            if let Some(r) = route_answer(user) { return Ok(r); }
             self.seen.lock().unwrap().push(user.to_string());
             // the massing turn: make the keep dominate, drop the stables
             Ok("total 26000\nsection keep share=0.45 prominence=4\ndrop stables\n".into())
@@ -1131,7 +1153,7 @@ fn programme_scenario() {
     let cm = stubs::ChunkManager::new();
     let mut pb = Paintbrush::new(32);
     pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(
-        Box::new(Arch { seen: seen.clone() }))));
+        Box::new(Ambient(Arch { seen: seen.clone() })))));
     let gaze = Paintbrush::gaze_from([0.0, 70.0, -20.0], [0.0, -0.3, 1.0], Some(([0, 64, 0], [0, 1, 0], 21.0)));
     pb.start_turn(&cm, &gaze, Some("grass"), "a huge fortress with a chapel, on a cliff", None);
     let t0 = std::time::Instant::now();
@@ -1163,10 +1185,6 @@ fn study_scenario() {
     impl voxel_tools::llm::Completer for Sculptor {
         fn name(&self) -> &str { "sculptor" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
-            // The routing turn now precedes any build the tables are
-            // not certain of. A scripted model must answer it, or its
-            // first build reply is consumed as a route.
-            if let Some(r) = route_answer(user) { return Ok(r); }
             self.seen.lock().unwrap().push(user.to_string());
             let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(match i {
@@ -1182,7 +1200,7 @@ fn study_scenario() {
     let cm = stubs::ChunkManager::new();
     let mut pb = Paintbrush::new(32);
     pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(
-        Box::new(Sculptor { n: n.clone(), seen: seen.clone() }))));
+        Box::new(Ambient(Sculptor { n: n.clone(), seen: seen.clone() })))));
     let gaze = Paintbrush::gaze_from([0.0, 70.0, -30.0], [0.0, -0.2, 1.0], Some(([0, 64, 0], [0, 1, 0], 31.0)));
     pb.start_turn(&cm, &gaze, Some("grass"), "a colossal statue of Zeus", None);
     let t0 = std::time::Instant::now();
@@ -1223,7 +1241,6 @@ fn floor_scenario() {
     impl voxel_tools::llm::Completer for Weak {
         fn name(&self) -> &str { "weak" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
-            if let Some(r) = route_answer(user) { return Ok(r); }
             let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(if i == 0 {
                 "IT IS: A giant tree from Avatar\nMATERIALS: oak_log\nSCALE: 40\n".into()
@@ -1239,7 +1256,7 @@ fn floor_scenario() {
     let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cm = stubs::ChunkManager::new();
     let mut pb = Paintbrush::new(32);
-    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(Weak { n }))));
+    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(Ambient(Weak { n })))));
     let gaze = Paintbrush::gaze_from([0.0, 70.0, -14.0], [0.0, -0.3, 1.0], Some(([0, 64, 0], [0, 1, 0], 15.0)));
     pb.start_turn(&cm, &gaze, Some("grass"), "a giant tree from avatar", None);
     let t0 = std::time::Instant::now();
@@ -1266,10 +1283,6 @@ fn propose_scenario() {
     impl voxel_tools::llm::Completer for Arch {
         fn name(&self) -> &str { "arch" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
-            // The routing turn now precedes any build the tables are
-            // not certain of. A scripted model must answer it, or its
-            // first build reply is consumed as a route.
-            if let Some(r) = route_answer(user) { return Ok(r); }
             self.seen.lock().unwrap().push(user.to_string());
             Ok("is a tower carrying sails, with the machinery below and a store beneath that\n\
                 ordinary 700\n\
@@ -1283,7 +1296,7 @@ fn propose_scenario() {
     let cm = stubs::ChunkManager::new();
     let mut pb = Paintbrush::new(32);
     pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(
-        Box::new(Arch { seen: seen.clone() }))));
+        Box::new(Ambient(Arch { seen: seen.clone() })))));
     let gaze = Paintbrush::gaze_from([0.0, 70.0, -20.0], [0.0, -0.3, 1.0], Some(([0, 64, 0], [0, 1, 0], 21.0)));
     pb.start_turn(&cm, &gaze, Some("grass"), "a huge windmill", None);
     let t0 = std::time::Instant::now();
@@ -1314,10 +1327,6 @@ fn dossier_scenario() {
     impl voxel_tools::llm::Completer for Team {
         fn name(&self) -> &str { "team" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
-            // The routing turn now precedes any build the tables are
-            // not certain of. A scripted model must answer it, or its
-            // first build reply is consumed as a route.
-            if let Some(r) = route_answer(user) { return Ok(r); }
             self.seen.lock().unwrap().push(user.to_string());
             let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(match i {
@@ -1335,7 +1344,7 @@ fn dossier_scenario() {
     let cm = stubs::ChunkManager::new();
     let mut pb = Paintbrush::new(32);
     pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(
-        Box::new(Team { n, seen: seen.clone() }))));
+        Box::new(Ambient(Team { n, seen: seen.clone() })))));
     let gaze = Paintbrush::gaze_from([0.0, 70.0, -20.0], [0.0, -0.3, 1.0], Some(([0, 64, 0], [0, 1, 0], 21.0)));
     pb.start_turn(&cm, &gaze, Some("grass"), "a walled yard with a hall and a gate, in stone", None);
     let t0 = std::time::Instant::now();
@@ -1371,13 +1380,12 @@ fn verb_scenario() {
     impl voxel_tools::llm::Completer for M {
         fn name(&self) -> &str { "m" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
-            if let Some(r) = route_answer(user) { return Ok(r); }
             Ok("form tower size=medium block=stone\n".into())
         }
     }
     let cm = stubs::ChunkManager::new();
     let mut pb = Paintbrush::new(32);
-    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(M))));
+    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(Box::new(Ambient(M)))));
     let gaze = Paintbrush::gaze_from([0.0, 70.0, -14.0], [0.0, -0.3, 1.0], Some(([0, 64, 0], [0, 1, 0], 15.0)));
     pb.start_turn(&cm, &gaze, Some("grass"), "a half-built stone tower", None);
     let t0 = std::time::Instant::now();
@@ -1408,7 +1416,6 @@ fn takes_scenario() {
     impl voxel_tools::llm::Completer for T {
         fn name(&self) -> &str { "t" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
-            if let Some(r) = route_answer(user) { return Ok(r); }
             // a different shape per take, as a leaning model would give
             let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(match i % 3 {
@@ -1421,7 +1428,7 @@ fn takes_scenario() {
     let cm = stubs::ChunkManager::new();
     let mut pb = Paintbrush::new(32);
     pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(
-        Box::new(T { n: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)) }))));
+        Box::new(Ambient(T { n: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)) })))));
     let gaze = Paintbrush::gaze_from([0.0, 70.0, -16.0], [0.0, -0.3, 1.0], Some(([0, 64, 0], [0, 1, 0], 17.0)));
     let mut line = |pb: &mut Paintbrush, s: &str| -> Option<stubs::Command> {
         pb.key(Key::Enter);

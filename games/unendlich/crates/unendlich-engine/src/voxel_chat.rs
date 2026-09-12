@@ -570,6 +570,11 @@ pub struct Paintbrush {
     take_results: Vec<voxel_tools::takes::Take>,
     take_request: String,
     take_at: usize,
+    /// What the loaded model was found able to write. Keyed by name,
+    /// so switching models re-probes.
+    probed: Option<(String, voxel_tools::capability::Found)>,
+    /// A probe running on a worker, so asking never stops the world.
+    probe_in_flight: Option<(String, std::sync::mpsc::Receiver<voxel_tools::capability::Found>)>,
     /// A verb read off the request, applied once the build lands.
     pending_verb: Option<(voxel_tools::transform::Verb, f32)>,
     /// The noun whose definition is being asked for.
@@ -685,6 +690,8 @@ impl Paintbrush {
             review_pending_after_drone: 0,
             pending_job: voxel_tools::prompt::Job::Plan,
             last_surface: None,
+            probed: None,
+            probe_in_flight: None,
             take_leans: Vec::new(),
             take_results: Vec::new(),
             take_request: String::new(),
@@ -1807,6 +1814,7 @@ impl Paintbrush {
         // the dictionary can actually make, so a miss means the fast
         // path would be guessing.
         self.last_surface = surface.map(|s| s.to_string());
+        self.ensure_probed();
         // SETUP HAPPENS ONCE. The routing turn used to answer a
         // question asked here at the top, so its answer arrived by
         // calling this function AGAIN -- and everything above the
@@ -2084,6 +2092,77 @@ impl Paintbrush {
         voxel_tools::prompt::tier_for(params, ctx)
     }
 
+    /// Find out what this model can actually write, once, and keep it
+    /// for the session.
+    ///
+    /// Run lazily rather than at load: a player who loads a model and
+    /// never builds should not pay for a probe, and the first build is
+    /// early enough for the answer to matter.
+    fn ensure_probed(&mut self) {
+        // KEYED ON WHATEVER IS ANSWERING, not on a loaded gguf. Gating
+        // on `LoadState::Loaded` meant an API provider was never probed
+        // at all -- and those are exactly the models whose capability
+        // varies most, since nothing about them is known from a file
+        // name. A completer is a completer.
+        let name = match &self.models.state {
+            voxel_tools::model::LoadState::Loaded { name, .. } => name.clone(),
+            _ => self.provider.describe(),
+        };
+        if self.probed.as_ref().map(|(n, _)| n == &name).unwrap_or(false) { return; }
+        if self.probe_in_flight.is_some() { return; }
+        let Some(mut c) = self.completer_for(false) else { return };
+        let (params, ctx) = match &self.models.state {
+            voxel_tools::model::LoadState::Loaded { name, ctx, .. } => (
+                self.models.resolve(name).ok().map(|m| m.params_billions).filter(|b| *b > 0.0),
+                *ctx as usize),
+            _ => (None, self.ctx_tokens),
+        };
+        // ON A WORKER. `probe` asks three questions and waits for each,
+        // and doing that on the calling thread BLOCKED `start_turn` for
+        // a second -- the world stops while the engine wonders what the
+        // model can do. The size guess is used until the answer lands,
+        // which is what a guess is for.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(voxel_tools::capability::probe(c.as_mut(), params, ctx));
+        });
+        self.probe_in_flight = Some((name, rx));
+    }
+
+    /// Collect the probe when it lands. Called from the same poll as
+    /// everything else, so it never blocks.
+    fn poll_probe(&mut self) {
+        let got = match &self.probe_in_flight {
+            Some((_, rx)) => rx.try_recv(),
+            None => return,
+        };
+        match got {
+            Ok(found) => {
+                let name = self.probe_in_flight.take().map(|(n, _)| n).unwrap_or_default();
+                log::info!("[paintbrush] capability: {} ({:?})", found.summary(), found.notes);
+                self.say(found.summary());
+                self.probed = Some((name, found));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                log::warn!("[paintbrush] the capability probe died; using the size guess");
+                self.probe_in_flight = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// What this model was found able to write, or a guess from its
+    /// size if it has not been probed.
+    fn rung(&self) -> voxel_tools::capability::Rung {
+        if let Some((_, f)) = &self.probed { return f.rung; }
+        match self.prompt_tier() {
+            voxel_tools::prompt::Tier::Tiny | voxel_tools::prompt::Tier::Compact =>
+                voxel_tools::capability::Rung::Numbers,
+            voxel_tools::prompt::Tier::Medium => voxel_tools::capability::Rung::Expressions,
+            voxel_tools::prompt::Tier::Full => voxel_tools::capability::Rung::Piecewise,
+        }
+    }
+
     fn system_prompt(&self) -> String {
         let (params, ctx) = match &self.models.state {
             voxel_tools::model::LoadState::Loaded { name, ctx, .. } => (
@@ -2093,7 +2172,11 @@ impl Paintbrush {
         };
         let tier = voxel_tools::prompt::tier_for(params, ctx);
         log::info!("[paintbrush] prompt tier {tier:?} (params {params:?}, ctx {ctx})");
-        voxel_tools::prompt::system_prompt_for_model(params, ctx, self.max_reply)
+        // AND ONLY THE SYNTAX IT CAN USE. Showing a model syntax it
+        // cannot write wastes a build; withholding syntax it could use
+        // wastes the model.
+        format!("{}\n{}", voxel_tools::prompt::system_prompt_for_model(params, ctx, self.max_reply),
+                voxel_tools::capability::syntax_for(self.rung()))
     }
 
     /// Put a model call on the worker thread. The ONE place a completer
@@ -2222,6 +2305,7 @@ impl Paintbrush {
 
     /// Call every frame. Applies a reply once the worker has one.
     pub fn poll_turn(&mut self, cm: &ChunkManager) {
+        self.poll_probe();
         let Some(turn) = &self.in_flight else { return };
         let Some(result) = turn.poll() else {
             // PROGRESSIVE PREVIEW. The reply is still being written, but
