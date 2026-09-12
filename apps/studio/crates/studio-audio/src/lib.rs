@@ -283,8 +283,11 @@ fn solo_audible_bus_set(project: &Project, bus_solo: &[studio_core::BusId]) -> s
 /// edit.
 #[derive(Default)]
 pub struct EffectCache {
-    clip: BTreeMap<studio_core::ClipId, (Vec<studio_core::Effect>, Vec<studio_fx::Instance>)>,
-    bus: BTreeMap<studio_core::BusId, (Vec<studio_core::Effect>, Vec<studio_fx::Instance>)>,
+    /// Each instance with its index in the chain it came from: disabled
+    /// effects are skipped at instantiate, so the instance list is
+    /// shorter than the chain, and a parameter ride addresses the chain.
+    clip: BTreeMap<studio_core::ClipId, (Vec<studio_core::Effect>, Vec<(usize, studio_fx::Instance)>)>,
+    bus: BTreeMap<studio_core::BusId, (Vec<studio_core::Effect>, Vec<(usize, studio_fx::Instance)>)>,
 }
 
 impl EffectCache {
@@ -303,22 +306,89 @@ impl EffectCache {
         self.bus.clear();
     }
 
-    fn clip_instances(&mut self, id: studio_core::ClipId, chain: &[studio_core::Effect], rate: f32) -> &mut [studio_fx::Instance] {
+    fn build(chain: &[studio_core::Effect], rate: f32) -> Vec<(usize, studio_fx::Instance)> {
+        chain.iter().enumerate()
+            .filter(|(_, e)| e.enabled)
+            .filter_map(|(i, e)| studio_fx::instantiate(e, rate).map(|inst| (i, inst)))
+            .collect()
+    }
+
+    fn clip_instances(&mut self, id: studio_core::ClipId, chain: &[studio_core::Effect], rate: f32) -> &mut [(usize, studio_fx::Instance)] {
         let entry = self.clip.entry(id).or_default();
         if entry.0 != chain {
             entry.0 = chain.to_vec();
-            entry.1 = chain.iter().filter(|e| e.enabled).filter_map(|e| studio_fx::instantiate(e, rate)).collect();
+            entry.1 = Self::build(chain, rate);
         }
         &mut entry.1
     }
 
-    fn bus_instances(&mut self, id: studio_core::BusId, chain: &[studio_core::Effect], rate: f32) -> &mut [studio_fx::Instance] {
+    fn bus_instances(&mut self, id: studio_core::BusId, chain: &[studio_core::Effect], rate: f32) -> &mut [(usize, studio_fx::Instance)] {
         let entry = self.bus.entry(id).or_default();
         if entry.0 != chain {
             entry.0 = chain.to_vec();
-            entry.1 = chain.iter().filter(|e| e.enabled).filter_map(|e| studio_fx::instantiate(e, rate)).collect();
+            entry.1 = Self::build(chain, rate);
         }
         &mut entry.1
+    }
+}
+
+/// Frames between parameter updates: control rate. A ride is evaluated
+/// at each block's first frame and the instance runs the block with it —
+/// the classic DAW bargain (a zipper on a violent ramp, never a click),
+/// chosen over per-sample redesign because an EQ band redesign per
+/// sample is more work than the band itself.
+pub const PARAM_BLOCK: usize = 64;
+
+/// One parameter ride on one running instance, resolved for a forward
+/// sweep: the stored value the lane multiplies, the schema's range to
+/// snap the product into, and the lane and bindings with their cursors.
+struct ParamRide<'a> {
+    /// Index into the CHAIN (not the instance list).
+    effect: usize,
+    key: String,
+    stored: f32,
+    spec: studio_fx::schema::ParamSpec,
+    lane: Option<&'a [(Ticks, f32)]>,
+    cursor: usize,
+    sweeps: Vec<studio_core::Sweep<'a>>,
+}
+
+impl<'a> ParamRide<'a> {
+    /// The rides on `chain` from `targets` (the model's list for this bus
+    /// or clip). A target whose effect index is past the chain, whose
+    /// effect is disabled, or whose key the schema does not know is left
+    /// out — dangling, and harmless, like a binding to a deleted clip.
+    fn resolve(project: &'a Project, chain: &[studio_core::Effect],
+               targets: &[(u8, studio_core::ParamKey, AutoTarget)]) -> Vec<ParamRide<'a>> {
+        targets.iter().filter_map(|(effect, key, target)| {
+            let e = chain.get(*effect as usize)?;
+            if !e.enabled { return None; }
+            let key = key.as_str();
+            let spec = studio_fx::schema::expand(e)?.into_iter().find(|s| s.key == key)?;
+            let stored = e.params.get(key).copied().unwrap_or(spec.default);
+            let sweeps = project.binding_sweeps(*target);
+            let lane = project.automation.get(target).map(|l| l.as_slice());
+            if lane.is_none() && sweeps.is_empty() { return None; }
+            Some(ParamRide { effect: *effect as usize, key: key.to_string(), stored, spec, lane, cursor: 0, sweeps })
+        }).collect()
+    }
+
+    /// `stored × lane × Π(bindings)`, snapped to the parameter's range.
+    fn value(&mut self, at: Ticks) -> f32 {
+        let mut v = self.stored;
+        if let Some(l) = self.lane { v *= studio_core::eval_lane_cursor(l, at, &mut self.cursor); }
+        for sw in self.sweeps.iter_mut() { v *= sw.value(at); }
+        self.spec.clamp(v)
+    }
+}
+
+/// Push every ride's value at `at` into its instance.
+fn apply_rides(rides: &mut [ParamRide<'_>], instances: &mut [(usize, studio_fx::Instance)], at: Ticks, rate: f32) {
+    for r in rides.iter_mut() {
+        let v = r.value(at);
+        if let Some((_, inst)) = instances.iter_mut().find(|(i, _)| *i == r.effect) {
+            inst.set_param(&r.key, v, rate);
+        }
     }
 }
 
@@ -589,7 +659,11 @@ pub fn mixdown_into(
             // pattern rather than introducing a different one here. An
             // unknown effect kind is silently skipped via `instantiate`'s
             // `None`.
-            let clip_fx: &mut [studio_fx::Instance] = cache.clip_instances(clip.id, &clip.effects, rate as f32);
+            let clip_fx = cache.clip_instances(clip.id, &clip.effects, rate as f32);
+            // Parameter rides on this clip's chain, applied every
+            // PARAM_BLOCK frames below. Empty for almost every clip.
+            let clip_targets = project.clip_param_targets(clip.id);
+            let mut clip_rides = ParamRide::resolve(project, &clip.effects, &clip_targets);
 
             let start = clip.pos.max(from);
             let stop = clip.end().min(to);
@@ -652,7 +726,10 @@ pub fn mixdown_into(
                         match read(&src.channels[1], pos) { Some(v) => v, None => break }
                     } else { v0 };
                 }
-                for inst in clip_fx.iter_mut() {
+                if !clip_rides.is_empty() && i % PARAM_BLOCK == 0 {
+                    apply_rides(&mut clip_rides, clip_fx, at, rate as f32);
+                }
+                for (_, inst) in clip_fx.iter_mut() {
                     l = inst.process_audio(l);
                     r = inst.process_audio(r);
                 }
@@ -717,9 +794,27 @@ pub fn mixdown_into(
         // behaviour every other effect host in this codebase has.
         if !bus.chain.is_empty() {
             let instances = cache.bus_instances(id, &bus.chain, rate as f32);
-            for s in buf.iter_mut() {
-                for inst in instances.iter_mut() {
-                    *s = inst.process_audio(*s);
+            let targets = project.bus_param_targets(id);
+            let mut rides = ParamRide::resolve(project, &bus.chain, &targets);
+            if rides.is_empty() {
+                for s in buf.iter_mut() {
+                    for (_, inst) in instances.iter_mut() {
+                        *s = inst.process_audio(*s);
+                    }
+                }
+            } else {
+                // Ridden: the same loop in blocks, the rides applied at
+                // each block's first frame (interleaved, so a block is
+                // PARAM_BLOCK frames = twice that in samples).
+                let from_s = from.to_samples(rate);
+                for (bi, block) in buf.chunks_mut(PARAM_BLOCK * 2).enumerate() {
+                    let at = Ticks::from_samples(from_s + (bi * PARAM_BLOCK) as i64, rate);
+                    apply_rides(&mut rides, instances, at, rate as f32);
+                    for s in block.iter_mut() {
+                        for (_, inst) in instances.iter_mut() {
+                            *s = inst.process_audio(*s);
+                        }
+                    }
                 }
             }
         }
@@ -1758,6 +1853,101 @@ mod automation_render_tests {
         for i in 0..plain.len() {
             assert!((plain[i] - unity[i]).abs() < 1e-6, "a unity lane is transparent at {i}");
         }
+    }
+
+    fn effect(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
+        studio_core::Effect { kind: kind.into(), enabled: true,
+            params: params.iter().map(|(k, v)| ((*k).to_string(), *v)).collect() }
+    }
+
+    #[test]
+    fn a_parameter_lane_rides_a_bus_effect_at_control_rate() {
+        // A -20 dB gain effect on the bus and a lane on its `db`: 1.0 (the
+        // full -20) for the first half, 0.0 (unity) after. The stored
+        // value is what the lane multiplies — the fader rule, on a knob.
+        use studio_core::ParamKey;
+        let (mut p, audio) = one_clip_project();
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0, muted: false,
+            // A DISABLED effect first: the instance list skips it, so
+            // `effect: 1` proves the index addresses the chain, not the
+            // instance list.
+            chain: vec![studio_core::Effect { enabled: false, ..effect("gain", &[("db", 0.0)]) },
+                        effect("gain", &[("db", -20.0)])],
+            sends: vec![], parent: None } }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let plain = render(&p, &audio);
+        let db = AutoTarget::BusParam { bus: BusId(1), effect: 1, key: ParamKey::new("db").unwrap() };
+        let mut ridden = p.clone();
+        ridden.apply(&Op::SetAutoPoint { target: db, at: Ticks::ZERO, value: 1.0 }).unwrap();
+        ridden.apply(&Op::SetAutoPoint { target: db, at: Ticks::from_seconds(0.5), value: 1.0 }).unwrap();
+        // A step, not a ramp, at 0.5 s: eval_lane is linear between points,
+        // so put the two points a tick apart.
+        ridden.apply(&Op::SetAutoPoint { target: db, at: Ticks::from_seconds(0.5).saturating_add(Ticks(1)), value: 0.0 }).unwrap();
+        let out = render(&ridden, &audio);
+        let quiet = out[1000];
+        let loud = out[out.len() - 1000];
+        assert!((quiet - 0.05).abs() < 0.002, "first half: 0.5 at -20 dB = 0.05, got {quiet}");
+        assert!((loud - 0.5).abs() < 0.002, "second half: the lane at 0 makes -20 × 0 = 0 dB, got {loud}");
+        // Control rate: the step lands within one block of the point.
+        let half = out.len() / 2;
+        let first_loud = out.iter().position(|v| *v > 0.4).unwrap();
+        assert!(first_loud >= half && first_loud < half + PARAM_BLOCK * 2 + 2,
+                "the change lands at the point's block: {first_loud} vs {half}");
+        // The plain project, and one ridden at unity, are untouched.
+        assert!((plain[1000] - 0.05).abs() < 0.002);
+        let mut unity = p.clone();
+        unity.apply(&Op::SetAutoPoint { target: db, at: Ticks::ZERO, value: 1.0 }).unwrap();
+        let same = render(&unity, &audio);
+        for i in 0..plain.len() { assert!((plain[i] - same[i]).abs() < 1e-6, "unity ride is transparent at {i}"); }
+    }
+
+    #[test]
+    fn a_dangling_or_unknown_parameter_target_changes_nothing() {
+        use studio_core::ParamKey;
+        let (mut p, audio) = one_clip_project();
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "B".into(), gain: 1.0, muted: false,
+            chain: vec![effect("gain", &[("db", -6.0)])], sends: vec![], parent: None } }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let plain = render(&p, &audio);
+        let mut r = p.clone();
+        // Past the chain's end, a key the effect does not have, and a key
+        // the effect cannot move live: all three are silently nothing.
+        for t in [
+            AutoTarget::BusParam { bus: BusId(1), effect: 5, key: ParamKey::new("db").unwrap() },
+            AutoTarget::BusParam { bus: BusId(1), effect: 0, key: ParamKey::new("nothing").unwrap() },
+            AutoTarget::ClipParam { clip: ClipId(1), effect: 0, key: ParamKey::new("db").unwrap() },
+        ] {
+            r.apply(&Op::SetAutoPoint { target: t, at: Ticks::ZERO, value: 0.0 }).unwrap();
+        }
+        assert_eq!(render(&r, &audio), plain);
+    }
+
+    #[test]
+    fn a_parameter_lane_on_a_clip_effect_follows_the_clip() {
+        // The same ride on a CLIP's chain, through a binding gated to the
+        // clip — the reusable-curve promise, on a parameter.
+        use studio_core::{Binding, BindingId, CurveId, Gate, ParamKey};
+        let (mut p, audio) = one_clip_project();
+        p.apply(&Op::SetEffects { id: ClipId(1), effects: vec![effect("gain", &[("db", -20.0)])] }).unwrap();
+        let target = AutoTarget::ClipParam { clip: ClipId(1), effect: 0, key: ParamKey::new("db").unwrap() };
+        p.apply(&Op::SetCurve { id: CurveId(1), name: "open".into() }).unwrap();
+        // In CLIP time: full attenuation for the first half, unity after.
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::ZERO, value: 1.0 }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::from_seconds(0.5), value: 1.0 }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::from_seconds(0.5).saturating_add(Ticks(1)), value: 0.0 }).unwrap();
+        p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
+            curve: CurveId(1), target, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+        let out = render(&p, &audio);
+        assert!((out[1000] - 0.05).abs() < 0.002, "clip time 0: -20 dB: {}", out[1000]);
+        assert!((out[out.len() - 1000] - 0.5).abs() < 0.002, "clip time 0.75 s: unity: {}", out[out.len() - 1000]);
+        // Move the clip later: the ride moves with it. Render a window
+        // that starts inside the clip and the step is still half a second
+        // into the CLIP, not into the timeline.
+        p.apply(&Op::MoveClip { id: ClipId(1), pos: Ticks::from_seconds(0.25), track: TrackId(1) }).unwrap();
+        let out = render(&p, &audio);
+        let at = |s: f32| out[(s * 48_000.0) as usize * 2];
+        assert!((at(0.5) - 0.05).abs() < 0.002, "0.25 s into the clip: still -20 dB: {}", at(0.5));
+        assert!((at(0.9) - 0.5).abs() < 0.002, "0.65 s into the clip: unity: {}", at(0.9));
     }
 }
 
