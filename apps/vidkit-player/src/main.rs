@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use uikit_egui::{adaptive::Adaptive, skin::Skin, PaletteColors};
-use vidkit_core::io::MemorySource;
 use vidkit_core::traits::{MediaSource, Presenter};
 use vidkit_egui::{bottom_bar, next_fit, EguiPresenter, Fit, Transport, VideoView};
 
@@ -45,8 +44,14 @@ struct Opened {
 /// WebM is rare and a file with no extension is not, and the magic is the file
 /// whereas the name is a guess.
 fn open_local(path: &PathBuf) -> Result<Opened, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let head = bytes.get(..16).unwrap_or(&bytes).to_vec();
+    // Checked first, and read through a FileSource rather than swallowed.
+    //
+    // `std::fs::read` loaded the WHOLE FILE into memory to look at sixteen
+    // bytes of header. A two-hour lecture is gigabytes and the phone this
+    // targets has a few, so the process was killed before a frame appeared and
+    // it looked like a crash rather than a mistake.
+    let facts = io::check_file(path)?;
+    let head = facts.head.clone();
 
     let is_webm = head.len() >= 4 && head[0..4] == [0x1A, 0x45, 0xDF, 0xA3];
     let is_mp4 = head.len() >= 8
@@ -56,7 +61,7 @@ fn open_local(path: &PathBuf) -> Result<Opened, String> {
         );
 
     let (kind, profile, dims, dur, packets) = if is_webm {
-        let mut d = vidkit_webm::WebmDemuxer::open(MemorySource(bytes))
+        let mut d = vidkit_webm::WebmDemuxer::open(io::FileSource::open(path)?)
             .map_err(|e| format!("webm: {e}"))?;
         let (p, dims, dur) = (d.video_profile(), d.dimensions(), d.duration());
         let mut n = 0;
@@ -66,7 +71,7 @@ fn open_local(path: &PathBuf) -> Result<Opened, String> {
         ("WebM", p, dims, dur, n)
     } else if is_mp4 {
         let mut d =
-            vidkit_mp4::Mp4Demuxer::open(MemorySource(bytes)).map_err(|e| format!("mp4: {e}"))?;
+            vidkit_mp4::Mp4Demuxer::open(io::FileSource::open(path)?).map_err(|e| format!("mp4: {e}"))?;
         let (p, dims, dur) = (d.video_profile(), d.dimensions(), d.duration());
         let mut n = 0;
         while matches!(d.next_packet(), Ok(Some(_))) {

@@ -2032,3 +2032,218 @@ mod fetch_tests {
         assert_eq!(after, before, "a failed download left its directory behind");
     }
 }
+
+// ---------------------------------------------------------------------------
+// opening a local file without swallowing it
+// ---------------------------------------------------------------------------
+
+/// A [`ByteSource`] over a file on disk.
+///
+/// `open_local` used `std::fs::read`, which loads the WHOLE FILE into memory to
+/// read sixteen bytes of header. A two-hour lecture is gigabytes and the phone
+/// this targets has a few; the process is killed before a frame is shown, and
+/// the failure looks like a crash rather than a mistake. The demuxers only ever
+/// wanted random access, which is what this gives them.
+pub struct FileSource {
+    file: std::fs::File,
+    len: u64,
+}
+
+impl FileSource {
+    pub fn open(path: &std::path::Path) -> Result<Self, String> {
+        let file = std::fs::File::open(path).map_err(|e| describe_open_error(path, &e))?;
+        let len = file.metadata().map_err(|e| format!("{}: {e}", path.display()))?.len();
+        Ok(Self { file, len })
+    }
+}
+
+impl vidkit_core::io::ByteSource for FileSource {
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> vidkit_core::io::Result<usize> {
+        use std::io::{Read, Seek, SeekFrom};
+        if offset >= self.len {
+            return Ok(0);
+        }
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| vidkit_core::io::Error::Io(e.to_string()))?;
+        // A short read at the end of a file is normal, not an error; the
+        // caller retries or stops.
+        self.file
+            .read(buf)
+            .map_err(|e| vidkit_core::io::Error::Io(e.to_string()))
+    }
+
+    fn size(&self) -> Option<u64> {
+        Some(self.len)
+    }
+}
+
+/// What is wrong with a path, in words someone can act on.
+///
+/// `std::io::Error`'s own text is "No such file or directory (os error 2)",
+/// which names neither the file nor what to do. Every branch here says which
+/// path and what the user can change.
+pub fn describe_open_error(path: &std::path::Path, e: &std::io::Error) -> String {
+    let p = path.display();
+    match e.kind() {
+        std::io::ErrorKind::NotFound => format!("{p}: no such file"),
+        std::io::ErrorKind::PermissionDenied => {
+            format!("{p}: no permission to read it")
+        }
+        _ if e.raw_os_error() == Some(21) => format!("{p}: that is a directory"),
+        _ => format!("{p}: {e}"),
+    }
+}
+
+/// Facts about a file worth knowing before trying to demux it.
+#[derive(Clone, PartialEq, Debug)]
+pub struct FileFacts {
+    pub len: u64,
+    /// The first bytes, for a container sniff.
+    pub head: Vec<u8>,
+}
+
+/// The smallest thing that could plausibly be a video.
+///
+/// An MP4 needs an `ftyp`, a `moov` with a sample table and an `mdat`; a WebM
+/// needs an EBML header, Info, Tracks and a Cluster. Neither fits in a few
+/// hundred bytes. The point is not the exact number — it is to reject a
+/// zero-byte or truncated download with "that file is empty" instead of a
+/// parser error about a malformed box.
+pub const MIN_PLAUSIBLE_LEN: u64 = 256;
+
+/// Check a path before opening it.
+pub fn check_file(path: &std::path::Path) -> Result<FileFacts, String> {
+    let meta = std::fs::metadata(path).map_err(|e| describe_open_error(path, &e))?;
+    if meta.is_dir() {
+        return Err(format!("{}: that is a directory", path.display()));
+    }
+    if !meta.is_file() {
+        // A socket, fifo or device node. Reading one may block forever, which
+        // is a worse outcome than refusing.
+        return Err(format!("{}: not a regular file", path.display()));
+    }
+    let len = meta.len();
+    if len == 0 {
+        return Err(format!("{}: the file is empty", path.display()));
+    }
+    if len < MIN_PLAUSIBLE_LEN {
+        return Err(format!(
+            "{}: only {len} bytes — too small to be a video, probably a truncated download",
+            path.display()
+        ));
+    }
+
+    use vidkit_core::io::ByteSource;
+    let mut src = FileSource::open(path)?;
+    let mut head = [0u8; 16];
+    let n = src
+        .read_at(0, &mut head)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(FileFacts {
+        len,
+        head: head[..n].to_vec(),
+    })
+}
+
+#[cfg(test)]
+mod file_check_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("vidkit-fc-{}-{name}", std::process::id()));
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(bytes).unwrap();
+        p
+    }
+
+    /// "No such file or directory (os error 2)" names neither the file nor
+    /// anything the reader can do about it.
+    #[test]
+    fn a_missing_file_is_named_in_plain_words() {
+        let e = check_file(std::path::Path::new("/nope/missing.mp4")).unwrap_err();
+        assert!(e.contains("/nope/missing.mp4"), "{e}");
+        assert!(e.contains("no such file"), "{e}");
+        assert!(!e.contains("os error"), "raw errno leaked to the user: {e}");
+    }
+
+    #[test]
+    fn a_directory_is_reported_as_one() {
+        let e = check_file(&std::env::temp_dir()).unwrap_err();
+        assert!(e.contains("directory"), "{e}");
+    }
+
+    /// A zero-byte file is an interrupted download, and saying so beats a
+    /// parser complaining about a malformed box.
+    #[test]
+    fn an_empty_file_says_it_is_empty() {
+        let p = tmp("empty.mp4", b"");
+        let e = check_file(&p).unwrap_err();
+        assert!(e.contains("empty"), "{e}");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn a_truncated_file_is_called_out_as_truncated() {
+        let p = tmp("tiny.mp4", b"\x00\x00\x00\x18ftypisom");
+        let e = check_file(&p).unwrap_err();
+        assert!(e.contains("too small"), "{e}");
+        assert!(e.contains("truncated"), "{e}");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn a_plausible_file_returns_its_head_and_length() {
+        let mut bytes = vec![0u8; 1024];
+        bytes[4..8].copy_from_slice(b"ftyp");
+        let p = tmp("ok.mp4", &bytes);
+        let facts = check_file(&p).expect("should pass");
+        assert_eq!(facts.len, 1024);
+        assert_eq!(&facts.head[4..8], b"ftyp");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// THE POINT: reading a header must not read the file. `std::fs::read` on
+    /// a two-hour lecture allocates gigabytes to look at sixteen bytes.
+    #[test]
+    fn checking_a_large_file_does_not_load_it() {
+        use vidkit_core::io::ByteSource;
+        // 8 MB is enough to make the difference measurable without making the
+        // test slow; the real files are three orders of magnitude larger.
+        let big = vec![0xABu8; 8 * 1024 * 1024];
+        let p = tmp("big.mp4", &big);
+
+        let mut src = FileSource::open(&p).expect("open");
+        assert_eq!(src.size(), Some(8 * 1024 * 1024));
+        let mut buf = [0u8; 16];
+        assert_eq!(src.read_at(0, &mut buf).unwrap(), 16);
+        assert!(buf.iter().all(|&b| b == 0xAB));
+
+        // Random access, not a cursor: the demuxers jump around sample tables.
+        let mut mid = [0u8; 4];
+        assert_eq!(src.read_at(4 * 1024 * 1024, &mut mid).unwrap(), 4);
+        assert_eq!(src.read_at(0, &mut buf).unwrap(), 16, "cannot read backwards");
+
+        // Past the end is zero, not an error, which is how `read_exact_at`
+        // detects truncation.
+        assert_eq!(src.read_at(99 * 1024 * 1024, &mut buf).unwrap(), 0);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// A fifo would block forever on read; refusing is the better outcome.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_rather_than_read() {
+        let p = std::env::temp_dir().join(format!("vidkit-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let made = std::process::Command::new("mkfifo").arg(&p).status();
+        if !made.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("SKIP: no mkfifo");
+            return;
+        }
+        let e = check_file(&p).unwrap_err();
+        assert!(e.contains("not a regular file"), "{e}");
+        let _ = std::fs::remove_file(p);
+    }
+}
