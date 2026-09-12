@@ -110,6 +110,13 @@ impl Player {
         }
     }
 
+    /// Leave stream mode: the queue is dropped and `push` (the loop
+    /// player) is what the callback reads again. For the loop generator
+    /// after the arrangement has been playing through the stream queue.
+    pub fn stop_stream(&mut self) {
+        self.stream = None;
+    }
+
     /// Stream mode: samples queued ahead of the playhead, in SOURCE-rate
     /// samples so the generator thread can compare against window lengths.
     pub fn queued_src_samples(&self) -> usize {

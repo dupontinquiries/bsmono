@@ -9,6 +9,7 @@
 mod micsample;
 mod micsession;
 #[cfg(feature = "app")] mod miclisten;
+mod arrange;
 mod audio_io;
 mod config;
 mod dataset;
@@ -16,6 +17,8 @@ mod upscale;
 mod dsp;
 #[cfg(feature = "gpu")]
 mod gpu;
+#[cfg(feature = "app")]
+mod arrangepage;
 #[cfg(feature = "app")]
 mod gui;
 mod model;

@@ -22,6 +22,9 @@ use std::time::Instant;
 use candle_core::Device;
 use eframe::egui;
 
+use crate::arrange::model::Timeline;
+use crate::arrange::render::{Library, Sample, Transport};
+use crate::arrangepage::{ArrangeIo, ArrangeOut, ArrangeView};
 use crate::config::{Config, Playback};
 use crate::dsp::{GlState, Mel};
 use crate::model::{load_generator, Generator};
@@ -116,6 +119,23 @@ struct StreamControls {
     restart: bool,
 }
 
+/// The arrangement as the audio thread sees it. The GUI owns the editor
+/// and publishes a copy of the timeline after every command; the thread
+/// renders blocks from that copy and reports where it is.
+struct ArrShared {
+    timeline: Timeline,
+    /// Behind an Arc so the GUI can take a reference each frame without
+    /// copying every decoded file; an import replaces it (copy-on-write).
+    library: Arc<Library>,
+    /// GUI -> thread.
+    playing: bool,
+    seek: Option<f64>,
+    capture: bool,
+    /// thread -> GUI: the beat the speakers are at.
+    pos: f64,
+    notice: Option<String>,
+}
+
 struct Shared {
     target_z: Vec<f32>,
     current_z: Vec<f32>,
@@ -127,6 +147,7 @@ struct Shared {
     device_label: String,
     playback: PlaybackInfo,
     stream_ctl: StreamControls,
+    arr: ArrShared,
     /// Output gain the generator thread applies to its player, 0..1.
     ///
     /// Routed through Shared rather than by handing the GUI an Arc<Player>: the
@@ -157,6 +178,15 @@ pub fn run(cfg: Config) -> Result<()> {
             lead_windows: 2,
             gl_iters: cfg.griffin_iters_rt,
             restart: false,
+        },
+        arr: ArrShared {
+            timeline: Timeline::default(),
+            library: Arc::new(Library::default()),
+            playing: false,
+            seek: None,
+            capture: false,
+            pos: 0.0,
+            notice: None,
         },
         gain: 1.0,
         stopped: false,
@@ -209,6 +239,106 @@ pub fn run(cfg: Config) -> Result<()> {
 // generator / audio thread
 // ----------------------------------------------------------------------------
 
+/// Samples per arrangement block. ~93 ms at 22050: short enough that an
+/// edit is heard promptly, long enough that the lock is not taken often.
+const ARR_BLOCK: usize = 2048;
+
+/// The arrangement's share of a generator loop iteration: capture the
+/// window that is playing when asked, and while the arrangement is
+/// playing, render its blocks into the player instead of generating.
+///
+/// Returns true when the arrangement has the audio and the caller should
+/// skip its own generation this iteration. `render_hq` gives the caller's
+/// current window at full quality for a capture; `stream_player` says
+/// whether the caller's player is in stream mode (a loop-mode player is
+/// put back when the arrangement stops).
+struct ArrService {
+    transport: Transport,
+    was_playing: bool,
+    pushed: bool,
+}
+
+impl ArrService {
+    fn new() -> Self {
+        Self { transport: Transport::default(), was_playing: false, pushed: false }
+    }
+
+    fn tick(
+        &mut self,
+        cfg: &Config,
+        shared: &Arc<Mutex<Shared>>,
+        audio: &Arc<Mutex<player::Player>>,
+        stream_player: bool,
+        render_hq: impl FnOnce() -> Option<(Vec<f32>, Option<Vec<f32>>, f32)>,
+    ) -> bool {
+        // Capture, whether or not the arrangement is playing.
+        let capture = {
+            let mut s = shared.lock().unwrap();
+            std::mem::take(&mut s.arr.capture)
+        };
+        if capture {
+            match render_hq() {
+                Some((audio_hq, planes, bpm)) => {
+                    let mut s = shared.lock().unwrap();
+                    let n = s.arr.library.beats.len() + 1;
+                    Arc::make_mut(&mut s.arr.library).add_beat(Sample { name: format!("beat {n}"), audio: audio_hq, sr: cfg.sr, planes, bpm: Some(bpm) });
+                    s.arr.notice = Some(format!("captured beat {n}"));
+                }
+                None => shared.lock().unwrap().arr.notice = Some("nothing playing to capture".into()),
+            }
+        }
+
+        let (playing, seek) = {
+            let mut s = shared.lock().unwrap();
+            (s.arr.playing, s.arr.seek.take())
+        };
+        if let Some(b) = seek {
+            self.transport.seek(b);
+            if playing {
+                audio.lock().unwrap().clear_stream();
+                self.pushed = false;
+            }
+        }
+        if !playing {
+            if self.was_playing {
+                // Hand the device back to the generator.
+                let mut p = audio.lock().unwrap();
+                if stream_player { p.clear_stream() } else { p.stop_stream() }
+                self.was_playing = false;
+                self.pushed = false;
+            }
+            return false;
+        }
+        if !self.was_playing {
+            audio.lock().unwrap().clear_stream();
+            self.was_playing = true;
+            self.pushed = false;
+        }
+        let queued = audio.lock().unwrap().queued_src_samples();
+        let low_water = 3 * ARR_BLOCK;
+        if queued < low_water {
+            let mut block = vec![0.0f32; ARR_BLOCK];
+            let started = {
+                let s = shared.lock().unwrap();
+                self.transport.render_next(&s.arr.timeline, &s.arr.library, cfg.sr, &mut block)
+            };
+            let (queued, scope) = {
+                let mut p = audio.lock().unwrap();
+                p.push_window(&block, if self.pushed { ARR_BLOCK } else { 0 });
+                (p.queued_src_samples(), p.scope_snapshot())
+            };
+            self.pushed = true;
+            let mut s = shared.lock().unwrap();
+            let lag_beats = queued as f64 / cfg.sr as f64 * s.arr.timeline.bpm / 60.0;
+            s.arr.pos = (started - lag_beats).max(0.0);
+            s.scope = scope;
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        true
+    }
+}
+
 fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> Result<()> {
     // A conditional renderer cannot be looped — every window needs the one
     // before it — so the stream loop is the only sensible playback for it,
@@ -247,6 +377,9 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
 
     let latent = cfg.latent;
     let mut current_z = vec![0.0f32; latent];
+    let mut arr = ArrService::new();
+    // The last window rendered, for a capture.
+    let mut last: Option<(Vec<f32>, usize)> = None;
 
     // One beat is `time_frames` hops long. Pace generation to a little under
     // the beat duration so windows overlap (the player crossfades them) and we
@@ -320,6 +453,25 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
             }
         }
 
+        {
+            let (gain, stopped) = {
+                let s = shared.lock().unwrap();
+                (s.gain, s.stopped)
+            };
+            let mut p = audio.lock().unwrap();
+            p.set_gain(gain);
+            p.set_stopped(stopped);
+        }
+        let last_ref = last.clone();
+        let (mel_ref, iters, bpm) = (&mel, cfg.griffin_iters, cfg.bpm);
+        if arr.tick(&cfg, &shared, &audio, false, || {
+            let (flat, t) = last_ref?;
+            let hq = mel_ref.mel_to_wav(&flat, t, iters);
+            Some((hq, Some(flat), bpm))
+        }) {
+            continue;
+        }
+
         // exponential smoothing toward target (the "thumb glides" feel)
         for i in 0..latent {
             current_z[i] = 0.9 * current_z[i] + 0.1 * target[i];
@@ -327,6 +479,7 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
 
         let t0 = Instant::now();
         let (flat, _n_mels, t) = g.generate(&current_z, &dev)?;
+        last = Some((flat.clone(), t));
         // warm-started, low-iteration inversion: fast and smooth while morphing
         let wav = mel.mel_to_wav_warm(&flat, t, cfg.griffin_iters_rt, &mut gl);
         let gen_ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -407,6 +560,7 @@ fn stream_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -
     let mut streamer = Streamer::new(&cfg, g, dev.clone());
     let mut walk = LatentWalk::new(&cfg);
     let mut windows: u64 = 0;
+    let mut arr = ArrService::new();
 
     let (_stream, audio) = player::start(cfg.sr)?;
 
@@ -474,6 +628,16 @@ restart the GUI with --ckpt-dir pointing at its directory",
             p.set_stopped(stopped);
             p.queued_src_samples()
         };
+        {
+            let (st, iters) = (&streamer, cfg.griffin_iters);
+            let bpm = ctl.bpm;
+            if arr.tick(&cfg, &shared, &audio, true, || {
+                let hq = st.render_last_hq(iters)?;
+                Some((hq, st.last_planes().map(|p| p.to_vec()), bpm))
+            }) {
+                continue;
+            }
+        }
         if queued >= low_water && save_req.is_none() {
             // Nothing to render; keep the lead reading live while waiting.
             shared.lock().unwrap().playback.lead_secs = queued as f32 / cfg.sr as f32;
@@ -535,6 +699,7 @@ restart the GUI with --ckpt-dir pointing at its directory",
 enum Page {
     Morph,
     Train,
+    Arrange,
 }
 
 struct App {
@@ -581,6 +746,8 @@ struct App {
     ckpt_text: String,
     save_text: String,
     status: String,
+    /// The arrangement page's editor, tools and view state.
+    arrange: ArrangeView,
     /// Whether the model shape in `cfg` (what the next run builds) matches
     /// the checkpoint directory's config.json. Refreshed on the cache timer
     /// rather than per frame; `None` when there is no checkpoint to compare.
@@ -624,6 +791,7 @@ impl App {
             save_text: "beat.wav".into(),
             status: "drag on the pad to morph".into(),
             shape_note: None,
+            arrange: ArrangeView::default(),
         }
     }
 
@@ -667,6 +835,7 @@ impl App {
                 ui.horizontal(|ui| {
                     let was = self.page;
                     ui.selectable_value(&mut self.page, Page::Morph, "morph");
+                    ui.selectable_value(&mut self.page, Page::Arrange, "arrange");
                     ui.selectable_value(&mut self.page, Page::Train, "train");
                     // ARRIVING AT THE TRAINING PAGE STOPS THE BEAT, once, on the
                     // transition. Training is a long watch and a loop playing
@@ -686,6 +855,10 @@ impl App {
                     // pages get the same one rather than a second pair of buttons
                     // that could disagree with it.
                     self.train_controls(ui);
+                    return;
+                }
+                if self.page == Page::Arrange {
+                    self.arrange_column(ui);
                     return;
                 }
 
@@ -778,6 +951,10 @@ impl App {
             self.train_body(ui);
             return;
         }
+        if self.page == Page::Arrange {
+            self.arrange_body(ui);
+            return;
+        }
             ui.add_space(4.0);
             ui.label("latent pad — X→z₀  Y→z₁  scroll→z₂");
 
@@ -863,6 +1040,120 @@ impl App {
 }
 
 impl App {
+    /// The arrangement page's canvas. The library and transport are read
+    /// under the shared lock once, the view runs, and what it asked for
+    /// is written back.
+    fn arrange_body(&mut self, ui: &mut egui::Ui) {
+        let (library, playhead, playing) = {
+            let s = self.shared.lock().unwrap();
+            (s.arr.library.clone(), s.arr.pos, s.arr.playing)
+        };
+        let io = ArrangeIo { library: &library, playhead, playing };
+        let out = self.arrange.ui(ui, &io);
+        self.arrange_apply(out);
+    }
+
+    /// The arrangement's controls column: the library, imports, exports,
+    /// and the selected clip.
+    fn arrange_column(&mut self, ui: &mut egui::Ui) {
+        let (library, playhead, playing, notice) = {
+            let mut s = self.shared.lock().unwrap();
+            (s.arr.library.clone(), s.arr.pos, s.arr.playing, s.arr.notice.take())
+        };
+        if let Some(n) = notice {
+            self.status = n;
+        }
+        let io = ArrangeIo { library: &library, playhead, playing };
+        let mut out = ArrangeOut::default();
+        self.arrange.library_ui(ui, &io, &mut out);
+        self.arrange_apply(out);
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(&self.status).italics());
+    }
+
+    /// Carry out what the arrangement view asked for.
+    fn arrange_apply(&mut self, out: ArrangeOut) {
+        if let Some(st) = out.status {
+            self.status = st;
+        }
+        let mut s = self.shared.lock().unwrap();
+        if out.changed {
+            s.arr.timeline = self.arrange.timeline().clone();
+        }
+        if let Some(b) = out.seek {
+            s.arr.seek = Some(b);
+            s.arr.pos = b;
+        }
+        if out.toggle_play {
+            s.arr.playing = !s.arr.playing;
+            // The arrangement takes the device; the generator's own
+            // transport must not also be stopped or the block queue is
+            // silent.
+            if s.arr.playing {
+                s.stopped = false;
+            }
+            self.status = if s.arr.playing { "arrangement playing".into() } else { "arrangement stopped".into() };
+        }
+        if out.capture_beat {
+            s.arr.capture = true;
+            self.status = "capturing…".into();
+        }
+        drop(s);
+        if let Some(path) = out.import_file {
+            self.import_audio(path);
+        }
+        if let Some(path) = out.export_wav {
+            self.export_arrangement(path);
+        }
+    }
+
+    /// Decode a file on a worker and add it to the library when done.
+    fn import_audio(&mut self, path: String) {
+        let sr = self.cfg.sr;
+        let shared = self.shared.clone();
+        self.status = format!("importing {path}…");
+        std::thread::spawn(move || {
+            let p = PathBuf::from(&path);
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(path.clone());
+            match audio_io::decode_to_mono(&p, sr) {
+                Ok(audio) if !audio.is_empty() => {
+                    let mut s = shared.lock().unwrap();
+                    Arc::make_mut(&mut s.arr.library).add_file(Sample { name: name.clone(), audio, sr, planes: None, bpm: None });
+                    s.arr.notice = Some(format!("imported {name}"));
+                }
+                Ok(_) => shared.lock().unwrap().arr.notice = Some(format!("{name} decoded to nothing")),
+                Err(e) => shared.lock().unwrap().arr.notice = Some(format!("import {name}: {e}")),
+            }
+        });
+    }
+
+    /// Render the whole arrangement offline and write it.
+    fn export_arrangement(&mut self, path: String) {
+        let (timeline, library) = {
+            let s = self.shared.lock().unwrap();
+            (self.arrange.timeline().clone(), s.arr.library.clone())
+        };
+        let sr = self.cfg.sr;
+        let end = timeline.end();
+        if end <= 0.0 {
+            self.status = "nothing to export".into();
+            return;
+        }
+        let n = (timeline.beats_to_secs(end) * sr as f64).ceil() as usize;
+        let mut out = vec![0.0f32; n];
+        crate::arrange::render::render_block(&timeline, &library, sr, 0.0, &mut out);
+        let peak = out.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+        if peak > 0.98 {
+            for x in &mut out {
+                *x *= 0.98 / peak;
+            }
+        }
+        match audio_io::save_wav(&PathBuf::from(&path), &out, sr) {
+            Ok(()) => self.status = format!("exported {path} ({:.1} s)", n as f64 / sr as f64),
+            Err(e) => self.status = format!("export {path}: {e}"),
+        }
+    }
+
     /// What will be played back, and the knobs on it.
     ///
     /// The headline is one sentence the listener can act on — "stream,
