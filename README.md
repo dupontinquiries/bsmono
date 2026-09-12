@@ -48,6 +48,27 @@ no third-party trademarks or assets.
   ride the surface, waders throw splash rings, fish leap, dragonflies stitch
   the air. Wading costs up to 40 % speed by depth; Rainspots and Riptail are
   riverborn and wade free.
+- **Wind you can see and hear** — gust fronts (weather.rs) rise in ~1.5 s
+  and fall over ~6 s, more often and harder in storms, with a wandering
+  heading. Every flora voxel carries a sway weight; the voxel and shadow
+  shaders bend the canopy by height with a travelling gust wave and tip
+  flutter, so trees, palms, bamboo, ferns and vine curtains lean and shiver
+  together (rocks and ruins stay put). Big gusts tear leaves loose.
+- **Procedural ambience** (`src/audio.rs`, cpal, feature `audio`, on by
+  default) — no samples: a wind body, a place-shaped howl (the resonant band
+  the wind excites depends on where you stand — a whistle over the river, a
+  hollow moan under the stone gates, a broad hiss in the canopy, a keening on
+  the cliff rim), pitch rising with each gust, a high keen only the strongest
+  fronts reach, rain, water lapping by the channel, thunder rolls keyed to the
+  actual lightning strikes and their distance, and a Schroeder reverb that
+  opens up at the bases, on the bridges and along the cliffs. The howl pans
+  with the wind relative to the camera. `--no-default-features` builds without
+  cpal; the DSP core is tested either way.
+- **Lighting** — warm wrap-lit key, sky-coloured fill in the shadows (no dead
+  grey), ground bounce tinted by the haze, a soft back/rim light from the
+  anti-sun side, a broad enamel specular on all voxels, contact darkening near
+  the ground, sun light shafts in post when the sun is low and in frame, a
+  gentle S-curve after ACES. Shadows follow the swaying canopy.
 - **Ambient life** — ground-bird flocks that flush when you come near and
   settle elsewhere, glow-moths around the heal trees at night, fireflies that
   come out under cloud, sky birds that scatter at lightning and roost at night.
@@ -68,11 +89,13 @@ no third-party trademarks or assets.
 
 ## Build & Run
 
-Requirements: Rust 1.75+, a GPU with Vulkan (or GL).
+Requirements: Rust 1.75+, a GPU with Vulkan (or GL). For audio on Linux,
+ALSA headers (`libasound2-dev`) at build time — or build with
+`--no-default-features` for a silent binary.
 
 ```bash
 cargo run --release          # windowed game
-cargo test                   # 25 tests: roster, items, lanes, sim, weather, map events, wildlife,
+cargo test                   # 30 tests: roster, items, lanes, sim, weather, map events, wildlife,
                              #   plus offline WGSL validation of every shader with naga
 cargo run -- --screenshot    # headless demo: renders PNG screenshots (no window)
 cargo run --example simdbg   # 120 s AI-only match trace (economy, events, weather, hunt tally)
@@ -120,6 +143,7 @@ src/
 ├── weather.rs     weather state machine → `Atmosphere` sample (plain numbers)
 ├── map_events.rs  event scheduler + effects; `speed_mul` / `gold_mul` hooks
 ├── wild.rs        heal trees, prey (hare / stag / glowfish), the hunt, Riverblessing
+├── audio.rs       acoustics_at(pos) → howl/reverb voicing; WindSynth DSP; cpal shell
 ├── sim.rs         entities, economy, damage pipeline, kills
 ├── systems.rs     tick: waves, movement, auto-attacks, projectiles, zones, sky
 ├── abilities.rs   cast execution for all 13 archetypes

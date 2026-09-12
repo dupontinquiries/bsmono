@@ -147,6 +147,38 @@ impl Vfx {
             }
         }
 
+        // gust fronts tear loose leaves out of the canopy around the player
+        {
+            let atm = game.weather.atmosphere();
+            if atm.gust > 0.55 && self.particles.len() < MAX_PARTICLES - 256 {
+                let n = ((atm.gust - 0.55) * 40.0 * dt * 60.0) as usize;
+                let centre = game.gods[0].pos;
+                for i in 0..n {
+                    let s = self.time * 7.0 + i as f32;
+                    let p = centre + Vec3::new(rnd_jitter(s) * 18.0, 3.0 + rnd_jitter(s * 1.7).abs() * 5.0, rnd_jitter(s * 2.3) * 18.0);
+                    if crate::consts::lane_clearance(p.x, p.z) < 4.0 {
+                        continue;
+                    }
+                    let tint = match i % 3 {
+                        0 => [0.24, 0.36, 0.12],
+                        1 => [0.40, 0.30, 0.10],
+                        _ => [0.18, 0.32, 0.12],
+                    };
+                    self.particles.push(Particle {
+                        pos: p,
+                        vel: wind * 0.9 + Vec3::new(rnd_jitter(s + 9.0), 0.4 + rnd_jitter(s + 4.0) * 0.5, rnd_jitter(s + 5.0)) * 1.5,
+                        life: 2.5 + rnd_jitter(s).abs() * 2.0,
+                        max_life: 4.5,
+                        size: 0.18,
+                        color: tint,
+                        alpha: 0.9,
+                        gravity: 0.9,
+                        drag: 0.6,
+                    });
+                }
+            }
+        }
+
         // ground birds: flush when anything comes within 6 u, land elsewhere
         for (k, f) in self.flocks.iter_mut().enumerate() {
             f.phase += dt;

@@ -576,7 +576,7 @@ impl Renderer {
 
         let post_params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("post params"),
-            size: 32,
+            size: 48,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -765,7 +765,7 @@ impl Renderer {
             params: [time, atm.fog_density, self.exposure, atm.night],
             sun_col: [atm.sun_col[0], atm.sun_col[1], atm.sun_col[2], atm.cloud_cover],
             weather: [atm.rain, atm.snow, atm.wetness, atm.lightning],
-            wind: [atm.wind.x, atm.wind.y, atm.wind.z, 0.0],
+            wind: [atm.wind.x, atm.wind.y, atm.wind.z, atm.gust],
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 
@@ -793,17 +793,36 @@ impl Renderer {
         self.queue.write_buffer(
             &self.post_params,
             0,
-            // exposure, vignette, time, lightning | bloom strength, night, rain, 0
-            bytemuck::cast_slice(&[
-                self.exposure * (1.0 + atm.night * 0.35),
-                0.55 + atm.night * 0.2,
-                time,
-                atm.lightning,
-                0.55 + atm.night * 0.3,
-                atm.night,
-                atm.rain,
-                0.0f32,
-            ]),
+            // exposure, vignette, time, lightning | bloom, night, rain, 0 |
+            // sun uv x, sun uv y, ray strength, contrast
+            {
+                // project the sun (a far point along its direction) to screen uv
+                let sp = vp * (cam.eye + sun * 400.0).extend(1.0);
+                let (sun_uv, ray) = if sp.w > 0.0 {
+                    let n = sp.truncate() / sp.w;
+                    let uv = [n.x * 0.5 + 0.5, 0.5 - n.y * 0.5];
+                    let in_frame = (1.0 - ((n.x.abs() - 1.0).max(0.0) + (n.y.abs() - 1.0).max(0.0)) * 1.5).clamp(0.0, 1.0);
+                    // shafts want a low sun and a clear-ish sky
+                    let low = (1.0 - sun.y * 1.1).clamp(0.0, 1.0);
+                    ([uv[0], uv[1]], in_frame * (0.25 + 0.6 * low) * (1.0 - atm.cloud_cover * 0.8) * (1.0 - atm.night * 0.7))
+                } else {
+                    ([0.5, 0.5], 0.0)
+                };
+                bytemuck::cast_slice(&[
+                    self.exposure * (1.0 + atm.night * 0.35),
+                    0.55 + atm.night * 0.2,
+                    time,
+                    atm.lightning,
+                    0.55 + atm.night * 0.3,
+                    atm.night,
+                    atm.rain,
+                    0.0f32,
+                    sun_uv[0],
+                    sun_uv[1],
+                    ray,
+                    0.22,
+                ])
+            },
         );
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

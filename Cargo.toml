@@ -23,6 +23,14 @@ glam = "0.27"
 bytemuck = { version = "1.15", features = ["derive"] }
 pollster = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
+cpal = { version = "0.15", optional = true }
+
+[features]
+# Procedural wind/rain/thunder ambience through cpal. On by default; build
+# with `--no-default-features` on machines without ALSA/CoreAudio headers
+# (the DSP core in src/audio.rs compiles and is tested either way).
+default = ["audio"]
+audio = ["cpal"]
 
 [profile.release]
 opt-level = 3

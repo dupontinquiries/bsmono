@@ -136,11 +136,15 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
     let night = frame.params.w;
     let cloud = frame.sun_col.w;
-    var hemi = vec3(0.58, 0.62, 0.76) * mix(1.0, 0.72, cloud);
-    hemi = mix(hemi, vec3(0.06, 0.07, 0.16), night);
+    var sky = mix(vec3(0.50, 0.60, 0.85), vec3(0.55, 0.57, 0.62), cloud);
+    sky = mix(sky, vec3(0.05, 0.07, 0.18), night);
+    var hemi = sky * (0.55 + 0.35 * (N.y * 0.5 + 0.5));
     let flash = frame.weather.w;
     hemi = hemi + vec3(0.9, 0.9, 1.2) * flash;
+    // sky fills the shadows so they read blue, not grey; slopes facing away
+    // from the sun get a touch of the anti-sun sky
     let sun_col = frame.sun_col.xyz * 1.02;
+    let wrap = clamp((dot(N, sun) + 0.2) / 1.2, 0.0, 1.0);
     let dist = distance(in.world, frame.cam_pos.xyz);
     let fog = 1.0 - exp(-dist * frame.params.y);
 
@@ -154,7 +158,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let snow = frame.weather.y;
     let snow_cov = snow * smoothstep(0.35, 0.9, N.y) * (0.6 + 0.4 * (1.0 - pud));
     albedo = mix(albedo, vec3(0.88, 0.92, 0.98), snow_cov * 0.85);
-    var lit = albedo * (sun_col * ndl * shadow + hemi * 0.9);
+    var lit = albedo * (sun_col * mix(wrap * wrap, ndl, 0.7) * shadow + hemi * 0.9 + sky * 0.2 * (1.0 - shadow));
     let V = normalize(frame.cam_pos.xyz - in.world);
     let Hv = normalize(V + sun);
     let fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);

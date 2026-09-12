@@ -45,6 +45,10 @@ struct AppState {
     last_frame: Instant,
     accumulator: f32,
     exiting: bool,
+    #[cfg(feature = "audio")]
+    ambience: Option<crate::audio::output::Ambience>,
+    thunder_count: u32,
+    thunder_dist: f32,
 }
 
 pub fn run() {
@@ -295,6 +299,10 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         last_frame: Instant::now(),
         accumulator: 0.0,
         exiting: false,
+        #[cfg(feature = "audio")]
+        ambience: None,
+        thunder_count: 0,
+        thunder_dist: 1.0,
     })
 }
 
@@ -471,6 +479,10 @@ fn start_game(s: &mut AppState) {
     s.game = Some(Game::new(s.ui.selected as u32, allies, enemies));
     s.vfx = Vfx::default();
     s.screen = Screen::Playing;
+    #[cfg(feature = "audio")]
+    if s.ambience.is_none() {
+        s.ambience = crate::audio::output::Ambience::start();
+    }
     s.ui.floaters.clear();
     s.ui.announce = None;
     s.ui.shop_open = false;
@@ -517,6 +529,11 @@ fn render(s: &mut AppState) {
                         crate::sim::Event::Announce { text } => {
                             s.ui.push_events(&[ui::Event2::Announce { text: text.clone(), dur: 2.5 }]);
                         }
+                        // sky-tall bolts are lightning (weather or Thunder Front)
+                        crate::sim::Event::BoltFx { from, to, .. } if from.y - to.y > 30.0 => {
+                            s.thunder_count = s.thunder_count.wrapping_add(1);
+                            s.thunder_dist = (to.distance(g.gods[0].pos) / 160.0).clamp(0.0, 1.0);
+                        }
                         _ => {}
                     }
                 }
@@ -549,6 +566,13 @@ fn render(s: &mut AppState) {
         }
     };
     let vp = cam.view_proj(s.renderer.width as f32 / s.renderer.height as f32);
+
+    // ambience: the listener is the player; the wind pans with the camera
+    #[cfg(feature = "audio")]
+    if let (Some(g), Some(amb)) = (s.game.as_ref(), s.ambience.as_ref()) {
+        let p = crate::audio::params_for(g, g.gods[0].pos, s.cam_yaw, s.thunder_count, s.thunder_dist);
+        amb.set(p);
+    }
 
     // world draws (+ this frame's sky state)
     if let Some(g) = s.game.as_ref() {

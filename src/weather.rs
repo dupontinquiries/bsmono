@@ -64,6 +64,8 @@ pub struct Atmosphere {
     pub night: f32,
     /// Horizontal wind (world units/s) — leans rain, drifts snow and leaves.
     pub wind: Vec3,
+    /// A gust front, 0..1: rises fast, falls slow. Bends the canopy, howls.
+    pub gust: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -119,6 +121,13 @@ pub struct Weather {
     pub wind_phase: f32,
     /// Sim clock, for the slow daily arc of the sun.
     pub clock: f32,
+    /// Gust state: current strength, target, and when the next front arrives.
+    pub gust: f32,
+    gust_target: f32,
+    next_gust_t: f32,
+    /// Slowly wandering wind heading (radians), so gusts don't always come
+    /// from the same quarter.
+    pub wind_heading: f32,
 }
 
 pub const BLEND_SECS: f32 = 8.0;
@@ -138,6 +147,10 @@ impl Weather {
             night_target: 0.0,
             wind_phase: 0.0,
             clock: 0.0,
+            gust: 0.0,
+            gust_target: 0.0,
+            next_gust_t: 20.0,
+            wind_heading: 0.53,
         }
     }
 
@@ -162,6 +175,28 @@ impl Weather {
         self.blend = (self.blend + dt / BLEND_SECS).min(1.0);
         self.wind_phase += dt;
         self.clock = t;
+
+        // --- gust fronts: a sharp rise (~1.5 s), a ragged plateau, a slow
+        // fall (~6 s). Frequency and size scale with the weather's wind.
+        let base_wind = {
+            let a = target(self.prev);
+            let b = target(self.kind);
+            lerp(a.wind, b.wind, smooth(self.blend))
+        };
+        if t >= self.next_gust_t {
+            let windy = ((base_wind - 1.0) / 6.5).clamp(0.0, 1.0);
+            self.gust_target = rng.range(0.45, 1.0) * (0.55 + 0.45 * windy);
+            self.next_gust_t = t + rng.range(6.0, 22.0) * (1.25 - windy * 0.8);
+            self.wind_heading += rng.range(-0.5, 0.5);
+        }
+        if self.gust < self.gust_target {
+            self.gust = (self.gust + dt / 1.5 * self.gust_target).min(self.gust_target);
+            if (self.gust_target - self.gust).abs() < 0.02 {
+                self.gust_target = 0.0; // crest reached: start the fall
+            }
+        } else {
+            self.gust = (self.gust - dt / 6.0).max(0.0);
+        }
 
         // natural drift, unless a map event holds the sky
         if t >= self.next_change_t && t >= self.forced_until {
@@ -245,8 +280,9 @@ impl Weather {
 
         let base_sun = [1.14, 1.00, 0.84];
         let wp = self.wind_phase;
-        let gust = 0.75 + 0.25 * (wp * 0.7).sin() * (wp * 0.23 + 1.0).cos();
-        let wind = Vec3::new(0.86, 0.0, 0.5).normalize() * wind_s * gust;
+        let breath = 0.75 + 0.25 * (wp * 0.7).sin() * (wp * 0.23 + 1.0).cos();
+        let hd = self.wind_heading;
+        let wind = Vec3::new(hd.cos(), 0.0, hd.sin()) * wind_s * (breath + self.gust * 2.2);
         Atmosphere {
             sun_dir,
             sun_col: [base_sun[0] * sun_mul[0], base_sun[1] * sun_mul[1], base_sun[2] * sun_mul[2]],
@@ -259,6 +295,7 @@ impl Weather {
             lightning: self.lightning,
             night: n,
             wind,
+            gust: self.gust,
         }
     }
 }
@@ -317,6 +354,27 @@ mod tests {
             t += 0.1;
         }
         assert!(ev.iter().any(|e| matches!(e, WeatherEvent::Changed(_))), "the sky must drift again after the hold");
+    }
+
+    #[test]
+    fn gusts_come_and_go() {
+        let mut w = Weather::new();
+        w.set(WeatherKind::Storm);
+        w.blend = 1.0;
+        let mut rng = Rng::new(11);
+        let mut ev = Vec::new();
+        let (mut peak, mut calm) = (0.0f32, 0usize);
+        let mut t = 0.0;
+        for _ in 0..(120 * 30) {
+            w.tick(1.0 / 30.0, t, &mut rng, &mut ev);
+            t += 1.0 / 30.0;
+            peak = peak.max(w.gust);
+            if w.gust < 0.05 {
+                calm += 1;
+            }
+        }
+        assert!(peak > 0.6, "a storm should throw big gusts: {peak}");
+        assert!(calm > 30 * 5, "gusts must fall away between fronts: {calm}");
     }
 
     #[test]

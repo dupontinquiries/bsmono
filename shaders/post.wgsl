@@ -6,6 +6,7 @@
 struct PostParams {
     a: vec4<f32>, // exposure, vignette, time, lightning
     b: vec4<f32>, // bloom strength, night, rain, unused
+    c: vec4<f32>, // sun screen x, sun screen y (uv), ray strength, contrast
 };
 @group(0) @binding(2) var<uniform> pp: PostParams;
 
@@ -61,12 +62,35 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     glow = glow / 12.0;
     col = col + glow * pp.b.x;
 
+    // --- light shafts: radial samples of the bright pass toward the sun's
+    // screen position; strongest when the sun is low and in frame
+    let ray_s = pp.c.z;
+    if (ray_s > 0.001) {
+        let sun_uv = pp.c.xy;
+        var acc = vec3(0.0);
+        let step = (sun_uv - in.uv) / 22.0;
+        var uvr = in.uv;
+        var wgt = 1.0;
+        let dither = hash21(in.uv * 640.0 + fract(pp.a.z) * 37.0) * 0.8;
+        uvr = uvr + step * dither;
+        for (var i: i32 = 0; i < 22; i = i + 1) {
+            uvr = uvr + step;
+            let s = textureSample(hdr, samp, clamp(uvr, vec2(0.0), vec2(1.0))).rgb;
+            acc = acc + bright(s) * wgt;
+            wgt = wgt * 0.93;
+        }
+        let fade = smoothstep(1.4, 0.2, distance(in.uv, sun_uv));
+        col = col + acc / 22.0 * ray_s * fade * vec3(1.0, 0.9, 0.75);
+    }
+
     // --- lightning: a full-frame flash on top of the lit scene
     col = col + vec3(0.55, 0.58, 0.8) * params.w * 0.9;
 
-    // exposure + ACES
+    // exposure + ACES, then a gentle S-curve for punch (contrast in pp.c.w)
     col = col * params.x;
     col = aces(col);
+    let k = pp.c.w;
+    col = mix(col, col * col * (3.0 - 2.0 * col), k);
 
     // subtle saturation lift (the Long Night desaturates toward blue-steel)
     let luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
