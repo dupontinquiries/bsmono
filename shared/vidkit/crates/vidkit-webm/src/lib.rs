@@ -48,8 +48,19 @@ impl<S: ByteSource> WebmDemuxer<S> {
                 id::INFO => info = Some(parse_info(&mut src, &h, seg_end)?),
                 id::TRACKS => track = Some(parse_video_track(&mut src, &h, seg_end)?),
                 id::CLUSTER => {
-                    first_cluster = Some(h);
-                    break;
+                    // Remember it, but keep scanning until Tracks is found.
+                    //
+                    // Breaking here made a file whose Tracks follows its first
+                    // cluster unopenable -- "no Tracks element" on a file that
+                    // plainly has one. The comment above already said neither
+                    // Info nor Tracks is guaranteed to appear before the first
+                    // cluster; the loop then assumed they were.
+                    if first_cluster.is_none() {
+                        first_cluster = Some(h);
+                    }
+                    if info.is_some() && track.is_some() {
+                        break;
+                    }
                 }
                 _ => {}
             }
@@ -302,6 +313,128 @@ pub mod build {
 
 #[cfg(test)]
 mod tests {
+
+    /// Layouts real muxers emit, each built the same except for the one
+    /// feature under test. A real 1080p AV1 WebM reported ZERO packets while
+    /// its tracks parsed fine, so the cluster scan is finding nothing that the
+    /// track scan can see — these are the candidates.
+    mod real_layouts {
+        use super::*;
+        use crate::build as w;
+        use crate::ebml::id;
+
+        const SEEK_HEAD: u32 = 0x114D9B74;
+        const VOID: u32 = 0xEC;
+        const CUES: u32 = 0x1C53BB6B;
+        const TAGS: u32 = 0x1254C367;
+
+        fn tracks() -> Vec<u8> {
+            let video = w::elem(
+                id::VIDEO,
+                &w::cat(&[w::uint(id::PIXEL_WIDTH, 1920), w::uint(id::PIXEL_HEIGHT, 1080)]),
+            );
+            w::elem(
+                id::TRACKS,
+                &w::elem(
+                    id::TRACK_ENTRY,
+                    &w::cat(&[
+                        w::uint(id::TRACK_NUMBER, 1),
+                        w::uint(id::TRACK_TYPE, 1),
+                        w::string(id::CODEC_ID, "V_AV1"),
+                        video,
+                    ]),
+                ),
+            )
+        }
+
+        fn info() -> Vec<u8> {
+            w::elem(
+                id::INFO,
+                &w::cat(&[
+                    w::uint(id::TIMESTAMP_SCALE, 1_000_000),
+                    w::float64(id::DURATION, 66.0),
+                ]),
+            )
+        }
+
+        fn cluster() -> Vec<u8> {
+            w::elem(
+                id::CLUSTER,
+                &w::cat(&[
+                    w::uint(id::TIMESTAMP, 0),
+                    w::simple_block(1, 0, true, &[0xB0; 4]),
+                    w::simple_block(1, 33, false, &[0xB1; 4]),
+                ]),
+            )
+        }
+
+        fn file(before_clusters: Vec<Vec<u8>>) -> Vec<u8> {
+            let mut body = Vec::new();
+            for part in before_clusters {
+                body.extend_from_slice(&part);
+            }
+            body.extend_from_slice(&cluster());
+            w::cat(&[
+                w::elem(id::EBML_HEADER, &[0x42, 0x86, 0x81, 0x01]),
+                w::elem(id::SEGMENT, &body),
+            ])
+        }
+
+        fn packets(bytes: Vec<u8>) -> usize {
+            let d = WebmDemuxer::open(vidkit_core::io::MemorySource(bytes)).expect("open");
+            d.block_count()
+        }
+
+        /// The baseline the existing tests already cover.
+        #[test]
+        fn plain_info_tracks_clusters() {
+            assert_eq!(packets(file(vec![info(), tracks()])), 2);
+        }
+
+        /// Almost every real muxer writes a SeekHead first.
+        #[test]
+        fn a_leading_seekhead_does_not_hide_the_clusters() {
+            let sh = w::elem(SEEK_HEAD, &[0u8; 24]);
+            assert_eq!(packets(file(vec![sh, info(), tracks()])), 2);
+        }
+
+        /// Void padding is reserved space a muxer leaves to rewrite headers.
+        #[test]
+        fn void_padding_does_not_hide_the_clusters() {
+            let void = w::elem(VOID, &[0u8; 64]);
+            assert_eq!(packets(file(vec![info(), tracks(), void])), 2);
+        }
+
+        /// Cues before the clusters, which some muxers do so seeking works
+        /// without reading to the end.
+        #[test]
+        fn cues_before_the_clusters_do_not_hide_them() {
+            let cues = w::elem(CUES, &[0u8; 32]);
+            assert_eq!(packets(file(vec![info(), tracks(), cues])), 2);
+        }
+
+        #[test]
+        fn tags_before_the_clusters_do_not_hide_them() {
+            let tags = w::elem(TAGS, &[0u8; 16]);
+            assert_eq!(packets(file(vec![info(), tracks(), tags])), 2);
+        }
+
+        /// Tracks AFTER the first cluster. The scan breaks at the first
+        /// cluster, so a file laid out this way loses its track.
+        #[test]
+        fn tracks_after_the_first_cluster_are_still_found() {
+            let mut body = Vec::new();
+            body.extend_from_slice(&info());
+            body.extend_from_slice(&cluster());
+            body.extend_from_slice(&tracks());
+            let bytes = w::cat(&[
+                w::elem(id::EBML_HEADER, &[0x42, 0x86, 0x81, 0x01]),
+                w::elem(id::SEGMENT, &body),
+            ]);
+            assert_eq!(packets(bytes), 2, "a late Tracks lost the blocks");
+        }
+    }
+
 
     /// Matroska in a `.mkv` opens exactly like WebM.
     ///

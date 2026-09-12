@@ -367,6 +367,10 @@ MUTANTS = [
      "            Some(c) => c.delivery == Delivery::DmaBuf && !self.gpu.can_import_dmabuf(),",
      "            Some(_) => false,"),
 
+    ("webm/scan-stops-at-first-cluster", "crates/vidkit-webm/src/lib.rs",
+     "                    if info.is_some() && track.is_some() {\n                        break;\n                    }",
+     "                    break;"),
+
     # --- av1 sequence header ----------------------------------------------------
     ("av1/sequence-header-never-emitted", "crates/vidkit-mp4/src/demux.rs",
      "                    let with_seq = s.is_sync && self.needs_parameter_sets;",
