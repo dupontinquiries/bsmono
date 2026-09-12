@@ -6,18 +6,20 @@ Unverified or unbuilt, in the order they matter.
       `nix copy --to file://` and the narinfo/nix-cache-info formats; the
       base32 codec matches the known vector. Needs: `nix copy` a closure,
       `depot ingest nix`, then `nix build --substituters http://…/nix`.
-- [ ] **toolchain install.sh against real tarballs.** The script is POSIX sh
-      and reviewed, not run. Needs: `pack-rust.sh 1.96.0 <triple>`, ingest,
-      `sh install.sh 1.96.0 $HOME/.local` on a box without rustup.
+- [x] ~~toolchain install.sh against real tarballs~~ — done 2026-09-12 with
+      the 1.96.0 x86_64-gnu set: sha256 verified, installed, `rustc` works,
+      tampered hash refused. Still untested: a musl host (the `ldd` detection
+      branch) and `TRIPLE=` cross installs.
 - [ ] **cross builds** for `aarch64-unknown-linux-musl` (phones) and
       `aarch64-unknown-linux-gnu` (Asahi). No C deps by default, so this
       should be `cargo build --target …` with the std for that triple; the
       optional `zstd` feature is the only thing that would need a cross CC.
 - [ ] **flake.nix** — written from the `buildRustPackage` pattern, never
       evaluated.
-- [ ] **UI in a browser.** Routes and JSON verified with curl; the JS has
-      not been executed. Check: hash routing, filter boxes, yank button
-      with a token, the Clients tab's checkbox → snippet refresh.
+- [ ] **UI in a browser.** Routes and JSON verified with curl; `node
+      --check` passes; the JS has not been executed. Check: hash routing,
+      filter boxes, yank button with a token, the Clients tab's checkbox →
+      snippet refresh.
 - [ ] **Graceful SIGTERM drain.** The accept loop polls a stop flag but
       nothing sets it (std has no signal handler). Safe today because every
       write is atomic; a `signal-hook`-free option is a `/proc/self`-free

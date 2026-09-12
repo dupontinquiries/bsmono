@@ -52,10 +52,15 @@ Built and tested in a sandbox with the offline Rust 1.96 drop, `rpm`,
   with the crates-io source id unchanged, fetches, builds, runs.
 - **Real dnf** (`--installroot`): makecache, repoquery, `provides` by path,
   `install` from the depot.
+- **Toolchains, real tarballs** (the 1.96.0 x86_64 set from `pack-rust.sh`):
+  ingest, then the served `install.sh` into a fresh prefix — sha256 checked
+  against `index.json`, three components installed, `rustc 1.96.0`; that
+  toolchain then built the depot-fetched crates. Breaking the computed hash
+  makes the installer refuse and install nothing.
 - curl: ETag/304, Range/206, HEAD, traversal refused, writes refused without
-  the admin token; UI and manual served.
+  the admin token; UI and manual served; `node --check` on the UI script.
 - `systemd-analyze verify` passes; offline security exposure 1.2.
 
-Not verified: nix client, toolchain `install.sh` against a real tarball,
-`flake.nix`, cross builds (musl/aarch64), the UI in a browser (JS not
-executed here), graceful SIGTERM drain. See [TODO.md](TODO.md).
+Not verified: nix client, `flake.nix`, cross builds (musl/aarch64), the UI
+in a browser (JS syntax-checked, not executed), graceful SIGTERM drain.
+See [TODO.md](TODO.md).
