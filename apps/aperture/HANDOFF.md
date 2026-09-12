@@ -221,6 +221,12 @@ this branch, that's where to look first.
   reconsidering if a real need shows up, but don't do either casually.
 - **Multi-cursor, IME preedit, streaming ghosts, LSP**: named in
   `TODO.md`, untouched, larger than anything tackled solo this session.
+- **CORRECTION (later session):** the next bullet's claim about
+  `logscope-egui` and `scene-kit` was true when written and is not now.
+  `apps/logscope/crates/logscope-egui/Cargo.toml:24` takes a path
+  dependency on `shared/scene-kit` with `default-features = false`, and its
+  own comment lists which modules migrated. The migration TODO.md describes
+  is partly done. Everything else in the bullet still holds.
 - **`logscope-egui` itself was never modified — confirmed by actually
   building it**, not just by argument. It has NO Cargo dependency on
   `shared/scene-kit` at all (checked `Cargo.toml` directly): its own copies
