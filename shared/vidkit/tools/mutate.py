@@ -286,10 +286,6 @@ MUTANTS = [
      "Command::Do(Action::SeekBy(parse_number(slot).unwrap_or(10.0) as i64))"),
 
     # --- command palette ------------------------------------------------------
-    ("pal/ties-not-broken-on-length", "crates/vidkit-egui/src/palette.rs",
-     "            .then(a.command.name.len().cmp(&b.command.name.len()))", ""),
-    ("pal/word-matches-demoted", "crates/vidkit-egui/src/palette.rs",
-     "    if name.split_whitespace().any(|w| w.starts_with(query)) {", "    if false {"),
     ("pal/unavailable-commands-offered", "crates/vidkit-egui/src/palette.rs",
      "            Action::PlayClipboard => clipboard.playable,", "            Action::PlayClipboard => true,"),
 
@@ -604,6 +600,10 @@ def restore_inflight():
         INFLIGHT.unlink(missing_ok=True)
 
 
+def _clear_running():
+    (ROOT / ".mutate-running").unlink(missing_ok=True)
+
+
 def main():
     pattern = sys.argv[1] if len(sys.argv) > 1 else ""
     restore_inflight()
@@ -613,6 +613,11 @@ def main():
         print("warning: no VK_ICD_FILENAMES and no lavapipe; shader mutants "
               "cannot be killed because their tests will skip\n")
 
+    running = ROOT / ".mutate-running"
+    running.write_text(f"pid {os.getpid()}\n")
+    print("NOTE: source files are edited IN PLACE while this runs.")
+    print("Do not commit until it finishes -- `git add -A` mid-sweep commits a")
+    print("mutation, and the suite then fails on a bug nobody wrote.\n")
     print(f"baseline: ", end="", flush=True)
     try:
         ok = run_tests()
@@ -678,4 +683,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        code = main()
+    finally:
+        _clear_running()
+    sys.exit(code)

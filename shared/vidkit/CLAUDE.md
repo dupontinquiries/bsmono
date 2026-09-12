@@ -82,7 +82,7 @@ trusting them.
 ```sh
 cargo test --ignore-rust-version            # 462 tests
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json cargo test -p vidkit-vk
-python3 tools/mutate.py                     # 179 mutants, all must be killed
+python3 tools/mutate.py                     # 177 mutants, all must be killed
 python3 tools/mutate.py shader              # just the WGSL ones
 ```
 
@@ -91,6 +91,13 @@ suite fails to notice. It sets `VK_ICD_FILENAMES` to lavapipe itself when
 nothing else is configured, because the Vulkan tests skip without a device and
 a skipped test kills no mutant, and it puts a packaged rustc 1.91 on PATH when
 one exists.
+
+**Do not commit while it runs.** The sweep edits source files IN PLACE. A
+`git add -A` mid-sweep commits a mutation, and the suite then fails on a bug
+nobody wrote — this happened, and `caps.rs` shipped with its max-resolution
+check replaced by `if false`. `.mutate-running` exists for the whole run and
+the tool says so at startup; `git status` before committing is the habit that
+actually saves you.
 
 **Run it detached.** A full sweep outlives a five-minute harness call, and a
 killed run used to leave the source mutated. It now records the original in

@@ -21,7 +21,7 @@ not exist in the tree; tracked as C9-7c rather than silently dropped.
 | audio-kit | DSP primitives: level / goertzel+spectrogram / pitch / window / gen | ✅ v0.1, 25 tests |
 | voice-kit | whisper post-proc: hallucination filtering (union) + ggml model resolution | ✅ v0.1, 10 tests |
 | core-kit | foundational leaf utils: time / hex / rng (SplitMix64) | ✅ v0.1, 12 tests; share-kit repointed |
-| vidkit | video playback: caps model / MP4+WebM demux / player loop / egui surface | ✅ v0.1, 462 tests, 179 mutants; see `apps/vidkit-player/TODO_vidkit.md` |
+| vidkit | video playback: caps model / MP4+WebM demux / player loop / egui surface | ✅ v0.1, 462 tests, 177 mutants; see `apps/vidkit-player/TODO_vidkit.md` |
 
 All build & test `--offline` (crypto-kit/share-kit need the cached crates.io deps).
 
