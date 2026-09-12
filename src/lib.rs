@@ -4,7 +4,7 @@
 // microvoxels.
 //
 // Layering (headless core → shell):
-//   consts / gods / items / weather / map_events / wild / audio(dsp) / sim / systems / abilities / ai
+//   consts / gods / items / weather / map_events / wild / audio(dsp) / input / sim / systems / abilities / ai
 //       — pure data + arithmetic, run under `cargo test` with no GPU
 //   voxel / models / props / vfx        — mesh + particle generation (CPU)
 //   render / scene / ui / app / headless — wgpu, egui, winit shells
@@ -19,6 +19,9 @@ pub mod weather;
 pub mod map_events;
 pub mod wild;
 pub mod audio;
+pub mod input;
+pub mod gamepad;
+pub mod touch;
 pub mod sim;
 pub mod systems;
 pub mod abilities;

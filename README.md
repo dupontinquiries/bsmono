@@ -95,7 +95,7 @@ ALSA headers (`libasound2-dev`) at build time — or build with
 
 ```bash
 cargo run --release          # windowed game
-cargo test                   # 30 tests: roster, items, lanes, sim, weather, map events, wildlife,
+cargo test                   # 40 tests: roster, items, lanes, sim, weather, map events, wildlife,
                              #   plus offline WGSL validation of every shader with naga
 cargo run -- --screenshot    # headless demo: renders PNG screenshots (no window)
 cargo run --example simdbg   # 120 s AI-only match trace (economy, events, weather, hunt tally)
@@ -119,16 +119,41 @@ cargo run -- --screenshot    # renders via lavapipe (CPU)
 
 ## Controls
 
-| Input | Action |
+Every action is rebindable — open **CONTROLS** from the main menu or press
+`Esc` in a match, click a row, press the key / mouse button / pad button you
+want. Bindings are *logical* keys (the character a key types on your layout),
+so a Dvorak player binding `e` gets the key labelled `e`. Two stock schemes
+(QWERTY WASD, Dvorak `,AOE`) plus custom. Saved to
+`$XDG_CONFIG_HOME/clawbound/controls.cfg` (a plain text file). This is the
+input model the monorepo's other games (skydribble, unendlich) use.
+
+| Input (QWERTY scheme) | Action |
 |---|---|
 | Mouse (click to lock) | Third-person camera, crosshair aim |
-| `W A S D` | Move (camera-relative) |
+| `W A S D` / arrows | Move (camera-relative) |
+| `Shift` (hold) | Auto-run toward the crosshair |
 | `LMB` | Basic attack (auto-assist target) |
-| `1 2 3 4` | Cast abilities at crosshair ground point (4 = ultimate) |
+| `1 2 3 4` or `Q E R F` | Cast abilities at crosshair ground point (4 = ultimate) |
 | `B` | Toggle the 100-item shop |
 | `Tab` / `C` (hold) | Scoreboard |
-| Mouse wheel | Zoom |
-| `Esc` | Release cursor / close shop |
+| Mouse wheel / `PgUp` `PgDn` | Zoom |
+| `X` | Camera behind me |
+| `Esc` | Release cursor → controls panel |
+
+**Controller** (`--features gamepad`, gilrs; needs `libudev-dev` on Linux):
+left stick move, right stick look, `RT` attack, `X Y B RB` abilities 1–4,
+D-pad up shop, Select scoreboard, Start menu, `R3` recenter — buttons are
+rebindable like keys (press a pad button on a row).
+
+**Touch** (phones / tablets — postmarketOS, Plasma Mobile): enabled
+automatically on the first touch. A floating stick appears under your thumb
+anywhere in the left 42 % of the screen; attack and ability buttons (with
+cooldown sweeps) cluster bottom-right; drag in the open area to turn the
+camera; **tap the ground to walk there**. Portrait and landscape both work.
+Size and on/off live in the controls panel.
+
+Camera look uses raw mouse motion (`DeviceEvent::MouseMotion`), so it works
+on Wayland compositors that refuse cursor warping.
 
 ## Architecture
 
@@ -144,6 +169,9 @@ src/
 ├── map_events.rs  event scheduler + effects; `speed_mul` / `gold_mul` hooks
 ├── wild.rs        heal trees, prey (hare / stag / glowfish), the hunt, Riverblessing
 ├── audio.rs       acoustics_at(pos) → howl/reverb voicing; WindSynth DSP; cpal shell
+├── input.rs       Action / Bind / Bindings (schemes, capture, config file), InputState, resolve()
+├── gamepad.rs     PB_* codes, PadState, gilrs shell (feature `gamepad`)
+├── touch.rs       floating stick + button cluster + tap-to-walk, portrait/landscape
 ├── sim.rs         entities, economy, damage pipeline, kills
 ├── systems.rs     tick: waves, movement, auto-attacks, projectiles, zones, sky
 ├── abilities.rs   cast execution for all 13 archetypes

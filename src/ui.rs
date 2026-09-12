@@ -136,7 +136,7 @@ pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool) {
                 *quit = true;
             }
             ui.add_space(20.0);
-            ui.label(egui::RichText::new("WASD move · Mouse look · LMB attack · 1-4 abilities · B shop · Tab scoreboard").size(13.0).color(Color32::from_rgb(160, 158, 150)));
+            ui.label(egui::RichText::new("Move · Mouse look · Attack · 1-4 abilities · Shop · Scoreboard — all rebindable in CONTROLS; gamepad and touch supported").size(13.0).color(Color32::from_rgb(160, 158, 150)));
             ui.label(egui::RichText::new("5v5 · three lanes · destroy towers to unshield the enemy Elder · watch the sky").size(13.0).color(Color32::from_rgb(160, 158, 150)));
         });
     });
@@ -718,4 +718,148 @@ pub fn draw_end(ctx: &egui::Context, game: &Game, again: &mut bool, menu: &mut b
 
 pub fn roster_len() -> usize {
     ROSTER.len()
+}
+
+
+// --- controls panel (rebind by pressing), touch HUD, hints ----------------
+
+/// What the controls panel asked for this frame; app.rs applies it.
+pub struct ControlsPanel {
+    pub close: bool,
+    pub capture: Option<crate::input::Action>,
+    pub clear: Option<crate::input::Action>,
+    pub scheme: Option<crate::input::Scheme>,
+    pub reset: bool,
+}
+
+pub fn draw_controls_button(ctx: &egui::Context, open: &mut bool) {
+    egui::Area::new(egui::Id::new("controls_btn")).anchor(egui::Align2::RIGHT_TOP, [-16.0, 16.0]).show(ctx, |ui| {
+        if ui.add_sized([150.0, 32.0], egui::Button::new(egui::RichText::new("⚙  CONTROLS").size(15.0))).clicked() {
+            *open = true;
+        }
+    });
+}
+
+pub fn draw_click_to_play(ctx: &egui::Context) {
+    egui::Area::new(egui::Id::new("click_hint")).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -150.0]).show(ctx, |ui| {
+        ui.label(egui::RichText::new("click the world to take control · Esc for controls").size(14.0).color(Color32::from_rgb(200, 195, 180)));
+    });
+}
+
+pub fn draw_controls(ctx: &egui::Context, cfg: &mut crate::input::Config, capturing: Option<crate::input::Action>, pad_connected: bool, out: &mut ControlsPanel) {
+    use crate::input::{Action, Scheme, ACTIONS};
+    setup_style(ctx);
+    egui::Area::new(egui::Id::new("controls")).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+        egui::Frame::default().fill(PANEL).stroke(Stroke::new(1.5_f32, GOLD)).inner_margin(16.0).show(ui, |ui| {
+            ui.set_width(560.0);
+            ui.horizontal(|ui| {
+                ui.heading(egui::RichText::new("CONTROLS").size(22.0).color(GOLD));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("  ✕  ").clicked() {
+                        out.close = true;
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Scheme").size(13.0).color(Color32::from_rgb(170, 168, 158)));
+                for sc in [Scheme::Classic, Scheme::Dvorak] {
+                    let sel = cfg.bindings.scheme == sc;
+                    if ui.selectable_label(sel, sc.name()).clicked() && !sel {
+                        out.scheme = Some(sc);
+                    }
+                }
+                if cfg.bindings.scheme == Scheme::Custom {
+                    ui.label(egui::RichText::new("CUSTOM").color(GOLD));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("reset all").clicked() {
+                        out.reset = true;
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(if pad_connected { "controller connected — press a pad button on a row to bind it" } else { "click a row, then press the key / mouse button you want (Esc cancels)" }).size(12.0).color(Color32::from_rgb(150, 148, 140)));
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical().max_height(330.0).show(ui, |ui| {
+                egui::Grid::new("bindgrid").num_columns(3).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
+                    for a in ACTIONS {
+                        let cap = capturing == Some(a);
+                        ui.label(egui::RichText::new(a.label()).size(13.0));
+                        let txt = if cap { "press a key…".to_string() } else { cfg.bindings.labels(a) };
+                        let b = ui.add_sized([260.0, 22.0], egui::Button::new(egui::RichText::new(txt).size(13.0).color(if cap { GOLD } else { Color32::WHITE })));
+                        if b.clicked() {
+                            out.capture = Some(a);
+                        }
+                        if ui.small_button("clear").clicked() {
+                            out.clear = Some(a);
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            ui.separator();
+            let st = &mut cfg.settings;
+            let mut changed = false;
+            changed |= ui.add(egui::Slider::new(&mut st.mouse_sens, 0.2..=3.0).text("mouse sensitivity")).changed();
+            changed |= ui.add(egui::Slider::new(&mut st.pad_sens, 0.2..=3.0).text("stick sensitivity")).changed();
+            changed |= ui.checkbox(&mut st.invert_y, "invert look Y").changed();
+            ui.horizontal(|ui| {
+                changed |= ui.checkbox(&mut st.touch_enabled, "on-screen touch controls").changed();
+                changed |= ui.add(egui::Slider::new(&mut st.touch_scale, 0.6..=1.8).text("size")).changed();
+            });
+            if changed {
+                cfg.save();
+            }
+            let _ = Action::Menu;
+        });
+    });
+}
+
+/// Touch overlay: floating stick, attack + ability buttons (with cooldown
+/// sweeps), shop / board / menu. Geometry from `touch::layout`, drawn in
+/// the same shorter-side units the pad uses for hit-testing.
+pub fn draw_touch_pad(ctx: &egui::Context, pad: &crate::touch::TouchPad, game: &Game, w: f32, h: f32) {
+    let short = w.min(h).max(1.0);
+    let ppp = ctx.pixels_per_point();
+    let to_px = |v: glam::Vec2| Pos2::new(v.x * short / ppp, v.y * short / ppp);
+    let r_px = |r: f32| r * pad.scale * short / ppp;
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("touchpad")));
+    let l = crate::touch::layout(pad.extent, pad.scale);
+    let g = &game.gods[0];
+    let def = game.def(0);
+    let dim = Color32::from_rgba_premultiplied(20, 20, 28, 120);
+    let ring = Color32::from_rgba_premultiplied(230, 226, 216, 140);
+
+    // stick
+    if let Some((origin, knob)) = pad.stick_draw() {
+        painter.circle(to_px(origin), r_px(0.135), dim, Stroke::new(2.0, ring));
+        painter.circle_filled(to_px(knob), r_px(0.05), Color32::from_rgba_premultiplied(230, 226, 216, 200));
+    } else {
+        // a faint hint where the thumb usually rests
+        painter.circle_stroke(to_px(glam::Vec2::new(0.22, pad.extent.y - 0.30)), r_px(0.06), Stroke::new(1.0, Color32::from_rgba_premultiplied(230, 226, 216, 50)));
+    }
+    // attack
+    let atk_c = if pad.attack_down() { Color32::from_rgba_premultiplied(200, 80, 60, 200) } else { dim };
+    painter.circle(to_px(l.attack), r_px(crate::touch::ATK_R), atk_c, Stroke::new(2.0, ring));
+    painter.text(to_px(l.attack), Align2::CENTER_CENTER, "ATK", FontId::proportional(r_px(0.06)), Color32::WHITE);
+    // abilities with cooldown sweep
+    for (i, c) in l.abilities.iter().enumerate() {
+        let ab = &def.abilities[i];
+        let col = Color32::from_rgb((ab.color[0] * 255.0) as u8, (ab.color[1] * 255.0) as u8, (ab.color[2] * 255.0) as u8);
+        let cd = g.cds[i];
+        let ready = cd <= 0.0 && g.mana >= ab.cost;
+        let fill = if pad.ability_down(i) { col } else if ready { col.linear_multiply(0.55) } else { dim };
+        painter.circle(to_px(*c), r_px(crate::touch::BTN_R), fill, Stroke::new(2.0, if ab.ult { GOLD } else { ring }));
+        let label = if cd > 0.0 { format!("{:.0}", cd.ceil()) } else { format!("{}", i + 1) };
+        painter.text(to_px(*c), Align2::CENTER_CENTER, label, FontId::proportional(r_px(0.05)), Color32::WHITE);
+    }
+    // shop / board / menu
+    painter.circle(to_px(l.shop), r_px(crate::touch::BTN_R * 0.8), dim, Stroke::new(1.5, ring));
+    painter.text(to_px(l.shop), Align2::CENTER_CENTER, "$", FontId::proportional(r_px(0.05)), GOLD);
+    painter.circle(to_px(l.board), r_px(crate::touch::BTN_R * 0.8) / pad.scale, dim, Stroke::new(1.5, ring));
+    painter.text(to_px(l.board), Align2::CENTER_CENTER, "≡", FontId::proportional(r_px(0.045) / pad.scale), Color32::WHITE);
+    painter.circle(to_px(l.menu), r_px(crate::touch::BTN_R * 0.8) / pad.scale, dim, Stroke::new(1.5, ring));
+    painter.text(to_px(l.menu), Align2::CENTER_CENTER, "⚙", FontId::proportional(r_px(0.045) / pad.scale), Color32::WHITE);
 }

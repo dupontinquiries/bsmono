@@ -24,6 +24,7 @@ bytemuck = { version = "1.15", features = ["derive"] }
 pollster = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 cpal = { version = "0.15", optional = true }
+gilrs = { version = "0.11", optional = true }
 
 [features]
 # Procedural wind/rain/thunder ambience through cpal. On by default; build
@@ -31,6 +32,8 @@ cpal = { version = "0.15", optional = true }
 # (the DSP core in src/audio.rs compiles and is tested either way).
 default = ["audio"]
 audio = ["cpal"]
+# Controller support via gilrs (needs libudev-dev on Linux).
+gamepad = ["gilrs"]
 
 [profile.release]
 opt-level = 3

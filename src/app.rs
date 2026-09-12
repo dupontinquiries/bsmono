@@ -1,13 +1,20 @@
 // Windowed application: winit 0.29 event loop + egui wiring + player controls.
+//
+// Input flows one way: winit events → `input::InputEvent` (logical keys, raw
+// mouse motion, touch) → `input::resolve()` once per frame → `Controls` → sim.
+// Nothing below reads a KeyCode; the bindings decide what a key means.
 
-use std::collections::HashSet;
 use std::time::Instant;
 
-use glam::Vec3;
-use winit::event::{ElementState, Event, KeyEvent, MouseButton, WindowEvent};
+use glam::{Vec2, Vec3};
+use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, MouseButton, TouchPhase, WindowEvent};
 use winit::event_loop::{EventLoop, EventLoopWindowTarget};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowBuilder};
+
+use crate::gamepad::{Pad, PadState};
+use crate::input::{self, Action, Bind, Config, Controls, InputEvent, InputState, MouseBtn, Named};
+use crate::touch::TouchPad;
 
 use crate::render::{Camera, Renderer};
 use crate::scene::Scene;
@@ -35,8 +42,18 @@ struct AppState {
     screen: Screen,
     game: Option<Game>,
     vfx: Vfx,
-    keys: HashSet<KeyCode>,
-    mouse_down: bool,
+    // --- input stack
+    cfg: Config,
+    input: InputState,
+    pad: Pad,
+    pad_state: PadState,
+    touch: TouchPad,
+    controls: Controls,
+    /// Controls panel open (pause / rebind). `capturing` = waiting for a press.
+    controls_open: bool,
+    capturing: Option<Action>,
+    /// Walk-to order from a tap (world ground point).
+    walk_to: Option<Vec3>,
     locked: bool,
     scoreboard: bool,
     cam_yaw: f32,
@@ -78,6 +95,11 @@ pub fn run() {
                 Event::AboutToWait => {
                     if let Some(s) = state.as_ref() {
                         s.window.request_redraw();
+                    }
+                }
+                Event::DeviceEvent { event, .. } => {
+                    if let Some(s) = state.as_mut() {
+                        handle_device_event(s, event);
                     }
                 }
                 Event::WindowEvent { event, .. } => {
@@ -289,8 +311,19 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         screen: Screen::Menu,
         game: None,
         vfx: Vfx::default(),
-        keys: HashSet::new(),
-        mouse_down: false,
+        cfg: {
+            let c = Config::load();
+            eprintln!("[clawbound] controls: {} scheme{}", c.bindings.scheme.name(), Config::path().map(|p| format!(" ({})", p.display())).unwrap_or_default());
+            c
+        },
+        input: InputState::default(),
+        pad: Pad::new(),
+        pad_state: PadState::default(),
+        touch: TouchPad::new(),
+        controls: Controls::default(),
+        controls_open: false,
+        capturing: None,
+        walk_to: None,
         locked: false,
         scoreboard: false,
         cam_yaw: std::f32::consts::PI,
@@ -306,13 +339,90 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
     })
 }
 
+/// winit logical key → our backend-neutral bind (None for keys we don't map).
+fn bind_of_key(k: &Key) -> Option<Bind> {
+    Some(match k {
+        Key::Character(s) => input::ch(s.as_str()),
+        Key::Named(n) => Bind::Named(match n {
+            NamedKey::Space => Named::Space,
+            NamedKey::Shift => Named::Shift,
+            NamedKey::Control => Named::Control,
+            NamedKey::Alt => Named::Alt,
+            NamedKey::Tab => Named::Tab,
+            NamedKey::Escape => Named::Escape,
+            NamedKey::Enter => Named::Enter,
+            NamedKey::Backspace => Named::Backspace,
+            NamedKey::ArrowUp => Named::ArrowUp,
+            NamedKey::ArrowDown => Named::ArrowDown,
+            NamedKey::ArrowLeft => Named::ArrowLeft,
+            NamedKey::ArrowRight => Named::ArrowRight,
+            NamedKey::PageUp => Named::PageUp,
+            NamedKey::PageDown => Named::PageDown,
+            NamedKey::Home => Named::Home,
+            NamedKey::End => Named::End,
+            NamedKey::CapsLock => Named::CapsLock,
+            NamedKey::F1 => Named::F1,
+            NamedKey::F2 => Named::F2,
+            NamedKey::F3 => Named::F3,
+            NamedKey::F4 => Named::F4,
+            NamedKey::F5 => Named::F5,
+            _ => return None,
+        }),
+        _ => return None,
+    })
+}
+
+fn bind_of_mouse(b: MouseButton) -> Bind {
+    Bind::Mouse(match b {
+        MouseButton::Left => MouseBtn::Left,
+        MouseButton::Right => MouseBtn::Right,
+        MouseButton::Middle => MouseBtn::Middle,
+        MouseButton::Back => MouseBtn::Back,
+        MouseButton::Forward => MouseBtn::Forward,
+        MouseButton::Other(n) => MouseBtn::Other(n),
+    })
+}
+
+fn set_locked(s: &mut AppState, lock: bool) {
+    if s.locked == lock {
+        return;
+    }
+    s.locked = lock;
+    if lock {
+        // Locked is the right mode on X11/Windows/macOS; Wayland compositors
+        // that refuse it fall back to Confined + hidden cursor, and the raw
+        // DeviceEvent::MouseMotion path still delivers deltas either way.
+        let _ = s.window.set_cursor_grab(winit::window::CursorGrabMode::Locked)
+            .or_else(|_| s.window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
+        s.window.set_cursor_visible(false);
+    } else {
+        let _ = s.window.set_cursor_grab(winit::window::CursorGrabMode::None);
+        s.window.set_cursor_visible(true);
+    }
+}
+
+fn handle_device_event(s: &mut AppState, event: DeviceEvent) {
+    if let DeviceEvent::MouseMotion { delta } = event {
+        if s.locked {
+            s.input.handle(InputEvent::MouseDelta(delta.0 as f32, delta.1 as f32));
+        }
+    }
+}
+
 fn handle_window_event(s: &mut AppState, event: WindowEvent) {
     let egui_response = s.egui_winit.on_window_event(&s.window, &event);
+    let size = s.window.inner_size();
+    let short = size.width.min(size.height).max(1) as f32;
+    // touch positions in normalized units of the shorter side, y down
+    let norm = |p: winit::dpi::PhysicalPosition<f64>| Vec2::new(p.x as f32 / short, p.y as f32 / short);
 
     match event {
         WindowEvent::CloseRequested => s.exiting = true,
+        WindowEvent::Focused(false) => s.input.handle(InputEvent::FocusLost),
         WindowEvent::Resized(size) => {
             s.renderer.resize(size.width.max(1), size.height.max(1));
+            let sh = size.width.min(size.height).max(1) as f32;
+            s.touch.extent = Vec2::new(size.width.max(1) as f32 / sh, size.height.max(1) as f32 / sh);
             s.surface.configure(
                 &s.renderer.device,
                 &wgpu::SurfaceConfiguration {
@@ -327,113 +437,180 @@ fn handle_window_event(s: &mut AppState, event: WindowEvent) {
                 },
             );
         }
-        WindowEvent::CursorMoved { position, .. } => {
-            if s.locked {
-                let center = winit::dpi::PhysicalPosition::new(
-                    s.window.inner_size().width as f64 / 2.0,
-                    s.window.inner_size().height as f64 / 2.0,
-                );
-                let dx = position.x - center.x;
-                let dy = position.y - center.y;
-                s.cam_yaw -= dx as f32 * 0.0045;
-                s.cam_pitch = (s.cam_pitch + dy as f32 * 0.0035).clamp(0.06, 1.15);
-                let _ = s.window.set_cursor_position(center);
-            }
-        }
-        WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-            if !egui_response.consumed {
-                if s.screen == Screen::Playing && !s.locked && !s.ui.shop_open {
-                    s.locked = true;
-                    let _ = s.window.set_cursor_grab(winit::window::CursorGrabMode::Locked)
-                        .or_else(|_| s.window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
-                    s.window.set_cursor_visible(false);
+        WindowEvent::MouseInput { state, button, .. } => {
+            let b = bind_of_mouse(button);
+            match state {
+                ElementState::Pressed => {
+                    if let Some(a) = s.capturing.take() {
+                        s.cfg.bindings.capture(a, b);
+                        s.cfg.save();
+                        return;
+                    }
+                    if !egui_response.consumed {
+                        // a click on the world while the cursor is free re-captures it
+                        if s.screen == Screen::Playing && !s.locked && !s.ui.shop_open && !s.controls_open && !s.cfg.settings.touch_enabled {
+                            set_locked(s, true);
+                        }
+                        s.input.handle(InputEvent::Press(b));
+                    }
                 }
-                s.mouse_down = true;
+                ElementState::Released => s.input.handle(InputEvent::Release(b)),
             }
-        }
-        WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
-            s.mouse_down = false;
         }
         WindowEvent::MouseWheel { delta, .. } => {
-            let d = match delta {
-                winit::event::MouseScrollDelta::LineDelta(_, y) => y * 0.8,
-                winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.02,
-            };
-            s.cam_dist = (s.cam_dist - d).clamp(4.5, 16.0);
-        }
-        WindowEvent::KeyboardInput {
-            event:
-                KeyEvent {
-                    state: ElementState::Pressed,
-                    physical_key: PhysicalKey::Code(code),
-                    ..
-                },
-            ..
-        } => {
             if !egui_response.consumed {
-                s.keys.insert(code);
-                handle_key(s, code);
+                let d = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y * 0.8,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.02,
+                };
+                s.input.handle(InputEvent::Scroll(d));
             }
         }
-        WindowEvent::KeyboardInput {
-            event:
-                KeyEvent {
-                    state: ElementState::Released,
-                    physical_key: PhysicalKey::Code(code),
-                    ..
-                },
-            ..
-        } => {
-            s.keys.remove(&code);
-            if code == KeyCode::Tab || code == KeyCode::KeyC {
-                s.scoreboard = false;
+        WindowEvent::KeyboardInput { event: KeyEvent { state, logical_key, repeat, .. }, .. } => {
+            let Some(b) = bind_of_key(&logical_key) else { return };
+            match state {
+                ElementState::Pressed if !repeat => {
+                    if let Some(a) = s.capturing.take() {
+                        // Esc cancels a capture instead of binding it
+                        if b != Bind::Named(Named::Escape) {
+                            s.cfg.bindings.capture(a, b);
+                            s.cfg.save();
+                        }
+                        return;
+                    }
+                    // typing into egui (shop search etc.) must not move the ancestor
+                    if !egui_response.consumed || b == Bind::Named(Named::Escape) {
+                        s.input.handle(InputEvent::Press(b));
+                    }
+                }
+                ElementState::Pressed => {}
+                ElementState::Released => s.input.handle(InputEvent::Release(b)),
+            }
+        }
+        WindowEvent::Touch(t) => {
+            // a touchscreen announces itself: enable the on-screen pad on first touch
+            if !s.cfg.settings.touch_enabled {
+                s.cfg.settings.touch_enabled = true;
+                s.cfg.save();
+                set_locked(s, false);
+            }
+            s.touch.enabled = true;
+            s.touch.scale = s.cfg.settings.touch_scale;
+            let p = norm(t.location);
+            match t.phase {
+                TouchPhase::Started => {
+                    if !egui_response.consumed {
+                        s.touch.down(t.id, p);
+                    }
+                }
+                TouchPhase::Moved => s.touch.moved(t.id, p),
+                TouchPhase::Ended => s.touch.up(t.id),
+                TouchPhase::Cancelled => s.touch.cancel(t.id),
             }
         }
         _ => {}
     }
 }
 
-fn handle_key(s: &mut AppState, code: KeyCode) {
-    match code {
-        KeyCode::Escape => {
-            if s.screen == Screen::Playing {
-                s.locked = false;
-                s.ui.shop_open = false;
-                let _ = s.window.set_cursor_grab(winit::window::CursorGrabMode::None);
-                s.window.set_cursor_visible(true);
-            }
+/// Once per frame: poll the pad, resolve everything to `Controls`, and act on
+/// the meta actions (menu, shop, scoreboard, capture) here; gameplay intent
+/// is applied in the fixed-step loop.
+fn gather_controls(s: &mut AppState, dt: f32) {
+    s.pad_state = s.pad.poll();
+    s.touch.tick(dt);
+    s.touch.enabled = s.cfg.settings.touch_enabled;
+    s.touch.scale = s.cfg.settings.touch_scale;
+
+    // bind capture from a controller button
+    if let Some(a) = s.capturing {
+        if let Some(code) = s.pad_state.any_edge() {
+            s.cfg.bindings.capture(a, Bind::Pad(code));
+            s.cfg.save();
+            s.capturing = None;
         }
-        KeyCode::Tab | KeyCode::KeyC => {
-            if s.screen == Screen::Playing {
-                s.scoreboard = true;
-            }
-        }
-        KeyCode::KeyB => {
-            if s.screen == Screen::Playing {
-                s.ui.shop_open = !s.ui.shop_open;
-                if s.ui.shop_open && s.locked {
-                    s.locked = false;
-                    let _ = s.window.set_cursor_grab(winit::window::CursorGrabMode::None);
-                    s.window.set_cursor_visible(true);
-                }
-            }
-        }
-        KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3 | KeyCode::Digit4 => {
-            if s.screen == Screen::Playing && s.game.is_some() {
-                let slot = match code {
-                    KeyCode::Digit1 => 0,
-                    KeyCode::Digit2 => 1,
-                    KeyCode::Digit3 => 2,
-                    _ => 3,
-                };
-                let aim = compute_aim(s);
-                if let Some(g) = s.game.as_mut() {
-                    g.cast_queue.push((0, slot, aim));
-                }
-            }
-        }
-        _ => {}
     }
+
+    let gameplay_active = s.screen == Screen::Playing
+        && !s.ui.shop_open
+        && !s.controls_open
+        && s.capturing.is_none()
+        && (s.locked || s.cfg.settings.touch_enabled || s.pad_state.connected);
+    let c = input::resolve(&s.input, &s.cfg, &s.pad_state, Some(&s.touch), gameplay_active);
+    s.controls = c;
+    s.input.end_frame();
+    s.touch.end_frame();
+
+    if s.screen != Screen::Playing {
+        return;
+    }
+    if c.menu && s.capturing.is_none() {
+        if s.ui.shop_open {
+            s.ui.shop_open = false;
+        } else if s.controls_open {
+            s.controls_open = false;
+            if !s.cfg.settings.touch_enabled {
+                set_locked(s, true);
+            }
+        } else if s.locked {
+            set_locked(s, false);
+        } else {
+            s.controls_open = true;
+        }
+    }
+    if c.shop {
+        s.ui.shop_open = !s.ui.shop_open;
+        if s.ui.shop_open {
+            set_locked(s, false);
+        } else if !s.cfg.settings.touch_enabled {
+            set_locked(s, true);
+        }
+    }
+    s.scoreboard = c.scoreboard;
+    if gameplay_active {
+        s.cam_yaw += c.look.x;
+        s.cam_pitch = (s.cam_pitch + c.look.y).clamp(0.06, 1.15);
+        s.cam_dist = (s.cam_dist - c.zoom).clamp(4.5, 16.0);
+        if c.recenter {
+            if let Some(g) = s.game.as_ref() {
+                s.cam_yaw = g.gods[0].yaw + std::f32::consts::FRAC_PI_2;
+            }
+        }
+        if let Some(tap) = c.tap {
+            s.walk_to = ground_point_from_screen(s, tap);
+        }
+        if c.mv.length_squared() > 0.01 {
+            s.walk_to = None; // the stick takes over from a walk-to order
+        }
+    }
+}
+
+/// Screen point (normalized, y down, x in shorter-side units) → ground hit.
+fn ground_point_from_screen(s: &AppState, p: Vec2) -> Option<Vec3> {
+    let g = s.game.as_ref()?;
+    let player = &g.gods[0];
+    let dir = cam_dir(s.cam_yaw, s.cam_pitch);
+    let target = player.pos + Vec3::Y * 1.5;
+    let cam = Camera { eye: target - dir * s.cam_dist, target, fov_y: 0.95 };
+    let aspect = s.renderer.width as f32 / s.renderer.height.max(1) as f32;
+    let vp = cam.view_proj(aspect);
+    let inv = vp.inverse();
+    // p is in shorter-side units: x spans 0..extent.x, y spans 0..extent.y
+    let ext = s.touch.extent;
+    let ndc = Vec2::new(p.x / ext.x * 2.0 - 1.0, 1.0 - p.y / ext.y * 2.0);
+    let near = inv * glam::Vec4::new(ndc.x, ndc.y, 0.0, 1.0);
+    let far = inv * glam::Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
+    let a = near.truncate() / near.w;
+    let b = far.truncate() / far.w;
+    let d = b - a;
+    if d.y.abs() < 1e-4 {
+        return None;
+    }
+    let t = -a.y / d.y;
+    if t < 0.0 {
+        return None;
+    }
+    let hit = a + d * t;
+    Some(Vec3::new(hit.x, 0.0, hit.z))
 }
 
 fn cam_dir(yaw: f32, pitch: f32) -> Vec3 {
@@ -465,7 +642,7 @@ fn start_game(s: &mut AppState) {
         .map(|d| d.as_secs())
         .unwrap_or(42);
     let mut rng = crate::sim::Rng::new(0xBEEF ^ seed);
-    let mut pool: Vec<u32> = (0..12u32).filter(|&i| i != s.ui.selected as u32).collect();
+    let mut pool: Vec<u32> = (0..crate::gods::ROSTER_LEN as u32).filter(|&i| i != s.ui.selected as u32).collect();
     let mut allies = [0u32; 4];
     let mut enemies = [0u32; 5];
     for a in allies.iter_mut() {
@@ -488,6 +665,11 @@ fn start_game(s: &mut AppState) {
     s.ui.shop_open = false;
     s.cam_yaw = std::f32::consts::PI;
     s.cam_pitch = 0.38;
+    s.walk_to = None;
+    s.controls_open = false;
+    if !s.cfg.settings.touch_enabled {
+        set_locked(s, true);
+    }
 }
 
 fn render(s: &mut AppState) {
@@ -498,25 +680,40 @@ fn render(s: &mut AppState) {
         s.scene = Some(Scene::new(&mut s.renderer));
         render_portraits(s);
     }
+    // input: one resolve per frame, then the fixed-step loop applies it
+    gather_controls(s, dt_frame);
     let scene = s.scene.as_ref().unwrap();
 
     // fixed-step simulation + player input
     if s.screen == Screen::Playing {
+        let c = s.controls;
+        let aim = if s.game.is_some() { compute_aim(s) } else { Vec3::ZERO };
+        let yaw = s.cam_yaw;
+        let walk_to = s.walk_to;
         if let Some(g) = s.game.as_mut() {
+            // casts are edges: queue them once, outside the step loop
+            for slot in 0..4u32 {
+                if c.cast[slot as usize] {
+                    g.cast_queue.push((0, slot, aim));
+                }
+            }
             s.accumulator = (s.accumulator + dt_frame).min(0.25);
             while s.accumulator >= 1.0 / 60.0 {
                 s.accumulator -= 1.0 / 60.0;
-                let mut mv = Vec3::ZERO;
-                let yaw = s.cam_yaw;
                 let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos()).normalize_or_zero();
                 let right = Vec3::new(fwd.z, 0.0, -fwd.x);
-                if s.keys.contains(&KeyCode::KeyW) { mv += fwd; }
-                if s.keys.contains(&KeyCode::KeyS) { mv -= fwd; }
-                if s.keys.contains(&KeyCode::KeyD) { mv += right; }
-                if s.keys.contains(&KeyCode::KeyA) { mv -= right; }
+                let mut mv = fwd * c.mv.y + right * c.mv.x;
+                if let Some(t) = walk_to {
+                    let d = Vec3::new(t.x - g.gods[0].pos.x, 0.0, t.z - g.gods[0].pos.z);
+                    if d.length() > 0.8 {
+                        mv = d.normalize();
+                    } else {
+                        s.walk_to = None;
+                    }
+                }
                 let gi = &mut g.gods[0];
-                gi.move_dir = if !s.ui.shop_open { mv } else { Vec3::ZERO };
-                gi.attack_held = s.mouse_down && !s.ui.shop_open;
+                gi.move_dir = mv;
+                gi.attack_held = c.attack;
                 g.tick(1.0 / 60.0);
                 let events: Vec<crate::sim::Event> = g.events.drain(..).collect();
                 for e in &events {
@@ -621,9 +818,14 @@ fn render(s: &mut AppState) {
     let mut locked_in = false;
     let mut again = false;
     let mut menu = false;
+    let mut open_controls = false;
+    let mut panel = ui::ControlsPanel { close: false, capture: None, clear: None, scheme: None, reset: false };
     let output = s.egui_ctx.run(raw_input, |ctx| {
         match s.screen {
-            Screen::Menu => ui::draw_menu(ctx, &mut play, &mut quit),
+            Screen::Menu => {
+                ui::draw_menu(ctx, &mut play, &mut quit);
+                ui::draw_controls_button(ctx, &mut open_controls);
+            }
             Screen::Select => ui::draw_select(ctx, &mut s.ui, &mut locked_in),
             Screen::Playing => {
                 if let Some(g) = s.game.as_mut() {
@@ -631,6 +833,11 @@ fn render(s: &mut AppState) {
                         ui::draw_shop(ctx, g, 0, &mut s.ui);
                     } else {
                         ui::draw_hud(ctx, g, 0, vp, s.renderer.width as f32, s.renderer.height as f32, &mut s.ui);
+                        if s.cfg.settings.touch_enabled {
+                            ui::draw_touch_pad(ctx, &s.touch, g, s.renderer.width as f32, s.renderer.height as f32);
+                        } else if !s.locked && !s.controls_open {
+                            ui::draw_click_to_play(ctx);
+                        }
                     }
                     if s.scoreboard {
                         ui::draw_scoreboard(ctx, g);
@@ -641,7 +848,35 @@ fn render(s: &mut AppState) {
                 }
             }
         }
+        if s.controls_open {
+            ui::draw_controls(ctx, &mut s.cfg, s.capturing, s.pad_state.connected, &mut panel);
+        }
     });
+    if open_controls {
+        s.controls_open = true;
+    }
+    if panel.close {
+        s.controls_open = false;
+        s.capturing = None;
+        if s.screen == Screen::Playing && !s.cfg.settings.touch_enabled {
+            set_locked(s, true);
+        }
+    }
+    if let Some(a) = panel.capture {
+        s.capturing = Some(a);
+    }
+    if let Some(a) = panel.clear {
+        s.cfg.bindings.clear(a);
+        s.cfg.save();
+    }
+    if let Some(sc) = panel.scheme {
+        s.cfg.bindings = input::Bindings::for_scheme(sc);
+        s.cfg.save();
+    }
+    if panel.reset {
+        s.cfg = Config::default();
+        s.cfg.save();
+    }
     s.egui_winit.handle_platform_output(s.window, output.platform_output);
 
     for td in output.textures_delta.set.iter() {
