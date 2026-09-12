@@ -17,6 +17,7 @@ use studio_live::transport::Transport;
 
 pub mod archive;
 pub mod audition;
+pub mod call;
 pub mod capture;
 /// Playing a synth, and getting a pattern back.
 pub mod perform;
