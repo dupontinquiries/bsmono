@@ -3304,7 +3304,14 @@ mod published_signals {
     //! same reason `perfverdict` reads `main.rs` with `include_str!` to check the gate list.
 
     const BACKEND: &str = include_str!("backend.rs");
-    const CHAT: &str = include_str!("tabs/chat.rs");
+    const CHAT: &str = concat!(
+        include_str!("tabs/chat.rs"),
+        // The draw moved out of `chat.rs` (chat_draw, chat_spatial). A test that reads only
+        // the state file would scan code with none of the call sites in it and pass
+        // vacuously — which is worse than failing, because it looks like the wiring is fine.
+        include_str!("tabs/chat_draw.rs"),
+        include_str!("tabs/chat_spatial.rs"),
+    );
 
     /// Names of the atomics `backend.rs` publishes for consumption (`pub`/`pub(crate)` statics).
     fn published() -> Vec<String> {

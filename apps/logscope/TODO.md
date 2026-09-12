@@ -3260,11 +3260,21 @@ different jobs and only one is safe mechanically: the compiler proves a move, an
 prove that a block lifted out of the middle did not depend on a local three hundred lines
 above it.
 
+`ui` (2,236) followed it into `chat_draw.rs`. chat.rs is 5,504 lines.
+
 Still to do, in size order:
-- [ ] Decompose `spatial_ui` itself — the scene, the drop ingest, the panels and the
-      transcript are four things in one function.
-- [ ] `ui` (2,236) — same treatment: move it out first, decompose after.
+- [ ] Decompose `spatial_ui` — the scene, the drop ingest, the panels and the transcript are
+      four things in one function.
+- [ ] Decompose `ui` — chrome, transcript, composer, right page.
 - [ ] `run_command` (712).
+
+### Watch the source-scanning tests when you move code
+
+`chatgesture` and `backend` have tests that `include_str!("tabs/chat.rs")` and assert on the
+wiring they find. After the move those files no longer contain the call sites, and the tests
+would have PASSED against a file with nothing in it to check — vacuously, which is worse than
+failing because it reads as the wiring being fine. They now concatenate `chat.rs`,
+`chat_draw.rs` and `chat_spatial.rs`. Any further split has to extend that list.
 
 ### chat.rs is still 10,441 lines
 Six cuts done (tests, scene/slab, save format, formatters, dock, `mic_shape`), each verified

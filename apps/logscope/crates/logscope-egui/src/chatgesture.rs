@@ -171,7 +171,15 @@ mod widget_ownership_wiring {
 
     #[test]
     fn both_swipe_sites_consult_drag_owner() {
-        let src = include_str!("tabs/chat.rs");
+        let src = concat!(
+            include_str!("tabs/chat.rs"),
+            // THE DRAW MOVED. `chat.rs` was split (chat_draw, chat_spatial); a wiring test
+            // that reads only the state file now scans a file with none of the call sites in
+            // it and passes vacuously. Concatenating the pieces keeps the test asking the
+            // same question of the same code.
+            include_str!("tabs/chat_draw.rs"),
+            include_str!("tabs/chat_spatial.rs"),
+        );
         let drags = src.matches("total_drag_delta()").count();
         // Two live reads (plus two mentions in comments, which do not carry
         // the call parentheses in a way that matters here — count the calls).
@@ -189,7 +197,15 @@ ask whether a widget owns the press will steal it from a text field");
     fn the_guard_uses_the_shared_helper_not_a_local_reimplementation() {
         // The whole point of `drag_owner` is that there is ONE answer. A
         // hand-rolled equivalent here would drift from pager's and touch's.
-        let src = include_str!("tabs/chat.rs");
+        let src = concat!(
+            include_str!("tabs/chat.rs"),
+            // THE DRAW MOVED. `chat.rs` was split (chat_draw, chat_spatial); a wiring test
+            // that reads only the state file now scans a file with none of the call sites in
+            // it and passes vacuously. Concatenating the pieces keeps the test asking the
+            // same question of the same code.
+            include_str!("tabs/chat_draw.rs"),
+            include_str!("tabs/chat_spatial.rs"),
+        );
         assert!(src.contains("uikit_egui::gesture_layer::drag_owner"),
             "the ownership check must come from uikit-egui, not be re-derived locally");
     }
