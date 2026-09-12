@@ -60,6 +60,9 @@ untestable wrapper would have looked like progress.
   llvmpipe**; *assumed* on turnip and AGX. Opt-in via `VIDKIT_GPU=1`
 - Selective streaming: relevance plan → byte ranges → clipped read-ahead —
   *verified*
+- The full page path against REAL yt-dlp 2026.08.19: resolve, select, fetch,
+  sniff, demux — *verified* by `the_real_extractor_is_parsed_and_played`, which
+  skips cleanly when yt-dlp is absent
 
 ## Open, in the order I would do them
 
@@ -68,31 +71,11 @@ untestable wrapper would have looked like progress.
    up yet". `voice-kit` already does the post-processing and
    `voiced-core::grammar` already does the matching; only the mic and the model
    are missing. *read*
-2. **REAL YT-DLP REJECTS EVERY DIRECT URL. Fix this first.** *verified* —
-   yt-dlp 2026.08.19 installed from pypi, run against a local server by
-   `real_ytdlp_tests::the_real_extractor_is_parsed_and_played`.
-
-   The generic extractor reports `"vcodec": null` and omits `width`, `height`,
-   `fps` and `acodec` entirely for any URL it has not probed. `select` rejects
-   a format whose codec it cannot check against the device's decoders, so every
-   such stream comes back `NoPlayableFormat`. Defensible in isolation and wrong
-   here: the container knows the codec and our own demuxer reads it.
-
-   `Reject::CodecNotReported` now distinguishes "did not say" from "said
-   something unsupported". The fix is to let an unreported codec survive
-   selection as a last resort, which needs something `DeviceCaps::best_path`
-   accepts — there is no `Codec::Unknown`, and inventing a plausible profile
-   would lie to everything downstream. The test pins the current behaviour and
-   fails loudly if it changes in a NEW way.
-
-   Every fixture before this used JSON I wrote by hand, which is why the parser
-   looked finished. `--no-check-formats` and `--print` are worth reading before
-   choosing the fix.
-
-3. **Exercise the TLS path against a real server.** `TlsTransport` compiles and
+2. **Exercise the TLS path against a real server.** `TlsTransport` compiles and
    its scheme selection is tested, but no test has made an actual HTTPS
-   request — the sandbox has no reachable TLS origin. Treat "https works" as
-   *read*, not *verified*, until someone points it at a real URL. *read*
+   request — this sandbox has no reachable TLS origin. "https works" is *read*,
+   not *verified*. *read*
+
 4. **Tooltip fade-in.** Asked for and done — see below — but only the shared
    helper; individual controls still need `.on_hover_text` replaced. *verified*
 5. **`Inhibitor` impl.** wlr idle-inhibit on Phosh, `org.freedesktop.ScreenSaver`

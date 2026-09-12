@@ -78,7 +78,30 @@ mod tests {
     fn missing_fields_do_not_break_parsing() {
         let p = parse(r#"{"formats":[{"format_id":"1"}]}"#).unwrap();
         assert_eq!(p.formats[0].fps_or_guess(), 30);
-        assert!(!p.formats[0].has_video());
+    }
+
+    /// "none" is the extractor saying there is no video; absent or null is it
+    /// saying nothing. This test used to assert they were the same, which is
+    /// precisely the assumption that made every real yt-dlp direct URL
+    /// unplayable -- an ordinary .mp4 link was classified as audio-only and
+    /// rejected before anything else looked at it.
+    #[test]
+    fn an_unreported_codec_is_not_the_same_as_no_video() {
+        let none = parse(r#"{"formats":[{"format_id":"1","vcodec":"none"}]}"#).unwrap();
+        assert!(!none.formats[0].has_video(), "\"none\" means no video track");
+        assert!(none.formats[0].codec_reported());
+
+        // What real yt-dlp emits for anything it has not probed.
+        let null = parse(r#"{"formats":[{"format_id":"1","vcodec":null}]}"#).unwrap();
+        assert!(null.formats[0].has_video(), "null was treated as audio-only");
+        assert!(!null.formats[0].codec_reported());
+
+        let absent = parse(r#"{"formats":[{"format_id":"1"}]}"#).unwrap();
+        assert!(absent.formats[0].has_video());
+        assert!(!absent.formats[0].codec_reported());
+
+        let known = parse(r#"{"formats":[{"format_id":"1","vcodec":"av01.0.08M.08"}]}"#).unwrap();
+        assert!(known.formats[0].has_video() && known.formats[0].codec_reported());
     }
 
     /// The headline behaviour: same JSON, opposite codec, because the hardware
@@ -89,16 +112,16 @@ mod tests {
 
         let asahi = select(&p, &asahi_m_series(), Some("en")).unwrap();
         assert_eq!(
-            asahi.score.profile.codec.to_string(),
+            asahi.score.as_ref().expect("a scored selection").profile.codec.to_string(),
             "h264",
             "AVD fixed-function H.264 must beat any software path on Asahi; got {}",
             asahi.summary
         );
 
         let fp = select(&p, &fairphone_venus(), Some("en")).unwrap();
-        assert_eq!(fp.score.cost, Cost::Fixed);
+        assert_eq!(fp.score.as_ref().expect("a scored selection").cost, Cost::Fixed);
         assert!(
-            matches!(fp.score.profile.codec.to_string().as_str(), "vp9" | "h264"),
+            matches!(fp.score.as_ref().expect("a scored selection").profile.codec.to_string().as_str(), "vp9" | "h264"),
             "Fairphone must land on a Venus path, got {}",
             fp.summary
         );
@@ -117,11 +140,11 @@ mod tests {
         });
 
         let asahi = select(&p, &asahi_m_series(), None).unwrap();
-        assert_eq!(asahi.score.profile.codec.to_string(), "av1", "{}", asahi.summary);
+        assert_eq!(asahi.score.as_ref().expect("a scored selection").profile.codec.to_string(), "av1", "{}", asahi.summary);
 
         let fp = select(&p, &fairphone_venus(), None).unwrap();
-        assert_eq!(fp.score.profile.codec.to_string(), "vp9", "{}", fp.summary);
-        assert_eq!(fp.score.cost, Cost::Fixed);
+        assert_eq!(fp.score.as_ref().expect("a scored selection").profile.codec.to_string(), "vp9", "{}", fp.summary);
+        assert_eq!(fp.score.as_ref().expect("a scored selection").cost, Cost::Fixed);
     }
 
     #[test]
@@ -196,9 +219,9 @@ mod tests {
             a.summary
         );
         assert!(
-            b.score.effective_fps <= 30,
+            b.score.as_ref().expect("a scored selection").effective_fps <= 30,
             "frame rate not capped on battery: {}",
-            b.score.effective_fps
+            b.score.as_ref().expect("a scored selection").effective_fps
         );
     }
 
@@ -214,9 +237,9 @@ mod tests {
         // Everything is clamped to the 854-wide budget, so the chosen stream
         // cannot score above that many effective pixels.
         assert!(
-            s.score.effective_pixels <= 854 * 480,
+            s.score.as_ref().expect("a scored selection").effective_pixels <= 854 * 480,
             "effective pixels {} exceed the 480p cap: {}",
-            s.score.effective_pixels,
+            s.score.as_ref().expect("a scored selection").effective_pixels,
             s.summary
         );
     }
@@ -299,7 +322,7 @@ mod tests {
         let p = probe_fixture();
         let s = select(&p, &desktop_full_hw(), None).unwrap();
         assert_eq!(s.video_format_id, "337", "{}", s.summary);
-        assert_eq!(s.score.effective_fps, 60);
+        assert_eq!(s.score.as_ref().expect("a scored selection").effective_fps, 60);
     }
 
     /// Cap the panel at 30 Hz and the same machine takes the AV1 stream —

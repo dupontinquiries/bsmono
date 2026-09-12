@@ -321,6 +321,12 @@ MUTANTS = [
     ("stream/out-of-plan-not-counted", "crates/vidkit-ytdlp/src/http.rs",
      "                self.plan_misses += 1;", "                "),
 
+    ("ytdlp/absent-vcodec-means-no-video", "crates/vidkit-ytdlp/src/probe.rs",
+     '        !matches!(self.vcodec.as_deref(), Some("none") | Some(""))',
+     '        !matches!(self.vcodec.as_deref(), None | Some("none") | Some(""))'),
+    ("ytdlp/unreported-fallback-removed", "crates/vidkit-ytdlp/src/select.rs",
+     "            return match unreported {", "            return match None::<&RawFormat> {"),
+
     # --- device profiles ---------------------------------------------------------
     ("caps/m3-claims-a-gpu", "crates/vidkit-core/src/caps.rs",
      "        gpu: GpuClass::Unaccelerated,", "        gpu: GpuClass::Vulkan,"),

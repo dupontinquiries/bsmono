@@ -104,7 +104,13 @@ pub struct Selection {
     pub video_format_id: String,
     /// `None` when the chosen video format is muxed (already has audio).
     pub audio_format_id: Option<String>,
-    pub score: Score,
+    /// `None` when the extractor did not report a codec.
+    ///
+    /// Not a placeholder profile: there is no honest value to put here, and a
+    /// plausible-looking one would be handed to `best_path`, which would
+    /// return a decode path for a codec nobody has identified. The container
+    /// carries the truth and the demuxer reads it a moment later.
+    pub score: Option<Score>,
     /// One line, for the UI: "VP9 1080p30 via Venus (fixed-function)".
     pub summary: String,
     /// Every candidate and why it won or lost.
@@ -267,7 +273,39 @@ pub fn select(
         });
     }
 
-    let (vf, score) = best.ok_or(SelectError::NothingPlayable)?;
+    let (vf, score) = match best {
+        Some(b) => b,
+        // Nothing scored. Before giving up, take a format the extractor simply
+        // did not describe -- that is not the same as one it described as
+        // something we cannot play. Real yt-dlp reports `"vcodec": null` for
+        // every direct URL through the generic extractor, so without this the
+        // whole page path fails on the most ordinary input there is.
+        None => {
+            let unreported = probe.formats.iter().find(|f| {
+                matches!(
+                    evaluate(f, caps),
+                    Verdict::Rejected(Reject::CodecNotReported)
+                )
+            });
+            return match unreported {
+                Some(f) => Ok(Selection {
+                    video_format_id: f.format_id.clone(),
+                    audio_format_id: if f.has_audio() {
+                        None
+                    } else {
+                        pick_audio(probe, prefer_lang).map(|a| a.format_id.clone())
+                    },
+                    score: None,
+                    summary: format!(
+                        "{} — codec not reported; the container will say",
+                        f.format_id
+                    ),
+                    trace,
+                }),
+                None => Err(SelectError::NothingPlayable),
+            };
+        }
+    };
 
     let audio = if vf.has_audio() {
         None
@@ -302,7 +340,7 @@ pub fn select(
     Ok(Selection {
         video_format_id: vf.format_id.clone(),
         audio_format_id: audio,
-        score,
+        score: Some(score),
         summary,
         trace,
     })

@@ -1353,31 +1353,16 @@ mod real_ytdlp_tests {
             vidkit_core::caps::desktop_full_hw(),
         );
 
-        // KNOWN FAILURE, documented rather than asserted away. Real yt-dlp
-        // reports `"vcodec": null` for a URL it has not probed, and the
-        // selector rejects a format whose codec it cannot check against the
-        // device's decoders. That is defensible in isolation and wrong here:
-        // the container knows the codec and our own demuxer reads it.
-        //
-        // Fixing it properly needs an "unreported" codec that survives
-        // `DeviceCaps::best_path`, which is real surgery. Until then this test
-        // pins the CURRENT behaviour so the fix is visible when it lands, and
-        // names what to expect afterwards. Asserting success here would have
-        // meant deleting the test or faking the input, which is how a known
-        // bug becomes an unknown one.
+        // Was a KNOWN FAILURE and is not any more. Real yt-dlp reports
+        // `"vcodec": null` for anything it has not probed, `has_video` treated
+        // that as audio-only, and every direct URL was rejected before
+        // anything else looked at it. Now asserted for real.
         match opened {
             Ok(o) => {
-                // The fix landed. Tighten this into a real assertion.
                 assert_eq!(o.dimensions, (64, 64), "wrong dimensions: {}", o.label);
                 assert!(o.packets > 0, "no packets: {}", o.label);
             }
-            Err(e) => {
-                assert!(
-                    e.contains("NoPlayableFormat"),
-                    "real yt-dlp failed in a NEW way, which is worth looking at: {e}"
-                );
-                eprintln!("KNOWN: real yt-dlp reports a null vcodec and the selector rejects it");
-            }
+            Err(e) => panic!("real yt-dlp output was not usable: {e}"),
         }
     }
 }
