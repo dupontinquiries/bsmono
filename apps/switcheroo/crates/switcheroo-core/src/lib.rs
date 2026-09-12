@@ -94,6 +94,19 @@ pub enum Kind {
     /// crypto: connect, write one byte. This is the kind switcheroo can
     /// actually switch today.
     GenericGatt,
+    /// Advertises the Matter commissionable service (16-bit UUID 0xFFF6).
+    ///
+    /// A DIFFERENT PROTOCOL, not a variant of the one above. Matter commissions over BLE and
+    /// then runs over Wi-Fi or Thread; HAP-over-BLE stays on BLE for everything. Sharing a
+    /// radio is all these two have in common — the pairing, the transport and the data model
+    /// are separate specs, and nothing in `hap-core` applies.
+    ///
+    /// Recognised so the row can SAY that. Without this a Matter plug lands in `Unknown` and
+    /// is told "no recognised on/off service", which is wrong twice over: the device is a
+    /// switch, and it is one this app could plausibly support one day. "I do not speak your
+    /// protocol" and "I see nothing here" are different answers and lead to different next
+    /// steps — buy a different plug, versus wait for Matter support.
+    Matter,
     /// Seen and named, but nothing we recognise. Listed so the user can
     /// tell the app is working even when their device is not supported,
     /// rather than staring at an empty window and guessing.
@@ -111,6 +124,9 @@ impl Kind {
         match self {
             Kind::HomeKit => "HomeKit",
             Kind::GenericGatt => "GATT switch",
+            // Named as the protocol, not as a fault: the row is telling the user what the
+            // device IS, and "Matter" is information they can act on.
+            Kind::Matter => "Matter",
             Kind::Unknown => "unrecognised",
         }
     }
@@ -123,6 +139,11 @@ impl Kind {
                 "HomeKit accessories need a HAP pairing (SRP + Ed25519 + an encrypted \
                  session) before they accept any write. Pair it with its setup code; \
                  see HOMEKIT.md.",
+            ),
+            Kind::Matter => Some(
+                "This is a Matter accessory, not HomeKit-over-BLE. Matter commissions over \
+                 BLE and then runs over Wi-Fi or Thread — a separate spec from HAP, so the \
+                 pairing here does not apply. Switcheroo does not speak it yet.",
             ),
             Kind::Unknown => Some(
                 "No recognised on/off service in this device's advertisement.",
@@ -146,6 +167,13 @@ pub fn classify(service_uuids: &[String]) -> Kind {
     // CoreBluetooth disagree about which one they hand you.
     if has("fe4a") || has("0000fe4a-0000-1000-8000-00805f9b34fb") {
         return Kind::HomeKit;
+    }
+    // 0xFFF6 -- the Matter commissionable-node service. Checked AFTER HAP because a
+    // dual-protocol accessory advertises both while commissioning, and this app can actually
+    // drive the HAP side: preferring Matter there would say "unsupported" about a plug it
+    // could switch. Both spellings, for the same BlueZ/CoreBluetooth reason as above.
+    if has("fff6") || has("0000fff6-0000-1000-8000-00805f9b34fb") {
+        return Kind::Matter;
     }
     // 0x1815 Automation IO / 0x1816 is cycling, not this — 1815 is the
     // assigned service for generic digital output, which is what the cheap
@@ -1193,6 +1221,36 @@ impl Outlook {
 
 #[cfg(test)]
 mod outlook_tests {
+
+    /// A Matter plug is a switch this app cannot drive YET, which is different from a device
+    /// with nothing switchable in it. Before this it landed in `Unknown` and was told "no
+    /// recognised on/off service" — wrong twice: it is a switch, and it is one that could be
+    /// supported. The two answers lead to different next steps: buy a different plug, versus
+    /// wait for Matter support.
+    #[test]
+    fn a_matter_accessory_is_named_rather_than_dismissed() {
+        for uuid in ["fff6", "0000FFF6-0000-1000-8000-00805F9B34FB"] {
+            let k = classify(&[uuid.to_string()]);
+            assert_eq!(k, Kind::Matter, "{uuid}");
+        }
+        assert_eq!(Kind::Matter.label(), "Matter");
+        let why = Kind::Matter.unsupported_reason().expect("it is unsupported");
+        assert!(why.contains("Matter"), "{why}");
+        assert!(why.contains("Wi-Fi or Thread"), "the reason should say why HAP does not apply: {why}");
+        // Not controllable — and not silently so.
+        assert!(!Kind::Matter.is_controllable());
+    }
+
+    /// HAP WINS when both are advertised. A dual-protocol accessory announces both while
+    /// commissioning, and this app can actually drive the HAP side — preferring Matter there
+    /// would report "unsupported" about a plug it could switch.
+    #[test]
+    fn a_dual_protocol_accessory_is_classified_by_what_we_can_drive() {
+        let both = vec!["fe4a".to_string(), "fff6".to_string()];
+        assert_eq!(classify(&both), Kind::HomeKit);
+        let both_rev = vec!["fff6".to_string(), "fe4a".to_string()];
+        assert_eq!(classify(&both_rev), Kind::HomeKit, "order of the advert must not decide");
+    }
     use super::*;
 
     /// The dialog's paragraph is true in general and wrong about most individual plugs. A

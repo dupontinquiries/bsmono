@@ -392,13 +392,51 @@ SESSION for the reason `inspect` already gives: each `pair_verify` is a Curve255
 two signature round trips over BLE, so confirming one bit in a second session would double the
 cost of every toggle.
 
-### Still to do
+### What is actually blocking, as of 2026-09-08
 
-- [ ] Broadcast notifications (the Broadcast Encryption Key), so a plug switched at the wall
-      updates the row without a poll. `GsnTracker` already notices the advert; what is missing
-      is decrypting the notification body. This one DOES want the spec open.
-- [ ] Confirm on real hardware that a Wemo accepts the write and reports back. Everything
-      above is reasoning about code, not a plug that clicked.
+Asked directly, and the answer is short: **two things, and neither is code shape.**
+
+1. **The Broadcast Encryption Key.** Its derivation needs the HAP spec's exact HKDF salt and
+   info strings and the key-refresh protocol around them. Those are constants — guessing them
+   produces writes and reads an accessory silently ignores, which is indistinguishable from
+   a plug out of range. Not a thing to approximate, and not something a web summary of Matter
+   supplies.
+   * Scope check: this only buys the accessory announcing a change WITHOUT a session. The
+     fallback already works — `GsnTracker` sees the GSN bump, the row goes stale, and
+     `Refresher` schedules a read. So this is a latency and battery optimisation, not a
+     missing capability, and it is priced accordingly.
+2. **A plug.** Everything in this file is reasoning about code. Nothing here has clicked a
+   relay.
+
+Everything else people assume is missing is wired: pair-setup, pair-verify, PDU framing,
+fragmentation, session encryption, `set_on`/`get_on`, read-back confirmation, the refresh
+scheduler, and the pairing dialog's Outlook states.
+
+### Matter is a separate question, and worth asking first
+
+A search for "Apple HomeKit specs" now returns mostly Matter, and that is not this protocol.
+Matter commissions over BLE and then runs over Wi-Fi or Thread; HAP-over-BLE stays on BLE
+throughout. Different pairing, different transport, different data model — nothing in
+`hap-core` applies.
+
+`classify` now recognises the Matter commissionable service (0xFFF6) and the row says so,
+because before this a Matter plug landed in `Unknown` and was told "no recognised on/off
+service" — wrong twice over: it IS a switch, and it is one that could be supported. The two
+answers lead to different next steps.
+
+HAP WINS when an accessory advertises both, which dual-protocol devices do while
+commissioning: this app can drive the HAP side, and preferring Matter would report
+"unsupported" about a plug it could switch.
+
+**So the question to answer before any more HAP work: do the Wemo plugs in question advertise
+0xFE4A or 0xFFF6?** The row will now say. If they are Matter-only, no amount of HAP work
+reaches them and the next piece is a Matter commissioning stack, not a Broadcast Encryption
+Key.
+
+### Not the way in on Asahi
+For the record, since it comes up: AppleScript needs macOS, and Homebridge or Home Assistant
+would put a server between the phone and a plug three metres away. Speaking HAP-BLE directly
+is why this app exists.
 
 ## Superseded — the note that follows was written before the check above
 
