@@ -1809,11 +1809,25 @@ pub fn fetch_to_temp<R: vidkit_ytdlp::CommandRunner>(
 
     // Find what it actually wrote. The extension depends on the remux and on
     // what the site served, so globbing beats guessing.
+    //
+    // `.part` files are excluded rather than ranked: an interrupted download
+    // leaves one, it is often the LARGEST thing in the directory, and handing
+    // it to the decoder produces a parser error about a truncated container
+    // instead of "the download did not finish".
     let file = std::fs::read_dir(&dir)
         .ok()
         .and_then(|rd| {
-            let mut files: Vec<std::path::PathBuf> =
-                rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+            let mut files: Vec<std::path::PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && !matches!(
+                            p.extension().and_then(|e| e.to_str()),
+                            Some("part") | Some("ytdl") | Some("temp")
+                        )
+                })
+                .collect();
             files.sort();
             // Largest wins: yt-dlp can leave a `.part` or a thumbnail behind.
             files.into_iter().max_by_key(|p| {
@@ -1824,6 +1838,15 @@ pub fn fetch_to_temp<R: vidkit_ytdlp::CommandRunner>(
             let _ = std::fs::remove_dir_all(&dir);
             format!("{url}: yt-dlp wrote no file")
         })?;
+
+    // The same checks a local file gets. yt-dlp can exit zero having written
+    // nothing usable -- a zero-byte file when the format selector matched
+    // something the site then refused, for one -- and "the download is empty"
+    // is a better message than whatever the demuxer says about byte zero.
+    if let Err(e) = check_file(&file) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!("{url}: {e}"));
+    }
 
     Ok(TempMedia { dir, file })
 }
@@ -2011,6 +2034,73 @@ mod fetch_tests {
         assert_eq!((f.width, f.height), (320, 240));
 
         let _ = std::fs::remove_file(&clip);
+    }
+
+    /// An interrupted download leaves a `.part`, and it is often the largest
+    /// thing in the directory — so "take the biggest file" picks it and the
+    /// decoder reports a truncated container instead of an unfinished
+    /// download.
+    #[test]
+    fn a_part_file_is_not_mistaken_for_the_media() {
+        struct Interrupted;
+        impl vidkit_ytdlp::CommandRunner for Interrupted {
+            fn run(&mut self, _p: &str, a: &[String]) -> Result<Vec<u8>, vidkit_ytdlp::RunError> {
+                let tmpl = a.iter().find(|x| x.contains("media.")).unwrap();
+                let dir = std::path::Path::new(tmpl).parent().unwrap();
+                // The part file is deliberately the biggest.
+                std::fs::write(dir.join("media.mp4.part"), vec![0u8; 8192]).unwrap();
+                std::fs::write(dir.join("media.mp4"), vec![7u8; 4096]).unwrap();
+                Ok(Vec::new())
+            }
+        }
+        let got = fetch_to_temp(&mut Interrupted, "https://site/v", None).expect("fetch");
+        assert_eq!(
+            got.path().extension().and_then(|e| e.to_str()),
+            Some("mp4"),
+            "picked the .part: {}",
+            got.path().display()
+        );
+    }
+
+    /// yt-dlp can exit zero having written nothing usable.
+    #[test]
+    fn an_empty_download_is_reported_as_one() {
+        struct WroteNothing;
+        impl vidkit_ytdlp::CommandRunner for WroteNothing {
+            fn run(&mut self, _p: &str, a: &[String]) -> Result<Vec<u8>, vidkit_ytdlp::RunError> {
+                let tmpl = a.iter().find(|x| x.contains("media.")).unwrap();
+                let dir = std::path::Path::new(tmpl).parent().unwrap();
+                std::fs::write(dir.join("media.mp4"), b"").unwrap();
+                Ok(Vec::new())
+            }
+        }
+        let e = match fetch_to_temp(&mut WroteNothing, "https://site/v", None) {
+            Err(e) => e,
+            Ok(_) => panic!("an empty download was accepted"),
+        };
+        assert!(e.contains("empty"), "unhelpful: {e}");
+    }
+
+    /// And it must not leave the directory behind when it refuses.
+    #[test]
+    fn a_rejected_download_is_cleaned_up() {
+        struct Tiny;
+        impl vidkit_ytdlp::CommandRunner for Tiny {
+            fn run(&mut self, _p: &str, a: &[String]) -> Result<Vec<u8>, vidkit_ytdlp::RunError> {
+                let tmpl = a.iter().find(|x| x.contains("media.")).unwrap();
+                let dir = std::path::Path::new(tmpl).parent().unwrap();
+                std::fs::write(dir.join("media.mp4"), b"tiny").unwrap();
+                Ok(Vec::new())
+            }
+        }
+        let before = std::fs::read_dir(std::env::temp_dir())
+            .map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("vidkit-dl-")).count())
+            .unwrap_or(0);
+        assert!(fetch_to_temp(&mut Tiny, "https://site/v", None).is_err());
+        let after = std::fs::read_dir(std::env::temp_dir())
+            .map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("vidkit-dl-")).count())
+            .unwrap_or(0);
+        assert_eq!(after, before, "a rejected download left its directory behind");
     }
 
     /// A failing yt-dlp must not leave its directory behind either.
