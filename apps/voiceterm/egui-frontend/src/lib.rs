@@ -325,6 +325,28 @@ pub mod log;
 /// is a different thing from the sink picker I duplicated by accident.
 #[path = "../../src/nlp.rs"]
 pub mod nlp;
+/// NOT MOUNTED: the connections graph, and why.
+///
+/// `connections` is the Qt build's Obsidian-style node view over the archive, the voice
+/// corpus, chat history and speakers — 1,556 lines, Qt-free, and the natural next port after
+/// `voice_intent`. It does not mount, and the obstacle is worth writing down because it is
+/// not the one you would guess.
+///
+/// It needs `crate::chat`, which needs `crate::token_log::parse_anthropic_usage` and
+/// `append_event`. THIS CRATE ALREADY HAS A `token_log` — its own, ten functions to the Qt
+/// one's twenty-three. So mounting the chain does not add a module, it collides with one, and
+/// the two are not interchangeable: the Qt version is a superset written for a different
+/// caller.
+///
+/// That is a reconciliation, not a mount — someone has to decide which `token_log` is
+/// canonical and move the callers of the other. Doing it halfway, by renaming one to get a
+/// compile, would leave two token ledgers writing to the same place and no way to tell which
+/// number is right.
+///
+/// The rest of the chain (`layout_cache`, `archive`, `user_tags`) is clean and mounts
+/// without complaint; `archive` and `layout_cache` also want `scraper`, which is the heaviest
+/// dependency this crate would take on and is worth pricing deliberately rather than
+/// acquiring as a side effect of a graph view.
 #[path = "../../src/session_walk.rs"]
 pub mod session_walk;
 
