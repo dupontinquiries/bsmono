@@ -333,6 +333,84 @@ mod tests {
 // the popup
 // ---------------------------------------------------------------------------
 
+/// The controls themselves, separated from the panel chrome.
+fn panel_body(ui: &mut egui::Ui, s: &mut Settings, glass: &crate::glass::GlassStyle) {
+    // Hints use the glass hint colour, not the palette's: a dim grey that
+    // reads on an opaque surface drops under 3:1 on a translucent one.
+    let hint = |ui: &mut egui::Ui, t: &str| {
+        ui.colored_label(glass.hint_text, egui::RichText::new(t).small());
+    };
+    ui.label("quality");
+    egui::ComboBox::from_label("stream")
+        .selected_text(s.quality.label())
+        .show_ui(ui, |ui| {
+            for q in vidkit_core::Quality::ALL {
+                ui.selectable_value(&mut s.quality, q, q.label())
+                    .on_hover_text(q.hint());
+            }
+        });
+    hint(ui, s.quality.hint());
+    egui::ComboBox::from_label("frame rate")
+        .selected_text(s.fps_cap.label())
+        .show_ui(ui, |ui| {
+            for f in vidkit_core::FpsCap::ALL {
+                ui.selectable_value(&mut s.fps_cap, f, f.label());
+            }
+        });
+    hint(ui, "a lower frame rate costs less than a lower resolution, and text stays sharp");
+
+    ui.separator();
+    ui.label("picture");
+    for m in FillMode::ALL {
+        ui.radio_value(&mut s.fill, m, m.label());
+    }
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label("rotate in app");
+        if ui.small_button("↺").clicked() {
+            s.rotation = (s.rotation - 1).rem_euclid(4);
+        }
+        ui.label(format!("{}°", s.rotation * 90));
+        if ui.small_button("↻").clicked() {
+            s.rotation = (s.rotation + 1).rem_euclid(4);
+        }
+    });
+
+    ui.separator();
+    ui.label("controls");
+    ui.add(
+        egui::Slider::new(&mut s.hide_after_secs, limits::HIDE_AFTER.0..=limits::HIDE_AFTER.1)
+            .text("hide after (s)"),
+    );
+    ui.add(
+        egui::Slider::new(
+            &mut s.gesture_sensitivity,
+            limits::SENSITIVITY.0..=limits::SENSITIVITY.1,
+        )
+        // Named for what moving it does, not for the field: "less
+        // sensitive" reads the same direction as the number.
+        .text("gesture travel (higher = less sensitive)"),
+    );
+    ui.checkbox(&mut s.edge_rotate, "right edge rotates")
+        .on_hover_text("off gives the whole right half to speed");
+
+    ui.separator();
+    ui.label("power");
+    ui.checkbox(&mut s.keep_screen_on, "keep the screen on while watching");
+    ui.checkbox(&mut s.save_data_on_battery, "smaller stream on battery");
+    ui.checkbox(&mut s.gpu_convert, "convert on the GPU")
+        .on_hover_text("uploads 1.5 bytes a pixel instead of 4; unproven on this device");
+
+    ui.add_space(8.0);
+    if ui.button("reset to defaults").clicked() {
+        *s = Settings::default();
+    }
+    if ui.button("reset to defaults").clicked() {
+        *s = Settings::default();
+    }
+}
+
 /// Draw the settings popup. Returns true while it is open.
 ///
 /// A modal window, like the palette: it is a mode, and changes take effect
@@ -363,112 +441,48 @@ pub fn show_over(
         still_open = false;
     }
 
-    // Blur behind the window, painted first so the window sits on top of it.
-    // egui has no backdrop filter, so this redraws the frame texture a few
-    // times at small offsets -- see `glass.rs`.
-    if let Some((tex, uv)) = backdrop {
-        let screen = ctx.screen_rect();
-        let panel = egui::Rect::from_center_size(
-            screen.center(),
-            egui::vec2(400.0, (screen.height() - 120.0).clamp(200.0, 620.0)),
-        );
-        egui::Area::new(egui::Id::new("settings_glass"))
-            .order(egui::Order::Middle)
-            .fixed_pos(panel.min)
-            .show(ctx, |ui| {
-                crate::glass::draw(ui, panel, &glass, Some((tex, uv)));
-            });
-    }
+    // ONE LAYER, which is the whole reason this is an Area and not a Window.
+    // A Window paints its own frame over whatever is behind it, so a
+    // translucent one lets the raw video through and drowns the blur -- the
+    // panel came out tinted with sharp bands rather than frosted. Here the
+    // blurred backdrop and the tint are composited into the same rect and the
+    // content sits on top of them with no frame of its own.
+    let screen = ctx.screen_rect();
+    let size = egui::vec2(
+        420.0_f32.min(screen.width() - 32.0),
+        (screen.height() - 96.0).clamp(220.0, 640.0),
+    );
+    let panel = egui::Rect::from_center_size(screen.center(), size);
 
-    egui::Window::new("settings")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .default_width(380.0)
-        // An explicit opaque frame. egui's default window fill is
-        // semi-transparent against a dark backdrop, and over a bright test
-        // pattern the controls became unreadable -- the video showed straight
-        // through the radio buttons.
-        // The glass frame, whose opacity is set by the contrast test in
-        // `glass.rs` rather than by eye -- a panel that reads well over a dark
-        // clip and vanishes over a snow scene is the usual outcome of choosing
-        // it by looking.
-        .frame(crate::glass::window_frame(&glass))
-        .open(&mut still_open)
+    egui::Area::new(egui::Id::new("settings_panel"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(panel.min)
         .show(ctx, |ui| {
-            // Bounded and scrollable: the panel is taller than a phone in
-            // landscape, and an unbounded window silently clips its last
-            // controls off the bottom of the screen -- "reset to defaults" was
-            // unreachable at 800px tall.
-            let max = (ctx.screen_rect().height() - 120.0).max(200.0);
-            egui::ScrollArea::vertical().max_height(max).show(ui, |ui| {
-            ui.label("quality");
-            egui::ComboBox::from_label("stream")
-                .selected_text(s.quality.label())
-                .show_ui(ui, |ui| {
-                    for q in vidkit_core::Quality::ALL {
-                        ui.selectable_value(&mut s.quality, q, q.label())
-                            .on_hover_text(q.hint());
-                    }
-                });
-            ui.small(s.quality.hint());
-            egui::ComboBox::from_label("frame rate")
-                .selected_text(s.fps_cap.label())
-                .show_ui(ui, |ui| {
-                    for f in vidkit_core::FpsCap::ALL {
-                        ui.selectable_value(&mut s.fps_cap, f, f.label());
-                    }
-                });
-            ui.small("a lower frame rate costs less than a lower resolution, and text stays sharp");
+            crate::glass::draw(ui, panel, &glass, backdrop);
+            // Claim the rect, or clicks fall through to the video: a modal that
+            // does not eat its own input scrubs the film while you adjust it.
+            ui.allocate_rect(panel, egui::Sense::click_and_drag());
 
-            ui.separator();
-            ui.label("picture");
-            for m in FillMode::ALL {
-                ui.radio_value(&mut s.fill, m, m.label());
-            }
+            let inner = panel.shrink(14.0);
+            let mut content = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(inner)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            let ui = &mut content;
 
-            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label("rotate in app");
-                if ui.small_button("↺").clicked() {
-                    s.rotation = (s.rotation - 1).rem_euclid(4);
-                }
-                ui.label(format!("{}°", s.rotation * 90));
-                if ui.small_button("↻").clicked() {
-                    s.rotation = (s.rotation + 1).rem_euclid(4);
-                }
+                ui.heading("settings");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("✕").clicked() {
+                        still_open = false;
+                    }
+                });
             });
-
             ui.separator();
-            ui.label("controls");
-            ui.add(
-                egui::Slider::new(&mut s.hide_after_secs, limits::HIDE_AFTER.0..=limits::HIDE_AFTER.1)
-                    .text("hide after (s)"),
-            );
-            ui.add(
-                egui::Slider::new(
-                    &mut s.gesture_sensitivity,
-                    limits::SENSITIVITY.0..=limits::SENSITIVITY.1,
-                )
-                // Named for what moving it does, not for the field: "less
-                // sensitive" reads the same direction as the number.
-                .text("gesture travel (higher = less sensitive)"),
-            );
-            ui.checkbox(&mut s.edge_rotate, "right edge rotates")
-                .on_hover_text("off gives the whole right half to speed");
-
-            ui.separator();
-            ui.label("power");
-            ui.checkbox(&mut s.keep_screen_on, "keep the screen on while watching");
-            ui.checkbox(&mut s.save_data_on_battery, "smaller stream on battery");
-            ui.checkbox(&mut s.gpu_convert, "convert on the GPU")
-                .on_hover_text("uploads 1.5 bytes a pixel instead of 4; unproven on this device");
-
-            ui.add_space(8.0);
-            if ui.button("reset to defaults").clicked() {
-                *s = Settings::default();
-            }
-            });
+            egui::ScrollArea::vertical()
+                .max_height(inner.height() - 52.0)
+                .show(ui, |ui| panel_body(ui, s, &glass));
         });
 
     // Anything typed or dragged can still be out of range: the slider is not

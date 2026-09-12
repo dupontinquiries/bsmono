@@ -107,20 +107,21 @@ untestable wrapper would have looked like progress.
    fully, and reconsider whether `vidkit-egui::palette` should exist at all now
    that it is only an action set. *read*
 
-## The glass panel is half done
+## The glass panel
 
 Translucency and readability are *verified* — `glass.rs` picks the tint alpha
 from the WCAG contrast arithmetic so text clears 4.5:1 over a white frame AND a
-black one, and `backdrop_visible` fails if a future tweak makes the panel
-opaque enough that the video behind it disappears.
+black one, and `backdrop_visible` fails if a tweak makes the panel opaque
+enough that the video behind it disappears.
 
-The BLUR is not. Painting the blurred copy in a layer behind a translucent
-window does not work: the raw video shows through the window on top of it and
-drowns it, so the result is a tinted panel with sharp bands. Doing it properly
-means the panel must be one layer — blurred backdrop and tint composited
-together with nothing translucent above — which means the settings window
-cannot use its own egui frame. *verified* by screenshot that the current
-approach does not blur.
+The softening is *verified* too, and honestly described: the panel is one
+`Area` compositing backdrop and tint into a single rect, and six offset copies
+at a 14-point radius turn hard band edges into gradients. It is ghosting, not
+a convolution. A real separable blur needs the glow path and a render target,
+which would make the settings panel depend on the GPU feature — worth doing
+deliberately, not by accident. *verified* by screenshot at each step; two
+earlier attempts (blur behind a Window, and a 3-point radius) did nothing
+visible and the screenshots are what said so.
 
 ## Traps, all paid for once already
 

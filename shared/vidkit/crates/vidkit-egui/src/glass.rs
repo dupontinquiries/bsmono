@@ -11,18 +11,19 @@
 //! neighbouring pixels the same way a box blur does. It costs a few extra
 //! textured quads over the panel area only.
 //!
-//! **Known limitation, measured by screenshot rather than reasoned about.**
-//! Painting the blurred copy in a layer *behind* a translucent panel does not
-//! work: the raw video shows through the panel on top of it and drowns the
-//! blur, so the result is a tinted window with sharp bands rather than a
-//! frosted one. What is shipped is honest translucency plus a verified
-//! contrast floor; the blur taps only bite where the panel is drawn by
-//! [`draw`] with the window frame left transparent.
+//! **What this achieves, measured by screenshot at each step.** Painting the
+//! blur in a layer *behind* a translucent `Window` does nothing: the window
+//! paints its own frame over it and the raw video shows through on top,
+//! drowning the blur. The panel therefore has to be ONE layer — an `Area` that
+//! composites backdrop and tint into the same rect with no frame above them —
+//! which is what `settings::show_over` now does.
 //!
-//! Doing it properly means the panel must be ONE layer -- blurred backdrop and
-//! tint composited together, with nothing translucent above them -- which
-//! means the settings window cannot use its own frame. That is the next step
-//! and it is not done.
+//! Even then the first radius was invisible: 3 points against 60-point colour
+//! bands moves nothing a viewer can see. At 14 points the band edges become
+//! gradients. That is genuine softening and it is honestly ghosting rather
+//! than a frost — six offset copies average neighbours, they do not convolve a
+//! kernel. A real separable blur needs the glow path and a render target, and
+//! would make a settings panel depend on the GPU feature.
 //!
 //! It is an approximation and looks like one at large radii, which is why
 //! [`GlassStyle::taps`] is small. The honest alternative — a real separable
@@ -70,8 +71,12 @@ impl Default for GlassStyle {
             // the HINT text was the binding constraint, and the answer to that
             // was to stop dimming it rather than to thicken the glass.
             tint: Color32::from_rgba_unmultiplied(20, 18, 26, 170),
-            taps: 5,
-            radius: 3.0,
+            taps: 6,
+            // 14 points, not 3. Three was invisible by construction: the
+            // offsets have to be a noticeable fraction of the features being
+            // blurred, and 3pt against 60pt colour bands moves nothing a
+            // viewer can see. Verified by screenshot, not by reasoning.
+            radius: 14.0,
             corner_radius: 12.0,
             border: Color32::from_rgba_unmultiplied(255, 255, 255, 46),
             hint_text: Color32::from_gray(205),
@@ -291,6 +296,10 @@ mod tests {
     fn the_tap_count_stays_cheap() {
         let s = GlassStyle::default();
         assert!(s.taps >= 3, "too few taps to read as a blur");
+        assert!(
+            s.radius >= 8.0,
+            "a radius smaller than the features being blurred does nothing visible"
+        );
         assert!(
             s.taps <= 6,
             "each tap is a textured quad over the panel; beyond six the gain is invisible"
