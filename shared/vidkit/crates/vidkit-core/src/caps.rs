@@ -49,6 +49,28 @@ pub struct DecodeCap {
     /// Highest frame rate this path sustains at `max_width x max_height`.
     /// Used to reject "4K60 AV1 in software on a Fairphone" before we try it.
     pub max_fps_at_max_size: u32,
+    /// Hard ceiling on frames per second, whatever the pixel arithmetic says.
+    ///
+    /// The scaling below is pixels-per-second, which is the right SHAPE and
+    /// too generous at the small end: a "4K30" software path extrapolates to
+    /// 120 fps at 1080p, and no software decoder does that. Throughput stops
+    /// being pixel-bound and becomes per-frame bound — parse, entropy decode,
+    /// reference management and the memory traffic of handing frames on all
+    /// cost per FRAME regardless of size.
+    ///
+    /// A flat fps ceiling cannot express the two data points reported from the
+    /// target hardware — 480p at 90 is fine in performance mode, software
+    /// decode at 1080p60 drops frames sometimes — because 90 is above 60 and a
+    /// single number cannot allow one and refuse the other. PIXEL RATE can:
+    /// 480p90 is ~37 Mpx/s and 1080p60 is ~124 Mpx/s, so rating a software
+    /// path at 1080p30 (~62 Mpx/s) admits the first and refuses the second.
+    ///
+    /// That is what the software profiles now say, and this ceiling is only
+    /// the backstop for the very small end, where the pixel arithmetic would
+    /// otherwise promise several hundred frames a second and the per-frame
+    /// costs — parse, entropy decode, reference management, handing the frame
+    /// on — become the limit instead.
+    pub max_fps_ceiling: u32,
     pub cost: Cost,
     pub delivery: Delivery,
     pub backend: Backend,
@@ -91,7 +113,8 @@ impl DecodeCap {
         if px == 0 {
             return false;
         }
-        let budget = (self.max_fps_at_max_size as u64) * max_px / px;
+        let scaled = (self.max_fps_at_max_size as u64) * max_px / px;
+        let budget = scaled.min(self.max_fps_ceiling.max(1) as u64);
         (fps as u64) <= budget
     }
 }
@@ -287,7 +310,8 @@ pub fn asahi_m_series() -> DeviceCaps {
                 max_width: 4096,
                 max_height: 4096,
                 max_fps_at_max_size: 30,
-                cost: Cost::Fixed,
+                max_fps_ceiling: 240,
+        cost: Cost::Fixed,
                 delivery: Delivery::DmaBuf,
                 backend: Backend::V4l2Stateless,
             },
@@ -295,10 +319,11 @@ pub fn asahi_m_series() -> DeviceCaps {
                 codec: Codec::Av1,
                 max_bit_depth: 12,
                 max_chroma: Chroma::Yuv444,
-                max_width: 3840,
-                max_height: 2160,
+                max_width: 1920,
+                max_height: 1080,
                 max_fps_at_max_size: 30,
-                cost: Cost::SoftwareSimd,
+                max_fps_ceiling: 120,
+        cost: Cost::SoftwareSimd,
                 delivery: Delivery::CpuPlanes,
                 backend: Backend::Dav1d,
             },
@@ -306,12 +331,13 @@ pub fn asahi_m_series() -> DeviceCaps {
                 codec: Codec::Vp9,
                 max_bit_depth: 12,
                 max_chroma: Chroma::Yuv420,
-                max_width: 3840,
-                max_height: 2160,
+                max_width: 1920,
+                max_height: 1080,
                 // ffvp9 is decent but not dav1d; deliberately rated below AV1
                 // by giving it the slower Cost, not a smaller fps budget.
                 max_fps_at_max_size: 30,
-                cost: Cost::SoftwareSlow,
+                max_fps_ceiling: 120,
+        cost: Cost::SoftwareSlow,
                 delivery: Delivery::CpuPlanes,
                 backend: Backend::FfmpegSw,
             },
@@ -319,10 +345,11 @@ pub fn asahi_m_series() -> DeviceCaps {
                 codec: Codec::Hevc,
                 max_bit_depth: 10,
                 max_chroma: Chroma::Yuv420,
-                max_width: 3840,
-                max_height: 2160,
+                max_width: 1920,
+                max_height: 1080,
                 max_fps_at_max_size: 30,
-                cost: Cost::SoftwareSlow,
+                max_fps_ceiling: 120,
+        cost: Cost::SoftwareSlow,
                 delivery: Delivery::CpuPlanes,
                 backend: Backend::FfmpegSw,
             },
@@ -383,6 +410,7 @@ pub fn asahi_m3() -> DeviceCaps {
         max_width: w,
         max_height: h,
         max_fps_at_max_size: fps,
+        max_fps_ceiling: 240,
         cost: Cost::Fixed,
         delivery: Delivery::DmaBuf,
         backend: Backend::V4l2Stateless,
@@ -404,8 +432,9 @@ pub fn asahi_m3() -> DeviceCaps {
                 max_chroma: Chroma::Yuv420,
                 max_width: 1920,
                 max_height: 1080,
-                max_fps_at_max_size: 60,
-                cost: Cost::SoftwareSimd,
+                max_fps_at_max_size: 30,
+                max_fps_ceiling: 120,
+        cost: Cost::SoftwareSimd,
                 delivery: Delivery::CpuPlanes,
                 backend: Backend::Dav1d,
             },
@@ -438,7 +467,8 @@ pub fn fairphone_venus() -> DeviceCaps {
                 max_width: 3840,
                 max_height: 2160,
                 max_fps_at_max_size: 30,
-                cost: Cost::Fixed,
+                max_fps_ceiling: 240,
+        cost: Cost::Fixed,
                 delivery: Delivery::DmaBuf,
                 backend: Backend::V4l2Stateful,
             },
@@ -449,7 +479,8 @@ pub fn fairphone_venus() -> DeviceCaps {
                 max_width: 3840,
                 max_height: 2160,
                 max_fps_at_max_size: 30,
-                cost: Cost::Fixed,
+                max_fps_ceiling: 240,
+        cost: Cost::Fixed,
                 delivery: Delivery::DmaBuf,
                 backend: Backend::V4l2Stateful,
             },
@@ -460,7 +491,8 @@ pub fn fairphone_venus() -> DeviceCaps {
                 max_width: 3840,
                 max_height: 2160,
                 max_fps_at_max_size: 30,
-                cost: Cost::Fixed,
+                max_fps_ceiling: 240,
+        cost: Cost::Fixed,
                 delivery: Delivery::DmaBuf,
                 backend: Backend::V4l2Stateful,
             },
@@ -473,7 +505,8 @@ pub fn fairphone_venus() -> DeviceCaps {
                 max_width: 1920,
                 max_height: 1080,
                 max_fps_at_max_size: 30,
-                cost: Cost::SoftwareSimd,
+                max_fps_ceiling: 120,
+        cost: Cost::SoftwareSimd,
                 delivery: Delivery::CpuPlanes,
                 backend: Backend::Dav1d,
             },
@@ -517,6 +550,7 @@ pub fn desktop_full_hw() -> DeviceCaps {
         max_width: 7680,
         max_height: 4320,
         max_fps_at_max_size: 60,
+        max_fps_ceiling: 240,
         cost: Cost::Fixed,
         delivery: Delivery::DmaBuf,
         backend: Backend::Vaapi,
@@ -570,8 +604,10 @@ mod tests {
     #[test]
     fn asahi_prefers_av1_over_vp9_in_software() {
         let d = asahi_m_series();
-        let av1 = d.best_path(&prof("av01.0.08M.08"), 1920, 1080, 60).unwrap();
-        let vp9 = d.best_path(&prof("vp09.00.50.08"), 1920, 1080, 60).unwrap();
+        // 1080p30: neither codec is offered at 1080p60 in software any more,
+        // and the point of this test is the ORDERING, not the frame rate.
+        let av1 = d.best_path(&prof("av01.0.08M.08"), 1920, 1080, 30).unwrap();
+        let vp9 = d.best_path(&prof("vp09.00.50.08"), 1920, 1080, 30).unwrap();
         assert!(av1.cost < vp9.cost, "dav1d should outrank ffvp9 on Asahi");
     }
 
@@ -619,6 +655,40 @@ mod tests {
         }
     }
 
+    /// The two data points reported from the target hardware, pinned so a
+    /// future "optimisation" to the ratings has to argue with them.
+    ///
+    /// A flat fps ceiling cannot express both -- 90 is above 60 -- so the
+    /// budget is pixel rate, and rating software at 1080p30 admits 480p90
+    /// (~37 Mpx/s) while refusing 1080p60 (~124 Mpx/s).
+    #[test]
+    fn software_decode_takes_480p90_and_refuses_1080p60() {
+        let d = asahi_m_series();
+        let p = av1(8);
+
+        assert!(
+            d.can_decode(&p, 854, 480, 90),
+            "480p90 was refused; it is fine in performance mode"
+        );
+        assert!(
+            !d.can_decode(&p, 1920, 1080, 60),
+            "1080p60 was offered on a software path, where it drops frames"
+        );
+        // ...and the honest middle: 1080p30 is fine.
+        assert!(d.can_decode(&p, 1920, 1080, 30), "1080p30 should be within budget");
+    }
+
+    /// The ceiling is the backstop for the very small end, where the pixel
+    /// arithmetic alone would promise several hundred frames a second.
+    #[test]
+    fn a_tiny_frame_does_not_promise_unlimited_frames() {
+        let d = asahi_m_series();
+        assert!(
+            !d.can_decode(&av1(8), 160, 120, 400),
+            "400 fps was offered because the pixels were small"
+        );
+    }
+
     /// The headline change: on M3 the AVD decodes AV1 in fixed-function
     /// silicon. On M1/M2 the same codec is dav1d on the big cores.
     #[test]
@@ -627,11 +697,13 @@ mod tests {
         let older = asahi_m_series();
         let p = av1(10);
 
-        let m3_path = m3.best_path(&p, 1920, 1080, 60).expect("m3 must decode av1");
+        let m3_path = m3.best_path(&p, 1920, 1080, 60).expect("m3 must decode av1 in hardware at 60");
         assert_eq!(m3_path.cost, Cost::Fixed, "m3 av1 is not fixed-function");
 
+        // 1080p30, not 60: a software path is no longer rated for 1080p60,
+        // because it drops frames there on the real hardware.
         let old_path = older
-            .best_path(&p, 1920, 1080, 60)
+            .best_path(&p, 1920, 1080, 30)
             .expect("m1 must still decode av1");
         assert!(
             !old_path.cost.is_hardware(),
@@ -701,10 +773,11 @@ mod tests {
                     codec: Codec::Vp9,
                     max_bit_depth: 10,
                     max_chroma: Chroma::Yuv420,
-                    max_width: 3840,
-                    max_height: 2160,
+                    max_width: 1920,
+                    max_height: 1080,
                     max_fps_at_max_size: 30,
-                    cost: Cost::SoftwareSlow,
+                    max_fps_ceiling: 120,
+        cost: Cost::SoftwareSlow,
                     delivery: Delivery::CpuPlanes,
                     backend: Backend::FfmpegSw,
                 },
@@ -715,7 +788,8 @@ mod tests {
                     max_width: 3840,
                     max_height: 2160,
                     max_fps_at_max_size: 30,
-                    cost: Cost::Fixed,
+                    max_fps_ceiling: 240,
+        cost: Cost::Fixed,
                     delivery: Delivery::DmaBuf,
                     backend: Backend::V4l2Stateful,
                 },

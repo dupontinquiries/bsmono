@@ -62,6 +62,11 @@ pub fn caps_from_enumeration(formats: &[EnumeratedFormat]) -> Vec<DecodeCap> {
                 max_width: f.max_width,
                 max_height: f.max_height,
                 max_fps_at_max_size: 30,
+                // Fixed-function silicon is not per-frame bound the way
+                // software decode is, so the ceiling is only a sanity bound.
+                // The driver reports sizes, not rates; a real rate needs
+                // VIDIOC_ENUM_FRAMEINTERVALS, which is a separate job.
+                max_fps_ceiling: 240,
                 cost: Cost::Fixed,
                 delivery: Delivery::DmaBuf,
                 backend: Backend::V4l2Stateful,

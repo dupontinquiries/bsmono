@@ -336,6 +336,12 @@ MUTANTS = [
     ("probe/soc-id-check-removed", "crates/vidkit-v4l2/src/sysprobe.rs",
      "            && rest[1..].chars().all(|ch| ch.is_ascii_digit());", "            ;"),
 
+    ("caps/per-frame-ceiling-ignored", "crates/vidkit-core/src/caps.rs",
+     "        let budget = scaled.min(self.max_fps_ceiling.max(1) as u64);", "        let budget = scaled;"),
+    ("caps/software-rated-for-1080p60", "crates/vidkit-core/src/caps.rs",
+     "max_fps_at_max_size: 30,\n                max_fps_ceiling: 120,",
+     "max_fps_at_max_size: 60,\n                max_fps_ceiling: 120,"),
+
     # --- device profiles ---------------------------------------------------------
     ("caps/m3-claims-a-gpu", "crates/vidkit-core/src/caps.rs",
      "        gpu: GpuClass::Unaccelerated,", "        gpu: GpuClass::Vulkan,"),
