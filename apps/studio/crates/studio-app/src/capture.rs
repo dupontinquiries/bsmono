@@ -18,7 +18,7 @@
 //! would drop nothing; it is the right next step and is named here rather
 //! than pretended.)
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// One thing to try when opening a device: a rate, a channel count and a
@@ -95,6 +95,15 @@ pub struct Take {
 struct Shared {
     buf: Mutex<Vec<f32>>,
     dropped: AtomicUsize,
+    /// Whether the callback appends to `buf` — a take in progress. The
+    /// stream can be open without one (the call keeps it open), so this
+    /// flag, not the stream's existence, is what "recording" means.
+    taking: AtomicBool,
+    /// The live tap: the same mono fold, into a second buffer the owner
+    /// drains every frame instead of at the end. On while a call is on.
+    tap: Mutex<Vec<f32>>,
+    tap_on: AtomicBool,
+    tap_dropped: AtomicUsize,
 }
 
 /// A microphone, recording into memory until stopped.
@@ -109,6 +118,19 @@ pub trait Capture {
     /// The rate actually negotiated — reported because "recording" at a
     /// rate nobody chose is how a take ends up the wrong length.
     fn rate(&self) -> u32;
+    /// Open the microphone for the LIVE tap: samples flow to
+    /// [`Capture::tap_drain`] continuously, independent of any take. A
+    /// take started while the tap is on shares the stream; stopping
+    /// either leaves the other running. The call is the tap's owner.
+    fn tap_start(&mut self) -> Result<(), String>;
+    fn tap_stop(&mut self);
+    fn tapping(&self) -> bool;
+    /// Everything the tap captured since the last drain, mono at
+    /// [`Capture::rate`]. Empty when the tap is off or nothing arrived.
+    fn tap_drain(&mut self) -> Vec<f32>;
+    /// Blocks the tap lost because the owner held its lock — the call's
+    /// dropout counter, said out loud like the take's.
+    fn tap_dropped(&self) -> usize;
 }
 
 /// No microphone: every call succeeds shallowly and records silence, so
@@ -127,6 +149,16 @@ impl Capture for NullCapture {
     fn elapsed(&self) -> f32 { 0.0 }
     fn device_name(&self) -> &str { "none" }
     fn rate(&self) -> u32 { 0 }
+    // No microphone: the tap refuses like the take does, so a call on
+    // this machine is listen-only and says so, rather than sending a
+    // silence nobody chose.
+    fn tap_start(&mut self) -> Result<(), String> {
+        Err("no input device — the call is listen-only here".into())
+    }
+    fn tap_stop(&mut self) {}
+    fn tapping(&self) -> bool { false }
+    fn tap_drain(&mut self) -> Vec<f32> { Vec::new() }
+    fn tap_dropped(&self) -> usize { 0 }
 }
 
 #[cfg(feature = "audio")]
@@ -177,12 +209,13 @@ impl CpalCapture {
 }
 
 #[cfg(feature = "audio")]
-impl Capture for CpalCapture {
-    fn start(&mut self) -> Result<(), String> {
+impl CpalCapture {
+    /// Open the device if it is not open. The negotiation lives here so
+    /// the take and the tap share one stream: whichever asks first opens
+    /// it, and it closes when the last of them stops.
+    fn ensure_stream(&mut self) -> Result<(), String> {
         use cpal::traits::{DeviceTrait, StreamTrait};
         if self.stream.is_some() { return Ok(()); }
-        self.shared.buf.lock().map_err(|_| "capture buffer poisoned")?.clear();
-        self.shared.dropped.store(0, Ordering::Relaxed);
 
         fn build<T: cpal::SizedSample>(
             device: &cpal::Device,
@@ -197,16 +230,28 @@ impl Capture for CpalCapture {
                 move |data: &[T], _| {
                     // Mono-fold on the audio thread: it is one multiply-add
                     // per frame and it halves (or quarters) what the lock
-                    // holds. A vocal take is a mono take.
-                    match shared.buf.try_lock() {
-                        Ok(mut b) => {
-                            for frame in data.chunks(chans.max(1)) {
-                                let sum: f32 = frame.iter().copied().map(to_f32).sum();
-                                b.push(sum / frame.len().max(1) as f32);
-                            }
+                    // holds. A vocal take is a mono take, and so is a voice
+                    // on a call. Each destination is gated by its own flag
+                    // and guarded by its own try_lock, so the take and the
+                    // tap cannot block each other any more than the UI.
+                    let fold = |b: &mut Vec<f32>| {
+                        for frame in data.chunks(chans.max(1)) {
+                            let sum: f32 = frame.iter().copied().map(to_f32).sum();
+                            b.push(sum / frame.len().max(1) as f32);
                         }
-                        // Never block the audio thread — count and move on.
-                        Err(_) => { shared.dropped.fetch_add(1, Ordering::Relaxed); }
+                    };
+                    if shared.taking.load(Ordering::Relaxed) {
+                        match shared.buf.try_lock() {
+                            Ok(mut b) => fold(&mut b),
+                            // Never block the audio thread — count and move on.
+                            Err(_) => { shared.dropped.fetch_add(1, Ordering::Relaxed); }
+                        }
+                    }
+                    if shared.tap_on.load(Ordering::Relaxed) {
+                        match shared.tap.try_lock() {
+                            Ok(mut b) => fold(&mut b),
+                            Err(_) => { shared.tap_dropped.fetch_add(1, Ordering::Relaxed); }
+                        }
                     }
                 },
                 |e| eprintln!("capture stream error: {e}"),
@@ -291,8 +336,31 @@ impl Capture for CpalCapture {
              is busy, whatever else is holding it."))
     }
 
+    /// Close the device if nobody needs it — dropping the stream stops it.
+    fn release_if_idle(&mut self) {
+        let taking = self.shared.taking.load(Ordering::Relaxed);
+        let tapping = self.shared.tap_on.load(Ordering::Relaxed);
+        if !taking && !tapping { drop(self.stream.take()); }
+    }
+}
+
+#[cfg(feature = "audio")]
+impl Capture for CpalCapture {
+    fn start(&mut self) -> Result<(), String> {
+        if self.shared.taking.load(Ordering::Relaxed) { return Ok(()); }
+        self.shared.buf.lock().map_err(|_| "capture buffer poisoned")?.clear();
+        self.shared.dropped.store(0, Ordering::Relaxed);
+        self.ensure_stream()?;
+        self.shared.taking.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn stop(&mut self) -> Option<Take> {
-        drop(self.stream.take()?); // dropping the stream stops the device
+        if !self.shared.taking.load(Ordering::Relaxed) { return None; }
+        self.shared.taking.store(false, Ordering::Relaxed);
+        // The callback may be mid-fold; the lock below waits for it, and
+        // the flag it just read means it will not start another.
+        self.release_if_idle();
         let samples = std::mem::take(&mut *self.shared.buf.lock().ok()?);
         if samples.is_empty() { return None; }
         Some(Take {
@@ -302,12 +370,36 @@ impl Capture for CpalCapture {
         })
     }
 
-    fn recording(&self) -> bool { self.stream.is_some() }
+    fn recording(&self) -> bool { self.shared.taking.load(Ordering::Relaxed) }
     fn elapsed(&self) -> f32 {
         self.shared.buf.lock().map(|b| b.len() as f32 / self.rate as f32).unwrap_or(0.0)
     }
     fn device_name(&self) -> &str { &self.name }
     fn rate(&self) -> u32 { self.rate }
+
+    fn tap_start(&mut self) -> Result<(), String> {
+        if self.shared.tap_on.load(Ordering::Relaxed) { return Ok(()); }
+        self.shared.tap.lock().map_err(|_| "tap buffer poisoned")?.clear();
+        self.shared.tap_dropped.store(0, Ordering::Relaxed);
+        self.ensure_stream()?;
+        self.shared.tap_on.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+    fn tap_stop(&mut self) {
+        self.shared.tap_on.store(false, Ordering::Relaxed);
+        self.release_if_idle();
+        if let Ok(mut t) = self.shared.tap.lock() { t.clear(); }
+    }
+    fn tapping(&self) -> bool { self.shared.tap_on.load(Ordering::Relaxed) }
+    fn tap_drain(&mut self) -> Vec<f32> {
+        // A real lock, not try_lock: this side is the UI thread, and it
+        // is the callback's job (try_lock, count) to never wait on us.
+        match self.shared.tap.lock() {
+            Ok(mut t) => std::mem::take(&mut *t),
+            Err(_) => Vec::new(),
+        }
+    }
+    fn tap_dropped(&self) -> usize { self.shared.tap_dropped.load(Ordering::Relaxed) }
 }
 
 /// The microphone, or an honest stand-in for one.
