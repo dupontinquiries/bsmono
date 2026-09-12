@@ -511,9 +511,18 @@ pub fn plan_inline(env: &Envelope, occupant_h: f32) -> Vec<PlannedRoom> {
         return out;
     }
     let span = z1 - z0;
-    // how many compartments the run can hold at a standable depth
+    // How many compartments the run can hold at a standable depth.
+    //
+    // The ceiling is 8, not 5, so a tube can hold a whole roster:
+    // `content::HUB` needs a bridge, a hangar, a corridor and four other
+    // rooms = seven. At five, `plan_named` ran out of slots on the narrow
+    // hulls and OVERLAID the leftovers onto the spine, which fused them
+    // to the corridor and made their doors decorative -- the same bug the
+    // door gap was added to fix, arriving by a different route. Giving
+    // the tube enough compartments removes the overflow case rather than
+    // managing it.
     let depth = min_side * 0.75;
-    let n = ((span / depth).floor() as usize).clamp(0, 5);
+    let n = ((span / depth).floor() as usize).clamp(0, 8);
     if n == 0 {
         return out;
     }
@@ -938,25 +947,6 @@ mod tests {
                 .iter()
                 .find(|p| p.kind == RoomKind::Corridor)
                 .unwrap_or_else(|| panic!("{name}: no corridor placed"));
-            // KNOWN GAP, not fixed here: when the bays run out
-            // `plan_named` overlays the remaining roster rooms onto the
-            // spine, so on the narrow single-file hulls (the cutter)
-            // those rooms DO intersect it and their doors would be
-            // decorative. That is the same class of bug as the one this
-            // test was written for, and it predates this fix. The real
-            // answer is for overflow to carve dedicated slices and
-            // shorten the spine rather than overlay it. Until then this
-            // asserts the case that IS fixed -- hulls with enough bays
-            // for the roster -- rather than passing vacuously or
-            // pretending the tube case works.
-            let bays = plan(&env, OCC).iter().filter(|p| p.kind == RoomKind::Quest).count();
-            let needed = crate::content::HUB
-                .iter()
-                .filter(|r| !matches!(r.kind, RoomKind::Bridge | RoomKind::Hangar | RoomKind::Corridor))
-                .count();
-            if bays < needed {
-                continue; // overflow hull -- see the note above
-            }
             for r in &placed {
                 if r.kind == RoomKind::Corridor {
                     continue; // corridor stretches may share the spine

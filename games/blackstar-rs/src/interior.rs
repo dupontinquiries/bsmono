@@ -302,26 +302,30 @@ impl Interior {
             (2.6 * s).max(floor.y).min(cap.y),
             (4.0 * s).max(floor.z).min(cap.z),
         );
-        // SHAPE-DERIVED LAYOUT IS BUILT AND TESTED, AND NOT WIRED HERE
-        // YET — deliberately, and this is the reason.
+        // SHAPE-DERIVED LAYOUT IS BUILT AND TESTED, AND STILL NOT WIRED
+        // HERE. Two attempts, and the second found the real reason.
         //
-        // `roomplan::plan_named` places this exact roster by hull shape
-        // and keeps every id (`plan_named_keeps_every_roster_id`). It
-        // was wired into this function and then backed out, because
-        // turning it on made `a_shut_door_is_a_wall_and_an_open_one_is_
-        // a_way_through` fail: the planner lets its spine corridor
-        // physically OVERLAP every room it serves, so the interior
-        // becomes one connected void and a shut door stops being a wall.
-        // `roomplan::overlaps` even excludes corridor-room overlap on
-        // purpose, on the reasoning that an overlap is a doorway — true
-        // for one door, false as a layout rule, and the door system is
-        // what proved it.
+        // `roomplan::plan_named` places this roster by hull shape and
+        // keeps every id. The first attempt failed because the planner's
+        // spine overlapped every room, so a shut door was walkable; that
+        // is fixed (`roomplan::spine_intersects`, door gap, both layouts,
+        // whole fleet).
         //
-        // Fixing it means rooms ABUT the spine with a door gap rather
-        // than intersecting it, which is a real change to the planner
-        // and wants its own pass. Until then the hand-authored placement
-        // below stays: every ship is the same ship at a different size,
-        // which is worse layout and correct behaviour.
+        // The second attempt failed anyway, and wider: five tests, from
+        // shut doors to hull solidity to wall-climbing. THE PLANNER'S
+        // GUARANTEES DO NOT SURVIVE THIS FUNCTION. Look at what the
+        // wiring did to each planned room -- override `centre.y` with
+        // `deck_y`, clamp `half` with `cap`. Both are reasonable-looking
+        // and both invalidate the plan: the planner proved its rooms fit
+        // the envelope and cleared the spine AT THE POSITIONS AND SIZES
+        // IT CHOSE, and a caller that moves and resizes them afterwards
+        // is not using that proof, it is discarding it.
+        //
+        // So the next attempt is not "wire it again". It is: decide who
+        // owns deck height and clamping. Either the planner takes
+        // `deck_y` and `cap` as inputs and honours them while proving its
+        // invariants, or this function stops adjusting what it is given.
+        // Wiring before that is wiring a proof that no longer holds.
         let cells: Vec<Cell> = HUB
             .iter()
             .map(|r| Cell {
