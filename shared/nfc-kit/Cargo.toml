@@ -1,0 +1,11 @@
+[package]
+name = "nfc-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Contactless card family classification from raw ATR/UID bytes. Pure — no pcsc, no reader dependency, testable against known ATR fixtures without any hardware. The reader-facing half lives in apps/card-diagnoser, same split as bt-kit/systemcompkit: pure protocol logic here, thin real I/O in the app that actually needs a reader plugged in."
+
+[lib]
+name = "nfc_kit"
+path = "src/lib.rs"
+
+[dependencies]
