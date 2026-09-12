@@ -244,8 +244,21 @@ fn reroll_ui(app: &mut App, ui: &mut egui::Ui) {
     // into a confirmation.
     let devices = st.roster.devices();
     let plan = reroll::plan(&devices, &st.reroll_apps);
+    // AND WHETHER THE BUILDS WILL OVERLAP. The plan says how many there are; whether they run
+    // at once depends on THIS machine's memory, and a queue that quietly runs one at a time on
+    // a 64GB workstation looks like the feature was never added. Saying the number also makes
+    // the 24GB threshold visible to someone wondering why their laptop is not stacking.
+    let host = cockpit::buildflags::detect_host();
+    let par = cockpit::buildflags::host_build_plan(host).concurrent;
+    let overlap = if par > 1 && plan.build_count() > 1 {
+        format!(" ({par} at a time, {}GB)", host.ram_mb / 1024)
+    } else if plan.build_count() > 1 {
+        format!(" (one at a time — under {}GB)", cockpit::buildflags::STACK_RAM_MB / 1024)
+    } else {
+        String::new()
+    };
     ui.label(format!(
-        "plan: {} pairing, {} build(s), {} install(s)",
+        "plan: {} pairing, {} build(s){overlap}, {} install(s)",
         plan.enroll_count(), plan.build_count(), plan.install_count()));
     for (id, why) in &plan.skipped {
         let reason = match why {

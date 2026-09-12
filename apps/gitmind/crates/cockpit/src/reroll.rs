@@ -368,6 +368,44 @@ pub fn run<R: Runner>(plan: &Plan, r: &mut R, on: &mut dyn FnMut(Event)) -> Repo
     let mut dead_builds: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut installed: BTreeMap<String, usize> = BTreeMap::new();
 
+    // BUILDS FIRST, AND OVERLAPPED WHERE THERE IS MEMORY FOR IT.
+    //
+    // `host_build_plan` decides how many may run at once from the machine's RAM and cores —
+    // one below 24GB, which is the behaviour this had before. `Runner::build_batch` runs a
+    // group; its default is sequential, so a runner that has not opted in is unaffected.
+    //
+    // Ahead of the main loop rather than inside it because a batch cannot be interleaved with
+    // the installs that depend on it: an install needs ITS app built, and the only way to know
+    // that inside a sequential walk is to have built everything first. Builds do not touch a
+    // device, so hoisting them changes no ordering that matters.
+    let host = crate::buildflags::detect_host();
+    let concurrency = crate::buildflags::host_build_plan(host).concurrent;
+    for batch in plan.build_batches(concurrency) {
+        let pairs: Vec<(String, String)> = batch
+            .iter()
+            .filter_map(|s| match s {
+                Step::Build { app, triple } => Some((app.clone(), triple.clone())),
+                _ => None,
+            })
+            .collect();
+        for s in &batch {
+            on(Event::StepStarted(s.clone()));
+        }
+        for ((app, triple), res) in pairs.iter().zip(r.build_batch(&pairs)) {
+            let step = Step::Build { app: app.clone(), triple: triple.clone() };
+            match res {
+                Ok(()) => on(Event::StepDone(step)),
+                Err(e) => {
+                    // Recorded the same way the sequential path records it, so an install
+                    // below still skips with "its build failed" rather than trying and
+                    // failing to copy a binary that was never produced.
+                    dead_builds.insert((app.clone(), triple.clone()), e.clone());
+                    on(Event::StepFailed { step, error: e });
+                }
+            }
+        }
+    }
+
     for step in &plan.steps {
         match step {
             Step::Enroll { device } => {
@@ -418,6 +456,9 @@ pub fn run<R: Runner>(plan: &Plan, r: &mut R, on: &mut dyn FnMut(Event)) -> Repo
                     }
                 }
             }
+            // Built above, in batches. Skipped here rather than removed from the plan, so a
+            // report still walks the same steps in the same order.
+            Step::Build { .. } if true => {}
             Step::Build { app, triple } => {
                 on(Event::StepStarted(step.clone()));
                 match r.build(app, triple) {
@@ -480,6 +521,107 @@ pub fn run<R: Runner>(plan: &Plan, r: &mut R, on: &mut dyn FnMut(Event)) -> Repo
 
 #[cfg(test)]
 mod tests {
+
+    /// The batching has to actually OVERLAP, or the seam is decoration. A runner whose
+    /// `build_batch` runs them at once must see them at once — this drives one that records
+    /// how many were in flight simultaneously.
+    #[test]
+    fn a_concurrent_runner_sees_the_batch_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Default)]
+        struct Par {
+            live: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+            built: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        impl Runner for Par {
+            fn enroll(&mut self, _d: &str) -> Result<(), String> { Ok(()) }
+            fn build(&mut self, app: &str, _t: &str) -> Result<(), String> {
+                self.built.lock().unwrap().push(app.into());
+                Ok(())
+            }
+            fn install(&mut self, _a: &str, _d: &str) -> Result<(), String> { Ok(()) }
+            fn refresh(&mut self, _d: &str) -> Result<(), String> { Ok(()) }
+            fn rename(&mut self, _d: &str, _h: &str) -> Result<(), String> { Ok(()) }
+            fn triple_of(&self, _d: &str) -> Option<String> { Some("t".into()) }
+            fn build_batch(&mut self, batch: &[(String, String)]) -> Vec<Result<(), String>> {
+                let (live, peak, built) = (self.live.clone(), self.peak.clone(), self.built.clone());
+                std::thread::scope(|sc| {
+                    let hs: Vec<_> = batch
+                        .iter()
+                        .map(|(app, _)| {
+                            let (live, peak, built) = (live.clone(), peak.clone(), built.clone());
+                            let app = app.clone();
+                            sc.spawn(move || {
+                                let n = live.fetch_add(1, Ordering::SeqCst) + 1;
+                                peak.fetch_max(n, Ordering::SeqCst);
+                                std::thread::sleep(std::time::Duration::from_millis(30));
+                                built.lock().unwrap().push(app);
+                                live.fetch_sub(1, Ordering::SeqCst);
+                                Ok(())
+                            })
+                        })
+                        .collect();
+                    hs.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            }
+        }
+
+        let plan = Plan {
+            steps: vec![
+                Step::Build { app: "a".into(), triple: "t".into() },
+                Step::Build { app: "b".into(), triple: "t".into() },
+                Step::Build { app: "c".into(), triple: "t".into() },
+            ],
+            skipped: Vec::new(),
+        };
+        // The batch the plan hands over, at a concurrency this test chooses rather than the
+        // host's — the policy is tested separately and this is about the plumbing.
+        let batch: Vec<(String, String)> = plan
+            .build_batches(3)[0]
+            .iter()
+            .filter_map(|s| match s {
+                Step::Build { app, triple } => Some((app.clone(), triple.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut r = Par::default();
+        let res = r.build_batch(&batch);
+        assert_eq!(res.len(), 3);
+        assert!(res.iter().all(|x| x.is_ok()));
+        assert!(
+            r.peak.load(Ordering::SeqCst) > 1,
+            "the batch ran one at a time: peak {}",
+            r.peak.load(Ordering::SeqCst)
+        );
+        assert_eq!(r.built.lock().unwrap().len(), 3);
+    }
+
+    /// And the DEFAULT stays sequential, so a runner that has not opted in is unaffected —
+    /// which is what makes this safe to put in `run` for everyone.
+    #[test]
+    fn the_default_batch_is_still_one_at_a_time() {
+        #[derive(Default)]
+        struct Seq { order: Vec<String> }
+        impl Runner for Seq {
+            fn enroll(&mut self, _d: &str) -> Result<(), String> { Ok(()) }
+            fn build(&mut self, app: &str, _t: &str) -> Result<(), String> {
+                self.order.push(app.into());
+                Ok(())
+            }
+            fn install(&mut self, _a: &str, _d: &str) -> Result<(), String> { Ok(()) }
+            fn refresh(&mut self, _d: &str) -> Result<(), String> { Ok(()) }
+            fn rename(&mut self, _d: &str, _h: &str) -> Result<(), String> { Ok(()) }
+            fn triple_of(&self, _d: &str) -> Option<String> { Some("t".into()) }
+        }
+        let mut r = Seq::default();
+        let batch = vec![("a".to_string(), "t".to_string()), ("b".to_string(), "t".to_string())];
+        let res = r.build_batch(&batch);
+        assert_eq!(res.len(), 2);
+        assert_eq!(r.order, vec!["a".to_string(), "b".to_string()], "order was not preserved");
+    }
 
     /// Builds stack; nothing else does. An install depends on the build before it, and a
     /// rename changes the device a later step talks to.
