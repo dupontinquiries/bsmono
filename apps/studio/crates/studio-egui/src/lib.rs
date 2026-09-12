@@ -45,6 +45,17 @@ use uikit_egui::PaletteColors;
 /// Viewport state: where the timeline is scrolled and how far it is zoomed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct View {
+    /// Label the ruler in SMPTE timecode at this rate, instead of as a wall clock.
+    ///
+    /// `None` keeps `H:MM:SS.mmm`, which is right for a music session: a bar is not a frame
+    /// and rounding a beat to 1/25s would be a lie about where it sits.
+    ///
+    /// `Some` is for video, where a duration is the WRONG OBJECT. `01:00:00:12` names a frame
+    /// you can cut on; it is what the camera stamped, what the slate showed and what every
+    /// note on the shot list refers to. `studio_video::timecode` has done this arithmetic —
+    /// including drop-frame, which is the hard part — since it was written, and nothing has
+    /// ever called it.
+    pub timecode_rate: Option<(studio_video::timecode::Rate, bool)>,
     /// Horizontal zoom. Stored as pixels per SECOND rather than per tick so the
     /// number stays human — 100.0 is "a second is a hundred pixels".
     pub px_per_sec: f32,
@@ -166,7 +177,10 @@ pub fn trim_target(
 
 impl Default for View {
     fn default() -> Self {
-        View { px_per_sec: 100.0, scroll: Ticks::ZERO, track_h: 64.0, gutter: 132.0, drag: None }
+        View { px_per_sec: 100.0, scroll: Ticks::ZERO, track_h: 64.0, gutter: 132.0, drag: None,
+               // A wall clock by default: Studio opens as a music session, and a bar is not
+               // a frame. Video projects set this when they know their rate.
+               timecode_rate: None }
     }
 }
 
@@ -421,7 +435,7 @@ pub fn timeline(
             painter.line_segment([Pos2::new(x, origin.y + RULER_H - 6.0), Pos2::new(x, origin.y + RULER_H)],
                                  Stroke::new(1.0_f32, colors.border));
             painter.text(Pos2::new(x + 3.0, origin.y + 3.0), Align2::LEFT_TOP,
-                         format_timecode(Ticks::from_seconds(s as f64)),
+                         ruler_label(view, Ticks::from_seconds(s as f64)),
                          FontId::monospace(10.0), colors.text_weak);
         }
     }
@@ -741,6 +755,22 @@ pub fn peer_color(site: u64) -> Color32 {
 }
 
 /// `H:MM:SS.mmm`, the form both source editors show.
+/// What the ruler writes at a tick: a frame, or a duration.
+///
+/// The choice is the view's, not this function's — a music session and a video edit want
+/// different objects at the same position, and picking one globally would make the other's
+/// ruler wrong. Drop-frame labels come out with a semicolon, which is the convention that
+/// tells an editor at a glance which counting is in use.
+pub fn ruler_label(view: &View, t: Ticks) -> String {
+    match view.timecode_rate {
+        Some((rate, drop)) => {
+            let frame = (t.to_seconds() * rate.exact()).round() as i64;
+            studio_video::timecode::Timecode::from_frames(frame, rate, drop).to_string()
+        }
+        None => format_timecode(t),
+    }
+}
+
 pub fn format_timecode(t: Ticks) -> String {
     let total_ms = (t.0 as f64 / TICKS_PER_SECOND as f64 * 1000.0).round() as i64;
     let (neg, total_ms) = (total_ms < 0, total_ms.abs());
@@ -907,6 +937,40 @@ mod tests {
             active_track: Some(TrackId(1)), seq: 1 , recording: false,});
         assert_eq!(doc.peers_on(ClipId(10)).len(), 1, "the peer is inside the 2s..6s clip");
         assert!(doc.peers_on(ClipId(20)).is_empty(), "and not inside the other one");
+    }
+
+    /// A duration is the WRONG OBJECT for a video ruler. `01:00:00:12` names a frame you can
+    /// cut on — what the camera stamped and what the shot list refers to — and
+    /// `studio_video::timecode` has done the arithmetic, drop-frame included, with no caller
+    /// since it was written.
+    #[test]
+    fn the_ruler_names_frames_when_the_view_is_a_video_project() {
+        use studio_video::timecode::Rate;
+        let mut v = View::default();
+        // Music session: unchanged, because a bar is not a frame and rounding a beat to
+        // 1/25s would misplace it.
+        assert_eq!(ruler_label(&v, Ticks::from_seconds(61.5)), format_timecode(Ticks::from_seconds(61.5)));
+        assert!(ruler_label(&v, Ticks::from_seconds(61.5)).contains('.'));
+
+        // Video: frames, colon-separated.
+        v.timecode_rate = Some((Rate::Fps25, false));
+        assert_eq!(ruler_label(&v, Ticks::from_seconds(0.0)), "00:00:00:00");
+        assert_eq!(ruler_label(&v, Ticks::from_seconds(1.0)), "00:00:01:00");
+        // 61.5s at 25fps is frame 1537.5, which ROUNDS to 1538 -> 00:01:01:13. I wrote :12
+        // first by truncating in my head; the label names the nearest frame, because a ruler
+        // tick that fell between two frames has to pick one and the nearer is the honest
+        // choice.
+        assert_eq!(ruler_label(&v, Ticks::from_seconds(61.5)), "00:01:01:13");
+
+        // Drop-frame prints a SEMICOLON, the convention that tells an editor at a glance
+        // which counting is in use — the two disagree by 3.6 seconds an hour.
+        v.timecode_rate = Some((Rate::Fps29_97, true));
+        let df = ruler_label(&v, Ticks::from_seconds(3600.0));
+        assert!(df.contains(';'), "drop-frame should be marked: {df}");
+        v.timecode_rate = Some((Rate::Fps29_97, false));
+        let ndf = ruler_label(&v, Ticks::from_seconds(3600.0));
+        assert!(!ndf.contains(';'), "{ndf}");
+        assert_ne!(df, ndf, "drop and non-drop must not label an hour the same");
     }
 
     #[test]
