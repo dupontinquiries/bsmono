@@ -123,6 +123,7 @@ pub mod latent;
 pub mod capability;
 pub mod expr;
 /// Parts and relations without coordinates, and the solver that grounds them.
+pub mod siting;
 pub mod sketch;
 /// The stages a timelapse edits out: lighting, site prep, the palette trial.
 pub mod unshown;

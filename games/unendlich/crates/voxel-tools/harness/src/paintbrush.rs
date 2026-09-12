@@ -1537,7 +1537,7 @@ impl Paintbrush {
 
     /// The stages a build video cuts, done last because they need the
     /// finished thing: light the inside, and say what was left out.
-    fn finish_dossier(&mut self, cm: &ChunkManager, gaze: &Gaze,
+    fn finish_dossier(&mut self, cm: &ChunkManager, _gaze: &Gaze,
                       player_feet: Option<(i32, i32, i32)>, prose: &str) {
         let Some(d) = self.dossier.take() else { return };
         self.say(d.status());
@@ -1879,7 +1879,6 @@ impl Paintbrush {
     /// is set twice.
     fn begin(&mut self, cm: &ChunkManager, gaze: &Gaze, prose: &str,
              player_feet: Option<(i32, i32, i32)>, debug: bool) {
-        let surface: Option<&str> = self.last_surface.as_deref();
         // ASK WHAT KIND OF THING THIS IS, before anything else.
         //
         // The word tables get one build in three wrong -- `arch` inside
@@ -1951,6 +1950,8 @@ impl Paintbrush {
         // hitch before "asking ..." appeared. It is built on the worker
         // now, from a clone of the session over an owned view of the
         // chunk store, immediately before the model call it feeds.
+        // `begin` has no `surface` of its own: it is resumed into by the
+        // routing turn, which is why the surface lives on the session.
         let session = self.session.clone();
         let drone_world = crate::bind::DroneWorld(cm.drone_view());
         let (gaze_c, surface_c, prose_c) = (*gaze, self.last_surface.clone(), prose.to_string());
@@ -2267,9 +2268,16 @@ impl Paintbrush {
             voxel_tools::chat::LastBuild { name: w.name.clone(), min: w.min, max: w.max,
                                            blocks: w.blocks(), palette_hint: None }
         }).collect();
+        // USE THE SURFACE WE WERE GIVEN. When `begin` was split out of
+        // `start_turn` I moved the surface onto `self.last_surface` for
+        // the routing turn to resume with -- and this path, which takes
+        // its own `surface` argument, silently started ignoring it. The
+        // compiler called it an unused variable; it was a caller's
+        // argument being dropped on the floor.
+        self.last_surface = surface.map(|s| s.to_string());
         let session = self.session.clone();
         let drone_world = crate::bind::DroneWorld(cm.drone_view());
-        let (gaze_c, surface_c, prose_c) = (*gaze, self.last_surface.clone(), prose.to_string());
+        let (gaze_c, surface_c, prose_c) = (*gaze, surface.map(|s| s.to_string()), prose.to_string());
         let user: Box<dyn FnOnce() -> String + Send> = Box::new(move || {
             let mut staged = StagedWorld::new(&drone_world);
             let tools = VoxelTools::new(&mut staged);
