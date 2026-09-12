@@ -48,6 +48,9 @@ false alarm, and the rule that follows: probe before patching.
   `BIN_PATCHES_air_behaviors.md`, `BIN_PATCHES_bending_ai.md`
 
 **Other projects**
+- `apps/depot/MANUAL.md` (operator manual), `apps/depot/DECISIONS.md` (the
+  Linux/ecosystem defaults behind each choice), `apps/depot/TODO.md`; overview in
+  [`../architecture/OFFLINE_SUPPLY_CHAIN.md`](../architecture/OFFLINE_SUPPLY_CHAIN.md)
 - `apps/logscope/HANDOFF.md`, `apps/logscope/reference-docs/HANDOFF-imagegen.md`
 - `apps/bo-suite/docs/HANDOFF.md`
 - `apps/gitmind/TOOLBOX.md`

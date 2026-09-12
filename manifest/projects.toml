@@ -159,6 +159,16 @@ targets = ["desktop"]
 primary = true            # the only drivemind GUI; core+cli are UI-less
 notes = "egui shell on shared/uikit (Night palette): device rail, per-device SMART verdicts, verify/cleanup/videos/advise tabs, and a live log_view of the engine's Event stream — the same loop `dvm` prints to stderr. One worker thread + two mpsc channels; no async runtime. `cargo build --release -p drivemind-egui` produces the deployable bin (`app` feature default-on)."
 
+[apps.depot]
+path = "apps/depot"
+kind = "cargo"
+role = "service"
+daemon = false           # LAN service; hardened unit in apps/depot/systemd (DynamicUser, StateDirectory)
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone", "alpine"]
+notes = "offline mirror: cargo sparse registry, Fedora dnf repodata, Nix binary cache, Rust toolchains, served by a std-only httpd from a content-addressed store; signed dedup packs move content across the air gap. Manual and decisions are embedded (/manual, /decisions). RPM repodata verified byte-identical to createrepo_c; real cargo + dnf clients verified. No async runtime, no C deps by default - buildable from its own mirror."
+
 [apps.aperture]
 path = "apps/aperture"
 kind = "cargo"
