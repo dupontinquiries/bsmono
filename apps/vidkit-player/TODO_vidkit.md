@@ -27,8 +27,8 @@ keep:
 
 | seam | trait | real impl lives | status |
 |---|---|---|---|
-| yt-dlp process | `CommandRunner` | app | **not written** |
-| HTTP range fetch | `HttpTransport` | app | **not written** |
+| yt-dlp process | `CommandRunner` | `src/io.rs` | ✅ written, tested — *verified* |
+| HTTP range fetch | `HttpTransport` | `src/io.rs` | ✅ written, tested over a real socket — **plain HTTP only, no TLS** — *verified* |
 | V4L2 decode | `V4l2Api` | `vidkit-v4l2::device` | compiles, never run — *verified* it builds, *assumed* it works |
 | transcription | `Transcriber` (voiced-core) | app | **not written** |
 | relevance model | `Analyzer::take_pending`/`fulfill` | app | **not written** |
@@ -60,11 +60,15 @@ untestable wrapper would have looked like progress.
    up yet". `voice-kit` already does the post-processing and
    `voiced-core::grammar` already does the matching; only the mic and the model
    are missing. *read*
-2. **`HttpTransport` impl.** `StreamSource` and the section plan are both
-   finished and have no way to reach the network. A `ureq` wrapper with no logic
-   in it. *read*
-3. **`CommandRunner` impl.** Same shape; `std::process::Command` around
-   `yt-dlp`. *read*
+2. **A TLS client.** `TcpTransport` in `src/io.rs` fetches ranges over a real
+   socket and is tested against a local server, but speaks `http://` only —
+   the monorepo has no TLS client, and `net-kit`'s is plain TCP whose
+   `roundtrip` returns a `String` that would mangle a binary body. YouTube is
+   HTTPS-only, so this is what stands between the finished `StreamSource` and
+   actually playing a URL. It is a change to `TcpTransport::fetch` and nothing
+   else. *verified*
+3. **Wire the two into the app.** `ProcessRunner` and `TcpTransport` exist and
+   nothing constructs them; `StreamSource::open` wants both. *verified*
 4. **Tooltip fade-in.** Asked for and done — see below — but only the shared
    helper; individual controls still need `.on_hover_text` replaced. *verified*
 5. **`Inhibitor` impl.** wlr idle-inhibit on Phosh, `org.freedesktop.ScreenSaver`

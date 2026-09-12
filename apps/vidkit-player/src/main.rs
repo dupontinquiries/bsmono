@@ -28,6 +28,7 @@ use vidkit_core::traits::{MediaSource, Presenter};
 use vidkit_egui::{bottom_bar, next_fit, EguiPresenter, Fit, Transport, VideoView};
 
 mod filepick;
+mod io;
 mod palette;
 mod pattern;
 

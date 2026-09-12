@@ -2513,6 +2513,7 @@ dependencies = [
  "vidkit-egui",
  "vidkit-mp4",
  "vidkit-webm",
+ "vidkit-ytdlp",
 ]
 
 [[package]]

@@ -22,6 +22,8 @@ egui = "0.34"
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
 
 vidkit-core = { path = "../../shared/vidkit/crates/vidkit-core" }
+# The IO wrappers in src/io.rs implement its CommandRunner and HttpTransport.
+vidkit-ytdlp = { path = "../../shared/vidkit/crates/vidkit-ytdlp" }
 vidkit-egui = { path = "../../shared/vidkit/crates/vidkit-egui", features = ["glow-upload"] }
 vidkit-mp4 = { path = "../../shared/vidkit/crates/vidkit-mp4" }
 vidkit-webm = { path = "../../shared/vidkit/crates/vidkit-webm" }
