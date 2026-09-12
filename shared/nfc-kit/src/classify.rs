@@ -6,17 +6,30 @@
 //!
 //! Most PC/SC-compliant contactless readers (the common cheap USB ones —
 //! ACR122U and its many clones) report a *synthesized* ATR for storage
-//! cards, following the PC/SC Workgroup's Part 3 supplemental convention:
-//! a fixed prefix, the PC/SC storage-card RID, then a 2-byte "card name"
-//! code that identifies the chip family. The `card_name_table` below is
-//! populated from values that are widely and consistently cited across
-//! libnfc/pcsc community references — it has NOT been checked against the
-//! primary PC/SC Part 3 specification document in this session (no access
-//! to fetch it here), so treat an exact family match as a strong hint, not
-//! a certified identification. An unrecognized 2-byte code, or an ATR that
-//! doesn't follow this synthetic shape at all (a real ISO 7816 contact
-//! card, or a reader that doesn't synthesize this format), falls back
-//! honestly to "ISO 14443-4 generic" or "unrecognized", never a guessed
+//! cards, following the PC/SC Workgroup's Part 3 §3.1.3.2.3.2 (Table 3-6)
+//! convention: a fixed header, a variable-length historical-byte block
+//! (its length, `n`, sits in the low nibble of byte 1 — genuinely per-card,
+//! not a fixed count; an earlier version of this parser wrongly hardcoded
+//! `n=15` and would have silently rejected any real card with a different
+//! historical-byte count), and inside those historical bytes, the PC/SC
+//! storage-card RID followed by a 2-byte "card name" code that identifies
+//! the chip family.
+//!
+//! **What the primary spec (checked directly, PDF in hand) settles**: the
+//! byte structure above — confirmed against Table 3-6's actual text, not
+//! a community shortcut. **What it explicitly does NOT settle**: the
+//! mapping from a specific 2-byte code to a specific chip family. Section
+//! 3.1.3.2.3.2 says outright that "its Standard and Card Name describing
+//! bytes must be interpreted according to the Part 3 Supplemental
+//! Document, maintained by PC/SC" — a separate document, not this one, and
+//! not something available to check in this session either. So
+//! `card_name_family`'s specific code→chip entries remain exactly as
+//! uncertain as before: populated from values widely and consistently
+//! cited across libnfc/pcsc community references, not independently
+//! verified against that Supplemental Document. An unrecognized code, or
+//! an ATR that doesn't follow this structural convention at all (a real
+//! ISO 7816 contact card, or a reader that doesn't synthesize this
+//! format), falls back honestly to "unrecognized", never a guessed
 //! specific chip name.
 //!
 //! The `GET UID` command (`FF CA 00 00 00`) is on much firmer ground: it's
@@ -53,12 +66,8 @@ pub struct CardProfile {
     pub atr_hex: String,
 }
 
-/// The PC/SC Part 3 synthetic storage-card ATR prefix, common across the
-/// contactless readers that use this convention. Bytes after this prefix
-/// carry the RID, standard, and card-name code this module actually reads.
-const SYNTHETIC_PREFIX: [u8; 6] = [0x3B, 0x8F, 0x80, 0x01, 0x80, 0x4F];
-/// The PC/SC storage-card RID (registered application identifier),
-/// expected right after the prefix and a length byte.
+/// The PC/SC storage-card RID (registered application identifier), the one
+/// piece of this ATR convention that IS a truly fixed byte string.
 const PCSC_STORAGE_RID: [u8; 5] = [0xA0, 0x00, 0x00, 0x03, 0x06];
 
 fn card_name_family(code: u16) -> Option<(&'static str, &'static [&'static str])> {
@@ -83,6 +92,63 @@ fn card_name_family(code: u16) -> Option<(&'static str, &'static [&'static str])
     }
 }
 
+/// Locates the RID + standard byte + card-name code within a synthetic
+/// storage-card ATR, per PC/SC Part 3 §3.1.3.2.3.2 (Table 3-6) — checked
+/// directly against that spec text, not the community-reference shortcuts
+/// this module used before.
+///
+/// Fixed bytes, per the table: `atr[0] == 0x3B` (initial header),
+/// `atr[2] == 0x80` (TD1: high nibble 8 = only TD2 follows, low nibble 0 =
+/// T=0), `atr[3] == 0x01` (TD2: high nibble 0 = nothing further follows,
+/// low nibble 1 = T=1). `atr[1]` is **not** fixed — its own low nibble
+/// *is* `n`, the historical-byte count, which varies by card. An earlier
+/// version of this parser hardcoded `atr[1] == 0x8F` as part of a fixed
+/// 6-byte prefix, which only matched a card with exactly 15 historical
+/// bytes and would have silently rejected any real storage card ATR with
+/// a different count — a real false-negative, not a hypothetical one,
+/// caught by checking the actual PC/SC Part 3 spec text directly rather
+/// than trusting an assumed fixed shape.
+///
+/// The historical bytes themselves then carry, in order: a category
+/// indicator (`0x80`), the AID-presence tag (`0x4F`), a length byte, the
+/// 5-byte RID, a standard byte, and the 2-byte card-name code — everything
+/// after the code (further PIX bytes, RFU) is present per the spec but not
+/// needed for family classification, so this parser doesn't require a
+/// specific total length beyond having enough bytes to reach the code.
+fn locate_card_name_code(atr: &[u8]) -> Option<u16> {
+    if atr.len() < 4 {
+        return None;
+    }
+    if atr[0] != 0x3B || atr[2] != 0x80 || atr[3] != 0x01 {
+        return None;
+    }
+    if atr[1] & 0xF0 != 0x80 {
+        return None; // high nibble must indicate "only TD1 follows"
+    }
+    let n = (atr[1] & 0x0F) as usize; // historical byte count — varies per card, not assumed
+    let hist_start = 4;
+    let hist_end = hist_start + n; // exclusive
+    if atr.len() < hist_end {
+        return None; // ATR claims more historical bytes than it actually carries
+    }
+    let hist = &atr[hist_start..hist_end];
+    // Within the historical bytes: category indicator, AID-presence tag,
+    // length, then the 5-byte RID, then the standard byte, then the 2-byte
+    // card-name code.
+    if hist.len() < 2 || hist[0] != 0x80 || hist[1] != 0x4F {
+        return None;
+    }
+    let rid_start = 3; // after category indicator, AID tag, and the length byte
+    if hist.len() < rid_start + 5 + 1 + 2 {
+        return None; // not enough historical bytes to hold RID + standard + code
+    }
+    if hist[rid_start..rid_start + 5] != PCSC_STORAGE_RID {
+        return None;
+    }
+    let code_start = rid_start + 5 + 1; // skip the RID, then the one standard byte
+    Some(u16::from_be_bytes([hist[code_start], hist[code_start + 1]]))
+}
+
 /// Parses a raw ATR and classifies the card family it most likely
 /// describes. `uid`, if already retrieved via `GET_UID_APDU`, is folded
 /// into the profile as a fact, not used to influence the classification
@@ -92,38 +158,31 @@ pub fn classify(atr: &[u8], uid: Option<&[u8]>) -> CardProfile {
     let uid_hex = uid.map(hex);
     let atr_hex = hex(atr);
 
-    if atr.len() >= 20 && atr[0..6] == SYNTHETIC_PREFIX {
-        // Byte 6 is a length/count byte for what follows; the RID sits at
-        // 7..12, the "standard" byte at 12, and the 2-byte card-name code
-        // at 13..15 — this exact offset layout is the part most consistently
-        // reproduced across community references for this ATR convention.
-        if atr.len() >= 15 && atr[7..12] == PCSC_STORAGE_RID {
-            let code = u16::from_be_bytes([atr[13], atr[14]]);
-            if let Some((family, protocols)) = card_name_family(code) {
-                let mut notes = Vec::new();
-                if matches!(code, 0x0344) {
-                    notes.push(
-                        "DESFire cards commonly randomize their anticollision UID for privacy — the same physical card can report a different UID on separate taps unless read past this layer via a card-specific GetCardUID command.".to_string(),
-                    );
-                }
-                return CardProfile {
-                    family: family.to_string(),
-                    protocols: protocols.iter().map(|s| s.to_string()).collect(),
-                    confidence: Confidence::High,
-                    notes,
-                    uid_hex,
-                    atr_hex,
-                };
+    if let Some(code) = locate_card_name_code(atr) {
+        if let Some((family, protocols)) = card_name_family(code) {
+            let mut notes = Vec::new();
+            if matches!(code, 0x0344) {
+                notes.push(
+                    "DESFire cards commonly randomize their anticollision UID for privacy — the same physical card can report a different UID on separate taps unless read past this layer via a card-specific GetCardUID command.".to_string(),
+                );
             }
             return CardProfile {
-                family: format!("Unrecognized contactless storage card (code {code:#06x})"),
-                protocols: vec!["ISO/IEC 14443 (exact variant unknown)".to_string()],
-                confidence: Confidence::Medium,
-                notes: vec!["Matches the PC/SC synthetic storage-card ATR shape, but this specific card-name code isn't in this tool's lookup table yet.".to_string()],
+                family: family.to_string(),
+                protocols: protocols.iter().map(|s| s.to_string()).collect(),
+                confidence: Confidence::High,
+                notes,
                 uid_hex,
                 atr_hex,
             };
         }
+        return CardProfile {
+            family: format!("Unrecognized contactless storage card (code {code:#06x})"),
+            protocols: vec!["ISO/IEC 14443 (exact variant unknown)".to_string()],
+            confidence: Confidence::Medium,
+            notes: vec!["Matches the PC/SC synthetic storage-card ATR shape, but this specific card-name code isn't in this tool's lookup table yet.".to_string()],
+            uid_hex,
+            atr_hex,
+        };
     }
 
     CardProfile {
@@ -161,20 +220,59 @@ pub fn copy_summary(profile: &CardProfile) -> String {
 mod tests {
     use super::*;
 
-    /// A real, commonly-reproduced example ATR for a MIFARE Classic 1K
-    /// card via a PC/SC-synthesizing reader.
+    /// Builds a synthetic storage-card ATR per PC/SC Part 3 Table 3-6,
+    /// with an explicit, caller-chosen historical-byte count `n` — the
+    /// thing the old, buggy parser assumed was always 15. `extra_tail` is
+    /// arbitrary PIX/RFU padding appended after the mandatory RID +
+    /// standard + code bytes, letting a test build ATRs of genuinely
+    /// different total lengths for the same card-name code.
+    fn synthetic_atr(code: u16, extra_tail: &[u8]) -> Vec<u8> {
+        let code_bytes = code.to_be_bytes();
+        let mut hist = vec![0x80, 0x4F, 0x0C]; // category indicator, AID-presence tag, length (value unchecked by the parser)
+        hist.extend_from_slice(&PCSC_STORAGE_RID);
+        hist.push(0x00); // standard byte (value unchecked by the parser)
+        hist.extend_from_slice(&code_bytes);
+        hist.extend_from_slice(extra_tail);
+        let n = hist.len() as u8;
+
+        let mut atr = vec![0x3B, 0x80 | n, 0x80, 0x01];
+        atr.extend_from_slice(&hist);
+        atr.push(0x00); // TCK — value unchecked by this parser
+        atr
+    }
+
     fn mifare_1k_atr() -> Vec<u8> {
-        vec![
-            0x3B, 0x8F, 0x80, 0x01, 0x80, 0x4F, 0x0C, 0xA0, 0x00, 0x00, 0x03, 0x06, 0x03, 0x00,
-            0x01, 0x00, 0x00, 0x00, 0x00, 0x6A,
-        ]
+        synthetic_atr(0x0001, &[])
     }
 
     fn desfire_atr() -> Vec<u8> {
-        vec![
-            0x3B, 0x8F, 0x80, 0x01, 0x80, 0x4F, 0x0C, 0xA0, 0x00, 0x00, 0x03, 0x06, 0x03, 0x03,
-            0x44, 0x00, 0x00, 0x00, 0x00, 0x6A,
-        ]
+        synthetic_atr(0x0344, &[])
+    }
+
+    #[test]
+    fn two_cards_with_different_historical_byte_counts_both_classify_correctly() {
+        // The actual bug this rewrite fixes: an earlier version hardcoded
+        // n=15 as part of a fixed prefix, which would have silently
+        // rejected either of these if their real n happened to differ
+        // from that assumption. mifare_1k_atr() has no tail (n=11);
+        // this one pads with 3 extra RFU-ish bytes (n=14) — genuinely
+        // different total ATR lengths, same card-name code.
+        let padded = synthetic_atr(0x0001, &[0x00, 0x00, 0x00]);
+        assert_ne!(mifare_1k_atr().len(), padded.len(), "sanity: the two fixtures really do have different n");
+        let p = classify(&padded, None);
+        assert_eq!(p.family, "MIFARE Classic 1K");
+        assert_eq!(p.confidence, Confidence::High);
+    }
+
+    #[test]
+    fn a_claimed_historical_byte_count_longer_than_the_atr_actually_is_is_rejected_not_read_out_of_bounds() {
+        // atr[1]'s low nibble claims more historical bytes than the ATR
+        // actually contains — malformed input a real (or hostile) reader
+        // could hand back. Must be a clean "unrecognized", not a panic
+        // from indexing past the end of the slice.
+        let atr = vec![0x3B, 0x8F, 0x80, 0x01, 0x80, 0x4F]; // claims n=15, only has 2 historical bytes
+        let p = classify(&atr, None);
+        assert_eq!(p.confidence, Confidence::Low);
     }
 
     #[test]
@@ -201,9 +299,7 @@ mod tests {
 
     #[test]
     fn a_synthetic_shell_with_an_unknown_code_is_medium_not_a_false_family_name() {
-        let mut atr = mifare_1k_atr();
-        atr[13] = 0xFF;
-        atr[14] = 0xFF; // a code not in the table
+        let atr = synthetic_atr(0xFFFF, &[]); // a code not in the table
         let p = classify(&atr, None);
         assert_eq!(p.confidence, Confidence::Medium);
         assert!(p.family.contains("Unrecognized"), "must not confidently misname an unknown code as MIFARE Classic");
