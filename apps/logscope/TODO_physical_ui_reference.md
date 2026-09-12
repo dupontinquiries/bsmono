@@ -21,7 +21,33 @@ already has `physkin` for this per scene; the target is a good deal further alon
 
 **Quick actions are labelled with their shortcut** (⌘N, ⌘S, ⌘I, ⌘R) on the plate itself.
 
-## The concrete defect visible in mistfall-01
+## CORRECTION: the screenshot is not current, and the box is not wrong
+
+I wrote below that mistfall-01 proves a live defect. Two checks say otherwise, and both were
+available before I claimed it:
+
+**The screenshot predates this build.** Its right panel has four tabs — Files, Graph, Context,
+Prompting. The build has five: `RightPage` gained `Engine` earlier in this session. So the
+image is at best a snapshot of an older tree, and "the current build" was my assumption from
+the filename, not something I checked.
+
+**The suspect I named is innocent.** I said `px_extents` probably under-measures because it
+estimates from a character count. Measured: `px_extents` computes `chars * 6.0 * cell *
+per_px`, and `scene_kit::mesh3d::label_cells` — which actually draws the label — lays it out
+as `chars * 6.0 * scale`. Same constant, same count, computed from the same final string
+(`chars` comes from `label_of(...)`, after the role tag and elision, not from the `LABEL_CHARS`
+cap I guessed at). The model and the draw agree about the box.
+
+So: the overlap in that image may already be fixed, and if it is not, the cause is somewhere
+other than the extents. Do not start from my hypothesis.
+
+**What would settle it**, in order:
+- [ ] A fresh screenshot of the current build in the same scene. One image ends this.
+- [ ] Failing that, point `layout_probe::analyse` at the spatial pane — it reports text
+      overlap directly and has never been run against the scene. That is a test, not an
+      opinion, and it is the thing I should have written instead of a hypothesis.
+
+## The defect as reported in mistfall-01 (see the correction above)
 
 Graph node labels COLLIDE — "82t: 6." sits on top of "82t: 6. How can we make thi", and three
 more overlap around the strand. This is not a missing feature: `nodelabel::visible` is a real
