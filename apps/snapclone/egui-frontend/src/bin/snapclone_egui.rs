@@ -571,6 +571,26 @@ impl App {
         }
         if let Some(f) = self.rig.shared.take_frame() {
             self.last_live = Some(f.clone());
+            // THE RECORDER, FED. `Recorder::offer` had no caller at all: it counted frames it
+            // never saw, `av1_encode` built a command with no input, and video snaps could not
+            // work however complete the encoder side was. This is the missing link, and the
+            // sink is `video_spill`, which writes each ADMITTED frame — the recorder's rules
+            // (no duplicates, no reorders, no resize, no torn buffers) run in front of the
+            // disk rather than behind it, which is the point of putting them there.
+            //
+            // A refusal is not an error here: dropping a duplicate is the recorder working.
+            // Only the SPILL's own failures are worth surfacing, and it holds those until the
+            // end because a camera thread is not a place to unwind.
+            if self.snap.recorder.is_some() {
+                let (rec, spill_slot) = (&mut self.snap.recorder, &mut self.snap.spill);
+                let rec = rec.as_mut().expect("checked above");
+                let spill = spill_slot.get_or_insert_with(|| {
+                    snapclone_egui::video_spill::Spill::create(
+                        snapclone_egui::video_spill::spill_path(f.seq),
+                    )
+                });
+                let _ = rec.offer(&f, &mut |admitted| spill.write(&admitted.rgba));
+            }
             // THE DECODER, while the scanner is up: every fourth frame through
             // the kit's `qr::decode_frame`, and a hit becomes the same
             // `QrPayload` event a pasted code raises. Nothing fed this

@@ -23,8 +23,14 @@ camera, a microphone, a second device, or a network — so the honest status is
 
 - [ ] Camera preview renders at all (blank preview fails everything below it).
 - [ ] A photo snap: capture → send → arrives → opens → expires.
-- [ ] `video_record` produces FRAMES ON DISK, not just a count. This is the
-      blocker for video snaps; everything downstream of it is already built.
+- [x] `video_record` produces FRAMES ON DISK. `video_spill` is the sink and the
+      camera loop now calls `Recorder::offer` — which had NO CALLER at all, so the
+      recorder counted frames it never saw. Raw RGBA, exactly the shape
+      `Source::RawStdin` describes to ffmpeg.
+      - [ ] Confirm on the device: a recording leaves a file in
+            `~/.cache/snapclone/spill/` whose size is frames x w x h x 4.
+      - [ ] Pipe it into the printed command and check the clip plays. Nothing
+            spawns ffmpeg yet — the command is still printed, not run.
 - [ ] A video snap, once the above lands.
 - [ ] Voice call: ring → answer → audio both ways → hang up. Note WHICH leg
       fails, since the signalling and the media path are separate.

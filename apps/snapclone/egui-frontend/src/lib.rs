@@ -85,6 +85,8 @@ pub mod video_backend;
 /// Asking the system which encoders it has, so `video_backend`'s decision has inputs.
 pub mod video_probe;
 pub mod video_record;
+/// Admitted frames on disk, so `av1_encode`'s command has something to read.
+pub mod video_spill;
 pub mod firewall_backend;
 pub mod gossip;
 pub mod handshake;
@@ -174,6 +176,9 @@ pub struct Snapclone {
     /// its counters must start clean each time — reusing one would report the
     /// previous clip's duration on the next.
     pub recorder: Option<crate::video_record::Recorder>,
+    /// Where the recording's admitted frames are being written. Beside the recorder because
+    /// the two start and stop together — `offer` feeds this, and the shutter finishes it.
+    pub spill: Option<crate::video_spill::Spill>,
     pub shutter_note: String,
     /// Why the last feed tap did not open a viewer. Empty when there is
     /// nothing to say.
@@ -746,6 +751,7 @@ impl Snapclone {
             shutter: Default::default(),
             prefs_handedness: settings_kit::Handedness::Right,
             recorder: None,
+            spill: None,
             shutter_note: String::new(),
             feed_note: String::new(),
             local_id: String::new(),
@@ -4127,7 +4133,17 @@ impl Snapclone {
                             // `video_backend::choose`/`unavailable_report` have been pure and
                             // tested all along with nothing supplying their probes;
                             // `video_probe` is the probes.
-                            let why = match crate::video_probe::status(false) {
+                            // THE SPILL FIRST. It is the input the encode command reads, and
+                            // if it failed there is nothing to encode — printing "would run:
+                            // ffmpeg …" over a file that is not there is the worst kind of
+                            // confident.
+                            let spill_err = match self.spill.take().map(|s| s.finish()) {
+                                Some(Err(e)) => Some(e),
+                                _ => None,
+                            };
+                            let why = if let Some(e) = spill_err {
+                                format!("nothing to encode \u{2014} {e}")
+                            } else { match crate::video_probe::status(false) {
                                 Ok(b) => {
                                     // THE COMMAND THAT WOULD RUN, not just the backend's
                                     // name. `av1_encode::command` turns the recorder's own
@@ -4177,7 +4193,7 @@ impl Snapclone {
                                     }
                                 }
                                 Err(missing) => missing.join("; "),
-                            };
+                            } };
                             format!(
                                 "would record {:.1}s \u{2014} {} frames at {:.0} fps; {why}",
                                 r.duration_secs(),
