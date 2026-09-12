@@ -1,0 +1,386 @@
+// Headless harness: renders the game (no window) via Vulkan/GL — used to
+// capture screenshots for verification on machines without a display.
+
+use glam::{Mat4, Vec3};
+
+use crate::render::{Camera, Renderer};
+use crate::scene::Scene;
+use crate::sim::{Game, Rng, Team};
+use crate::ui::{self, UiState};
+use crate::vfx::Vfx;
+
+fn make_device() -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+    // Metal on macOS, then Vulkan → GL elsewhere; never fail with a panic.
+    let mut masks = Vec::new();
+    if cfg!(target_os = "macos") {
+        masks.push(wgpu::Backends::METAL);
+    } else {
+        masks.push(wgpu::Backends::VULKAN);
+        masks.push(wgpu::Backends::GL);
+    }
+    for mask in masks {
+        // Contain wgpu-internal panics (missing EGL/driver) just like app.rs.
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<
+            (wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue),
+            String,
+        > {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: mask,
+                ..Default::default()
+            });
+            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            }))
+            .ok_or_else(|| "no adapter".to_string())?;
+            let (device, queue) = pollster::block_on(adapter.request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("headless"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                },
+                None,
+            ))
+            .map_err(|e| e.to_string())?;
+            Ok((instance, adapter, device, queue))
+        }));
+        match attempt {
+            Ok(Ok((instance, adapter, device, queue))) => {
+                eprintln!("[clawbound] headless GPU ok — {:?}", adapter.get_info().backend);
+                return Some((instance, adapter, device, queue));
+            }
+            Ok(Err(e)) => eprintln!("[clawbound] headless: {mask:?} unavailable: {e}"),
+            Err(_) => eprintln!("[clawbound] headless: {mask:?} crashed internally, skipping"),
+        }
+    }
+    None
+}
+
+const W: u32 = 1280;
+const H: u32 = 720;
+
+pub fn run() -> Result<(), String> {
+    let (_instance, _adapter, device, queue) =
+        make_device().ok_or_else(|| "No suitable GPU backend found (install mesa-vulkan-drivers for lavapipe)".to_string())?;
+    let adapter_info = {
+        // fetch a rough name via adapter? not critical
+        "headless".to_string()
+    };
+    let _ = adapter_info;
+
+    let mut egui_renderer = egui_wgpu::Renderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb, None, 1);
+    let mut renderer = Renderer::new(device, queue, W, H, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let target = renderer.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("shot target"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+
+    println!("building voxel world…");
+    let scene = Scene::new(&mut renderer);
+    println!("total voxel instances uploaded: {}", scene.total_voxels);
+
+    // demo match: all AI driven
+    let mut rng = Rng::new(0xD30);
+    let mut pool: Vec<u32> = (0..crate::gods::ROSTER_LEN as u32).collect();
+    let player = pool.remove((rng.next_u() % crate::gods::ROSTER_LEN as u64) as usize);
+    let mut allies = [0u32; 4];
+    let mut enemies = [0u32; 5];
+    for a in allies.iter_mut() {
+        *a = pool.remove((rng.next_u() % pool.len() as u64) as usize);
+    }
+    for e in enemies.iter_mut() {
+        *e = pool.remove((rng.next_u() % pool.len() as u64) as usize);
+    }
+    let mut game = Game::new(player, allies, enemies);
+    // drive the player slot with AI for the demo
+    let lane = crate::consts::Lane::Mid;
+    game.gods[0].ai = Some(crate::sim::AiBrain {
+        lane,
+        aggression: 0.9,
+        state: crate::sim::AiState::Push,
+        target: None,
+        strafe_dir: 1.0,
+        strafe_t: 0.0,
+        buy_t: 1.0,
+        wp: 0,
+    });
+
+    // egui for HUD in screenshots
+    let egui_ctx = egui::Context::default();
+    let mut ui_state = UiState::new();
+
+    // portraits
+    for i in 0..crate::gods::ROSTER.len() {
+        let body = scene.god_body[i][0];
+        let weapon = scene.god_weapon[i][0];
+        let pixels = renderer.render_portrait(body, weapon);
+        let image = egui::ColorImage::from_rgba_unmultiplied([128, 128], &pixels);
+        let tid = egui_ctx.load_texture(format!("ancestor{}", i), image, egui::TextureOptions::LINEAR);
+        ui_state.portraits.insert(i as u32, tid.id());
+    }
+    println!("portraits rendered ({})", ui_state.portraits.len());
+
+    let mut vfx = Vfx::default();
+    let mut sim_time = 0.0f32;
+    let captures: &[(f32, &str)] = &[
+        (8.0, "clawbound_select.png"),
+        (13.0, "clawbound_horizon.png"),
+        (55.0, "clawbound_battle_mid.png"),
+        (56.0, "clawbound_orbit.png"),
+        (110.0, "clawbound_battle_late.png"),
+    ];
+    let mut next_capture = 0usize;
+
+    // capture god select screen first
+    {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W as f32, H as f32))),
+            time: Some(0.0),
+            ..Default::default()
+        };
+        let mut locked = true;
+        let output = egui_ctx.run(raw, |ctx| {
+            ui::draw_select(ctx, &mut ui_state, &mut locked);
+        });
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &egui_ctx, output, W, H);
+        save_shot(&renderer.device, &renderer.queue, &target, captures[0].1)?;
+        next_capture = 1;
+        println!("saved {}", captures[0].1);
+    }
+
+    let steps_per_frame = 2; // sim at 120Hz
+    let mut frame: u64 = 0;
+    let total = 120.0f32;
+
+    while next_capture < captures.len() {
+        let cap_t = captures[next_capture].0;
+        // fast-forward the simulation to the next capture point (no render)
+        while sim_time < cap_t.min(total) {
+            for _ in 0..steps_per_frame {
+                let _n0 = game.events.len();
+                game.tick(1.0 / 120.0);
+                let events: Vec<crate::sim::Event> = game.events.drain(..).collect();
+                vfx.update(1.0 / 120.0, &events, &game);
+                for e in &events {
+                    match e {
+                        crate::sim::Event::Damage { pos, amount, big } => {
+                            if ui_state.floaters.len() < 50 && *amount > 0.0 {
+                                ui_state.push_events(&[ui::Event2::Damage { pos: *pos, amount: *amount, big: *big }]);
+                            }
+                        }
+                        crate::sim::Event::Announce { text } => {
+                            ui_state.push_events(&[ui::Event2::Announce { text: text.clone(), dur: 2.5 }]);
+                        }
+                        _ => {}
+                    }
+                }
+                sim_time += 1.0 / 120.0;
+            }
+            ui_state.tick(1.0 / 60.0);
+            if game.over.is_some() {
+                println!("match over at t={:.1}", sim_time);
+                break;
+            }
+        }
+        if game.over.is_some() && sim_time < cap_t {
+            // capture what we have anyway
+        }
+
+        // script an ultimate barrage right before battle captures
+        if !captures[next_capture].1.contains("orbit") {
+            for i in 0..game.gods.len() {
+                if game.gods[i].respawn_t <= 0.0 {
+                    let mut aim = game.gods[i].pos + Vec3::X * 5.0;
+                    for e in &game.gods {
+                        if e.team != game.gods[i].team && e.respawn_t <= 0.0 {
+                            aim = e.pos;
+                            break;
+                        }
+                    }
+                    game.gods[i].cds = [0.0; 4];
+                    game.gods[i].mana = game.gods[i].max_mana;
+                    game.cast_queue.push((i, 3, aim));
+                    game.cast_queue.push((i, 1, aim));
+                }
+            }
+            for _ in 0..40 {
+                game.tick(1.0 / 120.0);
+                let events: Vec<crate::sim::Event> = game.events.drain(..).collect();
+                vfx.update(1.0 / 120.0, &events, &game);
+                sim_time += 1.0 / 120.0;
+            }
+        }
+
+        // action camera: frame the player + nearest enemy fight
+        let p = &game.gods[0];
+        let mut cam_target = p.pos + Vec3::Y * 1.4;
+        let mut nearest: Option<(f32, Vec3)> = None;
+        for g2 in &game.gods {
+            if g2.team != p.team && g2.respawn_t <= 0.0 {
+                let d = g2.pos.distance(p.pos);
+                if d < 26.0 && nearest.map_or(true, |(bd, _)| d < bd) {
+                    nearest = Some((d, g2.pos));
+                }
+            }
+        }
+        if let Some((_, ep)) = nearest {
+            cam_target = (p.pos + ep) * 0.5 + Vec3::Y * 1.6;
+        }
+        let yaw = sim_time * 0.11 + 2.4;
+        let cam = if captures[next_capture].1.contains("orbit") {
+            let a = sim_time * 0.02;
+            Camera {
+                eye: Vec3::new(a.cos() * 70.0, 55.0, a.sin() * 70.0),
+                target: Vec3::ZERO,
+                fov_y: 0.9,
+            }
+        } else if captures[next_capture].1.contains("horizon") {
+            // low angle from the blue jungle toward the red base + north ziggurat
+            Camera {
+                eye: Vec3::new(34.0, 8.0, -84.0),
+                target: Vec3::new(-8.0, 20.0, 130.0),
+                fov_y: 1.0,
+            }
+        } else {
+            Camera {
+                eye: cam_target + Vec3::new(yaw.cos() * 7.5, 6.0, yaw.sin() * 7.5),
+                target: cam_target,
+                fov_y: 0.95,
+            }
+        };
+
+        renderer.atmosphere = game.weather.atmosphere();
+        scene.draw(&mut renderer, &game, &mut vfx, cam);
+        renderer.render_frame(&view, cam, sim_time);
+
+        // HUD overlay
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(W as f32, H as f32))),
+            time: Some(sim_time as f64),
+            ..Default::default()
+        };
+        let vp = cam.view_proj(W as f32 / H as f32);
+        let output = egui_ctx.run(raw, |ctx| {
+            ui::draw_hud(ctx, &game, 0, vp, W as f32, H as f32, &mut ui_state);
+            if captures[next_capture].1.contains("orbit") {
+                ui::draw_scoreboard(ctx, &game);
+            }
+        });
+        draw_egui(&renderer.device, &renderer.queue, &mut egui_renderer, &view, &egui_ctx, output, W, H);
+
+        save_shot(&renderer.device, &renderer.queue, &target, captures[next_capture].1)?;
+        println!(
+            "saved {} (t={:.0})  ancestors alive: {}  minions: {}  towers: {}/{}",
+            captures[next_capture].1,
+            sim_time,
+            game.gods.iter().filter(|g| g.respawn_t <= 0.0).count(),
+            game.minions.len(),
+            game.tower_alive[0],
+            game.tower_alive[1]
+        );
+        next_capture += 1;
+        frame += 1;
+        if game.over.is_some() {
+            break;
+        }
+    }
+
+    println!("headless render complete. {} frames simulated.", frame);
+    Ok(())
+}
+
+fn draw_egui(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    egui_renderer: &mut egui_wgpu::Renderer,
+    view: &wgpu::TextureView,
+    ctx: &egui::Context,
+    output: egui::FullOutput,
+    w: u32,
+    h: u32,
+) {
+    for td in output.textures_delta.set.iter() {
+        egui_renderer.update_texture(device, queue, td.0, &td.1);
+    }
+    let screen = egui_wgpu::ScreenDescriptor {
+        size_in_pixels: [w, h],
+        pixels_per_point: ctx.pixels_per_point(),
+    };
+    let clipped = ctx.tessellate(output.shapes, screen.pixels_per_point);
+    let mut encoder = device.create_command_encoder(&Default::default());
+    let mut cbuffers = egui_renderer.update_buffers(device, queue, &mut encoder, &clipped, &screen);
+    {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("egui headless"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        egui_renderer.render(&mut rpass, &clipped, &screen);
+    }
+    cbuffers.push(encoder.finish());
+    queue.submit(cbuffers);
+    for td in output.textures_delta.free.iter() {
+        egui_renderer.free_texture(td);
+    }
+}
+
+fn save_shot(device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::Texture, path: &str) -> Result<(), String> {
+    let (w, h) = (target.width(), target.height());
+    let read_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("shot read"),
+        size: (w * h * 4) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        wgpu::ImageCopyTexture {
+            texture: target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::ImageCopyBuffer {
+            buffer: &read_buf,
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: None,
+            },
+        },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    queue.submit([encoder.finish()]);
+    let slice = read_buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    device.poll(wgpu::Maintain::Wait);
+    rx.recv().map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    let data = slice.get_mapped_range();
+    let mut img = Vec::with_capacity((w * h * 4) as usize);
+    // remove row padding (none here since bytes_per_row == w*4)
+    img.extend_from_slice(&data);
+    drop(data);
+    read_buf.unmap();
+    let out = image::RgbaImage::from_raw(w, h, img).ok_or("image layout")?;
+    out.save(path).map_err(|e| e.to_string())?;
+    let _ = Mat4::IDENTITY;
+    let _ = Team::Blue;
+    Ok(())
+}

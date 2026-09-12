@@ -1,0 +1,33 @@
+[package]
+name = "clawbound-battleground"
+version = "0.1.0"
+edition = "2021"
+description = "Clawbound — Battleground: the thirteen legendary ancestors in a microvoxel 5v5 arena, Rust + wgpu"
+license = "MIT"
+
+[lib]
+name = "clawbound"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clawbound"
+path = "src/main.rs"
+
+[dependencies]
+wgpu = "0.19"
+winit = "0.29"
+egui = "0.27"
+egui-wgpu = "0.27"
+egui-winit = "0.27"
+glam = "0.27"
+bytemuck = { version = "1.15", features = ["derive"] }
+pollster = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Optimize dependencies in debug builds so the sim + software Vulkan stay usable
+[profile.dev.package."*"]
+opt-level = 2

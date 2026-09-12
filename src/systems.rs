@@ -1,0 +1,920 @@
+// Per-tick systems: waves, movement, auto-attacks, projectiles, zones, regen.
+
+use crate::consts::*;
+use crate::gods::{Archetype, AutoKind};
+use crate::sim::*;
+use glam::Vec3;
+
+impl Game {
+    pub fn tick(&mut self, dt: f32) {
+        if self.over.is_some() {
+            return;
+        }
+        self.t += dt;
+
+        // 1. minion waves
+        if self.t >= self.next_wave_t {
+            self.next_wave_t = self.t + WAVE_INTERVAL;
+            for lane in LANES {
+                for team in [Team::Blue, Team::Red] {
+                    self.spawn_wave(lane, team);
+                }
+            }
+        }
+
+        // 2. AI decisions
+        let n = self.gods.len();
+        for i in 0..n {
+            if self.gods[i].respawn_t > 0.0 {
+                continue;
+            }
+            if self.gods[i].ai.is_some() {
+                crate::ai::think(self, i);
+            }
+        }
+
+        // 3. cast queue (player requests + AI requests)
+        let queue = std::mem::take(&mut self.cast_queue);
+        for (gi, slot, aim) in queue {
+            self.cast(gi, slot, aim);
+        }
+
+        // 4. movement
+        self.move_gods(dt);
+        self.move_minions(dt);
+
+        // 5. auto-attacks
+        self.god_autoattacks(dt);
+        self.minion_attacks(dt);
+        self.tower_attacks(dt);
+        self.titan_attacks(dt);
+
+        // 6. projectiles + zones
+        self.projectiles_tick(dt);
+        self.zones_tick(dt);
+
+        // 6b. sky + map events (weather.rs / map_events.rs)
+        self.atmosphere_tick(dt);
+        // 6c. the living jungle: heal trees + prey (wild.rs)
+        self.wild_tick(dt);
+
+        // 7. regen / timers
+        self.timers_tick(dt);
+    }
+
+    fn spawn_wave(&mut self, lane: Lane, team: Team) {
+        let path = lane.path_for(team);
+        let scale = 1.0 + (self.t / 60.0).min(15.0) * 0.07;
+        let hp = MINION_HP * scale;
+        let offs = [[0.0f32, 0.0], [1.6, 0.4], [0.8, -1.4]];
+        for k in 0..WAVE_MELEE {
+            let _ = k;
+            let o = offs[k % 3];
+            self.minions.push(Minion {
+                team,
+                lane,
+                caster: false,
+                pos: path[0] + Vec3::new(o[0], 0.0, o[1]),
+                hp,
+                max_hp: hp,
+                atk_timer: 0.0,
+                atk_anim: 0.0,
+                walk_anim: self.rng.f32() * 6.0,
+                wp: 1.min(path.len() - 1),
+                last_hit: None,
+                yaw: 0.0,
+            });
+        }
+        let o = offs[2];
+        self.minions.push(Minion {
+            team,
+            lane,
+            caster: true,
+            pos: path[0] + Vec3::new(o[0] + 1.0, 0.0, o[1]),
+            hp,
+            max_hp: hp,
+            atk_timer: 0.0,
+            atk_anim: 0.0,
+            walk_anim: self.rng.f32() * 6.0,
+            wp: 1.min(path.len() - 1),
+            last_hit: None,
+            yaw: 0.0,
+        });
+    }
+
+    // --- movement ---------------------------------------------------------------
+
+    fn move_gods(&mut self, dt: f32) {
+        for i in 0..self.gods.len() {
+            if self.gods[i].respawn_t > 0.0 {
+                continue;
+            }
+            let speed = self.move_speed(i);
+            let dir = self.gods[i].move_dir;
+            let yaw_cur = self.gods[i].yaw;
+            let g = &mut self.gods[i];
+            // dash overrides
+            if let Some(d) = &mut g.dash {
+                d.t += dt;
+                let a = (d.t / d.dur).min(1.0);
+                g.pos = d.from.lerp(d.to, a) + Vec3::Y * (a * (1.0 - a) * 4.0 * 0.35);
+                if a >= 1.0 {
+                    g.pos = d.to;
+                    g.dash = None;
+                }
+                g.walk_anim += dt * 12.0;
+            } else if dir.length_squared() > 0.0001 {
+                g.pos += dir.normalize() * speed * dt;
+                let want = dir.z.atan2(dir.x);
+                let mut d = want - yaw_cur;
+                while d > std::f32::consts::PI {
+                    d -= std::f32::consts::TAU;
+                }
+                while d < -std::f32::consts::PI {
+                    d += std::f32::consts::TAU;
+                }
+                g.yaw = yaw_cur + d * (dt * 14.0).min(1.0);
+                g.walk_anim += dt * 9.0;
+            } else {
+                g.walk_anim += dt * 1.5;
+            }
+            // arena bounds
+            let r = Vec3::new(g.pos.x, 0.0, g.pos.z).length();
+            if r > ARENA_RADIUS - 2.0 {
+                let s = (ARENA_RADIUS - 2.0) / r;
+                g.pos.x *= s;
+                g.pos.z *= s;
+            }
+        }
+        // separation
+        for a in 0..self.gods.len() {
+            for b in (a + 1)..self.gods.len() {
+                let (pa, pb) = (self.gods[a].pos, self.gods[b].pos);
+                let d = Vec3::new(pb.x - pa.x, 0.0, pb.z - pa.z);
+                let dist = d.length();
+                if dist < 1.1 && dist > 0.0001 {
+                    let push = d.normalize() * (1.1 - dist) * 0.5;
+                    self.gods[a].pos -= push;
+                    self.gods[b].pos += push;
+                }
+            }
+        }
+    }
+
+    fn move_minions(&mut self, dt: f32) {
+        for mi in 0..self.minions.len() {
+            // engage scan (immutable first)
+            let (mteam, mpos, mwp, mlane) = {
+                let m = &self.minions[mi];
+                (m.team, m.pos, m.wp, m.lane)
+            };
+            let mut engaged = false;
+            for gi in 0..self.gods.len() {
+                let g = &self.gods[gi];
+                if g.team != mteam && g.respawn_t <= 0.0 && g.pos.distance(mpos) < 5.5 {
+                    engaged = true;
+                    break;
+                }
+            }
+            if !engaged && self.enemy_in_minion_range(mi, 5.0).is_some() {
+                engaged = true;
+            }
+            let m = &mut self.minions[mi];
+            if !engaged {
+                let path = crate::consts::lane_path(mlane, mteam);
+                let target = path[mwp.min(path.len() - 1)];
+                let d = Vec3::new(target.x - m.pos.x, 0.0, target.z - m.pos.z);
+                if d.length() < 1.5 && m.wp + 1 < path.len() {
+                    m.wp += 1;
+                } else if d.length_squared() > 0.001 {
+                    let step = 7.4 * dt;
+                    m.pos += d.normalize() * step;
+                    m.yaw = d.z.atan2(d.x);
+                    m.walk_anim += dt * 10.0;
+                }
+            } else {
+                m.walk_anim += dt * 2.0;
+            }
+        }
+        // minion separation (cheap: sample pairs)
+        for a in 0..self.minions.len() {
+            for b in (a + 1)..self.minions.len().min(a + 14) {
+                let (pa, pb) = (self.minions[a].pos, self.minions[b].pos);
+                let d = Vec3::new(pb.x - pa.x, 0.0, pb.z - pa.z);
+                let dist = d.length();
+                if dist < 0.85 && dist > 0.0001 {
+                    let push = d.normalize() * (0.85 - dist) * 0.4;
+                    self.minions[a].pos -= push;
+                    self.minions[b].pos += push;
+                }
+            }
+        }
+    }
+
+    fn enemy_in_minion_range(&self, mi: usize, range: f32) -> Option<TargetRef> {
+        let m = &self.minions[mi];
+        let mut best: Option<TargetRef> = None;
+        let mut bd = range;
+        for (ti, tw) in self.towers.iter().enumerate() {
+            if tw.team != m.team {
+                let d = tw.pos.distance(m.pos);
+                if d < bd {
+                    bd = d;
+                    best = Some(TargetRef::Tower(ti));
+                }
+            }
+        }
+        let et = m.team.other();
+        let tp = &self.titans[et as usize];
+        if tp.hp > 0.0 && !self.titan_shielded(et) && tp.pos.distance(m.pos) < range + 2.0 {
+            best = Some(TargetRef::Titan(et));
+        }
+        best
+    }
+
+    // --- auto attacks -------------------------------------------------------------
+
+    fn god_autoattacks(&mut self, dt: f32) {
+        for i in 0..self.gods.len() {
+            if self.gods[i].respawn_t > 0.0 {
+                continue;
+            }
+            let wants = self.gods[i].attack_held || self.gods[i].ai.is_some();
+            if !wants {
+                self.gods[i].atk_timer = (self.gods[i].atk_timer - dt).max(0.0);
+                self.gods[i].atk_anim = (self.gods[i].atk_anim - dt * 4.0).max(0.0);
+                continue;
+            }
+            // acquire target: nearest enemy god > minion > tower in range
+            let g = &self.gods[i];
+            let def = self.def(i);
+            let range = def.auto_range;
+            let mut target: Option<TargetRef> = None;
+            let mut bd = range;
+            for j in 0..self.gods.len() {
+                let e = &self.gods[j];
+                if e.team != g.team && e.respawn_t <= 0.0 {
+                    let d = e.pos.distance(g.pos);
+                    if d < bd {
+                        bd = d;
+                        target = Some(TargetRef::God(j));
+                    }
+                }
+            }
+            if target.is_none() {
+                let mut bd2 = range + 0.5;
+                for (mi, m) in self.minions.iter().enumerate() {
+                    if m.team != g.team {
+                        let d = m.pos.distance(g.pos);
+                        if d < bd2 {
+                            bd2 = d;
+                            target = Some(TargetRef::Minion(mi));
+                        }
+                    }
+                }
+            }
+            if target.is_none() {
+                for (ti, tw) in self.towers.iter().enumerate() {
+                    if tw.team != g.team {
+                        let d = tw.pos.distance(g.pos);
+                        if d < range + 2.0 {
+                            target = Some(TargetRef::Tower(ti));
+                            break;
+                        }
+                    }
+                }
+            }
+            // timers
+            let atk_timer_next = self.gods[i].atk_timer - dt;
+            if atk_timer_next > 0.0 || target.is_none() {
+                let g = &mut self.gods[i];
+                g.atk_timer = atk_timer_next.max(0.0);
+                g.atk_anim = (g.atk_anim - dt * 4.0).max(0.0);
+                continue;
+            }
+            // fire!
+            let interval = self.auto_interval(i);
+            let dmg = self.auto_damage(i);
+            let (pen_pct, pen_flat) = (self.gods[i].pen_pct, self.gods[i].pen_flat);
+            let team = self.gods[i].team;
+            let from = self.gods[i].pos + Vec3::Y * 1.4;
+            let g = &mut self.gods[i];
+            g.atk_timer = interval;
+            g.atk_anim = 1.0;
+            match def.auto {
+                AutoKind::Melee => {
+                    let to = self.target_pos(target.unwrap());
+                    let dir = (to - from).normalize_or_zero();
+                    self.events.push(Event::DashFx { pos: from + dir * 1.2, dir, color: team.rgb() });
+                    self.deal_damage(target.unwrap(), dmg, def.dmg_type == crate::gods::DmgType::Magical, Some(i), pen_pct, pen_flat);
+                }
+                AutoKind::Ranged => {
+                    let to = self.target_pos(target.unwrap());
+                    let dir = (to - from).normalize_or_zero();
+                    let speed = 42.0;
+                    self.projectiles.push(Projectile {
+                        team,
+                        pos: from,
+                        vel: dir * speed,
+                        dmg,
+                        radius: 0.55,
+                        life: 2.2,
+                        kind: ProjKind::Arrow,
+                        owner: i,
+                        pen_pct,
+                        pen_flat,
+                        color: team.rgb(),
+                    });
+                }
+            }
+        }
+    }
+
+    pub fn target_pos(&self, t: TargetRef) -> Vec3 {
+        match t {
+            TargetRef::God(i) => self.gods[i].pos,
+            TargetRef::Minion(i) => self.minions[i].pos,
+            TargetRef::Tower(i) => self.towers[i].pos,
+            TargetRef::Titan(team) => self.titans[team as usize].pos,
+        }
+    }
+
+    fn minion_attacks(&mut self, dt: f32) {
+        let n = self.minions.len();
+        for mi in 0..n {
+            if mi >= self.minions.len() {
+                break; // earlier kill shifted indices
+            }
+            let m = &self.minions[mi];
+            // target: nearest enemy god/minion in range
+            let range = if m.caster { MINION_RANGE_CASTER } else { MINION_RANGE_MELEE + 0.4 };
+            let mut target: Option<TargetRef> = None;
+            let mut bd = range;
+            for gi in 0..self.gods.len() {
+                let g = &self.gods[gi];
+                if g.team != m.team && g.respawn_t <= 0.0 {
+                    let d = g.pos.distance(m.pos);
+                    if d < bd {
+                        bd = d;
+                        target = Some(TargetRef::God(gi));
+                    }
+                }
+            }
+            if target.is_none() {
+                for om in 0..self.minions.len() {
+                    let e = &self.minions[om];
+                    if e.team != m.team {
+                        let d = e.pos.distance(m.pos);
+                        if d < bd {
+                            bd = d;
+                            target = Some(TargetRef::Minion(om));
+                        }
+                    }
+                }
+            }
+            // towers block path — attack them while marching
+            if target.is_none() {
+                let twr = if m.caster { range } else { range + 1.0 };
+                for ti in 0..self.towers.len() {
+                    let tw = &self.towers[ti];
+                    if tw.team != m.team && tw.pos.distance(m.pos) < twr {
+                        target = Some(TargetRef::Tower(ti));
+                        break;
+                    }
+                }
+            }
+            // vulnerable titan in reach
+            if target.is_none() {
+                let et = m.team.other();
+                let tp = &self.titans[et as usize];
+                if tp.hp > 0.0 && !self.titan_shielded(et) && tp.pos.distance(m.pos) < range + 2.5 {
+                    target = Some(TargetRef::Titan(et));
+                }
+            }
+            let m = &mut self.minions[mi];
+            m.atk_timer -= dt;
+            m.atk_anim = (m.atk_anim - dt * 4.0).max(0.0);
+            if m.atk_timer > 0.0 || target.is_none() {
+                continue;
+            }
+            m.atk_timer = MINION_ATK_CD;
+            m.atk_anim = 1.0;
+            let mut dmg = if m.caster { MINION_CASTER_DMG } else { MINION_DMG };
+            dmg *= 1.0 + (self.t / 60.0).min(15.0) * 0.08;
+            // structures take bonus minion damage so lanes actually fall
+            if matches!(target.unwrap(), TargetRef::Tower(_) | TargetRef::Titan(_)) {
+                dmg *= 2.4;
+            }
+            let magic = m.caster;
+            let _ = magic;
+            match target.unwrap() {
+                TargetRef::God(gi) => {
+                    if m.caster {
+                        self.spawn_minion_bolt(mi, TargetRef::God(gi));
+                    } else {
+                        self.deal_damage(TargetRef::God(gi), dmg, false, None, 0.0, 0.0);
+                    }
+                }
+                TargetRef::Minion(oi) => {
+                    if m.caster {
+                        self.spawn_minion_bolt(mi, TargetRef::Minion(oi));
+                    } else {
+                        self.deal_damage(TargetRef::Minion(oi), dmg, false, None, 0.0, 0.0);
+                    }
+                }
+                TargetRef::Tower(ti) => self.deal_damage(TargetRef::Tower(ti), dmg, false, None, 0.0, 0.0),
+                TargetRef::Titan(team) => self.deal_damage(TargetRef::Titan(team), dmg, false, None, 0.0, 0.0),
+            }
+        }
+    }
+
+    fn spawn_minion_bolt(&mut self, mi: usize, target: TargetRef) {
+        let (pos, team) = (self.minions[mi].pos + Vec3::Y * 1.0, self.minions[mi].team);
+        let to = self.target_pos(target) + Vec3::Y * 1.0;
+        let dir = (to - pos).normalize_or_zero();
+        let dmg = MINION_CASTER_DMG * (1.0 + (self.t / 60.0).min(15.0) * 0.08);
+        self.projectiles.push(Projectile {
+            team,
+            pos,
+            vel: dir * 26.0,
+            dmg,
+            radius: 0.5,
+            life: 1.6,
+            kind: ProjKind::Bolt,
+            owner: usize::MAX,
+            pen_pct: 0.0,
+            pen_flat: 0.0,
+            color: team.rgb(),
+        });
+    }
+
+    fn tower_attacks(&mut self, dt: f32) {
+        let n = self.towers.len();
+        for ti in 0..n {
+            let tw = &self.towers[ti];
+            if tw.hp <= 0.0 {
+                continue;
+            }
+            // target: minions first, then gods
+            let mut target: Option<TargetRef> = None;
+            let mut bd = TOWER_RANGE;
+            for (mi, m) in self.minions.iter().enumerate() {
+                if m.team != tw.team {
+                    let d = m.pos.distance(tw.pos);
+                    if d < bd {
+                        bd = d;
+                        target = Some(TargetRef::Minion(mi));
+                    }
+                }
+            }
+            if target.is_none() {
+                let mut bd2 = TOWER_RANGE;
+                for gi in 0..self.gods.len() {
+                    let g = &self.gods[gi];
+                    if g.team != tw.team && g.respawn_t <= 0.0 {
+                        let d = g.pos.distance(tw.pos);
+                        if d < bd2 {
+                            bd2 = d;
+                            target = Some(TargetRef::God(gi));
+                        }
+                    }
+                }
+                // ramp reset when switching to minions
+                let tw = &mut self.towers[ti];
+                if tw.last_target.map_or(false, |t| matches!(t, TargetRef::Minion(_))) {
+                    tw.ramp = 0;
+                }
+            }
+            // timers
+            let atk_timer_next = self.towers[ti].atk_timer - dt;
+            let fire_anim_next = (self.towers[ti].fire_anim - dt * 3.0).max(0.0);
+            if atk_timer_next > 0.0 || target.is_none() {
+                let tw = &mut self.towers[ti];
+                tw.atk_timer = atk_timer_next.max(0.0);
+                tw.fire_anim = fire_anim_next;
+                continue;
+            }
+            // fire!
+            let last_target = self.towers[ti].last_target;
+            let cur_ramp = self.towers[ti].ramp;
+            let is_god = matches!(target.unwrap(), TargetRef::God(_));
+            let new_ramp = if is_god && last_target == target {
+                (cur_ramp + 1).min(3)
+            } else if is_god {
+                cur_ramp
+            } else {
+                0
+            };
+            let dmg = TOWER_DMG * TOWER_RAMP.powi(new_ramp as i32);
+            let from = self.towers[ti].pos + Vec3::Y * 5.2;
+            let to = self.target_pos(target.unwrap()) + Vec3::Y * 1.0;
+            let dir = (to - from).normalize_or_zero();
+            let tteam = self.towers[ti].team;
+            let tw = &mut self.towers[ti];
+            tw.atk_timer = TOWER_ATK_CD;
+            tw.fire_anim = 1.0;
+            tw.ramp = new_ramp;
+            tw.last_target = target;
+            self.projectiles.push(Projectile {
+                team: tteam,
+                pos: from,
+                vel: dir * 34.0,
+                dmg,
+                radius: 0.7,
+                life: 2.0,
+                kind: ProjKind::Bolt,
+                owner: usize::MAX,
+                pen_pct: 0.0,
+                pen_flat: 0.0,
+                color: tw.team.rgb(),
+            });
+        }
+    }
+
+    fn titan_attacks(&mut self, dt: f32) {
+        for t in 0..2 {
+            let titan = self.titans[t];
+            if titan.hp <= 0.0 {
+                continue;
+            }
+            let team = titan.team;
+            let mut target: Option<TargetRef> = None;
+            let mut bd = TITAN_RANGE;
+            for gi in 0..self.gods.len() {
+                let g = &self.gods[gi];
+                if g.team != team && g.respawn_t <= 0.0 {
+                    let d = g.pos.distance(titan.pos);
+                    if d < bd {
+                        bd = d;
+                        target = Some(TargetRef::God(gi));
+                    }
+                }
+            }
+            if target.is_none() {
+                for mi in 0..self.minions.len() {
+                    let m = &self.minions[mi];
+                    if m.team != team {
+                        let d = m.pos.distance(titan.pos);
+                        if d < bd {
+                            bd = d;
+                            target = Some(TargetRef::Minion(mi));
+                        }
+                    }
+                }
+            }
+            let timer_next = self.titans[t].atk_timer - dt;
+            let anim_next = (self.titans[t].atk_anim - dt * 3.0).max(0.0);
+            if timer_next > 0.0 || target.is_none() {
+                let titan = &mut self.titans[t];
+                titan.atk_timer = timer_next.max(0.0);
+                titan.atk_anim = anim_next;
+                continue;
+            }
+            let tpos = self.titans[t].pos;
+            let tteam = self.titans[t].team;
+            {
+                let titan = &mut self.titans[t];
+                titan.atk_timer = TITAN_ATK_CD;
+                titan.atk_anim = 1.0;
+            }
+            self.deal_damage(target.unwrap(), TITAN_DMG, false, None, 0.0, 0.0);
+            self.events.push(Event::NovaFx { pos: tpos + Vec3::Y * 1.0, radius: 3.0, color: tteam.rgb() });
+        }
+    }
+
+    // --- projectiles ----------------------------------------------------------------
+
+    fn projectiles_tick(&mut self, dt: f32) {
+        let mut dead = vec![false; self.projectiles.len()];
+        for pi in 0..self.projectiles.len() {
+            let p = &mut self.projectiles[pi];
+            match p.kind {
+                ProjKind::Lob { start, target, t, dur, radius } => {
+                    p.life -= dt;
+                    let nt = (t + dt / dur).min(1.0);
+                    let height = nt * (1.0 - nt) * 4.5;
+                    p.pos = start.lerp(target, nt) + Vec3::Y * height;
+                    if nt >= 1.0 || p.life <= 0.0 {
+                        // detonate
+                        dead[pi] = true;
+                        let team = p.team;
+                        let (dmg, pen_pct, pen_flat, owner) = (p.dmg, p.pen_pct, p.pen_flat, p.owner);
+                        self.events.push(Event::Explosion { pos: Vec3::new(target.x, 0.3, target.z), radius, color: p.color });
+                        self.aoe_damage(Vec3::new(target.x, 0.0, target.z), radius, team, dmg, owner, pen_pct, pen_flat);
+                    }
+                    continue;
+                }
+                _ => {
+                    p.pos += p.vel * dt;
+                    p.life -= dt;
+                    if p.life <= 0.0 || p.pos.y < -0.5 || Vec3::new(p.pos.x, 0.0, p.pos.z).length() > ARENA_RADIUS + 4.0 {
+                        dead[pi] = true;
+                        continue;
+                    }
+                }
+            }
+            // collision: enemy units within radius+0.6
+            let p = &self.projectiles[pi];
+            let mut hit: Option<TargetRef> = None;
+            for gi in 0..self.gods.len() {
+                let g = &self.gods[gi];
+                if g.team != p.team && g.respawn_t <= 0.0 {
+                    let c = g.pos + Vec3::Y * 1.1;
+                    if (c - p.pos).length() < p.radius + 0.85 {
+                        hit = Some(TargetRef::God(gi));
+                        break;
+                    }
+                }
+            }
+            if hit.is_none() {
+                for mi in 0..self.minions.len() {
+                    let m = &self.minions[mi];
+                    if m.team != p.team {
+                        let c = m.pos + Vec3::Y * 0.7;
+                        if (c - p.pos).length() < p.radius + 0.6 {
+                            hit = Some(TargetRef::Minion(mi));
+                            break;
+                        }
+                    }
+                }
+            }
+            if hit.is_none() {
+                for ti in 0..self.towers.len() {
+                    let tw = &self.towers[ti];
+                    if tw.team != p.team {
+                        let c = tw.pos + Vec3::Y * 2.5;
+                        if (c - p.pos).length() < p.radius + 1.6 {
+                            hit = Some(TargetRef::Tower(ti));
+                            break;
+                        }
+                    }
+                }
+            }
+            if hit.is_none() {
+                for t in 0..2 {
+                    let tt = &self.titans[t];
+                    if tt.team != p.team {
+                        let c = tt.pos + Vec3::Y * 2.5;
+                        if (c - p.pos).length() < p.radius + 2.2 {
+                            hit = Some(TargetRef::Titan(tt.team));
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(h) = hit {
+                let (pdmg, ppen, ppf, powner, ppos, pcolor) = {
+                    let p = &self.projectiles[pi];
+                    (p.dmg, p.pen_pct, p.pen_flat, p.owner, p.pos, p.color)
+                };
+                let owner = if powner == usize::MAX { None } else { Some(powner) };
+                self.deal_damage(h, pdmg, false, owner, ppen, ppf);
+                self.events.push(Event::Explosion { pos: ppos, radius: 0.9, color: pcolor });
+                dead[pi] = true;
+            }
+        }
+        let mut i = 0;
+        self.projectiles.retain(|_| {
+            let keep = !dead[i];
+            i += 1;
+            keep
+        });
+    }
+
+    pub fn aoe_damage(&mut self, center: Vec3, radius: f32, team: Team, dmg: f32, owner: usize, pen_pct: f32, pen_flat: f32) {
+        let mut hits: Vec<TargetRef> = Vec::new();
+        for gi in 0..self.gods.len() {
+            let g = &self.gods[gi];
+            if g.team != team && g.respawn_t <= 0.0 && g.pos.distance(center) <= radius + 0.7 {
+                hits.push(TargetRef::God(gi));
+            }
+        }
+        for mi in 0..self.minions.len() {
+            let m = &self.minions[mi];
+            if m.team != team && m.pos.distance(center) <= radius + 0.4 {
+                hits.push(TargetRef::Minion(mi));
+            }
+        }
+        for ti in 0..self.towers.len() {
+            let tw = &self.towers[ti];
+            if tw.team != team && tw.pos.distance(center) <= radius + 1.5 {
+                hits.push(TargetRef::Tower(ti));
+            }
+        }
+        for t in 0..2 {
+            let tt = &self.titans[t];
+            if tt.team != team && tt.pos.distance(center) <= radius + 2.5 {
+                hits.push(TargetRef::Titan(tt.team));
+            }
+        }
+        for h in hits {
+            self.deal_damage(h, dmg, true, if owner == usize::MAX { None } else { Some(owner) }, pen_pct, pen_flat);
+        }
+    }
+
+    // --- zones ------------------------------------------------------------------
+
+    fn zones_tick(&mut self, dt: f32) {
+        let mut i = 0;
+        while i < self.zones.len() {
+            // snapshot (no outstanding borrows)
+            let (zteam, zpos, zradius, zcolor, kind_id, timer, val, strike, owner) = {
+                let z = &self.zones[i];
+                let (kid, t, v, st) = match &z.kind {
+                    ZoneKind::Storm { until, dps, strike_t, owner: _ } => (0u8, *until, *dps, *strike_t),
+                    ZoneKind::Ring { trigger_t, dmg, .. } => (1u8, *trigger_t, *dmg, 0.0),
+                };
+                let own = match &z.kind {
+                    ZoneKind::Storm { owner, .. } | ZoneKind::Ring { owner, .. } => *owner,
+                };
+                (z.team, z.pos, z.radius, z.color, kid, t, v, st, own)
+            };
+
+            let mut remove = false;
+            let new_timer = timer - dt;
+            if kind_id == 0 {
+                // storm: tick damage + strikes (snapshot targets first —
+                // deal_damage may remove minions and shift indices)
+                let mut targets = Vec::new();
+                for gi in 0..self.gods.len() {
+                    let g = &self.gods[gi];
+                    if g.team != zteam && g.respawn_t <= 0.0 && g.pos.distance(zpos) <= zradius {
+                        targets.push(TargetRef::God(gi));
+                    }
+                }
+                for mi in 0..self.minions.len() {
+                    let m = &self.minions[mi];
+                    if m.team != zteam && m.pos.distance(zpos) <= zradius {
+                        targets.push(TargetRef::Minion(mi));
+                    }
+                }
+                for t in targets {
+                    self.deal_damage(t, val * dt, true, Some(owner), 0.0, 0.0);
+                }
+                let mut strike2 = strike - dt;
+                if strike2 <= 0.0 {
+                    strike2 = 0.45;
+                    let ang = self.rng.f32() * std::f32::consts::TAU;
+                    let r = self.rng.f32() * zradius * 0.8;
+                    let at = zpos + Vec3::new(ang.cos() * r, 0.0, ang.sin() * r);
+                    self.events.push(Event::BoltFx { from: at + Vec3::Y * 9.0, to: at, color: zcolor, thick: 0.35 });
+                    self.aoe_damage(at, 1.8, zteam, val * 0.5, owner, 0.0, 0.0);
+                }
+                if new_timer <= 0.0 {
+                    remove = true;
+                }
+                if let ZoneKind::Storm { until, strike_t, .. } = &mut self.zones[i].kind {
+                    *until = new_timer;
+                    *strike_t = strike2;
+                }
+            } else {
+                // ring: detonate at trigger
+                if new_timer <= 0.0 {
+                    self.events.push(Event::Explosion { pos: zpos, radius: zradius, color: zcolor });
+                    self.aoe_damage(zpos, zradius, zteam, val, owner, 0.0, 0.0);
+                    remove = true;
+                } else if let ZoneKind::Ring { trigger_t, .. } = &mut self.zones[i].kind {
+                    *trigger_t = new_timer;
+                }
+            }
+
+            if remove {
+                self.zones.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        // apply storm slows
+        let storm_zones: Vec<(Team, Vec3, f32)> = self
+            .zones
+            .iter()
+            .filter(|z| matches!(z.kind, ZoneKind::Storm { .. }))
+            .map(|z| (z.team, z.pos, z.radius))
+            .collect();
+        for (zteam, zpos, zradius) in storm_zones {
+            for g in self.gods.iter_mut() {
+                if g.team != zteam && g.pos.distance(zpos) <= zradius {
+                    g.slow = g.slow.max(0.25);
+                    g.slow_t = g.slow_t.max(0.3);
+                }
+            }
+        }
+    }
+
+    // --- timers -------------------------------------------------------------------
+
+    fn timers_tick(&mut self, dt: f32) {
+        for i in 0..self.gods.len() {
+            // precompute respawn spawn (needs &mut rng before borrowing god)
+            let will_respawn = self.gods[i].respawn_t > 0.0 && self.gods[i].respawn_t - dt <= 0.0;
+            let spawn = if will_respawn {
+                let lane = self.gods[i].ai.as_ref().map_or(Lane::Mid, |a| a.lane);
+                Some(Self::spawn_pos(self.gods[i].team, lane, &mut self.rng))
+            } else {
+                None
+            };
+            let was_dead = self.gods[i].respawn_t > 0.0;
+            let last_dmg = self.gods[i].last_dmg_t;
+            let now = self.t;
+
+            {
+                let g = &mut self.gods[i];
+                for c in g.cds.iter_mut() {
+                    *c = (*c - dt).max(0.0);
+                }
+                if g.buff_t > 0.0 {
+                    g.buff_t -= dt;
+                    if g.buff_t <= 0.0 {
+                        g.buff_atkspd = 0.0;
+                        g.buff_ms = 0.0;
+                    }
+                }
+                if g.slow_t > 0.0 {
+                    g.slow_t -= dt;
+                    if g.slow_t <= 0.0 {
+                        g.slow = 0.0;
+                    }
+                }
+                if g.shield_t > 0.0 {
+                    g.shield_t -= dt;
+                    if g.shield_t <= 0.0 {
+                        g.shield = 0.0;
+                    }
+                }
+                g.atk_anim = (g.atk_anim - dt * 4.0).max(0.0);
+
+                if was_dead {
+                    g.respawn_t -= dt;
+                    if g.respawn_t <= 0.0 {
+                        g.pos = spawn.unwrap();
+                        g.hp = g.max_hp;
+                        g.mana = g.max_mana;
+                        g.recent_damagers.clear();
+                    }
+                } else {
+                    // regen
+                    g.mana = (g.mana + (2.6 + 0.5 * g.level as f32) * dt).min(g.max_mana);
+                    if now - last_dmg > 6.0 {
+                        g.hp = (g.hp + g.max_hp * 0.012 * dt).min(g.max_hp);
+                    }
+                    let f = g.team.fountain();
+                    if g.pos.distance(f) < FOUNTAIN_RADIUS {
+                        g.hp = (g.hp + g.max_hp * FOUNTAIN_REGEN * dt * 4.0).min(g.max_hp);
+                        g.mana = (g.mana + g.max_mana * FOUNTAIN_REGEN * dt * 4.0).min(g.max_mana);
+                    }
+                }
+            }
+
+            // fountain damages enemies (after the mutable borrow ends)
+            if !was_dead {
+                let gteam = self.gods[i].team;
+                let f = gteam.fountain();
+                if self.gods[i].pos.distance(f) < FOUNTAIN_RADIUS {
+                    for e in 0..self.gods.len() {
+                        let eg = &self.gods[e];
+                        if eg.team != gteam && eg.respawn_t <= 0.0 && eg.pos.distance(f) < FOUNTAIN_RADIUS {
+                            self.deal_damage(TargetRef::God(e), FOUNTAIN_DPS * dt, false, None, 0.0, 0.0);
+                        }
+                    }
+                }
+            }
+        }
+        // AI auto-buy occasionally
+        for i in 0..self.gods.len() {
+            if self.gods[i].ai.is_some() {
+                let due = {
+                    let b = self.gods[i].ai.as_mut().unwrap();
+                    b.buy_t -= dt;
+                    b.buy_t <= 0.0
+                };
+                if due {
+                    self.gods[i].ai.as_mut().unwrap().buy_t = 2.0;
+                    self.auto_buy(i);
+                }
+            }
+        }
+    }
+}
+
+impl GodUnit {
+    pub fn yaw_toward(&mut self, dir: Vec3, dt: f32) -> f32 {
+        let want = dir.z.atan2(dir.x);
+        let mut d = want - self.yaw;
+        while d > std::f32::consts::PI {
+            d -= std::f32::consts::TAU;
+        }
+        while d < -std::f32::consts::PI {
+            d += std::f32::consts::TAU;
+        }
+        self.yaw + d * (dt * 14.0).min(1.0)
+    }
+}
+
+/// Convenience for renderer: archetype color of an ability.
+pub fn ability_color(def: &crate::gods::GodDef, slot: u32) -> [f32; 3] {
+    def.abilities[slot as usize].color
+}
+
+/// Re-export for headless harness.
+pub use crate::gods::Archetype as ArchT;
+pub type ArchAlias = Archetype;
