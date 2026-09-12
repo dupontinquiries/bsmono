@@ -58,6 +58,13 @@ pub mod helix;
 /// ("`Selection` is already value-based; becomes `Vec<Selection>` + edit
 /// fan-out with offset fixup"). The work was done; nothing reached it.
 pub mod multicursor;
+/// One graph over every query source: stable ids for places, edges that
+/// remember the callsite and who claimed them. The layer buckets, saved
+/// navigation paths and the depth horizon all read from.
+pub mod entity;
+/// Where you came from, as the EDGES you travelled rather than the places
+/// you landed — so going back is unambiguous when two routes converge.
+pub mod nav;
 /// Ordered packs of places in the codebase, with an attention horizon —
 /// the working unit above a file and below the whole tree. Stored as git
 /// refs (`gitspace::GitStore`) or plain files, and resolved by SYMBOL
