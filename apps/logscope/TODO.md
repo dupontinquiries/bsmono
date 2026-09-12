@@ -3263,8 +3263,13 @@ above it.
 `ui` (2,236) followed it into `chat_draw.rs`. chat.rs is 5,504 lines.
 
 Still to do, in size order:
-- [ ] Decompose `spatial_ui` — the scene, the drop ingest, the panels and the transcript are
-      four things in one function.
+- [ ] Decompose `spatial_ui`. MEASURED: one anonymous block — the 3D mesh layer — is 1,939 of
+      its 2,707 lines, 72%. That single block is the job; the other 41 top-level blocks are
+      small. It reads dozens of locals declared above it, so this is NOT a scripted move: the
+      compiler can prove a whole-method move and cannot prove that a block lifted from the
+      middle did not depend on something three hundred lines up. It wants reading. The next
+      two candidates are much easier — a 212-line fly-through block and a 97-line one, with a
+      handful of enclosing locals each.
 - [ ] Decompose `ui` — chrome, transcript, composer, right page.
 - [ ] `run_command` (712).
 
@@ -3313,11 +3318,13 @@ the kit, so every app gets them) `cross_fade`, `stagger`, `dropdown_in`, `flash_
 - [ ] `apply` on reload is still unwired; the panel section draws but changes need a
       settings-kit store to persist.
 
-### The uiverify / menu_ui disagreement
-- [ ] `bleed_through` reports 100% of `menu_ui`'s ink bounds changing with the background,
-      while `menu_ui` draws through `egui::Frame::popup`, which should occlude. Either the
-      popup frame is not opaque in this style or the rasteriser mishandles the `Area`'s
-      layer. The two-pixel probe that settles it is described in `uikit-egui/src/menu.rs`.
+### The uiverify / menu_ui disagreement — RESOLVED
+Neither was wrong; my REGION was. The probe says a pixel in the middle of the panel is
+`#E6E6E9` over black and over magenta, so the frame is opaque and the rasteriser sees it. The
+100% came from deriving the region from the ink BOUNDS, which include the popup's shadow —
+`bleed_through` then insets from the shadow's edge rather than the panel's and samples mostly
+shadow-over-background. `menu.rs` keeps the story, because a shadow is exactly what makes
+"the widget's bounds" and "the widget's opaque area" different rectangles.
 
 ### UX audit loop
 `uxloop` is built (stable finding ids, fixed/introduced diff, a baseline in the state dir).

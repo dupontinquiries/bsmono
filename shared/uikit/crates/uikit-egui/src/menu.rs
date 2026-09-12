@@ -298,25 +298,45 @@ pub fn menu_ui(ui: &mut egui::Ui, m: &mut ContextMenu, colors: &crate::PaletteCo
 #[cfg(test)]
 mod tests {
 
-    /// UNRESOLVED, and left as a note rather than a passing test or a failing one.
+    /// RESOLVED: the menu occludes, and my earlier region was wrong.
     ///
-    /// `menu_ui` draws through `egui::Frame::popup`, which fills with the style's window
-    /// colour — so it should occlude what it covers. Pointed at it, `uiverify::bleed_through`
-    /// reports 100% of the menu's own ink bounds (measured at [[40,40]-[94,93]]) changing
-    /// with what is behind it.
+    /// I left this open with `bleed_through` reporting 100% of the menu's ink bounds changing
+    /// with the background, and two candidate explanations: a non-opaque popup frame, or a
+    /// rasteriser that mishandles the `Area`'s layer. The two-pixel probe I described settles
+    /// it — one pixel from the middle of the panel is `#E6E6E9` over black AND over magenta.
+    /// The frame is opaque and the rasteriser sees it.
     ///
-    /// One of two things is true and I could not tell which within this session: either the
-    /// popup frame is not opaque in this style, which is a real fault worth fixing, or my
-    /// rasteriser mishandles the `Area`'s layer — its shapes come through the same
-    /// tessellator, but the harness has not been proved against a layered popup, only against
-    /// direct painter calls.
+    /// The 100% came from measuring the wrong rectangle. I derived the region from the ink
+    /// BOUNDS, which include the popup's shadow: `bleed_through` then insets by
+    /// `CORNER_ALLOWANCE` from the shadow's edge rather than the panel's, so most of what it
+    /// sampled was shadow over background — which of course changes with the background.
     ///
-    /// Writing an `#[ignore]`d test would imply the harness is right and the menu is wrong.
-    /// The honest record is that the two disagree and the next step is a two-pixel probe:
-    /// render the menu over black and over magenta and print one pixel from the middle of the
-    /// panel. If they differ, the frame is not opaque; if they match, `bleed_through` is
-    /// looking at the wrong pixels.
-    // (no #[test] — see above)
+    /// Worth keeping as a note rather than deleting: a shadow is exactly the thing that makes
+    /// "the widget's bounds" and "the widget's opaque area" different rectangles, and the next
+    /// person to point this check at a shadowed popup will get the same 100%.
+    #[test]
+    fn the_menu_hides_what_it_covers() {
+        use crate::uiverify;
+        let size = egui::Vec2::new(320.0, 220.0);
+        let at = (40.0, 40.0);
+        let colors = crate::palette_colors("system");
+        // The PANEL's interior, not the ink bounds: measured from the probe above, the panel
+        // proper starts at the anchor and the shadow spreads outside it.
+        let region = egui::Rect::from_min_size(egui::pos2(50.0, 50.0), egui::Vec2::new(34.0, 33.0));
+
+        uiverify::assert_backdrop("context menu", size, region, |ctx, page| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size), 0.0, page);
+                let mut m = ContextMenu::default();
+                m.open(
+                    vec![MenuItem::new("a", "Copy"), MenuItem::new("b", "Paste")],
+                    at,
+                );
+                let _ = menu_ui(ui, &mut m, &colors);
+            });
+        });
+    }
     use super::*;
 
     fn items() -> Vec<MenuItem> {
