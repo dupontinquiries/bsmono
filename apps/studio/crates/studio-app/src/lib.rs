@@ -4083,8 +4083,11 @@ impl eframe::App for App {
                         let alive = match t {
                             studio_core::AutoTarget::TrackGain(id) =>
                                 p.tracks.iter().any(|tr| tr.id == id),
-                            studio_core::AutoTarget::BusGain(id) =>
+                            studio_core::AutoTarget::BusGain(id)
+                            | studio_core::AutoTarget::BusParam { bus: id, .. } =>
                                 p.busses.contains_key(&id),
+                            studio_core::AutoTarget::ClipParam { clip, .. } =>
+                                p.clips.contains_key(&clip),
                         };
                         if !alive { self.studio.auto_target = None; }
                     }
@@ -4143,6 +4146,21 @@ impl eframe::App for App {
                             studio_core::AutoTarget::BusGain(id) =>
                                 p.busses.get(&id).map(|x| format!("bus {}", x.name))
                                     .unwrap_or_else(|| "?".into()),
+                            // "bus verb · reverb · mix" — the effect by
+                            // kind, since a chain index means nothing
+                            // on screen; "(gone)" when the chain no
+                            // longer reaches that far.
+                            studio_core::AutoTarget::BusParam { bus, effect, key } => {
+                                let b = p.busses.get(&bus);
+                                let kind = b.and_then(|b| b.chain.get(effect as usize))
+                                    .map(|e| e.kind.clone()).unwrap_or_else(|| "(gone)".into());
+                                format!("bus {} · {kind} · {key}", b.map(|b| b.name.as_str()).unwrap_or("?"))
+                            }
+                            studio_core::AutoTarget::ClipParam { clip, effect, key } => {
+                                let kind = p.clips.get(&clip).and_then(|c| c.effects.get(effect as usize))
+                                    .map(|e| e.kind.clone()).unwrap_or_else(|| "(gone)".into());
+                                format!("clip {} · {kind} · {key}", clip.0)
+                            }
                         };
                         let gate_name = |g: studio_core::Gate| match g {
                             studio_core::Gate::Always => "always".to_string(),

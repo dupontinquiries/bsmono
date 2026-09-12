@@ -31,7 +31,7 @@
 //! can be receiving live edits while the catch-up is still arriving.
 
 use crate::{Presence, RackSync, SiteId, Stamp, StampedOp};
-use studio_core::{AutoTarget, Binding, BindingId, Bus, BusId, Clip, ClipId, CurveId, Effect, Gate, GroupId, Op, Send, Source, SourceId, Ticks, Track, TrackId, TrackKind};
+use studio_core::{AutoTarget, Binding, BindingId, Bus, BusId, Clip, ClipId, CurveId, Effect, Gate, GroupId, Op, ParamKey, Send, Source, SourceId, Ticks, Track, TrackId, TrackKind};
 use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 
 /// Bumped whenever the encoding changes shape. A peer that sees a version it
@@ -267,12 +267,36 @@ fn put_auto_target(o: &mut Vec<u8>, t: AutoTarget) {
     match t {
         AutoTarget::TrackGain(id) => { put_u8(o, 0); put_u64(o, id.0); }
         AutoTarget::BusGain(id) => { put_u8(o, 1); put_u64(o, id.0); }
+        // The parameter targets: id, effect index, then the key's 16
+        // fixed bytes as they are — no length prefix, the pad is the
+        // encoding. Kinds 2 and 3 do not bump WIRE_VERSION: a v15 peer
+        // already refuses an unknown target kind (the arm below), and a
+        // bump would refuse every v15 save file for a target most
+        // projects never draw.
+        AutoTarget::BusParam { bus, effect, key } => {
+            put_u8(o, 2); put_u64(o, bus.0); put_u8(o, effect); o.extend_from_slice(&key.0);
+        }
+        AutoTarget::ClipParam { clip, effect, key } => {
+            put_u8(o, 3); put_u64(o, clip.0); put_u8(o, effect); o.extend_from_slice(&key.0);
+        }
     }
 }
 fn get_auto_target(r: &mut R) -> Option<AutoTarget> {
     match r.u8()? {
         0 => Some(AutoTarget::TrackGain(TrackId(r.u64()?))),
         1 => Some(AutoTarget::BusGain(BusId(r.u64()?))),
+        2 => {
+            let bus = BusId(r.u64()?);
+            let effect = r.u8()?;
+            let key = ParamKey(r.take(16)?.try_into().ok()?);
+            Some(AutoTarget::BusParam { bus, effect, key })
+        }
+        3 => {
+            let clip = ClipId(r.u64()?);
+            let effect = r.u8()?;
+            let key = ParamKey(r.take(16)?.try_into().ok()?);
+            Some(AutoTarget::ClipParam { clip, effect, key })
+        }
         _ => None, // an unknown target refuses the packet, like an unknown op
     }
 }
@@ -1086,6 +1110,10 @@ mod tests {
             Op::SetRoute { track: TrackId(2), bus: None },
             Op::RemoveSource { id: SourceId(3) },
             Op::SetTrackGain { id: TrackId(2), gain: 0.7 },
+            Op::SetAutoPoint { target: AutoTarget::BusParam { bus: BusId(1), effect: 2,
+                                   key: ParamKey::new("freq0").unwrap() }, at: Ticks(7), value: 0.25 },
+            Op::RemoveAutoPoint { target: AutoTarget::ClipParam { clip: ClipId(3), effect: 0,
+                                      key: ParamKey::new("preserve_pitch").unwrap() }, at: Ticks(7) },
             Op::SetCurve { id: CurveId(4), name: "filter sweep — ad-lib".into() },
             Op::RemoveCurve { id: CurveId(4) },
             Op::SetCurvePoint { curve: CurveId(4), at: Ticks::from_seconds(0.5), value: 0.0 },
@@ -1452,6 +1480,33 @@ mod group_key_wire_tests {
             let p = Packet::Op(StampedOp { stamp: Stamp { lamport: 4, site: SiteId(1) }, op });
             assert_eq!(Packet::decode(&p.encode()).expect("decodes"), p);
         }
+    }
+
+    #[test]
+    fn a_parameter_target_a_peer_does_not_know_refuses_the_packet_without_a_version_bump() {
+        // Kinds 2 and 3 were added without bumping WIRE_VERSION (see
+        // put_auto_target). The claim that makes that safe: a peer that
+        // does not know a target kind refuses the whole packet, and does
+        // not read the bytes after it as something else. Find the kind
+        // byte by diffing two otherwise-identical packets, then set it to
+        // a kind no build has.
+        let at = |t: AutoTarget| Packet::Op(StampedOp {
+            stamp: Stamp { lamport: 4, site: SiteId(1) },
+            op: Op::SetAutoPoint { target: t, at: Ticks(9), value: 0.5 } }).encode();
+        let a = at(AutoTarget::TrackGain(TrackId(5)));
+        let b = at(AutoTarget::BusGain(BusId(5)));
+        assert_eq!(a.len(), b.len());
+        let kind_at = a.iter().zip(&b).position(|(x, y)| x != y).expect("the kind byte differs");
+        assert_eq!((a[kind_at], b[kind_at]), (0, 1));
+        let mut future = a.clone();
+        future[kind_at] = 9;
+        assert!(Packet::decode(&future).is_none(), "kind 9: refused, not misread");
+        // And the parameter kinds carry their key with no length prefix:
+        // exactly 16 bytes after the index, whatever the key's length.
+        let short = at(AutoTarget::BusParam { bus: BusId(5), effect: 0, key: ParamKey::new("q").unwrap() });
+        let long = at(AutoTarget::BusParam { bus: BusId(5), effect: 0, key: ParamKey::new("preserve_pitch").unwrap() });
+        assert_eq!(short.len(), long.len(), "fixed-shape on the wire");
+        assert_eq!(short.len(), a.len() + 1 + 16, "index byte plus the key's 16");
     }
 }
 

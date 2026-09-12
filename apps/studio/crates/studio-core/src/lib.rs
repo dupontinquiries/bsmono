@@ -327,13 +327,59 @@ pub struct Group {
     pub tempo: Option<TempoMap>,
 }
 
+/// An effect parameter's key, fixed-width so an [`AutoTarget`] stays
+/// `Copy` and an op stays fixed-shape on the wire: up to 16 ASCII bytes,
+/// NUL-padded. Every key `studio-fx`'s schema declares fits (the longest,
+/// `preserve_pitch`, is 14); one that does not is refused at construction
+/// rather than truncated into a different key.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ParamKey(pub [u8; 16]);
+
+impl ParamKey {
+    pub fn new(key: &str) -> Option<ParamKey> {
+        let b = key.as_bytes();
+        if b.is_empty() || b.len() > 16 || !b.iter().all(|c| c.is_ascii() && *c != 0) { return None; }
+        let mut k = [0u8; 16];
+        k[..b.len()].copy_from_slice(b);
+        Some(ParamKey(k))
+    }
+    pub fn as_str(&self) -> &str {
+        let n = self.0.iter().position(|&c| c == 0).unwrap_or(16);
+        std::str::from_utf8(&self.0[..n]).unwrap_or("")
+    }
+}
+
+impl std::fmt::Debug for ParamKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "ParamKey({:?})", self.as_str()) }
+}
+impl std::fmt::Display for ParamKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.as_str()) }
+}
+
 /// What an automation lane drives. Track and bus gain first — the volume
-/// ride is the automation everyone reaches for — with the enum here so a
-/// clip-gain or effect-parameter target is a variant away, not a redesign.
+/// ride is the automation everyone reaches for — and now an effect
+/// parameter on a bus's or a clip's chain, addressed by the effect's
+/// index in that chain and the parameter's key.
+///
+/// A parameter lane follows the fader rule: the value the effect runs
+/// with is `stored × lane × Π(bindings)`, so 1.0 is transparent and a
+/// curve is a ride on top of whatever the knob says — a filter sweep is
+/// a cutoff at 1 kHz and a curve from 0.1 to 8. The render applies it at
+/// control rate (a block of frames, not each sample) through
+/// `studio_fx::Instance::set_param`, which changes only what an effect
+/// can change without losing its state; a key it cannot move live is
+/// ignored, and the schema says which those are.
+///
+/// The index, not an effect id: effects have none — a chain is a Vec and
+/// `SetBusChain` replaces it whole — so a lane on `effect: 1` follows
+/// whatever sits second. Reordering the chain moves the ride, the same
+/// way deleting a clip leaves a binding dangling and harmless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AutoTarget {
     TrackGain(TrackId),
     BusGain(BusId),
+    BusParam { bus: BusId, effect: u8, key: ParamKey },
+    ClipParam { clip: ClipId, effect: u8, key: ParamKey },
 }
 
 /// A lane's value at `at`: linear between points, held flat before the
@@ -690,8 +736,15 @@ impl Project {
     fn check_auto_target(&self, target: AutoTarget) -> Result<(), EditError> {
         match target {
             AutoTarget::TrackGain(id) => self.check_track(id),
-            AutoTarget::BusGain(id) => {
+            AutoTarget::BusGain(id) | AutoTarget::BusParam { bus: id, .. } => {
+                // The bus must exist; the effect index need not, yet — a
+                // lane may be drawn before the chain is built, the same
+                // way a binding may outlive its clip.
                 if self.busses.contains_key(&id) { Ok(()) } else { Err(EditError::NoSuchBus(id)) }
+            }
+            AutoTarget::ClipParam { clip, .. } => {
+                let c = self.clips.get(&clip).ok_or(EditError::NoSuchClip(clip))?;
+                self.check_track(c.track)
             }
         }
     }
