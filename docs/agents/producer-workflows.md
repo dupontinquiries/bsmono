@@ -74,8 +74,9 @@ as a phase after "arrange" has the order wrong for this user.
   automation clips* everywhere — filter sweeps and risers into drops,
   volume dips for the beat drop. The automation is what makes an
   arrangement sound finished. The app's automation targets were track and
-  bus gain only; **effect-parameter automation is the biggest single gap**
-  after the curves work.
+  bus gain only; effect-parameter automation was the biggest single gap
+  after the curves work — closed in c17 (`AutoTarget::BusParam` /
+  `ClipParam`, `Instance::set_param`, rides at control rate).
 - **Mixing tools**: an assistant-style EQ/dynamics per insert (Neutron:
   EQ, compressor, sculptor, masking), a limiter, **delay and reverb on
   sends**, sidechain ducking, stereo width, and a maximizer on master
@@ -212,7 +213,11 @@ first phase is for.
 2. ~~Reverb and delay in `studio-fx`~~ — built (c17): `studio-fx::space`,
    all-wet on a return bus, "sync delay to tempo" in the palette. The
    README's "The sends finally have something to feed".
-3. Effect-parameter automation on top of `curves.rs`.
+3. ~~Effect-parameter automation on top of `curves.rs`~~ — built (c17):
+   `AutoTarget::BusParam`/`ClipParam`, `Instance::set_param` +
+   `is_live_param`, `studio-audio`'s `ParamRide` at 64-frame control
+   rate, "automate" on the fx editor's live controls. The README's
+   "Riding a knob".
 4. Synth + piano control-panel sketch, SFZ/SF2 kind behind it.
 5. Take lanes, loop-record, comping.
 6. Video: align-by-audio, ffmpeg edit-list render.

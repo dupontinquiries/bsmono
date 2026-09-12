@@ -1042,6 +1042,39 @@ read it at a glance. Per-band correlation completes the picture: not "this mix
 has phase problems" but "your 200 Hz is out of phase", which is the difference
 between a meter you act on and one you learn to ignore.
 
+## Riding a knob
+
+The FL footage has automation clips on everything — filter sweeps and
+risers into drops, a reverb's mix opening on the last bar — and the
+app's lanes reached track and bus gain only. `AutoTarget::BusParam` and
+`ClipParam` (an effect by its index in its chain, a parameter by a
+16-byte key so the target stays `Copy` and the op fixed-shape) are the
+rest of it. A parameter lane follows the fader rule: the effect runs
+with `stored × lane × Π(bindings)`, so a curve is a ride on what the
+knob says, a filter sweep is a cutoff at 1 kHz and a curve from 0.1 to
+8, and everything the curves module promised — gated to a clip, moving
+with it, duplicated with it, one curve on twelve ad-libs — holds on a
+knob as it does on a fader.
+
+The part that is not bookkeeping: an effect must take a new value
+WITHOUT losing its state. Rebuilding the instance at every point
+empties the delay line and resets the filter — a click per point. So
+`Instance::set_param` moves what can be moved mid-stream (gains,
+thresholds, mixes, feedback, damping, a band's design with its memory
+carried over), refuses what cannot (a delay's time, a lookahead, a
+band's type — buffer sizes, not values), and `is_live_param` states the
+same set for the editor, which offers "automate" only on those. The
+render applies rides at control rate, 64 frames, the classic bargain.
+Pinned: a low-pass swept over a tone by redesign-in-place keeps its
+largest step at the tone's own slope; the same sweep by reinstantiate
+steps an order larger. And a ride on a disabled effect's neighbour
+still reaches the right one, because the cache keeps the chain index
+with each instance.
+
+Wire target kinds 2 and 3 without a `WIRE_VERSION` bump: an older peer
+already refuses an unknown target kind outright, and a bump would
+refuse every older save file for a target most projects never draw.
+
 ## The sends finally have something to feed
 
 The mixer had busses and sends since the console panel landed, and the
@@ -1405,8 +1438,8 @@ a time move is two (the left-trim precedent), all through the op-log door
 so a ride is undoable, on the wire, and refusable out loud.
 
 **Automation — the ride, as ops.** `Project` gains lanes: points per
-`AutoTarget` (track gain and bus gain first; the enum is where a
-clip-gain or effect-parameter target lands later), edited by
+`AutoTarget` (track gain and bus gain first; effect parameters landed
+in c17 — "Riding a knob" below), edited by
 `SetAutoPoint`/`RemoveAutoPoint` in the house op shape — absolute
 (time, value) so peers converge per-point, a refusal when a removal has
 nothing to restore, locked tracks refusing their lane the way they refuse
