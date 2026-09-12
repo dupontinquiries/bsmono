@@ -243,7 +243,24 @@ impl Call {
             self.out_rs = Resampler::new(RATE, rate);
         }
         let target = (rate as u64 * self.target_ms as u64 / 1000) as usize;
-        if self.primed && sink.stream_queued() == 0 {
+        if !self.primed {
+            // The first fill is silence pushed WITHOUT popping anyone: a
+            // peer whose frames arrived in the same UI frame we joined
+            // would otherwise have the whole depth popped from its
+            // buffer at once — three concealed, three late, before a
+            // word was heard. Found by the TCP test, where the burst
+            // and the join land in the same turn.
+            self.frame.fill(0.0);
+            while sink.stream_queued() < target {
+                self.chunk.clear();
+                self.out_rs.push(&self.frame, &mut self.chunk);
+                if self.chunk.is_empty() { break; }
+                sink.stream_push(Arc::new(self.chunk.clone()));
+            }
+            self.primed = true;
+            return packets;
+        }
+        if sink.stream_queued() == 0 {
             self.starved += 1;
         }
         while sink.stream_queued() < target {
@@ -255,7 +272,6 @@ impl Call {
             if self.chunk.is_empty() { break; }
             sink.stream_push(Arc::new(self.chunk.clone()));
         }
-        self.primed = true;
         packets
     }
 
@@ -287,21 +303,24 @@ impl Call {
     }
 }
 
+/// A sink and a microphone the tests drive by hand, so the clock is the
+/// test's. `pub(crate)` so the shell's TCP test can put a real socket
+/// between two of them.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fakes {
     use super::*;
     use crate::capture::Take;
 
     /// A sink the test drains by hand, so the clock is the test's.
-    struct FakeSink {
-        rate: u32,
-        queued: Vec<f32>,
-        played: Vec<f32>,
+    pub(crate) struct FakeSink {
+        pub(crate) rate: u32,
+        pub(crate) queued: Vec<f32>,
+        pub(crate) played: Vec<f32>,
     }
     impl FakeSink {
-        fn new(rate: u32) -> FakeSink { FakeSink { rate, queued: Vec::new(), played: Vec::new() } }
+        pub(crate) fn new(rate: u32) -> FakeSink { FakeSink { rate, queued: Vec::new(), played: Vec::new() } }
         /// The device consumed `n` frames.
-        fn consume(&mut self, n: usize) {
+        pub(crate) fn consume(&mut self, n: usize) {
             let n = n.min(self.queued.len());
             self.played.extend(self.queued.drain(..n));
         }
@@ -321,15 +340,15 @@ mod tests {
     }
 
     /// A microphone the test speaks into.
-    struct FakeMic {
-        rate: u32,
-        tapping: bool,
-        script: Vec<f32>,
-        refuse: bool,
+    pub(crate) struct FakeMic {
+        pub(crate) rate: u32,
+        pub(crate) tapping: bool,
+        pub(crate) script: Vec<f32>,
+        pub(crate) refuse: bool,
     }
     impl FakeMic {
-        fn new(rate: u32) -> FakeMic { FakeMic { rate, tapping: false, script: Vec::new(), refuse: false } }
-        fn say(&mut self, pcm: &[f32]) { self.script.extend_from_slice(pcm); }
+        pub(crate) fn new(rate: u32) -> FakeMic { FakeMic { rate, tapping: false, script: Vec::new(), refuse: false } }
+        pub(crate) fn say(&mut self, pcm: &[f32]) { self.script.extend_from_slice(pcm); }
     }
     impl Capture for FakeMic {
         fn start(&mut self) -> Result<(), String> { Ok(()) }
@@ -349,6 +368,17 @@ mod tests {
         }
         fn tap_dropped(&self) -> usize { 0 }
     }
+
+    pub(crate) fn sine(n: usize, hz: f32, rate: u32, amp: f32) -> Vec<f32> {
+        (0..n).map(|i| amp * (2.0 * std::f32::consts::PI * hz * i as f32 / rate as f32).sin())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::fakes::*;
 
     fn sine(n: usize, hz: f32, rate: u32, amp: f32) -> Vec<f32> {
         (0..n).map(|i| amp * (2.0 * std::f32::consts::PI * hz * i as f32 / rate as f32).sin())
