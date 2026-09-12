@@ -62,6 +62,11 @@ pub mod multicursor;
 /// remember the callsite and who claimed them. The layer buckets, saved
 /// navigation paths and the depth horizon all read from.
 pub mod entity;
+/// The real [`entity::EdgeSource`] implementations: an outline as
+/// containment, project-search hits as text matches, git blame as time.
+/// They take plain rows rather than calling the modules that produce them,
+/// so they compile and test in the featureless build too.
+pub mod edgesrc;
 /// Where you came from, as the EDGES you travelled rather than the places
 /// you landed — so going back is unambiguous when two routes converge.
 pub mod nav;
