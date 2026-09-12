@@ -615,9 +615,27 @@ impl App {
             // event before; the scanner had a status line and no eyes.
             if self.snap.qr.as_ref().is_some_and(|q| q.is_scanning()) {
                 self.scan_frames = self.scan_frames.wrapping_add(1);
+                // COUNTED, so the scanner can say why it has not found anything. Looking and
+                // broken produce the same screen otherwise — a preview and no result — and
+                // the person holding the phone moves it closer, then turns it, then gives up
+                // on a feature that was never running.
+                //
+                // Both counters here rather than inside the `if`: a frame that is not
+                // plausible still ARRIVED, and it is the gap between those two numbers that
+                // says "the camera works and the picture is black".
+                self.snap.scan_counts.frames += 1;
+                if f.pixels_plausible() {
+                    self.snap.scan_counts.plausible += 1;
+                }
                 if self.scan_frames % 4 == 0 && f.pixels_plausible() {
+                    self.snap.scan_counts.attempts += 1;
                     if let Some(id) = uikit_egui::qr::decode_frame(&f.rgba, f.width as usize, f.height as usize) {
                         eprintln!("snapclone: scanned {id}");
+                        // Kept, because the scanner CLOSES on a hit: without this the status
+                        // reverts to "scanner off" the moment it succeeds, which reads as the
+                        // scan having failed at the last second.
+                        self.snap.scan_counts.hits += 1;
+                        self.snap.scan_hit = Some(id.clone());
                         let cmds = self.snap.apply(HostEvent::QrPayload(id));
                         self.handle(cmds);
                     }

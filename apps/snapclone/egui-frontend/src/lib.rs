@@ -86,6 +86,8 @@ pub mod video_backend;
 pub mod video_probe;
 pub mod video_record;
 /// Admitted frames on disk, so `av1_encode`'s command has something to read.
+/// Why the QR scanner has not found anything — the difference between looking and broken.
+pub mod qr_scan_status;
 pub mod video_spill;
 /// Running the encode: the thin spawn layer `av1_encode` and `video_spill` were built for.
 pub mod video_encode_run;
@@ -181,6 +183,10 @@ pub struct Snapclone {
     /// Where the recording's admitted frames are being written. Beside the recorder because
     /// the two start and stop together — `offer` feeds this, and the shutter finishes it.
     pub spill: Option<crate::video_spill::Spill>,
+    /// What the QR scanner has seen this session — see `qr_scan_status`.
+    pub scan_counts: crate::qr_scan_status::Counts,
+    /// The last code decoded, so a hit survives the scanner closing on it.
+    pub scan_hit: Option<String>,
     /// Where a finished encode reports back from its thread.
     ///
     /// A channel rather than a shared `Mutex<Option<Done>>`: the UI polls once a frame, and a
@@ -763,6 +769,8 @@ impl Snapclone {
             prefs_handedness: settings_kit::Handedness::Right,
             recorder: None,
             spill: None,
+            scan_counts: Default::default(),
+            scan_hit: None,
             encode_done: std::sync::mpsc::channel(),
             shutter_note: String::new(),
             feed_note: String::new(),
@@ -3389,7 +3397,15 @@ impl Snapclone {
                 let mut child = child.new_child(egui::UiBuilder::new().max_rect(area.shrink(12.0)));
                 let mut scanned = None;
                 if let Some(q) = self.qr.as_mut() {
-                    scanned = crate::qr::qr_ui(&mut child, q, &colors);
+                    // With the diagnosis, so the scanner can say whether it is looking or
+                    // broken. Computed here because the counters live on the app and the
+                    // scanner has no business owning them.
+                    let diag = crate::qr_scan_status::status(
+                        q.is_scanning(),
+                        self.scan_counts,
+                        self.scan_hit.as_deref(),
+                    );
+                    scanned = crate::qr::qr_ui_diag(&mut child, q, &colors, diag);
                 }
                 // BOTH HALVES. qr_ui reads somebody else's code; my_code_ui
                 // shows yours so they can read it back. With only the scanner,

@@ -199,6 +199,17 @@ impl QrScan {
 /// Draw the scanner sheet. Returns a contact once one is confirmed.
 pub fn qr_ui(ui: &mut egui::Ui, s: &mut QrScan,
              c: &uikit_egui::PaletteColors) -> Option<ScannedContact> {
+    qr_ui_diag(ui, s, c, crate::qr_scan_status::Status::Idle)
+}
+
+/// [`qr_ui`] with the scanner's own diagnosis of why it has not found anything.
+///
+/// Separate so every existing call site draws what it drew. The diagnosis needs counters the
+/// camera loop keeps, and threading them through the one signature would have made the
+/// scanner's UI depend on state it has no business owning.
+pub fn qr_ui_diag(ui: &mut egui::Ui, s: &mut QrScan,
+                  c: &uikit_egui::PaletteColors,
+                  diag: crate::qr_scan_status::Status) -> Option<ScannedContact> {
     let dt = ui.input(|i| i.stable_dt) * 1000.0;
     let mut out = s.tick(dt);
 
@@ -228,6 +239,16 @@ pub fn qr_ui(ui: &mut egui::Ui, s: &mut QrScan,
             ui.painter().rect_filled(rect, 8.0, c.bg_base);
             ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(2.0_f32, border),
                                      egui::StrokeKind::Inside);
+            // WHY IT HAS NOT FOUND ANYTHING. A scanner that is looking and one that is broken
+            // draw the same thing — a viewfinder and no result — so the person moves the phone
+            // closer, turns it, and gives up on a feature that was never running.
+            //
+            // A fault is coloured; "looking" is not. "Looking" in warning colour every second
+            // teaches people to ignore this line, which costs exactly when there is a fault.
+            if !matches!(diag, crate::qr_scan_status::Status::Idle) {
+                let col = if diag.is_fault() { c.warning } else { c.text_weak };
+                ui.colored_label(col, egui::RichText::new(diag.line()).small());
+            }
         }
         let status_col = if matches!(s.phase, Phase::Found { .. } | Phase::Done(_)) {
             c.success
