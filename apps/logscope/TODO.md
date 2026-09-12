@@ -3240,7 +3240,19 @@ already found a couple of "ported twice, wired once" cases this session) before 
 
 ## Open after the 2026-09-08 session
 
-### chat.rs is still 10,388 lines
+### The file is 10,441 lines and ONE METHOD is 6,492 of them
+
+`spatial_ui` is 62% of the file. That is the real problem, not the file's length: the
+remaining top-level items are small and findable, and everything hard to navigate is inside
+one method. Its first block (drag-and-drop ingest) is only 26 lines, so there is no single
+big lump to lift — it is a long sequence of inline sections, and splitting it safely wants
+more room than a session's tail end. Starting and stopping halfway leaves it worse than
+either end.
+
+Sizes, for whoever picks it up: `spatial_ui` 6492, `ui` 2235, `run_command` 711,
+`apply_evt` 379.
+
+### chat.rs is still 10,441 lines
 Six cuts done (tests, scene/slab, save format, formatters, dock, `mic_shape`), each verified
 by the test count staying at exactly 1422. What remains needs judgement rather than a script,
 because each couples to `Chat`:
@@ -3259,8 +3271,10 @@ Done: right-page cross-fade, engine-log line stagger, engine-badge flash on chan
 the kit, so every app gets them) `cross_fade`, `stagger`, `dropdown_in`, `flash_on_change`,
 `reduce_motion`/`dur`.
 
-- [ ] Chat message entrance. The transcript's draw loop is deep in `chat.rs` and I did not
-      want to guess at the seam; doing the `run_command` split above will surface it.
+- [x] Chat message entrance — ALREADY EXISTED. `theme::appear(m.born, 0.18)` per message,
+      smoothstepped. Nothing to add, and adding a second would fight it, the same way a
+      token fade would fight `reveal_shown_len`. What it DID need was honouring
+      `UIKIT_REDUCE_MOTION`: it predates the switch and was quietly exempt.
 - [ ] Code-block reveal.
 - [ ] Tab-strip selection glide. `selectable_label` paints its own background, so this needs
       custom painting rather than a wrapper.

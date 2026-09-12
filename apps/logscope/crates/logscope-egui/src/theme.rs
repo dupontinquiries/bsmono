@@ -1721,7 +1721,18 @@ pub fn fade(ui: &mut egui::Ui, alpha: f32, add: impl FnOnce(&mut egui::Ui)) {
 
 /// Eased 0→1 ramp over `secs` since `since` (an `Instant`), for fade-/slide-in on appear.
 pub fn appear(since: std::time::Instant, secs: f32) -> f32 {
-    let t = (since.elapsed().as_secs_f32() / secs.max(1e-3)).clamp(0.0, 1.0);
+    // REDUCED MOTION REACHES THIS TOO. `uikit_egui::motion::dur` returns zero when
+    // `UIKIT_REDUCE_MOTION` is set, and every animation added since honours it — this one
+    // predates the switch and was quietly exempt, which is the way an accessibility setting
+    // ends up meaning "most of it": each individual exemption looks harmless and the person
+    // who needs it still cannot use the app.
+    //
+    // Zero duration lands on t=1 immediately, so a message appears rather than fading.
+    let secs = uikit_egui::motion::dur(secs);
+    if secs <= 1e-4 {
+        return 1.0;
+    }
+    let t = (since.elapsed().as_secs_f32() / secs).clamp(0.0, 1.0);
     // smoothstep for a softer landing than linear
     t * t * (3.0 - 2.0 * t)
 }
@@ -2423,6 +2434,24 @@ mod variant_tests {
 
 #[cfg(test)]
 mod md_contrast_tests {
+
+    /// Each individual exemption from an accessibility setting looks harmless, and the person
+    /// who needs it still cannot use the app. `appear` predates `UIKIT_REDUCE_MOTION` and was
+    /// quietly outside it.
+    #[test]
+    fn appear_finishes_instantly_when_motion_is_reduced() {
+        // The switch is process-wide and cached, so this tests the mechanism rather than
+        // flipping the global: a zero duration must land on 1.0 rather than dividing by it.
+        let now = std::time::Instant::now();
+        assert_eq!(super::appear(now, 0.0), 1.0, "a zero duration should be instant, not NaN");
+        // And a normal duration still animates from near zero.
+        let a = super::appear(now, 10.0);
+        assert!(a < 0.1, "a fresh element should start hidden: {a}");
+        // Smoothstep, not linear: the landing is softer than the start.
+        let mid = 0.5f32;
+        let sm = mid * mid * (3.0 - 2.0 * mid);
+        assert!((sm - 0.5).abs() < 1e-6, "smoothstep should be symmetric about the midpoint");
+    }
     use super::*;
 
     /// Every markdown colour must clear the body floor on the panel it lands on.
