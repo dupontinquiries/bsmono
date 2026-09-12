@@ -80,9 +80,9 @@ as a phase after "arrange" has the order wrong for this user.
   EQ, compressor, sculptor, masking), a limiter, **delay and reverb on
   sends**, sidechain ducking, stereo width, and a maximizer on master
   (Ozone). The app has EQ/comp/limiter/multiband/imager/saturation and
-  a mix assistant — and **no reverb and no delay at all** (verified: the
-  registered effect kinds in `studio-fx/src/lib.rs`). The mixer has sends
-  with nothing worth sending to.
+  a mix assistant — and, as of c17, reverb and delay (`studio-fx::space`;
+  before that there were none, verified against the registered kinds,
+  and the sends had nothing worth sending to).
 - **Vocals** arrive three ways: as chops loaded like drums (`vox –
   breath.wav`), as files delivered from a recording studio (the Downloads
   folder), and as a long single take on the playlist that then gets
@@ -146,8 +146,9 @@ producers get started" without extra hardware.
   use; anyone with a Dante rig mutes it and routes their own. The
   maintainer knows about group-call work in `snapclone` and chose in-app
   anyway for the routing simplicity. → `Packet::Voice` + `voice::Jitter`
-  in `studio-collab`; the shell halves (Opus encode/decode, sink) are not
-  built.
+  in `studio-collab`; the shell halves are built now (c17):
+  `studio-collab::voice::Link`, `studio-media::voice` (Opus frames),
+  `studio-app::call` (the pump), ☎ / mute / hold-to-talk in the toolbar.
 - **Presence must say who is recording** so nobody moves the singer's
   playhead mid-take. → `Presence.recording`, overlay label `name ● rec`.
 - **Whisper transcripts** matter for a specific reason: "when someone wants
@@ -205,9 +206,12 @@ first phase is for.
 
 ## 8. Open, in the order agreed
 
-1. Voice link shell halves (Opus is in `studio-media`; the sink mixes
-   one-shot voices already).
-2. Reverb and delay in `studio-fx` (sends have nothing to feed).
+1. ~~Voice link shell halves~~ — built (c17): `studio-collab::voice::Link`,
+   `studio-media::voice`, `studio-app::call`; the README's "The call"
+   section. Unverified against a real sound card or microphone.
+2. ~~Reverb and delay in `studio-fx`~~ — built (c17): `studio-fx::space`,
+   all-wet on a return bus, "sync delay to tempo" in the palette. The
+   README's "The sends finally have something to feed".
 3. Effect-parameter automation on top of `curves.rs`.
 4. Synth + piano control-panel sketch, SFZ/SF2 kind behind it.
 5. Take lanes, loop-record, comping.

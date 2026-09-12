@@ -597,6 +597,56 @@ receiving live edits *while* the catch-up is still arriving — a test does
 exactly that, then replays the entire history again and requires nothing to
 change.
 
+## The call
+
+The singer is remote, and a small producer should not need an intercom
+box or a second program to hear them. So the voice call rides the same
+wire the ops do, in the app by default; whoever has a Dante rig mutes it
+and routes their own. `Packet::Voice` is one 20 ms Opus frame with a
+site and a sequence number, and it never touches the document: the
+shell's `integrate_packet` puts it in `Studio::voice_inbox` and the
+call takes it from there — the same seam `outbox` is, pointing the
+other way, so the document's integration stays a pure function with no
+device in it.
+
+The layers, headless first (each tested without a sound card):
+
+* `studio-collab::voice` — the jitter buffer (frames held to a depth,
+  played in order, a missing slot concealed rather than waited for, a
+  late frame dropped rather than played late), a `Codec` seam, a
+  streaming `Resampler`, and `Link`: one buffer and one decoder per
+  peer, one encoder for us, the additive mix, and a meter. A muted link
+  keeps SENDING encoded silence, so the far side's loss counter reads
+  packet loss and only packet loss. Every frame carries a one-byte codec
+  tag; a receiver conceals a tag it does not speak and counts it —
+  a mismatched build is a silent peer with a rising number, not a
+  speaker full of static.
+* `studio-media::voice` — Opus at its narrowest: a frame in, a packet
+  out. VOIP mode, 24 kbit/s, DTX on (measured: a silent frame cost 41
+  bytes without it and one byte with it, plus a 25-byte refresh every
+  400 ms), libopus's own packet-loss concealment.
+* `studio-app::call` — the pump. The sink grew a SEQUENTIAL stream
+  (`stream_push`: chunks played end to end over the loop and the
+  voices — a one-shot per frame would land wherever the callback was
+  and gap or overlap) and the microphone grew a live tap that shares
+  the device with a take. The UI thread is the playout clock, by proxy:
+  the stream is kept topped up to 100 ms every frame and each chunk
+  pushed is one slot popped from every peer's buffer. The stream is
+  filled with silence from the moment the call starts, not from the
+  first frame heard — otherwise the first pump after a peer speaks pops
+  the whole depth at once and the jitter buffer's sixty milliseconds
+  are spent on the sink's queue instead of the network. The TCP test
+  found that race; the fake-only tests could not.
+
+The controls: ☎ joins and leaves, mute, push-to-talk with a button you
+HOLD (the one push-to-talk that works on a phone), and the status line
+reads the meter — peers, buffering, lost, late, a foreign codec, UI
+stalls, dropped mic blocks. No microphone makes the call listen-only,
+not refused. A peer who speaks before you join is named as ringing.
+Echo cancellation is not built; headphones are the honest answer and
+the join message says so. Verified end to end over 127.0.0.1 with only
+the two devices faked; NOT yet against a sound card or a microphone.
+
 ## Surviving a real carrier
 
 `wire` says what a packet looks like; `carrier` says how it survives something
@@ -991,6 +1041,42 @@ horizontal one — what every hardware vectorscope does, and why an engineer can
 read it at a glance. Per-band correlation completes the picture: not "this mix
 has phase problems" but "your 200 Hz is out of phase", which is the difference
 between a meter you act on and one you learn to ignore.
+
+## The sends finally have something to feed
+
+The mixer had busses and sends since the console panel landed, and the
+registry had nothing worth sending to: `voice::Delay` is a tuned comb (a
+timbre, by design not a room) and there was no reverb at all. The
+footage in `docs/agents/producer-workflows.md` has delay and reverb on
+sends in every project. `studio-fx::space` is them:
+
+* **Reverb** — Schroeder/Moorer as Freeverb arranged it: eight parallel
+  low-pass-feedback combs into four series allpasses per channel, the
+  right channel's lines 23 samples longer so the two decays decorrelate
+  into width. Forty lines, allocates nothing after construction, and
+  the tail is a known exponential — which is what makes `size` a number
+  the tests check (a 0.9 room holds ten times the energy of a 0.2 room
+  two seconds in) rather than a feel. The tunings scale with the sample
+  rate so a 48 kHz project gets the same room as a 44.1 kHz one, not a
+  smaller one. Every room is fed the mono sum, per Freeverb, and the
+  frame's rooms are computed together when its last channel arrives:
+  a half-stale width matrix measured as a high-pass on the tail — 74 %
+  of the energy differed between the ears at width 0 — so every channel
+  is one sample late, uniformly, which for a room is nothing.
+* **Delay** — time in ms, feedback, a one-pole low-pass INSIDE the loop
+  (each repeat duller than the last), mix, and ping-pong, where the
+  frame's mono sum enters the last channel's line and each channel's
+  repeat feeds the other's, so a hit bounces across the field instead
+  of stacking. `instantiate` has a rate and no tempo, so sync is the
+  shell's: "sync delay to tempo" rewrites every delay's time on every
+  bus and selected clip to a dotted eighth / eighth / quarter /
+  sixteenth at the active song's tempo (or the rack's) — as ops, so it
+  undoes and travels.
+
+Both carry per-channel state behind the per-sample interface, the
+bargain `playrate` made. On a bus that other busses send into, the
+mixer adds them all-wet (`mix` 1.0); as an insert, 30 %. The rule is a
+pure function with a test, not a checkbox.
 
 ## The chain strip
 
