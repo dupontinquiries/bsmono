@@ -305,6 +305,9 @@ pub enum TurnKind {
     /// One rung of the study ladder. Which rung is on the session, so
     /// the reply knows what it was answering.
     Study,
+    /// The first turn of any build: what KIND of thing is this? Its
+    /// answer routes everything after it.
+    Route,
     /// Planning the build into a DOSSIER: the parts, before any of
     /// them is built. The only turn that sees the whole.
     Dossier,
@@ -551,6 +554,14 @@ pub struct Paintbrush {
     /// What the next turn is being asked to write, so its reply budget
     /// fits the job. Set beside every `spawn_turn`.
     pending_job: voxel_tools::prompt::Job,
+    /// The surface the player was standing on, kept so the build can
+    /// be restarted after the routing turn without the caller.
+    last_surface: Option<String>,
+    /// What the routing turn decided, consumed by the next start.
+    routed: Option<voxel_tools::route::Reading>,
+    /// Set when the routing turn could not answer, so the restart uses
+    /// the tables rather than asking again forever.
+    route_failed: bool,
     /// The noun whose definition is being asked for.
     proposed_noun: Option<String>,
     /// The build plan, while it is being executed part by part.
@@ -663,6 +674,9 @@ impl Paintbrush {
             review_round: 0,
             review_pending_after_drone: 0,
             pending_job: voxel_tools::prompt::Job::Plan,
+            last_surface: None,
+            routed: None,
+            route_failed: false,
             proposed_noun: None,
             dossier: None,
             part_at: 0,
@@ -1395,6 +1409,16 @@ impl Paintbrush {
     }
 
 
+    /// Begin the build again with the route in hand. The routing turn
+    /// answers a question `start_turn` asks at its very top, so the
+    /// honest thing is to run it again rather than thread the answer
+    /// through every branch below it.
+    fn restart_after_routing(&mut self, cm: &ChunkManager, gaze: &Gaze,
+                             player_feet: Option<(i32, i32, i32)>, prose: &str) {
+        let surface = self.last_surface.clone();
+        self.start_turn(cm, gaze, surface.as_deref(), prose, player_feet);
+    }
+
     /// Draw the massing and ask whether it reads, before anything is
     /// detailed. Fixing a proportion here costs one line; fixing it
     /// after everything is built costs the build.
@@ -1736,7 +1760,62 @@ impl Paintbrush {
         // The recognizer is the honest signal: it is a table of things
         // the dictionary can actually make, so a miss means the fast
         // path would be guessing.
-        let path = voxel_tools::compose::choose_path(prose);
+        self.last_surface = surface.map(|s| s.to_string());
+        // THE RUN MUST EXIST BEFORE THE FIRST TURN, not after the
+        // routing branch. It was created further down, so a build that
+        // paused to ask what kind of thing it was had NO RUN -- and
+        // anything watching `is_running` saw the build end the instant
+        // it began. The routing turn is part of the build, so the run
+        // starts with it.
+        if self.run.is_none() {
+            self.run = Some(voxel_tools::session::Run::new(prose, voxel_tools::session::Limits {
+                max_rounds: self.review_rounds.max(1),
+                ..self.run_limits.clone()
+            }));
+        }
+        // ASK WHAT KIND OF THING THIS IS, before anything else.
+        //
+        // The word tables get one build in three wrong -- `arch` inside
+        // a yard, `vines` as a subject, `gorilla` absent from a list --
+        // and a wrong route wastes every turn after it. One cheap turn
+        // here is the highest-value question in the whole loop.
+        //
+        // The tables remain as the fallback, which is what they are
+        // good for: they answer instantly and they are never absent.
+        let path = match self.routed.take() {
+            Some(r) => {
+                let p = voxel_tools::compose::path_for_request(&r, prose);
+                log::info!("[paintbrush] route (model): {} -> {p:?}", r.summary());
+                p
+            }
+            None if self.route_failed => {
+                self.route_failed = false;
+                let p = voxel_tools::compose::choose_path(prose);
+                log::info!("[paintbrush] route (tables, model answer unusable): {p:?}");
+                p
+            }
+            // The tables answer instantly and are right for most of
+            // what is typed. A turn is only worth spending where they
+            // are unreliable -- or, worse, confidently wrong.
+            None if voxel_tools::compose::tables_confident(prose) => {
+                let p = voxel_tools::compose::choose_path(prose);
+                log::info!("[paintbrush] route (tables, confident): {p:?}");
+                p
+            }
+            None => {
+                if let Some(c) = self.completer_for(debug) {
+                    let p = voxel_tools::route::prompt(prose);
+                    self.pending_job = voxel_tools::prompt::Job::Line;
+                    self.spawn_turn(c, "You are sorting a build request by what kind of thing \
+                                        it is.".into(),
+                                    Box::new(move || p), gaze, player_feet, prose, TurnKind::Route);
+                    return;
+                }
+                let p = voxel_tools::compose::choose_path(prose);
+                log::info!("[paintbrush] route (tables, no provider): {p:?}");
+                p
+            }
+        };
         // A new build starts a RUN: the rounds, their history, and the
         // status the marker shows.
         self.run = Some(voxel_tools::session::Run::new(prose, voxel_tools::session::Limits {
@@ -2127,6 +2206,24 @@ impl Paintbrush {
                         } else {
                             self.finish_study(cm, &turn.gaze, turn.player_feet, &turn.prose);
                         }
+                    }
+                    TurnKind::Route => {
+                        match voxel_tools::route::parse(&raw).filter(|r| r.usable()) {
+                            Some(r) => {
+                                self.say(format!("this is a {}", r.summary()));
+                                self.routed = Some(r);
+                            }
+                            None => {
+                                // NEVER a reason to fail: the tables
+                                // answer instantly and are never absent
+                                log::info!("[paintbrush] routing turn unusable; using the tables");
+                                self.say("sorting it the quick way");
+                                self.routed = None;
+                                self.route_failed = true;
+                            }
+                        }
+                        // start again, now knowing what it is
+                        self.restart_after_routing(cm, &turn.gaze, turn.player_feet, &turn.prose);
                     }
                     TurnKind::Dossier => {
                         let (d, errs) = voxel_tools::dossier::parse(&raw);

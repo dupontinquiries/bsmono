@@ -18,6 +18,45 @@ fn settle(pb: &mut paintbrush::Paintbrush) {
     }
 }
 
+/// Answer the routing turn from the prompt itself, so a scripted model
+/// does not have to. Returns None for any other prompt.
+fn route_answer(prompt: &str) -> Option<String> {
+    if !prompt.contains("kind figure|building|landscape|object|several") { return None; }
+    // MATCH ON THE REQUEST, not the whole prompt. The routing prompt's
+    // own examples mention a statue, a gorilla and a tree, so scanning
+    // the prompt made every request a figure -- "a water sphere" came
+    // back as `figure: sphere` and climbed the study ladder.
+    let full = prompt.to_lowercase();
+    let l: String = full.split("asked for:").nth(1)
+        .and_then(|r| r.lines().next()).unwrap_or("").trim().to_string();
+    let subject = |d: &str| full.split("asked for:").nth(1)
+        .and_then(|r| r.split(|c| c == '\n').next())
+        .and_then(|r| r.split_whitespace().last().map(|s| s.trim_matches(',').to_string()))
+        .unwrap_or_else(|| d.to_string());
+    // THE SUBJECT IS WHAT COMES BEFORE THE MODIFIER. "a huge fortress
+    // with a chapel, on a cliff" is a FORTRESS -- taking the last word
+    // made it a cliff, which is where it stands, not what it is. This
+    // is the same rule the real prompt states and the real router
+    // relies on the model to apply.
+    let head: String = ["with", " on ", " in ", " under ", " beside ", ","]
+        .iter().filter_map(|m| l.find(m)).min().map(|i| l[..i].to_string())
+        .unwrap_or_else(|| l.clone());
+    let subject = |d: &str| head.split_whitespace().last()
+        .map(|s| s.trim_matches(',').to_string())
+        .filter(|s| s.len() > 2).unwrap_or_else(|| d.to_string());
+    Some(if l.contains("statue") || l.contains("zeus") || l.contains("gorilla") {
+        format!("kind figure\nsubject {}\nheight 60\n", subject("figure"))
+    } else if l.contains("yard") || l.contains(" and a ") {
+        "kind several\nsubject yard\nparts yard; hall; gate\n".to_string()
+    } else if l.contains("sphere") || l.contains("tree") {
+        format!("kind object\nsubject {}\nheight 24\n", subject("thing"))
+    } else if l.contains("canyon") || l.contains("schism") {
+        "kind landscape\nsubject canyon\n".to_string()
+    } else {
+        format!("kind building\nsubject {}\n", subject("building"))
+    })
+}
+
 fn main() {
     scenario();
     focus_scenario();
@@ -617,7 +656,8 @@ fn cancel_scenario() {
     struct Slow { steps: std::sync::Arc<std::sync::atomic::AtomicUsize> }
     impl voxel_tools::llm::Completer for Slow {
         fn name(&self) -> &str { "slow" }
-        fn complete(&mut self, _: &str, _: &str) -> Result<String, String> { Ok("cylinder @0,0 r=2\n".into()) }
+        fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            if let Some(r) = route_answer(user) { return Ok(r); } Ok("cylinder @0,0 r=2\n".into()) }
         fn complete_with(&mut self, _: &str, _: &str, ctl: &voxel_tools::llm::TurnControl) -> Result<String, String> {
             let mut text = String::new();
             for i in 0..200 {
@@ -731,7 +771,8 @@ fn validator_scenario() {
     struct Probe(std::sync::Arc<std::sync::Mutex<Option<bool>>>);
     impl voxel_tools::llm::Completer for Probe {
         fn name(&self) -> &str { "probe" }
-        fn complete(&mut self, _: &str, _: &str) -> Result<String, String> { Ok(String::new()) }
+        fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            if let Some(r) = route_answer(user) { return Ok(r); } Ok(String::new()) }
         fn complete_with(&mut self, _: &str, _: &str, ctl: &voxel_tools::llm::TurnControl) -> Result<String, String> {
             let check = ctl.line_check.expect("a validator was passed");
             // what a 1B writes, and what the loop would take back
@@ -761,7 +802,8 @@ fn progressive_scenario() {
     struct Slow;
     impl voxel_tools::llm::Completer for Slow {
         fn name(&self) -> &str { "slow" }
-        fn complete(&mut self, _: &str, _: &str) -> Result<String, String> { Ok(String::new()) }
+        fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            if let Some(r) = route_answer(user) { return Ok(r); } Ok(String::new()) }
         fn complete_with(&mut self, _: &str, _: &str, ctl: &voxel_tools::llm::TurnControl) -> Result<String, String> {
             let lines = ["# a hamlet", "form house @0,0 @8,6 style=cottage seed=1", "form house @14,0 @22,6 style=cottage seed=2",
                          "path @4,7 @18,7 w=2", "form house @28,0 @36,6 style=cottage seed=3", "tree @11,10 oak h=7",
@@ -806,6 +848,10 @@ fn referent_scenario() {
     impl voxel_tools::llm::Completer for Capture {
         fn name(&self) -> &str { "capture" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            // The routing turn now precedes any build the tables are
+            // not certain of. A scripted model must answer it, or its
+            // first build reply is consumed as a route.
+            if let Some(r) = route_answer(user) { return Ok(r); }
             *self.0.lock().unwrap() = user.to_string();
             Ok("cylinder @0,0 r=2 h=3\n".into())
         }
@@ -860,6 +906,10 @@ fn review_scenario() {
     impl voxel_tools::llm::Completer for Scripted {
         fn name(&self) -> &str { "scripted" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            // The routing turn now precedes any build the tables are
+            // not certain of. A scripted model must answer it, or its
+            // first build reply is consumed as a route.
+            if let Some(r) = route_answer(user) { return Ok(r); }
             let mut c = self.calls.lock().unwrap();
             c.push(user.to_string());
             Ok(match c.len() {
@@ -906,7 +956,8 @@ fn long_run_scenario() {
     struct Rounds { n: std::sync::Arc<std::sync::atomic::AtomicUsize> }
     impl voxel_tools::llm::Completer for Rounds {
         fn name(&self) -> &str { "rounds" }
-        fn complete(&mut self, _: &str, _: &str) -> Result<String, String> {
+        fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            if let Some(r) = route_answer(user) { return Ok(r); }
             let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(match i {
                 0 => "spec height=8-12 durability=high\nenclose @-6,-6 @6,6 h=6 block=stone\n".into(),
@@ -1012,6 +1063,10 @@ fn four_pass_scenario() {
     impl voxel_tools::llm::Completer for Script {
         fn name(&self) -> &str { "script" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            // The routing turn now precedes any build the tables are
+            // not certain of. A scripted model must answer it, or its
+            // first build reply is consumed as a route.
+            if let Some(r) = route_answer(user) { return Ok(r); }
             self.seen.lock().unwrap().push(user.to_string());
             let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(match i {
@@ -1061,6 +1116,10 @@ fn programme_scenario() {
     impl voxel_tools::llm::Completer for Arch {
         fn name(&self) -> &str { "arch" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            // The routing turn now precedes any build the tables are
+            // not certain of. A scripted model must answer it, or its
+            // first build reply is consumed as a route.
+            if let Some(r) = route_answer(user) { return Ok(r); }
             self.seen.lock().unwrap().push(user.to_string());
             // the massing turn: make the keep dominate, drop the stables
             Ok("total 26000\nsection keep share=0.45 prominence=4\ndrop stables\n".into())
@@ -1102,6 +1161,10 @@ fn study_scenario() {
     impl voxel_tools::llm::Completer for Sculptor {
         fn name(&self) -> &str { "sculptor" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            // The routing turn now precedes any build the tables are
+            // not certain of. A scripted model must answer it, or its
+            // first build reply is consumed as a route.
+            if let Some(r) = route_answer(user) { return Ok(r); }
             self.seen.lock().unwrap().push(user.to_string());
             let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(match i {
@@ -1157,7 +1220,8 @@ fn floor_scenario() {
     struct Weak { n: std::sync::Arc<std::sync::atomic::AtomicUsize> }
     impl voxel_tools::llm::Completer for Weak {
         fn name(&self) -> &str { "weak" }
-        fn complete(&mut self, _: &str, _: &str) -> Result<String, String> {
+        fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            if let Some(r) = route_answer(user) { return Ok(r); }
             let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(if i == 0 {
                 "IT IS: A giant tree from Avatar\nMATERIALS: oak_log\nSCALE: 40\n".into()
@@ -1200,6 +1264,10 @@ fn propose_scenario() {
     impl voxel_tools::llm::Completer for Arch {
         fn name(&self) -> &str { "arch" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            // The routing turn now precedes any build the tables are
+            // not certain of. A scripted model must answer it, or its
+            // first build reply is consumed as a route.
+            if let Some(r) = route_answer(user) { return Ok(r); }
             self.seen.lock().unwrap().push(user.to_string());
             Ok("is a tower carrying sails, with the machinery below and a store beneath that\n\
                 ordinary 700\n\
@@ -1244,6 +1312,10 @@ fn dossier_scenario() {
     impl voxel_tools::llm::Completer for Team {
         fn name(&self) -> &str { "team" }
         fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            // The routing turn now precedes any build the tables are
+            // not certain of. A scripted model must answer it, or its
+            // first build reply is consumed as a route.
+            if let Some(r) = route_answer(user) { return Ok(r); }
             self.seen.lock().unwrap().push(user.to_string());
             let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(match i {

@@ -269,7 +269,64 @@ pub fn names_several(prose: &str) -> bool {
 /// a yard, `vines` taken as a subject, `gorilla` absent from an animal
 /// list. Adding words is not generalising. There is no list of every
 /// noun, and a model does not need one.
+/// Are the word tables reliable for this request?
+///
+/// They are, for most of what is typed: "a castle", "a small cottage",
+/// "carve a canyon" -- one known noun, no structure, nothing to get
+/// wrong. Asking a model about those spends a turn to be told what is
+/// already certain, and a turn is the most expensive thing here.
+///
+/// They are NOT reliable when the request has structure they cannot
+/// see. Every reported failure was one of these:
+///   * several things joined, where a single noun match is not a plan
+///     for the whole ("a walled yard with a hall and a gate" -> `arch`)
+///   * a modifier after the subject, which the head-noun rule takes as
+///     the subject ("a giant tree with vines" -> `vines`)
+///   * a noun in no table at all, where the default decides ("a
+///     gorilla statue" -> not an animal, therefore a man)
+pub fn tables_confident(prose: &str) -> bool {
+    let l = prose.to_lowercase();
+    // several things, or a modifier phrase: the two shapes the tables
+    // read wrongly rather than not at all, which is worse
+    if names_several(&l) { return false; }
+    if ["with", " on ", " in ", " under ", " covered", " full of ", " made of "]
+        .iter().any(|m| l.contains(m)) { return false; }
+    // A MATCH IS NOT AN EXPLANATION. "A gorilla statue" matches
+    // `statue` and the tables are then CONFIDENT AND WRONG, which is
+    // worse than uncertain -- they never looked at `gorilla` at all.
+    // Confidence requires that every content word is accounted for:
+    // the matched noun, or a modifier the tables understand.
+    let known = crate::typology::lookup(&l).is_some() || crate::recipe::recognise(&l).is_some();
+    if !known { return false; }
+    const UNDERSTOOD: &[&str] = &[
+        "a", "an", "the", "of", "make", "build", "create", "me", "please", "some",
+        // verbs the tables DO handle: a carve word is understood
+        "carve", "dig", "cut", "excavate", "hollow", "sink", "quarry", "gouge", "raise",
+        "tiny", "small", "little", "modest", "large", "big", "grand", "great", "huge",
+        "giant", "colossal", "enormous", "vast", "massive", "gigantic", "titanic",
+        "stone", "wooden", "wood", "iron", "glass", "marble", "quartz", "sand", "snow",
+        "old", "new", "ancient", "ruined", "tall", "wide", "narrow", "low", "round",
+        "square", "dark", "pale", "here", "there", "up", "down"];
+    let unexplained = l.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 2 && !UNDERSTOOD.contains(w))
+        // the noun that matched is explained, and so is anything the
+        // recognizer or a typology would itself recognise
+        .filter(|w| crate::recipe::recognise(w).is_none() && crate::typology::lookup(w).is_none())
+        .count();
+    unexplained == 0
+}
+
 pub fn path_for(r: &crate::route::Reading) -> Path {
+    path_for_request(r, &r.subject)
+}
+
+/// As `path_for`, but told the WHOLE request as well as the subject.
+///
+/// The subject alone is not enough to choose between a known form and
+/// composing: "a water sphere" has the subject `sphere`, which IS a
+/// known form -- so it took the one-turn path and the WATER was lost.
+/// A form only answers the request when it accounts for the request.
+pub fn path_for_request(r: &crate::route::Reading, request: &str) -> Path {
     use crate::route::Kind;
     match r.kind {
         Kind::Several => Path::Parts,
@@ -293,7 +350,11 @@ pub fn path_for(r: &crate::route::Reading) -> Path {
         Kind::Object => {
             // an object with a name this world knows is a form; one
             // without is composed from parts and relations
-            if crate::recipe::recognise(&r.subject).is_some() { Path::Known } else { Path::Compose }
+            // the form must account for the whole request, not just
+            // its head noun
+            if crate::recipe::recognise(request).is_some() && tables_confident(request) {
+                Path::Known
+            } else { Path::Compose }
         }
     }
 }
@@ -874,5 +935,45 @@ mod tests {
         }
         // a small figure does not climb the ladder
         assert_eq!(path_for(&r(Kind::Figure, "gnome", Some(6))), Path::Known);
+    }
+
+    #[test]
+    fn a_turn_is_spent_on_routing_only_where_the_tables_are_unreliable() {
+        // asking about "a castle" spends a turn to be told what is
+        // already certain, and a turn is the most expensive thing here
+        for sure in ["a castle", "a small cottage", "a huge fortress", "a statue of Zeus",
+                     "carve a great canyon"] {
+            assert!(tables_confident(sure), "{sure} needs no turn");
+        }
+        // and these are the three shapes that were read WRONGLY rather
+        // than not at all, which is worse
+        for unsure in ["a walled yard with a hall and a gate",
+                       "a giant tree with vines",
+                       "a gorilla statue on a plinth",
+                       "a windmill, a bakery and a row of cottages"] {
+            assert!(!tables_confident(unsure), "{unsure} is worth a turn");
+        }
+        // an unknown noun alone is still worth asking about: the
+        // default decides, and the default is a guess
+        assert!(!tables_confident("a gorilla statue"), "gorilla is in no table");
+    }
+
+    #[test]
+    fn a_form_must_account_for_the_whole_request_not_just_its_head_noun() {
+        use crate::route::{Kind, Reading};
+        let r = Reading { subject: "sphere".into(), kind: Kind::Object,
+                          height: Some(16), parts: vec![], notes: vec![] };
+        // "a water sphere" has the subject , which IS a known
+        // form -- so it took the one-turn path and the WATER was lost
+        assert_eq!(path_for_request(&r, "a water sphere"), Path::Compose);
+        // A bare sphere is ALSO Compose, because `sphere` is a sketch
+        // shape and not a dictionary form -- the dictionary has house,
+        // tower, castle, temple and nine others, and no sphere. My
+        // first version of this test assumed otherwise.
+        assert_eq!(path_for_request(&r, "a sphere"), Path::Compose);
+        // a real form does take the one-turn path
+        let t = Reading { subject: "tower".into(), kind: Kind::Object,
+                          height: None, parts: vec![], notes: vec![] };
+        assert_eq!(path_for_request(&t, "a stone tower"), Path::Known);
     }
 }
