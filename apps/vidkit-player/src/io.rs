@@ -1569,3 +1569,137 @@ pub fn fmt_duration(d: std::time::Duration) -> String {
         format!("{m}:{sec:02}")
     }
 }
+
+// ---------------------------------------------------------------------------
+// the system clipboard
+// ---------------------------------------------------------------------------
+
+/// The helpers that can read a clipboard, in preference order.
+///
+/// Same set and order voiceterm uses, and shelling out for the same reason: no
+/// crate dependency, and on Wayland the clipboard is a compositor protocol that
+/// an application has no business speaking directly.
+pub const CLIPBOARD_READERS: &[(&str, &[&str])] = &[
+    ("wl-paste", &["-n"]),
+    ("xclip", &["-selection", "clipboard", "-o"]),
+    ("xsel", &["--clipboard", "--output"]),
+    ("pbpaste", &[]),
+];
+
+/// Read the system clipboard, trying each helper until one answers.
+///
+/// Takes a runner so the fallback ORDER is testable without a display server —
+/// which is the part that goes wrong, since the first helper being installed
+/// does not mean it works (an `xclip` on a Wayland session exits non-zero).
+pub fn read_clipboard_with<R: vidkit_ytdlp::CommandRunner>(runner: &mut R) -> Option<String> {
+    for (cmd, args) in CLIPBOARD_READERS {
+        let argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        if let Ok(out) = runner.run(cmd, &argv) {
+            let text = String::from_utf8_lossy(&out).trim().to_string();
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+        // A helper that is present but fails, or returns nothing, is not the
+        // answer — keep going. Stopping at the first INSTALLED helper is the
+        // bug this loop exists to avoid: xclip is installed on plenty of
+        // Wayland sessions and exits non-zero on all of them.
+    }
+    None
+}
+
+/// Read the system clipboard with a real subprocess.
+pub fn read_clipboard() -> Option<String> {
+    let mut r = ProcessRunner {
+        // Short: this is on the click path and a hung helper would freeze the
+        // UI thread for the full default timeout.
+        timeout: Duration::from_secs(3),
+    };
+    read_clipboard_with(&mut r)
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Answers for named commands; anything else fails, as a missing binary
+    /// does.
+    struct FakeTools {
+        answers: HashMap<String, Result<String, ()>>,
+        pub tried: Vec<String>,
+    }
+
+    impl vidkit_ytdlp::CommandRunner for FakeTools {
+        fn run(&mut self, p: &str, _a: &[String]) -> Result<Vec<u8>, vidkit_ytdlp::RunError> {
+            self.tried.push(p.to_string());
+            match self.answers.get(p) {
+                Some(Ok(s)) => Ok(s.clone().into_bytes()),
+                Some(Err(())) => Err(vidkit_ytdlp::RunError::Io("failed".into())),
+                None => Err(vidkit_ytdlp::RunError::Io("not installed".into())),
+            }
+        }
+    }
+
+    fn tools(pairs: &[(&str, Result<&str, ()>)]) -> FakeTools {
+        FakeTools {
+            answers: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.map(|s| s.to_string())))
+                .collect(),
+            tried: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_first_working_helper_answers() {
+        let mut t = tools(&[("wl-paste", Ok("https://example.org/v.mp4"))]);
+        assert_eq!(
+            read_clipboard_with(&mut t).as_deref(),
+            Some("https://example.org/v.mp4")
+        );
+        assert_eq!(t.tried, vec!["wl-paste"], "kept going after a good answer");
+    }
+
+    /// The bug this loop exists for: xclip is installed on plenty of Wayland
+    /// sessions and exits non-zero on all of them. Stopping at the first
+    /// INSTALLED helper reads nothing forever.
+    #[test]
+    fn a_helper_that_fails_is_not_the_end_of_the_search() {
+        let mut t = tools(&[
+            ("wl-paste", Err(())),
+            ("xclip", Err(())),
+            ("xsel", Ok("recovered")),
+        ]);
+        assert_eq!(read_clipboard_with(&mut t).as_deref(), Some("recovered"));
+        assert_eq!(t.tried, vec!["wl-paste", "xclip", "xsel"]);
+    }
+
+    /// An EMPTY answer is not an answer. A helper on the wrong display server
+    /// often succeeds and returns nothing.
+    #[test]
+    fn an_empty_answer_falls_through() {
+        let mut t = tools(&[("wl-paste", Ok("   \n")), ("xclip", Ok("real text"))]);
+        assert_eq!(read_clipboard_with(&mut t).as_deref(), Some("real text"));
+    }
+
+    #[test]
+    fn no_helper_at_all_is_none_rather_than_a_panic() {
+        let mut t = tools(&[]);
+        assert_eq!(read_clipboard_with(&mut t), None);
+        assert_eq!(t.tried.len(), CLIPBOARD_READERS.len(), "gave up early");
+    }
+
+    /// Surrounding whitespace is stripped: a URL copied from a browser very
+    /// often carries a trailing newline, and `classify` rejects anything with
+    /// whitespace in it.
+    #[test]
+    fn a_trailing_newline_does_not_defeat_classification() {
+        let mut t = tools(&[("wl-paste", Ok("https://www.youtube.com/watch?v=abc12345678\n"))]);
+        let got = read_clipboard_with(&mut t).expect("read");
+        assert!(
+            vidkit_ytdlp::classify(&got).is_playable(),
+            "a newline made the URL unrecognisable"
+        );
+    }
+}

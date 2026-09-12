@@ -921,8 +921,20 @@ impl Player {
     /// with no yt-dlp. A page URL needs the extractor, and that path needs TLS
     /// this build does not have, so it says so rather than failing obscurely.
     fn play_clipboard(&mut self) {
-        let Some(text) = self.last_paste.clone() else {
-            self.gpu_error = Some("nothing pasted yet — press Ctrl+V first".into());
+        // The SYSTEM clipboard, then the last in-app paste as a fallback.
+        //
+        // Reading only egui's `Event::Paste` meant the app never saw the
+        // clipboard at all: copying a URL in a browser and clicking "play from
+        // clipboard" delivered no event, so the command reported "nothing
+        // pasted yet" on a clipboard that plainly had a URL in it. That was a
+        // documented limitation and it made the feature useless as anyone
+        // would actually use it.
+        let Some(text) = io::read_clipboard().or_else(|| self.last_paste.clone()) else {
+            self.gpu_error = Some(
+                "could not read the clipboard — install wl-paste, xclip or xsel, \
+                 or paste into the window with Ctrl+V"
+                    .into(),
+            );
             return;
         };
         let what = vidkit_ytdlp::classify(&text);

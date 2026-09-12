@@ -211,6 +211,19 @@ mod tests {
     /// A watch URL carrying a `list=` is still a VIDEO. Checking playlist first
     /// opens the whole list from a link to one video in it, which is not what
     /// was copied.
+    /// A real URL, reported as not playing. It classifies fine — the failure
+    /// was further along.
+    #[test]
+    fn a_real_youtube_watch_url_classifies_as_a_video() {
+        match classify("https://www.youtube.com/watch?v=yDFBYeY68U0") {
+            Paste::Video { id, url } => {
+                assert_eq!(id.as_deref(), Some("yDFBYeY68U0"));
+                assert!(url.contains("yDFBYeY68U0"));
+            }
+            other => panic!("a plain watch URL classified as {other:?}"),
+        }
+    }
+
     #[test]
     fn a_watch_url_inside_a_playlist_is_still_the_video() {
         match classify("https://www.youtube.com/watch?v=abc12345678&list=PL9999") {
