@@ -71,8 +71,11 @@ untestable wrapper would have looked like progress.
 
 ## Open, in the order I would do them
 
-1. **`Transcriber` impl (whisper-rs).** Unblocks subtitles, scrub-to-sections
-   and the voice router in one go — three palette rows currently say "not wired
+1. **`Transcriber` impl (whisper-rs).** The ONLY thing missing for lecture
+   watching now: `vidkit_relevance::sections` already turns cues into chapters
+   and answers "where did they discuss X" with a timestamp, and it needs no
+   model — but it needs cues, and nothing produces them. Also unblocks
+   subtitles, scrub-to-sections and the voice router — three palette rows currently say "not wired
    up yet". `voice-kit` already does the post-processing and
    `voiced-core::grammar` already does the matching; only the mic and the model
    are missing. *read*

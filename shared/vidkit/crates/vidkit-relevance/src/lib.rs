@@ -32,6 +32,7 @@
 //! that a model that never answers degrades to playing the whole video.
 
 pub mod ranges;
+pub mod sections;
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};

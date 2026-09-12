@@ -301,6 +301,19 @@ MUTANTS = [
      "            Some(last) if last.end >= r.start => last.end = last.end.max(r.end),",
      "            _unused if false => {},"),
 
+    # --- lecture chapters and search ---------------------------------------------
+    ("sect/filler-hides-boundaries", "crates/vidkit-relevance/src/sections.rs",
+     "        .filter(|(_, &n)| windows.len() >= 3 && n * 2 >= windows.len())",
+     "        .filter(|(_, &_n)| false)"),
+    ("sect/titles-by-raw-frequency", "crates/vidkit-relevance/src/sections.rs",
+     "        let idf = (n_windows as f32 / df).ln();", "        let idf = 1.0;"),
+    ("sect/short-chapters-survive", "crates/vidkit-relevance/src/sections.rs",
+     "            if end.saturating_sub(start) < policy.min_len {", "            if false {"),
+    ("sect/latest-mention-wins", "crates/vidkit-relevance/src/sections.rs",
+     "            .then(a.at.cmp(&b.at))", "            .then(b.at.cmp(&a.at))"),
+    ("sect/silence-is-a-topic-change", "crates/vidkit-relevance/src/sections.rs",
+     "        return 1.0;\n    }\n    let inter", "        return 0.0;\n    }\n    let inter"),
+
     # --- relevance / section scrubbing --------------------------------------
     ("relev/unanalysed-gets-skipped", "crates/vidkit-relevance/src/lib.rs",
      "            Score::Pending => 1.0,", "            Score::Pending => 0.0,"),
