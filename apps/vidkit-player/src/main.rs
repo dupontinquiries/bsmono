@@ -209,6 +209,15 @@ impl Player {
         // switcheroo, which shipped with star and refresh glyphs rendering as
         // boxes. Idempotent, so the double call costs nothing.
         uikit_egui::fonts::install(&cc.egui_ctx);
+        // Clean up films left by runs that did not exit cleanly. Drop covers a
+        // normal quit; it does not run on SIGKILL, an OOM kill, or a phone's
+        // session manager stopping the app -- and each of those leaves a whole
+        // video behind.
+        let swept = io::sweep_on_start();
+        if swept > 0 {
+            eprintln!("removed {swept} leftover download(s) from a previous run");
+        }
+
         let colors = vidkit_egui::install(&cc.egui_ctx, snapclone_theme::palette_by_id("dark"));
 
         // Opt-in while it is unproven on hardware. The glow context is handed
@@ -1045,10 +1054,10 @@ impl Player {
             // first frame arrives in milliseconds instead of after the whole
             // download. Falls back to download-then-play, because a site whose
             // streams ffmpeg cannot read directly still works that way.
-            match self.stream_page(&url, cap) {
+            let stream_err = match self.stream_page(&url, cap) {
                 Ok(()) => return,
-                Err(e) => self.gpu_error = Some(format!("{e} — falling back to download")),
-            }
+                Err(e) => e,
+            };
 
             match io::fetch_to_temp(&mut io::ProcessRunner::default(), &url, cap) {
                 Ok(media) => {
@@ -1064,20 +1073,14 @@ impl Player {
                         Err(e) => self.gpu_error = Some(format!("downloaded, but {e}")),
                     }
                 }
-                Err(e) => self.gpu_error = Some(e),
-            }
-            return;
-        }
-        #[allow(unreachable_code)]
-        if false {
-            match io::open_page_url(io::ProcessRunner::default(), &url, io::assumed_caps()) {
-                Ok(o) => self.accept_opened(o),
-                // Reported verbatim. The resolver's message names which of the
-                // several things went wrong -- yt-dlp missing, the extractor
-                // failing, no format the device can play -- and flattening
-                // those into "could not open" throws away the only part that
-                // tells anyone what to do.
-                Err(e) => self.gpu_error = Some(e),
+                // BOTH reasons, not just the last one. The download error
+                // overwrote the streaming error, so a failure that started in
+                // resolution was reported as a download problem and sent the
+                // reader to the wrong half of the system.
+                Err(e) => {
+                    self.gpu_error =
+                        Some(format!("streaming: {stream_err} / download: {e}"))
+                }
             }
             return;
         }

@@ -2337,3 +2337,143 @@ mod file_check_tests {
         let _ = std::fs::remove_file(p);
     }
 }
+
+/// The prefix every download directory uses.
+pub const TEMP_PREFIX: &str = "vidkit-dl-";
+
+/// Delete download directories left by earlier runs.
+///
+/// `TempMedia`'s `Drop` handles a clean exit. It does not run on SIGKILL, on
+/// an OOM kill, or when a phone's session manager stops the app — and those
+/// are the cases that matter, because what is left behind is a whole film. A
+/// few of those fill the storage of the device this targets, and nothing else
+/// in the system would ever clean them up.
+///
+/// Directories belonging to a LIVE process are left alone: two copies of the
+/// player running at once must not delete each other's download mid-playback.
+pub fn sweep_stale_downloads(tmp: &std::path::Path, is_running: impl Fn(u32) -> bool) -> usize {
+    let mut removed = 0;
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return 0;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(rest) = name.strip_prefix(TEMP_PREFIX) else {
+            continue;
+        };
+        // Belt and braces, and NOT load-bearing: `remove_dir_all` refuses a
+        // plain file, so deleting this check changes no behaviour and no test
+        // catches it. Kept because relying on that stdlib detail to protect
+        // someone's file is a worse bet than one explicit line.
+        if !e.path().is_dir() {
+            continue;
+        }
+        // `vidkit-dl-<pid>-<nanos>`.
+        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        if is_running(pid) {
+            continue;
+        }
+        if std::fs::remove_dir_all(e.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Is a process alive? `/proc` on Linux.
+pub fn pid_is_running(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Sweep the real temp directory at startup.
+pub fn sweep_on_start() -> usize {
+    sweep_stale_downloads(&std::env::temp_dir(), pid_is_running)
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("vidkit-sweep-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn download_dir(root: &std::path::Path, pid: u32, bytes: usize) -> std::path::PathBuf {
+        let d = root.join(format!("{TEMP_PREFIX}{pid}-12345"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("media.mp4"), vec![0u8; bytes]).unwrap();
+        d
+    }
+
+    /// What Drop cannot cover: a killed process leaves a whole film behind,
+    /// and a few of those fill a phone.
+    #[test]
+    fn a_dead_processes_download_is_removed() {
+        let root = scratch("dead");
+        let d = download_dir(&root, 999_999, 4096);
+        assert_eq!(sweep_stale_downloads(&root, |_| false), 1);
+        assert!(!d.exists(), "the film was left behind");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Two players running at once must not delete each other's download
+    /// mid-playback.
+    #[test]
+    fn a_live_processes_download_is_left_alone() {
+        let root = scratch("live");
+        let d = download_dir(&root, 4242, 4096);
+        assert_eq!(sweep_stale_downloads(&root, |pid| pid == 4242), 0);
+        assert!(d.exists(), "deleted a running player's download");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Only our own directories. Deleting somebody else's /tmp entry because
+    /// the name looked close enough is a far worse bug than leaking one.
+    #[test]
+    fn unrelated_temp_entries_are_untouched() {
+        let root = scratch("others");
+        std::fs::create_dir_all(root.join("someone-elses-work")).unwrap();
+        std::fs::write(root.join("vidkit-dl-notapid"), b"x").unwrap();
+        // A FILE whose name parses as a dead pid. The previous fixture's pid
+        // did not parse, so it was rejected before the is-a-directory check
+        // and that check was never exercised.
+        std::fs::write(root.join("vidkit-dl-999998-1"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("vidkit-dl-notapid-dir")).unwrap();
+        assert_eq!(sweep_stale_downloads(&root, |_| false), 0);
+        assert!(root.join("someone-elses-work").exists());
+        assert!(root.join("vidkit-dl-notapid").exists(), "deleted a file, not a dir");
+        assert!(
+            root.join("vidkit-dl-999998-1").exists(),
+            "deleted a plain file whose name looked like a download directory"
+        );
+        assert!(
+            root.join("vidkit-dl-notapid-dir").exists(),
+            "deleted a directory whose pid does not parse"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The current process is alive, so its own in-flight download survives a
+    /// sweep — otherwise starting a second window deletes the first's film.
+    #[test]
+    fn our_own_live_download_survives_a_real_sweep() {
+        let root = scratch("self");
+        let mine = download_dir(&root, std::process::id(), 1024);
+        assert_eq!(sweep_stale_downloads(&root, pid_is_running), 0);
+        assert!(mine.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_missing_temp_directory_is_not_an_error() {
+        assert_eq!(
+            sweep_stale_downloads(std::path::Path::new("/nope/nothing"), |_| false),
+            0
+        );
+    }
+}
