@@ -327,6 +327,15 @@ MUTANTS = [
     ("ytdlp/unreported-fallback-removed", "crates/vidkit-ytdlp/src/select.rs",
      "            return match unreported {", "            return match None::<&RawFormat> {"),
 
+    ("probe/m3-not-av1-capable", "crates/vidkit-v4l2/src/sysprobe.rs",
+     '        "t8122" | "t6030" | "t6031" | "t6034" | "t8132" | "t6040" | "t6041"', '        "t8103"'),
+    ("probe/m3-trusts-bound-gpu", "crates/vidkit-v4l2/src/sysprobe.rs",
+     "        caps.gpu = caps.gpu.min(GpuClass::Unaccelerated);", "        ()"),
+    ("probe/unknown-guesses-anyway", "crates/vidkit-v4l2/src/sysprobe.rs",
+     "        Detected::Unknown { .. } => return None,", "        Detected::Unknown { .. } => desktop_full_hw(),"),
+    ("probe/soc-id-check-removed", "crates/vidkit-v4l2/src/sysprobe.rs",
+     "            && rest[1..].chars().all(|ch| ch.is_ascii_digit());", "            ;"),
+
     # --- device profiles ---------------------------------------------------------
     ("caps/m3-claims-a-gpu", "crates/vidkit-core/src/caps.rs",
      "        gpu: GpuClass::Unaccelerated,", "        gpu: GpuClass::Vulkan,"),

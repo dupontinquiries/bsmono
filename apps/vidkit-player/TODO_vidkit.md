@@ -49,6 +49,11 @@ untestable wrapper would have looked like progress.
   by test, *assumed* on real hardware — the M3 resolution/fps limits in
   particular are placeholders, since the announcement says AV1 works and not to
   what limits
+- `vidkit_v4l2::sysprobe` reads the device-tree SoC id, the V4L2 driver names
+  and the bound DRM driver, so the profile is PROBED rather than guessed from
+  the target triple — which could not tell an M1 from an M3 from a Fairphone.
+  *verified* against fixture filesystem roots; never run on real hardware, so
+  the paths it reads are *read* from documentation
 - `GpuClass`: hardware decode does NOT imply a usable GPU. M3 decodes AV1 into
   DMA-BUFs with no driver to import them, so every frame is mapped and
   converted on the CPU — `frames_need_cpu_copy` reports it. *verified*

@@ -2608,6 +2608,7 @@ dependencies = [
  "vidkit-egui",
  "vidkit-mp4",
  "vidkit-stream",
+ "vidkit-v4l2",
  "vidkit-webm",
  "vidkit-ytdlp",
 ]
@@ -2624,6 +2625,14 @@ dependencies = [
  "vidkit-mp4",
  "vidkit-webm",
  "vidkit-ytdlp",
+]
+
+[[package]]
+name = "vidkit-v4l2"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "vidkit-core",
 ]
 
 [[package]]

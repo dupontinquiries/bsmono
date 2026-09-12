@@ -1012,19 +1012,21 @@ impl vidkit_stream::TransportFactory<Box<dyn HttpTransport + Send>> for SchemeFa
 /// the decoder cannot manage, so it is one function to replace rather than a
 /// choice scattered through the app.
 pub fn assumed_caps() -> vidkit_core::caps::DeviceCaps {
-    // aarch64 covers at least three shapes with opposite preferences: Venus
-    // (VP9 in hardware, no AV1), Asahi M1/M2 (neither in hardware, AV1 fastest
-    // in software) and Asahi M3 (AV1 in hardware, no usable GPU). Guessing one
-    // from the triple is wrong for two of them, which is why the probe is the
-    // real fix and this is one function.
-    if cfg!(target_arch = "aarch64") {
-        // Could equally be Asahi, whose preferences are the opposite way round
-        // — AV1 in software beats VP9 there, and the reverse on Venus. Guessing
-        // wrong costs battery rather than correctness, and probing is the fix.
-        vidkit_core::caps::fairphone_venus()
-    } else {
-        vidkit_core::caps::desktop_full_hw()
+    // Probed, not guessed. `sysprobe` reads the device-tree SoC id, the V4L2
+    // driver names and the bound DRM driver, all of which the kernel already
+    // knows — where the target triple could not tell an M1 from an M3 from a
+    // Fairphone, and was therefore wrong for two of the three aarch64 shapes
+    // this player targets.
+    let p = vidkit_v4l2::sysprobe::probe(std::path::Path::new("/"));
+    if let Some(caps) = vidkit_v4l2::sysprobe::caps_for(&p) {
+        return caps;
     }
+    // Unidentified. The probe refuses to guess and so does this: a desktop
+    // profile is the safe default because it assumes the least about what is
+    // present, and the evidence goes in the name so a bug report is one paste.
+    let mut fallback = vidkit_core::caps::desktop_full_hw();
+    fallback.name = format!("unrecognised device ({:?})", p.detected);
+    fallback
 }
 
 /// Why the direct-media branch exists, measured rather than argued.

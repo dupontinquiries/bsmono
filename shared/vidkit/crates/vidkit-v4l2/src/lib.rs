@@ -1,6 +1,7 @@
 //! Stateful V4L2 decoding, with the state machine separated from the ioctls so
 //! the sequencing can be tested without hardware.
 
+pub mod sysprobe;
 pub mod api;
 pub mod probe;
 #[cfg(target_os = "linux")]
