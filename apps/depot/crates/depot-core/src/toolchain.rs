@@ -54,21 +54,24 @@ pub fn parse_component_filename(name: &str) -> Option<(String, String, String)> 
 pub fn ingest_file(store: &Store, path: &Path) -> Result<(ToolchainEntry, bool)> {
     let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| invalid("bad filename"))?;
     let (component, version, triple) = parse_component_filename(name).ok_or_else(|| invalid(format!("{name}: not <component>-<version>-<triple>.tar.xz")))?;
-    // Cheap sanity: a component tarball is xz or gz; refuse an HTML error page
-    // saved with the right name, which is how a bad mirror fetch shows up.
-    let mut magic = [0u8; 6];
-    {
-        use std::io::Read;
-        let mut f = std::fs::File::open(path)?;
-        let n = f.read(&mut magic)?;
-        let is_xz = n >= 6 && magic == [0xfd, b'7', b'z', b'X', b'Z', 0x00];
-        let is_gz = n >= 2 && magic[..2] == [0x1f, 0x8b];
-        if !(is_xz || is_gz) {
-            return Err(invalid(format!("{name}: not an xz or gzip stream (magic {:02x?})", &magic[..n.min(6)])));
-        }
-    }
+    check_magic(path, name)?;
     let s = store.put_file(path, None)?;
     Ok((ToolchainEntry { version, triple, component, filename: name.to_string(), hash: s.hash, size: s.size, added: crate::now() }, s.fresh))
+}
+
+/// Cheap sanity: a component tarball is xz or gz; refuse an HTML error page
+/// saved with the right name, which is how a bad mirror fetch shows up.
+pub fn check_magic(path: &Path, name: &str) -> Result<()> {
+    use std::io::Read;
+    let mut magic = [0u8; 6];
+    let mut f = std::fs::File::open(path)?;
+    let n = f.read(&mut magic)?;
+    let is_xz = n >= 6 && magic == [0xfd, b'7', b'z', b'X', b'Z', 0x00];
+    let is_gz = n >= 2 && magic[..2] == [0x1f, 0x8b];
+    if !(is_xz || is_gz) {
+        return Err(invalid(format!("{name}: not an xz or gzip stream (magic {:02x?})", &magic[..n.min(6)])));
+    }
+    Ok(())
 }
 
 /// Ingest every `*.tar.xz`/`*.tar.gz` under `dir` (recursively one level —

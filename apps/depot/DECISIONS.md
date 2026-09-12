@@ -189,6 +189,14 @@ root, **and** applies the same check to the nearest existing ancestor for
 paths that do not exist yet — the case a plain `canonicalize()` misses and
 that a symlink inside `pub/` would otherwise open.
 
+Shutdown is one flag: `SIGTERM`/`SIGINT` set it (a two-line `signal(2)`
+handler via the `libc` bindings — std has no signal API), the accept loop
+sees it within 100 ms, closes the work channel and joins the workers, so a
+download in flight completes. Verified by killing the server mid-transfer:
+the client got all 11 MB and a 200. One caveat: an *idle* keep-alive
+connection holds its worker until the keep-alive timeout, so exit can lag
+by that much — systemd's default `TimeoutStopSec=90s` covers it.
+
 **Not taken:** hyper/axum (the seam is `Handler`; if HTTP/2 or TLS is
 wanted, it slots in there), `net-kit`'s server (single-threaded, buffered
 bodies — fine for its RPC use, wrong for 2 GB uploads).

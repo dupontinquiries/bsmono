@@ -59,7 +59,34 @@ impl App {
         }
     }
 
-    /// Stream a request body to a temp file under `<root>/tmp/`.
+    /// Stream a request body straight into the object store — hashed once,
+    /// on the way in, WITHOUT the catalog lock. The caller then ingests the
+    /// object under the lock, which for an RPM is a header read and for a
+    /// crate a tar scan; never a second pass over the bytes. If ingest
+    /// rejects it and the object was new, the caller removes it.
+    fn receive(&self, req: &mut Request<'_>) -> Result<depot_core::store::Stored, Response> {
+        if req.content_length == 0 {
+            return Err(Response::text(411, "Content-Length required\n"));
+        }
+        let store = depot_core::Store::open(&self.root);
+        let stored = store.put_reader(&mut req.body, None).map_err(|e| Response::text(400, format!("read body: {e}\n")))?;
+        if stored.size != req.content_length {
+            if stored.fresh {
+                let _ = store.remove(&stored.hash);
+            }
+            return Err(Response::text(400, format!("short body: {} of {} bytes\n", stored.size, req.content_length)));
+        }
+        Ok(stored)
+    }
+
+    fn discard_if_fresh(&self, stored: &depot_core::store::Stored) {
+        if stored.fresh {
+            let _ = depot_core::Store::open(&self.root).remove(&stored.hash);
+        }
+    }
+
+    /// Stream a request body to a temp file under `<root>/tmp/` (packs,
+    /// which are not objects themselves).
     fn spool(&self, req: &mut Request<'_>, suffix: &str) -> Result<PathBuf, Response> {
         if req.content_length == 0 {
             return Err(Response::text(411, "Content-Length required\n"));
@@ -184,15 +211,20 @@ impl App {
                 if let Err(r) = self.authorize(req) {
                     return r;
                 }
-                let tmp = match self.spool(req, ".crate") {
-                    Ok(p) => p,
+                let stored = match self.receive(req) {
+                    Ok(s) => s,
                     Err(r) => return r,
                 };
-                let res = self.depot.lock().unwrap().ingest_crate(&tmp);
-                let _ = std::fs::remove_file(&tmp);
+                let res = self.depot.lock().unwrap().ingest_crate_stored(&stored.hash);
                 match res {
-                    Ok(i) => ok_json(&i),
-                    Err(e) => err(422, e),
+                    Ok(mut i) => {
+                        i.fresh = stored.fresh;
+                        ok_json(&i)
+                    }
+                    Err(e) => {
+                        self.discard_if_fresh(&stored);
+                        err(422, e)
+                    }
                 }
             }
             ("POST", ["crates", name, vers, action @ ("yank" | "unyank")]) => {
@@ -227,15 +259,20 @@ impl App {
                     return r;
                 }
                 let repo = repo.to_string();
-                let tmp = match self.spool(req, ".rpm") {
-                    Ok(p) => p,
+                let stored = match self.receive(req) {
+                    Ok(s) => s,
                     Err(r) => return r,
                 };
-                let res = self.depot.lock().unwrap().ingest_rpm(&repo, &tmp, false);
-                let _ = std::fs::remove_file(&tmp);
+                let res = self.depot.lock().unwrap().ingest_rpm_stored(&repo, &stored.hash, false);
                 match res {
-                    Ok(i) => ok_json(&i),
-                    Err(e) => err(422, e),
+                    Ok(mut i) => {
+                        i.fresh = stored.fresh;
+                        ok_json(&i)
+                    }
+                    Err(e) => {
+                        self.discard_if_fresh(&stored);
+                        err(422, e)
+                    }
                 }
             }
             ("GET", ["nix"]) => {
@@ -260,20 +297,20 @@ impl App {
                 if fname.contains('/') || fname.contains("..") {
                     return Response::text(400, "bad X-Filename\n");
                 }
-                let tmp = match self.spool(req, ".tar") {
-                    Ok(p) => p,
+                let stored = match self.receive(req) {
+                    Ok(s) => s,
                     Err(r) => return r,
                 };
-                let named = tmp.with_file_name(&fname);
-                if std::fs::rename(&tmp, &named).is_err() {
-                    let _ = std::fs::remove_file(&tmp);
-                    return Response::text(500, "rename failed\n");
-                }
-                let res = self.depot.lock().unwrap().ingest_toolchain(&named);
-                let _ = std::fs::remove_file(&named);
+                let res = self.depot.lock().unwrap().ingest_toolchain_stored(&fname, &stored.hash);
                 match res {
-                    Ok((items, errors)) => ok_json(&json!({"ingested": items, "errors": errors})),
-                    Err(e) => err(422, e),
+                    Ok(mut i) => {
+                        i.fresh = stored.fresh;
+                        ok_json(&i)
+                    }
+                    Err(e) => {
+                        self.discard_if_fresh(&stored);
+                        err(422, e)
+                    }
                 }
             }
             ("GET", ["have"]) => {

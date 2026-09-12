@@ -57,10 +57,16 @@ Built and tested in a sandbox with the offline Rust 1.96 drop, `rpm`,
   against `index.json`, three components installed, `rustc 1.96.0`; that
   toolchain then built the depot-fetched crates. Breaking the computed hash
   makes the installer refuse and install nothing.
+- **HTTP writes** with the admin token: PUT crate (fresh, then duplicate →
+  `fresh:false`), PUT rpm, PUT a real 10 MB toolchain tarball (hash matches
+  the CLI path's), junk as a crate → 422 and the object is removed, wrong
+  token → 401. Uploads stream into the store without the catalog lock.
+- **UI executed** under jsdom against the live server (`tools/ui-test.js`):
+  18 checks across every view, including the Clients tab's live refresh.
+- **SIGTERM** mid-download: the download completes, the process exits.
 - curl: ETag/304, Range/206, HEAD, traversal refused, writes refused without
-  the admin token; UI and manual served; `node --check` on the UI script.
+  the admin token.
 - `systemd-analyze verify` passes; offline security exposure 1.2.
 
-Not verified: nix client, `flake.nix`, cross builds (musl/aarch64), the UI
-in a browser (JS syntax-checked, not executed), graceful SIGTERM drain.
-See [TODO.md](TODO.md).
+Not verified: nix client, `flake.nix`, cross builds (musl/aarch64), a real
+browser (jsdom only). See [TODO.md](TODO.md).

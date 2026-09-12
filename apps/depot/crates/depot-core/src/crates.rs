@@ -45,6 +45,14 @@ pub struct CrateMeta {
 /// the `Cargo.toml` entry is buffered.
 pub fn read_crate(path: &Path) -> Result<CrateMeta> {
     let (cksum, size) = sha256_file(path)?;
+    read_crate_known(path, &cksum, size)
+}
+
+/// `read_crate` with the sha256 and size already known (an object in the
+/// store). The gzip+tar scan for Cargo.toml still happens; that is the
+/// part that cannot be skipped.
+pub fn read_crate_known(path: &Path, cksum: &str, size: u64) -> Result<CrateMeta> {
+    let cksum = cksum.to_string();
     let f = std::fs::File::open(path)?;
     let gz = flate2::read::GzDecoder::new(f);
     let mut ar = tar::Archive::new(gz);

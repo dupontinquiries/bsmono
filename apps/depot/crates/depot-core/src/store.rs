@@ -86,6 +86,15 @@ impl Store {
     /// not match, nothing is written. The source is COPIED, not moved: the
     /// caller's file may be on another filesystem or one they want to keep.
     pub fn put_file(&self, src: &Path, expect: Option<&str>) -> Result<Stored> {
+        // Fast path: the caller already knows the hash and the object is
+        // here — nothing to read. This is what makes ingesting an object
+        // that an HTTP upload streamed into the store cost a stat, not a
+        // second pass over a 2 GB file under the catalog lock.
+        if let Some(e) = expect {
+            if let Some(size) = self.size_of(e) {
+                return Ok(Stored { hash: e.to_string(), size, fresh: false });
+            }
+        }
         let (hash, size) = sha256_file(src)?;
         if let Some(e) = expect {
             if e != hash {
@@ -126,6 +135,19 @@ impl Store {
         }
         self.commit(&tmp, &hash)?;
         Ok(Stored { hash, size, fresh: true })
+    }
+
+    /// Delete an object. Only `gc` and a failed ingest of a freshly uploaded
+    /// object should call this; nothing checks references here.
+    pub fn remove(&self, hash: &str) -> Result<()> {
+        let p = self.object_path(hash);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o644));
+        }
+        fs::remove_file(&p)?;
+        Ok(())
     }
 
     pub fn put_bytes(&self, data: &[u8]) -> Result<Stored> {

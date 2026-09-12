@@ -287,13 +287,7 @@ fn run(cli: &Cli) -> Result<(), String> {
             for h in &orphans {
                 bytes += d.store.size_of(h).unwrap_or(0);
                 if cli.flag("delete") {
-                    let p = d.store.object_path(h);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
-                    }
-                    std::fs::remove_file(&p).map_err(|e| e.to_string())?;
+                    d.store.remove(h).map_err(|e| e.to_string())?;
                 }
             }
             println!("{} unreferenced object(s), {}{}", orphans.len(), human(bytes), if cli.flag("delete") { " — deleted" } else { " (pass --delete to remove)" });
@@ -409,13 +403,39 @@ fn serve(cli: &Cli) -> Result<(), String> {
     let server = depot_httpd::Server::bind(&bind, app).map_err(|e| format!("bind {bind}: {e}"))?.workers(workers).log(log);
     let addr = server.local_addr().map_err(|e| e.to_string())?;
     eprintln!("depot serving {} on http://{addr}/  (HTTP writes {})", r.display(), if writes { "enabled" } else { "disabled" });
-    // Shutdown: systemd sends SIGTERM, whose default action ends the process.
-    // That is acceptable here because every write depot makes is atomic
-    // (temp file + rename), so there is nothing to flush. A graceful drain
-    // would need a signal handler and std has none; the flag is the hook.
+    // Shutdown: systemd sends SIGTERM (Ctrl-C sends SIGINT). The handler
+    // only sets a flag; the accept loop sees it within 100 ms, stops
+    // accepting, closes the work channel and joins the workers, so responses
+    // in flight complete. Every write is atomic anyway, so even an unclean
+    // kill loses nothing; this just avoids cutting a download at 99%.
     let stop = Arc::new(AtomicBool::new(false));
-    server.serve(stop).map_err(|e| e.to_string())
+    install_stop_handler(Arc::clone(&stop));
+    let r = server.serve(stop).map_err(|e| e.to_string());
+    eprintln!("depot: stopped");
+    r
 }
+
+#[cfg(unix)]
+fn install_stop_handler(stop: Arc<AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    static FLAG: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
+    // Async-signal-safe: one atomic store, no allocation, no locks.
+    extern "C" fn on_signal(_: libc::c_int) {
+        if let Some(f) = FLAG.get() {
+            f.store(true, Ordering::Relaxed);
+        }
+    }
+    let _ = FLAG.set(stop);
+    // SAFETY: installing a handler that only touches an atomic; the
+    // function pointer cast is what signal(2) expects.
+    unsafe {
+        libc::signal(libc::SIGTERM, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_stop_handler(_stop: Arc<AtomicBool>) {}
 
 fn write_private(path: &Path, contents: &str) -> Result<(), String> {
     if let Some(p) = path.parent() {

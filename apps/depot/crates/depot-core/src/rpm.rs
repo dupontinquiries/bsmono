@@ -314,9 +314,17 @@ impl RpmInfo {
     }
 }
 
-/// Read an RPM's lead, signature header and header. The payload is not read.
+/// Read an RPM's lead, signature header and header. The payload is not read
+/// (but the whole file is hashed for the pkgid).
 pub fn read_rpm(path: &Path) -> Result<RpmInfo> {
     let (sha256, size_package) = sha256_file(path)?;
+    read_rpm_known(path, &sha256, size_package)
+}
+
+/// `read_rpm` for a file whose sha256 and size are already known (an object
+/// in the store): only the headers are read.
+pub fn read_rpm_known(path: &Path, sha256: &str, size_package: u64) -> Result<RpmInfo> {
+    let sha256 = sha256.to_string();
     let mut f = File::open(path)?;
     let mut lead = [0u8; 96];
     f.read_exact(&mut lead).map_err(|_| invalid(format!("{}: too short for an RPM lead", path.display())))?;

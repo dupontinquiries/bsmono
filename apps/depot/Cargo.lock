@@ -187,6 +187,7 @@ dependencies = [
  "cli-kit",
  "depot-core",
  "depot-httpd",
+ "libc",
  "net-kit",
  "serde",
  "serde_json",

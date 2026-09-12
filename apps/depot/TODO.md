@@ -16,20 +16,23 @@ Unverified or unbuilt, in the order they matter.
       optional `zstd` feature is the only thing that would need a cross CC.
 - [ ] **flake.nix** — written from the `buildRustPackage` pattern, never
       evaluated.
-- [ ] **UI in a browser.** Routes and JSON verified with curl; `node
-      --check` passes; the JS has not been executed. Check: hash routing,
-      filter boxes, yank button with a token, the Clients tab's checkbox →
-      snippet refresh.
-- [ ] **Graceful SIGTERM drain.** The accept loop polls a stop flag but
-      nothing sets it (std has no signal handler). Safe today because every
-      write is atomic; a `signal-hook`-free option is a `/proc/self`-free
-      pipe trick via `sigaction` through libc — decide whether one libc
-      call is worth it.
-- [ ] **Lock held while hashing uploads.** `PUT /api/*` spools to disk
-      without the lock but `ingest_*` re-hashes under it. For a 2 GB
-      toolchain tarball that blocks API reads for seconds. Fix: hash in
-      `spool`, pass the hash to `put_file` (it already accepts an expected
-      hash) — then the lock hold is a rename.
+- [x] ~~UI in a browser~~ — executed under jsdom against a live server
+      (`tools/ui-test.js`, 18 checks: every view, yank-without-token alert,
+      token save, verify button, Clients checkboxes → snippet + one-liner
+      refresh, manual/decisions markdown). Not done: a real browser, the
+      yank button WITH a token (needs a writable depot in the harness).
+- [x] ~~Graceful SIGTERM drain~~ — `signal(2)` via libc sets the flag;
+      verified: TERM mid-download, the download completed, "depot: stopped"
+      logged. Remaining: an idle keep-alive connection delays exit by the
+      keep-alive timeout (worker blocked in read); make handle_connection
+      check the flag between requests if that ever matters.
+- [x] ~~Lock held while hashing uploads~~ — uploads now stream straight
+      into the store (hashed once, no lock), then `ingest_*_stored(hash)`
+      runs under the lock: header read for RPMs, Cargo.toml scan for crates,
+      a stat for toolchains. `put_file` short-circuits when the expected
+      object exists. A rejected fresh upload is removed. Verified over HTTP
+      with a 10 MB tarball; the crate/rpm catalog entries are asserted equal
+      to the file-ingest path in `depot::tests`.
 - [ ] `comps.xml` / `updateinfo.xml` for dnf groups and advisories
       (Anaconda environment picker needs comps).
 - [ ] rustup dist-server layout (channel manifest + dated paths) so

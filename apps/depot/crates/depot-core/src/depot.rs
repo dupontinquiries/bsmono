@@ -65,6 +65,19 @@ impl Depot {
     pub fn ingest_crate(&mut self, path: &Path) -> Result<Ingested> {
         let m = crates::read_crate(path)?;
         let s = self.store.put_file(path, Some(&m.cksum))?;
+        self.finish_crate(m, s)
+    }
+
+    /// Ingest a `.crate` that is already an object in the store (an HTTP
+    /// upload streamed there without holding this lock). Only the
+    /// Cargo.toml scan happens here; no hashing, no copy.
+    pub fn ingest_crate_stored(&mut self, hash: &str) -> Result<Ingested> {
+        let size = self.store.size_of(hash).ok_or_else(|| invalid(format!("object {hash} is not in the store")))?;
+        let m = crates::read_crate_known(&self.store.object_path(hash), hash, size)?;
+        self.finish_crate(m, crate::store::Stored { hash: hash.to_string(), size, fresh: true })
+    }
+
+    fn finish_crate(&mut self, m: crates::CrateMeta, s: crate::store::Stored) -> Result<Ingested> {
         self.catalog.upsert_crate(&m.name, CrateEntry { vers: m.vers.clone(), hash: s.hash.clone(), size: s.size, index_line: m.index_line, yanked: false, added: crate::now() });
         self.catalog.save(&self.root)?;
         self.views().rebuild_crate(&m.name)?;
@@ -78,6 +91,19 @@ impl Depot {
         check_repo_id(repo)?;
         let info = rpm::read_rpm(path)?;
         let s = self.store.put_file(path, Some(&info.sha256))?;
+        self.finish_rpm(repo, info, s, defer_views)
+    }
+
+    /// `ingest_rpm` for an object already in the store: reads the headers
+    /// only (the pkgid IS the object name).
+    pub fn ingest_rpm_stored(&mut self, repo: &str, hash: &str, defer_views: bool) -> Result<Ingested> {
+        check_repo_id(repo)?;
+        let size = self.store.size_of(hash).ok_or_else(|| invalid(format!("object {hash} is not in the store")))?;
+        let info = rpm::read_rpm_known(&self.store.object_path(hash), hash, size)?;
+        self.finish_rpm(repo, info, crate::store::Stored { hash: hash.to_string(), size, fresh: true }, defer_views)
+    }
+
+    fn finish_rpm(&mut self, repo: &str, info: rpm::RpmInfo, s: crate::store::Stored, defer_views: bool) -> Result<Ingested> {
         let filename = info.filename();
         let href = crate::views::rpm_href(&info.name, &filename);
         let now = crate::now();
@@ -161,6 +187,20 @@ impl Depot {
         self.catalog.save(&self.root)?;
         self.views().rebuild_toolchains()?;
         Ok((out, errors))
+    }
+
+    /// A toolchain tarball already in the store: the filename carries the
+    /// metadata, the object carries the bytes.
+    pub fn ingest_toolchain_stored(&mut self, filename: &str, hash: &str) -> Result<Ingested> {
+        let size = self.store.size_of(hash).ok_or_else(|| invalid(format!("object {hash} is not in the store")))?;
+        let (component, version, triple) = toolchain::parse_component_filename(filename).ok_or_else(|| invalid(format!("{filename}: not <component>-<version>-<triple>.tar.xz")))?;
+        toolchain::check_magic(&self.store.object_path(hash), filename)?;
+        let e = crate::catalog::ToolchainEntry { version, triple, component, filename: filename.to_string(), hash: hash.to_string(), size, added: crate::now() };
+        let id = format!("{}/{}/{}", e.version, e.triple, e.component);
+        self.catalog.upsert_toolchain(e);
+        self.catalog.save(&self.root)?;
+        self.views().rebuild_toolchains()?;
+        Ok(Ingested { kind: "toolchain", id, hash: hash.to_string(), size, fresh: true })
     }
 
     pub fn yank_crate(&mut self, name: &str, vers: &str, yanked: bool) -> Result<()> {
@@ -299,6 +339,51 @@ mod tests {
         assert_eq!(w2.objects, 0);
 
         assert!(Depot::open(&crate::tmpdir("not-a-depot")).is_err());
+        std::fs::remove_dir_all(a).unwrap();
+        std::fs::remove_dir_all(b).unwrap();
+    }
+
+    #[test]
+    fn stored_ingest_paths_match_file_ingest_and_reject_cleanly() {
+        let a = crate::tmpdir("depot-stored-a");
+        let b = crate::tmpdir("depot-stored-b");
+        let mut file_side = Depot::init(&a).unwrap();
+        let mut stream_side = Depot::init(&b).unwrap();
+        // The HTTP path: bytes land in the store first (no lock), then the
+        // catalog is built from the object. It must produce the same catalog
+        // entries as ingesting the file directly.
+        for (kind, f) in [("crate", "cfg-if-1.0.0.crate"), ("rpm", "edge-1.2.3-4.fc42.noarch.rpm")] {
+            let path = testdata(f);
+            let mut fh = std::fs::File::open(&path).unwrap();
+            let stored = stream_side.store.put_reader(&mut fh, None).unwrap();
+            assert!(stored.fresh);
+            let (via_file, via_store) = if kind == "crate" {
+                (file_side.ingest_crate(&path).unwrap(), stream_side.ingest_crate_stored(&stored.hash).unwrap())
+            } else {
+                (file_side.ingest_rpm("r", &path, false).unwrap(), stream_side.ingest_rpm_stored("r", &stored.hash, false).unwrap())
+            };
+            assert_eq!((via_file.id.clone(), via_file.hash.clone(), via_file.size), (via_store.id, via_store.hash, via_store.size));
+        }
+        assert_eq!(serde_json::to_string(&file_side.catalog.crates).unwrap(), serde_json::to_string(&stream_side.catalog.crates).unwrap());
+        assert_eq!(file_side.catalog.rpm["r"].packages[0].primary_xml, stream_side.catalog.rpm["r"].packages[0].primary_xml, "same fragment object → same bytes");
+        // Toolchain: name carries the metadata, object carries the bytes.
+        let mut xz = vec![0xfd, b'7', b'z', b'X', b'Z', 0x00];
+        xz.extend_from_slice(b"payload");
+        let st = stream_side.store.put_bytes(&xz).unwrap();
+        let t = stream_side.ingest_toolchain_stored("rust-std-1.96.0-aarch64-unknown-linux-musl.tar.xz", &st.hash).unwrap();
+        assert_eq!(t.id, "1.96.0/aarch64-unknown-linux-musl/rust-std");
+        assert!(stream_side.ingest_toolchain_stored("README.md", &st.hash).is_err());
+        // A crate that is not a crate: the caller (web) removes the fresh
+        // object; here we check the ingest error and Store::remove.
+        let junk = stream_side.store.put_bytes(b"not a crate").unwrap();
+        assert!(stream_side.ingest_crate_stored(&junk.hash).is_err());
+        stream_side.store.remove(&junk.hash).unwrap();
+        assert!(!stream_side.store.has(&junk.hash));
+        assert!(stream_side.ingest_crate_stored(&"0".repeat(64)).is_err(), "unknown object");
+        // put_file fast path: expected hash + object present → no read of src
+        // (src may not even exist).
+        let s = stream_side.store.put_file(Path::new("/nonexistent/file"), Some(&st.hash)).unwrap();
+        assert_eq!((s.fresh, s.size), (false, xz.len() as u64));
         std::fs::remove_dir_all(a).unwrap();
         std::fs::remove_dir_all(b).unwrap();
     }
