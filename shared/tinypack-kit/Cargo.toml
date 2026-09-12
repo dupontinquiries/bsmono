@@ -1,0 +1,24 @@
+[package]
+name = "tinypack-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Fit the most into a tiny fixed byte budget (NFC tag, DHT value, QR): a static-vocabulary token codec for short text that beats deflate on messages under ~1 KB and never expands, an adaptive binary arithmetic coder, and a headerless 8x8-DCT image codec that binary-searches its quantiser to land under a budget. Zero dependencies; the CLI speaks PGM/PPM, PNG is a feature."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "tinypack"
+path = "src/bin/tinypack.rs"
+
+[features]
+default = []
+# PNG read/write for the CLI. Off by default so the kit stays dependency-free.
+png = ["dep:png"]
+
+[dependencies]
+png = { version = "0.17", optional = true }
+
+[profile.release]
+opt-level = 3
