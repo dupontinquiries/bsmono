@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>unendlich · rig harness</title>
+<style>
+  :root { --bg:#0c0f14; --panel:#11151c; --line:#232c38; --ink:#d8dde6; --dim:#6b7787; --amber:#e0a85e; --red:#c8553d; --green:#6fbf73; --blue:#5ea0e0; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html, body { height:100%; background:var(--bg); color:var(--ink); font-family: ui-monospace, "IBM Plex Mono", Menlo, monospace; font-size:12px; overflow:hidden; }
+  #stage { position:fixed; inset:0; }
+  #tabs { position:fixed; top:0; left:0; right:0; display:flex; gap:2px; padding:8px 10px; background:linear-gradient(180deg, rgba(12,15,20,.95), rgba(12,15,20,0)); z-index:5; }
+  #tabs button, .btn { background:var(--panel); border:1px solid var(--line); color:var(--dim); padding:6px 12px; cursor:pointer; font:inherit; letter-spacing:.08em; text-transform:uppercase; font-size:10.5px; }
+  #tabs button.on, .btn.on { color:var(--amber); border-color:var(--amber); }
+  #tabs .title { margin-left:auto; color:var(--dim); font-size:10.5px; align-self:center; letter-spacing:.1em; }
+  #dock { position:fixed; left:10px; bottom:10px; width:min(440px, calc(100vw - 20px)); background:rgba(17,21,28,.92); border:1px solid var(--line); padding:10px 12px; z-index:5; max-height:calc(100vh - 70px); overflow:auto; }
+  #dock .row { display:flex; align-items:center; gap:8px; margin:5px 0; flex-wrap:wrap; }
+  #dock label { color:var(--dim); min-width:64px; }
+  #dock select, #dock input[type=range] { flex:1; font:inherit; background:var(--bg); color:var(--ink); border:1px solid var(--line); }
+  #dock input[type=range] { accent-color: var(--amber); }
+  .kv { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:2px 10px; margin-top:6px; }
+  .kv div { color:var(--dim); } .kv div b { color:var(--ink); font-weight:500; }
+  .note { color:var(--amber); margin-top:6px; min-height:1.2em; }
+  #log { max-height:140px; overflow:auto; border-top:1px solid var(--line); margin-top:6px; padding-top:4px; color:var(--dim); }
+  #log .ev { color:var(--ink); } #log .ev.hit { color:var(--red); } #log .ev.now { background:rgba(224,168,94,.15); }
+  .hp { height:6px; background:#222; border:1px solid var(--line); flex:1; } .hp i { display:block; height:100%; background:var(--green); }
+  #brain { position:fixed; top:48px; left:10px; right:10px; bottom:10px; background:var(--panel); border:1px solid var(--line); display:none; }
+  #brain canvas { width:100%; height:100%; display:block; }
+  #items2d { position:fixed; top:48px; left:10px; right:10px; display:none; gap:8px; flex-wrap:wrap; z-index:4; }
+  #items2d .ic { width:64px; text-align:center; color:var(--dim); font-size:9.5px; } #items2d canvas { width:64px; height:64px; background:var(--panel); border:1px solid var(--line); display:block; }
+  #help { position:fixed; right:10px; bottom:10px; color:var(--dim); font-size:10.5px; text-align:right; line-height:1.6; z-index:5; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="tabs">
+  <button data-tab="creature" class="on">Creature</button>
+  <button data-tab="items">Items</button>
+  <button data-tab="melee">Melee</button>
+  <button data-tab="brain">Brain</button>
+  <span class="title">unendlich · rig harness — real engine files, posed by anim_rig</span>
+</div>
+<div id="items2d"></div>
+<div id="brain"><canvas id="brainc"></canvas></div>
+<div id="dock">
+  <div class="row" id="seqrow"><label>sequence</label><select id="seq"></select></div>
+  <div class="row"><button class="btn on" id="play">pause</button><label>speed</label><input type="range" id="rate" min="0.1" max="2" step="0.1" value="1"><span id="ratev">1.0×</span></div>
+  <div class="row"><label>frame</label><input type="range" id="scrub" min="0" max="1" step="1" value="0"><span id="tv">0.00 s</span></div>
+  <div class="row" id="hprow" style="display:none"><label>A hp</label><div class="hp"><i id="hpa"></i></div><span id="hpav"></span><label>B hp</label><div class="hp"><i id="hpb"></i></div><span id="hpbv"></span></div>
+  <div class="kv" id="kv"></div>
+  <div class="note" id="note"></div>
+  <div id="log" style="display:none"></div>
+</div>
+<div id="help">drag: orbit · wheel: zoom · space: play/pause · ←/→: step<br>corners come from anim_rig::corners — what the entity pass draws</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const DATA = __DATA__;
+
+// ── scene ──────────────────────────────────────────────────────────
+const stage = document.getElementById('stage');
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(40, innerWidth/innerHeight, 0.05, 200);
+const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+stage.appendChild(renderer.domElement);
+scene.add(new THREE.AmbientLight(0x404a57, 1.1));
+const key = new THREE.DirectionalLight(0xfff0d8, 1.1); key.position.set(4, 7, 5); scene.add(key);
+const fill = new THREE.DirectionalLight(0x6fa0ff, 0.4); fill.position.set(-5, 2, -3); scene.add(fill);
+const grid = new THREE.GridHelper(40, 40, 0x2a3442, 0x1a2129); scene.add(grid);
+
+// orbit
+let orbit = { yaw: 0.9, pitch: 0.42, dist: 5, target: new THREE.Vector3(0, 0.3, 0) };
+function placeCamera(){
+  const { yaw, pitch, dist, target } = orbit;
+  camera.position.set(target.x + dist*Math.cos(pitch)*Math.sin(yaw), target.y + dist*Math.sin(pitch), target.z + dist*Math.cos(pitch)*Math.cos(yaw));
+  camera.lookAt(target);
+}
+let dragging = false, px = 0, py = 0;
+renderer.domElement.addEventListener('pointerdown', e => { dragging = true; px = e.clientX; py = e.clientY; });
+addEventListener('pointerup', () => dragging = false);
+addEventListener('pointermove', e => { if (!dragging) return; orbit.yaw -= (e.clientX - px) * 0.008; orbit.pitch = Math.max(-1.2, Math.min(1.45, orbit.pitch + (e.clientY - py) * 0.008)); px = e.clientX; py = e.clientY; });
+renderer.domElement.addEventListener('wheel', e => { orbit.dist = Math.max(1, Math.min(60, orbit.dist * (1 + e.deltaY * 0.001))); }, { passive:true });
+addEventListener('resize', () => { camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+// ── box meshes from engine corners ─────────────────────────────────
+// Corner order is push_box_oriented's: i = sx*4 + sy*2 + sz, each -/+.
+// FACE_INDICES is the engine's winding (world/entity.rs).
+const FACE = [4,6,7,4,7,5, 0,1,3,0,3,2, 2,3,7,2,7,6, 0,4,5,0,5,1, 1,5,7,1,7,3, 0,2,6,0,6,4];
+function makeBox(color){
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(36*3), 3));
+  const m = new THREE.MeshStandardMaterial({ color: new THREE.Color(color[0], color[1], color[2]), roughness: 0.85, metalness: 0.0, flatShading: true, side: THREE.DoubleSide });
+  return new THREE.Mesh(g, m);
+}
+function setBox(mesh, c /*24 floats*/, offset /*[x,y,z]*/){
+  const a = mesh.geometry.attributes.position.array;
+  for (let i = 0; i < 36; i++) {
+    const k = FACE[i]*3;
+    a[i*3] = c[k] + offset[0]; a[i*3+1] = c[k+1] + offset[1]; a[i*3+2] = c[k+2] + offset[2];
+  }
+  mesh.geometry.attributes.position.needsUpdate = true;
+  mesh.geometry.computeVertexNormals();
+}
+// A group of N boxes that tracks a frame's box list.
+class BoxSet {
+  constructor(){ this.group = new THREE.Group(); scene.add(this.group); this.meshes = []; }
+  show(boxes, offset){
+    while (this.meshes.length < boxes.length) { const m = makeBox([1,1,1]); this.meshes.push(m); this.group.add(m); }
+    this.meshes.forEach((m, i) => {
+      if (i < boxes.length) { m.visible = true; m.material.color.setRGB(boxes[i].color[0], boxes[i].color[1], boxes[i].color[2]); setBox(m, boxes[i].c, offset); }
+      else m.visible = false;
+    });
+  }
+  hide(){ this.meshes.forEach(m => m.visible = false); }
+}
+
+// ── tabs ───────────────────────────────────────────────────────────
+let tab = 'creature';
+const dock = document.getElementById('dock');
+document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => { document.querySelectorAll('#tabs button').forEach(x => x.classList.remove('on')); b.classList.add('on'); setTab(b.dataset.tab); });
+function setTab(t){
+  tab = t;
+  document.getElementById('brain').style.display = t === 'brain' ? 'block' : 'none';
+  document.getElementById('items2d').style.display = t === 'items' ? 'flex' : 'none';
+  document.getElementById('seqrow').style.display = t === 'creature' ? 'flex' : 'none';
+  document.getElementById('hprow').style.display = t === 'melee' ? 'flex' : 'none';
+  document.getElementById('log').style.display = t === 'melee' ? 'block' : 'none';
+  dock.style.display = t === 'brain' ? 'none' : 'block';
+  creatureSet.hide(); meleeA.hide(); meleeB.hide(); itemGroup.visible = false; grid.visible = t !== 'items';
+  frame = 0; playing = true;
+  if (t === 'creature') { loadSeq(); orbit.dist = 5; orbit.target.set(0, 0.3, 0); }
+  if (t === 'melee') { orbit.dist = 9; orbit.target.set(0, 0.3, 0); document.getElementById('scrub').max = DATA.melee.frames.length - 1; }
+  if (t === 'items') { itemGroup.visible = true; orbit.dist = 22; orbit.target.set(0, 0.5, 0); }
+  if (t === 'brain') drawBrain();
+}
+
+// ── creature sequences ─────────────────────────────────────────────
+const creatureSet = new BoxSet();
+const seqSel = document.getElementById('seq');
+DATA.sequences.forEach((s, i) => { const o = document.createElement('option'); o.value = i; o.textContent = `${s.name} (${s.creature}, ${s.frames.length} frames)`; seqSel.appendChild(o); });
+let seq = DATA.sequences[0];
+seqSel.onchange = () => { loadSeq(); };
+function loadSeq(){ seq = DATA.sequences[+seqSel.value]; frame = 0; document.getElementById('scrub').max = seq.frames.length - 1; if (seq.creature === 'dragon') orbit.dist = 14; }
+
+// ── melee ──────────────────────────────────────────────────────────
+const meleeA = new BoxSet(), meleeB = new BoxSet();
+const logEl = document.getElementById('log');
+const meleeEvents = [];
+DATA.melee.frames.forEach((f, i) => f.events.forEach(e => meleeEvents.push({ i, t: f.t, e })));
+logEl.innerHTML = meleeEvents.map((x, k) => `<div class="ev ${x.e.includes('hits') ? 'hit' : ''}" data-k="${k}">${x.t.toFixed(2)}s ${x.e}</div>`).join('');
+
+// ── items ──────────────────────────────────────────────────────────
+const itemGroup = new THREE.Group(); scene.add(itemGroup); itemGroup.visible = false;
+const U = 0.35; // viewer scale per voxel unit
+DATA.items.forEach((it, i) => {
+  const g = new THREE.Group();
+  const col = i % 7, row = Math.floor(i / 7);
+  g.position.set((col - 3) * 5.2, 0.5, (row - 0.5) * 6.5);
+  it.boxes.forEach(b => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(b.size[0]*U, b.size[1]*U, b.size[2]*U), new THREE.MeshStandardMaterial({ color: new THREE.Color(...b.color), roughness: 0.8, flatShading: true }));
+    m.position.set(b.center[0]*U, b.center[1]*U, b.center[2]*U);
+    g.add(m);
+  });
+  g.userData.name = it.class;
+  itemGroup.add(g);
+  // 2D icon: the same boxes projected by item_model::icon_quads
+  const wrap = document.createElement('div'); wrap.className = 'ic';
+  const c = document.createElement('canvas'); c.width = 128; c.height = 128;
+  const ctx = c.getContext('2d');
+  it.icon.forEach(q => {
+    ctx.beginPath();
+    q.pts.forEach((p, k) => { const x = p[0]*128, y = 128 - p[1]*128; k ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+    ctx.closePath();
+    ctx.fillStyle = `rgb(${q.color.map(v => Math.round(v*255)).join(',')})`; ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,.45)'; ctx.lineWidth = 1.2; ctx.stroke();
+  });
+  wrap.appendChild(c); wrap.appendChild(document.createTextNode(it.class));
+  document.getElementById('items2d').appendChild(wrap);
+});
+
+// ── brain chart ────────────────────────────────────────────────────
+const behaviorColor = { Rest:'#5ea0e0', Forage:'#6fbf73', Patrol:'#8a93a3', Fight:'#e0a85e', Flee:'#c8553d' };
+function drawBrain(){
+  const c = document.getElementById('brainc'); const W = c.width = c.clientWidth*devicePixelRatio, H = c.height = c.clientHeight*devicePixelRatio;
+  const ctx = c.getContext('2d'); ctx.scale(devicePixelRatio, devicePixelRatio); const w = c.clientWidth, h = c.clientHeight;
+  const fr = DATA.brain.frames, t1 = fr[fr.length-1].t;
+  const x = t => 50 + (t/t1)*(w-70), y = v => 30 + (1-v)*(h-130);
+  ctx.fillStyle = '#11151c'; ctx.fillRect(0,0,w,h);
+  // choice band
+  fr.forEach((f, i) => { ctx.fillStyle = behaviorColor[f.choice]; ctx.fillRect(x(f.t), h-80, Math.ceil(x(t1/(fr.length-1)) - x(0)) + 1, 26); if (f.held_by_hysteresis) { ctx.fillStyle = '#fff'; ctx.fillRect(x(f.t), h-54, 1, 6); } });
+  ctx.fillStyle = '#6b7787'; ctx.font = '11px ui-monospace, monospace';
+  ctx.fillText('chosen behavior (behavior_arbiter::select, hysteresis 0.15) — white ticks: held by hysteresis (raw argmax differed)', 50, h-32);
+  ctx.fillText(`flips: ${DATA.brain.flips} over ${fr.length} ticks`, 50, h-14);
+  // drives
+  const series = [['threat','#c8553d'],['hunger','#6fbf73'],['fatigue','#5ea0e0'],['health','#d8dde6'],['aggression','#e0a85e']];
+  series.forEach(([k, col], si) => {
+    ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.beginPath();
+    fr.forEach((f, i) => { const X = x(f.t), Y = y(f.drives[k]); i ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); }); ctx.stroke();
+    ctx.fillStyle = col; ctx.fillText(k, 50 + si*90, 18);
+  });
+  ctx.strokeStyle = '#232c38'; ctx.beginPath(); ctx.moveTo(50, y(0)); ctx.lineTo(w-20, y(0)); ctx.moveTo(50, y(1)); ctx.lineTo(w-20, y(1)); ctx.stroke();
+  ctx.fillStyle = '#6b7787'; ctx.fillText('1', 36, y(1)+4); ctx.fillText('0', 36, y(0)+4);
+  Object.entries(behaviorColor).forEach(([k, col], i) => { ctx.fillStyle = col; ctx.fillRect(w-330 + i*62, h-108, 10, 10); ctx.fillStyle = '#d8dde6'; ctx.fillText(k, w-316 + i*62, h-99); });
+  // scenario labels
+  ctx.fillStyle = '#6b7787';
+  [['0–8 hunger rises', 0.5],['8 fed', 8.2],['14 rests', 14.2],['20 predator', 20.2]].forEach(([s, t]) => ctx.fillText(s, x(t), y(1)-6));
+}
+
+// ── playback ───────────────────────────────────────────────────────
+let frame = 0, playing = true, rate = 1, acc = 0, last = performance.now();
+const scrub = document.getElementById('scrub'), kv = document.getElementById('kv'), note = document.getElementById('note');
+document.getElementById('play').onclick = () => { playing = !playing; document.getElementById('play').textContent = playing ? 'pause' : 'play'; };
+document.getElementById('rate').oninput = e => { rate = +e.target.value; document.getElementById('ratev').textContent = rate.toFixed(1) + '×'; };
+scrub.oninput = e => { frame = +e.target.value; playing = false; document.getElementById('play').textContent = 'play'; };
+addEventListener('keydown', e => { if (e.code === 'Space') { document.getElementById('play').click(); e.preventDefault(); } if (e.code === 'ArrowRight') { frame++; playing = false; } if (e.code === 'ArrowLeft') { frame--; playing = false; } });
+
+function frameCount(){ return tab === 'melee' ? DATA.melee.frames.length : (tab === 'creature' ? seq.frames.length : 1); }
+function showKV(obj){ kv.innerHTML = Object.entries(obj).map(([k, v]) => `<div>${k} <b>${typeof v === 'number' ? v.toFixed(2) : v}</b></div>`).join(''); }
+
+function tick(now){
+  const dt = (now - last) / 1000; last = now;
+  const n = frameCount();
+  if (playing && n > 1) { acc += dt * rate; const fdt = tab === 'melee' ? DATA.melee.dt : seq.dt; while (acc >= fdt) { acc -= fdt; frame++; } }
+  frame = ((frame % n) + n) % n; scrub.value = frame;
+  if (tab === 'creature') {
+    const f = seq.frames[frame];
+    // treadmill: the creature stays at the origin, the grid slides by its travel
+    creatureSet.show(f.boxes, [0, groundOffset(seq), 0]);
+    grid.position.x = -(f.body[0] % 1);
+    document.getElementById('tv').textContent = f.t.toFixed(2) + ' s';
+    showKV(f.input); note.textContent = f.note;
+  } else if (tab === 'melee') {
+    const f = DATA.melee.frames[frame];
+    const g = groundOffset(seq);
+    grid.position.x = 0;
+    meleeA.show(rot(f.a.boxes, f.a.yaw), [f.a.x, g, 0]); meleeB.show(rot(f.b.boxes, f.b.yaw), [f.b.x, g, 0]);
+    document.getElementById('tv').textContent = f.t.toFixed(2) + ' s';
+    const A = DATA.melee.fighters.a, B = DATA.melee.fighters.b;
+    document.getElementById('hpa').style.width = (100*f.a.hp/A.max_hp) + '%'; document.getElementById('hpav').textContent = f.a.hp.toFixed(1);
+    document.getElementById('hpb').style.width = (100*f.b.hp/B.max_hp) + '%'; document.getElementById('hpbv').textContent = f.b.hp.toFixed(1);
+    showKV({ 'A phase': f.a.phase, 'A strike01': f.a.strike01, 'A cooldown': f.a.cooldown, 'B phase': f.b.phase, 'B strike01': f.b.strike01, 'B cooldown': f.b.cooldown, dist: f.dist });
+    note.textContent = f.events.join(' · ');
+    logEl.querySelectorAll('.ev').forEach(el => el.classList.toggle('now', meleeEvents[+el.dataset.k].i <= frame && meleeEvents[+el.dataset.k].i > frame - 15));
+  } else if (tab === 'items') {
+    itemGroup.children.forEach((g, i) => g.rotation.y = now * 0.0004 + i * 0.4);
+  }
+  placeCamera();
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+// rest the standing sole on the grid: the fixture's lowest rest corner
+function groundOffset(s){
+  const fx = DATA.creatures[s ? s.creature : 'fauna'];
+  let lo = -fx.torso[1]; fx.parts.forEach(p => lo = Math.min(lo, p.offset[1] - p.half[1]));
+  return -lo;
+}
+// yaw a box list about Y (melee fighter B faces −X) — the body rotation
+// anim_rig::world_corners applies; done here so both fighters share the
+// body-local pose stream the engine consumes.
+function rot(boxes, yaw){
+  if (!yaw) return boxes;
+  const s = Math.sin(yaw), c = Math.cos(yaw);
+  return boxes.map(b => { const out = new Array(24); for (let i = 0; i < 8; i++) { const x = b.c[i*3], y = b.c[i*3+1], z = b.c[i*3+2]; out[i*3] = x*c - z*s; out[i*3+1] = y; out[i*3+2] = x*s + z*c; } return { color: b.color, c: out }; });
+}
+setTab('creature');
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
