@@ -182,9 +182,15 @@ async fn radio_loop(
                     });
                 }
                 Command::SetPower { id, on } => {
+                    // The accessory's own answer, not the value we asked for. `set_power`
+                    // reads the characteristic back inside the same session — a write that is
+                    // ACKed and does nothing (child lock, fault state) would otherwise leave
+                    // the row showing On over a socket that is off.
+                    let mut confirmed = on;
                     let r = if kind_of(&central, &id).await == Kind::HomeKit {
-                        hap_write_power(&central, &store, &id, on).await.map(|trace| {
-                            for l in trace { let _ = ev_tx.send(Event::Failed { id: None, message: format!("hap {l}") }); }
+                        hap_write_power(&central, &store, &id, on).await.map(|(actual, trace)| {
+                            confirmed = actual;
+                            for l in trace { let _ = ev_tx.send(Event::Failed { id: None, message: format!("hap: {l}") }); }
                         })
                     } else {
                         write_power(&central, &id, on).await
@@ -192,7 +198,7 @@ async fn radio_loop(
                     let _ = ev_tx.send(match r {
                         Ok(()) => Event::PowerIs {
                             id,
-                            power: if on { Power::On } else { Power::Off },
+                            power: if confirmed { Power::On } else { Power::Off },
                         },
                         Err(m) => Event::Failed {
                             id: Some(id),
@@ -433,7 +439,7 @@ async fn hap_write_power(
     store: &crate::hap::Store,
     id: &DeviceId,
     on: bool,
-) -> Result<Vec<String>, String> {
+) -> Result<(bool, Vec<String>), String> {
     let pairing = store.load(id).ok_or_else(|| "HomeKit accessory: pair it first (8-digit setup code on the plug)".to_string())?;
     let p = find(central, id).await?;
     crate::hap::set_power(p, pairing, on).await

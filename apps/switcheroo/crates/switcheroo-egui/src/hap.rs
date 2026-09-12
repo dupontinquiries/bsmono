@@ -195,13 +195,29 @@ pub async fn pair(p: Peripheral, store: &Store, id: &DeviceId, setup_code: Strin
 
 /// Verify with the stored pairing, then write On. Both in one blocking
 /// task so the session never crosses an await point.
-pub async fn set_power(p: Peripheral, pairing: Pairing, on: bool) -> Result<Vec<String>, String> {
+pub async fn set_power(
+    p: Peripheral,
+    pairing: Pairing,
+    on: bool,
+) -> Result<(bool, Vec<String>), String> {
     let mut t = transport(p).await?;
     tokio::task::spawn_blocking(move || {
         let mut c = Controller::new(&mut t);
         c.pair_verify(&pairing).map_err(|e| e.to_string())?;
         c.set_on(on).map_err(|e| e.to_string())?;
-        Ok(std::mem::take(&mut c.trace))
+        // READ BACK, and report what the ACCESSORY says rather than what we asked for.
+        //
+        // A successful write means the accessory accepted the PDU, not that the outlet
+        // changed: a plug with a child lock, a firmware in a fault state, or one that clamps
+        // a value all ACK and do nothing. Reporting the requested value then leaves the row
+        // showing On over a socket that is off, and the next `AccessoryChanged` advert looks
+        // like someone else touched it.
+        //
+        // In the SAME session, for the reason `inspect` gives below: each `pair_verify` is a
+        // Curve25519 exchange and two signature round trips over BLE, so a second session to
+        // confirm one bit would double the cost of every toggle.
+        let actual = c.get_on().map_err(|e| e.to_string())?;
+        Ok((actual, std::mem::take(&mut c.trace)))
     }).await.map_err(|e| format!("write task: {e}"))?
 }
 

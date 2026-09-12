@@ -366,11 +366,41 @@ Pure: every decision takes the clock as an argument. No timers, no radio, no I/O
 
 ---
 
-## STILL TO DO — switching a Wemo plug on and off (2026-09-08)
+## CORRECTION — writing was already wired (2026-09-08)
 
-Asked directly: *"keep enabling homekit wemo plugs on and off via BLE"*. Reading is wired —
-adverts, GSN change detection, pairing, and the refresh scheduler above. WRITING is not, and
-the gap is one specific piece.
+The section below claimed writing was not built and that the Broadcast Encryption Key was the
+blocker. THAT WAS WRONG, and I wrote it without checking the code. The chain is complete and
+has been: the UI submits `Command::SetPower`, `ble.rs` routes HomeKit devices to
+`hap::set_power`, which pair-verifies and calls `Controller::set_on` — and `hap-core::ble`
+has the PDU framing, the fragmentation, the encrypted-session wrapping and both
+`set_on`/`get_on`.
+
+The Broadcast Encryption Key is for BROADCAST NOTIFICATIONS — an accessory announcing a change
+without a session. That is a read-path optimisation, not a prerequisite for writing, and
+conflating the two is how the TODO came to describe a wall that is not there.
+
+### What was actually wrong: the row reported the value it ASKED for
+
+`Event::PowerIs` was built from the requested `on`, not from the accessory. A successful write
+means the accessory accepted the PDU, not that the outlet changed — a plug with a child lock,
+a firmware in a fault state, or one that clamps a value all ACK and do nothing. The row would
+then show On over a socket that is off, and the next `AccessoryChanged` advert would look like
+someone else had touched it.
+
+`set_power` now reads the characteristic back and returns what the accessory says, IN THE SAME
+SESSION for the reason `inspect` already gives: each `pair_verify` is a Curve25519 exchange and
+two signature round trips over BLE, so confirming one bit in a second session would double the
+cost of every toggle.
+
+### Still to do
+
+- [ ] Broadcast notifications (the Broadcast Encryption Key), so a plug switched at the wall
+      updates the row without a poll. `GsnTracker` already notices the advert; what is missing
+      is decrypting the notification body. This one DOES want the spec open.
+- [ ] Confirm on real hardware that a Wemo accepts the write and reports back. Everything
+      above is reasoning about code, not a plug that clicked.
+
+## Superseded — the note that follows was written before the check above
 
 ### The blocker: the Broadcast Encryption Key
 
