@@ -15,7 +15,10 @@ This manual is served by the running depot at `/manual`, and printed by
 it, the **Tutorials** tab (`/tutorials`, `depot tutorial`) has six
 step-by-step guides — Linux basics, setting up the server, filling it,
 syncing across the air gap, preparing clients, serving over USB — each
-step with the commands to run and what you should see.
+step with the commands to run and what you should see. Where a step is
+something the depot can verify about itself (a key attached, a URL set,
+content present) the step shows whether *this* depot already satisfies
+it; diagrams are drawn from text fences by the same binary.
 
 ---
 
@@ -394,7 +397,8 @@ pattern: `APKINDEX.tar.gz` derived from the `.apk` control segments).
 | rotate the token | delete the file, run `--new` again; takes effect immediately |
 | back up | `rsync -a <root>/{catalog.json,objects,keys,trust,depot.toml} …` (pub/ and tmp/ are derived) |
 | logs | `journalctl -u depot` — one line per request: method, path, status, bytes, ms |
-| learn / teach | `depot tutorial` lists the guides; `depot tutorial server-setup` prints one; the UI shows them a step at a time |
+| learn / teach | `depot tutorial` lists the guides; `depot tutorial server-setup` prints one; the UI shows them a step at a time, with a live check per step where the depot can verify itself |
+| diagrams | `depot niftyplot FILE` (or `-` for stdin) renders a `.niftyplot` diagram to SVG on stdout; the same engine draws the fenced diagrams in tutorials |
 
 Nothing in depot needs the clock to be right (offline boxes often have it
 wrong): timestamps are informational, signatures have no expiry, and dnf's
@@ -421,7 +425,8 @@ Reads are open; writes need `Authorization: Bearer <admin token>`.
 | PUT | `/api/packs[?allow_unsigned=1]` | a pack | unpack |
 | GET | `/api/client-config?crates=1&rpm=<id>&nix=1&toolchain=1` or `?all=1` | | snippets as JSON |
 | GET | `/api/verify` | | `{"corrupt":[…]}` |
-| GET | `/api/tutorials` · `/api/tutorials/<slug>.md` | | tutorials as steps (JSON) / raw markdown |
+| GET | `/api/tutorials` · `/api/tutorials/<slug>.md` | | tutorials as steps (JSON, each with its live check outcome) / raw markdown |
+| POST | `/api/niftyplot` | diagram source | SVG (`image/svg+xml`) |
 | GET | `/bootstrap.sh?…` · `/crates/index/config.json` · `/toolchains/install.sh` | | generated per request |
 
 Everything under `/crates/`, `/rpm/`, `/nix/`, `/toolchains/` is a static

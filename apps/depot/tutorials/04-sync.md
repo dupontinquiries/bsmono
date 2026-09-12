@@ -13,6 +13,27 @@ each object's bytes against its name as it lands. The receiver's
 **have-list** — every object hash it already holds — is what makes packs
 small: nothing on the list is included.
 
+```niftyplot
+%kind: graph
+%title: "One pack, two depots"
+plane online {
+    Online: "online depot"
+    Pack: "sync.depot"
+}
+plane gap {
+    Stick: "USB stick, or curl"
+}
+plane offline {
+    Have: "have.txt"
+    Offline: "offline depot"
+}
+Offline -- "1. have" → Have
+Have -- "2. carry over" → Online
+Online -- "3. pack --have" → Pack
+Pack -- "4." → Stick
+Stick -- "5. unpack: signature, then hashes" → Offline
+```
+
 ```sh
 depot pack --help | grep -A3 "^SYNC"
 ```
@@ -20,6 +41,7 @@ depot pack --help | grep -A3 "^SYNC"
 You should see the four commands: `have`, `pack`, `unpack`, `inspect`.
 
 ## Exchange keys — once
+%check: trusted_any
 
 The offline depot must be told which public key to accept:
 
@@ -63,6 +85,7 @@ wasteful after. `inspect` reads only the manifest — use it to check a pack
 before carrying it.
 
 ## Offline: unpack
+%check: has_content
 
 ```sh
 depot unpack 2026-09-12.depot

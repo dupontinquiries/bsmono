@@ -25,7 +25,15 @@
       .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
     while (i < lines.length) {
       const l = lines[i];
-      if (/^```/.test(l)) { let b = ''; i++; while (i < lines.length && !/^```/.test(lines[i])) { b += lines[i] + '\n'; i++; } i++; out += '<pre><code>' + esc(b) + '</code></pre>'; continue; }
+      if (/^```/.test(l)) {
+        const lang = l.slice(3).trim(); let b = ''; i++;
+        while (i < lines.length && !/^```/.test(lines[i])) { b += lines[i] + '\n'; i++; } i++;
+        // A niftyplot fence is a diagram: the source stays (readable first —
+        // it is what `depot tutorial` prints), the SVG is fetched from the
+        // depot after render and placed above it.
+        if (lang === 'niftyplot') { out += '<figure class="niftyplot-fig"><div class="niftyplot-svg muted">rendering diagram…</div><details><summary>diagram source</summary><pre><code>' + esc(b) + '</code></pre></details></figure>'; continue; }
+        out += '<pre><code>' + esc(b) + '</code></pre>'; continue;
+      }
       const h = /^(#{1,6})\s+(.*)/.exec(l);
       if (h) { const id = h[2].toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''); out += `<h${h[1].length} id="${id}">${inline(h[2])}</h${h[1].length}>`; i++; continue; }
       if (/^\s*[-*]\s+/.test(l)) { out += '<ul>'; while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) { out += '<li>' + inline(lines[i].replace(/^\s*[-*]\s+/, '')) + '</li>'; i++; } out += '</ul>'; continue; }
@@ -202,6 +210,8 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "X-Filename: rustc-1.96.0-aarch
       <div class="progress"><div style="width:${Math.round(100 * p.done.length / n)}%"></div></div>
       <ul class="steps-toc">${toc}</ul>
       <h2>${i + 1}. ${esc(step.title)}</h2>
+      ${step.check ? `<div class="check ${step.check.ok ? 'ok' : 'todo'}">${step.check.ok ? 'This depot already satisfies this step' : 'Not yet on this depot'}: ${esc(step.check.detail)}</div>` : ''}
+      <div class="row"><button type="button" class="secondary" id="say" data-say="${esc(step.say)}" hidden>read aloud</button></div>
       <div class="md step-body">${md(step.body)}</div>
       <div class="stepnav">
         ${i > 0 ? `<a href="#tutorial/${esc(slug)}/${i - 1}"><button class="secondary" type="button">← previous</button></a>` : ''}
@@ -254,6 +264,24 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" -H "X-Filename: rustc-1.96.0-aarch
       p.done = p.done.includes(i) ? p.done.filter((k) => k !== i) : p.done.concat(i).sort((a, b) => a - b);
       saveProgress(slug, p); route();
     });
+    main.querySelectorAll('.niftyplot-fig').forEach(async (fig) => {
+      const src = fig.querySelector('pre code').textContent;
+      const box = fig.querySelector('.niftyplot-svg');
+      try {
+        const r = await fetch('/api/niftyplot', { method: 'POST', body: src });
+        if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
+        box.innerHTML = await r.text(); box.classList.remove('muted');
+      } catch (e) { box.textContent = 'diagram: ' + e.message; }
+    });
+    const say = $('#say');
+    if (say && 'speechSynthesis' in window && say.dataset.say) {
+      say.hidden = false;
+      say.addEventListener('click', () => {
+        if (window.speechSynthesis.speaking) { window.speechSynthesis.cancel(); say.textContent = 'read aloud'; return; }
+        const u = new SpeechSynthesisUtterance(say.dataset.say); u.onend = () => (say.textContent = 'read aloud');
+        say.textContent = 'stop'; window.speechSynthesis.speak(u);
+      });
+    }
     main.querySelectorAll('.step-body pre').forEach((pre) => {
       const b = document.createElement('button'); b.type = 'button'; b.className = 'copy'; b.textContent = 'copy';
       b.addEventListener('click', async () => { try { await navigator.clipboard.writeText(pre.textContent); b.textContent = 'copied'; setTimeout(() => (b.textContent = 'copy'), 1200); } catch (_) { b.textContent = 'select + Ctrl-C'; } });

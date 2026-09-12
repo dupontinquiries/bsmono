@@ -6,6 +6,7 @@ them for you; this walks through what they do so you can fix them when
 something changes.
 
 ## Reach the depot
+%check: reachable
 
 Before configuring anything, prove the client can see the server:
 

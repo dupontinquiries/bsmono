@@ -62,6 +62,16 @@ A file on disk is an *inode* (the data plus its metadata); a name in a
 directory just points at one. `ln` adds a second name. The file exists
 until the last name is removed, and both names see the same bytes.
 
+```niftyplot
+%kind: graph
+%title: "Two names, one inode"
+A as note: "objects/ab/ab12…"
+B as note: "pub/rpm/f42/Packages/h/hello.rpm"
+I as cylinder: "inode 4711 — the bytes"
+A → I
+B → I
+```
+
 ```sh
 echo data > a
 ln a b                    # hardlink: b is another name for a's inode
@@ -178,6 +188,27 @@ where, and the packages themselves. No server logic, no database, no
 login. That is why one plain file server can stand in for crates.io,
 Fedora's mirrors and cache.nixos.org at once, and why a USB stick can
 carry a whole repository.
+
+```niftyplot
+%kind: graph
+%title: "What each client reads first"
+plane clients {
+    cargo
+    dnf
+    nix
+    sh: "install.sh"
+}
+plane depot {
+    C: "/crates/index/config.json"
+    D: "/rpm/<repo>/repodata/repomd.xml"
+    N: "/nix/nix-cache-info"
+    T: "/toolchains/index.json"
+}
+cargo → C
+dnf → D
+nix → N
+sh → T
+```
 
 ```sh
 curl -s http://depot.lan:8000/crates/index/config.json          # cargo's "where do I download from"

@@ -10,7 +10,7 @@
 //                                          testdata fixtures + a pack-rust set)
 //   depot serve --root /tmp/d1 --bind 127.0.0.1:8123 --quiet &
 //   mkdir /tmp/uitest && cd /tmp/uitest && npm install jsdom@24
-//   node /path/to/ui-test.js               -> "27 passed, 0 failed"
+//   node /path/to/ui-test.js               -> "31 passed, 0 failed"
 //
 // Two harness lessons, paid for: (1) do NOT dispatch hashchange by hand -
 // jsdom fires it on `location.hash =`, and a manual dispatch renders every
@@ -88,7 +88,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   d.querySelector('#markdone').click();
   h = await settle((h) => /1 done/.test(h));
   check('mark done updates progress and persists', /done ✓/.test(h) && JSON.parse(w.localStorage.getItem('depot-tut-sync')).done.includes(0));
+  await settle((h) => h.includes('<svg ') && h.includes('One pack, two depots'), 6000);
+  check('niftyplot fence in a step renders to inline SVG via /api/niftyplot, source kept', d.querySelectorAll('.niftyplot-fig svg').length === 1 && d.querySelector('.niftyplot-fig details pre').textContent.includes('%kind: graph'));
+  check('read-aloud button hidden when speechSynthesis is absent', d.querySelector('#say').hidden === true);
+  h = await go('#tutorial/fill-the-depot/1', (h) => h.includes('Step 2 of 8'));
+  check('a satisfied check reads as already done, with evidence', /class="check ok"/.test(h) && /2 crates, 2 versions/.test(h));
   h = await go('#tutorial/sync/1', (h) => h.includes('Step 2 of 7'));
+  check('step with a %check shows a live badge from this depot (trust/ is empty here)', /class="check todo"/.test(h) && /Not yet on this depot: trust\/ is empty/.test(h));
   check('next step: previous button appears, intro hidden, toc marks step 1 done', h.includes('previous') && !h.includes('Two depots: one that can see') && /class="[^"]*done[^"]*"/.test(h));
   h = await go('#tutorial/sync/6', (h) => h.includes('Step 7 of 7'));
   check('last step offers finish', h.includes('finish') && !h.includes('next →'));

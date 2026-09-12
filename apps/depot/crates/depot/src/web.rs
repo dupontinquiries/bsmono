@@ -11,6 +11,7 @@
 //! URL, which depends on how the client reached us: `/crates/config.json`,
 //! `/toolchains/install.sh`, `/bootstrap.sh`.
 
+use crate::checks;
 use crate::clientcfg::{self, Want};
 use crate::tutorial;
 use depot_core::pack::Select;
@@ -173,7 +174,35 @@ impl App {
     fn api(&self, method: &str, rest: &str, req: &mut Request<'_>) -> Response {
         let segs: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
         match (method, segs.as_slice()) {
-            ("GET", ["tutorials"]) => ok_json(&json!({"tutorials": tutorial::all()})),
+            ("GET", ["tutorials"]) => {
+                // Steps carry their live check outcome, evaluated now against
+                // this depot (cheap: catalog/config already in memory).
+                let d = self.depot.lock().unwrap();
+                let list: Vec<serde_json::Value> = tutorial::all()
+                    .into_iter()
+                    .map(|t| {
+                        let steps: Vec<serde_json::Value> = t
+                            .steps
+                            .iter()
+                            .map(|st| {
+                                let outcome = st.check.as_deref().and_then(|k| checks::run(k, &d));
+                                json!({"title": st.title, "body": st.body, "say": st.say, "check": outcome})
+                            })
+                            .collect();
+                        json!({"slug": t.slug, "title": t.title, "intro": t.intro, "steps": steps})
+                    })
+                    .collect();
+                ok_json(&json!({"tutorials": list}))
+            }
+            ("POST", ["niftyplot"]) => {
+                // Diagram source in, SVG out. Rendering is pure; the only
+                // guard is the body size.
+                let src = match req.read_body(256 * 1024) {
+                    Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                    Err(e) => return Response::text(413, format!("niftyplot: {e}\n")),
+                };
+                Response::bytes(200, "image/svg+xml; charset=utf-8", nifty_core::svg::render_source(&src).into_bytes()).with_header("Cache-Control", "no-cache")
+            }
             ("GET", ["tutorials", name]) => match name.strip_suffix(".md").and_then(tutorial::find) {
                 Some(src) => Response::bytes(200, "text/markdown; charset=utf-8", src.text.as_bytes().to_vec()),
                 None => Response::not_found(),

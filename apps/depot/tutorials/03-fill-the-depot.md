@@ -22,6 +22,7 @@ You should see zero counts on a fresh depot. Nothing to create up front:
 a repo exists the moment you ingest into it.
 
 ## Crates: what cargo already downloaded
+%check: has_crates
 
 Every `.crate` cargo has ever fetched on a machine sits in its registry
 cache. Fetching for a project pulls its whole dependency graph, so the
@@ -43,6 +44,7 @@ curl -s http://localhost:8000/crates/index/se/rd/serde | tail -c 200
 ```
 
 ## RPMs: the set an installed system needs
+%check: has_rpm
 
 For a full reload you want everything the target has installed, with
 dependencies resolved, for the target's arch. On a box of the same Fedora
@@ -77,6 +79,7 @@ depot ingest rpm --repo fedora-42-aarch64 /srv/reposync/fedora/Packages/*/ /srv/
 time and is idempotent: rerun it and only new packages download.
 
 ## Attach the signing key
+%check: rpm_keys
 
 dnf verifies each package against the repo's GPG key. Fedora's is already
 on every Fedora box; a COPR's is one download away:
@@ -94,6 +97,7 @@ You should see `gpg key <hash>` for each. The RPM tab now shows
 from `gpgcheck=0` to `gpgcheck=1`.
 
 ## Rust toolchains
+%check: has_toolchains
 
 `maintenance/pack-rust.sh` downloads and checksums the standalone
 component tarballs for a version and the triples you name; depot ingests
@@ -110,6 +114,7 @@ You should see one entry per component per triple (three per triple for
 other triple is needed on top of a host toolchain.
 
 ## Nix store paths
+%check: has_nix
 
 On a machine with nix, sign the paths you will ship (offline nix refuses
 unsigned paths by default), copy them to a directory, ingest:
@@ -127,6 +132,7 @@ cache.nixos.org keeps that signature too, and every default `nix.conf`
 already trusts it.
 
 ## Check the result
+%check: has_content
 
 ```sh
 depot status

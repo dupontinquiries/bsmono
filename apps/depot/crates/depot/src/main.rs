@@ -1,6 +1,7 @@
 //! `depot` — one binary. `depot serve` is the server; everything else is the
 //! CLI that operators and scripts use on either side of the air gap.
 
+mod checks;
 mod clientcfg;
 mod tutorial;
 mod web;
@@ -56,6 +57,7 @@ MAINTENANCE
   gc [--delete]                    list (or delete) objects nothing references
   manual | decisions               print the manual / the design decisions
   tutorial [NAME]                  list the step-by-step tutorials, or print one
+  niftyplot FILE|-                 render a .niftyplot diagram (or stdin) to SVG on stdout
 ";
 
 fn main() -> ExitCode {
@@ -301,6 +303,18 @@ fn run(cli: &Cli) -> Result<(), String> {
         }
         "decisions" => {
             print!("{}", web::DECISIONS_MD);
+            Ok(())
+        }
+        "niftyplot" => {
+            let src = match args.first() {
+                Some(&"-") | None => {
+                    let mut s = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).map_err(|e| e.to_string())?;
+                    s
+                }
+                Some(f) => std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?,
+            };
+            print!("{}", nifty_core::svg::render_source(&src));
             Ok(())
         }
         "tutorial" => {

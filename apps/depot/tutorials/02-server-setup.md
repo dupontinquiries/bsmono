@@ -45,6 +45,7 @@ You should see the usage text. `/usr/local/bin` is for programs you
 installed yourself; `/usr/bin` belongs to the package manager.
 
 ## Choose the root and initialise
+%check: initialised
 
 The root is one directory holding everything. As a service it is
 `/var/lib/depot`; for trying things out as yourself, `~/.local/share/depot`.
@@ -63,6 +64,7 @@ depot's signing key — it never leaves the box; `keys/depot.pub` is what
 you give to depots that will unpack from here.
 
 ## Give it a name
+%check: public_url_set
 
 Clients need something stable to type. Pick the address of your LAN
 interface and a name for it:
@@ -141,6 +143,7 @@ restart depot`. Or avoid the question: enable HTTP writes (next step) and
 ingest with `curl`, which never touches the files as root.
 
 ## Enable writes over HTTP (optional)
+%check: writes_enabled
 
 Out of the box the depot is read-only over the network. Uploads, yanks
 and pack pushes need a token file that does not exist until you make it:
@@ -168,6 +171,7 @@ unchanged files (rsync, borg, restic) will copy each object exactly once,
 ever.
 
 ## Check it
+%check: signing_key
 
 ```sh
 sudo DEPOT_ROOT=/var/lib/depot depot status

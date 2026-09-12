@@ -12,6 +12,9 @@ between the online and offline sides as signed, content-deduplicated packs.
 - **Tutorials:** [tutorials/](tutorials/) — six step-by-step guides (Linux
   basics, server setup, filling the depot, sync, clients, USB link), shown
   one step at a time in the UI with progress (`/tutorials`, `depot tutorial`).
+  Steps can carry `%check: <key>` — a live check against the running depot
+  (the notes wizard's `can_advance`, applied to a tutorial) — and
+  ` ```niftyplot ` diagrams rendered by `shared/nifty-core`'s SVG backend.
 
 ## Layout
 
@@ -19,7 +22,8 @@ between the online and offline sides as signed, content-deduplicated packs.
 crates/depot-httpd   std-only threaded HTTP/1.1 — the transport seam (hyper/TLS would slot in here)
 crates/depot-core    headless: store, catalog, the four projections, signed packs
 crates/depot         the binary: CLI + `depot serve` (routes in web.rs) + embedded UI (ui/)
-tutorials/           markdown, one `## ` per step; embedded and parsed by crates/depot/src/tutorial.rs
+tutorials/           markdown, one `## ` per step, optional `%check:` and niftyplot fences; parsed by crates/depot/src/tutorial.rs
+crates/depot/src/checks.rs   the live check keys (initialised, public_url_set, rpm_keys, trusted_any, …)
 tools/ui-test.js     executes the UI under jsdom against a live server (27 checks)
 systemd/             hardened unit: DynamicUser + StateDirectory=depot, port 8000, no capabilities
 flake.nix            nix build (unverified here — no nix in the sandbox)
@@ -67,9 +71,13 @@ Built and tested in a sandbox with the offline Rust 1.96 drop, `rpm`,
   the CLI path's), junk as a crate → 422 and the object is removed, wrong
   token → 401. Uploads stream into the store without the catalog lock.
 - **UI executed** under jsdom against the live server (`tools/ui-test.js`):
-  27 checks across every view, including the Clients tab's live refresh and
+  31 checks across every view, including the Clients tab's live refresh,
   the tutorial stepper (progress, mark-done, next/previous, `/tutorials` as
-  a plain URL).
+  a plain URL), a niftyplot fence rendering to inline SVG, and live check
+  badges in both states.
+- **Diagrams** rasterised with `rsvg-convert` and viewed: the SVG backend's
+  output is correct outside a browser too (first cut was not — `var()`
+  only — and that is recorded in the nifty-core commit).
 - **SIGTERM** mid-download: the download completes, the process exits.
 - curl: ETag/304, Range/206, HEAD, traversal refused, writes refused without
   the admin token.

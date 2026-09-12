@@ -234,3 +234,25 @@ Fedora box may not resolve it. `.lan` is not an official TLD but is what
 most home routers hand out, and a real DNS entry or `/etc/hosts` line works
 everywhere. `public_url` in `depot.toml` bakes the choice into every
 generated client file.
+
+## 16. Tutorials that check themselves, and diagrams that stay text
+
+**Rests on:** two things already in the tree. voiceterm's notes wizard
+gates each step with `can_advance(step, cfg) -> Result<(), String>`; a
+tutorial that runs *inside* the thing it teaches can do the same, so a
+step may declare `%check: <key>` and the depot evaluates it against its
+own catalog and config on every request — "this depot already satisfies
+this step: 2 crates, 2 versions" or "not yet: trust/ is empty". The keys
+are a fixed list (`checks.rs`); a typo in a markdown file fails the test
+suite rather than rendering nothing. And `nifty-core` — voiceterm's
+plain-text diagram engine — gained an SVG backend, so a ` ```niftyplot `
+fence in a tutorial is a diagram in the UI and readable text in `depot
+tutorial` output, which is the format's first design principle.
+
+**Not taken:** extracting the wizard's `Step` enum into a shared crate. The
+generic part (next/prev clamp, index, title, a check) is a dozen lines and
+the wizard's steps are wizard-specific; a shared crate would isolate
+nothing that varies. The *shape* is reused, on purpose, and named here so
+the next person sees the lineage. Likewise no image files: a diagram is
+text in the same file as the prose, diffable, and rendered by the same
+binary that serves it.

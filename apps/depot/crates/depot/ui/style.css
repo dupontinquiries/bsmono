@@ -59,3 +59,12 @@ a { color: var(--accent); }
 .step-body pre { position: relative; }
 .copy { position: absolute; top: .35rem; right: .35rem; font-size: .75rem; padding: .15rem .45rem; background: var(--bg); color: var(--muted); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
 .copy:hover { color: var(--fg); }
+
+/* diagrams + live checks in tutorials */
+.niftyplot-fig { margin: .8rem 0; }
+.niftyplot-fig svg { max-width: 100%; height: auto; display: block; }
+.niftyplot-fig details { margin-top: .3rem; }
+.niftyplot-fig summary { color: var(--muted); font-size: .85rem; cursor: pointer; }
+.niftyplot { --nifty-node: var(--panel); --nifty-line: var(--fg); --nifty-text: var(--fg); --nifty-edge: var(--muted); --nifty-bg: var(--bg); --nifty-plane: var(--bg); --nifty-planeline: var(--line); --nifty-muted: var(--muted); }
+.check { border-left: 3px solid var(--ok); padding: .4rem .8rem; background: var(--panel); border-radius: 0 8px 8px 0; margin: .6rem 0; font-size: .92rem; }
+.check.todo { border-left-color: var(--accent); }

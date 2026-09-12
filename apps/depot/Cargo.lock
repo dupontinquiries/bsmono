@@ -189,6 +189,7 @@ dependencies = [
  "depot-httpd",
  "libc",
  "net-kit",
+ "nifty-core",
  "serde",
  "serde_json",
 ]
@@ -449,6 +450,10 @@ version = "0.1.0"
 dependencies = [
  "core-kit",
 ]
+
+[[package]]
+name = "nifty-core"
+version = "0.1.0"
 
 [[package]]
 name = "opaque-debug"

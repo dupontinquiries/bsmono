@@ -25,6 +25,18 @@ You should see a controller name on a phone/SBC and nothing on a laptop.
 pmOS brings the gadget up at boot: the phone is `172.16.42.1` on `usb0`
 and hands the host `172.16.42.2`. Plug in and check both ends:
 
+```niftyplot
+%kind: graph
+%title: "The USB link"
+plane phone {
+    P: "depot serve — 172.16.42.1:8000"
+}
+plane host {
+    H: "client — 172.16.42.2"
+}
+P ↔ H
+```
+
 ```sh
 # on the phone
 ip -4 addr show usb0
@@ -38,6 +50,7 @@ NCM works with Linux, macOS and Windows 10+; RNDIS only with Windows.
 `deviceinfo_usb_network_function` in the pmOS device package selects it.
 
 ## Tell depot its USB address
+%check: public_url_usb
 
 There is no DNS on a two-node link, so the address is the name. Put it
 in the config so generated client files and `bootstrap.sh` use it:
