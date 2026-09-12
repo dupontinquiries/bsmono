@@ -27,7 +27,7 @@ keep:
 
 | seam | trait | real impl lives | status |
 |---|---|---|---|
-| yt-dlp process | `CommandRunner` | `src/io.rs` | ✅ written, tested — *verified* |
+| yt-dlp process | `CommandRunner` | `src/io.rs` | ✅ written, wired, tested with a scripted extractor — *verified*; never run against real yt-dlp — *assumed* |
 | HTTP range fetch | `HttpTransport` | `src/io.rs` | ✅ plain TCP + `ureq`/rustls for https, picked by scheme — *verified* over a real socket for http, *read* for TLS |
 | V4L2 decode | `V4l2Api` | `vidkit-v4l2::device` | compiles, never run — *verified* it builds, *assumed* it works |
 | transcription | `Transcriber` (voiced-core) | app | **not written** |
@@ -60,9 +60,11 @@ untestable wrapper would have looked like progress.
    up yet". `voice-kit` already does the post-processing and
    `voiced-core::grammar` already does the matching; only the mic and the model
    are missing. *read*
-2. **`ProcessRunner` into `StreamSource`.** The runner exists and is tested;
-   nothing constructs it, so a page URL cannot be resolved. This is the last
-   piece of "paste a YouTube link and it plays". *verified*
+2. **Run it against real yt-dlp.** The whole page path — resolve, select,
+   fetch, sniff, demux — is tested with a *scripted* extractor and a local
+   server. yt-dlp is not installed here, so its actual JSON shape and its
+   failure messages are *assumed*. This is the first thing to try on a machine
+   that has it. *verified* for the path, *assumed* for the extractor.
 
 3. **Exercise the TLS path against a real server.** `TlsTransport` compiles and
    its scheme selection is tested, but no test has made an actual HTTPS

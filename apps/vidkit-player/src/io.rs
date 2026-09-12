@@ -876,26 +876,57 @@ impl HttpTransport for TlsTransport {
 /// Boxed rather than an enum because the choice is made once per source and
 /// never again; an enum would put a match on every range request to save an
 /// indirection that no profile has ever shown to matter.
-pub fn transport_for(url: &str) -> Result<Box<dyn HttpTransport + Send>, String> {
+/// Which transport a URL needs.
+///
+/// Split out from `transport_for` so the CHOICE is testable: the boxed trait
+/// object cannot be inspected, and this sandbox has no TLS origin to fetch
+/// from, so without this the scheme dispatch was only exercised for http and a
+/// mutation making everything plain TCP survived.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Scheme {
+    PlainTcp,
+    Tls,
+}
+
+pub fn scheme_of(url: &str) -> Result<Scheme, String> {
     if url.starts_with("https://") {
-        #[cfg(feature = "https")]
-        {
-            return Ok(Box::new(TlsTransport::default()));
-        }
-        #[cfg(not(feature = "https"))]
-        {
-            return Err(format!("{url}: this build has no HTTPS support"));
-        }
+        Ok(Scheme::Tls)
+    } else if url.starts_with("http://") {
+        Ok(Scheme::PlainTcp)
+    } else {
+        Err(format!("{url}: not an http or https URL"))
     }
-    if url.starts_with("http://") {
-        return Ok(Box::new(TcpTransport::default()));
+}
+
+pub fn transport_for(url: &str) -> Result<Box<dyn HttpTransport + Send>, String> {
+    match scheme_of(url)? {
+        Scheme::Tls => {
+            #[cfg(feature = "https")]
+            {
+                Ok(Box::new(TlsTransport::default()))
+            }
+            #[cfg(not(feature = "https"))]
+            {
+                Err(format!("{url}: this build has no HTTPS support"))
+            }
+        }
+        Scheme::PlainTcp => Ok(Box::new(TcpTransport::default())),
     }
-    Err(format!("{url}: not an http or https URL"))
 }
 
 #[cfg(test)]
 mod transport_choice_tests {
     use super::*;
+
+    /// The choice itself, asserted as a value. There is no TLS origin to fetch
+    /// from here, so without this the https branch is never exercised.
+    #[test]
+    fn https_selects_tls_and_http_does_not() {
+        assert_eq!(scheme_of("https://example.org/v.mp4"), Ok(Scheme::Tls));
+        assert_eq!(scheme_of("http://127.0.0.1:8080/v.mp4"), Ok(Scheme::PlainTcp));
+        assert!(scheme_of("ftp://example.org/v").is_err());
+        assert!(scheme_of("example.org/v").is_err());
+    }
 
     #[test]
     fn the_scheme_chooses_the_transport() {
@@ -949,5 +980,256 @@ mod transport_choice_tests {
             })
             .expect("plain http through the chosen transport");
         assert_eq!(got, b"0123456789");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// page URLs, through the extractor
+// ---------------------------------------------------------------------------
+
+/// Builds a transport per resolved URL, choosing by scheme.
+///
+/// A resolved media URL is very often on a different host from the page and,
+/// on YouTube, always https — so the choice has to be made per URL rather than
+/// once for the session.
+pub struct SchemeFactory;
+
+impl vidkit_stream::TransportFactory<Box<dyn HttpTransport + Send>> for SchemeFactory {
+    fn open(&mut self, url: &str) -> Box<dyn HttpTransport + Send> {
+        // A resolved media URL is usually on a different host from the page
+        // and, on YouTube, always https -- so the scheme is re-examined per
+        // URL rather than assumed from the page.
+        transport_for(url).unwrap_or_else(|_| Box::new(TcpTransport::default()))
+    }
+}
+
+/// Which capability profile to select formats against.
+///
+/// Guessed from the target triple, which is crude and deliberately visible:
+/// `DeviceCaps` is meant to be probed at runtime from the V4L2 and Vulkan
+/// devices present, and until `vidkit-v4l2::device` has run against real
+/// hardware that probe cannot be trusted. A wrong guess here picks a stream
+/// the decoder cannot manage, so it is one function to replace rather than a
+/// choice scattered through the app.
+pub fn assumed_caps() -> vidkit_core::caps::DeviceCaps {
+    if cfg!(target_arch = "aarch64") {
+        // Could equally be Asahi, whose preferences are the opposite way round
+        // — AV1 in software beats VP9 there, and the reverse on Venus. Guessing
+        // wrong costs battery rather than correctness, and probing is the fix.
+        vidkit_core::caps::fairphone_venus()
+    } else {
+        vidkit_core::caps::desktop_full_hw()
+    }
+}
+
+/// Resolve a page URL with an extractor and open what it points at.
+///
+/// Generic over the runner so the whole path — resolution, format selection,
+/// transport, demux — is testable with a scripted extractor and a local
+/// server, without yt-dlp installed. That matters: this is the one path that
+/// otherwise could not be exercised at all here, and an untested path is where
+/// the next bug lives.
+pub fn open_page_url<R: vidkit_ytdlp::CommandRunner + Send>(
+    runner: R,
+    url: &str,
+    caps: vidkit_core::caps::DeviceCaps,
+) -> Result<OpenedUrl, String> {
+    open_page_url_capped(runner, url, caps, 10_000)
+}
+
+/// As [`open_page_url`], with the packet ceiling exposed.
+///
+/// The ceiling exists because a live stream has no end and counting to it is a
+/// hang rather than a slow open. It is a parameter so a test can actually
+/// reach it -- with it hard-coded at ten thousand, no fixture here has enough
+/// packets and the bound was unexercised.
+pub fn open_page_url_capped<R: vidkit_ytdlp::CommandRunner + Send>(
+    runner: R,
+    url: &str,
+    caps: vidkit_core::caps::DeviceCaps,
+    max_packets: usize,
+) -> Result<OpenedUrl, String> {
+    use vidkit_core::traits::MediaSource;
+    use vidkit_ytdlp::http::ChunkPolicy;
+
+    let mut source = vidkit_stream::StreamSource::open(
+        runner,
+        &mut SchemeFactory,
+        url,
+        caps,
+        Default::default(),
+        ChunkPolicy {
+            chunk_bytes: 256 * 1024,
+            retries: 2,
+        },
+    )
+    .map_err(|e| format!("{url}: {e}"))?;
+
+    let dims = source.dimensions();
+    let dur = source.duration();
+    let codec = source
+        .video_profile()
+        .map(|p| format!("{} {}-bit", p.codec, p.bit_depth))
+        .unwrap_or_else(|| "unknown codec".into());
+    let container = source.container();
+
+    let mut packets = 0usize;
+    // Bounded. A live stream has no end, and counting to it is a hang rather
+    // than a slow open.
+    while packets < max_packets {
+        match source.next_packet() {
+            Ok(Some(_)) => packets += 1,
+            Ok(None) => break,
+            Err(e) => return Err(format!("{url}: {e:?}")),
+        }
+    }
+
+    Ok(OpenedUrl {
+        label: format!(
+            "{container:?} · {codec} · {}x{} · {packets} packets · resolved",
+            dims.0, dims.1
+        ),
+        duration: dur,
+        dimensions: dims,
+        packets,
+    })
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Stands in for yt-dlp: returns prepared JSON instead of spawning it.
+    struct ScriptedRunner(Vec<String>);
+
+    impl vidkit_ytdlp::CommandRunner for ScriptedRunner {
+        fn run(&mut self, _p: &str, _a: &[String]) -> Result<Vec<u8>, vidkit_ytdlp::RunError> {
+            if self.0.is_empty() {
+                return Err(vidkit_ytdlp::RunError::Io("script exhausted".into()));
+            }
+            Ok(self.0.remove(0).into_bytes())
+        }
+    }
+
+    /// Serve an MP4 over plain http, honouring Range, and return the port.
+    fn serve(body: Vec<u8>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..64 {
+                let Ok((mut sock, _)) = listener.accept() else { break };
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (start, end) = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .and_then(|l| l.split('=').nth(1).map(str::trim).map(str::to_string))
+                    .and_then(|r| {
+                        let (a, b) = r.split_once('-')?;
+                        Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+                    })
+                    .unwrap_or((0, body.len() - 1));
+                if start >= body.len() {
+                    let _ = sock.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n\r\n");
+                    continue;
+                }
+                let slice = &body[start..=end.min(body.len() - 1)];
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                    start + slice.len() - 1,
+                    body.len(),
+                    slice.len()
+                );
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(slice);
+            }
+        });
+        port
+    }
+
+    fn ytdlp_json(url: &str) -> String {
+        format!(
+            r#"{{"formats":[
+              {{"format_id":"399","url":"{url}","vcodec":"av01.0.08M.08","acodec":"none",
+                "width":64,"height":64,"fps":30,"vbr":900.0,"protocol":"https",
+                "http_headers":{{"User-Agent":"Mozilla/5.0 test"}}}}]}}"#
+        )
+    }
+
+    /// The whole page-URL path with nothing mocked except the extractor
+    /// itself: resolution, format selection, transport, sniff, demux.
+    #[test]
+    fn a_page_url_resolves_and_opens() {
+        let port = serve(crate::io::tests_support::sample_mp4());
+        let media = format!("http://127.0.0.1:{port}/v.mp4");
+        let opened = open_page_url(
+            ScriptedRunner(vec![ytdlp_json(&media)]),
+            "https://site/watch?v=1",
+            vidkit_core::caps::desktop_full_hw(),
+        )
+        .expect("resolve and open");
+
+        assert_eq!(opened.dimensions, (64, 64));
+        assert_eq!(opened.packets, 2);
+        assert!(opened.label.contains("resolved"), "{}", opened.label);
+    }
+
+    /// An extractor that is not installed, or fails, must say so with the URL
+    /// rather than produce an empty player.
+    #[test]
+    fn a_failing_extractor_is_reported_with_the_url() {
+        let e = open_page_url(
+            ScriptedRunner(Vec::new()),
+            "https://site/watch?v=1",
+            vidkit_core::caps::desktop_full_hw(),
+        )
+        .unwrap_err();
+        assert!(e.contains("https://site/watch"), "the URL was dropped: {e}");
+    }
+
+    /// Nothing playable in the JSON is a different failure from a broken
+    /// extractor and reads differently.
+    #[test]
+    fn a_page_with_no_usable_format_says_so() {
+        let e = open_page_url(
+            ScriptedRunner(vec![r#"{"formats":[]}"#.to_string()]),
+            "https://site/watch?v=2",
+            vidkit_core::caps::desktop_full_hw(),
+        )
+        .unwrap_err();
+        assert!(e.contains("watch?v=2"), "{e}");
+    }
+
+    /// The bound must actually stop, or a live stream hangs the open.
+    #[test]
+    fn the_packet_ceiling_is_respected() {
+        let port = serve(crate::io::tests_support::sample_mp4());
+        let media = format!("http://127.0.0.1:{port}/v.mp4");
+        let opened = open_page_url_capped(
+            ScriptedRunner(vec![ytdlp_json(&media)]),
+            "https://site/watch?v=3",
+            vidkit_core::caps::desktop_full_hw(),
+            1,
+        )
+        .expect("open");
+        assert_eq!(opened.packets, 1, "the ceiling did not stop the count");
+    }
+
+    /// The caps guess is crude and must at least be internally consistent:
+    /// whatever it returns has to accept something the selector can pick, or
+    /// every page URL fails with "no usable format" on that device.
+    #[test]
+    fn the_assumed_caps_can_actually_play_something() {
+        let caps = assumed_caps();
+        assert!(
+            !caps.caps.is_empty(),
+            "a profile with no decoders rejects every stream"
+        );
     }
 }

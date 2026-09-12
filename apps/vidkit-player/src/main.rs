@@ -926,28 +926,36 @@ impl Player {
             }
         };
 
+        // A page goes through the extractor; a direct link does not, because
+        // spawning a Python interpreter to learn what the URL already said is
+        // seconds of latency for nothing.
         if !io::is_direct_media(&url) {
-            // A page URL still needs the extractor to turn it into a media URL.
-            // HTTPS itself is no longer the blocker -- a direct https link
-            // plays -- so the message names the actual missing piece rather
-            // than the one that used to be missing.
-            self.gpu_error = Some(format!(
-                "{url} is a page, not a media file — that needs yt-dlp, which is not wired up yet"
-            ));
+            match io::open_page_url(io::ProcessRunner::default(), &url, io::assumed_caps()) {
+                Ok(o) => self.accept_opened(o),
+                // Reported verbatim. The resolver's message names which of the
+                // several things went wrong -- yt-dlp missing, the extractor
+                // failing, no format the device can play -- and flattening
+                // those into "could not open" throws away the only part that
+                // tells anyone what to do.
+                Err(e) => self.gpu_error = Some(e),
+            }
             return;
         }
         match io::open_direct_url(&url) {
-            Ok(o) => {
-                self.transport.duration = o.duration;
-                self.transport.status = "NV12 · CPU convert".into();
-                self.opened = Some(Ok(Opened {
-                    label: o.label,
-                    duration: o.duration,
-                }));
-                self.gpu_error = None;
-            }
+            Ok(o) => self.accept_opened(o),
             Err(e) => self.gpu_error = Some(e),
         }
+    }
+
+    /// Adopt a freshly opened URL.
+    fn accept_opened(&mut self, o: io::OpenedUrl) {
+        self.transport.duration = o.duration;
+        self.transport.status = "NV12 · CPU convert".into();
+        self.opened = Some(Ok(Opened {
+            label: o.label,
+            duration: o.duration,
+        }));
+        self.gpu_error = None;
     }
 
     /// Push a freshly opened file into the transport.
