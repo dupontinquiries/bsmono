@@ -376,3 +376,326 @@ mod tests {
         assert!(!e.is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// fetch while playing
+// ---------------------------------------------------------------------------
+
+/// Decode straight from URLs, without downloading first.
+///
+/// The download-then-play path waits for the whole file before the first
+/// frame, which on a lecture is a long stare at a test pattern. This starts
+/// decoding immediately.
+///
+/// # Why ffmpeg fetches rather than us
+///
+/// The obvious shape — download in the background, point the decoder at the
+/// growing file — does not work. ffmpeg reaching the write head of a regular
+/// file sees EOF and stops; there is no "wait for more" for a plain file. And
+/// an MP4 written by a remux has its `moov` atom at the END, so the file is
+/// not even openable until the last byte lands.
+///
+/// Giving ffmpeg the URLs sidesteps both: an HTTP input blocks for more data
+/// instead of ending, and ffmpeg reads only as far ahead as it needs.
+///
+/// # Two inputs, because YouTube has two streams
+///
+/// Video and audio arrive as separate URLs. ffmpeg takes both as inputs and
+/// maps one stream from each — the same muxing yt-dlp would have done, done
+/// while playing instead of before it.
+pub struct StreamingInput {
+    pub video_url: String,
+    /// Separate audio, when the site serves it that way.
+    pub audio_url: Option<String>,
+    /// Headers the media URL is signed against. A CDN that checks the
+    /// User-Agent answers 403 without them, which looks exactly like an
+    /// expired link.
+    pub headers: Vec<(String, String)>,
+}
+
+/// ffmpeg arguments for streaming inputs.
+///
+/// Pure, because the flag order is what breaks: `-headers` and `-user_agent`
+/// are INPUT options and must precede the `-i` they apply to. Placed after,
+/// ffmpeg silently ignores them and the fetch 403s.
+pub fn streaming_args(input: &StreamingInput, max_long_edge: Option<u32>) -> Vec<String> {
+    let mut a: Vec<String> = vec!["-v".into(), "error".into(), "-nostdin".into()];
+
+    let header_blob = |a: &mut Vec<String>| {
+        if !input.headers.is_empty() {
+            let joined: String = input
+                .headers
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}\r\n"))
+                .collect();
+            a.push("-headers".into());
+            a.push(joined);
+        }
+        // Reconnect on a dropped connection. A CDN closing an idle socket
+        // mid-film is routine, and without this the film simply stops.
+        a.push("-reconnect".into());
+        a.push("1".into());
+        a.push("-reconnect_streamed".into());
+        a.push("1".into());
+        a.push("-reconnect_delay_max".into());
+        a.push("5".into());
+    };
+
+    header_blob(&mut a);
+    a.push("-i".into());
+    a.push(input.video_url.clone());
+
+    if let Some(au) = &input.audio_url {
+        header_blob(&mut a);
+        a.push("-i".into());
+        a.push(au.clone());
+        // Take video from the first input and audio from the second.
+        a.push("-map".into());
+        a.push("0:v:0".into());
+        a.push("-map".into());
+        a.push("1:a:0".into());
+    }
+
+    if let Some(cap) = max_long_edge {
+        a.push("-vf".into());
+        // -2 keeps the other axis even and proportional, which NV12 needs.
+        a.push(format!("scale='if(gt(iw,ih),min({cap},iw),-2)':'if(gt(iw,ih),-2,min({cap},ih))'"));
+    }
+    a.push("-f".into());
+    a.push("rawvideo".into());
+    a.push("-pix_fmt".into());
+    a.push("nv12".into());
+    a.push("-".into());
+    a
+}
+
+impl FfmpegFrames {
+    /// Start decoding from URLs, fetching as it goes.
+    ///
+    /// The dimensions come from probing the video URL, which costs one small
+    /// HTTP request rather than the whole file.
+    pub fn open_streaming(
+        input: &StreamingInput,
+        max_long_edge: Option<u32>,
+    ) -> Result<Self, String> {
+        let p = probe_url(&input.video_url, &input.headers)?;
+        let (mut w, mut h) = (p.width, p.height);
+        if let Some(cap) = max_long_edge {
+            let long = w.max(h);
+            if long > cap {
+                let scale = cap as f64 / long as f64;
+                w = ((w as f64 * scale) as u32) & !1;
+                h = ((h as f64 * scale) as u32) & !1;
+            }
+        }
+
+        let child = Command::new("ffmpeg")
+            .args(streaming_args(input, max_long_edge))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => "ffmpeg is not installed".to_string(),
+                _ => format!("ffmpeg: {e}"),
+            })?;
+
+        Ok(Self {
+            child,
+            width: w,
+            height: h,
+            frame_interval: Duration::from_secs_f64(1.0 / p.fps.max(1.0)),
+            buf: vec![0u8; frame_bytes(w, h)],
+            index: 0,
+            frames_read: 0,
+        })
+    }
+}
+
+/// ffprobe a URL rather than a path.
+pub fn probe_url(url: &str, headers: &[(String, String)]) -> Result<Probe, String> {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args(["-v", "error"]);
+    if !headers.is_empty() {
+        let joined: String = headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}\r\n"))
+            .collect();
+        cmd.args(["-headers", &joined]);
+    }
+    cmd.args([
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate",
+        "-of", "default=noprint_wrappers=1",
+    ])
+    .arg(url);
+
+    let out = cmd.output().map_err(|e| format!("ffprobe: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ffprobe {url}: {}",
+            String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("failed")
+        ));
+    }
+    parse_probe(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| format!("{url}: no video stream"))
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    fn input() -> StreamingInput {
+        StreamingInput {
+            video_url: "http://cdn/v.mp4".into(),
+            audio_url: None,
+            headers: vec![("User-Agent".into(), "Mozilla/5.0".into())],
+        }
+    }
+
+    /// `-headers` is an INPUT option. After the `-i` it applies to, ffmpeg
+    /// ignores it and the fetch 403s on any CDN that checks.
+    #[test]
+    fn headers_come_before_the_input_they_apply_to() {
+        let a = streaming_args(&input(), None);
+        let hi = a.iter().position(|x| x == "-headers").expect("no headers");
+        let ii = a.iter().position(|x| x == "-i").expect("no input");
+        assert!(hi < ii, "headers after -i are ignored: {a:?}");
+    }
+
+    /// Two inputs and an explicit map, or ffmpeg picks one file's streams and
+    /// the audio is silently dropped.
+    #[test]
+    fn separate_audio_becomes_a_second_input_and_a_map() {
+        let mut i = input();
+        i.audio_url = Some("http://cdn/a.m4a".into());
+        let a = streaming_args(&i, None);
+        assert_eq!(a.iter().filter(|x| *x == "-i").count(), 2, "{a:?}");
+        assert!(a.windows(2).any(|w| w[0] == "-map" && w[1] == "0:v:0"));
+        assert!(a.windows(2).any(|w| w[0] == "-map" && w[1] == "1:a:0"));
+    }
+
+    /// Each input needs its own headers; a signed audio URL is signed too.
+    #[test]
+    fn both_inputs_get_the_headers() {
+        let mut i = input();
+        i.audio_url = Some("http://cdn/a.m4a".into());
+        let a = streaming_args(&i, None);
+        assert_eq!(
+            a.iter().filter(|x| *x == "-headers").count(),
+            2,
+            "the audio input was left unsigned: {a:?}"
+        );
+    }
+
+    /// A CDN closing an idle socket mid-film is routine; without reconnect the
+    /// film just stops.
+    #[test]
+    fn it_reconnects_on_a_dropped_connection() {
+        let a = streaming_args(&input(), None);
+        assert!(a.iter().any(|x| x == "-reconnect"));
+        assert!(a.iter().any(|x| x == "-reconnect_streamed"));
+    }
+
+    #[test]
+    fn the_output_is_raw_nv12_on_stdout() {
+        let a = streaming_args(&input(), None);
+        assert_eq!(a.last().unwrap(), "-");
+        assert!(a.windows(2).any(|w| w[0] == "-pix_fmt" && w[1] == "nv12"));
+    }
+
+    /// FETCH WHILE PLAYING, against a real socket: ffmpeg pulls over HTTP and
+    /// frames come out. The server counts how much it served, and the check is
+    /// that decoding STARTED before the whole file went out.
+    #[test]
+    fn it_decodes_over_http_without_downloading_first() {
+        if Command::new("ffmpeg").arg("-version").stdout(Stdio::null())
+            .stderr(Stdio::null()).status().map(|s| !s.success()).unwrap_or(true)
+        {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // Long enough that serving it all takes visibly longer than the header.
+        let clip = std::env::temp_dir().join(format!("vidkit-stream-{}.mp4", std::process::id()));
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10:duration=20",
+                "-pix_fmt", "yuv420p", "-c:v", "libx264",
+                // moov at the front, so a streaming reader can start.
+                "-movflags", "+faststart",
+            ])
+            .arg(&clip)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("SKIP: could not encode");
+            return;
+        }
+        let body = std::fs::read(&clip).unwrap();
+        let total = body.len();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..32 {
+                let Ok((mut sock, _)) = listener.accept() else { break };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                if n == 0 { continue; }
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (start, end) = req.lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .and_then(|l| l.split('=').nth(1).map(str::trim).map(str::to_string))
+                    .and_then(|r| {
+                        let (a, b) = r.split_once('-')?;
+                        Some((a.parse::<usize>().ok()?, b.parse::<usize>().unwrap_or(body.len() - 1)))
+                    })
+                    .unwrap_or((0, body.len() - 1));
+                if start >= body.len() { continue; }
+                let slice = &body[start..=end.min(body.len() - 1)];
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Type: video/mp4\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\n\r\n",
+                    start + slice.len() - 1, body.len(), slice.len());
+                let _ = sock.write_all(head.as_bytes());
+                // Dribble it, so a decoder that waited for the whole file
+                // would visibly stall.
+                for chunk in slice.chunks(16 * 1024) {
+                    if sock.write_all(chunk).is_err() { break; }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        });
+
+        let input = StreamingInput {
+            video_url: format!("http://127.0.0.1:{port}/clip.mp4"),
+            audio_url: None,
+            headers: Vec::new(),
+        };
+        let started = std::time::Instant::now();
+        let mut d = FfmpegFrames::open_streaming(&input, None).expect("open streaming");
+        assert_eq!((d.width, d.height), (320, 240));
+
+        let first = d.next_frame().expect("a first frame over http");
+        let elapsed = started.elapsed();
+        match &first.data {
+            FrameData::Cpu(p) => {
+                assert_eq!(p.data[0].len(), 320 * 240);
+                assert!(p.data[0].iter().any(|&v| v > 16), "decoded an empty frame");
+            }
+            _ => panic!("expected CPU planes"),
+        }
+        // Serving 20 seconds of dribbled video takes far longer than this; a
+        // first frame this early means it did not wait for the file.
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "waited {elapsed:?} for the first frame — that is download-then-play"
+        );
+        eprintln!("DIAG first frame after {elapsed:?} of a {total}-byte clip");
+        let _ = std::fs::remove_file(&clip);
+    }
+}

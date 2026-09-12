@@ -1008,6 +1008,17 @@ impl Player {
             // hidden: this waits for the whole download, so the first frame
             // comes after it rather than during.
             let cap = self.settings.quality.max_long_edge();
+
+            // FETCH WHILE PLAYING first. Resolution costs one yt-dlp run; the
+            // media itself is then pulled by ffmpeg as it decodes, so the
+            // first frame arrives in milliseconds instead of after the whole
+            // download. Falls back to download-then-play, because a site whose
+            // streams ffmpeg cannot read directly still works that way.
+            match self.stream_page(&url, cap) {
+                Ok(()) => return,
+                Err(e) => self.gpu_error = Some(format!("{e} — falling back to download")),
+            }
+
             match io::fetch_to_temp(&mut io::ProcessRunner::default(), &url, cap) {
                 Ok(media) => {
                     match decode::FfmpegFrames::open(media.path(), Some(1920)) {
@@ -1061,5 +1072,46 @@ impl Player {
         if let Some(Ok(o)) = &self.opened {
             self.transport.duration = o.duration;
         }
+    }
+}
+
+impl Player {
+    /// Resolve a page and start decoding straight from the media URLs.
+    fn stream_page(&mut self, url: &str, cap: Option<u32>) -> Result<(), String> {
+        use vidkit_ytdlp::{ResolveOptions, Resolver};
+
+        let caps = io::assumed_caps();
+        let mut r = Resolver::new(io::ProcessRunner::default(), url, ResolveOptions::default());
+        let resolved = r
+            .resolve(&caps)
+            .map_err(|e| format!("{url}: {e:?}"))?
+            .clone();
+
+        let input = decode::StreamingInput {
+            video_url: resolved.video_url.clone(),
+            audio_url: resolved.audio_url.clone(),
+            // Verbatim: the signed URL is bound to them and a different
+            // User-Agent gets a 403 that looks like an expired link.
+            headers: resolved.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        };
+
+        let frames = decode::FfmpegFrames::open_streaming(&input, cap)?;
+        // Resolved carries no duration; the probe the decoder just did knows
+        // the frame rate but not the length, and asking yt-dlp again for it is
+        // another process. Left as it was rather than guessed.
+        self.transport.status = "NV12 · CPU convert · streaming".into();
+        self.opened = Some(Ok(Opened {
+            label: format!(
+                "{} · {}x{} · streaming while it downloads",
+                resolved.video_format_id, resolved.width, resolved.height
+            ),
+            duration: None,
+        }));
+        self.frames = Some(frames);
+        // The previous download, if any, is no longer needed.
+        self.downloaded = None;
+        self.transport.playing = true;
+        self.gpu_error = None;
+        Ok(())
     }
 }
