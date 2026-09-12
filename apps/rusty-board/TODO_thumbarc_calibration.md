@@ -27,12 +27,34 @@ Anchor, sweep, confirm, as a state machine with no UI in it.
   In points it would be re-run every time the keyboard changed size, which is exactly when
   nobody wants to.
 
-## Still to do
+## Done: the overlay and the way in
 
-- [ ] The OVERLAY. `thumbcal` has no drawing: something has to show the two corners to tap,
-      trail the sweep as it is drawn, and paint the fitted polygon over the real keys at the
-      confirm step. Painting it over the keys is the point — a shape shown in the abstract
-      does not tell anyone whether the top row will be reachable.
+`calibration_ui` draws all four steps over the BOARD's rect — not the window's, which differ
+by the status bar on a phone, and a calibration offset by it would measure a reach nobody has.
+
+The scrim is translucent on purpose: the keys are the thing being measured against, and a
+reach shape over a black rectangle answers a different question than the one asked. A pixel
+test asserts the keys still show through, and another that every step draws something — a
+calibration that shows nothing while the finger moves is one people repeat because they assume
+it missed.
+
+Both corners are offered at the anchor step: which thumb is in use is exactly what this cannot
+infer, and a right-handed default would make left-handed users tap twice. Cancel is present on
+the rejected step too, so someone who opened this by accident can leave without sweeping.
+
+Opened by `RUSTY_BOARD_CALIBRATE=1`, the same env convention as `RUSTY_BOARD_PLACEMENT`. Not a
+settings row yet, and honest about that — but reachable, which a flow needs to be before it is
+a feature.
+
+While it is open the overlay TAKES the board: a sweep that also typed would fill the screen
+with letters at the moment the operator is concentrating on their thumb.
+
+The accepted value is the REACH, not the polygon. `Style` derives the arc per board rect, so a
+shape fitted at one size would be wrong the moment the keyboard rotated. `Style::calibrated_reach`
+is `Option<f32>` and `None` keeps the width-based guess — a hand that has never been measured
+is better served by an estimate than by nothing.
+
+## Still to do
 - [ ] Persistence. A calibration that does not survive a restart is a demo. It belongs beside
       the other board settings, and `Arc`'s polygon is a short list of pairs, so the format is
       not the hard part; deciding what happens to a saved arc when the board's aspect changes

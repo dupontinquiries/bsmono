@@ -754,11 +754,15 @@ pub struct Style {
     /// nearly the full width, rows far from it give more up. `None` falls back to
     /// `halfboard`'s uniform inset, which is what every existing caller gets.
     pub arc: bool,
+    /// A MEASURED reach, from `thumbcal`, replacing the guess `default_for` makes from the
+    /// board's width. `None` keeps the width-based default — a hand that has never been
+    /// measured is better served by an estimate than by nothing.
+    pub calibrated_reach: Option<f32>,
 }
 
 impl Default for Style {
     fn default() -> Self {
-        Style { key_radius: None, opacity: 1.0, magnifier: true, half: crate::halfboard::Side::Off, arc: true }
+        Style { calibrated_reach: None, key_radius: None, opacity: 1.0, magnifier: true, half: crate::halfboard::Side::Off, arc: true }
     }
 }
 
@@ -779,6 +783,7 @@ impl Style {
             // how you held it yesterday is a keyboard you have to un-compact.
             half: crate::halfboard::Side::Off,
             arc: true,
+            calibrated_reach: None,
         }
     }
 
@@ -872,7 +877,12 @@ pub fn keyboard_ui_styled(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, pal
             .is_on()
             .then(|| crate::thumbarc::Corner::from_side(style.half))
             .flatten()
-            .and_then(|c| crate::thumbarc::Arc::default_for(full_rect.width(), c))
+            .and_then(|c| match style.calibrated_reach {
+                // MEASURED BEATS ESTIMATED. `default_for` reads the board's width and guesses
+                // a hand from it; a calibration read the hand.
+                Some(r) => Some(crate::thumbarc::Arc::default_shape(c, r)),
+                None => crate::thumbarc::Arc::default_for(full_rect.width(), c),
+            })
     } else {
         None
     };

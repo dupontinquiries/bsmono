@@ -14,6 +14,14 @@ use crate::{apply_theme, keyboard_ui_styled, Board};
 use uikit_egui::Adaptive;
 
 pub struct Feel {
+    /// The thumb-reach calibration, while it is open.
+    ///
+    /// `Some` puts the overlay over the board and takes the input. Opened by
+    /// `RUSTY_BOARD_CALIBRATE=1` for now — the same env convention as
+    /// `RUSTY_BOARD_PLACEMENT`, and honest about being a way in rather than a settings row it
+    /// does not have yet. A flow nobody can reach is not a feature, and an env var is a way
+    /// to reach it.
+    pub thumb_cal: Option<crate::thumbcal::Calibration>,
     /// What the board draws with: the persisted appearance block with the panel's values
     /// folded on top.
     pub style: crate::Style,
@@ -246,6 +254,9 @@ impl Feel {
             cfg.appearance.show_magnifier,
         );
         Feel {
+            // Open only when asked. See the field's note on the env var.
+            thumb_cal: std::env::var("RUSTY_BOARD_CALIBRATE").is_ok()
+                .then(crate::thumbcal::Calibration::default),
             style,
             base_style: style,
             ripples: Vec::new(),
@@ -1041,6 +1052,41 @@ impl Feel {
                             (board_rect.max.y - adaptive.min_touch_target).max(board_rect.min.y),
                         ),
                     );
+                    // THE CALIBRATION TAKES THE BOARD while it is open: the overlay measures
+                    // a reach against these keys, and letting a sweep also type would give the
+                    // operator a screen full of letters at the moment they are concentrating
+                    // on their thumb.
+                    if self.thumb_cal.is_some() {
+                        let colors = uikit_egui::palette_colors(self.board.palette());
+                        let mut cal = self.thumb_cal.take().expect("checked");
+                        // The sweep, from the same pointer the board would have used.
+                        if ui.input(|i| i.pointer.primary_down()) {
+                            if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                                cal.sample((
+                                    (p.x - board_rect.min.x) / board_rect.width().max(1.0),
+                                    (p.y - board_rect.min.y) / board_rect.height().max(1.0),
+                                ));
+                            }
+                        } else if ui.input(|i| i.pointer.any_released()) {
+                            cal.finish();
+                        }
+                        match crate::thumbcal::calibration_ui(ui, &mut cal, board_rect, &colors) {
+                            Some(crate::thumbcal::CalAction::Accept(_)) => {
+                                // The REACH, not the polygon: `Style` derives the arc per
+                                // board rect, so storing a shape fitted to one size would be
+                                // wrong the moment the keyboard was resized or rotated.
+                                if let crate::thumbcal::Step::Confirm { reach, .. } = cal.step {
+                                    self.style.calibrated_reach = Some(reach);
+                                    self.base_style.calibrated_reach = Some(reach);
+                                }
+                            }
+                            Some(crate::thumbcal::CalAction::Cancel) => {}
+                            // Retry keeps the overlay up; the state machine already reset.
+                            Some(crate::thumbcal::CalAction::Retry) => self.thumb_cal = Some(cal),
+                            None => self.thumb_cal = Some(cal),
+                        }
+                        return;
+                    }
                     let zones = crate::springboard::zones(board_rect, letters, self.style.half);
                     let swiping = self.swipe.is_active();
                     {

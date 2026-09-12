@@ -268,3 +268,208 @@ mod tests {
         assert_eq!(reach_of(Corner::BottomRight, &[(0.0, 0.0)]), 1.0);
     }
 }
+
+/// What the operator did to the overlay this frame.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CalAction {
+    /// Take the fitted arc.
+    Accept(Arc),
+    /// Try the sweep again.
+    Retry,
+    /// Leave without changing anything.
+    Cancel,
+}
+
+/// Draw the calibration over the keyboard.
+///
+/// OVER THE REAL KEYS, which is the point rather than a detail: a reach shape shown in the
+/// abstract tells nobody whether the top row will be reachable. The confirm step paints the
+/// fitted polygon on top of the board the user is about to get, so the question being answered
+/// is "can I hit those" and not "does that curve look right".
+///
+/// The board rect is passed in rather than taken from `ui`, so this draws over the keyboard's
+/// own rect and not the whole window — on a phone those differ by the status bar, and a
+/// calibration offset by it would measure a reach nobody has.
+pub fn calibration_ui(
+    ui: &mut egui::Ui,
+    cal: &mut Calibration,
+    board: egui::Rect,
+    c: &uikit_egui::PaletteColors,
+) -> Option<CalAction> {
+    let p = ui.painter();
+    // A scrim, so the keys read as inert while this is up. Not opaque: the keys are the thing
+    // being measured against and hiding them would defeat the overlay.
+    p.rect_filled(board, 0.0, egui::Color32::from_black_alpha(150));
+
+    let to_screen = |n: (f32, f32)| {
+        egui::pos2(board.min.x + n.0 * board.width(), board.min.y + n.1 * board.height())
+    };
+    let mut out = None;
+
+    match &cal.step {
+        Step::Anchor => {
+            // Both corners offered, because which thumb is in use is exactly what this cannot
+            // infer — and a right-handed default would make left-handed users tap twice.
+            for (corner, at) in
+                [(Corner::BottomLeft, (0.08, 0.88)), (Corner::BottomRight, (0.92, 0.88))]
+            {
+                let pos = to_screen(at);
+                p.circle_filled(pos, 26.0, c.accent.gamma_multiply(0.35));
+                p.circle_stroke(pos, 26.0, egui::Stroke::new(2.0, c.accent));
+                if ui.input(|i| i.pointer.primary_released())
+                    && ui.input(|i| i.pointer.interact_pos()).is_some_and(|q| (q - pos).length() <= 40.0)
+                {
+                    cal.anchor(corner);
+                }
+            }
+            p.text(
+                to_screen((0.5, 0.35)),
+                egui::Align2::CENTER_CENTER,
+                "Rest your thumb and tap that corner",
+                egui::FontId::proportional(16.0),
+                c.text,
+            );
+        }
+        Step::Sweep { samples, .. } => {
+            // The trail, so the sweep is visibly being recorded. A calibration that shows
+            // nothing while the finger moves is one people repeat because they assume it
+            // missed.
+            let pts: Vec<egui::Pos2> = samples.iter().map(|s| to_screen(*s)).collect();
+            if pts.len() > 1 {
+                p.add(egui::Shape::line(pts, egui::Stroke::new(3.0, c.accent)));
+            }
+            p.text(
+                to_screen((0.5, 0.35)),
+                egui::Align2::CENTER_CENTER,
+                "Now sweep as far as your thumb reaches",
+                egui::FontId::proportional(16.0),
+                c.text,
+            );
+        }
+        Step::Confirm { arc, .. } => {
+            // The fitted shape ON the keys.
+            let poly: Vec<egui::Pos2> = arc.polygon.iter().map(|n| to_screen(*n)).collect();
+            if poly.len() > 2 {
+                p.add(egui::Shape::convex_polygon(
+                    poly.clone(),
+                    c.accent.gamma_multiply(0.25),
+                    egui::Stroke::new(2.0, c.accent),
+                ));
+            }
+            out = confirm_buttons(ui, board, "Keep this reach?", cal);
+        }
+        Step::Rejected { why, .. } => {
+            p.text(
+                to_screen((0.5, 0.4)),
+                egui::Align2::CENTER_CENTER,
+                why,
+                egui::FontId::proportional(15.0),
+                c.warning,
+            );
+            out = confirm_buttons(ui, board, "", cal);
+        }
+    }
+    out
+}
+
+/// The accept/retry/cancel row, shared by confirm and reject.
+///
+/// CANCEL IS ALWAYS THERE, including on the rejected step. Someone who opened this by accident
+/// on a keyboard they were happy with must be able to leave without sweeping anything.
+fn confirm_buttons(
+    ui: &mut egui::Ui,
+    board: egui::Rect,
+    prompt: &str,
+    cal: &mut Calibration,
+) -> Option<CalAction> {
+    let mut out = None;
+    let row = egui::Rect::from_min_size(
+        egui::pos2(board.min.x, board.min.y + board.height() * 0.62),
+        egui::vec2(board.width(), 44.0),
+    );
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(row), |ui| {
+        ui.vertical_centered(|ui| {
+            if !prompt.is_empty() {
+                ui.label(prompt);
+            }
+            ui.horizontal(|ui| {
+                ui.add_space((board.width() - 260.0).max(0.0) * 0.5);
+                if cal.accept().is_some() && ui.button("Keep").clicked() {
+                    if let Some(a) = cal.accept() {
+                        out = Some(CalAction::Accept(a));
+                    }
+                }
+                if ui.button("Sweep again").clicked() {
+                    cal.retry();
+                    out = Some(CalAction::Retry);
+                }
+                if ui.button("Cancel").clicked() {
+                    out = Some(CalAction::Cancel);
+                }
+            });
+        });
+    });
+    out
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+
+    fn draw(step: Step) -> (uikit_egui::uiverify::Frame, egui::Rect) {
+        let board = egui::Rect::from_min_size(egui::pos2(0.0, 60.0), egui::vec2(320.0, 180.0));
+        let bg = egui::Color32::from_rgb(18, 18, 22);
+        let f = uikit_egui::uiverify::render(egui::vec2(320.0, 240.0), bg, |ctx| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                // Stand-in keys, so "over the real keys" is something the test can see.
+                ui.painter().rect_filled(board, 0.0, egui::Color32::from_rgb(60, 60, 70));
+                let mut cal = Calibration { step: step.clone() };
+                let colors = uikit_egui::palette_colors("system");
+                let _ = calibration_ui(ui, &mut cal, board, &colors);
+            });
+        });
+        (f, board)
+    }
+
+    /// A calibration that shows nothing while the finger moves is one people repeat, because
+    /// they assume it missed.
+    #[test]
+    fn every_step_draws_something_over_the_board() {
+        let bg = egui::Color32::from_rgb(18, 18, 22);
+        for step in [
+            Step::Anchor,
+            Step::Sweep {
+                anchor: Corner::BottomRight,
+                samples: (0..10).map(|i| (1.0 - i as f32 * 0.08, 1.0 - i as f32 * 0.08)).collect(),
+            },
+            Step::Confirm {
+                anchor: Corner::BottomRight,
+                arc: Arc::default_shape(Corner::BottomRight, 0.7),
+                reach: 0.7,
+            },
+            Step::Rejected { anchor: Corner::BottomRight, why: "that was a tap".into() },
+        ] {
+            let (f, board) = draw(step.clone());
+            let ink = f.ink_in(board, bg);
+            assert!(ink > 0.05, "{step:?} drew almost nothing: {ink:.3}");
+        }
+    }
+
+    /// The scrim must not hide the keys — they are the thing being measured against, and a
+    /// reach shape over a black rectangle answers a different question than the one asked.
+    #[test]
+    fn the_keys_still_show_through_the_scrim() {
+        let (f, board) = draw(Step::Confirm {
+            anchor: Corner::BottomRight,
+            arc: Arc::default_shape(Corner::BottomRight, 0.7),
+            reach: 0.7,
+        });
+        // The key colour is (60,60,70) at 150/255 alpha over the scrim: still distinctly
+        // lighter than pure black, which is what "visible" means here.
+        let d = f.dominant(board);
+        assert!(
+            d.r() > 10 || d.g() > 10 || d.b() > 12,
+            "the scrim blacked the keys out: {d:?}"
+        );
+    }
+}
