@@ -569,6 +569,24 @@ impl App {
             let cmds = self.snap.apply(HostEvent::CaptureStatus(st));
             self.handle(cmds);
         }
+        // THE ENCODE'S ANSWER. It runs on its own thread and would otherwise finish
+        // invisibly — a snap that silently succeeded and one that silently failed look
+        // identical from the camera page, which is the state this whole chain was in before
+        // the frames existed.
+        while let Ok(done) = self.snap.encode_done.1.try_recv() {
+            use snapclone_egui::video_encode_run::Done;
+            self.snap.shutter_note = match done {
+                Done::Ok { out, bytes } => {
+                    format!("encoded {} \u{2014} {:.1}MB", out.display(), bytes as f64 / 1e6)
+                }
+                // The reason, not just "failed". `run_blocking` already trimmed ffmpeg's
+                // stderr to its tail so the complaint is not buried under a build dump.
+                Done::Failed { code, why } => {
+                    format!("encode failed{}: {why}", code.map(|c| format!(" ({c})")).unwrap_or_default())
+                }
+                Done::NotRun(e) => format!("encoder did not start: {e}"),
+            };
+        }
         if let Some(f) = self.rig.shared.take_frame() {
             self.last_live = Some(f.clone());
             // THE RECORDER, FED. `Recorder::offer` had no caller at all: it counted frames it

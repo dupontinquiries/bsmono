@@ -87,6 +87,8 @@ pub mod video_probe;
 pub mod video_record;
 /// Admitted frames on disk, so `av1_encode`'s command has something to read.
 pub mod video_spill;
+/// Running the encode: the thin spawn layer `av1_encode` and `video_spill` were built for.
+pub mod video_encode_run;
 pub mod firewall_backend;
 pub mod gossip;
 pub mod handshake;
@@ -179,6 +181,15 @@ pub struct Snapclone {
     /// Where the recording's admitted frames are being written. Beside the recorder because
     /// the two start and stop together — `offer` feeds this, and the shutter finishes it.
     pub spill: Option<crate::video_spill::Spill>,
+    /// Where a finished encode reports back from its thread.
+    ///
+    /// A channel rather than a shared `Mutex<Option<Done>>`: the UI polls once a frame, and a
+    /// channel makes "nothing yet" the cheap case without taking a lock the encode thread
+    /// might be holding while it writes.
+    pub encode_done: (
+        std::sync::mpsc::Sender<crate::video_encode_run::Done>,
+        std::sync::mpsc::Receiver<crate::video_encode_run::Done>,
+    ),
     pub shutter_note: String,
     /// Why the last feed tap did not open a viewer. Empty when there is
     /// nothing to say.
@@ -752,6 +763,7 @@ impl Snapclone {
             prefs_handedness: settings_kit::Handedness::Right,
             recorder: None,
             spill: None,
+            encode_done: std::sync::mpsc::channel(),
             shutter_note: String::new(),
             feed_note: String::new(),
             local_id: String::new(),
@@ -4137,13 +4149,18 @@ impl Snapclone {
                             // if it failed there is nothing to encode — printing "would run:
                             // ffmpeg …" over a file that is not there is the worst kind of
                             // confident.
-                            let spill_err = match self.spill.take().map(|s| s.finish()) {
-                                Some(Err(e)) => Some(e),
+                            let spilled = self.spill.take().map(|s| s.finish());
+                            let ready = match &spilled {
+                                Some(Ok(r)) => Some(r.clone()),
                                 _ => None,
                             };
-                            let why = if let Some(e) = spill_err {
-                                format!("nothing to encode \u{2014} {e}")
-                            } else { match crate::video_probe::status(false) {
+                            let out = crate::video_spill::spill_path(0).with_extension("mkv");
+                            let why = match &spilled {
+                                Some(Err(e)) => format!("nothing to encode \u{2014} {e}"),
+                                // No spill at all means no recording was running — not a
+                                // failure, just nothing to do.
+                                None => "no recording".to_string(),
+                                Some(Ok(_)) => match crate::video_probe::status(false) {
                                 Ok(b) => {
                                     // THE COMMAND THAT WOULD RUN, not just the backend's
                                     // name. `av1_encode::command` turns the recorder's own
@@ -4172,6 +4189,9 @@ impl Snapclone {
                                             b.name()
                                         ),
                                         Some((w, h)) => {
+                                            // `ready` is Some in this arm: the outer match
+                                            // only reaches here for `Some(Ok(_))`.
+                                            let ready = ready.clone().expect("spill succeeded");
                                             let src = crate::av1_encode::Source::RawStdin {
                                                 width: w,
                                                 height: h,
@@ -4181,12 +4201,27 @@ impl Snapclone {
                                                     .unwrap_or(30),
                                                 pix_fmt: "yuv420p".to_string(),
                                             };
-                                            match crate::av1_encode::command(&src, &plan, "snap.mkv") {
-                                                Ok(argv) => format!(
-                                                    "{} ready \u{2014} would run: {}",
-                                                    b.name(),
-                                                    crate::av1_encode::display(&argv)
-                                                ),
+                                            // AND IT RUNS. The argv was printed because the
+                                            // frames did not exist; they do now, so the
+                                            // remaining step was piping one into the other.
+                                            //
+                                            // ON A THREAD: an encode is seconds of work and
+                                            // this is called from the shutter, with the user
+                                            // still looking at the preview. Blocking here
+                                            // freezes the camera for the length of the clip.
+                                            match crate::av1_encode::command(&src, &plan, out.to_str().unwrap_or("snap.mkv")) {
+                                                Ok(argv) => {
+                                                    let (spill_path, out2) = (ready.path.clone(), out.clone());
+                                                    let tx = self.encode_done.0.clone();
+                                                    std::thread::spawn(move || {
+                                                        let d = crate::video_encode_run::run_and_tidy(
+                                                            &argv, &spill_path, &out2);
+                                                        // A closed receiver means the app is
+                                                        // gone; nothing to report to.
+                                                        let _ = tx.send(d);
+                                                    });
+                                                    format!("{} \u{2014} encoding {} frames", b.name(), ready.frames)
+                                                }
                                                 Err(e) => format!("{}: {e}", b.name()),
                                             }
                                         }

@@ -29,8 +29,13 @@ camera, a microphone, a second device, or a network — so the honest status is
       `Source::RawStdin` describes to ffmpeg.
       - [ ] Confirm on the device: a recording leaves a file in
             `~/.cache/snapclone/spill/` whose size is frames x w x h x 4.
-      - [ ] Pipe it into the printed command and check the clip plays. Nothing
-            spawns ffmpeg yet — the command is still printed, not run.
+      - [x] It is piped in. `video_encode_run` spawns the encoder on its own
+            thread with the spill streamed to stdin, and the result comes back
+            over a channel to the camera page.
+      - [ ] Confirm on the device that the clip PLAYS. Everything up to the
+            ffmpeg invocation is tested here (against `sh -c 'cat > file'`, which
+            has the same stdin contract); whether real ffmpeg accepts the argv
+            for a real sensor's frames is not something this container can say.
 - [ ] A video snap, once the above lands.
 - [ ] Voice call: ring → answer → audio both ways → hang up. Note WHICH leg
       fails, since the signalling and the media path are separate.
