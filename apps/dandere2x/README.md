@@ -123,6 +123,12 @@ truncated render would otherwise score well on the frames that exist.
 
 ## Numbers and where the time goes
 
+Every reuse experiment — what worked, what did not, and the clip-by-clip
+numbers behind the flags described above — is recorded in
+[`docs/REUSE_FINDINGS.md`](docs/REUSE_FINDINGS.md). Read it before adding a
+new block source: most of the obvious ideas have been measured and several
+of them lose.
+
 - The engine is 8-bit RGB. 10-bit sources are dithered to 8 on decode; the
   output is 10-bit AV1 carrying 8-bit-precision content. Real-ESRGAN is
   8-bit-trained, so only reused blocks would gain from a 16-bit path.

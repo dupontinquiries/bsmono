@@ -33,6 +33,9 @@
 //! is gated on the measurement this step provides: if integer plates do not
 //! move the reuse fraction on real footage, sub-pixel plates will not either.
 //!
+//! Measured on real footage this is a NET LOSS on handheld and on a 3D game
+//! camera; see docs/REUSE_FINDINGS.md §4 before enabling it.
+//!
 //! Memory: the median is computed in row strips so the per-pixel sample
 //! lists never exceed `strip_rows · plate_width · 3 · frames` bytes.
 

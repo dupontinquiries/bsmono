@@ -32,6 +32,8 @@
 //! bits), so the "truth" a window holds is in its best-encoded frame, not
 //! in the majority vote.
 //!
+//! Conclusions from these runs are written up in docs/REUSE_FINDINGS.md §5.
+//!
 //! Score with the high-bitrate encode of the same frames as ground truth;
 //! that is the only honest reference for "did it remove artefacts or detail".
 //!

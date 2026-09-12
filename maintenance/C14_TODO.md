@@ -1281,6 +1281,24 @@ of these fixes touched it — degenerate/near-zero-area triangles (genuinely
 are both still on the table.
 
 
+## 24b. dandere2x block reuse: measured record, and the seam risk region redraw adds
+
+The reuse work (region redraw, anchor propagation, sub-pel refinement, the
+plate, subtile cache harvesting) is written up in
+`apps/dandere2x/docs/REUSE_FINDINGS.md` — clip-by-clip numbers, and which of
+the obvious ideas measured as losses. Read it before adding a block source.
+
+Two things there that touch §24 directly:
+
+- Region redraw blends one rectangle back with the same `blend_block` ramp,
+  now via `blend_rect`. Whatever §24 concludes about the per-block crossover
+  applies at the rectangle's edge in the same way, on one seam per frame
+  instead of hundreds.
+- Every number in that document comes from `analyze`, which counts pixels and
+  cannot see a seam. The anchor gate (`--anchor-rmse`, flat RMSE) is looser
+  than the JPEG gate for smooth content, and a cached hit is a block drawn in
+  another frame's context. Neither has been checked with `compare` on a GPU.
+
 ## 24. dandere2x blocky artefacts: the merge hard-copies every residual block
 
 Reported with a frame showing the block grid plainly: "still blocky artifacts

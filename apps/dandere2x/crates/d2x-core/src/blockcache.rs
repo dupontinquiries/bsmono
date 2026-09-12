@@ -286,7 +286,8 @@ mod tests {
     }
 }
 
-// MEASURED, so the next person does not repeat it.
+// MEASURED, so the next person does not repeat it. Full record, including
+// the other reuse experiments, in docs/REUSE_FINDINGS.md.
 //
 // Round 1 — harvesting alone: subtile harvesting took inserts on Lone Ranger
 // AV1 (120 frames, 512 MB) from 14,567 to 54,390, 3.7x the supply at no extra
