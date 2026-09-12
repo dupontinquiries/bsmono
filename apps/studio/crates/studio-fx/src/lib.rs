@@ -16,6 +16,7 @@ pub mod compositor;
 pub mod reference;
 pub mod analysis;
 pub mod playrate;
+pub mod space;
 pub mod saturation;
 pub mod multiband;
 pub mod imager;
@@ -475,6 +476,10 @@ pub enum Instance {
     AdaptiveSat(Box<adaptive_sat::AdaptiveSat>),
     TapeStop(playrate::TapeStop),
     Halftime(playrate::Halftime),
+    /// The send pair — see `space`'s module docs. Both carry per-channel
+    /// state behind the per-sample interface, like the playrate pair.
+    Reverb(Box<space::Reverb>),
+    Delay(Box<space::Delay>),
 }
 
 impl Instance {
@@ -505,6 +510,8 @@ impl Instance {
             Instance::Gate(g) => g.process(x),
             Instance::TapeStop(t) => t.process(x),
             Instance::Halftime(h) => h.process(x),
+            Instance::Reverb(r) => r.process(x),
+            Instance::Delay(d) => d.process(x),
             Instance::Transform(_) | Instance::Color(_) | Instance::Retime(_) => x,
         }
     }
@@ -686,6 +693,17 @@ pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> 
         "halftime" => Instance::Halftime(playrate::Halftime::new(
             rate, p(q, "window", 0.5),
             p(q, "channels", 2.0).max(1.0) as usize)),
+        // The send pair. `mix` defaults to a plausible INSERT amount; a
+        // send bus sets it to 1.0 (all wet), which is what the mixer's
+        // "+ fx" on a bus does.
+        "reverb" => Instance::Reverb(Box::new(space::Reverb::new(
+            rate, p(q, "size", 0.5), p(q, "damp", 0.4), p(q, "predelay", 10.0),
+            p(q, "mix", 0.3), p(q, "width", 1.0),
+            p(q, "channels", 2.0).max(1.0) as usize))),
+        "delay" => Instance::Delay(Box::new(space::Delay::new(
+            rate, p(q, "time", 321.4), p(q, "feedback", 0.4), p(q, "damp", 5000.0),
+            p(q, "mix", 0.3), p(q, "pingpong", 0.0) > 0.5,
+            p(q, "channels", 2.0).max(1.0) as usize))),
         "color" => Instance::Color(Color {
             lift: [p(q, "lift_r", 0.0), p(q, "lift_g", 0.0), p(q, "lift_b", 0.0)],
             gamma: [p(q, "gamma_r", 1.0), p(q, "gamma_g", 1.0), p(q, "gamma_b", 1.0)],
