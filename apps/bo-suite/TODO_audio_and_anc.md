@@ -27,9 +27,17 @@ work rather than a claim about it.
 
 ## Active ANC
 
-- [ ] Say what the app CONTROLS versus what it only displays. ANC on most hardware is
-      negotiated by the device; a UI that appears to set a level it cannot set is worse than
-      one that shows the level and says where it is set.
+- [x] Say what the app CONTROLS versus what it only displays. The answer was already in
+      `anc.rs`: `process` has no caller here BY DESIGN — cpal lives in `bo-controller`, which
+      owns the engine and feeds it, and this app is the control surface. What was wrong is
+      that the panel did not say so. In Auto with no snapshot, `phase()` returns `Quiet` for
+      `None`, so the readout claimed "quiet — nothing to cancel" about a room nothing had
+      listened to. It now says it is waiting for the engine, and the dot is HOLLOW rather
+      than grey-filled — grey-filled and grey-hollow both read as "not emitting", but only
+      one also means "and I do not know what the room sounds like".
+- [ ] The other half: nothing carries a snapshot FROM `bo-controller` to this app. Until that
+      link exists the panel is permanently in the waiting state — which is now at least
+      honest, but it is not the feature.
 - [ ] Whatever the transport is (BLE, USB HID, a vendor protocol), the argv/packet builder
       should be pure and tested the way `mediagen` and `visionpair` are in logscope — the
       command is what the tests pin, and the spawning is a thin layer.

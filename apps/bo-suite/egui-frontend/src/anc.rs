@@ -143,6 +143,16 @@ impl Anc {
         }
     }
 
+    /// Has the engine reported anything at all?
+    ///
+    /// `false` means no snapshot has arrived — `process` has no caller in this binary by
+    /// design, so until `bo-controller` reports, the panel knows the MODE and nothing about
+    /// the room. Distinguished from `Quiet` because "nothing to cancel" is a claim and this
+    /// is the absence of one.
+    pub fn has_engine_report(&self) -> bool {
+        self.last.is_some()
+    }
+
     /// Should this read as a problem?
     ///
     /// Quiet is not a fault, and colouring it like one teaches the operator to
@@ -171,6 +181,20 @@ impl Anc {
         match self.mode {
             Mode::Off => "off".into(),
             Mode::Forced => "forced on — phase ignored".into(),
+            // NOTHING HAS LISTENED YET is not the same as "quiet".
+            //
+            // `process` has no caller in this binary and that is deliberate — cpal lives in
+            // `bo-controller`, which owns the engine and feeds it; this app is the control
+            // surface. But `last` is `None` until a snapshot arrives from somewhere, and
+            // `phase()` reports `Quiet` for `None`, so an Auto-mode readout with no engine
+            // behind it said "quiet — nothing to cancel".
+            //
+            // That is a positive claim about a room nothing has listened to, and it is the
+            // most misleading thing this panel could say: an operator reading it concludes
+            // the ANC is working and there is simply no drone, when in fact no audio has
+            // reached the engine at all.
+            Mode::Auto if self.last.is_none() =>
+                "waiting for the engine — no audio has reached it yet".into(),
             Mode::Auto => match (self.phase(), self.last) {
                 (DronePhase::Quiet, _) => "quiet — nothing to cancel".into(),
                 (DronePhase::Detected, Some(s)) =>
@@ -306,7 +330,12 @@ pub fn anc_chip(ui: &mut egui::Ui, a: &mut Anc, scene: &mut uikit_egui::A11yScen
         } else {
             c.text_weak
         };
-        ui.colored_label(dot, "●");
+        // A HOLLOW DOT while nothing has reported. Grey-filled and grey-hollow both read as
+        // "not emitting", but only one of them also means "and I have no idea what the room
+        // sounds like" — which is the state this panel is in until `bo-controller` reports,
+        // since `process` has no caller here by design.
+        let glyph = if a.mode != Mode::Off && !a.has_engine_report() { "\u{25cb}" } else { "\u{25cf}" };
+        ui.colored_label(dot, glyph);
         let label = format!("ANC {}", a.mode.label());
         let resp = ui.selectable_label(a.mode != Mode::Off, &label)
             .on_hover_text("Off · Auto · On");
@@ -335,6 +364,37 @@ pub fn anc_chip(ui: &mut egui::Ui, a: &mut Anc, scene: &mut uikit_egui::A11yScen
 
 #[cfg(test)]
 mod tests {
+
+    /// The most misleading thing this panel could say. In Auto with no engine behind it,
+    /// `phase()` reports `Quiet` for a `None` snapshot, so the readout claimed "quiet —
+    /// nothing to cancel" about a room nothing had listened to. An operator reading that
+    /// concludes the ANC is working and there is simply no drone.
+    #[test]
+    fn auto_with_no_engine_report_says_so_rather_than_claiming_quiet() {
+        let mut a = Anc::default();
+        a.mode = Mode::Auto;
+        assert!(!a.has_engine_report());
+        let r = a.readout();
+        assert!(r.contains("waiting for the engine"), "{r}");
+        assert!(!r.contains("nothing to cancel"), "it claimed the room was quiet: {r}");
+
+        // Once a snapshot arrives, a genuine quiet IS reported as quiet — the point is the
+        // distinction, not suppressing the word.
+        let _ = a.process(&[0.0f32; 1024]);
+        assert!(a.has_engine_report());
+        let r = a.readout();
+        assert!(!r.contains("waiting"), "{r}");
+    }
+
+    /// Off and Forced say what they are without an engine: neither is a claim about the room.
+    #[test]
+    fn the_other_modes_are_unaffected_by_having_no_report() {
+        let mut a = Anc::default();
+        a.mode = Mode::Off;
+        assert_eq!(a.readout(), "off");
+        a.mode = Mode::Forced;
+        assert!(a.readout().contains("forced"), "{}", a.readout());
+    }
     use super::*;
     use std::f32::consts::TAU;
 
