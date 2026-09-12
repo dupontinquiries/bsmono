@@ -71,6 +71,17 @@ untestable wrapper would have looked like progress.
 
 ## Open, in the order I would do them
 
+0. **Fragmented MP4 (`moof`/`trun`).** *verified* against a real yt-dlp `f616`
+   download: ftyp brand `dash`, a 688-byte `moov` with an EMPTY sample table,
+   then moof/mdat pairs. This is what YouTube serves and what yt-dlp fetches
+   fragment by fragment, so it is the ORDINARY case here, not an exotic one —
+   and it is the cause of the "0 packets" reports. `vidkit-mp4` reads sample
+   tables from `moov` only; every sample in a DASH file lives in `trun`.
+   Playback is unaffected because ffmpeg demuxes, so this shows up as a wrong
+   description rather than a broken video. The demuxer now says which thing is
+   unsupported instead of reporting a corrupt `stsc`.
+
+
 1. **`Transcriber` impl (whisper-rs).** Resolve the model through
    `shared/models-kit` — `models_kit::find("whisper", name)` — and NOT with a
    path of its own. `~/models/<kind>/<name>` is the canonical store and

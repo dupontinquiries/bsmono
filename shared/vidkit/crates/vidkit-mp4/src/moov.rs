@@ -172,7 +172,24 @@ fn sample_offsets(
     sizes: &[u32],
 ) -> Result<Vec<u64>> {
     if stsc.is_empty() {
-        return Err(Error::Malformed("stsc is empty".into()));
+        // An EMPTY sample table is the signature of a fragmented MP4, not a
+        // corrupt one, and saying "stsc is empty" sends the reader looking for
+        // damage that is not there.
+        //
+        // A DASH file has a tiny `moov` carrying only the track header and an
+        // `mvex`; every sample lives in the `moof`/`trun` boxes that follow.
+        // That is what YouTube serves and what yt-dlp downloads fragment by
+        // fragment, so it is the ORDINARY case for this player rather than an
+        // exotic one. Verified against a real `f616` download: ftyp brand
+        // `dash`, a 688-byte moov, then moof/mdat pairs.
+        //
+        // Supporting it means parsing `trun`, which is a real piece of work
+        // and is recorded in the TODO. Until then this says which thing is
+        // unsupported.
+        return Err(Error::Unsupported(
+            "fragmented MP4 (DASH): the sample table is in moof/trun, which this demuxer does not read"
+                .into(),
+        ));
     }
     let mut offsets = Vec::with_capacity(sizes.len());
     let mut sample = 0usize;

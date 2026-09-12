@@ -126,6 +126,55 @@ pub mod build {
 
 #[cfg(test)]
 mod tests {
+
+    /// A fragmented MP4 must say so rather than blaming a corrupt sample
+    /// table.
+    ///
+    /// Built to the shape of a real yt-dlp `f616` download: ftyp brand `dash`,
+    /// a moov whose stbl is EMPTY, and the samples in moof/mdat pairs that
+    /// follow. That file is what YouTube serves, so this is the ordinary case
+    /// for this player, and "stsc is empty" pointed at damage that was not
+    /// there.
+    #[test]
+    fn a_fragmented_mp4_is_named_as_unsupported_not_corrupt() {
+        use crate::build::*;
+        let stbl = bx(
+            b"stbl",
+            &cat(&[
+                stsd(visual_entry(b"avc1", 1920, 1080, avcc(4, &[0x67, 0x64, 0, 0x28], &[0x68]))),
+                table(b"stts", &[]),
+                table(b"stsc", &[]),
+                stsz(&[]),
+                table(b"stco", &[]),
+            ]),
+        );
+        let minf = bx(b"minf", &cat(&[bx(b"vmhd", &[0u8; 12]), stbl]));
+        let mdia = bx(b"mdia", &cat(&[mdhd(30_000, 0), hdlr(b"vide"), minf]));
+        let trak = bx(b"trak", &cat(&[tkhd(1, 1920, 1080), mdia]));
+        // `mvex` is what marks a file as fragmented.
+        let mvex = bx(b"mvex", &bx(b"trex", &[0u8; 24]));
+        let moov = bx(b"moov", &cat(&[bx(b"mvhd", &[0u8; 100]), trak, mvex]));
+        let file = cat(&[
+            bx(b"ftyp", b"dash\0\0\0\0iso6mp41"),
+            moov,
+            bx(b"moof", &[0u8; 32]),
+            bx(b"mdat", &[0u8; 64]),
+        ]);
+
+        let e = match Mp4Demuxer::open(MemorySource(file)) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a fragmented file opened as if it had a sample table"),
+        };
+        assert!(
+            e.contains("fragmented"),
+            "the message does not name the real cause: {e}"
+        );
+        assert!(
+            !e.contains("stsc is empty"),
+            "still blaming the sample table: {e}"
+        );
+    }
+
     /// Two AV1 samples, both sync, with the given av1C payload.
     fn av1_file(av1c_payload: &[u8]) -> Vec<u8> {
         use crate::build::*;
