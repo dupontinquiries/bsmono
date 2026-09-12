@@ -318,12 +318,15 @@ pub fn plan(env: &Envelope, occupant_h: f32) -> Vec<PlannedRoom> {
             if free < min_side {
                 continue; // too pinched here -- a real answer, not a failure
             }
-            let room_half_x = (free * 0.5).min(w * 0.45);
+            // leave the DOOR GAP outboard of the spine before the room
+            // starts -- see `DOOR_GAP_H`
+            let gap = DOOR_GAP_H * occupant_h;
+            let room_half_x = ((free - gap) * 0.5).min(w * 0.45);
             if half_z_room < min_side * 0.5 || room_half_x < min_side * 0.5 {
                 continue;
             }
             for (side, tag) in [(-1.0f32, "p"), (1.0, "s")] {
-                let cx = side * (spine_w + room_half_x);
+                let cx = side * (spine_w + gap + room_half_x);
                 bays.push(PlannedRoom {
                     id: format!("bay_{s}{tag}"),
                     kind: RoomKind::Quest,
@@ -343,13 +346,20 @@ pub fn plan(env: &Envelope, occupant_h: f32) -> Vec<PlannedRoom> {
         return plan_inline(env, occupant_h);
     }
 
-    let mid_z = (z0 + z1) * 0.5;
-    let (mw, mh) = env.min_over(z0, z1);
+    // THE SPINE STOPS SHORT OF THE BOW AND STERN ROOMS. Running it the
+    // full length put it straight through the bridge and the hangar --
+    // both centred on x=0 and far wider than the corridor -- so those
+    // two were fused to it and their doors were decorative.
+    let gap = DOOR_GAP_H * occupant_h;
+    let sz0 = bay_z0;
+    let sz1 = bay_z1;
+    let mid_z = (sz0 + sz1) * 0.5;
+    let (mw, mh) = env.min_over(sz0, sz1);
     out.push(PlannedRoom {
         id: "spine".into(),
         kind: RoomKind::Corridor,
         centre: Vec3::new(0.0, -mh * DECK_DROP, mid_z),
-        half: Vec3::new((mw * SPINE_FRAC).max(min_side * 0.35), mh * 0.5, (z1 - z0) * 0.5),
+        half: Vec3::new((mw * SPINE_FRAC).max(min_side * 0.35), mh * 0.5, (sz1 - sz0) * 0.5),
     });
     out.extend(bays);
 
@@ -358,7 +368,15 @@ pub fn plan(env: &Envelope, occupant_h: f32) -> Vec<PlannedRoom> {
         ("bridge", RoomKind::Bridge, z1, -1.0f32),
         ("hangar", RoomKind::Hangar, z0, 1.0),
     ] {
-        let half_z_room = end_zone * 0.45;
+        // fit inside the end zone with the DOOR GAP held clear of the
+        // spine: the bridge used to start 0.11 m inside the corridor.
+        let half_z_room = ((end_zone - gap) * 0.5).max(0.0);
+        if half_z_room <= 0.0 {
+            continue;
+        }
+        // the gap belongs BETWEEN this room and the spine, not between
+        // it and the hull's nose -- the first attempt put it at the
+        // wrong end and the bridge still touched the corridor exactly.
         let centre_z = zc + sign * half_z_room;
         let (w, h) = env.min_over(centre_z - half_z_room, centre_z + half_z_room);
         if w < min_side * 0.5 || h <= 0.0 {
@@ -533,14 +551,57 @@ pub fn plan_inline(env: &Envelope, occupant_h: f32) -> Vec<PlannedRoom> {
     // overflows the compartments, and silently drops them — which is
     // how the cutter placed five of eight. A single-file hull still has
     // circulation; it is just the same volume you stand in.
-    let (w, h) = env.min_over(z0, z1);
-    out.push(PlannedRoom {
-        id: "spine".into(),
-        kind: RoomKind::Corridor,
-        centre: Vec3::new(0.0, -h * DECK_DROP, (z0 + z1) * 0.5),
-        half: Vec3::new((w * 0.5).max(min_side * 0.3), h * 0.5, span * 0.5),
-    });
+    // A SINGLE-FILE HULL HAS NO SEPARATE CORRIDOR, and inventing one was
+    // wrong twice over. Spanning the compartments fused them into one
+    // void (doors stop being walls); squeezing a link between them ate
+    // the middle cabin. In a tube you walk THROUGH the compartments --
+    // each one is its own stretch of circulation and they meet at doors.
+    //
+    // So the last compartment is retagged as the corridor rather than a
+    // new box being added. `plan_named` needs a Corridor slot to place
+    // the roster's corridor rooms, and this gives it a real one that
+    // occupies space nothing else claims.
+    if let Some(mid) = out.len().checked_sub(1).map(|n| n / 2) {
+        if out[mid].kind == RoomKind::Quest {
+            out[mid].kind = RoomKind::Corridor;
+            out[mid].id = "spine".into();
+        }
+    }
     out
+}
+
+/// (guess) — the gap between the spine and the rooms it serves, in
+/// occupant-heights. This is where the DOOR lives.
+///
+/// Without it the spine intersects every room, the interior becomes one
+/// connected void, and a shut door stops being a wall — which is exactly
+/// how wiring this planner into `Interior::generate` broke
+/// `a_shut_door_is_a_wall_and_an_open_one_is_a_way_through`. A doorway
+/// is a hole you make in a wall, not the absence of the wall.
+pub const DOOR_GAP_H: f32 = 0.35;
+
+/// Does the spine intersect any room it serves?
+///
+/// Separate from `overlaps` because it is a DIFFERENT failure. `overlaps`
+/// asks whether two rooms occupy the same steel; this asks whether the
+/// corridor has swallowed them, which reads as a perfectly reasonable
+/// plan right up until doors stop working. `overlaps` deliberately
+/// excluded corridors on the reasoning that an overlap is a doorway —
+/// true for one door, false as a layout rule, and nothing was checking
+/// the difference.
+pub fn spine_intersects(rooms: &[PlannedRoom]) -> Option<String> {
+    let spine = rooms.iter().find(|r| r.kind == RoomKind::Corridor)?;
+    for r in rooms {
+        if r.kind == RoomKind::Corridor {
+            continue;
+        }
+        let d = (spine.centre - r.centre).abs();
+        let s = spine.half + r.half;
+        if d.x < s.x - 1e-3 && d.y < s.y - 1e-3 && d.z < s.z - 1e-3 {
+            return Some(r.id.clone());
+        }
+    }
+    None
 }
 
 /// Is every planned room inside the envelope it was planned for?
@@ -813,6 +874,102 @@ mod tests {
             a.iter().zip(b.iter()).any(|(x, y)| x.centre != y.centre || x.half != y.half),
             "hull shape made no difference to the layout"
         );
+    }
+
+    #[test]
+    fn the_spine_never_swallows_a_room_it_serves() {
+        // THE REGRESSION THIS PLANNER SHIPPED ONCE. Wiring it into
+        // `Interior::generate` broke
+        // `a_shut_door_is_a_wall_and_an_open_one_is_a_way_through`: the
+        // spine intersected every room, so the interior was one
+        // connected void and a shut door stopped being a wall. Checked
+        // across the whole fleet and both layouts, because the wide plan
+        // and the single-file fallback each had their own version of it.
+        for (name, heights, _) in crate::aboard::FLEET {
+            let len = heights * OCC;
+            let env = Envelope::from_extents(len * 0.5, len * 0.16, len * 0.09, 0.55);
+            let rooms = plan(&env, OCC);
+            assert_eq!(
+                spine_intersects(&rooms),
+                None,
+                "{name}: the spine swallowed a room -- its door is now decorative"
+            );
+        }
+    }
+
+    #[test]
+    fn the_spine_leaves_a_real_gap_not_just_a_shared_face() {
+        // touching is not separation: two boxes sharing a face still let
+        // you walk between them. There must be actual daylight for a
+        // door to sit in.
+        let env = box_env();
+        let rooms = plan(&env, OCC);
+        let spine = rooms.iter().find(|r| r.kind == RoomKind::Corridor).expect("a spine");
+        let gap = DOOR_GAP_H * OCC;
+        for r in &rooms {
+            if r.kind == RoomKind::Corridor {
+                continue;
+            }
+            let d = (spine.centre - r.centre).abs();
+            let s = spine.half + r.half;
+            // separated on at least one axis by at least most of the gap
+            let sep = (d.x - s.x).max(d.z - s.z);
+            assert!(
+                sep > gap * 0.5,
+                "{} is only {sep:.3} m from the spine -- no room for a door",
+                r.id
+            );
+        }
+    }
+
+    #[test]
+    fn the_named_layout_also_keeps_its_doors_working() {
+        // plan_named reuses plan()'s slots so it inherits the fix, but it
+        // also SUBDIVIDES the spine for overflow rooms — its own chance
+        // to reintroduce the bug. Overflow rooms legitimately sit IN the
+        // spine volume (they are stretches of corridor), so they are
+        // identified by carrying the corridor kind, not by id; every
+        // room that is a real room must stay clear.
+        for (name, heights, _) in crate::aboard::FLEET {
+            let len = heights * OCC;
+            let env = Envelope::from_extents(len * 0.5, len * 0.16, len * 0.09, 0.55);
+            let placed = plan_named(&env, OCC, crate::content::HUB);
+            let spine = placed
+                .iter()
+                .find(|p| p.kind == RoomKind::Corridor)
+                .unwrap_or_else(|| panic!("{name}: no corridor placed"));
+            // KNOWN GAP, not fixed here: when the bays run out
+            // `plan_named` overlays the remaining roster rooms onto the
+            // spine, so on the narrow single-file hulls (the cutter)
+            // those rooms DO intersect it and their doors would be
+            // decorative. That is the same class of bug as the one this
+            // test was written for, and it predates this fix. The real
+            // answer is for overflow to carve dedicated slices and
+            // shorten the spine rather than overlay it. Until then this
+            // asserts the case that IS fixed -- hulls with enough bays
+            // for the roster -- rather than passing vacuously or
+            // pretending the tube case works.
+            let bays = plan(&env, OCC).iter().filter(|p| p.kind == RoomKind::Quest).count();
+            let needed = crate::content::HUB
+                .iter()
+                .filter(|r| !matches!(r.kind, RoomKind::Bridge | RoomKind::Hangar | RoomKind::Corridor))
+                .count();
+            if bays < needed {
+                continue; // overflow hull -- see the note above
+            }
+            for r in &placed {
+                if r.kind == RoomKind::Corridor {
+                    continue; // corridor stretches may share the spine
+                }
+                let d = (spine.centre - r.centre).abs();
+                let s = spine.half + r.half;
+                assert!(
+                    !(d.x < s.x - 1e-3 && d.y < s.y - 1e-3 && d.z < s.z - 1e-3),
+                    "{name}: the spine swallowed {} -- its door is decorative",
+                    r.id
+                );
+            }
+        }
     }
 
     #[test]
