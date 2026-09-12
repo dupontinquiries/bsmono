@@ -305,6 +305,8 @@ pub enum TurnKind {
     /// One rung of the study ladder. Which rung is on the session, so
     /// the reply knows what it was answering.
     Study,
+    /// One reading of a request, among several being compared.
+    Take,
     /// The first turn of any build: what KIND of thing is this? Its
     /// answer routes everything after it.
     Route,
@@ -562,6 +564,12 @@ pub struct Paintbrush {
     /// Set when the routing turn could not answer, so the restart uses
     /// the tables rather than asking again forever.
     route_failed: bool,
+    /// The leans for each take being built, the results so far, and
+    /// which one is in flight.
+    take_leans: Vec<Vec<(voxel_tools::takes::Axis, f32)>>,
+    take_results: Vec<voxel_tools::takes::Take>,
+    take_request: String,
+    take_at: usize,
     /// A verb read off the request, applied once the build lands.
     pending_verb: Option<(voxel_tools::transform::Verb, f32)>,
     /// The noun whose definition is being asked for.
@@ -677,6 +685,10 @@ impl Paintbrush {
             review_pending_after_drone: 0,
             pending_job: voxel_tools::prompt::Job::Plan,
             last_surface: None,
+            take_leans: Vec::new(),
+            take_results: Vec::new(),
+            take_request: String::new(),
+            take_at: 0,
             pending_verb: None,
             routed: None,
             route_failed: false,
@@ -1043,6 +1055,37 @@ impl Paintbrush {
                             .into_iter().map(|(_, _, n)| n).collect();
                         self.say(format!("no build by that name in the tree; known: {}", known.join(", ")));
                     }
+                }
+                Pending::None
+            }
+            Command::Takes(n, request) => {
+                // A build is a CHOICE. The same request, built several
+                // ways that differ by a decision somebody could state a
+                // preference about -- not by a seed.
+                self.take_leans = voxel_tools::takes::spread(n, self.session.creative_seed);
+                self.take_results.clear();
+                self.take_request = request.clone();
+                self.take_at = 0;
+                self.say(format!("building {n} takes of {request:?}"));
+                self.next_take(cm, gaze);
+                Pending::None
+            }
+            Command::Pick(n) => {
+                match self.take_results.get(n - 1).cloned() {
+                    Some(t) => {
+                        self.say(format!("keeping take {n}: {}", t.why()));
+                        let view = WorldView(cm);
+                        let mut staged = StagedWorld::new(&view);
+                        {
+                            let mut tools = VoxelTools::new(&mut staged);
+                            let _ = self.session.receive_program(&mut tools, gaze, &t.source,
+                                                                 None, &self.take_request);
+                        }
+                        self.flush_staged(cm, &mut staged);
+                        self.take_results.clear();
+                        self.commit(cm, gaze);
+                    }
+                    None => self.say(format!("there is no take {n}; /takes first")),
                 }
                 Pending::None
             }
@@ -1788,6 +1831,32 @@ impl Paintbrush {
         self.begin(cm, gaze, prose, player_feet, debug);
     }
 
+    /// Ask for the next take, or offer them all when there are no more.
+    fn next_take(&mut self, cm: &ChunkManager, gaze: &Gaze) {
+        if self.take_at >= self.take_leans.len() {
+            if self.take_results.is_empty() { self.say("no take produced anything"); return; }
+            let chosen = voxel_tools::takes::choose(std::mem::take(&mut self.take_results),
+                                                    self.take_leans.len());
+            self.say(voxel_tools::takes::offer(&chosen));
+            self.take_results = chosen;
+            return;
+        }
+        let Some(c) = self.completer_for(false) else { self.say("no provider"); return };
+        let leans = self.take_leans[self.take_at].clone();
+        let request = self.take_request.clone();
+        // the same request, with the lean appended: a take is a LEAN,
+        // not a different brief
+        let p = format!("{}{}", voxel_tools::compose::compose_prompt(&request,
+                            &voxel_tools::compose::Reading {
+                                essence: request.clone(), ..Default::default() }),
+                        voxel_tools::takes::lean_prompt(&leans));
+        self.say(format!("take {} of {} ...", self.take_at + 1, self.take_leans.len()));
+        self.pending_job = voxel_tools::prompt::Job::Program;
+        let _ = cm;
+        self.spawn_turn(c, "You are building one reading of a request.".into(),
+                        Box::new(move || p), gaze, None, &request, TurnKind::Take);
+    }
+
     /// The build itself, once setup has happened. The routing turn
     /// resumes here rather than at the top of `start_turn`, so nothing
     /// is set twice.
@@ -2229,6 +2298,25 @@ impl Paintbrush {
                         } else {
                             self.finish_study(cm, &turn.gaze, turn.player_feet, &turn.prose);
                         }
+                    }
+                    TurnKind::Take => {
+                        let src = voxel_tools::llm::strip_fences(&raw);
+                        let (prog, _) = voxel_tools::program::parse(&src);
+                        if !prog.passes.is_empty() {
+                            let r = voxel_tools::program::run(&prog, self.session.focus(&turn.gaze).anchor);
+                            let cells: std::collections::BTreeSet<(i32, i32, i32)> =
+                                r.changes.iter().filter(|c| c.to != 0).map(|c| c.at).collect();
+                            if !cells.is_empty() {
+                                let leans = self.take_leans[self.take_at.min(self.take_leans.len() - 1)].clone();
+                                let t = voxel_tools::takes::measure_take(
+                                    &format!("take {}", self.take_at + 1), leans, &src, &cells);
+                                self.say(format!("  {} -- {} ({} cells)", t.label, t.why(),
+                                                 t.measures.cells));
+                                self.take_results.push(t);
+                            }
+                        }
+                        self.take_at += 1;
+                        self.next_take(cm, &turn.gaze);
                     }
                     TurnKind::Route => {
                         match voxel_tools::route::parse(&raw).filter(|r| r.usable()) {

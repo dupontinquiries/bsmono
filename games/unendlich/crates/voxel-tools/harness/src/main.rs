@@ -85,6 +85,7 @@ fn main() {
     propose_scenario();
     dossier_scenario();
     verb_scenario();
+    takes_scenario();
 }
 
 /// Drives Paintbrush exactly as the game's input handler would:
@@ -1395,4 +1396,57 @@ fn verb_scenario() {
     assert!(log.iter().any(|l| l.contains("it is half-built")), "the verb was read: {log:?}");
     assert!(log.iter().any(|l| l.contains("half-built:") && l.contains("removed")),
             "and applied when the build landed: {log:?}");
+}
+
+
+/// Three takes on one request, and a pick.
+fn takes_scenario() {
+    use paintbrush::Paintbrush;
+    use voxel_tools::chatbox::Key;
+    println!("\n==== three takes and a pick");
+    struct T { n: std::sync::Arc<std::sync::atomic::AtomicUsize> }
+    impl voxel_tools::llm::Completer for T {
+        fn name(&self) -> &str { "t" }
+        fn complete(&mut self, _: &str, user: &str) -> Result<String, String> {
+            if let Some(r) = route_answer(user) { return Ok(r); }
+            // a different shape per take, as a leaning model would give
+            let i = self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(match i % 3 {
+                0 => "pass a add\n  part t box w=10 h=24 d=10 material=stone\n  rel t on ground\nend\n",
+                1 => "pass a add\n  part t box w=26 h=7 d=26 material=stone\n  rel t on ground\nend\n",
+                _ => "pass a add\n  part t profile r=9,7,5,3 h=18 material=stone\n  rel t on ground\nend\n",
+            }.into())
+        }
+    }
+    let cm = stubs::ChunkManager::new();
+    let mut pb = Paintbrush::new(32);
+    pb.test_completer = Some(std::sync::Arc::new(std::sync::Mutex::new(
+        Box::new(T { n: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)) }))));
+    let gaze = Paintbrush::gaze_from([0.0, 70.0, -16.0], [0.0, -0.3, 1.0], Some(([0, 64, 0], [0, 1, 0], 17.0)));
+    let mut line = |pb: &mut Paintbrush, s: &str| -> Option<stubs::Command> {
+        pb.key(Key::Enter);
+        for c in s.chars() { pb.key(Key::Char(c)); }
+        pb.key(Key::Enter)
+    };
+    if let Some(cmd) = line(&mut pb, "/takes 3 a watchtower") { pb.dispatch(&cm, &gaze, cmd); }
+    // ACCUMULATE: draining inside the loop consumes the very lines the
+    // assertions below need to see.
+    let mut log: Vec<String> = Vec::new();
+    let t0 = std::time::Instant::now();
+    while t0.elapsed().as_secs() < 40 {
+        pb.poll_turn(&cm); pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(4));
+        log.extend(pb.drain_log());
+        if log.iter().any(|l| l.contains("/pick")) { break; }
+    }
+    log.extend(pb.drain_log());
+    for l in log.iter().filter(|l| l.contains("take") || l.contains("/pick")) {
+        println!("  {}", l.trim().chars().take(110).collect::<String>());
+    }
+    assert!(log.iter().any(|l| l.contains("take 1")), "it built takes: {log:?}");
+    assert!(log.iter().any(|l| l.contains("/pick")), "and offered a choice: {log:?}");
+    if let Some(cmd) = line(&mut pb, "/pick 2") { pb.dispatch(&cm, &gaze, cmd); }
+    for _ in 0..60 { pb.poll_drone(); std::thread::sleep(std::time::Duration::from_millis(4)); }
+    let after = pb.drain_log();
+    for l in after.iter().filter(|l| l.contains("keeping")) { println!("  {}", l.trim()); }
+    assert!(after.iter().any(|l| l.contains("keeping take 2")), "the pick landed: {after:?}");
 }

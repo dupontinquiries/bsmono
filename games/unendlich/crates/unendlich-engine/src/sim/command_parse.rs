@@ -156,6 +156,11 @@ pub enum Command {
     Review,
     /// `/rounds [n]` — how many review rounds a build runs.
     Rounds(Option<usize>),
+    /// Build the same request several ways and offer the results, so a
+    /// build is a choice rather than an answer.
+    Takes(usize, String),
+    /// Keep one of the takes that were offered.
+    Pick(usize),
     /// `/refine [rung|all]` — small detail passes over the last build.
     /// No argument lists them.
     Refine(Option<String>),
@@ -296,6 +301,22 @@ pub fn parse(line: &str) -> Command {
         "/switch" => match args.as_slice() { [] => Command::Unknown, n => Command::Switch(n.join(" ")) },
         "/merge" => match args.as_slice() { [] => Command::Unknown, n => Command::Merge(n.join(" ")) },
         "/like" => match args.as_slice() { [] => Command::Unknown, n => Command::Like(n.join(" ")) },
+        // BUILD IT SEVERAL WAYS AND CHOOSE. `/takes 3 a lighthouse`
+        // runs the same request with different leans; `/pick 2` keeps
+        // one. A build is a choice rather than an answer.
+        "/takes" => match args.as_slice() {
+            [] => Command::Unknown,
+            [n, tail @ ..] if n.parse::<usize>().is_ok() && !tail.is_empty() =>
+                Command::Takes(n.parse::<usize>().unwrap().clamp(2, 4), tail.join(" ")),
+            other => Command::Takes(3, other.join(" ")),
+        },
+        "/pick" => match args.as_slice() {
+            [n] => match n.parse::<usize>() {
+                Ok(v) if (1..=4).contains(&v) => Command::Pick(v),
+                _ => Command::Unknown,
+            },
+            _ => Command::Unknown,
+        },
         "/review" => if args.is_empty() { Command::Review } else { Command::Unknown },
         "/rounds" => match args.as_slice() {
             [] => Command::Rounds(None),

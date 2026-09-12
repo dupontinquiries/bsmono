@@ -54,7 +54,7 @@ pub enum AnimProfile { GroundUp, Physics, Random, Instant }
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Command {
     Build(String), BuildVoice(bool), ShowPlan, CommitPlan, UndoBuild,
-    Focus(Option<FocusAdjust>), Anim(AnimProfile), Model(Option<String>), Keys, Cancel, Repair, Land(LandOp), Hive, Refine(Option<String>), Deferred { drop: bool }, Provider(Option<String>), Shot { kind: String, id: Option<String> }, Branch(Option<String>), Switch(String), Merge(String), Like(String), Review, Rounds(Option<usize>), Unknown,
+    Focus(Option<FocusAdjust>), Anim(AnimProfile), Model(Option<String>), Keys, Cancel, Repair, Land(LandOp), Hive, Refine(Option<String>), Deferred { drop: bool }, Provider(Option<String>), Shot { kind: String, id: Option<String> }, Branch(Option<String>), Switch(String), Merge(String), Like(String), Review, Rounds(Option<usize>), Takes(usize, String), Pick(usize), Unknown,
 }
 pub fn parse(line: &str) -> Command {
     let t = line.trim();
@@ -63,6 +63,23 @@ pub fn parse(line: &str) -> Command {
             "enablevoice" => Command::BuildVoice(true),
             "disablevoice" => Command::BuildVoice(false),
             _ => Command::Build(rest.trim().to_string()),
+        };
+    }
+    // /takes carries a REQUEST, which has spaces. The match below is
+    // over two whitespace-split tokens, so putting it there gave the
+    // count and dropped the request -- "building 3 takes of \"\"".
+    if let Some(rest) = t.strip_prefix("/takes ") {
+        let rest = rest.trim();
+        let mut w = rest.split_whitespace();
+        return match w.next().and_then(|n| n.parse::<usize>().ok()) {
+            Some(n) => Command::Takes(n.clamp(2, 4), w.collect::<Vec<_>>().join(" ")),
+            None => Command::Takes(3, rest.to_string()),
+        };
+    }
+    if let Some(rest) = t.strip_prefix("/pick ") {
+        return match rest.trim().parse::<usize>() {
+            Ok(v) if (1..=4).contains(&v) => Command::Pick(v),
+            _ => Command::Unknown,
         };
     }
     // /land takes the whole remainder: a claim name may have spaces.
