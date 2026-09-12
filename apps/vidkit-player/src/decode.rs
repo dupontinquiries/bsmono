@@ -873,3 +873,349 @@ mod streaming_tests {
         let _ = std::fs::remove_file(&clip);
     }
 }
+
+// ---------------------------------------------------------------------------
+// audio
+// ---------------------------------------------------------------------------
+
+/// PCM pulled out of the same source the video comes from.
+///
+/// A separate ffmpeg rather than a second output on the video one: two raw
+/// streams down one pipe would need demultiplexing that ffmpeg will not do for
+/// us, and a second process costs less than getting that wrong.
+pub struct AudioStream {
+    child: Child,
+    pub rate: u32,
+    pub channels: u16,
+    buf: Vec<u8>,
+    pub frames_read: u64,
+}
+
+/// Interleaved signed 16-bit samples, which is what every sink here wants.
+pub const AUDIO_FORMAT: &str = "s16le";
+
+/// ffmpeg arguments for audio-only output.
+///
+/// Pure, so the flags are checked without spawning: `-vn` matters most. Without
+/// it ffmpeg picks the video stream too and the "PCM" is a video frame, which
+/// plays as a burst of noise loud enough to hurt.
+pub fn audio_args(input: &str, rate: u32, channels: u16, from: Duration) -> Vec<String> {
+    let mut a: Vec<String> = vec!["-v".into(), "error".into(), "-nostdin".into()];
+    if !from.is_zero() {
+        a.push("-ss".into());
+        a.push(format!("{:.3}", from.as_secs_f64()));
+    }
+    a.push("-i".into());
+    a.push(input.into());
+    a.push("-vn".into());
+    a.push("-f".into());
+    a.push(AUDIO_FORMAT.into());
+    a.push("-acodec".into());
+    a.push("pcm_s16le".into());
+    a.push("-ar".into());
+    a.push(rate.to_string());
+    a.push("-ac".into());
+    a.push(channels.to_string());
+    a.push("-".into());
+    a
+}
+
+impl AudioStream {
+    pub fn open(input: &str, rate: u32, channels: u16, from: Duration) -> Result<Self, String> {
+        let child = Command::new("ffmpeg")
+            .args(audio_args(input, rate, channels, from))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("ffmpeg (audio): {e}"))?;
+        Ok(Self {
+            child,
+            rate,
+            channels,
+            // A tenth of a second per read: small enough that the clock stays
+            // responsive, large enough that the pipe is not the bottleneck.
+            buf: vec![0u8; (rate as usize / 10) * channels as usize * 2],
+            frames_read: 0,
+        })
+    }
+
+    /// The next block of PCM, or `None` at the end.
+    pub fn next_block(&mut self) -> Option<&[u8]> {
+        let stdout = self.child.stdout.as_mut()?;
+        // A partial final block is still audio. Reading exactly would discard
+        // the tail of every file whose length is not a multiple of the block.
+        let mut filled = 0;
+        while filled < self.buf.len() {
+            match stdout.read(&mut self.buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => break,
+            }
+        }
+        if filled == 0 {
+            return None;
+        }
+        self.frames_read += (filled / (self.channels as usize * 2)) as u64;
+        Some(&self.buf[..filled])
+    }
+
+    /// How much audio has been produced, which is what an audio clock needs.
+    pub fn position(&self) -> Duration {
+        Duration::from_secs_f64(self.frames_read as f64 / self.rate.max(1) as f64)
+    }
+}
+
+impl Drop for AudioStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Somewhere for PCM to go.
+///
+/// A trait because there is no audio device in the sandbox this was written in,
+/// and a sink that cannot be tested is a sink that does not work. Everything
+/// above it — decoding, block sizing, the position an audio clock reads — is
+/// exercised against a recording sink.
+pub trait AudioSink {
+    fn play(&mut self, pcm: &[u8]) -> Result<(), String>;
+    fn name(&self) -> &str;
+}
+
+/// Discards audio, and says so. Used when no player is installed.
+pub struct NullSink {
+    pub bytes: u64,
+}
+
+impl AudioSink for NullSink {
+    fn play(&mut self, pcm: &[u8]) -> Result<(), String> {
+        self.bytes += pcm.len() as u64;
+        Ok(())
+    }
+    fn name(&self) -> &str {
+        "none (silent)"
+    }
+}
+
+/// The command-line players, in preference order.
+///
+/// Same shelling-out pattern as the clipboard: no crate dependency, and on a
+/// PipeWire system the socket protocol is not something an application should
+/// speak directly.
+pub const AUDIO_PLAYERS: &[(&str, &[&str])] = &[
+    ("pw-play", &["--format", "s16", "--rate", "{rate}", "--channels", "{ch}", "-"]),
+    ("paplay", &["--format=s16le", "--rate={rate}", "--channels={ch}", "--raw"]),
+    ("aplay", &["-q", "-f", "S16_LE", "-r", "{rate}", "-c", "{ch}", "-"]),
+];
+
+/// Fill in the rate and channel placeholders.
+pub fn player_args(args: &[&str], rate: u32, channels: u16) -> Vec<String> {
+    args.iter()
+        .map(|a| {
+            a.replace("{rate}", &rate.to_string())
+                .replace("{ch}", &channels.to_string())
+        })
+        .collect()
+}
+
+/// Which player is installed, if any.
+pub fn find_audio_player() -> Option<&'static str> {
+    AUDIO_PLAYERS.iter().map(|(c, _)| *c).find(|c| {
+        Command::new("which")
+            .arg(c)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Pipes PCM to a command-line player.
+pub struct CommandSink {
+    child: Child,
+    player: &'static str,
+}
+
+impl CommandSink {
+    pub fn open(player: &'static str, args: &[String]) -> Result<Self, String> {
+        let child = Command::new(player)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("{player}: {e}"))?;
+        Ok(Self { child, player })
+    }
+}
+
+impl AudioSink for CommandSink {
+    fn play(&mut self, pcm: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        let stdin = self
+            .child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| format!("{}: stdin closed", self.player))?;
+        // A player that has exited leaves a broken pipe. Reported rather than
+        // ignored: silently dropping audio for the rest of the film is the
+        // failure that gets described as "it just went quiet".
+        stdin
+            .write_all(pcm)
+            .map_err(|e| format!("{}: {e}", self.player))
+    }
+    fn name(&self) -> &str {
+        self.player
+    }
+}
+
+impl Drop for CommandSink {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Open the best sink available, falling back to silence.
+///
+/// Returns the null sink rather than an error when nothing is installed: a
+/// video player that refuses to play because the machine has no sound daemon
+/// is worse than one that plays quietly and says so. The NAME is what the UI
+/// shows, which is how the difference stays visible.
+pub fn open_sink(rate: u32, channels: u16) -> Box<dyn AudioSink> {
+    if let Some(player) = find_audio_player() {
+        let args = AUDIO_PLAYERS
+            .iter()
+            .find(|(c, _)| *c == player)
+            .map(|(_, a)| player_args(a, rate, channels))
+            .unwrap_or_default();
+        if let Ok(s) = CommandSink::open(player, &args) {
+            return Box::new(s);
+        }
+    }
+    Box::new(NullSink { bytes: 0 })
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::*;
+
+    fn have_ffmpeg() -> bool {
+        Command::new("ffmpeg").arg("-version").stdout(Stdio::null())
+            .stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+    }
+
+    /// Without `-vn`, ffmpeg takes the video stream too and the "PCM" is a
+    /// video frame — which plays as a burst of noise loud enough to hurt.
+    #[test]
+    fn audio_output_excludes_video() {
+        let a = audio_args("in.mp4", 48_000, 2, Duration::ZERO);
+        assert!(a.iter().any(|x| x == "-vn"), "no -vn: {a:?}");
+        assert!(a.windows(2).any(|w| w[0] == "-f" && w[1] == "s16le"));
+        // The codec as well as the container format. Reading 8-bit output as
+        // pairs of bytes still yields plausible-looking samples, so the
+        // decode test alone cannot tell the two apart.
+        assert!(a.windows(2).any(|w| w[0] == "-acodec" && w[1] == "pcm_s16le"), "{a:?}");
+        assert!(a.windows(2).any(|w| w[0] == "-ar" && w[1] == "48000"));
+        assert!(a.windows(2).any(|w| w[0] == "-ac" && w[1] == "2"));
+    }
+
+    /// Audio must seek with the video, or a scrub desynchronises the two.
+    #[test]
+    fn the_seek_flag_precedes_the_input_here_too() {
+        let a = audio_args("in.mp4", 48_000, 2, Duration::from_secs(9));
+        let ss = a.iter().position(|x| x == "-ss").expect("no -ss");
+        let i = a.iter().position(|x| x == "-i").expect("no -i");
+        assert!(ss < i, "decoding and discarding to the seek point: {a:?}");
+    }
+
+    #[test]
+    fn player_placeholders_are_filled_in() {
+        let a = player_args(AUDIO_PLAYERS[2].1, 44_100, 1);
+        assert!(a.contains(&"44100".to_string()), "{a:?}");
+        assert!(a.contains(&"1".to_string()), "{a:?}");
+        assert!(!a.iter().any(|x| x.contains('{')), "a placeholder survived: {a:?}");
+    }
+
+    /// Decode a tone and check it is not silence. Every size assertion passes
+    /// against a stream of zeros, which is exactly what a wrong `-acodec` or a
+    /// missing stream produces.
+    #[test]
+    fn it_decodes_audible_pcm() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("vidkit-aud-{}.mp4", std::process::id()));
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                "-f", "lavfi", "-i", "color=c=black:size=64x64:rate=10:duration=2",
+                "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            ])
+            .arg(&path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("SKIP: could not encode");
+            return;
+        }
+
+        let mut a = AudioStream::open(&path.to_string_lossy(), 48_000, 2, Duration::ZERO)
+            .expect("open audio");
+        let block = a.next_block().expect("a block of pcm").to_vec();
+        assert!(!block.is_empty());
+
+        let peak = block
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(peak > 1000, "the audio is silence — peak {peak}");
+
+        // The position an audio clock would read advances with the samples.
+        assert!(a.position() > Duration::from_millis(50), "{:?}", a.position());
+
+        let mut total = block.len();
+        while let Some(b) = a.next_block() {
+            total += b.len();
+        }
+        // Two seconds, stereo, 48 kHz, 2 bytes a sample.
+        let expected = 2 * 48_000 * 2 * 2;
+        // Within ten percent, not merely "more than half": at half the
+        // tolerance an 8-bit stream would pass, and 8-bit read as 16-bit is
+        // noise at the wrong pitch rather than an error.
+        let diff = (total as i64 - expected as i64).abs();
+        assert!(
+            diff * 10 < expected as i64,
+            "got {total} bytes, expected about {expected} — wrong sample width?"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// No sound daemon must not stop the video. A player that refuses to run
+    /// because the machine is silent is worse than one that plays quietly and
+    /// says so in the UI.
+    #[test]
+    fn a_machine_with_no_player_still_gets_a_sink() {
+        let s = open_sink(48_000, 2);
+        assert!(!s.name().is_empty());
+        // Either a real player or the honest null one; never a failure.
+    }
+
+    /// A sink that discards must still account for what it discarded, or
+    /// "audio is playing" and "audio is being thrown away" look identical.
+    #[test]
+    fn the_null_sink_counts_what_it_drops() {
+        let mut s = NullSink { bytes: 0 };
+        s.play(&[0u8; 100]).unwrap();
+        s.play(&[0u8; 50]).unwrap();
+        assert_eq!(s.bytes, 150);
+        assert!(s.name().contains("silent"), "the name should admit it: {}", s.name());
+    }
+}

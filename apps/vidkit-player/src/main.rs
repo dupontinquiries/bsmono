@@ -140,6 +140,11 @@ struct Player {
     /// Kept alive so the downloaded file outlives the decoder reading it.
     /// Dropping it deletes the file, and ffmpeg is still holding it open.
     downloaded: Option<io::TempMedia>,
+    /// Audio alongside the video. `None` when the source has no audio track.
+    audio: Option<decode::AudioStream>,
+    /// Where PCM goes. Always present -- the null sink is the honest fallback
+    /// on a machine with no sound daemon.
+    sink: Box<dyn decode::AudioSink>,
 }
 
 /// File-picker state. Navigation is uikit-egui's PathPicker; the file list and
@@ -225,6 +230,10 @@ impl Player {
         // Try to decode it for real. A failure is not fatal: the file still
         // opens, is described, and falls back to the test pattern -- which is
         // what this player did for everything until now.
+        // Built here, before `file` is moved into the struct.
+        let audio = file.as_ref().and_then(|p| {
+            decode::AudioStream::open(&p.to_string_lossy(), 48_000, 2, Duration::ZERO).ok()
+        });
         let mut frames = None;
         let mut decode_error = None;
         if let Some(p) = &file {
@@ -267,6 +276,8 @@ impl Player {
             gpu_error: gpu_error.or(decode_error),
             frames,
             downloaded: None,
+            audio,
+            sink: decode::open_sink(48_000, 2),
             chrome: Default::default(),
             settings: Default::default(),
             settings_open: false,
@@ -295,6 +306,21 @@ impl Player {
                 pattern::bars(t * 0.25)
             }
         };
+
+        // Audio first: the sink blocks when its buffer is full, which is what
+        // paces playback on the machines that have one. Video after, so a
+        // stalled sink does not also stall the picture on machines that do
+        // not.
+        if let Some(a) = self.audio.as_mut() {
+            if let Some(pcm) = a.next_block() {
+                if let Err(e) = self.sink.play(pcm) {
+                    // Report once and stop trying: a broken pipe per frame
+                    // fills the log and the banner.
+                    self.gpu_error = Some(format!("audio stopped: {e}"));
+                    self.audio = None;
+                }
+            }
+        }
 
         if let (Some(gpu), Some(gl)) = (&self.gpu, eframe_frame.gl()) {
             if let Ok(mut g) = gpu.lock() {
