@@ -3270,6 +3270,14 @@ Still to do, in size order:
       middle did not depend on something three hundred lines up. It wants reading. The next
       two candidates are much easier — a 212-line fly-through block and a 97-line one, with a
       handful of enclosing locals each.
+      - [x] The fly-through is out: `Chat::fly_through(ui, n, pos)`. `spatial_ui` 2707 -> 2494.
+      - [ ] The 97-line block next, same method.
+
+**How to do these safely**, since the dependency set is the whole difficulty: extract the
+block with NO parameters, compile, and let rustc list `cannot find value` — those are the
+real dependencies. Guessing from a regex over the body gave 12 candidates for the
+fly-through; the compiler said two (`n` and `pos`), and one of those needed its borrow
+adjusted. Do not skip the compile step and do not trust a grep.
 - [ ] Decompose `ui` — chrome, transcript, composer, right page.
 - [ ] `run_command` (712).
 

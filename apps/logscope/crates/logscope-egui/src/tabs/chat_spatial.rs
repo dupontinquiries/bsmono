@@ -543,222 +543,9 @@ impl Chat {
             } else { self.cam_pan_t0 = None; }
         }
 
-        // Fly-through (headless / smooth camera move): LOGSCOPE_FLY=s (0..1) travels the camera target ALONG
-        // the conversation path (id order) and FACES the direction of travel, sitting just inside the palace —
-        // so we move THROUGH the mind palace. LOGSCOPE_FLY_AUTO=speed animates s from the clock for a
-        // continuous glide. The forward look is derived from the path tangent (see OrbitCam::project).
-        {
-            let auto = self.fly_auto.or_else(|| std::env::var("LOGSCOPE_FLY_AUTO").ok().and_then(|v| v.trim().parse::<f32>().ok()));
-            let manual = std::env::var("LOGSCOPE_FLY").ok().and_then(|v| v.trim().parse::<f32>().ok());
-            let s_opt = if let Some(spd) = auto {
-                // Variable-speed traversal: advance the strand position by dt scaled DOWN by the current node's
-                // dwell weight, so longer messages linger and short ones pass quicker (bounded, see tour_dwell).
-                // Falls back to the old time-linear mapping if dwell weights aren't computed yet.
-                if !self.tour_dwell.is_empty() && n > 1 {
-                    let dt = ui.input(|i| i.stable_dt).min(0.05);
-                    let cur = (self.tour_s.clamp(0.0, 0.999) * (n - 1) as f32).round() as usize;
-                    let dwell = self.tour_dwell.get(cur).copied().unwrap_or(1.0);
-                    self.tour_s = (self.tour_s + dt * spd * 0.02 / dwell).fract();
-                    Some(self.tour_s)
-                } else {
-                    let tt = ui.input(|i| i.time) as f32;
-                    Some(((tt * spd * 0.015).fract() + 1.0).fract())
-                }
-            } else { manual };
-            if let (Some(s), true) = (s_opt, n > 1) {
-                use crate::spatial::Vec3 as V3;
-                let s = s.clamp(0.0, 0.999);
-                let seg = s * (n - 1) as f32;
-                let i0 = (seg.floor() as usize).min(n - 1);
-                let i1 = (i0 + 1).min(n - 1);
-                let fr = seg - i0 as f32;
-                // Catmull-Rom through the 4 surrounding nodes → a smooth curve, not a polyline of kinks
-                let cr = |p0: V3, p1: V3, p2: V3, p3: V3, u: f32| {
-                    let u2 = u * u; let u3 = u2 * u;
-                    let f = |a: f32, b: f32, c: f32, d: f32|
-                        0.5 * ((2.0 * b) + (-a + c) * u + (2.0 * a - 5.0 * b + 4.0 * c - d) * u2 + (-a + 3.0 * b - 3.0 * c + d) * u3);
-                    V3::new(f(p0.x, p1.x, p2.x, p3.x), f(p0.y, p1.y, p2.y, p3.y), f(p0.z, p1.z, p2.z, p3.z))
-                };
-                let pm = pos[i0.saturating_sub(1)]; let p1 = pos[i0]; let p2 = pos[i1]; let p3 = pos[(i1 + 1).min(n - 1)];
-                let here = cr(pm, p1, p2, p3, fr);
-                let look = cr(pm, p1, p2, p3, (fr + 0.34).min(1.0)); // look well ahead → a SMOOTH tangent that doesn't whip at every node
-                let (tx, ty, tz) = (look.x - here.x, look.y - here.y, look.z - here.z);
-                let tl = (tx * tx + ty * ty + tz * tz).sqrt().max(1e-3);
-                let (txn, tyn, tzn) = (tx / tl, ty / tl, tz / tl);
-                let base_pitch = ((-tyn).asin().clamp(-1.2, 1.2)) + 0.12; // downward bias to see floor/pearls
-                let base_yaw = txn.atan2(-tzn);
-                let base_dist = std::env::var("LOGSCOPE_FLY_DIST").ok().and_then(|d| d.trim().parse().ok()).unwrap_or(5.2);
-                // ── CINEMATIC DIRECTOR ── a shot state machine fed the graph's AABB (centroid + bounding radius)
-                // and the current strand point. It cycles slowly through filmic shots — travelling along the strand,
-                // pulling back to ESTABLISH the whole graph (the re-frame on arrival), slow ORBIT arcs, DUTCH tilts,
-                // and close PUSH-IN passes — with slow eases so the camera glides like a movie rather than snapping.
-                let now = ui.input(|i| i.time) as f32;
-                let cc = crate::spatial::centroid(&pos);
-                let fitd = crate::spatial::fit_distance(crate::spatial::bounding_radius(&pos, cc));
-                let rnd = |seed: f32| ((seed * 12.9898).sin() * 43758.5453).fract().abs();
-                if now >= self.cam_shot_until {
-                    let h = rnd(now);
-                    self.cam_shot = match self.cam_shot {                         // arrival → often ESTABLISH (re-frame graph)
-                        0 => if h < 0.5 { 1 } else if h < 0.75 { 2 } else { 3 },  // travel → establish / orbit / dutch
-                        1 => if h < 0.6 { 0 } else { 2 },                         // establish → travel / orbit
-                        2 => if h < 0.55 { 0 } else if h < 0.8 { 1 } else { 4 },  // orbit → travel / establish / push
-                        3 => 0,                                                   // dutch → travel
-                        _ => if h < 0.6 { 0 } else { 1 },                         // push → travel / establish
-                    };
-                    self.cam_shot_until = now + 11.0 + h * 8.0;                   // 11–19 s dwell: fewer cuts, slower film pacing
-                }
-                self.cam_orbit_phase += 0.0026;                                  // slow continuous drift for orbit/dutch
-                let (mut want_target, mut want_yaw, mut want_pitch, mut want_dist, mut want_roll, mut k) =
-                    (here, base_yaw, base_pitch, base_dist, 0.0f32, 0.02f32);     // default: slow travel along the strand
-                match self.cam_shot {
-                    1 => { want_target = cc; want_dist = fitd; want_pitch = 0.42; want_yaw = base_yaw + (self.cam_orbit_phase * 0.4).sin() * 0.5; k = 0.014; } // ESTABLISH
-                    2 => { want_target = here; want_dist = (fitd * 0.55).clamp(7.0, 40.0); want_pitch = 0.3; want_yaw = self.cam_orbit_phase * 0.8; k = 0.018; } // ORBIT arc
-                    3 => { want_roll = (self.cam_orbit_phase * 0.5).sin() * 0.26; k = 0.022; }                                                                   // DUTCH tilt
-                    4 => { want_dist = 4.4; want_pitch = base_pitch * 0.7; k = 0.026; }                                                                          // PUSH-IN passthrough (less extreme)
-                    _ => {}
-                }
-                // GUARD: a collapsed graph (bounding_radius→0) or a gigantic one can make fit_distance return
-                // NaN/inf or an absurd distance; a degenerate spline point can make want_target non-finite. Any
-                // of these propagate into orbit.dist/target → a NaN eye → NaN projection → a BLANK/broken frame
-                // (this is the "starting the tour breaks the render" bug). Clamp them to sane, finite values here.
-                if !want_dist.is_finite() { want_dist = base_dist; }
-                want_dist = want_dist.clamp(2.0, 240.0);
-                if !(want_target.x.is_finite() && want_target.y.is_finite() && want_target.z.is_finite()) { want_target = here; }
-                if !want_yaw.is_finite() { want_yaw = base_yaw; }
-                if !want_pitch.is_finite() { want_pitch = base_pitch; }
-                self.orbit.target.x += (want_target.x - self.orbit.target.x) * k;
-                self.orbit.target.y += (want_target.y - self.orbit.target.y) * k;
-                self.orbit.target.z += (want_target.z - self.orbit.target.z) * k;
-                let mut dyaw = want_yaw - self.orbit.yaw;
-                while dyaw > std::f32::consts::PI { dyaw -= std::f32::consts::TAU; }
-                while dyaw < -std::f32::consts::PI { dyaw += std::f32::consts::TAU; }
-                self.orbit.yaw += dyaw * k;
-                self.orbit.pitch += (want_pitch - self.orbit.pitch) * k;
-                self.orbit.dist += (want_dist - self.orbit.dist) * k;
-                self.orbit.roll += (want_roll - self.orbit.roll) * (k * 0.8);    // ease the Dutch tilt in/out
-                // final belt-and-braces: never let the eased orbit carry a non-finite value into projection
-                if !self.orbit.dist.is_finite() { self.orbit.dist = base_dist; }
-                self.orbit.dist = self.orbit.dist.clamp(2.0, 240.0);
-                if !self.orbit.yaw.is_finite() { self.orbit.yaw = base_yaw; }
-                if !self.orbit.pitch.is_finite() { self.orbit.pitch = base_pitch; }
-                if !(self.orbit.target.x.is_finite() && self.orbit.target.y.is_finite() && self.orbit.target.z.is_finite()) { self.orbit.target = here; }
-
-                // CAMERA BOUNDING-SPHERE EVASION: keep the eye OUT of opaque solids (columns / central plinth)
-                // and INSIDE the perimeter wall, using the colliders the env generator emitted from the same
-                // EnvParams that built the hall. We shift the whole camera (target+eye) by the push so the look
-                // direction is preserved — no more flying blind into a stone column or the plinth.
-                let (cyf, syf) = (self.orbit.yaw.cos(), self.orbit.yaw.sin());
-                let (cpf, spf) = (self.orbit.pitch.cos(), self.orbit.pitch.sin());
-                let dd0 = self.orbit.dist;
-                let eye = V3::new(self.orbit.target.x + dd0 * (-cpf * syf),
-                                  self.orbit.target.y + dd0 * spf,
-                                  self.orbit.target.z + dd0 * (cpf * cyf));
-                let cam_r = 0.85f32; // camera collision volume (bounding-sphere radius)
-                // openings (doors / hallway mouths) where the camera may cross the perimeter Bound
-                let gates: Vec<(f32, f32)> = crate::scene3d::env_colliders().iter().filter_map(|c| match c {
-                    crate::scene3d::Collider::Gate { ang, half } => Some((*ang, *half)), _ => None,
-                }).collect();
-                // floor/ceiling envelope from the solids, so the eye rides BETWEEN floor and dome (no diving
-                // through the floor or punching the roof while it follows the strand).
-                let (mut floor_y, mut ceil_y) = (f32::MAX, f32::MIN);
-                // Horizontal palace AABB from the same colliders (Pillars cover hallway + wing geometry, Bound the
-                // rotunda perimeter) → a hard OUTER bound for the fly, below.
-                let (mut ax0, mut az0, mut ax1, mut az1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-                for c in crate::scene3d::env_colliders() {
-                    match c {
-                        crate::scene3d::Collider::Pillar { x, z, r, y0, y1 } => {
-                            floor_y = floor_y.min(y0); ceil_y = ceil_y.max(y1);
-                            ax0 = ax0.min(x - r); ax1 = ax1.max(x + r); az0 = az0.min(z - r); az1 = az1.max(z + r);
-                        }
-                        crate::scene3d::Collider::Bound { r } => {
-                            ax0 = ax0.min(-r); ax1 = ax1.max(r); az0 = az0.min(-r); az1 = az1.max(r);
-                        }
-                        _ => {}
-                    }
-                }
-                let (mut px, mut py, mut pz) = (0.0f32, 0.0f32, 0.0f32);
-                // a few relaxation passes so the eye settles in the GAP between solids (one pass under-resolves
-                // when it's wedged between two columns), instead of tunnelling through a wall.
-                for _ in 0..3 {
-                    for col in crate::scene3d::env_colliders() {
-                        match col {
-                            crate::scene3d::Collider::Pillar { x, z, r, y0, y1 } => {
-                                let ey = eye.y + py;
-                                if ey > y0 - cam_r && ey < y1 + cam_r {
-                                    let (dx, dz) = (eye.x + px - x, eye.z + pz - z);
-                                    let dist = (dx * dx + dz * dz).sqrt();
-                                    let rr = r + cam_r;
-                                    if dist < rr {
-                                        if dist > 1e-3 { let f = (rr - dist) / dist; px += dx * f; pz += dz * f; }
-                                        else { px += rr; }
-                                    }
-                                }
-                            }
-                            crate::scene3d::Collider::Bound { r } => {
-                                let (ex, ez) = (eye.x + px, eye.z + pz);
-                                let dist = (ex * ex + ez * ez).sqrt();
-                                let rr = r - cam_r;
-                                if dist > rr && dist > 1e-3 {
-                                    // let the camera slip OUT through a door / hallway mouth; otherwise hold it in
-                                    let ang = ez.atan2(ex);
-                                    let open = gates.iter().any(|&(ga, half)| { let d = (ang - ga).abs(); d.min(std::f32::consts::TAU - d) < half });
-                                    if !open { let f = (dist - rr) / dist; px -= ex * f; pz -= ez * f; }
-                                }
-                            }
-                            crate::scene3d::Collider::Gate { .. } => {} // handled above (pre-collected)
-                        }
-                    }
-                }
-                if floor_y.is_finite() {
-                    let ey = eye.y + py;
-                    let (lo, hi) = (floor_y + 1.2, ceil_y - 0.6);
-                    if ey < lo { py += lo - ey; }
-                    else if hi > lo && ey > hi { py += hi - ey; }
-                }
-                // COLLIDER-INDEPENDENT HEIGHT CAP: even when a scene emits no floor/ceiling colliders (so the
-                // clamp above is skipped) or the dome is very tall, never let the eye climb more than a bounded
-                // vantage above/below the graph itself. Without this, a big-graph ESTABLISH pull-back sends the
-                // eye straight into the sky — the "start tour flies up very high" bug. Generous (2.5× the
-                // bounding radius) so it still frames the whole palace from above, just not from orbit.
-                {
-                    let br = crate::spatial::bounding_radius(&pos, cc).max(4.0);
-                    let ey = eye.y + py;
-                    let hi = cc.y + br * 2.5 + 6.0;
-                    let lo = cc.y - br * 2.5 - 6.0;
-                    if ey > hi { py += hi - ey; } else if ey < lo { py += lo - ey; }
-                }
-                // HARD OUTER BOUND: clamp the eye into the palace AABB (+margin) so bounded traversal holds even
-                // when the fly slips out a gate down a hall — it stops at the hall's end instead of sailing into
-                // open ocean (pass-63 overshoot). Bound = union of the node extent (so the eye can always reach
-                // every strand node and pull back to ESTABLISH them) and the collider solids (walls/wings), so the
-                // clamp never fights the spline; it only catches what would leave the palace.
-                let (mut bx0, mut bz0, mut bx1, mut bz1) = (ax0, az0, ax1, az1);
-                for q in &pos { bx0 = bx0.min(q.x); bx1 = bx1.max(q.x); bz0 = bz0.min(q.z); bz1 = bz1.max(q.z); }
-                // Skip the outer clamp during the ESTABLISH (1) and ORBIT (2) shots — those DELIBERATELY pull
-                // the eye far outside the graph extent to frame the whole palace. Clamping them jammed the eye
-                // onto the graph edge, so the scene fell entirely out of view ("starting tour blanks the
-                // scene"). The close travel/dutch/push shots still get the clamp, catching a slip out a hallway
-                // into open ocean (the pass-63 overshoot it was added for).
-                let framing_shot = matches!(self.cam_shot, 1 | 2);
-                if bx0.is_finite() && !framing_shot {
-                    let m = 4.0;
-                    let ex = eye.x + px;
-                    if ex < bx0 - m { px += (bx0 - m) - ex; } else if ex > bx1 + m { px += (bx1 + m) - ex; }
-                    let ez = eye.z + pz;
-                    if ez < bz0 - m { pz += (bz0 - m) - ez; } else if ez > bz1 + m { pz += (bz1 + m) - ez; }
-                }
-                // EASE the evasion offset toward the freshly-computed push so the camera SLIDES around columns and
-                // along walls instead of snapping (the snap is what read as "ricochet"). The smoothed offset is
-                // what shifts the eye+target, preserving look direction.
-                let target_push = crate::spatial::Vec3::new(px, py, pz);
-                self.fly_push.x += (target_push.x - self.fly_push.x) * 0.18;
-                self.fly_push.y += (target_push.y - self.fly_push.y) * 0.18;
-                self.fly_push.z += (target_push.z - self.fly_push.z) * 0.18;
-                self.orbit.target.x += self.fly_push.x; self.orbit.target.y += self.fly_push.y; self.orbit.target.z += self.fly_push.z;
-
-                self.spatial_auto = false; self.spatial_zoomed = true;
-            }
-        }
+        // The fly-through is `fly_through` below: 212 lines of camera path that sat
+        // between the node layout and the mesh draw, three unrelated things in a row.
+        self.fly_through(ui, n, &pos);
 
         // A gently drifting camera (slight parallax + rotation) for projection & rendering — additive on top
         // of the persistent orbit, so it breathes without ever running off into a full orbit. Used for the
@@ -2726,4 +2513,230 @@ impl Chat {
         }
         send_now
     }
+    /// The fly-through: `LOGSCOPE_FLY` / `LOGSCOPE_FLY_AUTO` walk the camera along the
+    /// conversation path, facing the direction of travel.
+    ///
+    /// Lifted out of `spatial_ui`, where it sat between the node layout and the mesh draw —
+    /// three unrelated things in a row, and this is the only one that moves the camera.
+    ///
+    /// Extracted AGAINST THE COMPILER rather than by eye: the parameters are the names rustc
+    /// reported as unresolved, not the ones I guessed it needed. A block this long in the
+    /// middle of a 2,700-line function has no honest way to be read for its dependencies.
+    fn fly_through(&mut self, ui: &egui::Ui, n: usize, pos: &[crate::spatial::Vec3]) {
+        // Fly-through (headless / smooth camera move): LOGSCOPE_FLY=s (0..1) travels the camera target ALONG
+        // the conversation path (id order) and FACES the direction of travel, sitting just inside the palace —
+        // so we move THROUGH the mind palace. LOGSCOPE_FLY_AUTO=speed animates s from the clock for a
+        // continuous glide. The forward look is derived from the path tangent (see OrbitCam::project).
+            let auto = self.fly_auto.or_else(|| std::env::var("LOGSCOPE_FLY_AUTO").ok().and_then(|v| v.trim().parse::<f32>().ok()));
+            let manual = std::env::var("LOGSCOPE_FLY").ok().and_then(|v| v.trim().parse::<f32>().ok());
+            let s_opt = if let Some(spd) = auto {
+                // Variable-speed traversal: advance the strand position by dt scaled DOWN by the current node's
+                // dwell weight, so longer messages linger and short ones pass quicker (bounded, see tour_dwell).
+                // Falls back to the old time-linear mapping if dwell weights aren't computed yet.
+                if !self.tour_dwell.is_empty() && n > 1 {
+                    let dt = ui.input(|i| i.stable_dt).min(0.05);
+                    let cur = (self.tour_s.clamp(0.0, 0.999) * (n - 1) as f32).round() as usize;
+                    let dwell = self.tour_dwell.get(cur).copied().unwrap_or(1.0);
+                    self.tour_s = (self.tour_s + dt * spd * 0.02 / dwell).fract();
+                    Some(self.tour_s)
+                } else {
+                    let tt = ui.input(|i| i.time) as f32;
+                    Some(((tt * spd * 0.015).fract() + 1.0).fract())
+                }
+            } else { manual };
+            if let (Some(s), true) = (s_opt, n > 1) {
+                use crate::spatial::Vec3 as V3;
+                let s = s.clamp(0.0, 0.999);
+                let seg = s * (n - 1) as f32;
+                let i0 = (seg.floor() as usize).min(n - 1);
+                let i1 = (i0 + 1).min(n - 1);
+                let fr = seg - i0 as f32;
+                // Catmull-Rom through the 4 surrounding nodes → a smooth curve, not a polyline of kinks
+                let cr = |p0: V3, p1: V3, p2: V3, p3: V3, u: f32| {
+                    let u2 = u * u; let u3 = u2 * u;
+                    let f = |a: f32, b: f32, c: f32, d: f32|
+                        0.5 * ((2.0 * b) + (-a + c) * u + (2.0 * a - 5.0 * b + 4.0 * c - d) * u2 + (-a + 3.0 * b - 3.0 * c + d) * u3);
+                    V3::new(f(p0.x, p1.x, p2.x, p3.x), f(p0.y, p1.y, p2.y, p3.y), f(p0.z, p1.z, p2.z, p3.z))
+                };
+                let pm = pos[i0.saturating_sub(1)]; let p1 = pos[i0]; let p2 = pos[i1]; let p3 = pos[(i1 + 1).min(n - 1)];
+                let here = cr(pm, p1, p2, p3, fr);
+                let look = cr(pm, p1, p2, p3, (fr + 0.34).min(1.0)); // look well ahead → a SMOOTH tangent that doesn't whip at every node
+                let (tx, ty, tz) = (look.x - here.x, look.y - here.y, look.z - here.z);
+                let tl = (tx * tx + ty * ty + tz * tz).sqrt().max(1e-3);
+                let (txn, tyn, tzn) = (tx / tl, ty / tl, tz / tl);
+                let base_pitch = ((-tyn).asin().clamp(-1.2, 1.2)) + 0.12; // downward bias to see floor/pearls
+                let base_yaw = txn.atan2(-tzn);
+                let base_dist = std::env::var("LOGSCOPE_FLY_DIST").ok().and_then(|d| d.trim().parse().ok()).unwrap_or(5.2);
+                // ── CINEMATIC DIRECTOR ── a shot state machine fed the graph's AABB (centroid + bounding radius)
+                // and the current strand point. It cycles slowly through filmic shots — travelling along the strand,
+                // pulling back to ESTABLISH the whole graph (the re-frame on arrival), slow ORBIT arcs, DUTCH tilts,
+                // and close PUSH-IN passes — with slow eases so the camera glides like a movie rather than snapping.
+                let now = ui.input(|i| i.time) as f32;
+                let cc = crate::spatial::centroid(&pos);
+                let fitd = crate::spatial::fit_distance(crate::spatial::bounding_radius(&pos, cc));
+                let rnd = |seed: f32| ((seed * 12.9898).sin() * 43758.5453).fract().abs();
+                if now >= self.cam_shot_until {
+                    let h = rnd(now);
+                    self.cam_shot = match self.cam_shot {                         // arrival → often ESTABLISH (re-frame graph)
+                        0 => if h < 0.5 { 1 } else if h < 0.75 { 2 } else { 3 },  // travel → establish / orbit / dutch
+                        1 => if h < 0.6 { 0 } else { 2 },                         // establish → travel / orbit
+                        2 => if h < 0.55 { 0 } else if h < 0.8 { 1 } else { 4 },  // orbit → travel / establish / push
+                        3 => 0,                                                   // dutch → travel
+                        _ => if h < 0.6 { 0 } else { 1 },                         // push → travel / establish
+                    };
+                    self.cam_shot_until = now + 11.0 + h * 8.0;                   // 11–19 s dwell: fewer cuts, slower film pacing
+                }
+                self.cam_orbit_phase += 0.0026;                                  // slow continuous drift for orbit/dutch
+                let (mut want_target, mut want_yaw, mut want_pitch, mut want_dist, mut want_roll, mut k) =
+                    (here, base_yaw, base_pitch, base_dist, 0.0f32, 0.02f32);     // default: slow travel along the strand
+                match self.cam_shot {
+                    1 => { want_target = cc; want_dist = fitd; want_pitch = 0.42; want_yaw = base_yaw + (self.cam_orbit_phase * 0.4).sin() * 0.5; k = 0.014; } // ESTABLISH
+                    2 => { want_target = here; want_dist = (fitd * 0.55).clamp(7.0, 40.0); want_pitch = 0.3; want_yaw = self.cam_orbit_phase * 0.8; k = 0.018; } // ORBIT arc
+                    3 => { want_roll = (self.cam_orbit_phase * 0.5).sin() * 0.26; k = 0.022; }                                                                   // DUTCH tilt
+                    4 => { want_dist = 4.4; want_pitch = base_pitch * 0.7; k = 0.026; }                                                                          // PUSH-IN passthrough (less extreme)
+                    _ => {}
+                }
+                // GUARD: a collapsed graph (bounding_radius→0) or a gigantic one can make fit_distance return
+                // NaN/inf or an absurd distance; a degenerate spline point can make want_target non-finite. Any
+                // of these propagate into orbit.dist/target → a NaN eye → NaN projection → a BLANK/broken frame
+                // (this is the "starting the tour breaks the render" bug). Clamp them to sane, finite values here.
+                if !want_dist.is_finite() { want_dist = base_dist; }
+                want_dist = want_dist.clamp(2.0, 240.0);
+                if !(want_target.x.is_finite() && want_target.y.is_finite() && want_target.z.is_finite()) { want_target = here; }
+                if !want_yaw.is_finite() { want_yaw = base_yaw; }
+                if !want_pitch.is_finite() { want_pitch = base_pitch; }
+                self.orbit.target.x += (want_target.x - self.orbit.target.x) * k;
+                self.orbit.target.y += (want_target.y - self.orbit.target.y) * k;
+                self.orbit.target.z += (want_target.z - self.orbit.target.z) * k;
+                let mut dyaw = want_yaw - self.orbit.yaw;
+                while dyaw > std::f32::consts::PI { dyaw -= std::f32::consts::TAU; }
+                while dyaw < -std::f32::consts::PI { dyaw += std::f32::consts::TAU; }
+                self.orbit.yaw += dyaw * k;
+                self.orbit.pitch += (want_pitch - self.orbit.pitch) * k;
+                self.orbit.dist += (want_dist - self.orbit.dist) * k;
+                self.orbit.roll += (want_roll - self.orbit.roll) * (k * 0.8);    // ease the Dutch tilt in/out
+                // final belt-and-braces: never let the eased orbit carry a non-finite value into projection
+                if !self.orbit.dist.is_finite() { self.orbit.dist = base_dist; }
+                self.orbit.dist = self.orbit.dist.clamp(2.0, 240.0);
+                if !self.orbit.yaw.is_finite() { self.orbit.yaw = base_yaw; }
+                if !self.orbit.pitch.is_finite() { self.orbit.pitch = base_pitch; }
+                if !(self.orbit.target.x.is_finite() && self.orbit.target.y.is_finite() && self.orbit.target.z.is_finite()) { self.orbit.target = here; }
+
+                // CAMERA BOUNDING-SPHERE EVASION: keep the eye OUT of opaque solids (columns / central plinth)
+                // and INSIDE the perimeter wall, using the colliders the env generator emitted from the same
+                // EnvParams that built the hall. We shift the whole camera (target+eye) by the push so the look
+                // direction is preserved — no more flying blind into a stone column or the plinth.
+                let (cyf, syf) = (self.orbit.yaw.cos(), self.orbit.yaw.sin());
+                let (cpf, spf) = (self.orbit.pitch.cos(), self.orbit.pitch.sin());
+                let dd0 = self.orbit.dist;
+                let eye = V3::new(self.orbit.target.x + dd0 * (-cpf * syf),
+                                  self.orbit.target.y + dd0 * spf,
+                                  self.orbit.target.z + dd0 * (cpf * cyf));
+                let cam_r = 0.85f32; // camera collision volume (bounding-sphere radius)
+                // openings (doors / hallway mouths) where the camera may cross the perimeter Bound
+                let gates: Vec<(f32, f32)> = crate::scene3d::env_colliders().iter().filter_map(|c| match c {
+                    crate::scene3d::Collider::Gate { ang, half } => Some((*ang, *half)), _ => None,
+                }).collect();
+                // floor/ceiling envelope from the solids, so the eye rides BETWEEN floor and dome (no diving
+                // through the floor or punching the roof while it follows the strand).
+                let (mut floor_y, mut ceil_y) = (f32::MAX, f32::MIN);
+                // Horizontal palace AABB from the same colliders (Pillars cover hallway + wing geometry, Bound the
+                // rotunda perimeter) → a hard OUTER bound for the fly, below.
+                let (mut ax0, mut az0, mut ax1, mut az1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                for c in crate::scene3d::env_colliders() {
+                    match c {
+                        crate::scene3d::Collider::Pillar { x, z, r, y0, y1 } => {
+                            floor_y = floor_y.min(y0); ceil_y = ceil_y.max(y1);
+                            ax0 = ax0.min(x - r); ax1 = ax1.max(x + r); az0 = az0.min(z - r); az1 = az1.max(z + r);
+                        }
+                        crate::scene3d::Collider::Bound { r } => {
+                            ax0 = ax0.min(-r); ax1 = ax1.max(r); az0 = az0.min(-r); az1 = az1.max(r);
+                        }
+                        _ => {}
+                    }
+                }
+                let (mut px, mut py, mut pz) = (0.0f32, 0.0f32, 0.0f32);
+                // a few relaxation passes so the eye settles in the GAP between solids (one pass under-resolves
+                // when it's wedged between two columns), instead of tunnelling through a wall.
+                for _ in 0..3 {
+                    for col in crate::scene3d::env_colliders() {
+                        match col {
+                            crate::scene3d::Collider::Pillar { x, z, r, y0, y1 } => {
+                                let ey = eye.y + py;
+                                if ey > y0 - cam_r && ey < y1 + cam_r {
+                                    let (dx, dz) = (eye.x + px - x, eye.z + pz - z);
+                                    let dist = (dx * dx + dz * dz).sqrt();
+                                    let rr = r + cam_r;
+                                    if dist < rr {
+                                        if dist > 1e-3 { let f = (rr - dist) / dist; px += dx * f; pz += dz * f; }
+                                        else { px += rr; }
+                                    }
+                                }
+                            }
+                            crate::scene3d::Collider::Bound { r } => {
+                                let (ex, ez) = (eye.x + px, eye.z + pz);
+                                let dist = (ex * ex + ez * ez).sqrt();
+                                let rr = r - cam_r;
+                                if dist > rr && dist > 1e-3 {
+                                    // let the camera slip OUT through a door / hallway mouth; otherwise hold it in
+                                    let ang = ez.atan2(ex);
+                                    let open = gates.iter().any(|&(ga, half)| { let d = (ang - ga).abs(); d.min(std::f32::consts::TAU - d) < half });
+                                    if !open { let f = (dist - rr) / dist; px -= ex * f; pz -= ez * f; }
+                                }
+                            }
+                            crate::scene3d::Collider::Gate { .. } => {} // handled above (pre-collected)
+                        }
+                    }
+                }
+                if floor_y.is_finite() {
+                    let ey = eye.y + py;
+                    let (lo, hi) = (floor_y + 1.2, ceil_y - 0.6);
+                    if ey < lo { py += lo - ey; }
+                    else if hi > lo && ey > hi { py += hi - ey; }
+                }
+                // COLLIDER-INDEPENDENT HEIGHT CAP: even when a scene emits no floor/ceiling colliders (so the
+                // clamp above is skipped) or the dome is very tall, never let the eye climb more than a bounded
+                // vantage above/below the graph itself. Without this, a big-graph ESTABLISH pull-back sends the
+                // eye straight into the sky — the "start tour flies up very high" bug. Generous (2.5× the
+                // bounding radius) so it still frames the whole palace from above, just not from orbit.
+                {
+                    let br = crate::spatial::bounding_radius(&pos, cc).max(4.0);
+                    let ey = eye.y + py;
+                    let hi = cc.y + br * 2.5 + 6.0;
+                    let lo = cc.y - br * 2.5 - 6.0;
+                    if ey > hi { py += hi - ey; } else if ey < lo { py += lo - ey; }
+                }
+                // HARD OUTER BOUND: clamp the eye into the palace AABB (+margin) so bounded traversal holds even
+                // when the fly slips out a gate down a hall — it stops at the hall's end instead of sailing into
+                // open ocean (pass-63 overshoot). Bound = union of the node extent (so the eye can always reach
+                // every strand node and pull back to ESTABLISH them) and the collider solids (walls/wings), so the
+                // clamp never fights the spline; it only catches what would leave the palace.
+                let (mut bx0, mut bz0, mut bx1, mut bz1) = (ax0, az0, ax1, az1);
+                for q in pos { bx0 = bx0.min(q.x); bx1 = bx1.max(q.x); bz0 = bz0.min(q.z); bz1 = bz1.max(q.z); }
+                // Skip the outer clamp during the ESTABLISH (1) and ORBIT (2) shots — those DELIBERATELY pull
+                // the eye far outside the graph extent to frame the whole palace. Clamping them jammed the eye
+                // onto the graph edge, so the scene fell entirely out of view ("starting tour blanks the
+                // scene"). The close travel/dutch/push shots still get the clamp, catching a slip out a hallway
+                // into open ocean (the pass-63 overshoot it was added for).
+                let framing_shot = matches!(self.cam_shot, 1 | 2);
+                if bx0.is_finite() && !framing_shot {
+                    let m = 4.0;
+                    let ex = eye.x + px;
+                    if ex < bx0 - m { px += (bx0 - m) - ex; } else if ex > bx1 + m { px += (bx1 + m) - ex; }
+                    let ez = eye.z + pz;
+                    if ez < bz0 - m { pz += (bz0 - m) - ez; } else if ez > bz1 + m { pz += (bz1 + m) - ez; }
+                }
+                // EASE the evasion offset toward the freshly-computed push so the camera SLIDES around columns and
+                // along walls instead of snapping (the snap is what read as "ricochet"). The smoothed offset is
+                // what shifts the eye+target, preserving look direction.
+                let target_push = crate::spatial::Vec3::new(px, py, pz);
+                self.fly_push.x += (target_push.x - self.fly_push.x) * 0.18;
+                self.fly_push.y += (target_push.y - self.fly_push.y) * 0.18;
+                self.fly_push.z += (target_push.z - self.fly_push.z) * 0.18;
+                self.orbit.target.x += self.fly_push.x; self.orbit.target.y += self.fly_push.y; self.orbit.target.z += self.fly_push.z;
+
+                self.spatial_auto = false; self.spatial_zoomed = true;
+            }
+    }
+
 }
