@@ -54,6 +54,35 @@ unendlich (merged). `card-diagnoser` needs prerequisite `c7339651` — and that 
 the "compositor-maybe-gitmind-work" session, which is where the nfc-kit work lives, so the
 re-export has to come from that machine.
 
+## 6. beatspace: video-on-the-timeline (`arrange::video`) — 8 commits unmerged, bundle attached
+
+Continuous work across several turns of one long conversation on top of this fleet's own
+`85ad685d` (the prior cycle's base). Of the branch's original 14 commits, the **older 7**
+(dynamic-tracks core: stems/context renderer, the arrangement timeline itself, the sidebar,
+command palette, project save/load + time-stretch, the bounce-rung device preference, and the
+`studio-app` `BounceFormat` dedupe) are already an ancestor of this repo's `main` via
+`cbced33c0 merge beatspace dynamic-tracks` — checked directly, not assumed: `bounce.rs`,
+`project.rs`, and `stretch.rs` are all present in `main`'s tree.
+
+The **newer 8 are NOT merged** and remain only on `refs/heads/dynamic-tracks`, bundle attached
+to this conversation (`beatspace-reconciled.bundle`, base = this repo's own `HEAD`/`main`):
+`cache_policy` (a 2D temporal×spatial falloff replacing a flat ring buffer), `bucket`/`profile`
+(content-importance segments keyed by SOURCE, not by timeline clip, verified against the real
+`arrange::cmd::Editor` through Split/Trim/Move/Duplicate/Delete/Undo), `feel::Strictness`
+(three named cache-trust levels), `probe`/`decode` (real `ffprobe`/`ffmpeg`, a GOP-aware seek
+proven byte-identical to decode-from-zero for both AV1 and H.264-with-B-frames), `source::import`
+(a video file in as separable picture + a plain audio `Sample`), `backend` (a hardware-decode
+selection seam, honestly unimplemented beyond `Software`), and `gl_playback` (a real, headless,
+pixel-exact-proven GPU texture upload/render/readback via surfaceless EGL against Mesa
+`llvmpipe` — the one piece of this batch verified against an actual graphics API rather than
+only pure logic).
+
+285 tests, `apps/beatspace --no-default-features [--features app|app,gpu|gpu-playback|...]` all
+checked clean against THIS repo's dependency graph, not just the branch's original one — this
+was reconciled here, not merged on faith. What is genuinely missing, in every sense: nothing in
+`arrangepage.rs` plays a video clip yet. See `apps/beatspace/README.md`'s new "Video timeline"
+section for the full real/unproven breakdown.
+
 ---
 
 ## Merge attempt log: blackstar-024-delta (2026-09-08)

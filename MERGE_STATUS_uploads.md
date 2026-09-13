@@ -81,7 +81,6 @@ the next check — hand-merging a lockfile is how a tree ends up pinned to versi
 ever built. voiceterm-egui went 1584 -> 1605 tests.
 
 ### `aperture-todos-buckets-all--files-no-full.zip` — ALREADY LANDED
-
 Both bundles inside (`aperture-entities.bundle` and `aperture-entities-since-eccca.bundle`)
 have the same tip, `1e86c97f5`, which is an ancestor of HEAD — it was merged in the previous
 pass. Checked past the hash as well: `entity.rs`, `nav.rs` and `bucket.rs` are all in the tree,
@@ -92,3 +91,18 @@ to do.
 `voiceterm-013-since-010-partial` was re-verified with `c7339651` present and STILL lacks its
 prerequisites — a different missing base, not the same gap. It needs a re-export from whichever
 session holds `c15unified-010`.
+
+## Third pass, `c18unified-002-full-fleet-6k`
+
+### `beatspace-reconciled.bundle` — PARTIAL, 8 of the branch's 14 commits still unmerged
+See `ORPHANED_WORK.md` §6 for the full breakdown. The older 7 commits are already an ancestor
+of `main` via `cbced33c0 merge beatspace dynamic-tracks` — checked directly (`bounce.rs`,
+`project.rs`, `stretch.rs` all present in `main`'s tree), not assumed from the merge existing.
+The newer 8 (`arrange::video`: cache policy, buckets/profile, strictness, probe/decode, source
+import, the backend seam, `gl_playback`) are not merged and remain on `refs/heads/dynamic-tracks`
+if this bundle has been fetched, or need it re-fetched otherwise (base = this repo's own
+`HEAD`, `cc9cbaa0`). Reconciled against THIS repo's actual dependency graph before writing this
+entry, not the branch's original one — a fresh `gl_playback.rs` (real, headless, EGL-backed GPU
+texture round trip) had to be ported in by hand since it postdated the branch's last sync here;
+285 tests pass, `--features app|app,gpu|gpu-playback|app,gpu,gpu-playback,opus-encode,opus-decode`
+all check clean.

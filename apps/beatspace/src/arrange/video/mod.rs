@@ -41,13 +41,32 @@
 //!   the priority order is testable without probing real hardware). Only
 //!   `Backend::Software` is actually implemented — the others are typed
 //!   placeholders for VA-API/NVDEC/VideoToolbox, not a claim any of them
-//!   run; see the module's own doc.
+//!   run; see the module's own doc for why decode has no software
+//!   fallback the way `gl_playback` does for render.
+//! * `gl_playback` (feature `gpu-playback`) — the DISPLAY half proven for
+//!   real: a decoded frame uploaded as an actual GPU texture, sampled by
+//!   an actual fragment shader, rendered to an offscreen framebuffer, and
+//!   read back pixel-exact — headless, via surfaceless EGL, so it runs
+//!   identically on real hardware or on Mesa's software rasterizer where
+//!   no GPU exists. Proven against both a synthetic pattern and a real
+//!   frame decoded from an AV1 fixture by `decode::decode_range`. This is
+//!   NOT part of the fleet's wgpu-version table (`C18_TODO.md`) — it is
+//!   plain OpenGL/EGL via `glow`, chosen to match `eframe`'s own `glow`
+//!   backend (see this crate's `Cargo.toml` comment on why `app` forces
+//!   glow over wgpu), and has nothing to do with the `gpu` feature's
+//!   candle/wgpu training backend either. Three separate GPU-adjacent
+//!   things in this one crate; none of them are each other.
 //!
 //! Nothing here has been wired into the egui view yet — no clip on the
-//! timeline plays a `VideoAsset`, no frame has been drawn to a screen.
-//! `decode` in particular needs a real display to prove "realtime"
-//! rather than just "correct, and byte-identical whichever way you reach
-//! a frame," which is as far as a headless sandbox can take it.
+//! timeline plays a `VideoAsset`, no frame drawn by `gl_playback` has
+//! reached an actual window. The missing piece is entirely integration:
+//! a `SourceRef::Video` variant on `arrange::model::Clip`, a monitor
+//! panel in `arrangepage.rs` that drives `cache_policy`/`feel` from the
+//! playhead and calls `decode` + `gl_playback` for the resulting frames,
+//! and — per the fleet's own beatspace precedent (`0ac14413`, "workspace
+//! on desktop vs tabs on mobile") — a layout that is a real panel on a
+//! desktop-width screen and a tab on a phone-width one, not a shrunk copy
+//! of the same panel.
 
 pub mod backend;
 pub mod bucket;
