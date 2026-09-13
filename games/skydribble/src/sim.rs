@@ -12,6 +12,7 @@
 //! resets outweigh raw time-to-goal, passes score in the team drills, and the
 //! defender drill also rewards making the defender run (distance traveled).
 
+use crate::platform::ApplyProfile as _; // Profile::apply is a trait method now (see platform.rs)
 use glam::Vec3;
 
 use crate::bots::{self, Bot, Brain};

@@ -1,6 +1,7 @@
 //! SKYDRIBBLE — a Rocket-League-inspired open-world air-dribble playground.
 //! Rust + wgpu 22 + winit 0.29 (the same stack as the reference repo's games).
 
+use crate::platform::ApplyProfile as _; // Profile::apply is a trait method now (see platform.rs)
 // Shared with skydribble — see games/shared/shellkit. These were byte-
 // identical copies in both games' own src/ before extraction; `use` at
 // crate root keeps every existing `crate::net::...`-style path working

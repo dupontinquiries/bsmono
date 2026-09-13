@@ -1,0 +1,10 @@
+[package]
+name = "handheld-detect"
+version = "0.1.0"
+edition = "2021"
+description = """
+Is this machine a phone? Device-tree model, /proc/version build tag and
+hostname, classified by a pure function so a target can be proven in a
+headless test without owning one. Detection only — what a game DOES about
+being on a handheld stays in the game.
+"""

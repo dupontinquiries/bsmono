@@ -19,6 +19,9 @@ gamepad = ["dep:gilrs", "shellkit/gamepad"]
 analog = ["dep:libloading", "shellkit/analog"]
 
 [dependencies]
+# handheld detection, shared with the other game (games/shared/handheld-detect).
+# Detection only -- this game keeps its own Profile::apply tuning.
+handheld-detect = { path = "../shared/handheld-detect" }
 # voice bank: ids, screenplay parsing, scripts, size budget (games/shared/linebank)
 linebank = { path = "../shared/linebank" }
 # THE FORGE'S MOUTH (src/raidforge.rs): aperture's completion engine, which is

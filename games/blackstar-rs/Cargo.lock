@@ -989,6 +989,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "handheld-detect"
+version = "0.1.0"
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2025,6 +2029,7 @@ dependencies = [
  "gilrs",
  "glam",
  "gltf",
+ "handheld-detect",
  "image",
  "libloading",
  "linebank",
