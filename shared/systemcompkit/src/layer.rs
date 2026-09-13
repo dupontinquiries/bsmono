@@ -32,6 +32,13 @@ impl AnchorEdges {
     /// its width tracks the output, height is the caller's own concern via
     /// `LayerSurfaceIntent::size`.
     pub const BOTTOM_BAR: AnchorEdges = AnchorEdges { top: false, bottom: true, left: true, right: true };
+    /// A top panel/bar: the mirror of `BOTTOM_BAR`.
+    pub const TOP_BAR: AnchorEdges = AnchorEdges { top: true, bottom: false, left: true, right: true };
+    /// A right-hand sidebar: anchored to the right edge, spanning full
+    /// height. For a thumb-reachable strip on a phone held one-handed —
+    /// `left`/`right` mean "span vertically" the way `top`/`bottom` mean
+    /// "span horizontally" for the bar constants above.
+    pub const RIGHT_BAR: AnchorEdges = AnchorEdges { top: true, bottom: true, left: false, right: true };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +98,42 @@ impl LayerSurfaceIntent {
             anchor: AnchorEdges::BOTTOM_BAR,
             exclusive_zone: height as i32,
             size: (0, height),
+            keyboard_interactivity: KeyboardInteractivity::None,
+        }
+    }
+
+    /// A top panel/bar of a given height, the mirror of `bottom_panel`.
+    ///
+    /// This is a static intent: `size`/`exclusive_zone` are fixed at
+    /// construction. A bar that collapses to a slim strip and expands to a
+    /// tall launcher+taskbar sheet needs to change ITS OWN height at
+    /// runtime — re-requesting a new `exclusive_zone` and committing a new
+    /// buffer size on the live surface. That resize-in-place path does not
+    /// exist yet anywhere in this crate (`wayland_io` only ever sends the
+    /// intent once, at surface creation); calling `top_panel` again on mode
+    /// change would build a second intent but nothing consumes it into an
+    /// actual live reconfigure. Real work, not a follow-up call away.
+    pub fn top_panel(height: u32) -> LayerSurfaceIntent {
+        LayerSurfaceIntent {
+            layer: Layer::Top,
+            anchor: AnchorEdges::TOP_BAR,
+            exclusive_zone: height as i32,
+            size: (0, height),
+            keyboard_interactivity: KeyboardInteractivity::None,
+        }
+    }
+
+    /// A right-hand sidebar of a given width — the mobile thumb-strip
+    /// shape. Width is reserved via `exclusive_zone` exactly like the two
+    /// bars above reserve height; `size` fixes width and leaves height 0
+    /// (tracks the output), the transposed equivalent of `top_panel`'s
+    /// `(0, height)`.
+    pub fn side_panel(width: u32) -> LayerSurfaceIntent {
+        LayerSurfaceIntent {
+            layer: Layer::Top,
+            anchor: AnchorEdges::RIGHT_BAR,
+            exclusive_zone: width as i32,
+            size: (width, 0),
             keyboard_interactivity: KeyboardInteractivity::None,
         }
     }
@@ -172,5 +215,21 @@ mod tests {
         assert_eq!(intent.exclusive_zone, 48, "the reserved space must match the panel's own requested height");
         assert_eq!(intent.size, (0, 48), "width 0 tracks the output; height is fixed");
         assert!(intent.anchor.bottom && intent.anchor.left && intent.anchor.right && !intent.anchor.top);
+    }
+
+    #[test]
+    fn top_panel_is_bottom_panels_mirror() {
+        let intent = LayerSurfaceIntent::top_panel(32);
+        assert_eq!(intent.exclusive_zone, 32);
+        assert_eq!(intent.size, (0, 32));
+        assert!(intent.anchor.top && intent.anchor.left && intent.anchor.right && !intent.anchor.bottom);
+    }
+
+    #[test]
+    fn side_panel_reserves_width_not_height() {
+        let intent = LayerSurfaceIntent::side_panel(72);
+        assert_eq!(intent.exclusive_zone, 72, "width reserved the same way top/bottom panels reserve height");
+        assert_eq!(intent.size, (72, 0), "height 0 tracks the output; width is fixed — transposed vs. top_panel");
+        assert!(intent.anchor.right && intent.anchor.top && intent.anchor.bottom && !intent.anchor.left);
     }
 }
