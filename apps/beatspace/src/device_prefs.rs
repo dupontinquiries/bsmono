@@ -16,16 +16,24 @@ use std::path::PathBuf;
 
 use audio_kit::BounceFormat;
 
+use crate::arrange::video::feel::Strictness;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DevicePrefs {
     /// What library-bound renders — project sources, saved beats, exports —
     /// are encoded as. See `audio_kit::bounce`.
     pub bounce_format: BounceFormat,
+    /// How much a video bucket hint is trusted to reallocate the frame
+    /// cache, and how much churn it may cause doing it — a hardware-class
+    /// decision, not a project one, which is why it lives here rather
+    /// than in a project file or the checkpoint's config.json. See
+    /// `arrange::video::feel::Strictness`.
+    pub bucket_strictness: Strictness,
 }
 
 impl Default for DevicePrefs {
     fn default() -> Self {
-        Self { bounce_format: BounceFormat::default() }
+        Self { bounce_format: BounceFormat::default(), bucket_strictness: Strictness::default() }
     }
 }
 
@@ -33,8 +41,10 @@ impl DevicePrefs {
     pub fn encode(&self) -> String {
         format!(
             "# per-device preferences; safe to delete, never load-bearing\n\
-             bounce_format={}\n",
-            self.bounce_format.token()
+             bounce_format={}\n\
+             bucket_strictness={}\n",
+            self.bounce_format.token(),
+            self.bucket_strictness.token(),
         )
     }
 
@@ -49,6 +59,7 @@ impl DevicePrefs {
             let Some((k, v)) = line.split_once('=') else { continue };
             match k.trim() {
                 "bounce_format" => p.bounce_format = BounceFormat::from_token(v),
+                "bucket_strictness" => p.bucket_strictness = Strictness::from_token(v.trim()),
                 _ => {} // a newer build's key, not our business
             }
         }
@@ -90,12 +101,16 @@ mod tests {
 
     #[test]
     fn encode_decode_round_trips_and_unknown_lines_are_ignored() {
-        let p = DevicePrefs { bounce_format: BounceFormat::Flac };
+        let p = DevicePrefs { bounce_format: BounceFormat::Flac, bucket_strictness: Strictness::STRICT };
         assert_eq!(DevicePrefs::decode(&p.encode()), p);
-        let lenient = "# comment\n\nbounce_format = wav\nfuture_key=whatever\nnot a pair\n";
-        assert_eq!(DevicePrefs::decode(lenient).bounce_format, BounceFormat::Wav);
+        let lenient = "# comment\n\nbounce_format = wav\nbucket_strictness = loose\nfuture_key=whatever\nnot a pair\n";
+        let decoded = DevicePrefs::decode(lenient);
+        assert_eq!(decoded.bounce_format, BounceFormat::Wav);
+        assert_eq!(decoded.bucket_strictness, Strictness::LOOSE);
         assert_eq!(DevicePrefs::decode("").bounce_format, BounceFormat::Opus192, "empty is the default");
+        assert_eq!(DevicePrefs::decode("").bucket_strictness, Strictness::BALANCED, "empty is the default");
         assert_eq!(DevicePrefs::decode("bounce_format=mp3").bounce_format, BounceFormat::Opus192, "unknown token is the default");
+        assert_eq!(DevicePrefs::decode("bucket_strictness=extreme").bucket_strictness, Strictness::BALANCED, "unknown token is the default");
     }
 
     #[test]

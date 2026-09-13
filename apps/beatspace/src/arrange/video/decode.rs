@@ -34,6 +34,7 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -152,6 +153,70 @@ pub fn decode_range(
 mod tests {
     use super::*;
     use super::super::probe::{self, tests::{has_av1, make_test_fixture}};
+
+    /// Same discipline, for a codec with genuinely different reference
+    /// structure: H.264 with B-frames means DECODE order and DISPLAY
+    /// (presentation) order diverge for some frames — a case AV1 as
+    /// encoded by `make_test_fixture` above does not exercise at all,
+    /// since that encode has none. If GOP-aware seeking here silently
+    /// assumed decode order and display order were the same thing, this
+    /// is the codec that would expose it: `ffprobe`'s `pts_time` is
+    /// display order (what "frame 50" means to a caller), and `ffmpeg`'s
+    /// own `-ss`/`-frames:v` pipeline is responsible for handling the
+    /// B-frame reordering internally — this test does not re-implement
+    /// that, it just confirms the CONTRACT (seek-and-discard equals
+    /// decode-from-zero) still holds when there is reordering to get
+    /// wrong.
+    fn has_h264() -> bool {
+        static CHECKED: OnceLock<bool> = OnceLock::new();
+        *CHECKED.get_or_init(|| {
+            let enc = match Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output() {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+                _ => return false,
+            };
+            enc.lines().any(|l| l.split_whitespace().nth(1) == Some("libx264"))
+        })
+    }
+
+    fn make_h264_fixture(dir: &Path, secs: u32, gop: u32) -> std::path::PathBuf {
+        let path = dir.join("fixture_h264.mp4");
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error"])
+            .args(["-f", "lavfi", "-i", &format!("testsrc2=size=320x180:rate=24:duration={secs}")])
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-g", &gop.to_string()])
+            // bframes explicit and >0: the point of this fixture is to
+            // have decode order and display order actually differ.
+            .args(["-bf", "2", "-pix_fmt", "yuv420p", "-an"])
+            .arg(&path)
+            .status()
+            .expect("running ffmpeg to build the H.264 test fixture must succeed");
+        assert!(status.success(), "ffmpeg exited non-zero building the H.264 fixture");
+        path
+    }
+
+    #[test]
+    fn gop_aware_seeking_also_holds_for_h264_with_b_frames() {
+        if !has_h264() {
+            eprintln!("skipping: this ffmpeg build cannot encode libx264");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("bs-decode-h264-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = make_h264_fixture(&dir, 5, 24);
+        let kf = crate::arrange::video::probe::keyframes(&path).unwrap();
+        assert!(kf.len() >= 2, "expected multiple GOPs: {kf:?}");
+
+        let baseline = decode_range(&path, &[(0, 0.0)], 0, 52, 320, 180).unwrap();
+        assert_eq!(baseline.len(), 52);
+        let (kf_index, _) = nearest_at_or_before(&kf, 50).unwrap();
+        assert_ne!(kf_index, 0, "test setup: expected frame 50 to need a real seek");
+        let via_seek = decode_range(&path, &kf, 50, 3, 320, 180).unwrap();
+        assert_eq!(via_seek.len(), 3);
+        assert_eq!(via_seek[0], baseline[50], "B-frame reordering must not desync a seek from decode-from-zero, frame 50");
+        assert_eq!(via_seek[1], baseline[51], "…nor the frame after it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn nearest_at_or_before_picks_the_last_keyframe_not_past_the_target() {
