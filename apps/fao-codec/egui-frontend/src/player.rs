@@ -192,8 +192,9 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
             ui.add(egui::TextEdit::singleline(&mut deck.path).id_salt(format!("player-path-{name}")).desired_width(360.0));
             if ui.button(format!("Load {name} (.fao)")).clicked() { deck.open(); }
             if let Some(f) = &deck.file {
-                ui.label(egui::RichText::new(format!("{}×{} {} frames {:.2} fps{}", f.width(), f.height(), f.frame_count(), f.fps(),
-                    if f.has_block_dict() { " +dict" } else { "" })).weak().small());
+                ui.label(egui::RichText::new(format!("{}×{} {} frames {:.2} fps{}{}", f.width(), f.height(), f.frame_count(), f.fps(),
+                    if f.has_block_dict() { " +dict" } else { "" },
+                    if f.has_v8_webs() { " +v8" } else { "" })).weak().small());
             }
         });
         if let Some(e) = &deck.error { ui.colored_label(ui.visuals().error_fg_color, e); }
