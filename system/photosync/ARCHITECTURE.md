@@ -322,3 +322,64 @@ On Crash/Error
 │                                     │
 └─────────────────────────────────────┘
 ```
+
+## Update: a gallery UI and a native P2P sync path (new, not yet wired to the daemon)
+
+Everything above describes the original daemon: process files on disk,
+lean on Syncthing for transport, expose nothing to look at. Three pieces
+added since have not touched that daemon and do not replace Syncthing
+here — they're new surfaces alongside it:
+
+**A gallery.** `src/album.rs` (headless: grouping, albums, selection,
+sharing — an album is a set of paths, never a copy) and
+`src/gallery_grid.rs` (layout math: column count, cell placement,
+virtualized visible-range) are pure logic with no renderer. Reading is via
+`PhotoSyncDB::connection()` + `album::load()`, which returns a `Library`
+complete with albums from the daemon's own `files`/`albums` tables — this
+accessor didn't exist for a while, which made `album::load` unreachable
+from anything holding a `PhotoSyncDB` (every real caller: daemon, sync
+server, CLI). `crates/photosync-egui/` is the renderer: an egui shell on
+the fleet's shared `uikit-egui` kit, styled after Fotema's camera-roll
+shape — Library/Albums/Settings as ordinary rail destinations (Settings
+is a ordinary tab, not a separate window the way GTK/libadwaita apps
+place it), thumbnails as procedural placeholders (`settings::ThumbStyle`
+— Solid/Blur/Tileset, all pure per-frame painting, no thumbnail cache on
+disk to grow over time) since no decoder is wired in yet. `App::demo()`
+is what it runs on today; `App::from_db()` is the real path once a
+`PhotoSyncDB` is available to point it at.
+
+**Per-device permissions.** `Permission` (`ReadOnly < Contribute <
+FullSync`, real `Ord`-based capability checks) plus a `permissions` table
+keyed on `device_id`, with `set_permission`/`permission_for`/`authorize`
+on `PhotoSyncDB`. Deliberately not threaded into `register_file` or
+`garbage_collect` themselves — `authorize()` is a query a future sync
+server's request handler checks before acting, so the CLI's local,
+single-device use is never gated by a system it never asked for. Nothing
+calls `authorize()` yet; `sync_server.rs` still accepts writes ungated.
+
+**A native P2P sync path, built but not connected to anything real.**
+`src/peers.rs`: sync-partner discovery on `dht-kit` (the fleet's
+wire-format-only DHT primitives — no transport, no routing table by
+design). Derives a library id into an `InfoHash`, announces this device's
+`Permission` offer, finds other announced devices. `src/chunk_sync.rs`: a
+durable per-(library, peer) sync channel built on `snapclone-group`'s
+Merkle DAG + anti-entropy engine + delivery tracker — reused for
+something it wasn't written for (ephemeral group snaps → durable photo
+chunks). One DAG node per chunk, not per file, so an interrupted transfer
+resumes instead of restarting a large file from zero; the DAG/delivery
+state is meant to persist across many short connections
+(`ChunkSync::begin_connection` resets in-flight request bookkeeping for a
+fresh connection while keeping every chunk already admitted — found and
+fixed a real stall in `snapclone-group`'s engine where an interrupted
+request never got retried otherwise). Chunk bytes themselves stay in this
+daemon's own block store, keyed by the same hash `chunk_and_store`
+already computes — never only in the DHT/DAG layer, which is designed to
+expire.
+
+None of this has a transport wired in (no NAT traversal, no encrypted
+handshake — `chunk_sync.rs`'s own doc names `snapclone-group`'s sealed
+`entry.rs`/crypto as the natural next layer, deliberately not pulled in
+yet). It's the discovery-and-diffing half of a sync protocol, sitting
+next to — not replacing — the Syncthing-based transport this document
+describes above, until a decision is made about which one this app
+actually ships with.
