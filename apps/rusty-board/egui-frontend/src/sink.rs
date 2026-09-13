@@ -59,13 +59,19 @@ pub trait Sink {
     /// exists.
     fn pump(&mut self) {}
 
-    /// Whether the keyboard should currently be shown. The default is
-    /// `true` — `Preview` (desktop/tests) and any sink with no real
-    /// focus signal has no reason to hide itself; only a sink with an
-    /// actual compositor-driven focus signal (`WaylandIntegration`)
-    /// overrides this.
-    fn is_visible(&self) -> bool {
-        true
+    /// What this sink knows about focus. The DECISION about visibility
+    /// is not made here — see `focus_policy`.
+    ///
+    /// This used to be `fn is_visible(&self) -> bool`, defaulting to
+    /// `true`. The bool was the bug: it gave one value to two states that
+    /// need different handling — "there is no focus signal, so never
+    /// hide" (the `Preview` default) and "there is a signal and it says
+    /// no field is focused". The Wayland sink's signal starts at
+    /// not-focused and stays there forever if the compositor never
+    /// activates it, so a keyboard that hid on `false` hid permanently
+    /// with nothing in the log to say why.
+    fn focus_source(&self) -> crate::focus_policy::FocusSource {
+        crate::focus_policy::FocusSource::None
     }
 }
 
@@ -164,8 +170,11 @@ impl Sink for crate::wayland::WaylandIntegration {
     fn pump(&mut self) {
         crate::wayland::WaylandIntegration::pump(self);
     }
-    fn is_visible(&self) -> bool {
-        crate::wayland::WaylandIntegration::is_visible(self)
+    fn focus_source(&self) -> crate::focus_policy::FocusSource {
+        crate::focus_policy::FocusSource::InputMethod {
+            active: crate::wayland::WaylandIntegration::is_active(self),
+            unavailable: board_compositor::im_health::input_method_unavailable(),
+        }
     }
 }
 

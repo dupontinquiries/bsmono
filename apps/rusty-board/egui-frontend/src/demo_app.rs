@@ -60,6 +60,22 @@ pub struct Feel {
     /// documented transitions (a long upward fling, a double-activate back) had nowhere to
     /// live. See `visible_mode`.
     vis: crate::visible_mode::Machine,
+    /// Turns what the sink OBSERVED about focus into whether the keyboard
+    /// should be on screen. Separate from `vis` (which is the user-driven
+    /// Full/Tray/Dismissed machine) because this one answers to the
+    /// compositor and has to cope with compositors that never answer at
+    /// all — see `focus_policy`.
+    focus: crate::focus_policy::FocusPolicy,
+    /// Last verdict, kept for the status line so a degraded state is
+    /// visible to the person holding the phone rather than only in the
+    /// journal.
+    focus_reason: crate::focus_policy::Reason,
+    /// Process start, for `focus_policy`'s grace window. Not egui's
+    /// `input.time`: the layer shell calls `pump_sink` while idle with no
+    /// `Context` in hand, and a policy fed two different clocks depending
+    /// on which path woke it would time out at the wrong moment. `Instant`
+    /// is monotonic, which is the only property the policy needs.
+    started: std::time::Instant,
     tray_open: bool,
     microterm: crate::microterm::Microterm,
     /// The dictation SERVICE, not a bare Dictation: it owns the same state
@@ -230,7 +246,35 @@ impl Feel {
     /// runs a frame (which emits `Visible`) only when they differ.
     pub fn pump_sink(&mut self) -> bool {
         self.sink.pump();
-        self.sink.is_visible()
+        self.decide_visibility()
+    }
+
+    /// The single place the show/hide question is answered, so the idle
+    /// path and the frame path cannot drift apart. They did not share one
+    /// before; `pump_sink` read the sink directly and `frame` read it
+    /// again, which is two copies of a rule that is about to grow
+    /// fallbacks.
+    fn decide_visibility(&mut self) -> bool {
+        let now_ms = self.started.elapsed().as_millis() as u64;
+        let d = self.focus.decide(now_ms, self.sink.focus_source());
+        if d.reason != self.focus_reason {
+            // Once per transition, not once per frame — this fires at
+            // 60 Hz otherwise and buries the journal.
+            if d.reason.is_degraded() {
+                tracing::warn!("focus: {}", d.reason.describe());
+            } else {
+                tracing::debug!("focus: {}", d.reason.describe());
+            }
+            self.focus_reason = d.reason;
+        }
+        d.visible
+    }
+
+    /// What the status line should say about focus. Public because the
+    /// degraded states are the ones a person needs to see without a
+    /// serial cable.
+    pub fn focus_reason(&self) -> crate::focus_policy::Reason {
+        self.focus_reason
     }
 
     /// A screen for a shell that KNOWS its placement (the layer shell), rather than inferring
@@ -275,6 +319,15 @@ impl Feel {
             // host loads rusty-board's shipped dictionary into the same recognizer.
             tray: Default::default(),
             vis: Default::default(),
+            // Same `cfg` the appearance settings above came from, so the
+            // escape hatch is the one already documented in
+            // `config/mod.rs` and already present in every user's
+            // config.toml — not a second setting meaning the same thing.
+            focus: crate::focus_policy::FocusPolicy::from_config(
+                cfg.behavior.auto_hide_on_no_focus,
+            ),
+            focus_reason: crate::focus_policy::Reason::AwaitingFirstActivate,
+            started: std::time::Instant::now(),
             tray_open: false,
             microterm: Default::default(),
             // 16kHz: what the transcriber expects, and what the window maths
@@ -354,18 +407,19 @@ impl Feel {
         // needs (on Wayland: dispatching the input-method event queue —
         // see `Sink::pump`'s doc and `wayland.rs`'s module doc for why
         // that has to happen here rather than on some other thread).
-        // Must run before reading `is_visible()` below, or this frame's
+        // Must run before `decide_visibility()` below, or this frame's
         // Activate/Deactivate event wouldn't be reflected until the
         // next one.
         self.sink.pump();
 
         // Maliit-style focus-driven show/hide: a real compositor focus
-        // signal (Wayland input-method Activate/Deactivate), not
-        // internal app state. `Preview`/no-signal sinks default
-        // `is_visible()` to `true` (see `Sink`'s doc) so desktop/test
-        // runs keep behaving exactly as before — only a sink with a
-        // real signal ever asks to hide.
-        let should_show = self.sink.is_visible();
+        // signal (Wayland input-method Activate/Deactivate), not internal
+        // app state. `Preview`/no-signal sinks report
+        // `FocusSource::None`, which resolves to visible, so desktop and
+        // test runs behave exactly as before. What the policy adds over
+        // reading the sink directly is the cases where the signal exists
+        // but is not to be believed — see `focus_policy`.
+        let should_show = self.decide_visibility();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(should_show));
         if should_show && !self.was_visible {
             self.reveal.start();

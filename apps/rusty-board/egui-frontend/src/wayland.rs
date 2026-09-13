@@ -133,8 +133,24 @@ impl WaylandIntegration {
     /// caller is expected to call `pump()` first each frame so this
     /// reflects events actually processed this frame, not the previous
     /// one.
-    pub fn is_visible(&self) -> bool {
+    ///
+    /// Named `is_active`, not `is_visible`, because it is not the answer
+    /// to "should the keyboard be on screen" and was mistaken for it:
+    /// this returns `false` both when a field has been deselected and
+    /// when the compositor has never spoken to us at all, and only the
+    /// first of those is a reason to hide. `focus_policy` makes that
+    /// distinction; see its module doc.
+    pub fn is_active(&self) -> bool {
         self.visible.get()
+    }
+
+    /// Whether another client owns the seat's input method, so
+    /// [`Self::is_active`] is frozen and meaningless. Re-exported off the
+    /// process-wide flag `wayland_backend` sets from the `Unavailable`
+    /// event, so callers do not need to depend on `board_compositor`
+    /// directly to ask.
+    pub fn input_method_unavailable(&self) -> bool {
+        board_compositor::im_health::input_method_unavailable()
     }
 }
 
