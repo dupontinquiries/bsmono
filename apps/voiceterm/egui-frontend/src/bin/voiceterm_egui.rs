@@ -1761,7 +1761,32 @@ impl VoicetermApp {
             quick.push((c.to_string(), c.to_string()));
         }
 
-        let bar = voiceterm_egui::bars::bottom_bar::default_bar(&tabs, &workspaces, &quick);
+        // WHICH PAGE — the piece `default_bar` never had. Three reads, each
+        // already used elsewhere in this file for something else, composed
+        // through `bar_pages::current_page` rather than re-derived here: see
+        // that function's doc for why a second derivation is the failure
+        // mode being avoided.
+        let foreground_cmd = self.pty.as_ref().and_then(|h| h.foreground_command());
+        let all_lines = self.app.terminal.grid.all_lines();
+        let on_terminal_tab = {
+            use voiceterm_egui::terminal_workspace::TermPanes as _;
+            !matches!(
+                self.workspace.model().pane_kind(self.workspace.focused_pane()),
+                Some(voiceterm_egui::terminal_workspace::PaneKind::Web { .. })
+            )
+        };
+        // NOT WIRED: this crate has no dictation-session state at all yet
+        // (grepped the whole binary — the word appears only in two unrelated
+        // comments). Hardcoding `false` rather than inventing a flag means
+        // the Dictation page is simply unreachable here today, which is
+        // honest; a fabricated always-false-except-when-I-guess flag would
+        // look wired and not be.
+        let dictating = false;
+        let page = voiceterm_egui::bar_pages::current_page(
+            foreground_cmd.as_deref(), &all_lines, on_terminal_tab, dictating,
+        );
+        let live = voiceterm_egui::bar_pages::Live { tabs: tabs.clone(), workspaces: workspaces.clone(), quick: quick.clone() };
+        let bar = voiceterm_egui::bar_pages::bar_for(&page, &live);
         let mut event = None;
         egui::TopBottomPanel::bottom("voiceterm_bottom_bar").show(ctx, |ui| {
             event = bar_ui(ui, &bar);

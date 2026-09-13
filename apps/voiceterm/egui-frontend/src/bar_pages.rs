@@ -86,16 +86,30 @@
 //! `bar_pages` instead (E0432/E0433, "cannot find `dictate` in `crate`").
 //!
 //! They are mounted at `lib.rs`'s crate root now, which is where `crate::`
-//! inside those Qt-authored files actually looks. This file only needs its
-//! own `grammar_context` mount plus a second `bottom_bar` mount for the
-//! `BottomBar`/`BarButton` types `bar_for` builds — a third mount of that
-//! file alongside `bars`'s and `archived_view`'s, each scoped to its own
-//! module tree by `#[path]`, which is why three mounts of one file compile
-//! fine rather than colliding.
+//! inside those Qt-authored files actually looks. This file needs its own
+//! `grammar_context` mount, but reaches `BottomBar`/`BarButton` by
+//! RE-EXPORTING `bars::bottom_bar` rather than mounting a second `#[path]`
+//! copy of `bottom_bar.rs`.
+//!
+//! A second mount was tried first and is worth recording exactly why it
+//! failed: `#[path]` scoping each mount to its own module tree means two
+//! mounts of one source file produce two DISTINCT types — `bars::bottom_bar
+//! ::BottomBar` and `bar_pages::bottom_bar::BottomBar` look identical and are
+//! not the same type to the compiler. `bars::bar_ui` takes the former; a
+//! `BottomBar` built by this module's `bar_for` would have been the latter,
+//! and the call site (`bar_ui(ui, &bar)`) would not type-check no matter how
+//! the caller phrased it. Re-exporting `bars`'s mount instead of adding a
+//! third means there is exactly one `BottomBar` type for the whole crate to
+//! agree on, which is the property three separate mounts cannot have no
+//! matter how carefully each is scoped.
+//!
+//! `archived_view.rs` still mounts its OWN copy, unchanged by this. It draws
+//! from a page list it owns and never calls `bars::bar_ui` or `bar_for`, so
+//! it never needs to agree with either of the other two on the type — the
+//! problem above only bites when a `BottomBar` value has to cross a module
+//! boundary, and archived_view's never does.
 
-#[path = "../../src/bottom_bar.rs"]
-#[allow(dead_code, unused_imports)]
-pub mod bottom_bar;
+pub use crate::bars::bottom_bar;
 
 #[path = "../../src/grammar_context.rs"]
 #[allow(dead_code, unused_imports)]
@@ -106,3 +120,92 @@ use crate::dictate::Ctl;
 use crate::editor_voice::{self, Editor};
 
 include!("bar_pages_core.rs");
+
+/// Derive today's [`Page`] from a live terminal session, matching
+/// `main.rs::current_grammar_label` on the Qt side field for field.
+///
+/// This is the ONE call site that should ever compute the three inputs
+/// `grammar_context::grammar_label` needs — a second call site re-deriving
+/// "last non-empty line" or "is this the terminal tab" independently is
+/// exactly how the swipe-dispatch rule drifted between voiceterm's own two
+/// copies earlier in this crate's history, and how bar_pages' Qt
+/// implementation and a hand-rolled egui equivalent would drift from each
+/// other the first time either changed. Callers pass in what only they can
+/// know (the active pane's process and its rendered lines, whether this tab
+/// is the terminal tab, whether dictation is live) and get back the `Page`
+/// grammar_label + page_for would have produced together.
+///
+/// `all_lines` is whatever `app.terminal.grid.all_lines()` returns for the
+/// FOCUSED pane — this function does not reach into a pane store itself,
+/// because doing so would tie bar_pages to this crate's particular
+/// App/PtyHost shapes, and bar_pages.rs is shared, byte-identical text with
+/// the Qt build (see the module doc above). The caller already has to know
+/// which pane is focused to draw anything else; passing its lines here costs
+/// nothing new.
+pub fn current_page(
+    foreground_cmd: Option<&str>,
+    all_lines: &[String],
+    on_terminal_tab: bool,
+    dictating: bool,
+) -> Page {
+    let fg = foreground_cmd.unwrap_or("");
+    let last_line = all_lines
+        .iter()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(String::as_str)
+        .unwrap_or("");
+    let label = grammar_context::grammar_label(fg, last_line, on_terminal_tab);
+    page_for(&label, dictating)
+}
+
+#[cfg(test)]
+mod current_page_tests {
+    use super::*;
+
+    #[test]
+    fn no_foreground_process_and_empty_grid_is_plain_terminal() {
+        // The state a freshly spawned shell is in before anything has run.
+        assert_eq!(current_page(None, &[], true, false), Page::Terminal);
+    }
+
+    #[test]
+    fn an_editor_in_the_foreground_wins_regardless_of_grid_content() {
+        assert_eq!(
+            current_page(Some("hx"), &["$ hx notes.md".into()], true, false),
+            Page::Editor(editor_voice::detect_editor("hx").unwrap())
+        );
+    }
+
+    #[test]
+    fn a_repl_prompt_is_read_from_the_last_nonempty_line_not_the_first() {
+        // `detect_repl` requires the line to be the BARE prompt token — see
+        // `prompt_is_bare`, which exists specifically to reject
+        // `print('>>>')` and `x >>> y`. A first draft of this test used
+        // ">>> 1 + 1" as the prompt line, which `detect_repl` correctly
+        // does not match; that would have asserted a Repl page for input
+        // this function cannot actually classify as one.
+        let lines = vec![
+            "1 + 1".to_string(),
+            "2".to_string(),
+            ">>>".to_string(), // the bare prompt, with nothing typed yet
+        ];
+        // No foreground process name distinguishes a REPL (it IS the shell,
+        // interpreting its own input) — the prompt text is the only signal,
+        // and it must come from the last line with content.
+        assert_eq!(current_page(None, &lines, true, false), Page::Repl("python".into()));
+    }
+
+    #[test]
+    fn dictation_outranks_a_live_editor() {
+        // grammar_label / page_for's own precedence: dictation is session
+        // state the terminal cannot see, so it is checked first regardless
+        // of what is in the foreground.
+        assert_eq!(current_page(Some("hx"), &[], true, true), Page::Dictation);
+    }
+
+    #[test]
+    fn the_web_tab_falls_back_to_web_not_terminal() {
+        assert_eq!(current_page(None, &[], false, false), Page::Web);
+    }
+}
