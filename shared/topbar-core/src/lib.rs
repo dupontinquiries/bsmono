@@ -22,9 +22,11 @@
 pub mod bar;
 pub mod category;
 pub mod placement;
+pub mod runtime;
 pub mod tile;
 
 pub use bar::{Bar, BarMode};
 pub use category::TileCategory;
 pub use placement::Placement;
+pub use runtime::{BarSurface, Runtime};
 pub use tile::{unify, TileItem, TileSource};
