@@ -2936,8 +2936,14 @@ pub fn write_fao_container(
         output.write_all(&fhdr.recon_size.to_le_bytes())?;
         output.write_all(&fhdr.psnr_x10.to_le_bytes())?;
         output.write_all(&[fhdr.skip_pct])?;
+        // 13 bytes on disk: ftype, compressed_size, recon_size, psnr_x10, skip_pct, gmx. That
+        // is what fao_app's transcode worker writes and what read_fao_frame skips before the
+        // payload (fhdr_sz = 13, same constant as the index arithmetic above). This writer
+        // also emitted gmy — a 14th byte — while indexing every frame at 13, so every frame
+        // it wrote read back one byte late (marker 0, then a misaligned second frame). Found
+        // by the egui Player's round-trip test; no app called this writer, which is why it
+        // survived.
         output.write_all(&[fhdr.gmx as u8])?;
-        output.write_all(&[fhdr.gmy as u8])?;
         output.write_all(recon)?;
     }
     output.flush()?;
