@@ -54,6 +54,8 @@ pub struct TerrainGenerator {
     seed: u32,
     // r607: parity instruments were fooled by the silent per-batch CPU
     // fallback below — these counters make the actual backend visible.
+    /// See `set_gpu_enabled`. Starts true; the settings panel flips it live.
+    gpu_enabled: std::sync::atomic::AtomicBool,
     gpu_batches_ok: std::sync::atomic::AtomicU64,
     gpu_batches_failed: std::sync::atomic::AtomicU64,
 }
@@ -112,6 +114,7 @@ impl TerrainGenerator {
             #[cfg(feature = "gpu")]
             gpu,
             seed: seed32,
+            gpu_enabled: std::sync::atomic::AtomicBool::new(true),
             gpu_batches_ok: std::sync::atomic::AtomicU64::new(0),
             gpu_batches_failed: std::sync::atomic::AtomicU64::new(0),
         })
@@ -159,11 +162,18 @@ impl TerrainGenerator {
 
     /// any error from the GPU path. The CPU and GPU paths produce
     /// byte-identical output for the same inputs.
+    /// Live switch for the GPU path (the settings panel's Terrain generation control).
+    /// `false` routes every batch to the CPU generator even when the GPU one exists; it does
+    /// not construct a GPU generator that `auto` declined — that needs a relaunch with the
+    /// setting on `gpu`, which the panel says.
+    pub fn set_gpu_enabled(&self, on: bool) { self.gpu_enabled.store(on, std::sync::atomic::Ordering::Relaxed); }
+    pub fn gpu_enabled(&self) -> bool { self.gpu_enabled.load(std::sync::atomic::Ordering::Relaxed) }
+
     pub fn generate(&self, coords: &[ChunkCoord]) -> Vec<Chunk> {
         if coords.is_empty() { return Vec::new(); }
 
         #[cfg(feature = "gpu")]
-        {
+        if self.gpu_enabled() {
             if let Some(gpu) = &self.gpu {
                 let cap = gpu.batch_size() as usize;
                 let mut all = Vec::with_capacity(coords.len());

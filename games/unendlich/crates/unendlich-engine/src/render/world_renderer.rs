@@ -625,6 +625,10 @@ pub struct WorldRenderer {
     pub ui_adaptive_rd: bool,
     /// r480: tiled shared-memory octree mesher (only active with GPU_MESHER=2).
     pub ui_octree_tile: bool,
+    /// Terrain generation backend: 0 = auto, 1 = CPU, 2 = GPU. Persisted as settings.json
+    /// "gen_backend"; the CPU/GPU choice takes effect live when a GPU generator exists, and at
+    /// the next launch when `auto` declined to build one.
+    pub ui_gen_backend: u8,
     /// r480: detached terrain — glide over not-yet-streamed ground, settle on spawn.
     pub ui_detached_terrain: bool,
     pub ui_fog_on: bool,
@@ -1742,6 +1746,7 @@ impl WorldRenderer {
             ui_gpu_mesh_yield: 0,
             ui_adaptive_rd: false,
             ui_octree_tile: true,
+            ui_gen_backend: 0,
             ui_detached_terrain: true,
             ui_fog_on: true,
             ui_debug_master: false,
@@ -3627,6 +3632,7 @@ impl WorldRenderer {
             let mut ui_gpu_mesh_yield = self.ui_gpu_mesh_yield;
             let mut ui_adaptive_rd = self.ui_adaptive_rd;
             let mut ui_octree_tile = self.ui_octree_tile;
+            let mut ui_gen_backend = self.ui_gen_backend;
             let mut ui_detached_terrain = self.ui_detached_terrain;
             let mut wizard_seed_buf = self.wizard_seed_buf.clone();
             // r181/r182: preview upload happens INSIDE the closure (ctx
@@ -4402,6 +4408,20 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                     }
                                     ui.label("detached terrain");
                                     ui.weak("glide over not-yet-streamed ground instead of falling, settle when it spawns");
+                                    ui.add_space(6.0);
+                                    ui.label("Terrain generation");
+                                    ui.horizontal(|ui| {
+                                        for (i, name) in [(0u8, "Auto"), (1u8, "CPU"), (2u8, "GPU")] {
+                                            if ui.selectable_label(ui_gen_backend == i, name).clicked() {
+                                                ui_gen_backend = i;
+                                            }
+                                        }
+                                    });
+                                    ui.weak(match ui_gen_backend {
+                                        1 => "CPU: lock-free across the loader workers. Never contends with the frame.",
+                                        2 => "GPU: Vulkan compute, one batch per submit. If auto declined it on this driver, GPU applies at the next launch (UNENDLICH_GEN_BACKEND=gpu forces it).",
+                                        _ => "Auto: the GPU where a device exists, except on drivers where it is measured to lose (Honeykrisp declines it).",
+                                    });
                                 }
                                 5 => {
                                     // r437: DEBUG tab. Master gate (off by default) + per-system
@@ -5628,6 +5648,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             self.ui_gpu_mesh_yield = ui_gpu_mesh_yield;
             self.ui_adaptive_rd = ui_adaptive_rd;
             self.ui_octree_tile = ui_octree_tile;
+            self.ui_gen_backend = ui_gen_backend;
             self.ui_detached_terrain = ui_detached_terrain;
             self.wizard_preview_tex = wizard_preview_tex; // r182
             if wizard_preview_uploaded {
