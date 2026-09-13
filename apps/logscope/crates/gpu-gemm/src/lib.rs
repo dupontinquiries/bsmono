@@ -1585,7 +1585,19 @@ struct Frame { enc: wgpu::CommandEncoder, pending: Vec<Pending>, keep: Vec<Keep>
 const FLUSH_EVERY_DEFAULT: u32 = 32;
 /// Candidate passes-per-submit the `SubmitTuner` sweeps on live decode tokens. Smaller = more submits =
 /// more overhead but smoother display; larger = fewer submits = less overhead but longer submits.
-pub const SUBMIT_PROFILES: &[u32] = &[16, 32, 64, 128, 256, 512];
+///
+/// THE LADDER STARTS AT 1, NOT 16. The settle rule below already anticipated "a big model where even
+/// flush=16 exceeds the budget" and fell back to the smoothest candidate -- but if 16 is the smallest
+/// candidate, the smoothest available may still be a multi-second submit. On a shared display GPU that
+/// is not a smoothness problem, it is a WATCHDOG problem: the driver kills the device, and on Asahi
+/// that takes the compositor and every other client down with it until a reboot.
+///
+/// Observed with an 8B model on Apple silicon: the whole GPU wedged, kwin and plasmashell failing with
+/// ENODEV. `flush_every` has always clamped to a floor of 1, so these values were supported and simply
+/// never tried. The equivalent fix in llama.cpp (nodes_per_submit 100 -> 1, against a 2000ms
+/// lockup_timeout) cost no measurable throughput, because at these sizes each pass is already large
+/// enough to keep the GPU busy.
+pub const SUBMIT_PROFILES: &[u32] = &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
 /// Default in-flight submit cap for the governor (see `Gpu::submit`): one executing + one queued keeps
 /// the GPU saturated while bounding how far display work can fall behind. `LOGSCOPE_SUBMIT_INFLIGHT`
 /// overrides; 0 disables.
@@ -7505,6 +7517,11 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// converging over ~a dozen live replies. The ceiling is one submit per TOKEN regardless (the logits
     /// readback forces it), so past ~dispatches-per-token the ladder flattens — the probe sees that too.
     /// Cost: ~256 tiny dispatches per candidate (≈1 s worst-case on Asahi, once per GPU until cached).
+    /// The ladder now starts at 1 rather than 16, so this probes four more candidates and takes
+    /// correspondingly longer at startup. That is worth paying: the small end is where a big model on a
+    /// shared display GPU has to live, and probing it once beats discovering it when the driver's
+    /// watchdog takes the desktop down. At flush=1 the probe issues 256 separate submits, which at
+    /// Asahi's ~0.5 ms sync tax is ~128 ms -- the small candidates are the CHEAP ones to measure.
     pub fn submit_stride_probe(&self, cands: &[u32]) -> Vec<(u32, f64)> {
         let n = 2048usize;
         let a = self.upload(&vec![1.0f32; n], 1, n);

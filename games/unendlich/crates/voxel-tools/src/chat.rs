@@ -93,6 +93,12 @@ pub struct Pending {
     prose: String,
     /// What the dry run placed, for a review's measurement and picture.
     placed: Vec<(i32, i32, i32)>,
+    /// How many distinct materials the build used, when that is
+    /// knowable. `Edit` records only the block that WAS there, not what
+    /// replaced it, so the IR path cannot tell -- and `None` means
+    /// unknown rather than one, because a check that cannot see its
+    /// input must not guess.
+    materials: Option<usize>,
     /// The program source, when this pending came from one. A review
     /// needs it: a program's ops list is empty by construction.
     program: String,
@@ -488,6 +494,9 @@ impl ChatSession {
         // keeps every downstream thing -- preview, waypoint, commit,
         // undo, the world tree -- working unchanged.
         let placed: Vec<(i32, i32, i32)> = run.changes.iter().map(|c| c.at).collect();
+        let materials: Option<usize> = Some(run.changes.iter()
+            .filter(|c| c.to != 0).map(|c| c.to)
+            .collect::<std::collections::BTreeSet<u16>>().len());
         let bounds = placed.iter().fold(None::<((i32,i32,i32),(i32,i32,i32))>, |b, p| Some(match b {
             None => (*p, *p),
             Some((lo, hi)) => ((lo.0.min(p.0), lo.1.min(p.1), lo.2.min(p.2)),
@@ -501,6 +510,7 @@ impl ChatSession {
         echo.push_str(&format!("\n{} added, {cut} removed", run.changes.len() - cut));
         let blocks = run.changes.len();
         self.pending = Some(Pending {
+            materials,
             plan: BuildPlan { name: "program".into(), ops: Vec::new(), anchor: Some(anchor) },
             feature_id: f.feature_id.clone(),
             predicted_blocks: blocks,
@@ -557,9 +567,35 @@ impl ChatSession {
         // expressive path was the one path with no feedback. A program
         // is reviewed in its own terms: passes, their polarity, and how
         // many cells each moved.
+        // WHAT IS MEASURABLY WRONG, before anything the model has to
+        // spot for itself. A model looking at an ASCII elevation of its
+        // own work says "looks good" far more often than it should, and
+        // every fault this crate actually produces -- floating, in
+        // pieces, perfectly mirrored, four shapes, one material -- can
+        // be CHECKED. Telling it "this floats four blocks above the
+        // ground" turns a question of taste into a fact.
+        let faults = crate::faults::check(&crate::faults::Look {
+            cells: &cells,
+            ground,
+            // Known on the program path, where the dry run keeps what
+            // it placed. Unknown on the IR path, because `Edit` records
+            // only the block that WAS there. 2 stands in for unknown so
+            // the check stays quiet rather than firing wrongly: a check
+            // that cannot see its input must not guess.
+            materials: p.materials.unwrap_or(2),
+            parts: p.pass_log.len().max(ops.len()),
+            enclosed: !p.prose.to_lowercase().contains("statue"),
+        });
+        let fault_lines = crate::faults::lines(&faults, 3);
+        {
+        }
+        // THE PROGRAM PATH GETS THEM TOO. It returns early, and the
+        // comment right below records that this exact path was once
+        // "the most expressive path with no feedback". Adding the
+        // faults after the early return would have reintroduced that.
         if ops.is_empty() && !p.program.is_empty() {
-            return Some(crate::review::program_prompt(
-                &p.prose, &p.program, &p.pass_log, &measured, &elev, &p.findings, round));
+            return Some(format!("{fault_lines}{}", crate::review::program_prompt(
+                &p.prose, &p.program, &p.pass_log, &measured, &elev, &p.findings, round)));
         }
         let mut base = crate::review::prompt(&p.prose, &ops, spec.as_deref(), &measured, &elev,
                                             &p.findings, variants, round);
@@ -569,6 +605,7 @@ impl ChatSession {
         if let Some(note) = &self.study_note {
             base = format!("{note}\n{base}");
         }
+        if !fault_lines.is_empty() { base = format!("{fault_lines}{base}"); }
         // and what changed since last round, which is the only thing
         // that answers "did my edit help"
         if self.bench.attempts.len() > 1 {
@@ -1000,6 +1037,7 @@ impl ChatSession {
             plan, feature_id: f.feature_id.clone(), predicted_blocks: dry.blocks_changed,
             ir: ir.to_string(), prose: prose.to_string(),
             placed: placed.clone(),
+            materials: None,
             program: String::new(),
             pass_log: Vec::new(),
             extra_cells: Vec::new(),
@@ -2143,5 +2181,59 @@ mod tests {
             Reply::Preview { echo, .. } => assert!(echo.contains("RECOGNIZED"), "{echo}"),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn a_review_names_what_is_measurably_wrong_before_asking_the_model_to_look() {
+        // A model looking at an ASCII elevation of its own work says
+        // "looks good" far more often than it should. Every fault this
+        // crate actually produces can be CHECKED, and a fact beats a
+        // question of taste.
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(20, 5, 15.0);
+        // a build that FLOATS -- the reported fault, verbatim
+        let r = s.receive_program(&mut t, &g,
+            "pass a add\n  part b box w=10 h=10 d=10 material=stone\n  \
+             rel b above ground by=30\nend\n", None, "a floating lump");
+        assert!(matches!(r, Reply::Preview { .. }), "{r:?}");
+        let p = s.review_prompt(0, &[]).expect("a review");
+        assert!(p.contains("WHAT IS WRONG WITH IT, measured rather than guessed"), "{p}");
+        assert!(p.contains("floats"), "the reported fault is named: {p}");
+        assert!(p.contains("Fix the first one before the others"), "{p}");
+        assert!(p.contains("or say why it is deliberate"), "it is not a gate: {p}");
+    }
+
+    #[test]
+    fn the_one_material_check_fires_now_that_the_count_is_real() {
+        // It was passed a constant 2 and so could never fire. `Edit`
+        // records only the block that WAS there, but the PROGRAM path's
+        // dry run keeps what it placed, so there the count is real.
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(20, 5, 15.0);
+        // hollow and on the ground, so the one-material fault is not
+        // pushed out of the top three by worse ones
+        let one = s.receive_program(&mut t, &g,
+            "pass a add\n  part b box w=14 h=9 d=14 material=stone hollow\n  \
+             rel b on ground\nend\n", None, "a lump of one stone");
+        assert!(matches!(one, Reply::Preview { .. }), "{one:?}");
+        let p = s.review_prompt(0, &[]).expect("a review");
+        assert!(p.contains("all one material"), "{p}");
+
+        // two materials and it stays quiet
+        let mut w2 = Flat::new();
+        let mut t2 = VoxelTools::new(&mut w2);
+        let mut s2 = ChatSession::new(32, 200);
+        let two = s2.receive_program(&mut t2, &g,
+            "pass a add\n  part b box w=14 h=9 d=14 material=stone hollow\n  \
+             rel b on ground\nend\n\
+             pass c add\n  part t box w=4 h=3 d=4 material=oak_planks\n  \
+             rel t on b\nend\n", None, "a lump with a cap");
+        assert!(matches!(two, Reply::Preview { .. }), "{two:?}");
+        let p2 = s2.review_prompt(0, &[]).expect("a review");
+        assert!(!p2.contains("all one material"), "{p2}");
     }
 }
