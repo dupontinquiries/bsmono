@@ -52,6 +52,7 @@ pub struct VulkanSurface {
     pub queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
+    tier: topbar_core::RenderTier,
 }
 
 impl VulkanSurface {
@@ -86,12 +87,23 @@ impl VulkanSurface {
                 .map_err(|e| RenderError::Surface(e.to_string()))?
         };
 
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        // Hardware first, `PowerPreference::LowPower` (the bar is idle
+        // most of the time — no reason to wake a discrete GPU for it).
+        // Fall back to `force_fallback_adapter: true` if nothing hardware
+        // answers — this is what actually reaches lavapipe on a system
+        // that has it, rather than requiring the caller to construct a
+        // second `VulkanSurface` attempt by hand.
+        let hardware_request = wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::LowPower,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
-        }))
-        .map_err(|_| RenderError::NoAdapter)?;
+        };
+        let fallback_request = wgpu::RequestAdapterOptions { force_fallback_adapter: true, ..hardware_request };
+        let adapter = match pollster::block_on(instance.request_adapter(&hardware_request)) {
+            Ok(adapter) => adapter,
+            Err(_) => pollster::block_on(instance.request_adapter(&fallback_request)).map_err(|_| RenderError::NoAdapter)?,
+        };
+        let tier = classify_adapter(&adapter.get_info());
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
             .map_err(|e| RenderError::Device(e.to_string()))?;
@@ -110,7 +122,17 @@ impl VulkanSurface {
         };
         surface.configure(&device, &config);
 
-        Ok(VulkanSurface { instance, device, queue, surface, config })
+        Ok(VulkanSurface { instance, device, queue, surface, config, tier })
+    }
+
+    /// Which [`topbar_core::RenderTier`] this surface actually landed on —
+    /// classified from `wgpu::AdapterInfo::device_type` at `new()` time,
+    /// not assumed from having requested `Backends::VULKAN`: a fallback
+    /// adapter (lavapipe) is still a Vulkan adapter, just a software one,
+    /// which is exactly the distinction `RenderTier` exists to carry
+    /// through to `Runtime::quality()`.
+    pub fn tier(&self) -> topbar_core::RenderTier {
+        self.tier
     }
 
     pub fn format(&self) -> wgpu::TextureFormat {
@@ -134,5 +156,52 @@ impl VulkanSurface {
     /// caller might otherwise expect grouped with the outright failures.
     pub fn acquire(&self) -> wgpu::CurrentSurfaceTexture {
         self.surface.get_current_texture()
+    }
+}
+
+/// Maps wgpu's own hardware/software distinction onto the shared
+/// `topbar_core::RenderTier` — `ShmOnly` is never produced here; that tier
+/// only applies when there's no wgpu adapter answering at all, which is a
+/// decision made one level up (the caller falling back to
+/// `systemcompkit::wayland_io::paint_argb8888` entirely), not something
+/// this function can detect from an `AdapterInfo` it was only called with
+/// because SOME adapter did answer.
+fn classify_adapter(info: &wgpu::AdapterInfo) -> topbar_core::RenderTier {
+    match info.device_type {
+        wgpu::DeviceType::Cpu => topbar_core::RenderTier::SoftwareEmulated,
+        _ => topbar_core::RenderTier::Hardware,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn adapter_info(device_type: wgpu::DeviceType) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: "test".into(),
+            vendor: 0,
+            device: 0,
+            device_type,
+            device_pci_bus_id: String::new(),
+            driver: String::new(),
+            driver_info: String::new(),
+            backend: wgpu::Backend::Vulkan,
+            subgroup_min_size: 0,
+            subgroup_max_size: 0,
+            transient_saves_memory: false,
+        }
+    }
+
+    #[test]
+    fn cpu_device_type_classifies_as_software_emulated() {
+        assert_eq!(classify_adapter(&adapter_info(wgpu::DeviceType::Cpu)), topbar_core::RenderTier::SoftwareEmulated);
+    }
+
+    #[test]
+    fn every_real_gpu_device_type_classifies_as_hardware() {
+        for dt in [wgpu::DeviceType::DiscreteGpu, wgpu::DeviceType::IntegratedGpu, wgpu::DeviceType::VirtualGpu, wgpu::DeviceType::Other] {
+            assert_eq!(classify_adapter(&adapter_info(dt)), topbar_core::RenderTier::Hardware);
+        }
     }
 }

@@ -1,15 +1,14 @@
 //! runtime — ties a [`crate::bar::Bar`] to a live layer-shell surface and a
 //! [`crate::placement::Placement`], and nothing else. Deliberately does
 //! NOT touch rendering: painting `Bar::poses()` into pixels is a real,
-//! still-open question (egui has no CPU rasterizer of its own — a
-//! layer-shell `WlSurface` isn't something `eframe`/winit will hand a GL
-//! context for the way it does for a normal toplevel window, so either a
-//! `softbuffer`-backed software path or a `wayland-egl` + `glow` GPU path
-//! needs picking, and neither has been started or tested here). That
-//! choice is exactly the kind of thing this crate's own design already
-//! seams off behind a trait rather than guessing at: [`BarSurface`] is the
-//! transport seam, a `BarPainter` trait for rendering is the next one and
-//! isn't defined yet because there's nothing concrete to seam against.
+//! still-open question — three candidate paths exist now
+//! (`topbar-render`'s Vulkan-via-wgpu, `systemcompkit`'s `wl_shm` CPU
+//! path, and an as-yet-unbuilt GL-via-wgpu path for the software-rasterizer
+//! middle tier) and none is wired to a `BarPainter` trait here yet, because
+//! there's still nothing settled enough to seam against. What Runtime DOES
+//! own: `RenderTier`/`RenderQuality` (see `quality.rs`) — not rendering
+//! itself, but the caller-facing knob a painter reads to decide how much
+//! of the hardware-tier look (animation, translucency) it can afford.
 //!
 //! What IS here: the orchestration logic — poll the surface, tick the
 //! board, resize on mode change — tested against a fake surface so it
@@ -19,6 +18,7 @@ use hatch_core::grid::GridSpec;
 
 use crate::bar::{Bar, BarMode};
 use crate::placement::Placement;
+use crate::quality::{RenderQuality, RenderTier};
 use crate::tile::TileItem;
 
 /// The transport seam. `systemcompkit::wayland_io::LayerSurface` implements
@@ -41,17 +41,35 @@ pub struct Runtime<S: BarSurface> {
     placement: Placement,
     collapsed_size: u32,
     expanded_size: u32,
+    tier: RenderTier,
 }
 
 impl<S: BarSurface> Runtime<S> {
+    /// `board_config` is the caller's own choice — typically
+    /// `tier.board_config()` for the common case, but not forced: a caller
+    /// that wants hardware-tier animation on a software-tier device (or
+    /// vice versa) can still pass whatever `BoardConfig` it wants. `tier`
+    /// is stored separately and read via `quality()`/`tier()` for the
+    /// OTHER thing it drives — translucency — which isn't a `BoardConfig`
+    /// field at all and is instead a flag a painter checks before
+    /// compositing a background blur.
     pub fn new(
         surface: S,
         placement: Placement,
         board_config: hatch_core::anim::BoardConfig,
         collapsed_size: u32,
         expanded_size: u32,
+        tier: RenderTier,
     ) -> Runtime<S> {
-        Runtime { surface, bar: Bar::new(board_config), placement, collapsed_size, expanded_size }
+        Runtime { surface, bar: Bar::new(board_config), placement, collapsed_size, expanded_size, tier }
+    }
+
+    pub fn tier(&self) -> RenderTier {
+        self.tier
+    }
+
+    pub fn quality(&self) -> RenderQuality {
+        self.tier.quality()
     }
 
     pub fn placement(&self) -> Placement {
@@ -130,7 +148,6 @@ mod tests {
     use crate::category::TileCategory;
     use crate::tile::TileSource;
     use hatch_core::anim::BoardConfig;
-
     struct FakeSurface {
         configured: Option<(u32, u32)>,
         closed: bool,
@@ -167,7 +184,7 @@ mod tests {
 
     #[test]
     fn starts_collapsed_and_toggling_resizes_to_the_expanded_size() {
-        let mut rt = Runtime::new(FakeSurface::new(), Placement::LaptopTopBar, BoardConfig::default(), 32, 320);
+        let mut rt = Runtime::new(FakeSurface::new(), Placement::LaptopTopBar, BoardConfig::default(), 32, 320, RenderTier::Hardware);
         assert_eq!(rt.mode(), BarMode::Collapsed);
 
         rt.toggle_expanded().unwrap();
@@ -181,7 +198,7 @@ mod tests {
 
     #[test]
     fn set_items_drops_categories_the_placement_does_not_show() {
-        let mut rt = Runtime::new(FakeSurface::new(), Placement::LaptopTopBar, BoardConfig::default(), 32, 320);
+        let mut rt = Runtime::new(FakeSurface::new(), Placement::LaptopTopBar, BoardConfig::default(), 32, 320, RenderTier::Hardware);
         // LaptopTopBar doesn't show SystemMonitor (see placement.rs).
         let items = vec![tile("firefox", TileCategory::Launcher), tile("cpu", TileCategory::SystemMonitor)];
         rt.set_items(items, &spec(), 0.0);
@@ -191,7 +208,7 @@ mod tests {
 
     #[test]
     fn same_items_on_a_desktop_bottom_bar_keep_the_system_monitor_tile() {
-        let mut rt = Runtime::new(FakeSurface::new(), Placement::DesktopBottomBar, BoardConfig::default(), 48, 48);
+        let mut rt = Runtime::new(FakeSurface::new(), Placement::DesktopBottomBar, BoardConfig::default(), 48, 48, RenderTier::Hardware);
         let items = vec![tile("firefox", TileCategory::Launcher), tile("cpu", TileCategory::SystemMonitor)];
         rt.set_items(items, &spec(), 0.0);
         assert_eq!(rt.poses().count(), 2);
@@ -201,8 +218,16 @@ mod tests {
     fn is_closed_and_tick_pass_through_to_the_surface() {
         let mut surface = FakeSurface::new();
         surface.closed = true;
-        let mut rt = Runtime::new(surface, Placement::MobileThumbSidebar, BoardConfig::default(), 72, 72);
+        let mut rt = Runtime::new(surface, Placement::MobileThumbSidebar, BoardConfig::default(), 72, 72, RenderTier::ShmOnly);
         assert!(rt.is_closed());
         rt.tick(0.0); // must not panic with no items ever set
+    }
+
+    #[test]
+    fn tier_and_quality_are_exposed_and_consistent() {
+        let rt = Runtime::new(FakeSurface::new(), Placement::LaptopTopBar, BoardConfig::default(), 32, 320, RenderTier::SoftwareEmulated);
+        assert_eq!(rt.tier(), RenderTier::SoftwareEmulated);
+        assert_eq!(rt.quality(), RenderTier::SoftwareEmulated.quality());
+        assert!(!rt.quality().translucent, "software-emulated tier must not ask for translucency");
     }
 }

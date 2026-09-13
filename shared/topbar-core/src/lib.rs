@@ -22,11 +22,13 @@
 pub mod bar;
 pub mod category;
 pub mod placement;
+pub mod quality;
 pub mod runtime;
 pub mod tile;
 
 pub use bar::{Bar, BarMode};
 pub use category::TileCategory;
 pub use placement::Placement;
+pub use quality::{RenderQuality, RenderTier};
 pub use runtime::{BarSurface, Runtime};
 pub use tile::{unify, TileItem, TileSource};
