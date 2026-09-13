@@ -78,6 +78,37 @@ pub struct PtyHost {
 }
 
 impl PtyHost {
+    /// The `comm` of the process currently in the foreground process
+    /// group of this pty — what the shell has handed the terminal to
+    /// (vim, a REPL, a long-running build) as opposed to the shell
+    /// itself sitting idle at a prompt.
+    ///
+    /// Mirrors `pty_term.rs::foreground_command` on the Qt side exactly,
+    /// down to the `/proc/<pid>/comm` read, because `grammar_context::
+    /// grammar_label` is written against that contract: a name like
+    /// `hx` or `vim`, not a full command line. Re-deriving the format
+    /// here independently is how the two builds' voice-command
+    /// detection would quietly diverge the first time either changed.
+    ///
+    /// `portable_pty::MasterPty::process_group_leader` already wraps the
+    /// `tcgetpgrp` the Qt side calls directly, so this is the read half
+    /// only.
+    pub fn foreground_command(&self) -> Option<String> {
+        let pgid = self.master.process_group_leader()?;
+        if pgid <= 0 {
+            return None;
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{}/comm", pgid)).ok()?;
+        let trimmed = comm.trim_end_matches(['\n', '\0']);
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+}
+
+impl PtyHost {
     /// Spawn the user's login shell.
     ///
     /// `SHELL` with `/bin/sh` as the fallback, matching the Qt side. `-l`

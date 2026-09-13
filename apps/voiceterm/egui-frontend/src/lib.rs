@@ -267,6 +267,7 @@ pub mod note_edit;
 pub use nifty_core::niftyplot;
 pub mod palace;
 pub mod bars;
+pub mod bar_pages;
 pub mod browser;
 pub mod bookmarks_view;
 pub mod build_view;
