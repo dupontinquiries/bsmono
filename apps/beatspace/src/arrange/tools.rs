@@ -214,6 +214,7 @@ impl Tools {
                         source: b.source,
                         start: cell,
                         source_beats: b.beats,
+                        exact: false,
                     }));
                     self.drag = Drag::Painting { track, painted: vec![cell] };
                 }
@@ -271,6 +272,7 @@ impl Tools {
                                 source: b.source,
                                 start: cell,
                                 source_beats: b.beats,
+                                exact: false,
                             }));
                         }
                     }
@@ -491,8 +493,8 @@ mod tests {
     fn setup() -> (Editor, TrackId, TrackId, ClipId, ClipId) {
         let mut e = Editor::default();
         let (t0, t1) = (e.timeline.tracks[0].id, e.timeline.tracks[1].id);
-        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0 }).unwrap().created[0];
-        let b = e.apply(Command::Place { track: t0, source: SourceRef::Beat(1), start: 4.0, source_beats: 2.0 }).unwrap().created[0];
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false }).unwrap().created[0];
+        let b = e.apply(Command::Place { track: t0, source: SourceRef::Beat(1), start: 4.0, source_beats: 2.0, exact: false }).unwrap().created[0];
         (e, t0, t1, a, b)
     }
 
@@ -641,7 +643,7 @@ mod tests {
     #[test]
     fn marquee_selects_what_it_crosses_on_the_tracks_it_spans() {
         let (mut e, _, t1, a, b) = setup();
-        let c = e.apply(Command::Place { track: t1, source: SourceRef::File(0), start: 1.0, source_beats: 1.0 }).unwrap().created[0];
+        let c = e.apply(Command::Place { track: t1, source: SourceRef::File(0), start: 1.0, source_beats: 1.0, exact: false }).unwrap().created[0];
         let mut t = Tools::default();
         t.press(&e, at(3.0, 0, Hit::Empty), Mods::default());
         t.drag(&e, at(0.5, 1, Hit::Empty));

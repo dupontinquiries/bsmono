@@ -144,7 +144,10 @@ alt-drag copies, edges trim, double-click splits), draw (paints the armed
 source one clip per grid cell), split, erase, loop; the ruler seeks and scrubs.
 Wheel pans, ctrl+wheel or pinch zooms around the pointer, two fingers pan.
 Keys: space play · delete · ctrl-z/y · ctrl-d duplicate · s split at playhead ·
-l loop · ctrl-a · arrows nudge · home · 1–5 tools. Clips keep their start beat
+l loop · ctrl-a · arrows nudge · home · 1–5 tools · r record · ctrl-k the
+command palette (every action by name, plus `tempo 128`, `go 9`, `zoom 60`,
+`grid 1/2`). Right-click or long-press for a context menu. `●` records the
+live stream into a take that lands at the playhead. Clips keep their start beat
 when the tempo changes and are not time-stretched. `export wav` renders the
 whole arrangement. Playback runs through the same audio device as the
 generator, which pauses while the arrangement plays.

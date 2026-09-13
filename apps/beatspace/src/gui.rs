@@ -22,6 +22,7 @@ use std::time::Instant;
 use candle_core::Device;
 use eframe::egui;
 
+use crate::arrange::cmd::Command;
 use crate::arrange::model::Timeline;
 use crate::arrange::render::{Library, Sample, Transport};
 use crate::arrangepage::{ArrangeIo, ArrangeOut, ArrangeView};
@@ -134,6 +135,14 @@ struct ArrShared {
     /// thread -> GUI: the beat the speakers are at.
     pos: f64,
     notice: Option<String>,
+    /// GUI -> thread: start a take at this beat / stop the running one.
+    record_toggle: Option<f64>,
+    /// thread -> GUI: seconds recorded so far, while a take runs.
+    recording_secs: Option<f32>,
+    /// thread -> GUI: a finished take to place (source, start beat,
+    /// length in beats). The GUI applies it through the editor so it is
+    /// undoable like everything else.
+    pending_place: Option<(crate::arrange::model::SourceRef, f64, f64)>,
 }
 
 struct Shared {
@@ -187,6 +196,9 @@ pub fn run(cfg: Config) -> Result<()> {
             capture: false,
             pos: 0.0,
             notice: None,
+            record_toggle: None,
+            recording_secs: None,
+            pending_place: None,
         },
         gain: 1.0,
         stopped: false,
@@ -561,6 +573,7 @@ fn stream_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -
     let mut walk = LatentWalk::new(&cfg);
     let mut windows: u64 = 0;
     let mut arr = ArrService::new();
+    let mut take: Option<crate::stream::Take> = None;
 
     let (_stream, audio) = player::start(cfg.sr)?;
 
@@ -658,6 +671,23 @@ restart the GUI with --ckpt-dir pointing at its directory",
             p.push_window(&window.audio, window.advance);
             p.queued_src_samples()
         };
+        // Recording: the same windows the player got, overlap-added into a
+        // take. Toggled from the arrange page; a finished take goes into
+        // the library and is handed back to be placed.
+        let toggle = shared.lock().unwrap().arr.record_toggle.take();
+        if let Some(start_beat) = toggle {
+            match take.take() {
+                Some(t) => finish_take(t, &cfg, &shared),
+                None => {
+                    take = Some(crate::stream::Take::start(start_beat, ctl.bpm, cfg.sr));
+                    shared.lock().unwrap().arr.notice = Some(format!("recording from beat {start_beat:.2}"));
+                }
+            }
+        }
+        if let Some(t) = take.as_mut() {
+            t.push(&window);
+            shared.lock().unwrap().arr.recording_secs = Some(t.secs());
+        }
 
         if let Some(path) = save_req {
             match streamer.render_last_hq(cfg.griffin_iters) {
@@ -685,6 +715,29 @@ restart the GUI with --ckpt-dir pointing at its directory",
         }
     }
     Ok(())
+}
+
+/// Add a finished take to the library and queue its placement.
+fn finish_take(t: crate::stream::Take, cfg: &Config, shared: &Arc<Mutex<Shared>>) {
+    let start_beat = t.start_beat;
+    let mut s = shared.lock().unwrap();
+    s.arr.recording_secs = None;
+    match t.finish() {
+        Some((audio, beats)) => {
+            let n = s.arr.library.beats.len() + 1;
+            let secs = audio.len() as f32 / cfg.sr as f32;
+            let r = Arc::make_mut(&mut s.arr.library).add_beat(Sample {
+                name: format!("take {n}"),
+                audio,
+                sr: cfg.sr,
+                planes: None,
+                bpm: None,
+            });
+            s.arr.pending_place = Some((r, start_beat, beats));
+            s.arr.notice = Some(format!("take {n}: {secs:.1} s, placed at beat {start_beat:.2}"));
+        }
+        None => s.arr.notice = Some("the take was empty".into()),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1044,26 +1097,47 @@ impl App {
     /// under the shared lock once, the view runs, and what it asked for
     /// is written back.
     fn arrange_body(&mut self, ui: &mut egui::Ui) {
-        let (library, playhead, playing) = {
+        self.arrange_take_pending();
+        let (library, playhead, playing, recording, can_record) = {
             let s = self.shared.lock().unwrap();
-            (s.arr.library.clone(), s.arr.pos, s.arr.playing)
+            (s.arr.library.clone(), s.arr.pos, s.arr.playing, s.arr.recording_secs, s.playback.stream)
         };
-        let io = ArrangeIo { library: &library, playhead, playing };
+        let io = ArrangeIo { library: &library, playhead, playing, recording, can_record };
         let out = self.arrange.ui(ui, &io);
         self.arrange_apply(out);
+    }
+
+    /// A take the stream thread finished: place it through the editor so
+    /// it is undoable, then publish.
+    fn arrange_take_pending(&mut self) {
+        let pending = self.shared.lock().unwrap().arr.pending_place.take();
+        if let Some((source, start, beats)) = pending {
+            // The beats track, or wherever the first track is.
+            if let Some(track) = self.arrange.timeline().tracks.first().map(|t| t.id) {
+                // Exact: a take starts where recording started, not on the
+                // nearest grid line.
+                let placed = self.arrange.editor.apply(Command::Place { track, source, start, source_beats: beats, exact: true });
+                match placed {
+                    Ok(_) => {}
+                    Err(e) => self.status = format!("the take could not be placed at {start:.2}: {e:?} — it is in the library"),
+                }
+                let mut s = self.shared.lock().unwrap();
+                s.arr.timeline = self.arrange.timeline().clone();
+            }
+        }
     }
 
     /// The arrangement's controls column: the library, imports, exports,
     /// and the selected clip.
     fn arrange_column(&mut self, ui: &mut egui::Ui) {
-        let (library, playhead, playing, notice) = {
+        let (library, playhead, playing, notice, recording, can_record) = {
             let mut s = self.shared.lock().unwrap();
-            (s.arr.library.clone(), s.arr.pos, s.arr.playing, s.arr.notice.take())
+            (s.arr.library.clone(), s.arr.pos, s.arr.playing, s.arr.notice.take(), s.arr.recording_secs, s.playback.stream)
         };
         if let Some(n) = notice {
             self.status = n;
         }
-        let io = ArrangeIo { library: &library, playhead, playing };
+        let io = ArrangeIo { library: &library, playhead, playing, recording, can_record };
         let mut out = ArrangeOut::default();
         self.arrange.library_ui(ui, &io, &mut out);
         self.arrange_apply(out);
@@ -1097,6 +1171,14 @@ impl App {
         if out.capture_beat {
             s.arr.capture = true;
             self.status = "capturing…".into();
+        }
+        if let Some(start) = out.toggle_record {
+            if s.arr.playing {
+                self.status = "stop the arrangement first: a take records the live stream".into();
+            } else {
+                s.arr.record_toggle = Some(start);
+                s.stopped = false;
+            }
         }
         drop(s);
         if let Some(path) = out.import_file {

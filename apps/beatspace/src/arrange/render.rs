@@ -232,7 +232,7 @@ mod tests {
         let t0 = e.timeline.tracks[0].id;
         // At 120 BPM and 100 Hz, a beat is 50 samples. Beat 0 (1 s = 2
         // beats) at beat 1: samples 50..150.
-        e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 1.0, source_beats: 2.0 }).unwrap();
+        e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 1.0, source_beats: 2.0, exact: false }).unwrap();
         let mut out = vec![0.0f32; 200];
         render_block(&e.timeline, &l, 100, 0.0, &mut out);
         assert_eq!(out[0], 0.0);
@@ -259,7 +259,7 @@ mod tests {
         let l = lib();
         let mut e = Editor::default();
         let t1 = e.timeline.tracks[1].id;
-        let id = e.apply(Command::Place { track: t1, source: SourceRef::File(0), start: 0.0, source_beats: 4.0 }).unwrap().created[0];
+        let id = e.apply(Command::Place { track: t1, source: SourceRef::File(0), start: 0.0, source_beats: 4.0, exact: false }).unwrap().created[0];
         // Head-trim one beat: the clip now starts at beat 1 and plays the
         // ramp from its 50th sample.
         e.apply(Command::Trim { clip: id, start: 1.0, len: 3.0, offset: 1.0 }).unwrap();
@@ -276,7 +276,7 @@ mod tests {
         l.add_beat(Sample { name: "dc".into(), audio: vec![1.0; 44100], sr: 22050, planes: None, bpm: None });
         let mut e = Editor::default();
         let t0 = e.timeline.tracks[0].id;
-        e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0 }).unwrap();
+        e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false }).unwrap();
         let mut out = vec![0.0f32; 22050];
         render_block(&e.timeline, &l, 22050, 0.0, &mut out);
         let fade = (0.005 * 22050.0) as usize; // 110 samples
@@ -291,7 +291,7 @@ mod tests {
         let l = lib();
         let mut e = Editor::default();
         let t0 = e.timeline.tracks[0].id;
-        e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 2.0, source_beats: 2.0 }).unwrap();
+        e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 2.0, source_beats: 2.0, exact: false }).unwrap();
         // Ask for beats 1..3 (100 samples): the clip begins halfway.
         let mut out = vec![0.0f32; 100];
         render_block(&e.timeline, &l, 100, 1.0, &mut out);
@@ -304,7 +304,7 @@ mod tests {
         let l = lib();
         let mut e = Editor::default();
         let t0 = e.timeline.tracks[0].id;
-        e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0 }).unwrap();
+        e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false }).unwrap();
         e.apply(Command::SetLoop { region: Some((0.0, 1.0)) }).unwrap();
         let mut tr = Transport { playing: true, pos: 0.5 };
         // 100 samples = 2 beats: 0.5..1.0 (25 samples), wrap, 0..1 (50),

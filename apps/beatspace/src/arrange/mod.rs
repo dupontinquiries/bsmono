@@ -5,6 +5,7 @@
 //! * `tools`  — the pointer, in beats and tracks: gestures in, commands out.
 //! * `render` — the library of sources and the block mixer with a looping
 //!              transport.
+//! * `palette` — every action by name, ranked for a command palette.
 //!
 //! None of them know egui or an audio device. `arrangepage` (behind the
 //! `app` feature) is the view over them; the generator thread drives the
@@ -19,5 +20,6 @@
 
 pub mod cmd;
 pub mod model;
+pub mod palette;
 pub mod render;
 pub mod tools;

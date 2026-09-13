@@ -27,6 +27,7 @@ use egui::{Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 use crate::arrange::cmd::{Command, Editor};
 use crate::arrange::model::{Grid, SourceRef, Timeline};
+use crate::arrange::palette::{self, Action};
 use crate::arrange::render::Library;
 use crate::arrange::tools::{At, Brush, Edge, Effect, Hit, Mods, Preview, Shortcut, Tool, Tools};
 
@@ -36,6 +37,10 @@ pub struct ArrangeIo<'a> {
     /// Beat the audio thread last reported playing.
     pub playhead: f64,
     pub playing: bool,
+    /// Whether the stream is being recorded into a take, and for how long.
+    pub recording: Option<f32>,
+    /// Whether recording is possible at all (stream playback).
+    pub can_record: bool,
 }
 
 /// What the view wants the app to do.
@@ -46,6 +51,8 @@ pub struct ArrangeOut {
     pub seek: Option<f64>,
     pub toggle_play: bool,
     pub capture_beat: bool,
+    /// Start a take at this beat, or stop the one running.
+    pub toggle_record: Option<f64>,
     pub import_file: Option<String>,
     pub export_wav: Option<String>,
     pub status: Option<String>,
@@ -67,6 +74,12 @@ pub struct ArrangeView {
     pub import_path: String,
     pub export_path: String,
     rename: Option<(u64, String)>,
+    /// The command palette: open, its query, the highlighted row.
+    palette_open: bool,
+    palette_query: String,
+    palette_cursor: usize,
+    /// The beat a context menu was opened on.
+    menu_at: Option<At>,
 }
 
 impl Default for ArrangeView {
@@ -84,6 +97,10 @@ impl Default for ArrangeView {
             import_path: String::new(),
             export_path: "arrangement.wav".into(),
             rename: None,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_cursor: 0,
+            menu_at: None,
         }
     }
 }
@@ -193,6 +210,7 @@ impl ArrangeView {
         ui.add_space(4.0);
         self.canvas(ui, io, &mut out);
         self.keys(ui, io, &mut out);
+        self.palette_ui(ui, io, &mut out);
         ui.add_space(4.0);
         let hint = self.tools.tool.hint();
         ui.label(egui::RichText::new(hint).small().weak());
@@ -207,6 +225,20 @@ impl ArrangeView {
             if ui.button("⏮").on_hover_text("home").clicked() {
                 self.playhead = 0.0;
                 out.seek = Some(0.0);
+            }
+            let rec_label = match io.recording {
+                Some(secs) => format!("● {secs:.1}s"),
+                None => "●".into(),
+            };
+            let rec = ui.add_enabled(io.can_record || io.recording.is_some(), egui::Button::new(egui::RichText::new(rec_label).color(if io.recording.is_some() { Color32::from_rgb(255, 80, 80) } else { Color32::from_rgb(200, 90, 90) })))
+                .on_hover_text(if io.can_record { "r — record the live stream into a take that lands at the playhead" } else { "recording needs stream playback (train with the dynamic preset)" });
+            if rec.clicked() {
+                out.toggle_record = Some(self.playhead);
+            }
+            if ui.button("⌘").on_hover_text("ctrl-k — every command by name").clicked() {
+                self.palette_open = !self.palette_open;
+                self.palette_query.clear();
+                self.palette_cursor = 0;
             }
             ui.separator();
             for (i, t) in Tool::ALL.iter().enumerate() {
@@ -349,6 +381,92 @@ impl ArrangeView {
                 _ => egui::CursorIcon::Default,
             };
             ui.ctx().set_cursor_icon(icon);
+        }
+
+        // ---- context menu: right-click, or a long press on touch ----
+        if resp.secondary_clicked() {
+            if let Some(p) = resp.interact_pointer_pos().filter(|p| in_lane(*p)) {
+                let at = self.at(p, area);
+                if let Hit::Clip { id, .. } = at.hit {
+                    if !self.editor.selection.contains(&id) {
+                        self.editor.selection.clear();
+                        self.editor.selection.insert(id);
+                    }
+                }
+                self.menu_at = Some(at);
+            }
+        }
+        let mut menu_fx: Vec<Effect> = Vec::new();
+        let mut menu_action: Option<Action> = None;
+        if let Some(at) = self.menu_at {
+            resp.context_menu(|ui| {
+                ui.set_min_width(170.0);
+                let sel: Vec<u64> = self.editor.selection.iter().copied().collect();
+                match at.hit {
+                    Hit::Clip { id, .. } => {
+                        if ui.button("split here").clicked() {
+                            menu_fx.push(Effect::Command(Command::Split { clip: id, beat: at.beat }));
+                            ui.close();
+                        }
+                        if ui.button(format!("duplicate ({})", sel.len())).clicked() {
+                            menu_action = Some(Action::Duplicate);
+                            ui.close();
+                        }
+                        if ui.button("mute / unmute clip").clicked() {
+                            menu_fx.push(Effect::Command(Command::ToggleClipMute { clip: id }));
+                            ui.close();
+                        }
+                        if ui.button("loop this clip").clicked() {
+                            if let Some((_, c)) = self.editor.timeline.find(id) {
+                                menu_fx.push(Effect::Command(Command::SetLoop { region: Some((c.start, c.end())) }));
+                            }
+                            ui.close();
+                        }
+                        if ui.button(format!("delete ({})", sel.len())).clicked() {
+                            menu_fx.push(Effect::Command(Command::Delete { clips: sel.clone() }));
+                            ui.close();
+                        }
+                    }
+                    Hit::Empty | Hit::Ruler => {
+                        if let (Some(b), Some(ix)) = (self.tools.brush, at.track) {
+                            if ui.button(format!("place {} here", io.library.name(b.source))).clicked() {
+                                let track = self.editor.timeline.tracks[ix].id;
+                                menu_fx.push(Effect::Command(Command::Place { track, source: b.source, start: at.beat, source_beats: b.beats, exact: false }));
+                                ui.close();
+                            }
+                        }
+                        if ui.button("loop this bar").clicked() {
+                            let bar = self.editor.timeline.beats_per_bar as f64;
+                            let b0 = (at.beat / bar).floor() * bar;
+                            menu_fx.push(Effect::Command(Command::SetLoop { region: Some((b0, b0 + bar)) }));
+                            ui.close();
+                        }
+                        if ui.button("seek here").clicked() {
+                            menu_fx.push(Effect::Seek(at.beat.max(0.0)));
+                            ui.close();
+                        }
+                        if ui.button("add track").clicked() {
+                            menu_action = Some(Action::AddTrack);
+                            ui.close();
+                        }
+                    }
+                }
+                ui.separator();
+                if ui.button("commands…  ctrl-k").clicked() {
+                    self.palette_open = true;
+                    self.palette_query.clear();
+                    ui.close();
+                }
+            });
+        }
+        if !resp.context_menu_opened() {
+            self.menu_at = None;
+        }
+        if !menu_fx.is_empty() {
+            self.apply_effects(menu_fx, out);
+        }
+        if let Some(a) = menu_action {
+            self.run_action(a, io, out);
         }
 
         // ---- draw ----
@@ -537,8 +655,16 @@ impl ArrangeView {
         let mut fx: Vec<Effect> = Vec::new();
         let cmd = Modifiers::COMMAND;
         let take = |ui: &mut egui::Ui, m: Modifiers, k: Key| ui.input_mut(|i| i.consume_key(m, k));
+        if take(ui, cmd, Key::K) || take(ui, cmd, Key::P) {
+            self.palette_open = !self.palette_open;
+            self.palette_query.clear();
+            self.palette_cursor = 0;
+        }
         if take(ui, Modifiers::NONE, Key::Space) {
             out.toggle_play = true;
+        }
+        if take(ui, Modifiers::NONE, Key::R) && (_io.can_record || _io.recording.is_some()) {
+            out.toggle_record = Some(self.playhead);
         }
         if take(ui, Modifiers::NONE, Key::Delete) || take(ui, Modifiers::NONE, Key::Backspace) {
             fx.extend(Shortcut::Delete.effects(&self.editor, self.playhead, &mut self.tools));
@@ -591,6 +717,141 @@ impl ArrangeView {
         self.apply_effects(fx, out);
     }
 
+    /// Carry out a named action.
+    fn run_action(&mut self, a: Action, io: &ArrangeIo<'_>, out: &mut ArrangeOut) {
+        let ph = self.playhead;
+        let mut fx: Vec<Effect> = Vec::new();
+        match a {
+            Action::Tool(t) => self.tools.set_tool(t),
+            Action::Undo => {
+                if let Some(l) = self.editor.undo() {
+                    out.changed = true;
+                    out.status = Some(format!("undid {l}"));
+                }
+            }
+            Action::Redo => {
+                if let Some(l) = self.editor.redo() {
+                    out.changed = true;
+                    out.status = Some(format!("redid {l}"));
+                }
+            }
+            Action::Delete => fx = Shortcut::Delete.effects(&self.editor, ph, &mut self.tools),
+            Action::Duplicate => fx = Shortcut::Duplicate.effects(&self.editor, ph, &mut self.tools),
+            Action::SplitAtPlayhead => fx = Shortcut::SplitAtPlayhead.effects(&self.editor, ph, &mut self.tools),
+            Action::ToggleLoop => fx = Shortcut::ToggleLoop.effects(&self.editor, ph, &mut self.tools),
+            Action::SelectAll => fx = Shortcut::SelectAll.effects(&self.editor, ph, &mut self.tools),
+            Action::ClearSelection => self.editor.selection.clear(),
+            Action::AddTrack => {
+                let n = self.editor.timeline.tracks.len() + 1;
+                fx.push(Effect::Command(Command::AddTrack { name: format!("track {n}") }));
+            }
+            Action::CaptureBeat => out.capture_beat = true,
+            Action::RecordTake => {
+                if io.can_record || io.recording.is_some() {
+                    out.toggle_record = Some(ph);
+                } else {
+                    out.status = Some("recording needs stream playback".into());
+                }
+            }
+            Action::Export => out.export_wav = Some(self.export_path.trim().to_string()),
+            Action::Play => out.toggle_play = true,
+            Action::SeekStart => fx.push(Effect::Seek(0.0)),
+            Action::ZoomIn => self.px_per_beat = (self.px_per_beat * 1.25).min(400.0),
+            Action::ZoomOut => self.px_per_beat = (self.px_per_beat / 1.25).max(4.0),
+            Action::ZoomFit => {
+                let end = self.editor.timeline.end().max(4.0);
+                // Fit the arrangement into ~800pt of lane; the canvas
+                // clamps the rest.
+                self.px_per_beat = (800.0 / end as f32).clamp(4.0, 400.0);
+                self.scroll_beats = 0.0;
+            }
+            Action::SetGrid(g) => fx.push(Effect::Command(Command::SetGrid { grid: g })),
+            Action::SetTempo(bpm) => fx.push(Effect::Command(Command::SetTempo { bpm })),
+            Action::Go(b) => fx.push(Effect::Seek(b)),
+            Action::Zoom(px) => self.px_per_beat = px.clamp(4.0, 400.0),
+        }
+        self.apply_effects(fx, out);
+    }
+
+    /// The command palette, as the kit's bar: an input, ghost completion,
+    /// and up to `MAX_ROWS` matches beneath it. Enter runs the highlighted
+    /// row, up/down move, escape closes.
+    fn palette_ui(&mut self, ui: &mut egui::Ui, io: &ArrangeIo<'_>, out: &mut ArrangeOut) {
+        if !self.palette_open {
+            return;
+        }
+        use uikit_egui::command_bar::{accept, ghost, move_cursor, MAX_ROWS};
+        let matches = palette::search(&self.palette_query);
+        let n = matches.len().min(MAX_ROWS);
+        self.palette_cursor = self.palette_cursor.min(n.saturating_sub(1));
+        let mut run: Option<Action> = None;
+        let mut close = false;
+        egui::Frame::popup(ui.style()).show(ui, |ui| {
+            ui.set_min_width(ui.available_width().min(420.0));
+            let best = matches.first().map(|m| m.label.clone());
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.palette_query)
+                    .id_salt("arr-palette")
+                    .hint_text("command… (tempo 128 · go 9 · zoom 60 · grid 1/2)")
+                    .desired_width(f32::INFINITY),
+            );
+            r.request_focus();
+            // Keys while the box has focus: these are consumed before
+            // the TextEdit would see them next frame.
+            let (up, down, enter, esc, tab) = ui.input_mut(|i| (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Tab),
+            ));
+            if up {
+                self.palette_cursor = move_cursor(self.palette_cursor, n, -1);
+            }
+            if down {
+                self.palette_cursor = move_cursor(self.palette_cursor, n, 1);
+            }
+            if tab {
+                if let Some(b) = &best {
+                    self.palette_query = accept(&self.palette_query, b);
+                }
+            }
+            if esc {
+                close = true;
+            }
+            if enter {
+                run = matches.get(self.palette_cursor).map(|m| m.action);
+                close = true;
+            }
+            if let Some(b) = &best {
+                if let Some(g) = ghost(&self.palette_query, b) {
+                    ui.label(egui::RichText::new(format!("{}{g}  ⇥", self.palette_query)).weak().small());
+                }
+            }
+            for (i, m) in matches.iter().take(MAX_ROWS).enumerate() {
+                let row = ui.selectable_label(i == self.palette_cursor, format!("{}    {}", m.label, m.key));
+                if row.clicked() {
+                    run = Some(m.action);
+                    close = true;
+                }
+                if row.hovered() {
+                    self.palette_cursor = i;
+                }
+            }
+            if matches.is_empty() {
+                ui.label(egui::RichText::new("no such command").weak());
+            }
+        });
+        if let Some(a) = run {
+            self.run_action(a, io, out);
+        }
+        if close {
+            self.palette_open = false;
+            self.palette_query.clear();
+            ui.memory_mut(|m| m.surrender_focus(egui::Id::new("arr-palette")));
+        }
+    }
+
     /// The library, for the controls column: captured beats and files,
     /// arming the draw brush, and dropping a source at the playhead.
     pub fn library_ui(&mut self, ui: &mut egui::Ui, io: &ArrangeIo<'_>, out: &mut ArrangeOut) {
@@ -637,7 +898,7 @@ impl ArrangeView {
         }
         if let Some((r, track)) = drop {
             if let Some(beats) = io.library.beats_of(r, &self.editor.timeline) {
-                let fx = vec![Effect::Command(Command::Place { track, source: r, start: self.playhead, source_beats: beats })];
+                let fx = vec![Effect::Command(Command::Place { track, source: r, start: self.playhead, source_beats: beats, exact: false })];
                 self.apply_effects(fx, out);
             }
         }

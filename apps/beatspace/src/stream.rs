@@ -266,9 +266,72 @@ impl OverlapAdd {
     }
 }
 
+/// A take: the stream's windows overlap-added into one sample while
+/// recording, so what lands on the timeline is exactly what was heard —
+/// crossfades included — not a row of hard-cut windows.
+///
+/// Fed the same `StreamWindow`s the player gets. `finish` yields the
+/// audio and how long it is in beats at the tempo the conductor had, which
+/// is what a clip's length is.
+pub struct Take {
+    oa: OverlapAdd,
+    /// Beat on the arrangement the take started at.
+    pub start_beat: f64,
+    pub windows: u64,
+    bpm: f32,
+    sr: u32,
+}
+
+impl Take {
+    pub fn start(start_beat: f64, bpm: f32, sr: u32) -> Self {
+        Self { oa: OverlapAdd::new(), start_beat, windows: 0, bpm, sr }
+    }
+
+    pub fn push(&mut self, w: &StreamWindow) {
+        self.oa.push(&w.audio, w.advance);
+        self.windows += 1;
+    }
+
+    /// Seconds recorded so far.
+    pub fn secs(&self) -> f32 {
+        self.oa.queued() as f32 / self.sr.max(1) as f32
+    }
+
+    /// The audio and its length in beats. Empty takes yield nothing.
+    pub fn finish(mut self) -> Option<(Vec<f32>, f64)> {
+        let n = self.oa.queued();
+        if n == 0 {
+            return None;
+        }
+        let mut audio = vec![0.0f32; n];
+        self.oa.pull(&mut audio);
+        let beats = n as f64 / self.sr as f64 * self.bpm as f64 / 60.0;
+        Some((audio, beats))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_take_is_the_overlap_added_stream_and_knows_its_length_in_beats() {
+        // Three 10-sample windows advancing by 6: 22 samples, as the
+        // player would have queued them.
+        let mut take = Take::start(4.0, 120.0, 100);
+        for _ in 0..3 {
+            take.push(&StreamWindow { audio: vec![0.5; 10], advance: 6 });
+        }
+        assert_eq!(take.windows, 3);
+        assert!((take.secs() - 0.22).abs() < 1e-6);
+        let (audio, beats) = take.finish().unwrap();
+        assert_eq!(audio.len(), 22);
+        // 0.22 s at 120 BPM is 0.44 beats.
+        assert!((beats - 0.44).abs() < 1e-9);
+        // Outside the crossfades the level is the window's own.
+        assert!((audio[2] - 0.5).abs() < 1e-6);
+        assert!(Take::start(0.0, 120.0, 100).finish().is_none(), "nothing recorded, nothing placed");
+    }
 
     #[test]
     fn overlap_add_places_windows_at_the_advance_and_crossfades_the_overlap() {

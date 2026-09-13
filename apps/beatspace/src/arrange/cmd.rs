@@ -18,8 +18,10 @@ use super::model::{ClipId, Grid, SourceRef, Timeline, TrackId};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// Place `source` at `start` on `track`; `source_beats` is the
-    /// material's length at the current tempo.
-    Place { track: TrackId, source: SourceRef, start: f64, source_beats: f64 },
+    /// material's length at the current tempo. `exact` skips the grid — a
+    /// recorded take lands where recording started, not on the nearest
+    /// beat.
+    Place { track: TrackId, source: SourceRef, start: f64, source_beats: f64, exact: bool },
     /// Move clips by `delta_beats`, optionally to another track (all
     /// selected clips go to the same track — a cross-track move of a
     /// multi-selection keeps their relative tracks by index).
@@ -165,11 +167,11 @@ impl Editor {
     /// The command's effect on a timeline, with nothing recorded. Pure.
     fn run(t: &mut Timeline, cmd: &Command) -> Result<Vec<ClipId>, Refused> {
         match cmd {
-            Command::Place { track, source, start, source_beats } => {
+            Command::Place { track, source, start, source_beats, exact } => {
                 if t.track(*track).is_none() {
                     return Err(Refused::NoSuchTrack);
                 }
-                let start = t.grid.snap(*start);
+                let start = if *exact { *start } else { t.grid.snap(*start) };
                 t.place(*track, *source, start, *source_beats).map(|id| vec![id]).ok_or(Refused::DoesNotFit)
             }
             Command::Move { clips, delta_beats, delta_tracks } => {
@@ -353,7 +355,7 @@ mod tests {
     #[test]
     fn place_snaps_to_the_grid_and_is_undoable() {
         let (mut e, t0, _) = ed();
-        let r = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 1.3, source_beats: 2.0 }).unwrap();
+        let r = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 1.3, source_beats: 2.0, exact: false }).unwrap();
         assert_eq!(r.created.len(), 1);
         let c = e.timeline.find(r.created[0]).unwrap().1;
         assert_eq!(c.start, 1.0, "snapped to the beat grid");
@@ -367,11 +369,18 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_placement_ignores_the_grid() {
+        let (mut e, t0, _) = ed();
+        let r = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 1.3, source_beats: 2.0, exact: true }).unwrap();
+        assert_eq!(e.timeline.find(r.created[0]).unwrap().1.start, 1.3);
+    }
+
+    #[test]
     fn a_refused_command_records_nothing() {
         let (mut e, t0, _) = ed();
-        e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 4.0 }).unwrap();
+        e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 4.0, exact: false }).unwrap();
         let depth = e.undo.len();
-        let err = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 1.0, source_beats: 1.0 }).unwrap_err();
+        let err = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 1.0, source_beats: 1.0, exact: false }).unwrap_err();
         assert_eq!(err, Refused::DoesNotFit);
         assert_eq!(e.undo.len(), depth);
         assert_eq!(e.apply(Command::Delete { clips: vec![999] }).unwrap_err(), Refused::NoSuchClip);
@@ -381,9 +390,9 @@ mod tests {
     #[test]
     fn a_move_across_tracks_is_all_or_nothing() {
         let (mut e, t0, t1) = ed();
-        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0 }).unwrap().created[0];
-        let b = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 4.0, source_beats: 2.0 }).unwrap().created[0];
-        let blocker = e.apply(Command::Place { track: t1, source: SourceRef::File(0), start: 5.0, source_beats: 1.0 }).unwrap().created[0];
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false }).unwrap().created[0];
+        let b = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 4.0, source_beats: 2.0, exact: false }).unwrap().created[0];
+        let blocker = e.apply(Command::Place { track: t1, source: SourceRef::File(0), start: 5.0, source_beats: 1.0, exact: false }).unwrap().created[0];
         // b would land on the blocker: the whole move is refused, a stays.
         assert_eq!(e.apply(Command::Move { clips: vec![a, b], delta_beats: 0.0, delta_tracks: 1 }).unwrap_err(), Refused::DoesNotFit);
         assert_eq!(e.timeline.find_track_of(a), Some(t0));
@@ -404,7 +413,7 @@ mod tests {
     #[test]
     fn split_makes_two_clips_that_continue_the_same_material() {
         let (mut e, t0, _) = ed();
-        let a = e.apply(Command::Place { track: t0, source: SourceRef::File(0), start: 2.0, source_beats: 4.0 }).unwrap().created[0];
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::File(0), start: 2.0, source_beats: 4.0, exact: false }).unwrap().created[0];
         let r = e.apply(Command::Split { clip: a, beat: 3.0 }).unwrap();
         let right = r.created[0];
         let (_, l) = e.timeline.find(a).unwrap();
@@ -424,8 +433,8 @@ mod tests {
     #[test]
     fn trim_keeps_material_offsets_and_respects_neighbours() {
         let (mut e, t0, _) = ed();
-        let a = e.apply(Command::Place { track: t0, source: SourceRef::File(0), start: 0.0, source_beats: 4.0 }).unwrap().created[0];
-        let _b = e.apply(Command::Place { track: t0, source: SourceRef::File(0), start: 6.0, source_beats: 1.0 }).unwrap().created[0];
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::File(0), start: 0.0, source_beats: 4.0, exact: false }).unwrap().created[0];
+        let _b = e.apply(Command::Place { track: t0, source: SourceRef::File(0), start: 6.0, source_beats: 1.0, exact: false }).unwrap().created[0];
         // Head trim: start moves, offset grows, end stays.
         e.apply(Command::Trim { clip: a, start: 1.0, len: 3.0, offset: 1.0 }).unwrap();
         // Tail trim into the neighbour is refused.
@@ -436,7 +445,7 @@ mod tests {
     #[test]
     fn duplicate_places_copies_later_and_reports_them() {
         let (mut e, t0, _) = ed();
-        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0 }).unwrap().created[0];
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false }).unwrap().created[0];
         let r = e.apply(Command::Duplicate { clips: vec![a], delta_beats: 2.0 }).unwrap();
         assert_eq!(r.created.len(), 1);
         assert_eq!(e.timeline.find(r.created[0]).unwrap().1.start, 2.0);
