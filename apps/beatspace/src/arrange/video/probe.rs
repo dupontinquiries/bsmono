@@ -162,7 +162,7 @@ fn parse_keyframes_csv(text: &str) -> Vec<(i64, f64)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::OnceLock;
 
