@@ -2259,6 +2259,19 @@ logscope's two are guarded; check aperture, voiceterm and studio next.
 3. **The retry ladder does not converge** (§57): the same malformed call
    repeated a dozen times with the reminder growing each round. The ladder
    text does reach the model, so escalation is happening and not working.
+   PARTIAL FIX (`d5986ee76`): one class of "malformed call" was a call that
+   was not malformed at all, just in a format the parser did not recognize —
+   the parser only took a flat `{"tool": ...}` object in a ```tool fence or
+   `<tool_call>` tags, and chatllm.cpp's per-family handlers (tool_qwen2.5.py,
+   tool_llama3.1.py, tool_mistral.py, tool_deepseekcoder.py) show base models
+   are trained on bare JSON, fenced ```json, and other XML-ish tag names too.
+   The parser now accepts those in addition to the harness's own wire format.
+   This does not by itself prove the ladder converges — a call that is
+   ACTUALLY malformed (wrong arg types, missing required fields, hallucinated
+   tool name) still needs the ladder to work, and that path is unverified.
+   The next check is whether a genuinely malformed call still loops after
+   this fix, isolating whatever fraction of the non-convergence was really a
+   parser gap vs. the ladder's own escalation being ineffective.
 4. **Two liaison modules, one dead** (§55) — decide which is canonical.
 5. **`ctxplan` relevance on context cards** (§53 item 4) — the number now
    exists and the reference design shows it; surfacing it would make the
