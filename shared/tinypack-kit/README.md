@@ -35,3 +35,27 @@ No ARM measurements. `drop` has no transport yet — the seam is
 writes of only the bytes that changed. `Sealer` is a trait; `MacSealer` is a
 test stand-in, not crypto — `crypto-kit` (AES-GCM, Ed25519) is the real one.
 `fit()`'s cross-resolution PSNR favours the largest rung; read the table.
+
+
+## `ledger` — who did what, and whose scrip you hold
+
+A personal, offline-first receipt chain. Every person is their own issuer:
+an append-only hash-linked signed log where `Gift{to,amount}` hands out your
+own scrip and `Attest{subject,tag,obj}` records authorship / an access grant /
+a friendship. Single-author chains mean no consensus — verify one signature
+and one hash link. Equivocation (two entries at one `seq`) is kept as proof,
+not raced. `Store` is a grow-only CRDT: `merge` is commutative + idempotent,
+so tapping cards in any order converges. Entries frame into one `drop` pack
+via `pack_batch`/`fit_batch`, so receipts propagate on the same cards as
+messages; a DHT is just another transport later.
+
+Answers the intended questions directly: `authors_of(obj)` ("who wrote this
+voiceterm script"), `attestations_about(me, tag::GRANT)` ("who gave me
+logscope access"), `mutual_friends(a,b)` (snapclone). `balance(issuer,holder)`
+sums un-revoked gifts; a caught equivocator's balance is zero.
+
+Crypto is the same seam as `drop`: `Sealer` for sign/verify (Ed25519),
+`Hasher` for content ids (BLAKE3) — both deployment-wide constants supplied
+by `crypto-kit`; tests use `MacSealer` and a labelled non-cryptographic
+mixer. Not verified: no real crypto wired yet; no DHT transport; no app
+integration (voiceterm/logscope/snapclone) — that is deliberately held off.

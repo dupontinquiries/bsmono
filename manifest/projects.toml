@@ -363,7 +363,7 @@ daemon = false
 flatpak = false
 runtime = "none"
 targets = ["desktop", "phone", "x86", "alpine"]   # pure Rust -> cross-clean
-notes = "fit the most into a tiny byte budget (NFC tag, DHT value, QR): static-vocab token codec for short text (EN chat 3.5 bits/byte where deflate expands; retrain with tools/train_vocab.py), adaptive binary arithmetic coder, headerless DCT image codec with budget fitting (128x128 photo in 734 B), and `drop` — store-carry-forward over passive tags where the tag is the mailbox and the phone the courier (Device::tap(image)->image, Sealer trait for crypto-kit). Zero deps; `tinypack` CLI speaks PGM/PPM, PNG behind a feature. NOT verified on ARM; no NFC transport yet. Candidate consumer: snapclone-wirecodec (tag 0x02 for sub-64-byte text)."
+notes = "fit the most into a tiny byte budget (NFC tag, DHT value, QR): static-vocab token codec for short text (EN chat 3.5 bits/byte where deflate expands; retrain with tools/train_vocab.py), adaptive binary arithmetic coder, headerless DCT image codec with budget fitting (128x128 photo in 734 B), and `drop` — store-carry-forward over passive tags (tag=mailbox, phone=courier, Device::tap(image)->image); and `ledger` — per-person hash-chained signed receipts (personal scrip + attestations: authorship/access-grant/friend), CRDT merge, rides drop packs, Sealer+Hasher traits for crypto-kit. Zero deps; `tinypack` CLI speaks PGM/PPM, PNG behind a feature. NOT verified on ARM; no NFC transport yet. Candidate consumer: snapclone-wirecodec (tag 0x02 for sub-64-byte text)."
 
 [shared.net-kit]
 path = "shared/net-kit"

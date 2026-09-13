@@ -25,6 +25,7 @@ pub mod bac;
 pub mod drop;
 pub mod huffman;
 pub mod image;
+pub mod ledger;
 pub mod text;
 
 /// Usable user-memory budgets of common NFC tags, in bytes. These are what
