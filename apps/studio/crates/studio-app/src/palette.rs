@@ -106,6 +106,9 @@ pub enum ShellVerb {
     Overlap(studio_core::Overlap),
     ArchiveDialog,
     ExportDialog,
+    /// The music video: the timeline's video clips over the mixdown,
+    /// through ffmpeg, next to the project file.
+    ExportVideo,
     Settings,
     ToggleWorkbench,
     ToggleLibrary,
@@ -311,6 +314,8 @@ pub fn root() -> Vec<Choice> {
         c("overlap: refuse", None, Then::Do(Act::Shell(ShellVerb::Overlap(studio_core::Overlap::Refuse)))),
         c("save archive…", None, Then::Do(Act::Shell(ShellVerb::ArchiveDialog))),
         c("export…", None, Then::Do(Act::Shell(ShellVerb::ExportDialog))),
+        c("export the music video (mp4 next to the project)", Some("video clips cut over the mixdown, via ffmpeg"),
+          Then::Do(Act::Shell(ShellVerb::ExportVideo))),
         c("settings…", None, Then::Do(Act::Shell(ShellVerb::Settings))),
         c("workspace: edit (arrange & trim)", Some("C-1"),
           Then::Do(Act::Shell(ShellVerb::Workspace(0)))),

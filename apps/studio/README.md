@@ -1125,6 +1125,28 @@ Wire target kinds 2 and 3 without a `WIRE_VERSION` bump: an older peer
 already refuses an unknown target kind outright, and a bump would
 refuse every older save file for a target most projects never draw.
 
+## The picture, rendered
+
+The arrangement rendered to audio since the first mixdown; the other
+half of a music video is `studio_video::edit`. The cut list is timeline
+arithmetic: every clip on a video track, the FIRST video track on top
+where two overlap (every editor's rule, and how the arrangement paints
+them), black where none — a gap is a segment, not a skip, because the
+audio's timing must hold. The ffmpeg command is a string built from it
+(one input per distinct file, `trim` + `setpts` per cut, `color` per
+gap, everything scaled and padded to one frame size, `concat`, the
+mixdown WAV mapped under it, `-shortest`), tested as a string; and
+tested for real where ffmpeg has libx264, by rendering two coloured
+fixtures cut against each other and reading the centre pixel back at
+four moments. "export the music video" runs it on the export worker
+and lands the mp4 next to the project file; a video source whose file
+is not where the project says is a gap, and a timeline with no video
+is refused rather than rendered black.
+
+Sync by audio was already there (`align_offset_ms`, and the slate's own
+aligner with a confidence) — verified before writing a third, which the
+agents' guide asks for and this session nearly failed to do.
+
 ## A curve over a composition
 
 `Gate::Group(id)`: a binding active over the group's HULL — from its

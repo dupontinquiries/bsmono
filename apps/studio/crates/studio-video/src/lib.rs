@@ -58,6 +58,8 @@
 pub mod timecode;
 /// Dual-system sound: aligning a separately-recorded take to picture by the clap. Pure.
 pub mod slate;
+/// The timeline's video clips cut into one mp4 over the mixdown — ffmpeg's edit list.
+pub mod edit;
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -362,7 +364,7 @@ mod tests {
     /// produces another" shape that this codebase has already been bitten by
     /// and calls out by name elsewhere. The guard now checks the capability
     /// the tests actually need, not the binary's presence.
-    fn has_ffmpeg() -> bool {
+    pub(crate) fn has_ffmpeg() -> bool {
         static CHECKED: OnceLock<bool> = OnceLock::new();
         *CHECKED.get_or_init(|| {
             let ok = |c: &str| Command::new(c).arg("-version").output()

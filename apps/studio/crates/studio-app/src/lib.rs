@@ -4937,6 +4937,17 @@ impl App {
                 palette::ShellVerb::ExportDialog => {
                     self.export_dialog = Some(Default::default());
                 }
+                palette::ShellVerb::ExportVideo => {
+                    if self.export_run.is_some() {
+                        self.studio.status = "an export is already running".into();
+                    } else {
+                        let out = self.project_path.with_extension("mp4");
+                        self.export_done.clear();
+                        self.export_run = Some(export::start_video(
+                            self.studio.session.doc.project.clone(), self.audio.clone(), out,
+                            self.sink.rate().max(8_000), 1280, 720, 30));
+                    }
+                }
                 palette::ShellVerb::Settings => { self.settings_open = true; }
                 palette::ShellVerb::Workspace(ix) => self.apply_layout(ix as usize),
                 palette::ShellVerb::SharePattern => {

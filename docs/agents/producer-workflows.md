@@ -162,10 +162,11 @@ producers get started" without extra hardware.
 
 ## 5. Music video, as the maintainer wants it
 
-Nothing is built. The two cheap wins, in order: sync camera footage by
-audio (the existing `align` cross-correlation with a different source
-pair) and render an mp4 through the ffmpeg edit list `studio-video`
-already shells to. Camera capture on the phone is PipeWire/libcamera
+Both cheap wins are in as of c17: sync camera footage by audio (the
+existing `align` cross-correlation — a video source's audio is a
+`SourceAudio` like any other) and the mp4 render through ffmpeg's edit
+list (`studio_video::edit`, "export the music video"). Still not built:
+camera capture on the phone, which is PipeWire/libcamera
 through the portal. Realtime video playback is the expensive thing and is
 not needed for either win.
 
@@ -225,7 +226,13 @@ first phase is for.
    palette verbs for loop / comp / mute lanes. The README's "The second
    take". Still open inside it: the transcript-driven "best take" score
    (needs whisper on the machine).
-6. Video: align-by-audio, ffmpeg edit-list render.
+6. ~~Video: align-by-audio, ffmpeg edit-list render~~ — align-by-audio
+   already existed (`align_offset_ms` + `Studio::align_selected`, and
+   `slate::align` with a confidence — verified before writing a third);
+   the edit-list render is built (c17): `studio_video::edit` (the cut
+   list as timeline arithmetic, the ffmpeg command as a string, a real
+   render test that reads the frames back), `export::render_music_video`
+   / `start_video`, "export the music video" in the palette.
 7. ~~`Gate::Group` (a curve over a composition's hull)~~ — built (c17):
    `Project::group_hull`, gate kind 3 on the wire WITHOUT a bump (the
    parameter-target precedent: an unknown gate kind already refuses the

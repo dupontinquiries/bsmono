@@ -358,6 +358,73 @@ pub fn start_arrangement(
     Run { rx, cancel, jobs: n_jobs }
 }
 
+/// The music video: every video clip on the timeline cut into one mp4
+/// (top video track on top, black where none) over the arrangement's
+/// mixdown. Video sources whose files are not on disk are gaps; a
+/// timeline with no video at all is refused, since black over audio is
+/// not a video anyone asked for. Synchronous — the shell runs it on a
+/// worker. Returns the file written.
+pub fn render_music_video(
+    project: &Project,
+    audio: &std::collections::BTreeMap<studio_core::SourceId, SourceAudio>,
+    out: &Path,
+    rate: u32,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Result<PathBuf, String> {
+    let paths: std::collections::BTreeMap<studio_core::SourceId, PathBuf> = project.sources.values()
+        .filter(|s| s.has_video)
+        .map(|s| (s.id, PathBuf::from(&s.path)))
+        .filter(|(_, p)| p.is_file())
+        .collect();
+    let end = project.duration();
+    let list = studio_video::edit::edit_list(project, &paths, Some(end));
+    if !list.iter().any(|s| matches!(s, studio_video::edit::Segment::Cut(_))) {
+        return Err(if paths.is_empty() {
+            "no video on the timeline (or its files are not where the project says)".into()
+        } else { "no video clip on a video track".into() });
+    }
+    // The mixdown under it, as a WAV beside the output; removed after.
+    let stereo = studio_audio::mixdown(project, audio, &std::collections::BTreeMap::new(),
+                                       Ticks::ZERO, end, rate, &[], &[]);
+    let wav = out.with_extension("mix.wav");
+    let bytes = studio_audio::export::export_wav_dithered_bytes(&stereo, 2, rate, path_seed(out)).map_err(|e| e.to_string())?;
+    std::fs::write(&wav, bytes).map_err(|e| format!("{}: {e}", wav.display()))?;
+    let result = studio_video::edit::render(&list, Some(&wav), out, width, height, fps)
+        .map_err(|e| e.to_string());
+    let _ = std::fs::remove_file(&wav);
+    result.map(|()| out.to_path_buf())
+}
+
+/// [`render_music_video`] on a worker, reported through the same `Run`
+/// the audio exports use so the tracker window shows it. Cancel is not
+/// honoured mid-render: ffmpeg is one child process and this crate does
+/// not reach into it; the flag is checked only before it starts.
+pub fn start_video(
+    project: Project,
+    audio: std::collections::BTreeMap<studio_core::SourceId, SourceAudio>,
+    out: PathBuf,
+    rate: u32,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Run {
+    let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
+    std::thread::spawn(move || {
+        if flag.load(Ordering::Relaxed) { let _ = tx.send(Event::Cancelled); return; }
+        let _ = tx.send(Event::Progress { done: 0, jobs: 1, frac: 0.0 });
+        let _ = tx.send(Event::Note("rendering the video through ffmpeg — this takes a while".into()));
+        match render_music_video(&project, &audio, &out, rate, width, height, fps) {
+            Ok(p) => { let _ = tx.send(Event::File(p)); let _ = tx.send(Event::Done); }
+            Err(e) => { let _ = tx.send(Event::Failed(e)); }
+        }
+    });
+    Run { rx, cancel, jobs: 1 }
+}
+
 /// Render the rack-loop jobs — one `render_pattern` pass each, duplicated
 /// to both channels (the loop is mono by construction, and a stereo file
 /// is what every player expects).
@@ -435,6 +502,52 @@ pub fn pick_folder() -> Option<PathBuf> {
 }
 #[cfg(not(feature = "picker"))]
 pub fn pick_folder() -> Option<PathBuf> { None }
+
+#[cfg(test)]
+mod video_tests {
+    use super::*;
+    use studio_core::{Clip, Op, Source, SourceId, Track};
+
+    fn has_x264() -> bool {
+        std::process::Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output()
+            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(" libx264 "))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn the_music_video_is_the_timelines_cuts_over_the_mixdown_and_a_missing_file_is_a_gap() {
+        let tmp = std::env::temp_dir().join(format!("studio-mv-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video, name: "cam".into(),
+            muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Audio, name: "vox".into(),
+            muted: false, locked: false, gain: 1.0, route: None }, at: 1 }).unwrap();
+        // A video source whose file is NOT there: the render must refuse,
+        // saying so, rather than shell out to nothing.
+        let ghost = tmp.join("ghost.mp4");
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: ghost.to_string_lossy().into_owned(),
+            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1, has_video: true } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1), pos: Ticks::ZERO,
+            src_in: Ticks::ZERO, len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
+        let audio = std::collections::BTreeMap::new();
+        let out = tmp.join("mv.mp4");
+        let err = render_music_video(&p, &audio, &out, 48_000, 64, 48, 10).unwrap_err();
+        assert!(err.contains("not where the project says"), "{err}");
+        if !has_x264() { return; }
+        // Now a real fixture behind the same source.
+        let ok = std::process::Command::new("ffmpeg").args(["-y", "-f", "lavfi", "-i", "color=c=green:s=64x48:r=10:d=1",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", ghost.to_str().unwrap()]).output().unwrap();
+        assert!(ok.status.success());
+        let got = render_music_video(&p, &audio, &out, 48_000, 64, 48, 10).unwrap();
+        assert_eq!(got, out);
+        assert!(out.is_file());
+        assert!(!out.with_extension("mix.wav").exists(), "the mixdown WAV is cleaned up");
+        let probe = studio_video::probe(&out).unwrap();
+        assert!((probe.duration.to_seconds() - 1.0).abs() < 0.15, "{:?}", probe.duration);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
 
 #[cfg(test)]
 mod tests {
