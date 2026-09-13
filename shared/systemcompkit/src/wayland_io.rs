@@ -27,13 +27,16 @@ use crate::capture::{CaptureEvent, CaptureSession};
 use crate::idle::{IdleEvent, IdleTracker};
 use crate::layer::{KeyboardInteractivity, Layer, LayerEvent, LayerSurfaceIntent, LayerSurfaceState};
 use crate::toplevel::{ToplevelEvent, ToplevelTracker};
+use std::io::Write;
+use std::os::fd::AsFd;
 use cosmic_protocols::toplevel_info::v1::client::{
     zcosmic_toplevel_handle_v1::{self, ZcosmicToplevelHandleV1},
     zcosmic_toplevel_info_v1::{self, ZcosmicToplevelInfoV1},
 };
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{
-    wl_compositor::WlCompositor, wl_output::WlOutput, wl_registry, wl_seat::WlSeat, wl_surface::WlSurface,
+    wl_buffer::{self, WlBuffer}, wl_compositor::WlCompositor, wl_output::WlOutput, wl_registry, wl_seat::WlSeat,
+    wl_shm::{self, WlShm}, wl_shm_pool::{self, WlShmPool}, wl_surface::WlSurface,
 };
 use wayland_client::{event_created_child, Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
@@ -229,6 +232,34 @@ impl Dispatch<ZwlrLayerShellV1, ()> for LayerIoState {
     }
 }
 
+impl Dispatch<WlShm, ()> for LayerIoState {
+    fn event(_: &mut Self, _: &WlShm, _: wl_shm::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        // `Format` announcements only — Argb8888 is required by the spec
+        // to always be supported, which is the only format `paint_argb8888`
+        // uses, so there is nothing here worth tracking.
+    }
+}
+
+impl Dispatch<WlShmPool, ()> for LayerIoState {
+    fn event(_: &mut Self, _: &WlShmPool, _: wl_shm_pool::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        // wl_shm_pool has no events.
+    }
+}
+
+impl Dispatch<WlBuffer, ()> for LayerIoState {
+    fn event(_: &mut Self, buffer: &WlBuffer, event: wl_buffer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let wl_buffer::Event::Release = event {
+            // The compositor is done reading this buffer's contents —
+            // destroy the protocol object now rather than leaking one per
+            // `paint_argb8888` call. The backing tempfile/mmap (owned by
+            // the caller, not this Dispatch impl — see that method's own
+            // doc on why) is a separate lifetime question this doesn't
+            // touch.
+            buffer.destroy();
+        }
+    }
+}
+
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for LayerIoState {
     fn event(
         state: &mut Self,
@@ -260,27 +291,36 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for LayerIoState {
     }
 }
 
-/// A layer-shell surface, connected and live. Rendering/buffer-attach is
-/// deliberately NOT this crate's job — `wl_surface`, `wl_buffer`, and
-/// actually drawing something belong to whatever egui/uikit backend sits
-/// on top; this hands back the raw `WlSurface` so that backend can attach
-/// to it, and otherwise only handles the layer-shell protocol's own
-/// configure/ack/closed bookkeeping.
+/// A layer-shell surface, connected and live. GPU rendering is deliberately
+/// NOT this crate's job — attaching a Vulkan/EGL context to `wl_surface()`
+/// belongs to whatever backend sits on top (see `topbar-render`, and its
+/// own header on why that turned out to need `wayland-client`'s "system"
+/// feature — a real C-library dependency this crate's default build still
+/// doesn't carry). CPU/`wl_shm` painting is different: it's plain wire
+/// protocol (an fd passed over the same socket everything else here
+/// already uses), not a windowing-system-integration layer with its own
+/// C ABI, so `paint_argb8888` below lives here rather than pushing every
+/// consumer that just wants "put some pixels on screen, no GPU driver
+/// involved" through a second crate and a second connection.
 pub struct LayerSurface {
     conn: Connection,
     queue: EventQueue<LayerIoState>,
     io_state: LayerIoState,
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
+    shm: WlShm,
 }
 
 impl LayerSurface {
-    /// Connects, binds `wl_compositor` + `zwlr_layer_shell_v1`, creates a
-    /// surface, and requests it per `intent`. The surface is not yet
-    /// configured when this returns — call `poll()` at least once (and
-    /// generally every frame) before assuming `configured_size()` is
-    /// `Some`; a compositor sends the first `configure` asynchronously,
-    /// not as part of surface creation itself.
+    /// Connects, binds `wl_compositor` + `zwlr_layer_shell_v1` + `wl_shm`,
+    /// creates a surface, and requests it per `intent`. `wl_shm` is treated
+    /// as required (`MissingGlobal` if absent) same as the other two: the
+    /// spec requires every compositor to support it, and `paint_argb8888`
+    /// needs it. The surface is not yet configured when this returns —
+    /// call `poll()` at least once (and generally every frame) before
+    /// assuming `configured_size()` is `Some`; a compositor sends the
+    /// first `configure` asynchronously, not as part of surface creation
+    /// itself.
     pub fn connect(intent: LayerSurfaceIntent, namespace: &str) -> Result<Self, ConnectError> {
         let conn = Connection::connect_to_env().map_err(|e| ConnectError::NoDisplay(e.to_string()))?;
         let (globals, queue) = registry_queue_init::<LayerIoState>(&conn)
@@ -291,6 +331,7 @@ impl LayerSurface {
             globals.bind(&qh, 1..=6, ()).map_err(|_| ConnectError::MissingGlobal("wl_compositor"))?;
         let shell: ZwlrLayerShellV1 =
             globals.bind(&qh, 1..=4, ()).map_err(|_| ConnectError::MissingGlobal("zwlr_layer_shell_v1"))?;
+        let shm: WlShm = globals.bind(&qh, 1..=1, ()).map_err(|_| ConnectError::MissingGlobal("wl_shm"))?;
 
         let surface = compositor.create_surface(&qh, ());
         let wire_layer = match intent.layer {
@@ -334,6 +375,7 @@ impl LayerSurface {
             io_state: LayerIoState { state: LayerSurfaceState::new() },
             surface,
             layer_surface,
+            shm,
         })
     }
 
@@ -378,6 +420,52 @@ impl LayerSurface {
 
     pub fn is_closed(&self) -> bool {
         self.io_state.state.closed
+    }
+
+    /// Paints `pixels` (tightly-packed BGRA bytes — wl_shm's `Argb8888` is
+    /// little-endian-BGRA in memory, not byte-order-ARGB; get this wrong
+    /// and every pixel's red/blue channels swap) onto this surface and
+    /// commits it. `pixels.len()` must equal `width * height * 4`.
+    ///
+    /// Pure wire protocol, no C library: `wl_shm_pool` shares memory with
+    /// the compositor by passing a file descriptor over the same Unix
+    /// socket `wayland-client`'s pure-Rust backend already speaks for
+    /// every other request in this crate — unlike a Vulkan/EGL surface,
+    /// there is no windowing-system-integration C ABI involved here at
+    /// all. That's what makes this the actually-portable rendering path
+    /// across mixed GPU-driver-quality hardware, not a consolation prize:
+    /// see `topbar-render`'s own notes on Lima (Mali-400/450, e.g.
+    /// PinePhone) having no Vulkan driver at all and no path to get one —
+    /// this works identically regardless of what GPU (or whether a GPU
+    /// driver exists at all) sits under the compositor.
+    ///
+    /// Known simplification, stated rather than hidden: allocates a fresh
+    /// `tempfile` + `wl_shm_pool` + `wl_buffer` on every call rather than
+    /// reusing a double-buffered pool. Correct — the `Release` event
+    /// handler above destroys each buffer once the compositor is done
+    /// with it, so nothing leaks — but wasteful for a real per-frame paint
+    /// loop. Buffer reuse is real follow-up work, not done here.
+    pub fn paint_argb8888(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<(), String> {
+        let stride = width as i32 * 4;
+        validate_argb8888_len(pixels.len(), width, height)?;
+
+        let mut file = tempfile::tempfile().map_err(|e| format!("tempfile for shm buffer: {e}"))?;
+        file.write_all(pixels).map_err(|e| format!("write shm buffer contents: {e}"))?;
+        file.flush().map_err(|e| e.to_string())?;
+
+        let qh = self.queue.handle();
+        let pool = self.shm.create_pool(file.as_fd(), stride * height as i32, &qh, ());
+        let buffer = pool.create_buffer(0, width as i32, height as i32, stride, wl_shm::Format::Argb8888, &qh, ());
+        // The pool itself is only needed to create the buffer; the spec
+        // allows destroying it immediately afterward — the buffer keeps
+        // the underlying shm mapping alive on the compositor side until
+        // its own `Release` event.
+        pool.destroy();
+
+        self.surface.attach(Some(&buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, width as i32, height as i32);
+        self.surface.commit();
+        self.flush()
     }
 
     /// The live connection this surface is on — needed by anything that
@@ -857,5 +945,31 @@ impl OutputCaptureSession {
 
     pub fn flush(&self) -> Result<(), String> {
         self.conn.flush().map_err(|e| e.to_string())
+    }
+}
+
+/// Pulled out of `LayerSurface::paint_argb8888` purely so it's
+/// unit-testable — the rest of that method needs a live compositor
+/// connection and can't be, same ceiling as everything else in this file.
+fn validate_argb8888_len(len: usize, width: u32, height: u32) -> Result<(), String> {
+    let expected = width as usize * height as usize * 4;
+    if len != expected {
+        return Err(format!("paint_argb8888: expected {expected} bytes for {width}x{height}, got {len}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod paint_tests {
+    use super::validate_argb8888_len;
+
+    #[test]
+    fn rejects_a_buffer_shorter_than_width_times_height_times_4() {
+        assert!(validate_argb8888_len(10, 4, 4).is_err());
+    }
+
+    #[test]
+    fn accepts_an_exactly_sized_buffer() {
+        assert!(validate_argb8888_len(4 * 4 * 4, 4, 4).is_ok());
     }
 }

@@ -2,7 +2,7 @@
 name = "systemcompkit"
 version = "0.1.0"
 edition = "2021"
-description = "Compositor-integration state-tracking, pure and hardware-free-testable, for a shell built with eguikit over cosmic-comp: toplevel list (app-switcher), idle/lock timing, layer-shell surface intent. Mirrors bt-kit's own split (see that crate's description): the actual wayland-client/wayland-protocols wiring is a thin, feature-gated layer in `wayland_io`, off by default, so nothing in the monorepo that only wants the tracking logic pays smithay/wayland-client's compile cost."
+description = "Compositor-integration state-tracking, pure and hardware-free-testable, for a shell built with eguikit over cosmic-comp: toplevel list (app-switcher), idle/lock timing, layer-shell surface intent. Mirrors bt-kit's own split (see that crate's description): the actual wayland-client/wayland-protocols wiring is a thin, feature-gated layer in `wayland_io`, off by default, so nothing in the monorepo that only wants the tracking logic pays smithay/wayland-client's compile cost. That feature-gated layer also includes a wl_shm CPU paint primitive (LayerSurface::paint_argb8888) — plain wire protocol, no C ABI, no GPU driver — deliberately kept separate from GPU rendering (Vulkan/EGL), which needs wayland-client's additional 'system' feature (libwayland-client.so) and lives in the separate topbar-render crate instead."
 
 [lib]
 name = "systemcompkit"
@@ -15,12 +15,19 @@ default = []
 # reason to link a Wayland client library just to get the pure tracking
 # logic, and only whatever becomes the actual compositor-facing shell needs
 # the real thing.
-wayland_io = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-wlr", "dep:cosmic-protocols"]
+wayland_io = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-wlr", "dep:cosmic-protocols", "dep:tempfile"]
 
 [dependencies]
 wayland-client = { version = "0.31", optional = true }
 wayland-protocols = { version = "0.32", features = ["client", "staging"], optional = true }
 wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
+# Backing storage for LayerSurface::paint_argb8888's wl_shm buffers. A
+# plain (auto-deleted) file is all wl_shm needs — no memfd_create/sealing
+# machinery required, and no C library: this is a thin wrapper over
+# open()+unlink() via the `rustix`/`libc` crates it depends on, same
+# category of dependency as std's own filesystem calls, not a windowing
+# C ABI like libwayland-client.
+tempfile = { version = "3", optional = true }
 # COSMIC's own toplevel extension (state/title/app_id/closed) layered on
 # the standard ext-foreign-toplevel-list handle -- confirmed from the
 # protocol XML itself, not the crate's own shipped example, which
