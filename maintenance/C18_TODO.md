@@ -340,3 +340,65 @@ the same convention.
 Clean runs after all of it: `lock_check` stale 0/143, `eframe_backend_check`
 all explicit, `aarch64_flags_check` clean, `archive_check` complete provenance,
 `voiceprint_parity_check` PASS, `board_gestures_parity_check` PASS.
+
+## 12. Two crates gate real code on features that do not exist
+
+`cfg_feature_check.py` (new) scans every crate's `src/` for
+`#[cfg(feature = "x")]` and `cfg!(feature = "x")` and checks `x` against the
+manifest's `[features]` plus its optional dependencies. Two hits in 321 crates,
+and both are live bugs rather than tidiness.
+
+### `apps/rusty-board` — `llm-swipe-ffi`, 9 sites
+
+`src/gestures/llm_swipe.rs` (455 lines) gates its entire real implementation on
+a feature `Cargo.toml` does not declare. Confirmed by resolution, not by
+reading: `cargo tree --features llm-swipe-ffi` gives
+`error: the package 'rusty-board' does not contain this feature`, while
+`--features llm` resolves fine.
+
+Consequences, compounding:
+
+* the real `RerankerInner` — the one holding a loaded GGUF model — has never
+  been compiled, so it has never been type-checked. It references
+  `crate::llm_backend::{LoadedModel, GenParams, load_model, generate}`, and
+  **there is no `llm_backend` module in rusty-board**; the crate has `src/llm/`
+  instead. The only `llm_backend` in the tree is logscope's, so this was
+  adapted from there and never rewired. It could not compile even if the
+  feature were declared.
+* the `cfg(not(...))` mock arm therefore compiles unconditionally and is
+  permanently the real path.
+* `RerankerError::NotCompiledIn` reads "build with --features llm-swipe-ffi",
+  which is an instruction that errors out.
+* nothing outside the file references `LlmSwipeReranker` — grepped across the
+  whole repo, per CLAUDE.md §8, not just the one directory.
+* three docs name the feature three different ways: `llm-swipe-ffi` in the
+  code, `llama-ffi` and `llm` in `docs/QT_REWRITE_HANDOFF.md`. None exists.
+
+`config.rs` still exposes `llm_swipe_enabled` and `llm_swipe_model_path` as
+user settings, so the config surface advertises a feature that is mock-only.
+
+This is unfinished work, not superseded work, so §7b's archive path is not
+obviously right either — deleting it loses a design, declaring the feature
+hands the next person a build error. It needs a decision, and it is 455 lines
+of the swipe path nobody can currently reach.
+
+### `games/unendlich/crates/voxel-tools/harness` — `ai-engine` / `ai-gpu`, 19 sites
+
+The harness crate has an EMPTY `[features]` section, and the parent
+`voxel-tools` does not declare these either. `paintbrush.rs` branches on both,
+including a `cfg(all(feature = "ai-gpu", not(feature = "ai-engine")))` that can
+never be true. Not read in depth; recorded with the same shape as above.
+
+### Note on the checker
+
+rustc's `unexpected_cfgs` lint covers part of this since 1.80, but it is a
+warning among many and it says nothing about a crate nobody currently
+compiles — which is the state both of these are in.
+
+One false positive was found and designed out rather than tolerated:
+`apps/voiceterm/src/build_diagnostics.rs` embeds captured compiler output as a
+string literal containing `#[cfg(feature = "winit")]`. The checker only counts
+an attribute that opens a line, or the `cfg!()` macro. Verified by injecting
+that exact string-literal shape into a clean crate and confirming it is not
+flagged, alongside three positive break tests (declare the missing feature →
+that crate drops off; inject a phantom cfg into crypto-kit → caught by name).
