@@ -202,3 +202,141 @@ Settled by reading the lockfile, not by reasoning about the checker.
 The generalisable bit: a checker with a documented false-positive class will
 launder a true positive of the same shape. The first-hop asymmetry in
 `path_deps` is still there and is worth either fixing or explaining.
+
+---
+
+# Second pass
+
+## 7. The near-duplicate band is where the risk is, and it is a different list
+
+§4's byte-identical scan found four sets outside the snapclone fork and read
+as "this tree is clean". That was the wrong instrument for the question.
+Byte-identical copies have not drifted *yet*; the ones that have are invisible
+to a hash.
+
+Re-scanned comparing normalised line SETS (comments and blanks stripped) for
+same-named files, reporting the 55–99% band. 27 pairs. The band matters:
+100% is §4's list, and unrelated files never reach 55%.
+
+Ranked by lines at risk:
+
+| lines | pair | similarity |
+|---|---|---|
+| 19070 | `games/blackstar-rs/src` ↔ `games/skydribble/src`, 15 modules | 55–100% |
+| 2421 | `bo-suite/bo-mux` ↔ `bo-suite/bo-controller`, 4 modules | 69–99% |
+| 2233 | `rusty-board/src/gestures` ↔ `crates/board-gestures`, 2 modules | 95–97% |
+| 150 | `voiceterm/src/whisper_pool.rs` ↔ `logscope-egui/src/whisper_pool.rs` | 89% |
+| 443 | `bot-arena/src/fsm.rs` ↔ `unendlich/docs/.../reference/fsm.rs` | 99% |
+
+The rusty-board pair is now guarded (`board_gestures_parity_check.py`,
+`2f63ae549`). The rest are below.
+
+## 8. blackstar-rs and skydribble are one forked engine — the largest kit candidate outside snapclone
+
+Fifteen same-named modules, **19,070 normalised lines** on the blackstar side:
+
+    100.0%   346  fx.rs          92.7%  4033  world.rs
+    100.0%   299  gyro.rs        89.7%   804  meshgen.rs
+    100.0%    78  platform.rs    87.2%   711  bots.rs
+     98.9%    99  font.rs        82.7%  1111  render.rs
+     96.8%   259  partcars.rs    82.2%  6338  sim.rs
+                                 81.2%   680  procars.rs
+                                 72.2%   409  config.rs
+                                 68.6%  1920  physics.rs
+                                 59.6%   515  sound.rs
+                                 55.5%  1468  hud.rs
+
+`games/shared/` already exists (bsweb, isosurface, linebank, netcode,
+perfbisect, shellkit, worldhost). The three at 100% (`fx`, `gyro`, `platform`,
+723 lines) can move today with no reconciliation; `gyro.rs` should go wherever
+§2's IIO source layer lands rather than into a game crate.
+
+`world.rs` at 92.7% of 4033 lines and `sim.rs` at 82.2% of 6338 are not a
+tidy-up — they are a decision about whether the two games share an engine.
+Worth answering before either grows further, but not a commit.
+
+## 9. bo-suite duplicates 2421 lines of DSP between two crates in ONE app, and already has the dependency
+
+The easiest of the three by a distance, and the one I would do first if it
+could be compiled here.
+
+    99.2%  1209  passby_canceller.rs
+    90.6%   407  masker.rs
+    72.3%   666  drone_canceller.rs
+    69.4%   139  cancel_tones.rs
+
+Both crates are members of the same workspace. `bo-mux/src/lib.rs` already
+declares `pub mod passby_canceller;`. `bo-controller/Cargo.toml` **already
+depends on bo-mux** — added for `mux_bridge.rs`, with a comment noting the
+dependency had been missing. And `bo-controller/src/main.rs` declares its own
+`mod passby_canceller;` beside it.
+
+So the fix for the 1209-line file is: delete
+`bo-controller/src/passby_canceller.rs`, swap `mod passby_canceller;` for
+`use bo_mux::passby_canceller;`, done. Nothing to reconcile either — the only
+difference between the two copies is that bo-mux's carries an extra test
+assertion (that the FSM leaves Peak rather than stalling). bo-mux's copy is a
+strict superset.
+
+`masker.rs` at 90.6% needs the diff read. `drone_canceller` and `cancel_tones`
+have genuinely diverged and are separate work.
+
+**Not done here because bo-controller declares `qmetaobject = "0.2"` and Qt6
+is not installable in this sandbox** (CLAUDE.md §8). An unverifiable edit to
+the module wiring of a binary I cannot compile is exactly what that rule is
+about. Two comments in the same crate —
+`drone_canceller.rs:457` ("Shared helpers (mirrored from passby_canceller for
+now)") and `frequency_shifter.rs:81` ("inlined here so…") — say a third layer
+of the same duplication is already known and accepted.
+
+## 10. Dependency version fragmentation: one free win taken, five real ports left
+
+`fleet_build.sh` compiles every app into ONE shared target directory, so a
+dependency resolved to N versions is N compilations in the fleet build.
+
+Counting resolved versions across all 143 lockfiles, the wgpu family (wgpu,
+wgpu-core, wgpu-hal, naga, wgpu-types) was **30 distinct compilation units**.
+
+Five of those were pure lockfile drift — four workspaces on 29.0.3 against
+thirty-two on 29.0.4, both declaring `wgpu = "29"`, nothing pinned. Unified in
+`69bc263f1`: **30 → 25**, no manifest edit, no code change, gpu-gemm verified
+building against it.
+
+What remains is real and each needs a port:
+
+| wgpu | workspaces |
+|---|---|
+| 29.0.4 | 32 — the mainstream |
+| 22.1.0 | blackstar-rs, clawbound, skydribble, soldier, snapclone/camera-bridge |
+| 0.19.4 | fao-codec, blackstar/foldview, **clawbound-battleground**, road-warrior |
+| 24.0.5 | echelon/client |
+| 27.0.1 | beatspace |
+
+**`clawbound-battleground` is on wgpu 0.19 and glam 0.27** — the oldest in the
+tree — while its sibling `games/clawbound` is on wgpu 22 and everything else
+on glam 0.28. That crate came in with this session's merge (`5adbcae1e`), so
+the merge added the tree's most out-of-date GPU stack. Worth a look before it
+sets.
+
+egui is in better shape: 44 declarations on 0.34, with 0.27 (×2), 0.28 and
+0.29 outstanding. Two of those four are already recorded as
+`font_install_check.py` known misses BLOCKED ON A VERSION BUMP, so the version
+spread and the boxed-glyph bug are the same problem.
+
+Also checked and NOT a bug: `games/echelon` pins `serde = "=1.0.203"` exactly,
+which looks like the sort of pin that forces a duplicate build. Its comment
+says it is deliberate, for distro rustc 1.75, and names `apps/bot-arena` as
+the same convention.
+
+## 11. Fixed this pass
+
+* `card-diagnoser` never called `uikit_egui::fonts::install`, so the arrows in
+  `reader.rs` rendered as boxes (`4fe8b6145`). It already had the uikit-egui
+  dependency, so unlike the switcheroo case the checker was written for, this
+  was a one-liner. `font_install_check.py` now reports no MISSING.
+* wgpu 29.0.3 → 29.0.4, above.
+* `board_gestures_parity_check.py`, §7.
+
+Clean runs after all of it: `lock_check` stale 0/143, `eframe_backend_check`
+all explicit, `aarch64_flags_check` clean, `archive_check` complete provenance,
+`voiceprint_parity_check` PASS, `board_gestures_parity_check` PASS.
