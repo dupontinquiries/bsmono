@@ -2479,6 +2479,11 @@ pub struct App {
     /// playhead beside the rack, instead of export → import → watch.
     side_slot: SideSlot,
     frame_cache: viewport::FrameCache,
+    /// The program monitor above the timeline: the frame under the playhead from the
+    /// topmost video track — the same clip choice the export makes (`viewport::video_at`)
+    /// — with the arrangement's audio already coming through the mixdown. Toggled from
+    /// the bar; the workbench's viewport side slot is the same picture in another place.
+    preview_open: bool,
     /// `None` until the person picks a key — autotune has no sensible
     /// default scale, and silently tuning to C minor because nobody chose
     /// anything is a worse failure than making "tune take" wait.
@@ -2611,6 +2616,7 @@ impl Default for App {
                   _ => SideSlot::Viewport,
               },
               frame_cache: viewport::FrameCache::default(),
+              preview_open: true,
               export_dialog: None,
               export_note: String::new(),
               export_run: None,
@@ -2993,6 +2999,10 @@ impl eframe::App for App {
                     .on_hover_text("timeline above, rack/program/mixer below — instead of tabs")
                     .clicked() { combined = !combined; }
                 self.studio.combined = combined;
+                if ui.add(egui::Button::selectable(self.preview_open, "preview"))
+                    .on_hover_text("program monitor above the timeline: the frame under the playhead \
+                                    from the topmost video track, the clip the export takes; audio is the mixdown")
+                    .clicked() { self.preview_open = !self.preview_open; }
                 // The playhead's visible controls. `g g` and `g e` have
                 // always done this; nothing on screen said so, which
                 // meant a new user had no way back to the start at all.
@@ -3949,6 +3959,24 @@ impl eframe::App for App {
                         Panel::Timeline => {}
                     }
                 });
+        }
+        let timeline_showing = matches!(if self.studio.combined { Panel::Timeline } else { self.studio.panel }, Panel::Timeline);
+        if timeline_showing && self.preview_open {
+            egui::Panel::top("program").resizable(true).default_size(220.0).show(ctx, |ui| {
+                let project = &self.studio.session.doc.project;
+                let ph = self.studio.playhead();
+                let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("program").strong());
+                    let secs = ph.0 as f64 / studio_core::TICKS_PER_SECOND as f64;
+                    ui.label(egui::RichText::new(format!("{:02}:{:06.3}", (secs / 60.0) as u64, secs % 60.0)).monospace());
+                    match viewport::video_at(project, ph) {
+                        Some((path, _)) => { ui.label(egui::RichText::new(format!("← {}", std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())).weak().small()); }
+                        None => { ui.label(egui::RichText::new("no video under the playhead").weak().small()); }
+                    }
+                });
+                viewport::show(ui, project, ph, &base, &mut self.frame_cache, &colors);
+            });
         }
         egui::CentralPanel::default().show(ctx, |ui| {
             // The central panel's scroll report, when the panel has one.
