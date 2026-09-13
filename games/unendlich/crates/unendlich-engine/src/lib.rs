@@ -9,6 +9,9 @@
 
 pub mod assets;
 pub mod touch_controls;
+/// Phone detection (UI scale + touch mode from content scale / framebuffer /
+/// session env) and the on-screen control layout. Pure.
+pub mod mobile_ui;
 pub mod pngutil;
 pub mod constants;
 pub mod scale;

@@ -3651,6 +3651,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
         .map(|p| p.join("unendlich/settings.json"))
         .unwrap_or_else(|_| std::path::PathBuf::from("unendlich-settings.json"));
+    let mut settings_had_gui_scale = false;
     if let Ok(txt) = std::fs::read_to_string(&settings_path) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
             let g = |k: &str| v.get(k).cloned().unwrap_or(serde_json::Value::Null);
@@ -3662,7 +3663,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             if let Some(n) = g("leaf_stride").as_u64() { renderer.ui_leaf_stride = n; }
             if let Some(n) = g("apply_budget").as_u64() { renderer.ui_apply_budget = n as u32; }
             if let Some(n) = g("render_distance").as_i64() { renderer.ui_render_distance = (n as i32).clamp(2, 32); } // r197
-            if let Some(f) = g("gui_scale").as_f64() { renderer.ui_scale = (f as f32).clamp(1.0, 3.0); } // r200
+            if let Some(f) = g("gui_scale").as_f64() {
+                renderer.ui_scale = (f as f32).clamp(unendlich_engine::mobile_ui::UI_SCALE_MIN, unendlich_engine::mobile_ui::UI_SCALE_MAX); // r200
+                settings_had_gui_scale = true;
+            }
             if let Some(n) = g("fps_target").as_u64() { renderer.ui_fps_target = n as u32; }
             if let Some(b) = g("autotune").as_bool() { renderer.ui_autotune = b; }
             if let Some(n) = g("gpu_mesh_yield").as_u64() { renderer.ui_gpu_mesh_yield = n.min(200); }
@@ -3672,6 +3676,44 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             log::info!("[settings] loaded {}", settings_path.display());
         }
     }
+    // r-mobile: PHONE DETECTION. The game came up at ui_scale 2.0 on every
+    // panel and had no touch controls (touch_controls has the model,
+    // InputCache the seam, nothing fed either). Decide from what the platform
+    // can tell us — GLFW content scale, framebuffer, the session env — with
+    // UNENDLICH_UI_SCALE / UNENDLICH_TOUCH overriding and a saved gui_scale
+    // kept. Logged with the rule that decided it.
+    let (touch_mode, mobile_detect) = {
+        use unendlich_engine::mobile_ui::{detect, Hints};
+        let (cs_x, _cs_y) = window.get_content_scale();
+        let (fbw, fbh) = window.get_framebuffer_size();
+        let envf = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<f32>().ok());
+        let hints = Hints {
+            content_scale: Some(cs_x).filter(|s| s.is_finite() && *s > 0.0),
+            fb: Some((fbw.max(0) as u32, fbh.max(0) as u32)),
+            env_ui_scale: envf("UNENDLICH_UI_SCALE"),
+            env_touch: std::env::var("UNENDLICH_TOUCH").ok().map(|v| v.trim() != "0"),
+            toolkit_scale: envf("GDK_SCALE").or_else(|| envf("QT_SCALE_FACTOR")),
+            desktop: std::env::var("XDG_CURRENT_DESKTOP").ok().or_else(|| std::env::var("DESKTOP_SESSION").ok()),
+            session_type: std::env::var("XDG_SESSION_TYPE").ok(),
+            saved_ui_scale: if settings_had_gui_scale { Some(renderer.ui_scale) } else { None },
+        };
+        let d = detect(&hints);
+        renderer.ui_scale = d.ui_scale;
+        log::info!(
+            "[mobile] ui_scale {:.2} ({}), touch {}, phone {} — content scale {:.2}, fb {}x{}, desktop {:?}",
+            d.ui_scale, d.reason, d.touch, d.phone, cs_x, fbw, fbh, hints.desktop
+        );
+        (d.touch, d)
+    };
+    let _ = &mobile_detect;
+    let mut touch_layout = {
+        let (fbw, fbh) = window.get_framebuffer_size();
+        unendlich_engine::mobile_ui::layout(fbw as f32, fbh as f32, renderer.ui_scale)
+    };
+    let mut pointer_touch = unendlich_engine::mobile_ui::PointerTouch::default();
+    // The world owns the pointer (no UI open) as of the previous frame — the
+    // event loop runs before this frame's UI state is known.
+    let mut touch_world_prev = false;
     fn save_settings(path: &std::path::Path, r: &unendlich_engine::render::world_renderer::WorldRenderer) {
         let v = serde_json::json!({
             "fog": r.ui_fog_on, "shadows": r.ui_shadows_on,
@@ -3912,6 +3954,40 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // pass through, which is what you want — you can aim at where
             // a build should go while describing it.
             let chat_owns_keys = chat_focus;
+            // r-mobile: in touch mode, while the world owns the pointer, the
+            // compositor's emulated mouse IS the finger: a press on an
+            // on-screen button owns that button, any other press is the
+            // stick (left half) or the look drag (right half). Those events
+            // never reach InputCache as mouse events — a tap must not punch.
+            let touch_routed = if touch_mode && touch_world_prev {
+                match event {
+                    WindowEvent::MouseButton(MouseButtonLeft, Action::Press, _) => {
+                        let (cx, cy) = window.get_cursor_pos();
+                        let (ww, wh) = window.get_size();
+                        let (fbw, fbh) = window.get_framebuffer_size();
+                        let sx = if ww > 0 { fbw as f64 / ww as f64 } else { 1.0 };
+                        let sy = if wh > 0 { fbh as f64 / wh as f64 } else { 1.0 };
+                        pointer_touch.press((cx * sx) as f32, (cy * sy) as f32, &touch_layout);
+                        true
+                    }
+                    WindowEvent::MouseButton(MouseButtonLeft, Action::Release, _) => {
+                        pointer_touch.release();
+                        true
+                    }
+                    WindowEvent::CursorPos(cx, cy) => {
+                        let (ww, wh) = window.get_size();
+                        let (fbw, fbh) = window.get_framebuffer_size();
+                        let sx = if ww > 0 { fbw as f64 / ww as f64 } else { 1.0 };
+                        let sy = if wh > 0 { fbh as f64 / wh as f64 } else { 1.0 };
+                        pointer_touch.moved((cx * sx) as f32, (cy * sy) as f32);
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if !touch_routed {
             if let Some(ev) = unendlich_engine::input_codes::input_event_from_glfw(&event) {
                 // Both key variants: an UnknownKey is still a keystroke
                 // the chat is consuming, and letting it through would
@@ -3922,6 +3998,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 if !(chat_owns_keys && is_key) {
                     input.handle_event(&ev);
                 }
+            }
             }
             match event {
                 // Chat keys first, through the ONE routing function shared
@@ -3970,6 +4047,74 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
                 _ => {}
             }
+        }
+
+        // r-mobile: hand this frame's finger to the touch model and the
+        // buttons to the keys they stand for. A held button (jump, attack,
+        // sprint, sneak) is a key held; a tap (inventory) is a press that
+        // releases at once; Menu is the Esc path; Use is the right button.
+        if touch_mode {
+            use unendlich_engine::input_codes::{InputEvent, KeyAction, MouseBtn, TouchPhase};
+            use unendlich_engine::keybindings::GameAction;
+            use unendlich_engine::mobile_ui::ButtonKind;
+            if let Some((w, h)) = needs_resize {
+                touch_layout = unendlich_engine::mobile_ui::layout(w as f32, h as f32, renderer.ui_scale);
+            }
+            for t in pointer_touch.touches.drain(..) {
+                let phase = match t.phase {
+                    unendlich_engine::touch_controls::Phase::Start => TouchPhase::Start,
+                    unendlich_engine::touch_controls::Phase::Move => TouchPhase::Move,
+                    unendlich_engine::touch_controls::Phase::End => TouchPhase::End,
+                };
+                input.handle_event(&InputEvent::Touch { id: t.id, x: t.x, y: t.y, phase });
+            }
+            let action_of = |b: ButtonKind| match b {
+                ButtonKind::Jump => Some(GameAction::Jump),
+                ButtonKind::Sprint => Some(GameAction::Sprint),
+                ButtonKind::Sneak => Some(GameAction::Sneak),
+                ButtonKind::Inventory => Some(GameAction::OpenInventory),
+                _ => None,
+            };
+            let tapped: Vec<ButtonKind> = pointer_touch.tapped.drain(..).collect();
+            let released: Vec<ButtonKind> = pointer_touch.released.drain(..).collect();
+            for b in tapped {
+                match b {
+                    ButtonKind::Attack => input.handle_event(&InputEvent::MouseButton { button: MouseBtn::Left, action: KeyAction::Press }),
+                    ButtonKind::Use => {
+                        input.handle_event(&InputEvent::MouseButton { button: MouseBtn::Right, action: KeyAction::Press });
+                        input.handle_event_late(&InputEvent::MouseButton { button: MouseBtn::Right, action: KeyAction::Release });
+                    }
+                    ButtonKind::Menu => esc_pressed = true,
+                    other => {
+                        if let Some(a) = action_of(other) {
+                            if let Some(k) = bindings.keys_for_action(a).first().copied() {
+                                input.handle_event(&InputEvent::Key { code: k, action: KeyAction::Press });
+                                if !other.is_held() {
+                                    input.handle_event_late(&InputEvent::Key { code: k, action: KeyAction::Release });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for b in released {
+                match b {
+                    ButtonKind::Attack => input.handle_event(&InputEvent::MouseButton { button: MouseBtn::Left, action: KeyAction::Release }),
+                    other if other.is_held() => {
+                        if let Some(a) = action_of(other) {
+                            if let Some(k) = bindings.keys_for_action(a).first().copied() {
+                                input.handle_event(&InputEvent::Key { code: k, action: KeyAction::Release });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // dt is computed further down the frame; the touch clock uses the
+            // wall time since the previous frame directly (same source).
+            let touch_dt = last_frame.elapsed().as_secs_f32().min(0.1);
+            let (fbw, _) = window.get_framebuffer_size();
+            input.tick_touch(touch_dt, fbw as f32);
         }
 
         // Carry-aware: a late-drained Esc shows up as just-pressed next frame.
@@ -4969,7 +5114,21 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             input.cursor_delta = (0.0, 0.0);
             log::info!("[ui] cursor released to UI (authority)");
         }
-        if !mouse_captured && !any_ui_owns_cursor && input.is_mouse_button_just_pressed(MouseBtn::Left) {
+        if touch_mode {
+            // r-mobile: a touchscreen has no cursor to disable — the look drag
+            // is a finger delta the touch model folds into cursor_delta. The
+            // world "captures" whenever no UI is open.
+            let want = !any_ui_owns_cursor;
+            if want != mouse_captured {
+                mouse_captured = want;
+                input.cursor_delta = (0.0, 0.0);
+                if !want {
+                    input.touch.clear();
+                    pointer_touch = unendlich_engine::mobile_ui::PointerTouch::default();
+                }
+            }
+            touch_world_prev = want;
+        } else if !mouse_captured && !any_ui_owns_cursor && input.is_mouse_button_just_pressed(MouseBtn::Left) {
             window.set_cursor_mode(CursorMode::Disabled);
             mouse_captured = true;
             // Reset deltas so we don't snap on first frame.
@@ -8094,6 +8253,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         if bindings.is_action_pressed(GameAction::MoveBackward, &input) { move_local.x -= 1.0; }
         if bindings.is_action_pressed(GameAction::MoveRight, &input)    { move_local.z += 1.0; }
         if bindings.is_action_pressed(GameAction::MoveLeft, &input)     { move_local.z -= 1.0; }
+        // r-mobile: the virtual stick, as an axis (up on the glass = forward).
+        if touch_mode {
+            let [sx, sy] = input.move_axes();
+            move_local.x += -sy;
+            move_local.z += sx;
+        }
 
         // r600 (soak-with-movement): under UNENDLICH_AUTOPLAY, once in-world,
         // walk. A steady forward push with a slow yaw drift traces a wide
@@ -13277,6 +13442,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // `ui_mouse_down` was set only in the top drain, leaving egui stuck
             // "pressed" on late releases → clicks became window drags.)
             renderer.ui_pointer_down = input.is_mouse_button_pressed(MouseBtn::Left);
+            // r-mobile: the on-screen controls, drawn by the HUD when in-world
+            renderer.touch_overlay = if touch_mode && touch_world_prev {
+                Some(unendlich_engine::render::world_renderer::TouchOverlay {
+                    layout: touch_layout.clone(),
+                    stick: input.touch.stick(),
+                    held: pointer_touch.held_button.into_iter().collect(),
+                })
+            } else {
+                None
+            };
             renderer.ui_pointer2_down = input.is_mouse_button_pressed(MouseBtn::Right); // r186
             // Clicks whose press+release collapse into one frame (low fps)
             // produce no level edge; forward them as discrete clicks.
