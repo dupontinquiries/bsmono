@@ -62,6 +62,7 @@ impl Permission {
 pub mod album;
 pub mod gallery_grid;
 pub mod peers;
+pub mod chunk_sync;
 
 // Configuration
 #[derive(Debug, Clone, Copy, PartialEq)]
