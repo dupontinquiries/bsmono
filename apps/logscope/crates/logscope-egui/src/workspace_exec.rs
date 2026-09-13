@@ -1959,13 +1959,110 @@ pub enum Rejected {
 /// stop being invisible.
 pub fn parse_tools_reported(text: &str) -> (Vec<Tool>, Vec<Rejected>) {
     let (mut out, mut bad) = (Vec::new(), Vec::new());
-    for block in extract_blocks(text) {
+    for raw in extract_blocks(text) {
+        let block = canonical_block(&raw);
         match parse_one(&block) {
             Some(t) => out.push(t),
             None => bad.push(diagnose(&block)),
         }
     }
     (out, bad)
+}
+
+/// A tool call as a model actually wrote it, before the per-tool field logic sees it: the name
+/// may come from a tag (`<function=NAME>`) rather than from the JSON, and the arguments may be
+/// nested under `arguments` / `parameters` (the shapes models are TRAINED on) rather than flat.
+struct RawCall { name: Option<String>, body: String }
+
+/// Rewrite a raw call into the flat `{"tool": NAME, ...args}` shape `parse_one` and `diagnose`
+/// were written against, so every family's native format reaches the same field logic.
+///
+/// Why this exists — the field failure in C13 §57, read against chatllm.cpp's per-family tool
+/// handlers (scripts/tool_*.py): a model emits the format it was trained on, and the ladder then
+/// tells it "no valid tool call" for a call that was well-formed in its own grammar. The repeat
+/// is not the model failing to correct; it is the model correctly re-emitting its native format.
+///   Qwen2.5 / Qwen3 / Hermes   <tool_call>{"name": F, "arguments": {..}}</tool_call>
+///   Llama 3.1 / 3.2            <function=F>{..}</function>   or   {"name": F, "parameters": {..}}
+///   Mistral                    [TOOL_CALLS][{"name": F, "arguments": {..}}]
+///   DeepSeek / GLM4            F\n{..}   (name on its own line, then the JSON)
+/// The old parser required a top-level `"tool"` key with flat fields: every one of those was
+/// `NoToolKey` or plain prose.
+fn canonical_block(raw: &RawCall) -> String {
+    let body = raw.body.trim();
+    // DeepSeek/GLM: a bare identifier line, then the JSON object.
+    let (line_name, body) = match body.split_once('\n') {
+        Some((first, rest)) if !first.trim().is_empty()
+            && first.trim().chars().all(|c| c.is_alphanumeric() || c == '_')
+            && rest.trim_start().starts_with('{') => (Some(first.trim().to_string()), rest.trim()),
+        _ => (None, body),
+    };
+    let name = raw.name.clone().or(line_name).or_else(|| top_level_name(body));
+    let Some(name) = name else { return body.to_string() };
+    // Arguments: the nested object when there is one, else the body's own fields.
+    let args = ["arguments", "parameters", "params", "input", "args"].iter()
+        .find_map(|k| nested_object(body, k))
+        .unwrap_or_else(|| {
+            // Flat: drop the name field itself so `"name"` can still mean read_near's symbol.
+            body.to_string()
+        });
+    let inner = args.trim().trim_start_matches('{').trim_end_matches('}').trim();
+    if inner.is_empty() { format!("{{\"tool\": \"{name}\"}}") }
+    else { format!("{{\"tool\": \"{name}\", {inner}}}") }
+}
+
+/// Every name `parse_one` accepts, aliases included. Used where a tool call is INFERRED from an
+/// unmarked JSON object (a ```json fence, a bare `{…}` line): those shapes are also how models
+/// write ordinary data, so only an object naming a real tool is taken as a call. Explicit
+/// wrappers (`<tool_call>`, ```tool, `<function=`, `[TOOL_CALLS]`) are taken as calls regardless,
+/// so an unknown tool there is reported as one.
+fn known_tool_name(name: &str) -> bool {
+    matches!(name, "write_file" | "read_file" | "edit" | "edit_file" | "patch" | "read_range" | "read_near"
+        | "search" | "list_dir" | "git_log" | "log" | "propose" | "dry_run" | "doc" | "share_doc" | "write_doc"
+        | "scratch_code" | "scratch" | "idea" | "make_tool" | "run")
+}
+
+/// The function name from a top-level `tool` / `name` / `function` key — "top-level" meaning it
+/// appears before any nested-arguments key, so an argument called `name` is not mistaken for it.
+fn top_level_name(body: &str) -> Option<String> {
+    let args_at = ["\"arguments\"", "\"parameters\"", "\"params\"", "\"input\"", "\"args\""].iter()
+        .filter_map(|k| body.find(k)).min().unwrap_or(body.len());
+    for key in ["tool", "name", "function"] {
+        let pat = format!("\"{key}\"");
+        if let Some(k) = body.find(&pat) {
+            if k < args_at { if let Some(v) = json_str(&body[k..], key) { return Some(v); } }
+        }
+    }
+    None
+}
+
+/// The balanced `{ ... }` value of `key`, or None if the key is absent or its value is not an object.
+fn nested_object(body: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let k = body.find(&pat)?;
+    let after = &body[k + pat.len()..];
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim_start();
+    if !rest.starts_with('{') { return None; }
+    let end = balanced_object_end(rest)?;
+    Some(rest[..=end].to_string())
+}
+
+/// Index of the `}` that closes the object opening at `src[0]`, string- and escape-aware.
+fn balanced_object_end(src: &str) -> Option<usize> {
+    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
+    for (i, c) in src.char_indices() {
+        if in_str {
+            if esc { esc = false; } else if c == '\\' { esc = true; } else if c == '"' { in_str = false; }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => { depth -= 1; if depth == 0 { return Some(i); } }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Name the reason a block failed. Mirrors `parse_one`'s field requirements — if that gains a tool,
@@ -2057,33 +2154,88 @@ fn balanced_fence_end(after: &str) -> Option<usize> {
 }
 
 /// Extract the raw JSON-ish payloads from either supported block shape.
-fn extract_blocks(text: &str) -> Vec<String> {
-    let mut blocks = Vec::new();
-    // fenced ```tool … ```
-    let mut rest = text;
-    while let Some(start) = rest.find("```tool") {
-        let after = &rest[start + "```tool".len()..];
-        // End the block at a fence where the payload is BALANCED JSON — not the first ``` blindly.
-        // A write_file whose contents contain a fence (README with ```rust examples, doc comments
-        // with ```) otherwise truncates mid-JSON and the tail spills out as broken file fragments.
-        match balanced_fence_end(after) {
-            Some(end) => {
-                blocks.push(after[..end].trim().to_string());
-                rest = &after[end + 3..];
+fn extract_blocks(text: &str) -> Vec<RawCall> {
+    let mut blocks: Vec<RawCall> = Vec::new();
+    let mut seen_json = |blocks: &mut Vec<RawCall>, body: &str| {
+        // Fences of several kinds can wrap the same object; count it once.
+        let b = body.trim();
+        if !blocks.iter().any(|r| r.name.is_none() && r.body == b) { blocks.push(RawCall { name: None, body: b.to_string() }); }
+    };
+    // fenced ```tool … ``` — and ```json … ``` when the object names a tool, which is what a model
+    // told "reply with JSON" writes.
+    for fence in ["```tool", "```json"] {
+        let mut rest = text;
+        while let Some(start) = rest.find(fence) {
+            let after = &rest[start + fence.len()..];
+            // End the block at a fence where the payload is BALANCED JSON — not the first ``` blindly.
+            // A write_file whose contents contain a fence (README with ```rust examples, doc comments
+            // with ```) otherwise truncates mid-JSON and the tail spills out as broken file fragments.
+            match balanced_fence_end(after) {
+                Some(end) => {
+                    let body = after[..end].trim();
+                    if fence == "```tool" || top_level_name(body).is_some_and(|n| known_tool_name(&n)) { seen_json(&mut blocks, body); }
+                    rest = &after[end + 3..];
+                }
+                None => break,
             }
-            None => break,
         }
     }
-    // <tool_call> … </tool_call>
+    // <tool_call> … </tool_call>   (Qwen / ChatML / Hermes)
     let mut rest = text;
     while let Some(start) = rest.find("<tool_call>") {
         let after = &rest[start + "<tool_call>".len()..];
         if let Some(end) = after.find("</tool_call>") {
-            blocks.push(after[..end].trim().to_string());
+            seen_json(&mut blocks, &after[..end]);
             rest = &after[end + "</tool_call>".len()..];
         } else { break; }
     }
+    // <function=NAME>{…}</function>   (Llama 3.1/3.2 — chatllm.cpp's tool_llama3.1.py)
+    let mut rest = text;
+    while let Some(start) = rest.find("<function=") {
+        let after = &rest[start + "<function=".len()..];
+        let Some(gt) = after.find('>') else { break };
+        let name = after[..gt].trim().to_string();
+        let body_from = &after[gt + 1..];
+        let end = body_from.find("</function>").unwrap_or(body_from.len());
+        blocks.push(RawCall { name: Some(name), body: body_from[..end].trim().to_string() });
+        rest = &body_from[end..];
+    }
+    // [TOOL_CALLS][{…}, {…}]   (Mistral) and <|python_tag|>{…}   (Llama 3.1): a JSON array or object
+    // after the marker, up to the model's end-of-message token or the end of the turn.
+    for marker in ["[TOOL_CALLS]", "<|python_tag|>"] {
+        let mut rest = text;
+        while let Some(start) = rest.find(marker) {
+            let after = rest[start + marker.len()..].trim_start();
+            let end = ["<|eom_id|>", "<|eot_id|>", "</s>"].iter().filter_map(|t| after.find(t)).min().unwrap_or(after.len());
+            let payload = after[..end].trim();
+            let mut objs = 0;
+            for obj in json_objects(payload) { seen_json(&mut blocks, obj); objs += 1; }
+            if objs == 0 { break; }
+            rest = &after[end..];
+        }
+    }
+    // A bare top-level object that names a tool, on its own — no wrapper at all. Only whole lines
+    // that open with `{` so JSON quoted inside prose is not picked up.
+    if blocks.is_empty() {
+        for line in text.lines() {
+            let t = line.trim();
+            if t.starts_with('{') && t.ends_with('}') && top_level_name(t).is_some_and(|n| known_tool_name(&n)) { seen_json(&mut blocks, t); }
+        }
+    }
     blocks
+}
+
+/// Every top-level `{…}` object in `payload`: the elements of a `[…]` array, or one bare object.
+fn json_objects(payload: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = payload;
+    while let Some(k) = rest.find('{') {
+        let from = &rest[k..];
+        let Some(end) = balanced_object_end(from) else { break };
+        out.push(&from[..=end]);
+        rest = &from[end + 1..];
+    }
+    out
 }
 
 /// Parse one JSON object into a `Tool`. A tiny hand-rolled extractor (no serde dep needed on this path):
@@ -4228,6 +4380,60 @@ error: could not compile `demo` (lib) due to 3 previous errors
 
         let cmd_form = "```tool\n{\"tool\":\"run\",\"cmd\":\"cargo build\"}\n```";
         assert_eq!(parse_tools(cmd_form), vec![Tool::Run { argv: vec!["cargo".into(), "build".into()] }]);
+    }
+
+    /// The shapes models are TRAINED to emit, as chatllm.cpp's per-family handlers document them
+    /// (scripts/tool_qwen2.5.py, tool_llama3.1.py, tool_mistral.py, tool_deepseekcoder.py). Every
+    /// one of these was a `NoToolKey` reject or invisible prose before, which is the C13 §57 loop:
+    /// the ladder told the model "no valid tool call" and the model, correctly, wrote the same
+    /// call again in its own grammar.
+    #[test]
+    fn native_tool_call_formats_parse() {
+        // Qwen2.5 / Qwen3 / Hermes: name + nested arguments inside <tool_call>.
+        let qwen = "<tool_call>\n{\"name\": \"read_range\", \"arguments\": {\"path\": \"src/lib.rs\", \"start\": 40, \"end\": 90}}\n</tool_call>";
+        assert_eq!(parse_tools(qwen), vec![Tool::ReadRange { path: "src/lib.rs".into(), start: 40, end: 90 }]);
+        // Llama 3.1 / 3.2: <function=NAME>{args}</function>.
+        let llama = "I'll look at the file.\n<function=read_file>{\"path\": \"Cargo.toml\"}</function>";
+        assert_eq!(parse_tools(llama), vec![Tool::ReadFile { path: "Cargo.toml".into() }]);
+        // Llama 3.1 JSON form after <|python_tag|>, `parameters` rather than `arguments`.
+        let llama_json = "<|python_tag|>{\"name\": \"search\", \"parameters\": {\"pattern\": \"fn main\", \"path\": \"src\"}}<|eom_id|>";
+        assert_eq!(parse_tools(llama_json), vec![Tool::Search { pattern: "fn main".into(), path: "src".into() }]);
+        // Mistral: [TOOL_CALLS] then a JSON array — two calls in one turn.
+        let mistral = "[TOOL_CALLS][{\"name\": \"list_dir\", \"arguments\": {\"path\": \"src\"}}, {\"name\": \"git_log\", \"arguments\": {\"n\": 5}}]";
+        assert_eq!(parse_tools(mistral), vec![Tool::ListDir { path: "src".into() }, Tool::GitLog { n: 5, path: String::new() }]);
+        // DeepSeek / GLM4: the name on its own line, then the JSON, inside the fence the prompt taught.
+        let deepseek = "```tool\nread_file\n{\"path\": \"README.md\"}\n```";
+        assert_eq!(parse_tools(deepseek), vec![Tool::ReadFile { path: "README.md".into() }]);
+        // A model told "reply with JSON" that used a ```json fence and no wrapper at all.
+        let json_fence = "```json\n{\"tool\": \"read_file\", \"path\": \"a.rs\"}\n```";
+        assert_eq!(parse_tools(json_fence), vec![Tool::ReadFile { path: "a.rs".into() }]);
+        // And a bare object on its own line.
+        let bare = "Reading now.\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"b.rs\"}}\n";
+        assert_eq!(parse_tools(bare), vec![Tool::ReadFile { path: "b.rs".into() }]);
+    }
+
+    /// An argument named `name` (read_near's symbol) must not be mistaken for the function name
+    /// when the call is in the nested native shape.
+    #[test]
+    fn a_nested_name_argument_is_the_argument_not_the_function() {
+        let qwen = "<tool_call>{\"name\": \"read_near\", \"arguments\": {\"path\": \"src/lib.rs\", \"name\": \"fn dispatch\"}}</tool_call>";
+        assert_eq!(parse_tools(qwen), vec![Tool::ReadNear { path: "src/lib.rs".into(), name: "fn dispatch".into() }]);
+    }
+
+    /// Ordinary JSON in a ```json fence is data, not a call: a `name` key that is not a tool must
+    /// not become an UnknownTool reject (which would feed the ladder on a turn that made no call).
+    #[test]
+    fn json_data_in_a_json_fence_is_not_a_call() {
+        let data = "Here is the manifest:\n```json\n{\"name\": \"my-crate\", \"version\": \"0.1.0\"}\n```";
+        let (tools, bad) = parse_tools_reported(data);
+        assert!(tools.is_empty() && bad.is_empty(), "{tools:?} {bad:?}");
+    }
+
+    /// A native-shape call to a tool we do not implement is reported as that tool, not as prose.
+    #[test]
+    fn a_native_call_to_an_unknown_tool_is_named() {
+        let (_, bad) = parse_tools_reported("<tool_call>{\"name\": \"send_email\", \"arguments\": {\"to\": \"x\"}}</tool_call>");
+        assert_eq!(bad, vec![Rejected::UnknownTool("send_email".into())]);
     }
 
     #[test]
