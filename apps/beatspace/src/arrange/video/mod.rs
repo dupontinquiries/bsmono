@@ -6,22 +6,28 @@
 //!   story, and Feel mode's base layer.
 //! * `bucket` — content importance (`Bucket`) resolved at three confidence
 //!   levels: a verified profiled segment, a guess borrowed from nearby
-//!   segments (decayed by distance and by crossing a clip boundary), or a
-//!   neutral fallback that IS `cache_policy`'s plain distance falloff.
-//! * `profile` (planned) — the cheap analyzer that produces verified
-//!   segments, and the freeze/fingerprint/verify machinery that catches a
-//!   profile going stale against a re-encoded source or a tuned analyzer.
-//! * `feel` (planned) — combines a `BucketField` resolution with
-//!   `cache_policy::Shells` to bend the falloff by importance under a
-//!   fixed byte budget, and the `Preview`/`Render`/`Feel` mode switch.
-//! * `decode` (planned) — the real pixel path: ffmpeg-backed, GOP-aware,
-//!   scaled per tier by ffmpeg's own scaler rather than decode-then-
-//!   downsample.
+//!   segments, or a neutral fallback that IS `cache_policy`'s plain
+//!   distance falloff. Segments are keyed by SOURCE, never by timeline
+//!   clip, so Split/Trim/Move/Duplicate can never desync them — see the
+//!   module's own doc for why that split matters.
+//! * `profile` — the cheap analyzer (motion, cut detection, a named-crude
+//!   skin-tone proxy for "maybe a face") that produces verified segments,
+//!   and the freeze/fingerprint/verify machinery that catches a profile
+//!   going stale against a re-encoded source or a tuned analyzer.
+//! * `feel` — combines a `BucketField` resolution with a `cache_policy`
+//!   desired set to bend the falloff toward important content under the
+//!   SAME byte budget (a reallocation, never an addition), and the
+//!   `Preview`/`Render`/`Feel` mode enum.
+//! * `probe` — real file metadata and exact keyframe positions via
+//!   `ffprobe`, tested against a real AV1+Opus fixture ffmpeg encodes on
+//!   the fly (guarded: skips cleanly on a build without libaom/libopus).
+//! * `decode` (not yet built) — the real pixel path: ffmpeg-backed,
+//!   GOP-aware using `probe::keyframes`, scaled per tier by ffmpeg's own
+//!   scaler rather than decode-then-downsample.
 //!
 //! Nothing here has been wired into the egui view yet, and `decode` in
 //! particular needs a real display to prove "realtime" rather than just
-//! "correct" — see the module's own doc for exactly what has and hasn't
-//! been run.
+//! "correct" once it exists.
 
 pub mod bucket;
 pub mod cache_policy;
