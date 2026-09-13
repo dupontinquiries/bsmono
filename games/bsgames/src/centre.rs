@@ -23,10 +23,15 @@ pub struct GameEntry {
     pub kind: LaunchKind,
 }
 
-/// The four fleet games.
+/// The five fleet games.
 pub fn registry() -> Vec<GameEntry> {
     vec![
         GameEntry { id: "clawbound".into(), name: "Clawbound".into(), engine: "wgpu".into(), dir: "games/clawbound".into(), kind: LaunchKind::Cargo },
+        // The 5v5 arena for Clawbound's thirteen ancestors. Reads `--quick-match` (straight into a
+        // match with a random ancestor) and the BSGAMES_HANDOFF_* env (logs the session, plays solo —
+        // online play is not wired in it yet). Default features want libasound2-dev; the game's own
+        // README covers `--no-default-features` for a silent build.
+        GameEntry { id: "clawbound-battleground".into(), name: "Clawbound: Battleground".into(), engine: "wgpu".into(), dir: "games/clawbound-battleground".into(), kind: LaunchKind::Cargo },
         GameEntry { id: "soldier".into(), name: "Soldier".into(), engine: "wgpu".into(), dir: "games/soldier".into(), kind: LaunchKind::Cargo },
         GameEntry { id: "unendlich".into(), name: "Unendlich".into(), engine: "custom".into(), dir: "games/unendlich".into(), kind: LaunchKind::Cargo },
         GameEntry { id: "blackstar".into(), name: "Blackstar".into(), engine: "vulkan/opengl".into(), dir: "games/blackstar".into(), kind: LaunchKind::CmakeBin("blackstar".into()) },
@@ -174,9 +179,12 @@ mod tests {
     use netcode::store::{ProfileService, SnapcoreStore};
 
     #[test]
-    fn registry_has_the_four_games_with_launchers() {
+    fn registry_has_the_five_games_with_launchers() {
         let r = registry();
-        assert_eq!(r.len(), 4);
+        assert_eq!(r.len(), 5);
+        let bg = r.iter().find(|g| g.id == "clawbound-battleground").unwrap();
+        assert_eq!(launch_argv(bg), vec!["cargo", "run", "--release", "--manifest-path", "games/clawbound-battleground/Cargo.toml"]);
+        assert_eq!(quick_match_argv(bg).last().map(String::as_str), Some("--quick-match"));
         // Rust games → cargo; cybertron → cmake bin
         let claw = r.iter().find(|g| g.id == "clawbound").unwrap();
         assert_eq!(launch_argv(claw), vec!["cargo", "run", "--release", "--manifest-path", "games/clawbound/Cargo.toml"]);

@@ -1,0 +1,316 @@
+use glam::Vec3;
+
+// ---------------------------------------------------------------------------
+// Arena layout — three lanes (TOP / MID / BOT), two bases, 12 towers, 2 titans
+// Blue base sits south (negative Z), Red base north (positive Z).
+// The valley is an expanded jungle map: dense playable jungle inside
+// ARENA_RADIUS, then overgrown hills and colossal ruins beyond the bounds.
+// ---------------------------------------------------------------------------
+
+/// Global layout scale — expands the whole valley (lanes, bases, towers).
+pub const MAP_SCALE: f32 = 1.42;
+
+pub const ARENA_RADIUS: f32 = 95.0 * MAP_SCALE; // playable floor (~135)
+pub const GROUND_HALF: f32 = 225.0; // rendered terrain half-extent
+
+/// Base microvoxel edge length (world units) for character voxels.
+pub const VOXEL_SIZE: f32 = 0.14;
+
+// --- River -----------------------------------------------------------------
+// Two winding rivers run north–south through the side jungle. They dip under
+// the side lanes (wooden bridges span the crossings).
+
+pub const RIVER_CENTER_X: f32 = 62.0 * MAP_SCALE;
+pub const RIVER_AMPLITUDE: f32 = 12.0 * MAP_SCALE;
+pub const RIVER_FREQ: f32 = 0.050;
+pub const RIVER_PHASE: f32 = 0.8;
+pub const RIVER_HALF_WIDTH: f32 = 5.2;
+
+/// Signed river center for the left (side = -1) / right (side = 1) river.
+pub fn river_x(side: f32, z: f32) -> f32 {
+    side * (RIVER_CENTER_X + RIVER_AMPLITUDE * (z * RIVER_FREQ + RIVER_PHASE).sin())
+}
+
+/// Distance from (x, z) to the nearest river centerline (both rivers).
+pub fn river_dist(x: f32, z: f32) -> f32 {
+    (x - river_x(-1.0, z)).abs().min((x - river_x(1.0, z)).abs())
+}
+
+/// Still-water surface height. The riverbed dips below it (see
+/// `render::terrain_height`); the banks rise above it.
+pub const WATER_LEVEL: f32 = -0.30;
+/// Deepest the bed goes below the water, mid-channel.
+pub const RIVER_DEPTH: f32 = 2.1;
+
+/// How deep the water is at (x, z), in world units (0 on dry ground).
+pub fn water_depth(x: f32, z: f32) -> f32 {
+    (WATER_LEVEL - crate::render::terrain_height(x, z)).max(0.0)
+}
+
+/// Riverblessing: what a caught glowfish grants, and for how long.
+pub const BLESSING_SECS: f32 = 45.0;
+pub const BLESSING_MS: f32 = 0.12;
+pub const BLESSING_AS: f32 = 0.10;
+pub const BLESSING_MP_PER_S: f32 = 0.01; // fraction of max mana
+
+/// Movement multiplier for wading: waist-deep water costs ~40 %. Riverborn
+/// ancestors and anyone carrying the Riverblessing ignore it.
+pub fn wade_speed_mul(depth: f32) -> f32 {
+    1.0 - 0.40 * (depth / 1.2).clamp(0.0, 1.0)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Team {
+    Blue = 0,
+    Red = 1,
+}
+
+impl Team {
+    pub fn other(self) -> Team {
+        match self {
+            Team::Blue => Team::Red,
+            Team::Red => Team::Blue,
+        }
+    }
+    /// Direction this team pushes along Z (Blue pushes north/+Z, Red south/-Z).
+    pub fn push_z(self) -> f32 {
+        match self {
+            Team::Blue => 1.0,
+            Team::Red => -1.0,
+        }
+    }
+    /// Fountain (heal / respawn) position.
+    pub fn fountain(self) -> Vec3 {
+        match self {
+            Team::Blue => Vec3::new(0.0, 0.0, -88.0 * MAP_SCALE),
+            Team::Red => Vec3::new(0.0, 0.0, 88.0 * MAP_SCALE),
+        }
+    }
+    pub fn titan_pos(self) -> Vec3 {
+        match self {
+            Team::Blue => Vec3::new(0.0, 0.0, -74.0 * MAP_SCALE),
+            Team::Red => Vec3::new(0.0, 0.0, 74.0 * MAP_SCALE),
+        }
+    }
+    pub fn base_pos(self) -> Vec3 {
+        match self {
+            Team::Blue => Vec3::new(0.0, 0.0, -82.0 * MAP_SCALE),
+            Team::Red => Vec3::new(0.0, 0.0, 82.0 * MAP_SCALE),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Team::Blue => "ORDER",
+            Team::Red => "CHAOS",
+        }
+    }
+    pub fn rgb(self) -> [f32; 3] {
+        match self {
+            Team::Blue => [0.25, 0.55, 1.0],
+            Team::Red => [1.0, 0.30, 0.24],
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Lane {
+    Top = 0,
+    Mid = 1,
+    Bot = 2,
+}
+
+pub const LANES: [Lane; 3] = [Lane::Top, Lane::Mid, Lane::Bot];
+
+impl Lane {
+    pub fn index(self) -> usize {
+        self as usize
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Lane::Top => "TOP",
+            Lane::Mid => "MID",
+            Lane::Bot => "BOT",
+        }
+    }
+    /// Canonical polyline from Blue base toward Red base.
+    pub fn polyline(self) -> Vec<Vec3> {
+        match self {
+            Lane::Mid => vec![
+                Vec3::new(0.0, 0.0, -68.0),
+                Vec3::new(0.0, 0.0, -34.0),
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 34.0),
+                Vec3::new(0.0, 0.0, 68.0),
+            ],
+            Lane::Top => vec![
+                Vec3::new(0.0, 0.0, -64.0),
+                Vec3::new(-34.0, 0.0, -56.0),
+                Vec3::new(-52.0, 0.0, -34.0),
+                Vec3::new(-58.0, 0.0, 0.0),
+                Vec3::new(-52.0, 0.0, 34.0),
+                Vec3::new(-34.0, 0.0, 56.0),
+                Vec3::new(0.0, 0.0, 64.0),
+            ],
+            Lane::Bot => vec![
+                Vec3::new(0.0, 0.0, -64.0),
+                Vec3::new(34.0, 0.0, -56.0),
+                Vec3::new(52.0, 0.0, -34.0),
+                Vec3::new(58.0, 0.0, 0.0),
+                Vec3::new(52.0, 0.0, 34.0),
+                Vec3::new(34.0, 0.0, 56.0),
+                Vec3::new(0.0, 0.0, 64.0),
+            ],
+        }
+        .into_iter()
+        .map(|v| v * MAP_SCALE)
+        .collect()
+    }
+    /// Dense waypoints (sampled every ~5 units) from this team's base to the enemy base.
+    pub fn path_for(self, team: Team) -> Vec<Vec3> {
+        let mut pts = self.polyline();
+        if team == Team::Red {
+            pts.reverse();
+        }
+        // prepend / append the bases so minions walk out of the fountain
+        let start = team.base_pos() + Vec3::new(0.0, 0.0, team.push_z() * 10.0);
+        let enemy = team.other();
+        let end = enemy.base_pos() + Vec3::new(0.0, 0.0, enemy.push_z() * 10.0);
+        let mut out = Vec::with_capacity(64);
+        out.push(start);
+        for p in pts {
+            let last = *out.last().unwrap();
+            push_sampled(&mut out, last, p, 5.0);
+        }
+        let last = *out.last().unwrap();
+        push_sampled(&mut out, last, end, 5.0);
+        out
+    }
+}
+
+fn push_sampled(out: &mut Vec<Vec3>, from: Vec3, to: Vec3, step: f32) {
+    let d = to - from;
+    let len = d.length();
+    if len < 0.01 {
+        return;
+    }
+    let n = (len / step).ceil() as usize;
+    for i in 1..=n {
+        out.push(from + d * (i as f32 / n as f32));
+    }
+}
+
+/// Cached per (lane, team) dense waypoints (6 combos, built once).
+pub fn lane_path(lane: Lane, team: Team) -> &'static [Vec3] {
+    use std::sync::OnceLock;
+    static PATHS: OnceLock<Vec<Vec<Vec3>>> = OnceLock::new();
+    let all = PATHS.get_or_init(|| {
+        let mut v = Vec::new();
+        for lane in LANES {
+            for team in [Team::Blue, Team::Red] {
+                v.push(lane.path_for(team));
+            }
+        }
+        v
+    });
+    &all[lane.index() * 2 + team as usize]
+}
+
+/// (lane, team) → tower world position. Two towers per lane per team.
+pub fn tower_pos(lane: Lane, team: Team, inner: bool) -> Vec3 {
+    use Lane::*;
+    let zflip = |v: Vec3| -> Vec3 {
+        match team {
+            Team::Blue => v,
+            Team::Red => Vec3::new(v.x, v.y, -v.z),
+        }
+    };
+    let pos = match (lane, inner) {
+        (Mid, false) => Vec3::new(0.0, 0.0, -38.0),
+        (Mid, true) => Vec3::new(0.0, 0.0, -60.0),
+        (Top, false) => Vec3::new(-43.0, 0.0, -42.0),
+        (Top, true) => Vec3::new(-50.0, 0.0, -52.0),
+        (Bot, false) => Vec3::new(43.0, 0.0, -42.0),
+        (Bot, true) => Vec3::new(50.0, 0.0, -52.0),
+    };
+    zflip(pos * MAP_SCALE)
+}
+
+// ---------------------------------------------------------------------------
+// Tuning
+// ---------------------------------------------------------------------------
+
+pub const WAVE_FIRST: f32 = 12.0;
+pub const WAVE_INTERVAL: f32 = 30.0;
+pub const WAVE_MELEE: usize = 2;
+pub const WAVE_CASTER: usize = 1;
+
+pub const START_GOLD: f32 = 700.0;
+pub const PASSIVE_GOLD: f32 = 1.9;
+pub const GOLD_MELEE: f32 = 21.0;
+pub const GOLD_CASTER: f32 = 27.0;
+pub const GOLD_GOD: f32 = 300.0;
+pub const GOLD_TOWER: f32 = 250.0;
+
+pub const XP_MELEE: f32 = 62.0;
+pub const XP_CASTER: f32 = 80.0;
+pub const XP_GOD: f32 = 340.0;
+pub const XP_SHARE_RADIUS: f32 = 14.0;
+pub const MAX_LEVEL: u32 = 20;
+
+pub const MINION_HP: f32 = 320.0;
+pub const MINION_HP_SCALE: f32 = 1.0; // per minute factor
+pub const MINION_DMG: f32 = 14.0;
+pub const MINION_CASTER_DMG: f32 = 22.0;
+pub const MINION_RANGE_MELEE: f32 = 2.2;
+pub const MINION_RANGE_CASTER: f32 = 9.0;
+pub const MINION_ATK_CD: f32 = 1.4;
+
+pub const TOWER_HP: f32 = 1450.0;
+pub const TOWER_DMG: f32 = 168.0;
+pub const TOWER_RANGE: f32 = 16.0;
+pub const TOWER_ATK_CD: f32 = 1.1;
+pub const TOWER_RAMP: f32 = 1.25;
+
+pub const TITAN_HP: f32 = 4600.0;
+pub const TITAN_DMG: f32 = 260.0;
+pub const TITAN_RANGE: f32 = 6.5;
+pub const TITAN_ATK_CD: f32 = 1.0;
+/// Titan is shielded while the owning team still has this many towers standing.
+pub const TITAN_TOWERS_REQ: usize = 4;
+
+pub const FOUNTAIN_RADIUS: f32 = 10.0;
+pub const FOUNTAIN_REGEN: f32 = 0.08; // fraction per second
+pub const FOUNTAIN_DPS: f32 = 520.0;
+
+pub const AGGRO_RANGE: f32 = 13.0;
+pub const RESPAWN_BASE: f32 = 6.0;
+pub const RESPAWN_PER_LEVEL: f32 = 2.2;
+
+/// Distance from (x, z) to the nearest lane centerline, and negative distance
+/// to each base (props should stay clear of both). Shared by world dressing.
+pub fn lane_clearance(x: f32, z: f32) -> f32 {
+    let p = Vec3::new(x, 0.0, z);
+    let mut best = f32::MAX;
+    for lane in [Lane::Top, Lane::Mid, Lane::Bot] {
+        let pts = lane.polyline();
+        for w in pts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let ab = b - a;
+            let t = ((p - a).dot(ab) / ab.length_squared().max(0.001)).clamp(0.0, 1.0);
+            best = best.min((a + ab * t - p).length());
+        }
+    }
+    for team in [Team::Blue, Team::Red] {
+        best = best.min(p.distance(team.base_pos()) - 16.0);
+    }
+    best
+}
+
+pub fn xp_for_level(level: u32) -> f32 {
+    // cumulative XP needed to go from `level` to `level + 1`
+    100.0 + 62.0 * level as f32 + 7.0 * level as f32 * level as f32
+}
+
+pub fn respawn_time(level: u32) -> f32 {
+    RESPAWN_BASE + RESPAWN_PER_LEVEL * level as f32
+}

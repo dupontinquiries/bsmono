@@ -1,0 +1,970 @@
+// Windowed application: winit 0.29 event loop + egui wiring + player controls.
+//
+// Input flows one way: winit events → `input::InputEvent` (logical keys, raw
+// mouse motion, touch) → `input::resolve()` once per frame → `Controls` → sim.
+// Nothing below reads a KeyCode; the bindings decide what a key means.
+
+use std::time::Instant;
+
+use glam::{Vec2, Vec3};
+use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, MouseButton, TouchPhase, WindowEvent};
+use winit::event_loop::{EventLoop, EventLoopWindowTarget};
+use winit::keyboard::{Key, NamedKey};
+use winit::window::{Window, WindowBuilder};
+
+use crate::gamepad::{Pad, PadState};
+use crate::input::{self, Action, Bind, Config, Controls, InputEvent, InputState, MouseBtn, Named};
+use crate::touch::TouchPad;
+
+use crate::render::{Camera, Renderer};
+use crate::scene::Scene;
+use crate::sim::Game;
+use crate::ui::{self, UiState};
+use crate::vfx::Vfx;
+
+#[derive(PartialEq, Clone, Copy)]
+enum Screen {
+    Menu,
+    Select,
+    Playing,
+}
+
+struct AppState {
+    window: &'static Window,
+    surface: wgpu::Surface<'static>,
+    surface_format: wgpu::TextureFormat,
+    renderer: Renderer,
+    scene: Option<Scene>,
+    egui_ctx: egui::Context,
+    egui_winit: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
+    ui: UiState,
+    screen: Screen,
+    game: Option<Game>,
+    vfx: Vfx,
+    // --- input stack
+    cfg: Config,
+    input: InputState,
+    pad: Pad,
+    pad_state: PadState,
+    touch: TouchPad,
+    controls: Controls,
+    /// Controls panel open (pause / rebind). `capturing` = waiting for a press.
+    controls_open: bool,
+    capturing: Option<Action>,
+    /// Walk-to order from a tap (world ground point).
+    walk_to: Option<Vec3>,
+    locked: bool,
+    scoreboard: bool,
+    cam_yaw: f32,
+    cam_pitch: f32,
+    cam_dist: f32,
+    last_frame: Instant,
+    accumulator: f32,
+    exiting: bool,
+    #[cfg(feature = "audio")]
+    ambience: Option<crate::audio::output::Ambience>,
+    thunder_count: u32,
+    thunder_dist: f32,
+    launch: crate::launch::LaunchOptions,
+}
+
+pub fn run(opts: crate::launch::LaunchOptions) {
+    if let Some(role) = &opts.handoff {
+        // The centre handed us a friend session. Online play is not wired
+        // in this game yet, so the honest thing is to say so and still put
+        // the player in a match rather than at a menu.
+        eprintln!(
+            "[clawbound] bsgames handoff ({role:?}, me={:?}, peer={:?}): online play is not wired yet — starting a solo quick match",
+            opts.player_name, opts.peer_id
+        );
+    }
+    let event_loop = EventLoop::new().expect("event loop");
+    let mut state: Option<AppState> = None;
+
+    event_loop
+        .run(move |event, elwt| {
+            match event {
+                Event::Resumed => {
+                    if state.is_none() {
+                        eprintln!("RESUMED: initializing window + GPU");
+                        match init_window(elwt) {
+                            Ok(mut s) => {
+                                eprintln!("RESUMED: init ok — surface configured");
+                                s.launch = opts.clone();
+                                if let Some(n) = &opts.player_name {
+                                    s.ui.player_label = Some(n.clone());
+                                }
+                                state = Some(s);
+                            }
+                            Err(msg) => {
+                                eprintln!(
+                                    "\n[clawbound] graphics initialization failed:\n  {msg}\n\nHints:\n  - force a backend with WGPU_BACKEND=metal|vulkan|dx12|gl|all\n  - update your GPU drivers\n"
+                                );
+                                elwt.exit();
+                            }
+                        }
+                    }
+                }
+                Event::AboutToWait => {
+                    if let Some(s) = state.as_ref() {
+                        s.window.request_redraw();
+                    }
+                }
+                Event::DeviceEvent { event, .. } => {
+                    if let Some(s) = state.as_mut() {
+                        handle_device_event(s, event);
+                    }
+                }
+                Event::WindowEvent { event, .. } => {
+                    if let Some(s) = state.as_mut() {
+                        if event == WindowEvent::RedrawRequested {
+                            render(s);
+                            if s.exiting {
+                                elwt.exit();
+                            }
+                        } else {
+                            handle_window_event(s, event);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        })
+        .expect("event loop run");
+}
+
+struct GpuInit {
+    surface: wgpu::Surface<'static>,
+    #[allow(dead_code)]
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    format: wgpu::TextureFormat,
+}
+
+fn try_gpu_backend(window: &'static Window, backends: wgpu::Backends) -> Result<GpuInit, String> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends,
+        ..Default::default()
+    });
+    // wgpu 0.19 PANICS inside create_surface (instance.rs `hal_surface.unwrap()`)
+    // when none of the requested backends managed to initialize its HAL instance
+    // (no driver/ICD on this machine). Probe adapters first — enumeration never
+    // touches the window surface, so it is panic-free.
+    if instance.enumerate_adapters(backends).is_empty() {
+        return Err("no adapters for this backend (driver/ICD missing or incompatible)".to_string());
+    }
+    let surface = instance
+        .create_surface(window)
+        .map_err(|e| format!("create_surface: {e}"))?;
+    // SAFETY: `window` is a leaked &'static Window, so the returned
+    // Surface<'static> stays valid for the life of the (single-window) process.
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: Some(&surface),
+        force_fallback_adapter: false,
+    }))
+    .ok_or_else(|| "no compatible adapter".to_string())?;
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("main device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+        },
+        None,
+    ))
+    .map_err(|e| format!("request_device: {e}"))?;
+    let caps = surface.get_capabilities(&adapter);
+    let format = caps
+        .formats
+        .iter()
+        .copied()
+        .find(|f| f.is_srgb())
+        .or_else(|| caps.formats.first().copied())
+        .ok_or_else(|| "surface exposes no formats".to_string())?;
+    Ok(GpuInit { surface, adapter, device, queue, format })
+}
+
+/// Backend priority per platform. `WGPU_BACKEND` env overrides.
+/// IMPORTANT: never request a backend mask whose instance can't exist on this
+/// OS — wgpu 0.19 panics inside create_surface when NO enabled backend can
+/// build the surface (`instance.rs: hal_surface.unwrap()`).
+/// - stock macOS: only Metal (Vulkan needs MoltenVK, GL needs ANGLE)
+/// - Windows: Vulkan → DX12 → GL
+/// - Linux/other: Vulkan → GL
+fn platform_backends() -> Vec<(&'static str, wgpu::Backends)> {
+    if let Ok(env_backend) = std::env::var("WGPU_BACKEND") {
+        let b = env_backend.trim().to_ascii_lowercase();
+        let forced = match b.as_str() {
+            "metal" => Some(wgpu::Backends::METAL),
+            "vulkan" => Some(wgpu::Backends::VULKAN),
+            "dx12" => Some(wgpu::Backends::DX12),
+            "gl" | "gles" => Some(wgpu::Backends::GL),
+            "primary" => Some(wgpu::Backends::PRIMARY),
+            "all" => Some(wgpu::Backends::all()),
+            other => {
+                eprintln!("[clawbound] ignoring unknown WGPU_BACKEND='{other}' (metal|vulkan|dx12|gl|primary|all)");
+                None
+            }
+        };
+        let usable = forced.filter(|mask| {
+            if cfg!(target_os = "macos") {
+                // a mask without METAL can never create a surface on stock macOS
+                mask.intersects(wgpu::Backends::METAL)
+            } else {
+                mask.intersects(wgpu::Backends::VULKAN | wgpu::Backends::GL | wgpu::Backends::DX12)
+            }
+        });
+        match (forced, usable) {
+            (Some(_), Some(mask)) => {
+                eprintln!("[clawbound] WGPU_BACKEND override: forcing {mask:?}");
+                return vec![("forced", mask)];
+            }
+            (Some(mask), None) => {
+                eprintln!("[clawbound] WGPU_BACKEND={mask:?} cannot work on this OS (no MoltenVK/ANGLE?) — using platform defaults");
+            }
+            _ => {}
+        }
+    }
+    let mut list = Vec::new();
+    if cfg!(target_os = "macos") {
+        list.push(("metal", wgpu::Backends::METAL));
+    } else {
+        if cfg!(windows) {
+            list.push(("dx12", wgpu::Backends::DX12));
+        }
+        list.push(("vulkan", wgpu::Backends::VULKAN));
+        list.push(("gl", wgpu::Backends::GL));
+    }
+    list
+}
+
+fn panic_message(p: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
+    let window = WindowBuilder::new()
+        .with_title("Clawbound — Battleground · Rust + wgpu Microvoxel Edition")
+        .with_inner_size(winit::dpi::LogicalSize::new(1366.0f64, 768.0f64))
+        .build(target)
+        .map_err(|e| format!("window creation failed: {e}"))?;
+    // leak the window so the surface can be 'static (one window per process)
+    let window: &'static Window = Box::leak(Box::new(window));
+    let size = window.inner_size();
+
+    let mut errors = Vec::new();
+    let mut gpu = None;
+    for (name, mask) in platform_backends() {
+        // wgpu 0.19 has several internal `unwrap()`s along its instance/surface
+        // paths (missing driver/ICD, missing ANGLE, headless EGL…). Contain
+        // them: a backend that panics is simply "unavailable" on this machine.
+        let attempt =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| try_gpu_backend(window, mask)));
+        match attempt {
+            Ok(Ok(g)) => {
+                let info = g.adapter.get_info();
+                eprintln!("[clawbound] GPU ok — backend '{name}': '{}' ({:?})", info.name, info.backend);
+                gpu = Some(g);
+                break;
+            }
+            Ok(Err(e)) => {
+                eprintln!("[clawbound] backend '{name}' unavailable: {e}");
+                errors.push(format!("{name}: {e}"));
+            }
+            Err(p) => {
+                let msg = panic_message(&p);
+                eprintln!("[clawbound] backend '{name}' crashed internally: {msg}");
+                errors.push(format!("{name}: wgpu internal panic ({msg})"));
+            }
+        }
+    }
+    let GpuInit { surface, device, queue, format, .. } = gpu.ok_or_else(|| {
+        format!(
+            "no usable GPU backend (tried {}). Set WGPU_BACKEND=metal|vulkan|dx12|gl|all to override, and update your GPU drivers.",
+            errors.join(" | ")
+        )
+    })?;
+
+    surface.configure(
+        &device,
+        &wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        },
+    );
+
+    let egui_ctx = egui::Context::default();
+    let egui_winit = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, window, None, None);
+    let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1);
+    let renderer = Renderer::new(device, queue, size.width.max(1), size.height.max(1), format);
+
+    Ok(AppState {
+        window,
+        surface,
+        surface_format: format,
+        renderer,
+        scene: None,
+        egui_ctx,
+        egui_winit,
+        egui_renderer,
+        ui: UiState::new(),
+        screen: Screen::Menu,
+        game: None,
+        vfx: Vfx::default(),
+        cfg: {
+            let c = Config::load();
+            eprintln!("[clawbound] controls: {} scheme{}", c.bindings.scheme.name(), Config::path().map(|p| format!(" ({})", p.display())).unwrap_or_default());
+            c
+        },
+        input: InputState::default(),
+        pad: Pad::new(),
+        pad_state: PadState::default(),
+        touch: TouchPad::new(),
+        controls: Controls::default(),
+        controls_open: false,
+        capturing: None,
+        walk_to: None,
+        locked: false,
+        scoreboard: false,
+        cam_yaw: std::f32::consts::PI,
+        cam_pitch: 0.38,
+        cam_dist: 8.5,
+        last_frame: Instant::now(),
+        accumulator: 0.0,
+        exiting: false,
+        #[cfg(feature = "audio")]
+        ambience: None,
+        thunder_count: 0,
+        thunder_dist: 1.0,
+        launch: crate::launch::LaunchOptions::default(),
+    })
+}
+
+/// winit logical key → our backend-neutral bind (None for keys we don't map).
+fn bind_of_key(k: &Key) -> Option<Bind> {
+    Some(match k {
+        Key::Character(s) => input::ch(s.as_str()),
+        Key::Named(n) => Bind::Named(match n {
+            NamedKey::Space => Named::Space,
+            NamedKey::Shift => Named::Shift,
+            NamedKey::Control => Named::Control,
+            NamedKey::Alt => Named::Alt,
+            NamedKey::Tab => Named::Tab,
+            NamedKey::Escape => Named::Escape,
+            NamedKey::Enter => Named::Enter,
+            NamedKey::Backspace => Named::Backspace,
+            NamedKey::ArrowUp => Named::ArrowUp,
+            NamedKey::ArrowDown => Named::ArrowDown,
+            NamedKey::ArrowLeft => Named::ArrowLeft,
+            NamedKey::ArrowRight => Named::ArrowRight,
+            NamedKey::PageUp => Named::PageUp,
+            NamedKey::PageDown => Named::PageDown,
+            NamedKey::Home => Named::Home,
+            NamedKey::End => Named::End,
+            NamedKey::CapsLock => Named::CapsLock,
+            NamedKey::F1 => Named::F1,
+            NamedKey::F2 => Named::F2,
+            NamedKey::F3 => Named::F3,
+            NamedKey::F4 => Named::F4,
+            NamedKey::F5 => Named::F5,
+            _ => return None,
+        }),
+        _ => return None,
+    })
+}
+
+fn bind_of_mouse(b: MouseButton) -> Bind {
+    Bind::Mouse(match b {
+        MouseButton::Left => MouseBtn::Left,
+        MouseButton::Right => MouseBtn::Right,
+        MouseButton::Middle => MouseBtn::Middle,
+        MouseButton::Back => MouseBtn::Back,
+        MouseButton::Forward => MouseBtn::Forward,
+        MouseButton::Other(n) => MouseBtn::Other(n),
+    })
+}
+
+fn set_locked(s: &mut AppState, lock: bool) {
+    if s.locked == lock {
+        return;
+    }
+    s.locked = lock;
+    if lock {
+        // Locked is the right mode on X11/Windows/macOS; Wayland compositors
+        // that refuse it fall back to Confined + hidden cursor, and the raw
+        // DeviceEvent::MouseMotion path still delivers deltas either way.
+        let _ = s.window.set_cursor_grab(winit::window::CursorGrabMode::Locked)
+            .or_else(|_| s.window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
+        s.window.set_cursor_visible(false);
+    } else {
+        let _ = s.window.set_cursor_grab(winit::window::CursorGrabMode::None);
+        s.window.set_cursor_visible(true);
+    }
+}
+
+fn handle_device_event(s: &mut AppState, event: DeviceEvent) {
+    if let DeviceEvent::MouseMotion { delta } = event {
+        if s.locked {
+            s.input.handle(InputEvent::MouseDelta(delta.0 as f32, delta.1 as f32));
+        }
+    }
+}
+
+fn handle_window_event(s: &mut AppState, event: WindowEvent) {
+    let egui_response = s.egui_winit.on_window_event(&s.window, &event);
+    let size = s.window.inner_size();
+    let short = size.width.min(size.height).max(1) as f32;
+    // touch positions in normalized units of the shorter side, y down
+    let norm = |p: winit::dpi::PhysicalPosition<f64>| Vec2::new(p.x as f32 / short, p.y as f32 / short);
+
+    match event {
+        WindowEvent::CloseRequested => s.exiting = true,
+        WindowEvent::Focused(false) => s.input.handle(InputEvent::FocusLost),
+        WindowEvent::Resized(size) => {
+            s.renderer.resize(size.width.max(1), size.height.max(1));
+            let sh = size.width.min(size.height).max(1) as f32;
+            s.touch.extent = Vec2::new(size.width.max(1) as f32 / sh, size.height.max(1) as f32 / sh);
+            s.surface.configure(
+                &s.renderer.device,
+                &wgpu::SurfaceConfiguration {
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    format: s.surface_format,
+                    width: size.width.max(1),
+                    height: size.height.max(1),
+                    present_mode: wgpu::PresentMode::Fifo,
+                    alpha_mode: wgpu::CompositeAlphaMode::Auto,
+                    view_formats: vec![],
+                    desired_maximum_frame_latency: 2,
+                },
+            );
+        }
+        WindowEvent::MouseInput { state, button, .. } => {
+            let b = bind_of_mouse(button);
+            match state {
+                ElementState::Pressed => {
+                    if let Some(a) = s.capturing.take() {
+                        s.cfg.bindings.capture(a, b);
+                        s.cfg.save();
+                        return;
+                    }
+                    if !egui_response.consumed {
+                        // a click on the world while the cursor is free re-captures it
+                        if s.screen == Screen::Playing && !s.locked && !s.ui.shop_open && !s.controls_open && !s.cfg.settings.touch_enabled {
+                            set_locked(s, true);
+                        }
+                        s.input.handle(InputEvent::Press(b));
+                    }
+                }
+                ElementState::Released => s.input.handle(InputEvent::Release(b)),
+            }
+        }
+        WindowEvent::MouseWheel { delta, .. } => {
+            if !egui_response.consumed {
+                let d = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y * 0.8,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.02,
+                };
+                s.input.handle(InputEvent::Scroll(d));
+            }
+        }
+        WindowEvent::KeyboardInput { event: KeyEvent { state, logical_key, repeat, .. }, .. } => {
+            let Some(b) = bind_of_key(&logical_key) else { return };
+            match state {
+                ElementState::Pressed if !repeat => {
+                    if let Some(a) = s.capturing.take() {
+                        // Esc cancels a capture instead of binding it
+                        if b != Bind::Named(Named::Escape) {
+                            s.cfg.bindings.capture(a, b);
+                            s.cfg.save();
+                        }
+                        return;
+                    }
+                    // typing into egui (shop search etc.) must not move the ancestor
+                    if !egui_response.consumed || b == Bind::Named(Named::Escape) {
+                        s.input.handle(InputEvent::Press(b));
+                    }
+                }
+                ElementState::Pressed => {}
+                ElementState::Released => s.input.handle(InputEvent::Release(b)),
+            }
+        }
+        WindowEvent::Touch(t) => {
+            // a touchscreen announces itself: enable the on-screen pad on first touch
+            if !s.cfg.settings.touch_enabled {
+                s.cfg.settings.touch_enabled = true;
+                s.cfg.save();
+                set_locked(s, false);
+            }
+            s.touch.enabled = true;
+            s.touch.scale = s.cfg.settings.touch_scale;
+            let p = norm(t.location);
+            match t.phase {
+                TouchPhase::Started => {
+                    if !egui_response.consumed {
+                        s.touch.down(t.id, p);
+                    }
+                }
+                TouchPhase::Moved => s.touch.moved(t.id, p),
+                TouchPhase::Ended => s.touch.up(t.id),
+                TouchPhase::Cancelled => s.touch.cancel(t.id),
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Once per frame: poll the pad, resolve everything to `Controls`, and act on
+/// the meta actions (menu, shop, scoreboard, capture) here; gameplay intent
+/// is applied in the fixed-step loop.
+fn gather_controls(s: &mut AppState, dt: f32) {
+    s.pad_state = s.pad.poll();
+    s.touch.tick(dt);
+    s.touch.enabled = s.cfg.settings.touch_enabled;
+    s.touch.scale = s.cfg.settings.touch_scale;
+
+    // bind capture from a controller button
+    if let Some(a) = s.capturing {
+        if let Some(code) = s.pad_state.any_edge() {
+            s.cfg.bindings.capture(a, Bind::Pad(code));
+            s.cfg.save();
+            s.capturing = None;
+        }
+    }
+
+    let gameplay_active = s.screen == Screen::Playing
+        && !s.ui.shop_open
+        && !s.controls_open
+        && s.capturing.is_none()
+        && (s.locked || s.cfg.settings.touch_enabled || s.pad_state.connected);
+    let c = input::resolve(&s.input, &s.cfg, &s.pad_state, Some(&s.touch), gameplay_active);
+    s.controls = c;
+    s.input.end_frame();
+    s.touch.end_frame();
+
+    if s.screen != Screen::Playing {
+        return;
+    }
+    if c.menu && s.capturing.is_none() {
+        if s.ui.shop_open {
+            s.ui.shop_open = false;
+        } else if s.controls_open {
+            s.controls_open = false;
+            if !s.cfg.settings.touch_enabled {
+                set_locked(s, true);
+            }
+        } else if s.locked {
+            set_locked(s, false);
+        } else {
+            s.controls_open = true;
+        }
+    }
+    if c.shop {
+        s.ui.shop_open = !s.ui.shop_open;
+        if s.ui.shop_open {
+            set_locked(s, false);
+        } else if !s.cfg.settings.touch_enabled {
+            set_locked(s, true);
+        }
+    }
+    s.scoreboard = c.scoreboard;
+    if gameplay_active {
+        s.cam_yaw += c.look.x;
+        s.cam_pitch = (s.cam_pitch + c.look.y).clamp(0.06, 1.15);
+        s.cam_dist = (s.cam_dist - c.zoom).clamp(4.5, 16.0);
+        if c.recenter {
+            if let Some(g) = s.game.as_ref() {
+                s.cam_yaw = g.gods[0].yaw + std::f32::consts::FRAC_PI_2;
+            }
+        }
+        if let Some(tap) = c.tap {
+            s.walk_to = ground_point_from_screen(s, tap);
+        }
+        if c.mv.length_squared() > 0.01 {
+            s.walk_to = None; // the stick takes over from a walk-to order
+        }
+    }
+}
+
+/// Screen point (normalized, y down, x in shorter-side units) → ground hit.
+fn ground_point_from_screen(s: &AppState, p: Vec2) -> Option<Vec3> {
+    let g = s.game.as_ref()?;
+    let player = &g.gods[0];
+    let dir = cam_dir(s.cam_yaw, s.cam_pitch);
+    let target = player.pos + Vec3::Y * 1.5;
+    let cam = Camera { eye: target - dir * s.cam_dist, target, fov_y: 0.95 };
+    let aspect = s.renderer.width as f32 / s.renderer.height.max(1) as f32;
+    let vp = cam.view_proj(aspect);
+    let inv = vp.inverse();
+    // p is in shorter-side units: x spans 0..extent.x, y spans 0..extent.y
+    let ext = s.touch.extent;
+    let ndc = Vec2::new(p.x / ext.x * 2.0 - 1.0, 1.0 - p.y / ext.y * 2.0);
+    let near = inv * glam::Vec4::new(ndc.x, ndc.y, 0.0, 1.0);
+    let far = inv * glam::Vec4::new(ndc.x, ndc.y, 1.0, 1.0);
+    let a = near.truncate() / near.w;
+    let b = far.truncate() / far.w;
+    let d = b - a;
+    if d.y.abs() < 1e-4 {
+        return None;
+    }
+    let t = -a.y / d.y;
+    if t < 0.0 {
+        return None;
+    }
+    let hit = a + d * t;
+    Some(Vec3::new(hit.x, 0.0, hit.z))
+}
+
+fn cam_dir(yaw: f32, pitch: f32) -> Vec3 {
+    Vec3::new(yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos())
+}
+
+fn compute_aim(s: &AppState) -> Vec3 {
+    let player = &s.game.as_ref().unwrap().gods[0];
+    let dir = cam_dir(s.cam_yaw, s.cam_pitch);
+    let eye = player.pos + Vec3::Y * 1.5 - dir * s.cam_dist;
+    if dir.y < -0.02 {
+        let t = -eye.y / dir.y;
+        let hit = eye + dir * t;
+        let d = Vec3::new(hit.x, 0.0, hit.z) - Vec3::new(player.pos.x, 0.0, player.pos.z);
+        if d.length() > 30.0 {
+            player.pos + d.normalize() * 30.0
+        } else {
+            Vec3::new(hit.x, 0.0, hit.z)
+        }
+    } else {
+        let f = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
+        player.pos + f * 14.0
+    }
+}
+
+fn start_game(s: &mut AppState) {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(42);
+    let mut rng = crate::sim::Rng::new(0xBEEF ^ seed);
+    let mut pool: Vec<u32> = (0..crate::gods::ROSTER_LEN as u32).filter(|&i| i != s.ui.selected as u32).collect();
+    let mut allies = [0u32; 4];
+    let mut enemies = [0u32; 5];
+    for a in allies.iter_mut() {
+        let k = (rng.next_u() % pool.len() as u64) as usize;
+        *a = pool.remove(k);
+    }
+    for e in enemies.iter_mut() {
+        let k = (rng.next_u() % pool.len() as u64) as usize;
+        *e = pool.remove(k.min(pool.len() - 1));
+    }
+    s.game = Some(Game::new(s.ui.selected as u32, allies, enemies));
+    s.vfx = Vfx::default();
+    s.screen = Screen::Playing;
+    #[cfg(feature = "audio")]
+    if s.ambience.is_none() {
+        s.ambience = crate::audio::output::Ambience::start();
+    }
+    s.ui.floaters.clear();
+    s.ui.announce = None;
+    s.ui.shop_open = false;
+    s.cam_yaw = std::f32::consts::PI;
+    s.cam_pitch = 0.38;
+    s.walk_to = None;
+    s.controls_open = false;
+    if !s.cfg.settings.touch_enabled {
+        set_locked(s, true);
+    }
+}
+
+fn render(s: &mut AppState) {
+    let dt_frame = s.last_frame.elapsed().as_secs_f32().min(0.05);
+    s.last_frame = Instant::now();
+
+    if s.scene.is_none() {
+        s.scene = Some(Scene::new(&mut s.renderer));
+        render_portraits(s);
+        if s.launch.quick_match && s.screen == Screen::Menu {
+            // --quick-match (bsgames): straight into a 5v5 with the named or a random ancestor
+            let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(1);
+            s.ui.selected = s.launch.ancestor_id().map(|i| i as usize).unwrap_or((seed % crate::gods::ROSTER_LEN as u64) as usize);
+            eprintln!("[clawbound] quick match as {}", crate::gods::god(s.ui.selected as u32).name);
+            start_game(s);
+        }
+    }
+    // input: one resolve per frame, then the fixed-step loop applies it
+    gather_controls(s, dt_frame);
+    let scene = s.scene.as_ref().unwrap();
+
+    // fixed-step simulation + player input
+    if s.screen == Screen::Playing {
+        let c = s.controls;
+        let aim = if s.game.is_some() { compute_aim(s) } else { Vec3::ZERO };
+        let yaw = s.cam_yaw;
+        let walk_to = s.walk_to;
+        if let Some(g) = s.game.as_mut() {
+            // casts are edges: queue them once, outside the step loop
+            for slot in 0..4u32 {
+                if c.cast[slot as usize] {
+                    g.cast_queue.push((0, slot, aim));
+                }
+            }
+            s.accumulator = (s.accumulator + dt_frame).min(0.25);
+            while s.accumulator >= 1.0 / 60.0 {
+                s.accumulator -= 1.0 / 60.0;
+                let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos()).normalize_or_zero();
+                let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+                let mut mv = fwd * c.mv.y + right * c.mv.x;
+                if let Some(t) = walk_to {
+                    let d = Vec3::new(t.x - g.gods[0].pos.x, 0.0, t.z - g.gods[0].pos.z);
+                    if d.length() > 0.8 {
+                        mv = d.normalize();
+                    } else {
+                        s.walk_to = None;
+                    }
+                }
+                let gi = &mut g.gods[0];
+                gi.move_dir = mv;
+                gi.attack_held = c.attack;
+                g.tick(1.0 / 60.0);
+                let events: Vec<crate::sim::Event> = g.events.drain(..).collect();
+                for e in &events {
+                    match e {
+                        crate::sim::Event::Damage { pos, amount, big } => {
+                            if s.ui.floaters.len() < 50 && *amount > 0.0 {
+                                s.ui.push_events(&[ui::Event2::Damage { pos: *pos, amount: *amount, big: *big }]);
+                            }
+                        }
+                        crate::sim::Event::Announce { text } => {
+                            s.ui.push_events(&[ui::Event2::Announce { text: text.clone(), dur: 2.5 }]);
+                        }
+                        // sky-tall bolts are lightning (weather or Thunder Front)
+                        crate::sim::Event::BoltFx { from, to, .. } if from.y - to.y > 30.0 => {
+                            s.thunder_count = s.thunder_count.wrapping_add(1);
+                            s.thunder_dist = (to.distance(g.gods[0].pos) / 160.0).clamp(0.0, 1.0);
+                        }
+                        _ => {}
+                    }
+                }
+                s.vfx.update(1.0 / 60.0, &events, g);
+            }
+        }
+        s.ui.tick(dt_frame);
+    }
+
+    // camera
+    let cam = match s.screen {
+        Screen::Menu | Screen::Select => {
+            let t = s.last_frame.elapsed().as_secs_f32() * 0.05;
+            let r = 55.0;
+            Camera {
+                eye: Vec3::new(t.cos() * r, 32.0, t.sin() * r),
+                target: Vec3::ZERO,
+                fov_y: 0.9,
+            }
+        }
+        Screen::Playing => {
+            let g = s.game.as_ref().unwrap();
+            let player = &g.gods[0];
+            let dir = cam_dir(s.cam_yaw, s.cam_pitch);
+            // the ground moves: an earthquake (or a nearby boar slam) jolts the camera
+            let shake = g.disasters.shake;
+            let tt = s.last_frame.elapsed().as_secs_f32() * 60.0 + g.t * 47.0;
+            let jolt = Vec3::new((tt * 1.7).sin(), (tt * 2.3).cos() * 0.6, (tt * 1.1).sin()) * shake * 0.35;
+            let target = player.pos + Vec3::Y * 1.5 + jolt;
+            Camera {
+                eye: target - dir * s.cam_dist + jolt * 0.5,
+                target,
+                fov_y: 0.95,
+            }
+        }
+    };
+    let vp = cam.view_proj(s.renderer.width as f32 / s.renderer.height as f32);
+
+    // ambience: the listener is the player; the wind pans with the camera
+    #[cfg(feature = "audio")]
+    if let (Some(g), Some(amb)) = (s.game.as_ref(), s.ambience.as_ref()) {
+        let p = crate::audio::params_for(g, g.gods[0].pos, s.cam_yaw, s.thunder_count, s.thunder_dist);
+        amb.set(p);
+    }
+
+    // world draws (+ this frame's sky state)
+    if let Some(g) = s.game.as_ref() {
+        s.renderer.atmosphere = g.weather.atmosphere();
+        // catastrophe uniforms: flood rise, shake, fire glow near the player
+        let near_fire = g.disasters.fire.iter().map(|f| f.pos.distance(g.gods[0].pos)).fold(f32::MAX, f32::min);
+        let glow = if near_fire < 40.0 { (1.0 - near_fire / 40.0).clamp(0.0, 1.0) } else { 0.0 };
+        s.renderer.event = (g.disasters.flood_rise, g.disasters.shake, glow);
+        let mut vfx = std::mem::take(&mut s.vfx);
+        scene.draw(&mut s.renderer, g, &mut vfx, cam);
+        s.vfx = vfx;
+    } else {
+        s.renderer.atmosphere = crate::weather::Weather::new().atmosphere();
+        s.renderer.clear_queues();
+    }
+
+    // surface frame
+    let frame = match s.surface.get_current_texture() {
+        Ok(f) => Some(f),
+        Err(_) => {
+            s.surface.configure(
+                &s.renderer.device,
+                &wgpu::SurfaceConfiguration {
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    format: s.surface_format,
+                    width: s.renderer.width,
+                    height: s.renderer.height,
+                    present_mode: wgpu::PresentMode::Fifo,
+                    alpha_mode: wgpu::CompositeAlphaMode::Auto,
+                    view_formats: vec![],
+                    desired_maximum_frame_latency: 2,
+                },
+            );
+            // Minimized/occluded windows can briefly fail to produce a frame;
+            // skip this frame instead of panicking.
+            s.surface
+                .get_current_texture()
+                .map_err(|e| eprintln!("[clawbound] skipping frame: {e}"))
+                .ok()
+        }
+    };
+    let Some(frame) = frame else { return; };
+    let view = frame.texture.create_view(&Default::default());
+    s.renderer.render_frame(&view, cam, s.last_frame.elapsed().as_secs_f32());
+
+    // egui frame
+    let raw_input = s.egui_winit.take_egui_input(s.window);
+    let mut play = false;
+    let mut quit = false;
+    let mut locked_in = false;
+    let mut again = false;
+    let mut menu = false;
+    let mut open_controls = false;
+    let mut panel = ui::ControlsPanel { close: false, capture: None, clear: None, scheme: None, reset: false };
+    let output = s.egui_ctx.run(raw_input, |ctx| {
+        match s.screen {
+            Screen::Menu => {
+                ui::draw_menu(ctx, &mut play, &mut quit);
+                ui::draw_controls_button(ctx, &mut open_controls);
+            }
+            Screen::Select => ui::draw_select(ctx, &mut s.ui, &mut locked_in),
+            Screen::Playing => {
+                if let Some(g) = s.game.as_mut() {
+                    if s.ui.shop_open {
+                        ui::draw_shop(ctx, g, 0, &mut s.ui);
+                    } else {
+                        ui::draw_hud(ctx, g, 0, vp, s.renderer.width as f32, s.renderer.height as f32, &mut s.ui);
+                        if s.cfg.settings.touch_enabled {
+                            ui::draw_touch_pad(ctx, &s.touch, g, s.renderer.width as f32, s.renderer.height as f32);
+                        } else if !s.locked && !s.controls_open {
+                            ui::draw_click_to_play(ctx);
+                        }
+                    }
+                    if s.scoreboard {
+                        ui::draw_scoreboard_labelled(ctx, g, s.ui.player_label.as_deref());
+                    }
+                    if g.over.is_some() {
+                        ui::draw_end(ctx, g, &mut again, &mut menu);
+                    }
+                }
+            }
+        }
+        if s.controls_open {
+            ui::draw_controls(ctx, &mut s.cfg, s.capturing, s.pad_state.connected, &mut panel);
+        }
+    });
+    if open_controls {
+        s.controls_open = true;
+    }
+    if panel.close {
+        s.controls_open = false;
+        s.capturing = None;
+        if s.screen == Screen::Playing && !s.cfg.settings.touch_enabled {
+            set_locked(s, true);
+        }
+    }
+    if let Some(a) = panel.capture {
+        s.capturing = Some(a);
+    }
+    if let Some(a) = panel.clear {
+        s.cfg.bindings.clear(a);
+        s.cfg.save();
+    }
+    if let Some(sc) = panel.scheme {
+        s.cfg.bindings = input::Bindings::for_scheme(sc);
+        s.cfg.save();
+    }
+    if panel.reset {
+        s.cfg = Config::default();
+        s.cfg.save();
+    }
+    s.egui_winit.handle_platform_output(s.window, output.platform_output);
+
+    for td in output.textures_delta.set.iter() {
+        s.egui_renderer.update_texture(&s.renderer.device, &s.renderer.queue, td.0, &td.1);
+    }
+    let screen_desc = egui_wgpu::ScreenDescriptor {
+        size_in_pixels: [s.renderer.width, s.renderer.height],
+        pixels_per_point: s.egui_ctx.pixels_per_point(),
+    };
+    let clipped = s.egui_ctx.tessellate(output.shapes, screen_desc.pixels_per_point);
+    let mut encoder = s.renderer.device.create_command_encoder(&Default::default());
+    let mut cbuffers = s.egui_renderer.update_buffers(&s.renderer.device, &s.renderer.queue, &mut encoder, &clipped, &screen_desc);
+    {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("egui"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        s.egui_renderer.render(&mut rpass, &clipped, &screen_desc);
+    }
+    cbuffers.push(encoder.finish());
+    s.renderer.queue.submit(cbuffers);
+    for td in output.textures_delta.free.iter() {
+        s.egui_renderer.free_texture(td);
+    }
+    frame.present();
+
+    // transitions
+    if play {
+        s.screen = Screen::Select;
+    }
+    if quit {
+        s.exiting = true;
+    }
+    if locked_in || again {
+        start_game(s);
+    }
+    if menu {
+        s.screen = Screen::Menu;
+        s.game = None;
+    }
+}
+
+fn render_portraits(s: &mut AppState) {
+    let scene = s.scene.as_ref().unwrap();
+    for i in 0..crate::gods::ROSTER.len() {
+        let body = scene.god_body[i][0];
+        let weapon = scene.god_weapon[i][0];
+        let pixels = s.renderer.render_portrait(body, weapon);
+        let image = egui::ColorImage::from_rgba_unmultiplied([128, 128], &pixels);
+        let tid = s.egui_ctx.load_texture(format!("ancestor{}", i), image, egui::TextureOptions::LINEAR);
+        s.ui.portraits.insert(i as u32, tid.id());
+    }
+}

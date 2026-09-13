@@ -1,0 +1,682 @@
+// Static world props: trees, rocks, crystals, braziers, base gates, fountains.
+// All props are merged into one static voxel mesh at startup (single draw).
+
+use crate::voxel::{Grid, VoxelMesh};
+
+fn solid(c: [f32; 3]) -> [f32; 4] {
+    [c[0], c[1], c[2], 1.0]
+}
+
+fn mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+}
+
+pub fn pine(s: f32) -> VoxelMesh {
+    let mut g = Grid::new(12, 26, 12);
+    let c = 6;
+    g.cyl_y(c as f32, c as f32, 1.6, 0, 5, solid([0.36, 0.26, 0.16]));
+    let leaf = [0.14, 0.38, 0.20];
+    let leaf2 = [0.10, 0.30, 0.16];
+    g.cone_y(c as f32, c as f32, 5.0 * s, 1.2, 4, 11, solid(leaf));
+    g.cone_y(c as f32, c as f32, 4.2 * s, 1.0, 10, 17, solid(leaf2));
+    g.cone_y(c as f32, c as f32, 3.2 * s, 0.6, 16, 23, solid(leaf));
+    g.mesh(0.6, true)
+}
+
+pub fn oak(s: f32) -> VoxelMesh {
+    let mut g = Grid::new(16, 22, 16);
+    let c = 8;
+    g.cyl_y(c as f32, c as f32, 1.8, 0, 8, solid([0.4, 0.29, 0.18]));
+    g.ellipsoid(c as f32, 13.0, c as f32, 6.5 * s, 4.6 * s, 6.5 * s, solid([0.22, 0.45, 0.18]));
+    g.ellipsoid((c - 3) as f32, 11.0, (c + 2) as f32, 4.0 * s, 3.0 * s, 4.0 * s, solid([0.16, 0.38, 0.14]));
+    g.ellipsoid((c + 3) as f32, 12.0, (c - 2) as f32, 3.6 * s, 2.8 * s, 3.6 * s, solid([0.26, 0.50, 0.20]));
+    g.mesh(0.6, true)
+}
+
+pub fn rock(s: f32) -> VoxelMesh {
+    let mut g = Grid::new(10, 8, 10);
+    g.ellipsoid(5.0, 3.0, 5.0, 4.5 * s, 2.6 * s, 4.2 * s, solid([0.40, 0.38, 0.36]));
+    g.ellipsoid(3.5, 4.0, 4.0, 2.4 * s, 1.8 * s, 2.4 * s, solid([0.48, 0.46, 0.44]));
+    // moss creeping over the top
+    g.ellipsoid(4.0, 5.2, 4.5, 3.0 * s, 0.8, 3.0 * s, solid(MOSS));
+    g.mesh(0.6, true)
+}
+
+/// A cluster of river-worn boulders: three rounded stones, wet-dark at the
+/// base, lichen on the shoulders.
+pub fn boulder_cluster(s: f32, variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(18, 10, 18);
+    let stone = [0.44, 0.42, 0.40];
+    let dark = [0.30, 0.29, 0.30];
+    let lichen = [0.55, 0.58, 0.36];
+    let offs = [(6.0, 6.0, 1.0), (11.0, 9.0, 0.8), (7.5, 12.0, 0.65), (12.5, 4.5, 0.5)];
+    for (i, (x, z, sc)) in offs.iter().enumerate() {
+        if (variant + i as i32) % 5 == 4 {
+            continue;
+        }
+        let r = 3.6 * sc * s;
+        g.ellipsoid(*x, r * 0.75, *z, r, r * 0.8, r * 1.1, solid(stone));
+        g.ellipsoid(*x, r * 0.3, *z, r * 1.05, r * 0.35, r * 1.15, solid(dark));
+        g.ellipsoid(*x + 0.6, r * 1.4, *z - 0.4, r * 0.55, 0.6, r * 0.55, solid(lichen));
+    }
+    g.mesh(0.6, true)
+}
+
+/// A curtain of hanging vines from a canopy branch, with leaves and a few
+/// trumpet flowers — two poles hold the branch so it reads on its own.
+pub fn vine_curtain(variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(20, 30, 8);
+    let bark = [0.30, 0.215, 0.125];
+    let vine = [0.16, 0.42, 0.16];
+    let vine_d = [0.12, 0.32, 0.13];
+    let leaf = [0.30, 0.55, 0.20];
+    let bloom = if variant % 2 == 0 { [0.95, 0.45, 0.55] } else { [0.95, 0.75, 0.3] };
+    // branch across the top, on two crooked poles
+    g.filled_box(1, 24, 3, 18, 25, 4, solid(bark));
+    g.filled_box(1, 0, 3, 2, 24, 4, solid(bark));
+    g.filled_box(17, 0, 3, 18, 24, 4, solid(bark));
+    for k in 0..9 {
+        let x = 2 + k * 2 + (variant + k) % 2;
+        let len = 8 + ((variant * 7 + k * 13) % 14);
+        for i in 0..len {
+            let y = 24 - i;
+            let sway = ((i as f32 * 0.5 + k as f32).sin() * 1.2) as i32;
+            let z = 3 + sway;
+            g.set(x, y, z, solid(if i % 3 == 0 { vine_d } else { vine }));
+            if i % 4 == 2 {
+                g.set(x + 1, y, z, solid(leaf));
+                g.set(x - 1, y - 1, z + 1, solid(leaf));
+            }
+        }
+        if (variant + k) % 3 == 0 {
+            g.ellipsoid(x as f32, (24 - len) as f32, 3.5, 1.2, 1.0, 1.2, solid(bloom));
+        }
+    }
+    g.mesh(0.55, true)
+}
+
+pub fn crystal(team: [f32; 3]) -> VoxelMesh {
+    let mut g = Grid::new(8, 18, 8);
+    let glow = mix(team, [1.0, 1.0, 1.0], 0.3);
+    g.cone_y(4.0, 4.0, 2.6, 0.7, 2, 13, solid(glow));
+    g.cone_y(4.0, 4.0, 2.0, 0.5, 0, 4, solid(mix(team, [0.1, 0.1, 0.2], 0.4)));
+    g.cone_y(2.0, 6.0, 1.4, 0.4, 1, 8, solid(mix(glow, [0.2, 0.2, 0.3], 0.3)));
+    g.mesh(0.35, true)
+}
+
+pub fn brazier() -> VoxelMesh {
+    let mut g = Grid::new(8, 12, 8);
+    let c = 4;
+    g.filled_box(c - 1, 0, c - 1, c + 1, 7, c + 1, solid([0.3, 0.26, 0.24]));
+    g.cyl_y(c as f32, c as f32, 2.8, 7, 8, solid([0.42, 0.36, 0.30]));
+    g.cyl_y(c as f32, c as f32, 2.4, 8, 9, solid([0.15, 0.13, 0.12]));
+    g.mesh(0.12, true)
+}
+
+/// Base gate: monumental archway behind the titan.
+pub fn base_gate(team: [f32; 3]) -> VoxelMesh {
+    let mut g = Grid::new(52, 40, 22);
+    let cx = 26;
+    let cz = 11;
+    let stone = [0.34, 0.33, 0.36];
+    let stone_d = [0.24, 0.24, 0.27];
+    let trim = mix(team, [0.9, 0.9, 0.95], 0.25);
+
+    // pillars
+    g.filled_box(cx - 22, 0, cz - 7, cx - 14, 30, cz + 7, solid(stone));
+    g.filled_box(cx + 14, 0, cz - 7, cx + 22, 30, cz + 7, solid(stone));
+    for y in (4..30).step_by(4) {
+        g.filled_box(cx - 23, y, cz - 8, cx + 23, y, cz + 8, solid(stone_d));
+    }
+    // arch
+    for i in 0..8 {
+        let t = i as f32 / 7.0;
+        let half = (18.0 * (1.0 - t * t).sqrt()) as i32;
+        g.filled_box(cx - half - 1, 30 + i * 2, cz - 7, cx + half + 1, 31 + i * 2, cz + 7, solid(stone));
+    }
+    // banner drapes
+    g.filled_box(cx - 21, 10, cz + 7, cx - 15, 26, cz + 8, solid(team));
+    g.filled_box(cx + 15, 10, cz + 7, cx + 21, 26, cz + 8, solid(team));
+    g.filled_box(cx - 14, 12, cz + 7, cx - 15, 24, cz + 8, solid(trim));
+    g.filled_box(cx + 14, 12, cz + 7, cx + 15, 24, cz + 8, solid(trim));
+    // steps
+    g.filled_box(cx - 26, 0, cz - 11, cx + 26, 1, cz + 11, solid(stone_d));
+    g.mesh(0.24, true)
+}
+
+/// Fountain: circular pool with central spire (heal particles spawn here).
+pub fn fountain(team: [f32; 3]) -> VoxelMesh {
+    let mut g = Grid::new(26, 12, 26);
+    let c = 13;
+    let water = mix(team, [0.5, 0.8, 1.0], 0.5);
+    g.cyl_y(c as f32, c as f32, 11.0, 0, 1, solid([0.35, 0.34, 0.36]));
+    g.cyl_y(c as f32, c as f32, 10.0, 1, 2, solid(mix(water, [0.0, 0.0, 0.0], 0.35)));
+    g.cyl_y(c as f32, c as f32, 3.0, 2, 8, solid([0.4, 0.39, 0.41]));
+    g.cyl_y(c as f32, c as f32, 5.0, 8, 9, solid(water));
+    g.cyl_y(c as f32, c as f32, 2.0, 9, 10, solid(mix(team, [1.0, 1.0, 1.0], 0.4)));
+    g.mesh(0.2, true)
+}
+
+/// Titan pedestal.
+pub fn titan_pedestal(team: [f32; 3]) -> VoxelMesh {
+    let mut g = Grid::new(30, 8, 30);
+    let c = 15;
+    g.filled_box(2, 0, 2, 27, 2, 27, solid([0.30, 0.29, 0.31]));
+    g.filled_box(5, 2, 5, 24, 4, 24, solid([0.38, 0.37, 0.39]));
+    g.cyl_y(c as f32, c as f32, 10.0, 4, 5, solid(mix(team, [0.2, 0.2, 0.25], 0.5)));
+    g.cyl_y(c as f32, c as f32, 9.0, 5, 7, solid([0.42, 0.41, 0.43]));
+    g.mesh(0.22, true)
+}
+
+/// Lane pathway slabs (decorative pads under each lane polyline).
+pub fn lane_pad() -> VoxelMesh {
+    let mut g = Grid::new(10, 1, 10);
+    g.filled_box(0, 0, 0, 9, 0, 9, solid([0.44, 0.42, 0.38]));
+    // tiled pattern
+    for (x, z) in [(2usize, 2usize), (2, 7), (7, 2), (7, 7)] {
+        g.set(x as i32, 0, z as i32, solid([0.36, 0.34, 0.30]));
+    }
+    g.mesh(0.9, false)
+}
+
+// ---------------------------------------------------------------------------
+// Indiana-jones jungle flora
+// ---------------------------------------------------------------------------
+
+const MOSS: [f32; 3] = [0.20, 0.42, 0.18];
+const STONE: [f32; 3] = [0.37, 0.36, 0.34];
+const STONE_D: [f32; 3] = [0.28, 0.275, 0.26];
+
+/// Massive broadleaf canopy tree with buttress roots and hanging vines.
+/// variant picks canopy shape/vine layout deterministically.
+pub fn jungle_tree(s: f32, variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(22, 26, 22);
+    let c = 11.0;
+    let bark = [0.30, 0.215, 0.125];
+    let bark_d = [0.24, 0.17, 0.10];
+    // trunk
+    g.cyl_y(c, c, 2.6, 0, 9, solid(bark));
+    g.cyl_y(c, c, 2.1, 9, 14, solid(bark_d));
+    // buttress roots
+    for k in 0..4 {
+        let a = variant as f32 * 0.9 + k as f32 * std::f32::consts::FRAC_PI_2 + 0.4;
+        let dx = a.cos();
+        let dz = a.sin();
+        for i in 0..5 {
+            let r = 2.6 + i as f32 * 1.35;
+            let h = (7 - i * 2).max(2);
+            let x = (c + dx * r) as i32;
+            let z = (c + dz * r) as i32;
+            g.filled_box(x - 1, 0, z - 1, x + 1, h, z + 1, solid(bark_d));
+        }
+        // moss collar at the root base
+        g.ellipsoid(c + dx * 4.0, 1.0, c + dz * 4.0, 2.2, 1.0, 2.2, solid(MOSS));
+    }
+    // canopy: layered blobs, two-tone
+    let leaf_a = [0.095, 0.315, 0.115];
+    let leaf_b = [0.135, 0.395, 0.145];
+    g.ellipsoid(c, 19.5, c, 8.5 * s, 3.6 * s, 8.5 * s, solid(leaf_a));
+    g.ellipsoid(c - 4.0, 17.5, c + 3.0, 5.2 * s, 2.8 * s, 5.2 * s, solid(leaf_b));
+    g.ellipsoid(c + 4.5, 18.5, c - 3.5, 4.8 * s, 2.6 * s, 4.8 * s, solid(leaf_b));
+    g.ellipsoid(c, 22.0, c, 5.5 * s, 2.6 * s, 5.5 * s, solid(leaf_a));
+    // hanging vines from the canopy rim
+    let vins = [(-7.0, 1.0, 6), (7.5, -2.0, 5), (1.0, 7.5, 7), (-2.0, -7.0, 5)];
+    for (i, (vx, vz, len)) in vins.iter().enumerate() {
+        if (variant + i as i32) % 2 == 0 {
+            continue;
+        }
+        let x = (c + vx * s) as i32;
+        let z = (c + vz * s) as i32;
+        for y in 14..14 + len {
+            g.set(x, y, z, solid([0.16, 0.40, 0.16]));
+            if y % 3 == 0 {
+                g.set(x + 1, y, z, solid([0.14, 0.36, 0.14]));
+            }
+        }
+        g.set(x, 14 + len, z, solid([0.30, 0.55, 0.20])); // tip leaf
+    }
+    g.mesh(0.6, true)
+}
+
+/// Curved trunk palm with radiating fronds and coconuts.
+pub fn palm(s: f32, variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(16, 30, 16);
+    let c = 8.0;
+    let bend = if variant % 2 == 0 { 1.0 } else { -1.0 };
+    // trunk: progressive offset gives the classic lean
+    for y in 0..19 {
+        let t = y as f32 / 19.0;
+        let x = c + bend * t * t * 3.2;
+        g.filled_box(x as i32 - 1, y, c as i32 - 1, x as i32, y + 1, c as i32, solid([0.42, 0.31, 0.18]));
+    }
+    let top_x = c + bend * 3.2;
+    let top_y = 19;
+    // fronds
+    for k in 0..8 {
+        let a = k as f32 / 8.0 * std::f32::consts::TAU + variant as f32 * 0.35;
+        let col = if k % 2 == 0 { [0.145, 0.42, 0.17] } else { [0.11, 0.36, 0.14] };
+        for i in 1..7 {
+            let r = i as f32 * 1.15 * s;
+            let y = top_y as f32 + 2.2 - i as f32 * 0.85;
+            let x = (top_x + a.cos() * r) as i32;
+            let z = (c + a.sin() * r) as i32;
+            g.set(x, y as i32, z, solid(col));
+            g.set(x, y as i32 - 1, z, solid(col));
+        }
+    }
+    // coconuts
+    for (dx, dz) in [(-1.0, 0.0), (1.2, 0.6), (0.2, -1.3)] {
+        g.set((top_x + dx) as i32, top_y, (c + dz) as i32, solid([0.30, 0.21, 0.11]));
+    }
+    g.mesh(0.6, true)
+}
+
+/// Strangler fig: host trunk wrapped in aerial roots under a wide flat canopy.
+pub fn strangler_fig(s: f32, variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(26, 28, 26);
+    let c = 13.0;
+    let bark = [0.27, 0.20, 0.13];
+    // host trunk
+    g.cyl_y(c, c, 2.4, 0, 16, solid(bark));
+    // aerial roots arcing outward
+    for k in 0..6 {
+        let a = k as f32 / 6.0 * std::f32::consts::TAU + variant as f32 * 0.55;
+        for y in 0..17 {
+            let t = y as f32 / 17.0;
+            let r = 2.6 + (1.0 - t) * 5.6 * s;
+            let x = (c + a.cos() * r) as i32;
+            let z = (c + a.sin() * r) as i32;
+            g.set(x, y, z, solid(bark));
+            g.set(x + 1, y, z, solid([0.23, 0.17, 0.11]));
+        }
+        g.ellipsoid(c + a.cos() * 2.8, 0.6, c + a.sin() * 2.8, 1.8, 0.9, 1.8, solid(MOSS));
+    }
+    // wide flat canopy
+    let leaf_a = [0.10, 0.33, 0.12];
+    let leaf_b = [0.14, 0.41, 0.15];
+    g.ellipsoid(c, 19.0, c, 11.0 * s, 3.0 * s, 11.0 * s, solid(leaf_a));
+    g.ellipsoid(c - 5.0, 21.0, c - 2.0, 5.0 * s, 2.2 * s, 5.0 * s, solid(leaf_b));
+    g.ellipsoid(c + 4.0, 21.5, c + 4.0, 4.4 * s, 2.2 * s, 4.4 * s, solid(leaf_b));
+    g.mesh(0.6, true)
+}
+
+/// Bamboo clump: thin segmented culms with leaf tufts.
+pub fn bamboo(s: f32, variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(12, 30, 12);
+    let c = 6.0;
+    let culm = [0.34, 0.52, 0.21];
+    let ring = [0.44, 0.62, 0.28];
+    for k in 0..7 {
+        let a = k as f32 * 2.4 + variant as f32;
+        let r = 0.8 + (k % 3) as f32 * 1.1;
+        let bx = (c + a.cos() * r) as i32;
+        let bz = (c + a.sin() * r) as i32;
+        let top = 16 + ((k * 5 + variant) % 9);
+        for y in 0..top {
+            let cc = if y % 3 == 2 { ring } else { culm };
+            g.set(bx, y, bz, solid(cc));
+        }
+        // leaf tufts
+        for (dx, dz, dy) in [(1, 0, 0), (-1, 1, -1), (0, -1, 1)] {
+            g.set(bx + dx, top + dy, bz + dz, solid([0.24, 0.46, 0.16]));
+        }
+    }
+    let _ = s;
+    g.mesh(0.6, true)
+}
+
+/// Ground fern rosette.
+pub fn fern(variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(11, 6, 11);
+    let c = 5.0;
+    for k in 0..7 {
+        let a = k as f32 / 7.0 * std::f32::consts::TAU + variant as f32 * 0.8;
+        let col = if k % 2 == 0 { [0.13, 0.38, 0.13] } else { [0.17, 0.45, 0.16] };
+        for i in 1..5 {
+            let r = i as f32 * 1.05;
+            let y = (2.2 - i as f32 * 0.35) as i32;
+            g.set((c + a.cos() * r) as i32, y, (c + a.sin() * r) as i32, solid(col));
+        }
+    }
+    g.set(c as i32, 2, c as i32, solid([0.30, 0.52, 0.18]));
+    g.mesh(0.35, true)
+}
+
+/// Leafy undergrowth bush with occasional berries/blooms.
+pub fn bush(variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(10, 7, 10);
+    let c = 5.0;
+    g.ellipsoid(c, 2.6, c, 4.4, 2.6, 4.4, solid([0.11, 0.31, 0.12]));
+    g.ellipsoid(c - 1.5, 3.4, c + 1.0, 2.6, 1.8, 2.6, solid([0.15, 0.38, 0.15]));
+    if variant % 3 == 0 {
+        for (bx, bz) in [(3, 4), (6, 5), (5, 7), (7, 3)] {
+            g.set(bx, 3, bz, solid([0.75, 0.30, 0.20])); // red bloom
+        }
+    } else if variant % 3 == 1 {
+        for (bx, bz) in [(4, 6), (6, 4)] {
+            g.set(bx, 4, bz, solid([0.85, 0.72, 0.30])); // pale flower
+        }
+    }
+    g.mesh(0.6, true)
+}
+
+/// Mossy fallen log.
+pub fn fallen_log(s: f32) -> VoxelMesh {
+    let mut g = Grid::new(24, 7, 9);
+    let bark = [0.31, 0.23, 0.14];
+    g.ellipsoid(12.0, 2.6, 4.5, 11.0 * s, 2.3, 3.4, solid(bark));
+    g.ellipsoid(12.0, 4.6, 4.5, 9.5 * s, 0.9, 2.9, solid(MOSS));
+    // hollow ends
+    g.ellipsoid(1.5, 2.6, 4.5, 1.2, 1.4, 1.8, solid([0.14, 0.10, 0.07]));
+    g.ellipsoid(22.5, 2.6, 4.5, 1.2, 1.4, 1.8, solid([0.14, 0.10, 0.07]));
+    // shelf fungus
+    g.ellipsoid(8.0, 4.4, 7.6, 1.4, 0.7, 1.0, solid([0.62, 0.48, 0.28]));
+    g.ellipsoid(17.0, 4.4, 1.6, 1.3, 0.7, 1.0, solid([0.60, 0.44, 0.24]));
+    g.mesh(0.6, true)
+}
+
+// ---------------------------------------------------------------------------
+// Overgrown ruins
+// ---------------------------------------------------------------------------
+
+/// Broken mossy column.
+pub fn ruin_pillar(_s: f32, variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(9, 26, 9);
+    let c = 4.5;
+    g.filled_box(1, 0, 1, 7, 1, 7, solid(STONE_D));
+    let top = 8 + variant % 4 * 3;
+    let mut y = 2;
+    while y < top {
+        let seg_h = 3.min(top - y);
+        let lean = ((y / 3) % 2) as f32 * 0.4 * if variant % 2 == 0 { 1.0 } else { -1.0 };
+        g.cyl_y(c + lean, c, 2.2, y, y + seg_h, solid(STONE));
+        y += seg_h;
+    }
+    // tilted fallen top piece
+    g.cyl_y(c + 1.6, c + 0.8, 2.0, top, top + 2, solid(STONE_D));
+    // moss creeping up
+    for yy in (2..top).step_by(2) {
+        g.set(2, yy, 3, solid(MOSS));
+        g.set(6, yy + 1, 6, solid([0.17, 0.38, 0.15]));
+    }
+    g.mesh(0.6, true)
+}
+
+/// Vine-draped stone archway (walk-under).
+pub fn ruin_arch(s: f32, variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(34, 26, 10);
+    let mossy = variant % 2 == 0;
+    // pillars
+    g.filled_box(3, 0, 2, 8, 15, 7, solid(STONE));
+    g.filled_box(25, 0, 2, 30, 15, 7, solid(STONE));
+    // arch courses
+    for i in 0..10 {
+        let t = i as f32 / 9.0;
+        let half = (11.0 * (1.0 - t * t).sqrt()) as i32;
+        g.filled_box(16 - half - 1, 15 + i, 2, 16 + half + 1, 16 + i, 7, solid(if i % 3 == 0 { STONE_D } else { STONE }));
+    }
+    // keystone
+    g.filled_box(15, 24, 2, 18, 25, 7, solid(STONE_D));
+    // vines hanging from the arch
+    for k in 0..7 {
+        let vx = 6 + (k * 4 + variant) % 22;
+        let len = 3 + (k * 3 + variant) % 7;
+        for y in 0..len {
+            let yy = 23 - y;
+            if yy < 4 {
+                break;
+            }
+            g.set(vx, yy, 7, solid([0.17, 0.40, 0.15]));
+            if k % 2 == 0 {
+                g.set(vx, yy, 2, solid([0.14, 0.36, 0.13]));
+            }
+        }
+    }
+    if mossy {
+        for xx in (3..9).step_by(2) {
+            g.set(xx, 1, 2, solid(MOSS));
+            g.set(31 - (xx - 3), 2, 7, solid([0.16, 0.37, 0.14]));
+        }
+    }
+    let _ = s;
+    g.mesh(0.6, true)
+}
+
+/// Crumbled L-shaped overgrown wall.
+pub fn ruin_wall(s: f32, variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(24, 12, 20);
+    let _ = variant;
+    for x in 0..20 {
+        let h = 6 - ((x * 5) % 4);
+        for y in 0..h {
+            for z in 0..3 {
+                let moss = y < 2 || (x % 5 == 0 && y < h - 1);
+                g.set(x, y, z, solid(if moss { MOSS } else { STONE }));
+            }
+        }
+    }
+    for z in 3..16 {
+        let h = 5 - ((z * 3) % 3);
+        for y in 0..h {
+            for x in 0..3 {
+                let moss = y < 2 || (z % 4 == 0);
+                g.set(x, y, z, solid(if moss { [0.18, 0.40, 0.16] } else { STONE_D }));
+            }
+        }
+    }
+    let _ = s;
+    g.mesh(0.6, true)
+}
+
+/// Small weathered stone head (mini colossus), moss-streaked.
+pub fn stone_head(s: f32, variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(14, 20, 12);
+    let _ = variant;
+    // shoulders + head
+    g.filled_box(2, 0, 2, 11, 3, 9, solid(STONE_D));
+    g.ellipsoid(7.0, 9.0, 5.5, 4.4, 6.0, 3.4, solid(STONE));
+    // brow + nose
+    g.filled_box(3, 11, 2, 10, 12, 4, solid(STONE_D));
+    g.filled_box(6, 7, 1, 7, 11, 3, solid(STONE_D));
+    // eyes
+    g.set(4, 10, 2, solid([0.10, 0.10, 0.12]));
+    g.set(9, 10, 2, solid([0.10, 0.10, 0.12]));
+    // mouth
+    g.filled_box(5, 5, 1, 8, 5, 2, solid(STONE_D));
+    // moss streaks
+    g.set(3, 8, 2, solid(MOSS));
+    g.set(10, 6, 2, solid([0.17, 0.38, 0.15]));
+    g.set(5, 1, 8, solid(MOSS));
+    let _ = s;
+    g.mesh(0.6, true)
+}
+
+/// Wooden plank bridge over the river (deck spans +X, arches slightly).
+pub fn bridge(len_cells: usize) -> VoxelMesh {
+    let mut g = Grid::new(len_cells, 9, 11);
+    let n = len_cells as i32;
+    let plank_a = [0.45, 0.34, 0.20];
+    let plank_b = [0.38, 0.28, 0.16];
+    for x in 0..n {
+        let t = x as f32 / (n - 1).max(1) as f32;
+        let arch = (1.0 - (2.0 * t - 1.0).powi(2)).max(0.0) * 2.2;
+        let y = 2 + arch as i32;
+        let col = if x % 2 == 0 { plank_a } else { plank_b };
+        g.filled_box(x, y, 3, x, y, 7, solid(col));
+        // support posts near the banks
+        if x == 1 || x == n - 2 {
+            g.filled_box(x, 0, 3, x, y, 3, solid([0.34, 0.25, 0.15]));
+            g.filled_box(x, 0, 7, x, y, 7, solid([0.34, 0.25, 0.15]));
+        }
+        // rails + rope
+        if x % 3 != 2 {
+            g.set(x, y + 3, 3, solid([0.30, 0.22, 0.13]));
+            g.set(x, y + 3, 7, solid([0.30, 0.22, 0.13]));
+        }
+        g.set(x, y + 2, 3, solid([0.52, 0.44, 0.30]));
+        g.set(x, y + 2, 7, solid([0.52, 0.44, 0.30]));
+    }
+    g.mesh(0.6, true)
+}
+
+// ---------------------------------------------------------------------------
+// Beyond-the-bounds colossal silhouettes
+// ---------------------------------------------------------------------------
+
+/// Colossal jungle giant rising from the outer hills.
+pub fn mega_tree(s: f32, variant: i32) -> VoxelMesh {
+    let mut g = Grid::new(34, 46, 34);
+    let c = 17.0;
+    let bark = [0.27, 0.20, 0.12];
+    g.cyl_y(c, c, 5.0, 0, 16, solid(bark));
+    g.cyl_y(c, c, 4.0, 16, 24, solid([0.23, 0.17, 0.10]));
+    // flaring roots
+    for k in 0..5 {
+        let a = k as f32 * 1.26 + variant as f32 * 0.7;
+        for i in 0..6 {
+            let r = 5.0 + i as f32 * 1.7;
+            let h = (12 - i * 2).max(3);
+            let x = (c + a.cos() * r) as i32;
+            let z = (c + a.sin() * r) as i32;
+            g.filled_box(x - 1, 0, z - 1, x + 2, h, z + 2, solid(bark));
+        }
+    }
+    // enormous canopy
+    let leaf_a = [0.075, 0.26, 0.095];
+    let leaf_b = [0.11, 0.33, 0.12];
+    g.ellipsoid(c, 32.0, c, 13.0 * s, 5.0 * s, 13.0 * s, solid(leaf_a));
+    g.ellipsoid(c - 7.0, 28.5, c + 4.0, 7.0 * s, 3.4 * s, 7.0 * s, solid(leaf_b));
+    g.ellipsoid(c + 6.0, 29.5, c - 6.0, 6.4 * s, 3.2 * s, 6.4 * s, solid(leaf_b));
+    g.ellipsoid(c, 37.0, c, 7.5 * s, 3.4 * s, 7.5 * s, solid(leaf_a));
+    // hollow the underside for shape + voxel savings
+    g.carve_sphere(c, 26.0, c, 9.0);
+    // long hanging vines
+    for k in 0..6 {
+        let a = k as f32 * 1.05 + variant as f32 * 0.4;
+        let x = (c + a.cos() * 10.0) as i32;
+        let z = (c + a.sin() * 10.0) as i32;
+        let len = 6 + (k * 3 + variant) % 6;
+        for y in 0..len {
+            let yy = 27 - y;
+            if yy < 14 {
+                break;
+            }
+            g.set(x, yy, z, solid([0.13, 0.33, 0.12]));
+        }
+    }
+    g.mesh(1.2, true)
+}
+
+/// Great stepped temple (hollow shell) — the "what's out there" landmark.
+pub fn ziggurat() -> VoxelMesh {
+    let mut g = Grid::new(60, 42, 60);
+    let c = 30;
+    let tiers = 5;
+    for i in 0..tiers {
+        let half = 27 - i * 5;
+        let y0 = 1 + i * 7;
+        let stone = if i % 2 == 0 { STONE } else { STONE_D };
+        // perimeter walls (hollow inside)
+        g.filled_box(c - half, y0, c - half, c + half, y0 + 6, c - half + 1, solid(stone));
+        g.filled_box(c - half, y0, c + half - 1, c + half, y0 + 6, c + half, solid(stone));
+        g.filled_box(c - half, y0, c - half, c - half + 1, y0 + 6, c + half, solid(stone));
+        g.filled_box(c + half - 1, y0, c - half, c + half, y0 + 6, c + half, solid(stone));
+        // ledge slab
+        g.filled_box(c - half, y0 + 6, c - half, c + half, y0 + 6, c + half, solid(STONE_D));
+        // moss on the lower courses
+        if i < 3 {
+            for x in (c - half..=c + half).step_by(3) {
+                g.set(x, y0, c - half, solid(MOSS));
+                g.set(x, y0 + 1, c + half, solid([0.17, 0.38, 0.15]));
+            }
+        }
+        // shrubs on the ledges
+        g.ellipsoid((c - half + 3) as f32, (y0 + 7) as f32, (c - half + 4) as f32, 2.0, 1.4, 2.0, solid([0.10, 0.30, 0.11]));
+        g.ellipsoid((c + half - 4) as f32, (y0 + 7) as f32, (c + half - 5) as f32, 1.8, 1.2, 1.8, solid([0.13, 0.35, 0.13]));
+    }
+    // grand stair (south face)
+    for i in 0..tiers * 7 {
+        let w = 3;
+        let y = 1 + tiers * 7 - i - 1;
+        let step_back = i / 7 * 5;
+        let zz = c + 27 - step_back;
+        if zz <= c + 28 && zz < 60 {
+            g.filled_box(c - w, y, zz, c + w, y + 1, zz + 1, solid(STONE_D));
+        }
+    }
+    // summit shrine
+    let top_y = 1 + tiers * 7;
+    g.filled_box(c - 5, top_y, c - 5, c + 5, top_y + 5, c + 5, solid(STONE));
+    g.filled_box(c - 2, top_y, c + 4, c + 2, top_y + 3, c + 5, solid([0.12, 0.11, 0.10])); // doorway
+    g.mesh(1.2, true)
+}
+
+/// Colossal moai-like head, half sunk into the hillside.
+pub fn colossus_head() -> VoxelMesh {
+    let mut g = Grid::new(26, 40, 24);
+    let stone = [0.33, 0.325, 0.31];
+    let stone_d = [0.25, 0.25, 0.24];
+    // head mass
+    g.ellipsoid(13.0, 20.0, 11.0, 9.5, 13.5, 8.5, solid(stone));
+    // brow ridge
+    g.filled_box(4, 26, 2, 21, 28, 6, solid(stone_d));
+    // nose
+    g.filled_box(11, 16, 1, 14, 25, 4, solid(stone_d));
+    // eyes (deep set)
+    g.filled_box(6, 24, 2, 9, 25, 4, solid([0.08, 0.08, 0.10]));
+    g.filled_box(16, 24, 2, 19, 25, 4, solid([0.08, 0.08, 0.10]));
+    // mouth
+    g.filled_box(8, 10, 1, 17, 11, 3, solid(stone_d));
+    // headdress slab
+    g.filled_box(3, 33, 3, 22, 36, 19, solid([0.42, 0.30, 0.20]));
+    // buried base
+    g.filled_box(2, 0, 2, 23, 6, 20, solid(stone_d));
+    // moss streaks down the face
+    for (mx, my) in [(5, 22), (20, 18), (13, 8), (7, 12)] {
+        for y in 0..6 {
+            let yy = my - y;
+            if yy > 1 {
+                g.set(mx, yy, 1, solid(MOSS));
+            }
+        }
+    }
+    g.mesh(1.2, true)
+}
+
+/// Broken aqueduct arc — towering ruined channel on the rim.
+pub fn aqueduct_arch() -> VoxelMesh {
+    let mut g = Grid::new(22, 42, 10);
+    let stone = [0.35, 0.345, 0.33];
+    let stone_d = [0.27, 0.265, 0.255];
+    // two pillars
+    g.filled_box(2, 0, 2, 6, 30, 7, solid(stone));
+    g.filled_box(15, 0, 2, 19, 30, 7, solid(stone));
+    // double arch
+    for i in 0..9 {
+        let t = i as f32 / 8.0;
+        let half = (7.0 * (1.0 - t * t).sqrt()) as i32;
+        g.filled_box(10 - half - 1, 30 + i, 2, 11 + half + 1, 31 + i, 7, solid(if i % 2 == 0 { stone_d } else { stone }));
+        let half2 = (half as f32 * 0.55) as i32;
+        g.filled_box(10 - half2 - 1, 21 + i, 3, 11 + half2 + 1, 22 + i, 6, solid(stone_d));
+    }
+    // broken channel on top
+    g.filled_box(2, 39, 2, 12, 41, 7, solid(stone_d));
+    // vines
+    for k in 0..5 {
+        let vx = 3 + k * 4;
+        let len = 4 + k % 5;
+        for y in 0..len {
+            let yy = 38 - y;
+            if yy < 10 {
+                break;
+            }
+            g.set(vx, yy, 2, solid([0.15, 0.37, 0.14]));
+        }
+    }
+    // moss
+    for yy in (2..12).step_by(3) {
+        g.set(2, yy, 7, solid(MOSS));
+        g.set(19, yy + 1, 2, solid([0.16, 0.38, 0.15]));
+    }
+    g.mesh(1.2, true)
+}
