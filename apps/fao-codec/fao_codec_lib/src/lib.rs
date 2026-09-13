@@ -6864,7 +6864,11 @@ pub fn compress_frame_dct(yuv: &[u8], w: usize, h: usize, quality: u8) -> Vec<u8
                 // Quantize and zigzag scan
                 let mut coeffs = [0i16; 64];
                 for i in 0..64 {
-                    coeffs[i] = (dct_out[zigzag[i] as usize] / qt[zigzag[i] as usize]).round() as i16;
+                    let raw = (dct_out[zigzag[i] as usize] / qt[zigzag[i] as usize]).round();
+                    if raw.abs() > 32767.0 {
+                        DEBUG_OVERFLOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    coeffs[i] = raw as i16;
                 }
                 
                 // Find last non-zero
@@ -6927,6 +6931,8 @@ pub fn compress_frame_dct(yuv: &[u8], w: usize, h: usize, quality: u8) -> Vec<u8
 }
 
 /// Decompress DCT-compressed frame to YUV420p.
+pub static DEBUG_ESCAPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DEBUG_OVERFLOWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub fn decompress_frame_dct(data: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
     if data.len() < 8 || data[0] != b'D' { return None; }
     let stored_w = u16::from_le_bytes([data[1], data[2]]) as usize;
@@ -6999,17 +7005,45 @@ pub fn decompress_frame_dct(data: &[u8], w: usize, h: usize) -> Option<Vec<u8>> 
                         // EOB
                         break;
                     }
-                    
+                    // The encoder's escape/filler for a zero-run of 16+: (run=15, value=0),
+                    // meaning "15 more zeros, more run to come" — NOT a coefficient. A real
+                    // symbol only ever has value != 0 (the encoder's else-branch that emits one
+                    // requires coeffs[i] != 0), so (15, 0) is unambiguous filler. Falling
+                    // through to the general branch below — as this used to — places a
+                    // spurious zero at `idx` and advances by 16 instead of 15, shifting every
+                    // coefficient after it by one position for the rest of the block. Silent at
+                    // low quality (few blocks have a run this long) and increasingly
+                    // corrupting as more AC coefficients survive quantization: PSNR got WORSE
+                    // as quality went up, a cliff a ground-truth comparison caught because
+                    // every prior test decoded a payload against ITS OWN encode's expectations
+                    // rather than a true original — which a consistent positional shift cannot
+                    // fail.
+                    if run == 15 && v_lo == 0 && v_hi == 0 {
+                        idx += 15;
+                        DEBUG_ESCAPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
                     idx += run;
                     if idx < 64 {
                         let v = i16::from_le_bytes([v_lo, v_hi]);
                         coeffs[idx] = v;
                         idx += 1;
                     } else {
+                        DEBUG_OVERFLOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         // Out of range - skip
                     }
-                    
-                    if idx >= 64 { break; }
+                    // NO "if idx >= 64 { break; }" here. The encoder ALWAYS writes an explicit
+                    // (0,0,0) EOB triplet after a block's real symbols, even when the last
+                    // stored coefficient fills idx to exactly 64 (zigzag position 63, the
+                    // highest-frequency slot). Breaking here on idx==64 exits WITHOUT reading
+                    // that triplet, leaving `pos` 3 bytes behind for every plane/block after it
+                    // — a whole-frame desync, not a local error. It only shows up once quality
+                    // is high enough that position 63 is occupied often, which is why it read
+                    // as a quality-vs-PSNR "cliff" (fine through q=77, ~15dB collapse at q=78
+                    // on the content that exposed it) rather than a correctness bug: nothing
+                    // about the desync is quality-proportional, only its PROBABILITY is. The
+                    // loop now always terminates by reading the EOB marker on the next
+                    // iteration, which is guaranteed to be there.
                 }
                 
                 // Inverse zigzag and dequantize
@@ -7533,3 +7567,97 @@ pub fn classify_superblock(plane: &[f32], w: usize, ox: usize, oy: usize) -> boo
     // Flat if low variance AND low edge energy
     variance < 30.0 && edge < 2.0  // strict: only truly flat regions
 }
+
+#[cfg(test)]
+mod dct_frame_tests {
+    use super::*;
+
+    /// Every prior test/caller of `compress_frame_dct`/`decompress_frame_dct` compared a
+    /// decoded payload against the SAME function's own encode of a smooth gradient or flat
+    /// frame — content whose 8x8 blocks rarely have a zero-run of 16 or more between surviving
+    /// coefficients, so the escape/filler symbol (`run=15, value=0`, emitted for a zero-run
+    /// this long) was almost never exercised, and never checked against ground truth when it
+    /// was. A real ffmpeg-decoded frame's busy content hits it constantly — see the
+    /// egui-frontend transcode module's `a_real_frame_survives_dct_round_trip_at_every_quality`,
+    /// which caught this as PSNR getting WORSE at higher quality (7 dB at q=80 vs 29 at q=50).
+    ///
+    /// This reproduces it precisely, in the lib, with no ffmpeg dependency: build the SAME
+    /// logical coefficient stream — 30 zeros then one nonzero coefficient at zigzag position
+    /// 30 — two ways. One uses the two-escape encoding a real encoder emits for a run this
+    /// long. The other is a single symbol with `run=30` written directly (the decoder's run
+    /// byte is not range-checked to <16, so this is a legal, simpler encoding of the identical
+    /// logical stream — the encoder just never happens to produce it). If escapes are handled
+    /// correctly, both decode to the SAME block, bit for bit; the bug shifted the escaped
+    /// version's coefficient to position 32.
+    fn one_ac_at_position_30(direct: bool) -> Vec<u8> {
+        let mut packed = Vec::new();
+        let v: i16 = 77;
+        let v_bytes = [(v as u16 & 0xFF) as u8, ((v as u16 >> 8) & 0xFF) as u8];
+        if direct {
+            packed.extend_from_slice(&[30, v_bytes[0], v_bytes[1]]); // run=30 directly
+        } else {
+            packed.extend_from_slice(&[15, 0, 0]); // escape: 15 zeros
+            packed.extend_from_slice(&[15, 0, 0]); // escape: 15 more zeros (30 total)
+            packed.extend_from_slice(&[0, v_bytes[0], v_bytes[1]]); // run=0: the value lands right here
+        }
+        packed.extend_from_slice(&[0, 0, 0]); // EOB
+        let mut frame = vec![b'D', 8, 0, 8, 0, 80]; // marker, w=8 h=8 (LE u16), quality=80
+        frame.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&zstd::encode_all(std::io::Cursor::new(&packed), 3).unwrap());
+        frame
+    }
+
+    #[test]
+    fn an_escaped_zero_run_decodes_identically_to_the_same_run_written_directly() {
+        let (w, h) = (8, 8);
+        let via_escape = decompress_frame_dct(&one_ac_at_position_30(false), w, h).expect("decodes");
+        let direct = decompress_frame_dct(&one_ac_at_position_30(true), w, h).expect("decodes");
+        assert_eq!(via_escape, direct,
+            "the escaped and direct encodings describe the SAME coefficient stream — a \
+             decoder that treats the escape's (run=15, value=0) as a real symbol shifts the \
+             coefficient at position 30 to position 32 instead");
+    }
+
+    /// A DIFFERENT bug than the escape one, found by bisecting a quality-vs-PSNR cliff that
+    /// survived the escape fix (fine at q=77, ~15dB collapse at q=78 on busy synthetic content,
+    /// with escapes=0 throughout — so not that bug). The encoder always writes an explicit
+    /// (0,0,0) EOB triplet after a block's real symbols, even when the last coefficient fills
+    /// the block exactly (zigzag position 63, `idx` reaching 64 via a store rather than via
+    /// reading the EOB). The decoder used to break out of the loop the instant `idx` reached 64
+    /// WITHOUT consuming that EOB triplet, leaving the byte cursor 3 bytes behind for every
+    /// block after it — a whole-frame desync, not a local error, which is why one bad block
+    /// this session's transcode work hit (U desynced hard, Y collapsed, V happened to still
+    /// look fine) rather than a single wrong pixel. It reads as quality-dependent because a
+    /// higher quality keeps more high-frequency coefficients alive, making position 63 more
+    /// likely to be occupied — but the desync itself has nothing to do with quality; only its
+    /// probability does. A block whose 64th (last) coefficient is nonzero reproduces it at any
+    /// quality.
+    #[test]
+    fn a_full_block_still_consumes_its_trailing_eob_marker() {
+        let (w, h) = (8, 8);
+        // Every position from 0..64 gets a small nonzero value: last coefficient is at index 63.
+        let mut packed = Vec::new();
+        for i in 0..64i16 {
+            let v = i + 1; // never zero
+            packed.extend_from_slice(&[0, (v as u16 & 0xFF) as u8, ((v as u16 >> 8) & 0xFF) as u8]);
+        }
+        packed.extend_from_slice(&[0, 0, 0]); // EOB, as the encoder always writes
+        // A second, trivial Y block (all zero, immediate EOB) right after it — this is what
+        // desyncs if the first block's EOB is not consumed: decoding it would instead read
+        // stray bytes, corrupting or failing the rest of the frame instead of a flat block.
+        packed.extend_from_slice(&[0, 0, 0]);
+        // Chroma: 16x8 luma means 8x4 chroma planes, one 8x8-block-shaped decode call each in
+        // this codec's own decode_plane (it does not special-case sub-8 dimensions) — trivial
+        // all-zero blocks, immediate EOB, one per plane.
+        packed.extend_from_slice(&[0, 0, 0]); // U
+        packed.extend_from_slice(&[0, 0, 0]); // V
+        let mut frame = vec![b'D', 16, 0, 8, 0, 80];
+        frame.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&zstd::encode_all(std::io::Cursor::new(&packed), 3).unwrap());
+        // 16x8: Y is two 8x8 blocks side by side; chroma is 8x4 (still block-shaped for this
+        // codec's own decode_plane). Every plane after the first must still be reachable.
+        let yuv = decompress_frame_dct(&frame, 16, 8);
+        assert!(yuv.is_some(), "a full block followed by a second block must still decode");
+    }
+}
+
