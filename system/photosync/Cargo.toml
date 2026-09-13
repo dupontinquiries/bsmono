@@ -18,6 +18,10 @@ rayon = "1.8"
 clap = { version = "4.4", features = ["derive"] }
 anyhow = "1.0"
 indicatif = "0.17"
+# Wire-format-only DHT primitives (InfoHash, Value, msgpack Msg framing) —
+# no transport, no routing table, no engine. See `peers.rs` for why this is
+# as far up the fleet's DHT stack as this crate reaches for now.
+dht-kit = { path = "../../shared/dht-kit" }
 walkdir = "2.4"
 notify = "6.1"
 
