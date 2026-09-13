@@ -238,5 +238,12 @@ first phase is for.
    parameter-target precedent: an unknown gate kind already refuses the
    packet, and a bump would refuse every older save file), "automation
    curve over the selected clip's group" in the palette.
-8. Triplet snap, arpeggiate/chord tools, folder-drop → kit, phone share
-   sheet with an mp3/m4a target, the drawn overlap line.
+8. Triplet snap, ~~arpeggiate/chord tools~~, ~~folder-drop → kit~~, phone
+   share sheet with ~~an mp3/m4a target~~, the drawn overlap line.
+   Built (c17): `Pattern::harmonize` / `arpeggiate` with
+   `Key::scale_step` (a tool row in the program panel, seven palette
+   verbs); a directory drop is `Studio::import_kit`; `ExportFormat::Mp3`
+   / `M4a` through `studio_video::transcode_audio`. Still open: the
+   triplet grid (a sub-step note position — a rack-wire codec change,
+   not a snap setting), the share sheet itself (a portal call), the
+   drawn overlap line.

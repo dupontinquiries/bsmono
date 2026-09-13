@@ -1125,6 +1125,32 @@ Wire target kinds 2 and 3 without a `WIRE_VERSION` bump: an older peer
 already refuses an unknown target kind outright, and a bump would
 refuse every older save file for a target most projects never draw.
 
+## Three small tools the footage kept showing
+
+**Chords on the roll.** `Key::scale_step` walks the scale (a third is
+two degrees, a fifth four, the octave seven; an out-of-key note steps
+from the nearest scale note below it). `Pattern::harmonize` copies
+every note on the channel that far away, diatonic when the project has
+a key and the major interval in semitones when not, never stacking a
+(start, key) that exists; `Pattern::arpeggiate` breaks every chord into
+a run — up, down, or up-and-down without repeating the ends — filling
+the chord's span. Channel-wide on purpose: the roll has no note
+selection, and "add fifths to this bass line" is what is meant. A tool
+row above the roll, and palette verbs.
+
+**A folder is a kit.** Drop a directory on the app and every audio file
+in it, in name order, is a sampler channel — the way a drum pack
+unzips. Non-audio and undecodable files are skipped and counted; more
+than 32 takes the first 32 and says so.
+
+**The phone's formats.** mp3 and m4a exports, through ffmpeg
+(`studio_video::transcode_audio`): the dithered WAV written beside the
+target, transcoded, removed. Stereo only, like Opus. Read back by the
+app's own decoder in the tests, the arrangement's length within a
+codec frame. Still open on this line: the share sheet itself, which is
+a portal call, and the triplet grid, which is a sub-step note position
+and therefore a rack-wire change, not a snap setting.
+
 ## The picture, rendered
 
 The arrangement rendered to audio since the first mixdown; the other
