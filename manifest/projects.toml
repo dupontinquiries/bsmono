@@ -456,6 +456,16 @@ runtime = "none"
 targets = ["desktop"]
 notes = "papercraft stalk/hide/chase game (Rust + wgpu22; Vulkan/Metal/WebGPU). Deterministic logic lives in lib.rs; the default bin renders offscreen→PNG headless (CI-safe: `cargo run --release -- out.png MODE TOD`), the live window is `--features app -- --play`. Modes: world/map/goals/poses/seq/senses/wildlife/game/prowl/capture + the open-world clan-founding sim (openworld.rs, season-tick deterministic). IN-SANDBOX BUILD (cargo 1.75): sed the lockfile `version = 4`→`3`, then pin `image 0.25.1`, `proc-macro-crate 3.1.0`, `indexmap 2.2.6` to drop the edition-2024 chains — full test suite then runs (206+ green)."
 
+[games.clawbound-battleground]
+path = "games/clawbound-battleground"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone"]
+notes = "Clawbound: Battleground — the 5v5 three-lane arena for the thirteen legendary ancestors (games/clawbound's ancestor.rs), Rust + wgpu 0.19 microvoxels. Package AND bin are both `clawbound-battleground` (lib `clawbound`), so gitmind's `-p <name>` and binary lookup agree. Headless core (sim, weather, map events, wildlife, objectives, catastrophes, input bindings, wind/reverb DSP) runs under `cargo test` with no GPU: 51 tests incl. naga validation of every WGSL shader. Default feature `audio` needs libasound2-dev to link (`--no-default-features` for a silent binary, like skydribble); `--features gamepad` adds gilrs (libudev-dev). bsgames: honours `--quick-match` and reads BSGAMES_HANDOFF_* (plays solo — no netcode yet). Controls follow skydribble/unendlich: logical-key bindings with QWERTY/Dvorak schemes saved to $XDG_CONFIG_HOME/clawbound/controls.cfg, gamepad, and an on-screen touch pad that enables itself on first touch (portrait + landscape) — the phone target is real, present mode Fifo."
+
 [games.unendlich]
 path = "games/unendlich"
 kind = "cargo"

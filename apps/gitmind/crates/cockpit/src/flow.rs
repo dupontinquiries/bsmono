@@ -1284,11 +1284,17 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     work_group.apps.push(switcheroo());
     work_group.apps.push(hatch());
     work_group.apps.push(drivemind());
+    // clawbound-battleground: a plain package at games/clawbound-battleground
+    // whose package and bin share the name, so the simple shape is exact;
+    // discovery resolves games/ at build time. Listed as a custom push rather
+    // than in `media` above because it must not join `all` twice.
+    let battleground = || crate::suite::SuiteApp::simple("clawbound-battleground", "clawbound-battleground");
     let mut media_group = group("media", "Video, camera, imaging & games", &media);
     // Media rather than music: it is a video NLE first, with the audio editor
     // sharing its core — the README's own framing.
     media_group.apps.push(studio());
     media_group.apps.push(unendlich());
+    media_group.apps.push(battleground());
     media_group.apps.push(bscale());
     let mut all_group = group("bigsilicons-apps", "Every BigSilicon app — build all in one go", &all);
     all_group.apps.push(bsettings());
@@ -1304,6 +1310,7 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     all_group.apps.push(cadscope());
     all_group.apps.push(simscope());
     all_group.apps.push(unendlich());
+    all_group.apps.push(battleground());
     vec![
         {
             // cadscope and simscope join here rather than via the simple
