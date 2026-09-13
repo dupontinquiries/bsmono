@@ -399,6 +399,11 @@ pub static GPU_SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// unfused; dispatches/passes >= the flush batch means fusion is live and the cost is per-dispatch.
 pub static GPU_PASSES_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static GPU_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Buffer-to-buffer copies recorded per decode (`copy_buf`: KV-cache row writes, `slice_cols`,
+/// NoPE pass-throughs). Counted separately from dispatches because on Honeykrisp a copy is a
+/// compute job of its own — the driver has no blit engine — so a layer's copies cost what its
+/// dispatches do and were invisible in every profile line until this counter existed.
+pub static GPU_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static SHEXP_LAYERS_LOADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Weights that reached resident form WITHOUT an f32 round-trip (q8_0 / Q4_K / Q4_0 fast paths)
 /// versus those that took the long way. Counted because a load-path optimisation that misses the
@@ -14865,6 +14870,7 @@ impl Gpu {
     /// Buffer-to-buffer copy that records into the open frame if one is active (so cache
     /// writes batch with the token's compute), else submits on its own.
     fn copy_buf(&self, src: &Tensor, src_off: u64, dst: &Tensor, dst_off: u64, bytes: u64) {
+        GPU_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(frame) = self.frame.lock().unwrap().as_mut() {
             // DRAIN FIRST, same hazard as zero_tensor. A KV cache write copied
             // out of a tensor that a queued dispatch has not yet filled reads
