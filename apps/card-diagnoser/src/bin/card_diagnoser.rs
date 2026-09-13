@@ -29,6 +29,11 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Without this the arrows in reader.rs render as boxes. This crate
+        // already depends on uikit-egui for the palette, so the fonts were
+        // one call away the whole time — see font_install_check.py, which
+        // exists because exactly this went unnoticed in switcheroo.
+        uikit_egui::fonts::install(&cc.egui_ctx);
         let ctx = cc.egui_ctx.clone();
         let wake: reader::Waker = Arc::new(move || ctx.request_repaint());
         App {
