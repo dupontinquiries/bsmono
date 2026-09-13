@@ -20,6 +20,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 settings-kit = { path = "../../../shared/settings-kit" }
 
+[dev-dependencies]
+# Building a synthetic V8MX trailer for decode.rs's v8 test (the trailer's per-web blobs are
+# zstd, same as fao_codec_lib's own encoder/decoder — see fao_codec_lib/Cargo.toml).
+zstd = "0.13"
+
 [features]
 # app default-on per the -egui house convention: `cargo build --release` = deployable bin.
 # Headless lib for CI: --no-default-features.

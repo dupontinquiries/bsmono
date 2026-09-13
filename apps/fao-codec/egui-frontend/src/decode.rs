@@ -13,10 +13,17 @@
 //!   'R' repeat marker (v8)   walk back up to 600 frames to the first non-'R' and show that
 //!   other                    raw YUV, raw RGB, or zlib of either — sized by the header
 //!
-//! What is NOT here, and says so: 'V8' / 'Z' frames need the V8MX trailer decoder (mesh +
-//! pose track + webs, ~180 lines of trailer parsing in fao_app), and 'V4'..'V7' render as
-//! nothing in the GTK app too. `decode_rgb` returns `Gap::NeedsV8` for those so the page
-//! can name the reason rather than draw a black frame; that decoder is the next slice.
+//! v8 frames ('Z', or 'V' immediately followed by '8') render through the same
+//! `V8Decoder::render_frame_rgb` fao_app calls, once a `V8MX` multi-web trailer is present.
+//! `render_frame_rgb` only ever reads `self.webs` (via `web_for_frame`) and `self.library_refs`
+//! — `scene_mesh` and `pose_track` are never consulted by the render path itself (`pose_track`
+//! only feeds the OPTIONAL jitter/EMA stabilizer, off unless `FAO_LESS_JITTER`/`FAO_POSE_EMA`
+//! are set; the per-frame pose is read straight out of the frame bytes by `V8Frame::from_bytes_
+//! any`). So a decoder built from V8MX alone renders correctly; fao_app's V8MS mesh-trailer and
+//! V8PT pose-track parsing (three on-disk pose formats, ~120 lines) are not ported — they exist
+//! for other consumers (mesh export, the World tab) rather than for turning frames into pixels.
+//! `V8LR` (library-referenced webs, needs an external library file via `FAO_LIBRARY`) is also
+//! not ported: `Gap::NeedsV8` still covers a file whose webs are all library refs.
 //!
 //! The anchor cache is the same shape as fao_app's: (index, rgb) pairs, searched newest
 //! first, so a T-chain that references one anchor decodes it once.
@@ -29,6 +36,8 @@ pub enum Gap {
     OutOfRange,
     Empty,
     /// 'V8' / 'Z': needs the V8MX trailer decoder, not ported yet.
+    /// 'V8'/'Z' with no V8MX trailer, or one whose webs are all library refs (needs an
+    /// external library file — not ported).
     NeedsV8,
     /// 'V4'..'V7': fao_app renders nothing for these either.
     Unrenderable(u8),
@@ -44,7 +53,7 @@ impl std::fmt::Display for Gap {
         match self {
             Gap::OutOfRange => write!(f, "frame index past the end of the file"),
             Gap::Empty => write!(f, "empty payload (skip frame with nothing before it)"),
-            Gap::NeedsV8 => write!(f, "v8 frame: rendering needs the V8MX trailer decoder — not ported to the egui Player yet"),
+            Gap::NeedsV8 => write!(f, "v8 frame: no V8MX web trailer (or none of its webs render without an external V8LR library)"),
             Gap::Unrenderable(m) => write!(f, "'{}' frame: fao_app renders nothing for this version either", *m as char),
             Gap::NeedsDict => write!(f, "'K' frame but the file has no FAOBKD01 block dictionary"),
             Gap::RepeatUnresolved => write!(f, "'R' repeat marker with no renderable frame in the 600 before it"),
@@ -125,6 +134,7 @@ pub struct FaoFile {
     pub header: fao_v1::FaoFileHeader,
     pub index: Vec<fao_v1::FaoFrameEntry>,
     block_dict: Option<fao_v1::block_dict::BlockDictionary>,
+    v8: Option<fao_v1::v8_reconstruction_codec::V8Decoder>,
     cache: RefCell<Vec<(usize, Vec<u8>)>>,
 }
 
@@ -137,7 +147,9 @@ impl FaoFile {
         let index = fao_v1::read_fao_index(&data, header.frame_count as usize);
         if index.is_empty() { return None; }
         let block_dict = read_block_dict(&data, &index);
-        Some(FaoFile { data, header, index, block_dict, cache: RefCell::new(Vec::new()) })
+        let v8 = read_v8mx_trailer(&data, &index)
+            .map(|webs| fao_v1::v8_reconstruction_codec::V8Decoder::new(header.width.into(), header.height.into()).with_webs(webs));
+        Some(FaoFile { data, header, index, block_dict, v8, cache: RefCell::new(Vec::new()) })
     }
     pub fn width(&self) -> usize { self.header.width as usize }
     pub fn height(&self) -> usize { self.header.height as usize }
@@ -146,6 +158,7 @@ impl FaoFile {
         if self.header.fps_den == 0 { 0.0 } else { self.header.fps_num as f64 / self.header.fps_den as f64 }
     }
     pub fn has_block_dict(&self) -> bool { self.block_dict.is_some() }
+    pub fn has_v8_webs(&self) -> bool { self.v8.is_some() }
 
     /// Payload bytes of frame `idx` (what the markers are read from).
     pub fn payload(&self, idx: usize) -> Option<Vec<u8>> {
@@ -193,7 +206,11 @@ impl FaoFile {
             return Err(Gap::RepeatUnresolved);
         }
         let is_v8 = marker == b'Z' || (marker == b'V' && bytes.get(1) == Some(&b'8'));
-        if is_v8 { return Err(Gap::NeedsV8); }
+        if is_v8 {
+            return self.v8.as_ref()
+                .and_then(|dec| dec.render_frame_rgb(&bytes, idx as u32))
+                .ok_or(Gap::NeedsV8);
+        }
 
         match marker {
             b'D' => fao_v1::decompress_frame_dct(&bytes, w, h).map(|yuv| yuv_to_rgb(&yuv, w, h)),
@@ -222,6 +239,30 @@ impl FaoFile {
             }
         }.ok_or(Gap::Failed(marker))
     }
+}
+
+/// fao_app's V8MX location logic: find the FIRST `V8MX` magic after the frame data, find where
+/// it ends (the next `V8PT`/`V8MS`/`V8RP`/`V8LR` magic, or — more precisely, when present — the
+/// u32 LE length stored in the 4 bytes immediately BEFORE the magic), and parse that span with
+/// `V8Decoder::parse_v8mx`, the same function fao_app calls. Only V8MX is located: V8MS (mesh)
+/// and V8PT (pose track) are not read by this port (see the module doc — `render_frame_rgb`
+/// never consults either), and V8LR/V8AT/V9DC are not searched for at all.
+fn read_v8mx_trailer(data: &[u8], index: &[fao_v1::FaoFrameEntry]) -> Option<Vec<fao_v1::v8_reconstruction_codec::DecodedWeb>> {
+    let frame_data_end: usize = index.iter().map(|e| (e.offset + e.size as u64) as usize).max().unwrap_or(0);
+    let search_start = frame_data_end.min(data.len());
+    if data.len() < search_start + 4 { return None; }
+    let pos = (search_start..data.len().saturating_sub(4)).find(|&i| &data[i..i + 4] == b"V8MX")?;
+    let mut end = data.len();
+    for i in (pos + 5)..data.len().saturating_sub(4) {
+        if matches!(&data[i..i + 4], b"V8PT" | b"V8MS" | b"V8RP" | b"V8LR") { end = i; break; }
+    }
+    if pos >= 4 {
+        let stated_len = u32::from_le_bytes(data[pos - 4..pos].try_into().unwrap()) as usize;
+        let computed_end = pos + stated_len;
+        if stated_len > 0 && computed_end <= data.len() && computed_end <= end { end = computed_end; }
+    }
+    let webs = fao_v1::v8_reconstruction_codec::V8Decoder::parse_v8mx(&data[pos..end])?;
+    if webs.is_empty() { None } else { Some(webs) }
 }
 
 /// fao_app's `read_block_dict`: the dictionary trailer is `FAOBKD01` + u32 LE size + bytes,
@@ -292,6 +333,92 @@ mod tests {
         assert!(Gap::NeedsV8.to_string().contains("V8MX"));
         assert!(Gap::Unrenderable(b'V').to_string().contains("fao_app"));
         assert!(Gap::Failed(b'T').to_string().contains("'T'"));
+    }
+
+    /// Builds a valid `V8MX` trailer byte-for-byte per `V8Decoder::parse_v8mx`'s own reader:
+    /// version 1, one standalone (`kind=2`) web whose mesh blob is the v1 layout (n_verts,
+    /// n_indices, n_colors headers, then the arrays), zstd-compressed. A one-triangle mesh —
+    /// enough to prove the render path runs, not to look like anything.
+    fn one_triangle_v8mx_trailer() -> Vec<u8> {
+        let verts: [[f32; 3]; 3] = [[-0.5, -0.5, 2.0], [0.5, -0.5, 2.0], [0.0, 0.5, 2.0]];
+        let colors: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let indices: [u32; 3] = [0, 1, 2];
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&3u32.to_le_bytes()); // n_verts
+        raw.extend_from_slice(&3u32.to_le_bytes()); // n_indices
+        raw.extend_from_slice(&3u32.to_le_bytes()); // n_colors
+        for v in verts { for c in v { raw.extend_from_slice(&c.to_le_bytes()); } }
+        for i in indices { raw.extend_from_slice(&i.to_le_bytes()); }
+        for c in colors { for ch in c { raw.extend_from_slice(&ch.to_le_bytes()); } }
+        let blob = zstd::encode_all(std::io::Cursor::new(&raw[..]), 1).unwrap();
+
+        let mut web = Vec::new();
+        web.extend_from_slice(&1u32.to_le_bytes());  // chunk_id
+        web.extend_from_slice(&0u32.to_le_bytes());  // canonical_id (unused for kind=2)
+        web.extend_from_slice(&0u32.to_le_bytes());  // frame_start
+        web.extend_from_slice(&9u32.to_le_bytes());  // frame_end
+        web.push(2);                                 // kind: standalone
+        for v in identity_4x4() { web.extend_from_slice(&v.to_le_bytes()); }
+        web.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        web.extend_from_slice(&blob);
+
+        let mut trailer = Vec::new();
+        trailer.extend_from_slice(b"V8MX");
+        trailer.push(1); // trailer_version 1 (legacy, no per-blob tag byte)
+        trailer.extend_from_slice(&1u32.to_le_bytes()); // n_webs
+        trailer.extend_from_slice(&web);
+        trailer
+    }
+    fn identity_4x4() -> [f32; 16] {
+        let mut m = [0.0f32; 16];
+        for i in 0..4 { m[i * 4 + i] = 1.0; }
+        m
+    }
+
+    /// A one-frame .fao whose payload is a raw (unwrapped) `V8Frame` and whose trailer is the
+    /// V8MX above — end to end through `FaoFile::parse` and `decode_rgb`, the same path a real
+    /// v8 export takes, down to the identical needle-search this port copied from fao_app.
+    #[test]
+    fn a_v8_frame_renders_through_the_real_v8_decoder() {
+        let (w, h) = (32usize, 32usize);
+        let frame = fao_v1::v8_reconstruction_codec::V8Frame {
+            camera_pose: fao_v1::v8_reconstruction_codec::CameraPose::default(),
+            features: Vec::new(),
+        };
+        let payload = frame.to_bytes();
+        assert_eq!(&payload[0..2], b"V8", "V8Frame::to_bytes should start with the v8 magic");
+        let mut out = Vec::new();
+        fao_v1::write_fao_container(&mut out, w, h, 30.0, 0.8,
+            &[(Vec::new(), payload.clone(), payload[0], payload.len(), 0.0, 0.0)]).unwrap();
+        out.extend_from_slice(&one_triangle_v8mx_trailer());
+
+        let f = FaoFile::parse(out).expect("parses with a trailer appended");
+        assert!(f.has_v8_webs(), "the V8MX trailer should have been found and parsed");
+        assert_eq!(f.markers(), vec![Some(b'V')]);
+        match f.decode_rgb(0) {
+            Ok(rgb) => {
+                assert_eq!(rgb.len(), w * h * 3);
+                assert!(rgb.iter().any(|&b| b != 0), "a rasterized triangle should not be all-black");
+            }
+            Err(g) => panic!("expected a rendered frame, got a gap: {g}"),
+        }
+    }
+
+    /// Without a V8MX trailer, the same frame is a named gap, not a silent black frame.
+    #[test]
+    fn a_v8_frame_with_no_trailer_is_a_named_gap_not_a_crash() {
+        let (w, h) = (16usize, 16usize);
+        let frame = fao_v1::v8_reconstruction_codec::V8Frame {
+            camera_pose: fao_v1::v8_reconstruction_codec::CameraPose::default(),
+            features: Vec::new(),
+        };
+        let payload = frame.to_bytes();
+        let mut out = Vec::new();
+        fao_v1::write_fao_container(&mut out, w, h, 30.0, 0.8,
+            &[(Vec::new(), payload.clone(), payload[0], payload.len(), 0.0, 0.0)]).unwrap();
+        let f = FaoFile::parse(out).unwrap();
+        assert!(!f.has_v8_webs());
+        assert_eq!(f.decode_rgb(0), Err(Gap::NeedsV8));
     }
 
     #[test]

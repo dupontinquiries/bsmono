@@ -844,6 +844,7 @@ dependencies = [
  "image",
  "settings-kit",
  "uikit-egui",
+ "zstd",
 ]
 
 [[package]]
