@@ -1686,6 +1686,19 @@ bool roll_lava(int wx, int wy, int wz, uint world_seed) {
 //   = 19.2 KB, well under M2's 32 KB workgroup limit.
 shared float cached_surface_target[NEIGHBORHOOD_COLS];
 
+// Per-column surface biome for the chunk's own 32×32 columns (4 KB; 23.2 KB total shared).
+//
+// biome_at_3d_gpu(x, chunk_origin.y, z) was called PER VOXEL — for every exposed voxel and
+// every near-surface probe hit — with a y that is constant for the whole chunk. Its arguments
+// are the column's, so its value is the column's, and it carries the one expensive loop in
+// this shader: a scan of up to 128 y-values, each a model_density + model_is_cave (multi-
+// octave 3D noise), for shelf columns. One thread walks a 4×4 column block × several calls
+// each; that serial chain per thread, 16 workgroups per batch on a GPU with hundreds of
+// cores, is the batch latency the 2026-09-01 bisect measured at 0.5-1.6 s and blamed on
+// occupancy. Computed once per column here (2 per thread), read in the voxel loop. Same
+// function, same arguments (wx/wz are float(int) both places), so the value is identical.
+shared uint cached_sbiome[CHUNK_SIZE * CHUNK_SIZE];
+
 void main() {
     uvec3 local = gl_LocalInvocationID; // [0,8) x [0,8) x [0,8)
     ivec3 chunk_origin = pc.chunk_coord * CHUNK_SIZE;
@@ -1831,6 +1844,17 @@ void main() {
 
     // ---- Phase B: per-block density / surface / ore / TREE loop ----
 
+    // Surface biome once per chunk column (see cached_sbiome). Two columns per invocation.
+    for (int k = 0; k < 2; k++) {
+        int col = int(inv_idx) * 2 + k;
+        if (col >= CHUNK_SIZE * CHUNK_SIZE) break;
+        int lx = col % CHUNK_SIZE;
+        int lz = col / CHUNK_SIZE;
+        cached_sbiome[col] = biome_at_3d_gpu(float(chunk_origin.x + lx), float(chunk_origin.y),
+                                             float(chunk_origin.z + lz), world_seed);
+    }
+    barrier();
+
     // Each invocation iterates over its 4x4x4 = 64 blocks.
     for (int dz_b = 0; dz_b < 4; dz_b++) {
         for (int dy = 0; dy < 4; dy++) {
@@ -1896,7 +1920,7 @@ void main() {
                     float t = model_temperature(dxf, dyf, dzf, world_seed);
                     // r613: CPU Phase 2 classifies with biome_at_3d at the
                     // CHUNK ORIGIN's y (one sample per column) — mirror it.
-                    uint sbiome = biome_at_3d_gpu(dxf, float(chunk_origin.y), dzf, world_seed);
+                    uint sbiome = cached_sbiome[lx + lz * CHUNK_SIZE]; // == biome_at_3d_gpu(dxf, chunk_origin.y, dzf)
                     block_id = pick_surface_block_gpu(wy, h, t, sbiome); // r611
                 } else {
                     // Subsurface or deep. Look up: is there air within 3 above?
@@ -1912,7 +1936,7 @@ void main() {
                     if (near_surface) {
                         float h = model_humidity(dxf, dyf, dzf, world_seed);
                         float t = model_temperature(dxf, dyf, dzf, world_seed);
-                        uint sbiome = biome_at_3d_gpu(dxf, float(chunk_origin.y), dzf, world_seed); // r613
+                        uint sbiome = cached_sbiome[lx + lz * CHUNK_SIZE]; // r613, cached per column
                         block_id = pick_subsurface_block_gpu(h, t, sbiome); // r611
                     } else {
                         // Deep stone — try ore.
