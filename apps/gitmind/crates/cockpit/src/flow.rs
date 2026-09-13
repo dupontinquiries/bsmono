@@ -1890,9 +1890,30 @@ pub fn detect_init_remote(user: &str, host: &str) -> crate::daemons::InitSystem 
 /// Install + enable every gitmind daemon whose binary is present on the target, writing the
 /// right service units for its init system (systemd user units on desktop, OpenRC on the phone).
 /// Graceful: missing daemon binaries are skipped, so a partial deploy still starts what it can.
+///
+/// Builds the daemon list from [`daemons::known`] — the registry PLUS whatever
+/// `discover_units` finds on disk for every `daemon = true` manifest project —
+/// not the static registry alone. Before this it called
+/// `install_daemons_script` with only `daemons::all()`'s five entries, so a
+/// remote deploy would install voiced/sharemd/coordd/settingsd/
+/// logscope-fabricd and silently never install bo-mux or the
+/// camera-bridge/camera-server/camera-view trio, even though `known()` had
+/// been able to see all of them since the discovery fix. Visible to a scan
+/// and invisible to install is exactly the gap C14_TODO §17 opened this
+/// module to close.
 pub fn install_daemons_remote(user: &str, host: &str, bin_dir: &str, home: &str) -> Result<String, String> {
     let init = detect_init_remote(user, host);
-    let script = crate::daemons::install_daemons_script(bin_dir, home, init);
+    let root = crate::ops::repo_root();
+    let manifest = std::fs::read_to_string(root.join("manifest/projects.toml"))
+        .map_err(|e| format!("reading manifest/projects.toml: {e}"))?;
+    let daemon_projects: Vec<(String, String)> = crate::appcatalog::parse_manifest(&manifest)
+        .into_iter()
+        .filter(|e| e.daemon)
+        .map(|e| (e.app_id, e.path))
+        .collect();
+    let discovered = crate::daemons::discover_units(&root, &daemon_projects);
+    let known = crate::daemons::known(&discovered);
+    let script = crate::daemons::install_daemons_script(&known, bin_dir, home, init);
     crate::deploy::remote_capture(user, host, &script)
 }
 

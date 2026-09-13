@@ -91,7 +91,14 @@ impl InitSystem {
 }
 
 /// A systemd **user** unit for a daemon (installed under ~/.config/systemd/user).
-pub fn systemd_user_unit(d: &Daemon, exec_path: &str) -> String {
+/// The shared core of [`systemd_user_unit`]: everything it needs is three
+/// `&str`s. Pulled out so a `KnownDaemon` (owned `String` fields, since a
+/// manifest-discovered daemon cannot be `&'static str`) can drive the exact
+/// same generator as the static registry's `Daemon` without a second,
+/// independently-maintained copy of this format string — which is the same
+/// class of drift C14_TODO §17 is about, one function later.
+fn systemd_user_unit_core(name: &str, description: &str, integration: &str, exec_path: &str) -> String {
+    let _ = name; // not read by this init system's unit body, but part of the shared signature
     format!(
         "[Unit]\n\
          Description={desc}\n\
@@ -105,14 +112,18 @@ pub fn systemd_user_unit(d: &Daemon, exec_path: &str) -> String {
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        desc = d.description,
-        integration = d.integration,
+        desc = description,
+        integration = integration,
         exec = exec_path,
     )
 }
 
-/// An OpenRC service script (installed under /etc/init.d, runs in the background).
-pub fn openrc_service(d: &Daemon, exec_path: &str) -> String {
+pub fn systemd_user_unit(d: &Daemon, exec_path: &str) -> String {
+    systemd_user_unit_core(d.name, d.description, d.integration, exec_path)
+}
+
+/// [`openrc_service`]'s shared core — see [`systemd_user_unit_core`].
+fn openrc_service_core(name: &str, description: &str, integration: &str, exec_path: &str) -> String {
     format!(
         "#!/sbin/openrc-run\n\
          # X-Fleet-Integration: {integration}\n\
@@ -127,11 +138,16 @@ pub fn openrc_service(d: &Daemon, exec_path: &str) -> String {
          depend() {{\n\
          \tneed net\n\
          }}\n",
-        name = d.name,
-        desc = d.description,
-        integration = d.integration,
+        name = name,
+        desc = description,
+        integration = integration,
         exec = exec_path,
     )
+}
+
+/// An OpenRC service script (installed under /etc/init.d, runs in the background).
+pub fn openrc_service(d: &Daemon, exec_path: &str) -> String {
+    openrc_service_core(d.name, d.description, d.integration, exec_path)
 }
 
 /// A daemon this fleet knows about, from either source.
@@ -224,23 +240,57 @@ pub fn known(discovered: &[(String, Vec<String>)]) -> Vec<KnownDaemon> {
 /// `appcatalog::parse_manifest` supplies both fields, so the caller filters
 /// rather than this module depending on the catalogue.
 ///
-/// The thin shell around [`daemon_names_from_units`]: a `read_dir` each, and
-/// nothing else. A project with no `systemd/` directory yields an empty list
-/// rather than an error — `bo-suite` is `daemon = true` with no units checked
-/// in, and that is a fact about the project, not a failure of the scan.
+/// Walks the WHOLE project tree for `systemd/` directories, not just one at
+/// its root. The one-path version missed real units three times over on this
+/// fleet's own layout: `apps/bo-suite/bo-mux/systemd/` (the daemon is a
+/// sub-crate of an app+daemon project, so its units are a level below the
+/// project root the manifest names), and `system/snapclone/` ships a SECOND
+/// `systemd/` directory nested under `camera-bridge/`
+/// (`camera-bridge.service`, `camera-server.service`, `camera-view.service`)
+/// that the project-root one does not contain. A comment on `known` above
+/// claimed bo-suite ships no checked-in units; it does, one level down, which
+/// is the failure mode a hybrid project's daemon-as-subcrate produces and
+/// exactly why this walks rather than joins one path.
+///
+/// `.git`, `target` and `node_modules` are pruned so this cannot wander into
+/// a build artifact or history and either hang or report a false unit.
 pub fn discover_units(root: &std::path::Path, projects: &[(String, String)])
     -> Vec<(String, Vec<String>)>
 {
+    fn walk(dir: &std::path::Path, names: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else { continue };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let fname = entry.file_name();
+            let fname = fname.to_string_lossy();
+            if fname == ".git" || fname == "target" || fname == "node_modules" {
+                continue;
+            }
+            if fname == "systemd" {
+                if let Ok(rd2) = std::fs::read_dir(&path) {
+                    names.extend(
+                        rd2.filter_map(|e| e.ok())
+                            .map(|e| e.file_name().to_string_lossy().into_owned()),
+                    );
+                }
+                // A systemd/ directory is a leaf for this purpose: no
+                // project in the fleet nests one systemd/ inside another,
+                // and descending into it would mean re-applying the
+                // service/socket dance to unit file CONTENTS.
+                continue;
+            }
+            walk(&path, names);
+        }
+    }
+
     let mut out = Vec::new();
     for (id, rel) in projects {
-        let dir = root.join(rel).join("systemd");
-        let names: Vec<String> = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        let mut names = Vec::new();
+        walk(&root.join(rel), &mut names);
         out.push((id.clone(), daemon_names_from_units(&names)));
     }
     out
@@ -406,44 +456,61 @@ pub fn parse_status(output: &str) -> Vec<(String, bool)> {
 }
 
 /// The unit file path a daemon's service lands at, for the given init system.
-pub fn unit_path(d: &Daemon, init: InitSystem, home: &str) -> String {
+fn unit_path_core(name: &str, init: InitSystem, home: &str) -> String {
     match init {
-        InitSystem::Systemd => format!("{home}/.config/systemd/user/{}.service", d.name),
-        InitSystem::OpenRc => format!("/etc/init.d/{}", d.name),
+        InitSystem::Systemd => format!("{home}/.config/systemd/user/{name}.service"),
+        InitSystem::OpenRc => format!("/etc/init.d/{name}"),
+    }
+}
+
+pub fn unit_path(d: &Daemon, init: InitSystem, home: &str) -> String {
+    unit_path_core(d.name, init, home)
+}
+
+fn enable_cmd_core(name: &str, init: InitSystem) -> String {
+    match init {
+        InitSystem::Systemd => format!("systemctl --user enable --now {name}.service"),
+        InitSystem::OpenRc => format!("rc-update add {name} default && rc-service {name} start"),
     }
 }
 
 /// The command to enable + start a daemon now, for the given init system.
 pub fn enable_cmd(d: &Daemon, init: InitSystem) -> String {
-    match init {
-        InitSystem::Systemd => format!("systemctl --user enable --now {}.service", d.name),
-        InitSystem::OpenRc => format!("rc-update add {name} default && rc-service {name} start", name = d.name),
-    }
+    enable_cmd_core(d.name, init)
 }
 
 /// A shell script that installs + enables every daemon whose binary is present in `bin_dir`,
 /// writing the right unit for `init` and enabling it. Skips daemons whose binary is missing so a
 /// partial deploy still works (graceful).
-pub fn install_daemons_script(bin_dir: &str, home: &str, init: InitSystem) -> String {
+///
+/// Takes `&[KnownDaemon]` — [`known`]'s merged registry-plus-discovery list — rather than
+/// [`all`]'s static five. Before this it iterated `all()` directly, so a daemon `discover_units`
+/// found (bo-mux, camera-bridge, camera-server, camera-view, plus whatever a future project adds)
+/// was VISIBLE to `known()` and still never installed: two mechanisms in this one module
+/// disagreeing about the same fleet, which is exactly what C14_TODO §17 is about. A discovered
+/// daemon's empty `integration` shows up as `X-Fleet-Integration=` in its generated unit — bare
+/// but present, matching what `is_fleet_daemon` already expects for a daemon with no declared
+/// core-kit.
+pub fn install_daemons_script(known: &[KnownDaemon], bin_dir: &str, home: &str, init: InitSystem) -> String {
     let mut s = String::from("#!/bin/sh\nset -e\n");
     s.push_str(&format!("# install + enable gitmind daemons ({})\n", init.as_str()));
     if init == InitSystem::Systemd {
         s.push_str(&format!("mkdir -p {home}/.config/systemd/user\n"));
     }
-    for d in all() {
+    for d in known {
         let exec = format!("{bin_dir}/{}", d.name);
-        let unit = unit_path(d, init, home);
+        let unit = unit_path_core(&d.name, init, home);
         let body = match init {
-            InitSystem::Systemd => systemd_user_unit(d, &exec),
-            InitSystem::OpenRc => openrc_service(d, &exec),
+            InitSystem::Systemd => systemd_user_unit_core(&d.name, &d.description, &d.integration, &exec),
+            InitSystem::OpenRc => openrc_service_core(&d.name, &d.description, &d.integration, &exec),
         };
         s.push_str(&format!("if [ -x \"{exec}\" ]; then\n"));
         s.push_str(&format!("  cat > \"{unit}\" <<'UNIT'\n{body}UNIT\n"));
         if init == InitSystem::OpenRc {
             s.push_str(&format!("  chmod +x \"{unit}\"\n"));
         }
-        s.push_str(&format!("  {}\n", enable_cmd(d, init)));
-        s.push_str(&format!("  echo \"  ✓ {} ({})\"\n", d.name, d.socket));
+        s.push_str(&format!("  {}\n", enable_cmd_core(&d.name, init)));
+        s.push_str(&format!("  echo \"  ✓ {}\"\n", d.name));
         s.push_str(&format!("else echo \"  – skip {} (binary not installed)\"; fi\n", d.name));
     }
     if init == InitSystem::Systemd {
@@ -537,16 +604,25 @@ mod tests {
 
     #[test]
     fn install_script_covers_daemons_and_is_graceful() {
-        let sh = install_daemons_script("/home/user/.local/bin", "/home/user", InitSystem::Systemd);
-        // every daemon referenced
+        // Built from `known()`, not `all()` — a discovered daemon (no
+        // registry entry, found on disk by discover_units) must be
+        // installable too, not just visible. This is the regression
+        // C14_TODO §17 names for install specifically: discovery alone found
+        // bo-mux and the camera-bridge trio and still never installed them.
+        let discovered = vec![("bo-suite".to_string(), vec!["bo-mux".to_string()])];
+        let k = known(&discovered);
+        let sh = install_daemons_script(&k, "/home/user/.local/bin", "/home/user", InitSystem::Systemd);
+        // every registry daemon referenced
         for d in all() {
             assert!(sh.contains(d.name), "script mentions {}", d.name);
         }
+        // and the discovered one too, with no registry entry of its own
+        assert!(sh.contains("bo-mux"), "a discovered daemon must be installed, not just seen");
         // graceful: only installs present binaries
         assert!(sh.contains("if [ -x"));
         assert!(sh.contains("skip"));
         // openrc variant chmods the init script
-        let rc = install_daemons_script("/usr/local/bin", "/root", InitSystem::OpenRc);
+        let rc = install_daemons_script(&k, "/usr/local/bin", "/root", InitSystem::OpenRc);
         assert!(rc.contains("chmod +x") && rc.contains("rc-update add"));
     }
 
@@ -739,21 +815,49 @@ mod tests {
         // test stayed green.
         let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../.."));
         let projects = vec![
-            ("snapclone".to_string(), "apps/snapclone".to_string()),
+            // `daemon = true` in the manifest is `system.snapclone` at
+            // `system/snapclone` — NOT `apps/snapclone`. An earlier version
+            // of this test used `apps/snapclone`, which happens to carry a
+            // mirrored `systemd/` tree too and so passed for the wrong
+            // reason: it was never testing the project the manifest marks.
+            ("snapclone".to_string(), "system/snapclone".to_string()),
             ("photosync".to_string(), "system/photosync".to_string()),
             ("voiced".to_string(), "apps/voiced".to_string()),
-            // `daemon = true` with NO systemd directory. Must be empty, not an
-            // error — a fact about the project, not a failure of the scan.
+            // `daemon = true`, and its units are a level below the project
+            // root the manifest names: apps/bo-suite/bo-mux/systemd/, not
+            // apps/bo-suite/systemd/. A comment here used to say bo-suite
+            // ships no units at all; it does, one level down, which is
+            // exactly the shape a hybrid app+daemon project produces and
+            // exactly what the one-path version of this scan could not see.
             ("bo-suite".to_string(), "apps/bo-suite".to_string()),
         ];
         let found = discover_units(root, &projects);
         let of = |id: &str| found.iter().find(|(p, _)| p == id).map(|(_, v)| v.clone()).unwrap();
 
-        assert_eq!(of("snapclone"), vec!["snapclone-bus", "snapclone-camera-bridge"]);
+        // snapclone ships TWO systemd/ directories in its own tree: the
+        // project root (snapclone-bus, snapclone-camera-bridge) and a second
+        // one nested under camera-bridge/ (camera-bridge, camera-server,
+        // camera-view). All five must be visible — the project-root-only
+        // version found two and silently dropped three.
+        assert_eq!(
+            of("snapclone"),
+            vec![
+                "camera-bridge",
+                "camera-server",
+                "camera-view",
+                "snapclone-bus",
+                "snapclone-camera-bridge",
+            ]
+        );
         assert_eq!(of("photosync"), vec!["photosync"]);
         // voiced ships a .socket beside its .service; only one daemon.
         assert_eq!(of("voiced"), vec!["voiced"]);
-        assert!(of("bo-suite").is_empty(), "a project with no systemd/ was not empty");
+        assert_eq!(
+            of("bo-suite"),
+            vec!["bo-mux"],
+            "bo-mux's unit lives a directory below the project root and must \
+             still be found"
+        );
 
         // A missing project directory is also empty rather than a panic — the
         // manifest can name a path before the tree exists.
@@ -768,15 +872,70 @@ mod tests {
         // adds a daemon project without units or removes the discovery.
         let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../.."));
         let projects = vec![
-            ("snapclone".to_string(), "apps/snapclone".to_string()),
+            ("snapclone".to_string(), "system/snapclone".to_string()),
             ("photosync".to_string(), "system/photosync".to_string()),
+            ("bo-suite".to_string(), "apps/bo-suite".to_string()),
         ];
         let k = known(&discover_units(root, &projects));
         let names: Vec<&str> = k.iter().map(|d| d.name.as_str()).collect();
-        for want in ["snapclone-bus", "snapclone-camera-bridge", "photosync"] {
+        for want in [
+            "snapclone-bus",
+            "snapclone-camera-bridge",
+            "camera-bridge",
+            "camera-server",
+            "camera-view",
+            "photosync",
+            "bo-mux",
+        ] {
             assert!(names.contains(&want), "{want} still invisible: {names:?}");
         }
         assert!(names.contains(&"voiced"), "the registry entries were lost");
+    }
+
+    #[test]
+    fn every_manifest_daemon_project_is_covered_by_all_or_discovery() {
+        // The actual regression guard C14_TODO §17 asked for: cross-check
+        // EVERY `daemon = true` project in the real manifest against `all()`
+        // plus discovery, so a new daemon with no registry entry and no
+        // systemd/ units (a project marked `daemon = true` prematurely, or a
+        // units directory nobody wired) shows up here as a fact rather than
+        // as silence in daemons::all(). Not a fixture: parses the real
+        // manifest and walks the real tree, same as the two tests above.
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../.."));
+        let manifest = std::fs::read_to_string(root.join("manifest/projects.toml"))
+            .expect("manifest/projects.toml must exist at the repo root");
+        // `daemons.rs` stays pure and does not depend on `appcatalog` (see the
+        // doc on `discover_units`: "the caller filters rather than this
+        // module depending on the catalogue") — so this test, playing the
+        // caller, does the filtering the same way a real one would.
+        let projects: Vec<(String, String)> = crate::appcatalog::parse_manifest(&manifest)
+            .into_iter()
+            .filter(|e| e.daemon)
+            .map(|e| (e.app_id, e.path))
+            .collect();
+        assert!(
+            projects.len() >= 7,
+            "expected at least the 7 daemon=true projects known when this test \
+             was written (bo-suite, snapclone, photosync, sharemd, settingsd, \
+             voiced, coordd); found {}: {projects:?}",
+            projects.len()
+        );
+
+        let k = known(&discover_units(root, &projects));
+        let uncovered: Vec<&String> = projects
+            .iter()
+            .map(|(id, _)| id)
+            .filter(|id| !k.iter().any(|d| &d.project == *id))
+            .collect();
+        // A project appearing here is not necessarily a bug — a fresh
+        // `daemon = true` marker can predate its units — but it must be
+        // seen, not silently absent, which is the whole of C14_TODO §17's
+        // complaint about the previous state.
+        assert!(
+            uncovered.is_empty(),
+            "daemon=true project(s) with neither a registry entry nor a \
+             discovered unit: {uncovered:?}"
+        );
     }
 
 }
