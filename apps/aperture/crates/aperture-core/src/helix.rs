@@ -114,7 +114,15 @@ pub enum Act {
     /// somewhere" verb in this editor is already Ctrl+G, and giving `f`
     /// a second, weaker meaning would be the worse of two bindings.
     Route,
-    /// `/`: open the in-buffer incremental search bar (`bufsearch`).
+    /// `/`: open the in-buffer find bar — the same one Ctrl+F opens.
+    ///
+    /// Deliberately not a `/`-specific searcher. `FindState` in the shell
+    /// already does incremental matching, next/prev with wraparound,
+    /// highlighting, query history and replace; a second one would drift
+    /// from it. (A `bufsearch` module was written for this before
+    /// grepping for `FindState` turned the existing bar up, and deleted
+    /// unused — the duplicate-hunting this session spent most of its time
+    /// on, committed live.)
     Search,
     /// Open the command palette. Bound to Space in Normal mode, alongside
     /// (not instead of) Ctrl+P — Helix's own leader key is Space, and a

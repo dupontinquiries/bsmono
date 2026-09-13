@@ -2781,6 +2781,52 @@ impl AppState {
                 }
                 self.after_edit(now_ms);
             }
+            Act::InsertAtLineEdge { end } => {
+                // Unconditional line edge, NOT the selection's edge —
+                // that is what distinguishes Shift-I/A from i/a. A
+                // selection is collapsed by the move itself (extend =
+                // false), which is what Helix does too: Shift-I from a
+                // visual selection puts you at the line start in Insert,
+                // not at the selection start.
+                if *end {
+                    self.editor.move_end(false);
+                } else {
+                    self.editor.move_home(false);
+                }
+            }
+            Act::SelectLine => {
+                // Helix's `x`: select the whole line the caret is on, and
+                // extend onto the next line when a line is already
+                // selected. Built from move_home/move_end with `extend`
+                // rather than a new Editor primitive, because that is
+                // exactly what "select this line" IS in terms the editor
+                // already has, and a second implementation of line bounds
+                // would be one more thing to keep in step with them.
+                if self.editor.sel.is_caret() {
+                    self.editor.move_home(false);
+                    self.editor.move_end(true);
+                } else {
+                    // Already a selection: extend a line further down,
+                    // which is what a repeated `x` means.
+                    self.editor.move_vertical(1, true);
+                    self.editor.move_end(true);
+                }
+            }
+            Act::Search => {
+                // The SAME bar Ctrl+F opens, not a second search surface.
+                // `FindState` already does incremental matching, next/prev
+                // with wraparound, match highlighting, history and replace;
+                // a `/`-specific searcher would have been a second
+                // implementation of all of it, drifting from this one the
+                // first time either changed. `open_find` also seeds the
+                // query from the selection, which is the right behaviour
+                // for `/` too — Helix's own `/` after a selection is
+                // usually "find more of this".
+                self.open_find();
+            }
+            Act::CommandPalette => {
+                self.open_palette();
+            }
             Act::EnterVisual | Act::EnterNormal | Act::Pass => {}
             Act::Route => {
                 // `f` is the route palette, not find-char: this editor's
