@@ -56,6 +56,12 @@ pub struct WordCandidate {
 struct WordEntry {
     text: String,
     chars: Vec<char>,
+    /// Frequency rank, resolved at load time. It used to be looked up per
+    /// surviving candidate through `frequency_rank`, a `HashMap<String,
+    /// usize>` — so the hot path hashed a whole word and probed a map to
+    /// recover a number that was already known when the entry was built.
+    /// Same reasoning as `chars` above, one field later.
+    rank: usize,
 }
 
 pub struct GestureRecognizer {
@@ -117,9 +123,16 @@ impl GestureRecognizer {
                 // text allocation here also serves as the frequency_rank
                 // key below (we clone for the map insert).
                 let chars: Vec<char> = lc.chars().collect();
+                // A duplicated word keeps its FIRST rank, matching the
+                // `or_insert` below — resolving it here rather than after
+                // the fact keeps the two in step. Getting this wrong would
+                // change scoring for duplicated words only, which is
+                // exactly the kind of difference a benchmark cannot see.
+                let first_rank = *self.frequency_rank.get(&lc).unwrap_or(&rank);
                 self.words_by_length[len].push(WordEntry {
                     text: lc.clone(),
                     chars,
+                    rank: first_rank,
                 });
             }
             // Keep the *first* occurrence (highest frequency) if duplicated.
@@ -267,13 +280,17 @@ impl GestureRecognizer {
         let lo = raw_len.saturating_sub(len_window);
         let hi = (raw_len + len_window).min(self.words_by_length.len().saturating_sub(1));
 
-        let mut candidates: Vec<WordCandidate> = Vec::with_capacity(64);
+        // Scored as (score, &str) rather than (score, String). Every word
+        // that survives the edit cap used to be cloned here, and then all
+        // but five were dropped by `truncate(5)` a few lines later — so the
+        // allocation count scaled with how MANY words nearly matched, which
+        // is worst exactly on the ambiguous swipes where latency shows.
+        // The borrows are of `self.words_by_length` and of `raw_lc`, both of
+        // which outlive this vec; the five survivors are cloned at the end.
+        let mut scored: Vec<(f64, &str)> = Vec::with_capacity(64);
 
         if self.frequency_rank.contains_key(&raw_lc) {
-            candidates.push(WordCandidate {
-                word: raw_lc.clone(),
-                score: 0.0,
-            });
+            scored.push((0.0, raw_lc.as_str()));
         }
 
         // Pre-compute raw-letter positions ONCE. spatial_distance
@@ -323,11 +340,7 @@ impl GestureRecognizer {
                 let len_diff = (raw_chars.len() as f64 - wc.len() as f64).abs();
                 let length_pen = len_diff * length_weight;
 
-                let rank = self
-                    .frequency_rank
-                    .get(word)
-                    .copied()
-                    .unwrap_or(self.total_words);
+                let rank = entry.rank;
                 let freq_pen = ((rank as f64 + 1.0).ln() / 12.0).min(0.8) * freq_weight;
 
                 let score = spatial * spatial_weight
@@ -336,24 +349,23 @@ impl GestureRecognizer {
                     + endpoint_bonus
                     + freq_pen;
 
-                candidates.push(WordCandidate {
-                    word: word.clone(),
-                    score,
-                });
+                scored.push((score, word.as_str()));
             }
         }
 
-        candidates.sort_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         // After sorting, equal-score duplicates of the same word are
         // adjacent (scoring is a pure function of inputs, so the same
         // word produces the same score). dedup_by avoids the
         // HashSet+String-clone-per-candidate cost.
-        candidates.dedup_by(|a, b| a.word == b.word);
-        candidates.truncate(5);
+        scored.dedup_by(|a, b| a.1 == b.1);
+        scored.truncate(5);
+
+        // Only now does anything allocate: at most five Strings per gesture.
+        let mut candidates: Vec<WordCandidate> = scored
+            .into_iter()
+            .map(|(score, word)| WordCandidate { word: word.to_string(), score })
+            .collect();
 
         // Raw-fallback penalty depends on speed: slow → low penalty so
         // the user's deliberate raw input can win. Fast → high penalty
