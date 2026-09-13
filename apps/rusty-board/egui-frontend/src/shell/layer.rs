@@ -181,6 +181,18 @@ impl State {
     }
 }
 
+/// Everything the layer surface is told about itself, in one place, because it has to be said
+/// twice: once after `get_layer_surface`, and again on every re-map — unmapping (a null-buffer
+/// commit) returns the surface to its freshly-created state, anchor included. Bottom edge, full
+/// width (width 0 = stretch between the two side anchors), a strip HEIGHT tall that other
+/// windows must make room for, and NO keyboard focus — the text goes to whoever had it.
+fn apply_layer_state(layer: &LayerSurface) {
+    layer.set_anchor(Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+    layer.set_size(0, HEIGHT);
+    layer.set_exclusive_zone(HEIGHT as i32);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+}
+
 /// Run the keyboard under the layer shell until the compositor closes it. `Err(Unsupported)`
 /// means nothing was shown and the caller may run a different shell.
 pub fn run(title: &str) -> Result<(), LayerError> {
@@ -194,13 +206,7 @@ pub fn run(title: &str) -> Result<(), LayerError> {
 
     let surface = compositor.create_surface(&qh);
     let layer = layer_shell.create_layer_surface(&qh, surface, layer_from_env(), Some(title.to_string()), None);
-    // Bottom edge, full width (width 0 = stretch between the two side anchors), a strip
-    // HEIGHT tall that other windows must make room for, and NO keyboard focus — the text goes
-    // to whoever had it.
-    layer.set_anchor(Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-    layer.set_size(0, HEIGHT);
-    layer.set_exclusive_zone(HEIGHT as i32);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+    apply_layer_state(&layer);
     // Initial commit without a buffer: this is what asks for the first configure.
     layer.commit();
 
@@ -299,8 +305,16 @@ pub fn run(title: &str) -> Result<(), LayerError> {
             }
             Some(true) if !mapped => {
                 // Show: commit without a buffer, then wait for configure (handled below).
-                state.layer.set_size(0, HEIGHT);
-                state.layer.set_exclusive_zone(HEIGHT as i32);
+                //
+                // THE WHOLE STATE, not just size and exclusive zone. Unmapping resets the layer
+                // surface "to the state it had right after layer_shell.get_layer_surface"
+                // (wlr-layer-shell-unstable-v1, "unmapping"), so the anchor is gone too — and
+                // a width of 0 without both side anchors is a protocol error, not a default:
+                //   zwlr_layer_surface_v1#7: error 1: the layer surface has a width of 0 but
+                //   its anchor doesn't include the left and the right screen edge
+                // which is how every hide→show cycle on a strict compositor (KDE, sway) killed
+                // the shell. Phones that never hide the board never saw it.
+                apply_layer_state(&state.layer);
                 state.layer.wl_surface().commit();
                 mapped = true;
                 tracing::debug!("layer: map requested");
