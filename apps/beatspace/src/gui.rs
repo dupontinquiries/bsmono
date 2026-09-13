@@ -22,10 +22,130 @@ use std::time::Instant;
 use candle_core::Device;
 use eframe::egui;
 
-use crate::config::Config;
+use crate::arrange::cmd::Command;
+use crate::arrange::model::Timeline;
+use crate::arrange::render::{Library, Sample, Transport};
+use crate::arrangepage::{ArrangeIo, ArrangeOut, ArrangeView};
+use crate::config::{Config, Playback};
+use crate::device_prefs::DevicePrefs;
+use audio_kit::BounceFormat;
 use crate::dsp::{GlState, Mel};
 use crate::model::{load_generator, Generator};
+use crate::stream::{Conductor, LatentWalk, Streamer};
 use crate::{audio_io, player};
+
+/// What the generator thread is doing, written by it once per window and
+/// read by the control column. The GUI's own `cfg` is what the NEXT training
+/// run will build; this is what is playing now, which can differ once a
+/// checkpoint has been loaded from elsewhere.
+#[derive(Clone, Default)]
+struct PlaybackInfo {
+    /// Stream (continuing windows) or loop (crossfaded beats).
+    stream: bool,
+    stems: usize,
+    ctx_frames: usize,
+    beat_phase: bool,
+    time_frames: usize,
+    stride_frames: usize,
+    overlap_frames: usize,
+    hop: usize,
+    sr: u32,
+    /// Stream: tempo the conductor is advancing at, and where in the beat
+    /// the next window starts.
+    bpm: f32,
+    phase: f32,
+    /// Stream: audio queued ahead of the playhead, in seconds.
+    lead_secs: f32,
+    /// Stream: windows rendered since the last (re)start.
+    windows: u64,
+    /// The epoch recorded beside the loaded checkpoint, when there is one.
+    epoch: Option<usize>,
+    /// Stream: the next window continues the previous one (false right
+    /// after a restart, when it starts from silence).
+    continuing: bool,
+}
+
+impl PlaybackInfo {
+    fn from_cfg(cfg: &Config, stream: bool) -> Self {
+        Self {
+            stream,
+            stems: cfg.stems,
+            ctx_frames: cfg.ctx_frames,
+            beat_phase: cfg.beat_phase,
+            time_frames: cfg.time_frames,
+            stride_frames: cfg.window_stride(),
+            overlap_frames: cfg.overlap_frames,
+            hop: cfg.hop,
+            sr: cfg.sr,
+            bpm: cfg.bpm,
+            ..Default::default()
+        }
+    }
+    fn secs(&self, frames: usize) -> f32 {
+        (frames * self.hop) as f32 / self.sr.max(1) as f32
+    }
+    /// One line saying what the listener will hear next.
+    fn headline(&self) -> String {
+        if !self.stream {
+            return format!(
+                "loop — one {:.0} ms beat, crossfaded into the next as the latent moves",
+                self.secs(self.time_frames) * 1000.0
+            );
+        }
+        let stems = if self.stems >= 2 { "drums + instruments" } else { "one mixed stem" };
+        let how = if self.ctx_frames > 0 {
+            if self.continuing { "continuing the previous window" } else { "starting from silence" }
+        } else {
+            "independent windows, phase-continued"
+        };
+        format!(
+            "stream — {stems}, {how}; {:.0} ms windows every {:.0} ms",
+            self.secs(self.time_frames) * 1000.0,
+            self.secs(self.stride_frames) * 1000.0
+        )
+    }
+}
+
+/// Knobs the control column turns on the stream. Read by the stream loop
+/// before each window; ignored by the loop player, which has none of them.
+#[derive(Clone)]
+struct StreamControls {
+    bpm: f32,
+    /// Conductor glide per window, (0, 1].
+    smoothing: f32,
+    /// Windows of audio to keep queued ahead of the playhead.
+    lead_windows: usize,
+    /// Griffin-Lim iterations per window at playback.
+    gl_iters: usize,
+    /// One-shot: forget the previous window and the beat grid, drop the
+    /// queue, start over.
+    restart: bool,
+}
+
+/// The arrangement as the audio thread sees it. The GUI owns the editor
+/// and publishes a copy of the timeline after every command; the thread
+/// renders blocks from that copy and reports where it is.
+struct ArrShared {
+    timeline: Timeline,
+    /// Behind an Arc so the GUI can take a reference each frame without
+    /// copying every decoded file; an import replaces it (copy-on-write).
+    library: Arc<Library>,
+    /// GUI -> thread.
+    playing: bool,
+    seek: Option<f64>,
+    capture: bool,
+    /// thread -> GUI: the beat the speakers are at.
+    pos: f64,
+    notice: Option<String>,
+    /// GUI -> thread: start a take at this beat / stop the running one.
+    record_toggle: Option<f64>,
+    /// thread -> GUI: seconds recorded so far, while a take runs.
+    recording_secs: Option<f32>,
+    /// thread -> GUI: a finished take to place (source, start beat,
+    /// length in beats, the tempo it was recorded at). The GUI applies it
+    /// through the editor so it is undoable like everything else.
+    pending_place: Option<(crate::arrange::model::SourceRef, f64, f64, f64)>,
+}
 
 struct Shared {
     target_z: Vec<f32>,
@@ -36,6 +156,11 @@ struct Shared {
     weights_request: Option<PathBuf>,
     loaded_label: String,
     device_label: String,
+    playback: PlaybackInfo,
+    stream_ctl: StreamControls,
+    arr: ArrShared,
+    /// The device's bounce rung, for saved beats written on this thread.
+    bounce_format: BounceFormat,
     /// Output gain the generator thread applies to its player, 0..1.
     ///
     /// Routed through Shared rather than by handing the GUI an Arc<Player>: the
@@ -59,6 +184,27 @@ pub fn run(cfg: Config) -> Result<()> {
         weights_request: None,
         loaded_label: "(none)".into(),
         device_label: "?".into(),
+        playback: PlaybackInfo::from_cfg(&cfg, cfg.playback == Playback::Stream || cfg.conditional()),
+        stream_ctl: StreamControls {
+            bpm: cfg.bpm,
+            smoothing: 0.1,
+            lead_windows: 2,
+            gl_iters: cfg.griffin_iters_rt,
+            restart: false,
+        },
+        arr: ArrShared {
+            timeline: Timeline::default(),
+            library: Arc::new(Library::default()),
+            playing: false,
+            seek: None,
+            capture: false,
+            pos: 0.0,
+            notice: None,
+            record_toggle: None,
+            recording_secs: None,
+            pending_place: None,
+        },
+        bounce_format: DevicePrefs::load().bounce_format,
         gain: 1.0,
         stopped: false,
     }));
@@ -110,7 +256,113 @@ pub fn run(cfg: Config) -> Result<()> {
 // generator / audio thread
 // ----------------------------------------------------------------------------
 
+/// Samples per arrangement block. ~93 ms at 22050: short enough that an
+/// edit is heard promptly, long enough that the lock is not taken often.
+const ARR_BLOCK: usize = 2048;
+
+/// The arrangement's share of a generator loop iteration: capture the
+/// window that is playing when asked, and while the arrangement is
+/// playing, render its blocks into the player instead of generating.
+///
+/// Returns true when the arrangement has the audio and the caller should
+/// skip its own generation this iteration. `render_hq` gives the caller's
+/// current window at full quality for a capture; `stream_player` says
+/// whether the caller's player is in stream mode (a loop-mode player is
+/// put back when the arrangement stops).
+struct ArrService {
+    transport: Transport,
+    was_playing: bool,
+    pushed: bool,
+}
+
+impl ArrService {
+    fn new() -> Self {
+        Self { transport: Transport::default(), was_playing: false, pushed: false }
+    }
+
+    fn tick(
+        &mut self,
+        cfg: &Config,
+        shared: &Arc<Mutex<Shared>>,
+        audio: &Arc<Mutex<player::Player>>,
+        stream_player: bool,
+        render_hq: impl FnOnce() -> Option<(Vec<f32>, Option<Vec<f32>>, f32)>,
+    ) -> bool {
+        // Capture, whether or not the arrangement is playing.
+        let capture = {
+            let mut s = shared.lock().unwrap();
+            std::mem::take(&mut s.arr.capture)
+        };
+        if capture {
+            match render_hq() {
+                Some((audio_hq, planes, bpm)) => {
+                    let mut s = shared.lock().unwrap();
+                    let n = s.arr.library.beats.len() + 1;
+                    Arc::make_mut(&mut s.arr.library).add_beat(Sample { name: format!("beat {n}"), audio: audio_hq, sr: cfg.sr, planes, bpm: Some(bpm) });
+                    s.arr.notice = Some(format!("captured beat {n}"));
+                }
+                None => shared.lock().unwrap().arr.notice = Some("nothing playing to capture".into()),
+            }
+        }
+
+        let (playing, seek) = {
+            let mut s = shared.lock().unwrap();
+            (s.arr.playing, s.arr.seek.take())
+        };
+        if let Some(b) = seek {
+            self.transport.seek(b);
+            if playing {
+                audio.lock().unwrap().clear_stream();
+                self.pushed = false;
+            }
+        }
+        if !playing {
+            if self.was_playing {
+                // Hand the device back to the generator.
+                let mut p = audio.lock().unwrap();
+                if stream_player { p.clear_stream() } else { p.stop_stream() }
+                self.was_playing = false;
+                self.pushed = false;
+            }
+            return false;
+        }
+        if !self.was_playing {
+            audio.lock().unwrap().clear_stream();
+            self.was_playing = true;
+            self.pushed = false;
+        }
+        let queued = audio.lock().unwrap().queued_src_samples();
+        let low_water = 3 * ARR_BLOCK;
+        if queued < low_water {
+            let mut block = vec![0.0f32; ARR_BLOCK];
+            let started = {
+                let s = shared.lock().unwrap();
+                self.transport.render_next(&s.arr.timeline, &s.arr.library, cfg.sr, &mut block)
+            };
+            let (queued, scope) = {
+                let mut p = audio.lock().unwrap();
+                p.push_window(&block, if self.pushed { ARR_BLOCK } else { 0 });
+                (p.queued_src_samples(), p.scope_snapshot())
+            };
+            self.pushed = true;
+            let mut s = shared.lock().unwrap();
+            let lag_beats = queued as f64 / cfg.sr as f64 * s.arr.timeline.bpm / 60.0;
+            s.arr.pos = (started - lag_beats).max(0.0);
+            s.scope = scope;
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        true
+    }
+}
+
 fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> Result<()> {
+    // A conditional renderer cannot be looped — every window needs the one
+    // before it — so the stream loop is the only sensible playback for it,
+    // whatever the config says; and a legacy model streams fine.
+    if cfg.playback == Playback::Stream || cfg.conditional() {
+        return stream_loop(cfg, shared, stop);
+    }
     let dev = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
     {
         let mut s = shared.lock().unwrap();
@@ -128,7 +380,9 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
         if let Err(e) = load_generator(&mut g, &latest, &dev) {
             eprintln!("[gui] failed to load {latest:?}: {e}");
         } else {
-            shared.lock().unwrap().loaded_label = latest.display().to_string();
+            let mut s = shared.lock().unwrap();
+            s.loaded_label = latest.display().to_string();
+            s.playback.epoch = crate::train::read_resume_epoch_in(&cfg.ckpt_dir);
         }
     }
 
@@ -140,6 +394,9 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
 
     let latent = cfg.latent;
     let mut current_z = vec![0.0f32; latent];
+    let mut arr = ArrService::new();
+    // The last window rendered, for a capture.
+    let mut last: Option<(Vec<f32>, usize)> = None;
 
     // One beat is `time_frames` hops long. Pace generation to a little under
     // the beat duration so windows overlap (the player crossfades them) and we
@@ -206,9 +463,30 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
                     cur_latent = lat;
                     let mut s = shared.lock().unwrap();
                     s.loaded_label = format!("{} ({frames}f)", path.display());
+                    s.playback.time_frames = frames;
+                    s.playback.epoch = path.parent().and_then(crate::train::read_resume_epoch_in);
                 }
                 Err(e) => eprintln!("[gui] load weights {path:?}: {e}"),
             }
+        }
+
+        {
+            let (gain, stopped) = {
+                let s = shared.lock().unwrap();
+                (s.gain, s.stopped)
+            };
+            let mut p = audio.lock().unwrap();
+            p.set_gain(gain);
+            p.set_stopped(stopped);
+        }
+        let last_ref = last.clone();
+        let (mel_ref, iters, bpm) = (&mel, cfg.griffin_iters, cfg.bpm);
+        if arr.tick(&cfg, &shared, &audio, false, || {
+            let (flat, t) = last_ref?;
+            let hq = mel_ref.mel_to_wav(&flat, t, iters);
+            Some((hq, Some(flat), bpm))
+        }) {
+            continue;
         }
 
         // exponential smoothing toward target (the "thumb glides" feel)
@@ -218,6 +496,7 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
 
         let t0 = Instant::now();
         let (flat, _n_mels, t) = g.generate(&current_z, &dev)?;
+        last = Some((flat.clone(), t));
         // warm-started, low-iteration inversion: fast and smooth while morphing
         let wav = mel.mel_to_wav_warm(&flat, t, cfg.griffin_iters_rt, &mut gl);
         let gen_ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -241,10 +520,11 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
             // render a clean, high-quality version from the same latent (fresh
             // phase, full iterations) rather than saving the realtime preview
             let hq = mel.mel_to_wav(&flat, t, cfg.griffin_iters);
-            if let Err(e) = audio_io::save_wav(&path, &hq, cfg.sr) {
-                eprintln!("[gui] save wav {path:?}: {e}");
-            } else {
-                println!("[gui] saved {path:?} ({} iters)", cfg.griffin_iters);
+            let rung = shared.lock().unwrap().bounce_format;
+            let target = audio_io::unique_path(&audio_io::with_format_ext(&path, rung));
+            match audio_io::save_audio(&target, &hq, cfg.sr, rung) {
+                Ok(written) => println!("[gui] saved {} ({} iters)", written.display(), cfg.griffin_iters),
+                Err(e) => eprintln!("[gui] save {path:?}: {e}"),
             }
         }
 
@@ -265,6 +545,213 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
     Ok(())
 }
 
+/// The stream: windows that continue each other, paced by the audio queue.
+///
+/// Where `gen_loop` renders a beat from the latent and crossfades into it
+/// from the top, this asks the conductor for a step, the streamer for the
+/// window after the last one, and the player to overlap-add it; then it
+/// waits until the queue is short enough to need another. Generation is
+/// driven by how far ahead of the playhead it is, not by a timer, so a slow
+/// render eats into the lead rather than into the beat grid.
+///
+/// The conductor is `LatentWalk` — the same 0.9/0.1 glide, with a beat
+/// clock — behind the `Conductor` trait. A learned one replaces it here and
+/// nowhere else.
+fn stream_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> Result<()> {
+    let dev = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+    {
+        let mut s = shared.lock().unwrap();
+        s.device_label = format!("{dev:?} · stream");
+    }
+
+    let mut g = Generator::new(&cfg, &dev)?;
+    let latest = cfg.ckpt_dir.join("gen_latest.safetensors");
+    if latest.exists() {
+        if let Err(e) = load_generator(&mut g, &latest, &dev) {
+            eprintln!("[gui] failed to load {latest:?}: {e}");
+        } else {
+            let mut s = shared.lock().unwrap();
+            s.loaded_label = latest.display().to_string();
+            s.playback.epoch = crate::train::read_resume_epoch_in(&cfg.ckpt_dir);
+        }
+    }
+    let mut streamer = Streamer::new(&cfg, g, dev.clone());
+    let mut walk = LatentWalk::new(&cfg);
+    let mut windows: u64 = 0;
+    let mut arr = ArrService::new();
+    let mut take: Option<crate::stream::Take> = None;
+
+    let (_stream, audio) = player::start(cfg.sr)?;
+
+    // Lead: how many windows of audio to keep queued. Less and a slow
+    // render is a dropout; more and a pad move takes that much longer to
+    // be heard. Set from the control column.
+    let advance = cfg.window_stride() * cfg.hop;
+
+    while !stop.load(Ordering::Relaxed) {
+        let (target, weights_req, save_req, ctl) = {
+            let mut s = shared.lock().unwrap();
+            let ctl = s.stream_ctl.clone();
+            s.stream_ctl.restart = false;
+            (s.target_z.clone(), s.weights_request.take(), s.save_request.take(), ctl)
+        };
+        let low_water = ctl.lead_windows.max(1) * advance;
+        walk.set_bpm(&cfg, ctl.bpm);
+        walk.set_smoothing(ctl.smoothing);
+        if ctl.restart {
+            streamer.reset();
+            walk.reset_phase();
+            audio.lock().unwrap().clear_stream();
+            windows = 0;
+        }
+
+        if let Some(path) = weights_req {
+            // The config.json next to the checkpoint is the authority on the
+            // conditional geometry — stems, context, phase planes — which
+            // `g.fc.w` alone cannot say. A checkpoint without one is loaded
+            // into the running config's shape, and a mismatch is reported by
+            // name rather than rebuilt around.
+            let sibling = path.parent().map(|d| d.join("config.json"));
+            let build_cfg = match sibling.filter(|p| p.exists()).and_then(|p| Config::load_json(&p).ok()) {
+                Some(saved) => match cfg.shape_compatible_with(&saved) {
+                    Ok(()) => cfg.clone(),
+                    Err(why) => {
+                        eprintln!(
+                            "[gui] {} was trained with a different model shape ({why}); \
+restart the GUI with --ckpt-dir pointing at its directory",
+                            path.display()
+                        );
+                        continue;
+                    }
+                },
+                None => cfg.clone(),
+            };
+            match Generator::new(&build_cfg, &dev).and_then(|mut ng| load_generator(&mut ng, &path, &dev).map(|_| ng)) {
+                Ok(ng) => {
+                    streamer.set_generator(ng);
+                    let mut s = shared.lock().unwrap();
+                    s.loaded_label = path.display().to_string();
+                    s.playback.epoch = path.parent().and_then(crate::train::read_resume_epoch_in);
+                }
+                Err(e) => eprintln!("[gui] load weights {path:?}: {e}"),
+            }
+        }
+
+        let (gain, stopped) = {
+            let s = shared.lock().unwrap();
+            (s.gain, s.stopped)
+        };
+        let queued = {
+            let mut p = audio.lock().unwrap();
+            p.set_gain(gain);
+            p.set_stopped(stopped);
+            p.queued_src_samples()
+        };
+        {
+            let (st, iters) = (&streamer, cfg.griffin_iters);
+            let bpm = ctl.bpm;
+            if arr.tick(&cfg, &shared, &audio, true, || {
+                let hq = st.render_last_hq(iters)?;
+                Some((hq, st.last_planes().map(|p| p.to_vec()), bpm))
+            }) {
+                continue;
+            }
+        }
+        if queued >= low_water && save_req.is_none() {
+            // Nothing to render; keep the lead reading live while waiting.
+            shared.lock().unwrap().playback.lead_secs = queued as f32 / cfg.sr as f32;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        }
+
+        let continuing = streamer.last_planes().is_some();
+        let t0 = Instant::now();
+        let window = {
+            let step = walk.step(&target);
+            streamer.next_window(&step, ctl.gl_iters.max(1))?
+        };
+        let gen_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        windows += 1;
+        let queued = {
+            let mut p = audio.lock().unwrap();
+            p.push_window(&window.audio, window.advance);
+            p.queued_src_samples()
+        };
+        // Recording: the same windows the player got, overlap-added into a
+        // take. Toggled from the arrange page; a finished take goes into
+        // the library and is handed back to be placed.
+        let toggle = shared.lock().unwrap().arr.record_toggle.take();
+        if let Some(start_beat) = toggle {
+            match take.take() {
+                Some(t) => finish_take(t, &cfg, &shared),
+                None => {
+                    take = Some(crate::stream::Take::start(start_beat, ctl.bpm, cfg.sr));
+                    shared.lock().unwrap().arr.notice = Some(format!("recording from beat {start_beat:.2}"));
+                }
+            }
+        }
+        if let Some(t) = take.as_mut() {
+            t.push(&window);
+            shared.lock().unwrap().arr.recording_secs = Some(t.secs());
+        }
+
+        if let Some(path) = save_req {
+            match streamer.render_last_hq(cfg.griffin_iters) {
+                Some(hq) => {
+                    let rung = shared.lock().unwrap().bounce_format;
+                    let target = audio_io::unique_path(&audio_io::with_format_ext(&path, rung));
+                    match audio_io::save_audio(&target, &hq, cfg.sr, rung) {
+                        Ok(written) => println!("[gui] saved {} ({} iters)", written.display(), cfg.griffin_iters),
+                        Err(e) => eprintln!("[gui] save {path:?}: {e}"),
+                    }
+                }
+                None => eprintln!("[gui] nothing rendered yet to save"),
+            }
+        }
+
+        let scope = audio.lock().unwrap().scope_snapshot();
+        {
+            let mut s = shared.lock().unwrap();
+            s.current_z = walk.current().to_vec();
+            s.gen_ms = gen_ms;
+            s.scope = scope;
+            let p = &mut s.playback;
+            p.stream = true;
+            p.bpm = ctl.bpm;
+            p.phase = walk.beat_phase();
+            p.lead_secs = queued as f32 / cfg.sr as f32;
+            p.windows = windows;
+            p.continuing = continuing;
+        }
+    }
+    Ok(())
+}
+
+/// Add a finished take to the library and queue its placement.
+fn finish_take(t: crate::stream::Take, cfg: &Config, shared: &Arc<Mutex<Shared>>) {
+    let (start_beat, bpm) = (t.start_beat, t.bpm());
+    let mut s = shared.lock().unwrap();
+    s.arr.recording_secs = None;
+    match t.finish() {
+        Some((audio, beats)) => {
+            let n = s.arr.library.beats.len() + 1;
+            let secs = audio.len() as f32 / cfg.sr as f32;
+            // The take knows its tempo, so it is placed locked to it and
+            // follows the arrangement's tempo from then on.
+            let r = Arc::make_mut(&mut s.arr.library).add_beat(Sample {
+                name: format!("take {n}"),
+                audio,
+                sr: cfg.sr,
+                planes: None,
+                bpm: Some(bpm),
+            });
+            s.arr.pending_place = Some((r, start_beat, beats, bpm as f64));
+            s.arr.notice = Some(format!("take {n}: {secs:.1} s, placed at beat {start_beat:.2}"));
+        }
+        None => s.arr.notice = Some("the take was empty".into()),
+    }
+}
+
 // ----------------------------------------------------------------------------
 // GUI
 // ----------------------------------------------------------------------------
@@ -277,6 +764,7 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
 enum Page {
     Morph,
     Train,
+    Arrange,
 }
 
 struct App {
@@ -323,12 +811,21 @@ struct App {
     ckpt_text: String,
     save_text: String,
     status: String,
+    /// The arrangement page's editor, tools and view state.
+    arrange: ArrangeView,
+    /// This device's preferences (the bounce rung), from the sidecar.
+    device: DevicePrefs,
+    /// Whether the model shape in `cfg` (what the next run builds) matches
+    /// the checkpoint directory's config.json. Refreshed on the cache timer
+    /// rather than per frame; `None` when there is no checkpoint to compare.
+    shape_note: Option<Result<(), String>>,
 }
 
 const RANGE: f32 = 3.0; // pad maps to [-RANGE, RANGE]
 
 impl App {
     fn new(cfg: Config, shared: Arc<Mutex<Shared>>) -> Self {
+        let project_path = crate::arrange::project::default_dir(&cfg.ckpt_dir).display().to_string();
         let latent = cfg.latent;
         // Computed before the struct literal moves cfg into it.
         let ckpt_text = cfg
@@ -359,8 +856,15 @@ impl App {
             walk_t: None,
             walk_speed: 0.01,
             ckpt_text,
-            save_text: "beat.wav".into(),
+            save_text: "beat".into(),
             status: "drag on the pad to morph".into(),
+            shape_note: None,
+            arrange: {
+                let mut a = ArrangeView::default();
+                a.project_path = project_path;
+                a
+            },
+            device: DevicePrefs::load(),
         }
     }
 
@@ -388,6 +892,7 @@ struct Snapshot<'a> {
     gen_ms: f32,
     loaded: &'a str,
     device: &'a str,
+    playback: &'a PlaybackInfo,
 }
 
 impl App {
@@ -403,6 +908,7 @@ impl App {
                 ui.horizontal(|ui| {
                     let was = self.page;
                     ui.selectable_value(&mut self.page, Page::Morph, "morph");
+                    ui.selectable_value(&mut self.page, Page::Arrange, "arrange");
                     ui.selectable_value(&mut self.page, Page::Train, "train");
                     // ARRIVING AT THE TRAINING PAGE STOPS THE BEAT, once, on the
                     // transition. Training is a long watch and a loop playing
@@ -422,6 +928,10 @@ impl App {
                     // pages get the same one rather than a second pair of buttons
                     // that could disagree with it.
                     self.train_controls(ui);
+                    return;
+                }
+                if self.page == Page::Arrange {
+                    self.arrange_column(ui);
                     return;
                 }
 
@@ -450,26 +960,51 @@ impl App {
                 );
 
                 ui.separator();
+                self.playback_section(ui, snap.playback);
+
+                ui.separator();
                 ui.label("Generator weights:");
                 ui.add(egui::TextEdit::singleline(&mut self.ckpt_text).id_salt("gui-self_ckpt_text").desired_width(230.0));
-                if ui.button("Load weights").clicked() {
-                    let p = PathBuf::from(self.ckpt_text.trim());
-                    if p.exists() {
-                        self.shared.lock().unwrap().weights_request = Some(p);
-                        self.status = "loading weights…".into();
-                    } else {
-                        self.status = "weights path not found".into();
+                ui.horizontal(|ui| {
+                    if ui.button("Load weights").clicked() {
+                        let p = PathBuf::from(self.ckpt_text.trim());
+                        if p.exists() {
+                            self.shared.lock().unwrap().weights_request = Some(p);
+                            self.status = "loading weights…".into();
+                        } else {
+                            self.status = "weights path not found".into();
+                        }
                     }
-                }
+                    // The common case while a run is going in the other
+                    // page: hear the newest checkpoint without retyping
+                    // its path.
+                    if ui.button("↻ latest")
+                        .on_hover_text("reload gen_latest.safetensors from the checkpoint directory")
+                        .clicked()
+                    {
+                        let p = self.cfg.ckpt_dir.join("gen_latest.safetensors");
+                        if p.exists() {
+                            self.ckpt_text = p.display().to_string();
+                            self.shared.lock().unwrap().weights_request = Some(p);
+                            self.status = "reloading latest…".into();
+                        } else {
+                            self.status = "no gen_latest.safetensors yet".into();
+                        }
+                    }
+                });
                 ui.label(egui::RichText::new(format!("loaded: {loaded}")).small().weak());
 
                 ui.separator();
                 ui.label("Save current beat:");
                 ui.add(egui::TextEdit::singleline(&mut self.save_text).id_salt("gui-self_save_text").desired_width(230.0));
-                if ui.button("💾  Save WAV").clicked() {
+                let rung = audio_io::effective_format(self.device.bounce_format);
+                if ui.button(format!("💾  Save {}", rung.ext()))
+                    .on_hover_text("at this device's bounce rung (arrange page); never overwrites")
+                    .clicked()
+                {
                     let p = PathBuf::from(self.save_text.trim());
                     self.shared.lock().unwrap().save_request = Some(p);
-                    self.status = "saving wav…".into();
+                    self.status = format!("saving {}…", rung.ext());
                 }
 
                 ui.separator();
@@ -491,6 +1026,10 @@ impl App {
         let current_z = snap.current_z;
         if self.page == Page::Train {
             self.train_body(ui);
+            return;
+        }
+        if self.page == Page::Arrange {
+            self.arrange_body(ui);
             return;
         }
             ui.add_space(4.0);
@@ -577,6 +1116,291 @@ impl App {
     }
 }
 
+impl App {
+    /// The arrangement page's canvas. The library and transport are read
+    /// under the shared lock once, the view runs, and what it asked for
+    /// is written back.
+    fn arrange_body(&mut self, ui: &mut egui::Ui) {
+        self.arrange_take_pending();
+        let (library, playhead, playing, recording, can_record) = {
+            let s = self.shared.lock().unwrap();
+            (s.arr.library.clone(), s.arr.pos, s.arr.playing, s.arr.recording_secs, s.playback.stream)
+        };
+        let io = ArrangeIo { library: &library, playhead, playing, recording, can_record, bounce_format: self.device.bounce_format };
+        let out = self.arrange.ui(ui, &io);
+        self.arrange_apply(out);
+    }
+
+    /// A take the stream thread finished: place it through the editor so
+    /// it is undoable, then publish.
+    fn arrange_take_pending(&mut self) {
+        let pending = self.shared.lock().unwrap().arr.pending_place.take();
+        if let Some((source, start, beats, bpm)) = pending {
+            // The beats track, or wherever the first track is.
+            if let Some(track) = self.arrange.timeline().tracks.first().map(|t| t.id) {
+                // Exact: a take starts where recording started, not on the
+                // nearest grid line. Locked to the tempo it was recorded at.
+                let placed = self.arrange.editor.apply(Command::Place { track, source, start, source_beats: beats, exact: true, lock: Some(bpm) });
+                match placed {
+                    Ok(_) => {}
+                    Err(e) => self.status = format!("the take could not be placed at {start:.2}: {e:?} — it is in the library"),
+                }
+                let mut s = self.shared.lock().unwrap();
+                s.arr.timeline = self.arrange.timeline().clone();
+            }
+        }
+    }
+
+    /// The arrangement's controls column: the library, imports, exports,
+    /// and the selected clip.
+    fn arrange_column(&mut self, ui: &mut egui::Ui) {
+        let (library, playhead, playing, notice, recording, can_record) = {
+            let mut s = self.shared.lock().unwrap();
+            (s.arr.library.clone(), s.arr.pos, s.arr.playing, s.arr.notice.take(), s.arr.recording_secs, s.playback.stream)
+        };
+        if let Some(n) = notice {
+            self.status = n;
+        }
+        let io = ArrangeIo { library: &library, playhead, playing, recording, can_record, bounce_format: self.device.bounce_format };
+        let mut out = ArrangeOut::default();
+        self.arrange.library_ui(ui, &io, &mut out);
+        self.arrange_apply(out);
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(&self.status).italics());
+    }
+
+    /// Carry out what the arrangement view asked for.
+    fn arrange_apply(&mut self, out: ArrangeOut) {
+        if let Some(st) = out.status {
+            self.status = st;
+        }
+        let mut s = self.shared.lock().unwrap();
+        if out.changed {
+            s.arr.timeline = self.arrange.timeline().clone();
+        }
+        if let Some(b) = out.seek {
+            s.arr.seek = Some(b);
+            s.arr.pos = b;
+        }
+        if out.toggle_play {
+            s.arr.playing = !s.arr.playing;
+            // The arrangement takes the device; the generator's own
+            // transport must not also be stopped or the block queue is
+            // silent.
+            if s.arr.playing {
+                s.stopped = false;
+            }
+            self.status = if s.arr.playing { "arrangement playing".into() } else { "arrangement stopped".into() };
+        }
+        if out.capture_beat {
+            s.arr.capture = true;
+            self.status = "capturing…".into();
+        }
+        if let Some(start) = out.toggle_record {
+            if s.arr.playing {
+                self.status = "stop the arrangement first: a take records the live stream".into();
+            } else {
+                s.arr.record_toggle = Some(start);
+                s.stopped = false;
+            }
+        }
+        drop(s);
+        if let Some(path) = out.import_file {
+            self.import_audio(path);
+        }
+        if let Some(path) = out.export_wav {
+            self.export_arrangement(path);
+        }
+        if let Some(dir) = out.save_project {
+            self.save_project(dir);
+        }
+        if let Some(dir) = out.load_project {
+            self.load_project(dir);
+        }
+        if let Some(f) = out.set_bounce_format {
+            self.set_bounce_format(f);
+        }
+    }
+
+    /// Move the fidelity slider and keep it on this device: the sidecar in
+    /// the user's config directory, never the project or the checkpoint,
+    /// because storage constraints are per device.
+    fn set_bounce_format(&mut self, f: BounceFormat) {
+        self.device.bounce_format = f;
+        // The audio thread writes saved beats with it too.
+        self.shared.lock().unwrap().bounce_format = f;
+        match self.device.save() {
+            Ok(p) => self.status = format!("{} (kept in {})", f.label(), p.display()),
+            Err(e) => self.status = format!("{} for this session; could not write the device prefs: {e}", f.label()),
+        }
+    }
+
+    fn save_project(&mut self, dir: String) {
+        let dir = if dir.is_empty() { crate::arrange::project::default_dir(&self.cfg.ckpt_dir) } else { PathBuf::from(dir) };
+        let library = self.shared.lock().unwrap().arr.library.clone();
+        match crate::arrange::project::save(&dir, self.arrange.timeline(), &library, self.device.bounce_format) {
+            Ok(written) => self.status = format!("saved project to {} ({} sources as {})", dir.display(), library.beats.len() + library.files.len(), written.label()),
+            Err(e) => self.status = format!("save project: {e:#}"),
+        }
+    }
+
+    fn load_project(&mut self, dir: String) {
+        let dir = if dir.is_empty() { crate::arrange::project::default_dir(&self.cfg.ckpt_dir) } else { PathBuf::from(dir) };
+        match crate::arrange::project::load(&dir, self.cfg.sr) {
+            Ok((timeline, library)) => {
+                let n = (library.beats.len(), library.files.len());
+                self.arrange.replace(timeline);
+                let mut s = self.shared.lock().unwrap();
+                s.arr.playing = false;
+                s.arr.seek = Some(0.0);
+                s.arr.pos = 0.0;
+                s.arr.library = Arc::new(library);
+                s.arr.timeline = self.arrange.timeline().clone();
+                self.status = format!("loaded {} ({} beats, {} files)", dir.display(), n.0, n.1);
+            }
+            Err(e) => self.status = format!("load project: {e:#}"),
+        }
+    }
+
+    /// Decode a file on a worker and add it to the library when done.
+    fn import_audio(&mut self, path: String) {
+        let sr = self.cfg.sr;
+        let shared = self.shared.clone();
+        self.status = format!("importing {path}…");
+        std::thread::spawn(move || {
+            let p = PathBuf::from(&path);
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(path.clone());
+            match audio_io::decode_to_mono(&p, sr) {
+                Ok(audio) if !audio.is_empty() => {
+                    let mut s = shared.lock().unwrap();
+                    Arc::make_mut(&mut s.arr.library).add_file(Sample { name: name.clone(), audio, sr, planes: None, bpm: None });
+                    s.arr.notice = Some(format!("imported {name}"));
+                }
+                Ok(_) => shared.lock().unwrap().arr.notice = Some(format!("{name} decoded to nothing")),
+                Err(e) => shared.lock().unwrap().arr.notice = Some(format!("import {name}: {e}")),
+            }
+        });
+    }
+
+    /// Render the whole arrangement offline and write it.
+    fn export_arrangement(&mut self, path: String) {
+        let (timeline, library) = {
+            let s = self.shared.lock().unwrap();
+            (self.arrange.timeline().clone(), s.arr.library.clone())
+        };
+        let sr = self.cfg.sr;
+        let out = crate::arrange::render::render_all(&timeline, &library, sr);
+        let n = out.len();
+        if n == 0 {
+            self.status = "nothing to export".into();
+            return;
+        }
+        // Never overwrite a render the user asked for by hand.
+        let target = audio_io::unique_path(&audio_io::with_format_ext(&PathBuf::from(&path), self.device.bounce_format));
+        match audio_io::save_audio(&target, &out, sr, self.device.bounce_format) {
+            Ok(written) => self.status = format!("exported {} ({:.1} s)", written.display(), n as f64 / sr as f64),
+            Err(e) => self.status = format!("export {path}: {e}"),
+        }
+    }
+
+    /// What will be played back, and the knobs on it.
+    ///
+    /// The headline is one sentence the listener can act on — "stream,
+    /// drums + instruments, continuing" — and the details under it are the
+    /// numbers behind that sentence. The controls are only the ones the
+    /// stream has; the loop player has none, and the section says so
+    /// rather than showing sliders that do nothing.
+    fn playback_section(&mut self, ui: &mut egui::Ui, p: &PlaybackInfo) {
+        egui::CollapsingHeader::new("playback")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(p.headline()).strong());
+
+                let ms = |frames: usize| p.secs(frames) * 1000.0;
+                let mut lines = vec![format!(
+                    "window {} frames ({:.0} ms) · stride {} ({:.0} ms) · overlap {} ({:.0} ms)",
+                    p.time_frames, ms(p.time_frames),
+                    p.stride_frames, ms(p.stride_frames),
+                    p.overlap_frames, ms(p.overlap_frames),
+                )];
+                lines.push(format!(
+                    "model: {} · context {} · beat phase {}",
+                    if p.stems >= 2 { "2 stems (harmonic/percussive)" } else { "1 stem (mixed)" },
+                    if p.ctx_frames > 0 { format!("{} frames", p.ctx_frames) } else { "none".into() },
+                    if p.beat_phase { "on" } else { "off" },
+                ));
+                if let Some(e) = p.epoch {
+                    lines.push(format!("checkpoint epoch {e}"));
+                }
+                if p.stream {
+                    lines.push(format!(
+                        "lead {:.2} s queued · {} windows since start · beat phase {:.2} at {:.0} BPM",
+                        p.lead_secs, p.windows, p.phase, p.bpm
+                    ));
+                }
+                for l in lines {
+                    ui.label(egui::RichText::new(l).small().weak());
+                }
+
+                if !p.stream {
+                    ui.label(egui::RichText::new(
+                        "loop playback has no tempo or lead: train with the dynamic preset \
+(train page → model) to get a stream").small().italics());
+                    return;
+                }
+
+                // The controls. Each writes to Shared; the stream loop reads
+                // them before the next window, so a change is heard within
+                // one lead's worth of audio.
+                let (mut ctl, changed_before) = {
+                    let s = self.shared.lock().unwrap();
+                    (s.stream_ctl.clone(), s.stream_ctl.clone())
+                };
+                let beat_on = p.beat_phase;
+                ui.add_enabled(beat_on,
+                    egui::Slider::new(&mut ctl.bpm, 60.0..=200.0).text("BPM"))
+                    .on_hover_text(if beat_on {
+                        "tempo the conductor advances the beat phase at; the renderer was trained \
+to put its beats where this says"
+                    } else {
+                        "this model has no beat phase input, so tempo has nothing to drive"
+                    });
+                ui.add(egui::Slider::new(&mut ctl.smoothing, 0.01..=1.0).logarithmic(true).text("glide"))
+                    .on_hover_text("fraction of the way to the pad position each window moves: \
+0.1 is the original glide, 1.0 jumps");
+                ui.add(egui::Slider::new(&mut ctl.lead_windows, 1..=6).text("lead (windows)"))
+                    .on_hover_text("audio kept queued ahead of the playhead. More survives a slow \
+render; less makes the pad respond sooner");
+                ui.add(egui::Slider::new(&mut ctl.gl_iters, 1..=16).text("phase iters"))
+                    .on_hover_text("Griffin-Lim iterations per window: fewer is faster and rougher");
+                ui.horizontal(|ui| {
+                    if ui.button("↺ restart track")
+                        .on_hover_text("forget the previous window and the beat grid, drop the \
+queue, and start again from silence at the current pad position")
+                        .clicked()
+                    {
+                        ctl.restart = true;
+                        self.status = "restarting the track".into();
+                    }
+                    if ui.button("reset knobs").clicked() {
+                        ctl.bpm = self.cfg.bpm;
+                        ctl.smoothing = 0.1;
+                        ctl.lead_windows = 2;
+                        ctl.gl_iters = self.cfg.griffin_iters_rt;
+                    }
+                });
+                let changed = ctl.bpm != changed_before.bpm
+                    || ctl.smoothing != changed_before.smoothing
+                    || ctl.lead_windows != changed_before.lead_windows
+                    || ctl.gl_iters != changed_before.gl_iters
+                    || ctl.restart;
+                if changed {
+                    self.shared.lock().unwrap().stream_ctl = ctl;
+                }
+            });
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // FONTS ONLY. beatspace paints with nine hand-picked `Color32`
@@ -587,7 +1411,7 @@ impl eframe::App for App {
         ui.ctx().request_repaint(); // keep animating
 
         // snapshot shared state
-        let (current_z, target_snapshot, gen_ms, scope, loaded, device) = {
+        let (current_z, target_snapshot, gen_ms, scope, loaded, device, playback) = {
             let s = self.shared.lock().unwrap();
             (
                 s.current_z.clone(),
@@ -596,6 +1420,7 @@ impl eframe::App for App {
                 s.scope.clone(),
                 s.loaded_label.clone(),
                 s.device_label.clone(),
+                s.playback.clone(),
             )
         };
 
@@ -628,7 +1453,7 @@ impl eframe::App for App {
 
         let snap = Snapshot {
             current_z: &current_z, target_snapshot: &target_snapshot,
-            gen_ms, loaded: &loaded, device: &device,
+            gen_ms, loaded: &loaded, device: &device, playback: &playback,
         };
         // The scope keeps its own bottom panel and is declared FIRST, so it
         // reserves its strip before the two panes divide what is left.
@@ -797,6 +1622,8 @@ at. Off starts over and overwrites.\n\nWeights resume exactly; the optimizer's m
 (candle keeps it private), so expect roughly a thousand steps of re-warming.");
         });
 
+        self.model_options(ui, running);
+
         if !running {
             if ui.button("▶  start training").clicked() {
                 self.start_training();
@@ -852,6 +1679,7 @@ at. Off starts over and overwrites.\n\nWeights resume exactly; the optimizer's m
                          else { Some(self.cfg.cache_batches * self.cfg.batch_size.max(1)) };
             self.cache = crate::trainpage::read_cache(&self.cfg.cache_dir, budget);
             self.cache_checked = Some(std::time::Instant::now());
+            self.refresh_shape_note();
         }
         ui.separator();
         ui.label(egui::RichText::new("cache").small());
@@ -892,6 +1720,137 @@ at. Off starts over and overwrites.\n\nWeights resume exactly; the optimizer's m
         }
     }
 
+    /// The model shape the next run builds: the dynamic-track preset and
+    /// its parts. Written straight into `self.cfg`, which is what
+    /// `start_training` passes on, so what the page shows is what the
+    /// trainer gets.
+    fn model_options(&mut self, ui: &mut egui::Ui, running: bool) {
+        ui.separator();
+        ui.label(egui::RichText::new("model").small());
+
+        let is_dynamic = self.cfg.stems == 2 && self.cfg.ctx_frames > 0
+            && self.cfg.beat_phase && self.cfg.seq_windows >= 2;
+        let mut dynamic = is_dynamic;
+        if ui.add_enabled(!running, egui::Checkbox::new(&mut dynamic, "dynamic tracks"))
+            .on_hover_text(
+                "Train a renderer that CONTINUES its own output instead of emitting \
+independent loops: two mel stems (drums / instruments, split at cache time), a context of \
+the previous window, a beat-phase input, and a second discriminator scoring adjacent windows \
+across their join. Playback streams instead of looping.\n\nChanges the MODEL SHAPE and the \
+cache format, so it cannot resume a legacy checkpoint and rebuilds the mel cache. About \
+three to four times the cost of a legacy step.")
+            .changed()
+        {
+            if dynamic {
+                let d = Config::dynamic();
+                self.cfg.stems = d.stems;
+                self.cfg.ctx_frames = d.ctx_frames;
+                self.cfg.beat_phase = d.beat_phase;
+                self.cfg.seq_windows = d.seq_windows;
+                self.cfg.overlap_frames = d.overlap_frames;
+                self.cfg.rollout = d.rollout;
+                self.cfg.playback = Playback::Stream;
+            } else {
+                let d = Config::default();
+                self.cfg.stems = d.stems;
+                self.cfg.ctx_frames = d.ctx_frames;
+                self.cfg.beat_phase = d.beat_phase;
+                self.cfg.seq_windows = d.seq_windows;
+                self.cfg.playback = Playback::Loop;
+            }
+            self.refresh_shape_note();
+        }
+
+        // The parts, for anyone who wants one without the others. Each is
+        // a flag on the trainer; the preset is just all of them at once.
+        egui::CollapsingHeader::new("parts")
+            .id_salt("gui-model-parts")
+            .default_open(false)
+            .show(ui, |ui| {
+                let before = (self.cfg.stems, self.cfg.ctx_frames, self.cfg.beat_phase,
+                              self.cfg.seq_windows, self.cfg.overlap_frames, self.cfg.rollout);
+                ui.horizontal(|ui| {
+                    ui.label("stems");
+                    ui.add_enabled_ui(!running, |ui| {
+                        ui.selectable_value(&mut self.cfg.stems, 1, "1 mixed");
+                        ui.selectable_value(&mut self.cfg.stems, 2, "2 harm/perc");
+                    });
+                }).response.on_hover_text(
+                    "Two splits the spectrogram into harmonic and percussive planes (median \
+filtering, no model) so the generator emits drums and instruments as separate channels that \
+share one trunk.");
+                ui.add_enabled(!running,
+                    egui::Slider::new(&mut self.cfg.ctx_frames, 0..=self.cfg.time_frames.min(64)).text("context frames"))
+                    .on_hover_text("Frames of the previous window the renderer sees. 0 is the \
+unconditional generator; anything else makes every window a continuation.");
+                ui.add_enabled(!running, egui::Checkbox::new(&mut self.cfg.beat_phase, "beat phase input"))
+                    .on_hover_text("Feed the renderer where in the beat each column falls, \
+estimated per clip at cache time. Playback then has a tempo control.");
+                ui.add_enabled(!running,
+                    egui::Slider::new(&mut self.cfg.seq_windows, 1..=6).text("windows per sample"))
+                    .on_hover_text("Consecutive windows per training sample. 2 or more turns on \
+the sequence discriminator; a conditional renderer needs at least 2.");
+                ui.add_enabled(!running,
+                    egui::Slider::new(&mut self.cfg.overlap_frames, 2..=self.cfg.time_frames.saturating_sub(1).max(2))
+                        .text("overlap frames"))
+                    .on_hover_text("Frames adjacent windows share, in training and playback: the \
+crossfade region.");
+                ui.add_enabled(!running, egui::Checkbox::new(&mut self.cfg.rollout, "free-running rollout"))
+                    .on_hover_text("Also score the renderer continuing ITSELF for a few windows, \
+which is what playback asks of it. Off is faster and drifts.");
+                let after = (self.cfg.stems, self.cfg.ctx_frames, self.cfg.beat_phase,
+                             self.cfg.seq_windows, self.cfg.overlap_frames, self.cfg.rollout);
+                if before != after {
+                    // Playback mode follows the shape: a conditional model
+                    // cannot be looped.
+                    self.cfg.playback = if self.cfg.conditional() { Playback::Stream } else { self.cfg.playback };
+                    self.refresh_shape_note();
+                }
+            });
+
+        // What "start" will do, in one line, and whether the checkpoint
+        // directory agrees. Said before the button rather than by the
+        // trainer refusing after it.
+        let c = &self.cfg;
+        let mut what = vec![format!("{} stem{}", c.stems, if c.stems == 1 { "" } else { "s" })];
+        if c.ctx_frames > 0 { what.push(format!("ctx {}", c.ctx_frames)); }
+        if c.beat_phase { what.push("beat phase".into()); }
+        if c.seq_windows >= 2 {
+            what.push(format!("{}-window sequences{}", c.seq_windows, if c.rollout { " + rollout" } else { "" }));
+        }
+        what.push(format!("plays as {}", if c.playback == Playback::Stream || c.conditional() { "stream" } else { "loop" }));
+        ui.label(egui::RichText::new(format!("will train: {}", what.join(" · "))).small());
+        if c.conditional() && c.seq_windows < 2 {
+            ui.colored_label(egui::Color32::from_rgb(220, 120, 60),
+                "a conditional renderer needs windows per sample ≥ 2 — the trainer will refuse");
+        }
+        if let Err(why) = &c.validate() {
+            ui.colored_label(egui::Color32::from_rgb(220, 120, 60), format!("invalid: {why}"));
+        }
+        match &self.shape_note {
+            Some(Err(why)) if self.train_resume => {
+                ui.colored_label(egui::Color32::from_rgb(220, 120, 60),
+                    format!("differs from the checkpoint ({why}) — resume will be refused; \
+untick resume or use another checkpoint dir"));
+            }
+            Some(Err(_)) => {
+                ui.label(egui::RichText::new(
+                    "shape differs from the checkpoint in this directory: a fresh run overwrites it").small());
+            }
+            _ => {}
+        }
+    }
+
+    /// Compare `cfg`'s shape with the checkpoint directory's config.json.
+    fn refresh_shape_note(&mut self) {
+        let saved = self.cfg.ckpt_dir.join("config.json");
+        self.shape_note = if saved.exists() {
+            Config::load_json(&saved).ok().map(|prev| self.cfg.shape_compatible_with(&prev))
+        } else {
+            None
+        };
+    }
+
     /// Spawn a trainer and pipe its output into the page.
     ///
     /// Runs the same binary as the CLI rather than calling `train::run` in a
@@ -925,6 +1884,18 @@ at. Off starts over and overwrites.\n\nWeights resume exactly; the optimizer's m
                 // checkpoint's, so a bad combination reports a named reason in
                 // the log pane rather than failing inside a tensor assignment.
                 .arg("--time-frames").arg(time_frames.to_string())
+                // The dynamic-track shape, from the config this GUI is
+                // playing, so the trainer builds what the stream loop will
+                // load. Without these a run launched from here would train
+                // the legacy model into a directory whose config.json says
+                // otherwise.
+                .arg("--stems").arg(cfg.stems.to_string())
+                .arg("--ctx-frames").arg(cfg.ctx_frames.to_string())
+                .arg("--ctx-dim").arg(cfg.ctx_dim.to_string())
+                .arg("--beat-phase").arg(cfg.beat_phase.to_string())
+                .arg("--seq-windows").arg(cfg.seq_windows.to_string())
+                .arg("--overlap-frames").arg(cfg.overlap_frames.to_string())
+                .args(if cfg.rollout { &[][..] } else { &["--no-rollout"][..] })
                 .args(if resume { &["--resume"][..] } else { &[][..] })
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())

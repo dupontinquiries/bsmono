@@ -99,6 +99,23 @@ Resume from the latest checkpoint with `--resume`.
 Useful flags: `--steps-per-epoch`, `--ckpt-every`, `--batch-size`. Run
 `cargo run --release -- train --help` for the full list.
 
+### 2b. Train a dynamic track model
+
+```bash
+cargo run --release -- train --dynamic --data-dir ./data --ckpt-dir ./checkpoints-dynamic
+```
+
+`--dynamic` trains a renderer that CONTINUES its own output instead of
+emitting independent loops: two mel stems (harmonic/percussive, split at cache
+time), an 8-frame context from the previous window, a beat-phase input, and a
+second discriminator that scores adjacent windows across their join. The cache
+format changes (`BSP2`), so use a fresh `--cache-dir` or let it rebuild. Each
+of the preset's parts has its own flag (`--stems`, `--ctx-frames`,
+`--beat-phase`, `--seq-windows`, `--overlap-frames`, `--no-rollout`); a
+checkpoint's `config.json` records them and the GUI streams rather than loops
+when it reads one. `smoke --dynamic` is the structural check for this path.
+A step costs roughly three to four legacy steps at `--seq-windows 3`.
+
 ### 3. Explore in the GUI
 
 ```bash
@@ -117,6 +134,35 @@ cargo run --release -- gui --ckpt-dir ./checkpoints
 You can open the GUI **before** you've trained anything — an untrained generator
 still produces sound (noisy, but it moves and crossfades), which is handy for
 checking your audio path works.
+
+### 4. Arrange
+
+The **arrange** page is a timeline of tracks on a beat grid. Capture the window
+the generator is playing (`＋ capture playing beat`) or import a wav/flac/mp3,
+then paint, move, trim, split and loop clips. Tools: select (drag moves,
+alt-drag copies, edges trim, double-click splits), draw (paints the armed
+source one clip per grid cell), split, erase, loop; the ruler seeks and scrubs.
+Wheel pans, ctrl+wheel or pinch zooms around the pointer, two fingers pan.
+Keys: space play · delete · ctrl-z/y · ctrl-d duplicate · s split at playhead ·
+l loop · ctrl-a · arrows nudge · home · 1–5 tools · r record · ctrl-k the
+command palette (every action by name, plus `tempo 128`, `go 9`, `zoom 60`,
+`grid 1/2`). Right-click or long-press for a context menu. `●` records the
+live stream into a take that lands at the playhead. A clip that knows its
+tempo (a captured beat, a take) is placed "following tempo": it keeps its
+length in beats and its audio is time-stretched (WSOLA, pitch kept) as the
+tempo moves; a clip that does not (an imported file) plays at natural speed
+and its extent in beats follows the tempo. Toggle either way per clip. Fade
+handles sit on each clip's top corners; drag them, or use the sliders. `save`
+writes a self-contained project directory (`project.json` beside the
+library's audio); `load` brings it back. `export` renders the whole
+arrangement. What renders are encoded as — project sources, saved beats,
+exports — is the **bounce fidelity** slider on the arrange page, studio's
+ladder: opus 32k…256k, flac, wav. It is a per-device choice (kept in
+`~/.config/beatspace/device.prefs`, never in the project or the checkpoint)
+because storage constraints are per device; opus 192k is the default, and a
+build without the `opus-encode` feature (system libopus) writes the flac rung
+instead — bigger, never a hole. Files are read back in any of the three. Playback runs through the same audio device as the
+generator, which pauses while the arrangement plays.
 
 ### GPU / acceleration
 

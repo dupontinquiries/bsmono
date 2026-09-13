@@ -10,6 +10,47 @@ fn default_griffin_iters_rt() -> usize {
     8
 }
 
+// Defaults for the dynamic-track fields. Every one of them reproduces the
+// legacy model exactly — one stem, no context, no beat phase, one window per
+// sample — so a config.json written before these existed deserialises to the
+// model that wrote it and its checkpoint still loads.
+fn default_stems() -> usize {
+    1
+}
+fn default_ctx_dim() -> usize {
+    32
+}
+fn default_seq_windows() -> usize {
+    1
+}
+fn default_rollout() -> bool {
+    true
+}
+fn default_overlap_frames() -> usize {
+    4
+}
+fn default_bpm() -> f32 {
+    120.0
+}
+fn default_playback() -> Playback {
+    Playback::Loop
+}
+
+/// How the GUI turns generated windows into sound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Playback {
+    /// The original behaviour: loop the current window, crossfade into the
+    /// next one from its first sample when it arrives. Windows are
+    /// independent textures.
+    Loop,
+    /// Each window is a continuation of the previous one: it starts
+    /// `time_frames - overlap_frames` frames after it, its first frames are
+    /// crossfaded over the previous tail, and Griffin-Lim is seeded from the
+    /// previous phase in time-aligned fashion. The track never restarts.
+    Stream,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     // --- audio / mel front-end ---
@@ -30,6 +71,51 @@ pub struct Config {
     pub g_filters: usize,
     pub d_filters: usize,
     pub sparse_threshold: f32,
+
+    // --- dynamic tracks: representation ---
+    /// Mel channels per frame. 1 is the mixed signal; 2 splits it into
+    /// harmonic and percussive stems (HPSS, in dsp.rs) so drums and
+    /// instruments are separate planes the generator emits together.
+    #[serde(default = "default_stems")]
+    pub stems: usize,
+    /// Frames of the PREVIOUS window the renderer sees when producing the
+    /// next one. 0 is the legacy unconditional generator; anything else makes
+    /// every window a continuation.
+    #[serde(default)]
+    pub ctx_frames: usize,
+    /// Width of the vector the context encoder reduces those frames to.
+    #[serde(default = "default_ctx_dim")]
+    pub ctx_dim: usize,
+    /// Feed the renderer a per-frame beat phase (sin/cos planes) so it knows
+    /// where in the beat each column falls. Estimated per clip at cache time.
+    #[serde(default)]
+    pub beat_phase: bool,
+
+    // --- dynamic tracks: training ---
+    /// Consecutive windows per training sample. 1 is the legacy i.i.d. crop;
+    /// 2 or more trains the renderer as a continuation and adds the sequence
+    /// discriminator, which scores adjacent windows side by side.
+    #[serde(default = "default_seq_windows")]
+    pub seq_windows: usize,
+    /// Also score a FREE-RUNNING rollout — the renderer fed its own output as
+    /// context for `seq_windows - 1` steps. Teacher forcing alone trains a
+    /// model that is only ever asked to continue real audio, and playback
+    /// asks it to continue itself.
+    #[serde(default = "default_rollout")]
+    pub rollout: bool,
+
+    // --- dynamic tracks: playback / stitching ---
+    /// Frames by which consecutive windows overlap, in training and in
+    /// playback. The crossfade region, and the part of the new window the
+    /// previous phase seeds directly.
+    #[serde(default = "default_overlap_frames")]
+    pub overlap_frames: usize,
+    /// Tempo the playback conductor advances the beat phase at. Only used
+    /// when `beat_phase` is on.
+    #[serde(default = "default_bpm")]
+    pub bpm: f32,
+    #[serde(default = "default_playback")]
+    pub playback: Playback,
 
     // --- training ---
     pub lr: f64,
@@ -87,6 +173,16 @@ impl Default for Config {
             d_filters: 64,
             sparse_threshold: 0.05,
 
+            stems: default_stems(),
+            ctx_frames: 0,
+            ctx_dim: default_ctx_dim(),
+            beat_phase: false,
+            seq_windows: default_seq_windows(),
+            rollout: default_rollout(),
+            overlap_frames: default_overlap_frames(),
+            bpm: default_bpm(),
+            playback: default_playback(),
+
             lr: 2e-4,
             beta1: 0.5,
             label_smooth: 0.9,
@@ -123,6 +219,42 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The dynamic-track preset on top of the defaults: two stems, an
+    /// 8-frame context, beat phase, three-window sequences, streaming
+    /// playback. One place to define it so the CLI, the smoke test and the
+    /// GUI agree on what "dynamic" means.
+    pub fn dynamic() -> Self {
+        Self {
+            stems: 2,
+            ctx_frames: 8,
+            beat_phase: true,
+            seq_windows: 3,
+            playback: Playback::Stream,
+            ..Self::default()
+        }
+    }
+
+    /// Is any of the conditional machinery on? When false the generator is
+    /// the legacy `z -> window` map and `forward_train(z)` works unchanged.
+    pub fn conditional(&self) -> bool {
+        self.ctx_frames > 0 || self.beat_phase
+    }
+
+    /// Whether the trainer runs the sequence path.
+    pub fn sequential(&self) -> bool {
+        self.seq_windows >= 2
+    }
+
+    /// Frames between the starts of consecutive windows.
+    pub fn window_stride(&self) -> usize {
+        self.time_frames - self.overlap_frames
+    }
+
+    /// Frames of beat phase one window advances the conductor by, at `bpm`.
+    pub fn beats_per_window(&self) -> f32 {
+        (self.window_stride() * self.hop) as f32 / self.sr as f32 * self.bpm / 60.0
+    }
+
     /// Shape constraints the model imposes, checked before anything allocates.
     ///
     /// The generator builds its seed grid as `n_mels / 16` by
@@ -174,6 +306,40 @@ channels, and below 4 channels a ReLU can zero the entire layer",
                 self.hop, self.n_fft
             ));
         }
+        if !(1..=2).contains(&self.stems) {
+            bad.push(format!(
+                "stems = {} must be 1 (mixed) or 2 (harmonic + percussive); dsp.rs has no \
+other splitter",
+                self.stems
+            ));
+        }
+        if self.ctx_frames > self.time_frames {
+            bad.push(format!(
+                "ctx_frames = {} cannot exceed time_frames = {}: the context is a tail of the \
+previous window",
+                self.ctx_frames, self.time_frames
+            ));
+        }
+        if self.ctx_frames > 0 && self.ctx_dim == 0 {
+            bad.push("ctx_dim must be greater than zero when ctx_frames is set".into());
+        }
+        if self.overlap_frames >= self.time_frames {
+            bad.push(format!(
+                "overlap_frames = {} must be smaller than time_frames = {} or consecutive \
+windows never advance",
+                self.overlap_frames, self.time_frames
+            ));
+        }
+        if self.seq_windows == 0 {
+            bad.push("seq_windows must be at least 1".into());
+        }
+        if self.playback == Playback::Stream && self.overlap_frames < 2 {
+            bad.push(format!(
+                "overlap_frames = {} is too short for stream playback: frames are centred on \
+hop boundaries, so the audio overlap is (overlap_frames - 1) hops",
+                self.overlap_frames
+            ));
+        }
         if bad.is_empty() {
             Ok(())
         } else {
@@ -188,7 +354,7 @@ channels, and below 4 channels a ReLU can zero the entire layer",
     /// `time_frames` cannot be loaded into a model built at another, and the
     /// failure surfaces deep inside a tensor assignment rather than at the
     /// point the operator changed the number.
-    fn shape_key(&self) -> [usize; 6] {
+    fn shape_key(&self) -> [usize; 9] {
         [
             self.n_mels,
             self.time_frames,
@@ -196,6 +362,16 @@ channels, and below 4 channels a ReLU can zero the entire layer",
             self.g_filters,
             self.d_filters,
             self.n_fft,
+            // The conditional renderer: stems set the width of the last
+            // deconvolution and the discriminators' first block; ctx_frames
+            // (as on/off) and ctx_dim set fc's input width; beat_phase adds
+            // two input planes to the last deconvolution.
+            self.stems,
+            if self.ctx_frames > 0 { self.ctx_dim } else { 0 },
+            // The context encoder's first conv sees ctx_frames columns but
+            // pools to a vector, so its weights do not depend on the count;
+            // its PRESENCE does, and the ctx_dim entry carries that.
+            self.beat_phase as usize,
         ]
     }
 
@@ -208,7 +384,10 @@ channels, and below 4 channels a ReLU can zero the entire layer",
         if a == b {
             return Ok(());
         }
-        let names = ["n_mels", "time_frames", "latent", "g_filters", "d_filters", "n_fft"];
+        let names = [
+            "n_mels", "time_frames", "latent", "g_filters", "d_filters", "n_fft",
+            "stems", "ctx_dim (0 when ctx_frames is 0)", "beat_phase",
+        ];
         let diffs: Vec<String> = names
             .iter()
             .zip(a.iter().zip(b.iter()))

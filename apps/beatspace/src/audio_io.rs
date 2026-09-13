@@ -7,7 +7,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use audio_kit::BounceFormat;
 
 /// Decode any supported file to mono f32 at `target_sr`.
 pub fn decode_to_mono(path: &Path, target_sr: u32) -> Result<Vec<f32>> {
@@ -222,6 +224,98 @@ pub fn resample_linear(input: &[f32], from_sr: u32, to_sr: u32) -> Vec<f32> {
 }
 
 // ----------------------------------------------------------------------------
+// Writing: the bounce ladder (opus rungs / flac / wav)
+// ----------------------------------------------------------------------------
+
+/// The format a rung actually writes on THIS build: an Opus rung falls to
+/// the lossless one when the encoder is not compiled in. Bigger, never a
+/// hole.
+pub fn effective_format(format: BounceFormat) -> BounceFormat {
+    if cfg!(feature = "opus-encode") { format } else { format.without_opus() }
+}
+
+/// `path` with the extension of what will actually be written.
+pub fn with_format_ext(path: &Path, format: BounceFormat) -> PathBuf {
+    path.with_extension(effective_format(format).ext())
+}
+
+/// `path`, or `stem-1.ext`, `stem-2.ext`… — the exporter's never-overwrite
+/// rule for renders the user asked for by hand (saved beats, exports). A
+/// project's own files are the project's and do overwrite.
+pub fn unique_path(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "audio".into());
+    let ext = path.extension().map(|e| e.to_string_lossy().to_string());
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut n = 1u32;
+    loop {
+        let name = match &ext {
+            Some(e) => format!("{stem}-{n}.{e}"),
+            None => format!("{stem}-{n}"),
+        };
+        let p = dir.join(name);
+        if !p.exists() {
+            return p;
+        }
+        n += 1;
+    }
+}
+
+/// Write mono audio at the rung the device prefers. The file gets the
+/// extension of the format actually written — replacing any the caller
+/// gave, so a preference change never produces a `.wav` that is FLAC
+/// inside, and a build without Opus writes `.flac` where `.opus` was asked
+/// for. Returns the path written.
+pub fn save_audio(path: &Path, samples: &[f32], sr: u32, format: BounceFormat) -> Result<PathBuf> {
+    let format = effective_format(format);
+    let out = path.with_extension(format.ext());
+    match format {
+        BounceFormat::Wav => save_wav(&out, samples, sr)?,
+        BounceFormat::Flac => {
+            let bytes = audio_kit::flac::encode(&[samples.to_vec()], sr, seed_for(&out))
+                .map_err(|e| anyhow!("flac encode {}: {e}", out.display()))?;
+            std::fs::write(&out, bytes).with_context(|| format!("write {}", out.display()))?;
+        }
+        opus => {
+            #[cfg(feature = "opus-encode")]
+            {
+                save_opus(&out, samples, sr, opus.bitrate_bps())?;
+            }
+            #[cfg(not(feature = "opus-encode"))]
+            {
+                // effective_format() never yields an Opus rung here.
+                let _ = opus;
+                unreachable!("opus rung on a build without opus-encode");
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A dither seed from the file name, so re-saving the same audio to the
+/// same file gives the same bytes.
+fn seed_for(path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.file_name().hash(&mut h);
+    h.finish()
+}
+
+/// Ogg Opus at 48 kHz (opus-kit encodes at that rate only, by design):
+/// resampled from `sr` first, at the rung's bitrate.
+#[cfg(feature = "opus-encode")]
+fn save_opus(path: &Path, samples: &[f32], sr: u32, bitrate_bps: Option<i32>) -> Result<()> {
+    let at48 = if sr == 48_000 { samples.to_vec() } else { resample_linear(samples, sr, 48_000) };
+    let pcm: Vec<i16> = at48.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16).collect();
+    let enc = opus_kit::encode::encode_ogg_opus_at(&pcm, 1, opus_kit::encode::Application::Audio, bitrate_bps)
+        .map_err(|e| anyhow!("opus encode {}: {e:?}", path.display()))?;
+    std::fs::write(path, enc.bytes).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
 // WAV export (16-bit PCM)
 // ----------------------------------------------------------------------------
 
@@ -239,4 +333,48 @@ pub fn save_wav(path: &Path, samples: &[f32], sr: u32) -> Result<()> {
     }
     writer.finalize()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    #[test]
+    fn the_rung_decides_the_extension_and_opus_falls_to_flac_without_the_encoder() {
+        let dir = std::env::temp_dir().join(format!("bs-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio: Vec<f32> = (0..4000).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let asked = dir.join("beat.wav");
+        let flac = save_audio(&asked, &audio, 8000, BounceFormat::Flac).unwrap();
+        assert_eq!(flac, dir.join("beat.flac"), "the extension follows the format, not the request");
+        let back = decode_to_mono(&flac, 8000).unwrap();
+        assert_eq!(back.len(), audio.len());
+        let err = back.iter().zip(&audio).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(err < 1e-3, "{err}");
+        let wav = save_audio(&asked, &audio, 8000, BounceFormat::Wav).unwrap();
+        assert_eq!(wav, dir.join("beat.wav"));
+        let opus = save_audio(&asked, &audio, 8000, BounceFormat::Opus192).unwrap();
+        if cfg!(feature = "opus-encode") {
+            assert_eq!(opus, dir.join("beat.opus"));
+        } else {
+            assert_eq!(opus, dir.join("beat.flac"), "no encoder: the lossless rung, not a refusal");
+            assert_eq!(effective_format(BounceFormat::Opus32), BounceFormat::Flac);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_path_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("bs-unique-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("take.flac");
+        assert_eq!(unique_path(&p), p, "free name is used as is");
+        std::fs::write(&p, b"x").unwrap();
+        assert_eq!(unique_path(&p), dir.join("take-1.flac"));
+        std::fs::write(dir.join("take-1.flac"), b"x").unwrap();
+        assert_eq!(unique_path(&p), dir.join("take-2.flac"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

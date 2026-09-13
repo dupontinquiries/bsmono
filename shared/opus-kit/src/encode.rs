@@ -44,7 +44,11 @@
 
 use crate::{Error, GRANULE_RATE};
 use audiopus::coder::Encoder;
-use audiopus::{Application, Channels, SampleRate};
+use audiopus::{Channels, SampleRate};
+/// Re-exported so a caller can pick the tuning without depending on
+/// audiopus itself — the point of the kit is that nothing outside it
+/// names libopus.
+pub use audiopus::Application;
 
 /// 20ms frames at 48kHz: the frame size this project's material already
 /// uses everywhere and a safe default complexity/latency tradeoff.
@@ -71,12 +75,28 @@ pub fn encode_ogg_opus(
     channels: u8,
     application: Application,
 ) -> Result<Encoded, Error> {
+    encode_ogg_opus_at(pcm, channels, application, None)
+}
+
+/// [`encode_ogg_opus`] with a target bitrate in bits per second (`None`
+/// leaves libopus's own default). studio's bounce ladder and beatspace's
+/// pick rungs with this.
+pub fn encode_ogg_opus_at(
+    pcm: &[i16],
+    channels: u8,
+    application: Application,
+    bitrate_bps: Option<i32>,
+) -> Result<Encoded, Error> {
     if channels != 1 && channels != 2 {
         return Err(Error::UnsupportedMapping(channels));
     }
     let ch = if channels == 1 { Channels::Mono } else { Channels::Stereo };
-    let enc = Encoder::new(SampleRate::Hz48000, ch, application)
+    let mut enc = Encoder::new(SampleRate::Hz48000, ch, application)
         .map_err(|_| Error::NotOpus)?;
+    if let Some(bps) = bitrate_bps {
+        enc.set_bitrate(audiopus::Bitrate::BitsPerSecond(bps))
+            .map_err(|_| Error::NotOpus)?;
+    }
 
     // Algorithmic delay, at the encoder's own 48kHz rate — see the module
     // doc for why fixing the rate at 48kHz is what makes this a direct

@@ -98,6 +98,7 @@ pub mod focus;
 pub mod handed;
 pub mod sections;
 pub mod two_pane;
+pub mod sidebar; // a side column whose width is the user's, never its content's
 pub mod layout_probe;
 /// Render a frame to pixels in a test and assert properties of the picture.
 pub mod uiverify;

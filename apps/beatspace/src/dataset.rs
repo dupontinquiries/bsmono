@@ -1,16 +1,24 @@
 //! Dataset: turn a folder of audio into mel-spectrogram crops for training.
 //!
-//! Each source clip is decoded once, converted to a full mel spectrogram, and
-//! written to a binary cache file storing the mel **transposed** as
-//! `(T, n_mels)` row-major. That layout makes a random time-crop of
-//! `time_frames` consecutive frames a single contiguous block on disk — we can
-//! seek + read_exact without loading the whole clip or pulling in mmap.
+//! Each source clip is decoded once, analysed into `stems` mel planes plus a
+//! beat phase per frame, and held **transposed** as one row per frame. That
+//! layout makes a random time-crop of `time_frames` consecutive frames — or a
+//! run of `seq_windows` consecutive crops — a single contiguous block, on
+//! disk or in RAM, with no mmap.
 //!
-//! Cache file layout (little-endian):
-//!   magic: b"BSPC"  (4 bytes)
+//! Cache file layout, v2 (little-endian):
+//!   magic:  b"BSP2"  (4 bytes)
 //!   n_mels: u32
+//!   stems:  u32
 //!   t:      u32
-//!   data:   t * n_mels  f32   (row r = frame r, n_mels values)
+//!   data:   t rows of (stems * n_mels + 1) f32:
+//!           [stem0 mel..., stem1 mel..., beat_phase]
+//!
+//! v1 (`BSPC`, header n_mels/t, rows of n_mels) is still READ, because
+//! micsession writes it directly into a source directory and those crops are
+//! recordings that exist nowhere else. A v1 row is one mixed stem with no
+//! phase, so it only fits a `stems = 1` run; a v1 file in the CACHE is a
+//! stale entry and is rebuilt.
 
 use anyhow::{anyhow, Result};
 use rand::Rng;
@@ -25,17 +33,52 @@ use candle_core::{Device, Tensor};
 use crate::config::Config;
 use crate::dsp::Mel;
 
-const MAGIC: &[u8; 4] = b"BSPC";
+const MAGIC_V1: &[u8; 4] = b"BSPC";
+const MAGIC: &[u8; 4] = b"BSP2";
 
 pub struct Dataset {
     clips: Vec<ClipMeta>,
     n_mels: usize,
+    stems: usize,
     time_frames: usize,
+    /// Frames between the starts of consecutive windows in a sequence.
+    stride: usize,
+}
+
+/// Where a clip's frames live and how a row is laid out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Layout {
+    /// v1: `n_mels` values per row, one stem, no phase. Header is 12 bytes.
+    V1,
+    /// v2: `stems * n_mels + 1` values per row. Header is 16 bytes.
+    V2 { stems: usize },
+}
+
+impl Layout {
+    fn header_bytes(self) -> usize {
+        match self {
+            Layout::V1 => 12,
+            Layout::V2 { .. } => 16,
+        }
+    }
+    fn row_len(self, n_mels: usize) -> usize {
+        match self {
+            Layout::V1 => n_mels,
+            Layout::V2 { stems } => stems * n_mels + 1,
+        }
+    }
+    fn stems(self) -> usize {
+        match self {
+            Layout::V1 => 1,
+            Layout::V2 { stems } => stems,
+        }
+    }
 }
 
 struct ClipMeta {
     path: PathBuf, // cache file
     t: usize,      // number of frames
+    layout: Layout,
     /// The mel data, when it fitted in RAM.
     ///
     /// `None` means read it from `path` on every crop — which is a File::open,
@@ -138,17 +181,18 @@ pub fn build_or_load(cfg: &Config) -> Result<Dataset> {
         })
         .collect();
 
-    let mut clips: Vec<ClipMeta> = results.into_iter().flatten().collect();
+    let clips: Vec<ClipMeta> = results.into_iter().flatten().collect();
     if clips.is_empty() {
         return Err(anyhow!(
-            "every clip was too short for one {}-frame crop, or all failed to decode",
-            cfg.time_frames
+            "every clip was too short for one {}-frame sample ({} window(s) of {} at stride {}), \
+or all failed to decode",
+            min_frames(cfg), cfg.seq_windows, cfg.time_frames, cfg.window_stride()
         ));
     }
     println!(
         "[dataset] usable clips: {} (need >= {} frames each)",
         clips.len(),
-        cfg.time_frames
+        min_frames(cfg)
     );
     // Residency happened during the build, not after it: build_one claims from
     // the shared budget and keeps the mel it just computed rather than writing
@@ -173,7 +217,9 @@ pub fn build_or_load(cfg: &Config) -> Result<Dataset> {
     Ok(Dataset {
         clips,
         n_mels: cfg.n_mels,
+        stems: cfg.stems,
         time_frames: cfg.time_frames,
+        stride: cfg.window_stride(),
     })
 }
 
@@ -285,8 +331,16 @@ fn build_one(src: &Path, cfg: &Config) -> Result<Option<ClipMeta>> {
     // against the header — so a corrupt or mismatched file is skipped with the
     // same rules as any other cache entry rather than trusted for its name.
     if src.extension().and_then(|e| e.to_str()) == Some("bspc") {
-        return match try_read_header(src, cfg) {
-            Ok(Some(meta)) if meta.t >= cfg.time_frames => Ok(Some(meta)),
+        // A v1 source is one mixed stem. It cannot stand in for a two-stem
+        // row, and inventing a silent second stem would teach the generator
+        // that drums are optional.
+        return match try_read_header(src, cfg, true) {
+            Ok(Some(meta)) if meta.layout.stems() != cfg.stems => Err(anyhow!(
+                "{src:?} is a {}-stem crop and this run trains {} stems; use --stems {} \
+or re-capture",
+                meta.layout.stems(), cfg.stems, meta.layout.stems()
+            )),
+            Ok(Some(meta)) if meta.t >= min_frames(cfg) => Ok(Some(meta)),
             _ => Ok(None),
         };
     }
@@ -294,8 +348,8 @@ fn build_one(src: &Path, cfg: &Config) -> Result<Option<ClipMeta>> {
     let cache = cache_path(src, cfg);
 
     // If a valid cache already exists, just read its header.
-    if let Ok(Some(meta)) = try_read_header(&cache, cfg) {
-        if meta.t >= cfg.time_frames {
+    if let Ok(Some(meta)) = try_read_header(&cache, cfg, false) {
+        if meta.t >= min_frames(cfg) {
             return Ok(Some(meta));
         } else {
             return Ok(None);
@@ -304,8 +358,9 @@ fn build_one(src: &Path, cfg: &Config) -> Result<Option<ClipMeta>> {
 
     let audio = crate::audio_io::decode_to_mono(src, cfg.sr)?;
     let mel = Mel::new(cfg);
-    let (data, t) = mel.wav_to_mel(&audio); // (n_mels, T) row-major
-    if t < cfg.time_frames {
+    let a = mel.analyse(&audio, cfg.stems); // stems x (n_mels, T), phase (T)
+    let t = a.t;
+    if t < min_frames(cfg) {
         // RECORD THE REJECTION. Returning without writing meant every run
         // decoded every too-short clip again — full decode plus mel, for a
         // result that cannot change unless the file does. In a library where
@@ -321,19 +376,24 @@ fn build_one(src: &Path, cfg: &Config) -> Result<Option<ClipMeta>> {
         // again that it is too short. The full-mel writes below are megabytes
         // for data that is already in hand; this is a tombstone.
         let mut file = File::create(&cache)?;
-        file.write_all(MAGIC)?;
-        file.write_all(&(cfg.n_mels as u32).to_le_bytes())?;
-        file.write_all(&(t as u32).to_le_bytes())?;
+        write_header(&mut file, cfg.n_mels, cfg.stems, t)?;
         return Ok(None);
     }
     let n_mels = cfg.n_mels;
+    let layout = Layout::V2 { stems: cfg.stems };
+    let row = layout.row_len(n_mels);
 
-    // transpose (n_mels, T) -> (T, n_mels)
-    let mut tdata = vec![0f32; t * n_mels];
-    for m in 0..n_mels {
-        for f in 0..t {
-            tdata[f * n_mels + m] = data[m * t + f];
+    // Transpose into rows: [stem0 mel..., stem1 mel..., phase] per frame.
+    let mut tdata = vec![0f32; t * row];
+    for (si, plane) in a.planes.iter().enumerate() {
+        for m in 0..n_mels {
+            for f in 0..t {
+                tdata[f * row + si * n_mels + m] = plane[m * t + f];
+            }
         }
+    }
+    for f in 0..t {
+        tdata[f * row + row - 1] = a.phase[f];
     }
 
     // RAM FIRST, AND THEN NO WRITE AT ALL.
@@ -347,41 +407,76 @@ fn build_one(src: &Path, cfg: &Config) -> Result<Option<ClipMeta>> {
     //
     // So a clip that fits in the budget is held and never written. The .bspc
     // file is the FALLBACK for what does not fit, not the primary store.
-    let need = (t as u64) * (n_mels as u64) * 4;
+    let need = (t as u64) * (row as u64) * 4;
     if claim_mem(need) {
-        return Ok(Some(ClipMeta { path: cache, t, resident: Some(std::sync::Arc::new(tdata)) }));
+        return Ok(Some(ClipMeta {
+            path: cache, t, layout, resident: Some(std::sync::Arc::new(tdata)),
+        }));
     }
 
     let mut file = File::create(&cache)?;
-    file.write_all(MAGIC)?;
-    file.write_all(&(n_mels as u32).to_le_bytes())?;
-    file.write_all(&(t as u32).to_le_bytes())?;
+    write_header(&mut file, n_mels, cfg.stems, t)?;
     let bytes: &[u8] = bytemuck_cast(&tdata);
     file.write_all(bytes)?;
 
-    Ok(Some(ClipMeta { path: cache, t, resident: None }))
+    Ok(Some(ClipMeta { path: cache, t, layout, resident: None }))
 }
 
-fn try_read_header(cache: &Path, cfg: &Config) -> Result<Option<ClipMeta>> {
+/// Frames a clip must hold to yield one training sample: `seq_windows`
+/// windows at `window_stride` apart.
+fn min_frames(cfg: &Config) -> usize {
+    cfg.time_frames + cfg.window_stride() * cfg.seq_windows.max(1).saturating_sub(1)
+}
+
+fn write_header(file: &mut File, n_mels: usize, stems: usize, t: usize) -> Result<()> {
+    file.write_all(MAGIC)?;
+    file.write_all(&(n_mels as u32).to_le_bytes())?;
+    file.write_all(&(stems as u32).to_le_bytes())?;
+    file.write_all(&(t as u32).to_le_bytes())?;
+    Ok(())
+}
+
+/// Read a cache header. `accept_v1` is for SOURCE `.bspc` files (micsession's
+/// crops); in the cache directory a v1 file is a stale entry and reads as
+/// absent so it is rebuilt.
+fn try_read_header(cache: &Path, cfg: &Config, accept_v1: bool) -> Result<Option<ClipMeta>> {
     if !cache.exists() {
         return Ok(None);
     }
     let mut f = File::open(cache)?;
     let mut magic = [0u8; 4];
-    if f.read_exact(&mut magic).is_err() || &magic != MAGIC {
+    if f.read_exact(&mut magic).is_err() {
         return Ok(None);
     }
     let mut b4 = [0u8; 4];
-    f.read_exact(&mut b4)?;
-    let n_mels = u32::from_le_bytes(b4) as usize;
-    f.read_exact(&mut b4)?;
-    let t = u32::from_le_bytes(b4) as usize;
+    let mut u32_at = |f: &mut File| -> Result<usize> {
+        f.read_exact(&mut b4)?;
+        Ok(u32::from_le_bytes(b4) as usize)
+    };
+    let (layout, n_mels, t) = if &magic == MAGIC {
+        let n_mels = u32_at(&mut f)?;
+        let stems = u32_at(&mut f)?;
+        let t = u32_at(&mut f)?;
+        (Layout::V2 { stems }, n_mels, t)
+    } else if &magic == MAGIC_V1 && accept_v1 {
+        let n_mels = u32_at(&mut f)?;
+        let t = u32_at(&mut f)?;
+        (Layout::V1, n_mels, t)
+    } else {
+        return Ok(None);
+    };
     if n_mels != cfg.n_mels {
-        return Ok(None); // cache built with a different config -> rebuild
+        return Ok(None); // built with a different config -> rebuild
+    }
+    if let Layout::V2 { stems } = layout {
+        if stems != cfg.stems {
+            return Ok(None); // a cache entry for the other stem count
+        }
     }
     Ok(Some(ClipMeta {
         path: cache.to_path_buf(),
         t,
+        layout,
         resident: None,
     }))
 }
@@ -395,78 +490,116 @@ impl Dataset {
         self.clips.is_empty()
     }
 
-    /// Read one random `(n_mels, time_frames)` crop, returned as a flat
-    /// row-major `(n_mels, time_frames)` Vec (already transposed back).
-    fn random_crop(&self) -> Result<Vec<f32>> {
-        let mut rng = rand::thread_rng();
-        let clip = &self.clips[rng.gen_range(0..self.clips.len())];
-        let max_start = clip.t - self.time_frames;
-        let start = if max_start == 0 {
-            0
-        } else {
-            rng.gen_range(0..=max_start)
-        };
-
-        // contiguous block: rows [start, start+time_frames) each n_mels wide
-        let n_mels = self.n_mels;
-        let frames = self.time_frames;
-        let header = 4 + 4 + 4;
-        let offset = header + (start * n_mels) * 4;
+    /// Read `frames` consecutive rows of one clip starting at `start`, as
+    /// `(frames, row_len)` row-major in the clip's own layout.
+    fn read_rows(&self, clip: &ClipMeta, start: usize, frames: usize) -> Result<Vec<f32>> {
+        let row = clip.layout.row_len(self.n_mels);
         // Resident clips skip the File::open and the seek — two syscalls per
         // sample, times batch_size, times every step.
-        let owned;
-        let tdata: &[f32] = match &clip.resident {
-            Some(v) => {
-                let a = start * n_mels;
-                &v[a..a + frames * n_mels]
-            }
+        match &clip.resident {
+            Some(v) => Ok(v[start * row..(start + frames) * row].to_vec()),
             None => {
+                let offset = clip.layout.header_bytes() + start * row * 4;
                 let mut f = File::open(&clip.path)?;
                 f.seek(SeekFrom::Start(offset as u64))?;
-                let mut buf = vec![0u8; frames * n_mels * 4];
+                let mut buf = vec![0u8; frames * row * 4];
                 f.read_exact(&mut buf)?;
-                // Transposed straight out of the read buffer: the `.to_vec()`
-                // that used to sit here copied every disk crop a second time.
-                owned = buf;
-                bytemuck_cast_slice(&owned)
-            }
-        }; // (frames, n_mels)
-
-        // transpose (frames, n_mels) -> (n_mels, frames)
-        let mut out = vec![0f32; n_mels * frames];
-        for fr in 0..frames {
-            for m in 0..n_mels {
-                out[m * frames + fr] = tdata[fr * n_mels + m];
+                Ok(f32s_from_le(&buf))
             }
         }
-        Ok(out)
     }
 
-    /// Sample a batch as a tensor of shape (B, 1, n_mels, time_frames).
-    pub fn sample_batch(&self, batch: usize, dev: &Device) -> Result<Tensor> {
-        let n_mels = self.n_mels;
-        let frames = self.time_frames;
-        // The crops in parallel. With the cache on disk each crop is an
-        // open, a seek and a read, and a batch of 32 did them one after
-        // another on the training thread while the GPU waited; the cache
-        // BUILDER next to this has used rayon since the start. Crops are
-        // independent, so this is the same batch assembled by every core.
-        let crops: Vec<Vec<f32>> = (0..batch)
-            .into_par_iter()
-            .map(|_| self.random_crop())
-            .collect::<Result<_>>()?;
-        let mut all = Vec::with_capacity(batch * n_mels * frames);
-        for c in &crops {
-            all.extend_from_slice(c);
+    /// Transpose `frames` rows into `(stems, n_mels, frames)` planes and a
+    /// `(frames,)` phase, in the dataset's stem count. A v1 row supplies its
+    /// one stem and a zero phase.
+    fn unpack(&self, rows: &[f32], layout: Layout, frames: usize, mel_out: &mut Vec<f32>, phase_out: &mut Vec<f32>) {
+        let (n_mels, stems) = (self.n_mels, self.stems);
+        let row = layout.row_len(n_mels);
+        let base = mel_out.len();
+        mel_out.resize(base + stems * n_mels * frames, 0.0);
+        for s in 0..stems.min(layout.stems()) {
+            for m in 0..n_mels {
+                for fr in 0..frames {
+                    mel_out[base + (s * n_mels + m) * frames + fr] = rows[fr * row + s * n_mels + m];
+                }
+            }
         }
-        let t = Tensor::from_vec(all, (batch, 1, n_mels, frames), dev)?;
-        Ok(t)
+        for fr in 0..frames {
+            phase_out.push(match layout {
+                Layout::V1 => 0.0,
+                Layout::V2 { .. } => rows[fr * row + row - 1],
+            });
+        }
+    }
+
+    /// One random window: `(stems, n_mels, time_frames)` planes plus the
+    /// beat phase of each frame.
+    fn random_crop(&self) -> Result<(Vec<f32>, Vec<f32>)> {
+        let (mel, phase) = self.random_sequence(1)?;
+        Ok((mel, phase))
+    }
+
+    /// `k` consecutive windows of one clip, `stride` frames apart, as
+    /// `(k, stems, n_mels, time_frames)` planes and `(k, time_frames)` phase.
+    fn random_sequence(&self, k: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        let mut rng = rand::thread_rng();
+        let clip = &self.clips[rng.gen_range(0..self.clips.len())];
+        let span = self.time_frames + self.stride * k.saturating_sub(1);
+        if clip.t < span {
+            return Err(anyhow!("clip {:?} has {} frames, a {k}-window sample needs {span}", clip.path, clip.t));
+        }
+        let max_start = clip.t - span;
+        let start = if max_start == 0 { 0 } else { rng.gen_range(0..=max_start) };
+        // One contiguous read covering every window, then each window is a
+        // sub-range of it: windows overlap, so reading them separately would
+        // read the overlap twice.
+        let rows = self.read_rows(clip, start, span)?;
+        let row = clip.layout.row_len(self.n_mels);
+        let mut mel = Vec::with_capacity(k * self.stems * self.n_mels * self.time_frames);
+        let mut phase = Vec::with_capacity(k * self.time_frames);
+        for w in 0..k {
+            let a = w * self.stride * row;
+            let b = a + self.time_frames * row;
+            self.unpack(&rows[a..b], clip.layout, self.time_frames, &mut mel, &mut phase);
+        }
+        Ok((mel, phase))
+    }
+
+    /// Sample a batch as a tensor of shape (B, stems, n_mels, time_frames).
+    pub fn sample_batch(&self, batch: usize, dev: &Device) -> Result<Tensor> {
+        Ok(self.sample_sequence_batch(batch, 1, dev)?.mel.squeeze(1)?)
+    }
+
+    /// Sample `batch` sequences of `k` consecutive windows each.
+    ///
+    /// Crops are independent, so the batch is assembled in parallel — with
+    /// the cache on disk each one is an open, a seek and a read.
+    pub fn sample_sequence_batch(&self, batch: usize, k: usize, dev: &Device) -> Result<SeqBatch> {
+        let (n_mels, frames, stems) = (self.n_mels, self.time_frames, self.stems);
+        let seqs: Vec<(Vec<f32>, Vec<f32>)> = (0..batch)
+            .into_par_iter()
+            .map(|_| self.random_sequence(k))
+            .collect::<Result<_>>()?;
+        let mut mel = Vec::with_capacity(batch * k * stems * n_mels * frames);
+        let mut phase = Vec::with_capacity(batch * k * frames);
+        for (m, p) in &seqs {
+            mel.extend_from_slice(m);
+            phase.extend_from_slice(p);
+        }
+        Ok(SeqBatch {
+            mel: Tensor::from_vec(mel, (batch, k, stems, n_mels, frames), dev)?,
+            phase: Tensor::from_vec(phase, (batch, k, frames), dev)?,
+        })
     }
 }
 
-// ----------------------------------------------------------------------------
-// tiny zero-dependency f32<->u8 reinterpret helpers (avoids the bytemuck dep)
-// ----------------------------------------------------------------------------
+/// A batch of window sequences.
+pub struct SeqBatch {
+    /// `(B, K, stems, n_mels, time_frames)`.
+    pub mel: Tensor,
+    /// `(B, K, time_frames)` beat phase in [0, 1).
+    pub phase: Tensor,
+}
 
 fn bytemuck_cast(data: &[f32]) -> &[u8] {
     // Safe: f32 has no padding/invalid bit patterns for read, and the slice
@@ -475,19 +608,15 @@ fn bytemuck_cast(data: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) }
 }
 
-fn bytemuck_cast_slice(data: &[u8]) -> &[f32] {
+/// Bytes -> f32, by value. The read buffer is a `Vec<u8>` whose alignment
+/// is only guaranteed to 1, and `from_raw_parts` on a misaligned `*const
+/// f32` is undefined behaviour, so this decodes rather than casts. A crop is
+/// a few tens of thousands of floats; the copy is not the cost.
+fn f32s_from_le(data: &[u8]) -> Vec<f32> {
     assert!(data.len() % 4 == 0);
-    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4) }
+    data.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 
-
-/// Keep the cache to `cache_batches * batch_size` clips, evicting the
-/// least-recently-used.
-///
-/// The cache is a WORKING SET, not a copy of the library. At 5,630 sources a
-/// full mel cache is tens of gigabytes for a trainer that reads `batch_size`
-/// clips at a time, and the disk it fills is the disk the checkpoints need.
-///
 /// LRU by access time rather than by creation: a sampler drawing randomly
 /// touches the same clips repeatedly within a run, and evicting by age would
 /// throw out the ones currently in rotation. Where a filesystem does not track
@@ -560,10 +689,10 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let ds = Dataset {
             clips: vec![
-                ClipMeta { path: path.clone(), t, resident: None },
-                ClipMeta { path: path.clone(), t, resident: Some(std::sync::Arc::new(data.clone())) },
+                ClipMeta { path: path.clone(), t, layout: Layout::V1, resident: None },
+                ClipMeta { path: path.clone(), t, layout: Layout::V1, resident: Some(std::sync::Arc::new(data.clone())) },
             ],
-            n_mels, time_frames: frames,
+            n_mels, stems: 1, time_frames: frames, stride: frames,
         };
         let batch = 16;
         let tens = ds.sample_batch(batch, &Device::Cpu).unwrap();
@@ -802,6 +931,121 @@ mod tests {
         assert!(cfg.cache_dir.join("keep.ckpt").exists(), "a non-cache file was evicted");
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// Build a v2 clip in memory: value = frame*100 + stem*10 + mel, phase =
+    /// frame/t. Distinct in every field so a transposition error shows.
+    fn v2_clip(n_mels: usize, stems: usize, t: usize) -> Vec<f32> {
+        let row = stems * n_mels + 1;
+        let mut data = vec![0f32; t * row];
+        for fr in 0..t {
+            for st in 0..stems { for m in 0..n_mels {
+                data[fr * row + st * n_mels + m] = (fr * 100 + st * 10 + m) as f32;
+            } }
+            data[fr * row + row - 1] = fr as f32 / t as f32;
+        }
+        data
+    }
+
+    #[test]
+    fn a_v2_sequence_batch_has_consecutive_windows_at_the_stride_from_disk_and_ram() {
+        let dir = std::env::temp_dir().join(format!("bs-seq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (n_mels, stems, t, frames, stride, k) = (3usize, 2usize, 12usize, 4usize, 3usize, 3usize);
+        let data = v2_clip(n_mels, stems, t);
+        let path = dir.join("clip.bspc");
+        {
+            let mut f = File::create(&path).unwrap();
+            write_header(&mut f, n_mels, stems, t).unwrap();
+            f.write_all(bytemuck_cast(&data)).unwrap();
+        }
+        let ds = Dataset {
+            clips: vec![
+                ClipMeta { path: path.clone(), t, layout: Layout::V2 { stems }, resident: None },
+                ClipMeta { path: path.clone(), t, layout: Layout::V2 { stems }, resident: Some(std::sync::Arc::new(data.clone())) },
+            ],
+            n_mels, stems, time_frames: frames, stride,
+        };
+        let batch = 12;
+        let sb = ds.sample_sequence_batch(batch, k, &Device::Cpu).unwrap();
+        assert_eq!(sb.mel.dims(), &[batch, k, stems, n_mels, frames]);
+        assert_eq!(sb.phase.dims(), &[batch, k, frames]);
+        let mel: Vec<f32> = sb.mel.flatten_all().unwrap().to_vec1().unwrap();
+        let ph: Vec<f32> = sb.phase.flatten_all().unwrap().to_vec1().unwrap();
+        let per_w = stems * n_mels * frames;
+        for b in 0..batch {
+            let start = (mel[b * k * per_w] / 100.0) as usize;
+            assert!(start + frames + stride * (k - 1) <= t, "sequence runs off the clip");
+            for w in 0..k {
+                let base = (b * k + w) * per_w;
+                for st in 0..stems { for m in 0..n_mels { for fr in 0..frames {
+                    let want = ((start + w * stride + fr) * 100 + st * 10 + m) as f32;
+                    assert_eq!(mel[base + (st * n_mels + m) * frames + fr], want, "b{b} w{w} s{st} m{m} f{fr}");
+                } } }
+                for fr in 0..frames {
+                    let want = (start + w * stride + fr) as f32 / t as f32;
+                    assert_eq!(ph[(b * k + w) * frames + fr], want, "phase b{b} w{w} f{fr}");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_v1_source_is_read_as_one_stem_with_zero_phase_and_refused_for_two() {
+        let dir = std::env::temp_dir().join(format!("bs-v1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (n_mels, t) = (4usize, 8usize);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC_V1);
+        bytes.extend_from_slice(&(n_mels as u32).to_le_bytes());
+        bytes.extend_from_slice(&(t as u32).to_le_bytes());
+        let data: Vec<f32> = (0..t * n_mels).map(|i| i as f32).collect();
+        bytes.extend_from_slice(bytemuck_cast(&data));
+        let path = dir.join("crop-000000.bspc");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut cfg = Config { n_mels, time_frames: 4, ..Config::default() };
+        cfg.stems = 1;
+        let meta = try_read_header(&path, &cfg, true).unwrap().expect("v1 source accepted");
+        assert_eq!(meta.layout, Layout::V1);
+        assert_eq!(meta.t, t);
+        // In the CACHE a v1 file is stale, whatever the stem count.
+        assert!(try_read_header(&path, &cfg, false).unwrap().is_none());
+        let ds = Dataset { clips: vec![meta], n_mels, stems: 1, time_frames: 4, stride: 4 };
+        let sb = ds.sample_sequence_batch(2, 2, &Device::Cpu).unwrap();
+        assert_eq!(sb.mel.dims(), &[2, 2, 1, n_mels, 4]);
+        let ph: Vec<f32> = sb.phase.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(ph.iter().all(|&p| p == 0.0), "a v1 row has no phase");
+
+        cfg.stems = 2;
+        let err = match build_one(&path, &cfg) { Err(e) => e.to_string(), Ok(_) => panic!("a v1 crop was accepted for two stems") };
+        assert!(err.contains("1-stem crop") && err.contains("--stems 1"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cache_entry_for_the_other_stem_count_is_rebuilt() {
+        let dir = std::env::temp_dir().join(format!("bs-stems-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.bspc");
+        let mut f = File::create(&path).unwrap();
+        write_header(&mut f, 8, 2, 100).unwrap();
+        drop(f);
+        let one = Config { n_mels: 8, stems: 1, ..Config::default() };
+        let two = Config { n_mels: 8, stems: 2, ..Config::default() };
+        assert!(try_read_header(&path, &one, false).unwrap().is_none());
+        assert!(try_read_header(&path, &two, false).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn min_frames_covers_the_whole_sequence() {
+        let c = Config { time_frames: 64, overlap_frames: 4, seq_windows: 3, ..Config::default() };
+        assert_eq!(c.window_stride(), 60);
+        assert_eq!(min_frames(&c), 64 + 60 * 2);
+        let one = Config { seq_windows: 1, ..c };
+        assert_eq!(min_frames(&one), 64);
+    }
 }
 
 
@@ -860,14 +1104,5 @@ fn rotation_offset(cfg: &Config, total: usize) -> usize {
     let next = (cur + budget) % total.max(1);
     let _ = std::fs::write(&f, next.to_string());
     cur % total.max(1)
-}
 
-
-/// Read a cached clip's whole body, skipping the header.
-fn read_clip_body(path: &Path, t: usize, n_mels: usize) -> Result<Vec<f32>> {
-    let mut f = File::open(path)?;
-    f.seek(SeekFrom::Start(12))?;   // MAGIC + n_mels + t
-    let mut buf = vec![0u8; t * n_mels * 4];
-    f.read_exact(&mut buf)?;
-    Ok(bytemuck_cast_slice(&buf).to_vec())
 }

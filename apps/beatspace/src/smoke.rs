@@ -48,7 +48,9 @@ use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 
 use crate::config::Config;
 use crate::dsp::Mel;
+use crate::dataset::SeqBatch;
 use crate::model::{bce_with_logits, Discriminator, Generator};
+use crate::seqstep::SeqLosses;
 
 /// A deterministic PRNG, so a failure reproduces exactly.
 ///
@@ -371,40 +373,43 @@ impl Report {
 /// The `run_mean`/`run_var` buffers are not trainable and not random: they are
 /// zeros and ones. Redrawing them would be a different (and wrong) model.
 fn reseed(g: &mut Generator, d: &mut Discriminator, dev: &Device, seed: u64) -> Result<()> {
-    use std::collections::HashMap;
     let mut rng = Rng::new(seed);
-
-    let mut redraw = |sd: HashMap<String, Tensor>| -> Result<HashMap<String, Tensor>> {
-        // Sorted, so the draw order does not depend on HashMap iteration order
-        // — otherwise "same seed" would still give different weights run to run.
-        let mut names: Vec<String> = sd.keys().cloned().collect();
-        names.sort();
-        let mut out = HashMap::new();
-        for name in names {
-            let t = &sd[&name];
-            let dims = t.dims().to_vec();
-            let n: usize = dims.iter().product();
-            // Match model.rs's own initialiser for each parameter kind.
-            let vals: Vec<f32> = if name.ends_with(".run_var") {
-                vec![1.0; n]
-            } else if name.ends_with(".run_mean") || name.ends_with(".beta") {
-                vec![0.0; n]
-            } else if name.ends_with(".gamma") {
-                (0..n).map(|_| 1.0 + rng.normal() * 0.02).collect()
-            } else {
-                // Weights and biases: randn_var's N(0, 0.02), the DCGAN convention.
-                (0..n).map(|_| rng.normal() * 0.02).collect()
-            };
-            out.insert(name, Tensor::from_vec(vals, dims, dev)?);
-        }
-        Ok(out)
-    };
-
-    let gs = redraw(g.state_dict())?;
+    let gs = redraw_state(g.state_dict(), &mut rng, dev)?;
     g.load_state(&gs)?;
-    let ds = redraw(d.state_dict())?;
+    let ds = redraw_state(d.state_dict(), &mut rng, dev)?;
     d.load_state(&ds)?;
     Ok(())
+}
+
+/// One network's state dict, redrawn from `rng` per parameter kind.
+fn redraw_state(
+    sd: std::collections::HashMap<String, Tensor>,
+    rng: &mut Rng,
+    dev: &Device,
+) -> Result<std::collections::HashMap<String, Tensor>> {
+    // Sorted, so the draw order does not depend on HashMap iteration order
+    // — otherwise "same seed" would still give different weights run to run.
+    let mut names: Vec<String> = sd.keys().cloned().collect();
+    names.sort();
+    let mut out = std::collections::HashMap::new();
+    for name in names {
+        let t = &sd[&name];
+        let dims = t.dims().to_vec();
+        let n: usize = dims.iter().product();
+        // Match model.rs's own initialiser for each parameter kind.
+        let vals: Vec<f32> = if name.ends_with(".run_var") {
+            vec![1.0; n]
+        } else if name.ends_with(".run_mean") || name.ends_with(".beta") {
+            vec![0.0; n]
+        } else if name.ends_with(".gamma") {
+            (0..n).map(|_| 1.0 + rng.normal() * 0.02).collect()
+        } else {
+            // Weights and biases: randn_var's N(0, 0.02), the DCGAN convention.
+            (0..n).map(|_| rng.normal() * 0.02).collect()
+        };
+        out.insert(name, Tensor::from_vec(vals, dims, dev)?);
+    }
+    Ok(out)
 }
 
 /// Train the tiny model on synthetic audio for `steps` and report what happened.
@@ -750,5 +755,278 @@ inputs: {:?} — its head is seeing one value",
         // moments of 4096 draws.
         assert!(mean.abs() < 0.1, "mean {mean} is not near 0");
         assert!((var - 1.0).abs() < 0.15, "variance {var} is not near 1");
+    }
+}
+
+// ============================================================================
+// The dynamic architecture: the same idea, for the sequence path
+// ============================================================================
+
+/// `tiny_config` with every dynamic part on. Same sizes; the sequence path
+/// is a different model, not a bigger one.
+pub fn tiny_dynamic_config() -> Config {
+    let base = tiny_config();
+    Config {
+        stems: 2,
+        ctx_frames: 8,
+        beat_phase: true,
+        seq_windows: 3,
+        overlap_frames: 4,
+        playback: crate::config::Playback::Stream,
+        ..base
+    }
+}
+
+/// A batch of synthetic sequences: `seq_windows` consecutive windows per
+/// row at `window_stride`, from one longer render per row, analysed the way
+/// the dataset does it (`Mel::analyse`: stems and a beat phase).
+pub fn synthetic_sequence_batch(cfg: &Config, mel: &Mel, rng: &mut Rng, dev: &Device) -> Result<SeqBatch> {
+    let (b, k, t, c, m) = (cfg.batch_size, cfg.seq_windows, cfg.time_frames, cfg.stems, cfg.n_mels);
+    let span = t + cfg.window_stride() * (k - 1);
+    let need = cfg.n_fft + cfg.hop * (span + 4);
+    let mut mels = Vec::with_capacity(b * k * c * m * t);
+    let mut phases = Vec::with_capacity(b * k * t);
+    for row in 0..b {
+        let src = Source::ALL[row % Source::ALL.len()];
+        let f0 = 80.0 * (1.0 + (row / Source::ALL.len()) as f32 * 0.5);
+        let audio = src.render(need, cfg.sr, f0, rng);
+        let a = mel.analyse(&audio, c);
+        if a.t < span {
+            bail!("synthetic clip produced {} mel frames, need {span}", a.t);
+        }
+        for w in 0..k {
+            let start = w * cfg.window_stride();
+            for plane in &a.planes {
+                for r in 0..m {
+                    mels.extend_from_slice(&plane[r * a.t + start..r * a.t + start + t]);
+                }
+            }
+            phases.extend_from_slice(&a.phase[start..start + t]);
+        }
+    }
+    Ok(SeqBatch {
+        mel: Tensor::from_vec(mels, (b, k, c, m, t), dev).context("sequence batch tensor")?,
+        phase: Tensor::from_vec(phases, (b, k, t), dev).context("sequence phase tensor")?,
+    })
+}
+
+/// What a dynamic run observed. Structural, like `Report`.
+#[derive(Debug, Clone)]
+pub struct SeqReport {
+    pub steps: usize,
+    pub first: SeqLosses,
+    pub last: SeqLosses,
+    /// Fraction of parameters that changed, per network.
+    pub g_moved: f32,
+    pub d_moved: f32,
+    pub sd_moved: f32,
+    /// Same z and phase, two different real contexts: mean |difference|.
+    /// Zero means the renderer ignores what came before.
+    pub ctx_sensitivity: f32,
+    /// Same z and context, two different `z`: mean |difference|.
+    pub z_diversity: f32,
+    /// Same everything twice, eval mode. Must be zero.
+    pub repeatability: f32,
+    /// A free-running eval rollout from a real window: mean |difference|
+    /// between its first and second window. Zero means it froze.
+    pub rollout_motion: f32,
+    /// Whether every value in that rollout was finite and inside tanh's range.
+    pub rollout_sane: bool,
+    /// Spread of the sequence discriminator's per-column scores on one pair.
+    pub sd_column_spread: f32,
+}
+
+impl SeqReport {
+    pub fn line(&self) -> String {
+        format!(
+            "{} steps · d {:.3}->{:.3} · sd {:.3}->{:.3} · g {:.3}->{:.3} (win {:.3} seq {:.3}) · \
+moved g {:.0}% d {:.0}% sd {:.0}% · ctx-sens {:.2e} · z-div {:.4} · repeat {:.1e} · \
+rollout motion {:.2e} sane {} · sd col spread {:.2e}",
+            self.steps,
+            self.first.d, self.last.d,
+            self.first.sd, self.last.sd,
+            self.first.g, self.last.g, self.last.g_win, self.last.g_seq,
+            self.g_moved * 100.0, self.d_moved * 100.0, self.sd_moved * 100.0,
+            self.ctx_sensitivity, self.z_diversity, self.repeatability,
+            self.rollout_motion, self.rollout_sane, self.sd_column_spread,
+        )
+    }
+
+    /// The checks, as messages. Empty means sound.
+    pub fn failures(&self) -> Vec<String> {
+        let mut bad = Vec::new();
+        for (name, v) in [("generator", self.g_moved), ("window discriminator", self.d_moved), ("sequence discriminator", self.sd_moved)] {
+            if v <= 0.5 {
+                bad.push(format!("only {:.1}% of {name} parameters moved — something is detached", v * 100.0));
+            }
+        }
+        if self.ctx_sensitivity <= 0.0 {
+            bad.push("the renderer's output does not depend on the previous window at all".into());
+        }
+        if self.z_diversity <= 1e-4 {
+            bad.push(format!("z-diversity {:.8} — the renderer is ignoring its latent", self.z_diversity));
+        }
+        if self.repeatability != 0.0 {
+            bad.push(format!("the same inputs gave different output twice ({:.3e})", self.repeatability));
+        }
+        if self.rollout_motion <= 0.0 {
+            bad.push("a free-running rollout emitted the same window twice — it is not continuing".into());
+        }
+        if !self.rollout_sane {
+            bad.push("a free-running rollout produced a non-finite or out-of-range value".into());
+        }
+        if self.sd_column_spread <= 0.0 {
+            bad.push("the sequence discriminator scores every column identically — it is not looking along time".into());
+        }
+        bad
+    }
+}
+
+fn frac_moved(before: &[Vec<f32>], after: &[Vec<f32>]) -> f32 {
+    let (mut moved, mut total) = (0usize, 0usize);
+    for (b, a) in before.iter().zip(after.iter()) {
+        for (x, y) in b.iter().zip(a.iter()) {
+            total += 1;
+            if (x - y).abs() > 0.0 {
+                moved += 1;
+            }
+        }
+    }
+    if total == 0 { 0.0 } else { moved as f32 / total as f32 }
+}
+
+fn snapshot(vars: &[candle_core::Var]) -> Result<Vec<Vec<f32>>> {
+    Ok(vars.iter().map(|v| v.flatten_all()?.to_vec1::<f32>()).collect::<candle_core::Result<_>>()?)
+}
+
+fn mean_abs_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
+    Ok((a - b)?.abs()?.mean_all()?.to_scalar::<f32>()?)
+}
+
+/// Train the tiny dynamic model on synthetic sequences for `steps` and
+/// report what happened. Drives `seqstep::step`, the same function the
+/// trainer calls.
+pub fn run_seq(steps: usize, seed: u64) -> Result<SeqReport> {
+    use crate::model::SeqDiscriminator;
+    use crate::seqstep::{self, SeqModels};
+
+    let cfg = tiny_dynamic_config();
+    cfg.validate().map_err(|e| anyhow::anyhow!("tiny dynamic config: {e}"))?;
+    let dev = Device::Cpu;
+    let mel = Mel::new(&cfg);
+    let mut rng = Rng::new(seed);
+
+    let mut g = Generator::new(&cfg, &dev)?;
+    let mut d = Discriminator::new(&cfg, &dev)?;
+    let mut sd = SeqDiscriminator::new(&cfg, &dev)?;
+    {
+        let mut wr = Rng::new(seed ^ 0xA5A5_A5A5);
+        g.load_state(&redraw_state(g.state_dict(), &mut wr, &dev)?)?;
+        d.load_state(&redraw_state(d.state_dict(), &mut wr, &dev)?)?;
+        sd.load_state(&redraw_state(sd.state_dict(), &mut wr, &dev)?)?;
+    }
+    let (g_before, d_before, sd_before) =
+        (snapshot(&g.trainable_vars())?, snapshot(&d.trainable_vars())?, snapshot(&sd.trainable_vars())?);
+
+    let params = |lr: f64| ParamsAdamW { lr, beta1: cfg.beta1, beta2: 0.999, eps: 1e-8, weight_decay: 0.0 };
+    let mut m = SeqModels {
+        opt_g: AdamW::new(g.trainable_vars(), params(cfg.lr))?,
+        opt_d: AdamW::new(d.trainable_vars(), params(cfg.lr))?,
+        opt_sd: AdamW::new(sd.trainable_vars(), params(cfg.lr))?,
+        g, d, sd,
+    };
+
+    let mut first = None;
+    let mut last = None;
+    for step in 0..steps {
+        let batch = synthetic_sequence_batch(&cfg, &mel, &mut rng, &dev)?;
+        let l = seqstep::step(&cfg, &dev, &batch, &mut m, |n| {
+            Ok(Tensor::from_vec(rng.normal_vec(n * cfg.latent), (n, cfg.latent), &dev)?)
+        })?;
+        if !l.finite() {
+            bail!("step {step}: a loss went non-finite ({l:?}) — the architecture is unstable, not undertrained");
+        }
+        if step == 0 {
+            first = Some(l);
+        }
+        last = Some(l);
+    }
+    let (first, last) = (first.unwrap_or(SeqLosses { d: f32::NAN, sd: f32::NAN, g: f32::NAN, g_win: f32::NAN, g_seq: f32::NAN }), last.unwrap_or(SeqLosses { d: f32::NAN, sd: f32::NAN, g: f32::NAN, g_win: f32::NAN, g_seq: f32::NAN }));
+
+    let g_moved = frac_moved(&g_before, &snapshot(&m.g.trainable_vars())?);
+    let d_moved = frac_moved(&d_before, &snapshot(&m.d.trainable_vars())?);
+    let sd_moved = frac_moved(&sd_before, &snapshot(&m.sd.trainable_vars())?);
+
+    // --- eval-mode probes on a fresh batch ---
+    let probe = synthetic_sequence_batch(&cfg, &mel, &mut rng, &dev)?;
+    let w0 = probe.mel.narrow(1, 0, 1)?.squeeze(1)?; // (B, C, M, T)
+    let w1 = probe.mel.narrow(1, 1, 1)?.squeeze(1)?;
+    let p1 = probe.phase.narrow(1, 1, 1)?.squeeze(1)?; // (B, T)
+    let p2 = probe.phase.narrow(1, 2, 1)?.squeeze(1)?;
+    let b = cfg.batch_size;
+    let z_a = Tensor::from_vec(rng.normal_vec(b * cfg.latent), (b, cfg.latent), &dev)?;
+    let mut z_b = rng.normal_vec(b * cfg.latent);
+    for (i, v) in z_b.iter_mut().enumerate() {
+        *v += if i % 2 == 0 { 2.0 } else { -2.0 };
+    }
+    let z_b = Tensor::from_vec(z_b, (b, cfg.latent), &dev)?;
+    let ctx_of = |w: &Tensor| -> Result<Tensor> {
+        Ok(w.narrow(3, cfg.time_frames - cfg.ctx_frames, cfg.ctx_frames)?.contiguous()?)
+    };
+    let cond_a = crate::model::Cond { ctx: Some(ctx_of(&w0)?), phase: Some(p1.clone()) };
+    let cond_b = crate::model::Cond { ctx: Some(ctx_of(&w1)?), phase: Some(p1.clone()) };
+    let out_aa = m.g.forward_eval_cond(&z_a, &cond_a)?;
+    let out_ab = m.g.forward_eval_cond(&z_a, &cond_b)?;
+    let out_ba = m.g.forward_eval_cond(&z_b, &cond_a)?;
+    let out_aa2 = m.g.forward_eval_cond(&z_a, &cond_a)?;
+    let ctx_sensitivity = mean_abs_diff(&out_aa, &out_ab)?;
+    let z_diversity = mean_abs_diff(&out_aa, &out_ba)?;
+    let repeatability = mean_abs_diff(&out_aa, &out_aa2)?;
+
+    let roll = seqstep::rollout_eval(&cfg, &m.g, &w0, &[p1.clone(), p2.clone()], |n| {
+        Ok(Tensor::from_vec(rng.normal_vec(n * cfg.latent), (n, cfg.latent), &dev)?)
+    })?;
+    let rollout_motion = mean_abs_diff(&roll[0], &roll[1])?;
+    let rollout_sane = roll.iter().all(|w| {
+        w.flatten_all().and_then(|f| f.to_vec1::<f32>()).map(|v| v.iter().all(|x| x.is_finite() && x.abs() <= 1.0)).unwrap_or(false)
+    });
+
+    let pair = seqstep::join_pair(&w0, &w1, cfg.overlap_frames)?;
+    let cols: Vec<f32> = m.sd.forward(&pair, false)?.narrow(0, 0, 1)?.flatten_all()?.to_vec1()?;
+    let sd_column_spread = cols.iter().fold(f32::MIN, |a, &x| a.max(x)) - cols.iter().fold(f32::MAX, |a, &x| a.min(x));
+
+    Ok(SeqReport {
+        steps, first, last, g_moved, d_moved, sd_moved,
+        ctx_sensitivity, z_diversity, repeatability, rollout_motion, rollout_sane, sd_column_spread,
+    })
+}
+
+#[cfg(test)]
+mod seq_tests {
+    use super::*;
+
+    #[test]
+    fn the_dynamic_architecture_is_sound() {
+        let r = run_seq(6, 7).expect("run");
+        let bad = r.failures();
+        assert!(bad.is_empty(), "{}\n{bad:?}", r.line());
+    }
+
+    #[test]
+    fn a_synthetic_sequence_batch_has_the_dataset_layout() {
+        let cfg = tiny_dynamic_config();
+        let mel = Mel::new(&cfg);
+        let mut rng = Rng::new(3);
+        let b = synthetic_sequence_batch(&cfg, &mel, &mut rng, &Device::Cpu).unwrap();
+        assert_eq!(b.mel.dims(), &[cfg.batch_size, 3, 2, cfg.n_mels, cfg.time_frames]);
+        assert_eq!(b.phase.dims(), &[cfg.batch_size, 3, cfg.time_frames]);
+        // Window 1's first `overlap` columns are window 0's last ones: the
+        // stride is what says so.
+        let w0 = b.mel.narrow(1, 0, 1).unwrap().squeeze(1).unwrap();
+        let w1 = b.mel.narrow(1, 1, 1).unwrap().squeeze(1).unwrap();
+        let t = cfg.time_frames;
+        let tail = w0.narrow(3, t - cfg.overlap_frames, cfg.overlap_frames).unwrap();
+        let head = w1.narrow(3, 0, cfg.overlap_frames).unwrap();
+        assert_eq!(mean_abs_diff(&tail, &head).unwrap(), 0.0);
     }
 }

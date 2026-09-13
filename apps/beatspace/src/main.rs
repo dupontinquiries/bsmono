@@ -9,19 +9,25 @@
 mod micsample;
 mod micsession;
 #[cfg(feature = "app")] mod miclisten;
+mod arrange;
 mod audio_io;
 mod config;
 mod dataset;
+mod device_prefs;
 mod upscale;
 mod dsp;
 #[cfg(feature = "gpu")]
 mod gpu;
 #[cfg(feature = "app")]
+mod arrangepage;
+#[cfg(feature = "app")]
 mod gui;
 mod model;
 #[cfg(feature = "app")]
 mod player;
+mod seqstep;
 mod smoke;
+mod stream;
 mod train;
 mod trainpage;
 mod wgpu_train;
@@ -184,6 +190,39 @@ struct TrainArgs {
     #[arg(long)]
     d_filters: Option<usize>,
 
+    // --- dynamic tracks. `--dynamic` is the preset; the individual flags
+    //     override it. All of them are shape fields except --seq-windows,
+    //     --no-rollout and --overlap-frames, which only change the training
+    //     signal and the stitching.
+    /// The dynamic-track preset: --stems 2 --ctx-frames 8 --beat-phase
+    /// --seq-windows 3 and streaming playback. Trains a renderer that
+    /// continues its own output with drums and instruments as separate
+    /// stems, judged by a sequence discriminator across window joins.
+    #[arg(long, default_value_t = false)]
+    dynamic: bool,
+    /// Mel stems per frame: 1 (mixed) or 2 (harmonic + percussive).
+    #[arg(long)]
+    stems: Option<usize>,
+    /// Frames of the previous window the renderer conditions on. 0 = none.
+    #[arg(long)]
+    ctx_frames: Option<usize>,
+    /// Width of the context vector.
+    #[arg(long)]
+    ctx_dim: Option<usize>,
+    /// Feed the renderer a beat phase per column (sin/cos planes).
+    #[arg(long)]
+    beat_phase: Option<bool>,
+    /// Consecutive windows per sample. 2+ enables the sequence path.
+    #[arg(long)]
+    seq_windows: Option<usize>,
+    /// Skip the free-running rollout (faster, but the model is only ever
+    /// asked to continue real audio, which playback never gives it).
+    #[arg(long, default_value_t = false)]
+    no_rollout: bool,
+    /// Frames adjacent windows overlap by, in training and playback.
+    #[arg(long)]
+    overlap_frames: Option<usize>,
+
     // --- optimisation, safe to change between runs on the same checkpoint.
     /// Adam learning rate.
     #[arg(long)]
@@ -203,6 +242,10 @@ struct SmokeArgs {
     /// Seed, so a failure reproduces exactly.
     #[arg(long, default_value_t = 7)]
     seed: u64,
+    /// Smoke the DYNAMIC architecture instead: two stems, context, beat
+    /// phase, the sequence discriminator and a free-running rollout.
+    #[arg(long, default_value_t = false)]
+    dynamic: bool,
 }
 
 #[cfg(feature = "app")]
@@ -217,7 +260,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Train(a) => {
-            let mut cfg = Config::default();
+            let mut cfg = if a.dynamic { Config::dynamic() } else { Config::default() };
+            if let Some(v) = a.stems { cfg.stems = v; }
+            if let Some(v) = a.ctx_frames { cfg.ctx_frames = v; }
+            if let Some(v) = a.ctx_dim { cfg.ctx_dim = v; }
+            if let Some(v) = a.beat_phase { cfg.beat_phase = v; }
+            if let Some(v) = a.seq_windows { cfg.seq_windows = v; }
+            if a.no_rollout { cfg.rollout = false; }
+            if let Some(v) = a.overlap_frames { cfg.overlap_frames = v; }
             cfg.data_dir = a.data_dir;
             cfg.ckpt_dir = a.ckpt_dir;
             cfg.cache_dir = a.cache_dir;
@@ -294,6 +344,19 @@ proceeding, but a shape mismatch will now fail inside the loader",
                 }
             }
             train::run(&cfg, a.resume)?;
+        }
+        Cmd::Smoke(a) if a.dynamic => {
+            let r = smoke::run_seq(a.steps, a.seed)?;
+            println!("[smoke] {}", r.line());
+            let bad = r.failures();
+            if bad.is_empty() {
+                println!("[smoke] dynamic architecture looks sound");
+            } else {
+                for b in &bad {
+                    eprintln!("[smoke] FAIL: {b}");
+                }
+                anyhow::bail!("{} smoke check(s) failed", bad.len());
+            }
         }
         Cmd::Smoke(a) => {
             // Prints and then sets the exit code, rather than only asserting:

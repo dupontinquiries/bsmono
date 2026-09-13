@@ -10,3 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 core-kit = { path = "../core-kit" }
+
+[dev-dependencies]
+# The FLAC encoder's independent validator, and nothing a consumer links.
+symphonia = { version = "0.6", default-features = false, features = ["flac", "pcm"] }
