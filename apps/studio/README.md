@@ -496,6 +496,56 @@ That is the whole trick: a take reaches a collaborator's timeline by exactly the
 mechanism a drag does. Recording is not special-cased in the sync layer, which
 is why sharing it works at all.
 
+## The second take
+
+One take lands where the playhead was; that has worked since takes were
+ops. The second take of the same phrase landed on the first, and the
+overlap policy either refused it, trimmed the take you might have
+wanted, or moved it to the one shadow lane where the third collided
+again. A vocal session is eight takes of the same two bars.
+
+`studio_core`'s takes module: a take goes to the first lane in the
+track's CHAIN with room — the track, then `vox ↓`, then `vox ↓ ↓`, each
+a shadow lane of the one before (room.rs's own convention applied to
+itself), created only when every existing lane over that span is
+taken. Eight takes of two bars are eight lanes; a take of different
+bars goes back on the parent. A lane is a track, a take is a clip, the
+chain is a fact about names; nothing new travels on the wire. The lane
+and its clip land as one undo step. With a lane's clip selected, the
+take target is the chain's ROOT, so re-taking the phrase you are
+looking at stacks under the same track, never under the lane.
+
+**Loop-record.** "loop the selected clips' span" gives the transport a
+range; the playback block renders the range ALONE and sets it looped,
+so the wrap happens in the callback, sample exact — the singer hears
+the bar come round on time, so what she sings lands on time — and the
+sink's counter maps back into the timeline by `start + (frame mod
+len)`. Recording inside it: each time the playhead comes round (moves
+backwards by more than a jitter — `looping::Passes`, tested with
+numbers), the microphone's audio so far is cut (`Capture::split_take`,
+the buffer swapped out without stopping the stream) and placed at the
+loop's start on the next free lane, trimmed to the loop's length. The
+pass boundary is where the UI saw the wrap, so a frame's worth of the
+next pass sits past the loop's end on this one and is trimmed off;
+not corrected further, because a sample-exact split needs the capture
+and the sink on one clock, and they are two devices.
+
+**Comping.** The root track is the comp; each lane is an alternative.
+"comp: use the selected takes on the track" copies each selected lane
+clip's span onto the root — same source, the offset carried in
+`src_in`, whatever the root held over that span giving way by the trim
+rule — so the comp is ordinary clips that render, export and travel,
+and the lanes keep every take intact underneath. A swipe that takes
+half of one take is `s` on the lane and a comp of the half. "mute the
+take lanes" is a track flag on each, as one step. Two adjacent choices
+from one lane do not trim each other: room is made against a probe
+that carries the comp's own placements.
+
+What this does not decide is which take is best. That is a score, and
+the score the maintainer wants is the transcript's — the take whose
+words match the lyric — which needs whisper on the machine. The choice
+arrives as a lane per span; where it came from is the shell's business.
+
 ## Phones, and the two ways to watch a session
 
 Both source editors assume a mouse and a big screen. The useful touch set is
@@ -596,6 +646,56 @@ Because `integrate` is idempotent and order-independent, the joiner can be
 receiving live edits *while* the catch-up is still arriving — a test does
 exactly that, then replays the entire history again and requires nothing to
 change.
+
+## The call
+
+The singer is remote, and a small producer should not need an intercom
+box or a second program to hear them. So the voice call rides the same
+wire the ops do, in the app by default; whoever has a Dante rig mutes it
+and routes their own. `Packet::Voice` is one 20 ms Opus frame with a
+site and a sequence number, and it never touches the document: the
+shell's `integrate_packet` puts it in `Studio::voice_inbox` and the
+call takes it from there — the same seam `outbox` is, pointing the
+other way, so the document's integration stays a pure function with no
+device in it.
+
+The layers, headless first (each tested without a sound card):
+
+* `studio-collab::voice` — the jitter buffer (frames held to a depth,
+  played in order, a missing slot concealed rather than waited for, a
+  late frame dropped rather than played late), a `Codec` seam, a
+  streaming `Resampler`, and `Link`: one buffer and one decoder per
+  peer, one encoder for us, the additive mix, and a meter. A muted link
+  keeps SENDING encoded silence, so the far side's loss counter reads
+  packet loss and only packet loss. Every frame carries a one-byte codec
+  tag; a receiver conceals a tag it does not speak and counts it —
+  a mismatched build is a silent peer with a rising number, not a
+  speaker full of static.
+* `studio-media::voice` — Opus at its narrowest: a frame in, a packet
+  out. VOIP mode, 24 kbit/s, DTX on (measured: a silent frame cost 41
+  bytes without it and one byte with it, plus a 25-byte refresh every
+  400 ms), libopus's own packet-loss concealment.
+* `studio-app::call` — the pump. The sink grew a SEQUENTIAL stream
+  (`stream_push`: chunks played end to end over the loop and the
+  voices — a one-shot per frame would land wherever the callback was
+  and gap or overlap) and the microphone grew a live tap that shares
+  the device with a take. The UI thread is the playout clock, by proxy:
+  the stream is kept topped up to 100 ms every frame and each chunk
+  pushed is one slot popped from every peer's buffer. The stream is
+  filled with silence from the moment the call starts, not from the
+  first frame heard — otherwise the first pump after a peer speaks pops
+  the whole depth at once and the jitter buffer's sixty milliseconds
+  are spent on the sink's queue instead of the network. The TCP test
+  found that race; the fake-only tests could not.
+
+The controls: ☎ joins and leaves, mute, push-to-talk with a button you
+HOLD (the one push-to-talk that works on a phone), and the status line
+reads the meter — peers, buffering, lost, late, a foreign codec, UI
+stalls, dropped mic blocks. No microphone makes the call listen-only,
+not refused. A peer who speaks before you join is named as ringing.
+Echo cancellation is not built; headphones are the honest answer and
+the join message says so. Verified end to end over 127.0.0.1 with only
+the two devices faked; NOT yet against a sound card or a microphone.
 
 ## Surviving a real carrier
 
@@ -992,6 +1092,137 @@ read it at a glance. Per-band correlation completes the picture: not "this mix
 has phase problems" but "your 200 Hz is out of phase", which is the difference
 between a meter you act on and one you learn to ignore.
 
+## Riding a knob
+
+The FL footage has automation clips on everything — filter sweeps and
+risers into drops, a reverb's mix opening on the last bar — and the
+app's lanes reached track and bus gain only. `AutoTarget::BusParam` and
+`ClipParam` (an effect by its index in its chain, a parameter by a
+16-byte key so the target stays `Copy` and the op fixed-shape) are the
+rest of it. A parameter lane follows the fader rule: the effect runs
+with `stored × lane × Π(bindings)`, so a curve is a ride on what the
+knob says, a filter sweep is a cutoff at 1 kHz and a curve from 0.1 to
+8, and everything the curves module promised — gated to a clip, moving
+with it, duplicated with it, one curve on twelve ad-libs — holds on a
+knob as it does on a fader.
+
+The part that is not bookkeeping: an effect must take a new value
+WITHOUT losing its state. Rebuilding the instance at every point
+empties the delay line and resets the filter — a click per point. So
+`Instance::set_param` moves what can be moved mid-stream (gains,
+thresholds, mixes, feedback, damping, a band's design with its memory
+carried over), refuses what cannot (a delay's time, a lookahead, a
+band's type — buffer sizes, not values), and `is_live_param` states the
+same set for the editor, which offers "automate" only on those. The
+render applies rides at control rate, 64 frames, the classic bargain.
+Pinned: a low-pass swept over a tone by redesign-in-place keeps its
+largest step at the tone's own slope; the same sweep by reinstantiate
+steps an order larger. And a ride on a disabled effect's neighbour
+still reaches the right one, because the cache keeps the chain index
+with each instance.
+
+Wire target kinds 2 and 3 without a `WIRE_VERSION` bump: an older peer
+already refuses an unknown target kind outright, and a bump would
+refuse every older save file for a target most projects never draw.
+
+## Three small tools the footage kept showing
+
+**Chords on the roll.** `Key::scale_step` walks the scale (a third is
+two degrees, a fifth four, the octave seven; an out-of-key note steps
+from the nearest scale note below it). `Pattern::harmonize` copies
+every note on the channel that far away, diatonic when the project has
+a key and the major interval in semitones when not, never stacking a
+(start, key) that exists; `Pattern::arpeggiate` breaks every chord into
+a run — up, down, or up-and-down without repeating the ends — filling
+the chord's span. Channel-wide on purpose: the roll has no note
+selection, and "add fifths to this bass line" is what is meant. A tool
+row above the roll, and palette verbs.
+
+**A folder is a kit.** Drop a directory on the app and every audio file
+in it, in name order, is a sampler channel — the way a drum pack
+unzips. Non-audio and undecodable files are skipped and counted; more
+than 32 takes the first 32 and says so.
+
+**The phone's formats.** mp3 and m4a exports, through ffmpeg
+(`studio_video::transcode_audio`): the dithered WAV written beside the
+target, transcoded, removed. Stereo only, like Opus. Read back by the
+app's own decoder in the tests, the arrangement's length within a
+codec frame. Still open on this line: the share sheet itself, which is
+a portal call, and the triplet grid, which is a sub-step note position
+and therefore a rack-wire change, not a snap setting.
+
+## The picture, rendered
+
+The arrangement rendered to audio since the first mixdown; the other
+half of a music video is `studio_video::edit`. The cut list is timeline
+arithmetic: every clip on a video track, the FIRST video track on top
+where two overlap (every editor's rule, and how the arrangement paints
+them), black where none — a gap is a segment, not a skip, because the
+audio's timing must hold. The ffmpeg command is a string built from it
+(one input per distinct file, `trim` + `setpts` per cut, `color` per
+gap, everything scaled and padded to one frame size, `concat`, the
+mixdown WAV mapped under it, `-shortest`), tested as a string; and
+tested for real where ffmpeg has libx264, by rendering two coloured
+fixtures cut against each other and reading the centre pixel back at
+four moments. "export the music video" runs it on the export worker
+and lands the mp4 next to the project file; a video source whose file
+is not where the project says is a gap, and a timeline with no video
+is refused rather than rendered black.
+
+Sync by audio was already there (`align_offset_ms`, and the slate's own
+aligner with a confidence) — verified before writing a third, which the
+agents' guide asks for and this session nearly failed to do.
+
+## A curve over a composition
+
+`Gate::Group(id)`: a binding active over the group's HULL — from its
+first member's start to its last member's end, the gap between members
+included — with the curve's origin at the hull's start. A riser across
+the whole drop, a filter opening over a chorus made of twelve clips;
+the ride follows the group as its members move (the origin moves with
+the first, the span stretches with the last) and grows as members are
+added. A group with no members, or none at all, is never active, and
+its binding stays harmless. The palette's "automation curve over the
+selected clip's group" mints one, curve and binding as one undo step.
+On the wire it is gate kind 3, without a version bump, for the reason
+the parameter targets gave.
+
+## The sends finally have something to feed
+
+The mixer had busses and sends since the console panel landed, and the
+registry had nothing worth sending to: `voice::Delay` is a tuned comb (a
+timbre, by design not a room) and there was no reverb at all. The
+footage in `docs/agents/producer-workflows.md` has delay and reverb on
+sends in every project. `studio-fx::space` is them:
+
+* **Reverb** — Schroeder/Moorer as Freeverb arranged it: eight parallel
+  low-pass-feedback combs into four series allpasses per channel, the
+  right channel's lines 23 samples longer so the two decays decorrelate
+  into width. Forty lines, allocates nothing after construction, and
+  the tail is a known exponential — which is what makes `size` a number
+  the tests check (a 0.9 room holds ten times the energy of a 0.2 room
+  two seconds in) rather than a feel. The tunings scale with the sample
+  rate so a 48 kHz project gets the same room as a 44.1 kHz one, not a
+  smaller one. Every room is fed the mono sum, per Freeverb, and the
+  frame's rooms are computed together when its last channel arrives:
+  a half-stale width matrix measured as a high-pass on the tail — 74 %
+  of the energy differed between the ears at width 0 — so every channel
+  is one sample late, uniformly, which for a room is nothing.
+* **Delay** — time in ms, feedback, a one-pole low-pass INSIDE the loop
+  (each repeat duller than the last), mix, and ping-pong, where the
+  frame's mono sum enters the last channel's line and each channel's
+  repeat feeds the other's, so a hit bounces across the field instead
+  of stacking. `instantiate` has a rate and no tempo, so sync is the
+  shell's: "sync delay to tempo" rewrites every delay's time on every
+  bus and selected clip to a dotted eighth / eighth / quarter /
+  sixteenth at the active song's tempo (or the rack's) — as ops, so it
+  undoes and travels.
+
+Both carry per-channel state behind the per-sample interface, the
+bargain `playrate` made. On a bus that other busses send into, the
+mixer adds them all-wet (`mix` 1.0); as an insert, 30 %. The rule is a
+pure function with a test, not a checkbox.
+
 ## The chain strip
 
 The third piece of the Ozone grammar, after the shared canvas and the meters: a
@@ -1319,8 +1550,8 @@ a time move is two (the left-trim precedent), all through the op-log door
 so a ride is undoable, on the wire, and refusable out loud.
 
 **Automation — the ride, as ops.** `Project` gains lanes: points per
-`AutoTarget` (track gain and bus gain first; the enum is where a
-clip-gain or effect-parameter target lands later), edited by
+`AutoTarget` (track gain and bus gain first; effect parameters landed
+in c17 — "Riding a knob" below), edited by
 `SetAutoPoint`/`RemoveAutoPoint` in the house op shape — absolute
 (time, value) so peers converge per-point, a refusal when a removal has
 nothing to restore, locked tracks refusing their lane the way they refuse

@@ -45,6 +45,22 @@ pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Opti
         ui.colored_label(c.text_weak,
             "drag to draw a note · click to remove · grab the right edge to resize · right-click for slide");
     });
+    // ── chord tools ─────────────────────────────────────────────────────
+    // Channel-wide on purpose: the roll has no note selection, and "add
+    // fifths to this bass line" / "break these block chords into runs"
+    // are what a producer means. Every one is one click and one status.
+    ui.horizontal_wrapped(|ui| {
+        ui.label("chords:");
+        if ui.button("+3rds").on_hover_text("a third above every note, in the key").clicked() { s.harmonize_roll(2); }
+        if ui.button("+5ths").on_hover_text("a fifth above every note").clicked() { s.harmonize_roll(4); }
+        if ui.button("+8va").on_hover_text("an octave above").clicked() { s.harmonize_roll(7); }
+        if ui.button("+8vb").on_hover_text("an octave below").clicked() { s.harmonize_roll(-7); }
+        ui.separator();
+        ui.label("arpeggiate:");
+        if ui.button("↑").on_hover_text("each chord becomes a run, up").clicked() { s.arpeggiate_roll(studio_live::Arp::Up, 1); }
+        if ui.button("↓").clicked() { s.arpeggiate_roll(studio_live::Arp::Down, 1); }
+        if ui.button("↑↓").clicked() { s.arpeggiate_roll(studio_live::Arp::UpDown, 1); }
+    });
 
     let Some(pattern) = s.rack.patterns.get(s.current_pattern) else {
         ui.colored_label(c.text_weak, "No pattern. Add one on the Rack tab.");

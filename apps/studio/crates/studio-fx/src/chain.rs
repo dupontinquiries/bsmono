@@ -167,7 +167,7 @@ mod tests {
     }
 
     fn boosting_eq() -> Eq {
-        Eq { bands: vec![Biquad::design(BandKind::Peaking, RATE, 200.0, 1.0, 12.0)] }
+        Eq { bands: vec![Biquad::design(BandKind::Peaking, RATE, 200.0, 1.0, 12.0)], ..Eq::default() }
     }
 
     fn run(chain: &mut Chain, input: &[f32]) -> Vec<f32> {

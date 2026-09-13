@@ -74,15 +74,16 @@ as a phase after "arrange" has the order wrong for this user.
   automation clips* everywhere — filter sweeps and risers into drops,
   volume dips for the beat drop. The automation is what makes an
   arrangement sound finished. The app's automation targets were track and
-  bus gain only; **effect-parameter automation is the biggest single gap**
-  after the curves work.
+  bus gain only; effect-parameter automation was the biggest single gap
+  after the curves work — closed in c17 (`AutoTarget::BusParam` /
+  `ClipParam`, `Instance::set_param`, rides at control rate).
 - **Mixing tools**: an assistant-style EQ/dynamics per insert (Neutron:
   EQ, compressor, sculptor, masking), a limiter, **delay and reverb on
   sends**, sidechain ducking, stereo width, and a maximizer on master
   (Ozone). The app has EQ/comp/limiter/multiband/imager/saturation and
-  a mix assistant — and **no reverb and no delay at all** (verified: the
-  registered effect kinds in `studio-fx/src/lib.rs`). The mixer has sends
-  with nothing worth sending to.
+  a mix assistant — and, as of c17, reverb and delay (`studio-fx::space`;
+  before that there were none, verified against the registered kinds,
+  and the sends had nothing worth sending to).
 - **Vocals** arrive three ways: as chops loaded like drums (`vox –
   breath.wav`), as files delivered from a recording studio (the Downloads
   folder), and as a long single take on the playlist that then gets
@@ -146,8 +147,9 @@ producers get started" without extra hardware.
   use; anyone with a Dante rig mutes it and routes their own. The
   maintainer knows about group-call work in `snapclone` and chose in-app
   anyway for the routing simplicity. → `Packet::Voice` + `voice::Jitter`
-  in `studio-collab`; the shell halves (Opus encode/decode, sink) are not
-  built.
+  in `studio-collab`; the shell halves are built now (c17):
+  `studio-collab::voice::Link`, `studio-media::voice` (Opus frames),
+  `studio-app::call` (the pump), ☎ / mute / hold-to-talk in the toolbar.
 - **Presence must say who is recording** so nobody moves the singer's
   playhead mid-take. → `Presence.recording`, overlay label `name ● rec`.
 - **Whisper transcripts** matter for a specific reason: "when someone wants
@@ -160,10 +162,11 @@ producers get started" without extra hardware.
 
 ## 5. Music video, as the maintainer wants it
 
-Nothing is built. The two cheap wins, in order: sync camera footage by
-audio (the existing `align` cross-correlation with a different source
-pair) and render an mp4 through the ffmpeg edit list `studio-video`
-already shells to. Camera capture on the phone is PipeWire/libcamera
+Both cheap wins are in as of c17: sync camera footage by audio (the
+existing `align` cross-correlation — a video source's audio is a
+`SourceAudio` like any other) and the mp4 render through ffmpeg's edit
+list (`studio_video::edit`, "export the music video"). Still not built:
+camera capture on the phone, which is PipeWire/libcamera
 through the portal. Realtime video playback is the expensive thing and is
 not needed for either win.
 
@@ -205,13 +208,42 @@ first phase is for.
 
 ## 8. Open, in the order agreed
 
-1. Voice link shell halves (Opus is in `studio-media`; the sink mixes
-   one-shot voices already).
-2. Reverb and delay in `studio-fx` (sends have nothing to feed).
-3. Effect-parameter automation on top of `curves.rs`.
+1. ~~Voice link shell halves~~ — built (c17): `studio-collab::voice::Link`,
+   `studio-media::voice`, `studio-app::call`; the README's "The call"
+   section. Unverified against a real sound card or microphone.
+2. ~~Reverb and delay in `studio-fx`~~ — built (c17): `studio-fx::space`,
+   all-wet on a return bus, "sync delay to tempo" in the palette. The
+   README's "The sends finally have something to feed".
+3. ~~Effect-parameter automation on top of `curves.rs`~~ — built (c17):
+   `AutoTarget::BusParam`/`ClipParam`, `Instance::set_param` +
+   `is_live_param`, `studio-audio`'s `ParamRide` at 64-frame control
+   rate, "automate" on the fx editor's live controls. The README's
+   "Riding a knob".
 4. Synth + piano control-panel sketch, SFZ/SF2 kind behind it.
-5. Take lanes, loop-record, comping.
-6. Video: align-by-audio, ffmpeg edit-list render.
-7. `Gate::Group` (a curve over a composition's hull), wire bump.
-8. Triplet snap, arpeggiate/chord tools, folder-drop → kit, phone share
-   sheet with an mp3/m4a target, the drawn overlap line.
+5. ~~Take lanes, loop-record, comping~~ — built (c17): `studio_core`'s
+   takes module (`take_lane_ops`, `comp_ops`, `take_lanes_mute_ops`),
+   `looping::{Window, Passes}` + `Capture::split_take` in the shell,
+   palette verbs for loop / comp / mute lanes. The README's "The second
+   take". Still open inside it: the transcript-driven "best take" score
+   (needs whisper on the machine).
+6. ~~Video: align-by-audio, ffmpeg edit-list render~~ — align-by-audio
+   already existed (`align_offset_ms` + `Studio::align_selected`, and
+   `slate::align` with a confidence — verified before writing a third);
+   the edit-list render is built (c17): `studio_video::edit` (the cut
+   list as timeline arithmetic, the ffmpeg command as a string, a real
+   render test that reads the frames back), `export::render_music_video`
+   / `start_video`, "export the music video" in the palette.
+7. ~~`Gate::Group` (a curve over a composition's hull)~~ — built (c17):
+   `Project::group_hull`, gate kind 3 on the wire WITHOUT a bump (the
+   parameter-target precedent: an unknown gate kind already refuses the
+   packet, and a bump would refuse every older save file), "automation
+   curve over the selected clip's group" in the palette.
+8. Triplet snap, ~~arpeggiate/chord tools~~, ~~folder-drop → kit~~, phone
+   share sheet with ~~an mp3/m4a target~~, the drawn overlap line.
+   Built (c17): `Pattern::harmonize` / `arpeggiate` with
+   `Key::scale_step` (a tool row in the program panel, seven palette
+   verbs); a directory drop is `Studio::import_kit`; `ExportFormat::Mp3`
+   / `M4a` through `studio_video::transcode_audio`. Still open: the
+   triplet grid (a sub-step note position — a rack-wire codec change,
+   not a snap setting), the share sheet itself (a portal call), the
+   drawn overlap line.

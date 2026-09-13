@@ -46,9 +46,13 @@
 use std::fmt;
 use std::path::Path;
 
-#[cfg(feature = "opus")]
 pub mod flac;
+#[cfg(feature = "opus")]
 mod opus;
+/// Frame-level Opus for the in-house call. Needs libopus like `.opus`
+/// decode does, so it rides the same feature.
+#[cfg(feature = "opus")]
+pub mod voice;
 
 use studio_audio::SourceAudio;
 use symphonia::core::audio::{AudioBufferRef, Signal};

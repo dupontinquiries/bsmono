@@ -65,6 +65,24 @@ pub enum ShellVerb {
     CollabUnfollow,
     /// Ask peers for the full op log again.
     CollabResync,
+    /// The voice call over the session's wire: join/leave, mute, and
+    /// push-to-talk mode. Shell verbs like the rest of collaboration —
+    /// who can hear whom is not a fact about the music.
+    CallToggle,
+    CallMute,
+    CallPushToTalk,
+    /// Chord tools on the roll's channel: a harmony `n` scale degrees
+    /// away (2 = third, 4 = fifth, 7 = octave, negative below), and every
+    /// chord broken into a run in this order.
+    Harmonize(i8),
+    Arpeggiate(studio_live::Arp),
+    /// The arrangement loop range, from the selection; and off.
+    LoopSelection,
+    LoopOff,
+    /// Takes: the selected lane clips copied onto their chain's root;
+    /// the lanes under the take target muted or unmuted.
+    CompTakes,
+    MuteTakeLanes(bool),
     RecordTake,
     /// Show or hide the out-of-key dimming in the piano roll.
     ToggleKeyGuide,
@@ -79,14 +97,23 @@ pub enum ShellVerb {
     /// always to the strip's lane when nothing is selected) — see
     /// `Studio::new_curve_on_selection`.
     NewCurve,
+    /// A curve gated to the group the selected clip is in: a ride over
+    /// the composition's hull.
+    NewCurveOnGroup,
     /// Cut the selection on the rack grid every N steps (4 = beat, 16 = bar).
     SplitOnGrid(u8),
+    /// Every delay's time to N sixteenths at the working tempo — the
+    /// sync `instantiate` cannot do, since it has a rate and no tempo.
+    SyncDelay(u8),
     /// The strip's binding gets its own copy of its curve.
     MakeCurveUnique,
     /// Overlap policy for the selected clip's track (every track with none selected).
     Overlap(studio_core::Overlap),
     ArchiveDialog,
     ExportDialog,
+    /// The music video: the timeline's video clips over the mixdown,
+    /// through ffmpeg, next to the project file.
+    ExportVideo,
     Settings,
     ToggleWorkbench,
     ToggleLibrary,
@@ -234,6 +261,31 @@ pub fn root() -> Vec<Choice> {
           Then::Do(Act::Shell(ShellVerb::CollabUnfollow))),
         c("resync with collaborators", Some("re-request the op log"),
           Then::Do(Act::Shell(ShellVerb::CollabResync))),
+        // The call. "collaborator" again, so the group stays one search.
+        c("call collaborators (join / leave the voice call)", None,
+          Then::Do(Act::Shell(ShellVerb::CallToggle))),
+        c("mute / unmute the call microphone", None,
+          Then::Do(Act::Shell(ShellVerb::CallMute))),
+        c("push-to-talk on the call (hold the talk button)", None,
+          Then::Do(Act::Shell(ShellVerb::CallPushToTalk))),
+        // The roll's chord tools.
+        c("harmonize the roll: add thirds", Some("in the project key, or major"),
+          Then::Do(Act::Shell(ShellVerb::Harmonize(2)))),
+        c("harmonize the roll: add fifths", None, Then::Do(Act::Shell(ShellVerb::Harmonize(4)))),
+        c("harmonize the roll: add an octave above", None, Then::Do(Act::Shell(ShellVerb::Harmonize(7)))),
+        c("harmonize the roll: add an octave below", None, Then::Do(Act::Shell(ShellVerb::Harmonize(-7)))),
+        c("arpeggiate the roll's chords: up", Some("one step per note"),
+          Then::Do(Act::Shell(ShellVerb::Arpeggiate(studio_live::Arp::Up)))),
+        c("arpeggiate the roll's chords: down", None, Then::Do(Act::Shell(ShellVerb::Arpeggiate(studio_live::Arp::Down)))),
+        c("arpeggiate the roll's chords: up and down", None, Then::Do(Act::Shell(ShellVerb::Arpeggiate(studio_live::Arp::UpDown)))),
+        // Loop and takes.
+        c("loop the selected clips' span", Some("record inside it for a take per pass"),
+          Then::Do(Act::Shell(ShellVerb::LoopSelection))),
+        c("loop off", None, Then::Do(Act::Shell(ShellVerb::LoopOff))),
+        c("comp: use the selected takes on the track", Some("copies each onto its chain's root"),
+          Then::Do(Act::Shell(ShellVerb::CompTakes))),
+        c("mute the take lanes under this track", None, Then::Do(Act::Shell(ShellVerb::MuteTakeLanes(true)))),
+        c("unmute the take lanes under this track", None, Then::Do(Act::Shell(ShellVerb::MuteTakeLanes(false)))),
         c("find in the timeline", None, Then::Ask(Ask::FindHow)),
         c("jump to marker", None, Then::Ask(Ask::JumpMarker)),
         c("delete all markers", None, Then::Do(Act::Ops(vec![Op::ClearMarkers]))),
@@ -261,14 +313,24 @@ pub fn root() -> Vec<Choice> {
         c("yank selection", Some("y"), Then::Do(Act::Key('y'))),
         c("paste at playhead (with automation)", Some("p"), Then::Do(Act::Key('p'))),
         c("automation curve on selected clips", None, Then::Do(Act::Shell(ShellVerb::NewCurve))),
+        c("automation curve over the selected clip's group", Some("the whole composition, gap included"),
+          Then::Do(Act::Shell(ShellVerb::NewCurveOnGroup))),
         c("split selection on beats", None, Then::Do(Act::Shell(ShellVerb::SplitOnGrid(4)))),
         c("split selection on bars", None, Then::Do(Act::Shell(ShellVerb::SplitOnGrid(16)))),
+        // Delay sync: the four lengths a producer reaches for, the trap
+        // default first.
+        c("sync delay to tempo: dotted eighth", None, Then::Do(Act::Shell(ShellVerb::SyncDelay(3)))),
+        c("sync delay to tempo: eighth", None, Then::Do(Act::Shell(ShellVerb::SyncDelay(2)))),
+        c("sync delay to tempo: quarter", None, Then::Do(Act::Shell(ShellVerb::SyncDelay(4)))),
+        c("sync delay to tempo: sixteenth", None, Then::Do(Act::Shell(ShellVerb::SyncDelay(1)))),
         c("make curve unique (strip's binding)", None, Then::Do(Act::Shell(ShellVerb::MakeCurveUnique))),
         c("overlap: newest wins (trim what it lands on)", None, Then::Do(Act::Shell(ShellVerb::Overlap(studio_core::Overlap::Trim)))),
         c("overlap: shadow lane (a track beside it, same bus)", None, Then::Do(Act::Shell(ShellVerb::Overlap(studio_core::Overlap::Lane)))),
         c("overlap: refuse", None, Then::Do(Act::Shell(ShellVerb::Overlap(studio_core::Overlap::Refuse)))),
         c("save archive…", None, Then::Do(Act::Shell(ShellVerb::ArchiveDialog))),
         c("export…", None, Then::Do(Act::Shell(ShellVerb::ExportDialog))),
+        c("export the music video (mp4 next to the project)", Some("video clips cut over the mixdown, via ffmpeg"),
+          Then::Do(Act::Shell(ShellVerb::ExportVideo))),
         c("settings…", None, Then::Do(Act::Shell(ShellVerb::Settings))),
         c("workspace: edit (arrange & trim)", Some("C-1"),
           Then::Do(Act::Shell(ShellVerb::Workspace(0)))),

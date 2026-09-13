@@ -45,7 +45,34 @@ pub const ADDABLE_FX: &[(&str, &[(&str, f32)])] = &[
     // behind a chain chip rather than a plugin you must go find.
     ("tapestop", &[("start", 0.0), ("length", 1.0), ("channels", 2.0)]),
     ("halftime", &[("window", 0.5), ("channels", 2.0)]),
+    // The send pair. These defaults are an INSERT's (30% wet); the bus
+    // menu turns `mix` up to 1.0 when the bus is a send target — see
+    // `send_target_mix`. The delay's 321.4 ms is the dotted eighth at
+    // 140 BPM; "sync delay to tempo" in the palette rewrites it.
+    ("reverb", &[("size", 0.5), ("damp", 0.4), ("predelay", 10.0), ("width", 1.0),
+                 ("mix", 0.3), ("channels", 2.0)]),
+    ("delay", &[("time", 321.4), ("feedback", 0.4), ("damp", 5000.0), ("pingpong", 0.0),
+                ("mix", 0.3), ("channels", 2.0)]),
 ];
+
+/// Kinds whose `mix` should be all-wet on a bus other busses send to: a
+/// reverb on a send return that also passes the dry would double every
+/// track routed through it. Anything else keeps its insert default.
+pub const SEND_KINDS: &[&str] = &["reverb", "delay"];
+
+/// The effect to add to bus `to`: the catalog's defaults, with `mix`
+/// raised to 1.0 for a send kind when some bus sends into `to` — the
+/// one thing a return bus is for. Pure, so the rule is testable without
+/// a panel.
+pub fn effect_for_bus(kind: &str, params: &[(&str, f32)], to: studio_core::BusId,
+                      busses: &[studio_core::Bus]) -> studio_core::Effect {
+    let mut e = effect(kind, params);
+    let is_return = busses.iter().any(|b| b.sends.iter().any(|sd| sd.to == to));
+    if is_return && SEND_KINDS.contains(&kind) {
+        e.params.insert("mix".into(), 1.0);
+    }
+    e
+}
 
 pub fn effect(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
     studio_core::Effect {
@@ -60,7 +87,7 @@ pub fn effect(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
 /// gated to a vocal clip is the structural sidechain), or bound always
 /// when nothing is selected. What Gemini's read of FL called the
 /// "context-menu parameter binding": the knob is where automation starts.
-fn automate_menu(resp: &egui::Response, s: &mut Studio, target: studio_core::AutoTarget) {
+pub(crate) fn automate_menu(resp: &egui::Response, s: &mut Studio, target: studio_core::AutoTarget) {
     resp.context_menu(|ui| {
         if ui.button("automate: show lane").clicked() {
             s.auto_target = Some(target);
@@ -356,7 +383,7 @@ fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
             ui.menu_button("+ fx", |ui| {
                 for (kind, params) in ADDABLE_FX {
                     if ui.button(*kind).clicked() {
-                        chain.push(effect(kind, params));
+                        chain.push(effect_for_bus(kind, params, b.id, &busses));
                         changed = true;
                         ui.close();
                     }
@@ -401,5 +428,37 @@ fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
         ui.colored_label(c.warning,
             format!("solo: {} track(s) — monitoring only, exports follow it",
                     s.solo.len()));
+    }
+}
+
+#[cfg(test)]
+mod send_defaults_tests {
+    use super::*;
+    use studio_core::{Bus, BusId, Send};
+
+    fn bus(id: u64, sends_to: &[u64]) -> Bus {
+        Bus {
+            id: BusId(id), name: format!("bus {id}"), parent: None, gain: 1.0, chain: vec![],
+            sends: sends_to.iter().map(|&t| Send { to: BusId(t), level: 0.5, pre_fader: false }).collect(),
+            muted: false,
+        }
+    }
+
+    #[test]
+    fn a_reverb_on_a_return_bus_is_all_wet_and_on_an_insert_bus_is_not() {
+        let busses = vec![bus(1, &[2]), bus(2, &[]), bus(3, &[])];
+        let params = ADDABLE_FX.iter().find(|(k, _)| *k == "reverb").unwrap().1;
+        let on_return = effect_for_bus("reverb", params, BusId(2), &busses);
+        assert_eq!(on_return.params["mix"], 1.0, "bus 1 sends into bus 2: a return, all wet");
+        let on_insert = effect_for_bus("reverb", params, BusId(3), &busses);
+        assert_eq!(on_insert.params["mix"], 0.3, "nobody sends to bus 3: the insert default");
+        // A non-send kind is never touched, return or not.
+        let sat = ADDABLE_FX.iter().find(|(k, _)| *k == "saturation").unwrap().1;
+        let e = effect_for_bus("saturation", sat, BusId(2), &busses);
+        assert_eq!(e.params.get("mix"), None, "saturation's mix is instantiate's default, untouched");
+        // And every send kind is in the catalog, or the rule guards nothing.
+        for k in SEND_KINDS {
+            assert!(ADDABLE_FX.iter().any(|(kind, _)| kind == k), "{k} is addable");
+        }
     }
 }

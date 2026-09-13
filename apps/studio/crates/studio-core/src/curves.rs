@@ -82,6 +82,13 @@ pub enum Gate {
     /// Active inside `[start, end)`, origin at `start`. A clip-shaped gate
     /// with nothing placed on it — for ducking a bus through a break, say.
     Window { start: Ticks, end: Ticks },
+    /// Active over the group's HULL — from its first member's start to
+    /// its last member's end — origin at the hull's start. A curve over
+    /// a composition: a riser across the whole drop, a filter opening
+    /// over a chorus made of twelve clips, following the group as its
+    /// members move and growing as they are added. A gate on a group
+    /// with no members (or no group) is never active.
+    Group(crate::GroupId),
 }
 
 /// One curve aimed at one target through one gate.
@@ -125,7 +132,28 @@ impl Gate {
                 if end <= start { return None; }
                 Some(Opening { span: Some((start, end)), origin: start })
             }
+            Gate::Group(id) => {
+                let (start, end) = project.group_hull(id)?;
+                Some(Opening { span: Some((start, end)), origin: start })
+            }
         }
+    }
+}
+
+impl Project {
+    /// The span a group's members cover — first start to last end — or
+    /// `None` for a group with no members (or none at all). Members that
+    /// no longer exist as clips are skipped, not counted.
+    pub fn group_hull(&self, id: crate::GroupId) -> Option<(Ticks, Ticks)> {
+        let g = self.groups.get(&id)?;
+        let mut span: Option<(Ticks, Ticks)> = None;
+        for c in g.clips.iter().filter_map(|c| self.clips.get(c)) {
+            span = Some(match span {
+                None => (c.pos, c.end()),
+                Some((s, e)) => (s.min(c.pos), e.max(c.end())),
+            });
+        }
+        span.filter(|(s, e)| e > s)
     }
 }
 
@@ -188,6 +216,38 @@ impl Project {
                 Some(Sweep { points: &curve.points, opening, cursor: 0 })
             })
             .collect()
+    }
+
+    /// Every parameter target ridden on bus `bus`'s chain — the union of
+    /// lanes and bindings — as `(effect index, key, target)`, sorted, so
+    /// a render can ask once per bus and drive each one at control rate.
+    /// Indices past the chain's end are included: the chain is the
+    /// caller's to check, and a dangling target is harmless.
+    pub fn bus_param_targets(&self, bus: crate::BusId) -> Vec<(u8, crate::ParamKey, AutoTarget)> {
+        let mut out: Vec<_> = self.automation.keys().copied()
+            .chain(self.bindings.values().map(|b| b.target))
+            .filter_map(|t| match t {
+                AutoTarget::BusParam { bus: b, effect, key } if b == bus => Some((effect, key, t)),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The same for clip `clip`'s effect chain.
+    pub fn clip_param_targets(&self, clip: ClipId) -> Vec<(u8, crate::ParamKey, AutoTarget)> {
+        let mut out: Vec<_> = self.automation.keys().copied()
+            .chain(self.bindings.values().map(|b| b.target))
+            .filter_map(|t| match t {
+                AutoTarget::ClipParam { clip: c, effect, key } if c == clip => Some((effect, key, t)),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// The ops that place a copy of clip `id` at (`pos`, `track`) AND
@@ -406,6 +466,99 @@ mod tests {
                    Err(EditError::NoSuchCurve(CurveId(9))));
         assert_eq!(p.apply(&Op::RemoveCurvePoint { curve: CurveId(1), at: Ticks(0) }),
                    Err(EditError::NoSuchAutoPoint));
+    }
+
+    #[test]
+    fn a_parameter_target_is_a_key_on_an_effect_and_is_validated_like_gain() {
+        use crate::{BusId, ParamKey};
+        let mut p = project();
+        let bus = BusId(1);
+        p.apply(&Op::AddBus { bus: crate::Bus { id: bus, name: "b".into(), parent: None, gain: 1.0,
+                                                 chain: vec![], sends: vec![], muted: false } }).unwrap();
+        let mix = ParamKey::new("mix").unwrap();
+        let on_bus = AutoTarget::BusParam { bus, effect: 0, key: mix };
+        let on_clip = AutoTarget::ClipParam { clip: ClipId(1), effect: 2, key: ParamKey::new("freq0").unwrap() };
+        // Lanes on both, before any chain exists: the ride may be drawn first.
+        p.apply(&Op::SetAutoPoint { target: on_bus, at: Ticks(0), value: 0.0 }).unwrap();
+        p.apply(&Op::SetAutoPoint { target: on_bus, at: Ticks(1_000), value: 1.0 }).unwrap();
+        p.apply(&Op::SetAutoPoint { target: on_clip, at: Ticks(0), value: 2.0 }).unwrap();
+        assert!((p.auto_value(on_bus, Ticks(500)) - 0.5).abs() < 1e-6, "a parameter lane reads like any lane");
+        assert_eq!(p.auto_value(on_clip, Ticks(9)), 2.0);
+        // A binding on a parameter, gated to a clip.
+        p.apply(&Op::SetCurve { id: CurveId(1), name: "sweep".into() }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(0), value: 4.0 }).unwrap();
+        let bound = AutoTarget::BusParam { bus, effect: 1, key: ParamKey::new("freq0").unwrap() };
+        p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
+            curve: CurveId(1), target: bound, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+        // The render's question: what is ridden on this bus, and where.
+        let targets = p.bus_param_targets(bus);
+        assert_eq!(targets.iter().map(|(e, k, _)| (*e, k.as_str())).collect::<Vec<_>>(),
+                   vec![(0, "mix"), (1, "freq0")], "lanes and bindings, sorted by effect");
+        assert_eq!(targets[1].2, bound);
+        assert_eq!(p.clip_param_targets(ClipId(1)).len(), 1);
+        assert!(p.clip_param_targets(ClipId(7)).is_empty());
+        assert!(p.bus_param_targets(BusId(7)).is_empty());
+        // Validation: the bus or the clip's track must exist, and a locked
+        // track refuses a parameter ride on its clip like it refuses its fader.
+        let missing = AutoTarget::BusParam { bus: BusId(9), effect: 0, key: mix };
+        assert_eq!(p.apply(&Op::SetAutoPoint { target: missing, at: Ticks(0), value: 1.0 }),
+                   Err(EditError::NoSuchBus(BusId(9))));
+        let no_clip = AutoTarget::ClipParam { clip: ClipId(9), effect: 0, key: mix };
+        assert_eq!(p.apply(&Op::SetAutoPoint { target: no_clip, at: Ticks(0), value: 1.0 }),
+                   Err(EditError::NoSuchClip(ClipId(9))));
+        p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: false, locked: true }).unwrap();
+        assert_eq!(p.apply(&Op::SetAutoPoint { target: on_clip, at: Ticks(5), value: 1.0 }),
+                   Err(EditError::TrackLocked(TrackId(1))));
+        // The key itself: 16 ASCII bytes, no more, no NUL, no empty.
+        assert_eq!(ParamKey::new("preserve_pitch").unwrap().as_str(), "preserve_pitch");
+        assert_eq!(ParamKey::new("sixteen_chars_ok").unwrap().as_str(), "sixteen_chars_ok");
+        assert!(ParamKey::new("seventeen_chars__").is_none(), "too long is refused, never truncated");
+        assert!(ParamKey::new("").is_none());
+        assert!(ParamKey::new("naïve").is_none(), "ASCII only");
+        assert!(ParamKey::new("a\0b").is_none(), "the pad byte cannot be in a key");
+        assert!(ParamKey::new("mix") < ParamKey::new("size"), "orders as the string does");
+        assert_eq!(format!("{}", mix), "mix");
+    }
+
+    #[test]
+    fn a_group_gate_opens_over_the_hull_and_follows_the_members() {
+        use crate::GroupId;
+        let mut p = project(); // clip 1 sits at 1000..2000
+        // A second clip well apart; a group of the two.
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(3), source: SourceId(1), track: TrackId(1),
+            pos: Ticks(5_000), src_in: Ticks::ZERO, len: Ticks(1_000), gain: 1.0, effects: vec![] } }).unwrap();
+        p.apply(&Op::SetGroup { id: GroupId(1), name: "drop".into(), clips: vec![ClipId(1), ClipId(3)] }).unwrap();
+        assert_eq!(p.group_hull(GroupId(1)), Some((Ticks(1_000), Ticks(6_000))), "first start to last end");
+        assert_eq!(p.group_hull(GroupId(9)), None);
+        p.apply(&Op::SetCurve { id: CurveId(1), name: "riser".into() }).unwrap();
+        // 0 at the hull's start, 1 five thousand ticks later: a riser
+        // across the composition, in hull-relative time.
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(0), value: 0.0 }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(5_000), value: 1.0 }).unwrap();
+        p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
+            curve: CurveId(1), target: T, gate: Gate::Group(GroupId(1)) } }).unwrap();
+        let v = |p: &Project, t: i64| p.auto_value(T, Ticks(t));
+        assert!((v(&p, 1_000)).abs() < 1e-6, "hull start: the curve's 0");
+        assert!((v(&p, 3_500) - 0.5).abs() < 1e-6, "halfway across the hull — INCLUDING the gap between members");
+        assert!((v(&p, 6_000) - 1.0).abs() < 1e-6, "past the hull: transparent, which is also the curve's end");
+        assert!((v(&p, 500) - 1.0).abs() < 1e-6, "before the hull: transparent");
+        // Move the last member later: the hull grows, the ride keeps its
+        // origin at the first member and holds its last point past its end.
+        p.apply(&Op::MoveClip { id: ClipId(3), pos: Ticks(9_000), track: TrackId(1) }).unwrap();
+        assert_eq!(p.group_hull(GroupId(1)), Some((Ticks(1_000), Ticks(10_000))));
+        assert!((v(&p, 3_500) - 0.5).abs() < 1e-6, "the curve is in hull-relative time; its own length is 5000");
+        assert!((v(&p, 8_000) - 1.0).abs() < 1e-6, "past the curve's end but inside the hull: held at the last point");
+        // Move the FIRST member: the origin moves with it.
+        p.apply(&Op::MoveClip { id: ClipId(1), pos: Ticks(2_000), track: TrackId(1) }).unwrap();
+        assert!((v(&p, 4_500) - 0.5).abs() < 1e-6, "origin now 2000: halfway is at 4500");
+        assert!((v(&p, 1_500) - 1.0).abs() < 1e-6, "before the hull: transparent");
+        // Validation and the empty case.
+        assert_eq!(p.apply(&Op::SetBinding { id: BindingId(2), binding: Binding {
+            curve: CurveId(1), target: T, gate: Gate::Group(GroupId(9)) } }),
+            Err(EditError::NoSuchGroup(GroupId(9))));
+        p.apply(&Op::RemoveGroup { id: GroupId(1) }).unwrap();
+        assert!((v(&p, 3_500) - 1.0).abs() < 1e-6, "the group is gone: the binding stays, never active");
+        assert_eq!(p.binding_sweeps(T).len(), 0, "and a sweep is not built for it");
     }
 
     #[test]

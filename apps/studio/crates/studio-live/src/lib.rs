@@ -319,6 +319,10 @@ pub struct Note {
     pub slide: bool,
 }
 
+/// The order an arpeggio runs its chord in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arp { Up, Down, UpDown }
+
 impl Pattern {
     pub fn new(name: &str, steps: u32, channels: usize) -> Pattern {
         Pattern { name: name.into(), steps: steps.min(64), rows: vec![0; channels],
@@ -506,6 +510,84 @@ impl Pattern {
             }
         }
     }
+    /// The channel's chords: every start with two or more notes, with the
+    /// notes at that start sorted low to high.
+    pub fn chords(&self, ch: usize) -> Vec<(u32, Vec<Note>)> {
+        let mut out: Vec<(u32, Vec<Note>)> = Vec::new();
+        for n in self.roll(ch) {
+            match out.last_mut() {
+                Some((start, notes)) if *start == n.start => notes.push(*n),
+                _ => out.push((n.start, vec![*n])),
+            }
+        }
+        out.retain(|(_, notes)| notes.len() >= 2);
+        for (_, notes) in out.iter_mut() { notes.sort_by_key(|n| n.key); }
+        out
+    }
+
+    /// Harmonize: a copy of every note in the channel `degrees` scale
+    /// degrees away (2 = a third, 4 = a fifth, 7 = an octave in a
+    /// seven-note scale; negative for below), in `key` when the project
+    /// has one, else in semitones (3rd = 4, 5th = 7, octave = 12 — the
+    /// major intervals). Same start, length, velocity and slide; a note
+    /// that would collide with an existing (start, key) is not added, so
+    /// harmonizing twice does not stack. Returns how many were added.
+    pub fn harmonize(&mut self, ch: usize, degrees: i32, key: Option<studio_core::Key>) -> usize {
+        let existing: Vec<Note> = self.roll(ch).to_vec();
+        let taken: std::collections::BTreeSet<(u32, i8)> = existing.iter().map(|n| (n.start, n.key)).collect();
+        let mut added = 0;
+        for n in existing {
+            let k = match key {
+                Some(k) => k.scale_step(n.key, degrees),
+                None => {
+                    // No key: the major-scale interval in semitones.
+                    const MAJOR: [i32; 7] = [0, 2, 4, 5, 7, 9, 11];
+                    let oct = degrees.div_euclid(7);
+                    let deg = MAJOR[degrees.rem_euclid(7) as usize];
+                    (n.key as i32 + oct * 12 + deg).clamp(i8::MIN as i32, i8::MAX as i32) as i8
+                }
+            };
+            if taken.contains(&(n.start, k)) { continue; }
+            self.add_note(ch, Note { key: k, ..n });
+            added += 1;
+        }
+        added
+    }
+
+    /// Arpeggiate: every chord in the channel becomes a run of its notes,
+    /// `note_len` steps each, cycling in `order` until the chord's span
+    /// (its longest note) is filled. A single note is left alone.
+    /// Returns how many chords were broken up.
+    pub fn arpeggiate(&mut self, ch: usize, order: Arp, note_len: u32) -> usize {
+        let note_len = note_len.max(1);
+        let chords = self.chords(ch);
+        for (start, notes) in &chords {
+            let span = notes.iter().map(|n| n.len.max(1)).max().unwrap_or(1);
+            for n in notes { self.remove_note(ch, *start, n.key); }
+            let mut keys: Vec<i8> = notes.iter().map(|n| n.key).collect();
+            match order {
+                Arp::Up => {}
+                Arp::Down => keys.reverse(),
+                Arp::UpDown => {
+                    // Up then back down without repeating the ends: C E G E.
+                    let mut down: Vec<i8> = keys.iter().rev().skip(1).copied().collect();
+                    down.pop();
+                    keys.extend(down);
+                }
+            }
+            let vel = notes.iter().map(|n| n.vel).fold(0.0f32, f32::max);
+            let mut t = 0;
+            let mut i = 0;
+            while t < span {
+                let len = note_len.min(span - t);
+                self.add_note(ch, Note { key: keys[i % keys.len()], start: start + t, len, vel, slide: false });
+                t += note_len;
+                i += 1;
+            }
+        }
+        chords.len()
+    }
+
     /// Every (channel, step) that fires, in step order — what a renderer walks.
     pub fn hits(&self) -> Vec<(usize, u32)> {
         let mut v = Vec::new();
@@ -936,6 +1018,15 @@ pub fn apply_step_mod(kind: &SynthKind, m: &StepMod, prev_note: Option<i8>) -> S
             decay_ms: *decay_ms,
         },
         SynthKind::Sine { hz } => SynthKind::Sine { hz: hz * 2f32.powf(m.tune as f32 / 12.0) },
+        // The roll's key and the step's tune fold into the transpose, so
+        // a host's sf2 engine reads ONE number: the semitones above the
+        // roll's origin (`studio_core::KEY_ZERO_MIDI`) to play. Before
+        // this fold every note on an sf2 channel would have played the
+        // same pitch.
+        SynthKind::Sf2 { path, bank, preset, transpose } => SynthKind::Sf2 {
+            path: path.clone(), bank: *bank, preset: *preset,
+            transpose: transpose.saturating_add(m.tune),
+        },
         SynthKind::Drum { voice, tone, decay_ms, tune } => SynthKind::Drum {
             voice: *voice, tone: *tone, decay_ms: *decay_ms,
             tune: tune.saturating_add(m.tune),
@@ -1706,6 +1797,37 @@ mod tests {
     }
 
     #[test]
+    fn an_sf2_channel_hands_its_engine_the_roll_key_folded_into_the_transpose() {
+        // No engine here; a spy synth records the kinds it is asked to
+        // render. Before the fold, every note on an sf2 channel arrived as
+        // the channel's own transpose — one pitch for the whole part.
+        struct Spy(Vec<SynthKind>);
+        impl Synth for Spy {
+            fn render(&mut self, kind: &SynthKind, _: u32, out: &mut [f32]) { self.0.push(kind.clone()); out.fill(0.0); }
+        }
+        let mut rack = rack();
+        rack.channels.push(Channel {
+            name: "piano".into(),
+            kind: SynthKind::Sf2 { path: "/nowhere.sf2".into(), bank: 0, preset: 0, transpose: 12 },
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+        });
+        let ch = rack.channels.len() - 1;
+        let mut pattern = Pattern::new("keys", 16, rack.channels.len());
+        pattern.add_note(ch, Note { key: 3, start: 0, len: 4, vel: 0.9, slide: false });  // C2 on the roll
+        pattern.add_note(ch, Note { key: 7, start: 4, len: 4, vel: 0.9, slide: false });  // E2
+        pattern.toggle(ch, 8);
+        pattern.set_mod(ch, 8, StepMod { tune: -5, ..StepMod::default() });                  // a step hit, tuned
+        let tempo = Tempo { bpm: 120.0, steps_per_beat: 4, swing: 0.0 };
+        let mut spy = Spy(Vec::new());
+        render_pattern(&pattern, &rack, &mut spy, &tempo, 48_000, 0);
+        let mut transposes: Vec<i8> = spy.0.iter().filter_map(|k| match k {
+            SynthKind::Sf2 { transpose, .. } => Some(*transpose), _ => None }).collect();
+        transposes.sort(); // step hits render before roll notes; the order is not the claim
+        assert_eq!(transposes, vec![7, 15, 19], "the tuned step 12 - 5, then 12 + 3 and 12 + 7");
+        assert!(spy.0.iter().all(|k| matches!(k, SynthKind::Sf2 { preset: 0, bank: 0, .. })), "bank and preset ride along");
+    }
+
+    #[test]
     fn bounce_ops_declares_a_source_length_matching_render_patterns_actual_output() {
         let rack = rack();
         let mut pattern = Pattern::new("beat", 16, rack.channels.len());
@@ -2325,6 +2447,66 @@ mod choke_tests {
 #[cfg(test)]
 mod roll_tests {
     use super::*;
+
+    fn note(key: i8, start: u32, len: u32) -> Note { Note { key, start, len, vel: 0.8, slide: false } }
+
+    #[test]
+    fn harmonize_adds_the_interval_in_key_and_never_stacks() {
+        let mut p = Pattern::new("p", 16, 1);
+        let c = 3i8; // C2 on the roll (key 0 is A1)
+        p.add_note(0, note(c, 0, 4));
+        p.add_note(0, note(c + 7, 4, 4)); // G
+        let c_major = studio_core::Key { root: 0, scale: studio_core::Scale::Major };
+        assert_eq!(p.harmonize(0, 2, Some(c_major)), 2, "a third above each");
+        let keys: Vec<(u32, i8)> = p.roll(0).iter().map(|n| (n.start, n.key)).collect();
+        assert_eq!(keys, vec![(0, c), (0, c + 4), (4, c + 7), (4, c + 11)], "C+E, G+B — the diatonic thirds");
+        assert_eq!(p.harmonize(0, 2, Some(c_major)), 2, "thirds of the thirds: G and D");
+        assert_eq!(p.harmonize(0, 2, Some(c_major)), 2, "and again: B and F");
+        assert_eq!(p.roll(0).len(), 8);
+        // Fifths: G and B exist already at each start (from the thirds);
+        // only D and F over the top two are new — the collision rule at
+        // work — and a second pass of the same interval adds nothing.
+        assert_eq!(p.harmonize(0, 4, Some(c_major)), 4, "two new per start, the rest already there");
+        let mut seen = std::collections::BTreeSet::new();
+        assert!(p.roll(0).iter().all(|n| seen.insert((n.start, n.key))), "no (start, key) twice — nothing stacks");
+        assert_eq!(p.harmonize(0, 0, Some(c_major)), 0, "a unison is every note's own place: nothing added");
+        assert!(p.roll(0).iter().all(|n| n.len == 4 && (n.vel - 0.8).abs() < 1e-6), "copies keep length and velocity");
+        // No key: major intervals in semitones.
+        let mut q = Pattern::new("q", 16, 1);
+        q.add_note(0, note(10, 0, 2));
+        assert_eq!(q.harmonize(0, 4, None), 1);
+        assert_eq!(q.roll(0)[1].key, 17, "a fifth is seven semitones");
+        assert_eq!(q.harmonize(0, -7, None), 2, "an octave below each of the two");
+        assert_eq!(q.roll(0).iter().map(|n| n.key).min(), Some(-2));
+    }
+
+    #[test]
+    fn arpeggiate_breaks_each_chord_into_a_run_that_fills_its_span() {
+        let mut p = Pattern::new("p", 16, 1);
+        for k in [3, 7, 10] { p.add_note(0, note(k, 0, 8)); }   // C E G, 8 steps
+        for k in [5, 8] { p.add_note(0, note(k, 8, 4)); }       // D F, 4 steps
+        p.add_note(0, note(0, 12, 2));                           // a lone A: untouched
+        assert_eq!(p.chords(0).len(), 2);
+        assert_eq!(p.arpeggiate(0, Arp::Up, 2), 2);
+        let run: Vec<(u32, i8, u32)> = p.roll(0).iter().map(|n| (n.start, n.key, n.len)).collect();
+        assert_eq!(run, vec![(0, 3, 2), (2, 7, 2), (4, 10, 2), (6, 3, 2),   // C E G C
+                             (8, 5, 2), (10, 8, 2),                          // D F
+                             (12, 0, 2)],                                    // the lone A
+                   "{run:?}");
+        assert!(p.chords(0).is_empty(), "no chords left");
+        // Down, and up-down, on a fresh triad; an odd span ends with a short note.
+        let mut d = Pattern::new("d", 16, 1);
+        for k in [3, 7, 10] { d.add_note(0, note(k, 0, 5)); }
+        d.arpeggiate(0, Arp::Down, 2);
+        assert_eq!(d.roll(0).iter().map(|n| (n.key, n.len)).collect::<Vec<_>>(), vec![(10, 2), (7, 2), (3, 1)]);
+        let mut u = Pattern::new("u", 16, 1);
+        for k in [3, 7, 10] { u.add_note(0, note(k, 0, 8)); }
+        u.arpeggiate(0, Arp::UpDown, 2);
+        assert_eq!(u.roll(0).iter().map(|n| n.key).collect::<Vec<_>>(), vec![3, 7, 10, 7], "C E G E: no repeated ends");
+        // A pattern with no chords: nothing happens, and it says so.
+        assert_eq!(u.arpeggiate(0, Arp::Up, 1), 0);
+        assert_eq!(u.roll(0).len(), 4);
+    }
 
     fn sub_rack(decay_ms: f32, glide_ms: f32) -> Rack {
         Rack {

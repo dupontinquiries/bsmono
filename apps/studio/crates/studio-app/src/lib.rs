@@ -17,6 +17,7 @@ use studio_live::transport::Transport;
 
 pub mod archive;
 pub mod audition;
+pub mod call;
 pub mod capture;
 /// Playing a synth, and getting a pattern back.
 pub mod perform;
@@ -26,6 +27,7 @@ pub mod clip_inspector;
 pub mod fx_editor;
 pub mod find;
 pub mod library;
+pub mod looping;
 pub mod midi;
 pub mod mix_assistant;
 pub mod mixer_panel;
@@ -78,6 +80,14 @@ pub struct Studio {
     /// and rack syncs — waiting for whatever carrier exists to drain them.
     /// The shell is transport-agnostic on purpose: this Vec IS the seam.
     outbox: Vec<studio_collab::wire::Packet>,
+    /// Voice frames received, waiting for the shell's [`call::Call`] to
+    /// take them. `Studio` owns the document and the wire's integration;
+    /// it does not own the sink or the microphone, which is where a
+    /// voice frame is going. Handing frames across this Vec keeps
+    /// `integrate_packet` a pure function of the document, testable
+    /// without a device — the same seam `outbox` is, pointing the other
+    /// way.
+    pub voice_inbox: Vec<studio_collab::wire::Packet>,
     /// Manifests for sources whose bytes this peer can serve.
     manifests: std::collections::BTreeMap<studio_core::SourceId, studio_collab::assets::Manifest>,
     /// The content-addressed chunk store — shared across sources on purpose:
@@ -231,6 +241,7 @@ impl Studio {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             outbox: Vec::new(),
+            voice_inbox: Vec::new(),
             manifests: Default::default(),
             chunk_store: Default::default(),
             pending_assets: Default::default(),
@@ -883,10 +894,13 @@ impl Studio {
                 }
                 replies
             }
-            // Voice is for the jitter buffer and the sink, not the Doc;
-            // the receive half is not wired yet, so a frame is dropped
-            // here on purpose rather than half-handled.
-            Packet::Voice { .. } => Vec::new(),
+            // Voice is for the jitter buffer and the sink, not the Doc:
+            // it goes to the call through `voice_inbox`, never into the
+            // history, and earns no reply.
+            Packet::Voice { site, seq, frame } => {
+                self.voice_inbox.push(Packet::Voice { site, seq, frame });
+                Vec::new()
+            }
         }
     }
 
@@ -1110,6 +1124,176 @@ impl Studio {
     /// played — `split_on_grid_ops`'s promises. Cutting by the grid rather
     /// than by ear is also the answer to editing over a Bluetooth link,
     /// where the ear is a few hundred milliseconds late.
+    /// Set every delay's `time` to a note length at the working tempo:
+    /// `sixteenths` sixteenth-notes (3 = the dotted eighth, 2 = an eighth,
+    /// 1 = a sixteenth, 4 = a quarter). Every bus chain, and the
+    /// effect chains of the selected clips. `instantiate` has a rate and
+    /// no tempo, so this is where sync lives — as ops, so it undoes and
+    /// travels. The tempo is the active song's map at the playhead when
+    /// it has one (the ruler's own lookup), else the rack's — the clock
+    /// the grid splits use.
+    pub fn sync_delays_to_tempo(&mut self, sixteenths: u8) -> usize {
+        let p = &self.session.doc.project;
+        let bpm = self.active_song
+            .and_then(|id| p.groups.get(&id))
+            .and_then(|g| g.tempo.as_ref())
+            .map(|m| m.bpm_at(self.playhead()))
+            .unwrap_or(self.rack.tempo_bpm);
+        let ms = studio_fx::space::beats_to_ms(bpm, sixteenths as f32 / 4.0);
+        let retime = |chain: &[studio_core::Effect]| -> Option<Vec<studio_core::Effect>> {
+            if !chain.iter().any(|e| e.kind == "delay") { return None; }
+            Some(chain.iter().map(|e| {
+                let mut e = e.clone();
+                if e.kind == "delay" { e.params.insert("time".into(), ms); }
+                e
+            }).collect())
+        };
+        let mut ops = Vec::new();
+        for b in p.busses.values() {
+            if let Some(chain) = retime(&b.chain) {
+                ops.push(studio_core::Op::SetBusChain { id: b.id, chain });
+            }
+        }
+        for id in &self.selection {
+            if let Some(c) = p.clips.get(id) {
+                if let Some(effects) = retime(&c.effects) {
+                    ops.push(studio_core::Op::SetEffects { id: *id, effects });
+                }
+            }
+        }
+        let n = ops.len();
+        for op in ops { self.edit(op, "sync delay"); }
+        self.status = if n == 0 {
+            "sync delay: no delay on any bus or selected clip".into()
+        } else {
+            format!("sync delay: {n} chain(s) set to {ms:.1} ms ({} at {bpm:.0} BPM)",
+                    match sixteenths { 1 => "a sixteenth", 2 => "an eighth", 3 => "a dotted eighth",
+                                       4 => "a quarter", _ => "the note" })
+        };
+        n
+    }
+
+    /// Chord tools on the roll's channel (the same channel the rack strip
+    /// selects). `degrees` scale degrees in the project's key when it has
+    /// one — a third is 2, a fifth 4, an octave 7 — else the major
+    /// interval in semitones. Direct rack edits, like the roll's own.
+    pub fn harmonize_roll(&mut self, degrees: i32) -> usize {
+        let key = self.session.doc.project.key;
+        let ch = self.selected_channel;
+        let Some(p) = self.rack.patterns.get_mut(self.current_pattern) else {
+            self.status = "no pattern".into();
+            return 0;
+        };
+        let n = p.harmonize(ch, degrees, key);
+        self.loop_dirty |= n > 0;
+        let what = match degrees { 2 => "thirds", 4 => "fifths", 7 => "octaves", -7 => "octaves below", _ => "notes" };
+        self.status = if n == 0 { format!("harmonize: nothing to add ({what} already there, or an empty roll)") }
+                      else { format!("harmonize: {n} {what} added{}", if key.is_some() { " in key" } else { "" }) };
+        n
+    }
+
+    /// Every chord on the roll's channel becomes a run of its notes.
+    pub fn arpeggiate_roll(&mut self, order: studio_live::Arp, note_len: u32) -> usize {
+        let ch = self.selected_channel;
+        let Some(p) = self.rack.patterns.get_mut(self.current_pattern) else {
+            self.status = "no pattern".into();
+            return 0;
+        };
+        let n = p.arpeggiate(ch, order, note_len);
+        self.loop_dirty |= n > 0;
+        self.status = if n == 0 { "arpeggiate: no chords on this channel (two or more notes on one step)".into() }
+                      else { format!("arpeggiate: {n} chord{} broken into runs", if n == 1 { "" } else { "s" }) };
+        n
+    }
+
+    /// The track a take is aimed at: the root of the selected clip's
+    /// chain when one clip is selected (re-taking the phrase you are
+    /// looking at), else the first audio track.
+    pub fn take_target(&self) -> Option<studio_core::TrackId> {
+        let p = &self.session.doc.project;
+        if let Some(c) = self.selection.first().and_then(|id| p.clips.get(id)) {
+            return Some(p.take_root(c.track));
+        }
+        p.tracks.iter().find(|t| t.kind == studio_core::TrackKind::Audio).map(|t| t.id)
+    }
+
+    /// Land a take (an already-imported source) at `at` on `track`'s
+    /// chain: the first lane with room, or a new one — one undo step for
+    /// the lane and the clip together. Returns where it landed.
+    pub fn place_take(&mut self, source: studio_core::SourceId, len: Ticks, at: Ticks,
+                      track: studio_core::TrackId) -> Option<(studio_core::TrackId, studio_core::ClipId)> {
+        let p = &self.session.doc.project;
+        let end = at.saturating_add(len);
+        let new_track = studio_core::TrackId(p.tracks.iter().map(|t| t.id.0).max().unwrap_or(0) + 1);
+        let (lane, mut ops) = match p.take_lane_ops(track, at, end, new_track) {
+            Ok(x) => x,
+            Err(e) => { self.status = format!("take refused: {e:?}"); return None; }
+        };
+        let cid = studio_core::ClipId(p.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1);
+        let made_lane = !ops.is_empty();
+        ops.push(studio_core::Op::AddClip { clip: studio_core::Clip {
+            id: cid, source, track: lane, pos: at, src_in: Ticks::ZERO, len, gain: 1.0, effects: vec![] } });
+        self.edit_group(ops, "take");
+        if !self.session.doc.project.clips.contains_key(&cid) { return None; }
+        let n = self.session.doc.project.take_lanes(track).len();
+        self.status = format!("take {:.1}s on {}{}", len.to_seconds(),
+            self.session.doc.project.tracks.iter().find(|t| t.id == lane).map(|t| t.name.as_str()).unwrap_or("?"),
+            if made_lane { format!(" — lane {n} of the chain") } else { String::new() });
+        Some((lane, cid))
+    }
+
+    /// The comp verb: the selected clips, each on some lane of a chain,
+    /// copied onto their chain's root over their own span. A clip already
+    /// on a root is left alone. One undo step.
+    pub fn comp_selected_takes(&mut self) -> usize {
+        let p = &self.session.doc.project;
+        let mut by_root: std::collections::BTreeMap<studio_core::TrackId, Vec<(Ticks, Ticks, studio_core::TrackId)>> =
+            Default::default();
+        for id in &self.selection {
+            let Some(c) = p.clips.get(id) else { continue };
+            let root = p.take_root(c.track);
+            if root == c.track { continue; }
+            by_root.entry(root).or_default().push((c.pos, c.end(), c.track));
+        }
+        if by_root.is_empty() {
+            self.status = "comp: select a take on a lane (not the track itself)".into();
+            return 0;
+        }
+        let mut next = p.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1;
+        let mut ops = Vec::new();
+        let mut n = 0;
+        for (root, choices) in &by_root {
+            match p.comp_ops(*root, choices, &mut next) {
+                Ok(o) => { n += choices.len(); ops.extend(o); }
+                Err(e) => { self.status = format!("comp refused: {e:?}"); return 0; }
+            }
+        }
+        self.edit_group(ops, &format!("comp {n} take{}", if n == 1 { "" } else { "s" }));
+        self.status = format!("comp: {n} take{} on the track — the lanes keep the rest",
+                              if n == 1 { "" } else { "s" });
+        n
+    }
+
+    /// Mute (or unmute) every lane under the take target's chain, so the
+    /// comp on the root is what plays.
+    pub fn set_take_lanes_muted(&mut self, muted: bool) -> usize {
+        let Some(root) = self.take_target() else {
+            self.status = "no audio track".into();
+            return 0;
+        };
+        let ops = self.session.doc.project.take_lanes_mute_ops(root, muted);
+        let n = ops.len();
+        if n == 0 {
+            self.status = if muted { "no unmuted take lanes under this track" }
+                          else { "no muted take lanes under this track" }.into();
+            return 0;
+        }
+        self.edit_group(ops, if muted { "mute take lanes" } else { "unmute take lanes" });
+        self.status = format!("{} {n} take lane{}", if muted { "muted" } else { "unmuted" },
+                              if n == 1 { "" } else { "s" });
+        n
+    }
+
     pub fn split_selection_on_grid(&mut self, steps: i64) {
         if self.selection.is_empty() {
             self.status = "split on grid: nothing selected".into();
@@ -1384,6 +1568,38 @@ impl Studio {
     /// with neither there is nothing to aim at, said out loud. One group,
     /// one undo; the strip switches to the new binding so the next click
     /// places its first point.
+    /// A curve over a composition: the group the first selected clip is
+    /// in gates the binding, so the ride spans the hull — from the first
+    /// member's start to the last's end, gap included — and follows the
+    /// group as its members move or are added. Target: the strip's, or
+    /// the clip's own track gain. One undo step.
+    pub fn new_curve_on_group(&mut self, target: Option<studio_core::AutoTarget>) {
+        use studio_core::{Binding, BindingId, CurveId, Gate, Op};
+        let p = &self.session.doc.project;
+        let Some(clip) = self.selection.first().and_then(|id| p.clips.get(id)) else {
+            self.status = "select a clip that is in a group".into();
+            return;
+        };
+        let Some((gid, g)) = p.groups.iter().find(|(_, g)| g.clips.contains(&clip.id)) else {
+            self.status = format!("clip {} is in no group — group the composition first (G)", clip.id.0);
+            return;
+        };
+        let (gid, gname) = (*gid, g.name.clone());
+        let target = target.unwrap_or(studio_core::AutoTarget::TrackGain(clip.track));
+        let curve = CurveId(p.curves.keys().map(|c| c.0).max().unwrap_or(0) + 1);
+        let bid = BindingId(p.bindings.keys().map(|b| b.0).max().unwrap_or(0) + 1);
+        let name = format!("curve {} over {gname}", curve.0);
+        self.edit_group(vec![
+            Op::SetCurve { id: curve, name: name.clone() },
+            Op::SetBinding { id: bid, binding: Binding { curve, target, gate: Gate::Group(gid) } },
+        ], &format!("{name} bound"));
+        if self.session.doc.project.bindings.contains_key(&bid) {
+            self.auto_target = None;
+            self.auto_binding = Some(bid);
+            self.status = format!("{name}: rides the group's whole span, gap included");
+        }
+    }
+
     pub fn new_curve_on_selection(&mut self, target: Option<studio_core::AutoTarget>) {
         use studio_core::{Binding, BindingId, CurveId, Gate, Op};
         let p = &self.session.doc.project;
@@ -1482,14 +1698,12 @@ impl Studio {
         // rate-parametric end to end, and since the source-rate fix it
         // resamples sources correctly at ANY render rate rather than only
         // happening to be right at 48k.
-        let rate = match format { ExportFormat::Opus => 48_000, ExportFormat::Wav => rate };
+        let rate = match format { ExportFormat::Opus => 48_000, _ => rate };
         // Opus's mapping family 0 is mono/stereo only (studio-media refuses
         // wider, loudly), so a surround deliverable is a WAV — said here
-        // rather than discovered as a confusing encoder error.
-        let layout = match format {
-            ExportFormat::Opus => studio_audio::format::ChannelFormat::Stereo,
-            ExportFormat::Wav => layout,
-        };
+        // rather than discovered as a confusing encoder error. The
+        // phone's formats (mp3, m4a) are stereo for the same reason.
+        let layout = if format.stereo_only() { studio_audio::format::ChannelFormat::Stereo } else { layout };
         let stereo = self.render_arrangement(rate, sources);
         // The render is stereo (see studio_audio::format's scope note); the
         // deliverable is whatever was asked for.
@@ -1540,6 +1754,16 @@ impl Studio {
                     .map_err(|e| e.to_string())?;
                 std::fs::write(&path, bytes).map_err(|e| format!("write {path:?}: {e}"))?;
             }
+            ExportFormat::Mp3 | ExportFormat::M4a => {
+                // A WAV beside it, transcoded by ffmpeg, then removed.
+                let wav = path.with_extension("tmp.wav");
+                studio_audio::export::export_wav_dithered(&samples, 2, rate, stamp, &wav)
+                    .map_err(|e| format!("wav write: {e}"))?;
+                let r = studio_video::transcode_audio(&wav, &path, format.ffmpeg_codec().expect("lossy"), 192_000)
+                    .map_err(|e| format!("{}: {e} — ffmpeg with that encoder is needed for .{}", format.ext(), format.ext()));
+                let _ = std::fs::remove_file(&wav);
+                r?;
+            }
         }
         self.status = format!("exported {} ({})", path.display(), layout.label());
         Ok(path)
@@ -1564,6 +1788,94 @@ impl Studio {
             Ticks::ZERO, end, rate, &self.solo, &[],
         )
     }
+
+    /// `[from, to)` of the arrangement, for the loop window.
+    pub fn render_arrangement_range(
+        &self,
+        rate: u32,
+        sources: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
+        from: Ticks,
+        to: Ticks,
+    ) -> Vec<f32> {
+        if to <= from { return Vec::new(); }
+        studio_audio::mixdown(
+            &self.session.doc.project, sources, &std::collections::BTreeMap::new(),
+            from, to, rate, &self.solo, &[],
+        )
+    }
+
+    /// Set (or clear) the loop range from the selection's span, as the
+    /// transport's `loop_range`. The playback block renders the range
+    /// alone and loops it; recording inside it is loop-record.
+    pub fn loop_selection(&mut self) {
+        let p = &self.session.doc.project;
+        let clips: Vec<&studio_core::Clip> = self.selection.iter().filter_map(|id| p.clips.get(id)).collect();
+        if clips.is_empty() {
+            self.status = "loop: select the clips that span the bars to loop".into();
+            return;
+        }
+        let start = clips.iter().map(|c| c.pos).min().unwrap();
+        let end = clips.iter().map(|c| c.end()).max().unwrap();
+        self.transport.loop_range = Some((start, end));
+        self.arrangement_dirty = true;
+        self.status = format!("looping {:.2}s – {:.2}s (record inside it for a take per pass)",
+                              start.to_seconds(), end.to_seconds());
+    }
+
+    pub fn loop_off(&mut self) {
+        self.transport.loop_range = None;
+        self.arrangement_dirty = true;
+        self.status = "loop off".into();
+    }
+
+    /// A folder dropped on the app is a KIT: every audio file in it, in
+    /// name order, becomes a sampler channel — kick, clap, hat, snare,
+    /// the way a drum pack unzips. Non-audio files and files that fail
+    /// to decode are skipped and counted; more than [`Self::KIT_MAX`]
+    /// files takes the first that many, and says so. Returns what was
+    /// decoded so the shell can keep the audio and the raw bytes (the
+    /// peers' copy) beside the sources it registered.
+    pub fn import_kit(&mut self, dir: &std::path::Path)
+        -> Result<Vec<(studio_core::SourceId, studio_audio::SourceAudio, Vec<u8>)>, String>
+    {
+        const AUDIO_EXT: &[&str] = &["wav", "flac", "mp3", "ogg", "opus", "aif", "aiff", "m4a"];
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str())
+                .map(|x| AUDIO_EXT.contains(&x.to_ascii_lowercase().as_str())).unwrap_or(false))
+            .collect();
+        files.sort();
+        if files.is_empty() {
+            return Err(format!("no audio files in {}", dir.display()));
+        }
+        let total = files.len();
+        files.truncate(Self::KIT_MAX);
+        let mut out = Vec::new();
+        let mut failed = 0;
+        for path in &files {
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("hit").to_string();
+            let raw = match std::fs::read(path) { Ok(b) => b, Err(_) => { failed += 1; continue } };
+            let hint = path.extension().and_then(|e| e.to_str());
+            let audio = match studio_media::decode_bytes(raw.clone(), hint) {
+                Ok(a) => a,
+                Err(_) => { failed += 1; continue }
+            };
+            let id = self.import_audio(&name, &path.display().to_string(), &audio);
+            out.push((id, audio, raw));
+        }
+        let kit = dir.file_name().and_then(|s| s.to_str()).unwrap_or("kit");
+        self.status = format!("kit '{kit}': {} channel{} added{}{}", out.len(),
+            if out.len() == 1 { "" } else { "s" },
+            if failed > 0 { format!(", {failed} file(s) could not be decoded") } else { String::new() },
+            if total > Self::KIT_MAX { format!(", first {} of {total} taken", Self::KIT_MAX) } else { String::new() });
+        Ok(out)
+    }
+
+    /// Rack channels one folder drop may add: a 64-step bitmask per
+    /// channel is the pattern's row, and a kit past this is a library,
+    /// not a kit.
+    pub const KIT_MAX: usize = 32;
 
     /// Land decoded audio on the timeline as a clip at the playhead — the
     /// import a melody loop wants, where the rack sampler is the import a
@@ -2356,6 +2668,12 @@ pub struct App {
     /// drag everybody else's screen around.
     follow: Option<String>,
     mic: Box<dyn capture::Capture>,
+    /// The in-house voice link: off until joined, pumped every frame the
+    /// wire is polled. See `call`.
+    call: call::Call,
+    /// Loop-record's pass detector, armed while recording with a loop
+    /// range. See `looping`.
+    passes: looping::Passes,
     /// Where the take started, so it lands where it was sung.
     take_from: studio_core::Ticks,
     settings_open: bool,
@@ -2407,7 +2725,14 @@ pub struct App {
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum SinkContent { Nothing, RackLoop, Arrangement }
+enum SinkContent {
+    Nothing,
+    RackLoop,
+    Arrangement,
+    /// The arrangement's loop range alone, rendered and set looped — see
+    /// `looping::Window`. Carries the range so a changed loop reloads.
+    ArrangementLoop(looping::Window),
+}
 
 #[cfg(feature = "app")]
 impl Default for App {
@@ -2511,6 +2836,8 @@ impl Default for App {
               lexicon,
               find_ui: None,
               mic: capture::open_capture(),
+              call: call::Call::new(),
+              passes: looping::Passes::default(),
               take_from: studio_core::Ticks::ZERO,
               settings_open: false, library_open: ws.library_open,
               rebinds: rebinds::Rebinds::decode(&ws.rebinds), rebind_capture: None,
@@ -2927,6 +3254,34 @@ impl eframe::App for App {
                     self.toggle_take();
                 }
                 if live { ctx.request_repaint(); } // the counter must tick
+                // The call. One button to join or leave, and while on it,
+                // mute and a HOLD-to-talk control — a button you hold is
+                // the one push-to-talk that works on a phone, where there
+                // is no key to hold.
+                let on_call = self.call.on();
+                let call_btn = egui::Button::new(if on_call { "☎ on call" } else { "☎" })
+                    .fill(if on_call { egui::Color32::from_rgb(40, 110, 60) }
+                          else { ui.visuals().widgets.inactive.bg_fill });
+                if ui.add(call_btn)
+                    .on_hover_text(if on_call { "leave the call" }
+                                   else { "join the session's voice call" })
+                    .clicked() {
+                    self.toggle_call();
+                }
+                if on_call && self.call.listen_only().is_none() {
+                    let muted = self.call.muted();
+                    if ui.add(egui::Button::selectable(muted, "mute"))
+                        .on_hover_text("send silence (the far side's meter reads no loss)")
+                        .clicked() {
+                        self.call.set_muted(!muted);
+                    }
+                    if self.call.push_to_talk() {
+                        let held = ui.add(egui::Button::new("hold to talk"))
+                            .on_hover_text("push-to-talk: heard while this is held")
+                            .is_pointer_button_down_on();
+                        self.call.set_talking(held);
+                    }
+                }
                 if ui.button("⏮").on_hover_text("playhead to start (g g)").clicked() {
                     self.studio.transport.set_position(studio_core::Ticks::ZERO);
                     self.studio.status = "playhead at start".into();
@@ -2955,6 +3310,8 @@ impl eframe::App for App {
                 ui.label(&self.studio.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("{} clips", self.studio.session.doc.project.clips.len()));
+                    let call = self.call.describe(&*self.mic);
+                    if !call.is_empty() { ui.separator(); ui.label(call); }
                 });
             });
         });
@@ -3101,6 +3458,18 @@ impl eframe::App for App {
         // ── files dropped on the window become rack channels ─────────────
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped {
+            // A folder is a kit — see `Studio::import_kit`.
+            if let Some(dir) = f.path.as_ref().filter(|p| p.is_dir()) {
+                match self.studio.import_kit(dir) {
+                    Ok(hits) => for (id, audio, raw) in hits {
+                        self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                        self.audio.insert(id, audio);
+                        self.studio.register_asset(id, &raw);
+                    },
+                    Err(e) => self.studio.status = format!("kit import failed: {e}"),
+                }
+                continue;
+            }
             let name = f.path.as_ref()
                 .and_then(|p| p.file_stem()).and_then(|s| s.to_str())
                 .map(str::to_owned)
@@ -3214,6 +3583,18 @@ impl eframe::App for App {
             for p in self.studio.drain_outbox() {
                 carrier.send(p);
             }
+            // The call: frames that arrived go to the link, the tap's
+            // audio goes out, and the sink's stream is topped up. Only
+            // here, inside the wire block — a call with no carrier has
+            // nobody on it, and the verb says so instead of opening a
+            // microphone for no one.
+            for p in self.studio.voice_inbox.drain(..) {
+                self.call.receive(&p);
+            }
+            let site = self.studio.session.doc.site;
+            for p in self.call.pump(&mut *self.mic, &mut *self.sink, site) {
+                carrier.send(p);
+            }
             // Our own presence: the sending half of what integrate_packet
             // merges. Rate-limited and heartbeat'd inside; called every
             // frame, sends when it should.
@@ -3225,11 +3606,17 @@ impl eframe::App for App {
             for ev in self.studio.session.sweep(now_ms) {
                 if let studio_collab::session::Event::TimedOut(site) = ev {
                     self.studio.status = format!("site {} timed out", site.0);
+                    // Their last words must not replay when they are back
+                    // on a fresh sequence.
+                    self.call.forget(site);
                 }
             }
             // Packets arrive between frames; a connected shell keeps frames
             // coming so a peer's edit shows without waiting for a local one.
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            // A call needs the pump more often than that: its stream depth
+            // is the stall budget, and 50 ms is half of it.
+            ctx.request_repaint_after(std::time::Duration::from_millis(
+                if self.call.on() { 20 } else { 50 }));
         }
 
         // ── the controller ────────────────────────────────────────────────
@@ -3289,20 +3676,39 @@ impl eframe::App for App {
         // enforces exclusivity); this block just keeps the sink's buffer
         // truthful for the current owner and idles it for nobody.
         if self.studio.transport.playing {
-            if self.loaded != SinkContent::Arrangement || self.studio.arrangement_dirty {
-                let buf = self.studio.render_arrangement(self.sink.rate(), &self.audio);
-                self.sink.set_buffer(std::sync::Arc::new(buf), 2, false);
-                self.sink.seek(
-                    self.studio.transport.position().to_samples(self.sink.rate()).max(0) as usize);
+            let window = looping::Window::new(self.studio.transport.loop_range, self.sink.rate());
+            let want = match window { Some(w) => SinkContent::ArrangementLoop(w), None => SinkContent::Arrangement };
+            if self.loaded != want || self.studio.arrangement_dirty {
+                let (buf, looped, seek) = match window {
+                    // The range alone, looped by the callback — sample
+                    // exact, which loop-record depends on.
+                    Some(w) => (self.studio.render_arrangement_range(self.sink.rate(), &self.audio, w.start, w.end),
+                                true, w.frame(self.studio.transport.position())),
+                    None => (self.studio.render_arrangement(self.sink.rate(), &self.audio), false,
+                             self.studio.transport.position().to_samples(self.sink.rate()).max(0) as usize),
+                };
+                self.sink.set_buffer(std::sync::Arc::new(buf), 2, looped);
+                self.sink.seek(seek);
                 self.studio.arrangement_dirty = false;
-                self.loaded = SinkContent::Arrangement;
+                self.loaded = want;
             }
             self.sink.set_playing(true);
             if let Some(f) = self.sink.position() {
                 // Video follows audio, never the reverse (transport's rule №1)
                 // — the sink's consumed frames ARE the playhead.
-                self.studio.transport.set_position(
-                    studio_core::Ticks::from_samples(f as i64, self.sink.rate()));
+                let at = match window {
+                    Some(w) => w.timeline(f),
+                    None => studio_core::Ticks::from_samples(f as i64, self.sink.rate()),
+                };
+                self.studio.transport.set_position(at);
+                // Loop-record: the playhead came round while the take
+                // ran — what the microphone caught is one pass, placed
+                // at the loop's start on the next free lane.
+                if let Some(w) = window {
+                    if self.mic.recording() && self.passes.observe(at) {
+                        self.commit_pass(w);
+                    }
+                }
             } else if !self.sink.playing() {
                 self.studio.transport.stop();
                 self.studio.status = "reached the end".into();
@@ -3969,8 +4375,11 @@ impl eframe::App for App {
                         let alive = match t {
                             studio_core::AutoTarget::TrackGain(id) =>
                                 p.tracks.iter().any(|tr| tr.id == id),
-                            studio_core::AutoTarget::BusGain(id) =>
+                            studio_core::AutoTarget::BusGain(id)
+                            | studio_core::AutoTarget::BusParam { bus: id, .. } =>
                                 p.busses.contains_key(&id),
+                            studio_core::AutoTarget::ClipParam { clip, .. } =>
+                                p.clips.contains_key(&clip),
                         };
                         if !alive { self.studio.auto_target = None; }
                     }
@@ -4029,6 +4438,21 @@ impl eframe::App for App {
                             studio_core::AutoTarget::BusGain(id) =>
                                 p.busses.get(&id).map(|x| format!("bus {}", x.name))
                                     .unwrap_or_else(|| "?".into()),
+                            // "bus verb · reverb · mix" — the effect by
+                            // kind, since a chain index means nothing
+                            // on screen; "(gone)" when the chain no
+                            // longer reaches that far.
+                            studio_core::AutoTarget::BusParam { bus, effect, key } => {
+                                let b = p.busses.get(&bus);
+                                let kind = b.and_then(|b| b.chain.get(effect as usize))
+                                    .map(|e| e.kind.clone()).unwrap_or_else(|| "(gone)".into());
+                                format!("bus {} · {kind} · {key}", b.map(|b| b.name.as_str()).unwrap_or("?"))
+                            }
+                            studio_core::AutoTarget::ClipParam { clip, effect, key } => {
+                                let kind = p.clips.get(&clip).and_then(|c| c.effects.get(effect as usize))
+                                    .map(|e| e.kind.clone()).unwrap_or_else(|| "(gone)".into());
+                                format!("clip {} · {kind} · {key}", clip.0)
+                            }
                         };
                         let gate_name = |g: studio_core::Gate| match g {
                             studio_core::Gate::Always => "always".to_string(),
@@ -4036,6 +4460,10 @@ impl eframe::App for App {
                                 format!("clip {}", c.0) } else { format!("clip {} (gone)", c.0) },
                             studio_core::Gate::Window { start, end } =>
                                 format!("{:.2}–{:.2}s", start.to_seconds(), end.to_seconds()),
+                            studio_core::Gate::Group(g) => match p.groups.get(&g) {
+                                Some(grp) => format!("group {}", grp.name),
+                                None => format!("group {} (gone)", g.0),
+                            },
                         };
                         let mut pick = self.studio.auto_binding;
                         for (id, b) in &p.bindings {
@@ -4514,6 +4942,25 @@ impl App {
                     self.studio.status = format!("resync requested — {n} ops locally");
                 }
                 palette::ShellVerb::RecordTake => { self.toggle_take(); }
+                palette::ShellVerb::CallToggle => { self.toggle_call(); }
+                palette::ShellVerb::LoopSelection => { self.studio.loop_selection(); }
+                palette::ShellVerb::Harmonize(d) => { self.studio.harmonize_roll(d as i32); }
+                palette::ShellVerb::Arpeggiate(order) => { self.studio.arpeggiate_roll(order, 1); }
+                palette::ShellVerb::LoopOff => { self.studio.loop_off(); }
+                palette::ShellVerb::CompTakes => { self.studio.comp_selected_takes(); }
+                palette::ShellVerb::MuteTakeLanes(m) => { self.studio.set_take_lanes_muted(m); }
+                palette::ShellVerb::CallMute => {
+                    let m = !self.call.muted();
+                    self.call.set_muted(m);
+                    self.studio.status = if m { "call: microphone muted" }
+                                         else { "call: microphone open" }.into();
+                }
+                palette::ShellVerb::CallPushToTalk => {
+                    let p = !self.call.push_to_talk();
+                    self.call.set_push_to_talk(p);
+                    self.studio.status = if p { "call: push-to-talk — hold the talk button" }
+                                         else { "call: microphone open (push-to-talk off)" }.into();
+                }
                 palette::ShellVerb::ToggleKeyGuide => {
                     self.studio.key_guide = !self.studio.key_guide;
                     self.studio.status = format!("out-of-key dimming {}",
@@ -4569,11 +5016,16 @@ impl App {
                             "no bus feeding master to analyse".into(),
                     }
                 }
+                palette::ShellVerb::NewCurveOnGroup => {
+                    let t = self.studio.auto_target;
+                    self.studio.new_curve_on_group(t);
+                }
                 palette::ShellVerb::NewCurve => {
                     let t = self.studio.auto_target;
                     self.studio.new_curve_on_selection(t);
                 }
                 palette::ShellVerb::SplitOnGrid(steps) => self.studio.split_selection_on_grid(steps as i64),
+                palette::ShellVerb::SyncDelay(n) => { self.studio.sync_delays_to_tempo(n); }
                 palette::ShellVerb::Overlap(policy) => {
                     let track = self.studio.selection.first()
                         .and_then(|c| self.studio.session.doc.project.clips.get(c)).map(|c| c.track);
@@ -4588,6 +5040,17 @@ impl App {
                 }
                 palette::ShellVerb::ExportDialog => {
                     self.export_dialog = Some(Default::default());
+                }
+                palette::ShellVerb::ExportVideo => {
+                    if self.export_run.is_some() {
+                        self.studio.status = "an export is already running".into();
+                    } else {
+                        let out = self.project_path.with_extension("mp4");
+                        self.export_done.clear();
+                        self.export_run = Some(export::start_video(
+                            self.studio.session.doc.project.clone(), self.audio.clone(), out,
+                            self.sink.rate().max(8_000), 1280, 720, 30));
+                    }
                 }
                 palette::ShellVerb::Settings => { self.settings_open = true; }
                 palette::ShellVerb::Workspace(ix) => self.apply_layout(ix as usize),
@@ -4668,6 +5131,55 @@ impl App {
         self.studio.status = format!("workspace: {}", l.name);
     }
 
+    /// Join or leave the call. Refuses without a carrier: the call rides
+    /// the same wire the ops do, and with no wire there is nobody on it.
+    fn toggle_call(&mut self) {
+        if self.carrier.is_none() && !self.call.on() {
+            self.studio.status =
+                "no session wire — start with STUDIO_LISTEN or STUDIO_CONNECT to call".into();
+            return;
+        }
+        self.call.toggle(&mut *self.mic);
+        self.studio.status = if self.call.on() {
+            match self.call.listen_only() {
+                Some(why) => format!("joined the call, listen-only: {why}"),
+                None => format!("joined the call from {} at {} Hz — headphones avoid echo",
+                                self.mic.device_name(), self.mic.rate()),
+            }
+        } else { "left the call".into() };
+    }
+
+    /// One loop-record pass: cut the take so far and place it at the
+    /// loop's start, trimmed to the loop's length (the frame's worth of
+    /// overshoot past the wrap belongs to the next pass and is dropped —
+    /// see `looping`'s module docs).
+    fn commit_pass(&mut self, w: looping::Window) {
+        let Some(take) = self.mic.split_take() else { return };
+        let mut audio = take.audio;
+        let max = (w.frames() as f64 * audio.sample_rate as f64 / w.rate as f64) as usize;
+        for ch in &mut audio.channels { ch.truncate(max); }
+        if audio.frames() == 0 { return; }
+        let name = format!("take {} pass {}", self.studio.session.doc.project.sources.len() + 1, self.passes.done);
+        let path = format!("takes/{}.flac", export::sanitize(&name));
+        let id = self.studio.import_audio(&name, &path, &audio);
+        let appended = self.studio.rack.channels.len().saturating_sub(1);
+        self.studio.rack.channels.truncate(appended);
+        for p in &mut self.studio.rack.patterns { p.rows.truncate(appended); }
+        let len = studio_core::Ticks::from_samples(audio.frames() as i64, audio.sample_rate);
+        if let Some(track) = self.studio.take_target() {
+            self.studio.place_take(id, len, w.start, track);
+        }
+        if let Ok(bytes) = studio_media::flac::encode_flac(&audio, id.0) {
+            self.studio.register_asset(id, &bytes);
+        }
+        self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+        self.audio.insert(id, audio);
+        self.studio.status = format!("pass {}: {}", self.passes.done, self.studio.status);
+        if take.dropped_blocks > 0 {
+            self.studio.status = format!("{} — WARNING: {} block(s) dropped", self.studio.status, take.dropped_blocks);
+        }
+    }
+
     fn toggle_take(&mut self) {
         if self.mic.recording() {
             let Some(take) = self.mic.stop() else {
@@ -4684,36 +5196,32 @@ impl App {
             let appended = self.studio.rack.channels.len().saturating_sub(1);
             self.studio.rack.channels.truncate(appended);
             for p in &mut self.studio.rack.patterns { p.rows.truncate(appended); }
-            let track = self.studio.session.doc.project.tracks.iter()
-                .find(|t| t.kind == studio_core::TrackKind::Audio).map(|t| t.id);
             let len = studio_core::Ticks::from_samples(
                 audio.frames() as i64, audio.sample_rate);
-            if let Some(track) = track {
-                let cid = studio_core::ClipId(
-                    self.studio.session.doc.project.clips.keys()
-                        .map(|c| c.0).max().unwrap_or(0) + 1);
-                self.studio.edit(studio_core::Op::AddClip { clip: studio_core::Clip {
-                    id: cid, source: id, track, pos: self.take_from,
-                    src_in: studio_core::Ticks::ZERO, len, gain: 1.0,
-                    effects: vec![] } }, "take");
+            // The second take of a phrase goes to a lane, not onto the
+            // first — see studio_core's takes module.
+            if let Some(track) = self.studio.take_target() {
+                self.studio.place_take(id, len, self.take_from, track);
             }
             if let Ok(bytes) = studio_media::flac::encode_flac(&audio, id.0) {
                 self.studio.register_asset(id, &bytes);
             }
             self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
             self.audio.insert(id, audio);
-            self.studio.status = format!("take: {:.1}s{}", len.to_seconds(),
-                if dropped > 0 {
-                    // Said, not swallowed: a take with holes must not be
-                    // built on unknowingly.
-                    format!(" — WARNING: {dropped} block(s) dropped, check the take")
-                } else { String::new() });
+            if dropped > 0 {
+                // Said, not swallowed: a take with holes must not be
+                // built on unknowingly.
+                self.studio.status = format!("{} — WARNING: {dropped} block(s) dropped, check the take",
+                                             self.studio.status);
+            }
         } else {
             self.take_from = self.studio.playhead();
+            self.passes = looping::Passes::start();
             match self.mic.start() {
                 Ok(()) => self.studio.status =
-                    format!("recording from {} at {} Hz…",
-                            self.mic.device_name(), self.mic.rate()),
+                    format!("recording from {} at {} Hz…{}",
+                            self.mic.device_name(), self.mic.rate(),
+                            if self.studio.transport.loop_range.is_some() { " (a take per pass of the loop)" } else { "" }),
                 Err(e) => self.studio.status = e,
             }
         }
@@ -5000,6 +5508,10 @@ impl App {
                     ui.label("format:");
                     ui.selectable_value(&mut plan.format, ExportFormat::Opus, "opus");
                     ui.selectable_value(&mut plan.format, ExportFormat::Wav, "wav");
+                    ui.selectable_value(&mut plan.format, ExportFormat::Mp3, "mp3")
+                        .on_hover_text("for the group chat — through ffmpeg");
+                    ui.selectable_value(&mut plan.format, ExportFormat::M4a, "m4a")
+                        .on_hover_text("for iMessage and the like — through ffmpeg");
                 });
                 ui.horizontal(|ui| {
                     ui.label("scope:");
@@ -5054,6 +5566,10 @@ impl App {
                             ui.colored_label(egui::Color32::GRAY,
                                 "48 kHz stereo — the codec's contract");
                         });
+                    }
+                    ExportFormat::Mp3 | ExportFormat::M4a => {
+                        ui.colored_label(egui::Color32::GRAY,
+                            "stereo, 192 kbps, encoded by ffmpeg — the format a phone shares");
                     }
                 }
                 if !self.export_note.is_empty() {
@@ -5465,11 +5981,19 @@ mod arrangement_tests {
 
 /// What `Studio::export_arrangement` writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExportFormat { Wav, Opus }
+pub enum ExportFormat { Wav, Opus, Mp3, M4a }
 impl ExportFormat {
     pub fn ext(self) -> &'static str {
-        match self { ExportFormat::Wav => "wav", ExportFormat::Opus => "opus" }
+        match self { ExportFormat::Wav => "wav", ExportFormat::Opus => "opus",
+                     ExportFormat::Mp3 => "mp3", ExportFormat::M4a => "m4a" }
     }
+    /// The lossy ones are stereo at the render rate through ffmpeg; the
+    /// ffmpeg encoder name, for [`ExportFormat::Mp3`] and [`ExportFormat::M4a`].
+    pub fn ffmpeg_codec(self) -> Option<&'static str> {
+        match self { ExportFormat::Mp3 => Some("libmp3lame"), ExportFormat::M4a => Some("aac"), _ => None }
+    }
+    /// Stereo only, like Opus: the formats a phone shares.
+    pub fn stereo_only(self) -> bool { !matches!(self, ExportFormat::Wav) }
 }
 
 #[cfg(test)]
@@ -5504,6 +6028,38 @@ mod export_tests {
             // And it isn't silence: the bounced kick is in there.
             let head: f32 = back.channels[0][..4800].iter().map(|v| v.abs()).sum();
             assert!(head > 5.0, "{fmt:?} export is audible ({head})");
+        }
+    }
+
+    #[test]
+    fn the_phones_formats_come_out_of_ffmpeg_the_right_length_or_say_what_is_missing() {
+        // mp3 and m4a are not decoded exactly by anything (encoder delay
+        // and padding are the formats' own), so the check is ffprobe's:
+        // audio, stereo-only layout enforced, the arrangement's length
+        // within a codec frame's worth. Without ffmpeg's encoder the
+        // export fails with a sentence that names it, not a panic.
+        let (mut s, sources) = bounced_studio();
+        let dir = std::env::temp_dir().join("studio-export-phone");
+        let expect = s.render_arrangement(48_000, &sources).len() as f64 / 2.0 / 48_000.0;
+        for fmt in [ExportFormat::Mp3, ExportFormat::M4a] {
+            match s.export_arrangement(&sources, &dir, fmt, 44_100, studio_audio::format::ChannelFormat::Surround51) {
+                Ok(path) => {
+                    assert_eq!(path.extension().and_then(|e| e.to_str()), Some(fmt.ext()));
+                    assert!(s.status.contains("(2.0)"), "5.1 asked, stereo delivered, said: {}", s.status);
+                    assert!(!path.with_extension("tmp.wav").exists(), "the WAV beside it is gone");
+                    // Read back with the app's own decoder — a phone's
+                    // file the app cannot open is not one it should make.
+                    let back = studio_media::decode_file(&path).expect("our decoder reads it");
+                    assert_eq!(back.channels.len(), 2, "{fmt:?}: stereo");
+                    let secs = back.frames() as f64 / back.sample_rate as f64;
+                    assert!((secs - expect).abs() < 0.15, "{fmt:?}: {secs} s vs {expect}");
+                    let head: f32 = back.channels[0][..4800].iter().map(|v| v.abs()).sum();
+                    assert!(head > 1.0, "{fmt:?}: audible ({head})");
+                }
+                Err(e) => {
+                    assert!(e.contains("ffmpeg"), "{fmt:?}: a missing encoder is named: {e}");
+                }
+            }
         }
     }
 
@@ -5569,6 +6125,33 @@ mod mixer_tests {
     }
 
     #[test]
+    fn a_delay_syncs_to_the_tempo_as_an_op_and_undoes() {
+        let mut s = Studio::demo();
+        s.rack.tempo_bpm = 140.0;
+        let bus = studio_core::BusId(77);
+        s.edit(studio_core::Op::AddBus { bus: studio_core::Bus {
+            id: bus, name: "verb".into(), parent: None, gain: 1.0,
+            chain: vec![mixer_panel::effect("delay", &[("time", 100.0), ("feedback", 0.4)]),
+                        mixer_panel::effect("gain", &[("db", 0.0)])],
+            sends: vec![], muted: false } }, "bus");
+        let before = s.session.doc.history().len();
+        assert_eq!(s.sync_delays_to_tempo(3), 1, "one chain had a delay");
+        let chain = &s.session.doc.project.busses[&bus].chain;
+        assert!((chain[0].params["time"] - 321.428).abs() < 0.01, "dotted eighth at 140: {}", chain[0].params["time"]);
+        assert_eq!(chain[0].params["feedback"], 0.4, "the other params are kept");
+        assert_eq!(chain[1].kind, "gain", "and the rest of the chain is untouched");
+        assert_eq!(s.session.doc.history().len(), before + 1, "one op, so one undo");
+        assert!(s.status.contains("321.4 ms"), "{}", s.status);
+        s.key(studio_egui::keys::Key::c('u'));
+        assert_eq!(s.session.doc.project.busses[&bus].chain[0].params["time"], 100.0, "undo restores");
+        assert_eq!(s.sync_delays_to_tempo(1), 1);
+        assert!((s.session.doc.project.busses[&bus].chain[0].params["time"] - 107.14).abs() < 0.01, "a sixteenth");
+        s.edit(studio_core::Op::SetBusChain { id: bus, chain: vec![] }, "clear");
+        assert_eq!(s.sync_delays_to_tempo(2), 0, "nothing to sync says so");
+        assert!(s.status.contains("no delay"), "{}", s.status);
+    }
+
+    #[test]
     fn a_fader_op_lands_in_history_like_any_edit() {
         let mut s = Studio::demo();
         let t = s.session.doc.project.tracks.iter()
@@ -5597,6 +6180,18 @@ mod collab_tests {
         let base = a.session.doc.project.clone();
         let b = Studio::new(base, SiteId(2), Team::from_contacts("duo", &["sc-b".into()]));
         (a, b)
+    }
+
+    #[test]
+    fn a_voice_frame_goes_to_the_inbox_and_nowhere_near_the_history() {
+        let (_, mut b) = pair();
+        let before = b.session.doc.history().len();
+        let v = studio_collab::wire::Packet::Voice { site: SiteId(1), seq: 7, frame: vec![1, 2, 3] };
+        let replies = b.integrate_packet(v.clone(), 0);
+        assert!(replies.is_empty(), "a voice frame earns no reply");
+        assert_eq!(b.voice_inbox, vec![v], "and waits in the inbox for the call");
+        assert_eq!(b.session.doc.history().len(), before, "never an op");
+        assert!(b.drain_outbox().is_empty(), "and nothing to broadcast");
     }
 
     fn pipe(from: &mut Studio, to: &mut Studio) {
@@ -5938,6 +6533,56 @@ mod tcp_carrier_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("projects never converged over the socket");
+    }
+
+    #[test]
+    fn a_word_crosses_the_socket_and_comes_out_of_the_far_sink() {
+        // The call end to end with the ONLY thing faked being the two
+        // devices: A's Call encodes (Opus, if this build has it) into
+        // packets, A's carrier ships them, B's Studio integrates them into
+        // its inbox, B's Call decodes them into B's sink. The document is
+        // untouched by all of it.
+        use crate::call::fakes::{FakeMic, FakeSink, sine};
+        use studio_collab::voice::FRAME;
+        let mut a = Studio::demo();
+        let mut b = Studio::new(a.session.doc.project.clone(), SiteId(2),
+                                Team::from_contacts("duo", &["sc-b".into()]));
+        let ca = StreamPeer::listen("127.0.0.1:0").expect("bind");
+        let cb = StreamPeer::connect(ca.local.unwrap()).expect("dial");
+        let (mut call_a, mut call_b) = (call::Call::new(), call::Call::new());
+        let (mut mic_a, mut sink_a) = (FakeMic::new(48_000), FakeSink::new(48_000));
+        let (mut mic_b, mut sink_b) = (FakeMic::new(48_000), FakeSink::new(48_000));
+        call_a.start(&mut mic_a);
+        call_b.start(&mut mic_b);
+        let history = b.session.doc.history().len();
+        mic_a.say(&sine(FRAME * 20, 440.0, 48_000, 0.5));
+        let mut inbox_b = 0;
+        for _ in 0..400 {
+            // A's microphone keeps running after the word — a real tap
+            // yields room tone every frame, and a peer that goes silent
+            // on the wire is what concealment is for, not this.
+            mic_a.say(&[0.0; FRAME]);
+            // Exactly the shell's order: wire → integrate → inbox → call → wire.
+            pump(&mut a, &ca);
+            for p in a.voice_inbox.drain(..) { call_a.receive(&p); }
+            for p in call_a.pump(&mut mic_a, &mut sink_a, a.session.doc.site) { ca.send(p); }
+            pump(&mut b, &cb);
+            for p in b.voice_inbox.drain(..) { inbox_b += 1; call_b.receive(&p); }
+            // B's device plays one frame per turn; the pump refills one slot.
+            sink_b.consume(FRAME);
+            for p in call_b.pump(&mut mic_b, &mut sink_b, b.session.doc.site) { cb.send(p); }
+            if inbox_b >= 40 && sink_b.played.len() >= FRAME * 30 { break; }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(inbox_b >= 20, "B's Studio handed {inbox_b} voice frames to the call");
+        let peak = sink_b.played.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        assert!(peak > 0.3, "A's tone came out of B's sink over TCP: peak {peak}");
+        let m = call_b.meter();
+        assert_eq!((m.peers, m.playing, m.unknown), (1, 1, 0), "{m:?}");
+        assert!(m.lost <= 1, "a steady sender over loopback needs no concealment: {m:?}");
+        assert_eq!(b.session.doc.history().len(), history, "the call never touched the document");
+        assert_eq!(a.session.doc.project, b.session.doc.project);
+        assert!(call_b.describe(&mic_b).starts_with("call ("), "{}", call_b.describe(&mic_b));
     }
 }
 
@@ -6615,6 +7260,205 @@ pub fn curve_time(at: Ticks, origin: Ticks) -> Ticks {
 }
 
 #[cfg(test)]
+mod kit_tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_of_hits_becomes_channels_in_name_order_and_the_rest_is_counted() {
+        let dir = std::env::temp_dir().join(format!("studio-kit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = |n: usize| studio_audio::export::export_wav_dithered_bytes(
+            &vec![0.2; 480 * n], 1, 48_000, 1).unwrap();
+        std::fs::write(dir.join("kick.wav"), wav(10)).unwrap();
+        std::fs::write(dir.join("clap.WAV"), wav(5)).unwrap();
+        std::fs::write(dir.join("hat.wav"), wav(2)).unwrap();
+        std::fs::write(dir.join("readme.txt"), b"not audio").unwrap();
+        std::fs::write(dir.join("broken.flac"), b"nope").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let mut s = Studio::demo();
+        let before = s.rack.channels.len();
+        let hits = s.import_kit(&dir).unwrap();
+        assert_eq!(hits.len(), 3);
+        let names: Vec<&str> = s.rack.channels[before..].iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["clap", "hat", "kick"], "name order, extension case ignored");
+        assert!(s.status.starts_with("kit '"), "{}", s.status);
+        assert!(s.status.contains("3 channels added, 1 file(s) could not be decoded"), "{}", s.status);
+        assert!(s.rack.channels[before..].iter().all(|c| matches!(c.kind, studio_live::SynthKind::Sampler { .. })));
+        assert_eq!(hits[0].1.frames(), 480 * 5, "clap's audio came back with its id");
+        assert_eq!(s.session.doc.project.sources.len(), 3 + Studio::demo().session.doc.project.sources.len());
+        // An empty folder is refused, saying so.
+        let empty = dir.join("sub");
+        assert!(s.import_kit(&empty).unwrap_err().starts_with("no audio files"));
+        assert!(s.import_kit(&dir.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod chord_tool_tests {
+    use super::*;
+
+    #[test]
+    fn the_roll_tools_edit_the_selected_channel_and_say_what_they_did() {
+        let mut s = Studio::demo();
+        let ch = s.selected_channel;
+        let pat = s.current_pattern;
+        let note = |key: i8, start: u32| studio_live::Note { key, start, len: 4, vel: 0.8, slide: false };
+        s.rack.patterns[pat].add_note(ch, note(3, 0));
+        s.rack.patterns[pat].add_note(ch, note(3, 8));
+        s.loop_dirty = false;
+        assert_eq!(s.harmonize_roll(4), 2);
+        assert!(s.status.starts_with("harmonize: 2 fifths added"), "{}", s.status);
+        assert!(s.loop_dirty, "the loop must re-render");
+        assert_eq!(s.rack.patterns[pat].roll(ch).len(), 4);
+        assert_eq!(s.arpeggiate_roll(studio_live::Arp::Up, 1), 2, "two chords now");
+        assert!(s.status.starts_with("arpeggiate: 2 chords"), "{}", s.status);
+        assert_eq!(s.rack.patterns[pat].roll(ch).len(), 8, "four one-step notes per four-step chord");
+        assert_eq!(s.arpeggiate_roll(studio_live::Arp::Up, 1), 0);
+        assert!(s.status.contains("no chords"), "{}", s.status);
+        // With a key set, the harmony is diatonic: C major, a third above C is E.
+        s.edit(studio_core::Op::SetKey { key: Some(studio_core::Key { root: 0, scale: studio_core::Scale::Major }) }, "key");
+        s.rack.patterns[pat].rolls.clear();
+        s.rack.patterns[pat].add_note(ch, note(3, 0));
+        s.harmonize_roll(2);
+        assert!(s.status.ends_with("in key"), "{}", s.status);
+        assert_eq!(s.rack.patterns[pat].roll(ch).iter().map(|n| n.key).collect::<Vec<_>>(), vec![3, 7]);
+    }
+}
+
+#[cfg(test)]
+mod take_shell_tests {
+    //! The shell half of takes: a re-take lands on a lane, the comp verb
+    //! copies the chosen lane clips onto the root, the lanes mute as a
+    //! group, and the loop range is the selection's span.
+    use super::*;
+    use studio_core::{ClipId, Op, Ticks, TrackId};
+    use studio_egui::keys::Key;
+
+    /// A one-second mono source registered on the demo project.
+    fn source(s: &mut Studio, n: u64) -> studio_core::SourceId {
+        let audio = studio_audio::SourceAudio { sample_rate: 48_000, channels: vec![vec![0.1 * n as f32; 48_000]] };
+        let id = s.import_audio(&format!("t{n}"), &format!("takes/t{n}.flac"), &audio);
+        // import_audio appends a rack channel a vocal take does not want;
+        // the shell drops it, the way toggle_take does.
+        let appended = s.rack.channels.len().saturating_sub(1);
+        s.rack.channels.truncate(appended);
+        for p in &mut s.rack.patterns { p.rows.truncate(appended); }
+        id
+    }
+
+    #[test]
+    fn three_takes_at_the_playhead_are_three_lanes_and_one_undo_each() {
+        let mut s = Studio::demo();
+        s.selection.clear();
+        let root = s.take_target().expect("an audio track");
+        let far = Ticks::from_seconds(100.0); // where the demo has nothing
+        let len = Ticks::from_seconds(1.0);
+        let a = source(&mut s, 1);
+        let b = source(&mut s, 2);
+        let c = source(&mut s, 3);
+        let (l1, c1) = s.place_take(a, len, far, root).unwrap();
+        assert_eq!(l1, root, "the first take: on the track");
+        assert!(s.status.starts_with("take 1.0s on"), "{}", s.status);
+        let (l2, c2) = s.place_take(b, len, far, root).unwrap();
+        assert_ne!(l2, root);
+        assert!(s.status.contains("lane 2 of the chain"), "{}", s.status);
+        let (l3, _c3) = s.place_take(c, len, far, root).unwrap();
+        assert_eq!(s.session.doc.project.take_lanes(root), vec![l1, l2, l3]);
+        // The lane and its clip were one undo step: `u` removes both.
+        let tracks = s.session.doc.project.tracks.len();
+        s.key(Key::c('u'));
+        assert_eq!(s.session.doc.project.tracks.len(), tracks - 1, "the third lane is gone with its take");
+        assert_eq!(s.session.doc.project.take_lanes(root), vec![l1, l2]);
+        // With a clip on a lane selected, the take target is the ROOT.
+        s.selection = vec![c2];
+        assert_eq!(s.take_target(), Some(root), "a re-take of a lane's phrase goes to the chain, not under the lane");
+        // A take somewhere else lands on the root again.
+        let (l4, _) = s.place_take(c, len, Ticks::from_seconds(200.0), root).unwrap();
+        assert_eq!(l4, root);
+        let _ = c1;
+    }
+
+    #[test]
+    fn comp_copies_the_selected_lane_clips_onto_the_root_and_mutes_the_lanes() {
+        let mut s = Studio::demo();
+        s.selection.clear();
+        let root = s.take_target().unwrap();
+        let far = Ticks::from_seconds(100.0);
+        let len = Ticks::from_seconds(1.0);
+        let a = source(&mut s, 1);
+        let b = source(&mut s, 2);
+        let (_, _c1) = s.place_take(a, len, far, root).unwrap();
+        let (l2, c2) = s.place_take(b, len, far, root).unwrap();
+        // Split the second take in half on its lane, choose its second half.
+        s.selection = vec![c2];
+        s.transport.set_position(far.saturating_add(Ticks::from_seconds(0.5)));
+        s.key(Key::c('s'));
+        let halves: Vec<ClipId> = {
+            let p = &s.session.doc.project;
+            let mut v: Vec<&studio_core::Clip> = p.clips.values().filter(|c| c.track == l2).collect();
+            v.sort_by_key(|c| c.pos);
+            v.iter().map(|c| c.id).collect()
+        };
+        assert_eq!(halves.len(), 2, "split on the lane: two pieces");
+        s.selection = vec![halves[1]];
+        assert_eq!(s.comp_selected_takes(), 1);
+        assert!(s.status.starts_with("comp: 1 take on the track"), "{}", s.status);
+        let p = &s.session.doc.project;
+        let mut on_root: Vec<&studio_core::Clip> = p.clips.values().filter(|c| c.track == root && c.pos >= far).collect();
+        on_root.sort_by_key(|c| c.pos);
+        assert_eq!(on_root.len(), 2, "take 1's head, take 2's tail");
+        assert_eq!((on_root[0].source, on_root[0].len), (a, Ticks::from_seconds(0.5)));
+        assert_eq!((on_root[1].source, on_root[1].src_in), (b, Ticks::from_seconds(0.5)), "the offset into take 2 is carried");
+        assert_eq!(p.clips.values().filter(|c| c.track == l2).count(), 2, "the lane keeps both halves");
+        // Mute the lanes: the comp is what plays. Then undo it all.
+        s.selection = vec![on_root[0].id];
+        assert_eq!(s.set_take_lanes_muted(true), 1);
+        assert!(s.session.doc.project.tracks.iter().find(|t| t.id == l2).unwrap().muted);
+        assert_eq!(s.set_take_lanes_muted(true), 0, "nothing left to mute");
+        assert_eq!(s.set_take_lanes_muted(false), 1);
+        s.key(Key::c('u')); // unmute
+        s.key(Key::c('u')); // mute
+        s.key(Key::c('u')); // the comp, as one step
+        let p = &s.session.doc.project;
+        let on_root: Vec<&studio_core::Clip> = p.clips.values().filter(|c| c.track == root && c.pos >= far).collect();
+        assert_eq!(on_root.len(), 1, "one undo removed the comp piece and restored take 1 whole");
+        assert_eq!(on_root[0].len, len);
+        // A root clip selected: nothing to comp, said.
+        s.selection = vec![on_root[0].id];
+        assert_eq!(s.comp_selected_takes(), 0);
+        assert!(s.status.starts_with("comp: select a take on a lane"), "{}", s.status);
+    }
+
+    #[test]
+    fn the_loop_range_is_the_selections_span_and_off_clears_it() {
+        let mut s = Studio::demo();
+        let p = &s.session.doc.project;
+        let c1 = ClipId(1);
+        let (pos, end) = (p.clips[&c1].pos, p.clips[&c1].end());
+        s.selection = vec![c1];
+        s.loop_selection();
+        assert_eq!(s.transport.loop_range, Some((pos, end)));
+        assert!(s.arrangement_dirty, "the sink must reload with the range alone");
+        assert!(s.status.starts_with("looping"), "{}", s.status);
+        s.selection.clear();
+        s.loop_selection();
+        assert_eq!(s.transport.loop_range, Some((pos, end)), "no selection: the range is kept, and said");
+        assert!(s.status.starts_with("loop: select"), "{}", s.status);
+        s.loop_off();
+        assert_eq!(s.transport.loop_range, None);
+        // The range renders on its own: exactly the span's frames.
+        s.selection = vec![c1];
+        s.loop_selection();
+        let sources: std::collections::BTreeMap<_, _> = Default::default();
+        let out = s.render_arrangement_range(48_000, &sources, pos, end);
+        assert_eq!(out.len() as i64, (end.to_samples(48_000) - pos.to_samples(48_000)) * 2);
+        let _ = Op::SetTrackGain { id: TrackId(1), gain: 1.0 };
+    }
+}
+
+#[cfg(test)]
 mod curve_shell_tests {
     //! The shell half of the curves module: `y`/`p` carry a clip's
     //! bindings, a curve is minted from the selection, and the strip's
@@ -6651,6 +7495,79 @@ mod curve_shell_tests {
         assert!(s.auto_target.is_none());
         // The dip is real, halfway into clip 1 (pos 0 s, len 3 s).
         assert!((p.auto_value(b.target, Ticks::from_seconds(1.5))).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_curve_minted_on_an_effect_parameter_is_the_structural_sidechain_on_a_knob() {
+        // A reverb return bus; select the vocal clip; mint a curve on the
+        // reverb's MIX gated to that clip. The clip's presence now drives
+        // the knob — what the fader's menu did for gain, on a parameter.
+        use studio_core::{BusId, ParamKey};
+        let mut s = Studio::demo();
+        let bus = BusId(40);
+        s.edit(Op::AddBus { bus: studio_core::Bus { id: bus, name: "verb".into(), parent: None, gain: 1.0,
+            chain: vec![mixer_panel::effect("reverb", &[("mix", 1.0)])], sends: vec![], muted: false } }, "bus");
+        let clip = studio_core::ClipId(1);
+        s.selection = vec![clip];
+        let target = AutoTarget::BusParam { bus, effect: 0, key: ParamKey::new("mix").unwrap() };
+        s.new_curve_on_selection(Some(target));
+        let p = &s.session.doc.project;
+        let (bid, b) = p.bindings.iter().next().expect("bound");
+        assert_eq!(b.target, target);
+        assert_eq!(b.gate, Gate::Clip(clip));
+        assert_eq!(s.auto_binding, Some(*bid), "the strip shows the new binding");
+        assert!(s.status.contains("bound to 1 target"), "{}", s.status);
+        // The render's question answers with it, and the target is live.
+        assert_eq!(p.bus_param_targets(bus).len(), 1);
+        assert!(studio_fx::Instance::is_live_param("reverb", "mix"));
+        // Duplicating the clip re-aims a binding at the copy (the
+        // curves module's promise, unchanged by the target's kind).
+        s.key(Key::c('y'));
+        s.transport.set_position(Ticks::from_seconds(100.0));
+        s.key(Key::c('p'));
+        let p = &s.session.doc.project;
+        assert_eq!(p.bindings.len(), 2);
+        assert!(p.bindings.values().all(|b| b.target == target), "both bindings aim at the same knob");
+        assert_eq!(p.bus_param_targets(bus).len(), 1, "one target, two gates — deduplicated");
+        // Undo the paste, then the mint: the bus is back to a plain reverb.
+        s.key(Key::c('u'));
+        s.key(Key::c('u'));
+        assert!(s.session.doc.project.bindings.is_empty());
+        assert!(s.session.doc.project.bus_param_targets(bus).is_empty());
+    }
+
+    #[test]
+    fn a_curve_over_a_group_spans_the_hull_and_is_one_undo() {
+        let mut s = Studio::demo();
+        let p = &s.session.doc.project;
+        // Two clips on one track, apart: group them.
+        let track = p.clips[&studio_core::ClipId(1)].track;
+        let mut on_track: Vec<&studio_core::Clip> = p.clips.values().filter(|c| c.track == track).collect();
+        on_track.sort_by_key(|c| c.pos);
+        assert!(on_track.len() >= 2, "the demo has two clips on this track");
+        let (a, b) = (on_track[0].id, on_track[1].id);
+        let hull = (on_track[0].pos, on_track[1].end());
+        let gid = studio_core::GroupId(70);
+        s.edit(Op::SetGroup { id: gid, name: "drop".into(), clips: vec![a, b] }, "group");
+        s.selection = vec![b];
+        s.new_curve_on_group(None);
+        let p = &s.session.doc.project;
+        assert_eq!(p.bindings.len(), 1);
+        let bnd = p.bindings.values().next().unwrap();
+        assert_eq!(bnd.gate, Gate::Group(gid));
+        assert_eq!(bnd.target, AutoTarget::TrackGain(track));
+        assert_eq!(p.group_hull(gid), Some(hull));
+        assert!(s.status.contains("over drop"), "{}", s.status);
+        assert!(s.auto_binding.is_some());
+        s.key(Key::c('u'));
+        assert!(s.session.doc.project.bindings.is_empty() && s.session.doc.project.curves.is_empty(),
+                "curve and binding undo together");
+        // A clip in no group is refused, and said.
+        s.selection = vec![studio_core::ClipId(3)];
+        s.edit(Op::RemoveGroup { id: gid }, "ungroup");
+        s.new_curve_on_group(None);
+        assert!(s.status.contains("in no group"), "{}", s.status);
+        assert!(s.session.doc.project.bindings.is_empty());
     }
 
     #[test]

@@ -234,6 +234,8 @@ impl Crush {
             phase: 1.0,
         }
     }
+    /// Live: the level count is used per held sample, so it moves freely.
+    pub fn set_bits(&mut self, bits: u8) { self.levels = 2f32.powi(bits.clamp(1, 16) as i32) - 1.0; }
     pub fn process(&mut self, x: f32) -> f32 {
         self.phase += self.hold;
         if self.phase >= 1.0 {
@@ -274,6 +276,8 @@ impl Gate {
             release: (-1.0 / ((release_ms.max(1.0) / 1000.0) * rate)).exp(),
         }
     }
+    /// Live: the threshold is a comparison, so it moves without a click.
+    pub fn set_threshold_db(&mut self, db: f32) { self.thresh = 10f32.powf(db / 20.0); }
     pub fn is_open(&self) -> bool {
         self.open
     }

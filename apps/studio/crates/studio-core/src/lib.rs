@@ -45,6 +45,7 @@ pub use curves::{Binding, Curve, Gate, Opening, Sweep};
 mod batch;
 mod room;
 pub use room::{Overlap, LANE_SUFFIX};
+mod takes;
 
 /// A point or duration on the project timebase, in ticks.
 ///
@@ -295,6 +296,23 @@ impl Key {
     pub fn name(&self) -> String {
         format!("{} {}", PITCH_NAMES[(self.root % 12) as usize], self.scale.name())
     }
+    /// The roll key `steps` SCALE degrees away from `key` — up for
+    /// positive, down for negative. A third is 2 degrees, a fifth 4, an
+    /// octave the scale's length. A key that is not in the scale steps
+    /// from the nearest scale note below it, so an out-of-key note still
+    /// harmonizes to something in the key rather than nothing.
+    pub fn scale_step(&self, key: i8, steps: i32) -> i8 {
+        let degrees = self.scale.degrees();
+        let n = degrees.len() as i32;
+        let pc = (key_midi(key) - self.root as i32).rem_euclid(12) as u8;
+        // Degree index of the note, or of the nearest scale note below.
+        let idx = degrees.iter().rposition(|&d| d <= pc).unwrap_or(0) as i32;
+        let base = key as i32 - (pc as i32 - degrees[idx as usize] as i32);
+        let target = idx + steps;
+        let octaves = target.div_euclid(n);
+        let deg = degrees[target.rem_euclid(n) as usize] as i32;
+        (base + octaves * 12 + (deg - degrees[idx as usize] as i32)).clamp(i8::MIN as i32, i8::MAX as i32) as i8
+    }
 }
 
 /// A named point on the timeline.
@@ -327,13 +345,59 @@ pub struct Group {
     pub tempo: Option<TempoMap>,
 }
 
+/// An effect parameter's key, fixed-width so an [`AutoTarget`] stays
+/// `Copy` and an op stays fixed-shape on the wire: up to 16 ASCII bytes,
+/// NUL-padded. Every key `studio-fx`'s schema declares fits (the longest,
+/// `preserve_pitch`, is 14); one that does not is refused at construction
+/// rather than truncated into a different key.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ParamKey(pub [u8; 16]);
+
+impl ParamKey {
+    pub fn new(key: &str) -> Option<ParamKey> {
+        let b = key.as_bytes();
+        if b.is_empty() || b.len() > 16 || !b.iter().all(|c| c.is_ascii() && *c != 0) { return None; }
+        let mut k = [0u8; 16];
+        k[..b.len()].copy_from_slice(b);
+        Some(ParamKey(k))
+    }
+    pub fn as_str(&self) -> &str {
+        let n = self.0.iter().position(|&c| c == 0).unwrap_or(16);
+        std::str::from_utf8(&self.0[..n]).unwrap_or("")
+    }
+}
+
+impl std::fmt::Debug for ParamKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "ParamKey({:?})", self.as_str()) }
+}
+impl std::fmt::Display for ParamKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.as_str()) }
+}
+
 /// What an automation lane drives. Track and bus gain first — the volume
-/// ride is the automation everyone reaches for — with the enum here so a
-/// clip-gain or effect-parameter target is a variant away, not a redesign.
+/// ride is the automation everyone reaches for — and now an effect
+/// parameter on a bus's or a clip's chain, addressed by the effect's
+/// index in that chain and the parameter's key.
+///
+/// A parameter lane follows the fader rule: the value the effect runs
+/// with is `stored × lane × Π(bindings)`, so 1.0 is transparent and a
+/// curve is a ride on top of whatever the knob says — a filter sweep is
+/// a cutoff at 1 kHz and a curve from 0.1 to 8. The render applies it at
+/// control rate (a block of frames, not each sample) through
+/// `studio_fx::Instance::set_param`, which changes only what an effect
+/// can change without losing its state; a key it cannot move live is
+/// ignored, and the schema says which those are.
+///
+/// The index, not an effect id: effects have none — a chain is a Vec and
+/// `SetBusChain` replaces it whole — so a lane on `effect: 1` follows
+/// whatever sits second. Reordering the chain moves the ride, the same
+/// way deleting a clip leaves a binding dangling and harmless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AutoTarget {
     TrackGain(TrackId),
     BusGain(BusId),
+    BusParam { bus: BusId, effect: u8, key: ParamKey },
+    ClipParam { clip: ClipId, effect: u8, key: ParamKey },
 }
 
 /// A lane's value at `at`: linear between points, held flat before the
@@ -677,6 +741,9 @@ pub enum EditError {
     NoSuchBinding(BindingId),
     /// A `Gate::Window` whose end is not after its start can never open.
     EmptyWindow,
+    /// A comp span that no single take on `lane` covers whole — see
+    /// `Project::comp_ops`.
+    NoTakeOver { lane: TrackId, from: Ticks, to: Ticks },
 }
 
 impl Project {
@@ -690,8 +757,15 @@ impl Project {
     fn check_auto_target(&self, target: AutoTarget) -> Result<(), EditError> {
         match target {
             AutoTarget::TrackGain(id) => self.check_track(id),
-            AutoTarget::BusGain(id) => {
+            AutoTarget::BusGain(id) | AutoTarget::BusParam { bus: id, .. } => {
+                // The bus must exist; the effect index need not, yet — a
+                // lane may be drawn before the chain is built, the same
+                // way a binding may outlive its clip.
                 if self.busses.contains_key(&id) { Ok(()) } else { Err(EditError::NoSuchBus(id)) }
+            }
+            AutoTarget::ClipParam { clip, .. } => {
+                let c = self.clips.get(&clip).ok_or(EditError::NoSuchClip(clip))?;
+                self.check_track(c.track)
             }
         }
     }
@@ -823,6 +897,7 @@ impl Project {
                     Gate::Always => {}
                     Gate::Clip(c) => { if !self.clips.contains_key(&c) { return Err(EditError::NoSuchClip(c)); } }
                     Gate::Window { start, end } => { if end <= start { return Err(EditError::EmptyWindow); } }
+                    Gate::Group(g) => { if !self.groups.contains_key(&g) { return Err(EditError::NoSuchGroup(g)); } }
                 }
                 let inv = match self.bindings.insert(*id, *binding) {
                     Some(old) => Op::SetBinding { id: *id, binding: old },
@@ -2234,6 +2309,25 @@ mod key_and_marker_tests {
         assert_eq!(note_label(51), "C6", "midi 84 — the octave boundary, not a sharp");
         assert_eq!(note_label(52), "C#6");
         assert_eq!(note_label(48), "A5");
+    }
+
+    #[test]
+    fn a_scale_step_walks_the_degrees_and_an_out_of_key_note_snaps_below() {
+        // Roll key 0 is A1; in C major, C is key 3 (A, A#, B, C).
+        let c_major = Key { root: 0, scale: Scale::Major };
+        let c = 3i8;
+        assert_eq!(c_major.scale_step(c, 2), c + 4, "a third above C is E");
+        assert_eq!(c_major.scale_step(c, 4), c + 7, "a fifth above C is G");
+        assert_eq!(c_major.scale_step(c, 7), c + 12, "seven degrees is the octave");
+        assert_eq!(c_major.scale_step(c + 11, 2), c + 14, "a third above B wraps: D");
+        assert_eq!(c_major.scale_step(c + 4, -2), c, "a third below E is C");
+        assert_eq!(c_major.scale_step(c, -1), c - 1, "a step below C is B");
+        assert_eq!(c_major.scale_step(c + 1, 2), c + 4, "C# is not in C major: steps from C, to E");
+        let a_minor = Key { root: 9, scale: Scale::Minor };
+        assert_eq!(a_minor.scale_step(0, 2), 3, "a third above A in A minor is C");
+        assert_eq!(a_minor.scale_step(0, 4), 7, "a fifth above A is E");
+        let chromatic = Key { root: 0, scale: Scale::Chromatic };
+        assert_eq!(chromatic.scale_step(5, 4), 9, "chromatic: a degree is a semitone");
     }
 
     #[test]

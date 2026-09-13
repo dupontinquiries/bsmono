@@ -126,6 +126,8 @@ pub const KINDS: &[(&str, &str)] = &[
     ("crush", "bit crusher"),
     ("tapestop", "tape stop"),
     ("halftime", "half-time"),
+    ("reverb", "room: size, damping, predelay, width"),
+    ("delay", "echo: time, feedback, damping, ping-pong"),
     ("transform", "position, scale, rotation, opacity (video)"),
     ("color", "lift / gamma / gain / saturation (video)"),
     ("retime", "speed ramp (video)"),
@@ -198,6 +200,22 @@ pub fn schema(kind: &str) -> Option<Vec<ParamSpec>> {
             f("length", "length", 0.05, 10.0, "s", 1.0),
         ],
         "halftime" => vec![f("window", "window", 0.05, 2.0, "s", 0.5)],
+        "reverb" => vec![
+            f("size", "size", 0.0, 1.0, "", 0.5),
+            f("damp", "damping", 0.0, 1.0, "", 0.4),
+            f("predelay", "predelay", 0.0, 200.0, "ms", 10.0),
+            f("width", "width", 0.0, 1.0, "", 1.0),
+            f("mix", "mix", 0.0, 1.0, "%", 0.3),
+        ],
+        "delay" => vec![
+            // 321.4 ms is the dotted eighth at 140 BPM — the trap default;
+            // the shell's sync verb rewrites it from the project tempo.
+            f("time", "time", 1.0, 2000.0, "ms", 321.4),
+            f("feedback", "feedback", 0.0, 0.98, "%", 0.4),
+            f("damp", "damping", 200.0, 20000.0, "Hz", 5000.0),
+            b("pingpong", "ping-pong", false),
+            f("mix", "mix", 0.0, 1.0, "%", 0.3),
+        ],
         "transform" => vec![
             f("x", "x", -1.0, 1.0, "", 0.0), f("y", "y", -1.0, 1.0, "", 0.0),
             f("scale_x", "scale x", 0.01, 4.0, "x", 1.0), f("scale_y", "scale y", 0.01, 4.0, "x", 1.0),
@@ -345,7 +363,10 @@ mod tests {
 
     #[test]
     fn an_unknown_kind_has_no_schema_rather_than_a_wrong_one() {
-        assert!(schema("reverb").is_none());
-        assert!(expand(&studio_core::Effect { kind: "reverb".into(), params: BTreeMap::new(), enabled: true }).is_none());
+        // This test's example used to be "reverb" — which then got built.
+        // A name no build will ever register, so the claim stays true.
+        assert!(schema("no-such-effect").is_none());
+        assert!(expand(&studio_core::Effect { kind: "no-such-effect".into(), params: BTreeMap::new(), enabled: true }).is_none());
+        assert!(schema("reverb").is_some(), "and the one that used to stand in for unknown is known now");
     }
 }
