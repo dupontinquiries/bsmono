@@ -151,7 +151,12 @@ fatal-looking error while the Ubuntu repos have in fact updated. Read past it
   builds); 43 s cold, ~8 s warm. Bin wiring is verifiable here.
 * `cargo test -p unendlich-engine --lib --profile sandboxtest --no-run` —
   the process died silently during the engine test crate's codegen (no
-  error in the log, no binary). Do not plan on it. Pure modules run with
+  error in the log, no binary). Do not plan on it.
+* BUT `cargo build -p unendlich-engine --lib --profile sandboxtest` —
+  Finished in 1m30s, and `cargo build --example rig_dump` links against
+  it (~1m27s cold, <1 s warm). Engine-coupled checks can run as
+  `assert!`s in an example (see `examples/rig_dump.rs`, run by
+  `harness/rig/run.sh`). The limit is the TEST crate specifically. Pure modules run with
   `harness/pure_test.sh`; composed pure modules with a `#[path]` shim
   (`games/unendlich/harness/rig/run.sh` compiles 138 tests in ~3 s).
 * Background jobs: a plain `nohup … &` dies with the tool call; use the

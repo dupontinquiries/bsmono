@@ -33,6 +33,9 @@ tested; what remains is bin/render integration.
 - ◐ `SIM` **Circadian rest cycle** — `rest_urge` now feeds the arbiter's `fatigue` (was 0.0 since r269); `wants_rest` sets `RoamerRig.resting` → `settle` eases → the rig beds the creature down. STILL OPEN: `chill` from local temperature (rain only today). *(needs ATMO temp — see deps)*
 - ⟶ `SIM` **Dragon/large-body sensing & pathing** — wire `body_scale::BodyScale` + `collision_probe::coarsened` into the large-creature tick (size-aware *lean* already wired).
 - ⟶ `SIM` **Stamina + sprint** — wire the speed multiplier into the roamer movement tick.
+- ✅ `SIM` **Creature-vs-creature melee** — DONE (c16): `sim::melee` strike loop, wired for the Dinosaur hunt (bite lands on the lunge peak; prey takes damage/knockback/flinch; lethal → ragdoll).
+- ✅ `SIM` **Legendary weapon abilities** — DONE (c16): `sim::weapon_ability` — every `ProcKind` fires from the equipped weapon; statuses on `RoamerRig.status`. OPEN: player-facing feedback (a burn/chill icon on the target, a proc log line in the HUD); a serpent spine wave in `anim_rig` so `Arche::Serpent` can join `FAUNA_ARCHES`.
+- ◐ `UI` **Mobile Linux** — `mobile_ui` detection + touch controls wired (c16). OPEN: verify on a device (Phosh drag ordering, button radius), a settings toggle for touch mode, pinch-zoom for the inventory.
 - ⟶ `SIM` **Eased turning** — wire `turning::ease_yaw` into the roamer heading update. NOTE (c16): `turn_toward`/`wander_turn` already rate-cap yaw, so this is a second-order refinement, not a snap fix.
 - ⟶ `SIM` **Surface cache + cadence** — wire to cut redundant surface probing (perf lever).
 - ⟶ `WORLD` **Plant genome storage + growth-tick** — wild = `from_seed` (free); bred/tended = sparse sidecar by block-index; growth tick uses `rate_mul`, caps at `target_height`. *Open Q: per-block / per-cluster / per-mother-tree.*

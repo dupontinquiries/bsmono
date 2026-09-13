@@ -21,6 +21,21 @@ Last refreshed: v0.20.0.
   the fullgame bin (ui-overlay) in the sandbox; NOT verified running. Found:
   roamers never wrote `body.velocity`, so the old mesher's leg swing had
   amplitude 0 — that was the sliding.
+- **c16 rig session, part 2:** legendary weapons — each of the 8
+  `WeaponClass`es has its own model (`Greatsword`, `Greataxe`, `Wand` added)
+  and every element's proc is an ability (`sim::weapon_ability`: frost nova,
+  water jet, gale cut, stone spikes, flame wave, lightning arc) fired from
+  the EQUIPPED weapon on hit, with burn/chill/stagger statuses ticking on
+  roamers. Fauna hatch from the design layer (`spawn::FAUNA_ARCHES`:
+  quadruped/critter/canid/bird/heavy), posed by the rig with real roles and
+  sketch colours; forge dragons topple on death. Mobile Linux: `mobile_ui`
+  detects phone/scale (Phosh etc., portrait framebuffers, env overrides),
+  the mouse-emulated finger drives `touch_controls` (stick left, look
+  right) with on-screen buttons bound to the real actions, HUD overlay.
+  `examples/rig_dump.rs` runs the engine-coupled checks on the REAL lib
+  (the sandbox builds `--lib`; only the test crate dies) and dumps every
+  archetype for the viewer. All compile-checked (lib + fullgame bin); not
+  run on a device.
 
 * **Library compiles clean** under all four feature combos.
 * **All 478 unit tests pass** (`cargo test --features render --features gpu --lib`).
