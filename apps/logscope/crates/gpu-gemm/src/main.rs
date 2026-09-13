@@ -6026,6 +6026,55 @@ still pass, which is why this one exists."
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-rope-kv") {
+        // ROPE_KV_APPEND / QKNORM_ROPE_KV_APPEND == the rope-then-copy path, bit-exact, on the
+        // app's decode route (prefill_chunked, then decode_step per token). Compares every
+        // token's logits AND every layer's K/V cache rows, because a wrong-row write would leave
+        // this token's logits intact and only poison later ones. Runs both a llama-shaped and a
+        // QK-norm fixture so both kernels are exercised; a missing fixture is a FAIL, not a skip.
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let gpu = Gpu::new();
+        eprintln!("gate-rope-kv: adapter = {}", gpu.adapter_name);
+        for (path, gen) in [("/tmp/tiny-qwen2.gguf", "python3 tools/make-tiny-gguf.py /tmp/tiny-qwen2.gguf"),
+                            ("/tmp/tiny-qwen3.gguf", "python3 tools/make-tiny-gguf.py /tmp/tiny-qwen3.gguf qwen3")] {
+            let Ok(bytes) = std::fs::read(path) else { ck(&format!("{path} present (generate: {gen})"), false); continue };
+            let m = gpu.load_gguf_opt(&bytes, true).expect("load");
+            let prompt: Vec<u32> = (0..12u32).map(|i| 1 + (i * 7919) % (m.vocab as u32 - 2)).collect();
+            let n_tok = 6usize;
+            let run = |fused: bool| -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+                gpu_kernels::set_rope_kv_append(Some(fused));
+                let c = gpu.new_cache(m.n_layers, prompt.len() + n_tok + 2, m.kv_dim());
+                let mut logits = gpu.prefill_chunked(&m, &c, &prompt, 512);
+                let mut all = Vec::new();
+                for t in 0..n_tok {
+                    // A fixed token stream, not argmax, so a divergence cannot change the input.
+                    let next = prompt[(t * 5) % prompt.len()];
+                    logits = gpu.decode_step(&m, &c, next, prompt.len() + t);
+                    all.push(logits.clone());
+                }
+                gpu.end_frame();
+                let ks: Vec<Vec<f32>> = c.k.iter().map(|t| gpu.download(t)).collect();
+                let vs: Vec<Vec<f32>> = c.v.iter().map(|t| gpu.download(t)).collect();
+                (all, ks, vs)
+            };
+            let (la, ka, va) = run(false);
+            let (lb, kb, vb) = run(true);
+            gpu_kernels::set_rope_kv_append(None);
+            let rows = prompt.len() + n_tok; let kv = m.kv_dim();
+            let same_rows = |a: &Vec<Vec<f32>>, b: &Vec<Vec<f32>>| a.iter().zip(b).all(|(x, y)| x[..rows * kv] == y[..rows * kv]);
+            let name = path.rsplit('/').next().unwrap_or(path);
+            ck(&format!("{name}: {n_tok} decode steps, logits bit-identical fused vs copy path"), la == lb);
+            ck(&format!("{name}: K cache rows bit-identical ({} layers x {rows} rows)", m.n_layers), same_rows(&ka, &kb));
+            ck(&format!("{name}: V cache rows bit-identical"), same_rows(&va, &vb));
+            // The rows the decode steps wrote must differ from zero — a kernel that writes nothing
+            // and a copy path that writes nothing would agree perfectly.
+            let touched = kb.iter().all(|k| k[prompt.len() * kv..rows * kv].iter().any(|&x| x != 0.0));
+            ck(&format!("{name}: the decode-written K rows are non-zero (the kernel wrote them)"), touched);
+        }
+        println!("gate-rope-kv: {}", if ok { "fused rope+KV-append is bit-exact vs rope+copies \u{2713}" } else { "FAIL \u{2717}" });
+        if !ok { std::process::exit(1); }
+        return;
+    }
     if args.iter().any(|a| a == "--gate-swa") {
         // A windowed KV view must give exactly the answer attention would give over a cache containing
         // only those rows. If it does not, the view offset or length is wrong — and the symptom would be
@@ -6140,7 +6189,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-gemma4-altv  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-gemma4-altv  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rope-kv  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }

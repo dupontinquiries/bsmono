@@ -61,6 +61,14 @@ pub const LEVERS: &[Lever] = &[
     Lever { var: "LOGSCOPE_FUSED_QKV", default: Default_::On, platform: Platform::Any,
         validated_by: Some("--gate-qkv (per-projection green; end-to-end check RED, unresolved)"),
         why: "one dispatch instead of three for Q/K/V; bit-exact, so there is no reason to withhold it" },
+    Lever { var: "LOGSCOPE_ROPE_KV_APPEND", default: Default_::On, platform: Platform::Any,
+        validated_by: Some("--gate-rope-kv (logits AND every K/V cache row bit-exact vs the rope+copy path, \
+llama-shaped and QK-norm fixtures; three deliberate kernel breaks caught)"),
+        why: "rope q, and write roped k and raw v straight into this token's cache rows, in ONE dispatch: \
+it replaces one dispatch and five buffer copies per layer on the f32-KV decode path (three on the QK-norm \
+path). Same rotation math, so the values are identical; only the destinations change. Copies matter \
+because Honeykrisp has no blit engine — each is a compute job — and because every copy drains the \
+pass-fusion queue, which is why fusion could not get a token below 5 passes before this" },
     Lever { var: "LOGSCOPE_FUSE_NORM", default: Default_::On, platform: Platform::Any,
         validated_by: Some("--gate-matvec"),
         why: "folds the norm into the following matvec in the m=1 decode case; bit-exact" },

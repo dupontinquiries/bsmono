@@ -1323,6 +1323,25 @@ fn env_decode_tile() -> Option<u32> {
 fn fused_qkv_enabled() -> bool {
     std::env::var("LOGSCOPE_FUSED_QKV").as_deref() != Ok("0")
 }
+/// ROPE_KV_APPEND on the f32-KV decode path: rope q, and write roped k and raw v straight into
+/// this token's cache rows, in ONE dispatch — replacing ROPE_MH plus five buffer copies per layer
+/// (decode-census: 6 dispatches + 5 copies -> 6 dispatches + 0). Same rotation math, so the
+/// values are bit-identical; only the destinations change. Default ON, LOGSCOPE_ROPE_KV_APPEND=0
+/// restores the copy path. `--gate-rope-kv` and `rope_kv_append_is_bit_exact` prove it.
+///
+/// The override exists for the gate: the env is read once, and an A/B needs both paths in one
+/// process on one model. 0 = follow the env, 1 = forced off, 2 = forced on.
+static ROPE_KV_APPEND_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub fn set_rope_kv_append(on: Option<bool>) {
+    ROPE_KV_APPEND_OVERRIDE.store(match on { None => 0, Some(false) => 1, Some(true) => 2 },
+        std::sync::atomic::Ordering::Relaxed);
+}
+fn rope_kv_append_enabled() -> bool {
+    match ROPE_KV_APPEND_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false, 2 => true,
+        _ => std::env::var("LOGSCOPE_ROPE_KV_APPEND").as_deref() != Ok("0"),
+    }
+}
 /// Bind-group caching in dispatch_with. OPT-IN (default off) while it proves out on hardware: reuses the
 /// bind group for a repeated (pipeline, buffers, dims) instead of recreating it per dispatch — targets the
 /// Asahi dispatch-bound (CPU command-setup) cost. LOGSCOPE_BG_CACHE=1 enables. Bit-identical either way.
@@ -6772,6 +6791,21 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                     pos as u32, neox, eps.to_bits(), msc];
         self.dispatch(QKNORM_ROPE, &[qkv, qn, kn, ff], &out, bytemuck::cast_slice(&dims),
                       ((n_heads + n_kv_heads) as u32, 1, 1));
+        out
+    }
+
+    /// qknorm_rope_fused with the cache rows as destinations: q → [1, ad]; normed+roped k →
+    /// `kc` row `pos`; raw v → `vc` row `pos`. One dispatch instead of one dispatch + 3 copies.
+    fn qknorm_rope_kv_append(&self, qkv: &Tensor, qn: &Tensor, kn: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor,
+                             n_heads: usize, n_kv_heads: usize, hd: usize, base: f32, pos: usize, eps: f32) -> Tensor {
+        let ad = n_heads * hd; let kv = n_kv_heads * hd;
+        let out = self.alloc(1, ad);
+        let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
+        let dims = [n_heads as u32, n_kv_heads as u32, hd as u32, base.to_bits(),
+                    pos as u32, neox, eps.to_bits(), msc, kv as u32, 0u32, 0u32, 0u32];
+        self.dispatch_rw(QKNORM_ROPE_KV_APPEND, &[qkv, qn, kn, ff, kc, vc], 4, &out, bytemuck::cast_slice(&dims),
+                         ((n_heads + 2 * n_kv_heads) as u32, 1, 1));
         out
     }
 
@@ -13398,6 +13432,8 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 // Per-row-position RoPE: like ROPE_MH but each row reads its own absolute position
 // from `pos[row]` instead of pos0+row. Needed for batched decode, where the N rows
 // are N different sessions at N different positions.
+const ROPE_KV_APPEND: &str = include_str!("kernels/rope_kv_append.wgsl");
+const QKNORM_ROPE_KV_APPEND: &str = include_str!("kernels/qknorm_rope_kv_append.wgsl");
 const ROPE_MH_ROWS: &str = r#"
 // ROPE_MH_ROWS
 struct D { t:u32,dm:u32,base:f32,_p:u32,hd:u32,neox:u32,msc:f32,_c:u32 };
@@ -14915,6 +14951,26 @@ impl Gpu {
         self.dispatch(ROPE_MH, &[x, ff], &out, bytemuck::cast_slice(&dims), wg1((t * dm / 2) as u32)); out
     }
 
+    /// One decode token: rope the q heads of `qkv` into a fresh [1, ad], rope the k heads straight
+    /// into `kc` row `pos`, and copy the v heads straight into `vc` row `pos`. One dispatch for what
+    /// block_decode_fused spent one dispatch and five copies on (see ROPE_KV_APPEND's header).
+    /// Bit-identical to rope_mh_t + the copies; NoPE (base == 0) is the identity, as before.
+    fn rope_kv_append(&self, qkv: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize,
+                      ad: usize, kv: usize, hd: usize, base: f32) -> Tensor {
+        let q = self.alloc(1, ad);
+        let dm = ad + kv;
+        let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
+        let rot = { let r = self.rope_dims.load(std::sync::atomic::Ordering::Relaxed); if r == 0 { hd as u32 } else { r.min(hd as u32) } };
+        let nope = (base == 0.0) as u32;
+        let dims = [1u32, dm as u32, base.to_bits(), pos as u32, hd as u32, neox, msc, 0u32, rot,
+                    ad as u32, kv as u32, nope];
+        // (ad+kv)/2 rotation pairs, then kv/2 two-lane v copies.
+        let threads = ((dm / 2) + (kv / 2)) as u32;
+        self.dispatch_rw(ROPE_KV_APPEND, &[qkv, ff, kc, vc], 2, &q, bytemuck::cast_slice(&dims), wg1(threads));
+        q
+    }
+
     /// rope_mh_t with a per-sequence position wrap: row's position = pos0 + row % sl.
     /// For BATCHED canvases (B sequences of length sl concatenated). sl==0 = plain rope_mh_t.
     pub fn rope_mh_t_sl(&self, x: &Tensor, ff: &Tensor, t: usize, dm: usize, base: f32, pos0: usize, head_dim: usize, sl: usize) -> Tensor {
@@ -16153,14 +16209,22 @@ sequence.");
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         // Fused norm→QKV: RMSNorm(x) folds into the wqkv matvec (one dispatch instead of two).
         let qkv = w.wqkv.norm_apply(self, x, &w.g1, d, eps, 1);            // [1, ad+2kv]
-        let (q, kr) = if let (Some(qnw), Some(knw)) = (&w.q_norm, &w.k_norm) {
+        // Every branch writes this token's roped k into `kc` row `pos`; the fused one writes v too.
+        let mut v_in_cache = false;
+        let q = if let (Some(qnw), Some(knw)) = (&w.q_norm, &w.k_norm) {
+            if rope_kv_append_enabled() && w.v_norm.is_none() && base != 0.0 {
+                // The same fusion with the cache rows as destinations — the slice-q, k→cache and
+                // v→cache copies go away. NoPE and Gemma's v_norm keep the copy path below.
+                v_in_cache = true;
+                self.qknorm_rope_kv_append(&qkv, qnw, knw, ff, kc, vc, n_heads, n_kv_heads, hd, base, pos, eps)
+            } else {
             // Qwen3/3.5 QK-Norm: FUSED norm+rope — one dispatch replaces the old 4-chain
             // (norm q → norm k → rope q → rope k); output layout identical (q ‖ k).
             let qk = self.qknorm_rope_fused(&qkv, qnw, knw, ff, n_heads, n_kv_heads, hd, base, pos, eps);
             let qr = self.slice_cols(&qk, 0, ad);
-            let kr = self.slice_cols(&qk, ad, kv);
-            self.write_row(kc, &kr, pos, kv);
-            (qr, kr)
+            self.copy_buf(&qk, (ad * 4) as u64, kc, (pos * kv * 4) as u64, (kv * 4) as u64);   // roped k → K-cache row
+            qr
+            }
         } else if w.q_norm.is_some() || w.k_norm.is_some() {
             // single-sided norm (no known arch does this) — keep the unfused chain for correctness
             let qn = self.qk_norm(self.slice_cols(&qkv, 0, ad), &w.q_norm, 1, ad, hd, eps);
@@ -16168,15 +16232,21 @@ sequence.");
             let qr = self.rope_mh_t(&qn, ff, 1, ad, base, pos, hd);
             let kr = self.rope_mh_t(&kn, ff, 1, kv, base, pos, hd);
             self.write_row(kc, &kr, pos, kv);
-            (qr, kr)
+            qr
+        } else if rope_kv_append_enabled() && w.v_norm.is_none() {
+            // ONE dispatch: rope q → q, rope k → kc[pos], v → vc[pos]. What it replaces: the
+            // slice(q|k) copy, ROPE_MH, the slice-q copy, the k→cache copy, a slice-k copy whose
+            // result nothing read, and the v→cache copy below — one dispatch and five copies,
+            // each copy a compute job on Honeykrisp and a pass-fusion drain everywhere.
+            v_in_cache = true;
+            self.rope_kv_append(&qkv, ff, kc, vc, pos, ad, kv, hd, base)
         } else {
             // RoPE q and k in one pass: [0,ad)=q heads, [ad,ad+kv)=k heads are contiguous and head-aligned.
             let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, ad + kv), ff, 1, ad + kv, base, pos, hd);
             let q = self.slice_cols(&qk, 0, ad);
             self.copy_buf(&qk, (ad * 4) as u64, kc, (pos * kv * 4) as u64, (kv * 4) as u64);   // roped k → K-cache row
-            (q, self.slice_cols(&qk, ad, kv))
+            q
         };
-        let _ = &kr; // k already written to cache above in both branches
         // Gemma 4 V handling: normed (and possibly k-sourced) V goes through write_row; the raw
         // copy_buf below is the every-other-family path. The k slice of `qkv` is the RAW
         // projection — qknorm_rope_fused produced a NEW tensor above, so this reads pre-norm k.
@@ -16187,6 +16257,7 @@ sequence.");
                 let vn = self.v_norm_apply(&vsrc, ones, 1, kv, hd, eps);
                 self.write_row(vc, &vn, pos, kv);
             }
+            None if v_in_cache => {}
             None => self.copy_buf(&qkv, ((ad + kv) * 4) as u64, vc, (pos * kv * 4) as u64, (kv * 4) as u64), // v → V-cache row
         }
         // Llama 4 iRoPE attention temperature on NoPE layers past the floor (see block_decode).
