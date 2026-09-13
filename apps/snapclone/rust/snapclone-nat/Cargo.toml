@@ -10,10 +10,13 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 anyhow     = "1"
-tokio      = { version = "1", features = ["net", "time", "rt", "macros", "sync"] }
+tokio      = { version = "1", features = ["net", "time", "rt", "macros", "sync", "io-util"] }
 tracing    = "0.1"
 rand       = "0.8"
 bytes      = "1"
+# SO_REUSEADDR on the punch socket — the C++ `ShareAddress` — so TCP can bind
+# the same port for the post-punch connect. std's UdpSocket exposes no setter.
+socket2    = "0.5"
 
 [features]
 default = []

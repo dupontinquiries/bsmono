@@ -18,6 +18,17 @@ rayon = "1.8"
 clap = { version = "4.4", features = ["derive"] }
 anyhow = "1.0"
 indicatif = "0.17"
+# Wire-format-only DHT primitives (InfoHash, Value, msgpack Msg framing) —
+# no transport, no routing table, no engine. See `peers.rs` for why this is
+# as far up the fleet's DHT stack as this crate reaches for now.
+dht-kit = { path = "../../shared/dht-kit" }
+# The anti-entropy engine (Merkle DAG + have/want sync + delivery tracking)
+# built for snapclone's ephemeral group snaps, reused here for something it
+# was never written for: syncing durable photo chunks between a pair of
+# devices. See `chunk_sync.rs` for what's borrowed and what deliberately
+# isn't (the DHT-TTL-backed storage half stays snapclone's; photosync's
+# chunk bytes live in `PhotoSyncDB`'s block store, which does not expire).
+snapclone-group = { path = "../../apps/snapclone/rust/snapclone-group" }
 walkdir = "2.4"
 notify = "6.1"
 

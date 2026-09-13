@@ -306,6 +306,7 @@ impl Bind {
 pub enum Scheme {
     Classic,
     Dvorak,
+    DvorakEsdf,
     Custom,
 }
 
@@ -314,6 +315,7 @@ impl Scheme {
         match self {
             Scheme::Classic => "QWERTY (WASD)",
             Scheme::Dvorak => "DVORAK (,AOE)",
+            Scheme::DvorakEsdf => "DVORAK (.OEU)",
             Scheme::Custom => "CUSTOM",
         }
     }
@@ -373,10 +375,41 @@ impl Bindings {
         b
     }
 
+    /// Dvorak, ESDF grip: the one-column-right alternate a lot of players
+    /// use for the extra keys it opens up to the left hand. `,aoe` (above)
+    /// is WASD's physical row on a Dvorak keyboard; this is ESDF's — same
+    /// idea, one row over. QWERTY E/S/D/F sit under Dvorak `.`/`o`/`e`/`u`,
+    /// so that's forward/left/back/right here. It can't just add those as
+    /// extra binds alongside `dvorak()`'s `o`/`e` — ESDF's left and back
+    /// land on the exact keys `,aoe` uses for back and right, so holding
+    /// one would silently trigger a direction from the other scheme. Two
+    /// schemes, not one scheme with doubled-up binds.
+    pub fn dvorak_esdf() -> Bindings {
+        let mut b = Bindings::classic();
+        let set = |b: &mut Bindings, a: Action, v: Vec<Bind>| b.replace_kbm(a, v);
+        set(&mut b, Action::Forward, vec![ch("."), Bind::Named(Named::ArrowUp)]);
+        set(&mut b, Action::Left, vec![ch("o"), Bind::Named(Named::ArrowLeft)]);
+        set(&mut b, Action::Back, vec![ch("e"), Bind::Named(Named::ArrowDown)]);
+        set(&mut b, Action::Right, vec![ch("u"), Bind::Named(Named::ArrowRight)]);
+        // Abilities keep `dvorak()`'s layout, except Ability2's letter alt
+        // (`.`) is now Forward — it keeps its number key, same as every
+        // other action does, rather than fighting over the same key.
+        set(&mut b, Action::Ability1, vec![ch("'"), ch("1")]);
+        set(&mut b, Action::Ability2, vec![ch("2")]);
+        set(&mut b, Action::Ability3, vec![ch("p"), ch("3")]);
+        set(&mut b, Action::Ability4, vec![ch("y"), ch("4")]);
+        set(&mut b, Action::Shop, vec![ch("x")]);
+        set(&mut b, Action::Scoreboard, vec![Bind::Named(Named::Tab), ch("j")]);
+        set(&mut b, Action::Recenter, vec![ch("q")]);
+        b.scheme = Scheme::DvorakEsdf;
+        b
+    }
+
     pub fn for_scheme(s: Scheme) -> Bindings {
         match s {
             Scheme::Classic | Scheme::Custom => Bindings::classic(),
             Scheme::Dvorak => Bindings::dvorak(),
+            Scheme::DvorakEsdf => Bindings::dvorak_esdf(),
         }
     }
 
@@ -445,6 +478,7 @@ impl Bindings {
         let _ = writeln!(out, "scheme {}", match self.scheme {
             Scheme::Classic => "classic",
             Scheme::Dvorak => "dvorak",
+            Scheme::DvorakEsdf => "dvorak_esdf",
             Scheme::Custom => "custom",
         });
         for (a, v) in &self.map {
@@ -457,6 +491,7 @@ impl Bindings {
             "scheme" => {
                 self.scheme = match rest.trim() {
                     "dvorak" => Scheme::Dvorak,
+                    "dvorak_esdf" => Scheme::DvorakEsdf,
                     "custom" => Scheme::Custom,
                     _ => Scheme::Classic,
                 };

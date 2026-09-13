@@ -822,7 +822,7 @@ pub fn draw_controls(ctx: &egui::Context, cfg: &mut crate::input::Config, captur
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Scheme").size(13.0).color(Color32::from_rgb(170, 168, 158)));
-                for sc in [Scheme::Classic, Scheme::Dvorak] {
+                for sc in [Scheme::Classic, Scheme::Dvorak, Scheme::DvorakEsdf] {
                     let sel = cfg.bindings.scheme == sc;
                     if ui.selectable_label(sel, sc.name()).clicked() && !sel {
                         out.scheme = Some(sc);

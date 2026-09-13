@@ -5284,6 +5284,41 @@ If a bug seems new, check the relevant `Q_LOGGING_CATEGORY` first
 through specific log channels and `journalctl --user -t SnapClone`
 filtering by category narrows things down fast.
 
+### Networking: NAT rewrite + a build-breaking OpenDHT link bug (this session)
+
+Two things, both device-unverified — see `maintenance/C19_TODO.md` for the
+full account.
+
+1. **`rust/snapclone-nat` rewritten around one shared punch socket.** The
+   crate existed but had a real bug: `discover()` and `punch()` each bound
+   their own `UdpSocket` on the same configured port instead of sharing one,
+   which breaks hole-punching against anything but the most permissive NAT
+   (the punch has to leave from the exact port STUN mapped). Also wrote the
+   `ffi.rs` the crate's own `lib.rs` had declared behind `feature = "ffi"`
+   since it was first scaffolded — that file never existed, so the feature
+   failed to compile and nothing in the Qt app could reach this crate at
+   all. Ported faithfully from `NatTraversal.cpp`: tested timing constants
+   (60×150ms burst, 20s maintenance, 4s STUN timeout, 25s CGNAT keepalive),
+   the wire-compatible punch payload (`SNAPCLONE_PUNCH_V1\n<sc-id>` — the
+   old scaffold sent a bare zero byte and could never have talked to a real
+   Qt peer), and all three self-punch guards (loopback, self-id,
+   self-reflexive — the same-CGNAT hairpin case). 24 unit tests pass,
+   including a real two-peer punch exchange over a live interface. **Not
+   run against an actual NAT or wired into the Qt side yet** — the header
+   for `sc_nat_*` still needs writing when that happens.
+2. **`OPENDHT_C` was forced `OFF` in `CMakeLists.txt`, but the DHT adapter
+   (`JamiAdapter_dht_impl.cpp`) calls the C API exclusively** —
+   `dht_runner_new`/`bootstrap`/etc. via `<opendht_c.h>`, no C++
+   `DhtRunner` usage anywhere. With `OPENDHT_C` off, `opendht-c` never
+   builds, and `opendht_with_c` was linking plain `opendht` — every
+   `dht_runner_*` symbol undefined at link time on a clean build. Set to
+   `ON`, and `opendht_with_c` now links `opendht-c` (which pulls in
+   `opendht` itself). **Verified with a real compiler**: built an isolated
+   harness against the vendored submodule, confirmed the old config fails
+   exactly as described (`undefined reference to 'dht_runner_new'`, etc.)
+   and the fix resolves it. The full Qt6 app itself wasn't build-tested
+   here (no Qt6 in this sandbox) — only the DHT link step specifically.
+
 ### V32.34+ camera smoke test checklist
 
 What's new since the last device test:

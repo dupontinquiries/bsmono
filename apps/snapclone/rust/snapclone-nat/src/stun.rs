@@ -41,7 +41,7 @@ pub fn build_request(tx: &TransactionId) -> Bytes {
 }
 
 /// Reflexive address parsed from a STUN Binding Response.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReflexiveAddr {
     pub ip:   std::net::IpAddr,
     pub port: u16,

@@ -1,0 +1,28 @@
+[package]
+name = "photosync-egui"
+version = "0.1.0"
+edition = "2021"
+description = "photosync's egui shell: a Fotema-shaped camera roll over album.rs/gallery_grid.rs, on the shared kit."
+
+[[bin]]
+name = "photosync-egui"
+path = "src/main.rs"
+required-features = ["app"]
+
+[dependencies]
+# The headless core this renders. `album` groups and owns membership;
+# `gallery_grid` is pure layout arithmetic. Neither knows egui exists —
+# see the module docs on both for why that split is load-bearing here.
+photosync = { package = "photosync-system", path = "../..", default-features = false }
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# THE SHARED KIT, per house convention: palette, tokens, sidebar, backdrop.
+uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
+snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
+
+egui = "0.34"
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+
+[features]
+default = ["app"]
+app = ["dep:eframe"]

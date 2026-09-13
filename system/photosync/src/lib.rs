@@ -24,10 +24,48 @@ pub enum HashAlgorithm {
     SHA256,     // Slower, cryptographic (for integrity verification)
 }
 
+/// What a device is allowed to do against this library's shared storage.
+/// Ordered — `Ord` follows declaration order below, so `a >= Permission::Contribute`
+/// is a real capability check, not just an equality test. Per-device, not
+/// per-file: a shared photo library's access control is "can this person
+/// touch the library at all", not per-photo ACLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Permission {
+    /// Can list and fetch (files, thumbnails). Cannot add or remove anything.
+    ReadOnly,
+    /// ReadOnly, plus can register new files. Cannot run `garbage_collect`
+    /// or touch another device's files.
+    Contribute,
+    /// Full read/write, including garbage collection. Intended for a
+    /// device's own primary owner, or a fully trusted co-owner.
+    FullSync,
+}
+
+impl Permission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Permission::ReadOnly => "read_only",
+            Permission::Contribute => "contribute",
+            Permission::FullSync => "full_sync",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Permission> {
+        match s {
+            "read_only" => Some(Permission::ReadOnly),
+            "contribute" => Some(Permission::Contribute),
+            "full_sync" => Some(Permission::FullSync),
+            _ => None,
+        }
+    }
+}
+
 pub mod album;
 pub mod gallery_grid;
+pub mod peers;
+pub mod chunk_sync;
 
 // Configuration
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DeduplicationConfig {
     pub chunk_size: usize,
     pub chunking_strategy: ChunkingStrategy,
@@ -100,6 +138,18 @@ impl RollingHash {
 }
 
 impl PhotoSyncDB {
+    /// The open connection underneath, for callers that need `album::load`
+    /// or `album::save_albums` directly. Without this, `album::load` — the
+    /// function that actually builds a gallery's `Library`, complete with
+    /// albums — is unreachable from anything holding a `PhotoSyncDB` (the
+    /// daemon, the sync server, the CLI, and any future egui shell all do;
+    /// none of them have a bare `Connection` lying around), which made it
+    /// dead code outside its own tests. `list_files` below is a different,
+    /// narrower cut for a different purpose — see its doc.
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     pub fn new(db_path: &Path, block_store: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         fs::create_dir_all(block_store)?;
         let conn = Connection::open(db_path)?;
@@ -177,6 +227,20 @@ impl PhotoSyncDB {
                 width INTEGER NOT NULL,
                 height INTEGER NOT NULL,
                 format TEXT NOT NULL
+            )",
+            [],
+        )?;
+        
+        // Per-device access level for this library's shared storage — see
+        // `Permission`. No row for a device means it has no access at all
+        // (not `ReadOnly` — an explicit grant is required either way, but
+        // this makes "never granted" and "granted ReadOnly" distinguishable
+        // for an audit trail rather than both reading as "the weakest tier").
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS permissions (
+                device_id TEXT PRIMARY KEY,
+                level TEXT NOT NULL,
+                granted_at INTEGER NOT NULL
             )",
             [],
         )?;
@@ -385,6 +449,75 @@ impl PhotoSyncDB {
         
         Ok(())
     }
+
+    /// Every registered file, newest-taken first — for sync/replication
+    /// callers that want "what files exist" without albums (a peer
+    /// deciding what to pull, `peers.rs`'s eventual consumer). For gallery
+    /// display, use `album::load(db.connection())` instead: it returns the
+    /// same rows shaped as `album::Item` and also loads albums, which this
+    /// deliberately doesn't.
+    pub fn list_files(&self) -> Result<Vec<FileRecord>, Box<dyn std::error::Error>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, size, device_id, modified_at, created_at, thumbnail_hash, metadata_json
+             FROM files ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(FileRecord {
+                path: row.get(0)?,
+                size: row.get(1)?,
+                device_id: row.get(2)?,
+                modified_at: row.get(3)?,
+                created_at: row.get(4)?,
+                thumbnail_hash: row.get(5)?,
+                metadata_json: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Grant (or replace) a device's access level. Re-granting the same
+    /// device updates `granted_at` — there's no history kept here; an
+    /// audit log of grants, if wanted, is a different table wrapping this
+    /// one, not a job for the permission check itself.
+    pub fn set_permission(&mut self, device_id: &str, level: Permission) -> Result<(), Box<dyn std::error::Error>> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        self.conn.execute(
+            "INSERT INTO permissions (device_id, level, granted_at) VALUES (?, ?, ?)
+             ON CONFLICT(device_id) DO UPDATE SET level = excluded.level, granted_at = excluded.granted_at",
+            params![device_id, level.as_str(), timestamp],
+        )?;
+        Ok(())
+    }
+
+    /// `None` means no grant exists — see the schema note on `permissions`
+    /// for why that is kept distinct from `Some(Permission::ReadOnly)`.
+    pub fn permission_for(&self, device_id: &str) -> Result<Option<Permission>, Box<dyn std::error::Error>> {
+        let level: Option<String> = self.conn
+            .query_row(
+                "SELECT level FROM permissions WHERE device_id = ?",
+                params![device_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(level.and_then(|s| Permission::from_str(&s)))
+    }
+
+    /// Whether `device_id` currently holds at least `required`. This is a
+    /// query, not an enforcement point — callers (a future sync server's
+    /// request handler is the obvious one; see `sync_server.rs`) check it
+    /// before acting rather than it being threaded into `register_file` or
+    /// `garbage_collect` themselves, so a purely local, single-device use of
+    /// this library (the CLI, today) is never blocked by a permission
+    /// system it never asked for.
+    pub fn authorize(&self, device_id: &str, required: Permission) -> Result<bool, Box<dyn std::error::Error>> {
+        Ok(self.permission_for(device_id)?.map_or(false, |granted| granted >= required))
+    }
     
     pub fn get_storage_stats(&self) -> Result<StorageStats, Box<dyn std::error::Error>> {
         let mut stmt = self.conn.prepare(
@@ -482,6 +615,21 @@ impl StorageStats {
             0.0
         }
     }
+}
+
+/// One `files` row, as read back — see `PhotoSyncDB::list_files`. Keeps the
+/// chunk list and hashing metadata out (a reader that wants to reconstruct
+/// bytes goes back through `PhotoSyncDB` for that); this is just what a
+/// gallery or a sync peer needs to know a file exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRecord {
+    pub path: String,
+    pub size: i64,
+    pub device_id: String,
+    pub modified_at: i64,
+    pub created_at: i64,
+    pub thumbnail_hash: Option<String>,
+    pub metadata_json: Option<String>,
 }
 
 #[derive(Debug, Default)]

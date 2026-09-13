@@ -6,6 +6,75 @@ for strategic direction see [ROADMAP.md](ROADMAP.md).
 
 ---
 
+## V32.39 — snapclone-nat rewritten around one socket; OpenDHT link bug fixed
+
+Off-device session (no Qt6, no real NAT in the sandbox) auditing the
+Rust NAT crate and the OpenDHT build config. Full account in
+`maintenance/C19_TODO.md`; TODO.md's "Notes for the next session" has
+the on-device verification steps.
+
+**`rust/snapclone-nat` had never actually worked.** Two separate problems:
+
+1. `discover()` (STUN) and `punch()` each bound their own `UdpSocket` on
+   the configured port instead of sharing one. The C++ original
+   (`NatTraversal.cpp`) binds `m_punchSocket` exactly once and does STUN,
+   punching, and the SCUD data channel all through it — the whole
+   mechanism depends on the punch leaving from the exact local port STUN
+   discovered the NAT mapping for. Two sockets meant the reflexive address
+   and the punch traffic weren't even using the same port.
+2. `lib.rs` had declared `#[cfg(feature = "ffi")] pub mod ffi;` since the
+   crate was first scaffolded, but `src/ffi.rs` never existed. Enabling
+   the feature failed to compile, so nothing on the Qt side could reach
+   this crate at all — it had been dead code from day one.
+
+Root cause of (1) once found, root cause of (2) was just: the file was
+never written. Neither was caught earlier because nothing had exercised
+the crate's `ffi` feature or run a real two-socket punch attempt.
+
+**Fix:** rewrote `traversal.rs` around one shared socket + a single
+receive loop that demuxes STUN responses / SCUD frames / punches by
+content (new `wire.rs`, pure functions, no I/O — this is where the punch
+payload framing and the three self-punch guards live, unit-tested
+directly). Wrote `ffi.rs` for real: an opaque handle over a
+current-thread tokio runtime, poll-based events (no callbacks into
+C++, matching every other `sc_*` FFI in this tree). Ported the tested
+C++ constants instead of the scaffold's guessed ones (60×150ms burst /
+20s maintenance / 4s STUN timeout / 25s CGNAT keepalive), and made the
+punch payload wire-compatible (`SNAPCLONE_PUNCH_V1\n<sc-id>` — the old
+scaffold sent a bare zero byte, which could never have interoperated
+with a real peer).
+
+24 unit tests pass, including a real two-peer punch exchange over the
+sandbox's own non-loopback interface (confirms the shared-socket demux,
+the punch reply, retargeting to a peer's actual source, and the
+once-per-peer ready guard). **Not tested against an actual NAT, and not
+wired to the Qt side** — `sc_nat_*` needs a hand-written header when
+that happens, matching this crate's usual cbindgen-adjacent convention.
+
+**Separately: `OPENDHT_C` was forced `OFF`, but the code needs it ON.**
+`JamiAdapter_dht_impl.cpp` calls OpenDHT's C API exclusively
+(`dht_runner_new`/`bootstrap`/`put`/`get`/`shutdown`, `dht_infohash_*`,
+`dht_value_*` via `<opendht_c.h>`) — zero C++ `DhtRunner` usage anywhere
+in this tree. `OPENDHT_C OFF` means opendht's `opendht-c` target is
+never created, and `opendht_with_c` (the interface library everything
+links against) was linking plain `opendht` — every `dht_runner_*` symbol
+undefined at link time on a clean build.
+
+Watch for: this is exactly the kind of bug that "works on my machine"
+forever — if a previous build already produced `opendht-c` and it's
+sitting in a build directory or a system lib path, the missing symbols
+resolve by accident and the misconfiguration never surfaces. A truly
+clean `rm -rf build && cmake -B build` is what catches it.
+
+**Fix:** `OPENDHT_C ON`, `opendht_with_c` links `opendht-c` (which
+privately links `opendht` itself, so nothing downstream needs to change).
+**Verified with a real compiler, not just by reading CMake** — built an
+isolated harness against the vendored `vendor/opendht` submodule with
+the exact `opendht_with_c` logic. Reproduced the failure first (linking
+plain `opendht` → `undefined reference to 'dht_runner_new'` etc.), then
+confirmed the fix builds, links, and runs. The full Qt6 app wasn't
+build-tested (no Qt6 in this sandbox) — only the DHT link step.
+
 ## V32.31 — Landmarking foundation (data layer + UI; no DHT yet) + video recording preview aspect fix
 
 ### Bonus: video recording preview aspect distortion — fixed
