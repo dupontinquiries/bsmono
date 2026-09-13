@@ -385,9 +385,29 @@ pub const fn flags() -> &'static [Flag] {
                       that nobody uses in production, so visual \
                       regression doesn't matter. \
                       \
-                      Default off; backward-compatible with v0.24.20.",
-            default: "2",
+                      Default off; backward-compatible with v0.24.20. \
+                      \
+                      The registered default was \"2\" while unendlich_fullgame \
+                      hard-codes mode 0 (the GPU meshers are off entirely), so \
+                      the telemetry `flag` event reported a GPU mesher on every \
+                      run that never had one. The value here is what the code \
+                      does; the env var is currently not read at all.",
+            default: "0",
             valid: "0|1|2",
+            binaries: &["unendlich-world"],
+        },
+        Flag {
+            env: "UNENDLICH_GEN_BACKEND",
+            summary: "Terrain generator: `cpu` (lock-free parallel across the loader \
+                      workers), `gpu` (forced Vulkan compute, one batch per submit), or \
+                      `auto`. `auto` takes the GPU when a device exists EXCEPT on drivers \
+                      where it is measured to lose — Honeykrisp (Asahi) declines it: the \
+                      GPU path measured 0.63-0.98x the CPU one and its batches serialise \
+                      with the frame on the single hardware queue (world::gpu_generator:: \
+                      auto_policy). Not in the registry before, so 46 M2 Ultra telemetry \
+                      runs with the GPU generator on recorded no gen backend at all.",
+            default: "auto",
+            valid: "cpu|gpu|auto",
             binaries: &["unendlich-world"],
         },
         Flag {

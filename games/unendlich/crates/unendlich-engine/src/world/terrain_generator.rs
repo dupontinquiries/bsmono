@@ -81,10 +81,15 @@ impl TerrainGenerator {
         #[cfg(feature = "gpu")]
         let gpu = match backend {
             Backend::Cpu => None,
-            Backend::Auto => match VulkanChunkGenerator::new(batch_size) {
+            Backend::Auto => match VulkanChunkGenerator::new_auto(batch_size) {
                 Ok(g) => {
                     log::info!("GPU world generation enabled (batch size = {}).", batch_size);
                     Some(Arc::new(g))
+                }
+                // A policy decline is the expected outcome on some drivers, not a failure.
+                Err(e @ crate::world::gpu_generator::GpuGenError::DriverPrefersCpu { .. }) => {
+                    log::info!("terrain-gen: {e}. Using the CPU generator.");
+                    None
                 }
                 Err(e) => {
                     log::warn!("GPU unavailable: {}. Using CPU.", e);
