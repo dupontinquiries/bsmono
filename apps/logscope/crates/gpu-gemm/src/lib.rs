@@ -1527,7 +1527,8 @@ fn moe_down_fused() -> bool {
 /// Fused RMSNorm+matvec for the m=1 decode norm→matmul pairs (LOGSCOPE_FUSE_NORM=0 → the explicit
 /// two-dispatch rmsnorm then matvec). One fewer dispatch per pair, twice per layer.
 fn fuse_norm_enabled() -> bool {
-    std::env::var("LOGSCOPE_FUSE_NORM").as_deref() != Ok("0")
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| std::env::var("LOGSCOPE_FUSE_NORM").as_deref() != Ok("0"))
 }
 
 /// Whether ROUTE_TRACE is armed (env set + v1 path forced so routing is CPU-visible). Cached once.
@@ -1565,7 +1566,8 @@ fn route_trace_tok(layer: i32, tok: i64, experts: &[u32]) {
 /// Flash split-K decode attention above the 4096-row shared-memory cap (LOGSCOPE_FLASH_ATTN=0 →
 /// the old single-workgroup-per-head serial fallback).
 fn flash_attn_enabled() -> bool {
-    std::env::var("LOGSCOPE_FLASH_ATTN").as_deref() != Ok("0")
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| std::env::var("LOGSCOPE_FLASH_ATTN").as_deref() != Ok("0"))
 }
 /// LOGSCOPE_GEMM_TILE override for the prefill GEMM workgroup tile (manual A/B; read once, cached).
 fn env_gemm_tile() -> Option<u32> {
@@ -3297,6 +3299,26 @@ fn dispatch_hist_on() -> bool {
     *G.get_or_init(|| std::env::var("LOGSCOPE_DISPATCH_HIST").as_deref() == Ok("1"))
 }
 
+/// Read-once env flags on the per-dispatch path. `std::env::var_os` takes the process-wide env
+/// lock and scans the environment; `dispatch`, `dispatch_with` (once per INPUT), the matvec
+/// selector (three reads per matvec) and the attention selector together read ~1500 times per
+/// token on a 32-layer model, all on the CPU side that serialises with encoding. None of these
+/// is set at runtime anywhere (grep set_var), so one read is the same answer. Flags that gates DO
+/// toggle in-process (LOGSCOPE_FUSED_QKV, LOGSCOPE_SMALL_CHUNK) are deliberately not here.
+macro_rules! env_flag_once {
+    ($name:literal) => {{
+        static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *G.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+fn trace_bind_on() -> bool { env_flag_once!("LOGSCOPE_TRACE_BIND") }
+fn decode_attn_serial_forced() -> bool { env_flag_once!("LOGSCOPE_DECODE_ATTN_SERIAL") }
+fn matvec_kernel_forced() -> bool {
+    env_flag_once!("LOGSCOPE_MATVEC_V1") || env_flag_once!("LOGSCOPE_MATVEC_V2") || env_flag_once!("LOGSCOPE_MATVEC_V3")
+}
+fn prefill_naive_forced() -> bool { env_flag_once!("LOGSCOPE_PREFILL_NAIVE") }
+fn prefill_tiled_forced() -> bool { env_flag_once!("LOGSCOPE_PREFILL_TILED") }
+
 /// Snapshot the histogram as (shader_id, count), most frequent first.
 pub fn dispatch_histogram() -> Vec<(usize, u64)> {
     let Some(h) = DISPATCH_HIST.get() else { return Vec::new() };
@@ -4533,7 +4555,7 @@ see prefill_chunked_from for the pattern.", std::panic::Location::caller().file(
 dispatch would be dropped as a non-fatal validation error and its output left stale. Use wg1() and \
 make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
         }
-        if std::env::var_os("LOGSCOPE_TRACE_BIND").is_some() {
+        if trace_bind_on() {
             let head: String = shader.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(90).collect();
             eprintln!("  dispatch shader: {head} | dims[..8 u32]={:?} wg={wg:?}",
                 dims.chunks(4).take(8).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<_>>());
@@ -4645,7 +4667,7 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
             //
             // This prints what is ACTUALLY bound, which separates them in one run: a view line here
             // means the tensor carried one; no view line plus a short result means dims.
-            if std::env::var_os("LOGSCOPE_TRACE_BIND").is_some() {
+            if trace_bind_on() {
                 let sz = t.buf.size();
                 match t.view {
                     None => eprintln!("  bind[{i}] whole buffer, {sz} bytes ({} u32)", sz / 4),
@@ -6647,7 +6669,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         if m == 1 {
             // decode: env override (manual A/B) → per-shape autotuned (kernel, tile) → global profile.
             // The KERNEL is chosen at runtime per shape+platform, not hardcoded (matvec_decode_cfg dispatches).
-            if std::env::var_os("LOGSCOPE_MATVEC_V1").is_some() || std::env::var_os("LOGSCOPE_MATVEC_V2").is_some() || std::env::var_os("LOGSCOPE_MATVEC_V3").is_some() {
+            if matvec_kernel_forced() {
                 return self.matvec_decode(a, w, self.decode_tile_for(w.n, w.k)); // env forces a kernel
             }
             return self.matvec_decode_cfg(a, w, self.decode_cfg_for(w.n, w.k));
@@ -6701,11 +6723,11 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             }
             return out;
         }
-        if std::env::var_os("LOGSCOPE_PREFILL_NAIVE").is_some() { return self.linear_q8_0_naive(a, w, m); }
+        if prefill_naive_forced() { return self.linear_q8_0_naive(a, w, m); }
         // register-blocked GEMM is the DEFAULT prefill kernel: measured 2795 GFLOP/s on M2 (2.8× the
         // override-tiled kernel, 5.6× naive), and it has no override constants so it compiles on every
         // backend (GL included) — no gemm_ok gate needed. Escape to the tiled kernel with LOGSCOPE_PREFILL_TILED.
-        if std::env::var_os("LOGSCOPE_PREFILL_TILED").is_some() && self.gemm_ok() {
+        if prefill_tiled_forced() && self.gemm_ok() {
             return self.linear_q8_0_gemm(a, w, m, self.gemm_tile_for(w.n, w.k));
         }
         self.linear_q8_0_gemm_rb(a, w, m)
@@ -15491,7 +15513,7 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
         // kernel at ANY length so that hypothesis can be A/B-tested (and pins a safe path if true).
         // DECODE_ATTN_MH_PAR is barrier-heavy; if a prior GPU op faulted (degraded), or the diagnostic
         // flag is set, use the serial (barrier-free) kernel that can't wedge a fragile driver.
-        let decode_serial = self.degraded() || std::env::var_os("LOGSCOPE_DECODE_ATTN_SERIAL").is_some();
+        let decode_serial = self.degraded() || decode_attn_serial_forced();
         if decode_serial {
             self.dispatch(DECODE_ATTN_MH, &[q, kc, vc], out, bytemuck::cast_slice(&dims), ((n_heads as u32).div_ceil(64), 1, 1));
         } else if l <= 4096 {
