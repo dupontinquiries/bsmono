@@ -402,3 +402,77 @@ an attribute that opens a line, or the `cfg!()` macro. Verified by injecting
 that exact string-literal shape into a clean crate and confirming it is not
 flagged, alongside three positive break tests (declare the missing feature →
 that crate drops off; inject a phantom cfg into crypto-kit → caught by name).
+
+---
+
+## 13. logscope-egui and the voice popup: one port, two consumers, currently zero
+
+Scoped after being asked for "logscope-egui's system log pages, and
+voiceterm-qt's voice popup alongside voiceterm-egui". Surveyed before
+building, and the survey changed the shape of both asks.
+
+### The system-log pages are not missing
+
+`logscope-egui/src/*.rs` lacks 122 modules that `logscope/src/*.rs` has,
+which looks damning until you read `logscope-egui/Cargo.toml`:
+
+    logscope = { path = "../logscope", default-features = false }
+
+The egui crate DEPENDS on the GTK crate as a headless library, GTK gated
+off. The 122 modules are consumed, not absent — the manifest comment says
+"most of its modules have since diverged from logscope's originals", which
+is a statement about drift, not about coverage. logscope-egui is also the
+LARGER crate (192 files against 149).
+
+`journalctl` handling specifically lives in `diagreport.rs` (folding a dump
+into a report's ERRORS section as bursts) and `externalwatch.rs`, both in
+the shared headless crate and both reachable from the port.
+
+So "functioning pages for system log viewing" needs a NAMED page that is
+wrong, not a file-count comparison. Nothing was changed here on the strength
+of one.
+
+### The voice popup exists in exactly one place, and it is QML
+
+`voiceterm/src/voice.rs` is 4,417 lines and **entirely Qt-free** — zero
+`qmetaobject`/`QString`/`QObject` references, and zero `use crate::` lines,
+so it is self-contained. What is Qt-bound is only the SURFACE: the popup
+itself is QML, and voice.rs's comments describe pushing events "for QML to
+consume".
+
+The important finding is that **voiceterm-egui does not have the popup
+either**. Grepping its frontend for voice turns up `voice_prefix`,
+`voice_routing` and `repl_voice_glow` — prefix parsing, routing and a REPL
+glow effect — but no capture-and-preview popup. And logscope-egui's "voice"
+hits are a MODEL-SELECTOR category (Large/Small/Voice/Image), not speech.
+
+So the ask is one port with two consumers and no existing implementation on
+either side. That is a shared-kit shape, not a copy-into-logscope shape:
+mounting voice.rs twice by `#[path]` would put the wake-word state,
+partial-preview buffer and recording lifecycle in two places, and voice.rs
+keeps that state in module-level statics (`cancel_recording()`,
+`get_partial_preview()`, `clear_partial_preview()` take no receiver), so two
+mounts would be two independent recorders fighting over one microphone.
+
+### Shape, in dependency order
+
+1. `shared/voice-kit` (or into an existing kit) taking voice.rs as its
+   engine — ONE mount, so one recorder.
+2. An egui popup surface over it, in a shared widget crate, since both
+   consumers want the same one. voiceterm's QML is the reference for what it
+   shows: partial preview with per-speaker colouring, cancel/finish, and the
+   wake-suppression rule (`voice popup open` must block a wake firing
+   mid-utterance, per pty_term.rs:2538 and main.rs:2850).
+3. Mount in voiceterm-egui first — it is the app whose whole premise is
+   voice, and the one with the QML to compare against.
+4. Then logscope-egui, which is the case with no reference implementation
+   and should not go first.
+
+`filler_words.rs` also records that a cancelled popup feeds the filler-word
+corpus ("voice popups the user cancelled without executing"), so the cancel
+path has a consumer and is not merely a dismiss.
+
+**Not started.** Recorded rather than begun because step 1 is a shared-kit
+extraction of a 4,417-line module and step 2 is a new surface; starting
+either without the budget to finish and compile it is how the `bufsearch`
+duplicate happened earlier this session.
