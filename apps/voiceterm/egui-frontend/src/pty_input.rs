@@ -54,6 +54,10 @@ pub enum Chord {
     PrevTab,
     FocusRight,
     FocusLeft,
+    /// Konsole's Ctrl+Shift+( — "Split View Left/Right". New pane to the Right.
+    SplitRight,
+    /// Konsole's Ctrl+Shift+) — "Split View Top/Bottom". New pane Down.
+    SplitDown,
 }
 
 /// Chords intercepted BEFORE encoding.
@@ -70,6 +74,16 @@ pub fn chord(key: Key, m: Mods, split_visible: bool) -> Option<Chord> {
             Key::Char('t') | Key::Char('T') => Some(Chord::NewTab),
             Key::Char(']') => Some(Chord::NextTab),
             Key::Char('[') => Some(Chord::PrevTab),
+            // Konsole's split bindings. It documents them as Ctrl+Shift+(
+            // and Ctrl+Shift+), which on a US layout are the shifted 9 and 0
+            // — and since the chord already requires Shift, what actually
+            // arrives depends on whether the toolkit reports the physical
+            // digit or the shifted glyph. egui reports the digit
+            // (`Key::Num9.name()` is "9"), an IME or on-screen keyboard may
+            // commit the paren. Both are accepted rather than guessing,
+            // because the failure is silent: the chord simply never fires.
+            Key::Char('9') | Key::Char('(') => Some(Chord::SplitRight),
+            Key::Char('0') | Key::Char(')') => Some(Chord::SplitDown),
             Key::Right if split_visible => Some(Chord::FocusRight),
             Key::Left if split_visible => Some(Chord::FocusLeft),
             _ => None,
@@ -302,6 +316,20 @@ fn from_egui_key(k: egui::Key, _m: Mods) -> Option<Key> {
         E::PageUp => Key::PageUp,
         E::PageDown => Key::PageDown,
         E::Space => Key::Char(' '),
+        // NAMED PUNCTUATION NEVER REACHED THE FALLBACK BELOW.
+        //
+        // That fallback takes `egui::Key::name()` and keeps it only if it is
+        // ONE character. For digits that works — `Num9.name()` is "9" — but
+        // `CloseBracket.name()` is "CloseBracket", twelve characters, so it
+        // returned None.
+        //
+        // Which means Ctrl+Shift+] and Ctrl+Shift+[ have never reached
+        // `chord()`, and the NextTab/PrevTab entries there have never fired.
+        // The `Event::Text` path cannot rescue them either: it pushes with
+        // `Mods::none()`, and the chord table requires ctrl+shift. A dead
+        // binding with a live-looking table entry.
+        E::OpenBracket => Key::Char('['),
+        E::CloseBracket => Key::Char(']'),
         other => {
             let n = other.name();
             let mut cs = n.chars();
@@ -315,6 +343,82 @@ fn from_egui_key(k: egui::Key, _m: Mods) -> Option<Key> {
 
 #[cfg(test)]
 mod tests {
+    // ---- pane splits and the dead bracket chords -------------------------
+
+    #[test]
+    fn ctrl_shift_9_and_0_split_the_pane() {
+        // Konsole's Ctrl+Shift+( / ) — the bindings this was reported
+        // missing. Direction follows Konsole's own naming: "Split View
+        // Left/Right" puts the new pane to the Right, "Top/Bottom" puts it
+        // Down.
+        let cs = Mods { ctrl: true, shift: true, alt: false };
+        assert_eq!(chord(Key::Char('9'), cs, false), Some(Chord::SplitRight));
+        assert_eq!(chord(Key::Char('0'), cs, false), Some(Chord::SplitDown));
+    }
+
+    #[test]
+    fn the_shifted_glyph_form_splits_too() {
+        // egui reports the physical digit, but an IME or on-screen keyboard
+        // commits the shifted character instead. Accepting only one of the
+        // two fails silently — the chord never fires and the key falls
+        // through to the shell.
+        let cs = Mods { ctrl: true, shift: true, alt: false };
+        assert_eq!(chord(Key::Char('('), cs, false), Some(Chord::SplitRight));
+        assert_eq!(chord(Key::Char(')'), cs, false), Some(Chord::SplitDown));
+    }
+
+    #[test]
+    fn splitting_does_not_need_an_existing_split() {
+        // Unlike the focus chords, which are gated on `split_visible`
+        // because focusing a pane that is not there is meaningless. Creating
+        // the first split is exactly the case that matters.
+        let cs = Mods { ctrl: true, shift: true, alt: false };
+        for visible in [false, true] {
+            assert_eq!(chord(Key::Char('9'), cs, visible), Some(Chord::SplitRight));
+        }
+    }
+
+    #[test]
+    fn a_bare_digit_is_not_a_split() {
+        // Typing 9 into the shell must stay typing 9. Only the full
+        // ctrl+shift chord is taken.
+        assert_eq!(chord(Key::Char('9'), Mods::none(), true), None);
+        assert_eq!(
+            chord(Key::Char('9'), Mods { ctrl: true, shift: false, alt: false }, true),
+            None
+        );
+        assert_eq!(
+            chord(Key::Char('9'), Mods { ctrl: false, shift: true, alt: false }, true),
+            None
+        );
+    }
+
+    #[test]
+    fn the_bracket_keys_reach_key_char_at_all() {
+        // The regression this file's chord table silently depended on.
+        // `from_egui_key` fell through to `egui::Key::name()` and kept the
+        // result only if it was ONE char. "CloseBracket" is twelve, so
+        // Ctrl+Shift+] produced None and the NextTab entry never ran —
+        // a live-looking table entry with no reachable key behind it.
+        //
+        // Digits were always fine (`Num9.name()` is "9"), which is why the
+        // split chords above needed no such mapping and these did.
+        assert_eq!(from_egui_key(egui::Key::OpenBracket, Mods::none()), Some(Key::Char('[')));
+        assert_eq!(from_egui_key(egui::Key::CloseBracket, Mods::none()), Some(Key::Char(']')));
+        assert_eq!(from_egui_key(egui::Key::Num9, Mods::none()), Some(Key::Char('9')));
+    }
+
+    #[test]
+    fn ctrl_shift_brackets_now_switch_tabs() {
+        // The end-to-end pairing of the two halves: the key maps, and the
+        // chord table matches it.
+        let cs = Mods { ctrl: true, shift: true, alt: false };
+        let close = from_egui_key(egui::Key::CloseBracket, cs).unwrap();
+        let open = from_egui_key(egui::Key::OpenBracket, cs).unwrap();
+        assert_eq!(chord(close, cs, false), Some(Chord::NextTab));
+        assert_eq!(chord(open, cs, false), Some(Chord::PrevTab));
+    }
+
     use super::*;
 
     const PLAIN: TermMode = TermMode { app_cursor: false, bracketed_paste: false };

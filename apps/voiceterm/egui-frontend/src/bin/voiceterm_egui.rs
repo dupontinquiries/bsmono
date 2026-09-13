@@ -5299,6 +5299,26 @@ impl eframe::App for VoicetermApp {
                             voiceterm_egui::terminal_workspace::Dir::Right),
                         Chord::FocusLeft => self.workspace.focus_dir(
                             voiceterm_egui::terminal_workspace::Dir::Left),
+                        // Through apply() with the same phrases the voice and
+                        // menu paths use, for the reason given above NewTab:
+                        // `tabs`/`active` are a projection of `model`, and the
+                        // chord must not become a second way to say this that
+                        // can drift from the first.
+                        //
+                        // "horizontal" means side-by-side here — see
+                        // parse_command, which follows tmux's -h/-v rather
+                        // than naming the split LINE. Konsole calls the same
+                        // thing "Split View Left/Right".
+                        Chord::SplitRight => {
+                            self.workspace.apply(
+                                &voiceterm_egui::gesture_menus::WsCall::Command(
+                                    "split horizontal".into()));
+                        }
+                        Chord::SplitDown => {
+                            self.workspace.apply(
+                                &voiceterm_egui::gesture_menus::WsCall::Command(
+                                    "split vertical".into()));
+                        }
                     }
                 }
             }
