@@ -75,10 +75,20 @@ pub fn check(l: &Look) -> Vec<Fault> {
     let m = crate::bench::measure(l.cells);
     let lowest = l.cells.iter().map(|c| c.1).min().unwrap();
 
-    // FLOATING. Reported directly: "a gorilla statue built but was
-    // only a few shapes basic and floating".
+    // FLOATING, and this is the one to be careful about: FALSE ADVICE
+    // IS WORSE THAN NONE. A first version compared the lowest cell
+    // against a ground plane derived from the anchor, and reported a
+    // box built `rel b on ground` as floating by 2 -- the anchor is not
+    // the ground and the arithmetic between them is not one this check
+    // can assume.
+    //
+    // `critique::floating` already does this properly by asking the
+    // WORLD what is under each block. This one has no world, so it can
+    // only report the unambiguous case: the whole build sitting clear
+    // above where the ground was said to be, by more than any anchor
+    // convention could explain.
     let gap = lowest - l.ground;
-    if gap > 1 {
+    if gap > 4 {
         out.push(Fault { weight: Weight::Broken,
             what: format!("it floats: the lowest block is {gap} above the ground"),
             fix: "put something under it, or lower the whole thing so it stands".into() });
@@ -192,12 +202,16 @@ mod tests {
     fn the_faults_that_were_actually_reported_are_the_ones_it_finds() {
         // "a gorilla statue built but was only a few shapes basic and
         // floating"
-        let floating = solid(10, 14, 10, 68);
+        // 12 clear of the ground: unambiguous, not an anchor
+        // convention. The gorilla was reported at 4, which this check
+        // now deliberately lets pass -- `critique::floating`, which can
+        // ask the world, is the one that catches those.
+        let floating = solid(10, 14, 10, 76);
         let mut l = look(&floating);
         l.parts = 4;
         l.materials = 1;
         let f = check(&l);
-        assert!(f.iter().any(|x| x.what.contains("floats") && x.what.contains("4 above")),
+        assert!(f.iter().any(|x| x.what.contains("floats") && x.what.contains("12 above")),
                 "{f:?}");
         assert!(f.iter().any(|x| x.what.contains("4 shape(s)")), "{f:?}");
         assert!(f.iter().any(|x| x.what.contains("all one material")), "{f:?}");
@@ -283,7 +297,7 @@ mod tests {
         let f = check(&look(&good));
         assert!(good_enough(&f), "{f:?}");
         // and one with a broken fault is not
-        let floating = solid(10, 10, 10, 70);
+        let floating = solid(10, 10, 10, 80);
         assert!(!good_enough(&check(&look(&floating))));
     }
 

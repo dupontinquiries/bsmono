@@ -93,6 +93,12 @@ pub struct Pending {
     prose: String,
     /// What the dry run placed, for a review's measurement and picture.
     placed: Vec<(i32, i32, i32)>,
+    /// How many distinct materials the build used, when that is
+    /// knowable. `Edit` records only the block that WAS there, not what
+    /// replaced it, so the IR path cannot tell -- and `None` means
+    /// unknown rather than one, because a check that cannot see its
+    /// input must not guess.
+    materials: Option<usize>,
     /// The program source, when this pending came from one. A review
     /// needs it: a program's ops list is empty by construction.
     program: String,
@@ -488,6 +494,9 @@ impl ChatSession {
         // keeps every downstream thing -- preview, waypoint, commit,
         // undo, the world tree -- working unchanged.
         let placed: Vec<(i32, i32, i32)> = run.changes.iter().map(|c| c.at).collect();
+        let materials: Option<usize> = Some(run.changes.iter()
+            .filter(|c| c.to != 0).map(|c| c.to)
+            .collect::<std::collections::BTreeSet<u16>>().len());
         let bounds = placed.iter().fold(None::<((i32,i32,i32),(i32,i32,i32))>, |b, p| Some(match b {
             None => (*p, *p),
             Some((lo, hi)) => ((lo.0.min(p.0), lo.1.min(p.1), lo.2.min(p.2)),
@@ -501,6 +510,7 @@ impl ChatSession {
         echo.push_str(&format!("\n{} added, {cut} removed", run.changes.len() - cut));
         let blocks = run.changes.len();
         self.pending = Some(Pending {
+            materials,
             plan: BuildPlan { name: "program".into(), ops: Vec::new(), anchor: Some(anchor) },
             feature_id: f.feature_id.clone(),
             predicted_blocks: blocks,
@@ -567,14 +577,12 @@ impl ChatSession {
         let faults = crate::faults::check(&crate::faults::Look {
             cells: &cells,
             ground,
-            // `placed` carries POSITIONS, not block ids, so the
-            // material count is not knowable here. Passing 2 means the
-            // one-material check never fires rather than firing
-            // wrongly -- a check that cannot see its input must not
-            // guess. Counting distinct materials needs the dry run to
-            // keep them, which is a change to `Pending` and not to
-            // this.
-            materials: 2,
+            // Known on the program path, where the dry run keeps what
+            // it placed. Unknown on the IR path, because `Edit` records
+            // only the block that WAS there. 2 stands in for unknown so
+            // the check stays quiet rather than firing wrongly: a check
+            // that cannot see its input must not guess.
+            materials: p.materials.unwrap_or(2),
             parts: p.pass_log.len().max(ops.len()),
             enclosed: !p.prose.to_lowercase().contains("statue"),
         });
@@ -1029,6 +1037,7 @@ impl ChatSession {
             plan, feature_id: f.feature_id.clone(), predicted_blocks: dry.blocks_changed,
             ir: ir.to_string(), prose: prose.to_string(),
             placed: placed.clone(),
+            materials: None,
             program: String::new(),
             pass_log: Vec::new(),
             extra_cells: Vec::new(),
@@ -2194,5 +2203,37 @@ mod tests {
         assert!(p.contains("floats"), "the reported fault is named: {p}");
         assert!(p.contains("Fix the first one before the others"), "{p}");
         assert!(p.contains("or say why it is deliberate"), "it is not a gate: {p}");
+    }
+
+    #[test]
+    fn the_one_material_check_fires_now_that_the_count_is_real() {
+        // It was passed a constant 2 and so could never fire. `Edit`
+        // records only the block that WAS there, but the PROGRAM path's
+        // dry run keeps what it placed, so there the count is real.
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(20, 5, 15.0);
+        // hollow and on the ground, so the one-material fault is not
+        // pushed out of the top three by worse ones
+        let one = s.receive_program(&mut t, &g,
+            "pass a add\n  part b box w=14 h=9 d=14 material=stone hollow\n  \
+             rel b on ground\nend\n", None, "a lump of one stone");
+        assert!(matches!(one, Reply::Preview { .. }), "{one:?}");
+        let p = s.review_prompt(0, &[]).expect("a review");
+        assert!(p.contains("all one material"), "{p}");
+
+        // two materials and it stays quiet
+        let mut w2 = Flat::new();
+        let mut t2 = VoxelTools::new(&mut w2);
+        let mut s2 = ChatSession::new(32, 200);
+        let two = s2.receive_program(&mut t2, &g,
+            "pass a add\n  part b box w=14 h=9 d=14 material=stone hollow\n  \
+             rel b on ground\nend\n\
+             pass c add\n  part t box w=4 h=3 d=4 material=oak_planks\n  \
+             rel t on b\nend\n", None, "a lump with a cap");
+        assert!(matches!(two, Reply::Preview { .. }), "{two:?}");
+        let p2 = s2.review_prompt(0, &[]).expect("a review");
+        assert!(!p2.contains("all one material"), "{p2}");
     }
 }
