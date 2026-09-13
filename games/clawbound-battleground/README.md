@@ -15,7 +15,9 @@ no third-party trademarks or assets.
 ## Features
 
 - **5v5, three lanes** — TOP / MID / BOT with waypoint pathing, per-lane minion
-  waves (melee + casters), 12 towers, two Elders gated behind tower kills.
+  waves (melee + casters, small feline voxel bodies matching the ancestors'
+  own — a collar in the team colour stands in for old armor trim), 12 towers,
+  two Elders gated behind tower kills.
 - **13 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
   Windclaw, Faryowl, Oldroar, Twofang, Suneye, Snowhush, Riptail, Stillsmoke,
   Stonewhisper — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
@@ -69,7 +71,13 @@ no third-party trademarks or assets.
   channel, bank foam, sparkling sun glints, rain rings. Voxel "gelatin" beads
   ride the surface, waders throw splash rings, fish leap, dragonflies stitch
   the air. Wading costs up to 40 % speed by depth; Rainspots and Riptail are
-  riverborn and wade free.
+  riverborn and wade free. The water and every alpha-blended voxel now
+  properly occlude behind nearer opaque geometry (a bridge pier no longer
+  reads as behind the water sheet flowing past it).
+- **Trees and stones block movement** — the jungle isn't just scenery: units
+  push out of tree trunks and rock/boulder footprints the same way they push
+  out of each other, at a radius scaled to each prop's size. Bushes, ferns,
+  vines and the bridge stay walk-through.
 - **Wind you can see and hear** — gust fronts (weather.rs) rise in ~1.5 s
   and fall over ~6 s, more often and harder in storms, with a wandering
   heading. Every flora voxel carries a sway weight; the voxel and shadow
@@ -95,12 +103,16 @@ no third-party trademarks or assets.
   settle elsewhere, glow-moths around the heal trees at night, fireflies that
   come out under cloud, sky birds that scatter at lightning and roost at night.
 - **100-item shop** in 8 stat categories, three tiers, 8 stacking items. AI
-  ancestors auto-buy role-appropriate builds.
+  ancestors auto-buy role-appropriate builds. Item slots unlock with level —
+  1 at level 1, ramping to the full 6 by level 9 — and level 9 is also a
+  one-time capstone: a flat +10% max HP and power on top of the normal
+  1–20 growth curve.
 - **Character select** with live offscreen-rendered voxel portraits, legend,
   philosophy, stat bars and ability descriptions.
-- **Full HUD**: ability bar with cooldown sweeps, HP/MP/XP bars, gold + 6 item
-  slots, kill feed, announcements, floating damage numbers, world-space HP
-  bars, 3-lane minimap, hold-Tab scoreboard, death/victory/defeat screens.
+- **Full HUD**: ability bar with cooldown sweeps, HP/MP/XP bars, gold + up to
+  6 item slots (fewer before level 9 — see above), kill feed, announcements,
+  floating damage numbers, world-space HP bars, 3-lane minimap, hold-Tab
+  scoreboard, death/victory/defeat screens.
 - **Rendering**: MSAA×4, PCF shadow maps that follow the (weather-driven,
   slowly arcing) sun, a 1.6 u heightmap with per-material fragment detail
   (grass tufts, cracked dirt with pebbles and ruts, pebbled riverbed with
@@ -145,8 +157,9 @@ cargo run -- --screenshot    # renders via lavapipe (CPU)
 Every action is rebindable — open **CONTROLS** from the main menu or press
 `Esc` in a match, click a row, press the key / mouse button / pad button you
 want. Bindings are *logical* keys (the character a key types on your layout),
-so a Dvorak player binding `e` gets the key labelled `e`. Two stock schemes
-(QWERTY WASD, Dvorak `,AOE`) plus custom. Saved to
+so a Dvorak player binding `e` gets the key labelled `e`. Three stock schemes
+(QWERTY WASD, Dvorak `,AOE`, Dvorak `.OEU` — the ESDF grip's Dvorak
+equivalent) plus custom. Saved to
 `$XDG_CONFIG_HOME/clawbound/controls.cfg` (a plain text file). This is the
 input model the monorepo's other games (skydribble, unendlich) use.
 
