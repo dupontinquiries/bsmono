@@ -1018,6 +1018,15 @@ pub fn apply_step_mod(kind: &SynthKind, m: &StepMod, prev_note: Option<i8>) -> S
             decay_ms: *decay_ms,
         },
         SynthKind::Sine { hz } => SynthKind::Sine { hz: hz * 2f32.powf(m.tune as f32 / 12.0) },
+        // The roll's key and the step's tune fold into the transpose, so
+        // a host's sf2 engine reads ONE number: the semitones above the
+        // roll's origin (`studio_core::KEY_ZERO_MIDI`) to play. Before
+        // this fold every note on an sf2 channel would have played the
+        // same pitch.
+        SynthKind::Sf2 { path, bank, preset, transpose } => SynthKind::Sf2 {
+            path: path.clone(), bank: *bank, preset: *preset,
+            transpose: transpose.saturating_add(m.tune),
+        },
         SynthKind::Drum { voice, tone, decay_ms, tune } => SynthKind::Drum {
             voice: *voice, tone: *tone, decay_ms: *decay_ms,
             tune: tune.saturating_add(m.tune),
@@ -1785,6 +1794,37 @@ mod tests {
         let mut synth = BuiltinSynth { sources: &sources };
         let out = render_pattern(&pattern, &rack, &mut synth, &tempo, 48_000, 0);
         assert!(out.iter().any(|s| *s != 0.0), "a pattern with a Sub hit must produce audible output");
+    }
+
+    #[test]
+    fn an_sf2_channel_hands_its_engine_the_roll_key_folded_into_the_transpose() {
+        // No engine here; a spy synth records the kinds it is asked to
+        // render. Before the fold, every note on an sf2 channel arrived as
+        // the channel's own transpose — one pitch for the whole part.
+        struct Spy(Vec<SynthKind>);
+        impl Synth for Spy {
+            fn render(&mut self, kind: &SynthKind, _: u32, out: &mut [f32]) { self.0.push(kind.clone()); out.fill(0.0); }
+        }
+        let mut rack = rack();
+        rack.channels.push(Channel {
+            name: "piano".into(),
+            kind: SynthKind::Sf2 { path: "/nowhere.sf2".into(), bank: 0, preset: 0, transpose: 12 },
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None,
+        });
+        let ch = rack.channels.len() - 1;
+        let mut pattern = Pattern::new("keys", 16, rack.channels.len());
+        pattern.add_note(ch, Note { key: 3, start: 0, len: 4, vel: 0.9, slide: false });  // C2 on the roll
+        pattern.add_note(ch, Note { key: 7, start: 4, len: 4, vel: 0.9, slide: false });  // E2
+        pattern.toggle(ch, 8);
+        pattern.set_mod(ch, 8, StepMod { tune: -5, ..StepMod::default() });                  // a step hit, tuned
+        let tempo = Tempo { bpm: 120.0, steps_per_beat: 4, swing: 0.0 };
+        let mut spy = Spy(Vec::new());
+        render_pattern(&pattern, &rack, &mut spy, &tempo, 48_000, 0);
+        let mut transposes: Vec<i8> = spy.0.iter().filter_map(|k| match k {
+            SynthKind::Sf2 { transpose, .. } => Some(*transpose), _ => None }).collect();
+        transposes.sort(); // step hits render before roll notes; the order is not the claim
+        assert_eq!(transposes, vec![7, 15, 19], "the tuned step 12 - 5, then 12 + 3 and 12 + 7");
+        assert!(spy.0.iter().all(|k| matches!(k, SynthKind::Sf2 { preset: 0, bank: 0, .. })), "bank and preset ride along");
     }
 
     #[test]
