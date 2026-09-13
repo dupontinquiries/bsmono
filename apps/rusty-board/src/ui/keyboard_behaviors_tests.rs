@@ -5510,41 +5510,44 @@ mod offkey_swipe_fallback_regression_tests {
     //! The fix falls back to `SwipeSource` in Standard mode when
     //! the hit-test misses (with `swipe_typing_enabled` on).
     //!
-    //! This logic-level test models the behavior-selection rule in
-    //! isolation. The full drag_begin closure is GTK-bound and not
-    //! directly testable; the rule itself is what matters.
+    //! The rule itself now lives in `board_layouts::dispatch`, is
+    //! exercised by eleven tests there, and is what `drag_begin`
+    //! actually calls. This module keeps the regression cases that
+    //! motivated it, pointed at the real function.
+    //!
+    //! It previously held a PRIVATE REIMPLEMENTATION of the rule —
+    //! `fn select_behavior` — which these tests exercised while the
+    //! live code ran a different, longer version inline in
+    //! `keyboard_view.rs`. The copy had drifted in three ways, two of
+    //! them asserted the wrong way round:
+    //!
+    //!   * a Normal character key with swipe-typing on becomes a
+    //!     SwipeSource in the live code; `onkey_normal_keeps_hit_behavior`
+    //!     asserted it stays Normal. That promotion is what makes
+    //!     dragging across letters produce a word at all.
+    //!   * an off-key start in Cardinal/Stenotype dispatches Cardinal
+    //!     in the live code; `cardinal_offkey_stays_none` asserted None.
+    //!   * the SwipeSource -> Normal downgrade under suppress_freeform
+    //!     was not modelled at all.
+    //!
+    //! Six green tests therefore said nothing about the code that
+    //! ships. The GTK crate cannot be compiled in the authoring
+    //! sandbox, which is exactly why the rule was moved to a crate
+    //! that can be.
     use crate::keyboard::ButtonBehavior;
     use crate::layouts::DispatchMode;
+    use board_layouts::dispatch::{select_behavior, Hit};
 
-    /// Mimics the post-fix behavior-selection rule. Returns None
-    /// only when the gesture should be dropped (specialized mode +
-    /// off-key, or Standard with swipe_typing disabled + off-key).
-    fn select_behavior(
-        hit_behavior: Option<ButtonBehavior>,
-        mode: DispatchMode,
-        swipe_typing_on: bool,
-    ) -> Option<ButtonBehavior> {
-        let suppress_freeform = mode.suppresses_freeform_swipe();
-        if hit_behavior.is_none()
-            && !suppress_freeform
-            && swipe_typing_on
-        {
-            // Fall back: Standard mode with swipe-typing on, but
-            // hit-test missed — keep the swipe alive.
-            return Some(ButtonBehavior::SwipeSource);
-        }
-        hit_behavior
+    fn on(raw: ButtonBehavior, is_character: bool) -> Option<Hit> {
+        Some(Hit { raw, is_character })
     }
 
     #[test]
     fn standard_offkey_fallsback_to_swipesource() {
-        // The exact case the rewrite regressed: Standard layout
-        // (Dispatch::Standard, suppress_freeform=false), no key hit,
-        // swipe-typing on. Pre-fix: None → dropped. Post-fix:
-        // Some(SwipeSource) → recognizer runs.
-        let r = select_behavior(None, DispatchMode::Standard, true);
+        // The exact case the rewrite regressed: Standard layout, no
+        // key hit, swipe-typing on. Pre-fix: None -> dropped.
         assert_eq!(
-            r,
+            select_behavior(None, DispatchMode::Standard, true),
             Some(ButtonBehavior::SwipeSource),
             "off-key swipe in Standard mode with swipe-typing on \
              must run the recognizer — the OLD pre-rewrite code did"
@@ -5553,50 +5556,66 @@ mod offkey_swipe_fallback_regression_tests {
 
     #[test]
     fn standard_offkey_swipe_typing_off_drops() {
-        // When swipe-typing is OFF, even off-key drags should
-        // remain None — there's no recognizer pipeline to run.
-        let r = select_behavior(None, DispatchMode::Standard, false);
         assert_eq!(
-            r, None,
+            select_behavior(None, DispatchMode::Standard, false),
+            None,
             "off-key swipe with swipe-typing disabled stays None"
         );
     }
 
     #[test]
-    fn cardinal_offkey_stays_none() {
-        // In Cardinal mode, off-key drags don't get the recognizer
-        // fall-back (the recognizer never runs for cardinal anyway).
-        let r = select_behavior(None, DispatchMode::Cardinal, true);
-        assert_eq!(r, None, "off-key swipe in Cardinal stays None");
+    fn grid_mode_offkey_dispatches_cardinal() {
+        // Was `cardinal_offkey_stays_none`, asserting None. The live
+        // code returns Some(Cardinal) so drag_end can run
+        // dispatch_cardinal_swipe, whose own nearest-cell hit-test
+        // (30px) resolves a touch that landed between cells — the
+        // "cardinal swipes don't work" report, tested just below.
+        // Asserting None here contradicted that fix.
+        for mode in [DispatchMode::Cardinal, DispatchMode::Stenotype] {
+            assert_eq!(
+                select_behavior(None, mode, true),
+                Some(ButtonBehavior::Cardinal),
+                "{mode:?} off-cell start must reach the cardinal dispatcher"
+            );
+        }
     }
 
     #[test]
-    fn stenotype_offkey_stays_none() {
-        // Same for Stenotype: per-button steno dispatch only.
-        let r = select_behavior(None, DispatchMode::Stenotype, true);
-        assert_eq!(r, None, "off-key swipe in Stenotype stays None");
-    }
-
-    #[test]
-    fn onkey_normal_keeps_hit_behavior() {
-        // When the hit-test FINDS a key, the fall-back never
-        // activates — the key's own behavior wins.
-        let r = select_behavior(
-            Some(ButtonBehavior::Normal),
-            DispatchMode::Standard,
-            true,
+    fn onkey_letter_becomes_a_swipe_source() {
+        // Was `onkey_normal_keeps_hit_behavior`, asserting Normal.
+        assert_eq!(
+            select_behavior(on(ButtonBehavior::Normal, true), DispatchMode::Standard, true),
+            Some(ButtonBehavior::SwipeSource)
         );
-        assert_eq!(r, Some(ButtonBehavior::Normal));
+        // A Normal key that is NOT a character (Backspace, Shift) is
+        // not promoted, which is the distinction the old copy lacked
+        // the input to make.
+        assert_eq!(
+            select_behavior(on(ButtonBehavior::Normal, false), DispatchMode::Standard, true),
+            Some(ButtonBehavior::Normal)
+        );
     }
 
     #[test]
     fn onkey_swipesource_kept() {
-        let r = select_behavior(
-            Some(ButtonBehavior::SwipeSource),
-            DispatchMode::Standard,
-            true,
+        assert_eq!(
+            select_behavior(on(ButtonBehavior::SwipeSource, false), DispatchMode::Standard, true),
+            Some(ButtonBehavior::SwipeSource)
         );
-        assert_eq!(r, Some(ButtonBehavior::SwipeSource));
+    }
+
+    #[test]
+    fn onkey_swipesource_downgraded_in_grid_modes() {
+        // Space reports SwipeSource unconditionally; in cardinal/steno
+        // that would fire swipe-typing and look like the standard
+        // keyboard took over. Never modelled by the old copy.
+        for mode in [DispatchMode::Cardinal, DispatchMode::Stenotype] {
+            assert_eq!(
+                select_behavior(on(ButtonBehavior::SwipeSource, false), mode, true),
+                Some(ButtonBehavior::Normal),
+                "{mode:?}"
+            );
+        }
     }
 }
 

@@ -1016,8 +1016,6 @@ impl KeyboardView {
                 refresh_hitboxes(&widgets_begin, &kb_box_begin, &hitboxes_begin);
                 let dispatch_mode =
                     cur_layout_begin.borrow().style.dispatch_mode();
-                let suppress_freeform =
-                    dispatch_mode.suppresses_freeform_swipe();
                 let behavior = {
                     let boxes = hitboxes_begin.borrow();
                     // Default: no scaling (large min → factor clamps to
@@ -1028,82 +1026,24 @@ impl KeyboardView {
                         // drag_update can scale tap-eviction to match
                         // the classifier's cell-scaled tap threshold.
                         source_cell_min_for_begin.set(b.width.min(b.height));
-                        let raw = b.key.behavior();
-                        if suppress_freeform {
-                            // Experimental modes (cardinal/steno) must
-                            // NOT run the freeform swipe-typing
-                            // recognizer. The space key reports
-                            // SwipeSource unconditionally (correct for
-                            // QWERTY springboard), so swiping from the
-                            // cardinal/steno space bar would otherwise
-                            // fire swipe-typing and look like the normal
-                            // keyboard took over. Downgrade SwipeSource
-                            // → Normal here; the key's own declared
-                            // Cardinal behavior (steno buttons, cardinal
-                            // cells) is preserved so their swipes still
-                            // route through dispatch_cardinal_swipe.
-                            if raw == ButtonBehavior::SwipeSource {
-                                ButtonBehavior::Normal
-                            } else {
-                                raw
-                            }
-                        } else if raw == ButtonBehavior::Normal
-                            && matches!(b.key.action, KeyAction::Character)
-                            && crate::gestures::swipe::swipe_typing_enabled()
-                        {
-                            // Standard mode WITH swipe-typing enabled:
-                            // Normal letter keys participate in swipe-
-                            // typing so dragging through them composes
-                            // a word. When swipe-typing is off, leave
-                            // them as Normal so drag-off-letter is a
-                            // clean tap-or-cancel (no recognizer pass,
-                            // no surprise word).
-                            ButtonBehavior::SwipeSource
-                        } else {
-                            raw
+                        board_layouts::dispatch::Hit {
+                            raw: b.key.behavior(),
+                            is_character: matches!(b.key.action, KeyAction::Character),
                         }
                     });
-                    // Regression fix (vs the OLD pre-rewrite code at
-                    // 151b01d^): if no key was hit at drag_begin but
-                    // we're in Standard mode with swipe-typing on,
-                    // FALL BACK TO SwipeSource so the path still runs
-                    // through the recognizer at drag_end. The OLD
-                    // code never required a hit-test on the source
-                    // key for non-cardinal layouts (`treat = true`
-                    // unconditionally in non-cardinal); the rewrite
-                    // started requiring `Some(behavior)` and silently
-                    // dropped any gesture whose start landed outside
-                    // every hitbox. Real-world misses include:
-                    //   - touch landing in the bottom padding strip
-                    //     below the bottom row
-                    //   - touch landing in a gap between rows
-                    //   - compute_bounds returning bad/zero offset
-                    //     on a slow compositor so the translated
-                    //     kx/ky misses every box
-                    // dispatch_swipe_source operates on path geometry,
-                    // not on a source-key reference, so the fall-back
-                    // is safe.
-                    if hit.is_none()
-                        && !suppress_freeform
-                        && crate::gestures::swipe::swipe_typing_enabled()
-                    {
-                        Some(ButtonBehavior::SwipeSource)
-                    } else if hit.is_none() && suppress_freeform {
-                        // Cardinal / Stenotype off-cell start: fall
-                        // back to Cardinal behavior so drag_end runs
-                        // dispatch_cardinal_swipe. That function does
-                        // its own nearest-cell hit-test (within 30px)
-                        // and resolves the source key from a touch
-                        // that landed in the gap between cells. This
-                        // is the "cardinal swipes don't work" report:
-                        // CSS margins between cardinal cells create a
-                        // few-pixel band where touch coords miss every
-                        // widget but the user clearly intended to
-                        // swipe FROM the nearest cell.
-                        Some(ButtonBehavior::Cardinal)
-                    } else {
-                        hit
-                    }
+                    // The rule itself lives in board_layouts::dispatch, which
+                    // has no GTK dependency and so can actually be tested.
+                    // It used to be inline here, with a SECOND copy of it in
+                    // keyboard_behaviors_tests.rs that six tests exercised
+                    // instead — and that copy had drifted, asserting that a
+                    // letter key does NOT become a swipe source (it does) and
+                    // that an off-cell start in a grid mode is dropped (it
+                    // dispatches Cardinal). See that module's header.
+                    board_layouts::dispatch::select_behavior(
+                        hit,
+                        dispatch_mode,
+                        crate::gestures::swipe::swipe_typing_enabled(),
+                    )
                 };
                 info!(
                     "drag begin: behavior={:?} mode={:?} swipe_typing={} \
