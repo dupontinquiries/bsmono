@@ -111,6 +111,11 @@ pub trait Capture {
     fn start(&mut self) -> Result<(), String>;
     /// Stop and take the audio. `None` if nothing was ever started.
     fn stop(&mut self) -> Option<Take>;
+    /// Take the audio so far and keep recording — the loop-record cut.
+    /// `None` when not recording or nothing has arrived since the last
+    /// cut; the dropped-block count is since the take started, not
+    /// since the cut, so a hole anywhere in the session is still said.
+    fn split_take(&mut self) -> Option<Take>;
     fn recording(&self) -> bool;
     /// Seconds captured so far — the UI's counter.
     fn elapsed(&self) -> f32;
@@ -145,6 +150,7 @@ impl Capture for NullCapture {
         Err("no input device — nothing will be recorded".into())
     }
     fn stop(&mut self) -> Option<Take> { self.on = false; None }
+    fn split_take(&mut self) -> Option<Take> { None }
     fn recording(&self) -> bool { self.on }
     fn elapsed(&self) -> f32 { 0.0 }
     fn device_name(&self) -> &str { "none" }
@@ -366,6 +372,18 @@ impl Capture for CpalCapture {
         Some(Take {
             audio: studio_audio::SourceAudio { sample_rate: self.rate,
                                                channels: vec![samples] },
+            dropped_blocks: self.shared.dropped.load(Ordering::Relaxed),
+        })
+    }
+
+    fn split_take(&mut self) -> Option<Take> {
+        if !self.shared.taking.load(Ordering::Relaxed) { return None; }
+        // A real lock, briefly: the callback's try_lock loses this one
+        // block at worst, and counts it.
+        let samples = std::mem::take(&mut *self.shared.buf.lock().ok()?);
+        if samples.is_empty() { return None; }
+        Some(Take {
+            audio: studio_audio::SourceAudio { sample_rate: self.rate, channels: vec![samples] },
             dropped_blocks: self.shared.dropped.load(Ordering::Relaxed),
         })
     }

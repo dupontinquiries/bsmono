@@ -353,6 +353,7 @@ pub(crate) mod fakes {
     impl Capture for FakeMic {
         fn start(&mut self) -> Result<(), String> { Ok(()) }
         fn stop(&mut self) -> Option<Take> { None }
+        fn split_take(&mut self) -> Option<Take> { None }
         fn recording(&self) -> bool { false }
         fn elapsed(&self) -> f32 { 0.0 }
         fn device_name(&self) -> &str { "fake" }

@@ -71,6 +71,13 @@ pub enum ShellVerb {
     CallToggle,
     CallMute,
     CallPushToTalk,
+    /// The arrangement loop range, from the selection; and off.
+    LoopSelection,
+    LoopOff,
+    /// Takes: the selected lane clips copied onto their chain's root;
+    /// the lanes under the take target muted or unmuted.
+    CompTakes,
+    MuteTakeLanes(bool),
     RecordTake,
     /// Show or hide the out-of-key dimming in the piano roll.
     ToggleKeyGuide,
@@ -250,6 +257,14 @@ pub fn root() -> Vec<Choice> {
           Then::Do(Act::Shell(ShellVerb::CallMute))),
         c("push-to-talk on the call (hold the talk button)", None,
           Then::Do(Act::Shell(ShellVerb::CallPushToTalk))),
+        // Loop and takes.
+        c("loop the selected clips' span", Some("record inside it for a take per pass"),
+          Then::Do(Act::Shell(ShellVerb::LoopSelection))),
+        c("loop off", None, Then::Do(Act::Shell(ShellVerb::LoopOff))),
+        c("comp: use the selected takes on the track", Some("copies each onto its chain's root"),
+          Then::Do(Act::Shell(ShellVerb::CompTakes))),
+        c("mute the take lanes under this track", None, Then::Do(Act::Shell(ShellVerb::MuteTakeLanes(true)))),
+        c("unmute the take lanes under this track", None, Then::Do(Act::Shell(ShellVerb::MuteTakeLanes(false)))),
         c("find in the timeline", None, Then::Ask(Ask::FindHow)),
         c("jump to marker", None, Then::Ask(Ask::JumpMarker)),
         c("delete all markers", None, Then::Do(Act::Ops(vec![Op::ClearMarkers]))),

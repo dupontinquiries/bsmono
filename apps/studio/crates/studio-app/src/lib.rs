@@ -27,6 +27,7 @@ pub mod clip_inspector;
 pub mod fx_editor;
 pub mod find;
 pub mod library;
+pub mod looping;
 pub mod midi;
 pub mod mix_assistant;
 pub mod mixer_panel;
@@ -1172,6 +1173,94 @@ impl Studio {
         n
     }
 
+    /// The track a take is aimed at: the root of the selected clip's
+    /// chain when one clip is selected (re-taking the phrase you are
+    /// looking at), else the first audio track.
+    pub fn take_target(&self) -> Option<studio_core::TrackId> {
+        let p = &self.session.doc.project;
+        if let Some(c) = self.selection.first().and_then(|id| p.clips.get(id)) {
+            return Some(p.take_root(c.track));
+        }
+        p.tracks.iter().find(|t| t.kind == studio_core::TrackKind::Audio).map(|t| t.id)
+    }
+
+    /// Land a take (an already-imported source) at `at` on `track`'s
+    /// chain: the first lane with room, or a new one — one undo step for
+    /// the lane and the clip together. Returns where it landed.
+    pub fn place_take(&mut self, source: studio_core::SourceId, len: Ticks, at: Ticks,
+                      track: studio_core::TrackId) -> Option<(studio_core::TrackId, studio_core::ClipId)> {
+        let p = &self.session.doc.project;
+        let end = at.saturating_add(len);
+        let new_track = studio_core::TrackId(p.tracks.iter().map(|t| t.id.0).max().unwrap_or(0) + 1);
+        let (lane, mut ops) = match p.take_lane_ops(track, at, end, new_track) {
+            Ok(x) => x,
+            Err(e) => { self.status = format!("take refused: {e:?}"); return None; }
+        };
+        let cid = studio_core::ClipId(p.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1);
+        let made_lane = !ops.is_empty();
+        ops.push(studio_core::Op::AddClip { clip: studio_core::Clip {
+            id: cid, source, track: lane, pos: at, src_in: Ticks::ZERO, len, gain: 1.0, effects: vec![] } });
+        self.edit_group(ops, "take");
+        if !self.session.doc.project.clips.contains_key(&cid) { return None; }
+        let n = self.session.doc.project.take_lanes(track).len();
+        self.status = format!("take {:.1}s on {}{}", len.to_seconds(),
+            self.session.doc.project.tracks.iter().find(|t| t.id == lane).map(|t| t.name.as_str()).unwrap_or("?"),
+            if made_lane { format!(" — lane {n} of the chain") } else { String::new() });
+        Some((lane, cid))
+    }
+
+    /// The comp verb: the selected clips, each on some lane of a chain,
+    /// copied onto their chain's root over their own span. A clip already
+    /// on a root is left alone. One undo step.
+    pub fn comp_selected_takes(&mut self) -> usize {
+        let p = &self.session.doc.project;
+        let mut by_root: std::collections::BTreeMap<studio_core::TrackId, Vec<(Ticks, Ticks, studio_core::TrackId)>> =
+            Default::default();
+        for id in &self.selection {
+            let Some(c) = p.clips.get(id) else { continue };
+            let root = p.take_root(c.track);
+            if root == c.track { continue; }
+            by_root.entry(root).or_default().push((c.pos, c.end(), c.track));
+        }
+        if by_root.is_empty() {
+            self.status = "comp: select a take on a lane (not the track itself)".into();
+            return 0;
+        }
+        let mut next = p.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1;
+        let mut ops = Vec::new();
+        let mut n = 0;
+        for (root, choices) in &by_root {
+            match p.comp_ops(*root, choices, &mut next) {
+                Ok(o) => { n += choices.len(); ops.extend(o); }
+                Err(e) => { self.status = format!("comp refused: {e:?}"); return 0; }
+            }
+        }
+        self.edit_group(ops, &format!("comp {n} take{}", if n == 1 { "" } else { "s" }));
+        self.status = format!("comp: {n} take{} on the track — the lanes keep the rest",
+                              if n == 1 { "" } else { "s" });
+        n
+    }
+
+    /// Mute (or unmute) every lane under the take target's chain, so the
+    /// comp on the root is what plays.
+    pub fn set_take_lanes_muted(&mut self, muted: bool) -> usize {
+        let Some(root) = self.take_target() else {
+            self.status = "no audio track".into();
+            return 0;
+        };
+        let ops = self.session.doc.project.take_lanes_mute_ops(root, muted);
+        let n = ops.len();
+        if n == 0 {
+            self.status = if muted { "no unmuted take lanes under this track" }
+                          else { "no muted take lanes under this track" }.into();
+            return 0;
+        }
+        self.edit_group(ops, if muted { "mute take lanes" } else { "unmute take lanes" });
+        self.status = format!("{} {n} take lane{}", if muted { "muted" } else { "unmuted" },
+                              if n == 1 { "" } else { "s" });
+        n
+    }
+
     pub fn split_selection_on_grid(&mut self, steps: i64) {
         if self.selection.is_empty() {
             self.status = "split on grid: nothing selected".into();
@@ -1625,6 +1714,45 @@ impl Studio {
             &self.session.doc.project, sources, &std::collections::BTreeMap::new(),
             Ticks::ZERO, end, rate, &self.solo, &[],
         )
+    }
+
+    /// `[from, to)` of the arrangement, for the loop window.
+    pub fn render_arrangement_range(
+        &self,
+        rate: u32,
+        sources: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
+        from: Ticks,
+        to: Ticks,
+    ) -> Vec<f32> {
+        if to <= from { return Vec::new(); }
+        studio_audio::mixdown(
+            &self.session.doc.project, sources, &std::collections::BTreeMap::new(),
+            from, to, rate, &self.solo, &[],
+        )
+    }
+
+    /// Set (or clear) the loop range from the selection's span, as the
+    /// transport's `loop_range`. The playback block renders the range
+    /// alone and loops it; recording inside it is loop-record.
+    pub fn loop_selection(&mut self) {
+        let p = &self.session.doc.project;
+        let clips: Vec<&studio_core::Clip> = self.selection.iter().filter_map(|id| p.clips.get(id)).collect();
+        if clips.is_empty() {
+            self.status = "loop: select the clips that span the bars to loop".into();
+            return;
+        }
+        let start = clips.iter().map(|c| c.pos).min().unwrap();
+        let end = clips.iter().map(|c| c.end()).max().unwrap();
+        self.transport.loop_range = Some((start, end));
+        self.arrangement_dirty = true;
+        self.status = format!("looping {:.2}s – {:.2}s (record inside it for a take per pass)",
+                              start.to_seconds(), end.to_seconds());
+    }
+
+    pub fn loop_off(&mut self) {
+        self.transport.loop_range = None;
+        self.arrangement_dirty = true;
+        self.status = "loop off".into();
     }
 
     /// Land decoded audio on the timeline as a clip at the playhead — the
@@ -2421,6 +2549,9 @@ pub struct App {
     /// The in-house voice link: off until joined, pumped every frame the
     /// wire is polled. See `call`.
     call: call::Call,
+    /// Loop-record's pass detector, armed while recording with a loop
+    /// range. See `looping`.
+    passes: looping::Passes,
     /// Where the take started, so it lands where it was sung.
     take_from: studio_core::Ticks,
     settings_open: bool,
@@ -2472,7 +2603,14 @@ pub struct App {
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum SinkContent { Nothing, RackLoop, Arrangement }
+enum SinkContent {
+    Nothing,
+    RackLoop,
+    Arrangement,
+    /// The arrangement's loop range alone, rendered and set looped — see
+    /// `looping::Window`. Carries the range so a changed loop reloads.
+    ArrangementLoop(looping::Window),
+}
 
 #[cfg(feature = "app")]
 impl Default for App {
@@ -2577,6 +2715,7 @@ impl Default for App {
               find_ui: None,
               mic: capture::open_capture(),
               call: call::Call::new(),
+              passes: looping::Passes::default(),
               take_from: studio_core::Ticks::ZERO,
               settings_open: false, library_open: ws.library_open,
               rebinds: rebinds::Rebinds::decode(&ws.rebinds), rebind_capture: None,
@@ -3403,20 +3542,39 @@ impl eframe::App for App {
         // enforces exclusivity); this block just keeps the sink's buffer
         // truthful for the current owner and idles it for nobody.
         if self.studio.transport.playing {
-            if self.loaded != SinkContent::Arrangement || self.studio.arrangement_dirty {
-                let buf = self.studio.render_arrangement(self.sink.rate(), &self.audio);
-                self.sink.set_buffer(std::sync::Arc::new(buf), 2, false);
-                self.sink.seek(
-                    self.studio.transport.position().to_samples(self.sink.rate()).max(0) as usize);
+            let window = looping::Window::new(self.studio.transport.loop_range, self.sink.rate());
+            let want = match window { Some(w) => SinkContent::ArrangementLoop(w), None => SinkContent::Arrangement };
+            if self.loaded != want || self.studio.arrangement_dirty {
+                let (buf, looped, seek) = match window {
+                    // The range alone, looped by the callback — sample
+                    // exact, which loop-record depends on.
+                    Some(w) => (self.studio.render_arrangement_range(self.sink.rate(), &self.audio, w.start, w.end),
+                                true, w.frame(self.studio.transport.position())),
+                    None => (self.studio.render_arrangement(self.sink.rate(), &self.audio), false,
+                             self.studio.transport.position().to_samples(self.sink.rate()).max(0) as usize),
+                };
+                self.sink.set_buffer(std::sync::Arc::new(buf), 2, looped);
+                self.sink.seek(seek);
                 self.studio.arrangement_dirty = false;
-                self.loaded = SinkContent::Arrangement;
+                self.loaded = want;
             }
             self.sink.set_playing(true);
             if let Some(f) = self.sink.position() {
                 // Video follows audio, never the reverse (transport's rule №1)
                 // — the sink's consumed frames ARE the playhead.
-                self.studio.transport.set_position(
-                    studio_core::Ticks::from_samples(f as i64, self.sink.rate()));
+                let at = match window {
+                    Some(w) => w.timeline(f),
+                    None => studio_core::Ticks::from_samples(f as i64, self.sink.rate()),
+                };
+                self.studio.transport.set_position(at);
+                // Loop-record: the playhead came round while the take
+                // ran — what the microphone caught is one pass, placed
+                // at the loop's start on the next free lane.
+                if let Some(w) = window {
+                    if self.mic.recording() && self.passes.observe(at) {
+                        self.commit_pass(w);
+                    }
+                }
             } else if !self.sink.playing() {
                 self.studio.transport.stop();
                 self.studio.status = "reached the end".into();
@@ -4647,6 +4805,10 @@ impl App {
                 }
                 palette::ShellVerb::RecordTake => { self.toggle_take(); }
                 palette::ShellVerb::CallToggle => { self.toggle_call(); }
+                palette::ShellVerb::LoopSelection => { self.studio.loop_selection(); }
+                palette::ShellVerb::LoopOff => { self.studio.loop_off(); }
+                palette::ShellVerb::CompTakes => { self.studio.comp_selected_takes(); }
+                palette::ShellVerb::MuteTakeLanes(m) => { self.studio.set_take_lanes_muted(m); }
                 palette::ShellVerb::CallMute => {
                     let m = !self.call.muted();
                     self.call.set_muted(m);
@@ -4832,6 +4994,37 @@ impl App {
         } else { "left the call".into() };
     }
 
+    /// One loop-record pass: cut the take so far and place it at the
+    /// loop's start, trimmed to the loop's length (the frame's worth of
+    /// overshoot past the wrap belongs to the next pass and is dropped —
+    /// see `looping`'s module docs).
+    fn commit_pass(&mut self, w: looping::Window) {
+        let Some(take) = self.mic.split_take() else { return };
+        let mut audio = take.audio;
+        let max = (w.frames() as f64 * audio.sample_rate as f64 / w.rate as f64) as usize;
+        for ch in &mut audio.channels { ch.truncate(max); }
+        if audio.frames() == 0 { return; }
+        let name = format!("take {} pass {}", self.studio.session.doc.project.sources.len() + 1, self.passes.done);
+        let path = format!("takes/{}.flac", export::sanitize(&name));
+        let id = self.studio.import_audio(&name, &path, &audio);
+        let appended = self.studio.rack.channels.len().saturating_sub(1);
+        self.studio.rack.channels.truncate(appended);
+        for p in &mut self.studio.rack.patterns { p.rows.truncate(appended); }
+        let len = studio_core::Ticks::from_samples(audio.frames() as i64, audio.sample_rate);
+        if let Some(track) = self.studio.take_target() {
+            self.studio.place_take(id, len, w.start, track);
+        }
+        if let Ok(bytes) = studio_media::flac::encode_flac(&audio, id.0) {
+            self.studio.register_asset(id, &bytes);
+        }
+        self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+        self.audio.insert(id, audio);
+        self.studio.status = format!("pass {}: {}", self.passes.done, self.studio.status);
+        if take.dropped_blocks > 0 {
+            self.studio.status = format!("{} — WARNING: {} block(s) dropped", self.studio.status, take.dropped_blocks);
+        }
+    }
+
     fn toggle_take(&mut self) {
         if self.mic.recording() {
             let Some(take) = self.mic.stop() else {
@@ -4848,36 +5041,32 @@ impl App {
             let appended = self.studio.rack.channels.len().saturating_sub(1);
             self.studio.rack.channels.truncate(appended);
             for p in &mut self.studio.rack.patterns { p.rows.truncate(appended); }
-            let track = self.studio.session.doc.project.tracks.iter()
-                .find(|t| t.kind == studio_core::TrackKind::Audio).map(|t| t.id);
             let len = studio_core::Ticks::from_samples(
                 audio.frames() as i64, audio.sample_rate);
-            if let Some(track) = track {
-                let cid = studio_core::ClipId(
-                    self.studio.session.doc.project.clips.keys()
-                        .map(|c| c.0).max().unwrap_or(0) + 1);
-                self.studio.edit(studio_core::Op::AddClip { clip: studio_core::Clip {
-                    id: cid, source: id, track, pos: self.take_from,
-                    src_in: studio_core::Ticks::ZERO, len, gain: 1.0,
-                    effects: vec![] } }, "take");
+            // The second take of a phrase goes to a lane, not onto the
+            // first — see studio_core's takes module.
+            if let Some(track) = self.studio.take_target() {
+                self.studio.place_take(id, len, self.take_from, track);
             }
             if let Ok(bytes) = studio_media::flac::encode_flac(&audio, id.0) {
                 self.studio.register_asset(id, &bytes);
             }
             self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
             self.audio.insert(id, audio);
-            self.studio.status = format!("take: {:.1}s{}", len.to_seconds(),
-                if dropped > 0 {
-                    // Said, not swallowed: a take with holes must not be
-                    // built on unknowingly.
-                    format!(" — WARNING: {dropped} block(s) dropped, check the take")
-                } else { String::new() });
+            if dropped > 0 {
+                // Said, not swallowed: a take with holes must not be
+                // built on unknowingly.
+                self.studio.status = format!("{} — WARNING: {dropped} block(s) dropped, check the take",
+                                             self.studio.status);
+            }
         } else {
             self.take_from = self.studio.playhead();
+            self.passes = looping::Passes::start();
             match self.mic.start() {
                 Ok(()) => self.studio.status =
-                    format!("recording from {} at {} Hz…",
-                            self.mic.device_name(), self.mic.rate()),
+                    format!("recording from {} at {} Hz…{}",
+                            self.mic.device_name(), self.mic.rate(),
+                            if self.studio.transport.loop_range.is_some() { " (a take per pass of the loop)" } else { "" }),
                 Err(e) => self.studio.status = e,
             }
         }
@@ -6865,6 +7054,137 @@ pub fn shift_points(points: &[(Ticks, f32)], origin: Ticks) -> Vec<(Ticks, f32)>
 /// at the clip's start, never a negative curve time nothing could play.
 pub fn curve_time(at: Ticks, origin: Ticks) -> Ticks {
     Ticks(at.saturating_sub(origin).0.max(0))
+}
+
+#[cfg(test)]
+mod take_shell_tests {
+    //! The shell half of takes: a re-take lands on a lane, the comp verb
+    //! copies the chosen lane clips onto the root, the lanes mute as a
+    //! group, and the loop range is the selection's span.
+    use super::*;
+    use studio_core::{ClipId, Op, Ticks, TrackId};
+    use studio_egui::keys::Key;
+
+    /// A one-second mono source registered on the demo project.
+    fn source(s: &mut Studio, n: u64) -> studio_core::SourceId {
+        let audio = studio_audio::SourceAudio { sample_rate: 48_000, channels: vec![vec![0.1 * n as f32; 48_000]] };
+        let id = s.import_audio(&format!("t{n}"), &format!("takes/t{n}.flac"), &audio);
+        // import_audio appends a rack channel a vocal take does not want;
+        // the shell drops it, the way toggle_take does.
+        let appended = s.rack.channels.len().saturating_sub(1);
+        s.rack.channels.truncate(appended);
+        for p in &mut s.rack.patterns { p.rows.truncate(appended); }
+        id
+    }
+
+    #[test]
+    fn three_takes_at_the_playhead_are_three_lanes_and_one_undo_each() {
+        let mut s = Studio::demo();
+        s.selection.clear();
+        let root = s.take_target().expect("an audio track");
+        let far = Ticks::from_seconds(100.0); // where the demo has nothing
+        let len = Ticks::from_seconds(1.0);
+        let a = source(&mut s, 1);
+        let b = source(&mut s, 2);
+        let c = source(&mut s, 3);
+        let (l1, c1) = s.place_take(a, len, far, root).unwrap();
+        assert_eq!(l1, root, "the first take: on the track");
+        assert!(s.status.starts_with("take 1.0s on"), "{}", s.status);
+        let (l2, c2) = s.place_take(b, len, far, root).unwrap();
+        assert_ne!(l2, root);
+        assert!(s.status.contains("lane 2 of the chain"), "{}", s.status);
+        let (l3, _c3) = s.place_take(c, len, far, root).unwrap();
+        assert_eq!(s.session.doc.project.take_lanes(root), vec![l1, l2, l3]);
+        // The lane and its clip were one undo step: `u` removes both.
+        let tracks = s.session.doc.project.tracks.len();
+        s.key(Key::c('u'));
+        assert_eq!(s.session.doc.project.tracks.len(), tracks - 1, "the third lane is gone with its take");
+        assert_eq!(s.session.doc.project.take_lanes(root), vec![l1, l2]);
+        // With a clip on a lane selected, the take target is the ROOT.
+        s.selection = vec![c2];
+        assert_eq!(s.take_target(), Some(root), "a re-take of a lane's phrase goes to the chain, not under the lane");
+        // A take somewhere else lands on the root again.
+        let (l4, _) = s.place_take(c, len, Ticks::from_seconds(200.0), root).unwrap();
+        assert_eq!(l4, root);
+        let _ = c1;
+    }
+
+    #[test]
+    fn comp_copies_the_selected_lane_clips_onto_the_root_and_mutes_the_lanes() {
+        let mut s = Studio::demo();
+        s.selection.clear();
+        let root = s.take_target().unwrap();
+        let far = Ticks::from_seconds(100.0);
+        let len = Ticks::from_seconds(1.0);
+        let a = source(&mut s, 1);
+        let b = source(&mut s, 2);
+        let (_, _c1) = s.place_take(a, len, far, root).unwrap();
+        let (l2, c2) = s.place_take(b, len, far, root).unwrap();
+        // Split the second take in half on its lane, choose its second half.
+        s.selection = vec![c2];
+        s.transport.set_position(far.saturating_add(Ticks::from_seconds(0.5)));
+        s.key(Key::c('s'));
+        let halves: Vec<ClipId> = {
+            let p = &s.session.doc.project;
+            let mut v: Vec<&studio_core::Clip> = p.clips.values().filter(|c| c.track == l2).collect();
+            v.sort_by_key(|c| c.pos);
+            v.iter().map(|c| c.id).collect()
+        };
+        assert_eq!(halves.len(), 2, "split on the lane: two pieces");
+        s.selection = vec![halves[1]];
+        assert_eq!(s.comp_selected_takes(), 1);
+        assert!(s.status.starts_with("comp: 1 take on the track"), "{}", s.status);
+        let p = &s.session.doc.project;
+        let mut on_root: Vec<&studio_core::Clip> = p.clips.values().filter(|c| c.track == root && c.pos >= far).collect();
+        on_root.sort_by_key(|c| c.pos);
+        assert_eq!(on_root.len(), 2, "take 1's head, take 2's tail");
+        assert_eq!((on_root[0].source, on_root[0].len), (a, Ticks::from_seconds(0.5)));
+        assert_eq!((on_root[1].source, on_root[1].src_in), (b, Ticks::from_seconds(0.5)), "the offset into take 2 is carried");
+        assert_eq!(p.clips.values().filter(|c| c.track == l2).count(), 2, "the lane keeps both halves");
+        // Mute the lanes: the comp is what plays. Then undo it all.
+        s.selection = vec![on_root[0].id];
+        assert_eq!(s.set_take_lanes_muted(true), 1);
+        assert!(s.session.doc.project.tracks.iter().find(|t| t.id == l2).unwrap().muted);
+        assert_eq!(s.set_take_lanes_muted(true), 0, "nothing left to mute");
+        assert_eq!(s.set_take_lanes_muted(false), 1);
+        s.key(Key::c('u')); // unmute
+        s.key(Key::c('u')); // mute
+        s.key(Key::c('u')); // the comp, as one step
+        let p = &s.session.doc.project;
+        let on_root: Vec<&studio_core::Clip> = p.clips.values().filter(|c| c.track == root && c.pos >= far).collect();
+        assert_eq!(on_root.len(), 1, "one undo removed the comp piece and restored take 1 whole");
+        assert_eq!(on_root[0].len, len);
+        // A root clip selected: nothing to comp, said.
+        s.selection = vec![on_root[0].id];
+        assert_eq!(s.comp_selected_takes(), 0);
+        assert!(s.status.starts_with("comp: select a take on a lane"), "{}", s.status);
+    }
+
+    #[test]
+    fn the_loop_range_is_the_selections_span_and_off_clears_it() {
+        let mut s = Studio::demo();
+        let p = &s.session.doc.project;
+        let c1 = ClipId(1);
+        let (pos, end) = (p.clips[&c1].pos, p.clips[&c1].end());
+        s.selection = vec![c1];
+        s.loop_selection();
+        assert_eq!(s.transport.loop_range, Some((pos, end)));
+        assert!(s.arrangement_dirty, "the sink must reload with the range alone");
+        assert!(s.status.starts_with("looping"), "{}", s.status);
+        s.selection.clear();
+        s.loop_selection();
+        assert_eq!(s.transport.loop_range, Some((pos, end)), "no selection: the range is kept, and said");
+        assert!(s.status.starts_with("loop: select"), "{}", s.status);
+        s.loop_off();
+        assert_eq!(s.transport.loop_range, None);
+        // The range renders on its own: exactly the span's frames.
+        s.selection = vec![c1];
+        s.loop_selection();
+        let sources: std::collections::BTreeMap<_, _> = Default::default();
+        let out = s.render_arrangement_range(48_000, &sources, pos, end);
+        assert_eq!(out.len() as i64, (end.to_samples(48_000) - pos.to_samples(48_000)) * 2);
+        let _ = Op::SetTrackGain { id: TrackId(1), gain: 1.0 };
+    }
 }
 
 #[cfg(test)]
