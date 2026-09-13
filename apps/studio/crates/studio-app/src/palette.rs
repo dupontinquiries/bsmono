@@ -71,6 +71,11 @@ pub enum ShellVerb {
     CallToggle,
     CallMute,
     CallPushToTalk,
+    /// Chord tools on the roll's channel: a harmony `n` scale degrees
+    /// away (2 = third, 4 = fifth, 7 = octave, negative below), and every
+    /// chord broken into a run in this order.
+    Harmonize(i8),
+    Arpeggiate(studio_live::Arp),
     /// The arrangement loop range, from the selection; and off.
     LoopSelection,
     LoopOff,
@@ -263,6 +268,16 @@ pub fn root() -> Vec<Choice> {
           Then::Do(Act::Shell(ShellVerb::CallMute))),
         c("push-to-talk on the call (hold the talk button)", None,
           Then::Do(Act::Shell(ShellVerb::CallPushToTalk))),
+        // The roll's chord tools.
+        c("harmonize the roll: add thirds", Some("in the project key, or major"),
+          Then::Do(Act::Shell(ShellVerb::Harmonize(2)))),
+        c("harmonize the roll: add fifths", None, Then::Do(Act::Shell(ShellVerb::Harmonize(4)))),
+        c("harmonize the roll: add an octave above", None, Then::Do(Act::Shell(ShellVerb::Harmonize(7)))),
+        c("harmonize the roll: add an octave below", None, Then::Do(Act::Shell(ShellVerb::Harmonize(-7)))),
+        c("arpeggiate the roll's chords: up", Some("one step per note"),
+          Then::Do(Act::Shell(ShellVerb::Arpeggiate(studio_live::Arp::Up)))),
+        c("arpeggiate the roll's chords: down", None, Then::Do(Act::Shell(ShellVerb::Arpeggiate(studio_live::Arp::Down)))),
+        c("arpeggiate the roll's chords: up and down", None, Then::Do(Act::Shell(ShellVerb::Arpeggiate(studio_live::Arp::UpDown)))),
         // Loop and takes.
         c("loop the selected clips' span", Some("record inside it for a take per pass"),
           Then::Do(Act::Shell(ShellVerb::LoopSelection))),

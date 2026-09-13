@@ -1173,6 +1173,39 @@ impl Studio {
         n
     }
 
+    /// Chord tools on the roll's channel (the same channel the rack strip
+    /// selects). `degrees` scale degrees in the project's key when it has
+    /// one — a third is 2, a fifth 4, an octave 7 — else the major
+    /// interval in semitones. Direct rack edits, like the roll's own.
+    pub fn harmonize_roll(&mut self, degrees: i32) -> usize {
+        let key = self.session.doc.project.key;
+        let ch = self.selected_channel;
+        let Some(p) = self.rack.patterns.get_mut(self.current_pattern) else {
+            self.status = "no pattern".into();
+            return 0;
+        };
+        let n = p.harmonize(ch, degrees, key);
+        self.loop_dirty |= n > 0;
+        let what = match degrees { 2 => "thirds", 4 => "fifths", 7 => "octaves", -7 => "octaves below", _ => "notes" };
+        self.status = if n == 0 { format!("harmonize: nothing to add ({what} already there, or an empty roll)") }
+                      else { format!("harmonize: {n} {what} added{}", if key.is_some() { " in key" } else { "" }) };
+        n
+    }
+
+    /// Every chord on the roll's channel becomes a run of its notes.
+    pub fn arpeggiate_roll(&mut self, order: studio_live::Arp, note_len: u32) -> usize {
+        let ch = self.selected_channel;
+        let Some(p) = self.rack.patterns.get_mut(self.current_pattern) else {
+            self.status = "no pattern".into();
+            return 0;
+        };
+        let n = p.arpeggiate(ch, order, note_len);
+        self.loop_dirty |= n > 0;
+        self.status = if n == 0 { "arpeggiate: no chords on this channel (two or more notes on one step)".into() }
+                      else { format!("arpeggiate: {n} chord{} broken into runs", if n == 1 { "" } else { "s" }) };
+        n
+    }
+
     /// The track a take is aimed at: the root of the selected clip's
     /// chain when one clip is selected (re-taking the phrase you are
     /// looking at), else the first audio track.
@@ -4842,6 +4875,8 @@ impl App {
                 palette::ShellVerb::RecordTake => { self.toggle_take(); }
                 palette::ShellVerb::CallToggle => { self.toggle_call(); }
                 palette::ShellVerb::LoopSelection => { self.studio.loop_selection(); }
+                palette::ShellVerb::Harmonize(d) => { self.studio.harmonize_roll(d as i32); }
+                palette::ShellVerb::Arpeggiate(order) => { self.studio.arpeggiate_roll(order, 1); }
                 palette::ShellVerb::LoopOff => { self.studio.loop_off(); }
                 palette::ShellVerb::CompTakes => { self.studio.comp_selected_takes(); }
                 palette::ShellVerb::MuteTakeLanes(m) => { self.studio.set_take_lanes_muted(m); }
@@ -7105,6 +7140,38 @@ pub fn shift_points(points: &[(Ticks, f32)], origin: Ticks) -> Vec<(Ticks, f32)>
 /// at the clip's start, never a negative curve time nothing could play.
 pub fn curve_time(at: Ticks, origin: Ticks) -> Ticks {
     Ticks(at.saturating_sub(origin).0.max(0))
+}
+
+#[cfg(test)]
+mod chord_tool_tests {
+    use super::*;
+
+    #[test]
+    fn the_roll_tools_edit_the_selected_channel_and_say_what_they_did() {
+        let mut s = Studio::demo();
+        let ch = s.selected_channel;
+        let pat = s.current_pattern;
+        let note = |key: i8, start: u32| studio_live::Note { key, start, len: 4, vel: 0.8, slide: false };
+        s.rack.patterns[pat].add_note(ch, note(3, 0));
+        s.rack.patterns[pat].add_note(ch, note(3, 8));
+        s.loop_dirty = false;
+        assert_eq!(s.harmonize_roll(4), 2);
+        assert!(s.status.starts_with("harmonize: 2 fifths added"), "{}", s.status);
+        assert!(s.loop_dirty, "the loop must re-render");
+        assert_eq!(s.rack.patterns[pat].roll(ch).len(), 4);
+        assert_eq!(s.arpeggiate_roll(studio_live::Arp::Up, 1), 2, "two chords now");
+        assert!(s.status.starts_with("arpeggiate: 2 chords"), "{}", s.status);
+        assert_eq!(s.rack.patterns[pat].roll(ch).len(), 8, "four one-step notes per four-step chord");
+        assert_eq!(s.arpeggiate_roll(studio_live::Arp::Up, 1), 0);
+        assert!(s.status.contains("no chords"), "{}", s.status);
+        // With a key set, the harmony is diatonic: C major, a third above C is E.
+        s.edit(studio_core::Op::SetKey { key: Some(studio_core::Key { root: 0, scale: studio_core::Scale::Major }) }, "key");
+        s.rack.patterns[pat].rolls.clear();
+        s.rack.patterns[pat].add_note(ch, note(3, 0));
+        s.harmonize_roll(2);
+        assert!(s.status.ends_with("in key"), "{}", s.status);
+        assert_eq!(s.rack.patterns[pat].roll(ch).iter().map(|n| n.key).collect::<Vec<_>>(), vec![3, 7]);
+    }
 }
 
 #[cfg(test)]

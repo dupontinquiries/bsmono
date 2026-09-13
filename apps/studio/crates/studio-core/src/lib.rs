@@ -296,6 +296,23 @@ impl Key {
     pub fn name(&self) -> String {
         format!("{} {}", PITCH_NAMES[(self.root % 12) as usize], self.scale.name())
     }
+    /// The roll key `steps` SCALE degrees away from `key` — up for
+    /// positive, down for negative. A third is 2 degrees, a fifth 4, an
+    /// octave the scale's length. A key that is not in the scale steps
+    /// from the nearest scale note below it, so an out-of-key note still
+    /// harmonizes to something in the key rather than nothing.
+    pub fn scale_step(&self, key: i8, steps: i32) -> i8 {
+        let degrees = self.scale.degrees();
+        let n = degrees.len() as i32;
+        let pc = (key_midi(key) - self.root as i32).rem_euclid(12) as u8;
+        // Degree index of the note, or of the nearest scale note below.
+        let idx = degrees.iter().rposition(|&d| d <= pc).unwrap_or(0) as i32;
+        let base = key as i32 - (pc as i32 - degrees[idx as usize] as i32);
+        let target = idx + steps;
+        let octaves = target.div_euclid(n);
+        let deg = degrees[target.rem_euclid(n) as usize] as i32;
+        (base + octaves * 12 + (deg - degrees[idx as usize] as i32)).clamp(i8::MIN as i32, i8::MAX as i32) as i8
+    }
 }
 
 /// A named point on the timeline.
@@ -2292,6 +2309,25 @@ mod key_and_marker_tests {
         assert_eq!(note_label(51), "C6", "midi 84 — the octave boundary, not a sharp");
         assert_eq!(note_label(52), "C#6");
         assert_eq!(note_label(48), "A5");
+    }
+
+    #[test]
+    fn a_scale_step_walks_the_degrees_and_an_out_of_key_note_snaps_below() {
+        // Roll key 0 is A1; in C major, C is key 3 (A, A#, B, C).
+        let c_major = Key { root: 0, scale: Scale::Major };
+        let c = 3i8;
+        assert_eq!(c_major.scale_step(c, 2), c + 4, "a third above C is E");
+        assert_eq!(c_major.scale_step(c, 4), c + 7, "a fifth above C is G");
+        assert_eq!(c_major.scale_step(c, 7), c + 12, "seven degrees is the octave");
+        assert_eq!(c_major.scale_step(c + 11, 2), c + 14, "a third above B wraps: D");
+        assert_eq!(c_major.scale_step(c + 4, -2), c, "a third below E is C");
+        assert_eq!(c_major.scale_step(c, -1), c - 1, "a step below C is B");
+        assert_eq!(c_major.scale_step(c + 1, 2), c + 4, "C# is not in C major: steps from C, to E");
+        let a_minor = Key { root: 9, scale: Scale::Minor };
+        assert_eq!(a_minor.scale_step(0, 2), 3, "a third above A in A minor is C");
+        assert_eq!(a_minor.scale_step(0, 4), 7, "a fifth above A is E");
+        let chromatic = Key { root: 0, scale: Scale::Chromatic };
+        assert_eq!(chromatic.scale_step(5, 4), 9, "chromatic: a degree is a semitone");
     }
 
     #[test]
