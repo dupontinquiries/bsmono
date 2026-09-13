@@ -99,6 +99,15 @@ pub struct AbilityDef {
     pub power_scale: f32, // fraction of god's power stat added to dmg/heal
 }
 
+impl AbilityDef {
+    /// Mobility abilities (dash/blink) are the only shape where "a
+    /// direction" is the whole aim — never a substitute for precise casts,
+    /// and never an ultimate (see touch.rs's drag-to-aim, which uses this).
+    pub fn quick_aimable(&self) -> bool {
+        !self.ult && matches!(self.arch, Archetype::Dash { .. } | Archetype::Blink { .. })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct GodDef {
     pub id: u32,
@@ -419,4 +428,27 @@ pub const PAL_ACCENT: usize = 3; // crest colour: eyes + crest (from Clawbound's
 
 pub fn voxel_scale() -> f32 {
     VOXEL_SIZE
+}
+
+#[cfg(test)]
+mod quick_aim_tests {
+    use super::*;
+
+    #[test]
+    fn ultimates_are_never_quick_aimable() {
+        for def in ROSTER.iter() {
+            for ab in def.abilities.iter().filter(|a| a.ult) {
+                assert!(!ab.quick_aimable(), "{}'s ultimate {} must never be a drag-to-aim quick cast", def.name, ab.name);
+            }
+        }
+    }
+
+    #[test]
+    fn every_ancestor_has_a_real_mobility_option_to_drag_aim() {
+        // not a hard requirement of the game design, but worth knowing if a
+        // future ancestor ships with no dash/blink at all — touch's quick
+        // aim would then just never activate for them, silently
+        let with_mobility = ROSTER.iter().filter(|d| d.abilities.iter().any(|a| a.quick_aimable())).count();
+        assert!(with_mobility > ROSTER.len() / 2, "expected most ancestors to have a drag-aimable mobility skill, found {with_mobility}/{}", ROSTER.len());
+    }
 }

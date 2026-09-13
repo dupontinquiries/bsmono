@@ -433,7 +433,14 @@ fn handle_window_event(s: &mut AppState, event: WindowEvent) {
 
     match event {
         WindowEvent::CloseRequested => s.exiting = true,
-        WindowEvent::Focused(false) => s.input.handle(InputEvent::FocusLost),
+        WindowEvent::Focused(false) => {
+            s.input.handle(InputEvent::FocusLost);
+            // release the OS grab and show the cursor while the window is
+            // in the background — otherwise `s.locked` can say "captured"
+            // while the compositor has already let go of it behind our
+            // back, and a later click silently no-ops instead of re-locking.
+            set_locked(s, false);
+        }
         WindowEvent::Resized(size) => {
             s.renderer.resize(size.width.max(1), size.height.max(1));
             let sh = size.width.min(size.height).max(1) as f32;
@@ -561,14 +568,17 @@ fn gather_controls(s: &mut AppState, dt: f32) {
     if c.menu && s.capturing.is_none() {
         if s.ui.shop_open {
             s.ui.shop_open = false;
+            s.ui.sell_armed = None;
         } else if s.controls_open {
             s.controls_open = false;
             if !s.cfg.settings.touch_enabled {
                 set_locked(s, true);
             }
-        } else if s.locked {
-            set_locked(s, false);
         } else {
+            // one press: free the cursor and open the panel together,
+            // instead of a first press just releasing and a second one
+            // actually opening it
+            set_locked(s, false);
             s.controls_open = true;
         }
     }
@@ -576,14 +586,20 @@ fn gather_controls(s: &mut AppState, dt: f32) {
         s.ui.shop_open = !s.ui.shop_open;
         if s.ui.shop_open {
             set_locked(s, false);
-        } else if !s.cfg.settings.touch_enabled {
-            set_locked(s, true);
+        } else {
+            s.ui.sell_armed = None;
+            if !s.cfg.settings.touch_enabled {
+                set_locked(s, true);
+            }
         }
     }
     s.scoreboard = c.scoreboard;
     if gameplay_active {
         s.cam_yaw += c.look.x;
-        s.cam_pitch = (s.cam_pitch + c.look.y).clamp(0.06, 1.15);
+        // a touch more headroom at both ends than before: near-level
+        // when you push all the way up, a steeper overhead angle at the
+        // other end, so the range doesn't feel like it stops short.
+        s.cam_pitch = (s.cam_pitch + c.look.y).clamp(-0.12, 1.30);
         s.cam_dist = (s.cam_dist - c.zoom).clamp(4.5, 16.0);
         if c.recenter {
             if let Some(g) = s.game.as_ref() {
@@ -669,15 +685,17 @@ fn start_game(s: &mut AppState) {
         *e = pool.remove(k.min(pool.len() - 1));
     }
     s.game = Some(Game::new(s.ui.selected as u32, allies, enemies));
-    // `Scene` is created on the very first `render()` call, before the menu
-    // is even reachable — see `render()` below — so by the time the player
-    // can click into a match it already exists and its obstacle list is
-    // ready to hand to the fresh `Game`.
-    if let Some(scene) = &s.scene {
-        s.game.as_mut().unwrap().set_obstacles(scene.obstacles.clone());
-    }
     s.vfx = Vfx::default();
     s.screen = Screen::Playing;
+    // static for the whole match (an ancestor's kit never changes): which
+    // ability slots accept a touch drag-to-aim. Computed once here rather
+    // than every frame in gather_controls so it can never race a same-frame
+    // touch-down against a stale value.
+    {
+        let def = s.game.as_ref().unwrap().def(0);
+        let caps = [def.abilities[0].quick_aimable(), def.abilities[1].quick_aimable(), def.abilities[2].quick_aimable(), def.abilities[3].quick_aimable()];
+        s.touch.set_drag_capable(caps);
+    }
     #[cfg(feature = "audio")]
     if s.ambience.is_none() {
         s.ambience = crate::audio::output::Ambience::start();
@@ -723,14 +741,28 @@ fn render(s: &mut AppState) {
             // casts are edges: queue them once, outside the step loop
             for slot in 0..4u32 {
                 if c.cast[slot as usize] {
-                    g.cast_queue.push((0, slot, aim));
+                    let cast_aim = if let Some(dir) = c.cast_dir[slot as usize] {
+                        // a committed touch drag-to-aim: rotate its screen-
+                        // space direction (x right, y up) onto the camera's
+                        // own basis, same convention movement uses, so a
+                        // drag toward the top of the screen aims the way
+                        // the camera is actually looking, not a fixed axis
+                        let (fwd, right) = input::camera_basis(yaw);
+                        let world_dir = fwd * dir.y + right * dir.x;
+                        g.gods[0].pos + world_dir * 20.0
+                    } else {
+                        aim
+                    };
+                    g.cast_queue.push((0, slot, cast_aim));
                 }
             }
             s.accumulator = (s.accumulator + dt_frame).min(0.25);
             while s.accumulator >= 1.0 / 60.0 {
                 s.accumulator -= 1.0 / 60.0;
-                let fwd = Vec3::new(yaw.sin(), 0.0, yaw.cos()).normalize_or_zero();
-                let right = Vec3::new(fwd.z, 0.0, -fwd.x);
+                // camera_basis (input.rs) is verified against the real view
+                // matrix; hand-rolling this vector here is exactly how it
+                // was backwards before (D/right and A/left were swapped).
+                let (fwd, right) = crate::input::camera_basis(yaw);
                 let mut mv = fwd * c.mv.y + right * c.mv.x;
                 if let Some(t) = walk_to {
                     let d = Vec3::new(t.x - g.gods[0].pos.x, 0.0, t.z - g.gods[0].pos.z);
@@ -873,8 +905,11 @@ fn render(s: &mut AppState) {
                         ui::draw_hud(ctx, g, 0, vp, s.renderer.width as f32, s.renderer.height as f32, &mut s.ui);
                         if s.cfg.settings.touch_enabled {
                             ui::draw_touch_pad(ctx, &s.touch, g, s.renderer.width as f32, s.renderer.height as f32);
-                        } else if !s.locked && !s.controls_open {
-                            ui::draw_click_to_play(ctx);
+                        } else {
+                            ui::draw_crosshair(ctx, s.locked, s.renderer.width as f32, s.renderer.height as f32);
+                            if !s.locked && !s.controls_open {
+                                ui::draw_click_to_play(ctx);
+                            }
                         }
                     }
                     if s.scoreboard {

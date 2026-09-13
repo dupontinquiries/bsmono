@@ -12,12 +12,16 @@ The roster and its kits come straight from `monorepo/games/clawbound/src/ancesto
 (names, legends, philosophies, ability names, crest colours). This crate contains
 no third-party trademarks or assets.
 
+Headless logic (sim, weather, map events, wildlife, objectives, catastrophes,
+input resolution, audio DSP) is under `cargo test` and trustworthy. The
+rendering, ambience, and touch-drag visuals have not been seen running on a
+real display — see **[TODO.md](TODO.md)** for exactly what that covers and
+what else is known-but-unresolved.
+
 ## Features
 
 - **5v5, three lanes** — TOP / MID / BOT with waypoint pathing, per-lane minion
-  waves (melee + casters, small feline voxel bodies matching the ancestors'
-  own — a collar in the team colour stands in for old armor trim), 12 towers,
-  two Elders gated behind tower kills.
+  waves (melee + casters), 12 towers, two Elders gated behind tower kills.
 - **13 playable ancestors** — Goldenmane, Duskstripe, Rainspots, Nightpelt,
   Windclaw, Faryowl, Oldroar, Twofang, Suneye, Snowhush, Riptail, Stillsmoke,
   Stonewhisper — across 5 roles (Warrior / Guardian / Mage / Hunter / Assassin).
@@ -71,13 +75,7 @@ no third-party trademarks or assets.
   channel, bank foam, sparkling sun glints, rain rings. Voxel "gelatin" beads
   ride the surface, waders throw splash rings, fish leap, dragonflies stitch
   the air. Wading costs up to 40 % speed by depth; Rainspots and Riptail are
-  riverborn and wade free. The water and every alpha-blended voxel now
-  properly occlude behind nearer opaque geometry (a bridge pier no longer
-  reads as behind the water sheet flowing past it).
-- **Trees and stones block movement** — the jungle isn't just scenery: units
-  push out of tree trunks and rock/boulder footprints the same way they push
-  out of each other, at a radius scaled to each prop's size. Bushes, ferns,
-  vines and the bridge stay walk-through.
+  riverborn and wade free.
 - **Wind you can see and hear** — gust fronts (weather.rs) rise in ~1.5 s
   and fall over ~6 s, more often and harder in storms, with a wandering
   heading. Every flora voxel carries a sway weight; the voxel and shadow
@@ -102,17 +100,21 @@ no third-party trademarks or assets.
 - **Ambient life** — ground-bird flocks that flush when you come near and
   settle elsewhere, glow-moths around the heal trees at night, fireflies that
   come out under cloud, sky birds that scatter at lightning and roost at night.
-- **100-item shop** in 8 stat categories, three tiers, 8 stacking items. AI
-  ancestors auto-buy role-appropriate builds. Item slots unlock with level —
-  1 at level 1, ramping to the full 6 by level 9 — and level 9 is also a
-  one-time capstone: a flat +10% max HP and power on top of the normal
-  1–20 growth curve.
+- **100-item shop** in 8 stat categories, three tiers, 8 stacking items,
+  searchable (type to filter, arrow keys + Enter to buy), with hover-lift and
+  a green purchase flash on item cards, a gold dot marking categories
+  recommended for your role, and sell-back (click an owned slot to arm it,
+  click again for a 70 % refund). AI ancestors auto-buy role-appropriate
+  builds. The search/keyboard-grid pattern is adapted from games/clawbound's
+  `lobby.rs` ancestor picker (`LobbyInput::Point/Move/Search`), generalized
+  into `src/gridpick.rs` so the same tested logic backs both the shop and
+  the ancestor-select screen below.
 - **Character select** with live offscreen-rendered voxel portraits, legend,
-  philosophy, stat bars and ability descriptions.
-- **Full HUD**: ability bar with cooldown sweeps, HP/MP/XP bars, gold + up to
-  6 item slots (fewer before level 9 — see above), kill feed, announcements,
-  floating damage numbers, world-space HP bars, 3-lane minimap, hold-Tab
-  scoreboard, death/victory/defeat screens.
+  philosophy, stat bars, ability descriptions, a search box, keyboard grid
+  navigation (arrows + Enter to lock in), and hover/cursor-lift animation.
+- **Full HUD**: ability bar with cooldown sweeps, HP/MP/XP bars, gold + 6 item
+  slots, kill feed, announcements, floating damage numbers, world-space HP
+  bars, 3-lane minimap, hold-Tab scoreboard, death/victory/defeat screens.
 - **Rendering**: MSAA×4, PCF shadow maps that follow the (weather-driven,
   slowly arcing) sun, a 1.6 u heightmap with per-material fragment detail
   (grass tufts, cracked dirt with pebbles and ruts, pebbled riverbed with
@@ -129,7 +131,9 @@ ALSA headers (`libasound2-dev`) at build time — or build with
 
 ```bash
 cargo run --release          # windowed game
-cargo test                   # 49 tests: roster, items, lanes, sim, weather, map events, wildlife,
+cargo test                   # 79 tests (67 lib + integration + shader validation + doctests):
+                             #   roster, items, lanes, sim, weather, map events, wildlife,
+                             #   objectives, catastrophes, input/camera math, gridpick, touch,
                              #   plus offline WGSL validation of every shader with naga
 cargo run -- --screenshot    # headless demo: renders PNG screenshots (no window)
 cargo run --example simdbg 3 # 12-minute AI-only match trace for a seed (economy, events,
@@ -157,9 +161,8 @@ cargo run -- --screenshot    # renders via lavapipe (CPU)
 Every action is rebindable — open **CONTROLS** from the main menu or press
 `Esc` in a match, click a row, press the key / mouse button / pad button you
 want. Bindings are *logical* keys (the character a key types on your layout),
-so a Dvorak player binding `e` gets the key labelled `e`. Three stock schemes
-(QWERTY WASD, Dvorak `,AOE`, Dvorak `.OEU` — the ESDF grip's Dvorak
-equivalent) plus custom. Saved to
+so a Dvorak player binding `e` gets the key labelled `e`. Two stock schemes
+(QWERTY WASD, Dvorak `,AOE`) plus custom. Saved to
 `$XDG_CONFIG_HOME/clawbound/controls.cfg` (a plain text file). This is the
 input model the monorepo's other games (skydribble, unendlich) use.
 
@@ -174,7 +177,7 @@ input model the monorepo's other games (skydribble, unendlich) use.
 | `Tab` / `C` (hold) | Scoreboard |
 | Mouse wheel / `PgUp` `PgDn` | Zoom |
 | `X` | Camera behind me |
-| `Esc` | Release cursor → controls panel |
+| `Esc` | Pause: release cursor and open the controls panel (one press) |
 
 **Controller** (`--features gamepad`, gilrs; needs `libudev-dev` on Linux):
 left stick move, right stick look, `RT` attack, `X Y B RB` abilities 1–4,
@@ -184,12 +187,46 @@ rebindable like keys (press a pad button on a row).
 **Touch** (phones / tablets — postmarketOS, Plasma Mobile): enabled
 automatically on the first touch. A floating stick appears under your thumb
 anywhere in the left 42 % of the screen; attack and ability buttons (with
-cooldown sweeps) cluster bottom-right; drag in the open area to turn the
-camera; **tap the ground to walk there**. Portrait and landscape both work.
-Size and on/off live in the controls panel.
+cooldown sweeps, and a flash the instant one comes off cooldown) cluster
+bottom-right; drag in the open area to turn the camera; **tap the ground to
+walk there**. Portrait and landscape both work. Size and on/off live in the
+controls panel.
+
+**Drag-to-aim a mobility skill**: for whichever ability is a Dash or Blink
+(never an ultimate — `AbilityDef::quick_aimable()`), press and drag from
+that ability's own button to pick a direction — a line and a confidence
+ring show exactly where it'll go — then release to fire; a plain tap still
+casts it at the camera crosshair like every other ability. This replaced an
+earlier, unsafe design that read a fast swipe *anywhere in the open area* as
+a dash: that collided with ordinary fast camera-whipping during real fights,
+which crosses the same velocity thresholds a deliberate flick would — a
+misread there doesn't cost you a menu selection, it burns your escape at the
+worst possible moment. Anchoring the gesture to the button itself (never
+where camera-panning starts) and excluding ultimates and every non-
+directional archetype (heals, shields, novas...) closes that off structurally
+rather than by tuning thresholds. The per-ability-type care this needed —
+ultimates get none of it, healing/shield/nova casts aim exactly like they do
+on keyboard/mouse/pad — is the actual adaptation of skydribble's flick-to-
+dodge for this game, not just a reskinned gesture.
+
+Tap recognition in the open area is `src/touchkit/`, vendored from the
+monorepo's `shared/touchkit` — the same gesture recognizer skydribble's
+on-screen driving joystick (`shellkit::touch`, a floating stick +
+BOOST/JUMP/MENU buttons + tap-to-drive) is built on, vendored the same way
+`games/shared/shellkit` vendors it, so this game stays a standalone,
+clonable tree with no monorepo path dependencies.
+
+Mouse capture releases automatically if the window loses focus (so a clean
+Alt-Tab can't leave the OS grab out of sync with what the game thinks is
+locked), and a small crosshair fades in while captured so capture state is
+never ambiguous.
 
 Camera look uses raw mouse motion (`DeviceEvent::MouseMotion`), so it works
-on Wayland compositors that refuse cursor warping.
+on Wayland compositors that refuse cursor warping. The camera-relative
+movement basis (`input::camera_basis`) is verified against the actual
+`Mat4::look_at_rh` view matrix in a unit test, not just derived by hand —
+this is what strafe (`A`/`D`, arrow keys) reads, so a sign error there can't
+silently drift back in.
 
 ## Architecture
 
@@ -207,9 +244,15 @@ src/
 ├── bosses.rs      the Elder Boar + Storm Drake: pits, AI, rewards, TargetRef::Boss
 ├── disasters.rs   wildfire / tempest / earthquake / flood / tornado + map scars
 ├── audio.rs       acoustics_at(pos) → howl/reverb voicing; WindSynth DSP; cpal shell
-├── input.rs       Action / Bind / Bindings (schemes, capture, config file), InputState, resolve()
+├── input.rs       Action / Bind / Bindings (schemes, capture, config file), InputState,
+│                  resolve(), camera_basis() (verified against the real view matrix)
 ├── gamepad.rs     PB_* codes, PadState, gilrs shell (feature `gamepad`)
-├── touch.rs       floating stick + button cluster + tap-to-walk, portrait/landscape
+├── touch.rs       floating stick + button cluster + tap-to-walk + swipe-to-dash
+├── touchkit/      vendored gesture recognizer (tap/swipe/fling/pinch), from
+│                  the monorepo's shared/touchkit — see Controls above
+├── gridpick.rs    search-filtered grid + cursor, shared by shop and select
+│                  (adapted from games/clawbound's lobby.rs picker)
+├── launch.rs      --quick-match / --ancestor / BSGAMES_HANDOFF_* parsing
 ├── sim.rs         entities, economy, damage pipeline, kills
 ├── systems.rs     tick: waves, movement, auto-attacks, projectiles, zones, sky
 ├── abilities.rs   cast execution for all 13 archetypes
@@ -246,3 +289,10 @@ Rendering pipeline per frame:
 
 All characters, names and lore are from the Clawbound project in this
 monorepo. No third-party trademarks, assets or code are used.
+
+## Status
+
+See **[TODO.md](TODO.md)** for what's untested (mainly: anything visual, since
+this was built without a display), known gaps (no netcode for the bsgames
+handoff, gamepad untested end-to-end, an unexplained Blue-side AI win bias),
+and ideas raised but not built.

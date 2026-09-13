@@ -250,6 +250,8 @@ pub const GOLD_MELEE: f32 = 21.0;
 pub const GOLD_CASTER: f32 = 27.0;
 pub const GOLD_GOD: f32 = 300.0;
 pub const GOLD_TOWER: f32 = 250.0;
+/// Fraction of an item's cost refunded by `Game::sell_item`.
+pub const SELL_REFUND: f32 = 0.7;
 
 pub const XP_MELEE: f32 = 62.0;
 pub const XP_CASTER: f32 = 80.0;

@@ -109,10 +109,6 @@ impl Game {
     // --- movement ---------------------------------------------------------------
 
     fn move_gods(&mut self, dt: f32) {
-        // Half the god-god separation distance (`1.1` below) used as one
-        // unit's radius against a fixed obstacle, so a god now stops the
-        // same distance from a tree trunk as it stops from another god.
-        const UNIT_RADIUS: f32 = 0.55;
         for i in 0..self.gods.len() {
             if self.gods[i].respawn_t > 0.0 {
                 continue;
@@ -152,22 +148,6 @@ impl Game {
                 let s = (ARENA_RADIUS - 2.0) / r;
                 g.pos.x *= s;
                 g.pos.z *= s;
-            }
-            // static props: trees and stones. Same push-out shape as the
-            // unit-separation pass below, just against a fixed circle
-            // instead of another moving unit — see `Game::set_obstacles`.
-            for &(ox, oz, orad) in &self.obstacles {
-                let d = Vec3::new(g.pos.x - ox, 0.0, g.pos.z - oz);
-                let min_dist = orad + UNIT_RADIUS;
-                let dist = d.length();
-                if dist < min_dist && dist > 0.0001 {
-                    g.pos += d.normalize() * (min_dist - dist);
-                } else if dist <= 0.0001 {
-                    // Degenerate (unit spawned dead-center on an obstacle);
-                    // push along an arbitrary fixed direction rather than
-                    // dividing by zero or leaving it stuck.
-                    g.pos.x += min_dist;
-                }
             }
         }
         // separation
@@ -218,20 +198,6 @@ impl Game {
                 }
             } else {
                 m.walk_anim += dt * 2.0;
-            }
-            // static props: same push-out as gods, smaller radius for the
-            // smaller minion model. Lane paths mostly avoid solid props
-            // already (`jungle_spot`/`lane_clearance` keep them off-lane),
-            // so this mostly matters for a minion that's been knocked or
-            // chased off its path into the treeline.
-            const MINION_RADIUS: f32 = 0.4;
-            for &(ox, oz, orad) in &self.obstacles {
-                let d = Vec3::new(m.pos.x - ox, 0.0, m.pos.z - oz);
-                let min_dist = orad + MINION_RADIUS;
-                let dist = d.length();
-                if dist < min_dist && dist > 0.0001 {
-                    m.pos += d.normalize() * (min_dist - dist);
-                }
             }
         }
         // minion separation (cheap: sample pairs)

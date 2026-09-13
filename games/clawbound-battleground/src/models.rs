@@ -528,47 +528,37 @@ pub const WEAPON_PIVOT_VOX: f32 = 0.0;
 const MV: f32 = 0.09;
 
 pub fn build_minion(caster: bool, team: Team) -> VoxelMesh {
-    // A tiny cat, not a soldier: low quadruped body, tail, pointed ears, a
-    // team-colored collar standing in for the old cloth/metal palette so
-    // team identification at a glance is unchanged. Caster cats float a
-    // little orb over their head instead of carrying a club.
     let tc = team.rgb();
-    let fur = if caster { [0.62, 0.60, 0.66] } else { [0.72, 0.56, 0.34] };
-    let fur_dark = mix(fur, [0.05, 0.05, 0.05], 0.35);
-    let collar = tc;
-    let eyes = [0.95, 0.85, 0.2];
+    let cloth = mix(tc, [0.35, 0.35, 0.4], 0.45);
+    let metal = mix(tc, [0.75, 0.75, 0.8], 0.55);
+    let skin = [0.8, 0.62, 0.45];
 
-    // Wider than tall: a cat's footprint is its body length, not its height.
-    let mut g = Grid::new(16, 9, 10);
-    let cx = 8;
-    let cz = 5;
+    let mut g = Grid::new(12, 14, 12);
+    let cx = 6;
+    let cz = 6;
 
-    // body: a low tapered box, haunches slightly higher than the shoulders
-    g.filled_box(cx - 4, 2, cz - 2, cx + 3, 5, cz + 2, solid(fur));
-    g.filled_box(cx - 5, 2, cz - 2, cx - 4, 4, cz + 2, solid(fur)); // haunches, a touch taller
-    // four short legs
-    for (lx, lz) in [(cx - 4, cz - 2), (cx - 4, cz + 1), (cx + 2, cz - 2), (cx + 2, cz + 1)] {
-        g.filled_box(lx, 0, lz, lx + 1, 2, lz + 1, solid(fur_dark));
-    }
-    // tail: a curved-up stub of blocks trailing off the haunches
-    g.filled_box(cx - 7, 4, cz - 1, cx - 6, 4, cz, solid(fur_dark));
-    g.filled_box(cx - 8, 5, cz - 1, cx - 7, 5, cz, solid(fur_dark));
-    g.filled_box(cx - 8, 6, cz - 1, cx - 7, 6, cz, solid(fur));
-    // head, out front of the shoulders
-    g.ellipsoid((cx + 4) as f32, 4.0, cz as f32, 1.8, 1.6, 1.7, solid(fur));
-    // ears: two small pyramids via cone_y, one voxel wide at the tip
-    g.cone_y((cx + 3) as f32, (cz - 1) as f32, 0.9, 0.1, 5, 6, solid(fur_dark));
-    g.cone_y((cx + 3) as f32, (cz + 1) as f32, 0.9, 0.1, 5, 6, solid(fur_dark));
-    // eyes and a collar band at the neck — the team's colour, where the
-    // old model's helmet trim used to read
-    g.set(cx + 5, 4, cz - 1, solid(eyes));
-    g.set(cx + 5, 4, cz + 1, solid(eyes));
-    g.cyl_y((cx + 3) as f32, cz as f32, 1.9, 3, 3, solid(collar));
+    // legs
+    g.filled_box(cx - 2, 0, cz - 1, cx - 1, 4, cz + 1, solid(mix(cloth, [0.1, 0.1, 0.1], 0.4)));
+    g.filled_box(cx + 1, 0, cz - 1, cx + 2, 4, cz + 1, solid(mix(cloth, [0.1, 0.1, 0.1], 0.4)));
+    // torso
+    g.filled_box(cx - 3, 5, cz - 2, cx + 3, 9, cz + 2, solid(cloth));
+    // arms
+    g.filled_box(cx - 4, 5, cz - 1, cx - 4, 8, cz + 1, solid(skin));
+    g.filled_box(cx + 4, 5, cz - 1, cx + 4, 8, cz + 1, solid(skin));
+    // head
+    g.ellipsoid(cx as f32, 11.0, cz as f32, 2.4, 2.4, 2.4, solid(skin));
+    // helmet
+    g.ellipsoid(cx as f32, 12.0, cz as f32, 2.6, 1.8, 2.6, solid(metal));
+    g.set(cx - 1, 11, cz + 2, solid(tc));
+    g.set(cx + 1, 11, cz + 2, solid(tc));
 
     if caster {
-        // a small glowing orb hovering just above the head, echoing the
-        // old caster's floating hand-orb
-        g.ellipsoid((cx + 4) as f32, 6.3, cz as f32, 0.9, 0.9, 0.9, solid(mix(tc, [1.0, 1.0, 1.0], 0.35)));
+        // hood robe flare + floating orb hands
+        g.cone_y(cx as f32, cz as f32, 4.0, 3.0, 2, 6, solid(cloth));
+        g.ellipsoid(cx as f32 + 5.0, 8.5, cz as f32, 1.2, 1.2, 1.2, solid(mix(tc, [1.0, 1.0, 1.0], 0.3)));
+    } else {
+        // little club
+        g.filled_box(cx + 4, 6, cz - 1, cx + 5, 12, cz, solid([0.4, 0.28, 0.16]));
     }
 
     g.mesh(MV, true)

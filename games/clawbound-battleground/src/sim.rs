@@ -113,12 +113,6 @@ pub struct GodUnit {
     pub pos: Vec3,
     pub yaw: f32,
     pub level: u32,
-    /// One-time capstone at level 9 — see `slots_for_level`'s doc for why 9
-    /// is the arc's top. Checked by `recalc` to apply the flat bonus below;
-    /// stored rather than derived from `level` so it survives the (rare)
-    /// case of a level being lost or recalculated some other way — an
-    /// awakening earned should stay earned.
-    pub awakened: bool,
     pub xp: f32,
     pub gold: f32,
     pub kills: u32,
@@ -263,9 +257,6 @@ pub struct Game {
     pub wild: crate::wild::Wild,
     pub bosses: crate::bosses::Bosses,
     pub disasters: crate::disasters::Disasters,
-    /// Solid world props (x, z, radius) — trees, rocks. Empty unless
-    /// `set_obstacles` was called; see that method's doc.
-    pub obstacles: Vec<(f32, f32, f32)>,
 }
 
 impl Game {
@@ -297,7 +288,6 @@ impl Game {
                 pos: spawn,
                 yaw: -team.push_z() * std::f32::consts::FRAC_PI_2,
                 level: 1,
-                awakened: false,
                 xp: 0.0,
                 gold: START_GOLD,
                 kills: 0,
@@ -386,7 +376,6 @@ impl Game {
             wild,
             bosses: crate::bosses::Bosses::new(),
             disasters: crate::disasters::Disasters::default(),
-            obstacles: Vec::new(),
         };
         // starter items for AI gods (player buys via shop)
         for i in 0..10 {
@@ -395,16 +384,6 @@ impl Game {
             }
         }
         g
-    }
-
-    /// Wire in the world's solid props (trees, stones — see `scene::build_world`'s
-    /// `solid!` macro) so movement can push units out of them. Separate from
-    /// `new` because `Scene` (the renderer's world) and `Game` (headless sim)
-    /// are built independently — every `Game::new` call in tests/headless.rs
-    /// has none of this and simply gets no prop collision, which is correct
-    /// for a run with no rendered world to collide with.
-    pub fn set_obstacles(&mut self, obstacles: Vec<(f32, f32, f32)>) {
-        self.obstacles = obstacles;
     }
 
     pub fn spawn_pos(team: Team, lane: Lane, rng: &mut Rng) -> Vec3 {
@@ -459,20 +438,15 @@ impl Game {
         let def = self.def(i);
         let g = &mut self.gods[i];
         let (base_hp, base_mana, _, base_power, base_prot) = def.at_level(g.level);
-        // The level-9 capstone: a flat 10% on top of the curve, once,
-        // rather than a bigger `hp_growth`/`power_growth` for every god —
-        // this is a single felt spike at the top of the 1-9 arc, not a
-        // change to the smooth 1-20 curve everything else still uses.
-        let awaken = if g.awakened { 1.10 } else { 1.0 };
         let st = Self::item_stats(g);
-        let new_max = base_hp * awaken + st.health;
+        let new_max = base_hp + st.health;
         let hp_frac = if g.max_hp > 0.0 { g.hp / g.max_hp } else { 1.0 };
         g.max_hp = new_max;
         g.hp = (new_max * hp_frac).max(g.hp.min(new_max));
         let new_mmax = base_mana + st.mana;
         g.max_mana = new_mmax;
         g.mana = g.mana.min(new_mmax);
-        g.power = base_power * awaken + st.power + st.intelligence * 0.9 + st.strength * 0.6;
+        g.power = base_power + st.power + st.intelligence * 0.9 + st.strength * 0.6;
         g.prot = base_prot + st.protection;
         g.pen_pct = st.pen_pct;
         g.pen_flat = st.pen_flat;
@@ -704,8 +678,6 @@ impl Game {
         xp *= 1.0 + 0.02 * (self.t / 60.0).min(8.0); // late-game scaling
         let g = &mut self.gods[gi];
         g.xp += xp;
-        let old_level = g.level;
-        let old_slots = items::slots_for_level(old_level);
         let mut leveled = false;
         while g.level < MAX_LEVEL && g.xp >= xp_for_level(g.level) {
             g.xp -= xp_for_level(g.level);
@@ -714,24 +686,7 @@ impl Game {
         }
         if leveled {
             let pos = g.pos;
-            let new_level = g.level;
-            let is_player = g.is_player;
             self.events.push(Event::LevelUp { pos });
-            // Only the player cares about a text banner for their own
-            // build — AI gods level up constantly and would spam the feed.
-            if is_player {
-                let new_slots = items::slots_for_level(new_level);
-                if new_slots > old_slots {
-                    self.events.push(Event::Announce { text: "New item slot unlocked!".into() });
-                }
-                if new_level >= 9 && !self.gods[gi].awakened {
-                    self.gods[gi].awakened = true;
-                    self.events.push(Event::Announce { text: "Power awakened!".into() });
-                }
-            } else if new_level >= 9 && !self.gods[gi].awakened {
-                // AI gods still get the actual stat bonus, just no banner.
-                self.gods[gi].awakened = true;
-            }
             self.recalc(gi);
             let g = &mut self.gods[gi];
             g.hp = (g.hp + g.max_hp * 0.22).min(g.max_hp);
@@ -760,7 +715,7 @@ impl Game {
     pub fn buy_item(&mut self, gi: usize, item_id: u16) -> bool {
         let cat = items::all();
         let g = &self.gods[gi];
-        if g.items.len() >= items::slots_for_level(g.level) {
+        if g.items.len() >= 6 {
             return false;
         }
         let item = &cat[item_id as usize];
@@ -775,13 +730,31 @@ impl Game {
         true
     }
 
+    /// Sell the item in build slot `slot` for a fraction of its cost
+    /// (`SELL_REFUND`) — a mispurchase or a build pivot shouldn't be
+    /// permanent. Returns the gold refunded, or `None` if the slot is empty.
+    pub fn sell_item(&mut self, gi: usize, slot: usize) -> Option<f32> {
+        let g = &mut self.gods[gi];
+        if slot >= g.items.len() {
+            return None;
+        }
+        let item_id = g.items.remove(slot);
+        if slot < g.stacks.len() {
+            g.stacks.remove(slot);
+        }
+        let refund = (items::all()[item_id as usize].cost * SELL_REFUND).round();
+        g.gold += refund;
+        self.recalc(gi);
+        Some(refund)
+    }
+
     /// AI auto-buy: walk the role build order, buy the best affordable item.
     pub fn auto_buy(&mut self, gi: usize) {
         let role = self.def(gi).role;
         let order = items::role_build_order(role);
         let cat = items::all();
         let g = &self.gods[gi];
-        if g.items.len() >= items::slots_for_level(g.level) {
+        if g.items.len() >= 6 {
             return;
         }
         let mut best: Option<u16> = None;
@@ -806,5 +779,24 @@ impl Game {
         (0..self.gods.len())
             .filter(|&i| self.gods[i].team != team && self.gods[i].respawn_t <= 0.0 && self.gods[i].pos.distance(pos) <= radius)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod shop_tests {
+    use super::*;
+
+    #[test]
+    fn selling_refunds_a_fraction_and_frees_the_slot() {
+        let mut g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        let item = items::all().iter().find(|i| i.cat == items::Cat::Health).unwrap();
+        g.gods[0].gold = item.cost;
+        assert!(g.buy_item(0, item.id));
+        assert_eq!(g.gods[0].items.len(), 1);
+        let refund = g.sell_item(0, 0).expect("a real slot");
+        assert!((refund - item.cost * SELL_REFUND).abs() < 1e-3);
+        assert_eq!(g.gods[0].gold, refund, "sold with nothing else bought, gold is exactly the refund");
+        assert!(g.gods[0].items.is_empty());
+        assert!(g.sell_item(0, 0).is_none(), "an empty slot sells nothing");
     }
 }

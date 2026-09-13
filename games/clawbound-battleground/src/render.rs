@@ -338,17 +338,7 @@ impl Renderer {
         let depth_state_ro = wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: false,
-            // Was `Always`: every alpha-blended draw (water, alpha voxels)
-            // ignored the depth buffer entirely and painted over whatever
-            // opaque geometry the shadow/opaque passes had already put in
-            // front of it — the bridge piers and near-bank terrain showing
-            // through the water sheet, foliage popping in front of props
-            // that were actually nearer the camera. `LessEqual` keeps this
-            // pipeline usable for the full-screen sky triangle (its NDC
-            // depth is exactly the 1.0 clear value, so `Less` would fail it
-            // outright) while making water/alpha voxels correctly occlude
-            // behind anything opaque that's actually closer to the camera.
-            depth_compare: wgpu::CompareFunction::LessEqual,
+            depth_compare: wgpu::CompareFunction::Always,
             stencil: Default::default(),
             bias: Default::default(),
         };
@@ -775,19 +765,6 @@ impl Renderer {
     pub fn render_frame(&mut self, target: &wgpu::TextureView, cam: Camera, time: f32) {
         self.camera = cam;
         self.time = time;
-        // Depth-testing the alpha pipeline (see `depth_state_ro`) fixes
-        // transparent-vs-opaque ordering, but two transparent surfaces still
-        // blend in whatever order they were queued unless sorted here —
-        // painter's algorithm, back (far) to front (near), so the nearer
-        // one's blend is the last one applied and comes out on top.
-        let eye = self.camera.eye;
-        self.transparent.sort_by(|a, b| {
-            let da = self.draws[a.1 as usize].model[3];
-            let db = self.draws[b.1 as usize].model[3];
-            let da = Vec3::new(da[0], da[1], da[2]).distance_squared(eye);
-            let db = Vec3::new(db[0], db[1], db[2]).distance_squared(eye);
-            db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
-        });
         let aspect = self.width as f32 / self.height as f32;
         let vp = cam.view_proj(aspect);
         let inv = vp.inverse();

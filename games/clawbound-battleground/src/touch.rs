@@ -1,7 +1,11 @@
 // On-screen controls for handhelds (postmarketOS / Plasma Mobile phones,
 // PinePhone, tablets) — the layout the monorepo's other games use, adapted
-// for a MOBA. Self-contained (no gesture crate) so the bundle stands alone;
-// the tap/drag recogniser is the small subset of shared/touchkit we need.
+// for a MOBA.
+//
+// Tap recognition in the open area is `crate::touchkit`, vendored from the
+// monorepo's `shared/touchkit` (the same crate skydribble's `shellkit::
+// touch` — its on-screen driving joystick — builds on, and games/shared/
+// shellkit vendors for exactly the same "stay a standalone tree" reason).
 //
 // ```text
 //  [≡]                                                  [board]
@@ -10,13 +14,39 @@
 //  /   \                                                   [ATK]
 //  | O |  <- floating stick: move                   (2)
 //  \___/                                              (1)      [shop]
+//                                        (press-drag from here to aim a
+//                                         dash/blink; a plain tap still
+//                                         fires it at the crosshair)
 // ```
 //
-// The stick is *floating*: it appears wherever a finger lands in the left
-// 42 % of the screen, so there is nothing to aim at. Buttons are fixed on
-// the right. A drag anywhere in the open area turns the camera; a tap in the
-// open area is a walk-to order (app.rs resolves it to a ground point).
+// EARLIER DESIGN NOTE, kept because the mistake is worth not repeating: the
+// first version of this read a fast swipe *anywhere in the open area* as a
+// quick-cast of the ancestor's Dash. That is precisely wrong for a fast-
+// paced game: the open area is also where the camera gets whipped around
+// constantly *during real fights*, at speeds that cross exactly the same
+// velocity/distance thresholds a deliberate flick would. An ambient gesture
+// cannot be "unique enough" to avoid that collision, because both gestures
+// start from the same place with the same hand doing the same motion. A
+// misread there does not lose you a menu selection — it burns your escape
+// or engage at the worst possible moment.
+//
+// So instead: press-and-drag *from the ability button itself* (`down()`
+// records which button a finger landed on; nothing but that finger's own
+// motion after that touch-down matters). That is structurally impossible
+// to confuse with camera panning, because camera panning never starts on a
+// small fixed circle in the bottom-right — and it is *more* precise than a
+// flick, since the drag angle is continuous rather than four cardinal
+// snaps. It also only exists for mobility abilities: `AbilityDef::
+// quick_aimable()` is false for every ultimate and every non-directional
+// archetype (heals, shields, novas...), so there is no path from "fast
+// gesture" to "irreversible ultimate" or "heal aimed at nothing" at all —
+// per-ability-type correctness, not just per-gesture-type.
+//
+// A quick tap on any ability button (dragged past the button or not) still
+// fires it at the camera crosshair, exactly like keyboard/mouse/pad — drag-
+// aim is a strictly additive precision option, never a required one.
 
+use crate::touchkit::{Config as TkConfig, Gesture, GestureRecognizer, Touch as TkTouch, Vec2 as TkVec2};
 use glam::Vec2;
 
 /// Button geometry in normalized screen units (fractions of the shorter
@@ -25,8 +55,14 @@ pub const BTN_R: f32 = 0.075;
 pub const ATK_R: f32 = 0.11;
 const STICK_R: f32 = 0.135;
 const DEAD: f32 = 0.12;
-const TAP_MAX_DIST: f32 = 0.022;
-const TAP_MAX_MS: f64 = 300.0;
+/// A drag on an ability button shorter than this still counts as a tap
+/// (fires at the crosshair) — long enough that a finger merely settling on
+/// the button doesn't accidentally arm a direction.
+const ABILITY_DRAG_DEADZONE: f32 = BTN_R * 0.6;
+/// Drag distance (screen units) that reads as "full commitment" to a
+/// direction, for the HUD's aim indicator; the direction is used as-is
+/// past the deadzone regardless, only the visual confidence ring grows.
+const ABILITY_DRAG_FULL: f32 = BTN_R * 2.2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Btn {
@@ -71,10 +107,8 @@ struct Finger {
     id: u64,
     start: Vec2,
     pos: Vec2,
-    t0: f64,
     btn: Option<Btn>,
     on_stick: bool,
-    moved: bool,
 }
 
 pub struct TouchPad {
@@ -85,6 +119,18 @@ pub struct TouchPad {
     fingers: Vec<Finger>,
     stick: Option<(u64, Vec2, Vec2)>, // id, origin, pos
     edges: Vec<Btn>,
+    /// Which ability slots (0..4) accept a press-and-drag aim this frame —
+    /// set once a frame by app.rs from `AbilityDef::quick_aimable()`, so
+    /// this module stays game-agnostic (it knows "slot 2 is drag-able
+    /// right now", never "slot 2 is a Dash").
+    drag_capable: [bool; 4],
+    /// A completed drag-release cast this frame: (slot, direction), screen
+    /// space, y UP (a world-facing convention app.rs can hand straight to
+    /// a camera-relative dash direction). One-shot, like `tap_pending`.
+    pub ability_release: Vec<(usize, Vec2)>,
+    /// Recognizes taps in the open area (the finger that's neither the
+    /// stick nor over a button).
+    rec: GestureRecognizer,
     /// Accumulated look drag (normalized units) since last `end_frame`.
     pub look: Vec2,
     /// A tap in the open area this frame (normalized, y down).
@@ -100,7 +146,32 @@ impl Default for TouchPad {
 
 impl TouchPad {
     pub fn new() -> TouchPad {
-        TouchPad { enabled: false, extent: Vec2::new(16.0 / 9.0, 1.0), scale: 1.0, fingers: Vec::new(), stick: None, edges: Vec::new(), look: Vec2::ZERO, tap_pending: None, now_ms: 0.0 }
+        let cfg = TkConfig {
+            // normalized (0..1) screen units, not pixels: shrink the
+            // pixel-tuned defaults to match, same ratios shellkit uses
+            tap_max_dist: 0.022,
+            ..TkConfig::default()
+        };
+        TouchPad {
+            enabled: false,
+            extent: Vec2::new(16.0 / 9.0, 1.0),
+            scale: 1.0,
+            fingers: Vec::new(),
+            stick: None,
+            edges: Vec::new(),
+            drag_capable: [false; 4],
+            ability_release: Vec::new(),
+            rec: GestureRecognizer::new(cfg),
+            look: Vec2::ZERO,
+            tap_pending: None,
+            now_ms: 0.0,
+        }
+    }
+
+    /// Called once a frame from app.rs with the current ancestor's kit
+    /// (`AbilityDef::quick_aimable()` per slot).
+    pub fn set_drag_capable(&mut self, caps: [bool; 4]) {
+        self.drag_capable = caps;
     }
 
     fn hit(&self, p: Vec2) -> Option<Btn> {
@@ -135,19 +206,26 @@ impl TouchPad {
             self.stick = Some((id, p, p));
             on_stick = true;
         }
-        if let Some(b) = btn {
-            self.edges.push(b);
+        // Drag-capable ability buttons defer their cast to release (tap vs.
+        // aimed drag, decided in `up()`); everything else fires immediately
+        // on press, same as before.
+        let fires_on_press = match btn {
+            Some(Btn::Ability(i)) => !self.drag_capable.get(i).copied().unwrap_or(false),
+            Some(_) => true,
+            None => false,
+        };
+        if fires_on_press {
+            if let Some(b) = btn {
+                self.edges.push(b);
+            }
         }
-        self.fingers.push(Finger { id, start: p, pos: p, t0: self.now_ms, btn, on_stick, moved: false });
+        self.fingers.push(Finger { id, start: p, pos: p, btn, on_stick });
     }
 
     pub fn moved(&mut self, id: u64, p: Vec2) {
         if let Some(f) = self.fingers.iter_mut().find(|f| f.id == id) {
             let prev = f.pos;
             f.pos = p;
-            if (p - f.start).length() > TAP_MAX_DIST {
-                f.moved = true;
-            }
             if !f.on_stick && f.btn.is_none() {
                 self.look += p - prev; // open-area drag steers the camera
             }
@@ -160,27 +238,46 @@ impl TouchPad {
     }
 
     pub fn up(&mut self, id: u64) {
-        if let Some(i) = self.fingers.iter().position(|f| f.id == id) {
-            let f = self.fingers.remove(i);
-            let short = self.now_ms - f.t0 < TAP_MAX_MS;
-            if !f.moved && short && f.btn.is_none() && !f.on_stick {
-                self.tap_pending = Some(f.pos);
+        if let Some(f) = self.fingers.iter().find(|f| f.id == id).copied() {
+            if let Some(Btn::Ability(i)) = f.btn {
+                if self.drag_capable.get(i).copied().unwrap_or(false) {
+                    let d = f.pos - f.start; // screen space, y down
+                    if d.length() > ABILITY_DRAG_DEADZONE {
+                        // y down -> y up for the world-facing convention
+                        self.ability_release.push((i, (d * Vec2::new(1.0, -1.0)).normalize_or(Vec2::new(0.0, 1.0))));
+                    } else {
+                        // settled without committing to a direction: a plain tap
+                        self.edges.push(Btn::Ability(i));
+                    }
+                }
             }
         }
-        if self.stick.map(|s| s.0 == id).unwrap_or(false) {
-            self.stick = None;
-        }
-    }
-
-    pub fn cancel(&mut self, id: u64) {
         self.fingers.retain(|f| f.id != id);
         if self.stick.map(|s| s.0 == id).unwrap_or(false) {
             self.stick = None;
         }
     }
 
+    pub fn cancel(&mut self, id: u64) {
+        self.up(id);
+    }
+
+    /// Feed the recognizer with whichever finger is in the open area (not
+    /// the stick, not on a button — there's at most one at a time for our
+    /// purposes, matching how the stick already claims the left third).
     pub fn tick(&mut self, dt: f32) {
         self.now_ms += (dt * 1000.0) as f64;
+        let touches: Vec<TkTouch> = self
+            .fingers
+            .iter()
+            .filter(|f| !f.on_stick && f.btn.is_none())
+            .map(|f| TkTouch::new(f.id, TkVec2::new(f.pos.x, f.pos.y)))
+            .collect();
+        for g in self.rec.update(&touches, self.now_ms) {
+            if let Gesture::Tap(p) = g {
+                self.tap_pending = Some(Vec2::new(p.x, p.y));
+            }
+        }
     }
 
     /// Clear one-shot state; call after `resolve` each frame.
@@ -188,6 +285,26 @@ impl TouchPad {
         self.edges.clear();
         self.look = Vec2::ZERO;
         self.tap_pending = None;
+        self.ability_release.clear();
+    }
+
+    /// Live drag vector for ability button `i` (screen space, y down, raw —
+    /// not normalized) while a finger is down on it past the deadzone, for
+    /// the HUD's aim indicator. `None` before the deadzone or with no
+    /// finger there, so a settling touch never flashes a direction it
+    /// isn't going to fire.
+    pub fn ability_drag_live(&self, i: usize) -> Option<Vec2> {
+        if !self.drag_capable.get(i).copied().unwrap_or(false) {
+            return None;
+        }
+        let f = self.fingers.iter().find(|f| f.btn == Some(Btn::Ability(i)))?;
+        let d = f.pos - f.start;
+        (d.length() > ABILITY_DRAG_DEADZONE).then_some(d)
+    }
+
+    /// How committed a live drag is, 0..1, for the HUD's confidence ring.
+    pub fn ability_drag_confidence(&self, i: usize) -> f32 {
+        self.ability_drag_live(i).map_or(0.0, |d| ((d.length() - ABILITY_DRAG_DEADZONE) / (ABILITY_DRAG_FULL - ABILITY_DRAG_DEADZONE)).clamp(0.0, 1.0))
     }
 
     /// Stick vector, y up, dead-zoned and clamped: the WASD equivalent.
@@ -255,9 +372,11 @@ mod tests {
     }
 
     #[test]
-    fn buttons_edge_and_hold_and_a_tap_walks() {
+    fn a_non_drag_capable_ability_fires_on_press_exactly_as_before() {
         let mut t = TouchPad::new();
         t.enabled = true;
+        // no set_drag_capable call: every slot defaults to false, matching
+        // every ability that isn't a non-ultimate dash/blink
         let l = layout(t.extent, 1.0);
         t.down(2, l.abilities[2]);
         assert!(t.ability_edge(2) && t.ability_down(2));
@@ -265,16 +384,107 @@ mod tests {
         assert!(!t.ability_edge(2) && t.ability_down(2), "edge once, hold persists");
         t.down(3, l.attack);
         assert!(t.attack_down());
-        // a quick tap in the open area
+        // a quick tap in the open area: down, one tick, up — same shape as
+        // touchkit's own `tap_is_recognized` test
         t.down(4, Vec2::new(1.2, 0.3));
-        t.tick(0.1);
+        t.tick(0.05);
         t.up(4);
+        t.tick(0.001);
         assert_eq!(t.tap_pending, Some(Vec2::new(1.2, 0.3)));
-        // a drag there is a look, not a tap
+    }
+
+    #[test]
+    fn a_slow_drag_in_the_open_area_just_looks_around() {
+        let mut t = TouchPad::new();
+        t.enabled = true;
         t.end_frame();
         t.down(5, Vec2::new(1.2, 0.3));
-        t.moved(5, Vec2::new(1.3, 0.3));
+        t.tick(0.0);
+        for i in 1..=8 {
+            t.moved(5, Vec2::new(1.2 + i as f32 * 0.0015, 0.3));
+            t.tick(0.1);
+        }
         t.up(5);
-        assert!(t.tap_pending.is_none() && t.look.x > 0.09);
+        t.tick(0.001);
+        assert!(t.tap_pending.is_none() && t.look.x > 0.009);
+    }
+
+    // --- drag-to-aim: the safety-motivated redesign ------------------------
+    //
+    // The earlier version of this read a fast swipe *anywhere in the open
+    // area* as a dash cast. That collides with ordinary fast camera
+    // whipping during a real fight, which crosses the same velocity/
+    // distance thresholds — the misread these tests exist to make
+    // structurally impossible: the gesture is now anchored to a specific
+    // ability button's own touch-down, which camera panning never starts
+    // from, and only for slots app.rs has marked drag-capable (mobility
+    // abilities, never ultimates — see `AbilityDef::quick_aimable`).
+
+    #[test]
+    fn a_non_capable_ability_button_never_offers_a_drag_aim() {
+        let mut t = TouchPad::new();
+        t.enabled = true;
+        // drag_capable defaults to all-false: this is the "not a dash, or
+        // is an ultimate" case, which must behave exactly like today —
+        // fire on press, full stop, no matter how far the finger wanders
+        let l = layout(t.extent, 1.0);
+        t.down(1, l.abilities[3]);
+        assert!(t.ability_edge(3), "fires immediately on press");
+        t.end_frame();
+        t.moved(1, l.abilities[3] + Vec2::new(0.3, 0.3)); // a huge swipe away
+        t.up(1);
+        assert!(t.ability_release.is_empty(), "a non-capable slot never emits a drag release");
+        assert!(!t.ability_edge(3), "and does not fire a second time on release");
+    }
+
+    #[test]
+    fn a_capable_ability_dragged_past_the_deadzone_fires_on_release_with_direction() {
+        let mut t = TouchPad::new();
+        t.enabled = true;
+        t.set_drag_capable([false, true, false, false]);
+        let l = layout(t.extent, 1.0);
+        t.down(1, l.abilities[1]);
+        assert!(!t.ability_edge(1), "a drag-capable slot must NOT fire on press");
+        assert!(t.ability_drag_live(1).is_none(), "not armed until past the deadzone");
+        // drag straight up on screen (toward the top) well past the deadzone
+        t.moved(1, l.abilities[1] + Vec2::new(0.0, -ABILITY_DRAG_DEADZONE * 3.0));
+        let live = t.ability_drag_live(1).expect("armed now");
+        assert!(live.y < 0.0, "raw screen-space drag is still y-down at this point");
+        assert!(t.ability_drag_confidence(1) > 0.0);
+        t.up(1);
+        assert_eq!(t.ability_release.len(), 1);
+        let (slot, dir) = t.ability_release[0];
+        assert_eq!(slot, 1);
+        assert!(dir.y > 0.9 && dir.x.abs() < 1e-3, "up on screen -> +y in the world-facing convention: {dir}");
+        assert!(!t.ability_edge(1), "a committed drag never also fires the plain-tap edge");
+    }
+
+    #[test]
+    fn a_capable_ability_released_without_committing_still_falls_back_to_a_tap() {
+        let mut t = TouchPad::new();
+        t.enabled = true;
+        t.set_drag_capable([true, false, false, false]);
+        let l = layout(t.extent, 1.0);
+        t.down(2, l.abilities[0]);
+        assert!(!t.ability_edge(0));
+        // a finger settling, or jittering slightly, but never committing
+        t.moved(2, l.abilities[0] + Vec2::new(0.01, 0.0));
+        t.up(2);
+        assert!(t.ability_release.is_empty(), "too small a drag is not a direction");
+        assert!(t.ability_edge(0), "so it falls back to a plain crosshair-aimed cast");
+    }
+
+    #[test]
+    fn drag_capability_is_per_slot_and_never_leaks_to_other_slots() {
+        let mut t = TouchPad::new();
+        t.enabled = true;
+        t.set_drag_capable([false, true, false, false]);
+        let l = layout(t.extent, 1.0);
+        // slot 0 is not capable even though slot 1 is
+        t.down(9, l.abilities[0]);
+        assert!(t.ability_edge(0), "slot 0 still fires on press");
+        t.moved(9, l.abilities[0] + Vec2::new(0.0, -ABILITY_DRAG_DEADZONE * 3.0));
+        t.up(9);
+        assert!(t.ability_release.is_empty(), "slot 0's drag must not be read as an aim");
     }
 }

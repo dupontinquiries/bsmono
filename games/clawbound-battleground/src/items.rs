@@ -138,23 +138,6 @@ fn st(kind: StackKind, per: f32, max: f32, interval: f32) -> Option<Stacking> {
     Some(Stacking { kind, per, max, interval })
 }
 
-/// How many item slots a level has unlocked. Six is the full build (see the
-/// `>= 6` cap `buy_item`/`auto_buy` used to hard-code); this spreads that
-/// unlock across the levels a match's early-to-mid game actually covers, so
-/// a level-up before 9 is also "I can carry another item" and not just a
-/// number going up. Flat at 6 from 9 onward — `MAX_LEVEL` is 20, but there's
-/// no seventh slot to give a level-20 god that a level-9 one doesn't have.
-pub fn slots_for_level(level: u32) -> usize {
-    match level {
-        0..=1 => 1,
-        2..=3 => 2,
-        4..=5 => 3,
-        6..=7 => 4,
-        8 => 5,
-        _ => 6, // 9+
-    }
-}
-
 pub fn all() -> &'static [Item] {
     static CATALOG: OnceLock<Vec<Item>> = OnceLock::new();
     CATALOG.get_or_init(|| build())

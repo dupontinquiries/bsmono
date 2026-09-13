@@ -14,7 +14,7 @@
 //             merged from keyboard/mouse, gamepad (`PadState`) and touch
 //             (`TouchPad`), the same way skydribble's `Game::controls` does.
 
-use glam::Vec2;
+use glam::{Vec2, Vec3};
 use std::collections::HashSet;
 
 // ------------------------------------------------------------- actions ----
@@ -306,7 +306,6 @@ impl Bind {
 pub enum Scheme {
     Classic,
     Dvorak,
-    DvorakEsdf,
     Custom,
 }
 
@@ -315,7 +314,6 @@ impl Scheme {
         match self {
             Scheme::Classic => "QWERTY (WASD)",
             Scheme::Dvorak => "DVORAK (,AOE)",
-            Scheme::DvorakEsdf => "DVORAK (.OEU)",
             Scheme::Custom => "CUSTOM",
         }
     }
@@ -375,41 +373,10 @@ impl Bindings {
         b
     }
 
-    /// Dvorak, ESDF grip: the one-column-right alternate a lot of players
-    /// use for the extra keys it opens up to the left hand. `,aoe` (above)
-    /// is WASD's physical row on a Dvorak keyboard; this is ESDF's — same
-    /// idea, one row over. QWERTY E/S/D/F sit under Dvorak `.`/`o`/`e`/`u`,
-    /// so that's forward/left/back/right here. It can't just add those as
-    /// extra binds alongside `dvorak()`'s `o`/`e` — ESDF's left and back
-    /// land on the exact keys `,aoe` uses for back and right, so holding
-    /// one would silently trigger a direction from the other scheme. Two
-    /// schemes, not one scheme with doubled-up binds.
-    pub fn dvorak_esdf() -> Bindings {
-        let mut b = Bindings::classic();
-        let set = |b: &mut Bindings, a: Action, v: Vec<Bind>| b.replace_kbm(a, v);
-        set(&mut b, Action::Forward, vec![ch("."), Bind::Named(Named::ArrowUp)]);
-        set(&mut b, Action::Left, vec![ch("o"), Bind::Named(Named::ArrowLeft)]);
-        set(&mut b, Action::Back, vec![ch("e"), Bind::Named(Named::ArrowDown)]);
-        set(&mut b, Action::Right, vec![ch("u"), Bind::Named(Named::ArrowRight)]);
-        // Abilities keep `dvorak()`'s layout, except Ability2's letter alt
-        // (`.`) is now Forward — it keeps its number key, same as every
-        // other action does, rather than fighting over the same key.
-        set(&mut b, Action::Ability1, vec![ch("'"), ch("1")]);
-        set(&mut b, Action::Ability2, vec![ch("2")]);
-        set(&mut b, Action::Ability3, vec![ch("p"), ch("3")]);
-        set(&mut b, Action::Ability4, vec![ch("y"), ch("4")]);
-        set(&mut b, Action::Shop, vec![ch("x")]);
-        set(&mut b, Action::Scoreboard, vec![Bind::Named(Named::Tab), ch("j")]);
-        set(&mut b, Action::Recenter, vec![ch("q")]);
-        b.scheme = Scheme::DvorakEsdf;
-        b
-    }
-
     pub fn for_scheme(s: Scheme) -> Bindings {
         match s {
             Scheme::Classic | Scheme::Custom => Bindings::classic(),
             Scheme::Dvorak => Bindings::dvorak(),
-            Scheme::DvorakEsdf => Bindings::dvorak_esdf(),
         }
     }
 
@@ -478,7 +445,6 @@ impl Bindings {
         let _ = writeln!(out, "scheme {}", match self.scheme {
             Scheme::Classic => "classic",
             Scheme::Dvorak => "dvorak",
-            Scheme::DvorakEsdf => "dvorak_esdf",
             Scheme::Custom => "custom",
         });
         for (a, v) in &self.map {
@@ -491,7 +457,6 @@ impl Bindings {
             "scheme" => {
                 self.scheme = match rest.trim() {
                     "dvorak" => Scheme::Dvorak,
-                    "dvorak_esdf" => Scheme::DvorakEsdf,
                     "custom" => Scheme::Custom,
                     _ => Scheme::Classic,
                 };
@@ -710,6 +675,14 @@ pub struct Controls {
     pub recenter: bool,
     /// Normalized screen point tapped in the open area (walk-to), if any.
     pub tap: Option<Vec2>,
+    /// Per-slot aim override, screen-space direction (y up): set only by a
+    /// committed touch drag-release on a drag-capable ability button (see
+    /// touch.rs). When set for a slot in `cast`, app.rs casts toward this
+    /// world direction instead of the camera crosshair. Never set for an
+    /// ultimate or a non-directional archetype — `AbilityDef::
+    /// quick_aimable()` is what makes a slot drag-capable in the first
+    /// place, and ultimates are never quick-aimable.
+    pub cast_dir: [Option<Vec2>; 4],
 }
 
 /// Merge keyboard/mouse, controller and touch into `Controls`. Pure.
@@ -781,10 +754,17 @@ pub fn resolve(
     if let Some(t) = touch {
         if t.enabled {
             mv += t.stick_vec();
-            c.look += Vec2::new(-t.look.x * 3.2, t.look.y * 2.4) * s.mouse_sens;
+            let inv = if s.invert_y { -1.0 } else { 1.0 };
+            c.look += Vec2::new(-t.look.x * 3.2, t.look.y * 2.4 * inv) * s.mouse_sens;
             c.attack |= t.attack_down();
             for i in 0..4 {
                 c.cast[i] |= t.ability_edge(i);
+            }
+            for &(slot, dir) in &t.ability_release {
+                if slot < 4 {
+                    c.cast[slot] = true;
+                    c.cast_dir[slot] = Some(dir);
+                }
             }
             c.shop |= t.shop_edge();
             c.menu |= t.menu_edge();
@@ -798,6 +778,22 @@ pub fn resolve(
     }
     c.mv = mv;
     c
+}
+
+/// Camera-relative movement basis for a third-person yaw: `forward` is the
+/// direction the camera looks (horizontal component — matches `cam_dir`'s
+/// x/z exactly), `right` is screen-right at that yaw.
+///
+/// `right` must be `cross(forward, WORLD_UP)`, not `cross(WORLD_UP, forward)`
+/// — those two differ only by sign, and the wrong one silently strafes
+/// every player backwards while auto-attack, ability aim and everything
+/// else (which reads world position, not this vector) keeps working, so
+/// nothing else catches it. Verified numerically against
+/// `Mat4::look_at_rh` in the test below, not just by hand.
+pub fn camera_basis(yaw: f32) -> (Vec3, Vec3) {
+    let forward = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+    let right = Vec3::new(-forward.z, 0.0, forward.x);
+    (forward, right)
 }
 
 #[cfg(test)]
@@ -879,6 +875,48 @@ mod tests {
         st.handle(InputEvent::FocusLost);
         let gone = resolve(&st, &cfg, &PadState::default(), None, true);
         assert_eq!(gone.mv, Vec2::ZERO, "focus loss releases everything");
+    }
+
+    #[test]
+    fn camera_right_matches_the_actual_view_matrix() {
+        // Ground truth: for a camera at `eye` looking at `target` via
+        // Mat4::look_at_rh(eye, target, Y) — exactly what render.rs builds —
+        // screen-right is whatever world offset from `target` gives a larger
+        // (more positive) clip-space x. `camera_basis`'s `right` must agree,
+        // at an arbitrary yaw, not just yaw = 0.
+        use glam::Mat4;
+        let yaw = 0.7_f32;
+        let target = Vec3::new(3.0, 0.0, -2.0);
+        let (forward, right) = camera_basis(yaw);
+        let eye = target - forward * 8.0;
+        let view = Mat4::look_at_rh(eye, target, Vec3::Y);
+        let proj = Mat4::perspective_rh(1.0, 1.6, 0.1, 100.0);
+        let vp = proj * view;
+        let ndc_x = |p: Vec3| {
+            let c = vp * p.extend(1.0);
+            c.x / c.w
+        };
+        let base = ndc_x(target);
+        let toward_right = ndc_x(target + right);
+        let toward_left = ndc_x(target - right);
+        assert!(toward_right > base, "camera_basis's right must point toward larger clip-x: {toward_right} vs base {base}");
+        assert!(toward_left < base, "and its negation must point the other way: {toward_left} vs base {base}");
+    }
+
+    #[test]
+    fn camera_basis_is_orthonormal_and_matches_cam_dir_horizontally() {
+        for i in 0..12 {
+            let yaw = i as f32 * 0.5;
+            let (fwd, right) = camera_basis(yaw);
+            assert!((fwd.length() - 1.0).abs() < 1e-5);
+            assert!((right.length() - 1.0).abs() < 1e-5);
+            assert!(fwd.dot(right).abs() < 1e-5, "forward and right must be perpendicular");
+            // must match the horizontal component of the render-side camera
+            // direction (see render.rs's Camera / app.rs's cam_dir): both are
+            // (sin(yaw), *, cos(yaw)), so moving forward walks the way the
+            // camera is actually looking, not some other convention.
+            assert!((fwd.x - yaw.sin()).abs() < 1e-5 && (fwd.z - yaw.cos()).abs() < 1e-5);
+        }
     }
 
     #[test]
