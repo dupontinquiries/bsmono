@@ -3056,6 +3056,19 @@ pub struct MoeStream {
     /// GPU pass rather than a host round-trip.
     pub pinned_raw: std::collections::HashMap<u32, (wgpu::Buffer, wgpu::Buffer)>,
 }
+/// A zero-copy VIEW of one row of an f32 tensor: [1, cols] at `row`, sharing the buffer. Binds as
+/// an input or an output like any tensor, so a batched [n, cols] activation can feed n per-session
+/// dispatches without staging each row through a copy. Storage-buffer bindings must start on a
+/// 256-byte boundary (wgpu's min_storage_buffer_offset_alignment on every driver this runs on), so
+/// the caller checks `row_views_aligned` first and keeps the copy path otherwise.
+fn row_view(t: &Tensor, row: usize) -> Tensor {
+    let base = t.view.map(|(o, _)| o).unwrap_or(0);
+    let bytes = (t.cols * 4) as u64;
+    Tensor { buf: t.buf.clone(), rows: 1, cols: t.cols, pool: None, site: (0, 0), view: Some((base + row as u64 * bytes, bytes)), bid: 0 }
+}
+/// Can every row of an [_, cols] f32 tensor be a storage binding? Row stride is cols*4 bytes.
+fn row_views_aligned(cols: usize) -> bool { (cols * 4) % 256 == 0 }
+
 /// Build a zero-copy row-range VIEW of a quantized Lin: expert e's [rows, k] slice of a stacked weight,
 /// sharing the underlying buffers (no re-quant, no copy). Offsets are 256-aligned for every per-expert
 /// slice of the qwen3moe shapes (k=2048/768; scales 32-block → whole f32s per row). F32 Lins (router)
@@ -14958,6 +14971,13 @@ impl Gpu {
     fn rope_kv_append(&self, qkv: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize,
                       ad: usize, kv: usize, hd: usize, base: f32) -> Tensor {
         let q = self.alloc(1, ad);
+        self.rope_kv_append_into(qkv, ff, kc, vc, pos, ad, kv, hd, base, &q);
+        q
+    }
+    /// rope_kv_append writing q into a caller-owned [1, ad] (a row view of a batched q, for the
+    /// batched decode path, or a fresh alloc).
+    fn rope_kv_append_into(&self, qkv: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize,
+                           ad: usize, kv: usize, hd: usize, base: f32, q: &Tensor) {
         let dm = ad + kv;
         let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
         let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
@@ -14967,8 +14987,7 @@ impl Gpu {
                     ad as u32, kv as u32, nope];
         // (ad+kv)/2 rotation pairs, then kv/2 two-lane v copies.
         let threads = ((dm / 2) + (kv / 2)) as u32;
-        self.dispatch_rw(ROPE_KV_APPEND, &[qkv, ff, kc, vc], 2, &q, bytemuck::cast_slice(&dims), wg1(threads));
-        q
+        self.dispatch_rw(ROPE_KV_APPEND, &[qkv, ff, kc, vc], 2, q, bytemuck::cast_slice(&dims), wg1(threads));
     }
 
     /// rope_mh_t with a per-sequence position wrap: row's position = pos0 + row % sl.
@@ -15453,7 +15472,14 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     }
 
     fn decode_attention_mh(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
-        let out = self.alloc(1, dm); let hd = dm / n_heads;
+        let out = self.alloc(1, dm);
+        self.decode_attention_mh_into(q, kc, vc, l, dm, n_heads, n_kv_heads, &out);
+        out
+    }
+    /// decode_attention_mh writing into a caller-owned [1, dm] — a row view of the batched attention
+    /// output on the batched path, so session i's result lands in row i with no copy.
+    fn decode_attention_mh_into(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize, out: &Tensor) {
+        let hd = dm / n_heads;
         let dims = [l as u32, hd as u32, n_heads as u32, n_kv_heads as u32];
         // Rule-based by shape: the parallel kernel (one workgroup per head, KV rows split across
         // threads) uses the whole GPU and dominates at long context, but needs scores[l] in
@@ -15467,15 +15493,14 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
         // flag is set, use the serial (barrier-free) kernel that can't wedge a fragile driver.
         let decode_serial = self.degraded() || std::env::var_os("LOGSCOPE_DECODE_ATTN_SERIAL").is_some();
         if decode_serial {
-            self.dispatch(DECODE_ATTN_MH, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), ((n_heads as u32).div_ceil(64), 1, 1));
+            self.dispatch(DECODE_ATTN_MH, &[q, kc, vc], out, bytemuck::cast_slice(&dims), ((n_heads as u32).div_ceil(64), 1, 1));
         } else if l <= 4096 {
-            self.dispatch(DECODE_ATTN_MH_PAR, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), (n_heads as u32, 1, 1));
+            self.dispatch(DECODE_ATTN_MH_PAR, &[q, kc, vc], out, bytemuck::cast_slice(&dims), (n_heads as u32, 1, 1));
         } else if flash_attn_enabled() {
-            return self.decode_attention_flash(q, kc, vc, l, dm, n_heads, n_kv_heads);
+            self.decode_attention_flash_into(q, kc, vc, l, dm, n_heads, n_kv_heads, out);
         } else {
-            self.dispatch(DECODE_ATTN_MH, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), ((n_heads as u32).div_ceil(64), 1, 1));
+            self.dispatch(DECODE_ATTN_MH, &[q, kc, vc], out, bytemuck::cast_slice(&dims), ((n_heads as u32).div_ceil(64), 1, 1));
         }
-        out
     }
 
     /// Flash-style split-K decode attention (see DECODE_ATTN_FLASH_P1/P2): pass 1 computes local
@@ -15483,16 +15508,19 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     /// The structural long-context decode kernel — per-token attention cost parallelizes across
     /// the sequence instead of one workgroup per head crawling all of KV.
     pub fn decode_attention_flash(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
+        let out = self.alloc(1, dm);
+        self.decode_attention_flash_into(q, kc, vc, l, dm, n_heads, n_kv_heads, &out);
+        out
+    }
+    fn decode_attention_flash_into(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize, out: &Tensor) {
         let hd = dm / n_heads;
         let chunk = 2048usize;
         let nch = l.div_ceil(chunk);
         let part = self.alloc(1, n_heads * nch * (hd + 2));
         let dims = [l as u32, hd as u32, n_heads as u32, n_kv_heads as u32, chunk as u32, nch as u32, 0, 0];
         self.dispatch(DECODE_ATTN_FLASH_P1, &[q, kc, vc], &part, bytemuck::cast_slice(&dims), (n_heads as u32, nch as u32, 1));
-        let out = self.alloc(1, dm);
         let dims2 = [hd as u32, nch as u32, n_heads as u32, 0];
-        self.dispatch(DECODE_ATTN_FLASH_P2, &[&part], &out, bytemuck::cast_slice(&dims2), (n_heads as u32, 1, 1));
-        out
+        self.dispatch(DECODE_ATTN_FLASH_P2, &[&part], out, bytemuck::cast_slice(&dims2), (n_heads as u32, 1, 1));
     }
 
     /// Two-span decode attention: one online softmax over a WARM int8 K/V tail (`wl` rows) followed by a
@@ -16529,10 +16557,37 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         let mut x = self.upload(&xh, n, d);
         let posv: Vec<u32> = sessions.iter().map(|s| s.pos as u32).collect();
         let pos = self.upload_u32(&posv);
+        // The fused per-session step: one norm+QKV projection for the batch, then per session ONE
+        // rope+KV-append (q into row i of a batched q, k and v into that session's cache) and ONE
+        // attention writing row i of the batched output. The copy path below spends 4n copies per
+        // layer staging q/k/v/attn rows through single-row tensors plus two batched rope passes;
+        // this spends none. Measured by --gate-batched-fused at n=4 on lavapipe, per layer:
+        // 17 dispatches + 16 copies -> 17 dispatches + 0 copies (the two rope passes became n
+        // rope+append dispatches; the m>1 norm/residual/ffn stay unfused, which is the next cut).
+        // Same kernels as the single-session path; the gate checks every session's logits and
+        // cache rows bit-exact against the copy path. Row views need 256-byte-aligned rows; the
+        // families with QK-norm / v-norm / a shared-KV twist keep the copy path.
+        let fused_rows = rope_kv_append_enabled() && row_views_aligned(ad + 2 * kv) && row_views_aligned(ad)
+            && m.layers.iter().all(|w| w.q_norm.is_none() && w.k_norm.is_none() && w.v_norm.is_none() && !w.v_from_k);
         for li in 0..m.n_layers {
             let w = &m.layers[li];
-            let n1 = self.rmsnorm_t(&x, &w.g1, n, d, m.eps);
             let rb = if w.nope { 0.0 } else { m.base }; // Llama4 iRoPE NoPE switch (rows path)
+            if fused_rows {
+                let qkv = w.wqkv.norm_apply(self, &x, &w.g1, d, m.eps, n);   // [n, ad+2kv]
+                let qb = self.alloc(n, ad);
+                let attn = self.alloc(n, ad);
+                for i in 0..n {
+                    let p = sessions[i].pos;
+                    let (kc, vc) = (&sessions[i].cache.k[li], &sessions[i].cache.v[li]);
+                    let qi = row_view(&qb, i);
+                    self.rope_kv_append_into(&row_view(&qkv, i), &m.rope_factors, kc, vc, p, ad, kv, hd, rb, &qi);
+                    self.decode_attention_mh_into(&qi, kc, vc, p + 1, ad, m.n_heads, m.n_kv_heads, &row_view(&attn, i));
+                }
+                let x2 = w.wo.apply_add(self, &attn, n, &x);
+                x = self.ffn_apply(w, &x2, n, d, m.eps);
+                continue;
+            }
+            let n1 = self.rmsnorm_t(&x, &w.g1, n, d, m.eps);
             let qb = self.rope_mh_rows(&w.wq.apply(self, &n1, n), &m.rope_factors, &pos, n, ad, rb, hd);
             let kb = self.rope_mh_rows(&w.wk.apply(self, &n1, n), &m.rope_factors, &pos, n, kv, rb, hd);
             let vb = w.wv.apply(self, &n1, n);
