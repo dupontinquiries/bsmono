@@ -406,11 +406,67 @@ pub struct SurvivalHud {
 /// r576: one occupied backpack slot for the survival inventory panel — a swatch
 /// colour + short label + stack count, pre-resolved by the bin so the renderer
 /// stays a pure view.
+/// r-mobile: what the HUD draws for the touch controls: the layout, the live
+/// stick (anchor, knob) when a thumb is down, and which buttons are held.
+#[derive(Debug, Clone)]
+pub struct TouchOverlay {
+    pub layout: crate::mobile_ui::TouchLayout,
+    pub stick: Option<((f32, f32), (f32, f32))>,
+    pub held: Vec<crate::mobile_ui::ButtonKind>,
+}
+
+/// r-mobile: paint the touch controls. Coordinates in the layout are
+/// framebuffer pixels; the painter works in points, so divide by `ppp`.
+pub fn paint_touch_overlay(p: &egui::Painter, ov: &TouchOverlay, ppp: f32) {
+    use crate::mobile_ui::{ButtonKind, STICK_RADIUS_PT};
+    let ppp = if ppp > 0.0 { ppp } else { 1.0 };
+    let pt = |x: f32, y: f32| egui::pos2(x / ppp, y / ppp);
+    let base = egui::Color32::from_rgba_unmultiplied(20, 24, 30, 120);
+    let ring = egui::Color32::from_rgba_unmultiplied(220, 225, 235, 150);
+    let hot = egui::Color32::from_rgba_unmultiplied(224, 168, 94, 200);
+    // stick: home ghost, or the live anchor + knob
+    match ov.stick {
+        Some((anchor, at)) => {
+            let range = crate::touch_controls::STICK_RANGE_PX / ppp;
+            p.circle(pt(anchor.0, anchor.1), range, base, egui::Stroke::new(1.5, ring));
+            let (dx, dy) = (at.0 - anchor.0, at.1 - anchor.1);
+            let len = (dx * dx + dy * dy).sqrt();
+            let k = if len > crate::touch_controls::STICK_RANGE_PX { crate::touch_controls::STICK_RANGE_PX / len } else { 1.0 };
+            p.circle_filled(pt(anchor.0 + dx * k, anchor.1 + dy * k), range * 0.42, hot);
+        }
+        None => {
+            let c = ov.layout.stick_home;
+            p.circle(pt(c.cx, c.cy), c.r / ppp, base, egui::Stroke::new(1.0, ring.gamma_multiply(0.5)));
+            p.circle_filled(pt(c.cx, c.cy), STICK_RADIUS_PT * ov.layout.scale * 0.3 / ppp, ring.gamma_multiply(0.35));
+        }
+    }
+    for (kind, c) in &ov.layout.buttons {
+        let held = ov.held.contains(kind);
+        p.circle(pt(c.cx, c.cy), c.r / ppp, if held { hot } else { base }, egui::Stroke::new(1.5, ring));
+        let size = (c.r / ppp) * 0.9;
+        p.text(pt(c.cx, c.cy), egui::Align2::CENTER_CENTER, kind.glyph(), egui::FontId::proportional(size), if held { egui::Color32::BLACK } else { ring });
+        let _ = ButtonKind::ALL;
+    }
+}
+
 #[derive(Clone)]
 pub struct InvSlotView {
     pub color: [u8; 3],
     pub name: String,
     pub count: u32,
+    /// r-item-models: the slot's icon quads (`item_icon`); empty = draw the
+    /// flat `color` swatch as before.
+    pub icon: Vec<unendlich_ui::IconQuad>,
+}
+
+/// r-item-models: an item's icon as the UI crate's quads — the seam between
+/// `item_model::icon_quads` (engine, pure) and `unendlich_ui::paint_item_icon`
+/// (egui). Tilted by the class's conventional icon angle.
+pub fn item_icon(model: &crate::item_model::ItemModel) -> Vec<unendlich_ui::IconQuad> {
+    crate::item_model::icon_quads(model, crate::item_model::icon_tilt(model.class), 0.08)
+        .into_iter()
+        .map(|q| unendlich_ui::IconQuad { pts: q.pts, color: q.color })
+        .collect()
 }
 
 pub struct WorldRenderer {
@@ -505,6 +561,8 @@ pub struct WorldRenderer {
     pub ui_pointer_pos: (f32, f32),
     #[cfg(feature = "ui-overlay")]
     pub ui_pointer_down: bool,
+    /// r-mobile: the on-screen touch controls to draw this frame (`None` off).
+    pub touch_overlay: Option<TouchOverlay>,
     /// r186: right button state (preview avoid-click etc.).
     pub ui_pointer2_down: bool,
     pub ui_pointer2_down_prev: bool,
@@ -1693,6 +1751,7 @@ impl WorldRenderer {
             ui_pointer_pos: (0.0, 0.0),
             #[cfg(feature = "ui-overlay")]
             ui_pointer_down: false,
+            touch_overlay: None,
             ui_pointer2_down: false,
             ui_pointer2_down_prev: false,
             #[cfg(feature = "ui-overlay")]
@@ -4191,7 +4250,8 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                     ui.label("GUI scale (applies on release)");
                                     let scale_accent = unendlich_ui::current_theme(ui.ctx()).accent;
                                     let resp = ui.horizontal(|ui| {
-                                        let r = unendlich_ui::menu::slider(ui, &mut ui_scale_staged, 1.0, 3.0, 9, scale_accent);
+                                        // r-mobile: up to 4.0 so a phone's detected scale is inside the slider's range
+                                        let r = unendlich_ui::menu::slider(ui, &mut ui_scale_staged, crate::mobile_ui::UI_SCALE_MIN, crate::mobile_ui::UI_SCALE_MAX, 13, scale_accent);
                                         ui.add_space(6.0);
                                         ui.label(egui::RichText::new(format!("{:.2}", ui_scale_staged)).strong().color(scale_accent));
                                         r
@@ -5113,8 +5173,12 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                     let draw_slot = |ui: &mut egui::Ui, rect: egui::Rect, view: Option<&InvSlotView>| {
                                         let p = ui.painter();
                                         if let Some(s) = view {
-                                            let [r, g, b] = s.color;
-                                            p.rect_filled(rect.shrink(8.0), egui::CornerRadius::same(2), egui::Color32::from_rgb(r, g, b));
+                                            if s.icon.is_empty() {
+                                                let [r, g, b] = s.color;
+                                                p.rect_filled(rect.shrink(8.0), egui::CornerRadius::same(2), egui::Color32::from_rgb(r, g, b));
+                                            } else {
+                                                unendlich_ui::paint_item_icon(p, rect.shrink(5.0), &s.icon, 1.0);
+                                            }
                                             if s.count > 1 {
                                                 p.text(
                                                     rect.right_top() + egui::vec2(-4.0, 2.0),
@@ -5170,8 +5234,12 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                                 pp + egui::vec2(16.0, 16.0),
                                                 egui::vec2(26.0, 26.0),
                                             );
-                                            let [rr, gg, bb] = cur.color;
-                                            p.rect_filled(r, egui::CornerRadius::same(3), egui::Color32::from_rgb(rr, gg, bb));
+                                            if cur.icon.is_empty() {
+                                                let [rr, gg, bb] = cur.color;
+                                                p.rect_filled(r, egui::CornerRadius::same(3), egui::Color32::from_rgb(rr, gg, bb));
+                                            } else {
+                                                unendlich_ui::paint_item_icon(p, r, &cur.icon, 1.0);
+                                            }
                                             if cur.count > 1 {
                                                 p.text(
                                                     r.right_bottom(),
@@ -5194,9 +5262,8 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                         ui, "creative_backpack", 27, 56.0, 6.0, accent,
                                         |ui, i, rect| {
                                             if let Some(Some(it)) = inv_snapshot.get(i) {
-                                                let [r, g, b] = it.display_color();
                                                 let p = ui.painter();
-                                                p.rect_filled(rect.shrink(8.0), egui::CornerRadius::same(2), egui::Color32::from_rgb(r, g, b));
+                                                unendlich_ui::paint_item_icon(p, rect.shrink(5.0), &item_icon(&it.model()), 1.0);
                                                 let short: String = it.display_name().chars().take(6).collect();
                                                 p.text(
                                                     rect.center_bottom() - egui::vec2(0.0, 3.0),
@@ -5220,16 +5287,13 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                     |ui, i, rect| {
                                         let name = items[i].display_name();
                                         let short: String = name.chars().take(6).collect();
-                                        let [r, g, b] = items[i].display_color();
-                                        // colour swatch (a small filled inset),
-                                        // brighter when this is the selected slot
-                                        let sw = egui::Color32::from_rgb(r, g, b);
-                                        let inset = rect.shrink(8.0);
+                                        // r-item-models: the item's box model as an icon
+                                        // (was a flat colour swatch), dimmed unless selected
+                                        let inset = rect.shrink(5.0);
                                         let p = ui.painter();
-                                        p.rect_filled(
-                                            inset,
-                                            egui::CornerRadius::same(2),
-                                            if i == selected { sw } else { sw.gamma_multiply(0.7) },
+                                        unendlich_ui::paint_item_icon(
+                                            p, inset, &item_icon(&items[i].model()),
+                                            if i == selected { 1.0 } else { 0.7 },
                                         );
                                         if i == selected {
                                             p.rect_stroke(
@@ -5300,12 +5364,9 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                             egui::Color32::from_rgba_unmultiplied(20, 24, 30, 200),
                                         );
                                         if let Some(it) = assigned {
-                                            let [r, g, b] = it.display_color();
-                                            let sw = egui::Color32::from_rgb(r, g, b);
-                                            p.rect_filled(
-                                                rect.shrink(5.0),
-                                                egui::CornerRadius::same(2),
-                                                if i == creative_hotbar_sel { sw } else { sw.gamma_multiply(0.65) },
+                                            unendlich_ui::paint_item_icon(
+                                                p, rect.shrink(4.0), &item_icon(&it.model()),
+                                                if i == creative_hotbar_sel { 1.0 } else { 0.65 },
                                             );
                                         }
                                         if i == creative_hotbar_sel {
@@ -5420,6 +5481,13 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                 // menus + orbit backdrop, nothing else. One predicate; any
                 // future overlay must join it rather than invent its own.
                 let in_world_overlays = !menu_open && !wizard_open;
+                // r-mobile: the touch controls, under everything else in the HUD
+                if in_world_overlays {
+                    if let Some(ov) = self.touch_overlay.as_ref() {
+                        let painter = c.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("unendlich_touch_overlay")));
+                        paint_touch_overlay(&painter, ov, c.pixels_per_point());
+                    }
+                }
                 if in_world_overlays {
                 let hb_n = items.len().min(9);
                 let hb_w = unendlich_ui::hotbar_width(hb_n, 44.0, 4.0);
@@ -5441,9 +5509,12 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                 let [r, g, b] = it.display_color();
                                 egui::Color32::from_rgb(r, g, b)
                             });
+                            // r-item-models: the slot draws the item's box model; the
+                            // flat swatch remains the fallback inside slot_icon.
+                            let icon = shown.map(|it| item_icon(&it.model())).unwrap_or_default();
                             // Dvorak home-row key that fast-selects this slot.
                             let key = crate::hotbar::slot_homerow_key(i).map(|c| c.to_string());
-                            let resp = unendlich_ui::slot_swatch(ui, 44.0, i == creative_hotbar_sel, sw, key.as_deref());
+                            let resp = unendlich_ui::slot_icon(ui, 44.0, i == creative_hotbar_sel, &icon, sw, key.as_deref());
                             // r657: click a hotbar slot to make it active; if it
                             // holds an item, that becomes the item to place.
                             if resp.clicked() {

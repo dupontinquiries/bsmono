@@ -7,6 +7,36 @@ Last refreshed: v0.20.0.
 
 ## Verified working
 
+- **c16 rig session (2026-09-12):** engine build fixed (`begin()` referenced a
+  `surface` it does not have); `Cargo.lock` caught up. New pure cores:
+  `item_model` (hand + slot models), `anim_rig` (oriented per-part posing:
+  hip-pivot legs that plant, breath/squash/stretch, tail chain, strike, settle,
+  ragdoll blend), `sim::melee` (creature-vs-creature strike loop timed to the
+  lunge), `sim::ragdoll_bridge` (`from_anatomy`, `sample_body_local`;
+  `ragdoll.rs` is solver-only now). Bin: roamers render via
+  `creature_to_vertices_rigged`; Dinosaurs BITE instead of an instant kill;
+  deaths are ragdolls; rest beds down; arbiter `fatigue` is the rest urge.
+  Harness: `harness/rig/run.sh` (rustc-only, real files by `#[path]`, 138
+  tests) → `rig_viewer.html` (three.js). Verified by `cargo check` of lib and
+  the fullgame bin (ui-overlay) in the sandbox; NOT verified running. Found:
+  roamers never wrote `body.velocity`, so the old mesher's leg swing had
+  amplitude 0 — that was the sliding.
+- **c16 rig session, part 2:** legendary weapons — each of the 8
+  `WeaponClass`es has its own model (`Greatsword`, `Greataxe`, `Wand` added)
+  and every element's proc is an ability (`sim::weapon_ability`: frost nova,
+  water jet, gale cut, stone spikes, flame wave, lightning arc) fired from
+  the EQUIPPED weapon on hit, with burn/chill/stagger statuses ticking on
+  roamers. Fauna hatch from the design layer (`spawn::FAUNA_ARCHES`:
+  quadruped/critter/canid/bird/heavy), posed by the rig with real roles and
+  sketch colours; forge dragons topple on death. Mobile Linux: `mobile_ui`
+  detects phone/scale (Phosh etc., portrait framebuffers, env overrides),
+  the mouse-emulated finger drives `touch_controls` (stick left, look
+  right) with on-screen buttons bound to the real actions, HUD overlay.
+  `examples/rig_dump.rs` runs the engine-coupled checks on the REAL lib
+  (the sandbox builds `--lib`; only the test crate dies) and dumps every
+  archetype for the viewer. All compile-checked (lib + fullgame bin); not
+  run on a device.
+
 * **Library compiles clean** under all four feature combos.
 * **All 478 unit tests pass** (`cargo test --features render --features gpu --lib`).
   (472 pre-v0.20 + 6 indirect-draw + alignment tests.)

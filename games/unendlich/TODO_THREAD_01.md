@@ -18,6 +18,13 @@ Status legend:
 These are pure modules with passing tests; the only thing left is the
 unverifiable bin/sim-loop/render hookup.
 
+- **c16 rig session (see BACKLOG §A):** ragdoll-on-death, per-state liveliness,
+  squash/stretch and neck/tail flex-bend are DONE via `anim_rig` +
+  `sim::ragdoll_bridge` + the roamer wiring; rest cycle is half done (urge feeds
+  the arbiter, creature beds down; `chill` from temperature still open). Item
+  models: `item_model` (hand + slot). Creature-vs-creature melee: `sim::melee`.
+  Harness: `harness/rig/run.sh` → three.js viewer. The entries below are kept
+  for their design notes.
 - **[wire] Ragdoll on death/knockout.** `sim::ragdoll` (Verlet nodes/sticks,
   gravity, ground, self-collision) exists. Needs a `ragdoll::from_anatomy(&Creature)`
   bridge (parts → `Node`s, bone offsets → `Stick`s) and a death/knockout trigger

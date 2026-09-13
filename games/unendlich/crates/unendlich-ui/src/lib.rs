@@ -305,6 +305,77 @@ pub fn slot_swatch(
     resp
 }
 
+/// r-item-models: one quad of an item icon, in the unit square (`x` right,
+/// `y` UP — the engine's `item_model::icon_quads` convention), already sorted
+/// back-to-front. Plain data so this crate stays engine-independent; the
+/// engine converts its `item_model::IconQuad` to this at the seam.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IconQuad {
+    pub pts: [[f32; 2]; 4],
+    pub color: [f32; 3],
+}
+
+/// Paint an item icon into `rect`: each quad as a filled convex polygon with
+/// a thin dark edge so adjacent boxes of one colour still read as parts.
+/// `brightness` scales the colours (1.0 = as given; a dimmed unselected slot
+/// passes ~0.65). Draws nothing for an empty slice.
+pub fn paint_item_icon(p: &egui::Painter, rect: egui::Rect, quads: &[IconQuad], brightness: f32) {
+    let k = brightness.clamp(0.0, 1.0);
+    let edge = Color32::from_rgba_unmultiplied(0, 0, 0, 110);
+    for q in quads {
+        let pts: Vec<egui::Pos2> = q
+            .pts
+            .iter()
+            .map(|[x, y]| egui::pos2(rect.min.x + x * rect.width(), rect.max.y - y * rect.height()))
+            .collect();
+        let c = Color32::from_rgb(
+            (q.color[0] * k * 255.0).round().clamp(0.0, 255.0) as u8,
+            (q.color[1] * k * 255.0).round().clamp(0.0, 255.0) as u8,
+            (q.color[2] * k * 255.0).round().clamp(0.0, 255.0) as u8,
+        );
+        p.add(egui::Shape::convex_polygon(pts, c, Stroke::new(0.8, edge)));
+    }
+}
+
+/// [`slot_swatch`] with an item icon: paints `icon` when it has quads, else
+/// the flat `swatch` colour (so an item with no model still shows something).
+pub fn slot_icon(
+    ui: &mut Ui,
+    px: f32,
+    selected: bool,
+    icon: &[IconQuad],
+    swatch: Option<Color32>,
+    label: Option<&str>,
+) -> Response {
+    if icon.is_empty() {
+        return slot_swatch(ui, px, selected, swatch, label);
+    }
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(px, px), Sense::click());
+    let t = ui.ctx().animate_bool(resp.id, resp.hovered() || selected);
+    let th = current_theme(ui.ctx());
+    let p = ui.painter();
+    p.rect_filled(rect, r(6), th.panel2);
+    let inner = egui::Rect::from_min_max(
+        rect.min + egui::vec2(4.0, 4.0),
+        egui::pos2(rect.max.x - 4.0, rect.max.y - 13.0),
+    );
+    paint_item_icon(p, inner, icon, if selected { 1.0 } else { 0.8 });
+    let border = if selected { th.accent } else { th.line };
+    let width = if selected { 1.5 } else { 1.0 };
+    p.rect_stroke(
+        rect,
+        r(6),
+        Stroke::new(width, border.gamma_multiply(0.55 + 0.45 * t)),
+        StrokeKind::Inside,
+    );
+    if let Some(l) = label {
+        let galley = p.layout_no_wrap(l.to_string(), egui::FontId::monospace(9.0), th.ink);
+        let pos = egui::pos2(rect.center().x - galley.size().x * 0.5, rect.max.y - 12.0);
+        p.galley(pos, galley, th.ink);
+    }
+    resp
+}
+
 /// A classic bottom-bar hotbar: a subtle backing strip + a horizontal row of
 /// `count` cells, filled by `render(ui, i)` (typically a [`slot`]/[`slot_swatch`]).
 /// Themed via the active theme. The caller positions it (an `Area` near the screen

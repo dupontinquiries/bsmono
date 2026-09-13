@@ -317,11 +317,9 @@ pub fn spawn(kind: CreatureKind, position: [f32; 3]) -> Creature {
                 .with_mass(1.5)
                 .with_anatomy(anatomy)
         }
-        CreatureKind::Fauna => {
-            // Generic grounded wild animal — a medium quadruped frame with eyes,
-            // a jaw, four feet, and a tail. The visual body plan is rolled from
-            // the general archetypes at the design layer; this is its gameplay
-            // (breakable) anatomy.
+        CreatureKind::Fauna if std::env::var("UNENDLICH_FAUNA_BOXES").map(|v| v == "1").unwrap_or(false) => {
+            // The pre-design generic quadruped, kept behind UNENDLICH_FAUNA_BOXES=1
+            // for comparison. Default Fauna now hatch from the design layer below.
             let anatomy = Anatomy::new()
                 .with(PartState::new(Part::Eye, 8, [0.5, 0.35, 0.18], [0.08, 0.08, 0.08]))
                 .with(PartState::new(Part::Eye, 8, [0.5, 0.35, -0.18], [0.08, 0.08, 0.08]))
@@ -334,6 +332,16 @@ pub fn spawn(kind: CreatureKind, position: [f32; 3]) -> Creature {
             Creature::new(body_of(position, [0.7, 0.5, 0.4]))
                 .with_mass(8.0)
                 .with_anatomy(anatomy)
+        }
+        CreatureKind::Fauna => {
+            // r-rig: the visual body plan IS the creature now: one of the general
+            // archetypes (quadruped, critter, canid, bird, heavy), hatched by the
+            // design layer from the position seed, bridged by from_blueprint
+            // (anatomy hp from box volume, mass from total volume, the sketch kept
+            // on `design` for the rigged mesher).
+            let seed = dragon_seed(position) ^ 0xFA0A;
+            let arche = FAUNA_ARCHES[((seed >> 17) as usize) % FAUNA_ARCHES.len()];
+            spawn_designed(arche, position)
         }
         CreatureKind::Dinosaur => {
             // Great reptilian megafauna — a large heavy frame, big jaw, four
@@ -417,9 +425,33 @@ pub fn from_blueprint(bp: &crate::creature_design::CreatureBlueprint, position: 
         }
     }
     let mass = (volume * 8.0).max(0.5); // ~8 mass-units per block³
-    Creature::new(body_of(position, body_half))
+    let mut c = Creature::new(body_of(position, body_half))
         .with_mass(mass)
-        .with_anatomy(anatomy)
+        .with_anatomy(anatomy);
+    // r-rig: keep the sketch so the rigged mesher poses the boxes with their
+    // real roles and colours (the anatomy above files a neck under Part::Tail).
+    c.design = Some(std::sync::Arc::new(bp.clone()));
+    c
+}
+
+/// r-rig: the body plans the ecology rolls for `CreatureKind::Fauna` — the
+/// general sheet minus the humanoid Biped and the legless Serpent (the rig
+/// has no spine wave yet; a serpent would slide as a stiff bar).
+pub const FAUNA_ARCHES: [crate::creature_design::Arche; 5] = [
+    crate::creature_design::Arche::Quadruped,
+    crate::creature_design::Arche::Critter,
+    crate::creature_design::Arche::Canid,
+    crate::creature_design::Arche::Bird,
+    crate::creature_design::Arche::Heavy,
+];
+
+/// r-rig: a design-layer creature of `arche` at `position`, seeded by the
+/// position (the same rule `dragon_seed` uses, so a spot always hatches the
+/// same animal).
+pub fn spawn_designed(arche: crate::creature_design::Arche, position: [f32; 3]) -> Creature {
+    let seed = dragon_seed(position) ^ 0xA11E_5EED;
+    let bp = crate::creature_design::EggSpec::chosen(arche, seed).hatch();
+    from_blueprint(&bp, position)
 }
 
 /// What right-clicking ("using") the held item should do in the world. This is

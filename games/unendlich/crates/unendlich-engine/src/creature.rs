@@ -423,6 +423,12 @@ pub struct Creature {
     /// genome dragon. When present the mesher renders these cells instead of the
     /// box anatomy. `None` for every other creature (unchanged rendering).
     pub forge: Option<std::sync::Arc<crate::sim::dragon_forge::ForgeModel>>,
+    /// r-rig: the design-layer sketch this creature was hatched from
+    /// (`creature_design::CreatureBlueprint`), when it was. The rigged mesher
+    /// poses its boxes with their real roles (a neck bends as a neck, not as
+    /// the `Part::Tail` the anatomy files it under) and its colours; the
+    /// anatomy stays the gameplay (breakable) body. `None` = box anatomy.
+    pub design: Option<std::sync::Arc<crate::creature_design::CreatureBlueprint>>,
     /// Accumulated weathering (dirt on the belly, wetness washing it off), fed into
     /// the forge dragon's body material at mesh time. `clean()` for fresh/other
     /// creatures (unchanged look until something accumulates grime).
@@ -431,7 +437,7 @@ pub struct Creature {
 
 impl Creature {
     pub fn new(body: PhysicsBody) -> Self {
-        Self { body, yaw: 0.0, gait_phase: 0.0, pitch: 0.0, roll: 0.0, limbs: Vec::new(), mass: 1.0, parts: Vec::new(), anatomy: None, tint: [1.0, 1.0, 1.0], torso_bend: 0.0, anim_time: 0.0, gaze_yaw: 0.0, gaze_pitch: 0.0, forge: None, grime: crate::sim::creature_grime::GrimeState::clean() }
+        Self { body, yaw: 0.0, gait_phase: 0.0, pitch: 0.0, roll: 0.0, limbs: Vec::new(), mass: 1.0, parts: Vec::new(), anatomy: None, tint: [1.0, 1.0, 1.0], torso_bend: 0.0, anim_time: 0.0, gaze_yaw: 0.0, gaze_pitch: 0.0, forge: None, design: None, grime: crate::sim::creature_grime::GrimeState::clean() }
     }
 
     /// The creature's lowest point relative to its body centre (negative = below

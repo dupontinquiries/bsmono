@@ -294,6 +294,41 @@ impl ItemKind {
             ItemKind::Legendary(spec) => format!("{} {}", spec.element_name(), spec.class_name()),
         }
     }
+
+    /// The shape class this item draws as (`item_model`): a copper and an
+    /// iron pickaxe are one shape in two palettes; every legendary blade is a
+    /// sword whatever its element. A shovel has no model of its own yet and
+    /// draws as a hammer-headed haft.
+    pub fn model_class(self) -> crate::item_model::ItemClass {
+        use crate::item_model::ItemClass;
+        match self {
+            ItemKind::Block(_) => ItemClass::Block,
+            ItemKind::SpawnEgg(_) => ItemClass::Egg,
+            ItemKind::Ingot(_) => ItemClass::Ingot,
+            ItemKind::Tool(ToolKind::Pickaxe, _) => ItemClass::Pickaxe,
+            ItemKind::Tool(ToolKind::Axe, _) => ItemClass::Axe,
+            ItemKind::Tool(ToolKind::Shovel, _) => ItemClass::Hammer,
+            ItemKind::Legendary(spec) => legendary_model_class(spec.class),
+        }
+    }
+
+    /// The model's colours, from the same source as `display_color` so the
+    /// hand, the slot and the legacy swatch agree: metal on wood for tools,
+    /// the element hue for legendaries, the shell colour for eggs.
+    pub fn model_palette(self) -> crate::item_model::Palette {
+        use crate::item_model::Palette;
+        let f = |c: [u8; 3]| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0];
+        match self {
+            ItemKind::Tool(_, m) => Palette::tool(f(m.color())),
+            ItemKind::Legendary(spec) => legendary_model_palette(f(spec.display_color()), spec.tier),
+            other => Palette::mono(f(other.display_color())),
+        }
+    }
+
+    /// The boxes this item is drawn from, in the hand and in the slot.
+    pub fn model(self) -> crate::item_model::ItemModel {
+        crate::item_model::model_for(self.model_class(), &self.model_palette())
+    }
 }
 
 /// The SpawnEggs tab: one egg per creature.
@@ -516,6 +551,56 @@ pub fn item_display(id: u32) -> ItemDisplay {
         return ItemDisplay { color: [184, 189, 196], name: "Weapon".into() };
     }
     ItemDisplay { color: [150, 150, 156], name: "Item".into() }
+}
+
+/// r-legendary: every `WeaponClass` has its own shape now (a greatsword is
+/// not a long sword in a different colour; a wand is not a dagger).
+pub fn legendary_model_class(class: WeaponClass) -> crate::item_model::ItemClass {
+    use crate::item_model::ItemClass;
+    match class {
+        WeaponClass::Dagger => ItemClass::Dagger,
+        WeaponClass::Blade => ItemClass::Sword,
+        WeaponClass::Greatsword => ItemClass::Greatsword,
+        WeaponClass::Axe => ItemClass::Axe,
+        WeaponClass::Greataxe => ItemClass::Greataxe,
+        WeaponClass::Spear => ItemClass::Spear,
+        WeaponClass::Staff => ItemClass::Staff,
+        WeaponClass::Wand => ItemClass::Wand,
+    }
+}
+
+/// r-legendary: the element hue on the working part, fittings that brighten
+/// with tier (brass at 0, silver at 1, gold at 2+), a leather grip.
+pub fn legendary_model_palette(element: [f32; 3], tier: u8) -> crate::item_model::Palette {
+    let secondary = match tier {
+        0 => [0.72, 0.66, 0.50],
+        1 => [0.80, 0.82, 0.86],
+        _ => [0.92, 0.78, 0.32],
+    };
+    crate::item_model::Palette { primary: element, secondary, grip: crate::item_model::LEATHER }
+}
+
+/// The model for a survival-inventory id, mirroring [`item_display`]'s id
+/// ranges exactly (food 2000..2003, blocks < 256, ingots 1000+, forged
+/// weapons 4000..4008, everything else the generic held box). Where
+/// `item_display` gives a colour and a name, this gives the boxes.
+pub fn item_model_for_id(id: u32) -> crate::item_model::ItemModel {
+    use crate::item_model::{model_for, ItemClass, Palette};
+    let f = |c: [u8; 3]| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0];
+    let disp = item_display(id);
+    let class = match id {
+        2000..=2002 => ItemClass::Food,
+        0..=255 if disp.name != "Item" => ItemClass::Block,
+        1000..=1002 => ItemClass::Ingot,
+        // 4000 + index into WeaponClass::ALL
+        4000..=4007 => legendary_model_class(WeaponClass::ALL[(id - 4000) as usize]),
+        _ => ItemClass::Generic,
+    };
+    let pal = match id {
+        4000..=4007 => legendary_model_palette(f(disp.color), 0),
+        _ => Palette::mono(f(disp.color)),
+    };
+    model_for(class, &pal)
 }
 
 #[cfg(test)]
@@ -942,5 +1027,80 @@ mod legendary_palette_tests {
         assert_eq!(classes.len(), WeaponClass::ALL.len(), "not every class represented");
         assert_eq!(elements.len(), 6, "not every element 0..6 represented");
         assert!(saw_low && saw_high, "palette should show both a low and a high tier");
+    }
+}
+
+#[cfg(test)]
+mod item_model_adapter_tests {
+    use super::*;
+    use crate::item_model::ItemClass;
+
+    #[test]
+    fn every_catalog_item_has_a_model_and_only_unmapped_kinds_are_generic() {
+        for it in full_catalog() {
+            let m = it.model();
+            assert!(!m.boxes.is_empty(), "{it:?} has an empty model");
+            assert_eq!(m.class, it.model_class());
+            // Nothing in the catalog is the legacy single box: a tool is a
+            // tool shape, an egg an egg, a block a block.
+            assert_ne!(m.class, ItemClass::Generic, "{it:?} fell through to Generic");
+        }
+    }
+
+    #[test]
+    fn tools_and_legendaries_map_to_their_shapes() {
+        assert_eq!(ItemKind::Tool(ToolKind::Pickaxe, MetalKind::Iron).model_class(), ItemClass::Pickaxe);
+        assert_eq!(ItemKind::Tool(ToolKind::Axe, MetalKind::Copper).model_class(), ItemClass::Axe);
+        let blade = ItemKind::Legendary(LegendarySpec { seed: 1, class: WeaponClass::Greatsword, element_idx: 4, tier: 2 });
+        assert_eq!(blade.model_class(), ItemClass::Greatsword);
+        assert_eq!(ItemKind::Legendary(LegendarySpec { seed: 1, class: WeaponClass::Wand, element_idx: 1, tier: 0 }).model_class(), ItemClass::Wand);
+        // every weapon class is a distinct shape
+        let mut classes: Vec<ItemClass> = WeaponClass::ALL.iter().map(|c| legendary_model_class(*c)).collect();
+        classes.sort_by_key(|c| format!("{c:?}"));
+        classes.dedup();
+        assert_eq!(classes.len(), WeaponClass::ALL.len(), "two weapon classes share a model");
+        // tier brightens the fittings
+        assert_ne!(legendary_model_palette([1.0, 0.0, 0.0], 0).secondary, legendary_model_palette([1.0, 0.0, 0.0], 2).secondary);
+        let spear = ItemKind::Legendary(LegendarySpec { seed: 1, class: WeaponClass::Spear, element_idx: 0, tier: 0 });
+        assert_eq!(spear.model_class(), ItemClass::Spear);
+        // Same shape, different palette: the metal is on the head, wood on the haft.
+        let iron = ItemKind::Tool(ToolKind::Pickaxe, MetalKind::Iron).model();
+        let gold = ItemKind::Tool(ToolKind::Pickaxe, MetalKind::Gold).model();
+        assert_eq!(iron.boxes.len(), gold.boxes.len());
+        assert!(iron.boxes.iter().zip(gold.boxes.iter()).all(|(a, b)| a.size == b.size && a.center == b.center));
+        assert_ne!(iron.boxes[1].color, gold.boxes[1].color, "head colour follows the metal");
+        assert_eq!(iron.boxes[0].color, crate::item_model::WOOD, "haft is wood");
+    }
+
+    #[test]
+    fn model_palette_primary_matches_display_color() {
+        for it in full_catalog() {
+            let [r, g, b] = it.display_color();
+            let p = it.model_palette().primary;
+            let want = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
+            assert!((p[0] - want[0]).abs() < 1e-6 && (p[1] - want[1]).abs() < 1e-6 && (p[2] - want[2]).abs() < 1e-6,
+                "{it:?}: palette primary {p:?} != display_color {want:?}");
+        }
+    }
+
+    #[test]
+    fn item_id_models_mirror_item_display_ranges() {
+        // food
+        for id in 2000..=2002 { assert_eq!(item_model_for_id(id).class, ItemClass::Food, "id {id}"); }
+        // ingots: 1000 + MetalKind index
+        for id in 1000..1000 + MetalKind::ALL.len() as u32 { assert_eq!(item_model_for_id(id).class, ItemClass::Ingot); }
+        // forged weapons: 4000 + WeaponClass index, same shape as the ItemKind path
+        for (i, wc) in WeaponClass::ALL.iter().enumerate() {
+            let via_id = item_model_for_id(4000 + i as u32).class;
+            let via_kind = ItemKind::Legendary(LegendarySpec { seed: 0, class: *wc, element_idx: 0, tier: 0 }).model_class();
+            assert_eq!(via_id, via_kind, "{wc:?}");
+        }
+        // a real block is a block; air and the unmapped sentinel are generic
+        assert_eq!(item_model_for_id(ItemKind::Block(BlockId::Stone).to_item_id()).class, ItemClass::Block);
+        assert_eq!(item_model_for_id(0).class, ItemClass::Generic);
+        assert_eq!(item_model_for_id(ItemKind::UNMAPPED_ID).class, ItemClass::Generic);
+        // and the generic model is the legacy box, coloured like the legacy swatch
+        let g = item_model_for_id(ItemKind::UNMAPPED_ID);
+        assert_eq!(g.boxes[0].size, [1.7, 5.2, 1.7]);
     }
 }

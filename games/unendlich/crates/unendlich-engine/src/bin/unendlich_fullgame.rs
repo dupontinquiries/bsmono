@@ -186,6 +186,76 @@ struct Roamer {
     graze_cell: (i32, i32),
     /// r300: `roamer_tick` value at the last graze scan (cadence gate).
     graze_scan_tick: u32,
+    /// r-rig: everything the oriented entity path (`anim_rig`) and the melee
+    /// loop read about this creature. One field so the five constructors
+    /// each add one line; `Default` is a standing, idle, unhurt body.
+    rig: RoamerRig,
+}
+
+/// r-rig: per-roamer animation / physics / combat state for
+/// `creature_to_vertices_rigged` and `sim::melee`.
+#[derive(Debug, Clone, Default)]
+struct RoamerRig {
+    /// Horizontal speed this tick (blocks/s), smoothed. Roamers move by
+    /// setting their position and never wrote `body.velocity`, so the old
+    /// entity path saw speed 0 and its legs never swung (this is why walking
+    /// creatures slid).
+    speed: f32,
+    /// Bedded-down amount `[0,1]`, eased toward `resting`.
+    settle: f32,
+    resting: bool,
+    /// Landing squash `[0,1]`, set on touchdown, decays.
+    impact: f32,
+    /// Normalised yaw rate `[-1,1]` (tail swings out of the turn).
+    turn01: f32,
+    prev_yaw: f32,
+    /// Position at the previous tick (speed is a position delta: roamers
+    /// never write `body.velocity`). `None` until the first tick.
+    prev_pos: Option<[f32; 3]>,
+    /// The melee loop (predators hunting); `strike01` feeds the lunge.
+    bout: unendlich_engine::sim::melee::Bout,
+    strike01: f32,
+    /// Set on death: the ragdoll takes the body for `DEATH_LINGER` seconds
+    /// while the pose blends toward it, then the roamer is removed.
+    dying: Option<Dying>,
+    /// r-legendary: burn / chill / stagger left by a weapon's proc
+    /// (`sim::weapon_ability`); ticked each roamer tick.
+    status: unendlich_engine::sim::weapon_ability::StatusEffects,
+    /// Fractional burn damage carried between ticks (hp is an integer).
+    burn_accum: f32,
+}
+
+/// r-rig: a dead roamer's ragdoll (`sim::ragdoll_bridge::from_anatomy`).
+#[derive(Debug, Clone)]
+struct Dying {
+    nodes: Vec<unendlich_engine::sim::ragdoll::Node>,
+    sticks: Vec<unendlich_engine::sim::ragdoll::Stick>,
+    /// Seconds since death.
+    t: f32,
+}
+
+/// r-rig: how long a corpse lies before the roamer is removed.
+const DEATH_LINGER: f32 = 6.0;
+/// r-rig: `Dying` progress reaches 1 (pure ragdoll) this long after death.
+const DEATH_BLEND: f32 = 0.6;
+
+/// r-rig: begin a roamer's death: build the ragdoll from its anatomy with
+/// the killing blow's `impulse`, keep the roamer for `DEATH_LINGER`. A
+/// creature without anatomy (a forge dragon renders its own model) has no
+/// parts to land on nodes, so it is removed at once as before.
+fn begin_death(roamers: &mut Vec<Roamer>, i: usize, impulse: [f32; 3], dt: f32) {
+    let Some(r) = roamers.get_mut(i) else { return };
+    if r.rig.dying.is_some() {
+        return;
+    }
+    let Some(anat) = r.creature.anatomy.as_ref() else {
+        roamers.swap_remove(i);
+        return;
+    };
+    let (nodes, sticks) = unendlich_engine::sim::ragdoll_bridge::from_anatomy(&r.creature, anat, impulse, dt.max(1e-3));
+    r.rig.dying = Some(Dying { nodes, sticks, t: 0.0 });
+    r.rig.strike01 = 0.0;
+    r.rig.resting = false;
 }
 
 /// r666: build a wild, persistent [`Roamer`] of `kind` at `pos`, seeded by
@@ -268,6 +338,7 @@ fn build_roamer(kind: unendlich_engine::item::CreatureKind, pos: [f32; 3], wseed
         graze_target: None,
         graze_cell: (i32::MIN, i32::MIN),
         graze_scan_tick: 0,
+                        rig: RoamerRig::default(),
     }
 }
 
@@ -398,6 +469,30 @@ fn equipped_weapon(
     let class = unendlich_engine::sim::viewmodel::weapon_class_for_id(hand_item?.0)?;
     const DEFAULT_INSTANCE_SEED: u64 = 0xC1A5_5EED;
     Some(unendlich_engine::sim::legendary_weapon::forge(DEFAULT_INSTANCE_SEED, class, 0, 0))
+}
+
+/// r-item-models: the boxes the hero holds (`item_model`), from the same
+/// sources `equipped_weapon` reads so the hand shows the item combat swings:
+/// creative = the picked catalog item; survival = the selected slot's forged
+/// instance, else the survival id (meat, ingot, block) through
+/// `item_model_for_id`. `None` = empty hand (the legacy `held_color` path
+/// still runs when this is `None`, so nothing that drew before goes missing).
+fn held_item_model(
+    survival_mode: bool,
+    creative_place_item: Option<unendlich_engine::item::ItemKind>,
+    hand_item: Option<unendlich_engine::items::ItemId>,
+    app: &unendlich_engine::app::App,
+    selected_palette_idx: usize,
+) -> Option<unendlich_engine::item_model::ItemModel> {
+    if !survival_mode {
+        return creative_place_item.map(|k| k.model());
+    }
+    if let Some(stack) = app.inventory().slot(selected_palette_idx) {
+        if let Some(spec) = stack.weapon_instance {
+            return Some(unendlich_engine::item::ItemKind::Legendary(spec).model());
+        }
+    }
+    hand_item.map(|h| unendlich_engine::item::item_model_for_id(h.0))
 }
 
 /// r-swing: f32 (0..1) counterpart to `LegendarySpec::display_color`'s u8
@@ -3556,6 +3651,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
         .map(|p| p.join("unendlich/settings.json"))
         .unwrap_or_else(|_| std::path::PathBuf::from("unendlich-settings.json"));
+    let mut settings_had_gui_scale = false;
     if let Ok(txt) = std::fs::read_to_string(&settings_path) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
             let g = |k: &str| v.get(k).cloned().unwrap_or(serde_json::Value::Null);
@@ -3567,7 +3663,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             if let Some(n) = g("leaf_stride").as_u64() { renderer.ui_leaf_stride = n; }
             if let Some(n) = g("apply_budget").as_u64() { renderer.ui_apply_budget = n as u32; }
             if let Some(n) = g("render_distance").as_i64() { renderer.ui_render_distance = (n as i32).clamp(2, 32); } // r197
-            if let Some(f) = g("gui_scale").as_f64() { renderer.ui_scale = (f as f32).clamp(1.0, 3.0); } // r200
+            if let Some(f) = g("gui_scale").as_f64() {
+                renderer.ui_scale = (f as f32).clamp(unendlich_engine::mobile_ui::UI_SCALE_MIN, unendlich_engine::mobile_ui::UI_SCALE_MAX); // r200
+                settings_had_gui_scale = true;
+            }
             if let Some(n) = g("fps_target").as_u64() { renderer.ui_fps_target = n as u32; }
             if let Some(b) = g("autotune").as_bool() { renderer.ui_autotune = b; }
             if let Some(n) = g("gpu_mesh_yield").as_u64() { renderer.ui_gpu_mesh_yield = n.min(200); }
@@ -3577,6 +3676,44 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             log::info!("[settings] loaded {}", settings_path.display());
         }
     }
+    // r-mobile: PHONE DETECTION. The game came up at ui_scale 2.0 on every
+    // panel and had no touch controls (touch_controls has the model,
+    // InputCache the seam, nothing fed either). Decide from what the platform
+    // can tell us — GLFW content scale, framebuffer, the session env — with
+    // UNENDLICH_UI_SCALE / UNENDLICH_TOUCH overriding and a saved gui_scale
+    // kept. Logged with the rule that decided it.
+    let (touch_mode, mobile_detect) = {
+        use unendlich_engine::mobile_ui::{detect, Hints};
+        let (cs_x, _cs_y) = window.get_content_scale();
+        let (fbw, fbh) = window.get_framebuffer_size();
+        let envf = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<f32>().ok());
+        let hints = Hints {
+            content_scale: Some(cs_x).filter(|s| s.is_finite() && *s > 0.0),
+            fb: Some((fbw.max(0) as u32, fbh.max(0) as u32)),
+            env_ui_scale: envf("UNENDLICH_UI_SCALE"),
+            env_touch: std::env::var("UNENDLICH_TOUCH").ok().map(|v| v.trim() != "0"),
+            toolkit_scale: envf("GDK_SCALE").or_else(|| envf("QT_SCALE_FACTOR")),
+            desktop: std::env::var("XDG_CURRENT_DESKTOP").ok().or_else(|| std::env::var("DESKTOP_SESSION").ok()),
+            session_type: std::env::var("XDG_SESSION_TYPE").ok(),
+            saved_ui_scale: if settings_had_gui_scale { Some(renderer.ui_scale) } else { None },
+        };
+        let d = detect(&hints);
+        renderer.ui_scale = d.ui_scale;
+        log::info!(
+            "[mobile] ui_scale {:.2} ({}), touch {}, phone {} — content scale {:.2}, fb {}x{}, desktop {:?}",
+            d.ui_scale, d.reason, d.touch, d.phone, cs_x, fbw, fbh, hints.desktop
+        );
+        (d.touch, d)
+    };
+    let _ = &mobile_detect;
+    let mut touch_layout = {
+        let (fbw, fbh) = window.get_framebuffer_size();
+        unendlich_engine::mobile_ui::layout(fbw as f32, fbh as f32, renderer.ui_scale)
+    };
+    let mut pointer_touch = unendlich_engine::mobile_ui::PointerTouch::default();
+    // The world owns the pointer (no UI open) as of the previous frame — the
+    // event loop runs before this frame's UI state is known.
+    let mut touch_world_prev = false;
     fn save_settings(path: &std::path::Path, r: &unendlich_engine::render::world_renderer::WorldRenderer) {
         let v = serde_json::json!({
             "fog": r.ui_fog_on, "shadows": r.ui_shadows_on,
@@ -3817,6 +3954,40 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // pass through, which is what you want — you can aim at where
             // a build should go while describing it.
             let chat_owns_keys = chat_focus;
+            // r-mobile: in touch mode, while the world owns the pointer, the
+            // compositor's emulated mouse IS the finger: a press on an
+            // on-screen button owns that button, any other press is the
+            // stick (left half) or the look drag (right half). Those events
+            // never reach InputCache as mouse events — a tap must not punch.
+            let touch_routed = if touch_mode && touch_world_prev {
+                match event {
+                    WindowEvent::MouseButton(MouseButtonLeft, Action::Press, _) => {
+                        let (cx, cy) = window.get_cursor_pos();
+                        let (ww, wh) = window.get_size();
+                        let (fbw, fbh) = window.get_framebuffer_size();
+                        let sx = if ww > 0 { fbw as f64 / ww as f64 } else { 1.0 };
+                        let sy = if wh > 0 { fbh as f64 / wh as f64 } else { 1.0 };
+                        pointer_touch.press((cx * sx) as f32, (cy * sy) as f32, &touch_layout);
+                        true
+                    }
+                    WindowEvent::MouseButton(MouseButtonLeft, Action::Release, _) => {
+                        pointer_touch.release();
+                        true
+                    }
+                    WindowEvent::CursorPos(cx, cy) => {
+                        let (ww, wh) = window.get_size();
+                        let (fbw, fbh) = window.get_framebuffer_size();
+                        let sx = if ww > 0 { fbw as f64 / ww as f64 } else { 1.0 };
+                        let sy = if wh > 0 { fbh as f64 / wh as f64 } else { 1.0 };
+                        pointer_touch.moved((cx * sx) as f32, (cy * sy) as f32);
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if !touch_routed {
             if let Some(ev) = unendlich_engine::input_codes::input_event_from_glfw(&event) {
                 // Both key variants: an UnknownKey is still a keystroke
                 // the chat is consuming, and letting it through would
@@ -3827,6 +3998,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 if !(chat_owns_keys && is_key) {
                     input.handle_event(&ev);
                 }
+            }
             }
             match event {
                 // Chat keys first, through the ONE routing function shared
@@ -3875,6 +4047,74 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
                 _ => {}
             }
+        }
+
+        // r-mobile: hand this frame's finger to the touch model and the
+        // buttons to the keys they stand for. A held button (jump, attack,
+        // sprint, sneak) is a key held; a tap (inventory) is a press that
+        // releases at once; Menu is the Esc path; Use is the right button.
+        if touch_mode {
+            use unendlich_engine::input_codes::{InputEvent, KeyAction, MouseBtn, TouchPhase};
+            use unendlich_engine::keybindings::GameAction;
+            use unendlich_engine::mobile_ui::ButtonKind;
+            if let Some((w, h)) = needs_resize {
+                touch_layout = unendlich_engine::mobile_ui::layout(w as f32, h as f32, renderer.ui_scale);
+            }
+            for t in pointer_touch.touches.drain(..) {
+                let phase = match t.phase {
+                    unendlich_engine::touch_controls::Phase::Start => TouchPhase::Start,
+                    unendlich_engine::touch_controls::Phase::Move => TouchPhase::Move,
+                    unendlich_engine::touch_controls::Phase::End => TouchPhase::End,
+                };
+                input.handle_event(&InputEvent::Touch { id: t.id, x: t.x, y: t.y, phase });
+            }
+            let action_of = |b: ButtonKind| match b {
+                ButtonKind::Jump => Some(GameAction::Jump),
+                ButtonKind::Sprint => Some(GameAction::Sprint),
+                ButtonKind::Sneak => Some(GameAction::Sneak),
+                ButtonKind::Inventory => Some(GameAction::OpenInventory),
+                _ => None,
+            };
+            let tapped: Vec<ButtonKind> = pointer_touch.tapped.drain(..).collect();
+            let released: Vec<ButtonKind> = pointer_touch.released.drain(..).collect();
+            for b in tapped {
+                match b {
+                    ButtonKind::Attack => input.handle_event(&InputEvent::MouseButton { button: MouseBtn::Left, action: KeyAction::Press }),
+                    ButtonKind::Use => {
+                        input.handle_event(&InputEvent::MouseButton { button: MouseBtn::Right, action: KeyAction::Press });
+                        input.handle_event_late(&InputEvent::MouseButton { button: MouseBtn::Right, action: KeyAction::Release });
+                    }
+                    ButtonKind::Menu => esc_pressed = true,
+                    other => {
+                        if let Some(a) = action_of(other) {
+                            if let Some(k) = bindings.keys_for_action(a).first().copied() {
+                                input.handle_event(&InputEvent::Key { code: k, action: KeyAction::Press });
+                                if !other.is_held() {
+                                    input.handle_event_late(&InputEvent::Key { code: k, action: KeyAction::Release });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for b in released {
+                match b {
+                    ButtonKind::Attack => input.handle_event(&InputEvent::MouseButton { button: MouseBtn::Left, action: KeyAction::Release }),
+                    other if other.is_held() => {
+                        if let Some(a) = action_of(other) {
+                            if let Some(k) = bindings.keys_for_action(a).first().copied() {
+                                input.handle_event(&InputEvent::Key { code: k, action: KeyAction::Release });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // dt is computed further down the frame; the touch clock uses the
+            // wall time since the previous frame directly (same source).
+            let touch_dt = last_frame.elapsed().as_secs_f32().min(0.1);
+            let (fbw, _) = window.get_framebuffer_size();
+            input.tick_touch(touch_dt, fbw as f32);
         }
 
         // Carry-aware: a late-drained Esc shows up as just-pressed next frame.
@@ -4874,7 +5114,21 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             input.cursor_delta = (0.0, 0.0);
             log::info!("[ui] cursor released to UI (authority)");
         }
-        if !mouse_captured && !any_ui_owns_cursor && input.is_mouse_button_just_pressed(MouseBtn::Left) {
+        if touch_mode {
+            // r-mobile: a touchscreen has no cursor to disable — the look drag
+            // is a finger delta the touch model folds into cursor_delta. The
+            // world "captures" whenever no UI is open.
+            let want = !any_ui_owns_cursor;
+            if want != mouse_captured {
+                mouse_captured = want;
+                input.cursor_delta = (0.0, 0.0);
+                if !want {
+                    input.touch.clear();
+                    pointer_touch = unendlich_engine::mobile_ui::PointerTouch::default();
+                }
+            }
+            touch_world_prev = want;
+        } else if !mouse_captured && !any_ui_owns_cursor && input.is_mouse_button_just_pressed(MouseBtn::Left) {
             window.set_cursor_mode(CursorMode::Disabled);
             mouse_captured = true;
             // Reset deltas so we don't snap on first frame.
@@ -5595,6 +5849,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         graze_target: None,
                         graze_cell: (i32::MIN, i32::MIN),
                         graze_scan_tick: 0,
+                        rig: RoamerRig::default(),
                     });
                     log::info!(
                         "[director] {:?} spawned at ({:.0},{:.0}) — {} (phase {:.2})",
@@ -6558,6 +6813,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         graze_target: None,
                         graze_cell: (i32::MIN, i32::MIN),
                         graze_scan_tick: 0,
+                        rig: RoamerRig::default(),
                     });
                     hatched += 1;
                 }
@@ -7997,6 +8253,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         if bindings.is_action_pressed(GameAction::MoveBackward, &input) { move_local.x -= 1.0; }
         if bindings.is_action_pressed(GameAction::MoveRight, &input)    { move_local.z += 1.0; }
         if bindings.is_action_pressed(GameAction::MoveLeft, &input)     { move_local.z -= 1.0; }
+        // r-mobile: the virtual stick, as an axis (up on the glass = forward).
+        if touch_mode {
+            let [sx, sy] = input.move_axes();
+            move_local.x += -sy;
+            move_local.z += sx;
+        }
 
         // r600 (soak-with-movement): under UNENDLICH_AUTOPLAY, once in-world,
         // walk. A steady forward push with a slow yaw drift traces a wide
@@ -8560,6 +8822,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             graze_target: None,
                             graze_cell: (i32::MIN, i32::MIN),
                             graze_scan_tick: 0,
+                        rig: RoamerRig::default(),
                         });
                     }
                 }
@@ -8605,9 +8868,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         unendlich_engine::item::CreatureKind::Dragon => 2u8,
                         _ => 0u8,
                     };
-                    (k, r.creature.body.position, r.creature.mass)
+                    // r-rig: a corpse is not prey (kind 255 matches nothing)
+                    (if r.rig.dying.is_some() { 255u8 } else { k }, r.creature.body.position, r.creature.mass)
                 })
                 .collect();
+            // r-rig: prey hp for the melee loop (a Fighter needs the defender's hp),
+            // and the blows landed this tick, applied after the loop.
+            let herd_hp: Vec<i32> = roamers.iter().map(|r| r.hp).collect();
+            let mut prey_hits: Vec<(usize, f32, [f32; 3], f32)> = Vec::new();
             let mut prey_killed: Vec<usize> = Vec::new();
             // r166: HIDING — sneaking inside tall flora conceals you:
             // creature SIGHT fails (hearing still works at reduced loudness,
@@ -8760,9 +9028,52 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     graze_cell,
                     graze_scan_tick,
                     home, // r693: den anchor for dragon territorial defense
+                    rig,
                     ..
                 } = r;
                 let self_xz = (cr.body.position[0], cr.body.position[2]);
+                // r-rig: per-tick bookkeeping from the previous tick's motion:
+                // speed and yaw rate from deltas (smoothed), landing squash
+                // decay, and the bedded-down ease toward `resting`.
+                {
+                    let p = cr.body.position;
+                    let inst = match rig.prev_pos {
+                        Some(q) if dt > 1e-4 => ((p[0] - q[0]).powi(2) + (p[2] - q[2]).powi(2)).sqrt() / dt,
+                        _ => 0.0,
+                    };
+                    rig.speed += (inst.min(12.0) - rig.speed) * (dt * 8.0).min(1.0);
+                    let dyaw = {
+                        use std::f32::consts::{PI, TAU};
+                        (cr.yaw - rig.prev_yaw + PI).rem_euclid(TAU) - PI
+                    };
+                    let rate = if dt > 1e-4 { (dyaw / dt) / turn_rate.max(0.1) } else { 0.0 };
+                    rig.turn01 += (rate.clamp(-1.0, 1.0) - rig.turn01) * (dt * 6.0).min(1.0);
+                    rig.prev_pos = Some(p);
+                    rig.prev_yaw = cr.yaw;
+                    rig.impact *= (-6.0 * dt).exp();
+                    let target = if rig.resting { 1.0 } else { 0.0 };
+                    rig.settle += (target - rig.settle) * (dt * 1.5).min(1.0);
+                    // r-legendary: statuses. Burn ticks hp; a stagger stops the
+                    // creature and breaks its melee windup; a chill slows the step
+                    // (applied below with the stumble multiplier).
+                    if rig.status.any() {
+                        rig.burn_accum += rig.status.tick(dt);
+                        if rig.burn_accum >= 1.0 {
+                            let whole = rig.burn_accum.floor();
+                            *hp -= whole as i32;
+                            rig.burn_accum -= whole;
+                        }
+                        if rig.status.staggered() {
+                            rig.bout.flinch(1e9, 1.0);
+                            rig.strike01 = 0.0;
+                        }
+                        // ember / frost tint over whatever the creature wears
+                        let st = rig.status.tint(cr.anim_time);
+                        for k in 0..3 {
+                            cr.tint[k] = (cr.tint[k] * 0.9 + 0.1) * st[k];
+                        }
+                    }
+                }
                 // Advance the forge idle clock. It was never ticked, so anim_time
                 // stayed 0 for every live creature and the forge's idle animations
                 // (breathing, wing beat, jaw, head idle-scan) were frozen — only
@@ -8871,6 +9182,29 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     }
                 };
 
+                // r-rig: a dead creature is a ragdoll now — step it, keep it on
+                // the ground it died on, and skip every living behaviour.
+                if let Some(d) = rig.dying.as_mut() {
+                    d.t += dt;
+                    let ground = surface_at(cr.body.position[0], cr.body.position[2])
+                        .map(|t| (t + 1) as f32)
+                        .unwrap_or(cr.body.position[1] - 1.0);
+                    unendlich_engine::sim::ragdoll::step(&mut d.nodes, &d.sticks, ground, dt.max(1e-3), 4);
+                    if cr.forge.is_some() {
+                        // r-rig: a forge dragon renders its own voxel model, which
+                        // the rig cannot pose onto ragdoll nodes — so it TOPPLES:
+                        // rolls onto its side, noses down, and sinks to the ground.
+                        let k = (dt * 2.5).min(1.0);
+                        cr.roll += (1.3 - cr.roll) * k;
+                        cr.pitch += (0.12 - cr.pitch) * k;
+                        let lie_y = ground + cr.body.half_extents[1] * 0.55;
+                        cr.body.position[1] += (lie_y - cr.body.position[1]) * (dt * 3.0).min(1.0);
+                        cr.body.velocity = [0.0; 3];
+                    }
+                    rig.speed = 0.0;
+                    continue;
+                }
+
                 // --- Airborne: integrate a leap arc, then everything else waits ---
                 if let Some((v, aloft0)) = *airborne {
                     let mut v = v;
@@ -8909,6 +9243,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             cr.body.position[1] = cr.grounded_y((t + 1) as f32);
                         }
                         *airborne = None;
+                        // r-rig: touchdown → landing squash, scaled by the fall speed
+                        rig.impact = (nvy.abs() / 12.0).clamp(0.0, 1.0).max(rig.impact);
                     }
                     continue; // skip normal movement while in the air
                 }
@@ -9181,7 +9517,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             unendlich_engine::sim::behavior_arbiter::Drives {
                                 threat: tdn,
                                 hunger: (1.0 - vitality.energy).clamp(0.0, 1.0),
-                                fatigue: 0.0, // (rest_cycle wiring is a later refinement)
+                                // r-rig: the rest urge (species rhythm × time of day ×
+                                // hunger-as-fatigue × rain), so Rest can win the argmax
+                                fatigue: unendlich_engine::sim::rest_cycle::rest_urge(
+                                    unendlich_engine::sim::rest_cycle::rhythm_for(*kind),
+                                    sky_state.day_phase(),
+                                    1.0 - vitality.energy.clamp(0.0, 1.0),
+                                    0.3 * precip01,
+                                ),
                                 aggression: eff_aggression,
                                 health_frac: (*hp as f32 / 40.0).clamp(0.0, 1.0),
                             }
@@ -9445,19 +9788,72 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         })
                         .collect();
                     if let ppm::Act::Hunt(prey_idx) = ppm::decide(&me, &others) {
-                        let (_, tp, _) = herd_snapshot[prey_idx];
+                        let (_, tp, tsize) = herd_snapshot[prey_idx];
                         let ddx = tp[0] - mypos[0];
                         let ddz = tp[2] - mypos[2];
                         let dd = (ddx * ddx + ddz * ddz).sqrt();
-                        if dd > 1.5 {
-                            // chase overrides wander heading at sprint pace
-                            rdx = ddx / dd * 3.2;
-                            rdz = ddz / dd * 3.2;
-                        } else {
-                            prey_killed.push(prey_idx);
-                            vitality.feed(0.5);
-                            log::info!("[ecology] Dinosaur brought down prey at ({:.0},{:.0})", tp[0], tp[2]);
+                        // r-rig: the kill is no longer instant at 1.5 blocks. The REAL
+                        // sim::melee loop runs: close, wind up, the bite lands on the
+                        // frame the lunge peaks (strike01 feeds anim_rig), recover,
+                        // repeat until a blow is lethal. Prey with more hp survives
+                        // a bite and can be knocked back.
+                        use unendlich_engine::sim::melee;
+                        let body_len = cr.body.half_extents[0].max(cr.body.half_extents[2]);
+                        let att = melee::Fighter {
+                            hp: (*hp).max(0) as f32,
+                            max_hp: 40.0,
+                            mass: cr.mass.max(0.5),
+                            reach: 0.8 + body_len,
+                            power: 8.0 + 2.0 * cr.mass,
+                            accuracy: 1.0,
+                            evasion: 0.5,
+                            armor: 0.0,
+                            left_hp: 20.0,
+                            right_hp: 20.0,
+                        };
+                        let def = melee::Fighter {
+                            hp: herd_hp.get(prey_idx).copied().unwrap_or(40).max(0) as f32,
+                            max_hp: 40.0,
+                            mass: tsize.max(0.5),
+                            evasion: 0.7,
+                            ..Default::default()
+                        };
+                        let roll = {
+                            let sd = (frame_count as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(prey_idx as u64 * 977);
+                            ((sd >> 40) & 0xFFFF) as f32 / 65535.0
+                        };
+                        let prey_radius = 0.5 * tsize.max(0.5);
+                        let (mv, blow) = melee::tick(&mut rig.bout, &att, &def, prey_radius, dd, 0.5, dt, roll);
+                        rig.strike01 = rig.bout.strike01(att.mass);
+                        match mv {
+                            melee::Move::Close => {
+                                // chase overrides wander heading at sprint pace
+                                rdx = ddx / dd.max(0.01) * 3.2;
+                                rdz = ddz / dd.max(0.01) * 3.2;
+                            }
+                            melee::Move::Hold | melee::Move::Back => {
+                                rdx = 0.0;
+                                rdz = 0.0;
+                                w.heading = ddz.atan2(ddx);
+                            }
                         }
+                        if let Some(e) = blow {
+                            if e.hit {
+                                let dir = [ddx / dd.max(0.01), 0.0, ddz / dd.max(0.01)];
+                                prey_hits.push((prey_idx, e.damage, dir, e.knockback));
+                                if e.lethal {
+                                    prey_killed.push(prey_idx);
+                                    vitality.feed(0.5);
+                                    log::info!("[ecology] Dinosaur brought down prey at ({:.0},{:.0}) — {:.1} dmg, overkill {:.1}", tp[0], tp[2], e.damage, e.overkill);
+                                } else {
+                                    log::info!("[ecology] Dinosaur bites prey for {:.1} (hp {:.0} left)", e.damage, e.defender_hp);
+                                }
+                            } else {
+                                log::info!("[ecology] Dinosaur's bite misses");
+                            }
+                        }
+                    } else {
+                        rig.strike01 = 0.0;
                     }
                 }
                 _t_herdscan_us += _t_hs.elapsed().as_micros() as u64;
@@ -9465,14 +9861,19 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // Diurnal fauna bed down at night, Nocturnal listeners by day,
                 // Crepuscular at the extremes, dragons (Cathemeral) rarely.
                 // Threat overrides rest; fatigue = hunger here.
+                if threat.is_some() {
+                    rig.resting = false;
+                }
                 if threat.is_none() {
                     let rhythm = unendlich_engine::sim::rest_cycle::rhythm_for(*kind);
                     let fatigue = 1.0 - vitality.energy.clamp(0.0, 1.0);
                     // r156: storms drive shelter-seeking — precipitation
                     // biases the urge so the herd hunkers down in the rain.
-                    if unendlich_engine::sim::rest_cycle::wants_rest(
+                    let resting_now = unendlich_engine::sim::rest_cycle::wants_rest(
                         rhythm, sky_state.day_phase(), fatigue, 0.3 * precip01,
-                    ) {
+                    );
+                    rig.resting = resting_now;
+                    if resting_now {
                         rdx = 0.0;
                         rdz = 0.0;
                         if frame_count % 1800 == 0 && rest_log_budget > 0 {
@@ -9500,7 +9901,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
                 // Stumble recovery slows the step (and the trip below may start
                 // one). A creature mid-stumble is hobbled until it recovers.
-                let speed_mult = stumble.tick();
+                let speed_mult = stumble.tick() * rig.status.speed_mult();
                 rdx *= speed_mult;
                 rdz *= speed_mult;
                 let step = (rdx * rdx + rdz * rdz).sqrt();
@@ -10167,6 +10568,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 graze_target: None,
                                 graze_cell: (i32::MIN, i32::MIN),
                                 graze_scan_tick: 0,
+                        rig: RoamerRig::default(),
                             });
                         }
                     }
@@ -10175,12 +10577,30 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // r141: resolve predator kills (deferred — indices were into the
             // pre-loop snapshot; remove highest-first so swap_remove is safe,
             // and only while the index still points at a non-persistent prey).
+            // r-rig: apply this tick's landed bites: hp, a shove along the bite,
+            // and a flinch if the prey was mid-strike itself.
+            for (pi, dmg, dir, kb) in prey_hits {
+                if let Some(pr) = roamers.get_mut(pi) {
+                    if pr.rig.dying.is_some() { continue; }
+                    pr.hp -= dmg.round().max(1.0) as i32;
+                    let v = &mut pr.creature.body.velocity;
+                    v[0] += dir[0] * kb;
+                    v[1] += 0.6;
+                    v[2] += dir[2] * kb;
+                    pr.creature.body.position[0] += dir[0] * kb * 0.08;
+                    pr.creature.body.position[2] += dir[2] * kb * 0.08;
+                    pr.rig.bout.flinch(dmg, 40.0);
+                    pr.rig.impact = (kb / 10.0).clamp(0.0, 0.6).max(pr.rig.impact);
+                }
+            }
             prey_killed.sort_unstable_by(|a, b| b.cmp(a));
             prey_killed.dedup();
             for pi in prey_killed {
                 if pi < roamers.len() && !roamers[pi].persistent {
                     let p = roamers[pi].creature.body.position;
-                    roamers.swap_remove(pi);
+                    // r-rig: the corpse stays as a ragdoll (see begin_death); the
+                    // meat drops now as before.
+                    begin_death(&mut roamers, pi, [0.0, 1.5, 0.0], dt);
                     fg_app.drops_mut().spawn(
                         unendlich_engine::items::ItemStack {
                             item: unendlich_engine::items::ItemId(MEAT_ITEM),
@@ -10192,6 +10612,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     );
                 }
             }
+            // r-rig: corpses that have lain for DEATH_LINGER are gone.
+            roamers.retain(|r| r.rig.dying.as_ref().map_or(true, |d| d.t < DEATH_LINGER));
             }
         }
 
@@ -10688,60 +11110,78 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 }
                             }
                         }
-                        // rNNN: LIGHTNING ARC — the strike chains to nearby foes
-                        // via the REAL legendary_weapon swing resolver (r369). A
-                        // Storm-element blade (element 5 ⇒ LightningArc proc) is
-                        // forged once; resolve_weapon_swing picks the arc targets
-                        // (greedy nearest, no repeats) and the per-arc damage.
-                        // Gated default-OFF, additive — primary hit is untouched.
-                        if lightning_arc_enabled {
+                        // r-legendary: THE EQUIPPED WEAPON'S ABILITY. Every proc is
+                        // resolved by sim::weapon_ability::on_hit from the weapon in
+                        // hand (the previous arc demo forged a fixed Storm blade
+                        // whatever was equipped, behind UNENDLICH_LIGHTNING_ARC, and
+                        // the other five procs did nothing). Frost chills, the jet
+                        // shoves, gale launches, spikes stagger a radius, flame
+                        // burns a cone, lightning chains. Statuses land on
+                        // RoamerRig.status and tick in the roamer loop.
+                        let mut ability_kb_mult = 1.0f32;
+                        let mut ability_launch = 0.0f32;
+                        if let Some(w) = weapon.as_ref() {
+                            use unendlich_engine::sim::weapon_ability as wa;
                             let origin = roamers[ri].creature.body.position;
                             let mut cand_idx: Vec<usize> = Vec::new();
                             let mut cand_pos: Vec<[f32; 3]> = Vec::new();
                             for (rj, rr) in roamers.iter().enumerate() {
-                                if rj == ri || rr.hp <= 0 { continue; }
+                                if rj == ri || rr.hp <= 0 || rr.rig.dying.is_some() { continue; }
                                 let p = rr.creature.body.position;
                                 let d2 = (p[0] - origin[0]).powi(2)
                                     + (p[1] - origin[1]).powi(2)
                                     + (p[2] - origin[2]).powi(2);
-                                if d2 <= 12.0 * 12.0 {
+                                if d2 <= 14.0 * 14.0 {
                                     cand_idx.push(rj);
                                     cand_pos.push(p);
                                 }
                             }
-                            let sword = unendlich_engine::sim::legendary_weapon::forge(
-                                0x5106_57A2,
-                                unendlich_engine::sim::legendary_weapon::WeaponClass::Blade,
-                                5, // Storm ⇒ LightningArc
-                                3,
-                            );
                             let roll_seed = (frame_count as u64)
                                 .wrapping_mul(0x9E37_79B9)
-                                .wrapping_add(ri as u64);
+                                .wrapping_add(ri as u64 * 7919);
                             let roll = ((roll_seed >> 40) & 0xFFFF) as f32 / 65535.0;
-                            let swing = unendlich_engine::sim::legendary_weapon::resolve_weapon_swing(
-                                &sword, roll, origin, &cand_pos, 4, 6.0,
-                            );
-                            if !swing.arc_targets.is_empty() {
-                                let arc_dmg = swing.arc_damage.round().max(1.0) as i32;
-                                for &ci in &swing.arc_targets {
-                                    let rj = cand_idx[ci];
-                                    roamers[rj].hp -= arc_dmg;
-                                    if witness_enabled {
-                                        let vk = match roamers[rj].kind {
-                                            unendlich_engine::item::CreatureKind::Dinosaur => 1u8,
-                                            unendlich_engine::item::CreatureKind::Dragon => 2u8,
-                                            _ => 0u8,
-                                        };
-                                        attack_events.push((roamers[rj].creature.body.position, vk));
-                                    }
+                            let dir = [cam_forward.x, 0.0, cam_forward.z];
+                            let out = wa::on_hit(w, origin, dir, &cand_pos, roll);
+                            ability_kb_mult = out.knockback_mult;
+                            ability_launch = out.launch_up;
+                            if let Some(st) = out.target_status {
+                                roamers[ri].rig.status.apply(st);
+                            }
+                            for sp in &out.splash {
+                                let rj = cand_idx[sp.idx];
+                                if sp.damage > 0.0 {
+                                    roamers[rj].hp -= sp.damage.round().max(1.0) as i32;
                                 }
+                                if let Some(st) = sp.status {
+                                    roamers[rj].rig.status.apply(st);
+                                }
+                                if sp.shove > 0.0 {
+                                    let q = roamers[rj].creature.body.position;
+                                    let (dx, dz) = (q[0] - origin[0], q[2] - origin[2]);
+                                    let d = (dx * dx + dz * dz).sqrt().max(0.01);
+                                    let v = &mut roamers[rj].creature.body.velocity;
+                                    v[0] += dx / d * sp.shove;
+                                    v[1] += 0.4;
+                                    v[2] += dz / d * sp.shove;
+                                }
+                                if witness_enabled {
+                                    let vk = match roamers[rj].kind {
+                                        unendlich_engine::item::CreatureKind::Dinosaur => 1u8,
+                                        unendlich_engine::item::CreatureKind::Dragon => 2u8,
+                                        _ => 0u8,
+                                    };
+                                    attack_events.push((roamers[rj].creature.body.position, vk));
+                                }
+                            }
+                            if out.proc != unendlich_engine::sim::legendary_weapon::ProcKind::None {
                                 log::info!(
-                                    "[lightning] arc chained to {} foe(s) for {} each",
-                                    swing.arc_targets.len(), arc_dmg
+                                    "[ability] {} — {:?} on the target{}",
+                                    out.label, out.target_status,
+                                    if out.splash.is_empty() { String::new() } else { format!(", {} other(s) caught", out.splash.len()) }
                                 );
                             }
                         }
+                        let _ = lightning_arc_enabled;
                         // r284: record this attack so creatures that can see it can
                         // react (witnessed-attack reaction, below). Position + kind.
                         if witness_enabled {
@@ -10773,10 +11213,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         // punch direction (+ a small upward pop), scaled by the attacker's
                         // stature (knockback_dealt = 1.0 default → a giant sends them flying).
                         {
-                            let kb = 3.0 * player_stature.knockback_dealt;
+                            let kb = 3.0 * player_stature.knockback_dealt * ability_kb_mult;
                             let v = &mut roamers[ri].creature.body.velocity;
                             v[0] += cam_forward.x * kb;
-                            v[1] += 1.2;
+                            v[1] += 1.2 + ability_launch;
                             v[2] += cam_forward.z * kb;
                         }
                         let p = roamers[ri].creature.body.position;
@@ -10863,7 +11303,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 log::info!("[loot] …and an egg");
                             }
                             log::info!("[loot] {} meat (tier {})", meat_n, tier);
-                            roamers.swap_remove(ri);
+                            // r-rig: the body falls as a ragdoll, carrying the blow's
+                            // knockback, instead of vanishing on the hit frame.
+                            let kb = 3.0 * player_stature.knockback_dealt;
+                            begin_death(
+                                &mut roamers,
+                                ri,
+                                [cam_forward.x * kb, 2.0, cam_forward.z * kb],
+                                dt,
+                            );
                         }
                         last_block_action = Instant::now();
                         creature_hit = true;
@@ -12994,6 +13442,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // `ui_mouse_down` was set only in the top drain, leaving egui stuck
             // "pressed" on late releases → clicks became window drags.)
             renderer.ui_pointer_down = input.is_mouse_button_pressed(MouseBtn::Left);
+            // r-mobile: the on-screen controls, drawn by the HUD when in-world
+            renderer.touch_overlay = if touch_mode && touch_world_prev {
+                Some(unendlich_engine::render::world_renderer::TouchOverlay {
+                    layout: touch_layout.clone(),
+                    stick: input.touch.stick(),
+                    held: pointer_touch.held_button.into_iter().collect(),
+                })
+            } else {
+                None
+            };
             renderer.ui_pointer2_down = input.is_mouse_button_pressed(MouseBtn::Right); // r186
             // Clicks whose press+release collapse into one frame (low fps)
             // produce no level edge; forward them as discrete clicks.
@@ -13078,6 +13536,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     color: d.color,
                                     name: d.name,
                                     count: st.count as u32,
+                                    icon: unendlich_engine::render::world_renderer::item_icon(
+                                        &unendlich_engine::item::item_model_for_id(st.item.0),
+                                    ),
                                 },
                             );
                         }
@@ -13096,6 +13557,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 color: d.color,
                                 name: d.name,
                                 count: st.count as u32,
+                                icon: unendlich_engine::render::world_renderer::item_icon(
+                                    &unendlich_engine::item::item_model_for_id(st.item.0),
+                                ),
                             }
                         }));
                     }
@@ -13106,6 +13570,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         color: d.color,
                         name: d.name,
                         count: st.count as u32,
+                        icon: unendlich_engine::render::world_renderer::item_icon(
+                            &unendlich_engine::item::item_model_for_id(st.item.0),
+                        ),
                     }
                 });
                 let game_secs = (8 * 3600 + (world_clock_elapsed as u64) * 60) % 86_400;
@@ -13471,6 +13938,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             walk_amp: hero_gait_amp,
                             anim_t: start.elapsed().as_secs_f32(),
                             held_color,
+                            held: held_item_model(
+                                survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
+                            ),
                             airborne: hero_airborne01,
                             vertical_vel: vvel,
                             land_crouch: hero_land_crouch,
@@ -13676,9 +14146,40 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
             }
             // Append the streamed ambient roamers.
+            // r-rig: through the oriented rig (creature_to_vertices_rigged): legs
+            // pivot and plant at the roamer's real speed, the tail bends out of
+            // turns, a landing squashes, a resting creature beds down, a hunting
+            // predator lunges, and a dead one lies where its ragdoll put it.
             for r in &roamers {
                 let cr = &r.creature;
-                let (cv, ci) = creature_to_vertices(cr);
+                use unendlich_engine::sim::liveliness::MotionState;
+                let (state, progress) = match r.rig.dying.as_ref() {
+                    Some(d) => (MotionState::Dying, (d.t / DEATH_BLEND).min(1.0)),
+                    None if r.rig.settle > 0.5 => (MotionState::Resting, 0.0),
+                    None if r.rig.speed > 0.2 => (MotionState::Walking, 0.0),
+                    None => (MotionState::Idle, 0.0),
+                };
+                let motion = unendlich_engine::anim_rig::MotionInput {
+                    gait_phase: cr.gait_phase,
+                    speed: r.rig.speed,
+                    flying: r.flying,
+                    fly_power: if r.flying { 1.0 } else { 0.0 },
+                    turn: r.rig.turn01,
+                    gaze_yaw: cr.gaze_yaw,
+                    gaze_pitch: cr.gaze_pitch,
+                    state,
+                    progress,
+                    time: cr.anim_time,
+                    impact: r.rig.impact,
+                    settle: r.rig.settle,
+                    strike: r.rig.strike01,
+                    ..Default::default()
+                };
+                let sample = r.rig.dying.as_ref().map(|d| {
+                    unendlich_engine::sim::ragdoll_bridge::sample_body_local(&d.nodes, cr.body.position, cr.yaw)
+                });
+                let rd = sample.as_ref().map(|(body, parts)| unendlich_engine::anim_rig::RagdollSample { body: *body, parts });
+                let (cv, ci) = unendlich_engine::world::entity::creature_to_vertices_rigged(cr, &motion, rd.as_ref(), 0.0);
                 let base = everts.len() as u32;
                 everts.extend(cv);
                 eindices.extend(ci.iter().map(|i| i + base));

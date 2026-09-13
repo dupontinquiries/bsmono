@@ -9,6 +9,9 @@
 
 pub mod assets;
 pub mod touch_controls;
+/// Phone detection (UI scale + touch mode from content scale / framebuffer /
+/// session env) and the on-screen control layout. Pure.
+pub mod mobile_ui;
 pub mod pngutil;
 pub mod constants;
 pub mod scale;
@@ -130,6 +133,10 @@ pub mod creature_viewer_ui;
 pub mod air;
 pub mod fabric;
 pub mod pose;
+/// Oriented per-part posing (legs pivot at the hip, squash/stretch, breath,
+/// tail S-curve, strike lunge, settle, ragdoll blend). Pure; supersedes the
+/// offset-only `pose::animate` on the rigged entity path.
+pub mod anim_rig;
 pub mod collision;
 pub mod inventory;
 pub mod action_queue;
@@ -137,6 +144,9 @@ pub mod inventory_screen;
 pub mod ui_feel;
 pub mod emblem;
 pub mod item;
+/// Procedural voxel-box models per item class (the hand and the slot draw
+/// the same boxes). Pure; the `ItemKind`/`ItemId` adapters live in `item.rs`.
+pub mod item_model;
 pub mod spawn;
 pub mod mob;
 pub mod loot;

@@ -233,6 +233,14 @@ impl TouchState {
         d
     }
 
+    /// The move finger's anchor and current position, for drawing the stick.
+    pub fn stick(&self) -> Option<((f32, f32), (f32, f32))> {
+        self.fingers
+            .iter()
+            .find(|(_, f)| self.role_of(f) == Some(Role::Move))
+            .map(|(_, f)| (f.anchor, f.at))
+    }
+
     /// Taps resolved since the last call, and clears them.
     pub fn take_taps(&mut self) -> Vec<(f32, f32)> {
         std::mem::take(&mut self.taps)

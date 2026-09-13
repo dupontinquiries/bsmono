@@ -1342,6 +1342,199 @@ pub fn creature_to_vertices_lod(creature: &crate::creature::Creature, min_part_h
     (verts, indices)
 }
 
+/// r-anim-rig: the [`anim_rig::Role`](crate::anim_rig::Role) an anatomy
+/// part poses as. Jaw/Eye/Ear form the head cluster (gaze + strike); feet
+/// are legs; hands are arms.
+pub fn rig_role(part: crate::creature::Part) -> crate::anim_rig::Role {
+    use crate::anim_rig::Role;
+    use crate::creature::Part::*;
+    match part {
+        Foot | StickyFoot => Role::Leg,
+        Hand => Role::Arm,
+        Wing => Role::Wing,
+        Tail => Role::Tail,
+        Jaw | Eye | Ear => Role::Head,
+        Fin => Role::Fin,
+    }
+}
+
+/// r-anim-rig: the anatomy as rig parts, in part order (so `PosedBox::source`
+/// indexes `anatomy.parts` directly). Destroyed parts are kept in the list so
+/// indices line up with a ragdoll sample; the vertex pass skips them.
+pub fn rig_parts(anatomy: &crate::creature::Anatomy) -> Vec<crate::anim_rig::RigPart> {
+    anatomy
+        .parts
+        .iter()
+        .map(|p| crate::anim_rig::RigPart { role: rig_role(p.part), offset: p.offset, half: p.half_extents })
+        .collect()
+}
+
+/// r-rig: a design-layer box role as a rig role. Neck is a chain (bends INTO
+/// a turn); Head/Snout/Eye/Jaw/Horn ride the head pivot; Ridge/Spine/other
+/// follow the torso.
+pub fn rig_role_of_box(role: crate::creature_design::BoxRole) -> crate::anim_rig::Role {
+    use crate::anim_rig::Role;
+    use crate::creature_design::BoxRole as B;
+    match role {
+        B::Leg => Role::Leg,
+        B::Wing => Role::Wing,
+        B::Tail => Role::Tail,
+        B::Neck => Role::Neck,
+        B::Head | B::Snout | B::Eye | B::Jaw | B::Horn => Role::Head,
+        _ => Role::Other,
+    }
+}
+
+/// r-rig: the design's boxes as rig parts, Body excluded, in box order — the
+/// same order `spawn::from_blueprint` filed them into the anatomy, so rig
+/// part `i` is anatomy part `i` and a ragdoll sample lines up. Returns the
+/// parts with their colours and the body box (half, colour).
+pub fn rig_parts_of_design(
+    bp: &crate::creature_design::CreatureBlueprint,
+) -> (Vec<crate::anim_rig::RigPart>, Vec<[f32; 3]>, [f32; 3], [f32; 3]) {
+    use crate::creature_design::BoxRole;
+    let mut parts = Vec::with_capacity(bp.boxes.len());
+    let mut colors = Vec::with_capacity(bp.boxes.len());
+    let mut body_half = [0.5, 0.5, 0.5];
+    let mut body_color = CREATURE_BODY_COLOR;
+    let mut seen_body = false;
+    for b in &bp.boxes {
+        if b.role == BoxRole::Body && !seen_body {
+            seen_body = true;
+            body_half = b.half;
+            body_color = b.color;
+            continue;
+        }
+        parts.push(crate::anim_rig::RigPart { role: rig_role_of_box(b.role), offset: b.offset, half: b.half });
+        colors.push(b.color);
+    }
+    (parts, colors, body_half, body_color)
+}
+
+/// r-rig: gait traits from a design's archetype label: birds and bipeds
+/// hop/stride with both legs together only for birds; looseness scales the
+/// swing. `(hop, swing_scale)`.
+pub fn gait_of_design(bp: &crate::creature_design::CreatureBlueprint) -> (bool, f32) {
+    let hop = bp.arch.starts_with("bird");
+    let swing = 0.7 + 0.6 * bp.looseness.clamp(0.0, 1.0);
+    (hop, swing)
+}
+
+/// Push eight already-placed corners (in `push_box_oriented`'s corner order)
+/// with its winding.
+fn push_corners(verts: &mut Vec<EntityVertex>, indices: &mut Vec<u32>, corners: &[[f32; 3]; 8], color: [f32; 3]) {
+    let base = verts.len() as u32;
+    for c in corners {
+        verts.push(EntityVertex { position: *c, color, alpha: 1.0 });
+    }
+    const FACE_INDICES: [u32; 36] = [
+        4, 6, 7, 4, 7, 5, 0, 1, 3, 0, 3, 2, 2, 3, 7, 2, 7, 6, 0, 4, 5, 0, 5, 1, 1, 5, 7, 1, 7, 3,
+        0, 2, 6, 0, 6, 4,
+    ];
+    for &i in &FACE_INDICES {
+        indices.push(base + i);
+    }
+}
+
+/// r-anim-rig: the oriented-part entity path. Like [`creature_to_vertices`]
+/// but every anatomy box is posed by `anim_rig::pose` — legs pivot at the
+/// hip and plant, the torso breathes/squashes/stretches, the tail bends as a
+/// chain, a strike lunges, a bedded creature folds, and with a ragdoll sample
+/// the pose blends toward physics by limpness. `motion` is the caller's
+/// per-creature state (gait phase and speed are read from the creature when
+/// the caller leaves them at their defaults). A genome dragon still renders
+/// through its forge model. With a default `MotionInput` and no ragdoll a
+/// standing creature is placed exactly as the un-rigged path places it.
+pub fn creature_to_vertices_rigged(
+    creature: &crate::creature::Creature,
+    motion: &crate::anim_rig::MotionInput,
+    ragdoll: Option<&crate::anim_rig::RagdollSample>,
+    min_part_half: f32,
+) -> (Vec<EntityVertex>, Vec<u32>) {
+    if let Some(forge) = creature.forge.as_ref() {
+        return forge_to_vertices(creature, forge);
+    }
+    let mut verts = Vec::new();
+    let mut indices = Vec::new();
+    let p = creature.body.position;
+    let tint = creature.tint;
+    let tinted = |c: [f32; 3]| [c[0] * tint[0], c[1] * tint[1], c[2] * tint[2]];
+    let body_rot = [creature.roll, creature.pitch, creature.yaw];
+    let torso_rot = [creature.roll + creature.torso_bend, creature.pitch, creature.yaw];
+
+    let Some(anat) = creature.anatomy.as_ref() else {
+        // no anatomy: the plain torso box, as before
+        let b = crate::anim_rig::PosedBox { source: None, role: None, center: [0.0; 3], half: creature.body.half_extents, rot: [0.0; 3] };
+        push_corners(&mut verts, &mut indices, &crate::anim_rig::world_corners(&b, p, torso_rot), tinted(CREATURE_BODY_COLOR));
+        return (verts, indices);
+    };
+
+    // Fill in what the creature knows when the caller did not say.
+    let mut m = *motion;
+    if m.gait_phase == 0.0 && m.speed == 0.0 {
+        let vel = creature.body.velocity;
+        m.gait_phase = creature.gait_phase;
+        m.speed = (vel[0] * vel[0] + vel[2] * vel[2]).sqrt();
+        m.flying = vel[1] > 0.5 || (vel[1].abs() <= 0.5 && m.speed > 3.0);
+        if let Some(g) = creature.graded_capabilities() {
+            m.leg_health = g.move_speed;
+            m.fly_power = if m.flying { g.fly_power.max(0.3) } else { 0.0 };
+        }
+    }
+    if m.gaze_yaw == 0.0 && m.gaze_pitch == 0.0 {
+        m.gaze_yaw = creature.gaze_yaw;
+        m.gaze_pitch = creature.gaze_pitch;
+    }
+    if m.time == 0.0 {
+        m.time = creature.anim_time;
+    }
+
+    // The design's boxes when the creature was hatched from one (real roles,
+    // its own colours), else the anatomy's parts.
+    let (parts, design_colors, torso_half, torso_color) = match creature.design.as_ref() {
+        Some(bp) => {
+            let (parts, colors, bh, bc) = rig_parts_of_design(bp);
+            if m.hop == false && m.swing_scale == 1.0 {
+                let (hop, sw) = gait_of_design(bp);
+                m.hop = hop;
+                m.swing_scale = sw;
+            }
+            (parts, Some(colors), bh, bc)
+        }
+        None => (rig_parts(anat), None, creature.body.half_extents, CREATURE_BODY_COLOR),
+    };
+    let mut boxes = Vec::with_capacity(parts.len() + crate::anim_rig::CHAIN_SEGMENTS + 1);
+    crate::anim_rig::pose(&parts, torso_half, &m, ragdoll, &mut boxes);
+    for b in &boxes {
+        let (color, rot) = match b.source {
+            None => (tinted(torso_color), torso_rot),
+            Some(i) => {
+                // destroyed parts vanish on either path (anatomy part i is box i)
+                if let Some(part) = anat.parts.get(i) {
+                    if part.is_destroyed() {
+                        continue;
+                    }
+                }
+                let color = match design_colors.as_ref().and_then(|c| c.get(i)) {
+                    Some(c) => *c,
+                    None => {
+                        let Some(part) = anat.parts.get(i) else { continue };
+                        let keep_always = matches!(part.part, crate::creature::Part::Foot | crate::creature::Part::StickyFoot);
+                        let biggest = part.half_extents[0].max(part.half_extents[1]).max(part.half_extents[2]);
+                        if !keep_always && biggest < min_part_half {
+                            continue;
+                        }
+                        part_color(part.part)
+                    }
+                };
+                (tinted(color), body_rot)
+            }
+        };
+        push_corners(&mut verts, &mut indices, &crate::anim_rig::world_corners(b, p, rot), color);
+    }
+    (verts, indices)
+}
+
 /// Render half-extents + colour for a sim mob kind: predators larger and red,
 /// prey small and tan, flyers bluish, the rest a neutral green-grey.
 pub fn mob_appearance(kind: crate::sim::mob::MobKind) -> ([f32; 3], [f32; 3]) {
@@ -1414,6 +1607,77 @@ mod tests {
         let (v1, _) = creature_to_vertices(&c);
         let c1 = centroid_of_last_box(&v1);
         assert!(c1[2] > 0.5 && c1[0].abs() < 0.1, "yaw PI/2 -> front at +Z (got {c1:?})");
+    }
+
+    #[test]
+    fn rigged_path_at_rest_places_the_torso_and_feet_where_the_plain_path_does() {
+        use crate::creature::{Anatomy, Creature, Part, PartState};
+        use crate::physics::PhysicsBody;
+        let mut c = Creature::new(PhysicsBody::new_player([3.0, 8.0, -2.0]));
+        c.yaw = 0.7;
+        c.pitch = 0.1;
+        c.anatomy = Some(
+            Anatomy::new()
+                .with(PartState::new(Part::Jaw, 12, [0.6, 0.1, 0.0], [0.16, 0.12, 0.16]))
+                .with(PartState::new(Part::Foot, 10, [0.45, -0.5, 0.25], [0.12, 0.3, 0.12]))
+                .with(PartState::new(Part::Foot, 10, [0.45, -0.5, -0.25], [0.12, 0.3, 0.12]))
+                .with(PartState::new(Part::Tail, 12, [-0.7, 0.1, 0.0], [0.4, 0.12, 0.12])),
+        );
+        let (plain, pi) = creature_to_vertices(&c);
+        let (rig, ri) = creature_to_vertices_rigged(&c, &crate::anim_rig::MotionInput::default(), None, 0.0);
+        // torso + jaw + 2 feet are box-for-box identical; the tail is a chain
+        // (CHAIN_SEGMENTS boxes) whose union covers the plain tail box.
+        assert_eq!(plain.len(), 8 * 4);
+        assert_eq!(rig.len(), 8 * (3 + crate::anim_rig::CHAIN_SEGMENTS));
+        assert_eq!(pi.len(), 36 * 4);
+        assert_eq!(ri.len(), 36 * (3 + crate::anim_rig::CHAIN_SEGMENTS));
+        for i in 0..8 * 3 {
+            for k in 0..3 {
+                assert!((plain[i].position[k] - rig[i].position[k]).abs() < 1e-4, "vertex {i} axis {k}: {:?} vs {:?}", plain[i].position, rig[i].position);
+            }
+            assert_eq!(plain[i].color, rig[i].color);
+        }
+        let bounds = |v: &[EntityVertex]| {
+            let mut lo = [f32::MAX; 3];
+            let mut hi = [f32::MIN; 3];
+            for q in v {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(q.position[k]);
+                    hi[k] = hi[k].max(q.position[k]);
+                }
+            }
+            (lo, hi)
+        };
+        let (plo, phi) = bounds(&plain[24..32]);
+        let (rlo, rhi) = bounds(&rig[24..]);
+        for k in 0..3 {
+            assert!((plo[k] - rlo[k]).abs() < 0.12 && (phi[k] - rhi[k]).abs() < 0.12, "tail chain bounds axis {k}: {rlo:?}..{rhi:?} vs {plo:?}..{phi:?}");
+        }
+    }
+
+    #[test]
+    fn rigged_path_walking_lifts_a_foot_and_a_dying_sample_lowers_the_torso() {
+        use crate::creature::{Anatomy, Creature, Part, PartState};
+        use crate::physics::PhysicsBody;
+        let mut c = Creature::new(PhysicsBody::new_player([0.0, 0.0, 0.0]));
+        c.anatomy = Some(
+            Anatomy::new()
+                .with(PartState::new(Part::Foot, 10, [0.45, -0.5, 0.25], [0.12, 0.3, 0.12]))
+                .with(PartState::new(Part::Foot, 10, [0.45, -0.5, -0.25], [0.12, 0.3, 0.12])),
+        );
+        let rest = creature_to_vertices_rigged(&c, &crate::anim_rig::MotionInput::default(), None, 0.0).0;
+        let m = crate::anim_rig::MotionInput { gait_phase: 0.0, speed: 5.0, ..Default::default() };
+        let walk = creature_to_vertices_rigged(&c, &m, None, 0.0).0;
+        let low = |v: &[EntityVertex]| v.iter().map(|q| q.position[1]).fold(f32::MAX, f32::min);
+        // phase 0: leg 0 is at cos>0 (swing) → lifted; leg 1 at cos<0 (stance) → planted
+        assert!(low(&walk[8..16]) > low(&rest[8..16]) + 0.03, "swing foot lifts");
+        assert!((low(&walk[16..24]) - low(&rest[16..24])).abs() < 0.02, "stance foot planted");
+        let nodes = [[0.0, -0.3, 0.0], [0.0, -0.3, 0.0]];
+        let rd = crate::anim_rig::RagdollSample { body: [0.0, -0.6, 0.0], parts: &nodes };
+        let dying = crate::anim_rig::MotionInput { state: crate::sim::liveliness::MotionState::Dying, progress: 1.0, ..Default::default() };
+        let dead = creature_to_vertices_rigged(&c, &dying, Some(&rd), 0.0).0;
+        let cy = |v: &[EntityVertex]| v.iter().map(|q| q.position[1]).sum::<f32>() / v.len() as f32;
+        assert!((cy(&dead[0..8]) - (-0.6)).abs() < 1e-4, "torso on its node");
     }
 
     #[test]
