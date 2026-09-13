@@ -706,6 +706,9 @@ pub mod buoyancy;
 pub mod dragon_wing_flex;
 pub mod menu_nav;
 pub mod legendary_weapon;
+/// What each legendary proc DOES on a landed blow (nova, jet, gale, spikes,
+/// flame, arc) and the statuses it leaves (burn, chill, stagger). Pure.
+pub mod weapon_ability;
 pub mod net_rendezvous;
 pub mod title_flow;
 pub mod camera_collision;

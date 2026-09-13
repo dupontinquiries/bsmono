@@ -42,6 +42,12 @@ pub enum ItemClass {
     Bow,
     Staff,
     Shield,
+    /// r-legendary: the two-handed blade — longer, wider, a heavier guard.
+    Greatsword,
+    /// r-legendary: double-bitted, on a long haft.
+    Greataxe,
+    /// r-legendary: a short rod with a focus stone; casts, does not cut.
+    Wand,
     Ingot,
     Egg,
     Block,
@@ -51,7 +57,7 @@ pub enum ItemClass {
 
 impl ItemClass {
     /// Every class, for sweeps and tests.
-    pub const ALL: [ItemClass; 14] = [
+    pub const ALL: [ItemClass; 17] = [
         ItemClass::Sword,
         ItemClass::Dagger,
         ItemClass::Axe,
@@ -66,6 +72,9 @@ impl ItemClass {
         ItemClass::Block,
         ItemClass::Food,
         ItemClass::Generic,
+        ItemClass::Greatsword,
+        ItemClass::Greataxe,
+        ItemClass::Wand,
     ];
 
     /// The `held_item_pose` class index (0 sword, 1 tool, 2 bow, 3 food, 4
@@ -73,12 +82,12 @@ impl ItemClass {
     /// agree on what kind of thing is being held.
     pub fn pose_class(self) -> u8 {
         match self {
-            ItemClass::Sword | ItemClass::Dagger => 0,
-            ItemClass::Axe | ItemClass::Pickaxe | ItemClass::Hammer => 1,
+            ItemClass::Sword | ItemClass::Dagger | ItemClass::Greatsword => 0,
+            ItemClass::Axe | ItemClass::Pickaxe | ItemClass::Hammer | ItemClass::Greataxe => 1,
             ItemClass::Bow => 2,
             ItemClass::Food => 3,
             ItemClass::Shield => 4,
-            ItemClass::Spear | ItemClass::Staff => 5,
+            ItemClass::Spear | ItemClass::Staff | ItemClass::Wand => 5,
             ItemClass::Ingot | ItemClass::Egg | ItemClass::Block | ItemClass::Generic => 255,
         }
     }
@@ -94,6 +103,9 @@ impl ItemClass {
                 | ItemClass::Spear
                 | ItemClass::Bow
                 | ItemClass::Staff
+                | ItemClass::Greatsword
+                | ItemClass::Greataxe
+                | ItemClass::Wand
         )
     }
 }
@@ -264,6 +276,25 @@ pub fn model_for(class: ItemClass, pal: &Palette) -> ItemModel {
             // The pre-model held item, exactly: one tall box.
             b([1.7, 5.2, 1.7], [0.0, 0.0, 0.0], pal.primary);
         }
+        ItemClass::Greatsword => {
+            b([1.4, 4.6, 1.4], [0.0, -1.8, 0.0], pal.grip); // two-hand grip
+            b([2.0, 1.0, 2.0], [0.0, -4.4, 0.0], pal.secondary); // heavy pommel
+            b([1.6, 1.0, 6.2], [0.0, 0.8, 0.0], pal.secondary); // wide guard
+            b([1.0, 9.4, 2.2], [0.0, 6.0, 0.0], pal.primary); // broad blade
+            b([0.8, 1.6, 1.4], [0.0, 11.4, 0.0], pal.primary); // tip
+        }
+        ItemClass::Greataxe => {
+            b([1.3, 9.0, 1.3], [0.0, 2.0, 0.0], pal.grip); // long haft
+            b([1.1, 3.0, 1.8], [0.0, 5.8, 0.0], pal.secondary); // eye
+            b([0.8, 4.4, 3.0], [0.0, 5.8, 2.7], pal.primary); // fore bit
+            b([0.8, 4.4, 3.0], [0.0, 5.8, -2.7], pal.primary); // aft bit (double)
+        }
+        ItemClass::Wand => {
+            b([0.9, 3.4, 0.9], [0.0, 0.4, 0.0], pal.grip); // short rod
+            b([1.3, 1.3, 1.3], [0.0, 2.8, 0.0], pal.primary); // focus stone
+            b([1.1, 0.5, 1.1], [0.0, 1.9, 0.0], pal.secondary); // collar
+            b([0.7, 0.7, 0.7], [0.0, 3.7, 0.0], pal.secondary); // tip spark
+        }
     }
     ItemModel { class, boxes }
 }
@@ -343,7 +374,10 @@ pub fn icon_tilt(class: ItemClass) -> f32 {
         | ItemClass::Pickaxe
         | ItemClass::Hammer
         | ItemClass::Spear
-        | ItemClass::Staff => -0.65,
+        | ItemClass::Staff
+        | ItemClass::Greatsword
+        | ItemClass::Greataxe
+        | ItemClass::Wand => -0.65,
         ItemClass::Bow => -0.35,
         _ => 0.0,
     }
@@ -398,6 +432,10 @@ mod tests {
         let spear = model_for(ItemClass::Spear, &PAL);
         assert!(sword.length() > 2.0 * egg.length(), "sword {} vs egg {}", sword.length(), egg.length());
         assert!(spear.length() > sword.length());
+        // the two-handers outsize their one-hand kin; a wand is shorter than a staff
+        assert!(model_for(ItemClass::Greatsword, &PAL).length() > sword.length() * 1.3);
+        assert!(model_for(ItemClass::Greataxe, &PAL).length() > model_for(ItemClass::Axe, &PAL).length());
+        assert!(model_for(ItemClass::Wand, &PAL).length() < model_for(ItemClass::Staff, &PAL).length() * 0.5);
         let (_, hi) = sword.bounds();
         assert!(hi[1] > 6.0, "blade tip should be well above the fist, got {}", hi[1]);
         // and the blade is the primary colour, the grip the grip colour

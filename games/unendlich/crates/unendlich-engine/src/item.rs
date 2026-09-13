@@ -308,13 +308,7 @@ impl ItemKind {
             ItemKind::Tool(ToolKind::Pickaxe, _) => ItemClass::Pickaxe,
             ItemKind::Tool(ToolKind::Axe, _) => ItemClass::Axe,
             ItemKind::Tool(ToolKind::Shovel, _) => ItemClass::Hammer,
-            ItemKind::Legendary(spec) => match spec.class {
-                WeaponClass::Dagger | WeaponClass::Wand => ItemClass::Dagger,
-                WeaponClass::Blade | WeaponClass::Greatsword => ItemClass::Sword,
-                WeaponClass::Axe | WeaponClass::Greataxe => ItemClass::Axe,
-                WeaponClass::Spear => ItemClass::Spear,
-                WeaponClass::Staff => ItemClass::Staff,
-            },
+            ItemKind::Legendary(spec) => legendary_model_class(spec.class),
         }
     }
 
@@ -326,11 +320,7 @@ impl ItemKind {
         let f = |c: [u8; 3]| [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0];
         match self {
             ItemKind::Tool(_, m) => Palette::tool(f(m.color())),
-            ItemKind::Legendary(spec) => Palette {
-                primary: f(spec.display_color()),
-                secondary: [0.72, 0.66, 0.50], // brass fittings
-                grip: crate::item_model::LEATHER,
-            },
+            ItemKind::Legendary(spec) => legendary_model_palette(f(spec.display_color()), spec.tier),
             other => Palette::mono(f(other.display_color())),
         }
     }
@@ -563,6 +553,33 @@ pub fn item_display(id: u32) -> ItemDisplay {
     ItemDisplay { color: [150, 150, 156], name: "Item".into() }
 }
 
+/// r-legendary: every `WeaponClass` has its own shape now (a greatsword is
+/// not a long sword in a different colour; a wand is not a dagger).
+pub fn legendary_model_class(class: WeaponClass) -> crate::item_model::ItemClass {
+    use crate::item_model::ItemClass;
+    match class {
+        WeaponClass::Dagger => ItemClass::Dagger,
+        WeaponClass::Blade => ItemClass::Sword,
+        WeaponClass::Greatsword => ItemClass::Greatsword,
+        WeaponClass::Axe => ItemClass::Axe,
+        WeaponClass::Greataxe => ItemClass::Greataxe,
+        WeaponClass::Spear => ItemClass::Spear,
+        WeaponClass::Staff => ItemClass::Staff,
+        WeaponClass::Wand => ItemClass::Wand,
+    }
+}
+
+/// r-legendary: the element hue on the working part, fittings that brighten
+/// with tier (brass at 0, silver at 1, gold at 2+), a leather grip.
+pub fn legendary_model_palette(element: [f32; 3], tier: u8) -> crate::item_model::Palette {
+    let secondary = match tier {
+        0 => [0.72, 0.66, 0.50],
+        1 => [0.80, 0.82, 0.86],
+        _ => [0.92, 0.78, 0.32],
+    };
+    crate::item_model::Palette { primary: element, secondary, grip: crate::item_model::LEATHER }
+}
+
 /// The model for a survival-inventory id, mirroring [`item_display`]'s id
 /// ranges exactly (food 2000..2003, blocks < 256, ingots 1000+, forged
 /// weapons 4000..4008, everything else the generic held box). Where
@@ -576,21 +593,11 @@ pub fn item_model_for_id(id: u32) -> crate::item_model::ItemModel {
         0..=255 if disp.name != "Item" => ItemClass::Block,
         1000..=1002 => ItemClass::Ingot,
         // 4000 + index into WeaponClass::ALL
-        4000..=4007 => match WeaponClass::ALL[(id - 4000) as usize] {
-            WeaponClass::Dagger | WeaponClass::Wand => ItemClass::Dagger,
-            WeaponClass::Blade | WeaponClass::Greatsword => ItemClass::Sword,
-            WeaponClass::Axe | WeaponClass::Greataxe => ItemClass::Axe,
-            WeaponClass::Spear => ItemClass::Spear,
-            WeaponClass::Staff => ItemClass::Staff,
-        },
+        4000..=4007 => legendary_model_class(WeaponClass::ALL[(id - 4000) as usize]),
         _ => ItemClass::Generic,
     };
-    let pal = match class {
-        ItemClass::Sword | ItemClass::Dagger | ItemClass::Axe | ItemClass::Spear | ItemClass::Staff => Palette {
-            primary: f(disp.color),
-            secondary: [0.72, 0.66, 0.50],
-            grip: crate::item_model::LEATHER,
-        },
+    let pal = match id {
+        4000..=4007 => legendary_model_palette(f(disp.color), 0),
         _ => Palette::mono(f(disp.color)),
     };
     model_for(class, &pal)
@@ -1045,7 +1052,15 @@ mod item_model_adapter_tests {
         assert_eq!(ItemKind::Tool(ToolKind::Pickaxe, MetalKind::Iron).model_class(), ItemClass::Pickaxe);
         assert_eq!(ItemKind::Tool(ToolKind::Axe, MetalKind::Copper).model_class(), ItemClass::Axe);
         let blade = ItemKind::Legendary(LegendarySpec { seed: 1, class: WeaponClass::Greatsword, element_idx: 4, tier: 2 });
-        assert_eq!(blade.model_class(), ItemClass::Sword);
+        assert_eq!(blade.model_class(), ItemClass::Greatsword);
+        assert_eq!(ItemKind::Legendary(LegendarySpec { seed: 1, class: WeaponClass::Wand, element_idx: 1, tier: 0 }).model_class(), ItemClass::Wand);
+        // every weapon class is a distinct shape
+        let mut classes: Vec<ItemClass> = WeaponClass::ALL.iter().map(|c| legendary_model_class(*c)).collect();
+        classes.sort_by_key(|c| format!("{c:?}"));
+        classes.dedup();
+        assert_eq!(classes.len(), WeaponClass::ALL.len(), "two weapon classes share a model");
+        // tier brightens the fittings
+        assert_ne!(legendary_model_palette([1.0, 0.0, 0.0], 0).secondary, legendary_model_palette([1.0, 0.0, 0.0], 2).secondary);
         let spear = ItemKind::Legendary(LegendarySpec { seed: 1, class: WeaponClass::Spear, element_idx: 0, tier: 0 });
         assert_eq!(spear.model_class(), ItemClass::Spear);
         // Same shape, different palette: the metal is on the head, wood on the haft.

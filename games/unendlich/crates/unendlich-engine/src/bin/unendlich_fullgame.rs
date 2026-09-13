@@ -218,6 +218,11 @@ struct RoamerRig {
     /// Set on death: the ragdoll takes the body for `DEATH_LINGER` seconds
     /// while the pose blends toward it, then the roamer is removed.
     dying: Option<Dying>,
+    /// r-legendary: burn / chill / stagger left by a weapon's proc
+    /// (`sim::weapon_ability`); ticked each roamer tick.
+    status: unendlich_engine::sim::weapon_ability::StatusEffects,
+    /// Fractional burn damage carried between ticks (hp is an integer).
+    burn_accum: f32,
 }
 
 /// r-rig: a dead roamer's ragdoll (`sim::ragdoll_bridge::from_anatomy`).
@@ -8883,6 +8888,26 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     rig.impact *= (-6.0 * dt).exp();
                     let target = if rig.resting { 1.0 } else { 0.0 };
                     rig.settle += (target - rig.settle) * (dt * 1.5).min(1.0);
+                    // r-legendary: statuses. Burn ticks hp; a stagger stops the
+                    // creature and breaks its melee windup; a chill slows the step
+                    // (applied below with the stumble multiplier).
+                    if rig.status.any() {
+                        rig.burn_accum += rig.status.tick(dt);
+                        if rig.burn_accum >= 1.0 {
+                            let whole = rig.burn_accum.floor();
+                            *hp -= whole as i32;
+                            rig.burn_accum -= whole;
+                        }
+                        if rig.status.staggered() {
+                            rig.bout.flinch(1e9, 1.0);
+                            rig.strike01 = 0.0;
+                        }
+                        // ember / frost tint over whatever the creature wears
+                        let st = rig.status.tint(cr.anim_time);
+                        for k in 0..3 {
+                            cr.tint[k] = (cr.tint[k] * 0.9 + 0.1) * st[k];
+                        }
+                    }
                 }
                 // Advance the forge idle clock. It was never ticked, so anim_time
                 // stayed 0 for every live creature and the forge's idle animations
@@ -9700,7 +9725,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
                 // Stumble recovery slows the step (and the trip below may start
                 // one). A creature mid-stumble is hobbled until it recovers.
-                let speed_mult = stumble.tick();
+                let speed_mult = stumble.tick() * rig.status.speed_mult();
                 rdx *= speed_mult;
                 rdz *= speed_mult;
                 let step = (rdx * rdx + rdz * rdz).sqrt();
@@ -10909,60 +10934,78 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 }
                             }
                         }
-                        // rNNN: LIGHTNING ARC — the strike chains to nearby foes
-                        // via the REAL legendary_weapon swing resolver (r369). A
-                        // Storm-element blade (element 5 ⇒ LightningArc proc) is
-                        // forged once; resolve_weapon_swing picks the arc targets
-                        // (greedy nearest, no repeats) and the per-arc damage.
-                        // Gated default-OFF, additive — primary hit is untouched.
-                        if lightning_arc_enabled {
+                        // r-legendary: THE EQUIPPED WEAPON'S ABILITY. Every proc is
+                        // resolved by sim::weapon_ability::on_hit from the weapon in
+                        // hand (the previous arc demo forged a fixed Storm blade
+                        // whatever was equipped, behind UNENDLICH_LIGHTNING_ARC, and
+                        // the other five procs did nothing). Frost chills, the jet
+                        // shoves, gale launches, spikes stagger a radius, flame
+                        // burns a cone, lightning chains. Statuses land on
+                        // RoamerRig.status and tick in the roamer loop.
+                        let mut ability_kb_mult = 1.0f32;
+                        let mut ability_launch = 0.0f32;
+                        if let Some(w) = weapon.as_ref() {
+                            use unendlich_engine::sim::weapon_ability as wa;
                             let origin = roamers[ri].creature.body.position;
                             let mut cand_idx: Vec<usize> = Vec::new();
                             let mut cand_pos: Vec<[f32; 3]> = Vec::new();
                             for (rj, rr) in roamers.iter().enumerate() {
-                                if rj == ri || rr.hp <= 0 { continue; }
+                                if rj == ri || rr.hp <= 0 || rr.rig.dying.is_some() { continue; }
                                 let p = rr.creature.body.position;
                                 let d2 = (p[0] - origin[0]).powi(2)
                                     + (p[1] - origin[1]).powi(2)
                                     + (p[2] - origin[2]).powi(2);
-                                if d2 <= 12.0 * 12.0 {
+                                if d2 <= 14.0 * 14.0 {
                                     cand_idx.push(rj);
                                     cand_pos.push(p);
                                 }
                             }
-                            let sword = unendlich_engine::sim::legendary_weapon::forge(
-                                0x5106_57A2,
-                                unendlich_engine::sim::legendary_weapon::WeaponClass::Blade,
-                                5, // Storm ⇒ LightningArc
-                                3,
-                            );
                             let roll_seed = (frame_count as u64)
                                 .wrapping_mul(0x9E37_79B9)
-                                .wrapping_add(ri as u64);
+                                .wrapping_add(ri as u64 * 7919);
                             let roll = ((roll_seed >> 40) & 0xFFFF) as f32 / 65535.0;
-                            let swing = unendlich_engine::sim::legendary_weapon::resolve_weapon_swing(
-                                &sword, roll, origin, &cand_pos, 4, 6.0,
-                            );
-                            if !swing.arc_targets.is_empty() {
-                                let arc_dmg = swing.arc_damage.round().max(1.0) as i32;
-                                for &ci in &swing.arc_targets {
-                                    let rj = cand_idx[ci];
-                                    roamers[rj].hp -= arc_dmg;
-                                    if witness_enabled {
-                                        let vk = match roamers[rj].kind {
-                                            unendlich_engine::item::CreatureKind::Dinosaur => 1u8,
-                                            unendlich_engine::item::CreatureKind::Dragon => 2u8,
-                                            _ => 0u8,
-                                        };
-                                        attack_events.push((roamers[rj].creature.body.position, vk));
-                                    }
+                            let dir = [cam_forward.x, 0.0, cam_forward.z];
+                            let out = wa::on_hit(w, origin, dir, &cand_pos, roll);
+                            ability_kb_mult = out.knockback_mult;
+                            ability_launch = out.launch_up;
+                            if let Some(st) = out.target_status {
+                                roamers[ri].rig.status.apply(st);
+                            }
+                            for sp in &out.splash {
+                                let rj = cand_idx[sp.idx];
+                                if sp.damage > 0.0 {
+                                    roamers[rj].hp -= sp.damage.round().max(1.0) as i32;
                                 }
+                                if let Some(st) = sp.status {
+                                    roamers[rj].rig.status.apply(st);
+                                }
+                                if sp.shove > 0.0 {
+                                    let q = roamers[rj].creature.body.position;
+                                    let (dx, dz) = (q[0] - origin[0], q[2] - origin[2]);
+                                    let d = (dx * dx + dz * dz).sqrt().max(0.01);
+                                    let v = &mut roamers[rj].creature.body.velocity;
+                                    v[0] += dx / d * sp.shove;
+                                    v[1] += 0.4;
+                                    v[2] += dz / d * sp.shove;
+                                }
+                                if witness_enabled {
+                                    let vk = match roamers[rj].kind {
+                                        unendlich_engine::item::CreatureKind::Dinosaur => 1u8,
+                                        unendlich_engine::item::CreatureKind::Dragon => 2u8,
+                                        _ => 0u8,
+                                    };
+                                    attack_events.push((roamers[rj].creature.body.position, vk));
+                                }
+                            }
+                            if out.proc != unendlich_engine::sim::legendary_weapon::ProcKind::None {
                                 log::info!(
-                                    "[lightning] arc chained to {} foe(s) for {} each",
-                                    swing.arc_targets.len(), arc_dmg
+                                    "[ability] {} — {:?} on the target{}",
+                                    out.label, out.target_status,
+                                    if out.splash.is_empty() { String::new() } else { format!(", {} other(s) caught", out.splash.len()) }
                                 );
                             }
                         }
+                        let _ = lightning_arc_enabled;
                         // r284: record this attack so creatures that can see it can
                         // react (witnessed-attack reaction, below). Position + kind.
                         if witness_enabled {
@@ -10994,10 +11037,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         // punch direction (+ a small upward pop), scaled by the attacker's
                         // stature (knockback_dealt = 1.0 default → a giant sends them flying).
                         {
-                            let kb = 3.0 * player_stature.knockback_dealt;
+                            let kb = 3.0 * player_stature.knockback_dealt * ability_kb_mult;
                             let v = &mut roamers[ri].creature.body.velocity;
                             v[0] += cam_forward.x * kb;
-                            v[1] += 1.2;
+                            v[1] += 1.2 + ability_launch;
                             v[2] += cam_forward.z * kb;
                         }
                         let p = roamers[ri].creature.body.position;
