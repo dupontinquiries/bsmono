@@ -136,6 +136,10 @@ pub struct MotionInput {
     pub settle: f32,
     /// Strike progress `[0,1]` (0 = none/idle, sweeps 0→1 over a strike).
     pub strike: f32,
+    /// Both legs swing together (a bird's hop) instead of in diagonal pairs.
+    pub hop: bool,
+    /// Scales the limb swing (a design's `looseness`; 1 = default).
+    pub swing_scale: f32,
 }
 
 impl Default for MotionInput {
@@ -156,6 +160,8 @@ impl Default for MotionInput {
             impact: 0.0,
             settle: 0.0,
             strike: 0.0,
+            hop: false,
+            swing_scale: 1.0,
         }
     }
 }
@@ -372,7 +378,7 @@ pub fn pose(
     out: &mut Vec<PosedBox>,
 ) {
     out.clear();
-    let speed01 = clamp01(finite(m.speed) / SPEED_SATURATE) * clamp01(m.leg_health);
+    let speed01 = clamp01(finite(m.speed) / SPEED_SATURATE) * clamp01(m.leg_health) * clampf(m.swing_scale, 0.0, 2.0);
     let settle = clamp01(m.settle);
     let strike = strike_curve(m.strike) * (1.0 - settle);
     let phase = finite(m.gait_phase);
@@ -425,7 +431,7 @@ pub fn pose(
         let mut rides_bob = true;
         match p.role {
             Role::Leg => {
-                let off = leg_phase_offset(leg_i);
+                let off = if m.hop { 0.0 } else { leg_phase_offset(leg_i) };
                 leg_i += 1;
                 let s = (phase + off).sin();
                 let c = (phase + off).cos();
@@ -683,6 +689,18 @@ mod tests {
         }
         assert!(min_stance_err < 0.03, "stance sole floats by {min_stance_err} (the residual float)");
         assert!(max_swing_lift > 0.08, "swing foot never lifts ({max_swing_lift})");
+    }
+
+    #[test]
+    fn a_hop_swings_both_legs_together_and_swing_scale_scales() {
+        let (parts, th) = quadruped();
+        let m = MotionInput { gait_phase: PI / 2.0, speed: 4.0, hop: true, ..Default::default() };
+        let out = posed(&parts, th, &m, None);
+        let f = feet(&out);
+        assert!((f[0].rot[1] - f[1].rot[1]).abs() < 1e-5 && f[0].rot[1] > 0.1, "in phase: {:?} {:?}", f[0].rot, f[1].rot);
+        let loose = posed(&parts, th, &MotionInput { gait_phase: PI / 2.0, speed: 4.0, swing_scale: 1.5, ..Default::default() }, None);
+        let tight = posed(&parts, th, &MotionInput { gait_phase: PI / 2.0, speed: 4.0, swing_scale: 0.5, ..Default::default() }, None);
+        assert!(feet(&loose)[0].rot[1] > feet(&tight)[0].rot[1] * 2.5);
     }
 
     #[test]

@@ -1369,6 +1369,57 @@ pub fn rig_parts(anatomy: &crate::creature::Anatomy) -> Vec<crate::anim_rig::Rig
         .collect()
 }
 
+/// r-rig: a design-layer box role as a rig role. Neck is a chain (bends INTO
+/// a turn); Head/Snout/Eye/Jaw/Horn ride the head pivot; Ridge/Spine/other
+/// follow the torso.
+pub fn rig_role_of_box(role: crate::creature_design::BoxRole) -> crate::anim_rig::Role {
+    use crate::anim_rig::Role;
+    use crate::creature_design::BoxRole as B;
+    match role {
+        B::Leg => Role::Leg,
+        B::Wing => Role::Wing,
+        B::Tail => Role::Tail,
+        B::Neck => Role::Neck,
+        B::Head | B::Snout | B::Eye | B::Jaw | B::Horn => Role::Head,
+        _ => Role::Other,
+    }
+}
+
+/// r-rig: the design's boxes as rig parts, Body excluded, in box order — the
+/// same order `spawn::from_blueprint` filed them into the anatomy, so rig
+/// part `i` is anatomy part `i` and a ragdoll sample lines up. Returns the
+/// parts with their colours and the body box (half, colour).
+pub fn rig_parts_of_design(
+    bp: &crate::creature_design::CreatureBlueprint,
+) -> (Vec<crate::anim_rig::RigPart>, Vec<[f32; 3]>, [f32; 3], [f32; 3]) {
+    use crate::creature_design::BoxRole;
+    let mut parts = Vec::with_capacity(bp.boxes.len());
+    let mut colors = Vec::with_capacity(bp.boxes.len());
+    let mut body_half = [0.5, 0.5, 0.5];
+    let mut body_color = CREATURE_BODY_COLOR;
+    let mut seen_body = false;
+    for b in &bp.boxes {
+        if b.role == BoxRole::Body && !seen_body {
+            seen_body = true;
+            body_half = b.half;
+            body_color = b.color;
+            continue;
+        }
+        parts.push(crate::anim_rig::RigPart { role: rig_role_of_box(b.role), offset: b.offset, half: b.half });
+        colors.push(b.color);
+    }
+    (parts, colors, body_half, body_color)
+}
+
+/// r-rig: gait traits from a design's archetype label: birds and bipeds
+/// hop/stride with both legs together only for birds; looseness scales the
+/// swing. `(hop, swing_scale)`.
+pub fn gait_of_design(bp: &crate::creature_design::CreatureBlueprint) -> (bool, f32) {
+    let hop = bp.arch.starts_with("bird");
+    let swing = 0.7 + 0.6 * bp.looseness.clamp(0.0, 1.0);
+    (hop, swing)
+}
+
 /// Push eight already-placed corners (in `push_box_oriented`'s corner order)
 /// with its winding.
 fn push_corners(verts: &mut Vec<EntityVertex>, indices: &mut Vec<u32>, corners: &[[f32; 3]; 8], color: [f32; 3]) {
@@ -1438,23 +1489,45 @@ pub fn creature_to_vertices_rigged(
         m.time = creature.anim_time;
     }
 
-    let parts = rig_parts(anat);
+    // The design's boxes when the creature was hatched from one (real roles,
+    // its own colours), else the anatomy's parts.
+    let (parts, design_colors, torso_half, torso_color) = match creature.design.as_ref() {
+        Some(bp) => {
+            let (parts, colors, bh, bc) = rig_parts_of_design(bp);
+            if m.hop == false && m.swing_scale == 1.0 {
+                let (hop, sw) = gait_of_design(bp);
+                m.hop = hop;
+                m.swing_scale = sw;
+            }
+            (parts, Some(colors), bh, bc)
+        }
+        None => (rig_parts(anat), None, creature.body.half_extents, CREATURE_BODY_COLOR),
+    };
     let mut boxes = Vec::with_capacity(parts.len() + crate::anim_rig::CHAIN_SEGMENTS + 1);
-    crate::anim_rig::pose(&parts, creature.body.half_extents, &m, ragdoll, &mut boxes);
+    crate::anim_rig::pose(&parts, torso_half, &m, ragdoll, &mut boxes);
     for b in &boxes {
         let (color, rot) = match b.source {
-            None => (tinted(CREATURE_BODY_COLOR), torso_rot),
+            None => (tinted(torso_color), torso_rot),
             Some(i) => {
-                let Some(part) = anat.parts.get(i) else { continue };
-                if part.is_destroyed() {
-                    continue;
+                // destroyed parts vanish on either path (anatomy part i is box i)
+                if let Some(part) = anat.parts.get(i) {
+                    if part.is_destroyed() {
+                        continue;
+                    }
                 }
-                let keep_always = matches!(part.part, crate::creature::Part::Foot | crate::creature::Part::StickyFoot);
-                let biggest = part.half_extents[0].max(part.half_extents[1]).max(part.half_extents[2]);
-                if !keep_always && biggest < min_part_half {
-                    continue;
-                }
-                (tinted(part_color(part.part)), body_rot)
+                let color = match design_colors.as_ref().and_then(|c| c.get(i)) {
+                    Some(c) => *c,
+                    None => {
+                        let Some(part) = anat.parts.get(i) else { continue };
+                        let keep_always = matches!(part.part, crate::creature::Part::Foot | crate::creature::Part::StickyFoot);
+                        let biggest = part.half_extents[0].max(part.half_extents[1]).max(part.half_extents[2]);
+                        if !keep_always && biggest < min_part_half {
+                            continue;
+                        }
+                        part_color(part.part)
+                    }
+                };
+                (tinted(color), body_rot)
             }
         };
         push_corners(&mut verts, &mut indices, &crate::anim_rig::world_corners(b, p, rot), color);

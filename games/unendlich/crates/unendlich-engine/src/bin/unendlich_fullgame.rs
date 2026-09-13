@@ -9025,6 +9025,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         .map(|t| (t + 1) as f32)
                         .unwrap_or(cr.body.position[1] - 1.0);
                     unendlich_engine::sim::ragdoll::step(&mut d.nodes, &d.sticks, ground, dt.max(1e-3), 4);
+                    if cr.forge.is_some() {
+                        // r-rig: a forge dragon renders its own voxel model, which
+                        // the rig cannot pose onto ragdoll nodes — so it TOPPLES:
+                        // rolls onto its side, noses down, and sinks to the ground.
+                        let k = (dt * 2.5).min(1.0);
+                        cr.roll += (1.3 - cr.roll) * k;
+                        cr.pitch += (0.12 - cr.pitch) * k;
+                        let lie_y = ground + cr.body.half_extents[1] * 0.55;
+                        cr.body.position[1] += (lie_y - cr.body.position[1]) * (dt * 3.0).min(1.0);
+                        cr.body.velocity = [0.0; 3];
+                    }
                     rig.speed = 0.0;
                     continue;
                 }
