@@ -1214,6 +1214,26 @@ pub fn draw_touch_pad(ctx: &egui::Context, pad: &crate::touch::TouchPad, game: &
         painter.circle(to_px(*c), r, fill, Stroke::new(2.0 + flash * 1.5, if ab.ult { GOLD } else { ring }));
         let label = if cd > 0.0 { format!("{:.0}", cd.ceil()) } else { format!("{}", i + 1) };
         painter.text(to_px(*c), Align2::CENTER_CENTER, label, FontId::proportional(r_px(0.05)), Color32::WHITE);
+        // drag-to-aim: only ever drawn for a mobility ability (never an
+        // ultimate — see AbilityDef::quick_aimable), and only once the
+        // finger has actually committed past the deadzone, so a settling
+        // touch never flashes a direction it isn't going to fire
+        if let Some(drag) = pad.ability_drag_live(i) {
+            let conf = pad.ability_drag_confidence(i);
+            // the arrow points where the finger actually is — screen space,
+            // y down, exactly like `drag` already is; no convention flip
+            // needed here (that only matters for the stored release vector)
+            let d = drag.normalize_or(glam::Vec2::new(0.0, -1.0));
+            let dir_px = Vec2::new(d.x, d.y);
+            let tip = to_px(*c) + dir_px * r_px(crate::touch::BTN_R) * (1.6 + conf * 0.8);
+            let aim_col = Color32::from_rgba_premultiplied(255, 255, 255, (140.0 + conf * 100.0) as u8);
+            painter.line_segment([to_px(*c), tip], Stroke::new(2.0 + conf * 2.0, aim_col));
+            painter.circle_filled(tip, 3.0 + conf * 3.0, aim_col);
+            // confidence ring: fills in around the button as the drag
+            // commits, so "will this actually fire in that direction" is
+            // never a guess
+            painter.circle_stroke(to_px(*c), r + 5.0, Stroke::new(2.0 + conf * 2.0, col.linear_multiply(0.4 + conf * 0.6)));
+        }
     }
     // shop / board / menu — press feedback so taps feel acknowledged
     painter.circle(to_px(l.shop), r_px(crate::touch::BTN_R * 0.8), dim, Stroke::new(1.5, ring));

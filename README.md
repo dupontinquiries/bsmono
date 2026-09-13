@@ -125,7 +125,7 @@ ALSA headers (`libasound2-dev`) at build time — or build with
 
 ```bash
 cargo run --release          # windowed game
-cargo test                   # 75 tests (63 lib + integration + shader validation + doctests):
+cargo test                   # 79 tests (67 lib + integration + shader validation + doctests):
                              #   roster, items, lanes, sim, weather, map events, wildlife,
                              #   objectives, catastrophes, input/camera math, gridpick, touch,
                              #   plus offline WGSL validation of every shader with naga
@@ -183,18 +183,32 @@ automatically on the first touch. A floating stick appears under your thumb
 anywhere in the left 42 % of the screen; attack and ability buttons (with
 cooldown sweeps, and a flash the instant one comes off cooldown) cluster
 bottom-right; drag in the open area to turn the camera; **tap the ground to
-walk there**; **swipe in the open area to fire a Dash ability in that
-direction** — the mobile answer to aiming a dash with a mouse. Portrait and
-landscape both work. Size and on/off live in the controls panel.
+walk there**. Portrait and landscape both work. Size and on/off live in the
+controls panel.
 
-Tap/swipe recognition is `src/touchkit/`, vendored from the monorepo's
-`shared/touchkit` — the same gesture recognizer skydribble's on-screen
-driving joystick (`shellkit::touch`, a floating stick + BOOST/JUMP/MENU
-buttons + tap-to-drive) is built on, vendored the same way `games/shared/
-shellkit` vendors it, so this game stays a standalone, clonable tree with no
-monorepo path dependencies. The swipe-to-dash mechanic is this game's own
-adaptation of that game's flick-to-dodge — same underlying gesture, different
-verb per game.
+**Drag-to-aim a mobility skill**: for whichever ability is a Dash or Blink
+(never an ultimate — `AbilityDef::quick_aimable()`), press and drag from
+that ability's own button to pick a direction — a line and a confidence
+ring show exactly where it'll go — then release to fire; a plain tap still
+casts it at the camera crosshair like every other ability. This replaced an
+earlier, unsafe design that read a fast swipe *anywhere in the open area* as
+a dash: that collided with ordinary fast camera-whipping during real fights,
+which crosses the same velocity thresholds a deliberate flick would — a
+misread there doesn't cost you a menu selection, it burns your escape at the
+worst possible moment. Anchoring the gesture to the button itself (never
+where camera-panning starts) and excluding ultimates and every non-
+directional archetype (heals, shields, novas...) closes that off structurally
+rather than by tuning thresholds. The per-ability-type care this needed —
+ultimates get none of it, healing/shield/nova casts aim exactly like they do
+on keyboard/mouse/pad — is the actual adaptation of skydribble's flick-to-
+dodge for this game, not just a reskinned gesture.
+
+Tap recognition in the open area is `src/touchkit/`, vendored from the
+monorepo's `shared/touchkit` — the same gesture recognizer skydribble's
+on-screen driving joystick (`shellkit::touch`, a floating stick +
+BOOST/JUMP/MENU buttons + tap-to-drive) is built on, vendored the same way
+`games/shared/shellkit` vendors it, so this game stays a standalone,
+clonable tree with no monorepo path dependencies.
 
 Mouse capture releases automatically if the window loses focus (so a clean
 Alt-Tab can't leave the OS grab out of sync with what the game thinks is

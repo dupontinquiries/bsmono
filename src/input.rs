@@ -675,10 +675,14 @@ pub struct Controls {
     pub recenter: bool,
     /// Normalized screen point tapped in the open area (walk-to), if any.
     pub tap: Option<Vec2>,
-    /// A quick swipe in the open area (touch only): screen-space direction,
-    /// y up. app.rs turns this into a Dash cast toward that direction — the
-    /// per-game adaptation of skydribble's flick-to-dodge (see touch.rs).
-    pub flick: Option<Vec2>,
+    /// Per-slot aim override, screen-space direction (y up): set only by a
+    /// committed touch drag-release on a drag-capable ability button (see
+    /// touch.rs). When set for a slot in `cast`, app.rs casts toward this
+    /// world direction instead of the camera crosshair. Never set for an
+    /// ultimate or a non-directional archetype — `AbilityDef::
+    /// quick_aimable()` is what makes a slot drag-capable in the first
+    /// place, and ultimates are never quick-aimable.
+    pub cast_dir: [Option<Vec2>; 4],
 }
 
 /// Merge keyboard/mouse, controller and touch into `Controls`. Pure.
@@ -756,11 +760,16 @@ pub fn resolve(
             for i in 0..4 {
                 c.cast[i] |= t.ability_edge(i);
             }
+            for &(slot, dir) in &t.ability_release {
+                if slot < 4 {
+                    c.cast[slot] = true;
+                    c.cast_dir[slot] = Some(dir);
+                }
+            }
             c.shop |= t.shop_edge();
             c.menu |= t.menu_edge();
             c.scoreboard |= t.board_down();
             c.tap = t.tap_pending;
-            c.flick = t.flick;
         }
     }
 

@@ -609,23 +609,6 @@ fn gather_controls(s: &mut AppState, dt: f32) {
         if let Some(tap) = c.tap {
             s.walk_to = ground_point_from_screen(s, tap);
         }
-        if let Some(dir) = c.flick {
-            // the per-game adaptation of skydribble's flick-to-dodge: aim a
-            // Dash ability in the swipe's direction instead of dodging a car.
-            // Screen-space (x right, y up) rotates onto the camera's own
-            // right/forward basis, same convention camera_basis uses for
-            // movement, so a swipe toward the top of the screen dashes the
-            // way the camera is actually looking, not some fixed world axis.
-            if let Some(g) = s.game.as_ref() {
-                let def = g.def(0);
-                if let Some(slot) = (0..4).find(|&i| matches!(def.abilities[i].arch, crate::gods::Archetype::Dash { .. }) && g.gods[0].cds[i] <= 0.0 && !def.abilities[i].ult) {
-                    let (fwd, right) = input::camera_basis(s.cam_yaw);
-                    let world_dir = fwd * dir.y + right * dir.x;
-                    let aim = g.gods[0].pos + world_dir * 20.0;
-                    s.game.as_mut().unwrap().cast_queue.push((0, slot as u32, aim));
-                }
-            }
-        }
         if c.mv.length_squared() > 0.01 {
             s.walk_to = None; // the stick takes over from a walk-to order
         }
@@ -704,6 +687,15 @@ fn start_game(s: &mut AppState) {
     s.game = Some(Game::new(s.ui.selected as u32, allies, enemies));
     s.vfx = Vfx::default();
     s.screen = Screen::Playing;
+    // static for the whole match (an ancestor's kit never changes): which
+    // ability slots accept a touch drag-to-aim. Computed once here rather
+    // than every frame in gather_controls so it can never race a same-frame
+    // touch-down against a stale value.
+    {
+        let def = s.game.as_ref().unwrap().def(0);
+        let caps = [def.abilities[0].quick_aimable(), def.abilities[1].quick_aimable(), def.abilities[2].quick_aimable(), def.abilities[3].quick_aimable()];
+        s.touch.set_drag_capable(caps);
+    }
     #[cfg(feature = "audio")]
     if s.ambience.is_none() {
         s.ambience = crate::audio::output::Ambience::start();
@@ -749,7 +741,19 @@ fn render(s: &mut AppState) {
             // casts are edges: queue them once, outside the step loop
             for slot in 0..4u32 {
                 if c.cast[slot as usize] {
-                    g.cast_queue.push((0, slot, aim));
+                    let cast_aim = if let Some(dir) = c.cast_dir[slot as usize] {
+                        // a committed touch drag-to-aim: rotate its screen-
+                        // space direction (x right, y up) onto the camera's
+                        // own basis, same convention movement uses, so a
+                        // drag toward the top of the screen aims the way
+                        // the camera is actually looking, not a fixed axis
+                        let (fwd, right) = input::camera_basis(yaw);
+                        let world_dir = fwd * dir.y + right * dir.x;
+                        g.gods[0].pos + world_dir * 20.0
+                    } else {
+                        aim
+                    };
+                    g.cast_queue.push((0, slot, cast_aim));
                 }
             }
             s.accumulator = (s.accumulator + dt_frame).min(0.25);
