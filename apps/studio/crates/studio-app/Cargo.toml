@@ -17,6 +17,7 @@ studio-live = { path = "../studio-live" }
 studio-fx = { path = "../studio-fx" }
 studio-voice = { path = "../studio-voice" }
 studio-media = { path = "../studio-media" }
+audio-kit = { path = "../../../../shared/audio-kit" }
 studio-video = { path = "../studio-video" }
 # bscale as a library job (GPU via wgpu 29 behind its default-on `gpu` feature).
 d2x-job = { path = "../../../bscale/crates/d2x-job" }

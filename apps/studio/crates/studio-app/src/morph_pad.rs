@@ -27,55 +27,14 @@ use studio_audio::SourceAudio;
 /// the default because on most systems and most ears it IS the sound,
 /// FLAC is the lossless rung for the rest, and WAV exists at the top for
 /// whoever insists — never as anyone's default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BounceFormat {
-    Opus32,
-    Opus64,
-    Opus128,
-    Opus192,
-    Opus256,
-    Flac,
-    Wav,
-}
-impl BounceFormat {
-    pub const ALL: [BounceFormat; 7] = [BounceFormat::Opus32, BounceFormat::Opus64,
-                                        BounceFormat::Opus128, BounceFormat::Opus192,
-                                        BounceFormat::Opus256, BounceFormat::Flac,
-                                        BounceFormat::Wav];
-    pub fn label(self) -> &'static str {
-        match self {
-            // 32k/64k are voice rungs, not music ones — named as such so the
-            // slider doesn't imply they're a smaller version of the same
-            // thing 128k is. Reaching past 64k for spoken word is the
-            // library-management use case this exists for; music wants the
-            // 128k floor above.
-            BounceFormat::Opus32 => "opus 32k (voice)",
-            BounceFormat::Opus64 => "opus 64k (voice)",
-            BounceFormat::Opus128 => "opus 128k",
-            BounceFormat::Opus192 => "opus 192k",
-            BounceFormat::Opus256 => "opus 256k",
-            BounceFormat::Flac => "flac (lossless)",
-            BounceFormat::Wav => "wav (uncompressed)",
-        }
-    }
-    /// Sidecar round-trip token — stable, label-independent.
-    pub fn token(self) -> &'static str {
-        match self {
-            BounceFormat::Opus32 => "opus-32", BounceFormat::Opus64 => "opus-64",
-            BounceFormat::Opus128 => "opus-128", BounceFormat::Opus192 => "opus-192",
-            BounceFormat::Opus256 => "opus-256", BounceFormat::Flac => "flac",
-            BounceFormat::Wav => "wav",
-        }
-    }
-    pub fn from_token(t: &str) -> BounceFormat {
-        Self::ALL.iter().copied().find(|f| f.token() == t)
-            .unwrap_or(BounceFormat::Opus192)
-    }
-    pub fn ext(self) -> &'static str {
-        match self { BounceFormat::Flac => "flac", BounceFormat::Wav => "wav",
-                     _ => "opus" }
-    }
-}
+///
+/// This is `audio_kit::BounceFormat`, re-exported under its old name:
+/// beatspace's arrangement projects wanted the identical ladder (same
+/// rungs, same tokens, same "never wav" default) and it was lifted out
+/// from under this module rather than reinvented. `label`/`token`/
+/// `from_token`/`ext`/`ALL` are unchanged, so nothing else in this file
+/// or its sidecar format moved.
+pub use audio_kit::BounceFormat;
 
 /// The pad's whole state, owned by the shell.
 #[derive(Default)]
