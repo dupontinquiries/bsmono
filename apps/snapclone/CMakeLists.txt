@@ -130,7 +130,18 @@ elseif(SNAPCLONE_OPENDHT_BACKEND)
     # ── Disable everything except the core library ────────────────────────────
     set(OPENDHT_TOOLS          OFF CACHE BOOL "" FORCE)
     set(OPENDHT_PYTHON         OFF CACHE BOOL "" FORCE)
-    set(OPENDHT_C              OFF CACHE BOOL "" FORCE)
+    # ON, not OFF: JamiAdapter_dht_impl.cpp calls the C API exclusively
+    # (dht_runner_new/bootstrap/put/get/run/shutdown, dht_infohash_*,
+    # dht_value_*, via <opendht_c.h>) — there is no C++ DhtRunner usage
+    # anywhere in this tree. With this OFF, opendht's `opendht-c` target is
+    # never created, so `opendht_with_c` below links only the C++ `opendht`
+    # library and every `dht_runner_*` symbol is undefined at link time.
+    # This built for a while regardless, on machines where a previous build
+    # had already produced `opendht-c` in the CMake cache from before this
+    # was set to OFF, or from an unrelated local build — a fresh clone
+    # reliably fails to link. See the DHT adapter's own include-order
+    # comment in JamiAdapter.cpp for the related header-inclusion note.
+    set(OPENDHT_C              ON  CACHE BOOL "" FORCE)
     set(OPENDHT_PEER_DISCOVERY OFF CACHE BOOL "" FORCE)
     set(OPENDHT_HTTP           OFF CACHE BOOL "" FORCE)
     set(OPENDHT_TESTS          OFF CACHE BOOL "" FORCE)
@@ -174,7 +185,15 @@ elseif(SNAPCLONE_OPENDHT_BACKEND)
     target_include_directories(opendht_with_c SYSTEM INTERFACE
         "${OPENDHT_SUBMODULE_DIR}/c"
         "${OPENDHT_SUBMODULE_DIR}/include")
-    target_link_libraries(opendht_with_c INTERFACE opendht)
+    # Link the C bindings target itself (only exists because OPENDHT_C=ON
+    # above), not just the C++ opendht library — the missing piece: the
+    # name "opendht_with_c" implied this already happened, but until now it
+    # linked plain `opendht`, so every dht_runner_*/dht_infohash_*/
+    # dht_value_* symbol JamiAdapter_dht_impl.cpp calls was undefined at
+    # link time on a clean build. opendht-c links opendht PRIVATEly itself
+    # (see opendht/CMakeLists.txt), so linking opendht-c alone pulls in
+    # both.
+    target_link_libraries(opendht_with_c INTERFACE opendht-c)
 
     # ── Patch the opendht Rust crate ─────────────────────────────────────────
     # The opendht Rust crate has a type mismatch in crypto.rs (i8 vs u8) that
