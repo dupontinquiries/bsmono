@@ -11,15 +11,35 @@ Order matters once, after that everything is fire-and-forget.
 # 1. Build and install the binary (the egui v2 keyboard, --features wayland).
 ./scripts/install.sh --system          # or: ./scripts/install.sh --gtk --system
 
-# 2. Register rusty-board as a virtual keyboard with Plasma/KWin.
-#    Drops the .desktop file in /usr/share/applications/, writes
-#    the kwinrc setting that selects rusty-board, and pokes KWin
-#    to reload its config.
+# 2. Register rusty-board with the compositor. WHICH SCRIPT depends
+#    on the session — they are not interchangeable and each is a
+#    no-op on the other's desktop.
+
+#    Plasma / Plasma Mobile: drops the .desktop file, writes the
+#    kwinrc setting that selects rusty-board, pokes KWin to reload.
 ./scripts/plasma-setup.sh
+
+#    Phosh / postmarketOS: mostly the opposite job. Phosh does not
+#    pick an input method by name — whichever client grabs the
+#    seat's zwp_input_method_v2 first owns it, one per seat — so
+#    this disables squeekboard (enabled on essentially every Phosh
+#    image, and holding the seat since login) and then installs the
+#    desktop entry and a session unit.
+./scripts/phosh-setup.sh
+./scripts/phosh-setup.sh --undo   # give the seat back to squeekboard
 ```
 
 After step 2, focusing a text field anywhere on the system should
 summon RustyBoard. If it doesn't, see "Troubleshooting" below.
+
+**On Phosh, "installed fine, never pops up" is almost always the
+seat.** `zwp_input_method_v2` allows one client per seat; a second
+one is handed an object that is immediately `unavailable` and never
+receives an Activate, so the keyboard never learns a text field was
+focused. That is not fixed by reinstalling — the other keyboard has
+to let go. `phosh-setup.sh` reports what still holds it, and
+RustyBoard's own status line now says "another on-screen keyboard
+owns the input method" rather than staying blank.
 
 ## Day-to-day: redeploy after a code change
 
