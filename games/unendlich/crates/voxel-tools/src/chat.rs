@@ -557,9 +557,37 @@ impl ChatSession {
         // expressive path was the one path with no feedback. A program
         // is reviewed in its own terms: passes, their polarity, and how
         // many cells each moved.
+        // WHAT IS MEASURABLY WRONG, before anything the model has to
+        // spot for itself. A model looking at an ASCII elevation of its
+        // own work says "looks good" far more often than it should, and
+        // every fault this crate actually produces -- floating, in
+        // pieces, perfectly mirrored, four shapes, one material -- can
+        // be CHECKED. Telling it "this floats four blocks above the
+        // ground" turns a question of taste into a fact.
+        let faults = crate::faults::check(&crate::faults::Look {
+            cells: &cells,
+            ground,
+            // `placed` carries POSITIONS, not block ids, so the
+            // material count is not knowable here. Passing 2 means the
+            // one-material check never fires rather than firing
+            // wrongly -- a check that cannot see its input must not
+            // guess. Counting distinct materials needs the dry run to
+            // keep them, which is a change to `Pending` and not to
+            // this.
+            materials: 2,
+            parts: p.pass_log.len().max(ops.len()),
+            enclosed: !p.prose.to_lowercase().contains("statue"),
+        });
+        let fault_lines = crate::faults::lines(&faults, 3);
+        {
+        }
+        // THE PROGRAM PATH GETS THEM TOO. It returns early, and the
+        // comment right below records that this exact path was once
+        // "the most expressive path with no feedback". Adding the
+        // faults after the early return would have reintroduced that.
         if ops.is_empty() && !p.program.is_empty() {
-            return Some(crate::review::program_prompt(
-                &p.prose, &p.program, &p.pass_log, &measured, &elev, &p.findings, round));
+            return Some(format!("{fault_lines}{}", crate::review::program_prompt(
+                &p.prose, &p.program, &p.pass_log, &measured, &elev, &p.findings, round)));
         }
         let mut base = crate::review::prompt(&p.prose, &ops, spec.as_deref(), &measured, &elev,
                                             &p.findings, variants, round);
@@ -569,6 +597,7 @@ impl ChatSession {
         if let Some(note) = &self.study_note {
             base = format!("{note}\n{base}");
         }
+        if !fault_lines.is_empty() { base = format!("{fault_lines}{base}"); }
         // and what changed since last round, which is the only thing
         // that answers "did my edit help"
         if self.bench.attempts.len() > 1 {
@@ -2143,5 +2172,27 @@ mod tests {
             Reply::Preview { echo, .. } => assert!(echo.contains("RECOGNIZED"), "{echo}"),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn a_review_names_what_is_measurably_wrong_before_asking_the_model_to_look() {
+        // A model looking at an ASCII elevation of its own work says
+        // "looks good" far more often than it should. Every fault this
+        // crate actually produces can be CHECKED, and a fact beats a
+        // question of taste.
+        let mut w = Flat::new();
+        let mut t = VoxelTools::new(&mut w);
+        let mut s = ChatSession::new(32, 200);
+        let g = gaze_at(20, 5, 15.0);
+        // a build that FLOATS -- the reported fault, verbatim
+        let r = s.receive_program(&mut t, &g,
+            "pass a add\n  part b box w=10 h=10 d=10 material=stone\n  \
+             rel b above ground by=30\nend\n", None, "a floating lump");
+        assert!(matches!(r, Reply::Preview { .. }), "{r:?}");
+        let p = s.review_prompt(0, &[]).expect("a review");
+        assert!(p.contains("WHAT IS WRONG WITH IT, measured rather than guessed"), "{p}");
+        assert!(p.contains("floats"), "the reported fault is named: {p}");
+        assert!(p.contains("Fix the first one before the others"), "{p}");
+        assert!(p.contains("or say why it is deliberate"), "it is not a gate: {p}");
     }
 }

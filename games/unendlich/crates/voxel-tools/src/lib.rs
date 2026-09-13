@@ -124,6 +124,7 @@ pub mod capability;
 pub mod history;
 pub mod ensemble;
 pub mod gpu_guard;
+pub mod faults;
 pub mod expr;
 /// Parts and relations without coordinates, and the solver that grounds them.
 pub mod siting;
