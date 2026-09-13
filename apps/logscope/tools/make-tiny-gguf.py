@@ -37,9 +37,12 @@ kv_f32("qwen2.rope.freq_base", 10000.0)
 kv_u32("qwen2.vocab_size", VOCAB)
 kv_str("tokenizer.ggml.model", "none")
 
-def weights(n):
-    # deterministic small values, no numpy dependency
-    x = 0x2545F4914F6CDD1D
+def weights(n, seed=0):
+    # deterministic small values, no numpy dependency. `seed` is the tensor's index in the file:
+    # with one fixed seed every tensor of a given length was BYTE-IDENTICAL, so attn_q_norm and
+    # attn_k_norm were the same vector and a kernel that normed k with the q weight passed the
+    # bit-exact gate (the §5b break test found it inert). Per-tensor seeding makes them differ.
+    x = 0x2545F4914F6CDD1D ^ (seed * 0x9E3779B97F4A7C15 & 0xFFFFFFFFFFFFFFFF)
     o = bytearray()
     for i in range(n):
         x ^= (x << 13) & 0xFFFFFFFFFFFFFFFF; x ^= x >> 7; x ^= (x << 17) & 0xFFFFFFFFFFFFFFFF
@@ -56,7 +59,7 @@ for i in range(L):
 def write(out, tensors, n_kv):
     ALIGN = 32
     infos, data, off = b"", b"", 0
-    for name, dims in tensors:
+    for ti, (name, dims) in enumerate(tensors):
         n = 1
         for d in dims: n *= d
         pad = (-off) % ALIGN
@@ -68,7 +71,7 @@ def write(out, tensors, n_kv):
             # appear in every selection — the flip the bias gate observes. Others 0.
             w = b"".join(struct.pack("<f", v) for v in ([0.0, 0.0, 3.0, 0.0] * (n // 4 + 1))[:n])
         else:
-            w = weights(n)
+            w = weights(n, ti)
         data += w; off += len(w)
 
     hdr = struct.pack("<IIQQ", 0x46554747, 3, len(tensors), n_kv) + kv + infos
