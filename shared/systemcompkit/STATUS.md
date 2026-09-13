@@ -24,6 +24,25 @@ only whatever becomes the actual shell needs the real thing.
 | `capture` | `ext-image-copy-capture-v1` + `ext-image-capture-source-v1` | confirmed correct at the time `layer`/`toplevel` were built (the earlier "not yet implemented" note was for this exact protocol pair) |
 | (not `toplevel`) | `wlr-foreign-toplevel-management` | deliberately **not** used — confirmed non-interoperable with `cosmic-comp`, which speaks the `ext-`/`zcosmic` family instead. This is the same protocol-family lesson the phosh-vs-KWin research surfaced earlier; recorded here so it isn't re-litigated by someone who only reads this crate in isolation |
 | (not `capture`) | `wlr-screencopy-unstable-v1` | deliberately **not** used — `cosmic-comp` has moved to the newer standardized protocol above |
+| `wayland_io::LayerSurface::paint_argb8888` | `wl_shm` (core protocol) | this crate's own `examples/paint_probe.rs`-then-`ldd` check (see below) — not a doc claim, an actual link-time verification |
+
+## The Vulkan/EGL vs. wl_shm finding, recorded here since it shapes `wayland_io`'s own dependency shape
+
+`wayland-client`'s **default** backend (what every type in this file uses)
+is pure-Rust with no C ABI underneath — no `wl_display*`/`wl_proxy*` pointer
+exists to hand to `raw-window-handle`, which any GPU rendering path
+(Vulkan via `topbar-render`, or EGL/GL) needs. That's not a Rust-bindings
+limitation to route around: confirmed by checking ARM's own open-source
+Vulkan WSI layer's build dependencies, which list `libwayland-client` as a
+hard requirement — the C library dependency is inherent to how Wayland's
+GPU-presentation extensions work, not a choice this crate or `topbar-render`
+made. `wl_shm` (what `paint_argb8888` uses) is different: it's plain wire
+protocol — an fd passed over the same socket everything else in this file
+already speaks — so it needs none of that. Verified, not assumed: built a
+throwaway example binary linking `LayerSurface::connect` with the
+`wayland_io` feature on (and `system` feature deliberately left OFF), then
+ran `ldd` against it and grepped for `wayland` in the output. Empty. No
+`libwayland-*.so` anywhere in the link.
 
 ## What's real vs. what's the honest ceiling
 
@@ -64,9 +83,12 @@ hardware.
 
 ## What isn't built yet
 
-- Nothing consumes this crate. No app in the monorepo depends on
-  `systemcompkit` yet — it's infrastructure waiting for a shell to build on
-  top of it, not something exercised end-to-end by any real UI.
+- `topbar-core`/`topbar-render` now consume this crate (`layer`'s
+  `top_panel`/`side_panel`, `LayerSurface::request_resize`/`paint_argb8888`,
+  `LayerSurface::connection()` for raw-window-handle) — the "nothing
+  consumes this crate" gap noted above is closed. See
+  `shared/topbar-STATUS.md` for that work's own status and TODOs; this
+  file stays scoped to `systemcompkit` itself.
 - `capture`'s `CaptureSource::Toplevel` path is now wired (`ToplevelSession::
   capture_toplevel(id, paint_cursors)`), retaining the real
   `ExtForeignToplevelHandleV1` proxies specifically for this — the gap
@@ -75,6 +97,12 @@ hardware.
   deliberately out of scope everywhere in this crate; see `capture.rs`'s own
   header for why that's a different kind of work than protocol-state
   tracking.
+- **Buffer reuse for `paint_argb8888`.** A fresh `tempfile`+`wl_shm_pool`+
+  `wl_buffer` per call is correct (the `Release` event handler destroys each
+  buffer once the compositor's done with it — nothing leaks) but wasteful
+  for a real per-frame paint loop. Double-buffering is real, undone work.
+- **Live-resize (`request_resize`) is unexercised against a real compositor**,
+  same ceiling as everything else in this file per the section above.
 
 ## The actual next decision, not an engineering task
 

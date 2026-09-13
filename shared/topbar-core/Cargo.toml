@@ -1,0 +1,26 @@
+[package]
+name = "topbar-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Headless state for the cosmic-comp top bar: a launcher row and a taskbar row unified into one tile set (hatch-core's Board), plus collapsed/expanded mode. No wayland-client, no egui — the layer-shell surface and rendering are a separate shell over this."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The unified tile animation engine (Board/TilePose/GridSpec) and the
+# launcher model (AppEntry, favorites) this bar's pinned row reuses as-is
+# rather than re-implementing ranking/favorites/icon-resolution a second time.
+hatch-core = { path = "../../apps/hatch/crates/hatch-core" }
+# ToplevelInfo — the taskbar row's source of running windows. `wayland_io`
+# passed through: `runtime::LayerSurfaceAdapter` wraps the real
+# `systemcompkit::wayland_io::LayerSurface` behind this crate's own
+# `BarSurface` trait, same reason systemcompkit itself feature-gates it —
+# most consumers of `Bar`/`unify`/`Placement` have no reason to link
+# wayland-client.
+systemcompkit = { path = "../systemcompkit" }
+
+[features]
+default = []
+wayland_io = ["systemcompkit/wayland_io"]

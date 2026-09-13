@@ -1,0 +1,22 @@
+[package]
+name = "topbar-render"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The rendering seam topbar-core's runtime.rs deliberately left open: paints egui into a raw wlr-layer-shell WlSurface using wgpu's Vulkan backend via raw-window-handle, with no winit and no wayland-egl in the picture. VK_KHR_wayland_surface only needs a wl_display + wl_surface — it's a generic Vulkan WSI extension, not something cosmic-comp (or any compositor) has to specially support the way EGL's wayland-egl integration is GL-specific. That's what makes this simpler than the GL path would have been: no wayland-egl crate, no EGLSurface, just two raw pointers wgpu already knows how to consume."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+topbar-core = { path = "../topbar-core", features = ["wayland_io"] }
+systemcompkit = { path = "../systemcompkit", features = ["wayland_io"] }
+wayland-client = { version = "0.31", features = ["system"] }
+egui = "0.34"
+# wgpu re-exported through egui-wgpu rather than depended on directly, so
+# the version actually used for wgpu::Instance/Surface/Device below is
+# guaranteed to be the exact one egui_wgpu::Renderer was built against —
+# no separate wgpu version in this Cargo.toml to drift out of sync with it.
+egui-wgpu = { version = "0.34", default-features = false }
+raw-window-handle = "0.6"
+pollster = "0.4"
