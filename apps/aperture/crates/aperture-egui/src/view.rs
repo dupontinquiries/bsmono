@@ -378,28 +378,37 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
         }
     }
 
-    // Pointer → caret.
+    // Pointer → caret. The click grid is built from the camera as it stands
+    // BEFORE this frame's step — the same value the old inline formula used —
+    // because that is the page the user was looking at when they clicked.
+    // Going through `PageGrid` rather than dividing by `line_h` is what keeps
+    // the click and the paint agreeing on the boundary pixel of every row;
+    // see page.rs, "Hit-testing".
     let content_left = rect.left() + m.gutter_w + m.pad;
+    let click_grid = crate::page::PageGrid::new(
+        rect.top(),
+        state.cam.scroll_y.pos,
+        m.line_h,
+        ui.ctx().pixels_per_point(),
+    );
     if response.double_clicked() {
         state.editor.move_word(-1, false);
         state.editor.move_word(1, true);
     } else if response.clicked() || response.drag_started() {
         if let Some(p) = response.interact_pointer_pos() {
             let shift = ui.ctx().input(|i| i.modifiers.shift);
-            let ci = state.caret_from_click(
+            let ci = state.caret_from_click_line(
                 p.x - content_left,
-                p.y - rect.top() + state.cam.scroll_y.pos,
-                m.line_h,
+                click_grid.line_at(p.y),
                 m.char_w,
             );
             state.click_set_caret(ci, shift);
         }
     } else if response.dragged() {
         if let Some(p) = response.interact_pointer_pos() {
-            let ci = state.caret_from_click(
+            let ci = state.caret_from_click_line(
                 p.x - content_left,
-                p.y - rect.top() + state.cam.scroll_y.pos,
-                m.line_h,
+                click_grid.line_at(p.y),
                 m.char_w,
             );
             state.click_set_caret(ci, true);
@@ -466,7 +475,28 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
         ui.ctx().request_repaint();
     }
     let scroll = state.cam.scroll_y.pos;
-    let origin = Pos2::new(content_left, rect.top() - scroll);
+    // ONE map from content y to screen y, for the whole frame. Every painter
+    // call below goes through it. See `page.rs` for why eight copies of
+    // `rect.top() - scroll + line * line_h` shimmered against each other even
+    // though they were the same expression: epaint rounds each shape to the
+    // pixel grid separately, so with a fractional `line_h` adjacent rows
+    // crossed the boundary on different frames. Quantizing the ORIGIN once
+    // makes the page translate rigidly.
+    let grid = crate::page::PageGrid::new(rect.top(), scroll, m.line_h, ui.ctx().pixels_per_point());
+    // Row top in screen space, including the insert/delete line-slide.
+    // Crisp when the slide is not running (the overwhelmingly common case);
+    // un-quantized for the rows that are actually moving, because a 1-px
+    // quantum is bigger than a frame of that animation and would read as
+    // stutter. Those rows are text, and epaint would re-round the galley
+    // anyway — accepted: the slide is brief and its endpoint is crisp.
+    let row_y = |line: usize| -> f32 {
+        if shift_px != 0.0 && line >= shift_from {
+            grid.y_smooth(line as f32 * m.line_h + shift_px)
+        } else {
+            grid.row_y(line)
+        }
+    };
+    let origin = Pos2::new(content_left, grid.y(0.0));
 
     // ── paint ───────────────────────────────────────────────────────────────
     let painter = ui.painter_at(rect);
@@ -482,9 +512,9 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     let last = (first + rows).min(n_lines);
 
     // Current-line strip + selection slabs under the text.
-    let cur_y = rect.top() - scroll + caret.line as f32 * m.line_h;
+    let cur_y = grid.row_y(caret.line);
     painter.rect_filled(
-        Rect::from_min_size(Pos2::new(rect.left() + m.gutter_w, cur_y), Vec2::new(rect.width() - m.gutter_w, m.line_h)),
+        Rect::from_min_size(Pos2::new(rect.left() + m.gutter_w, cur_y), Vec2::new(rect.width() - m.gutter_w, grid.row_h(caret.line))),
         0.0,
         colors.bg_hover.gamma_multiply(0.6),
     );
@@ -498,8 +528,7 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
             }
             let c0 = if line == pa.line { pa.col } else { 0 };
             let c1 = if line == pb.line { pb.col } else { state.editor.buffer.line_len(line) + 1 };
-            let y = rect.top() - scroll + line as f32 * m.line_h
-                + if line >= shift_from { shift_px } else { 0.0 };
+            let y = row_y(line);
             // Width-aware: a selection spanning a wide CJK glyph highlights
             // the full 2-cell glyph, not a narrow sliver. `_clamped` keeps
             // the existing "reaches one cell past EOL" convention for
@@ -537,8 +566,7 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
             }
             let c0 = if line == pa.line { pa.col } else { 0 };
             let c1 = if line == pb.line { pb.col } else { state.editor.buffer.line_len(line) + 1 };
-            let y = rect.top() - scroll + line as f32 * m.line_h
-                + if line >= shift_from { shift_px } else { 0.0 };
+            let y = row_y(line);
             let text = state.editor.buffer.line(line);
             let v0 = aperture_core::width::char_col_to_visual_clamped(&text, c0) as f32;
             let v1 = aperture_core::width::char_col_to_visual_clamped(&text, c1) as f32;
@@ -555,8 +583,7 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     // syntax cache can pull line text while we hold the rest of state.
     let AppState { editor, syntax, find, git_changed, lsp_diagnostics, .. } = &mut *state;
     for line in first..last {
-        let y = rect.top() - scroll + line as f32 * m.line_h
-            + if line >= shift_from { shift_px } else { 0.0 };
+        let y = row_y(line);
         // Find-match slabs: every match a faint wash, the current one loud.
         if let Some(f) = find.as_ref() {
             let find_line_text = editor.buffer.line(line);
@@ -686,7 +713,7 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
             let head = lines.next().unwrap_or("");
             let extra = lines.count();
             let gx = origin.x + state.cam.caret_x.pos + 2.0;
-            let gy = rect.top() - scroll + caret.line as f32 * m.line_h;
+            let gy = grid.row_y(caret.line);
             let mut job = LayoutJob::default();
             job.append(head, 0.0, fmt(&m.font, gcolor, true));
             let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
@@ -705,18 +732,27 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
 
     // Caret — the smoothly-trailing bar; solid while moving, blinking at rest.
     let cx = origin.x + state.cam.caret_x.pos;
-    let cy = rect.top() - scroll + state.cam.caret_y.pos;
     let moving = !state.cam.caret_x.settled() || !state.cam.caret_y.settled();
+    // The one place a snap rule differs between the animation and its end,
+    // ON PURPOSE (page.rs, "crisp vs smooth"): a 2 px bar quantized to the
+    // pixel grid every frame stutters visibly as it glides, and left
+    // un-quantized at rest it is a permanently blurry caret. So: smooth
+    // while moving, crisp once settled. The `with_round_to_pixels(false)`
+    // below is not optional — without it epaint re-rounds the shape and
+    // throws the smooth position away.
+    let cy = if moving { grid.y_smooth(state.cam.caret_y.pos) } else { grid.y(state.cam.caret_y.pos) };
     // The caret's look AND its frame budget come from one policy — see
     // `camera::CaretPolicy`, which exists because the two lines this
     // replaced asked for a repaint every 530 ms forever, focused or not.
     let focused = ui.ctx().input(|i| i.focused);
     let cd = state.caret.draw(now_ms, state.last_input_ms, focused, moving);
     if cd.alpha > 0.0 {
-        painter.rect_filled(
-            Rect::from_min_size(Pos2::new(cx - 1.0, cy + 1.0), Vec2::new(2.0, m.line_h - 2.0)),
-            1.0,
-            colors.accent.gamma_multiply(cd.alpha),
+        let bar = Rect::from_min_size(Pos2::new(cx - 1.0, cy + 1.0), Vec2::new(2.0, m.line_h - 2.0));
+        painter.add(
+            egui::epaint::RectShape::filled(bar, 1.0, colors.accent.gamma_multiply(cd.alpha))
+                // See `cy` above: rounding a gliding caret to the pixel grid
+                // is the stutter, so the moving case opts out of it.
+                .with_round_to_pixels(!moving),
         );
     }
     if let Some(ms) = cd.repaint_in_ms {
@@ -734,8 +770,7 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
         let line_text = state.editor.buffer.line(p.line);
         let vx = aperture_core::width::char_col_to_visual(&line_text, p.col) as f32;
         let ex = content_left + vx * m.char_w;
-        let ey = rect.top() - scroll + p.line as f32 * m.line_h
-            + if p.line >= shift_from { shift_px } else { 0.0 };
+        let ey = row_y(p.line);
         painter.rect_filled(
             Rect::from_min_size(Pos2::new(ex - 1.0, ey + 1.0), Vec2::new(2.0, m.line_h - 2.0)),
             1.0,

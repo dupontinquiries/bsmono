@@ -3260,8 +3260,22 @@ impl AppState {
     }
 
     /// Caret char index for a click at content-space (x px, y px).
+    ///
+    /// Kept for callers that only have a content y. The view no longer uses
+    /// it: dividing by `line_h` gives a row boundary half a pixel away from
+    /// where `page::PageGrid` actually painted one, so a click in that band
+    /// landed a row off. It goes through [`Self::caret_from_click_line`] with
+    /// the grid's answer instead. Same function underneath — this wrapper is
+    /// how the existing tests keep testing the thing they were written for.
     pub fn caret_from_click(&self, x: f32, y: f32, line_h: f32, char_w: f32) -> usize {
         let line = ((y / line_h).floor().max(0.0)) as usize;
+        self.caret_from_click_line(x, line, char_w)
+    }
+
+    /// Caret char index for a click at content-space `x`, on an already-known
+    /// `line`. The line is clamped to the buffer here so every caller gets
+    /// that for free.
+    pub fn caret_from_click_line(&self, x: f32, line: usize, char_w: f32) -> usize {
         let line = line.min(self.editor.buffer.len_lines().saturating_sub(1));
         let text = self.editor.buffer.line(line);
         let target_visual = ((x / char_w) + 0.5).floor().max(0.0) as usize;
