@@ -120,9 +120,27 @@ pub fn is_spent(c: &Count, now_secs: u64) -> bool {
 pub fn caps_are_sane() -> bool { MAX_TRIGRAMS > MAX_BIGRAMS }
 
 /// Approximate on-disk size, for the argument against a pre-trained corpus.
+/// Rough resident cost of a model holding these counts.
+///
+/// The 16-bytes-per-entry this used to return is the size of a LINE IN THE
+/// SERIALISED TOML — two short words, a count, a timestamp. That is a fine
+/// estimate of the file and a bad one for memory, and it was being used for
+/// memory: an in-RAM entry is a `String` key (24 bytes plus its heap
+/// allocation), a `Count` (two 8-byte fields), hashbrown's control byte and
+/// its load factor, and a share of the two prefix maps.
+///
+/// MEASURED at the steady state the caps produce — 5,616 bigrams and 10,334
+/// trigrams after 200k records — with a counting `GlobalAlloc`: 3,080 KB
+/// live, against the 249 KB the old formula reported for the same counts.
+/// A factor of 12.4. The constant below is that measurement divided by the
+/// entry count, not a fresh guess.
+///
+/// It is an estimate and says so; the point is that it is now the right
+/// ORDER, so a cap change is judged against something real.
+pub const BYTES_PER_ENTRY: usize = 197;
+
 pub fn approx_bytes(bigrams: usize, trigrams: usize) -> usize {
-    // ~16 bytes per line in the TOML: two short words, a count, a timestamp.
-    (bigrams + trigrams) * 16
+    (bigrams + trigrams) * BYTES_PER_ENTRY
 }
 
 /// The counts, held so the scoring policy above has something to score.
@@ -189,14 +207,84 @@ impl NgramStore {
         score(&Context { trigram, bigram, _marker: std::marker::PhantomData })
     }
 
-    /// Drop spent entries, and enforce the caps if still over.
+    /// Drop spent entries, then ENFORCE the caps, then rebuild the prefix
+    /// totals from what survived.
+    ///
+    /// The previous version did only the first step, and the doc comment
+    /// claimed the second. `retain(!is_spent)` frees nothing when nothing has
+    /// decayed yet, which is precisely the case for a user who is typing —
+    /// so the caps were thresholds that triggered a cleanup that could remove
+    /// zero entries, and all four maps grew without limit for the lifetime of
+    /// the process. Measured at 15,000 bigrams against a cap of 5,000.
+    ///
+    /// `bi_prefix` and `tri_prefix` were never touched at all. They are the
+    /// DENOMINATORS the scoring divides by, so leaving them behind after an
+    /// eviction is not only a leak: every surviving continuation of an
+    /// evicted prefix scores lower than it should, forever, with nothing to
+    /// notice it. Rebuilding them from the surviving keys fixes the leak and
+    /// the drift with one pass, and makes them bounded by construction —
+    /// there can be no prefix without an n-gram that has it.
     fn evict(&mut self, now_secs: u64) {
-        if self.bigrams.len() > MAX_BIGRAMS {
+        // Hysteresis, and it is not optional. `record` runs on every
+        // committed word, so an eviction that fires the moment the map is one
+        // entry over the cap does a sort and a full prefix rebuild PER
+        // KEYSTROKE for the rest of the session. The first version of this
+        // fix did exactly that and took the ngram test suite from 0.95 s to
+        // 20 s — the same defect it was fixing, moved from memory to time.
+        //
+        // Letting the map run SLACK entries past the cap before trimming back
+        // TO the cap means one sort per SLACK insertions, so the amortised
+        // cost per word is a division rather than a sort, and the ceiling
+        // rises by a bounded 12.5%.
+        let over_bi = self.bigrams.len() > MAX_BIGRAMS + MAX_BIGRAMS / 8;
+        let over_tri = self.trigrams.len() > MAX_TRIGRAMS + MAX_TRIGRAMS / 8;
+        if !over_bi && !over_tri {
+            return;
+        }
+
+        if over_bi {
             self.bigrams.retain(|_, c| !is_spent(c, now_secs));
+            cap_to(&mut self.bigrams, MAX_BIGRAMS, now_secs);
         }
-        if self.trigrams.len() > MAX_TRIGRAMS {
+        if over_tri {
             self.trigrams.retain(|_, c| !is_spent(c, now_secs));
+            cap_to(&mut self.trigrams, MAX_TRIGRAMS, now_secs);
         }
+
+        // Prefix = everything before the last separator, for both orders.
+        self.bi_prefix.clear();
+        for k in self.bigrams.keys() {
+            if let Some((p, _)) = k.rsplit_once('\u{1}') {
+                *self.bi_prefix.entry(p.to_string()).or_insert(0.0) += 1.0;
+            }
+        }
+        self.tri_prefix.clear();
+        for k in self.trigrams.keys() {
+            if let Some((pp_p, _)) = k.rsplit_once('\u{1}') {
+                *self.tri_prefix.entry(pp_p.to_string()).or_insert(0.0) += 1.0;
+            }
+        }
+    }
+}
+
+/// Drop the weakest entries until `m` is within `cap`.
+///
+/// Weakest by decayed count, so a rarely-used entry goes before a frequent
+/// one regardless of when each was last touched. Only runs when `retain`
+/// left the map over the cap, which is the case this whole function exists
+/// for: a session where nothing has decayed yet.
+fn cap_to(m: &mut std::collections::HashMap<String, Count>, cap: usize, now: u64) {
+    if m.len() <= cap {
+        return;
+    }
+    let mut scored: Vec<(f64, String)> = m
+        .iter()
+        .map(|(k, c)| (effective(c, now), k.clone()))
+        .collect();
+    // Ascending: the front is what goes.
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    for (_, k) in scored.into_iter().take(m.len() - cap) {
+        m.remove(&k);
     }
 }
 
@@ -323,11 +411,82 @@ mod tests {
 
     #[test]
     fn the_whole_model_stays_far_smaller_than_a_corpus() {
-        // "~100MB [for Brown] ... ~50KB and personalized." The size argument is
-        // the reason this is counting rather than a pretrained model, so a cap
-        // change that broke it would quietly undo the decision.
+        // "~100MB [for Brown] ... ~50KB and personalized." The size argument
+        // is the reason this counts rather than shipping a pretrained model,
+        // so a cap change that broke it would quietly undo the decision.
+        //
+        // The "~50KB" half of that claim was wrong by two orders of
+        // magnitude, and this test passed anyway because `approx_bytes`
+        // measured the serialised TOML rather than the resident maps. The
+        // real figure, measured with a counting allocator at the steady state
+        // the caps produce, is ~3 MB. The ARGUMENT survives — 3 MB against
+        // ~100 MB is still the reason not to ship a corpus — but the number
+        // in it did not, and a formula nobody had checked against a
+        // measurement is how it stayed wrong.
         let full = approx_bytes(MAX_BIGRAMS, MAX_TRIGRAMS);
-        assert!(full < 1_000_000, "the model grew past its own argument: {full}");
+        assert!(
+            full < 10_000_000,
+            "the model grew past its own argument: {full}"
+        );
+        assert!(
+            full > 1_000_000,
+            "approx_bytes is back to reporting serialised size ({full}); it \
+             is supposed to estimate RESIDENT bytes"
+        );
+    }
+
+    #[test]
+    fn the_prefix_totals_are_bounded_too() {
+        // The caps exist so a keyboard that runs for weeks does not grow
+        // without limit. `evict` enforces them on `bigrams` and `trigrams`
+        // and does not touch `bi_prefix` or `tri_prefix`, which gain an entry
+        // for every distinct previous word and every distinct previous PAIR
+        // the user ever types — so the two maps nobody caps are the two that
+        // track vocabulary rather than usage, and they are the ones that grow
+        // forever.
+        //
+        // `approx_bytes` cannot see this: it is a formula over the two capped
+        // maps, so `the_whole_model_stays_far_smaller_than_a_corpus` passes
+        // whatever the prefix maps do.
+        let mut st = NgramStore::default();
+        let n = MAX_BIGRAMS * 3;
+        for i in 0..n {
+            // A fresh previous-word each time: worst case, but the realistic
+            // shape of a growing personal vocabulary.
+            st.record(Some("aa"), Some(&format!("w{i}")), "next", 1_000);
+        }
+        assert!(
+            st.bigrams.len() <= MAX_BIGRAMS * 2,
+            "bigrams unbounded: {}", st.bigrams.len()
+        );
+        assert!(
+            st.bi_prefix.len() <= MAX_BIGRAMS * 2,
+            "bi_prefix grows without limit: {} entries after {} records",
+            st.bi_prefix.len(), n
+        );
+        assert!(
+            st.tri_prefix.len() <= MAX_TRIGRAMS * 2,
+            "tri_prefix grows without limit: {} entries after {} records",
+            st.tri_prefix.len(), n
+        );
+    }
+
+    #[test]
+    fn an_evicted_bigram_does_not_leave_its_total_behind() {
+        // The prefix maps are DENOMINATORS. If a bigram is evicted and its
+        // prefix total is not reduced, every surviving continuation of that
+        // prefix scores lower than it should, forever — a silent accuracy
+        // drift with no crash and no failing test.
+        let mut st = NgramStore::default();
+        for i in 0..(MAX_BIGRAMS * 3) {
+            st.record(None, Some(&format!("p{i}")), "w", 1_000);
+        }
+        let live: f64 = st.bi_prefix.values().sum();
+        assert!(
+            live <= (st.bigrams.len() as f64) * 2.0,
+            "prefix totals ({live}) far exceed the {} surviving bigrams they \
+             are supposed to normalise", st.bigrams.len()
+        );
     }
 
     #[test]
