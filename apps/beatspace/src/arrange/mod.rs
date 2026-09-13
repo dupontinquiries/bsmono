@@ -6,6 +6,9 @@
 //! * `render` — the library of sources and the block mixer with a looping
 //!              transport.
 //! * `palette` — every action by name, ranked for a command palette.
+//! * `stretch` — WSOLA time-stretch for tempo-locked clips.
+//! * `project` — save and load: a JSON of the timeline beside the library's
+//!              audio as WAV files.
 //!
 //! None of them know egui or an audio device. `arrangepage` (behind the
 //! `app` feature) is the view over them; the generator thread drives the
@@ -21,5 +24,7 @@
 pub mod cmd;
 pub mod model;
 pub mod palette;
+pub mod project;
 pub mod render;
+pub mod stretch;
 pub mod tools;

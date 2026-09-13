@@ -140,9 +140,9 @@ struct ArrShared {
     /// thread -> GUI: seconds recorded so far, while a take runs.
     recording_secs: Option<f32>,
     /// thread -> GUI: a finished take to place (source, start beat,
-    /// length in beats). The GUI applies it through the editor so it is
-    /// undoable like everything else.
-    pending_place: Option<(crate::arrange::model::SourceRef, f64, f64)>,
+    /// length in beats, the tempo it was recorded at). The GUI applies it
+    /// through the editor so it is undoable like everything else.
+    pending_place: Option<(crate::arrange::model::SourceRef, f64, f64, f64)>,
 }
 
 struct Shared {
@@ -719,21 +719,23 @@ restart the GUI with --ckpt-dir pointing at its directory",
 
 /// Add a finished take to the library and queue its placement.
 fn finish_take(t: crate::stream::Take, cfg: &Config, shared: &Arc<Mutex<Shared>>) {
-    let start_beat = t.start_beat;
+    let (start_beat, bpm) = (t.start_beat, t.bpm());
     let mut s = shared.lock().unwrap();
     s.arr.recording_secs = None;
     match t.finish() {
         Some((audio, beats)) => {
             let n = s.arr.library.beats.len() + 1;
             let secs = audio.len() as f32 / cfg.sr as f32;
+            // The take knows its tempo, so it is placed locked to it and
+            // follows the arrangement's tempo from then on.
             let r = Arc::make_mut(&mut s.arr.library).add_beat(Sample {
                 name: format!("take {n}"),
                 audio,
                 sr: cfg.sr,
                 planes: None,
-                bpm: None,
+                bpm: Some(bpm),
             });
-            s.arr.pending_place = Some((r, start_beat, beats));
+            s.arr.pending_place = Some((r, start_beat, beats, bpm as f64));
             s.arr.notice = Some(format!("take {n}: {secs:.1} s, placed at beat {start_beat:.2}"));
         }
         None => s.arr.notice = Some("the take was empty".into()),
@@ -811,6 +813,7 @@ const RANGE: f32 = 3.0; // pad maps to [-RANGE, RANGE]
 
 impl App {
     fn new(cfg: Config, shared: Arc<Mutex<Shared>>) -> Self {
+        let project_path = crate::arrange::project::default_dir(&cfg.ckpt_dir).display().to_string();
         let latent = cfg.latent;
         // Computed before the struct literal moves cfg into it.
         let ckpt_text = cfg
@@ -844,7 +847,11 @@ impl App {
             save_text: "beat.wav".into(),
             status: "drag on the pad to morph".into(),
             shape_note: None,
-            arrange: ArrangeView::default(),
+            arrange: {
+                let mut a = ArrangeView::default();
+                a.project_path = project_path;
+                a
+            },
         }
     }
 
@@ -1111,12 +1118,12 @@ impl App {
     /// it is undoable, then publish.
     fn arrange_take_pending(&mut self) {
         let pending = self.shared.lock().unwrap().arr.pending_place.take();
-        if let Some((source, start, beats)) = pending {
+        if let Some((source, start, beats, bpm)) = pending {
             // The beats track, or wherever the first track is.
             if let Some(track) = self.arrange.timeline().tracks.first().map(|t| t.id) {
                 // Exact: a take starts where recording started, not on the
-                // nearest grid line.
-                let placed = self.arrange.editor.apply(Command::Place { track, source, start, source_beats: beats, exact: true });
+                // nearest grid line. Locked to the tempo it was recorded at.
+                let placed = self.arrange.editor.apply(Command::Place { track, source, start, source_beats: beats, exact: true, lock: Some(bpm) });
                 match placed {
                     Ok(_) => {}
                     Err(e) => self.status = format!("the take could not be placed at {start:.2}: {e:?} — it is in the library"),
@@ -1187,6 +1194,39 @@ impl App {
         if let Some(path) = out.export_wav {
             self.export_arrangement(path);
         }
+        if let Some(dir) = out.save_project {
+            self.save_project(dir);
+        }
+        if let Some(dir) = out.load_project {
+            self.load_project(dir);
+        }
+    }
+
+    fn save_project(&mut self, dir: String) {
+        let dir = if dir.is_empty() { crate::arrange::project::default_dir(&self.cfg.ckpt_dir) } else { PathBuf::from(dir) };
+        let library = self.shared.lock().unwrap().arr.library.clone();
+        match crate::arrange::project::save(&dir, self.arrange.timeline(), &library) {
+            Ok(()) => self.status = format!("saved project to {}", dir.display()),
+            Err(e) => self.status = format!("save project: {e:#}"),
+        }
+    }
+
+    fn load_project(&mut self, dir: String) {
+        let dir = if dir.is_empty() { crate::arrange::project::default_dir(&self.cfg.ckpt_dir) } else { PathBuf::from(dir) };
+        match crate::arrange::project::load(&dir, self.cfg.sr) {
+            Ok((timeline, library)) => {
+                let n = (library.beats.len(), library.files.len());
+                self.arrange.replace(timeline);
+                let mut s = self.shared.lock().unwrap();
+                s.arr.playing = false;
+                s.arr.seek = Some(0.0);
+                s.arr.pos = 0.0;
+                s.arr.library = Arc::new(library);
+                s.arr.timeline = self.arrange.timeline().clone();
+                self.status = format!("loaded {} ({} beats, {} files)", dir.display(), n.0, n.1);
+            }
+            Err(e) => self.status = format!("load project: {e:#}"),
+        }
     }
 
     /// Decode a file on a worker and add it to the library when done.
@@ -1216,19 +1256,11 @@ impl App {
             (self.arrange.timeline().clone(), s.arr.library.clone())
         };
         let sr = self.cfg.sr;
-        let end = timeline.end();
-        if end <= 0.0 {
+        let out = crate::arrange::render::render_all(&timeline, &library, sr);
+        let n = out.len();
+        if n == 0 {
             self.status = "nothing to export".into();
             return;
-        }
-        let n = (timeline.beats_to_secs(end) * sr as f64).ceil() as usize;
-        let mut out = vec![0.0f32; n];
-        crate::arrange::render::render_block(&timeline, &library, sr, 0.0, &mut out);
-        let peak = out.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
-        if peak > 0.98 {
-            for x in &mut out {
-                *x *= 0.98 / peak;
-            }
         }
         match audio_io::save_wav(&PathBuf::from(&path), &out, sr) {
             Ok(()) => self.status = format!("exported {path} ({:.1} s)", n as f64 / sr as f64),

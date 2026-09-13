@@ -63,6 +63,9 @@ pub enum Edge {
     Body,
     Left,
     Right,
+    /// The fade handles along the clip's top edge.
+    FadeIn,
+    FadeOut,
 }
 
 /// What is under the pointer.
@@ -95,8 +98,10 @@ pub struct Mods {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Brush {
     pub source: SourceRef,
-    /// Its length in beats at the current tempo.
+    /// Its length in beats at the current tempo (or at `lock`).
     pub beats: f64,
+    /// Tempo the source is locked to, when it knows one.
+    pub lock: Option<f64>,
 }
 
 /// A gesture in flight.
@@ -105,6 +110,8 @@ pub enum Drag {
     None,
     Moving { clips: Vec<ClipId>, from_beat: f64, from_track: usize, delta_beats: f64, delta_tracks: i32, copy: bool },
     Trim { clip: ClipId, edge: Edge, orig: Clip, delta_beats: f64 },
+    /// Dragging a fade handle: the pointer's beat sets the fade length.
+    Fade { clip: ClipId, edge: Edge, orig: Clip, pointer_beat: f64 },
     Marquee { from_beat: f64, from_track: usize, to_beat: f64, to_track: usize },
     Loop { from_beat: f64, to_beat: f64 },
     Painting { track: usize, painted: Vec<f64> },
@@ -131,6 +138,8 @@ pub enum Preview {
     Moving { clips: Vec<ClipId>, delta_beats: f64, delta_tracks: i32, copy: bool, fits: bool },
     /// Draw this clip at the trimmed extent.
     Trim { clip: ClipId, start: f64, len: f64, fits: bool },
+    /// Draw these fade lengths on the clip.
+    Fade { clip: ClipId, fade_in: f64, fade_out: f64 },
     Marquee { from_beat: f64, from_track: usize, to_beat: f64, to_track: usize },
     Loop { from: f64, to: f64 },
 }
@@ -191,6 +200,12 @@ impl Tools {
                         copy: mods.alt,
                     };
                 }
+                Hit::Clip { id, edge: edge @ (Edge::FadeIn | Edge::FadeOut) } => {
+                    if let Some((_, c)) = ed.timeline.find(id) {
+                        out.push(Effect::Select { clips: vec![id], extend: false, toggle: false });
+                        self.drag = Drag::Fade { clip: id, edge, orig: c.clone(), pointer_beat: at.beat };
+                    }
+                }
                 Hit::Clip { id, edge } => {
                     if let Some((_, c)) = ed.timeline.find(id) {
                         out.push(Effect::Select { clips: vec![id], extend: false, toggle: false });
@@ -215,6 +230,7 @@ impl Tools {
                         start: cell,
                         source_beats: b.beats,
                         exact: false,
+                        lock: b.lock,
                     }));
                     self.drag = Drag::Painting { track, painted: vec![cell] };
                 }
@@ -253,6 +269,7 @@ impl Tools {
                 // original edge, which is what the preview needs.
                 *delta_beats = at.beat;
             }
+            Drag::Fade { pointer_beat, .. } => *pointer_beat = at.beat,
             Drag::Marquee { to_beat, to_track, .. } => {
                 *to_beat = at.beat;
                 if let Some(t) = at.track {
@@ -273,6 +290,7 @@ impl Tools {
                                 start: cell,
                                 source_beats: b.beats,
                                 exact: false,
+                                lock: b.lock,
                             }));
                         }
                     }
@@ -308,6 +326,12 @@ impl Tools {
                     if (start - orig.start).abs() > 1e-9 || (len - orig.len).abs() > 1e-9 {
                         out.push(Effect::Command(Command::Trim { clip, start, len, offset }));
                     }
+                }
+            }
+            Drag::Fade { clip, edge, orig, pointer_beat } => {
+                let (fi, fo) = fade_lengths(&orig, edge, pointer_beat);
+                if (fi - orig.fade_in).abs() > 1e-9 || (fo - orig.fade_out).abs() > 1e-9 {
+                    out.push(Effect::Command(Command::SetClipFades { clip, fade_in: fi, fade_out: fo }));
                 }
             }
             Drag::Marquee { from_beat, from_track, to_beat, to_track } => {
@@ -373,6 +397,10 @@ impl Tools {
                     None => Preview::Trim { clip: *clip, start: orig.start, len: orig.len, fits: true },
                 }
             }
+            Drag::Fade { clip, edge, orig, pointer_beat } => {
+                let (fade_in, fade_out) = fade_lengths(orig, *edge, *pointer_beat);
+                Preview::Fade { clip: *clip, fade_in, fade_out }
+            }
             Drag::Marquee { from_beat, from_track, to_beat, to_track } => {
                 Preview::Marquee { from_beat: *from_beat, from_track: *from_track, to_beat: *to_beat, to_track: *to_track }
             }
@@ -386,6 +414,17 @@ impl Tools {
 
     pub fn dragging(&self) -> bool {
         self.drag != Drag::None
+    }
+}
+
+/// The fades a handle drag gives. The in-handle sits at `start + fade_in`
+/// and the out-handle at `end - fade_out`; the pointer's beat is where the
+/// handle goes, clamped to the clip.
+fn fade_lengths(orig: &Clip, edge: Edge, pointer_beat: f64) -> (f64, f64) {
+    match edge {
+        Edge::FadeIn => ((pointer_beat - orig.start).clamp(0.0, orig.len), orig.fade_out),
+        Edge::FadeOut => (orig.fade_in, (orig.end() - pointer_beat).clamp(0.0, orig.len)),
+        _ => (orig.fade_in, orig.fade_out),
     }
 }
 
@@ -409,7 +448,7 @@ fn trim_extent(grid: &super::model::Grid, orig: &Clip, edge: Edge, pointer_beat:
             let len = end - orig.start;
             if len < min_len - 1e-9 { None } else { Some((orig.start, len, orig.offset)) }
         }
-        Edge::Body => Some((orig.start, orig.len, orig.offset)),
+        Edge::Body | Edge::FadeIn | Edge::FadeOut => Some((orig.start, orig.len, orig.offset)),
     }
 }
 
@@ -493,8 +532,8 @@ mod tests {
     fn setup() -> (Editor, TrackId, TrackId, ClipId, ClipId) {
         let mut e = Editor::default();
         let (t0, t1) = (e.timeline.tracks[0].id, e.timeline.tracks[1].id);
-        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false }).unwrap().created[0];
-        let b = e.apply(Command::Place { track: t0, source: SourceRef::Beat(1), start: 4.0, source_beats: 2.0, exact: false }).unwrap().created[0];
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false, lock: None }).unwrap().created[0];
+        let b = e.apply(Command::Place { track: t0, source: SourceRef::Beat(1), start: 4.0, source_beats: 2.0, exact: false, lock: None }).unwrap().created[0];
         (e, t0, t1, a, b)
     }
 
@@ -641,9 +680,41 @@ mod tests {
     }
 
     #[test]
+    fn a_painted_brush_carries_its_tempo_lock() {
+        let (mut e, t0, _, _, _) = setup();
+        let mut t = Tools::default();
+        t.set_tool(Tool::Draw);
+        t.brush = Some(Brush { source: SourceRef::Beat(2), beats: 1.0, lock: Some(120.0) });
+        { let fx = t.press(&e, at(8.0, 0, Hit::Empty), Mods::default()); apply(&mut e, fx); }
+        let c = e.timeline.track(t0).unwrap().clip_at(8.0).unwrap();
+        assert_eq!(c.tempo_lock, Some(120.0));
+    }
+
+    #[test]
+    fn dragging_the_fade_handles_sets_the_fades_and_previews_them() {
+        let (mut e, _, _, a, _) = setup();
+        let mut t = Tools::default();
+        t.press(&e, at(0.0, 0, Hit::Clip { id: a, edge: Edge::FadeIn }), Mods::default());
+        t.drag(&e, at(0.75, 0, Hit::Empty));
+        assert_eq!(t.preview(&e), Preview::Fade { clip: a, fade_in: 0.75, fade_out: 0.0 });
+        { let fx = t.release(&e, at(0.75, 0, Hit::Empty)); apply(&mut e, fx); }
+        assert_eq!(e.timeline.find(a).unwrap().1.fade_in, 0.75);
+        // Out handle: measured from the end; past the clip it clamps.
+        t.press(&e, at(2.0, 0, Hit::Clip { id: a, edge: Edge::FadeOut }), Mods::default());
+        t.drag(&e, at(-5.0, 0, Hit::Empty));
+        { let fx = t.release(&e, at(-5.0, 0, Hit::Empty)); apply(&mut e, fx); }
+        let c = e.timeline.find(a).unwrap().1;
+        assert_eq!((c.fade_in, c.fade_out), (0.75, 2.0));
+        // Pressing the handle where it already is (end - fade_out = 0)
+        // and letting go changes nothing and emits nothing.
+        t.press(&e, at(0.0, 0, Hit::Clip { id: a, edge: Edge::FadeOut }), Mods::default());
+        assert!(t.release(&e, at(0.0, 0, Hit::Empty)).is_empty());
+    }
+
+    #[test]
     fn marquee_selects_what_it_crosses_on_the_tracks_it_spans() {
         let (mut e, _, t1, a, b) = setup();
-        let c = e.apply(Command::Place { track: t1, source: SourceRef::File(0), start: 1.0, source_beats: 1.0, exact: false }).unwrap().created[0];
+        let c = e.apply(Command::Place { track: t1, source: SourceRef::File(0), start: 1.0, source_beats: 1.0, exact: false, lock: None }).unwrap().created[0];
         let mut t = Tools::default();
         t.press(&e, at(3.0, 0, Hit::Empty), Mods::default());
         t.drag(&e, at(0.5, 1, Hit::Empty));
@@ -660,7 +731,7 @@ mod tests {
         t.set_tool(Tool::Draw);
         // No brush: nothing happens.
         assert!(t.press(&e, at(8.0, 0, Hit::Empty), Mods::default()).is_empty());
-        t.brush = Some(Brush { source: SourceRef::Beat(2), beats: 1.0 });
+        t.brush = Some(Brush { source: SourceRef::Beat(2), beats: 1.0, lock: Some(120.0) });
         { let fx = t.press(&e, at(8.2, 0, Hit::Empty), Mods::default()); apply(&mut e, fx); }
         for x in [8.4, 8.6, 9.1, 9.4, 10.2, 10.2] {
             { let fx = t.drag(&e, at(x, 0, Hit::Empty)); apply(&mut e, fx); }

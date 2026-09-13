@@ -15,8 +15,10 @@
 
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
+
 /// Where a clip's audio comes from. Ids index the `render::Library`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SourceRef {
     /// A window captured from the generator (a "beat").
     Beat(usize),
@@ -27,25 +29,47 @@ pub enum SourceRef {
 pub type ClipId = u64;
 pub type TrackId = u64;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     pub id: ClipId,
     pub source: SourceRef,
     /// Start on the grid, in beats.
     pub start: f64,
-    /// Length on the grid, in beats. At most the source's length at the
-    /// current tempo minus `offset`; `Timeline::clamp_clip` enforces it.
+    /// Length on the grid, in beats.
     pub len: f64,
-    /// How far into the source the clip begins, in beats (a trimmed head).
+    /// How far into the clip's material the clip begins, in TIMELINE beats
+    /// (a trimmed head). With a tempo lock the material is stretched, so
+    /// this is measured on the stretched material like `len` is.
     pub offset: f64,
     /// Linear gain.
     pub gain: f32,
     pub muted: bool,
+    /// The tempo at which the source plays at its natural speed. When set,
+    /// the clip keeps its length in beats as the timeline tempo changes and
+    /// the audio is time-stretched (pitch kept) by `tempo / lock`. When not
+    /// set, the audio plays at natural speed and the clip's extent in beats
+    /// follows the tempo instead. Captured beats and takes know their
+    /// tempo and lock by default; imported files do not.
+    #[serde(default)]
+    pub tempo_lock: Option<f64>,
+    /// Fade lengths in beats. Below the renderer's 5 ms floor they have no
+    /// effect beyond it.
+    #[serde(default)]
+    pub fade_in: f64,
+    #[serde(default)]
+    pub fade_out: f64,
 }
 
 impl Clip {
     pub fn end(&self) -> f64 {
         self.start + self.len
+    }
+    /// Playback rate of the material at `bpm`: 1 unless tempo-locked.
+    pub fn rate_at(&self, bpm: f64) -> f64 {
+        match self.tempo_lock {
+            Some(lock) if lock > 0.0 => bpm / lock,
+            _ => 1.0,
+        }
     }
     pub fn contains(&self, beat: f64) -> bool {
         beat >= self.start && beat < self.end()
@@ -55,7 +79,7 @@ impl Clip {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     pub id: TrackId,
     pub name: String,
@@ -83,7 +107,7 @@ impl Track {
 }
 
 /// Snap resolution, in beats. `None` is free placement.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Grid(pub Option<f64>);
 
 impl Grid {
@@ -111,7 +135,7 @@ impl Grid {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Timeline {
     pub tracks: Vec<Track>,
     pub bpm: f64,
@@ -196,6 +220,13 @@ impl Timeline {
     /// looked at since. A newcomer that would land entirely inside an
     /// existing clip is refused rather than shortened to nothing.
     pub fn place(&mut self, track: TrackId, source: SourceRef, start: f64, source_beats: f64) -> Option<ClipId> {
+        self.place_locked(track, source, start, source_beats, None)
+    }
+
+    /// `place`, with a tempo lock: `source_beats` is then the material's
+    /// length at `lock` BPM, and the clip's length on the grid is the same
+    /// number of beats whatever the timeline tempo is.
+    pub fn place_locked(&mut self, track: TrackId, source: SourceRef, start: f64, source_beats: f64, lock: Option<f64>) -> Option<ClipId> {
         let id = self.fresh_id();
         let t = self.track_mut(track)?;
         let start = start.max(0.0);
@@ -214,9 +245,43 @@ impl Timeline {
         if t.clip_at(start).is_some() || len <= 1e-9 {
             return None;
         }
-        t.clips.push(Clip { id, source, start, len, offset: 0.0, gain: 1.0, muted: false });
+        t.clips.push(Clip {
+            id, source, start, len, offset: 0.0, gain: 1.0, muted: false,
+            tempo_lock: lock.filter(|l| *l > 0.0), fade_in: 0.0, fade_out: 0.0,
+        });
         t.clips.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
         Some(id)
+    }
+
+    /// Change the tempo. Tempo-locked clips keep their beats (their audio
+    /// stretches); the others keep their MATERIAL, so their extent in beats
+    /// scales by `new / old`, and a clip that would then reach into its
+    /// right neighbour is trimmed to it — the neighbour's start is a thing
+    /// the user placed. Loop region and starts are in beats and stay.
+    pub fn set_tempo(&mut self, bpm: f64) {
+        let old = self.bpm;
+        if !(bpm > 0.0) || (bpm - old).abs() < 1e-12 {
+            self.bpm = bpm;
+            return;
+        }
+        let k = bpm / old;
+        for track in &mut self.tracks {
+            for i in 0..track.clips.len() {
+                if track.clips[i].tempo_lock.is_some() {
+                    continue;
+                }
+                let next_start = track.clips.get(i + 1).map(|c| c.start);
+                let c = &mut track.clips[i];
+                c.len *= k;
+                c.offset *= k;
+                c.fade_in *= k;
+                c.fade_out *= k;
+                if let Some(ns) = next_start {
+                    c.len = c.len.min(ns - c.start);
+                }
+            }
+        }
+        self.bpm = bpm;
     }
 
     /// Can `clip` sit at `start` with `len` on `track` without touching
@@ -331,6 +396,32 @@ mod tests {
         assert!(!t.audible(&t.tracks[1]));
         t.tracks[0].muted = true;
         assert!(!t.audible(&t.tracks[0]));
+    }
+
+    #[test]
+    fn a_tempo_change_stretches_locked_clips_and_rescales_the_others() {
+        let mut t = tl(); // 120
+        let tr = t.tracks[0].id;
+        let locked = t.place_locked(tr, SourceRef::Beat(0), 0.0, 2.0, Some(120.0)).unwrap();
+        let free = t.place(tr, SourceRef::File(0), 4.0, 4.0).unwrap();
+        let wall = t.place(tr, SourceRef::File(0), 10.0, 1.0).unwrap();
+        t.track_mut(tr).unwrap().clip_mut(free).unwrap().offset = 1.0;
+        t.set_tempo(60.0);
+        let l = t.track(tr).unwrap().clip(locked).unwrap();
+        assert_eq!(l.len, 2.0, "locked: same beats");
+        assert_eq!(l.rate_at(60.0), 0.5, "…played at half speed");
+        let f = t.track(tr).unwrap().clip(free).unwrap();
+        assert_eq!(f.rate_at(60.0), 1.0);
+        // 4 beats of material at 120 is 2 s; at 60 that is 2 beats. It
+        // would have been 2, and the neighbour at 10 is not reached.
+        assert_eq!(f.len, 2.0);
+        assert_eq!(f.offset, 0.5);
+        // Speed up past the neighbour: 4 beats of material at 240 is 8
+        // beats, from 4 that reaches 12, past the wall at 10 -> trimmed.
+        t.set_tempo(240.0);
+        let f = t.track(tr).unwrap().clip(free).unwrap();
+        assert_eq!(f.len, 6.0);
+        assert!(t.track(tr).unwrap().clip(wall).unwrap().start == 10.0);
     }
 
     #[test]

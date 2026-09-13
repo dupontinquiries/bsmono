@@ -292,6 +292,11 @@ impl Take {
         self.windows += 1;
     }
 
+    /// The tempo the conductor had when the take started.
+    pub fn bpm(&self) -> f32 {
+        self.bpm
+    }
+
     /// Seconds recorded so far.
     pub fn secs(&self) -> f32 {
         self.oa.queued() as f32 / self.sr.max(1) as f32

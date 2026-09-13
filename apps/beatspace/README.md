@@ -147,8 +147,14 @@ Keys: space play · delete · ctrl-z/y · ctrl-d duplicate · s split at playhea
 l loop · ctrl-a · arrows nudge · home · 1–5 tools · r record · ctrl-k the
 command palette (every action by name, plus `tempo 128`, `go 9`, `zoom 60`,
 `grid 1/2`). Right-click or long-press for a context menu. `●` records the
-live stream into a take that lands at the playhead. Clips keep their start beat
-when the tempo changes and are not time-stretched. `export wav` renders the
+live stream into a take that lands at the playhead. A clip that knows its
+tempo (a captured beat, a take) is placed "following tempo": it keeps its
+length in beats and its audio is time-stretched (WSOLA, pitch kept) as the
+tempo moves; a clip that does not (an imported file) plays at natural speed
+and its extent in beats follows the tempo. Toggle either way per clip. Fade
+handles sit on each clip's top corners; drag them, or use the sliders. `save`
+writes a self-contained project directory (`project.json` beside the
+library's audio as WAV); `load` brings it back. `export wav` renders the
 whole arrangement. Playback runs through the same audio device as the
 generator, which pauses while the arrangement plays.
 

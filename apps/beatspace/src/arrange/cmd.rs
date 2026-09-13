@@ -21,7 +21,9 @@ pub enum Command {
     /// material's length at the current tempo. `exact` skips the grid — a
     /// recorded take lands where recording started, not on the nearest
     /// beat.
-    Place { track: TrackId, source: SourceRef, start: f64, source_beats: f64, exact: bool },
+    /// `lock` is a tempo the material is locked to (see `Clip::tempo_lock`);
+    /// `source_beats` is then its length at that tempo.
+    Place { track: TrackId, source: SourceRef, start: f64, source_beats: f64, exact: bool, lock: Option<f64> },
     /// Move clips by `delta_beats`, optionally to another track (all
     /// selected clips go to the same track — a cross-track move of a
     /// multi-selection keeps their relative tracks by index).
@@ -36,6 +38,12 @@ pub enum Command {
     Duplicate { clips: Vec<ClipId>, delta_beats: f64 },
     SetClipGain { clip: ClipId, gain: f32 },
     ToggleClipMute { clip: ClipId },
+    /// Lock the clip to a tempo (its audio is time-stretched as the
+    /// timeline tempo moves away from it), or unlock it (its extent in
+    /// beats follows the tempo instead).
+    SetTempoLock { clip: ClipId, bpm: Option<f64> },
+    /// Fade lengths in beats, clamped to the clip.
+    SetClipFades { clip: ClipId, fade_in: f64, fade_out: f64 },
     AddTrack { name: String },
     RemoveTrack { track: TrackId },
     RenameTrack { track: TrackId, name: String },
@@ -59,6 +67,9 @@ impl Command {
             Command::Duplicate { clips, .. } => format!("duplicate {}", clips.len()),
             Command::SetClipGain { gain, .. } => format!("clip gain {gain:.2}"),
             Command::ToggleClipMute { .. } => "mute clip".into(),
+            Command::SetTempoLock { bpm: Some(b), .. } => format!("lock to {b:.0} bpm"),
+            Command::SetTempoLock { bpm: None, .. } => "unlock tempo".into(),
+            Command::SetClipFades { fade_in, fade_out, .. } => format!("fades {fade_in:.2}/{fade_out:.2}"),
             Command::AddTrack { name } => format!("add track {name}"),
             Command::RemoveTrack { .. } => "remove track".into(),
             Command::RenameTrack { name, .. } => format!("rename to {name}"),
@@ -167,12 +178,12 @@ impl Editor {
     /// The command's effect on a timeline, with nothing recorded. Pure.
     fn run(t: &mut Timeline, cmd: &Command) -> Result<Vec<ClipId>, Refused> {
         match cmd {
-            Command::Place { track, source, start, source_beats, exact } => {
+            Command::Place { track, source, start, source_beats, exact, lock } => {
                 if t.track(*track).is_none() {
                     return Err(Refused::NoSuchTrack);
                 }
                 let start = if *exact { *start } else { t.grid.snap(*start) };
-                t.place(*track, *source, start, *source_beats).map(|id| vec![id]).ok_or(Refused::DoesNotFit)
+                t.place_locked(*track, *source, start, *source_beats, *lock).map(|id| vec![id]).ok_or(Refused::DoesNotFit)
             }
             Command::Move { clips, delta_beats, delta_tracks } => {
                 // Resolve every destination first, then commit: a move that
@@ -327,7 +338,46 @@ impl Editor {
                 if !(20.0..=400.0).contains(bpm) {
                     return Err(Refused::Invalid(format!("tempo {bpm} is outside 20–400")));
                 }
-                t.bpm = *bpm;
+                t.set_tempo(*bpm);
+                Ok(vec![])
+            }
+            Command::SetTempoLock { clip, bpm } => {
+                let track = t.find_track_of(*clip).ok_or(Refused::NoSuchClip)?;
+                let tempo = t.bpm;
+                let tr = t.track_mut(track).ok_or(Refused::NoSuchTrack)?;
+                let ix = tr.clips.iter().position(|c| c.id == *clip).ok_or(Refused::NoSuchClip)?;
+                let next_start = tr.clips.get(ix + 1).map(|c| c.start);
+                let c = &mut tr.clips[ix];
+                match (c.tempo_lock, bpm) {
+                    (Some(lock), None) => {
+                        // Unlocking at tempo T from lock L: the material
+                        // now plays at natural speed, so its extent scales
+                        // by T/L. Trimmed to the neighbour if it grows.
+                        let k = tempo / lock;
+                        c.len *= k;
+                        c.offset *= k;
+                        c.fade_in *= k;
+                        c.fade_out *= k;
+                        if let Some(ns) = next_start {
+                            c.len = c.len.min(ns - c.start);
+                        }
+                        c.tempo_lock = None;
+                    }
+                    (_, Some(b)) => {
+                        if !(20.0..=400.0).contains(b) {
+                            return Err(Refused::Invalid(format!("lock {b} is outside 20–400")));
+                        }
+                        c.tempo_lock = Some(*b);
+                    }
+                    (None, None) => {}
+                }
+                Ok(vec![])
+            }
+            Command::SetClipFades { clip, fade_in, fade_out } => {
+                let track = t.find_track_of(*clip).ok_or(Refused::NoSuchClip)?;
+                let c = t.track_mut(track).and_then(|tr| tr.clip_mut(*clip)).ok_or(Refused::NoSuchClip)?;
+                c.fade_in = fade_in.clamp(0.0, c.len);
+                c.fade_out = fade_out.clamp(0.0, c.len);
                 Ok(vec![])
             }
             Command::SetLoop { region } => {
@@ -355,7 +405,7 @@ mod tests {
     #[test]
     fn place_snaps_to_the_grid_and_is_undoable() {
         let (mut e, t0, _) = ed();
-        let r = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 1.3, source_beats: 2.0, exact: false }).unwrap();
+        let r = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 1.3, source_beats: 2.0, exact: false, lock: None }).unwrap();
         assert_eq!(r.created.len(), 1);
         let c = e.timeline.find(r.created[0]).unwrap().1;
         assert_eq!(c.start, 1.0, "snapped to the beat grid");
@@ -371,16 +421,16 @@ mod tests {
     #[test]
     fn an_exact_placement_ignores_the_grid() {
         let (mut e, t0, _) = ed();
-        let r = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 1.3, source_beats: 2.0, exact: true }).unwrap();
+        let r = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 1.3, source_beats: 2.0, exact: true, lock: None }).unwrap();
         assert_eq!(e.timeline.find(r.created[0]).unwrap().1.start, 1.3);
     }
 
     #[test]
     fn a_refused_command_records_nothing() {
         let (mut e, t0, _) = ed();
-        e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 4.0, exact: false }).unwrap();
+        e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 4.0, exact: false, lock: None }).unwrap();
         let depth = e.undo.len();
-        let err = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 1.0, source_beats: 1.0, exact: false }).unwrap_err();
+        let err = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 1.0, source_beats: 1.0, exact: false, lock: None }).unwrap_err();
         assert_eq!(err, Refused::DoesNotFit);
         assert_eq!(e.undo.len(), depth);
         assert_eq!(e.apply(Command::Delete { clips: vec![999] }).unwrap_err(), Refused::NoSuchClip);
@@ -390,9 +440,9 @@ mod tests {
     #[test]
     fn a_move_across_tracks_is_all_or_nothing() {
         let (mut e, t0, t1) = ed();
-        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false }).unwrap().created[0];
-        let b = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 4.0, source_beats: 2.0, exact: false }).unwrap().created[0];
-        let blocker = e.apply(Command::Place { track: t1, source: SourceRef::File(0), start: 5.0, source_beats: 1.0, exact: false }).unwrap().created[0];
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false, lock: None }).unwrap().created[0];
+        let b = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 4.0, source_beats: 2.0, exact: false, lock: None }).unwrap().created[0];
+        let blocker = e.apply(Command::Place { track: t1, source: SourceRef::File(0), start: 5.0, source_beats: 1.0, exact: false, lock: None }).unwrap().created[0];
         // b would land on the blocker: the whole move is refused, a stays.
         assert_eq!(e.apply(Command::Move { clips: vec![a, b], delta_beats: 0.0, delta_tracks: 1 }).unwrap_err(), Refused::DoesNotFit);
         assert_eq!(e.timeline.find_track_of(a), Some(t0));
@@ -413,7 +463,7 @@ mod tests {
     #[test]
     fn split_makes_two_clips_that_continue_the_same_material() {
         let (mut e, t0, _) = ed();
-        let a = e.apply(Command::Place { track: t0, source: SourceRef::File(0), start: 2.0, source_beats: 4.0, exact: false }).unwrap().created[0];
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::File(0), start: 2.0, source_beats: 4.0, exact: false, lock: None }).unwrap().created[0];
         let r = e.apply(Command::Split { clip: a, beat: 3.0 }).unwrap();
         let right = r.created[0];
         let (_, l) = e.timeline.find(a).unwrap();
@@ -433,8 +483,8 @@ mod tests {
     #[test]
     fn trim_keeps_material_offsets_and_respects_neighbours() {
         let (mut e, t0, _) = ed();
-        let a = e.apply(Command::Place { track: t0, source: SourceRef::File(0), start: 0.0, source_beats: 4.0, exact: false }).unwrap().created[0];
-        let _b = e.apply(Command::Place { track: t0, source: SourceRef::File(0), start: 6.0, source_beats: 1.0, exact: false }).unwrap().created[0];
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::File(0), start: 0.0, source_beats: 4.0, exact: false, lock: None }).unwrap().created[0];
+        let _b = e.apply(Command::Place { track: t0, source: SourceRef::File(0), start: 6.0, source_beats: 1.0, exact: false, lock: None }).unwrap().created[0];
         // Head trim: start moves, offset grows, end stays.
         e.apply(Command::Trim { clip: a, start: 1.0, len: 3.0, offset: 1.0 }).unwrap();
         // Tail trim into the neighbour is refused.
@@ -445,7 +495,7 @@ mod tests {
     #[test]
     fn duplicate_places_copies_later_and_reports_them() {
         let (mut e, t0, _) = ed();
-        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false }).unwrap().created[0];
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false, lock: None }).unwrap().created[0];
         let r = e.apply(Command::Duplicate { clips: vec![a], delta_beats: 2.0 }).unwrap();
         assert_eq!(r.created.len(), 1);
         assert_eq!(e.timeline.find(r.created[0]).unwrap().1.start, 2.0);

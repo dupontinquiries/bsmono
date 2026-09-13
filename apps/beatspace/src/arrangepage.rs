@@ -55,6 +55,8 @@ pub struct ArrangeOut {
     pub toggle_record: Option<f64>,
     pub import_file: Option<String>,
     pub export_wav: Option<String>,
+    pub save_project: Option<String>,
+    pub load_project: Option<String>,
     pub status: Option<String>,
 }
 
@@ -73,6 +75,7 @@ pub struct ArrangeView {
     playhead: f64,
     pub import_path: String,
     pub export_path: String,
+    pub project_path: String,
     rename: Option<(u64, String)>,
     /// The command palette: open, its query, the highlighted row.
     palette_open: bool,
@@ -96,6 +99,7 @@ impl Default for ArrangeView {
             playhead: 0.0,
             import_path: String::new(),
             export_path: "arrangement.wav".into(),
+            project_path: "arrangement".into(),
             rename: None,
             palette_open: false,
             palette_query: String::new(),
@@ -107,10 +111,21 @@ impl Default for ArrangeView {
 
 const PEAK_COLS: usize = 96;
 const EDGE_PX: f32 = 7.0;
+/// Height of the strip along a clip's top where the fade handles are.
+const FADE_STRIP_PX: f32 = 12.0;
 
 impl ArrangeView {
     pub fn timeline(&self) -> &Timeline {
         &self.editor.timeline
+    }
+
+    /// Replace the arrangement (a loaded project). Undo history starts
+    /// over; the peaks cache is dropped because source indices changed.
+    pub fn replace(&mut self, timeline: Timeline) {
+        self.editor = Editor::new(timeline);
+        self.tools = Tools::default();
+        self.peaks.clear();
+        self.playhead = 0.0;
     }
 
     fn x_of(&self, beat: f64, area: Rect) -> f32 {
@@ -136,12 +151,19 @@ impl ArrangeView {
         }
         let ix = ix as usize;
         let edge_beats = (EDGE_PX / self.px_per_beat) as f64;
+        // The fade handles live on the top strip of the clip, at
+        // start + fade_in and end - fade_out.
+        let in_top_strip = p.y - self.track_top(ix, area) < FADE_STRIP_PX;
         let hit = t.tracks[ix]
             .clips
             .iter()
             .find(|c| beat >= c.start - edge_beats && beat < c.end() + edge_beats)
             .map(|c| {
-                let edge = if beat < c.start + edge_beats {
+                let edge = if in_top_strip && (beat - (c.start + c.fade_in)).abs() <= edge_beats && beat <= c.start + c.len * 0.5 {
+                    Edge::FadeIn
+                } else if in_top_strip && (beat - (c.end() - c.fade_out)).abs() <= edge_beats {
+                    Edge::FadeOut
+                } else if beat < c.start + edge_beats {
                     Edge::Left
                 } else if beat > c.end() - edge_beats {
                     Edge::Right
@@ -373,6 +395,7 @@ impl ArrangeView {
             let icon = match (self.tools.tool, at.hit) {
                 (_, Hit::Ruler) => egui::CursorIcon::ResizeHorizontal,
                 (Tool::Select, Hit::Clip { edge: Edge::Left, .. }) | (Tool::Select, Hit::Clip { edge: Edge::Right, .. }) => egui::CursorIcon::ResizeHorizontal,
+                (Tool::Select, Hit::Clip { edge: Edge::FadeIn, .. }) | (Tool::Select, Hit::Clip { edge: Edge::FadeOut, .. }) => egui::CursorIcon::ResizeNeSw,
                 (Tool::Select, Hit::Clip { .. }) => egui::CursorIcon::Grab,
                 (Tool::Split, Hit::Clip { .. }) => egui::CursorIcon::VerticalText,
                 (Tool::Erase, _) => egui::CursorIcon::NotAllowed,
@@ -431,7 +454,7 @@ impl ArrangeView {
                         if let (Some(b), Some(ix)) = (self.tools.brush, at.track) {
                             if ui.button(format!("place {} here", io.library.name(b.source))).clicked() {
                                 let track = self.editor.timeline.tracks[ix].id;
-                                menu_fx.push(Effect::Command(Command::Place { track, source: b.source, start: at.beat, source_beats: b.beats, exact: false }));
+                                menu_fx.push(Effect::Command(Command::Place { track, source: b.source, start: at.beat, source_beats: b.beats, exact: false, lock: None }));
                                 ui.close();
                             }
                         }
@@ -549,11 +572,16 @@ impl ArrangeView {
             let clip_painter = painter.with_clip_rect(lane_row);
             for clip in &track.clips {
                 let (mut start, mut len) = (clip.start, clip.len);
+                let (mut fade_in, mut fade_out) = (clip.fade_in, clip.fade_out);
                 let mut ghost = false;
                 match &preview {
                     Preview::Trim { clip: id, start: s, len: l, .. } if *id == clip.id => {
                         start = *s;
                         len = *l;
+                    }
+                    Preview::Fade { clip: id, fade_in: fi, fade_out: fo } if *id == clip.id => {
+                        fade_in = *fi;
+                        fade_out = *fo;
                     }
                     Preview::Moving { clips, .. } if clips.contains(&clip.id) => ghost = true,
                     _ => {}
@@ -585,7 +613,33 @@ impl ArrangeView {
                         clip_painter.line_segment([egui::pos2(x, r.center().y - hh), egui::pos2(x, r.center().y + hh)], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 70)));
                     }
                 }
-                clip_painter.text(r.left_top() + Vec2::new(5.0, 3.0), egui::Align2::LEFT_TOP, io.library.name(clip.source), egui::FontId::proportional(11.0), Color32::from_gray(235));
+                // Fades: a line from the corner down to the handle, and a
+                // dim wedge under it. Handles are small squares on the top
+                // edge; the select tool grabs them.
+                let line = Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 255, 255, 140));
+                let dim = Color32::from_rgba_unmultiplied(0, 0, 0, 70);
+                if fade_in > 0.0 {
+                    let hx = self.x_of(start + fade_in, area).min(r.right());
+                    clip_painter.line_segment([egui::pos2(r.left(), r.bottom()), egui::pos2(hx, r.top())], line);
+                    clip_painter.add(egui::Shape::convex_polygon(vec![r.left_top(), egui::pos2(hx, r.top()), r.left_bottom()], dim, Stroke::NONE));
+                    clip_painter.rect_filled(Rect::from_center_size(egui::pos2(hx, r.top() + 4.0), Vec2::splat(7.0)), 1.0, Color32::from_gray(240));
+                } else {
+                    clip_painter.rect_filled(Rect::from_center_size(egui::pos2(r.left() + 4.0, r.top() + 4.0), Vec2::splat(5.0)), 1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 90));
+                }
+                if fade_out > 0.0 {
+                    let hx = self.x_of(start + len - fade_out, area).max(r.left());
+                    clip_painter.line_segment([egui::pos2(hx, r.top()), egui::pos2(r.right(), r.bottom())], line);
+                    clip_painter.add(egui::Shape::convex_polygon(vec![egui::pos2(hx, r.top()), r.right_top(), r.right_bottom()], dim, Stroke::NONE));
+                    clip_painter.rect_filled(Rect::from_center_size(egui::pos2(hx, r.top() + 4.0), Vec2::splat(7.0)), 1.0, Color32::from_gray(240));
+                } else {
+                    clip_painter.rect_filled(Rect::from_center_size(egui::pos2(r.right() - 4.0, r.top() + 4.0), Vec2::splat(5.0)), 1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 90));
+                }
+                let label = match clip.tempo_lock {
+                    Some(_) if (clip.rate_at(t.bpm) - 1.0).abs() > 1e-6 => format!("{} ⟲{:.2}x", io.library.name(clip.source), clip.rate_at(t.bpm)),
+                    Some(_) => format!("{} ⟲", io.library.name(clip.source)),
+                    None => io.library.name(clip.source).to_string(),
+                };
+                clip_painter.text(r.left_top() + Vec2::new(10.0, 3.0), egui::Align2::LEFT_TOP, label, egui::FontId::proportional(11.0), Color32::from_gray(235));
                 let stroke = if selected { Stroke::new(2.0, Color32::from_rgb(255, 220, 120)) } else { Stroke::new(1.0, Color32::from_gray(15)) };
                 clip_painter.rect_stroke(r, 4.0, stroke, StrokeKind::Inside);
             }
@@ -683,6 +737,9 @@ impl ArrangeView {
         if take(ui, cmd, Key::D) {
             fx.extend(Shortcut::Duplicate.effects(&self.editor, self.playhead, &mut self.tools));
         }
+        if take(ui, cmd, Key::S) {
+            out.save_project = Some(self.project_path.trim().to_string());
+        }
         if take(ui, cmd, Key::A) {
             fx.extend(Shortcut::SelectAll.effects(&self.editor, self.playhead, &mut self.tools));
         }
@@ -754,6 +811,8 @@ impl ArrangeView {
                 }
             }
             Action::Export => out.export_wav = Some(self.export_path.trim().to_string()),
+            Action::SaveProject => out.save_project = Some(self.project_path.trim().to_string()),
+            Action::LoadProject => out.load_project = Some(self.project_path.trim().to_string()),
             Action::Play => out.toggle_play = true,
             Action::SeekStart => fx.push(Effect::Seek(0.0)),
             Action::ZoomIn => self.px_per_beat = (self.px_per_beat * 1.25).min(400.0),
@@ -887,9 +946,18 @@ impl ArrangeView {
         }
         ui.label(egui::RichText::new("files").small().weak());
         list(ui, &io.library.files, SourceRef::File, t_files);
+        // A source that knows its tempo is placed locked to it: its beat
+        // count is then fixed and the audio follows the timeline tempo.
+        let lock_and_beats = |r: SourceRef| -> Option<(Option<f64>, f64)> {
+            let s = io.library.get(r)?;
+            match s.bpm {
+                Some(b) if b > 0.0 => Some((Some(b as f64), s.secs() * b as f64 / 60.0)),
+                _ => Some((None, self.editor.timeline.secs_to_beats(s.secs()))),
+            }
+        };
         if let Some(r) = arm {
-            if let Some(beats) = io.library.beats_of(r, &self.editor.timeline) {
-                self.tools.brush = Some(Brush { source: r, beats });
+            if let Some((lock, beats)) = lock_and_beats(r) {
+                self.tools.brush = Some(Brush { source: r, beats, lock });
                 if self.tools.tool == Tool::Select {
                     self.tools.set_tool(Tool::Draw);
                 }
@@ -897,8 +965,8 @@ impl ArrangeView {
             }
         }
         if let Some((r, track)) = drop {
-            if let Some(beats) = io.library.beats_of(r, &self.editor.timeline) {
-                let fx = vec![Effect::Command(Command::Place { track, source: r, start: self.playhead, source_beats: beats, exact: false })];
+            if let Some((lock, beats)) = lock_and_beats(r) {
+                let fx = vec![Effect::Command(Command::Place { track, source: r, start: self.playhead, source_beats: beats, exact: false, lock })];
                 self.apply_effects(fx, out);
             }
         }
@@ -914,18 +982,61 @@ impl ArrangeView {
                 out.export_wav = Some(self.export_path.trim().to_string());
             }
         });
+        ui.separator();
+        ui.label(egui::RichText::new("project").small());
+        ui.add(egui::TextEdit::singleline(&mut self.project_path).id_salt("arr-project").hint_text("directory").desired_width(f32::INFINITY))
+            .on_hover_text("a directory: project.json beside the library's audio as WAV, self-contained");
+        ui.horizontal(|ui| {
+            if ui.button("save").on_hover_text("ctrl-s").clicked() {
+                out.save_project = Some(self.project_path.trim().to_string());
+            }
+            if ui.button("load").on_hover_text("replaces the arrangement and the library; undo history starts over").clicked() {
+                out.load_project = Some(self.project_path.trim().to_string());
+            }
+        });
         if let Some(sel) = self.editor.selection.iter().next().copied() {
             if let Some((_, c)) = self.editor.timeline.find(sel) {
+                let c = c.clone();
                 ui.separator();
                 ui.label(egui::RichText::new(format!("clip {} · {:.2}–{:.2}", io.library.name(c.source), c.start, c.end())).small());
                 let mut gain = c.gain;
-                let muted = c.muted;
                 let r = ui.add(egui::Slider::new(&mut gain, 0.0..=2.0).text("gain"));
                 if r.drag_stopped() || (r.changed() && !r.dragged()) {
                     self.apply_effects(vec![Effect::Command(Command::SetClipGain { clip: sel, gain })], out);
                 }
-                if ui.selectable_label(muted, "mute clip").clicked() {
+                if ui.selectable_label(c.muted, "mute clip").clicked() {
                     self.apply_effects(vec![Effect::Command(Command::ToggleClipMute { clip: sel })], out);
+                }
+                // Tempo lock: on, the clip keeps its beats and the audio is
+                // time-stretched as the tempo moves; off, the audio plays
+                // at natural speed and the extent follows the tempo.
+                let tempo = self.editor.timeline.bpm;
+                let mut locked = c.tempo_lock.is_some();
+                let src_bpm = io.library.get(c.source).and_then(|s| s.bpm).map(|b| b as f64);
+                if ui.checkbox(&mut locked, "follow tempo (time-stretch)")
+                    .on_hover_text("locks the clip's length in beats; the audio is stretched, pitch kept, by tempo / lock")
+                    .changed()
+                {
+                    let bpm = if locked { Some(src_bpm.unwrap_or(tempo)) } else { None };
+                    self.apply_effects(vec![Effect::Command(Command::SetTempoLock { clip: sel, bpm })], out);
+                }
+                if let Some(lock) = c.tempo_lock {
+                    let mut l = lock;
+                    let r = ui.add(egui::DragValue::new(&mut l).range(20.0..=400.0).speed(0.5).prefix("locked to ").suffix(" bpm"));
+                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                        if (l - lock).abs() > 1e-9 {
+                            self.apply_effects(vec![Effect::Command(Command::SetTempoLock { clip: sel, bpm: Some(l) })], out);
+                        }
+                    }
+                    ui.label(egui::RichText::new(format!("playing at {:.2}x", c.rate_at(tempo))).small().weak());
+                }
+                let (mut fi, mut fo) = (c.fade_in, c.fade_out);
+                let half = (c.len * 0.5).max(0.0);
+                let r1 = ui.add(egui::Slider::new(&mut fi, 0.0..=half).text("fade in (beats)"));
+                let r2 = ui.add(egui::Slider::new(&mut fo, 0.0..=half).text("fade out (beats)"));
+                let done = |r: &egui::Response| r.drag_stopped() || (r.changed() && !r.dragged());
+                if (done(&r1) || done(&r2)) && ((fi - c.fade_in).abs() > 1e-9 || (fo - c.fade_out).abs() > 1e-9) {
+                    self.apply_effects(vec![Effect::Command(Command::SetClipFades { clip: sel, fade_in: fi, fade_out: fo })], out);
                 }
             }
         }
