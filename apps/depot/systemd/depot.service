@@ -1,0 +1,64 @@
+[Unit]
+Description=depot — offline mirror of cargo crates, Fedora RPMs, a Nix cache and Rust toolchains
+Documentation=http://localhost:8000/manual
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# depot reads $STATE_DIRECTORY, so no --root is needed here.
+ExecStart=/usr/local/bin/depot serve
+Restart=on-failure
+RestartSec=2
+
+# DynamicUser: systemd allocates a UID for the lifetime of the service;
+# StateDirectory: creates /var/lib/depot owned by it and exports the path as
+# $STATE_DIRECTORY. No user to add, no chown, nowhere else it can write.
+DynamicUser=yes
+StateDirectory=depot
+# Writes to the root need the CLI as that user; `depot init` on first start
+# so the box serves immediately (idempotent: skips what exists).
+ExecStartPre=/usr/local/bin/depot init
+
+# Port 8000 needs no capability; below 1024 would need
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+# and nothing else.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Ceilings, not reservations. Hashing a 2 GB pack holds ~64 KiB, not 2 GB;
+# the memory limit is for a surprise, not for the workload.
+MemoryHigh=256M
+MemoryMax=512M
+CPUWeight=50
+
+# Hardening. A file server needs its state directory and the network.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+# stderr is the journal: `journalctl -u depot -f`. One line per request.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

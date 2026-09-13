@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<filelists xmlns="http://linux.duke.edu/metadata/filelists" packages="3">
+<package pkgid="3804a71bfbf0982e9d42d3952fc8b3d9258c4f405c0dae5f51b0c9047a055b20" name="foo" arch="noarch">
+  <version epoch="0" ver="1.0" rel="1"/>
+</package>
+<package pkgid="7c4f932d7e66cfa3fb2ae756f916527e8ddf48ef8e6e428ac80a3a298a2ab7ab" name="hello" arch="i386">
+  <version epoch="0" ver="1.0" rel="1"/>
+  <file>/usr/local/bin/hello</file>
+  <file type="dir">/usr/share/doc/hello-1.0</file>
+  <file>/usr/share/doc/hello-1.0/FAQ</file>
+</package>
+<package pkgid="e05a5191e214b1f05ae2448ebe493e55c6313ab68eaf040b83baa80e25f15d54" name="hello" arch="x86_64">
+  <version epoch="0" ver="2.0" rel="1"/>
+  <file>/usr/bin/hello</file>
+  <file type="dir">/usr/share/doc/hello-2.0</file>
+  <file>/usr/share/doc/hello-2.0/COPYING</file>
+  <file>/usr/share/doc/hello-2.0/FAQ</file>
+  <file>/usr/share/doc/hello-2.0/README</file>
+</package>
+</filelists>

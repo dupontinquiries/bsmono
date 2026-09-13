@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<filelists xmlns="http://linux.duke.edu/metadata/filelists" packages="1">
+<package pkgid="9199a13d65f7a3c2df569ecf7639d500d58f349745adc1c7424419a844ce9dfe" name="edge" arch="noarch">
+  <version epoch="3" ver="1.2.3" rel="4.fc42"/>
+  <file>/etc/edge/edge.conf</file>
+  <file>/usr/bin/edge-tool</file>
+  <file type="dir">/usr/share/edge</file>
+  <file>/usr/share/edge/data.txt</file>
+  <file>/usr/share/edge/link.txt</file>
+  <file type="ghost">/var/cache/edge/ghost.db</file>
+</package>
+</filelists>

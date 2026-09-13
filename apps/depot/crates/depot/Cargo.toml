@@ -1,0 +1,25 @@
+[package]
+name = "depot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The offline package mirror, one binary: `depot serve` is the web server + UI, everything else is the CLI (init, ingest, pack, unpack, client-config, keygen, have, status)."
+
+[[bin]]
+name = "depot"
+path = "src/main.rs"
+
+[dependencies]
+depot-core = { path = "../depot-core" }
+depot-httpd = { path = "../depot-httpd" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+cli-kit = { path = "../../../../shared/cli-kit" }
+net-kit = { path = "../../../../shared/net-kit" }
+# niftyplot diagrams in tutorials/manual: parse + layout + the SVG backend
+nifty-core = { path = "../../../../shared/nifty-core" }
+# in-browser terminal: a real shell behind a pty (same crate voiceterm uses)
+portable-pty = "0.8"
+# Only for signal(2): std has no signal API. Bindings, not C code.
+libc = "0.2"

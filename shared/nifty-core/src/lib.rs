@@ -4,3 +4,4 @@
 pub mod graph_layout;
 pub mod mermaid;
 pub mod niftyplot;
+pub mod svg;
