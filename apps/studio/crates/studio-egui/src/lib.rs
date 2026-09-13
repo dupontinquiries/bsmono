@@ -289,6 +289,29 @@ pub struct TimelineResponse {
     /// every frame OF the drag, not just at its end — scrubbing is only
     /// useful if it follows the finger.
     pub sought: Option<Ticks>,
+    /// A rack pattern released over the tracks: (pattern index, snapped time, audio track).
+    /// The library's rows are the drag source (`PatternDrag`); this is the drop.
+    pub pattern_dropped: Option<(usize, Ticks, TrackId)>,
+}
+
+/// The payload a library pattern row carries while dragged. `len` is the pattern's length
+/// at the rack tempo, so the ghost over the timeline is the size the clip will be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PatternDrag { pub index: usize, pub len: Ticks }
+
+/// Where a pattern dropped at `at` lands: the time under the pointer, snapped to the same
+/// edges a moved clip snaps to and clamped at zero; the track under the pointer if it is an
+/// audio track, else the first audio track (a pattern is sound — it cannot land on a video
+/// row, the same refusal `move_target` makes). None when the project has no audio track.
+pub fn pattern_drop_target(project: &Project, view: &View, at: Pos2, origin: Pos2, playhead: Ticks) -> Option<(Ticks, TrackId)> {
+    let rows = track_rows(project);
+    let under = view.row_at(at.y, origin.y, rows.len()).map(|r| rows[r])
+        .filter(|t| project.tracks.iter().any(|tr| tr.id == *t && tr.kind == TrackKind::Audio));
+    let track = under.or_else(|| project.tracks.iter().find(|t| t.kind == TrackKind::Audio).map(|t| t.id))?;
+    let raw = view.x_to_time(at.x, origin.x);
+    let tolerance = Ticks((TICKS_PER_SECOND as f32 * 8.0 / view.px_per_sec) as i64);
+    let t = snap(project, Ticks(raw.0.max(0)), playhead, tolerance, None);
+    Some((Ticks(t.0.max(0)), track))
 }
 
 pub fn hit_test(project: &Project, view: &View, at: Pos2, origin: Pos2) -> Option<ClipId> {
@@ -553,6 +576,26 @@ pub fn timeline(
 
     // ── drag a clip: move from the body, trim from an edge ─────────────────
     let mut out = TimelineResponse::default();
+    // A pattern from the library over the tracks: ghost while hovering, place on release.
+    if let Some(drag) = resp.dnd_hover_payload::<PatternDrag>() {
+        if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
+            if let Some((t, track)) = pattern_drop_target(&doc.project, view, p, origin, playhead) {
+                let rows = track_rows(&doc.project);
+                if let Some(row) = rows.iter().position(|r| *r == track) {
+                    let ghost = view.clip_rect(t, drag.len, row, origin).intersect(rect);
+                    painter.rect_filled(ghost, 3.0, colors.accent.gamma_multiply(0.35));
+                    painter.rect_stroke(ghost, 3.0, Stroke::new(1.0, colors.accent), egui::StrokeKind::Inside);
+                }
+            }
+        }
+    }
+    if let Some(drag) = resp.dnd_release_payload::<PatternDrag>() {
+        if let Some(p) = ui.input(|i| i.pointer.hover_pos()).or_else(|| resp.interact_pointer_pos()) {
+            if let Some((t, track)) = pattern_drop_target(&doc.project, view, p, origin, playhead) {
+                out.pattern_dropped = Some((drag.index, t, track));
+            }
+        }
+    }
     if resp.drag_started() {
         if let Some(p) = resp.interact_pointer_pos() {
             view.drag = grab(&doc.project, view, p, origin, trim_side);
@@ -1312,3 +1355,45 @@ mod grab_and_trim_tests {
     }
 }
 
+#[cfg(test)]
+mod pattern_drop_tests {
+    use super::*;
+
+    fn track(id: u64, kind: TrackKind) -> studio_core::Track {
+        studio_core::Track { id: TrackId(id), kind, name: format!("t{id}"), muted: false, locked: false, gain: 1.0, route: None }
+    }
+    fn project() -> Project {
+        let mut p = Project::default();
+        for (i, (id, kind)) in [(1u64, TrackKind::Video), (2, TrackKind::Audio), (3, TrackKind::Audio)].into_iter().enumerate() {
+            p.apply(&studio_core::Op::AddTrack { track: track(id, kind), at: i }).unwrap();
+        }
+        p
+    }
+
+    #[test]
+    fn a_drop_on_a_video_row_goes_to_the_first_audio_track_and_an_audio_row_keeps_its_track() {
+        let p = project();
+        let view = View::default();
+        let origin = Pos2::new(0.0, 0.0);
+        let x = origin.x + view.gutter + view.px_per_sec * 2.0; // two seconds in
+        let video_row_y = origin.y + RULER_H + 0.5 * view.track_h;
+        let (t, track) = pattern_drop_target(&p, &view, Pos2::new(x, video_row_y), origin, Ticks::ZERO).unwrap();
+        assert_eq!(track, TrackId(2), "video row → first audio track");
+        assert!((t.0 - 2 * TICKS_PER_SECOND).abs() < TICKS_PER_SECOND / 100, "{t:?}");
+        let third_row_y = origin.y + RULER_H + 2.5 * view.track_h;
+        let (_, track) = pattern_drop_target(&p, &view, Pos2::new(x, third_row_y), origin, Ticks::ZERO).unwrap();
+        assert_eq!(track, TrackId(3));
+    }
+
+    #[test]
+    fn a_drop_left_of_zero_clamps_and_a_project_without_audio_refuses() {
+        let p = project();
+        let view = View::default();
+        let origin = Pos2::new(0.0, 0.0);
+        let (t, _) = pattern_drop_target(&p, &view, Pos2::new(origin.x - 500.0, origin.y + RULER_H + 1.0), origin, Ticks::ZERO).unwrap();
+        assert_eq!(t, Ticks::ZERO);
+        let mut only_video = Project::default();
+        only_video.apply(&studio_core::Op::AddTrack { track: track(1, TrackKind::Video), at: 0 }).unwrap();
+        assert!(pattern_drop_target(&only_video, &view, Pos2::new(50.0, 50.0), origin, Ticks::ZERO).is_none());
+    }
+}
