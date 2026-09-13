@@ -54,6 +54,8 @@ pub mod bucket;
 pub mod cache_policy;
 pub mod decode;
 pub mod feel;
+#[cfg(feature = "gpu-playback")]
+pub mod gl_playback;
 pub mod probe;
 pub mod profile;
 pub mod source;
