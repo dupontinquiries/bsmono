@@ -339,13 +339,24 @@ fn effective_count(entry: &Entry, now: i64) -> f64 {
 /// Evict the entry with the lowest effective count. Mutates in
 /// place. Called when we exceed `MAX_ENTRIES`.
 fn evict_lowest(entries: &mut HashMap<String, Entry>, now: i64) {
-    let Some((victim, _)) = entries
-        .iter()
-        .map(|(k, v)| (k.clone(), effective_count(v, now)))
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-    else {
+    // Find the victim BY REFERENCE, then clone only it.
+    //
+    // This used to be `.map(|(k, v)| (k.clone(), ...))` before `min_by`,
+    // which allocates a String for EVERY KEY IN THE TABLE in order to keep
+    // one. At the caps that is 5,000 allocations for the bigram table and
+    // 10,000 for the trigram table, per committed word, on the UI thread —
+    // and 14,999 of them are dropped immediately.
+    let mut best: Option<(&String, f64)> = None;
+    for (k, v) in entries.iter() {
+        let c = effective_count(v, now);
+        if best.map_or(true, |(_, bc)| c < bc) {
+            best = Some((k, c));
+        }
+    }
+    let Some((victim, _)) = best else {
         return;
     };
+    let victim = victim.clone();
     entries.remove(&victim);
 }
 

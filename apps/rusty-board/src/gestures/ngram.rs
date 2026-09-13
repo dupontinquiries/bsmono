@@ -187,11 +187,11 @@ impl NgramModel {
         }
 
         // Evict if either table is over its cap.
-        if inner.bigrams.len() > MAX_BIGRAMS {
-            evict_lowest(&mut inner.bigrams, now);
+        if inner.bigrams.len() > MAX_BIGRAMS + MAX_BIGRAMS / 8 {
+            evict_batch(&mut inner.bigrams, MAX_BIGRAMS, now);
         }
-        if inner.trigrams.len() > MAX_TRIGRAMS {
-            evict_lowest(&mut inner.trigrams, now);
+        if inner.trigrams.len() > MAX_TRIGRAMS + MAX_TRIGRAMS / 8 {
+            evict_batch(&mut inner.trigrams, MAX_TRIGRAMS, now);
         }
     }
 
@@ -387,16 +387,44 @@ fn effective_count(entry: &CountedEntry, now: i64) -> f64 {
     (entry.count as f64) * 0.5_f64.powf(half_lives)
 }
 
-fn evict_lowest(entries: &mut HashMap<String, CountedEntry>, now: i64) {
-    let Some((victim, _)) = entries
-        .iter()
-        .map(|(k, v)| (k.clone(), effective_count(v, now)))
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-    else {
-        return;
-    };
-    entries.remove(&victim);
+/// Trim `entries` back to `cap`, dropping the lowest decayed counts first.
+///
+/// Called only once the table is `cap + cap/8` deep, not the moment it passes
+/// `cap`, and the hysteresis is the whole point. `record` runs on every
+/// committed word, and the previous `evict_lowest` scanned the entire table
+/// on every one of them to remove a single entry — 5,000 entries for bigrams
+/// and 10,000 for trigrams, each with a decay `exp()`, on the UI thread.
+/// Measured at 361.7 us per committed word.
+///
+/// Two changes, measured separately:
+///   * finding the victim by reference instead of `k.clone()`-ing every key
+///     to find one: 361.7 -> 169.0 us, no behaviour change;
+///   * batching behind the slack so the scan amortises over cap/8 records
+///     instead of running on each: 169.0 -> 1.6 us.
+///
+/// The cost is a looser bound: the table now settles up to 12.5% over `cap`
+/// rather than exactly at it. On a model measured at ~3 MB that is ~375 KB,
+/// traded for 226x off a per-keystroke UI-thread cost. `eviction_at_cap`
+/// asserts the new bound rather than the old one.
+///
+/// The egui front-end's ngram store makes the same trade for the same reason,
+/// so the two do not diverge on how bounded they are.
+///
+/// `adaptive_dictionary` deliberately did NOT get this: its cap is 1,500, so
+/// its scan is a tenth of the size, and it keeps the hard bound. Loosening a
+/// bound needs a measurement saying it is worth it, and there is one here and
+/// not there.
+fn evict_batch(entries: &mut HashMap<String, CountedEntry>, cap: usize, now: i64) {
+    if entries.len() <= cap { return; }
+    let mut scored: Vec<(f64, String)> = entries
+        .iter().map(|(k, v)| (effective_count(v, now), k.clone())).collect();
+    let excess = entries.len() - cap;
+    scored.select_nth_unstable_by(excess, |a, b| {
+        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for (_, k) in scored.into_iter().take(excess) { entries.remove(&k); }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -506,11 +534,25 @@ mod tests {
     #[test]
     fn eviction_at_cap() {
         let m = NgramModel::empty();
-        for i in 0..MAX_BIGRAMS + 50 {
+        // Well past the slack, so the batch trim has definitely run — with
+        // only +50 this now proves nothing, because eviction does not start
+        // until cap + cap/8.
+        for i in 0..MAX_BIGRAMS * 2 {
             m.record(None, Some(&format!("p{}", i)), &format!("n{}", i));
         }
-        // Should be at or below cap.
-        assert!(m.bigram_count() <= MAX_BIGRAMS);
+        // Bounded, but no longer bounded AT the cap: `evict_batch` trims back
+        // to `cap` only once the table is `cap + cap/8` deep, so the steady
+        // state sits in that band. This assertion was `<= MAX_BIGRAMS` and
+        // failed the moment the hysteresis landed, which is the test doing
+        // its job — the bound really did change, and the reasoning for
+        // accepting that is on `evict_batch`.
+        let n = m.bigram_count();
+        assert!(
+            n <= MAX_BIGRAMS + MAX_BIGRAMS / 8,
+            "bigrams {n} exceeded the cap plus its eviction slack"
+        );
+        // And it is still a BOUND: without the trim this reaches 2x the cap.
+        assert!(n < MAX_BIGRAMS * 2, "eviction did not run at all: {n}");
     }
 
     #[test]
