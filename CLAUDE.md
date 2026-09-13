@@ -297,6 +297,7 @@ python3 maintenance/tools/eframe_backend_check.py . # eframe backends chosen, no
 python3 maintenance/tools/voiceprint_parity_check.py . # voiceterm's fingerprint/compute_mfcc vs shared/voiceprint-kit's copy
 python3 maintenance/tools/board_gestures_parity_check.py . # rusty-board's GTK swipe recognizer vs crates/board-gestures' copy
 python3 maintenance/tools/cfg_feature_check.py .   # cfg(feature="x") where no manifest declares x
+python3 maintenance/tools/aperture_cmdstrip_check.py . # aperture command-strip pins vs the palette labels they resolve against
 python3 maintenance/tools/font_install_check.py . # every egui app reaches uikit-egui's fonts::install, or its symbol glyphs are boxes
 ```
 
