@@ -203,60 +203,107 @@ impl NgramModel {
     ///   1. Trigram `(prev_prev, prev, word)` if available
     ///   2. Bigram `(prev, word)` if no trigram
     ///   3. 0.0 if no n-gram data
+    /// Score one candidate. Thin wrapper over [`Self::score_many`] so there
+    /// is exactly ONE implementation of the rule.
     pub fn score(
         &self,
         prev_prev: Option<&str>,
         prev: Option<&str>,
         word: &str,
     ) -> f64 {
-        let word = word.to_lowercase();
-        let prev = prev.map(|s| s.to_lowercase());
-        let prev_prev = prev_prev.map(|s| s.to_lowercase());
+        self.score_many(prev_prev, prev, std::slice::from_ref(&word))
+            .pop()
+            .unwrap_or(0.0)
+    }
+
+    /// Score every candidate for one swipe, in the order given.
+    ///
+    /// WHY THIS EXISTS
+    ///
+    /// The normalising denominator — the summed effective count of every
+    /// n-gram sharing the context prefix — depends ONLY on `prev_prev` and
+    /// `prev`, and `ai_swipe.rs` calls the scorer in a loop over candidates
+    /// with both held constant. So `score()` was walking the whole trigram
+    /// map (`iter().filter(starts_with).map(effective_count).sum()`, up to
+    /// MAX_TRIGRAMS = 10_000 entries, each with a decay `exp()`) once PER
+    /// CANDIDATE to recompute a number that could not have changed.
+    ///
+    /// Hoisting it makes that one walk per swipe instead of one per
+    /// candidate. No behaviour change: the same denominator, computed in the
+    /// same way, just not five times over.
+    ///
+    /// This is the same problem the egui front-end's `ngram.rs` solved with
+    /// persistent `bi_prefix` / `tri_prefix` maps — and that port paid for it
+    /// by losing the hard cap this side still has (see the eviction note on
+    /// `evict_lowest`). Hoisting per swipe gets most of the win without
+    /// introducing a second structure to keep in step with eviction.
+    pub fn score_many(
+        &self,
+        prev_prev: Option<&str>,
+        prev: Option<&str>,
+        words: &[&str],
+    ) -> Vec<f64> {
         let inner = self.inner.read();
         let now = now_secs();
+        let prev = prev.map(|s| s.to_lowercase());
+        let prev_prev = prev_prev.map(|s| s.to_lowercase());
 
-        // Try trigram first.
-        if let (Some(pp), Some(p)) = (&prev_prev, &prev) {
-            let key = trigram_key(pp, p, &word);
-            if let Some(entry) = inner.trigrams.get(&key) {
-                let eff = effective_count(entry, now);
-                // Normalize: total trigrams starting with (pp, p).
+        // Both denominators, computed once for the whole candidate list.
+        let tri_total = match (&prev_prev, &prev) {
+            (Some(pp), Some(p)) => {
                 let prefix = format!("{}\x1f{}\x1f", pp, p);
-                let total: f64 = inner
+                inner
                     .trigrams
                     .iter()
                     .filter(|(k, _)| k.starts_with(&prefix))
                     .map(|(_, e)| effective_count(e, now))
-                    .sum();
-                if total > 0.0 {
-                    let p_score = eff / total;
-                    return (MAX_BOOST * p_score).min(MAX_BOOST);
-                }
+                    .sum::<f64>()
             }
-        }
-
-        // Backoff: bigram.
-        if let Some(p) = &prev {
-            let key = bigram_key(p, &word);
-            if let Some(entry) = inner.bigrams.get(&key) {
-                let eff = effective_count(entry, now);
+            _ => 0.0,
+        };
+        let bi_total = match &prev {
+            Some(p) => {
                 let prefix = format!("{}\x1f", p);
-                let total: f64 = inner
+                inner
                     .bigrams
                     .iter()
                     .filter(|(k, _)| k.starts_with(&prefix))
                     .map(|(_, e)| effective_count(e, now))
-                    .sum();
-                if total > 0.0 {
-                    let p_score = eff / total;
-                    // Bigram backoff weights less than trigram by a
-                    // small factor (less context → less confidence).
-                    return (MAX_BOOST * p_score * 0.75).min(MAX_BOOST);
-                }
+                    .sum::<f64>()
             }
-        }
+            None => 0.0,
+        };
 
-        0.0
+        words
+            .iter()
+            .map(|w| {
+                let word = w.to_lowercase();
+
+                // Try trigram first.
+                if let (Some(pp), Some(p)) = (&prev_prev, &prev) {
+                    if tri_total > 0.0 {
+                        if let Some(entry) = inner.trigrams.get(&trigram_key(pp, p, &word)) {
+                            let p_score = effective_count(entry, now) / tri_total;
+                            return (MAX_BOOST * p_score).min(MAX_BOOST);
+                        }
+                    }
+                }
+
+                // Backoff: bigram.
+                if let Some(p) = &prev {
+                    if bi_total > 0.0 {
+                        if let Some(entry) = inner.bigrams.get(&bigram_key(p, &word)) {
+                            let p_score = effective_count(entry, now) / bi_total;
+                            // Bigram backoff weights less than trigram by a
+                            // small factor (less context → less confidence).
+                            return (MAX_BOOST * p_score * 0.75).min(MAX_BOOST);
+                        }
+                    }
+                }
+
+                0.0
+            })
+            .collect()
     }
 
     /// Flush to disk if dirty.

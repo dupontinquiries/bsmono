@@ -157,8 +157,20 @@ pub fn apply_to_candidates(candidates: &mut Vec<WordCandidate>) {
         if let Some(d) = dict {
             c.score -= d.boost(&c.word);
         }
-        if let Some(n) = ngram {
-            c.score -= n.score(prev_prev_str, prev_str, &c.word);
+    }
+    if let Some(n) = ngram {
+        // One call for the whole list, not one per candidate: the
+        // normalising denominator depends only on prev/prev_prev, which are
+        // fixed for this swipe, and computing it walks the entire trigram
+        // map. See `NgramModel::score_many`.
+        // Owned clones rather than `&str` borrows: the borrow of
+        // `candidates` has to END before the mutable pass below, and
+        // `score_many` needs the whole list up front by design.
+        let words: Vec<String> = candidates.iter().map(|c| c.word.clone()).collect();
+        let refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+        let bonuses = n.score_many(prev_prev_str, prev_str, &refs);
+        for (c, bonus) in candidates.iter_mut().zip(bonuses) {
+            c.score -= bonus;
         }
     }
 
