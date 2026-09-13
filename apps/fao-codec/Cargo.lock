@@ -842,6 +842,7 @@ dependencies = [
  "egui",
  "fao-codec-lib",
  "image",
+ "serde_json",
  "settings-kit",
  "uikit-egui",
  "zstd",
