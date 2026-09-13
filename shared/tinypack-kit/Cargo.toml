@@ -11,11 +11,16 @@ path = "src/lib.rs"
 [[bin]]
 name = "tinypack"
 path = "src/bin/tinypack.rs"
+required-features = ["std"]
 
 [features]
-default = []
-# PNG read/write for the CLI. Off by default so the kit stays dependency-free.
-png = ["dep:png"]
+# `std` on by default: the phone-side codecs (text, image) and the CLI need it.
+# Turn it off (`--no-default-features`) to build the no_std carry layer
+# (huffman, bac, drop, ledger) for microcontroller anchors and device-carriers.
+default = ["std"]
+std = []
+# PNG read/write for the CLI. Implies std. Off by default so the kit stays dependency-free.
+png = ["dep:png", "std"]
 
 [dependencies]
 png = { version = "0.17", optional = true }

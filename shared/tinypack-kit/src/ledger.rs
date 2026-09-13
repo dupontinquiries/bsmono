@@ -48,7 +48,11 @@
 //! in a single `drop` pack; the `drop`/DHT wiring lives in the app, not here.
 
 use crate::drop::Sealer;
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+#[cfg(not(feature = "std"))]
+#[allow(unused_imports)] // needed on a bare no_std target; host no_std sees it via the sysroot prelude
+use alloc::vec;
 
 /// 256-bit content id. Printed big-endian hex.
 pub type Id = [u8; 32];
@@ -323,7 +327,7 @@ impl Store {
 
     /// Every verified entry across all known authors.
     pub fn all_verified<'a>(&'a self, h: &'a dyn Hasher) -> impl Iterator<Item = &'a Entry> {
-        let authors: Vec<u32> = self.entries.keys().map(|&(a, _)| a).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        let authors: Vec<u32> = self.entries.keys().map(|&(a, _)| a).collect::<alloc::collections::BTreeSet<_>>().into_iter().collect();
         authors.into_iter().flat_map(move |a| {
             let len = self.verified_len(a, h);
             (0..len).filter_map(move |seq| self.entries.get(&(a, seq)))
@@ -332,7 +336,7 @@ impl Store {
 
     /// Ids of `issuer`'s own entries they have revoked (within the verified
     /// prefix).
-    fn revoked_by(&self, issuer: u32, h: &dyn Hasher) -> std::collections::BTreeSet<Id> {
+    fn revoked_by(&self, issuer: u32, h: &dyn Hasher) -> alloc::collections::BTreeSet<Id> {
         self.chain(issuer, h)
             .filter_map(|e| match &e.body {
                 Body::Revoke { target } => Some(*target),
@@ -379,7 +383,7 @@ impl Store {
     /// friends". Excludes forked authors.
     pub fn attestations_about(&self, subject: u32, tag: u16, h: &dyn Hasher) -> Vec<(u32, Vec<u8>)> {
         let mut out = Vec::new();
-        let authors: Vec<u32> = self.entries.keys().map(|&(a, _)| a).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        let authors: Vec<u32> = self.entries.keys().map(|&(a, _)| a).collect::<alloc::collections::BTreeSet<_>>().into_iter().collect();
         for a in authors {
             if self.is_forked(a) {
                 continue;
@@ -403,7 +407,7 @@ impl Store {
     /// this?"
     pub fn authors_of(&self, obj: &[u8], h: &dyn Hasher) -> Vec<u32> {
         let mut out = Vec::new();
-        let authors: Vec<u32> = self.entries.keys().map(|&(a, _)| a).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        let authors: Vec<u32> = self.entries.keys().map(|&(a, _)| a).collect::<alloc::collections::BTreeSet<_>>().into_iter().collect();
         for a in authors {
             if self.is_forked(a) {
                 continue;
@@ -527,7 +531,7 @@ pub fn fit_batch(entries: &[Entry], budget: usize) -> (Vec<u8>, usize) {
 mod tests {
     use super::*;
     use crate::drop::MacSealer;
-    use std::collections::BTreeSet;
+    use alloc::collections::BTreeSet;
 
     /// Test hasher: a 256-bit mixer over four 64-bit lanes. Well-distributed
     /// enough for tests; NOT collision-resistant — `crypto-kit` supplies

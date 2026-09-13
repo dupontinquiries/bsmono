@@ -10,6 +10,9 @@
 
 /// Primary decode table width in bits. Codes of this length or shorter decode
 /// in one table lookup; longer ones take the serial path.
+#[cfg(not(feature = "std"))]
+use alloc::{vec, vec::Vec};
+
 pub const FAST_BITS: u32 = 10;
 
 #[derive(Debug, Clone)]
@@ -239,7 +242,7 @@ mod tests {
         // so both the 10-bit table path and the serial path are exercised.
         let mut lens = Vec::new();
         for (n, l) in [(2usize, 2u8), (4, 4), (8, 6), (16, 8), (32, 10), (64, 12), (128, 14), (46, 16)] {
-            lens.extend(std::iter::repeat_n(l, n));
+            lens.extend(core::iter::repeat_n(l, n));
         }
         assert_eq!(lens.len(), 300);
         let c = Code::from_lengths(&lens);

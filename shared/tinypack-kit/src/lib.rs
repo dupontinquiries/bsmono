@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "std"), no_std)]
 //! tinypack-kit — fit the most into a tiny fixed byte budget.
 //!
 //! The constraint that shaped this: an NFC tag holds tens to hundreds of
@@ -21,11 +22,25 @@
 //! prints the whole fitting table so the size/quality trade is visible rather
 //! than chosen for you.
 
+//! ## `std` vs `no_std`
+//!
+//! The carry layer — [`huffman`], [`bac`], [`drop`], [`ledger`] — is
+//! `no_std` + `alloc`, so it builds for the ESP32-class anchors and
+//! device-carriers the courier model targets. The phone-side codecs
+//! ([`text`], [`image`]) and the `tinypack` CLI need `std` (a static vocab
+//! table and float transcendentals) and are gated behind the default-on
+//! `std` feature. Build the carry layer alone with `--no-default-features`.
+
+extern crate alloc;
+
 pub mod bac;
 pub mod drop;
 pub mod huffman;
-pub mod image;
 pub mod ledger;
+
+#[cfg(feature = "std")]
+pub mod image;
+#[cfg(feature = "std")]
 pub mod text;
 
 /// Usable user-memory budgets of common NFC tags, in bytes. These are what

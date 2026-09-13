@@ -42,7 +42,11 @@
 //! cards only ever hold the observations. That is the stream of new packs:
 //! the cards' contents evolve on every tap even when nobody sent anything.
 
-use std::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::vec::Vec;
+#[cfg(not(feature = "std"))]
+#[allow(unused_imports)] // needed on a bare no_std target; host no_std sees it via the sysroot prelude
+use alloc::vec;
 
 pub const MAGIC: u16 = 0x4450; // "DP"
 pub const CARD_HEADER_LEN: usize = 8;
@@ -486,7 +490,7 @@ impl Device {
                 n += 1;
             }
         }
-        let own = std::mem::take(&mut self.outbox);
+        let own = core::mem::take(&mut self.outbox);
         for p in &own {
             cands.push((tier(p), p.born, n, p.clone()));
             n += 1;
@@ -495,7 +499,7 @@ impl Device {
             cands.push((tier(p), p.born, n, p.clone()));
             n += 1;
         }
-        cands.sort_by_key(|(t, born, arrival, _)| (*t, std::cmp::Reverse(*born), *arrival));
+        cands.sort_by_key(|(t, born, arrival, _)| (*t, core::cmp::Reverse(*born), *arrival));
         let mut next = Card { gen: card.gen.wrapping_add(1), owner: card.owner, packs: vec![] };
         let mut on_card: BTreeSet<PackId> = BTreeSet::new();
         for (_, _, _, p) in cands {
@@ -506,7 +510,7 @@ impl Device {
         // beacons: mine, then the newest existing ones up to the cap
         let mut beacons: Vec<Pack> =
             card.packs.iter().filter(|p| p.kind == Kind::Beacon && p.src != self.id).cloned().collect();
-        beacons.sort_by_key(|p| std::cmp::Reverse(p.born));
+        beacons.sort_by_key(|p| core::cmp::Reverse(p.born));
         beacons.truncate(pol.beacons_per_card.saturating_sub(1));
         self.seq = self.seq.wrapping_add(1);
         next.packs.push(Pack {

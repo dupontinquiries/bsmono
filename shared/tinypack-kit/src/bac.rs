@@ -11,6 +11,9 @@
 //! zero costs almost nothing.
 
 /// Probability precision. p is in `1..4096`, meaning p/4096 that the bit is 1.
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 pub const PROB_BITS: u32 = 12;
 const PROB_ONE: u32 = 1 << PROB_BITS;
 

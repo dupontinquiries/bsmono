@@ -59,3 +59,24 @@ Crypto is the same seam as `drop`: `Sealer` for sign/verify (Ed25519),
 by `crypto-kit`; tests use `MacSealer` and a labelled non-cryptographic
 mixer. Not verified: no real crypto wired yet; no DHT transport; no app
 integration (voiceterm/logscope/snapclone) — that is deliberately held off.
+
+## `std` vs `no_std`
+
+The carry layer — `huffman`, `bac`, `drop`, `ledger` — builds `no_std` +
+`alloc`, so it targets the ESP32-class anchors and device-carriers the courier
+model points at. The phone-side codecs (`text`, `image`) and the CLI need
+`std` and sit behind the default-on `std` feature.
+
+```
+cargo build --no-default-features   # carry layer only, no_std + alloc
+cargo test                          # full suite (std)
+```
+
+Verified: `--no-default-features` compiles clean on x86 host (forces the crate
+through no_std). NOT verified: a true bare-metal target — the offline toolchain
+here only ships the x86_64 std sysroot, so no aarch64/thumb/riscv `core` to
+cross-build against. The one place that differs on real hardware is the `vec!`
+macro import in `drop`/`ledger`, which the host no_std build resolves via the
+sysroot prelude but a bare target needs explicitly (kept, with an
+`allow(unused_imports)` for the host false positive). Float transcendentals in
+`image` would need `libm` under no_std, which is why `image` stays std-gated.
