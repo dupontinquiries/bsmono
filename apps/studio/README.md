@@ -496,6 +496,56 @@ That is the whole trick: a take reaches a collaborator's timeline by exactly the
 mechanism a drag does. Recording is not special-cased in the sync layer, which
 is why sharing it works at all.
 
+## The second take
+
+One take lands where the playhead was; that has worked since takes were
+ops. The second take of the same phrase landed on the first, and the
+overlap policy either refused it, trimmed the take you might have
+wanted, or moved it to the one shadow lane where the third collided
+again. A vocal session is eight takes of the same two bars.
+
+`studio_core`'s takes module: a take goes to the first lane in the
+track's CHAIN with room — the track, then `vox ↓`, then `vox ↓ ↓`, each
+a shadow lane of the one before (room.rs's own convention applied to
+itself), created only when every existing lane over that span is
+taken. Eight takes of two bars are eight lanes; a take of different
+bars goes back on the parent. A lane is a track, a take is a clip, the
+chain is a fact about names; nothing new travels on the wire. The lane
+and its clip land as one undo step. With a lane's clip selected, the
+take target is the chain's ROOT, so re-taking the phrase you are
+looking at stacks under the same track, never under the lane.
+
+**Loop-record.** "loop the selected clips' span" gives the transport a
+range; the playback block renders the range ALONE and sets it looped,
+so the wrap happens in the callback, sample exact — the singer hears
+the bar come round on time, so what she sings lands on time — and the
+sink's counter maps back into the timeline by `start + (frame mod
+len)`. Recording inside it: each time the playhead comes round (moves
+backwards by more than a jitter — `looping::Passes`, tested with
+numbers), the microphone's audio so far is cut (`Capture::split_take`,
+the buffer swapped out without stopping the stream) and placed at the
+loop's start on the next free lane, trimmed to the loop's length. The
+pass boundary is where the UI saw the wrap, so a frame's worth of the
+next pass sits past the loop's end on this one and is trimmed off;
+not corrected further, because a sample-exact split needs the capture
+and the sink on one clock, and they are two devices.
+
+**Comping.** The root track is the comp; each lane is an alternative.
+"comp: use the selected takes on the track" copies each selected lane
+clip's span onto the root — same source, the offset carried in
+`src_in`, whatever the root held over that span giving way by the trim
+rule — so the comp is ordinary clips that render, export and travel,
+and the lanes keep every take intact underneath. A swipe that takes
+half of one take is `s` on the lane and a comp of the half. "mute the
+take lanes" is a track flag on each, as one step. Two adjacent choices
+from one lane do not trim each other: room is made against a probe
+that carries the comp's own placements.
+
+What this does not decide is which take is best. That is a score, and
+the score the maintainer wants is the transcript's — the take whose
+words match the lyric — which needs whisper on the machine. The choice
+arrives as a lane per span; where it came from is the shell's business.
+
 ## Phones, and the two ways to watch a session
 
 Both source editors assume a mouse and a big screen. The useful touch set is

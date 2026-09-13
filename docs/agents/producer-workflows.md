@@ -219,7 +219,12 @@ first phase is for.
    rate, "automate" on the fx editor's live controls. The README's
    "Riding a knob".
 4. Synth + piano control-panel sketch, SFZ/SF2 kind behind it.
-5. Take lanes, loop-record, comping.
+5. ~~Take lanes, loop-record, comping~~ — built (c17): `studio_core`'s
+   takes module (`take_lane_ops`, `comp_ops`, `take_lanes_mute_ops`),
+   `looping::{Window, Passes}` + `Capture::split_take` in the shell,
+   palette verbs for loop / comp / mute lanes. The README's "The second
+   take". Still open inside it: the transcript-driven "best take" score
+   (needs whisper on the machine).
 6. Video: align-by-audio, ffmpeg edit-list render.
 7. `Gate::Group` (a curve over a composition's hull), wire bump.
 8. Triplet snap, arpeggiate/chord tools, folder-drop → kit, phone share
