@@ -97,13 +97,24 @@ fn synth_dictionary(n: usize) -> Vec<String> {
 
 fn main() {
     let n = 20_000;
+
+    // Baseline BEFORE the input list is built, and this is the whole
+    // correctness of the number below.
+    //
+    // The first version took it AFTER, reasoning that the recognizer should
+    // be measured on top of the list it is handed. That is backwards:
+    // `with_dictionary` CONSUMES the Vec and frees every String in it during
+    // load, so a delta anchored after the list exists reports
+    // (recognizer - freed input) and under-reports by the size of the input —
+    // roughly 800 KB here, which turned ~89 bytes/word into a reported 50.
+    //
+    // Anchoring before means the input's allocations are inside the window,
+    // are freed inside the window, and net to zero. What is left is what the
+    // recognizer still holds.
+    let baseline = LIVE.load(Ordering::Relaxed);
     let words = synth_dictionary(n);
     let chars: usize = words.iter().map(|w| w.len()).sum();
-
-    // Baseline AFTER the input Vec exists, so we measure what the recognizer
-    // adds on top of the word list it is handed — the list itself is dropped
-    // by `load_dictionary`, so counting it would flatter the result.
-    let before = LIVE.load(Ordering::Relaxed);
+    let before = baseline;
     let r = GestureRecognizer::with_dictionary(words);
     let after = LIVE.load(Ordering::Relaxed);
 
@@ -124,6 +135,7 @@ fn main() {
     drop(m);
     drop(probe_words);
     let held = after - before;
+    let _ = before;
     println!(
         "words {n} | source text {} KB | recognizer holds {} KB | {} bytes/word | peak {} KB",
         chars / 1024,

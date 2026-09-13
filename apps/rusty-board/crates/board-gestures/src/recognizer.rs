@@ -150,6 +150,15 @@ impl GestureRecognizer {
             // Keep the *first* occurrence (highest frequency) if duplicated.
             seen_rank.entry(lc).or_insert(rank);
         }
+
+        // Reclaim the buckets' growth slack. Each was filled with `push`, so
+        // its capacity is whatever the doubling sequence last landed on — up
+        // to 2x the entries actually stored, and never used again because
+        // nothing is added after load. Same reasoning as the `Box<str>` /
+        // `Box<[char]>` on the entries themselves, one level up.
+        for bucket in &mut self.words_by_length {
+            bucket.shrink_to_fit();
+        }
     }
 
     /// Provide the current keyboard's letter positions for spatial scoring.
