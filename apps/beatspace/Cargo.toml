@@ -74,6 +74,14 @@ symphonia = { version = "0.6", default-features = false, features = [
 # Same treatment studio-media already gives its own opus support.
 ogg  = { version = "0.9", optional = true }   # ogg container demux for .opus
 opus = { version = "0.3", optional = true }   # libopus codec (system libopus + pkg-config)
+# The FLAC encoder (pure Rust, lifted from studio-media) for project audio
+# and exports when the preference says lossless-but-smaller-than-wav.
+audio-kit = { path = "../../shared/audio-kit" }
+# Ogg Opus WRITING, for the same preference set to opus. Its `encode`
+# feature is real FFI to libopus (audiopus), so it is behind `opus-encode`
+# here: off, an opus preference is refused with a message naming the
+# feature, like `opus-decode`.
+opus-kit = { path = "../../shared/opus-kit", optional = true }
 
 # --- misc ---
 anyhow = "1"
@@ -110,6 +118,8 @@ app = ["dep:cpal", "dep:eframe", "dep:egui", "dep:uikit-egui"]
 # .opus decoding. Off means .opus files are refused with a message naming the
 # feature, rather than the crate failing to build.
 opus-decode = ["dep:ogg", "dep:opus"]
+# .opus WRITING (project audio, exports). Needs system libopus like decode.
+opus-encode = ["dep:opus-kit", "opus-kit/encode"]
 cuda  = ["candle-core/cuda",  "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 # Batched generator inference on the GPU via wgpu (Vulkan on Asahi/Linux).

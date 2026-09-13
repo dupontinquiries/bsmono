@@ -24,15 +24,18 @@
 //! target. The opinionated, stateful processors (a streaming canceller, a
 //! diarizer) stay in the apps; this crate is the math beneath them.
 
+pub mod bounce;
 pub mod gen;
 pub mod goertzel;
 pub mod envelope;
 pub mod fingerprint;
+pub mod flac;
 pub mod level;
 pub mod pitch;
 pub mod wav;
 pub mod window;
 
+pub use bounce::BounceFormat;
 pub use gen::{Noise, Tone};
 pub use goertzel::{goertzel, spectrogram, spectrogram_at_freqs, SpectrogramConfig};
 pub use level::{db_to_lin, lin_to_db, peak, rms};

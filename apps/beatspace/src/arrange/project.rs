@@ -2,11 +2,20 @@
 //!
 //! A project is a DIRECTORY: `project.json` (the timeline and a manifest
 //! of the library) beside `beats/` and `files/` holding every source's
-//! audio as WAV at the model sample rate. Files are copied in rather than
-//! referenced, so a project moved to another machine still plays; the
+//! audio at the model sample rate, in the container the preference names
+//! (`Config::audio_format`: wav, flac or opus). Files are copied in rather
+//! than referenced, so a project moved to another machine still plays; the
 //! original path is kept in the manifest for the reader's sake. A captured
 //! beat's mel planes are written too (`.planes`: a small header then f32
 //! little-endian), so it can be re-armed or re-rendered later.
+//!
+//! The manifest records each source's actual file name, so a project saved
+//! as flac and re-saved as wav reads back either way; loading decodes
+//! whatever the name says through `audio_io::decode_to_mono`. The Opus
+//! rungs are lossy — a project saved that way and loaded again is not
+//! bit-for-bit the project that was saved, and a captured beat's planes
+//! are its lossless record. A build without the Opus encoder writes the
+//! flac rung instead and the manifest says so.
 //!
 //! The manifest lists sources in library order, because a clip's
 //! `SourceRef` is an index into that order; loading rebuilds the library
@@ -23,6 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use super::model::Timeline;
 use super::render::{Library, Sample};
+use audio_kit::BounceFormat;
 
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -49,11 +59,13 @@ pub struct ProjectFile {
 
 impl ProjectFile {
     /// The manifest for `timeline` and `lib`, naming where each source's
-    /// audio will be written. Pure: no file is touched.
-    pub fn describe(timeline: &Timeline, lib: &Library) -> Self {
+    /// audio will be written in `format` — the format as it will actually
+    /// be written on this build. Pure: no file is touched.
+    pub fn describe(timeline: &Timeline, lib: &Library, format: BounceFormat) -> Self {
+        let ext = crate::audio_io::effective_format(format).ext();
         let meta = |dir: &str, i: usize, s: &Sample| SampleMeta {
             name: s.name.clone(),
-            audio: format!("{dir}/{dir}-{i:03}.wav"),
+            audio: format!("{dir}/{dir}-{i:03}.{ext}"),
             sr: s.sr,
             bpm: s.bpm,
             planes: s.planes.as_ref().map(|_| format!("{dir}/{dir}-{i:03}.planes")),
@@ -97,18 +109,22 @@ impl ProjectFile {
     }
 }
 
-/// Write the project into `dir` (created if needed). Existing audio files
-/// with the same names are overwritten; the directory is not cleared, so
-/// a project that lost sources leaves orphan WAVs behind rather than
-/// deleting anything.
-pub fn save(dir: &Path, timeline: &Timeline, lib: &Library) -> Result<()> {
-    let pf = ProjectFile::describe(timeline, lib);
+/// Write the project into `dir` (created if needed), its audio at the
+/// device's rung (or the flac rung, on a build without Opus). Existing
+/// audio files with the same names are overwritten; the directory is not
+/// cleared, so a project that lost sources — or changed format — leaves
+/// the old files behind rather than deleting anything. Returns the format
+/// actually written.
+pub fn save(dir: &Path, timeline: &Timeline, lib: &Library, format: BounceFormat) -> Result<BounceFormat> {
+    let format = crate::audio_io::effective_format(format);
+    let pf = ProjectFile::describe(timeline, lib, format);
     pf.check_refs()?;
     std::fs::create_dir_all(dir.join("beats"))?;
     std::fs::create_dir_all(dir.join("files"))?;
     for (meta, s) in pf.beats.iter().zip(&lib.beats).chain(pf.files.iter().zip(&lib.files)) {
-        crate::audio_io::save_wav(&dir.join(&meta.audio), &s.audio, s.sr)
+        let written = crate::audio_io::save_audio(&dir.join(&meta.audio), &s.audio, s.sr, format)
             .with_context(|| format!("writing {}", meta.audio))?;
+        debug_assert_eq!(written, dir.join(&meta.audio));
         if let (Some(rel), Some(planes)) = (&meta.planes, &s.planes) {
             write_planes(&dir.join(rel), planes)?;
         }
@@ -116,7 +132,7 @@ pub fn save(dir: &Path, timeline: &Timeline, lib: &Library) -> Result<()> {
     let tmp = dir.join("project.json.tmp");
     std::fs::write(&tmp, pf.to_json()?)?;
     std::fs::rename(&tmp, dir.join("project.json"))?;
-    Ok(())
+    Ok(format)
 }
 
 /// Read a project. Every source is decoded to `sr` (a project saved at
@@ -199,8 +215,9 @@ mod tests {
     #[test]
     fn the_manifest_round_trips_through_json_with_every_field() {
         let (t, lib) = fixture();
-        let pf = ProjectFile::describe(&t, &lib);
+        let pf = ProjectFile::describe(&t, &lib, BounceFormat::Wav);
         assert_eq!(pf.beats[0].audio, "beats/beats-000.wav");
+        assert_eq!(ProjectFile::describe(&t, &lib, BounceFormat::Flac).beats[0].audio, "beats/beats-000.flac");
         assert_eq!(pf.beats[0].planes.as_deref(), Some("beats/beats-000.planes"));
         assert_eq!(pf.files[0].planes, None);
         let json = pf.to_json().unwrap();
@@ -213,7 +230,7 @@ mod tests {
     #[test]
     fn a_newer_format_or_a_dangling_source_is_refused() {
         let (t, lib) = fixture();
-        let mut pf = ProjectFile::describe(&t, &lib);
+        let mut pf = ProjectFile::describe(&t, &lib, BounceFormat::Wav);
         pf.version = FORMAT_VERSION + 1;
         assert!(ProjectFile::from_json(&pf.to_json().unwrap()).is_err());
         pf.version = FORMAT_VERSION;
@@ -227,7 +244,7 @@ mod tests {
         let (t, lib) = fixture();
         let dir = std::env::temp_dir().join(format!("bs-project-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        save(&dir, &t, &lib).unwrap();
+        save(&dir, &t, &lib, BounceFormat::Wav).unwrap();
         assert!(dir.join("project.json").exists());
         assert!(dir.join("beats/beats-000.wav").exists());
         assert!(dir.join("beats/beats-000.planes").exists());
@@ -250,6 +267,53 @@ mod tests {
         let new_track = e.timeline.tracks.last().unwrap().id;
         assert!(t.tracks.iter().all(|tr| tr.id != new_track));
         assert!(t.tracks.iter().flat_map(|tr| tr.clips.iter()).all(|c| c.id != new_track));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_saved_as_flac_loads_back_the_same_and_is_smaller() {
+        let (t, lib) = fixture();
+        let dir = std::env::temp_dir().join(format!("bs-project-flac-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        save(&dir, &t, &lib, BounceFormat::Flac).unwrap();
+        assert!(dir.join("beats/beats-000.flac").exists());
+        assert!(!dir.join("beats/beats-000.wav").exists());
+        let manifest = std::fs::read_to_string(dir.join("project.json")).unwrap();
+        assert!(manifest.contains("beats/beats-000.flac"));
+        let (t2, lib2) = load(&dir, 8000).unwrap();
+        assert_eq!(t2, t);
+        let err = lib2.beats[0].audio.iter().zip(&lib.beats[0].audio).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(err < 1e-3, "flac changed the audio by {err}");
+        assert_eq!(lib2.files[0].audio.len(), 1600);
+        // The constant 0.25 file: FLAC codes it in a handful of bytes.
+        let flac_len = std::fs::metadata(dir.join("files/files-000.flac")).unwrap().len();
+        assert!(flac_len < 1600 * 2 / 4, "flac {flac_len} bytes vs 3200 as wav");
+        // Re-saving as wav beside it: the manifest follows, the old flac
+        // is left alone.
+        save(&dir, &t2, &lib2, BounceFormat::Wav).unwrap();
+        assert!(dir.join("beats/beats-000.wav").exists() && dir.join("beats/beats-000.flac").exists());
+        let (t3, _) = load(&dir, 8000).unwrap();
+        assert_eq!(t3, t);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_opus_rung_on_a_build_without_the_encoder_writes_the_flac_rung_and_says_so() {
+        let (t, lib) = fixture();
+        let dir = std::env::temp_dir().join(format!("bs-project-opus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let written = save(&dir, &t, &lib, BounceFormat::Opus192).unwrap();
+        let manifest = std::fs::read_to_string(dir.join("project.json")).unwrap();
+        if cfg!(feature = "opus-encode") {
+            assert_eq!(written, BounceFormat::Opus192);
+            assert!(manifest.contains("beats/beats-000.opus"));
+        } else {
+            assert_eq!(written, BounceFormat::Flac, "bigger, never a hole");
+            assert!(manifest.contains("beats/beats-000.flac"));
+            assert!(dir.join("beats/beats-000.flac").exists());
+        }
+        let (t2, _) = load(&dir, 8000).unwrap();
+        assert_eq!(t2, t);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

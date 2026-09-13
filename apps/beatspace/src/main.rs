@@ -13,6 +13,7 @@ mod arrange;
 mod audio_io;
 mod config;
 mod dataset;
+mod device_prefs;
 mod upscale;
 mod dsp;
 #[cfg(feature = "gpu")]

@@ -154,8 +154,14 @@ tempo moves; a clip that does not (an imported file) plays at natural speed
 and its extent in beats follows the tempo. Toggle either way per clip. Fade
 handles sit on each clip's top corners; drag them, or use the sliders. `save`
 writes a self-contained project directory (`project.json` beside the
-library's audio as WAV); `load` brings it back. `export wav` renders the
-whole arrangement. Playback runs through the same audio device as the
+library's audio); `load` brings it back. `export` renders the whole
+arrangement. What renders are encoded as — project sources, saved beats,
+exports — is the **bounce fidelity** slider on the arrange page, studio's
+ladder: opus 32k…256k, flac, wav. It is a per-device choice (kept in
+`~/.config/beatspace/device.prefs`, never in the project or the checkpoint)
+because storage constraints are per device; opus 192k is the default, and a
+build without the `opus-encode` feature (system libopus) writes the flac rung
+instead — bigger, never a hole. Files are read back in any of the three. Playback runs through the same audio device as the
 generator, which pauses while the arrangement plays.
 
 ### GPU / acceleration

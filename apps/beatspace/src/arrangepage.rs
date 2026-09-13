@@ -23,9 +23,10 @@
 use std::collections::HashMap;
 
 use eframe::egui;
-use egui::{Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 use crate::arrange::cmd::{Command, Editor};
+use audio_kit::BounceFormat;
 use crate::arrange::model::{Grid, SourceRef, Timeline};
 use crate::arrange::palette::{self, Action};
 use crate::arrange::render::Library;
@@ -41,6 +42,8 @@ pub struct ArrangeIo<'a> {
     pub recording: Option<f32>,
     /// Whether recording is possible at all (stream playback).
     pub can_record: bool,
+    /// The device's bounce rung (projects, saved beats, exports).
+    pub bounce_format: BounceFormat,
 }
 
 /// What the view wants the app to do.
@@ -57,6 +60,8 @@ pub struct ArrangeOut {
     pub export_wav: Option<String>,
     pub save_project: Option<String>,
     pub load_project: Option<String>,
+    /// The user moved the fidelity slider.
+    pub set_bounce_format: Option<BounceFormat>,
     pub status: Option<String>,
 }
 
@@ -552,11 +557,11 @@ impl ArrangeView {
             painter.text(hdr.left_top() + Vec2::new(6.0, 5.0), egui::Align2::LEFT_TOP, &track.name, egui::FontId::proportional(12.0), if audible { Color32::from_gray(210) } else { Color32::from_gray(110) });
             let bw = 22.0;
             let by = hdr.bottom() - 22.0;
-            let m = ui.put(Rect::from_min_size(egui::pos2(hdr.left() + 6.0, by), Vec2::new(bw, 18.0)), egui::SelectableLabel::new(track.muted, "M"));
+            let m = ui.put(Rect::from_min_size(egui::pos2(hdr.left() + 6.0, by), Vec2::new(bw, 18.0)), egui::Button::selectable(track.muted, "M"));
             if m.clicked() {
                 header_actions.push(Command::ToggleMute { track: track.id });
             }
-            let s = ui.put(Rect::from_min_size(egui::pos2(hdr.left() + 6.0 + bw + 4.0, by), Vec2::new(bw, 18.0)), egui::SelectableLabel::new(track.solo, "S"));
+            let s = ui.put(Rect::from_min_size(egui::pos2(hdr.left() + 6.0 + bw + 4.0, by), Vec2::new(bw, 18.0)), egui::Button::selectable(track.solo, "S"));
             if s.clicked() {
                 header_actions.push(Command::ToggleSolo { track: track.id });
             }
@@ -976,12 +981,37 @@ impl ArrangeView {
                 out.import_file = Some(self.import_path.trim().to_string());
             }
         });
+        let effective = crate::audio_io::effective_format(io.bounce_format);
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.export_path).id_salt("arr-export").desired_width(150.0));
-            if ui.button("export wav").on_hover_text("render the whole arrangement to a file").clicked() {
+            if ui.button(format!("export {}", effective.ext()))
+                .on_hover_text("render the whole arrangement to a file at the rung below; never overwrites")
+                .clicked()
+            {
                 out.export_wav = Some(self.export_path.trim().to_string());
             }
         });
+        // Bounce fidelity — studio's ladder, the same words: what
+        // library-bound renders cost on THIS device. Saved per device in
+        // the sidecar, not with the project or the checkpoint.
+        ui.label(egui::RichText::new("bounce fidelity — what renders cost on this device").small());
+        let all = BounceFormat::ALL;
+        let mut ix = io.bounce_format.index();
+        let r = ui.add(egui::Slider::new(&mut ix, 0..=all.len() - 1).show_value(false));
+        if r.changed() && all[ix] != io.bounce_format {
+            out.set_bounce_format = Some(all[ix]);
+        }
+        ui.label(all[ix].label());
+        if effective != all[ix] {
+            ui.label(egui::RichText::new(format!(
+                "this build has no opus encoder (feature opus-encode): writes {} instead",
+                effective.label()
+            )).small().italics());
+        }
+        ui.label(egui::RichText::new(
+            "opus 192k is transparent on most systems at a tenth the size; flac is the \
+lossless rung; wav is for whoever insists. Saved per device — a phone and a desktop \
+answer this differently on purpose.").small().weak());
         ui.separator();
         ui.label(egui::RichText::new("project").small());
         ui.add(egui::TextEdit::singleline(&mut self.project_path).id_salt("arr-project").hint_text("directory").desired_width(f32::INFINITY))

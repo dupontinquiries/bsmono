@@ -27,6 +27,8 @@ use crate::arrange::model::Timeline;
 use crate::arrange::render::{Library, Sample, Transport};
 use crate::arrangepage::{ArrangeIo, ArrangeOut, ArrangeView};
 use crate::config::{Config, Playback};
+use crate::device_prefs::DevicePrefs;
+use audio_kit::BounceFormat;
 use crate::dsp::{GlState, Mel};
 use crate::model::{load_generator, Generator};
 use crate::stream::{Conductor, LatentWalk, Streamer};
@@ -157,6 +159,8 @@ struct Shared {
     playback: PlaybackInfo,
     stream_ctl: StreamControls,
     arr: ArrShared,
+    /// The device's bounce rung, for saved beats written on this thread.
+    bounce_format: BounceFormat,
     /// Output gain the generator thread applies to its player, 0..1.
     ///
     /// Routed through Shared rather than by handing the GUI an Arc<Player>: the
@@ -200,6 +204,7 @@ pub fn run(cfg: Config) -> Result<()> {
             recording_secs: None,
             pending_place: None,
         },
+        bounce_format: DevicePrefs::load().bounce_format,
         gain: 1.0,
         stopped: false,
     }));
@@ -515,10 +520,11 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
             // render a clean, high-quality version from the same latent (fresh
             // phase, full iterations) rather than saving the realtime preview
             let hq = mel.mel_to_wav(&flat, t, cfg.griffin_iters);
-            if let Err(e) = audio_io::save_wav(&path, &hq, cfg.sr) {
-                eprintln!("[gui] save wav {path:?}: {e}");
-            } else {
-                println!("[gui] saved {path:?} ({} iters)", cfg.griffin_iters);
+            let rung = shared.lock().unwrap().bounce_format;
+            let target = audio_io::unique_path(&audio_io::with_format_ext(&path, rung));
+            match audio_io::save_audio(&target, &hq, cfg.sr, rung) {
+                Ok(written) => println!("[gui] saved {} ({} iters)", written.display(), cfg.griffin_iters),
+                Err(e) => eprintln!("[gui] save {path:?}: {e}"),
             }
         }
 
@@ -691,10 +697,14 @@ restart the GUI with --ckpt-dir pointing at its directory",
 
         if let Some(path) = save_req {
             match streamer.render_last_hq(cfg.griffin_iters) {
-                Some(hq) => match audio_io::save_wav(&path, &hq, cfg.sr) {
-                    Ok(()) => println!("[gui] saved {path:?} ({} iters)", cfg.griffin_iters),
-                    Err(e) => eprintln!("[gui] save wav {path:?}: {e}"),
-                },
+                Some(hq) => {
+                    let rung = shared.lock().unwrap().bounce_format;
+                    let target = audio_io::unique_path(&audio_io::with_format_ext(&path, rung));
+                    match audio_io::save_audio(&target, &hq, cfg.sr, rung) {
+                        Ok(written) => println!("[gui] saved {} ({} iters)", written.display(), cfg.griffin_iters),
+                        Err(e) => eprintln!("[gui] save {path:?}: {e}"),
+                    }
+                }
                 None => eprintln!("[gui] nothing rendered yet to save"),
             }
         }
@@ -803,6 +813,8 @@ struct App {
     status: String,
     /// The arrangement page's editor, tools and view state.
     arrange: ArrangeView,
+    /// This device's preferences (the bounce rung), from the sidecar.
+    device: DevicePrefs,
     /// Whether the model shape in `cfg` (what the next run builds) matches
     /// the checkpoint directory's config.json. Refreshed on the cache timer
     /// rather than per frame; `None` when there is no checkpoint to compare.
@@ -844,7 +856,7 @@ impl App {
             walk_t: None,
             walk_speed: 0.01,
             ckpt_text,
-            save_text: "beat.wav".into(),
+            save_text: "beat".into(),
             status: "drag on the pad to morph".into(),
             shape_note: None,
             arrange: {
@@ -852,6 +864,7 @@ impl App {
                 a.project_path = project_path;
                 a
             },
+            device: DevicePrefs::load(),
         }
     }
 
@@ -984,10 +997,14 @@ impl App {
                 ui.separator();
                 ui.label("Save current beat:");
                 ui.add(egui::TextEdit::singleline(&mut self.save_text).id_salt("gui-self_save_text").desired_width(230.0));
-                if ui.button("💾  Save WAV").clicked() {
+                let rung = audio_io::effective_format(self.device.bounce_format);
+                if ui.button(format!("💾  Save {}", rung.ext()))
+                    .on_hover_text("at this device's bounce rung (arrange page); never overwrites")
+                    .clicked()
+                {
                     let p = PathBuf::from(self.save_text.trim());
                     self.shared.lock().unwrap().save_request = Some(p);
-                    self.status = "saving wav…".into();
+                    self.status = format!("saving {}…", rung.ext());
                 }
 
                 ui.separator();
@@ -1109,7 +1126,7 @@ impl App {
             let s = self.shared.lock().unwrap();
             (s.arr.library.clone(), s.arr.pos, s.arr.playing, s.arr.recording_secs, s.playback.stream)
         };
-        let io = ArrangeIo { library: &library, playhead, playing, recording, can_record };
+        let io = ArrangeIo { library: &library, playhead, playing, recording, can_record, bounce_format: self.device.bounce_format };
         let out = self.arrange.ui(ui, &io);
         self.arrange_apply(out);
     }
@@ -1144,7 +1161,7 @@ impl App {
         if let Some(n) = notice {
             self.status = n;
         }
-        let io = ArrangeIo { library: &library, playhead, playing, recording, can_record };
+        let io = ArrangeIo { library: &library, playhead, playing, recording, can_record, bounce_format: self.device.bounce_format };
         let mut out = ArrangeOut::default();
         self.arrange.library_ui(ui, &io, &mut out);
         self.arrange_apply(out);
@@ -1200,13 +1217,29 @@ impl App {
         if let Some(dir) = out.load_project {
             self.load_project(dir);
         }
+        if let Some(f) = out.set_bounce_format {
+            self.set_bounce_format(f);
+        }
+    }
+
+    /// Move the fidelity slider and keep it on this device: the sidecar in
+    /// the user's config directory, never the project or the checkpoint,
+    /// because storage constraints are per device.
+    fn set_bounce_format(&mut self, f: BounceFormat) {
+        self.device.bounce_format = f;
+        // The audio thread writes saved beats with it too.
+        self.shared.lock().unwrap().bounce_format = f;
+        match self.device.save() {
+            Ok(p) => self.status = format!("{} (kept in {})", f.label(), p.display()),
+            Err(e) => self.status = format!("{} for this session; could not write the device prefs: {e}", f.label()),
+        }
     }
 
     fn save_project(&mut self, dir: String) {
         let dir = if dir.is_empty() { crate::arrange::project::default_dir(&self.cfg.ckpt_dir) } else { PathBuf::from(dir) };
         let library = self.shared.lock().unwrap().arr.library.clone();
-        match crate::arrange::project::save(&dir, self.arrange.timeline(), &library) {
-            Ok(()) => self.status = format!("saved project to {}", dir.display()),
+        match crate::arrange::project::save(&dir, self.arrange.timeline(), &library, self.device.bounce_format) {
+            Ok(written) => self.status = format!("saved project to {} ({} sources as {})", dir.display(), library.beats.len() + library.files.len(), written.label()),
             Err(e) => self.status = format!("save project: {e:#}"),
         }
     }
@@ -1262,8 +1295,10 @@ impl App {
             self.status = "nothing to export".into();
             return;
         }
-        match audio_io::save_wav(&PathBuf::from(&path), &out, sr) {
-            Ok(()) => self.status = format!("exported {path} ({:.1} s)", n as f64 / sr as f64),
+        // Never overwrite a render the user asked for by hand.
+        let target = audio_io::unique_path(&audio_io::with_format_ext(&PathBuf::from(&path), self.device.bounce_format));
+        match audio_io::save_audio(&target, &out, sr, self.device.bounce_format) {
+            Ok(written) => self.status = format!("exported {} ({:.1} s)", written.display(), n as f64 / sr as f64),
             Err(e) => self.status = format!("export {path}: {e}"),
         }
     }
