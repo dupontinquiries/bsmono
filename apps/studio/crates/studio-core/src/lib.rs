@@ -45,6 +45,7 @@ pub use curves::{Binding, Curve, Gate, Opening, Sweep};
 mod batch;
 mod room;
 pub use room::{Overlap, LANE_SUFFIX};
+mod takes;
 
 /// A point or duration on the project timebase, in ticks.
 ///
@@ -723,6 +724,9 @@ pub enum EditError {
     NoSuchBinding(BindingId),
     /// A `Gate::Window` whose end is not after its start can never open.
     EmptyWindow,
+    /// A comp span that no single take on `lane` covers whole — see
+    /// `Project::comp_ops`.
+    NoTakeOver { lane: TrackId, from: Ticks, to: Ticks },
 }
 
 impl Project {
