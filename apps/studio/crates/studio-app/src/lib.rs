@@ -1820,6 +1820,55 @@ impl Studio {
         self.status = "loop off".into();
     }
 
+    /// A folder dropped on the app is a KIT: every audio file in it, in
+    /// name order, becomes a sampler channel — kick, clap, hat, snare,
+    /// the way a drum pack unzips. Non-audio files and files that fail
+    /// to decode are skipped and counted; more than [`Self::KIT_MAX`]
+    /// files takes the first that many, and says so. Returns what was
+    /// decoded so the shell can keep the audio and the raw bytes (the
+    /// peers' copy) beside the sources it registered.
+    pub fn import_kit(&mut self, dir: &std::path::Path)
+        -> Result<Vec<(studio_core::SourceId, studio_audio::SourceAudio, Vec<u8>)>, String>
+    {
+        const AUDIO_EXT: &[&str] = &["wav", "flac", "mp3", "ogg", "opus", "aif", "aiff", "m4a"];
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str())
+                .map(|x| AUDIO_EXT.contains(&x.to_ascii_lowercase().as_str())).unwrap_or(false))
+            .collect();
+        files.sort();
+        if files.is_empty() {
+            return Err(format!("no audio files in {}", dir.display()));
+        }
+        let total = files.len();
+        files.truncate(Self::KIT_MAX);
+        let mut out = Vec::new();
+        let mut failed = 0;
+        for path in &files {
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("hit").to_string();
+            let raw = match std::fs::read(path) { Ok(b) => b, Err(_) => { failed += 1; continue } };
+            let hint = path.extension().and_then(|e| e.to_str());
+            let audio = match studio_media::decode_bytes(raw.clone(), hint) {
+                Ok(a) => a,
+                Err(_) => { failed += 1; continue }
+            };
+            let id = self.import_audio(&name, &path.display().to_string(), &audio);
+            out.push((id, audio, raw));
+        }
+        let kit = dir.file_name().and_then(|s| s.to_str()).unwrap_or("kit");
+        self.status = format!("kit '{kit}': {} channel{} added{}{}", out.len(),
+            if out.len() == 1 { "" } else { "s" },
+            if failed > 0 { format!(", {failed} file(s) could not be decoded") } else { String::new() },
+            if total > Self::KIT_MAX { format!(", first {} of {total} taken", Self::KIT_MAX) } else { String::new() });
+        Ok(out)
+    }
+
+    /// Rack channels one folder drop may add: a 64-step bitmask per
+    /// channel is the pattern's row, and a kit past this is a library,
+    /// not a kit.
+    pub const KIT_MAX: usize = 32;
+
     /// Land decoded audio on the timeline as a clip at the playhead — the
     /// import a melody loop wants, where the rack sampler is the import a
     /// drum hit wants. Same op shape as a bounce and a take, so it is
@@ -3401,6 +3450,18 @@ impl eframe::App for App {
         // ── files dropped on the window become rack channels ─────────────
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped {
+            // A folder is a kit — see `Studio::import_kit`.
+            if let Some(dir) = f.path.as_ref().filter(|p| p.is_dir()) {
+                match self.studio.import_kit(dir) {
+                    Ok(hits) => for (id, audio, raw) in hits {
+                        self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                        self.audio.insert(id, audio);
+                        self.studio.register_asset(id, &raw);
+                    },
+                    Err(e) => self.studio.status = format!("kit import failed: {e}"),
+                }
+                continue;
+            }
             let name = f.path.as_ref()
                 .and_then(|p| p.file_stem()).and_then(|s| s.to_str())
                 .map(str::to_owned)
@@ -7140,6 +7201,42 @@ pub fn shift_points(points: &[(Ticks, f32)], origin: Ticks) -> Vec<(Ticks, f32)>
 /// at the clip's start, never a negative curve time nothing could play.
 pub fn curve_time(at: Ticks, origin: Ticks) -> Ticks {
     Ticks(at.saturating_sub(origin).0.max(0))
+}
+
+#[cfg(test)]
+mod kit_tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_of_hits_becomes_channels_in_name_order_and_the_rest_is_counted() {
+        let dir = std::env::temp_dir().join(format!("studio-kit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = |n: usize| studio_audio::export::export_wav_dithered_bytes(
+            &vec![0.2; 480 * n], 1, 48_000, 1).unwrap();
+        std::fs::write(dir.join("kick.wav"), wav(10)).unwrap();
+        std::fs::write(dir.join("clap.WAV"), wav(5)).unwrap();
+        std::fs::write(dir.join("hat.wav"), wav(2)).unwrap();
+        std::fs::write(dir.join("readme.txt"), b"not audio").unwrap();
+        std::fs::write(dir.join("broken.flac"), b"nope").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let mut s = Studio::demo();
+        let before = s.rack.channels.len();
+        let hits = s.import_kit(&dir).unwrap();
+        assert_eq!(hits.len(), 3);
+        let names: Vec<&str> = s.rack.channels[before..].iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["clap", "hat", "kick"], "name order, extension case ignored");
+        assert!(s.status.starts_with("kit '"), "{}", s.status);
+        assert!(s.status.contains("3 channels added, 1 file(s) could not be decoded"), "{}", s.status);
+        assert!(s.rack.channels[before..].iter().all(|c| matches!(c.kind, studio_live::SynthKind::Sampler { .. })));
+        assert_eq!(hits[0].1.frames(), 480 * 5, "clap's audio came back with its id");
+        assert_eq!(s.session.doc.project.sources.len(), 3 + Studio::demo().session.doc.project.sources.len());
+        // An empty folder is refused, saying so.
+        let empty = dir.join("sub");
+        assert!(s.import_kit(&empty).unwrap_err().starts_with("no audio files"));
+        assert!(s.import_kit(&dir.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
