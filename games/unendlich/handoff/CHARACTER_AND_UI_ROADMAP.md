@@ -28,10 +28,11 @@ agree. The build site at unendlich_fullgame.rs ~11838 only feeds the model, so
 overriding there alone would make a Windwalker *look* 2.0 but *move* like 1.8.
 
 ## Remaining asks — plan
-1. **Item models (only colours):** slots draw `rect_filled(display_color)` — there's
-   no per-item icon/mesh. Options: (a) a small procedural voxel-preview render per
-   ItemKind (reuse the entity/voxel renderer to bake tiny icons), or (b) a glyph/
-   shape per item CATEGORY over the colour (quick win). (b) is the cheap first step.
+1. **Item models — DONE (c16):** `item_model.rs` is a box model per `ItemClass`
+   in a grip-local frame; `hero_forge` draws it in the hand (`HeroPose.held`) and
+   `item_model::icon_quads` → `unendlich_ui::paint_item_icon` draws the same boxes
+   in every slot (six former swatch sites). Adapters: `ItemKind::model()`,
+   `item::item_model_for_id`. Shovel draws as a hammer-headed haft (no own class yet).
 2. **Creative hotbar inconsistency + "drag":** the creative catalog HOTBAR row
    (creative_hotbar) and the bottom in-game hotbar show different things, which reads
    as "empty/old/inconsistent". r657 made it CLICK-based (drag never worked in egui

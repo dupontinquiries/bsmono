@@ -141,3 +141,19 @@ One trap worth thirty seconds: a `deb.nodesource.com` entry in
 `/etc/apt/sources.list.d/` returns 403, and `apt-get update` prints it as a
 fatal-looking error while the Ubuntu repos have in fact updated. Read past it
 (or remove the file) rather than concluding apt is unavailable.
+
+## c16 rig session (rustc 1.96 from rustup.zip, 1 core / 4 GB)
+
+* `cargo check -p unendlich-engine --lib` — 12–18 s warm, any feature set
+  tried (default, `render,egui,unendlich-ui`, `ui-overlay`).
+* `cargo check -p unendlich-engine --bin unendlich-fullgame --features
+  ui-overlay` — WORKS after `apt-get install -y cmake xorg-dev` (glfw-sys
+  builds); 43 s cold, ~8 s warm. Bin wiring is verifiable here.
+* `cargo test -p unendlich-engine --lib --profile sandboxtest --no-run` —
+  the process died silently during the engine test crate's codegen (no
+  error in the log, no binary). Do not plan on it. Pure modules run with
+  `harness/pure_test.sh`; composed pure modules with a `#[path]` shim
+  (`games/unendlich/harness/rig/run.sh` compiles 138 tests in ~3 s).
+* Background jobs: a plain `nohup … &` dies with the tool call; use the
+  double-fork `(setsid nohup … > log 2>&1 < /dev/null &)` form.
+

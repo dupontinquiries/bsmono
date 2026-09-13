@@ -7,6 +7,21 @@ Last refreshed: v0.20.0.
 
 ## Verified working
 
+- **c16 rig session (2026-09-12):** engine build fixed (`begin()` referenced a
+  `surface` it does not have); `Cargo.lock` caught up. New pure cores:
+  `item_model` (hand + slot models), `anim_rig` (oriented per-part posing:
+  hip-pivot legs that plant, breath/squash/stretch, tail chain, strike, settle,
+  ragdoll blend), `sim::melee` (creature-vs-creature strike loop timed to the
+  lunge), `sim::ragdoll_bridge` (`from_anatomy`, `sample_body_local`;
+  `ragdoll.rs` is solver-only now). Bin: roamers render via
+  `creature_to_vertices_rigged`; Dinosaurs BITE instead of an instant kill;
+  deaths are ragdolls; rest beds down; arbiter `fatigue` is the rest urge.
+  Harness: `harness/rig/run.sh` (rustc-only, real files by `#[path]`, 138
+  tests) → `rig_viewer.html` (three.js). Verified by `cargo check` of lib and
+  the fullgame bin (ui-overlay) in the sandbox; NOT verified running. Found:
+  roamers never wrote `body.velocity`, so the old mesher's leg swing had
+  amplitude 0 — that was the sliding.
+
 * **Library compiles clean** under all four feature combos.
 * **All 478 unit tests pass** (`cargo test --features render --features gpu --lib`).
   (472 pre-v0.20 + 6 indirect-draw + alignment tests.)

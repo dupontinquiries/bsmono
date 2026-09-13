@@ -27,13 +27,13 @@ Legend: ✅ done · ▢ to build · ⟶ wire (core exists) · ▦ render/GPU · 
 These are the highest-leverage, lowest-risk items: the hard part is done and
 tested; what remains is bin/render integration.
 
-- ⟶ `SIM` **Ragdoll on death/knockout** — add `ragdoll::from_anatomy(&Creature)` bridge + a death/knockout trigger; render parts at node positions.
-- ⟶ `SIM` **Per-state liveliness** — tick sets each creature's `MotionState`; entity vertex pass `blend3`s pose→ragdoll by limpness, scales torso by `breath`.
-- ⟶ `SIM` **Squash & stretch deform** — per-part application in the entity vertex pass, fed by landing impact + forward speed.
-- ⟶ `SIM` **Circadian rest cycle** — feed `rest_urge` into the brain drive arbiter; add `Drive::Rest`; `chill` from local temperature. *(needs ATMO temp — see deps)*
+- ✅ `SIM` **Ragdoll on death/knockout** — DONE (c16 rig session): `sim::ragdoll_bridge::from_anatomy` + `sample_body_local`; `begin_death` in the bin flips a roamer into `RoamerRig.dying`, `creature_to_vertices_rigged` blends the pose to the nodes; corpse lingers 6 s. (`from_creature` used COLLISION limbs, not rendered parts — that was the missing bridge.)
+- ✅ `SIM` **Per-state liveliness** — DONE: `anim_rig::pose` blends by `limpness(state, progress)` and breathes the torso; the roamer render site sets `MotionState` (Dying/Resting/Walking/Idle).
+- ✅ `SIM` **Squash & stretch deform** — DONE: torso squash from `RoamerRig.impact` (touchdown), motion stretch from the roamer's real speed, in `anim_rig`.
+- ◐ `SIM` **Circadian rest cycle** — `rest_urge` now feeds the arbiter's `fatigue` (was 0.0 since r269); `wants_rest` sets `RoamerRig.resting` → `settle` eases → the rig beds the creature down. STILL OPEN: `chill` from local temperature (rain only today). *(needs ATMO temp — see deps)*
 - ⟶ `SIM` **Dragon/large-body sensing & pathing** — wire `body_scale::BodyScale` + `collision_probe::coarsened` into the large-creature tick (size-aware *lean* already wired).
 - ⟶ `SIM` **Stamina + sprint** — wire the speed multiplier into the roamer movement tick.
-- ⟶ `SIM` **Eased turning** — wire `turning::ease_yaw` into the roamer heading update.
+- ⟶ `SIM` **Eased turning** — wire `turning::ease_yaw` into the roamer heading update. NOTE (c16): `turn_toward`/`wander_turn` already rate-cap yaw, so this is a second-order refinement, not a snap fix.
 - ⟶ `SIM` **Surface cache + cadence** — wire to cut redundant surface probing (perf lever).
 - ⟶ `WORLD` **Plant genome storage + growth-tick** — wild = `from_seed` (free); bred/tended = sparse sidecar by block-index; growth tick uses `rate_mul`, caps at `target_height`. *Open Q: per-block / per-cluster / per-mother-tree.*
 - ⟶ `WORLD` **Pollination → breeding loop** — carrier entities, apply offspring genomes to the world, cross-pollination/dispersal radius. *(needs SIM bee/songbird — see deps)*
@@ -49,8 +49,8 @@ tested; what remains is bin/render integration.
 - ▢ `WORLD` **Rebuild coalescer** — one octree rebuild/stamp per chunk per cadence instead of per growth event.
 - ▢ `WORLD` **Cull / LOD upload policy** (PERF_QUEUE #4) — pure decision core for which chunks to upload/cull at a given RD.
 - ▢ `WORLD` **`competition_factor(height_rank, shade)`** — forest competition via `neighbor_grid` broadphase (noted "not built" in PLANT_GENETICS §3c).
-- ▢ `SIM` **Neck/tail flex-bend** — S-curve/swish over a segment chain; composes with `deform` + gait phase.
-- ▢ `SIM` **Per-leg catch-force / foot-lock IK** — proper foot planting beyond `grounding`; kills the residual float.
+- ✅ `SIM` **Neck/tail flex-bend** — DONE: `anim_rig` turns a Tail/Neck part into a `CHAIN_SEGMENTS` chain bent by `flex_bend` (tail out of the turn, neck into it, swish at the gait phase).
+- ◐ `SIM` **Per-leg catch-force / foot-lock IK** — the residual float is gone on the rigged path: legs pivot at the hip and the STANCE leg extends so its lowest corner sits on the rest sole (`anim_rig`). `foot_ik` (terrain-height planting) is still unwired.
 - ▢ `ATMO` **`MoistureField::recenter(new_origin)`** — integer-cell grid shift, zero-fill new cells (pure & testable); prerequisite for player-following fog.
 
 ## C. Render / GPU / integration — ATMO + MAIN, needs the M2
