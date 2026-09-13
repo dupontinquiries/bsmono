@@ -166,10 +166,25 @@ pub fn next_debounce(current_ms: u64) -> u64 {
 
 /// The whole keymap. `shift` is separate because `A`/`I`/`O` are
 /// different acts from `a`/`i`/`o`, not modified ones.
+///
+/// `ch` is lowercased before matching, and that is load-bearing rather than
+/// tidiness. The shell derives `shift` from `c.is_uppercase()` and passes
+/// the RAW char, so a Shift-I arrives here as `('I', true)`. Every shifted
+/// arm below is written lowercase, so before this normalisation none of
+/// them could ever match: `G`, `I`, `A` and `O` fell through to
+/// `Act::Pass` and did nothing in the running editor.
+///
+/// The unit tests did not catch it and could not have. They call
+/// `resolve(mode, 'i', true)` directly — a lowercase char with shift set,
+/// which is a combination the real caller never produces. The table was
+/// tested against an input shape the app does not send, which is the
+/// hazard of testing a pure function whose caller does the normalising:
+/// both halves are individually reasonable and the pair is broken.
 pub fn resolve(mode: Mode, ch: char, shift: bool) -> Act {
     if mode == Mode::Insert {
         return Act::Pass; // typing is typing
     }
+    let ch = ch.to_ascii_lowercase();
     match (ch, shift) {
         // hjkl. Kept because the whole point is not moving the hand to the
         // arrow keys; arrows still work, they just are not the reason.
@@ -304,6 +319,26 @@ mod tests {
         assert_eq!(resolve(Mode::Normal, 'i', false), Act::Insert { at: Edge::Before });
         assert_eq!(resolve(Mode::Normal, 'a', false), Act::Insert { at: Edge::After });
         assert_eq!(next_mode(Mode::Visual, &Act::Insert { at: Edge::Before }), Mode::Insert);
+    }
+
+    #[test]
+    fn shifted_keys_resolve_from_the_UPPERCASE_char_the_shell_sends() {
+        // The shape every other test in this module got wrong. `state.rs`
+        // calls `helix_key(c, c.is_uppercase(), ..)` with the RAW char, so
+        // a Shift-I arrives as ('I', true) — never ('i', true), which is
+        // what the tests below pass. Before `resolve` lowercased its input,
+        // every shifted arm was unreachable in the running editor and every
+        // test still passed, because they fed it an input the app does not
+        // produce.
+        assert_eq!(resolve(Mode::Normal, 'I', true), Act::InsertAtLineEdge { end: false });
+        assert_eq!(resolve(Mode::Normal, 'A', true), Act::InsertAtLineEdge { end: true });
+        assert_eq!(resolve(Mode::Normal, 'O', true), Act::OpenLine { above: true });
+        assert_eq!(resolve(Mode::Normal, 'G', true), Act::Move(Motion::DocEnd));
+        // And the lowercase forms keep their own meanings, so the
+        // normalisation did not collapse the pairs it exists to keep apart.
+        assert_eq!(resolve(Mode::Normal, 'i', false), Act::Insert { at: Edge::Before });
+        assert_eq!(resolve(Mode::Normal, 'o', false), Act::OpenLine { above: false });
+        assert_eq!(resolve(Mode::Normal, 'g', false), Act::Move(Motion::DocStart));
     }
 
     #[test]

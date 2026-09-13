@@ -3683,8 +3683,91 @@ mod tests {
         s.extra_cursors = vec![aperture_core::editor::Selection::caret(3)];
         s.typewriter_mode = true;
         s.helix = aperture_core::helix::Mode::Normal;
-        typed(&mut s, "x", 0); // Normal-mode 'x' = delete-under-caret
+        // 'x' is SelectLine now, not delete-under-caret — the comment here
+        // said the latter until `x` was corrected to match Helix, and the
+        // test kept passing either way because `helix_key` discards extra
+        // cursors before dispatching ANY act. Still the right key to press
+        // for this test's actual claim; the description of what it does was
+        // just stale.
+        typed(&mut s, "x", 0);
         assert!(s.extra_cursors.is_empty());
+    }
+
+    #[test]
+    fn x_selects_the_whole_line_without_deleting_it() {
+        // The regression that matters most about the x/d split: `x` must
+        // leave the buffer untouched. Bound to Act::Delete (as it was),
+        // this test's first press would have destroyed a character.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("hello\nworld\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(2);
+        s.typewriter_mode = true;
+        s.helix = aperture_core::helix::Mode::Normal;
+        typed(&mut s, "x", 0);
+        assert_eq!(
+            s.editor.buffer.slice_to_string(0, s.editor.buffer.len_chars()),
+            "hello\nworld\n",
+            "x must not modify the buffer"
+        );
+        assert!(!s.editor.sel.is_caret(), "x must leave a selection");
+        assert_eq!(s.editor.sel.min(), 0, "selection starts at the line start");
+        assert_eq!(s.editor.sel.max(), 5, "and runs to the line end");
+        assert_eq!(s.helix, aperture_core::helix::Mode::Visual);
+    }
+
+    #[test]
+    fn x_then_d_deletes_the_line_that_was_selected() {
+        // The pair the split exists to enable: select, SEE it, then operate.
+        // This is the whole argument for Helix's model over vim's `dd`.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("hello\nworld\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(2);
+        s.typewriter_mode = true;
+        s.helix = aperture_core::helix::Mode::Normal;
+        typed(&mut s, "x", 0);
+        typed(&mut s, "d", 0);
+        assert_eq!(
+            s.editor.buffer.slice_to_string(0, s.editor.buffer.len_chars()),
+            "\nworld\n",
+            "d after x removes exactly what x selected"
+        );
+    }
+
+    #[test]
+    fn shift_i_and_shift_a_land_in_insert_at_the_line_edges() {
+        // The bug this pair was fixed for: both used to resolve to a bare
+        // Act::Move, so the caret went to the right place and the editor
+        // stayed in Normal — the next character typed would have been
+        // interpreted as a command instead of inserted.
+        for (key, want_col, label) in [("I", 0usize, "line start"), ("A", 5, "line end")] {
+            let mut s = AppState::new(None, false);
+            s.editor = aperture_core::editor::Editor::from_str("hello\nworld\n");
+            s.editor.sel = aperture_core::editor::Selection::caret(3);
+            s.typewriter_mode = true;
+            s.helix = aperture_core::helix::Mode::Normal;
+            typed(&mut s, key, 0);
+            assert_eq!(
+                s.editor.sel.min(), want_col,
+                "Shift-{key} should sit at the {label}"
+            );
+            assert_eq!(
+                s.helix, aperture_core::helix::Mode::Insert,
+                "Shift-{key} must ENTER Insert, not just move the caret"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_opens_the_same_find_bar_ctrl_f_does() {
+        // Not a second search surface — see Act::Search's doc. If this ever
+        // stops being the same `FindState`, the two will drift.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("hello\n");
+        s.typewriter_mode = true;
+        s.helix = aperture_core::helix::Mode::Normal;
+        assert!(s.find.is_none());
+        typed(&mut s, "/", 0);
+        assert!(s.find.is_some(), "/ must open the find bar");
     }
 
     #[test]
