@@ -25,4 +25,6 @@
 
 pub mod bucket;
 pub mod cache_policy;
+pub mod feel;
+pub mod probe;
 pub mod profile;

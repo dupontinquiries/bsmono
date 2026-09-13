@@ -4,33 +4,75 @@
 //! the playhead. That's Preview mode. Feel mode wants the same byte
 //! budget spent unevenly — more on a face, more around a cut, less on a
 //! held static wide shot — which means every frame needs an IMPORTANCE
-//! on top of its distance, and that importance has to come from
-//! somewhere even for the (typical) case where nothing has explicitly
-//! analysed that frame yet.
+//! on top of its distance, resolved at three confidence levels (see
+//! [`Resolved`]).
 //!
-//! Three confidence levels, resolved in order:
+//! ## Two kinds of fact, held two different ways
 //!
-//! 1. **Verified** — an actual profiled [`Segment`] ([`profile`] produces
-//!    these) whose fingerprint still matches a fresh cheap re-scan.
-//!    Confidence 1.0; feel mode trusts it fully.
-//! 2. **Guessed** — no segment covers this frame, but a verified segment
-//!    exists nearby. Its importance is blended in, decayed by distance
-//!    AND by an extra attenuation for every clip boundary crossed to
-//!    reach it — a face shot says a lot about the next few frames of
-//!    ITS OWN clip and much less about the clip that follows it.
-//!    Confidence in `(0, 1)`, shrinking with distance and boundary
-//!    crossings, and bounded to a search radius so resolving one frame
-//!    never means scanning the whole timeline.
-//! 3. **Fallback** — nothing verified within the search radius in either
-//!    direction. Confidence 0, neutral importance: this degrades to
-//!    EXACTLY today's plain distance falloff, which is the point —
-//!    everywhere unanalysed behaves like Preview, and only gets bent
-//!    once real information exists near it.
+//! This is the part that makes bucket-guessing safe to build editing
+//! features on top of, which is the whole reason it's worth doing
+//! properly:
 //!
-//! [`BucketField`] holds the verified segments for one video source and
-//! resolves any frame against all three levels in one call.
+//! * **A [`Segment`] is a fact about a SOURCE** — a piece of decoded
+//!   content, addressed by absolute source-frame numbers. It does not
+//!   know or care where that source is used on the timeline. Splitting,
+//!   trimming, moving, or duplicating a clip that plays this source
+//!   changes nothing about the source itself, so segments are never
+//!   migrated, patched, or invalidated by any of those edits — only by
+//!   the source's own content actually changing, which
+//!   [`profile::verify`]'s fingerprint check catches. This is the frozen,
+//!   hand-maintained half.
+//! * **An [`Instance`] (which timeline clip plays which window of which
+//!   source) and adjacency (which instances are next to which) are facts
+//!   about the ARRANGEMENT.** These change on every structural edit, so
+//!   they are never hand-maintained — [`BucketField::rebuild`] throws the
+//!   old ones away and recomputes them fresh from the live timeline every
+//!   time, the same recompute-don't-patch discipline
+//!   `cache_policy::desired_set` already uses for the playhead shell.
+//!   Stale adjacency is a bug that can't happen if adjacency is never
+//!   kept, only ever just-computed.
+//!
+//! The consequence: Split, Trim, Duplicate, and Delete cannot desync a
+//! `BucketField` from reality even in principle, because segments never
+//! reference the thing those edits change. The only edit category that
+//! CAN invalidate a segment is replacing what a source plays (re-linking,
+//! re-encoding) — which is `profile::verify`'s job, not this module's.
+//! The property tests at the bottom pin this against the REAL editor in
+//! `arrange::cmd`, not a stand-in.
+//!
+//! ## Three confidence levels
+//!
+//! 1. **Verified** — a [`Segment`] covers this source frame, and its
+//!    profile is still fresh. Confidence 1.0.
+//! 2. **Guessed** — no segment covers it, but one is reachable by walking
+//!    outward through this instance and, if the walk runs out of room,
+//!    across a freshly-derived adjacency edge into a neighbouring
+//!    instance. Decayed by distance and by an extra attenuation per
+//!    boundary crossed — a face shot says a lot about its own next few
+//!    frames, much less about whatever clip comes after it. Bounded to a
+//!    search radius, so resolving one frame is never a timeline-wide scan.
+//! 3. **Fallback** — nothing verified within reach. Confidence exactly
+//!    0, neutral importance: this degrades to EXACTLY the plain distance
+//!    falloff, which is the point — everywhere unanalysed behaves like
+//!    Preview, and only bends once real information exists near it.
 
+use std::collections::HashMap;
 use std::ops::Range;
+
+/// Identifies a piece of underlying content — a video source, addressed
+/// the way `arrange::render::Library` addresses audio sources: an index
+/// (or any other stable id a caller assigns). Two clip instances that
+/// play the same source share this id and therefore share its segments
+/// automatically, with no extra bookkeeping — a duplicated clip is
+/// profiled for free.
+pub type SourceId = u64;
+
+/// Identifies one clip INSTANCE on the timeline. Deliberately the same
+/// shape as `arrange::model::ClipId` (a `u64`) so a caller can reuse the
+/// arrangement's own ids directly rather than maintaining a second id
+/// space, but this module takes no dependency on `arrange::model` itself
+/// — see the module doc on why instance state is never hand-maintained.
+pub type InstanceId = u64;
 
 /// A coarse content class. Ordered by ascending importance — later
 /// variants are more expensive to get wrong, not "bigger" in any other
@@ -66,18 +108,12 @@ impl Bucket {
     }
 }
 
-/// One clip's identity on the timeline, for boundary-crossing detection.
-/// An opaque id — `BucketField` doesn't need to know what a clip IS, only
-/// whether two frames belong to the same one.
-pub type ClipId = u64;
-
-/// A profiled, frozen span of one clip's frames. See [`profile::Segment`]
-/// for how these are produced and [`profile::verify`] for how staleness
-/// is caught before a segment is trusted here.
+/// A profiled, frozen span of one SOURCE's frames — see the module doc's
+/// "two kinds of fact" for why this never references a timeline clip.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Segment {
-    pub clip: ClipId,
-    /// Frame range, in the SOURCE's own frame numbering.
+    pub source: SourceId,
+    /// Frame range, in the SOURCE's own absolute frame numbering.
     pub range: Range<i64>,
     pub bucket: Bucket,
 }
@@ -86,7 +122,7 @@ pub struct Segment {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Resolved {
     pub importance: f32,
-    /// 1.0 = verified segment covers this frame exactly.
+    /// 1.0 = a verified segment covers this frame exactly.
     /// (0, 1) = guessed from a nearby verified segment.
     /// 0.0 = fallback; behave exactly like plain distance-based Preview.
     pub confidence: f32,
@@ -100,11 +136,11 @@ impl Resolved {
 /// scale by fps the same way [`cache_policy::Shells::for_fps`] does.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GuessRadius {
-    /// Frames a guess can travel within the SAME clip before its
+    /// Frames a guess can travel within the SAME instance before its
     /// confidence reaches zero.
     pub within_clip: i64,
-    /// Frames a guess can travel ACROSS a clip boundary before reaching
-    /// zero — shorter than `within_clip` on purpose.
+    /// Frames a guess can travel ACROSS an instance boundary before
+    /// reaching zero — shorter than `within_clip` on purpose.
     pub across_clip: i64,
 }
 
@@ -118,135 +154,149 @@ impl Default for GuessRadius {
     }
 }
 
-/// The verified segments for however many clips share one timeline, plus
-/// enough clip-adjacency information to know when a guess is crossing a
-/// boundary. Cheap to hold: segments, not frames.
+/// One clip instance's placement, as a caller derives it from ITS OWN
+/// timeline representation for [`BucketField::rebuild`]. Deliberately
+/// generic (not `arrange::model::Clip`) so this module stays decoupled
+/// from any one timeline shape, present or future.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement {
+    pub instance: InstanceId,
+    pub source: SourceId,
+    /// Where in the source this instance's frame 0 begins (a trimmed
+    /// head shifts this forward), and how many frames it plays.
+    pub source_offset: i64,
+    pub len: i64,
+    /// Which track it's on — adjacency is only ever derived between
+    /// clips on the SAME track; two clips that merely start around the
+    /// same time on different tracks are simultaneous, not sequential,
+    /// and say nothing about each other.
+    pub track: u64,
+    /// Position on the timeline, in the caller's own units (beats,
+    /// samples, whatever) — used only to order clips and measure gaps
+    /// for adjacency, then discarded.
+    pub start: f64,
+    pub end: f64,
+}
+
+/// One instance's mapping from its own local frame numbering (`0..len`)
+/// to the source it plays.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Instance {
+    source: SourceId,
+    source_offset: i64,
+    len: i64,
+}
+
+/// The verified segments for however many sources appear on one
+/// timeline, plus the CURRENT instance placement and adjacency — always
+/// exactly what [`BucketField::rebuild`] last computed, never
+/// hand-patched. See the module doc.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BucketField {
-    /// Sorted by `range.start` within each clip; clips are independent
-    /// (frame numbering restarts per source), so segments are grouped by
-    /// clip and each clip's list is searched on its own.
+    /// Segments, grouped implicitly by `source` at query time. Untouched
+    /// by `rebuild` — this is the hand-maintained half.
     segments: Vec<Segment>,
-    /// Clip adjacency on the timeline: `(left, right)` pairs meaning
-    /// `left`'s last frame is immediately followed by `right`'s first —
-    /// what lets a guess cross from one clip's tail into the next clip's
-    /// head. Built by the caller from the arrangement (`arrange::model`),
-    /// not derived here — this module knows nothing about beats or clips
-    /// on a grid, only which source-ids are adjacent.
-    adjacency: Vec<(ClipId, ClipId)>,
-    /// Frame COUNT of each clip's source (frames are numbered `0..len`).
-    /// Required to cross a boundary in either direction: without it, a
-    /// guess cannot tell when it has reached a clip's last frame (to step
-    /// forward into the next) or place itself at a previous clip's last
-    /// frame (to step backward into it) — the walk simply runs out of
-    /// budget short of the neighbour instead. Registering extents is what
-    /// unlocks cross-clip guessing; not registering them degrades safely
-    /// to within-clip-only guessing, never to a wrong answer.
-    extents: std::collections::HashMap<ClipId, i64>,
+    /// Rebuilt from scratch by every `rebuild` call.
+    instances: HashMap<InstanceId, Instance>,
+    adjacency: Vec<(InstanceId, InstanceId)>,
     radius: GuessRadius,
 }
 
 impl BucketField {
     pub fn new(radius: GuessRadius) -> Self {
-        Self { segments: Vec::new(), adjacency: Vec::new(), extents: Default::default(), radius }
+        Self { segments: Vec::new(), instances: HashMap::new(), adjacency: Vec::new(), radius }
     }
 
+    /// Add a verified segment for a source. Independent of the timeline —
+    /// call this once per profiled source, whenever profiling finishes or
+    /// a re-profile replaces stale segments; never in response to an
+    /// editing command.
     pub fn add_segment(&mut self, s: Segment) {
         self.segments.push(s);
-        self.segments.sort_by(|a, b| (a.clip, a.range.start).cmp(&(b.clip, b.range.start)));
     }
 
-    /// Declare that `right`'s first frame follows `left`'s last frame on
-    /// the timeline (adjacent, in playback order). Symmetric for lookup
-    /// purposes — a guess can travel either direction across the join.
-    pub fn adjoin(&mut self, left: ClipId, right: ClipId) {
-        self.adjacency.push((left, right));
+    /// Drop every segment for `source` — the caller's response to
+    /// `profile::verify` reporting it stale, before adding fresh ones.
+    pub fn clear_segments_for(&mut self, source: SourceId) {
+        self.segments.retain(|s| s.source != source);
     }
 
-    /// Register `clip`'s frame count (valid frames are `0..len`), needed
-    /// to cross a boundary to or from it. See the field doc for why.
-    pub fn set_extent(&mut self, clip: ClipId, len: i64) {
-        self.extents.insert(clip, len);
+    /// Replace ALL instance placement and adjacency with what
+    /// `placements` says right now. Call this after every structural
+    /// edit — split, trim, move, duplicate, delete, undo, redo — with the
+    /// full, current set of clips on the timeline. Cheap: this is a sort
+    /// and a linear scan per track, not per frame.
+    ///
+    /// `gap_tolerance` is how close two clips' ends must be, in the
+    /// caller's timeline units, to still count as adjacent for guessing —
+    /// exactly touching, or close enough that grid snapping didn't quite
+    /// close a real cut.
+    pub fn rebuild(&mut self, placements: &[Placement], gap_tolerance: f64) {
+        self.instances.clear();
+        self.adjacency.clear();
+        for p in placements {
+            self.instances.insert(p.instance, Instance { source: p.source, source_offset: p.source_offset, len: p.len });
+        }
+        let mut by_track: HashMap<u64, Vec<&Placement>> = HashMap::new();
+        for p in placements {
+            by_track.entry(p.track).or_default().push(p);
+        }
+        for track_clips in by_track.values_mut() {
+            track_clips.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+            for w in track_clips.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                if (b.start - a.end).abs() <= gap_tolerance {
+                    self.adjacency.push((a.instance, b.instance));
+                }
+            }
+        }
     }
 
-    fn next_clip(&self, clip: ClipId) -> Option<ClipId> {
-        self.adjacency.iter().find(|(l, _)| *l == clip).map(|(_, r)| *r)
+    fn next_instance(&self, id: InstanceId) -> Option<InstanceId> {
+        self.adjacency.iter().find(|(l, _)| *l == id).map(|(_, r)| *r)
     }
-    fn prev_clip(&self, clip: ClipId) -> Option<ClipId> {
-        self.adjacency.iter().find(|(_, r)| *r == clip).map(|(l, _)| *l)
-    }
-
-    fn segments_of(&self, clip: ClipId) -> impl Iterator<Item = &Segment> {
-        self.segments.iter().filter(move |s| s.clip == clip)
+    fn prev_instance(&self, id: InstanceId) -> Option<InstanceId> {
+        self.adjacency.iter().find(|(_, r)| *r == id).map(|(l, _)| *l)
     }
 
-    /// Level 1: an exact verified segment covering `frame` on `clip`.
-    fn exact(&self, clip: ClipId, frame: i64) -> Option<&Segment> {
-        self.segments_of(clip).find(|s| s.range.contains(&frame))
+    /// Level 1: an exact verified segment covering `instance`'s
+    /// `local_frame`, via that instance's current source mapping.
+    fn exact(&self, instance: InstanceId, local_frame: i64) -> Option<&Segment> {
+        let inst = self.instances.get(&instance)?;
+        let abs = inst.source_offset + local_frame;
+        self.segments.iter().find(|s| s.source == inst.source && s.range.contains(&abs))
     }
 
-    /// Level 2: walk outward from `(clip, frame)` up to the guess radius,
-    /// across clip boundaries via `adjacency` and `extents`, and blend
-    /// every verified segment found within reach. Multiple hits blend by
-    /// weight (nearer, and same-clip, evidence dominates) rather than
-    /// just taking the nearest, because two agreeing nearby segments
-    /// should read as more confident than one.
-    fn guess(&self, clip: ClipId, frame: i64) -> Resolved {
+    /// Level 2: walk outward from `(instance, local_frame)` up to the
+    /// guess radius, across adjacency into neighbouring instances, and
+    /// blend every verified segment found within reach.
+    fn guess(&self, instance: InstanceId, local_frame: i64) -> Resolved {
         let mut weighted_importance = 0.0f32;
         let mut weight_sum = 0.0f32;
         let mut best_confidence = 0.0f32;
 
-        // Walk in both directions independently; each carries its own
-        // remaining "budget" in frames, spent at 1:1 within a clip and
-        // RESET (not summed) to `across_clip` on crossing a boundary —
-        // crossing costs a fresh, shorter budget, it doesn't inherit
-        // whatever was left of the longer within-clip one.
         for dir in [-1i64, 1i64] {
-            let mut cur_clip = clip;
-            let mut cur_frame = frame;
+            if !self.instances.contains_key(&instance) {
+                return Resolved::FALLBACK;
+            }
+            let mut cur = instance;
+            let mut cur_frame = local_frame;
             let mut budget = self.radius.within_clip;
             let mut travelled = 0i64;
             let mut crossed = 0u32;
             loop {
-                if budget <= 0 {
+                if budget <= 0 || crossed > 5 {
                     break;
                 }
-                // A safety cap, not just a tuning knob: without it, a
-                // pathological chain of zero-length clips could cross
-                // forever without ever spending `budget` (each crossing
-                // resets it). Five crossings is already far past where
-                // `boundary_attenuation` (0.6^5 ≈ 0.078) makes the result
-                // meaningless, so this never fires on real input.
-                if crossed > 5 {
-                    break;
-                }
+                let Some(cur_inst) = self.instances.get(&cur) else { break };
                 let next_frame = cur_frame + dir;
-                let len = self.extents.get(&cur_clip).copied();
-
-                let crossing = if dir < 0 {
-                    next_frame < 0
-                } else {
-                    len.map_or(false, |l| next_frame >= l)
-                };
+                let crossing = if dir < 0 { next_frame < 0 } else { next_frame >= cur_inst.len };
                 if crossing {
-                    // Only crossable when the CURRENT clip's extent is
-                    // known for a forward cross (to know the far clip's
-                    // start is 0, which is always true — the real
-                    // requirement is knowing WE'VE reached the end, i.e.
-                    // len). A backward cross needs the PREVIOUS clip's
-                    // extent, to know where its last frame is.
-                    let next = if dir < 0 { self.prev_clip(cur_clip) } else { self.next_clip(cur_clip) };
-                    let Some(next_clip) = next else { break };
-                    let entry_frame = if dir < 0 {
-                        match self.extents.get(&next_clip) {
-                            Some(&l) if l > 0 => l - 1,
-                            _ => break, // can't place ourselves without the neighbour's length
-                        }
-                    } else {
-                        0
-                    };
-                    cur_clip = next_clip;
-                    cur_frame = entry_frame;
+                    let neighbour = if dir < 0 { self.prev_instance(cur) } else { self.next_instance(cur) };
+                    let Some(next_id) = neighbour else { break };
+                    let Some(next_inst) = self.instances.get(&next_id) else { break };
+                    cur = next_id;
+                    cur_frame = if dir < 0 { next_inst.len - 1 } else { 0 };
                     crossed += 1;
                     budget = self.radius.across_clip;
                 } else {
@@ -255,7 +305,7 @@ impl BucketField {
                 }
                 travelled += 1;
 
-                if let Some(seg) = self.exact(cur_clip, cur_frame) {
+                if let Some(seg) = self.exact(cur, cur_frame) {
                     let clip_reach = if crossed == 0 { self.radius.within_clip } else { self.radius.across_clip };
                     let boundary_attenuation = 0.6f32.powi(crossed as i32);
                     let decay = (1.0 - travelled as f32 / clip_reach.max(1) as f32).max(0.0);
@@ -276,12 +326,18 @@ impl BucketField {
         Resolved { importance: (weighted_importance / weight_sum).clamp(0.0, 1.0), confidence: best_confidence.clamp(0.0, 1.0) }
     }
 
-    /// Resolve one frame on one clip through all three levels.
-    pub fn resolve(&self, clip: ClipId, frame: i64) -> Resolved {
-        if let Some(seg) = self.exact(clip, frame) {
+    /// Resolve one frame of one CURRENT timeline instance through all
+    /// three levels. `instance` must be one `rebuild` was last called
+    /// with, or this returns fallback (an instance `rebuild` doesn't know
+    /// about has no placement to resolve through).
+    pub fn resolve(&self, instance: InstanceId, local_frame: i64) -> Resolved {
+        if !self.instances.contains_key(&instance) {
+            return Resolved::FALLBACK;
+        }
+        if let Some(seg) = self.exact(instance, local_frame) {
             return Resolved { importance: seg.bucket.importance(), confidence: 1.0 };
         }
-        self.guess(clip, frame)
+        self.guess(instance, local_frame)
     }
 }
 
@@ -293,111 +349,215 @@ mod tests {
         BucketField::new(GuessRadius::default())
     }
 
+    fn place(instance: InstanceId, source: SourceId, offset: i64, len: i64, track: u64, start: f64) -> Placement {
+        Placement { instance, source, source_offset: offset, len, track, start, end: start + len as f64 }
+    }
+
     #[test]
     fn an_exact_verified_segment_resolves_at_full_confidence() {
         let mut f = field();
-        f.add_segment(Segment { clip: 1, range: 100..140, bucket: Bucket::Face });
-        let r = f.resolve(1, 120);
+        f.add_segment(Segment { source: 100, range: 0..40, bucket: Bucket::Face });
+        f.rebuild(&[place(1, 100, 0, 200, 0, 0.0)], 0.0);
+        let r = f.resolve(1, 20);
         assert_eq!(r.confidence, 1.0);
         assert_eq!(r.importance, Bucket::Face.importance());
     }
 
     #[test]
-    fn a_gap_within_one_clip_decays_smoothly_away_from_the_known_segment() {
+    fn a_gap_within_one_instance_decays_smoothly_away_from_the_known_segment() {
         let mut f = field();
-        f.add_segment(Segment { clip: 1, range: 100..104, bucket: Bucket::Face });
-        let near = f.resolve(1, 108);
-        let far = f.resolve(1, 140);
-        assert!(near.confidence > 0.0, "just past the segment should still guess something");
-        assert!(near.confidence > far.confidence, "confidence should fall off with distance");
-        assert!(near.importance > 0.0);
-        // Monotonic decay, not a step function.
-        let mid = f.resolve(1, 120);
-        assert!(near.confidence >= mid.confidence && mid.confidence >= far.confidence);
+        f.add_segment(Segment { source: 1, range: 0..4, bucket: Bucket::Face });
+        f.rebuild(&[place(1, 1, 0, 200, 0, 0.0)], 0.0);
+        let near = f.resolve(1, 8);
+        let far = f.resolve(1, 40);
+        assert!(near.confidence > 0.0);
+        assert!(near.confidence > far.confidence, "near {} far {}", near.confidence, far.confidence);
     }
 
     #[test]
-    fn guessing_across_a_clip_boundary_decays_faster_than_the_same_distance_within_one_clip() {
-        // Clip 1 is 100 frames (0..100), with a Face segment right at its
-        // tail (90..100); clip 2 follows it and has NO segments of its
-        // own. Resolving 5 frames into clip 2 means crossing the join.
-        let mut across_field = field();
-        across_field.add_segment(Segment { clip: 1, range: 90..100, bucket: Bucket::Face });
-        across_field.set_extent(1, 100);
-        across_field.adjoin(1, 2);
-        let across = across_field.resolve(2, 5); // clip 2's OWN frame 5, i.e. 5 past the join
+    fn guessing_across_an_instance_boundary_decays_faster_than_the_same_distance_within_one() {
+        // Instance 1 plays 100 frames of source 1, with a Face segment at
+        // its tail; instance 2 plays a DIFFERENT source with no segments
+        // of its own and is placed immediately after instance 1.
+        let mut across = field();
+        across.add_segment(Segment { source: 1, range: 90..100, bucket: Bucket::Face });
+        across.rebuild(&[place(1, 1, 0, 100, 0, 0.0), place(2, 2, 0, 500, 0, 100.0)], 0.0);
+        let across_r = across.resolve(2, 5); // 5 frames into instance 2
 
-        // Same absolute walking distance (5 steps past the segment's
-        // edge), but never leaving the clip: a Face segment ending at
-        // frame 100 (exclusive) in a single, longer clip, probed 5
-        // frames later at 105 — no boundary anywhere on the path.
-        let mut within_field = field();
-        within_field.add_segment(Segment { clip: 1, range: 90..100, bucket: Bucket::Face });
-        let within = within_field.resolve(1, 105);
+        let mut within = field();
+        within.add_segment(Segment { source: 1, range: 90..100, bucket: Bucket::Face });
+        within.rebuild(&[place(1, 1, 0, 500, 0, 0.0)], 0.0); // one long instance, no boundary
+        let within_r = within.resolve(1, 105); // same absolute distance, no crossing
 
-        assert!(within.confidence > across.confidence, "within {} vs across {}", within.confidence, across.confidence);
-        assert!(across.confidence > 0.0, "the cross-clip guess should still find something, just weaker");
+        assert!(within_r.confidence > across_r.confidence);
+        assert!(across_r.confidence > 0.0);
     }
 
     #[test]
-    fn a_guess_beyond_the_radius_or_with_no_neighbour_falls_back_to_neutral() {
-        let mut f = field();
-        f.add_segment(Segment { clip: 1, range: 0..10, bucket: Bucket::Face });
-        let far = f.resolve(1, 10_000);
-        assert_eq!(far, Resolved::FALLBACK);
-        // An isolated clip with no adjacency and no segments of its own.
-        let g = field();
-        assert_eq!(g.resolve(9, 0), Resolved::FALLBACK);
-    }
-
-    #[test]
-    fn fallback_confidence_is_exactly_zero_so_feel_mode_can_degrade_to_plain_distance_falloff() {
+    fn fallback_is_neutral_and_exact_for_an_unknown_instance() {
         let f = field();
-        let r = f.resolve(1, 50);
-        assert_eq!(r.confidence, 0.0);
-        assert_eq!(r.importance, 0.0, "neutral, same as Bucket::Static");
+        assert_eq!(f.resolve(999, 0), Resolved::FALLBACK);
+    }
+
+    // ---------------------------------------------------------------
+    // The property this whole design exists for: driving the REAL editor
+    // (arrange::cmd) through structural edits must never require touching
+    // a segment, and adjacency must always reflect whatever the timeline
+    // looks like AFTER the edit — never what it looked like before.
+    // ---------------------------------------------------------------
+
+    use crate::arrange::cmd::{Command, Editor};
+    use crate::arrange::model::SourceRef;
+
+    /// Turn the editor's current timeline into `Placement`s, exactly as a
+    /// real caller would before calling `rebuild`. `SourceRef` (a
+    /// `Beat(usize)`/`File(usize)`) is folded into one `u64` `SourceId`
+    /// space so the two kinds never collide.
+    fn placements_from(ed: &Editor) -> Vec<Placement> {
+        let source_id = |r: SourceRef| -> SourceId {
+            match r {
+                SourceRef::Beat(i) => i as u64,
+                SourceRef::File(i) => 0x8000_0000_0000_0000 | i as u64,
+            }
+        };
+        // An arbitrary, fixed frames-per-beat for these tests, so a
+        // clip's `len`/`offset` (in beats) convert to whole frame counts.
+        const FPB: f64 = 100.0;
+        ed.timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().map(move |c| (t.id, c)))
+            .map(|(track, c)| Placement {
+                instance: c.id,
+                source: source_id(c.source),
+                source_offset: (c.offset * FPB).round() as i64,
+                len: (c.len * FPB).round() as i64,
+                track,
+                start: c.start,
+                end: c.end(),
+            })
+            .collect()
     }
 
     #[test]
-    fn two_nearby_segments_agreeing_are_more_confident_than_either_alone() {
-        // A Face segment on each side of a small gap: the guess in the
-        // middle should reflect both, and its confidence should be at
-        // least as high as the stronger single-sided guess would be.
-        let mut both = field();
-        both.add_segment(Segment { clip: 1, range: 0..10, bucket: Bucket::Face });
-        both.add_segment(Segment { clip: 1, range: 30..40, bucket: Bucket::Face });
-        let mid_both = both.resolve(1, 20);
+    fn splitting_a_clip_leaves_every_frames_resolution_unchanged() {
+        let mut e = Editor::default();
+        let t0 = e.timeline.tracks[0].id;
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 4.0, exact: false, lock: None }).unwrap().created[0];
 
-        let mut one = field();
-        one.add_segment(Segment { clip: 1, range: 0..10, bucket: Bucket::Face });
-        let mid_one = one.resolve(1, 20);
+        let mut field = field();
+        // A segment covering the middle of the 400-frame source (4 beats
+        // * 100 frames/beat in this test's arbitrary scale).
+        field.add_segment(Segment { source: 0, range: 150..250, bucket: Bucket::Face });
+        field.rebuild(&placements_from(&e), 0.0);
+        let before: Vec<Resolved> = (0..400).map(|f| field.resolve(a, f)).collect();
 
-        assert!(mid_both.confidence >= mid_one.confidence);
-        assert!(mid_both.importance > 0.0);
+        let r = e.apply(Command::Split { clip: a, beat: 2.0 }).unwrap();
+        let b = r.created[0];
+        field.rebuild(&placements_from(&e), 0.0);
+
+        // The left half (instance `a`) still covers source frames 0..200,
+        // the right half (instance `b`) covers 200..400 — same absolute
+        // frames, same segment, resolved through whichever instance now
+        // owns them. No segment was touched by the split.
+        for f in 0..200i64 {
+            assert_eq!(field.resolve(a, f), before[f as usize], "frame {f} after split (left half)");
+        }
+        for f in 200..400i64 {
+            let local = f - 200;
+            assert_eq!(field.resolve(b, local), before[f as usize], "frame {f} after split (right half, local {local})");
+        }
     }
 
     #[test]
-    fn an_unprofiled_clip_next_to_a_profiled_one_can_still_reach_across() {
-        let mut f = field();
-        f.add_segment(Segment { clip: 1, range: 90..100, bucket: Bucket::CutBoundary });
-        f.set_extent(1, 100); // required to know clip 1's tail is the join
-        f.adjoin(1, 2); // clip 2 has NO segments of its own at all
-        let just_in = f.resolve(2, 3); // near clip 2's start, close to the join
-        assert!(just_in.confidence > 0.0, "an entirely unprofiled clip should still borrow from its neighbour near the seam");
-        let deep_in = f.resolve(2, 1000);
-        assert_eq!(deep_in, Resolved::FALLBACK, "far from the seam, with nothing of its own, it's neutral");
+    fn trimming_a_clip_does_not_touch_segments_and_still_resolves_the_visible_frames_correctly() {
+        let mut e = Editor::default();
+        let t0 = e.timeline.tracks[0].id;
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::File(0), start: 0.0, source_beats: 4.0, exact: false, lock: None }).unwrap().created[0];
+
+        let mut field = field();
+        field.add_segment(Segment { source: 0x8000_0000_0000_0000, range: 50..150, bucket: Bucket::CutBoundary });
+        field.rebuild(&placements_from(&e), 0.0);
+
+        // Head-trim by one beat (100 frames at this test's scale): the
+        // instance now plays source frames 100..400.
+        e.apply(Command::Trim { clip: a, start: 1.0, len: 3.0, offset: 1.0 }).unwrap();
+        field.rebuild(&placements_from(&e), 0.0);
+
+        // Source frame 120 is now local frame 20 (120 - 100 offset), and
+        // must still resolve to the same segment.
+        assert_eq!(field.resolve(a, 20).importance, Bucket::CutBoundary.importance());
+        assert_eq!(field.resolve(a, 20).confidence, 1.0);
     }
 
     #[test]
-    fn without_a_registered_extent_a_guess_cannot_cross_forward_but_stays_correct() {
-        // The safe-degradation case named in the doc: adjacency exists
-        // but clip 1's length was never registered, so a forward guess
-        // from inside clip 1 cannot know where the join is and simply
-        // exhausts its within-clip budget instead of crossing incorrectly.
-        let mut f = field();
-        f.add_segment(Segment { clip: 2, range: 0..5, bucket: Bucket::Face });
-        f.adjoin(1, 2); // no set_extent(1, ..)
-        let r = f.resolve(1, 0);
-        assert_eq!(r, Resolved::FALLBACK, "cannot safely reach clip 2 without knowing clip 1's length");
+    fn moving_a_clip_changes_adjacency_but_never_a_segment() {
+        let mut e = Editor::default();
+        let t0 = e.timeline.tracks[0].id;
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false, lock: None }).unwrap().created[0];
+        e.apply(Command::Place { track: t0, source: SourceRef::Beat(1), start: 2.0, source_beats: 2.0, exact: false, lock: None }).unwrap();
+
+        let mut field = field();
+        field.add_segment(Segment { source: 1, range: 0..10, bucket: Bucket::Face }); // Beat(1)'s source
+        field.rebuild(&placements_from(&e), 0.0);
+        // a and its neighbour are adjacent (touching at beat 2); the
+        // neighbour's Face segment is reachable by a guess from a's tail.
+        let a_tail_before = field.resolve(a, 199); // last local frame of a (200 frames long)
+        assert!(a_tail_before.confidence > 0.0, "a should see its neighbour's Face segment across the join");
+
+        // A fresh arrangement where a's neighbour instead plays a source
+        // with NO segments — same shape, different adjacency — proves the
+        // guess result follows whatever `rebuild` was last given, not
+        // anything remembered from before.
+        let mut e2 = Editor::default();
+        let t0b = e2.timeline.tracks[0].id;
+        let a2 = e2.apply(Command::Place { track: t0b, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false, lock: None }).unwrap().created[0];
+        e2.apply(Command::Place { track: t0b, source: SourceRef::Beat(0), start: 2.0, source_beats: 2.0, exact: false, lock: None }).unwrap();
+        field.rebuild(&placements_from(&e2), 0.0);
+        let a_tail_after = field.resolve(a2, 199);
+        assert_eq!(a_tail_after, Resolved::FALLBACK, "the new neighbour's source has no Face segment, so the guess must find nothing");
+    }
+
+    #[test]
+    fn duplicating_a_clip_shares_its_sources_segments_for_free() {
+        let mut e = Editor::default();
+        let t0 = e.timeline.tracks[0].id;
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false, lock: None }).unwrap().created[0];
+
+        let mut field = field();
+        field.add_segment(Segment { source: 0, range: 50..150, bucket: Bucket::Face });
+        field.rebuild(&placements_from(&e), 0.0);
+        let original = field.resolve(a, 100);
+
+        let r = e.apply(Command::Duplicate { clips: vec![a], delta_beats: 2.0 }).unwrap();
+        let dup = r.created[0];
+        // No new segment was added anywhere — only the timeline changed.
+        field.rebuild(&placements_from(&e), 0.0);
+        let duplicate_resolution = field.resolve(dup, 100);
+
+        assert_eq!(original, duplicate_resolution, "the duplicate shares its source's profile with zero extra bookkeeping");
+    }
+
+    #[test]
+    fn deleting_a_clip_and_undoing_leaves_its_sources_segments_intact() {
+        let mut e = Editor::default();
+        let t0 = e.timeline.tracks[0].id;
+        let a = e.apply(Command::Place { track: t0, source: SourceRef::Beat(0), start: 0.0, source_beats: 2.0, exact: false, lock: None }).unwrap().created[0];
+
+        let mut field = field();
+        field.add_segment(Segment { source: 0, range: 0..200, bucket: Bucket::Face });
+        field.rebuild(&placements_from(&e), 0.0);
+        assert_eq!(field.resolve(a, 50).confidence, 1.0);
+
+        e.apply(Command::Delete { clips: vec![a] }).unwrap();
+        field.rebuild(&placements_from(&e), 0.0);
+        // The instance is gone; resolving it is a defined fallback, not a
+        // panic, and the segment itself is untouched (still there for
+        // whatever NEW instance next plays source 0).
+        assert_eq!(field.resolve(a, 50), Resolved::FALLBACK);
+
+        e.undo();
+        field.rebuild(&placements_from(&e), 0.0);
+        assert_eq!(field.resolve(a, 50).confidence, 1.0, "the segment survived the delete/undo round trip untouched");
     }
 }

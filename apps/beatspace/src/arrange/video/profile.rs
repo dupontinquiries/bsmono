@@ -47,7 +47,7 @@
 //! rather than letting frozen profiles silently start meaning something
 //! different from what they said when they were written.
 
-use super::bucket::{Bucket, ClipId, Segment};
+use super::bucket::{Bucket, Segment, SourceId};
 
 /// Bumped whenever the SCORING ALGORITHM changes — the motion formula,
 /// the skin heuristic, the cut threshold, or the segment merge rule.
@@ -187,7 +187,7 @@ impl Default for Params {
 /// the same classification are merged into one segment; this is also
 /// where a cut's margin gets expanded and can absorb neighbouring frames
 /// of the same or lower priority.
-pub fn profile(clip: ClipId, scores: &Scores, params: Params) -> Vec<Segment> {
+pub fn profile(source: SourceId, scores: &Scores, params: Params) -> Vec<Segment> {
     let n = scores.motion.len();
     if n == 0 || scores.skin.len() != n {
         return Vec::new();
@@ -210,7 +210,7 @@ pub fn profile(clip: ClipId, scores: &Scores, params: Params) -> Vec<Segment> {
     let mut start = 0usize;
     for i in 1..=n {
         if i == n || buckets[i] != buckets[start] {
-            segments.push(Segment { clip, range: (start as i64)..(i as i64), bucket: buckets[start] });
+            segments.push(Segment { source, range: (start as i64)..(i as i64), bucket: buckets[start] });
             start = i;
         }
     }
@@ -264,8 +264,8 @@ pub struct ProfileFreeze {
 }
 
 impl ProfileFreeze {
-    pub fn new(clip: ClipId, scores: &Scores, params: Params) -> Self {
-        Self { version: CURRENT_VERSION, fingerprint: fingerprint(scores), segments: profile(clip, scores, params) }
+    pub fn new(source: SourceId, scores: &Scores, params: Params) -> Self {
+        Self { version: CURRENT_VERSION, fingerprint: fingerprint(scores), segments: profile(source, scores, params) }
     }
 }
 
@@ -374,9 +374,9 @@ mod tests {
         // Expect: Static 0..25, CutBoundary 25..36, Static 36..60 (margin
         // 5 on each side of frame 30).
         assert_eq!(segs.len(), 3, "{segs:?}");
-        assert_eq!(segs[0], Segment { clip: 7, range: 0..25, bucket: Bucket::Static });
-        assert_eq!(segs[1], Segment { clip: 7, range: 25..36, bucket: Bucket::CutBoundary });
-        assert_eq!(segs[2], Segment { clip: 7, range: 36..60, bucket: Bucket::Static });
+        assert_eq!(segs[0], Segment { source: 7, range: 0..25, bucket: Bucket::Static });
+        assert_eq!(segs[1], Segment { source: 7, range: 25..36, bucket: Bucket::CutBoundary });
+        assert_eq!(segs[2], Segment { source: 7, range: 36..60, bucket: Bucket::Static });
     }
 
     #[test]
@@ -386,7 +386,7 @@ mod tests {
         motion[20] = 0.9; // a cut happens mid-shot (e.g. a lighting change)
         let skin = vec![0.5f32; n]; // skin throughout
         let segs = profile(1, &Scores { motion, skin }, Params::default());
-        assert_eq!(segs, vec![Segment { clip: 1, range: 0..40, bucket: Bucket::Face }], "Face outranks CutBoundary throughout");
+        assert_eq!(segs, vec![Segment { source: 1, range: 0..40, bucket: Bucket::Face }], "Face outranks CutBoundary throughout");
     }
 
     #[test]
