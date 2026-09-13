@@ -730,6 +730,24 @@ impl Game {
         true
     }
 
+    /// Sell the item in build slot `slot` for a fraction of its cost
+    /// (`SELL_REFUND`) — a mispurchase or a build pivot shouldn't be
+    /// permanent. Returns the gold refunded, or `None` if the slot is empty.
+    pub fn sell_item(&mut self, gi: usize, slot: usize) -> Option<f32> {
+        let g = &mut self.gods[gi];
+        if slot >= g.items.len() {
+            return None;
+        }
+        let item_id = g.items.remove(slot);
+        if slot < g.stacks.len() {
+            g.stacks.remove(slot);
+        }
+        let refund = (items::all()[item_id as usize].cost * SELL_REFUND).round();
+        g.gold += refund;
+        self.recalc(gi);
+        Some(refund)
+    }
+
     /// AI auto-buy: walk the role build order, buy the best affordable item.
     pub fn auto_buy(&mut self, gi: usize) {
         let role = self.def(gi).role;
@@ -761,5 +779,24 @@ impl Game {
         (0..self.gods.len())
             .filter(|&i| self.gods[i].team != team && self.gods[i].respawn_t <= 0.0 && self.gods[i].pos.distance(pos) <= radius)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod shop_tests {
+    use super::*;
+
+    #[test]
+    fn selling_refunds_a_fraction_and_frees_the_slot() {
+        let mut g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        let item = items::all().iter().find(|i| i.cat == items::Cat::Health).unwrap();
+        g.gods[0].gold = item.cost;
+        assert!(g.buy_item(0, item.id));
+        assert_eq!(g.gods[0].items.len(), 1);
+        let refund = g.sell_item(0, 0).expect("a real slot");
+        assert!((refund - item.cost * SELL_REFUND).abs() < 1e-3);
+        assert_eq!(g.gods[0].gold, refund, "sold with nothing else bought, gold is exactly the refund");
+        assert!(g.gods[0].items.is_empty());
+        assert!(g.sell_item(0, 0).is_none(), "an empty slot sells nothing");
     }
 }

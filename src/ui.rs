@@ -7,8 +7,47 @@ use glam::{Mat4, Vec3};
 
 use crate::consts::{self, Team, ARENA_RADIUS, LANES};
 use crate::gods::ROSTER;
+use crate::gridpick::GridPicker;
 use crate::items;
 use crate::sim::{AiState, Game};
+
+// --- shared animation helpers -------------------------------------------------
+// egui's `animate_bool` is already framerate-independent (it reads the
+// frame's own dt internally), so it's the whole mechanism: no timers of our
+// own to drift or forget to advance. `pulse_*` layers a one-shot decaying
+// flash on top (purchases, ability-ready, capture toggling) using egui's
+// persistent widget memory as the only place that state lives, so nothing
+// here needs to be threaded through `UiState`.
+
+/// Smoothed 0..1 hover amount for `id` this frame.
+fn hover_t(ctx: &egui::Context, id: egui::Id, hovered: bool) -> f32 {
+    ctx.animate_bool(id, hovered)
+}
+
+/// Draw a soft glow around `resp`'s rect that grows in as it's hovered.
+fn glow_hover(ui: &mut egui::Ui, resp: &egui::Response, color: Color32, corner: f32) {
+    let t = hover_t(ui.ctx(), resp.id, resp.hovered());
+    if t > 0.002 {
+        let r = resp.rect.expand(1.0 + t * 3.0);
+        ui.painter().rect_stroke(r, corner, Stroke::new(1.0 + t * 1.8, color.linear_multiply(t)));
+    }
+}
+
+/// Trigger a one-shot flash under `id` (call once, on the event).
+fn pulse_set(ctx: &egui::Context, id: egui::Id) {
+    ctx.data_mut(|d| d.insert_temp(id, 1.0f32));
+}
+
+/// Read + advance the flash under `id`: 1.0 the frame it's set, decaying to
+/// 0 over roughly `1/decay` seconds. Call at most once per id per frame.
+fn pulse_get(ctx: &egui::Context, id: egui::Id, decay: f32) -> f32 {
+    let dt = ctx.input(|i| i.stable_dt).min(0.1);
+    let v = ctx.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
+    if v > 0.0 {
+        ctx.data_mut(|d| d.insert_temp(id, (v - dt * decay).max(0.0)));
+    }
+    v
+}
 
 pub const GOLD: Color32 = Color32::from_rgb(222, 186, 96);
 pub const PANEL: Color32 = Color32::from_rgba_premultiplied(12, 12, 18, 225);
@@ -25,6 +64,8 @@ pub struct Floater {
 
 #[derive(Default)]
 pub struct UiState {
+    /// the player's display name from the game centre, if launched from it
+    pub player_label: Option<String>,
     pub shop_open: bool,
     pub shop_tab: items::Cat,
     pub selected: usize,
@@ -32,6 +73,13 @@ pub struct UiState {
     pub floaters: Vec<Floater>,
     pub announce: Option<(String, f32, f32)>,
     pub show_controls: bool,
+    /// ancestor-select grid: search box + cursor, shared logic with the shop
+    /// (gridpick.rs, adapted from games/clawbound's lobby picker)
+    pub pick: GridPicker,
+    /// shop item grid: same picker, scoped to the active category
+    pub shop_pick: GridPicker,
+    /// slot pending a sell confirmation click (click once to arm, again to sell)
+    pub sell_armed: Option<usize>,
 }
 
 impl UiState {
@@ -39,6 +87,8 @@ impl UiState {
         UiState {
             shop_tab: items::Cat::Strength,
             selected: 0,
+            pick: GridPicker::new(3),
+            shop_pick: GridPicker::new(2),
             ..Default::default()
         }
     }
@@ -128,11 +178,18 @@ pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool) {
             ui.label(egui::RichText::new("Rust · wgpu · Microvoxels — the thirteen legendary ancestors").size(15.0).color(Color32::from_rgb(150, 148, 140)));
             ui.add_space(28.0);
             let play_btn = ui.add_sized([260.0, 52.0], egui::Button::new(egui::RichText::new("▶  PLAY").size(24.0).color(Color32::BLACK).strong()).fill(GOLD));
+            let t = hover_t(ctx, play_btn.id, play_btn.hovered());
+            glow_hover(ui, &play_btn, GOLD, 6.0);
+            if t > 0.001 {
+                ui.painter().rect_filled(play_btn.rect, 6.0, Color32::from_white_alpha((t * 40.0) as u8));
+            }
             if play_btn.clicked() {
                 *play = true;
             }
             ui.add_space(8.0);
-            if ui.add_sized([260.0, 34.0], egui::Button::new(egui::RichText::new("Quit").size(16.0))).clicked() {
+            let quit_btn = ui.add_sized([260.0, 34.0], egui::Button::new(egui::RichText::new("Quit").size(16.0)));
+            glow_hover(ui, &quit_btn, Color32::from_rgb(200, 90, 80), 5.0);
+            if quit_btn.clicked() {
                 *quit = true;
             }
             ui.add_space(20.0);
@@ -146,45 +203,96 @@ pub fn draw_menu(ctx: &egui::Context, play: &mut bool, quit: &mut bool) {
 
 pub fn draw_select(ctx: &egui::Context, ui_state: &mut UiState, locked: &mut bool) {
     setup_style(ctx);
+    // Ancestor tag list for the picker: (name, "Role Melee/Ranged") — typing
+    // "guard" or "ranged" narrows the grid same as typing a name.
+    let tags: Vec<(&'static str, String)> = ROSTER
+        .iter()
+        .map(|d| (d.name, format!("{} {}", d.role.name(), if d.auto_range > 6.0 { "ranged" } else { "melee" })))
+        .collect();
+    let text = ancestor_tag_text;
+
     // left: roster grid
     egui::SidePanel::left("roster").exact_width(560.0).resizable(false).show(ctx, |ui| {
         ui.heading(egui::RichText::new("CHOOSE YOUR ANCESTOR").size(24.0).color(GOLD));
+        ui.add_space(4.0);
+        let search_id = egui::Id::new("select_search");
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut ui_state.pick.search)
+                .id(search_id)
+                .hint_text("search by name or role (e.g. \"guardian\", \"ranged\")")
+                .desired_width(f32::INFINITY),
+        );
+        if resp.changed() {
+            let s = ui_state.pick.search.clone();
+            ui_state.pick.set_search(s);
+        }
+        let search_focused = resp.has_focus();
         ui.add_space(6.0);
+
+        let shown = ui_state.pick.shown(&tags, text);
+        // keyboard grid nav — only when the search box isn't eating the keys
+        if !search_focused {
+            let (dx, dy, enter) = ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowRight) as i32 - i.key_pressed(egui::Key::ArrowLeft) as i32,
+                    i.key_pressed(egui::Key::ArrowDown) as i32 - i.key_pressed(egui::Key::ArrowUp) as i32,
+                    i.key_pressed(egui::Key::Enter),
+                )
+            });
+            if dx != 0 || dy != 0 {
+                ui_state.pick.move_cursor(dx, dy, shown.len());
+            }
+            if enter {
+                if let Some(i) = ui_state.pick.hovered(&tags, text) {
+                    ui_state.selected = i;
+                    *locked = true;
+                }
+            }
+        }
+        if let Some(i) = ui_state.pick.hovered(&tags, text) {
+            ui_state.selected = i;
+        }
+
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for row in 0..(ROSTER.len() + 2) / 3 {
+            if shown.is_empty() {
+                ui.add_space(20.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("no ancestor matches that search").size(14.0).color(Color32::from_rgb(150, 148, 140)));
+                });
+            }
+            for (cell, chunk) in shown.chunks(3).enumerate() {
                 ui.horizontal(|ui| {
-                    for colx in 0..3 {
-                        let i = row * 3 + colx;
-                        if i >= ROSTER.len() {
-                            continue;
-                        }
+                    for (col, &i) in chunk.iter().enumerate() {
                         let def = &ROSTER[i];
-                        let selected = ui_state.selected == i;
+                        let cursor_here = ui_state.pick.cursor == cell * 3 + col;
+                        let id = egui::Id::new("ancestor_card").with(i);
                         let (rect, resp) = ui.allocate_exact_size(Vec2::new(172.0, 210.0), Sense::click());
-                        let bg = if selected { GOLD.linear_multiply(0.35) } else { PANEL2 };
-                        ui.painter().rect_filled(rect, 8.0, bg);
-                        let border = if selected { Stroke::new(3.0_f32, GOLD) } else { Stroke::new(1.0_f32, Color32::from_rgb(70, 68, 80)) };
-                        ui.painter().rect_stroke(rect, 8.0, border);
-                        // portrait
+                        let t = hover_t(ctx, id, resp.hovered() || cursor_here);
+                        // a light lift on hover: the card grows a couple of
+                        // pixels around its own centre rather than jumping
+                        let r = rect.expand(t * 2.5);
+                        let bg = if cursor_here { GOLD.linear_multiply(0.35) } else { PANEL2.linear_multiply(1.0 + t * 0.15) };
+                        ui.painter().rect_filled(r, 8.0, bg);
+                        let border = if cursor_here {
+                            Stroke::new(3.0_f32, GOLD)
+                        } else {
+                            Stroke::new(1.0 + t * 1.5, Color32::from_rgb(70 + (t * 90.0) as u8, 68 + (t * 85.0) as u8, 80 + (t * 90.0) as u8))
+                        };
+                        ui.painter().rect_stroke(r, 8.0, border);
                         if let Some(tid) = ui_state.portraits.get(&(i as u32)) {
-                            let pr = Rect::from_min_size(rect.left_top() + Vec2::new(26.0, 10.0), Vec2::new(120.0, 120.0));
+                            let pr = Rect::from_center_size(r.center() + Vec2::new(0.0, -45.0 - t * 2.0), Vec2::splat(120.0 + t * 3.0));
                             ui.painter().image(*tid, pr, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
                         }
+                        ui.painter().text(r.center_bottom() + Vec2::new(0.0, -46.0), Align2::CENTER_CENTER, def.name, FontId::proportional(19.0), Color32::from_rgb(240, 235, 220));
                         ui.painter().text(
-                            rect.center_bottom() + Vec2::new(0.0, -46.0),
-                            Align2::CENTER_CENTER,
-                            def.name,
-                            FontId::proportional(19.0),
-                            Color32::from_rgb(240, 235, 220),
-                        );
-                        ui.painter().text(
-                            rect.center_bottom() + Vec2::new(0.0, -26.0),
+                            r.center_bottom() + Vec2::new(0.0, -26.0),
                             Align2::CENTER_CENTER,
                             format!("{} · {}", def.role.name(), if def.auto_range > 6.0 { "Ranged" } else { "Melee" }),
                             FontId::proportional(12.0),
                             Color32::from_rgb(160, 158, 150),
                         );
                         if resp.clicked() {
+                            ui_state.pick.point(cell * 3 + col, shown.len());
                             ui_state.selected = i;
                         }
                     }
@@ -237,6 +345,8 @@ pub fn draw_select(ctx: &egui::Context, ui_state: &mut UiState, locked: &mut boo
         }
         ui.add_space(14.0);
         let lock = ui.add_sized([300.0, 48.0], egui::Button::new(egui::RichText::new("LOCK IN").size(22.0).color(Color32::BLACK).strong()).fill(GOLD));
+        glow_hover(ui, &lock, GOLD, 8.0);
+        ui.label(egui::RichText::new("Enter also locks in · type to search · ← → ↑ ↓ to browse").size(11.0).color(Color32::from_rgb(140, 138, 130)));
         if lock.clicked() {
             *locked = true;
         }
@@ -579,34 +689,85 @@ pub fn draw_shop(ctx: &egui::Context, game: &mut Game, player: usize, ui_state: 
     setup_style(ctx);
     egui::Window::new(egui::RichText::new("ARMORY").size(22.0).color(GOLD))
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .fixed_size(Vec2::new(940.0, 620.0))
+        .fixed_size(Vec2::new(960.0, 660.0))
         .collapsible(false)
         .resizable(false)
         .show(ctx, |ui| {
-            let g = &game.gods[player];
+            let gold = game.gods[player].gold;
+            let role = game.def(player).role;
+            let recommended: [items::Cat; 2] = {
+                let o = items::role_build_order(role);
+                [o[0], o[1]]
+            };
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("Gold: {:.0}", g.gold)).size(17.0).color(GOLD).strong());
+                ui.label(egui::RichText::new(format!("Gold: {:.0}", gold)).size(17.0).color(GOLD).strong());
                 ui.separator();
                 for c in items::CATS {
-                    let label = c.name();
                     let sel = ui_state.shop_tab == c;
-                    let btn = egui::Button::new(egui::RichText::new(label).size(12.5));
-                    let btn = if sel { btn.fill(GOLD.linear_multiply(0.55)) } else { btn };
-                    if ui.add(btn).clicked() {
+                    let cc = c.color();
+                    let ccol = Color32::from_rgb((cc[0] * 255.0) as u8, (cc[1] * 255.0) as u8, (cc[2] * 255.0) as u8);
+                    let btn = egui::Button::new(egui::RichText::new(c.name()).size(12.5).color(if sel { Color32::BLACK } else { Color32::WHITE }));
+                    let btn = if sel { btn.fill(ccol) } else { btn };
+                    let resp = ui.add(btn);
+                    glow_hover(ui, &resp, ccol, 4.0);
+                    if recommended.contains(&c) && !sel {
+                        ui.painter().circle_filled(resp.rect.right_top() + Vec2::new(-3.0, 3.0), 3.0, GOLD);
+                    }
+                    if resp.clicked() {
                         ui_state.shop_tab = c;
+                        // the search text carries over between categories; only the
+                        // cursor resets, since a different category is a different length
+                        ui_state.shop_pick.cursor = 0;
                     }
                 }
             });
+            ui.add_space(2.0);
+            let search_id = egui::Id::new("shop_search");
+            let sresp = ui.add(egui::TextEdit::singleline(&mut ui_state.shop_pick.search).id(search_id).hint_text("search this category…").desired_width(240.0));
+            if sresp.changed() {
+                let s = ui_state.shop_pick.search.clone();
+                ui_state.shop_pick.set_search(s);
+            }
+            let search_focused = sresp.has_focus();
             ui.separator();
             ui.columns(2, |cols| {
                 // shop grid
                 cols[0].vertical(|ui| {
-                    egui::ScrollArea::vertical().id_source("shop_items").show(ui, |ui| {
-                        let cat_items: Vec<&items::Item> = items::all().iter().filter(|it| it.cat == ui_state.shop_tab).collect();
-                        for chunk in cat_items.chunks(2) {
+                    let cat_items: Vec<&items::Item> = items::all().iter().filter(|it| it.cat == ui_state.shop_tab).collect();
+                    let text = item_tag_text;
+                    let shown = ui_state.shop_pick.shown(&cat_items, text);
+                    if !search_focused {
+                        let (dx, dy, enter) = ctx.input(|i| {
+                            (
+                                i.key_pressed(egui::Key::ArrowRight) as i32 - i.key_pressed(egui::Key::ArrowLeft) as i32,
+                                i.key_pressed(egui::Key::ArrowDown) as i32 - i.key_pressed(egui::Key::ArrowUp) as i32,
+                                i.key_pressed(egui::Key::Enter),
+                            )
+                        });
+                        if dx != 0 || dy != 0 {
+                            ui_state.shop_pick.move_cursor(dx, dy, shown.len());
+                        }
+                        if enter {
+                            if let Some(i) = ui_state.shop_pick.hovered(&cat_items, text) {
+                                let item = cat_items[i];
+                                if game.gods[player].gold >= item.cost && game.gods[player].items.len() < 6 && game.buy_item(player, item.id) {
+                                    pulse_set(ctx, egui::Id::new("item_bought").with(item.id));
+                                }
+                            }
+                        }
+                    }
+                    egui::ScrollArea::vertical().id_source("shop_items").max_height(430.0).show(ui, |ui| {
+                        if shown.is_empty() {
+                            ui.add_space(16.0);
+                            ui.vertical_centered(|ui| ui.label(egui::RichText::new("no items match that search").size(13.0).color(Color32::from_rgb(150, 148, 140))));
+                        }
+                        for (cell, chunk) in shown.chunks(2).enumerate() {
                             ui.horizontal(|ui| {
-                                for item in chunk {
-                                    draw_item_card(ui, game, player, item);
+                                for (col, &i) in chunk.iter().enumerate() {
+                                    let cursor_here = ui_state.shop_pick.cursor == cell * 2 + col;
+                                    if draw_item_card(ui, game, player, cat_items[i], cursor_here) {
+                                        ui_state.shop_pick.point(cell * 2 + col, shown.len());
+                                    }
                                 }
                             });
                         }
@@ -622,20 +783,54 @@ pub fn draw_shop(ctx: &egui::Context, game: &mut Game, player: usize, ui_state: 
                     ui.monospace(format!("PEN {}% / {:.0} flat   CDR {:.0}%", (st.pen_pct * 100.0) as i32, st.pen_flat, st.cdr * 100.0));
                     ui.separator();
                     for i in 0..6 {
-                        if let Some(&iid) = g.items.get(i) {
+                        let slot_id = egui::Id::new("build_slot").with(i);
+                        if let Some(&iid) = game.gods[player].items.get(i) {
                             let item = &items::all()[iid as usize];
-                            let stacks = g.stacks.get(i).copied().unwrap_or(0.0);
+                            let stacks = game.gods[player].stacks.get(i).copied().unwrap_or(0.0);
                             let stack_txt = if item.stack.is_some() { format!("  [{} stacks]", stacks) } else { String::new() };
-                            ui.label(egui::RichText::new(format!("{}. {} — {}g{}", i + 1, item.name, item.cost, stack_txt)).size(13.0));
+                            let armed = ui_state.sell_armed == Some(i);
+                            let refund = (item.cost * consts::SELL_REFUND).round();
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
+                            let t = hover_t(ctx, slot_id, resp.hovered());
+                            let bg = if armed {
+                                Color32::from_rgba_premultiplied(90, 30, 26, 200)
+                            } else {
+                                Color32::from_rgba_premultiplied(24 + (t * 12.0) as u8, 22, 30, 200)
+                            };
+                            ui.painter().rect_filled(rect, 4.0, bg);
+                            let label = if armed { format!("{}. {} — click again to sell for {:.0}g", i + 1, item.name, refund) } else { format!("{}. {} — {}g{}", i + 1, item.name, item.cost, stack_txt) };
+                            ui.painter().text(rect.left_center() + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(13.0), if armed { Color32::from_rgb(255, 180, 170) } else { Color32::WHITE });
+                            if resp.hovered() && !armed {
+                                ui.painter().text(rect.right_center() + Vec2::new(-8.0, 0.0), Align2::RIGHT_CENTER, format!("sell for {:.0}g", refund), FontId::proportional(11.0), Color32::from_rgb(190, 150, 140));
+                            }
                             if let Some(stk) = &item.stack {
-                                ui.label(egui::RichText::new(format!("   {} (max {})", stack_kind_name(stk.kind), stk.max)).size(10.5).color(Color32::from_rgb(140, 220, 140)));
+                                if !armed {
+                                    ui.painter().text(rect.left_bottom() + Vec2::new(8.0, -2.0), Align2::LEFT_BOTTOM, format!("{} (max {})", stack_kind_name(stk.kind), stk.max), FontId::proportional(9.5), Color32::from_rgb(140, 220, 140));
+                                }
+                            }
+                            if resp.clicked() {
+                                if armed {
+                                    game.sell_item(player, i);
+                                    ui_state.sell_armed = None;
+                                } else {
+                                    ui_state.sell_armed = Some(i);
+                                }
                             }
                         } else {
                             ui.label(egui::RichText::new(format!("{}. — empty —", i + 1)).size(13.0).color(Color32::from_rgb(90, 88, 96)));
+                            ui.add_space(14.0);
                         }
                     }
+                    if ui_state.sell_armed.is_some() {
+                        ui.separator();
+                        ui.label(egui::RichText::new("Click that slot again to sell, or a different one to switch — closing the shop cancels it.").size(11.0).color(Color32::from_rgb(200, 150, 140)));
+                    }
                     ui.separator();
-                    ui.label(egui::RichText::new("Click items on the left to purchase.").size(11.5).color(Color32::from_rgb(150, 148, 140)));
+                    ui.label(egui::RichText::new(if recommended.contains(&ui_state.shop_tab) {
+                        "★ recommended for your role — click an item on the left to buy, or an owned item to sell.".to_string()
+                    } else {
+                        "Click an item on the left to buy, or an owned item to sell.".to_string()
+                    }).size(11.5).color(Color32::from_rgb(150, 148, 140)));
                 });
             });
         });
@@ -650,20 +845,52 @@ fn stack_kind_name(k: items::StackKind) -> &'static str {
     }
 }
 
-fn draw_item_card(ui: &mut egui::Ui, game: &mut Game, player: usize, item: &items::Item) {
+/// Draws one item card; returns `true` if it was clicked (bought or
+/// attempted), so the caller can sync the keyboard-nav cursor to it.
+fn draw_item_card(ui: &mut egui::Ui, game: &mut Game, player: usize, item: &items::Item, cursor_here: bool) -> bool {
     let g = &game.gods[player];
-    let affordable = g.gold >= item.cost && g.items.len() < 6;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(300.0, 96.0), Sense::click());
+    let already_full = g.items.len() >= 6;
+    let affordable = g.gold >= item.cost && !already_full;
+    let owned_stack = g.items.iter().position(|&iid| iid == item.id).filter(|_| item.stack.is_some());
+    let (base_rect, resp) = ui.allocate_exact_size(Vec2::new(300.0, 96.0), Sense::click());
+    let id = egui::Id::new("item_card").with(item.id);
+    let t = hover_t(ui.ctx(), id, resp.hovered() || cursor_here);
+    let flash = pulse_get(ui.ctx(), egui::Id::new("item_bought").with(item.id), 2.2);
+    // a light lift on hover/keyboard-cursor, same treatment as the ancestor cards
+    let rect = base_rect.expand(t * 2.0);
     let c = item.cat.color();
     let cc = Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8);
-    ui.painter().rect_filled(rect, 6.0, PANEL2);
+    let bg = if flash > 0.01 {
+        let k = flash * 0.6;
+        let [pr, pg, pb, pa] = PANEL2.to_array();
+        Color32::from_rgba_premultiplied(
+            (pr as f32 * (1.0 - k) + 70.0 * k) as u8,
+            (pg as f32 * (1.0 - k) + 150.0 * k) as u8,
+            (pb as f32 * (1.0 - k) + 80.0 * k) as u8,
+            pa,
+        )
+    } else {
+        PANEL2.linear_multiply(1.0 + t * 0.18)
+    };
+    ui.painter().rect_filled(rect, 6.0, bg);
     ui.painter().rect_filled(Rect::from_min_size(rect.left_top(), Vec2::new(6.0, rect.height())), 3.0, cc);
-    ui.painter().text(rect.left_top() + Vec2::new(14.0, 14.0), Align2::LEFT_TOP, item.name, FontId::proportional(14.0), if affordable { Color32::WHITE } else { Color32::from_rgb(140, 138, 148) });
-    ui.painter().text(rect.right_top() + Vec2::new(-8.0, 12.0), Align2::RIGHT_TOP, format!("{}g", item.cost), FontId::proportional(13.0), GOLD);
+    let name_color = if flash > 0.01 {
+        Color32::from_rgb(210, 255, 210)
+    } else if affordable {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(140, 138, 148)
+    };
+    ui.painter().text(rect.left_top() + Vec2::new(14.0, 14.0), Align2::LEFT_TOP, item.name, FontId::proportional(14.0), name_color);
+    if let Some(slot) = owned_stack {
+        ui.painter().text(rect.right_top() + Vec2::new(-8.0, 12.0), Align2::RIGHT_TOP, format!("owned #{}", slot + 1), FontId::proportional(11.0), Color32::from_rgb(140, 220, 140));
+    } else {
+        ui.painter().text(rect.right_top() + Vec2::new(-8.0, 12.0), Align2::RIGHT_TOP, format!("{}g", item.cost), FontId::proportional(13.0), GOLD);
+    }
     // tier pips
-    for t in 0..3 {
-        let filled = t < item.tier as i32;
-        ui.painter().circle_filled(rect.left_top() + Vec2::new(20.0 + t as f32 * 10.0, 34.0), 3.0, if filled { cc } else { Color32::from_rgb(60, 58, 68) });
+    for tp in 0..3 {
+        let filled = tp < item.tier as i32;
+        ui.painter().circle_filled(rect.left_top() + Vec2::new(20.0 + tp as f32 * 10.0, 34.0), 3.0, if filled { cc } else { Color32::from_rgb(60, 58, 68) });
     }
     // stat line
     let s = &item.stats;
@@ -681,18 +908,35 @@ fn draw_item_card(ui: &mut egui::Ui, game: &mut Game, player: usize, item: &item
     if s.move_speed > 0.0 { parts.push(format!("+{:.0}% MS", s.move_speed * 100.0)); }
     ui.painter().text(rect.left_top() + Vec2::new(14.0, 56.0), Align2::LEFT_TOP, parts.join("  "), FontId::proportional(11.0), Color32::from_rgb(190, 200, 210));
     ui.painter().text(rect.left_bottom() + Vec2::new(14.0, -6.0), Align2::LEFT_BOTTOM, item.desc, FontId::proportional(9.5), Color32::from_rgb(135, 133, 142));
+    if already_full && !affordable && g.gold >= item.cost {
+        ui.painter().text(rect.right_bottom() + Vec2::new(-8.0, -6.0), Align2::RIGHT_BOTTOM, "build is full", FontId::proportional(9.5), Color32::from_rgb(200, 120, 100));
+    }
 
-    if resp.clicked() && affordable {
-        let _ = game.buy_item(player, item.id);
+    let clicked = resp.clicked();
+    if clicked && affordable {
+        if game.buy_item(player, item.id) {
+            pulse_set(ui.ctx(), egui::Id::new("item_bought").with(item.id));
+        }
     }
-    if resp.hovered() {
-        ui.painter().rect_stroke(rect, 6.0, Stroke::new(1.5_f32, cc));
-    }
+    let border = if cursor_here {
+        Stroke::new(2.5_f32, GOLD)
+    } else if t > 0.002 {
+        Stroke::new(1.0 + t * 1.2, cc.linear_multiply(t))
+    } else {
+        Stroke::new(1.0_f32, Color32::from_rgb(50, 48, 58))
+    };
+    ui.painter().rect_stroke(rect, 6.0, border);
+    clicked
 }
 
 // --- scoreboard ----------------------------------------------------------------
 
 pub fn draw_scoreboard(ctx: &egui::Context, game: &Game) {
+    draw_scoreboard_labelled(ctx, game, None)
+}
+
+pub fn draw_scoreboard_labelled(ctx: &egui::Context, game: &Game, ui_label: Option<&str>) {
+    let ui_label = ui_label.map(|s| s.to_string());
     setup_style(ctx);
     egui::Area::new(egui::Id::new("board")).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
         egui::Frame::default().fill(PANEL).stroke(Stroke::new(1.5_f32, GOLD)).inner_margin(14.0).show(ui, |ui| {
@@ -715,7 +959,10 @@ pub fn draw_scoreboard(ctx: &egui::Context, game: &Game) {
                             continue;
                         }
                         let names: Vec<String> = g.items.iter().map(|id| items::all()[*id as usize].name.to_string()).collect();
-                        ui.monospace(game.god_name(i));
+                        match (&ui_label, g.is_player) {
+                            (Some(n), true) => ui.monospace(format!("{} ({})", game.god_name(i), n)),
+                            _ => ui.monospace(game.god_name(i)),
+                        };
                         ui.monospace(format!("{}", g.level));
                         ui.monospace(format!("{}/{}/{}", g.kills, g.deaths, g.assists));
                         ui.monospace(format!("{:.0}", g.gold));
@@ -790,8 +1037,46 @@ pub fn draw_controls_button(ctx: &egui::Context, open: &mut bool) {
 }
 
 pub fn draw_click_to_play(ctx: &egui::Context) {
+    // a slow breathing fade, so the prompt reads as "waiting for you" rather
+    // than sitting there as flat, static text
+    let t = ctx.input(|i| i.time) as f32;
+    let breathe = 0.75 + 0.25 * (t * 1.6).sin();
     egui::Area::new(egui::Id::new("click_hint")).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -150.0]).show(ctx, |ui| {
-        ui.label(egui::RichText::new("click the world to take control · Esc for controls").size(14.0).color(Color32::from_rgb(200, 195, 180)));
+        ui.label(egui::RichText::new("click the world to take control · Esc for controls").size(14.0).color(Color32::from_rgba_premultiplied(200, 195, 180, (breathe * 255.0) as u8)));
+    });
+}
+
+/// A small reticle at screen centre, fading in while the mouse is captured
+/// and a touch flourish (a brief expanding ring) whenever capture toggles —
+/// it doubles as the clearest possible signal of "you have control now".
+pub fn draw_crosshair(ctx: &egui::Context, locked: bool, w: f32, h: f32) {
+    let id = egui::Id::new("crosshair_captured");
+    let t = ctx.animate_bool(id, locked);
+    // fire the toggle ring exactly once per transition, using egui memory to
+    // remember which state we last drew (see pulse_set/get above)
+    let prev_id = egui::Id::new("crosshair_prev_locked");
+    let prev = ctx.data(|d| d.get_temp::<bool>(prev_id)).unwrap_or(locked);
+    if prev != locked {
+        pulse_set(ctx, egui::Id::new("crosshair_toggle"));
+    }
+    ctx.data_mut(|d| d.insert_temp(prev_id, locked));
+    let flash = pulse_get(ctx, egui::Id::new("crosshair_toggle"), 2.5);
+    if t < 0.01 && flash < 0.01 {
+        return;
+    }
+    egui::Area::new(egui::Id::new("crosshair")).fixed_pos(Pos2::ZERO).interactable(false).show(ctx, |ui| {
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("crosshair_layer")));
+        let c = Pos2::new(w * 0.5, h * 0.5);
+        let a = (t * 220.0) as u8;
+        let col = Color32::from_rgba_premultiplied(230, 226, 216, a);
+        painter.line_segment([c + Vec2::new(-6.0, 0.0), c + Vec2::new(-2.0, 0.0)], Stroke::new(1.4_f32, col));
+        painter.line_segment([c + Vec2::new(2.0, 0.0), c + Vec2::new(6.0, 0.0)], Stroke::new(1.4_f32, col));
+        painter.line_segment([c + Vec2::new(0.0, -6.0), c + Vec2::new(0.0, -2.0)], Stroke::new(1.4_f32, col));
+        painter.line_segment([c + Vec2::new(0.0, 2.0), c + Vec2::new(0.0, 6.0)], Stroke::new(1.4_f32, col));
+        if flash > 0.01 {
+            let r = 4.0 + (1.0 - flash) * 22.0;
+            painter.circle_stroke(c, r, Stroke::new(1.5_f32, col.linear_multiply(flash)));
+        }
     });
 }
 
@@ -881,34 +1166,72 @@ pub fn draw_touch_pad(ctx: &egui::Context, pad: &crate::touch::TouchPad, game: &
     let dim = Color32::from_rgba_premultiplied(20, 20, 28, 120);
     let ring = Color32::from_rgba_premultiplied(230, 226, 216, 140);
 
+    let t = ctx.input(|i| i.time) as f32;
+
     // stick
     if let Some((origin, knob)) = pad.stick_draw() {
         painter.circle(to_px(origin), r_px(0.135), dim, Stroke::new(2.0, ring));
         painter.circle_filled(to_px(knob), r_px(0.05), Color32::from_rgba_premultiplied(230, 226, 216, 200));
     } else {
-        // a faint hint where the thumb usually rests
-        painter.circle_stroke(to_px(glam::Vec2::new(0.22, pad.extent.y - 0.30)), r_px(0.06), Stroke::new(1.0, Color32::from_rgba_premultiplied(230, 226, 216, 50)));
+        // a faint hint where the thumb usually rests, breathing gently so
+        // it reads as "tap here" rather than a static leftover mark
+        let breathe = 0.5 + 0.5 * (t * 1.3).sin();
+        let a = (50.0 + breathe * 35.0) as u8;
+        painter.circle_stroke(to_px(glam::Vec2::new(0.22, pad.extent.y - 0.30)), r_px(0.055 + breathe * 0.01), Stroke::new(1.0, Color32::from_rgba_premultiplied(230, 226, 216, a)));
     }
-    // attack
-    let atk_c = if pad.attack_down() { Color32::from_rgba_premultiplied(200, 80, 60, 200) } else { dim };
-    painter.circle(to_px(l.attack), r_px(crate::touch::ATK_R), atk_c, Stroke::new(2.0, ring));
+    // attack: a quick press-scale via animate_bool, keyed to the button id
+    let atk_t = ctx.animate_bool(egui::Id::new("touch_atk"), pad.attack_down());
+    let atk_c = Color32::from_rgba_premultiplied((20.0 + atk_t * 180.0) as u8, (20.0 + atk_t * 60.0) as u8, (28.0 + atk_t * 32.0) as u8, (120.0 + atk_t * 80.0) as u8);
+    painter.circle(to_px(l.attack), r_px(crate::touch::ATK_R) * (1.0 + atk_t * 0.08), atk_c, Stroke::new(2.0, ring));
     painter.text(to_px(l.attack), Align2::CENTER_CENTER, "ATK", FontId::proportional(r_px(0.06)), Color32::WHITE);
-    // abilities with cooldown sweep
+    // abilities: press-scale, a bright flash the instant one comes off
+    // cooldown (so you notice without staring at the countdown), cooldown sweep
     for (i, c) in l.abilities.iter().enumerate() {
         let ab = &def.abilities[i];
         let col = Color32::from_rgb((ab.color[0] * 255.0) as u8, (ab.color[1] * 255.0) as u8, (ab.color[2] * 255.0) as u8);
         let cd = g.cds[i];
         let ready = cd <= 0.0 && g.mana >= ab.cost;
-        let fill = if pad.ability_down(i) { col } else if ready { col.linear_multiply(0.55) } else { dim };
-        painter.circle(to_px(*c), r_px(crate::touch::BTN_R), fill, Stroke::new(2.0, if ab.ult { GOLD } else { ring }));
+        let ready_id = egui::Id::new("touch_ability_ready").with(i);
+        let was_ready = ctx.data(|d| d.get_temp::<bool>(ready_id)).unwrap_or(ready);
+        if ready && !was_ready {
+            pulse_set(ctx, egui::Id::new("touch_ability_flash").with(i));
+        }
+        ctx.data_mut(|d| d.insert_temp(ready_id, ready));
+        let flash = pulse_get(ctx, egui::Id::new("touch_ability_flash").with(i), 2.0);
+        let press_t = ctx.animate_bool(egui::Id::new("touch_ability_press").with(i), pad.ability_down(i));
+        let fill = if pad.ability_down(i) {
+            col
+        } else if flash > 0.01 {
+            let k = flash * 0.6;
+            let [r, g, b, a] = col.to_array();
+            Color32::from_rgba_premultiplied((r as f32 * (1.0 - k) + 255.0 * k) as u8, (g as f32 * (1.0 - k) + 255.0 * k) as u8, (b as f32 * (1.0 - k) + 255.0 * k) as u8, a)
+        } else if ready {
+            col.linear_multiply(0.55)
+        } else {
+            dim
+        };
+        let r = r_px(crate::touch::BTN_R) * (1.0 + press_t * 0.1 + flash * 0.12);
+        painter.circle(to_px(*c), r, fill, Stroke::new(2.0 + flash * 1.5, if ab.ult { GOLD } else { ring }));
         let label = if cd > 0.0 { format!("{:.0}", cd.ceil()) } else { format!("{}", i + 1) };
         painter.text(to_px(*c), Align2::CENTER_CENTER, label, FontId::proportional(r_px(0.05)), Color32::WHITE);
     }
-    // shop / board / menu
+    // shop / board / menu — press feedback so taps feel acknowledged
     painter.circle(to_px(l.shop), r_px(crate::touch::BTN_R * 0.8), dim, Stroke::new(1.5, ring));
     painter.text(to_px(l.shop), Align2::CENTER_CENTER, "$", FontId::proportional(r_px(0.05)), GOLD);
-    painter.circle(to_px(l.board), r_px(crate::touch::BTN_R * 0.8) / pad.scale, dim, Stroke::new(1.5, ring));
+    let board_t = ctx.animate_bool(egui::Id::new("touch_board_held"), pad.board_down());
+    let board_fill = Color32::from_rgba_premultiplied((20.0 + board_t * 40.0) as u8, 20, 28, (120.0 + board_t * 60.0) as u8);
+    painter.circle(to_px(l.board), r_px(crate::touch::BTN_R * 0.8) / pad.scale * (1.0 + board_t * 0.08), board_fill, Stroke::new(1.5, ring));
     painter.text(to_px(l.board), Align2::CENTER_CENTER, "≡", FontId::proportional(r_px(0.045) / pad.scale), Color32::WHITE);
     painter.circle(to_px(l.menu), r_px(crate::touch::BTN_R * 0.8) / pad.scale, dim, Stroke::new(1.5, ring));
     painter.text(to_px(l.menu), Align2::CENTER_CENTER, "⚙", FontId::proportional(r_px(0.045) / pad.scale), Color32::WHITE);
+}
+
+/// Named (not closure) so it's automatically higher-ranked over the
+/// reference's lifetime — see the note on `GridPicker`'s `text` parameter.
+fn ancestor_tag_text<'a>(i: &'a (&'static str, String)) -> (&'a str, &'a str) {
+    (i.0, i.1.as_str())
+}
+
+fn item_tag_text<'a>(it: &'a &items::Item) -> (&'a str, &'a str) {
+    (it.name, it.desc)
 }

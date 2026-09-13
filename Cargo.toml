@@ -10,7 +10,7 @@ name = "clawbound"
 path = "src/lib.rs"
 
 [[bin]]
-name = "clawbound"
+name = "clawbound-battleground"
 path = "src/main.rs"
 
 [dependencies]
