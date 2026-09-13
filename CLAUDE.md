@@ -295,6 +295,7 @@ python3 maintenance/tools/archive_check.py # maintenance/archive/ provenance hea
 python3 maintenance/tools/aarch64_flags_check.py  # committed CPU flags vs the weakest target
 python3 maintenance/tools/eframe_backend_check.py . # eframe backends chosen, not inherited (glow, or wgpu with visible intent)
 python3 maintenance/tools/voiceprint_parity_check.py . # voiceterm's fingerprint/compute_mfcc vs shared/voiceprint-kit's copy
+python3 maintenance/tools/board_gestures_parity_check.py . # rusty-board's GTK swipe recognizer vs crates/board-gestures' copy
 python3 maintenance/tools/font_install_check.py . # every egui app reaches uikit-egui's fonts::install, or its symbol glyphs are boxes
 ```
 
@@ -337,6 +338,17 @@ shared dependency — see `maintenance/C12_TODO.md` §2. Nothing else notices if
 one side changes and the other doesn't; the checker fails loudly on drift or
 on either function going missing, until voiceterm depends on the kit for
 real (C12-2a) and the second copy can be deleted.
+
+`board_gestures_parity_check.py` is the same guard for the same reason, one
+layer over: `apps/rusty-board/src/gestures/{swipe,recognizer}.rs` and
+`crates/board-gestures/src/{swipe,recognizer}.rs` are 2233 duplicated lines
+decoding the keyboard's headline gesture for its two frontends, and the GTK
+crate does NOT depend on the shared one despite the egui manifest's comment
+saying it does. They AGREE today — the whole diff is the documented
+Key->label/swipe_target decoupling — which is why pinning them now is cheap:
+the checker starts green for a real reason and the first drift is what it
+catches. Drift here does not panic or fail to compile; both sides keep
+returning plausible words and slowly disagree about what the user swiped.
 
 `lock_check.py` exists because three stale lockfiles were found by tripping
 over them. A stale lock works perfectly online — cargo resolves the missing
