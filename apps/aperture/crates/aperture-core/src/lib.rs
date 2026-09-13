@@ -50,6 +50,7 @@ pub mod editor;
 pub mod panes;
 /// Modal motions and operators, active while typewriter mode is on.
 pub mod helix;
+pub mod bufsearch;
 /// Multi-cursor: `Selection` becomes `Vec<Selection>` and edits fan out.
 ///
 /// Declared late. The file sat in src/ with no `mod` line, so it was never
@@ -62,6 +63,9 @@ pub mod multicursor;
 /// remember the callsite and who claimed them. The layer buckets, saved
 /// navigation paths and the depth horizon all read from.
 pub mod entity;
+/// Vernacular aliases — friendlier display names for symbols, shown as an
+/// overlay label rather than a source edit. See the module doc for why.
+pub mod aliases;
 /// The real [`entity::EdgeSource`] implementations: an outline as
 /// containment, project-search hits as text matches, git blame as time.
 /// They take plain rows rather than calling the modules that produce them,

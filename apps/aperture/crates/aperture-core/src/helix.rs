@@ -80,8 +80,32 @@ pub enum Act {
     /// its start and end, which is why they carry an edge rather than
     /// being one variant plus a caret nudge.
     Insert { at: Edge },
+    /// `Shift-I` / `Shift-A`: jump to this line's start/end, THEN enter
+    /// Insert — one act, not a `Move` followed by a separate `Insert`.
+    ///
+    /// A first version of this returned `Act::Move(Motion::LineStart)` for
+    /// `I`, on the reasoning that "go to line start" was the whole of what
+    /// the key does and Insert would follow from context. It does not:
+    /// `next_mode` only enters Insert on `Act::Insert`/`Act::OpenLine`, and
+    /// falls through to `_ => mode` for everything else including `Move` —
+    /// so `Shift-I` moved the caret and left the editor in Normal mode,
+    /// silently. The bug is exactly the trap this module's own doc warns
+    /// about: "does `d` in Visual delete the selection or the char under
+    /// the caret" is the class of bug a table makes visible, and this was
+    /// the same class the other way — an act that LOOKED complete (it did
+    /// move the caret) while quietly missing the second half of what the
+    /// key means.
+    InsertAtLineEdge { end: bool },
     /// Open a new line and enter Insert: `o` below, `O` above.
     OpenLine { above: bool },
+    /// `x`: select the current line (extending onto the next line if a
+    /// line is already selected, as Helix's `x` does on repeat). Distinct
+    /// from `Delete` — Helix's `x` does not delete anything, it is a
+    /// selection primitive you then operate on with `d`/`y`/`c`. Binding
+    /// it to `Delete` (as this table used to) collapses two different
+    /// verbs onto one key: the FIRST press of real Helix `x` never
+    /// deletes.
+    SelectLine,
     EnterVisual,
     /// Leave Visual (or leave Insert) for Normal.
     EnterNormal,
@@ -90,6 +114,16 @@ pub enum Act {
     /// somewhere" verb in this editor is already Ctrl+G, and giving `f`
     /// a second, weaker meaning would be the worse of two bindings.
     Route,
+    /// `/`: open the in-buffer incremental search bar (`bufsearch`).
+    Search,
+    /// Open the command palette. Bound to Space in Normal mode, alongside
+    /// (not instead of) Ctrl+P — Helix's own leader key is Space, and a
+    /// modal editor without it reads as an incomplete port to anyone
+    /// coming from Helix, which is the whole point of this table.
+    /// Insert mode's Space is unaffected: `resolve` returns `Act::Pass`
+    /// for the entire mode before this arm is ever reached, so a space
+    /// bar keystroke while typing is never at risk of being reinterpreted.
+    CommandPalette,
     /// Cycle the completion debounce (250 -> 750 -> 1250 -> 250 ms).
     CycleCompletionSpeed,
     /// Nothing is bound; the shell may treat the key normally.
@@ -146,21 +180,26 @@ pub fn resolve(mode: Mode, ch: char, shift: bool) -> Act {
         ('g', false) => Act::Move(Motion::DocStart),
         ('g', true) => Act::Move(Motion::DocEnd),
 
-        ('x', false) => Act::Delete,
+        ('x', false) => Act::SelectLine,
         ('d', false) => Act::Delete,
         ('y', false) => Act::Yank,
         ('p', false) => Act::Paste,
 
         ('i', false) => Act::Insert { at: Edge::Before },
         ('a', false) => Act::Insert { at: Edge::After },
-        ('i', true) => Act::Move(Motion::LineStart), // I: to line start, then insert
-        ('a', true) => Act::Move(Motion::LineEnd),   // A: to line end, then insert
+        // I: to line start, then Insert. A: to line end, then Insert.
+        // See `Act::InsertAtLineEdge`'s doc for why this is one act and
+        // not `Act::Move` followed by a separate insert.
+        ('i', true) => Act::InsertAtLineEdge { end: false },
+        ('a', true) => Act::InsertAtLineEdge { end: true },
         ('o', false) => Act::OpenLine { above: false },
         ('o', true) => Act::OpenLine { above: true },
 
         ('v', false) => Act::EnterVisual,
 
         ('f', false) => Act::Route,
+        ('/', _) => Act::Search,
+        (' ', false) => Act::CommandPalette,
         ('c', false) => Act::CycleCompletionSpeed,
 
         _ => Act::Pass,
@@ -176,7 +215,12 @@ pub fn next_mode(mode: Mode, act: &Act) -> Mode {
     match act {
         Act::EnterVisual => Mode::Visual,
         Act::EnterNormal => Mode::Normal,
-        Act::Insert { .. } | Act::OpenLine { .. } => Mode::Insert,
+        Act::Insert { .. } | Act::OpenLine { .. } | Act::InsertAtLineEdge { .. } => Mode::Insert,
+        // Selecting a line is a Visual-shaped act even when pressed from
+        // Normal — Helix's `x` puts you in a state where the next
+        // keystroke (d/y/c, or another x to extend) operates on a
+        // selection, which IS what Visual mode means here.
+        Act::SelectLine => Mode::Visual,
         // An operator consumes the selection, so Visual has nothing left
         // to extend.
         Act::Delete | Act::Yank | Act::Paste => Mode::Normal,
@@ -194,7 +238,15 @@ mod tests {
         // every letter must reach the buffer. A single stolen key here
         // (a `d` that deletes while you are writing "add") is the failure
         // that makes people turn the whole feature off.
-        for ch in ['h', 'j', 'k', 'l', 'w', 'b', 'x', 'y', 'p', 'd', 'i', 'a', 'v', 'f', 'c'] {
+        //
+        // Space and `/` are in this list for the same reason and are the
+        // two keys most likely to break it if this table ever grows a
+        // second special case for Insert mode: Space is now the command
+        // palette leader and `/` is now search, both bound in Normal — if
+        // either leaked into Insert, every sentence containing a space or
+        // a slash (which is nearly every sentence, and every URL and path)
+        // would stop being typeable text.
+        for ch in ['h', 'j', 'k', 'l', 'w', 'b', 'x', 'y', 'p', 'd', 'i', 'a', 'v', 'f', 'c', ' ', '/'] {
             assert_eq!(resolve(Mode::Insert, ch, false), Act::Pass, "{ch} was stolen in Insert");
         }
     }
@@ -244,6 +296,70 @@ mod tests {
         assert_eq!(resolve(Mode::Normal, 'i', false), Act::Insert { at: Edge::Before });
         assert_eq!(resolve(Mode::Normal, 'a', false), Act::Insert { at: Edge::After });
         assert_eq!(next_mode(Mode::Visual, &Act::Insert { at: Edge::Before }), Mode::Insert);
+    }
+
+    #[test]
+    fn shift_i_and_shift_a_actually_enter_insert_mode() {
+        // The bug this fixes: an earlier version of `resolve` returned
+        // `Act::Move(Motion::LineStart)` for Shift-I, which moved the
+        // caret correctly and then, because `next_mode` does not enter
+        // Insert on a bare `Move`, left the editor in Normal mode. Typing
+        // the next character would have run it through the modal table
+        // instead of inserting it — silently, since the caret WAS in the
+        // right place and nothing looked wrong until you typed.
+        assert_eq!(resolve(Mode::Normal, 'i', true), Act::InsertAtLineEdge { end: false });
+        assert_eq!(resolve(Mode::Normal, 'a', true), Act::InsertAtLineEdge { end: true });
+        assert_eq!(
+            next_mode(Mode::Normal, &Act::InsertAtLineEdge { end: false }),
+            Mode::Insert,
+            "Shift-I must leave Insert mode active, not just move the caret"
+        );
+        assert_eq!(next_mode(Mode::Normal, &Act::InsertAtLineEdge { end: true }), Mode::Insert);
+        // And from Visual, same as plain `i`/`a` — jumping to a line edge
+        // while a selection is active must still end in Insert, not leave
+        // a stale Visual selection behind.
+        assert_eq!(next_mode(Mode::Visual, &Act::InsertAtLineEdge { end: false }), Mode::Insert);
+    }
+
+    #[test]
+    fn x_selects_the_line_rather_than_deleting_it() {
+        // Helix's `x` is a selection primitive, not an operator — the
+        // FIRST press never deletes anything. This table used to bind `x`
+        // to `Act::Delete`, identically to `d`, which collapsed two
+        // distinct verbs onto one key and meant there was no way to
+        // select-then-decide (delete? yank? insert before?) the way real
+        // Helix's line selection works.
+        assert_eq!(resolve(Mode::Normal, 'x', false), Act::SelectLine);
+        assert_ne!(
+            resolve(Mode::Normal, 'x', false),
+            Act::Delete,
+            "x must not be a second spelling of d"
+        );
+        // Selecting a line produces something to operate on, so it must
+        // land in the mode where a following d/y/c has a selection to
+        // consume — otherwise `x` then `d` would delete a bare caret
+        // position instead of the whole line `x` just selected.
+        assert_eq!(next_mode(Mode::Normal, &Act::SelectLine), Mode::Visual);
+    }
+
+    #[test]
+    fn slash_opens_search_from_either_modal_mode() {
+        for mode in [Mode::Normal, Mode::Visual] {
+            assert_eq!(resolve(mode, '/', false), Act::Search);
+        }
+        // Search does not itself change the modal mode — closing the
+        // search bar (Escape) is what returns to Normal, same as the
+        // route palette (`f`) leaves the mode alone until it is dismissed.
+        assert_eq!(next_mode(Mode::Normal, &Act::Search), Mode::Normal);
+    }
+
+    #[test]
+    fn space_opens_the_command_palette_only_from_normal() {
+        assert_eq!(resolve(Mode::Normal, ' ', false), Act::CommandPalette);
+        // Shifted space (a keyboard oddity, but resolve must not treat it
+        // as a different key by accident) falls through to Pass rather
+        // than silently also opening the palette.
+        assert_eq!(resolve(Mode::Normal, ' ', true), Act::Pass);
     }
 
     #[test]
