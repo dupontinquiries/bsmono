@@ -267,6 +267,30 @@ pub mod note_edit;
 pub use nifty_core::niftyplot;
 pub mod palace;
 pub mod bars;
+// The five mounts below back bar_pages, immediately after it. They live at
+// the crate ROOT rather than nested under bar_pages because the Qt-authored
+// files themselves (dictate.rs, repair.rs) use `crate::code_symbols`,
+// `crate::dictate` etc. to reach each other — correct in the Qt binary,
+// where they ARE crate-root siblings. Nesting them under bar_pages instead
+// would make `crate::dictate` resolve to nothing from inside dictate.rs's
+// own sibling `repair.rs`, which is exactly the E0432 this arrangement
+// avoids. See bar_pages.rs's module doc for the fuller account, including
+// the E0255 (`editor_voice` reimported under its own name) this also fixes.
+#[path = "../../src/editor_voice.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod editor_voice;
+#[path = "../../src/repl_voice.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod repl_voice;
+#[path = "../../src/code_symbols.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod code_symbols;
+#[path = "../../src/repair.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod repair;
+#[path = "../../src/dictate.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod dictate;
 pub mod bar_pages;
 pub mod browser;
 pub mod bookmarks_view;

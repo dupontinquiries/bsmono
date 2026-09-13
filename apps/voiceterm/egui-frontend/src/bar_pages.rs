@@ -17,12 +17,14 @@
 //! composes bottom_bar + editor_voice + dictate. No QML, no IO." What kept it
 //! unported was its dependency chain, mounted here in one place:
 //!
-//!     bar_pages -> editor_voice   (Qt-free, no crate:: deps)
-//!               -> dictate::Ctl   (Qt-free; needs code_symbols + repair)
-//!               -> bottom_bar     (already mounted independently by
-//!                                  bars.rs and archived_view.rs — a third
-//!                                  mount here is fine, `#[path]` scopes each
-//!                                  to its own module tree)
+//! ```text
+//! bar_pages -> editor_voice   (Qt-free, no crate:: deps)
+//!           -> dictate::Ctl   (Qt-free; needs code_symbols + repair)
+//!           -> bottom_bar     (already mounted independently by
+//!                              bars.rs and archived_view.rs — a third
+//!                              mount here is fine, `#[path]` scopes each
+//!                              to its own module tree)
+//! ```
 //!
 //! `grammar_context::grammar_label` — the function that PICKS the page — also
 //! needs `repl_voice`, mounted alongside it.
@@ -71,36 +73,36 @@
 //! foreground-process reading to call them with — the wiring is the next,
 //! smaller step.
 
+//! ## Why the sibling mounts moved to the crate root
+//!
+//! An earlier version of this file mounted `editor_voice`, `repl_voice`,
+//! `dictate`, `code_symbols` and `repair` as submodules HERE. That failed to
+//! compile two ways: `use editor_voice::{self, Editor}` re-imports the module
+//! under its own name (E0255, since `mod editor_voice` and `use
+//! editor_voice::self` both bind the name `editor_voice` in this scope), and
+//! `dictate.rs`/`repair.rs` reference EACH OTHER and `code_symbols` via
+//! `crate::dictate` / `crate::code_symbols` — correct in the Qt binary, where
+//! they are crate-root siblings, but resolving to nothing when nested under
+//! `bar_pages` instead (E0432/E0433, "cannot find `dictate` in `crate`").
+//!
+//! They are mounted at `lib.rs`'s crate root now, which is where `crate::`
+//! inside those Qt-authored files actually looks. This file only needs its
+//! own `grammar_context` mount plus a second `bottom_bar` mount for the
+//! `BottomBar`/`BarButton` types `bar_for` builds — a third mount of that
+//! file alongside `bars`'s and `archived_view`'s, each scoped to its own
+//! module tree by `#[path]`, which is why three mounts of one file compile
+//! fine rather than colliding.
+
 #[path = "../../src/bottom_bar.rs"]
 #[allow(dead_code, unused_imports)]
 pub mod bottom_bar;
-
-#[path = "../../src/editor_voice.rs"]
-#[allow(dead_code, unused_imports)]
-pub mod editor_voice;
-
-#[path = "../../src/repl_voice.rs"]
-#[allow(dead_code, unused_imports)]
-pub mod repl_voice;
-
-#[path = "../../src/code_symbols.rs"]
-#[allow(dead_code, unused_imports)]
-pub mod code_symbols;
-
-#[path = "../../src/repair.rs"]
-#[allow(dead_code, unused_imports)]
-pub mod repair;
-
-#[path = "../../src/dictate.rs"]
-#[allow(dead_code, unused_imports)]
-pub mod dictate;
 
 #[path = "../../src/grammar_context.rs"]
 #[allow(dead_code, unused_imports)]
 pub mod grammar_context;
 
 use bottom_bar::{BarButton, BarButtonKind, BarOption, BottomBar};
-use dictate::Ctl;
-use editor_voice::{self, Editor};
+use crate::dictate::Ctl;
+use crate::editor_voice::{self, Editor};
 
 include!("bar_pages_core.rs");
