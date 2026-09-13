@@ -67,9 +67,14 @@ struct WordEntry {
 pub struct GestureRecognizer {
     /// All known words, keyed by length for fast filtering.
     words_by_length: Vec<Vec<WordEntry>>,
-    /// Word frequency rank: lower = more common (rank 0 is most common).
-    /// Words not in this map are treated as rank = `dictionary.len()`.
-    frequency_rank: HashMap<String, usize>,
+    // `frequency_rank: HashMap<String, usize>` used to live here. Once the
+    // rank moved onto `WordEntry`, its only remaining runtime use was one
+    // `contains_key` per swipe — and it was paying for that with a SECOND
+    // owned copy of every word in the dictionary plus the map's own table.
+    // On a 20k-word dictionary that is the single largest resident cost in
+    // the recognizer. The duplicate-rank resolution it did at load time now
+    // uses a local map that is dropped when loading finishes.
+
     /// Layout-derived spatial map: lowercase-letter → (x, y) in unit-key
     /// space (0..grid_columns horizontally, 0..rows vertically). Empty
     /// until `set_key_positions` is called.
@@ -90,7 +95,6 @@ impl GestureRecognizer {
     pub fn new() -> Self {
         Self {
             words_by_length: vec![],
-            frequency_rank: HashMap::new(),
             key_positions: HashMap::new(),
             key_positions_ascii: [None; 26],
             total_words: 0,
@@ -108,11 +112,15 @@ impl GestureRecognizer {
 
     pub fn load_dictionary(&mut self, words: Vec<String>) {
         self.words_by_length.clear();
-        self.frequency_rank.clear();
         self.total_words = words.len();
 
         let max_len = words.iter().map(|w| w.len()).max().unwrap_or(20).max(20);
         self.words_by_length = vec![vec![]; max_len + 1];
+
+        // Local, and dropped at the end of this function: it exists only to
+        // give a duplicated word its FIRST rank, which is what the old
+        // `or_insert` did.
+        let mut seen_rank: HashMap<String, usize> = HashMap::new();
 
         for (rank, w) in words.into_iter().enumerate() {
             let lc = w.to_lowercase();
@@ -128,7 +136,7 @@ impl GestureRecognizer {
                 // the fact keeps the two in step. Getting this wrong would
                 // change scoring for duplicated words only, which is
                 // exactly the kind of difference a benchmark cannot see.
-                let first_rank = *self.frequency_rank.get(&lc).unwrap_or(&rank);
+                let first_rank = *seen_rank.get(&lc).unwrap_or(&rank);
                 self.words_by_length[len].push(WordEntry {
                     text: lc.clone(),
                     chars,
@@ -136,7 +144,7 @@ impl GestureRecognizer {
                 });
             }
             // Keep the *first* occurrence (highest frequency) if duplicated.
-            self.frequency_rank.entry(lc).or_insert(rank);
+            seen_rank.entry(lc).or_insert(rank);
         }
     }
 
@@ -289,9 +297,13 @@ impl GestureRecognizer {
         // which outlive this vec; the five survivors are cloned at the end.
         let mut scored: Vec<(f64, &str)> = Vec::with_capacity(64);
 
-        if self.frequency_rank.contains_key(&raw_lc) {
-            scored.push((0.0, raw_lc.as_str()));
-        }
+        // "Is the raw path itself a real word?" used to be a HashMap probe.
+        // The scan below already visits the bucket for `raw_len`, which is
+        // inside `lo..=hi` by construction, so the answer falls out of the
+        // loop for free: when the word being scored IS the raw text, it takes
+        // score 0.0 instead of its computed score. Same result as pushing it
+        // up front and letting the sort put it first.
+
 
         // Pre-compute raw-letter positions ONCE. spatial_distance
         // used to look them up per-candidate (~500x for a typical
@@ -349,7 +361,11 @@ impl GestureRecognizer {
                     + endpoint_bonus
                     + freq_pen;
 
-                scored.push((score, word.as_str()));
+                if word.as_str() == raw_lc.as_str() {
+                    scored.push((0.0, word.as_str()));
+                } else {
+                    scored.push((score, word.as_str()));
+                }
             }
         }
 

@@ -41,23 +41,47 @@ fn qwerty_positions() -> HashMap<char, (f64, f64)> {
 /// fills them. A dictionary of random noise would make the edit-distance cap
 /// reject almost everything and understate the cost.
 fn synth_dictionary(n: usize) -> Vec<String> {
+    // Distinctness is the property that matters and the one an obvious
+    // generator gets wrong: the first version of this cycled its syllable
+    // indices and produced 20,000 words of which 168 were unique, which
+    // silently turned a 20k-word benchmark into a 168-word one. Enumerating
+    // consonant/vowel positions in a mixed-radix counter guarantees every
+    // output differs, and the assert at the end refuses to hand back a list
+    // that is not the size it claims.
     let c = ["b", "d", "f", "g", "h", "k", "l", "m", "n", "p", "r", "s", "t", "w"];
     let v = ["a", "e", "i", "o", "u", "ai", "ea", "ou"];
-    let mut out = vec![
+    let mut out: Vec<String> = vec![
         "hello".to_string(), "help".to_string(), "held".to_string(),
         "hell".to_string(), "hollow".to_string(), "hero".to_string(),
     ];
     let mut i = 0usize;
     while out.len() < n {
+        let mut k = i;
         let syl = 2 + (i % 3);
         let mut w = String::new();
-        for s in 0..syl {
-            w.push_str(c[(i + s * 7) % c.len()]);
-            w.push_str(v[(i + s * 3) % v.len()]);
+        for _ in 0..syl {
+            w.push_str(c[k % c.len()]);
+            k /= c.len();
+            w.push_str(v[k % v.len()]);
+            k /= v.len();
+        }
+        // The mixed-radix counter repeats once it wraps for a given syllable
+        // count, so fold the high bits back in as a distinct tail.
+        if k > 0 {
+            w.push_str(c[k % c.len()]);
         }
         out.push(w);
         i += 1;
     }
+    out.sort();
+    out.dedup();
+    assert!(
+        out.len() >= n * 9 / 10,
+        "generator produced {} distinct words for n={n} — a benchmark on a \
+         dictionary that is mostly duplicates measures the wrong thing",
+        out.len()
+    );
+    out.truncate(n);
     out
 }
 
