@@ -884,9 +884,18 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppData {
             zwp_input_method_v2::Event::Unavailable => {
                 warn!(
                     "input-method-v2 reported Unavailable — another OSK \
-                     probably bound it first; show/hide won't work this \
-                     session"
+                     owns the seat's input method (squeekboard is enabled \
+                     by default on most postmarketOS/Phosh images). This \
+                     object is dead: no Activate will ever arrive on it, \
+                     so focus-driven show/hide has no signal for the rest \
+                     of this session."
                 );
+                // Recorded, not just logged. A front-end that hides
+                // itself when nothing is focused has to be able to tell
+                // "no field is focused" from "there is no focus signal";
+                // only the second means it should stop hiding. See
+                // `im_health`.
+                crate::im_health::set_input_method_unavailable();
             }
             zwp_input_method_v2::Event::SurroundingText {
                 text,

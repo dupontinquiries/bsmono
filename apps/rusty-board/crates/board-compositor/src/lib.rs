@@ -47,4 +47,6 @@ pub mod atspi_focus;
 
 pub mod content_purpose;
 
+pub mod im_health;
+
 pub use virtual_keyboard::{VirtualKeyboard, VirtualKeyboardBackend};
