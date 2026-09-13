@@ -25,3 +25,4 @@
 
 pub mod bucket;
 pub mod cache_policy;
+pub mod profile;
