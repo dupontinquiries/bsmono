@@ -82,6 +82,13 @@ pub enum Gate {
     /// Active inside `[start, end)`, origin at `start`. A clip-shaped gate
     /// with nothing placed on it — for ducking a bus through a break, say.
     Window { start: Ticks, end: Ticks },
+    /// Active over the group's HULL — from its first member's start to
+    /// its last member's end — origin at the hull's start. A curve over
+    /// a composition: a riser across the whole drop, a filter opening
+    /// over a chorus made of twelve clips, following the group as its
+    /// members move and growing as they are added. A gate on a group
+    /// with no members (or no group) is never active.
+    Group(crate::GroupId),
 }
 
 /// One curve aimed at one target through one gate.
@@ -125,7 +132,28 @@ impl Gate {
                 if end <= start { return None; }
                 Some(Opening { span: Some((start, end)), origin: start })
             }
+            Gate::Group(id) => {
+                let (start, end) = project.group_hull(id)?;
+                Some(Opening { span: Some((start, end)), origin: start })
+            }
         }
+    }
+}
+
+impl Project {
+    /// The span a group's members cover — first start to last end — or
+    /// `None` for a group with no members (or none at all). Members that
+    /// no longer exist as clips are skipped, not counted.
+    pub fn group_hull(&self, id: crate::GroupId) -> Option<(Ticks, Ticks)> {
+        let g = self.groups.get(&id)?;
+        let mut span: Option<(Ticks, Ticks)> = None;
+        for c in g.clips.iter().filter_map(|c| self.clips.get(c)) {
+            span = Some(match span {
+                None => (c.pos, c.end()),
+                Some((s, e)) => (s.min(c.pos), e.max(c.end())),
+            });
+        }
+        span.filter(|(s, e)| e > s)
     }
 }
 
@@ -490,6 +518,47 @@ mod tests {
         assert!(ParamKey::new("a\0b").is_none(), "the pad byte cannot be in a key");
         assert!(ParamKey::new("mix") < ParamKey::new("size"), "orders as the string does");
         assert_eq!(format!("{}", mix), "mix");
+    }
+
+    #[test]
+    fn a_group_gate_opens_over_the_hull_and_follows_the_members() {
+        use crate::GroupId;
+        let mut p = project(); // clip 1 sits at 1000..2000
+        // A second clip well apart; a group of the two.
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(3), source: SourceId(1), track: TrackId(1),
+            pos: Ticks(5_000), src_in: Ticks::ZERO, len: Ticks(1_000), gain: 1.0, effects: vec![] } }).unwrap();
+        p.apply(&Op::SetGroup { id: GroupId(1), name: "drop".into(), clips: vec![ClipId(1), ClipId(3)] }).unwrap();
+        assert_eq!(p.group_hull(GroupId(1)), Some((Ticks(1_000), Ticks(6_000))), "first start to last end");
+        assert_eq!(p.group_hull(GroupId(9)), None);
+        p.apply(&Op::SetCurve { id: CurveId(1), name: "riser".into() }).unwrap();
+        // 0 at the hull's start, 1 five thousand ticks later: a riser
+        // across the composition, in hull-relative time.
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(0), value: 0.0 }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks(5_000), value: 1.0 }).unwrap();
+        p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding {
+            curve: CurveId(1), target: T, gate: Gate::Group(GroupId(1)) } }).unwrap();
+        let v = |p: &Project, t: i64| p.auto_value(T, Ticks(t));
+        assert!((v(&p, 1_000)).abs() < 1e-6, "hull start: the curve's 0");
+        assert!((v(&p, 3_500) - 0.5).abs() < 1e-6, "halfway across the hull — INCLUDING the gap between members");
+        assert!((v(&p, 6_000) - 1.0).abs() < 1e-6, "past the hull: transparent, which is also the curve's end");
+        assert!((v(&p, 500) - 1.0).abs() < 1e-6, "before the hull: transparent");
+        // Move the last member later: the hull grows, the ride keeps its
+        // origin at the first member and holds its last point past its end.
+        p.apply(&Op::MoveClip { id: ClipId(3), pos: Ticks(9_000), track: TrackId(1) }).unwrap();
+        assert_eq!(p.group_hull(GroupId(1)), Some((Ticks(1_000), Ticks(10_000))));
+        assert!((v(&p, 3_500) - 0.5).abs() < 1e-6, "the curve is in hull-relative time; its own length is 5000");
+        assert!((v(&p, 8_000) - 1.0).abs() < 1e-6, "past the curve's end but inside the hull: held at the last point");
+        // Move the FIRST member: the origin moves with it.
+        p.apply(&Op::MoveClip { id: ClipId(1), pos: Ticks(2_000), track: TrackId(1) }).unwrap();
+        assert!((v(&p, 4_500) - 0.5).abs() < 1e-6, "origin now 2000: halfway is at 4500");
+        assert!((v(&p, 1_500) - 1.0).abs() < 1e-6, "before the hull: transparent");
+        // Validation and the empty case.
+        assert_eq!(p.apply(&Op::SetBinding { id: BindingId(2), binding: Binding {
+            curve: CurveId(1), target: T, gate: Gate::Group(GroupId(9)) } }),
+            Err(EditError::NoSuchGroup(GroupId(9))));
+        p.apply(&Op::RemoveGroup { id: GroupId(1) }).unwrap();
+        assert!((v(&p, 3_500) - 1.0).abs() < 1e-6, "the group is gone: the binding stays, never active");
+        assert_eq!(p.binding_sweeps(T).len(), 0, "and a sweep is not built for it");
     }
 
     #[test]

@@ -226,6 +226,10 @@ first phase is for.
    take". Still open inside it: the transcript-driven "best take" score
    (needs whisper on the machine).
 6. Video: align-by-audio, ffmpeg edit-list render.
-7. `Gate::Group` (a curve over a composition's hull), wire bump.
+7. ~~`Gate::Group` (a curve over a composition's hull)~~ — built (c17):
+   `Project::group_hull`, gate kind 3 on the wire WITHOUT a bump (the
+   parameter-target precedent: an unknown gate kind already refuses the
+   packet, and a bump would refuse every older save file), "automation
+   curve over the selected clip's group" in the palette.
 8. Triplet snap, arpeggiate/chord tools, folder-drop → kit, phone share
    sheet with an mp3/m4a target, the drawn overlap line.

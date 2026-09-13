@@ -1125,6 +1125,20 @@ Wire target kinds 2 and 3 without a `WIRE_VERSION` bump: an older peer
 already refuses an unknown target kind outright, and a bump would
 refuse every older save file for a target most projects never draw.
 
+## A curve over a composition
+
+`Gate::Group(id)`: a binding active over the group's HULL — from its
+first member's start to its last member's end, the gap between members
+included — with the curve's origin at the hull's start. A riser across
+the whole drop, a filter opening over a chorus made of twelve clips;
+the ride follows the group as its members move (the origin moves with
+the first, the span stretches with the last) and grows as members are
+added. A group with no members, or none at all, is never active, and
+its binding stays harmless. The palette's "automation curve over the
+selected clip's group" mints one, curve and binding as one undo step.
+On the wire it is gate kind 3, without a version bump, for the reason
+the parameter targets gave.
+
 ## The sends finally have something to feed
 
 The mixer had busses and sends since the console panel landed, and the

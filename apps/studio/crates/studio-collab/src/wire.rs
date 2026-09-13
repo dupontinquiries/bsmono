@@ -306,6 +306,10 @@ fn put_gate(o: &mut Vec<u8>, g: Gate) {
         Gate::Always => put_u8(o, 0),
         Gate::Clip(id) => { put_u8(o, 1); put_u64(o, id.0); }
         Gate::Window { start, end } => { put_u8(o, 2); put_ticks(o, start); put_ticks(o, end); }
+        // Kind 3 without a WIRE_VERSION bump, for the same reason as the
+        // parameter targets: an unknown gate kind refuses the packet, and
+        // a bump would refuse every older save file.
+        Gate::Group(g) => { put_u8(o, 3); put_u64(o, g.0); }
     }
 }
 fn get_gate(r: &mut R) -> Option<Gate> {
@@ -313,6 +317,7 @@ fn get_gate(r: &mut R) -> Option<Gate> {
         0 => Some(Gate::Always),
         1 => Some(Gate::Clip(ClipId(r.u64()?))),
         2 => Some(Gate::Window { start: r.ticks()?, end: r.ticks()? }),
+        3 => Some(Gate::Group(GroupId(r.u64()?))),
         _ => None, // an unknown gate kind refuses the packet, like an unknown op
     }
 }
@@ -1125,6 +1130,8 @@ mod tests {
             Op::SetBinding { id: BindingId(3), binding: Binding { curve: CurveId(4),
                 target: AutoTarget::TrackGain(TrackId(2)),
                 gate: Gate::Window { start: Ticks::from_seconds(8.0), end: Ticks::from_seconds(16.0) } } },
+            Op::SetBinding { id: BindingId(3), binding: Binding { curve: CurveId(4),
+                target: AutoTarget::TrackGain(TrackId(1)), gate: Gate::Group(GroupId(7)) } },
             Op::RemoveBinding { id: BindingId(3) },
         ]
     }

@@ -880,6 +880,7 @@ impl Project {
                     Gate::Always => {}
                     Gate::Clip(c) => { if !self.clips.contains_key(&c) { return Err(EditError::NoSuchClip(c)); } }
                     Gate::Window { start, end } => { if end <= start { return Err(EditError::EmptyWindow); } }
+                    Gate::Group(g) => { if !self.groups.contains_key(&g) { return Err(EditError::NoSuchGroup(g)); } }
                 }
                 let inv = match self.bindings.insert(*id, *binding) {
                     Some(old) => Op::SetBinding { id: *id, binding: old },

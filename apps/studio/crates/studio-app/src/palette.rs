@@ -92,6 +92,9 @@ pub enum ShellVerb {
     /// always to the strip's lane when nothing is selected) — see
     /// `Studio::new_curve_on_selection`.
     NewCurve,
+    /// A curve gated to the group the selected clip is in: a ride over
+    /// the composition's hull.
+    NewCurveOnGroup,
     /// Cut the selection on the rack grid every N steps (4 = beat, 16 = bar).
     SplitOnGrid(u8),
     /// Every delay's time to N sixteenths at the working tempo — the
@@ -292,6 +295,8 @@ pub fn root() -> Vec<Choice> {
         c("yank selection", Some("y"), Then::Do(Act::Key('y'))),
         c("paste at playhead (with automation)", Some("p"), Then::Do(Act::Key('p'))),
         c("automation curve on selected clips", None, Then::Do(Act::Shell(ShellVerb::NewCurve))),
+        c("automation curve over the selected clip's group", Some("the whole composition, gap included"),
+          Then::Do(Act::Shell(ShellVerb::NewCurveOnGroup))),
         c("split selection on beats", None, Then::Do(Act::Shell(ShellVerb::SplitOnGrid(4)))),
         c("split selection on bars", None, Then::Do(Act::Shell(ShellVerb::SplitOnGrid(16)))),
         // Delay sync: the four lengths a producer reaches for, the trap

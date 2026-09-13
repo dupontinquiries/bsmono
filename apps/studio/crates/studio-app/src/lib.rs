@@ -1535,6 +1535,38 @@ impl Studio {
     /// with neither there is nothing to aim at, said out loud. One group,
     /// one undo; the strip switches to the new binding so the next click
     /// places its first point.
+    /// A curve over a composition: the group the first selected clip is
+    /// in gates the binding, so the ride spans the hull — from the first
+    /// member's start to the last's end, gap included — and follows the
+    /// group as its members move or are added. Target: the strip's, or
+    /// the clip's own track gain. One undo step.
+    pub fn new_curve_on_group(&mut self, target: Option<studio_core::AutoTarget>) {
+        use studio_core::{Binding, BindingId, CurveId, Gate, Op};
+        let p = &self.session.doc.project;
+        let Some(clip) = self.selection.first().and_then(|id| p.clips.get(id)) else {
+            self.status = "select a clip that is in a group".into();
+            return;
+        };
+        let Some((gid, g)) = p.groups.iter().find(|(_, g)| g.clips.contains(&clip.id)) else {
+            self.status = format!("clip {} is in no group — group the composition first (G)", clip.id.0);
+            return;
+        };
+        let (gid, gname) = (*gid, g.name.clone());
+        let target = target.unwrap_or(studio_core::AutoTarget::TrackGain(clip.track));
+        let curve = CurveId(p.curves.keys().map(|c| c.0).max().unwrap_or(0) + 1);
+        let bid = BindingId(p.bindings.keys().map(|b| b.0).max().unwrap_or(0) + 1);
+        let name = format!("curve {} over {gname}", curve.0);
+        self.edit_group(vec![
+            Op::SetCurve { id: curve, name: name.clone() },
+            Op::SetBinding { id: bid, binding: Binding { curve, target, gate: Gate::Group(gid) } },
+        ], &format!("{name} bound"));
+        if self.session.doc.project.bindings.contains_key(&bid) {
+            self.auto_target = None;
+            self.auto_binding = Some(bid);
+            self.status = format!("{name}: rides the group's whole span, gap included");
+        }
+    }
+
     pub fn new_curve_on_selection(&mut self, target: Option<studio_core::AutoTarget>) {
         use studio_core::{Binding, BindingId, CurveId, Gate, Op};
         let p = &self.session.doc.project;
@@ -4326,6 +4358,10 @@ impl eframe::App for App {
                                 format!("clip {}", c.0) } else { format!("clip {} (gone)", c.0) },
                             studio_core::Gate::Window { start, end } =>
                                 format!("{:.2}–{:.2}s", start.to_seconds(), end.to_seconds()),
+                            studio_core::Gate::Group(g) => match p.groups.get(&g) {
+                                Some(grp) => format!("group {}", grp.name),
+                                None => format!("group {} (gone)", g.0),
+                            },
                         };
                         let mut pick = self.studio.auto_binding;
                         for (id, b) in &p.bindings {
@@ -4875,6 +4911,10 @@ impl App {
                         None => self.studio.status =
                             "no bus feeding master to analyse".into(),
                     }
+                }
+                palette::ShellVerb::NewCurveOnGroup => {
+                    let t = self.studio.auto_target;
+                    self.studio.new_curve_on_group(t);
                 }
                 palette::ShellVerb::NewCurve => {
                     let t = self.studio.auto_target;
@@ -7263,6 +7303,40 @@ mod curve_shell_tests {
         s.key(Key::c('u'));
         assert!(s.session.doc.project.bindings.is_empty());
         assert!(s.session.doc.project.bus_param_targets(bus).is_empty());
+    }
+
+    #[test]
+    fn a_curve_over_a_group_spans_the_hull_and_is_one_undo() {
+        let mut s = Studio::demo();
+        let p = &s.session.doc.project;
+        // Two clips on one track, apart: group them.
+        let track = p.clips[&studio_core::ClipId(1)].track;
+        let mut on_track: Vec<&studio_core::Clip> = p.clips.values().filter(|c| c.track == track).collect();
+        on_track.sort_by_key(|c| c.pos);
+        assert!(on_track.len() >= 2, "the demo has two clips on this track");
+        let (a, b) = (on_track[0].id, on_track[1].id);
+        let hull = (on_track[0].pos, on_track[1].end());
+        let gid = studio_core::GroupId(70);
+        s.edit(Op::SetGroup { id: gid, name: "drop".into(), clips: vec![a, b] }, "group");
+        s.selection = vec![b];
+        s.new_curve_on_group(None);
+        let p = &s.session.doc.project;
+        assert_eq!(p.bindings.len(), 1);
+        let bnd = p.bindings.values().next().unwrap();
+        assert_eq!(bnd.gate, Gate::Group(gid));
+        assert_eq!(bnd.target, AutoTarget::TrackGain(track));
+        assert_eq!(p.group_hull(gid), Some(hull));
+        assert!(s.status.contains("over drop"), "{}", s.status);
+        assert!(s.auto_binding.is_some());
+        s.key(Key::c('u'));
+        assert!(s.session.doc.project.bindings.is_empty() && s.session.doc.project.curves.is_empty(),
+                "curve and binding undo together");
+        // A clip in no group is refused, and said.
+        s.selection = vec![studio_core::ClipId(3)];
+        s.edit(Op::RemoveGroup { id: gid }, "ungroup");
+        s.new_curve_on_group(None);
+        assert!(s.status.contains("in no group"), "{}", s.status);
+        assert!(s.session.doc.project.bindings.is_empty());
     }
 
     #[test]
