@@ -3315,7 +3315,13 @@ pub fn mark_dispatch(pipe_id: usize, wg: (u32, u32, u32), dim0: u32) {
     }
     // COUNT unconditionally: the c689 report's disp/step column read 0 because this counter rode
     // the stall gate and never moved outside stall-armed runs. One relaxed add on a priced-hot path.
-    DISPATCH_SEQ.fetch_add(1, Relaxed); GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // DISPATCH_SEQ only. GPU_DISPATCHES is advanced by `record_dispatch` beside the actual
+    // `dispatch_workgroups`, and this hook ran on the bind-group-MISS path just before it — so
+    // with the cache off (the default) every dispatch was counted twice. decode-census on the
+    // tiny qwen2 read 28 dispatches against 14 passes for a 2-layer unfused decode, i.e. one
+    // pass per real dispatch reported as "2.0 dispatches/pass", and perfverdict's
+    // "ms of GPU time per dispatch" was half the truth.
+    DISPATCH_SEQ.fetch_add(1, Relaxed);
     if STALL_MS.load(Relaxed) == 0 { return; }
     // The PIPELINE identity, not a name: pipelines are cached for the process lifetime so the value is
     // stable and comparable across a run, and storing it is one atomic write on a path taken tens of
