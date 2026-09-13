@@ -380,6 +380,17 @@ impl LayerSurface {
         self.io_state.state.closed
     }
 
+    /// The live connection this surface is on — needed by anything that
+    /// wants to build a `raw-window-handle` display handle to hand to a
+    /// graphics API (wgpu/Vulkan, EGL) that doesn't go through
+    /// winit/eframe. `wl_surface()` alone isn't enough for that: a
+    /// `raw_window_handle::WaylandDisplayHandle` needs the `wl_display`
+    /// pointer, which only the connection (not the surface) knows —
+    /// `Connection::backend().display_ptr()`.
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     /// The raw surface, for whatever rendering backend attaches buffers to
     /// it. Deliberately not wrapped further — see this struct's own header.
     pub fn wl_surface(&self) -> &WlSurface {
