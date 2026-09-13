@@ -21,6 +21,7 @@ use fao_codec_lib as fao_v1;
 /// The format-based anchor test. One place, so the frame_type regression can't return.
 pub fn is_anchor_marker(m: u8) -> bool { matches!(m, b'D' | b'L' | b'P' | b'K' | b'V' | b'Z') }
 
+#[derive(Clone, Debug)]
 pub struct AnchorMap {
     /// Per frame: (prev anchor <= i, next anchor >= i). O(n) build, O(1) lookup.
     pub map: Vec<(Option<u32>, Option<u32>)>,
@@ -85,51 +86,200 @@ pub fn markers_from_fao(data: &[u8]) -> Option<Vec<Option<u8>>> {
     }).collect())
 }
 
+/// One opened .fao with its anchor map, decode state and the texture on screen.
+pub struct Deck {
+    pub path: String,
+    pub file: Option<crate::decode::FaoFile>,
+    pub anchor_map: Option<AnchorMap>,
+    pub error: Option<String>,
+    /// The frame the texture shows, so a scrub only re-decodes on change.
+    pub shown: Option<usize>,
+    pub gap: Option<String>,
+    pub tex: Option<egui::TextureHandle>,
+}
+impl Default for Deck {
+    fn default() -> Self {
+        Deck { path: String::new(), file: None, anchor_map: None, error: None, shown: None, gap: None, tex: None }
+    }
+}
+impl Deck {
+    pub fn open(&mut self) {
+        self.error = None; self.anchor_map = None; self.file = None; self.shown = None; self.gap = None; self.tex = None;
+        match std::fs::read(self.path.trim()) {
+            Err(e) => self.error = Some(format!("open failed: {e}")),
+            Ok(data) => match crate::decode::FaoFile::parse(data) {
+                None => self.error = Some("not a .fao file (header/index parse failed)".into()),
+                Some(f) => {
+                    self.anchor_map = Some(build_anchor_map(&f.markers()));
+                    self.file = Some(f);
+                }
+            },
+        }
+    }
+    /// Decode `idx` into the texture if it is not already the frame on screen. A frame the
+    /// decoder cannot show keeps the last texture and names the reason.
+    pub fn show(&mut self, ctx: &egui::Context, idx: usize, name: &str) {
+        if self.shown == Some(idx) { return; }
+        let Some(f) = &self.file else { return };
+        match f.decode_rgb(idx) {
+            Ok(rgb) => {
+                let img = egui::ColorImage::from_rgb([f.width(), f.height()], &rgb);
+                match &mut self.tex {
+                    Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                    None => self.tex = Some(ctx.load_texture(format!("fao-{name}"), img, egui::TextureOptions::LINEAR)),
+                }
+                self.shown = Some(idx); self.gap = None;
+            }
+            Err(g) => { self.shown = Some(idx); self.gap = Some(g.to_string()); }
+        }
+    }
+}
+
 pub struct State {
+    pub a: Deck,
+    pub b: Deck,
+    pub frame: usize,
+    /// A/B split: the fraction of the width that shows A (drag the divider).
+    pub split: f32,
+    pub playing: bool,
+    pub last_tick: Option<std::time::Instant>,
+    /// Compatibility with the anchor-analysis slice: A's fields, by the old names.
     pub path: String,
     pub anchor_map: Option<AnchorMap>,
     pub error: Option<String>,
 }
 impl Default for State {
-    fn default() -> Self { State { path: String::new(), anchor_map: None, error: None } }
+    fn default() -> Self {
+        State { a: Deck::default(), b: Deck::default(), frame: 0, split: 0.5, playing: false, last_tick: None,
+                path: String::new(), anchor_map: None, error: None }
+    }
 }
 impl State {
+    /// The anchor-analysis entry point kept for callers and tests: opens `path` as deck A.
     pub fn open(&mut self) {
-        self.error = None; self.anchor_map = None;
-        match std::fs::read(self.path.trim()) {
-            Err(e) => self.error = Some(format!("open failed: {e}")),
-            Ok(data) => match markers_from_fao(&data) {
-                None => self.error = Some("not a .fao file (header/index parse failed)".into()),
-                Some(markers) => self.anchor_map = Some(build_anchor_map(&markers)),
-            },
-        }
+        self.a.path = self.path.clone();
+        self.a.open();
+        self.anchor_map = self.a.anchor_map.clone();
+        self.error = self.a.error.clone();
+        self.frame = 0;
+    }
+    fn frame_count(&self) -> usize { self.a.file.as_ref().map(|f| f.frame_count()).unwrap_or(0) }
+    fn step(&mut self, delta: isize) {
+        let n = self.frame_count();
+        if n == 0 { return; }
+        self.frame = (self.frame as isize + delta).clamp(0, n as isize - 1) as usize;
+    }
+    /// ⏮ / ⏭ in fao_app: the previous / next self-contained frame from the anchor map.
+    fn step_anchor(&mut self, forward: bool) {
+        let Some(am) = &self.a.anchor_map else { return };
+        let pos = am.anchors.partition_point(|&a| (a as usize) < self.frame);
+        let target = if forward {
+            am.anchors.get(pos + usize::from(am.anchors.get(pos) == Some(&(self.frame as u32))))
+        } else {
+            pos.checked_sub(1).and_then(|p| am.anchors.get(p))
+        };
+        if let Some(&t) = target { self.frame = t as usize; }
     }
 }
 
 pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
     let st = &mut app.player;
-    ui.heading("▶ Player — anchor analysis");
-    ui.label(egui::RichText::new("format-based anchor map: the frames seek can land on without a decoded predecessor").weak().small());
+    ui.heading("▶ Player — A/B psychovisual comparison");
+    ui.label(egui::RichText::new("decoded frames, scrub, anchor stepping; drag the divider to compare A (left) against B (right)").weak().small());
+    for (deck, name) in [(&mut st.a, "A"), (&mut st.b, "B")] {
+        ui.horizontal(|ui| {
+            ui.label(format!("{name}:"));
+            ui.add(egui::TextEdit::singleline(&mut deck.path).id_salt(format!("player-path-{name}")).desired_width(360.0));
+            if ui.button(format!("Load {name} (.fao)")).clicked() { deck.open(); }
+            if let Some(f) = &deck.file {
+                ui.label(egui::RichText::new(format!("{}×{} {} frames {:.2} fps{}", f.width(), f.height(), f.frame_count(), f.fps(),
+                    if f.has_block_dict() { " +dict" } else { "" })).weak().small());
+            }
+        });
+        if let Some(e) = &deck.error { ui.colored_label(ui.visuals().error_fg_color, e); }
+    }
+    if ui.button("B = A").on_hover_text("Load A into B (sanity check)").clicked() {
+        st.b.path = st.a.path.clone(); st.b.open();
+    }
+    st.path = st.a.path.clone();
+    st.anchor_map = st.a.anchor_map.clone();
+    st.error = st.a.error.clone();
+
+    let n = st.frame_count();
+    if n == 0 { return; }
+
+    // Transport. Play advances at the file's fps (25 if the header has none), wall-clocked.
+    if st.playing {
+        let fps = st.a.file.as_ref().map(|f| f.fps()).filter(|f| *f > 0.0).unwrap_or(25.0);
+        let now = std::time::Instant::now();
+        let due = st.last_tick.map(|t| now.duration_since(t).as_secs_f64() >= 1.0 / fps).unwrap_or(true);
+        if due { st.last_tick = Some(now); st.frame = (st.frame + 1) % n; }
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(4));
+    }
     ui.horizontal(|ui| {
-        ui.label(".fao:");
-        ui.add(egui::TextEdit::singleline(&mut st.path).id_salt("player-st_path").desired_width(360.0));
-        if ui.button("Open").clicked() { st.open(); }
+        if ui.button("⏮").on_hover_text("Previous I-frame").clicked() { st.step_anchor(false); }
+        if ui.button("◀").on_hover_text("Previous frame").clicked() { st.step(-1); }
+        if ui.button(if st.playing { "⏸ Pause" } else { "▶ Play" }).clicked() { st.playing = !st.playing; st.last_tick = None; }
+        if ui.button("▶").on_hover_text("Next frame").clicked() { st.step(1); }
+        if ui.button("⏭").on_hover_text("Next I-frame").clicked() { st.step_anchor(true); }
+        let mut f = st.frame;
+        if ui.add(egui::Slider::new(&mut f, 0..=n - 1).text("frame")).changed() { st.frame = f; }
+        if let Some(am) = &st.a.anchor_map {
+            let (prev, _) = am.map.get(st.frame).copied().unwrap_or((None, None));
+            let marker = st.a.file.as_ref().and_then(|f| f.payload(st.frame)).and_then(|b| b.first().copied()).map(|m| m as char).unwrap_or('·');
+            ui.label(egui::RichText::new(format!("'{marker}'  anchor {}", prev.map(|p| p.to_string()).unwrap_or_else(|| "none".into()))).monospace().small());
+        }
     });
-    if let Some(e) = &st.error { ui.colored_label(ui.visuals().error_fg_color, e); }
-    if let Some(am) = &st.anchor_map {
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new(am.summary()).monospace());
-        // anchor timeline strip: one tick per anchor across the frame axis
+
+    // Decode what is on screen.
+    let ctx = ui.ctx().clone();
+    let frame = st.frame;
+    st.a.show(&ctx, frame, "A");
+    if st.b.file.is_some() { st.b.show(&ctx, frame, "B"); }
+    for (deck, name) in [(&st.a, "A"), (&st.b, "B")] {
+        if let Some(g) = &deck.gap { ui.colored_label(ui.visuals().warn_fg_color, format!("{name}: {g}")); }
+    }
+
+    // The picture: A, or A|B split with a draggable divider (fao_app's "A/B" view).
+    let Some(ta) = st.a.tex.as_ref() else { return };
+    let size = ta.size_vec2();
+    let avail = ui.available_size();
+    let scale = (avail.x / size.x).min(avail.y / size.y).min(4.0).max(0.05);
+    let shown = size * scale;
+    let (rect, resp) = ui.allocate_exact_size(shown, egui::Sense::click_and_drag());
+    let p = ui.painter_at(rect);
+    let uv_full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    match st.b.tex.as_ref() {
+        None => { p.image(ta.id(), rect, uv_full, egui::Color32::WHITE); }
+        Some(tb) => {
+            if resp.dragged() || resp.clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() { st.split = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0); }
+            }
+            let s = st.split;
+            let left = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + rect.width() * s, rect.bottom()));
+            let right = egui::Rect::from_min_max(egui::pos2(left.right(), rect.top()), rect.max);
+            p.image(ta.id(), left, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(s, 1.0)), egui::Color32::WHITE);
+            p.image(tb.id(), right, egui::Rect::from_min_max(egui::pos2(s, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            p.line_segment([egui::pos2(left.right(), rect.top()), egui::pos2(left.right(), rect.bottom())],
+                           egui::Stroke::new(2.0, ui.visuals().hyperlink_color));
+            p.text(egui::pos2(rect.left() + 6.0, rect.top() + 4.0), egui::Align2::LEFT_TOP, "A", egui::FontId::proportional(14.0), egui::Color32::WHITE);
+            p.text(egui::pos2(rect.right() - 6.0, rect.top() + 4.0), egui::Align2::RIGHT_TOP, "B", egui::FontId::proportional(14.0), egui::Color32::WHITE);
+        }
+    }
+
+    // The anchor strip, as before.
+    if let Some(am) = &st.a.anchor_map {
+        ui.label(egui::RichText::new(am.summary()).monospace().small());
         let n = am.map.len().max(1);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(720.0), 22.0), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(720.0), 14.0), egui::Sense::hover());
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
         for &a in &am.anchors {
             let x = rect.left() + rect.width() * (a as f32 / n as f32);
-            p.line_segment([egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.bottom() - 2.0)],
-                           egui::Stroke::new(1.0_f32, ui.visuals().hyperlink_color));
+            p.line_segment([egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.bottom() - 2.0)], egui::Stroke::new(1.0_f32, ui.visuals().hyperlink_color));
         }
-        ui.label(egui::RichText::new("full decode + A/B comparison are the next Player slices; this lands the seek foundation the GTK app's playback fix depends on").weak().small());
+        let x = rect.left() + rect.width() * (st.frame as f32 / n as f32);
+        p.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(2.0_f32, ui.visuals().warn_fg_color));
     }
 }
 

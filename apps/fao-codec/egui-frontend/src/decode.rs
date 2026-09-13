@@ -1,0 +1,304 @@
+//! decode — an opened .fao and the frames it can show, ported from fao_app's
+//! `decode_fao_frame_to_rgb` (the Player's decode path) and `read_block_dict`.
+//!
+//! What is here, per first payload byte, transcribed branch for branch:
+//!
+//!   'D' DCT I-frame          decompress_frame_dct
+//!   'P' YUV-split I-frame    decompress_frame_yuv_split
+//!   'L' lossy-chroma I-frame decompress_frame_lossy_chroma
+//!   'K' block-dict K-frame   decode_frame_from_dict with the FAOBKD01 trailer dict
+//!   'T' predicted frame      decode its ANCHOR first (recursively, through the cache), then
+//!                            decode_with_anchor over the anchor's YUV
+//!   'X' v10 frame            decode_frame chained on the previous frame's RGB
+//!   'R' repeat marker (v8)   walk back up to 600 frames to the first non-'R' and show that
+//!   other                    raw YUV, raw RGB, or zlib of either — sized by the header
+//!
+//! What is NOT here, and says so: 'V8' / 'Z' frames need the V8MX trailer decoder (mesh +
+//! pose track + webs, ~180 lines of trailer parsing in fao_app), and 'V4'..'V7' render as
+//! nothing in the GTK app too. `decode_rgb` returns `Gap::NeedsV8` for those so the page
+//! can name the reason rather than draw a black frame; that decoder is the next slice.
+//!
+//! The anchor cache is the same shape as fao_app's: (index, rgb) pairs, searched newest
+//! first, so a T-chain that references one anchor decodes it once.
+use fao_codec_lib as fao_v1;
+use std::cell::RefCell;
+
+/// Why a frame could not be turned into pixels. Every variant is a sentence in the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gap {
+    OutOfRange,
+    Empty,
+    /// 'V8' / 'Z': needs the V8MX trailer decoder, not ported yet.
+    NeedsV8,
+    /// 'V4'..'V7': fao_app renders nothing for these either.
+    Unrenderable(u8),
+    /// 'K' without a FAOBKD01 trailer in the file.
+    NeedsDict,
+    /// 'R' whose walk-back found no renderable frame within 600.
+    RepeatUnresolved,
+    /// The codec returned None (corrupt payload or a version this build cannot read).
+    Failed(u8),
+}
+impl std::fmt::Display for Gap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Gap::OutOfRange => write!(f, "frame index past the end of the file"),
+            Gap::Empty => write!(f, "empty payload (skip frame with nothing before it)"),
+            Gap::NeedsV8 => write!(f, "v8 frame: rendering needs the V8MX trailer decoder — not ported to the egui Player yet"),
+            Gap::Unrenderable(m) => write!(f, "'{}' frame: fao_app renders nothing for this version either", *m as char),
+            Gap::NeedsDict => write!(f, "'K' frame but the file has no FAOBKD01 block dictionary"),
+            Gap::RepeatUnresolved => write!(f, "'R' repeat marker with no renderable frame in the 600 before it"),
+            Gap::Failed(m) => write!(f, "'{}' frame failed to decode", *m as char),
+        }
+    }
+}
+
+/// The classic 4:2:0 → RGB conversion fao_app's Player uses (`yuv_to_rgb_simple`, single
+/// thread). Short planes give the same 64-gray fallback the GTK app shows.
+pub fn yuv_to_rgb(yuv: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let y_sz = w * h;
+    let hw = w / 2;
+    let hh = h / 2;
+    let uv_sz = hw * hh;
+    if yuv.len() < y_sz + 2 * uv_sz { return vec![64u8; w * h * 3]; }
+    let mut rgb = vec![0u8; w * h * 3];
+    let u_plane = &yuv[y_sz..y_sz + uv_sz];
+    let v_plane = &yuv[y_sz + uv_sz..y_sz + 2 * uv_sz];
+    for py in 0..h {
+        let uv_row = (py / 2) * hw;
+        let y_row = py * w;
+        let rgb_row = py * w * 3;
+        for px in 0..w {
+            let ux = (px / 2).min(hw.saturating_sub(1));
+            let yv = yuv[y_row + px] as f32;
+            let uv = u_plane[uv_row + ux] as f32 - 128.0;
+            let vv = v_plane[uv_row + ux] as f32 - 128.0;
+            let r = (yv + 1.402 * vv).clamp(0.0, 255.0);
+            let g = (yv - 0.344 * uv - 0.714 * vv).clamp(0.0, 255.0);
+            let b = (yv + 1.772 * uv).clamp(0.0, 255.0);
+            let ri = rgb_row + px * 3;
+            rgb[ri] = r as u8; rgb[ri + 1] = g as u8; rgb[ri + 2] = b as u8;
+        }
+    }
+    rgb
+}
+
+/// fao_app's `rgb_to_yuv420p`: the T-frame path needs its anchor as YUV, and the anchor
+/// comes out of the cache as RGB. Box-filtered chroma over each 2×2, BT.601 luma.
+pub fn rgb_to_yuv420p(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let y_sz = w * h;
+    let hw = w / 2; let hh = h / 2;
+    let uv_sz = hw * hh;
+    let mut yuv = vec![0u8; y_sz + 2 * uv_sz];
+    for py in 0..h {
+        for px in 0..w {
+            let i = (py * w + px) * 3;
+            if i + 2 >= rgb.len() { continue; }
+            let (r, g, b) = (rgb[i] as f32, rgb[i + 1] as f32, rgb[i + 2] as f32);
+            yuv[py * w + px] = (0.299 * r + 0.587 * g + 0.114 * b).clamp(0.0, 255.0) as u8;
+        }
+    }
+    for cy in 0..hh {
+        for cx in 0..hw {
+            let (mut sr, mut sg, mut sb) = (0.0f32, 0.0f32, 0.0f32);
+            for dy in 0..2 { for dx in 0..2 {
+                let (py, px) = (cy * 2 + dy, cx * 2 + dx);
+                if py >= h || px >= w { continue; }
+                let i = (py * w + px) * 3;
+                if i + 2 >= rgb.len() { continue; }
+                sr += rgb[i] as f32; sg += rgb[i + 1] as f32; sb += rgb[i + 2] as f32;
+            } }
+            let (r, g, b) = (sr / 4.0, sg / 4.0, sb / 4.0);
+            let u = (-0.169 * r - 0.331 * g + 0.5 * b + 128.0).clamp(0.0, 255.0);
+            let v = (0.5 * r - 0.419 * g - 0.081 * b + 128.0).clamp(0.0, 255.0);
+            yuv[y_sz + cy * hw + cx] = u as u8;
+            yuv[y_sz + uv_sz + cy * hw + cx] = v as u8;
+        }
+    }
+    yuv
+}
+
+/// An opened .fao: bytes, header, frame index, the block dictionary if the file carries
+/// one, and the anchor cache.
+pub struct FaoFile {
+    data: Vec<u8>,
+    pub header: fao_v1::FaoFileHeader,
+    pub index: Vec<fao_v1::FaoFrameEntry>,
+    block_dict: Option<fao_v1::block_dict::BlockDictionary>,
+    cache: RefCell<Vec<(usize, Vec<u8>)>>,
+}
+
+const ANCHOR_CACHE_CAP: usize = 8;
+const MAX_R_WALKBACK: usize = 600;
+
+impl FaoFile {
+    pub fn parse(data: Vec<u8>) -> Option<Self> {
+        let header = fao_v1::read_fao_header(&data)?;
+        let index = fao_v1::read_fao_index(&data, header.frame_count as usize);
+        if index.is_empty() { return None; }
+        let block_dict = read_block_dict(&data, &index);
+        Some(FaoFile { data, header, index, block_dict, cache: RefCell::new(Vec::new()) })
+    }
+    pub fn width(&self) -> usize { self.header.width as usize }
+    pub fn height(&self) -> usize { self.header.height as usize }
+    pub fn frame_count(&self) -> usize { self.index.len() }
+    pub fn fps(&self) -> f64 {
+        if self.header.fps_den == 0 { 0.0 } else { self.header.fps_num as f64 / self.header.fps_den as f64 }
+    }
+    pub fn has_block_dict(&self) -> bool { self.block_dict.is_some() }
+
+    /// Payload bytes of frame `idx` (what the markers are read from).
+    pub fn payload(&self, idx: usize) -> Option<Vec<u8>> {
+        let entry = self.index.get(idx)?;
+        fao_v1::read_fao_frame(&self.data, entry).map(|(b, _)| b)
+    }
+    /// First payload byte of every frame — the input `player::build_anchor_map` takes.
+    pub fn markers(&self) -> Vec<Option<u8>> {
+        (0..self.frame_count()).map(|i| self.payload(i).and_then(|b| b.first().copied())).collect()
+    }
+
+    /// Frame `idx` as packed RGB (w*h*3), or the reason it is not showable.
+    pub fn decode_rgb(&self, idx: usize) -> Result<Vec<u8>, Gap> {
+        if let Some((_, rgb)) = self.cache.borrow().iter().rev().find(|(i, _)| *i == idx) {
+            return Ok(rgb.clone());
+        }
+        let rgb = self.decode_uncached(idx)?;
+        let mut c = self.cache.borrow_mut();
+        if c.len() >= ANCHOR_CACHE_CAP { c.remove(0); }
+        c.push((idx, rgb.clone()));
+        Ok(rgb)
+    }
+
+    fn decode_uncached(&self, idx: usize) -> Result<Vec<u8>, Gap> {
+        let (w, h) = (self.width(), self.height());
+        let (yuv_sz, rgb_sz) = (w * h * 3 / 2, w * h * 3);
+        let bytes = self.payload(idx).ok_or(Gap::OutOfRange)?;
+        let Some(&marker) = bytes.first() else { return Err(Gap::Empty) };
+
+        if marker == fao_v1::v10::V10_MAGIC {
+            // v10 chains on the previous frame's pixels; the first frame has none.
+            let prev = if idx > 0 { self.decode_rgb(idx - 1).ok() } else { None };
+            return fao_v1::v10::decode_frame(&bytes, prev.as_deref(), w, h).ok_or(Gap::Failed(marker));
+        }
+        if marker == b'R' {
+            // v8 repeat marker: show the nearest earlier frame that is not itself a repeat.
+            let limit = idx.min(MAX_R_WALKBACK);
+            for back in 1..=limit {
+                let p = idx - back;
+                match self.payload(p) {
+                    Some(pb) if !pb.is_empty() && pb[0] != b'R' => return self.decode_rgb(p),
+                    _ => continue,
+                }
+            }
+            return Err(Gap::RepeatUnresolved);
+        }
+        let is_v8 = marker == b'Z' || (marker == b'V' && bytes.get(1) == Some(&b'8'));
+        if is_v8 { return Err(Gap::NeedsV8); }
+
+        match marker {
+            b'D' => fao_v1::decompress_frame_dct(&bytes, w, h).map(|yuv| yuv_to_rgb(&yuv, w, h)),
+            b'P' => fao_v1::decompress_frame_yuv_split(&bytes, w, h).map(|yuv| yuv_to_rgb(&yuv, w, h)),
+            b'L' => fao_v1::decompress_frame_lossy_chroma(&bytes, w, h).map(|yuv| yuv_to_rgb(&yuv, w, h)),
+            b'K' => {
+                let dict = self.block_dict.as_ref().ok_or(Gap::NeedsDict)?;
+                fao_v1::block_dict::decode_frame_from_dict(&bytes, dict).map(|(yuv, fw, fh)| yuv_to_rgb(&yuv, fw, fh))
+            }
+            b'V' => return Err(Gap::Unrenderable(marker)),
+            b'T' => {
+                let (tframe, fw, fh) = fao_v1::v21_predictive::TranslatedFrame::from_bytes(&bytes).ok_or(Gap::Failed(marker))?;
+                let anchor_idx = tframe.anchor_ref as usize;
+                if anchor_idx == idx { return Err(Gap::Failed(marker)); } // self-ref guard, as in fao_app
+                let anchor_rgb = self.decode_rgb(anchor_idx)?;
+                let anchor_yuv = rgb_to_yuv420p(&anchor_rgb, fw, fh);
+                tframe.decode_with_anchor(&anchor_yuv, fw, fh).map(|yuv| yuv_to_rgb(&yuv, fw, fh))
+            }
+            _ => {
+                if bytes.len() == yuv_sz { Some(yuv_to_rgb(&bytes, w, h)) }
+                else if bytes.len() == rgb_sz { Some(bytes) }
+                else {
+                    fao_v1::decompress_frame(&bytes, yuv_sz).map(|yuv| yuv_to_rgb(&yuv, w, h))
+                        .or_else(|| fao_v1::decompress_frame(&bytes, rgb_sz))
+                }
+            }
+        }.ok_or(Gap::Failed(marker))
+    }
+}
+
+/// fao_app's `read_block_dict`: the dictionary trailer is `FAOBKD01` + u32 LE size + bytes,
+/// searched for after the last frame's data.
+fn read_block_dict(data: &[u8], index: &[fao_v1::FaoFrameEntry]) -> Option<fao_v1::block_dict::BlockDictionary> {
+    let needle = b"FAOBKD01";
+    let frame_data_end: usize = index.iter().map(|e| (e.offset + e.size as u64) as usize).max().unwrap_or(0);
+    let search_start = frame_data_end.min(data.len());
+    if data.len() < 12 { return None; }
+    let at = (search_start..data.len().saturating_sub(needle.len()))
+        .find(|&i| &data[i..i + needle.len()] == needle)? + needle.len();
+    if at + 4 > data.len() { return None; }
+    let dict_size = u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]) as usize;
+    let start = at + 4;
+    if start + dict_size > data.len() { return None; }
+    fao_v1::block_dict::BlockDictionary::from_bytes(&data[start..start + dict_size])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A two-frame .fao written by the lib's own container writer, both DCT I-frames of a
+    /// gradient. The decoder must read them back to exactly what the codec's own
+    /// decompress gives — the plumbing (header, index, payload, dispatch, cache) is what
+    /// this proves, not the codec.
+    fn gradient_rgb(w: usize, h: usize, phase: u8) -> Vec<u8> {
+        let mut v = Vec::with_capacity(w * h * 3);
+        for y in 0..h { for x in 0..w {
+            v.push(((x * 255) / w.max(1)) as u8); v.push(((y * 255) / h.max(1)) as u8); v.push(phase);
+        } }
+        v
+    }
+    fn two_frame_file() -> (Vec<u8>, usize, usize) {
+        let (w, h) = (32usize, 16usize);
+        let mut frames = Vec::new();
+        for phase in [40u8, 200u8] {
+            let yuv = rgb_to_yuv420p(&gradient_rgb(w, h, phase), w, h);
+            let payload = fao_v1::compress_frame_dct(&yuv, w, h, 80);
+            assert_eq!(payload[0], b'D');
+            let n = payload.len();
+            frames.push((Vec::new(), payload, 0u8, n, 40.0f64, 0.0f64));
+        }
+        let mut out = Vec::new();
+        fao_v1::write_fao_container(&mut out, w, h, 30.0, 0.8, &frames).unwrap();
+        (out, w, h)
+    }
+
+    #[test]
+    fn a_dct_file_decodes_to_the_codecs_own_answer() {
+        let (data, w, h) = two_frame_file();
+        let f = FaoFile::parse(data.clone()).expect("parses");
+        assert_eq!((f.width(), f.height(), f.frame_count()), (w, h, 2));
+        assert_eq!(f.markers(), vec![Some(b'D'), Some(b'D')]);
+        for idx in 0..2 {
+            let payload = f.payload(idx).unwrap();
+            let want = yuv_to_rgb(&fao_v1::decompress_frame_dct(&payload, w, h).unwrap(), w, h);
+            assert_eq!(f.decode_rgb(idx).unwrap(), want, "frame {idx}");
+        }
+        // The second decode is the cache; it must be the same bytes, not a stale frame.
+        assert_eq!(f.decode_rgb(1).unwrap(), f.decode_rgb(1).unwrap());
+        assert_ne!(f.decode_rgb(0).unwrap(), f.decode_rgb(1).unwrap(), "frames differ by phase");
+        assert_eq!(f.decode_rgb(2), Err(Gap::OutOfRange));
+    }
+
+    #[test]
+    fn gaps_are_named_not_blank() {
+        assert!(Gap::NeedsV8.to_string().contains("V8MX"));
+        assert!(Gap::Unrenderable(b'V').to_string().contains("fao_app"));
+        assert!(Gap::Failed(b'T').to_string().contains("'T'"));
+    }
+
+    #[test]
+    fn yuv_rgb_round_trip_is_close_on_flat_color() {
+        let (w, h) = (8usize, 8usize);
+        let rgb: Vec<u8> = (0..w * h).flat_map(|_| [120u8, 60, 200]).collect();
+        let back = yuv_to_rgb(&rgb_to_yuv420p(&rgb, w, h), w, h);
+        for (a, b) in rgb.iter().zip(&back) { assert!((*a as i32 - *b as i32).abs() <= 3, "{a} vs {b}"); }
+    }
+}

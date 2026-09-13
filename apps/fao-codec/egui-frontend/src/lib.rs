@@ -16,6 +16,7 @@ pub mod seq_page;
 pub mod lab;
 pub mod library;
 pub mod player;
+pub mod decode;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
