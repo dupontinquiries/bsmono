@@ -12,6 +12,12 @@ The roster and its kits come straight from `monorepo/games/clawbound/src/ancesto
 (names, legends, philosophies, ability names, crest colours). This crate contains
 no third-party trademarks or assets.
 
+Headless logic (sim, weather, map events, wildlife, objectives, catastrophes,
+input resolution, audio DSP) is under `cargo test` and trustworthy. The
+rendering, ambience, and touch-drag visuals have not been seen running on a
+real display — see **[TODO.md](TODO.md)** for exactly what that covers and
+what else is known-but-unresolved.
+
 ## Features
 
 - **5v5, three lanes** — TOP / MID / BOT with waypoint pathing, per-lane minion
@@ -283,3 +289,10 @@ Rendering pipeline per frame:
 
 All characters, names and lore are from the Clawbound project in this
 monorepo. No third-party trademarks, assets or code are used.
+
+## Status
+
+See **[TODO.md](TODO.md)** for what's untested (mainly: anything visual, since
+this was built without a display), known gaps (no netcode for the bsgames
+handoff, gamepad untested end-to-end, an unexplained Blue-side AI win bias),
+and ideas raised but not built.
