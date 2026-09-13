@@ -77,6 +77,14 @@ opus = { version = "0.3", optional = true }   # libopus codec (system libopus + 
 # The FLAC encoder (pure Rust, lifted from studio-media) for project audio
 # and exports when the preference says lossless-but-smaller-than-wav.
 audio-kit = { path = "../../shared/audio-kit" }
+# GPU (or, absent real hardware, software-rasterized via Mesa llvmpipe)
+# texture upload/render for decoded video frames. Loaded dynamically
+# (libEGL.so.1 at runtime, not linked) so a build without any EGL/GL
+# present still compiles and simply reports the capability unavailable —
+# same "probe, don't assume" discipline as opus-encode's pkg-config check.
+glow = { version = "0.17", optional = true }
+khronos-egl = { version = "6", optional = true, features = ["dynamic"] }
+libloading = { version = "0.8", optional = true }
 # Ogg Opus WRITING, for the same preference set to opus. Its `encode`
 # feature is real FFI to libopus (audiopus), so it is behind `opus-encode`
 # here: off, an opus preference is refused with a message naming the
@@ -120,6 +128,10 @@ app = ["dep:cpal", "dep:eframe", "dep:egui", "dep:uikit-egui"]
 opus-decode = ["dep:ogg", "dep:opus"]
 # .opus WRITING (project audio, exports). Needs system libopus like decode.
 opus-encode = ["dep:opus-kit", "opus-kit/encode"]
+# The GPU texture upload/render path for decoded video frames (see
+# arrange::video::gl_playback). Independent of `app`: it needs an EGL
+# library at runtime, not an eframe window, and is tested standalone.
+gpu-playback = ["dep:glow", "dep:khronos-egl", "dep:libloading"]
 cuda  = ["candle-core/cuda",  "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 # Batched generator inference on the GPU via wgpu (Vulkan on Asahi/Linux).

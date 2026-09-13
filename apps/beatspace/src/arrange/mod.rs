@@ -28,3 +28,4 @@ pub mod project;
 pub mod render;
 pub mod stretch;
 pub mod tools;
+pub mod video;

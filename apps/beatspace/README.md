@@ -308,3 +308,52 @@ wgpu GPU backend (`--features gpu`) was built and its generator output validated
 **float-identical to candle** (max diff ≈1e-7) on software Vulkan (Mesa
 lavapipe); raw GPU throughput wasn't measured (no GPU in the test sandbox).
 
+## Video timeline (`arrange::video`) — what's real and what isn't
+
+The `dynamic-tracks` branch adds a video layer to the beat arrangement: AV1
+clips as separable picture and sound, three playback fidelities
+(`feel::Mode::{Preview,Render,Feel}`), and a content-aware cache that spends a
+fixed byte budget on what matters (faces, cuts) instead of a flat distance
+falloff. Same sandbox, same "no GPU" limitation as the wgpu note just above —
+but this time it was worked around rather than just noted, with the same
+software-rasterizer trick applied to the OTHER graphics API: `gl_playback`
+(feature `gpu-playback`) proves a decoded frame's round trip through a real
+OpenGL texture upload → shader sample → framebuffer render → readback,
+pixel-exact, via surfaceless EGL against Mesa's `llvmpipe` — no window, no
+`/dev/dri`, no lavapipe-for-Vulkan this time but the OpenGL equivalent of it.
+
+Real and tested (headless; 285 tests in `apps/beatspace`, including several
+that shell out to a real `ffmpeg`/`ffprobe` this session confirmed can
+encode/decode AV1, Opus, and H.264):
+
+* `cache_policy` — the 2D (temporal stride × spatial tier) falloff around a
+  velocity-predicted playhead, replacing a flat dense ring buffer.
+* `bucket`/`profile` — a cheap motion/cut/skin-tone-proxy analyzer producing
+  segments keyed by SOURCE (never by timeline clip), verified to survive
+  Split/Trim/Move/Duplicate/Delete/Undo by driving the real `arrange::cmd::
+  Editor` through them, plus a frozen-fingerprint checker that catches a
+  profile going stale against a re-encoded source or a retuned analyzer.
+* `feel::Strictness` — three named levels (not a slider), because how much a
+  hint is trusted to reallocate the cache is a hardware-class decision.
+* `probe`/`decode` — real `ffprobe` metadata and an exact keyframe table; a
+  GOP-aware seek proven BYTE-IDENTICAL to decoding from frame zero, for both
+  AV1 and H.264-with-B-frames (decode order ≠ display order there).
+* `source::import` — a video file in as a separable `VideoAsset` (no pixels
+  decoded yet) and a plain audio `Sample` (the same type any other import
+  produces).
+* `gl_playback` — see above; the one piece proven against a real GPU-API
+  pipeline rather than only against synthetic data.
+
+Honestly unproven or missing:
+
+* `backend::Backend` — VA-API/NVDEC/VideoToolbox are typed placeholders.
+  Unlike `gl_playback`'s render path, there is no software fallback for
+  hardware DECODE the way Mesa exists for render, so this genuinely cannot be
+  proven in a sandbox with no GPU — `choose()` always returns `Software`.
+* **Nothing is wired into the egui view.** No `SourceRef::Video` on a timeline
+  clip, no monitor panel in `arrangepage.rs`, no frame `gl_playback` renders
+  has reached an actual window. This is real integration work, not a stub —
+  see `arrange::video::mod`'s doc for the concrete shape it needs, including
+  following this same repo's own `0ac14413` precedent (desktop panel vs.
+  mobile tab) rather than inventing a new layout rule.
+
