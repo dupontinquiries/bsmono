@@ -257,6 +257,9 @@ pub struct Game {
     pub wild: crate::wild::Wild,
     pub bosses: crate::bosses::Bosses,
     pub disasters: crate::disasters::Disasters,
+    /// Solid world props (x, z, radius) — trees, rocks. Empty unless
+    /// `set_obstacles` was called; see that method's doc.
+    pub obstacles: Vec<(f32, f32, f32)>,
 }
 
 impl Game {
@@ -376,6 +379,7 @@ impl Game {
             wild,
             bosses: crate::bosses::Bosses::new(),
             disasters: crate::disasters::Disasters::default(),
+            obstacles: Vec::new(),
         };
         // starter items for AI gods (player buys via shop)
         for i in 0..10 {
@@ -384,6 +388,16 @@ impl Game {
             }
         }
         g
+    }
+
+    /// Wire in the world's solid props (trees, stones — see `scene::build_world`'s
+    /// `solid!` macro) so movement can push units out of them. Separate from
+    /// `new` because `Scene` (the renderer's world) and `Game` (headless sim)
+    /// are built independently — every `Game::new` call in tests/headless.rs
+    /// has none of this and simply gets no prop collision, which is correct
+    /// for a run with no rendered world to collide with.
+    pub fn set_obstacles(&mut self, obstacles: Vec<(f32, f32, f32)>) {
+        self.obstacles = obstacles;
     }
 
     pub fn spawn_pos(team: Team, lane: Lane, rng: &mut Rng) -> Vec3 {

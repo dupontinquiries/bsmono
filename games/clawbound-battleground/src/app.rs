@@ -669,6 +669,13 @@ fn start_game(s: &mut AppState) {
         *e = pool.remove(k.min(pool.len() - 1));
     }
     s.game = Some(Game::new(s.ui.selected as u32, allies, enemies));
+    // `Scene` is created on the very first `render()` call, before the menu
+    // is even reachable — see `render()` below — so by the time the player
+    // can click into a match it already exists and its obstacle list is
+    // ready to hand to the fresh `Game`.
+    if let Some(scene) = &s.scene {
+        s.game.as_mut().unwrap().set_obstacles(scene.obstacles.clone());
+    }
     s.vfx = Vfx::default();
     s.screen = Screen::Playing;
     #[cfg(feature = "audio")]
