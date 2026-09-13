@@ -54,8 +54,12 @@ pub struct WordCandidate {
 /// at load eliminates that cost.
 #[derive(Debug, Clone)]
 struct WordEntry {
-    text: String,
-    chars: Vec<char>,
+    // `Box<str>` / `Box<[char]>` rather than `String` / `Vec<char>`: these are
+    // built once at load and never pushed to again, so the capacity field of
+    // each is 8 bytes per entry of pure overhead — 320 KB across a 20k-word
+    // dictionary, for a number that can never differ from the length.
+    text: Box<str>,
+    chars: Box<[char]>,
     /// Frequency rank, resolved at load time. It used to be looked up per
     /// surviving candidate through `frequency_rank`, a `HashMap<String,
     /// usize>` — so the hot path hashed a whole word and probed a map to
@@ -130,7 +134,7 @@ impl GestureRecognizer {
                 // scoring + the canonical String for output. The
                 // text allocation here also serves as the frequency_rank
                 // key below (we clone for the map insert).
-                let chars: Vec<char> = lc.chars().collect();
+                let chars: Box<[char]> = lc.chars().collect();
                 // A duplicated word keeps its FIRST rank, matching the
                 // `or_insert` below — resolving it here rather than after
                 // the fact keeps the two in step. Getting this wrong would
@@ -138,7 +142,7 @@ impl GestureRecognizer {
                 // exactly the kind of difference a benchmark cannot see.
                 let first_rank = *seen_rank.get(&lc).unwrap_or(&rank);
                 self.words_by_length[len].push(WordEntry {
-                    text: lc.clone(),
+                    text: lc.clone().into_boxed_str(),
                     chars,
                     rank: first_rank,
                 });
@@ -361,10 +365,13 @@ impl GestureRecognizer {
                     + endpoint_bonus
                     + freq_pen;
 
-                if word.as_str() == raw_lc.as_str() {
-                    scored.push((0.0, word.as_str()));
+                // `&**word` rather than `word.as_str()`: `text` is a
+                // `Box<str>` now, and `str::as_str` is unstable.
+                let word: &str = &**word;
+                if word == raw_lc.as_str() {
+                    scored.push((0.0, word));
                 } else {
-                    scored.push((score, word.as_str()));
+                    scored.push((score, word));
                 }
             }
         }
