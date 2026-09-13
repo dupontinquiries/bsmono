@@ -322,6 +322,20 @@ pub fn thumbnail_strip(path: &Path, count: usize) -> Result<Vec<(Ticks, Vec<u8>)
 /// `Ok(None)` when the file genuinely has no audio track (checked via
 /// `probe` first), not an error: a silent video is a normal video, not a
 /// failure.
+/// A lossy audio deliverable through ffmpeg: `wav` transcoded to `out`
+/// with `codec` (`libmp3lame` for an mp3, `aac` for an m4a) at
+/// `bitrate` bits per second. The phone's share sheet and the group
+/// chat want an mp3 or an m4a, and this codebase encodes neither
+/// itself — Opus is the in-house format; these are the ones everyone
+/// else's player opens. A build of ffmpeg without the encoder fails
+/// with its own stderr, which names the missing encoder.
+pub fn transcode_audio(wav: &Path, out: &Path, codec: &str, bitrate: u32) -> Result<(), VideoError> {
+    let (w, o) = (wav.to_string_lossy(), out.to_string_lossy());
+    let br = format!("{bitrate}");
+    run("ffmpeg", &["-y", "-hide_banner", "-loglevel", "error", "-i", &w, "-vn",
+                    "-c:a", codec, "-b:a", &br, &o]).map(|_| ())
+}
+
 pub fn extract_audio(path: &Path) -> Result<Option<SourceAudio>, VideoError> {
     let info = probe(path)?;
     if !info.has_audio {

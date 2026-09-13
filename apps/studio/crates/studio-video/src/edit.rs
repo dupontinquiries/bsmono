@@ -265,6 +265,34 @@ mod tests {
     }
 
     #[test]
+    fn a_wav_transcodes_to_mp3_and_m4a_that_probe_as_audio_of_the_same_length() {
+        if !super::super::tests::has_ffmpeg() { return; }
+        let enc = super::super::run("ffmpeg", &["-hide_banner", "-encoders"]).unwrap();
+        let enc = String::from_utf8_lossy(&enc);
+        let tmp = std::env::temp_dir();
+        let wav = tmp.join(format!("studio-tc-{}.wav", std::process::id()));
+        let tone: Vec<f32> = (0..96_000).map(|i| (i as f32 * 0.03).sin() * 0.3).collect();
+        std::fs::write(&wav, studio_audio::export::export_wav_dithered_bytes(&tone, 2, 48_000, 1).unwrap()).unwrap();
+        for (codec, ext) in [("libmp3lame", "mp3"), ("aac", "m4a")] {
+            if !enc.contains(&format!(" {codec} ")) { continue; }
+            let out = tmp.join(format!("studio-tc-{}.{ext}", std::process::id()));
+            super::super::transcode_audio(&wav, &out, codec, 160_000).expect(codec);
+            // `probe` is a video probe (an audio-only file is NoVideoStream
+            // to it, correctly); the app's decoder is the reader here.
+            let back = studio_media::decode_file(&out).expect("studio-media reads it back");
+            assert_eq!(back.channels.len(), 2, "{ext}: stereo");
+            let secs = back.frames() as f64 / back.sample_rate as f64;
+            assert!((secs - 1.0).abs() < 0.15, "{ext}: a second, got {secs}");
+            let size = std::fs::metadata(&out).unwrap().len();
+            assert!(size > 5_000 && size < 60_000, "{ext}: 160 kbps of a second is ~20 KB, got {size}");
+            let _ = std::fs::remove_file(&out);
+        }
+        assert!(super::super::transcode_audio(&wav, &tmp.join("x.bin"), "no-such-codec", 1000).is_err(),
+                "a codec ffmpeg lacks fails, with its stderr");
+        let _ = std::fs::remove_file(&wav);
+    }
+
+    #[test]
     fn a_two_camera_cut_renders_and_the_frames_are_the_right_cameras() {
         if !super::super::tests::has_ffmpeg() { return; }
         // Two one-second fixtures of solid colour, no audio.

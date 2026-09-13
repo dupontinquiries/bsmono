@@ -285,6 +285,16 @@ fn write_deliverable(plan: &Plan, stereo: &[f32], rate: u32, seed: u64, path: &P
                 .map_err(|e| e.to_string())?;
             std::fs::write(path, bytes).map_err(|e| format!("write {path:?}: {e}"))
         }
+        ExportFormat::Mp3 | ExportFormat::M4a => {
+            let wav = path.with_extension("tmp.wav");
+            studio_audio::export::export_wav_dithered(stereo, 2, rate, seed, &wav)
+                .map_err(|e| format!("wav write: {e}"))?;
+            let r = studio_video::transcode_audio(&wav, path, plan.format.ffmpeg_codec().expect("lossy"),
+                                                  plan.opus_bitrate.max(96_000))
+                .map_err(|e| format!("{}: {e} — ffmpeg with that encoder is needed", plan.format.ext()));
+            let _ = std::fs::remove_file(&wav);
+            r
+        }
     }
 }
 
@@ -311,12 +321,11 @@ pub fn start_arrangement(
     project: Project,
     audio: std::collections::BTreeMap<studio_core::SourceId, SourceAudio>,
 ) -> Run {
-    // Opus's contract, enforced where it cannot be forgotten.
+    // Opus's contract, enforced where it cannot be forgotten; the phone's
+    // formats are stereo too.
     let mut plan = plan;
-    if plan.format == ExportFormat::Opus {
-        plan.rate = 48_000;
-        plan.layout = studio_audio::format::ChannelFormat::Stereo;
-    }
+    if plan.format == ExportFormat::Opus { plan.rate = 48_000; }
+    if plan.format.stereo_only() { plan.layout = studio_audio::format::ChannelFormat::Stereo; }
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = cancel.clone();

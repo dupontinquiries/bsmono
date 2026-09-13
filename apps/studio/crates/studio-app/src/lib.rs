@@ -1698,14 +1698,12 @@ impl Studio {
         // rate-parametric end to end, and since the source-rate fix it
         // resamples sources correctly at ANY render rate rather than only
         // happening to be right at 48k.
-        let rate = match format { ExportFormat::Opus => 48_000, ExportFormat::Wav => rate };
+        let rate = match format { ExportFormat::Opus => 48_000, _ => rate };
         // Opus's mapping family 0 is mono/stereo only (studio-media refuses
         // wider, loudly), so a surround deliverable is a WAV — said here
-        // rather than discovered as a confusing encoder error.
-        let layout = match format {
-            ExportFormat::Opus => studio_audio::format::ChannelFormat::Stereo,
-            ExportFormat::Wav => layout,
-        };
+        // rather than discovered as a confusing encoder error. The
+        // phone's formats (mp3, m4a) are stereo for the same reason.
+        let layout = if format.stereo_only() { studio_audio::format::ChannelFormat::Stereo } else { layout };
         let stereo = self.render_arrangement(rate, sources);
         // The render is stereo (see studio_audio::format's scope note); the
         // deliverable is whatever was asked for.
@@ -1755,6 +1753,16 @@ impl Studio {
                 let bytes = studio_media::encode_opus(&audio, 128_000)
                     .map_err(|e| e.to_string())?;
                 std::fs::write(&path, bytes).map_err(|e| format!("write {path:?}: {e}"))?;
+            }
+            ExportFormat::Mp3 | ExportFormat::M4a => {
+                // A WAV beside it, transcoded by ffmpeg, then removed.
+                let wav = path.with_extension("tmp.wav");
+                studio_audio::export::export_wav_dithered(&samples, 2, rate, stamp, &wav)
+                    .map_err(|e| format!("wav write: {e}"))?;
+                let r = studio_video::transcode_audio(&wav, &path, format.ffmpeg_codec().expect("lossy"), 192_000)
+                    .map_err(|e| format!("{}: {e} — ffmpeg with that encoder is needed for .{}", format.ext(), format.ext()));
+                let _ = std::fs::remove_file(&wav);
+                r?;
             }
         }
         self.status = format!("exported {} ({})", path.display(), layout.label());
@@ -5500,6 +5508,10 @@ impl App {
                     ui.label("format:");
                     ui.selectable_value(&mut plan.format, ExportFormat::Opus, "opus");
                     ui.selectable_value(&mut plan.format, ExportFormat::Wav, "wav");
+                    ui.selectable_value(&mut plan.format, ExportFormat::Mp3, "mp3")
+                        .on_hover_text("for the group chat — through ffmpeg");
+                    ui.selectable_value(&mut plan.format, ExportFormat::M4a, "m4a")
+                        .on_hover_text("for iMessage and the like — through ffmpeg");
                 });
                 ui.horizontal(|ui| {
                     ui.label("scope:");
@@ -5554,6 +5566,10 @@ impl App {
                             ui.colored_label(egui::Color32::GRAY,
                                 "48 kHz stereo — the codec's contract");
                         });
+                    }
+                    ExportFormat::Mp3 | ExportFormat::M4a => {
+                        ui.colored_label(egui::Color32::GRAY,
+                            "stereo, 192 kbps, encoded by ffmpeg — the format a phone shares");
                     }
                 }
                 if !self.export_note.is_empty() {
@@ -5965,11 +5981,19 @@ mod arrangement_tests {
 
 /// What `Studio::export_arrangement` writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExportFormat { Wav, Opus }
+pub enum ExportFormat { Wav, Opus, Mp3, M4a }
 impl ExportFormat {
     pub fn ext(self) -> &'static str {
-        match self { ExportFormat::Wav => "wav", ExportFormat::Opus => "opus" }
+        match self { ExportFormat::Wav => "wav", ExportFormat::Opus => "opus",
+                     ExportFormat::Mp3 => "mp3", ExportFormat::M4a => "m4a" }
     }
+    /// The lossy ones are stereo at the render rate through ffmpeg; the
+    /// ffmpeg encoder name, for [`ExportFormat::Mp3`] and [`ExportFormat::M4a`].
+    pub fn ffmpeg_codec(self) -> Option<&'static str> {
+        match self { ExportFormat::Mp3 => Some("libmp3lame"), ExportFormat::M4a => Some("aac"), _ => None }
+    }
+    /// Stereo only, like Opus: the formats a phone shares.
+    pub fn stereo_only(self) -> bool { !matches!(self, ExportFormat::Wav) }
 }
 
 #[cfg(test)]
@@ -6004,6 +6028,38 @@ mod export_tests {
             // And it isn't silence: the bounced kick is in there.
             let head: f32 = back.channels[0][..4800].iter().map(|v| v.abs()).sum();
             assert!(head > 5.0, "{fmt:?} export is audible ({head})");
+        }
+    }
+
+    #[test]
+    fn the_phones_formats_come_out_of_ffmpeg_the_right_length_or_say_what_is_missing() {
+        // mp3 and m4a are not decoded exactly by anything (encoder delay
+        // and padding are the formats' own), so the check is ffprobe's:
+        // audio, stereo-only layout enforced, the arrangement's length
+        // within a codec frame's worth. Without ffmpeg's encoder the
+        // export fails with a sentence that names it, not a panic.
+        let (mut s, sources) = bounced_studio();
+        let dir = std::env::temp_dir().join("studio-export-phone");
+        let expect = s.render_arrangement(48_000, &sources).len() as f64 / 2.0 / 48_000.0;
+        for fmt in [ExportFormat::Mp3, ExportFormat::M4a] {
+            match s.export_arrangement(&sources, &dir, fmt, 44_100, studio_audio::format::ChannelFormat::Surround51) {
+                Ok(path) => {
+                    assert_eq!(path.extension().and_then(|e| e.to_str()), Some(fmt.ext()));
+                    assert!(s.status.contains("(2.0)"), "5.1 asked, stereo delivered, said: {}", s.status);
+                    assert!(!path.with_extension("tmp.wav").exists(), "the WAV beside it is gone");
+                    // Read back with the app's own decoder — a phone's
+                    // file the app cannot open is not one it should make.
+                    let back = studio_media::decode_file(&path).expect("our decoder reads it");
+                    assert_eq!(back.channels.len(), 2, "{fmt:?}: stereo");
+                    let secs = back.frames() as f64 / back.sample_rate as f64;
+                    assert!((secs - expect).abs() < 0.15, "{fmt:?}: {secs} s vs {expect}");
+                    let head: f32 = back.channels[0][..4800].iter().map(|v| v.abs()).sum();
+                    assert!(head > 1.0, "{fmt:?}: audible ({head})");
+                }
+                Err(e) => {
+                    assert!(e.contains("ffmpeg"), "{fmt:?}: a missing encoder is named: {e}");
+                }
+            }
         }
     }
 
