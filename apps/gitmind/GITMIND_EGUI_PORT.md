@@ -81,3 +81,28 @@ original list has landed. The Qt `gui` crate remains the untouched fallback.
   `show_animated`). The three `max_height` calls are `ScrollArea::max_height`, a different type that
   is not deprecated.
 - The Qt `gui` crate is untouched and remains the fallback.
+
+## Fleet store: two entries were building the wrong binary
+
+Both `rusty-board` and `fao-codec` were plain `simple()` catalog entries — bare name, no
+path override. `ops::resolve_app_dir` turns a bare name into "does `apps/<name>` exist",
+and for both it does, just not to the app `manifest/projects.toml` calls primary:
+
+- `rusty-board` → `apps/rusty-board` is the live GTK4/libadwaita original the `-egui` port
+  is replacing. The manifest has marked `rusty-board-egui` primary for a while ("gitmind
+  selects this, not the GTK build"); the store never followed. Fleet build/push for
+  "rusty-board" silently built the deprecated keyboard end to end — no error, just none of
+  the egui port's fixes.
+- `fao-codec` → `apps/fao-codec` is a bare `[workspace]` with no `[package]` of its own
+  (members: the codec crates, `fao_app` the GTK original, `fao_cli`, `egui-frontend`). A
+  bare `cargo build --release` there has no default package to pick.
+
+Same fix as the nine earlier divergences this store already carries (ambient-learner et
+al. — see `store_entries_build_the_manifests_primary_port`): custom `SuiteApp` entries
+pointing at the manifest-primary path with an explicit `bin_name`. `rusty-board`'s entry
+also names `features: ["layer"]` — the deploy target the manifest's note now describes (a
+real docked `zwlr_layer_shell_v1` surface, not the KWin-ruled-toplevel fallback that
+predates the layer-shell shell existing) — the same shape `unendlich`'s entry uses for
+`render,window,ui-overlay`. Two dedicated tests added, mirroring `unendlich`'s; the
+pre-existing `bigsilicons` explicit-path allowlist test caught the first pass missing the
+two new names (worked as designed).

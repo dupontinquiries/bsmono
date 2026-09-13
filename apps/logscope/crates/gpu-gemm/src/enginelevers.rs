@@ -61,6 +61,14 @@ pub const LEVERS: &[Lever] = &[
     Lever { var: "LOGSCOPE_FUSED_QKV", default: Default_::On, platform: Platform::Any,
         validated_by: Some("--gate-qkv (per-projection green; end-to-end check RED, unresolved)"),
         why: "one dispatch instead of three for Q/K/V; bit-exact, so there is no reason to withhold it" },
+    Lever { var: "LOGSCOPE_ROPE_KV_APPEND", default: Default_::On, platform: Platform::Any,
+        validated_by: Some("--gate-rope-kv (logits AND every K/V cache row bit-exact vs the rope+copy path, \
+llama-shaped and QK-norm fixtures; three deliberate kernel breaks caught)"),
+        why: "rope q, and write roped k and raw v straight into this token's cache rows, in ONE dispatch: \
+it replaces one dispatch and five buffer copies per layer on the f32-KV decode path (three on the QK-norm \
+path). Same rotation math, so the values are identical; only the destinations change. Copies matter \
+because Honeykrisp has no blit engine — each is a compute job — and because every copy drains the \
+pass-fusion queue, which is why fusion could not get a token below 5 passes before this" },
     Lever { var: "LOGSCOPE_FUSE_NORM", default: Default_::On, platform: Platform::Any,
         validated_by: Some("--gate-matvec"),
         why: "folds the norm into the following matvec in the m=1 decode case; bit-exact" },
@@ -121,8 +129,17 @@ the arena's map-at-creation path already achieves the same end without the exten
     // LOGSCOPE_ARENA=1". A flag that changes generated tokens must never be
     // invisible, and this table is what makes a run reproducible from its log.
     Lever { var: "LOGSCOPE_PASS_FUSE", default: Default_::Off, platform: Platform::Any,
-        validated_by: Some("tools/gate-passfuse-diffusion.sh (RED: 3 of 6 configs change tokens)"),
-        why: "RETRACTED. Broke AR decode 6/6 (c4-736) and changes generated tokens on 3 of 6 diffusion configurations (tools/gate-passfuse-diffusion.sh). c4-933 fixed one real mechanism — begin_frame submitted a frame without draining its queued dispatches, silently dropping them — and a run on that build STILL produced garbage at 596 dispatches per pass, so at least one more cause remains. Do not enable it to go faster; enable it only to debug why it corrupts." },
+        validated_by: Some("probe-decode-parity --gate and decode-census (logits hash fused vs unfused) on lavapipe; \
+tools/gate-passfuse-diffusion.sh — all of it waiting on a Honeykrisp run of the current tree"),
+        why: "OFF until hardware confirms what the sandbox now says. History: broke AR decode 6/6 (c4-736); c4-933 fixed \
+begin_frame dropping queued dispatches and a run on THAT build still produced garbage; then 72e3190dd (Aug 19) \
+found the remaining mechanism — copy_buf and zero_tensor wrote to the frame encoder without draining the queue, \
+so a KV-cache copy or a clear ran AHEAD of the dispatches it depended on — and no hardware run has been made \
+since. On the current tree probe-decode-parity, which reproduced the corruption in-sandbox before that fix, is \
+0/6 wrong with fusion on, and decode-census reads a bit-identical logits hash fused vs unfused with a token \
+collapsing from 14 passes to 1 (ROPE_KV_APPEND removed the copies that forced drains). llama.cpp and colibri \
+record whole graphs into one command buffer with barriers between dependent dispatches and run on Asahi, so \
+the driver honours intra-command-buffer barriers. Flip to On only after bench-tps + a coherence check on the M2." },
     // The diffusion SCHEDULE levers are deliberately NOT here. This table is a
     // correctness register — every entry names the gate that proves it does not
     // change results — and steps/block/tau change results by design. I added

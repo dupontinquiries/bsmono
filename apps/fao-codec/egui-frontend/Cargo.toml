@@ -15,8 +15,17 @@ required-features = ["app"]
 egui = "0.34"
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
 fao_codec_lib = { package = "fao-codec-lib", path = "../fao_codec_lib" }
+# Encode Lab "Load image" (fao_app's Image button, via gdk-pixbuf there). PNG + JPEG only.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 settings-kit = { path = "../../../shared/settings-kit" }
+# transcode.rs's ffprobe JSON parsing.
+serde_json = "1"
+
+[dev-dependencies]
+# Building a synthetic V8MX trailer for decode.rs's v8 test (the trailer's per-web blobs are
+# zstd, same as fao_codec_lib's own encoder/decoder — see fao_codec_lib/Cargo.toml).
+zstd = "0.13"
 
 [features]
 # app default-on per the -egui house convention: `cargo build --release` = deployable bin.

@@ -399,6 +399,11 @@ pub static GPU_SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// unfused; dispatches/passes >= the flush batch means fusion is live and the cost is per-dispatch.
 pub static GPU_PASSES_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static GPU_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Buffer-to-buffer copies recorded per decode (`copy_buf`: KV-cache row writes, `slice_cols`,
+/// NoPE pass-throughs). Counted separately from dispatches because on Honeykrisp a copy is a
+/// compute job of its own — the driver has no blit engine — so a layer's copies cost what its
+/// dispatches do and were invisible in every profile line until this counter existed.
+pub static GPU_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static SHEXP_LAYERS_LOADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Weights that reached resident form WITHOUT an f32 round-trip (q8_0 / Q4_K / Q4_0 fast paths)
 /// versus those that took the long way. Counted because a load-path optimisation that misses the
@@ -1318,6 +1323,25 @@ fn env_decode_tile() -> Option<u32> {
 fn fused_qkv_enabled() -> bool {
     std::env::var("LOGSCOPE_FUSED_QKV").as_deref() != Ok("0")
 }
+/// ROPE_KV_APPEND on the f32-KV decode path: rope q, and write roped k and raw v straight into
+/// this token's cache rows, in ONE dispatch — replacing ROPE_MH plus five buffer copies per layer
+/// (decode-census: 6 dispatches + 5 copies -> 6 dispatches + 0). Same rotation math, so the
+/// values are bit-identical; only the destinations change. Default ON, LOGSCOPE_ROPE_KV_APPEND=0
+/// restores the copy path. `--gate-rope-kv` and `rope_kv_append_is_bit_exact` prove it.
+///
+/// The override exists for the gate: the env is read once, and an A/B needs both paths in one
+/// process on one model. 0 = follow the env, 1 = forced off, 2 = forced on.
+static ROPE_KV_APPEND_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub fn set_rope_kv_append(on: Option<bool>) {
+    ROPE_KV_APPEND_OVERRIDE.store(match on { None => 0, Some(false) => 1, Some(true) => 2 },
+        std::sync::atomic::Ordering::Relaxed);
+}
+fn rope_kv_append_enabled() -> bool {
+    match ROPE_KV_APPEND_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false, 2 => true,
+        _ => std::env::var("LOGSCOPE_ROPE_KV_APPEND").as_deref() != Ok("0"),
+    }
+}
 /// Bind-group caching in dispatch_with. OPT-IN (default off) while it proves out on hardware: reuses the
 /// bind group for a repeated (pipeline, buffers, dims) instead of recreating it per dispatch — targets the
 /// Asahi dispatch-bound (CPU command-setup) cost. LOGSCOPE_BG_CACHE=1 enables. Bit-identical either way.
@@ -1503,7 +1527,8 @@ fn moe_down_fused() -> bool {
 /// Fused RMSNorm+matvec for the m=1 decode norm→matmul pairs (LOGSCOPE_FUSE_NORM=0 → the explicit
 /// two-dispatch rmsnorm then matvec). One fewer dispatch per pair, twice per layer.
 fn fuse_norm_enabled() -> bool {
-    std::env::var("LOGSCOPE_FUSE_NORM").as_deref() != Ok("0")
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| std::env::var("LOGSCOPE_FUSE_NORM").as_deref() != Ok("0"))
 }
 
 /// Whether ROUTE_TRACE is armed (env set + v1 path forced so routing is CPU-visible). Cached once.
@@ -1541,7 +1566,8 @@ fn route_trace_tok(layer: i32, tok: i64, experts: &[u32]) {
 /// Flash split-K decode attention above the 4096-row shared-memory cap (LOGSCOPE_FLASH_ATTN=0 →
 /// the old single-workgroup-per-head serial fallback).
 fn flash_attn_enabled() -> bool {
-    std::env::var("LOGSCOPE_FLASH_ATTN").as_deref() != Ok("0")
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| std::env::var("LOGSCOPE_FLASH_ATTN").as_deref() != Ok("0"))
 }
 /// LOGSCOPE_GEMM_TILE override for the prefill GEMM workgroup tile (manual A/B; read once, cached).
 fn env_gemm_tile() -> Option<u32> {
@@ -3044,6 +3070,19 @@ pub struct MoeStream {
     /// GPU pass rather than a host round-trip.
     pub pinned_raw: std::collections::HashMap<u32, (wgpu::Buffer, wgpu::Buffer)>,
 }
+/// A zero-copy VIEW of one row of an f32 tensor: [1, cols] at `row`, sharing the buffer. Binds as
+/// an input or an output like any tensor, so a batched [n, cols] activation can feed n per-session
+/// dispatches without staging each row through a copy. Storage-buffer bindings must start on a
+/// 256-byte boundary (wgpu's min_storage_buffer_offset_alignment on every driver this runs on), so
+/// the caller checks `row_views_aligned` first and keeps the copy path otherwise.
+fn row_view(t: &Tensor, row: usize) -> Tensor {
+    let base = t.view.map(|(o, _)| o).unwrap_or(0);
+    let bytes = (t.cols * 4) as u64;
+    Tensor { buf: t.buf.clone(), rows: 1, cols: t.cols, pool: None, site: (0, 0), view: Some((base + row as u64 * bytes, bytes)), bid: 0 }
+}
+/// Can every row of an [_, cols] f32 tensor be a storage binding? Row stride is cols*4 bytes.
+fn row_views_aligned(cols: usize) -> bool { (cols * 4) % 256 == 0 }
+
 /// Build a zero-copy row-range VIEW of a quantized Lin: expert e's [rows, k] slice of a stacked weight,
 /// sharing the underlying buffers (no re-quant, no copy). Offsets are 256-aligned for every per-expert
 /// slice of the qwen3moe shapes (k=2048/768; scales 32-block → whole f32s per row). F32 Lins (router)
@@ -3272,6 +3311,26 @@ fn dispatch_hist_on() -> bool {
     *G.get_or_init(|| std::env::var("LOGSCOPE_DISPATCH_HIST").as_deref() == Ok("1"))
 }
 
+/// Read-once env flags on the per-dispatch path. `std::env::var_os` takes the process-wide env
+/// lock and scans the environment; `dispatch`, `dispatch_with` (once per INPUT), the matvec
+/// selector (three reads per matvec) and the attention selector together read ~1500 times per
+/// token on a 32-layer model, all on the CPU side that serialises with encoding. None of these
+/// is set at runtime anywhere (grep set_var), so one read is the same answer. Flags that gates DO
+/// toggle in-process (LOGSCOPE_FUSED_QKV, LOGSCOPE_SMALL_CHUNK) are deliberately not here.
+macro_rules! env_flag_once {
+    ($name:literal) => {{
+        static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *G.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+fn trace_bind_on() -> bool { env_flag_once!("LOGSCOPE_TRACE_BIND") }
+fn decode_attn_serial_forced() -> bool { env_flag_once!("LOGSCOPE_DECODE_ATTN_SERIAL") }
+fn matvec_kernel_forced() -> bool {
+    env_flag_once!("LOGSCOPE_MATVEC_V1") || env_flag_once!("LOGSCOPE_MATVEC_V2") || env_flag_once!("LOGSCOPE_MATVEC_V3")
+}
+fn prefill_naive_forced() -> bool { env_flag_once!("LOGSCOPE_PREFILL_NAIVE") }
+fn prefill_tiled_forced() -> bool { env_flag_once!("LOGSCOPE_PREFILL_TILED") }
+
 /// Snapshot the histogram as (shader_id, count), most frequent first.
 pub fn dispatch_histogram() -> Vec<(usize, u64)> {
     let Some(h) = DISPATCH_HIST.get() else { return Vec::new() };
@@ -3327,7 +3386,13 @@ pub fn mark_dispatch(pipe_id: usize, wg: (u32, u32, u32), dim0: u32) {
     }
     // COUNT unconditionally: the c689 report's disp/step column read 0 because this counter rode
     // the stall gate and never moved outside stall-armed runs. One relaxed add on a priced-hot path.
-    DISPATCH_SEQ.fetch_add(1, Relaxed); GPU_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // DISPATCH_SEQ only. GPU_DISPATCHES is advanced by `record_dispatch` beside the actual
+    // `dispatch_workgroups`, and this hook ran on the bind-group-MISS path just before it — so
+    // with the cache off (the default) every dispatch was counted twice. decode-census on the
+    // tiny qwen2 read 28 dispatches against 14 passes for a 2-layer unfused decode, i.e. one
+    // pass per real dispatch reported as "2.0 dispatches/pass", and perfverdict's
+    // "ms of GPU time per dispatch" was half the truth.
+    DISPATCH_SEQ.fetch_add(1, Relaxed);
     if STALL_MS.load(Relaxed) == 0 { return; }
     // The PIPELINE identity, not a name: pipelines are cached for the process lifetime so the value is
     // stable and comparable across a run, and storing it is one atomic write on a path taken tens of
@@ -4502,7 +4567,7 @@ see prefill_chunked_from for the pattern.", std::panic::Location::caller().file(
 dispatch would be dropped as a non-fatal validation error and its output left stale. Use wg1() and \
 make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
         }
-        if std::env::var_os("LOGSCOPE_TRACE_BIND").is_some() {
+        if trace_bind_on() {
             let head: String = shader.lines().find(|l| !l.trim().is_empty()).unwrap_or("").chars().take(90).collect();
             eprintln!("  dispatch shader: {head} | dims[..8 u32]={:?} wg={wg:?}",
                 dims.chunks(4).take(8).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<_>>());
@@ -4614,7 +4679,7 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
             //
             // This prints what is ACTUALLY bound, which separates them in one run: a view line here
             // means the tensor carried one; no view line plus a short result means dims.
-            if std::env::var_os("LOGSCOPE_TRACE_BIND").is_some() {
+            if trace_bind_on() {
                 let sz = t.buf.size();
                 match t.view {
                     None => eprintln!("  bind[{i}] whole buffer, {sz} bytes ({} u32)", sz / 4),
@@ -6616,7 +6681,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         if m == 1 {
             // decode: env override (manual A/B) → per-shape autotuned (kernel, tile) → global profile.
             // The KERNEL is chosen at runtime per shape+platform, not hardcoded (matvec_decode_cfg dispatches).
-            if std::env::var_os("LOGSCOPE_MATVEC_V1").is_some() || std::env::var_os("LOGSCOPE_MATVEC_V2").is_some() || std::env::var_os("LOGSCOPE_MATVEC_V3").is_some() {
+            if matvec_kernel_forced() {
                 return self.matvec_decode(a, w, self.decode_tile_for(w.n, w.k)); // env forces a kernel
             }
             return self.matvec_decode_cfg(a, w, self.decode_cfg_for(w.n, w.k));
@@ -6670,11 +6735,11 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             }
             return out;
         }
-        if std::env::var_os("LOGSCOPE_PREFILL_NAIVE").is_some() { return self.linear_q8_0_naive(a, w, m); }
+        if prefill_naive_forced() { return self.linear_q8_0_naive(a, w, m); }
         // register-blocked GEMM is the DEFAULT prefill kernel: measured 2795 GFLOP/s on M2 (2.8× the
         // override-tiled kernel, 5.6× naive), and it has no override constants so it compiles on every
         // backend (GL included) — no gemm_ok gate needed. Escape to the tiled kernel with LOGSCOPE_PREFILL_TILED.
-        if std::env::var_os("LOGSCOPE_PREFILL_TILED").is_some() && self.gemm_ok() {
+        if prefill_tiled_forced() && self.gemm_ok() {
             return self.linear_q8_0_gemm(a, w, m, self.gemm_tile_for(w.n, w.k));
         }
         self.linear_q8_0_gemm_rb(a, w, m)
@@ -6773,6 +6838,21 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                     pos as u32, neox, eps.to_bits(), msc];
         self.dispatch(QKNORM_ROPE, &[qkv, qn, kn, ff], &out, bytemuck::cast_slice(&dims),
                       ((n_heads + n_kv_heads) as u32, 1, 1));
+        out
+    }
+
+    /// qknorm_rope_fused with the cache rows as destinations: q → [1, ad]; normed+roped k →
+    /// `kc` row `pos`; raw v → `vc` row `pos`. One dispatch instead of one dispatch + 3 copies.
+    fn qknorm_rope_kv_append(&self, qkv: &Tensor, qn: &Tensor, kn: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor,
+                             n_heads: usize, n_kv_heads: usize, hd: usize, base: f32, pos: usize, eps: f32) -> Tensor {
+        let ad = n_heads * hd; let kv = n_kv_heads * hd;
+        let out = self.alloc(1, ad);
+        let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
+        let dims = [n_heads as u32, n_kv_heads as u32, hd as u32, base.to_bits(),
+                    pos as u32, neox, eps.to_bits(), msc, kv as u32, 0u32, 0u32, 0u32];
+        self.dispatch_rw(QKNORM_ROPE_KV_APPEND, &[qkv, qn, kn, ff, kc, vc], 4, &out, bytemuck::cast_slice(&dims),
+                         ((n_heads + 2 * n_kv_heads) as u32, 1, 1));
         out
     }
 
@@ -13404,6 +13484,8 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 // Per-row-position RoPE: like ROPE_MH but each row reads its own absolute position
 // from `pos[row]` instead of pos0+row. Needed for batched decode, where the N rows
 // are N different sessions at N different positions.
+const ROPE_KV_APPEND: &str = include_str!("kernels/rope_kv_append.wgsl");
+const QKNORM_ROPE_KV_APPEND: &str = include_str!("kernels/qknorm_rope_kv_append.wgsl");
 const ROPE_MH_ROWS: &str = r#"
 // ROPE_MH_ROWS
 struct D { t:u32,dm:u32,base:f32,_p:u32,hd:u32,neox:u32,msc:f32,_c:u32 };
@@ -14876,6 +14958,7 @@ impl Gpu {
     /// Buffer-to-buffer copy that records into the open frame if one is active (so cache
     /// writes batch with the token's compute), else submits on its own.
     fn copy_buf(&self, src: &Tensor, src_off: u64, dst: &Tensor, dst_off: u64, bytes: u64) {
+        GPU_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(frame) = self.frame.lock().unwrap().as_mut() {
             // DRAIN FIRST, same hazard as zero_tensor. A KV cache write copied
             // out of a tensor that a queued dispatch has not yet filled reads
@@ -14918,6 +15001,32 @@ impl Gpu {
         let rot = { let r = self.rope_dims.load(std::sync::atomic::Ordering::Relaxed); if r == 0 { head_dim as u32 } else { r.min(head_dim as u32) } };  // clamp: a stale larger value must never rotate past this head into its neighbor
         let dims = [t as u32, dm as u32, base.to_bits(), pos0 as u32, head_dim as u32, neox, msc, 0, rot, 0, 0, 0];
         self.dispatch(ROPE_MH, &[x, ff], &out, bytemuck::cast_slice(&dims), wg1((t * dm / 2) as u32)); out
+    }
+
+    /// One decode token: rope the q heads of `qkv` into a fresh [1, ad], rope the k heads straight
+    /// into `kc` row `pos`, and copy the v heads straight into `vc` row `pos`. One dispatch for what
+    /// block_decode_fused spent one dispatch and five copies on (see ROPE_KV_APPEND's header).
+    /// Bit-identical to rope_mh_t + the copies; NoPE (base == 0) is the identity, as before.
+    fn rope_kv_append(&self, qkv: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize,
+                      ad: usize, kv: usize, hd: usize, base: f32) -> Tensor {
+        let q = self.alloc(1, ad);
+        self.rope_kv_append_into(qkv, ff, kc, vc, pos, ad, kv, hd, base, &q);
+        q
+    }
+    /// rope_kv_append writing q into a caller-owned [1, ad] (a row view of a batched q, for the
+    /// batched decode path, or a fresh alloc).
+    fn rope_kv_append_into(&self, qkv: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize,
+                           ad: usize, kv: usize, hd: usize, base: f32, q: &Tensor) {
+        let dm = ad + kv;
+        let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
+        let rot = { let r = self.rope_dims.load(std::sync::atomic::Ordering::Relaxed); if r == 0 { hd as u32 } else { r.min(hd as u32) } };
+        let nope = (base == 0.0) as u32;
+        let dims = [1u32, dm as u32, base.to_bits(), pos as u32, hd as u32, neox, msc, 0u32, rot,
+                    ad as u32, kv as u32, nope];
+        // (ad+kv)/2 rotation pairs, then kv/2 two-lane v copies.
+        let threads = ((dm / 2) + (kv / 2)) as u32;
+        self.dispatch_rw(ROPE_KV_APPEND, &[qkv, ff, kc, vc], 2, q, bytemuck::cast_slice(&dims), wg1(threads));
     }
 
     /// rope_mh_t with a per-sequence position wrap: row's position = pos0 + row % sl.
@@ -15402,7 +15511,14 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     }
 
     fn decode_attention_mh(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
-        let out = self.alloc(1, dm); let hd = dm / n_heads;
+        let out = self.alloc(1, dm);
+        self.decode_attention_mh_into(q, kc, vc, l, dm, n_heads, n_kv_heads, &out);
+        out
+    }
+    /// decode_attention_mh writing into a caller-owned [1, dm] — a row view of the batched attention
+    /// output on the batched path, so session i's result lands in row i with no copy.
+    fn decode_attention_mh_into(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize, out: &Tensor) {
+        let hd = dm / n_heads;
         let dims = [l as u32, hd as u32, n_heads as u32, n_kv_heads as u32];
         // Rule-based by shape: the parallel kernel (one workgroup per head, KV rows split across
         // threads) uses the whole GPU and dominates at long context, but needs scores[l] in
@@ -15414,17 +15530,16 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
         // kernel at ANY length so that hypothesis can be A/B-tested (and pins a safe path if true).
         // DECODE_ATTN_MH_PAR is barrier-heavy; if a prior GPU op faulted (degraded), or the diagnostic
         // flag is set, use the serial (barrier-free) kernel that can't wedge a fragile driver.
-        let decode_serial = self.degraded() || std::env::var_os("LOGSCOPE_DECODE_ATTN_SERIAL").is_some();
+        let decode_serial = self.degraded() || decode_attn_serial_forced();
         if decode_serial {
-            self.dispatch(DECODE_ATTN_MH, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), ((n_heads as u32).div_ceil(64), 1, 1));
+            self.dispatch(DECODE_ATTN_MH, &[q, kc, vc], out, bytemuck::cast_slice(&dims), ((n_heads as u32).div_ceil(64), 1, 1));
         } else if l <= 4096 {
-            self.dispatch(DECODE_ATTN_MH_PAR, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), (n_heads as u32, 1, 1));
+            self.dispatch(DECODE_ATTN_MH_PAR, &[q, kc, vc], out, bytemuck::cast_slice(&dims), (n_heads as u32, 1, 1));
         } else if flash_attn_enabled() {
-            return self.decode_attention_flash(q, kc, vc, l, dm, n_heads, n_kv_heads);
+            self.decode_attention_flash_into(q, kc, vc, l, dm, n_heads, n_kv_heads, out);
         } else {
-            self.dispatch(DECODE_ATTN_MH, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), ((n_heads as u32).div_ceil(64), 1, 1));
+            self.dispatch(DECODE_ATTN_MH, &[q, kc, vc], out, bytemuck::cast_slice(&dims), ((n_heads as u32).div_ceil(64), 1, 1));
         }
-        out
     }
 
     /// Flash-style split-K decode attention (see DECODE_ATTN_FLASH_P1/P2): pass 1 computes local
@@ -15432,16 +15547,19 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     /// The structural long-context decode kernel — per-token attention cost parallelizes across
     /// the sequence instead of one workgroup per head crawling all of KV.
     pub fn decode_attention_flash(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
+        let out = self.alloc(1, dm);
+        self.decode_attention_flash_into(q, kc, vc, l, dm, n_heads, n_kv_heads, &out);
+        out
+    }
+    fn decode_attention_flash_into(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize, out: &Tensor) {
         let hd = dm / n_heads;
         let chunk = 2048usize;
         let nch = l.div_ceil(chunk);
         let part = self.alloc(1, n_heads * nch * (hd + 2));
         let dims = [l as u32, hd as u32, n_heads as u32, n_kv_heads as u32, chunk as u32, nch as u32, 0, 0];
         self.dispatch(DECODE_ATTN_FLASH_P1, &[q, kc, vc], &part, bytemuck::cast_slice(&dims), (n_heads as u32, nch as u32, 1));
-        let out = self.alloc(1, dm);
         let dims2 = [hd as u32, nch as u32, n_heads as u32, 0];
-        self.dispatch(DECODE_ATTN_FLASH_P2, &[&part], &out, bytemuck::cast_slice(&dims2), (n_heads as u32, 1, 1));
-        out
+        self.dispatch(DECODE_ATTN_FLASH_P2, &[&part], out, bytemuck::cast_slice(&dims2), (n_heads as u32, 1, 1));
     }
 
     /// Two-span decode attention: one online softmax over a WARM int8 K/V tail (`wl` rows) followed by a
@@ -16158,14 +16276,22 @@ sequence.");
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         // Fused norm→QKV: RMSNorm(x) folds into the wqkv matvec (one dispatch instead of two).
         let qkv = w.wqkv.norm_apply(self, x, &w.g1, d, eps, 1);            // [1, ad+2kv]
-        let (q, kr) = if let (Some(qnw), Some(knw)) = (&w.q_norm, &w.k_norm) {
+        // Every branch writes this token's roped k into `kc` row `pos`; the fused one writes v too.
+        let mut v_in_cache = false;
+        let q = if let (Some(qnw), Some(knw)) = (&w.q_norm, &w.k_norm) {
+            if rope_kv_append_enabled() && w.v_norm.is_none() && base != 0.0 {
+                // The same fusion with the cache rows as destinations — the slice-q, k→cache and
+                // v→cache copies go away. NoPE and Gemma's v_norm keep the copy path below.
+                v_in_cache = true;
+                self.qknorm_rope_kv_append(&qkv, qnw, knw, ff, kc, vc, n_heads, n_kv_heads, hd, base, pos, eps)
+            } else {
             // Qwen3/3.5 QK-Norm: FUSED norm+rope — one dispatch replaces the old 4-chain
             // (norm q → norm k → rope q → rope k); output layout identical (q ‖ k).
             let qk = self.qknorm_rope_fused(&qkv, qnw, knw, ff, n_heads, n_kv_heads, hd, base, pos, eps);
             let qr = self.slice_cols(&qk, 0, ad);
-            let kr = self.slice_cols(&qk, ad, kv);
-            self.write_row(kc, &kr, pos, kv);
-            (qr, kr)
+            self.copy_buf(&qk, (ad * 4) as u64, kc, (pos * kv * 4) as u64, (kv * 4) as u64);   // roped k → K-cache row
+            qr
+            }
         } else if w.q_norm.is_some() || w.k_norm.is_some() {
             // single-sided norm (no known arch does this) — keep the unfused chain for correctness
             let qn = self.qk_norm(self.slice_cols(&qkv, 0, ad), &w.q_norm, 1, ad, hd, eps);
@@ -16173,15 +16299,21 @@ sequence.");
             let qr = self.rope_mh_t(&qn, ff, 1, ad, base, pos, hd);
             let kr = self.rope_mh_t(&kn, ff, 1, kv, base, pos, hd);
             self.write_row(kc, &kr, pos, kv);
-            (qr, kr)
+            qr
+        } else if rope_kv_append_enabled() && w.v_norm.is_none() {
+            // ONE dispatch: rope q → q, rope k → kc[pos], v → vc[pos]. What it replaces: the
+            // slice(q|k) copy, ROPE_MH, the slice-q copy, the k→cache copy, a slice-k copy whose
+            // result nothing read, and the v→cache copy below — one dispatch and five copies,
+            // each copy a compute job on Honeykrisp and a pass-fusion drain everywhere.
+            v_in_cache = true;
+            self.rope_kv_append(&qkv, ff, kc, vc, pos, ad, kv, hd, base)
         } else {
             // RoPE q and k in one pass: [0,ad)=q heads, [ad,ad+kv)=k heads are contiguous and head-aligned.
             let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, ad + kv), ff, 1, ad + kv, base, pos, hd);
             let q = self.slice_cols(&qk, 0, ad);
             self.copy_buf(&qk, (ad * 4) as u64, kc, (pos * kv * 4) as u64, (kv * 4) as u64);   // roped k → K-cache row
-            (q, self.slice_cols(&qk, ad, kv))
+            q
         };
-        let _ = &kr; // k already written to cache above in both branches
         // Gemma 4 V handling: normed (and possibly k-sourced) V goes through write_row; the raw
         // copy_buf below is the every-other-family path. The k slice of `qkv` is the RAW
         // projection — qknorm_rope_fused produced a NEW tensor above, so this reads pre-norm k.
@@ -16192,6 +16324,7 @@ sequence.");
                 let vn = self.v_norm_apply(&vsrc, ones, 1, kv, hd, eps);
                 self.write_row(vc, &vn, pos, kv);
             }
+            None if v_in_cache => {}
             None => self.copy_buf(&qkv, ((ad + kv) * 4) as u64, vc, (pos * kv * 4) as u64, (kv * 4) as u64), // v → V-cache row
         }
         // Llama 4 iRoPE attention temperature on NoPE layers past the floor (see block_decode).
@@ -16463,10 +16596,37 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         let mut x = self.upload(&xh, n, d);
         let posv: Vec<u32> = sessions.iter().map(|s| s.pos as u32).collect();
         let pos = self.upload_u32(&posv);
+        // The fused per-session step: one norm+QKV projection for the batch, then per session ONE
+        // rope+KV-append (q into row i of a batched q, k and v into that session's cache) and ONE
+        // attention writing row i of the batched output. The copy path below spends 4n copies per
+        // layer staging q/k/v/attn rows through single-row tensors plus two batched rope passes;
+        // this spends none. Measured by --gate-batched-fused at n=4 on lavapipe, per layer:
+        // 17 dispatches + 16 copies -> 17 dispatches + 0 copies (the two rope passes became n
+        // rope+append dispatches; the m>1 norm/residual/ffn stay unfused, which is the next cut).
+        // Same kernels as the single-session path; the gate checks every session's logits and
+        // cache rows bit-exact against the copy path. Row views need 256-byte-aligned rows; the
+        // families with QK-norm / v-norm / a shared-KV twist keep the copy path.
+        let fused_rows = rope_kv_append_enabled() && row_views_aligned(ad + 2 * kv) && row_views_aligned(ad)
+            && m.layers.iter().all(|w| w.q_norm.is_none() && w.k_norm.is_none() && w.v_norm.is_none() && !w.v_from_k);
         for li in 0..m.n_layers {
             let w = &m.layers[li];
-            let n1 = self.rmsnorm_t(&x, &w.g1, n, d, m.eps);
             let rb = if w.nope { 0.0 } else { m.base }; // Llama4 iRoPE NoPE switch (rows path)
+            if fused_rows {
+                let qkv = w.wqkv.norm_apply(self, &x, &w.g1, d, m.eps, n);   // [n, ad+2kv]
+                let qb = self.alloc(n, ad);
+                let attn = self.alloc(n, ad);
+                for i in 0..n {
+                    let p = sessions[i].pos;
+                    let (kc, vc) = (&sessions[i].cache.k[li], &sessions[i].cache.v[li]);
+                    let qi = row_view(&qb, i);
+                    self.rope_kv_append_into(&row_view(&qkv, i), &m.rope_factors, kc, vc, p, ad, kv, hd, rb, &qi);
+                    self.decode_attention_mh_into(&qi, kc, vc, p + 1, ad, m.n_heads, m.n_kv_heads, &row_view(&attn, i));
+                }
+                let x2 = w.wo.apply_add(self, &attn, n, &x);
+                x = self.ffn_apply(w, &x2, n, d, m.eps);
+                continue;
+            }
+            let n1 = self.rmsnorm_t(&x, &w.g1, n, d, m.eps);
             let qb = self.rope_mh_rows(&w.wq.apply(self, &n1, n), &m.rope_factors, &pos, n, ad, rb, hd);
             let kb = self.rope_mh_rows(&w.wk.apply(self, &n1, n), &m.rope_factors, &pos, n, kv, rb, hd);
             let vb = w.wv.apply(self, &n1, n);

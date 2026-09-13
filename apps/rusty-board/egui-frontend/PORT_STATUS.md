@@ -93,9 +93,23 @@ moved.
   due (idle = no paint). The eframe shell remains for desktops and as the runtime fallback when
   a compositor has no layer shell; there it is a **ruled toplevel** (`plasma-setup.sh` writes
   the KWin rule) and the status strip says which. `Feel::frame(&egui::Context)` +
-  `Feel::pump_sink()` are the seam both shells use. Compile-verified only: the layer shell has
-  not been run against a compositor. First run is on a device; the things most likely to be
-  wrong are integer-only scale (soft text at 2.5×) and the map/unmap sequence on KWin.
+  `Feel::pump_sink()` are the seam both shells use.
+  UPDATE (desktop testing): the map/unmap sequence WAS wrong, and it was the first thing
+  desktop testing hit — every hide-then-show cycle:
+  `zwlr_layer_surface_v1#7: error 1: the layer surface has a width of 0 but its anchor
+  doesn't include the left and the right screen edge` — connection killed, "layer-shell
+  shell failed: read: Protocol error 1". Root cause: unmapping (the null-buffer commit
+  the hide path makes) resets the layer surface "to the state it had right after
+  layer_shell.get_layer_surface" per the protocol's own text — anchor, exclusive zone
+  and keyboard interactivity all reset, not just size. The show path only re-sent size
+  and exclusive zone, so the re-map committed width 0 with no anchor. A phone session
+  that never hides the board never reaches this, which is why it shipped compile-clean.
+  Fixed: the four requests (`set_anchor`, `set_size`, `set_exclusive_zone`,
+  `set_keyboard_interactivity`) now live in one `apply_layer_state()`, called after
+  `get_layer_surface` and again on every re-map, so the two sites cannot drift apart
+  again. Still open from this line: integer-only scale (soft text at 2.5x) is
+  unverified either way, and the fix itself has only been reproduced hide-then-show
+  on KDE — sway is untested.
 
 ## Voice: connected, and faster (feature `voice`)
 

@@ -181,6 +181,40 @@ architectural notes.
 * **GPU dispatch on Honeykrisp.** The generator's persistent-map
   pattern was validated on pre-Honeykrisp Asahi. Re-validation is
   filed and is the gate for v0.18.1 work.
+  UPDATE (later session): re-validation found the answer was "don't,
+  yet, by default" rather than "re-verify". 46 telemetry runs
+  (events.jsonl) on an M2 Ultra with `GEN_BACKEND=auto` all had the
+  GPU terrain generator on, and all had main-pass medians of 0.6-4s —
+  the second frame of one run spent 217ms in the main pass with two
+  chunks loaded, before there was anything to draw. The 2026-09-01
+  perf bisect (docs/claude-notes/perfbisect-desktop-findings.md) had
+  already measured why: the generator's record->submit->wait_for_
+  fences batches sit on the SAME hardware queue the frame renders on
+  (0.5-1.6s per batch), and the GPU path was 0.63-0.98x the CPU path
+  regardless of the queue contention. The honeykrisp runtime profile
+  has said `GEN_BACKEND=cpu` since the bisect, but `Backend::Auto`
+  never consulted it — it was "use the GPU if a device exists", full
+  stop. Fixed: `Backend::Auto` now reads the driver id via
+  `VK_KHR_driver_properties` before creating a device
+  (`world::gpu_generator::auto_policy`, a pure function keyed on the
+  driver, not the queue shape) and declines on Honeykrisp with a
+  reason and an override (`UNENDLICH_GEN_BACKEND=gpu` still forces
+  it). Exposed to Settings as a three-way Auto/CPU/GPU control,
+  live-togglable without a relaunch when a GPU generator already
+  exists. Separately, the shader's own per-voxel cost was cut: the
+  surface-biome scan (`biome_at_3d_gpu`) ran once per exposed voxel
+  with a `y` constant for the whole chunk, carrying the shader's one
+  expensive loop (up to 128 y-values of multi-octave 3D noise) far
+  more often than needed; it is now cached once per column in shared
+  memory. Verified bit-exact (`gen_parity`, new bin: GPU block-id hash
+  unchanged before/after on lavapipe) — NOT yet verified for wall time
+  on Honeykrisp itself. The number that would close this item: the
+  generator's own per-batch log line with `UNENDLICH_GEN_BACKEND=gpu`,
+  compared against the 0.5-1.6s above. If it's now tens of ms, the
+  `auto_policy` decline can be lifted (it's a one-line change with its
+  own tests) and this bug class is actually closed; if not, the
+  generator's single-queue serialization is the next thing to fix,
+  not just its per-voxel cost.
 
 ## Known limitations / TODO
 

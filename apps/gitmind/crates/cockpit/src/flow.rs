@@ -662,6 +662,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rusty_board_builds_the_egui_port_not_the_gtk_original() {
+        // The bare name "rusty-board" resolves (ops::resolve_app_dir) to apps/rusty-board,
+        // which is a real directory — the GTK4/libadwaita original is still a live package
+        // there — so a plain simple() entry built the WRONG keyboard silently: no build
+        // error, just none of the egui port's fixes (most recently the layer-shell anchor
+        // reset on re-map). manifest/projects.toml marks rusty-board-egui primary.
+        for group_name in ["work", "bigsilicons-apps"] {
+            let group = store_groups().into_iter().find(|g| g.name == group_name).unwrap_or_else(|| panic!("missing group {group_name}"));
+            let r = group.apps.iter().find(|a| a.name == "rusty-board").unwrap_or_else(|| panic!("{group_name} is missing rusty-board"));
+            assert_eq!(r.path, "apps/rusty-board/egui-frontend", "{group_name}'s rusty-board entry points at the GTK original's directory");
+            assert_eq!(r.build_app_id(), "rusty-board-egui");
+            assert!(r.features.iter().any(|f| f == "layer"), "{group_name}'s rusty-board entry should build the deploy target (layer), not the app-only desktop-test default");
+        }
+        for group in store_groups() {
+            let hits: Vec<_> = group.apps.iter().filter(|a| a.name == "rusty-board").collect();
+            assert!(hits.len() <= 1, "{} has rusty-board listed more than once: {:?}", group.name, hits);
+        }
+    }
+
+    #[test]
+    fn fao_codec_builds_the_egui_port_not_the_bare_workspace_root() {
+        // apps/fao-codec is a [workspace] with no [package] of its own; a bare cargo build
+        // there has no default package to pick. manifest/projects.toml marks fao-codec-egui
+        // primary — the port with the real encoder, decoder and Encode Lab pages.
+        for group_name in ["music", "bigsilicons-apps"] {
+            let group = store_groups().into_iter().find(|g| g.name == group_name).unwrap_or_else(|| panic!("missing group {group_name}"));
+            let f = group.apps.iter().find(|a| a.name == "fao-codec").unwrap_or_else(|| panic!("{group_name} is missing fao-codec"));
+            assert_eq!(f.path, "apps/fao-codec/egui-frontend", "{group_name}'s fao-codec entry points at the bare workspace root");
+            assert_eq!(f.build_app_id(), "fao-codec-egui");
+        }
+        for group in store_groups() {
+            let hits: Vec<_> = group.apps.iter().filter(|a| a.name == "fao-codec").collect();
+            assert!(hits.len() <= 1, "{} has fao-codec listed more than once: {:?}", group.name, hits);
+        }
+    }
+
     fn g(repo: &Path, args: &[&str]) {
         let mut full: Vec<&str> = vec!["-c", "user.name=T", "-c", "user.email=t@t"];
         full.extend_from_slice(args);
@@ -1101,12 +1138,12 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
                  "photosync", "vidkit-player"];
     // beatspace is a CUSTOM entry below (it needs run_flags), so it is not in
     // this simple list — being in both would put it in the group twice.
-    let music = ["krapper", "bo-suite", "fao-codec"];
+    let music = ["krapper", "bo-suite"];
     // ambient-learner is a CUSTOM entry below: the manifest marks
     // `ambient-learner-egui` primary, and a bare name here resolves to
     // `apps/ambient-learner` — the ICED parent, which is not what the fleet
     // ships. Being in both lists would offer it twice.
-    let work = ["voiceterm", "rusty-board"];
+    let work = ["voiceterm"];
     let all: Vec<&str> = coding.iter().chain(&media).chain(&music).chain(&work).copied().collect();
     // bsettings: crate `bigsilicon-settings` at apps/settings-app, GUI bin needs the `gui` feature.
     // Its path/features differ from the simple apps/<name> convention, so it's a custom entry.
@@ -1233,6 +1270,36 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     //   bscale — a workspace AND it needs `gpu,app`; the bin is a member
     //   with the same name as the workspace, which is what makes a bare entry
     //   look plausible and build nothing.
+    // rusty-board: the manifest marks `rusty-board-egui` primary — "the default keyboard;
+    // gitmind selects this, not the GTK build" (manifest/projects.toml) — but the bare name
+    // here resolved to `apps/rusty-board`, a real directory (the GTK4/libadwaita original is
+    // still a live package there), so `resolve_app_dir` found it and built the wrong keyboard,
+    // with none of the egui port's fixes. Same shape as ambient-learner, several commits later.
+    //
+    // `layer` is the docked, tuck-away-like-Maliit build the manifest note names as the deploy
+    // target (a ruled floating toplevel on KWin was the fallback "until a layer-shell shell
+    // exists" — it now does; the anchor-reset-on-remap protocol bug that shell hit under KDE
+    // is fixed). `layer` implies `app`, so this is the one feature a caller needs to name.
+    let rusty_board = || crate::suite::SuiteApp {
+        name: "rusty-board".into(),
+        path: "apps/rusty-board/egui-frontend".into(),
+        features: vec!["layer".into()],
+        no_default: false, target: String::new(), run_flags: String::new(),
+        bin_name: Some("rusty-board-egui".into()),
+    };
+    // fao-codec: the manifest marks `fao-codec-egui` primary — "the egui port is the intended
+    // build" — but the bare name here resolved to `apps/fao-codec`, a WORKSPACE ROOT with no
+    // `[package]` of its own (members: fao_codec_core/lib/v1/v2, fao_app the GTK original,
+    // fao_cli, egui-frontend). A bare `cargo build --release` there has no default package to
+    // pick, so this entry built nothing usable — the workspace-root shape `cadscope`/`aperture`/
+    // `simscope` already carry a comment about, that this list still offered as a simple entry.
+    let fao_codec = || crate::suite::SuiteApp {
+        name: "fao-codec".into(),
+        path: "apps/fao-codec/egui-frontend".into(),
+        features: vec![],
+        no_default: false, target: String::new(), run_flags: String::new(),
+        bin_name: Some("fao-codec-egui".into()),
+    };
     let hatch = || crate::suite::SuiteApp {
         name: "hatch".into(),
         path: "apps/hatch/egui-frontend".into(),
@@ -1278,6 +1345,7 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
         bin_name: Some("unendlich-fullgame".into()),
     };
     let mut work_group = group("work", "Productivity, comms & input", &work);
+    work_group.apps.push(rusty_board());
     work_group.apps.push(bsettings());
     work_group.apps.push(ambient_learner());
     work_group.apps.push(dialer());
@@ -1298,6 +1366,8 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     media_group.apps.push(bscale());
     let mut all_group = group("bigsilicons-apps", "Every BigSilicon app — build all in one go", &all);
     all_group.apps.push(bsettings());
+    all_group.apps.push(rusty_board());
+    all_group.apps.push(fao_codec());
     all_group.apps.push(ambient_learner());
     all_group.apps.push(dialer());
     all_group.apps.push(switcheroo());
@@ -1329,6 +1399,7 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
             // because it carries run_flags the list cannot express.
             let mut m = group("music", "Audio synthesis, codecs & music", &music);
             m.apps.push(beatspace());
+            m.apps.push(fao_codec());
             m
         },
         work_group,
@@ -1390,11 +1461,16 @@ mod store_group_tests {
         // `egui-frontend` deliberately. Same exception, different cause, and
         // worth saying so: the next reader will otherwise assume it is another
         // workspace.
-        const EXPLICIT_PATH: [&str; 11] = [
+        const EXPLICIT_PATH: [&str; 13] = [
             "bsettings", "studio", "aperture", "cadscope", "simscope", "ambient-learner",
             // Five apps the store did not offer at all until they were added;
             // each is a workspace whose runnable crate is a member.
             "hatch", "drivemind", "switcheroo", "dialer", "bscale",
+            // rusty-board and fao-codec: same ambient-learner shape — a real, buildable
+            // directory exists at the bare name (a live GTK package / a workspace root with
+            // no package respectively), but it is not what the manifest calls primary, so
+            // these point at the egui port explicitly.
+            "rusty-board", "fao-codec",
         ];
         for a in &all.apps {
             assert!(!a.path.contains('/') || EXPLICIT_PATH.contains(&a.name.as_str()),
@@ -2357,9 +2433,13 @@ mod launch_consistency_tests {
         diverging.sort();
         diverging.dedup();
 
-        // The one that was reported must be fixed.
+        // The ones that were reported must be fixed.
         assert!(!diverging.iter().any(|n| n == "ambient-learner"),
                 "ambient-learner still builds the iced parent");
+        assert!(!diverging.iter().any(|n| n == "rusty-board"),
+                "rusty-board still builds the GTK original, not the primary egui port");
+        assert!(!diverging.iter().any(|n| n == "fao-codec"),
+                "fao-codec still points at the workspace root, not the primary egui port");
 
         if !diverging.is_empty() {
             eprintln!("store entries building a non-primary parent ({}):\n  {}",

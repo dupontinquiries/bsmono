@@ -424,6 +424,14 @@ A peer who declares no active track still matches on time alone, so the warning
 degrades to "someone is around here" rather than vanishing. (A test caught that:
 it originally flagged both clips under one playhead.)
 
+**A picture above the tracks.** The frame-under-the-playhead preview
+(`studio-video::frame_rgb`, topmost video track, half-second cache) existed
+only as the workbench's side-slot viewport — reachable from a different tab,
+not from the Timeline itself, so editing had no monitor. A `preview` toggle on
+the bar (default on) now opens the same viewport in a resizable panel above
+the tracks, so scrubbing the timeline shows what plays without leaving the
+editing surface.
+
 ## The audio half
 
 The idea worth taking from Audacity is not any of its UI: it is that a
@@ -484,6 +492,33 @@ beatspace loaded registers a renderer, and a host without one still opens, edits
 and plays the project — the beatspace channel is simply silent. A test pins
 that, because a project that fails to open because a plugin is missing is the
 worst failure mode a DAW has.
+
+### Placing a pattern, and staying live
+
+A pattern reaches the timeline three ways now — the rack's own bounce button,
+⇥ in the library, and dragging a pattern row onto a track — and all three go
+through one path, `Studio::place_pattern(index, at, track, …)`: render at the
+rack tempo, land as the same `AddSource`+`AddClip` a bounce or a recorded take
+produces (undoable, and shareable by the collaboration mechanism those already
+use), refusing a non-audio track or an overlapping drop *before* the source
+lands rather than leaving an orphan.
+
+The drop itself is `studio-egui`'s job, not the host's: `pattern_drop_target`
+snaps to the same edges a moved clip snaps to, and routes a drop over a video
+row to the nearest audio track — a pattern is sound, the same refusal a
+cross-kind clip move already makes.
+
+What makes this more than a bounce: `Studio::pattern_links` keeps every placed
+source linked to its pattern **by name** (indices move when patterns are
+deleted), and an edit to the rack re-renders every linked source and re-mixes
+the arrangement through the same tested mixdown the export uses — so the
+timeline playhead passing through a placed pattern hears it as it is *now*,
+through the mixer, not as a frozen bounce from when it was dropped. Deleting
+the source pattern unlinks and keeps the last render rather than going silent
+or stale without saying so. Links are not persisted — a reopened project
+plays the frozen take until the pattern is placed again, which is a
+deliberate simplification, not an oversight (linking on reload needs the
+pattern's *content*, not just its name, to be a safe match).
 
 ## Recording, and why takes are ops
 

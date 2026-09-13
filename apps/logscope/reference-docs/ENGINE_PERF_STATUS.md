@@ -81,24 +81,88 @@ Honest apportionment: dims-cache + buffer-pool primarily shrink the ~16% CPU sli
 (and possibly some gpu-sync if MoltenVK per-dispatch binding is in the critical path —
 **M2-measurable, not knowable on lavapipe**). The 84% gpu-sync is owned by fusion.
 
+## 4b. A later session's additions (commits aa9dec1b9..f080c720f, lavapipe-validated)
+
+Also section 5 item 1's territory — RoPE fusion, plus two bugs found in the counters
+used to apportion everything above, and the PASS_FUSE retraction re-examined against
+llama.cpp's own Vulkan backend.
+
+- `aa9dec1b9` **GPU_DISPATCHES was double-counted** — `mark_dispatch` (the bind-group-
+  miss path) and `record_dispatch` both incremented it. With the bind-group cache off
+  (the default), every dispatch counted twice, so every "~210 dispatches/token" figure
+  above, and every "N dispatches/pass" ratio derived from it, reads 2x the true count.
+  The `--bench` output's shape does not change; the absolute dispatch numbers in this
+  doc predate the fix and should be halved before comparing against a post-fix run.
+- `701924b52` **GPU_COPIES** — buffer copies (`copy_buf`: KV-cache row writes,
+  `slice_cols`) were never counted anywhere. On the app's decode path they ran ~45% of
+  a layer's GPU commands. On Honeykrisp a copy is a compute job (no blit engine), so
+  this was invisible cost, not zero cost.
+- `e8cedaaf4` **decode-census** (`gpu-gemm/src/bin/`) — per-token dispatch/pass/
+  submit/copy/poll census plus a logits hash, mirroring the app's real decode path
+  (stream_session -> decode_step), so a lever A/B can be checked bit-exact and
+  counted in one run instead of cross-referencing --bench against a gate.
+- `2d33e93c2`, `f080c720f` **ROPE_KV_APPEND / QKNORM_ROPE_KV_APPEND** — this is section
+  5 item 1's "RoPE(q)+RoPE(k) merged (-1/layer)", done, and further: rope q, and write
+  roped k and raw v STRAIGHT INTO the KV-cache rows, in one dispatch. Removes the copies
+  found above, not just a rope dispatch: per layer, f32-KV path 6 dispatches + 5 copies
+  -> 6 + 0; QK-norm (Qwen3) path 7 + 4 -> 7 + 0. Default-on lever
+  (LOGSCOPE_ROPE_KV_APPEND), --gate-rope-kv (logits AND every K/V cache row bit-exact
+  vs the copy path, on two fixture families, three deliberate kernel breaks caught).
+  f080c720f extends the same idea to decode_batched (the N-session fan path): row
+  views into the batched KV tensor instead of per-session copies.
+- `21a82e432` **PASS_FUSE re-examined, still Off by default.** The retraction's own
+  in-sandbox reproduction (probe-decode-parity) is 0/6 wrong with fusion on as of this
+  tree — the copy_buf/zero_tensor drain fix that predates it landed AFTER the hardware
+  run that produced the retraction, and no hardware run has been made since. llama.cpp's
+  Vulkan backend and wgpu-core's own barrier semantics both permit compute->compute
+  barriers inside one command buffer, which is what fusion needs — the driver was never
+  the right suspect. With ROPE_KV_APPEND, a fused token drops to 1 pass (was 14
+  unfused, 5 fused-with-copies) with an unchanged logits hash on lavapipe. Left Off
+  pending an M2 run: bit-exact on lavapipe is not bit-exact on a driver where FMA
+  contraction differs, and the lever registry entry says so with the reproduction
+  steps rather than asserting either way.
+- `62e80e61e` a fixture-generator bug the above work exposed: make-tiny-gguf.py
+  restarted its xorshift from one fixed seed per tensor, so any two same-length
+  tensors — attn_q_norm and attn_k_norm in the qwen3 fixture — were byte-identical. A
+  QK-norm kernel that normed k with the q weight passed a bit-exact gate undetected
+  until a deliberate break test (CLAUDE.md section 5b) found it inert. Seeded per
+  tensor index now; every emitter that shares write() picks this up.
+
+## 4c. Tool-calling (unrelated axis, same session as 4b)
+
+`d5986ee76` — the app-side tool-call parser now accepts the formats base models are
+actually trained on (bare JSON, fenced json, XML-ish tags) in addition to the
+harness's own wire format, rather than only the latter. Orthogonal to everything
+above; noted here only so this doc's commit range is a complete account of the
+session.
+
 ## 5. Remaining work, priority order
 
-1. **Finish fusion (the 84% lever).** Make `LOGSCOPE_FUSED_QKV` default; extend
-   fusion to prefill (`block_prefill*`, needs strided q/k extraction at t>1); add the
-   plan's further cuts — residual-add folded into matmul epilogue (−2/layer),
-   RMSNorm folded into the next matmul's load (−2/layer), RoPE(q)+RoPE(k) merged
-   (−1/layer). Target ~210 → ~130–150 dispatches/token.
+1. ~~**Finish fusion (the 84% lever).**~~ RoPE(q)+RoPE(k)+KV-append is done (4b).
+   Still open from the original plan: residual-add folded into matmul epilogue
+   (−2/layer), RMSNorm folded into the next matmul's load (−2/layer) — FUSE_NORM in
+   `enginelevers.rs` may already cover part of this, not cross-checked against this
+   doc. Then **default `LOGSCOPE_PASS_FUSE=1`** once an M2 run confirms 4b's lavapipe
+   result, extend fusion to prefill (`block_prefill*`, needs strided q/k extraction
+   at t>1).
 2. **Memory cleanup.** Once fused is the only consumer, drop `wq/wk/wv` from
    `BlockWeights` + the int8 cache (reclaims the duplicate-resident cost that blocks
    fused-default today). Cache the resident embedding — `generate_kv_gpu` re-uploads
    a ~1 GB f32 table per call.
 3. **N×K locked pool** — run `decode_batched` (N rows) inside the windowed frame →
-   N·K tokens/submit (the original "pool" goal).
+   N·K tokens/submit (the original "pool" goal). 4b's row-view change is a step
+   toward this (fewer per-session copies in the same loop) but does not itself add
+   the K-step windowing.
 4. **App-side Q4 wiring** — `logscope-egui` `backend.rs` has its own int8-only budget
    pre-check; relax it to defer to the loader's auto-select so the 70B loads in the app.
 5. **Measure on M2** via `tools/bench-tps.sh` (restored this session): baseline,
-   FUSED_QKV on/off, Q4_RESIDENT on/off, workers sweep, spec. That single pass apportions
-   every change above and finds the batched saturation knee.
+   FUSED_QKV on/off, ROPE_KV_APPEND on/off, PASS_FUSE on/off (the one this doc most
+   needs — 4b's lavapipe numbers say it should work now), Q4_RESIDENT on/off, workers
+   sweep, spec. That single pass apportions every change above, including 4b's, and
+   finds the batched saturation knee. No hardware run has happened since `aa9dec1b9`;
+   every dispatch-count figure quoted anywhere before that commit is 2x the true value
+   (the double-count bug) and should not be trusted for a before/after comparison
+   without re-deriving from a post-fix build.
 
 ## 6. Source chats (no single prior handoff existed)
 
@@ -107,3 +171,8 @@ Honest apportionment: dims-cache + buffer-pool primarily shrink the ~16% CPU sli
   the 20.66 tok/s breakdown, fused-QKV/gpusample/windowed patches, `bench-tps.sh`.
 - "c4 logscope mind palace work round 3" — merge + further gates.
 - This session (c5) — upload-locking, Q4 bandwidth/auto-select, lavapipe runner.
+- A later session (c5b, this doc's 4b/4c) — the dispatch-count bug, GPU_COPIES,
+  decode-census, ROPE_KV_APPEND/QKNORM_ROPE_KV_APPEND, the PASS_FUSE re-examination,
+  the fixture-seeding bug, and (separately) tool-call format acceptance. Commits
+  `aa9dec1b9`..`f080c720f` plus `d5986ee76`; see those commit messages for the full
+  reasoning and verification each carries.

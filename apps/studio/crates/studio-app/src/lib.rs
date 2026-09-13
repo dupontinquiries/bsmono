@@ -184,6 +184,17 @@ pub struct Studio {
     pub trim_side: studio_egui::TrimSide,
     /// Set by the panel's bounce button; the shell performs it.
     pub pending_bounce: bool,
+    /// A pattern to land on the timeline next frame: (pattern index, time, track). Set by a
+    /// library drop or ⇥; `pending_bounce` is the rack's "at the playhead" case of it.
+    pub pending_place: Option<(usize, studio_core::Ticks, studio_core::TrackId)>,
+    /// LIVE SUBPATTERNS. Sources the timeline got from a pattern, keyed to the pattern by
+    /// NAME (indices move when patterns are deleted; names are what the user sees). When
+    /// the rack changes, every linked source is re-rendered and the arrangement re-mixed,
+    /// so the playhead passes through the pattern as it is NOW — through the same mixdown
+    /// the export uses, which is what makes the preview mirror the render. Not persisted:
+    /// a saved project holds the bounce's WAV, and a reopened project plays that frozen
+    /// take until the pattern is placed again.
+    pub pattern_links: std::collections::BTreeMap<studio_core::SourceId, String>,
     /// What this device's person is called in presence packets — per device
     /// (it rides the workspace sidecar), because the same account on a phone
     /// and a desktop may legitimately want "kes (phone)" vs "kes". Empty
@@ -276,6 +287,8 @@ impl Studio {
             octave: 0,
             trim_side: studio_egui::TrimSide::default(),
             pending_bounce: false,
+            pending_place: None,
+            pattern_links: std::collections::BTreeMap::new(),
             display_name: String::new(),
             presence_seq: 0,
             last_presence: None,
@@ -2179,7 +2192,6 @@ impl Studio {
         rate: u32,
         sources: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
     ) -> Option<(studio_core::SourceId, studio_audio::SourceAudio)> {
-        let pattern = self.rack.patterns.get(self.current_pattern)?.clone();
         let track = self.session.doc.project.tracks.iter()
             .find(|t| t.kind == studio_core::TrackKind::Audio)
             .map(|t| t.id);
@@ -2187,23 +2199,96 @@ impl Studio {
             self.status = "bounce refused: no audio track".into();
             return None;
         };
-        let samples = self.render_loop(rate, sources);
+        let at = self.playhead();
+        self.place_pattern(self.current_pattern, at, track, rate, sources)
+    }
+
+    /// Render pattern `index` at the rack tempo and land it at `at` on `track` as an
+    /// ordinary AddSource + AddClip (undoable, on the wire); the source is LINKED to the
+    /// pattern by name so later rack edits re-render it (`rerender_pattern_links`). The
+    /// library drop, ⇥ and the rack's bounce all come through here.
+    pub fn place_pattern(
+        &mut self,
+        index: usize,
+        at: studio_core::Ticks,
+        track: studio_core::TrackId,
+        rate: u32,
+        sources: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
+    ) -> Option<(studio_core::SourceId, studio_audio::SourceAudio)> {
+        let pattern = match self.rack.patterns.get(index) {
+            Some(p) => p.clone(),
+            None => { self.status = "that pattern no longer exists".into(); return None; }
+        };
+        if !self.session.doc.project.tracks.iter().any(|t| t.id == track && t.kind == studio_core::TrackKind::Audio) {
+            self.status = "placing refused: a pattern needs an audio track".into();
+            return None;
+        }
         let source = studio_core::SourceId(
             self.session.doc.project.sources.keys().map(|s| s.0).max().unwrap_or(0) + 1);
         let clip = studio_core::ClipId(
             self.session.doc.project.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1);
-        let at = self.playhead();
-        // The source id in the name keeps every bounce's file distinct: two
-        // bounces of 'Trap A' are two sources, and the first must not be
-        // overwritten on disk while the project still points at it.
         let path = format!("bounces/{}-{}.wav", pattern.name, source.0);
         let ops = studio_live::bounce_ops(&pattern, &self.rack.tempo(), rate,
                                           source, clip, track, at, &path);
+        // Room is checked BEFORE the source lands: an AddClip the model refuses (overlap)
+        // would otherwise leave a source with no clip and a status line about a bounce
+        // that is not on the timeline. The refusal names the clip in the way.
+        if let Some(studio_core::Op::AddClip { clip: c }) = ops.get(1) {
+            if let Some(other) = self.session.doc.project.clips.values().find(|o| c.overlaps(o)) {
+                self.status = format!("placing refused: '{}' would overlap clip {} on that track at {:.2}s",
+                                      pattern.name, other.id.0, at.0 as f64 / studio_core::TICKS_PER_SECOND as f64);
+                return None;
+            }
+        }
+        let samples = self.render_pattern_index(index, rate, sources);
         for op in ops {
             self.edit(op, "bounced");
         }
-        self.status = format!("bounced '{}' to the timeline", pattern.name);
+        self.pattern_links.insert(source, pattern.name.clone());
+        self.status = format!("placed '{}' on the timeline at {:.2}s (live: rack edits re-render it)",
+                              pattern.name, at.0 as f64 / studio_core::TICKS_PER_SECOND as f64);
         Some((source, studio_audio::SourceAudio { sample_rate: rate, channels: vec![samples] }))
+    }
+
+    /// `render_loop` for a chosen pattern rather than the current one.
+    pub fn render_pattern_index(
+        &self,
+        index: usize,
+        rate: u32,
+        sources: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
+    ) -> Vec<f32> {
+        let Some(p) = self.rack.patterns.get(index) else { return Vec::new() };
+        let mut synth = studio_live::BuiltinSynth { sources };
+        studio_live::render_pattern(p, &self.rack, &mut synth, &self.rack.tempo(), rate, 0)
+    }
+
+    /// The live half of a placed pattern: every linked source whose pattern still exists is
+    /// re-rendered from the rack as it is now. Returns the sources that changed, so the
+    /// caller can replace their audio and peaks and re-mix the arrangement. A source whose
+    /// pattern was deleted keeps its last render and is unlinked — it is a bounce now, and
+    /// the status line says so.
+    pub fn rerender_pattern_links(
+        &mut self,
+        rate: u32,
+        sources: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
+    ) -> Vec<(studio_core::SourceId, studio_audio::SourceAudio)> {
+        let mut out = Vec::new();
+        let mut orphaned = Vec::new();
+        for (source, name) in self.pattern_links.clone() {
+            if !self.session.doc.project.sources.contains_key(&source) { orphaned.push(source); continue; }
+            match self.rack.patterns.iter().position(|p| p.name == name) {
+                Some(i) => {
+                    let samples = self.render_pattern_index(i, rate, sources);
+                    out.push((source, studio_audio::SourceAudio { sample_rate: rate, channels: vec![samples] }));
+                }
+                None => {
+                    orphaned.push(source);
+                    self.status = format!("pattern '{name}' is gone; its clip keeps the last render");
+                }
+            }
+        }
+        for s in orphaned { self.pattern_links.remove(&s); }
+        out
     }
 }
 
@@ -2712,6 +2797,11 @@ pub struct App {
     /// playhead beside the rack, instead of export → import → watch.
     side_slot: SideSlot,
     frame_cache: viewport::FrameCache,
+    /// The program monitor above the timeline: the frame under the playhead from the
+    /// topmost video track — the same clip choice the export makes (`viewport::video_at`)
+    /// — with the arrangement's audio already coming through the mixdown. Toggled from
+    /// the bar; the workbench's viewport side slot is the same picture in another place.
+    preview_open: bool,
     /// `None` until the person picks a key — autotune has no sensible
     /// default scale, and silently tuning to C minor because nobody chose
     /// anything is a worse failure than making "tune take" wait.
@@ -2853,6 +2943,7 @@ impl Default for App {
                   _ => SideSlot::Viewport,
               },
               frame_cache: viewport::FrameCache::default(),
+              preview_open: true,
               export_dialog: None,
               export_note: String::new(),
               export_run: None,
@@ -3235,6 +3326,10 @@ impl eframe::App for App {
                     .on_hover_text("timeline above, rack/program/mixer below — instead of tabs")
                     .clicked() { combined = !combined; }
                 self.studio.combined = combined;
+                if ui.add(egui::Button::selectable(self.preview_open, "preview"))
+                    .on_hover_text("program monitor above the timeline: the frame under the playhead \
+                                    from the topmost video track, the clip the export takes; audio is the mixdown")
+                    .clicked() { self.preview_open = !self.preview_open; }
                 // The playhead's visible controls. `g g` and `g e` have
                 // always done this; nothing on screen said so, which
                 // meant a new user had no way back to the start at all.
@@ -3724,11 +3819,33 @@ impl eframe::App for App {
         } else {
             self.sink.set_playing(false);
         }
+        // LIVE SUBPATTERNS: the rack changed (loop_dirty is the rack's own dirty bit) — every
+        // source placed from a pattern is re-rendered, its peaks rebuilt, and the arrangement
+        // re-mixed, so the tape plays the pattern as it is now through the mixer.
+        if self.studio.loop_dirty && !self.studio.pattern_links.is_empty() {
+            let rate = self.sink.rate();
+            let fresh = self.studio.rerender_pattern_links(rate, &self.audio);
+            if !fresh.is_empty() {
+                for (id, audio) in fresh {
+                    self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
+                    self.audio.insert(id, audio);
+                }
+                self.studio.arrangement_dirty = true;
+            }
+        }
         if self.studio.pending_bounce {
             self.studio.pending_bounce = false;
+            let first_audio = self.studio.session.doc.project.tracks.iter()
+                .find(|t| t.kind == studio_core::TrackKind::Audio).map(|t| t.id);
+            match first_audio {
+                Some(track) => self.studio.pending_place = Some((self.studio.current_pattern, self.studio.playhead(), track)),
+                None => self.studio.status = "bounce refused: no audio track".into(),
+            }
+        }
+        if let Some((index, at, track)) = self.studio.pending_place.take() {
             // The timeline's rate, not the sink's: a bounce is project
             // material and must not change length because of the sound card.
-            if let Some((id, audio)) = self.studio.bounce_current_pattern(48_000, &self.audio) {
+            if let Some((id, audio)) = self.studio.place_pattern(index, at, track, 48_000, &self.audio) {
                 self.peaks.insert(id, studio_audio::Peaks::build(&audio, 256, 256));
                 // The op recorded a path; make it true on disk, so the
                 // project's reference points at a real file rather than a
@@ -4093,9 +4210,17 @@ impl eframe::App for App {
                             // junk. The sidebar half of the report — patterns
                             // being invisible — is fixed; this half is
                             // reported honestly rather than half-built.
-                            self.studio.status = format!(
-                                "\"{name}\" is in the sidebar now, but placing a pattern on the \
-                                 timeline is not implemented yet — see C13_TODO");
+                            let at = self.studio.playhead();
+                            let project = &self.studio.session.doc.project;
+                            let track = project.tracks.iter()
+                                .filter(|t| t.kind == studio_core::TrackKind::Audio)
+                                .find(|t| !project.clips.values().any(|c| c.track == t.id && c.pos <= at && c.end() > at))
+                                .or_else(|| project.tracks.iter().find(|t| t.kind == studio_core::TrackKind::Audio))
+                                .map(|t| t.id);
+                            match track {
+                                Some(track) => self.studio.pending_place = Some((i, at, track)),
+                                None => self.studio.status = format!("\"{name}\" needs an audio track to land on"),
+                            }
                         }
                         None => {
                             self.studio.status =
@@ -4241,6 +4366,24 @@ impl eframe::App for App {
                     }
                 });
         }
+        let timeline_showing = matches!(if self.studio.combined { Panel::Timeline } else { self.studio.panel }, Panel::Timeline);
+        if timeline_showing && self.preview_open {
+            egui::Panel::top("program").resizable(true).default_size(220.0).show(ctx, |ui| {
+                let project = &self.studio.session.doc.project;
+                let ph = self.studio.playhead();
+                let base = self.project_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("program").strong());
+                    let secs = ph.0 as f64 / studio_core::TICKS_PER_SECOND as f64;
+                    ui.label(egui::RichText::new(format!("{:02}:{:06.3}", (secs / 60.0) as u64, secs % 60.0)).monospace());
+                    match viewport::video_at(project, ph) {
+                        Some((path, _)) => { ui.label(egui::RichText::new(format!("← {}", std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())).weak().small()); }
+                        None => { ui.label(egui::RichText::new("no video under the playhead").weak().small()); }
+                    }
+                });
+                viewport::show(ui, project, ph, &base, &mut self.frame_cache, &colors);
+            });
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             // The central panel's scroll report, when the panel has one.
             // Pages-mode over-scroll navigation reads ONLY this — the
@@ -4301,6 +4444,9 @@ impl eframe::App for App {
                         // seek and not a model edit — moving the playhead
                         // is not something a collaborator should undo.
                         self.studio.transport.set_position(t);
+                    }
+                    if let Some((index, at, track)) = tr.pattern_dropped {
+                        self.studio.pending_place = Some((index, at, track));
                     }
                     if let Some(g) = tr.toggled_group {
                         if !self.studio.closed_groups.remove(&g) {
@@ -5897,6 +6043,80 @@ mod import_shell_tests {
         };
         s.import_audio("legacy", "samples/legacy.wav", &audio);
         assert!(s.status.contains("44100"), "status was {:?}", s.status);
+    }
+}
+
+#[cfg(test)]
+mod placed_pattern_tests {
+    use super::*;
+
+    fn first_audio(s: &Studio) -> studio_core::TrackId {
+        s.session.doc.project.tracks.iter().find(|t| t.kind == studio_core::TrackKind::Audio).unwrap().id
+    }
+
+    /// A drop is a bounce at the drop's time and track — an ordinary AddSource + AddClip.
+    #[test]
+    fn a_placed_pattern_lands_where_it_was_dropped_and_is_linked() {
+        let mut s = Studio::demo();
+        let track = first_audio(&s);
+        let end = s.session.doc.project.clips.values().map(|c| c.end()).max().unwrap_or(studio_core::Ticks::ZERO);
+        let at = studio_core::Ticks(end.0 + studio_core::Ticks::from_seconds(3.25).0);
+        let (id, audio) = s.place_pattern(0, at, track, 48_000, &Default::default()).expect("placed");
+        let clip = s.session.doc.project.clips.values().find(|c| c.source == id).expect("clip");
+        assert_eq!(clip.pos, at);
+        assert_eq!(clip.track, track);
+        assert_eq!(clip.len, s.session.doc.project.sources[&id].len);
+        assert!(!audio.channels[0].is_empty());
+        assert_eq!(s.pattern_links.get(&id).map(String::as_str), Some(s.rack.patterns[0].name.as_str()));
+        assert!(s.status.contains("live"), "{}", s.status);
+    }
+
+    /// A drop on top of an existing clip is refused before any op lands — no orphan source.
+    #[test]
+    fn a_drop_that_would_overlap_is_refused_whole() {
+        let mut s = Studio::demo();
+        let (track, at) = {
+            let p = &s.session.doc.project;
+            let c = p.clips.values()
+                .find(|c| p.tracks.iter().any(|t| t.id == c.track && t.kind == studio_core::TrackKind::Audio))
+                .expect("demo has an audio clip");
+            (c.track, c.pos)
+        };
+        let n_sources = s.session.doc.project.sources.len();
+        assert!(s.place_pattern(0, at, track, 48_000, &Default::default()).is_none());
+        assert_eq!(s.session.doc.project.sources.len(), n_sources, "no source without its clip");
+        assert!(s.pattern_links.is_empty());
+        assert!(s.status.contains("overlap"), "{}", s.status);
+    }
+
+    #[test]
+    fn a_pattern_cannot_land_on_a_video_track() {
+        let mut s = Studio::demo();
+        let Some(video) = s.session.doc.project.tracks.iter().find(|t| t.kind == studio_core::TrackKind::Video).map(|t| t.id)
+            else { return };
+        assert!(s.place_pattern(0, studio_core::Ticks::ZERO, video, 48_000, &Default::default()).is_none());
+        assert!(s.status.contains("audio track"), "{}", s.status);
+    }
+
+    /// The live half: edit the rack, and the placed source re-renders to the edited groove;
+    /// delete the pattern, and the source keeps its take and is unlinked.
+    #[test]
+    fn rack_edits_re_render_the_placed_source_until_the_pattern_is_gone() {
+        let mut s = Studio::demo();
+        let track = first_audio(&s);
+        let (id, before) = s.place_pattern(0, studio_core::Ticks::ZERO, track, 48_000, &Default::default()).unwrap();
+        // Silence every row of the pattern: the re-render must differ from the placed take.
+        for row in s.rack.patterns[0].rows.iter_mut() { *row = 0; }
+        let fresh = s.rerender_pattern_links(48_000, &Default::default());
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].0, id);
+        assert_ne!(fresh[0].1.channels[0], before.channels[0], "the re-render is the edited pattern");
+        assert!(fresh[0].1.channels[0].iter().all(|x| *x == 0.0), "no hits, no sound");
+        s.rack.patterns.remove(0);
+        let fresh = s.rerender_pattern_links(48_000, &Default::default());
+        assert!(fresh.is_empty());
+        assert!(!s.pattern_links.contains_key(&id), "a deleted pattern unlinks its source");
+        assert!(s.status.contains("keeps the last render"), "{}", s.status);
     }
 }
 

@@ -841,8 +841,11 @@ dependencies = [
  "eframe",
  "egui",
  "fao-codec-lib",
+ "image",
+ "serde_json",
  "settings-kit",
  "uikit-egui",
+ "zstd",
 ]
 
 [[package]]
@@ -1678,6 +1681,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

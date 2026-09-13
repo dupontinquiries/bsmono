@@ -951,11 +951,23 @@ fn main() {
     // world faster when gen is the streaming bottleneck (slower per-chunk, but N×
     // concurrent). `gpu` forces the serialized GPU path; `auto` (default) picks GPU
     // if present.
-    let gen_backend = match std::env::var("UNENDLICH_GEN_BACKEND").as_deref() {
-        Ok("cpu") | Ok("CPU") => Backend::Cpu,
-        Ok("gpu") | Ok("GPU") => Backend::Gpu,
+    // Precedence: UNENDLICH_GEN_BACKEND env > settings.json "gen_backend" > auto. The settings
+    // file is otherwise read much later (after the renderer exists), but the generator is built
+    // here, so this one key is read early on its own; the panel's control writes the same key.
+    let settings_gen_backend: Option<String> = settings_file_path().and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("gen_backend").and_then(|b| b.as_str()).map(|b| b.to_ascii_lowercase()));
+    let gen_backend_src = match std::env::var("UNENDLICH_GEN_BACKEND") {
+        Ok(v) => (v.to_ascii_lowercase(), "env"),
+        Err(_) => (settings_gen_backend.clone().unwrap_or_else(|| "auto".into()), if settings_gen_backend.is_some() { "settings.json" } else { "default" }),
+    };
+    let gen_backend = match gen_backend_src.0.as_str() {
+        "cpu" => Backend::Cpu,
+        "gpu" => Backend::Gpu,
         _ => Backend::Auto,
     };
+    log::info!("terrain-gen backend = {} (from {}; UNENDLICH_GEN_BACKEND=cpu|gpu|auto overrides settings.json)",
+        gen_backend_src.0, gen_backend_src.1);
     // r726: opt-in CPU chunk-occlusion flood cull (world::occlusion_flood). OFF by
     // default; its failure mode is vanishing terrain, so it's operator-gated. The
     // renderer reads DEBUG.occlusion_cull when building its draw set.
@@ -3646,11 +3658,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let mut fg_prev_settings_open: bool = false; // r187
     let mut fg_music_fadein: f32 = 0.0; // r187: starts silent
     // r187: sticky settings path + tiny serde helpers.
-    let settings_path: std::path::PathBuf = std::env::var("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-        .map(|p| p.join("unendlich/settings.json"))
-        .unwrap_or_else(|_| std::path::PathBuf::from("unendlich-settings.json"));
+    // Their `settings_file_path()` helper (defined below) replaces the
+    // inline XDG_CONFIG_HOME/HOME dance this side had — same logic, one
+    // caller, and there are now two call sites for it. `settings_had_gui_scale`
+    // is kept from this side: it is read at the `saved_ui_scale` line further
+    // down, so dropping it with the inline path would not have compiled.
+    let settings_path: std::path::PathBuf = settings_file_path()
+        .unwrap_or_else(|| std::path::PathBuf::from("unendlich-settings.json"));
     let mut settings_had_gui_scale = false;
     if let Ok(txt) = std::fs::read_to_string(&settings_path) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
@@ -3673,8 +3687,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             if let Some(b) = g("adaptive_rd").as_bool() { renderer.ui_adaptive_rd = b; }
             if let Some(b) = g("octree_tile").as_bool() { renderer.ui_octree_tile = b; }
             if let Some(b) = g("detached_terrain").as_bool() { renderer.ui_detached_terrain = b; }
+            if let Some(b) = g("gen_backend").as_str() {
+                renderer.ui_gen_backend = match b.to_ascii_lowercase().as_str() { "cpu" => 1, "gpu" => 2, _ => 0 };
+            }
             log::info!("[settings] loaded {}", settings_path.display());
         }
+    }
+    fn settings_file_path() -> Option<std::path::PathBuf> {
+        std::env::var("XDG_CONFIG_HOME").map(std::path::PathBuf::from)
+            .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+            .ok().map(|p| p.join("unendlich/settings.json"))
     }
     // r-mobile: PHONE DETECTION. The game came up at ui_scale 2.0 on every
     // panel and had no touch controls (touch_controls has the model,
@@ -3725,6 +3747,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             "autotune": r.ui_autotune,
             "gpu_mesh_yield": r.ui_gpu_mesh_yield,
             "adaptive_rd": r.ui_adaptive_rd,
+            "gen_backend": match r.ui_gen_backend { 1 => "cpu", 2 => "gpu", _ => "auto" },
             "octree_tile": r.ui_octree_tile,
             "detached_terrain": r.ui_detached_terrain,
         });
@@ -4797,6 +4820,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         if renderer.settings_menu_open && esc_pressed {
             renderer.settings_menu_open = false;
             save_settings(&settings_path, &renderer); // r187 sticky
+            // Terrain generation: CPU flips the GPU path off live; Auto/GPU turn it back on if a
+            // GPU generator exists. When `auto` declined to build one, the panel text says the
+            // GPU choice applies at the next launch — nothing to do here but persist it.
+            let want_gpu = renderer.ui_gen_backend != 1;
+            if generator.gpu_enabled() != want_gpu {
+                generator.set_gpu_enabled(want_gpu);
+                log::info!("[settings] terrain generation -> {} (gpu generator present: {})",
+                    match renderer.ui_gen_backend { 1 => "cpu", 2 => "gpu", _ => "auto" }, generator.has_gpu());
+            }
             esc_pressed = false; // consumed
         } else if renderer.craft_menu_open && esc_pressed {
             renderer.craft_menu_open = false;

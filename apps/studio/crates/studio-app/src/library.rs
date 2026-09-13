@@ -843,7 +843,9 @@ fn patterns_section(ui: &mut egui::Ui, rack: &studio_live::Rack, filter: &str,
                     // timeline the same way a sample can, which is what was
                     // actually asked for ("drag into the timeline").
                     let id = egui::Id::new(("studio-pattern", i));
-                    let r = ui.dnd_drag_source(id, PatternDrag(i), |ui| {
+                    let step = rack.tempo().step_len();
+                    let len = studio_core::Ticks(step.0.saturating_mul(p.steps as i64));
+                    let r = ui.dnd_drag_source(id, studio_egui::PatternDrag { index: i, len }, |ui| {
                         ui.label(egui::RichText::new(format!("▦ {label}")).strong());
                     }).response;
                     r.on_hover_text("drag onto the timeline, or press ⇥");
@@ -861,8 +863,8 @@ fn patterns_section(ui: &mut egui::Ui, rack: &studio_live::Rack, filter: &str,
 /// Drag payload for a pattern row. A newtype rather than a bare `usize` so
 /// egui's typed dnd cannot confuse it with some other index-shaped payload
 /// dragged from elsewhere in the app.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PatternDrag(pub usize);
+/// Moved to `studio_egui::PatternDrag` so the timeline (the drop) can name the type.
+pub use studio_egui::PatternDrag;
 
 pub fn show_tree(ui: &mut egui::Ui, roots: &Roots, state: &mut TreeState,
                  rack: &studio_live::Rack, project: &studio_core::Project,

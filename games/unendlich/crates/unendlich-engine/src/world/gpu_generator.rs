@@ -45,6 +45,9 @@ pub enum GpuGenError {
     Vulkan(vk::Result),
     NoDevice,
     NoComputeQueue,
+    /// `Backend::Auto` declined the GPU path on a driver where it is measured to lose:
+    /// see `auto_policy`. `Backend::Gpu` (UNENDLICH_GEN_BACKEND=gpu) bypasses the check.
+    DriverPrefersCpu { driver: String, why: &'static str },
     NoMemoryType,
     ShaderMissing(String),
     Io(std::io::Error),
@@ -65,6 +68,8 @@ impl std::fmt::Display for GpuGenError {
             GpuGenError::Vulkan(r) => write!(f, "Vulkan error: {:?}", r),
             GpuGenError::NoDevice => write!(f, "No suitable Vulkan device found"),
             GpuGenError::NoComputeQueue => write!(f, "No compute queue family found"),
+            GpuGenError::DriverPrefersCpu { driver, why } =>
+                write!(f, "auto declined the GPU generator on {driver}: {why} (UNENDLICH_GEN_BACKEND=gpu forces it)"),
             GpuGenError::NoMemoryType => write!(f, "Suitable memory type not found"),
             GpuGenError::ShaderMissing(p) => write!(f, "Shader file missing: {}", p),
             GpuGenError::Io(e) => write!(f, "I/O error: {}", e),
@@ -152,7 +157,14 @@ unsafe impl Send for VulkanChunkGenerator {}
 unsafe impl Sync for VulkanChunkGenerator {}
 
 impl VulkanChunkGenerator {
-    pub fn new(batch_size: u32) -> Result<Self> {
+    /// The forced GPU path (`UNENDLICH_GEN_BACKEND=gpu`): no driver policy applied.
+    pub fn new(batch_size: u32) -> Result<Self> { Self::new_with_policy(batch_size, false) }
+
+    /// The `Backend::Auto` path: same construction, but `auto_policy` may decline the driver
+    /// first (returning `DriverPrefersCpu`), before any device is created.
+    pub fn new_auto(batch_size: u32) -> Result<Self> { Self::new_with_policy(batch_size, true) }
+
+    fn new_with_policy(batch_size: u32, apply_policy: bool) -> Result<Self> {
         assert!(batch_size > 0);
 
         let entry = unsafe { Entry::load() }
@@ -160,6 +172,16 @@ impl VulkanChunkGenerator {
 
         let instance = create_instance(&entry)?;
         let physical_device = pick_physical_device(&instance)?;
+        if apply_policy {
+            let (id, name, dev_name) = driver_of(&instance, physical_device);
+            let shared = compute_shares_the_only_graphics_queue(&instance, physical_device);
+            log::info!("terrain-gen auto: device {dev_name} driver {name} (id {}), compute {} the graphics queue",
+                id.as_raw(), if shared { "SHARES" } else { "does not share" });
+            if let Some(why) = auto_policy(id, &name, shared) {
+                unsafe { instance.destroy_instance(None) };
+                return Err(GpuGenError::DriverPrefersCpu { driver: format!("{dev_name} / {name}"), why });
+            }
+        }
         let queue_family = find_compute_queue_family(&instance, physical_device)?;
         let device = create_device(&instance, physical_device, queue_family)?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
@@ -582,6 +604,85 @@ fn create_instance(entry: &Entry) -> Result<Instance> {
     {
         let info = vk::InstanceCreateInfo::builder().application_info(&app_info);
         Ok(unsafe { entry.create_instance(&info, None)? })
+    }
+}
+
+/// Should `Backend::Auto` decline the GPU generator on this driver? `Some(reason)` = yes.
+///
+/// This is the measured answer, not an assumption. On Honeykrisp (Asahi, Apple GPUs) the
+/// generator's record→submit→wait_for_fences batches land on the one hardware queue the frame
+/// renders on; the 2026-09-01 perf bisect (docs/claude-notes/perfbisect-desktop-findings.md)
+/// measured the GPU path at 0.63–0.98× the CPU path AND frames of 0.5–1.6 s while a batch is in
+/// front of the main pass. The honeykrisp runtime profile has said `GEN_BACKEND=cpu` since then,
+/// but `auto` never consulted it: 46 telemetry runs on the M2 Ultra all had the GPU generator on,
+/// all had main-pass medians of 0.6–4 s, and the last one hit the gpu-guard abort with 2 chunks
+/// loaded. `auto` now declines on that driver. Every other driver keeps the old behaviour: a
+/// shared graphics/compute queue elsewhere is logged by the renderer but is not, by itself,
+/// evidence that the GPU path loses there.
+pub fn auto_policy(driver: vk::DriverId, driver_name: &str, compute_shares_graphics_queue: bool) -> Option<&'static str> {
+    let _ = compute_shares_graphics_queue; // reported by the caller's log line; not yet a decision input
+    // VK_DRIVER_ID_MESA_HONEYKRISP = 26 (the ash 0.37 headers predate the name; 0.38 still calls
+    // it MESA_AGXV). The name check covers a driver reporting the id under either spelling.
+    if driver == DRIVER_ID_MESA_HONEYKRISP || driver_name.eq_ignore_ascii_case("honeykrisp") {
+        return Some("measured 0.63-0.98x the CPU path and it serialises with the frame on the single queue \
+(frames of 0.5-1.6 s per batch; perfbisect-desktop-findings.md)");
+    }
+    None
+}
+
+pub const DRIVER_ID_MESA_HONEYKRISP: vk::DriverId = vk::DriverId::from_raw(26);
+
+/// Driver id, driver name and device name via VK_KHR_driver_properties (core in the 1.2
+/// instance this module creates).
+fn driver_of(instance: &Instance, dev: vk::PhysicalDevice) -> (vk::DriverId, String, String) {
+    let mut drv = vk::PhysicalDeviceDriverProperties::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::builder().push_next(&mut drv).build();
+    unsafe { instance.get_physical_device_properties2(dev, &mut props2) };
+    let name = unsafe { CStr::from_ptr(drv.driver_name.as_ptr()) }.to_string_lossy().into_owned();
+    let dev_name = unsafe { CStr::from_ptr(props2.properties.device_name.as_ptr()) }.to_string_lossy().into_owned();
+    (drv.driver_id, name, dev_name)
+}
+
+/// True when the first compute-capable family is also the graphics family and has one queue —
+/// the shape on which a generator batch sits in line with the frame instead of beside it.
+fn compute_shares_the_only_graphics_queue(instance: &Instance, dev: vk::PhysicalDevice) -> bool {
+    let families = unsafe { instance.get_physical_device_queue_family_properties(dev) };
+    families.iter()
+        .find(|p| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
+        .map(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS) && p.queue_count == 1)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod auto_policy_tests {
+    use super::*;
+
+    #[test]
+    fn honeykrisp_is_declined_by_id_and_by_name() {
+        assert!(auto_policy(DRIVER_ID_MESA_HONEYKRISP, "Honeykrisp", true).is_some());
+        assert!(auto_policy(DRIVER_ID_MESA_HONEYKRISP, "Honeykrisp", false).is_some(),
+            "the decision is the measured driver, not the queue shape");
+        assert!(auto_policy(vk::DriverId::from_raw(0), "honeykrisp", true).is_some(),
+            "an id the headers do not know is still declined by name");
+    }
+
+    #[test]
+    fn other_drivers_keep_the_gpu_path_even_with_a_shared_queue() {
+        // lavapipe, RADV, Intel, NVIDIA: none measured, none declined — a shared queue alone
+        // is not evidence the GPU generator loses there.
+        for (id, name) in [(13u32, "llvmpipe"), (3, "radv"), (4, "NVIDIA"), (6, "Intel open-source Mesa driver")] {
+            assert!(auto_policy(vk::DriverId::from_raw(id as i32), name, true).is_none(), "{name}");
+            assert!(auto_policy(vk::DriverId::from_raw(id as i32), name, false).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_decline_names_the_override() {
+        let e = GpuGenError::DriverPrefersCpu { driver: "Apple M2 Ultra / Honeykrisp".into(),
+            why: auto_policy(DRIVER_ID_MESA_HONEYKRISP, "Honeykrisp", true).unwrap() };
+        let msg = e.to_string();
+        assert!(msg.contains("UNENDLICH_GEN_BACKEND=gpu"), "{msg}");
+        assert!(msg.contains("Honeykrisp"), "{msg}");
     }
 }
 
