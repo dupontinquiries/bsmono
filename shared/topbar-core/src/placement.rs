@@ -58,15 +58,27 @@ impl Placement {
     /// The `systemcompkit` layer-shell intent for this placement at a
     /// given primary size (height for top/bottom, width for the
     /// sidebar) — see each constructor's own doc for what "primary size"
-    /// reserves. Static, same caveat as `LayerSurfaceIntent::top_panel`:
-    /// no live-resize path exists yet to actually apply a NEW size to an
-    /// already-open surface.
+    /// reserves.
     pub fn layer_intent(&self, primary_size: u32) -> LayerSurfaceIntent {
         match self {
             Placement::LaptopTopBar => LayerSurfaceIntent::top_panel(primary_size),
             Placement::MobileThumbSidebar => LayerSurfaceIntent::side_panel(primary_size),
             Placement::DesktopBottomBar => LayerSurfaceIntent::bottom_panel(primary_size),
         }
+    }
+
+    /// The `(size, exclusive_zone)` pair a caller hands to
+    /// `wayland_io::LayerSurface::request_resize` when the bar's mode
+    /// changes and its primary size needs to change with it (e.g.
+    /// collapsed-strip height vs. expanded-sheet height). Just
+    /// `layer_intent`'s two resize-relevant fields, named for that call
+    /// site so a caller doesn't need to know which two fields of a
+    /// `LayerSurfaceIntent` matter for a resize versus which one (anchor)
+    /// must NOT change after `connect()` — see `request_resize`'s own doc
+    /// on why anchor isn't a parameter there.
+    pub fn resize_params(&self, primary_size: u32) -> ((u32, u32), i32) {
+        let intent = self.layer_intent(primary_size);
+        (intent.size, intent.exclusive_zone)
     }
 }
 
@@ -99,5 +111,12 @@ mod tests {
 
         let bottom = Placement::DesktopBottomBar.layer_intent(48);
         assert!(bottom.anchor.bottom && !bottom.anchor.top);
+    }
+
+    #[test]
+    fn resize_params_matches_the_intent_it_was_derived_from() {
+        let placement = Placement::LaptopTopBar;
+        let intent = placement.layer_intent(64);
+        assert_eq!(placement.resize_params(64), (intent.size, intent.exclusive_zone));
     }
 }

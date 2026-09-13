@@ -104,15 +104,16 @@ impl LayerSurfaceIntent {
 
     /// A top panel/bar of a given height, the mirror of `bottom_panel`.
     ///
-    /// This is a static intent: `size`/`exclusive_zone` are fixed at
-    /// construction. A bar that collapses to a slim strip and expands to a
-    /// tall launcher+taskbar sheet needs to change ITS OWN height at
-    /// runtime — re-requesting a new `exclusive_zone` and committing a new
-    /// buffer size on the live surface. That resize-in-place path does not
-    /// exist yet anywhere in this crate (`wayland_io` only ever sends the
-    /// intent once, at surface creation); calling `top_panel` again on mode
-    /// change would build a second intent but nothing consumes it into an
-    /// actual live reconfigure. Real work, not a follow-up call away.
+    /// This intent itself is still static — `size`/`exclusive_zone` are
+    /// fixed at construction, same as before. What changed:
+    /// `wayland_io::LayerSurface::request_resize` now exists to push a NEW
+    /// size/exclusive_zone onto an already-mapped surface via
+    /// `set_size`/`set_exclusive_zone` + commit, so a bar that collapses
+    /// to a slim strip and expands to a tall sheet doesn't need to
+    /// destroy/recreate its surface — it calls `request_resize` with the
+    /// values from a freshly-built intent for the new mode. Untested
+    /// against a real compositor (see that method's own doc), but the
+    /// primitive is no longer missing.
     pub fn top_panel(height: u32) -> LayerSurfaceIntent {
         LayerSurfaceIntent {
             layer: Layer::Top,

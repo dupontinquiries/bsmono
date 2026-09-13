@@ -348,6 +348,34 @@ impl LayerSurface {
         self.io_state.state.configured_size
     }
 
+    /// Requests a new size and exclusive zone on this already-mapped
+    /// surface — the mechanism `Placement`'s collapsed/expanded transition
+    /// needs, closing the gap `layer.rs`'s `top_panel`/`side_panel` docs
+    /// call out. Protocol-legal at any time on `zwlr_layer_surface_v1`:
+    /// `set_size`/`set_exclusive_zone` are plain requests, no
+    /// destroy/recreate round trip. The compositor answers with a fresh
+    /// `configure` event through the SAME `Dispatch` impl that handles the
+    /// first one — nothing new to wire there — so `poll()`'s
+    /// `configured_size()` reflects the new size once that event arrives.
+    /// Anchor is deliberately not a parameter here: changing which edge a
+    /// mapped surface is anchored to mid-session is a different, odder
+    /// operation (effectively "become a different bar") that no caller in
+    /// this monorepo needs yet — `Placement` picks anchor once, at
+    /// `connect()` time, via `layer_intent()`.
+    ///
+    /// Not exercised against a real compositor — see this crate's own
+    /// `STATUS.md` for why nothing here is. It type-checks against the
+    /// real `zwlr_layer_surface_v1` request signatures and follows the
+    /// same set-then-commit-then-flush shape `connect()` already uses for
+    /// the initial configure; that is the honest ceiling until something
+    /// runs it on hardware.
+    pub fn request_resize(&mut self, size: (u32, u32), exclusive_zone: i32) -> Result<(), String> {
+        self.layer_surface.set_size(size.0, size.1);
+        self.layer_surface.set_exclusive_zone(exclusive_zone);
+        self.surface.commit();
+        self.flush()
+    }
+
     pub fn is_closed(&self) -> bool {
         self.io_state.state.closed
     }
