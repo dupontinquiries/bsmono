@@ -180,8 +180,34 @@ pub fn normalise(g: &Gray, b: Rect, ink: Ink, t: u8) -> Cell {
     let mut c = [false; CELL * CELL];
     for cy in 0..CELL {
         for cx in 0..CELL {
-            // sample the source box; any ink in the cell's footprint
-            // lights it, which keeps thin strokes alive at this size
+            // sample the source box and light the cell on a 25% vote
+            // (`lit * 4 >= n`), not the 1/3 majority (`lit * 3 >= n`)
+            // this used to be.
+            //
+            // Measured, not guessed: '0' and '8' differ ONLY in the
+            // middle bar (seven-segment slot 3), that bar renders
+            // exactly on the boundary between two CELL rows at this
+            // glyph size, and splits 3 of 12 sampled pixels into EACH of
+            // the two rows -- 25% exactly, under the old 33% threshold
+            // in BOTH rows. The middle bar vanished from every digit
+            // that has one, so '0' and '8' normalised to identical
+            // grids -- distance 0, not merely low-confidence. Confirmed
+            // with a debug harness that printed both grids and found
+            // d(8,0) = 0.
+            //
+            // `lit > 0` (any ink at all) was tried first and reverted:
+            // it fixed this pair but fattened every stroke enough that
+            // OTHER templates moved closer together too, dropping the
+            // exact-self-match confidence from >0.3 to 0.25. 25% is the
+            // narrowest threshold that still captures the exact 3-of-12
+            // split measured above, without also lighting a cell on a
+            // single stray noise pixel the way `lit > 0` would.
+            //
+            // A vote still makes sense for a real photographed board,
+            // where JPEG noise and uneven lighting can light a stray
+            // pixel in an otherwise-dark cell -- 25% keeps that
+            // rejection, just not so strict that a stroke exactly this
+            // thin can fall entirely between two votes.
             let sx0 = b.x + cx * b.w / CELL;
             let sx1 = (b.x + (cx + 1) * b.w / CELL).max(sx0 + 1);
             let sy0 = b.y + cy * b.h / CELL;
@@ -193,7 +219,18 @@ pub fn normalise(g: &Gray, b: Rect, ink: Ink, t: u8) -> Cell {
                 let v = g.at(x, y);
                 if match ink { Ink::DarkOnLight => v < t, Ink::LightOnDark => v >= t } { lit += 1; }
             }}
-            c[cy * CELL + cx] = n > 0 && lit * 3 >= n;
+            // ANY-INK (`lit > 0`) was tried first and reverted: it fixed
+            // '0' vs '8' but fattened every stroke enough that OTHER
+            // templates moved closer together too, and the confidence
+            // margin for an exact self-match dropped from >0.3 to 0.25 --
+            // trading one bug for a smaller, harder-to-notice one.
+            //
+            // `lit * 4 >= n` (25%) is the narrowest fix that still passes:
+            // measured directly, the split middle-bar cells sample 3 of 12
+            // pixels (25% exactly) on each side of the boundary, so this
+            // is the lowest threshold that captures them without also
+            // capturing a single stray noise pixel the way `lit > 0` does.
+            c[cy * CELL + cx] = n > 0 && lit * 4 >= n;
         }
     }
     c
@@ -573,6 +610,29 @@ mod tests {
         let ambiguous = [true; CELL * CELL];
         let r = recognise(&ambiguous, &templates()).unwrap();
         assert!(r.sure < MIN_SURE, "all-ink is not a character: {r:?}");
+    }
+
+    #[test]
+    fn zero_and_eight_are_distinguishable() {
+        // The exact failure this session found. '0' and '8' differ ONLY
+        // in the seven-segment middle bar, and that bar renders exactly
+        // on the boundary between two CELL rows at this glyph size --
+        // splitting a thin stroke across two sample rows so a majority
+        // vote (the old `lit * 3 >= n`) sees a minority in BOTH and drops
+        // the bar from both templates. '0' and '8' then normalised to
+        // the same grid: distance 0, and `recognise` could not tell them
+        // apart at all -- not "less confident", indistinguishable.
+        //
+        // Pinned directly on the templates, not through `recognise`,
+        // because that is where the bug actually was: the two grids must
+        // differ before anything downstream can be asked to score them.
+        let t = templates();
+        let zero = t.iter().find(|(c, _)| *c == '0').unwrap().1;
+        let eight = t.iter().find(|(c, _)| *c == '8').unwrap().1;
+        assert_ne!(zero, eight, "'0' and '8' normalised to the same cell grid");
+        // And recognise() must still call 8 as 8 against its own template.
+        let r = recognise(&eight, &t).expect("read");
+        assert_eq!(r.ch, '8');
     }
 
     #[test]

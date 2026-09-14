@@ -761,40 +761,57 @@ it preview a different artifact than the one clicked. That is wrong CONTENT,
 not a wrong scroll offset. It is selection state with several call sites, so
 it wants its own change rather than being folded into an id sweep.
 
+## 17. studio-video's slate OCR: two real bugs found, one fixed, one is a font limit
 
-## 17. studio-video's slate OCR: 3 pre-existing test failures, found while fixing a merge
+Surfaced while verifying the av1-in-rust-studio-live merge (84666efa4), then
+investigated properly rather than left as three unexplained failures.
 
-Surfaced while verifying the av1-in-rust-studio-live merge (caf76f68f and
-the commit after it). `studio-video/src/slate_ocr.rs` needed one fix to
-compile at all -- `#[derive(..., Eq, ...)]` on `Board`, which holds a bare
-`f32` confidence field and cannot implement `Eq` (NaN != NaN). Removed the
-derive; nothing in the crate constrained `Board: Eq` (checked by grep), so
-it was a pure over-derive.
+### Bug 1, fixed: '0' and '8' normalised to the identical grid
 
-That fix is unrelated to what follows, and confirmed so by structure alone:
-the derive is on `Board` at line 303; the three failing tests exercise
-`recognise()` at line 217, a different function against a different type
-(`Read`), through logic the derive removal never touches.
+`normalise()`'s cell-lighting rule was a 1/3 majority vote (`lit * 3 >= n`).
+'0' and '8' differ ONLY in the seven-segment middle bar (slot 3), that bar
+renders exactly on the boundary between two `CELL` rows at `CELL=8`, and
+splits 3 of 12 sampled pixels into EACH of the two rows -- 25% in both,
+under the 1/3 threshold. The middle bar vanished from every digit that has
+one, so `'0'` and `'8'` normalised to byte-identical `Cell` grids: distance
+0, not merely low-confidence. `recognise()` returned `'0'` for the '8'
+template read against its own generating set.
 
-THREE TESTS FAIL, ALL IN THE SAME FUNCTION
+Found by a debug test that printed both 8x8 grids and the actual distances
+rather than guessing from the source -- `d(8,0)` was 0 where it should have
+been small-but-nonzero. Threshold changed to 25% (`lit * 4 >= n`), the
+narrowest value that captures the measured 3-of-12 split. A looser `lit > 0`
+(any ink at all) was tried first and reverted: it fixed this pair but
+fattened every stroke enough that other templates moved closer together
+too, dropping the exact-self-match confidence from >0.3 to 0.25 -- trading
+one bug for a smaller, harder-to-notice one. Comment in the code records
+both the measurement and the reverted attempt.
 
-    confidence_is_the_margin_not_the_distance
-    it_does_not_care_which_side_is_ink
-    it_reads_a_board_off_a_frame
+New test `zero_and_eight_are_distinguishable`, pinned on the templates
+directly rather than through `recognise()`, because that is where the bug
+actually lived: the two grids have to differ before anything downstream can
+be asked to score them.
 
-The first: `recognise(eight, &templates())` -- reading the template FOR '8'
-against the template set that generated it -- returns `ch: '0'`, not `'8'`.
-Distance-to-self should be 0 and uniquely minimal unless two templates
-render identically or `distance()`/`sort()` has a tie-breaking bug. '0' is
-seven-segment `[0,1,2,4,5,6]` and '8' is `[0,1,2,3,4,5,6]` (all seven) --
-one segment apart, not identical -- so the templates are not the cause on
-inspection; the bug is more likely in `distance()`, `normalise()`, or the
-tie-break when `scored.sort()` produces equal keys, and would need actual
-debugging to place precisely.
+### Bug 2, NOT fixed: '8' and 'A' are 4 pixels apart, and that is real
 
-Not chased further. This module's own handoff docs say plainly that nothing
-here has been verified against a decoder or real use, and a self-recognition
-failure on the reader's OWN generated templates is exactly the kind of
-thing "not verified" was warning about -- it is not a regression from
-anything in this session, and studio-video's remaining 37 tests (all
-non-OCR) pass clean.
+With bug 1 fixed, the three tests still fail, but for a different reason:
+`recognise(eight_template, &templates())` correctly returns `ch: '8'` now,
+with `sure: 0.25` against the test's `> 0.3` floor. The actual runner-up
+(found the same way -- printed and measured, not assumed) is `'A'` at
+distance 4, and `'8'`/`'A'` differ only in the BOTTOM bar (segment 6) in
+this seven-segment rendering. A seven-segment 8 minus its bottom stroke is
+a real, generic ambiguity in this font style, not a normalise() defect --
+it is what an actual person's handwriting-adjacent seven-segment '8' looks
+like when the bottom is short or faint.
+
+Not chased into a second threshold change. Two threshold edits in one
+session, the first of which had to be partially reverted for a regression
+it introduced, is the point at which the next change wants either a
+different distance metric (weighting the outer segments more than the
+default per-cell equality) or a redrawn 'A' template -- both real design
+decisions about the font, not a bug with an obvious fix. Recorded rather
+than guessed at a third time.
+
+`it_does_not_care_which_side_is_ink` and `it_reads_a_board_off_a_frame` fail
+for the same underlying reason (both read real boards containing digits
+close to this same confidence floor) and should clear once bug 2 does.
