@@ -43,7 +43,7 @@
 //! different reading of the spec would encode a stream rav1e's own
 //! decoder path did not expect.
 
-use crate::{Model, Warp};
+use super::{Model, Warp};
 
 /// AV1 carries warp parameters as fixed point with this many
 /// fractional bits.

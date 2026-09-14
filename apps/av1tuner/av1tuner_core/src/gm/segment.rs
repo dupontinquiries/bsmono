@@ -40,7 +40,7 @@
 //! That is the same measurement feeding a third use, after the
 //! encoder's global motion parameters and the timeline bucketing.
 
-use crate::{LocalMv, Warp};
+use super::{LocalMv, Warp};
 
 /// AV1 allows eight. Using all eight costs map bits for distinctions
 /// nobody sees, so this uses four and says why.

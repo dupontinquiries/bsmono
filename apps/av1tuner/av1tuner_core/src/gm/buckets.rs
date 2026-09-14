@@ -95,7 +95,7 @@ pub struct FrameMotion {
 impl FrameMotion {
     /// Build from an `Estimate`, which is where this data already
     /// exists.
-    pub fn from_estimate(index: u64, e: &crate::Estimate) -> FrameMotion {
+    pub fn from_estimate(index: u64, e: &super::Estimate) -> FrameMotion {
         FrameMotion {
             index,
             global_px: (e.warp.tx * e.warp.tx + e.warp.ty * e.warp.ty).sqrt(),
@@ -359,9 +359,9 @@ mod tests {
     fn it_is_built_from_the_estimate_the_encoder_already_made() {
         // nothing extra is decoded; the two features share a
         // measurement rather than each having their own
-        let e = crate::Estimate {
-            model: crate::Model::Translation,
-            warp: crate::Warp::translation(-6.0, 8.0),
+        let e = super::super::Estimate {
+            model: super::super::Model::Translation,
+            warp: super::super::Warp::translation(-6.0, 8.0),
             sad_before: 20.0, sad_after: 4.0, inlier_ratio: 0.9,
         };
         let fm = FrameMotion::from_estimate(7, &e);
