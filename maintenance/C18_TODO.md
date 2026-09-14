@@ -1352,3 +1352,91 @@ capture as the default case (it does — `RingBuf::drain_into_mono` averages
 down from whatever channel count cpal reports), this is likely a non-issue
 in practice, but it is the kind of assumption worth re-checking once real
 device testing is possible, not asserting closed from source-reading alone.
+
+---
+
+## 21. Asahi Linux: a different device class, checked, and the wake-word restriction from section 20 does NOT apply
+
+Follow-up to section 20, same method — sourced facts checked against actual
+code — for the other named phone-adjacent-but-not-a-phone target this
+fleet's own comments already single out (`scene-kit/perf.rs`,
+`vidkit`, `uikit-egui/adaptive.rs` all treat Asahi as its own case).
+
+### It is a laptop/desktop platform, not a phone, and the code already knows that
+
+`scene-kit/src/perf.rs::suggested_power_for_renderer` explicitly buckets
+"Asahi's AGX" with desktop GPUs at full power, opposite the actual phone
+entries (Fairphone/PinePhone's Mali tiers) which get throttled. That
+distinction is right and matters for everything downstream: Asahi Linux
+runs on M1/M2/M3 MacBooks and Mac desktops — mains-adjacent power budgets,
+full-size batteries meant for a laptop's workload, not a phone's. Section
+20's wake-word finding (no cheap background-listening mode exists on FP5
+because the mic hardware itself cannot support one) has no equivalent
+constraint here: there is no sourced reason to believe M-series audio
+hardware has the same AMIC-only wiring problem, and every source found
+describes it as a full digital audio complex through the SoC. **Do not
+apply section 20's "foreground-only wake word" restriction to an Asahi
+target** — that would be importing a phone-specific hardware limitation
+onto a laptop for no reason.
+
+### Microphone support is real, current, and moving fast — dated deliberately
+
+Sourced from asahilinux.org's own feature-support tables and a August 2026
+report: microphones work via `linux-asahi` on M1 and M2 Mac laptops today.
+M3 was the newest case — Apple changed the ADC's decimation stage
+("High Frequency decimator", new filter coefficients, different init
+sequence), and without the M3-specific coefficients "the microphone driver
+loads but produces garbage data" rather than failing loudly. That work
+completed only recently (the source is dated ~17 days before this session,
+reporting M3 mic/webcam/USB3/Thunderbolt landing after a fresh
+reverse-engineering pass). **Practical read for this fleet:** M1/M2 Asahi
+targets are a safe, working mic today; an M3 target should not be assumed
+identical without checking the linux-asahi version in use actually carries
+the M3 audio patches — "Asahi supports mics" is not one fact across the
+whole M-series, the same way "Fairphone 5 mic works" turned out to mean
+specifically "Mic1 only" once section 20 checked the real closing comment
+rather than the headline.
+
+### A real, different risk this fleet's code happens to already avoid: speaker damage, not battery drain
+
+Asahi's own audio documentation states the actual risk on the OUTPUT side
+plainly: driving the speakers without the platform's calibrated DSP model
+("Smart Amp") "means permanently damaged hardware" per their own tracking
+of the concern, which is why Asahi Linux shipped with speakers **disabled
+by default** until model-specific safety validation existed per device,
+and why the documented deployment order is
+`asahi-audio`/`speakersafetyd` sitting ahead of whatever plays audio.
+This is a fundamentally different hazard class than section 20's finding
+— that one was about battery drain and a feature quietly not working;
+this one is about a feature that WORKS but can damage the hardware if a
+consumer bypasses the safety layer.
+
+Checked whether anything in this fleet plays audio directly rather than
+through a system mixer, since that is exactly the bypass that would matter
+here: `apps/voiceterm/src/audio_feedback.rs` is the one hit
+(short synthesized UI tones for voice state transitions — start/stop/ok/
+error beeps under 200ms). It uses `cpal`'s `default_output_device()`
+(routes through PipeWire's mixer, which is where `speakersafetyd` sits on
+Asahi) with a command-line fallback trying `paplay`/`pw-play` (also
+PipeWire) before `aplay` (direct ALSA, last resort, and only reached if no
+sound server is running at all — an unlikely state on a real Asahi
+desktop session). So this fleet's one audio-output code path is already
+safe on Asahi BY CONSTRUCTION — not because anyone designed for
+`speakersafetyd` specifically, but because using the OS default output
+device rather than opening a raw ALSA device was already the right call
+for the ordinary reason (respecting the user's actual output device
+choice). Worth stating as a real constraint for any FUTURE audio-output
+code in this fleet, though: never open a raw ALSA/output device by name on
+a target that might be Asahi, for exactly the reason above — go through
+`cpal`'s default device or a system player, every time, without exception.
+
+### Confidence and dating, stated plainly
+
+The M3 mic-support source is very recent (dated within about two and a
+half weeks of this session) and driver support moves fast; treat "M3 mics
+work" as current-at-time-of-writing rather than a permanently settled
+fact the way section 20's FP5 hardware wiring finding is (that one is a
+physical hardware fact, unlikely to change; this one is software support
+status, which does). If this matters for a real port, re-check
+asahilinux.org's own feature tables rather than trust this section's
+snapshot.
