@@ -885,9 +885,27 @@ That is the join between this chapter and §16. `system/` is where daemons live;
    started after, and `daemon-reload` between — the step whose absence made
    today's rusty-board redeploy report a stale unit.
 
-Steps 1 and 2 are pure and testable here. Step 3 needs a cross toolchain in the
-sandbox, which apt can probably supply (`gcc-aarch64-linux-gnu`,
-`musl-tools`) — untested. Step 4 needs a device.
+Steps 1 and 2 are pure and testable here. Step 4 needs a device.
+
+Step 3, checked in c18unified: `gcc-aarch64-linux-gnu` and `musl-tools` both
+install clean via apt — the linker half is not the blocker it looked like.
+The blocker is the Rust STD for the target triple: this sandbox's toolchain
+was installed by `pack-rust.sh`'s offline bundle rather than rustup, so there
+is no `rustup target add`, and fetching `rust-std-<ver>-aarch64-unknown-
+linux-{gnu,musl}.tar.xz` directly from `static.rust-lang.org` — the exact
+component `pack-rust.sh` itself downloads — 403s with `x-deny-reason:
+host_not_allowed`. That domain is not on this sandbox's fixed network
+allowlist (`crates.io`/`static.crates.io` are; `static.rust-lang.org` is
+not), and unlike every other "not installable here" claim this session, this
+one is a genuine hard boundary rather than an untested premise: the allowlist
+is fixed by the harness, not by a package manager.
+
+So step 3 is buildable the moment a rust-std for the target exists on disk —
+via `pack-rust.sh` run somewhere with that domain reachable, or a std
+fetched through `crates.io`'s proxy if one exists, or vendored into the repo
+alongside the existing `rustup.zip`-style bundles. Nothing about the linker,
+the toolchain version, or the target triple is in question; only the std's
+transport is blocked.
 
 ## 18. gitmind LAN share: three independent failures, and where the fix stops
 
