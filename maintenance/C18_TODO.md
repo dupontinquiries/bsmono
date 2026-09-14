@@ -454,10 +454,61 @@ keeps that state in module-level statics (`cancel_recording()`,
 `get_partial_preview()`, `clear_partial_preview()` take no receiver), so two
 mounts would be two independent recorders fighting over one microphone.
 
-### Shape, in dependency order
+### Shape, in dependency order — CORRECTED: `shared/voice-kit` already exists
 
-1. `shared/voice-kit` (or into an existing kit) taking voice.rs as its
-   engine — ONE mount, so one recorder.
+Step 1 below originally said "`shared/voice-kit` (or into an existing kit)
+taking voice.rs as its engine." Checked before starting the extraction, and
+that sentence was wrong: `shared/voice-kit` already exists, and `voice.rs`
+already consumes it —
+
+    voice_kit::hallucination::looks_like_speech(text)
+    voice_kit::hallucination::trim_hallucination_loop(s)
+
+— for exactly what its own manifest says it is for: "Shared whisper-voice
+post-processing + model resolution... Zero-dependency." Two comments in
+`voice.rs` (near line 1301 and 3586) record this as a prior repoint, not
+something to redo.
+
+So `voice-kit` is the WRONG target for this port. It is deliberately narrow
+— text-level hallucination filtering and model resolution, explicitly not
+"the signal-level math" (that is `audio-kit`) and not the recording
+lifecycle, wake-word state or popup surface `voice.rs` also holds. Taking
+the whole 4,417-line file into `voice-kit` would bloat a zero-dependency
+text-processing crate with `cpal`/`whisper-rs` recording plumbing it was
+explicitly written to exclude — the opposite mistake from not extracting at
+all, and the kind of over-broad grab this session has been undoing rather
+than committing (`av1tuner`'s six `crate::X`-should-be-`super::X` paths and
+`bo-suite`'s two dedups were both about respecting an existing boundary,
+not inventing a bigger one).
+
+The real target is narrower than "all of voice.rs": just the
+recording-lifecycle and preview-buffer surface a POPUP needs to call --
+`begin_capture`, `cancel_recording`, `finish_recording`,
+`get_partial_preview[_words]`, `clear_partial_preview`,
+`update_partial_preview_words`, `pop_wake_event`,
+`set_wake_suppressed`/`is_wake_suppressed` — a subset of voice.rs's 51
+public items, not all of them. Model resolution and hallucination filtering
+stay exactly where `voice-kit` already correctly has them; wake-word
+detection internals, whisper invocation and the cpal capture loop are
+implementation details behind the handful of functions above and do not
+need to move anywhere to be called from a shared popup.
+
+Scoping which of the 51 belong in that surface and which stay
+voiceterm-private is real work not done here — it needs reading each
+caller, the way `board_layouts::dispatch`'s extraction earlier this session
+checked every call site in `keyboard_view.rs` before moving anything.
+Guessing the list from function names alone risks the same wrong-nesting
+mistake `av1tuner`'s port made twice in one turn.
+
+Original dependency order, steps 2-4 unchanged:
+
+1. ~~shared/voice-kit taking voice.rs as its engine~~ — corrected above.
+   The real step 1 is a NEW narrow surface (name TBD — not `voice-kit`,
+   which is taken and means something else), holding only the
+   recording/preview functions a popup calls, with `voice.rs` becoming a
+   thin voiceterm-specific wrapper the way `av1tuner`'s `gm` module's
+   children now correctly point `super::` at their real parent instead of
+   `crate::`.
 2. An egui popup surface over it, in a shared widget crate, since both
    consumers want the same one. voiceterm's QML is the reference for what it
    shows: partial preview with per-speaker colouring, cancel/finish, and the
@@ -472,10 +523,10 @@ mounts would be two independent recorders fighting over one microphone.
 corpus ("voice popups the user cancelled without executing"), so the cancel
 path has a consumer and is not merely a dismiss.
 
-**Not started.** Recorded rather than begun because step 1 is a shared-kit
-extraction of a 4,417-line module and step 2 is a new surface; starting
-either without the budget to finish and compile it is how the `bufsearch`
-duplicate happened earlier this session.
+**Still not started.** The corrected step 1 is smaller than the original
+mis-scoped one, but still real work: choosing the exact function subset
+needs reading every call site first, which is a session in itself, not
+something to guess through in the remaining budget of this one.
 
 ---
 
