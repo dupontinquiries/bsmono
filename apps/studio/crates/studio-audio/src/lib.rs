@@ -24,6 +24,7 @@
 //! (project, sources, window) so a render is reproducible and testable — no
 //! device, no callback, no clock.
 
+pub mod boom;
 pub mod format;
 pub mod stems;
 pub mod block;
