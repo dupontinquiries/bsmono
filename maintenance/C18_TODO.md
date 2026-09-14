@@ -713,25 +713,75 @@ This means the "~1,200 lines, bounded, comparable to
 the way that matters: it under-counted by not reading
 `record_and_transcribe_inner` past its static-name footprint. The Tier1
 acoustic-index fast path, the speaker-aware fingerprint lookup, and the
-noise-floor-adaptive VAD threshold are not peripheral to this function —
-they are most of its body (lines 3350-3550 of ~3155-3572) — and none of
-them can be stubbed out without changing what `listen()` actually does:
-skipping the acoustic-index check would mean every popup-crate consumer
-loses the "skip Whisper on a confident cache hit" latency win, and skipping
-the noise-floor read would mean the VAD threshold silently reverts to a
-fixed 0.008 regardless of room noise.
+noise-floor-adaptive VAD threshold are most of the function's body (lines
+3350-3550 of ~3155-3572).
 
 So 1a is not "the model-loading core," cleanly separable from everything
-else. It is "the model-loading core AND the acoustic-index/speaker-aware
-VAD pipeline," which pulls in at least `audio_profile`, `phonetic`,
-`acoustic_index`, and `speakers` — four more modules, none confirmed
-self-contained the way `voice_lang`/`whisper_pool` were. The next step
-before any extraction attempt is checking THOSE four the same way
-`voice_lang`/`whisper_pool` were checked: size, `use crate::` count, and
-whether they in turn stay bounded or keep unrolling. Not done in this
-pass — this correction exists so the next one starts from an accurate
-line count instead of the ~1,200 that turned out to be an undercount from
-an incomplete read.
+else, on the strength of the file structure alone. It reaches into
+`audio_profile`, `phonetic`, `acoustic_index`, and `speakers` — four more
+modules, none yet confirmed self-contained the way `voice_lang`/
+`whisper_pool` were.
+
+### The four checked — the closure is real, and would make the popup crate bigger than voice.rs
+
+    audio_profile     707 lines   -- use crate::phonetic
+    phonetic         1860 lines   -- leaf (std only)
+    acoustic_index    997 lines   -- leaf (std only)
+    speakers         1405 lines   -- use crate::phonetic
+
+`phonetic` and `acoustic_index` are leaves — the closure stops here, it
+does not keep unrolling — but it stops at roughly **4,969 lines** for
+these four alone, more than the whole of `voice.rs` (4,417 lines). Taking
+all of this into a "small popup surface" would mean the shared crate ends
+up larger than the file the popup was meant to be extracted FROM.
+
+### The resolution: the acoustic-index path is opt-in, not load-bearing
+
+Before concluding the extraction is impractical, checked whether the Tier1
+section is actually required for `listen()`'s DEFAULT behavior or only for
+an optional enhancement — because if optional, the boundary can be drawn
+BEFORE it rather than after, which is a much smaller extraction. (This
+also corrects something said too quickly two paragraphs up: "skipping the
+acoustic-index check would mean every consumer loses the latency win" was
+written before this check, and is not quite right — see below.)
+
+It is optional, in the function's own words: *"Default behavior (SHADOW
+mode): no behavioral change. Whisper always runs."* The skip-Whisper fast
+path only activates when `WEB2QML_TIER1_PROMOTE=1` is explicitly set — off
+by default. Unset, the acoustic-index calls still run (for shadow-mode
+logging: recording cache/Whisper agreement for later tuning) but nothing
+they return changes what gets transcribed.
+
+So a shared core does not need `acoustic_index`, `speakers`, or
+`audio_profile`'s noise-floor read to reproduce voiceterm's DEFAULT voice
+behavior. Those three are a voiceterm-specific enhancement layer sitting
+on top of `listen()`/`transcribe_with_dual_model`, not something a popup
+needs to function. The boundary: the shared crate implements plain VAD (a
+simply-adaptive threshold, no acoustic-index lookup, no fingerprint cache)
+and voiceterm's own wrapper re-adds the Tier1/speaker layer as a
+voiceterm-specific pre-check in front of the shared `transcribe`, not
+inside it.
+
+This does mean the shared crate's VAD will not be bit-identical to
+voiceterm's CURRENT behavior even with `WEB2QML_TIER1_PROMOTE` unset:
+losing the noise-floor-adaptive threshold (the `audio_profile::
+noise_floor()` read) is a real difference for voiceterm specifically, even
+though shadow mode changes nothing a user sees today. Whether voiceterm
+keeps a richer VAD as a wrapper, or the shared crate's VAD gets enhanced to
+match once `audio_profile`'s further dependents (if any beyond `phonetic`)
+are confirmed bounded, is a real design choice for whoever builds this —
+stated as a choice now rather than left as an undiscovered blocker.
+
+With that boundary, the ACTUAL 1a closure returns to roughly the original
+size: `ensure_models_loaded`, `load_tier`, a plain-VAD version of
+`record_and_transcribe_inner` (its acoustic-index section removed, its
+`RING_BUFFER`/`CANCEL_FLAG`/`FINISH_FLAG`/`FAST_FINALIZE`/
+`FORCE_TINY_TIER` handling kept), `transcribe_with_dual_model`, `run_one`,
+the 6+2 statics, `ModelTier`+3 helpers, `voice_lang`+`whisper_pool`
+(confirmed self-contained), `clog!`. `audio_profile`, `phonetic`,
+`acoustic_index`, `speakers` stay in voiceterm, feeding voiceterm's own
+wrapper rather than the shared core — back to roughly 1,200-1,400 lines,
+this time because the boundary was actually checked rather than assumed.
 
 One more coupling, from `listen_with_audio` specifically — part of 1b (the
 popup surface), not the four core functions above, so it does not block
