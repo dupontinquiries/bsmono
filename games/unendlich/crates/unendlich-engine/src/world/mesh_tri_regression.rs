@@ -1,0 +1,166 @@
+//! `world::mesh_tri_regression` — chunk mesh triangle-count regression guard.
+//!
+//! Motivated by a live diagnosis (2026-09, via `IndirectDrawSet::max_index_count`
+//! added to the running game's per-second log): a single chunk was found
+//! carrying 170,000-220,000 triangles -- for reference, `CHUNK_SIZE = 32`, so
+//! even a maximally-dense, entirely-unculled 32^3 solid cube tops out around
+//! 390K triangles, meaning a single "normal" chunk sitting at roughly half that
+//! is wildly outside what greedy-meshed voxel terrain should ever produce
+//! (hundreds to low thousands of triangles is typical). The spike tracked
+//! `[worldgen] ruin at (...)` log lines closely enough across three
+//! consecutive samples to be a real correlation, not noise: `stamp_ruins`
+//! (`cpu_generator.rs`) scatters debris/rubble, and greedy meshing -- which
+//! merges long runs of *identical adjacent* blocks into big quads, and works
+//! great on terrain's long uniform stone/dirt runs -- falls apart on
+//! scattered, mostly-isolated rubble, where nearly every block contributes
+//! its own unmerged faces. Foliage placement (`flora_blocks.rs`) has the same
+//! shape of risk: individually-placed leaves/fronds/decorations rather than
+//! large uniform runs.
+//!
+//! This module doesn't fix the mesher or the structure/foliage generators --
+//! it's a tripwire so a future change to either one that makes this worse
+//! fails a test instead of silently shipping and being rediscovered live via
+//! a GPU-watchdog self-stop. Two things it can catch:
+//!   - `sample_grid_worst_case_stays_under_budget`: generates a grid of real
+//!     chunks (terrain + whatever ruins/structures the deterministic seed
+//!     happens to place in range) and asserts the worst one seen stays under
+//!     `MAX_TRIS_ANY_SAMPLED_CHUNK`.
+//!   - `foliage_overlay_stays_under_budget`: takes a plain generated chunk and
+//!     overlays a full region's worth of flora on top (the densest case the
+//!     real streaming path would ever produce for one chunk), asserting
+//!     against `MAX_TRIS_FOLIAGE_OVERLAY`.
+//!
+//! # On the bound constants
+//! `MAX_TRIS_ANY_SAMPLED_CHUNK` and `MAX_TRIS_FOLIAGE_OVERLAY` are a
+//! first-pass guess, not calibrated against a real run of these tests (no
+//! compiler in the environment that wrote them). They're set well above what
+//! ordinary greedy-meshed terrain should produce but comfortably below the
+//! ~170K-220K triangle range actually observed live, so a first real run
+//! should be expected to either pass comfortably or reveal that these bounds
+//! need tightening/loosening once real numbers are in hand -- treat the first
+//! CI run's actual worst-case numbers as the real calibration data, and
+//! consider ratcheting the constants down closer to that observed max once
+//! it's known, so future regressions are caught earlier rather than only
+//! once they approach today's already-bad worst case.
+
+/// Triangle-count ceiling for the worst chunk seen across a sampled grid of
+/// real generated chunks (terrain + any ruins the deterministic seed places
+/// in range). See the module doc's "On the bound constants" section.
+pub const MAX_TRIS_ANY_SAMPLED_CHUNK: usize = 90_000;
+
+/// Triangle-count ceiling for a single chunk with a full region's flora
+/// overlaid on top -- the densest single-chunk foliage case the real
+/// streaming path (`region_flora_blocks`) would ever produce.
+pub const MAX_TRIS_FOLIAGE_OVERLAY: usize = 90_000;
+
+/// Mesh `chunk` with the plain (no sky/model) entry point and return its
+/// triangle count. Pulled out as its own function so both tests (and any
+/// future caller wanting a quick triangle-count check) share one path.
+pub fn triangle_count_of(chunk: &crate::world::chunk::Chunk) -> usize {
+    crate::render::mesher::mesh_chunk(chunk).indices.len() / 3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::CHUNK_SIZE;
+    use crate::world::chunk::{Chunk, ChunkCoord};
+    use crate::world::cpu_generator::WorldGenerator;
+
+    /// Generate a grid of real chunks around a few y-bands likely to
+    /// straddle the surface (ruins/structures are surface-anchored per
+    /// `stamp_ruins`'s `base_y` check; foliage is likewise surface-anchored),
+    /// mesh each, and return the worst `(coord, triangle_count)` seen.
+    ///
+    /// Grid size is deliberately modest (9x9 per y-band x 3 bands = 243
+    /// chunks) -- enough to reliably catch at least one ruin at typical
+    /// hit-rates (stamp_ruins hosts a ruin in ~38% of 80-block regions, and
+    /// a 9x9-chunk span at CHUNK_SIZE=32 covers multiple such regions) without
+    /// making the test slow enough to skip in practice.
+    fn worst_case_in_sampled_grid(seed: u32) -> (ChunkCoord, usize) {
+        let gen = WorldGenerator::new(seed);
+        let mut worst: (ChunkCoord, usize) = (ChunkCoord::new(0, 0, 0), 0);
+        for y in [2, 3, 4] {
+            for cz in -4..=4 {
+                for cx in -4..=4 {
+                    let coord = ChunkCoord::new(cx, y, cz);
+                    let chunk = gen.generate_chunk(coord);
+                    let tris = triangle_count_of(&chunk);
+                    if tris > worst.1 {
+                        worst = (coord, tris);
+                    }
+                }
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn sample_grid_worst_case_stays_under_budget() {
+        // Multiple seeds: a single seed could luck into (or out of) placing
+        // a ruin in the sampled range at all. A few different seeds make
+        // this a real regression guard rather than a coin flip on one map.
+        for seed in [1u32, 12345, 999_983] {
+            let (coord, tris) = worst_case_in_sampled_grid(seed);
+            assert!(
+                tris <= MAX_TRIS_ANY_SAMPLED_CHUNK,
+                "seed {seed}: chunk {coord:?} produced {tris} triangles, exceeding the \
+                 budget of {MAX_TRIS_ANY_SAMPLED_CHUNK} -- likely a mesh-hostile \
+                 generation feature (ruin/debris/structure) regressed denser, or the \
+                 mesher stopped greedy-merging something it used to. See this module's \
+                 doc comment for the live incident this test was written to catch.",
+            );
+        }
+    }
+
+    #[test]
+    fn foliage_overlay_stays_under_budget() {
+        let gen = WorldGenerator::new(42);
+        let coord = ChunkCoord::new(0, 3, 0);
+        let mut chunk = gen.generate_chunk(coord);
+        let (ox, oy, oz) = coord.block_origin();
+
+        // The densest single-chunk case the real streaming path produces:
+        // every flora block a full CHUNK_SIZE x CHUNK_SIZE region would get,
+        // stamped directly onto this one chunk's blocks (in reality flora
+        // spans neighboring chunks too via region_flora_blocks_cached's
+        // wider scan, so this actually concentrates MORE density into one
+        // chunk than live play would -- a deliberately pessimistic worst case).
+        let placed = crate::world::flora_blocks::region_flora_blocks(
+            &gen, ox, oz, CHUNK_SIZE, CHUNK_SIZE,
+        );
+        for (pos, block) in placed {
+            let (lx, ly, lz) = (pos[0] - ox, pos[1] - oy, pos[2] - oz);
+            if (0..CHUNK_SIZE).contains(&lx)
+                && (0..CHUNK_SIZE).contains(&ly)
+                && (0..CHUNK_SIZE).contains(&lz)
+            {
+                chunk.blocks[Chunk::block_index(lx, ly, lz)] = block;
+            }
+        }
+
+        let tris = triangle_count_of(&chunk);
+        assert!(
+            tris <= MAX_TRIS_FOLIAGE_OVERLAY,
+            "chunk {coord:?} with a full region's flora overlaid produced {tris} \
+             triangles, exceeding the budget of {MAX_TRIS_FOLIAGE_OVERLAY} -- foliage \
+             placement got denser, or the mesher stopped greedy-merging it well. See \
+             this module's doc comment for the live ruin incident this test's sibling \
+             was written to catch; foliage was flagged as likely to do the same thing \
+             eventually.",
+        );
+    }
+
+    #[test]
+    fn triangle_count_of_empty_chunk_is_zero() {
+        // Sanity check on the helper itself, independent of world generation:
+        // an all-air chunk has no faces to mesh at all.
+        let coord = ChunkCoord::new(0, 0, 0);
+        let blocks = vec![
+            crate::world::blocks::BlockId::Air;
+            (CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize
+        ];
+        let chunk = Chunk::from_blocks(coord, blocks);
+        assert_eq!(triangle_count_of(&chunk), 0);
+    }
+}

@@ -160,6 +160,7 @@ pub mod smoke_field;
 // Round 15.
 pub mod batch_chunk_priority;
 pub mod mesh_tier;
+pub mod mesh_tri_regression;
 // Round 16.
 pub mod batch_mesh_tier;
 pub mod ridge_noise;
