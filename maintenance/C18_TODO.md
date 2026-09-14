@@ -676,3 +676,43 @@ work is largely "ask epaint and cache it" rather than implementing a line
 breaker — worth checking before writing one, since `view.rs` currently calls
 `layout_no_wrap` and switching to `layout` returns exactly the rows this
 layer needs.
+
+## 16. Two adjacent focus classes, searched and clean
+
+Follow-up to the ten unpinned text fields (0b31df97f). Same method — look for
+the CAUSE, not the symptom — applied to the two neighbouring failure modes.
+Both came back clean, which is worth recording so the next person does not
+re-run them.
+
+### `request_focus()` every frame
+
+28 call sites. Six looked bare; three of those are a test harness
+(`ctx.run(RawInput::default())` in pty_input.rs). The two real ones are
+palettes — `voiceterm_egui.rs:1490` and `beatspace/arrangepage.rs:862` —
+whose comments say "focused on open" while the call fires every frame.
+
+Untidy, NOT broken, and left alone. Focus-stealing only hurts when something
+else wants focus, and in both palettes the result rows respond to CLICKS
+(which do not need focus) while Enter is read from global input rather than
+from the field. `request_focus()` on an already-focused widget is idempotent
+in egui. Rewriting them would be churn on working code.
+
+### Duplicate `id_salt` literals
+
+Two files reuse a salt within themselves, and both are correct:
+
+* `uikit-egui/src/layout_probe.rs:227-228` — a test that deliberately
+  creates a clash and ASSERTS the probe reports it.
+* `aperture/loop_pane.rs:114,155` — two `instruction` fields in different
+  arms of one `match state.provider_kind`, so only one exists per frame and
+  they can never collide.
+
+### What would still be worth checking, and is not covered
+
+`id_salt` values built from a loop index (`id_salt(i)`) rather than a
+literal: those ARE position-derived in the way that matters if the list
+reorders — a field keyed by row index keeps the previous row's focus when
+the list is filtered. The scan above only found literals. A follow-up would
+look for `id_salt` taking a variable and check whether the value is stable
+across a reorder, which is a harder question than "is there an id at all"
+and needs reading each call site rather than a grep.
