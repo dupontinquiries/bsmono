@@ -707,12 +707,28 @@ Two files reuse a salt within themselves, and both are correct:
   arms of one `match state.provider_kind`, so only one exists per frame and
   they can never collide.
 
-### What would still be worth checking, and is not covered
+### The loop-index variant: checked, three fixed
 
-`id_salt` values built from a loop index (`id_salt(i)`) rather than a
-literal: those ARE position-derived in the way that matters if the list
-reorders — a field keyed by row index keeps the previous row's focus when
-the list is filtered. The scan above only found literals. A follow-up would
-look for `id_salt` taking a variable and check whether the value is stable
-across a reorder, which is a harder question than "is there an id at all"
-and needs reading each call site rather than a grep.
+`id_salt` values built from a loop index rather than a literal ARE
+position-derived in the way that matters when a list reorders. 38 `id_salt`
+calls take a variable; most key off a real identity (`node.id`, `t.id`, a
+label). Five key off a bare index, and reading each was the only way to tell
+them apart:
+
+| site | verdict |
+|---|---|
+| `av1tuner app.rs:1632,1755` | REAL — `Vec::remove` shifts groups; fixed with a stable `MergeGroup::id` (908b710cf) |
+| `logscope replicatorui.rs:328` | REAL — same loop already keys by `c.id` four lines up; fixed (b52c27aac) |
+| `logscope chat_draw.rs:1144` | REAL — `arts` re-parsed each frame; now keyed by `a.path` (b52c27aac) |
+| `bot-arena studio.rs:266` | fine — iterates a static const array |
+
+None of the three is the one-character bug: an index is stable WHILE typing
+and only shifts on delete or re-parse, so the symptom is inherited cursor
+state or a jumped scroll position, not a dead field. Same root cause, milder
+outcome — which is exactly why a symptom-shaped search missed them.
+
+Still open, and worse than any of the above: `chat_draw`'s `self.preview` is
+an `Option<usize>` into the same re-parsed `arts` vector, so a renumber makes
+it preview a different artifact than the one clicked. That is wrong CONTENT,
+not a wrong scroll offset. It is selection state with several call sites, so
+it wants its own change rather than being folded into an id sweep.
