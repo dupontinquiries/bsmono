@@ -1,0 +1,31 @@
+[package]
+name = "voice-engine-kit"
+version = "0.1.0"
+edition = "2021"
+description = """
+The model-loading, capture and transcription core lifted out of
+apps/voiceterm/src/voice.rs — dual-tier (tiny/base/high-accuracy) whisper
+dispatch with a grace-window race between tiers, cpal capture hardened
+against flaky Linux input devices, and adaptive-threshold VAD. Deliberately
+does NOT include voiceterm's Tier1 acoustic-index fast path, speaker-aware
+fingerprint cache, or corpus-recording call site: those are opt-in
+enhancements a consuming app layers on top (see the crate-level doc), not
+things this engine needs to function. See maintenance/C18_TODO.md sections
+13/18/19 in the monorepo for the extraction's full scoping and the four
+rounds of correction it took to get the closure right.
+"""
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+voice = ["whisper-rs", "cpal"]
+voice-vulkan = ["voice", "whisper-rs/vulkan"]
+voice-cuda = ["voice", "whisper-rs/cuda"]
+voice-metal = ["voice", "whisper-rs/metal"]
+
+[dependencies]
+whisper-rs = { version = "0.16", optional = true }
+cpal = { version = "0.15", optional = true }
+libc = "0.2"
