@@ -81,6 +81,34 @@ impl SchedAttr {
     }
 }
 
+/// Clamp the CURRENT thread's util_max to an arbitrary value on the
+/// 0..=1024 scale. The general form [`clamp_current_thread_to_ecores`]
+/// wraps with [`ECORE_UTIL_MAX`] fixed.
+///
+/// Exposed (rather than keeping `clamp_tid_util_max` private to this file)
+/// for callers whose scope does not match the background-tuned default —
+/// `ECORE_UTIL_MAX` (256, 25%) was chosen for work this module's own doc
+/// scopes to "invisible to the user" (corpus write, index compaction). A
+/// caller clamping a thread the user is actively waiting on, with the
+/// user's own consent to trade latency for battery (see
+/// `power_profile::EnergyMode`), may reasonably want a looser cap than a
+/// background write does — that number has NOT been chosen here, on
+/// purpose: it needs a real device and a stopwatch, not a guess, and a
+/// wrong guess baked into a private constant would be harder to find than
+/// one left as an explicit parameter at the call site.
+///
+/// On non-Linux this is always a no-op returning false, same as every
+/// other function here.
+#[cfg(target_os = "linux")]
+pub fn clamp_current_thread_to_util_max(util_max: u32) -> bool {
+    clamp_tid_util_max(0, util_max)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn clamp_current_thread_to_util_max(_util_max: u32) -> bool {
+    false
+}
+
 /// Clamp the CURRENT thread's util_max so the scheduler biases it onto
 /// an efficiency core. Call as the first statement inside a background
 /// worker thread. Returns true if the hint was accepted, false on any
