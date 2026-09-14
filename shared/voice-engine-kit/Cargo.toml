@@ -29,3 +29,5 @@ voice-metal = ["voice", "whisper-rs/metal"]
 whisper-rs = { version = "0.16", optional = true }
 cpal = { version = "0.15", optional = true }
 libc = "0.2"
+voice-kit = { path = "../voice-kit" }
+models-kit = { path = "../models-kit" }
