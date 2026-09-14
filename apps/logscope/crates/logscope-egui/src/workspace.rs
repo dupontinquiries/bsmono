@@ -341,6 +341,56 @@ pub fn manifest_delta(old: &str, new: &str) -> (Vec<String>, Vec<String>, Vec<St
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_artifact_emitted_earlier_renumbers_the_ones_after_it() {
+        // The property that made `chat_draw`'s `preview: Option<usize>` a
+        // wrong-CONTENT bug rather than a cosmetic one. `arts` is re-parsed
+        // from the whole message text every frame, so a reply that emits a
+        // file BEFORE an existing one shifts every later index by exactly the
+        // amount that makes a stored index point at the wrong artifact —
+        // silently, and only sometimes.
+        //
+        // Pinned here rather than in chat_draw because this is a fact about
+        // parse_artifacts, and it is what justifies keying that selection by
+        // path.
+        let before = parse_artifacts("// file: b.rs\n```\nfn b() {}\n```\n");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].path, "b.rs");
+
+        let after = parse_artifacts(
+            "// file: a.rs\n```\nfn a() {}\n```\n// file: b.rs\n```\nfn b() {}\n```\n",
+        );
+        assert_eq!(after.len(), 2);
+        // b.rs was index 0 and is now index 1. A `preview` of Some(0) held
+        // across this reply would expand a.rs while b.rs's row stayed
+        // highlighted.
+        assert_eq!(after[0].path, "a.rs");
+        assert_eq!(after[1].path, "b.rs");
+        assert_ne!(
+            before.iter().position(|x| x.path == "b.rs"),
+            after.iter().position(|x| x.path == "b.rs"),
+            "the index moved, which is the whole hazard"
+        );
+    }
+
+    #[test]
+    fn paths_are_unique_so_they_can_key_a_selection() {
+        // Keying `preview` by path is only correct if two rows cannot share
+        // one. parse_artifacts either MERGES a repeated path into the
+        // existing artifact (bumping `fragments`) or, when the second block
+        // redefines rather than continues it, gives it a unique_path. Both
+        // branches preserve uniqueness; this asserts the pair rather than
+        // trusting the comment.
+        let merged = parse_artifacts(
+            "// file: a.rs\n```\nfn a() {}\n```\n// file: a.rs\n```\nfn a2() {}\n```\n",
+        );
+        let mut paths: Vec<&str> = merged.iter().map(|a| a.path.as_str()).collect();
+        let n = paths.len();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), n, "two artifacts shared a path: {paths:?}");
+    }
     use super::*;
 
     #[test]

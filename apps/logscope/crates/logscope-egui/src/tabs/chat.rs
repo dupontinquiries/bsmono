@@ -1014,7 +1014,18 @@ pub struct Chat {
     attach_picker: crate::filepicker::FilePicker,
     save_dir: Option<std::path::PathBuf>,  // remembered "save to folder" location
     last_saved: Option<std::path::PathBuf>, // folder of the most recent save (for "Open folder")
-    preview: Option<usize>,                 // index of the generated file whose body is expanded
+    /// PATH of the generated file whose body is expanded, not its index.
+    ///
+    /// `arts` is re-parsed from the message text every frame
+    /// (`parse_artifacts(last_text)`), so an index is only valid until the
+    /// next reply emits an artifact before an existing one — after which the
+    /// expanded pane showed a DIFFERENT file than the row that was clicked.
+    /// Wrong content, silently, and only when the list happened to renumber.
+    ///
+    /// A path is what the row actually identifies, and `parse_artifacts`
+    /// already merges fragments that share one, so two rows cannot carry the
+    /// same path.
+    preview: Option<String>,
     auto_continue: bool,                    // decode a fresh reply continuously up to the reply ceiling
     stepwise: bool,                         // checkpoint mode: model pauses at ⏸ STEP k/n markers, harness auto-continues
     patch_mode: bool,

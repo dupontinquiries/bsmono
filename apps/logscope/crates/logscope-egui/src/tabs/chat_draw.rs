@@ -1106,12 +1106,12 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                             let sz = a.content.len();
                             let szs = if sz >= 1024 { format!("{:.1}K", sz as f32 / 1024.0) } else { format!("{sz} B") };
                             ui.horizontal(|ui| {
-                                let open = self.preview == Some(i);
+                                let open = self.preview.as_deref() == Some(a.path.as_str());
                                 let tri = if open { "▾" } else { "▸" };
                                 let merged = if a.fragments > 1 { format!("  ·  merged ×{}", a.fragments) } else { String::new() };
                                 let mut r = ui.selectable_label(open, RichText::new(format!("{tri} {}  ·  {badge}  ·  {szs}{merged}", a.path)).monospace().small().color(theme::INK()));
                                 if a.fragments > 1 { r = r.on_hover_text("Reassembled from pieces emitted across stop/start (warm-resume) — one whole file"); }
-                                if r.clicked() { self.preview = if open { None } else { Some(i) }; }
+                                if r.clicked() { self.preview = if open { None } else { Some(a.path.clone()) }; }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if ui.small_button("Copy").on_hover_text("Copy this file's contents to the clipboard").clicked() {
                                         ui.ctx().copy_text(a.content.clone());
@@ -1138,7 +1138,7 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                                     }
                                 });
                             }
-                            if self.preview == Some(i) {
+                            if self.preview.as_deref() == Some(a.path.as_str()) {
                                 egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(6), inner_margin: egui::Margin::same(theme::PAD_SM), ..Default::default() }
                                 .show(ui, |ui| {
                                     // Keyed by path, not by `i`. `arts` is re-parsed from the
@@ -1146,11 +1146,9 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                                     // artifact renumbers the ones after it and this pane would
                                     // inherit another artifact's scroll offset.
                                     //
-                                    // `self.preview` is still an INDEX into the same vector and
-                                    // has the same exposure — after a renumber it previews a
-                                    // different artifact than the one clicked. Not changed here:
-                                    // that is selection state with its own call sites, where this
-                                    // is one widget id.
+                                    // `self.preview` is keyed by path too, for the same reason —
+                                    // it was an index into this vector and previewed the wrong
+                                    // artifact after a renumber.
                                     egui::ScrollArea::vertical().id_salt(("prev", a.path.as_str())).max_height(160.0).auto_shrink([false, true]).show(ui, |ui| {
                                         ui.label(RichText::new(&a.content).monospace().small().color(theme::DIM()));
                                     });
