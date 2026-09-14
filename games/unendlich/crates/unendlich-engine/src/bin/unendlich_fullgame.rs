@@ -3663,6 +3663,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             if let Some(n) = g("leaf_stride").as_u64() { renderer.ui_leaf_stride = n; }
             if let Some(n) = g("apply_budget").as_u64() { renderer.ui_apply_budget = n as u32; }
             if let Some(n) = g("render_distance").as_i64() { renderer.ui_render_distance = (n as i32).clamp(2, 32); } // r197
+            if let Some(n) = g("shadow_stride").as_u64() { renderer.ui_shadow_stride = (n as u32).clamp(1, 8); }
+            if let Some(b) = g("shadow_cache").as_bool() { renderer.ui_shadow_cache = b; }
             if let Some(f) = g("gui_scale").as_f64() {
                 renderer.ui_scale = (f as f32).clamp(unendlich_engine::mobile_ui::UI_SCALE_MIN, unendlich_engine::mobile_ui::UI_SCALE_MAX); // r200
                 settings_had_gui_scale = true;
@@ -3721,6 +3723,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             "plant_stride": r.ui_plant_stride, "leaf_stride": r.ui_leaf_stride,
             "apply_budget": r.ui_apply_budget, "fps_target": r.ui_fps_target,
             "render_distance": r.ui_render_distance,
+            "shadow_stride": r.ui_shadow_stride,
+            "shadow_cache": r.ui_shadow_cache,
             "gui_scale": r.ui_scale,
             "autotune": r.ui_autotune,
             "gpu_mesh_yield": r.ui_gpu_mesh_yield,
@@ -8039,6 +8043,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             plant_stride_atom.store(renderer.ui_plant_stride.max(1), std::sync::atomic::Ordering::Relaxed);
             leaf_stride_atom.store(renderer.ui_leaf_stride.max(1), std::sync::atomic::Ordering::Relaxed);
             chunk_manager.set_apply_budget(renderer.ui_apply_budget as usize);
+            // Shadow amortization sliders -> the live setters (no GPU
+            // resource recreation, safe every-15-frames like the levers
+            // above). set_shadow_chunk_stride re-clamps to [1,8] itself.
+            renderer.set_shadow_chunk_stride(renderer.ui_shadow_stride);
+            renderer.set_shadow_cache(renderer.ui_shadow_cache);
             // r197: live render distance — the slider drives the override
             // atomic that runtime_render_distance() consults first. r476: the
             // adaptive controller caps it BELOW the chosen value under load.

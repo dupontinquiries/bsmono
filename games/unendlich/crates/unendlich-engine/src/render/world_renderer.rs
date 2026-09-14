@@ -773,6 +773,14 @@ pub struct WorldRenderer {
     pub ui_render_distance: i32,
     /// r325: render resolution scale (neural upscale), 0.5..1.0.
     pub ui_render_scale: f32,
+    /// Live shadow-caster temporal-amortization stride slider: applies to
+    /// `shadow_chunk_stride` via `set_shadow_chunk_stride` each frame.
+    /// 1 = every caster every frame; higher = 1/N per frame, round-robin.
+    pub ui_shadow_stride: u32,
+    /// Live whole-pass shadow-cache toggle: applies to `shadow_cache` via
+    /// `set_shadow_cache` each frame (skip the shadow pass entirely when
+    /// sun + camera are both unchanged from last frame).
+    pub ui_shadow_cache: bool,
     /// r197: clicked saved-world index (consumed by bin), -1 = none
     pub menu_world_pick: i32,
     /// r197: saved-world names+meta for the LoadSlots screen list
@@ -843,7 +851,9 @@ pub struct WorldRenderer {
     /// persistent shadow image (left in SHADER_READ_ONLY by the render pass's
     /// own subpass dependency), so the main pass still samples valid shadows.
     /// THE lever for the dominant GPU cost (shadow p50≈49ms): when the player
-    /// stands still, shadow drops to ~0. `UNENDLICH_SHADOW_CACHE`, default off.
+    /// stands still, shadow drops to ~0. `UNENDLICH_SHADOW_CACHE`, default ON
+    /// (R27) — this doc comment previously said "default off" and was stale;
+    /// see the `unwrap_or(true)` at construction below.
     /// Tradeoff: a chunk that finishes loading while the camera is perfectly
     /// still won't cast a shadow until the next camera move.
     shadow_cache: bool,
@@ -1167,6 +1177,14 @@ impl WorldRenderer {
     /// output regardless of what limits its caller passes.
     pub fn set_shadow_chunk_stride(&mut self, stride: u32) {
         self.shadow_chunk_stride = stride.clamp(1, 8);
+    }
+
+    /// Live-adjust whole-pass shadow caching (see `shadow_cache` field doc).
+    /// No GPU resources are recreated — this only gates the `skip_shadow`
+    /// check in `draw_frame`, so it's safe to flip from a settings UI or a
+    /// `RuntimeConfig`/`PerfPreset` switch without a restart.
+    pub fn set_shadow_cache(&mut self, on: bool) {
+        self.shadow_cache = on;
     }
 
     pub fn new(
@@ -1858,6 +1876,9 @@ impl WorldRenderer {
             menu_keybind_list: Vec::new(),
             ui_render_distance: 6,
             ui_render_scale: 1.0,
+            ui_shadow_stride: shadow_chunk_stride.clamp(1, 8),
+            ui_shadow_cache: std::env::var("UNENDLICH_SHADOW_CACHE")
+                .ok().map(|v| !(v == "0" || v.eq_ignore_ascii_case("false"))).unwrap_or(true),
             menu_world_pick: -1,
             menu_world_list: Vec::new(),
             menu_mp_list: Vec::new(),
@@ -3689,6 +3710,8 @@ impl WorldRenderer {
             let mut ui_perf_preset = self.ui_perf_preset;
             let mut ui_render_distance = self.ui_render_distance; // r197
             let mut ui_render_scale = self.ui_render_scale; // r325
+            let mut ui_shadow_stride = self.ui_shadow_stride;
+            let mut ui_shadow_cache = self.ui_shadow_cache;
             let mut ui_fps_target = self.ui_fps_target;
             let mut ui_autotune = self.ui_autotune;
             let mut ui_gpu_mesh_yield = self.ui_gpu_mesh_yield;
@@ -4366,6 +4389,8 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                                 ui_perf_preset = i as u8;
                                                 ui_render_distance = cfg.render_distance as i32;
                                                 ui_render_scale = cfg.render_scale;
+                                                ui_shadow_stride = cfg.shadow_chunk_stride;
+                                                ui_shadow_cache = cfg.shadow_cache;
                                             }
                                         }
                                     });
@@ -4374,13 +4399,17 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                             crate::runtime_config::PerfPreset::SELECTABLE[(ui_perf_preset.min(4)) as usize]
                                         );
                                         let modified = ui_render_distance != base.render_distance as i32
-                                            || (ui_render_scale - base.render_scale).abs() > 0.001;
+                                            || (ui_render_scale - base.render_scale).abs() > 0.001
+                                            || ui_shadow_stride != base.shadow_chunk_stride
+                                            || ui_shadow_cache != base.shadow_cache;
                                         ui.horizontal(|ui| {
                                             if modified {
                                                 ui.label(egui::RichText::new("🔨 custom profile").color(warn_col).small());
                                                 if unendlich_ui::tab_button(ui, "reset", false).clicked() {
                                                     ui_render_distance = base.render_distance as i32;
                                                     ui_render_scale = base.render_scale;
+                                                    ui_shadow_stride = base.shadow_chunk_stride;
+                                                    ui_shadow_cache = base.shadow_cache;
                                                 }
                                             } else {
                                                 ui.label(egui::RichText::new("● preset").color(accent).small());
@@ -4428,6 +4457,19 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                         ui.add_space(6.0);
                                         ui.label(egui::RichText::new(format!("{:.0}%", ui_render_scale * 100.0)).strong().color(accent));
                                     });
+                                    ui.separator();
+                                    // Shadow amortization: THE lever for the dominant GPU cost on
+                                    // most scenes (shadow-pass p50 dwarfs everything else at RD>=8 —
+                                    // see vk-harness/perf/reference.jsonl). Stride > 1 renders only
+                                    // 1/N chunks' shadows per frame, round-robin, reusing the rest
+                                    // of last frame's depth; a fast camera move forces a full
+                                    // render so it doesn't visibly lag.
+                                    ui.label("shadow stride (1 = every caster every frame; higher = cheaper, staler)");
+                                    int_slider!("shadow stride", ui_shadow_stride, u32, 1, 8);
+                                    if unendlich_ui::menu::toggle(ui, ui_shadow_cache, accent).clicked() {
+                                        ui_shadow_cache = !ui_shadow_cache;
+                                    }
+                                    ui.label("skip shadow pass when sun + camera are both still");
                                     ui.separator();
 
                                     if unendlich_ui::menu::toggle(ui, ui_autotune, accent).clicked() {
@@ -5702,6 +5744,8 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             self.ui_perf_preset = ui_perf_preset;
             self.ui_render_distance = ui_render_distance; // r197
             self.ui_render_scale = ui_render_scale; // r325
+            self.ui_shadow_stride = ui_shadow_stride;
+            self.ui_shadow_cache = ui_shadow_cache;
             self.ui_fps_target = ui_fps_target;
             self.ui_autotune = ui_autotune;
             self.ui_gpu_mesh_yield = ui_gpu_mesh_yield;

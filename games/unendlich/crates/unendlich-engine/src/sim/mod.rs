@@ -631,6 +631,7 @@ pub mod frame_pacer;
 pub mod cull_dispatch_split;
 pub mod upload_priority_sort;
 pub mod dragon_archetype;
+pub mod shadow_lod;
 pub mod shadow_refresh_plan;
 pub mod bending_runtime;
 pub mod flora_harvest;
