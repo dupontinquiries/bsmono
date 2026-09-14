@@ -617,14 +617,61 @@ surface moves, or the popup crate depends on voiceterm for it — inverting
 the extraction, which was the failure mode this whole investigation was
 checking for.
 
-One more coupling worth flagging rather than chasing further right now:
-`listen_with_audio` also reaches OUTSIDE `voice.rs` entirely, into
-`crate::log_summary::VOICE_ACTIVE` (a deferral flag telling a log-summary
-worker to back off while voice has the CPU). That is a fourth thing a
-shared crate would need — either take a callback/trait for it, or accept
-that this one flag stays a voiceterm-only side effect the shared core does
-not perform, with voiceterm setting it around the call instead of inside
-it. Not resolved here.
+### The core's full dependency closure — bounded, not the 13-module reach it looked like
+
+`voice.rs` as a whole reaches into 13 sibling modules (`speakers`,
+`event_signal`, `acoustic_index`, `wake_gate`, `voice_lang`, `separation`,
+`phonetic`, `audio_profile`, `log_summary`, `whisper_pool`,
+`corpus_recorder`, `security`, `peer_handshake`, plus `clog!` 98 times) —
+which looked like it made the whole file too entangled to extract any
+piece of cleanly. Checked what the SPECIFIC four core functions (1a's
+target: `ensure_models_loaded`, `load_tier`, `transcribe_with_dual_model`,
+`run_one`) actually touch, rather than assume they inherit the whole
+file's footprint: only `crate::clog`, `crate::voice_lang`,
+`crate::whisper_pool`.
+
+Both `voice_lang.rs` (173 lines) and `whisper_pool.rs` (360 lines) have
+**zero** `use crate::` themselves — self-contained, so they do not drag in
+a second hop of the other 11 modules. `clog!` expands to
+`$crate::log::emit(...)`, which resolves against whichever crate invokes
+it — so the macro itself is portable to a new crate with its own `log`
+module, or the shared crate can take an `emit` callback instead.
+
+The core also needs `ModelTier`, `model_file`, `forced_tier`, `model_path`
+(~80 lines, `voice.rs`-local) and the already-external `models_kit` crate
+`model_file` calls into.
+
+So the real closure for 1a is: 4 functions (~550 lines total) + 6 statics
+(`TINY_CTX`/`BASE_CTX`/`LARGE_CTX`/`TINY_STATE`/`BASE_STATE`/`LARGE_STATE`)
++ `ModelTier`+3 helpers (~80 lines) + two small self-contained sibling
+modules (533 lines) + the `clog!` macro (needs `$crate::log::emit` in the
+new crate, or a callback parameter) + `models_kit` (already shared).
+`run_one` takes `&whisper_rs::WhisperContext` as a plain parameter rather
+than reading a specific tier's static itself, so it does not add a
+dependency of its own — its caller (`transcribe_with_dual_model`) is what
+selects which context to pass in. `PREVIEW_STATE` was nearly counted into
+this list and does not belong here: checked its one call site
+(`ensure_preview_thread`, line 1173) and it backs the LIVE-PREVIEW text
+path, which is a popup-facing (1b) concern, not part of `listen()`'s call
+chain.
+Roughly 1,200 lines total, not the whole 4,417-line file and not an
+unbounded dependency tangle — a normal-sized extraction, comparable to
+`board_layouts::dispatch` earlier this session.
+
+This is now precise enough to execute as a single focused pass: create the
+crate, move the ~1,200 lines and the two sibling modules, decide `clog!`
+vs. a logging parameter (recommend: define an equivalent macro in the new
+crate rather than a callback — matches how `voice-kit` and other shared
+kits in this monorepo already use their own `clog!`-equivalent rather than
+threading a logger parameter through every function), then re-export from
+`voice.rs` the way `bo-controller`'s `passby_canceller`/`masker` did.
+
+One more coupling, from `listen_with_audio` specifically — part of 1b (the
+popup surface), not the four core functions above, so it does not block
+1a. It reaches into `crate::log_summary::VOICE_ACTIVE`, a deferral flag
+telling a log-summary worker to back off while voice has the CPU. A shared
+popup crate needs an answer for this too: a callback, or leaving that one
+flag as a voiceterm-side effect set around the call rather than inside it.
 
 ---
 
