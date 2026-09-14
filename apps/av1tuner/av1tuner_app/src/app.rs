@@ -1629,7 +1629,10 @@ impl App {
         let mut delete_requested = false;
         ui.horizontal(|ui| {
             ui.label("Group name:");
-            ui.add(egui::TextEdit::singleline(&mut self.groups[idx].name).id_salt(("app-group-name", idx)));
+            // id read out first: `&mut self.groups[idx].name` and
+            // `self.groups[idx].id` in one expression is a double borrow.
+            let gid = self.groups[idx].id;
+            ui.add(egui::TextEdit::singleline(&mut self.groups[idx].name).id_salt(("app-group-name", gid)));
             if self.groups.len() > 1 
                 && ui.button("🗑 Delete tab").clicked() 
             {
@@ -1752,7 +1755,8 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Output template:");
             let hint = self.global_template.clone();
-            let resp = ui.add(egui::TextEdit::singleline(&mut self.groups[idx].output_template).id_salt(("app-group-output", idx)));
+            let gid = self.groups[idx].id;
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.groups[idx].output_template).id_salt(("app-group-output", gid)));
             resp.on_hover_text(format!(
                 "Tokens: {{groupname}} {{sourcename}} {{codec}} {{crf}} \
                  {{date}} {{time}} {{localdir}} {{savings}}. \

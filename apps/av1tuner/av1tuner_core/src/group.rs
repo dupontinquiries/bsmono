@@ -110,6 +110,27 @@ impl Default for UpscaleConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MergeGroup {
+    /// Stable identity, for anything that must survive the group MOVING.
+    ///
+    /// Groups live in a `Vec` and `remove_group` uses `Vec::remove`, so
+    /// deleting one shifts every later group's index down by one. Anything
+    /// keyed by that index therefore addresses a DIFFERENT group after a
+    /// delete while keeping the old one's state — which is what the name
+    /// field's `id_salt(("app-group-name", idx))` was doing: egui retains
+    /// per-widget text state (cursor, selection, undo) under that id, so
+    /// after deleting a tab the next tab's name field inherited the deleted
+    /// tab's editing state.
+    ///
+    /// `#[serde(default)]` is already on this struct, so were a project ever
+    /// saved and reloaded, one written before this field existed would
+    /// deserialise to `id: 0` rather than failing. Nothing deserialises
+    /// `MergeGroup` today — the Serialize/Deserialize derives have no
+    /// consumer — so there is no repair pass here. If persistence lands,
+    /// it needs one: every legacy group arriving as `0` would SHARE an id,
+    /// which is worse than the index this replaced, because indices are at
+    /// least distinct.
+    #[serde(default)]
+    pub id: u64,
     /// Display name + default {groupname} token value.
     pub name: String,
     /// Ordered source clips (merge order = this order).
@@ -124,9 +145,22 @@ pub struct MergeGroup {
     pub upscale: UpscaleConfig,
 }
 
+/// Hand out a process-unique group id.
+///
+/// A counter rather than a UUID: these only have to be distinct WITHIN one
+/// process's `groups` vector, which is what the widget ids are scoped to.
+/// Starts at 1 so `0` stays available as "loaded from a project that predates
+/// this field" — see the note on `MergeGroup::id`.
+pub fn next_group_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl Default for MergeGroup {
     fn default() -> Self {
         Self {
+            id: next_group_id(),
             name: "Group 1".to_string(),
             clips: Vec::new(),
             settings_override: None,
