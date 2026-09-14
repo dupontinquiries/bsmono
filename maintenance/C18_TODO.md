@@ -622,3 +622,57 @@ Next step is a `cardinal.toml` (or a `LayoutBuilder` call) that declares
 GTK build had. The operator has seen that row, so the GTK version of it
 existed at some point — worth finding in history before designing it fresh:
 `git log -S cardinal -- resources/layouts` is the place to start.
+
+---
+
+## 15. aperture soft wrap: why it is a layer, not a flag
+
+Asked for alongside two palette fixes (both landed in 10ccbddb5). This one is
+scoped rather than started, because it is a change to how the editor
+addresses rows and half of it is worse than none of it.
+
+### What assumes one buffer line is one screen row
+
+Every one of these, in `view.rs` unless noted:
+
+| site | assumption |
+|---|---|
+| `caret.line as f32 * m.line_h` (425, 443, 460, 470) | caret Y is the buffer line number |
+| `scroll / m.line_h` (510) | the first visible row is a buffer line index |
+| `grid.row_y(line)` (496, 515, 716) | `PageGrid` is indexed by buffer line |
+| `click_grid.line_at(p.y)` (402, 411) | a click Y maps to one buffer line |
+| `camera::typewriter_target`, `Follow::lines` | both take a caret Y derived the same way |
+| `page.rs::line_at` / `row_y` | documented as exact inverses of each other |
+
+`page.rs` is the awkward one: its whole contract is that `line_at` inverts
+`row_y`, which is what makes the caret land where the click did. Wrapping
+breaks the bijection — one buffer line becomes N rows, and `line_at` can no
+longer return a single line.
+
+### The shape it wants
+
+A visual-row layer between the buffer and the grid: `(buffer_line, wrap_ix)`
+as the addressing unit, with buffer<->visual maps rebuilt when the width or
+the text changes. Then `PageGrid` indexes VISUAL rows and its inverse becomes
+`visual_at(y) -> (line, wrap_ix)`, and every site above goes through the map
+rather than multiplying.
+
+The right first step is the map itself, pure and tested, in `aperture-core`
+next to `page.rs`: given a line's text, a font metric and a width, produce
+the wrap points. That is testable without a frame, it is where the
+off-by-one bugs live (a wrap point at a space that is then trimmed; a line
+whose last word exactly fills the width; a tab), and it can land and be
+proven before anything in `view.rs` moves.
+
+### Why not a partial version
+
+Rendering wrapped text without moving the caret math puts the caret in the
+wrong place on every wrapped line — the least acceptable regression an editor
+has, and one that is not obvious in a screenshot. The order has to be map
+first, then addressing, then painting, and the painting is the easy part.
+
+`egui`'s own `Galley` already wraps and reports row/column, so the layout
+work is largely "ask epaint and cache it" rather than implementing a line
+breaker — worth checking before writing one, since `view.rs` currently calls
+`layout_no_wrap` and switching to `layout` returns exactly the rows this
+layer needs.
