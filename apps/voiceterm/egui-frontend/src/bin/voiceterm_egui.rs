@@ -679,9 +679,9 @@ struct VoicetermApp {
     /// now") every frame instead of counting discrete press EVENTS, which
     /// sidesteps the repeat storm regardless of how many repeat events
     /// the backend sends for one physical hold.
-    ctrl_p_gesture: voiceterm_egui::ctrl_p_gesture::GestureTracker,
+    ctrl_p_gesture: uikit_egui::ctrl_p_gesture::GestureTracker,
     /// State for the voice popup Ctrl+P-held opens (Surface::Voice).
-    voice_popup: voiceterm_egui::voice_popup::VoicePopup,
+    voice_popup: uikit_egui::voice_popup::VoicePopup,
     /// Promotion thresholds for the acoustic cache — the runtime knobs the
     /// original exposes, here on the Docs tab beside the corpus tape that
     /// feeds it.
@@ -3226,12 +3226,12 @@ impl eframe::App for VoicetermApp {
             (i.modifiers.command && i.key_down(egui::Key::P), i.stable_dt)
         });
         match self.ctrl_p_gesture.poll(ctrl_p_down, std::time::Duration::from_secs_f32(dt)) {
-            voiceterm_egui::ctrl_p_gesture::Gesture::Tap => {
+            uikit_egui::ctrl_p_gesture::Gesture::Tap => {
                 self.surfaces.toggle(Surface::Palette);
                 self.palette_query.clear();
                 self.palette_sel = 0;
             }
-            voiceterm_egui::ctrl_p_gesture::Gesture::HoldStarted => {
+            uikit_egui::ctrl_p_gesture::Gesture::HoldStarted => {
                 if self.voice_popup.start(self.password_mode) {
                     self.surfaces.open(Surface::Voice);
                 }
@@ -3240,14 +3240,14 @@ impl eframe::App for VoicetermApp {
                 // this layer (see voice_popup.rs's own doc); a toast or
                 // other visible refusal is a real gap, not solved here.
             }
-            voiceterm_egui::ctrl_p_gesture::Gesture::HoldReleased => {
+            uikit_egui::ctrl_p_gesture::Gesture::HoldReleased => {
                 // Releasing the held key ends the utterance, the same
                 // shape a push-to-talk key has — `finish()` keeps the
                 // audio and proceeds to transcription rather than
                 // dropping it the way `cancel()` would.
                 self.voice_popup.finish();
             }
-            voiceterm_egui::ctrl_p_gesture::Gesture::None => {}
+            uikit_egui::ctrl_p_gesture::Gesture::None => {}
         }
         let open_t = overlay::openness(ctx, Surface::Palette, self.surfaces.is(Surface::Palette));
         if open_t > 0.0 {

@@ -23,6 +23,7 @@ license = "MIT OR Apache-2.0"
 # panels, scene-kit and logscope all read ONE sun curve — see that module.
 math-kit = { path = "../../../math-kit" }
 qrcodegen = { version = "1.8", optional = true }
+voice-engine-kit = { path = "../../../voice-engine-kit", optional = true, features = ["voice"] }
 touchkit = { path = "../../../touchkit", features = ["egui"] }
 # `glow` alone leaves winit with NO Linux backend compiled, so the `demo`
 # feature failed to build anywhere on Linux with "The platform you're compiling
@@ -49,6 +50,17 @@ demo = ["dep:eframe"]
 # identicon in `qr` is dependency-free and most apps only need that; an app that shares
 # data (voiceterm's zettelkasten) turns this on.
 qrbig = ["dep:qrcodegen"]
+# The voice popup (voice_popup.rs) and its Ctrl+P-style tap/hold trigger
+# (ctrl_p_gesture.rs, unconditional -- see below). Off by default: pulls in
+# voice-engine-kit's whisper-rs/cpal, a real dependency cost most apps
+# using this kit have no use for. An app that wants voice (voiceterm-egui,
+# first) turns this on. `features = ["voice"]` is forwarded unconditionally
+# rather than left for the consumer to also enable -- the popup calling
+# voice-engine-kit's capture/transcribe functions with that feature OFF
+# would just silently do nothing (they compile to no-ops), which is a
+# worse failure mode than one crate forwarding the feature it actually
+# needs to function.
+voice-popup = ["dep:voice-engine-kit"]
 
 [[example]]
 name = "logscope_touch"

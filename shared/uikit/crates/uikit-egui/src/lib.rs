@@ -135,6 +135,20 @@ pub mod toast;
 pub mod split_pane;
 pub mod toggle_grid;
 pub mod theme_bridge;
+/// Tap-vs-hold classification for a key binding that means two different
+/// things depending on press duration (Ctrl+P toggling a palette on tap,
+/// opening voice on hold, is the first real consumer). Pure, zero-cost,
+/// unconditional -- unlike voice_popup below, nothing here pulls in a
+/// heavy dependency, so there is no reason to gate it behind a feature.
+pub mod ctrl_p_gesture;
+/// The voice popup: tap-to-listen, cancel/finish, drawn state. Gated
+/// behind the `voice-popup` feature since it depends on
+/// voice-engine-kit's whisper-rs/cpal -- a real cost most apps using this
+/// kit have no use for. First moved here from voiceterm-egui
+/// (`maintenance/C18_TODO.md` -- the Ctrl+P wiring work), where it lived
+/// as a local, non-reusable module before this extraction.
+#[cfg(feature = "voice-popup")]
+pub mod voice_popup;
 pub mod tokens;
 /// Who owns a keystroke: a focused text field, or an app shortcut.
 pub mod typing_guard;

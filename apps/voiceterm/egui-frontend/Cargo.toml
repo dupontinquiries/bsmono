@@ -51,7 +51,10 @@ iio-source = { path = "../../../shared/iio-source" }
 # -- added here because it was designed and written without a compile
 # available at the time (explicit constraint that turn), and this is the
 # first real `cargo check`/`cargo test` run against those files since.
-voice-engine-kit = { path = "../../../shared/voice-engine-kit", features = ["voice"] }
+# voice-engine-kit no longer a direct dependency -- reached only through
+# uikit-egui's voice_popup module (feature "voice-popup" below), which is
+# where ctrl_p_gesture.rs/voice_popup.rs moved to. Confirmed nothing else
+# in this crate calls voice_engine_kit:: directly before removing this.
 # Pulled in by the voice-intent chain (`security`, `token_stats`).
 libc = "0.2"
 aho-corasick = "1"
@@ -72,7 +75,7 @@ peer-handshake = { path = "../../../shared/peer-handshake" }
 # exactly what happened when the model was lifted.
 pane-kit = { path = "../../../shared/pane-kit" }
 egui = "0.34"
-uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui", features = ["qrbig"] }
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui", features = ["qrbig", "voice-popup"] }
 # The Bluetooth transfer half of the acoustic handshake: HandshakePayload
 # now carries bt_addr once trusted, and this is what actually moves bytes
 # once it does. "rfcomm" pulls bluer + tokio — isolated to a single spawned

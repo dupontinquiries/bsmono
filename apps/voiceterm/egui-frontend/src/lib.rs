@@ -314,8 +314,10 @@ pub mod action_compass;
 pub mod shell;
 pub mod surface;   // which transient surface is up — the QML's modality, as state (C10-0a)
 pub mod overlay;   // how each surface draws — the QML's modal forms (drawer/sheet/popup)
-pub mod ctrl_p_gesture;  // tap-vs-hold classification for the Ctrl+P dual-mode trigger
-pub mod voice_popup;     // the voice dialog, drawn inside Surface::Voice
+// ctrl_p_gesture and voice_popup moved to shared/uikit/crates/uikit-egui
+// (voice-popup feature) -- generic, zero voiceterm-specific dependencies,
+// so every egui app gets the same API instead of a per-app copy. Used
+// here as uikit_egui::ctrl_p_gesture / uikit_egui::voice_popup.
 pub mod pane_host; // what follows a pane: the session bundle + the focus swap (C11-6a)
 pub mod gesture_menus;
 
