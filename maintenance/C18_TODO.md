@@ -1250,3 +1250,105 @@ now-exhaustively-scoped extraction rather than an open-ended one.
 **This is the actual final number.** Every function in the list above has
 had its full body read at least once in this session, not sampled or
 grepped in isolation. The next step is the mechanical move itself.
+
+---
+
+## 20. Fairphone 5 hardware reality, sourced, against the wake/background-listen and call-audio designs
+
+Three real, external sources — postmarketOS pmaports issue #4337 (call audio
+routing, still open), issue #3794 (mic support, closed/fixed), and
+Fairphone's own published FAQ answer on wake-word limitations — checked
+against the actual code this session has been reading and extracting all
+along. Not design opinions; hardware facts with citations, worth recording
+precisely rather than folding into a vaguer "voice might not work great on
+phones" caveat.
+
+### 1. Always-on wake listening cannot work while the screen is off on FP5. This is a hardware fact, not a tuning problem.
+
+Fairphone's own FAQ, cited directly: FP5 wires an **Analog Microphone
+(AMIC)**, not a low-power **Digital Microphone (DMIC)**. A DMIC can run a
+wake-word check on a tiny dedicated low-power block while the SoC sleeps;
+an AMIC requires the WCD9835 codec (talking to the QCM6490 over SoundWire)
+to stay fully powered and actively digitizing, which is real, continuous
+main-SoC power draw — not something firmware or a Linux driver can work
+around, because the limitation is which wire is soldered to which chip. "No
+Linux drivers can paper over this" is Fairphone's own conclusion, and it
+matches what the pmaports issues independently show: two years of driver
+work (#3794, closed) got ONE mic path working for calls and regular
+capture, with no mention anywhere of a low-power wake path, because there
+is no low-power path on this SoC's mic wiring to enable.
+
+**Against the actual code:** `voice.rs::start_background_listener` polls
+the mic on a background thread indefinitely — sleep, sample, repeat,
+capped only by a per-session count and an hourly pause, with no reference
+to screen or suspend state anywhere in the function. `set_app_backgrounded`
+(main.rs) is the one place screen-state reaches the voice engine at all,
+and its own comment states the assumption plainly: backgrounding "slows the
+wake-listener's poll cadence 4x" — a cost optimization, not a correctness
+one. That assumption is wrong for what this hardware can actually do.
+Slowing the poll rate 4x while the screen is off does not fix anything if
+the mic path itself cannot produce useful audio without the codec fully
+awake, and keeping the codec fully awake for however-many-seconds between
+polls is a real, continuous battery cost every one of those polls pays —
+this is very likely why real-world reports (not sourced here, but
+consistent with the FAQ's own stated trade-off) describe background voice
+listening draining an FP5 battery fast if left enabled.
+
+**What this means for the extraction / porting plan:** `voice-engine-kit`'s
+capture core (§19) should not assume a caller can leave capture running
+indefinitely in the background on a phone target and expect either
+low battery cost or reliable audio. If a consuming app (rusty-board,
+dialer, any future egui port) wants a wake-word feature, the honest design
+on FP5 specifically is: wake listening is a FOREGROUND-ONLY feature (screen
+on, app visible), full stop — not a background feature that degrades
+gracefully, because there is no degraded-but-working middle state the
+hardware offers. This wants a real API decision in whichever app first
+tries to port wake-word behavior: either don't offer background wake at
+all on this device, or offer it with a loud, honest battery-cost warning
+in Settings rather than silently running the existing 4x-slower poll loop
+and letting the user discover the drain themselves.
+
+### 2. Call audio routing is unfinished on FP5, in a way that blocks `dialer` specifically
+
+Issue #4337 (open, "5 of 14 checklist items completed" as of the pasted
+snapshot) documents, first-hand from people running it: speaker-vs-earpiece
+switching frequently does nothing ("Speaker button does nothing" — unknown
+whether the bug is in alsa-ucm, the call daemon, wireplumber, or the calling
+app itself), mute may not actually reach the call audio path because
+`dummystreamhack`/`q6voiced` route audio before mute takes effect, and
+earpiece-only output does not work at all yet (it plays through both
+speakers at speakerphone volume regardless of the UI's "earpiece" selection).
+Bluetooth and USB-C call audio routing are unimplemented. This is upstream
+postmarketOS/kernel/UCM state, not anything in this monorepo, and not
+fixable at the `voiceterm`/`voice-engine-kit` layer.
+
+**Against the porting plan from earlier this session:** `dialer` was ranked
+as the top candidate for a voice-workflow port ("voice commands during
+calls, obvious use"). On real FP5 hardware today, per this issue, call
+audio itself is not reliably routable — so a voice popup that tries to
+listen DURING an active call is building on ground that is not solid yet:
+even if the popup's own capture and transcription work perfectly, whether
+the far end can hear anything, or whether the mic is actually carrying
+call audio versus silence, is presently unresolved upstream. Not a reason
+to skip `dialer` — voice commands BETWEEN calls (dialing by voice, reading
+back a number) do not depend on in-call audio routing at all and are
+unaffected — but a voice feature that specifically operates DURING a live
+call on this device should be flagged to whoever tests it as depending on
+external, actively-in-progress driver work, not treated as a `dialer`-side
+bug if it does not work.
+
+### 3. Only Mic1 of the physical array is enabled (issue #3794's closing comment)
+
+Bhushan Shah's closing comment on #3794: "For now not all mics are enabled,
+only Mic1 is enabled." `audio_profile.rs`'s noise-floor calibration and any
+beamforming/multi-mic assumption elsewhere in the pipeline should not
+assume a stereo or multi-element capture path on this device — `cpal`'s
+device enumeration will report whatever ALSA/UCM exposes, and on FP5 today
+that is a single functional capture channel dressed up as "Bottom
+Microphone." Worth checking (not done here) whether anything in
+`audio_profile`/`acoustic_index` implicitly assumes more than one
+real input channel is available; if the pipeline already treats mono
+capture as the default case (it does — `RingBuf::drain_into_mono` averages
+down from whatever channel count cpal reports), this is likely a non-issue
+in practice, but it is the kind of assumption worth re-checking once real
+device testing is possible, not asserting closed from source-reading alone.
