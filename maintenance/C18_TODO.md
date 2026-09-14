@@ -1168,3 +1168,85 @@ repoint should also fix the checker's docstring to point at wherever the
 real record ends up (this section, or a properly filed C12-2a if the
 original intent can be reconstructed) — a docstring that cites a phantom
 record should not survive past whoever notices it.
+
+---
+
+## 19. Section 13's 1a closure, finished: exhaustive dependency scan, ready to build
+
+Continuation of section 13, executing rather than scoping. Before writing
+any code, did one exhaustive, single-pass scan of every function already
+confirmed in scope for 1a (the model-loading + capture core), rather than
+keep discovering dependencies one at a time across separate reads — that
+piecemeal approach had already found four unaccounted-for couplings
+(`FORCE_TINY_TIER`/`FAST_FINALIZE`, then `audio_profile`/`acoustic_index`/
+`speakers`, then in this pass `corpus_recorder` and `log_summary`) and was
+not converging.
+
+**The complete list, verified by reading every target function's full body
+in one pass:** `clog`, `voice_lang`, `whisper_pool`, `corpus_recorder`,
+`acoustic_index`, `audio_profile`, `speakers`, `log_summary`. Eight total,
+not the three from the first pass or the seven from the second.
+
+**One more real finding in this pass:** `ensure_capture_running`'s cpal
+audio callback — the function `begin_capture` depends on to have any audio
+at all — calls `crate::corpus_recorder::push_samples()` unconditionally on
+every audio frame, for opt-in corpus recording. Checked `corpus_recorder`
+(998 lines): zero `use crate::`, genuinely self-contained like
+`voice_lang`/`whisper_pool`, AND gated on a single atomic-bool check
+(`if !ACTIVE.load(...) { return; }`) so it is cheap when unused — but it is
+still a real call from inside the hot capture path, not a static read.
+
+**Resolution, same shape as the acoustic-index decision:** `corpus_recorder`
+is opt-in instrumentation, not something the shared capture callback needs
+to function. It stays a voiceterm-side hook: voiceterm's own wrapper around
+the shared crate's capture callback adds the `push_samples` call, the
+shared crate's callback does not call it itself. Same treatment for
+`log_summary::VOICE_ACTIVE` (one `pub static AtomicBool`, set around the
+`listen_with_audio` call rather than inside it).
+
+**Final 1a scope, confirmed and closed:**
+
+- Move: `ModelTier`+3 helpers, `ensure_models_loaded`, `load_tier`,
+  `ensure_whisper_loaded`, `ensure_capture_running` (cpal device selection
+  and stream setup — real, ~270 lines, hardened against flaky Linux audio
+  stacks, ported VERBATIM given how battle-tested the retry logic is),
+  `begin_capture`, `cancel_recording`, `finish_recording`, `RingBuf` +
+  `BgRingBuf` (background buffer is used by `ensure_capture_running`'s
+  stream callback for background fingerprint enrichment — kept since it
+  is written to unconditionally by the same callback that has to move
+  anyway, even though nothing in 1a's own functions ever reads it back
+  out; a stray unread buffer is acceptable, a capture callback that
+  silently stops maintaining a structure voiceterm still expects to read
+  later is not), `listen`, `listen_with_audio` (with its `corpus_recorder`
+  call REMOVED, added back by voiceterm's wrapper), `record_and_
+  transcribe_inner` (acoustic-index/speaker section removed, same as
+  section 13/18's finding), `transcribe_with_dual_model`, `run_one`.
+- Move: `TINY_CTX`/`BASE_CTX`/`LARGE_CTX`/`TINY_STATE`/`BASE_STATE`/
+  `LARGE_STATE`, `FORCE_TINY_TIER`, `FAST_FINALIZE`, `CANCEL_FLAG`,
+  `FINISH_FLAG`, `RING_BUFFER`, `BG_RING_BUFFER`.
+- Move: `voice_lang.rs`, `whisper_pool.rs`, `corpus_recorder.rs` (all
+  three confirmed self-contained) as sibling modules of the new crate.
+  `corpus_recorder` moves WITH the crate even though its call site is
+  removed from the shared callback, because voiceterm's wrapper needs to
+  call it from somewhere and there is no reason to leave a
+  self-contained, already-extracted module behind only to re-duplicate
+  it.
+- Stays in voiceterm: `acoustic_index`, `audio_profile`, `speakers`,
+  `log_summary`, and voiceterm's own wrapper functions that call the
+  shared crate's capture/transcribe entry points and layer the optional
+  enhancements (Tier1 fast path, corpus recording, VOICE_ACTIVE) on top.
+- `clog!`: define an equivalent `$crate::log::emit`-shaped macro in the
+  new crate.
+
+Rough size: the functions above are ~900 lines by themselves
+(`ensure_capture_running` alone is ~270), plus `voice_lang`+`whisper_pool`+
+`corpus_recorder` at 173+360+998 = 1,531 lines of sibling modules. Real
+total is closer to **2,400-2,500 lines**, not the ~1,200 estimated when
+`corpus_recorder` was still unknown — corrected here rather than carried
+forward wrong a third time. Still far short of the ~4,969-line dead end
+from including acoustic-index/phonetic/speakers, and still a normal-sized,
+now-exhaustively-scoped extraction rather than an open-ended one.
+
+**This is the actual final number.** Every function in the list above has
+had its full body read at least once in this session, not sampled or
+grepped in isolation. The next step is the mechanical move itself.
