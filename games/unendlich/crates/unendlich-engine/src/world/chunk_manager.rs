@@ -921,6 +921,19 @@ impl ChunkManager {
         self.apply_budget = n;
     }
 
+    /// Live sky-cull-margin override (settings Performance tab, chunk-cull
+    /// aggression). Was startup-only (env `UNENDLICH_SKY_CULL`, read once at
+    /// construction); this lets the aggression mode switch it live like the
+    /// other culling knobs it's grouped with. Takes effect for chunks
+    /// requested from here on -- already-loaded chunks aren't retroactively
+    /// evicted, matching how `set_apply_budget` and the shadow-stride/cache
+    /// live setters behave (a live knob changes future decisions, not past
+    /// ones). `None` or `Some(0)` = off (load the full RD ball); `Some(m)`
+    /// for `m >= 1` skips chunks entirely-empty-sky by more than `m` chunks.
+    pub fn set_sky_cull_margin(&mut self, margin: Option<i32>) {
+        self.sky_cull_margin = margin.filter(|&m| m > 0);
+    }
+
     pub fn set_world_root(&mut self, world_root: PathBuf) {
         log::info!("Persistent storage re-rooted at {}", world_root.display());
         if let Err(e) = std::fs::create_dir_all(&world_root) {

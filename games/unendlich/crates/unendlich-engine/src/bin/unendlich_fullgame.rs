@@ -8129,6 +8129,33 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             // shadow_cache isn't one of frame_pacer's knobs, so no conflict.
             renderer.set_shadow_cache(renderer.ui_shadow_cache);
+            // r-cull-aggression: apply the selected mode's three underlying
+            // settings. None of frame_pacer/adaptive_rd touch these, so
+            // (unlike shadow_chunk_stride above) there's no fight to gate
+            // against.
+            {
+                let cull = unendlich_engine::runtime_config::ChunkCullAggression::from_index(
+                    renderer.ui_cull_aggression,
+                ).settings();
+                chunk_manager.set_sky_cull_margin(cull.sky_cull_margin);
+                unendlich_engine::debug_settings::DEBUG
+                    .simd_precull
+                    .store(cull.simd_precull, std::sync::atomic::Ordering::Relaxed);
+                let was_on = unendlich_engine::debug_settings::DEBUG
+                    .occlusion_cull
+                    .swap(cull.occlusion_cull, std::sync::atomic::Ordering::Relaxed);
+                // r736's own occlusion_cull doc: "clears the flags when
+                // disabled so nothing stays hidden." Toggling it off via
+                // this slider needs the same courtesy the original
+                // (env-var, startup-only) call site never had to worry
+                // about, since that one never changed live. `renderer`
+                // owns the actual occlusion flags (chunk_indirect's
+                // per-slot bits, set by `apply_occlusion`), so clear them
+                // there when we transition on -> off.
+                if was_on && !cull.occlusion_cull {
+                    renderer.clear_chunk_occlusion();
+                }
+            }
             // r197: live render distance — the slider drives the override
             // atomic that runtime_render_distance() consults first. r476: the
             // adaptive controller caps it BELOW the chosen value under load.

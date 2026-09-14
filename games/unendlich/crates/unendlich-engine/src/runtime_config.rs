@@ -270,6 +270,147 @@ fn parse_csv<const N: usize>(key: &str) -> Option<[u32; N]> {
     }
 }
 
+// =============================================================================
+// Chunk-cull aggression (r-cull-aggression)
+// =============================================================================
+//
+// Three independent, already-implemented, mostly-off-by-default cheap-reject
+// mechanisms exist scattered across the engine, each with its own env var and
+// no shared UI:
+//   - `UNENDLICH_SKY_CULL` (world::chunk_manager): skip requesting chunks
+//     that are provably entirely empty sky above the terrain (~57% of loaded
+//     chunks in the run that motivated it). Opt-in because it will NOT load
+//     far-above-terrain player builds (their chunks are simply never
+//     requested) -- a real correctness tradeoff, not just a perf one.
+//   - `UNENDLICH_SIMD_PRECULL` (world::simd_cull): SIMD sphere-vs-frustum
+//     broad-phase pre-cull. EXACT, not approximate -- a chunk this rejects
+//     really is outside the frustum. No correctness tradeoff; free to enable.
+//   - `UNENDLICH_OCCLUSION_CULL` (world::occlusion_flood, DEBUG.occlusion_cull):
+//     CPU flood-fill visibility from the camera's chunk, hiding buried
+//     resident chunks the cull shader would otherwise still draw. Its own
+//     doc comment: "failure mode is vanishing terrain" -- genuinely
+//     experimental, the one tier here with a real (if rare) visible-artifact
+//     risk.
+//
+// `ChunkCullAggression` is a single named-mode dial over these three,
+// ordered so each step up trades a little more of that risk for a little
+// more saved work -- rather than exposing three separate raw toggles whose
+// interactions/tradeoffs a settings-menu reader would have to reconstruct
+// themselves. Live-adjustable: none of the three underlying mechanisms need
+// a restart (sky_cull_margin now has a live setter -- see
+// `ChunkManager::set_sky_cull_margin` -- to match; simd_precull/occlusion_cull
+// were already plain `AtomicBool`s).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkCullAggression {
+    /// Everything off. Loads/draws exactly the RD ball, no broad-phase or
+    /// occlusion shortcuts. Slowest, zero risk of hiding anything that
+    /// should be visible.
+    Off,
+    /// Exact-only culling: SIMD frustum pre-cull. Free -- no visible-result
+    /// tradeoff, just less wasted work reaching the GPU cull shader. Good
+    /// default for anyone who doesn't want to think about this setting.
+    Light,
+    /// Light + sky-cull with a generous margin. Skips far-above-terrain
+    /// empty sky; the margin is wide enough that it's very unlikely to eat a
+    /// legitimate player build, but "very unlikely" isn't "never" -- a tall
+    /// sky base near the margin could have its upper chunks not requested.
+    Balanced,
+    /// Balanced + a tighter sky-cull margin + occlusion flood-cull. Most
+    /// aggressive: fastest, but carries occlusion_cull's own documented
+    /// "vanishing terrain" risk and the tighter margin raises (still low)
+    /// odds of clipping a tall build. Recommended only once Off/Light/
+    /// Balanced have been tried and more headroom is still needed.
+    Aggressive,
+}
+
+/// One step in `ChunkCullAggression`'s settings, in the same order as the
+/// enum so the settings UI can index into `ALL` by `u8` (mirrors
+/// `PerfPreset::SELECTABLE`'s pattern).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CullAggressionSettings {
+    /// `None` = sky-cull off. `Some(m)` = skip chunks more than `m` chunks
+    /// of empty sky above the estimated surface. Feeds
+    /// `ChunkManager::set_sky_cull_margin`.
+    pub sky_cull_margin: Option<i32>,
+    /// Feeds `debug_settings::DEBUG.simd_precull`.
+    pub simd_precull: bool,
+    /// Feeds `debug_settings::DEBUG.occlusion_cull`. The one flag with a
+    /// documented visible-artifact risk -- see the module doc above.
+    pub occlusion_cull: bool,
+}
+
+impl ChunkCullAggression {
+    pub const ALL: [ChunkCullAggression; 4] = [
+        ChunkCullAggression::Off,
+        ChunkCullAggression::Light,
+        ChunkCullAggression::Balanced,
+        ChunkCullAggression::Aggressive,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ChunkCullAggression::Off => "Off",
+            ChunkCullAggression::Light => "Light",
+            ChunkCullAggression::Balanced => "Balanced",
+            ChunkCullAggression::Aggressive => "Aggressive",
+        }
+    }
+
+    /// Short explanation for a settings-page tooltip/weak-label -- names the
+    /// mechanisms this tier turns on and, for the tiers that have one, the
+    /// tradeoff.
+    pub fn description(self) -> &'static str {
+        match self {
+            ChunkCullAggression::Off =>
+                "no shortcuts -- loads/draws the full render-distance ball",
+            ChunkCullAggression::Light =>
+                "SIMD frustum pre-cull only -- exact, no visible tradeoff",
+            ChunkCullAggression::Balanced =>
+                "+ sky-cull (generous margin) -- may skip a very tall build's upper chunks",
+            ChunkCullAggression::Aggressive =>
+                "+ tighter sky-cull + occlusion flood-cull -- fastest, small chance of a visible pop-in/vanish",
+        }
+    }
+
+    pub fn settings(self) -> CullAggressionSettings {
+        match self {
+            ChunkCullAggression::Off => CullAggressionSettings {
+                sky_cull_margin: None,
+                simd_precull: false,
+                occlusion_cull: false,
+            },
+            ChunkCullAggression::Light => CullAggressionSettings {
+                sky_cull_margin: None,
+                simd_precull: true,
+                occlusion_cull: false,
+            },
+            ChunkCullAggression::Balanced => CullAggressionSettings {
+                sky_cull_margin: Some(8),
+                simd_precull: true,
+                occlusion_cull: false,
+            },
+            ChunkCullAggression::Aggressive => CullAggressionSettings {
+                sky_cull_margin: Some(3),
+                simd_precull: true,
+                occlusion_cull: true,
+            },
+        }
+    }
+
+    /// Index into `ALL` (and matching UI button row). `Off` = 0.
+    pub fn index(self) -> u8 {
+        ChunkCullAggression::ALL.iter().position(|&m| m == self).unwrap_or(0) as u8
+    }
+
+    /// Inverse of `index`; out-of-range clamps to `Off` rather than
+    /// panicking, since this is fed by a UI value that could in principle
+    /// be stale/corrupt (e.g. a settings.json from a future version with
+    /// more tiers).
+    pub fn from_index(i: u8) -> ChunkCullAggression {
+        ChunkCullAggression::ALL.get(i as usize).copied().unwrap_or(ChunkCullAggression::Off)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +500,46 @@ mod tests {
         for p in PerfPreset::SELECTABLE {
             assert_eq!(RuntimeConfig::preset(p).matching_preset(), p);
         }
+    }
+
+    #[test]
+    fn cull_aggression_index_roundtrips() {
+        for m in ChunkCullAggression::ALL {
+            assert_eq!(ChunkCullAggression::from_index(m.index()), m);
+        }
+    }
+
+    #[test]
+    fn cull_aggression_from_index_out_of_range_is_off_not_panic() {
+        assert_eq!(ChunkCullAggression::from_index(255), ChunkCullAggression::Off);
+    }
+
+    #[test]
+    fn cull_aggression_escalates_monotonically() {
+        // Each step up should turn on at least as much as the step below --
+        // never LESS aggressive settings.settings() further along ALL.
+        let s: Vec<CullAggressionSettings> =
+            ChunkCullAggression::ALL.iter().map(|m| m.settings()).collect();
+        for w in s.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            // simd_precull and occlusion_cull should never turn OFF going up
+            // a tier once on.
+            assert!(!a.simd_precull || b.simd_precull, "simd_precull regressed");
+            assert!(!a.occlusion_cull || b.occlusion_cull, "occlusion_cull regressed");
+            // sky_cull_margin: None (off) is the least aggressive; once
+            // Some(m), a later tier's margin should be <= (tighter/equal),
+            // not wider (wider margin culls LESS).
+            if let (Some(am), Some(bm)) = (a.sky_cull_margin, b.sky_cull_margin) {
+                assert!(bm <= am, "sky_cull_margin got less aggressive going up a tier");
+            }
+        }
+    }
+
+    #[test]
+    fn cull_aggression_off_is_truly_off() {
+        let s = ChunkCullAggression::Off.settings();
+        assert_eq!(s.sky_cull_margin, None);
+        assert!(!s.simd_precull);
+        assert!(!s.occlusion_cull);
     }
 }

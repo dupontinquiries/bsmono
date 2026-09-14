@@ -781,6 +781,11 @@ pub struct WorldRenderer {
     /// `set_shadow_cache` each frame (skip the shadow pass entirely when
     /// sun + camera are both unchanged from last frame).
     pub ui_shadow_cache: bool,
+    /// Live chunk-cull-aggression mode index (see
+    /// `runtime_config::ChunkCullAggression`). The bin applies
+    /// `.settings()` for this index to `ChunkManager::set_sky_cull_margin`
+    /// and the `simd_precull`/`occlusion_cull` debug atomics each frame.
+    pub ui_cull_aggression: u8,
     /// r197: clicked saved-world index (consumed by bin), -1 = none
     pub menu_world_pick: i32,
     /// r197: saved-world names+meta for the LoadSlots screen list
@@ -1895,6 +1900,17 @@ impl WorldRenderer {
             ui_shadow_stride: shadow_chunk_stride.clamp(1, 8),
             ui_shadow_cache: std::env::var("UNENDLICH_SHADOW_CACHE")
                 .ok().map(|v| !(v == "0" || v.eq_ignore_ascii_case("false"))).unwrap_or(true),
+            // r-cull-aggression: defaults to Light (index 1) -- the
+            // zero-tradeoff tier (SIMD frustum pre-cull only) -- rather than
+            // trying to reverse-map whatever combination of the three
+            // underlying env vars (UNENDLICH_SIMD_PRECULL/SKY_CULL/
+            // OCCLUSION_CULL) happens to be set into one of the four named
+            // tiers, which isn't always well-defined (e.g. occlusion_cull=1
+            // with sky_cull=0 matches none of them exactly). Those env vars
+            // were rarely if ever actually used standalone in practice, so
+            // this is a disclosed simplification, not a behavior-preserving
+            // migration.
+            ui_cull_aggression: crate::runtime_config::ChunkCullAggression::Light.index(),
             menu_world_pick: -1,
             menu_world_list: Vec::new(),
             menu_mp_list: Vec::new(),
@@ -3734,6 +3750,7 @@ impl WorldRenderer {
             let mut ui_render_scale = self.ui_render_scale; // r325
             let mut ui_shadow_stride = self.ui_shadow_stride;
             let mut ui_shadow_cache = self.ui_shadow_cache;
+            let mut ui_cull_aggression = self.ui_cull_aggression;
             let mut ui_fps_target = self.ui_fps_target;
             let mut ui_autotune = self.ui_autotune;
             let mut ui_gpu_mesh_yield = self.ui_gpu_mesh_yield;
@@ -4388,6 +4405,19 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                     ui.weak("Esc cancels a pending rebind");
                                 }
                                 4 => {
+                                    // r-perf-scroll: this tab kept growing (render
+                                    // distance/scale, plant/leaf/apply strides,
+                                    // autotune, shadow stride/cache, now chunk-cull
+                                    // aggression) with no scroll area, unlike the
+                                    // keybinds tab (3) which has always had one --
+                                    // it started overflowing the panel. Same fix,
+                                    // same pattern: wrap the whole tab body.
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("perf_scroll")
+                                        .auto_shrink([false, false])
+                                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                                        .max_height(260.0)
+                                        .show(ui, |ui| {
 
                                     // r225: live performance levers on the
                                     // custom slider. These bind integer state
@@ -4498,6 +4528,23 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                     ui.label("skip shadow pass when sun + camera are both still");
                                     ui.separator();
 
+                                    // r-cull-aggression: named-mode dial over three
+                                    // independent cheap-reject mechanisms (SIMD frustum
+                                    // pre-cull, sky-cull, CPU occlusion flood-cull) --
+                                    // see runtime_config::ChunkCullAggression's module
+                                    // doc for what each tier actually turns on and why
+                                    // they're ordered the way they are.
+                                    ui.label("chunk cull aggression");
+                                    ui.horizontal(|ui| {
+                                        for m in crate::runtime_config::ChunkCullAggression::ALL {
+                                            if unendlich_ui::tab_button(ui, m.label(), ui_cull_aggression == m.index()).clicked() {
+                                                ui_cull_aggression = m.index();
+                                            }
+                                        }
+                                    });
+                                    ui.weak(crate::runtime_config::ChunkCullAggression::from_index(ui_cull_aggression).description());
+                                    ui.separator();
+
                                     if unendlich_ui::menu::toggle(ui, ui_autotune, accent).clicked() {
                                         ui_autotune = !ui_autotune;
                                     }
@@ -4538,6 +4585,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                     }
                                     ui.label("detached terrain");
                                     ui.weak("glide over not-yet-streamed ground instead of falling, settle when it spawns");
+                                        }); // end perf_scroll ScrollArea
                                 }
                                 5 => {
                                     // r437: DEBUG tab. Master gate (off by default) + per-system
@@ -5772,6 +5820,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             self.ui_render_scale = ui_render_scale; // r325
             self.ui_shadow_stride = ui_shadow_stride;
             self.ui_shadow_cache = ui_shadow_cache;
+            self.ui_cull_aggression = ui_cull_aggression;
             self.ui_fps_target = ui_fps_target;
             self.ui_autotune = ui_autotune;
             self.ui_gpu_mesh_yield = ui_gpu_mesh_yield;
