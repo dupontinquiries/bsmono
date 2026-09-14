@@ -2949,6 +2949,25 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // at the Update phase, read by the hive tick early in the next frame.
     let mut hive_last_frame_ms: f32 = 16.0;
     let mut frame_count = 0u64;
+    // r-breadcrumb-fix: `frame_count` above is ALSO the per-second FPS
+    // window counter -- it's reset to 0 every ~1s at the bottom of the
+    // "if last_log.elapsed() >= 1s" logging block (it's literally the
+    // number printed as "FPS:"). That's fine for FPS math, but ~90 other
+    // call sites in this file read `frame_count` as if it were a
+    // monotonic lifetime frame index (`% 600`, `% 1800`, `% 7200` pacing
+    // for weather/roamers/fire-spread/tutorial timers, RNG seeding,
+    // catch-up-tick deltas). Those almost never reach the larger moduli
+    // before getting zeroed, so they fire far less reliably than their
+    // authors intended -- confirmed independently via the breadcrumb log,
+    // where the `frame_count == 0` heartbeat check below fired 15 times
+    // in ~20 seconds (once per FPS-window reset) instead of once at
+    // actual startup, and the `% 600` "alive" heartbeat never fired at
+    // all. `lifetime_frame` is the genuine monotonic counter; only the
+    // breadcrumb heartbeat is repointed at it here -- the ~90 gameplay
+    // call sites are a separate, larger, needs-its-own-pass fix (each one
+    // needs checking for whether it actually wants "phase within the last
+    // second" or "true frame index," which isn't safe to assume in bulk).
+    let mut lifetime_frame: u64 = 0;
     // Reusable buffer for mesh_pool.drain_up_to_into — avoids per-frame Vec alloc.
     let mut drained_buf: Vec<unendlich_engine::render::meshing_pool::MeshResult> = Vec::new();
     // Reusable containers for occlusion flood — avoids per-frame HashSet/VecDeque alloc.
@@ -8046,7 +8065,22 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // Shadow amortization sliders -> the live setters (no GPU
             // resource recreation, safe every-15-frames like the levers
             // above). set_shadow_chunk_stride re-clamps to [1,8] itself.
-            renderer.set_shadow_chunk_stride(renderer.ui_shadow_stride);
+            //
+            // shadow_chunk_stride is ALSO driven by frame_pacer (200ms
+            // cadence, p90-reactive -- see its "Known interaction" comment
+            // above for the sibling case with adaptive_rd). Without a
+            // gate, this periodic apply would blindly stomp frame_pacer's
+            // adjustment back to the slider's fixed value every 15 frames,
+            // fighting a controller that's actively trying to recover from
+            // exactly the bad frame times that would trigger this codepath
+            // -- worse than the adaptive_rd/frame_pacer case above because
+            // this write isn't reactive or hysteresis-gated at all. Defer
+            // to frame_pacer whenever it's enabled; the slider still
+            // applies immediately when the pacer is off.
+            if !frame_pacer_enabled {
+                renderer.set_shadow_chunk_stride(renderer.ui_shadow_stride);
+            }
+            // shadow_cache isn't one of frame_pacer's knobs, so no conflict.
             renderer.set_shadow_cache(renderer.ui_shadow_cache);
             // r197: live render distance — the slider drives the override
             // atomic that runtime_render_distance() consults first. r476: the
@@ -14916,12 +14950,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         }
         match draw_result {
             Ok(true) => {
-                if frame_count == 0 {
+                if lifetime_frame == 0 {
                     unendlich_engine::breadcrumb::drop_crumb("gpu: first frame presented OK");
-                } else if frame_count % 600 == 0 {
+                } else if lifetime_frame % 600 == 0 {
                     // slow heartbeat (~every 10s @60fps) — a hang/power-off leaves this as the last line
-                    unendlich_engine::breadcrumb::drop_crumb(&format!("alive: frame {frame_count}"));
+                    unendlich_engine::breadcrumb::drop_crumb(&format!("alive: frame {lifetime_frame}"));
                 }
+                lifetime_frame += 1;
                 frame_count += 1;
             }
             Ok(false) => {
@@ -16817,6 +16852,25 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 meshing_in_flight.len(),
                 mesh_pool.pending_results(),
                 heat_sources.len(),
+            );
+            // Diagnostic for the 2026-09 "main pass balloons to 1-2s while
+            // stationary" repro (see log.log / log-no-indirect-draw.log):
+            // both those runs ruled out UNENDLICH_INDIRECT as the cause
+            // (same blowup with it on either way), and shadow cost wasn't
+            // the dominant term (main dwarfed it throughout). Left
+            // unexplained: main-pass time grew much faster than the
+            // "rendering" (visible chunk) count did. This line gives the
+            // next repro the number needed to tell "more draw slots than
+            // visible chunks" (a leak in indirect-slot freeing) apart from
+            // "same slot count, each one costing more" (driver-side, e.g.
+            // thermal throttling or per-chunk shader/descriptor cost
+            // actually rising) -- compare indirect_in_use against the
+            // "rendering" count above once both are in the log.
+            log::info!(
+                "  indirect: in_use={} high_water={} capacity={}",
+                renderer.indirect_in_use(),
+                renderer.indirect_high_water(),
+                renderer.indirect_capacity(),
             );
             // v0.24.18: push these same values into the thread probe's
             // engine_state pseudo-thread so the sampler's per-100ms

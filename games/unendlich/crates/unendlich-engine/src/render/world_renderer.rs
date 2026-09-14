@@ -1179,6 +1179,14 @@ impl WorldRenderer {
         self.shadow_chunk_stride = stride.clamp(1, 8);
     }
 
+    /// Current live shadow-caster stride (read-only). Exposed so the
+    /// settings UI can display frame_pacer's actual value when the pacer
+    /// owns this knob, instead of a slider position that may be stale
+    /// (see the frame_pacer gate in `unendlich_fullgame`'s apply loop).
+    pub fn shadow_chunk_stride(&self) -> u32 {
+        self.shadow_chunk_stride
+    }
+
     /// Live-adjust whole-pass shadow caching (see `shadow_cache` field doc).
     /// No GPU resources are recreated — this only gates the `skip_shadow`
     /// check in `draw_frame`, so it's safe to flip from a settings UI or a
@@ -4466,6 +4474,10 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                     // render so it doesn't visibly lag.
                                     ui.label("shadow stride (1 = every caster every frame; higher = cheaper, staler)");
                                     int_slider!("shadow stride", ui_shadow_stride, u32, 1, 8);
+                                    ui.weak(format!(
+                                        "live: {} (frame_pacer autotune overrides this slider when UNENDLICH_FRAME_PACER=1, the default)",
+                                        self.shadow_chunk_stride(),
+                                    ));
                                     if unendlich_ui::menu::toggle(ui, ui_shadow_cache, accent).clicked() {
                                         ui_shadow_cache = !ui_shadow_cache;
                                     }
@@ -7174,6 +7186,24 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
     /// `UNENDLICH_MAX_DRAWS`). Used by the run-summary memory line.
     pub fn indirect_capacity(&self) -> u32 {
         self.indirect.capacity()
+    }
+
+    /// Slots currently allocated (== capacity - free_list.len()). Compare
+    /// against `loaded`/`rendering` chunk counts in the FPS summary line:
+    /// if this tracks noticeably higher than the visible-chunk count, draw
+    /// slots aren't being freed on eviction/LOD-drop and are accumulating
+    /// — a candidate explanation for main-pass GPU time growing faster
+    /// than the visible chunk count would predict.
+    pub fn indirect_in_use(&self) -> u32 {
+        self.indirect.in_use()
+    }
+
+    /// Highest `in_use()` has ever reached this run. If this keeps
+    /// climbing while `in_use()` itself stays flat or drops, slots got
+    /// stuck allocated at some point and were never freed even though
+    /// the live chunk set moved on.
+    pub fn indirect_high_water(&self) -> u32 {
+        self.indirect.high_water()
     }
 
     /// Count of uploaded meshes per LOD level (Near, Mid, Far, VeryFar). Near
