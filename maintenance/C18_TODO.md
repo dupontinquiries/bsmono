@@ -554,14 +554,36 @@ Original dependency order, steps 2-4 unchanged:
 corpus ("voice popups the user cancelled without executing"), so the cancel
 path has a consumer and is not merely a dismiss.
 
-**Scoping done; extraction not started.** The function list above is
-derived from every real call site, not guessed — that was the actual risk
-in this task, per `av1tuner`'s two wrong-nesting attempts earlier this
-session, and it is now closed. What remains is mechanical: move the 10
-functions and their module-static backing state into a new crate, leave
-the other 22 in `voiceterm`, and fix up `voice.rs`'s internal references
-the way `bo-controller`'s `passby_canceller`/`masker` re-exports did. Real
-work, but no longer work that can go wrong from a wrong guess about scope.
+**Scoping done; extraction not started, and here is why not attempted
+today.** The function list above is derived from every real call site, not
+guessed — that was the actual risk in this task, per `av1tuner`'s two
+wrong-nesting attempts earlier this session, and it is now closed. What
+looked like the remaining step — move the 10 functions and their state,
+leave the other 22 — turned out to have a second layer once the module's 27
+statics were actually listed rather than assumed manageable:
+
+`RING_BUFFER`/`CANCEL_FLAG`/`FINISH_FLAG` clearly belong with the popup
+surface. But `TINY_CTX`/`BASE_CTX`/`LARGE_CTX` and their matching `*_STATE`
+statics are loaded whisper model contexts, and `listen()`/
+`listen_with_audio()` — both squarely in the popup-surface list — almost
+certainly read them, the same contexts `prewarm()`/`warmup()`/
+`is_available()` populate. Those three were scoped as staying BEHIND, as
+engine-configuration concerns. If `listen()` needs the contexts those
+functions set up, the popup surface and the "stays in voiceterm" list are
+not actually separable into two crates without either the model-loading
+statics moving too (which drags whisper-rs model management into what was
+meant to be a small popup-facing surface) or the popup crate taking a
+dependency back on voiceterm for the contexts (inverting the extraction).
+
+This is exactly the kind of coupling a call-site grep does not surface —
+call sites show WHO calls a function, not what statics that function reads
+inside its own body. Confirming or refuting the suspected coupling means
+reading `listen()`'s and `listen_with_audio()`'s full bodies against all 27
+statics, which is the next concrete step and was not done today: this
+section already went through two rounds of correction in one session
+(wrong target, then a guessed function list), and a third attempt at "here
+is definitely the boundary" without reading the function bodies risks being
+a third wrong answer rather than the last one.
 
 ---
 
