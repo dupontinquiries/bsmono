@@ -1520,3 +1520,97 @@ gap in understanding, recorded rather than guessed past: confirm build.sh's
 actual app-selection logic before assuming this manifest fix alone stops
 gitmind from trying to build apps.photosync as a runnable app the next time
 "build everything" is invoked.
+
+---
+
+## 24. voice popup: rebuilt on the real base component; Ctrl+P tap/hold designed, not wired; the morph and multi-user are open
+
+Follow-up to sections 13/18/19/22, redirected mid-build by real feedback.
+
+### The popup now extends the palette's own machinery, not a bespoke window
+
+Corrected after being told the command palette should be the base
+component. Read `qml/main.qml`'s real `voicePopup` (~line 18700): a modal
+`Popup`, centered, with a 44px state-colored round badge, a two-line
+header (bold title + smaller instruction, both text changing with state),
+and a state-gated action row (prominent "Done speaking" + smaller
+"Cancel" while recording). Read `overlay.rs`/`surface.rs` — the shared
+system every other QML popup (Settings, Favorites, the palette itself)
+already ported onto, one table (`overlay::form`) mapping each `Surface`
+to its cited QML size, pinned by `qml_still_says_what_the_table_copies`
+so drift fails a named test.
+
+Added `Surface::Voice` (enum, `ALL` array 8->9, the exhaustiveness match
+in the surface test) and its `form()` row, citing `voicePopup`'s real
+width formula (`Math.min(root.width - 40, 480)`, confirmed present in the
+QML text by grep before citing it, not assumed) — added to the pinning
+test too. `voice_popup.rs` rewritten as a `draw(ui, colors)` function
+meant to run INSIDE `overlay::show`'s content closure, matching the
+badge/header/action-row structure read from the QML rather than the
+earlier draft's plain label-and-two-buttons layout.
+
+`self.surfaces` (the app's existing open/close tracker) is the source of
+truth for on-screen or not; this module only owns what happens WHILE
+open (`Stage`). Documented, not hidden, one real ordering dependency this
+split creates: `VoicePopup::default()`'s placeholder stage is never
+drawn, but the real call site (not yet wired) MUST call `start()` in the
+same action that opens the surface, or a reopened popup shows a stale
+result from the previous session.
+
+### Ctrl+P tap-vs-hold: the pure classifier is built and hand-verified; not wired
+
+The existing `Ctrl+P` binding (`voiceterm_egui.rs:3194`) uses
+`key_pressed` -- edge-triggered, no notion of duration. Telling a tap from
+a hold needs a small state machine tracking how long the key has been
+continuously down, kept in its own module
+(`ctrl_p_gesture.rs`) rather than inline, since press/hold classification
+is a distinct concern a future third hold-triggered binding could reuse.
+
+`GestureTracker::poll(down, dt)` returns `Tap` / `HoldStarted` (fires
+once per press, not every frame past the threshold) / `HoldReleased` /
+`None`; `hold_progress()` gives the raw 0..1 ratio for a morph animation
+to smooth. Threshold is 220ms, reasoned not measured -- flagged with the
+same caveat every other unmeasured constant this session added carries
+(`power_profile::FOREGROUND_ECO_UTIL_MAX`, `poll_schedule`'s hysteresis).
+
+Nine tests written; traced BY HAND against the actual match arms rather
+than left unverified, since `cargo test` was off the table this pass.
+Checked specifically: the boundary case (a press landing exactly on
+220ms uses `>=`, confirmed to fire), and the state-leak case (a second
+press after a full release classifies independently -- `hold_fired`
+correctly resets to false on release before being re-armed on the next
+press-down, traced step by step through both presses). Every one of the
+nine traced correctly against the code as written.
+
+NOT wired: `voiceterm_egui.rs`'s Ctrl+P handler still only does
+`key_pressed` -> toggle. Feeding it through `GestureTracker` -- and
+deciding what `HoldStarted`/`HoldReleased` actually DO (open
+`Surface::Voice` and call `VoicePopup::start`, on `HoldReleased` call
+`finish()` the way a push-to-talk key would) -- is the next concrete
+step, not done here.
+
+### The visual morph: not designed beyond the parameter it needs
+
+The ask was a blend between "fuzzy palette style" and "listening, top
+suggestions style" as the hold progresses. `GestureTracker::hold_progress()`
+supplies the 0..1 input such a blend would consume (smoothed through
+`ctx.animate_value_with_time` the way `overlay::openness` already smooths
+its own bool-driven animation) but the actual interpolated LAYOUT --
+which palette elements fade, whether the badge grows in from nothing,
+how the top-N fuzzy matches present differently from voice's top
+suggestions -- is not designed. This needs seeing the palette's real
+fuzzy-match list on screen next to a sketch of the voice state, not a
+guess written blind; recorded as the next design question rather than an
+implementation guess.
+
+### Multi-user handling across the egui fleet: not started, not scoped
+
+Raised as a new, separate, fleet-wide ask. Not begun -- deserves the same
+scoping discipline as the voice-engine-kit extraction (check what exists
+before designing) rather than a bolt-on alongside this popup work.
+`voiceterm`'s `speakers.rs` (per-speaker VOICE fingerprinting -- whose
+voice is this) is the nearest existing concept and answers a different
+question than multi-user session/profile/settings ownership. Needs its
+own investigation pass: what "user" means per app (a phone's owner vs.
+guest? separate settings profiles? OS-level user accounts?), what
+already exists close to it app by app, before any design.

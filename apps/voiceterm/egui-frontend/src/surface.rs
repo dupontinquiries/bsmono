@@ -51,13 +51,19 @@ pub enum Surface {
     /// opens this: the defaults suit almost everyone, and a knob on screen
     /// for something touched twice a year costs everyone who never does.
     WebSettings,
+    /// The voice dialog (QML voicePopup; centered modal). Given its own
+    /// `Surface` rather than a bespoke window, per the ask to make the
+    /// existing overlay/palette machinery the base component voice
+    /// extends, matching how every other QML popup already ported this
+    /// way.
+    Voice,
 }
 
 impl Surface {
     /// Every variant, for exhaustive tests. If a surface is added, the
     /// `all_pairs_are_exclusive` test covers it by construction — but only if
     /// it is added HERE too, which `variant_count_matches_the_enum` enforces.
-    pub const ALL: [Surface; 8] = [
+    pub const ALL: [Surface; 9] = [
         Surface::Blocks,
         Surface::MissingPkg,
         Surface::Workspaces,
@@ -66,6 +72,7 @@ impl Surface {
         Surface::CmdSheet,
         Surface::Palette,
         Surface::WebSettings,
+        Surface::Voice,
     ];
 }
 
@@ -148,7 +155,8 @@ mod tests {
                 | Surface::Favorites
                 | Surface::CmdSheet
                 | Surface::Palette
-                | Surface::WebSettings => {}
+                | Surface::WebSettings
+                | Surface::Voice => {}
             }
         }
         let mut sorted: Vec<_> = Surface::ALL.iter().map(|s| format!("{s:?}")).collect();

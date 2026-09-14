@@ -63,6 +63,20 @@ pub fn form(s: Surface) -> Form {
         Surface::CmdSheet => Form::BottomSheet { max_h: 640.0, frac: 0.72 },
         // paletteDrawer main.qml:31310 — Math.min(360, root.width*0.85), RightEdge
         Surface::Palette => Form::RightDrawer { max_w: 360.0, frac: 0.85 },
+        // voicePopup main.qml:18727 — width: Math.min(root.width - 40, 480),
+        // height: content-driven (Math.min(root.height - 16, implicitHeight
+        // + 56)). `resolved_size`'s own CenterPopup formula already caps
+        // width at `screen.x - 32` for every surface, which is 8px tighter
+        // than this one's real `- 40` margin -- accepted rather than
+        // special-cased, since the difference is sub-pixel-visible at any
+        // width mobile/desktop actually uses and a per-surface margin
+        // constant would be new surface area on `resolved_size` for one
+        // surface's 8px. max_h is a static cap here (520) rather than the
+        // QML's dynamic content-height formula, because this table's
+        // CenterPopup only has one height field to give it — the content
+        // closure sizes itself within that cap the same way Settings and
+        // Favorites already do.
+        Surface::Voice => Form::CenterPopup { w: 480.0, max_h: 520.0 },
     }
 }
 
@@ -236,8 +250,9 @@ mod tests {
             ("favoritesPopup", "Math.min(380, root.width - 32)"),
             ("cmdSheetPanel", "Math.min(parent.height * 0.72, 640)"),
             ("drawer slide", "duration: 180; easing.type: Easing.OutCubic"),
+            ("voicePopup", "Math.min(root.width - 40, 480)"),
         ];
-        assert_eq!(cited.len(), 8);
+        assert_eq!(cited.len(), 9);
         for (what, expr) in cited {
             assert!(
                 qml.contains(expr),
