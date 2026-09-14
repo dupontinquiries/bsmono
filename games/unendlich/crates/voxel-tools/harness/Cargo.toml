@@ -4,3 +4,23 @@ version = "0.1.0"
 edition = "2021"
 [dependencies]
 voxel-tools = { path = ".." }
+# Optional, and that is what makes `ai-gpu = ["ai-engine", ...]` mean
+# something: the implication is expressed in the feature graph rather than
+# only asserted by the `compile_error!` in paintbrush.rs.
+aperture-engine = { path = "../../../../../apps/aperture/crates/aperture-engine", optional = true }
+
+[features]
+default = []
+# Copied from games/unendlich/crates/unendlich-engine, which declares exactly
+# these two for exactly this engine — not invented here. This crate had NO
+# [features] section at all while paintbrush.rs gated 19 sites on these two
+# names, so every `#[cfg(feature = "ai-engine")]` arm was dead, every
+# `cfg!(feature = "ai-gpu")` was permanently false, and the `compile_error!`
+# asserting ai-gpu implies ai-engine could never fire.
+#
+# The sibling's own comment records the resulting silent failure in its own
+# crate: `describe()` reported "in-instance" while every code path was
+# compiled out, so a build returned None instantly and told the operator to
+# enable a feature they already had.
+ai-gpu = ["ai-engine", "aperture-engine/gpu"]
+ai-engine = ["dep:aperture-engine"]

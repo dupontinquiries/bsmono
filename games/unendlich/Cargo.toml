@@ -9,6 +9,11 @@ members = [
     "crates/unendlich-dash",
     "crates/unendlich-ui",
     "crates/voxel-tools",
+    # The harness was never a member, so cargo in it failed with "believes it
+    # is in a workspace when it is not" and nothing ever built it — which is
+    # why 19 sites gated on two undeclared features went unnoticed. An unbuilt
+    # crate cannot fail.
+    "crates/voxel-tools/harness",
 ]
 
 # Shared profile config — applied to all member crates.
