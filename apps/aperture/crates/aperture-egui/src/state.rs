@@ -2824,9 +2824,29 @@ impl AppState {
             }
             Act::OpenLine { above } => {
                 if *above {
+                    // Was a bare `insert_text("\n")` -- zero indent at
+                    // all, unlike `o` (below), which at least copied the
+                    // current line's indent even before this session's
+                    // smart-indent fix. Shift-`o` opens a SIBLING line
+                    // before the current one, not a new nested block, so
+                    // it matches the current line's own indent rather
+                    // than deepening the way `o` after an opener now does.
+                    //
+                    // KNOWN GAP, not attempted here: if the current line
+                    // is itself a closer (`}`), matching ITS indent is
+                    // the outer level, not the inner one the new line is
+                    // semantically inside of. Getting that right needs
+                    // finding the closer's matching opener (a real
+                    // bracket-matching scan backward, not a one-line
+                    // lookup), which is a bigger feature than this fix
+                    // makes -- Shift-O above a lone `}` still lands the
+                    // new line at the closer's own (outer) indent today.
+                    let line = self.editor.buffer.char_to_pos(self.editor.sel.head).line;
+                    let indent = self.editor.line_indent(line);
                     self.editor.move_home(false);
-                    self.editor.insert_text("\n", now_ms);
-                    self.editor.move_vertical(-1, false);
+                    let p = self.editor.sel.head;
+                    self.editor.insert_text(&format!("{indent}\n"), now_ms);
+                    self.editor.sel = Selection::caret(p + indent.chars().count());
                 } else {
                     self.editor.move_end(false);
                     self.editor.newline_smart(now_ms);

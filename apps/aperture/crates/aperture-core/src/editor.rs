@@ -120,6 +120,47 @@ impl Editor {
         self.insert_text(&s, now_ms);
     }
 
+    /// A line's leading whitespace, unchanged — no bracket-aware
+    /// deepening (that's [`Self::open_below_indent`]). Public because
+    /// `Act::OpenLine { above: true }` (Shift-`o`, in aperture-egui's
+    /// state.rs) needs it too: opening a line ABOVE the current one is
+    /// inserting a SIBLING line, not descending into a new block, so it
+    /// should match the current line's indent, never deepen it.
+    pub fn line_indent(&self, line: usize) -> String {
+        self.buffer.line(line).chars().take_while(|c| *c == ' ' || *c == '\t').collect()
+    }
+
+    /// The indent for a NEW line opened directly below `line`: match that
+    /// line's own indent, but go one level DEEPER when its last
+    /// non-whitespace character is an unmatched opener (`{`, `(`, `[`).
+    ///
+    /// Generalizes what `newline_smart`'s three-line split already does
+    /// for an IMMEDIATELY adjacent `{}` pair (Enter typed literally between
+    /// them) to the ordinary case: the closer is on its own line, several
+    /// lines down, or does not exist yet at all (typing a brand new
+    /// function body at end of file). Before this, `newline_smart` fell
+    /// through to plain `newline` in that ordinary case, which copies the
+    /// CURRENT line's indent unchanged — so `o` after `fn foo() {` put the
+    /// caret at column 0, not one level in, unlike every editor with real
+    /// smart-indent.
+    ///
+    /// Deliberately does NOT look at what follows on a LATER line (whether
+    /// the eventual closer is over- or under-indented, say) — only the
+    /// line being opened below. Reaching further to also re-indent an
+    /// existing closer as a side effect of one keystroke is a bigger,
+    /// riskier change (silently reformatting a line the person did not
+    /// touch) than this fix makes, and is not attempted here.
+    fn open_below_indent(&self, line: usize) -> String {
+        let text = self.buffer.line(line);
+        let indent: String = text.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        let trimmed = text.trim_end();
+        if trimmed.ends_with(['{', '(', '[']) {
+            format!("{indent}{}", " ".repeat(TAB_WIDTH))
+        } else {
+            indent
+        }
+    }
+
     /// Enter's smart form: between an unseparated `{` and `}` (the pair
     /// auto-pairs itself would have produced), split into three lines — the
     /// opener, an empty deeper-indented line with the caret, the closer at
@@ -128,29 +169,43 @@ impl Editor {
     /// step), then the caret is placed by hand: `insert_text` naturally
     /// lands it at the END of the inserted text (after the closer's line),
     /// so the middle line needs an explicit `Selection` afterward.
-    /// Anything else (caret not between an adjacent `{}`) falls through to
-    /// plain `newline`'s ordinary auto-indent.
+    ///
+    /// Anything else (caret not between an adjacent `{}`) used to fall
+    /// through to plain `newline`'s same-indent copy unconditionally.
+    /// Generalized to use [`Self::open_below_indent`] instead — the
+    /// ordinary "Enter after an opening bracket whose closer is not on
+    /// this same line" case, which is most real code, not the exception.
+    /// This function backs `o`/Shift-`o`-below, plain Enter, and
+    /// voice-dictated newlines alike (all three call it), so the fix
+    /// reaches every one of them, which is the correct scope: they are
+    /// the same keystroke in spirit, not three features to fix separately.
     pub fn newline_smart(&mut self, now_ms: u64) {
         if !self.sel.is_caret() {
             return self.newline(now_ms);
         }
         let at = self.sel.head;
         let (prev, next) = (self.buffer.char_at(at.wrapping_sub(1)), self.buffer.char_at(at));
-        if at == 0 || prev != Some('{') || next != Some('}') {
-            return self.newline(now_ms);
+        if at != 0 && prev == Some('{') && next == Some('}') {
+            let line = self.buffer.char_to_pos(at).line;
+            let text = self.buffer.line(line);
+            let indent: String = text.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+            let inner = format!("{indent}{}", " ".repeat(TAB_WIDTH));
+            let mut s = String::with_capacity(2 + indent.len() * 2 + inner.len());
+            s.push('\n');
+            s.push_str(&inner);
+            s.push('\n');
+            s.push_str(&indent);
+            let caret_at = at + 1 + inner.chars().count();
+            self.insert_text(&s, now_ms);
+            self.sel = Selection::caret(caret_at);
+            return;
         }
         let line = self.buffer.char_to_pos(at).line;
-        let text = self.buffer.line(line);
-        let indent: String = text.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
-        let inner = format!("{indent}{}", " ".repeat(TAB_WIDTH));
-        let mut s = String::with_capacity(2 + indent.len() * 2 + inner.len());
-        s.push('\n');
-        s.push_str(&inner);
+        let indent = self.open_below_indent(line);
+        let mut s = String::with_capacity(1 + indent.len());
         s.push('\n');
         s.push_str(&indent);
-        let caret_at = at + 1 + inner.chars().count();
         self.insert_text(&s, now_ms);
-        self.sel = Selection::caret(caret_at);
     }
 
     pub fn insert_tab(&mut self, now_ms: u64) {
@@ -552,6 +607,73 @@ mod tests {
         e2.sel = Selection { anchor: 0, head: 1 }; // a real selection, not a caret
         e2.newline_smart(0);
         assert_eq!(e2.buffer.to_string(), "\n}\n", "a selection falls through too, never brace-splits");
+    }
+
+    #[test]
+    fn open_below_indent_deepens_after_an_opening_brace_on_its_own_line() {
+        // The actual gap this fix closes: `o` (or Enter) at the end of
+        // `fn foo() {` with the closer several lines down (NOT the
+        // adjacent-`{}` case above) used to fall through to plain
+        // `newline`, which copies the CURRENT line's indent unchanged --
+        // putting the new line at column 0, not one level in.
+        let mut e = Editor::from_str("fn foo() {\n}\n");
+        e.sel = Selection::caret(10); // end of "fn foo() {"
+        e.newline_smart(0);
+        assert_eq!(
+            e.buffer.to_string(),
+            "fn foo() {\n    \n}\n",
+            "the new line must be indented one level deeper, matching every editor with real smart-indent"
+        );
+    }
+
+    #[test]
+    fn open_below_indent_respects_the_openers_own_indent() {
+        // Nested context: the opener itself is already indented 4, the new
+        // line must be 8, not a flat TAB_WIDTH from column 0.
+        let mut e = Editor::from_str("fn f() {\n    if x {\n    }\n}\n");
+        e.sel = Selection::caret(19); // end of "    if x {"
+        e.newline_smart(0);
+        let s = e.buffer.to_string();
+        assert!(s.contains("    if x {\n        \n    }\n"), "got: {s:?}");
+    }
+
+    #[test]
+    fn open_below_indent_handles_parens_and_brackets_too() {
+        for (src, caret, opener) in [
+            ("call(\n)\n", 5, '('),
+            ("arr[\n]\n", 4, '['),
+        ] {
+            let mut e = Editor::from_str(src);
+            e.sel = Selection::caret(caret);
+            e.newline_smart(0);
+            let s = e.buffer.to_string();
+            assert!(
+                s.starts_with(&format!("{}\n    \n", &src[..caret])),
+                "opener {opener:?}: got {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_below_indent_does_not_deepen_an_ordinary_line() {
+        // A line that does NOT end in an opener must behave exactly as
+        // plain `newline` always did -- same indent, no change.
+        let mut e = Editor::from_str("    let x = 1;\nnext\n");
+        e.sel = Selection::caret(14); // end of "    let x = 1;"
+        e.newline_smart(0);
+        assert!(e.buffer.to_string().starts_with("    let x = 1;\n    \n"), "must match the CURRENT line's indent, not deepen it");
+    }
+
+    #[test]
+    fn open_below_indent_ignores_trailing_whitespace_after_the_opener() {
+        // "fn foo() {  " (trailing spaces after the brace) must still be
+        // recognised as ending in an opener -- `trim_end()` is there
+        // specifically for this, and a regression that dropped it would
+        // silently stop deepening on any line with trailing whitespace.
+        let mut e = Editor::from_str("fn foo() {  \n}\n");
+        e.sel = Selection::caret(12); // end of the line, after the trailing spaces
+        e.newline_smart(0);
+        assert!(e.buffer.to_string().starts_with("fn foo() {  \n    \n"), "trailing whitespace must not hide the opener");
     }
 
     #[test]
