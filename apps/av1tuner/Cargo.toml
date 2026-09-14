@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "av1tuner_core",
     "av1tuner_app",
+    "av1tuner_cli",
 ]
 
 [workspace.package]

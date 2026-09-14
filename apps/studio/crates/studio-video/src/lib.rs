@@ -58,6 +58,7 @@
 pub mod timecode;
 /// Dual-system sound: aligning a separately-recorded take to picture by the clap. Pure.
 pub mod slate;
+pub mod slate_ocr;
 /// The timeline's video clips cut into one mp4 over the mixdown — ffmpeg's edit list.
 pub mod edit;
 

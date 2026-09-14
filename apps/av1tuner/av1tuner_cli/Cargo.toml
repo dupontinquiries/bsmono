@@ -1,0 +1,12 @@
+[package]
+name = "av1tuner_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "av1tuner-cli"
+path = "src/main.rs"
+
+[dependencies]
+av1tuner_core = { path = "../av1tuner_core" }
