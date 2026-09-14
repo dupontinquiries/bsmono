@@ -1141,7 +1141,17 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                             if self.preview == Some(i) {
                                 egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(6), inner_margin: egui::Margin::same(theme::PAD_SM), ..Default::default() }
                                 .show(ui, |ui| {
-                                    egui::ScrollArea::vertical().id_salt(("prev", i)).max_height(160.0).auto_shrink([false, true]).show(ui, |ui| {
+                                    // Keyed by path, not by `i`. `arts` is re-parsed from the
+                                    // message text every frame, so a reply that emits a new
+                                    // artifact renumbers the ones after it and this pane would
+                                    // inherit another artifact's scroll offset.
+                                    //
+                                    // `self.preview` is still an INDEX into the same vector and
+                                    // has the same exposure — after a renumber it previews a
+                                    // different artifact than the one clicked. Not changed here:
+                                    // that is selection state with its own call sites, where this
+                                    // is one widget id.
+                                    egui::ScrollArea::vertical().id_salt(("prev", a.path.as_str())).max_height(160.0).auto_shrink([false, true]).show(ui, |ui| {
                                         ui.label(RichText::new(&a.content).monospace().small().color(theme::DIM()));
                                     });
                                 });

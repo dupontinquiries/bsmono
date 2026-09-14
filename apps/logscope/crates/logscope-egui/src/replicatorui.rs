@@ -325,7 +325,13 @@ fn column(ui: &mut egui::Ui, i: usize, c: &mut ColumnView<'_>, col_w: f32,
             // The transcript, oldest at the top and pinned to the bottom — the linear chat view's
             // reading order. The old panel drew `.rev().take(12)`, i.e. newest-first with the
             // reply above the prompt that caused it, which reads as a different conversation.
-            egui::ScrollArea::vertical().id_salt(("replicant_lane", i))
+            // `c.id`, not `i`. The assignment field four lines above already
+            // keys by `c.id`; this reached for the loop index instead, in the
+            // same loop, so a column list that reorders (or loses a replicant)
+            // hands this lane the scroll position of whichever column now sits
+            // at that index. Scroll offset is retained per id, so the
+            // transcript jumps to another replicant's read position.
+            egui::ScrollArea::vertical().id_salt(("replicant_lane", c.id))
                 .max_height(260.0).stick_to_bottom(true).auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_max_width(inner - 8.0);
