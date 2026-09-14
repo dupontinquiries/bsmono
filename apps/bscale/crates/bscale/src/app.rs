@@ -607,7 +607,7 @@ impl Shell {
             ui.heading("Job");
             egui::Grid::new("paths").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                 ui.label("Input");
-                let changed = ui.add(egui::TextEdit::singleline(&mut self.input)
+                let changed = ui.add(egui::TextEdit::singleline(&mut self.input).id_salt("bscale-input")
                     .hint_text("video file or PNG directory")
                     .desired_width(f32::INFINITY)).changed();
                 if changed && (self.output.is_empty() || self.output == self.output_suggested) {
@@ -618,11 +618,11 @@ impl Shell {
                 }
                 ui.end_row();
                 ui.label("Output");
-                ui.add(egui::TextEdit::singleline(&mut self.output).hint_text("out.mkv or a directory").desired_width(f32::INFINITY));
+                ui.add(egui::TextEdit::singleline(&mut self.output).id_salt("bscale-output").hint_text("out.mkv or a directory").desired_width(f32::INFINITY));
                 ui.end_row();
                 ui.label("Models folder");
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.models_dir).desired_width(200.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.models_dir).id_salt("bscale-models-dir").desired_width(200.0));
                     if ui.add_enabled(!self.scanning, egui::Button::new("Scan")).clicked() {
                         self.rescan_models();
                     }

@@ -724,7 +724,7 @@ impl Player {
             .frame(self.overlay_frame())
             .show(ctx, |ui| {
                 let edit = ui.add(
-                    egui::TextEdit::singleline(&mut self.palette.query)
+                    egui::TextEdit::singleline(&mut self.palette.query).id_salt("vidkit-palette-query")
                         .hint_text("type a command…")
                         .desired_width(f32::INFINITY),
                 );
@@ -835,7 +835,7 @@ impl Player {
                 });
 
                 let edit = ui.add(
-                    egui::TextEdit::singleline(&mut p.query)
+                    egui::TextEdit::singleline(&mut p.query).id_salt("vidkit-picker-query")
                         .hint_text("filter…")
                         .desired_width(f32::INFINITY),
                 );

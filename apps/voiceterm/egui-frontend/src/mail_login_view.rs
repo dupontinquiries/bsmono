@@ -113,20 +113,20 @@ pub fn login_ui(ui: &mut egui::Ui, form: &mut Form, c: &PaletteColors) -> Option
     let mut edited = false;
     egui::Grid::new("mail-login").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
         ui.label("username");
-        edited |= ui.add(egui::TextEdit::singleline(&mut form.username).hint_text("you@proton.me").desired_width(f32::INFINITY)).changed();
+        edited |= ui.add(egui::TextEdit::singleline(&mut form.username).id_salt("mail-login-username").hint_text("you@proton.me").desired_width(f32::INFINITY)).changed();
         ui.end_row();
         ui.label("password");
-        edited |= ui.add(egui::TextEdit::singleline(&mut form.password).password(true).desired_width(f32::INFINITY)).changed();
+        edited |= ui.add(egui::TextEdit::singleline(&mut form.password).id_salt("mail-login-password").password(true).desired_width(f32::INFINITY)).changed();
         ui.end_row();
         ui.label("2FA code");
-        edited |= ui.add(egui::TextEdit::singleline(&mut form.totp).hint_text("optional, 6 digits").desired_width(f32::INFINITY)).changed();
+        edited |= ui.add(egui::TextEdit::singleline(&mut form.totp).id_salt("mail-login-totp").hint_text("optional, 6 digits").desired_width(f32::INFINITY)).changed();
         ui.end_row();
         ui.label("");
         edited |= ui.checkbox(&mut form.two_password, "two-password mode (separate mailbox password)").changed();
         ui.end_row();
         if form.two_password {
             ui.label("mailbox password");
-            edited |= ui.add(egui::TextEdit::singleline(&mut form.mailbox_password).password(true).desired_width(f32::INFINITY)).changed();
+            edited |= ui.add(egui::TextEdit::singleline(&mut form.mailbox_password).id_salt("mail-login-mailbox-password").password(true).desired_width(f32::INFINITY)).changed();
             ui.end_row();
         }
     });

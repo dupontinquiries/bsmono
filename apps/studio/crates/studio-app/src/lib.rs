@@ -2359,7 +2359,7 @@ impl App {
                 }
                 ui.separator();
                 ui.label("Or by id:");
-                let edit = ui.add(egui::TextEdit::singleline(&mut d.text).hint_text("xxxx-xxxx-xxxx-…").desired_width(f32::INFINITY));
+                let edit = ui.add(egui::TextEdit::singleline(&mut d.text).id_salt("studio-join-by-id").hint_text("xxxx-xxxx-xxxx-…").desired_width(f32::INFINITY));
                 let go = ui.button("join").clicked() || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                 if go {
                     match studio_collab::lan::SessionId::parse(&d.text) {
