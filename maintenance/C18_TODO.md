@@ -687,13 +687,51 @@ grepped: a grep for known static names would have missed them entirely,
 the same way the model-context coupling itself was invisible to a
 call-site grep on `main.rs`.
 
-This is now precise enough to execute as a single focused pass: create the
-crate, move the ~1,200 lines and the two sibling modules, decide `clog!`
-vs. a logging parameter (recommend: define an equivalent macro in the new
-crate rather than a callback — matches how `voice-kit` and other shared
-kits in this monorepo already use their own `clog!`-equivalent rather than
-threading a logger parameter through every function), then re-export from
-`voice.rs` the way `bo-controller`'s `passby_canceller`/`masker` did.
+**Correction, and a more serious one than the last two.** Continuing the
+verbatim read into `record_and_transcribe_inner` itself (the ~417-line
+function `listen_with_audio`'s chain calls, previously only grep-checked
+against the known static list on a truncated extract) found real
+dependencies that grep missed because they are FUNCTION CALLS, not static
+names:
+
+    crate::audio_profile::noise_floor()       -- itself pulls in
+                                                  crate::phonetic::TonalProfile
+    crate::acoustic_index::{promote_enabled, fingerprint,
+        find_best_by_fingerprint, promote_thresholds, record_hit,
+        record_shadow_observation, add_exemplar, Exemplar}
+    crate::speakers::current_active_id()
+
+`audio_profile` (707 lines) is NOT self-contained the way `voice_lang`/
+`whisper_pool` are — it has its own `use crate::phonetic::TonalProfile`,
+pulling in an eighth module. `acoustic_index` is a whole fingerprint-cache
+subsystem (7 functions plus a public type), not a helper. `speakers` was
+already known as a heavy dependency (13 uses across the file) but not
+previously connected to this specific function.
+
+This means the "~1,200 lines, bounded, comparable to
+`board_layouts::dispatch`" estimate two commits ago was wrong, and wrong in
+the way that matters: it under-counted by not reading
+`record_and_transcribe_inner` past its static-name footprint. The Tier1
+acoustic-index fast path, the speaker-aware fingerprint lookup, and the
+noise-floor-adaptive VAD threshold are not peripheral to this function —
+they are most of its body (lines 3350-3550 of ~3155-3572) — and none of
+them can be stubbed out without changing what `listen()` actually does:
+skipping the acoustic-index check would mean every popup-crate consumer
+loses the "skip Whisper on a confident cache hit" latency win, and skipping
+the noise-floor read would mean the VAD threshold silently reverts to a
+fixed 0.008 regardless of room noise.
+
+So 1a is not "the model-loading core," cleanly separable from everything
+else. It is "the model-loading core AND the acoustic-index/speaker-aware
+VAD pipeline," which pulls in at least `audio_profile`, `phonetic`,
+`acoustic_index`, and `speakers` — four more modules, none confirmed
+self-contained the way `voice_lang`/`whisper_pool` were. The next step
+before any extraction attempt is checking THOSE four the same way
+`voice_lang`/`whisper_pool` were checked: size, `use crate::` count, and
+whether they in turn stay bounded or keep unrolling. Not done in this
+pass — this correction exists so the next one starts from an accurate
+line count instead of the ~1,200 that turned out to be an undercount from
+an incomplete read.
 
 One more coupling, from `listen_with_audio` specifically — part of 1b (the
 popup surface), not the four core functions above, so it does not block
