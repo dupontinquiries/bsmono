@@ -243,7 +243,7 @@ impl VoicePopup {
     ///
     /// Layout follows the QML's real structure (see module doc): a round
     /// badge, a two-line header, then a state-gated action row.
-    pub fn draw(&mut self, ui: &mut egui::Ui, colors: &voiceterm_egui::PaletteColors) {
+    pub fn draw(&mut self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             self.draw_badge(ui, colors);
@@ -311,7 +311,7 @@ impl VoicePopup {
     /// is not reproduced -- egui's `Context::animate_value` could drive one
     /// from `ui.ctx().input(|i| i.time)`, deferred rather than guessed at
     /// without seeing it on screen first.
-    fn draw_badge(&self, ui: &mut egui::Ui, colors: &voiceterm_egui::PaletteColors) {
+    fn draw_badge(&self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
         let (bg, glyph) = match &self.stage {
             Stage::Listening => (colors.danger, "\u{25CF}"),
             Stage::Transcribing => (colors.accent, "\u{29D7}"),

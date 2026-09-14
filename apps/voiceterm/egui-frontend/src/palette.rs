@@ -234,6 +234,27 @@ pub fn vocabulary() -> Vec<Entry> {
         v.push(Entry {
             command: Command::OpenView { view, target: Target::Focused },
             title: format!("Show {}", view.label().to_lowercase()),
+            // Tried adding generic verb keywords ("open", "go to",
+            // "switch to") here and reverted after `search()`'s real
+            // scorer proved it does not do what it looks like it should.
+            // `uikit_egui::fuzzy::score` requires the WHOLE query's
+            // characters (spaces stripped) to be an ordered subsequence
+            // of ONE haystack -- title OR a single keyword, never
+            // combined. "switch to mail" is not a character subsequence
+            // of "Show mail" (wrong letters in the wrong order), nor of a
+            // keyword "switch to" alone (which has no "mail" in it at
+            // all) -- so a generic verb keyword shared across every view
+            // in this loop can never help a compound "verb + view name"
+            // phrase match, regardless of which verb is chosen. It would
+            // only ever fire on the verb typed ALONE, which ties every
+            // view in the loop at the same score -- not a real
+            // navigation improvement. A genuine fix needs PER-VIEW name
+            // synonyms (e.g. "email" for Mail) that a compound query
+            // like "email" alone would match via the title fallback
+            // already in place today -- not attempted here, since
+            // inventing synonym words per view without knowing what
+            // users actually say is exactly the guessing this session
+            // has tried not to do.
             keywords: &[],
         });
         v.push(Entry {
@@ -253,8 +274,12 @@ pub fn vocabulary() -> Vec<Entry> {
                    title: "Split down".into(), keywords: &["hsplit", "below"] });
     v.push(Entry { command: Command::ClosePane, title: "Close pane".into(),
                    keywords: &["kill"] });
-    v.push(Entry { command: Command::NewTab, title: "New tab".into(), keywords: &[] });
-    v.push(Entry { command: Command::NextTab, title: "Next tab".into(), keywords: &[] });
+    // NewTab/NextTab were the other two zero-keyword entries in this
+    // vocabulary. NextTab's fix mirrors PrevTab's own "back" one line
+    // below -- a deliberate one-word symmetric pair, not a longer
+    // speculative list, matching this file's own restraint elsewhere.
+    v.push(Entry { command: Command::NewTab, title: "New tab".into(), keywords: &["add tab"] });
+    v.push(Entry { command: Command::NextTab, title: "Next tab".into(), keywords: &["forward"] });
     v.push(Entry { command: Command::PrevTab, title: "Previous tab".into(), keywords: &["back"] });
     v.push(Entry { command: Command::ToggleRail, title: "Toggle sidebar".into(),
                    keywords: &["rail", "hide", "collapse"] });
@@ -439,6 +464,35 @@ mod tests {
         // A web pane needs a URL this grammar does not carry, so it declines
         // rather than opening a blank one.
         assert_eq!(parse_phrase("show me the web"), None);
+    }
+
+    #[test]
+    fn the_two_real_zero_keyword_gaps_are_now_reachable_by_synonym() {
+        // Confirms the fix has real effect through search() -- not just
+        // that the array literal compiles, but that fuzzy::score actually
+        // finds these entries by a word that never appears in the title.
+        //
+        // A third candidate fix (generic "open"/"go to"/"switch to"
+        // keywords on the per-view OpenView::Focused entries) was tried
+        // and REVERTED -- see that entry's own comment. `search()`'s real
+        // scorer requires the whole query to be a character subsequence
+        // of ONE field (title or a single keyword, never combined), so a
+        // compound query like "switch to mail" can never match a generic
+        // keyword "switch to" plus a title-only "mail" -- confirmed by
+        // this test failing against that assumption before the revert.
+        let entries = vocabulary();
+        let has_command = |hits: &[&Entry], want: &Command| hits.iter().any(|e| &e.command == want);
+
+        // "add tab" -- the title is "New tab". A COMPLETE alternate
+        // phrase, not a generic modifier, so the compound-query problem
+        // above does not apply here: the whole query is one field's
+        // worth of characters.
+        let hits = search(&entries, "add tab");
+        assert!(has_command(&hits, &Command::NewTab), "add tab should find New tab via the new keyword");
+
+        // "forward" -- the title is "Next tab"; mirrors PrevTab's "back".
+        let hits = search(&entries, "forward");
+        assert!(has_command(&hits, &Command::NextTab), "forward should find Next tab via the new keyword");
     }
 
     #[test]

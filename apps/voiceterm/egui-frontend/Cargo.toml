@@ -46,6 +46,12 @@ app-wayland = ["dep:eframe", "wayland"]
 # to shared/iio-source (maintenance/C18_TODO.md section 2). Re-exported at
 # the crate root as `iio_accel` so existing call sites are unchanged.
 iio-source = { path = "../../../shared/iio-source" }
+# The model-loading/capture/transcription core voice_popup.rs and
+# ctrl_p_gesture.rs depend on (maintenance/C18_TODO.md sections 13/18/19)
+# -- added here because it was designed and written without a compile
+# available at the time (explicit constraint that turn), and this is the
+# first real `cargo check`/`cargo test` run against those files since.
+voice-engine-kit = { path = "../../../shared/voice-engine-kit", features = ["voice"] }
 # Pulled in by the voice-intent chain (`security`, `token_stats`).
 libc = "0.2"
 aho-corasick = "1"

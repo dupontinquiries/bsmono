@@ -1795,3 +1795,71 @@ the "where did the training loop go" question with a real, precise answer
 and gives the next session an actual architecture to build FROM rather
 than guess AT -- which was the whole point of being told to read the QML
 and existing Rust before porting anything from these Qt/GTK predecessors.
+
+---
+
+## 27. Command palette voice-keyword audit: two real fixes, one disproven, one architectural limit found
+
+Direct follow-up to section 26, "go through the command palette commands
+once you understand the predecessor." `voiceterm-egui/src/palette.rs`'s
+own doc already states the goal precisely: "voice and typing resolve
+through the same list ... a command that exists in one and not the other
+is the class of bug where a feature is reachable by mouse and mysteriously
+absent by voice." Audited `vocabulary()` for entries with `keywords: &[]`
+-- three found (the per-view `Target::Focused` OpenView entries, `NewTab`,
+`NextTab`), matching neighbors like `PrevTab`'s `&["back"]` that already
+carry a synonym.
+
+### Two real, verified fixes
+
+`NewTab` gets `&["add tab"]`, `NextTab` gets `&["forward"]` (mirroring
+`PrevTab`'s existing `"back"` as a deliberate symmetric pair). Both are
+COMPLETE alternate phrases for the whole command, matching the file's
+established pattern (`"kill"` for ClosePane, `"back"` for PrevTab) --
+confirmed working via a real test against the actual `search()` function,
+not asserted from the array literal alone.
+
+### One fix tried, disproven by its own test, and reverted
+
+The third candidate -- generic `"open"`/`"go to"`/`"switch to"` keywords on
+the per-view `OpenView::Focused` entries -- looked reasonable and was
+initially committed to this section's draft, then DISPROVEN by writing a
+test against it: `search(&entries, "switch to mail")` does not find "Show
+mail". Traced to `uikit_egui::fuzzy::score`'s real semantics (read the
+actual implementation, not assumed): it requires the WHOLE query's
+characters (spaces stripped) to form an ordered subsequence of ONE
+haystack -- title or a single keyword, checked independently, NEVER
+combined. "switchtomail" is not a subsequence of "Show mail" (wrong
+letters, wrong order), nor of a keyword "switch to" alone (which contains
+no "mail" at all). So no generic verb keyword, shared across every view in
+the loop, can ever help a compound "verb + view name" phrase match --
+regardless of which verb is chosen. It would only fire if the ENTIRE
+query were the bare verb, which ties every view in the loop at the same
+score: not a real navigation improvement. Reverted rather than left in
+looking useful while doing nothing.
+
+### The real architectural finding this leaves for section 26's open gap
+
+`search()`'s per-field, subsequence-only scoring is a genuine reason
+`parse_phrase()` exists as a SEPARATE hand-written grammar rather than
+routing voice entirely through `search()` + `keywords`: `parse_phrase`
+can parse "show me my mail in a new pane" (title/target combined from
+free-form natural language) precisely because it is a real grammar, not a
+fuzzy character match against a static list. `search()` + `keywords` is
+well-suited to short, complete alternate phrases (what this section's two
+real fixes are) but structurally cannot handle compound natural-language
+commands the way `parse_phrase` does. The module doc's "one list" framing
+is true at the DATA level (`Command`/`Entry` are shared) but the two
+CONSUMERS (`search` for typed/short-phrase lookup, `parse_phrase` for
+full-sentence voice grammar) are genuinely different matching strategies
+for different input shapes, not one algorithm serving both. Worth stating
+plainly rather than let the doc's aspirational framing stand unchallenged.
+
+Verified: `cargo test --lib` on voiceterm-egui -- 1742 passing, 0 failed
+(this is also the FIRST real compile+test run of voice_popup.rs and
+ctrl_p_gesture.rs since they were designed without a compiler available;
+both needed real fixes -- a missing `voice-engine-kit` dependency in
+Cargo.toml, and two `voiceterm_egui::PaletteColors` self-references that
+needed to be `uikit_egui::PaletteColors`, the crate PaletteColors is
+actually defined in -- found and fixed by this same compile pass, not
+left for a future one).
