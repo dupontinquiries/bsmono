@@ -543,3 +543,82 @@ The user-facing port is complete. The gap is the camera BACKEND, which is a
 different piece of work and wants deciding as one (does the egui build talk
 to libcamera directly, or through camera-bridge?) rather than surface by
 surface.
+
+---
+
+## 15. Two field reports from device testing (2026-09-13)
+
+Both logged from real use. Both checked against the tree, and neither is
+what the symptom suggests — recorded so the next person does not start by
+writing the thing that already exists.
+
+### "voiceterm has no mail sign-in page"
+
+Correct as a symptom, and it is DELIBERATE. `mail_login_view.rs` exists, is
+tested, and is declared at `lib.rs:250` — and has zero callers, which its own
+header states and justifies:
+
+> This form has no caller in the egui frontend, and wiring it would be
+> theatre. `submit` yields `Credentials` for "the host to hand to the bridge
+> (`mail_login`)" — and this frontend has no bridge. The Qt build's
+> `mail_login` goes to a `mail_hub`, which is gated behind the `mail-crypto`
+> feature and refuses with "this build can't sign in to Proton yet" when it
+> is absent.
+>
+> So a login screen here would collect a password, validate it, and drop it.
+> That is worse than no login screen: a form that looks like it works is how
+> someone concludes their credentials were wrong.
+
+`mail_store::empty_reason` is what the pane shows instead — it names the
+maildir paths tried and says a remote account is a separate thing this build
+does not reach.
+
+**So the work is not the form. It is the bridge**, and the blocker is
+`TODO_mail_srp_login.md` (Proton SRP). Wiring the form before that exists
+would be the regression the header describes.
+
+### "voiceterm has no graph"
+
+Different cause — the graph IS wired. `graph_view` has six references in the
+binary and is drawn at `voiceterm_egui.rs:3908`, with focus seeding, depth
+controls and breadcrumbs.
+
+What happens on a fresh install is the empty state. `graph_from_notes`
+defaults to `true` (line 6311), and with an empty deck the pane draws:
+
+    no notes yet — capture some, or switch to the typed source
+
+That is honest and it reads as absence. The graph of the TYPED source is one
+radio button away and is not discoverable from a screen that looks blank.
+
+Worth a small change rather than a port: on an empty deck, either default to
+the typed source (which always has something to draw) or make the two-way
+selector visible above the message rather than reading as an error. The
+selector is already there — `ui.selectable_value(... "my notes" / "typed
+source")` — so this is placement, not a feature.
+
+### "rusty-board-egui cardinal has no voice/space/delete/enter row"
+
+The sharpest of the three: **there is no cardinal layout in either
+frontend.** `LayoutStyle::CardinalGrid` appears in the tree only in
+`board-layouts`' builder doc examples and in tests
+(`builder.rs:250,307,321`, `keyboard_view.rs:6060`,
+`keyboard_behaviors_tests.rs:809`). The one shipped layout,
+`resources/layouts/en_us_qwerty.toml`, declares no `style` at all, so it
+takes `LayoutStyle::default()` = `Standard`.
+
+So the missing bottom row is downstream of a missing layout. The MACHINERY is
+complete on both sides — `CardinalCell`, `cardinal_key`, `cardinal_key_w`,
+`DispatchMode::Cardinal`, the `select_behavior` arms that route an off-cell
+start to the cardinal dispatcher (extracted and tested this session in
+`board_layouts::dispatch`) — and nothing builds a layout that uses any of it.
+
+That also explains why the dispatch work could be tested but never observed:
+every cardinal path in `select_behavior` is reachable only from a layout that
+does not ship.
+
+Next step is a `cardinal.toml` (or a `LayoutBuilder` call) that declares
+`style = "CardinalGrid"` and includes the voice/space/delete/enter row the
+GTK build had. The operator has seen that row, so the GTK version of it
+existed at some point — worth finding in history before designing it fresh:
+`git log -S cardinal -- resources/layouts` is the place to start.
