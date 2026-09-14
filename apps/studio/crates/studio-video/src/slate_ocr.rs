@@ -300,7 +300,7 @@ pub fn draw_glyph(g: &mut Gray, ch: char, x: usize, y: usize, w: usize, h: usize
 /// was not sure of is EMPTY, not guessed. An empty scene asks the
 /// editor a question; a wrong one sends them looking for a take that
 /// was never mis-shot.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Board {
     pub roll: Option<String>,
     pub scene: Option<String>,

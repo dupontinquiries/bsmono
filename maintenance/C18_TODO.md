@@ -760,3 +760,41 @@ an `Option<usize>` into the same re-parsed `arts` vector, so a renumber makes
 it preview a different artifact than the one clicked. That is wrong CONTENT,
 not a wrong scroll offset. It is selection state with several call sites, so
 it wants its own change rather than being folded into an id sweep.
+
+
+## 17. studio-video's slate OCR: 3 pre-existing test failures, found while fixing a merge
+
+Surfaced while verifying the av1-in-rust-studio-live merge (caf76f68f and
+the commit after it). `studio-video/src/slate_ocr.rs` needed one fix to
+compile at all -- `#[derive(..., Eq, ...)]` on `Board`, which holds a bare
+`f32` confidence field and cannot implement `Eq` (NaN != NaN). Removed the
+derive; nothing in the crate constrained `Board: Eq` (checked by grep), so
+it was a pure over-derive.
+
+That fix is unrelated to what follows, and confirmed so by structure alone:
+the derive is on `Board` at line 303; the three failing tests exercise
+`recognise()` at line 217, a different function against a different type
+(`Read`), through logic the derive removal never touches.
+
+THREE TESTS FAIL, ALL IN THE SAME FUNCTION
+
+    confidence_is_the_margin_not_the_distance
+    it_does_not_care_which_side_is_ink
+    it_reads_a_board_off_a_frame
+
+The first: `recognise(eight, &templates())` -- reading the template FOR '8'
+against the template set that generated it -- returns `ch: '0'`, not `'8'`.
+Distance-to-self should be 0 and uniquely minimal unless two templates
+render identically or `distance()`/`sort()` has a tie-breaking bug. '0' is
+seven-segment `[0,1,2,4,5,6]` and '8' is `[0,1,2,3,4,5,6]` (all seven) --
+one segment apart, not identical -- so the templates are not the cause on
+inspection; the bug is more likely in `distance()`, `normalise()`, or the
+tie-break when `scored.sort()` produces equal keys, and would need actual
+debugging to place precisely.
+
+Not chased further. This module's own handoff docs say plainly that nothing
+here has been verified against a decoder or real use, and a self-recognition
+failure on the reader's OWN generated templates is exactly the kind of
+thing "not verified" was warning about -- it is not a regression from
+anything in this session, and studio-video's remaining 37 tests (all
+non-OCR) pass clean.
