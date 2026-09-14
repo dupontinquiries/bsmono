@@ -597,31 +597,59 @@ selector visible above the message rather than reading as an error. The
 selector is already there — `ui.selectable_value(... "my notes" / "typed
 source")` — so this is placement, not a feature.
 
-### "rusty-board-egui cardinal has no voice/space/delete/enter row"
+### "rusty-board-egui cardinal has no voice/space/delete/enter row" — CORRECTED
 
-The sharpest of the three: **there is no cardinal layout in either
-frontend.** `LayoutStyle::CardinalGrid` appears in the tree only in
-`board-layouts`' builder doc examples and in tests
-(`builder.rs:250,307,321`, `keyboard_view.rs:6060`,
-`keyboard_behaviors_tests.rs:809`). The one shipped layout,
-`resources/layouts/en_us_qwerty.toml`, declares no `style` at all, so it
-takes `LayoutStyle::default()` = `Standard`.
+This was written from a `git log -S` search that found no shipped `.toml`
+and concluded the layout does not exist. Wrong conclusion, reached by
+looking in one place. `Layout::default_cardinal_grid()` in
+`crates/board-layouts/src/lib.rs` is a complete, tested, hand-built layout
+— MessagEase-style 3x3 with the exact row described: mic, LLM-prompt,
+backspace, return, settings. Three sibling variants exist too
+(`_dvorak`, `_dvorak_for_anchor`, `_words`).
 
-So the missing bottom row is downstream of a missing layout. The MACHINERY is
-complete on both sides — `CardinalCell`, `cardinal_key`, `cardinal_key_w`,
-`DispatchMode::Cardinal`, the `select_behavior` arms that route an off-cell
-start to the cardinal dispatcher (extracted and tested this session in
-`board_layouts::dispatch`) — and nothing builds a layout that uses any of it.
+**It is reachable on both frontends, traced end to end:**
 
-That also explains why the dispatch work could be tested but never observed:
-every cardinal path in `select_behavior` is reachable only from a layout that
-does not ship.
+* **GTK**: Settings -> "Keyboard mode" -> Cardinal. A real dropdown
+  (`settings_panel.rs:335`), gated on `feature = "input-modes"`, which IS in
+  the default feature chain (`default -> build-functioncalling ->
+  build-voice -> full-keyboard -> input-modes`). Selecting it sets
+  `cfg.layout.experimental_mode = "cardinal"`, which `keyboard_view.rs`'s
+  `"cardinal" =>` arm resolves straight to `default_cardinal_grid()`.
 
-Next step is a `cardinal.toml` (or a `LayoutBuilder` call) that declares
-`style = "CardinalGrid"` and includes the voice/space/delete/enter row the
-GTK build had. The operator has seen that row, so the GTK version of it
-existed at some point — worth finding in history before designing it fresh:
-`git log -S cardinal -- resources/layouts` is the place to start.
+* **egui**: `RealBoard::new()` (`real_layout.rs:399`) loads it into the file
+  list unconditionally — no feature gate, always present. `demo_app.rs`'s
+  sidebar draws a vertical tab per file, labelled from `display_name`
+  ("English (Cardinal Grid)" + a keyboard glyph), and clicking one sets
+  `self.real.active` and switches. Traced the whole path: no missing
+  `pub fn`, no unconstructed type, no untested arm.
+
+**What this means for the report.** Either it describes a build that
+predates this wiring (`demo_app.rs`'s sidebar tab strip is recent —
+`05c7145b3` touched it two commits before this write-up), or the operator
+looked for a settings TOGGLE on the egui build, which has none — the
+cardinal grid there is a sidebar tab, a different UI pattern from GTK's
+Settings menu, and someone expecting the GTK pattern would report finding
+nothing while looking straight at "English (Cardinal Grid) ⌨" without
+recognising it as the answer.
+
+The dispatch machinery this section originally credited (`CardinalCell`,
+`select_behavior`'s cardinal arms) is not just present, it is EXERCISED —
+`default_cardinal_grid()` is constructed in the app's own state
+(`demo_app.rs:315`), not only in tests. The original write-up's "every
+cardinal path is reachable only from a layout that does not ship" is the
+part that does not hold: the layout ships from code, unconditionally, on
+both frontends.
+
+**Not corrected: whether the row LOOKS right.** Reading confirms it is
+wired and constructs without error; it does not confirm the rendered
+gesture directions, key spacing or touch targets match what "the operator
+has seen" on the GTK build historically. If the report persists after
+finding the "English (Cardinal Grid)" sidebar tab, the gap is almost
+certainly a rendering or gesture-mapping difference between the two
+frontends' cardinal drawing, not a missing layout — worth checking
+`keyboard_ui_styled`'s cardinal-cell rendering against GTK's equivalent
+next, with a screenshot from the device rather than another read of the
+source.
 
 ---
 
