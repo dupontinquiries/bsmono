@@ -12,6 +12,7 @@ path = "src/main.rs"
 # Experimental video upscaling. Path deps, optional, so a default build of
 # beatspace neither compiles nor downloads any of it.
 d2x-core = { path = "../bscale/crates/d2x-core", optional = true }
+d2x-job = { path = "../bscale/crates/d2x-job", optional = true }
 d2x-wgpu = { path = "../bscale/crates/d2x-wgpu", optional = true }
 # Native folder picker for the training page. xdg-portal so it works under a
 # Wayland compositor on mobile Linux without dragging in GTK — this fleet
@@ -142,7 +143,7 @@ gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 # supplies from ~/models. Off means an upscale request is refused with a
 # message naming the feature — the same posture as `opus-decode` above —
 # rather than the crate failing to build.
-upscale = ["dep:d2x-core"]
+upscale = ["dep:d2x-core", "dep:d2x-job"]
 # The same, on the GPU. Implies `gpu` because it shares the wgpu stack rather
 # than standing up a second one.
 upscale-gpu = ["upscale", "gpu", "dep:d2x-wgpu"]

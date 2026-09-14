@@ -52,11 +52,20 @@ impl Unavailable {
 /// no-model cases, so a caller has one thing to show the user either way.
 #[cfg(feature = "upscale")]
 pub fn probe() -> Result<Source, Unavailable> {
-    // Model resolution belongs to bscale, not here — a second search path
-    // would drift from the first, which is the failure this monorepo keeps
-    // hitting. Ask it.
-    let dirs: Vec<String> = d2x_core::model_search_dirs_display();
-    match d2x_core::resolve_default_model() {
+    // Model resolution belongs to bscale (d2x-job), not here — a second
+    // search path would drift from the first, which is the failure this
+    // monorepo keeps hitting. Ask it.
+    //
+    // Was `d2x_core::model_search_dirs_display()` / `d2x_core::
+    // resolve_default_model()` -- neither exists in d2x-core; both are
+    // real functions in d2x-job (which depends on d2x-core, not the
+    // reverse, so this is a layer-respecting addition, not a shortcut).
+    // resolve_default_model was newly added there for this exact caller
+    // -- previously only load_model() (which also loads the network,
+    // heavier than this probe needs) and default_model_paths() (paths
+    // only, no existence check or vendored/found distinction) existed.
+    let dirs: Vec<String> = d2x_job::model_search_dirs_display();
+    match d2x_job::resolve_default_model() {
         Some((path, vendored)) => Ok(if vendored { Source::Vendored(path) } else { Source::Found(path) }),
         None => Err(Unavailable::NoModel { looked_in: dirs }),
     }

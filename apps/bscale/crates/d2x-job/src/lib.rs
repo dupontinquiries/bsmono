@@ -13,3 +13,4 @@ pub use d2x_core::pipeline::{Event as PipelineEvent, Summary};
 pub use d2x_core::plan::FrameStats;
 pub use ffmpeg::{EncodeOptions, Probe, Segment};
 pub use job::{Backend, Event, Job};
+pub use job::{model_search_dirs_display, resolve_default_model};

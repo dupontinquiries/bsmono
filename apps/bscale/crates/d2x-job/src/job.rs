@@ -215,6 +215,60 @@ pub fn default_model_paths() -> Vec<PathBuf> {
         .collect()
 }
 
+/// Resolve the DEFAULT model (no `--model` given): the first existing path
+/// among [`default_model_paths`], plus whether it came from the
+/// checkout-relative vendored fallback rather than a directory the operator
+/// actually chose.
+///
+/// Added for callers (currently `apps/beatspace`) that want to know
+/// AVAILABILITY and provenance without loading the network the way
+/// [`load_model`] does — `probe()`-shaped code that just needs to tell a
+/// user "upscaling is ready" or "here's where I looked", not decode
+/// tensors. `load_model(None)` is rewritten below to call this too, so
+/// there remains exactly one place that decides which directories count
+/// as "vendored" — the search-path drift `model_search_dirs`'s own doc
+/// comment already warns duplicating this logic would cause.
+///
+/// "Vendored" means the matched directory is one of `model_search_dirs`'s
+/// checkout-relative entries (`exe.ancestors()` or
+/// `CARGO_MANIFEST_DIR/../../models`) — the ones pushed last, after every
+/// directory an operator could have configured. A path matching one of
+/// THOSE specific directory entries is vendored; anything found in an
+/// earlier-searched directory is not, regardless of the file's own origin.
+pub fn resolve_default_model() -> Option<(PathBuf, bool)> {
+    let dirs = model_search_dirs();
+    // The same boundary `model_search_dirs` itself documents: vendored
+    // entries are the checkout-relative ones, pushed after every real
+    // configured location. Recomputed here from the same function rather
+    // than a second definition of "vendored", so the two cannot drift.
+    let vendored_dirs: std::collections::HashSet<&PathBuf> = {
+        let mut exe_ancestors: Vec<PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            for anc in exe.ancestors().take(5) {
+                exe_ancestors.push(anc.join("models"));
+            }
+        }
+        let manifest_vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models");
+        dirs.iter()
+            .filter(|d| exe_ancestors.contains(d) || **d == manifest_vendored)
+            .collect()
+    };
+    for dir in &dirs {
+        let candidate = dir.join("realesr-animevideov3.safetensors");
+        if candidate.is_file() {
+            return Some((candidate, vendored_dirs.contains(dir)));
+        }
+    }
+    None
+}
+
+/// Display form of [`model_search_dirs`], for an error message telling a
+/// user where this looked. Added alongside [`resolve_default_model`] for
+/// the same `probe()`-shaped caller.
+pub fn model_search_dirs_display() -> Vec<String> {
+    model_search_dirs().into_iter().map(|d| d.display().to_string()).collect()
+}
+
 
 #[cfg(test)]
 mod model_search_tests {
@@ -270,7 +324,15 @@ mod model_search_tests {
 pub fn load_model(explicit: Option<&Path>) -> anyhow::Result<(Arc<Network>, PathBuf)> {
     let path = match explicit {
         Some(p) => p.to_path_buf(),
-        None => default_model_paths().into_iter().find(|p| p.exists()).ok_or_else(|| anyhow!("no --model given and the vendored realesr-animevideov3.safetensors was not found"))?,
+        // Reuses resolve_default_model rather than its own
+        // `.find(|p| p.exists())` (what this line used to be) so there is
+        // one definition of "the default model, if any", not two that
+        // happen to agree today and can silently drift apart tomorrow --
+        // added when apps/beatspace needed the same resolution without
+        // loading the network.
+        None => resolve_default_model()
+            .map(|(path, _vendored)| path)
+            .ok_or_else(|| anyhow!("no --model given and the vendored realesr-animevideov3.safetensors was not found"))?,
     };
     let net = Network::load(&path).with_context(|| format!("loading model {}", path.display()))?;
     Ok((Arc::new(net), path))

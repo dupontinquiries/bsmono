@@ -267,10 +267,14 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "d2x-core",
+ "d2x-job",
  "d2x-wgpu",
  "eframe",
  "egui",
+ "glow 0.17.0",
  "hound",
+ "khronos-egl",
+ "libloading 0.8.9",
  "naga 29.0.4",
  "ogg",
  "opus",
@@ -948,6 +952,17 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "d2x-job"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "d2x-core",
+ "d2x-wgpu",
+ "image",
+ "serde_json",
 ]
 
 [[package]]
