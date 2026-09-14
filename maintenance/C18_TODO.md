@@ -1678,3 +1678,120 @@ Not started. Recorded with the real mechanism identified precisely so the
 next pass builds the actual feature rather than a plausible-sounding
 guess about "multi-user" (accounts, profiles) that would have been the
 wrong thing entirely.
+
+
+---
+
+## 26. The "quick brown fox" training loop, found: a real, deliberately reusable 4-substrate onboarding architecture
+
+Resolved after being pointed at manpages specifically. `apps/voiceterm/
+data/manpages/onboarding.md` is the actual teleprompter content — a real
+markdown document, rendered natively by voiceterm's own manpage viewer,
+containing the calibration paragraph:
+
+    The quick brown fox jumps over the lazy dog. She sells sea shells by
+    the sea shore. Peter Piper picked a peck of pickled peppers. How much
+    wood would a woodchuck chuck if a woodchuck could chuck wood?
+
+Four pangrams, not one -- broad phonetic coverage across vowels/consonants,
+stated explicitly in the doc's own text. The doc frames the whole flow:
+read this aloud, tap the mic, the system suggests a COLOR representing the
+captured voice (`main.rs`'s `speaker_preview_color()`), pick a name, Save.
+
+### The architecture is genuinely reusable, not onboarding-specific -- it says so itself
+
+Traced via the code's own "Substrate A/B/C/D" labels
+(`src/manpages.rs`, `qml/main.qml`, `src/main.rs`), each shipped as its
+own numbered increment before onboarding used any of them:
+
+* **Substrate A (manpages.rs, ship 2.6.1)** -- named markdown documents,
+  looked up by name, rendered natively in the app's own preview pane. The
+  teleprompter IS a manpage; nothing onboarding-specific about the
+  renderer itself.
+* **Substrate B ("Global Thought Bubble", ship 2.6.2)** -- a single
+  root-level overlay that can point at any UI element with explanatory
+  text (`globalThoughtBubble.target = someItem; .text = "..."; .show()`).
+  General-purpose from day one, per its own comment: "used by the guided
+  tour driver (2.6.3, future) AND any feature that wants to point at
+  something."
+* **Substrate C ("Guided Tour Driver", ship 2.6.3)** -- a declarative
+  script runner. A JS array of typed steps (`bubble`, `navigate`, `delay`,
+  `jobStatus`, `clearJob`) composing A+B+D. Steps advance on ack, timer,
+  or immediately depending on type. This is the actual reusable engine:
+  ANY guided flow in this app (not just voice onboarding) is just a script
+  for this runner.
+* **Substrate D (background job-status strip, ship 2.6.4)** -- a thin
+  strip at the window's bottom edge, visible while `job_status` is
+  non-empty, fading out on completion. Its own comment: "reusable for any
+  feature that wants to surface 'we're doing something long-running.'"
+  THIS IS THE ANSWER to the aperture "permanent banner + expansion"
+  design question from earlier this session -- the exact primitive
+  already exists, already battle-tested, and was explicitly designed with
+  onboarding named as only its FIRST intended consumer, not its only one.
+
+### Ship 2.6.5 is the actual onboarding flow -- and it reuses the ordinary voice popup, not a separate one
+
+The elegant part, worth preserving in any port: onboarding does NOT get
+its own capture UI. `onboardingActive` (a bool) makes the SAME voice
+popup's completion route to the speaker-registration dialog instead of
+normal intent dispatch, cleared on save/cancel. The comment states the
+reasoning directly: "lets us reuse the regular voice popup for capture
+without polluting the intent dispatch path with onboarding-specific
+branches." The registration dialog itself reads
+`backend.speaker_preview_color()` for the swatch, and there is a
+`v0.1.212 (ship 2.6.5)` comment confirming color preview from the LAST
+CAPTURED AUDIO specifically -- the suggested color is a real function of
+the voice sample, not a random/default assignment.
+
+### Custom vocab / command dictionaries: still not found, and now a clearer negative
+
+Re-checked with the fuller picture in hand. Nothing in this architecture
+loads a vocabulary from a config file -- the Guided Tour Driver's scripts
+are AUTHORED (presumably hand-written JS arrays somewhere, not yet
+located precisely) rather than user-configurable, and `voice_intent.rs`'s
+5,243 lines remain entirely hard-coded. The "custom ones to a config
+location" the original ask remembered may describe a planned-but-unbuilt
+extension of this system (a script or vocab file an end user could add
+without editing QML/Rust), not something already shipped. Worth a
+targeted follow-up search for the guided-tour SCRIPTS themselves (where
+are the actual `{ type: "bubble", ... }` arrays defined?) before
+concluding this piece never existed either -- not done in this pass.
+
+### The cross-app port, reframed by this finding
+
+The porting shape from earlier sessions (move a floating mic FAB into a
+bottom bar/sidebar per app) was solving a narrower problem than what
+actually exists to port. The real reusable unit is FOUR primitives (doc
+viewer, pointing overlay, script runner, status strip) plus the pattern of
+routing an existing capture UI's completion through a mode flag rather
+than building a parallel one. Per-app feasibility, using the bottom-bar/
+sidebar survey done earlier this session:
+
+* **voiceterm-egui**: has the mic FAB (the thing being relocated) and a
+  real bottom bar already. Best-positioned app for a full, faithful port
+  -- it is also the ORIGIN of all four substrates, so the port is "extract
+  and generalize," not "invent from a description."
+  Substrate D maps directly onto its existing bottom bar.
+* **aperture-egui**: has a real status bar (`egui::Panel::bottom
+  ("aperture_status")`) and a conditional command strip
+  (`aperture_cmd_strip`) -- Substrate D's job-status strip fits as an
+  expansion of the status bar exactly as scoped in this session's earlier
+  answer to the banner-plus-expansion question. Substrate A (doc viewer)
+  would need a real design decision: does aperture even want a manpage-
+  style reader, or does its own file-open path already cover "read
+  something"? Not decided here.
+* **studio**: NO assembled top-level app exists to receive any of this --
+  `studio-egui` is a widget-library crate with no `eframe::App` impl, no
+  bottom bar, no side panel; `studio-live` (a name in the original ask)
+  is a fully headless pattern/synth/DSP crate with no UI surface at all.
+  Porting voice-onboarding UI here is blocked on an assembled app existing
+  first, not on anything voice-specific -- a real, separate piece of work
+  this section does not attempt to scope.
+
+### Not started
+
+Nothing has been extracted, generalized, or ported. This section closes
+the "where did the training loop go" question with a real, precise answer
+and gives the next session an actual architecture to build FROM rather
+than guess AT -- which was the whole point of being told to read the QML
+and existing Rust before porting anything from these Qt/GTK predecessors.
