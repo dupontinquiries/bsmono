@@ -1614,3 +1614,67 @@ question than multi-user session/profile/settings ownership. Needs its
 own investigation pass: what "user" means per app (a phone's owner vs.
 guest? separate settings profiles? OS-level user accounts?), what
 already exists close to it app by app, before any design.
+
+
+---
+
+## 25. Multi-user handling: found in voiceterm-qt, precise scope, real port candidate
+
+Followed a direct lead rather than guess. "Multi-user" in voiceterm-qt is
+NOT accounts, profiles, or OS-level users -- it is per-speaker VOICE
+COMMAND ROUTING across multiple terminal panes, built directly on the
+existing speaker-fingerprint identity system (`speakers::current_active_id`,
+already ported and used elsewhere). `multi_user_active = !speakers::
+is_empty()` (voice.rs:826, main.rs:20535) is the literal gate.
+
+### The real mechanism, in `apps/voiceterm/src/pane_voice.rs` (383 lines)
+
+Two structs, both pure, both zero `crate::` dependencies (confirmed by
+grep before scoping this as portable, not assumed):
+
+* `VoiceRouting` -- per-speaker pane targeting and broadcast sets.
+  `set_target("alice", 1)` + `set_target("bob", 2)` means Alice's spoken
+  commands go to pane 1, Bob's to pane 2, independently
+  (`routing_is_per_speaker_and_independent` is a real, already-passing
+  test pinning exactly this). `resolve(spk)` returns broadcast-set (if
+  non-empty) > single target (if set) > the focused pane, in that order.
+  A pane closing forgets it everywhere (`forget_pane`) so nothing keeps
+  writing into a dead pane.
+* `MicBindings` -- the more robust alternative for the common one-mic-
+  per-person setup: bind a physical input DEVICE directly to a pane, so
+  routing needs no diarization at all -- "the hardware already tells us
+  the source" (the module's own words, and a real engineering point: a
+  device-level binding cannot misidentify a speaker the way an acoustic
+  fingerprint occasionally can).
+* Spoken command parsing (`parse`, "send to pane 2", "broadcast to all",
+  "clear target") that these two structs consume -- also pure, also
+  tested, also portable as-is.
+
+### egui side: checked, and there is nothing here yet
+
+`voiceterm-egui/src/voice_routing.rs` (340 lines) exists but is a DIFFERENT
+concept entirely -- "who gets to act on the microphone" (passive
+fingerprinting/VAD taps vs. one exclusive command-or-dictation interpreter
+at a time), confirmed by reading it: zero pane-routing logic, zero
+`VoiceRouting`/`MicBindings` equivalent. Real, already-ported work, just
+not this. `pane_voice.rs`'s actual mechanism has no egui port at all.
+
+### Shape of the port, not yet started
+
+1. `pane_voice.rs` -> a new module in `voiceterm-egui` (or a shared crate,
+   if snapclone's multi-pane surfaces or another egui app turns out to
+   want the same routing shape -- not decided here). Verbatim move is
+   plausible given the zero-dependency confirmation above, the same
+   discipline `iio-source`/`voiceprint-kit` used.
+2. A UI surface to SET routing (voiceterm-qt's "multi-user routing panel",
+   per `VoiceRouting::entries()`'s own doc comment) -- not designed here,
+   needs the QML panel read the way `voicePopup`'s real layout was read
+   for section 24, not guessed.
+3. Wiring `speakers::current_active_id()` (or the egui port's own speaker
+   identity, if one exists independently of `speakers.rs` -- not checked
+   yet) as the `spk: &str` key `resolve`/`set_target` actually take.
+
+Not started. Recorded with the real mechanism identified precisely so the
+next pass builds the actual feature rather than a plausible-sounding
+guess about "multi-user" (accounts, profiles) that would have been the
+wrong thing entirely.
