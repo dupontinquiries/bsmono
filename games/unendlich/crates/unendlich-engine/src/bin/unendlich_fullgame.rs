@@ -16944,20 +16944,30 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // stationary" repro (see log.log / log-no-indirect-draw.log):
             // both those runs ruled out UNENDLICH_INDIRECT as the cause
             // (same blowup with it on either way), and shadow cost wasn't
-            // the dominant term (main dwarfed it throughout). Left
-            // unexplained: main-pass time grew much faster than the
-            // "rendering" (visible chunk) count did. This line gives the
-            // next repro the number needed to tell "more draw slots than
-            // visible chunks" (a leak in indirect-slot freeing) apart from
-            // "same slot count, each one costing more" (driver-side, e.g.
-            // thermal throttling or per-chunk shader/descriptor cost
-            // actually rising) -- compare indirect_in_use against the
-            // "rendering" count above once both are in the log.
+            // the dominant term (main dwarfed it throughout). A follow-up
+            // repro (2026-09-14 21:42 session) then ruled out a slot leak
+            // too: in_use tracked "rendering" almost exactly (27 vs 29,
+            // 35 vs 40) across the same run where main-pass time stayed
+            // ~2s regardless of a render-distance drop between frames and
+            // didn't track rendering count either -- so it's neither "more
+            // draw slots than visible chunks" (leak) nor simply "more
+            // chunks" driving the cost. Left open: whether it's "same
+            // chunk count, each one costing more" (driver-side -- thermal,
+            // e.g.) or "one chunk with pathological geometry" (a generated
+            // structure/ruin far denser than typical terrain, invisible to
+            // a chunk-count metric). max_index_count/total_index_count
+            // below are what the next repro needs to tell those apart: a
+            // max spike with total roughly flat points at one dense chunk;
+            // both flat while main still spikes points off this whole
+            // geometry-volume axis entirely (driver/thermal/environmental).
             log::info!(
-                "  indirect: in_use={} high_water={} capacity={}",
+                "  indirect: in_use={} high_water={} capacity={} max_idx={} total_idx={} (~{} tris)",
                 renderer.indirect_in_use(),
                 renderer.indirect_high_water(),
                 renderer.indirect_capacity(),
+                renderer.indirect_max_index_count(),
+                renderer.indirect_total_index_count(),
+                renderer.indirect_total_index_count() / 3,
             );
             // v0.24.18: push these same values into the thread probe's
             // engine_state pseudo-thread so the sampler's per-100ms

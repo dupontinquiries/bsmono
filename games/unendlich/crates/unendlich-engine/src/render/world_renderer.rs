@@ -7289,6 +7289,23 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
         self.indirect.high_water()
     }
 
+    /// r-chunk-geometry-diag: largest single active chunk's index count
+    /// this frame (triangle count = this / 3). See
+    /// `IndirectDrawSet::max_index_count`'s doc for why this exists --
+    /// distinguishing "many ordinary chunks" from "one chunk with
+    /// pathological geometry" when main-pass GPU time doesn't track the
+    /// visible chunk count.
+    pub fn indirect_max_index_count(&self) -> u32 {
+        self.indirect.max_index_count()
+    }
+
+    /// r-chunk-geometry-diag: total index count summed across all active
+    /// chunks this frame -- the real triangle budget, as opposed to
+    /// `in_use` which only counts how many chunks, not how big each is.
+    pub fn indirect_total_index_count(&self) -> u64 {
+        self.indirect.total_index_count()
+    }
+
     /// Count of uploaded meshes per LOD level (Near, Mid, Far, VeryFar). Near
     /// chunks are full-detail (the expensive ones); pulling `UNENDLICH_LOD_BANDS`
     /// inward shifts chunks to coarser LODs, cutting mesher memory pressure.

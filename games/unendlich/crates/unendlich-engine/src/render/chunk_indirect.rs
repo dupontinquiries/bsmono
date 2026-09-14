@@ -384,6 +384,32 @@ impl IndirectDrawSet {
     pub fn high_water(&self) -> u32 { self.high_water }
     pub fn in_use(&self) -> u32 { self.capacity - self.free_list.len() as u32 }
 
+    /// r-chunk-geometry-diag: largest single chunk's index count among all
+    /// currently-active slots (0 if none active). `ChunkDraw::empty()`
+    /// zeroes `index_count`, and nothing else sets it to 0 for a slot that's
+    /// actually holding a chunk's mesh, so scanning for nonzero entries finds
+    /// exactly the in-use slots without needing to cross-reference
+    /// `free_list`. Triangle count is `index_count / 3`.
+    ///
+    /// Exists to answer a question the aggregate `in_use`/`high_water`
+    /// counts can't: whether a main-pass GPU time spike that doesn't track
+    /// visible CHUNK COUNT is instead one chunk carrying pathologically
+    /// dense geometry (e.g. a generated structure/ruin far denser than
+    /// typical terrain) -- max index_count would spike while in_use stays
+    /// flat, which total/mean alone wouldn't show.
+    pub fn max_index_count(&self) -> u32 {
+        self.cpu_shadow.iter().map(|d| d.index_count).max().unwrap_or(0)
+    }
+
+    /// Sum of index_count across all active slots -- the actual total
+    /// triangle budget being submitted this frame (`/ 3` for triangle
+    /// count), as opposed to `in_use` which only counts chunks, not their
+    /// individual complexity. u64 since capacity (thousands) x a busy
+    /// chunk's index count (tens of thousands) can exceed u32 comfortably.
+    pub fn total_index_count(&self) -> u64 {
+        self.cpu_shadow.iter().map(|d| d.index_count as u64).sum()
+    }
+
     /// The chunk-metadata SSBO. Exposed for binding into the chunk and
     /// shadow graphics pipelines at descriptor binding 3 — the vertex
     /// shader reads `chunks[gl_InstanceIndex].aabb_min` to recover each
