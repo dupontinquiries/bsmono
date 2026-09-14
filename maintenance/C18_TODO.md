@@ -1128,3 +1128,43 @@ than guessed at a third time.
 `it_does_not_care_which_side_is_ink` and `it_reads_a_board_off_a_frame` fail
 for the same underlying reason (both read real boards containing digits
 close to this same confidence floor) and should clear once bug 2 does.
+
+---
+
+## 18. voiceprint-kit exists, is unconsumed, and a checker cites a TODO item that was never written down
+
+Found while executing section 13's voice-popup extraction: `phonetic.rs`
+and `acoustic_index.rs`, the two modules that made the popup core's real
+closure ~4,969 lines instead of ~1,200, ALREADY have a pure extraction —
+`shared/voiceprint-kit` (386 lines), whose own header says it was "lifted
+VERBATIM from apps/voiceterm (phonetic.rs's MFCC pipeline and
+acoustic_index.rs's 39-dimensional utterance fingerprint)."
+
+**voiceterm does not consume it.** `grep -c voiceprint_kit:: src/phonetic.rs
+src/acoustic_index.rs` is 0/0. Confirmed the two are still byte-identical
+duplicates (`N_MFCC`/`N_MEL`/`FRAME_SIZE`/`FRAME_HOP` match exactly). So
+this is the `bo-controller` situation exactly: a correct shared crate
+exists, and the original app still carries its own live copy nobody
+repointed.
+
+`maintenance/tools/voiceprint_parity_check.py` already guards the drift —
+good, and it explains ITSELF clearly why this is not a trivial repoint
+("touches voiceterm's AI01->AI02 bundle format, not a small change") — but
+its docstring cites the real fix as "recorded as C12-2a in
+maintenance/C12_TODO.md," and that file has no such entry. Either the
+session that wrote the checker never actually filed the TODO item, or it
+was filed and later lost. Either way, the pointer is dead, and a dead
+pointer in a checker's own docstring is worse than no pointer: it tells
+the next reader information exists where it does not, costing them a
+search rather than saving them one — which is exactly what it cost this
+session, tracing it down to confirm before writing this entry.
+
+Not fixed here (the repoint is real, non-trivial, bundle-format-touching
+work per the checker's own accurate description, not something to attempt
+at the tail of an unrelated extraction). Filed HERE instead of inventing a
+new C12-2a, since C12's own numbering is not this session's to extend
+correctly without the original context that assigned it. Whoever does the
+repoint should also fix the checker's docstring to point at wherever the
+real record ends up (this section, or a properly filed C12-2a if the
+original intent can be reconstructed) — a docstring that cites a phantom
+record should not survive past whoever notices it.
