@@ -1263,9 +1263,27 @@ impl WorldRenderer {
         if std::env::var("UNENDLICH_NEURAL_TRAIN_SELFTEST").ok().as_deref() == Some("1") {
             crate::render::neural_train::TrainMlp::self_test(2000);
         }
+        // r476: frames in flight default 2 (CPU/GPU overlap — the single biggest
+        // smoothness win on Asahi). Metadata SSBO is double-buffered so >1 is
+        // crash-safe. Override with UNENDLICH_FRAMES_IN_FLIGHT (=1 old behavior).
+        //
+        // Hoisted up here (was originally computed further down, right before
+        // the `frames: Vec<FrameSync>` loop) so `EntityPipeline::new` below
+        // can be told the real value instead of guessing -- r-entity-uaf
+        // needs it to size its retired-buffer countdown correctly.
+        let frames_in_flight: usize = std::env::var("UNENDLICH_FRAMES_IN_FLIGHT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(1, MAX_FRAMES_IN_FLIGHT))
+            .unwrap_or(2);
+        log::info!(
+            "WorldRenderer: frames_in_flight = {} (cap {}; UNENDLICH_FRAMES_IN_FLIGHT)",
+            frames_in_flight, MAX_FRAMES_IN_FLIGHT
+        );
         let entity_pipeline = EntityPipeline::new(
             &ctx.device, render_pass, pipeline.descriptor_set_layout,
             unsafe { ctx.instance.get_physical_device_memory_properties(ctx.physical_device) },
+            frames_in_flight,
         )?;
 
         let command_pool = unsafe {
@@ -1363,18 +1381,8 @@ impl WorldRenderer {
             )?
         };
 
-        // r476: frames in flight default 2 (CPU/GPU overlap — the single biggest
-        // smoothness win on Asahi). Metadata SSBO is double-buffered so >1 is
-        // crash-safe. Override with UNENDLICH_FRAMES_IN_FLIGHT (=1 old behavior).
-        let frames_in_flight: usize = std::env::var("UNENDLICH_FRAMES_IN_FLIGHT")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|n| n.clamp(1, MAX_FRAMES_IN_FLIGHT))
-            .unwrap_or(2);
-        log::info!(
-            "WorldRenderer: frames_in_flight = {} (cap {}; UNENDLICH_FRAMES_IN_FLIGHT)",
-            frames_in_flight, MAX_FRAMES_IN_FLIGHT
-        );
+        // frames_in_flight computed earlier (hoisted above EntityPipeline::new
+        // construction) -- reused here for the FrameSync array.
         let mut frames = Vec::with_capacity(frames_in_flight);
         for i in 0..frames_in_flight {
             let image_available = unsafe { ctx.device.create_semaphore(&vk::SemaphoreCreateInfo::builder(), None)? };
@@ -3463,10 +3471,13 @@ impl WorldRenderer {
     /// `AtmosphereParams::neutral()` (mid-day clear sky), suitable for
     /// tests and headless paths that have no climate data.
     /// Upload this frame's baked entity geometry (from
-    /// [`crate::world::entity::snapshot_to_vertices`]). Call after the frame
-    /// fence wait and before `draw_frame`, since the entity buffers are
-    /// single-buffered host memory. Infallible: a failed upload just skips the
-    /// mobs this frame rather than killing the frame.
+    /// [`crate::world::entity::snapshot_to_vertices`]). Call any time before
+    /// `draw_frame` for the frame currently being built. Growth of the
+    /// underlying buffers no longer requires a prior fence wait -- see the
+    /// r-entity-uaf doc in `entity_pipeline`'s module comment; the old buffer
+    /// is retired and reclaimed later by `process_retired`, which
+    /// `draw_frame_with_view_and_atmos` already calls every frame. Infallible:
+    /// a failed upload just skips the mobs this frame rather than killing it.
     pub fn upload_entities(
         &mut self,
         ctx: &VulkanContext,
@@ -3563,6 +3574,9 @@ impl WorldRenderer {
 
         // Tick deferred destroys at the start of the frame.
         self.process_pending_destroys(ctx);
+        // r-entity-uaf: same deferred-free discipline, same timing, for the
+        // entity/creature vertex+index buffers' retired-on-growth pairs.
+        self.entity_pipeline.process_retired(&ctx.device);
 
         let aspect = self.swapchain.extent.width as f32 / self.swapchain.extent.height as f32;
         let vp = view.view_projection(aspect);
