@@ -160,7 +160,7 @@ impl SyncPlan {
         let mut batches = Vec::new();
         let mut cur: Vec<ChunkEditRecord> = Vec::new();
         let mut cur_bytes = 6usize; // magic + count
-        let mut push_cur = |cur: &mut Vec<ChunkEditRecord>, cur_bytes: &mut usize, batches: &mut Vec<Vec<u8>>| {
+        let push_cur = |cur: &mut Vec<ChunkEditRecord>, cur_bytes: &mut usize, batches: &mut Vec<Vec<u8>>| {
             if !cur.is_empty() {
                 batches.push(encode_records(cur));
                 cur.clear();

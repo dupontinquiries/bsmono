@@ -39,7 +39,12 @@ pub fn absorbency(block: BlockId) -> u8 {
         | Marble | Calcite | MossyCobblestone | PolishedStone | PolishedBasalt | ChiseledStoneBricks | SmoothSandstone | Terracotta
         | Selenite | Gypsum | Dolomite | Sulfur | Magma => 60, // stone takes a film
         GoldOre | IronOre | CoalOre | CopperOre | DiamondOre => 60,
-        Glass | Ice | Obsidian | Quartz | Crystal | Amber | IronBlock | GoldBlock | Bone | Selenite | GlowCrystal => 30,
+        // `Selenite` removed here: it already matches the stone-family arm
+        // above (60), which made this copy unreachable — rustc's own
+        // "unreachable pattern" warning, not a guess. `GlowCrystal` is a
+        // distinct pattern in the same arm and was never affected; only
+        // the duplicated `Selenite` was dead.
+        Glass | Ice | Obsidian | Quartz | Crystal | Amber | IronBlock | GoldBlock | Bone | GlowCrystal => 30,
     }
 }
 

@@ -5592,7 +5592,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                             bar(ui, "Stamina", sv.stamina, egui::Color32::from_rgb(90, 200, 170));
                             ui.add_space(3.0);
                             // thermal: comfort −1..1 → bar fill from center; blue cold, green ok, red hot.
-                            let c01 = (sv.comfort.clamp(-1.0, 1.0) * 0.5 + 0.5);
+                            let c01 = sv.comfort.clamp(-1.0, 1.0) * 0.5 + 0.5;
                             let warmth = sv.comfort.clamp(-1.0, 1.0);
                             let tcol = if warmth < -0.25 {
                                 egui::Color32::from_rgb(90, 150, 220) // cold

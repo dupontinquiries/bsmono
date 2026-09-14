@@ -1517,7 +1517,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // three Späher that fed the Sentinel flock were spawn-area scaffolding. Real
     // creatures now come solely from the streamed ambient ecosystem (SpawnStreamer)
     // below. Kept as an empty vec so the loop that renders/updates it is unchanged.
-    let mut test_creatures: Vec<unendlich_engine::creature::Creature> = Vec::new();
+    let test_creatures: Vec<unendlich_engine::creature::Creature> = Vec::new();
     log::info!("Test creatures disabled (was demo Dragon + Späher)");
 
     // Ambient ecosystem, STREAMED around the player. The SpawnStreamer tracks
@@ -2194,7 +2194,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         .map(|v| v != "0" && !v.is_empty()).unwrap_or(true);
     let cam_shake_on = std::env::var("UNENDLICH_CAM_SHAKE")
         .map(|v| v != "0" && !v.is_empty()).unwrap_or(true);
-    let mut fp_body: bool = true;
+    let fp_body: bool = true;
     let mut self_avatar: Option<unendlich_engine::creature::Creature> = None;
     let mut self_avatar_dirty = true; // rebuild from active_character on next use
     let mut self_avatar_prev: Option<[f32; 3]> = None; // for deriving avatar velocity
@@ -4824,6 +4824,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // GPU generator exists. When `auto` declined to build one, the panel text says the
             // GPU choice applies at the next launch — nothing to do here but persist it.
             let want_gpu = renderer.ui_gen_backend != 1;
+            // `generator` was moved into `ChunkManager::new` back at its
+            // construction — `ChunkManager` owns the one `Arc`, and
+            // `.generator()` hands back a `&Arc<TerrainGenerator>` rather
+            // than this scope holding a second handle to it. Cloning the
+            // Arc before the move would also fix the compile error, but it
+            // would leave two owners where the code already has an
+            // accessor built for exactly one.
+            let generator = chunk_manager.generator();
             if generator.gpu_enabled() != want_gpu {
                 generator.set_gpu_enabled(want_gpu);
                 log::info!("[settings] terrain generation -> {} (gpu generator present: {})",

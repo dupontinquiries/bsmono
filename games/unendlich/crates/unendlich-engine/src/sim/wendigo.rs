@@ -51,7 +51,6 @@
 use crate::sim::elemental::Element;
 use crate::sim::fixed::Vec3;
 use crate::sim::legendary_weapon::WeaponClass;
-use crate::world::blocks::BlockId;
 
 // ─────────────────────────── shared gate/hunt core ───────────────────────────
 

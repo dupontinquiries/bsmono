@@ -17,7 +17,6 @@
 //!
 //! Pure/integer/deterministic; reuses the real brick constants so it can't drift.
 
-use crate::constants::CHUNK_SIZE;
 use crate::world::mesh_brick::{brick_index_of, BRICKS_PER_AXIS, BRICK_SIZE};
 
 /// One dirtied brick: the chunk it lives in and its 0..64 index within that chunk.

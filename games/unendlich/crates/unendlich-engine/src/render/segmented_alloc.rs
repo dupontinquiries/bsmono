@@ -23,7 +23,7 @@
 //! and why it's staged separately, same discipline as the
 //! `mesh_dirty_integration_sketch.md` precedent.
 
-use super::mesh_buffer_alloc::{align_up, AllocError, SpanAllocator};
+use super::mesh_buffer_alloc::{align_up, SpanAllocator};
 
 /// A span within a specific segment. Unlike `mesh_buffer_alloc::Span`,
 /// this carries WHICH segment (buffer) the span lives in — the caller

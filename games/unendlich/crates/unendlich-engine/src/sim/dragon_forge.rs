@@ -219,7 +219,7 @@ fn build_solids(p: &Proportions, glow: bool) -> (Vec<Solid>, Vec<Emis>) {
 
     // ---- legs: 2 segments + toes ----
     let reared = p.pose;
-    let mut leg = |solids: &mut Vec<Solid>, root: V3, side: f32, front_: bool| {
+    let leg = |solids: &mut Vec<Solid>, root: V3, side: f32, front_: bool| {
         let root_s = [root[0] + side * (hip_r * 0.85), root[1] - 0.05, root[2]];
         let mut foot_y = 0.0f32;
         let mut foot_z = root[2] + if front_ { 0.35 } else { -0.25 };
@@ -256,7 +256,7 @@ fn build_solids(p: &Proportions, glow: bool) -> (Vec<Solid>, Vec<Emis>) {
     // ---- wings: bones + membrane ----
     let (span, spread) = (p.wing_span, p.wing_spread);
     let wing_thick = 0.045 * p.bulk; // membrane half-thickness (≈ finger radius, so it voxelises)
-    let mut wing = |solids: &mut Vec<Solid>, side: f32| {
+    let wing = |solids: &mut Vec<Solid>, side: f32| {
         let base = [sh_p[0] + side * sh_r * 0.8, sh_p[1] + 0.25, sh_p[2] - 0.1];
         let elbow = [base[0] + side * (1.1 * span), base[1] + 0.9 * spread + 0.5, base[2] - 0.5 * spread - 0.3];
         let wrist = [elbow[0] + side * (1.5 * span), elbow[1] + 0.3 * spread, elbow[2] - 1.4 * span * spread - 0.2];
@@ -467,7 +467,7 @@ fn voxelize(solids: &[Solid], emis: &[Emis], res: u32) -> (Vec<ForgeBox>, V3, V3
     let mut occ = vec![0u8; gx * gy * gz];
     let at = |ix: usize, iy: usize, iz: usize| ((ix * gy) + iy) * gz + iz;
 
-    let mut stamp = |occ: &mut [u8], lo: V3, hi: V3, v: u8, test: &dyn Fn(f32, f32, f32) -> bool| {
+    let stamp = |occ: &mut [u8], lo: V3, hi: V3, v: u8, test: &dyn Fn(f32, f32, f32) -> bool| {
         let ix0 = (((lo[0]-mn[0]) / cell).floor().max(0.0)) as usize;
         let ix1 = ((((hi[0]-mn[0]) / cell).ceil()) as usize).min(gx - 1);
         let iy0 = (((lo[1]-mn[1]) / cell).floor().max(0.0)) as usize;

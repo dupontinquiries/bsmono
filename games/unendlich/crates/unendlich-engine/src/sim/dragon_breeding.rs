@@ -32,7 +32,7 @@ fn mix(dom: f32, rec: f32, jit: f32) -> f32 {
 /// Deterministic in `(a, b, seed)`.
 pub fn cross(a: &Genome, b: &Genome, seed: u64) -> Genome {
     let mut s = seed ^ 0xD3A6_0_u64.wrapping_mul(0x9E37_79B9);
-    let mut gene = |x: f32, y: f32, s: &mut u64| {
+    let gene = |x: f32, y: f32, s: &mut u64| {
         let coin = unit(s);
         let (dom, rec) = if coin < 0.5 { (x, y) } else { (y, x) };
         let jit = (unit(s) - 0.5) * 0.06; // ±0.03
