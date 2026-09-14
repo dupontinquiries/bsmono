@@ -481,24 +481,55 @@ than committing (`av1tuner`'s six `crate::X`-should-be-`super::X` paths and
 `bo-suite`'s two dedups were both about respecting an existing boundary,
 not inventing a bigger one).
 
-The real target is narrower than "all of voice.rs": just the
-recording-lifecycle and preview-buffer surface a POPUP needs to call --
-`begin_capture`, `cancel_recording`, `finish_recording`,
-`get_partial_preview[_words]`, `clear_partial_preview`,
-`update_partial_preview_words`, `pop_wake_event`,
-`set_wake_suppressed`/`is_wake_suppressed` — a subset of voice.rs's 51
-public items, not all of them. Model resolution and hallucination filtering
-stay exactly where `voice-kit` already correctly has them; wake-word
-detection internals, whisper invocation and the cpal capture loop are
-implementation details behind the handful of functions above and do not
-need to move anywhere to be called from a shared popup.
+### The real popup surface, read from every call site rather than guessed
 
-Scoping which of the 51 belong in that surface and which stay
-voiceterm-private is real work not done here — it needs reading each
-caller, the way `board_layouts::dispatch`'s extraction earlier this session
-checked every call site in `keyboard_view.rs` before moving anything.
-Guessing the list from function names alone risks the same wrong-nesting
-mistake `av1tuner`'s port made twice in one turn.
+Corrected again, this time by doing the read the previous version of this
+section deferred. `voice::` is called 77 times from `main.rs`, across 32
+distinct functions — not the "~8-10" guessed earlier from function names
+alone. Grepping `voice::FN` gave the full list; reading each call site's
+surrounding QObject method (the actual QML binding, not the Rust name)
+separated it into two real groups.
+
+**The popup surface — 10 functions, all clustered around the QML-facing
+methods `voice_listen`, `voice_begin_capture`, `voice_cancel`,
+`voice_finish`, `voice_listen_dual`, `voice_partial_preview[_words]`,
+`voice_pop_wake_event`, `voice_set_wake_suppressed`,
+`voice_is_wake_suppressed`:**
+
+    begin_capture              cancel_recording         finish_recording
+    listen                     listen_with_audio
+    get_partial_preview        get_partial_preview_words
+    pop_wake_event
+    set_wake_suppressed        is_wake_suppressed
+
+The doc comments on the QObject methods ARE the popup contract, verified
+rather than inferred: `voice_set_wake_suppressed`'s comment says "QML
+controls wake suppression — set true on popup open, false on close.
+Prevents a wake firing mid-foreground-utterance" (confirming the wake-
+suppression rule this section already named from pty_term.rs/main.rs
+independently), and `voice_pop_wake_event`'s says the captured audio is
+stashed for "the next voice flow (which QML triggers in response)" —
+naming the exact hand-off a shared popup has to reproduce.
+
+**Stays in voiceterm, not part of a shared surface — the other 22:**
+tuning knobs (`set_whisper_interval_ms`, `set_phonetic_interval_ms`,
+`set_force_tiny_tier`, `set_fast_finalize`), device/model plumbing
+(`input_device_names`, `prewarm`, `warmup`, `is_available`), wake-phrase
+persistence (`registered_wake_phrase`, `set_registered_wake_phrase`,
+`load_registered_wake_phrase_from_disk`), and diagnostics
+(`wake_bursts_detected`, `wake_fired_count`, `wake_last_rms`,
+`pop_bg_transcription`, `pop_ask_ai_event`). These configure or introspect
+the engine; a popup does not need to call them to draw itself, and several
+(the wake-phrase setters) are settings-page concerns in the Qt build, not
+popup concerns.
+
+The remaining design question — worth stating rather than deciding here —
+is whether `pop_wake_event`'s `last_audio_buffer` hand-off (currently: the
+QObject stashes it as a field, and a SEPARATE QML-triggered call reads it
+back out) can cross a plain function-call shared surface at all, or whether
+it needs an explicit return value instead of an implicit stash-and-fetch.
+That is a real API decision for whoever builds the surface, not something
+to default without picking.
 
 Original dependency order, steps 2-4 unchanged:
 
@@ -523,10 +554,14 @@ Original dependency order, steps 2-4 unchanged:
 corpus ("voice popups the user cancelled without executing"), so the cancel
 path has a consumer and is not merely a dismiss.
 
-**Still not started.** The corrected step 1 is smaller than the original
-mis-scoped one, but still real work: choosing the exact function subset
-needs reading every call site first, which is a session in itself, not
-something to guess through in the remaining budget of this one.
+**Scoping done; extraction not started.** The function list above is
+derived from every real call site, not guessed — that was the actual risk
+in this task, per `av1tuner`'s two wrong-nesting attempts earlier this
+session, and it is now closed. What remains is mechanical: move the 10
+functions and their module-static backing state into a new crate, leave
+the other 22 in `voiceterm`, and fix up `voice.rs`'s internal references
+the way `bo-controller`'s `passby_canceller`/`masker` re-exports did. Real
+work, but no longer work that can go wrong from a wrong guess about scope.
 
 ---
 
