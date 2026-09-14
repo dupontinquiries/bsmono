@@ -5792,6 +5792,16 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
         //
         // This must run BEFORE `begin_frame` resets the slot — once
         // we reset, the previous results are gone.
+        //
+        // r-gpu-guard-wait: this fence wait is also *why* dropping
+        // QueryResultFlags::WAIT inside collect_frame (see its own
+        // comment) costs nothing in the normal case -- by the time we
+        // get here, the fence has already guaranteed the GPU finished
+        // writing this slot's queries, so a non-blocking poll finds
+        // them available immediately. The only case a poll can come up
+        // empty is the pre-existing "never recorded into yet" first-
+        // cycle case, which was always handled by the availability
+        // check regardless of the WAIT flag.
         self.gpu_timer.collect_frame(frame_idx as u32);
 
         // v0.24.3 chug-debug-2: pull the per-frame GPU zone breakdown

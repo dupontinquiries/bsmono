@@ -406,6 +406,27 @@ impl GpuTimer {
         let mut data: [[u64; 2]; MAX_ZONES as usize] = [[0; 2]; MAX_ZONES as usize];
         let first = self.query_index(frame_idx, Marker::FrameStart);
 
+        // r-gpu-guard-wait: deliberately NOT passing QueryResultFlags::WAIT.
+        // This call used to block until the driver confirmed every query
+        // available -- fine on a healthy frame (the result is already
+        // sitting there), but this is also the data feed for gpu_guard,
+        // the thing that's supposed to react FAST to a runaway GPU. A
+        // blocking wait here means the guard's own instrumentation can
+        // itself stall on the GPU precisely when the GPU is already the
+        // problem -- delaying the guard's reaction by exactly the
+        // pathology it exists to catch. Per the Vulkan spec,
+        // WITH_AVAILABILITY without WAIT is the standard non-blocking
+        // poll idiom: if a query isn't ready yet, the implementation
+        // writes 0 to its availability slot (its data slot is left
+        // undefined) instead of blocking -- which is exactly the "not
+        // ready, skip and try again next frame" case the availability
+        // loop below already handles (it was written for the first-
+        // cycle-through-a-slot case, but the check itself doesn't care
+        // WHY availability is 0, so it's correct for this case too with
+        // no further changes). Worst case with this change: a slow frame
+        // now also costs a skipped telemetry sample instead of a CPU
+        // stall, which is a strict improvement -- the render loop already
+        // treats a missing sample as "no data this round," not an error.
         let result = unsafe {
             self.device.get_query_pool_results::<[u64; 2]>(
                 self.pool,
@@ -413,7 +434,6 @@ impl GpuTimer {
                 MAX_ZONES,
                 &mut data,
                 vk::QueryResultFlags::TYPE_64
-                    | vk::QueryResultFlags::WAIT
                     | vk::QueryResultFlags::WITH_AVAILABILITY,
             )
         };
@@ -427,10 +447,15 @@ impl GpuTimer {
             }
         }
 
-        // Validate availability defensively: on the first cycle
-        // through a slot the queries are unwritten. With WAIT, this
-        // path only fires when the slot has genuinely never been
-        // recorded into yet (first MAX_FRAMES_IN_FLIGHT frames).
+        // Validate availability defensively: a query can be unavailable
+        // either because this is the first cycle through this slot (never
+        // recorded into yet, first MAX_FRAMES_IN_FLIGHT frames) or --
+        // since r-gpu-guard-wait dropped the WAIT flag above -- simply
+        // because the GPU hasn't finished this slot's work yet on a busy
+        // frame. Either way the right response is the same: skip this
+        // round's telemetry and let the next `collect_frame` call catch
+        // it once it's actually ready, rather than blocking to force the
+        // answer now.
         for i in 0..MAX_ZONES as usize {
             if data[i][1] == 0 {
                 self.skipped_frames += 1;

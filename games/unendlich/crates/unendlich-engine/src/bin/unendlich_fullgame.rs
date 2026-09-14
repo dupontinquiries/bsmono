@@ -2966,37 +2966,45 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // r-breadcrumb-fix: `frame_count` above is ALSO the per-second FPS
     // window counter -- it's reset to 0 every ~1s at the bottom of the
     // "if last_log.elapsed() >= 1s" logging block (it's literally the
-    // number printed as "FPS:"). That's fine for FPS math, but ~90 other
+    // number printed as "FPS:"). That's fine for FPS math, but many other
     // call sites in this file read `frame_count` as if it were a
-    // monotonic lifetime frame index (`% 600`, `% 1800`, `% 7200` pacing
-    // for weather/roamers/fire-spread/tutorial timers, RNG seeding,
-    // catch-up-tick deltas). Those almost never reach the larger moduli
-    // before getting zeroed, so they fire far less reliably than their
-    // authors intended -- confirmed independently via the breadcrumb log,
-    // where the `frame_count == 0` heartbeat check below fired 15 times
-    // in ~20 seconds (once per FPS-window reset) instead of once at
-    // actual startup, and the `% 600` "alive" heartbeat never fired at
-    // all. `lifetime_frame` is the genuine monotonic counter.
+    // monotonic lifetime frame index -- cadence gates, stored-then-later-
+    // compared timestamps (tutorial launch frame, per-roamer AI catch-up
+    // ticks, a reveal-log delta), continuous animation phase (spin/walk-
+    // cycle/menu-yaw -- these would visibly snap back to 0 every second),
+    // and cycling-index selectors (`(frame_count / 240) % 6`, which under
+    // the bug is very nearly ALWAYS 0, since frame_count rarely reaches
+    // 240 before reset -- the "cycle" never actually cycled). Confirmed
+    // independently via the breadcrumb log: the `frame_count == 0`
+    // heartbeat check fired 15 times in ~20 seconds (once per FPS-window
+    // reset) instead of once at actual startup, and the `% 600` "alive"
+    // heartbeat never fired at all. `lifetime_frame` is the genuine
+    // monotonic counter.
     //
-    // Repointed at it: the breadcrumb heartbeat, plus every cadence check
-    // with modulus >= 120 (17 sites: weather/fire-spread/roamer-spawn-
-    // director/tutorial/hot-metal/imbue/autotune/rest-log timers at 120,
-    // 240, 300, 600, 1800, 2700, 7200) -- those moduli are unreachable
-    // under the old reset-every-~1s behavior at any normal framerate, so
-    // there was no "intended behavior" to preserve; switching them is an
-    // unambiguous fix, not a judgment call.
+    // Repointed at it (two passes): the breadcrumb heartbeat; every
+    // cadence check with modulus >= 120 (weather/fire-spread/roamer-
+    // spawn-director/tutorial/hot-metal/imbue/autotune/rest-log timers);
+    // then, on review, every remaining site that stores-and-later-compares
+    // a frame count (tutorial launch frame, roamer catch-up ticks, reveal-
+    // log delta -- all silently broken by the reset the same way, just
+    // less obviously than a stuck modulus), every remaining cadence check
+    // regardless of modulus size (consistency: even a % 30 with fps under
+    // 30 is fps-dependent-flaky rather than a stable cadence, so there's
+    // no real "already fine" case left to protect), the cycling-index
+    // selectors, the animation-phase reads, and the `FloraCell::sown`
+    // "planted_tick" writes (checked: currently write-only, nothing reads
+    // it back for growth timing yet -- fixed anyway since it's free and
+    // forward-looking for whenever something does).
     //
-    // Deliberately left alone: cadence checks with modulus <= 90 (~30,
-    // 40, 45, 60, 67, 90). At typical framerates (30-144fps) frame_count
-    // can still reach these before the ~1s reset, so they land close to
-    // their intended real-world cadence already -- switching them is a
-    // real behavior change (their timing shifts from "roughly once a
-    // second-ish, fps-dependent" to "exactly every N true frames") for
-    // uncertain benefit, so each one needs its own look rather than a
-    // bulk pass. Also left alone: RNG seeding uses of `frame_count`
-    // (e.g. `frame_count as u64 ^ ...`) -- reading a resetting-but-still-
-    // varying counter doesn't break anything there, only cadence checks
-    // that compare it against a fixed residue actually malfunction.
+    // Left alone: pure RNG seed-mixing where the value is XORed/multiplied
+    // into a seed and immediately consumed for one draw, never stored or
+    // compared (e.g. `fg_world_seed ^ (frame_count as u64)` feeding a
+    // one-shot spawn/genome roll) -- a resetting-but-still-varying input is
+    // harmless there, and touching dozens of such sites for no behavior
+    // change isn't worth the diff noise. Also left alone: `frame_count`'s
+    // own bookkeeping (declaration/increment/reset) and the three places
+    // it's threaded into the FPS summary log/events (it IS the FPS number
+    // there, correctly).
     let mut lifetime_frame: u64 = 0;
     // Reusable buffer for mesh_pool.drain_up_to_into — avoids per-frame Vec alloc.
     let mut drained_buf: Vec<unendlich_engine::render::meshing_pool::MeshResult> = Vec::new();
@@ -3810,17 +3818,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
 
         // r322: the mesh-cache trial survived the GPU-init risk window — clear
         // the marker so a later, unrelated crash isn't blamed on it.
-        if !safe_tune_disarmed && frame_count > 600 {
+        if !safe_tune_disarmed && lifetime_frame > 600 {
             safe_tune.disarm();
             safe_tune_disarmed = true;
             if effective_mesh_cache > 0 {
-                log::info!("[safe-tune] mesh_cache survived {frame_count} frames; marker cleared");
+                log::info!("[safe-tune] mesh_cache survived {lifetime_frame} frames; marker cleared");
             }
         }
 
         // r661: Bending Tutorial — stamp the bounded arena at spawn once the
         // tutorial world's chunks are loaded (~90 frames after launch). One-shot.
-        if fg_tutorial_arena_pending && frame_count > fg_tutorial_launch_frame + 90 {
+        if fg_tutorial_arena_pending && lifetime_frame > fg_tutorial_launch_frame + 90 {
             fg_tutorial_arena_pending = false;
             let p = local_player.view.position;
             let (px, pz) = (p.x.floor() as i32, p.z.floor() as i32);
@@ -3856,7 +3864,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
 
         // One-shot landmark placement (see flag declaration). Wait ~1.5s so the
         // spawn-area chunks are loaded and set_block lands on real chunks.
-        if !landmarks_placed && frame_count > 90 {
+        if !landmarks_placed && lifetime_frame > 90 {
             landmarks_placed = true;
             let p = local_player.view.position;
             let (px, pz) = (p.x.floor() as i32, p.z.floor() as i32);
@@ -4779,7 +4787,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             paintbrush.retry_deferred(&chunk_manager);
             // Plants a build planted become living plants: the bred genome
             // goes into the flora store and the lifecycle takes over.
-            let planted = paintbrush.drain_plants(&mut session.flora, frame_count);
+            let planted = paintbrush.drain_plants(&mut session.flora, lifetime_frame);
             if planted > 0 { log::info!("[paintbrush] {planted} plant(s) handed to the flora store"); }
             // GPU pacing: the in-instance model may submit only the decode
             // steps this frame's headroom allows. A late frame stalls
@@ -5014,7 +5022,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             let rb_timer = unendlich_engine::dev_mode::rollback_timer_frames();
 
             let rb_travel = unendlich_engine::dev_mode::rollback_travel_blocks();
-            let timer_due = frame_count > 0 && frame_count % rb_timer == 0;
+            let timer_due = lifetime_frame > 0 && lifetime_frame % rb_timer == 0;
             let travel_due = fg_rb_travel >= rb_travel;
             let craft_due = fg_rb_craft_flag || fg_rb_force_point;
 
@@ -5639,7 +5647,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         if renderer.perf_window_open || renderer.settings_menu_open {
             let n = frame_times_ms.len();
             let lo = n.saturating_sub(120);
-            if frame_count % 30 == 0 {
+            if lifetime_frame % 30 == 0 {
                 let avg = if n > lo { frame_times_ms[lo..].iter().sum::<f64>() / (n - lo) as f64 } else { 0.0 };
                 // r178: narrative tier first (prose), raw tier below.
                 let avg_fps = if avg > 0.0 { 1000.0 / avg } else { 0.0 };
@@ -5687,7 +5695,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // r139: popdyn step — humidity-scaled grass regen vs herd grazing.
         // r461: named-location discovery — when the player crosses into a new biome-scale region,
         // give it a deterministic lore name and announce it (Collections tab is the device-side view).
-        if mouse_captured && frame_count % 45 == 17 {
+        if mouse_captured && lifetime_frame % 45 == 17 {
             use unendlich_engine::world::named_locations as nl;
             let pp = local_player.view.position;
             let reg = nl::region_of(pp.x.floor() as i32, pp.z.floor() as i32);
@@ -5709,7 +5717,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
             }
         }
-        if frame_count % 30 == 0 {
+        if lifetime_frame % 30 == 0 {
             let humid = {
                 let m = chunk_manager.model_arc();
                 let pp = local_player.view.position;
@@ -6076,7 +6084,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // to switch placement onto sim::surface_scan::top_solid_y_in_chunk (reads the actual
         // top solid voxel — handoff/HANDOFF_world_surface.md); physics-anchored plants come
         // later. Until then this budgeted pass removes the visible offenders near the player.
-        if air_cleanup_enabled && mouse_captured && frame_count % air_cleanup_interval == 73 {
+        if air_cleanup_enabled && mouse_captured && lifetime_frame % air_cleanup_interval == 73 {
             use unendlich_engine::world::blocks::BlockId as B;
             let pp = local_player.view.position;
             let (pxi, pyi, pzi) = (pp.x.floor() as i32, pp.y.floor() as i32, pp.z.floor() as i32);
@@ -6225,7 +6233,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // r450: FLORA SPREAD — surface plants seed nearby suitable ground using the
         // sim::flora_spread core (plant_propagation dispersal × plant_growth_env viability).
         // Knobs declared near plant_stride. Budgeted + strided; default ON.
-        if flora_spread_enabled && mouse_captured && frame_count % flora_spread_interval == 11 {
+        if flora_spread_enabled && mouse_captured && lifetime_frame % flora_spread_interval == 11 {
             use unendlich_engine::sim::flora_spread as fs;
             use unendlich_engine::sim::plant_growth_env::Conditions;
             use unendlich_engine::world::blocks::BlockId as B;
@@ -6342,7 +6350,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         }
         // r452: SAPLING GROWTH — advance living session.saplings via sim::plant_growth (env from the climate
         // model); mature ones become real trees (flora_blocks). Occasionally plant a new sapling.
-        if flora_spread_enabled && mouse_captured && frame_count % sapling_grow_interval == 37 {
+        if flora_spread_enabled && mouse_captured && lifetime_frame % sapling_grow_interval == 37 {
             use unendlich_engine::sim::plant_growth as pg;
             use unendlich_engine::world::blocks::BlockId as B;
             use unendlich_engine::world::flora_placement::FloraSpecies;
@@ -6486,7 +6494,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 (1..=6).all(|u| matches!(chunk_manager.block_at(bx, ay + u, bz), B::Air));
                             if clear && chunk_manager.set_block(bx, ay, bz, B::OakLog) {
                                 let mut fc = unendlich_engine::world::flora_store::FloraCell::sown(
-                                    oak, frame_count,
+                                    oak, lifetime_frame,
                                 );
                                 fc.element = ((hh >> 40) % 6) as u8;
                                 fc.vigor = 0.4 + ((hh >> 48) % 100) as f32 / 250.0;
@@ -6502,7 +6510,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // sim::plant_growth (climate-driven, like saplings). Ripe at FINAL_STAGE; crops whose
         // host block was removed/changed drop out of tracking. Mutated growth is marked dirty so
         // it gets saved. Runs in both modes.
-        if mouse_captured && frame_count % 90 == 41 && !session.flora.is_empty() {
+        if mouse_captured && lifetime_frame % 90 == 41 && !session.flora.is_empty() {
             use unendlich_engine::sim::plant_growth as pg;
             let m = chunk_manager.model_arc();
             let mut remove: Vec<[i32; 3]> = Vec::new();
@@ -6588,7 +6596,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // r455: PIONEER FLORA — climate-driven decoration variety (sim::pioneer_flora) using blocks
         // that already render: dead bushes on arid sand, lichen on cold rock, moss on damp rock, ferns
         // in humid undergrowth. Runtime + recoverable; shares the flora_spread enable. Budgeted probes.
-        if flora_spread_enabled && mouse_captured && frame_count % flora_spread_interval == 53 {
+        if flora_spread_enabled && mouse_captured && lifetime_frame % flora_spread_interval == 53 {
             use unendlich_engine::sim::pioneer_flora::pioneer_for;
             use unendlich_engine::world::blocks::BlockId as B;
             let m = chunk_manager.model_arc();
@@ -6635,7 +6643,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // pass: probe random cells underground, and where plain Stone faces Air (a cave wall)
         // below sea level, depth-weighted sim::cave_ore picks an ore (rare; richer deeper). The
         // CPU mesher renders it, so it's visible regardless of the worldgen backend.
-        if mouse_captured && frame_count % 67 == 17 {
+        if mouse_captured && lifetime_frame % 67 == 17 {
             use unendlich_engine::world::blocks::BlockId as B;
             let sea = unendlich_engine::constants::SEA_LEVEL as i32;
             let pp = local_player.view.position;
@@ -6690,7 +6698,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // r464: HOT METAL — metal cells beside lava heat up (sim::hot_metal), quench (steam) in water,
         // and melt to lava at their melting point. Bounded discovery scan + cheap evolution of tracked
         // cells; melt is a one-time set_block (no per-tick remeshing — keeps the T1 hitch budget clean).
-        if hot_metal_enabled && mouse_captured && frame_count % 20 == 7 {
+        if hot_metal_enabled && mouse_captured && lifetime_frame % 20 == 7 {
             use unendlich_engine::sim::hot_metal as hm;
             use unendlich_engine::world::blocks::BlockId;
             let tp = hm::ThermalParams::default();
@@ -6750,7 +6758,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     session.hot_metal.insert(c, t1);
                 }
             }
-            if (quenched > 0 || melted > 0) && frame_count % 120 < 20 {
+            if (quenched > 0 || melted > 0) && lifetime_frame % 120 < 20 {
                 log::info!(
                     "[hot-metal] {} cell(s) hot (max {:.0}°C), quench-steam {}, melted→lava {}",
                     session.hot_metal.len(), hottest, quenched, melted
@@ -6785,7 +6793,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // region coords; dry-land surface sites only) decides who lives
         // there; we hatch real Roamers (Grazer->Fauna, Seeker->Dinosaur),
         // capped by the popdyn carrying capacity. Explore = encounter.
-        if frame_count % 60 == 30 && mouse_captured {
+        if lifetime_frame % 60 == 30 && mouse_captured {
             let pp = local_player.view.position;
             let (rx, rz) = (
                 (pp.x.floor() as i32).div_euclid(unendlich_engine::sim::spawn::REGION_SIZE),
@@ -6908,7 +6916,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 y: (pp.y.floor() as i32).div_euclid(unendlich_engine::constants::CHUNK_SIZE),
                 z: (pp.z.floor() as i32).div_euclid(unendlich_engine::constants::CHUNK_SIZE),
             };
-            let which = ((frame_count / 240) % 6) as usize;
+            let which = ((lifetime_frame / 240) % 6) as usize;
             if !SEAM_BROKEN[which].load(Relaxed) {
                 let ok = catch_unwind(AssertUnwindSafe(|| {
                     match which {
@@ -7075,7 +7083,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 let spike = if fire_attuned { 1.5 } else { 6.0 };
                 fg_app.vitality_mut().tick(dt, burn);
                 fg_thermal.body_c = (fg_thermal.body_c + spike * dt).min(43.0);
-                if frame_count % 30 == 0 {
+                if lifetime_frame % 30 == 0 {
                     log::warn!("[survival] YOU ARE IN LAVA — get out NOW");
                 }
             }
@@ -7204,7 +7212,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // r128: PREDATOR CONTACT — a Dinosaur or Dragon within 1.6 blocks
             // bites every ~0.7s: vitality chip + log. Run, fight, or keep
             // distance; creative is exempt.
-            if survival_mode && frame_count % 40 == 0 {
+            if survival_mode && lifetime_frame % 40 == 0 {
                 use unendlich_engine::item::CreatureKind;
                 let pp = local_player.view.position;
                 for r in roamers.iter() {
@@ -7246,7 +7254,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             );
                             log::info!("[cooking] the meat sizzles over the fire — cooked! (eat it for more vitality)");
                         }
-                    } else if frame_count % 30 == 0 {
+                    } else if lifetime_frame % 30 == 0 {
                         log::info!("[cooking] roasting… {:.0}%", cook_progress / COOK_TIME * 100.0);
                     }
                 } else if cook_progress > 0.0 {
@@ -8049,7 +8057,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // The warning includes recent section timings so we can see WHICH
         // part of the frame stretched without waiting for the next 1Hz
         // log boundary.
-        if dt_ms > 100.0 && frame_count > 5 {
+        if dt_ms > 100.0 && lifetime_frame > 5 {
             log::warn!(
                 "LONG FRAME: dt={:.1}ms (sections may have already accumulated some of this; \
                  recent 1s totals: cloud_remesh={:.1}ms evict={:.1}ms submit={:.1}ms \
@@ -8080,7 +8088,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             fg_music_fadein = (fg_music_fadein + dt * 0.4).min(1.0);
         }
         #[cfg(feature = "audio")]
-        if frame_count % 15 == 0 {
+        if lifetime_frame % 15 == 0 {
             if let Some(m) = fg_music_player.as_ref() {
                 // r179: crafting/creative menus are IN-WORLD — the title
                 // theme doesn't belong there. Title bus: menus only.
@@ -8097,7 +8105,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // r184: performance levers — sliders write the live atomics; the
         // autotuner nudges them toward the FPS target (raise strides ->
         // lower budget below target; relax above 1.25x target).
-        if frame_count % 15 == 0 {
+        if lifetime_frame % 15 == 0 {
             plant_stride_atom.store(renderer.ui_plant_stride.max(1), std::sync::atomic::Ordering::Relaxed);
             leaf_stride_atom.store(renderer.ui_leaf_stride.max(1), std::sync::atomic::Ordering::Relaxed);
             chunk_manager.set_apply_budget(renderer.ui_apply_budget as usize);
@@ -9063,11 +9071,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 mob_chunk, player_chunk, &mob_band_params,
                             );
                             let divisor = sched_band.divisor(&mob_band_params);
-                            let since_last = (frame_count as u64).saturating_sub(r.last_tick_frame);
+                            let since_last = (lifetime_frame as u64).saturating_sub(r.last_tick_frame);
                             match unendlich_engine::sim::mob_bands::mob_band_tick(divisor, since_last) {
                                 Some(n) => {
                                     // fires: record this tick and carry n forward.
-                                    r.last_tick_frame = frame_count as u64;
+                                    r.last_tick_frame = lifetime_frame as u64;
                                     mob_band_catch_up = n.max(1);
                                     false
                                 }
@@ -9075,7 +9083,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             }
                         } else {
                             !unendlich_engine::sim::ai_budget::should_full_tick(
-                                frame_count as u64, ent_id, band,
+                                lifetime_frame as u64, ent_id, band,
                             )
                         };
                         if curfewed {
@@ -9461,7 +9469,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     let wariness = unendlich_engine::sim::awareness_blend::awareness(sight, hearing, 0.0);
                     // sample-log so it's observable without flooding (one in ~256
                     // frames per noticing roamer).
-                    if wariness > 0.15 && (frame_count & 0xFF) == 0 {
+                    if wariness > 0.15 && (lifetime_frame & 0xFF) == 0 {
                         log::info!("[awareness] wariness={:.2} (sight={:.1} hearing={:.2})", wariness, sight, hearing);
                     }
                 }
@@ -11900,7 +11908,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                 session.flora.plant(
                                                     [x, y, z],
                                                     unendlich_engine::world::flora_store::FloraCell::sown(
-                                                        BlockId::OakLog as u8, frame_count,
+                                                        BlockId::OakLog as u8, lifetime_frame,
                                                     ),
                                                 );
                                                 log::info!("[farm] planted a tree sapling at ({},{},{})", x, y, z);
@@ -11916,7 +11924,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                             };
                                             chunk_manager.set_block(x, y, z, BlockId::Sprout);
                                             let mut fc = unendlich_engine::world::flora_store::FloraCell::sown(
-                                                BlockId::Sprout as u8, frame_count,
+                                                BlockId::Sprout as u8, lifetime_frame,
                                             );
                                             fc.element = target;
                                             // r522: genome = this crop's seed line crossed with a fresh draw.
@@ -11924,11 +11932,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                 fg_world_seed
                                                     ^ ((x as u64) << 20)
                                                     ^ ((z as u64) << 4)
-                                                    ^ frame_count,
+                                                    ^ lifetime_frame,
                                             );
                                             let g = unendlich_engine::sim::plant_tree_genetics::cross(
                                                 &seed_stock[target as usize], &fresh,
-                                                fg_world_seed ^ frame_count.wrapping_mul(0x9E37_79B9),
+                                                fg_world_seed ^ lifetime_frame.wrapping_mul(0x9E37_79B9),
                                             );
                                             fc.genome = g.as_array();
                                             session.flora.plant([x, y, z], fc);
@@ -12041,7 +12049,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                 session.flora.plant(
                                                     [x, y, z],
                                                     unendlich_engine::world::flora_store::FloraCell::sown(
-                                                        BlockId::OakLog as u8, frame_count,
+                                                        BlockId::OakLog as u8, lifetime_frame,
                                                     ),
                                                 );
                                                 log::info!("[farm] planted a tree sapling at ({},{},{})", x, y, z);
@@ -12057,7 +12065,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                             };
                                             chunk_manager.set_block(x, y, z, BlockId::Sprout);
                                             let mut fc = unendlich_engine::world::flora_store::FloraCell::sown(
-                                                BlockId::Sprout as u8, frame_count,
+                                                BlockId::Sprout as u8, lifetime_frame,
                                             );
                                             fc.element = target;
                                             // r522: genome = this crop's seed line crossed with a fresh draw.
@@ -12065,11 +12073,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                 fg_world_seed
                                                     ^ ((x as u64) << 20)
                                                     ^ ((z as u64) << 4)
-                                                    ^ frame_count,
+                                                    ^ lifetime_frame,
                                             );
                                             let g = unendlich_engine::sim::plant_tree_genetics::cross(
                                                 &seed_stock[target as usize], &fresh,
-                                                fg_world_seed ^ frame_count.wrapping_mul(0x9E37_79B9),
+                                                fg_world_seed ^ lifetime_frame.wrapping_mul(0x9E37_79B9),
                                             );
                                             fc.genome = g.as_array();
                                             session.flora.plant([x, y, z], fc);
@@ -13578,8 +13586,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // Perceive against the real terrain now: a Späher no longer sees the
             // player through a hill (ChunkManager implements WorldQuery).
             let reveals = sentinel_flock.tick(&chunk_manager, &[(player, loudness)], player);
-            if !reveals.is_empty() && frame_count.saturating_sub(last_reveal_log_frame) >= 30 {
-                last_reveal_log_frame = frame_count;
+            if !reveals.is_empty() && lifetime_frame.saturating_sub(last_reveal_log_frame) >= 30 {
+                last_reveal_log_frame = lifetime_frame;
                 for (idx, alarm) in &reveals {
                     log::info!(
                         "Späher #{idx} reveals the player — {:?} via {:?}",
@@ -13590,7 +13598,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             // Periodic readout of the flock's sustained state (so alarm holding
             // while you linger — and decaying as you leave — is visible).
-            if frame_count % 30 == 0 {
+            if lifetime_frame % 30 == 0 {
                 // r126: on-screen HUD (egui card top-left) — same data as the
                 // [HUD] log line, visible without a terminal.
                 // r545: survival meters for the on-screen bars (hunger + thermal now;
@@ -14284,7 +14292,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // r120: ground item drops render as small colored cubes (swatch
                 // color from the items debug palette; slow spin from anim time).
                 {
-                    let spin = (frame_count as f32) * 0.03;
+                    let spin = (lifetime_frame as f32) * 0.03;
                     let palette = unendlich_engine::items::default_palette();
                     // r147: drops afloat bob on the REAL water-wave field —
                     // params derived from the live wind + temperature.
@@ -14418,7 +14426,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         up: [upv.x, upv.y, upv.z],
                     };
                     let speed01 = (last_player_speed / 5.6).clamp(0.0, 1.0);
-                    let walk_phase = (frame_count as f32) * 0.21 * (0.3 + speed01);
+                    let walk_phase = (lifetime_frame as f32) * 0.21 * (0.3 + speed01);
                     // r481: weapons take a dedicated model keyed by class; other
                     // hand items fall back to the id->form heuristic.
                     let hid = hand_item.map(|h| h.0);
@@ -14549,7 +14557,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // acceleration on click) — base 0.9 rad/s + 3.2/s per radian.
             ramp_approach(&mut fg_menu_yaw, yaw_target, dt, 0.9, 3.2);
             ramp_approach(&mut fg_menu_pitch_par, par_y, dt, 0.5, 2.0);
-            let th = (frame_count as f32) * 0.0015 + fg_menu_yaw;
+            let th = (lifetime_frame as f32) * 0.0015 + fg_menu_yaw;
             let (ox, oz) = (th.cos() * 46.0, th.sin() * 46.0);
             local_player.view.position = glm::vec3(ox, 96.0, oz);
             local_player.view.yaw = th + std::f32::consts::PI; // face the center
@@ -15406,7 +15414,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 if water_erosion {
                     let mut ebudget = water_erosion_budget;
                     // rolling start offset so we don't always scan the same cells first
-                    let estart = (frame_count as usize).wrapping_mul(2654435761) % n.max(1);
+                    let estart = (lifetime_frame as usize).wrapping_mul(2654435761) % n.max(1);
                     for off in 0..n {
                         if ebudget == 0 { break; }
                         let i = (estart + off) % n;
@@ -15442,7 +15450,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // downstream; where the current slows, the load drops back as bed. Budgeted.
                 if water_flow_erosion {
                     let mut fbudget = flow_erosion_budget;
-                    let fstart = (frame_count as usize).wrapping_mul(40503).wrapping_add(7) % n.max(1);
+                    let fstart = (lifetime_frame as usize).wrapping_mul(40503).wrapping_add(7) % n.max(1);
                     // pass 1: erode under fast flow
                     for off in 0..n {
                         if fbudget == 0 { break; }
@@ -15515,7 +15523,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // else stone) and flash a steam puff. Budgeted via the erosion budget.
                 if lava_water_react {
                     let mut lbudget = flow_erosion_budget * 2;
-                    let lstart = (frame_count as usize).wrapping_mul(2246822519) % n.max(1);
+                    let lstart = (lifetime_frame as usize).wrapping_mul(2246822519) % n.max(1);
                     for off in 0..n {
                         if lbudget == 0 { break; }
                         let i = (lstart + off) % n;
@@ -15732,7 +15740,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         // r661's fg_pending_load bounced to the menu.) The arena is
                         // stamped once chunks load.
                         fg_tutorial_arena_pending = true;
-                        fg_tutorial_launch_frame = frame_count;
+                        fg_tutorial_launch_frame = lifetime_frame;
                         AppInput::StartTutorial(TUTORIAL_SEED)
                     }
                     _ => AppInput::None,
