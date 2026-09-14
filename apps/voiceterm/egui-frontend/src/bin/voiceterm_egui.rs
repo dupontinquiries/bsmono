@@ -668,6 +668,20 @@ struct VoicetermApp {
     /// True while the foreground looks like it is asking for a secret.
     /// Suppresses echo AND keeps the line out of the audit log.
     password_mode: bool,
+    /// Tap-vs-hold classifier for Ctrl+P (`ctrl_p_gesture.rs`). Replaces
+    /// a bare `i.key_pressed(Key::P)` toggle -- reported as "spamming the
+    /// command palette on/off" when the key is held, because OS-level
+    /// key-repeat (`egui::Event::Key`'s own `repeat: bool` field, already
+    /// known to this fleet -- snapclone's test fixtures construct it
+    /// explicitly) sends the key down again and again while held, and
+    /// `key_pressed` toggled on every one. `GestureTracker::poll` reads
+    /// `key_down` (a continuous, level-based query -- "is it down right
+    /// now") every frame instead of counting discrete press EVENTS, which
+    /// sidesteps the repeat storm regardless of how many repeat events
+    /// the backend sends for one physical hold.
+    ctrl_p_gesture: voiceterm_egui::ctrl_p_gesture::GestureTracker,
+    /// State for the voice popup Ctrl+P-held opens (Surface::Voice).
+    voice_popup: voiceterm_egui::voice_popup::VoicePopup,
     /// Promotion thresholds for the acoustic cache — the runtime knobs the
     /// original exposes, here on the Docs tab beside the corpus tape that
     /// feeds it.
@@ -3191,14 +3205,69 @@ impl eframe::App for VoicetermApp {
         // THE COMMAND PALETTE, above everything. Ctrl+P or "open command
         // palette" — the eleven-tab switcher's replacement, and the reason the
         // rail only needs to carry tabs.
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::P)) {
-            self.surfaces.toggle(Surface::Palette);
-            self.palette_query.clear();
-            self.palette_sel = 0;
+        //
+        // Was a bare `i.key_pressed(Key::P)` toggle — reported as
+        // "spamming the command palette on/off" while the key is held.
+        // egui's `Event::Key` carries a `repeat: bool` field (this fleet
+        // already knows about it — snapclone's own test fixtures
+        // construct it explicitly), and OS-level key-repeat sends the
+        // key down again and again while physically held; `key_pressed`
+        // toggled on every one of those repeats, not just the first.
+        //
+        // Routed through `GestureTracker` instead: it reads `key_down` (a
+        // continuous, level-based "is it down right now" query) every
+        // frame rather than counting discrete press EVENTS, so the number
+        // of repeat events the backend happens to send for one physical
+        // hold no longer matters. This also finishes the Ctrl+P-hold ->
+        // voice ask from the same session: a quick tap still toggles the
+        // palette exactly as before; a hold past the threshold opens the
+        // voice popup instead.
+        let (ctrl_p_down, dt) = ctx.input(|i| {
+            (i.modifiers.command && i.key_down(egui::Key::P), i.stable_dt)
+        });
+        match self.ctrl_p_gesture.poll(ctrl_p_down, std::time::Duration::from_secs_f32(dt)) {
+            voiceterm_egui::ctrl_p_gesture::Gesture::Tap => {
+                self.surfaces.toggle(Surface::Palette);
+                self.palette_query.clear();
+                self.palette_sel = 0;
+            }
+            voiceterm_egui::ctrl_p_gesture::Gesture::HoldStarted => {
+                if self.voice_popup.start(self.password_mode) {
+                    self.surfaces.open(Surface::Voice);
+                }
+                // `start` returning false (password mode active) opens
+                // nothing — the popup was designed to refuse silently at
+                // this layer (see voice_popup.rs's own doc); a toast or
+                // other visible refusal is a real gap, not solved here.
+            }
+            voiceterm_egui::ctrl_p_gesture::Gesture::HoldReleased => {
+                // Releasing the held key ends the utterance, the same
+                // shape a push-to-talk key has — `finish()` keeps the
+                // audio and proceeds to transcription rather than
+                // dropping it the way `cancel()` would.
+                self.voice_popup.finish();
+            }
+            voiceterm_egui::ctrl_p_gesture::Gesture::None => {}
         }
         let open_t = overlay::openness(ctx, Surface::Palette, self.surfaces.is(Surface::Palette));
         if open_t > 0.0 {
             self.palette_ui(ctx, open_t);
+        }
+        let voice_open_t = overlay::openness(ctx, Surface::Voice, self.surfaces.is(Surface::Voice));
+        if voice_open_t > 0.0 {
+            self.voice_popup.tick();
+            let close_now = overlay::show(ctx, Surface::Voice, voice_open_t, |ui| {
+                self.voice_popup.draw(ui, &self.colors);
+            })
+            .closed;
+            // `tick()` returning true (a cancelled recording) closes
+            // immediately, matching the Qt build's own voice_cancel
+            // behavior; a backdrop click or Esc via the Modal (`.closed`
+            // from `overlay::show`) closes it the same way every other
+            // surface already does.
+            if close_now {
+                self.surfaces.close_if(Surface::Voice);
+            }
         }
 
         // THE LEFT RAIL: workspace tabs, vertically, collapsible. The Qt app
@@ -6242,6 +6311,8 @@ fn main() -> eframe::Result<()> {
                 audit: Default::default(),
                 audit_lines: Vec::new(),
                 password_mode: false,
+                ctrl_p_gesture: Default::default(),
+                voice_popup: Default::default(),
                 acoustic: Default::default(),
                 acoustic_distance: 0.20,
                 acoustic_confirms: 2,
