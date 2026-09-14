@@ -3751,6 +3751,16 @@ impl WorldRenderer {
             let mut ui_shadow_stride = self.ui_shadow_stride;
             let mut ui_shadow_cache = self.ui_shadow_cache;
             let mut ui_cull_aggression = self.ui_cull_aggression;
+            // r-borrow-fix: must read this BEFORE the settings closure below
+            // (self.egui_overlay.prepare(..., |c| { ... })) rather than
+            // calling self.shadow_chunk_stride() from inside it -- the
+            // closure already needs unique access to `self` (mutates
+            // self.chat_buffer, and `frame: &self.frames[frame_idx]` is
+            // borrowed across its whole body for the UBO write later), so
+            // an additional `self.` call inside it is a second borrow the
+            // compiler correctly rejects (E0500/E0501, caught on the first
+            // real build of this code).
+            let live_shadow_chunk_stride = self.shadow_chunk_stride();
             let mut ui_fps_target = self.ui_fps_target;
             let mut ui_autotune = self.ui_autotune;
             let mut ui_gpu_mesh_yield = self.ui_gpu_mesh_yield;
@@ -4520,7 +4530,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                     int_slider!("shadow stride", ui_shadow_stride, u32, 1, 8);
                                     ui.weak(format!(
                                         "live: {} (frame_pacer autotune overrides this slider when UNENDLICH_FRAME_PACER=1, the default)",
-                                        self.shadow_chunk_stride(),
+                                        live_shadow_chunk_stride,
                                     ));
                                     if unendlich_ui::menu::toggle(ui, ui_shadow_cache, accent).clicked() {
                                         ui_shadow_cache = !ui_shadow_cache;
