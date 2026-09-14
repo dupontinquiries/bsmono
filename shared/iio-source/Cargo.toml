@@ -1,0 +1,17 @@
+[package]
+name = "iio-source"
+version = "0.1.0"
+edition = "2021"
+description = """
+Raw /sys/bus/iio/devices accelerometer reading: device discovery, *_raw/
+*_scale parsing, in_accel_mount_matrix correction, orientation and tilt
+classification matching iio-sensor-proxy's own orientation.c thresholds so
+a Rust reader and the system daemon cannot disagree, EBUSY/contended
+detection when the daemon owns the device in buffered mode, and a
+relative-flick gesture layer on top. Lifted from voiceterm's iio_accel.rs
+-- the most complete of eight independent readers this fleet had grown
+(maintenance/C18_TODO.md section 2). Zero-dependency (std only).
+"""
+
+[lib]
+path = "src/lib.rs"
