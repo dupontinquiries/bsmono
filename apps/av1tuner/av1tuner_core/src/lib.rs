@@ -32,6 +32,7 @@ pub mod job;
 pub mod preflight;
 pub mod probe;
 pub mod remote;
+pub mod source;
 pub mod sample;
 pub mod scene;
 pub mod merge;
