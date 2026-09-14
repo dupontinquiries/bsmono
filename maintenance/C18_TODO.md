@@ -1476,3 +1476,47 @@ This is the same "consuming app supplies the hook, the shared core does
 not call the optional feature itself" pattern already used for
 `log_summary::VOICE_ACTIVE`, generalized into one real mechanism instead
 of three ad-hoc special cases the closure kept discovering one at a time.
+
+---
+
+## 23. photosync's "no binary" error: the manifest entry was missing, not a build bug
+
+Real user report: `cargo build --release -p photosync --no-default-features
+--features app` succeeds, produces no binary, gitmind's build tool correctly
+says so. Traced rather than patched around.
+
+`apps/photosync` (headless photo-library core: perceptual dedup, ascii+tag
+pipeline) has no `[[bin]]`, no `src/main.rs`, no `src/bin/`. Its `app`
+feature is `app = []` -- empty, no dependencies, gated behind nothing,
+because the egui shell the crate's own description promises ("the egui
+shell is behind the `app` feature") was never written. Confirmed by reading
+the file, not assumed.
+
+The crate's own introducing commit (2455e18d3) says it should be "in the
+gitmind fleet catalog as a simple media entry" -- but `apps.photosync` had
+NO manifest entry at all. `manifest/projects.toml` only had
+`system.photosync` (a different path, `system/photosync`, the actual sync
+daemon merged separately this session). So gitmind's tooling, asked to
+build "photosync" with a feature named "app", had no manifest information
+telling it this crate is not one -- it built the only reasonable guess
+(a binary named after the crate) and correctly reported it does not exist.
+
+Fixed: registered `apps.photosync` in the manifest as `role = "lib"`,
+following the EXACT precedent `apps/settings/egui-frontend` already needed
+for the identical reason (a headless/library crate with no `[[bin]]`,
+previously missing from the manifest, silently invisible to gitmind's
+catalogue as a result) -- same fields, same reasoning, restated in this
+entry's own notes so it does not require re-deriving from settings-egui's
+comment a second time.
+
+NOT chased further: whether `build/build.sh` or gitmind's other build
+entry points ALREADY skip role="lib" entries when building "everything",
+or whether that skip needs adding separately. `ops.rs`'s own build-and-
+verify helper has no role-awareness at all (checked directly, no hits for
+`role` in that file) -- the filtering, if it exists, is upstream of it, in
+build.sh or wherever assembles the per-app cargo invocation, and that
+script has no manifest-reading code visible by a direct grep either. Real
+gap in understanding, recorded rather than guessed past: confirm build.sh's
+actual app-selection logic before assuming this manifest fix alone stops
+gitmind from trying to build apps.photosync as a runnable app the next time
+"build everything" is invoked.

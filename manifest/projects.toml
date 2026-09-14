@@ -181,6 +181,16 @@ runtime = "none"
 targets = ["desktop", "phone", "alpine"]
 notes = "offline mirror: cargo sparse registry, Fedora dnf repodata, Nix binary cache, Rust toolchains, served by a std-only httpd from a content-addressed store; signed dedup packs move content across the air gap. Manual and decisions are embedded (/manual, /decisions). RPM repodata verified byte-identical to createrepo_c; real cargo + dnf clients verified. No async runtime, no C deps by default - buildable from its own mirror."
 
+[apps.photosync]
+path = "apps/photosync"
+kind = "cargo"
+role = "lib"              # headless core -- no egui, no wgpu, no decoder, by design
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone"]
+notes = "the headless photo-library core: perceptual dedup, metadata tracking, an ascii+tag pipeline. Confused with system/photosync (the sync daemon at a different path) until this entry existed -- gitmind's build tool correctly built this crate with --features app and correctly reported no binary, because none exists: `app = []` is an empty, aspirational feature flag with no [[bin]] behind it yet (see the crate's own Cargo.toml description, 'the egui shell is behind the app feature' -- not yet written). role=\"lib\" is the honest description until that shell exists, the same fix apps/settings/egui-frontend needed for the same reason. Do not build this with -p photosync --features app expecting a binary; there is nothing to run yet."
+
 [apps.aperture]
 path = "apps/aperture"
 kind = "cargo"
