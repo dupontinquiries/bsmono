@@ -138,7 +138,9 @@ mod tests {
             .count();
         let expected_len = (CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize;
 
+        crate::render::mesher::mesh_diag_reset();
         let mesh = crate::render::mesher::mesh_chunk(&chunk);
+        let diag = crate::render::mesher::mesh_diag_snapshot();
         let tris = mesh.indices.len() / 3;
         let verts = mesh.vertices.len();
 
@@ -151,6 +153,16 @@ mod tests {
             mesh.indices.len(),
             expected_len * 6 * 2,
         );
+        println!(
+            "  emission breakdown: subdivided_top: {} blocks -> {} quads ({} tris) | \
+             jittered_top: {} blocks -> {} quads ({} tris) | soft_side: {} quads ({} tris) | \
+             accounted_for={} tris, unaccounted (normal greedy-merged path)={} tris",
+            diag.subdivided_top_blocks, diag.subdivided_top_quads, diag.subdivided_top_quads * 2,
+            diag.jittered_top_blocks, diag.jittered_top_quads, diag.jittered_top_quads * 2,
+            diag.soft_side_faces, diag.soft_side_faces * 2,
+            (diag.subdivided_top_quads + diag.jittered_top_quads + diag.soft_side_faces) * 2,
+            (tris as i64) - ((diag.subdivided_top_quads + diag.jittered_top_quads + diag.soft_side_faces) as i64 * 2),
+        );
         // A few things worth reading off this once it actually runs:
         //   - blocks.len() != expected_len would mean generate_chunk itself
         //     returned a wrongly-sized array -- a generation bug, not a mesher one.
@@ -160,6 +172,14 @@ mod tests {
         //   - tris > expected_len*6*2 (the theoretical max) with blocks.len()
         //     and non_air both looking normal would isolate the bug to
         //     mesh_chunk's merge/emission logic specifically.
+        //   - subdivided_top_blocks/jittered_top_blocks should each be
+        //     <= non_air (one call per exposed top face, at most one top per
+        //     block) -- if either exceeds non_air, that IS a duplicate-
+        //     emission bug, isolated to that specific function.
+        //   - a large positive "unaccounted" tri count means the normal
+        //     greedy-merge path (not instrumented directly, computed here by
+        //     subtraction) is contributing more than the three named paths
+        //     combined -- worth instrumenting that path directly next if so.
         println!(
             "(diagnostic only, not asserting -- see this test's doc comment for what to \
              read off the numbers above)"

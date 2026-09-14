@@ -324,6 +324,63 @@ const CORNER_CACHE_W: usize = CHUNK_SIZE as usize + 2;
 /// Slice span: chunk-local `y` in `0 .. CHUNK_SIZE`.
 const CORNER_CACHE_H: usize = CHUNK_SIZE as usize;
 
+// r-mesh-diag: per-emission-path quad counters, for isolating whether a
+// large mesh is "expensive but correct" (a lot of legitimate calls into the
+// subdivided-top / soft-side paths) vs "emitting more than it should" (a
+// count that doesn't reconcile with the chunk's actual non-air block count).
+// Same safety pattern as CORNER_CACHE/ENV_CACHE/TINT_CACHE below: genuinely
+// thread-local (not a shared static), so incrementing from multiple meshing
+// worker threads concurrently is race-free by construction -- each thread
+// gets its own counters, exactly like each thread gets its own caches.
+// Zero behavior change: these are read-only observers of code paths that
+// already run; nothing here affects what geometry gets emitted.
+thread_local! {
+    static MESH_DIAG_SUBDIVIDED_TOP_QUADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MESH_DIAG_JITTERED_TOP_QUADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MESH_DIAG_SOFT_SIDE_QUADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MESH_DIAG_SUBDIVIDED_TOP_BLOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MESH_DIAG_JITTERED_TOP_BLOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Snapshot of the per-emission-path counters (see the `thread_local!`
+/// block above for what each counts and why it's race-free).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MeshDiagCounts {
+    /// Quads emitted by `emit_subdivided_top` (nsub*nsub per call).
+    pub subdivided_top_quads: u64,
+    /// Calls to `emit_subdivided_top` -- i.e. distinct weathered-top blocks.
+    pub subdivided_top_blocks: u64,
+    /// Quads emitted by `emit_jittered_top` (1 per call).
+    pub jittered_top_quads: u64,
+    /// Calls to `emit_jittered_top` -- distinct non-weathered-jitter-top blocks.
+    pub jittered_top_blocks: u64,
+    /// Quads (== calls, 1 each) emitted by `emit_soft_side_face`.
+    pub soft_side_faces: u64,
+}
+
+/// Zero all per-emission-path counters on the calling thread. Call before
+/// meshing whatever you want to measure.
+pub fn mesh_diag_reset() {
+    MESH_DIAG_SUBDIVIDED_TOP_QUADS.with(|c| c.set(0));
+    MESH_DIAG_JITTERED_TOP_QUADS.with(|c| c.set(0));
+    MESH_DIAG_SOFT_SIDE_QUADS.with(|c| c.set(0));
+    MESH_DIAG_SUBDIVIDED_TOP_BLOCKS.with(|c| c.set(0));
+    MESH_DIAG_JITTERED_TOP_BLOCKS.with(|c| c.set(0));
+    MESH_DIAG_SOFT_SIDE_FACES.with(|c| c.set(0));
+}
+
+/// Read the per-emission-path counters accumulated on the calling thread
+/// since the last `mesh_diag_reset()`.
+pub fn mesh_diag_snapshot() -> MeshDiagCounts {
+    MeshDiagCounts {
+        subdivided_top_quads: MESH_DIAG_SUBDIVIDED_TOP_QUADS.with(|c| c.get()),
+        subdivided_top_blocks: MESH_DIAG_SUBDIVIDED_TOP_BLOCKS.with(|c| c.get()),
+        jittered_top_quads: MESH_DIAG_JITTERED_TOP_QUADS.with(|c| c.get()),
+        jittered_top_blocks: MESH_DIAG_JITTERED_TOP_BLOCKS.with(|c| c.get()),
+        soft_side_faces: MESH_DIAG_SOFT_SIDE_QUADS.with(|c| c.get()),
+    }
+}
+
 thread_local! {
     // r697: FLAT-ARRAY corner memo (was a HashMap in r695). The cache is hit 4×
     // per corner, so lookup cost matters: a flat array indexed by local
@@ -3335,6 +3392,12 @@ pub(crate) fn emit_subdivided_top(
     // (named `nsub`, not `N`, because a module-level `const N: usize`
     // is in scope and `let N` would be read as a const-pattern.)
     let nsub: i32 = top_subdivision();
+    // r-mesh-diag: count this call and its quad output. See the
+    // MeshDiagCounts doc for why this is safe to add unconditionally
+    // (thread-local, read-only observer, zero behavior change).
+    MESH_DIAG_SUBDIVIDED_TOP_BLOCKS.with(|c| c.set(c.get() + 1));
+    MESH_DIAG_SUBDIVIDED_TOP_QUADS.with(|c| c.set(c.get() + (nsub as u64) * (nsub as u64)));
+
     let inv_n = 1.0 / (nsub as f32);
     let base_idx = mesh.vertices.len() as u32;
 
@@ -3412,6 +3475,9 @@ pub(crate) fn emit_jittered_top(
     chunk: &Chunk,
     world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
 ) {
+    // r-mesh-diag: see MeshDiagCounts doc; thread-local, zero behavior change.
+    MESH_DIAG_JITTERED_TOP_BLOCKS.with(|c| c.set(c.get() + 1));
+    MESH_DIAG_JITTERED_TOP_QUADS.with(|c| c.set(c.get() + 1));
     let block_wx = origin[0] + u;
     let block_wy = origin[1] + slice;
     let block_wz = origin[2] + v;
@@ -3672,6 +3738,8 @@ pub(crate) fn emit_soft_side_face(
     chunk: &Chunk,
     world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
 ) {
+    // r-mesh-diag: see MeshDiagCounts doc; thread-local, zero behavior change.
+    MESH_DIAG_SOFT_SIDE_QUADS.with(|c| c.set(c.get() + 1));
     // World position of the BLOCK (not the face) for env sampling.
     let mut block_local = [0i32; 3];
     block_local[cfg.axis] = slice;
