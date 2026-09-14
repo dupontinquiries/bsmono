@@ -62,3 +62,4 @@ pub mod corpus_recorder;
 pub mod cpu_efficiency;
 pub mod power_profile;
 pub mod poll_schedule;
+pub mod capture_hooks;
