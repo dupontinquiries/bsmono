@@ -42,6 +42,10 @@ app-x11 = ["dep:eframe", "x11"]
 app-wayland = ["dep:eframe", "wayland"]
 
 [dependencies]
+# The raw sysfs accelerometer reader -- was a local iio_accel.rs, extracted
+# to shared/iio-source (maintenance/C18_TODO.md section 2). Re-exported at
+# the crate root as `iio_accel` so existing call sites are unchanged.
+iio-source = { path = "../../../shared/iio-source" }
 # Pulled in by the voice-intent chain (`security`, `token_stats`).
 libc = "0.2"
 aho-corasick = "1"

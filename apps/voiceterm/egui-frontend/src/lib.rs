@@ -102,7 +102,15 @@ pub mod mail;
 pub mod voice_routing;
 /// One command vocabulary for the palette and the recogniser.
 pub mod palette;
-pub mod iio_accel;
+// Was `mod iio_accel;` over a local copy that `maintenance/C18_TODO.md`
+// section 2 identified as the most complete of eight independent IIO
+// readers in this fleet, and extracted verbatim into `shared/iio-source`
+// (this crate's own copy was the SOURCE of that extraction, not a
+// duplicate to reconcile against a pre-existing kit). Re-exported here so
+// every existing `voiceterm_egui::iio_accel::X` call site keeps working
+// unchanged -- the same shape `bo-controller`'s `passby_canceller`/
+// `masker` re-exports used earlier this session.
+pub use iio_source as iio_accel;
 
 /// Double-flick commands, bound to tab management.
 ///
