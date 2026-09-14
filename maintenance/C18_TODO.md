@@ -511,9 +511,21 @@ independently), and `voice_pop_wake_event`'s says the captured audio is
 stashed for "the next voice flow (which QML triggers in response)" —
 naming the exact hand-off a shared popup has to reproduce.
 
-**Stays in voiceterm, not part of a shared surface — the other 22:**
-tuning knobs (`set_whisper_interval_ms`, `set_phonetic_interval_ms`,
-`set_force_tiny_tier`, `set_fast_finalize`), device/model plumbing
+**Correction, found while doing the 1a extraction itself:**
+`set_force_tiny_tier` and `set_fast_finalize` were misfiled below as
+"tuning knobs, stays behind." Both are read INSIDE the core's own call
+chain — `FORCE_TINY_TIER` in `transcribe_with_dual_model` (line 3743),
+`FAST_FINALIZE` in `record_and_transcribe_inner` (line 3185) — and their
+own doc comments say they are "set ONLY by QML paths that know the next
+utterance will be short," i.e. genuinely popup-facing one-shot hints, not
+engine configuration. They belong in 1b (popup surface) alongside their
+statics, not in the "stays in voiceterm" list. This is exactly the kind of
+correction a name-based guess cannot catch and a trace does: both looked
+like config from their names alone.
+
+**Stays in voiceterm, not part of a shared surface — the other 20 (was
+22; corrected above):** tuning knobs (`set_whisper_interval_ms`,
+`set_phonetic_interval_ms`), device/model plumbing
 (`input_device_names`, `prewarm`, `warmup`, `is_available`), wake-phrase
 persistence (`registered_wake_phrase`, `set_registered_wake_phrase`,
 `load_registered_wake_phrase_from_disk`), and diagnostics
@@ -641,22 +653,39 @@ The core also needs `ModelTier`, `model_file`, `forced_tier`, `model_path`
 (~80 lines, `voice.rs`-local) and the already-external `models_kit` crate
 `model_file` calls into.
 
-So the real closure for 1a is: 4 functions (~550 lines total) + 6 statics
-(`TINY_CTX`/`BASE_CTX`/`LARGE_CTX`/`TINY_STATE`/`BASE_STATE`/`LARGE_STATE`)
-+ `ModelTier`+3 helpers (~80 lines) + two small self-contained sibling
-modules (533 lines) + the `clog!` macro (needs `$crate::log::emit` in the
-new crate, or a callback parameter) + `models_kit` (already shared).
-`run_one` takes `&whisper_rs::WhisperContext` as a plain parameter rather
-than reading a specific tier's static itself, so it does not add a
-dependency of its own — its caller (`transcribe_with_dual_model`) is what
-selects which context to pass in. `PREVIEW_STATE` was nearly counted into
-this list and does not belong here: checked its one call site
-(`ensure_preview_thread`, line 1173) and it backs the LIVE-PREVIEW text
-path, which is a popup-facing (1b) concern, not part of `listen()`'s call
-chain.
+So the real closure for 1a is: 4 functions (~550 lines total) + 6 model
+statics (`TINY_CTX`/`BASE_CTX`/`LARGE_CTX`/`TINY_STATE`/`BASE_STATE`/
+`LARGE_STATE`) + 2 more found only by reading `transcribe_with_dual_model`
+line by line rather than grepping static names against it —
+`FORCE_TINY_TIER` and `FAST_FINALIZE`, one-shot popup hints read inside
+the core's own call chain (line 3743 and, via `record_and_transcribe_
+inner`, line 3185) — + `ModelTier`+3 helpers (~80 lines) + two small
+self-contained sibling modules (533 lines) + the `clog!` macro (needs
+`$crate::log::emit` in the new crate, or a callback parameter) +
+`models_kit` (already shared). `run_one` takes
+`&whisper_rs::WhisperContext` as a plain parameter rather than reading a
+specific tier's static itself, so it does not add a dependency of its own
+— its caller (`transcribe_with_dual_model`) is what selects which context
+to pass in. `PREVIEW_STATE` was nearly counted into this list and does not
+belong here: checked its one call site (`ensure_preview_thread`, line
+1173) and it backs the LIVE-PREVIEW text path, which is a popup-facing
+(1b) concern, not part of `listen()`'s call chain.
+
+Their SETTER functions (`set_force_tiny_tier`, `set_fast_finalize`) do not
+have to live in 1a's crate even though their statics do — a setter is a
+one-line atomic store the popup surface (1b) can call across the crate
+boundary on a `pub` static, the same way `enable_cmd`/`unit_path` in
+gitmind's daemons module stayed thin wrappers over shared state earlier
+this session. What matters is that the STATICS move with the core, since
+that is what `transcribe_with_dual_model` reads.
+
 Roughly 1,200 lines total, not the whole 4,417-line file and not an
 unbounded dependency tangle — a normal-sized extraction, comparable to
-`board_layouts::dispatch` earlier this session.
+`board_layouts::dispatch` earlier this session. The two hint flags found
+just now are the reason this was read function-by-function rather than
+grepped: a grep for known static names would have missed them entirely,
+the same way the model-context coupling itself was invisible to a
+call-site grep on `main.rs`.
 
 This is now precise enough to execute as a single focused pass: create the
 crate, move the ~1,200 lines and the two sibling modules, decide `clog!`
