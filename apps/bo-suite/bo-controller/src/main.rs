@@ -46,7 +46,15 @@ mod lyrics_transcriber;
 mod spectral_masker;
 mod volume_safety;
 mod volume_safety_ack;
-mod masker;
+// Was `mod masker;` over a copy the file's own header called "vendored
+// from bo-mux" — so unlike passby_canceller (which drifted with no such
+// note), this one SAID where it came from and had simply fallen behind
+// since: bo-mux's copy carries four newer NaN/Inf-defense tests
+// (masker_nan_gain_db_falls_back_to_unity and three siblings) this copy
+// never received, on top of independently-rewritten comments describing
+// the same defenses. Re-exporting rather than porting the four tests over
+// by hand, so there is exactly one copy left to fall behind again.
+pub use bo_mux::masker;
 mod cancel_tones;
 pub use bo_core::pattern_learner;
 mod mic_capture;
