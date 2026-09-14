@@ -939,10 +939,55 @@ pub const PALETTE_ROWS_MAX: usize = 200;
 
 /// How tall the palette's result list may grow before it scrolls.
 ///
-/// Bounded so the palette does not run off the bottom of a phone — the failure
-/// C13_TODO §24 records for settings panels across the fleet, where a page was
-/// a bare stack with nothing bounding it and a Ui does not scroll, it clips.
+/// The floor, and the value on a small screen. Bounded so the palette does not
+/// run off the bottom of a phone — the failure C13_TODO §24 records for
+/// settings panels across the fleet, where a page was a bare stack with
+/// nothing bounding it and a Ui does not scroll, it clips.
 pub const PALETTE_LIST_H: f32 = 360.0;
+
+/// The fraction of the window the result list may occupy.
+///
+/// The rest is the palette's own input row and margins plus whatever is
+/// behind it, and leaving that much is what keeps the thing readable as a
+/// popup rather than a full-screen takeover.
+const PALETTE_LIST_FRACTION: f32 = 0.62;
+
+/// Hard ceiling, for a tall desktop monitor.
+///
+/// Past roughly this height the list stops being scannable — you are reading
+/// a page, not picking from a menu, and the fuzzy filter is the better tool
+/// for narrowing than the eye is.
+const PALETTE_LIST_H_MAX: f32 = 720.0;
+
+/// The result list's height for a window of `screen_h` pixels.
+///
+/// Pure, so the phone bound below is testable without a window — the whole
+/// risk in making this taller is regressing the small-screen case, and that
+/// is not something to find out on a device.
+///
+/// A fixed 360 was the same on a 2160px monitor as on a phone, which on the
+/// desktop meant about eight visible rows with the scrollbar doing the rest —
+/// the palette was short for no reason other than that the phone needed it to
+/// be.
+pub fn palette_list_h_for(screen_h: f32) -> f32 {
+    (screen_h * PALETTE_LIST_FRACTION)
+        .max(PALETTE_LIST_H)
+        .min(PALETTE_LIST_H_MAX)
+        // Never taller than the window itself, which the `max` above could
+        // otherwise force on a short window — a list taller than the screen
+        // cannot be scrolled to the bottom of. Applied LAST so it wins over
+        // the floor.
+        .min((screen_h - 96.0).max(120.0))
+}
+
+/// The result list's height for THIS window.
+///
+/// Takes the `Ui` rather than reading a global so it reflects the actual
+/// window, and so it stays correct when the window is resized rather than
+/// being sampled once at startup.
+pub fn palette_list_h(ui: &egui::Ui) -> f32 {
+    palette_list_h_for(ui.ctx().screen_rect().height())
+}
 
 
 /// The strip: a palette button that opens on tap-and-hold, then recents
@@ -1276,7 +1321,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 // came from `max_height` alone taking whatever the Area
                                 // offered, which depended on last frame. Content height does
                                 // not.
-                                .max_height(PALETTE_LIST_H)
+                                .max_height(palette_list_h(ui))
                                 .auto_shrink([false, true])
                                 // The scrollbar was always reserving its gutter, which is
                                 // the "excessive padding on the right hand side".
@@ -1304,7 +1349,16 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 // the list scrolls under the finger and snaps
                                 // home the moment it lifts.
                                 if selected && p.follow_selection {
-                                    resp.scroll_to_me(None);
+                                    // `Some(Center)`, not `None`. `None` scrolls the MINIMUM
+                                    // distance to bring the row into view, which parks
+                                    // the selection hard against whichever edge it
+                                    // entered from — hold ↓ and the highlight pins to
+                                    // the bottom pixel row with the next results
+                                    // invisible below it, which reads as the list
+                                    // lagging one item behind the keyboard. Centring
+                                    // keeps the neighbours on both sides visible, so
+                                    // you can see what you are about to land on.
+                                    resp.scroll_to_me(Some(egui::Align::Center));
                                 }
                                 if resp.clicked() {
                                     apply = Some((items[i].0.clone(), items[i].1.clone()));
@@ -1364,7 +1418,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                     // real content, capped, and only show the scrollbar when
                                     // it is needed. See that comment for why this does not
                                     // reintroduce the latch it replaced.
-                                    .max_height(PALETTE_LIST_H)
+                                    .max_height(palette_list_h(ui))
                                     .auto_shrink([false, true])
                                     .scroll_bar_visibility(
                                         egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
@@ -1382,7 +1436,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                         .response
                                         .interact(Sense::click());
                                     if selected && p.follow_selection {
-                                        resp.scroll_to_me(None);
+                                        resp.scroll_to_me(Some(egui::Align::Center)); // see the note at the commands list
                                     }
                                     if resp.clicked() {
                                         open_path = Some(full.to_string_lossy().into_owned());
@@ -1439,7 +1493,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 // how tall a palette list may get.
                                 egui::ScrollArea::vertical()
                                     .id_salt("palette_go_to_route")
-                                    .max_height(PALETTE_LIST_H)
+                                    .max_height(palette_list_h(ui))
                                     .auto_shrink([false, true])
                                     .scroll_bar_visibility(
                                         egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
@@ -1488,7 +1542,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 }
                                 egui::ScrollArea::vertical()
                                     .id_salt("palette_workspace_symbol")
-                                    .max_height(PALETTE_LIST_H)
+                                    .max_height(palette_list_h(ui))
                                     .auto_shrink([false, true])
                                     .scroll_bar_visibility(
                                         egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
@@ -1539,7 +1593,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 }
                                 egui::ScrollArea::vertical()
                                     .id_salt("palette_project_search")
-                                    .max_height(PALETTE_LIST_H)
+                                    .max_height(palette_list_h(ui))
                                     .auto_shrink([false, true])
                                     .scroll_bar_visibility(
                                         egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
@@ -1725,6 +1779,61 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{palette_list_h_for, PALETTE_LIST_H, PALETTE_LIST_H_MAX};
+
+    #[test]
+    fn a_phone_keeps_the_bound_the_fixed_height_gave_it() {
+        // The regression that matters. PALETTE_LIST_H exists because a
+        // palette taller than the screen runs off the bottom of a phone and
+        // a Ui clips rather than scrolls (C13_TODO §24). Making the list
+        // taller on desktop must not touch that.
+        //
+        // 720p portrait phone, and a short one.
+        for h in [1280.0_f32, 960.0, 800.0] {
+            let got = palette_list_h_for(h);
+            assert!(got <= h - 96.0, "{h}px screen got a {got}px list, leaving no room");
+        }
+    }
+
+    #[test]
+    fn a_desktop_gets_a_taller_list_than_the_old_fixed_one() {
+        // The point of the change: on a big monitor the fixed 360 showed
+        // about eight rows and left the rest to the scrollbar.
+        assert!(palette_list_h_for(2160.0) > PALETTE_LIST_H);
+        assert!(palette_list_h_for(1440.0) > PALETTE_LIST_H);
+    }
+
+    #[test]
+    fn it_stops_growing_before_the_list_stops_being_scannable() {
+        // Past the ceiling you are reading a page rather than picking from
+        // a menu, and the fuzzy filter narrows better than the eye does.
+        assert_eq!(palette_list_h_for(4320.0), PALETTE_LIST_H_MAX);
+    }
+
+    #[test]
+    fn a_very_short_window_never_gets_a_list_taller_than_itself() {
+        // The `.max(PALETTE_LIST_H)` floor would otherwise force 360px onto
+        // a 200px window, and a list taller than the screen cannot be
+        // scrolled to the bottom of. The window clamp is applied last for
+        // exactly this reason.
+        for h in [400.0_f32, 300.0, 200.0] {
+            assert!(
+                palette_list_h_for(h) < h,
+                "{h}px window got a list at least as tall as itself"
+            );
+        }
+    }
+
+    #[test]
+    fn it_never_returns_a_negative_or_zero_height() {
+        // A degenerate window (minimised, or mid-resize) must not produce a
+        // negative max_height — egui takes it as a constraint and the
+        // arithmetic below it would go strange rather than loud.
+        for h in [0.0_f32, 1.0, 50.0, 96.0] {
+            assert!(palette_list_h_for(h) > 0.0, "{h}px screen produced a non-positive height");
+        }
+    }
+
     use super::*;
 
     #[test]
