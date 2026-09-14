@@ -1440,3 +1440,39 @@ physical hardware fact, unlikely to change; this one is software support
 status, which does). If this matters for a real port, re-check
 asahilinux.org's own feature tables rather than trust this section's
 snapshot.
+
+---
+
+## 22. §19's closure had a third hole: `begin_capture` starts the preview worker directly
+
+Found doing the actual extraction (not another scan — this one only shows
+up when you read the function that calls the entry point, `begin_capture`
+itself, which section 19's scan technically included but the specific
+calls inside it were not individually traced against the "is this
+optional" question the way `acoustic_index`/`corpus_recorder` were).
+
+`begin_capture()` calls `ensure_preview_thread()` and
+`clear_partial_preview()` directly, unconditionally. `ensure_preview_thread`
+spawns a two-tier live-preview worker (phonetic dumb-DB match every 250ms,
+real whisper transcription every 1500ms, per-speaker routing) — a real,
+substantial, separate feature (showing partial text before the utterance
+finishes), not something `listen()`/`listen_with_audio()`'s own return
+value depends on. Same shape as `corpus_recorder`'s call from inside the
+cpal audio callback: a real, valuable, but OPTIONAL feature invoked
+directly from a function that has to move into the shared core regardless.
+
+**Resolution: one hook mechanism for both**, rather than two bespoke ones.
+`voice-engine-kit` gets a small `capture_hooks` module: an `AUDIO_TAP`
+(called with each raw audio chunk + sample rate, replaces the direct
+`corpus_recorder::push_samples` call) and a `ON_CAPTURE_START` hook
+(called from `begin_capture`, replaces the direct `ensure_preview_thread`/
+`clear_partial_preview` calls). Both default to a cheap no-op; a
+consuming app installs its own via `set_audio_tap`/`set_on_capture_start`
+once at startup, before capture begins. voiceterm's own wrapper installs
+both, using its own `corpus_recorder`/preview-worker code unchanged — the
+capture core does not need to know either concern exists.
+
+This is the same "consuming app supplies the hook, the shared core does
+not call the optional feature itself" pattern already used for
+`log_summary::VOICE_ACTIVE`, generalized into one real mechanism instead
+of three ad-hoc special cases the closure kept discovering one at a time.
