@@ -476,3 +476,70 @@ path has a consumer and is not merely a dismiss.
 extraction of a 4,417-line module and step 2 is a new surface; starting
 either without the budget to finish and compile it is how the `bufsearch`
 duplicate happened earlier this session.
+
+---
+
+## 14. snapclone: the photo popup and call slide-up are already ported
+
+Scoped after being asked for "the snapclone-qt take a photo popup for adding
+text and choosing senders" and "the slideup for calls". Both exist. Recorded
+so the ask is not re-opened on the strength of a filename search that misses
+them.
+
+### The photo popup
+
+`SnapComposerDialog` (592 lines of C++) is ported as `composer.rs` (302) +
+`composer_ui.rs` (184), and the port carries the parts that matter rather
+than the widget tree: caption baked into the image before send (so the
+recipient's client needs no overlay agreement), `cycleColor`, swipe-up-to-send
+so the whole background is the button, and keyboard-inset avoidance.
+
+The duration trap is documented in the port and worth repeating here:
+`duration_secs = 0` means NO LIMIT on this wire, not "vanishes instantly", so
+`if (duration)` is exactly backwards and leaks the photo. `send_flow.rs`
+records that the egui bin was writing 0 for every snap before it was fixed.
+
+Choosing recipients is the second half and is also there: `composer_ui.rs`
+ends on "Next: choose recipients", and `send_flow.rs` restores the Qt
+four-step sequence (take -> compose -> pick -> receipt) that the port
+originally had "all the pieces and none of the sequence" of.
+
+**One real gap, and it is on the QT side.** `SnapComposerDialog.cpp:41`:
+
+    // caption() stub — Snap struct has no caption field yet.
+    QString SnapComposerDialog::caption() const { return {}; }
+
+The caption is baked into the pixels and never travels as text, so nothing
+downstream can search, index or re-render it. That is a Snap-struct change,
+not a port.
+
+### The call slide-up
+
+`IncomingCallDialog.cpp` (175 lines) is ported as `ring.rs` (518) — larger
+than the original, because it also absorbed `RingtoneSynth` and the timeout
+rule: Decline and the 30-second timeout are the same answer, since a call
+nobody picked up was declined and the caller should not hear a ring that
+never ends.
+
+### What IS unported, measured rather than guessed
+
+Of 82 Qt UI surfaces (`src/ui/**/*.cpp`), 65 are named somewhere in
+`egui-frontend/src/`. The 17 that are not:
+
+    CameraBridgeManager  CameraRegistry     CameraTester
+    ComponentTestWindow  FocusSweep         FramePixelOps
+    IioSensorProxySource LibcameraBackend   ModalLayerTestPanel
+    PostureController    QtCameraBackend    RecordingMetadata
+    VcmController        VideoRecorder      VideoTranscoder
+    VoiceActivityTracker converter
+
+Almost none is a screen. They are camera-backend plumbing (libcamera and Qt
+backends, lens VCM control, focus sweep, pixel ops), video recording and
+transcoding, two test harnesses, and `IioSensorProxySource` — which belongs
+with C18_TODO section 2's IIO source layer rather than being ported into
+snapclone a ninth time.
+
+The user-facing port is complete. The gap is the camera BACKEND, which is a
+different piece of work and wants deciding as one (does the egui build talk
+to libcamera directly, or through camera-bridge?) rather than surface by
+surface.
