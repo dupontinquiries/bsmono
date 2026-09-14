@@ -113,6 +113,59 @@ mod tests {
         }
     }
 
+    /// r-1.2M-tri-diag: a first real run of `sample_grid_worst_case_stays_under_budget`
+    /// (seed 1) hit chunk (4,3,1) at 1,210,776 triangles -- over 3x the
+    /// *theoretical maximum* for a correctly face-culled 32^3 chunk (393,216,
+    /// i.e. every one of its 32,768 blocks isolated as a lone speck exposing
+    /// all 6 faces -- the worst case adversarial pattern possible). That
+    /// number being mathematically exceeded rules out "just a lot of exposed
+    /// surface" (dense rubble, dense foliage, missing neighbor culling on the
+    /// outer shell -- all bounded well under that ceiling) and points at
+    /// either duplicate face emission or the mesher/generator processing more
+    /// than one chunk's worth of data. This test doesn't diagnose which --
+    /// it dumps the numbers a debugger session needs to. Not a pass/fail
+    /// guard; run with `-- --nocapture` and read the output.
+    #[test]
+    fn dump_diagnostics_for_1_2m_tri_chunk() {
+        let gen = WorldGenerator::new(1);
+        let coord = ChunkCoord::new(4, 3, 1);
+        let chunk = gen.generate_chunk(coord);
+
+        let non_air = chunk
+            .blocks
+            .iter()
+            .filter(|b| !matches!(b, crate::world::blocks::BlockId::Air))
+            .count();
+        let expected_len = (CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize;
+
+        let mesh = crate::render::mesher::mesh_chunk(&chunk);
+        let tris = mesh.indices.len() / 3;
+        let verts = mesh.vertices.len();
+
+        println!(
+            "chunk {coord:?}: blocks.len()={} (expected {expected_len}), non_air={non_air}/{expected_len} ({:.1}%), \
+             vertices={verts}, indices={}, triangles={tris}, \
+             theoretical_max_triangles_if_every_block_isolated={}",
+            chunk.blocks.len(),
+            non_air as f32 / expected_len as f32 * 100.0,
+            mesh.indices.len(),
+            expected_len * 6 * 2,
+        );
+        // A few things worth reading off this once it actually runs:
+        //   - blocks.len() != expected_len would mean generate_chunk itself
+        //     returned a wrongly-sized array -- a generation bug, not a mesher one.
+        //   - verts far exceeding non_air*8 (8 corners/block, generous upper
+        //     bound before any culling/merging) would point at the mesher
+        //     visiting cells outside this chunk's own volume.
+        //   - tris > expected_len*6*2 (the theoretical max) with blocks.len()
+        //     and non_air both looking normal would isolate the bug to
+        //     mesh_chunk's merge/emission logic specifically.
+        println!(
+            "(diagnostic only, not asserting -- see this test's doc comment for what to \
+             read off the numbers above)"
+        );
+    }
+
     #[test]
     fn foliage_overlay_stays_under_budget() {
         let gen = WorldGenerator::new(42);
