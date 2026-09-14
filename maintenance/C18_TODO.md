@@ -531,16 +531,27 @@ it needs an explicit return value instead of an implicit stash-and-fetch.
 That is a real API decision for whoever builds the surface, not something
 to default without picking.
 
-Original dependency order, steps 2-4 unchanged:
+Dependency order, step 1 now split into 1a/1b now that the layers are
+confirmed rather than assumed; steps 2-4 unchanged:
 
-1. ~~shared/voice-kit taking voice.rs as its engine~~ — corrected above.
-   The real step 1 is a NEW narrow surface (name TBD — not `voice-kit`,
-   which is taken and means something else), holding only the
-   recording/preview functions a popup calls, with `voice.rs` becoming a
-   thin voiceterm-specific wrapper the way `av1tuner`'s `gm` module's
-   children now correctly point `super::` at their real parent instead of
-   `crate::`.
-2. An egui popup surface over it, in a shared widget crate, since both
+1a. Extract the shared core FIRST, on its own, with no popup-shaped API:
+    `ensure_models_loaded`, `load_tier`, `transcribe_with_dual_model`,
+    `run_one`, and the `*_CTX`/`*_STATE` statics. This is the piece both
+    `warmup`/`prewarm` and the popup surface need, so it has to exist
+    before either side is cut over — cutting the popup surface out first
+    would immediately hit the same "which crate owns TINY_CTX" question
+    this section spent its last two passes on.
+1b. Then the popup surface proper (`RING_BUFFER`, `CANCEL_FLAG`,
+    `FINISH_FLAG`, the preview/wake-event statics, the 10 functions),
+    depending on 1a's crate rather than reaching into voiceterm.
+    `listen_with_audio`'s reach into `crate::log_summary::VOICE_ACTIVE`
+    needs a decision here: a callback the caller supplies, or leave that
+    one flag as a voiceterm-side effect set around the call rather than
+    inside it.
+    `voice.rs` becomes a thin voiceterm-specific wrapper over 1a+1b, the
+    way `av1tuner`'s `gm` module's children now correctly point `super::`
+    at their real parent instead of `crate::`.
+2. An egui popup surface over 1b, in a shared widget crate, since both
    consumers want the same one. voiceterm's QML is the reference for what it
    shows: partial preview with per-speaker colouring, cancel/finish, and the
    wake-suppression rule (`voice popup open` must block a wake firing
@@ -554,36 +565,66 @@ Original dependency order, steps 2-4 unchanged:
 corpus ("voice popups the user cancelled without executing"), so the cancel
 path has a consumer and is not merely a dismiss.
 
-**Scoping done; extraction not started, and here is why not attempted
-today.** The function list above is derived from every real call site, not
-guessed — that was the actual risk in this task, per `av1tuner`'s two
-wrong-nesting attempts earlier this session, and it is now closed. What
-looked like the remaining step — move the 10 functions and their state,
-leave the other 22 — turned out to have a second layer once the module's 27
-statics were actually listed rather than assumed manageable:
+**Still not started, and now genuinely ready to be.** Three passes in this
+session went into scoping (wrong target, then an unverified function list,
+then a suspected coupling) and this one confirmed the coupling by tracing
+real call chains rather than reasoning about them. The shape is now known
+precisely enough that step 1a is a mechanical extraction — pick the
+functions and statics named above, move them, re-export from `voice.rs` —
+rather than a design question. That mechanical step is what the next
+session should spend its budget on, not more scoping.
 
-`RING_BUFFER`/`CANCEL_FLAG`/`FINISH_FLAG` clearly belong with the popup
-surface. But `TINY_CTX`/`BASE_CTX`/`LARGE_CTX` and their matching `*_STATE`
-statics are loaded whisper model contexts, and `listen()`/
-`listen_with_audio()` — both squarely in the popup-surface list — almost
-certainly read them, the same contexts `prewarm()`/`warmup()`/
-`is_available()` populate. Those three were scoped as staying BEHIND, as
-engine-configuration concerns. If `listen()` needs the contexts those
-functions set up, the popup surface and the "stays in voiceterm" list are
-not actually separable into two crates without either the model-loading
-statics moving too (which drags whisper-rs model management into what was
-meant to be a small popup-facing surface) or the popup crate taking a
-dependency back on voiceterm for the contexts (inverting the extraction).
+**Traced, and the coupling is real — confirmed, not suspected.** Read
+`listen()` and `listen_with_audio()`'s full call chains against all 27
+statics rather than stopping at their own bodies, since a static touched
+three calls deep is invisible to a shallow read.
 
-This is exactly the kind of coupling a call-site grep does not surface —
-call sites show WHO calls a function, not what statics that function reads
-inside its own body. Confirming or refuting the suspected coupling means
-reading `listen()`'s and `listen_with_audio()`'s full bodies against all 27
-statics, which is the next concrete step and was not done today: this
-section already went through two rounds of correction in one session
-(wrong target, then a guessed function list), and a third attempt at "here
-is definitely the boundary" without reading the function bodies risks being
-a third wrong answer rather than the last one.
+    listen() -> listen_with_audio() -> record_and_transcribe_inner()
+             -> ensure_models_loaded() / transcribe_with_dual_model()
+             -> touch TINY_CTX, BASE_CTX, LARGE_CTX (and load_tier(),
+                run_one() touch the matching *_STATE pair)
+
+`record_and_transcribe_inner` itself only touches `RING_BUFFER`/
+`CANCEL_FLAG`/`FINISH_FLAG` directly — the model statics are two calls
+further in, which a shallow read of the popup-facing function alone would
+have missed entirely. Then checked the three functions scoped as
+"config, stays behind" against the SAME chain, expecting them to be
+independent:
+
+    warmup()   -> transcribe_with_dual_model() -> same TINY/BASE/LARGE_CTX
+    prewarm()  -> ensure_whisper_loaded() -> ensure_models_loaded() -> same
+    is_available() -> touches NONE of the 27 statics (file-exists + `which`
+                       checks only) -- genuinely independent, confirmed
+
+They are not independent. `warmup` and `prewarm` reach the identical model
+statics through one-line wrappers (`ensure_whisper_loaded` is a bare
+pass-through to `ensure_models_loaded`) around the exact same loader
+`listen`'s chain calls. There is no separate "config-only" path at the
+model layer — everything that ever transcribes or warms the model funnels
+through one `ensure_models_loaded`/`load_tier` pair. `is_available` is the
+one of the three that is genuinely independent, confirmed rather than
+assumed by the same check.
+
+So the shape is not "10 popup functions in one crate, 22 engine functions
+in another." It is three layers: a shared model-loading/inference core
+(`ensure_models_loaded`, `load_tier`, `transcribe_with_dual_model`,
+`run_one`, the `*_CTX`/`*_STATE` statics) that BOTH the popup surface and
+`warmup`/`prewarm` need; the popup surface proper (`RING_BUFFER`,
+`CANCEL_FLAG`, `FINISH_FLAG`, the preview/wake-event statics, and the 10
+functions built on them); and the handful of genuinely independent
+functions like `is_available`. The core has to move wherever the popup
+surface moves, or the popup crate depends on voiceterm for it — inverting
+the extraction, which was the failure mode this whole investigation was
+checking for.
+
+One more coupling worth flagging rather than chasing further right now:
+`listen_with_audio` also reaches OUTSIDE `voice.rs` entirely, into
+`crate::log_summary::VOICE_ACTIVE` (a deferral flag telling a log-summary
+worker to back off while voice has the CPU). That is a fourth thing a
+shared crate would need — either take a callback/trait for it, or accept
+that this one flag stays a voiceterm-only side effect the shared core does
+not perform, with voiceterm setting it around the call instead of inside
+it. Not resolved here.
 
 ---
 
