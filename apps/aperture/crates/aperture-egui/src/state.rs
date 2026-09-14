@@ -1197,6 +1197,52 @@ impl AppState {
         &self.symbols
     }
 
+    /// Where a completion accept should actually start REPLACING, distinct
+    /// from `word_before_caret`'s own `start` — the bug two screenshots
+    /// caught: selecting `StreamDeserializer` after typing `serde_json::`
+    /// replaced the WHOLE `serde_json::` prefix with the bare label,
+    /// producing `StreamDeserializer` instead of
+    /// `serde_json::StreamDeserializer`.
+    ///
+    /// `word_before_caret` deliberately walks back through `::` too, so the
+    /// local-symbol fuzzy matcher can score a query like `serde_json::Strea`
+    /// against a full qualified name — that part is correct and unchanged.
+    /// The bug is that `popup_accept` then used THAT SAME span as the
+    /// replace-range, but LSP completion items at a qualified-path position
+    /// are scoped to just the final segment (rust-analyzer's own
+    /// `insertText` for a `mod::` completion is the bare item name, not the
+    /// qualified path) — the client is expected to leave everything up to
+    /// the last `::` untouched and only replace from there.
+    ///
+    /// Finds the char-index right after the LAST `::` in `word`, if any;
+    /// `word_start` unchanged (falls back to matching `word_before_caret`'s
+    /// own start) when there is no `::` at all, which is every ordinary
+    /// non-path completion and must stay exactly as it worked before this
+    /// fix.
+    ///
+    /// Works on `word`'s CHARS, not `str::rfind`'s byte offset — `word` is
+    /// built by reversing a `Vec<char>` in `word_before_caret`, and
+    /// `word_start`/the caret are char positions (walked via `char_at`),
+    /// so a byte offset would only happen to agree with a char offset for
+    /// pure-ASCII text.
+    fn completion_replace_start(word_start: usize, word: &str) -> usize {
+        let chars: Vec<char> = word.chars().collect();
+        let mut last_colon_pair_end: Option<usize> = None;
+        let mut i = 0;
+        while i + 1 < chars.len() {
+            if chars[i] == ':' && chars[i + 1] == ':' {
+                last_colon_pair_end = Some(i + 2);
+                i += 2; // don't let ":::" double-count the shared colon
+            } else {
+                i += 1;
+            }
+        }
+        match last_colon_pair_end {
+            Some(end) => word_start + end,
+            None => word_start,
+        }
+    }
+
     /// The word (ident chars, `::` included) ending at the caret.
     fn word_before_caret(&self) -> (usize, String) {
         let caret = self.editor.sel.head;
@@ -1229,6 +1275,12 @@ impl AppState {
             self.popup = None;
             return;
         }
+        // The REPLACE boundary, distinct from `start` (which the fuzzy
+        // matcher below still needs as the full word-with-`::` start for
+        // scoring). See `completion_replace_start`'s own doc for the bug
+        // this fixes: accepting a completion must not eat an already-typed
+        // module-path prefix like `serde_json::`.
+        let replace_start = Self::completion_replace_start(start, &word);
         self.gather_symbols();
         let mut scored: Vec<(i32, PopupItem)> = self
             .symbols
@@ -1250,11 +1302,11 @@ impl AppState {
             // request LSP and let `poll_lsp` open the popup itself if an
             // answer arrives before the person moves on.
             self.popup = None;
-            self.request_lsp_completion(start);
+            self.request_lsp_completion(replace_start);
         } else {
             self.ghost.dismiss();
-            self.popup = Some(Popup { items, sel: 0, prefix_start: start });
-            self.request_lsp_completion(start);
+            self.popup = Some(Popup { items, sel: 0, prefix_start: replace_start });
+            self.request_lsp_completion(replace_start);
         }
     }
 
@@ -3356,6 +3408,61 @@ fn first_line(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use aperture_complete::CompletionOutcome;
+
+    #[test]
+    fn completion_replace_start_stops_after_the_last_double_colon() {
+        // The exact bug from the screenshots: typing `serde_json::` then
+        // accepting `StreamDeserializer` must produce
+        // `serde_json::StreamDeserializer`, not just `StreamDeserializer` --
+        // which means the replace range must start right after the `::`,
+        // not at the beginning of `serde_json`.
+        let word = "serde_json::";
+        let word_start = 4; // arbitrary — the caret column the word began at
+        let replace_start = AppState::completion_replace_start(word_start, word);
+        assert_eq!(
+            replace_start,
+            word_start + word.chars().count(),
+            "with nothing typed after `::`, the replace range must be EMPTY \
+             (start == caret), so accepting only inserts, never deletes \
+             the already-typed module path"
+        );
+    }
+
+    #[test]
+    fn completion_replace_start_with_a_partial_segment_typed() {
+        // serde_json::Strea| (partial segment typed) -- replace only
+        // "Strea", keep "serde_json::".
+        let word = "serde_json::Strea";
+        let word_start = 4;
+        let replace_start = AppState::completion_replace_start(word_start, word);
+        let expected = word_start + "serde_json::".chars().count();
+        assert_eq!(replace_start, expected, "must replace only the partial segment, not the module path");
+    }
+
+    #[test]
+    fn completion_replace_start_with_a_nested_path_uses_the_last_pair() {
+        // std::collections::Has| -- must stop after the LAST `::`
+        // (before "Has"), not the first (which would eat "collections" too).
+        let word = "std::collections::Has";
+        let word_start = 0;
+        let replace_start = AppState::completion_replace_start(word_start, word);
+        let expected = "std::collections::".chars().count();
+        assert_eq!(replace_start, expected, "must use the LAST `::`, not the first");
+    }
+
+    #[test]
+    fn completion_replace_start_is_unchanged_for_a_plain_identifier() {
+        // No `::` at all -- an ordinary local-symbol completion, the
+        // pre-fix behavior, must be untouched.
+        let word = "wor";
+        let word_start = 7;
+        assert_eq!(AppState::completion_replace_start(word_start, word), word_start);
+    }
+
+    #[test]
+    fn completion_replace_start_empty_word_is_a_no_op() {
+        assert_eq!(AppState::completion_replace_start(3, ""), 3);
+    }
 
     fn typed(s: &mut AppState, text: &str, t: u64) {
         s.handle(Ev::Text(text.into()), t);
