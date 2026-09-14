@@ -366,7 +366,6 @@ pub fn mesh_diag_reset() {
     MESH_DIAG_SOFT_SIDE_QUADS.with(|c| c.set(0));
     MESH_DIAG_SUBDIVIDED_TOP_BLOCKS.with(|c| c.set(0));
     MESH_DIAG_JITTERED_TOP_BLOCKS.with(|c| c.set(0));
-    MESH_DIAG_SOFT_SIDE_FACES.with(|c| c.set(0));
 }
 
 /// Read the per-emission-path counters accumulated on the calling thread
