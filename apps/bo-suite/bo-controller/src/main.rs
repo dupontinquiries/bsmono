@@ -62,7 +62,15 @@ mod drone_canceller;
 mod frequency_shifter;
 pub use bo_core::music_masker;
 mod network_sim;
-mod passby_canceller;
+// Was `mod passby_canceller;` over a local copy byte-for-byte identical to
+// bo-mux's except for one extra test assertion there (that the FSM leaves
+// Peak rather than stalling — bo-mux's copy is the strict superset). Every
+// call site here already spells it `crate::passby_canceller::...` or
+// `passby_canceller::...`, matching how `backup_beeper` and `music_masker`
+// two lines up are re-exported from bo-core rather than duplicated — so this
+// follows the pattern already established in this file instead of inventing
+// a new one. C18_TODO section 9.
+pub use bo_mux::passby_canceller;
 mod reverb;
 mod settings_store;
 mod v1;
