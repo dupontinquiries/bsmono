@@ -154,6 +154,33 @@ pub fn sees_in_fog(
     sees(eye.in_fog(sigma_t), eye_pos, facing, target_pos, radius, target_speed)
 }
 
+/// r-vision-worldquery: fold a real occlusion check into an already-computed
+/// `Detection`, downgrading to `Unseen` if the line of sight is blocked.
+///
+/// This is the missing half of `sees_in_fog`: that function alone answers
+/// "is the target within FOV/range/fog/motion-resolvable size," with no
+/// notion of a solid block in between -- a dragon could "see" straight
+/// through a boulder or a dense bush. `has_los` is a caller-supplied
+/// closure (typically `|| sim::vision::line_of_sight(eye, target, &world)`)
+/// so this stays pure and testable without any real world/chunk store, the
+/// same "occlusion is injected, not hardcoded" pattern `sim::mesh_vision`
+/// already uses for the same reason.
+///
+/// Takes a closure rather than a plain `bool` deliberately: `line_of_sight`
+/// walks every voxel between eye and target (cost scales with distance), so
+/// this only pays for it when there's something to protect -- an already-
+/// `Unseen` detection (out of cone/range/too-small-to-resolve) has nothing
+/// for a wall to hide, so the closure never runs. That "cheap check first,
+/// raycast only for survivors" ordering is what keeps this affordable to
+/// call every tick for every roamer a scheduler band ticks.
+pub fn occlude_detection<F: FnOnce() -> bool>(detection: Detection, has_los: F) -> Detection {
+    if detection.is_detected() && !has_los() {
+        Detection::Unseen
+    } else {
+        detection
+    }
+}
+
 #[cfg(test)]
 mod tests {    use super::*;
 
@@ -225,5 +252,66 @@ mod tests {    use super::*;
         assert!(keen.range > weak.range && keen.acuity_ratio < weak.acuity_ratio);
         assert!(sees(keen, eye, FWD, target, 0.5, 0.0).is_detected(), "keen eyes reach 60 blocks");
         assert_eq!(sees(weak, eye, FWD, target, 0.5, 0.0), Detection::Unseen, "weak eyes fall short");
+    }
+
+    // r-vision-worldquery: occlude_detection tests. Pure -- no world, no
+    // chunk store, just bool closures standing in for a real line_of_sight
+    // call, per the "occlusion is injected, not hardcoded" pattern.
+
+    #[test]
+    fn occlude_detection_downgrades_clear_to_unseen_when_blocked() {
+        let out = occlude_detection(Detection::Clear, || false /* blocked */);
+        assert_eq!(out, Detection::Unseen);
+    }
+
+    #[test]
+    fn occlude_detection_downgrades_motion_to_unseen_when_blocked() {
+        let out = occlude_detection(Detection::Motion, || false /* blocked */);
+        assert_eq!(out, Detection::Unseen);
+    }
+
+    #[test]
+    fn occlude_detection_leaves_clear_alone_when_los_is_open() {
+        let out = occlude_detection(Detection::Clear, || true /* clear */);
+        assert_eq!(out, Detection::Clear);
+    }
+
+    #[test]
+    fn occlude_detection_leaves_motion_alone_when_los_is_open() {
+        let out = occlude_detection(Detection::Motion, || true /* clear */);
+        assert_eq!(out, Detection::Motion);
+    }
+
+    #[test]
+    fn occlude_detection_never_upgrades_an_already_unseen_detection() {
+        // Blocked-vs-clear shouldn't matter -- Unseen in means Unseen out,
+        // since there was nothing geometrically detectable to occlude.
+        assert_eq!(occlude_detection(Detection::Unseen, || false), Detection::Unseen);
+        assert_eq!(occlude_detection(Detection::Unseen, || true), Detection::Unseen);
+    }
+
+    #[test]
+    fn occlude_detection_never_calls_the_closure_for_an_already_unseen_detection() {
+        // The whole point of taking a closure instead of a bool: an
+        // already-Unseen detection has nothing for a wall to hide, so the
+        // (potentially expensive, real-raycast-backed) closure must never
+        // run for it. Proven here with a closure that panics if called,
+        // not just documented in a comment.
+        let out = occlude_detection(Detection::Unseen, || panic!("has_los must not be called for an already-Unseen detection"));
+        assert_eq!(out, Detection::Unseen);
+    }
+
+    #[test]
+    fn occlude_detection_does_call_the_closure_for_a_detected_target() {
+        // The complementary proof: for a detection that DID resolve
+        // something, the occlusion check must actually run (not be skipped
+        // in the other direction either). Verified via a Cell the closure
+        // mutates, since a bare "no panic" wouldn't distinguish "ran and
+        // returned true" from "never ran and the early-return path returned
+        // the input unchanged by coincidence."
+        let called = std::cell::Cell::new(false);
+        let out = occlude_detection(Detection::Clear, || { called.set(true); true });
+        assert!(called.get(), "has_los must be called for a Clear detection");
+        assert_eq!(out, Detection::Clear);
     }
 }

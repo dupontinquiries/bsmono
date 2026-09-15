@@ -9421,6 +9421,25 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 let eye = [self_xz.0, cr.body.position[1] + cr.body.half_extents[1], self_xz.1];
                 let facing = [cr.yaw.cos(), 0.0, cr.yaw.sin()];
                 let detection = unendlich_engine::sim::eyes::sees_in_fog(senses.eyes, frame_fog_sigma, eye, facing, player_pos3, 0.4, player_speed);
+                // r-vision-worldquery: fold real occlusion in. sees_in_fog alone
+                // has no notion of a solid block in between -- without this, a
+                // dragon "sees" straight through a boulder or a dense bush as
+                // long as the player is geometrically within its FOV/range/fog.
+                // occlude_detection only invokes the closure (the actual
+                // raycast) when sees_in_fog already found something detectable
+                // -- an out-of-cone/range/too-small target has nothing for a
+                // wall to hide, so the (real, per-voxel) line_of_sight cost is
+                // paid only for candidates that already passed the cheap check.
+                let detection = unendlich_engine::sim::eyes::occlude_detection(detection, || {
+                    use unendlich_engine::sim::fixed::{Fixed, Vec3};
+                    let to_fixed3 = |p: [f32; 3]| Vec3::new(
+                        Fixed::from_f64(p[0] as f64),
+                        Fixed::from_f64(p[1] as f64),
+                        Fixed::from_f64(p[2] as f64),
+                    );
+                    let view = chunk_manager.drone_view();
+                    unendlich_engine::sim::vision::line_of_sight(to_fixed3(eye), to_fixed3(player_pos3), &view)
+                });
                 let seen = detection.is_detected();
                 let perceived: Option<(f32, f32)> = if seen && !player_hidden {
                     Some(player_xz) // sight pins the true position

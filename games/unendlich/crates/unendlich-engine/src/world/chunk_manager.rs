@@ -261,6 +261,39 @@ impl DroneView {
     }
 }
 
+// r-vision-worldquery: the missing wire between two already-correct, already-
+// tested pieces -- sim::vision::line_of_sight (a real, deterministic voxel
+// raycaster: Amanatides & Woo DDA, rollback-safe) needs a WorldQuery to read
+// the world through, and until now nothing implemented WorldQuery over the
+// live chunk store at all (every existing impl -- FlatWorld, SceneWorld,
+// NeutralWorld -- is a test/utility scene). DroneView is the right target,
+// not ChunkManager directly: it's already the documented "read-only, Send
+// view... for off-thread work," which is exactly what a sim-side raycast
+// wants (no exclusive/mutable access, cheap Arc::clone to obtain, safe to
+// hold across a roamer-AI tick without fighting the render thread for
+// ChunkManager access).
+//
+// This single ~10-line impl unlocks two separate consumers, both of which
+// were previously stubbed exactly because this didn't exist:
+//   - Creature vision occlusion (sim::eyes::sees_in_fog's live call site in
+//     unendlich_fullgame.rs currently has no occlusion check at all -- a
+//     dragon can "see" straight through a boulder or a dense bush as long as
+//     the player is within its FOV cone and range).
+//   - sim::mesh_vision's occlusion predicate, hardcoded `|_, _| false`
+//     ("conservative first pass... occlusion-backed cave win is a follow-up
+//     once a line-of-sight source is wired" -- see
+//     docs/design/mesh_vision_scheduling.md, which names this exact
+//     raycast-to-chunk-center approach as its cheapest suggested option).
+// physics_of_block is the documented conversion seam (BlockId -> BlockPhysics)
+// per its own doc comment: "the seam that lets the live voxel world drive sim
+// cognition (terrain occlusion, obstacle-aware paths)" -- this impl is that
+// seam actually being used for the first time.
+impl crate::sim::physics::WorldQuery for DroneView {
+    fn physics_at(&self, x: i32, y: i32, z: i32) -> crate::sim::physics::BlockPhysics {
+        crate::sim::physics::physics_of_block(self.block_at(x, y, z))
+    }
+}
+
 pub struct ChunkManager {
     chunks: Arc<DashMap<ChunkCoord, Arc<Chunk>>>,
     /// v0.24.23 propagation: parallel map of GPU-resident-style sparse
@@ -3098,6 +3131,88 @@ mod tests {
         let chunk = Chunk::empty(coord);
         let octree = OctreeArray::from_chunk(&chunk);
         mgr.install_chunk(chunk, octree);
+    }
+
+    // r-vision-worldquery: tests for the new WorldQuery impl on DroneView.
+    // Two layers, matching how the codebase tests physics_of_block/WorldQuery
+    // elsewhere: (1) physics_at itself reports the right BlockPhysics for
+    // solid/air/unloaded, and (2) an actual sim::vision::line_of_sight call
+    // through a DroneView proves the wiring end-to-end, not just that the
+    // trait method returns sane values in isolation.
+    #[test]
+    fn drone_view_world_query_reports_solid_for_solid_blocks() {
+        use crate::sim::physics::WorldQuery;
+        let mgr = make_manager();
+        insert_chunk_at(&mgr, ChunkCoord::new(0, 0, 0));
+        assert!(mgr.set_block(5, 5, 5, BlockId::Stone));
+
+        let view = mgr.drone_view();
+        let phys = view.physics_at(5, 5, 5);
+        assert!(phys.is_solid(), "Stone should report solid via WorldQuery");
+    }
+
+    #[test]
+    fn drone_view_world_query_reports_air_for_air_blocks() {
+        use crate::sim::physics::WorldQuery;
+        let mgr = make_manager();
+        insert_chunk_at(&mgr, ChunkCoord::new(0, 0, 0));
+        // Chunk::empty is all-air; don't set anything at (1,1,1).
+
+        let view = mgr.drone_view();
+        let phys = view.physics_at(1, 1, 1);
+        assert!(!phys.is_solid(), "untouched (air) block should not report solid");
+    }
+
+    #[test]
+    fn drone_view_world_query_unloaded_chunk_defaults_to_air_not_panic() {
+        use crate::sim::physics::WorldQuery;
+        let mgr = make_manager();
+        // Deliberately never insert any chunk -- the whole point of this
+        // test is the "chunk not loaded" branch of DroneView::block_at,
+        // which returns BlockId::Air rather than panicking or blocking.
+        let view = mgr.drone_view();
+        let phys = view.physics_at(99_999, 5, -99_999);
+        assert!(!phys.is_solid(), "unloaded chunk should default to non-solid (Air), not panic");
+    }
+
+    #[test]
+    fn line_of_sight_through_drone_view_is_blocked_by_a_real_wall() {
+        // End-to-end proof: sim::vision::line_of_sight (a real, independently-
+        // tested voxel raycaster) actually gets useful answers through a live
+        // DroneView, not just that WorldQuery compiles against it. Build a
+        // solid wall between two open points and confirm the ray reports
+        // blocked; then remove the wall (fresh chunk, no wall) and confirm
+        // the same two points report clear. This is exactly the "duck behind
+        // a rock and the dragon loses you" mechanic at the primitive level.
+        use crate::sim::fixed::{Fixed, Vec3};
+        use crate::sim::vision::line_of_sight;
+
+        let mgr = make_manager();
+        insert_chunk_at(&mgr, ChunkCoord::new(0, 0, 0));
+        // A wall spanning y=0..=3, z=0..=3 at x=5, between an eye at x=2
+        // and a target at x=8 (both at y=1,z=1) -- the ray from eye to
+        // target must cross x=5 at y=1,z=1, which the wall covers.
+        for y in 0..4 {
+            for z in 0..4 {
+                assert!(mgr.set_block(5, y, z, BlockId::Stone));
+            }
+        }
+        let view = mgr.drone_view();
+        let eye = Vec3::new(Fixed::from_int(2), Fixed::from_int(1), Fixed::from_int(1));
+        let target = Vec3::new(Fixed::from_int(8), Fixed::from_int(1), Fixed::from_int(1));
+        assert!(
+            !line_of_sight(eye, target, &view),
+            "a solid wall directly between eye and target must block line_of_sight"
+        );
+
+        // Same two points, fresh chunk with no wall: must be clear.
+        let mgr2 = make_manager();
+        insert_chunk_at(&mgr2, ChunkCoord::new(0, 0, 0));
+        let view2 = mgr2.drone_view();
+        assert!(
+            line_of_sight(eye, target, &view2),
+            "with nothing in between, line_of_sight through an all-air chunk must be clear"
+        );
     }
 
     // F4: the generator lifecycle. Proves the manager is NOT a startup-once
