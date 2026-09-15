@@ -30,12 +30,19 @@
 //! idempotent and order-independent, needs no coordination at all: the joiner
 //! can be receiving live edits while the catch-up is still arriving.
 
-use crate::{Presence, RackSync, SiteId, Stamp, StampedOp};
+use crate::{Presence, RackSync, SiteId, Stamp, StampedOp, ViewMode};
 use studio_core::{AutoTarget, Binding, BindingId, Bus, BusId, Clip, ClipId, CurveId, Effect, Gate, GroupId, Op, ParamKey, Send, Source, SourceId, Ticks, Track, TrackId, TrackKind};
 use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 
 /// Bumped whenever the encoding changes shape. A peer that sees a version it
 /// does not know refuses the packet rather than guessing.
+///
+/// v16: `Presence` gained `following` (has-site byte + site id, same shape
+/// as `active_track`) and `view_mode` (one byte, 0-3) -- for
+/// `follow_graph`'s chain resolution: a peer several hops down a follow
+/// chain needs to see the ROOT's view mode, which means every peer's own
+/// follow target and view mode both have to be on the wire, not just
+/// derivable locally.
 ///
 /// v15: `Presence` gained `recording` (one byte after `seq`) and
 /// `Packet::Voice`(10) — one encoded voice frame for the in-house call,
@@ -88,7 +95,7 @@ use studio_live::{Channel, Note, Pattern, Rack, StepMod, SynthKind};
 /// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
 /// packet kind on its own — see the version-refusal tests below for both
 /// mechanisms exercised separately.
-pub const WIRE_VERSION: u8 = 15;
+pub const WIRE_VERSION: u8 = 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -931,6 +938,12 @@ impl Packet {
                 put_u64(&mut o, p.active_track.map(|t| t.0).unwrap_or(0));
                 put_u16(&mut o, p.selection.len().min(u16::MAX as usize) as u16);
                 for c in &p.selection { put_u64(&mut o, c.0); }
+                put_u8(&mut o, p.following.is_some() as u8);
+                put_u64(&mut o, p.following.map(|s| s.0).unwrap_or(0));
+                put_u8(&mut o, match p.view_mode {
+                    ViewMode::Plain => 0, ViewMode::Badges => 1,
+                    ViewMode::Thumbnails => 2, ViewMode::DataInspector => 3,
+                });
             }
             Packet::Hello { site, since } => {
                 put_u8(&mut o, 3); put_u64(&mut o, site.0); put_u64(&mut o, *since);
@@ -996,10 +1009,20 @@ impl Packet {
                 let n = r.u16()? as usize;
                 let mut selection = Vec::with_capacity(n.min(4096));
                 for _ in 0..n { selection.push(ClipId(r.u64()?)); }
+                let has_following = r.u8()? != 0;
+                let following_site = r.u64()?;
+                let view_mode = match r.u8()? {
+                    1 => ViewMode::Badges,
+                    2 => ViewMode::Thumbnails,
+                    3 => ViewMode::DataInspector,
+                    _ => ViewMode::Plain,
+                };
                 Packet::Presence(Presence {
                     site, name, playhead, seq,
                     active_track: has_track.then_some(TrackId(track)),
                     selection, recording,
+                    following: has_following.then_some(SiteId(following_site)),
+                    view_mode,
                 })
             }
             3 => Packet::Hello { site: SiteId(r.u64()?), since: r.u64()? },
@@ -1289,13 +1312,13 @@ mod tests {
     fn presence_and_the_handshake_round_trip() {
         let pr = Packet::Presence(Presence {
             site: SiteId(2), name: "ada".into(), playhead: Ticks::from_seconds(31.5),
-            selection: vec![ClipId(1), ClipId(4)], active_track: Some(TrackId(9)), seq: 17, recording: false,
+            selection: vec![ClipId(1), ClipId(4)], active_track: Some(TrackId(9)), seq: 17, recording: false, following: None, view_mode: ViewMode::Plain,
         });
         assert_eq!(Packet::decode(&pr.encode()).unwrap(), pr);
         // no active track is a distinct state from track 0
         let none = Packet::Presence(Presence {
             site: SiteId(2), name: "ada".into(), playhead: Ticks::ZERO,
-            selection: vec![], active_track: None, seq: 1, recording: false,
+            selection: vec![], active_track: None, seq: 1, recording: false, following: None, view_mode: ViewMode::Plain,
         });
         match Packet::decode(&none.encode()).unwrap() {
             Packet::Presence(p) => assert!(p.active_track.is_none(), "None must not decode as Some(0)"),
@@ -1450,7 +1473,7 @@ mod tests {
         // This is the inverse check: it pins that WIRE_VERSION really did
         // move, so a future edit to the encoding can't silently forget the
         // bump and let two incompatible builds both claim version N.
-        assert_eq!(WIRE_VERSION, 15, "bump this alongside the next encoding change, not instead of it");
+        assert_eq!(WIRE_VERSION, 16, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]
@@ -1547,9 +1570,32 @@ mod automation_wire_tests {
     }
 
     #[test]
+    fn presence_following_and_view_mode_survive_the_wire() {
+        for (following, mode) in [
+            (None, ViewMode::Plain),
+            (Some(SiteId(7)), ViewMode::Badges),
+            (Some(SiteId(0)), ViewMode::Thumbnails), // site id 0 specifically: must not be confused with "no following" (has-byte + 0, not just 0)
+            (None, ViewMode::DataInspector),
+        ] {
+            let p = Packet::Presence(Presence { site: SiteId(1), name: "a".into(), playhead: Ticks(0),
+                selection: vec![], active_track: None, seq: 1, recording: false,
+                following, view_mode: mode });
+            let back = Packet::decode(&p.encode()).expect("decodes");
+            match back {
+                Packet::Presence(pr) => {
+                    assert_eq!(pr.following, following, "following mismatch for {mode:?}");
+                    assert_eq!(pr.view_mode, mode);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
     fn a_recording_flag_and_a_voice_frame_survive_the_wire_and_refuse_every_prefix() {
         let p = Packet::Presence(Presence { site: SiteId(4), name: "ada".into(), playhead: Ticks(77),
-            selection: vec![ClipId(2)], active_track: Some(TrackId(1)), seq: 9, recording: true });
+            selection: vec![ClipId(2)], active_track: Some(TrackId(1)), seq: 9, recording: true,
+            following: None, view_mode: ViewMode::Plain });
         let back = Packet::decode(&p.encode()).expect("decodes");
         assert_eq!(back, p);
         match back { Packet::Presence(pr) => assert!(pr.recording), _ => unreachable!() }

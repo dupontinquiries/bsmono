@@ -662,7 +662,7 @@ impl Studio {
     /// only sign of life the wire carries (there is no join packet), so a
     /// reader parked on one frame must still beat inside the sweep's
     /// `LIVENESS_MS` window or be swept as a ghost by every peer.
-    pub fn presence_beat(&mut self, now_ms: i64) -> Option<studio_collab::wire::Packet> {
+    pub fn presence_beat(&mut self, now_ms: i64, following: Option<studio_collab::SiteId>, view_mode: studio_collab::ViewMode) -> Option<studio_collab::wire::Packet> {
         const MIN_GAP_MS: i64 = 100;
         // Three beats per liveness window — one lost packet must not read
         // as a departure.
@@ -682,6 +682,8 @@ impl Studio {
                 || last.selection != self.selection
                 || last.active_track != active_track
                 || last.recording != self.recording
+                || last.following != following
+                || last.view_mode != view_mode
                 || (self.display_name.is_empty() != last.name.starts_with("site "))
                 || (!self.display_name.is_empty() && last.name != self.display_name),
         };
@@ -699,6 +701,7 @@ impl Studio {
             selection: self.selection.clone(),
             active_track,
             seq: self.presence_seq + 1, recording: self.recording,
+            following, view_mode,
         };
         self.presence_seq += 1;
         self.last_presence = Some(cur.clone());
@@ -2481,7 +2484,7 @@ mod tests {
     fn presence_beat_sends_changes_and_heartbeats_but_not_every_frame() {
         let mut s = Studio::demo();
         // First call: always sends — peers know we exist.
-        let first = s.presence_beat(10_000).expect("first beat sends");
+        let first = s.presence_beat(10_000, None, studio_collab::ViewMode::Plain).expect("first beat sends");
         let pr = match first {
             studio_collab::wire::Packet::Presence(pr) => pr,
             other => panic!("expected Presence, got {other:?}"),
@@ -2492,14 +2495,14 @@ mod tests {
         assert_eq!(pr.seq, 1);
 
         // Nothing changed, heartbeat not due: an idle shell is near-silent.
-        assert!(s.presence_beat(10_016).is_none(), "16ms later, idle: no packet");
+        assert!(s.presence_beat(10_016, None, studio_collab::ViewMode::Plain).is_none(), "16ms later, idle: no packet");
 
         // The playhead moved right after a send: news, but rate-limited —
         // the gap counts from the LAST SEND, so a scrub is ~10 pkt/s, not 60.
         s.transport.set_position(studio_core::Ticks::from_seconds(3.0));
-        assert!(s.presence_beat(10_050).is_none(),
+        assert!(s.presence_beat(10_050, None, studio_collab::ViewMode::Plain).is_none(),
                 "changed but only 50ms since the last send: held");
-        let moved = s.presence_beat(10_120).expect("past the gap: the move ships");
+        let moved = s.presence_beat(10_120, None, studio_collab::ViewMode::Plain).expect("past the gap: the move ships");
         match moved {
             studio_collab::wire::Packet::Presence(pr) => {
                 assert_eq!(pr.playhead, studio_core::Ticks::from_seconds(3.0));
@@ -2511,8 +2514,8 @@ mod tests {
         // Idle again — but the heartbeat must still beat inside LIVENESS_MS,
         // or every peer sweeps us as a ghost while we sit and listen.
         let hb = studio_collab::session::LIVENESS_MS / 3;
-        assert!(s.presence_beat(10_120 + hb - 1).is_none());
-        assert!(s.presence_beat(10_120 + hb).is_some(), "heartbeat due: sends unchanged state");
+        assert!(s.presence_beat(10_120 + hb - 1, None, studio_collab::ViewMode::Plain).is_none());
+        assert!(s.presence_beat(10_120 + hb, None, studio_collab::ViewMode::Plain).is_some(), "heartbeat due: sends unchanged state");
         assert!(hb * 2 < studio_collab::session::LIVENESS_MS,
                 "two consecutive lost heartbeats still leave a beat inside the window");
     }
@@ -2522,14 +2525,14 @@ mod tests {
     #[test]
     fn presence_beat_announces_selection_and_derived_track() {
         let mut s = Studio::demo();
-        s.presence_beat(0);
+        s.presence_beat(0, None, studio_collab::ViewMode::Plain);
         let (clip, track) = {
             let (id, c) = s.session.doc.project.clips.iter().next()
                 .expect("demo project has clips");
             (*id, c.track)
         };
         s.selection = vec![clip];
-        match s.presence_beat(1_000) {
+        match s.presence_beat(1_000, None, studio_collab::ViewMode::Plain) {
             Some(studio_collab::wire::Packet::Presence(pr)) => {
                 assert_eq!(pr.selection, vec![clip]);
                 assert_eq!(pr.active_track, Some(track),
@@ -3865,7 +3868,20 @@ impl eframe::App for App {
             // Our own presence: the sending half of what integrate_packet
             // merges. Rate-limited and heartbeat'd inside; called every
             // frame, sends when it should.
-            if let Some(p) = self.studio.presence_beat(now_ms) {
+            //
+            // `follow` is local, by NAME (see its own doc); resolved to a
+            // SiteId here, at the boundary, because `Studio` deliberately
+            // doesn't know about this UI-only concept -- `follow_graph`'s
+            // chain resolution needs a real SiteId to walk, not a name.
+            // `view_mode` has no real per-device setting yet (the
+            // "terrain toggle" UI hasn't been built) -- `Plain` until it
+            // does, which is also the correct value for every peer who
+            // never touches this feature at all.
+            let roster = self.studio.session.roster();
+            let following = self.follow.as_deref()
+                .and_then(|name| roster.iter().find(|m| m.name == name))
+                .map(|m| m.site);
+            if let Some(p) = self.studio.presence_beat(now_ms, following, studio_collab::ViewMode::Plain) {
                 carrier.send(p);
             }
             // And the silence sweep — members time out with an announcement,
@@ -8377,7 +8393,7 @@ mod curve_shell_tests {
     fn presence_says_when_a_take_is_rolling() {
         let mut s = Studio::demo();
         s.recording = true;
-        let pkt = s.presence_beat(10_000).expect("first presence is always due");
+        let pkt = s.presence_beat(10_000, None, studio_collab::ViewMode::Plain).expect("first presence is always due");
         match pkt { studio_collab::wire::Packet::Presence(p) => assert!(p.recording), other => panic!("{other:?}") }
     }
 
