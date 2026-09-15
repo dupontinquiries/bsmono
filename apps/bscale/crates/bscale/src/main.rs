@@ -451,6 +451,10 @@ fn main() -> anyhow::Result<()> {
                         print_event(&e);
                     }
                 }
+                // Already said in human-readable form by the paired
+                // `Event::Stage("memory: {plan}")` this run also emits;
+                // this structured copy exists for GUI consumers.
+                job::Event::MemoryPlan(_) => {}
             })?;
             if job.jobs > 1 {
                 eprintln!("done: {} frames in {:.1}s ({:.2} fps); {:.1}% of pixels went through the network", s.frames, s.elapsed.as_secs_f64(), s.frames as f64 / s.elapsed.as_secs_f64().max(1e-9), s.upscaled_pixel_fraction * 100.0);

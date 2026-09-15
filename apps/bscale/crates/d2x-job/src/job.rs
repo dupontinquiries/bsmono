@@ -14,6 +14,13 @@ pub enum Event {
     Pipeline(PEvent),
     /// Segment-parallel runs: which worker the pipeline event belongs to.
     Segment(usize, PEvent),
+    /// The RAM-aware ring sizing actually applied to this run (see
+    /// `mem_plan`/`apply_plan`) -- structured, so a GUI can show the real
+    /// numbers next to the override sliders instead of only a formatted
+    /// log line. `job.pipeline` itself is never mutated by `apply_plan`
+    /// (it runs on a local copy), so this is the only way anything outside
+    /// `run`/`run_segmented` learns what was actually used.
+    MemoryPlan(MemPlan),
 }
 use d2x_core::predict::AnalyzeConfig;
 use d2x_core::blockcache::BlockCache;
@@ -920,6 +927,7 @@ pub fn run(job: &Job, mut on_event: impl FnMut(Event)) -> anyhow::Result<Summary
     let mut cfg = job.pipeline;
     apply_plan(&mut cfg, &plan);
     on_event(Event::Stage(format!("memory: {plan}")));
+    on_event(Event::MemoryPlan(plan));
     on_event(Event::Stage("starting encoder".into()));
     let sink = open_sink(job, probe.as_ref(), &keyframes, info.width * scale, info.height * scale)?;
     on_event(Event::Stage("frame 0 is a full-frame upscale; later frames only pay for what changed".into()));

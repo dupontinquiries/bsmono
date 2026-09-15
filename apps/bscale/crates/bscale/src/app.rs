@@ -39,6 +39,11 @@ enum Msg {
     Preview { width: u32, height: u32, rgb: Vec<u8> },
     Log(LogLevel, String),
     Done(Result<(), String>),
+    /// The real RAM-aware ring sizing this run is actually using (see
+    /// `job::Event::MemoryPlan`) -- distinct from `Log` so the UI can show
+    /// it as structured numbers next to the override sliders, not just
+    /// scroll it into the log text.
+    MemoryPlan(job::MemPlan),
 }
 
 /// Wraps the sink to (a) honour Stop and (b) ship a thumbnail of every
@@ -88,7 +93,7 @@ impl FrameSource for StoppableSource {
     }
 }
 
-fn run_job(job: Job, analyze_only: bool, tx: Sender<Msg>, stop: Arc<AtomicBool>) {
+fn run_job(mut job: Job, analyze_only: bool, tx: Sender<Msg>, stop: Arc<AtomicBool>) {
     let r = (|| -> anyhow::Result<()> {
         if analyze_only {
             let _ = tx.send(Msg::Log(LogLevel::Info, "probing".into()));
@@ -107,6 +112,7 @@ fn run_job(job: Job, analyze_only: bool, tx: Sender<Msg>, stop: Arc<AtomicBool>)
                 let _ = match e {
                     job::Event::Stage(m) => tx2.send(Msg::Log(LogLevel::Info, m)),
                     job::Event::Pipeline(e) | job::Event::Segment(_, e) => tx2.send(Msg::Event(e)),
+                    job::Event::MemoryPlan(plan) => tx2.send(Msg::MemoryPlan(plan)),
                 };
             })?;
             return Ok(());
@@ -129,6 +135,17 @@ fn run_job(job: Job, analyze_only: bool, tx: Sender<Msg>, stop: Arc<AtomicBool>)
         let _ = tx.send(Msg::Log(LogLevel::Info, format!("loading model and initialising the {:?} backend", job.backend)));
         let tiers = job::build_tiers(&job)?;
         let scale = tiers[0].scale();
+        // The RAM-aware ring sizing: previously only applied on the
+        // `job::run`/`run_segmented` paths (the `--jobs > 1` branch above,
+        // and the CLI). This single-pipeline path called `run_tiered`
+        // directly with the raw, un-adjusted `job.pipeline` -- meaning the
+        // GUI's default refs=3/shot-refs=4 (PipelineConfig::default())
+        // were not a display artifact here, they were what actually ran,
+        // regardless of available RAM. Fixed by computing and applying the
+        // same plan every other path already gets.
+        let plan = job::mem_plan(&job, info.width, info.height, scale);
+        job::apply_plan(&mut job.pipeline, &plan);
+        let _ = tx.send(Msg::MemoryPlan(plan));
         let inner = job::open_sink(&job, probe.as_ref(), &keyframes, info.width * scale, info.height * scale)?;
         let sink: Box<dyn FrameSink> = Box::new(TeeSink { inner, tx: tx.clone(), every: 4, n: 0 });
         let _ = tx.send(Msg::Log(LogLevel::Info, "frame 0 is a full-frame upscale; later frames only pay for what changed".into()));
@@ -153,6 +170,11 @@ struct Shell {
     job: Job,
     matcher: usize,
     backend: usize,
+    /// The real ring sizing the last/current run actually applied (see
+    /// `Msg::MemoryPlan`) -- shown next to the override sliders so "what
+    /// will run" is never silently the same-looking number as "what
+    /// you're overriding". `None` before any job has probed a source.
+    running_plan: Option<job::MemPlan>,
     input: String,
     /// A dropped path waiting on confirmation. A drop has no undo — it
     /// overwrites the input and the old text is gone — so it never takes
@@ -177,6 +199,15 @@ struct Shell {
     /// (the bug logscope's picker documents).
     models_dir: String,
     catalogue: Vec<d2x_core::registry::ModelInfo>,
+    /// Distinguishes "never scanned yet" from "scanned and found nothing" --
+    /// `catalogue.is_empty()` alone can't tell those apart, and using it as
+    /// the auto-rescan trigger meant an empty (or misconfigured, or briefly
+    /// inaccessible) models folder caused a NEW scan thread every single
+    /// frame forever: the scan completes, sets `catalogue` back to an empty
+    /// `Vec`, and the next frame sees "empty, not scanning, no pending
+    /// receiver" and fires again. Set true once, in `drain_scan`, after the
+    /// first result of any kind (including an empty one) is processed.
+    scanned_once: bool,
     model_key: Option<String>,
     cascade_key: Option<String>,
     scanning: bool,
@@ -201,6 +232,7 @@ impl Default for Shell {
             job,
             matcher: 1,
             backend: 0,
+            running_plan: None,
             input: String::new(),
             pending_drop: None,
             output: String::new(),
@@ -218,6 +250,7 @@ impl Default for Shell {
                 .and_then(|p| p.parent().map(|d| d.display().to_string()))
                 .unwrap_or_else(|| "models".into()),
             catalogue: Vec::new(),
+            scanned_once: false,
             model_key: None,
             cascade_key: None,
             scanning: false,
@@ -357,6 +390,7 @@ impl Shell {
             self.catalogue = found;
             self.scanning = false;
             self.scan_rx = None;
+            self.scanned_once = true;
         }
     }
 
@@ -515,6 +549,7 @@ impl Shell {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         self.running = true;
+        self.running_plan = None; // stale from a previous run until the new one probes its source
         let stop = self.stop.clone();
         self.push_log(LogLevel::Info, format!("{} {}", if analyze_only { "analyzing" } else { "upscaling" }, job.input.display()));
         std::thread::Builder::new().name("d2x-job".into()).spawn(move || {
@@ -590,6 +625,7 @@ impl Shell {
                     self.preview_size = (width, height);
                 }
                 Msg::Log(level, text) => self.push_log(level, text),
+                Msg::MemoryPlan(plan) => { self.running_plan = Some(plan); }
                 Msg::Done(r) => {
                     self.running = false;
                     match r {
@@ -682,7 +718,18 @@ impl Shell {
                 ui.label("in flight");
                 ui.add(egui::DragValue::new(&mut self.job.inflight).range(1..=8));
             });
-            ui.label("ring depths and block cache follow the memory budget (half of available RAM) unless set on the CLI");
+            // Was: "ring depths and block cache follow the memory budget
+            // ... unless set on the CLI" -- true for the CLI and the
+            // segmented (--jobs > 1) path, but NOT for this single-job GUI
+            // path until the fix that added `running_plan`: this ran with
+            // exactly the sliders above, no budget applied, regardless of
+            // available RAM. Now it does, and this line shows what was
+            // actually used on the last/current run rather than asserting
+            // it and hoping.
+            match self.running_plan {
+                Some(plan) => { ui.label(format!("last run actually used: {plan}")); }
+                None => { ui.label("ring depths and block cache follow the memory budget (half of available RAM); sliders above are the override, shown here once a run has probed a source"); }
+            }
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.job.flat_bypass, "flat → bicubic");
             });
@@ -831,7 +878,7 @@ impl eframe::App for Shell {
         }
 
         let ctx = ui.ctx().clone();
-        if self.catalogue.is_empty() && !self.scanning && self.scan_rx.is_none() {
+        if !self.scanned_once && !self.scanning && self.scan_rx.is_none() {
             self.rescan_models();
         }
         self.drain_scan();
