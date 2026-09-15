@@ -67,6 +67,10 @@ pub mod swipe_physics;
 pub mod video_viewer;
 pub mod posture;
 pub mod camera_policy;
+/// Why the camera did not open, and what to do about it: the acquisition
+/// failure taxonomy and the route ladder. camera_policy covers a camera that
+/// works and then degrades; this covers one that never opened.
+pub mod camera_fault;
 pub mod ambient_blobs;
 pub mod ambient_camera;
 pub mod ambient_inbox;
