@@ -40,7 +40,7 @@ fn main() {
     // what the 0.5% coverage was saying.
     let sub_ring: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(ring);
 
-    let cfg = SubtileCfg { levels: 1, ring, min_block: 8 };
+    let cfg = SubtileCfg { levels: 1, ring, sub_ring, min_block: 8 };
     match cfg.refusal(block) {
         Some(why) => {
             println!("subtiling does not apply at block {block}, ring {ring}: {why}");
