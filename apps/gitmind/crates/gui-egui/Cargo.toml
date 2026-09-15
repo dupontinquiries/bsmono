@@ -10,6 +10,21 @@ required-features = ["app"]
 
 [lib]
 path = "src/lib.rs"
+# No doctests here, and the rustdoc target was producing nothing but noise:
+# `cargo test` reported E0463 "can't find crate for `uikit_egui`" from the
+# --doc target while the lib itself compiled clean. This crate has no runnable
+# doctest to lose (it has no fenced doc blocks at all), so the target's entire
+# output was a false failure.
+#
+# This removes a WRONG SIGNAL; it does not explain it. What is known: the
+# rustdoc invocation carried a correct `--extern uikit_egui=...rlib` and still
+# could not resolve it. What ruled out the obvious theory: ambient-learner
+# (49 compiled doc blocks), logscope-egui (18) and snapclone-egui (9) all
+# depend on uikit-egui, all have real doctests, and all PASS -- so this is not
+# a blanket target-dir or dependency problem, and the cause is still unknown.
+# It may well resurface on a crate that does have doctests, where turning them
+# off would not be the right answer.
+doctest = false
 
 [dependencies]
 egui = "0.34"
