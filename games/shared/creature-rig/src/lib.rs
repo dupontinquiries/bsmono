@@ -38,7 +38,12 @@
 //! about animals, not about posing boxes.
 
 pub mod anim_rig;
+/// The timers that make a fight read on the body: flinch, guard, cast,
+/// strike, death. Drives `MotionInput`'s existing fields rather than adding
+/// new ones -- see the module header for why that restraint matters here.
+pub mod combat;
 pub mod sim;
 
 pub use anim_rig::{corners, pose, world_corners, MotionInput, PosedBox, RigPart, Role};
+pub use combat::Combat;
 pub use sim::liveliness::MotionState;

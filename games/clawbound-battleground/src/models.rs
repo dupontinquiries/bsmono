@@ -654,61 +654,153 @@ pub fn build_tower(team: Team) -> (VoxelMesh, VoxelMesh) {
 
 const XV: f32 = 0.145;
 
+/// The titan: a six-legged winged sabre-ancestor, not a man in armour.
+///
+/// This was a humanoid — legs, skirt, torso, pauldrons, arms, fists, a mace.
+/// Fully armoured with no flesh showing, so it read as a golem rather than a
+/// person, but it was still the one human silhouette left in a game whose
+/// gods and minions are all cats. Now it is what a titan in this world should
+/// be: the ancestor the ancestors descend from.
+///
+/// Six legs rather than four is the whole silhouette. Doubling a cat's size
+/// reads as a big cat; adding a third pair reads as something older than cats
+/// — the same trick the roster's megafauna camps use, where a leader is
+/// recognisable but wrong-scaled. Wings are baked into the body rather than
+/// animated: they are a canopy the thing stands under, and a titan that
+/// flapped would leave the lane.
+///
+/// Faces **+Z**, like every other creature here. The second mesh is the right
+/// FORELEG CLAW, which is why it needs no change in `scene.rs`: the existing
+/// weapon transform offsets +1.85 on X and rotates about X, and for a
+/// +Z-facing body that is exactly a forward swipe on the right side. A mace
+/// in a fist and a claw on a foreleg happen to want the same matrix.
 pub fn build_titan(team: Team) -> (VoxelMesh, VoxelMesh) {
     let tc = team.rgb();
     let armor = mix(tc, [0.55, 0.55, 0.6], 0.45);
     let armor_dark = mix(tc, [0.2, 0.2, 0.25], 0.6);
+    let pelt = mix(tc, [0.30, 0.26, 0.24], 0.5);
     let gold = [0.85, 0.68, 0.3];
     let glow = mix(tc, [1.0, 1.0, 1.0], 0.4);
+    let fang = [0.94, 0.92, 0.84];
 
-    let mut g = Grid::new(40, 42, 30);
-    let cx = 20;
-    let cz = 15;
+    // Longer than it is tall: a hexapod is read end-on, so the grid is deep.
+    let mut g = Grid::new(40, 42, 56);
+    let (cx, cz) = (20i32, 28i32);
+    let (cxf, czf) = (cx as f32, cz as f32);
 
-    // legs
-    g.filled_box(cx - 8, 0, cz - 3, cx - 3, 14, cz + 3, solid(armor_dark));
-    g.filled_box(cx + 3, 0, cz - 3, cx + 8, 14, cz + 3, solid(armor_dark));
-    g.filled_box(cx - 9, 0, cz - 4, cx - 2, 3, cz + 4, solid(armor));
-    g.filled_box(cx + 2, 0, cz - 4, cx + 9, 3, cz + 4, solid(armor));
-    // skirt
-    g.cone_y(cx as f32, cz as f32, 9.0, 10.0, 12, 18, solid(armor_dark));
-    // torso
-    g.filled_box(cx - 9, 18, cz - 5, cx + 9, 30, cz + 5, solid(armor));
-    g.filled_box(cx - 6, 22, cz - 2, cx + 6, 29, cz + 2, solid(mix(armor, gold, 0.35)));
-    // pauldrons
-    g.ellipsoid((cx - 10) as f32, 30.0, cz as f32, 4.0, 3.0, 4.5, solid(armor));
-    g.ellipsoid((cx + 10) as f32, 30.0, cz as f32, 4.0, 3.0, 4.5, solid(armor));
-    // arms
-    g.filled_box(cx - 13, 16, cz - 3, cx - 10, 27, cz + 3, solid(armor_dark));
-    g.filled_box(cx + 10, 16, cz - 3, cx + 13, 27, cz + 3, solid(armor_dark));
-    g.filled_box(cx - 14, 12, cz - 4, cx - 10, 16, cz + 4, solid(armor)); // fists
-    g.filled_box(cx + 10, 12, cz - 4, cx + 14, 16, cz + 4, solid(armor));
-    // head + horns
-    g.ellipsoid(cx as f32, 33.0, cz as f32, 4.0, 3.6, 4.0, solid(armor_dark));
-    g.set(cx - 2, 34, cz + 3, solid(glow));
-    g.set(cx + 2, 34, cz + 3, solid(glow));
-    for s in [-1i32, 1] {
-        for i in 0..6 {
-            g.set(cx + s * (4 + i / 2), 35 + i / 2, cz + 1 - i / 3, solid(gold));
+    // ── six legs, three pairs ────────────────────────────────────────────
+    // Front pair tallest and set widest: the shoulders carry the wings, and
+    // a hexapod that tapers front-to-back reads as built for pouncing rather
+    // than as a centipede.
+    for (i, (zoff, h, spread)) in [(14i32, 17i32, 9i32), (0, 15, 8), (-14, 14, 8)].into_iter().enumerate() {
+        for s in [-1i32, 1] {
+            let lx = cx + s * spread;
+            let lz = cz + zoff;
+            g.filled_box(lx - 3, 0, lz - 3, lx + 3, h, lz + 3, solid(armor_dark));
+            // greave
+            g.filled_box(lx - 4, h - 5, lz - 4, lx + 4, h - 2, lz + 4, solid(armor));
+            // paw + claws
+            g.filled_box(lx - 4, 0, lz - 4, lx + 4, 2, lz + 4, solid(pelt));
+            for c in -1..=1i32 {
+                g.set(lx + c * 2, 0, lz + 4, solid(fang));
+            }
+            // A gold band on the front pair only, so the eye finds the head.
+            if i == 0 {
+                g.filled_box(lx - 4, h - 1, lz - 4, lx + 4, h, lz + 4, solid(gold));
+            }
         }
     }
-    // crown spikes
-    for i in -2..=2i32 {
-        g.filled_box(cx + i * 3, 36, cz - 1, cx + i * 3, 38 - i.abs(), cz + 1, solid(gold));
+
+    // ── barrel body ──────────────────────────────────────────────────────
+    g.ellipsoid(cxf, 22.0, czf, 9.0, 7.0, 21.0, solid(pelt));
+    // armoured spine and flank plates over it
+    g.ellipsoid(cxf, 24.0, czf - 2.0, 8.0, 6.5, 16.0, solid(armor));
+    g.filled_box(cx - 7, 28, cz - 16, cx + 7, 30, cz + 10, solid(armor_dark));
+    g.filled_box(cx - 3, 30, cz - 14, cx + 3, 31, cz + 8, solid(gold));
+
+    // ── wings: swept, armoured, static ───────────────────────────────────
+    // Ribbed rather than solid so they read as a frame with a membrane, and
+    // so a 40-wide grid can hold a span that still looks like a wing.
+    for s in [-1i32, 1] {
+        for r in 0..6i32 {
+            let t = r as f32 / 5.0;
+            let x = cx + s * (9 + (t * 9.0) as i32);
+            let y = 30 + (t * 9.0) as i32;
+            let z0 = cz + 6 - (t * 16.0) as i32;
+            let z1 = cz + 10 - (t * 4.0) as i32;
+            g.filled_box(x, y, z0, x, y + 1, z1, solid(if r % 2 == 0 { armor } else { armor_dark }));
+        }
+        // leading edge, and a gold tip so the span is legible against sky
+        g.filled_box(cx + s * 9, 30, cz + 8, cx + s * 18, 31, cz + 9, solid(armor));
+        g.set(cx + s * 18, 39, cz + 6, solid(gold));
+    }
+
+    // ── head: sabre skull ────────────────────────────────────────────────
+    let hz = czf + 19.0;
+    g.ellipsoid(cxf, 26.0, hz, 6.0, 5.5, 6.0, solid(pelt));
+    // helm over the crown, open at the muzzle
+    g.ellipsoid(cxf, 28.0, hz - 1.0, 6.2, 4.4, 5.6, solid(armor));
+    g.ellipsoid(cxf, 24.0, hz + 5.0, 3.4, 3.0, 3.2, solid(pelt));
+    g.set(cx, 24, cz + 24, solid(armor_dark)); // nose
+    // sabre fangs -- the one feature that has to survive at lane distance
+    for s in [-1i32, 1] {
+        for i in 0..7i32 {
+            g.set(cx + s * 2, 22 - i, cz + 23 - i / 3, solid(fang));
+        }
+    }
+    // eyes, and ears folded back under the helm
+    g.set(cx - 3, 27, cz + 24, solid(glow));
+    g.set(cx + 3, 27, cz + 24, solid(glow));
+    for s in [-1i32, 1] {
+        g.filled_box(cx + s * 4, 31, cz + 14, cx + s * 5, 34, cz + 16, solid(armor_dark));
+        g.set(cx + s * 5, 34, cz + 16, solid(gold));
+    }
+    // crown horns, sweeping back over the shoulders
+    for s in [-1i32, 1] {
+        for i in 0..8i32 {
+            g.set(cx + s * (5 + i / 3), 32 + i / 2, cz + 12 - i * 2, solid(gold));
+        }
+    }
+
+    // ── tail: armoured, rising ───────────────────────────────────────────
+    for i in 0..10i32 {
+        let z = (cz - 21 - i).max(0);
+        let y = 20 + i;
+        if y >= 42 {
+            break;
+        }
+        let r = 3 - i / 4;
+        g.filled_box(cx - r, y, z, cx + r, y + 1, z, solid(if i % 3 == 0 { armor } else { pelt }));
     }
     let body = g.mesh(XV, true);
 
-    // giant mace (weapon)
-    let mut wg = Grid::new(20, 44, 20);
-    let wx = 10;
-    let wz = 10;
-    wg.filled_box(wx, 0, wz, wx, 30, wz, solid([0.3, 0.22, 0.15]));
-    wg.ellipsoid(wx as f32, 36.0, wz as f32, 6.0, 6.0, 6.0, solid(armor_dark));
-    for a in 0..10 {
-        let ang = a as f32 / 10.0 * std::f32::consts::TAU;
-        let x = wx as f32 + ang.cos() * 6.0;
-        let z = wz as f32 + ang.sin() * 6.0;
-        wg.ellipsoid(x, 36.0, z, 1.6, 1.6, 1.6, solid(mix(tc, [1.0, 1.0, 1.0], 0.3)));
+    // ── the right foreleg's siege claw (the "weapon" slot) ───────────────
+    // Built around its own origin so the existing swing transform pivots it
+    // at the shoulder rather than through its middle.
+    let mut wg = Grid::new(20, 40, 24);
+    let (wx, wz) = (10i32, 12i32);
+    // armoured forearm down to the wrist
+    wg.filled_box(wx - 3, 18, wz - 3, wx + 3, 34, wz + 3, solid(armor_dark));
+    wg.filled_box(wx - 4, 30, wz - 4, wx + 4, 33, wz + 4, solid(armor));
+    wg.filled_box(wx - 4, 20, wz - 4, wx + 4, 22, wz + 4, solid(gold));
+    // the paw
+    wg.ellipsoid(wx as f32, 16.0, wz as f32, 4.5, 4.0, 4.5, solid(pelt));
+    // four blades, splayed and curving forward -- the reason this is a claw
+    // and not a mace.
+    for (i, s) in [-3i32, -1, 1, 3].into_iter().enumerate() {
+        let lean = i as i32 % 2;
+        for j in 0..11i32 {
+            let x = wx + s;
+            let y = (14 - j).max(0);
+            let z = wz + 3 + j / 2 + lean;
+            if z < 24 {
+                wg.set(x, y, z, solid(fang));
+            }
+        }
+    }
+    // a dewclaw high on the inside, the way a real cat carries one
+    for j in 0..5i32 {
+        wg.set(wx - 5, 22 - j, wz + 1 + j / 2, solid(fang));
     }
     let weapon = wg.mesh(XV, false);
 
