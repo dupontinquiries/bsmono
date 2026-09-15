@@ -156,6 +156,21 @@ upscale-gpu = ["upscale", "gpu", "dep:d2x-wgpu"]
 [profile.dev]
 debug = "line-tables-only"
 
+# gemm-f16 (pulled in transitively by candle-core, via gemm 0.19.0) emits
+# ARMv8.2 FEAT_FP16 ("fullfp16") NEON inline-asm unconditionally, and it only
+# assembles cleanly in an optimized build -- in a plain debug build on
+# aarch64 it fails with "error: instruction requires: fullfp16", even on
+# hardware (Apple Silicon) that has the feature. This is a known upstream
+# issue in the gemm crate family going back to at least 0.17.1 and still
+# present in 0.19.0 (sarah-quinones/gemm#25, #31; huggingface/candle#1625,
+# #2823) -- not something fixable from this repo's source. The standard
+# workaround, used elsewhere for exactly this bug, is to force this one
+# dependency to build at release-like optimization even under the dev/test
+# profile; it does not affect this crate's own debug build.
+[profile.dev.package.gemm-f16]
+opt-level = 3
+[profile.dev.package.gemm-common]
+opt-level = 3
 
 [dev-dependencies]
 # `wgsl-in` explicitly: naga ships default = [] and puts `front::wgsl`
