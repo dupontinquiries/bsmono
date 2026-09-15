@@ -29,6 +29,17 @@ use switcheroo_core::intent::{Intent, MediaCommand, Target};
 use switcheroo_core::media::{DemoMedia, MediaBackend};
 use switcheroo_core::schedule::{Clock, Scheduler, Signals, Wifi};
 
+/// Serializes tests (here and in `hap.rs`) that mutate `XDG_DATA_HOME` via
+/// `std::env::set_var`/`remove_var`. Those calls are process-global, but
+/// `cargo test` runs tests in this crate concurrently by default; without
+/// this lock, one test's `remove_var` (or a different tmp-path `set_var`)
+/// can land mid-way through another test's run, so `data_dir()` picks up
+/// the wrong base path or falls back to `$HOME/.local/share` entirely —
+/// producing a spurious "file not found" for a write that actually
+/// succeeded, just to a different directory than the test expects.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// After this long without hearing from a device, its row greys out.
 pub const STALE_AFTER: Duration = Duration::from_secs(45);
 
@@ -580,6 +591,9 @@ mod tests {
     }
     #[test]
     fn sentences_reach_the_backend_the_player_or_the_scheduler() {
+        // See ENV_TEST_LOCK's doc comment: XDG_DATA_HOME is process-global,
+        // and hap.rs's tests mutate it too.
+        let _env_guard = crate::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("sw-app-{}", std::process::id()));
         std::env::set_var("XDG_DATA_HOME", &tmp);
         let mut a = app_with(vec![

@@ -298,6 +298,9 @@ mod tests {
 
     #[test]
     fn the_store_round_trips_a_pairing_and_makes_one_identity() {
+        // See lib.rs's ENV_TEST_LOCK doc comment: XDG_DATA_HOME is
+        // process-global and lib.rs's tests mutate it too.
+        let _env_guard = crate::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("sw-hap-store-{}", std::process::id()));
         std::env::set_var("XDG_DATA_HOME", &tmp);
         let s = Store::open();
