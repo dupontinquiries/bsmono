@@ -397,6 +397,9 @@ pub mod dictation_session;
 #[path = "../../src/voice_status.rs"]
 #[allow(dead_code, unused_imports)]
 pub mod voice_status;
+#[path = "../../src/filler_words.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod filler_words;
 #[path = "../../src/dictation_engine.rs"]
 #[allow(dead_code, unused_imports)]
 pub mod dictation_engine;

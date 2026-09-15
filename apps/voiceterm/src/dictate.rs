@@ -510,6 +510,25 @@ fn strip_fillers<'a>(words: &[&'a str]) -> Vec<&'a str> {
             i += 1;
             continue;
         }
+        // AND WHAT THE CORPUS LEARNED. `filler_words` exists to replace exactly
+        // the hardcoded list above, on a direct request recorded in its header
+        // ("any way we can let the corpus decide this and not a default?") --
+        // filed after "Mh mhmmm" was parsed as a command. It was written, given
+        // 12 tests, and then never called from the dictation path, so the
+        // hardcoded list stayed the only one in force and nothing a user
+        // rejected was ever learned from.
+        //
+        // ADDITIVE, not a replacement: the constants above are a floor that
+        // works on a fresh install with an empty corpus, and the learned set
+        // adds to it. Swapping them out would make a new user's first session
+        // worse to make a long-time user's better.
+        //
+        // Cheap enough per word: `is_filler` is a `ensure_loaded` (once) then a
+        // map lookup, so this is not I/O in a hot loop.
+        if crate::filler_words::is_filler(words[i]) {
+            i += 1;
+            continue;
+        }
         out.push(words[i]);
         i += 1;
     }
@@ -1598,5 +1617,32 @@ mod tests {
             b.apply(&plan(&segment(u), Mode::Code, Placement::Cursor));
         }
         assert_eq!(b.text, "UserStore::new()\nmax_retries = 3;");
+    }
+
+    /// The hardcoded list keeps working with an empty corpus -- a fresh
+    /// install must not get worse because learning was added.
+    #[test]
+    fn the_builtin_fillers_still_strip_without_any_corpus() {
+        let w = ["um", "let", "x", "uh", "equals", "five"];
+        let got = strip_fillers(&w);
+        assert_eq!(got, vec!["let", "x", "equals", "five"]);
+    }
+
+    /// And the learned list is consulted on top of it. Registered past the
+    /// threshold, a word the constants never heard of is dropped too.
+    #[test]
+    fn a_corpus_learned_filler_is_stripped_as_well() {
+        let odd = "mhmmm";
+        // Below the threshold it must NOT strip -- one rejection is not a
+        // pattern, and dropping a word after a single mistake would eat real
+        // speech.
+        crate::filler_words::register_rejection(odd);
+        let w = ["mhmmm", "hello"];
+        // Push it past the threshold.
+        for _ in 0..10 { crate::filler_words::register_rejection(odd); }
+        assert!(crate::filler_words::is_filler(odd), "the corpus should have learned it");
+        assert_eq!(strip_fillers(&w), vec!["hello"]);
+        // Leave the corpus as we found it, or the next test inherits it.
+        crate::filler_words::remove(odd);
     }
 }
