@@ -8758,6 +8758,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // can build the player view cone for vision-driven mesh scheduling.
         #[cfg(feature = "mesh-vision-sched")]
         chunk_manager.set_player_view_yaw(local_player.view.yaw);
+        // r-plant-lod-vector: always published (not gated behind
+        // mesh-vision-sched -- this is a separate, independent feature:
+        // scaling decorate_chunk_styled's plant stamp budget by distance AND
+        // facing, not the mesh-defer gate above). Cheap (four atomic
+        // stores); see mesher::set_player_view_for_plant_lod's doc for why
+        // this is a snapshot rather than a threaded parameter.
+        unendlich_engine::render::mesher::set_player_view_for_plant_lod(
+            [local_player.view.position.x, local_player.view.position.y, local_player.view.position.z],
+            local_player.view.yaw,
+        );
         chunk_manager.update_with_interest_points(&[
             (pos.x as i32, pos.y as i32, pos.z as i32),
         ]);

@@ -2819,7 +2819,12 @@ pub(crate) fn decorate_chunk_styled(
     // self-stop this was diagnosed from), but a coarser "cheap billboard"
     // fallback would look better and is a natural follow-up once this
     // ships and the actual budget numbers get tuned against real hardware.
-    let plant_budget = max_plant_stamps_per_chunk();
+    let chunk_center = [
+        origin[0] as f32 + n as f32 / 2.0,
+        origin[1] as f32 + n as f32 / 2.0,
+        origin[2] as f32 + n as f32 / 2.0,
+    ];
+    let plant_budget = plant_stamp_budget_for_chunk(chunk_center);
     let mut plant_stamps_used: u32 = 0;
     // Iterate the inverted plant index instead of scanning every cell.
     // For a chunk with no plants this loop is empty (zero cost). For a
@@ -3406,6 +3411,148 @@ fn max_plant_stamps_per_chunk() -> u32 {
             .unwrap_or(MAX_PLANT_STAMPS_PER_CHUNK_DEFAULT)
     })
 }
+
+// r-plant-lod-vector: a lock-free snapshot of the player's current eye
+// position + facing, so decorate_chunk_styled (called from meshing worker
+// threads, not the main thread) can scale its plant budget by how urgently
+// the player's actual view cone wants this chunk -- distance AND facing
+// direction ("LOD + vector, not just LOD + camera position"), reusing
+// sim::mesh_vision's already-tested ViewCone/MeshUrgency machinery rather
+// than threading a new parameter through MeshRequest -> mesh_chunk_greedy_
+// with_neighbors -> decorate_chunk (four signatures across three files,
+// each needing every call site updated) for what is fundamentally a
+// same-shape problem to the sky/current_tick fields MeshRequest ALREADY
+// documents as "snapshot at submission time... bakes in this [value]": a
+// mesh worker reading a slightly-stale player position from a frame or two
+// ago is exactly as harmless as it already is for lighting/tick-transition
+// baking elsewhere in this same request. Same AtomicU32-encoded-float
+// pattern already used for cross-thread gain automation in audio.rs's
+// StemGroup (no new dependency, no locking, updated once per frame from the
+// main thread, read at most once per plant-stamping pass on a worker
+// thread).
+mod player_view_for_plant_lod {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    static EYE_X: AtomicU32 = AtomicU32::new(0);
+    static EYE_Y: AtomicU32 = AtomicU32::new(0);
+    static EYE_Z: AtomicU32 = AtomicU32::new(0);
+    static YAW: AtomicU32 = AtomicU32::new(0);
+    /// False until the first real `set()` call. Before that (or if the
+    /// caller never wires this up at all -- tests, headless tools), plant
+    /// stamping must behave exactly as before this feature existed: full
+    /// budget, no distance/facing scaling. This flag is what makes that the
+    /// safe default rather than "scale by a bogus (0,0,0) eye position".
+    static VALID: AtomicBool = AtomicBool::new(false);
+
+    /// Publish the player's current eye position and yaw. Call once per
+    /// frame from the main thread; cheap (four atomic stores, `Relaxed` --
+    /// this is an LOD hint, not synchronization-critical state).
+    pub fn set(eye: [f32; 3], yaw: f32) {
+        EYE_X.store(eye[0].to_bits(), Ordering::Relaxed);
+        EYE_Y.store(eye[1].to_bits(), Ordering::Relaxed);
+        EYE_Z.store(eye[2].to_bits(), Ordering::Relaxed);
+        YAW.store(yaw.to_bits(), Ordering::Relaxed);
+        VALID.store(true, Ordering::Relaxed);
+    }
+
+    /// Read the last-published eye/yaw, or `None` if `set()` has never been
+    /// called (safe default: caller should skip distance/facing scaling
+    /// entirely and use the full plant budget).
+    pub fn get() -> Option<([f32; 3], f32)> {
+        if !VALID.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some((
+            [
+                f32::from_bits(EYE_X.load(Ordering::Relaxed)),
+                f32::from_bits(EYE_Y.load(Ordering::Relaxed)),
+                f32::from_bits(EYE_Z.load(Ordering::Relaxed)),
+            ],
+            f32::from_bits(YAW.load(Ordering::Relaxed)),
+        ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn set_then_get_round_trips() {
+            reset_for_test();
+            set([1.0, 2.0, 3.0], 0.75);
+            let (eye, yaw) = get().expect("set() was called, get() must return Some");
+            assert_eq!(eye, [1.0, 2.0, 3.0]);
+            assert_eq!(yaw, 0.75);
+            reset_for_test();
+        }
+
+        #[test]
+        fn reset_clears_validity() {
+            set([9.0, 9.0, 9.0], 1.0);
+            assert!(get().is_some());
+            reset_for_test();
+            assert!(get().is_none(), "reset_for_test must fully clear the published view");
+        }
+    }
+
+    /// r-plant-lod-vector: test-only reset, since `set()` mutates process-
+    /// global state that would otherwise silently leak into every other
+    /// test in this binary run after the first test that calls `set()`.
+    /// Any test that calls `set()` MUST reset before and after itself (both
+    /// directions: before, so it doesn't inherit state from a prior test
+    /// that forgot to clean up; after, so it doesn't poison tests that run
+    /// later and never expected a player view to be published at all --
+    /// e.g. mesh_tri_regression's plant-budget tests, which assert exact
+    /// plant_stamps counts against the flat, unscaled budget).
+    #[cfg(test)]
+    pub fn reset_for_test() {
+        VALID.store(false, Ordering::Relaxed);
+    }
+}
+
+/// r-plant-lod-vector: compute the effective plant stamp budget for one
+/// chunk, given the current player view (if any has been published via
+/// `player_view_for_plant_lod::set`). Falls back to the flat
+/// `max_plant_stamps_per_chunk()` -- unscaled, exactly this feature's
+/// pre-existing behavior -- when no player view is available (tests,
+/// headless tools, or simply the very first chunks meshed before the main
+/// loop's first frame publishes one).
+///
+/// `chunk_center` is in world blocks (see the identical computation in
+/// chunk_manager.rs's mesh-vision-sched shell-walk for the established
+/// convention this mirrors). Range and FOV reuse `ViewCone::player`'s
+/// existing defaults (~90° fov) rather than inventing a second set of
+/// tuning constants; `PLANT_LOD_RANGE` is deliberately independent of
+/// render distance -- plants past this range aren't worth discriminating
+/// further regardless of how far the world itself renders.
+fn plant_stamp_budget_for_chunk(chunk_center: [f32; 3]) -> u32 {
+    const PLANT_LOD_RANGE: f32 = 100.0;
+    let base = max_plant_stamps_per_chunk();
+    let Some((eye, yaw)) = player_view_for_plant_lod::get() else {
+        return base;
+    };
+    let cone = crate::sim::mesh_vision::ViewCone::player(eye, yaw, PLANT_LOD_RANGE);
+    // Occlusion intentionally not plumbed in here -- conservative, matching
+    // mesh_vision's own "conservative first pass" precedent (see that
+    // module's doc): an occluded-but-in-cone chunk still gets Now/Soon's
+    // scale rather than being further thinned, so nothing looks sparser
+    // than it should just because line_of_sight wasn't checked for this
+    // purpose too.
+    let urgency = crate::sim::mesh_vision::urgency_for_cone(&cone, chunk_center, false);
+    let scale = crate::sim::mesh_vision::plant_budget_scale_for_urgency(urgency);
+    ((base as f32) * scale).round().max(1.0) as u32
+}
+
+/// r-plant-lod-vector: publish the player's current eye position and yaw
+/// for `plant_stamp_budget_for_chunk` to read on meshing worker threads.
+/// Call once per frame from the main loop; see `player_view_for_plant_lod`'s
+/// own doc for why this is a lock-free snapshot rather than a threaded
+/// parameter. Safe to never call at all (plant stamping simply stays at the
+/// flat, unscaled budget it always used before this feature existed).
+pub fn set_player_view_for_plant_lod(eye: [f32; 3], yaw: f32) {
+    player_view_for_plant_lod::set(eye, yaw);
+}
+
 
 /// Emit a subdivided top face for a soft block. The 1×1 block top
 /// becomes an 8×8 grid of mini-quads. Each interior vertex's Y is
@@ -4844,6 +4991,63 @@ mod tests {
             diag.plant_stamps, plant_count as u64,
             "a chunk with fewer plants than the budget should have every one of them \
              stamped, same as before this safety valve existed",
+        );
+    }
+
+    /// r-plant-lod-vector: the core claim of this feature -- "LOD + vector,
+    /// not just LOD + camera position" -- means a chunk directly BEHIND the
+    /// player gets a smaller plant budget than one directly AHEAD, at the
+    /// exact same distance. Isolates plant_stamp_budget_for_chunk directly
+    /// rather than running a full mesh_chunk_greedy through
+    /// decorate_chunk_styled: this global (player_view_for_plant_lod) is
+    /// process-wide state shared with other tests that assert exact
+    /// plant_stamps counts against the flat, unscaled default (e.g.
+    /// plant_budget_does_not_affect_chunks_under_the_cap above) and Rust's
+    /// default test runner executes tests in parallel threads of the same
+    /// process -- calling only this one pure function keeps the window
+    /// where VALID=true as short as possible, minimizing collision risk
+    /// with those tests rather than holding it open for a full mesh pass.
+    #[test]
+    fn plant_budget_scales_by_facing_not_just_distance() {
+        player_view_for_plant_lod::reset_for_test();
+
+        let chunk_center = [16.0, 16.0, 16.0]; // ChunkCoord(0,0,0)'s center
+        let eye = [16.0, 16.0, -14.0]; // 30 blocks from chunk_center on -Z
+
+        // Facing +Z (toward the chunk, horiz_angle(eye, chunk_center) = PI/2):
+        // the chunk is directly ahead, well within range -> Now -> full scale.
+        player_view_for_plant_lod::set(eye, std::f32::consts::FRAC_PI_2);
+        let ahead_budget = plant_stamp_budget_for_chunk(chunk_center);
+
+        // Facing -Z (directly away): the SAME chunk, at the SAME distance,
+        // is now directly behind the player -> Defer -> reduced scale. Only
+        // the facing changed between these two calls.
+        player_view_for_plant_lod::set(eye, -std::f32::consts::FRAC_PI_2);
+        let behind_budget = plant_stamp_budget_for_chunk(chunk_center);
+
+        player_view_for_plant_lod::reset_for_test();
+
+        assert!(
+            behind_budget < ahead_budget,
+            "same chunk, same distance, only facing differs -- behind ({behind_budget}) must \
+             get a smaller plant budget than ahead ({ahead_budget}), proving this is a facing \
+             (vector) effect and not just a distance falloff"
+        );
+        assert!(behind_budget >= 1, "budget must never be reduced all the way to zero");
+    }
+
+    #[test]
+    fn plant_budget_falls_back_to_flat_default_with_no_player_view_published() {
+        // Regression guard: if nothing ever calls set_player_view_for_plant_lod
+        // (tests, headless tools, or simply before the main loop's first
+        // frame), behavior must be identical to before this feature existed
+        // -- the flat, unscaled max_plant_stamps_per_chunk() value.
+        player_view_for_plant_lod::reset_for_test();
+        let chunk_center = [16.0, 16.0, 16.0];
+        assert_eq!(
+            plant_stamp_budget_for_chunk(chunk_center),
+            max_plant_stamps_per_chunk(),
+            "with no player view published, the budget must be the flat default, unscaled"
         );
     }
 

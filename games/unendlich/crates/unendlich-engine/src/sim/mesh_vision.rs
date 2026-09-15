@@ -73,6 +73,29 @@ pub enum MeshUrgency {
     Now = 2,
 }
 
+/// r-plant-lod-vector: a scale factor on some per-chunk detail budget (today:
+/// decorate_chunk_styled's plant stamp count), given how urgently a cone
+/// wants this chunk. Reuses this module's own urgency signal rather than
+/// reinventing distance/facing math a second time -- "LOD + vector, not just
+/// LOD + camera position" means a chunk directly behind the player at 20
+/// blocks costs less than one directly ahead at the same range, which is
+/// exactly what MeshUrgency (a real FOV + distance test, see
+/// `urgency_for_cone`) already distinguishes.
+///
+/// None of these scales are ever exactly 0.0 -- an out-of-cone chunk should
+/// look believably (if simply) planted when the player turns toward it, not
+/// pop in from nothing. This mirrors the module's existing philosophy for
+/// meshing itself (`Soon`, not `Defer`, for anything a small turn could
+/// reveal) applied one level down, to decoration density within an
+/// already-meshed chunk.
+pub fn plant_budget_scale_for_urgency(urgency: MeshUrgency) -> f32 {
+    match urgency {
+        MeshUrgency::Now => 1.0,
+        MeshUrgency::Soon => 0.5,
+        MeshUrgency::Defer => 0.15,
+    }
+}
+
 /// Horizontal angle from `from` to `to` in the XZ plane (matches
 /// `sim::perception::horiz_angle`).
 fn horiz_angle(from: [f32; 3], to: [f32; 3]) -> f32 {
@@ -234,5 +257,33 @@ mod tests {
         let player = ViewCone::player([0.0, 0.0, 0.0], 0.0, R);
         let chunk = [-25.0, 0.0, 0.0]; // behind the only cone
         assert_eq!(urgency_for_cones(&[player], chunk, |_, _| false), MeshUrgency::Defer);
+    }
+
+    #[test]
+    fn plant_budget_scale_ranks_now_above_soon_above_defer() {
+        let now = plant_budget_scale_for_urgency(MeshUrgency::Now);
+        let soon = plant_budget_scale_for_urgency(MeshUrgency::Soon);
+        let defer = plant_budget_scale_for_urgency(MeshUrgency::Defer);
+        assert!(now > soon, "Now must scale higher than Soon");
+        assert!(soon > defer, "Soon must scale higher than Defer");
+    }
+
+    #[test]
+    fn plant_budget_scale_for_now_is_full_budget() {
+        // A chunk the player is actually looking at, up close, must not be
+        // quietly thinned out -- Now means full detail, same as before this
+        // feature existed.
+        assert_eq!(plant_budget_scale_for_urgency(MeshUrgency::Now), 1.0);
+    }
+
+    #[test]
+    fn plant_budget_scale_never_reaches_zero() {
+        // Even the least-urgent tier must leave *something* planted, so
+        // turning toward a long-deferred chunk doesn't pop plants in from
+        // nothing -- it should already look believably (if sparsely) planted.
+        assert!(
+            plant_budget_scale_for_urgency(MeshUrgency::Defer) > 0.0,
+            "Defer must still allow some plants, never a hard zero"
+        );
     }
 }
