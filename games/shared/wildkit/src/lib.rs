@@ -57,10 +57,14 @@
 //! truncation rather than a rewrite. It is the one file here that is not
 //! byte-identical to the engine's, and its header says so.
 //!
-//! Still behind: **biome climate** (reaches `world::biomes`) and
-//! **perception field** (reaches a GPU benchmark). biome_climate is the more
-//! valuable of the two — without it there is no clock, and "sight works
-//! differently at dusk" has nothing to vary against.
+//! **Climate came across as a SUBSET.** `biome_climate`'s useful half —
+//! [`sim::climate`], continuous temperature and moisture from a seed and a
+//! position — is Biome-free. Its other half classifies that into
+//! `world::biomes::Biome`, and following THAT costs 1,581 lines of another
+//! game's biome and block palettes. A thermometer is general; a
+//! `FungalCave` is not.
+//!
+//! Still behind: **perception field**, which reaches a GPU benchmark.
 
 pub mod sim;
 

@@ -24,8 +24,13 @@ service registration after the tests, so the cut was a truncation. It is the
 one file here that is NOT byte-identical to the engine's copy, and its own
 header records exactly what was removed.
 
-Still EXCLUDED: `biome_climate` (world::biomes) and `perception_field`
-(gpu_bench). Both are worth having and both need a real seam cut.
+`biome_climate` came across as a SUBSET (`sim::climate`): its
+temperature/moisture half is Biome-free, while its classifier would have
+dragged in 1,581 lines of unendlich's biome and block palettes. That file is
+therefore the one that will not diff cleanly against the engine, and its
+header says so.
+
+Still EXCLUDED: `perception_field` (gpu_bench).
 
 std-only, deterministic. 137 tests came with it.
 """

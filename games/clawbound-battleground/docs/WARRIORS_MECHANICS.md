@@ -102,11 +102,20 @@ drops out of a bound.
 economy, not a heal: prey caught → carried → cached → eaten. `forage_*` in
 unendlich is about a creature feeding itself, which is a different loop.
 
-### 5. Time of day and season
+### 5. Time of day and season — climate is in, the clock is not
 
-`biome_climate` stayed behind too (it reaches `world::biomes`). Without it
-there is no clock, and the brief's "LOS vs ears varies by time of day" has
-nothing to vary against. Extracting it is cheap — one enum's worth of seam.
+`wildkit::sim::climate` now provides temperature and moisture at a point,
+deterministic in the seed. That is the seasons-and-drought half of the brief.
+
+It came across as a SUBSET, and the estimate above ("one enum's worth of
+seam") was wrong: the classifier half returns `world::biomes::Biome`, and
+that dependency costs 1,581 lines of unendlich's biome and block palettes.
+Left behind deliberately — clawbound has its own voxel palette and would never
+name a `FungalCave`.
+
+Still missing is the CLOCK itself: climate says what the weather is like at a
+place, not what time it is. A day/night phase driving `PerceptParams`' sight
+range is a small piece of new code, not an extraction.
 
 ### 6. The spirit sites and the shadow realm
 
@@ -145,7 +154,8 @@ What the passage asks for that is missing:
 3. **Wire stamina**: a stream tile that regenerates it, and `gait_for` reading
    the multiplier so an exhausted cat drops out of a bound.
 4. **Scent markers** as their own type, with refresh-on-patrol.
-5. **Extract `biome_climate`** for the clock, then time-of-day perception.
+5. ~~**Extract `biome_climate`**~~ — the climate half is in as `sim::climate`.
+   What remains is a day/night clock feeding `PerceptParams`, which is new code.
 5. Stalk posture and aimed leap in the rig.
 6. Fresh-kill economy, spirit sites, shadow realm.
 

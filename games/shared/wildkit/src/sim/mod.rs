@@ -6,6 +6,9 @@
 //! mechanically until the engine depends on this crate instead.
 
 pub mod audio_occlusion;
+/// A SUBSET of the engine's biome_climate -- the temperature/moisture half,
+/// without the 19-variant biome palette. See the file header.
+pub mod climate;
 pub mod creature_hearing;
 pub mod fog_model;
 pub mod hearing_radius;
