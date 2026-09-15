@@ -220,6 +220,88 @@ mod tests {
         assert_eq!(ops.len(), 1);
     }
 
+    /// Every existing `move_together_ops` test uses ONE track. A
+    /// composition's clips can sit on any track ("membership is a PROJECT
+    /// fact", per `GroupId`'s own doc) -- this is the untested case: two
+    /// clips on track 1, one on track 2, moved together. Each must keep
+    /// its OWN track (a group is horizontal: same delta, same track per
+    /// member) and land at the right absolute position.
+    #[test]
+    fn moving_a_group_across_multiple_tracks_keeps_each_member_on_its_own_track() {
+        let mut p = chopped(); // clips 1,2,3 on track 1 at 0,1000,2000
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Video, name: "b-roll".into(),
+            muted: false, locked: false, gain: 1.0, route: None }, at: 1 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(2), path: "cutaway.mp4".into(),
+            len: Ticks(100_000), sample_rate: 48_000, channels: 0, has_video: true } }).unwrap();
+        // Clip 4 on track 2, positioned to overlap clip 2's timeline span --
+        // legal, since different tracks never collide with each other.
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(4), source: SourceId(2), track: TrackId(2),
+            pos: Ticks(1000), src_in: Ticks::ZERO, len: Ticks(1000), gain: 1.0, effects: vec![] } }).unwrap();
+
+        let ids = [ClipId(1), ClipId(2), ClipId(3), ClipId(4)];
+        let ops = p.move_together_ops(&ids, ClipId(1), Ticks(500)).unwrap(); // delta +500
+        assert_eq!(ops.len(), 4);
+        for op in &ops { p.apply(op).expect("no collision: same delta preserves both same-track spacing and cross-track independence"); }
+
+        assert_eq!(p.clips[&ClipId(1)].pos, Ticks(500));
+        assert_eq!(p.clips[&ClipId(2)].pos, Ticks(1500));
+        assert_eq!(p.clips[&ClipId(3)].pos, Ticks(2500));
+        assert_eq!(p.clips[&ClipId(4)].pos, Ticks(1500), "the video clip moves by the same delta as the audio clips");
+        assert_eq!(p.clips[&ClipId(1)].track, TrackId(1), "track 1 members must stay on track 1");
+        assert_eq!(p.clips[&ClipId(4)].track, TrackId(2), "the track-2 member must stay on track 2, not get reassigned");
+    }
+
+    /// Randomised same-track layouts and deltas: the doc comment above
+    /// `move_together_ops` claims same-track members can never collide
+    /// with EACH OTHER under this ordering (spacing is invariant under a
+    /// uniform shift). Checked here across many layouts instead of just
+    /// the one hand-picked "three adjacent clips" case the tests above
+    /// use -- a fixed-seed PRNG so a failure is reproducible.
+    #[test]
+    fn move_together_never_collides_same_track_members_with_each_other_across_random_layouts() {
+        // Small xorshift, not `rand`: this crate has zero dependencies and
+        // that's worth keeping for a one-off property check.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; self.0
+            }
+            fn range(&mut self, lo: i64, hi: i64) -> i64 { lo + (self.next() % (hi - lo).max(1) as u64) as i64 }
+        }
+        let mut rng = Rng(0x5eed_1234);
+
+        for trial in 0..200 {
+            let mut p = Project::default();
+            p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "t".into(),
+                muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+            p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "s.wav".into(),
+                len: Ticks(1_000_000), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+
+            // 2-5 non-overlapping clips, random lengths and gaps.
+            let n = rng.range(2, 6);
+            let mut pos = 0i64;
+            let mut ids = Vec::new();
+            for i in 0..n {
+                let len = rng.range(50, 500);
+                let id = ClipId(i as u64 + 1);
+                p.apply(&Op::AddClip { clip: Clip { id, source: SourceId(1), track: TrackId(1),
+                    pos: Ticks(pos), src_in: Ticks::ZERO, len: Ticks(len), gain: 1.0, effects: vec![] } }).unwrap();
+                ids.push(id);
+                pos += len + rng.range(0, 300); // gap, possibly zero (touching)
+            }
+
+            let anchor = ids[rng.range(0, n) as usize];
+            let delta = rng.range(-400, 400);
+            let anchor_old = p.clips[&anchor].pos;
+            let want = Ticks((anchor_old.0 + delta).max(0));
+
+            let ops = p.move_together_ops(&ids, anchor, want).unwrap();
+            for op in &ops {
+                p.apply(op).unwrap_or_else(|e| panic!("trial {trial}: same-track group move collided with itself: {e:?} (n={n}, delta={delta})"));
+            }
+        }
+    }
+
     #[test]
     fn grid_cuts_are_strictly_inside_and_honour_the_phase() {
         assert_eq!(Project::grid_cuts(Ticks(0), Ticks(1000), Ticks(250), Ticks::ZERO),
