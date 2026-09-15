@@ -209,3 +209,45 @@ mod current_page_tests {
         assert_eq!(current_page(None, &[], false, false), Page::Web);
     }
 }
+
+#[cfg(test)]
+mod drift_guard {
+    /// `bar_pages_core.rs` is a VERBATIM COPY of `../../src/bar_pages.rs`
+    /// with its 37-line `//!` header removed — `include!` splices text, and an
+    /// inner doc comment cannot appear mid-file, which is the only reason the
+    /// copy exists rather than a path to the original.
+    ///
+    /// A copy with no guard is a fork with a delay. Everything else this
+    /// frontend shares with the Qt app is `#[path]`-mounted precisely so one
+    /// fix serves both; this file is the exception, and nothing marked it as
+    /// one. A change to the Qt side's paging would land in the Qt app and not
+    /// here, and the symptom would be the bar behaving differently in the two
+    /// front-ends with both files looking correct in isolation.
+    ///
+    /// So: fail loudly when they diverge. Comparing the BODIES, since the
+    /// header is the one intended difference.
+    #[test]
+    fn the_copy_still_matches_the_shared_source() {
+        let orig = include_str!("../../src/bar_pages.rs");
+        let copy = include_str!("bar_pages_core.rs");
+        // Drop the original's leading `//!` block; everything after it must
+        // match exactly.
+        let body: String = orig
+            .lines()
+            .skip_while(|l| l.trim_start().starts_with("//!") || l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let copy_body: String = copy
+            .lines()
+            .skip_while(|l| l.trim_start().starts_with("//!") || l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            body.trim_end(),
+            copy_body.trim_end(),
+            "bar_pages_core.rs has drifted from src/bar_pages.rs. They are the same \
+             code by design -- re-copy the original (minus its //! header) rather \
+             than patching one side."
+        );
+    }
+}
