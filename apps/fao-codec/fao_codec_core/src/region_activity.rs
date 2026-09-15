@@ -395,3 +395,119 @@ impl IntraFrameDedup {
         duplicates.saturating_mul(256 - 2)
     }
 }
+
+// ── scene lighting adapter ───────────────────────────────────────────────────
+//
+// The statistics above exist to decide what to spend bits on. They are also,
+// incidentally, a downsampled luminance image of the frame with per-block
+// dynamic range and motion attached — everything needed to read a key light
+// out of the video, already computed and already temporally smoothed.
+//
+// `scenelight-kit` turns that into a light a UI can be lit by. The conversion
+// lives HERE rather than there so the kit stays dependency-free and this crate
+// keeps ownership of its own types: `scenelight-kit` never names
+// `BlockActivity`, and nothing in this crate has to know what a scene is.
+
+impl BlockActivity {
+    /// Mean luma across this block's 4x4 sample grid, 0..255.
+    pub fn mean_luma(&self) -> f32 {
+        self.avg_samples.iter().sum::<f32>() / 16.0
+    }
+
+    /// Widest min-to-max spread across the block's samples: local contrast.
+    ///
+    /// The per-sample spread, not the block's overall min-to-max, because a
+    /// smooth gradient across a block is not the same thing as a hard edge
+    /// inside it and only the latter is contrast.
+    pub fn luma_range(&self) -> f32 {
+        let mut worst = 0u8;
+        for i in 0..16 {
+            worst = worst.max(self.max_samples[i].saturating_sub(self.min_samples[i]));
+        }
+        worst as f32
+    }
+}
+
+impl RegionActivityTracker {
+    /// Export per-block statistics in the shape `scenelight-kit` consumes.
+    ///
+    /// Blocks never observed are SKIPPED rather than reported as black. A
+    /// tracker that has only analysed part of a frame — the normal case, since
+    /// it re-analyses what changed — would otherwise report a mostly-dark
+    /// frame and drag a scene's lighting down for reasons that have nothing to
+    /// do with the video.
+    ///
+    /// Returns `(bx, by, mean_luma, luma_range, total_motion)` per block; the
+    /// caller maps that onto its own struct so neither crate depends on the
+    /// other.
+    pub fn scene_block_stats(&self) -> Vec<(u16, u16, f32, f32, u64)> {
+        let mut out = Vec::with_capacity(self.blocks.len());
+        for by in 0..self.block_h {
+            for bx in 0..self.block_w {
+                let b = &self.blocks[by * self.block_w + bx];
+                if b.frames_seen == 0 {
+                    continue;
+                }
+                out.push((bx as u16, by as u16, b.mean_luma(), b.luma_range(), b.total_motion));
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod scene_light_tests {
+    use super::*;
+
+    fn tracker() -> RegionActivityTracker {
+        RegionActivityTracker::new(64, 64)
+    }
+
+    #[test]
+    fn mean_luma_averages_the_sample_grid() {
+        let mut b = BlockActivity::default();
+        b.avg_samples = [100.0; 16];
+        assert!((b.mean_luma() - 100.0).abs() < 1e-3);
+        b.avg_samples[0] = 260.0;
+        assert!(b.mean_luma() > 100.0);
+    }
+
+    /// Per-sample spread, not the block's overall min-to-max: a smooth ramp
+    /// across a block is not a hard edge inside it.
+    #[test]
+    fn luma_range_is_the_widest_per_sample_spread() {
+        let mut b = BlockActivity::default();
+        b.min_samples = [10; 16];
+        b.max_samples = [20; 16];
+        assert!((b.luma_range() - 10.0).abs() < 1e-3);
+        b.max_samples[7] = 200;
+        assert!((b.luma_range() - 190.0).abs() < 1e-3, "the worst sample wins");
+    }
+
+    /// THE PARTIAL-FRAME RULE. Unobserved blocks must not read as black, or a
+    /// tracker that has only seen part of a frame drags the scene dark.
+    #[test]
+    fn unobserved_blocks_are_skipped_not_reported_black() {
+        let mut t = tracker();
+        assert!(t.scene_block_stats().is_empty(), "nothing seen yet, nothing reported");
+        t.blocks[5].frames_seen = 3;
+        t.blocks[5].avg_samples = [200.0; 16];
+        let s = t.scene_block_stats();
+        assert_eq!(s.len(), 1, "only the observed block");
+        assert!(s[0].2 > 190.0, "and it is bright: {}", s[0].2);
+    }
+
+    /// Coordinates must be block coordinates, in grid order.
+    #[test]
+    fn stats_carry_block_coordinates() {
+        let mut t = tracker();
+        let bw = t.block_w;
+        for b in t.blocks.iter_mut() {
+            b.frames_seen = 1;
+        }
+        let s = t.scene_block_stats();
+        assert_eq!(s.len(), t.block_w * t.block_h);
+        assert_eq!((s[0].0, s[0].1), (0, 0));
+        assert_eq!((s[bw].0, s[bw].1), (0, 1), "row-major");
+    }
+}

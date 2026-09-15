@@ -1,0 +1,29 @@
+[package]
+name = "scenelight-kit"
+version = "0.1.0"
+edition = "2021"
+description = """
+Light and scene character from statistics a video encoder already computed.
+
+fao-codec's RegionActivityTracker keeps, per 16x16 block, a 4x4 grid of
+temporally-smoothed luma (`avg_samples`), the min/max range, and accumulated
+motion. It keeps them for compression reasons — deciding which blocks are
+static UI, which are alpha overlays, which are moving. But a grid of block
+luma IS a downsampled luminance image of the frame, and it is already in
+memory, already smoothed, and cost nothing extra.
+
+So: read the frame's light from it. Direction from the luma gradient,
+intensity from the mean, contrast from the range, restlessness from the
+motion. Then map that onto a scene's palette and its generator parameters, so
+a physical UI can take its character from whatever video is playing.
+
+Deliberately dependency-free and typed in plain arrays, so `fao-codec` does
+not depend on `logscope` and `logscope` does not depend on `fao-codec`. The
+encoder produces `BlockStats`; the UI consumes `SceneLight`. Neither has to
+know the other exists.
+"""
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
