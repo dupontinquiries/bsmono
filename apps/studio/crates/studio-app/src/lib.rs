@@ -2070,6 +2070,11 @@ impl Studio {
     /// from each source's path (the compact representation IS the file,
     /// `import_audio`'s own rule). A missing file refuses the whole pack:
     /// a loop that ships without its kick is worse than no loop.
+    ///
+    /// A GENERATOR source refuses the pack too, for the same reason and with
+    /// its own message: it has no file, so there is nothing to embed. See the
+    /// check below for why that is caught by type rather than left to the
+    /// read.
     pub fn export_pattern_pack(&self, pattern_ix: usize)
         -> Result<pattern_pack::PatternPack, String>
     {
@@ -2083,9 +2088,29 @@ impl Studio {
                 let src = self.session.doc.project.sources.get(&source)
                     .ok_or_else(|| format!("channel '{}' references a source the \
                                             project no longer has", ch.name))?;
+                // A generator has no file to pack. Refused HERE, by type,
+                // rather than letting the read below fail: a generator's path
+                // is empty, so `fs::read("")` reports "No such file or
+                // directory" against a blank filename and blames the file
+                // system for what is a category error. The pack format's rule
+                // is that the compact representation IS the file, so a source
+                // with no file cannot participate -- and saying so names the
+                // fix (bounce it to a sample first) instead of sending the
+                // user looking for a missing wav.
+                if src.is_generator() {
+                    return Err(format!(
+                        "channel '{}' plays the generator '{}', which has no sample file to \
+                         pack — bounce it to audio first",
+                        ch.name, src.display_name()));
+                }
                 let bytes = std::fs::read(&src.path)
                     .map_err(|e| format!("'{}': {e} — the pack would ship without \
                                           its sample", src.path))?;
+                // The FILE NAME here, deliberately not display_name(): this
+                // hint names a file inside the pack, so it wants the
+                // extension. display_name() is for labelling a clip in the
+                // UI. The generator case that made the two differ is refused
+                // above, so by here a path always exists.
                 let hint = std::path::Path::new(&src.path).file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "sample".into());
