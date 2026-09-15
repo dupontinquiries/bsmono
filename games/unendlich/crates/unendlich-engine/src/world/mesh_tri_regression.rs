@@ -137,6 +137,18 @@ mod tests {
             .filter(|b| !matches!(b, crate::world::blocks::BlockId::Air))
             .count();
         let expected_len = (CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE) as usize;
+        // r-plant-voxel-diag: chunk.plant_indices is the "inverted plant
+        // index" decorate_chunk_styled iterates to stamp a full voxelized
+        // sub-grid template (subvoxel_templates::stamp_template) per plant
+        // instance -- NOT a cheap 2-quad billboard. Per that module's own
+        // doc, each template bakes from an 8^3 sub-grid with "~5-20 filled"
+        // cells, each up to 6 faces before occlusion. This runs entirely
+        // outside the three emission paths instrumented below (it's a
+        // single call after the whole greedy-mask loop, not a per-face
+        // special case), so it's exactly the kind of thing that would show
+        // up as "unaccounted" in the breakdown -- reading it directly here
+        // since the field is already public, no mesher.rs changes needed.
+        let plant_count = chunk.plant_indices.len();
 
         crate::render::mesher::mesh_diag_reset();
         let mesh = crate::render::mesher::mesh_chunk(&chunk);
@@ -146,6 +158,7 @@ mod tests {
 
         println!(
             "chunk {coord:?}: blocks.len()={} (expected {expected_len}), non_air={non_air}/{expected_len} ({:.1}%), \
+             plant_indices={plant_count}, \
              vertices={verts}, indices={}, triangles={tris}, \
              theoretical_max_triangles_if_every_block_isolated={}",
             chunk.blocks.len(),
@@ -156,12 +169,23 @@ mod tests {
         println!(
             "  emission breakdown: subdivided_top: {} blocks -> {} quads ({} tris) | \
              jittered_top: {} blocks -> {} quads ({} tris) | soft_side: {} quads ({} tris) | \
-             accounted_for={} tris, unaccounted (normal greedy-merged path)={} tris",
+             accounted_for={} tris, unaccounted (normal greedy-merge + decorate_chunk's plant \
+             stamping + water/lava surfaces)={} tris{}",
             diag.subdivided_top_blocks, diag.subdivided_top_quads, diag.subdivided_top_quads * 2,
             diag.jittered_top_blocks, diag.jittered_top_quads, diag.jittered_top_quads * 2,
             diag.soft_side_faces, diag.soft_side_faces * 2,
             (diag.subdivided_top_quads + diag.jittered_top_quads + diag.soft_side_faces) * 2,
             (tris as i64) - ((diag.subdivided_top_quads + diag.jittered_top_quads + diag.soft_side_faces) as i64 * 2),
+            if plant_count > 0 {
+                format!(
+                    " (if fully attributed to plant stamping: {:.1} tris/plant across {plant_count} plants)",
+                    ((tris as i64) - ((diag.subdivided_top_quads + diag.jittered_top_quads + diag.soft_side_faces) as i64 * 2)) as f64
+                        / plant_count as f64,
+                )
+            } else {
+                " (plant_indices is empty -- rules out plant stamping entirely; \
+                   the unaccounted total must be normal greedy-merge or water/lava surfaces)".to_string()
+            },
         );
         // A few things worth reading off this once it actually runs:
         //   - blocks.len() != expected_len would mean generate_chunk itself
