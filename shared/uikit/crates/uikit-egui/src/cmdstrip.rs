@@ -76,6 +76,22 @@ impl Hold {
         self.fired
     }
 
+    /// How far into the hold window the current press is, 0.0 at
+    /// press-down to 1.0 at the threshold and beyond — the raw input to a
+    /// fill/morph animation. 0.0 when nothing is currently held. Added
+    /// alongside a keyboard adapter (`ctrl_p_gesture.rs` -- a hold on a
+    /// KEY rather than a touch point) that needed this and found `Hold`
+    /// had no accessor for it -- a real gap for any future TOUCH caller
+    /// wanting the same fill animation, not just that one adapter, so it
+    /// lives here rather than as a second, parallel timer duplicating
+    /// what `held` already tracks.
+    pub fn progress(&self) -> f32 {
+        match self.held {
+            Some(t) => (t / HOLD_SECONDS).min(1.0),
+            None => 0.0,
+        }
+    }
+
     /// The finger came up. `Some(Tap)` when it was short, `Some(Hold)`
     /// when the menu had opened — a caller acts on the tap and dismisses
     /// on the hold, and never has to compare durations itself.

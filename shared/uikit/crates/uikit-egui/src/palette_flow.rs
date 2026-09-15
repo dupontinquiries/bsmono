@@ -1,0 +1,311 @@
+//! palette_flow — Ctrl+P as one key that opens the command palette, then
+//! settles into voice on its own if you pause, rather than needing a
+//! hold gesture at all.
+//!
+//! ## Why this replaced the hold-duration design
+//!
+//! The earlier design (`ctrl_p_gesture::GestureTracker`, still present
+//! and still real infrastructure — a keyboard adapter over the shared
+//! `cmdstrip::Hold` touch-hold primitive) required physically holding
+//! Ctrl+P down past a threshold to trigger voice. Replaced by direct
+//! design feedback for a simpler flow: tap once to open (always the
+//! command palette, typed-search mode), and if you just PAUSE for a
+//! moment without typing, it settles into listening on its own — no key
+//! to hold, no timing to get right with your hand.
+//!
+//! ## The exact flow, worked through with the person who designed it
+//!
+//! ```text
+//! Off --Ctrl+P--> Command --idle 750ms--> Voice
+//!                    ^                       |
+//!                    |                       |
+//!                    +------ typing ---------+
+//!                    |  (cancels in-flight capture,
+//!                    |   escalates next dwell to 1500ms)
+//!                    |
+//!                    +--idle 1500ms--> Voice (again)
+//! ```
+//!
+//! Ctrl+P from either open state (`Command` or `Voice`) closes back to
+//! `Off` and resets the escalation — a fresh open always gets the
+//! shorter 750ms dwell.
+//!
+//! ## Why the dwell escalates rather than staying fixed
+//!
+//! A fixed 750ms would mean anyone who types, pauses to think, types
+//! more, pauses again — ordinary composition — keeps getting yanked into
+//! voice mode on every natural pause. Escalating to 1500ms after the
+//! FIRST time typing pulls the mode back is a cheap, real fix: it reads
+//! as "already tried typing once this session" without needing to
+//! actually parse or remember what was typed.
+//!
+//! ## What this module does not decide
+//!
+//! Whether crossing into `Voice` should call `voice_popup::VoicePopup::
+//! start()`, or whether leaving `Voice` (via typing OR via Ctrl+P closing
+//! it) should call `cancel()` — those are the caller's job, signaled
+//! through [`Transition`] rather than performed here, so this state
+//! machine stays pure and testable without a running voice engine.
+
+/// Which surface is currently open, if either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Off,
+    Command,
+    Voice,
+}
+
+/// What just happened, for the caller to act on. `tick`/`on_type`/
+/// `ctrl_p_tapped` all return one of these rather than mutating shared
+/// state the caller has to diff against the previous frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transition {
+    /// Nothing changed this call.
+    None,
+    /// Opened fresh, from `Off`. Always lands in `Command`.
+    Opened,
+    /// Closed back to `Off`. Carries which mode it closed FROM, since a
+    /// close from `Voice` needs to cancel an in-flight capture and a
+    /// close from `Command` does not.
+    Closed(Mode),
+    /// Typing pulled the mode back from `Voice` to `Command`. The
+    /// caller should cancel any in-flight capture — the person started
+    /// typing, which reads as "I changed my mind about speaking."
+    SwitchedToCommand,
+    /// The dwell timer crossed its threshold: `Command` -> `Voice`. The
+    /// caller should start listening.
+    SwitchedToVoice,
+}
+
+/// The first dwell, from a fresh `Command` open.
+pub const FIRST_DWELL_MS: f32 = 750.0;
+/// The escalated dwell, after typing has pulled the mode back from
+/// `Voice` to `Command` at least once this session (session = since the
+/// palette was last fully closed via Ctrl+P).
+pub const ESCALATED_DWELL_MS: f32 = 1500.0;
+
+pub struct PaletteFlow {
+    mode: Mode,
+    /// Milliseconds since the last reset — typing, or entering
+    /// `Command` fresh. Only accumulates while `mode == Command`;
+    /// meaningless (and un-ticked) otherwise.
+    idle_ms: f32,
+    /// The CURRENT dwell threshold `tick` compares `idle_ms` against.
+    /// Starts at `FIRST_DWELL_MS`; escalates to `ESCALATED_DWELL_MS` on
+    /// the first `on_type` call that pulls `Voice` back to `Command`.
+    dwell_ms: f32,
+}
+
+impl Default for PaletteFlow {
+    fn default() -> Self {
+        PaletteFlow { mode: Mode::Off, idle_ms: 0.0, dwell_ms: FIRST_DWELL_MS }
+    }
+}
+
+impl PaletteFlow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Ctrl+P was tapped. Opens (to `Command`, resetting the escalation)
+    /// from `Off`; closes (to `Off`) from either open mode.
+    pub fn ctrl_p_tapped(&mut self) -> Transition {
+        match self.mode {
+            Mode::Off => {
+                self.mode = Mode::Command;
+                self.idle_ms = 0.0;
+                self.dwell_ms = FIRST_DWELL_MS;
+                Transition::Opened
+            }
+            Mode::Command | Mode::Voice => {
+                let was = self.mode;
+                self.mode = Mode::Off;
+                Transition::Closed(was)
+            }
+        }
+    }
+
+    /// A text/typing event landed while the palette is open. A no-op
+    /// (returns `Transition::None`) while `Off` or already `Command` --
+    /// typing while already in typed-search mode is just... typing.
+    pub fn on_type(&mut self) -> Transition {
+        self.idle_ms = 0.0;
+        self.voice_to_command()
+    }
+
+    /// Voice failed to actually start (the caller's `voice_popup.start()`
+    /// refused — password mode, say). Same underlying transition as
+    /// `on_type`'s `Voice -> Command` step and the same escalation, under
+    /// its own name so a caller does not have to pretend a keystroke
+    /// happened just to get the same effect back onto `Command`.
+    pub fn voice_refused(&mut self) -> Transition {
+        self.voice_to_command()
+    }
+
+    fn voice_to_command(&mut self) -> Transition {
+        if self.mode == Mode::Voice {
+            self.mode = Mode::Command;
+            self.dwell_ms = ESCALATED_DWELL_MS;
+            return Transition::SwitchedToCommand;
+        }
+        Transition::None
+    }
+
+    /// Advance idle time by one frame's worth of milliseconds. Only has
+    /// an effect while `mode == Command` -- `Off` and `Voice` do not
+    /// accumulate or check a dwell timer at all.
+    pub fn tick(&mut self, dt_ms: f32) -> Transition {
+        if self.mode != Mode::Command {
+            return Transition::None;
+        }
+        self.idle_ms += dt_ms.max(0.0);
+        if self.idle_ms >= self.dwell_ms {
+            self.mode = Mode::Voice;
+            self.idle_ms = 0.0;
+            return Transition::SwitchedToVoice;
+        }
+        Transition::None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_p_opens_to_command_from_off() {
+        let mut f = PaletteFlow::new();
+        assert_eq!(f.mode(), Mode::Off);
+        assert_eq!(f.ctrl_p_tapped(), Transition::Opened);
+        assert_eq!(f.mode(), Mode::Command);
+    }
+
+    #[test]
+    fn idle_past_the_first_dwell_switches_to_voice() {
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped();
+        assert_eq!(f.tick(FIRST_DWELL_MS - 1.0), Transition::None, "must not fire early");
+        assert_eq!(f.tick(1.0), Transition::SwitchedToVoice, "must fire once the threshold is crossed");
+        assert_eq!(f.mode(), Mode::Voice);
+    }
+
+    #[test]
+    fn tick_does_nothing_while_off_or_voice() {
+        let mut f = PaletteFlow::new();
+        // Off: ticking a huge amount of time must not open anything.
+        assert_eq!(f.tick(100_000.0), Transition::None);
+        assert_eq!(f.mode(), Mode::Off);
+
+        f.ctrl_p_tapped();
+        f.tick(FIRST_DWELL_MS); // -> Voice
+        assert_eq!(f.mode(), Mode::Voice);
+        // Voice: ticking must not do anything further (no third state).
+        assert_eq!(f.tick(100_000.0), Transition::None);
+        assert_eq!(f.mode(), Mode::Voice);
+    }
+
+    #[test]
+    fn typing_while_voice_switches_back_to_command_and_escalates() {
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped();
+        f.tick(FIRST_DWELL_MS); // -> Voice
+        assert_eq!(f.on_type(), Transition::SwitchedToCommand);
+        assert_eq!(f.mode(), Mode::Command);
+        // The escalation: the SAME 750ms that worked the first time must
+        // NOT trigger Voice again -- this is the whole point of the ask.
+        assert_eq!(f.tick(FIRST_DWELL_MS), Transition::None, "must not re-trigger at the original dwell");
+        // But the escalated 1500ms threshold does fire.
+        assert_eq!(f.tick(ESCALATED_DWELL_MS - FIRST_DWELL_MS), Transition::SwitchedToVoice);
+    }
+
+    #[test]
+    fn typing_while_already_command_is_a_plain_no_op() {
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped(); // -> Command
+        assert_eq!(f.on_type(), Transition::None, "typing in Command is just typing");
+        assert_eq!(f.mode(), Mode::Command);
+    }
+
+    #[test]
+    fn typing_resets_the_idle_clock_even_without_a_mode_switch() {
+        // A person typing steadily in Command mode must never drift into
+        // Voice just because enough WALL time passed -- each keystroke
+        // has to reset the idle counter, not merely be ignored.
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped();
+        f.tick(FIRST_DWELL_MS - 50.0); // close to the threshold
+        f.on_type(); // keystroke -- resets idle_ms to 0
+        assert_eq!(f.tick(FIRST_DWELL_MS - 50.0), Transition::None, "reset clock must not be near the threshold yet");
+    }
+
+    #[test]
+    fn ctrl_p_closes_from_either_open_mode_and_reports_which() {
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped(); // -> Command
+        assert_eq!(f.ctrl_p_tapped(), Transition::Closed(Mode::Command));
+        assert_eq!(f.mode(), Mode::Off);
+
+        f.ctrl_p_tapped();
+        f.tick(FIRST_DWELL_MS); // -> Voice
+        assert_eq!(f.ctrl_p_tapped(), Transition::Closed(Mode::Voice));
+        assert_eq!(f.mode(), Mode::Off);
+    }
+
+    #[test]
+    fn closing_and_reopening_resets_the_escalation() {
+        // A fresh open must always get the SHORT dwell again, even if a
+        // previous session escalated to 1500ms -- the escalation is
+        // per-session (since the last full close), not permanent.
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped();
+        f.tick(FIRST_DWELL_MS); // -> Voice
+        f.on_type(); // -> Command, dwell escalated to 1500ms
+        f.ctrl_p_tapped(); // close fully -> Off
+
+        f.ctrl_p_tapped(); // reopen -> Command
+        assert_eq!(f.tick(FIRST_DWELL_MS), Transition::SwitchedToVoice, "a fresh open must use the SHORT dwell, not the escalated one");
+    }
+
+    #[test]
+    fn a_second_escalation_within_one_session_does_not_escalate_further() {
+        // Only one escalation step exists (750 -> 1500), not an
+        // ever-doubling series -- pinned explicitly so a future edit
+        // that turns this into 1500 -> 3000 -> 6000 fails a named test
+        // rather than silently changing the feel.
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped();
+        f.tick(FIRST_DWELL_MS); // -> Voice (1st time)
+        f.on_type(); // -> Command, escalate to 1500
+        f.tick(ESCALATED_DWELL_MS); // -> Voice (2nd time)
+        f.on_type(); // -> Command, escalate again -- but to what?
+        // Must still be 1500, not 3000: the SAME escalated threshold
+        // fires again, it does not escalate a second time.
+        assert_eq!(f.tick(ESCALATED_DWELL_MS), Transition::SwitchedToVoice);
+    }
+
+    #[test]
+    fn voice_refused_has_the_same_effect_as_on_type_without_needing_a_fake_keystroke() {
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped();
+        f.tick(FIRST_DWELL_MS); // -> Voice
+        assert_eq!(f.voice_refused(), Transition::SwitchedToCommand);
+        assert_eq!(f.mode(), Mode::Command);
+        // Same escalation as on_type's Voice -> Command step -- the
+        // original 750ms must not re-trigger.
+        assert_eq!(f.tick(FIRST_DWELL_MS), Transition::None);
+        assert_eq!(f.tick(ESCALATED_DWELL_MS - FIRST_DWELL_MS), Transition::SwitchedToVoice);
+    }
+
+    #[test]
+    fn voice_refused_is_a_no_op_outside_voice_mode() {
+        let mut f = PaletteFlow::new();
+        assert_eq!(f.voice_refused(), Transition::None, "Off must be unaffected");
+        f.ctrl_p_tapped();
+        assert_eq!(f.voice_refused(), Transition::None, "Command must be unaffected");
+        assert_eq!(f.mode(), Mode::Command);
+    }
+}

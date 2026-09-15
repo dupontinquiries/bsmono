@@ -1,78 +1,65 @@
-//! ctrl_p_gesture — classify a Ctrl+P press as a tap (toggle the palette)
-//! or a hold (open voice, morphing the palette into it), pure and testable
-//! without a frame.
+//! ctrl_p_gesture — classify a continuous key-hold (Ctrl+P: tap toggles a
+//! palette, hold opens voice) using the SAME timing primitive touch holds
+//! already use in this kit.
 //!
-//! ## Why this needs its own state, not just `key_pressed`/`key_down`
+//! ## This almost became a second implementation of the same idea
 //!
-//! The existing Ctrl+P binding uses `key_pressed` — an edge-triggered
-//! "did the key transition down-to-up... no, up-to-down this frame" check,
-//! fine for a single discrete action. Telling a TAP from a HOLD needs to
-//! know how long the key has been down, which `key_pressed`/`key_down`
-//! alone do not track — egui reports "is the key down right now", not
-//! "for how long". This module is the small piece of state that answers
-//! that question, kept separate from both the palette's own state and
-//! voice's, since press/hold classification is a distinct concern neither
-//! of them should have to reimplement if a THIRD hold-triggered binding
-//! ever wants the same shape.
+//! Built to answer "does the key need its own tap/hold timer" without
+//! first checking whether one already existed in this crate. One did:
+//! [`crate::cmdstrip::Hold`], built for touch (press-and-hold on a
+//! button), citing voiceterm's own hold duration explicitly so "two apps
+//! in the same fleet disagreeing about what a long-press feels like" —
+//! its own words — would not happen. This module's first draft carried
+//! its own independent 220ms threshold, discovered only once `Hold`'s
+//! existing 320ms (`cmdstrip::HOLD_SECONDS`) was found — exactly the
+//! disagreement `Hold`'s own doc comment already warned against, and
+//! this module was about to become a second one.
 //!
-//! ## The threshold, and why it is a constant here rather than tuned per
-//! call site
+//! Fixed by making [`GestureTracker`] a thin ADAPTER: it translates
+//! keyboard-style continuous polling (`key_down` — "is it physically down
+//! right now", queried every frame) into `Hold`'s touch-style discrete
+//! calls (`press()` once, `tick(dt)` every frame while held, `release()`
+//! once), rather than reimplementing the timer. One real state machine
+//! and one real threshold, used by both input shapes.
 //!
-//! 220ms. Reasoned, not measured (same caveat every other unmeasured
-//! constant in this session carries — `power_profile::
-//! FOREGROUND_ECO_UTIL_MAX`, `poll_schedule::ScheduleConfig::default`'s
-//! hysteresis): long enough that an ordinary tap-and-release (even a
-//! slightly slow one) reads as a tap, short enough that a deliberate hold
-//! does not feel laggy before voice starts responding. Needs a real
-//! keyboard and a real hand to tune, not arithmetic.
+//! ## Why the translation, not a shared call convention
 //!
-//! ## What this module does NOT decide
-//!
-//! Whether Ctrl+P is even the right binding for a given app, what "open
-//! voice" or "toggle the palette" DO once decided, and how the visual
-//! morph is drawn. Those are the caller's job — this module answers
-//! exactly one question, "given how long the key has been continuously
-//! down, and whether it JUST came up, what should happen", as data.
+//! Touch and keyboard genuinely report state differently at the egui
+//! layer: a touch press/release are discrete EVENTS (there is a frame
+//! where the finger went down, a frame where it came up), while
+//! `i.key_down(key)` is a continuous per-frame QUERY with no event to
+//! hook `press()`/`release()` onto directly. Rather than change `Hold`'s
+//! API to suit one caller, this adapter tracks the previous frame's
+//! `down` state itself and calls `press()`/`release()` on the
+//! transitions it detects — the minimum translation layer, not a
+//! reshaping of the shared primitive around this one consumer.
 
-use std::time::Duration;
-
-/// How long a continuous press must last before it counts as a hold
-/// rather than a tap.
-pub const HOLD_THRESHOLD: Duration = Duration::from_millis(220);
+use crate::cmdstrip::{Hold, Release};
 
 /// What happened this frame, for the caller to act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gesture {
-    /// Nothing to do — key is up and was not just released, or is down
-    /// but has not crossed the hold threshold yet.
+    /// Nothing to do this frame.
     None,
     /// The key was released before crossing the hold threshold: a tap.
     /// Caller should toggle the palette.
     Tap,
-    /// The key is down and HAS crossed the hold threshold, for the first
-    /// time this press (fires once, not every frame past the threshold —
-    /// see [`GestureTracker::poll`]'s doc for why that matters to the
-    /// caller). Caller should start voice.
+    /// The key is down and has crossed the hold threshold, for the first
+    /// time this press (fires once, matching `Hold::tick`'s own
+    /// fire-once contract). Caller should start voice.
     HoldStarted,
-    /// The key was released AFTER crossing the hold threshold (a hold
-    /// that is now ending). Caller should stop/finish voice, mirroring
-    /// how releasing a push-to-talk key ends the utterance.
+    /// The key was released after crossing the hold threshold. Caller
+    /// should stop/finish voice, mirroring how releasing a push-to-talk
+    /// key ends the utterance.
     HoldReleased,
 }
 
-/// Tracks one key's continuous-press state across frames. One instance
-/// per binding — do not share between Ctrl+P and some other hold-triggered
-/// key, since `held_since`/`hold_fired` describe exactly one physical key's
-/// history.
-#[derive(Debug, Clone, Copy, Default)]
+/// Tracks one key's continuous-press state across frames by adapting it
+/// onto [`Hold`]. One instance per binding.
+#[derive(Debug, Clone, Default)]
 pub struct GestureTracker {
-    /// `Some(d)` = key has been continuously down for `d` as of the last
-    /// poll; `None` = key is up.
-    held_for: Option<Duration>,
-    /// Whether `HoldStarted` has already been emitted for the CURRENT
-    /// press, so it fires exactly once per press rather than every frame
-    /// once the threshold is crossed.
-    hold_fired: bool,
+    hold: Hold,
+    was_down: bool,
 }
 
 impl GestureTracker {
@@ -81,144 +68,131 @@ impl GestureTracker {
     }
 
     /// Advance by one frame. `down` is whether the key is physically held
-    /// right now; `dt` is this frame's duration (egui's `ctx.input(|i|
-    /// i.stable_dt)` on a real call site — a parameter here, not read
-    /// internally, so this stays testable without a frame).
-    pub fn poll(&mut self, down: bool, dt: Duration) -> Gesture {
-        match (self.held_for, down) {
-            (None, false) => Gesture::None,
-            (None, true) => {
-                // Press just started.
-                self.held_for = Some(dt);
-                self.hold_fired = false;
-                Gesture::None
+    /// right now; `dt` is this frame's duration.
+    pub fn poll(&mut self, down: bool, dt: std::time::Duration) -> Gesture {
+        if down && !self.was_down {
+            // Rising edge: translate into Hold's press() event.
+            self.hold.press();
+        }
+        self.was_down = down;
+
+        if down {
+            if self.hold.tick(dt.as_secs_f32()) {
+                return Gesture::HoldStarted;
             }
-            (Some(_), false) => {
-                // Release. Classify by whether the hold threshold was
-                // ever crossed during this press — not by the duration
-                // at the moment of release, which is the same test but
-                // stated the way the actual field (`hold_fired`) makes
-                // it: a press that crossed the threshold and then got
-                // released a frame later is still a hold-that-ended, not
-                // a tap, even though the LAST recorded duration might sit
-                // right at the boundary.
-                let was_hold = self.hold_fired;
-                self.held_for = None;
-                self.hold_fired = false;
-                if was_hold { Gesture::HoldReleased } else { Gesture::Tap }
-            }
-            (Some(prev), true) => {
-                let now = prev + dt;
-                self.held_for = Some(now);
-                if now >= HOLD_THRESHOLD && !self.hold_fired {
-                    self.hold_fired = true;
-                    Gesture::HoldStarted
-                } else {
-                    Gesture::None
-                }
-            }
+            return Gesture::None;
+        }
+
+        // Falling edge or already-up: release() is a no-op (returns
+        // None) if nothing was held, so this is safe to call every frame
+        // the key is up, not just on the exact transition frame.
+        match self.hold.release() {
+            Some(Release::Tap) => Gesture::Tap,
+            Some(Release::Hold) => Gesture::HoldReleased,
+            None => Gesture::None,
         }
     }
 
-    /// How far into the hold this press is, 0.0 at press-down to 1.0 at
-    /// the threshold and beyond — the raw input to a morph animation
-    /// (feed through `ctx.animate_value_with_time` or similar for
-    /// smoothing; this returns the unsmoothed ratio). 0.0 while the key
-    /// is up.
+    /// How far into the hold this press is, 0.0 to 1.0 — delegates to
+    /// [`Hold::progress`] directly rather than tracking a second copy of
+    /// the same elapsed time.
     pub fn hold_progress(&self) -> f32 {
-        match self.held_for {
-            None => 0.0,
-            Some(d) => (d.as_secs_f32() / HOLD_THRESHOLD.as_secs_f32()).min(1.0),
-        }
+        self.hold.progress()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmdstrip::HOLD_SECONDS;
+    use std::time::Duration;
 
-    fn ms(n: u64) -> Duration { Duration::from_millis(n) }
+    fn secs(s: f32) -> Duration {
+        Duration::from_secs_f32(s)
+    }
 
     #[test]
     fn a_quick_tap_reports_tap_on_release() {
         let mut t = GestureTracker::new();
-        assert_eq!(t.poll(true, ms(0)), Gesture::None); // press-down
-        assert_eq!(t.poll(true, ms(50)), Gesture::None); // still held, short
-        assert_eq!(t.poll(false, ms(1)), Gesture::Tap); // released before threshold
+        assert_eq!(t.poll(true, secs(0.0)), Gesture::None); // press-down
+        assert_eq!(t.poll(true, secs(0.05)), Gesture::None); // still held, short
+        assert_eq!(t.poll(false, secs(0.001)), Gesture::Tap); // released before threshold
     }
 
     #[test]
     fn holding_past_the_threshold_fires_hold_started_exactly_once() {
         let mut t = GestureTracker::new();
-        assert_eq!(t.poll(true, ms(0)), Gesture::None);
-        assert_eq!(t.poll(true, ms(100)), Gesture::None); // 100ms, under 220
-        assert_eq!(t.poll(true, ms(150)), Gesture::HoldStarted); // 250ms, crosses
-        // Continuing to hold must NOT re-fire HoldStarted every frame --
-        // this is the property `hold_fired` exists to guarantee, and the
-        // one most likely to regress silently if a future edit reset the
-        // flag somewhere it should not.
-        assert_eq!(t.poll(true, ms(50)), Gesture::None);
-        assert_eq!(t.poll(true, ms(1000)), Gesture::None);
+        assert_eq!(t.poll(true, secs(0.0)), Gesture::None);
+        assert_eq!(t.poll(true, secs(0.10)), Gesture::None); // under threshold
+        assert_eq!(t.poll(true, secs(0.25)), Gesture::HoldStarted); // crosses HOLD_SECONDS (0.32)
+        // Continuing to hold must NOT re-fire HoldStarted every frame.
+        assert_eq!(t.poll(true, secs(0.05)), Gesture::None);
+        assert_eq!(t.poll(true, secs(1.0)), Gesture::None);
     }
 
     #[test]
     fn releasing_after_a_hold_reports_hold_released_not_tap() {
         let mut t = GestureTracker::new();
-        t.poll(true, ms(0));
-        t.poll(true, ms(300)); // crosses threshold -> HoldStarted (ignored here)
-        assert_eq!(t.poll(false, ms(1)), Gesture::HoldReleased);
+        t.poll(true, secs(0.0));
+        t.poll(true, secs(0.40)); // crosses threshold -> HoldStarted (ignored here)
+        assert_eq!(t.poll(false, secs(0.001)), Gesture::HoldReleased);
     }
 
     #[test]
     fn a_second_press_after_a_full_release_starts_fresh() {
-        // The state must not leak between presses -- a tap, then a hold,
-        // must classify independently rather than the second press
-        // inheriting `hold_fired` from the first.
         let mut t = GestureTracker::new();
-        t.poll(true, ms(0));
-        assert_eq!(t.poll(false, ms(50)), Gesture::Tap); // press 1: quick tap
+        t.poll(true, secs(0.0));
+        assert_eq!(t.poll(false, secs(0.05)), Gesture::Tap); // press 1: quick tap
 
-        t.poll(true, ms(0));
-        assert_eq!(t.poll(true, ms(300)), Gesture::HoldStarted); // press 2: a hold
-        assert_eq!(t.poll(false, ms(1)), Gesture::HoldReleased);
+        t.poll(true, secs(0.0));
+        assert_eq!(t.poll(true, secs(0.40)), Gesture::HoldStarted); // press 2: a hold
+        assert_eq!(t.poll(false, secs(0.001)), Gesture::HoldReleased);
     }
 
     #[test]
     fn key_up_with_no_prior_press_is_a_no_op() {
         let mut t = GestureTracker::new();
-        assert_eq!(t.poll(false, ms(16)), Gesture::None);
-        assert_eq!(t.poll(false, ms(16)), Gesture::None);
+        assert_eq!(t.poll(false, secs(0.016)), Gesture::None);
+        assert_eq!(t.poll(false, secs(0.016)), Gesture::None);
     }
 
     #[test]
     fn hold_progress_tracks_the_ratio_and_clamps_at_one() {
         let mut t = GestureTracker::new();
         assert_eq!(t.hold_progress(), 0.0); // key up
-        t.poll(true, ms(0));
+        t.poll(true, secs(0.0));
         assert_eq!(t.hold_progress(), 0.0);
-        t.poll(true, ms(110)); // half of 220ms
+        t.poll(true, secs(HOLD_SECONDS / 2.0));
         assert!((t.hold_progress() - 0.5).abs() < 0.01);
-        t.poll(true, ms(500)); // well past the threshold
+        t.poll(true, secs(2.0)); // well past the threshold
         assert_eq!(t.hold_progress(), 1.0, "must clamp, not overshoot past 1.0");
     }
 
     #[test]
     fn hold_progress_resets_to_zero_after_release() {
         let mut t = GestureTracker::new();
-        t.poll(true, ms(0));
-        t.poll(true, ms(300));
-        t.poll(false, ms(1));
+        t.poll(true, secs(0.0));
+        t.poll(true, secs(0.40));
+        t.poll(false, secs(0.001));
         assert_eq!(t.hold_progress(), 0.0, "released key must not report a stale progress");
     }
 
     #[test]
     fn a_press_landing_exactly_on_the_threshold_counts_as_a_hold() {
-        // Boundary case: `>=`, not `>`, in the poll() comparison -- pinned
-        // explicitly so a future refactor does not flip it to a strict
-        // inequality and silently require one frame longer than the
-        // documented threshold to trigger.
         let mut t = GestureTracker::new();
-        t.poll(true, ms(0));
-        assert_eq!(t.poll(true, HOLD_THRESHOLD), Gesture::HoldStarted);
+        t.poll(true, secs(0.0));
+        assert_eq!(t.poll(true, secs(HOLD_SECONDS)), Gesture::HoldStarted);
+    }
+
+    #[test]
+    fn uses_the_shared_threshold_not_an_independent_one() {
+        // Pins the whole point of this rewrite: the threshold this module
+        // fires HoldStarted at must be cmdstrip's own HOLD_SECONDS, not a
+        // value chosen independently by this file. A press just short of
+        // it must NOT fire; just at or past it must.
+        let mut t = GestureTracker::new();
+        t.poll(true, secs(0.0));
+        assert_eq!(t.poll(true, secs(HOLD_SECONDS - 0.01)), Gesture::None);
+        assert_eq!(t.poll(true, secs(0.01)), Gesture::HoldStarted);
     }
 }

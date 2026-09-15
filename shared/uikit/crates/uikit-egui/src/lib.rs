@@ -141,6 +141,15 @@ pub mod theme_bridge;
 /// unconditional -- unlike voice_popup below, nothing here pulls in a
 /// heavy dependency, so there is no reason to gate it behind a feature.
 pub mod ctrl_p_gesture;
+/// The idle-dwell state machine that replaced hold-duration as Ctrl+P's
+/// voice trigger -- see the module doc for the full flow and why.
+/// `ctrl_p_gesture` above is not removed: it is real, tested, reusable
+/// keyboard-hold infrastructure over `cmdstrip::Hold`, just no longer
+/// what drives voiceterm's own Ctrl+P after this redesign. Left in place
+/// rather than deleted on the chance a future binding wants a hold
+/// gesture specifically -- flagged here rather than left silently
+/// orphaned-looking, since nothing currently calls it.
+pub mod palette_flow;
 /// The voice popup: tap-to-listen, cancel/finish, drawn state. Gated
 /// behind the `voice-popup` feature since it depends on
 /// voice-engine-kit's whisper-rs/cpal -- a real cost most apps using this

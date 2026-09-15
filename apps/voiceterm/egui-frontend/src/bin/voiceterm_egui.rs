@@ -668,19 +668,24 @@ struct VoicetermApp {
     /// True while the foreground looks like it is asking for a secret.
     /// Suppresses echo AND keeps the line out of the audit log.
     password_mode: bool,
-    /// Tap-vs-hold classifier for Ctrl+P (`ctrl_p_gesture.rs`). Replaces
-    /// a bare `i.key_pressed(Key::P)` toggle -- reported as "spamming the
-    /// command palette on/off" when the key is held, because OS-level
-    /// key-repeat (`egui::Event::Key`'s own `repeat: bool` field, already
-    /// known to this fleet -- snapclone's test fixtures construct it
-    /// explicitly) sends the key down again and again while held, and
-    /// `key_pressed` toggled on every one. `GestureTracker::poll` reads
-    /// `key_down` (a continuous, level-based query -- "is it down right
-    /// now") every frame instead of counting discrete press EVENTS, which
-    /// sidesteps the repeat storm regardless of how many repeat events
-    /// the backend sends for one physical hold.
+    /// Ctrl+P's idle-dwell state machine (`palette_flow.rs`): tap opens
+    /// the command palette; pausing without typing settles into voice on
+    /// its own after a dwell (750ms first time, 1500ms after typing has
+    /// pulled it back once this session); Ctrl+P from either open state
+    /// closes. Replaced an earlier hold-duration design (`ctrl_p_gesture`
+    /// below is still real infrastructure, just no longer what drives
+    /// this) after direct design feedback that holding a key felt worse
+    /// than a self-adjusting dwell.
+    palette_flow: uikit_egui::palette_flow::PaletteFlow,
+    /// Kept for other potential hold-gesture bindings -- not currently
+    /// called from anywhere in this binary after the palette_flow
+    /// redesign above. Real, tested infrastructure (a keyboard adapter
+    /// over the shared `cmdstrip::Hold` touch-hold primitive), left in
+    /// place rather than removed on the chance something else wants it.
+    #[allow(dead_code)]
     ctrl_p_gesture: uikit_egui::ctrl_p_gesture::GestureTracker,
-    /// State for the voice popup Ctrl+P-held opens (Surface::Voice).
+    /// State for the voice popup Ctrl+P opens (via palette_flow's
+    /// SwitchedToVoice transition).
     voice_popup: uikit_egui::voice_popup::VoicePopup,
     /// Promotion thresholds for the acoustic cache — the runtime knobs the
     /// original exposes, here on the Docs tab beside the corpus tape that
@@ -3206,49 +3211,94 @@ impl eframe::App for VoicetermApp {
         // palette" — the eleven-tab switcher's replacement, and the reason the
         // rail only needs to carry tabs.
         //
-        // Was a bare `i.key_pressed(Key::P)` toggle — reported as
-        // "spamming the command palette on/off" while the key is held.
-        // egui's `Event::Key` carries a `repeat: bool` field (this fleet
-        // already knows about it — snapclone's own test fixtures
-        // construct it explicitly), and OS-level key-repeat sends the
-        // key down again and again while physically held; `key_pressed`
-        // toggled on every one of those repeats, not just the first.
+        // Redesigned twice this session. First: a bare `i.key_pressed
+        // (Key::P)` toggle, reported as "spamming the command palette
+        // on/off" while the key is held (OS-level key-repeat sends the
+        // key down again and again while physically held, and
+        // `key_pressed` toggled on every one). Second: a hold-duration
+        // gesture (hold Ctrl+P to trigger voice) -- replaced again after
+        // direct design feedback, in favor of the idle-dwell flow below:
+        // tap once to open (always the palette), then just PAUSE without
+        // typing and it settles into listening on its own. No key to
+        // hold, no timing to get right with a hand on the keyboard.
         //
-        // Routed through `GestureTracker` instead: it reads `key_down` (a
-        // continuous, level-based "is it down right now" query) every
-        // frame rather than counting discrete press EVENTS, so the number
-        // of repeat events the backend happens to send for one physical
-        // hold no longer matters. This also finishes the Ctrl+P-hold ->
-        // voice ask from the same session: a quick tap still toggles the
-        // palette exactly as before; a hold past the threshold opens the
-        // voice popup instead.
-        let (ctrl_p_down, dt) = ctx.input(|i| {
-            (i.modifiers.command && i.key_down(egui::Key::P), i.stable_dt)
+        // The repeat-spam bug's fix still applies here, explicitly:
+        // `ctrl_p_tapped()` must fire once per PHYSICAL press, not once
+        // per repeat event, so the raw event is checked for `repeat:
+        // false` directly rather than using `key_pressed` (whose
+        // repeat-inclusion was never fully certain) or `key_down` (a
+        // continuous state, wrong primitive for a discrete "was this
+        // just pressed" question).
+        let ctrl_p_pressed = ctx.input(|i| {
+            i.events.iter().any(|e| matches!(
+                e,
+                egui::Event::Key { key: egui::Key::P, pressed: true, repeat: false, modifiers, .. }
+                    if modifiers.command
+            ))
         });
-        match self.ctrl_p_gesture.poll(ctrl_p_down, std::time::Duration::from_secs_f32(dt)) {
-            uikit_egui::ctrl_p_gesture::Gesture::Tap => {
-                self.surfaces.toggle(Surface::Palette);
-                self.palette_query.clear();
-                self.palette_sel = 0;
-            }
-            uikit_egui::ctrl_p_gesture::Gesture::HoldStarted => {
-                if self.voice_popup.start(self.password_mode) {
-                    self.surfaces.open(Surface::Voice);
+        if ctrl_p_pressed {
+            match self.palette_flow.ctrl_p_tapped() {
+                uikit_egui::palette_flow::Transition::Opened => {
+                    self.surfaces.open(Surface::Palette);
+                    self.palette_query.clear();
+                    self.palette_sel = 0;
                 }
-                // `start` returning false (password mode active) opens
-                // nothing — the popup was designed to refuse silently at
-                // this layer (see voice_popup.rs's own doc); a toast or
-                // other visible refusal is a real gap, not solved here.
+                uikit_egui::palette_flow::Transition::Closed(uikit_egui::palette_flow::Mode::Command) => {
+                    self.surfaces.close_if(Surface::Palette);
+                }
+                uikit_egui::palette_flow::Transition::Closed(uikit_egui::palette_flow::Mode::Voice) => {
+                    // Closing OUT of Voice mode via Ctrl+P (not by typing
+                    // -- that path is handled below) drops whatever was
+                    // being captured, the same way Escape/backdrop-click
+                    // already do for every other surface.
+                    self.surfaces.close_if(Surface::Voice);
+                    self.voice_popup.cancel();
+                }
+                _ => {}
             }
-            uikit_egui::ctrl_p_gesture::Gesture::HoldReleased => {
-                // Releasing the held key ends the utterance, the same
-                // shape a push-to-talk key has — `finish()` keeps the
-                // audio and proceeds to transcription rather than
-                // dropping it the way `cancel()` would.
-                self.voice_popup.finish();
-            }
-            uikit_egui::ctrl_p_gesture::Gesture::None => {}
         }
+
+        // Typing while the palette is open in Voice mode means "I
+        // changed my mind about speaking" -- switch back to Command and
+        // drop the in-flight capture. Checked via the raw Text events
+        // rather than diffing `palette_query`'s length, since a paste or
+        // an IME commit should count as "typing" too, the same events
+        // `palette_ui`'s own TextEdit already consumes without these
+        // being removed from `i.events` first (egui does not consume
+        // Text events on read the way a pointer click's Response can).
+        let typed_this_frame = ctx.input(|i| {
+            i.events.iter().any(|e| matches!(e, egui::Event::Text(_)))
+        });
+        if typed_this_frame
+            && self.palette_flow.on_type() == uikit_egui::palette_flow::Transition::SwitchedToCommand
+        {
+            self.surfaces.close_if(Surface::Voice);
+            self.surfaces.open(Surface::Palette);
+            self.voice_popup.cancel();
+        }
+
+        // Advance the idle-dwell timer. Only has an effect while the
+        // flow is in Command mode (see palette_flow's own doc); a no-op
+        // otherwise, safe to call unconditionally every frame.
+        let dt_ms = ctx.input(|i| i.stable_dt) * 1000.0;
+        if self.palette_flow.tick(dt_ms) == uikit_egui::palette_flow::Transition::SwitchedToVoice {
+            if self.voice_popup.start(self.password_mode) {
+                self.surfaces.close_if(Surface::Palette);
+                self.surfaces.open(Surface::Voice);
+            } else {
+                // Password mode refused the start -- the flow already
+                // moved to Voice, but nothing is actually listening.
+                // `voice_refused()` steps it straight back to Command
+                // (named for this reason, sharing on_type's real effect
+                // rather than the flow staying stuck showing a voice
+                // popup that will never produce a result). A visible
+                // refusal toast is a real gap, not solved here (matches
+                // the same gap noted when this trigger was still
+                // hold-based).
+                self.palette_flow.voice_refused();
+            }
+        }
+
         let open_t = overlay::openness(ctx, Surface::Palette, self.surfaces.is(Surface::Palette));
         if open_t > 0.0 {
             self.palette_ui(ctx, open_t);
@@ -3264,9 +3314,15 @@ impl eframe::App for VoicetermApp {
             // immediately, matching the Qt build's own voice_cancel
             // behavior; a backdrop click or Esc via the Modal (`.closed`
             // from `overlay::show`) closes it the same way every other
-            // surface already does.
+            // surface already does. Either path routes back through
+            // palette_flow so its own state stays in sync with what is
+            // actually on screen.
             if close_now {
                 self.surfaces.close_if(Surface::Voice);
+                if self.palette_flow.mode() == uikit_egui::palette_flow::Mode::Voice {
+                    self.palette_flow.ctrl_p_tapped(); // Voice -> Off
+                }
+                self.voice_popup.cancel();
             }
         }
 
@@ -6311,6 +6367,7 @@ fn main() -> eframe::Result<()> {
                 audit: Default::default(),
                 audit_lines: Vec::new(),
                 password_mode: false,
+                palette_flow: Default::default(),
                 ctrl_p_gesture: Default::default(),
                 voice_popup: Default::default(),
                 acoustic: Default::default(),
