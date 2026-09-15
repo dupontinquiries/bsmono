@@ -35,6 +35,52 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
     if ctx.input(|i| i.key_pressed(egui::Key::F2)) {
         state.show_loop_pane = !state.show_loop_pane;
     }
+
+    // Ctrl+P's idle-dwell voice trigger -- same `palette_flow` state
+    // machine voiceterm-egui uses. Aperture has no separate typed-search
+    // "Command" surface the way voiceterm does (no palette.rs/vocabulary
+    // here), so `Mode::Command` has no drawer of its own to show or hide
+    // -- it is purely "armed, counting down," visible only through the
+    // mic indicator in the status bar below. This is actually a GOOD fit
+    // for an editor rather than a compromise: the person is typing in
+    // their FILE the whole time they use this app, so "any keystroke
+    // resets the dwell" reads naturally as "do not interrupt active
+    // editing with a mic switching on," not as a workaround for a
+    // missing search box.
+    //
+    // repeat: false filtered explicitly, same reason voiceterm-egui's own
+    // fix needed it: OS-level key-repeat sends the key down again and
+    // again while physically held, and a naive key_pressed would toggle
+    // on every one.
+    let ctrl_p_pressed = ctx.input(|i| {
+        i.events.iter().any(|e| matches!(
+            e,
+            egui::Event::Key { key: egui::Key::P, pressed: true, repeat: false, modifiers, .. }
+                if modifiers.command
+        ))
+    });
+    if ctrl_p_pressed {
+        if let uikit_egui::palette_flow::Transition::Closed(uikit_egui::palette_flow::Mode::Voice)
+            = state.palette_flow.ctrl_p_tapped()
+        {
+            state.voice_popup.cancel();
+        }
+    }
+    let typed_this_frame = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(_))));
+    if typed_this_frame
+        && state.palette_flow.on_type() == uikit_egui::palette_flow::Transition::SwitchedToCommand
+    {
+        state.voice_popup.cancel();
+    }
+    if state.palette_flow.tick(dt * 1000.0) == uikit_egui::palette_flow::Transition::SwitchedToVoice
+        && !state.voice_popup.start(false) // aperture has no password-mode concept
+    {
+        state.palette_flow.voice_refused();
+    }
+    if state.palette_flow.mode() == uikit_egui::palette_flow::Mode::Voice {
+        state.voice_popup.tick();
+    }
+
     state.poll_completions(now_ms);
     state.poll_lsp(now_ms);
     state.poll_note();
@@ -1163,6 +1209,51 @@ fn status_bar(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, now_ms:
         // sides drew on top of each other instead of one giving way.
         let room = ui.available_width();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // The mic indicator, rightmost -- drawn only while the flow is
+            // actually armed or listening, so an aperture user who never
+            // touches Ctrl+P sees no change to this bar at all. First in
+            // this right-to-left closure so it lands at the true right
+            // edge, matching how a status/notification icon usually sits.
+            if state.palette_flow.mode() != uikit_egui::palette_flow::Mode::Off {
+                let warming = state.palette_flow.dwell_progress();
+                let listening = state.palette_flow.mode() == uikit_egui::palette_flow::Mode::Voice;
+                let dt = ui.ctx().input(|i| i.stable_dt);
+                if state.mic_indicator.draw(ui, colors, warming, listening, dt)
+                    == uikit_egui::mic_indicator::MicAction::ForceOff
+                {
+                    if let uikit_egui::palette_flow::Transition::Closed(uikit_egui::palette_flow::Mode::Voice)
+                        = state.palette_flow.force_off()
+                    {
+                        state.voice_popup.cancel();
+                    }
+                }
+                // The banner-plus-expansion shape from earlier design
+                // discussion: while actually listening/transcribing/
+                // showing a result, the status bar's OWN row grows a
+                // label to the left of the icon rather than opening a
+                // second panel -- this bar is already the "permanent
+                // banner"; showing more content in it IS the expansion,
+                // using egui's ordinary layout growth rather than a
+                // separate height-animation system voiceterm's
+                // Surface/overlay has and aperture does not.
+                if listening {
+                    match &state.voice_popup.stage {
+                        uikit_egui::voice_popup::Stage::Listening => {
+                            ui.label(egui::RichText::new("listening…").color(colors.text_weak));
+                        }
+                        uikit_egui::voice_popup::Stage::Transcribing => {
+                            ui.spinner();
+                            ui.label(egui::RichText::new("thinking…").color(colors.text_weak));
+                        }
+                        uikit_egui::voice_popup::Stage::Done { text } => {
+                            ui.label(egui::RichText::new(text.as_str()).color(colors.text));
+                        }
+                        uikit_egui::voice_popup::Stage::Error { message } => {
+                            ui.label(egui::RichText::new(message.as_str()).color(colors.danger));
+                        }
+                    }
+                }
+            }
             if let Some((msg, until)) = &state.status {
                 if now_ms < *until {
                     ui.label(egui::RichText::new(msg.clone()).color(colors.accent));

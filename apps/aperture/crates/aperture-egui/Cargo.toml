@@ -48,7 +48,7 @@ aperture-complete = { workspace = true }
 aperture-lsp = { workspace = true }
 aperture-engine = { workspace = true }
 egui = { workspace = true }
-uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
+uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui", features = ["voice-popup"] }
 snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../../shared/settings-kit" }
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }

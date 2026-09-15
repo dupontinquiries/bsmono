@@ -254,6 +254,18 @@ pub struct AppState {
     pub lang: Language,
     pub syntax: Syntax,
     pub find: Option<FindState>,
+    /// Ctrl+P's idle-dwell flow (tap opens the palette/status expansion,
+    /// pausing without typing settles into voice) -- same shared
+    /// `uikit_egui::palette_flow` voiceterm-egui uses, so the two apps
+    /// feel identical rather than each guessing a timing.
+    pub palette_flow: uikit_egui::palette_flow::PaletteFlow,
+    /// Voice capture/transcription state, drawn as an expansion of the
+    /// existing status bar rather than a new panel -- see `status_bar`'s
+    /// own doc for why aperture (no `Surface`/`overlay` system) hosts
+    /// this differently than voiceterm does.
+    pub voice_popup: uikit_egui::voice_popup::VoicePopup,
+    /// The "about to switch on"/"listening" badge, with hold-to-cancel.
+    pub mic_indicator: uikit_egui::mic_indicator::MicIndicator,
     /// impakt-cam mode: the camera keeps the caret centered (dead zone +
     /// snap horizon live in `camera::Follow`). The view applies it only when
     /// the caret LINE changed, so wheel-browsing is free until you type.
@@ -570,6 +582,9 @@ impl AppState {
             lang,
             syntax: Syntax::new(lang),
             find: None,
+            palette_flow: Default::default(),
+            voice_popup: Default::default(),
+            mic_indicator: Default::default(),
             follow_mode: false,
             typewriter_mode: false,
             caret: crate::camera::CaretPolicy::default(),
