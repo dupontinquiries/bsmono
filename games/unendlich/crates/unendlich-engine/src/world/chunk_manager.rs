@@ -1901,15 +1901,33 @@ impl ChunkManager {
 
                 // r239 (mesh-vision-sched): vision-driven mesh gate. Build the
                 // player view cone and DEFER chunks no cone needs (behind the
-                // player / out of range). CONSERVATIVE first pass: occlusion is
-                // OFF (always false), so we only skip clearly-unseen chunks —
-                // never an in-view one — which can't produce an unmeshed hole
-                // in front of the player. (The occlusion-backed cave win is a
-                // follow-up once a line-of-sight source is wired; see
-                // docs/design/mesh_vision_scheduling.md.) A deferred chunk's
-                // voxels still load — only its MESH is skipped — and it
-                // re-enters this walk (and meshes) once the player turns toward
-                // it, since this runs every update.
+                // player / out of range). A deferred chunk's voxels still
+                // load — only its MESH is skipped — and it re-enters this
+                // walk (and meshes) once the player turns toward it, since
+                // this runs every update.
+                //
+                // r-mesh-vision-occlusion: occlusion is now real, not the
+                // permanently-false stub this shipped with. This is exactly
+                // the follow-up docs/design/mesh_vision_scheduling.md named
+                // as unblocking "the occlusion-backed cave win": a
+                // deterministic voxel raycast (sim::vision::line_of_sight,
+                // the same primitive already wired and tested for creature
+                // vision a few commits ago) from the player's eye to the
+                // chunk center, through self.drone_view() -- the existing
+                // "read-only, Send view... for off-thread work" accessor,
+                // cheap (Arc::clone) to obtain per call. Correctness note
+                // from that module's own "Risks/honesty" section: a WRONG
+                // defer shows the player an unmeshed hole, so the predicate
+                // must be conservative (when unsure, don't defer) -- this
+                // uses a real, tested LOS check, not a heuristic guess, so
+                // it can only correctly identify genuinely-blocked chunks;
+                // it never adds a false-occluded case beyond what the old
+                // always-false stub already couldn't produce (that stub
+                // could only ever UNDER-defer, never over-defer, and this
+                // change preserves that: a clear line of sight still means
+                // not-occluded exactly as before, this only adds the
+                // occluded=true case for chunks genuinely blocked by solid
+                // voxels in between).
                 #[cfg(feature = "mesh-vision-sched")]
                 {
                     use crate::sim::mesh_vision::{urgency_for_cones, MeshUrgency, ViewCone};
@@ -1928,9 +1946,16 @@ impl ChunkManager {
                     // range in blocks ≈ render distance (shells) × chunk size.
                     let range = (rd.max(1) * CHUNK_SIZE) as f32;
                     let cone = ViewCone::player(eye, self.player_view_yaw, range);
-                    // occlusion OFF for now (conservative): never defer an
-                    // in-view chunk.
-                    let urgency = urgency_for_cones(&[cone], cc, |_, _| false);
+                    let occlusion_view = self.drone_view();
+                    let urgency = urgency_for_cones(&[cone], cc, |_cone_idx, target| {
+                        use crate::sim::fixed::{Fixed, Vec3};
+                        let to_fixed3 = |p: [f32; 3]| Vec3::new(
+                            Fixed::from_f64(p[0] as f64),
+                            Fixed::from_f64(p[1] as f64),
+                            Fixed::from_f64(p[2] as f64),
+                        );
+                        !crate::sim::vision::line_of_sight(to_fixed3(eye), to_fixed3(target), &occlusion_view)
+                    });
                     if urgency == MeshUrgency::Defer {
                         // not needed by the cone — skip meshing this pass.
                         *counter -= 1; // don't spend budget on a deferred chunk
