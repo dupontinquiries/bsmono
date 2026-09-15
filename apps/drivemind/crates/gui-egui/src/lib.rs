@@ -272,3 +272,34 @@ fn tab_advise(ui: &mut Ui, st: &mut ShellState, colors: &uikit_egui::PaletteColo
         ui.add_space(6.0);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attach_label_covers_every_variant_with_a_distinct_string() {
+        // The one genuinely pure function in this file -- everything
+        // else takes `ui: &mut Ui` and needs a real rendering context
+        // (egui_kittest + a Vulkan/lavapipe backend, per this session's
+        // earlier aperture/voiceterm work) to exercise meaningfully,
+        // which isn't available here. This file had zero tests before
+        // this. A trivial lookup table, but an exhaustive match still
+        // benefits from confirming no two variants accidentally share a
+        // label (a copy-paste mistake in a match arm is easy to make and
+        // easy to miss on a quick read).
+        let labels = [
+            attach_label(Attach::NativeNvme),
+            attach_label(Attach::NativeSata),
+            attach_label(Attach::UsbBridge),
+            attach_label(Attach::Virtual),
+            attach_label(Attach::Unknown),
+        ];
+        let mut sorted = labels.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "every Attach variant must get its own distinct label: {labels:?}");
+        assert_eq!(attach_label(Attach::NativeNvme), "NVMe");
+        assert_eq!(attach_label(Attach::UsbBridge), "USB bridge");
+    }
+}
