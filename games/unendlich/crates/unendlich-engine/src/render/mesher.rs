@@ -3403,13 +3403,13 @@ fn top_subdivision() -> i32 {
 /// multiplier via its square root (a 0.15 triangle-scale needs nsub
 /// scaled by ~0.39, since 0.39^2 ~= 0.15, to land back on the intended
 /// triangle reduction). Same player-view snapshot as plants
-/// (`player_view_for_plant_lod` -- despite the name this is now a
-/// general "current player view for chunk-decoration LOD" cache;
-/// renaming it is a reasonable follow-up, not done here to keep each
-/// commit to the one thing it's for).
+/// (`player_view_for_decoration_lod`, renamed from
+/// `player_view_for_plant_lod` once this consumer made the old name
+/// inaccurate -- see git history for the plant-only version this started
+/// as).
 fn top_subdivision_for_block(pos: [f32; 3]) -> i32 {
     let base = top_subdivision();
-    let Some((eye, yaw)) = player_view_for_plant_lod::get() else {
+    let Some((eye, yaw)) = player_view_for_decoration_lod::get() else {
         return base;
     };
     let cone = crate::sim::mesh_vision::ViewCone::player(eye, yaw, DECORATION_LOD_RANGE);
@@ -3469,8 +3469,8 @@ fn max_plant_stamps_per_chunk() -> u32 {
 // baking elsewhere in this same request. Same AtomicU32-encoded-float
 // pattern already used for cross-thread gain automation in audio.rs's
 // StemGroup (no new dependency, no locking, updated once per frame from the
-// main thread, read at most once per plant-stamping pass on a worker
-// thread).
+// main thread, read at most once per plant-stamping or weathered-top-
+// subdivision call on a worker thread).
 /// r-plant-lod-vector / r-subdivision-lod-vector: shared cone range for
 /// both chunk-decoration LOD consumers (plant stamping and weathered-top
 /// subdivision). Deliberately independent of render distance -- decoration
@@ -3478,7 +3478,7 @@ fn max_plant_stamps_per_chunk() -> u32 {
 /// far the world itself renders.
 const DECORATION_LOD_RANGE: f32 = 100.0;
 
-mod player_view_for_plant_lod {
+mod player_view_for_decoration_lod {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     static EYE_X: AtomicU32 = AtomicU32::new(0);
@@ -3560,7 +3560,7 @@ mod player_view_for_plant_lod {
 
 /// r-plant-lod-vector: compute the effective plant stamp budget for one
 /// chunk, given the current player view (if any has been published via
-/// `player_view_for_plant_lod::set`). Falls back to the flat
+/// `player_view_for_decoration_lod::set`). Falls back to the flat
 /// `max_plant_stamps_per_chunk()` -- unscaled, exactly this feature's
 /// pre-existing behavior -- when no player view is available (tests,
 /// headless tools, or simply the very first chunks meshed before the main
@@ -3575,7 +3575,7 @@ mod player_view_for_plant_lod {
 /// further regardless of how far the world itself renders.
 fn plant_stamp_budget_for_chunk(chunk_center: [f32; 3]) -> u32 {
     let base = max_plant_stamps_per_chunk();
-    let Some((eye, yaw)) = player_view_for_plant_lod::get() else {
+    let Some((eye, yaw)) = player_view_for_decoration_lod::get() else {
         return base;
     };
     let cone = crate::sim::mesh_vision::ViewCone::player(eye, yaw, DECORATION_LOD_RANGE);
@@ -3592,12 +3592,12 @@ fn plant_stamp_budget_for_chunk(chunk_center: [f32; 3]) -> u32 {
 
 /// r-plant-lod-vector: publish the player's current eye position and yaw
 /// for `plant_stamp_budget_for_chunk` to read on meshing worker threads.
-/// Call once per frame from the main loop; see `player_view_for_plant_lod`'s
+/// Call once per frame from the main loop; see `player_view_for_decoration_lod`'s
 /// own doc for why this is a lock-free snapshot rather than a threaded
 /// parameter. Safe to never call at all (plant stamping simply stays at the
 /// flat, unscaled budget it always used before this feature existed).
-pub fn set_player_view_for_plant_lod(eye: [f32; 3], yaw: f32) {
-    player_view_for_plant_lod::set(eye, yaw);
+pub fn set_player_view_for_decoration_lod(eye: [f32; 3], yaw: f32) {
+    player_view_for_decoration_lod::set(eye, yaw);
 }
 
 
@@ -5049,7 +5049,7 @@ mod tests {
     /// player gets a smaller plant budget than one directly AHEAD, at the
     /// exact same distance. Isolates plant_stamp_budget_for_chunk directly
     /// rather than running a full mesh_chunk_greedy through
-    /// decorate_chunk_styled: this global (player_view_for_plant_lod) is
+    /// decorate_chunk_styled: this global (player_view_for_decoration_lod) is
     /// process-wide state shared with other tests that assert exact
     /// plant_stamps counts against the flat, unscaled default (e.g.
     /// plant_budget_does_not_affect_chunks_under_the_cap above) and Rust's
@@ -5059,23 +5059,23 @@ mod tests {
     /// with those tests rather than holding it open for a full mesh pass.
     #[test]
     fn plant_budget_scales_by_facing_not_just_distance() {
-        player_view_for_plant_lod::reset_for_test();
+        player_view_for_decoration_lod::reset_for_test();
 
         let chunk_center = [16.0, 16.0, 16.0]; // ChunkCoord(0,0,0)'s center
         let eye = [16.0, 16.0, -14.0]; // 30 blocks from chunk_center on -Z
 
         // Facing +Z (toward the chunk, horiz_angle(eye, chunk_center) = PI/2):
         // the chunk is directly ahead, well within range -> Now -> full scale.
-        player_view_for_plant_lod::set(eye, std::f32::consts::FRAC_PI_2);
+        player_view_for_decoration_lod::set(eye, std::f32::consts::FRAC_PI_2);
         let ahead_budget = plant_stamp_budget_for_chunk(chunk_center);
 
         // Facing -Z (directly away): the SAME chunk, at the SAME distance,
         // is now directly behind the player -> Defer -> reduced scale. Only
         // the facing changed between these two calls.
-        player_view_for_plant_lod::set(eye, -std::f32::consts::FRAC_PI_2);
+        player_view_for_decoration_lod::set(eye, -std::f32::consts::FRAC_PI_2);
         let behind_budget = plant_stamp_budget_for_chunk(chunk_center);
 
-        player_view_for_plant_lod::reset_for_test();
+        player_view_for_decoration_lod::reset_for_test();
 
         assert!(
             behind_budget < ahead_budget,
@@ -5088,11 +5088,11 @@ mod tests {
 
     #[test]
     fn plant_budget_falls_back_to_flat_default_with_no_player_view_published() {
-        // Regression guard: if nothing ever calls set_player_view_for_plant_lod
+        // Regression guard: if nothing ever calls set_player_view_for_decoration_lod
         // (tests, headless tools, or simply before the main loop's first
         // frame), behavior must be identical to before this feature existed
         // -- the flat, unscaled max_plant_stamps_per_chunk() value.
-        player_view_for_plant_lod::reset_for_test();
+        player_view_for_decoration_lod::reset_for_test();
         let chunk_center = [16.0, 16.0, 16.0];
         assert_eq!(
             plant_stamp_budget_for_chunk(chunk_center),
@@ -5107,18 +5107,18 @@ mod tests {
     /// doc): calls only the pure function, resets before and after.
     #[test]
     fn subdivision_scales_by_facing_not_just_distance() {
-        player_view_for_plant_lod::reset_for_test();
+        player_view_for_decoration_lod::reset_for_test();
 
         let block_pos = [16.0, 16.0, 16.0];
         let eye = [16.0, 16.0, -14.0]; // 30 blocks away on -Z, same as the plant test
 
-        player_view_for_plant_lod::set(eye, std::f32::consts::FRAC_PI_2); // facing toward it
+        player_view_for_decoration_lod::set(eye, std::f32::consts::FRAC_PI_2); // facing toward it
         let ahead_nsub = top_subdivision_for_block(block_pos);
 
-        player_view_for_plant_lod::set(eye, -std::f32::consts::FRAC_PI_2); // facing away
+        player_view_for_decoration_lod::set(eye, -std::f32::consts::FRAC_PI_2); // facing away
         let behind_nsub = top_subdivision_for_block(block_pos);
 
-        player_view_for_plant_lod::reset_for_test();
+        player_view_for_decoration_lod::reset_for_test();
 
         assert!(
             behind_nsub < ahead_nsub,
@@ -5130,7 +5130,7 @@ mod tests {
 
     #[test]
     fn subdivision_falls_back_to_flat_default_with_no_player_view_published() {
-        player_view_for_plant_lod::reset_for_test();
+        player_view_for_decoration_lod::reset_for_test();
         let block_pos = [16.0, 16.0, 16.0];
         assert_eq!(
             top_subdivision_for_block(block_pos),
