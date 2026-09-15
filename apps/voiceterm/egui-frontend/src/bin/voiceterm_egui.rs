@@ -16,7 +16,7 @@ use voiceterm_egui::action_compass::ActionCompass;
 use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, link_dispatch, link_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, tab_dispatch, tab_menu, tab_slide_menu, BlockAction, LinkAction, PaneAction};
 use voiceterm_egui::surface::{Surface, Surfaces};
 use voiceterm_egui::overlay;
-use voiceterm_egui::shell::{blocks_drawer_ui, fab_rect, keycap_bar_ui, load_prefs, mic_fab_ui, overflow_counts, paint_terminal_border, save_prefs, settings_panel, tab_row, theme_menu, PaneView, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
+use voiceterm_egui::shell::{blocks_drawer_ui, fab_rect, keycap_bar_ui, load_prefs, mic_fab_ui, overflow_counts, paint_terminal_border, save_prefs, settings_panel, summary_menu, tab_row, theme_menu, PaneView, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
 use voiceterm_egui::slide_menu::SlideOutcome;
 use uikit_egui::PaletteColors;
 use voiceterm_egui::App;
@@ -562,6 +562,8 @@ struct VoicetermApp {
     /// baseline identity.
     theme: snapclone_theme::PaletteId,
     theme_menu: voiceterm_egui::slide_menu::SlideMenu,
+    /// The Off/Terminal/Web/Full picker, moved off the always-visible bar.
+    summary_menu: voiceterm_egui::slide_menu::SlideMenu,
     /// Command blocks (QML blocksDrawer): tracked from what the demo feeds; the
     /// left-edge drawer shows when `surfaces` says `Surface::Blocks`.
     /// Reads the shell's cwd out of the pty stream. See `osc7`.
@@ -2465,8 +2467,18 @@ impl eframe::App for VoicetermApp {
                         }
                     }
                 });
-                for sc in voiceterm_egui::summary_scope::Scope::ALL {
-                    if ui.selectable_label(self.summary_scope == sc, sc.label()).clicked() {
+                // Was a permanent row of 4 selectable_label buttons -- one
+                // of the always-on rows crowding a mobile bar that also has
+                // to share the screen with a software keyboard on a 7"
+                // device. Made rarely, not every frame it was costing
+                // space, so it moves behind a toolbar icon, matching the
+                // theme picker's own show_hybrid pattern exactly (tap or
+                // hold, same host response).
+                let summary_host = ui.button(format!("\u{1F4CB} {}", self.summary_scope.label()));
+                if let voiceterm_egui::slide_menu::SlideOutcome::Selected(id, _) =
+                    self.summary_menu.show_hybrid(ui, &summary_host, &summary_menu())
+                {
+                    if let Some(sc) = voiceterm_egui::summary_scope::Scope::from_label(&id) {
                         self.summary_scope = sc;
                     }
                 }
@@ -6363,6 +6375,7 @@ fn main() -> eframe::Result<()> {
 
                 theme: boot_theme,
                 theme_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-theme-menu").columns(3).hold(0.35).item_size(64.0),
+                summary_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-summary-menu").columns(2),
                 blocks,
                 line_buf: Default::default(),
                 tabbar_scroll_to: None,

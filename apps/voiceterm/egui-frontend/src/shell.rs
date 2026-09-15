@@ -521,6 +521,21 @@ pub fn theme_menu() -> Vec<uikit_egui::slide_menu::SlideOption> {
         .collect()
 }
 
+// ── summary scope picker (moved off the always-visible bar, C18_TODO "mobile crowding") ─────
+
+/// The Off/Terminal/Web/Full choice, as a SlideMenu grid instead of a
+/// permanent row of selectable_label buttons -- one of the always-on rows
+/// crowding the mobile bar (a 7" screen plus a software keyboard leaves very
+/// little room, and this choice is made rarely, not every frame it was
+/// costing space). Same shape as `theme_menu` right above: one cell per
+/// enum value, id round-trips via `Scope::from_label`.
+pub fn summary_menu() -> Vec<uikit_egui::slide_menu::SlideOption> {
+    crate::summary_scope::Scope::ALL
+        .iter()
+        .map(|s| uikit_egui::slide_menu::SlideOption::new(s.label(), s.label()))
+        .collect()
+}
+
 // ── workspace tab sidebar (QML vTabBar, v0.1.796) ────────────────────────────
 
 /// One workspace tab in the vertical tab sidebar. `fence_after` draws the accent divider under

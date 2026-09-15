@@ -40,6 +40,13 @@ impl Scope {
         }
     }
 
+    /// The inverse of `label` -- for round-tripping through a `SlideOption`
+    /// id, matching `PaletteId::from_str`'s own precedent rather than an
+    /// ad hoc string match at each call site.
+    pub fn from_label(s: &str) -> Option<Scope> {
+        Self::ALL.into_iter().find(|sc| sc.label() == s)
+    }
+
     /// Does the terminal-block path run?
     pub fn terminal_enabled(self) -> bool {
         matches!(self, Scope::Terminal | Scope::Full)
