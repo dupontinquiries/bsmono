@@ -82,8 +82,23 @@ pub fn candidate_roots(
         // three. Bounded rather than walking to `/`: past a handful of levels
         // a match is coincidence, and matching some unrelated `assets/` on the
         // way to the filesystem root is worse than reporting a miss.
+        //
+        // The bound alone does not keep this promise for a SHORT base
+        // (`/tmp`, one level deep): its only ancestor already IS `/`, so
+        // `.take(6)` happily takes the one it has. That pushes `/` early,
+        // and the later dedup (keeps the FIRST occurrence) then steals the
+        // slot the manifest's own ancestor walk expects to fill at the
+        // very end -- confirmed against `the_executables_directory_is_
+        // searched_and_the_manifest_is_last`'s own real failure, which
+        // used exactly a one-level `cwd` (`/tmp`) as its input. Filtering
+        // the literal root out of THIS loop (not the manifest's, a few
+        // lines down, where reaching root is the intended trailing
+        // fallback) is what the comment above already promised, just not
+        // what the code did for a short enough base.
         for anc in base.ancestors().skip(1).take(6) {
-            out.push(anc.to_path_buf());
+            if anc != std::path::Path::new("/") {
+                out.push(anc.to_path_buf());
+            }
         }
     }
     out.push(manifest_dir.to_path_buf());

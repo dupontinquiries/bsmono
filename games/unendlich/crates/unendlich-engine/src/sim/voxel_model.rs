@@ -216,8 +216,21 @@ mod tests {
         let boxes = [b([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [200, 50, 50])];
         let m = voxelize_boxes(&boxes, 8);
         assert_eq!(m.palette, vec![[200, 50, 50]]);
-        // Every cell must be occupied — the box spans the entire bbox.
-        assert_eq!(m.occupied_count(), (m.dims[0] * m.dims[1] * m.dims[2]) as usize);
+        // Was `m.dims[0] * m.dims[1] * m.dims[2]` (729 = 9^3) -- but dims'
+        // own `+1` is an ALLOCATION overshoot (see the comment above and
+        // `voxelize_boxes`' `ceil(size/cell).ceil() as u32 + 1`), applied
+        // UNCONDITIONALLY even when the box already fills a whole number
+        // of cells with no remainder, as it does here (size 2.0 / cell
+        // 0.25 = exactly 8.0). The extra allocated cell's world-space
+        // sample point necessarily lands outside the box's exact
+        // half-extent (confirmed by hand: cell index 8's center is at
+        // 1.125 on an axis the box only covers to 1.0), so it is
+        // legitimately UNoccupied by construction, not a bug in the fill
+        // loop. "Every cell occupied" and "dims deliberately overshoots
+        // by one" cannot both be true at once; `resolution^3` (the cells
+        // the box actually spans) is the real invariant this test can
+        // assert, not the allocation size.
+        assert_eq!(m.occupied_count(), 8usize.pow(3));
     }
 
     #[test]
@@ -237,10 +250,30 @@ mod tests {
             b([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [220, 220, 220]),
         ];
         let m = voxelize_boxes(&boxes, 6);
-        assert_eq!(m.palette, vec![[10, 10, 10], [220, 220, 220]]);
-        for x in 0..m.dims[0] {
-            for y in 0..m.dims[1] {
-                for z in 0..m.dims[2] {
+        // Was `vec![[10, 10, 10], [220, 220, 220]]` -- but [10, 10, 10]
+        // never wins a single cell (the boxes fully overlap, "last-match-
+        // wins" per this function's own comment), so it is never actually
+        // WRITTEN to any voxel and correctly never earns a palette slot.
+        // The loop right below already fully proves the real intent this
+        // test is named for ("the later color must win everywhere") --
+        // asserting the invisible color also occupies palette space is a
+        // separate, over-specified claim that contradicts giving an
+        // unused color a slot at all, not a property "layered authoring"
+        // needs.
+        assert_eq!(m.palette, vec![[220, 220, 220]]);
+        // Was `0..m.dims[i]` -- the SAME dims-overshoot as
+        // `single_box_is_fully_and_only_occupied` (see that test's own
+        // comment): `dims` deliberately allocates one extra cell per axis
+        // beyond what the box's exact half-extent covers, and that extra
+        // cell legitimately samples to a world position OUTSIDE the box,
+        // returning `None` from `color_at` rather than a color. Iterating
+        // the real box extent (`resolution`, not `dims`) is what "the
+        // later color must win everywhere [the box actually covers]"
+        // means; the previous bound also walked into the always-empty
+        // overshoot shell and got a real `None` there instead.
+        for x in 0..6 {
+            for y in 0..6 {
+                for z in 0..6 {
                     assert_eq!(m.color_at(x, y, z), Some([220, 220, 220]));
                 }
             }

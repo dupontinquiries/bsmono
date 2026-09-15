@@ -1627,11 +1627,30 @@ mod tests {
         let (rig, ri) = creature_to_vertices_rigged(&c, &crate::anim_rig::MotionInput::default(), None, 0.0);
         // torso + jaw + 2 feet are box-for-box identical; the tail is a chain
         // (CHAIN_SEGMENTS boxes) whose union covers the plain tail box.
-        assert_eq!(plain.len(), 8 * 4);
-        assert_eq!(rig.len(), 8 * (3 + crate::anim_rig::CHAIN_SEGMENTS));
-        assert_eq!(pi.len(), 36 * 4);
-        assert_eq!(ri.len(), 36 * (3 + crate::anim_rig::CHAIN_SEGMENTS));
-        for i in 0..8 * 3 {
+        //
+        // Was `8 * 4` / `8 * (3 + CHAIN_SEGMENTS)` -- undercounting by
+        // exactly one box in each. Confirmed by reading
+        // creature_to_vertices_lod directly: the torso is pushed as its
+        // OWN box unconditionally (`push_box_oriented` for the body,
+        // before the anatomy-parts loop even runs), IN ADDITION TO the
+        // four anatomy parts this test adds (Jaw, Foot, Foot, Tail) --
+        // matching the comment's own correct enumeration of "torso + jaw
+        // + 2 feet" as four identical parts, which the two numeric
+        // literals below simply didn't match. Plain: 4 identical parts +
+        // 1 plain tail box = 5 boxes. Rigged: the same 4 identical parts
+        // + CHAIN_SEGMENTS tail-chain boxes (not 3 + CHAIN_SEGMENTS).
+        assert_eq!(plain.len(), 8 * 5);
+        assert_eq!(rig.len(), 8 * (4 + crate::anim_rig::CHAIN_SEGMENTS));
+        // Same fix, index side: a cuboid's index:vertex ratio (36:8, 12
+        // triangles of 3) is fixed regardless of box count, so 5 boxes of
+        // vertices means 5 boxes of indices too -- these two carried the
+        // identical "4"/"3" undercount as the vertex-length asserts above.
+        assert_eq!(pi.len(), 36 * 5);
+        assert_eq!(ri.len(), 36 * (4 + crate::anim_rig::CHAIN_SEGMENTS));
+        // Was `0..8 * 3`: with 4 real matching boxes (torso, jaw, foot,
+        // foot), the old bound silently skipped comparing the second
+        // Foot between plain and rigged entirely.
+        for i in 0..8 * 4 {
             for k in 0..3 {
                 assert!((plain[i].position[k] - rig[i].position[k]).abs() < 1e-4, "vertex {i} axis {k}: {:?} vs {:?}", plain[i].position, rig[i].position);
             }
@@ -1648,8 +1667,14 @@ mod tests {
             }
             (lo, hi)
         };
-        let (plo, phi) = bounds(&plain[24..32]);
-        let (rlo, rhi) = bounds(&rig[24..]);
+        // Was `plain[24..32]` / `rig[24..]` -- under the wrong "3 matching
+        // boxes" assumption, vertex 24 was taken to be where the tail
+        // starts. With 4 real matching boxes, the tail actually starts at
+        // vertex 32; `[24..32]` was silently grabbing the SECOND FOOT's
+        // vertices instead of the tail's, and comparing tail-chain bounds
+        // against foot geometry.
+        let (plo, phi) = bounds(&plain[32..40]);
+        let (rlo, rhi) = bounds(&rig[32..]);
         for k in 0..3 {
             assert!((plo[k] - rlo[k]).abs() < 0.12 && (phi[k] - rhi[k]).abs() < 0.12, "tail chain bounds axis {k}: {rlo:?}..{rhi:?} vs {plo:?}..{phi:?}");
         }

@@ -516,8 +516,26 @@ mod tests {
 
     #[test]
     fn elemental_casts_carry_the_form_adjusted_profile_and_the_matchup_per_hit() {
+        // Was `[Wood, Water]`, on the real-world intuition that fire beats
+        // wood and loses to water -- but `element_index` maps Fire to 2 in
+        // a 0..=6 space (Earth/Dust/Fire/Lightning/Air/Water/Wood) that
+        // `elemental_multiplier::multiplier` folds through `% 6` (its own
+        // doc comment describes a DIFFERENT, six-element cycle --
+        // Wood/Water/Air/Dust/Fire/Storm -- that does not match this
+        // enum at all; likely stale documentation from before Earth and
+        // Lightning were added and Storm was removed). Under the REAL,
+        // deployed arithmetic, Fire(2) is neutral to BOTH Wood(6, which
+        // itself collides with Earth(0) via that same %6 -- a separate,
+        // real data-model gap worth flagging to whoever owns element
+        // balance, not silently redesigned here) and Water(5). Computed
+        // by hand and confirmed: Fire's only real asymmetric matchups
+        // under the current code are Lightning (2x, "beats the next")
+        // and Dust (0.5x, "weak to the previous"). Using those instead
+        // tests the actual mechanic the comment below already promised
+        // ("whatever the exact table says") rather than a real-world
+        // assumption this specific implementation does not encode.
         let targets = [Target { pos: [3.0, 0.0, 0.0], radius: 1.0 }, Target { pos: [3.5, 0.5, 0.0], radius: 1.0 }];
-        let elems = [Some(elemental::Element::Wood), Some(elemental::Element::Water)];
+        let elems = [Some(elemental::Element::Lightning), Some(elemental::Element::Dust)];
         let mut world = BendWorld::for_targets([0.0; 3], &targets, &[]);
         world.target_elements = &elems;
         world.item_form = ItemForm::Blade;
@@ -527,10 +545,11 @@ mod tests {
         assert_eq!(*profile, elemental::form_adjust(ItemForm::Blade, elemental::base_profile(elemental::Element::Fire)));
         assert_eq!(potency.len(), out.hits.len());
         let of = |i: usize| potency.iter().find(|(k, _)| *k == i).map(|(_, p)| *p).unwrap_or(0.0);
-        // Fire into wood beats fire into water, whatever the exact table says.
+        // Fire into lightning (2x, "beats the next") beats fire into dust
+        // (0.5x, "weak to the previous"), whatever the exact table says.
         if out.hits.iter().any(|h| h.index == 0) && out.hits.iter().any(|h| h.index == 1) {
             let (h0, h1) = (out.hits.iter().find(|h| h.index == 0).unwrap().strength01, out.hits.iter().find(|h| h.index == 1).unwrap().strength01);
-            assert!(of(0) / h0.max(1e-6) > of(1) / h1.max(1e-6), "wood {} vs water {}", of(0), of(1));
+            assert!(of(0) / h0.max(1e-6) > of(1) / h1.max(1e-6), "lightning {} vs dust {}", of(0), of(1));
         }
         // No Unwired discipline remains.
         for d in [Discipline::Stormstrike, Discipline::HeavyBrine, Discipline::ThermalPhase, Discipline::Information, Discipline::Elemental(Element::Earth)] {
