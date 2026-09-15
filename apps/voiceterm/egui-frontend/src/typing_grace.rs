@@ -1,6 +1,21 @@
 //! typing_grace — don't take the microphone back while someone is typing.
 //!
-//! ## The bug
+//! ## NOT the reported bug — read this first
+//!
+//! The "voice loads on a timer and fights my typing" report is
+//! `uikit_egui::palette_flow`, not this: Ctrl+P opens the palette and it
+//! settles into voice after an idle dwell. That is fixed there (5s dwell once
+//! the keyboard is used, and arrow keys reset it). This module was written
+//! against `sync_voice_routing` before that was traced, and it turns out
+//! `sync_voice_routing` has NO PRODUCTION CALLER — the glove-to-router sync
+//! is a tested library layer nothing in `bin/voiceterm_egui.rs` runs.
+//!
+//! It is kept because the seam is real and the same collision will occur the
+//! moment the router is wired to the app. But nothing here is running today,
+//! and a reader looking for why voice interrupted their typing should be in
+//! `palette_flow.rs`.
+//!
+//! ## The bug it guards against
 //!
 //! `sync_voice_routing` returns the mic to the command vocabulary the instant
 //! glove mode stops dictating, and its comment explains why: *"voiceterm is a

@@ -79,10 +79,14 @@ pub enum Transition {
 
 /// The first dwell, from a fresh `Command` open.
 pub const FIRST_DWELL_MS: f32 = 750.0;
-/// The escalated dwell, after typing has pulled the mode back from
-/// `Voice` to `Command` at least once this session (session = since the
-/// palette was last fully closed via Ctrl+P).
-pub const ESCALATED_DWELL_MS: f32 = 1500.0;
+/// The dwell once the keyboard has been used at all this session.
+///
+/// Was 1500ms, and that was too short: 750ms is a pause for breath and
+/// 1500ms is a pause for thought, so voice kept taking the palette from
+/// under someone mid-command. Five seconds is long enough to stop and think
+/// without losing the keyboard, and short enough that putting your hands
+/// down still hands voice back without a deliberate action.
+pub const ESCALATED_DWELL_MS: f32 = 5000.0;
 
 pub struct PaletteFlow {
     mode: Mode,
@@ -159,12 +163,42 @@ impl PaletteFlow {
         Transition::Closed(was)
     }
 
-    /// A text/typing event landed while the palette is open. A no-op
-    /// (returns `Transition::None`) while `Off` or already `Command` --
-    /// typing while already in typed-search mode is just... typing.
+    /// A text/typing event landed while the palette is open.
+    ///
+    /// Returns `Transition::None` while `Off` or already `Command` -- typing
+    /// while already in typed-search mode is just... typing -- but it still
+    /// resets the timer AND escalates the dwell.
+    ///
+    /// The escalation used to happen only when typing pulled the mode back
+    /// from `Voice`. So the common case was unprotected: open the palette,
+    /// start typing, pause 750ms to think, and voice took it mid-command
+    /// without ever having been in `Voice` for the escalation to trigger on.
+    /// Using the keyboard at all is the signal, not losing a race to voice.
     pub fn on_type(&mut self) -> Transition {
+        self.keyboard_used()
+    }
+
+    /// An arrow key, Tab, Page Up/Down, Home/End -- moving through the
+    /// palette's own list rather than typing into it.
+    ///
+    /// Resets the dwell exactly as typing does, and this is the half that was
+    /// missing entirely: arrowing down a list of results inserts no text, so
+    /// `on_type` never fired and the timer ran out underneath the selection.
+    /// Voice would then arm at the precise moment before Enter -- the worst
+    /// instant available, since "enter" is also a word.
+    pub fn on_navigate(&mut self) -> Transition {
+        self.keyboard_used()
+    }
+
+    /// Any keyboard activity: reset the idle timer and hold the longer dwell.
+    fn keyboard_used(&mut self) -> Transition {
         self.idle_ms = 0.0;
-        self.voice_to_command()
+        let t = self.voice_to_command();
+        // Escalate even when the mode did not change -- see `on_type`.
+        if self.mode != Mode::Off {
+            self.dwell_ms = ESCALATED_DWELL_MS;
+        }
+        t
     }
 
     /// Voice failed to actually start (the caller's `voice_popup.start()`
@@ -183,6 +217,12 @@ impl PaletteFlow {
             return Transition::SwitchedToCommand;
         }
         Transition::None
+    }
+
+    /// The dwell currently in force, in ms. For the UI's warming ring and for
+    /// tests that should not hardcode which constant is active.
+    pub fn dwell_ms(&self) -> f32 {
+        self.dwell_ms
     }
 
     /// Advance idle time by one frame's worth of milliseconds. Only has
@@ -396,5 +436,95 @@ mod tests {
 
         f.ctrl_p_tapped(); // reopen -> Command
         assert_eq!(f.tick(FIRST_DWELL_MS), Transition::SwitchedToVoice, "a fresh open after force_off must use the SHORT dwell");
+    }
+
+    /// THE REPORTED BUG. Open, start typing, pause to think -- and voice took
+    /// the palette at 750ms. The escalation existed but only triggered when
+    /// typing pulled the mode back from Voice, so the ordinary case of typing
+    /// from a fresh open was never protected.
+    #[test]
+    fn typing_from_a_fresh_open_earns_the_long_dwell_immediately() {
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped();
+        assert_eq!(f.dwell_ms(), FIRST_DWELL_MS, "before any keystroke");
+        f.on_type();
+        assert_eq!(f.dwell_ms(), ESCALATED_DWELL_MS, "one keystroke is the signal");
+        // A pause for thought must not lose the keyboard.
+        assert_eq!(f.tick(FIRST_DWELL_MS + 1.0), Transition::None);
+        assert_eq!(f.mode(), Mode::Command, "still typing mode after 750ms");
+        assert_eq!(f.tick(ESCALATED_DWELL_MS), Transition::SwitchedToVoice,
+            "and voice still returns on its own");
+    }
+
+    /// Five seconds, as asked. Pinned as a value because the whole complaint
+    /// was that the number was too small.
+    #[test]
+    fn the_keyboard_dwell_is_five_seconds() {
+        assert_eq!(ESCALATED_DWELL_MS, 5000.0);
+        assert!(ESCALATED_DWELL_MS > FIRST_DWELL_MS * 4.0);
+    }
+
+    /// THE MISSING HALF. Arrowing through results inserts no text, so on_type
+    /// never fired and the dwell ran out under the selection -- arming voice
+    /// at the instant before Enter, which is also a word.
+    #[test]
+    fn navigating_the_list_resets_the_dwell_just_like_typing() {
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped();
+        f.on_navigate();
+        assert_eq!(f.dwell_ms(), ESCALATED_DWELL_MS);
+        // Walk a long list: never armed, however long it takes.
+        for _ in 0..40 {
+            assert_eq!(f.tick(400.0), Transition::None);
+            f.on_navigate();
+        }
+        assert_eq!(f.mode(), Mode::Command, "still the keyboard's after 16s of arrowing");
+    }
+
+    /// Navigation pulls voice back too, not just text.
+    #[test]
+    fn an_arrow_key_takes_the_palette_back_from_voice() {
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped();
+        assert_eq!(f.tick(FIRST_DWELL_MS), Transition::SwitchedToVoice);
+        assert_eq!(f.on_navigate(), Transition::SwitchedToCommand);
+        assert_eq!(f.mode(), Mode::Command);
+    }
+
+    /// Typing mid-dwell restarts the clock rather than letting the earlier
+    /// idle time count toward the threshold.
+    #[test]
+    fn each_keystroke_restarts_the_timer() {
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped();
+        for _ in 0..10 {
+            f.on_type();
+            assert_eq!(f.tick(ESCALATED_DWELL_MS - 100.0), Transition::None);
+        }
+        assert_eq!(f.mode(), Mode::Command);
+    }
+
+    /// Closing and reopening is a new session, so the short dwell is back --
+    /// someone who opens the palette and says nothing still gets voice fast.
+    #[test]
+    fn a_fresh_session_returns_to_the_short_dwell() {
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped();
+        f.on_type();
+        assert_eq!(f.dwell_ms(), ESCALATED_DWELL_MS);
+        f.force_off();
+        f.ctrl_p_tapped();
+        assert_eq!(f.dwell_ms(), FIRST_DWELL_MS, "a new open is not penalised");
+    }
+
+    /// Keyboard events while the palette is CLOSED must not arm anything or
+    /// change a dwell that is not running.
+    #[test]
+    fn keyboard_events_while_off_do_nothing() {
+        let mut f = PaletteFlow::new();
+        assert_eq!(f.on_type(), Transition::None);
+        assert_eq!(f.on_navigate(), Transition::None);
+        assert_eq!(f.mode(), Mode::Off);
+        assert_eq!(f.tick(100_000.0), Transition::None, "Off never arms");
     }
 }
