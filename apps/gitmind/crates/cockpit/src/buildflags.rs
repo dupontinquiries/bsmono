@@ -972,14 +972,30 @@ mod tests {
         assert!(c.windows(2).any(|w| w[0] == "--target" && w[1] == "aarch64-unknown-linux-musl"));
     }
 
-    #[test]
     /// THE TWO APPS THAT REPORTED A WAYLAND ERROR. `is_gui_app` reads one manifest, and for
     /// both of these it is the wrong one — so they missed the `-crt-static` flag, shipped a
     /// static musl binary that cannot dlopen libwayland-client, and the failure surfaced as
     /// a winit Wayland error that reads like a missing system library.
+    ///
+    /// This carried a DUPLICATE `#[test]` attribute (one above the doc comment and one
+    /// below), so it was registered twice and libtest ran two copies concurrently. Both
+    /// derived the same pid-keyed temp root and both began with `remove_dir_all`, so one
+    /// copy deleted the other's fixtures mid-run — which is why the voiceterm assertion
+    /// passed and the snapclone one, four lines later, reported "frontend was not found"
+    /// for a directory that had been created and then wiped. `is_gui_app_dir` was correct
+    /// throughout.
     #[test]
     fn a_frontend_in_a_subdirectory_is_still_a_gui_app() {
-        let root = std::env::temp_dir().join(format!("gm-gui-{}", std::process::id()));
+        // Unique per CALL, not per process: a pid is shared by every test in
+        // the binary, so it is the wrong key for a directory one test wipes.
+        let root = std::env::temp_dir().join(format!(
+            "gm-gui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
         let _ = std::fs::remove_dir_all(&root);
 
         // voiceterm's shape: the top-level manifest is a DIFFERENT package, eframe is in a

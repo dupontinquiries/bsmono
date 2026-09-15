@@ -17,6 +17,17 @@ pub mod protocol;
 /// The one client for the control socket — see the module note on why
 /// there were three copies of the path.
 pub mod control;
+
+/// Serialises tests that mutate `XDG_RUNTIME_DIR`.
+///
+/// `control.rs` points it at a nonexistent path to prove a dead socket reads
+/// as "not running", and `client.rs` points it at `/run/user/1000`. Both are
+/// process-global `set_var` calls in one test binary that cargo runs in
+/// parallel, so one test restoring the variable mid-way through the other's
+/// call lets the dead-socket test reach the REAL daemon — which answers, and
+/// the test that expected an error gets a status object instead.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub mod peer_auth;
 pub mod drone_canceller;
 pub mod passby_canceller;

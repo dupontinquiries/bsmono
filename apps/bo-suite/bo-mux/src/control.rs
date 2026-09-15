@@ -208,6 +208,9 @@ mod tests {
     #[test]
     fn a_dead_socket_is_not_running_rather_than_an_error() {
         // The one case a person can act on, so it gets its own variant.
+        // See crate::ENV_TEST_LOCK: client.rs mutates XDG_RUNTIME_DIR too,
+        // and without the lock this test reaches a real daemon.
+        let _env = crate::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old = std::env::var_os("XDG_RUNTIME_DIR");
         std::env::set_var("XDG_RUNTIME_DIR", "/nonexistent-bo-mux-sock-test");
         let running = is_running();

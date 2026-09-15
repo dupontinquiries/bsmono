@@ -91,8 +91,17 @@ mod tests {
 
     #[test]
     fn default_socket_path_uses_runtime_dir() {
+        // See crate::ENV_TEST_LOCK. This one never restored the variable at
+        // all, so it did not merely race control.rs's test -- it left
+        // /run/user/1000 set for whatever ran next.
+        let _env = crate::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("XDG_RUNTIME_DIR");
         std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
         let c = Client::default_socket();
+        match old {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
         assert!(c.socket_path.ends_with("bo-mux/control.sock"));
     }
 }
