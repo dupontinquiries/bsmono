@@ -217,4 +217,140 @@ mod tests {
         assert!(!devs[2].smart_capable());
         assert_eq!(devs[2].size_bytes, 0);
     }
+
+    #[test]
+    fn sata_ata_and_sas_transports_all_classify_as_native_sata() {
+        // Completely untested before this: the only transports the
+        // existing fixture exercised were nvme, usb, and null (virtual).
+        // NativeSata is reachable through three distinct lsblk TRAN
+        // strings -- each needs its own check, since a match arm typo'd
+        // to handle only one of the three would not be caught by testing
+        // just one.
+        for tran in ["sata", "ata", "sas"] {
+            let fix = format!(
+                r#"{{"blockdevices":[{{"name":"sda","path":"/dev/sda","type":"disk","size":100,
+                   "tran":"{tran}","model":null,"serial":null,"vendor":null,
+                   "rota":true,"rm":false,"mountpoint":null,"children":[]}}]}}"#
+            );
+            let sys = FixtureRunner::new().on(&cmdline(), 0, &fix);
+            let devs = enumerate(&sys).unwrap();
+            assert_eq!(devs.len(), 1);
+            assert_eq!(devs[0].attach, Attach::NativeSata, "tran={tran}");
+            assert!(devs[0].smart_capable(), "tran={tran}");
+        }
+    }
+
+    #[test]
+    fn a_genuinely_unrecognized_transport_and_name_falls_to_unknown_not_a_guess() {
+        // The fallback classifier only recognizes specific NAME prefixes
+        // (nvme, loop, zram, dm-, md, vd) when TRAN itself is absent or
+        // unrecognized. A device matching none of those must land on
+        // Unknown rather than being silently mis-sorted into one of the
+        // real categories -- Unknown existing at all is the module
+        // admitting what it does not know, which is safer than a wrong
+        // guess feeding into a SMART probe or a clone-safety check.
+        let fix = r#"{"blockdevices":[{"name":"xvda","path":"/dev/xvda","type":"disk","size":100,
+            "tran":null,"model":null,"serial":null,"vendor":null,
+            "rota":false,"rm":false,"mountpoint":null,"children":[]}]}"#;
+        let sys = FixtureRunner::new().on(&cmdline(), 0, fix);
+        let devs = enumerate(&sys).unwrap();
+        assert_eq!(devs[0].attach, Attach::Unknown);
+        assert!(!devs[0].smart_capable(), "Unknown must not be probed as if it were a real transport");
+    }
+
+    #[test]
+    fn a_non_disk_top_level_entry_is_excluded() {
+        // The existing fixture's only non-"disk" entries are NESTED
+        // partitions under a disk. A top-level sibling of a different
+        // type (a "rom" entry for a CD/DVD drive is the real-world case)
+        // must also be excluded by the same `kind != "disk"` check --
+        // untested at the top level specifically.
+        let fix = r#"{"blockdevices":[
+            {"name":"sda","path":"/dev/sda","type":"disk","size":100,
+             "tran":"sata","model":null,"serial":null,"vendor":null,
+             "rota":true,"rm":false,"mountpoint":null,"children":[]},
+            {"name":"sr0","path":"/dev/sr0","type":"rom","size":0,
+             "tran":"ata","model":null,"serial":null,"vendor":null,
+             "rota":false,"rm":true,"mountpoint":null,"children":[]}
+        ]}"#;
+        let sys = FixtureRunner::new().on(&cmdline(), 0, fix);
+        let devs = enumerate(&sys).unwrap();
+        assert_eq!(devs.len(), 1, "the rom entry must not appear as a device: {devs:?}");
+        assert_eq!(devs[0].name, "sda");
+    }
+
+    #[test]
+    fn mountpoints_are_collected_through_multiple_levels_of_children() {
+        // The existing fixture only ever had ONE level of children
+        // (disk -> partition, mounted). A real LVM stack is disk ->
+        // partition -> logical volume, mounted two levels down --
+        // collect_mounts is recursive specifically for this, and the
+        // existing test could pass even if the recursive call were
+        // accidentally removed, since one level deep does not need it.
+        let fix = r#"{"blockdevices":[{"name":"sda","path":"/dev/sda","type":"disk","size":100,
+            "tran":"sata","model":null,"serial":null,"vendor":null,
+            "rota":true,"rm":false,"mountpoint":null,
+            "children":[{"name":"sda1","path":"/dev/sda1","type":"part","size":50,
+                "tran":null,"model":null,"serial":null,"vendor":null,
+                "rota":true,"rm":false,"mountpoint":null,
+                "children":[{"name":"vg-lv","path":"/dev/mapper/vg-lv","type":"lvm","size":40,
+                    "tran":null,"model":null,"serial":null,"vendor":null,
+                    "rota":true,"rm":false,"mountpoint":"/home","children":[]}]}]}]}"#;
+        let sys = FixtureRunner::new().on(&cmdline(), 0, fix);
+        let devs = enumerate(&sys).unwrap();
+        assert_eq!(devs[0].mountpoints, vec!["/home"],
+            "a mountpoint two levels down through an LVM stack must still be found");
+    }
+
+    #[test]
+    fn a_zero_length_model_string_is_treated_the_same_as_absent() {
+        // The existing test only ever checked whitespace-trimming on
+        // VENDOR ("Samsung " -> "Samsung"). A genuinely EMPTY string
+        // (lsblk's real behavior for a field it has nothing to report,
+        // some kernels/versions use "" rather than null) needs its own
+        // check on MODEL specifically, since none_if_blank is called
+        // three separate times (model, serial, vendor) and a mistake in
+        // any one of those three call sites would not be caught by
+        // testing only one of them.
+        let fix = r#"{"blockdevices":[{"name":"sda","path":"/dev/sda","type":"disk","size":100,
+            "tran":"sata","model":"","serial":"","vendor":null,
+            "rota":true,"rm":false,"mountpoint":null,"children":[]}]}"#;
+        let sys = FixtureRunner::new().on(&cmdline(), 0, fix);
+        let devs = enumerate(&sys).unwrap();
+        assert_eq!(devs[0].model, None, "an empty string must become None, not Some(\"\")");
+        assert_eq!(devs[0].serial, None);
+    }
+
+    #[test]
+    fn a_failing_lsblk_command_is_a_real_error_not_an_empty_device_list() {
+        // If lsblk itself fails to run (missing binary, permission
+        // denied), enumerate() must propagate that as an Err a caller
+        // can act on and show -- not silently return an empty Vec, which
+        // would look identical to "this machine genuinely has no disks"
+        // and could feed a clone-planning UI a device list that is wrong
+        // for a completely different reason than it appears to be.
+        struct AlwaysFails;
+        impl SysRunner for AlwaysFails {
+            fn run(&self, _: &str, _: &[&str]) -> Result<SysOutput, String> {
+                Err("lsblk: command not found".into())
+            }
+        }
+        let err = enumerate(&AlwaysFails).expect_err("a failed command must not look like zero disks");
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn malformed_json_from_lsblk_is_a_real_error_not_a_panic_or_empty_list() {
+        // A different failure shape than the command failing outright:
+        // lsblk RUNS (exit 0) but its output is not the JSON this parser
+        // expects -- a lsblk version mismatch, a truncated pipe, a
+        // locale wrapping numbers in a way that breaks the parser. Must
+        // surface as an Err, not panic (this runs inside a GUI event
+        // loop, where a panic takes the whole app down over one
+        // unexpected line of output) and not silently succeed with an
+        // empty list indistinguishable from "no disks."
+        let sys = FixtureRunner::new().on(&cmdline(), 0, "not valid json at all");
+        let err = enumerate(&sys).expect_err("malformed JSON must not parse into an empty Vec");
+        assert!(err.contains("lsblk json"), "{err}");
+    }
 }
