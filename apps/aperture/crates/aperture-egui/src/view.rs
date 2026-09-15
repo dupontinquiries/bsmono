@@ -36,51 +36,6 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
         state.show_loop_pane = !state.show_loop_pane;
     }
 
-    // Ctrl+P's idle-dwell voice trigger -- same `palette_flow` state
-    // machine voiceterm-egui uses. Aperture has no separate typed-search
-    // "Command" surface the way voiceterm does (no palette.rs/vocabulary
-    // here), so `Mode::Command` has no drawer of its own to show or hide
-    // -- it is purely "armed, counting down," visible only through the
-    // mic indicator in the status bar below. This is actually a GOOD fit
-    // for an editor rather than a compromise: the person is typing in
-    // their FILE the whole time they use this app, so "any keystroke
-    // resets the dwell" reads naturally as "do not interrupt active
-    // editing with a mic switching on," not as a workaround for a
-    // missing search box.
-    //
-    // repeat: false filtered explicitly, same reason voiceterm-egui's own
-    // fix needed it: OS-level key-repeat sends the key down again and
-    // again while physically held, and a naive key_pressed would toggle
-    // on every one.
-    let ctrl_p_pressed = ctx.input(|i| {
-        i.events.iter().any(|e| matches!(
-            e,
-            egui::Event::Key { key: egui::Key::P, pressed: true, repeat: false, modifiers, .. }
-                if modifiers.command
-        ))
-    });
-    if ctrl_p_pressed {
-        if let uikit_egui::palette_flow::Transition::Closed(uikit_egui::palette_flow::Mode::Voice)
-            = state.palette_flow.ctrl_p_tapped()
-        {
-            state.voice_popup.cancel();
-        }
-    }
-    let typed_this_frame = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(_))));
-    if typed_this_frame
-        && state.palette_flow.on_type() == uikit_egui::palette_flow::Transition::SwitchedToCommand
-    {
-        state.voice_popup.cancel();
-    }
-    if state.palette_flow.tick(dt * 1000.0) == uikit_egui::palette_flow::Transition::SwitchedToVoice
-        && !state.voice_popup.start(false) // aperture has no password-mode concept
-    {
-        state.palette_flow.voice_refused();
-    }
-    if state.palette_flow.mode() == uikit_egui::palette_flow::Mode::Voice {
-        state.voice_popup.tick();
-    }
-
     state.poll_completions(now_ms);
     state.poll_lsp(now_ms);
     state.poll_note();
@@ -1031,8 +986,16 @@ pub fn palette_list_h_for(screen_h: f32) -> f32 {
 /// Takes the `Ui` rather than reading a global so it reflects the actual
 /// window, and so it stays correct when the window is resized rather than
 /// being sampled once at startup.
+///
+/// Reads `content_rect()`, not `screen_rect()` -- the same fix
+/// `dialog_width` already applied and documented (`screen_rect` does not
+/// exclude what sits under the system bars, so a title bar/inset made the
+/// usable area smaller than this function assumed). This sibling function
+/// had not received the same fix, so the list could compute a fraction of
+/// a taller-than-real height and render shorter than the window actually
+/// allowed for it -- reported as "too short for the window."
 pub fn palette_list_h(ui: &egui::Ui) -> f32 {
-    palette_list_h_for(ui.ctx().screen_rect().height())
+    palette_list_h_for(ui.ctx().content_rect().height())
 }
 
 
@@ -1209,51 +1172,6 @@ fn status_bar(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, now_ms:
         // sides drew on top of each other instead of one giving way.
         let room = ui.available_width();
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // The mic indicator, rightmost -- drawn only while the flow is
-            // actually armed or listening, so an aperture user who never
-            // touches Ctrl+P sees no change to this bar at all. First in
-            // this right-to-left closure so it lands at the true right
-            // edge, matching how a status/notification icon usually sits.
-            if state.palette_flow.mode() != uikit_egui::palette_flow::Mode::Off {
-                let warming = state.palette_flow.dwell_progress();
-                let listening = state.palette_flow.mode() == uikit_egui::palette_flow::Mode::Voice;
-                let dt = ui.ctx().input(|i| i.stable_dt);
-                if state.mic_indicator.draw(ui, colors, warming, listening, dt)
-                    == uikit_egui::mic_indicator::MicAction::ForceOff
-                {
-                    if let uikit_egui::palette_flow::Transition::Closed(uikit_egui::palette_flow::Mode::Voice)
-                        = state.palette_flow.force_off()
-                    {
-                        state.voice_popup.cancel();
-                    }
-                }
-                // The banner-plus-expansion shape from earlier design
-                // discussion: while actually listening/transcribing/
-                // showing a result, the status bar's OWN row grows a
-                // label to the left of the icon rather than opening a
-                // second panel -- this bar is already the "permanent
-                // banner"; showing more content in it IS the expansion,
-                // using egui's ordinary layout growth rather than a
-                // separate height-animation system voiceterm's
-                // Surface/overlay has and aperture does not.
-                if listening {
-                    match &state.voice_popup.stage {
-                        uikit_egui::voice_popup::Stage::Listening => {
-                            ui.label(egui::RichText::new("listening…").color(colors.text_weak));
-                        }
-                        uikit_egui::voice_popup::Stage::Transcribing => {
-                            ui.spinner();
-                            ui.label(egui::RichText::new("thinking…").color(colors.text_weak));
-                        }
-                        uikit_egui::voice_popup::Stage::Done { text } => {
-                            ui.label(egui::RichText::new(text.as_str()).color(colors.text));
-                        }
-                        uikit_egui::voice_popup::Stage::Error { message } => {
-                            ui.label(egui::RichText::new(message.as_str()).color(colors.danger));
-                        }
-                    }
-                }
-            }
             if let Some((msg, until)) = &state.status {
                 if now_ms < *until {
                     ui.label(egui::RichText::new(msg.clone()).color(colors.accent));
@@ -1759,11 +1677,80 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                             }
                         }
                         Mode::VoiceCommand => {
-                            ui.label(
-                                egui::RichText::new("type what you'd say, then Enter · Esc cancel")
-                                    .color(colors.text_weak)
-                                    .small(),
+                            // Computed once, before the row, so both the
+                            // button (inside the closure below) and the
+                            // poll check (after it) see the same value --
+                            // an earlier draft computed this INSIDE the
+                            // closure and then tried to read it outside,
+                            // which does not compile (out of scope).
+                            let stage_listening = matches!(
+                                state.voice_popup.stage,
+                                uikit_egui::voice_popup::Stage::Listening
+                                    | uikit_egui::voice_popup::Stage::Transcribing
                             );
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("type what you'd say, then Enter · Esc cancel")
+                                        .color(colors.text_weak)
+                                        .small(),
+                                );
+                                // The real mic control this mode never had --
+                                // `aperture_core::voice`'s own doc named this
+                                // as future work (no capture existed here at
+                                // all before). Click starts, right-click/hold
+                                // cancels; a result FILLS `p.input` rather
+                                // than auto-submitting, so speaking and
+                                // typing produce the identical, reviewable
+                                // outcome the "typed stand-in" framing
+                                // promises -- Enter still does the actual
+                                // submitting either way.
+                                let dt = ui.ctx().input(|i| i.stable_dt);
+                                match state.mic_indicator.draw(ui, colors, 0.0, stage_listening, dt) {
+                                    uikit_egui::mic_indicator::MicAction::Start => {
+                                        state.voice_popup.start(false);
+                                    }
+                                    uikit_egui::mic_indicator::MicAction::ForceOff => {
+                                        state.voice_popup.cancel();
+                                    }
+                                    uikit_egui::mic_indicator::MicAction::None => {}
+                                }
+                            });
+                            if stage_listening {
+                                state.voice_popup.tick();
+                                ui.ctx().request_repaint();
+                            }
+                            match &state.voice_popup.stage {
+                                uikit_egui::voice_popup::Stage::Listening => {
+                                    ui.label(egui::RichText::new("listening…").color(colors.text_weak));
+                                }
+                                uikit_egui::voice_popup::Stage::Transcribing => {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(egui::RichText::new("thinking…").color(colors.text_weak));
+                                    });
+                                }
+                                uikit_egui::voice_popup::Stage::Done { text } => {
+                                    // Filled once: reset to Listening right
+                                    // after copying out, so the SAME result
+                                    // is not re-copied into `p.input` on
+                                    // every subsequent frame (Stage::Done
+                                    // stays Done until the next capture).
+                                    if !text.is_empty() {
+                                        p.input = text.clone();
+                                    }
+                                    state.voice_popup.stage = uikit_egui::voice_popup::Stage::Listening;
+                                }
+                                uikit_egui::voice_popup::Stage::Error { message } => {
+                                    // The "no notifier of a missing mic"
+                                    // report, addressed here: whatever
+                                    // voice-engine-kit's real failure
+                                    // string says (no input device, no
+                                    // model found, arecord/whisper
+                                    // missing) is now visible instead of
+                                    // the mode silently doing nothing.
+                                    ui.label(egui::RichText::new(message.as_str()).color(colors.danger));
+                                }
+                            }
                             if enter && !p.input.trim().is_empty() {
                                 submit_voice = Some(p.input.trim().to_string());
                             }

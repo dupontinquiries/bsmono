@@ -37,6 +37,13 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MicAction {
     None,
+    /// A plain left click -- "start listening," for a caller with no
+    /// separate arming/dwell step (aperture's Mode::VoiceCommand: the
+    /// mode is already entered explicitly, so the mic is a click-to-talk
+    /// button, not an idle-triggered one the way voiceterm's Ctrl+P flow
+    /// is). Not returned while `listening` is already true -- clicking a
+    /// mic that is already live is not a second "start."
+    Start,
     /// Right-click, or a press-and-hold past the shared threshold --
     /// either way, "stop this, right now." The caller's own state
     /// machine decides what "stop" means (closing entirely, cancelling
@@ -106,6 +113,17 @@ impl MicIndicator {
             self.cancel_hold.abort();
             self.was_pressed = false;
             return MicAction::ForceOff;
+        }
+
+        // A plain click starts listening -- checked via `clicked()`
+        // (egui's own "full press+release, no drag") rather than folded
+        // into the hold-cancel timer below, since that timer answers a
+        // different question (was THIS press long enough to cancel) and
+        // a quick click already completes before `cancel_hold` would
+        // ever cross its threshold. Not fired while already `listening`
+        // -- see MicAction::Start's own doc for why.
+        if resp.clicked() && !listening {
+            return MicAction::Start;
         }
 
         let pressed_now = resp.is_pointer_button_down_on();

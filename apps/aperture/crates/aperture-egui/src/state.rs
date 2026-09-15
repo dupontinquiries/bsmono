@@ -254,17 +254,17 @@ pub struct AppState {
     pub lang: Language,
     pub syntax: Syntax,
     pub find: Option<FindState>,
-    /// Ctrl+P's idle-dwell flow (tap opens the palette/status expansion,
-    /// pausing without typing settles into voice) -- same shared
-    /// `uikit_egui::palette_flow` voiceterm-egui uses, so the two apps
-    /// feel identical rather than each guessing a timing.
-    pub palette_flow: uikit_egui::palette_flow::PaletteFlow,
-    /// Voice capture/transcription state, drawn as an expansion of the
-    /// existing status bar rather than a new panel -- see `status_bar`'s
-    /// own doc for why aperture (no `Surface`/`overlay` system) hosts
-    /// this differently than voiceterm does.
+    /// Voice capture/transcription state for `palette_ui::Mode::
+    /// VoiceCommand`'s mic button -- feeds a real transcript into the
+    /// SAME `run_voice_command` seam the mode's typed stand-in already
+    /// uses, rather than a separate trigger. An earlier draft wired this
+    /// through a standalone Ctrl+P handler in `view::frame` instead; that
+    /// collided with the REAL, pre-existing Ctrl+P binding
+    /// (`state.rs`'s `(P, true) => self.open_palette()`) and bypassed
+    /// this mode entirely -- removed once found.
     pub voice_popup: uikit_egui::voice_popup::VoicePopup,
-    /// The "about to switch on"/"listening" badge, with hold-to-cancel.
+    /// The mic button drawn inside `Mode::VoiceCommand`'s row: click to
+    /// start, right-click/hold to cancel.
     pub mic_indicator: uikit_egui::mic_indicator::MicIndicator,
     /// impakt-cam mode: the camera keeps the caret centered (dead zone +
     /// snap horizon live in `camera::Follow`). The view applies it only when
@@ -582,7 +582,6 @@ impl AppState {
             lang,
             syntax: Syntax::new(lang),
             find: None,
-            palette_flow: Default::default(),
             voice_popup: Default::default(),
             mic_indicator: Default::default(),
             follow_mode: false,
