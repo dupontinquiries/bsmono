@@ -93,6 +93,9 @@ pub mod speaker_list;
 /// module header for why the command vocabulary being live while someone
 /// typed was firing commands mid-sentence.
 pub mod typing_grace;
+/// Holds a dictation session for the frame loop: the facade plus the
+/// per-frame bookkeeping an immediate-mode UI needs around it.
+pub mod dictation_view;
 #[path = "../../src/voice_intent.rs"]
 pub mod voice_intent;
 pub mod workspaces_view;
@@ -376,6 +379,27 @@ pub mod repair;
 #[path = "../../src/dictate.rs"]
 #[allow(dead_code, unused_imports)]
 pub mod dictate;
+
+// ── the dictation stack, mounted whole ───────────────────────────────────────
+//
+// `repair`, `dictate` and `code_symbols` were already here; the frontend had
+// been assembling a dictation session out of them BY HAND. `dictation_engine`
+// exists precisely to stop that, and says so in its own header: "Leaving the
+// composition to the caller means writing it again in QML, in whatever the CLI
+// does, and in every test -- and getting it subtly different each time." This
+// frontend was that caller.
+//
+// Its two remaining dependencies close against modules already mounted, so the
+// whole facade arrives as three #[path] lines and no reimplementation.
+#[path = "../../src/dictation_session.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod dictation_session;
+#[path = "../../src/voice_status.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod voice_status;
+#[path = "../../src/dictation_engine.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod dictation_engine;
 pub mod bar_pages;
 pub mod browser;
 pub mod bookmarks_view;
