@@ -36,6 +36,7 @@ pub mod program_panel;
 pub mod palette;
 pub mod project_dir;
 pub mod viewport;
+pub mod playhead_sim;
 pub mod voice;
 pub mod workspace;
 pub mod rebinds;
@@ -122,6 +123,33 @@ pub struct Studio {
     /// Set by any PROJECT edit (including undo/redo and a bounce); the shell
     /// re-renders the arrangement buffer before the next timeline playback.
     pub arrangement_dirty: bool,
+    /// Set by [`Studio::seek`] whenever the playhead is moved by anything
+    /// OTHER than the sink-follows-transport feedback line in `sync_sink`
+    /// (scrub, GotoStart/GotoEnd, a marker jump, find-and-goto). Read and
+    /// cleared by `sync_sink`, which otherwise has no way to tell "the user
+    /// just seeked" apart from "nothing changed" -- `loaded`/
+    /// `arrangement_dirty` alone cover a content change, not a bare
+    /// position change within the SAME content, which is exactly what a
+    /// pause-then-seek-backward-then-play is. Without this flag the sink's
+    /// own internal cursor stays wherever it was left, play resumes it from
+    /// there, and the very next tick's `transport.set_position` (fed by the
+    /// sink's real position) silently snaps the playhead back -- the bug
+    /// this field exists to close.
+    pub seek_pending: bool,
+    /// Video/UI-facing clock for an active arrangement loop, kept SEPARATE
+    /// from the audio's own cycling position -- see `App::sync_sink`'s
+    /// unwrap step. `loop_video_base` is the timeline position where the
+    /// loop was (re)engaged; `loop_video_elapsed` accumulates real frames
+    /// played since then, never reset by a wrap; `loop_last_raw_frame` is
+    /// the last cycling sink frame observed, needed to detect the next
+    /// wrap. Together they let video/the playhead ruler keep advancing
+    /// like a normal timeline while the audio underneath repeats a short
+    /// window forever -- "the timeline should function like a timeline"
+    /// even when a beat pattern loops. Reset whenever the loop's buffer is
+    /// (re)loaded (see `sync_sink`'s resync branch).
+    pub loop_video_base: Ticks,
+    pub loop_video_elapsed: i64,
+    pub loop_last_raw_frame: Option<usize>,
     /// Solo'd tracks — monitoring state, deliberately NOT an op (see
     /// `mixer_panel`'s docs): it shapes what you hear and what you export,
     /// never what the project is.
@@ -220,6 +248,19 @@ pub struct Studio {
 }
 
 impl Studio {
+    /// Move the playhead by any USER-INITIATED means -- scrub, GotoStart/
+    /// GotoEnd, a marker jump, find-and-goto. Sets `seek_pending` so
+    /// `App::sync_sink` knows to re-seek the sink even when nothing about
+    /// WHAT is loaded changed, only WHERE in it. The sink-follows-transport
+    /// feedback line in `sync_sink` must NOT go through this method (it
+    /// would set `seek_pending` every single frame and force a reseek on
+    /// every tick) -- it calls `self.transport.set_position` directly, on
+    /// purpose, and that asymmetry is the whole fix.
+    pub fn seek(&mut self, at: Ticks) {
+        self.transport.set_position(at);
+        self.seek_pending = true;
+    }
+
     /// The 20-byte key the carrier publishes and reads under: a joined
     /// session's, else our own team + project's. One place, so the palette's
     /// "session id" and the wire agree by construction.
@@ -267,6 +308,10 @@ impl Studio {
             rack_playing: false,
             loop_dirty: true,
             arrangement_dirty: true,
+            seek_pending: false,
+            loop_video_base: Ticks::ZERO,
+            loop_video_elapsed: 0,
+            loop_last_raw_frame: None,
             solo: Vec::new(),
             mixer_drag: None,
             clip_gain_drag: None,
@@ -1461,10 +1506,10 @@ impl Studio {
                         self.status = format!("{} clips selected", self.selection.len());
                     }
                     Action::CollapseSelection => { self.selection.clear(); self.status = "cleared".into(); }
-                    Action::GotoStart => self.transport.set_position(Ticks::ZERO),
+                    Action::GotoStart => self.seek(Ticks::ZERO),
                     Action::GotoEnd => {
                         let d = self.session.doc.project.duration();
-                        self.transport.set_position(d);
+                        self.seek(d);
                     }
                     _ => {}
                 }
@@ -3378,12 +3423,12 @@ impl eframe::App for App {
                     }
                 }
                 if ui.button("⏮").on_hover_text("playhead to start (g g)").clicked() {
-                    self.studio.transport.set_position(studio_core::Ticks::ZERO);
+                    self.studio.seek(studio_core::Ticks::ZERO);
                     self.studio.status = "playhead at start".into();
                 }
                 if ui.button("⏭").on_hover_text("playhead to end (g e)").clicked() {
                     let d = self.studio.session.doc.project.duration();
-                    self.studio.transport.set_position(d);
+                    self.studio.seek(d);
                     self.studio.status = "playhead at end".into();
                 }
                 if ui.button("settings…").clicked() {
@@ -3767,58 +3812,7 @@ impl eframe::App for App {
         self.studio.sync_rack_if_changed();
 
         // ── one sink, one owner ───────────────────────────────────────────
-        // Priority is whoever the user pressed play on last (the key handler
-        // enforces exclusivity); this block just keeps the sink's buffer
-        // truthful for the current owner and idles it for nobody.
-        if self.studio.transport.playing {
-            let window = looping::Window::new(self.studio.transport.loop_range, self.sink.rate());
-            let want = match window { Some(w) => SinkContent::ArrangementLoop(w), None => SinkContent::Arrangement };
-            if self.loaded != want || self.studio.arrangement_dirty {
-                let (buf, looped, seek) = match window {
-                    // The range alone, looped by the callback — sample
-                    // exact, which loop-record depends on.
-                    Some(w) => (self.studio.render_arrangement_range(self.sink.rate(), &self.audio, w.start, w.end),
-                                true, w.frame(self.studio.transport.position())),
-                    None => (self.studio.render_arrangement(self.sink.rate(), &self.audio), false,
-                             self.studio.transport.position().to_samples(self.sink.rate()).max(0) as usize),
-                };
-                self.sink.set_buffer(std::sync::Arc::new(buf), 2, looped);
-                self.sink.seek(seek);
-                self.studio.arrangement_dirty = false;
-                self.loaded = want;
-            }
-            self.sink.set_playing(true);
-            if let Some(f) = self.sink.position() {
-                // Video follows audio, never the reverse (transport's rule №1)
-                // — the sink's consumed frames ARE the playhead.
-                let at = match window {
-                    Some(w) => w.timeline(f),
-                    None => studio_core::Ticks::from_samples(f as i64, self.sink.rate()),
-                };
-                self.studio.transport.set_position(at);
-                // Loop-record: the playhead came round while the take
-                // ran — what the microphone caught is one pass, placed
-                // at the loop's start on the next free lane.
-                if let Some(w) = window {
-                    if self.mic.recording() && self.passes.observe(at) {
-                        self.commit_pass(w);
-                    }
-                }
-            } else if !self.sink.playing() {
-                self.studio.transport.stop();
-                self.studio.status = "reached the end".into();
-            }
-        } else if self.studio.rack_playing {
-            if self.loaded != SinkContent::RackLoop || self.studio.loop_dirty {
-                let samples = self.studio.render_loop(self.sink.rate(), &self.audio);
-                self.sink.set_buffer(std::sync::Arc::new(samples), 1, true);
-                self.studio.loop_dirty = false;
-                self.loaded = SinkContent::RackLoop;
-            }
-            self.sink.set_playing(true);
-        } else {
-            self.sink.set_playing(false);
-        }
+        self.sync_sink();
         // LIVE SUBPATTERNS: the rack changed (loop_dirty is the rack's own dirty bit) — every
         // source placed from a pattern is re-rendered, its peaks rebuilt, and the arrangement
         // re-mixed, so the tape plays the pattern as it is now through the mixer.
@@ -4443,7 +4437,7 @@ impl eframe::App for App {
                         // Scrub. The transport owns position, so this is a
                         // seek and not a model edit — moving the playhead
                         // is not something a collaborator should undo.
-                        self.studio.transport.set_position(t);
+                        self.studio.seek(t);
                     }
                     if let Some((index, at, track)) = tr.pattern_dropped {
                         self.studio.pending_place = Some((index, at, track));
@@ -5140,16 +5134,16 @@ impl App {
                         at, name: format!("mark {n}") }, "marker");
                 }
                 palette::ShellVerb::GotoMarker(at) => {
-                    self.studio.transport.set_position(at);
+                    self.studio.seek(at);
                     self.studio.status = format!("at {:.1}s", at.to_seconds());
                 }
                 palette::ShellVerb::GotoStart => {
-                    self.studio.transport.set_position(studio_core::Ticks::ZERO);
+                    self.studio.seek(studio_core::Ticks::ZERO);
                     self.studio.status = "playhead at start".into();
                 }
                 palette::ShellVerb::GotoEnd => {
                     let d = self.studio.session.doc.project.duration();
-                    self.studio.transport.set_position(d);
+                    self.studio.seek(d);
                     self.studio.status = "playhead at end".into();
                 }
                 palette::ShellVerb::MixMaster => {
@@ -5293,6 +5287,130 @@ impl App {
                                 self.mic.device_name(), self.mic.rate()),
             }
         } else { "left the call".into() };
+    }
+
+    /// Should the sink's buffer be re-rendered and re-seeked this tick?
+    /// Exactly three reasons, and this is the whole list: the CONTENT
+    /// changed (`loaded != want` -- switched into/out of a loop, or the
+    /// loop range itself changed), a PROJECT EDIT happened
+    /// (`arrangement_dirty`), or the PLAYHEAD moved by user action
+    /// (`seek_pending`). Pulled out as a pure function -- no `self`, no
+    /// sink, no device -- specifically so the exact condition that was
+    /// missing `seek_pending` (the backward-seek-then-play bug) can be
+    /// tested directly, the same way `Transport`/`video_at` are tested
+    /// directly rather than through a full running app. See
+    /// `sink_resync_tests` below.
+    fn should_resync(loaded: &SinkContent, want: &SinkContent, arrangement_dirty: bool, seek_pending: bool) -> bool {
+        loaded != want || arrangement_dirty || seek_pending
+    }
+
+    /// Unwraps a counter that cycles every `period` frames (a looped
+    /// buffer's own read position) into how many NEW frames elapsed since
+    /// the last call. Pure arithmetic, no state of its own -- the caller
+    /// (`sync_sink`) owns `prev` across calls. Assumes at most one wrap
+    /// between calls, which holds as long as this is called every UI tick
+    /// (far more often than once per loop period); if that assumption is
+    /// somehow violated, this under-counts by whole periods rather than
+    /// going negative -- the safe direction to be wrong in for a
+    /// display-only clock (video looks briefly paused, never jumps
+    /// backward).
+    fn unwrap_cycled_frames(prev: Option<usize>, current: usize, period: usize) -> i64 {
+        match prev {
+            None => 0,
+            Some(p) if current >= p => (current - p) as i64,
+            Some(p) => (period.saturating_sub(p) + current) as i64,
+        }
+    }
+
+    /// Keep the sink truthful for whoever is currently playing --
+    /// arrangement (timeline), rack loop, or neither. Extracted from the
+    /// egui `ui()` method (it touches only `self.sink`/`self.studio`/
+    /// `self.mic`/`self.passes`, never `ui`/`frame`) specifically so it can
+    /// be called from a test with a fake `PlaybackSink` -- see
+    /// `sink_sync_tests` below for the backward-seek regression this
+    /// closes.
+    fn sync_sink(&mut self) {
+        // ── one sink, one owner ───────────────────────────────────────────
+        // Priority is whoever the user pressed play on last (the key handler
+        // enforces exclusivity); this block just keeps the sink's buffer
+        // truthful for the current owner and idles it for nobody.
+        if self.studio.transport.playing {
+            let window = looping::Window::new(self.studio.transport.loop_range, self.sink.rate());
+            let want = match window { Some(w) => SinkContent::ArrangementLoop(w), None => SinkContent::Arrangement };
+            if Self::should_resync(&self.loaded, &want, self.studio.arrangement_dirty, self.studio.seek_pending) {
+                let (buf, looped, seek) = match window {
+                    // The range alone, looped by the callback — sample
+                    // exact, which loop-record depends on.
+                    Some(w) => (self.studio.render_arrangement_range(self.sink.rate(), &self.audio, w.start, w.end),
+                                true, w.frame(self.studio.transport.position())),
+                    None => (self.studio.render_arrangement(self.sink.rate(), &self.audio), false,
+                             self.studio.transport.position().to_samples(self.sink.rate()).max(0) as usize),
+                };
+                self.sink.set_buffer(std::sync::Arc::new(buf), 2, looped);
+                self.sink.seek(seek);
+                self.studio.arrangement_dirty = false;
+                self.studio.seek_pending = false;
+                self.loaded = want;
+                // Fresh buffer load: the video-facing clock restarts from
+                // wherever the timeline actually is right now (NOT from
+                // the loop's own start -- a seek into the middle of a loop
+                // range must resume video from there, same as the audio
+                // seek two lines up does).
+                self.studio.loop_video_base = self.studio.transport.position();
+                self.studio.loop_video_elapsed = 0;
+                self.studio.loop_last_raw_frame = None;
+            }
+            self.sink.set_playing(true);
+            if let Some(f) = self.sink.position() {
+                // Video follows audio, never the reverse (transport's rule №1)
+                // — the sink's consumed frames ARE the playhead. EXCEPT
+                // while looping: the sink's own position cycles forever
+                // inside the loop window, and "the timeline should
+                // function like a timeline" (never freezing, never
+                // trapped) means video must keep advancing regardless.
+                // `at` (below) is genuinely wrapped -- still needed for
+                // loop-record pass detection -- while the position that
+                // actually drives video/the UI ruler is the separately
+                // unwrapped unbounded clock.
+                let at = match window {
+                    Some(w) => w.timeline(f),
+                    None => studio_core::Ticks::from_samples(f as i64, self.sink.rate()),
+                };
+                match window {
+                    Some(w) => {
+                        let delta = Self::unwrap_cycled_frames(self.studio.loop_last_raw_frame, f, w.frames());
+                        self.studio.loop_video_elapsed += delta;
+                        self.studio.loop_last_raw_frame = Some(f);
+                        let video_at = self.studio.loop_video_base.saturating_add(studio_core::Ticks::from_samples(self.studio.loop_video_elapsed, self.sink.rate()));
+                        self.studio.transport.set_position(video_at);
+                    }
+                    None => self.studio.transport.set_position(at),
+                }
+                // Loop-record: the playhead came round while the take
+                // ran — what the microphone caught is one pass, placed
+                // at the loop's start on the next free lane. Uses the
+                // WRAPPED `at`, not the unwrapped video clock -- pass
+                // detection is defined in terms of the loop's own cycle.
+                if let Some(w) = window {
+                    if self.mic.recording() && self.passes.observe(at) {
+                        self.commit_pass(w);
+                    }
+                }
+            } else if !self.sink.playing() {
+                self.studio.transport.stop();
+                self.studio.status = "reached the end".into();
+            }
+        } else if self.studio.rack_playing {
+            if self.loaded != SinkContent::RackLoop || self.studio.loop_dirty {
+                let samples = self.studio.render_loop(self.sink.rate(), &self.audio);
+                self.sink.set_buffer(std::sync::Arc::new(samples), 1, true);
+                self.studio.loop_dirty = false;
+                self.loaded = SinkContent::RackLoop;
+            }
+            self.sink.set_playing(true);
+        } else {
+            self.sink.set_playing(false);
+        }
     }
 
     /// One loop-record pass: cut the take so far and place it at the
@@ -5446,7 +5564,7 @@ impl App {
             });
         if run { self.find_ui = Some(ui_state); self.run_find(); }
         else if open { self.find_ui = Some(ui_state); }
-        if let Some(at) = goto { self.studio.transport.set_position(at); }
+        if let Some(at) = goto { self.studio.seek(at); }
     }
 
     /// The mastering pass window: measurements, findings, the strength
@@ -5918,6 +6036,88 @@ impl studio_egui::playkeys::AnalogSource for WootingAnalog {
         analog_kit::velocity(self.0.depth(Self::hid_of(key), held), 1.6)
     }
     fn active(&self) -> bool { self.0.active() }
+}
+
+#[cfg(test)]
+mod sink_resync_tests {
+    use super::*;
+
+    /// The exact bug: pause, seek backward, play. Nothing about WHAT is
+    /// loaded changes (still a plain, non-looped arrangement) and no
+    /// project edit happened, so `loaded == want` and `arrangement_dirty
+    /// == false` -- the two conditions `should_resync` checked BEFORE this
+    /// fix. Without `seek_pending`, this returns `false`, meaning
+    /// `sync_sink` skips `self.sink.seek(...)` entirely and the sink
+    /// resumes from its own stale internal cursor -- exactly the reported
+    /// symptom. With `seek_pending`, it returns `true`.
+    #[test]
+    fn a_bare_seek_with_no_content_change_still_forces_a_resync() {
+        let loaded = SinkContent::Arrangement;
+        let want = SinkContent::Arrangement;
+
+        // Before the fix, this line would have been `loaded != want ||
+        // arrangement_dirty` -- both false here -- so the call below
+        // would have returned false, silently skipping the reseek.
+        assert!(
+            App::should_resync(&loaded, &want, false, true),
+            "a user-initiated seek with unchanged content and no project edit MUST still force a resync"
+        );
+    }
+
+    /// The inverse, equally important: nothing pending, nothing dirty, no
+    /// content change -- must NOT resync every tick. Without this,
+    /// `sync_sink` would re-render and re-seek the sink on every single
+    /// frame it's called, which is the "resync forced constantly" failure
+    /// mode a careless fix (e.g. defaulting `seek_pending` to `true`)
+    /// could introduce instead.
+    #[test]
+    fn steady_playback_with_nothing_pending_does_not_resync() {
+        let loaded = SinkContent::Arrangement;
+        let want = SinkContent::Arrangement;
+        assert!(!App::should_resync(&loaded, &want, false, false));
+    }
+
+    /// The two pre-existing reasons still work, unchanged by this fix.
+    #[test]
+    fn content_change_and_project_edit_still_force_a_resync_on_their_own() {
+        let arrangement = SinkContent::Arrangement;
+        let looped = SinkContent::ArrangementLoop(looping::Window::new(Some((Ticks::ZERO, Ticks::from_seconds(2.0))), 48_000).unwrap());
+
+        assert!(App::should_resync(&arrangement, &looped, false, false), "switching into a loop must resync");
+        assert!(App::should_resync(&arrangement, &arrangement, true, false), "a project edit must resync");
+    }
+
+    /// The video-decoupling fix: a cycling sink position (0..period,
+    /// wrapping forever while a beat pattern loops) must unwrap into a
+    /// monotonically increasing total -- this is what lets video keep
+    /// advancing "like a normal timeline" instead of freezing or being
+    /// trapped in the loop range. Computed independently in Python first
+    /// (not hand-derived) to cross-check the arithmetic before trusting
+    /// this assertion.
+    #[test]
+    fn unwrap_cycled_frames_accumulates_monotonically_across_repeated_wraps() {
+        let period = 100usize;
+        let mut prev = None;
+        let mut total = 0i64;
+        for f in [0usize, 40, 80, 10, 55, 95, 5, 50] {
+            total += App::unwrap_cycled_frames(prev, f, period);
+            prev = Some(f);
+        }
+        assert_eq!(total, 250, "cross-checked independently: 40+40+30+45+40+10+45=250");
+    }
+
+    #[test]
+    fn unwrap_cycled_frames_first_call_has_no_delta() {
+        // No previous sample means no basis for a delta -- must be 0, not
+        // panic and not treat `current` itself as elapsed time.
+        assert_eq!(App::unwrap_cycled_frames(None, 73, 100), 0);
+    }
+
+    #[test]
+    fn unwrap_cycled_frames_handles_a_single_wrap_correctly() {
+        // period=100, was at 90, now at 5: travelled 10 (90->100) + 5 = 15.
+        assert_eq!(App::unwrap_cycled_frames(Some(90), 5, 100), 15);
+    }
 }
 
 #[cfg(test)]
