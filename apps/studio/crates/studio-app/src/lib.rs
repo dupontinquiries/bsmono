@@ -15,6 +15,15 @@ use studio_core::{Project, Ticks};
 use studio_egui::touch::{Panel, ViewMode};
 use studio_live::transport::Transport;
 
+/// Which file on disk is which clip, and what to do when it moves. The
+/// content hash existed (collab's Manifest) and the path existed; nothing
+/// joined them, so a moved sample failed as a decode error rather than as
+/// "this file moved".
+pub mod media_map;
+/// What a dropped file should become. The drop handler had one branch --
+/// directory is a kit, everything else is a rack channel -- so a video
+/// dropped on the timeline became a sampler hit.
+pub mod drop_plan;
 pub mod archive;
 pub mod audition;
 pub mod call;
