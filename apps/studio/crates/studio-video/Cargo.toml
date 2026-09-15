@@ -9,3 +9,4 @@ studio-audio = { path = "../studio-audio" }
 studio-media = { path = "../studio-media" }
 studio-core = { path = "../studio-core" }
 serde_json = "1"
+sha2 = "0.10"

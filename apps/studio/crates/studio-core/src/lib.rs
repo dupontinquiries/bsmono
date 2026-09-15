@@ -217,6 +217,21 @@ pub struct Project {
     /// undo could not restore.
     #[serde(default)]
     pub groups: BTreeMap<GroupId, Group>,
+    /// Archive-mode provenance per source: the exact hash it was last
+    /// verified against on disk, and — when the original was replaced by a
+    /// lower-quality stand-in and deleted — how to get it back. Sparse and
+    /// optional on purpose: a source with no entry here is just an
+    /// ordinary source, no different from before this existed.
+    /// `serde(default)` for the usual reason (a project saved before this
+    /// existed still loads).
+    #[serde(default)]
+    pub provenance: BTreeMap<SourceId, Provenance>,
+    /// Per-source perceptual fingerprints for fuzzy content matching
+    /// (transcoded/re-encoded duplicate detection) -- sparse and
+    /// independent of `provenance` on purpose: a project may want fuzzy
+    /// matching without archive tracking, or vice versa.
+    #[serde(default)]
+    pub fingerprints: BTreeMap<SourceId, FingerprintData>,
     /// Reusable automation curves, addressed by id — see the `curves`
     /// module. A curve with no binding is inert; a curve is never removed
     /// while a binding names it. `serde(default)` for the usual reason.
@@ -351,6 +366,58 @@ pub struct Group {
     /// this field existed. `#[serde(default)]` for the usual reason.
     #[serde(default)]
     pub active: Option<ClipId>,
+}
+
+/// Archive-mode provenance for one source: what it was last verified as on
+/// disk, and — for a proxy standing in for deleted original media — how to
+/// get the real thing back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Provenance {
+    /// Whole-file SHA-256 of THIS source's media, as of `verified_at`.
+    pub content_hash: [u8; 32],
+    pub file_size: u64,
+    /// Where this exact content was found, last time it was verified —
+    /// may differ from the source's OWN registered path if a relocation
+    /// search found it moved. `None` if it has never been found again
+    /// since being recorded (deleted, or not yet searched for).
+    pub last_verified_path: Option<String>,
+    /// Freeform timestamp (ISO 8601, or whatever the caller uses) of the
+    /// last verification — deliberately not a typed date: this crate has
+    /// no reason to parse it, only to show it.
+    pub verified_at: Option<String>,
+    /// Set when this source is a lower-quality stand-in for original
+    /// media that no longer exists at any known location.
+    #[serde(default)]
+    pub proxy_of: Option<ProxyInfo>,
+}
+
+/// What's known about the original media a proxy replaced.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProxyInfo {
+    /// The original's own content hash, if it was ever computed before
+    /// the original was lost — lets a re-acquired copy be VERIFIED as the
+    /// same footage, not just assumed to be.
+    pub original_hash: Option<[u8; 32]>,
+    /// How to get the original back: a camera/card name, a URL, a shoot
+    /// date, a person to ask — whatever the operator recorded. Freeform on
+    /// purpose; this crate has no way to act on it, only to show it.
+    pub reacquire_hint: Option<String>,
+    /// Why this proxy exists, in the operator's own words ("original
+    /// deleted after import to free the card", "downloaded compressed
+    /// copy, original never had"). Distinct from `reacquire_hint`: this is
+    /// the "why", that is the "how".
+    pub note: Option<String>,
+}
+
+/// A source's perceptual temporal fingerprint, stored as pure data --
+/// computed by `studio_video::fingerprint` (which needs `ffmpeg`), kept
+/// here so this crate can hold and serialize the RESULT without depending
+/// on anything that shells out. One dHash per sampled position, evenly
+/// spaced by `interval`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FingerprintData {
+    pub hashes: Vec<u64>,
+    pub interval: Ticks,
 }
 
 /// An effect parameter's key, fixed-width so an [`AutoTarget`] stays
@@ -658,6 +725,14 @@ pub enum Op {
     /// Dissolve a composition. Its clips are untouched — ungrouping is an
     /// organizational act, never an edit to the music.
     RemoveGroup { id: GroupId },
+    /// Set (or clear) a source's provenance record, absolutely -- same
+    /// LWW-friendly shape as `SetGroup`. A source with no record is
+    /// ordinary; this is additive metadata, never required for a project
+    /// to be valid.
+    SetProvenance { source: SourceId, provenance: Provenance },
+    RemoveProvenance { source: SourceId },
+    SetFingerprint { source: SourceId, fingerprint: FingerprintData },
+    RemoveFingerprint { source: SourceId },
     /// Set (or clear) the song's key. Absolute, like every other setting
     /// here, so two writers converge on the last word rather than on a
     /// sum of transpositions.
@@ -1216,6 +1291,30 @@ impl Project {
                 } else {
                     Ok(Op::Group { ops: restores })
                 }
+            }
+            Op::SetProvenance { source, provenance } => {
+                let inv = match self.provenance.get(source) {
+                    Some(old) => Op::SetProvenance { source: *source, provenance: old.clone() },
+                    None => Op::RemoveProvenance { source: *source },
+                };
+                self.provenance.insert(*source, provenance.clone());
+                Ok(inv)
+            }
+            Op::RemoveProvenance { source } => {
+                let old = self.provenance.remove(source).ok_or(EditError::NoSuchSource(*source))?;
+                Ok(Op::SetProvenance { source: *source, provenance: old })
+            }
+            Op::SetFingerprint { source, fingerprint } => {
+                let inv = match self.fingerprints.get(source) {
+                    Some(old) => Op::SetFingerprint { source: *source, fingerprint: old.clone() },
+                    None => Op::RemoveFingerprint { source: *source },
+                };
+                self.fingerprints.insert(*source, fingerprint.clone());
+                Ok(inv)
+            }
+            Op::RemoveFingerprint { source } => {
+                let old = self.fingerprints.remove(source).ok_or(EditError::NoSuchSource(*source))?;
+                Ok(Op::SetFingerprint { source: *source, fingerprint: old })
             }
         }
     }
@@ -2248,6 +2347,137 @@ mod group_and_bus_input_tests {
         assert_eq!(p.groups[&GroupId(1)].active, Some(ClipId(99)), "no membership validation -- that's a UI/consumer concern, not this layer's");
     }
 }
+
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    fn project_with_source() -> Project {
+        let mut p = Project::default();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "clip.mov".into(),
+            len: Ticks(100_000), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
+        p
+    }
+
+    fn sample_provenance(byte: u8) -> Provenance {
+        Provenance {
+            content_hash: [byte; 32],
+            file_size: 42,
+            last_verified_path: Some("clip.mov".into()),
+            verified_at: Some("2026-09-14T00:00:00Z".into()),
+            proxy_of: None,
+        }
+    }
+
+    #[test]
+    fn set_then_undo_restores_no_record_at_all() {
+        let mut p = project_with_source();
+        assert!(!p.provenance.contains_key(&SourceId(1)), "no record before anything is set");
+        let inv = p.apply(&Op::SetProvenance { source: SourceId(1), provenance: sample_provenance(7) }).unwrap();
+        assert_eq!(p.provenance[&SourceId(1)].content_hash, [7u8; 32]);
+        p.apply(&inv).unwrap();
+        assert!(!p.provenance.contains_key(&SourceId(1)), "undo of the FIRST set must remove the record entirely, not restore an empty one");
+    }
+
+    #[test]
+    fn restating_provenance_is_absolute_and_undoes_to_the_previous_value() {
+        let mut p = project_with_source();
+        p.apply(&Op::SetProvenance { source: SourceId(1), provenance: sample_provenance(1) }).unwrap();
+        let inv = p.apply(&Op::SetProvenance { source: SourceId(1), provenance: sample_provenance(2) }).unwrap();
+        assert_eq!(p.provenance[&SourceId(1)].content_hash, [2u8; 32]);
+        p.apply(&inv).unwrap();
+        assert_eq!(p.provenance[&SourceId(1)].content_hash, [1u8; 32], "undo restores the PREVIOUS record, not nothing");
+    }
+
+    #[test]
+    fn remove_provenance_undoes_by_restoring_the_exact_record() {
+        let mut p = project_with_source();
+        let mut prov = sample_provenance(3);
+        prov.proxy_of = Some(ProxyInfo {
+            original_hash: Some([9u8; 32]),
+            reacquire_hint: Some("card slot 2".into()),
+            note: Some("deleted after import".into()),
+        });
+        p.apply(&Op::SetProvenance { source: SourceId(1), provenance: prov.clone() }).unwrap();
+        let inv = p.apply(&Op::RemoveProvenance { source: SourceId(1) }).unwrap();
+        assert!(!p.provenance.contains_key(&SourceId(1)));
+        p.apply(&inv).unwrap();
+        assert_eq!(p.provenance[&SourceId(1)], prov, "undo of remove must restore the record byte for byte, including the proxy info");
+    }
+
+    #[test]
+    fn removing_provenance_that_does_not_exist_is_refused_by_name() {
+        let mut p = project_with_source();
+        assert!(matches!(p.apply(&Op::RemoveProvenance { source: SourceId(1) }), Err(EditError::NoSuchSource(SourceId(1)))));
+    }
+
+    /// Provenance is deliberately independent of the source it describes:
+    /// removing the SOURCE does not clean up its provenance record (same
+    /// "sparse, may dangle, harmless" contract `groups` already uses for
+    /// clip membership) -- pinned here so that stays a decision, not an
+    /// accident.
+    #[test]
+    fn removing_the_source_leaves_its_provenance_record_dangling_not_cleaned_up() {
+        let mut p = project_with_source();
+        p.apply(&Op::SetProvenance { source: SourceId(1), provenance: sample_provenance(4) }).unwrap();
+        p.apply(&Op::RemoveSource { id: SourceId(1) }).unwrap();
+        assert!(p.provenance.contains_key(&SourceId(1)), "provenance is sparse metadata, not cleaned up by RemoveSource -- this pins that as deliberate");
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_op_tests {
+    use super::*;
+
+    fn project_with_source() -> Project {
+        let mut p = Project::default();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "clip.mov".into(),
+            len: Ticks(100_000), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
+        p
+    }
+
+    fn sample_fingerprint(seed: u64) -> FingerprintData {
+        FingerprintData { hashes: vec![seed, seed + 1, seed + 2], interval: Ticks::from_seconds(1.0) }
+    }
+
+    #[test]
+    fn set_then_undo_restores_no_record_at_all() {
+        let mut p = project_with_source();
+        let inv = p.apply(&Op::SetFingerprint { source: SourceId(1), fingerprint: sample_fingerprint(10) }).unwrap();
+        assert_eq!(p.fingerprints[&SourceId(1)].hashes, vec![10, 11, 12]);
+        p.apply(&inv).unwrap();
+        assert!(!p.fingerprints.contains_key(&SourceId(1)));
+    }
+
+    #[test]
+    fn restating_is_absolute_and_undoes_to_the_previous_value() {
+        let mut p = project_with_source();
+        p.apply(&Op::SetFingerprint { source: SourceId(1), fingerprint: sample_fingerprint(1) }).unwrap();
+        let inv = p.apply(&Op::SetFingerprint { source: SourceId(1), fingerprint: sample_fingerprint(100) }).unwrap();
+        assert_eq!(p.fingerprints[&SourceId(1)].hashes[0], 100);
+        p.apply(&inv).unwrap();
+        assert_eq!(p.fingerprints[&SourceId(1)].hashes[0], 1);
+    }
+
+    #[test]
+    fn remove_undoes_by_restoring_the_exact_record() {
+        let mut p = project_with_source();
+        let fp = sample_fingerprint(5);
+        p.apply(&Op::SetFingerprint { source: SourceId(1), fingerprint: fp.clone() }).unwrap();
+        let inv = p.apply(&Op::RemoveFingerprint { source: SourceId(1) }).unwrap();
+        assert!(!p.fingerprints.contains_key(&SourceId(1)));
+        p.apply(&inv).unwrap();
+        assert_eq!(p.fingerprints[&SourceId(1)], fp);
+    }
+
+    #[test]
+    fn removing_a_fingerprint_that_does_not_exist_is_refused_by_name() {
+        let mut p = project_with_source();
+        assert!(matches!(p.apply(&Op::RemoveFingerprint { source: SourceId(1) }), Err(EditError::NoSuchSource(SourceId(1)))));
+    }
+}
+
 
 #[cfg(test)]
 mod tempo_map_tests {
