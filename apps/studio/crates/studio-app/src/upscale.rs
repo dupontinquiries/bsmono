@@ -72,6 +72,17 @@ pub fn start(input: PathBuf, start_s: f64, end_s: f64, out: PathBuf, settings: &
             d2x_job::Event::Stage(m) => {
                 let _ = tx.send(Event::Note(format!("upscale: {m}")));
             }
+            // d2x_job::Event grew this variant alongside the GUI-bugfix
+            // branch that made the RAM-aware plan actually apply on
+            // every path (previously bscale's single-job flow silently
+            // skipped it). Added here for the same reason the comment on
+            // `PlateUpscaled` below already explains: this match is not
+            // wildcarded on purpose, so a new sibling event surfaces as a
+            // compile error the moment studio-app doesn't handle it, not
+            // as a silently dropped one.
+            d2x_job::Event::MemoryPlan(plan) => {
+                let _ = tx.send(Event::Note(format!("upscale: {plan}")));
+            }
             d2x_job::Event::Pipeline(p) | d2x_job::Event::Segment(_, p) => match p {
                 d2x_job::PipelineEvent::Started { info, upscaler, .. } => {
                     total = info.frame_count;
