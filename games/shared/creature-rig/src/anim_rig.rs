@@ -138,6 +138,19 @@ pub struct MotionInput {
     pub strike: f32,
     /// Both legs swing together (a bird's hop) instead of in diagonal pairs.
     pub hop: bool,
+    /// Per-leg phase offsets in radians, indexed by the order `Role::Leg`
+    /// parts appear in `parts`. `None` keeps the built-in even/odd rule.
+    ///
+    /// Exists because the built-in rule can only express ONE pattern, and
+    /// quadrupeds change footfall pattern with speed — a walk is 4-beat, a
+    /// canter 3-beat, a bound pairs front-then-hind. Those are not frequency
+    /// changes and cannot be reached by scaling `gait_phase`.
+    ///
+    /// See [`LEG_PHASES_TROT`] and friends, and read their docs before
+    /// picking one: which index is which leg depends on the order the caller
+    /// supplies parts in, and getting that wrong silently produces a
+    /// different real gait rather than an error.
+    pub leg_phases: Option<[f32; 4]>,
     /// Scales the limb swing (a design's `looseness`; 1 = default).
     pub swing_scale: f32,
 }
@@ -161,6 +174,7 @@ impl Default for MotionInput {
             settle: 0.0,
             strike: 0.0,
             hop: false,
+            leg_phases: None,
             swing_scale: 1.0,
         }
     }
@@ -276,6 +290,31 @@ pub fn strike_curve(progress: f32) -> f32 {
 
 /// Diagonal-pair leg phase: even legs at 0, odd at π — the same rule
 /// `pose::leg_phase_offset` uses, so both paths trot alike.
+///
+/// **Caveat, found when this module was shared with a second game.** Whether
+/// even/odd lands on a diagonal or a lateral pair depends entirely on the
+/// order the caller supplies `Role::Leg` parts in, and for the most natural
+/// ordering — front pair then hind pair, same side first in each — it lands
+/// on a LATERAL pair:
+///
+/// ```text
+///   i=0 front-right ┐ even, phase 0
+///   i=1 front-left  ┐ odd,  phase π
+///   i=2 hind-right  ┘ even, phase 0   <- same side as i=0
+///   i=3 hind-left   ┘ odd,  phase π
+/// ```
+///
+/// Front-right moving with hind-right is a **pace**, not a trot. It is a real
+/// gait (camels, some bears) but an unusual one, and on a dog or a cat it
+/// reads as the camel-walk wobble. `legs_pivot_at_the_hip_and_diagonal_pairs_oppose`
+/// does not catch it because it only compares legs 0 and 1, which oppose
+/// under either gait.
+///
+/// This is left AS IS rather than quietly corrected: unendlich's creatures
+/// have been animating this way and silently changing another game's gait as
+/// a side effect of a refactor is not a fix, it is a surprise. Callers that
+/// want a specific pattern pass [`MotionInput::leg_phases`]; see
+/// [`LEG_PHASES_TROT`].
 fn leg_phase_offset(i: usize) -> f32 {
     if i % 2 == 0 {
         0.0
@@ -283,6 +322,46 @@ fn leg_phase_offset(i: usize) -> f32 {
         PI
     }
 }
+
+/// Resolve a leg's phase offset: the explicit table if given, else the
+/// built-in even/odd rule.
+fn gait_offset(m: &MotionInput, leg_i: usize) -> f32 {
+    match m.leg_phases {
+        Some(t) if leg_i < 4 => finite(t[leg_i]),
+        _ => leg_phase_offset(leg_i),
+    }
+}
+
+// ── gait presets ─────────────────────────────────────────────────────────
+//
+// All indexed for the part order `[front-left, front-right, hind-left,
+// hind-right]`. Supplying legs in a different order and using these unchanged
+// produces a different real gait rather than an error, which is exactly the
+// trap `leg_phase_offset` fell into — so the order is stated on every one.
+
+/// 2-beat diagonal pairs: FL+HR, then FR+HL. The ordinary cruise gait.
+pub const LEG_PHASES_TROT: [f32; 4] = [0.0, PI, PI, 0.0];
+/// 2-beat lateral pairs: FL+HL, then FR+HR. Camels; a stalking cat's creep.
+pub const LEG_PHASES_PACE: [f32; 4] = [0.0, PI, 0.0, PI];
+/// 4-beat lateral sequence HL → FL → HR → FR. Always three feet down, which
+/// is why heavy animals use it and why it reads as "walking".
+pub const LEG_PHASES_WALK: [f32; 4] = [
+    0.5 * PI,
+    1.5 * PI,
+    0.0,
+    PI,
+];
+/// 3-beat, right lead: HL, then HR+FL, then FR.
+pub const LEG_PHASES_CANTER: [f32; 4] = [
+    2.0 * PI / 3.0,
+    4.0 * PI / 3.0,
+    0.0,
+    2.0 * PI / 3.0,
+];
+/// 2-beat front pair then hind pair. The cat sprint. Equivalent to
+/// [`MotionInput::hop`] for a quadruped, and preferred over it because it
+/// says which pairs rather than collapsing every leg to phase 0.
+pub const LEG_PHASES_BOUND: [f32; 4] = [0.0, 0.0, PI, PI];
 
 /// The long axis of a box (index of its largest half-extent).
 fn long_axis(half: [f32; 3]) -> usize {
@@ -431,7 +510,7 @@ pub fn pose(
         let mut rides_bob = true;
         match p.role {
             Role::Leg => {
-                let off = if m.hop { 0.0 } else { leg_phase_offset(leg_i) };
+                let off = if m.hop { 0.0 } else { gait_offset(m, leg_i) };
                 leg_i += 1;
                 let s = (phase + off).sin();
                 let c = (phase + off).cos();
@@ -689,6 +768,112 @@ mod tests {
         }
         assert!(min_stance_err < 0.03, "stance sole floats by {min_stance_err} (the residual float)");
         assert!(max_swing_lift > 0.08, "swing foot never lifts ({max_swing_lift})");
+    }
+
+    /// The finding recorded on `leg_phase_offset`: with the natural part
+    /// ordering the built-in rule pairs SAME-SIDE legs, which is a pace.
+    ///
+    /// Pinned as a characterisation test, not an approval. If someone fixes
+    /// the default to a true diagonal this fails loudly and they can update
+    /// it deliberately — which is the point, since unendlich's creatures
+    /// currently move this way and the change would be visible.
+    #[test]
+    fn the_builtin_rule_pairs_lateral_legs_not_diagonal_ones() {
+        let (parts, th) = quadruped();
+        // parts[3..] are FR, FL, HR, HL by their offsets (X fwd, Z right).
+        let m = MotionInput { gait_phase: PI / 2.0, speed: 4.0, ..Default::default() };
+        let out = posed(&parts, th, &m, None);
+        let f = feet(&out);
+        let (fr, fl, hr, hl) = (f[0].rot[1], f[1].rot[1], f[2].rot[1], f[3].rot[1]);
+        assert!((fr - hr).abs() < 1e-5, "front-right and hind-right move together: a PACE");
+        assert!((fl - hl).abs() < 1e-5, "and the left pair likewise");
+        assert!((fr - hl).abs() > 0.1, "the DIAGONAL is not paired, which a trot would require");
+    }
+
+    /// The override reaches the legs and produces a real trot: diagonals
+    /// together, laterals opposed — the thing the built-in rule cannot do
+    /// with this part ordering.
+    #[test]
+    fn explicit_leg_phases_give_a_true_diagonal_trot() {
+        let (parts, th) = quadruped();
+        // Reorder to the [FL, FR, HL, HR] convention the presets document.
+        let mut p = parts.clone();
+        p.swap(3, 4); // FL, FR, HR, HL
+        p.swap(5, 6); // FL, FR, HL, HR
+        let m = MotionInput {
+            gait_phase: PI / 2.0,
+            speed: 4.0,
+            leg_phases: Some(LEG_PHASES_TROT),
+            ..Default::default()
+        };
+        let out = posed(&p, th, &m, None);
+        let f = feet(&out);
+        let (fl, fr, hl, hr) = (f[0].rot[1], f[1].rot[1], f[2].rot[1], f[3].rot[1]);
+        assert!((fl - hr).abs() < 1e-5, "FL pairs with HR: {fl} vs {hr}");
+        assert!((fr - hl).abs() < 1e-5, "FR pairs with HL: {fr} vs {hl}");
+        assert!((fl - fr).abs() > 0.1, "the diagonals oppose each other");
+    }
+
+    /// A walk is 4-beat: no two legs land together. The pattern heavy builds
+    /// need, and one a single sine cannot reach.
+    #[test]
+    fn a_walk_is_four_distinct_beats() {
+        let mut seen: Vec<f32> = Vec::new();
+        for ph in LEG_PHASES_WALK {
+            let ph = ph.rem_euclid(2.0 * PI);
+            assert!(
+                seen.iter().all(|q: &f32| (q - ph).abs() > 0.1),
+                "walk phase {ph} collides with an earlier leg"
+            );
+            seen.push(ph);
+        }
+        assert_eq!(LEG_PHASES_BOUND[0], LEG_PHASES_BOUND[1], "front pair together");
+        assert_eq!(LEG_PHASES_BOUND[2], LEG_PHASES_BOUND[3], "hind pair together");
+        assert!((LEG_PHASES_BOUND[0] - LEG_PHASES_BOUND[2]).abs() > 0.1);
+        assert_ne!(LEG_PHASES_PACE, LEG_PHASES_TROT, "pace and trot are different gaits");
+    }
+
+    /// `None` must behave exactly as before the field existed — the basis for
+    /// calling this non-breaking for unendlich.
+    #[test]
+    fn omitting_leg_phases_changes_nothing() {
+        let (parts, th) = quadruped();
+        for k in 0..8 {
+            let phase = k as f32 / 8.0 * 2.0 * PI;
+            let base = MotionInput { gait_phase: phase, speed: 5.0, ..Default::default() };
+            let a = posed(&parts, th, &base, None);
+            let b = posed(&parts, th, &MotionInput { leg_phases: None, ..base }, None);
+            assert_eq!(a, b, "None must equal the built-in rule at phase {phase}");
+        }
+    }
+
+    /// `hop` still wins, and a non-finite table cannot poison the geometry.
+    #[test]
+    fn hop_overrides_the_table_and_bad_values_are_neutralised() {
+        let (parts, th) = quadruped();
+        let m = MotionInput {
+            gait_phase: PI / 2.0,
+            speed: 4.0,
+            hop: true,
+            leg_phases: Some(LEG_PHASES_TROT),
+            ..Default::default()
+        };
+        let out = posed(&parts, th, &m, None);
+        let f = feet(&out);
+        assert!((f[0].rot[1] - f[1].rot[1]).abs() < 1e-5, "hop still pairs every leg");
+
+        let bad = MotionInput {
+            gait_phase: 1.0,
+            speed: 4.0,
+            leg_phases: Some([f32::NAN, f32::INFINITY, -f32::INFINITY, 0.0]),
+            ..Default::default()
+        };
+        let out = posed(&parts, th, &bad, None);
+        assert!(
+            out.iter().all(|b| b.center.iter().all(|c| c.is_finite())
+                && b.rot.iter().all(|r| r.is_finite())),
+            "a bad table must not produce NaN geometry"
+        );
     }
 
     #[test]

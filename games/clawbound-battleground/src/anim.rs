@@ -19,16 +19,18 @@
 //! So: this picks the gait and shapes the drive; `creature-rig` does the
 //! geometry. [`Anim::motion_input`] is the join.
 //!
-//! ## What clawbound still cannot express, honestly
+//! ## Footfall patterns now reach the rig
 //!
-//! `MotionInput` has no footfall-phase input — it hard-codes diagonal pairs,
-//! with `hop` for both-legs-together. So [`Gait::Trot`] and [`Gait::Bound`]
-//! map exactly, and **`Walk`, `Pace` and `Canter` currently render as a
-//! trot**. Getting them needs a phase-offset array threaded into
-//! `anim_rig::pose`, which is a small upstream change to a crate two games now
-//! share — deliberately not made as a side effect of this extraction. The
-//! selection logic below is already correct, so that change lights it up
-//! without touching this file.
+//! `anim_rig` originally hard-coded one pattern (diagonal pairs, plus a `hop`
+//! flag), so `Walk`, `Pace` and `Canter` all rendered as a trot. It now takes
+//! a `leg_phases` table and [`Gait::leg_phases`] supplies it, so the whole
+//! taxonomy renders.
+//!
+//! One thing to keep in mind when adding a creature: the table is indexed
+//! `[FL, FR, HL, HR]` and legs must be supplied to the rig in that order.
+//! Getting it wrong yields a different real gait — a pace instead of a trot —
+//! rather than an error, which is exactly the trap the rig's own built-in
+//! rule fell into.
 
 use creature_rig::anim_rig::{MotionInput, SPEED_SATURATE};
 use creature_rig::sim::liveliness::MotionState;
@@ -52,10 +54,26 @@ pub enum Gait {
 
 impl Gait {
     /// Does this pattern move both legs of a pair together?
-    ///
-    /// The one bit of the taxonomy `anim_rig` can currently act on.
     pub fn is_paired(self) -> bool {
         matches!(self, Gait::Bound)
+    }
+
+    /// The rig's per-leg phase table for this gait.
+    ///
+    /// Indexed `[FL, FR, HL, HR]`, which is the order this game supplies
+    /// `Role::Leg` parts in. That ordering is load-bearing — see the presets'
+    /// docs in `creature_rig::anim_rig`: supplying legs in a different order
+    /// and reusing these tables produces a different real gait rather than an
+    /// error.
+    pub fn leg_phases(self) -> [f32; 4] {
+        use creature_rig::anim_rig as rig;
+        match self {
+            Gait::Walk => rig::LEG_PHASES_WALK,
+            Gait::Trot => rig::LEG_PHASES_TROT,
+            Gait::Pace => rig::LEG_PHASES_PACE,
+            Gait::Canter => rig::LEG_PHASES_CANTER,
+            Gait::Bound => rig::LEG_PHASES_BOUND,
+        }
     }
 
     /// Fraction of the cycle a foot is on the ground. Faster gaits have a
@@ -218,7 +236,12 @@ impl Anim {
             impact: impact.clamp(0.0, 1.0),
             settle: 0.0,
             strike: 0.0,
-            hop: self.gait.is_paired(),
+            // The bound is expressed as a phase table rather than `hop`,
+            // which collapses every leg to phase 0. The table says which
+            // pairs, so a bound reads as front-then-hind instead of a
+            // four-legged pogo.
+            hop: false,
+            leg_phases: Some(self.gait.leg_phases()),
             // Heavier animals swing less freely, on top of the gait's own
             // drive.
             swing_scale: self.gait.swing_scale() * (1.0 - 0.25 * self.build.heft),
@@ -257,14 +280,50 @@ mod tests {
         assert_eq!(Build::feline().stride_hz(0.0), 0.0);
     }
 
-    /// Only a bound pairs the legs; that is the one bit of the taxonomy the
-    /// rig can act on today.
+    /// Every gait must map to a distinct footfall table, or the taxonomy is
+    /// decoration.
     #[test]
-    fn only_bounding_sets_hop() {
+    fn each_gait_maps_to_a_distinct_phase_table() {
+        use creature_rig::anim_rig as rig;
+        assert_eq!(Gait::Trot.leg_phases(), rig::LEG_PHASES_TROT);
+        assert_eq!(Gait::Bound.leg_phases(), rig::LEG_PHASES_BOUND);
+        let all = [Gait::Walk, Gait::Trot, Gait::Pace, Gait::Canter, Gait::Bound];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.leg_phases(), b.leg_phases(), "{a:?} and {b:?} share a table");
+            }
+        }
+        // A pace and a trot are the pair most easily confused, and the rig's
+        // own default conflated them.
+        assert_ne!(Gait::Pace.leg_phases(), Gait::Trot.leg_phases());
+    }
+
+    /// Bounding pairs the legs, and the table says so rather than the `hop`
+    /// flag, which would collapse all four to one phase.
+    #[test]
+    fn bounding_pairs_front_then_hind_via_the_table() {
+        let t = Gait::Bound.leg_phases();
+        assert_eq!(t[0], t[1], "front pair together");
+        assert_eq!(t[2], t[3], "hind pair together");
+        assert!((t[0] - t[2]).abs() > 0.1, "and the pairs oppose");
         assert!(Gait::Bound.is_paired());
         for g in [Gait::Walk, Gait::Trot, Gait::Pace, Gait::Canter] {
-            assert!(!g.is_paired(), "{g:?} must not hop");
+            assert!(!g.is_paired(), "{g:?} must not pair");
         }
+    }
+
+    /// The rig must receive the table, and must not also get `hop` — which
+    /// would override it.
+    #[test]
+    fn motion_input_carries_the_table_and_not_hop() {
+        let mut a = Anim::new(Build::feline());
+        for _ in 0..200 {
+            a.advance(1.0 / 60.0, 12.0, false);
+        }
+        assert_eq!(a.gait(), Gait::Bound);
+        let m = a.motion_input(0.0, (0.0, 0.0), 0.0, MotionState::Idle, 0.0);
+        assert!(!m.hop, "hop would collapse the table");
+        assert_eq!(m.leg_phases, Some(Gait::Bound.leg_phases()));
     }
 
     #[test]
