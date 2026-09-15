@@ -453,4 +453,17 @@ mod tests {
         assert!(rejected[0].contains("delete_tree"));
         assert!(matches!(parsed[0].actions[0], ToolAction::CopyFile { .. }));
     }
+
+    #[test]
+    fn a_reply_with_no_json_array_at_all_is_rejected_visibly_not_a_panic() {
+        // The first failure branch in parse_reply -- reply.find('[')
+        // returning None entirely -- had no test. A real, plausible LLM
+        // failure mode: a reply that's pure prose ("I don't see any
+        // duplicate files to report") with no structured output at all.
+        let mut rejected = Vec::new();
+        let parsed = OllamaBackend::parse_reply("I don't see anything to suggest here.", &mut rejected);
+        assert!(parsed.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0].contains("no JSON array"), "{}", rejected[0]);
+    }
 }
