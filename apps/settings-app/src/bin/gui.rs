@@ -46,24 +46,42 @@ impl eframe::App for BSettings {
             let _ = s.poll();
         }
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("BigSilicon settings");
-            ui.separator();
-            let changes = self.editor.ui(ui, &Adaptive::default());
-            if !changes.is_empty() {
-                match self.settings.as_mut() {
-                    Some(s) => {
-                        for (k, v) in &changes {
-                            let _ = s.set(k, v);
+            // Was a bare CentralPanel with no scroll wrapper at all -- on
+            // any window shorter than the settings content (real report:
+            // overflows the bottom with no scroll takeover), everything
+            // past the visible edge was simply unreachable, not just
+            // hidden. `editor.ui()` renders a genuinely long sequence of
+            // sliders/toggles with nothing bounding its height, so it
+            // needed a real ScrollArea, not a taller default window.
+            //
+            // Also removed this function's own `ui.heading("BigSilicon
+            // settings")` + separator -- `editor.ui()` already renders
+            // its own copy of both right at its start (SettingsEditor::ui,
+            // "BigSilicon Settings"), so the two were stacking as a
+            // visible duplicate heading. Found while reading this exact
+            // code to place the ScrollArea correctly, not a separate pass.
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                let changes = self.editor.ui(ui, &Adaptive::default());
+                if !changes.is_empty() {
+                    match self.settings.as_mut() {
+                        Some(s) => {
+                            for (k, v) in &changes {
+                                let _ = s.set(k, v);
+                            }
+                            self.editor.mark_published();
+                            self.status = format!("published {} change(s) — every app updated live", changes.len());
                         }
-                        self.editor.mark_published();
-                        self.status = format!("published {} change(s) — every app updated live", changes.len());
-                    }
-                    None => {
-                        self.editor.mark_published();
-                        self.status = "offline — change applied locally, not persisted".to_string();
+                        None => {
+                            self.editor.mark_published();
+                            self.status = "offline — change applied locally, not persisted".to_string();
+                        }
                     }
                 }
-            }
+            });
+            // Left OUTSIDE the ScrollArea deliberately: a status line
+            // ("published 3 change(s)...", "offline...") is exactly the
+            // kind of thing that should stay visible rather than scroll
+            // away with the content that caused it.
             ui.separator();
             ui.small(&self.status);
         });
