@@ -89,6 +89,10 @@ pub mod speakers;
 /// here already; nothing drew it -- `list_with_ids()` had no caller in this
 /// frontend at all.
 pub mod speaker_list;
+/// A keyboard in use holds the microphone off for five seconds. See the
+/// module header for why the command vocabulary being live while someone
+/// typed was firing commands mid-sentence.
+pub mod typing_grace;
 #[path = "../../src/voice_intent.rs"]
 pub mod voice_intent;
 pub mod workspaces_view;
@@ -143,13 +147,49 @@ pub fn shake_bindings() -> uikit_egui::glove::ShakeCommands {
 /// output — a filtered command is still a command that nearly fired.
 pub fn sync_voice_routing(router: &mut voice_routing::VoiceRouter,
                           glove: &uikit_egui::glove::GloveCursor) {
+    // No keyboard state available here, so nothing is suppressed. Callers with
+    // a keyboard should use `sync_voice_routing_with_grace`; this stays for
+    // the gesture-only path and for the existing tests, whose behaviour is
+    // unchanged.
+    sync_voice_routing_with_grace(router, glove, &typing_grace::TypingGrace::new(), 0)
+}
+
+/// As [`sync_voice_routing`], but a keyboard in use holds the command
+/// vocabulary off.
+///
+/// The bug this closes: the `Navigating` arm below re-arms the command
+/// vocabulary the instant dictation ends, and its reasoning is sound — a
+/// terminal that needed a tap to wake would defeat glove mode. But it never
+/// knew whether a keyboard was in use, so the vocabulary was live while
+/// someone typed, and a word heard mid-sentence fired a command.
+///
+/// `now_ms` is the caller's timebase; see `typing_grace` for why the clock
+/// lives outside.
+pub fn sync_voice_routing_with_grace(router: &mut voice_routing::VoiceRouter,
+                                     glove: &uikit_egui::glove::GloveCursor,
+                                     grace: &typing_grace::TypingGrace,
+                                     now_ms: u64) {
     match glove.mode() {
+        // An armed field outranks the keyboard: dictation is an explicit
+        // request, and typing in one field while speaking into another is
+        // ordinary.
         uikit_egui::glove::Mode::Dictating { field } => router.dictate_into(field),
         // Leaving dictation returns the mic to the command vocabulary rather
         // than to idle: voiceterm is a voice-driven app, and a terminal that
         // stopped listening after one dictation would need a tap to wake — the
         // gesture glove mode exists to avoid.
-        uikit_egui::glove::Mode::Navigating => router.listen_for_commands(),
+        //
+        // ...unless a keyboard is in use, in which case it goes to Idle and
+        // comes back on its own once the grace lapses. Idle rather than
+        // suspended, because `Listening::Idle` already means "nothing is
+        // interpreting, passive taps still run", which is exactly right here.
+        uikit_egui::glove::Mode::Navigating => {
+            if typing_grace::should_listen_for_commands(grace, false, now_ms) {
+                router.listen_for_commands();
+            } else {
+                router.idle();
+            }
+        }
     }
 }
 
@@ -162,6 +202,39 @@ mod voice_glove_tests {
         let mut g = GloveCursor::with_mode(ColdMode::On);
         g.set_bounds(400.0, 800.0);
         g
+    }
+
+    /// THE TYPING BUG, at the integration point. Leaving dictation used to
+    /// re-arm the command vocabulary unconditionally, so it was live while
+    /// someone typed.
+    #[test]
+    fn a_keyboard_in_use_holds_the_command_vocabulary_off() {
+        use super::typing_grace::{Input, TypingGrace};
+        // A fresh cursor is already Navigating -- the arm this fix touches.
+        let g = cursor();
+        let mut r = VoiceRouter::new();
+        let mut grace = TypingGrace::new();
+        grace.on_input(Input::Text, 1_000);
+
+        super::sync_voice_routing_with_grace(&mut r, &g, &grace, 1_500);
+        assert_eq!(r.state(), &super::voice_routing::Listening::Idle,
+            "typing must not leave the command vocabulary live");
+
+        // ...and it comes back on its own, with no tap.
+        super::sync_voice_routing_with_grace(&mut r, &g, &grace,
+            1_000 + super::typing_grace::GRACE_MS);
+        assert_eq!(r.state(), &super::voice_routing::Listening::Commands);
+    }
+
+    /// An idle keyboard must behave exactly as before this change.
+    #[test]
+    fn an_idle_keyboard_does_not_change_the_old_behaviour() {
+        use super::typing_grace::TypingGrace;
+        let g = cursor();
+        let (mut a, mut b) = (VoiceRouter::new(), VoiceRouter::new());
+        super::sync_voice_routing(&mut a, &g);
+        super::sync_voice_routing_with_grace(&mut b, &g, &TypingGrace::new(), 9_999);
+        assert_eq!(a.state(), b.state());
     }
 
     #[test]
