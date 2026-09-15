@@ -325,28 +325,55 @@ pub fn draw_glyph(g: &mut Gray, ch: char, x: usize, y: usize, w: usize, h: usize
         }
     };
     // top, top-left, top-right, middle, bottom-left, bottom-right, bottom
+    // Seven-segment 0..6, then the strokes a seven-segment display does not
+    // have. Those extra six exist because a pure seven-segment vocabulary
+    // CANNOT tell nine pairs apart -- G/6, I/1, O/0, S/5, T/R, W/U, X/H, Y/4,
+    // Z/2 were drawing byte-identical templates, which is a property of the
+    // display, not a bug in the matcher. A slate is handwritten, not a
+    // calculator, so the alphabet gets the diagonals and centre strokes that
+    // real handwriting uses to separate them.
     let s = |n: usize| -> (f32, f32, f32, f32) {
         match n {
             0 => (0.1, 0.02, 0.9, 0.02), 1 => (0.1, 0.02, 0.1, 0.5),
             2 => (0.9, 0.02, 0.9, 0.5),  3 => (0.1, 0.5, 0.9, 0.5),
             4 => (0.1, 0.5, 0.1, 0.98),  5 => (0.9, 0.5, 0.9, 0.98),
-            _ => (0.1, 0.98, 0.9, 0.98),
+            6 => (0.1, 0.98, 0.9, 0.98),
+            // centre vertical, upper and lower
+            7 => (0.5, 0.02, 0.5, 0.5),  8 => (0.5, 0.5, 0.5, 0.98),
+            // full diagonals
+            9 => (0.1, 0.02, 0.9, 0.98), 10 => (0.9, 0.02, 0.1, 0.98),
+            // half diagonals into and out of the centre
+            11 => (0.5, 0.5, 0.9, 0.98), 12 => (0.5, 0.5, 0.1, 0.98),
+            13 => (0.1, 0.02, 0.5, 0.5),
+            _  => (0.9, 0.02, 0.5, 0.5),
         }
     };
     let on: &[usize] = match ch {
-        '0' => &[0, 1, 2, 4, 5, 6], '1' => &[2, 5], '2' => &[0, 2, 3, 4, 6],
+        // A slashed zero -- the convention on slates and engineering drawings,
+        // and what separates it from O.
+        '0' => &[0, 1, 2, 4, 5, 6, 10], '1' => &[2, 5], '2' => &[0, 2, 3, 4, 6],
         '3' => &[0, 2, 3, 5, 6], '4' => &[1, 2, 3, 5], '5' => &[0, 1, 3, 5, 6],
         '6' => &[0, 1, 3, 4, 5, 6], '7' => &[0, 2, 5], '8' => &[0, 1, 2, 3, 4, 5, 6],
         '9' => &[0, 1, 2, 3, 5, 6],
         'A' => &[0, 1, 2, 3, 4, 5], 'B' => &[1, 3, 4, 5, 6], 'C' => &[0, 1, 4, 6],
         'D' => &[2, 3, 4, 5, 6], 'E' => &[0, 1, 3, 4, 6], 'F' => &[0, 1, 3, 4],
-        'G' => &[0, 1, 3, 4, 5, 6], 'H' => &[1, 2, 3, 4, 5], 'I' => &[2, 5],
+        // G is 6 plus the inward bar that makes it a letter.
+        'G' => &[0, 1, 3, 4, 5, 6, 8], 'H' => &[1, 2, 3, 4, 5],
+        // A serifed I, so it is not the bare stroke of a 1.
+        'I' => &[0, 2, 5, 6],
         'J' => &[2, 4, 5, 6], 'K' => &[1, 3, 4, 2], 'L' => &[1, 4, 6],
         'M' => &[0, 1, 2, 4, 5], 'N' => &[1, 2, 4, 5], 'O' => &[0, 1, 2, 4, 5, 6],
-        'P' => &[0, 1, 2, 3, 4], 'Q' => &[0, 1, 2, 3, 5], 'R' => &[0, 1, 4],
-        'S' => &[0, 1, 3, 5, 6], 'T' => &[0, 1, 4], 'U' => &[1, 2, 4, 5, 6],
-        'V' => &[1, 4, 6, 5], 'W' => &[1, 2, 4, 5, 6], 'X' => &[1, 2, 3, 4, 5],
-        'Y' => &[1, 2, 3, 5], 'Z' => &[0, 2, 3, 4, 6],
+        // R is P with a leg; T is a crossbar on a centre stem. Both were
+        // [0,1,4] -- neither shape, and identical to each other.
+        'P' => &[0, 1, 2, 3, 4], 'Q' => &[0, 1, 2, 3, 5], 'R' => &[0, 1, 2, 3, 4, 11],
+        // S's top stroke curves down from the top-right; a 5's is a flat bar.
+        // That is the only thing separating them, and with a flat top the two
+        // rasterised identically -- the last of the nine collisions.
+        'S' => &[14, 1, 3, 5, 6], 'T' => &[0, 7, 8], 'U' => &[1, 2, 4, 5, 6],
+        // W is U with the centre peak; X is two diagonals, not a squashed H.
+        'V' => &[1, 4, 6, 5], 'W' => &[1, 2, 4, 5, 6, 7], 'X' => &[9, 10],
+        // Y is two strokes meeting a stem; Z is top, diagonal, bottom.
+        'Y' => &[13, 14, 8], 'Z' => &[0, 10, 6],
         _ => &[],
     };
     for n in on { let (a, b, c, d) = s(*n); seg(g, a, b, c, d); }
@@ -674,6 +701,50 @@ mod tests {
             if got.ch != *ch { wrong.push((*ch, got.ch)); }
         }
         assert!(wrong.is_empty(), "templates collide: {wrong:?}");
+    }
+
+    /// THE COLLISION, pinned directly rather than only through the matcher.
+    ///
+    /// Nine pairs used to rasterise byte-identically -- G/6, I/1, O/0, S/5,
+    /// T/R, W/U, X/H, Y/4, Z/2 -- because the glyph table was pure
+    /// seven-segment and a seven-segment display genuinely cannot separate
+    /// them. The matcher was blamed for years of "the reader returns nothing";
+    /// it was doing the only honest thing available, which is to report no
+    /// confidence when two templates are the same.
+    ///
+    /// Asserted on the CELLS rather than through `recognise`, so a future
+    /// change to the scoring cannot make this pass while the glyphs are still
+    /// identical.
+    #[test]
+    fn no_two_glyphs_rasterise_to_the_same_cell() {
+        let t = templates();
+        assert_eq!(t.len(), 36, "the whole vocabulary is rendered");
+        let mut same = Vec::new();
+        for i in 0..t.len() {
+            for j in (i + 1)..t.len() {
+                if t[i].1 == t[j].1 {
+                    same.push((t[i].0, t[j].0));
+                }
+            }
+        }
+        assert!(same.is_empty(), "identical templates: {same:?}");
+        // And none is blank -- an all-false cell would tie with any other
+        // blank and is a glyph that draws nothing.
+        for (ch, cell) in &t {
+            assert!(cell.iter().any(|b| *b), "{ch} rendered nothing");
+        }
+    }
+
+    /// The pairs that used to collide must each be told apart, by name, so a
+    /// regression names the character rather than a count.
+    #[test]
+    fn the_nine_historic_collisions_are_each_resolved() {
+        let t = templates();
+        let cell = |c: char| t.iter().find(|(x, _)| *x == c).expect("in vocabulary").1;
+        for (a, b) in [('G', '6'), ('I', '1'), ('O', '0'), ('S', '5'),
+                       ('T', 'R'), ('W', 'U'), ('X', 'H'), ('Y', '4'), ('Z', '2')] {
+            assert_ne!(cell(a), cell(b), "{a} and {b} still rasterise the same");
+        }
     }
 
     #[test]

@@ -193,6 +193,11 @@ impl Coordinator {
         if !self.available {
             return;
         }
+        // Push the mode down before joining. `GroupVoice` defaults to
+        // TalkMode::Open; this coordinator defaults to PushToTalk (the Qt
+        // default), and a session left on Open has no floor at all -- every
+        // peer may transmit and `active_speaker` is whoever is loudest.
+        gv.mode = self.mode;
         gv.join();
         if self.interactive {
             self.mic_start();
@@ -336,9 +341,16 @@ impl Coordinator {
 
     // ── modes, security, views ───────────────────────────────────────────
 
-    /// Push-to-talk is grand (you hold it); the auto modes relax it.
-    pub fn set_talk_mode(&mut self, mode: TalkMode, bar: Option<&mut VoiceBar>) {
+    /// Push-to-talk is grand (you hold it); the auto mode relaxes it.
+    ///
+    /// Takes `gv` because the mode belongs to the SESSION, not to this
+    /// coordinator: the first version tracked `self.mode` and only resized the
+    /// button, so the session stayed on its default `TalkMode::Open` where
+    /// everyone may transmit and there is no floor to hold. Every floor test
+    /// failed at once, which is the right way for that to show up.
+    pub fn set_talk_mode(&mut self, mode: TalkMode, gv: &mut GroupVoice, bar: Option<&mut VoiceBar>) {
         self.mode = mode;
+        gv.mode = mode;
         if let Some(b) = bar {
             b.set_talk_prominent(mode == TalkMode::PushToTalk);
         }
@@ -497,15 +509,33 @@ mod tests {
 
     #[test]
     fn talk_prominence_tracks_the_mode() {
-        let (mut c, _gv) = setup();
+        let (mut c, mut gv) = setup();
         let mut bar = VoiceBar::default();
-        c.set_talk_mode(TalkMode::PushToTalk, Some(&mut bar));
+        c.set_talk_mode(TalkMode::PushToTalk, &mut gv, Some(&mut bar));
         assert_eq!(c.talk_mode(), TalkMode::PushToTalk);
+        assert_eq!(gv.mode, TalkMode::PushToTalk, "the SESSION has to hear about it");
         // Open is the auto mode here; only PTT is grand. (Qt also had VOX and
         // continuous; group_voice.rs models them as a single Open mode, so the
         // prominence rule is "PushToTalk or not" rather than a three-way.)
-        c.set_talk_mode(TalkMode::Open, Some(&mut bar));
+        c.set_talk_mode(TalkMode::Open, &mut gv, Some(&mut bar));
         assert_eq!(c.talk_mode(), TalkMode::Open);
+        assert_eq!(gv.mode, TalkMode::Open);
+    }
+
+    /// THE BUG THE BUILD FOUND. The coordinator defaulted to PushToTalk and
+    /// never told the session, which sat on its own default of Open -- where
+    /// there is no floor, everyone may transmit, and `active_speaker` is
+    /// whoever is loudest. Four floor tests failed at once.
+    #[test]
+    fn joining_puts_the_session_into_the_coordinators_talk_mode() {
+        let (mut c, mut gv) = setup();
+        assert_eq!(gv.mode, TalkMode::Open, "GroupVoice's own default");
+        c.join(&mut gv);
+        assert_eq!(gv.mode, TalkMode::PushToTalk, "join must push the mode down");
+        // ...and with a real floor, pressing talk actually claims it.
+        c.press_talk(&mut gv, 1);
+        c.apply_holder(&gv, None, None);
+        assert_eq!(c.holder(), "me");
     }
 
     /// Private goes to Securing, not straight to Private: the tier is a claim
