@@ -88,6 +88,22 @@ starts hidden with the auto-login ordering rule.
 
 ## voiceterm (QML, 8 files)
 
+> **This table covers the QML only, and that is the trap.** voiceterm's Qt app
+> is QML *plus* 198 Rust modules under `src/`, and the egui frontend
+> references 104 of them — **94 are unreached**, including
+> `dictation_engine` (36k), `audio_profile` (29k), `cmd_classifier` (29k) and
+> `note_render` (28k). Every QML row below says "ported" and the table is
+> still not a picture of parity.
+>
+> That is how the voice selection list went missing: `src/speakers.rs` is
+> mounted by `#[path]` and fully available, but `list_with_ids()` had no
+> caller anywhere in the frontend, so the data was reachable and invisible at
+> the same time. No row here could have shown that.
+>
+> Before claiming a voiceterm feature is ported, check whether anything in
+> `egui-frontend/` actually calls it. The QML table cannot answer that.
+
+
 | QML | egui module | status |
 |---|---|---|
 | main.qml | shell.rs | ported (pane system, earlier session) |

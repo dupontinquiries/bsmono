@@ -85,6 +85,10 @@ pub mod system_info;
 pub mod phonetic;
 #[path = "../../src/speakers.rs"]
 pub mod speakers;
+/// The voice selection list over that registry. The registry was reachable
+/// here already; nothing drew it -- `list_with_ids()` had no caller in this
+/// frontend at all.
+pub mod speaker_list;
 #[path = "../../src/voice_intent.rs"]
 pub mod voice_intent;
 pub mod workspaces_view;
