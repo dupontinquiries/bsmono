@@ -232,15 +232,23 @@ mod tests {
         let world: WorldState = Arc::new(RwLock::new(SystemState::new()));
         let shutdown = crate::systems::ShutdownSignal::new();
         let _handle = spawn(world.clone(), None, shutdown.clone());
-        // Don't leave the thread running past the test; request
-        // shutdown immediately. The worker will exit within one
-        // poll interval.
-        shutdown.request();
 
         // Let the worker run briefly. It will either succeed and mark
         // health Ok, or fail and mark Unavailable / Degraded — but it
-        // should not leave health as Unknown after this.
+        // should not leave health as Unknown after this. SENSOR_POLL_INTERVAL
+        // is 100ms, so 500ms comfortably covers at least one poll cycle.
+        //
+        // Shutdown must be requested *after* this sleep, not before: `run()`
+        // checks `shutdown.is_requested()` at the top of the loop, before
+        // sleeping or polling, so requesting shutdown immediately after
+        // spawn is a race — depending on scheduling, the worker can see the
+        // flag and exit on iteration 0 before ever polling, leaving
+        // sensor_health at its Unknown default regardless of how long the
+        // test thread then sleeps.
         thread::sleep(Duration::from_millis(500));
+
+        // Don't leave the thread running past the test.
+        shutdown.request();
 
         let state = world_state::read(&world);
         assert_ne!(
