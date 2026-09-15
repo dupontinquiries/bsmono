@@ -160,6 +160,17 @@ pub mod smoke_field;
 // Round 15.
 pub mod batch_chunk_priority;
 pub mod mesh_tier;
+// r-mesh-tri-regression-cfg: needs crate::render::mesher, which only exists
+// under render-core (the real render module) or mesh-ref (the headless
+// pure-mesher shim -- see render_meshref_shim.rs; both expose the identical
+// crate::render::mesher path, by design, specifically so headless-testable
+// mesh logic like this can build under either). Gating this out otherwise
+// matches how `render` itself is gated in lib.rs; an earlier version of this
+// module used crate::render::mesher unconditionally and broke a plain
+// featureless `cargo build`/`cargo check` of the whole workspace (E0433,
+// "cannot find `render` in `crate`") -- caught on the first real build.
+#[cfg(any(feature = "render-core", feature = "mesh-ref"))]
+pub mod mesh_tri_regression;
 // Round 16.
 pub mod batch_mesh_tier;
 pub mod ridge_noise;

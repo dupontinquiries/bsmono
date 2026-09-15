@@ -147,6 +147,19 @@ impl ShadowBucketTimer {
     /// Caller passes the frame index that just completed (not the
     /// frame currently being recorded). Errors that look like "not
     /// ready yet" return an empty Vec rather than propagating.
+    ///
+    /// r-gpu-guard-wait: no longer passes QueryResultFlags::WAIT (see
+    /// gpu_timer::collect_frame's matching comment for the full
+    /// reasoning -- this is the sibling instance of the same pattern,
+    /// found while fixing that one). This function already anticipated
+    /// a "not ready" outcome (per the doc line above, written before
+    /// this change) and handles it via the existing `result.is_err()`
+    /// check below, which without WAIT now also catches VK_NOT_READY --
+    /// so dropping WAIT trades a potential CPU block on an already-
+    /// struggling GPU for the pre-existing "return empty Vec, try again
+    /// next frame" path, at no cost in the normal case (this is called
+    /// right after the same slot's fence wait as gpu_timer::collect_frame,
+    /// so the data is normally already sitting there).
     pub fn collect_frame(&self, frame_idx: u32) -> Vec<u64> {
         if !self.supported || frame_idx >= self.frames_in_flight { return Vec::new(); }
         let first = frame_idx * MAX_BUCKET_TIMESTAMPS;
@@ -158,7 +171,7 @@ impl ShadowBucketTimer {
                 first,
                 count,
                 &mut raw,
-                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                vk::QueryResultFlags::TYPE_64,
             )
         };
         if result.is_err() { return Vec::new(); }

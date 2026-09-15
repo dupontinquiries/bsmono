@@ -61,15 +61,23 @@ pub enum LodLevel {
     /// closest to the player. F1 default for every call site.
     Near    = 0,
     /// Greedy mesher without sub-block features (no weathered
-    /// tops, simpler plants). Future tier.
+    /// tops, simpler plants). Live: routed in meshing_pool.rs and
+    /// budgeted (MID_BUDGET) alongside Near/Far/VeryFar in the bin's
+    /// chunk-streaming loop -- every session's periodic log line
+    /// ("mesher: near=... mid=... far=...") confirms this tier meshes
+    /// chunks in practice, not just in theory.
     Mid     = 1,
     /// Naive face-cull mesher, no greedy merging, no plants.
-    /// Approximate the existing `mesh_chunk_naive`. Future tier.
+    /// Approximate the existing `mesh_chunk_naive`. Live: same
+    /// routing/budgeting as Mid above (FAR_BUDGET), and eligible for
+    /// the virtual/downsampled fast path (`is_virtual_eligible` in
+    /// meshing_pool.rs) when a generator is available.
     Far     = 2,
     /// Aggressive simplification: one quad per visible chunk face
     /// at most, color-averaged. Almost-constant tris per chunk
-    /// regardless of contents. Future tier; primarily for the
-    /// outer band of large render-distance configs.
+    /// regardless of contents; primarily for the outer band of large
+    /// render-distance configs. Live: same routing/budgeting as Far
+    /// above (VFAR_BUDGET).
     VeryFar = 3,
 }
 

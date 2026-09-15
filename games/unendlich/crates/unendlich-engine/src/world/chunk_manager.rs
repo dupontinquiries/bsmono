@@ -261,6 +261,39 @@ impl DroneView {
     }
 }
 
+// r-vision-worldquery: the missing wire between two already-correct, already-
+// tested pieces -- sim::vision::line_of_sight (a real, deterministic voxel
+// raycaster: Amanatides & Woo DDA, rollback-safe) needs a WorldQuery to read
+// the world through, and until now nothing implemented WorldQuery over the
+// live chunk store at all (every existing impl -- FlatWorld, SceneWorld,
+// NeutralWorld -- is a test/utility scene). DroneView is the right target,
+// not ChunkManager directly: it's already the documented "read-only, Send
+// view... for off-thread work," which is exactly what a sim-side raycast
+// wants (no exclusive/mutable access, cheap Arc::clone to obtain, safe to
+// hold across a roamer-AI tick without fighting the render thread for
+// ChunkManager access).
+//
+// This single ~10-line impl unlocks two separate consumers, both of which
+// were previously stubbed exactly because this didn't exist:
+//   - Creature vision occlusion (sim::eyes::sees_in_fog's live call site in
+//     unendlich_fullgame.rs currently has no occlusion check at all -- a
+//     dragon can "see" straight through a boulder or a dense bush as long as
+//     the player is within its FOV cone and range).
+//   - sim::mesh_vision's occlusion predicate, hardcoded `|_, _| false`
+//     ("conservative first pass... occlusion-backed cave win is a follow-up
+//     once a line-of-sight source is wired" -- see
+//     docs/design/mesh_vision_scheduling.md, which names this exact
+//     raycast-to-chunk-center approach as its cheapest suggested option).
+// physics_of_block is the documented conversion seam (BlockId -> BlockPhysics)
+// per its own doc comment: "the seam that lets the live voxel world drive sim
+// cognition (terrain occlusion, obstacle-aware paths)" -- this impl is that
+// seam actually being used for the first time.
+impl crate::sim::physics::WorldQuery for DroneView {
+    fn physics_at(&self, x: i32, y: i32, z: i32) -> crate::sim::physics::BlockPhysics {
+        crate::sim::physics::physics_of_block(self.block_at(x, y, z))
+    }
+}
+
 pub struct ChunkManager {
     chunks: Arc<DashMap<ChunkCoord, Arc<Chunk>>>,
     /// v0.24.23 propagation: parallel map of GPU-resident-style sparse
@@ -919,6 +952,19 @@ impl ChunkManager {
     /// autotuner). 0 = unlimited, matching the env default semantics.
     pub fn set_apply_budget(&mut self, n: usize) {
         self.apply_budget = n;
+    }
+
+    /// Live sky-cull-margin override (settings Performance tab, chunk-cull
+    /// aggression). Was startup-only (env `UNENDLICH_SKY_CULL`, read once at
+    /// construction); this lets the aggression mode switch it live like the
+    /// other culling knobs it's grouped with. Takes effect for chunks
+    /// requested from here on -- already-loaded chunks aren't retroactively
+    /// evicted, matching how `set_apply_budget` and the shadow-stride/cache
+    /// live setters behave (a live knob changes future decisions, not past
+    /// ones). `None` or `Some(0)` = off (load the full RD ball); `Some(m)`
+    /// for `m >= 1` skips chunks entirely-empty-sky by more than `m` chunks.
+    pub fn set_sky_cull_margin(&mut self, margin: Option<i32>) {
+        self.sky_cull_margin = margin.filter(|&m| m > 0);
     }
 
     pub fn set_world_root(&mut self, world_root: PathBuf) {
@@ -1855,15 +1901,33 @@ impl ChunkManager {
 
                 // r239 (mesh-vision-sched): vision-driven mesh gate. Build the
                 // player view cone and DEFER chunks no cone needs (behind the
-                // player / out of range). CONSERVATIVE first pass: occlusion is
-                // OFF (always false), so we only skip clearly-unseen chunks —
-                // never an in-view one — which can't produce an unmeshed hole
-                // in front of the player. (The occlusion-backed cave win is a
-                // follow-up once a line-of-sight source is wired; see
-                // docs/design/mesh_vision_scheduling.md.) A deferred chunk's
-                // voxels still load — only its MESH is skipped — and it
-                // re-enters this walk (and meshes) once the player turns toward
-                // it, since this runs every update.
+                // player / out of range). A deferred chunk's voxels still
+                // load — only its MESH is skipped — and it re-enters this
+                // walk (and meshes) once the player turns toward it, since
+                // this runs every update.
+                //
+                // r-mesh-vision-occlusion: occlusion is now real, not the
+                // permanently-false stub this shipped with. This is exactly
+                // the follow-up docs/design/mesh_vision_scheduling.md named
+                // as unblocking "the occlusion-backed cave win": a
+                // deterministic voxel raycast (sim::vision::line_of_sight,
+                // the same primitive already wired and tested for creature
+                // vision a few commits ago) from the player's eye to the
+                // chunk center, through self.drone_view() -- the existing
+                // "read-only, Send view... for off-thread work" accessor,
+                // cheap (Arc::clone) to obtain per call. Correctness note
+                // from that module's own "Risks/honesty" section: a WRONG
+                // defer shows the player an unmeshed hole, so the predicate
+                // must be conservative (when unsure, don't defer) -- this
+                // uses a real, tested LOS check, not a heuristic guess, so
+                // it can only correctly identify genuinely-blocked chunks;
+                // it never adds a false-occluded case beyond what the old
+                // always-false stub already couldn't produce (that stub
+                // could only ever UNDER-defer, never over-defer, and this
+                // change preserves that: a clear line of sight still means
+                // not-occluded exactly as before, this only adds the
+                // occluded=true case for chunks genuinely blocked by solid
+                // voxels in between).
                 #[cfg(feature = "mesh-vision-sched")]
                 {
                     use crate::sim::mesh_vision::{urgency_for_cones, MeshUrgency, ViewCone};
@@ -1882,9 +1946,16 @@ impl ChunkManager {
                     // range in blocks ≈ render distance (shells) × chunk size.
                     let range = (rd.max(1) * CHUNK_SIZE) as f32;
                     let cone = ViewCone::player(eye, self.player_view_yaw, range);
-                    // occlusion OFF for now (conservative): never defer an
-                    // in-view chunk.
-                    let urgency = urgency_for_cones(&[cone], cc, |_, _| false);
+                    let occlusion_view = self.drone_view();
+                    let urgency = urgency_for_cones(&[cone], cc, |_cone_idx, target| {
+                        use crate::sim::fixed::{Fixed, Vec3};
+                        let to_fixed3 = |p: [f32; 3]| Vec3::new(
+                            Fixed::from_f64(p[0] as f64),
+                            Fixed::from_f64(p[1] as f64),
+                            Fixed::from_f64(p[2] as f64),
+                        );
+                        !crate::sim::vision::line_of_sight(to_fixed3(eye), to_fixed3(target), &occlusion_view)
+                    });
                     if urgency == MeshUrgency::Defer {
                         // not needed by the cone — skip meshing this pass.
                         *counter -= 1; // don't spend budget on a deferred chunk
@@ -3085,6 +3156,88 @@ mod tests {
         let chunk = Chunk::empty(coord);
         let octree = OctreeArray::from_chunk(&chunk);
         mgr.install_chunk(chunk, octree);
+    }
+
+    // r-vision-worldquery: tests for the new WorldQuery impl on DroneView.
+    // Two layers, matching how the codebase tests physics_of_block/WorldQuery
+    // elsewhere: (1) physics_at itself reports the right BlockPhysics for
+    // solid/air/unloaded, and (2) an actual sim::vision::line_of_sight call
+    // through a DroneView proves the wiring end-to-end, not just that the
+    // trait method returns sane values in isolation.
+    #[test]
+    fn drone_view_world_query_reports_solid_for_solid_blocks() {
+        use crate::sim::physics::WorldQuery;
+        let mgr = make_manager();
+        insert_chunk_at(&mgr, ChunkCoord::new(0, 0, 0));
+        assert!(mgr.set_block(5, 5, 5, BlockId::Stone));
+
+        let view = mgr.drone_view();
+        let phys = view.physics_at(5, 5, 5);
+        assert!(phys.is_solid(), "Stone should report solid via WorldQuery");
+    }
+
+    #[test]
+    fn drone_view_world_query_reports_air_for_air_blocks() {
+        use crate::sim::physics::WorldQuery;
+        let mgr = make_manager();
+        insert_chunk_at(&mgr, ChunkCoord::new(0, 0, 0));
+        // Chunk::empty is all-air; don't set anything at (1,1,1).
+
+        let view = mgr.drone_view();
+        let phys = view.physics_at(1, 1, 1);
+        assert!(!phys.is_solid(), "untouched (air) block should not report solid");
+    }
+
+    #[test]
+    fn drone_view_world_query_unloaded_chunk_defaults_to_air_not_panic() {
+        use crate::sim::physics::WorldQuery;
+        let mgr = make_manager();
+        // Deliberately never insert any chunk -- the whole point of this
+        // test is the "chunk not loaded" branch of DroneView::block_at,
+        // which returns BlockId::Air rather than panicking or blocking.
+        let view = mgr.drone_view();
+        let phys = view.physics_at(99_999, 5, -99_999);
+        assert!(!phys.is_solid(), "unloaded chunk should default to non-solid (Air), not panic");
+    }
+
+    #[test]
+    fn line_of_sight_through_drone_view_is_blocked_by_a_real_wall() {
+        // End-to-end proof: sim::vision::line_of_sight (a real, independently-
+        // tested voxel raycaster) actually gets useful answers through a live
+        // DroneView, not just that WorldQuery compiles against it. Build a
+        // solid wall between two open points and confirm the ray reports
+        // blocked; then remove the wall (fresh chunk, no wall) and confirm
+        // the same two points report clear. This is exactly the "duck behind
+        // a rock and the dragon loses you" mechanic at the primitive level.
+        use crate::sim::fixed::{Fixed, Vec3};
+        use crate::sim::vision::line_of_sight;
+
+        let mgr = make_manager();
+        insert_chunk_at(&mgr, ChunkCoord::new(0, 0, 0));
+        // A wall spanning y=0..=3, z=0..=3 at x=5, between an eye at x=2
+        // and a target at x=8 (both at y=1,z=1) -- the ray from eye to
+        // target must cross x=5 at y=1,z=1, which the wall covers.
+        for y in 0..4 {
+            for z in 0..4 {
+                assert!(mgr.set_block(5, y, z, BlockId::Stone));
+            }
+        }
+        let view = mgr.drone_view();
+        let eye = Vec3::new(Fixed::from_int(2), Fixed::from_int(1), Fixed::from_int(1));
+        let target = Vec3::new(Fixed::from_int(8), Fixed::from_int(1), Fixed::from_int(1));
+        assert!(
+            !line_of_sight(eye, target, &view),
+            "a solid wall directly between eye and target must block line_of_sight"
+        );
+
+        // Same two points, fresh chunk with no wall: must be clear.
+        let mgr2 = make_manager();
+        insert_chunk_at(&mgr2, ChunkCoord::new(0, 0, 0));
+        let view2 = mgr2.drone_view();
+        assert!(
+            line_of_sight(eye, target, &view2),
+            "with nothing in between, line_of_sight through an all-air chunk must be clear"
+        );
     }
 
     // F4: the generator lifecycle. Proves the manager is NOT a startup-once

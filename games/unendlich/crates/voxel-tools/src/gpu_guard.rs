@@ -160,6 +160,28 @@ impl Guard {
                  dropping {}", cost.total_us as f64 / 1e6, pass_us as f64 / 1e6,
                 self.shed.name()) };
         }
+        // r-shadow-windup-fix: a frame that barely touched the GPU (e.g. an
+        // idle frame during a still-loading world -- total_us near zero,
+        // observed live as "total=0.00ms" in the periodic log) proves
+        // nothing about whether a shed decision is safe to reverse: it
+        // trivially sits "under the soft limit" without the GPU pipeline
+        // having been exercised at all. Counting frames like that toward
+        // the calm-frame recovery threshold below is exactly how a bursty/
+        // idle boot period racks up 240 "calm" frames in well under the
+        // ~4 real seconds that threshold assumes, triggering a premature
+        // give-back right before the next real workload frame punishes it
+        // straight back -- observed live as shadow cost re-spiking to
+        // 500-600ms multiple times shortly after being shed in the same
+        // session. Below this floor a frame is simply not informative
+        // either way: don't count it as calm, but don't reset the calm
+        // streak either (an idle frame isn't evidence the shed decision
+        // was wrong, only that there was nothing to test it against yet).
+        // 1ms, well below any frame doing real rendering work but comfortably
+        // above a frame that submitted nothing.
+        const MIN_INFORMATIVE_US: u64 = 1_000;
+        if cost.total_us < MIN_INFORMATIVE_US {
+            return Verdict::Fine;
+        }
         if cost.total_us >= self.soft_us {
             self.calm = 0;
             self.over += 1;
@@ -304,6 +326,38 @@ mod tests {
         assert_eq!(g.shed_level(), Shed::Shadows, "not yet -- 200 calm frames is not enough");
         for _ in 0..60 { let _ = g.frame(cost(8, 5)); }
         assert_eq!(g.shed_level(), Shed::Nothing, "after a few seconds of calm, given back");
+    }
+
+    #[test]
+    fn idle_frames_do_not_count_toward_calm_recovery() {
+        // r-shadow-windup-fix: this is the exact scenario diagnosed live --
+        // a burst of frames that submitted essentially nothing to the GPU
+        // (total_us near zero, e.g. a still-loading world with nothing to
+        // draw yet) must NOT be treated as proof the shed decision is safe
+        // to reverse. Without the floor, this test's 300 near-zero frames
+        // would satisfy calm > 240 and give shadows back prematurely.
+        let mut g = Guard::default();
+        let _ = g.frame(cost(2000, 1800));
+        assert_eq!(g.shed_level(), Shed::Shadows);
+        // 300 idle frames (total_us = 0) -- more than the 240-frame
+        // threshold, but each one is below MIN_INFORMATIVE_US and must not
+        // advance the calm counter at all.
+        let idle = FrameCost { total_us: 0, main_us: 0, shadow_us: 0, froxel_us: 0, cull_us: 0 };
+        for _ in 0..300 {
+            assert_eq!(g.frame(idle), Verdict::Fine);
+        }
+        assert_eq!(
+            g.shed_level(), Shed::Shadows,
+            "idle frames must not count as calm -- 300 of them is not evidence the GPU can \
+             handle shadows again, only that nothing was submitted to test it"
+        );
+        // Confirm real calm frames still work normally after this: genuine
+        // stability (not idleness) still earns the recovery.
+        for _ in 0..260 { let _ = g.frame(cost(8, 5)); }
+        assert_eq!(
+            g.shed_level(), Shed::Nothing,
+            "genuine calm frames (real work, under budget) should still recover normally"
+        );
     }
 
     #[test]

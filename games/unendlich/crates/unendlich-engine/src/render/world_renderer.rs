@@ -777,6 +777,19 @@ pub struct WorldRenderer {
     pub ui_render_distance: i32,
     /// r325: render resolution scale (neural upscale), 0.5..1.0.
     pub ui_render_scale: f32,
+    /// Live shadow-caster temporal-amortization stride slider: applies to
+    /// `shadow_chunk_stride` via `set_shadow_chunk_stride` each frame.
+    /// 1 = every caster every frame; higher = 1/N per frame, round-robin.
+    pub ui_shadow_stride: u32,
+    /// Live whole-pass shadow-cache toggle: applies to `shadow_cache` via
+    /// `set_shadow_cache` each frame (skip the shadow pass entirely when
+    /// sun + camera are both unchanged from last frame).
+    pub ui_shadow_cache: bool,
+    /// Live chunk-cull-aggression mode index (see
+    /// `runtime_config::ChunkCullAggression`). The bin applies
+    /// `.settings()` for this index to `ChunkManager::set_sky_cull_margin`
+    /// and the `simd_precull`/`occlusion_cull` debug atomics each frame.
+    pub ui_cull_aggression: u8,
     /// r197: clicked saved-world index (consumed by bin), -1 = none
     pub menu_world_pick: i32,
     /// r197: saved-world names+meta for the LoadSlots screen list
@@ -847,7 +860,9 @@ pub struct WorldRenderer {
     /// persistent shadow image (left in SHADER_READ_ONLY by the render pass's
     /// own subpass dependency), so the main pass still samples valid shadows.
     /// THE lever for the dominant GPU cost (shadow p50≈49ms): when the player
-    /// stands still, shadow drops to ~0. `UNENDLICH_SHADOW_CACHE`, default off.
+    /// stands still, shadow drops to ~0. `UNENDLICH_SHADOW_CACHE`, default ON
+    /// (R27) — this doc comment previously said "default off" and was stale;
+    /// see the `unwrap_or(true)` at construction below.
     /// Tradeoff: a chunk that finishes loading while the camera is perfectly
     /// still won't cast a shadow until the next camera move.
     shadow_cache: bool,
@@ -1173,6 +1188,22 @@ impl WorldRenderer {
         self.shadow_chunk_stride = stride.clamp(1, 8);
     }
 
+    /// Current live shadow-caster stride (read-only). Exposed so the
+    /// settings UI can display frame_pacer's actual value when the pacer
+    /// owns this knob, instead of a slider position that may be stale
+    /// (see the frame_pacer gate in `unendlich_fullgame`'s apply loop).
+    pub fn shadow_chunk_stride(&self) -> u32 {
+        self.shadow_chunk_stride
+    }
+
+    /// Live-adjust whole-pass shadow caching (see `shadow_cache` field doc).
+    /// No GPU resources are recreated — this only gates the `skip_shadow`
+    /// check in `draw_frame`, so it's safe to flip from a settings UI or a
+    /// `RuntimeConfig`/`PerfPreset` switch without a restart.
+    pub fn set_shadow_cache(&mut self, on: bool) {
+        self.shadow_cache = on;
+    }
+
     pub fn new(
         ctx: &VulkanContext,
         framebuffer_size: (u32, u32),
@@ -1241,9 +1272,27 @@ impl WorldRenderer {
         if std::env::var("UNENDLICH_NEURAL_TRAIN_SELFTEST").ok().as_deref() == Some("1") {
             crate::render::neural_train::TrainMlp::self_test(2000);
         }
+        // r476: frames in flight default 2 (CPU/GPU overlap — the single biggest
+        // smoothness win on Asahi). Metadata SSBO is double-buffered so >1 is
+        // crash-safe. Override with UNENDLICH_FRAMES_IN_FLIGHT (=1 old behavior).
+        //
+        // Hoisted up here (was originally computed further down, right before
+        // the `frames: Vec<FrameSync>` loop) so `EntityPipeline::new` below
+        // can be told the real value instead of guessing -- r-entity-uaf
+        // needs it to size its retired-buffer countdown correctly.
+        let frames_in_flight: usize = std::env::var("UNENDLICH_FRAMES_IN_FLIGHT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(1, MAX_FRAMES_IN_FLIGHT))
+            .unwrap_or(2);
+        log::info!(
+            "WorldRenderer: frames_in_flight = {} (cap {}; UNENDLICH_FRAMES_IN_FLIGHT)",
+            frames_in_flight, MAX_FRAMES_IN_FLIGHT
+        );
         let entity_pipeline = EntityPipeline::new(
             &ctx.device, render_pass, pipeline.descriptor_set_layout,
             unsafe { ctx.instance.get_physical_device_memory_properties(ctx.physical_device) },
+            frames_in_flight,
         )?;
 
         let command_pool = unsafe {
@@ -1341,18 +1390,8 @@ impl WorldRenderer {
             )?
         };
 
-        // r476: frames in flight default 2 (CPU/GPU overlap — the single biggest
-        // smoothness win on Asahi). Metadata SSBO is double-buffered so >1 is
-        // crash-safe. Override with UNENDLICH_FRAMES_IN_FLIGHT (=1 old behavior).
-        let frames_in_flight: usize = std::env::var("UNENDLICH_FRAMES_IN_FLIGHT")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|n| n.clamp(1, MAX_FRAMES_IN_FLIGHT))
-            .unwrap_or(2);
-        log::info!(
-            "WorldRenderer: frames_in_flight = {} (cap {}; UNENDLICH_FRAMES_IN_FLIGHT)",
-            frames_in_flight, MAX_FRAMES_IN_FLIGHT
-        );
+        // frames_in_flight computed earlier (hoisted above EntityPipeline::new
+        // construction) -- reused here for the FrameSync array.
         let mut frames = Vec::with_capacity(frames_in_flight);
         for i in 0..frames_in_flight {
             let image_available = unsafe { ctx.device.create_semaphore(&vk::SemaphoreCreateInfo::builder(), None)? };
@@ -1863,6 +1902,20 @@ impl WorldRenderer {
             menu_keybind_list: Vec::new(),
             ui_render_distance: 6,
             ui_render_scale: 1.0,
+            ui_shadow_stride: shadow_chunk_stride.clamp(1, 8),
+            ui_shadow_cache: std::env::var("UNENDLICH_SHADOW_CACHE")
+                .ok().map(|v| !(v == "0" || v.eq_ignore_ascii_case("false"))).unwrap_or(true),
+            // r-cull-aggression: defaults to Light (index 1) -- the
+            // zero-tradeoff tier (SIMD frustum pre-cull only) -- rather than
+            // trying to reverse-map whatever combination of the three
+            // underlying env vars (UNENDLICH_SIMD_PRECULL/SKY_CULL/
+            // OCCLUSION_CULL) happens to be set into one of the four named
+            // tiers, which isn't always well-defined (e.g. occlusion_cull=1
+            // with sky_cull=0 matches none of them exactly). Those env vars
+            // were rarely if ever actually used standalone in practice, so
+            // this is a disclosed simplification, not a behavior-preserving
+            // migration.
+            ui_cull_aggression: crate::runtime_config::ChunkCullAggression::Light.index(),
             menu_world_pick: -1,
             menu_world_list: Vec::new(),
             menu_mp_list: Vec::new(),
@@ -3439,10 +3492,13 @@ impl WorldRenderer {
     /// `AtmosphereParams::neutral()` (mid-day clear sky), suitable for
     /// tests and headless paths that have no climate data.
     /// Upload this frame's baked entity geometry (from
-    /// [`crate::world::entity::snapshot_to_vertices`]). Call after the frame
-    /// fence wait and before `draw_frame`, since the entity buffers are
-    /// single-buffered host memory. Infallible: a failed upload just skips the
-    /// mobs this frame rather than killing the frame.
+    /// [`crate::world::entity::snapshot_to_vertices`]). Call any time before
+    /// `draw_frame` for the frame currently being built. Growth of the
+    /// underlying buffers no longer requires a prior fence wait -- see the
+    /// r-entity-uaf doc in `entity_pipeline`'s module comment; the old buffer
+    /// is retired and reclaimed later by `process_retired`, which
+    /// `draw_frame_with_view_and_atmos` already calls every frame. Infallible:
+    /// a failed upload just skips the mobs this frame rather than killing it.
     pub fn upload_entities(
         &mut self,
         ctx: &VulkanContext,
@@ -3539,6 +3595,9 @@ impl WorldRenderer {
 
         // Tick deferred destroys at the start of the frame.
         self.process_pending_destroys(ctx);
+        // r-entity-uaf: same deferred-free discipline, same timing, for the
+        // entity/creature vertex+index buffers' retired-on-growth pairs.
+        self.entity_pipeline.process_retired(&ctx.device);
 
         let aspect = self.swapchain.extent.width as f32 / self.swapchain.extent.height as f32;
         let vp = view.view_projection(aspect);
@@ -3694,6 +3753,19 @@ impl WorldRenderer {
             let mut ui_perf_preset = self.ui_perf_preset;
             let mut ui_render_distance = self.ui_render_distance; // r197
             let mut ui_render_scale = self.ui_render_scale; // r325
+            let mut ui_shadow_stride = self.ui_shadow_stride;
+            let mut ui_shadow_cache = self.ui_shadow_cache;
+            let mut ui_cull_aggression = self.ui_cull_aggression;
+            // r-borrow-fix: must read this BEFORE the settings closure below
+            // (self.egui_overlay.prepare(..., |c| { ... })) rather than
+            // calling self.shadow_chunk_stride() from inside it -- the
+            // closure already needs unique access to `self` (mutates
+            // self.chat_buffer, and `frame: &self.frames[frame_idx]` is
+            // borrowed across its whole body for the UBO write later), so
+            // an additional `self.` call inside it is a second borrow the
+            // compiler correctly rejects (E0500/E0501, caught on the first
+            // real build of this code).
+            let live_shadow_chunk_stride = self.shadow_chunk_stride();
             let mut ui_fps_target = self.ui_fps_target;
             let mut ui_autotune = self.ui_autotune;
             let mut ui_gpu_mesh_yield = self.ui_gpu_mesh_yield;
@@ -4349,6 +4421,19 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                     ui.weak("Esc cancels a pending rebind");
                                 }
                                 4 => {
+                                    // r-perf-scroll: this tab kept growing (render
+                                    // distance/scale, plant/leaf/apply strides,
+                                    // autotune, shadow stride/cache, now chunk-cull
+                                    // aggression) with no scroll area, unlike the
+                                    // keybinds tab (3) which has always had one --
+                                    // it started overflowing the panel. Same fix,
+                                    // same pattern: wrap the whole tab body.
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("perf_scroll")
+                                        .auto_shrink([false, false])
+                                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                                        .max_height(260.0)
+                                        .show(ui, |ui| {
 
                                     // r225: live performance levers on the
                                     // custom slider. These bind integer state
@@ -4372,6 +4457,8 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                                 ui_perf_preset = i as u8;
                                                 ui_render_distance = cfg.render_distance as i32;
                                                 ui_render_scale = cfg.render_scale;
+                                                ui_shadow_stride = cfg.shadow_chunk_stride;
+                                                ui_shadow_cache = cfg.shadow_cache;
                                             }
                                         }
                                     });
@@ -4380,13 +4467,17 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                             crate::runtime_config::PerfPreset::SELECTABLE[(ui_perf_preset.min(4)) as usize]
                                         );
                                         let modified = ui_render_distance != base.render_distance as i32
-                                            || (ui_render_scale - base.render_scale).abs() > 0.001;
+                                            || (ui_render_scale - base.render_scale).abs() > 0.001
+                                            || ui_shadow_stride != base.shadow_chunk_stride
+                                            || ui_shadow_cache != base.shadow_cache;
                                         ui.horizontal(|ui| {
                                             if modified {
                                                 ui.label(egui::RichText::new("🔨 custom profile").color(warn_col).small());
                                                 if unendlich_ui::tab_button(ui, "reset", false).clicked() {
                                                     ui_render_distance = base.render_distance as i32;
                                                     ui_render_scale = base.render_scale;
+                                                    ui_shadow_stride = base.shadow_chunk_stride;
+                                                    ui_shadow_cache = base.shadow_cache;
                                                 }
                                             } else {
                                                 ui.label(egui::RichText::new("● preset").color(accent).small());
@@ -4434,6 +4525,40 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                         ui.add_space(6.0);
                                         ui.label(egui::RichText::new(format!("{:.0}%", ui_render_scale * 100.0)).strong().color(accent));
                                     });
+                                    ui.separator();
+                                    // Shadow amortization: THE lever for the dominant GPU cost on
+                                    // most scenes (shadow-pass p50 dwarfs everything else at RD>=8 —
+                                    // see vk-harness/perf/reference.jsonl). Stride > 1 renders only
+                                    // 1/N chunks' shadows per frame, round-robin, reusing the rest
+                                    // of last frame's depth; a fast camera move forces a full
+                                    // render so it doesn't visibly lag.
+                                    ui.label("shadow stride (1 = every caster every frame; higher = cheaper, staler)");
+                                    int_slider!("shadow stride", ui_shadow_stride, u32, 1, 8);
+                                    ui.weak(format!(
+                                        "live: {} (frame_pacer autotune overrides this slider when UNENDLICH_FRAME_PACER=1, the default)",
+                                        live_shadow_chunk_stride,
+                                    ));
+                                    if unendlich_ui::menu::toggle(ui, ui_shadow_cache, accent).clicked() {
+                                        ui_shadow_cache = !ui_shadow_cache;
+                                    }
+                                    ui.label("skip shadow pass when sun + camera are both still");
+                                    ui.separator();
+
+                                    // r-cull-aggression: named-mode dial over three
+                                    // independent cheap-reject mechanisms (SIMD frustum
+                                    // pre-cull, sky-cull, CPU occlusion flood-cull) --
+                                    // see runtime_config::ChunkCullAggression's module
+                                    // doc for what each tier actually turns on and why
+                                    // they're ordered the way they are.
+                                    ui.label("chunk cull aggression");
+                                    ui.horizontal(|ui| {
+                                        for m in crate::runtime_config::ChunkCullAggression::ALL {
+                                            if unendlich_ui::tab_button(ui, m.label(), ui_cull_aggression == m.index()).clicked() {
+                                                ui_cull_aggression = m.index();
+                                            }
+                                        }
+                                    });
+                                    ui.weak(crate::runtime_config::ChunkCullAggression::from_index(ui_cull_aggression).description());
                                     ui.separator();
 
                                     if unendlich_ui::menu::toggle(ui, ui_autotune, accent).clicked() {
@@ -4490,6 +4615,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                         2 => "GPU: Vulkan compute, one batch per submit. If auto declined it on this driver, GPU applies at the next launch (UNENDLICH_GEN_BACKEND=gpu forces it).",
                                         _ => "Auto: the GPU where a device exists, except on drivers where it is measured to lose (Honeykrisp declines it).",
                                     });
+                                        }); // end perf_scroll ScrollArea
                                 }
                                 5 => {
                                     // r437: DEBUG tab. Master gate (off by default) + per-system
@@ -5722,6 +5848,9 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             self.ui_perf_preset = ui_perf_preset;
             self.ui_render_distance = ui_render_distance; // r197
             self.ui_render_scale = ui_render_scale; // r325
+            self.ui_shadow_stride = ui_shadow_stride;
+            self.ui_shadow_cache = ui_shadow_cache;
+            self.ui_cull_aggression = ui_cull_aggression;
             self.ui_fps_target = ui_fps_target;
             self.ui_autotune = ui_autotune;
             self.ui_gpu_mesh_yield = ui_gpu_mesh_yield;
@@ -5743,6 +5872,16 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
         //
         // This must run BEFORE `begin_frame` resets the slot — once
         // we reset, the previous results are gone.
+        //
+        // r-gpu-guard-wait: this fence wait is also *why* dropping
+        // QueryResultFlags::WAIT inside collect_frame (see its own
+        // comment) costs nothing in the normal case -- by the time we
+        // get here, the fence has already guaranteed the GPU finished
+        // writing this slot's queries, so a non-blocking poll finds
+        // them available immediately. The only case a poll can come up
+        // empty is the pre-existing "never recorded into yet" first-
+        // cycle case, which was always handled by the availability
+        // check regardless of the WAIT flag.
         self.gpu_timer.collect_frame(frame_idx as u32);
 
         // v0.24.3 chug-debug-2: pull the per-frame GPU zone breakdown
@@ -6552,7 +6691,24 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             // by the main pass don't race), then storage-image-write
             // → shader-sampled-read barrier AFTER compute (so the
             // main pass sees the new contents).
-            {
+            //
+            // r-gpu-guard-volumetrics: gpu_guard's Shed::Volumetrics tier
+            // logged "dropping volumetric lighting" for every session this
+            // whole debugging effort, but nothing ever actually checked it --
+            // confirmed by grepping every Shed::Volumetrics reference outside
+            // gpu_guard.rs itself and finding none. The froxel fill compute
+            // pass (dispatched below) has shown up costing over 300ms in a
+            // single frame in real crash logs (froxel_us=333490 in one
+            // capture), so this was real, meaningful, unclaimed cost sitting
+            // on the table during exactly the frames the guard was trying to
+            // relieve. Safe to skip entirely: `froxel.clear_to_sentinel` runs
+            // once at startup, so the volume always holds a defined neutral
+            // baseline even if this fill never runs again -- the main pass's
+            // fragment shader samples stale (or sentinel) scattering instead
+            // of this frame's, the same "reuse a safe empty state" trade
+            // already accepted for shadows_disabled just above.
+            let volumetrics_disabled = self.shed_level >= voxel_tools::gpu_guard::Shed::Volumetrics;
+            if !volumetrics_disabled {
                 // Pre-compute barrier: previous frame's main-pass
                 // reads → this frame's compute writes. Since the
                 // image is in GENERAL layout permanently, only an
@@ -6650,7 +6806,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                     &[],
                     std::slice::from_ref(&post_barrier),
                 );
-            }
+            } // end `if !volumetrics_disabled`
             // End froxel fill compute pass.
 
             // v0.21.1: GPU timestamp — froxel fill complete (post-barrier
@@ -7151,6 +7307,41 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
     /// `UNENDLICH_MAX_DRAWS`). Used by the run-summary memory line.
     pub fn indirect_capacity(&self) -> u32 {
         self.indirect.capacity()
+    }
+
+    /// Slots currently allocated (== capacity - free_list.len()). Compare
+    /// against `loaded`/`rendering` chunk counts in the FPS summary line:
+    /// if this tracks noticeably higher than the visible-chunk count, draw
+    /// slots aren't being freed on eviction/LOD-drop and are accumulating
+    /// — a candidate explanation for main-pass GPU time growing faster
+    /// than the visible chunk count would predict.
+    pub fn indirect_in_use(&self) -> u32 {
+        self.indirect.in_use()
+    }
+
+    /// Highest `in_use()` has ever reached this run. If this keeps
+    /// climbing while `in_use()` itself stays flat or drops, slots got
+    /// stuck allocated at some point and were never freed even though
+    /// the live chunk set moved on.
+    pub fn indirect_high_water(&self) -> u32 {
+        self.indirect.high_water()
+    }
+
+    /// r-chunk-geometry-diag: largest single active chunk's index count
+    /// this frame (triangle count = this / 3). See
+    /// `IndirectDrawSet::max_index_count`'s doc for why this exists --
+    /// distinguishing "many ordinary chunks" from "one chunk with
+    /// pathological geometry" when main-pass GPU time doesn't track the
+    /// visible chunk count.
+    pub fn indirect_max_index_count(&self) -> u32 {
+        self.indirect.max_index_count()
+    }
+
+    /// r-chunk-geometry-diag: total index count summed across all active
+    /// chunks this frame -- the real triangle budget, as opposed to
+    /// `in_use` which only counts how many chunks, not how big each is.
+    pub fn indirect_total_index_count(&self) -> u64 {
+        self.indirect.total_index_count()
     }
 
     /// Count of uploaded meshes per LOD level (Near, Mid, Far, VeryFar). Near

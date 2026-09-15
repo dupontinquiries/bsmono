@@ -9,8 +9,24 @@
 //! so a per-frame re-bake is cheaper than maintaining persistent per-entity
 //! buffers. The decode + shaders are proven in `vk-harness/tests/entity_render.rs`.
 //!
-//! Caller contract: `upload` must run after the frame's in-flight fence has been
-//! waited on (the buffer is single-buffered host memory), and before `record`.
+//! Caller contract: `upload` must run before `record`.
+//!
+//! r-entity-uaf: `upload`'s buffer-growth path used to `destroy_buffer` the old
+//! `vbuf`/`vmem` immediately and replace them, on the stated assumption that
+//! the caller had already waited on the frame's in-flight fence, making the
+//! (single, not per-frame-in-flight) buffer safe to free. That was true when
+//! `frames_in_flight` was hardcoded to 1 (each `draw_frame` fully drained the
+//! GPU before returning, so the wait from the *previous* iteration covered
+//! everything outstanding). It stopped being true once `frames_in_flight`
+//! defaulted to 2 (r476, for CPU/GPU overlap): with two slots, the *other*
+//! slot's command buffer -- which also binds this same shared, non-per-slot
+//! buffer -- can still be executing on the GPU when growth frees it out from
+//! under it. There is also no public API to wait for a specific frame's fence
+//! independently of calling `draw_frame`, so the old contract was not
+//! satisfiable by any correct caller once FIF > 1, only accidentally safe at
+//! FIF == 1. Fixed by retiring (not destroying) the old buffer for
+//! `frames_in_flight` frames, mirroring `WorldRenderer`'s `PendingDestroy`
+//! discipline for chunk mesh/indirect slots -- see `process_retired`.
 
 use ash::{vk, Device};
 use std::ffi::CStr;
@@ -19,6 +35,15 @@ use crate::world::entity::EntityVertex;
 
 const VERT_SPV: &[u8] = include_bytes!("../../../../assets/shaders/entity.vert.spv");
 const FRAG_SPV: &[u8] = include_bytes!("../../../../assets/shaders/entity.frag.spv");
+
+/// A retired `(buffer, memory)` pair, kept alive until the GPU is certain to
+/// have moved past any command buffer that could have referenced it. See the
+/// r-entity-uaf module doc for why this exists and how the countdown is safe.
+struct RetiredBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    frames_remaining: usize,
+}
 
 pub struct EntityPipeline {
     pub pipeline: vk::Pipeline,
@@ -31,6 +56,16 @@ pub struct EntityPipeline {
     imem: vk::DeviceMemory,
     icap: u64,
     index_count: u32,
+    /// How many frames a retired buffer must survive before it's actually
+    /// destroyed. Set from `WorldRenderer`'s own `frames_in_flight` at
+    /// construction (same source of truth chunk `PendingDestroy` uses), not
+    /// hardcoded, so `UNENDLICH_FRAMES_IN_FLIGHT=1` gets the old (correct,
+    /// slightly cheaper) immediate-free behavior back automatically.
+    frames_in_flight: usize,
+    /// Buffers replaced by a growth event, not yet safe to actually free.
+    /// Drained by `process_retired`, called once per frame from the same
+    /// spot `WorldRenderer::process_pending_destroys` runs.
+    retired: Vec<RetiredBuffer>,
 }
 
 impl EntityPipeline {
@@ -39,6 +74,7 @@ impl EntityPipeline {
         render_pass: vk::RenderPass,
         camera_set_layout: vk::DescriptorSetLayout,
         mem_props: vk::PhysicalDeviceMemoryProperties,
+        frames_in_flight: usize,
     ) -> Result<Self, vk::Result> {
         let vert_module = create_shader_module(device, VERT_SPV)?;
         let frag_module = create_shader_module(device, FRAG_SPV)?;
@@ -48,6 +84,7 @@ impl EntityPipeline {
             vk::PipelineShaderStageCreateInfo::builder()
                 .stage(vk::ShaderStageFlags::VERTEX).module(vert_module).name(entry).build(),
             vk::PipelineShaderStageCreateInfo::builder()
+
                 .stage(vk::ShaderStageFlags::FRAGMENT).module(frag_module).name(entry).build(),
         ];
 
@@ -157,11 +194,18 @@ impl EntityPipeline {
         Ok(Self {
             pipeline: pipelines[0], layout, mem_props,
             vbuf, vmem, vcap: 4096, ibuf, imem, icap: 4096, index_count: 0,
+            frames_in_flight: frames_in_flight.max(1),
+            retired: Vec::new(),
         })
     }
 
-    /// Re-bake upload for this frame. Grows the buffers if the bake outgrew them.
-    /// Must be called after the frame fence wait, before `record`.
+    /// Re-bake upload for this frame. Grows the buffers if the bake outgrew
+    /// them. Safe to call any time before `record` for the frame currently
+    /// being built -- growth no longer frees the old buffer immediately (see
+    /// the r-entity-uaf module doc); it's retired instead. Call
+    /// `process_retired` once per real frame (from the same spot
+    /// `WorldRenderer::process_pending_destroys` runs) to actually reclaim
+    /// retired buffers once it's safe.
     pub fn upload(&mut self, device: &Device, verts: &[EntityVertex], indices: &[u32]) -> Result<(), vk::Result> {
         // Pack vertices field-by-field so the GPU layout is exact regardless of
         // EntityVertex's Rust repr: [px,py,pz, cr,cg,cb, a] f32, 28 bytes each.
@@ -177,7 +221,15 @@ impl EntityPipeline {
 
         if !vbytes.is_empty() {
             if vbytes.len() as u64 > self.vcap {
-                unsafe { destroy_buffer(device, self.vbuf, self.vmem); }
+                // r-entity-uaf: retire, don't destroy -- a previous frame's
+                // command buffer (a different FIF slot than whichever one is
+                // "current" right now) may still be executing on the GPU and
+                // may still bind this exact buffer, since vbuf/vmem are
+                // shared across all slots rather than duplicated per-slot.
+                self.retired.push(RetiredBuffer {
+                    buffer: self.vbuf, memory: self.vmem,
+                    frames_remaining: self.frames_in_flight,
+                });
                 let cap = (vbytes.len() as u64).next_power_of_two();
                 let (b, m) = make_host_buffer(device, &self.mem_props, cap, vk::BufferUsageFlags::VERTEX_BUFFER)?;
                 self.vbuf = b; self.vmem = m; self.vcap = cap;
@@ -186,11 +238,16 @@ impl EntityPipeline {
         }
         if !ibytes.is_empty() {
             if ibytes.len() as u64 > self.icap {
-                unsafe { destroy_buffer(device, self.ibuf, self.imem); }
+                // r-entity-uaf: see the vbuf retirement above -- same reasoning.
+                self.retired.push(RetiredBuffer {
+                    buffer: self.ibuf, memory: self.imem,
+                    frames_remaining: self.frames_in_flight,
+                });
                 let cap = (ibytes.len() as u64).next_power_of_two();
                 let (b, m) = make_host_buffer(device, &self.mem_props, cap, vk::BufferUsageFlags::INDEX_BUFFER)?;
                 self.ibuf = b; self.imem = m; self.icap = cap;
             }
+
             write_host(device, self.imem, &ibytes)?;
         }
         Ok(())
@@ -211,10 +268,35 @@ impl EntityPipeline {
         }
     }
 
+    /// Tick retired buffers' countdown and actually free any that reach 0.
+    /// Call once per real frame -- the same spot
+    /// `WorldRenderer::process_pending_destroys` runs from is exactly right,
+    /// since that's already established as safe timing for this class of
+    /// deferred free (see the r-entity-uaf module doc).
+    pub fn process_retired(&mut self, device: &Device) {
+        let mut i = 0;
+        while i < self.retired.len() {
+            if self.retired[i].frames_remaining == 0 {
+                let r = self.retired.swap_remove(i);
+                unsafe { destroy_buffer(device, r.buffer, r.memory); }
+            } else {
+                self.retired[i].frames_remaining -= 1;
+                i += 1;
+            }
+        }
+    }
+
     pub fn destroy(&mut self, device: &Device) {
         unsafe {
             destroy_buffer(device, self.vbuf, self.vmem);
             destroy_buffer(device, self.ibuf, self.imem);
+            // r-entity-uaf: anything still in `retired` at shutdown -- by
+            // this point the caller (WorldRenderer::destroy) has already
+            // done a device_wait_idle, so it's unconditionally safe to free
+            // these now regardless of remaining countdown.
+            for r in self.retired.drain(..) {
+                destroy_buffer(device, r.buffer, r.memory);
+            }
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.layout, None);
         }

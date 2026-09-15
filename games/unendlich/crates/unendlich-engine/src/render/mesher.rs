@@ -324,6 +324,75 @@ const CORNER_CACHE_W: usize = CHUNK_SIZE as usize + 2;
 /// Slice span: chunk-local `y` in `0 .. CHUNK_SIZE`.
 const CORNER_CACHE_H: usize = CHUNK_SIZE as usize;
 
+// r-mesh-diag: per-emission-path quad counters, for isolating whether a
+// large mesh is "expensive but correct" (a lot of legitimate calls into the
+// subdivided-top / soft-side paths) vs "emitting more than it should" (a
+// count that doesn't reconcile with the chunk's actual non-air block count).
+// Same safety pattern as CORNER_CACHE/ENV_CACHE/TINT_CACHE below: genuinely
+// thread-local (not a shared static), so incrementing from multiple meshing
+// worker threads concurrently is race-free by construction -- each thread
+// gets its own counters, exactly like each thread gets its own caches.
+// Zero behavior change: these are read-only observers of code paths that
+// already run; nothing here affects what geometry gets emitted.
+thread_local! {
+    static MESH_DIAG_SUBDIVIDED_TOP_QUADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MESH_DIAG_JITTERED_TOP_QUADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MESH_DIAG_SOFT_SIDE_QUADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MESH_DIAG_SUBDIVIDED_TOP_BLOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static MESH_DIAG_JITTERED_TOP_BLOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // r-plant-hardware-budget: separate from the four above (which are all
+    // per-face paths inside the main greedy-mask loop) -- this counts actual
+    // stamp_template calls in decorate_chunk_styled, a single post-loop pass.
+    // Exists specifically to test the budget's "never exceeds the cap"
+    // invariant precisely, the same way the counters above let
+    // mesh_tri_regression's diagnostic test attribute triangles by path.
+    static MESH_DIAG_PLANT_STAMPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Snapshot of the per-emission-path counters (see the `thread_local!`
+/// block above for what each counts and why it's race-free).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MeshDiagCounts {
+    /// Quads emitted by `emit_subdivided_top` (nsub*nsub per call).
+    pub subdivided_top_quads: u64,
+    /// Calls to `emit_subdivided_top` -- i.e. distinct weathered-top blocks.
+    pub subdivided_top_blocks: u64,
+    /// Quads emitted by `emit_jittered_top` (1 per call).
+    pub jittered_top_quads: u64,
+    /// Calls to `emit_jittered_top` -- distinct non-weathered-jitter-top blocks.
+    pub jittered_top_blocks: u64,
+    /// Quads (== calls, 1 each) emitted by `emit_soft_side_face`.
+    pub soft_side_faces: u64,
+    /// Plants actually given full subvoxel-template detail by
+    /// `decorate_chunk_styled` -- bounded by `max_plant_stamps_per_chunk()`
+    /// regardless of how many plant-tagged blocks the chunk actually has.
+    pub plant_stamps: u64,
+}
+
+/// Zero all per-emission-path counters on the calling thread. Call before
+/// meshing whatever you want to measure.
+pub fn mesh_diag_reset() {
+    MESH_DIAG_SUBDIVIDED_TOP_QUADS.with(|c| c.set(0));
+    MESH_DIAG_JITTERED_TOP_QUADS.with(|c| c.set(0));
+    MESH_DIAG_SOFT_SIDE_QUADS.with(|c| c.set(0));
+    MESH_DIAG_SUBDIVIDED_TOP_BLOCKS.with(|c| c.set(0));
+    MESH_DIAG_JITTERED_TOP_BLOCKS.with(|c| c.set(0));
+    MESH_DIAG_PLANT_STAMPS.with(|c| c.set(0));
+}
+
+/// Read the per-emission-path counters accumulated on the calling thread
+/// since the last `mesh_diag_reset()`.
+pub fn mesh_diag_snapshot() -> MeshDiagCounts {
+    MeshDiagCounts {
+        subdivided_top_quads: MESH_DIAG_SUBDIVIDED_TOP_QUADS.with(|c| c.get()),
+        subdivided_top_blocks: MESH_DIAG_SUBDIVIDED_TOP_BLOCKS.with(|c| c.get()),
+        jittered_top_quads: MESH_DIAG_JITTERED_TOP_QUADS.with(|c| c.get()),
+        jittered_top_blocks: MESH_DIAG_JITTERED_TOP_BLOCKS.with(|c| c.get()),
+        soft_side_faces: MESH_DIAG_SOFT_SIDE_QUADS.with(|c| c.get()),
+        plant_stamps: MESH_DIAG_PLANT_STAMPS.with(|c| c.get()),
+    }
+}
+
 thread_local! {
     // r697: FLAT-ARRAY corner memo (was a HashMap in r695). The cache is hit 4×
     // per corner, so lookup cost matters: a flat array indexed by local
@@ -2717,17 +2786,62 @@ pub(crate) fn decorate_chunk_styled(
     tuft_style: TuftStyle,
 ) {
     let n = N as i32;
+    // r-plant-hardware-budget: cap how many of this chunk's plants get full
+    // subvoxel-template detail. Diagnosed live (see world::mesh_tri_regression's
+    // module doc): a single dense-canopy chunk with 1,930 plant-tagged blocks
+    // produced ~1.12M triangles from this pass alone -- decorate_chunk_styled
+    // had no ceiling at all before this, so a sufficiently foliage-dense chunk
+    // (a jungle canopy, a dense reed bed) could cost however much it happened
+    // to contain, unboundedly.
+    //
+    // Netcode/determinism note: this only decides which of a chunk's ALREADY-
+    // SIMULATED plants get full visual detail on THIS client -- it never
+    // changes chunk.blocks, chunk.plant_indices, or any other part of the
+    // deterministic world state, so it can't desync a lockstep/replicated sim.
+    // Two clients with different budgets (different hardware) render the same
+    // chunk's plants differently, exactly like they already do for render
+    // distance or LOD tier -- neither is "wrong," and the simulation doesn't
+    // care which one a given client chose. The selection itself is
+    // deterministic, not randomized or frame-varying: chunk.plant_indices is a
+    // BTreeSet (stable, sorted iteration order), and the budget simply stops
+    // stamping once it's spent -- the same plants get dropped every time this
+    // chunk is meshed on a given client (until the plant set itself changes),
+    // not a different flickering subset each frame.
+    //
+    // Trade-off, stated plainly: a plant that doesn't get stamped is not
+    // drawn at all, not downgraded to a simpler shape -- has_subvoxels()
+    // blocks are excluded from the normal cube-face greedy-mesh pass
+    // entirely (checked directly: BlockId::MESHABLE_LUT excludes
+    // is_subvoxel_only() blocks), so there's currently no cheaper fallback
+    // geometry to drop to. Over-budget plants are invisible, not simplified.
+    // That's an honest cost of a hardware safety valve, not a bug -- and
+    // it's a strict improvement over the alternative (the GPU-watchdog
+    // self-stop this was diagnosed from), but a coarser "cheap billboard"
+    // fallback would look better and is a natural follow-up once this
+    // ships and the actual budget numbers get tuned against real hardware.
+    let chunk_center = [
+        origin[0] as f32 + n as f32 / 2.0,
+        origin[1] as f32 + n as f32 / 2.0,
+        origin[2] as f32 + n as f32 / 2.0,
+    ];
+    let plant_budget = plant_stamp_budget_for_chunk(chunk_center);
+    let mut plant_stamps_used: u32 = 0;
     // Iterate the inverted plant index instead of scanning every cell.
     // For a chunk with no plants this loop is empty (zero cost). For a
     // forested surface chunk with ~200 plant blocks, we visit 200 cells
     // instead of 32k. Big win for tick perf too once lifecycle handlers
     // share this same indexing.
     for &plant_idx in &chunk.plant_indices {
+        if plant_stamps_used >= plant_budget {
+            break;
+        }
         let (lx, ly, lz) = Chunk::index_to_xyz(plant_idx);
         let block = chunk.blocks[plant_idx as usize];
         // Defensive: if the index got stale (shouldn't happen — set()
         // maintains it), skip. has_subvoxels is the gate.
         if !block.has_subvoxels() { continue; }
+        plant_stamps_used += 1;
+        MESH_DIAG_PLANT_STAMPS.with(|c| c.set(c.get() + 1));
 
         // Per-block instance state drives color modulation. Different
         // block types interpret state differently:
@@ -3267,6 +3381,226 @@ fn top_subdivision() -> i32 {
     })
 }
 
+/// r-subdivision-lod-vector: the same "LOD + vector, not just LOD +
+/// distance" treatment already applied to plant stamping
+/// (`plant_stamp_budget_for_chunk`), applied here to weathered-top
+/// subdivision -- confirmed by the live diagnostics as frequently the
+/// LARGER of the two absolute triangle contributors (e.g. 147968 of
+/// ~170588 total tris in one diagnosed chunk, before the flat
+/// UNENDLICH_TOP_SUBDIVISION knob was even applied). A block behind the
+/// player or far away now gets a coarser subdivision grid instead of the
+/// full detail level.
+///
+/// `pos` is the specific block's world position (not a chunk center --
+/// both call sites inside `emit_subdivided_top` already have their exact
+/// block_wx/wy/wz on hand, so this uses real per-block granularity for
+/// free rather than approximating from the chunk center the way the plant
+/// budget does at chunk granularity).
+///
+/// Reuses `plant_budget_scale_for_urgency`'s Now/Soon/Defer scale even
+/// though it was named for stamp counts: subdivision quad count is
+/// nsub^2, so a linear triangle-count scale factor becomes an nsub
+/// multiplier via its square root (a 0.15 triangle-scale needs nsub
+/// scaled by ~0.39, since 0.39^2 ~= 0.15, to land back on the intended
+/// triangle reduction). Same player-view snapshot as plants
+/// (`player_view_for_decoration_lod`, renamed from
+/// `player_view_for_plant_lod` once this consumer made the old name
+/// inaccurate -- see git history for the plant-only version this started
+/// as).
+fn top_subdivision_for_block(pos: [f32; 3]) -> i32 {
+    let base = top_subdivision();
+    let Some((eye, yaw)) = player_view_for_decoration_lod::get() else {
+        return base;
+    };
+    let cone = crate::sim::mesh_vision::ViewCone::player(eye, yaw, DECORATION_LOD_RANGE);
+    // Occlusion intentionally not plumbed in (see plant_stamp_budget_for_chunk's
+    // identical note) -- conservative, matching mesh_vision's own stated
+    // "conservative first pass" precedent.
+    let urgency = crate::sim::mesh_vision::urgency_for_cone(&cone, pos, false);
+    let tri_scale = crate::sim::mesh_vision::plant_budget_scale_for_urgency(urgency);
+    let nsub_scale = tri_scale.sqrt();
+    ((base as f32) * nsub_scale).round().clamp(1.0, 8.0) as i32
+}
+
+/// Hardware safety valve for `decorate_chunk_styled`'s plant-stamping pass
+/// (see that function's doc comment for the full "why" and the netcode/
+/// determinism reasoning). Default chosen to sit comfortably above what an
+/// ordinary forested chunk needs (tens to a couple hundred plants) while
+/// giving a real ceiling well under the ~1,930-plant dense-canopy case that
+/// was diagnosed producing ~1.12M triangles from this pass alone -- at that
+/// density even a generous per-tier default meaningfully bounds the worst
+/// case rather than leaving it unbounded.
+///
+/// Same pattern as `top_subdivision()` above: a single env-var-backed
+/// `OnceLock`, read once per process, not threaded through `RuntimeConfig`.
+/// This is a launch-time performance ceiling, not a live-adjustable quality
+/// slider -- consistent with how its sibling knob (`UNENDLICH_TOP_SUBDIVISION`)
+/// is already handled in this exact file. Scaling the default automatically
+/// by detected hardware tier (mirroring `device_budget::recommend_preset`) is
+/// a reasonable follow-up once real numbers from a running session are in
+/// hand; not done here to keep this change to the one thing it's for.
+const MAX_PLANT_STAMPS_PER_CHUNK_DEFAULT: u32 = 512;
+
+fn max_plant_stamps_per_chunk() -> u32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("UNENDLICH_MAX_PLANT_STAMPS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|n| n.clamp(16, 8192))
+            .unwrap_or(MAX_PLANT_STAMPS_PER_CHUNK_DEFAULT)
+    })
+}
+
+// r-plant-lod-vector: a lock-free snapshot of the player's current eye
+// position + facing, so decorate_chunk_styled (called from meshing worker
+// threads, not the main thread) can scale its plant budget by how urgently
+// the player's actual view cone wants this chunk -- distance AND facing
+// direction ("LOD + vector, not just LOD + camera position"), reusing
+// sim::mesh_vision's already-tested ViewCone/MeshUrgency machinery rather
+// than threading a new parameter through MeshRequest -> mesh_chunk_greedy_
+// with_neighbors -> decorate_chunk (four signatures across three files,
+// each needing every call site updated) for what is fundamentally a
+// same-shape problem to the sky/current_tick fields MeshRequest ALREADY
+// documents as "snapshot at submission time... bakes in this [value]": a
+// mesh worker reading a slightly-stale player position from a frame or two
+// ago is exactly as harmless as it already is for lighting/tick-transition
+// baking elsewhere in this same request. Same AtomicU32-encoded-float
+// pattern already used for cross-thread gain automation in audio.rs's
+// StemGroup (no new dependency, no locking, updated once per frame from the
+// main thread, read at most once per plant-stamping or weathered-top-
+// subdivision call on a worker thread).
+/// r-plant-lod-vector / r-subdivision-lod-vector: shared cone range for
+/// both chunk-decoration LOD consumers (plant stamping and weathered-top
+/// subdivision). Deliberately independent of render distance -- decoration
+/// past this range isn't worth discriminating further regardless of how
+/// far the world itself renders.
+const DECORATION_LOD_RANGE: f32 = 100.0;
+
+mod player_view_for_decoration_lod {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    static EYE_X: AtomicU32 = AtomicU32::new(0);
+    static EYE_Y: AtomicU32 = AtomicU32::new(0);
+    static EYE_Z: AtomicU32 = AtomicU32::new(0);
+    static YAW: AtomicU32 = AtomicU32::new(0);
+    /// False until the first real `set()` call. Before that (or if the
+    /// caller never wires this up at all -- tests, headless tools), plant
+    /// stamping must behave exactly as before this feature existed: full
+    /// budget, no distance/facing scaling. This flag is what makes that the
+    /// safe default rather than "scale by a bogus (0,0,0) eye position".
+    static VALID: AtomicBool = AtomicBool::new(false);
+
+    /// Publish the player's current eye position and yaw. Call once per
+    /// frame from the main thread; cheap (four atomic stores, `Relaxed` --
+    /// this is an LOD hint, not synchronization-critical state).
+    pub fn set(eye: [f32; 3], yaw: f32) {
+        EYE_X.store(eye[0].to_bits(), Ordering::Relaxed);
+        EYE_Y.store(eye[1].to_bits(), Ordering::Relaxed);
+        EYE_Z.store(eye[2].to_bits(), Ordering::Relaxed);
+        YAW.store(yaw.to_bits(), Ordering::Relaxed);
+        VALID.store(true, Ordering::Relaxed);
+    }
+
+    /// Read the last-published eye/yaw, or `None` if `set()` has never been
+    /// called (safe default: caller should skip distance/facing scaling
+    /// entirely and use the full plant budget).
+    pub fn get() -> Option<([f32; 3], f32)> {
+        if !VALID.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some((
+            [
+                f32::from_bits(EYE_X.load(Ordering::Relaxed)),
+                f32::from_bits(EYE_Y.load(Ordering::Relaxed)),
+                f32::from_bits(EYE_Z.load(Ordering::Relaxed)),
+            ],
+            f32::from_bits(YAW.load(Ordering::Relaxed)),
+        ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn set_then_get_round_trips() {
+            reset_for_test();
+            set([1.0, 2.0, 3.0], 0.75);
+            let (eye, yaw) = get().expect("set() was called, get() must return Some");
+            assert_eq!(eye, [1.0, 2.0, 3.0]);
+            assert_eq!(yaw, 0.75);
+            reset_for_test();
+        }
+
+        #[test]
+        fn reset_clears_validity() {
+            set([9.0, 9.0, 9.0], 1.0);
+            assert!(get().is_some());
+            reset_for_test();
+            assert!(get().is_none(), "reset_for_test must fully clear the published view");
+        }
+    }
+
+    /// r-plant-lod-vector: test-only reset, since `set()` mutates process-
+    /// global state that would otherwise silently leak into every other
+    /// test in this binary run after the first test that calls `set()`.
+    /// Any test that calls `set()` MUST reset before and after itself (both
+    /// directions: before, so it doesn't inherit state from a prior test
+    /// that forgot to clean up; after, so it doesn't poison tests that run
+    /// later and never expected a player view to be published at all --
+    /// e.g. mesh_tri_regression's plant-budget tests, which assert exact
+    /// plant_stamps counts against the flat, unscaled budget).
+    #[cfg(test)]
+    pub fn reset_for_test() {
+        VALID.store(false, Ordering::Relaxed);
+    }
+}
+
+/// r-plant-lod-vector: compute the effective plant stamp budget for one
+/// chunk, given the current player view (if any has been published via
+/// `player_view_for_decoration_lod::set`). Falls back to the flat
+/// `max_plant_stamps_per_chunk()` -- unscaled, exactly this feature's
+/// pre-existing behavior -- when no player view is available (tests,
+/// headless tools, or simply the very first chunks meshed before the main
+/// loop's first frame publishes one).
+///
+/// `chunk_center` is in world blocks (see the identical computation in
+/// chunk_manager.rs's mesh-vision-sched shell-walk for the established
+/// convention this mirrors). Range and FOV reuse `ViewCone::player`'s
+/// existing defaults (~90° fov) rather than inventing a second set of
+/// tuning constants; `DECORATION_LOD_RANGE` is deliberately independent of
+/// render distance -- plants past this range aren't worth discriminating
+/// further regardless of how far the world itself renders.
+fn plant_stamp_budget_for_chunk(chunk_center: [f32; 3]) -> u32 {
+    let base = max_plant_stamps_per_chunk();
+    let Some((eye, yaw)) = player_view_for_decoration_lod::get() else {
+        return base;
+    };
+    let cone = crate::sim::mesh_vision::ViewCone::player(eye, yaw, DECORATION_LOD_RANGE);
+    // Occlusion intentionally not plumbed in here -- conservative, matching
+    // mesh_vision's own "conservative first pass" precedent (see that
+    // module's doc): an occluded-but-in-cone chunk still gets Now/Soon's
+    // scale rather than being further thinned, so nothing looks sparser
+    // than it should just because line_of_sight wasn't checked for this
+    // purpose too.
+    let urgency = crate::sim::mesh_vision::urgency_for_cone(&cone, chunk_center, false);
+    let scale = crate::sim::mesh_vision::plant_budget_scale_for_urgency(urgency);
+    ((base as f32) * scale).round().max(1.0) as u32
+}
+
+/// r-plant-lod-vector: publish the player's current eye position and yaw
+/// for `plant_stamp_budget_for_chunk` to read on meshing worker threads.
+/// Call once per frame from the main loop; see `player_view_for_decoration_lod`'s
+/// own doc for why this is a lock-free snapshot rather than a threaded
+/// parameter. Safe to never call at all (plant stamping simply stays at the
+/// flat, unscaled budget it always used before this feature existed).
+pub fn set_player_view_for_decoration_lod(eye: [f32; 3], yaw: f32) {
+    player_view_for_decoration_lod::set(eye, yaw);
+}
+
+
 /// Emit a subdivided top face for a soft block. The 1×1 block top
 /// becomes an 8×8 grid of mini-quads. Each interior vertex's Y is
 /// computed via `bumpy_height` at sub-integer world coords, plus a
@@ -3331,10 +3665,19 @@ pub(crate) fn emit_subdivided_top(
     let o01 = corner_y_offset_cached(chunk, block_wx,     slice, block_wz + 1, softness);
 
     // 9×9 vertex grid at the default 8 subdivisions; runtime-overridable
-    // via UNENDLICH_TOP_SUBDIVISION (1..=8). Index: i × (nsub+1) + j.
+    // via UNENDLICH_TOP_SUBDIVISION (1..=8), and now also scaled by the
+    // player's live distance+facing to this exact block (r-subdivision-
+    // lod-vector) -- falls back to the flat env-var value when no player
+    // view has been published (tests, headless tools). Index: i × (nsub+1) + j.
     // (named `nsub`, not `N`, because a module-level `const N: usize`
     // is in scope and `let N` would be read as a const-pattern.)
-    let nsub: i32 = top_subdivision();
+    let nsub: i32 = top_subdivision_for_block([block_wx as f32, block_wy as f32, block_wz as f32]);
+    // r-mesh-diag: count this call and its quad output. See the
+    // MeshDiagCounts doc for why this is safe to add unconditionally
+    // (thread-local, read-only observer, zero behavior change).
+    MESH_DIAG_SUBDIVIDED_TOP_BLOCKS.with(|c| c.set(c.get() + 1));
+    MESH_DIAG_SUBDIVIDED_TOP_QUADS.with(|c| c.set(c.get() + (nsub as u64) * (nsub as u64)));
+
     let inv_n = 1.0 / (nsub as f32);
     let base_idx = mesh.vertices.len() as u32;
 
@@ -3412,6 +3755,9 @@ pub(crate) fn emit_jittered_top(
     chunk: &Chunk,
     world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
 ) {
+    // r-mesh-diag: see MeshDiagCounts doc; thread-local, zero behavior change.
+    MESH_DIAG_JITTERED_TOP_BLOCKS.with(|c| c.set(c.get() + 1));
+    MESH_DIAG_JITTERED_TOP_QUADS.with(|c| c.set(c.get() + 1));
     let block_wx = origin[0] + u;
     let block_wy = origin[1] + slice;
     let block_wz = origin[2] + v;
@@ -3672,6 +4018,8 @@ pub(crate) fn emit_soft_side_face(
     chunk: &Chunk,
     world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
 ) {
+    // r-mesh-diag: see MeshDiagCounts doc; thread-local, zero behavior change.
+    MESH_DIAG_SOFT_SIDE_QUADS.with(|c| c.set(c.get() + 1));
     // World position of the BLOCK (not the face) for env sampling.
     let mut block_local = [0i32; 3];
     block_local[cfg.axis] = slice;
@@ -4624,6 +4972,171 @@ mod tests {
         assert!(surface_verts >= 4 * 32 * 32 / 2,
             "expected ≥{} water surface vertices, got {}",
             4 * 32 * 32 / 2, surface_verts);
+    }
+
+    /// r-plant-hardware-budget: decorate_chunk_styled must never stamp more
+    /// plants than max_plant_stamps_per_chunk(), no matter how many
+    /// plant-tagged blocks the chunk actually has. Uses the MESH_DIAG_PLANT_STAMPS
+    /// counter (same infrastructure world::mesh_tri_regression's diagnostic
+    /// test uses to attribute triangles by emission path) for a precise
+    /// count, rather than inferring it from aggregate vertex/triangle totals.
+    #[test]
+    fn plant_stamps_never_exceed_the_hardware_budget() {
+        use crate::world::blocks::BlockId;
+        use crate::world::chunk::{Chunk, ChunkCoord};
+        let budget = max_plant_stamps_per_chunk();
+        // Comfortably more plant-tagged blocks than the budget allows, so a
+        // correct implementation must actually turn some away (a fixture
+        // sized at or under the budget wouldn't distinguish "the cap works"
+        // from "the cap silently does nothing").
+        let plant_count = budget as usize + 200;
+        let mut blocks = vec![BlockId::Air; (CHUNK_SIZE as usize).pow(3)];
+        for b in blocks.iter_mut().take(plant_count) {
+            *b = BlockId::OakLeaves;
+        }
+        let chunk = Chunk::from_blocks(ChunkCoord::new(0, 0, 0), blocks);
+        assert_eq!(
+            chunk.plant_indices.len(), plant_count,
+            "fixture sanity: from_blocks should have indexed every OakLeaves cell as a plant"
+        );
+
+        mesh_diag_reset();
+        let _mesh = mesh_chunk_greedy(&chunk, None, None, None);
+        let diag = mesh_diag_snapshot();
+
+        assert!(
+            diag.plant_stamps <= budget as u64,
+            "stamped {} plants, exceeding the budget of {budget} -- the hardware safety \
+             valve in decorate_chunk_styled isn't actually capping",
+            diag.plant_stamps,
+        );
+        assert_eq!(
+            diag.plant_stamps, budget as u64,
+            "with more plants available ({plant_count}) than the budget ({budget}), exactly \
+             the budget's worth should be stamped -- fewer would mean the cap is firing too \
+             early (a separate bug from not capping at all)",
+        );
+    }
+
+    /// The budget must not fire at all for a chunk with fewer plants than
+    /// the cap allows -- an ordinary lightly-vegetated chunk should be
+    /// completely unaffected by this safety valve.
+    #[test]
+    fn plant_budget_does_not_affect_chunks_under_the_cap() {
+        use crate::world::blocks::BlockId;
+        use crate::world::chunk::{Chunk, ChunkCoord};
+        let budget = max_plant_stamps_per_chunk();
+        let plant_count = (budget as usize / 4).max(1); // well under budget
+        let mut blocks = vec![BlockId::Air; (CHUNK_SIZE as usize).pow(3)];
+        for b in blocks.iter_mut().take(plant_count) {
+            *b = BlockId::OakLeaves;
+        }
+        let chunk = Chunk::from_blocks(ChunkCoord::new(0, 0, 0), blocks);
+
+        mesh_diag_reset();
+        let _mesh = mesh_chunk_greedy(&chunk, None, None, None);
+        let diag = mesh_diag_snapshot();
+
+        assert_eq!(
+            diag.plant_stamps, plant_count as u64,
+            "a chunk with fewer plants than the budget should have every one of them \
+             stamped, same as before this safety valve existed",
+        );
+    }
+
+    /// r-plant-lod-vector: the core claim of this feature -- "LOD + vector,
+    /// not just LOD + camera position" -- means a chunk directly BEHIND the
+    /// player gets a smaller plant budget than one directly AHEAD, at the
+    /// exact same distance. Isolates plant_stamp_budget_for_chunk directly
+    /// rather than running a full mesh_chunk_greedy through
+    /// decorate_chunk_styled: this global (player_view_for_decoration_lod) is
+    /// process-wide state shared with other tests that assert exact
+    /// plant_stamps counts against the flat, unscaled default (e.g.
+    /// plant_budget_does_not_affect_chunks_under_the_cap above) and Rust's
+    /// default test runner executes tests in parallel threads of the same
+    /// process -- calling only this one pure function keeps the window
+    /// where VALID=true as short as possible, minimizing collision risk
+    /// with those tests rather than holding it open for a full mesh pass.
+    #[test]
+    fn plant_budget_scales_by_facing_not_just_distance() {
+        player_view_for_decoration_lod::reset_for_test();
+
+        let chunk_center = [16.0, 16.0, 16.0]; // ChunkCoord(0,0,0)'s center
+        let eye = [16.0, 16.0, -14.0]; // 30 blocks from chunk_center on -Z
+
+        // Facing +Z (toward the chunk, horiz_angle(eye, chunk_center) = PI/2):
+        // the chunk is directly ahead, well within range -> Now -> full scale.
+        player_view_for_decoration_lod::set(eye, std::f32::consts::FRAC_PI_2);
+        let ahead_budget = plant_stamp_budget_for_chunk(chunk_center);
+
+        // Facing -Z (directly away): the SAME chunk, at the SAME distance,
+        // is now directly behind the player -> Defer -> reduced scale. Only
+        // the facing changed between these two calls.
+        player_view_for_decoration_lod::set(eye, -std::f32::consts::FRAC_PI_2);
+        let behind_budget = plant_stamp_budget_for_chunk(chunk_center);
+
+        player_view_for_decoration_lod::reset_for_test();
+
+        assert!(
+            behind_budget < ahead_budget,
+            "same chunk, same distance, only facing differs -- behind ({behind_budget}) must \
+             get a smaller plant budget than ahead ({ahead_budget}), proving this is a facing \
+             (vector) effect and not just a distance falloff"
+        );
+        assert!(behind_budget >= 1, "budget must never be reduced all the way to zero");
+    }
+
+    #[test]
+    fn plant_budget_falls_back_to_flat_default_with_no_player_view_published() {
+        // Regression guard: if nothing ever calls set_player_view_for_decoration_lod
+        // (tests, headless tools, or simply before the main loop's first
+        // frame), behavior must be identical to before this feature existed
+        // -- the flat, unscaled max_plant_stamps_per_chunk() value.
+        player_view_for_decoration_lod::reset_for_test();
+        let chunk_center = [16.0, 16.0, 16.0];
+        assert_eq!(
+            plant_stamp_budget_for_chunk(chunk_center),
+            max_plant_stamps_per_chunk(),
+            "with no player view published, the budget must be the flat default, unscaled"
+        );
+    }
+
+    /// r-subdivision-lod-vector: same "vector, not just distance" claim as
+    /// plant_budget_scales_by_facing_not_just_distance, for weathered-top
+    /// subdivision. Same shared-global-state care applies (see that test's
+    /// doc): calls only the pure function, resets before and after.
+    #[test]
+    fn subdivision_scales_by_facing_not_just_distance() {
+        player_view_for_decoration_lod::reset_for_test();
+
+        let block_pos = [16.0, 16.0, 16.0];
+        let eye = [16.0, 16.0, -14.0]; // 30 blocks away on -Z, same as the plant test
+
+        player_view_for_decoration_lod::set(eye, std::f32::consts::FRAC_PI_2); // facing toward it
+        let ahead_nsub = top_subdivision_for_block(block_pos);
+
+        player_view_for_decoration_lod::set(eye, -std::f32::consts::FRAC_PI_2); // facing away
+        let behind_nsub = top_subdivision_for_block(block_pos);
+
+        player_view_for_decoration_lod::reset_for_test();
+
+        assert!(
+            behind_nsub < ahead_nsub,
+            "same block, same distance, only facing differs -- behind ({behind_nsub}) must \
+             get coarser subdivision than ahead ({ahead_nsub})"
+        );
+        assert!(behind_nsub >= 1, "subdivision must never drop below 1 (a flat quad)");
+    }
+
+    #[test]
+    fn subdivision_falls_back_to_flat_default_with_no_player_view_published() {
+        player_view_for_decoration_lod::reset_for_test();
+        let block_pos = [16.0, 16.0, 16.0];
+        assert_eq!(
+            top_subdivision_for_block(block_pos),
+            top_subdivision(),
+            "with no player view published, subdivision must be the flat default, unscaled"
+        );
     }
 
     /// r446: a water cell with air on its sides/bottom emits side+bottom faces (volume), but
