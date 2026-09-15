@@ -90,6 +90,26 @@ pub struct Blocker {
     /// Ground height the top of the obstacle reaches, in world units. A dash
     /// or a knock-up above this clears it; see [`Blockers::resolve_at`].
     pub top: f32,
+    /// What this prop HIDES. Carried on the same entry as the collision so a
+    /// prop cannot be moved in one and forgotten in the other — the same
+    /// reasoning that put PropKind through the placement macros.
+    pub cover: Cover,
+}
+
+/// A disc of concealment. Separate from [`Shape`] because a prop's hiding
+/// span is not its collision span: a fern blocks nothing and hides 1.3 units,
+/// a boulder does both over the same radius.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Cover {
+    pub x: f32,
+    pub z: f32,
+    pub radius: f32,
+    /// 0 = hides nothing, 1 = breaks the view entirely.
+    pub amount: f32,
+}
+
+impl Cover {
+    pub const NONE: Cover = Cover { x: 0.0, z: 0.0, radius: 0.0, amount: 0.0 };
 }
 
 /// What a prop does to movement.
@@ -102,14 +122,42 @@ pub struct Footprint {
     /// Deliberately walk-through. See the module header — this is a recorded
     /// decision, not a missing entry.
     pub passable: bool,
+    /// How much this prop HIDES, 0..1, independent of whether it blocks.
+    ///
+    /// A wall and a bramble thicket are opposites: the wall stops you and the
+    /// thicket hides you, and a prop can do either, both, or neither. The
+    /// blockers grid was answering only "can I walk through it", which made
+    /// ferns and bushes pure decoration — the map had nowhere to dive.
+    ///
+    /// Concealment RADIUS is the collision radius when solid, and
+    /// `conceal_radius` when passable, because a fern conceals across a
+    /// wider span than the stem it can't be walked through at.
+    pub conceal: f32,
+    /// Span over which a passable prop conceals. Ignored when solid.
+    pub conceal_radius: f32,
 }
 
 impl Footprint {
     pub const fn solid(radius: f32, top: f32) -> Footprint {
-        Footprint { radius, top, passable: false }
+        // A solid prop conceals fully within its own footprint: you cannot
+        // see through a boulder.
+        Footprint { radius, top, passable: false, conceal: 1.0, conceal_radius: radius }
+    }
+    /// Passable AND hiding — a thicket, a fern bed, a hanging vine.
+    ///
+    /// This is the case the module was missing. `conceal` below 1.0 is
+    /// deliberate for most flora: standing in a fern makes you hard to see,
+    /// not invisible, and a binary would turn every bush into a cloak.
+    pub const fn cover(conceal: f32, conceal_radius: f32) -> Footprint {
+        Footprint { radius: 0.0, top: 0.0, passable: true, conceal, conceal_radius }
     }
     pub const fn passable() -> Footprint {
-        Footprint { radius: 0.0, top: 0.0, passable: true }
+        Footprint { radius: 0.0, top: 0.0, passable: true, conceal: 0.0, conceal_radius: 0.0 }
+    }
+
+    /// Does this prop hide anything at all?
+    pub const fn conceals(&self) -> bool {
+        self.conceal > 0.0 && self.conceal_radius > 0.0
     }
 }
 
@@ -193,8 +241,21 @@ impl PropKind {
             // as two separate blockers at build time instead.
             RuinArch => Footprint::passable(),
 
-            // Deliberately walk-through — see the module header.
-            Fern | Bush | VineCurtain | LanePad => Footprint::passable(),
+            // Walk-through, but NOT nothing: these are the props a cat dives
+            // into. Values are what they hide you from at a glance, and none
+            // is 1.0 — a fern makes you hard to see, not invisible, and a
+            // binary would turn every bush into a cloak.
+            //
+            // Radii are wider than a collision radius would be: concealment
+            // is about the spread of leaf, not the stem.
+            Bush => Footprint::cover(0.80, 1.6),
+            Fern => Footprint::cover(0.55, 1.3),
+            // A hanging curtain hides a lot from one side and is the classic
+            // ambush spot, hence the highest of the four.
+            VineCurtain => Footprint::cover(0.90, 1.1),
+            // A painted pad on the ground hides nothing; it is passable
+            // because it is flat, which is a different reason.
+            LanePad => Footprint::passable(),
         }
     }
 }
@@ -268,14 +329,28 @@ impl Blockers {
     /// whether anything was added, so a caller can assert coverage.
     pub fn push_prop(&mut self, kind: PropKind, x: f32, z: f32, ground_y: f32, scale: f32) -> bool {
         let f = kind.footprint();
-        if f.passable || f.radius <= 0.0 {
+        let solid = !f.passable && f.radius > 0.0;
+        if !solid && !f.conceals() {
+            // Neither blocks nor hides: a lane pad. Nothing to record.
             return false;
         }
+        let r = if solid { f.radius * scale.max(0.01) } else { 0.0 };
         self.push(Blocker {
-            shape: Shape::Circle { x, z, r: f.radius * scale.max(0.01) },
-            top: ground_y + f.top,
+            // A cover-only prop gets a ZERO-radius shape rather than being
+            // kept out of the set: it still needs a grid cell so
+            // `concealment_at` can find it, and a zero radius can never push
+            // anyone out (`resolve` compares against `br + radius` and the
+            // unit's own radius is what remains).
+            shape: Shape::Circle { x, z, r },
+            top: if solid { ground_y + f.top } else { f32::NEG_INFINITY },
+            cover: Cover {
+                x,
+                z,
+                radius: f.conceal_radius * scale.max(0.01),
+                amount: f.conceal,
+            },
         });
-        true
+        solid
     }
 
     /// Add a long prop as a capsule between two points.
@@ -296,6 +371,10 @@ impl Blockers {
         self.push(Blocker {
             shape: Shape::Segment { x0, z0, x1, z1, r: f.radius * scale.max(0.01) },
             top: ground_y + f.top,
+            // A wall's concealment is handled by its own solid footprint at
+            // each sample point along it, so the disc is left empty rather
+            // than guessing a midpoint.
+            cover: Cover::NONE,
         });
         true
     }
@@ -375,6 +454,63 @@ impl Blockers {
         p
     }
 
+    /// How hidden is a unit standing at `(x, z)`, 0..1?
+    ///
+    /// The cover half of this module. `resolve` answers "can I walk there";
+    /// this answers "can I be seen there", and they are genuinely different
+    /// questions about the same props — a boulder does both, a fern only the
+    /// second, a bridge neither.
+    ///
+    /// Concealment does NOT sum across overlapping props. Three ferns in a
+    /// patch make you no more hidden than the best one, because the alternative
+    /// is a scatter density accidentally becoming an invisibility field —
+    /// and the jungle generator plants ferns in clumps of six.
+    pub fn concealment_at(&self, x: f32, z: f32) -> f32 {
+        let mut scratch = Vec::new();
+        self.near(x, z, self.cell * 2.0, &mut scratch);
+        let mut best = 0.0f32;
+        for &i in &scratch {
+            let c = self.all[i as usize].cover;
+            if c.amount <= 0.0 {
+                continue;
+            }
+            let d2 = (x - c.x).powi(2) + (z - c.z).powi(2);
+            if d2 < c.radius * c.radius {
+                best = best.max(c.amount);
+            }
+        }
+        best.min(1.0)
+    }
+
+    /// Total sight obstruction along the segment from `a` to `b`.
+    ///
+    /// Sampled rather than analytically integrated: the props are circles and
+    /// the exact chord lengths are computable, but a watcher only needs to
+    /// know whether the view is broken, and sampling lets a solid blocker and
+    /// a thicket contribute through one path. Step is half a cell, so nothing
+    /// narrower than a cell can be missed entirely.
+    ///
+    /// Returns 0..1, saturating: once the line is fully broken, more foliage
+    /// behind it changes nothing.
+    pub fn sight_obstruction(&self, a: (f32, f32), b: (f32, f32)) -> f32 {
+        let (dx, dz) = (b.0 - a.0, b.1 - a.1);
+        let len = (dx * dx + dz * dz).sqrt();
+        if len < 1e-4 {
+            return self.concealment_at(a.0, a.1);
+        }
+        let step = (self.cell * 0.5).max(0.25);
+        let n = ((len / step).ceil() as usize).clamp(1, 512);
+        let mut worst = 0.0f32;
+        for k in 0..=n {
+            let t = k as f32 / n as f32;
+            worst = worst.max(self.concealment_at(a.0 + dx * t, a.1 + dz * t));
+            if worst >= 1.0 {
+                break;
+            }
+        }
+        worst
+    }
+
     /// Is `(x, z)` inside any blocker? Used by map generation and spawn
     /// placement to avoid dropping something inside a rock.
     pub fn blocked(&self, x: f32, z: f32, radius: f32) -> bool {
@@ -382,6 +518,13 @@ impl Blockers {
         self.near(x, z, radius + self.cell, &mut scratch);
         scratch.iter().any(|&i| {
             let b = self.all[i as usize];
+            // Cover-only entries live in the same set with a zero-radius
+            // shape. Without this they would answer "blocked" for any query
+            // whose own radius reached them, and spawn placement would refuse
+            // to put anything near a fern.
+            if b.top == f32::NEG_INFINITY {
+                return false;
+            }
             let (ax, az, br) = b.shape.nearest_axis(x, z);
             let need = br + radius;
             (x - ax).powi(2) + (z - az).powi(2) < need * need
@@ -445,8 +588,8 @@ mod tests {
     #[test]
     fn overlapping_blockers_resolve_to_a_free_spot() {
         let mut b = Blockers::new(100.0, 4.0);
-        b.push(Blocker { shape: Shape::Circle { x: -1.0, z: 0.0, r: 1.5 }, top: 5.0 });
-        b.push(Blocker { shape: Shape::Circle { x: 1.0, z: 0.0, r: 1.5 }, top: 5.0 });
+        b.push(Blocker { shape: Shape::Circle { x: -1.0, z: 0.0, r: 1.5 }, top: 5.0, cover: Cover::NONE });
+        b.push(Blocker { shape: Shape::Circle { x: 1.0, z: 0.0, r: 1.5 }, top: 5.0, cover: Cover::NONE });
         let out = b.resolve(Vec3::new(0.0, 0.0, 0.1), 0.4);
         assert!(!b.blocked(out.x, out.z, 0.4), "ended inside a blocker: {out:?}");
     }
@@ -456,7 +599,7 @@ mod tests {
     #[test]
     fn airborne_units_clear_low_blockers() {
         let mut b = Blockers::new(100.0, 4.0);
-        b.push(Blocker { shape: Shape::Circle { x: 0.0, z: 0.0, r: 2.0 }, top: 1.4 });
+        b.push(Blocker { shape: Shape::Circle { x: 0.0, z: 0.0, r: 2.0 }, top: 1.4, cover: Cover::NONE });
         let p = Vec3::new(0.5, 0.0, 0.0);
         // On the ground: blocked.
         assert_ne!(b.resolve_at(p, 0.5, f32::NEG_INFINITY), p);
@@ -499,7 +642,7 @@ mod tests {
     fn the_grid_is_position_independent() {
         for (x, z) in [(0.0, 0.0), (60.0, -70.0), (-95.0, 95.0)] {
             let mut b = Blockers::new(100.0, 4.0);
-            b.push(Blocker { shape: Shape::Circle { x, z, r: 2.0 }, top: 5.0 });
+            b.push(Blocker { shape: Shape::Circle { x, z, r: 2.0 }, top: 5.0, cover: Cover::NONE });
             let probe = Vec3::new(x + 0.5, 0.0, z);
             let out = b.resolve(probe, 0.5);
             assert!(!b.blocked(out.x, out.z, 0.5), "failed at ({x},{z}): {out:?}");
@@ -523,5 +666,108 @@ mod tests {
         let p = Vec3::new(1.0, 2.0, 3.0);
         assert_eq!(b.resolve(p, 0.5), p);
         assert!(!b.blocked(1.0, 3.0, 0.5));
+    }
+
+    // ── cover ────────────────────────────────────────────────────────────
+
+    /// THE THICKET. "All three cats dived for cover into a bramble thicket" —
+    /// a prop that hides you and does NOT stop you. Before this the grid only
+    /// answered "can I walk through it", so every fern was decoration and the
+    /// map had nowhere to dive.
+    #[test]
+    fn a_bush_hides_without_blocking() {
+        let mut b = Blockers::new(100.0, 4.0);
+        // push_prop returns whether it made a SOLID blocker; a bush is cover
+        // only, so false -- but it is still recorded.
+        assert!(!b.push_prop(PropKind::Bush, 0.0, 0.0, 0.0, 1.0));
+        assert_eq!(b.len(), 1, "cover-only props are still in the set");
+
+        let p = Vec3::new(0.0, 0.0, 0.0);
+        assert_eq!(b.resolve(p, 0.5), p, "a bush must never push a cat out");
+        assert!(!b.blocked(0.0, 0.0, 0.5), "and must not refuse a spawn");
+        assert!(b.concealment_at(0.0, 0.0) > 0.5, "but it hides");
+    }
+
+    /// A boulder does both; a lane pad does neither.
+    #[test]
+    fn solid_props_conceal_and_flat_ones_do_not() {
+        let mut b = Blockers::new(100.0, 4.0);
+        assert!(b.push_prop(PropKind::BoulderCluster, 0.0, 0.0, 0.0, 1.0));
+        assert_eq!(b.concealment_at(0.0, 0.0), 1.0, "you cannot see through a boulder");
+        assert!(b.blocked(0.0, 0.0, 0.3));
+
+        let mut b2 = Blockers::new(100.0, 4.0);
+        assert!(!b2.push_prop(PropKind::LanePad, 0.0, 0.0, 0.0, 1.0));
+        assert!(b2.is_empty(), "a flat pad neither blocks nor hides");
+    }
+
+    /// Concealment must not SUM. The jungle generator plants ferns in clumps
+    /// of six; summing would make a scatter density into an invisibility
+    /// field by accident.
+    #[test]
+    fn overlapping_cover_takes_the_best_not_the_total() {
+        let mut b = Blockers::new(100.0, 4.0);
+        for i in 0..6 {
+            b.push_prop(PropKind::Fern, i as f32 * 0.1, 0.0, 0.0, 1.0);
+        }
+        let one = PropKind::Fern.footprint().conceal;
+        assert!((b.concealment_at(0.0, 0.0) - one).abs() < 1e-3,
+            "six ferns hide as well as one, got {}", b.concealment_at(0.0, 0.0));
+        assert!(b.concealment_at(0.0, 0.0) < 1.0, "and never fully");
+    }
+
+    /// No prop below 1.0 may make a cat invisible -- a binary would turn
+    /// every bush into a cloak, which is the tuning mistake this guards.
+    #[test]
+    fn no_passable_cover_is_total() {
+        for k in [PropKind::Bush, PropKind::Fern, PropKind::VineCurtain] {
+            let f = k.footprint();
+            assert!(f.passable, "{k:?} must stay walk-through");
+            assert!(f.conceals(), "{k:?} must hide something");
+            assert!(f.conceal < 1.0, "{k:?} must not be a cloak");
+            assert!(f.conceal_radius > 0.0);
+        }
+    }
+
+    /// A watcher's line of sight is broken by what lies ALONG it, not by what
+    /// is near either end.
+    #[test]
+    fn sight_is_obstructed_by_cover_on_the_line() {
+        let mut b = Blockers::new(100.0, 4.0);
+        b.push_prop(PropKind::Bush, 5.0, 0.0, 0.0, 1.0);
+        // Looking straight through the bush.
+        assert!(b.sight_obstruction((0.0, 0.0), (10.0, 0.0)) > 0.5);
+        // Looking parallel to it, well off to the side: clear.
+        assert_eq!(b.sight_obstruction((0.0, 8.0), (10.0, 8.0)), 0.0);
+    }
+
+    /// Obstruction saturates: once the view is broken, more foliage behind it
+    /// changes nothing.
+    #[test]
+    fn obstruction_saturates_at_one() {
+        let mut b = Blockers::new(100.0, 4.0);
+        for i in 0..5 {
+            b.push_prop(PropKind::BoulderCluster, 2.0 + i as f32 * 2.0, 0.0, 0.0, 1.0);
+        }
+        assert_eq!(b.sight_obstruction((0.0, 0.0), (14.0, 0.0)), 1.0);
+    }
+
+    /// Scale widens what a prop hides, the same way it widens what it blocks.
+    #[test]
+    fn scale_widens_concealment_too() {
+        let mut b = Blockers::new(100.0, 4.0);
+        b.push_prop(PropKind::Bush, 0.0, 0.0, 0.0, 2.0);
+        let r = PropKind::Bush.footprint().conceal_radius;
+        assert!(b.concealment_at(r * 1.5, 0.0) > 0.0, "a 2x bush hides further out");
+    }
+
+    /// An empty set hides nothing and obstructs nothing, without panicking on
+    /// a degenerate ray.
+    #[test]
+    fn an_empty_set_conceals_nothing() {
+        let b = Blockers::new(100.0, 4.0);
+        assert_eq!(b.concealment_at(1.0, 2.0), 0.0);
+        assert_eq!(b.sight_obstruction((0.0, 0.0), (0.0, 0.0)), 0.0, "zero-length ray");
+        assert_eq!(b.sight_obstruction((0.0, 0.0), (50.0, 50.0)), 0.0);
     }
 }

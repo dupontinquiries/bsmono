@@ -1,0 +1,35 @@
+[package]
+name = "wildkit"
+version = "0.1.0"
+edition = "2021"
+description = """
+What an animal senses, and what the ground and weather do to it. Extracted
+VERBATIM from unendlich-engine's sim/ — scent laid and decaying, sight and
+hearing as separate channels, wind and fog and light that degrade them,
+predator/prey decision, path cost and remembered routes, river flow and
+terrain variation.
+
+Not written for this. unendlich already had all of it, tested and headless,
+and clawbound-battleground needs exactly the same primitives to make a cat
+move like a cat: a border patrol that can be scented before it is seen, a
+stalk that fails when the wind turns, prey that bolts when you disturb the
+ground. Copying would have forked 3,400 lines that are actively developed.
+
+The 21 modules here are the transitive closure of that set with NO further
+`use crate::` edges, so the extraction is a move rather than a rewrite and
+`src/sim/mod.rs` reproduces the path shape the files already use.
+
+Deliberately EXCLUDED, because they reach back into the engine: `stamina`
+(service_registry), `biome_climate` (world::biomes), `perception_field`
+(gpu_bench). Each is worth having and each needs a seam cut first.
+
+std-only, deterministic. 137 tests came with it.
+"""
+
+[lib]
+path = "src/lib.rs"
+
+# None. Same rule as creature-rig: coordinates cross the boundary as plain
+# arrays, and the first dependency here would be the one that makes this
+# hard to reuse again.
+[dependencies]

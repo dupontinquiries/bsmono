@@ -828,7 +828,8 @@ mod shop_tests {
         let rim = ARENA_RADIUS - 2.5;
         let mut b = Blockers::new(ARENA_RADIUS + 20.0, 6.0);
         // A big blocker right where the god stands, pushing it outward.
-        b.push(Blocker { shape: Shape::Circle { x: rim, z: 0.0, r: 4.0 }, top: 5.0 });
+        b.push(Blocker { shape: Shape::Circle { x: rim, z: 0.0, r: 4.0 }, top: 5.0,
+                         cover: crate::blockers::Cover::NONE });
         g.blockers = std::sync::Arc::new(b);
         g.gods[0].pos = glam::Vec3::new(rim, 0.0, 0.0);
         for _ in 0..60 {
