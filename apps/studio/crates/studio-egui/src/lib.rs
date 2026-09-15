@@ -13,6 +13,7 @@
 //! a surprising undo history.
 
 pub mod beatgrid;
+pub mod group_graph;
 pub mod touch;
 pub mod keys;
 pub mod playkeys;

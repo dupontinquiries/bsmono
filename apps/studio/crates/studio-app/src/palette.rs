@@ -133,6 +133,11 @@ pub enum ShellVerb {
     /// status line, never imports the wrong one silently (names are
     /// re-checked).
     ImportPack(u8),
+    /// Open the grouping graph -- every composition, tangled or solo, as
+    /// nodes and edges (see `studio_core::Project::group_tangles`). The
+    /// "cause and effect" visual, before deciding anything about limiting
+    /// or tiering group membership.
+    ShowGroupGraph,
 }
 
 /// One offer in the current step.
@@ -308,6 +313,7 @@ pub fn root() -> Vec<Choice> {
         c("quantize selected clips", Some("Q"), Then::Do(Act::Key('Q'))),
         c("group into a composition", Some("g"), Then::Do(Act::Key('g'))),
         c("ungroup", Some("G"), Then::Do(Act::Key('G'))),
+        c("show grouping graph (debug)", None, Then::Do(Act::Shell(ShellVerb::ShowGroupGraph))),
         c("split at playhead", Some("s"), Then::Do(Act::Key('s'))),
         c("delete selection", Some("d"), Then::Do(Act::Key('d'))),
         c("yank selection", Some("y"), Then::Do(Act::Key('y'))),
