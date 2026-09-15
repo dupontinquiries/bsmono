@@ -37,6 +37,7 @@
 //! changes gain) commute and both survive, because they are separate ops.
 
 pub mod wire;
+pub mod follow_graph;
 pub mod carrier;
 pub mod file;
 pub mod assets;
@@ -92,6 +93,40 @@ pub struct Presence {
     /// project. `serde(default)` so an older presence deserializes quiet.
     #[serde(default)]
     pub recording: bool,
+    /// Who THIS peer is following, if anyone -- broadcast (unlike the
+    /// local-only `follow` field in studio-app) specifically so
+    /// `follow_graph::resolve_effective_source` can walk a CHAIN of
+    /// follows: if I follow someone who is themselves following a third
+    /// person, resolving that chain needs every hop's target visible, not
+    /// just my own. `#[serde(default)]` for the usual reason.
+    #[serde(default)]
+    pub following: Option<SiteId>,
+    /// This peer's own view mode (badges / thumbnails / data-inspector /
+    /// plain) -- what `follow_graph::resolve_all` ultimately propagates to
+    /// whoever's follow chain roots at this peer. Broadcast unconditionally
+    /// like every other `Presence` field, not selectively disclosed: once
+    /// chains exist, a peer several hops away needs to see the ROOT's
+    /// mode, which means the root's mode has to be visible network-wide,
+    /// not just to whoever follows it directly.
+    #[serde(default)]
+    pub view_mode: ViewMode,
+}
+
+/// A clip's timeline overlay mode -- purely a rendering choice over the
+/// SAME underlying data (`Group.active`, `fingerprint::all_pairs_matches`)
+/// regardless of which mode is picked. `Plain` (the default) shows none of
+/// it, so a peer who never touches this feature sees no change at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ViewMode {
+    #[default]
+    Plain,
+    /// Small badges on clips that have a fingerprint match or take-bucket
+    /// membership -- the "little notifiers" from the design conversation.
+    Badges,
+    /// Sample-frame thumbnails over clips -- for visual scrubbers.
+    Thumbnails,
+    /// Raw hash/match/provenance data -- for data-oriented workflows.
+    DataInspector,
 }
 
 /// The rack (patterns, channels, tempo), synced as a **last-writer-wins
@@ -445,18 +480,18 @@ mod tests {
         let before = d.history().len();
         d.presence(Presence { site: SiteId(2), name: "kes".into(),
             playhead: Ticks::from_seconds(2.0), selection: vec![ClipId(10)],
-            active_track: Some(TrackId(1)), seq: 5 , recording: false,});
+            active_track: Some(TrackId(1)), seq: 5 , recording: false, following: None, view_mode: ViewMode::Plain,});
         assert_eq!(d.history().len(), before, "presence must never enter the op log");
         assert_eq!(d.peers_on(ClipId(10)).len(), 1, "a peer inside the clip is reported");
         // a stale packet cannot rewind them
         d.presence(Presence { site: SiteId(2), name: "kes".into(),
             playhead: Ticks::from_seconds(99.0), selection: vec![],
-            active_track: None, seq: 4 , recording: false,});
+            active_track: None, seq: 4 , recording: false, following: None, view_mode: ViewMode::Plain,});
         assert_eq!(d.peers[&SiteId(2)].playhead, Ticks::from_seconds(2.0), "stale presence ignored");
         // and a peer outside the clip is not reported as being on it
         d.presence(Presence { site: SiteId(2), name: "kes".into(),
             playhead: Ticks::from_seconds(99.0), selection: vec![],
-            active_track: None, seq: 6 , recording: false,});
+            active_track: None, seq: 6 , recording: false, following: None, view_mode: ViewMode::Plain,});
         assert!(d.peers_on(ClipId(10)).is_empty());
     }
 

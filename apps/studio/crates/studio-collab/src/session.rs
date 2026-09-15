@@ -275,6 +275,7 @@ impl Session {
 mod tests {
     use super::*;
     use studio_core::{Clip, ClipId, Op, Project, Source, SourceId, Ticks, Track, TrackId, TrackKind};
+    use crate::ViewMode;
 
     fn team() -> Team {
         Team::from_contacts("the cut", &[
@@ -338,7 +339,7 @@ mod tests {
         s.doc.local(edit).unwrap();
         s.presence(Presence { site: SiteId(2), name: "ada".into(),
             playhead: Ticks::from_seconds(3.5), selection: vec![ClipId(7)],
-            active_track: Some(TrackId(1)), seq: 1 , recording: false,}, 1100);
+            active_track: Some(TrackId(1)), seq: 1 , recording: false, following: None, view_mode: ViewMode::Plain,}, 1100);
         assert_eq!(s.doc.peers.len(), 1);
 
         let before = s.doc.project.clone();
@@ -377,7 +378,7 @@ mod tests {
         for t in [10_000i64, 20_000, 30_000, 40_000, 50_000, 60_000] {
             s.presence(Presence { site: SiteId(2), name: "ada".into(),
                 playhead: Ticks::from_seconds(t as f64 / 1000.0), selection: vec![],
-                active_track: None, seq: t as u64 , recording: false,}, t);
+                active_track: None, seq: t as u64 , recording: false, following: None, view_mode: ViewMode::Plain,}, t);
             assert!(s.sweep(t).is_empty(), "she is plainly still here at {t}ms");
         }
         assert!(s.is_present(SiteId(2)));
@@ -501,7 +502,7 @@ mod tests {
         s.presence(crate::Presence {
             site: SiteId(9), name: "drifter".into(),
             playhead: crate::Ticks::ZERO, selection: vec![],
-            active_track: None, seq: 1, recording: false,
+            active_track: None, seq: 1, recording: false, following: None, view_mode: ViewMode::Plain,
         }, 1_000);
         assert!(s.doc.peers.contains_key(&SiteId(9)), "presence merged");
         // Heard recently: survives a sweep.
@@ -515,7 +516,7 @@ mod tests {
         s.presence(crate::Presence {
             site: SiteId(9), name: "drifter".into(),
             playhead: crate::Ticks::ZERO, selection: vec![],
-            active_track: None, seq: 2, recording: false,
+            active_track: None, seq: 2, recording: false, following: None, view_mode: ViewMode::Plain,
         }, 200_000);
         assert!(s.doc.peers.contains_key(&SiteId(9)));
     }
