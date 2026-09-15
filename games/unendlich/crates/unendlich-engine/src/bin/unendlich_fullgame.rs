@@ -16988,6 +16988,29 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 renderer.indirect_total_index_count(),
                 renderer.indirect_total_index_count() / 3,
             );
+            // r-live-mesh-diag: report the worst (by index count) Near-tier
+            // chunk actually meshed since the last read -- direct evidence
+            // for whatever chunk is really driving a session's cost, rather
+            // than only having a diagnosis of a regression test's proxy
+            // chunk. See meshing_pool::take_worst_chunk_diag_for_live_log's
+            // doc for what it does and doesn't cover (CPU greedy mesher only,
+            // not UNENDLICH_MESHER=binary or the Mid/Far/VeryFar paths).
+            if let Some((coord, index_count, diag)) =
+                unendlich_engine::render::meshing_pool::take_worst_chunk_diag_for_live_log()
+            {
+                let accounted = (diag.subdivided_top_quads + diag.jittered_top_quads + diag.soft_side_faces) * 2;
+                log::info!(
+                    "  worst_mesh_since_last_log: chunk {coord:?} indices={index_count} (~{} tris) -- \
+                     subdivided_top: {}blk/{}tri | jittered_top: {}blk/{}tri | soft_side: {}tri | \
+                     plant_stamps={} | unaccounted(normal_merge+decoration_minus_plants)={}tri",
+                    index_count / 3,
+                    diag.subdivided_top_blocks, diag.subdivided_top_quads * 2,
+                    diag.jittered_top_blocks, diag.jittered_top_quads * 2,
+                    diag.soft_side_faces * 2,
+                    diag.plant_stamps,
+                    (index_count / 3) as i64 - accounted as i64,
+                );
+            }
             // v0.24.18: push these same values into the thread probe's
             // engine_state pseudo-thread so the sampler's per-100ms
             // rows carry the fps/queue context. Lets the analysis tool

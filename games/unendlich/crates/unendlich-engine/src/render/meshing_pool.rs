@@ -40,6 +40,56 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+// r-live-mesh-diag: cross-thread "worst chunk seen" tracker for
+// mesher::MeshDiagCounts, so a real live session's crash log can show which
+// emission path actually dominated the chunk that tipped it over -- rather
+// than only having a diagnosis of whatever chunk a regression test's random
+// grid search happened to land on. mesh_diag_reset/snapshot (mesher.rs) are
+// deliberately thread-local (each mesh worker fully processes one chunk at a
+// time on its own thread, so no locking is needed there); this Mutex is the
+// one piece of genuinely cross-thread state, and it only updates on a new
+// max (rare), so the lock is never contended on the hot per-chunk path.
+struct WorstChunkDiag {
+    coord: crate::world::chunk::ChunkCoord,
+    index_count: usize,
+    diag: crate::render::mesher::MeshDiagCounts,
+}
+
+fn worst_chunk_diag() -> &'static std::sync::Mutex<Option<WorstChunkDiag>> {
+    static V: std::sync::OnceLock<std::sync::Mutex<Option<WorstChunkDiag>>> = std::sync::OnceLock::new();
+    V.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn maybe_record_worst_chunk_diag(
+    coord: crate::world::chunk::ChunkCoord,
+    index_count: usize,
+    diag: crate::render::mesher::MeshDiagCounts,
+) {
+    let mut guard = worst_chunk_diag().lock().unwrap_or_else(|p| p.into_inner());
+    let is_new_worst = match &*guard {
+        Some(prev) => index_count > prev.index_count,
+        None => true,
+    };
+    if is_new_worst {
+        *guard = Some(WorstChunkDiag { coord, index_count, diag });
+    }
+}
+
+/// Read and clear the worst (by index count) Near-tier chunk mesh seen on
+/// any worker thread since the last call. Intended for the bin's periodic
+/// FPS-summary log line -- `None` if no Near-tier chunk has meshed since
+/// the last read (or ever). Only covers the CPU greedy mesher path (not
+/// `UNENDLICH_MESHER=binary`, off by default, or the Mid/Far/VeryFar
+/// downsampled/virtual paths, which don't call into mesher.rs's
+/// instrumented emission functions at all).
+pub fn take_worst_chunk_diag_for_live_log() -> Option<(crate::world::chunk::ChunkCoord, usize, crate::render::mesher::MeshDiagCounts)> {
+    worst_chunk_diag()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+        .map(|w| (w.coord, w.index_count, w.diag))
+}
+
 /// Process-wide count of chunks that overflowed the GPU mesher
 /// (`ERROR_OUT_OF_DEVICE_MEMORY`) and fell back to the CPU greedy mesher this
 /// run. A non-zero value at shutdown means device-memory pressure forced
@@ -842,7 +892,16 @@ fn worker_loop(
             // The three arms only differ in which optionals are passed;
             // `current_tick` is meaningful only with a world model.
             let tick = if req.world_model.is_some() { req.current_tick } else { None };
-            if near_mesher_is_binary() {
+            let is_binary = near_mesher_is_binary();
+            if !is_binary {
+                // r-live-mesh-diag: only reset/record for the instrumented
+                // (non-binary) path -- mesher_binary.rs doesn't call into
+                // mesher.rs's emission functions at all, so its counters
+                // would just read zero, which would be misleading to show
+                // rather than simply not shown.
+                crate::render::mesher::mesh_diag_reset();
+            }
+            let m = if is_binary {
                 // 2026-09-02: UNENDLICH_MESHER=binary — visibility and
                 // merging on world::bitchunk, same emitters. See
                 // render::mesher_binary. Off by default until seen on hardware.
@@ -851,7 +910,12 @@ fn worker_loop(
             } else {
                 crate::render::mesher::mesh_chunk_greedy_with_neighbors(
                     &req.chunk, &req.neighbors, Some(&req.sky), req.world_model.as_ref(), tick)
+            };
+            if !is_binary {
+                let diag = crate::render::mesher::mesh_diag_snapshot();
+                maybe_record_worst_chunk_diag(req.coord, m.indices.len(), diag);
             }
+            m
         } else if is_virtual_eligible {
             let factor = lod_settings.factor_for(req.lod);
             let gen = req.generator.as_ref()
