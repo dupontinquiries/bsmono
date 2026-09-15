@@ -53,6 +53,10 @@ pub mod anim;
 pub mod prompt;
 /// Post-build critique: floating blocks, entombment, sealed rooms.
 pub mod critique;
+/// Per-object material schemes: which block fills which ROLE, so a build
+/// cannot pick one block and reuse it for every part. See the module header
+/// for the tree that prompted it.
+pub mod scheme;
 /// Chat box: keys, history, autocomplete cards.
 pub mod chatbox;
 /// Voice: grammar and intent mapping for the voiced daemon.
