@@ -284,4 +284,150 @@ mod tests {
         // The unreadable-files emergency is also present and sorted first.
         assert_eq!(recs[0].priority, Priority::Emergency);
     }
+
+    #[test]
+    fn all_four_priority_levels_sort_correctly_together() {
+        // Both existing tests only ever confirmed "the Emergency one is
+        // first" -- never that Now, Soon, and Info also land in the
+        // right relative order with each other. Built one Inputs that
+        // produces all four levels at once (critical SMART = Emergency,
+        // a changed file = Now, reclaimable cleanup space = Soon) plus
+        // confirms nothing has snuck in front of Emergency or behind
+        // Soon. A reversed sort direction, or Priority's derived Ord
+        // reordered by a careless enum edit, would only be caught by
+        // checking the FULL order, not just one end of it.
+        let smart = vec![smart_with("/dev/sda", vec![Finding {
+            severity: Severity::Critical, key: "smart.overall".into(), message: "FAILED".into(),
+        }])];
+        let mut verify = VerifyReport::default();
+        verify.changed.push(("a.txt".into(), crate::integrity::FileStatus::Changed {
+            expected: "aaa".into(), actual: "bbb".into() }));
+        let cleanup = vec![Suggestion {
+            kind: SuggestionKind::RebuildableDir, path: "/x/target".into(),
+            paths: vec!["/x/target".into()], reclaim_bytes: 1000,
+            note: "n".into(), command: Some("rm -rf /x/target".into()),
+        }];
+        let recs = advise(&Inputs { smart: &smart, verify: Some(&verify), cleanup: &cleanup, ..Default::default() });
+        let prios: Vec<Priority> = recs.iter().map(|r| r.priority).collect();
+        let mut sorted = prios.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        assert_eq!(prios, sorted, "recommendations must already be in descending-priority order: {prios:?}");
+        assert_eq!(prios[0], Priority::Emergency);
+        assert!(prios.contains(&Priority::Now), "the changed-file recommendation must be present: {prios:?}");
+        assert!(prios.contains(&Priority::Soon), "the cleanup rollup must be present: {prios:?}");
+    }
+
+    #[test]
+    fn crc_errors_on_a_non_usb_device_do_not_trigger_the_bridge_warning() {
+        // The disambiguation exists specifically to blame the cable/
+        // enclosure INSTEAD of the media on a USB bridge -- on a native
+        // SATA/NVMe device there is no bridge to blame, and CRC-like
+        // findings there mean something else entirely. Neither existing
+        // test ever checked the `on_usb` guard in isolation; both of
+        // them always used a UsbBridge device.
+        let smart = vec![smart_with("/dev/sda", vec![Finding {
+            severity: Severity::Advisory, key: "ata.attr.199".into(), message: "UDMA CRC errors: 9".into(),
+        }])];
+        let devices = vec![BlockDevice {
+            name: "sda".into(), path: "/dev/sda".into(), size_bytes: 1, model: None, serial: None,
+            vendor: None, transport: Some("sata".into()), rotational: false, removable: false,
+            attach: Attach::NativeSata, mountpoints: vec![],
+        }];
+        let recs = advise(&Inputs { devices: &devices, smart: &smart, ..Default::default() });
+        assert!(!recs.iter().any(|r| r.title.contains("USB bridge")),
+            "a native SATA device must never get the USB-bridge disambiguation: {:?}", recs.iter().map(|r| &r.title).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn usb_crc_without_verify_errors_is_only_soon_priority_not_now() {
+        // The existing bridge test only ever exercised the "WITH verify
+        // read errors" branch (Now priority, extra sentence about a
+        // failing bridge). The other half of that if/else -- CRC errors
+        // present but nothing wrong turned up in verification -- must
+        // stay at the lower Soon priority with the plain message, not
+        // escalate speculatively.
+        let devices = vec![BlockDevice {
+            name: "sda".into(), path: "/dev/sda".into(), size_bytes: 1, model: None, serial: None,
+            vendor: None, transport: Some("usb".into()), rotational: false, removable: true,
+            attach: Attach::UsbBridge, mountpoints: vec![],
+        }];
+        let smart = vec![smart_with("/dev/sda", vec![Finding {
+            severity: Severity::Advisory, key: "ata.attr.199".into(), message: "UDMA CRC errors: 9".into(),
+        }])];
+        let recs = advise(&Inputs { devices: &devices, smart: &smart, ..Default::default() });
+        let bridge = recs.iter().find(|r| r.title.contains("USB bridge")).unwrap();
+        assert_eq!(bridge.priority, Priority::Soon);
+        assert!(!bridge.detail.contains("failing bridge/cable"), "{}", bridge.detail);
+    }
+
+    #[test]
+    fn cleanup_reclaim_rolls_up_into_one_recommendation_not_one_per_suggestion() {
+        let cleanup = vec![
+            Suggestion { kind: SuggestionKind::RebuildableDir, path: "/a".into(), paths: vec!["/a".into()],
+                reclaim_bytes: 1_000_000, note: "n".into(), command: Some("rm -rf /a".into()) },
+            Suggestion { kind: SuggestionKind::DuplicateGroup, path: "/b1".into(), paths: vec!["/b1".into(), "/b2".into()],
+                reclaim_bytes: 2_000_000, note: "n".into(), command: None },
+            // A BigFile suggestion must NOT count toward reclaimable
+            // bytes here -- it isn't reclaimable without a human
+            // decision to actually delete it, unlike a cache dir or a
+            // confirmed exact duplicate.
+            Suggestion { kind: SuggestionKind::BigFile, path: "/huge".into(), paths: vec!["/huge".into()],
+                reclaim_bytes: 9_999_999, note: "n".into(), command: None },
+        ];
+        let recs = advise(&Inputs { cleanup: &cleanup, ..Default::default() });
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert_eq!(recs[0].priority, Priority::Soon);
+        assert!(recs[0].title.contains("2.9 MiB"),
+            "must reflect only the RebuildableDir + DuplicateGroup bytes (3,000,000 = 2.9 MiB per human_bytes' binary units), not the BigFile's: {}", recs[0].title);
+    }
+
+    #[test]
+    fn video_candidates_produce_one_handoff_recommendation_with_the_batch_command() {
+        let scan = VideoScan {
+            candidates: vec![crate::video::VideoCandidate {
+                path: "/x.avi".into(), size: 1_000_000, codec: Some("mpeg4".into()),
+                bit_rate: None, why: "legacy codec mpeg4".into(), est_savings_ratio: 0.6,
+            }],
+            skipped_modern: 0, total_candidate_bytes: 1_000_000,
+        };
+        let recs = advise(&Inputs { videos: Some(&scan), video_batch_path: Some("/tmp/batch.txt"), ..Default::default() });
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].priority, Priority::Soon);
+        assert!(recs[0].command.as_ref().unwrap().contains("/tmp/batch.txt"), "{:?}", recs[0].command);
+    }
+
+    #[test]
+    fn an_empty_video_scan_produces_no_recommendation_at_all() {
+        // The `if !v.candidates.is_empty()` guard -- untested that a
+        // scan finding NOTHING correctly produces zero noise rather
+        // than an empty or misleading recommendation.
+        let scan = VideoScan::default();
+        let recs = advise(&Inputs { videos: Some(&scan), ..Default::default() });
+        assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn migration_percentage_is_computed_and_zero_tracked_bytes_does_not_divide_by_zero() {
+        let plan_normal = MigrationPlan {
+            repo: "/repo".into(),
+            candidates: vec![crate::deltahostile::Candidate {
+                path: "big.bin".into(), size: 250, reason: crate::deltahostile::Reason::HighEntropy(7.9),
+            }],
+            total_bytes: 250,
+            tracked_bytes: 1000,
+        };
+        let recs = advise(&Inputs { migration: Some(&plan_normal), ..Default::default() });
+        assert!(recs[0].title.contains("25%"), "{}", recs[0].title);
+
+        // tracked_bytes: 0 is a real shape (a repo scan that could not
+        // read any file sizes at all) -- the `if m.tracked_bytes > 0`
+        // guard exists specifically to avoid a float division by zero
+        // here, and had no test forcing that exact input.
+        let plan_zero = MigrationPlan {
+            repo: "/repo".into(), candidates: plan_normal.candidates.clone(),
+            total_bytes: 250, tracked_bytes: 0,
+        };
+        let recs2 = advise(&Inputs { migration: Some(&plan_zero), ..Default::default() });
+        assert!(recs2[0].title.contains("0%"), "{}", recs2[0].title); // must not panic or produce NaN/inf
+    }
 }
