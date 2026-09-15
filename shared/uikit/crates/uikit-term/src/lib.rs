@@ -1662,6 +1662,19 @@ impl App {
                         self.terminal.grid.scroll_to_bottom();
                         if mine(keys::EventClass::Text) {
                             self.terminal.input.push_str(t);
+                            // LOCAL ECHO. Nothing else draws `input` -- the
+                            // renderer paints the grid and the pending line is
+                            // not in it -- so without this you type and the
+                            // screen does not change until Enter. That is what
+                            // `terminal-standalone` looked like: a live prompt
+                            // that ignored the keyboard.
+                            //
+                            // Only under InputOwner::Widget, which is the whole
+                            // point of the distinction: its own doc says "the
+                            // line buffer is the only thing making typing
+                            // visible". Under Host the PTY echoes, and doing it
+                            // here too would double every character.
+                            self.terminal.feed(t);
                         }
                     }
                     egui::Event::Key { key: egui::Key::PageUp, pressed: true, modifiers, .. }
@@ -1693,11 +1706,21 @@ impl App {
                     egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. }
                         if mine(keys::EventClass::LineEdit) =>
                     {
-                        self.terminal.input.pop();
+                        // Echo the rub-out too, and ONLY if something was
+                        // actually removed -- backspacing at an empty prompt
+                        // must not eat the `$ ` in front of it.
+                        if self.terminal.input.pop().is_some() {
+                            self.terminal.feed("\u{8} \u{8}");
+                        }
                     }
                     egui::Event::Key { key: egui::Key::Enter, pressed: true, .. }
                         if mine(keys::EventClass::LineEdit) =>
                     {
+                        // The newline is echoed here rather than left to the
+                        // host: the host is being handed a COMMAND and should
+                        // not have to know whether the line it came from was
+                        // already terminated on screen.
+                        self.terminal.feed("\r\n");
                         submitted = Some(std::mem::take(&mut self.terminal.input));
                     }
                     // Ctrl/Cmd+F: open the find bar. Must come BEFORE the catch-all key arm

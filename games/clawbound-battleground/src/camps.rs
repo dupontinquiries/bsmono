@@ -301,7 +301,11 @@ pub struct CampSpec {
 }
 
 /// Why a camp spec was rejected.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` but NOT `Eq`: `BadRespawn` carries the offending `f32`, and
+/// floats have no total equality. Carrying the value is worth more than the
+/// derive — "respawn was 0" is actionable and "BadRespawn" alone is not.
+#[derive(Debug, Clone, PartialEq)]
 pub enum CampError {
     /// The leader is too small to lead.
     LeaderTooSmall(Beast),

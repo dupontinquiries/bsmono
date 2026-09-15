@@ -23,9 +23,13 @@ impl eframe::App for StandaloneTerminal {
         uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(snapclone_theme::PaletteId::System));
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(cmd) = self.app.handle_input(ui) {
-                // no real PTY here — echo the command back so typing is visibly alive
-                self.app.terminal.feed(&format!("{cmd}\r\n$ "));
+            if let Some(_cmd) = self.app.handle_input(ui) {
+                // No real PTY here, so the only response is a fresh prompt.
+                // The command itself is NOT re-fed: under InputOwner::Widget
+                // the kit now echoes each keystroke as it is typed (that is
+                // what makes a shell-less terminal feel alive at all), so
+                // feeding it again here printed every command twice.
+                self.app.terminal.feed("$ ");
             }
             let term_rect = ui.available_rect_before_wrap();
             self.app.fit_to(term_rect.size());
