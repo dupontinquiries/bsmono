@@ -2744,6 +2744,17 @@ pub struct App {
     /// in the Dialog) so a dialog can be opened and closed without
     /// forgetting which genres this device works in.
     lexicon: voice::Lexicon,
+    /// The actual microphone — everything in `voice.rs`/`voice_utterance`
+    /// is capture-agnostic by design ("the seam a speech backend calls,"
+    /// per that function's own doc), and until now nothing called it with
+    /// real audio: the Dialog state machine, the palette-act dispatch, and
+    /// `feedback_popup`'s drawing were all complete and tested headless,
+    /// but Ctrl+Space only ever opened an empty `Dialog` sitting at
+    /// `State::Listening` forever. This is that missing seam, built on
+    /// `voice-engine-kit` the same way voiceterm-egui's popup is —
+    /// spawned on a background thread on open, polled here, fed into
+    /// `voice_utterance` once text is ready.
+    voice_capture: std::sync::Arc<std::sync::Mutex<voice::VoiceCapturePending>>,
     /// The find panel: how to search, what was typed, and what came back.
     find_ui: Option<FindUi>,
     /// Whose viewport this device is following, by collaborator name.
@@ -2923,6 +2934,7 @@ impl Default for App {
               clipboard_pending: None,
               lan: studio_collab::lan::Discovery::open(),
               voice: None,
+              voice_capture: Default::default(),
               lexicon,
               find_ui: None,
               mic: capture::open_capture(),
@@ -3531,10 +3543,40 @@ impl eframe::App for App {
         // headless, so wiring a backend is one call and no new verbs.
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Space)) {
             self.voice = match self.voice {
-                Some(_) => None,
-                None => Some(voice::Dialog { lexicon: self.lexicon.clone(),
-                                             ..Default::default() }),
+                Some(_) => {
+                    voice_engine_kit::cancel_recording();
+                    None
+                }
+                None => {
+                    voice::spawn_listen(self.voice_capture.clone());
+                    Some(voice::Dialog { lexicon: self.lexicon.clone(),
+                                         ..Default::default() })
+                }
             };
+        }
+        if let Some(text) = voice::poll_capture(&self.voice_capture) {
+            if text.is_empty() {
+                // Cancelled (voice_engine_kit's own convention -- see
+                // poll_capture's doc for why this is classified HERE,
+                // not inside hear()). Reset to the resting frame rather
+                // than feed hear() an empty string, which would show a
+                // spurious "nothing but filler" for a deliberate cancel.
+                if let Some(d) = &mut self.voice {
+                    d.state = voice::State::Listening;
+                }
+            } else if text.starts_with('[') {
+                // voice_engine_kit's embedded-error convention (no model,
+                // no input device, etc.) -- a real system problem, not a
+                // misheard command. Shown through Failed's own `why`
+                // field rather than invented as a new State variant, but
+                // with an empty `heard` so the popup does not print the
+                // bracketed string twice.
+                if let Some(d) = &mut self.voice {
+                    d.state = voice::State::Failed { heard: String::new(), why: text };
+                }
+            } else {
+                self.voice_utterance(&text);
+            }
         }
         if let Some(d) = &self.voice {
             voice::feedback_popup(ctx, d, &colors);

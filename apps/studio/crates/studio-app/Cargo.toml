@@ -14,6 +14,7 @@ studio-collab = { path = "../studio-collab" }
 studio-audio = { path = "../studio-audio" }
 studio-egui = { path = "../studio-egui" }
 studio-live = { path = "../studio-live" }
+voice-engine-kit = { path = "../../../../shared/voice-engine-kit", features = ["voice"] }
 studio-fx = { path = "../studio-fx" }
 studio-voice = { path = "../studio-voice" }
 studio-media = { path = "../studio-media" }

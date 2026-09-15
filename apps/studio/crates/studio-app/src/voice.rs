@@ -765,3 +765,72 @@ pub fn feedback_popup(ctx: &egui::Context, dialog: &Dialog,
         });
     hot
 }
+
+// ── the missing seam: real capture, feeding `App::voice_utterance` ──────
+//
+// Everything above this line was already complete and tested headless
+// before this addition -- `hear`/`Dialog`/`State`/`feedback_popup` never
+// needed to change. What was missing was anything calling
+// `App::voice_utterance(text)` with a REAL transcription: Ctrl+Space
+// opened a `Dialog` sitting at `State::Listening` with nothing behind it
+// listening. This is that missing half, built on `voice-engine-kit` the
+// same way `voice_popup.rs` (voiceterm-egui/uikit-egui) is -- spawned on
+// its own thread on open, polled once per frame, fed in once ready.
+
+/// One pending capture: `running` distinguishes "nothing started" from
+/// "started, no result yet"; `result` is drained by [`poll_capture`] the
+/// instant it lands.
+#[derive(Default)]
+pub struct VoiceCapturePending {
+    running: bool,
+    result: Option<String>,
+}
+
+/// Start listening on a background thread. Safe to call repeatedly while
+/// already running -- it is a no-op in that case, matching
+/// `voice_popup::spawn_listen`'s own guard for the same reason (Ctrl+Space
+/// re-triggering mid-capture should not spawn a second worker).
+pub fn spawn_listen(pending: std::sync::Arc<std::sync::Mutex<VoiceCapturePending>>) {
+    // Matches voice_popup's own reasoning for calling this explicitly and
+    // early: capture starts the instant this returns, not after whatever
+    // latency exists before the spawned thread's first instruction runs.
+    voice_engine_kit::begin_capture();
+    {
+        let mut p = pending.lock().unwrap_or_else(|e| e.into_inner());
+        if p.running {
+            return;
+        }
+        p.running = true;
+        p.result = None;
+    }
+    std::thread::Builder::new()
+        .name("studio-voice-listen".to_string())
+        .spawn(move || {
+            let (text, _audio) = voice_engine_kit::listen_with_audio();
+            let mut p = pending.lock().unwrap_or_else(|e| e.into_inner());
+            p.result = Some(text);
+            p.running = false;
+        })
+        .ok();
+}
+
+/// Call once per frame. Returns `Some(text)` exactly once, the frame a
+/// result lands -- `None` otherwise, including while still running.
+///
+/// Returns the RAW text, unclassified -- checked against `Dialog::hear`'s
+/// real behavior before assuming it was safe not to: an empty string
+/// (a cancelled recording, per `voice_engine_kit::listen_with_audio`'s
+/// own convention) fed straight into `hear` sets `State::Failed { why:
+/// "nothing but filler" }`, which misrepresents a deliberate cancel as a
+/// misheard command. That classification belongs to the CALLER, which
+/// already has to decide what "cancelled" vs "real error" vs "a genuine
+/// utterance" means for this specific UI moment -- not duplicated here as
+/// a second opinion `poll_capture` would then need to keep in sync with
+/// whatever the caller does.
+pub fn poll_capture(pending: &std::sync::Arc<std::sync::Mutex<VoiceCapturePending>>) -> Option<String> {
+    let mut p = pending.lock().unwrap_or_else(|e| e.into_inner());
+    if p.running {
+        return None;
+    }
+    p.result.take()
+}
