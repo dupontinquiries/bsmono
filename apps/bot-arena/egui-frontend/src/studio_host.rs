@@ -34,15 +34,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
+use bot_arena::chatlog::Preprocessor;
 use crate::studio::{StageState, Studio, StudioAction, STAGE_NAMES};
 
-/// Everything a run needs. Field-for-field the GTK `StudioConfig`.
+/// Everything a run needs. Field-for-field the GTK `StudioConfig`, plus the
+/// egui-only chat-corpus options.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StudioConfig {
     pub corpus: PathBuf,
     pub preprocess: bool,
-    /// Use the bundled Rust corpus_md converter instead of an external tool.
-    pub builtin_pp: bool,
+    /// Which stage-0 converter to run.
+    pub pp: Preprocessor,
     pub tool: Option<PathBuf>,
     /// Template with `{in}` and `{out}`.
     pub tool_args: String,
@@ -57,6 +59,22 @@ pub struct StudioConfig {
     pub gpt_dim: u32,
     pub gpt_layers: u32,
     pub niches: u32,
+
+    // ── Preprocessor::Chat options ───────────────────────────────────────
+    /// Checkout to correlate logged tool paths against. `None` means the
+    /// corpus carries no `repo_path:` lines — which is a legitimate choice for
+    /// logs about a tree you do not have, and the reason this is an Option
+    /// rather than defaulting to the registry's repo path.
+    pub chat_repo: Option<PathBuf>,
+    /// Keep assistant reasoning blocks. On by default: reasoning is ~52k of
+    /// the sample's blocks against 87k of prose, and it is the half that
+    /// explains why an edit was made rather than what it was.
+    pub chat_thinking: bool,
+    /// Keep tool OUTPUT. The calls are always kept when this converter runs;
+    /// this is the expensive half — 147k results, mostly build logs.
+    pub chat_tool_results: bool,
+    /// Max characters per tool result. 0 means uncapped.
+    pub chat_result_cap: u32,
 }
 
 impl Default for StudioConfig {
@@ -67,7 +85,7 @@ impl Default for StudioConfig {
         StudioConfig {
             corpus: PathBuf::new(),
             preprocess: false,
-            builtin_pp: true,
+            pp: Preprocessor::Html,
             tool: None,
             tool_args: "{in} {out}/corpus.md -j 4".into(),
             bin_dir: bot_arena::registry::bin_dir(),
@@ -81,6 +99,15 @@ impl Default for StudioConfig {
             gpt_dim: 128,
             gpt_layers: 2,
             niches: 6,
+            chat_repo: None,
+            chat_thinking: true,
+            chat_tool_results: true,
+            // Matches chatlog::Policy::default(). Duplicated as a plain u32
+            // rather than importing the Policy here: this is the shell's
+            // config, it round-trips through a string settings file, and the
+            // converter is a separate PROCESS that re-applies its own default
+            // when the flag is absent.
+            chat_result_cap: 2000,
         }
     }
 }
@@ -196,6 +223,24 @@ impl StudioConfig {
         if let Some(v) = m.get("preprocess") {
             self.preprocess = v == "true";
         }
+        // Absent or unrecognised leaves the default. A settings file written
+        // by the GTK studio has no `pp` key at all (it only ships the HTML
+        // converter), so this must degrade to Html rather than to nothing.
+        if let Some(p) = m.get("pp").and_then(|v| Preprocessor::from_key(v)) {
+            self.pp = p;
+        }
+        if let Some(p) = path("chat_repo") {
+            self.chat_repo = Some(p);
+        }
+        if let Some(v) = m.get("chat_thinking") {
+            self.chat_thinking = v == "true";
+        }
+        if let Some(v) = m.get("chat_tool_results") {
+            self.chat_tool_results = v == "true";
+        }
+        if let Some(v) = m.get("chat_result_cap").and_then(|v| v.parse::<u32>().ok()) {
+            self.chat_result_cap = v;
+        }
         let num = |k: &str, cur: u32| -> u32 {
             m.get(k)
                 .and_then(|v| v.parse::<f64>().ok())
@@ -238,18 +283,32 @@ impl StudioConfig {
         m.insert("gpt_steps".into(), self.gpt_steps.to_string());
         m.insert("gpt_dim".into(), self.gpt_dim.to_string());
         m.insert("gpt_layers".into(), self.gpt_layers.to_string());
+        m.insert("pp".into(), self.pp.key().to_string());
+        m.insert(
+            "chat_repo".into(),
+            self.chat_repo.as_ref().map(ps).unwrap_or_default(),
+        );
+        m.insert(
+            "chat_thinking".into(),
+            if self.chat_thinking { "true" } else { "false" }.into(),
+        );
+        m.insert(
+            "chat_tool_results".into(),
+            if self.chat_tool_results { "true" } else { "false" }.into(),
+        );
+        m.insert("chat_result_cap".into(), self.chat_result_cap.to_string());
         m
     }
 }
 
 // ── corpus inspection ────────────────────────────────────────────────────────
 
-/// The bundled Rust converter sits next to this binary.
-pub fn builtin_converter() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("corpus_md")))
-        .unwrap_or_else(|| PathBuf::from("corpus_md"))
+/// The bundled Rust converter for `pp`, which sits next to this binary.
+///
+/// `None` for [`Preprocessor::External`] — see [`Preprocessor::builtin_bin`].
+pub fn builtin_converter(pp: Preprocessor) -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    pp.builtin_path_near(exe_dir.as_deref())
 }
 
 /// Effective corpus the pipeline stages read: the preprocessed dir if enabled.
@@ -364,18 +423,41 @@ pub fn stage_command(cfg: &StudioConfig, idx: usize) -> Option<(PathBuf, Vec<Str
                 .replace("{in}", &cfg.corpus.display().to_string())
                 .replace("{out}", &pre);
             let parts: Vec<String> = subst.split_whitespace().map(|s| s.to_string()).collect();
-            if cfg.builtin_pp {
+            match cfg.pp {
                 // Bundled Rust converter (sits next to this binary) — no python/html2text.
-                Some((builtin_converter(), parts, false))
-            } else {
-                let tool = cfg.tool.clone()?;
-                // Python tools (e.g. create-md-from-web.py) run via the interpreter.
-                if tool.extension().and_then(|s| s.to_str()) == Some("py") {
-                    let mut args = vec![tool.display().to_string()];
-                    args.extend(parts);
-                    Some((PathBuf::from("python3"), args, false))
-                } else {
-                    Some((tool, parts, false))
+                Preprocessor::Html => Some((builtin_converter(Preprocessor::Html)?, parts, false)),
+                Preprocessor::Chat => {
+                    // corpus_chat takes corpus_md's argv shape (in, out, -j)
+                    // so the {in}/{out} template still applies, then appends
+                    // its own flags. Built here rather than asking the user to
+                    // type them into tool_args: these are checkbox state, and
+                    // a flag the GUI owns should not be hand-editable text
+                    // that can silently disagree with the checkbox.
+                    let mut args = parts;
+                    if let Some(repo) = cfg.chat_repo.as_ref() {
+                        args.push("--repo".into());
+                        args.push(repo.display().to_string());
+                    }
+                    if !cfg.chat_thinking {
+                        args.push("--no-thinking".into());
+                    }
+                    if !cfg.chat_tool_results {
+                        args.push("--no-tool-results".into());
+                    }
+                    args.push("--result-cap".into());
+                    args.push(cfg.chat_result_cap.to_string());
+                    Some((builtin_converter(Preprocessor::Chat)?, args, false))
+                }
+                Preprocessor::External => {
+                    let tool = cfg.tool.clone()?;
+                    // Python tools (e.g. create-md-from-web.py) run via the interpreter.
+                    if tool.extension().and_then(|s| s.to_str()) == Some("py") {
+                        let mut args = vec![tool.display().to_string()];
+                        args.extend(parts);
+                        Some((PathBuf::from("python3"), args, false))
+                    } else {
+                        Some((tool, parts, false))
+                    }
                 }
             }
         }
@@ -786,7 +868,7 @@ mod tests {
     fn preprocess_substitutes_in_and_out_and_routes_python_via_interpreter() {
         let mut cfg = base_cfg(Path::new("/out"));
         cfg.preprocess = true;
-        cfg.builtin_pp = false;
+        cfg.pp = Preprocessor::External;
         cfg.tool = Some(PathBuf::from("/tools/create-md-from-web.py"));
         cfg.tool_args = "{in} {out}/corpus.md -j 4".into();
         let (p, a, _) = stage_command(&cfg, 0).unwrap();

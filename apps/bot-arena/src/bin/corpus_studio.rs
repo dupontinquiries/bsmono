@@ -26,6 +26,7 @@ use gtk::prelude::*;
 use adw::prelude::*;
 use gtk::{gio, glib};
 
+use bot_arena::chatlog::Preprocessor;
 use bot_arena::registry;
 
 const APP_ID: &str = "org.example.CorpusStudio";
@@ -57,7 +58,7 @@ const STAGE_NAMES: [&str; 7] = [
 struct StudioConfig {
     corpus: PathBuf,
     preprocess: bool,
-    builtin_pp: bool, // use the bundled Rust corpus_md converter instead of an external tool
+    pp: bot_arena::chatlog::Preprocessor,
     tool: Option<PathBuf>,
     tool_args: String, // template with {in} and {out}
     bin_dir: PathBuf,
@@ -71,6 +72,12 @@ struct StudioConfig {
     gpt_dim: u32,
     gpt_layers: u32,
     niches: u32,
+    // Preprocessor::Chat options -- see egui's StudioConfig for the rationale
+    // on each; kept identical so the shared settings file round-trips.
+    chat_repo: Option<PathBuf>,
+    chat_thinking: bool,
+    chat_tool_results: bool,
+    chat_result_cap: u32,
 }
 
 enum Msg {
@@ -207,10 +214,11 @@ fn pick_file(window: &adw::ApplicationWindow, title: &str,
 }
 
 /// The bundled Rust HTML→MD converter, expected next to this binary.
-fn builtin_converter() -> PathBuf {
-    std::env::current_exe().ok()
-        .and_then(|p| p.parent().map(|d| d.join("corpus_md")))
-        .unwrap_or_else(|| PathBuf::from("corpus_md"))
+/// The bundled Rust converter for `pp`, which sits next to this binary.
+/// `None` for `Preprocessor::External` — see `Preprocessor::builtin_bin`.
+fn builtin_converter(pp: Preprocessor) -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    pp.builtin_path_near(exe_dir.as_deref())
 }
 
 /// Effective corpus the pipeline stages read: the preprocessed dir if enabled.
@@ -295,18 +303,40 @@ fn stage_command(cfg: &StudioConfig, idx: usize) -> Option<(PathBuf, Vec<String>
                 .replace("{in}", &cfg.corpus.display().to_string())
                 .replace("{out}", &pre);
             let parts: Vec<String> = subst.split_whitespace().map(|s| s.to_string()).collect();
-            if cfg.builtin_pp {
+            match cfg.pp {
                 // Bundled Rust converter (sits next to this binary) — no python/html2text.
-                Some((builtin_converter(), parts, false))
-            } else {
-                let tool = cfg.tool.clone()?;
-                // Python tools (e.g. create-md-from-web.py) run via the interpreter.
-                if tool.extension().and_then(|s| s.to_str()) == Some("py") {
-                    let mut args = vec![tool.display().to_string()];
-                    args.extend(parts);
-                    Some((PathBuf::from("python3"), args, false))
-                } else {
-                    Some((tool, parts, false))
+                Preprocessor::Html => Some((builtin_converter(Preprocessor::Html)?, parts, false)),
+                Preprocessor::Chat => {
+                    // Same reasoning as egui's stage_command: these are
+                    // checkbox/entry state, built here rather than left for
+                    // the user to type into the (Html/External-only) arg
+                    // template, so the flags can never disagree with the
+                    // widgets that are supposed to control them.
+                    let mut args = parts;
+                    if let Some(repo) = cfg.chat_repo.as_ref() {
+                        args.push("--repo".into());
+                        args.push(repo.display().to_string());
+                    }
+                    if !cfg.chat_thinking {
+                        args.push("--no-thinking".into());
+                    }
+                    if !cfg.chat_tool_results {
+                        args.push("--no-tool-results".into());
+                    }
+                    args.push("--result-cap".into());
+                    args.push(cfg.chat_result_cap.to_string());
+                    Some((builtin_converter(Preprocessor::Chat)?, args, false))
+                }
+                Preprocessor::External => {
+                    let tool = cfg.tool.clone()?;
+                    // Python tools (e.g. create-md-from-web.py) run via the interpreter.
+                    if tool.extension().and_then(|s| s.to_str()) == Some("py") {
+                        let mut args = vec![tool.display().to_string()];
+                        args.extend(parts);
+                        Some((PathBuf::from("python3"), args, false))
+                    } else {
+                        Some((tool, parts, false))
+                    }
                 }
             }
         }
@@ -414,6 +444,7 @@ fn build_ui(app: &adw::Application) {
     let tool_path: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
     let bin_path: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
     let out_path: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
+    let chat_repo_path: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
     let steps: Rc<RefCell<Vec<StepRow>>> = Rc::new(RefCell::new(Vec::new()));
     let next_stage: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -450,12 +481,21 @@ fn build_ui(app: &adw::Application) {
         .build();
     let pp_switch = adw::SwitchRow::builder().title("Run preprocessing first").build();
     pp.add(&pp_switch);
-    let builtin_switch = adw::SwitchRow::builder()
-        .title("Use built-in HTML→MD converter (Rust)")
-        .subtitle("Bundled, multithreaded; no python/html2text needed")
+    // Preprocessor::Chat's builtin_bin/label/key methods are the single
+    // source of truth for these three; the combo's model is built FROM them
+    // rather than a hand-written string list, so a fourth variant added later
+    // shows up here without anyone remembering to update this widget.
+    const PP_VARIANTS: [Preprocessor; 3] =
+        [Preprocessor::Html, Preprocessor::Chat, Preprocessor::External];
+    let pp_model = gtk::StringList::new(
+        &PP_VARIANTS.iter().map(|p| p.label()).collect::<Vec<_>>(),
+    );
+    let pp_combo = adw::ComboRow::builder()
+        .title("Converter")
+        .subtitle("Bundled HTML→MD is multithreaded and needs no python/html2text")
+        .model(&pp_model)
         .build();
-    builtin_switch.set_active(true);
-    pp.add(&builtin_switch);
+    pp.add(&pp_combo);
     let tool_row = adw::ActionRow::builder().title("Tool").subtitle("None selected").build();
     let tool_btn = gtk::Button::builder().label("Choose…").valign(gtk::Align::Center).build();
     tool_row.add_suffix(&tool_btn);
@@ -463,6 +503,63 @@ fn build_ui(app: &adw::Application) {
     let args_row = adw::EntryRow::builder().title("Arg template").build();
     args_row.set_text("{in} {out}/corpus.md -j 4");
     pp.add(&args_row);
+    // Preprocessor::Chat's own rows. corpus_row above doubles as the input
+    // directory (a folder of conversation-export JSON, same "Corpus" field
+    // the other two converters read their input from).
+    let chat_hint = adw::ActionRow::builder()
+        .title("Corpus folder above should hold Claude conversation export JSON")
+        .subtitle("Nested folders are fine — corpus_chat walks them")
+        .build();
+    pp.add(&chat_hint);
+    let chat_repo_row = adw::ActionRow::builder()
+        .title("Correlate against checkout (optional)")
+        .subtitle("None selected")
+        .build();
+    let chat_repo_btn = gtk::Button::builder().label("Choose…").valign(gtk::Align::Center).build();
+    chat_repo_row.add_suffix(&chat_repo_btn);
+    pp.add(&chat_repo_row);
+    let chat_thinking_switch = adw::SwitchRow::builder()
+        .title("Include assistant reasoning (thinking blocks)")
+        .build();
+    chat_thinking_switch.set_active(true);
+    pp.add(&chat_thinking_switch);
+    let chat_results_switch = adw::SwitchRow::builder()
+        .title("Include tool output (build logs, file reads)")
+        .build();
+    chat_results_switch.set_active(true);
+    pp.add(&chat_results_switch);
+    let chat_cap_row = adw::EntryRow::builder().title("Tool result cap (chars, 0 = uncapped)").build();
+    chat_cap_row.set_text("2000");
+    pp.add(&chat_cap_row);
+
+    // Show only the rows the selected converter uses. `External` wants
+    // tool+args; `Chat` wants its own four rows; `Html` wants none of them —
+    // it has nothing left to configure once selected.
+    let update_pp_visibility = {
+        let tool_row = tool_row.clone();
+        let args_row = args_row.clone();
+        let chat_hint = chat_hint.clone();
+        let chat_repo_row = chat_repo_row.clone();
+        let chat_thinking_switch = chat_thinking_switch.clone();
+        let chat_results_switch = chat_results_switch.clone();
+        let chat_cap_row = chat_cap_row.clone();
+        move |selected: u32| {
+            let is_external = selected as usize == 2;
+            let is_chat = selected as usize == 1;
+            tool_row.set_visible(is_external);
+            args_row.set_visible(is_external);
+            chat_hint.set_visible(is_chat);
+            chat_repo_row.set_visible(is_chat);
+            chat_thinking_switch.set_visible(is_chat);
+            chat_results_switch.set_visible(is_chat);
+            chat_cap_row.set_visible(is_chat);
+        }
+    };
+    update_pp_visibility(0);
+    {
+        let update_pp_visibility = update_pp_visibility.clone();
+        pp_combo.connect_selected_notify(move |c| update_pp_visibility(c.selected()));
+    }
     setup.add(&pp);
 
     let paths = adw::PreferencesGroup::builder().title("Pipeline").build();
@@ -511,9 +608,21 @@ fn build_ui(app: &adw::Application) {
         set_path("tool", &tool_row, &tool_path);
         set_path("bin", &bin_row, &bin_path);
         set_path("out", &out_row, &out_path);
+        set_path("chat_repo", &chat_repo_row, &chat_repo_path);
         if let Some(v) = s.get("ext") { ext_row.set_text(v); }
         if let Some(v) = s.get("args") { args_row.set_text(v); }
         if let Some(v) = s.get("preprocess") { pp_switch.set_active(v == "true"); }
+        // Absent (a settings file written before this converter existed, or
+        // by a future one) degrades to Html: index 0, the combo's default.
+        let selected = s.get("pp")
+            .and_then(|v| Preprocessor::from_key(v))
+            .and_then(|p| PP_VARIANTS.iter().position(|v| *v == p))
+            .unwrap_or(0) as u32;
+        pp_combo.set_selected(selected);
+        update_pp_visibility(selected);
+        if let Some(v) = s.get("chat_thinking") { chat_thinking_switch.set_active(v == "true"); }
+        if let Some(v) = s.get("chat_tool_results") { chat_results_switch.set_active(v == "true"); }
+        if let Some(v) = s.get("chat_result_cap") { chat_cap_row.set_text(v); }
         for (key, scale) in [
             ("merges", &merges_s), ("max_n", &maxn_s), ("w2v_dim", &wdim_s),
             ("w2v_epochs", &wep_s), ("niches", &nich_s), ("gpt_steps", &gsteps_s),
@@ -612,6 +721,10 @@ fn build_ui(app: &adw::Application) {
         tool_btn.connect_clicked(move |_| pick_file(&w, "Select preprocessing tool", &r, &t));
     }
     {
+        let w = window.clone(); let r = chat_repo_row.clone(); let t = chat_repo_path.clone();
+        chat_repo_btn.connect_clicked(move |_| pick_folder(&w, "Select checkout to correlate against", &r, &t));
+    }
+    {
         let w = window.clone(); let r = bin_row.clone(); let t = bin_path.clone();
         bin_btn.connect_clicked(move |_| pick_folder(&w, "Select binaries dir", &r, &t));
     }
@@ -661,21 +774,29 @@ fn build_ui(app: &adw::Application) {
         let bin_path = bin_path.clone();
         let out_path = out_path.clone();
         let pp_switch = pp_switch.clone();
-        let builtin_switch = builtin_switch.clone();
+        let pp_combo = pp_combo.clone();
         let args_row = args_row.clone();
         let ext_row = ext_row.clone();
+        let chat_repo_path = chat_repo_path.clone();
+        let chat_thinking_switch = chat_thinking_switch.clone();
+        let chat_results_switch = chat_results_switch.clone();
+        let chat_cap_row = chat_cap_row.clone();
         let merges_s = merges_s.clone(); let maxn_s = maxn_s.clone();
         let wdim_s = wdim_s.clone(); let wep_s = wep_s.clone(); let nich_s = nich_s.clone();
         let gsteps_s = gsteps_s.clone(); let gdim_s = gdim_s.clone(); let glay_s = glay_s.clone();
         move || -> Option<StudioConfig> {
             let corpus = corpus_path.borrow().clone()?;
+            let pp = PP_VARIANTS[pp_combo.selected() as usize];
             // Auto-detect the corpus extension when the field is left blank, so the
             // common "corpus is .txt/.rs but CORPUS_EXT defaults to .md → 0 files"
-            // trap can't silently produce an empty tokenizer.
+            // trap can't silently produce an empty tokenizer. Skipped for Chat:
+            // conversation exports are always .json and detection would just
+            // confirm that, at the cost of walking a potentially large export tree
+            // twice.
             let mut corpus_ext = ext_row.text().to_string();
-            if corpus_ext.trim().is_empty() {
-                let pp = pp_switch.is_active();
-                let scan_dir = if pp { out_path.borrow().clone().map(|o| o.join("preprocessed")).unwrap_or_else(|| corpus.clone()) } else { corpus.clone() };
+            if corpus_ext.trim().is_empty() && pp != Preprocessor::Chat {
+                let do_pp = pp_switch.is_active();
+                let scan_dir = if do_pp { out_path.borrow().clone().map(|o| o.join("preprocessed")).unwrap_or_else(|| corpus.clone()) } else { corpus.clone() };
                 let exts = detect_corpus_exts(&scan_dir);
                 // take the top 1-3 extensions present
                 let picked: Vec<String> = exts.iter().take(3).map(|(e, _)| e.clone()).collect();
@@ -684,7 +805,7 @@ fn build_ui(app: &adw::Application) {
             Some(StudioConfig {
                 corpus,
                 preprocess: pp_switch.is_active(),
-                builtin_pp: builtin_switch.is_active(),
+                pp,
                 tool: tool_path.borrow().clone(),
                 tool_args: args_row.text().to_string(),
                 bin_dir: bin_path.borrow().clone()?,
@@ -698,6 +819,10 @@ fn build_ui(app: &adw::Application) {
                 gpt_dim: gdim_s.value() as u32,
                 gpt_layers: glay_s.value() as u32,
                 niches: nich_s.value() as u32,
+                chat_repo: chat_repo_path.borrow().clone(),
+                chat_thinking: chat_thinking_switch.is_active(),
+                chat_tool_results: chat_results_switch.is_active(),
+                chat_result_cap: chat_cap_row.text().parse().unwrap_or(2000),
             })
         }
     };
@@ -930,6 +1055,11 @@ fn build_ui(app: &adw::Application) {
         let ext_row = ext_row.clone();
         let args_row = args_row.clone();
         let pp_switch = pp_switch.clone();
+        let pp_combo = pp_combo.clone();
+        let chat_repo_path = chat_repo_path.clone();
+        let chat_thinking_switch = chat_thinking_switch.clone();
+        let chat_results_switch = chat_results_switch.clone();
+        let chat_cap_row = chat_cap_row.clone();
         let merges_s = merges_s.clone(); let maxn_s = maxn_s.clone();
         let wdim_s = wdim_s.clone(); let wep_s = wep_s.clone(); let nich_s = nich_s.clone();
         let gsteps_s = gsteps_s.clone(); let gdim_s = gdim_s.clone(); let glay_s = glay_s.clone();
@@ -945,6 +1075,11 @@ fn build_ui(app: &adw::Application) {
             m.insert("ext".into(), ext_row.text().to_string());
             m.insert("args".into(), args_row.text().to_string());
             m.insert("preprocess".into(), if pp_switch.is_active() { "true" } else { "false" }.into());
+            m.insert("pp".into(), PP_VARIANTS[pp_combo.selected() as usize].key().to_string());
+            m.insert("chat_repo".into(), path_str(&chat_repo_path));
+            m.insert("chat_thinking".into(), if chat_thinking_switch.is_active() { "true" } else { "false" }.into());
+            m.insert("chat_tool_results".into(), if chat_results_switch.is_active() { "true" } else { "false" }.into());
+            m.insert("chat_result_cap".into(), chat_cap_row.text().to_string());
             m.insert("merges".into(), merges_s.value().to_string());
             m.insert("max_n".into(), maxn_s.value().to_string());
             m.insert("w2v_dim".into(), wdim_s.value().to_string());
@@ -979,6 +1114,13 @@ fn build_ui(app: &adw::Application) {
         let ext_row = ext_row.clone();
         let args_row = args_row.clone();
         let pp_switch = pp_switch.clone();
+        let pp_combo = pp_combo.clone();
+        let chat_repo_path = chat_repo_path.clone();
+        let chat_repo_row = chat_repo_row.clone();
+        let chat_thinking_switch = chat_thinking_switch.clone();
+        let chat_results_switch = chat_results_switch.clone();
+        let chat_cap_row = chat_cap_row.clone();
+        let update_pp_visibility = update_pp_visibility.clone();
         let merges_s = merges_s.clone(); let maxn_s = maxn_s.clone();
         let wdim_s = wdim_s.clone(); let wep_s = wep_s.clone(); let nich_s = nich_s.clone();
         let gsteps_s = gsteps_s.clone(); let gdim_s = gdim_s.clone(); let glay_s = glay_s.clone();
@@ -993,6 +1135,17 @@ fn build_ui(app: &adw::Application) {
             ext_row.set_text("");
             args_row.set_text("{in} {out}/corpus.md -j 4");
             pp_switch.set_active(false);
+            // The converter and its options reset with everything else.
+            // Missing these left a Reset that cleared the paths but kept the
+            // chat converter selected, with its repo still pointing at the
+            // old checkout -- a half-reset is more confusing than none.
+            pp_combo.set_selected(0);
+            update_pp_visibility(0);
+            *chat_repo_path.borrow_mut() = None;
+            chat_repo_row.set_subtitle("None selected");
+            chat_thinking_switch.set_active(true);
+            chat_results_switch.set_active(true);
+            chat_cap_row.set_text("2000");
             merges_s.set_value(16384.0); maxn_s.set_value(5.0);
             wdim_s.set_value(128.0); wep_s.set_value(5.0); nich_s.set_value(32.0);
             gsteps_s.set_value(2000.0); gdim_s.set_value(128.0); glay_s.set_value(4.0);

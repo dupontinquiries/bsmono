@@ -477,36 +477,81 @@ impl Dashboard {
                 });
                 ui.checkbox(&mut cfg.preprocess, "Run preprocessing first");
                 if cfg.preprocess {
-                    ui.checkbox(&mut cfg.builtin_pp, "Use built-in HTML→MD converter (Rust)");
-                    if !cfg.builtin_pp {
-                        ui.horizontal(|ui| {
-                            ui.colored_label(c.text, "Tool");
-                            let mut t = cfg
-                                .tool
-                                .as_ref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default();
-                            // One field, one id: this is not a list, it is
-                            // a single optional tool path that happens to
-                            // be edited through a temporary String.
-                            if uikit_egui::a11y::semantic_text_edit(
-                                ui, a11y,
-                                egui::Id::new("bot_arena.studio.tool").value(),
-                                "Preprocessing tool", &mut t)
-                            {
-                                let t = t.trim();
-                                cfg.tool = if t.is_empty() {
-                                    None
-                                } else {
-                                    Some(std::path::PathBuf::from(t))
-                                };
-                            }
-                        });
-                    }
                     ui.horizontal(|ui| {
-                        ui.colored_label(c.text, "Arg template ({in}, {out})");
-                        ui.add(egui::TextEdit::singleline(&mut cfg.tool_args).id_salt("lib-cfg_tool_args"));
+                        ui.colored_label(c.text, "Converter");
+                        for pp in [
+                            bot_arena::chatlog::Preprocessor::Html,
+                            bot_arena::chatlog::Preprocessor::Chat,
+                            bot_arena::chatlog::Preprocessor::External,
+                        ] {
+                            ui.radio_value(&mut cfg.pp, pp, pp.label());
+                        }
                     });
+                    match cfg.pp {
+                        bot_arena::chatlog::Preprocessor::External => {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(c.text, "Tool");
+                                let mut t = cfg
+                                    .tool
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_default();
+                                // One field, one id: this is not a list, it is
+                                // a single optional tool path that happens to
+                                // be edited through a temporary String.
+                                if uikit_egui::a11y::semantic_text_edit(
+                                    ui, a11y,
+                                    egui::Id::new("bot_arena.studio.tool").value(),
+                                    "Preprocessing tool", &mut t)
+                                {
+                                    let t = t.trim();
+                                    cfg.tool = if t.is_empty() {
+                                        None
+                                    } else {
+                                        Some(std::path::PathBuf::from(t))
+                                    };
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.colored_label(c.text, "Arg template ({in}, {out})");
+                                ui.add(egui::TextEdit::singleline(&mut cfg.tool_args).id_salt("lib-cfg_tool_args"));
+                            });
+                        }
+                        bot_arena::chatlog::Preprocessor::Chat => {
+                            ui.colored_label(
+                                c.text,
+                                "Corpus folder above should hold Claude conversation export JSON \
+                                 files (nested folders are fine — corpus_chat walks them).",
+                            );
+                            ui.horizontal(|ui| {
+                                ui.colored_label(c.text, "Correlate against checkout (optional)");
+                                let mut t = cfg
+                                    .chat_repo
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_default();
+                                if uikit_egui::a11y::semantic_text_edit(
+                                    ui, a11y,
+                                    egui::Id::new("bot_arena.studio.chat_repo").value(),
+                                    "Checkout to correlate against", &mut t)
+                                {
+                                    let t = t.trim();
+                                    cfg.chat_repo = if t.is_empty() {
+                                        None
+                                    } else {
+                                        Some(std::path::PathBuf::from(t))
+                                    };
+                                }
+                            });
+                            ui.checkbox(&mut cfg.chat_thinking, "Include assistant reasoning (thinking blocks)");
+                            ui.checkbox(&mut cfg.chat_tool_results, "Include tool output (build logs, file reads)");
+                            ui.horizontal(|ui| {
+                                ui.colored_label(c.text, "Tool result cap (chars, 0 = uncapped)");
+                                ui.add(egui::DragValue::new(&mut cfg.chat_result_cap));
+                            });
+                        }
+                        bot_arena::chatlog::Preprocessor::Html => {}
+                    }
                 }
                 ui.collapsing("Pipeline parameters", |ui| {
                     egui::Grid::new("studio_params").num_columns(2).show(ui, |ui| {

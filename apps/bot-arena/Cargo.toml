@@ -26,6 +26,15 @@ required-features = ["gtk-ui"]
 name = "corpus_md"
 path = "src/bin/corpus_md.rs"
 
+# corpus_chat is the chat-log sibling of corpus_md: Claude conversation exports
+# -> one training corpus, optionally correlated against a checkout. Same
+# dependency-free constraint (it parses JSON with the in-crate `json` module
+# rather than serde), and likewise builds with or without GTK. Declared
+# explicitly because Corpus Studio invokes it by path as a stage-0 converter.
+[[bin]]
+name = "corpus_chat"
+path = "src/bin/corpus_chat.rs"
+
 [dependencies]
 # Pinned to the 0.8 generation so it builds on distro rustc 1.75.
 # On rustc >= 1.80 you can bump to gtk4 0.9 / libadwaita 0.7 and drop the pins below.
