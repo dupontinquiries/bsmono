@@ -244,8 +244,18 @@ pub struct Plan {
 /// path is both a bug and an injection.
 pub fn plan(player: &str, url: &str, sink: &Sink) -> Plan {
     let q = shell_quote(url);
+    // See media_name_from_url's own doc for exactly what this is and is
+    // not: a real improvement over the bare binary name a volume mixer
+    // showed before, not a stand-in for real ID3 title/artist metadata
+    // (which nothing in this playback layer resolves yet). Prepended the
+    // same way PULSE_SINK already is below -- an environment variable
+    // libpulse understands identically regardless of which of the three
+    // players ends up running, exactly the reasoning PULSE_SINK's own
+    // comment already gives for choosing that mechanism over a
+    // per-player flag.
+    let prop = format!("PULSE_PROP_media.name={}", shell_quote(&media_name_from_url(url)));
     match sink {
-        Sink::Default => Plan { setup: Vec::new(), play: format!("{player} {q}"),
+        Sink::Default => Plan { setup: Vec::new(), play: format!("{prop} {player} {q}"),
                                 teardown: Vec::new() },
         Sink::One(name) => Plan {
             setup: Vec::new(),
@@ -253,7 +263,7 @@ pub fn plan(player: &str, url: &str, sink: &Sink) -> Plan {
             // player flag: every player spells the flag differently and
             // PULSE_SINK is understood by all of them through libpulse.
             // Swapping mpv for ffplay then costs nothing.
-            play: format!("PULSE_SINK={} {player} {q}", shell_quote(name)),
+            play: format!("{prop} PULSE_SINK={} {player} {q}", shell_quote(name)),
             teardown: Vec::new(),
         },
         // SURROUND. A null sink with the room's channel map, one loopback
@@ -291,7 +301,7 @@ pub fn plan(player: &str, url: &str, sink: &Sink) -> Plan {
             }
             Plan {
                 setup,
-                play: format!("PULSE_SINK={name} {player} {q}"),
+                play: format!("{prop} PULSE_SINK={name} {player} {q}"),
                 // Unloading BY NAME rather than every module of the type:
                 // `unload-module module-remap-sink` would take out any
                 // remap another application had created, which on a
@@ -307,7 +317,7 @@ pub fn plan(player: &str, url: &str, sink: &Sink) -> Plan {
                     "pactl load-module module-combine-sink sink_name={} slaves={} \
                      sink_properties=device.description={}",
                     combine, shell_quote(&slaves), combine)],
-                play: format!("PULSE_SINK={combine} {player} {q}"),
+                play: format!("{prop} PULSE_SINK={combine} {player} {q}"),
                 teardown: vec![format!("pactl unload-module module-combine-sink")],
             }
         }
@@ -320,6 +330,33 @@ pub fn plan(player: &str, url: &str, sink: &Sink) -> Plan {
 /// second album — and the naive version breaks on exactly those.
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// A readable name for the volume-mixer stream, derived from the file path.
+///
+/// Reported gap: bo-suite's players showed as bare "ffplay"/"mpv" in a
+/// system volume mixer, next to other apps (Clementine, in the report)
+/// showing real "artist - title" text. This is NOT that -- there is no
+/// track-id-to-metadata resolver anywhere in this playback layer yet
+/// (`now_playing_url`'s own doc comment already says so: "the library
+/// holds titles and tags, not paths"), and inventing a fake one here
+/// would be worse than the bare binary name it replaces. What IS real
+/// and already available at every call site is the file path itself --
+/// its basename, extension stripped, underscores/hyphens opened into
+/// spaces, is a genuine improvement over "ffplay" without pretending to
+/// know an artist or title the app has not actually looked up.
+///
+/// A real ID3/tag-based resolver feeding this instead (or a `Plan` field
+/// carrying it in directly) is the actual fix for the Clementine-parity
+/// ask; this is the honest interim step available without one.
+pub fn media_name_from_url(url: &str) -> String {
+    let stem = std::path::Path::new(url)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(url);
+    let pretty: String = stem.chars().map(|c| if c == '_' || c == '-' { ' ' } else { c }).collect();
+    let pretty = pretty.trim();
+    if pretty.is_empty() { "bo-suite".to_string() } else { pretty.to_string() }
 }
 
 /// What the player is doing, for the UI.
@@ -559,6 +596,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn media_name_strips_extension_and_opens_up_separators() {
+        assert_eq!(media_name_from_url("/music/01_Some-Track_Name.flac"), "01 Some Track Name");
+    }
+
+    #[test]
+    fn media_name_falls_back_when_cleanup_leaves_nothing() {
+        // A stem of pure separators becomes pure spaces after cleanup,
+        // which trims to empty -- must not surface an empty
+        // PULSE_PROP_media.name value in that case.
+        assert_eq!(media_name_from_url("/music/---.flac"), "bo-suite");
+    }
+
+    #[test]
+    fn media_name_treats_a_leading_dot_as_no_extension() {
+        // Rust's Path::file_stem, unlike Python's os.path.splitext,
+        // treats a dotfile as having no extension at all -- the whole
+        // name is the stem. Pinned explicitly: worth knowing precisely,
+        // not just "it doesn't crash", since it is the kind of platform
+        // API surprise this session has been bitten by before.
+        assert_eq!(media_name_from_url("/music/.flac"), ".flac");
+    }
+
+    #[test]
+    fn plan_carries_the_media_name_prop_for_every_sink_kind() {
+        // All four Sink variants build their own `play:` string
+        // independently -- confirms none of the three PULSE_SINK sites
+        // (One/Many/Surround) were missed when this prop was added
+        // alongside it.
+        assert!(plan("mpv", "/song.flac", &Sink::Default).play
+            .starts_with("PULSE_PROP_media.name='song' mpv"));
+        assert!(plan("mpv", "/song.flac", &Sink::One("s".into())).play
+            .contains("PULSE_PROP_media.name='song'"));
+        assert!(plan("mpv", "/song.flac", &Sink::Many(vec!["a".into(), "b".into()])).play
+            .contains("PULSE_PROP_media.name='song'"));
+        assert!(plan("mpv", "/song.flac", &Sink::Surround {
+            members: vec![("a".into(), "front-left".into())],
+            channel_map: "front-left".into(),
+        }).play.contains("PULSE_PROP_media.name='song'"));
+    }
+
+    #[test]
     fn a_path_with_an_apostrophe_survives_the_shell() {
         // Every second album has one. The naive quoting breaks on exactly
         // those, and the failure is a track that silently does not play.
@@ -571,7 +649,8 @@ mod tests {
     fn one_speaker_needs_no_setup_and_no_teardown() {
         let p = plan("mpv", "/a.flac", &Sink::One("bluez_sink.AA".into()));
         assert!(p.setup.is_empty() && p.teardown.is_empty());
-        assert!(p.play.starts_with("PULSE_SINK='bluez_sink.AA' mpv"), "{}", p.play);
+        assert!(p.play.starts_with("PULSE_PROP_media.name='a' PULSE_SINK='bluez_sink.AA' mpv"),
+                "{}", p.play);
     }
 
     #[test]
