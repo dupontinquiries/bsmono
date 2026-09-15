@@ -71,6 +71,15 @@ pub struct Job {
     /// `pipeline.analyze.tier_std[1]`) to this cheaper model instead of the
     /// main one. `Some(None)` = the vendored compact model.
     pub cascade_model: Option<Option<PathBuf>>,
+    /// Restoration chain: scale-1 models (denoise, deblur, de-artifact, ...)
+    /// run in this order over every decoded frame, before the gate ever
+    /// sees it. Independent of `model`/`cascade_model`, which upscale.
+    pub filters: Vec<PathBuf>,
+    /// RCAS sharpening applied to the upscaler's OUTPUT (AMD FSR units:
+    /// stops, lower = stronger). `None` = off. Wraps every tier, cascade
+    /// and bicubic included, so a difficulty-routed job stays consistently
+    /// sharpened regardless of which tier drew a given block.
+    pub sharpen: Option<f32>,
     /// Route flat missing blocks (luma std below `tier_std[0]`) to bicubic.
     pub flat_bypass: bool,
     /// Memory budgets; `None` = detect (half of MemAvailable for RAM, a
@@ -115,6 +124,8 @@ impl Default for Job {
             end: None,
             cancel: None,
             cascade_model: None,
+            filters: Vec::new(),
+            sharpen: None,
             flat_bypass: false,
             ram_budget: None,
             vram_budget: None,
@@ -424,7 +435,7 @@ pub fn build_tiers(job: &Job) -> anyhow::Result<Vec<Box<dyn Upscaler>>> {
             }
             tiers.push(Box::new(BicubicUpscaler { scale: job.scale }));
         }
-        return Ok(tiers);
+        return Ok(tiers.into_iter().map(|t| maybe_sharpen(job, t)).collect());
     }
     let mut tiers = vec![build_upscaler(job)?];
     if let Some(cheap) = &job.cascade_model {
@@ -441,7 +452,39 @@ pub fn build_tiers(job: &Job) -> anyhow::Result<Vec<Box<dyn Upscaler>>> {
         }
         tiers.push(Box::new(BicubicUpscaler { scale: job.scale }));
     }
-    Ok(tiers)
+    Ok(tiers.into_iter().map(|t| maybe_sharpen(job, t)).collect())
+}
+
+/// Build the restoration chain (`job.filters`, in order) as `Upscaler`s on
+/// the job's backend. Each filter is loaded and run exactly like the main
+/// model — same CPU/GPU code path, same tile machinery — just at scale 1
+/// and outside the gate, so a filter costs whatever `bscale bench` says for
+/// a model of its size, with no residual/cascade bookkeeping around it.
+pub fn build_filters(job: &Job) -> anyhow::Result<Vec<Box<dyn Upscaler>>> {
+    job.filters
+        .iter()
+        .map(|path| {
+            let mut j = job.clone();
+            j.model = Some(path.clone());
+            j.scale = 1;
+            j.cascade_model = None;
+            j.flat_bypass = false;
+            j.filters = Vec::new(); // no recursion; build_upscaler ignores it anyway
+            build_upscaler(&j).with_context(|| format!("loading filter {}", path.display()))
+        })
+        .collect()
+}
+
+/// Wraps one upscaler in `Sharpened` if `job.sharpen` is set. Centralised
+/// here (not left to each call site) so the CLI and the egui shell, which
+/// both go through `build_tiers`/`build_upscaler`, cannot drift on when
+/// sharpening applies -- the same reasoning this file states for model
+/// resolution.
+fn maybe_sharpen(job: &Job, u: Box<dyn Upscaler>) -> Box<dyn Upscaler> {
+    match job.sharpen {
+        Some(stops) => Box::new(d2x_core::upscale::Sharpened { inner: u, sharpness: d2x_core::rcas::Sharpness(stops) }),
+        None => u,
+    }
 }
 
 pub fn build_upscaler(job: &Job) -> anyhow::Result<Box<dyn Upscaler>> {
@@ -522,6 +565,10 @@ pub fn open_source(job: &Job) -> anyhow::Result<(Box<dyn FrameSource>, Option<ff
         Some(flag) => Box::new(Cancellable { inner: src, flag: flag.clone() }),
         None => src,
     };
+    // Restoration chain runs first: everything downstream (gate, matcher,
+    // residual, cascade) then sees the filtered frame as if it were the
+    // source, so reuse decisions are made on cleaned-up content.
+    let src: Box<dyn FrameSource> = if job.filters.is_empty() { src } else { Box::new(d2x_core::filters::FilteredSource::new(src, build_filters(job)?)?) };
     Ok((src, probe))
 }
 
@@ -756,7 +803,8 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
         let (seg, part, tx, p, job, servers, all, cache, cfg) = (*seg, part.clone(), tx.clone(), p.clone(), job.clone(), servers.clone(), keyframes.clone(), shared_cache.clone(), cfg);
         let stamp = stamp.clone();
         handles.push(std::thread::Builder::new().name(format!("d2x-seg{}", seg.index)).spawn(move || -> anyhow::Result<Summary> {
-            let src = Box::new(FfmpegSource::open_segment(&job.input, &p, seg)?);
+            let src: Box<dyn FrameSource> = Box::new(FfmpegSource::open_segment(&job.input, &p, seg)?);
+            let src: Box<dyn FrameSource> = if job.filters.is_empty() { src } else { Box::new(d2x_core::filters::FilteredSource::new(src, build_filters(&job)?)?) };
             let mut enc = job.encode.clone();
             // Keyframes relative to this segment's start (one scan, shared).
             enc.keyframes = all.iter().filter(|&&t| t >= seg.start && seg.end.map_or(true, |e| t < e)).map(|t| t - seg.start).collect();

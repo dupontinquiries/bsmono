@@ -182,6 +182,15 @@ struct Common {
     /// model path, or "default" for the vendored realesr-animevideov3.
     #[arg(long)]
     cascade: Option<String>,
+    /// Restoration chain run over every frame before the gate, comma-separated,
+    /// in order (e.g. --filters denoise.safetensors,deblur.safetensors). Each
+    /// must be a scale-1 model (trained with shuffle=1, no pixel-shuffle).
+    #[arg(long)]
+    filters: Option<String>,
+    /// RCAS sharpening after the upscaler, in AMD FSR's units: stops. Lower
+    /// is stronger (0.0 = maximum); omit for no sharpening.
+    #[arg(long)]
+    sharpen: Option<f32>,
     /// Flat missing blocks (luma std below --flat-std) skip the network: bicubic.
     #[arg(long)]
     flat_bypass: bool,
@@ -352,6 +361,8 @@ fn job_from(common: &Common, input: PathBuf, output: PathBuf) -> anyhow::Result<
         other => anyhow::bail!("--halfpel-filter must be bilinear|6tap, got {other}"),
     };
     j.cascade_model = common.cascade.as_ref().map(|c| if c == "default" { None } else { Some(PathBuf::from(c)) });
+    j.filters = common.filters.as_ref().map(|s| s.split(',').filter(|p| !p.is_empty()).map(PathBuf::from).collect()).unwrap_or_default();
+    j.sharpen = common.sharpen;
     j.flat_bypass = common.flat_bypass;
     j.pipeline.tiers = 1 + j.cascade_model.is_some() as usize + j.flat_bypass as usize;
     Ok(j)

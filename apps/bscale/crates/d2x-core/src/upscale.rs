@@ -155,3 +155,62 @@ impl Upscaler for Resampled {
         format!("{} -> x{} (lanczos)", self.inner.name(), self.target)
     }
 }
+
+/// Wraps an upscaler and RCAS-sharpens its output (`crate::rcas`). Belongs
+/// here rather than in the filter chain (`crate::filters`): a restoration
+/// filter runs BEFORE the upscaler, on the source; sharpening compensates
+/// for softness the upscaler itself introduces (regression-to-the-mean CNN
+/// output, bicubic, or a reused block inheriting an earlier upscale's
+/// softness — see rcas.rs's own module doc), so it has to run AFTER,
+/// wrapping the upscaler's output rather than the source.
+pub struct Sharpened {
+    pub inner: Box<dyn Upscaler>,
+    pub sharpness: crate::rcas::Sharpness,
+}
+
+impl Upscaler for Sharpened {
+    fn as_dyn(&mut self) -> &mut dyn Upscaler {
+        self
+    }
+    fn scale(&self) -> u32 {
+        self.inner.scale()
+    }
+    fn canvas(&self) -> u32 {
+        self.inner.canvas()
+    }
+    fn upscale(&mut self, frame: &Frame) -> anyhow::Result<Frame> {
+        let mut out = self.inner.upscale(frame)?;
+        crate::rcas::sharpen(&mut out, self.sharpness);
+        Ok(out)
+    }
+    fn name(&self) -> String {
+        format!("{} + rcas({:.2} stops)", self.inner.name(), self.sharpness.0)
+    }
+}
+
+#[cfg(test)]
+mod sharpened_tests {
+    use super::*;
+    use crate::rcas::Sharpness;
+
+    #[test]
+    fn wrapping_preserves_scale_and_actually_changes_pixels() {
+        let mut f = Frame::new(6, 6);
+        // A hard step edge down the middle -- something RCAS's cross-kernel
+        // has real gradient information to act on (a flat frame is exactly
+        // the case `sharpen` should leave alone, so it's not the case to
+        // prove wiring with).
+        for y in 0..6 {
+            for x in 0..6 {
+                let v = if x < 3 { 60 } else { 200 };
+                f.set_px(x, y, [v, v, v]);
+            }
+        }
+        let mut sharpened = Sharpened { inner: Box::new(NearestUpscaler { scale: 2 }), sharpness: Sharpness(0.5) };
+        let base = NearestUpscaler { scale: 2 }.upscale(&f).unwrap();
+        let out = sharpened.upscale(&f).unwrap();
+        assert_eq!(sharpened.scale(), 2, "wrapping must not change the reported scale");
+        assert_eq!((out.width, out.height), (base.width, base.height));
+        assert_ne!(out.data, base.data, "RCAS on a hard edge must change at least one pixel");
+    }
+}
