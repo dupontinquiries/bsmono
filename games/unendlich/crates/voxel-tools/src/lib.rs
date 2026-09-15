@@ -61,6 +61,10 @@ pub mod scheme;
 /// reply -- and a readback bounded by step count rather than block count.
 /// See the module header for the 5200-token truncation that prompted it.
 pub mod job;
+/// Which model plans and which model builds. Borrows logscope's role
+/// vocabulary where the jobs match and says plainly where they do not --
+/// a Mason is not a speculative Disciple.
+pub mod crew;
 /// Chat box: keys, history, autocomplete cards.
 pub mod chatbox;
 /// Voice: grammar and intent mapping for the voiced daemon.
