@@ -115,6 +115,20 @@ impl FixtureRunner {
         );
         self
     }
+    /// Like `on`, but also sets stderr -- `on` alone cannot simulate a
+    /// command that fails WITH a message (it hardcodes stderr empty),
+    /// which meant no test anywhere in this crate could verify that a
+    /// real failure message (a full destination, a bad sector, permission
+    /// denied) actually reaches the caller rather than being silently
+    /// dropped. Additive rather than changing `on`'s signature, so every
+    /// existing call site is untouched.
+    pub fn on_full(mut self, cmdline: &str, code: i32, stdout: &str, stderr: &str) -> Self {
+        self.map.insert(
+            cmdline.to_string(),
+            SysOutput { code, stdout: stdout.to_string(), stderr: stderr.to_string() },
+        );
+        self
+    }
 }
 
 impl Default for FixtureRunner {

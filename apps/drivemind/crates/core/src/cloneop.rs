@@ -207,6 +207,94 @@ mod tests {
     }
 
     #[test]
+    fn force_never_overrides_a_blocked_plan() {
+        // THE single most important property in this whole module, per
+        // its own header comment: "force only skips the 'are you sure'
+        // layer, never the physics." This was the one property with zero
+        // test coverage -- every other test either builds a plan that
+        // already passes, or checks blockers WITHOUT ever calling
+        // execute() on the result. A reordering bug (checking `force`
+        // before `plan.ok()`, say) would let force=true run a clone this
+        // exact test constructs to be blocked, and nothing before this
+        // would have caught it.
+        let devs = vec![dev("/dev/sda", 1000, &[]), dev("/dev/sdb", 500, &[])]; // dst too small
+        let p = plan(&devs, "/dev/sda", "/dev/sdb", false);
+        assert!(!p.ok(), "this plan must be blocked for the test to mean anything");
+        let sys = FixtureRunner::new().on(&p.command, 0, "");
+        let mut sink = null_sink();
+        let err = execute(&sys, &p, true, &mut sink)
+            .expect_err("a blocked plan must refuse even with force=true");
+        assert!(err.contains("blockers"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_byte_source_is_blocked() {
+        // "source reports 0 bytes — refusing to trust it", per the plan()
+        // code and its own header comment ("src is not empty-sized (0-byte
+        // source means enumeration lied)") -- a real safety check with no
+        // test exercising it at all before this one.
+        let devs = vec![dev("/dev/sda", 0, &[]), dev("/dev/sdb", 1000, &[])];
+        let p = plan(&devs, "/dev/sda", "/dev/sdb", false);
+        assert!(!p.ok());
+        assert!(p.blockers.iter().any(|b| b.contains("0 bytes")), "{:?}", p.blockers);
+    }
+
+    #[test]
+    fn an_unknown_source_is_blocked_independently_of_an_unknown_destination() {
+        // The existing coverage only ever tried an unknown DESTINATION.
+        // `s.is_none()` and `d.is_none()` are two separate checks in the
+        // real code; an unknown source needs its own test in case one
+        // path has a bug the other's test cannot reach.
+        let devs = vec![dev("/dev/sdb", 1000, &[])];
+        let p = plan(&devs, "/dev/sdz", "/dev/sdb", false);
+        assert!(!p.ok());
+        assert!(p.blockers.iter().any(|b| b.contains("source") && b.contains("not found")), "{:?}", p.blockers);
+    }
+
+    #[test]
+    fn a_destination_exactly_the_source_size_is_allowed() {
+        // The size check is `d.size_bytes < s.size_bytes` -- strictly
+        // less-than, so an EQUAL-sized destination must be allowed. The
+        // existing test only ever used a strictly-smaller destination for
+        // the blocked case and a strictly-larger one for the allowed
+        // case; the boundary itself (equal) was never exercised, and a
+        // one-character change to `<=` would not have been caught.
+        let devs = vec![dev("/dev/sda", 1000, &[]), dev("/dev/sdb", 1000, &[])];
+        let p = plan(&devs, "/dev/sda", "/dev/sdb", false);
+        assert!(p.ok(), "{:?}", p.blockers);
+    }
+
+    #[test]
+    fn a_failing_clone_command_is_reported_as_an_error_not_silently_ok() {
+        // Every existing execute() test used a fixture that succeeds
+        // (exit code 0). dd/ddrescue can and do fail mid-run (a real bad
+        // sector, a full destination, permission denied) -- execute()
+        // must surface that as an Err a caller can act on, not report
+        // success because the process merely ran.
+        let devs = vec![dev("/dev/sda", 1000, &[]), dev("/dev/sdb", 2000, &[])];
+        let p = plan(&devs, "/dev/sda", "/dev/sdb", false);
+        assert!(p.ok(), "{:?}", p.blockers);
+        let sys = FixtureRunner::new().on_full(&p.command, 1, "", "dd: writing to '/dev/sdb': No space left on device");
+        let mut sink = null_sink();
+        let err = execute(&sys, &p, true, &mut sink).expect_err("a nonzero exit must be an Err");
+        assert!(err.contains("No space left"), "{err}");
+    }
+
+    #[test]
+    fn multiple_real_blockers_all_accumulate_not_just_the_first() {
+        // A destination that is BOTH too small AND mounted must report
+        // BOTH problems, not short-circuit on whichever check runs
+        // first -- a person reading only one blocker might fix it,
+        // re-run, and hit the second one they were never told about.
+        let devs = vec![dev("/dev/sda", 1000, &[]), dev("/dev/sdb", 500, &["/mnt/x"])];
+        let p = plan(&devs, "/dev/sda", "/dev/sdb", false);
+        assert!(!p.ok());
+        assert!(p.blockers.iter().any(|b| b.contains("too small")), "{:?}", p.blockers);
+        assert!(p.blockers.iter().any(|b| b.contains("mounted")), "{:?}", p.blockers);
+        assert_eq!(p.blockers.len(), 2, "exactly these two, not deduplicated away or short-circuited: {:?}", p.blockers);
+    }
+
+    #[test]
     fn unhealthy_source_selects_ddrescue_and_mounted_source_only_warns() {
         let devs = vec![dev("/dev/sda", 1000, &["/data"]), dev("/dev/sdb", 2000, &[])];
         let p = plan(&devs, "/dev/sda", "/dev/sdb", true);

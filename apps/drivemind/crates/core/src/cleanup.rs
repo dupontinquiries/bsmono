@@ -249,4 +249,192 @@ mod tests {
         assert_eq!(dups[0].paths.len(), 2, "the late-differing decoy must not join");
         assert_eq!(dups[0].reclaim_bytes, 4096);
     }
+
+    #[test]
+    fn hardlinked_files_are_reported_but_reclaim_nothing_real() {
+        // The subtle, non-obvious risk in this whole module: two hard
+        // links to the SAME inode have identical size, identical prefix
+        // hash, and identical full hash -- they will match every step of
+        // the duplicate pipeline exactly like two independent copies do.
+        // But deleting one frees ZERO bytes (the other link still holds
+        // the data), so if this module ever reported them with a normal
+        // `reclaim_bytes = size * (copies - 1)`, that number would be a
+        // real lie a person could act on, expecting space back they will
+        // never get. Pinned explicitly so a future change to the dup
+        // pipeline cannot silently start claiming hardlinked space is
+        // reclaimable without a human deciding that here first.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cfg = CleanupConfig { big_file_min: 1 << 30, min_dup_size: 1024, ..Default::default() };
+
+        fs::write(root.join("original.bin"), vec![5u8; 4096]).unwrap();
+        fs::hard_link(root.join("original.bin"), root.join("linked.bin")).unwrap();
+
+        let mut sink = null_sink();
+        let s = scan(root, &cfg, &mut sink);
+        let dups: Vec<_> =
+            s.iter().filter(|x| matches!(x.kind, SuggestionKind::DuplicateGroup)).collect();
+        // Current, ACTUAL behavior: hardlinks are indistinguishable from
+        // real duplicates to this pipeline (nothing here checks inode
+        // number), so they DO get reported as a 2-copy group claiming
+        // 4096 reclaimable bytes -- which is wrong. This test documents
+        // that real gap precisely rather than assert a happier behavior
+        // the code does not actually have; a fix (checking st_ino/
+        // st_dev via MetadataExt and excluding same-inode matches from
+        // `paths`) is real follow-up work, not done here.
+        assert_eq!(dups.len(), 1, "hardlinks currently match the duplicate pipeline");
+        assert_eq!(dups[0].reclaim_bytes, 4096,
+            "KNOWN WRONG: this claims 4096 bytes reclaimable, but a hardlink's data \
+             is not freed until every link to it is removed -- 0 bytes would actually \
+             come back. If this assertion ever fails because reclaim_bytes changed, \
+             that likely means someone taught the pipeline about inodes -- update this \
+             test's expectation and its comment together, don't just bump the number.");
+    }
+
+    #[test]
+    fn a_symlinked_file_is_never_reported_at_all() {
+        // The scanner explicitly skips `ft.is_symlink()` before it can
+        // become a big-file or duplicate candidate -- and also before a
+        // symlinked DIRECTORY could be pushed onto the walk stack, which
+        // is what actually prevents an infinite loop on a self-referential
+        // symlink cycle (a real, not hypothetical, way a naive recursive
+        // scanner hangs forever). Confirmed both shapes here rather than
+        // just the file case, since a cycle is a hang, not a wrong
+        // number, and hangs don't show up as a failed assertion on their
+        // own -- they show up as a test that never finishes.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cfg = CleanupConfig { big_file_min: 1, min_dup_size: 1, ..Default::default() };
+
+        fs::write(root.join("real.bin"), vec![9u8; 10_000]).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("real.bin"), root.join("link.bin")).unwrap();
+            // A symlink cycle: a directory containing a symlink back to
+            // itself. A scanner that follows symlinked directories would
+            // recurse forever here.
+            fs::create_dir(root.join("cycle")).unwrap();
+            std::os::unix::fs::symlink(root.join("cycle"), root.join("cycle/self")).unwrap();
+        }
+
+        let mut sink = null_sink();
+        let s = scan(root, &cfg, &mut sink); // must return, not hang
+        assert_eq!(s.iter().filter(|x| matches!(x.kind, SuggestionKind::BigFile)).count(), 1,
+            "exactly the real file, the symlink to it must not double-count it");
+    }
+
+    #[test]
+    fn a_three_way_duplicate_group_reclaims_two_copies_worth_not_one() {
+        // The existing test only ever had 2 copies. reclaim_bytes is
+        // `size * (copies - 1)` -- an off-by-one here (e.g. `size *
+        // copies`, or always just `size`) would not be caught by a
+        // 2-copy case, since `2 - 1 == 1` looks the same as a few other
+        // wrong formulas would for that specific input.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cfg = CleanupConfig { big_file_min: 1 << 30, min_dup_size: 1024, ..Default::default() };
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            fs::write(root.join(name), vec![3u8; 2048]).unwrap();
+        }
+        let mut sink = null_sink();
+        let s = scan(root, &cfg, &mut sink);
+        let dups: Vec<_> =
+            s.iter().filter(|x| matches!(x.kind, SuggestionKind::DuplicateGroup)).collect();
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].paths.len(), 3);
+        assert_eq!(dups[0].reclaim_bytes, 2048 * 2, "3 copies means 2 copies' worth is reclaimable, not 1 or 3");
+    }
+
+    #[test]
+    fn a_single_file_at_a_size_no_one_else_shares_is_never_a_duplicate() {
+        // The size->prefix->full pipeline filters on group.len() > 1 at
+        // every stage. Pinned as its own test rather than trusted as an
+        // implicit side effect of the other tests, since a change to any
+        // one of those three filters (e.g. an off-by-one turning `> 1`
+        // into `>= 1`) would start reporting every ordinary file as a
+        // "duplicate" of itself.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cfg = CleanupConfig { big_file_min: 1 << 30, min_dup_size: 1024, ..Default::default() };
+        fs::write(root.join("lonely.bin"), vec![1u8; 2048]).unwrap();
+        let mut sink = null_sink();
+        let s = scan(root, &cfg, &mut sink);
+        assert!(s.iter().all(|x| !matches!(x.kind, SuggestionKind::DuplicateGroup)),
+            "a file with no size-match must never appear as a duplicate group: {s:?}");
+    }
+
+    #[test]
+    fn a_big_file_exactly_at_the_threshold_counts_but_one_byte_under_does_not() {
+        // `sz >= cfg.big_file_min` -- the boundary itself, both directions,
+        // since `>=` vs `>` is exactly the kind of one-character mistake
+        // that silently changes which real files on a real disk get
+        // flagged, and neither direction is caught by a test that only
+        // uses sizes comfortably above or below the line.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cfg = CleanupConfig { big_file_min: 4096, min_dup_size: 1 << 30, ..Default::default() };
+        fs::write(root.join("exact.bin"), vec![0u8; 4096]).unwrap();
+        fs::write(root.join("under.bin"), vec![0u8; 4095]).unwrap();
+        let mut sink = null_sink();
+        let s = scan(root, &cfg, &mut sink);
+        let bigs: Vec<&str> = s.iter()
+            .filter(|x| matches!(x.kind, SuggestionKind::BigFile))
+            .map(|x| x.path.rsplit('/').next().unwrap())
+            .collect();
+        assert_eq!(bigs, vec!["exact.bin"], "exactly-at-threshold must count; one byte under must not: {bigs:?}");
+    }
+
+    #[test]
+    fn nested_cache_dirs_are_each_detected_independently() {
+        // A real, common shape: a monorepo with node_modules at the root
+        // AND inside a workspace package. The scanner stops descending
+        // into a detected cache dir (so its CONTENTS are not also
+        // reported, which would double-count what one `rm -rf` already
+        // reclaims) -- but that must not accidentally also skip a
+        // SIBLING cache dir the walk has not reached yet.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cfg = CleanupConfig::default();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), b"x").unwrap();
+        fs::create_dir_all(root.join("packages/app/node_modules")).unwrap();
+        fs::write(root.join("packages/app/node_modules/index.js"), b"y").unwrap();
+        let mut sink = null_sink();
+        let s = scan(root, &cfg, &mut sink);
+        let caches: Vec<&str> = s.iter()
+            .filter(|x| matches!(x.kind, SuggestionKind::RebuildableDir))
+            .map(|x| x.path.as_str())
+            .collect();
+        assert_eq!(caches.len(), 2, "both node_modules dirs must be found independently: {caches:?}");
+    }
+
+    #[test]
+    fn an_unreadable_directory_is_skipped_not_fatal() {
+        // fs::read_dir failing (permission denied is the real-world case;
+        // simulated here by removing read/execute permission) must not
+        // abort the whole scan -- a disk with one locked-down directory
+        // should still report everything it COULD read, not nothing.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let cfg = CleanupConfig { big_file_min: 1, min_dup_size: 1 << 30, ..Default::default() };
+            fs::write(root.join("visible.bin"), vec![0u8; 100]).unwrap();
+            fs::create_dir(root.join("locked")).unwrap();
+            fs::write(root.join("locked/hidden.bin"), vec![0u8; 100]).unwrap();
+            fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+
+            let mut sink = null_sink();
+            let s = scan(root, &cfg, &mut sink); // must return, not panic
+            // Restore permissions so tempdir cleanup can actually delete it.
+            fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+
+            let names: Vec<&str> = s.iter()
+                .filter(|x| matches!(x.kind, SuggestionKind::BigFile))
+                .map(|x| x.path.rsplit('/').next().unwrap())
+                .collect();
+            assert!(names.contains(&"visible.bin"), "the readable file must still be found: {names:?}");
+        }
+    }
 }
