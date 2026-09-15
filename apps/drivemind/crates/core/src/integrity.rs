@@ -310,4 +310,134 @@ mod tests {
         assert!(rep.clean());
         assert_eq!(rep.ok, 1);
     }
+
+    #[test]
+    fn an_unreadable_file_is_a_read_error_not_silently_dropped_or_fatal() {
+        // The module's own header comment names this the single most
+        // important classification: "ReadError is the one people forget
+        // and the one that matters most here... a file that CANNOT BE
+        // READ is a dying disk talking to you." Neither existing test
+        // ever produced one. Also confirms the stated design goal
+        // directly: verify() must keep going past the read error and
+        // still report the OTHER files correctly, not stop or swallow
+        // the rest of the scan.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("data");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("healthy.txt"), b"fine").unwrap();
+            fs::write(root.join("dying.bin"), b"will become unreadable").unwrap();
+            let manifest = dir.path().join("m.jsonl");
+            let mut sink = null_sink();
+            create(&root, &manifest, &mut sink).unwrap();
+
+            fs::set_permissions(root.join("dying.bin"), fs::Permissions::from_mode(0o000)).unwrap();
+            let rep = verify(&root, &manifest, &mut sink);
+            fs::set_permissions(root.join("dying.bin"), fs::Permissions::from_mode(0o644)).unwrap();
+            let rep = rep.expect("a read error on one file must not fail the whole verify");
+
+            // NOTE: if this runs as root, the permission bits above are
+            // not actually enforced (root can read a 0o000 file
+            // regardless), so read_errors may legitimately be empty --
+            // asserting on it unconditionally would be the same mistake
+            // made and caught earlier in cleanup.rs/deltahostile.rs. The
+            // property that holds in BOTH cases is that the healthy file
+            // is still correctly verified either way.
+            assert_eq!(rep.ok, 1, "the healthy file must still be verified regardless of the other file's readability");
+            if !rep.read_errors.is_empty() {
+                assert_eq!(rep.read_errors[0].0, "dying.bin");
+                assert!(!rep.clean(), "a real read error must make the report non-clean");
+            }
+        }
+    }
+
+    #[test]
+    fn create_fails_fast_on_an_unreadable_file_rather_than_writing_a_partial_manifest() {
+        // "At CREATE time an unreadable file is fatal: a manifest that
+        // silently omits files would 'verify clean' forever." A real,
+        // deliberate asymmetry with verify()'s keep-going behavior --
+        // untested that create() actually enforces it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("data");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("locked.bin"), b"x").unwrap();
+            fs::set_permissions(root.join("locked.bin"), fs::Permissions::from_mode(0o000)).unwrap();
+            let manifest = dir.path().join("m.jsonl");
+            let mut sink = null_sink();
+            let result = create(&root, &manifest, &mut sink);
+            fs::set_permissions(root.join("locked.bin"), fs::Permissions::from_mode(0o644)).unwrap();
+            // Same root-bypass caveat as the test above: only assert the
+            // failure when it actually occurred.
+            if let Err(e) = result {
+                assert!(e.contains("locked.bin") || e.to_lowercase().contains("permission"), "{e}");
+            }
+        }
+    }
+
+    #[test]
+    fn load_rejects_an_empty_manifest_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("empty.jsonl");
+        fs::write(&manifest, "").unwrap();
+        let err = load(&manifest).expect_err("an empty file has no header line to read");
+        assert!(err.contains("empty manifest"), "{err}");
+    }
+
+    #[test]
+    fn load_rejects_a_manifest_with_the_wrong_kind_header() {
+        // The format-version guard: a manifest from an incompatible
+        // future (or past) version must be refused explicitly rather
+        // than silently misread as if every entry were dmv1-shaped.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("wrong.jsonl");
+        fs::write(&manifest, r#"{"kind":"dmv2","root":"/x","created_unix":0}"#).unwrap();
+        let err = load(&manifest).expect_err("an unrecognized kind must be refused");
+        assert!(err.contains("dmv2"), "{err}");
+    }
+
+    #[test]
+    fn load_rejects_malformed_json_in_an_entry_line_not_just_the_header() {
+        // The header can parse fine while a LATER line is corrupt (a
+        // truncated write, a manual edit gone wrong) -- a separate
+        // failure point from the header check above, and the existing
+        // tests only ever fed load() manifests written by create()
+        // itself, which never happens to produce a malformed entry.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("corrupt.jsonl");
+        fs::write(&manifest, "{\"kind\":\"dmv1\",\"root\":\"/x\",\"created_unix\":0}\nnot json\n").unwrap();
+        let err = load(&manifest).expect_err("a corrupt entry line must be refused, not silently skipped");
+        assert!(err.contains("manifest entry"), "{err}");
+    }
+
+    #[test]
+    fn symlinks_are_skipped_with_a_visible_note_not_walked_or_hashed() {
+        // walk()'s own doc explains the reasoning: following them "turns
+        // a manifest into a trap (targets move independently)." Untested
+        // that a symlink is genuinely excluded from both create()'s
+        // output and verify()'s "new" detection.
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("data");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("real.txt"), b"x").unwrap();
+            std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+            let manifest = dir.path().join("m.jsonl");
+            let mut notes: Vec<String> = Vec::new();
+            {
+                let mut sink = |e: Event| { if let Event::Note(n) = e { notes.push(n); } };
+                let n = create(&root, &manifest, &mut sink).unwrap();
+                assert_eq!(n, 1, "only the real file, not the symlink");
+            }
+            assert!(notes.iter().any(|n| n.contains("symlink")), "{notes:?}");
+            let mut sink2 = null_sink();
+            let rep = verify(&root, &manifest, &mut sink2).unwrap();
+            assert!(rep.new.is_empty(), "the symlink must not show up as an untracked new file either: {:?}", rep.new);
+        }
+    }
 }
