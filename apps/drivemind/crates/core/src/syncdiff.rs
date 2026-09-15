@@ -59,9 +59,23 @@ pub fn duplicates(cats: &[&Catalog]) -> Vec<DupGroup> {
             continue;
         }
         let hashes: Vec<&str> = occ.iter().map(|(_, e)| e.b3.as_str()).collect();
-        let grade = if hashes.iter().all(|h| !h.is_empty())
-            && hashes.windows(2).all(|w| w[0] == w[1])
-        {
+        let all_hashed = hashes.iter().all(|h| !h.is_empty());
+        let all_equal = hashes.windows(2).all(|w| w[0] == w[1]);
+        if all_hashed && !all_equal {
+            // Was falling through to `Probable` here -- the SAME label
+            // used when hashes are simply unavailable. But a hash on
+            // every side that does not agree is definitive proof at
+            // least one pair is NOT the same content, not merely
+            // "unconfirmed": the name+size match that got this group
+            // into the pipeline was a false positive. Reporting that as
+            // a "probable duplicate" actively misleads -- someone could
+            // delete a file that is not a duplicate of anything, trusting
+            // the report's own word for it. Excluded from the report
+            // entirely, since there is no true duplicate here to report,
+            // rather than reported under any grade.
+            continue;
+        }
+        let grade = if all_hashed && all_equal {
             MatchGrade::Confirmed
         } else {
             MatchGrade::Probable
@@ -242,5 +256,80 @@ mod tests {
         assert_eq!(docs.only_a_bytes, 2000);
         let media = reps.iter().find(|r| r.dir == "media").expect("media report");
         assert!(media.in_sync());
+    }
+
+    fn cat_hashed(key: &str, files: &[(&str, u64, &str)]) -> Catalog {
+        let entries = files
+            .iter()
+            .map(|(p, sz, b3)| {
+                (
+                    p.to_string(),
+                    Entry { path: p.to_string(), size: *sz, mtime_unix: 0, b3: b3.to_string() },
+                )
+            })
+            .collect();
+        Catalog {
+            meta: CatalogMeta {
+                identity: DeviceIdentity {
+                    fs_uuid: Some(key.into()),
+                    label: None,
+                    model: None,
+                    serial: None,
+                },
+                taken_at: 0,
+                mount_root: String::new(),
+                photo_file: None,
+                entry_count: 0,
+                total_bytes: 0,
+            },
+            entries,
+        }
+    }
+
+    #[test]
+    fn matching_hashes_on_both_sides_earn_a_confirmed_grade() {
+        // The ONE thing this module exists to distinguish -- "Probable"
+        // vs "Confirmed" -- had no test anywhere exercising the Confirmed
+        // path at all; the existing fixture never set a b3 hash on
+        // either side, so every prior test could only ever see Probable.
+        let a = cat_hashed("A", &[("f.bin", 100, "aaa111")]);
+        let b = cat_hashed("B", &[("f.bin", 100, "aaa111")]);
+        let dups = duplicates(&[&a, &b]);
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].grade, MatchGrade::Confirmed);
+    }
+
+    #[test]
+    fn same_name_and_size_but_a_hash_mismatch_is_not_reported_at_all() {
+        // Real bug this test pins the fix for: same name + size put two
+        // files in the same candidate group, but a b3 hash present on
+        // BOTH sides that DISAGREES is definitive proof they are not the
+        // same content -- not merely "unconfirmed" the way a missing
+        // hash is. This used to fall through to MatchGrade::Probable,
+        // the exact same label used when there is simply no hash evidence
+        // either way, which actively misleads: a "probable duplicate"
+        // that is provably NOT a duplicate could lead someone to delete
+        // a file trusting the report's own word for it. Correct behavior
+        // is exclusion from the report entirely -- there is no duplicate
+        // here to report, at any grade.
+        let a = cat_hashed("A", &[("f.bin", 100, "aaa111")]);
+        let b = cat_hashed("B", &[("f.bin", 100, "bbb222")]);
+        let dups = duplicates(&[&a, &b]);
+        assert!(dups.is_empty(), "a proven hash mismatch must not appear as any grade of duplicate: {dups:?}");
+    }
+
+    #[test]
+    fn a_missing_hash_on_one_side_still_reports_probable() {
+        // Distinguishes the fix above from a regression that excludes
+        // too much: when hash evidence is only PARTIAL (one side scanned
+        // without hashing), that is genuine uncertainty, not proof of a
+        // mismatch, and must still surface as Probable -- exactly the
+        // case the module's own doc comment describes ("default scans
+        // don't hash").
+        let a = cat_hashed("A", &[("f.bin", 100, "aaa111")]);
+        let b = cat_hashed("B", &[("f.bin", 100, "")]);
+        let dups = duplicates(&[&a, &b]);
+        assert_eq!(dups.len(), 1, "partial hash evidence is uncertainty, not proof -- must still report");
+        assert_eq!(dups[0].grade, MatchGrade::Probable);
     }
 }
