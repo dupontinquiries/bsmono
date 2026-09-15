@@ -6670,7 +6670,24 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             // by the main pass don't race), then storage-image-write
             // → shader-sampled-read barrier AFTER compute (so the
             // main pass sees the new contents).
-            {
+            //
+            // r-gpu-guard-volumetrics: gpu_guard's Shed::Volumetrics tier
+            // logged "dropping volumetric lighting" for every session this
+            // whole debugging effort, but nothing ever actually checked it --
+            // confirmed by grepping every Shed::Volumetrics reference outside
+            // gpu_guard.rs itself and finding none. The froxel fill compute
+            // pass (dispatched below) has shown up costing over 300ms in a
+            // single frame in real crash logs (froxel_us=333490 in one
+            // capture), so this was real, meaningful, unclaimed cost sitting
+            // on the table during exactly the frames the guard was trying to
+            // relieve. Safe to skip entirely: `froxel.clear_to_sentinel` runs
+            // once at startup, so the volume always holds a defined neutral
+            // baseline even if this fill never runs again -- the main pass's
+            // fragment shader samples stale (or sentinel) scattering instead
+            // of this frame's, the same "reuse a safe empty state" trade
+            // already accepted for shadows_disabled just above.
+            let volumetrics_disabled = self.shed_level >= voxel_tools::gpu_guard::Shed::Volumetrics;
+            if !volumetrics_disabled {
                 // Pre-compute barrier: previous frame's main-pass
                 // reads → this frame's compute writes. Since the
                 // image is in GENERAL layout permanently, only an
@@ -6768,7 +6785,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                     &[],
                     std::slice::from_ref(&post_barrier),
                 );
-            }
+            } // end `if !volumetrics_disabled`
             // End froxel fill compute pass.
 
             // v0.21.1: GPU timestamp — froxel fill complete (post-barrier
