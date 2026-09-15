@@ -902,6 +902,33 @@ pub fn keyboard_ui_styled(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, pal
         };
         let usable = row_w - gutter * (row.keys.len() as f32 + 1.0);
         ui.horizontal(|ui| {
+            // THE ROW MUST SPEND EXACTLY WHAT IT BUDGETED.
+            //
+            // `usable` above reserves `gutter * (n + 1)` for the spaces, but
+            // egui inserts `spacing.item_spacing.x` between items on its own,
+            // and that defaults to 8.0 while the COMPACT gutter is 6.0. A
+            // ten-key row therefore budgeted 66pt of gap and spent 86, and the
+            // surplus pushed the right-hand keys off the screen — worse on a
+            // phone, which is both the narrow case and the one using the
+            // smaller gutter.
+            //
+            // Making egui's spacing BE the gutter closes it: one leading
+            // add_space plus n keys is n+1 items with n gaps between them, so
+            // gutter*(n+1) is spent exactly. The y is zeroed because rows do
+            // their own `add_space(gutter)` below and would otherwise be
+            // double-spaced.
+            //
+            // The test rig sets item_spacing to ZERO before measuring, which
+            // is why this never failed a test: the harness removed the very
+            // term that was wrong. The rig is left alone -- its `key_rect`
+            // sums widths without gutters, so zero spacing is what makes its
+            // arithmetic right, and it exercises gesture routing rather than
+            // pixel layout. The row arithmetic below is covered by
+            // `row_spending` instead, which needs no egui at all.
+            ui.spacing_mut().item_spacing = Vec2::new(gutter, 0.0);
+            // Leading space keeps the count at gutter*(n+1): one before the
+            // first key, then n gaps between the n+1 items. Dropping it leaves
+            // the row a gutter short of its own budget.
             ui.add_space(gutter + row_left);
             for key in &row.keys {
                 let w = (usable * (key.weight / total_weight)).max(8.0);
@@ -2811,4 +2838,62 @@ mod gtk_parity_tests {
             "no rect with a rounded top and a square bottom was painted"
         );
     }
+
+/// The row-width arithmetic, without egui.
+///
+/// `keyboard_ui_styled` reserves `gutter * (n + 1)` for gaps and then relies
+/// on egui to insert them. That only holds if egui's `item_spacing.x` IS the
+/// gutter -- and it defaults to 8.0 while `Adaptive`'s compact gutter is 6.0,
+/// so every row on a phone overspent by `n * 2`pt and ran off the right edge.
+///
+/// Extracted as a pure function because the egui test rig zeroes
+/// `item_spacing` before measuring, which removed the term that was wrong. A
+/// harness cannot catch a bug it has configured away.
+#[cfg(test)]
+mod row_spending {
+    /// What a row actually consumes: one leading gutter, then `n` gaps
+    /// between the `n + 1` items (the leading space plus `n` keys), plus the
+    /// keys themselves.
+    fn spent(row_w: f32, row_left: f32, gutter: f32, item_spacing: f32, n: usize) -> f32 {
+        let usable = row_w - gutter * (n as f32 + 1.0);
+        (gutter + row_left) + n as f32 * item_spacing + usable
+    }
+
+    /// With the spacing set to the gutter, a row spends exactly its width.
+    #[test]
+    fn a_row_spends_exactly_what_it_budgeted() {
+        for n in [1usize, 3, 10, 12] {
+            for gutter in [6.0f32, 8.0, 12.0] {
+                let got = spent(1080.0, 0.0, gutter, gutter, n);
+                assert!((got - 1080.0).abs() < 1e-3,
+                    "n={n} gutter={gutter}: spent {got}, had 1080");
+            }
+        }
+    }
+
+    /// THE BUG. egui's default 8.0 against the compact 6.0 gutter overruns by
+    /// 2pt per key -- 20pt on a ten-key row, off the right edge of a phone.
+    #[test]
+    fn the_default_spacing_overruns_a_compact_row() {
+        let over = spent(1080.0, 0.0, 6.0, 8.0, 10) - 1080.0;
+        assert!((over - 20.0).abs() < 1e-3, "expected 20pt of overflow, got {over}");
+        // ...and it scales with the key count, so the widest rows are worst.
+        assert!(spent(1080.0, 0.0, 6.0, 8.0, 12) > spent(1080.0, 0.0, 6.0, 8.0, 10));
+    }
+
+    /// A gutter WIDER than egui's default underspends rather than overflowing,
+    /// which is why this only ever looked like a phone bug.
+    #[test]
+    fn a_wide_gutter_underspends_instead_of_overflowing() {
+        assert!(spent(1080.0, 0.0, 12.0, 8.0, 10) < 1080.0);
+    }
+
+    /// An inset row (the thumb arc) still ends inside its own bounds.
+    #[test]
+    fn an_inset_row_stays_within_its_bounds() {
+        let (row_left, row_w) = (120.0, 700.0);
+        let got = spent(row_w, row_left, 6.0, 6.0, 8);
+        assert!((got - (row_left + row_w)).abs() < 1e-3, "got {got}");
+    }
+}
 }
