@@ -877,7 +877,7 @@ mod tests {
         p.apply(&Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Audio,
             name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 1 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "/media/take1.mov".into(),
-            len: Ticks::from_seconds(600.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
+            len: Ticks::from_seconds(600.0), sample_rate: 48_000, channels: 2, has_video: true, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(10), source: SourceId(1), track: TrackId(1),
             pos: Ticks::from_seconds(2.0), src_in: Ticks::ZERO, len: Ticks::from_seconds(4.0),
             gain: 1.0, effects: Vec::new() } }).unwrap();
@@ -1084,7 +1084,7 @@ mod drag_lifecycle_tests {
         }
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
             len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2,
-            has_video: true } }).unwrap();
+            has_video: true, kind: studio_core::SourceKind::File } }).unwrap();
         // Audio clip on A1 (row 1), 3s..8s — the same shape the pure tests use.
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(20), source: SourceId(1),
             track: TrackId(2), pos: Ticks::from_seconds(3.0), src_in: Ticks::ZERO,
@@ -1217,7 +1217,7 @@ mod move_target_tests {
         }
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
             len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2,
-            has_video: true } }).unwrap();
+            has_video: true, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(20), source: SourceId(1),
             track: TrackId(2), pos: Ticks::from_seconds(3.0), src_in: Ticks::ZERO,
             len: Ticks::from_seconds(5.0), gain: 1.0, effects: vec![] } }).unwrap();
@@ -1277,7 +1277,7 @@ mod grab_and_trim_tests {
             name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
             len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 1,
-            has_video: false } }).unwrap();
+            has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(20), source: SourceId(1),
             track: TrackId(1), pos: Ticks::from_seconds(3.0), src_in: Ticks::from_seconds(1.0),
             len: Ticks::from_seconds(5.0), gain: 1.0, effects: vec![] } }).unwrap();

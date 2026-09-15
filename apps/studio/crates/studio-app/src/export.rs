@@ -536,7 +536,7 @@ mod video_tests {
         // saying so, rather than shell out to nothing.
         let ghost = tmp.join("ghost.mp4");
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: ghost.to_string_lossy().into_owned(),
-            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1, has_video: true } }).unwrap();
+            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1, has_video: true, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1), pos: Ticks::ZERO,
             src_in: Ticks::ZERO, len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
         let audio = std::collections::BTreeMap::new();
@@ -575,7 +575,7 @@ mod tests {
         }
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
             len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 1,
-            has_video: false } }).unwrap();
+            has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         for (id, track, at) in [(1u64, 2u64, 0.0), (2, 3, 1.0), (3, 2, 3.0)] {
             p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(1),
                 track: TrackId(track), pos: Ticks::from_seconds(at),

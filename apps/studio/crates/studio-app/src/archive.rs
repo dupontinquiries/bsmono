@@ -440,7 +440,7 @@ mod tests {
         for id in 1..=n {
             p.apply(&Op::AddSource { source: Source { id: SourceId(id),
                 path: format!("takes/take{id}.opus"), len: Ticks::from_seconds(1.0),
-                sample_rate: 44_100, channels: 1, has_video: false } }).unwrap();
+                sample_rate: 44_100, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         }
         SaveFile::from_project(&p, Vec::new(), Some(studio_live::Rack::trap_kit()))
     }

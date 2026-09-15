@@ -174,7 +174,7 @@ fn finish(
     let len = Ticks::from_samples(frames as i64, sample_rate);
     let ops = vec![
         Op::AddSource {
-            source: Source { id: new_source, path: path.into(), len, sample_rate, channels: channels.len() as u16, has_video: false },
+            source: Source { id: new_source, path: path.into(), len, sample_rate, channels: channels.len() as u16, has_video: false, kind: studio_core::SourceKind::File },
         },
         Op::AddClip {
             clip: Clip { id: new_clip, source: new_source, track, pos: at, src_in: Ticks::ZERO, len, gain: 1.0, effects: Vec::new() },
@@ -283,7 +283,7 @@ mod tests {
         // apply — nothing here removes or mutates them, only adds.
         let mut project = Project { name: "t".into(), ..Default::default() };
         project.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
-        project.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "original.wav".into(), len: Ticks::from_seconds(2.0), sample_rate: SR, channels: 1, has_video: false } }).unwrap();
+        project.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "original.wav".into(), len: Ticks::from_seconds(2.0), sample_rate: SR, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         project.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(2.0), gain: 1.0, effects: Vec::new() } }).unwrap();
         let original_source = project.sources[&SourceId(1)].clone();
         let original_clip = project.clips[&ClipId(1)].clone();

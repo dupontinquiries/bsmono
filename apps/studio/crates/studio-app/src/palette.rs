@@ -668,7 +668,7 @@ mod tests {
         let mut p = project();
         p.apply(&Op::AddSource { source: studio_core::Source { id: studio_core::SourceId(1),
             path: "x".into(), len: studio_core::Ticks::from_seconds(10.0), sample_rate: 48_000,
-            channels: 1, has_video: false } }).unwrap();
+            channels: 1, has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: studio_core::Clip { id: studio_core::ClipId(1),
             source: studio_core::SourceId(1), track: TrackId(1), pos: studio_core::Ticks::ZERO,
             src_in: studio_core::Ticks::ZERO, len: studio_core::Ticks::from_seconds(1.0),

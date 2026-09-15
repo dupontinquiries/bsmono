@@ -246,7 +246,7 @@ mod tests {
         host.local(Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
             name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         host.local(Op::AddSource { source: Source { id: SourceId(1), path: "a.mov".into(),
-            len: Ticks::from_seconds(600.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
+            len: Ticks::from_seconds(600.0), sample_rate: 48_000, channels: 2, has_video: true, kind: studio_core::SourceKind::File } }).unwrap();
         for i in 0..150u64 {
             host.local(Op::AddClip { clip: Clip { id: ClipId(i), source: SourceId(1),
                 track: TrackId(1), pos: Ticks::from_seconds(i as f64 * 2.0), src_in: Ticks::ZERO,

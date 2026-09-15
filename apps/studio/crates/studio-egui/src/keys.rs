@@ -465,7 +465,7 @@ mod tests {
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
             name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "a".into(),
-            len: Ticks::from_seconds(100.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
+            len: Ticks::from_seconds(100.0), sample_rate: 48_000, channels: 2, has_video: true, kind: studio_core::SourceKind::File } }).unwrap();
         for (i, at) in [0.0f64, 5.0, 12.0].iter().enumerate() {
             p.apply(&Op::AddClip { clip: Clip { id: ClipId(i as u64), source: SourceId(1),
                 track: TrackId(1), pos: Ticks::from_seconds(*at), src_in: Ticks::ZERO,

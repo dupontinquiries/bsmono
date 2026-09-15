@@ -640,16 +640,118 @@ impl TempoMap {
     }
 }
 
+/// What a [`Source`] actually is.
+///
+/// Before this, every source was a file on disk, so a drum pattern had to be
+/// baked to audio once (`studio_live::render_pattern`) and imported like any
+/// other sample. That is why "Trap A" appears on the timeline as `demo.wav`:
+/// by the time the timeline saw it, the pattern was gone and only the render
+/// remained. The bake also froze it — editing the pattern did nothing to
+/// clips already placed, because they referenced the rendered file rather
+/// than the pattern.
+///
+/// Internally tagged and defaulting to [`SourceKind::File`], so a project
+/// written before this field existed still loads: absent `kind` means file,
+/// which is what every old source was.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SourceKind {
+    /// Audio or video decoded from [`Source::path`].
+    #[default]
+    File,
+    /// A generator: the project's pattern at `pattern` renders on demand.
+    ///
+    /// `name` is denormalised from the pattern deliberately. A clip must be
+    /// able to label itself without reaching into `project.patterns` — the
+    /// timeline draws clips for tracks whose pattern may have been removed,
+    /// and a clip that renders as a blank rectangle because its generator is
+    /// gone is worse than one that still says "Trap A" and reports itself
+    /// dangling.
+    Pattern { pattern: usize, name: String },
+}
+
+impl SourceKind {
+    pub fn is_generator(&self) -> bool {
+        matches!(self, SourceKind::Pattern { .. })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Source {
     pub id: SourceId,
 
+    /// Where the media lives, for [`SourceKind::File`]. Empty for a
+    /// generator, which has nothing on disk until it is exported.
     pub path: String,
     pub len: Ticks,
     pub sample_rate: u32,
     pub channels: u16,
     /// True when the source carries picture as well as sound.
-    pub has_video: bool,
+    pub has_video: bool, kind: SourceKind::File,
+    /// File or generator. Defaults to `File` so pre-existing projects load
+    /// unchanged.
+    #[serde(default)]
+    pub kind: SourceKind,
+}
+
+impl Source {
+    /// A file-backed source — what every source was before generators.
+    pub fn file(id: SourceId, path: impl Into<String>, len: Ticks, sample_rate: u32, channels: u16, has_video: bool) -> Source {, kind: SourceKind::File
+        Source { id, path: path.into(), len, sample_rate, channels, has_video, kind: SourceKind::File }
+    }
+
+    /// A pattern-backed generator source. No path: nothing is on disk.
+    pub fn pattern(id: SourceId, pattern: usize, name: impl Into<String>, len: Ticks, sample_rate: u32, channels: u16) -> Source {
+        let name = name.into();
+        Source {
+            id,
+            path: String::new(),
+            len,
+            sample_rate,
+            channels,
+            has_video: false, kind: SourceKind::File,
+            kind: SourceKind::Pattern { pattern, name },
+        }
+    }
+
+    pub fn is_generator(&self) -> bool {
+        self.kind.is_generator()
+    }
+
+    /// What the timeline should write on a clip of this source.
+    ///
+    /// The whole point of the type: a pattern says its own name, a file says
+    /// its stem. Callers must not derive this from `path` themselves — that
+    /// is the bug that put `demo.wav` on a drum pattern.
+    pub fn display_name(&self) -> &str {
+        match &self.kind {
+            SourceKind::Pattern { name, .. } => name,
+            SourceKind::File => {
+                // Stem without allocating: find the last separator and drop a
+                // trailing extension.
+                let file = self.path.rsplit(['/', '\\']).next().unwrap_or(&self.path);
+                match file.rfind('.') {
+                    // A dotfile ("..wav" or ".gitignore") has no stem before
+                    // the dot, so keep the whole name rather than returning
+                    // an empty label.
+                    Some(0) | None => file,
+                    Some(i) => &file[..i],
+                }
+            }
+        }
+    }
+
+    /// Is this source's generator still present?
+    ///
+    /// Takes a COUNT rather than the patterns themselves: `Pattern` lives in
+    /// `studio-live`, which depends on this crate, and reaching the other way
+    /// would invert that. The caller has the project.
+    pub fn generator_is_live(&self, pattern_count: usize) -> bool {
+        match &self.kind {
+            SourceKind::File => true,
+            SourceKind::Pattern { pattern, .. } => *pattern < pattern_count,
+        }
+    }
 }
 
 fn unity_gain() -> f32 { 1.0 }
@@ -1590,7 +1692,7 @@ mod tests {
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
             name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "a.wav".into(),
-            len: Ticks::from_seconds(30.0), sample_rate: 48_000, channels: 2, has_video: false } }).unwrap();
+            len: Ticks::from_seconds(30.0), sample_rate: 48_000, channels: 2, has_video: false, kind: SourceKind::File } }).unwrap();
         p
     }
     fn clip(id: u64, pos: f64, len: f64) -> Clip {
@@ -1742,7 +1844,7 @@ mod tests {
     fn removing_a_source_still_referenced_by_a_clip_is_refused() {
         let mut p = proj();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "a.wav".into(),
-            len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2, has_video: false } }).unwrap();
+            len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2, has_video: false, kind: SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),
             pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(2.0), gain: 1.0, effects: Vec::new() } }).unwrap();
         let err = p.apply(&Op::RemoveSource { id: SourceId(1) });
@@ -1756,7 +1858,7 @@ mod tests {
         let start = p.clone();
         let mut h = History::default();
         h.apply(&mut p, &Op::AddSource { source: Source { id: SourceId(1), path: "a.wav".into(),
-            len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2, has_video: false } }).unwrap();
+            len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2, has_video: false, kind: SourceKind::File } }).unwrap();
         assert_eq!(p.sources.len(), 1);
         h.undo(&mut p);
         assert_eq!(p, start, "adding then undoing a source must fully round-trip — the bug this fixes is that it previously didn't");
@@ -1775,7 +1877,7 @@ mod tests {
         let mut h = History::default();
         h.apply_group(&mut p, &[
             Op::AddSource { source: Source { id: SourceId(1), path: "take.wav".into(),
-                len: Ticks::from_seconds(4.0), sample_rate: 48_000, channels: 2, has_video: false } },
+                len: Ticks::from_seconds(4.0), sample_rate: 48_000, channels: 2, has_video: false, kind: SourceKind::File } },
             Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),
                 pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(4.0), gain: 1.0, effects: Vec::new() } },
         ]).unwrap();
@@ -1797,9 +1899,9 @@ mod tests {
         let mut p = proj();
         let mut h = History::default();
         h.apply(&mut p, &Op::AddSource { source: Source { id: SourceId(1), path: "original.wav".into(),
-            len: Ticks::from_seconds(5.0), sample_rate: 48_000, channels: 2, has_video: false } }).unwrap();
+            len: Ticks::from_seconds(5.0), sample_rate: 48_000, channels: 2, has_video: false, kind: SourceKind::File } }).unwrap();
         h.apply(&mut p, &Op::AddSource { source: Source { id: SourceId(1), path: "duplicate-delivery.wav".into(),
-            len: Ticks::from_seconds(5.0), sample_rate: 48_000, channels: 2, has_video: false } }).unwrap();
+            len: Ticks::from_seconds(5.0), sample_rate: 48_000, channels: 2, has_video: false, kind: SourceKind::File } }).unwrap();
         assert_eq!(p.sources[&SourceId(1)].path, "duplicate-delivery.wav");
 
         h.undo(&mut p);
@@ -2220,7 +2322,7 @@ mod group_and_bus_input_tests {
             at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
             len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 1,
-            has_video: false } }).unwrap();
+            has_video: false, kind: SourceKind::File } }).unwrap();
         for id in [1u64, 2] {
             p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(1),
                 track: TrackId(1), pos: Ticks::from_seconds(id as f64 * 2.0),
@@ -2248,7 +2350,7 @@ mod group_and_bus_input_tests {
             at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
             len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 1,
-            has_video: false } }).unwrap();
+            has_video: false, kind: SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
             track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO,
             len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
@@ -2296,7 +2398,7 @@ mod group_and_bus_input_tests {
             at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x.mov".into(),
             len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2,
-            has_video: true } }).unwrap();
+            has_video: true, kind: SourceKind::File } }).unwrap();
         for id in [1u64, 2] {
             p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(1),
                 track: TrackId(1), pos: Ticks::from_seconds(id as f64 * 2.0),
@@ -2356,7 +2458,7 @@ mod provenance_tests {
     fn project_with_source() -> Project {
         let mut p = Project::default();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "clip.mov".into(),
-            len: Ticks(100_000), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
+            len: Ticks(100_000), sample_rate: 48_000, channels: 2, has_video: true, kind: SourceKind::File } }).unwrap();
         p
     }
 
@@ -2433,7 +2535,7 @@ mod fingerprint_op_tests {
     fn project_with_source() -> Project {
         let mut p = Project::default();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "clip.mov".into(),
-            len: Ticks(100_000), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
+            len: Ticks(100_000), sample_rate: 48_000, channels: 2, has_video: true, kind: SourceKind::File } }).unwrap();
         p
     }
 
@@ -2543,7 +2645,7 @@ mod tempo_map_tests {
             at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
             len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 1,
-            has_video: false } }).unwrap();
+            has_video: false, kind: SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
             track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO,
             len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
@@ -2701,5 +2803,92 @@ mod key_and_marker_tests {
         assert_eq!(p.key.unwrap().name(), "D dorian");
         p.apply(&inv).unwrap();
         assert_eq!(p.key, None, "back to having no opinion");
+    }
+}
+
+#[cfg(test)]
+mod source_kind_tests {
+    use super::*;
+
+    /// The bug this type exists for: a drum pattern showed on the timeline as
+    /// `demo.wav`, because the only thing a source carried was a path to the
+    /// file it had been baked into.
+    #[test]
+    fn a_pattern_source_labels_itself_by_name_not_by_a_rendered_file() {
+        let s = Source::pattern(SourceId(1), 0, "Trap A", Ticks(10_000), 48_000, 2);
+        assert_eq!(s.display_name(), "Trap A");
+        assert!(s.is_generator());
+        assert!(s.path.is_empty(), "a generator has nothing on disk");
+    }
+
+    #[test]
+    fn a_file_source_labels_itself_by_stem() {
+        let f = |p: &str| Source::file(SourceId(1), p, Ticks(1), 48_000, 1, false).display_name().to_string();
+        assert_eq!(f("kick.wav"), "kick");
+        assert_eq!(f("/takes/day2/vox_04.flac"), "vox_04");
+        assert_eq!(f(r"C:\media\b-roll.mov"), "b-roll");
+        assert_eq!(f("no_extension"), "no_extension");
+        // Several dots: only the last is the extension.
+        assert_eq!(f("stem.take.3.wav"), "stem.take.3");
+    }
+
+    /// A dotfile has no stem before the dot. Returning "" would label the
+    /// clip with nothing at all, which is worse than an odd name.
+    #[test]
+    fn a_dotfile_keeps_its_whole_name() {
+        let f = |p: &str| Source::file(SourceId(1), p, Ticks(1), 48_000, 1, false).display_name().to_string();
+        assert_eq!(f(".gitignore"), ".gitignore");
+        assert_eq!(f("/a/b/.hidden"), ".hidden");
+        assert_eq!(f(""), "");
+    }
+
+    /// THE COMPATIBILITY TEST. Every project file written before `kind`
+    /// existed omits it, and must still load as a file source. If this
+    /// breaks, every saved project in the wild fails to open.
+    #[test]
+    fn a_source_saved_before_kind_existed_still_loads_as_a_file() {
+        let old = r#"{
+            "id": 7,
+            "path": "vox.wav",
+            "len": 480000,
+            "sample_rate": 48000,
+            "channels": 1,
+            "has_video": false
+        }"#;
+        let s: Source = serde_json::from_str(old).expect("pre-kind project must still parse");
+        assert_eq!(s.kind, SourceKind::File);
+        assert!(!s.is_generator());
+        assert_eq!(s.display_name(), "vox");
+    }
+
+    #[test]
+    fn source_kind_round_trips_through_json() {
+        for s in [
+            Source::file(SourceId(1), "a/b.wav", Ticks(5), 48_000, 2, false),
+            Source::pattern(SourceId(2), 3, "Trap A", Ticks(5), 48_000, 2),
+        ] {
+            let j = serde_json::to_string(&s).unwrap();
+            assert_eq!(serde_json::from_str::<Source>(&j).unwrap(), s, "round trip failed for {j}");
+        }
+    }
+
+    /// A pattern can be deleted while clips referencing it remain. The clip
+    /// must still be able to name itself and to report that it is dangling —
+    /// rendering a blank rectangle and leaving the user guessing is the
+    /// failure this guards.
+    #[test]
+    fn a_generator_whose_pattern_was_deleted_still_names_itself_but_reports_dangling() {
+        let s = Source::pattern(SourceId(1), 4, "Trap A", Ticks(10), 48_000, 2);
+        assert!(s.generator_is_live(5), "pattern 4 of 5 exists");
+        assert!(!s.generator_is_live(4), "pattern 4 is gone when only 0..3 remain");
+        assert!(!s.generator_is_live(0));
+        assert_eq!(s.display_name(), "Trap A", "still labels itself with the pattern gone");
+    }
+
+    /// A file source has no generator to dangle.
+    #[test]
+    fn a_file_source_is_always_live() {
+        let s = Source::file(SourceId(1), "x.wav", Ticks(1), 48_000, 1, false);
+        assert!(s.generator_is_live(0));
     }
 }

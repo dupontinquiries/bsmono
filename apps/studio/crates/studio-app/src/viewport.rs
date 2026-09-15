@@ -168,10 +168,10 @@ mod tests {
         }
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "a.mp4".into(),
             len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2,
-            has_video: true } }).unwrap();
+            has_video: true, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(2), path: "b.mp4".into(),
             len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2,
-            has_video: true } }).unwrap();
+            has_video: true, kind: studio_core::SourceKind::File } }).unwrap();
         // Top video track: a TRIMMED clip at 2s reading from 5s into a.mp4.
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
             track: TrackId(1), pos: Ticks::from_seconds(2.0),
@@ -214,7 +214,7 @@ mod tests {
             p.apply(&Op::AddTrack { track: Track { id: TrackId(10 + i as u64), kind: TrackKind::Video, name: (*name).into(),
                 muted: false, locked: false, gain: 1.0, route: None }, at: i }).unwrap();
             p.apply(&Op::AddSource { source: Source { id: SourceId(20 + i as u64), path: format!("{name}.mp4"),
-                len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
+                len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2, has_video: true, kind: studio_core::SourceKind::File } }).unwrap();
         }
         let mut blend = std::collections::BTreeMap::new();
         blend.insert("mode".to_string(), 2.0); // multiply

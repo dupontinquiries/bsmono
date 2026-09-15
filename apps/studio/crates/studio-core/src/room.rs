@@ -156,7 +156,7 @@ mod tests {
         // The route's bus need not exist for these tests; AddTrack does
         // not validate it, and `shadow_lane_ops` copies it verbatim.
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "take.wav".into(),
-            len: Ticks(100_000), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+            len: Ticks(100_000), sample_rate: 48_000, channels: 1, has_video: false, kind: crate::SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),
             pos: Ticks(1000), src_in: Ticks(500), len: Ticks(4000), gain: 1.0, effects: vec![] } }).unwrap();
         p

@@ -169,7 +169,7 @@ impl Studio {
         let new_clip = studio_core::ClipId(self.session.doc.project.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1);
         self.edit(
             studio_core::Op::AddSource {
-                source: studio_core::Source { id, path: path.display().to_string(), len, sample_rate: old.sample_rate, channels: old.channels, has_video: true },
+                source: studio_core::Source { id, path: path.display().to_string(), len, sample_rate: old.sample_rate, channels: old.channels, has_video: true, kind: studio_core::SourceKind::File },
             },
             "upscaled",
         );
@@ -206,7 +206,7 @@ mod tests {
         let mk = |id: u64, kind: TrackKind, name: &str| Track { id: TrackId(id), kind, name: name.into(), muted: false, locked: false, gain: 1.0, route: None };
         p.tracks.push(mk(1, TrackKind::Video, "V1"));
         p.tracks.push(mk(2, TrackKind::Video, "V2"));
-        p.sources.insert(SourceId(1), Source { id: SourceId(1), path: "/nowhere/take.mkv".into(), len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2, has_video: true });
+        p.sources.insert(SourceId(1), Source { id: SourceId(1), path: "/nowhere/take.mkv".into(), len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2, has_video: true, kind: studio_core::SourceKind::File });
         p.clips.insert(ClipId(1), Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1), pos: Ticks::from_seconds(1.0), src_in: Ticks::from_seconds(2.0), len: Ticks::from_seconds(3.0), gain: 1.0, effects: Vec::new() });
         let mut s = Studio::new(p, crate::SiteId(1), crate::Team::from_contacts("solo", &["sc-local".into()]));
         s.selection = vec![ClipId(1)];

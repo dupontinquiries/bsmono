@@ -275,7 +275,7 @@ mod tests {
     fn built() -> Project {
         let mut p = Project { name: "the cut".into(), ..Default::default() };
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "/takes/a b.wav".into(),
-            len: Ticks::from_seconds(120.0), sample_rate: 44_100, channels: 2, has_video: false } }).unwrap();
+            len: Ticks::from_seconds(120.0), sample_rate: 44_100, channels: 2, has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddBus { bus: studio_core::Bus {
             id: studio_core::BusId(1), name: "Vocals".into(), parent: None, gain: 0.8,
             chain: vec![Effect { kind: "eq".into(), params: Default::default(), enabled: true }],
@@ -507,7 +507,7 @@ mod automation_file_tests {
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
             name: "vox".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "a.wav".into(),
-            len: Ticks(10_000), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+            len: Ticks(10_000), sample_rate: 48_000, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),
             pos: Ticks(100), src_in: Ticks::ZERO, len: Ticks(500), gain: 1.0, effects: vec![] } }).unwrap();
         p.apply(&Op::SetCurve { id: CurveId(1), name: "dip".into() }).unwrap();

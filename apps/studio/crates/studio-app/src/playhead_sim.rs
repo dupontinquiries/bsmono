@@ -55,7 +55,7 @@ impl SimProject {
         let source_id = SourceId(self.fresh_id());
         self.project.sources.insert(
             source_id,
-            Source { id: source_id, path: label.to_string(), len: Ticks::from_seconds(src_in_sec + len_sec + 3600.0), sample_rate: 48000, channels: 2, has_video: true },
+            Source { id: source_id, path: label.to_string(), len: Ticks::from_seconds(src_in_sec + len_sec + 3600.0), sample_rate: 48000, channels: 2, has_video: true, kind: studio_core::SourceKind::File },
         );
         let clip_id = ClipId(self.fresh_id());
         self.project.clips.insert(

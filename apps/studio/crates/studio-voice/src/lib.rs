@@ -359,7 +359,7 @@ mod tests {
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
             name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "take.wav".into(),
-            len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+            len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),
             pos: Ticks::from_seconds(100.0), src_in: Ticks::from_seconds(20.0),
             len: Ticks::from_seconds(20.0), gain: 1.0, effects: Vec::new() } }).unwrap();

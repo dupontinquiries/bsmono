@@ -898,7 +898,7 @@ mod tests {
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
             name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "t.wav".into(),
-            len: Ticks::from_seconds(len_s), sample_rate: rate, channels: 1, has_video: false } }).unwrap();
+            len: Ticks::from_seconds(len_s), sample_rate: rate, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),
             pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(len_s),
             gain, effects: Vec::new() } }).unwrap();
@@ -1668,7 +1668,7 @@ mod tests {
         let mut audio2 = audio.clone();
         audio2.insert(studio_core::SourceId(2), tone(24_000, 48_000, 660.0, 0.5));
         p.apply(&Op::AddSource { source: Source { id: studio_core::SourceId(2), path: "b.wav".into(),
-            len: Ticks::from_seconds(0.5), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+            len: Ticks::from_seconds(0.5), sample_rate: 48_000, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(2), source: studio_core::SourceId(2), track: TrackId(2),
             pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(0.5), gain: 1.0, effects: Vec::new() } }).unwrap();
 
@@ -1707,7 +1707,7 @@ mod track_fader_tests {
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
             name: "A1".into(), muted: false, locked: false, gain: track_gain, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
-            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
             track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO,
             len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
@@ -1747,7 +1747,7 @@ mod source_rate_tests {
             name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
             len: Ticks::from_seconds(1.0), sample_rate: 24_000, channels: 1,
-            has_video: false } }).unwrap();
+            has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
             track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO,
             len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
@@ -1778,7 +1778,7 @@ mod automation_render_tests {
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
             name: "A1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
-            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
             track: TrackId(1), pos: Ticks::ZERO, src_in: Ticks::ZERO,
             len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
@@ -1971,7 +1971,7 @@ mod binding_render_tests {
                 name: format!("A{id}"), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         }
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
-            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
             track: TrackId(1), pos: Ticks::from_seconds(0.2), src_in: Ticks::ZERO,
             len: Ticks::from_seconds(0.2), gain: 1.0, effects: vec![] } }).unwrap();
@@ -2375,7 +2375,7 @@ mod render_speed_tests {
                             * std::f32::consts::TAU).sin() * 0.2).collect()] };
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "s".into(),
             len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1,
-            has_video: false } }).unwrap();
+            has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
         let mut cid = 1u64;
         for t in 0..tracks {
             let id = TrackId(t as u64 + 1);

@@ -167,7 +167,7 @@ mod tests {
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "vox".into(),
             muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "take.wav".into(),
-            len: Ticks(100_000), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+            len: Ticks(100_000), sample_rate: 48_000, channels: 1, has_video: false, kind: crate::SourceKind::File } }).unwrap();
         for i in 0..3u64 {
             p.apply(&Op::AddClip { clip: Clip { id: ClipId(i + 1), source: SourceId(1), track: TrackId(1),
                 pos: Ticks(i as i64 * 1000), src_in: Ticks(i as i64 * 1000), len: Ticks(1000),
@@ -232,7 +232,7 @@ mod tests {
         p.apply(&Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Video, name: "b-roll".into(),
             muted: false, locked: false, gain: 1.0, route: None }, at: 1 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(2), path: "cutaway.mp4".into(),
-            len: Ticks(100_000), sample_rate: 48_000, channels: 0, has_video: true } }).unwrap();
+            len: Ticks(100_000), sample_rate: 48_000, channels: 0, has_video: true, kind: crate::SourceKind::File } }).unwrap();
         // Clip 4 on track 2, positioned to overlap clip 2's timeline span --
         // legal, since different tracks never collide with each other.
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(4), source: SourceId(2), track: TrackId(2),
@@ -275,7 +275,7 @@ mod tests {
             p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "t".into(),
                 muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
             p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "s.wav".into(),
-                len: Ticks(1_000_000), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+                len: Ticks(1_000_000), sample_rate: 48_000, channels: 1, has_video: false, kind: crate::SourceKind::File } }).unwrap();
 
             // 2-5 non-overlapping clips, random lengths and gaps.
             let n = rng.range(2, 6);

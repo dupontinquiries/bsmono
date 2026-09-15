@@ -354,7 +354,7 @@ impl Studio {
                 name: (*nm).into(), muted: false, locked: false, gain: 1.0, route: None }, at: i }).ok();
         }
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "takes/demo.wav".into(),
-            len: Ticks::from_seconds(600.0), sample_rate: 48_000, channels: 2, has_video: true } }).ok();
+            len: Ticks::from_seconds(600.0), sample_rate: 48_000, channels: 2, has_video: true, kind: studio_core::SourceKind::File } }).ok();
         for i in 0..6u64 {
             p.apply(&Op::AddClip { clip: Clip { id: ClipId(i + 1), source: SourceId(1),
                 track: TrackId(i % 3 + 1), pos: Ticks::from_seconds(i as f64 * 3.5),
@@ -474,12 +474,13 @@ impl Studio {
         let new_clip = studio_core::ClipId(
             self.session.doc.project.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1);
         let old = self.session.doc.project.sources.get(&clip.source)?.clone();
-        let path = format!("tuned/{}-{}.wav",
-            std::path::Path::new(&old.path).file_stem()
-                .and_then(|s| s.to_str()).unwrap_or("take"), id.0);
+        // display_name(), not the path stem: a pattern source has no path, so
+        // stemming it yields the "take" fallback and every tuned pattern in a
+        // project collides on "take-N.wav". The name is the identity.
+        let path = format!("tuned/{}-{}.wav", old.display_name(), id.0);
         self.edit(studio_core::Op::AddSource { source: studio_core::Source {
             id, path, len: studio_core::Ticks::from_samples(tuned.frames() as i64, rate),
-            sample_rate: rate, channels: tuned.channels.len() as u16, has_video: false,
+            sample_rate: rate, channels: tuned.channels.len() as u16, has_video: false, kind: studio_core::SourceKind::File,
         } }, "tuned");
         // The tuned copy needs somewhere to live: the same track is occupied
         // by the dry take, so it goes to the first audio track with room —
@@ -1976,7 +1977,7 @@ impl Studio {
                 id, path: path.into(), len,
                 sample_rate: audio.sample_rate,
                 channels: audio.channels.len() as u16,
-                has_video: false,
+                has_video: false, kind: studio_core::SourceKind::File,
             },
         }, "imported");
         self.edit(studio_core::Op::AddClip {
@@ -1993,7 +1994,7 @@ impl Studio {
     /// Land a VIDEO on the timeline: the C12-6a join, finally legal to
     /// make because `studio_video::frame_rgb` + the viewport can decode
     /// and display a frame (the gate that section set). The source is the
-    /// video FILE — `has_video: true`, length from the probe (a video may
+    /// video FILE — `has_video: true`, kind: studio_core::SourceKind::File, length from the probe (a video may
     /// outlast its own audio) — and the clip lands on a video track at the
     /// playhead. Where `import_clip` REFUSES when no audio track has room,
     /// this CREATES a video track when none has room: §6's own words are
@@ -2049,7 +2050,7 @@ impl Studio {
             source: studio_core::Source {
                 id, path: path.into(), len,
                 sample_rate, channels,
-                has_video: true,
+                has_video: true, kind: studio_core::SourceKind::File,
             },
         }, "imported");
         self.edit(studio_core::Op::AddClip {
@@ -2136,7 +2137,7 @@ impl Studio {
                     len: Ticks::from_samples(audio.frames() as i64, audio.sample_rate),
                     sample_rate: audio.sample_rate,
                     channels: audio.channels.len() as u16,
-                    has_video: false,
+                    has_video: false, kind: studio_core::SourceKind::File,
                 },
             }, "pack sample");
             remap.insert(*old, id);
@@ -2205,7 +2206,7 @@ impl Studio {
                 len: studio_core::Ticks::from_samples(audio.frames() as i64, audio.sample_rate),
                 sample_rate: audio.sample_rate,
                 channels: audio.channels.len() as u16,
-                has_video: false,
+                has_video: false, kind: studio_core::SourceKind::File,
             },
         }, "imported");
         let ch = self.rack.add_channel(studio_live::Channel {
@@ -2543,7 +2544,7 @@ mod tests {
     }
 
 
-    /// C12-6a's join, headless: a video import carries has_video: true and
+    /// C12-6a's join, headless: a video import carries has_video: true and, kind: studio_core::SourceKind::File
     /// lands on a video track — creating one when none has room, because
     /// §6's words are "give the timeline a video track to put it on" and
     /// AddTrack is an ordinary undoable op.
@@ -2583,7 +2584,7 @@ mod tests {
         a.edit(studio_core::Op::AddSource { source: studio_core::Source {
             id: sid, path: wav.display().to_string(),
             len: studio_core::Ticks::from_samples(frames as i64, rate),
-            sample_rate: rate, channels: 1, has_video: false } }, "s");
+            sample_rate: rate, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }, "s");
         a.rack.channels.push(studio_live::Channel {
             name: "clap".into(),
             kind: studio_live::SynthKind::Sampler { source: sid },
@@ -4302,7 +4303,7 @@ impl eframe::App for App {
                                     path: p.display().to_string(), len,
                                     sample_rate: audio.sample_rate,
                                     channels: audio.channels.len() as u16,
-                                    has_video: false } }, "sample");
+                                    has_video: false, kind: studio_core::SourceKind::File } }, "sample");
                             let cid = studio_core::ClipId(
                                 self.studio.session.doc.project.clips.keys()
                                     .map(|x| x.0).max().unwrap_or(0) + 1);
@@ -4387,7 +4388,7 @@ impl eframe::App for App {
             let name = path.file_stem().and_then(|s| s.to_str())
                 .unwrap_or("sample").to_owned();
             // Video takes the ffmpeg door, BEFORE decode_bytes — symphonia
-            // cannot open an mp4, and the old flow's silent has_video:false
+            // cannot open an mp4, and the old flow's silent has_video: false, kind: studio_core::SourceKind::File
             // (C12-6a's finding) began exactly here. To the rack, a video
             // is its audio (refusing a video's audio to a sampler would be
             // the tool overruling the musician — library.rs's own words);
@@ -6952,7 +6953,7 @@ mod asset_transfer_tests {
         let src = studio_core::SourceId(99);
         a.edit(studio_core::Op::AddSource { source: studio_core::Source {
             id: src, path: "blob.bin".into(), len: Ticks::from_seconds(1.0),
-            sample_rate: 48_000, channels: 1, has_video: false } }, "seeded");
+            sample_rate: 48_000, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }, "seeded");
         a.register_asset(src, &data);
 
         // Hand-deliver: op+manifest to B, then B's chunk request to A, then
@@ -6996,7 +6997,7 @@ mod asset_transfer_tests {
         b.drain_outbox();
         a.edit(studio_core::Op::AddSource { source: studio_core::Source {
             id: src_a, path: "kick.bin".into(), len: Ticks::from_seconds(1.0),
-            sample_rate: 48_000, channels: 1, has_video: false } }, "seeded");
+            sample_rate: 48_000, channels: 1, has_video: false, kind: studio_core::SourceKind::File } }, "seeded");
         a.register_asset(src_a, &sample);
         let mut replies = Vec::new();
         for p in a.drain_outbox() { replies.extend(b.integrate_packet(p, 0)); }
@@ -8573,7 +8574,7 @@ mod alignment_tests {
             let len = Ticks::from_samples(a.frames() as i64, 48_000);
             s.edit(Op::AddSource { source: Source { id: SourceId(sid),
                 path: format!("takes/{sid}.wav"), len, sample_rate: 48_000,
-                channels: 1, has_video: false } }, "src");
+                channels: 1, has_video: false, kind: studio_core::SourceKind::File } }, "src");
             audio.insert(SourceId(sid), a);
         }
         // Far past the demo clips, on the two audio tracks, same position:

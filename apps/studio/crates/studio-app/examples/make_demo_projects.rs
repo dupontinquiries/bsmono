@@ -46,9 +46,9 @@ fn loop_scenario() -> Studio {
     p.apply(&Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Video, name: "footage".into(),
         muted: false, locked: false, gain: 1.0, route: None }, at: 1 }).ok();
     p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "takes/beat.wav".into(),
-        len: Ticks::from_seconds(2.0), sample_rate: 48_000, channels: 2, has_video: false } }).ok();
+        len: Ticks::from_seconds(2.0), sample_rate: 48_000, channels: 2, has_video: false, kind: studio_core::SourceKind::File } }).ok();
     p.apply(&Op::AddSource { source: Source { id: SourceId(2), path: "footage/clip.mp4".into(),
-        len: Ticks::from_seconds(30.0), sample_rate: 48_000, channels: 0, has_video: true } }).ok();
+        len: Ticks::from_seconds(30.0), sample_rate: 48_000, channels: 0, has_video: true, kind: studio_core::SourceKind::File } }).ok();
     // The beat pattern: a 2-second drum loop tiled across the first 8
     // seconds, matching how a pattern actually gets "tiled in the timeline"
     // rather than looped by the transport.

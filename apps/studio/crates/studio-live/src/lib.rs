@@ -1324,7 +1324,7 @@ pub fn bounce_ops(
         studio_core::Op::AddSource {
             source: studio_core::Source {
                 id: source, path: path.into(), len,
-                sample_rate: rate, channels: 1, has_video: false,
+                sample_rate: rate, channels: 1, has_video: false, kind: studio_core::SourceKind::File,
             },
         },
         studio_core::Op::AddClip {
@@ -1408,7 +1408,7 @@ impl Recorder {
             studio_core::Op::AddSource {
                 source: studio_core::Source {
                     id: source, path: path.into(), len,
-                    sample_rate: self.rate, channels: self.channels, has_video: false,
+                    sample_rate: self.rate, channels: self.channels, has_video: false, kind: studio_core::SourceKind::File,
                 },
             },
             studio_core::Op::AddClip {

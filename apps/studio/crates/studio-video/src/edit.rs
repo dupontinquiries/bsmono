@@ -186,7 +186,7 @@ mod tests {
             muted: false, locked: false, gain: 1.0, route: None }, at: 2 }).unwrap();
         for id in paths.keys() {
             p.apply(&Op::AddSource { source: Source { id: *id, path: paths[id].to_string_lossy().into_owned(),
-                len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 1, has_video: true } }).unwrap();
+                len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 1, has_video: true, kind: studio_core::SourceKind::File } }).unwrap();
         }
         p
     }

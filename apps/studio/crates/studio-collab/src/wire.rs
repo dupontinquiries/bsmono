@@ -374,7 +374,7 @@ fn put_source(o: &mut Vec<u8>, s: &Source) {
 fn get_source(r: &mut R) -> Option<Source> {
     Some(Source {
         id: SourceId(r.u64()?), path: r.str()?, len: r.ticks()?,
-        sample_rate: r.u32()?, channels: r.u16()?, has_video: r.u8()? != 0,
+        sample_rate: r.u32()?, channels: r.u16()?, has_video: r.u8()? != 0, kind: studio_core::SourceKind::File,
     })
 }
 
@@ -1226,7 +1226,7 @@ mod tests {
             Op::SetGain { id: ClipId(9), gain: 0.125 },
             Op::SetEffects { id: ClipId(9), effects: effects() },
             Op::AddSource { source: Source { id: SourceId(3), path: "/takes/vox 03.wav".into(),
-                len: Ticks::from_seconds(90.0), sample_rate: 44_100, channels: 1, has_video: false } },
+                len: Ticks::from_seconds(90.0), sample_rate: 44_100, channels: 1, has_video: false, kind: studio_core::SourceKind::File } },
             Op::AddBus { bus: Bus {
                 id: BusId(5), name: "808 — sub".into(), parent: Some(BusId(1)), gain: 0.9,
                 chain: effects(),
@@ -1519,7 +1519,7 @@ mod tests {
         host.local(Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
             name: "V1".into(), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
         host.local(Op::AddSource { source: Source { id: SourceId(1), path: "a.mov".into(),
-            len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
+            len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2, has_video: true, kind: studio_core::SourceKind::File } }).unwrap();
         for i in 0..6u64 {
             host.local(Op::AddClip { clip: Clip { id: ClipId(i), source: SourceId(1), track: TrackId(1),
                 pos: Ticks::from_seconds(i as f64 * 5.0), src_in: Ticks::ZERO,

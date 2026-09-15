@@ -150,7 +150,7 @@ mod tests {
             muted: false, locked: false, gain: 1.0, route: None }, at: 1 }).unwrap();
         for s in 1..=4 {
             p.apply(&Op::AddSource { source: Source { id: SourceId(s), path: format!("take{s}"),
-                len: Ticks(10_000), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+                len: Ticks(10_000), sample_rate: 48_000, channels: 1, has_video: false, kind: crate::SourceKind::File } }).unwrap();
         }
         p
     }

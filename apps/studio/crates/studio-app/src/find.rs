@@ -241,7 +241,7 @@ mod tests {
             };
             p.apply(&Op::AddSource { source: Source { id, path: (*name).into(),
                 len: Ticks::from_seconds(0.5), sample_rate: 48_000, channels: 1,
-                has_video: false } }).unwrap();
+                has_video: false, kind: studio_core::SourceKind::File } }).unwrap();
             audio.insert(id, a);
         }
         for t in 0..2u64 {
