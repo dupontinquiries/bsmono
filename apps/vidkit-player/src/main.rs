@@ -661,6 +661,18 @@ impl Player {
         };
         self.transport.position = Duration::ZERO;
         self.started = Instant::now();
+        // Was missing entirely: `open_local` only demuxes far enough to
+        // build the metadata label (codec, dimensions, packet count) --
+        // it never starts a real, ongoing decoder. The app's own
+        // constructor already does this correctly for a file passed on
+        // the command line (`decode::FfmpegFrames::open(p, Some(1920))`,
+        // right after its own `open_local` call); this runtime re-open
+        // path (drag-drop, the file picker) never had the same second
+        // step, so nothing ever actually played after the first file --
+        // confirmed against the reported "not playing anything from
+        // files or clipboard," which routes through this exact function.
+        self.frames = decode::FfmpegFrames::open(&path, Some(1920)).ok();
+        self.audio = decode::AudioStream::open(&path.to_string_lossy(), 48_000, 2, Duration::ZERO).ok();
         self.path = Some(path);
         self.opened = Some(result);
     }
@@ -1025,9 +1037,13 @@ impl Player {
         let url = match &what {
             vidkit_ytdlp::Paste::Video { url, .. } => url.clone(),
             vidkit_ytdlp::Paste::LocalFile(p) => {
-                self.opened = Some(open_local(p));
-                self.path = Some(p.clone());
-                self.apply_opened();
+                // Was open_local(p) + apply_opened() inline, a second copy
+                // of load()'s own sequence -- and the copy that never got
+                // the real-decode fix load() needed. Calling load()
+                // directly means there is exactly one place that knows
+                // how to actually open a local file, not two that can
+                // silently drift.
+                self.load(p.clone());
                 return;
             }
             other => {
