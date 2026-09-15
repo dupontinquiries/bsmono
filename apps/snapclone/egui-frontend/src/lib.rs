@@ -52,6 +52,10 @@ pub mod ring;
 pub mod qr;
 pub mod wayfinder;
 pub mod voicebar;
+/// The group-call coordinator: what wires capture, the floor session and the
+/// three views into an actual call. Ported from Qt's GroupVoiceCoordinator,
+/// whose behaviour lived entirely in its `connect()` calls.
+pub mod voice_coord;
 pub mod landmark;
 pub mod export_reminder;
 pub mod nav_chrome;

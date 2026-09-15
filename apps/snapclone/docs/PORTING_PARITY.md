@@ -33,8 +33,8 @@ starts hidden with the auto-login ordering rule.
 | ExportReminderCard | ported | export_reminder.rs — monthly gate, snooze, auto-sync escape hatch |
 | FriendListWidget | ported | friends.rs `Roster` + `AddForm` — dedupe by id, empty state, three address formats |
 | GroupVoiceBar | ported | voicebar.rs — swipe-to-latch, eased transmit meter, Securing as its own tier |
-| GroupVoiceCoordinator | pending |  |
-| GroupVoiceRoster | pending |  |
+| GroupVoiceCoordinator | ported | voice_coord.rs — join/leave idempotent, ActivityGate mic rule (no hot mic on a locked phone), roster level only while we hold the floor, packets gated on the floor, inert mode |
+| GroupVoiceRoster | ported | roster.rs — active speaker, eased ring level, speaking floor. (Ledger was stale: this was ported and still listed pending.) |
 | HelpManualDialog | pending |  |
 | InboxWidget | pending |  |
 | IncomingCallDialog | ported | ring.rs `IncomingCall` — 30s auto-decline, first-answer-wins, ring derived from outcome |
