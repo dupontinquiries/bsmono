@@ -818,3 +818,161 @@ fn copy_path(src: &Path, dst: &Path) -> Result<u64, String> {
     }
     Err(format!("{} does not exist", src.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── flag parsing -- the primary argument mechanism for nearly every
+    // command in this file, so a bug here has broad reach. No test
+    // module existed in this file at all before this pass. ──
+
+    #[test]
+    fn flag_val_finds_the_value_following_the_named_flag() {
+        let args = vec!["--store".to_string(), "/tmp/x".to_string()];
+        assert_eq!(flag_val(&args, "--store"), Some("/tmp/x".to_string()));
+    }
+
+    #[test]
+    fn flag_val_returns_none_when_the_flag_is_the_last_argument() {
+        // The flag is present but nothing follows it -- `.get(i+1)` must
+        // return None cleanly, not panic on an out-of-bounds index. A
+        // real, plausible user mistake (`dvm catalog scan --uuid`,
+        // forgetting the value), not a contrived case.
+        let args = vec!["scan".to_string(), "--uuid".to_string()];
+        assert_eq!(flag_val(&args, "--uuid"), None);
+    }
+
+    #[test]
+    fn flag_val_returns_none_when_the_flag_is_absent() {
+        let args = vec!["scan".to_string(), "/mnt".to_string()];
+        assert_eq!(flag_val(&args, "--label"), None);
+    }
+
+    #[test]
+    fn flag_val_uses_the_first_occurrence_when_a_flag_repeats() {
+        // .position() finds the FIRST match -- pinned explicitly, since
+        // a change to .rposition() or an unnoticed swap would silently
+        // start honoring the LAST occurrence instead, changing which
+        // value wins with no visible error.
+        let args = vec!["--label".to_string(), "first".to_string(),
+                         "--label".to_string(), "second".to_string()];
+        assert_eq!(flag_val(&args, "--label"), Some("first".to_string()));
+    }
+
+    #[test]
+    fn flag_val_does_not_validate_that_the_value_is_not_itself_a_flag() {
+        // Real, documented limitation, not a hypothetical: the parser is
+        // purely positional -- it has no concept of "a value cannot
+        // start with --". `--label --store` (label's value accidentally
+        // omitted, the next real flag swallowed as if it were the
+        // label) returns "--store" as label's value rather than
+        // detecting the mistake. Pinned so this stays a known, visible
+        // shape of the parser rather than something to `flag_val` no
+        // longer being an eager scan.
+        let args = vec!["--label".to_string(), "--store".to_string(), "/tmp".to_string()];
+        assert_eq!(flag_val(&args, "--label"), Some("--store".to_string()),
+            "KNOWN LIMITATION: the parser cannot tell a missing value from an adjacent flag -- \
+             if this ever changes, that likely means someone added validation; update this test \
+             and its comment together");
+    }
+
+    #[test]
+    fn flag_value_and_flag_val_agree_on_the_same_input() {
+        // Two near-identical functions doing the same lookup with
+        // different return types (&str vs String) is a real duplication
+        // risk: a fix applied to one could be forgotten in the other.
+        // Confirmed they agree here as a tripwire -- if they ever
+        // diverge, this is the test that will catch it.
+        let args = vec!["--store".to_string(), "/tmp/x".to_string()];
+        assert_eq!(flag_value(&args, "--store"), Some("/tmp/x"));
+        assert_eq!(flag_val(&args, "--store").as_deref(), Some("/tmp/x"));
+    }
+
+    // ── store_dir: pure aside from reading XDG_DATA_HOME/HOME via
+    // catalog::default_store, which was already exercised on its own. ──
+
+    #[test]
+    fn store_dir_honors_an_explicit_override() {
+        let args = vec!["--store".to_string(), "/custom/path".to_string()];
+        assert_eq!(store_dir(&args), PathBuf::from("/custom/path"));
+    }
+
+    // ── copy_path: real filesystem writes, used by cmd_apply to
+    // actually move suggested changes onto disk. ──
+
+    #[test]
+    fn copy_path_creates_missing_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, b"hello").unwrap();
+        let dst = dir.path().join("a/b/c/dst.txt");
+        let n = copy_path(&src, &dst).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn copy_path_skips_a_destination_that_already_exists_at_the_same_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, b"hello").unwrap();
+        let dst = dir.path().join("dst.txt");
+        std::fs::write(&dst, b"hello").unwrap(); // pre-existing, same size
+        let n = copy_path(&src, &dst).unwrap();
+        assert_eq!(n, 0, "already present at the same size -- reported as zero newly-copied files");
+    }
+
+    #[test]
+    fn copy_path_refuses_to_silently_overwrite_a_same_named_different_sized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, b"hello").unwrap();
+        let dst = dir.path().join("dst.txt");
+        std::fs::write(&dst, b"a completely different, longer file").unwrap();
+        let err = copy_path(&src, &dst).expect_err("a size mismatch must not be silently resolved either way");
+        assert!(err.contains("different size"), "{err}");
+    }
+
+    #[test]
+    fn copy_path_does_not_verify_content_when_sizes_merely_match() {
+        // Real, documented limitation: two files of the SAME size but
+        // DIFFERENT content at the destination are treated as "already
+        // copied, skip" -- there is no hash check here, only a length
+        // comparison. This mirrors exactly the class of bug fixed in
+        // syncdiff.rs this same session (name+size alone is not proof
+        // of identity) but is NOT fixed here: changing this would mean
+        // hashing every file on every apply, a real cost/correctness
+        // tradeoff, not obviously the wrong call, and not this test's
+        // job to silently assume away. Pinned as the current, real
+        // behavior rather than left to surprise someone later as a
+        // "why didn't my file get copied" report.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, b"AAAAA").unwrap(); // 5 bytes
+        let dst = dir.path().join("dst.txt");
+        std::fs::write(&dst, b"ZZZZZ").unwrap(); // also 5 bytes, different content
+        let n = copy_path(&src, &dst).unwrap();
+        assert_eq!(n, 0, "KNOWN LIMITATION: same size is treated as identical regardless of content");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"ZZZZZ",
+            "the destination's original (different) content is left in place, unreplaced");
+    }
+
+    #[test]
+    fn copy_path_recurses_through_a_directory_tree_and_counts_only_new_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("srcdir");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("sub/b.txt"), b"bb").unwrap();
+        let dst = dir.path().join("dstdir");
+        // Pre-seed one file at the destination, already matching --
+        // this must count as 0 new copies for that one file, while the
+        // other is genuinely new.
+        std::fs::create_dir_all(dst.join("sub")).unwrap();
+        std::fs::write(dst.join("sub/b.txt"), b"bb").unwrap();
+        let n = copy_path(&src, &dst).unwrap();
+        assert_eq!(n, 1, "only a.txt should count as newly copied; sub/b.txt already matched");
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"a");
+    }
+}
