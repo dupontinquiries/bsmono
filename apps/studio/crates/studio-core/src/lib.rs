@@ -367,6 +367,25 @@ pub struct Group {
     /// Members are never touched by a window. Two comps can show
     /// non-overlapping halves of the SAME clips, and deleting one leaves the
     /// material whole.
+    ///
+    /// ## What a window does NOT do: change what you hear
+    ///
+    /// I twice wrote that "playback must honour the window or a trimmed comp
+    /// still sounds whole". That was wrong, and worth correcting here rather
+    /// than leaving as a phantom to-do.
+    ///
+    /// A group gates nothing audible. It carries a name, a membership, a
+    /// key, a tempo map and an active TAKE — playback reads clips off tracks
+    /// and never consults a group at all. So splitting a comp changes what a
+    /// gesture grabs and what the fold draws, and changes nothing about the
+    /// mix. Which is correct and is the same rule clips already follow:
+    /// splitting a clip does not change what you hear either.
+    ///
+    /// Removing half a comp is the case where a user might expect audio to
+    /// change, and it does not: `RemoveGroup` removes the VIEW. Deleting the
+    /// material is a separate gesture on the clips, which is the right split
+    /// of responsibilities — a fold is not a container, and unfolding must
+    /// never be able to lose a take.
     #[serde(default)]
     pub window: Option<(Ticks, Ticks)>,
     /// This song's own tempo map, independent of every other song's.
@@ -1425,6 +1444,15 @@ impl Project {
                 }
                 if let Some(active) = old.active {
                     restores.push(Op::SetGroupActive { id: *id, active: Some(active) });
+                }
+                // The window has the same property the comment above names:
+                // `SetGroup`'s preservation logic reads the EXISTING group,
+                // and by the time this inverse runs there is none. Omitted,
+                // undoing the deletion of a trimmed comp restored it
+                // untrimmed — the material would reappear correct and the view
+                // would silently widen.
+                if let Some(window) = old.window {
+                    restores.push(Op::SetGroupWindow { id: *id, window: Some(window) });
                 }
                 if restores.len() == 1 {
                     Ok(restores.pop().unwrap())
@@ -3163,5 +3191,28 @@ mod source_kind_tests {
     fn an_unknown_group_shows_nothing_rather_than_panicking() {
         let (p, _) = comp_project();
         assert!(p.group_members_in_window(GroupId(99)).is_empty());
+    }
+
+    /// Undo of a deleted comp must restore its TRIM too, not just its members.
+    /// key/tempo/active are bundled into RemoveGroup's inverse for a stated
+    /// reason; the window has the same property and was missed.
+    #[test]
+    fn undoing_a_deleted_comp_restores_its_window() {
+        let (mut p, g) = comp_project();
+        for op in p.split_group_ops(g, Ticks(150), GroupId(2)).unwrap() { p.apply(&op).unwrap(); }
+        assert_eq!(p.group_span(g), Some((Ticks(0), Ticks(150))));
+        let inv = p.apply(&Op::RemoveGroup { id: g }).unwrap();
+        assert!(!p.groups.contains_key(&g));
+        p.apply(&inv).unwrap();
+        assert_eq!(p.group_span(g), Some((Ticks(0), Ticks(150))),
+            "the trim came back with it");
+    }
+
+    /// An untrimmed comp's undo stays the single op it always was.
+    #[test]
+    fn undoing_a_plain_comp_is_still_one_op() {
+        let (mut p, g) = comp_project();
+        let inv = p.apply(&Op::RemoveGroup { id: g }).unwrap();
+        assert!(matches!(inv, Op::SetGroup { .. }), "not wrapped in a Group: {inv:?}");
     }
 }
