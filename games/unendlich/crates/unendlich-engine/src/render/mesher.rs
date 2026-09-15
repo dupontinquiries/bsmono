@@ -3381,6 +3381,47 @@ fn top_subdivision() -> i32 {
     })
 }
 
+/// r-subdivision-lod-vector: the same "LOD + vector, not just LOD +
+/// distance" treatment already applied to plant stamping
+/// (`plant_stamp_budget_for_chunk`), applied here to weathered-top
+/// subdivision -- confirmed by the live diagnostics as frequently the
+/// LARGER of the two absolute triangle contributors (e.g. 147968 of
+/// ~170588 total tris in one diagnosed chunk, before the flat
+/// UNENDLICH_TOP_SUBDIVISION knob was even applied). A block behind the
+/// player or far away now gets a coarser subdivision grid instead of the
+/// full detail level.
+///
+/// `pos` is the specific block's world position (not a chunk center --
+/// both call sites inside `emit_subdivided_top` already have their exact
+/// block_wx/wy/wz on hand, so this uses real per-block granularity for
+/// free rather than approximating from the chunk center the way the plant
+/// budget does at chunk granularity).
+///
+/// Reuses `plant_budget_scale_for_urgency`'s Now/Soon/Defer scale even
+/// though it was named for stamp counts: subdivision quad count is
+/// nsub^2, so a linear triangle-count scale factor becomes an nsub
+/// multiplier via its square root (a 0.15 triangle-scale needs nsub
+/// scaled by ~0.39, since 0.39^2 ~= 0.15, to land back on the intended
+/// triangle reduction). Same player-view snapshot as plants
+/// (`player_view_for_plant_lod` -- despite the name this is now a
+/// general "current player view for chunk-decoration LOD" cache;
+/// renaming it is a reasonable follow-up, not done here to keep each
+/// commit to the one thing it's for).
+fn top_subdivision_for_block(pos: [f32; 3]) -> i32 {
+    let base = top_subdivision();
+    let Some((eye, yaw)) = player_view_for_plant_lod::get() else {
+        return base;
+    };
+    let cone = crate::sim::mesh_vision::ViewCone::player(eye, yaw, DECORATION_LOD_RANGE);
+    // Occlusion intentionally not plumbed in (see plant_stamp_budget_for_chunk's
+    // identical note) -- conservative, matching mesh_vision's own stated
+    // "conservative first pass" precedent.
+    let urgency = crate::sim::mesh_vision::urgency_for_cone(&cone, pos, false);
+    let tri_scale = crate::sim::mesh_vision::plant_budget_scale_for_urgency(urgency);
+    let nsub_scale = tri_scale.sqrt();
+    ((base as f32) * nsub_scale).round().clamp(1.0, 8.0) as i32
+}
+
 /// Hardware safety valve for `decorate_chunk_styled`'s plant-stamping pass
 /// (see that function's doc comment for the full "why" and the netcode/
 /// determinism reasoning). Default chosen to sit comfortably above what an
@@ -3430,6 +3471,13 @@ fn max_plant_stamps_per_chunk() -> u32 {
 // StemGroup (no new dependency, no locking, updated once per frame from the
 // main thread, read at most once per plant-stamping pass on a worker
 // thread).
+/// r-plant-lod-vector / r-subdivision-lod-vector: shared cone range for
+/// both chunk-decoration LOD consumers (plant stamping and weathered-top
+/// subdivision). Deliberately independent of render distance -- decoration
+/// past this range isn't worth discriminating further regardless of how
+/// far the world itself renders.
+const DECORATION_LOD_RANGE: f32 = 100.0;
+
 mod player_view_for_plant_lod {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -3522,16 +3570,15 @@ mod player_view_for_plant_lod {
 /// chunk_manager.rs's mesh-vision-sched shell-walk for the established
 /// convention this mirrors). Range and FOV reuse `ViewCone::player`'s
 /// existing defaults (~90° fov) rather than inventing a second set of
-/// tuning constants; `PLANT_LOD_RANGE` is deliberately independent of
+/// tuning constants; `DECORATION_LOD_RANGE` is deliberately independent of
 /// render distance -- plants past this range aren't worth discriminating
 /// further regardless of how far the world itself renders.
 fn plant_stamp_budget_for_chunk(chunk_center: [f32; 3]) -> u32 {
-    const PLANT_LOD_RANGE: f32 = 100.0;
     let base = max_plant_stamps_per_chunk();
     let Some((eye, yaw)) = player_view_for_plant_lod::get() else {
         return base;
     };
-    let cone = crate::sim::mesh_vision::ViewCone::player(eye, yaw, PLANT_LOD_RANGE);
+    let cone = crate::sim::mesh_vision::ViewCone::player(eye, yaw, DECORATION_LOD_RANGE);
     // Occlusion intentionally not plumbed in here -- conservative, matching
     // mesh_vision's own "conservative first pass" precedent (see that
     // module's doc): an occluded-but-in-cone chunk still gets Now/Soon's
@@ -3618,10 +3665,13 @@ pub(crate) fn emit_subdivided_top(
     let o01 = corner_y_offset_cached(chunk, block_wx,     slice, block_wz + 1, softness);
 
     // 9×9 vertex grid at the default 8 subdivisions; runtime-overridable
-    // via UNENDLICH_TOP_SUBDIVISION (1..=8). Index: i × (nsub+1) + j.
+    // via UNENDLICH_TOP_SUBDIVISION (1..=8), and now also scaled by the
+    // player's live distance+facing to this exact block (r-subdivision-
+    // lod-vector) -- falls back to the flat env-var value when no player
+    // view has been published (tests, headless tools). Index: i × (nsub+1) + j.
     // (named `nsub`, not `N`, because a module-level `const N: usize`
     // is in scope and `let N` would be read as a const-pattern.)
-    let nsub: i32 = top_subdivision();
+    let nsub: i32 = top_subdivision_for_block([block_wx as f32, block_wy as f32, block_wz as f32]);
     // r-mesh-diag: count this call and its quad output. See the
     // MeshDiagCounts doc for why this is safe to add unconditionally
     // (thread-local, read-only observer, zero behavior change).
@@ -5048,6 +5098,44 @@ mod tests {
             plant_stamp_budget_for_chunk(chunk_center),
             max_plant_stamps_per_chunk(),
             "with no player view published, the budget must be the flat default, unscaled"
+        );
+    }
+
+    /// r-subdivision-lod-vector: same "vector, not just distance" claim as
+    /// plant_budget_scales_by_facing_not_just_distance, for weathered-top
+    /// subdivision. Same shared-global-state care applies (see that test's
+    /// doc): calls only the pure function, resets before and after.
+    #[test]
+    fn subdivision_scales_by_facing_not_just_distance() {
+        player_view_for_plant_lod::reset_for_test();
+
+        let block_pos = [16.0, 16.0, 16.0];
+        let eye = [16.0, 16.0, -14.0]; // 30 blocks away on -Z, same as the plant test
+
+        player_view_for_plant_lod::set(eye, std::f32::consts::FRAC_PI_2); // facing toward it
+        let ahead_nsub = top_subdivision_for_block(block_pos);
+
+        player_view_for_plant_lod::set(eye, -std::f32::consts::FRAC_PI_2); // facing away
+        let behind_nsub = top_subdivision_for_block(block_pos);
+
+        player_view_for_plant_lod::reset_for_test();
+
+        assert!(
+            behind_nsub < ahead_nsub,
+            "same block, same distance, only facing differs -- behind ({behind_nsub}) must \
+             get coarser subdivision than ahead ({ahead_nsub})"
+        );
+        assert!(behind_nsub >= 1, "subdivision must never drop below 1 (a flat quad)");
+    }
+
+    #[test]
+    fn subdivision_falls_back_to_flat_default_with_no_player_view_published() {
+        player_view_for_plant_lod::reset_for_test();
+        let block_pos = [16.0, 16.0, 16.0];
+        assert_eq!(
+            top_subdivision_for_block(block_pos),
+            top_subdivision(),
+            "with no player view published, subdivision must be the flat default, unscaled"
         );
     }
 
