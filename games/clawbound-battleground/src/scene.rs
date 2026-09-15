@@ -3,6 +3,7 @@
 
 use glam::{Mat4, Vec3};
 
+use crate::blockers::{Blockers, PropKind};
 use crate::consts::{self, Lane, Team, ARENA_RADIUS};
 use crate::gods::{ROSTER, ROSTER_LEN};
 use crate::models;
@@ -37,6 +38,10 @@ pub struct Scene {
     pub arrow: [u64; 2],
     pub boulder: u64,
     pub total_voxels: usize,
+    /// Static prop collision, built alongside the meshes in `build_world` so
+    /// the two cannot disagree. Handed to `Game` by the app; see
+    /// `Game::blockers`.
+    pub blockers: std::sync::Arc<Blockers>,
 }
 
 /// One frustum-cullable batch of static world voxels.
@@ -121,7 +126,7 @@ impl Scene {
             arrow[ti] = r.upload_mesh(&a);
         }
 
-        let (chunk_builds, bird_mesh) = build_world();
+        let (chunk_builds, bird_mesh, blockers) = build_world();
         let mut chunks = Vec::new();
         for (mesh, center, radius, vsize) in chunk_builds {
             total += mesh.inst.len();
@@ -179,6 +184,7 @@ impl Scene {
             arrow,
             boulder,
             total_voxels: total,
+            blockers: std::sync::Arc::new(blockers),
         }
     }
 
@@ -510,71 +516,82 @@ fn bird_mesh() -> VoxelMesh {
     g.mesh(0.5, true)
 }
 
-fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh) {
+fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     const TAU: f32 = std::f32::consts::TAU;
     let mut pieces: Vec<Piece> = Vec::new();
+    // Cell pitch of 6 world units: most props sit in one cell, and a unit's
+    // query touches a 3x3 neighbourhood rather than scanning all ~400.
+    let mut blockers = Blockers::new(crate::consts::ARENA_RADIUS + 20.0, 6.0);
     let mut rng = Rng::new(0x5EED_1234);
     let mut v = 0i32;
 
     macro_rules! put {
-        ($mesh:expr, $x:expr, $z:expr, $y:expr, $q:expr, $vs:expr) => {
+        ($kind:ident; $mesh:expr, $x:expr, $z:expr, $y:expr, $q:expr, $vs:expr) => {{
+            // One call site, two outputs: the mesh the renderer draws and the
+            // blocker the sim collides against. Threading the PropKind through
+            // the macro rather than maintaining a second list of positions is
+            // what stops the two drifting -- a prop that moves takes its
+            // collision with it, and a new prop cannot be added without the
+            // compiler asking which PropKind it is.
+            blockers.push_prop(PropKind::$kind, $x, $z, $y, 1.0);
             pieces.push(Piece { mesh: $mesh, pos: Vec3::new($x, $y, $z), quarter: $q, vsize: $vs, sway: 0.0 })
-        };
+        }};
     }
     // flora: sways in the wind (weight scales the shader's height-based bend)
     macro_rules! plant {
-        ($mesh:expr, $x:expr, $z:expr, $y:expr, $q:expr, $vs:expr, $sw:expr) => {
+        ($kind:ident; $mesh:expr, $x:expr, $z:expr, $y:expr, $q:expr, $vs:expr, $sw:expr) => {{
+            blockers.push_prop(PropKind::$kind, $x, $z, $y, 1.0);
             pieces.push(Piece { mesh: $mesh, pos: Vec3::new($x, $y, $z), quarter: $q, vsize: $vs, sway: $sw })
-        };
+        }};
     }
 
     // --- playable jungle flora ---
     for _ in 0..56 {
         if let Some((x, z)) = jungle_spot(&mut rng, 8.5) {
-            plant!(props::jungle_tree(0.85 + rng.f32() * 0.35, v), x, z, 0.0, (v % 4) as u8, V_MED, 1.0);
+            plant!(JungleTree; props::jungle_tree(0.85 + rng.f32() * 0.35, v), x, z, 0.0, (v % 4) as u8, V_MED, 1.0);
         }
         v += 1;
     }
     for _ in 0..18 {
         if let Some((x, z)) = jungle_spot(&mut rng, 7.0) {
-            plant!(props::palm(0.9 + rng.f32() * 0.3, v), x, z, 0.0, (v % 4) as u8, V_MED, 1.6);
+            plant!(Palm; props::palm(0.9 + rng.f32() * 0.3, v), x, z, 0.0, (v % 4) as u8, V_MED, 1.6);
         }
         v += 1;
     }
     for _ in 0..12 {
         if let Some((x, z)) = jungle_spot(&mut rng, 9.0) {
-            plant!(props::strangler_fig(0.9 + rng.f32() * 0.25, v), x, z, 0.0, (v % 4) as u8, V_MED, 0.8);
+            plant!(StranglerFig; props::strangler_fig(0.9 + rng.f32() * 0.25, v), x, z, 0.0, (v % 4) as u8, V_MED, 0.8);
         }
         v += 1;
     }
     for _ in 0..22 {
         if let Some((x, z)) = jungle_spot(&mut rng, 6.0) {
-            plant!(props::bamboo(1.0, v), x, z, 0.0, (v % 4) as u8, V_MED, 2.2);
+            plant!(Bamboo; props::bamboo(1.0, v), x, z, 0.0, (v % 4) as u8, V_MED, 2.2);
         }
         v += 1;
     }
     for _ in 0..120 {
         if let Some((x, z)) = jungle_spot(&mut rng, 5.2) {
-            plant!(props::fern(v), x, z, 0.0, 0, V_SM, 2.6);
+            plant!(Fern; props::fern(v), x, z, 0.0, 0, V_SM, 2.6);
         }
         v += 1;
     }
     for _ in 0..100 {
         if let Some((x, z)) = jungle_spot(&mut rng, 5.6) {
-            plant!(props::bush(v), x, z, 0.0, 0, V_MED, 1.8);
+            plant!(Bush; props::bush(v), x, z, 0.0, 0, V_MED, 1.8);
         }
         v += 1;
     }
     for _ in 0..46 {
         if let Some((x, z)) = jungle_spot(&mut rng, 7.0) {
-            put!(props::rock(0.7 + rng.f32() * 0.6), x, z, 0.0, 0, V_MED);
+            put!(Rock; props::rock(0.7 + rng.f32() * 0.6), x, z, 0.0, 0, V_MED);
         }
         v += 1;
     }
     // boulder clusters: in the jungle, and worn ones along the river banks
     for _ in 0..18 {
         if let Some((x, z)) = jungle_spot(&mut rng, 8.0) {
-            put!(props::boulder_cluster(0.8 + rng.f32() * 0.5, v), x, z, 0.0, (v % 4) as u8, V_MED);
+            put!(BoulderCluster; props::boulder_cluster(0.8 + rng.f32() * 0.5, v), x, z, 0.0, (v % 4) as u8, V_MED);
         }
         v += 1;
     }
@@ -584,7 +601,7 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh) {
         let (x, z) = (a.cos() * r, a.sin() * r);
         let rd = consts::river_dist(x, z);
         if rd > 6.5 && rd < 10.5 && consts::lane_clearance(x, z) > 7.0 {
-            put!(props::boulder_cluster(0.55 + rng.f32() * 0.4, v), x, z, terrain_height(x, z) - 0.3, (v % 4) as u8, V_MED);
+            put!(BoulderCluster; props::boulder_cluster(0.55 + rng.f32() * 0.4, v), x, z, terrain_height(x, z) - 0.3, (v % 4) as u8, V_MED);
         }
         v += 1;
     }
@@ -602,46 +619,46 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh) {
             let rr = crate::bosses::PIT_RADIUS + 1.5;
             let (x, z) = (pit.x + a.cos() * rr, pit.z + a.sin() * rr);
             if i % 4 == 0 {
-                put!(props::ruin_pillar(1.0, i as i32 + k as i32 * 5), x, z, 0.0, (i % 4) as u8, V_MED);
+                put!(RuinPillar; props::ruin_pillar(1.0, i as i32 + k as i32 * 5), x, z, 0.0, (i % 4) as u8, V_MED);
             } else {
-                put!(props::boulder_cluster(1.1 + (i % 3) as f32 * 0.25, i as i32), x, z, 0.0, (i % 4) as u8, V_MED);
+                put!(BoulderCluster; props::boulder_cluster(1.1 + (i % 3) as f32 * 0.25, i as i32), x, z, 0.0, (i % 4) as u8, V_MED);
             }
         }
-        put!(props::lane_pad(), pit.x, pit.z, -0.05, 0, V_MED);
+        put!(LanePad; props::lane_pad(), pit.x, pit.z, -0.05, 0, V_MED);
         for i in 0..3 {
             let a = i as f32 * 2.1 + k as f32;
-            put!(props::brazier(), pit.x + a.cos() * 6.0, pit.z + a.sin() * 6.0, 0.0, 0, V_BRAZ);
+            put!(Brazier; props::brazier(), pit.x + a.cos() * 6.0, pit.z + a.sin() * 6.0, 0.0, 0, V_BRAZ);
         }
     }
 
     // vine curtains strung between the trees
     for _ in 0..34 {
         if let Some((x, z)) = jungle_spot(&mut rng, 6.5) {
-            plant!(props::vine_curtain(v), x, z, 0.0, (v % 4) as u8, V_MED, 2.4);
+            plant!(VineCurtain; props::vine_curtain(v), x, z, 0.0, (v % 4) as u8, V_MED, 2.4);
         }
         v += 1;
     }
     for _ in 0..12 {
         if let Some((x, z)) = jungle_spot(&mut rng, 8.0) {
-            put!(props::crystal([0.5, 0.85, 1.0]), x, z, 0.0, 0, V_SM);
+            put!(Crystal; props::crystal([0.5, 0.85, 1.0]), x, z, 0.0, 0, V_SM);
         }
         v += 1;
     }
     for _ in 0..11 {
         if let Some((x, z)) = jungle_spot(&mut rng, 7.5) {
-            put!(props::fallen_log(0.85 + rng.f32() * 0.3), x, z, 0.0, (v % 4) as u8, V_MED);
+            put!(FallenLog; props::fallen_log(0.85 + rng.f32() * 0.3), x, z, 0.0, (v % 4) as u8, V_MED);
         }
         v += 1;
     }
     for _ in 0..14 {
         if let Some((x, z)) = jungle_spot(&mut rng, 8.0) {
-            plant!(props::pine(0.9 + rng.f32() * 0.5), x, z, 0.0, 0, V_MED, 0.9);
+            plant!(Pine; props::pine(0.9 + rng.f32() * 0.5), x, z, 0.0, 0, V_MED, 0.9);
         }
         v += 1;
     }
     for _ in 0..14 {
         if let Some((x, z)) = jungle_spot(&mut rng, 8.0) {
-            plant!(props::oak(0.9 + rng.f32() * 0.4), x, z, 0.0, 0, V_MED, 1.0);
+            plant!(Oak; props::oak(0.9 + rng.f32() * 0.4), x, z, 0.0, 0, V_MED, 1.0);
         }
         v += 1;
     }
@@ -665,24 +682,24 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh) {
     for (ci, (cx, cz)) in camps.iter().enumerate() {
         let vv = (ci as i32) * 3 + 1;
         match ci % 3 {
-            0 => put!(props::ruin_arch(1.0, vv), *cx, *cz, 0.0, (vv % 4) as u8, V_MED),
-            1 => put!(props::ruin_wall(1.0, vv), *cx, *cz, 0.0, (vv % 4) as u8, V_MED),
-            _ => put!(props::stone_head(1.0, vv), *cx, *cz, 0.0, (vv % 4) as u8, V_MED),
+            0 => put!(RuinArch; props::ruin_arch(1.0, vv), *cx, *cz, 0.0, (vv % 4) as u8, V_MED),
+            1 => put!(RuinWall; props::ruin_wall(1.0, vv), *cx, *cz, 0.0, (vv % 4) as u8, V_MED),
+            _ => put!(StoneHead; props::stone_head(1.0, vv), *cx, *cz, 0.0, (vv % 4) as u8, V_MED),
         }
         for k in 0..2 {
             let a = rng.f32() * TAU;
             let rr = 4.5 + rng.f32() * 3.5;
-            put!(props::ruin_pillar(1.0, vv + k as i32), cx + a.cos() * rr, cz + a.sin() * rr, 0.0, (k * 2) as u8, V_MED);
+            put!(RuinPillar; props::ruin_pillar(1.0, vv + k as i32), cx + a.cos() * rr, cz + a.sin() * rr, 0.0, (k * 2) as u8, V_MED);
         }
         for k in 0..2 {
             let a = rng.f32() * TAU;
             let rr = 5.0 + rng.f32() * 4.0;
-            plant!(props::bush(v + k), cx + a.cos() * rr, cz + a.sin() * rr, 0.0, 0, V_MED, 1.8);
+            plant!(Bush; props::bush(v + k), cx + a.cos() * rr, cz + a.sin() * rr, 0.0, 0, V_MED, 1.8);
         }
         for k in 0..2 {
             let a = rng.f32() * TAU;
             let rr = 3.5 + rng.f32() * 4.0;
-            plant!(props::fern(v + k), cx + a.cos() * rr, cz + a.sin() * rr, 0.0, 0, V_SM, 2.6);
+            plant!(Fern; props::fern(v + k), cx + a.cos() * rr, cz + a.sin() * rr, 0.0, 0, V_SM, 2.6);
         }
         v += 5;
     }
@@ -690,7 +707,7 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh) {
     // --- bridges where the side lanes cross the rivers ---
     for (side, lane) in [(-1.0f32, Lane::Top), (1.0f32, Lane::Bot)] {
         if let Some(p) = bridge_crossing(side, lane) {
-            put!(props::bridge(32), p.x, p.z, -0.35, 0, V_MED);
+            put!(Bridge; props::bridge(32), p.x, p.z, -0.35, 0, V_MED);
         }
     }
 
@@ -698,7 +715,7 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh) {
     for team in [Team::Blue, Team::Red] {
         for sx in [-7.0f32, 7.0] {
             let z = team.base_pos().z + team.push_z() * 16.0;
-            put!(props::brazier(), sx, z, 0.0, 0, V_BRAZ);
+            put!(Brazier; props::brazier(), sx, z, 0.0, 0, V_BRAZ);
         }
     }
 
@@ -706,14 +723,14 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh) {
     let zg = 196.0f32;
     let zign = Vec3::new(0.0, terrain_height(0.0, zg) - 3.0, zg);
     let zigs = Vec3::new(0.0, terrain_height(0.0, -zg) - 3.0, -zg);
-    put!(props::ziggurat(), zign.x, zign.z, zign.y, 2, V_BIG); // stair faces the valley
-    put!(props::ziggurat(), zigs.x, zigs.z, zigs.y, 0, V_BIG);
+    put!(Ziggurat; props::ziggurat(), zign.x, zign.z, zign.y, 2, V_BIG); // stair faces the valley
+    put!(Ziggurat; props::ziggurat(), zigs.x, zigs.z, zigs.y, 0, V_BIG);
     let mut landmarks = vec![zign, zigs];
 
     let h1 = Vec3::new(-164.0, terrain_height(-164.0, 66.0) - 2.0, 66.0);
     let h2 = Vec3::new(164.0, terrain_height(164.0, -66.0) - 2.0, -66.0);
-    put!(props::colossus_head(), h1.x, h1.z, h1.y, 1, V_BIG); // face +X, toward the valley
-    put!(props::colossus_head(), h2.x, h2.z, h2.y, 3, V_BIG); // face -X
+    put!(ColossusHead; props::colossus_head(), h1.x, h1.z, h1.y, 1, V_BIG); // face +X, toward the valley
+    put!(ColossusHead; props::colossus_head(), h2.x, h2.z, h2.y, 3, V_BIG); // face -X
     landmarks.push(h1);
     landmarks.push(h2);
 
@@ -726,38 +743,38 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh) {
             continue;
         }
         let q = (((a.to_degrees() / 90.0).round() as i32) + 1).rem_euclid(4) as u8;
-        put!(props::aqueduct_arch(), x, z, terrain_height(x, z) - 2.0, q, V_BIG);
+        put!(AqueductArch; props::aqueduct_arch(), x, z, terrain_height(x, z) - 2.0, q, V_BIG);
         landmarks.push(p);
     }
 
     // --- overgrown hills ring ---
     for i in 0..20 {
         if let Some((x, z)) = hill_spot(&mut rng, &landmarks, 40.0) {
-            plant!(props::mega_tree(0.9 + rng.f32() * 0.2, i), x, z, terrain_height(x, z) - 0.5, (i % 4) as u8, V_BIG, 0.6);
+            plant!(MegaTree; props::mega_tree(0.9 + rng.f32() * 0.2, i), x, z, terrain_height(x, z) - 0.5, (i % 4) as u8, V_BIG, 0.6);
         }
         v += 1;
     }
     for _ in 0..14 {
         if let Some((x, z)) = hill_spot(&mut rng, &landmarks, 24.0) {
-            plant!(props::jungle_tree(1.05 + rng.f32() * 0.25, v), x, z, terrain_height(x, z) - 0.2, (v % 4) as u8, V_MED, 1.0);
+            plant!(JungleTree; props::jungle_tree(1.05 + rng.f32() * 0.25, v), x, z, terrain_height(x, z) - 0.2, (v % 4) as u8, V_MED, 1.0);
         }
         v += 1;
     }
     for _ in 0..14 {
         if let Some((x, z)) = hill_spot(&mut rng, &landmarks, 18.0) {
-            plant!(props::bamboo(1.0, v), x, z, terrain_height(x, z) - 0.2, (v % 4) as u8, V_MED, 2.2);
+            plant!(Bamboo; props::bamboo(1.0, v), x, z, terrain_height(x, z) - 0.2, (v % 4) as u8, V_MED, 2.2);
         }
         v += 1;
     }
     for _ in 0..8 {
         if let Some((x, z)) = hill_spot(&mut rng, &landmarks, 20.0) {
-            plant!(props::palm(0.95 + rng.f32() * 0.2, v), x, z, terrain_height(x, z) - 0.2, (v % 4) as u8, V_MED, 1.6);
+            plant!(Palm; props::palm(0.95 + rng.f32() * 0.2, v), x, z, terrain_height(x, z) - 0.2, (v % 4) as u8, V_MED, 1.6);
         }
         v += 1;
     }
     for _ in 0..10 {
         if let Some((x, z)) = hill_spot(&mut rng, &landmarks, 14.0) {
-            plant!(props::bush(v), x, z, terrain_height(x, z), 0, V_MED, 1.8);
+            plant!(Bush; props::bush(v), x, z, terrain_height(x, z), 0, V_MED, 1.8);
         }
         v += 1;
     }
@@ -811,10 +828,11 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh) {
         out.push((merged, center, radius, plist[0].vsize));
     }
     eprintln!(
-        "[clawbound] world: {} props → {} chunks ({} voxels)",
+        "[clawbound] world: {} props → {} chunks ({} voxels), {} blockers",
         pieces.len(),
         out.len(),
-        out.iter().map(|(m, _, _, _)| m.inst.len()).sum::<usize>()
+        out.iter().map(|(m, _, _, _)| m.inst.len()).sum::<usize>(),
+        blockers.len()
     );
-    (out, bird_mesh())
+    (out, bird_mesh(), blockers)
 }

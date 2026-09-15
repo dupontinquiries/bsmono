@@ -716,6 +716,20 @@ fn render(s: &mut AppState) {
     let dt_frame = s.last_frame.elapsed().as_secs_f32().min(0.05);
     s.last_frame = Instant::now();
 
+    // Hand the world's static collision to the sim.
+    //
+    // Guarded rather than done at one construction site because neither order
+    // is guaranteed: `Scene` is built lazily on the first frame that has a
+    // renderer, `Game` is built when a match starts, and either can come
+    // first. The `is_empty` check makes this idempotent, so it costs one
+    // pointer comparison per frame after the handover.
+    if let (Some(sc), Some(g)) = (s.scene.as_ref(), s.game.as_mut()) {
+        if g.blockers.is_empty() && !sc.blockers.is_empty() {
+            g.blockers = sc.blockers.clone();
+            eprintln!("[clawbound] sim took {} prop blockers", g.blockers.len());
+        }
+    }
+
     if s.scene.is_none() {
         s.scene = Some(Scene::new(&mut s.renderer));
         render_portraits(s);

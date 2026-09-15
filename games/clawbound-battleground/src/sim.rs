@@ -257,6 +257,13 @@ pub struct Game {
     pub wild: crate::wild::Wild,
     pub bosses: crate::bosses::Bosses,
     pub disasters: crate::disasters::Disasters,
+    /// Static prop collision. EMPTY by default and filled in by the app from
+    /// `Scene::blockers` once the world meshes exist, because the props are
+    /// generated on the render side and `Game::new` runs before a `Scene`
+    /// does. An empty set is a no-op resolve, so headless runs and tests keep
+    /// the pre-collision behaviour rather than silently depending on a world
+    /// they never built.
+    pub blockers: std::sync::Arc<crate::blockers::Blockers>,
 }
 
 impl Game {
@@ -376,6 +383,7 @@ impl Game {
             wild,
             bosses: crate::bosses::Bosses::new(),
             disasters: crate::disasters::Disasters::default(),
+            blockers: std::sync::Arc::new(crate::blockers::Blockers::default()),
         };
         // starter items for AI gods (player buys via shop)
         for i in 0..10 {
@@ -798,5 +806,46 @@ mod shop_tests {
         assert_eq!(g.gods[0].gold, refund, "sold with nothing else bought, gold is exactly the refund");
         assert!(g.gods[0].items.is_empty());
         assert!(g.sell_item(0, 0).is_none(), "an empty slot sells nothing");
+    }
+
+    /// A fresh `Game` must collide with nothing, so headless runs and every
+    /// other test here keep the pre-collision behaviour rather than silently
+    /// depending on a world they never built.
+    #[test]
+    fn a_fresh_game_has_no_prop_collision() {
+        let g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        assert!(g.blockers.is_empty());
+        let p = glam::Vec3::new(10.0, 0.0, 10.0);
+        assert_eq!(g.blockers.resolve(p, 0.55), p, "an empty set is a no-op");
+    }
+
+    /// Movement must not push a unit outside the arena. The prop resolve runs
+    /// BEFORE the rim clamp precisely so the clamp has the last word.
+    #[test]
+    fn prop_pushout_cannot_eject_a_unit_past_the_arena_rim() {
+        use crate::blockers::{Blocker, Blockers, Shape};
+        let mut g = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+        let rim = ARENA_RADIUS - 2.5;
+        let mut b = Blockers::new(ARENA_RADIUS + 20.0, 6.0);
+        // A big blocker right where the god stands, pushing it outward.
+        b.push(Blocker { shape: Shape::Circle { x: rim, z: 0.0, r: 4.0 }, top: 5.0 });
+        g.blockers = std::sync::Arc::new(b);
+        g.gods[0].pos = glam::Vec3::new(rim, 0.0, 0.0);
+        for _ in 0..60 {
+            g.tick(1.0 / 60.0);
+        }
+        let r = glam::Vec3::new(g.gods[0].pos.x, 0.0, g.gods[0].pos.z).length();
+        assert!(r <= ARENA_RADIUS - 2.0 + 1e-3, "pushed outside the arena: r={r}");
+        assert!(g.gods[0].pos.is_finite());
+    }
+
+    /// The god radius must be the BODY, not the god-vs-god personal space.
+    /// Reusing the separation's 1.1 against static geometry would hold a cat
+    /// half a body-width off every trunk, which reads as an invisible wall.
+    #[test]
+    fn unit_radii_are_body_sized() {
+        assert!(GOD_RADIUS < 1.1);
+        assert!(MINION_RADIUS < GOD_RADIUS);
+        assert!(MINION_RADIUS > 0.0);
     }
 }

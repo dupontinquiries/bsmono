@@ -11,6 +11,18 @@ use glam::Vec3;
 pub const MAP_SCALE: f32 = 1.42;
 
 pub const ARENA_RADIUS: f32 = 95.0 * MAP_SCALE; // playable floor (~135)
+
+/// Collision radius of a god, for prop push-out.
+///
+/// 0.55 rather than the 1.1 the god-vs-god separation uses: that 1.1 is a
+/// *personal space* between two moving units, deliberately wider than either
+/// body so a melee scrum does not overlap. Against static geometry the same
+/// number would hold a cat half a body-width off every tree trunk, which
+/// reads as an invisible wall. This is the body.
+pub const GOD_RADIUS: f32 = 0.55;
+
+/// Collision radius of a minion. Smaller because a minion is a mini cat.
+pub const MINION_RADIUS: f32 = 0.32;
 pub const GROUND_HALF: f32 = 225.0; // rendered terrain half-extent
 
 /// Base microvoxel edge length (world units) for character voxels.

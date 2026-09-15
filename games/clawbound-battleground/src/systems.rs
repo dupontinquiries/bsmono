@@ -109,6 +109,10 @@ impl Game {
     // --- movement ---------------------------------------------------------------
 
     fn move_gods(&mut self, dt: f32) {
+        // Cloned once: the loop takes `&mut self.gods[i]`, so the borrow
+        // checker will not allow reading `self.blockers` inside it. An Arc
+        // clone is a refcount bump, not a copy of the grid.
+        let blockers = self.blockers.clone();
         for i in 0..self.gods.len() {
             if self.gods[i].respawn_t > 0.0 {
                 continue;
@@ -142,6 +146,17 @@ impl Game {
             } else {
                 g.walk_anim += dt * 1.5;
             }
+            // Prop collision. Runs AFTER the move and BEFORE the arena clamp:
+            // a push-out can shove a unit past the rim, and the clamp is the
+            // thing that must have the last word on staying inside the map.
+            //
+            // A dashing god is resolved at its feet height so it clears low
+            // obstacles -- `resolve_at` skips blockers topping out below the
+            // given height, which is what stops a leap over a boulder being
+            // yanked sideways mid-flight.
+            let feet = if g.dash.is_some() { g.pos.y } else { f32::NEG_INFINITY };
+            g.pos = blockers.resolve_at(g.pos, GOD_RADIUS, feet);
+
             // arena bounds
             let r = Vec3::new(g.pos.x, 0.0, g.pos.z).length();
             if r > ARENA_RADIUS - 2.0 {
@@ -166,6 +181,7 @@ impl Game {
     }
 
     fn move_minions(&mut self, dt: f32) {
+        let blockers = self.blockers.clone();
         for mi in 0..self.minions.len() {
             // engage scan (immutable first)
             let (mteam, mpos, mwp, mlane) = {
@@ -195,6 +211,11 @@ impl Game {
                     m.pos += d.normalize() * step;
                     m.yaw = d.z.atan2(d.x);
                     m.walk_anim += dt * 10.0;
+                    // Minions path down a lane and will walk into anything the
+                    // lane clips. Resolving here rather than only for gods
+                    // matters because a wave piling into a trunk is what makes
+                    // props read as solid from across the map.
+                    m.pos = blockers.resolve(m.pos, MINION_RADIUS);
                 }
             } else {
                 m.walk_anim += dt * 2.0;
