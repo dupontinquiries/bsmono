@@ -45,38 +45,23 @@ use std::time::Instant;
 // settable from one place. The bin-local `INITIAL_WIDTH`/`INITIAL_HEIGHT`
 // /`TITLE` constants that used to shadow them are gone.
 
-/// Default frame-time budget for GPU uploads, in milliseconds. We
-/// upload completed meshes one at a time and stop when this budget is
-/// exceeded — this keeps frame variance bounded even on bursty load.
-/// Overridable at runtime via `UNENDLICH_UPLOAD_BUDGET_MS`.
-///
-/// v0.24.42-upload-budget: raised from 4.0 to 6.0. After RC5+RC6 the
-/// Mid GPU mesher produces ~3,100 chunks/sec sustained; the bottleneck
-/// during post-movement transitions is the upload pipeline draining,
-/// not the mesher itself. 6 ms gives the per-frame upload phase more
-/// room without stretching the worst-case frame past the 8.3 ms
-/// vsync budget on 120 Hz displays. Backstop is still
-/// `MAX_UPLOADS_PER_FRAME_DEFAULT` and `UPLOAD_BYTES_BUDGET_DEFAULT`.
-const UPLOAD_BUDGET_MS_DEFAULT: f64 = 8.0; // r482: ↑ from 6.0 (FIF=2 headroom)
-
-/// Default cap on how many uploads we'll do in a single frame even if
-/// the budget allows. Prevents pathological cases where uploads are
-/// extremely cheap (empty meshes) from dominating the frame.
-/// Overridable at runtime via `UNENDLICH_MAX_UPLOADS_PER_FRAME`.
-///
-/// v0.24.42-upload-budget: raised from 16 to 64. Each upload's CPU
-/// overhead (memcpy of vertex+index into the host-visible mapped pool,
-/// plus the small bookkeeping work in `upload_chunk_mesh`) is well
-/// under 100 µs in practice. At the old cap=16 the upload phase
-/// drained the queue at 960 chunks/sec at 60 fps; the mesher peaks
-/// near 3,100. New cap matches the mesher's peak so the queue can
-/// fully drain in a single frame when bursts hit.
-const MAX_UPLOADS_PER_FRAME_DEFAULT: usize = 96; // r482: ↑ from 64 (adaptive ctrl manages range [12,192])
+// r-dead-const-cleanup: UPLOAD_BUDGET_MS_DEFAULT (was 8.0) and
+// MAX_UPLOADS_PER_FRAME_DEFAULT (was 96) used to live here as free-standing
+// constants, but neither was actually read anywhere (confirmed dead code,
+// flagged by the compiler) -- the live upload-knob defaults are
+// `runtime_cfg.upload_budget_ms` / `runtime_cfg.max_uploads_per_frame`
+// (RuntimeConfig's per-hardware-tier values), which fully superseded these
+// two at some point after they were introduced (r482) without anyone
+// removing the now-orphaned constants. Their tuning history (why 4.0->6.0->
+// 8.0 ms, why 16->64->96 uploads/frame) is preserved as a comment on the
+// actual live default-computation site instead of on dead bindings -- see
+// "Upload knobs" further down in this file.
 
 /// v0.24.3 upload-pressure investigation: default per-frame upload BYTES
 /// budget. Caps total mesh bytes (vertex_bytes + index_bytes) memcpy'd
-/// into the persistent-mapped pool buffer per frame. Acts alongside
-/// `UPLOAD_BUDGET_MS_DEFAULT`; whichever fires first wins.
+/// into the persistent-mapped pool buffer per frame. Acts alongside the
+/// live per-frame ms budget (`upload_budget_ms`, computed further down from
+/// `runtime_cfg.upload_budget_ms`); whichever fires first wins.
 ///
 /// Why bytes and not just ms: on M2's unified-memory architecture, the
 /// CPU's memcpy into HOST_COHERENT mapped memory triggers cache-line
@@ -2730,11 +2715,28 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
+        // r-dead-const-cleanup: tuning history preserved from the now-removed
+        // MAX_UPLOADS_PER_FRAME_DEFAULT constant. v0.24.42-upload-budget:
+        // raised 16->64. Each upload's CPU overhead (memcpy of vertex+index
+        // into the host-visible mapped pool, plus upload_chunk_mesh's small
+        // bookkeeping) is well under 100 µs in practice; at cap=16 the
+        // upload phase drained the queue at 960 chunks/sec at 60 fps while
+        // the mesher peaks near 3,100 -- a mismatched bottleneck. r482
+        // raised it again, 64->96, for the same reason. runtime_cfg's
+        // per-tier value below is what actually ships now; adaptive_uploads
+        // further manages the live cap within [12,192] once running.
         .unwrap_or(runtime_cfg.max_uploads_per_frame as usize);
     let upload_budget_ms: f64 = std::env::var("UNENDLICH_UPLOAD_BUDGET_MS")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|&v| v > 0.0)
+        // r-dead-const-cleanup: tuning history preserved from the now-removed
+        // UPLOAD_BUDGET_MS_DEFAULT constant. v0.24.42-upload-budget: raised
+        // 4.0->6.0 after RC5+RC6 made the Mid GPU mesher sustain ~3,100
+        // chunks/sec, shifting the bottleneck to the upload pipeline
+        // draining rather than the mesher itself; 6ms gave the per-frame
+        // upload phase more room without exceeding the 8.3ms vsync budget
+        // at 120Hz. r482 raised it again, 6.0->8.0, for FIF=2 headroom.
         .unwrap_or(runtime_cfg.upload_budget_ms as f64);
     // v0.24.3 upload-pressure investigation: bytes-budget alongside
     // ms-budget. Whichever fires first wins. Setting either to a very
@@ -4247,7 +4249,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             fg_app.inventory_mut().set_selected(selected_palette_idx);
             if survival_mode {
                 selected_block = PLACE_PALETTE[selected_palette_idx % PLACE_PALETTE.len()];
-                hand_item = fg_app.inventory().slot(selected_palette_idx).map(|s| s.item);
+                // hand_item is NOT set here -- the r487 unconditional resync
+                // a bit further down (search "keep hand_item synced") runs
+                // every frame regardless of this branch and would have
+                // immediately overwritten it anyway (confirmed dead store,
+                // r-hand-item-cleanup).
                 if let Some(stack) = fg_app.inventory().slot(selected_palette_idx) {
                     if let Some(b) = unendlich_engine::world::blocks::BlockId::ALL
                         .iter()
@@ -4400,9 +4406,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             fg_app.inventory_mut().set_selected(selected_palette_idx);
             if survival_mode {
                 selected_block = PLACE_PALETTE[selected_palette_idx];
-                // r125: in survival the hand holds the INVENTORY slot's item,
-                // not the creative palette.
-                hand_item = fg_app.inventory().slot(selected_palette_idx).map(|s| s.item);
+                // hand_item is NOT set here -- see the r487 unconditional
+                // resync note a bit further down; same reasoning as the
+                // sibling branch above (r-hand-item-cleanup).
                 if let Some(stack) = fg_app.inventory().slot(selected_palette_idx) {
                     if let Some(b) = unendlich_engine::world::blocks::BlockId::ALL
                         .iter()
