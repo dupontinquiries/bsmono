@@ -6,6 +6,22 @@ rules, animation semantics — with headless tests pinning each contract (the gp
 
 ## snapclone (Qt6 C++, 59 UI widgets)
 
+> **Audited 2026-09-15 against the tree, and 25 of 25 rows marked `pending`
+> were wrong.** Every one was either already ported with tests, partially
+> absorbed into another module, or a Qt-only test harness nobody wants. The
+> ledger had been drifting long enough that it was actively misdirecting work:
+> four separate attempts this session to "port" something found it already
+> done, and one of them nearly overwrote a better implementation with a weaker
+> verbatim one.
+>
+> Status now means: **ported** = a module exists, its header names the Qt
+> source, and it has tests. **partial** = some of the contract is in, and the
+> note says which part is not. **n/a** = a Qt test harness with no egui
+> counterpart wanted. Anything genuinely unstarted would be `pending`, and
+> right now nothing is.
+>
+> If you add a row, check the tree rather than the ledger.
+
 Shell contract (MainWindow.cpp), PORTED + tested in `egui-frontend`:
 five pages Camera·Inbox·Friends·Wayfinder·Settings; UnifiedNavBar two-level nav with
 verbatim sub-tab tables (Inbox All/Unread/Sent, Friends All/Online/Pending, Settings
@@ -17,58 +33,58 @@ starts hidden with the auto-login ordering rule.
 |---|---|---|
 | AddLandmarkDialog | ported | landmark.rs — no-fix refusal, private-only V1, geohash7 helper |
 | AmbientBlobs | ported | uikit_egui::livebg (Aurora/Waves live background) |
-| AmbientCameraDriver | pending |  |
-| AmbientInboxDriver | pending |  |
-| AmbientPaletteDeriver | pending |  |
-| CameraWidget | pending |  |
-| ChevronConfirm | pending |  |
-| ComponentTestWindow | pending |  |
+| AmbientCameraDriver | ported | ambient_camera.rs (13 tests) |
+| AmbientInboxDriver | ported | ambient_inbox.rs (12 tests) |
+| AmbientPaletteDeriver | ported | ambient_palette.rs (16 tests) |
+| CameraWidget | ported | camera.rs — the viewfinder; camera_select.rs carries the selection half |
+| ChevronConfirm | ported | chevron_confirm.rs (15 tests) |
+| ComponentTestWindow | n/a | Qt-only test harness; no egui equivalent wanted |
 | ContactCard | ported | friends.rs `Card`/`Accordion`/`Gesture` — 180ms OutCubic reveal, one open at a time, tap/scroll/swipe-close contract |
 | ContactEditorDialog | ported | contacts.rs `Editor` — edits the NICKNAME and notes; the advertised displayName stays read-only |
 | ContactPickerDialog | ported | contacts.rs `Picker` — single vs multi-select, empty-confirm refused |
-| ContactsPage | pending |  |
-| ConversationDetailDialog | pending |  |
-| ConversationSecurityBar | pending |  |
-| DiagnosticsDialog | pending |  |
+| ContactsPage | partial | sub-tab table in unified_nav.rs and pinned in lib.rs; the page BODY is not ported |
+| ConversationDetailDialog | ported | conversation.rs (10 tests) |
+| ConversationSecurityBar | ported | contacts.rs `SecurityBar` + `Tier`; voice_coord.rs re-exports the tier rather than redefining it |
+| DiagnosticsDialog | ported | conversation.rs — the diagnostics half |
 | ExportReminderCard | ported | export_reminder.rs — monthly gate, snooze, auto-sync escape hatch |
 | FriendListWidget | ported | friends.rs `Roster` + `AddForm` — dedupe by id, empty state, three address formats |
 | GroupVoiceBar | ported | voicebar.rs — swipe-to-latch, eased transmit meter, Securing as its own tier |
 | GroupVoiceCoordinator | ported | voice_coord.rs — join/leave idempotent, ActivityGate mic rule (no hot mic on a locked phone), roster level only while we hold the floor, packets gated on the floor, inert mode |
 | GroupVoiceRoster | ported | roster.rs — active speaker, eased ring level, speaking floor. (Ledger was stale: this was ported and still listed pending.) |
-| HelpManualDialog | pending |  |
-| InboxWidget | pending |  |
+| HelpManualDialog | ported | help_manual.rs (14 tests) |
+| InboxWidget | ported | inbox.rs (6 tests) |
 | IncomingCallDialog | ported | ring.rs `IncomingCall` — 30s auto-decline, first-answer-wins, ring derived from outcome |
 | LoginWidget | ported | session.rs `Login` — optional password, Enter-moves-focus, error clears the password |
 | MainWindow | partial | 5-page shell + login-overlay ordering rule in lib.rs; status bar/export gate pending |
 | MediaSendSummary | ported | send_summary.rs — three-facet receipt, dedupe savings, recipient count gates Send. (Ledger was stale.) Reinterpreted rather than verbatim; the Qt's unrecognised-container case was missing and has been restored — it claimed a strip that never happened. |
 | MobileDialog | ported | mobile_dialog.rs — form-factor ladder, sheet slide, result lifecycle |
-| ModalLayerTestPanel | pending |  |
+| ModalLayerTestPanel | n/a | Qt-only test harness for ModalSurface, which is itself ported |
 | ModalSurface | ported | modal.rs — six layers, derived scrim, tap-outside, dismissTopmost ordering |
 | MonthlyExportReminder | ported | export_reminder.rs `ReminderState` — pure should_show over month key |
 | OutboxWidget | ported | session.rs `Outbox` — transport phases, delivered is terminal, 24h prune of delivered only |
 | PagePeelHint | ported | nav_chrome.rs `PeelHint` — breath, duck-and-return, retires after 4 swipes |
-| PressGesture | pending |  |
-| QrCodeRenderer | pending |  |
+| PressGesture | ported | press_gesture.rs (15 tests) |
+| QrCodeRenderer | ported | qr_render.rs — re-export; the renderer moved to the shared kit |
 | QrScanDialog | ported | qr.rs `QrScan` — four payload forms, port-overflow rejection, decode latch, manual fallback |
 | RingtoneSynth | ported | ring.rs `render_mono` — E5-C#5-A4 bells, feedback comb, silent loop point |
-| ScrollAreas | pending |  |
+| ScrollAreas | ported | scroll_passthrough.rs (12 tests) |
 | SegmentedTabStrip | ported | nav_chrome.rs `TabStrip` — equal segments, underline, badge pills |
 | SettingsPage | partial | sub-tab table only; 4680-line page body pending |
 | SmartRibbon | ported | ribbon.rs — per-tab contextual actions, re-derived enablement, natural segments |
 | SnapComposerDialog | ported | composer.rs + composer_ui.rs — snapReady(image, durationSecs), caption baked into the frame by renderComposed so no overlay metadata travels. (Ledger was stale.) |
-| SnapExporter | pending |  |
+| SnapExporter | ported | snap_export.rs (13 tests) |
 | SnapFeedWidget | ported | snaps.rs `SnapFeed` — sealed tiles, 2 columns, order as supplied |
 | SnapViewerDialog | ported | snaps.rs `Viewer` — countdown that outlives an early close, playlist mode, save-not-notify |
-| SvgIcon | pending |  |
+| SvgIcon | partial | only an icon-name field in ribbon.rs — no renderer ported |
 | SwipeNavigator | ported | uikit_egui::nav + GestureLayer (page swipe, subpage drill, clamp) |
-| TabBar | pending |  |
-| ThumbnailService | pending |  |
-| TouchFeedback | pending |  |
-| UiDebugFlags | pending |  |
+| TabBar | ported | tab_bar.rs (19 tests) |
+| ThumbnailService | ported | thumbnails.rs (13 tests) |
+| TouchFeedback | ported | touch_feedback.rs (13 tests) |
+| UiDebugFlags | ported | trace_channels.rs (11 tests) |
 | UnifiedNavBar | ported | unified_nav.rs — segments/arrows/centered-name/underline-morph/dots, tables verbatim |
-| UxGuide | pending |  |
-| VirtualKeyboardWatcher | pending |  |
-| VoiceNetworkBridge | pending |  |
+| UxGuide | ported | lib.rs familiarity counter, consulted by chevron_confirm |
+| VirtualKeyboardWatcher | ported | keyboard_inset.rs (13 tests) |
+| VoiceNetworkBridge | ported | voice_bridge.rs (13 tests) |
 
 ## voiceterm (QML, 8 files)
 

@@ -54,26 +54,27 @@ use crate::group_voice::{GroupVoice, TalkMode};
 use crate::roster::Roster;
 use crate::voicebar::{Security, VoiceBar};
 
-/// Conversation security tier. `ConversationSecurityBar` is not ported yet
-/// (parity ledger: pending), so the tier lives here and the bar reads it when
-/// it arrives — that is the Qt ordering anyway, since the coordinator owned
-/// the tier and pushed it to the view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Tier {
-    #[default]
-    Standard,
-    Securing,
-    Private,
-}
+/// Conversation security tier.
+///
+/// A RE-EXPORT of `contacts::Tier`, not a second definition. The first draft
+/// of this module declared its own on the strength of the parity ledger
+/// saying `ConversationSecurityBar` was pending — it is not, `contacts.rs`
+/// has had the bar and its three tiers all along, and the ledger was wrong
+/// (again). Two `Tier` enums in one crate is how a coordinator and the bar it
+/// drives end up disagreeing about what Securing means.
+pub use crate::contacts::Tier;
 
-impl Tier {
-    /// The bar's own vocabulary. Qt mapped these one to one.
-    pub fn security(self) -> Security {
-        match self {
-            Tier::Standard => Security::Public,
-            Tier::Securing => Security::Securing,
-            Tier::Private => Security::Private,
-        }
+/// The voice bar's vocabulary for a tier. Qt mapped these one to one.
+///
+/// A free function rather than an inherent method because `Tier` belongs to
+/// `contacts` and this mapping is `voicebar`'s business — putting it on the
+/// type would make the contacts module depend on the voice bar to say what a
+/// tier means.
+pub fn tier_security(tier: Tier) -> Security {
+    match tier {
+        Tier::Standard => Security::Public,
+        Tier::Securing => Security::Securing,
+        Tier::Private => Security::Private,
     }
 }
 
@@ -346,7 +347,7 @@ impl Coordinator {
     pub fn set_security_tier(&mut self, tier: Tier, bar: Option<&mut VoiceBar>) {
         self.tier = tier;
         if let Some(b) = bar {
-            b.security = tier.security();
+            b.security = tier_security(tier);
         }
     }
 
@@ -366,7 +367,7 @@ impl Coordinator {
     pub fn set_views(&mut self, gv: &GroupVoice, mut bar: Option<&mut VoiceBar>, roster: Option<&mut Roster>) {
         if let Some(b) = bar.as_deref_mut() {
             b.set_talk_prominent(self.mode == TalkMode::PushToTalk);
-            b.security = self.tier.security();
+            b.security = tier_security(self.tier);
             b.set_on_air(self.in_call && self.holder == self.self_id && !self.holder.is_empty());
         }
         self.apply_holder(gv, bar, roster);
