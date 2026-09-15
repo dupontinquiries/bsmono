@@ -340,6 +340,13 @@ thread_local! {
     static MESH_DIAG_SOFT_SIDE_QUADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static MESH_DIAG_SUBDIVIDED_TOP_BLOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static MESH_DIAG_JITTERED_TOP_BLOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // r-plant-hardware-budget: separate from the four above (which are all
+    // per-face paths inside the main greedy-mask loop) -- this counts actual
+    // stamp_template calls in decorate_chunk_styled, a single post-loop pass.
+    // Exists specifically to test the budget's "never exceeds the cap"
+    // invariant precisely, the same way the counters above let
+    // mesh_tri_regression's diagnostic test attribute triangles by path.
+    static MESH_DIAG_PLANT_STAMPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Snapshot of the per-emission-path counters (see the `thread_local!`
@@ -356,6 +363,10 @@ pub struct MeshDiagCounts {
     pub jittered_top_blocks: u64,
     /// Quads (== calls, 1 each) emitted by `emit_soft_side_face`.
     pub soft_side_faces: u64,
+    /// Plants actually given full subvoxel-template detail by
+    /// `decorate_chunk_styled` -- bounded by `max_plant_stamps_per_chunk()`
+    /// regardless of how many plant-tagged blocks the chunk actually has.
+    pub plant_stamps: u64,
 }
 
 /// Zero all per-emission-path counters on the calling thread. Call before
@@ -366,6 +377,7 @@ pub fn mesh_diag_reset() {
     MESH_DIAG_SOFT_SIDE_QUADS.with(|c| c.set(0));
     MESH_DIAG_SUBDIVIDED_TOP_BLOCKS.with(|c| c.set(0));
     MESH_DIAG_JITTERED_TOP_BLOCKS.with(|c| c.set(0));
+    MESH_DIAG_PLANT_STAMPS.with(|c| c.set(0));
 }
 
 /// Read the per-emission-path counters accumulated on the calling thread
@@ -377,6 +389,7 @@ pub fn mesh_diag_snapshot() -> MeshDiagCounts {
         jittered_top_quads: MESH_DIAG_JITTERED_TOP_QUADS.with(|c| c.get()),
         jittered_top_blocks: MESH_DIAG_JITTERED_TOP_BLOCKS.with(|c| c.get()),
         soft_side_faces: MESH_DIAG_SOFT_SIDE_QUADS.with(|c| c.get()),
+        plant_stamps: MESH_DIAG_PLANT_STAMPS.with(|c| c.get()),
     }
 }
 
@@ -2773,17 +2786,57 @@ pub(crate) fn decorate_chunk_styled(
     tuft_style: TuftStyle,
 ) {
     let n = N as i32;
+    // r-plant-hardware-budget: cap how many of this chunk's plants get full
+    // subvoxel-template detail. Diagnosed live (see world::mesh_tri_regression's
+    // module doc): a single dense-canopy chunk with 1,930 plant-tagged blocks
+    // produced ~1.12M triangles from this pass alone -- decorate_chunk_styled
+    // had no ceiling at all before this, so a sufficiently foliage-dense chunk
+    // (a jungle canopy, a dense reed bed) could cost however much it happened
+    // to contain, unboundedly.
+    //
+    // Netcode/determinism note: this only decides which of a chunk's ALREADY-
+    // SIMULATED plants get full visual detail on THIS client -- it never
+    // changes chunk.blocks, chunk.plant_indices, or any other part of the
+    // deterministic world state, so it can't desync a lockstep/replicated sim.
+    // Two clients with different budgets (different hardware) render the same
+    // chunk's plants differently, exactly like they already do for render
+    // distance or LOD tier -- neither is "wrong," and the simulation doesn't
+    // care which one a given client chose. The selection itself is
+    // deterministic, not randomized or frame-varying: chunk.plant_indices is a
+    // BTreeSet (stable, sorted iteration order), and the budget simply stops
+    // stamping once it's spent -- the same plants get dropped every time this
+    // chunk is meshed on a given client (until the plant set itself changes),
+    // not a different flickering subset each frame.
+    //
+    // Trade-off, stated plainly: a plant that doesn't get stamped is not
+    // drawn at all, not downgraded to a simpler shape -- has_subvoxels()
+    // blocks are excluded from the normal cube-face greedy-mesh pass
+    // entirely (checked directly: BlockId::MESHABLE_LUT excludes
+    // is_subvoxel_only() blocks), so there's currently no cheaper fallback
+    // geometry to drop to. Over-budget plants are invisible, not simplified.
+    // That's an honest cost of a hardware safety valve, not a bug -- and
+    // it's a strict improvement over the alternative (the GPU-watchdog
+    // self-stop this was diagnosed from), but a coarser "cheap billboard"
+    // fallback would look better and is a natural follow-up once this
+    // ships and the actual budget numbers get tuned against real hardware.
+    let plant_budget = max_plant_stamps_per_chunk();
+    let mut plant_stamps_used: u32 = 0;
     // Iterate the inverted plant index instead of scanning every cell.
     // For a chunk with no plants this loop is empty (zero cost). For a
     // forested surface chunk with ~200 plant blocks, we visit 200 cells
     // instead of 32k. Big win for tick perf too once lifecycle handlers
     // share this same indexing.
     for &plant_idx in &chunk.plant_indices {
+        if plant_stamps_used >= plant_budget {
+            break;
+        }
         let (lx, ly, lz) = Chunk::index_to_xyz(plant_idx);
         let block = chunk.blocks[plant_idx as usize];
         // Defensive: if the index got stale (shouldn't happen — set()
         // maintains it), skip. has_subvoxels is the gate.
         if !block.has_subvoxels() { continue; }
+        plant_stamps_used += 1;
+        MESH_DIAG_PLANT_STAMPS.with(|c| c.set(c.get() + 1));
 
         // Per-block instance state drives color modulation. Different
         // block types interpret state differently:
@@ -3320,6 +3373,37 @@ fn top_subdivision() -> i32 {
             .and_then(|s| s.parse::<i32>().ok())
             .map(|n| n.clamp(1, 8))
             .unwrap_or(TOP_SUBDIVISION)
+    })
+}
+
+/// Hardware safety valve for `decorate_chunk_styled`'s plant-stamping pass
+/// (see that function's doc comment for the full "why" and the netcode/
+/// determinism reasoning). Default chosen to sit comfortably above what an
+/// ordinary forested chunk needs (tens to a couple hundred plants) while
+/// giving a real ceiling well under the ~1,930-plant dense-canopy case that
+/// was diagnosed producing ~1.12M triangles from this pass alone -- at that
+/// density even a generous per-tier default meaningfully bounds the worst
+/// case rather than leaving it unbounded.
+///
+/// Same pattern as `top_subdivision()` above: a single env-var-backed
+/// `OnceLock`, read once per process, not threaded through `RuntimeConfig`.
+/// This is a launch-time performance ceiling, not a live-adjustable quality
+/// slider -- consistent with how its sibling knob (`UNENDLICH_TOP_SUBDIVISION`)
+/// is already handled in this exact file. Scaling the default automatically
+/// by detected hardware tier (mirroring `device_budget::recommend_preset`) is
+/// a reasonable follow-up once real numbers from a running session are in
+/// hand; not done here to keep this change to the one thing it's for.
+const MAX_PLANT_STAMPS_PER_CHUNK_DEFAULT: u32 = 512;
+
+fn max_plant_stamps_per_chunk() -> u32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("UNENDLICH_MAX_PLANT_STAMPS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|n| n.clamp(16, 8192))
+            .unwrap_or(MAX_PLANT_STAMPS_PER_CHUNK_DEFAULT)
     })
 }
 
@@ -4691,6 +4775,76 @@ mod tests {
         assert!(surface_verts >= 4 * 32 * 32 / 2,
             "expected ≥{} water surface vertices, got {}",
             4 * 32 * 32 / 2, surface_verts);
+    }
+
+    /// r-plant-hardware-budget: decorate_chunk_styled must never stamp more
+    /// plants than max_plant_stamps_per_chunk(), no matter how many
+    /// plant-tagged blocks the chunk actually has. Uses the MESH_DIAG_PLANT_STAMPS
+    /// counter (same infrastructure world::mesh_tri_regression's diagnostic
+    /// test uses to attribute triangles by emission path) for a precise
+    /// count, rather than inferring it from aggregate vertex/triangle totals.
+    #[test]
+    fn plant_stamps_never_exceed_the_hardware_budget() {
+        use crate::world::blocks::BlockId;
+        use crate::world::chunk::{Chunk, ChunkCoord};
+        let budget = max_plant_stamps_per_chunk();
+        // Comfortably more plant-tagged blocks than the budget allows, so a
+        // correct implementation must actually turn some away (a fixture
+        // sized at or under the budget wouldn't distinguish "the cap works"
+        // from "the cap silently does nothing").
+        let plant_count = budget as usize + 200;
+        let mut blocks = vec![BlockId::Air; (CHUNK_SIZE as usize).pow(3)];
+        for b in blocks.iter_mut().take(plant_count) {
+            *b = BlockId::OakLeaves;
+        }
+        let chunk = Chunk::from_blocks(ChunkCoord::new(0, 0, 0), blocks);
+        assert_eq!(
+            chunk.plant_indices.len(), plant_count,
+            "fixture sanity: from_blocks should have indexed every OakLeaves cell as a plant"
+        );
+
+        mesh_diag_reset();
+        let _mesh = mesh_chunk_greedy(&chunk, None, None, None);
+        let diag = mesh_diag_snapshot();
+
+        assert!(
+            diag.plant_stamps <= budget as u64,
+            "stamped {} plants, exceeding the budget of {budget} -- the hardware safety \
+             valve in decorate_chunk_styled isn't actually capping",
+            diag.plant_stamps,
+        );
+        assert_eq!(
+            diag.plant_stamps, budget as u64,
+            "with more plants available ({plant_count}) than the budget ({budget}), exactly \
+             the budget's worth should be stamped -- fewer would mean the cap is firing too \
+             early (a separate bug from not capping at all)",
+        );
+    }
+
+    /// The budget must not fire at all for a chunk with fewer plants than
+    /// the cap allows -- an ordinary lightly-vegetated chunk should be
+    /// completely unaffected by this safety valve.
+    #[test]
+    fn plant_budget_does_not_affect_chunks_under_the_cap() {
+        use crate::world::blocks::BlockId;
+        use crate::world::chunk::{Chunk, ChunkCoord};
+        let budget = max_plant_stamps_per_chunk();
+        let plant_count = (budget as usize / 4).max(1); // well under budget
+        let mut blocks = vec![BlockId::Air; (CHUNK_SIZE as usize).pow(3)];
+        for b in blocks.iter_mut().take(plant_count) {
+            *b = BlockId::OakLeaves;
+        }
+        let chunk = Chunk::from_blocks(ChunkCoord::new(0, 0, 0), blocks);
+
+        mesh_diag_reset();
+        let _mesh = mesh_chunk_greedy(&chunk, None, None, None);
+        let diag = mesh_diag_snapshot();
+
+        assert_eq!(
+            diag.plant_stamps, plant_count as u64,
+            "a chunk with fewer plants than the budget should have every one of them \
+             stamped, same as before this safety valve existed",
+        );
     }
 
     /// r446: a water cell with air on its sides/bottom emits side+bottom faces (volume), but
