@@ -2308,6 +2308,48 @@ fn now_ms() -> i64 {
 
 #[cfg(feature = "app")]
 impl App {
+    /// Spawn the background hash + fingerprint job for a freshly-imported
+    /// source. `is_video` decides whether fingerprinting is attempted at
+    /// all -- hashing runs either way (any source can have an exact-match
+    /// identity; only video gets a temporal perceptual one).
+    fn spawn_provenance_job(&self, source: studio_core::SourceId, path: std::path::PathBuf, is_video: bool) {
+        let tx = self.provenance_tx.clone();
+        std::thread::Builder::new().name("studio-provenance".into()).spawn(move || {
+            let hash = studio_video::provenance::sha256_file(&path).ok()
+                .and_then(|h| std::fs::metadata(&path).ok().map(|m| (h, m.len())));
+            let fingerprint = if is_video {
+                studio_video::fingerprint::fingerprint_clip(&path, 1.0).ok()
+                    .map(|fp| studio_core::FingerprintData { hashes: fp.hashes, interval: fp.interval })
+            } else {
+                None
+            };
+            let _ = tx.send(ProvenanceJobResult { source, path, hash, fingerprint });
+        }).ok();
+    }
+
+    /// Once per frame: turn any finished provenance/fingerprint jobs into
+    /// real, undoable edits. Silent on failure beyond a status line -- a
+    /// clip a person can already see and use on the timeline should not
+    /// be blocked or rolled back just because its background identity
+    /// computation didn't finish or errored.
+    fn drain_provenance(&mut self) {
+        while let Ok(result) = self.provenance_rx.try_recv() {
+            if let Some((hash, size)) = result.hash {
+                self.studio.edit(studio_core::Op::SetProvenance {
+                    source: result.source,
+                    provenance: studio_core::Provenance {
+                        content_hash: hash, file_size: size,
+                        last_verified_path: Some(result.path.display().to_string()),
+                        verified_at: None, proxy_of: None,
+                    },
+                }, "computed provenance");
+            }
+            if let Some(fp) = result.fingerprint {
+                self.studio.edit(studio_core::Op::SetFingerprint { source: result.source, fingerprint: fp }, "computed fingerprint");
+            }
+        }
+    }
+
     /// Once per frame: say our session's name on the LAN, hear the others.
     fn lan_tick(&mut self) {
         let now = now_ms();
@@ -2687,9 +2729,37 @@ mod tests {
 /// timeline to `studio-egui`. Anything decidable lives above, where it can be
 /// tested without a window.
 #[cfg(feature = "app")]
+/// What a background provenance/fingerprint job reports back. Gated the
+/// same as `App` itself -- meaningless without it, since its only use is
+/// inside `impl App`.
+struct ProvenanceJobResult {
+    source: studio_core::SourceId,
+    /// The path this job actually hashed -- carried through so a
+    /// successful hash can record WHERE it was verified, not just that it
+    /// was.
+    path: std::path::PathBuf,
+    /// `None` if hashing failed (file vanished mid-job, permissions,
+    /// etc.) -- reported as a status line, not silently dropped.
+    hash: Option<([u8; 32], u64)>,
+    /// `None` if fingerprinting failed OR was never attempted (only
+    /// attempted for paths `library::is_video_path` recognizes -- hashing
+    /// a plain audio file is still worth doing, fingerprinting it against
+    /// a temporal-frame algorithm is not).
+    fingerprint: Option<studio_core::FingerprintData>,
+}
+
+#[cfg(feature = "app")]
 pub struct App {
     pub studio: Studio,
     peaks: std::collections::BTreeMap<studio_core::SourceId, studio_audio::Peaks>,
+    /// Background provenance/fingerprint jobs for freshly-imported video
+    /// clips: hashing a multi-gigabyte file and fingerprinting it (real
+    /// `ffmpeg` calls per sample -- seconds, not milliseconds, on real
+    /// footage, per this project's own measurements) must never run on the
+    /// UI thread. `provenance_tx` is cloned into each spawned job;
+    /// `provenance_rx` is drained once per frame in `drain_provenance`.
+    provenance_tx: std::sync::mpsc::Sender<ProvenanceJobResult>,
+    provenance_rx: std::sync::mpsc::Receiver<ProvenanceJobResult>,
     /// Decoded / synthesised audio per source — bounces and imports land
     /// here; the mixdown and the sampler both read it.
     audio: std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
@@ -2911,7 +2981,9 @@ impl Default for App {
         if let Some(m) = &midi {
             studio.status = format!("{} — midi: {}", studio.status, m.port_name());
         }
+        let (provenance_tx, provenance_rx) = std::sync::mpsc::channel();
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
+            provenance_tx, provenance_rx,
             follow: None,
               carrier, project_path, library_roots: library::Roots::from_env(library_root.clone()),
               library_root, library_tree, library_prefs,
@@ -3543,6 +3615,7 @@ impl eframe::App for App {
         if let Some(t) = self.clipboard_pending.take() { ctx.copy_text(t); }
         fx_editor::window(ctx, &mut self.studio, &colors);
         self.lan_tick();
+        self.drain_provenance();
         self.join_window(ctx);
         self.find_window(ctx);
         self.mix_pass_window(ctx);
@@ -4270,6 +4343,7 @@ impl eframe::App for App {
                             if let Ok(raw) = std::fs::read(&path) {
                                 self.studio.register_asset(id, &raw);
                             }
+                            self.spawn_provenance_job(id, path.clone(), true);
                         }
                     }
                     Err(e) => self.studio.status =

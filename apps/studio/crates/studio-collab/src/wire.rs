@@ -358,6 +358,85 @@ fn get_source(r: &mut R) -> Option<Source> {
     })
 }
 
+/// `Option<String>`: 0 = None, 1 + the string = Some. Shared because
+/// `Provenance`/`ProxyInfo` between them need it three times.
+fn put_opt_str(o: &mut Vec<u8>, s: &Option<String>) {
+    match s {
+        None => put_u8(o, 0),
+        Some(s) => { put_u8(o, 1); put_str(o, s); }
+    }
+}
+fn get_opt_str(r: &mut R) -> Option<Option<String>> {
+    Some(match r.u8()? { 0 => None, _ => Some(r.str()?) })
+}
+
+/// `Option<[u8; 32]>` (a content hash): 0 = None, 1 + 32 raw bytes = Some.
+fn put_opt_hash(o: &mut Vec<u8>, h: &Option<[u8; 32]>) {
+    match h {
+        None => put_u8(o, 0),
+        Some(h) => { put_u8(o, 1); o.extend_from_slice(h); }
+    }
+}
+fn get_opt_hash(r: &mut R) -> Option<Option<[u8; 32]>> {
+    Some(match r.u8()? {
+        0 => None,
+        _ => {
+            let mut buf = [0u8; 32];
+            for b in buf.iter_mut() { *b = r.u8()?; }
+            Some(buf)
+        }
+    })
+}
+
+fn put_fingerprint(o: &mut Vec<u8>, f: &studio_core::FingerprintData) {
+    put_ticks(o, f.interval);
+    put_u64(o, f.hashes.len() as u64);
+    for h in &f.hashes {
+        put_u64(o, *h);
+    }
+}
+fn get_fingerprint(r: &mut R) -> Option<studio_core::FingerprintData> {
+    let interval = r.ticks()?;
+    let n = r.u64()? as usize;
+    let mut hashes = Vec::with_capacity(n.min(1 << 20)); // sane cap against a corrupt length prefix
+    for _ in 0..n {
+        hashes.push(r.u64()?);
+    }
+    Some(studio_core::FingerprintData { hashes, interval })
+}
+
+fn put_provenance(o: &mut Vec<u8>, p: &studio_core::Provenance) {
+    o.extend_from_slice(&p.content_hash);
+    put_u64(o, p.file_size);
+    put_opt_str(o, &p.last_verified_path);
+    put_opt_str(o, &p.verified_at);
+    match &p.proxy_of {
+        None => put_u8(o, 0),
+        Some(px) => {
+            put_u8(o, 1);
+            put_opt_hash(o, &px.original_hash);
+            put_opt_str(o, &px.reacquire_hint);
+            put_opt_str(o, &px.note);
+        }
+    }
+}
+fn get_provenance(r: &mut R) -> Option<studio_core::Provenance> {
+    let mut content_hash = [0u8; 32];
+    for b in content_hash.iter_mut() { *b = r.u8()?; }
+    let file_size = r.u64()?;
+    let last_verified_path = get_opt_str(r)?;
+    let verified_at = get_opt_str(r)?;
+    let proxy_of = match r.u8()? {
+        0 => None,
+        _ => Some(studio_core::ProxyInfo {
+            original_hash: get_opt_hash(r)?,
+            reacquire_hint: get_opt_str(r)?,
+            note: get_opt_str(r)?,
+        }),
+    };
+    Some(studio_core::Provenance { content_hash, file_size, last_verified_path, verified_at, proxy_of })
+}
+
 fn put_op(o: &mut Vec<u8>, op: &Op) {
     match op {
         Op::AddTrack { track, at } => { put_u8(o, 1); put_track(o, track); put_u32(o, *at as u32); }
@@ -433,6 +512,14 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::RemoveCurvePoint { curve, at } => { put_u8(o, 35); put_u64(o, curve.0); put_ticks(o, *at); }
         Op::SetBinding { id, binding } => { put_u8(o, 36); put_u64(o, id.0); put_binding(o, binding); }
         Op::RemoveBinding { id } => { put_u8(o, 37); put_u64(o, id.0); }
+        Op::SetProvenance { source, provenance } => {
+            put_u8(o, 38); put_u64(o, source.0); put_provenance(o, provenance);
+        }
+        Op::RemoveProvenance { source } => { put_u8(o, 39); put_u64(o, source.0); }
+        Op::SetFingerprint { source, fingerprint } => {
+            put_u8(o, 40); put_u64(o, source.0); put_fingerprint(o, fingerprint);
+        }
+        Op::RemoveFingerprint { source } => { put_u8(o, 41); put_u64(o, source.0); }
         Op::Group { ops } => {
             put_u8(o, 25);
             put_u16(o, ops.len().min(u16::MAX as usize) as u16);
@@ -568,6 +655,10 @@ fn get_op(r: &mut R) -> Option<Op> {
         35 => Op::RemoveCurvePoint { curve: CurveId(r.u64()?), at: r.ticks()? },
         36 => Op::SetBinding { id: BindingId(r.u64()?), binding: get_binding(r)? },
         37 => Op::RemoveBinding { id: BindingId(r.u64()?) },
+        38 => Op::SetProvenance { source: SourceId(r.u64()?), provenance: get_provenance(r)? },
+        39 => Op::RemoveProvenance { source: SourceId(r.u64()?) },
+        40 => Op::SetFingerprint { source: SourceId(r.u64()?), fingerprint: get_fingerprint(r)? },
+        41 => Op::RemoveFingerprint { source: SourceId(r.u64()?) },
         25 => {
             let n = r.u16()? as usize;
             let mut ops = Vec::with_capacity(n.min(4096));
@@ -1133,6 +1224,33 @@ mod tests {
             Op::SetBinding { id: BindingId(3), binding: Binding { curve: CurveId(4),
                 target: AutoTarget::TrackGain(TrackId(1)), gate: Gate::Group(GroupId(7)) } },
             Op::RemoveBinding { id: BindingId(3) },
+            Op::SetProvenance { source: SourceId(5), provenance: studio_core::Provenance {
+                content_hash: [7u8; 32], file_size: 123_456_789,
+                last_verified_path: Some("footage/clip moved.mov".into()), // the space and awkward name are the point
+                verified_at: Some("2026-09-14T00:00:00Z".into()),
+                proxy_of: Some(studio_core::ProxyInfo {
+                    original_hash: Some([9u8; 32]),
+                    reacquire_hint: Some("Blackmagic 6K card, shoot 2026-09-06".into()),
+                    note: Some("original deleted to free the card".into()),
+                }),
+            } },
+            // The all-None shape too -- a provenance record with no proxy
+            // info is the common case (most sources are never proxies).
+            Op::SetProvenance { source: SourceId(6), provenance: studio_core::Provenance {
+                content_hash: [0u8; 32], file_size: 0,
+                last_verified_path: None, verified_at: None, proxy_of: None,
+            } },
+            Op::RemoveProvenance { source: SourceId(5) },
+            Op::SetFingerprint { source: SourceId(1), fingerprint: studio_core::FingerprintData {
+                hashes: vec![0, u64::MAX, 0x0123_4567_89ab_cdef, 1],
+                interval: Ticks::from_seconds(1.5),
+            } },
+            // Empty hash list -- a fingerprint attempt on a zero-duration
+            // or unreadable clip is a real, not-hypothetical shape.
+            Op::SetFingerprint { source: SourceId(2), fingerprint: studio_core::FingerprintData {
+                hashes: vec![], interval: Ticks::from_seconds(1.0),
+            } },
+            Op::RemoveFingerprint { source: SourceId(1) },
         ]
     }
 

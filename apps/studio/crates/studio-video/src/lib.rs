@@ -56,6 +56,8 @@
 
 /// SMPTE timecode, including drop-frame. Pure — no ffmpeg in it.
 pub mod timecode;
+pub mod fingerprint;
+pub mod provenance;
 /// Dual-system sound: aligning a separately-recorded take to picture by the clap. Pure.
 pub mod slate;
 pub mod slate_ocr;
