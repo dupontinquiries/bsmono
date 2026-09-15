@@ -784,6 +784,26 @@ impl Feel {
         if self.settings_open {
             egui::TopBottomPanel::bottom("settings").show(ctx, |ui| {
                 ui.label(egui::RichText::new("Settings").strong());
+                // SCROLL, AND CONSUME THE DRAG.
+                //
+                // This panel had no ScrollArea at all, which cost two things
+                // on a phone. The list is longer than the space, so the bottom
+                // of it was simply unreachable. And a drag over the panel was
+                // not consumed by anything, so it fell through to the board
+                // underneath and got classified as a key swipe -- which is why
+                // scrolling the settings TYPED. The keyboard was behaving
+                // correctly; nothing above it had claimed the gesture.
+                //
+                // `drag_to_scroll` is what makes a touch drag scroll rather
+                // than pass through, and it is the half that fixes the typing.
+                // Capped at 45% of the screen so the panel cannot grow until
+                // it pushes the board it is configuring off the bottom.
+                let max_h = ctx.screen_rect().height() * 0.45;
+                egui::ScrollArea::vertical()
+                    .max_height(max_h)
+                    .auto_shrink([false, true])
+                    .drag_to_scroll(true)
+                    .show(ui, |ui| {
                 // Which sections this port can actually honour. `settings::ready`
                 // exists precisely so the panel does not offer a switch that
                 // does nothing — a control that silently fails is worse than an
@@ -837,6 +857,7 @@ impl Feel {
                         r.on_hover_text(setting.help);
                     }
                 }
+                    });
             });
         }
 
