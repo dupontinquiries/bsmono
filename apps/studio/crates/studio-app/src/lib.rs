@@ -2818,6 +2818,8 @@ pub struct App {
     /// Where the take started, so it lands where it was sung.
     take_from: studio_core::Ticks,
     settings_open: bool,
+    /// The grouping graph debug panel (`ShellVerb::ShowGroupGraph`).
+    group_graph_open: bool,
     library_open: bool,
     /// Pressed→effective key translations, applied to raw typed input
     /// only (see the module docs for why the palette's keys bypass it).
@@ -2986,7 +2988,7 @@ impl Default for App {
               call: call::Call::new(),
               passes: looping::Passes::default(),
               take_from: studio_core::Ticks::ZERO,
-              settings_open: false, library_open: ws.library_open,
+              settings_open: false, group_graph_open: false, library_open: ws.library_open,
               rebinds: rebinds::Rebinds::decode(&ws.rebinds), rebind_capture: None,
               panel_nav: Default::default(),
               zones: studio_egui::playkeys::Zones::decode(&ws.piano_zones),
@@ -3562,6 +3564,16 @@ impl eframe::App for App {
                 // a half-calibration plays (zones first, layout fallback).
                 if let Some(cal) = self.piano_cal.take() { self.zones = cal.zones; }
             }
+        }
+        if self.group_graph_open {
+            let mut open = true;
+            egui::Window::new("Grouping graph").open(&mut open).resizable(true)
+                .default_size([420.0, 320.0])
+                .show(ctx, |ui| {
+                    let colors = uikit_egui::palette_colors_ctx(ctx, "midnight");
+                    studio_egui::group_graph::paint(ui, &self.studio.session.doc.project, &colors);
+                });
+            if !open { self.group_graph_open = false; }
         }
         if let Some((bus, bus_name)) = self.studio.mix_pass_request.take() {
             // Measure the ACTUAL mixdown — the thing being mastered, not a
@@ -5235,6 +5247,7 @@ impl App {
                     }
                 }
                 palette::ShellVerb::Settings => { self.settings_open = true; }
+                palette::ShellVerb::ShowGroupGraph => { self.group_graph_open = true; }
                 palette::ShellVerb::Workspace(ix) => self.apply_layout(ix as usize),
                 palette::ShellVerb::SharePattern => {
                     match self.studio.export_pattern_pack(self.studio.current_pattern)
