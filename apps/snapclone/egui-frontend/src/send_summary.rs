@@ -98,6 +98,13 @@ impl SendSummary {
     /// The headline for a row.
     pub fn primary_text(&self, f: Facet) -> String {
         match f {
+            // `format == 0` is the stripper saying it did NOT recognise this
+            // container, so nothing was examined and nothing removed. Claiming
+            // "Metadata stripped" there is a false privacy claim, which is the
+            // worst thing a receipt can do -- the Qt had this case
+            // ("Original file" / "kept as-is") and the port dropped it while
+            // `format` stayed stored-but-never-read.
+            Facet::Privacy if self.format == 0 => "Original file".into(),
             Facet::Privacy => "Metadata stripped".into(),
             Facet::Size => format!("Sending {}", human_bytes(self.upload_bytes)),
             Facet::Encryption => match self.recipients {
@@ -114,6 +121,9 @@ impl SendSummary {
     /// The supporting line.
     pub fn detail_text(&self, f: Facet) -> String {
         match f {
+            // Not "Nothing to strip": we did not look, so we cannot say there
+            // was nothing.
+            Facet::Privacy if self.format == 0 => "Kept as-is, not examined".into(),
             Facet::Privacy => match self.segments_removed {
                 // Already clean is good news, not an absence of news.
                 0 => "Nothing to strip".into(),
@@ -326,5 +336,39 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), g.len());
+    }
+
+    /// A receipt must not claim work it did not do.
+    ///
+    /// `format == 0` is the stripper reporting it did not recognise the
+    /// container: nothing was examined, so nothing was removed. The port had
+    /// dropped the Qt's case for this and reported "Metadata stripped" for
+    /// every file, with `format` stored and never read -- a false privacy
+    /// claim on exactly the screen whose job is being believable.
+    #[test]
+    fn an_unrecognised_container_does_not_claim_a_strip_that_did_not_happen() {
+        let mut s = SendSummary::default();
+        s.set_strip_result(0, 0);
+        assert_eq!(s.primary_text(Facet::Privacy), "Original file");
+        // And NOT "Nothing to strip" -- we did not look, so we cannot say
+        // there was nothing there.
+        assert_eq!(s.detail_text(Facet::Privacy), "Kept as-is, not examined");
+        assert_ne!(s.detail_text(Facet::Privacy), "Nothing to strip");
+
+        // A recognised container with nothing in it is a different, honest
+        // claim and must still read that way.
+        s.set_strip_result(1, 0);
+        assert_eq!(s.primary_text(Facet::Privacy), "Metadata stripped");
+        assert_eq!(s.detail_text(Facet::Privacy), "Nothing to strip");
+    }
+
+    /// An unrecognised container is still sendable -- only a missing recipient
+    /// blocks the send. This is a disclosure, not a fault.
+    #[test]
+    fn not_examining_a_file_does_not_block_sending_it() {
+        let mut s = SendSummary::default();
+        s.set_strip_result(0, 0);
+        s.set_recipients(2);
+        assert!(!s.blocks_send());
     }
 }

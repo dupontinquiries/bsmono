@@ -40,7 +40,7 @@ starts hidden with the auto-login ordering rule.
 | IncomingCallDialog | ported | ring.rs `IncomingCall` — 30s auto-decline, first-answer-wins, ring derived from outcome |
 | LoginWidget | ported | session.rs `Login` — optional password, Enter-moves-focus, error clears the password |
 | MainWindow | partial | 5-page shell + login-overlay ordering rule in lib.rs; status bar/export gate pending |
-| MediaSendSummary | pending |  |
+| MediaSendSummary | ported | send_summary.rs — three-facet receipt, dedupe savings, recipient count gates Send. (Ledger was stale.) Reinterpreted rather than verbatim; the Qt's unrecognised-container case was missing and has been restored — it claimed a strip that never happened. |
 | MobileDialog | ported | mobile_dialog.rs — form-factor ladder, sheet slide, result lifecycle |
 | ModalLayerTestPanel | pending |  |
 | ModalSurface | ported | modal.rs — six layers, derived scrim, tap-outside, dismissTopmost ordering |
@@ -55,7 +55,7 @@ starts hidden with the auto-login ordering rule.
 | SegmentedTabStrip | ported | nav_chrome.rs `TabStrip` — equal segments, underline, badge pills |
 | SettingsPage | partial | sub-tab table only; 4680-line page body pending |
 | SmartRibbon | ported | ribbon.rs — per-tab contextual actions, re-derived enablement, natural segments |
-| SnapComposerDialog | pending |  |
+| SnapComposerDialog | ported | composer.rs + composer_ui.rs — snapReady(image, durationSecs), caption baked into the frame by renderComposed so no overlay metadata travels. (Ledger was stale.) |
 | SnapExporter | pending |  |
 | SnapFeedWidget | ported | snaps.rs `SnapFeed` — sealed tiles, 2 columns, order as supplied |
 | SnapViewerDialog | ported | snaps.rs `Viewer` — countdown that outlives an early close, playlist mode, save-not-notify |
