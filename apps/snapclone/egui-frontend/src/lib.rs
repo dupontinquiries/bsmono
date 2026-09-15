@@ -4943,7 +4943,22 @@ impl Snapclone {
         if ui.add_enabled(self.settings.is_dirty(), egui::Button::new("Save to disk")).clicked() {
             self.settings.save();
             match crate::settings_store::store(&self.settings.current) {
-                Ok(()) => self.settings_error = None,
+                Ok(()) => {
+                    self.settings_error = None;
+                    // Was missing entirely: Save committed the in-memory
+                    // snapshot and wrote it to disk, but never pushed the
+                    // new value into `self.palette` -- the field
+                    // `uikit_egui::palette_colors(&self.palette)` actually
+                    // renders from (populated from the SEPARATE, cross-app
+                    // `settings_kit::Prefs.palette` via `apply_settings`,
+                    // not from this page's own `General.palette` at all).
+                    // The saved file was correct; the RUNNING session kept
+                    // showing the old theme until next launch, when
+                    // `settings_store::load()` happened to repopulate
+                    // things. Reported as "no color theme applied when it
+                    // is changed." Fixed by applying it live here too.
+                    self.palette = self.settings.current.general.palette.clone();
+                }
                 Err(e) => self.settings_error = Some(format!("could not save: {e}")),
             }
         }
