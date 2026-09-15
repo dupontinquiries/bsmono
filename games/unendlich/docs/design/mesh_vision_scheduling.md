@@ -22,22 +22,28 @@ is pure, always-built, unit-tested (9 tests). A **first integration pass** is
 wired behind the `mesh-vision-sched` cargo feature (off by default), r240:
 the chunk-manager shell-walk now builds the player view cone and DEFERS chunks
 no cone needs (behind the player / out of range) from meshing. **Occlusion is
-still OFF** in this pass (conservative — never defers an in-view chunk, so no
-holes in front of you); the occlusion-backed cave win is the next step. NEEDS
-A RUN to validate (compile-verified only — no GPU in the build sandbox).
+now real** (r-mesh-vision-occlusion, after r240): the shell-walk's occlusion
+predicate calls `sim::vision::line_of_sight` through `ChunkManager::drone_view()`
+-- the same deterministic voxel raycaster wired for creature vision -- instead
+of the original hardcoded `false`. NEEDS A RUN to validate (compile-verified
+only -- no GPU in the build sandbox).
 
-### Wired (r240, conservative pass)
+### Wired (r240, conservative pass; occlusion made real in a later follow-up)
 - `ChunkManager` gained a gated `player_view_yaw` + `set_player_view_yaw`,
   fed each frame from `local_player.view.yaw` in the bin.
 - In the shell-walk (`request_visible`), each candidate chunk gets
-  `urgency_for_cones(&[player_cone], chunk_center, |_,_| false)`; on `Defer`
+  `urgency_for_cones(&[player_cone], chunk_center, occluded_for)`; on `Defer`
   the chunk is skipped for meshing this pass (and its budget slot refunded).
   Voxels still load; the mesh is rebuilt when the player turns toward it
   (the walk runs every update).
-- Occlusion predicate is hardcoded `false` for now → only clearly-unseen
-  (behind / out-of-range) chunks defer. Wiring a real LOS/occlusion source
-  (raycast → GPU occlusion query) is the follow-up that unlocks the
-  dense-cave-interior win.
+- Occlusion predicate: `occluded_for` runs `line_of_sight(eye, chunk_center,
+  &self.drone_view())` -- a real per-voxel raycast, not a stub. Only clearly-
+  unseen (behind / out-of-range / genuinely blocked by solid voxels) chunks
+  defer now; the line_of_sight check is one-directional-safe (it can only add
+  correctly-identified occluded cases on top of the old always-false stub, it
+  can't produce a wrong defer that wasn't already possible before, since a
+  clear line of sight still reports not-occluded exactly as before). This is
+  what unlocks the dense-cave-interior win described below.
 
 ## The model
 
@@ -67,15 +73,21 @@ test) so mesh-vision and AI-vision agree on "in view".
 `occluded` / `occluded_for` are predicates the *caller* supplies. The model
 stays pure and testable; the real occlusion source plugs in at the call site.
 Options, cheapest first:
-- **Chunk-level LOS**: march the existing `raycast` from the eye to the chunk
-  center; if it hits solid before arriving, occluded. Cheap, coarse, good
-  enough to defer fully-buried cave chunks.
+- **Chunk-level LOS** (IMPLEMENTED, r-mesh-vision-occlusion): march
+  `sim::vision::line_of_sight` from the eye to the chunk center through
+  `ChunkManager::drone_view()`; if it hits solid before arriving, occluded.
+  Cheap, coarse, good enough to defer fully-buried cave chunks. This is the
+  same deterministic voxel raycaster used for creature vision LOS, reused
+  here rather than building a second occlusion mechanism.
 - **GPU occlusion queries / a depth pre-pass**: the precise version — last
   frame's depth tells you which chunks contributed no visible fragments; those
-  are occluded this frame. Reuses the draw pipeline.
+  are occluded this frame. Reuses the draw pipeline. Not implemented; the
+  chunk-level LOS above is coarser but already real, so this is only worth
+  building if profiling a real cave-heavy session shows the coarse version
+  isn't catching enough.
 - **Portal/visibility between chunk faces** for caves specifically (which chunk
   faces connect through open air) — the most accurate for interiors, the most
-  work.
+  work. Not implemented.
 
 ## Integration recipe (the `mesh-vision-sched`-gated part)
 
@@ -122,7 +134,8 @@ cargo run --release --bin unendlich-fullgame \
 - **Correctness over speed**: a wrong "defer" shows the player an unmeshed hole.
   The occlusion predicate must be *conservative* (when unsure, don't defer).
   The pure model already biases this way (occluded+near → Soon, not Defer).
-- This is a real pipeline change touching the mesh queue + needs the occlusion
-  source wired; only the decision model is done here. Nothing is on the default
-  path, so the engine is unaffected until the gated integration is built and
-  validated in a running session.
+- This is a real pipeline change touching the mesh queue, and the occlusion
+  source is now wired (chunk-level LOS via `line_of_sight`, see above) --
+  still gated behind `mesh-vision-sched`, off by default, so nothing is on
+  the default path until this is built and validated in a running session
+  (`cargo run --features mesh-vision-sched`, per "How to test" above).
