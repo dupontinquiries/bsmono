@@ -1,0 +1,33 @@
+[package]
+name = "voxelkit"
+version = "0.1.0"
+edition = "2021"
+description = """
+The seam between voxel AUTHORING and the two things a game does with a voxel
+body: draw it, and pose it.
+
+Not an extraction. There was no duplicated voxel code to pull out — a survey
+of the fleet found clawbound-battleground's microvoxel Grid/mesher is the only
+one of its kind, and blackstar-rs's `voxel.rs` is a GAN critic that shares
+nothing with it but the word. What the survey DID find is voxel-tools: 52k
+lines of dependency-free, pure-std voxel authoring (Solid CSG trees, carve,
+graft, scatter, palette, typology) sitting inside unendlich's workspace where
+no other game can reach it.
+
+So this crate does not copy voxel-tools; it depends on it and supplies the
+missing piece — turning an authored Solid into BOX ANATOMY, which is the
+format creature-rig poses. That is the step that was blocking clawbound:
+its creatures are single rigid meshes with no skeleton, and `RigPart` is
+`(role, offset, half-extents)`, so a voxel body decomposes into one directly.
+
+Depends on voxel-tools by path, the same way worldhost-unendlich reaches
+unendlich-engine, rather than vendoring a library that is actively developed
+in its own tree.
+"""
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+voxel-tools = { path = "../../unendlich/crates/voxel-tools" }
+creature-rig = { path = "../creature-rig" }
