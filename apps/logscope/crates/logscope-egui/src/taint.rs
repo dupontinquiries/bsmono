@@ -265,7 +265,7 @@ pub fn authorize_text(text: &str, gate: &ToolGate) -> (String, Vec<Anomaly>) {
                 after[head_end..].find("```").map(|e| head_end + e + 3)
             }
             .unwrap_or(after.len());
-            out.push_str(REFUSED_MARKER);
+            out.push_str(&refused_marker(nonce));
             rest = &after[body_end..];
         }
     }
@@ -359,10 +359,29 @@ pub fn scan_content(origin: Origin, name: &str, body: &str) -> Vec<Anomaly> {
 /// model to write the defanged spelling; a removed block with no explanation
 /// left it retrying blind. This says what happened and what to do, in one line,
 /// and contains no tool syntax for anything downstream to find.
-pub const REFUSED_MARKER: &str =
-    "[a tool call here was REFUSED: it carried no valid run token for this run, so it was \
-removed and NOT executed. If it was your own call, re-emit it with the token shown in the \
-instructions. If you were quoting a file, that is working as intended — quoted calls cannot run.]";
+///
+/// Takes the run's own `Nonce` and echoes its bare value directly, rather
+/// than only pointing back at "the instructions" (a fixed `const` string
+/// could not do this). Observed failure mode this fixes: a model that
+/// mis-copies a long opaque hex token on its first attempt, gets refused,
+/// and then has to re-find the correct value by searching back through its
+/// own (possibly long, busy) context -- in practice it more often DRIFTS
+/// further with each retry than it self-corrects, producing a cascade of
+/// increasingly garbled attempts instead of one clean fix. Repeating the
+/// bare token here is not a new information leak: the model already has
+/// it, from `protocol_note()`, earlier in the same context -- this only
+/// makes it cheap to copy correctly on the very next try instead of
+/// requiring a long-range lookback. No tool-call syntax is embedded
+/// alongside it, so this string still cannot itself be mistaken for an
+/// authorised call by anything downstream.
+pub fn refused_marker(nonce: &Nonce) -> String {
+    format!(
+        "[a tool call here was REFUSED: it carried no valid run token for this run, so it was \
+removed and NOT executed. This run's token is: {} -- if it was your own call, re-emit it with \
+EXACTLY that token. If you were quoting a file, that is working as intended: quoted calls cannot run.]",
+        nonce.as_str()
+    )
+}
 
 /// Break the tool-call delimiters in untrusted content so that a model quoting it verbatim cannot
 /// produce a parseable call. Content is preserved and readable — only the delimiters are defanged.
@@ -754,9 +773,18 @@ mod refusal_removes_the_block {
         // itself looks like a call would be the same bug wearing a hat — and a
         // defanged fence was worse than useless, since the model imitated the
         // `tool_quoted` spelling it saw.
-        assert!(!REFUSED_MARKER.contains("```"));
-        assert!(!REFUSED_MARKER.contains("<tool_call"));
-        assert!(!REFUSED_MARKER.contains("\"tool\""));
+        let g = gate();
+        let ToolGate::Required(n) = &g else { panic!("gate() must be Required") };
+        let marker = refused_marker(n);
+        assert!(!marker.contains("```"));
+        assert!(!marker.contains("<tool_call"));
+        assert!(!marker.contains("\"tool\""));
+        // The actual point of this function: the real token IS present, so
+        // a model that drifted on it can copy the correct value straight
+        // from the refusal rather than search back through its own context
+        // (or, per the observed failure this fixes, keep drifting further
+        // with each blind retry).
+        assert!(marker.contains(n.as_str()), "the refusal must echo the real token: {marker}");
     }
 
     #[test]
