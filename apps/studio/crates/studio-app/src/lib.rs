@@ -2950,6 +2950,17 @@ pub struct App {
     loaded: SinkContent,
 }
 
+/// What should move the playhead when the sink has no position to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SilentFallback {
+    /// The sink is reporting a position; audio wins, as it normally does.
+    SinkDrives,
+    /// A buffer is loaded but has no audible content. Run a wall clock.
+    WallClock,
+    /// Nothing is loaded at all -- genuinely the end.
+    Stop,
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum SinkContent {
     Nothing,
@@ -5450,6 +5461,41 @@ impl App {
     /// tested directly, the same way `Transport`/`video_at` are tested
     /// directly rather than through a full running app. See
     /// `sink_resync_tests` below.
+    /// What drives the playhead this tick when the sink reports no position.
+    ///
+    /// Pulled out as a pure function -- no `self`, no sink, no device -- for
+    /// the same reason `should_resync` was: the bug it closes is invisible
+    /// without an audio device and a loaded project, and this way it is a
+    /// `cargo test` that runs in microseconds. See `silent_clock_tests`.
+    ///
+    /// `loaded` is what the sink currently holds. `Nothing` genuinely has
+    /// nothing to play and must still stop; anything else means a buffer was
+    /// loaded and simply has no audible content, which is a missing clock
+    /// rather than the end of the timeline.
+    fn silent_fallback(loaded: &SinkContent, sink_has_position: bool) -> SilentFallback {
+        if sink_has_position {
+            SilentFallback::SinkDrives
+        } else if *loaded == SinkContent::Nothing {
+            SilentFallback::Stop
+        } else {
+            SilentFallback::WallClock
+        }
+    }
+
+    /// Frames to advance for an elapsed wall-clock interval.
+    ///
+    /// Clamped so a stalled frame -- a modal dialog, a long render, the
+    /// process being suspended -- cannot teleport the playhead across the
+    /// timeline. Separate from `silent_fallback` so the clamp is testable on
+    /// its own.
+    fn silent_frames(dt_secs: f64, rate: u32) -> i64 {
+        const MAX_STEP: f64 = 0.25;
+        if !dt_secs.is_finite() || dt_secs <= 0.0 {
+            return 0;
+        }
+        (dt_secs.min(MAX_STEP) * rate as f64) as i64
+    }
+
     fn should_resync(loaded: &SinkContent, want: &SinkContent, arrangement_dirty: bool, seek_pending: bool) -> bool {
         loaded != want || arrangement_dirty || seek_pending
     }
@@ -5570,22 +5616,21 @@ impl App {
                 // The audio path is untouched: whenever the sink can report a
                 // position it still wins, and `silent_clock` is cleared above
                 // so a project that gains audio hands the clock straight back.
-                let empty = self.loaded != SinkContent::Nothing && self.sink.position().is_none();
-                if empty {
-                    let now = std::time::Instant::now();
-                    let last = self.silent_clock.replace(now);
-                    if let Some(prev) = last {
-                        // Clamped: a stalled frame (a modal dialog, a long
-                        // render, the process being suspended) must not
-                        // teleport the playhead across the timeline.
-                        let dt = now.duration_since(prev).as_secs_f64().min(0.25);
-                        let frames = (dt * self.sink.rate() as f64) as i64;
-                        self.studio.transport.advance(frames);
+                match Self::silent_fallback(&self.loaded, false) {
+                    SilentFallback::WallClock => {
+                        let now = std::time::Instant::now();
+                        let last = self.silent_clock.replace(now);
+                        if let Some(prev) = last {
+                            let dt = now.duration_since(prev).as_secs_f64();
+                            let frames = Self::silent_frames(dt, self.sink.rate());
+                            self.studio.transport.advance(frames);
+                        }
                     }
-                } else {
-                    self.silent_clock = None;
-                    self.studio.transport.stop();
-                    self.studio.status = "reached the end".into();
+                    SilentFallback::Stop | SilentFallback::SinkDrives => {
+                        self.silent_clock = None;
+                        self.studio.transport.stop();
+                        self.studio.status = "reached the end".into();
+                    }
                 }
             }
         } else if self.studio.rack_playing {
@@ -6229,6 +6274,73 @@ impl studio_egui::playkeys::AnalogSource for WootingAnalog {
 #[cfg(test)]
 mod sink_resync_tests {
     use super::*;
+
+    /// THE VIDEO-ONLY-TIMELINE BUG. An arrangement that renders no audio gave
+    /// `sink.position() == None` AND `sink.playing() == false` (NullSink's
+    /// playing() is `playing && (looped || raw_pos() < frames)`, false at zero
+    /// frames), so sync_sink stopped it with "reached the end" before a frame
+    /// elapsed. A video-only timeline -- the kdenlive case -- could never play.
+    #[test]
+    fn a_loaded_but_silent_arrangement_runs_a_wall_clock_instead_of_stopping() {
+        // SinkContent deliberately has no Debug -- ArrangementLoop carries a
+        // looping::Window -- so the label is spelled out rather than derived.
+        for (name, loaded) in [("Arrangement", SinkContent::Arrangement),
+                               ("RackLoop", SinkContent::RackLoop)] {
+            assert_eq!(
+                App::silent_fallback(&loaded, false),
+                SilentFallback::WallClock,
+                "{name} is loaded and merely silent -- a missing clock, not the end"
+            );
+        }
+    }
+
+    /// Nothing loaded is genuinely the end; the old behaviour must survive.
+    #[test]
+    fn nothing_loaded_still_stops() {
+        assert_eq!(App::silent_fallback(&SinkContent::Nothing, false), SilentFallback::Stop);
+    }
+
+    /// Audio keeps priority whenever it can report a position -- transport
+    /// rule No.1 is unchanged for every project that has sound.
+    #[test]
+    fn the_sink_still_wins_whenever_it_has_a_position() {
+        for loaded in [SinkContent::Nothing, SinkContent::Arrangement, SinkContent::RackLoop] {
+            assert_eq!(App::silent_fallback(&loaded, true), SilentFallback::SinkDrives);
+        }
+    }
+
+    /// A stalled frame must not teleport the playhead across the timeline.
+    #[test]
+    fn a_long_stall_is_clamped_to_one_step() {
+        let rate = 48_000;
+        let normal = App::silent_frames(1.0 / 60.0, rate);
+        assert!(normal > 0 && normal < 900, "a 60fps tick is ~800 frames, got {normal}");
+        // Ten seconds of stall yields the same as the 250ms cap, not 10s.
+        assert_eq!(App::silent_frames(10.0, rate), App::silent_frames(0.25, rate));
+        assert_eq!(App::silent_frames(10.0, rate), 12_000);
+    }
+
+    /// Non-advancing or nonsensical intervals must move nothing rather than
+    /// running the playhead backwards.
+    #[test]
+    fn a_zero_or_bad_interval_advances_nothing() {
+        for dt in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let f = App::silent_frames(dt, 48_000);
+            assert!(f >= 0, "dt {dt} produced {f}");
+            if dt <= 0.0 || dt.is_nan() {
+                assert_eq!(f, 0, "dt {dt} must not move the playhead");
+            }
+        }
+        // Infinity is finite-checked into the clamp, never a huge jump.
+        assert_eq!(App::silent_frames(f64::INFINITY, 48_000), 0);
+    }
+
+    /// The clock must scale with the device rate, not assume 48k.
+    #[test]
+    fn frames_scale_with_the_sample_rate() {
+        assert_eq!(App::silent_frames(0.25, 44_100), 11_025);
+        assert_eq!(App::silent_frames(0.25, 96_000), 24_000);
+    }
 
     /// The exact bug: pause, seek backward, play. Nothing about WHAT is
     /// loaded changes (still a plain, non-looped arrangement) and no
