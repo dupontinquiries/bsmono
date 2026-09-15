@@ -112,6 +112,9 @@ mod tests {
     /// worse than resolving nothing.
     #[test]
     fn a_missing_config_is_an_empty_list_not_a_failure() {
+        // See lib.rs's ENV_TEST_LOCK doc comment: HOME is process-global and
+        // mail_store.rs's test mutates HOME (and MAIL) too.
+        let _env_guard = crate::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("vt-ssh-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

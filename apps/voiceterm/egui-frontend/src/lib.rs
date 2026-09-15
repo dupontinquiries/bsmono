@@ -516,6 +516,20 @@ pub mod kbd_focus;
 pub mod osc7;
 /// Turning this terminal's blocks into `session_auto`'s activity vocabulary.
 pub mod session_proposals;
+
+/// Serializes tests (in `mail_store.rs` and `editor_open_env.rs`) that mutate
+/// `HOME`/`MAIL` via `std::env::set_var`/`remove_var`. Both files' tests were
+/// commented "SAFETY: single-threaded test" -- but `cargo test` runs this
+/// crate's tests concurrently by default, and those calls mutate
+/// process-global state. One test's HOME landing mid-run of the other can
+/// make `mail_store::discover()` see a real mailbox under the wrong HOME (or
+/// `ssh_config_hosts()` see the wrong `.ssh`), which is exactly the shape of
+/// `mail_store::tests::an_empty_pane_says_where_it_looked`'s observed
+/// failure: `empty_reason()` returning `None` (a store WAS found) when the
+/// test's own freshly-created temp dir has nothing in it.
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // The GestureHost+SlidePopup replacement (grid gesture menus with QML-parity variants) lives in
 // the shared kit; re-exported under a voiceterm-familiar name.
 pub use uikit_egui::slide_menu;

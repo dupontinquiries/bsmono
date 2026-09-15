@@ -278,6 +278,9 @@ mod tests {
     /// build cannot reach.
     #[test]
     fn an_empty_pane_says_where_it_looked() {
+        // See lib.rs's ENV_TEST_LOCK doc comment: HOME/MAIL are process-global
+        // and editor_open_env.rs's tests mutate HOME too.
+        let _env_guard = crate::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("vt-mail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
