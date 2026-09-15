@@ -111,6 +111,34 @@ impl PaletteFlow {
         self.mode
     }
 
+    /// How far into the current dwell window `Command` mode is, 0.0 at
+    /// entry to 1.0 at the threshold and beyond -- the raw input to a
+    /// "mic is about to switch on" indicator. 0.0 outside `Command`
+    /// (nothing dwelling toward voice in `Off` or `Voice` -- `Voice` is
+    /// already there, not approaching it).
+    pub fn dwell_progress(&self) -> f32 {
+        if self.mode != Mode::Command {
+            return 0.0;
+        }
+        (self.idle_ms / self.dwell_ms).min(1.0)
+    }
+
+    /// An explicit manual override -- right-click or hold on the mic
+    /// indicator, say -- rather than waiting for Ctrl+P, typing, or the
+    /// dwell timer. Always goes straight to `Off` from either open mode,
+    /// resetting the escalation the same way a real Ctrl+P close does;
+    /// a no-op from `Off`. Returns the same `Transition::Closed`/`None`
+    /// shape `ctrl_p_tapped`'s close branch does, so a caller already
+    /// handling that transition (cancelling an in-flight capture on
+    /// `Closed(Mode::Voice)`) does not need a second match arm for this
+    /// path.
+    pub fn force_off(&mut self) -> Transition {
+        match self.mode {
+            Mode::Off => Transition::None,
+            Mode::Command | Mode::Voice => self.close(),
+        }
+    }
+
     /// Ctrl+P was tapped. Opens (to `Command`, resetting the escalation)
     /// from `Off`; closes (to `Off`) from either open mode.
     pub fn ctrl_p_tapped(&mut self) -> Transition {
@@ -121,12 +149,14 @@ impl PaletteFlow {
                 self.dwell_ms = FIRST_DWELL_MS;
                 Transition::Opened
             }
-            Mode::Command | Mode::Voice => {
-                let was = self.mode;
-                self.mode = Mode::Off;
-                Transition::Closed(was)
-            }
+            Mode::Command | Mode::Voice => self.close(),
         }
+    }
+
+    fn close(&mut self) -> Transition {
+        let was = self.mode;
+        self.mode = Mode::Off;
+        Transition::Closed(was)
     }
 
     /// A text/typing event landed while the palette is open. A no-op
@@ -307,5 +337,64 @@ mod tests {
         f.ctrl_p_tapped();
         assert_eq!(f.voice_refused(), Transition::None, "Command must be unaffected");
         assert_eq!(f.mode(), Mode::Command);
+    }
+
+    #[test]
+    fn dwell_progress_is_zero_outside_command() {
+        let mut f = PaletteFlow::new();
+        assert_eq!(f.dwell_progress(), 0.0, "Off");
+        f.ctrl_p_tapped();
+        f.tick(FIRST_DWELL_MS); // -> Voice
+        assert_eq!(f.dwell_progress(), 0.0, "Voice is already there, not approaching it");
+    }
+
+    #[test]
+    fn dwell_progress_tracks_the_ratio_and_clamps_at_one() {
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped();
+        assert_eq!(f.dwell_progress(), 0.0);
+        f.tick(FIRST_DWELL_MS / 2.0);
+        assert!((f.dwell_progress() - 0.5).abs() < 0.01);
+        f.tick(FIRST_DWELL_MS * 10.0); // well past -- but this also crosses
+                                        // into Voice, so progress must read 0
+                                        // again (Voice, not approaching it)
+        assert_eq!(f.dwell_progress(), 0.0, "once switched to Voice, progress is not 'past 1.0', it is the wrong question");
+    }
+
+    #[test]
+    fn dwell_progress_uses_the_escalated_threshold_after_typing() {
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped();
+        f.tick(FIRST_DWELL_MS); // -> Voice
+        f.on_type(); // -> Command, dwell escalated to 1500
+        f.tick(FIRST_DWELL_MS); // 750 of 1500
+        assert!((f.dwell_progress() - 0.5).abs() < 0.01, "progress must be against the ESCALATED dwell, not the original");
+    }
+
+    #[test]
+    fn force_off_closes_from_either_open_mode_and_is_a_no_op_from_off() {
+        let mut f = PaletteFlow::new();
+        assert_eq!(f.force_off(), Transition::None, "already Off");
+
+        f.ctrl_p_tapped(); // -> Command
+        assert_eq!(f.force_off(), Transition::Closed(Mode::Command));
+        assert_eq!(f.mode(), Mode::Off);
+
+        f.ctrl_p_tapped();
+        f.tick(FIRST_DWELL_MS); // -> Voice
+        assert_eq!(f.force_off(), Transition::Closed(Mode::Voice));
+        assert_eq!(f.mode(), Mode::Off);
+    }
+
+    #[test]
+    fn force_off_resets_the_escalation_the_same_as_a_real_close() {
+        let mut f = PaletteFlow::new();
+        f.ctrl_p_tapped();
+        f.tick(FIRST_DWELL_MS); // -> Voice
+        f.on_type(); // -> Command, escalated to 1500
+        f.force_off(); // -> Off
+
+        f.ctrl_p_tapped(); // reopen -> Command
+        assert_eq!(f.tick(FIRST_DWELL_MS), Transition::SwitchedToVoice, "a fresh open after force_off must use the SHORT dwell");
     }
 }

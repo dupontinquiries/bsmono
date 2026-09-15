@@ -156,6 +156,12 @@ pub mod palette_flow;
 /// kit have no use for. First moved here from voiceterm-egui
 /// (`maintenance/C18_TODO.md` -- the Ctrl+P wiring work), where it lived
 /// as a local, non-reusable module before this extraction.
+/// Warming/listening indicator with a hold-to-cancel gesture. Deliberately
+/// NOT gated behind `voice-popup` -- it depends only on egui, PaletteColors,
+/// and cmdstrip::Hold, none of which need voice-engine-kit, so an app
+/// drawing its own capture UI can reuse this widget without pulling in
+/// whisper-rs/cpal for a widget that never touches either.
+pub mod mic_indicator;
 #[cfg(feature = "voice-popup")]
 pub mod voice_popup;
 pub mod tokens;

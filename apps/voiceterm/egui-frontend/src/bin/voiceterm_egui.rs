@@ -687,6 +687,9 @@ struct VoicetermApp {
     /// State for the voice popup Ctrl+P opens (via palette_flow's
     /// SwitchedToVoice transition).
     voice_popup: uikit_egui::voice_popup::VoicePopup,
+    /// The "about to switch on" / "listening" badge drawn beside the
+    /// palette's own query box, with its own hold-to-cancel timer.
+    mic_indicator: uikit_egui::mic_indicator::MicIndicator,
     /// Promotion thresholds for the acoustic cache — the runtime knobs the
     /// original exposes, here on the Docs tab beside the corpus tape that
     /// feeds it.
@@ -3323,6 +3326,40 @@ impl eframe::App for VoicetermApp {
                     self.palette_flow.ctrl_p_tapped(); // Voice -> Off
                 }
                 self.voice_popup.cancel();
+            }
+        }
+
+        // The "about to switch on"/"listening" badge, drawn OUTSIDE both
+        // surfaces above -- it has to stay visible across BOTH `Command`
+        // (dwelling) and `Voice` (listening), and `palette_ui`/the voice
+        // popup's own overlay are only ever drawn one at a time (whichever
+        // surface is actually open), so nesting the indicator inside
+        // either one would make it disappear exactly when the OTHER mode
+        // is showing -- caught before wiring it in nested inside
+        // `palette_ui`, where the `listening` state could never actually
+        // be reached.
+        if self.palette_flow.mode() != uikit_egui::palette_flow::Mode::Off {
+            let dt = ctx.input(|i| i.stable_dt);
+            let warming = self.palette_flow.dwell_progress();
+            let listening = self.palette_flow.mode() == uikit_egui::palette_flow::Mode::Voice;
+            let action = egui::Area::new(egui::Id::new("voiceterm_mic_indicator"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    self.mic_indicator.draw(ui, &self.colors, warming, listening, dt)
+                })
+                .inner;
+            if action == uikit_egui::mic_indicator::MicAction::ForceOff {
+                match self.palette_flow.force_off() {
+                    uikit_egui::palette_flow::Transition::Closed(uikit_egui::palette_flow::Mode::Command) => {
+                        self.surfaces.close_if(Surface::Palette);
+                    }
+                    uikit_egui::palette_flow::Transition::Closed(uikit_egui::palette_flow::Mode::Voice) => {
+                        self.surfaces.close_if(Surface::Voice);
+                        self.voice_popup.cancel();
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -6370,6 +6407,7 @@ fn main() -> eframe::Result<()> {
                 palette_flow: Default::default(),
                 ctrl_p_gesture: Default::default(),
                 voice_popup: Default::default(),
+                mic_indicator: Default::default(),
                 acoustic: Default::default(),
                 acoustic_distance: 0.20,
                 acoustic_confirms: 2,
