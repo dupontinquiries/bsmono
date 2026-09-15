@@ -343,6 +343,12 @@ pub struct Group {
     /// still loads.
     #[serde(default)]
     pub tempo: Option<TempoMap>,
+    /// Which member is the "active take", when this group is a
+    /// take-bucket rather than a plain composition. `None` = not a
+    /// bucket, or no choice made -- an ordinary group, exactly as before
+    /// this field existed. `#[serde(default)]` for the usual reason.
+    #[serde(default)]
+    pub active: Option<ClipId>,
 }
 
 /// An effect parameter's key, fixed-width so an [`AutoTarget`] stays
@@ -670,6 +676,21 @@ pub enum Op {
     /// with, or a rename would need to start threading tempo through too.
     /// Refused on a group that does not exist, same as `SetGroupKey`.
     SetGroupTempo { id: GroupId, tempo: Option<TempoMap> },
+    /// Same shape again, for which member is the "active take" -- the one
+    /// that actually renders/exports when the group is a take-bucket
+    /// rather than a plain composition. Pure data: this field carries no
+    /// opinion about how a UI shows it (badge, thumbnail, data view,
+    /// nothing at all) -- every view mode reads the SAME `active` value,
+    /// there is exactly one of it, never a per-view copy. `None` means
+    /// "not a take-bucket" / "no choice made yet", not an error -- a group
+    /// with no active member is an ordinary composition, unchanged from
+    /// before this field existed. Refused on a group that does not exist,
+    /// same as `SetGroupKey`/`SetGroupTempo`. Does NOT validate that
+    /// `active` is actually a member of `clips` -- a take temporarily
+    /// removed from the bucket (or a bucket about to gain a new take)
+    /// should not have to clear this first; a UI reads a dangling active
+    /// pointer the same way it already reads a dangling group member.
+    SetGroupActive { id: GroupId, active: Option<ClipId> },
     /// Add or move a named marker. Absolute by NAME: setting a marker
     /// that already exists moves it, which is what "set the chorus here"
     /// means when you meant it the second time.
@@ -1089,19 +1110,19 @@ impl Project {
                 if clips.is_empty() {
                     return Err(EditError::EmptyGroup);
                 }
-                let (old_key, old_tempo) = self.groups.get(id)
-                    .map(|g| (g.key, g.tempo.clone())).unwrap_or((None, None));
+                let (old_key, old_tempo, old_active) = self.groups.get(id)
+                    .map(|g| (g.key, g.tempo.clone(), g.active)).unwrap_or((None, None, None));
                 let inv = match self.groups.get(id) {
                     Some(old) => Op::SetGroup { id: *id, name: old.name.clone(),
                                                 clips: old.clips.clone() },
                     None => Op::RemoveGroup { id: *id },
                 };
-                // Neither key nor tempo travels through `SetGroup` — both
-                // have their own ops and their own last-write-wins slots,
+                // Neither key, tempo, nor active travels through `SetGroup`
+                // — each has its own op and its own last-write-wins slot,
                 // same reasoning as why renaming a track doesn't reset its
-                // fader. A rename must not silently erase either.
+                // fader. A rename must not silently erase any of them.
                 self.groups.insert(*id, Group { name: name.clone(), clips: clips.clone(),
-                                                 key: old_key, tempo: old_tempo });
+                                                 key: old_key, tempo: old_tempo, active: old_active });
                 Ok(inv)
             }
             Op::SetKey { key } => {
@@ -1119,6 +1140,12 @@ impl Project {
                 let g = self.groups.get_mut(id).ok_or(EditError::NoSuchGroup(*id))?;
                 let inv = Op::SetGroupTempo { id: *id, tempo: g.tempo.clone() };
                 g.tempo = tempo.clone();
+                Ok(inv)
+            }
+            Op::SetGroupActive { id, active } => {
+                let g = self.groups.get_mut(id).ok_or(EditError::NoSuchGroup(*id))?;
+                let inv = Op::SetGroupActive { id: *id, active: g.active };
+                g.active = *active;
                 Ok(inv)
             }
             Op::SetMarker { at, name } => {
@@ -1166,18 +1193,21 @@ impl Project {
             Op::RemoveGroup { id } => {
                 let old = self.groups.remove(id).ok_or(EditError::NoSuchGroup(*id))?;
                 let restore = Op::SetGroup { id: *id, name: old.name, clips: old.clips };
-                // Same reasoning as the key: both key and tempo have their
-                // own ops, and by the time this inverse runs the group is
-                // already gone, so `SetGroup`'s own preservation logic has
-                // nothing to read from. Bundle whichever of the two
-                // actually had a value — a keyless, tempoless group's undo
-                // stays the plain single op it always was.
+                // Same reasoning as the key: key, tempo, and active each
+                // have their own op, and by the time this inverse runs the
+                // group is already gone, so `SetGroup`'s own preservation
+                // logic has nothing to read from. Bundle whichever
+                // actually had a value — a plain group's undo stays the
+                // single op it always was.
                 let mut restores = vec![restore];
                 if let Some(key) = old.key {
                     restores.push(Op::SetGroupKey { id: *id, key: Some(key) });
                 }
                 if let Some(tempo) = old.tempo {
                     restores.push(Op::SetGroupTempo { id: *id, tempo: Some(tempo) });
+                }
+                if let Some(active) = old.active {
+                    restores.push(Op::SetGroupActive { id: *id, active: Some(active) });
                 }
                 if restores.len() == 1 {
                     Ok(restores.pop().unwrap())
@@ -2155,6 +2185,65 @@ mod group_and_bus_input_tests {
         assert_eq!(p.groups[&GroupId(1)].name, "Verse");
         assert_eq!(p.groups[&GroupId(1)].key, Some(d_dorian),
                    "undo-of-remove must not silently drop the song's key");
+    }
+
+    #[test]
+    fn a_groups_active_take_has_its_own_op_and_survives_rename_and_remove_undo() {
+        let mut p = project();
+        p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
+            name: "A".into(), muted: false, locked: false, gain: 1.0, route: None },
+            at: 0 }).unwrap();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x.mov".into(),
+            len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2,
+            has_video: true } }).unwrap();
+        for id in [1u64, 2] {
+            p.apply(&Op::AddClip { clip: Clip { id: ClipId(id), source: SourceId(1),
+                track: TrackId(1), pos: Ticks::from_seconds(id as f64 * 2.0),
+                src_in: Ticks::ZERO, len: Ticks::from_seconds(1.0),
+                gain: 1.0, effects: vec![] } }).unwrap();
+        }
+        p.apply(&Op::SetGroup { id: GroupId(1), name: "Take Bucket".into(),
+                                clips: vec![ClipId(1), ClipId(2)] }).unwrap();
+
+        // Same refusal shape as SetGroupKey/SetGroupTempo -- a take-bucket
+        // pointer needs a group to belong to.
+        assert!(matches!(p.apply(&Op::SetGroupActive { id: GroupId(99), active: None }),
+                         Err(EditError::NoSuchGroup(GroupId(99)))));
+
+        let inv = p.apply(&Op::SetGroupActive { id: GroupId(1), active: Some(ClipId(2)) }).unwrap();
+        assert_eq!(p.groups[&GroupId(1)].active, Some(ClipId(2)));
+        assert_eq!(inv, Op::SetGroupActive { id: GroupId(1), active: None }, "invert = the old value");
+        p.apply(&inv).unwrap();
+        assert_eq!(p.groups[&GroupId(1)].active, None, "inverse round-trips cleanly");
+        p.apply(&Op::SetGroupActive { id: GroupId(1), active: Some(ClipId(2)) }).unwrap();
+
+        // The whole reason this is its own op, not a `SetGroup` field: a
+        // rename/restate must not silently flip which take is chosen.
+        p.apply(&Op::SetGroup { id: GroupId(1), name: "Take Bucket (renamed)".into(),
+                                clips: vec![ClipId(1), ClipId(2)] }).unwrap();
+        assert_eq!(p.groups[&GroupId(1)].active, Some(ClipId(2)),
+                   "a rename silently resetting which take is active would be exactly the bug this guards");
+
+        // Same "the group is already gone by the time this inverse runs"
+        // reasoning as the key/tempo test.
+        let inv_remove = p.apply(&Op::RemoveGroup { id: GroupId(1) }).unwrap();
+        assert!(p.groups.get(&GroupId(1)).is_none());
+        p.apply(&inv_remove).unwrap();
+        assert_eq!(p.groups[&GroupId(1)].active, Some(ClipId(2)),
+                   "undo-of-remove must not silently drop which take was chosen");
+    }
+
+    /// Data, not semantics: `active` doesn't have to point at a CURRENT
+    /// member. A take temporarily pulled from the bucket (or one about to
+    /// be added) shouldn't force clearing the pointer first -- same
+    /// "dangling is a consumer's problem, not this layer's" contract
+    /// `groups` itself already documents for membership.
+    #[test]
+    fn active_may_point_at_a_clip_no_longer_in_the_group_without_erroring() {
+        let mut p = project();
+        p.apply(&Op::SetGroup { id: GroupId(1), name: "hook".into(), clips: vec![ClipId(1)] }).unwrap();
+        p.apply(&Op::SetGroupActive { id: GroupId(1), active: Some(ClipId(99)) }).unwrap();
+        assert_eq!(p.groups[&GroupId(1)].active, Some(ClipId(99)), "no membership validation -- that's a UI/consumer concern, not this layer's");
     }
 }
 

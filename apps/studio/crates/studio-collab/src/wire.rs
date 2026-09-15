@@ -209,6 +209,19 @@ fn get_opt_bus_id(r: &mut R) -> Option<Option<BusId>> {
     })
 }
 
+fn put_opt_clip_id(o: &mut Vec<u8>, id: Option<ClipId>) {
+    match id {
+        Some(c) => { put_u8(o, 1); put_u64(o, c.0); }
+        None => put_u8(o, 0),
+    }
+}
+fn get_opt_clip_id(r: &mut R) -> Option<Option<ClipId>> {
+    Some(match r.u8()? {
+        0 => None,
+        _ => Some(ClipId(r.u64()?)),
+    })
+}
+
 fn put_effects(o: &mut Vec<u8>, effects: &[Effect]) {
     put_u16(o, effects.len().min(u16::MAX as usize) as u16);
     for e in effects {
@@ -433,6 +446,9 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
         Op::RemoveCurvePoint { curve, at } => { put_u8(o, 35); put_u64(o, curve.0); put_ticks(o, *at); }
         Op::SetBinding { id, binding } => { put_u8(o, 36); put_u64(o, id.0); put_binding(o, binding); }
         Op::RemoveBinding { id } => { put_u8(o, 37); put_u64(o, id.0); }
+        Op::SetGroupActive { id, active } => {
+            put_u8(o, 42); put_u64(o, id.0); put_opt_clip_id(o, *active);
+        }
         Op::Group { ops } => {
             put_u8(o, 25);
             put_u16(o, ops.len().min(u16::MAX as usize) as u16);
@@ -568,6 +584,7 @@ fn get_op(r: &mut R) -> Option<Op> {
         35 => Op::RemoveCurvePoint { curve: CurveId(r.u64()?), at: r.ticks()? },
         36 => Op::SetBinding { id: BindingId(r.u64()?), binding: get_binding(r)? },
         37 => Op::RemoveBinding { id: BindingId(r.u64()?) },
+        42 => Op::SetGroupActive { id: GroupId(r.u64()?), active: get_opt_clip_id(r)? },
         25 => {
             let n = r.u16()? as usize;
             let mut ops = Vec::with_capacity(n.min(4096));
@@ -1133,6 +1150,8 @@ mod tests {
             Op::SetBinding { id: BindingId(3), binding: Binding { curve: CurveId(4),
                 target: AutoTarget::TrackGain(TrackId(1)), gate: Gate::Group(GroupId(7)) } },
             Op::RemoveBinding { id: BindingId(3) },
+            Op::SetGroupActive { id: GroupId(1), active: Some(ClipId(2)) },
+            Op::SetGroupActive { id: GroupId(1), active: None },
         ]
     }
 
