@@ -687,7 +687,7 @@ pub struct Source {
     pub sample_rate: u32,
     pub channels: u16,
     /// True when the source carries picture as well as sound.
-    pub has_video: bool, kind: SourceKind::File,
+    pub has_video: bool,
     /// File or generator. Defaults to `File` so pre-existing projects load
     /// unchanged.
     #[serde(default)]
@@ -696,7 +696,7 @@ pub struct Source {
 
 impl Source {
     /// A file-backed source — what every source was before generators.
-    pub fn file(id: SourceId, path: impl Into<String>, len: Ticks, sample_rate: u32, channels: u16, has_video: bool) -> Source {, kind: SourceKind::File
+    pub fn file(id: SourceId, path: impl Into<String>, len: Ticks, sample_rate: u32, channels: u16, has_video: bool) -> Source {
         Source { id, path: path.into(), len, sample_rate, channels, has_video, kind: SourceKind::File }
     }
 
@@ -709,7 +709,7 @@ impl Source {
             len,
             sample_rate,
             channels,
-            has_video: false, kind: SourceKind::File,
+            has_video: false,
             kind: SourceKind::Pattern { pattern, name },
         }
     }
@@ -725,7 +725,7 @@ impl Source {
     /// is the bug that put `demo.wav` on a drum pattern.
     pub fn display_name(&self) -> &str {
         match &self.kind {
-            SourceKind::Pattern { name, .. } => name,
+            SourceKind::Pattern { name, .. } => name.as_str(),
             SourceKind::File => {
                 // Stem without allocating: find the last separator and drop a
                 // trailing extension.

@@ -286,10 +286,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let prev_home = std::env::var_os("HOME");
         let prev_mail = std::env::var_os("MAIL");
+        // USER too, and this is the whole bug. `candidates()` probes
+        // /var/mail/$USER, which EXISTS on a real build host -- so discover()
+        // found the tester's actual mailbox, empty_reason() correctly returned
+        // None, and the test blamed the code. Controlling HOME and MAIL is not
+        // enough; every input candidates() reads has to be controlled or the
+        // test is really asking whether the machine has mail.
+        let prev_user = std::env::var_os("USER");
         // SAFETY: single-threaded test; restored below.
         unsafe {
             std::env::set_var("HOME", &dir);
             std::env::remove_var("MAIL");
+            std::env::remove_var("USER");
         }
 
         let why = empty_reason().expect("no store, so a reason");
@@ -303,6 +311,7 @@ mod tests {
         unsafe {
             match prev_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
             if let Some(v) = prev_mail { std::env::set_var("MAIL", v) }
+            if let Some(v) = prev_user { std::env::set_var("USER", v) }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

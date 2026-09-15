@@ -219,13 +219,24 @@ impl Transcriber {
             }
             let state = guard.as_mut().expect("state just created");
             state.full(params, samples).context("running whisper inference")?;
-            let n_segments = state.full_n_segments().context("getting segment count")?;
+            // whisper-rs 0.16 API (see Cargo.toml for why we are pinned there):
+            // `full_n_segments` returns a plain i32 rather than a Result, and
+            // the per-segment text moved behind `get_segment(i) -> Option<_>`
+            // instead of `full_get_segment_text(i) -> Result<String>`. Both
+            // changes are why bumping off 0.13 needed a call-site edit and not
+            // only a version pin.
+            let n_segments = state.full_n_segments();
             let mut text = String::new();
             for i in 0..n_segments {
-                let seg = state
-                    .full_get_segment_text(i)
-                    .with_context(|| format!("getting segment {}", i))?;
-                text.push_str(&seg);
+                // A missing segment is skipped rather than failing the whole
+                // utterance: the count and the accessor are two calls into the
+                // same C state, and losing one segment of dictation beats
+                // losing the sentence.
+                let Some(seg) = state.get_segment(i) else { continue };
+                let chunk = seg
+                    .to_str_lossy()
+                    .with_context(|| format!("decoding segment {}", i))?;
+                text.push_str(&chunk);
             }
             text.trim().to_string()
         };
