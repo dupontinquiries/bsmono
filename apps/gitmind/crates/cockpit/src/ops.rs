@@ -142,6 +142,21 @@ pub fn resolve_binary(cargo: &str, app_dir: &Path, cargo_target: &str, app: &str
 /// The monorepo root, so repo-relative app paths (`apps/<name>`) resolve no matter what
 /// directory gitmind was launched from. Order: `$GITMIND_ROOT`, then walk up from the current
 /// dir looking for the repo root (a dir with an `apps/` subdir plus a `.git`/`.gitmind` marker),
+/// True when `app`'s `manifest/projects.toml` entry says `role = "lib"` --
+/// a headless core with no `[[bin]]` at all, by design, so a missing binary
+/// after a clean `cargo build` is the correct outcome, not a failure to
+/// explain away. Pure (takes the manifest TEXT, not a path) so it is
+/// testable without a real checkout; the real caller in
+/// `build_locally_cancellable` reads `manifest/projects.toml` from
+/// [`repo_root`] and passes the text in.
+pub fn is_lib_role(app: &str, manifest_text: &str) -> bool {
+    crate::appcatalog::parse_manifest(manifest_text)
+        .into_iter()
+        .find(|e| e.app_id == app)
+        .map(|e| e.role == "lib")
+        .unwrap_or(false)
+}
+
 /// then fall back to the current dir.
 pub fn repo_root() -> PathBuf {
     if let Ok(r) = std::env::var("GITMIND_ROOT") {
@@ -411,6 +426,23 @@ pub fn build_locally_cancellable(
                 Ok((bin, size))
             }
             _ => {
+                // A MISSING BINARY IS NOT ALWAYS A FAILURE: `role = "lib"` in
+                // manifest/projects.toml means exactly this -- a headless
+                // core with no [[bin]] at all, by design (photosync's own
+                // manifest entry documents this precisely: "role=lib is the
+                // honest description until that shell exists... there is
+                // nothing to run yet"). This function used to treat every
+                // missing binary as an error regardless of role, which is
+                // wrong for a project that was never supposed to produce
+                // one -- `cargo build` finishing clean on a lib-only crate
+                // IS the successful outcome, not a symptom to explain away.
+                let is_lib = std::fs::read_to_string(repo_root().join("manifest/projects.toml"))
+                    .map(|text| is_lib_role(app, &text))
+                    .unwrap_or(false);
+                if is_lib {
+                    on_line(&format!("✓ {app}: library builds clean (role=lib, no binary expected)"));
+                    return Ok((bin, 0));
+                }
                 on_line(&format!(
                     "✗ {app}: cargo succeeded but no binary at {}", bin.display()));
                 on_line("   the bin name may differ from the crate name, or sit behind a feature");
@@ -618,6 +650,48 @@ pub fn provision_fleet_user(admin: &str, host: &str, password: &str) -> Result<S
         Ok(format!("created fleet user '{user}' on {host} — set the user to '{user}' to connect"))
     } else {
         Err("provisioning didn't confirm — does that account have sudo rights?".into())
+    }
+}
+
+#[cfg(test)]
+mod is_lib_role_tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"
+[apps.photosync]
+path = "apps/photosync"
+kind = "cargo"
+role = "lib"
+daemon = false
+
+[apps.voiceterm]
+path = "apps/voiceterm"
+kind = "cargo"
+role = "app"
+daemon = false
+"#;
+
+    #[test]
+    fn a_lib_role_entry_is_recognised() {
+        assert!(is_lib_role("photosync", SAMPLE));
+    }
+
+    #[test]
+    fn an_app_role_entry_is_not_lib() {
+        assert!(!is_lib_role("voiceterm", SAMPLE));
+    }
+
+    #[test]
+    fn an_unknown_app_is_not_lib() {
+        // No entry at all -- must not panic, must not default to true (a
+        // typo'd or unregistered app should still get the real "no binary"
+        // error, not be silently waved through as an expected lib).
+        assert!(!is_lib_role("does-not-exist", SAMPLE));
+    }
+
+    #[test]
+    fn empty_manifest_text_is_not_lib() {
+        assert!(!is_lib_role("photosync", ""));
     }
 }
 

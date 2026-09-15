@@ -14,7 +14,7 @@ use std::path::Path;
 ///
 /// Kept as a named constant rather than inline so the claim and the list are in
 /// one place; a test asserts they agree with what is actually on disk.
-pub const CRATE_ROOTS: [&str; 5] = ["apps", "shared", "games", "tools", "system"];
+pub const CRATE_ROOTS: [&str; 6] = ["apps", "shared", "games", "tools", "system", "maintenance"];
 
 /// Top-level directories deliberately NOT scanned, and why.
 ///
