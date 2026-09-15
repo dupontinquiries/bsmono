@@ -564,7 +564,9 @@ pub fn draw_hud(ctx: &egui::Context, game: &Game, player: usize, vp: Mat4, w: f3
     // minions hp bars (only when damaged)
     for m in &game.minions {
         if m.hp < m.max_hp {
-            if let Some((sp, _)) = project(vp, m.pos + Vec3::Y * 1.5, w, h) {
+            // 1.1 not 1.5: the minion is a ~1.0u mini cat, not the 1.26u
+            // humanoid this offset was chosen for.
+            if let Some((sp, _)) = project(vp, m.pos + Vec3::Y * 1.1, w, h) {
                 let r = Rect::from_min_size(sp - Vec2::new(16.0, 6.0), Vec2::new(32.0, 4.0));
                 painter.rect_filled(r, 1.5, Color32::from_rgb(15, 14, 20));
                 painter.rect_filled(Rect::from_min_size(r.left_top(), Vec2::new(r.width() * (m.hp / m.max_hp).clamp(0.0, 1.0), 4.0)), 1.5, col(m.team));

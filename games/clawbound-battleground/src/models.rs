@@ -527,38 +527,82 @@ pub const WEAPON_PIVOT_VOX: f32 = 0.0;
 
 const MV: f32 = 0.09;
 
+/// Minions are **mini cats**, not soldiers.
+///
+/// This was a humanoid — legs, torso, arms in skin tone, a metal helmet and a
+/// wooden club. It is now a quadruped: there are no people anywhere in this
+/// game, and a game called Clawbound fielding little humans with clubs was
+/// the one place that slipped.
+///
+/// Built facing **+Z**, matching `build_hare` and `build_boar`, so the
+/// existing yaw handling in `scene.rs` needs no change. Roughly 1.0u tall
+/// against the old humanoid's 1.26u — a mini cat reads as small next to the
+/// gods, which is what a minion should do. The hp bar in `ui.rs` sits at a
+/// fixed `Y * 1.5`, lowered to suit.
 pub fn build_minion(caster: bool, team: Team) -> VoxelMesh {
     let tc = team.rgb();
-    let cloth = mix(tc, [0.35, 0.35, 0.4], 0.45);
-    let metal = mix(tc, [0.75, 0.75, 0.8], 0.55);
-    let skin = [0.8, 0.62, 0.45];
+    // Team colour carried in the FUR rather than in cloth and armour: with no
+    // clothing left to tint, the coat is the only thing that can read as
+    // allegiance at gameplay distance.
+    let fur = mix(tc, [0.42, 0.38, 0.34], 0.55);
+    let belly = mix(fur, [0.92, 0.88, 0.80], 0.6);
+    let dark = mix(fur, [0.10, 0.09, 0.12], 0.55);
+    let accent = mix(tc, [1.0, 1.0, 1.0], 0.35);
 
-    let mut g = Grid::new(12, 14, 12);
-    let cx = 6;
-    let cz = 6;
+    let mut g = Grid::new(12, 11, 20);
+    let (cx, cz) = (6i32, 9i32);
+    let (cxf, czf) = (cx as f32, cz as f32);
 
-    // legs
-    g.filled_box(cx - 2, 0, cz - 1, cx - 1, 4, cz + 1, solid(mix(cloth, [0.1, 0.1, 0.1], 0.4)));
-    g.filled_box(cx + 1, 0, cz - 1, cx + 2, 4, cz + 1, solid(mix(cloth, [0.1, 0.1, 0.1], 0.4)));
-    // torso
-    g.filled_box(cx - 3, 5, cz - 2, cx + 3, 9, cz + 2, solid(cloth));
-    // arms
-    g.filled_box(cx - 4, 5, cz - 1, cx - 4, 8, cz + 1, solid(skin));
-    g.filled_box(cx + 4, 5, cz - 1, cx + 4, 8, cz + 1, solid(skin));
+    // four legs — front pair slightly forward of the shoulder
+    for (sx, sz) in [(-3i32, 5i32), (3, 5), (-3, -5), (3, -5)] {
+        g.filled_box(cx + sx - 1, 0, cz + sz - 1, cx + sx, 3, cz + sz + 1, solid(fur));
+        // dark paws, the way the hare and boar both foot their legs
+        g.filled_box(cx + sx - 1, 0, cz + sz - 1, cx + sx, 0, cz + sz + 1, solid(dark));
+    }
+
+    // body: long barrel, pale underside
+    g.ellipsoid(cxf, 5.5, czf, 3.0, 2.8, 6.0, solid(fur));
+    g.ellipsoid(cxf, 4.2, czf, 2.2, 1.6, 5.0, solid(belly));
+
     // head
-    g.ellipsoid(cx as f32, 11.0, cz as f32, 2.4, 2.4, 2.4, solid(skin));
-    // helmet
-    g.ellipsoid(cx as f32, 12.0, cz as f32, 2.6, 1.8, 2.6, solid(metal));
-    g.set(cx - 1, 11, cz + 2, solid(tc));
-    g.set(cx + 1, 11, cz + 2, solid(tc));
+    g.ellipsoid(cxf, 7.0, czf + 7.0, 2.6, 2.5, 2.6, solid(fur));
+    // muzzle + nose. Kept a voxel clear of the z=19 grid edge: `Grid::set`
+    // drops out-of-range writes silently, so overshooting here would shave
+    // the front off the nose with no error to notice.
+    g.ellipsoid(cxf, 6.2, czf + 8.6, 1.3, 1.0, 1.2, solid(belly));
+    g.set(cx, 6, cz + 9, solid([0.92, 0.55, 0.60]));
+    // ears — the silhouette that makes it read as a cat at distance
+    for sx in [-1i32, 1] {
+        g.filled_box(cx + sx * 2, 9, cz + 6, cx + sx * 2, 10, cz + 7, solid(fur));
+        g.set(cx + sx * 2, 9, cz + 7, solid(accent));
+    }
+    // eyes, on the head's front face rather than out on the muzzle
+    g.set(cx - 1, 7, cz + 8, solid(dark));
+    g.set(cx + 1, 7, cz + 8, solid(dark));
+
+    // tail, curling up behind
+    for i in 0..5i32 {
+        let y = 6 + i.min(3);
+        let z = (cz - 6 - i / 2).max(0);
+        g.set(cx, y, z, solid(fur));
+    }
+    g.set(cx, 9, (cz - 8).max(0), solid(accent));
 
     if caster {
-        // hood robe flare + floating orb hands
-        g.cone_y(cx as f32, cz as f32, 4.0, 3.0, 2, 6, solid(cloth));
-        g.ellipsoid(cx as f32 + 5.0, 8.5, cz as f32, 1.2, 1.2, 1.2, solid(mix(tc, [1.0, 1.0, 1.0], 0.3)));
+        // A caster carries a floating orb rather than a hood: a robe needs
+        // shoulders, and this one is on four legs.
+        g.ellipsoid(cxf, 9.0, czf + 3.0, 1.3, 1.3, 1.3, solid(accent));
+        // collar tuft marking it apart from the melee line at a glance
+        for sx in [-2i32, -1, 0, 1, 2] {
+            g.set(cx + sx, 8, cz + 4, solid(accent));
+        }
     } else {
-        // little club
-        g.filled_box(cx + 4, 6, cz - 1, cx + 5, 12, cz, solid([0.4, 0.28, 0.16]));
+        // Melee: shoulder spaulder and bared claws — armour on the animal,
+        // not a weapon in a hand it does not have.
+        g.filled_box(cx - 3, 7, cz + 2, cx + 3, 7, cz + 4, solid(dark));
+        for sx in [-3i32, 3] {
+            g.set(cx + sx, 1, cz + 6, solid([0.95, 0.93, 0.86]));
+        }
     }
 
     g.mesh(MV, true)

@@ -20,6 +20,11 @@ egui = "0.27"
 egui-wgpu = "0.27"
 egui-winit = "0.27"
 glam = "0.27"
+# Per-part creature posing, extracted verbatim from unendlich-engine (see that
+# crate's Cargo.toml). `anim.rs` here supplies only the species layer on top —
+# which gait, how hard — because a bison that never bounds is a fact about
+# animals, not about posing boxes.
+creature-rig = { path = "../shared/creature-rig" }
 bytemuck = { version = "1.15", features = ["derive"] }
 pollster = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }

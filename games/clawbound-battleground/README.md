@@ -162,7 +162,7 @@ Every action is rebindable — open **CONTROLS** from the main menu or press
 `Esc` in a match, click a row, press the key / mouse button / pad button you
 want. Bindings are *logical* keys (the character a key types on your layout),
 so a Dvorak player binding `e` gets the key labelled `e`. Two stock schemes
-(QWERTY WASD, Dvorak `,AOE`) plus custom. Saved to
+(QWERTY WASD, Dvorak `.OEU`) plus custom. Saved to
 `$XDG_CONFIG_HOME/clawbound/controls.cfg` (a plain text file). This is the
 input model the monorepo's other games (skydribble, unendlich) use.
 

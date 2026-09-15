@@ -1,0 +1,29 @@
+[package]
+name = "creature-rig"
+version = "0.1.0"
+edition = "2021"
+description = """
+Per-part procedural posing for box creatures, extracted VERBATIM from
+unendlich-engine (src/anim_rig.rs + src/sim/{deform,flex_bend,liveliness,
+ragdoll}.rs). Those five files have zero `use crate::` edges outside this set
+— anim_rig reaches only deform/flex_bend/liveliness, and ragdoll reaches
+nothing — so the extraction is a move, not a rewrite; the `crate::sim::` paths
+still resolve because `src/sim/mod.rs` reproduces that shape.
+
+Why it left the engine: clawbound-battleground needs the same rig (its
+creatures animate with a whole-mesh bob+lean and legs that never plant), and
+depending on unendlich-engine to get it would pull a 326k-line Vulkan engine
+into a game that wants ~1.7k lines of pure math. Same reasoning as
+worldhost-unendlich's `engine` feature being off by default.
+
+std-only, deterministic, no panics on any input. 43 tests came with it.
+"""
+
+[lib]
+path = "src/lib.rs"
+
+# Deliberately none. The extracted files are std-only; adding glam here would
+# be the first step to this crate knowing about a renderer, which is the thing
+# that made the rig hard to reuse in the first place. Coordinates cross the
+# boundary as [f32; 3].
+[dependencies]

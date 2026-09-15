@@ -313,7 +313,7 @@ impl Scheme {
     pub fn name(self) -> &'static str {
         match self {
             Scheme::Classic => "QWERTY (WASD)",
-            Scheme::Dvorak => "DVORAK (,AOE)",
+            Scheme::Dvorak => "DVORAK (.OEU)",
             Scheme::Custom => "CUSTOM",
         }
     }
@@ -352,18 +352,37 @@ impl Bindings {
         Bindings { map, scheme: Scheme::Classic }
     }
 
-    /// Dvorak: the home-row cluster the monorepo's other games settled on —
-    /// `,` forward, `o` back, `a`/`e` strafe, abilities on `'` `.` `p` `y`
-    /// (the top row under the left hand), shop `x`, board `j`, recenter `q`.
+    /// Dvorak: the `.oeu` cluster the monorepo's other games settled on from
+    /// playtesting — `.` forward, `e` back, `o` LEFT, `u` RIGHT, abilities on
+    /// the rest of the top row (`'` `,` `p` `y`), shop `x`, board `j`,
+    /// recenter `q`.
+    ///
+    /// These are the Dvorak letters at the QWERTY **ESDF** positions, not
+    /// WASD's. That is deliberate and is what skydribble and blackstar-rs
+    /// both use: it centres the left hand one column right, which keeps the
+    /// ability row reachable without moving off the movement keys.
+    ///
+    /// ## What was wrong before
+    ///
+    /// This was the `,aoe` cluster (the WASD *positions*) with `a` left and
+    /// `e` right. Two things were wrong with it. The cluster disagreed with
+    /// every other game in the tree, and more importantly `e` was bound to
+    /// **Right** here while skydribble and blackstar-rs bind `e` to **back /
+    /// reverse** — so muscle memory carried between games produced a strafe
+    /// where a reverse was intended, and the left/right pair read as
+    /// inverted relative to the `o`/`u` the other games train you on.
     pub fn dvorak() -> Bindings {
         let mut b = Bindings::classic();
         let set = |b: &mut Bindings, a: Action, v: Vec<Bind>| b.replace_kbm(a, v);
-        set(&mut b, Action::Forward, vec![ch(","), Bind::Named(Named::ArrowUp)]);
-        set(&mut b, Action::Back, vec![ch("o"), Bind::Named(Named::ArrowDown)]);
-        set(&mut b, Action::Left, vec![ch("a"), Bind::Named(Named::ArrowLeft)]);
-        set(&mut b, Action::Right, vec![ch("e"), Bind::Named(Named::ArrowRight)]);
+        set(&mut b, Action::Forward, vec![ch("."), Bind::Named(Named::ArrowUp)]);
+        set(&mut b, Action::Back, vec![ch("e"), Bind::Named(Named::ArrowDown)]);
+        set(&mut b, Action::Left, vec![ch("o"), Bind::Named(Named::ArrowLeft)]);
+        set(&mut b, Action::Right, vec![ch("u"), Bind::Named(Named::ArrowRight)]);
+        // `.` moved to Forward, so Ability2 takes `,` — the abilities are the
+        // top row MINUS whatever movement claimed, kept in left-to-right
+        // order so the 1..4 numbering matches the physical order.
         set(&mut b, Action::Ability1, vec![ch("'"), ch("1")]);
-        set(&mut b, Action::Ability2, vec![ch("."), ch("2")]);
+        set(&mut b, Action::Ability2, vec![ch(","), ch("2")]);
         set(&mut b, Action::Ability3, vec![ch("p"), ch("3")]);
         set(&mut b, Action::Ability4, vec![ch("y"), ch("4")]);
         set(&mut b, Action::Shop, vec![ch("x")]);
@@ -811,10 +830,40 @@ mod tests {
     #[test]
     fn dvorak_scheme_moves_on_the_home_cluster_and_keeps_pad_binds() {
         let d = Bindings::dvorak();
-        assert!(d.binds(Action::Forward).contains(&ch(",")));
+        assert!(d.binds(Action::Forward).contains(&ch(".")));
         assert!(d.binds(Action::Attack).iter().any(|b| b.is_pad()), "pad binds survive a scheme swap");
         let c = Bindings::classic();
         assert!(c.binds(Action::Forward).contains(&ch("w")));
+    }
+
+    /// The bug this cluster was changed for: `o` and `u` are LEFT and RIGHT,
+    /// in that order. The previous scheme bound `e` to Right while
+    /// skydribble and blackstar-rs bind `e` to back/reverse, so anyone
+    /// moving between games strafed when they meant to back up.
+    #[test]
+    fn dvorak_strafe_is_o_left_u_right_not_inverted() {
+        let d = Bindings::dvorak();
+        assert!(d.binds(Action::Left).contains(&ch("o")), "o is LEFT");
+        assert!(d.binds(Action::Right).contains(&ch("u")), "u is RIGHT");
+        assert!(d.binds(Action::Back).contains(&ch("e")), "e is BACK, matching the other games");
+        // The inverted pairing must not come back.
+        assert!(!d.binds(Action::Right).contains(&ch("o")));
+        assert!(!d.binds(Action::Left).contains(&ch("u")));
+        assert!(!d.binds(Action::Right).contains(&ch("e")));
+    }
+
+    /// `.` is Forward, so nothing else may claim it — Ability2 used to.
+    #[test]
+    fn dvorak_movement_keys_are_not_double_bound_to_abilities() {
+        let d = Bindings::dvorak();
+        for mv in [ch("."), ch("o"), ch("e"), ch("u")] {
+            for ab in [Action::Ability1, Action::Ability2, Action::Ability3, Action::Ability4] {
+                assert!(!d.binds(ab).contains(&mv), "{ab:?} must not share a movement key");
+            }
+            assert!(!d.binds(Action::Shop).contains(&mv));
+            assert!(!d.binds(Action::Recenter).contains(&mv));
+            assert!(!d.binds(Action::Scoreboard).contains(&mv));
+        }
     }
 
     #[test]
@@ -844,7 +893,7 @@ mod tests {
         assert!((back.settings.mouse_sens - 1.75).abs() < 1e-3);
         // a bare scheme line selects the stock scheme
         let d = Config::from_text("scheme dvorak\n");
-        assert!(d.bindings.binds(Action::Forward).contains(&ch(",")));
+        assert!(d.bindings.binds(Action::Forward).contains(&ch(".")));
     }
 
     #[test]
