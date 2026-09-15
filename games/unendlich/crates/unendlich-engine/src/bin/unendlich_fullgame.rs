@@ -10650,6 +10650,34 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             if roamers[i].kind != roamers[j].kind {
                                 continue;
                             }
+                            // r-species-breeding-fix: `kind` alone isn't specific
+                            // enough for Fauna. CreatureKind::Fauna is explicitly
+                            // documented as covering ALL "everyday surface
+                            // animals" as one kind, while the actual roster
+                            // species (sim::fauna_roster::Species -- Deer vs
+                            // Rabbit vs whatever the roster enumerates) lives in
+                            // the separate Roamer::species field. That field was
+                            // set at spawn (picked per-biome) but never read
+                            // anywhere -- compiler-flagged as dead, traced here
+                            // as the actual cause: this block's own comment says
+                            // "same species breed," but the code only checked
+                            // `kind`, so any two Fauna-kind creatures bred
+                            // together regardless of their actual species. Non-
+                            // Fauna kinds are unaffected by this addition: each
+                            // of them is conceptually its own single "species"
+                            // (there's only one Dragon), so `kind` alone already
+                            // correctly gated them -- this only tightens the
+                            // Fauna case, where `kind` was too coarse. `None ==
+                            // None` (both fell back to no assigned species, e.g.
+                            // no roster match for their biome) is still treated
+                            // as compatible, matching the original pre-fix
+                            // behavior for that fallback case rather than newly
+                            // blocking it.
+                            if roamers[i].kind == unendlich_engine::item::CreatureKind::Fauna
+                                && roamers[i].species != roamers[j].species
+                            {
+                                continue;
+                            }
                             let pi = roamers[i].creature.body.position;
                             let pj = roamers[j].creature.body.position;
                             let d2 = (pi[0] - pj[0]).powi(2) + (pi[2] - pj[2]).powi(2);
