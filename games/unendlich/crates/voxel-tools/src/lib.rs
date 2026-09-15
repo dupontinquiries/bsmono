@@ -57,6 +57,10 @@ pub mod critique;
 /// cannot pick one block and reuse it for every part. See the module header
 /// for the tree that prompted it.
 pub mod scheme;
+/// A big build as a sequence of small requests, each of which fits in one
+/// reply -- and a readback bounded by step count rather than block count.
+/// See the module header for the 5200-token truncation that prompted it.
+pub mod job;
 /// Chat box: keys, history, autocomplete cards.
 pub mod chatbox;
 /// Voice: grammar and intent mapping for the voiced daemon.
