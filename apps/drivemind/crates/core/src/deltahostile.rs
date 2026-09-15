@@ -259,4 +259,103 @@ mod tests {
         fs::write(&q, super::tests::noise(1 << 20, 9)).unwrap();
         assert!(sampled_entropy(&q).unwrap() > 7.5);
     }
+
+    #[test]
+    fn git_ls_files_failing_is_a_real_error_not_an_empty_plan() {
+        // `if out.code != 0 { return Err(...) }` -- the very first real
+        // check in scan_repo, and untested: a path that is not a git
+        // repo at all (a plain directory someone pointed the scanner at
+        // by mistake) must be reported as a real error, not silently
+        // treated as "a git repo with nothing tracked", which would look
+        // identical to a genuinely empty, valid repo.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let repo_s = root.display().to_string();
+        let mut sys = FixtureRunner::new();
+        // FixtureRunner::on() can only set stdout (stderr is hardcoded
+        // empty there); building the fixture directly via the map it
+        // exposes is the only way to simulate a nonzero exit WITH a real
+        // stderr message, matching exactly what a real `git ls-files`
+        // failure looks like.
+        sys.map.insert(
+            format!("git -C {repo_s} ls-files -z"),
+            crate::SysOutput { code: 128, stdout: String::new(), stderr: "fatal: not a git repository".into() },
+        );
+        let mut sink = null_sink();
+        let err = scan_repo(&sys, root, &DeltaHostileConfig::default(), &mut sink)
+            .expect_err("a nonzero git exit must not become an empty plan");
+        assert!(err.contains("not a git repository"), "{err}");
+    }
+
+    #[test]
+    fn git_itself_failing_to_run_is_propagated_not_swallowed() {
+        // A different failure shape than a nonzero exit code: the git
+        // BINARY itself is missing or cannot be spawned at all. scan_repo
+        // uses `?` on sys.run(...) directly for this -- untested before
+        // this, since FixtureRunner-based tests always succeed at the
+        // run() level and only vary the exit code/output.
+        struct NoGit;
+        impl SysRunner for NoGit {
+            fn run(&self, _: &str, _: &[&str]) -> Result<crate::SysOutput, String> {
+                Err("git: command not found".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = null_sink();
+        let err = scan_repo(&NoGit, dir.path(), &DeltaHostileConfig::default(), &mut sink)
+            .expect_err("a missing git binary must be a real Err");
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn a_file_with_no_extension_at_all_is_still_caught_by_entropy() {
+        // ext_of() returns None for an extensionless path, which routes
+        // straight to entropy_reason (the `else` branch scan_repo takes
+        // when ext_of returns None) -- every file in the existing test
+        // has a real extension, so this branch specifically was never
+        // exercised on its own.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("BLOB"), noise(2 << 20, 123)).unwrap();
+        let repo_s = root.display().to_string();
+        let sys = FixtureRunner::new().on(&format!("git -C {repo_s} ls-files -z"), 0, "BLOB\0");
+        let mut sink = null_sink();
+        let plan = scan_repo(&sys, root, &DeltaHostileConfig::default(), &mut sink).unwrap();
+        assert_eq!(plan.candidates.len(), 1);
+        assert!(matches!(plan.candidates[0].reason, Reason::HighEntropy(_)),
+            "an extensionless high-entropy blob must be caught, not silently skipped: {:?}", plan.candidates[0].reason);
+    }
+
+    #[test]
+    fn an_unreadable_tracked_file_is_noted_not_fatal() {
+        // entropy_reason's Err arm sinks a Note and returns None rather
+        // than failing the whole scan -- a tracked file that has since
+        // become unreadable (permissions changed, or a real disk error)
+        // must not take down a diagnostic scan of the rest of the repo.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            fs::write(root.join("locked.bin"), noise(2 << 20, 55)).unwrap();
+            fs::set_permissions(root.join("locked.bin"), fs::Permissions::from_mode(0o000)).unwrap();
+            let repo_s = root.display().to_string();
+            let sys = FixtureRunner::new().on(&format!("git -C {repo_s} ls-files -z"), 0, "locked.bin\0");
+            let mut notes: Vec<String> = Vec::new();
+            let mut sink = |e: Event| { if let Event::Note(n) = e { notes.push(n); } };
+            let plan = scan_repo(&sys, root, &DeltaHostileConfig::default(), &mut sink);
+            fs::set_permissions(root.join("locked.bin"), fs::Permissions::from_mode(0o644)).unwrap();
+            let plan = plan.expect("an unreadable file must not fail the whole scan");
+            // NOT asserting candidates.is_empty() here: whether the
+            // permission bit is actually enforced depends on whether
+            // this runs as root (a sandboxed CI user commonly does,
+            // and root can read a 0o000 file regardless of the mode
+            // bits). The property this test actually needs to hold in
+            // EITHER case is the one already checked above -- the scan
+            // completes with Ok rather than aborting -- not a specific
+            // claim about the candidate list that only holds when the
+            // block is genuinely enforced.
+            let _ = plan;
+        }
+    }
 }
