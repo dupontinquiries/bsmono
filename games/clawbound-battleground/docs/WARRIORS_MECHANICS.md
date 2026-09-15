@@ -79,12 +79,22 @@ Concretely, `blockers::Footprint` grows a `concealment: f32` beside its
 and `sight_detect` takes the sum along the ray. The blocker grid is already
 the right spatial index for it.
 
-### 3. Stamina did not come across
+### 3. Stamina — DONE, now in wildkit
 
-`unendlich`'s `stamina.rs` reaches into a service registry, so it stayed
-behind. It is the module the brief most explicitly asks for — streams that
-restore it, a run that must end in a panting halt — and it needs a seam cut
-before it can travel. **Next extraction.**
+The seam turned out to be trivial: 21 lines of `linkme` service registration
+sitting *after* the tests, with the `Stamina` type itself reaching nothing. A
+truncation, not a rewrite. It is the one file in wildkit that is not
+byte-identical to the engine's copy, and its header records what was removed.
+
+The API is already the shape the brief wants. `can_sprint()` tests against
+`SPRINT_FLOOR` rather than against zero, which IS the panting halt — once
+spent, you cannot sprint again until recovered past the floor, so a chase
+costs something that outlives the chase. `tick(urge, dt)` returns the speed
+multiplier, so the gait selector in `anim.rs` can read it directly.
+
+What remains is wiring, not building: a stream tile that calls `tick` with a
+regen bonus, and `Build::gait_for` taking the multiplier so an exhausted cat
+drops out of a bound.
 
 ### 4. Fresh-kill as a stockpile
 
@@ -130,12 +140,12 @@ What the passage asks for that is missing:
 
 ## Order I would take this in
 
-1. **Cover on blockers** (`concealment` on `Footprint`). Smallest change,
-   biggest effect on how the map plays, and the grid already exists.
-2. **Extract `stamina`** — cut the service-registry seam. Unlocks streams,
-   the panting halt, and the chase economy.
-3. **Scent markers** as their own type, with refresh-on-patrol.
-4. **Extract `biome_climate`** for the clock, then time-of-day perception.
+1. ~~**Cover on blockers**~~ — done, `Footprint::cover`.
+2. ~~**Extract `stamina`**~~ — done, in wildkit.
+3. **Wire stamina**: a stream tile that regenerates it, and `gait_for` reading
+   the multiplier so an exhausted cat drops out of a bound.
+4. **Scent markers** as their own type, with refresh-on-patrol.
+5. **Extract `biome_climate`** for the clock, then time-of-day perception.
 5. Stalk posture and aimed leap in the rig.
 6. Fresh-kill economy, spirit sites, shadow realm.
 

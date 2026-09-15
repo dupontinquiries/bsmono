@@ -31,6 +31,11 @@
 //!
 //! **"Do I chase or run?"** — [`sim::predator_prey`], [`sim::prey_scan`].
 //!
+//! **"Can I keep running?"** — [`sim::stamina`]. `can_sprint` has a FLOOR
+//! rather than a threshold at zero, which is the panting halt: once spent you
+//! cannot sprint again until recovered past `SPRINT_FLOOR`, so a chase has a
+//! cost that outlives it.
+//!
 //! ## Why this is a shared crate and not a copy
 //!
 //! clawbound-battleground wants cats that move like the ones in the Warriors
@@ -46,12 +51,16 @@
 //!
 //! ## What is NOT here
 //!
-//! No renderer, no ECS, no game. And specifically no **stamina**, no
-//! **biome climate** and no **perception field** — those three reach back
-//! into the engine (a service registry, a world module, a GPU benchmark) and
-//! want a seam cut before they can travel. They are the obvious next
-//! extraction and are named in `Cargo.toml` so nobody has to rediscover why
-//! they were skipped.
+//! No renderer, no ECS, no game. **Stamina has since come across** — its
+//! seam turned out to be 21 lines of `linkme` service registration sitting
+//! after the tests, with the type itself reaching nothing, so the cut was a
+//! truncation rather than a rewrite. It is the one file here that is not
+//! byte-identical to the engine's, and its header says so.
+//!
+//! Still behind: **biome climate** (reaches `world::biomes`) and
+//! **perception field** (reaches a GPU benchmark). biome_climate is the more
+//! valuable of the two — without it there is no clock, and "sight works
+//! differently at dusk" has nothing to vary against.
 
 pub mod sim;
 

@@ -19,9 +19,13 @@ The 21 modules here are the transitive closure of that set with NO further
 `use crate::` edges, so the extraction is a move rather than a rewrite and
 `src/sim/mod.rs` reproduces the path shape the files already use.
 
-Deliberately EXCLUDED, because they reach back into the engine: `stamina`
-(service_registry), `biome_climate` (world::biomes), `perception_field`
-(gpu_bench). Each is worth having and each needs a seam cut first.
+`stamina` came across in a second pass: its coupling was 21 lines of `linkme`
+service registration after the tests, so the cut was a truncation. It is the
+one file here that is NOT byte-identical to the engine's copy, and its own
+header records exactly what was removed.
+
+Still EXCLUDED: `biome_climate` (world::biomes) and `perception_field`
+(gpu_bench). Both are worth having and both need a real seam cut.
 
 std-only, deterministic. 137 tests came with it.
 """

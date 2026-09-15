@@ -23,6 +23,9 @@ pub mod scent_strength;
 pub mod scent_track;
 pub mod sight_detect;
 pub mod spatial_audio;
+/// The one module here that is NOT byte-identical to the engine's copy --
+/// its `linkme` service registration was cut. See the file header.
+pub mod stamina;
 pub mod step_height;
 pub mod terrain_variation;
 pub mod wind_field;
