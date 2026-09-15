@@ -286,4 +286,139 @@ mod tests {
         assert_eq!(metas.len(), 1);
         assert_eq!(metas[0].identity.display(), "RedSticker [Samsung T7]");
     }
+
+    #[test]
+    fn key_falls_back_to_a_sanitized_label_model_slug_without_a_uuid() {
+        // The ONLY path the existing test exercised was fs_uuid present.
+        // The fallback -- used whenever a device has no UUID at all,
+        // which real-world exFAT/NTFS-formatted drives commonly don't --
+        // had zero coverage, including the exact sanitization rule
+        // (non-alphanumeric-or-hyphen characters become '_').
+        let id = DeviceIdentity {
+            fs_uuid: None,
+            label: Some("Red Sticker!".into()),
+            model: Some("WD My Passport".into()),
+            serial: None,
+        };
+        assert_eq!(id.key(), "Red_Sticker_-WD_My_Passport");
+    }
+
+    #[test]
+    fn an_empty_fs_uuid_string_is_treated_as_absent_not_used_verbatim() {
+        // `fs_uuid: Some("")` is a real shape lsblk/blkid can hand back
+        // (a field present but blank) -- key() explicitly checks
+        // `!u.is_empty()` before trusting it, which the existing test
+        // (fs_uuid always a real non-empty string) never exercised. A
+        // regression dropping that check would key every UUID-less-but-
+        // present-empty-string device under the literal string "",
+        // colliding every one of them into a single catalog slot.
+        let id = DeviceIdentity {
+            fs_uuid: Some(String::new()),
+            label: Some("X".into()),
+            model: None,
+            serial: None,
+        };
+        assert_eq!(id.key(), "X-nomodel", "an empty fs_uuid must fall through to the label/model slug");
+    }
+
+    #[test]
+    fn two_unlabeled_drives_with_the_same_model_and_no_uuid_collide_on_key() {
+        // Real, documented limitation, not a hypothetical: two different
+        // physical drives that both lack a filesystem UUID (common on
+        // exFAT/NTFS media) AND share the same model string AND were
+        // never given a label produce the IDENTICAL key -- meaning
+        // save() for the second drive silently overwrites the first
+        // drive's entire catalog under save()'s own documented "the
+        // store holds the LATEST view per device" rule, with no warning
+        // that "per device" was actually "per (label, model) pair" the
+        // whole time these two conditions hold. Pinned explicitly as a
+        // real gap so it stays visible rather than being rediscovered
+        // as a support report; resolving it (e.g. falling back further
+        // to a scan-time random id, or refusing to key two active
+        // catalogs identically) is real follow-up work, not done here.
+        let a = DeviceIdentity { fs_uuid: None, label: None, model: Some("Generic USB Disk".into()), serial: None };
+        let b = DeviceIdentity { fs_uuid: None, label: None, model: Some("Generic USB Disk".into()), serial: Some("DIFFERENT-SERIAL".into()) };
+        assert_eq!(a.key(), b.key(),
+            "KNOWN GAP: serial is not part of the fallback key at all, so two drives \
+             differing only by serial number collide -- if this assertion ever fails \
+             because key() changed, that likely means someone fixed this; update this \
+             test's expectation and comment together, don't just delete it");
+    }
+
+    #[test]
+    fn display_falls_back_to_no_label_placeholder() {
+        // Only the "has both label and model" shape was tested before.
+        let id = DeviceIdentity { fs_uuid: None, label: None, model: Some("X1".into()), serial: None };
+        assert_eq!(id.display(), "(no label) [X1]");
+        let bare = DeviceIdentity { fs_uuid: None, label: None, model: None, serial: None };
+        assert_eq!(bare.display(), "(no label)", "no model must not print an empty bracket pair");
+    }
+
+    #[test]
+    fn scan_does_not_follow_a_symlinked_directory_cycle() {
+        // Same real hazard as cleanup.rs's own scanner: a directory
+        // containing a symlink back to itself (or an ancestor) makes a
+        // naive recursive/stack walk loop forever. scan()'s `is_symlink`
+        // check runs before the `is_dir` branch that would push it onto
+        // the walk stack, which is what actually prevents this -- a hang
+        // here doesn't fail an assertion, it fails by the test never
+        // finishing at all.
+        #[cfg(unix)]
+        {
+            let td = tempfile::tempdir().unwrap();
+            let root = td.path();
+            std::fs::create_dir(root.join("cycle")).unwrap();
+            std::os::unix::fs::symlink(root.join("cycle"), root.join("cycle/self")).unwrap();
+            std::fs::write(root.join("real.txt"), b"hi").unwrap();
+            let entries = scan(root, false).unwrap(); // must return, not hang
+            assert_eq!(entries.len(), 1);
+            assert!(entries.contains_key("real.txt"));
+        }
+    }
+
+    #[test]
+    fn list_on_a_store_that_does_not_exist_yet_is_an_empty_list_not_an_error() {
+        // A brand-new install has no catalogs directory at all yet --
+        // the very first run of the app must show an empty list, not an
+        // error dialog about a directory that was never expected to
+        // exist before the first save().
+        let td = tempfile::tempdir().unwrap();
+        let never_created = td.path().join("does-not-exist");
+        assert!(list(&never_created).is_empty());
+    }
+
+    #[test]
+    fn load_a_key_with_no_saved_catalog_is_a_real_error() {
+        let td = tempfile::tempdir().unwrap();
+        let store = td.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        assert!(load(&store, "NEVER-SAVED").is_err());
+    }
+
+    #[test]
+    fn blank_lines_in_files_jsonl_are_skipped_not_treated_as_a_corrupt_entry() {
+        // load()'s own line loop explicitly skips a blank trimmed line
+        // before attempting to parse it as an Entry -- protecting
+        // against a trailing newline (which nearly every text-writing
+        // tool produces) being misread as a corrupt record. Untested:
+        // the existing round-trip test's files.jsonl was always written
+        // by save() itself, which never happens to leave a genuinely
+        // blank line in the middle.
+        let td = tempfile::tempdir().unwrap();
+        let store = td.path().join("store");
+        let dir = store.join("KEY");
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = CatalogMeta {
+            identity: DeviceIdentity { fs_uuid: Some("KEY".into()), label: None, model: None, serial: None },
+            taken_at: 0, mount_root: String::new(), photo_file: None, entry_count: 1, total_bytes: 5,
+        };
+        std::fs::write(dir.join("meta.json"), serde_json::to_string(&meta).unwrap()).unwrap();
+        let entry = Entry { path: "a.txt".into(), size: 5, mtime_unix: 0, b3: String::new() };
+        std::fs::write(
+            dir.join("files.jsonl"),
+            format!("{}\n\n\n", serde_json::to_string(&entry).unwrap()),
+        ).unwrap();
+        let cat = load(&store, "KEY").unwrap();
+        assert_eq!(cat.entries.len(), 1, "blank lines must not become bogus entries or a parse error");
+    }
 }
