@@ -474,7 +474,32 @@ mod live_tests {
         // `read_to_string` to serve an excerpt, which is the pattern
         // `probe_exec::slice` in the same crate exists to avoid. Two readers
         // for one job; see C14_TODO's fleet-run section.
-        const CEILING: usize = 386;
+        //
+        // 393, raised from 386. Found by the c18unified fleet run; the seven
+        // new keys are not attributable to one series the way past batches
+        // were -- diffed by name+kind, module+line, against the tree at
+        // df59bee09 (the 386 commit) rather than against a single session's
+        // module list, since these arrived spread across ordinary work
+        // rather than one landing. Audited one by one, all seven benign:
+        //
+        //   Struct Model       gpu-gemm modelpick, GGUF checkpoint candidate       vs logscope coresidency,
+        //                      {name, gib, role} memory-fit entry — different crates, unrelated shapes
+        //   Struct Pass        logscope-egui uxloop, a UX-audit iteration result   vs voice_ingest, one
+        //                      streaming whisper transcription pass — same crate, unrelated domains
+        //   Enum Value         gpu-gemm gguf, a GGUF metadata tagged union         vs logscope-egui
+        //                      engine_knobs, a knob's Flag/Count value — different crates
+        //   Fn ask             logscope repoquery, an "enough or send-more" prompt vs logscope-fan
+        //                      stunwire, a STUN UDP probe — generic verb, unrelated domains
+        //   Fn is_warm         logscope-egui matrix, is a cache cell resident      vs physkin, does a
+        //                      color read warm-toned — a false cognate, not a shared idea at all
+        //   Fn quantized       logscope-egui scene3d::EnvParams, buckets 3D scene  vs panel_rows::
+        //                      params for a render cache key                         PanelContext, buckets
+        //                      panel widths for a UI cache key — same CONVENTION (bucket-for-cache-key)
+        //                      applied to two unrelated structs, not the same idea implemented twice
+        //   Fn rows            logscope-egui panel_rows, active tab-panel row slice vs runcard::rows(),
+        //                      builds a run-status card's label/value rows — generic UI term, different
+        //                      widgets
+        const CEILING: usize = 393;
         assert!(d.len() <= CEILING,
             "{} duplicate names, ceiling {CEILING}. A new one appeared — either two ideas sharing a \
 name, which is fine and wants the ceiling raised deliberately, or one idea implemented twice, which \
