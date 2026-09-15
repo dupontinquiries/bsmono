@@ -473,9 +473,9 @@ mod tests {
         // The warn/crit pair is (70, 80) for NVMe and (55, 65) for ATA --
         // untested that these are genuinely DIFFERENT, not the same
         // numbers duplicated. 60C is below NVMe's warn threshold (70)
-        // but above ATA's critical threshold (65): the same temperature
-        // must produce no finding at all on one protocol and a Critical
-        // finding on the other.
+        // but above ATA's WARN threshold (55): the same temperature
+        // must produce no finding at all on one protocol and a Warning on
+        // the other.
         let nvme_60 = r#"{"device":{"name":"/dev/nvme0","type":"nvme","protocol":"NVMe"},
             "smart_status":{"passed":true},"temperature":{"current":60},
             "nvme_smart_health_information_log":{"critical_warning":0,"percentage_used":0}}"#;
@@ -488,7 +488,26 @@ mod tests {
         let rep_a = probe(&sys_a, "/dev/sdb", &mut sink).unwrap();
         assert!(!rep_n.findings.iter().any(|f| f.key == "temp"), "60C on NVMe is below its own warn threshold of 70");
         let ata_temp = rep_a.findings.iter().find(|f| f.key == "temp");
-        assert_eq!(ata_temp.map(|f| f.severity), Some(Severity::Critical), "60C on ATA is above ITS critical threshold of 65");
+        // Warning, not Critical. The first version of this asserted Critical
+        // with the message "60C on ATA is above ITS critical threshold of 65"
+        // -- which contradicts itself, since 60 is below 65. The code was
+        // right; the test was wrong, and it was written in a session that
+        // never compiled it. ATA is (warn 55, crit 65), so 60C lands in the
+        // warn band. The POINT of the test survives: the same temperature is
+        // no finding at all on NVMe and a real one on ATA.
+        assert_eq!(ata_temp.map(|f| f.severity), Some(Severity::Warning),
+            "60C on ATA is above its warn threshold of 55 but below its critical 65");
+
+        // ...and the critical side of the ATA split, which nothing covered:
+        // the bug that matters is a threshold pair applied to the wrong bus,
+        // and only checking the warn band would miss a crit that never fires.
+        let ata_70 = r#"{"device":{"name":"/dev/sdb","type":"sat","protocol":"ATA"},
+            "smart_status":{"passed":true},"temperature":{"current":70}}"#;
+        let sys_hot = FixtureRunner::new().on("smartctl -a --json=c /dev/sdb", 0, ata_70);
+        let rep_hot = probe(&sys_hot, "/dev/sdb", &mut sink).unwrap();
+        let hot = rep_hot.findings.iter().find(|f| f.key == "temp");
+        assert_eq!(hot.map(|f| f.severity), Some(Severity::Critical),
+            "70C on ATA is at or above its critical threshold of 65");
     }
 
     #[test]

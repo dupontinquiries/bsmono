@@ -262,7 +262,30 @@ pub fn recognise(c: &Cell, templates: &[(char, Cell)]) -> Option<Read> {
     // as an 8 with high confidence because the distance was small is
     // how a take gets filed under the wrong number.
     let runner = scored.iter().find(|(_, c2)| *c2 != ch).map(|(d, _)| *d).unwrap_or(CELL * CELL);
-    let margin = runner.saturating_sub(best) as f32 / (CELL * CELL / 4) as f32;
+    // RELATIVE margin, normalised by the runner-up rather than by a fixed
+    // fraction of the cell.
+    //
+    // This was `(runner - best) / (CELL * CELL / 4)`, which assumes the
+    // nearest wrong glyph differs by a quarter of every pixel in the cell.
+    // Real digit templates are nothing like that far apart, so a PERFECT
+    // match scored 0.25 -- under MIN_SURE (0.55) -- and `read_board` rejected
+    // every character it recognised correctly. That one miscalibration is why
+    // the reader returned an entirely empty Board rather than a wrong one,
+    // which is the more confusing failure: nothing to look at and nothing to
+    // blame.
+    //
+    // Dividing by the runner-up is self-normalising and says the intended
+    // thing directly: how much closer is the winner than its nearest rival,
+    // as a fraction. An exact match against any rival is 1.0. The module's
+    // own example -- two pixels from `8`, three from `B` -- gives 1/3, which
+    // is correctly below MIN_SURE and unread.
+    let margin = if runner == 0 {
+        // Two templates at distance zero: the glyph matches both exactly, so
+        // there is no evidence for either. Not confident, however close.
+        0.0
+    } else {
+        runner.saturating_sub(best) as f32 / runner as f32
+    };
     let closeness = 1.0 - (best as f32 / (CELL * CELL) as f32);
     Some(Read { ch, sure: (margin.min(1.0) * closeness).clamp(0.0, 1.0) })
 }
