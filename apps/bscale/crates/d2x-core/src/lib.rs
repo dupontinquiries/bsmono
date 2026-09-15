@@ -29,6 +29,9 @@ pub mod blockcache;
 pub mod subtile;
 pub mod budget;
 pub mod frame;
+/// Denoise/deblur/de-artifact networks (scale-1 `Network`s) chained ahead of
+/// the gate, so restoration and block reuse are independent knobs.
+pub mod filters;
 pub mod gate;
 pub mod matcher;
 pub mod net;
@@ -88,6 +91,7 @@ pub(crate) mod testimg {
     }
 }
 
+pub use filters::FilteredSource;
 pub use frame::Frame;
 pub use pipeline::{run, Event, FrameSink, FrameSource, PipelineConfig, SourceInfo, Summary};
 pub use plan::{FramePlan, FrameStats};
