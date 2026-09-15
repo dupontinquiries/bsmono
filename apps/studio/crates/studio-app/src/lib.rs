@@ -2813,6 +2813,10 @@ pub struct App {
     /// here; the mixdown and the sampler both read it.
     audio: std::collections::BTreeMap<studio_core::SourceId, studio_audio::SourceAudio>,
     sink: Box<dyn audition::PlaybackSink>,
+    /// Wall-clock epoch used ONLY while the arrangement has no audio to
+    /// report a position from. `None` whenever the sink is driving the
+    /// playhead, which is the normal case; see `sync_sink`.
+    silent_clock: Option<std::time::Instant>,
     /// The wire, when one was asked for: STUDIO_LISTEN=addr:port waits for a
     /// peer, STUDIO_CONNECT=addr:port dials one. Env vars, not a dialog —
     /// the same predictable-beats-configurable trade the export path makes,
@@ -3088,7 +3092,7 @@ impl Default for App {
               upscale_settings: upscale::Settings::default(),
               tune_scale: None,
               analog: Box::new(analog),
-              loaded: SinkContent::Nothing }
+              loaded: SinkContent::Nothing, silent_clock: None }
     }
 }
 
@@ -5508,6 +5512,7 @@ impl App {
             }
             self.sink.set_playing(true);
             if let Some(f) = self.sink.position() {
+                self.silent_clock = None;
                 // Video follows audio, never the reverse (transport's rule №1)
                 // — the sink's consumed frames ARE the playhead. EXCEPT
                 // while looping: the sink's own position cycles forever
@@ -5543,8 +5548,45 @@ impl App {
                     }
                 }
             } else if !self.sink.playing() {
-                self.studio.transport.stop();
-                self.studio.status = "reached the end".into();
+                // THE PLAYHEAD-NEVER-ADVANCES BUG.
+                //
+                // "Video follows audio, never the reverse" (transport's rule
+                // №1) is right for a project with audio, and wrong for one
+                // without. `NullSink::position()` returns None when
+                // `frames == 0`, and its `playing()` is
+                // `playing && (looped || raw_pos() < frames)` — also false at
+                // zero frames. So an arrangement that renders NO AUDIO landed
+                // here and was stopped with "reached the end" before a single
+                // frame elapsed. A video-only timeline — the kdenlive case —
+                // could never play at all, and a project whose only clip was
+                // a silent/unrendered pattern behaved the same way.
+                //
+                // An empty buffer is not the end of the timeline; it is the
+                // absence of a clock. So supply one. `Transport::advance`
+                // already exists for exactly this, takes a frame count rather
+                // than wall time, and was until now called only from its own
+                // tests — there was no clock in the app at all.
+                //
+                // The audio path is untouched: whenever the sink can report a
+                // position it still wins, and `silent_clock` is cleared above
+                // so a project that gains audio hands the clock straight back.
+                let empty = self.loaded != SinkContent::Nothing && self.sink.position().is_none();
+                if empty {
+                    let now = std::time::Instant::now();
+                    let last = self.silent_clock.replace(now);
+                    if let Some(prev) = last {
+                        // Clamped: a stalled frame (a modal dialog, a long
+                        // render, the process being suspended) must not
+                        // teleport the playhead across the timeline.
+                        let dt = now.duration_since(prev).as_secs_f64().min(0.25);
+                        let frames = (dt * self.sink.rate() as f64) as i64;
+                        self.studio.transport.advance(frames);
+                    }
+                } else {
+                    self.silent_clock = None;
+                    self.studio.transport.stop();
+                    self.studio.status = "reached the end".into();
+                }
             }
         } else if self.studio.rack_playing {
             if self.loaded != SinkContent::RackLoop || self.studio.loop_dirty {
