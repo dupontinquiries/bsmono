@@ -363,8 +363,12 @@ mod tests {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let prev = std::env::var_os("XDG_DATA_HOME");
-        unsafe { std::env::set_var("XDG_DATA_HOME", &tmp); }
+        // envlock-kit: the lock is the point. All four of these helpers set
+        // XDG_DATA_HOME to their OWN temp dir, and cargo runs them in
+        // parallel, so without serialising they overwrite each other's view
+        // of where data lives. Restoration moves to the guard's Drop, which
+        // also covers the panicking case the manual restore below did not.
+        let _env = envlock_kit::guard().set("XDG_DATA_HOME", &tmp);
         // Reset state so capture_dir() re-resolves.
         if let Ok(mut s) = state().lock() {
             *s = DumpState {
@@ -377,11 +381,6 @@ mod tests {
             };
         }
         f();
-        if let Some(p) = prev {
-            unsafe { std::env::set_var("XDG_DATA_HOME", p); }
-        } else {
-            unsafe { std::env::remove_var("XDG_DATA_HOME"); }
-        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

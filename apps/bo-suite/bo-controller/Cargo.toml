@@ -85,6 +85,10 @@ analysis = ["dep:bliss-audio"]
 # Used in settings_store tests to redirect persistence to a
 # per-test temp dir.
 tempfile = "3"
+# Four test helpers in this crate set XDG_DATA_HOME to their own temp dir and
+# cargo runs them in parallel. envlock-kit serialises that and restores on
+# Drop; see its module header for the four fleet bugs it was written after.
+envlock-kit = { path = "../../../shared/envlock-kit" }
 
 [build-dependencies]
 qmetaobject = "0.2"

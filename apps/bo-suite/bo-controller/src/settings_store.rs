@@ -378,15 +378,11 @@ mod tests {
         // Redirect settings to a temp dir so tests don't clobber
         // the real user's file.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let original = std::env::var("XDG_DATA_HOME").ok();
-        std::env::set_var("XDG_DATA_HOME", tmp.path());
+        // Serialised and restored by the guard; see envlock-kit.
+        let _env = envlock_kit::guard().set("XDG_DATA_HOME", tmp.path());
         invalidate_cache_for_test();
         f();
         invalidate_cache_for_test();
-        match original {
-            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-            None => std::env::remove_var("XDG_DATA_HOME"),
-        }
     }
 
     #[test]

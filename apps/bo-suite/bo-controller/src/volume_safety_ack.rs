@@ -115,22 +115,19 @@ mod tests {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let prev = std::env::var_os("XDG_DATA_HOME");
-        // SAFETY: tests run single-threaded with --test-threads=1 by
-        // default for the env-mutating tests, and the path discovery
-        // is the only consumer of this env var here.
-        unsafe { std::env::set_var("XDG_DATA_HOME", &tmp); }
+        // The SAFETY note that used to sit here claimed "tests run
+        // single-threaded with --test-threads=1 by default". They do not --
+        // cargo runs them on one thread per core -- and that false premise is
+        // why four helpers in this crate all set XDG_DATA_HOME to different
+        // temp dirs concurrently. envlock-kit provides the serialisation the
+        // comment assumed, and restores on Drop.
+        let _env = envlock_kit::guard().set("XDG_DATA_HOME", &tmp);
         // Reset the global cache so the env change takes effect.
         if let Ok(mut c) = cache().lock() {
             c.loaded = false;
             c.acks.clear();
         }
         f();
-        if let Some(p) = prev {
-            unsafe { std::env::set_var("XDG_DATA_HOME", p); }
-        } else {
-            unsafe { std::env::remove_var("XDG_DATA_HOME"); }
-        }
         // Reset cache again so subsequent tests start clean.
         if let Ok(mut c) = cache().lock() {
             c.loaded = false;

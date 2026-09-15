@@ -1,0 +1,26 @@
+[package]
+name = "envlock-kit"
+version = "0.1.0"
+edition = "2021"
+description = """
+One RAII guard for tests that must set an environment variable.
+
+Written after the FOURTH crate in this fleet failed a build for the same
+reason: a test calls std::env::set_var, cargo runs tests in parallel, the
+variable is process-global, and another test reads it mid-flight. Every time,
+the symptom was a confusing failure in code that was correct, and twice the
+first diagnosis was wrong because the failure pointed away from the cause
+(switcheroo, voiceterm, bo-mux, and gitmind's variant of it).
+
+A survey found 11 more crates with the same shape: the same variable mutated
+from two or more places with no lock. This is the thing that is cheaper than
+finding the twelfth.
+
+std-only. Test-support, but NOT dev-only in its own manifest -- a consumer
+puts it in [dev-dependencies].
+"""
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
