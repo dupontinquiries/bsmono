@@ -352,6 +352,23 @@ pub struct Group {
     /// failing to deserialize.
     #[serde(default)]
     pub key: Option<Key>,
+    /// The span of its own contents this comp SHOWS, absolute ticks.
+    ///
+    /// `None` — the default, and what every existing project loads as —
+    /// means "all of it", and the comp's extent stays its members' min..max.
+    ///
+    /// This exists so splitting a folded comp is a TRIM OF THE
+    /// REPRESENTATION rather than an edit of the material. Without a window
+    /// there was nowhere to record "this comp shows the first half", so the
+    /// only way to halve a comp was to cut the clips inside it — which is the
+    /// bug: content was spliced out of the comp, and a comp is a view OF the
+    /// content, not a copy of it.
+    ///
+    /// Members are never touched by a window. Two comps can show
+    /// non-overlapping halves of the SAME clips, and deleting one leaves the
+    /// material whole.
+    #[serde(default)]
+    pub window: Option<(Ticks, Ticks)>,
     /// This song's own tempo map, independent of every other song's.
     /// `None` means "no opinion" — the timeline draws this song's beat
     /// grid at a DAW-default 120 BPM rather than refusing to draw one,
@@ -849,6 +866,13 @@ pub enum Op {
     /// exist — unlike the project-wide key, which always has a project
     /// to belong to, a group-scoped key needs a group.
     SetGroupKey { id: GroupId, key: Option<Key> },
+    /// Set (or clear) the span of its contents a comp shows.
+    ///
+    /// Its own op rather than a field on `SetGroup`, for the reason given
+    /// there: `SetGroup` restates name and membership, so folding the window
+    /// into it would make every trim also rewrite the membership, and a
+    /// concurrent rename would silently revert the trim.
+    SetGroupWindow { id: GroupId, window: Option<(Ticks, Ticks)> },
     /// Same shape as `SetGroupKey`, for a song's tempo map — its own op
     /// for the identical reason: `SetGroup` restates name+membership on
     /// every rename and must not be the thing a tempo map rides along
@@ -911,6 +935,10 @@ pub enum EditError {
     NoSuchAutoPoint,
     /// A `SetGroup` with no members.
     EmptyGroup,
+    /// A comp split at a tick outside the comp's own span. Named like
+    /// `OutOfSource`, which refuses the same mistake on a clip: a cut at or
+    /// past an edge is a non-event, not an empty half.
+    OutOfComp { id: GroupId },
     /// A marker must have a name — an unnamed one cannot be jumped to.
     EmptyMarker,
     NoSuchMarker(String),
@@ -1289,8 +1317,11 @@ impl Project {
                 if clips.is_empty() {
                     return Err(EditError::EmptyGroup);
                 }
-                let (old_key, old_tempo, old_active) = self.groups.get(id)
-                    .map(|g| (g.key, g.tempo.clone(), g.active)).unwrap_or((None, None, None));
+                // The window joins these for the reason below: a rename must
+                // not silently erase a trim.
+                let (old_key, old_tempo, old_active, old_window) = self.groups.get(id)
+                    .map(|g| (g.key, g.tempo.clone(), g.active, g.window))
+                    .unwrap_or((None, None, None, None));
                 let inv = match self.groups.get(id) {
                     Some(old) => Op::SetGroup { id: *id, name: old.name.clone(),
                                                 clips: old.clips.clone() },
@@ -1301,7 +1332,8 @@ impl Project {
                 // same reasoning as why renaming a track doesn't reset its
                 // fader. A rename must not silently erase any of them.
                 self.groups.insert(*id, Group { name: name.clone(), clips: clips.clone(),
-                                                 key: old_key, tempo: old_tempo, active: old_active });
+                                                 key: old_key, tempo: old_tempo, active: old_active,
+                                                 window: old_window });
                 Ok(inv)
             }
             Op::SetKey { key } => {
@@ -1313,6 +1345,12 @@ impl Project {
                 let g = self.groups.get_mut(id).ok_or(EditError::NoSuchGroup(*id))?;
                 let inv = Op::SetGroupKey { id: *id, key: g.key };
                 g.key = *key;
+                Ok(inv)
+            }
+            Op::SetGroupWindow { id, window } => {
+                let g = self.groups.get_mut(id).ok_or(EditError::NoSuchGroup(*id))?;
+                let inv = Op::SetGroupWindow { id: *id, window: g.window };
+                g.window = *window;
                 Ok(inv)
             }
             Op::SetGroupTempo { id, tempo } => {
@@ -1552,6 +1590,62 @@ impl Project {
     /// Split a clip at an absolute timeline position, as both editors' `S` key
     /// does. Returns the ops (not the mutation) so the caller can route them
     /// through undo and collaboration like any other edit.
+    /// The span a comp occupies on the timeline: its members' extent, clipped
+    /// to its window if it has one.
+    ///
+    /// `None` when the group is unknown or empty.
+    pub fn group_span(&self, id: GroupId) -> Option<(Ticks, Ticks)> {
+        let g = self.groups.get(&id)?;
+        let mut lo: Option<Ticks> = None;
+        let mut hi: Option<Ticks> = None;
+        for c in g.clips.iter().filter_map(|c| self.clips.get(c)) {
+            lo = Some(lo.map_or(c.pos, |x: Ticks| if c.pos < x { c.pos } else { x }));
+            let e = c.end();
+            hi = Some(hi.map_or(e, |x: Ticks| if e > x { e } else { x }));
+        }
+        let (mut a, mut b) = (lo?, hi?);
+        if let Some((wa, wb)) = g.window {
+            if wa > a { a = wa; }
+            if wb < b { b = wb; }
+        }
+        if b <= a { None } else { Some((a, b)) }
+    }
+
+    /// Split a COMP at `at` — a trim of the representation, not a cut of the
+    /// material.
+    ///
+    /// This is what was wrong. Splitting a folded comp went through
+    /// `split_ops` on whichever member clip happened to be selected or under
+    /// the playhead, so the cut reached inside and spliced the content out of
+    /// the comp. A comp is a VIEW of its clips; halving the view must not
+    /// touch them.
+    ///
+    /// So: two groups over the SAME member list, with complementary windows.
+    /// Not one clip op between them. Undo is two `SetGroupWindow`s and a
+    /// `RemoveGroup`, and the audio is bit-identical throughout because
+    /// nothing about the audio changed.
+    ///
+    /// The new group takes the RIGHT half, matching `split_ops`, where the new
+    /// clip is the tail — so the id the caller just minted means the same
+    /// thing in both operations.
+    pub fn split_group_ops(&self, id: GroupId, at: Ticks, new_id: GroupId)
+        -> Result<Vec<Op>, EditError>
+    {
+        let g = self.groups.get(&id).ok_or(EditError::NoSuchGroup(id))?;
+        let (a, b) = self.group_span(id).ok_or(EditError::EmptyGroup)?;
+        // A cut outside the comp is refused rather than producing an empty
+        // half. Splitting at the very edge is the same non-event as splitting
+        // a clip at its own start.
+        if at <= a || at >= b {
+            return Err(EditError::OutOfComp { id });
+        }
+        Ok(vec![
+            Op::SetGroupWindow { id, window: Some((a, at)) },
+            Op::SetGroup { id: new_id, name: format!("{} (2)", g.name), clips: g.clips.clone() },
+            Op::SetGroupWindow { id: new_id, window: Some((at, b)) },
+        ])
+    }
+
     pub fn split_ops(&self, id: ClipId, at: Ticks, new_id: ClipId) -> Result<Vec<Op>, EditError> {
         let c = self.clips.get(&id).ok_or(EditError::NoSuchClip(id))?;
         if at <= c.pos || at >= c.end() {
@@ -2890,5 +2984,113 @@ mod source_kind_tests {
     fn a_file_source_is_always_live() {
         let s = Source::file(SourceId(1), "x.wav", Ticks(1), 48_000, 1, false);
         assert!(s.generator_is_live(0));
+    }
+
+    // ── comp split: a trim of the view, not a cut of the material ──────────
+
+    fn comp_project() -> (Project, GroupId) {
+        // Three clips at 0..100, 100..200, 200..300 on one track, grouped.
+        let mut p = Project::default();
+        let t = TrackId(1);
+        p.apply(&Op::AddTrack { id: t, name: "t".into(), kind: TrackKind::Audio }).unwrap();
+        let src = SourceId(1);
+        p.apply(&Op::AddSource { source: Source::file(src, "/a.wav", Ticks(1000), 48000, 2, false) }).unwrap();
+        let ids: Vec<ClipId> = (0..3).map(|i| ClipId(i + 1)).collect();
+        for (i, id) in ids.iter().enumerate() {
+            p.apply(&Op::AddClip { clip: Clip {
+                id: *id, source: src, track: t,
+                pos: Ticks(i as i64 * 100), src_in: Ticks(0), len: Ticks(100),
+                ..Default::default() } }).unwrap();
+        }
+        let g = GroupId(1);
+        p.apply(&Op::SetGroup { id: g, name: "comp 1".into(), clips: ids }).unwrap();
+        (p, g)
+    }
+
+    /// THE BUG. Splitting a comp used to reach inside and cut a member, so the
+    /// content was spliced out of the comp. It must not emit a single clip op.
+    #[test]
+    fn splitting_a_comp_does_not_touch_the_clips_inside_it() {
+        let (mut p, g) = comp_project();
+        let before = p.clips.clone();
+        let ops = p.split_group_ops(g, Ticks(150), GroupId(2)).unwrap();
+        assert!(ops.iter().all(|o| matches!(o,
+            Op::SetGroupWindow { .. } | Op::SetGroup { .. })),
+            "a comp split is groups only: {ops:?}");
+        for op in &ops { p.apply(op).unwrap(); }
+        assert_eq!(p.clips, before, "the material is untouched");
+    }
+
+    /// Two comps over the same clips, showing complementary halves.
+    #[test]
+    fn the_two_halves_cover_the_original_span_and_share_their_members() {
+        let (mut p, g) = comp_project();
+        let ops = p.split_group_ops(g, Ticks(150), GroupId(2)).unwrap();
+        for op in &ops { p.apply(op).unwrap(); }
+        assert_eq!(p.group_span(g), Some((Ticks(0), Ticks(150))));
+        assert_eq!(p.group_span(GroupId(2)), Some((Ticks(150), Ticks(300))));
+        assert_eq!(p.groups[&g].clips, p.groups[&GroupId(2)].clips,
+            "both halves are views of the SAME clips");
+    }
+
+    /// Deleting one half must leave the material whole -- the property that
+    /// makes this a view rather than a copy.
+    #[test]
+    fn removing_one_half_leaves_every_clip_intact() {
+        let (mut p, g) = comp_project();
+        let before = p.clips.clone();
+        for op in p.split_group_ops(g, Ticks(150), GroupId(2)).unwrap() { p.apply(&op).unwrap(); }
+        p.apply(&Op::RemoveGroup { id: GroupId(2) }).unwrap();
+        assert_eq!(p.clips, before);
+    }
+
+    /// A cut at or outside an edge is a non-event, not an empty half.
+    #[test]
+    fn a_cut_outside_the_comp_is_refused() {
+        let (p, g) = comp_project();
+        for at in [Ticks(-10), Ticks(0), Ticks(300), Ticks(999)] {
+            assert_eq!(p.split_group_ops(g, at, GroupId(2)),
+                       Err(EditError::OutOfComp { id: g }), "at {at:?}");
+        }
+    }
+
+    /// Splitting twice narrows further rather than re-widening -- the second
+    /// cut works on the already-trimmed view.
+    #[test]
+    fn a_second_split_trims_the_already_trimmed_half() {
+        let (mut p, g) = comp_project();
+        for op in p.split_group_ops(g, Ticks(200), GroupId(2)).unwrap() { p.apply(&op).unwrap(); }
+        for op in p.split_group_ops(g, Ticks(100), GroupId(3)).unwrap() { p.apply(&op).unwrap(); }
+        assert_eq!(p.group_span(g), Some((Ticks(0), Ticks(100))));
+        assert_eq!(p.group_span(GroupId(3)), Some((Ticks(100), Ticks(200))));
+        assert_eq!(p.group_span(GroupId(2)), Some((Ticks(200), Ticks(300))));
+    }
+
+    /// A rename must not silently erase a trim, the same rule key/tempo follow.
+    #[test]
+    fn renaming_a_comp_keeps_its_window() {
+        let (mut p, g) = comp_project();
+        for op in p.split_group_ops(g, Ticks(150), GroupId(2)).unwrap() { p.apply(&op).unwrap(); }
+        let clips = p.groups[&g].clips.clone();
+        p.apply(&Op::SetGroup { id: g, name: "renamed".into(), clips }).unwrap();
+        assert_eq!(p.group_span(g), Some((Ticks(0), Ticks(150))), "the trim survived the rename");
+    }
+
+    /// Undo restores the whole comp, and the window op is its own inverse.
+    #[test]
+    fn undoing_a_comp_split_restores_the_full_span() {
+        let (mut p, g) = comp_project();
+        let inv = p.apply(&Op::SetGroupWindow { id: g, window: Some((Ticks(0), Ticks(150)))}).unwrap();
+        assert_eq!(p.group_span(g), Some((Ticks(0), Ticks(150))));
+        p.apply(&inv).unwrap();
+        assert_eq!(p.group_span(g), Some((Ticks(0), Ticks(300))), "back to all of it");
+    }
+
+    /// An untrimmed comp behaves exactly as before the window existed.
+    #[test]
+    fn a_comp_with_no_window_spans_its_members() {
+        let (p, g) = comp_project();
+        assert!(p.groups[&g].window.is_none(), "None is the default");
+        assert_eq!(p.group_span(g), Some((Ticks(0), Ticks(300))));
     }
 }
