@@ -14285,15 +14285,34 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 );
                 let snowing = last_climate_temp_c <= 1.0;
                 let inten = precip01.clamp(0.0, 1.0);
+                // EVERY dimension below is in blocks and was tuned for a
+                // 1.8-block player. At stature the streaks stayed 0.4 blocks
+                // long inside a 16-block column, so a giant stood in a haze of
+                // specks that did not read as rain -- the drops were correct
+                // and simply invisible at that scale.
+                //
+                // `visual_ratio` rather than `size_ratio`: it is clamped, and
+                // a 15-block titan scaling the field by 8.3x is already at the
+                // edge of where each drop stops being a drop.
+                let vr = player_stature.visual_ratio();
                 let (count, fall_speed, sway, half, pcolor) = if snowing {
-                    ((140.0 + 360.0 * inten) as usize, 2.2_f32, 0.5_f32,
-                     [0.06_f32, 0.06, 0.06], [0.95_f32, 0.97, 1.0])
+                    ((140.0 + 360.0 * inten) as usize, 2.2_f32 * vr, 0.5_f32 * vr,
+                     [0.06_f32 * vr, 0.06 * vr, 0.06 * vr], [0.95_f32, 0.97, 1.0])
                 } else {
-                    ((220.0 + 700.0 * inten) as usize, 14.0_f32, 0.04_f32,
-                     [0.02_f32, 0.20, 0.02], [0.60_f32, 0.69, 0.85])
+                    ((220.0 + 700.0 * inten) as usize, 14.0_f32 * vr, 0.04_f32 * vr,
+                     [0.02_f32 * vr, 0.20 * vr, 0.02 * vr], [0.60_f32, 0.69, 0.85])
                 };
+                // The COLUMN scales too, or a giant's head is above the rain.
+                // Count grows with the cube root of the volume ratio rather
+                // than with the volume: filling an 8x box at constant density
+                // would be 512x the drops, which is a frame budget, not
+                // weather. Sparser rain at giant scale is also correct --
+                // drops are further apart relative to the eye.
+                let pradius = 16.0_f32 * vr;
+                let pheight = 18.0_f32 * vr;
+                let count = ((count as f32) * vr.max(0.1).powf(0.5)) as usize;
                 let drops = unendlich_engine::sim::precipitation::field(
-                    [pp.x, pp.y, pp.z], pt, count, 16.0, 18.0, fall_speed, [pwx, pwz], sway,
+                    [pp.x, pp.y, pp.z], pt, count, pradius, pheight, fall_speed, [pwx, pwz], sway,
                 );
                 let (hx, hy, hz) = (half[0], half[1], half[2]);
                 for d in &drops {
@@ -14738,8 +14757,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             let pp = local_player.view.position;
             if fg_app.swimming() && last_player_speed > 0.4 {
                 let f = local_player.forward();
+                // The player's OWN mass, not a literal 80kg. The comment above
+                // promises "a dragon crashing in makes a far bigger wave than
+                // a fish" and every roamer below already passes its own mass
+                // -- the player was the one body in the world that always
+                // displaced a reference person's worth of water, however large
+                // it was. Same defect as the rain: a constant tuned for 1.8
+                // blocks, applied at every stature.
                 let amp = unendlich_engine::sim::water_react::wave_amplitude(
-                    80.0, last_player_speed, 1.0, water_pushback_gain, water_pushback_max,
+                    player_stature.mass, last_player_speed, 1.0,
+                    water_pushback_gain, water_pushback_max,
                 );
                 water_flow_tiles.splash(pp.x as i32, pp.z as i32, f.x, f.z, amp, now_ms);
             }

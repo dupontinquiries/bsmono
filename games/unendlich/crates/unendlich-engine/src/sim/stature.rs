@@ -59,6 +59,35 @@ pub struct StatureProfile {
     pub water_resist_mult: f32,
 }
 
+impl StatureProfile {
+    /// This body's size relative to the reference person, `height / 1.8`.
+    ///
+    /// `derive` already computes this internally as `r`, but never exposed it,
+    /// so anything outside that needed it either re-derived the division or —
+    /// more often — forgot, and shipped a constant tuned for a 1.8-block
+    /// player.
+    ///
+    /// The rain was the visible case: precipitation drew 0.4-block streaks in
+    /// a 16-block column regardless of stature, so a giant stood in a haze of
+    /// specks that did not read as rain at all. Anything drawn in WORLD UNITS
+    /// near the player wants multiplying by this.
+    pub fn size_ratio(&self) -> f32 {
+        self.height / BASE_HEIGHT
+    }
+
+    /// `size_ratio` clamped to a sensible span for VISUAL scaling.
+    ///
+    /// Separate from the raw ratio because effects and physics want different
+    /// things from the same number. A 50-block titan wants rain scaled up,
+    /// but scaling a particle field by 27x makes each drop a bathtub and the
+    /// count needed to fill the column absurd; a 0.1-block sprite does not
+    /// want rain finer than a pixel. Physics has no such ceiling and uses the
+    /// raw ratio.
+    pub fn visual_ratio(&self) -> f32 {
+        self.size_ratio().clamp(0.35, 8.0)
+    }
+}
+
 /// The reference person — every law is anchored here so `derive(1.8, 1, 1, 1)`
 /// reproduces today's physics tuning.
 pub const BASE_HEIGHT: f32 = 1.8;
@@ -236,5 +265,34 @@ mod tests {
             assert!(p.height >= MIN_HEIGHT && p.height <= MAX_HEIGHT);
             assert!(p.knockback_resist01 >= 0.0 && p.knockback_resist01 < 1.0);
         }
+    }
+
+    /// The reference person is exactly 1.0, which is what anchors every
+    /// multiplier that uses this.
+    #[test]
+    fn the_reference_person_has_a_size_ratio_of_one() {
+        let p = derive(BASE_HEIGHT, 1.0, 1.0, 1.0);
+        assert!((p.size_ratio() - 1.0).abs() < 1e-6);
+        assert!((p.visual_ratio() - 1.0).abs() < 1e-6);
+    }
+
+    /// The whole point: a giant is bigger and a sprite is smaller.
+    #[test]
+    fn size_ratio_tracks_height() {
+        let tall = derive(9.0, 1.0, 1.0, 1.0);
+        let small = derive(0.9, 1.0, 1.0, 1.0);
+        assert!(tall.size_ratio() > 4.0, "{}", tall.size_ratio());
+        assert!(small.size_ratio() < 0.6, "{}", small.size_ratio());
+    }
+
+    /// Visual scaling is clamped where physics is not: a 50-block titan
+    /// scaling a particle field by 27x makes each raindrop a bathtub.
+    #[test]
+    fn visual_ratio_is_clamped_where_size_ratio_is_not() {
+        let titan = derive(MAX_HEIGHT, 1.0, 1.0, 1.0);
+        assert!(titan.size_ratio() > 8.0, "raw ratio is unbounded upward");
+        assert!(titan.visual_ratio() <= 8.0, "visual is capped");
+        let mote = derive(MIN_HEIGHT, 1.0, 1.0, 1.0);
+        assert!(mote.visual_ratio() >= 0.35, "and floored");
     }
 }
