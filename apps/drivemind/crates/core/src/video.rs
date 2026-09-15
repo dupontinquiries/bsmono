@@ -243,4 +243,77 @@ mod tests {
         assert_eq!(body.lines().count(), 2);
         assert!(body.contains("old.avi"));
     }
+
+    #[test]
+    fn h264_at_a_sane_bitrate_is_left_alone_not_flagged() {
+        // The `Some(_) => None` arm -- "h264 at sane bitrate... leave it"
+        // per its own comment -- had zero test coverage. Every existing
+        // h264 fixture was deliberately above the 8 Mbps threshold; a
+        // regression that flagged EVERY h264 file regardless of bitrate
+        // would not have been caught by any test before this one.
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        fs::write(r.join("normal.mp4"), vec![0u8; 100]).unwrap();
+        let path = r.join("normal.mp4").display().to_string();
+        let (k, v) = probe_fixture(&path, r#"{"streams":[{"codec_name":"h264","bit_rate":"3000000"}]}"#);
+        let sys = FixtureRunner::new().on(&k, 0, &v);
+        let mut sink = null_sink();
+        let s = scan(&sys, r, &mut sink);
+        assert!(s.candidates.is_empty(), "ordinary h264 must not be suggested for re-encode: {:?}", s.candidates);
+        assert_eq!(s.skipped_modern, 0, "h264 is not a MODERN codec either -- it's neither skip-as-modern nor flag-as-legacy");
+    }
+
+    #[test]
+    fn h264_bit_rate_exactly_at_the_threshold_counts_high() {
+        // `*br >= H264_HIGH_BITRATE` -- the boundary itself. The existing
+        // fixture used 45 Mbps, comfortably clear of 8 Mbps either way;
+        // a `>` vs `>=` mistake would not be caught without a value
+        // planted exactly on the line.
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        fs::write(r.join("edge.mp4"), vec![0u8; 100]).unwrap();
+        let path = r.join("edge.mp4").display().to_string();
+        let (k, v) = probe_fixture(&path, r#"{"streams":[{"codec_name":"h264","bit_rate":"8000000"}]}"#);
+        let sys = FixtureRunner::new().on(&k, 0, &v);
+        let mut sink = null_sink();
+        let s = scan(&sys, r, &mut sink);
+        assert_eq!(s.candidates.len(), 1, "exactly 8,000,000 bps must count as high bitrate");
+    }
+
+    #[test]
+    fn missing_ffprobe_falls_back_to_extension_only_listing_with_a_visible_note() {
+        // The module's own header states the design goal precisely:
+        // "Without ffprobe we fall back to extension-only listing with a
+        // Note that codecs are unknown -- visible degradation, not
+        // silent wrong answers." This had NO test at all -- every
+        // existing fixture answered every ffprobe call, so the "ffprobe
+        // is not installed on this machine" path (a real, common case on
+        // a minimal postmarketOS image) was never exercised.
+        struct NoFfprobe;
+        impl SysRunner for NoFfprobe {
+            fn run(&self, program: &str, _: &[&str]) -> Result<crate::SysOutput, String> {
+                if program == "ffprobe" {
+                    Err("ffprobe: command not found".into())
+                } else {
+                    Err("unexpected command in this fixture".into())
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        fs::write(r.join("mystery.mp4"), vec![0u8; 1234]).unwrap();
+
+        let mut notes: Vec<String> = Vec::new();
+        {
+            let mut sink = |e: Event| {
+                if let Event::Note(n) = e { notes.push(n); }
+            };
+            let s = scan(&NoFfprobe, r, &mut sink);
+            assert_eq!(s.candidates.len(), 1, "the file must still be listed by extension alone");
+            assert_eq!(s.candidates[0].codec, None, "codec must be honestly unknown, not guessed");
+            assert_eq!(s.candidates[0].why, "video file (codec unprobed)");
+        }
+        assert!(notes.iter().any(|n| n.contains("ffprobe not available")),
+            "the degradation must be VISIBLE, per this module's own stated design goal: {notes:?}");
+    }
 }
