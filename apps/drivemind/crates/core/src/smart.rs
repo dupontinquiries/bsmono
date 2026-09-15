@@ -442,4 +442,142 @@ mod tests {
         let err = probe(&sys, "/dev/sdz", &mut sink).unwrap_err();
         assert!(err.contains("exhausted"), "{err}");
     }
+
+    #[test]
+    fn a_hot_nvme_drive_produces_a_critical_temperature_finding() {
+        // Real gap: NVME_BAD (used by usb_bridge_ladder_reaches_sntjmicron_
+        // and_flags_failure) already carries temperature 83C, which is
+        // ABOVE the NVMe critical threshold of 80 -- but that test only
+        // ever checked overall worst() and the critical_warning bit
+        // count, never the temperature finding specifically. This is the
+        // exact class of gap that lets a real bug hide behind an
+        // already-passing test: the finding could silently stop being
+        // produced (a regression in the temp branch) and worst() would
+        // still read Critical because of the OTHER findings in that same
+        // fixture, masking it completely. Ladder wired in full, same
+        // shape as usb_bridge_ladder_reaches_sntjmicron_and_flags_failure,
+        // since NVME_BAD only resolves at the sntjmicron rung.
+        let sys = FixtureRunner::new()
+            .on("smartctl -a --json=c /dev/sda", 2, BRIDGE_EMPTY)
+            .on("smartctl -a --json=c -d sat /dev/sda", 2, BRIDGE_EMPTY)
+            .on("smartctl -a --json=c -d sntjmicron /dev/sda", 8, NVME_BAD);
+        let mut sink = null_sink();
+        let rep = probe(&sys, "/dev/sda", &mut sink).unwrap();
+        let temp = rep.findings.iter().find(|f| f.key == "temp");
+        assert!(temp.is_some(), "83C on an NVMe device (critical >= 80) must produce a temp finding: {:?}", rep.findings);
+        assert_eq!(temp.unwrap().severity, Severity::Critical);
+    }
+
+    #[test]
+    fn temperature_severity_uses_different_thresholds_for_nvme_vs_ata() {
+        // The warn/crit pair is (70, 80) for NVMe and (55, 65) for ATA --
+        // untested that these are genuinely DIFFERENT, not the same
+        // numbers duplicated. 60C is below NVMe's warn threshold (70)
+        // but above ATA's critical threshold (65): the same temperature
+        // must produce no finding at all on one protocol and a Critical
+        // finding on the other.
+        let nvme_60 = r#"{"device":{"name":"/dev/nvme0","type":"nvme","protocol":"NVMe"},
+            "smart_status":{"passed":true},"temperature":{"current":60},
+            "nvme_smart_health_information_log":{"critical_warning":0,"percentage_used":0}}"#;
+        let ata_60 = r#"{"device":{"name":"/dev/sdb","type":"sat","protocol":"ATA"},
+            "smart_status":{"passed":true},"temperature":{"current":60}}"#;
+        let sys_n = FixtureRunner::new().on("smartctl -a --json=c /dev/nvme0n1", 0, nvme_60);
+        let sys_a = FixtureRunner::new().on("smartctl -a --json=c /dev/sdb", 0, ata_60);
+        let mut sink = null_sink();
+        let rep_n = probe(&sys_n, "/dev/nvme0n1", &mut sink).unwrap();
+        let rep_a = probe(&sys_a, "/dev/sdb", &mut sink).unwrap();
+        assert!(!rep_n.findings.iter().any(|f| f.key == "temp"), "60C on NVMe is below its own warn threshold of 70");
+        let ata_temp = rep_a.findings.iter().find(|f| f.key == "temp");
+        assert_eq!(ata_temp.map(|f| f.severity), Some(Severity::Critical), "60C on ATA is above ITS critical threshold of 65");
+    }
+
+    #[test]
+    fn a_severe_ata_damage_attribute_is_critical_not_just_warning() {
+        // ATA_DAMAGE_ATTRS' `if a.raw >= 50 { Critical } else { Warning }`
+        // split had only ever been tested on the Warning side (attr 5,
+        // raw=8, in the existing ata_attrs_judged test). The Critical
+        // side -- the one that should actually change which clone tool
+        // gets selected -- had zero coverage.
+        let severe = r#"{"device":{"name":"/dev/sdb","type":"sat","protocol":"ATA"},
+            "smart_status":{"passed":true},"temperature":{"current":38},
+            "ata_smart_attributes":{"table":[
+                {"id":5,"name":"Reallocated_Sector_Ct","value":50,"thresh":10,"when_failed":"","raw":{"value":75}}
+            ]}}"#;
+        let sys = FixtureRunner::new().on("smartctl -a --json=c /dev/sdb", 0, severe);
+        let mut sink = null_sink();
+        let rep = probe(&sys, "/dev/sdb", &mut sink).unwrap();
+        let f = rep.findings.iter().find(|f| f.key == "ata.attr.5").expect("finding must exist");
+        assert_eq!(f.severity, Severity::Critical, "raw=75 is >= the 50 threshold for Critical");
+        assert_eq!(rep.worst(), Severity::Critical);
+    }
+
+    #[test]
+    fn available_spare_below_threshold_is_its_own_critical_finding() {
+        // NVME_BAD already has available_spare=4 < threshold=10, and the
+        // existing ladder test's assertions never isolated this specific
+        // finding -- only the aggregate worst() and the unrelated
+        // critical_warning bit count. A regression removing the spare
+        // check entirely would not have been caught, since percentage_
+        // used=101 alone already makes worst() Critical in that fixture.
+        let low_spare = r#"{"device":{"name":"/dev/nvme0","type":"nvme","protocol":"NVMe"},
+            "smart_status":{"passed":true},"temperature":{"current":40},
+            "nvme_smart_health_information_log":{"critical_warning":0,
+                "available_spare":4,"available_spare_threshold":10,"percentage_used":5}}"#;
+        let sys = FixtureRunner::new().on("smartctl -a --json=c /dev/nvme0n1", 0, low_spare);
+        let mut sink = null_sink();
+        let rep = probe(&sys, "/dev/nvme0n1", &mut sink).unwrap();
+        assert!(rep.findings.iter().any(|f| f.key == "nvme.spare" && f.severity == Severity::Critical),
+            "available_spare (4) below its own threshold (10) must be Critical on its own, isolated from percentage_used: {:?}", rep.findings);
+    }
+
+    #[test]
+    fn percentage_used_severity_tiers_are_distinct_at_each_boundary() {
+        // Only 3% (Ok) and 101% (Critical, via >100) had ever been used.
+        // The three OTHER tiers (70/90/100 boundaries, and the Advisory/
+        // Warning bands between them) had zero coverage -- a mis-ordered
+        // or off-by-one comparison chain (`>=100` before `>=90` matters,
+        // since they're checked in that order) would not be caught by
+        // only testing the extremes.
+        let at = |pct: i64| -> Severity {
+            let fix = format!(r#"{{"device":{{"name":"/dev/nvme0","type":"nvme","protocol":"NVMe"}},
+                "smart_status":{{"passed":true}},"temperature":{{"current":40}},
+                "nvme_smart_health_information_log":{{"critical_warning":0,"percentage_used":{pct}}}}}"#);
+            let sys = FixtureRunner::new().on("smartctl -a --json=c /dev/nvme0n1", 0, &fix);
+            let mut sink = null_sink();
+            let rep = probe(&sys, "/dev/nvme0n1", &mut sink).unwrap();
+            rep.findings.iter().find(|f| f.key == "nvme.percentage_used").unwrap().severity
+        };
+        assert_eq!(at(69), Severity::Ok, "just under the advisory line");
+        assert_eq!(at(70), Severity::Advisory, "exactly at the advisory line");
+        assert_eq!(at(89), Severity::Advisory, "just under the warning line");
+        assert_eq!(at(90), Severity::Warning, "exactly at the warning line");
+        assert_eq!(at(99), Severity::Warning, "just under the critical line");
+        assert_eq!(at(100), Severity::Critical, "exactly at the critical line");
+    }
+
+    #[test]
+    fn no_findings_at_all_reports_ok_not_a_default_that_looks_like_success() {
+        // worst()'s `.unwrap_or(Severity::Ok)` on a truly empty findings
+        // list -- untested with a report that has NOTHING to judge (no
+        // smart_status, no nvme section, no ata attributes, no
+        // temperature). Distinguishing this from smart_passed: Some(true)
+        // (which DOES add an explicit Ok finding) matters: this is the
+        // "we could not assess anything" case, not "we assessed and it's
+        // fine" -- both currently report Severity::Ok from worst(), which
+        // is worth pinning explicitly as a known shape rather than
+        // assuming a frontend can tell them apart some other way.
+        // The fixture must satisfy usable()'s check (presence of the
+        // /smart_status/passed pointer) or probe() rejects it and walks
+        // the rest of the ladder looking for a usable rung -- but the
+        // VALUE at that pointer being null rather than a bool still
+        // makes smart_passed itself None (as_bool() on null is None),
+        // which is the actual thing this test needs: a report usable()
+        // accepts but judge() has nothing to say about.
+        let bare = r#"{"device":{"name":"/dev/sdc","type":"scsi"},"smart_status":{"passed":null}}"#;
+        let sys = FixtureRunner::new().on("smartctl -a --json=c /dev/sdc", 0, bare);
+        let mut sink = null_sink();
+        let rep = probe(&sys, "/dev/sdc", &mut sink).unwrap();
+        assert!(rep.findings.is_empty());
+        assert_eq!(rep.worst(), Severity::Ok);
+    }
 }
