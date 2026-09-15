@@ -280,9 +280,15 @@ impl Studio {
     /// Select every clip of a composition — the group becomes the thing the
     /// next nudge, delete or effect applies to.
     pub fn select_group(&mut self, id: studio_core::GroupId) {
+        // Only what this comp SHOWS. Once a comp has been split the two halves
+        // share one member list, so selecting `g.clips` would hand the left
+        // half the right half's clips as well — and the next nudge would drag
+        // material that is not on screen. See `group_members_in_window`.
+        let picked = self.session.doc.project.group_members_in_window(id);
         if let Some(g) = self.session.doc.project.groups.get(&id) {
-            self.selection = g.clips.clone();
-            self.status = format!("selected {} clips of {}", g.clips.len(), g.name);
+            let name = g.name.clone();
+            self.status = format!("selected {} clips of {}", picked.len(), name);
+            self.selection = picked;
         }
     }
 

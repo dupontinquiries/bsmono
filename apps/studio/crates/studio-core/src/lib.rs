@@ -1611,6 +1611,27 @@ impl Project {
         if b <= a { None } else { Some((a, b)) }
     }
 
+    /// The members of a comp that its window actually shows.
+    ///
+    /// Without a window this is every member, which is what it always was.
+    /// With one it is the members that INTERSECT the window — and that
+    /// distinction is load-bearing once a comp has been split, because the two
+    /// halves share one member list. A gesture that selected every member of
+    /// the left half would be holding the right half's clips too, and nudging
+    /// it would drag material that is not on screen.
+    ///
+    /// Intersection, not containment: a clip straddling the cut is shown by
+    /// BOTH halves, and each should be able to act on it. Excluding it would
+    /// make a straddling clip unreachable from either side, which is worse
+    /// than it being reachable from both.
+    pub fn group_members_in_window(&self, id: GroupId) -> Vec<ClipId> {
+        let Some(g) = self.groups.get(&id) else { return Vec::new() };
+        let Some((a, b)) = g.window else { return g.clips.clone() };
+        g.clips.iter().copied().filter(|c| {
+            self.clips.get(c).map_or(false, |c| c.pos < b && c.end() > a)
+        }).collect()
+    }
+
     /// Split a COMP at `at` — a trim of the representation, not a cut of the
     /// material.
     ///
@@ -3092,5 +3113,55 @@ mod source_kind_tests {
         let (p, g) = comp_project();
         assert!(p.groups[&g].window.is_none(), "None is the default");
         assert_eq!(p.group_span(g), Some((Ticks(0), Ticks(300))));
+    }
+
+    /// THE CONSEQUENCE OF SHARING A MEMBER LIST. After a split both halves
+    /// list every clip, so a gesture on one half must not reach the other's
+    /// material.
+    #[test]
+    fn each_half_of_a_split_comp_only_shows_its_own_clips() {
+        let (mut p, g) = comp_project();
+        for op in p.split_group_ops(g, Ticks(150), GroupId(2)).unwrap() { p.apply(&op).unwrap(); }
+        // Members are 0..100, 100..200, 200..300; the cut is at 150.
+        let left = p.group_members_in_window(g);
+        let right = p.group_members_in_window(GroupId(2));
+        assert_eq!(left, vec![ClipId(1), ClipId(2)], "left half: {left:?}");
+        assert_eq!(right, vec![ClipId(2), ClipId(3)], "right half: {right:?}");
+        assert!(p.groups[&g].clips.len() == 3, "though both still LIST all three");
+    }
+
+    /// Intersection, not containment: the straddling clip belongs to both
+    /// halves. Unreachable from either side would be worse than reachable
+    /// from both.
+    #[test]
+    fn a_clip_straddling_the_cut_is_shown_by_both_halves() {
+        let (mut p, g) = comp_project();
+        for op in p.split_group_ops(g, Ticks(150), GroupId(2)).unwrap() { p.apply(&op).unwrap(); }
+        assert!(p.group_members_in_window(g).contains(&ClipId(2)));
+        assert!(p.group_members_in_window(GroupId(2)).contains(&ClipId(2)));
+    }
+
+    /// An untrimmed comp shows everything, exactly as before the window
+    /// existed.
+    #[test]
+    fn a_comp_with_no_window_shows_every_member() {
+        let (p, g) = comp_project();
+        assert_eq!(p.group_members_in_window(g), p.groups[&g].clips);
+    }
+
+    /// A window that touches only an edge excludes the clip that merely abuts
+    /// it -- a zero-length overlap is not a showing.
+    #[test]
+    fn a_clip_that_only_abuts_the_window_is_not_shown() {
+        let (mut p, g) = comp_project();
+        p.apply(&Op::SetGroupWindow { id: g, window: Some((Ticks(100), Ticks(200))) }).unwrap();
+        let shown = p.group_members_in_window(g);
+        assert_eq!(shown, vec![ClipId(2)], "the neighbours touch but do not overlap: {shown:?}");
+    }
+
+    #[test]
+    fn an_unknown_group_shows_nothing_rather_than_panicking() {
+        let (p, _) = comp_project();
+        assert!(p.group_members_in_window(GroupId(99)).is_empty());
     }
 }
