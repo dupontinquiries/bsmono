@@ -59,7 +59,8 @@ board-compositor = { path = "../crates/board-compositor", optional = true, defau
 audio-kit = { path = "../../../shared/audio-kit", optional = true }
 # Voice: the port mounts rusty-board's own voice stack by #[path] (it is
 # GTK-free), so these are the same deps the GTK build uses, at the same versions.
-whisper-rs = { version = "0.13", optional = true }
+# Pinned to 0.16 -- see apps/rusty-board/Cargo.toml for why.
+whisper-rs = { version = "0.16", optional = true }
 cpal = { version = "0.15", optional = true }
 parking_lot = "0.12"
 tracing = "0.1"

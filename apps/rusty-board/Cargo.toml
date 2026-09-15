@@ -52,8 +52,14 @@ anyhow = "1.0"
 # the gtk-free layout/input-model layer (shared with egui-frontend)
 board-layouts = { path = "crates/board-layouts" }
 
-# Voice input (whisper-rs)
-whisper-rs = { version = "0.13", optional = true }
+# Voice input (whisper-rs). Pinned to 0.16, the version+whisper-rs-sys pair
+# (0.16.0 / 0.15.0) already resolved and building clean across the rest of
+# the fleet (voice-engine-kit, uikit, voiceterm x2, aperture, studio, logscope).
+# The loose "0.13" range let this crate drift onto 0.13.2, whose vendored
+# whisper_full_params no longer matches the whisper-rs-sys/whisper.cpp build
+# that got linked -- not a bug in this repo, an upstream binding/native-lib
+# skew (whisper-rs's own raw-api docs disclaim semver across that boundary).
+whisper-rs = { version = "0.16", optional = true }
 cpal = { version = "0.15", optional = true }
 hound = { version = "3.5", optional = true }
 ringbuf = { version = "0.4", optional = true }
