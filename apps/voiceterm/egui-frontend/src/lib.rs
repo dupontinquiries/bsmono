@@ -88,6 +88,16 @@ pub mod speakers;
 /// The voice selection list over that registry. The registry was reachable
 /// here already; nothing drew it -- `list_with_ids()` had no caller in this
 /// frontend at all.
+/// "Hey Kessler here" -- parsing a spoken claim of identity, and the
+/// confidence-scored match against registered names. Zero deps, mounted
+/// verbatim; the seam into `speaker_list`'s ids is `speaker_claim_view`.
+#[path = "../../src/speaker_claim.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod speaker_claim;
+/// Joins the claim parser to `speaker_list`'s ids, enforcing the
+/// acoustic-wins security rule at the one point that matters: where a claim
+/// becomes an action.
+pub mod speaker_claim_view;
 pub mod speaker_list;
 /// A keyboard in use holds the microphone off for five seconds. See the
 /// module header for why the command vocabulary being live while someone
