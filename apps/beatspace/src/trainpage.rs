@@ -216,7 +216,47 @@ impl TrainPage {
         // impossible for a constant logit and is the same sliver of signal seen
         // from the other side. So the band is two-sided and generous: anything
         // from 95% of 2ln2 upward is a discriminator that has stopped working.
-        p.d_loss > 2.0 * Self::LN2 * 0.95
+        // ...but BOUNDED ABOVE on g_loss, which the one-sided version was not,
+        // and that produced a false positive on a real run: d_loss 1.3745 with
+        // g_loss 5.0980 and CLIMBING was reported as DEAD.
+        //
+        // Inverting those numbers says what was actually happening. g_loss =
+        // softplus(-z_fake) = 5.098 gives z_fake = -5.09, so D was spotting
+        // fakes with high confidence. Feeding that back through d_loss gives
+        // z_real = -1.08 — D was calling REAL DATA FAKE as well. That is not a
+        // discriminator with no information; it is one that has collapsed onto
+        // "everything is fake", and d_loss only lands near 2ln2 because the
+        // real-side error happens to make up what the fake side no longer
+        // costs.
+        //
+        // The two failures want opposite fixes, which is why conflating them is
+        // expensive: a dead D needs to be made stronger or restarted, while
+        // this one needs to be made WEAKER (or its learning rate cut) so the
+        // generator can get off the floor. Telling someone to stop the run is
+        // wrong in the second case — the run is trainable, the balance is not.
+        //
+        // So g_loss must be in the neighbourhood of ln2 as well. The band is
+        // deliberately loose — up to 2ln2, which admits the 0.7985 that the
+        // first version missed by demanding 5% — but it is a band rather than
+        // nothing, and 5.098 is seven times ln2.
+        p.d_loss > 2.0 * Self::LN2 * 0.95 && p.g_loss < 2.0 * Self::LN2
+    }
+
+    /// The other way a d_loss near 2ln2 happens: D rejects everything.
+    ///
+    /// Distinguished from [`Self::no_information`] by g_loss running AWAY
+    /// upward. D is separating perfectly well — it is simply wrong about real
+    /// data too, so the generator is handed a large, honest, hopeless gradient
+    /// and loses harder every epoch.
+    ///
+    /// Worth its own name because the remedy inverts. This run is not dead and
+    /// stopping it is not the advice; the discriminator is overpowering the
+    /// generator and wants weakening.
+    pub fn discriminator_overpowering(&self) -> bool {
+        let Some(p) = self.latest() else { return false };
+        // Three times ln2 is already ~2 logits of confident rejection; the
+        // observed run was at seven times.
+        p.g_loss > 3.0 * Self::LN2 && p.d_loss > Self::LN2
     }
 
     /// The largest single-epoch fall in the tracked loss, and where.
@@ -317,6 +357,14 @@ the generator is no longer learning\n");
 discriminator scores when it emits the same logit for real and fake. It is not separating \
 anything, so neither model has a gradient that means anything and the remaining epochs \
 cannot change that. Stop the run.\n"),
+            // Checked before the plateau arm for the same reason DEAD is: this
+            // looks flat in the tracked loss while g_loss runs away.
+            _ if self.discriminator_overpowering() => s.push_str(
+                "  trend:   D OVERPOWERING — g_loss is far above ln2 and rising while d_loss \
+sits near 2ln2. Inverting those says D is rejecting fakes confidently AND calling real data \
+fake, so the generator gets a large honest gradient and loses anyway. This is NOT the dead \
+equilibrium and the run is still trainable: weaken D (fewer steps, lower its learning rate) \
+rather than stopping.\n"),
             Some(t) if t.abs() < 0.001 => s.push_str(
                 "  trend:   flat over the last 40 points — plateau or converged\n"),
             Some(t) if t > 0.0 => s.push_str(&format!(
@@ -982,5 +1030,76 @@ mod view_tests {
         assert_eq!(v.files, 3, "non-cache files were counted");
         assert_eq!(v.bytes, 300);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE FALSE POSITIVE, with the numbers off the screen. d_loss 1.3745 with
+    /// g_loss 5.0980 was reported as DEAD, and it is the opposite situation.
+    #[test]
+    fn a_losing_generator_is_not_reported_as_a_dead_discriminator() {
+        let mut p = TrainPage::default();
+        p.start(20000, 16, "Cpu", "/music");
+        for i in 0..60u64 {
+            p.curve.push(Point { epoch: i, d_loss: 1.3745, g_loss: 5.0980, at_secs: i as f64 });
+        }
+        assert!(!p.no_information(),
+                "d_loss near 2ln2 with g_loss at 7x ln2 is not the dead equilibrium");
+        assert!(p.discriminator_overpowering(), "it is D winning, which is a different fix");
+        let s = p.summary();
+        assert!(s.contains("OVERPOWERING"), "{s}");
+        assert!(!s.contains("DEAD"), "the wrong advice must not appear: {s}");
+        assert!(s.contains("weaken D"), "and the right remedy must: {s}");
+    }
+
+    /// The genuinely dead run still reports DEAD -- including the awkward real
+    /// one the one-sided test was widened for, g_loss 0.7985 rather than a
+    /// textbook ln2.
+    #[test]
+    fn the_real_dead_run_is_still_caught() {
+        let mut p = TrainPage::default();
+        p.start(20000, 16, "Cpu", "/music");
+        for i in 0..60u64 {
+            p.curve.push(Point { epoch: i, d_loss: 1.3763, g_loss: 0.7985, at_secs: i as f64 });
+        }
+        assert!(p.no_information(), "0.7985 is 15% off ln2 and must still count");
+        assert!(!p.discriminator_overpowering());
+        assert!(p.summary().contains("DEAD"));
+    }
+
+    /// The textbook point, for completeness.
+    #[test]
+    fn the_textbook_dead_point_is_caught() {
+        let mut p = TrainPage::default();
+        let (d, g) = (2.0 * TrainPage::LN2, TrainPage::LN2);
+        for i in 0..60u64 {
+            p.curve.push(Point { epoch: i, d_loss: d, g_loss: g, at_secs: i as f64 });
+        }
+        assert!(p.no_information());
+    }
+
+    /// A healthy run trips neither. A working D scores well under 1.0.
+    #[test]
+    fn a_working_run_is_reported_as_neither() {
+        let mut p = TrainPage::default();
+        p.start(20000, 16, "Cpu", "/music");
+        for i in 0..60u64 {
+            p.curve.push(Point { epoch: i, d_loss: 0.62, g_loss: 1.1, at_secs: i as f64 });
+        }
+        assert!(!p.no_information());
+        assert!(!p.discriminator_overpowering());
+    }
+
+    /// The two are mutually exclusive by construction: one needs g_loss below
+    /// 2ln2, the other above 3ln2. A diagnosis that could report both would be
+    /// worse than either.
+    #[test]
+    fn the_two_diagnoses_cannot_both_fire() {
+        for g in [0.0f32, 0.5, 0.693, 1.0, 1.386, 2.0, 3.0, 5.098, 12.0] {
+            let mut p = TrainPage::default();
+            for i in 0..60u64 {
+                p.curve.push(Point { epoch: i, d_loss: 1.3745, g_loss: g, at_secs: i as f64 });
+            }
+            assert!(!(p.no_information() && p.discriminator_overpowering()),
+                    "both fired at g_loss={g}");
+        }
     }
 }
