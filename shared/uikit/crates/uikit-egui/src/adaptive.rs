@@ -321,9 +321,9 @@ mod tests {
 pub fn apply_text_floor(ctx: &egui::Context, adaptive: &Adaptive) {
     if !adaptive.is_compact() { return; }
     let floor = crate::layout_probe::MIN_READABLE_PT;
-    let needs = ctx.style().text_styles.get(&egui::TextStyle::Small).map(|f| f.size < floor).unwrap_or(false);
+    let needs = ctx.global_style().text_styles.get(&egui::TextStyle::Small).map(|f| f.size < floor).unwrap_or(false);
     if needs {
-        ctx.style_mut(|st| {
+        ctx.global_style_mut(|st| {
             if let Some(f) = st.text_styles.get_mut(&egui::TextStyle::Small) { f.size = floor; }
         });
     }
