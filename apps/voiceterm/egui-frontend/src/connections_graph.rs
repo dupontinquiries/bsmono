@@ -160,6 +160,94 @@ impl Edge {
     }
 }
 
+/// The query surface over a built graph.
+///
+/// The port carried the SHAPE — node identity, the edge vocabulary, pruning —
+/// and stopped there, so the frontend could build a graph and not ask it
+/// anything. `connections.rs` has `GraphSnapshot` with `find_node`,
+/// `edges_for_node`, `nodes_with_tag`, `related_to` and `pair_weight`, and an
+/// Obsidian-style view is mostly those questions: the graph is the index, the
+/// answers are the feature.
+///
+/// Owns nothing it does not need to. Scanning stays with the shell, exactly as
+/// the module header says; this is a borrowed view over slices the caller
+/// already holds.
+pub struct Graph<'a> {
+    pub nodes: &'a [Node],
+    pub edges: &'a [Edge],
+}
+
+impl<'a> Graph<'a> {
+    pub fn new(nodes: &'a [Node], edges: &'a [Edge]) -> Graph<'a> {
+        Graph { nodes, edges }
+    }
+
+    pub fn find_node(&self, id: &str) -> Option<&'a Node> {
+        self.nodes.iter().find(|n| n.id == id)
+    }
+
+    /// Every edge touching `id`, in either direction.
+    pub fn edges_for(&self, id: &str) -> Vec<&'a Edge> {
+        self.edges.iter().filter(|e| e.from == id || e.to == id).collect()
+    }
+
+    /// The `n` nodes most connected to `id`, strongest first.
+    ///
+    /// Adapted rather than copied: the original sums `u32` weights, and this
+    /// port's `EdgeReason::weight` returns `f32` because similarity edges
+    /// carry a continuous score. The SUMMING is the part that matters and is
+    /// kept — two pages sharing both a domain and a tag are more related than
+    /// two sharing either alone, and taking the strongest single edge would
+    /// throw that away.
+    ///
+    /// Ties break on id so the order is stable across runs. A "related" panel
+    /// that reshuffles on every rebuild cannot be read.
+    pub fn related_to(&self, id: &str, n: usize) -> Vec<(String, f32)> {
+        if n == 0 || id.is_empty() {
+            return Vec::new();
+        }
+        let mut scores: std::collections::HashMap<&str, f32> = Default::default();
+        for e in self.edges {
+            let other = if e.from == id {
+                e.to.as_str()
+            } else if e.to == id {
+                e.from.as_str()
+            } else {
+                continue;
+            };
+            // A self-edge would otherwise rank a node against itself at the
+            // top of its own related list.
+            if other == id {
+                continue;
+            }
+            *scores.entry(other).or_insert(0.0) += e.reason.weight();
+        }
+        let mut v: Vec<(String, f32)> =
+            scores.into_iter().map(|(k, s)| (k.to_string(), s)).collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v.truncate(n);
+        v
+    }
+
+    /// Total weight between two nodes, summed across parallel edges.
+    ///
+    /// What a canvas uses for line thickness.
+    pub fn pair_weight(&self, a: &str, b: &str) -> f32 {
+        self.edges.iter()
+            .filter(|e| (e.from == a && e.to == b) || (e.from == b && e.to == a))
+            .map(|e| e.reason.weight())
+            .sum()
+    }
+
+    /// Nodes carrying `tag`, case-insensitively.
+    pub fn nodes_with_tag(&self, tag: &str) -> Vec<&'a Node> {
+        let t = tag.trim().to_lowercase();
+        self.nodes.iter()
+            .filter(|n| n.tags.iter().any(|x| x.trim().to_lowercase() == t))
+            .collect()
+    }
+}
+
 /// Similarity below which an edge is not worth drawing.
 ///
 /// A graph where everything connects to everything shows nothing.
@@ -461,5 +549,95 @@ mod build_tests {
     fn nothing_in_yields_nothing_out() {
         let (nodes, edges) = build(&[], &[]);
         assert!(nodes.is_empty() && edges.is_empty());
+    }
+
+    fn node(id: &str, tags: &[&str]) -> Node {
+        Node { id: id.into(), kind: NodeKind::Page, title: id.into(),
+               subtitle: String::new(), preview: String::new(),
+               tags: tags.iter().map(|t| t.to_string()).collect() }
+    }
+
+    /// PARALLEL EDGES SUM. Two pages sharing both a domain and a tag are more
+    /// related than two sharing either alone; taking the strongest single edge
+    /// would throw that away. This is the rule the original states and the
+    /// reason related_to is not just a max.
+    #[test]
+    fn related_to_sums_parallel_edges() {
+        let nodes = vec![node("a", &[]), node("b", &[]), node("c", &[])];
+        let edges = vec![
+            Edge::undirected("a", "b", EdgeReason::SameDomain),
+            Edge::undirected("a", "b", EdgeReason::SharedTag("t".into())),
+            Edge::undirected("a", "c", EdgeReason::SameDomain),
+        ];
+        let g = Graph::new(&nodes, &edges);
+        let r = g.related_to("a", 5);
+        assert_eq!(r[0].0, "b", "two edges beat one: {r:?}");
+        assert!(r[0].1 > r[1].1);
+        assert_eq!(g.pair_weight("a", "b"), r[0].1, "pair_weight agrees");
+    }
+
+    /// Direction must not matter -- these relations are undirected, and
+    /// `Edge::undirected` canonicalises the endpoints, so a query for either
+    /// end has to find the other.
+    #[test]
+    fn related_to_finds_edges_from_either_end() {
+        let nodes = vec![node("zzz", &[]), node("aaa", &[])];
+        // Canonical order puts "aaa" first regardless of how it is written.
+        let edges = vec![Edge::undirected("zzz", "aaa", EdgeReason::SameDomain)];
+        let g = Graph::new(&nodes, &edges);
+        assert_eq!(g.related_to("zzz", 5)[0].0, "aaa");
+        assert_eq!(g.related_to("aaa", 5)[0].0, "zzz");
+    }
+
+    /// A related panel that reshuffles on every rebuild cannot be read.
+    #[test]
+    fn equal_scores_break_ties_on_id_so_the_order_is_stable() {
+        let nodes = vec![node("x", &[]), node("b", &[]), node("a", &[])];
+        let edges = vec![
+            Edge::undirected("x", "b", EdgeReason::SameDomain),
+            Edge::undirected("x", "a", EdgeReason::SameDomain),
+        ];
+        let g = Graph::new(&nodes, &edges);
+        let ids: Vec<String> = g.related_to("x", 5).into_iter().map(|(i, _)| i).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    /// A node must not top its own related list.
+    #[test]
+    fn a_self_edge_does_not_rank_a_node_against_itself() {
+        let nodes = vec![node("a", &[])];
+        let edges = vec![Edge { from: "a".into(), to: "a".into(), reason: EdgeReason::SameDomain }];
+        assert!(Graph::new(&nodes, &edges).related_to("a", 5).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_or_unconnected_node_relates_to_nothing() {
+        let nodes = vec![node("a", &[]), node("b", &[])];
+        let edges = vec![Edge::undirected("a", "b", EdgeReason::SameDomain)];
+        let g = Graph::new(&nodes, &edges);
+        assert!(g.related_to("ghost", 5).is_empty());
+        assert!(g.related_to("a", 0).is_empty(), "n=0 asks for nothing");
+        assert!(g.related_to("", 5).is_empty());
+        assert_eq!(g.pair_weight("a", "ghost"), 0.0);
+    }
+
+    #[test]
+    fn nodes_are_found_by_id_and_by_tag_case_insensitively() {
+        let nodes = vec![node("a", &["Rust", "cli"]), node("b", &["rust"])];
+        let g = Graph::new(&nodes, &[]);
+        assert_eq!(g.find_node("a").unwrap().id, "a");
+        assert!(g.find_node("nope").is_none());
+        assert_eq!(g.nodes_with_tag("RUST").len(), 2, "tags match regardless of case");
+        assert_eq!(g.nodes_with_tag(" cli ").len(), 1, "and are trimmed");
+    }
+
+    #[test]
+    fn edges_for_returns_both_directions() {
+        let nodes = vec![node("a", &[]), node("b", &[]), node("c", &[])];
+        let edges = vec![
+            Edge::undirected("a", "b", EdgeReason::SameDomain),
+            Edge::undirected("b", "c", EdgeReason::SharedTag("t".into())),
+        ];
+        assert_eq!(Graph::new(&nodes, &edges).edges_for("b").len(), 2);
     }
 }
