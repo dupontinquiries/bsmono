@@ -776,6 +776,44 @@ struct CarModels {
     cycle: Vec<usize>,
 }
 
+/// Which catalogue family an imported model belongs in.
+///
+/// `catalog_menu` already groups by `info[i].0` and inserts a header wherever
+/// it changes — but `cars.info` was only ever pushed for the built-in hover
+/// cars, so every imported model got `""` from `info.get(i)` and the whole
+/// import block collapsed into one ungrouped run. The grouping was never
+/// broken; it was starved.
+///
+/// Four families, ordered so the ones you want are at the top and the ones
+/// you cannot ship are at the bottom:
+///
+///   FORGE  generated originals (tools/forge) — no rights holder
+///   FIXED  re-exported with texture_export v13+, which merges every piece of
+///          a multi-file OBJ; v9 took whichever piece os.listdir returned
+///          first and dropped the rest (measured: 8-9% of the model kept)
+///   OLD    imported, not re-exported
+///   IP     filename matches a rights holder — visible, deliberately, rather
+///          than scattered through eleven hundred entries
+fn model_family(name: &str, forge: &HashSet<String>, fixed: &HashSet<String>) -> &'static str {
+    const IP_MARKS: &[&str] = &[
+        "transformer", "decepticon", "autobot", "optimus", "bumblebee",
+        "megatron", "starscream", "grimlock", "cybertron", "gundam", "sazabi",
+        "halo", "master_chief", "star_wars", "marvel", "spider", "octopus",
+        "ferrari", "lamborghini", "porsche", "chevrolet", "camaro", "alfa_romeo",
+        "bugatti", "mclaren", "bmw", "audi", "toyota", "nissan", "benelli",
+        "call_of_duty", "pacific_rim", "ben_10", "wuthering",
+    ];
+    let n = name.to_ascii_lowercase().replace([' ', '-'], "_");
+    // IP wins over everything: a model that is both re-exported and
+    // rights-holder material is still unshippable.
+    if IP_MARKS.iter().any(|m| n.contains(m)) {
+        return "IP";
+    }
+    if forge.contains(name) { return "FORGE"; }
+    if fixed.contains(name) { return "FIXED"; }
+    "OLD"
+}
+
 impl CarModels {
     fn class_of(&self, i: usize) -> &'static str {
         self.info.get(i).map(|x| x.0).unwrap_or("")
@@ -1979,6 +2017,24 @@ fn main() {
         }
         let bots: Vec<String> = chosen.into_iter().map(|c| c.name).collect();
 
+        // FORGE: anything with a matching GLB in assets/forge. FIXED: listed
+        // in assets/fixed.txt, which texture_export_v13 writes when it
+        // re-exports a multi-file model. Both are plain name sets so the
+        // classifier stays a pure function of strings.
+        let forge_names: HashSet<String> = std::fs::read_dir("assets/forge")
+            .into_iter().flatten().flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                (p.extension().is_some_and(|x| x == "glb"))
+                    .then(|| p.file_stem()?.to_str().map(str::to_string))
+                    .flatten()
+            })
+            .collect();
+        let fixed_names: HashSet<String> = std::fs::read_to_string("assets/fixed.txt")
+            .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty())
+                      .map(str::to_string).collect())
+            .unwrap_or_default();
+
         for bot in bots {
             let bdir = bots_dir.join(&bot);
             let mut poses: Vec<PathBuf> = std::fs::read_dir(&bdir)
@@ -2051,6 +2107,15 @@ fn main() {
                     format!("{} FOLD {k}", label.to_uppercase())
                 };
                 cars.names.push(Box::leak(nm.into_boxed_str()));
+                // info MUST be pushed once per name or the two vectors drift
+                // and every model after the gap is labelled with its
+                // neighbour's family.
+                cars.info.push((
+                    model_family(&bot, &forge_names, &fixed_names),
+                    Box::leak(
+                        format!("{} pose {}/{}", label, k + 1, poses.len()).into_boxed_str(),
+                    ) as &'static str,
+                ));
                 cars.xform.insert(idx, (cid, k));
             }
             // THE WALK STRIP, four phases at the robot end. Loaded at the
