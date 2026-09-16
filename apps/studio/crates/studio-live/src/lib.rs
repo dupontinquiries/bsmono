@@ -67,9 +67,18 @@ impl Tempo {
     /// are never moved — swing that shifted the downbeats would just be a
     /// slower tempo wearing a costume.
     pub fn swing_delay_samples(&self, step: u32, rate: u32) -> usize {
-        if step % 2 == 0 || self.swing <= 0.0 { return 0; }
+        self.swing_delay_samples_at(step, rate, self.swing)
+    }
+
+    /// The same, at an explicit swing amount.
+    ///
+    /// Split out so a channel can swing differently from the kit — see
+    /// [`Rack::channel_swing`]. Even steps are still never moved, whoever is
+    /// asking: that rule is about the downbeat, not about who owns the knob.
+    pub fn swing_delay_samples_at(&self, step: u32, rate: u32, swing: f32) -> usize {
+        if step % 2 == 0 || swing <= 0.0 { return 0; }
         let step_samples = self.step_len().to_samples(rate).max(1) as f32;
-        (self.swing.clamp(0.0, 1.0) * step_samples * 0.5) as usize
+        (swing.clamp(0.0, 1.0) * step_samples * 0.5) as usize
     }
     pub fn bar_len(&self, beats_per_bar: u32) -> Ticks {
         Ticks(self.step_len().0 * self.steps_per_beat as i64 * beats_per_bar as i64)
@@ -613,9 +622,51 @@ pub struct Rack {
     /// swing existed still loads — straight, which is what it was.
     #[serde(default)]
     pub swing: f32,
+    /// Per-channel swing overrides, by channel index. Absent = follow `swing`.
+    ///
+    /// ## Why a trap kit needs this
+    ///
+    /// The rack's swing moves every odd step on every channel, and for the
+    /// genre this app is mostly used for that is wrong. You swing the HATS and
+    /// keep the 808 dead straight: the hats' shuffle is what makes the beat
+    /// breathe, and the same shuffle on the 808 makes the low end sound drunk,
+    /// because a bassline that arrives late reads as a mistake rather than as
+    /// feel. Producers do this by hand on hardware and every modern sequencer
+    /// exposes it per track.
+    ///
+    /// `Some(0.0)` is meaningful and NOT the same as absent: it pins a channel
+    /// straight while the kit swings, which is exactly the 808's setting.
+    ///
+    /// Sparse, and a map rather than a field on `Channel`, for the reason
+    /// `Pattern.mods` gives: most channels want the kit's swing, so the common
+    /// rack stores nothing. It also means the 39 `Channel` literals in this
+    /// tree did not all have to be edited to add a feature most of them do not
+    /// use.
+    #[serde(default)]
+    pub swing_overrides: BTreeMap<usize, f32>,
 }
 
 impl Rack {
+    /// The swing a channel actually plays with.
+    ///
+    /// Its override if it has one, otherwise the kit's. This is the one place
+    /// that resolves it, so a caller cannot read `rack.swing` directly and
+    /// silently ignore the override — which is how a per-track feature ends up
+    /// working in the sequencer and not in the bounce.
+    pub fn channel_swing(&self, channel: usize) -> f32 {
+        self.swing_overrides.get(&channel).copied().unwrap_or(self.swing)
+    }
+
+    /// Pin a channel straight while the kit swings — the 808's setting.
+    pub fn set_channel_straight(&mut self, channel: usize) {
+        self.swing_overrides.insert(channel, 0.0);
+    }
+
+    /// Give a channel back to the kit's swing.
+    pub fn clear_channel_swing(&mut self, channel: usize) {
+        self.swing_overrides.remove(&channel);
+    }
+
     /// The [`Tempo`] this rack renders at. One source of truth: the rack is
     /// the serialized value, `Tempo` is its render-time view, and deriving
     /// the second from the first here is what keeps a BPM knob in a UI from
@@ -2900,5 +2951,65 @@ mod rhythm_tests {
         q.humanize(0, 0.15, 8);
         assert_ne!((0..16).map(|s| q.mod_at(0, s).vel).collect::<Vec<_>>(), a, "a new seed is a new take");
         assert!(p.mod_at(1, 0).vel == 1.0, "the other channel is untouched");
+    }
+
+    // ── per-channel swing ────────────────────────────────────────────────
+
+    /// A rack with no overrides behaves exactly as it always did.
+    #[test]
+    fn channels_follow_the_kit_by_default() {
+        let mut r = Rack::default();
+        r.swing = 0.6;
+        assert!(r.swing_overrides.is_empty());
+        for ch in 0..4 {
+            assert_eq!(r.channel_swing(ch), 0.6);
+        }
+    }
+
+    /// THE TRAP SETTING. Swing the hats, keep the 808 straight -- the same
+    /// shuffle on the low end reads as a mistake rather than as feel.
+    #[test]
+    fn an_808_can_be_pinned_straight_while_the_hats_swing() {
+        let mut r = Rack::default();
+        r.swing = 0.62;
+        let (eight_o_eight, hat) = (0usize, 1usize);
+        r.set_channel_straight(eight_o_eight);
+        assert_eq!(r.channel_swing(eight_o_eight), 0.0);
+        assert_eq!(r.channel_swing(hat), 0.62, "the hats keep the kit's feel");
+    }
+
+    /// `Some(0.0)` is not the same as absent, which is the distinction the
+    /// whole override rests on.
+    #[test]
+    fn a_zero_override_is_not_the_same_as_no_override() {
+        let mut r = Rack::default();
+        r.swing = 0.5;
+        r.set_channel_straight(2);
+        assert_eq!(r.channel_swing(2), 0.0);
+        r.clear_channel_swing(2);
+        assert_eq!(r.channel_swing(2), 0.5, "back to the kit");
+    }
+
+    /// A channel can also swing HARDER than the kit -- hats often do.
+    #[test]
+    fn a_channel_can_exceed_the_kits_swing() {
+        let mut r = Rack::default();
+        r.swing = 0.2;
+        r.swing_overrides.insert(1, 0.75);
+        assert!(r.channel_swing(1) > r.channel_swing(0));
+    }
+
+    /// The delay must follow the resolved swing, not the rack's -- otherwise
+    /// the override works in the UI and not in the audio.
+    #[test]
+    fn the_rendered_delay_follows_the_channels_own_swing() {
+        let t = Tempo { bpm: 120.0, steps_per_beat: 4, swing: 0.8 };
+        let straight = t.swing_delay_samples_at(1, 48_000, 0.0);
+        let swung = t.swing_delay_samples_at(1, 48_000, 0.8);
+        assert_eq!(straight, 0, "a straight channel is never delayed");
+        assert!(swung > 0);
+        // And the downbeat rule holds regardless of who is asking.
+        assert_eq!(t.swing_delay_samples_at(0, 48_000, 1.0), 0,
+            "even steps are never moved, whatever the channel wants");
     }
 }
