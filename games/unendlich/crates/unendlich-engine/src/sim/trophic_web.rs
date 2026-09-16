@@ -18,6 +18,16 @@
 /// The animal roster that participates in the food web.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Species {
+    /// The primary producer, and the base the whole web was missing.
+    ///
+    /// Without it `food_availability` returns 0 for every herbivore, because
+    /// it sums the biomass of a species' PREY and a rabbit has none. So the
+    /// feeding half of the Lotka-Volterra step was dead for the entire base of
+    /// the web: rabbits grew at their intrinsic rate and were limited only by
+    /// predation, and a region could never be overgrazed. "Wipe the wolves and
+    /// the rabbits explode" worked; "the rabbits then eat the meadow bare and
+    /// crash" could not.
+    Vegetation,
     // aquatic
     CaveFish,
     CaveTroll,
@@ -36,7 +46,8 @@ pub enum Species {
 }
 
 impl Species {
-    pub const ALL: [Species; 12] = [
+    pub const ALL: [Species; 13] = [
+        Species::Vegetation,
         Species::CaveFish,
         Species::CaveTroll,
         Species::BioShrimp,
@@ -63,7 +74,14 @@ impl Species {
             BioShrimp => &[Anglerfish],
             Rabbit => &[Fox, Wolf, Harpy],
             Deer => &[Wolf, Bear],
-            // apex / base species have none
+            // A moose had NO predators, which made `is_apex` call it one — a
+            // large herbivore filed as a top carnivore. Wolves and bears take
+            // calves and winter-weakened adults, which is the real relation
+            // and the reason a moose population is not unbounded.
+            Moose => &[Wolf, Bear],
+            // Everything that eats plants presses on the producer.
+            Vegetation => &[Rabbit, Deer, Moose],
+            // apex species have none
             _ => &[],
         }
     }
@@ -73,9 +91,18 @@ impl Species {
         Species::ALL.iter().copied().filter(|&p| p.predators().contains(&self)).collect()
     }
 
-    /// No predators — top of its chain.
+    /// A primary producer: eats nothing, and the base of every chain.
+    pub fn is_producer(self) -> bool {
+        matches!(self, Species::Vegetation)
+    }
+
+    /// No predators AND not a producer — top of its chain.
+    ///
+    /// The producer clause matters: vegetation is eaten by three species, so
+    /// it is not apex, but before `Vegetation` existed a firefly was — nothing
+    /// hunts one — and so was a moose, which was simply a missing edge.
     pub fn is_apex(self) -> bool {
-        self.predators().is_empty()
+        !self.is_producer() && self.predators().is_empty()
     }
 
     /// Intrinsic per-step growth rate. Small, fast-breeding species (rabbit,
@@ -83,6 +110,9 @@ impl Species {
     pub fn growth_rate(self) -> f32 {
         use Species::*;
         match self {
+            // Plants regrow fastest of anything: a meadow comes back in a
+            // season where a wolf pack takes years.
+            Vegetation => 0.50,
             Firefly | BioShrimp | CaveFish => 0.35,
             Rabbit => 0.30,
             Fox | Deer => 0.14,
@@ -101,18 +131,18 @@ impl Species {
 /// Per-species normalized biomass `0..1`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Populations {
-    pub biomass: [f32; 12],
+    pub biomass: [f32; 13],
 }
 
 impl Default for Populations {
     fn default() -> Self {
-        Populations { biomass: [0.0; 12] }
+        Populations { biomass: [0.0; 13] }
     }
 }
 
 impl Populations {
     pub fn uniform(v: f32) -> Self {
-        Populations { biomass: [v.clamp(0.0, 1.0); 12] }
+        Populations { biomass: [v.clamp(0.0, 1.0); 13] }
     }
     pub fn get(&self, s: Species) -> f32 {
         self.biomass[s.index()]
@@ -131,6 +161,13 @@ pub fn predation_pressure(s: Species, pops: &Populations) -> f32 {
 pub fn food_availability(s: Species, pops: &Populations) -> f32 {
     s.prey().iter().map(|&q| pops.get(q)).sum()
 }
+
+/// The trace a producer recovers from after being wiped out. See `step`.
+///
+/// Small enough that recovery is slow and visible, large enough that the
+/// logistic term has something to multiply — growth is `n * (...)`, so a
+/// literal zero can never leave zero however good the conditions.
+pub const SEED_BANK: f32 = 0.01;
 
 /// Coupling coefficients for the population step (tunable).
 #[derive(Debug, Clone, Copy)]
@@ -157,9 +194,23 @@ pub fn step(pops: &Populations, p: &WebParams) -> Populations {
     let mut out = *pops;
     for &s in &Species::ALL {
         let n = pops.get(s);
-        if n <= 0.0 && food_availability(s, pops) <= 0.0 {
+        if n <= 0.0 && food_availability(s, pops) <= 0.0 && !s.is_producer() {
             // extinct with no way to feed in → stays extinct (no spontaneous life)
             out.set(s, 0.0);
+            continue;
+        }
+        if s.is_producer() && n <= 0.0 {
+            // THE SEED BANK. A producer's food is sunlight, so
+            // `food_availability` is always 0 for it and the guard above would
+            // make burnt ground permanently barren — and with the base of the
+            // web gone, every herbivore above it starves with no recovery
+            // path. That is a dead region no fire should be able to create.
+            //
+            // Real ground regrows from a seed bank and from its edges, so a
+            // producer at zero comes back from a trace rather than from
+            // nothing. Deliberately tiny: a burnt meadow should take a long
+            // while to be a meadow again, which is the point of burning it.
+            out.set(s, SEED_BANK);
             continue;
         }
         let logistic = s.growth_rate() * (1.0 - n);
@@ -287,5 +338,105 @@ mod tests {
         let pops = Populations::default(); // all zero
         let next = step(&pops, &WebParams::default());
         assert_eq!(next.get(Anglerfish), 0.0);
+    }
+
+    /// THE MISSING BASE. Before `Vegetation`, `food_availability` summed a
+    /// herbivore's prey and a rabbit has none — so the feeding half of the
+    /// step was dead for the entire bottom of the web.
+    #[test]
+    fn herbivores_finally_have_something_to_eat() {
+        let mut pops = Populations::default();
+        pops.set(Species::Vegetation, 0.8);
+        pops.set(Species::Rabbit, 0.3);
+        assert!(food_availability(Species::Rabbit, &pops) > 0.5,
+                "a rabbit in a meadow should be well fed");
+        assert!(food_availability(Species::Deer, &pops) > 0.5);
+    }
+
+    /// OVERGRAZING, which is what the base makes possible: rabbits with no
+    /// predators eat the meadow down rather than growing forever.
+    #[test]
+    fn unchecked_herbivores_eat_the_meadow_down() {
+        let mut pops = Populations::default();
+        pops.set(Species::Vegetation, 1.0);
+        pops.set(Species::Rabbit, 0.6);
+        let p = WebParams::default();
+        for _ in 0..60 {
+            pops = step(&pops, &p);
+        }
+        assert!(pops.get(Species::Vegetation) < 1.0,
+                "the meadow should be grazed: {}", pops.get(Species::Vegetation));
+    }
+
+    /// A moose was filed as an APEX PREDATOR, because nothing hunted it and
+    /// `is_apex` meant "no predators".
+    #[test]
+    fn a_moose_is_prey_not_an_apex_predator() {
+        assert!(!Species::Moose.is_apex());
+        assert!(Species::Moose.predators().contains(&Species::Wolf));
+        assert!(Species::Bear.is_apex(), "a bear still is one");
+    }
+
+    /// A producer is not apex either, though nothing it eats hunts it.
+    #[test]
+    fn vegetation_is_a_producer_rather_than_an_apex_species() {
+        assert!(Species::Vegetation.is_producer());
+        assert!(!Species::Vegetation.is_apex());
+        assert!(!Species::Wolf.is_producer());
+        // It is eaten by every herbivore.
+        assert_eq!(Species::Vegetation.predators().len(), 3);
+    }
+
+    /// THE SEED BANK. Burnt ground must not be permanently barren, or a fire
+    /// starves everything above it forever.
+    #[test]
+    fn burnt_ground_regrows_rather_than_staying_dead() {
+        let mut pops = Populations::default();
+        pops.set(Species::Vegetation, 0.0);
+        let p = WebParams::default();
+        pops = step(&pops, &p);
+        assert!(pops.get(Species::Vegetation) > 0.0, "a trace comes back");
+        for _ in 0..200 {
+            pops = step(&pops, &p);
+        }
+        assert!(pops.get(Species::Vegetation) > 0.3,
+                "and grows back over time: {}", pops.get(Species::Vegetation));
+    }
+
+    /// ...but GRAZERS SUPPRESS THE RECOVERY, and that is the interesting half.
+    /// My first draft of the test above left rabbits on the burnt ground and
+    /// asserted it regrew anyway; simulating it showed 0.02 after 200 steps,
+    /// not the 0.3 I had assumed. Burnt ground with hungry animals on it stays
+    /// bare, which is what actually happens and is worth asserting rather than
+    /// designing around.
+    #[test]
+    fn grazers_hold_burnt_ground_bare() {
+        let mut grazed = Populations::default();
+        grazed.set(Species::Vegetation, 0.0);
+        grazed.set(Species::Rabbit, 0.2);
+        let mut clear = Populations::default();
+        clear.set(Species::Vegetation, 0.0);
+        let p = WebParams::default();
+        for _ in 0..200 {
+            grazed = step(&grazed, &p);
+            clear = step(&clear, &p);
+        }
+        assert!(grazed.get(Species::Vegetation) < clear.get(Species::Vegetation) * 0.5,
+                "grazed {} vs clear {}",
+                grazed.get(Species::Vegetation), clear.get(Species::Vegetation));
+    }
+
+    /// ...but animals still do not appear from nothing. The seed bank is a
+    /// producer rule, not a general one.
+    #[test]
+    fn extinct_animals_stay_extinct() {
+        let mut pops = Populations::default();
+        pops.set(Species::Vegetation, 1.0);
+        pops.set(Species::Wolf, 0.0);
+        let p = WebParams::default();
+        for _ in 0..50 {
+            pops = step(&pops, &p);
+        }
+        assert_eq!(pops.get(Species::Wolf), 0.0, "no spontaneous wolves");
     }
 }
