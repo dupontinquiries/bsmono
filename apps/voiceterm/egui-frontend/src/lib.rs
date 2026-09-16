@@ -589,6 +589,24 @@ pub mod note_blend;
 /// Joins `note_blend`'s active-line decision to `zbrackets`' rewriting. Both
 /// were here and neither had a caller; the seam between them is the feature.
 pub mod note_blend_view;
+
+/// When the app should speak up, and when it should not.
+///
+/// `src/moment.rs` classifies the moment -- time of day, what is going on --
+/// and returns Silence or a prompt, with suppression on top so a declined
+/// prompt does not come straight back. Zero dependencies, zero Qt, 31 tests,
+/// and no caller in this frontend: the egui app had no notion of a bad time to
+/// ask, so anything that wanted to prompt either always did or never did.
+///
+/// Directly related to `typing_grace`, which answers the same question for the
+/// microphone. That one is about a keyboard in use; this one is about 3am.
+#[path = "../../src/moment.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod moment;
+
+/// Per-app suppression state for `moment`. The classifier is stateless; the
+/// suppression around it is not, and the original kept it in process globals.
+pub mod moment_gate;
 /// Modeless vim-style count-prefix accumulator (`{N}b` = cycle N forward,
 /// `{N}B` = N back) — the state machine behind TODO_tab_cycle_shortcut.md,
 /// fully done and wired in the Qt frontend since v0.1.719. Pure,
