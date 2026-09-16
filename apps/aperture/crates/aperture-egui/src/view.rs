@@ -1330,6 +1330,18 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 // came from `max_height` alone taking whatever the Area
                                 // offered, which depended on last frame. Content height does
                                 // not.
+                                //
+                                // STATUS: reported again after this landed (the box still does
+                                // not grow back once text is entered then cleared). Nothing in
+                                // this crate can run a live egui::Context frame, so the claim
+                                // above that auto_shrink fixes the latch was never actually
+                                // exercised -- only reasoned about. It may be wrong about which
+                                // index of `auto_shrink([bool; 2])` controls height, or `Area`
+                                // may have its own last-frame-size memory that a ScrollArea
+                                // fix cannot reach regardless of the axis. Needs a device or an
+                                // egui integration-test harness to settle either way; I do not
+                                // have either from this sandbox and am not patching this again
+                                // on a second unverified guess.
                                 .max_height(palette_list_h(ui))
                                 .auto_shrink([false, true])
                                 // The scrollbar was always reserving its gutter, which is

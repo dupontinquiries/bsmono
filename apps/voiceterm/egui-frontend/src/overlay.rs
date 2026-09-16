@@ -101,6 +101,12 @@ pub fn resolved_size(f: Form, screen: Vec2) -> Vec2 {
             // The QML caps the popup's width to the screen (favoritesPopup:
             // root.width - 32) and its height to root.height - 80; keep both
             // so a phone in landscape does not clip.
+            //
+            // For a centre popup the `y` here is a CEILING, not a height --
+            // `show` applies it with `set_max_height` and lets the content
+            // decide the rest, which is the QML's `min(content + 32,
+            // root.height - 80)`. It was applied with `set_min_size` and every
+            // centre popup drew at its ceiling regardless of content.
             Vec2::new(w.min(screen.x - 32.0), max_h.min(screen.y - 80.0))
         }
     }
@@ -180,8 +186,26 @@ pub fn show(
         .frame(frame)
         .backdrop_color(BACKDROP.gamma_multiply(t))
         .show(ctx, |ui| {
-            ui.set_min_size(size);
-            ui.set_max_size(size);
+            // WIDTH is fixed, HEIGHT is a cap. The QML sizes a centre popup as
+            // `min(content + padding, root.height - 80)` -- a content-driven
+            // height with a ceiling -- and `set_min_size(size)` forced it to the
+            // ceiling always. So an 8-row favourites list and a 2-row one drew
+            // the same 560pt box, the short one with a large dead gap under it.
+            // Reported as "the directory picker is wrong vs the -qt".
+            //
+            // Drawers and the bottom sheet keep BOTH bounds: those are
+            // edge-flush surfaces whose whole point is a fixed extent, and a
+            // content-sized drawer would jump width as its list changed.
+            match f {
+                Form::CenterPopup { .. } => {
+                    ui.set_width(size.x);
+                    ui.set_max_height(size.y);
+                }
+                _ => {
+                    ui.set_min_size(size);
+                    ui.set_max_size(size);
+                }
+            }
             content(ui);
         });
     ShowOut { closed: resp.should_close() }
@@ -260,6 +284,33 @@ mod tests {
                  update overlay.rs's form table (and its comment) to match, or \
                  this port now differs from the original silently."
             );
+        }
+    }
+
+    /// A CEILING, NOT A HEIGHT. Every centre popup used to draw at `max_h`
+    /// whatever it held, so an 8-row favourites list and a 2-row one were the
+    /// same 560pt box with a dead gap under the short one.
+    ///
+    /// This asserts the value `show` now feeds `set_max_height`; the content
+    /// sizing itself within that cap needs a live egui frame, which this crate
+    /// cannot run, so the arithmetic is what is pinned here.
+    #[test]
+    fn a_centre_popup_height_is_a_ceiling_below_the_screen() {
+        let size = resolved_size(form(Surface::Favorites), PHONE);
+        assert_eq!(size.x, 380.0_f32.min(PHONE.x - 32.0), "width stays fixed");
+        assert!(size.y <= PHONE.y - 80.0, "never taller than the screen allows");
+        // On a tall screen the static cap is what binds; on a short one the
+        // screen is. Both are ceilings.
+        let short = Vec2::new(380.0, 400.0);
+        assert_eq!(resolved_size(form(Surface::Favorites), short).y, 400.0 - 80.0);
+    }
+
+    /// Drawers keep a FIXED extent -- a content-sized drawer would jump width
+    /// as its list changed, which is why the fix is scoped to centre popups.
+    #[test]
+    fn drawers_still_take_the_full_screen_height() {
+        for s in [Surface::Blocks, Surface::MissingPkg, Surface::Palette] {
+            assert_eq!(resolved_size(form(s), PHONE).y, PHONE.y, "{s:?}");
         }
     }
 }
