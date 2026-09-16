@@ -22,6 +22,10 @@ use studio_live::transport::Transport;
 /// Dialogue/Music/Effects stems -- the shape a film mix is delivered in, so
 /// the picture can be dubbed by replacing one of the three. `export`'s
 /// per-track stems are the music convention and cannot answer that request.
+/// Which of eight vocal takes is usable. `takes.rs` puts them on lanes and
+/// `comp_ops` copies chosen spans; neither helps you choose, and soloing each
+/// in turn is most of what comping costs.
+pub mod take_report;
 pub mod stems_dme;
 pub mod media_map;
 /// What a dropped file should become. The drop handler had one branch --
