@@ -489,7 +489,19 @@ impl Feel {
         }
 
         egui::Panel::top("out").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            // WRAPPED, not `horizontal`. egui's plain horizontal layout does
+            // not wrap: it lays every widget on one line and lets the tail run
+            // past the panel edge, where nothing can reach it. That is the
+            // "buttons off screen" report — on a 380 px phone this row of
+            // tray / settings / term / dictate plus a status label does not
+            // fit, and the ones that did not fit were simply gone rather than
+            // clipped visibly.
+            //
+            // Wrapping is the stopgap. The real fix is `chrome.rs`: three
+            // controls stay on the board and the rest move to a separate
+            // settings window, because a row that WRAPS onto three lines is
+            // still eating the vertical budget the keys need.
+            ui.horizontal_wrapped(|ui| {
                 // A diagnostic that ships switched off and is reachable without a rebuild —
                 // the same bargain as snapclone's trace channels. On device this is what tells
                 // you whether a gesture was read as cardinal, swipe, or nothing at all.

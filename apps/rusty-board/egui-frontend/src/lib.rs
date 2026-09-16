@@ -10,6 +10,11 @@
 use egui::{Align2, FontId, Rect, CornerRadius, Sense, Stroke, Ui, Vec2};
 use uikit_egui::{apply_palette, Adaptive, PaletteColors};
 
+/// Which controls live on the board, which on the options layer, and which
+/// belong in a separate settings window. The placement rule is "does this need
+/// the keyboard on screen while you use it", which is what stops the top bar
+/// growing back.
+pub mod chrome;
 pub mod cardinal_gesture;
 pub mod ngram;
 pub mod swipe_rerank;
