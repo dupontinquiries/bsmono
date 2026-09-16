@@ -600,6 +600,93 @@ mod tests {
         assert!(Walk::for_shape(&big).step_len() > Walk::for_shape(&small).step_len());
     }
 
+    // ---- mesh + view ----------------------------------------------------
+
+    #[test]
+    fn the_mesh_is_closed_and_every_index_is_valid() {
+        let m = moire().mesh(16, 7);
+        assert!(!m.tris.is_empty());
+        let n = m.verts.len() as u32;
+        for t in &m.tris {
+            for &i in t { assert!(i < n, "index {i} >= {n}"); }
+        }
+        // Every edge shared by exactly two triangles == closed. An open hull
+        // renders with holes you only notice from one angle.
+        use std::collections::HashMap;
+        let mut edges: HashMap<(u32, u32), i32> = HashMap::new();
+        for t in &m.tris {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let k = if a < b { (a, b) } else { (b, a) };
+                *edges.entry(k).or_insert(0) += 1;
+            }
+        }
+        let open: Vec<_> = edges.iter().filter(|(_, &c)| c != 2).collect();
+        assert!(open.is_empty(), "{} non-manifold edges", open.len());
+    }
+
+    #[test]
+    fn resolution_is_a_read_parameter() {
+        // The same ~200-byte Shape gives whatever density is asked for, and
+        // the bounds do not move. That is the whole argument for storing
+        // parameters instead of geometry.
+        let s = moire();
+        let coarse = s.mesh(8, 3);
+        let fine = s.mesh(32, 9);
+        assert!(fine.tris.len() > coarse.tris.len() * 4);
+        let (a, b) = (coarse.bounds(), fine.bounds());
+        for i in 0..3 {
+            assert!((a.0[i] - b.0[i]).abs() < 0.08, "lo[{i}] moved");
+            assert!((a.1[i] - b.1[i]).abs() < 0.08, "hi[{i}] moved");
+        }
+    }
+
+    #[test]
+    fn the_resample_does_not_overshoot() {
+        // Catmull-Rom can bulge past its control points. On a waisted hull
+        // that would put the widest ring somewhere nobody authored.
+        let s = moire();
+        let m = s.mesh(24, 9);
+        let max_hw = s.sections.iter().map(|x| x.half_w).fold(0.0, f32::max);
+        let widest = m.verts.iter().map(|v| v[0].abs()).fold(0.0, f32::max);
+        let track = s.width() * 0.5;
+        assert!(widest <= track + 1e-3, "something is wider than the wheels");
+        assert!(widest >= max_hw - 1e-3);
+    }
+
+    #[test]
+    fn the_car_actually_renders() {
+        let f = View::default().render(&moire().mesh(20, 7), 0.62, 0.30);
+        let cov = coverage(&f);
+        assert!(cov > 250, "only {cov} cells drawn -- is it inside out?");
+        assert!(cov < 76 * 30, "it filled the frame; the camera is inside it");
+    }
+
+    #[test]
+    fn rendering_is_deterministic() {
+        let m = moire().mesh(20, 7);
+        let v = View::default();
+        assert_eq!(v.render(&m, 0.62, 0.30), v.render(&m, 0.62, 0.30));
+    }
+
+    #[test]
+    fn a_backwards_mesh_looks_different() {
+        // My first version of this asserted that flipping every winding would
+        // COLLAPSE coverage. It does not, and the renderer said so: 330 cells
+        // either way. For a CLOSED mesh, culling front faces simply shows the
+        // back surface -- same silhouette, different shading and depth. So
+        // the honest assertion is that the picture changes, not that it
+        // vanishes, and the thing the cull actually buys is that an
+        // inside-out model is visibly lit from inside rather than subtly off.
+        let good = moire().mesh(20, 7);
+        let mut bad = good.clone();
+        for t in bad.tris.iter_mut() { t.swap(0, 1); }
+        let v = View::default();
+        let (a, b) = (v.render(&good, 0.62, 0.30), v.render(&bad, 0.62, 0.30));
+        assert_ne!(a, b, "winding has no visible effect -- is the cull wired up?");
+        assert_eq!(coverage(&a), coverage(&b),
+                   "a closed hull should occupy the same silhouette either way");
+    }
+
     #[test]
     fn the_whole_session_is_a_fold_over_timestamps() {
         // No clock anywhere: drive, transform, walk, all from a list of Ms.
@@ -618,4 +705,304 @@ mod tests {
         assert!(walk.body_z < start);
         assert_ne!(driven, Pose::default());
     }
+}
+
+// ───────────────────────────────────────────────────────────────── mesh
+
+/// A triangle mesh. Built on demand from a [`Shape`] and thrown away — the
+/// shape is the asset, this is a view of it.
+#[derive(Clone, Debug, Default)]
+pub struct Mesh {
+    pub verts: Vec<[f32; 3]>,
+    pub tris: Vec<[u32; 3]>,
+}
+
+impl Mesh {
+    pub fn bounds(&self) -> ([f32; 3], [f32; 3]) {
+        let mut lo = [f32::MAX; 3];
+        let mut hi = [f32::MIN; 3];
+        for v in &self.verts {
+            for i in 0..3 {
+                lo[i] = lo[i].min(v[i]);
+                hi[i] = hi[i].max(v[i]);
+            }
+        }
+        (lo, hi)
+    }
+    fn add(&mut self, other: &Mesh, scale: [f32; 3], off: [f32; 3]) {
+        let base = self.verts.len() as u32;
+        for v in &other.verts {
+            self.verts.push([v[0] * scale[0] + off[0],
+                             v[1] * scale[1] + off[1],
+                             v[2] * scale[2] + off[2]]);
+        }
+        for t in &other.tris {
+            self.tris.push([t[0] + base, t[1] + base, t[2] + base]);
+        }
+    }
+    fn quad(&mut self, a: u32, b: u32, c: u32, d: u32) {
+        self.tris.push([a, b, c]);
+        self.tris.push([a, c, d]);
+    }
+}
+
+fn catmull(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
+    let (t2, t3) = (t * t, t * t * t);
+    0.5 * ((2.0 * p1) + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
+}
+
+impl Shape {
+    /// Sweep the sections into a closed hull.
+    ///
+    /// `ring` is the cross-section resolution and it is a READ parameter, not
+    /// a property of the asset: the same ~200 bytes give a 12-sided hull for a
+    /// collision proxy and a 32-sided one for a close-up. That is the whole
+    /// argument for storing parameters instead of geometry.
+    pub fn mesh(&self, ring: usize, sub: usize) -> Mesh {
+        let mut m = Mesh::default();
+        if self.sections.len() < 2 || ring < 3 {
+            return m;
+        }
+        // Catmull-Rom through the control sections. Five hand-placed rings
+        // make ridges run ACROSS the body instead of around it; resampling is
+        // what turns control points into character lines.
+        let src = &self.sections;
+        let n = src.len();
+        let get = |i: isize| -> &Section { &src[(i.max(0) as usize).min(n - 1)] };
+        let mut dense: Vec<Section> = Vec::new();
+        if n >= 3 && sub > 1 {
+            for i in 0..n - 1 {
+                for s in 0..sub {
+                    let t = s as f32 / sub as f32;
+                    let (a, b, c, d) = (get(i as isize - 1), get(i as isize),
+                                        get(i as isize + 1), get(i as isize + 2));
+                    dense.push(Section {
+                        z: catmull(a.z, b.z, c.z, d.z, t),
+                        half_w: catmull(a.half_w, b.half_w, c.half_w, d.half_w, t),
+                        floor: catmull(a.floor, b.floor, c.floor, d.floor, t),
+                        roof: catmull(a.roof, b.roof, c.roof, d.roof, t),
+                        round: catmull(a.round, b.round, c.round, d.round, t),
+                    });
+                }
+            }
+            dense.push(src[n - 1]);
+        } else {
+            dense = src.clone();
+        }
+
+        let mut rings: Vec<Vec<u32>> = Vec::new();
+        for s in &dense {
+            let cy = (s.floor + s.roof) * 0.5;
+            let ry = (s.roof - s.floor) * 0.5;
+            let mut idx = Vec::with_capacity(ring);
+            for k in 0..ring {
+                let a = std::f32::consts::TAU * k as f32 / ring as f32;
+                let (ca, sa) = (a.cos(), a.sin());
+                // `round` blends the profile between a box and an ellipse:
+                // 0.15 reads as a chiselled hull, 0.9 as a pod. One dial.
+                let mx = ca.abs().max(sa.abs()).max(1e-6);
+                let (bx, by) = (ca / mx, sa / mx);
+                let x = s.half_w * (s.round * ca + (1.0 - s.round) * bx);
+                let y = cy + ry * (s.round * sa + (1.0 - s.round) * by);
+                idx.push(m.verts.len() as u32);
+                m.verts.push([x, y, s.z]);
+            }
+            rings.push(idx);
+        }
+        for w in rings.windows(2) {
+            for k in 0..ring {
+                let j = (k + 1) % ring;
+                m.quad(w[0][k], w[0][j], w[1][j], w[1][k]);
+            }
+        }
+        // caps, so the hull is closed and a backface test means something
+        for (r, flip) in [(&rings[0], true), (&rings[rings.len() - 1], false)] {
+            let c = m.verts.len() as u32;
+            let mut ctr = [0.0f32; 3];
+            for &i in r.iter() {
+                for a in 0..3 { ctr[a] += m.verts[i as usize][a]; }
+            }
+            for a in 0..3 { ctr[a] /= r.len() as f32; }
+            m.verts.push(ctr);
+            for k in 0..ring {
+                let j = (k + 1) % ring;
+                m.tris.push(if flip { [c, r[j], r[k]] } else { [c, r[k], r[j]] });
+            }
+        }
+        for &(x, y, z, rad) in &self.wheels {
+            let w = tyre(ring.max(8));
+            m.add(&w, [rad * TYRE_HALF_THICK * 2.0, rad, rad], [x, y, z]);
+        }
+        m
+    }
+}
+
+/// A tyre, not a squashed sphere. `procars.rs` records the squashed sphere as
+/// "most of why the older cars read as toys".
+fn tyre(seg: usize) -> Mesh {
+    let mut m = Mesh::default();
+    let (mut inner, mut outer) = (Vec::new(), Vec::new());
+    let (mut ti, mut to) = (Vec::new(), Vec::new());
+    for k in 0..seg {
+        let a = std::f32::consts::TAU * k as f32 / seg as f32;
+        let (y, z) = (a.cos(), a.sin());
+        inner.push(m.verts.len() as u32); m.verts.push([-0.5, y * 0.82, z * 0.82]);
+        outer.push(m.verts.len() as u32); m.verts.push([ 0.5, y * 0.82, z * 0.82]);
+    }
+    for k in 0..seg {
+        let a = std::f32::consts::TAU * k as f32 / seg as f32;
+        let (y, z) = (a.cos(), a.sin());
+        ti.push(m.verts.len() as u32); m.verts.push([-0.43, y, z]);
+        to.push(m.verts.len() as u32); m.verts.push([ 0.43, y, z]);
+    }
+    for k in 0..seg {
+        let j = (k + 1) % seg;
+        m.quad(ti[k], ti[j], to[j], to[k]);
+        m.quad(inner[k], inner[j], ti[j], ti[k]);
+        m.quad(to[k], to[j], outer[j], outer[k]);
+    }
+    for (r, x, flip) in [(&inner, -0.5f32, true), (&outer, 0.5, false)] {
+        let c = m.verts.len() as u32;
+        m.verts.push([x, 0.0, 0.0]);
+        for k in 0..seg {
+            let j = (k + 1) % seg;
+            m.tris.push(if flip { [c, r[j], r[k]] } else { [c, r[k], r[j]] });
+        }
+    }
+    m
+}
+
+// ─────────────────────────────────────────────────────────────────── view
+
+/// A z-buffered software rasteriser that writes characters.
+///
+/// It exists because a renderer you cannot run is a renderer you cannot
+/// trust. `blackstar-rs` has a real one and it needs a GPU, a window and an
+/// audio stack to start, so nothing about a model can be checked until the
+/// whole game launches. This one runs in a test.
+///
+/// `PIPELINE.md` puts the cost of not having this on the record: nothing in
+/// the model pipeline was ever checked by eye, and the one time visual
+/// feedback arrived it revealed ribs sealed inside an opaque chest that no
+/// measurement had caught.
+///
+/// Not a substitute for the real renderer — sufficient to catch inside-out
+/// normals, collapsed rings, and parts in the wrong place.
+pub struct View {
+    pub w: usize,
+    pub h: usize,
+    /// Character height / width in the terminal. Cells are tall, so a square
+    /// aspect needs the vertical squashed or every model looks stretched.
+    pub cell_aspect: f32,
+}
+
+impl Default for View {
+    fn default() -> Self { Self { w: 76, h: 30, cell_aspect: 2.1 } }
+}
+
+const RAMP: &[u8] = b" .:-=+*#%@";
+
+impl View {
+    /// Render to a string. Pure: same mesh and angles give the same bytes,
+    /// which is what lets a test assert on the picture.
+    pub fn render(&self, m: &Mesh, yaw: f32, pitch: f32) -> String {
+        let mut depth = vec![f32::MAX; self.w * self.h];
+        let mut shade = vec![0u8; self.w * self.h];
+        if m.verts.is_empty() {
+            return self.to_string_buf(&shade);
+        }
+        let (lo, hi) = m.bounds();
+        let ctr = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
+        let ext = (0..3).map(|i| hi[i] - lo[i]).fold(0.0f32, f32::max).max(1e-6);
+        let (cy, sy) = (yaw.cos(), yaw.sin());
+        let (cp, sp) = (pitch.cos(), pitch.sin());
+
+        let view = |p: &[f32; 3]| -> [f32; 3] {
+            let (x, y, z) = (p[0] - ctr[0], p[1] - ctr[1], p[2] - ctr[2]);
+            let (x, z) = (x * cy - z * sy, x * sy + z * cy);
+            let (y, z) = (y * cp - z * sp, y * sp + z * cp);
+            [x, y, z]
+        };
+        let pts: Vec<[f32; 3]> = m.verts.iter().map(view).collect();
+        // Fit to BOTH axes rather than to the smaller one scaled by aspect:
+        // the first version used min(w, h*aspect) and left the car occupying
+        // a third of the frame, which reads as "barely rendered" and made a
+        // coverage test fire for the wrong reason.
+        let sx = self.w as f32 / (ext * 1.10);
+        let sy = (self.h as f32 * self.cell_aspect) / (ext * 1.10);
+        let scale = sx.min(sy);
+        let scr: Vec<[f32; 3]> = pts.iter().map(|p| [
+            self.w as f32 * 0.5 + p[0] * scale,
+            self.h as f32 * 0.5 - p[1] * scale / self.cell_aspect,
+            p[2],
+        ]).collect();
+
+        let light = {
+            let l = [-0.42f32, 0.72, -0.55];
+            let n = (l[0] * l[0] + l[1] * l[1] + l[2] * l[2]).sqrt();
+            [l[0] / n, l[1] / n, l[2] / n]
+        };
+
+        for t in &m.tris {
+            let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+            let (p0, p1, p2) = (scr[a], scr[b], scr[c]);
+            let area = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p2[0] - p0[0]) * (p1[1] - p0[1]);
+            // Backface cull. Also how an inside-out mesh announces itself: it
+            // renders hollow instead of solid.
+            if area >= 0.0 { continue; }
+            let (v0, v1, v2) = (pts[a], pts[b], pts[c]);
+            let u = [v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2]];
+            let w = [v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2]];
+            let mut nrm = [u[1]*w[2]-u[2]*w[1], u[2]*w[0]-u[0]*w[2], u[0]*w[1]-u[1]*w[0]];
+            let nl = (nrm[0]*nrm[0]+nrm[1]*nrm[1]+nrm[2]*nrm[2]).sqrt().max(1e-9);
+            for i in 0..3 { nrm[i] /= nl; }
+            let d = (nrm[0]*light[0] + nrm[1]*light[1] + nrm[2]*light[2]).max(0.0);
+            let lvl = ((0.18 + 0.82 * d) * (RAMP.len() - 1) as f32).round() as usize;
+            let ch = RAMP[lvl.min(RAMP.len() - 1)];
+
+            let minx = p0[0].min(p1[0]).min(p2[0]).floor().max(0.0) as usize;
+            let maxx = (p0[0].max(p1[0]).max(p2[0]).ceil() as isize)
+                .clamp(0, self.w as isize - 1) as usize;
+            let miny = p0[1].min(p1[1]).min(p2[1]).floor().max(0.0) as usize;
+            let maxy = (p0[1].max(p1[1]).max(p2[1]).ceil() as isize)
+                .clamp(0, self.h as isize - 1) as usize;
+            for yy in miny..=maxy {
+                for xx in minx..=maxx {
+                    let (px, py) = (xx as f32 + 0.5, yy as f32 + 0.5);
+                    let w0 = ((p1[0]-p0[0])*(py-p0[1]) - (px-p0[0])*(p1[1]-p0[1])) / area;
+                    let w1 = ((p2[0]-p1[0])*(py-p1[1]) - (px-p1[0])*(p2[1]-p1[1])) / area;
+                    let w2 = 1.0 - w0 - w1;
+                    if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
+                    // w0 weights p2, w1 weights p0, w2 weights p1 -- the edge
+                    // functions above are built on edges p0->p1 and p1->p2, so
+                    // each weight belongs to the OPPOSITE vertex. Getting this
+                    // rotated draws far geometry in front of near.
+                    let z = w1 * p0[2] + w2 * p1[2] + w0 * p2[2];
+                    let i = yy * self.w + xx;
+                    if z < depth[i] { depth[i] = z; shade[i] = ch; }
+                }
+            }
+        }
+        self.to_string_buf(&shade)
+    }
+
+    fn to_string_buf(&self, shade: &[u8]) -> String {
+        let mut s = String::with_capacity((self.w + 1) * self.h);
+        for y in 0..self.h {
+            for x in 0..self.w {
+                let c = shade[y * self.w + x];
+                s.push(if c == 0 { ' ' } else { c as char });
+            }
+            s.push('\n');
+        }
+        s
+    }
+}
+
+/// How many cells the mesh actually covers. The cheapest possible assertion
+/// that something was drawn at all.
+pub fn coverage(frame: &str) -> usize {
+    frame.chars().filter(|c| !c.is_whitespace()).count()
 }
