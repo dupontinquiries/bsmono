@@ -1,0 +1,22 @@
+[package]
+name = "bsweb"
+version = "0.1.0"
+edition = "2021"
+description = "Manage a blackstar parts web: inspect, add, remove, repack."
+
+[lib]
+name = "bsweb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bsweb"
+path = "src/bin/bsweb.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+clap_complete = "4"
+flate2 = "1"
+zstd = "0.13"
+anyhow = "1"

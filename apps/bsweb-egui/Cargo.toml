@@ -1,0 +1,10 @@
+[package]
+name = "bsweb-egui"
+version = "0.1.0"
+edition = "2021"
+description = "Browse and triage a blackstar parts web on a phone."
+
+[dependencies]
+bsweb = { path = "../bsweb-core" }
+uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
+egui = "0.34"
