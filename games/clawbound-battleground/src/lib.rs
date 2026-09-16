@@ -31,6 +31,9 @@ pub mod daylight;
 /// wildkit's forage modules are a creature feeding itself; nothing there
 /// carries prey home, and carrying it home is the meta.
 pub mod freshkill;
+/// The Dark Forest bleeding into the living one: sight fails, scent persists,
+/// hearing lies. A `PerceptParams` modifier, the pattern `daylight` set.
+pub mod shadowrealm;
 pub mod weather;
 pub mod map_events;
 pub mod wild;

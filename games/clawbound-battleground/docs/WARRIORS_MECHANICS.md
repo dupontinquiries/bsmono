@@ -177,7 +177,14 @@ What the passage asks for that is missing:
    intruder without dropping dinner. Spoilage is in stages rather than a
    slope, because a pile you can hoard forever is a counter and not a
    decision.
-7. Spirit sites and the shadow realm — still design, not code.
+7. ~~**The shadow realm**~~ — done, `src/shadowrealm.rs`. Sight collapses
+   (no floor, unlike night — there is no adapting to it), scent is untouched,
+   and hearing LIES rather than fading. The lie is keyed to the PLACE and so
+   is deterministic: a random one would be noise, and a player averages noise
+   away by listening three times. Stable, it becomes "this hollow always sends
+   you left", which is a haunted place rather than a broken sensor.
+8. Spirit sites — an ordinary zone-with-an-effect, and the only thing in this
+   list that is still purely design.
 
 Steps 1–4 are mostly wiring existing, tested code. Step 5 is real animation
 work. Step 6 is design.
