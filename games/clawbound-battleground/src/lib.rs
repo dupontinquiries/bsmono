@@ -23,6 +23,10 @@ pub mod camps;
 /// a trail answers "who walked here" and a marker answers "whose ground is
 /// this".
 pub mod markers;
+/// The clock, and what it does to a cat's senses. `wildkit::sim::climate` says
+/// what the weather is like at a place; this says what time it is, which is
+/// the other half of "LOS vs ears varies by time of day".
+pub mod daylight;
 pub mod weather;
 pub mod map_events;
 pub mod wild;

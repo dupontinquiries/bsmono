@@ -163,8 +163,13 @@ What the passage asks for that is missing:
    contested ground is contested and picking a winner makes the border flicker
    as you walk along it. `stalest` is the patrol's to-do list, and it is what
    makes a border patrol a task rather than a walk.
-5. ~~**Extract `biome_climate`**~~ — the climate half is in as `sim::climate`.
-   What remains is a day/night clock feeding `PerceptParams`, which is new code.
+5. ~~**Extract `biome_climate`**~~ / ~~**day/night clock**~~ — both done.
+   Climate is `wildkit::sim::climate`; the clock is `src/daylight.rs`, which
+   modifies `PerceptParams`. The rule it settled: night does NOT improve
+   hearing. A cat's ears are the same ears at midnight — sight stops
+   contributing and the weights renormalise, so total perception is roughly
+   constant and merely moves between channels. Raising hearing would make
+   night strictly better for a hunter and invert the whole tension.
 5. Stalk posture and aimed leap in the rig.
 6. Fresh-kill economy, spirit sites, shadow realm.
 
