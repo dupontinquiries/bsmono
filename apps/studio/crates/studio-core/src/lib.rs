@@ -3041,15 +3041,21 @@ mod source_kind_tests {
         // Three clips at 0..100, 100..200, 200..300 on one track, grouped.
         let mut p = Project::default();
         let t = TrackId(1);
-        p.apply(&Op::AddTrack { id: t, name: "t".into(), kind: TrackKind::Audio }).unwrap();
+        p.apply(&Op::AddTrack {
+            track: Track { id: t, kind: TrackKind::Audio, name: "t".into(),
+                           muted: false, locked: false, gain: 1.0, route: None },
+            at: 0,
+        }).unwrap();
         let src = SourceId(1);
         p.apply(&Op::AddSource { source: Source::file(src, "/a.wav", Ticks(1000), 48000, 2, false) }).unwrap();
         let ids: Vec<ClipId> = (0..3).map(|i| ClipId(i + 1)).collect();
         for (i, id) in ids.iter().enumerate() {
+            // Clip has no Default -- every field is a real decision, so a
+            // default clip would be one that could not exist.
             p.apply(&Op::AddClip { clip: Clip {
                 id: *id, source: src, track: t,
                 pos: Ticks(i as i64 * 100), src_in: Ticks(0), len: Ticks(100),
-                ..Default::default() } }).unwrap();
+                gain: 1.0, effects: Vec::new() } }).unwrap();
         }
         let g = GroupId(1);
         p.apply(&Op::SetGroup { id: g, name: "comp 1".into(), clips: ids }).unwrap();

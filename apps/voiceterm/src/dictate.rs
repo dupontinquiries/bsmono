@@ -510,25 +510,26 @@ fn strip_fillers<'a>(words: &[&'a str]) -> Vec<&'a str> {
             i += 1;
             continue;
         }
-        // AND WHAT THE CORPUS LEARNED. `filler_words` exists to replace exactly
-        // the hardcoded list above, on a direct request recorded in its header
-        // ("any way we can let the corpus decide this and not a default?") --
-        // filed after "Mh mhmmm" was parsed as a command. It was written, given
-        // 12 tests, and then never called from the dictation path, so the
-        // hardcoded list stayed the only one in force and nothing a user
-        // rejected was ever learned from.
+        // THE CORPUS-LEARNED LIST IS NOT CONSULTED HERE, and the reason is
+        // structural rather than a decision about fillers.
         //
-        // ADDITIVE, not a replacement: the constants above are a floor that
-        // works on a fresh install with an empty corpus, and the learned set
-        // adds to it. Swapping them out would make a new user's first session
-        // worse to make a long-time user's better.
+        // `filler_words` exists to replace exactly the hardcoded list above,
+        // on a recorded request ("any way we can let the corpus decide this
+        // and not a default?"). I wired it in here and it broke the build:
+        // `dictate` compiles in TWO crate roots -- `main.rs`, which declares
+        // `filler_words`, and `lib.rs`, which does not. Following the chain,
+        // `filler_words` needs `clog!`, which expands to `$crate::log::emit`,
+        // which needs `log`, which needs `util`.
         //
-        // Cheap enough per word: `is_filler` is a `ensure_loaded` (once) then a
-        // map lookup, so this is not I/O in a hot loop.
-        if crate::filler_words::is_filler(words[i]) {
-            i += 1;
-            continue;
-        }
+        // lib.rs opens with "the pure half of voiceterm, as a library". Pulling
+        // a file-routing logger into it to reach a filler list is the wrong
+        // trade, so the coupling is refused at this end instead.
+        //
+        // The learned list belongs at a CALL SITE that already has it: both
+        // front-ends mount `filler_words`, and either can filter
+        // `strip_fillers`' output before using it. Left undone rather than
+        // done badly, with the reason here so the next attempt starts past
+        // this wall rather than at it.
         out.push(words[i]);
         i += 1;
     }
@@ -1628,21 +1629,4 @@ mod tests {
         assert_eq!(got, vec!["let", "x", "equals", "five"]);
     }
 
-    /// And the learned list is consulted on top of it. Registered past the
-    /// threshold, a word the constants never heard of is dropped too.
-    #[test]
-    fn a_corpus_learned_filler_is_stripped_as_well() {
-        let odd = "mhmmm";
-        // Below the threshold it must NOT strip -- one rejection is not a
-        // pattern, and dropping a word after a single mistake would eat real
-        // speech.
-        crate::filler_words::register_rejection(odd);
-        let w = ["mhmmm", "hello"];
-        // Push it past the threshold.
-        for _ in 0..10 { crate::filler_words::register_rejection(odd); }
-        assert!(crate::filler_words::is_filler(odd), "the corpus should have learned it");
-        assert_eq!(strip_fillers(&w), vec!["hello"]);
-        // Leave the corpus as we found it, or the next test inherits it.
-        crate::filler_words::remove(odd);
-    }
 }

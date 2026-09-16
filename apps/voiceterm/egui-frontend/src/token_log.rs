@@ -430,25 +430,18 @@ mod tests {
         assert!(top_spikes(&[], TimeWindow::AllTime, 0, 0, 5).is_empty());
     }
 
-    /// TokenEvent has no `Default` — every field is meaningful and a default
-    /// event would be a call that never happened — so tests build them.
-    fn ev(ts_ms: u64, op: &str, input_tokens: u32) -> TokenEvent {
-        TokenEvent { ts_ms, op: op.into(), model: "m".into(),
-                     input_tokens, output_tokens: 0, cached_input_tokens: 0 }
-    }
-
     /// THE POINT OF CARRYING A DISTRIBUTION. Two ops with the SAME total tell
     /// completely different stories, and a sum cannot separate them: one is
     /// ordinary traffic, the other is a single runaway call.
     #[test]
     fn totals_alone_cannot_tell_steady_traffic_from_one_runaway() {
         let steady: Vec<TokenEvent> = (0..10)
-            .map(|i| ev(1000 + i, "steady", 100))
+            .map(|i| ev(1000 + i, "steady", 100, 0))
             .collect();
         let mut spiky: Vec<TokenEvent> = (0..9)
-            .map(|i| ev(1000 + i, "spiky", 10))
+            .map(|i| ev(1000 + i, "spiky", 10, 0))
             .collect();
-        spiky.push(ev(1100, "spiky", 910));
+        spiky.push(ev(1100, "spiky", 910, 0));
         let all: Vec<TokenEvent> = steady.into_iter().chain(spiky).collect();
         let t = totals_by_op(&all, TimeWindow::AllTime, 2000, 0);
         let get = |n: &str| t.iter().find(|(o, _)| o == n).unwrap().1.clone();
