@@ -637,3 +637,180 @@ mod echo_tests {
                 "a long line was taken for an echo");
     }
 }
+
+// ── block kind detection ─────────────────────────────────────────────────────
+//
+// Ported VERBATIM from voiceterm's `src/term_blocks.rs`, which is where this
+// was written and tested (44 tests) and which nothing had ever called. There
+// were three implementations of command blocks in this fleet when this landed:
+// this one (639 lines, the LIVE one -- BlockTracker/CommandLines are what
+// `voiceterm_egui` actually runs), voiceterm's `egui-frontend/src/blocks.rs`
+// (415 lines, 19 tests, and exactly ONE caller using ONE function), and
+// `src/term_blocks.rs` (1,302 lines, 44 tests, no callers at all).
+//
+// The live one had the tracker and no kind detection; the other two had kind
+// detection and no users. So the detection comes here, taken from the
+// best-tested of the three rather than from the reimplementation.
+//
+// ORDERED, NOT SCORED, and the original explains why: Email is checked first
+// because `From:` at the top of the output is nearly conclusive, while
+// "consistent column counts" is a guess that `git log --oneline` would also
+// pass. Scoring them against each other would let the weakest test outvote the
+// strongest on a long output.
+
+/// The shape of a block's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlockKind {
+    /// No specific shape detected.
+    #[default]
+    Plain,
+    /// Output starts with mail headers — `mail`, `mutt -e display`, a
+    /// `cat ~/Maildir/...`.
+    Email,
+    /// A `git` command with output. Useful for clickable-hash follow-ups.
+    Git,
+    /// Rows of consistent column counts, for a future "show as table".
+    Table,
+}
+
+impl CommandBlock {
+    pub fn looks_like_email(text: &str) -> bool {
+        let mut has_anchor = false; // From: or Subject:
+        let mut total_headers = 0;
+        for (i, line) in text.lines().enumerate() {
+            if i >= 10 { break; }
+            // Header pattern: starts with one of the known
+            // header names + ":". Case-insensitive on the
+            // name to tolerate some forwarded-mail
+            // variations.
+            let lower = line.to_ascii_lowercase();
+            // Anchor headers (strong signal).
+            if lower.starts_with("from: ") || lower.starts_with("subject: ") {
+                has_anchor = true;
+                total_headers += 1;
+                continue;
+            }
+            // Supporting headers (weaker on their own).
+            if lower.starts_with("to: ")
+                || lower.starts_with("cc: ")
+                || lower.starts_with("bcc: ")
+                || lower.starts_with("date: ")
+                || lower.starts_with("reply-to: ")
+                || lower.starts_with("message-id: ")
+                || lower.starts_with("in-reply-to: ")
+                || lower.starts_with("references: ")
+            {
+                total_headers += 1;
+                continue;
+            }
+            // First non-empty non-header line ends the
+            // header block.
+            if !line.trim().is_empty() && total_headers > 0 {
+                break;
+            }
+        }
+        has_anchor && total_headers >= 2
+    }
+
+    /// Table shape detector. Looks for 3+ consecutive lines
+    /// whose split-on-multi-whitespace column counts agree
+    /// (within ±1). Excludes header-rule lines like `----`.
+    pub fn looks_like_table(text: &str) -> bool {
+        let mut col_counts: Vec<usize> = Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+            // Skip ruler lines.
+            if trimmed.chars().all(|c| c == '-' || c == '=' || c == '+' || c.is_whitespace()) {
+                continue;
+            }
+            // Multi-space split — table columns are usually
+            // separated by 2+ spaces or tabs.
+            let cols = if trimmed.contains('\t') {
+                trimmed.split('\t').filter(|s| !s.is_empty()).count()
+            } else {
+                // Split on runs of 2+ spaces.
+                let mut count = 0;
+                let mut in_word = false;
+                let mut prev_space_run = 0;
+                for c in trimmed.chars() {
+                    if c == ' ' {
+                        prev_space_run += 1;
+                    } else {
+                        if !in_word || prev_space_run >= 2 {
+                            count += 1;
+                            in_word = true;
+                        }
+                        prev_space_run = 0;
+                    }
+                }
+                count
+            };
+            // 2+ columns to be table-shaped.
+            if cols >= 2 {
+                col_counts.push(cols);
+            }
+        }
+        if col_counts.len() < 3 { return false; }
+        let first = col_counts[0];
+        col_counts.iter().all(|&c| c.abs_diff(first) <= 1)
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    fn block(cmd: &str, out: &str) -> CommandBlock {
+        let mut t = BlockTracker::new();
+        t.submit_command(cmd, 0);
+        t.append_output(out);
+        t.finish(Some(0));
+        t.blocks().last().unwrap().clone()
+    }
+
+    /// Email is checked FIRST because its signature is nearly conclusive.
+    #[test]
+    fn mail_headers_are_recognised() {
+        let b = block("cat mail.txt", "From: a@b.c\nSubject: hi\nTo: d@e.f\n\nbody");
+        assert_eq!(b.detected_kind(), BlockKind::Email);
+    }
+
+    /// One header is not enough -- prose mentioning "From:" must not become an
+    /// email, which is why the original requires two with an anchor.
+    #[test]
+    fn a_single_header_like_line_is_not_an_email() {
+        let b = block("echo", "From: the docs, we learn that\nthis is prose\n");
+        assert_ne!(b.detected_kind(), BlockKind::Email);
+    }
+
+    #[test]
+    fn a_git_command_with_output_is_git() {
+        let b = block("git status", "On branch main\nnothing to commit\n");
+        assert_eq!(b.detected_kind(), BlockKind::Git);
+        // ...and one with no output is not, since some git commands are silent.
+        let quiet = block("git config --global x y", "");
+        assert_eq!(quiet.detected_kind(), BlockKind::Plain);
+    }
+
+    /// ORDERING, NOT SCORING. `git log --oneline` passes the table shape test;
+    /// Git must win because a command prefix is the stronger signal.
+    #[test]
+    fn git_output_that_looks_tabular_is_still_git() {
+        let b = block("git log --oneline",
+                      "a1b2c3d  first  thing\ne4f5g6h  second  thing\ni7j8k9l  third  thing\n");
+        assert_eq!(b.detected_kind(), BlockKind::Git);
+    }
+
+    #[test]
+    fn consistent_columns_are_a_table() {
+        let b = block("ls -l", "a  1  x\nb  2  y\nc  3  z\n");
+        assert_eq!(b.detected_kind(), BlockKind::Table);
+    }
+
+    #[test]
+    fn ordinary_output_is_plain() {
+        assert_eq!(block("echo hi", "hi\n").detected_kind(), BlockKind::Plain);
+        assert_eq!(block("true", "").detected_kind(), BlockKind::Plain);
+    }
+}

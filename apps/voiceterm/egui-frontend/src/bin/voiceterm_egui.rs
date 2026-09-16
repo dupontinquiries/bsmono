@@ -1722,7 +1722,9 @@ impl VoicetermApp {
             if b.duration_ms.is_none() {
                 continue;
             }
-            if !voiceterm_egui::blocks::looks_like_email(b.output.trim_start()) {
+            // The live block engine now carries kind detection itself; this was the
+            // one call keeping a second 415-line copy of it alive.
+            if !uikit_term::blocks::CommandBlock::looks_like_email(b.output.trim_start()) {
                 continue;
             }
             let origin = format!("block:{}", b.id);
