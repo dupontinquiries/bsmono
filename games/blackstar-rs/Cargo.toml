@@ -1,11 +1,11 @@
 [package]
-name = "skydribble"
+name = "blackstar"
 version = "1.117.0"
 edition = "2021"
 # examples/shim.rs is an include! fragment, not a binary — declare the two
 # harnesses by hand so cargo does not try to build it as one.
 autoexamples = false
-description = "Rocket-League-inspired open-world air-dribble playground: Rust + wgpu, SDF-generated playful shapes, real RL car/ball models."
+description = "Blackstar: transforming vehicles in an open world. Rust + wgpu, SDF-generated shapes, generated (not imported) assets."
 
 [features]
 default = ["audio", "analog"]

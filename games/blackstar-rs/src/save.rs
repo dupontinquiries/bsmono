@@ -1,4 +1,4 @@
-//! Progress + settings persistence: a tiny human-readable `skydribble.save`
+//! Progress + settings persistence: a tiny human-readable `blackstar.save`
 //! file of `key value` lines next to the binary's working directory. Parsed
 //! leniently — a missing or mangled file just means defaults. Custom key
 //! bindings ride along as `bind <action> <spec,spec,...>` lines.
@@ -226,6 +226,14 @@ impl Default for Save {
 }
 
 pub fn path() -> PathBuf {
+    // blackstar.save is the name now. skydribble.save is still READ when the
+    // new one is absent, because renaming a binary should not silently
+    // discard a player's progress -- the first write lands in the new file
+    // and the old one is simply left alone.
+    let new = PathBuf::from("blackstar.save");
+    if new.exists() || !PathBuf::from("skydribble.save").exists() {
+        return new;
+    }
     PathBuf::from("skydribble.save")
 }
 

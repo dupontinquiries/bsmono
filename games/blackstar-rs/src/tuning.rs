@@ -339,7 +339,7 @@ pub fn run(argv: &[String]) {
         println!("`--tune guesses` for just the unverified ones, `--tune kit` for the");
         println!("curriculum, `--tune search` to attack the guessed gates with a sim.");
         println!("curriculum ledger.");
-        println!("cfg lines live in skydribble.save; edit and relaunch, no rebuild.");
+        println!("cfg lines live in blackstar.save; edit and relaunch, no rebuild.");
     }
 }
 
