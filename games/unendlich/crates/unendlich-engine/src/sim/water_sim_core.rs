@@ -5,6 +5,25 @@
 //! the two can't drift. Until then this is the canonical reference + the place new rules are proven
 //! before wiring.
 //!
+//! ## Status check (audited): the refactor still has not happened
+//!
+//! Nothing anywhere references this module — `water_sim_core` has zero callers, so the bin's
+//! inline loop is still the one that runs and this is still a copy. "Until then" has outlasted
+//! several revisions, which is what that phrase usually does.
+//!
+//! Two things a reader should know before trusting this file:
+//!
+//! * It claims to mirror the inline algorithm EXACTLY, and nothing enforces that. There is no
+//!   diff, no shared test vector, no guard. If the bin's loop has been tuned since extraction,
+//!   this file is a plausible-looking lie — and it is the file someone would naturally read to
+//!   understand the water sim, because it is the tested one.
+//! * The settle is DEFAULT ON since r637 (see the bin's `water_sim_enabled`), so the inline
+//!   copy is live for every player, not an experiment.
+//!
+//! The safe next step is the one the paragraph above already names: make the bin call this, on
+//! a device where the result can be seen. Verifying the mirror by reading is not the same thing
+//! and should not be recorded as if it were.
+//!
 //! Model: a square grid of world COLUMNS. Each column has a `base` (the y of its first water cell =
 //! floor+1), a `depth` (how many water cells it holds), an optional `steam` back-pressure, and a
 //! `bottomless` flag (floor below the sim window — all deep ocean). The settle moves water between

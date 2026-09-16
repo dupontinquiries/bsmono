@@ -2429,9 +2429,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // only Air↔Water cells (never touching terrain). OFF by default.
     // r539: the default had drifted to `true`, so the experimental settle ran for everyone —
     // and with rain feeding water into exposed columns each tick (apply_rain below), bodies
-    // visibly CLIMB during/after rain ("water rising strangely"). Restored to off; the sim is
-    // still backlog-blocked on a persistent per-chunk field, so opt in with UNENDLICH_WATER_SIM=1
-    // for testing only.
+    // visibly CLIMB during/after rain ("water rising strangely"). Turned off as the fix.
+    //
+    // THAT PARAGRAPH IS HISTORY, not current behaviour, and it read as current for two
+    // revisions: it still said "opt in with UNENDLICH_WATER_SIM=1 for testing only" while the
+    // line below defaults to TRUE and r637 deliberately made it so. Someone debugging water
+    // would have read it, concluded the sim was off, and gone looking somewhere else.
+    //
+    // What makes r637's default-on safe is that the rain interaction was FIXED rather than
+    // merely disabled: `water_sources::apply_rain` now caps each column and skips any column
+    // already at or above that cap, so "rain never floods standing water" is a property of
+    // the source rather than a consequence of the settle being switched off. Rain makes
+    // puddles; it cannot raise a lake.
     let water_sim_enabled =
         std::env::var("UNENDLICH_WATER_SIM").map(|v| v != "0" && !v.is_empty()).unwrap_or(true);
     // r637: DEFAULT ON. Water lateral spread (settle toward level) was gated off since
