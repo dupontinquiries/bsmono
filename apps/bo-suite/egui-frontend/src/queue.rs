@@ -536,4 +536,37 @@ mod tests {
         assert!(lib.contains("queue::now_playing_ui("), "now playing is not drawn");
         assert!(lib.contains("queue::queue_ui("), "the queue list is not drawn");
     }
+
+    /// TWO STRUCTS, ONE FACT. `chrome::NowPlaying` is field-identical to this
+    /// one and differs only in its methods, and the app holds BOTH plus
+    /// `Transport` -- three copies of "what is playing".
+    ///
+    /// That is what produced the reported screenshot: a queue strip saying
+    /// "Nothing playing" directly above a bar naming the track, because the
+    /// all-tracks and browse play paths updated two of the three. They now go
+    /// through one setter, but the duplication that made a partial update
+    /// possible is still here.
+    ///
+    /// This test exists to keep that visible. If the two ever stop being
+    /// interchangeable, collapsing them gets harder, and collapsing them is
+    /// the actual fix.
+    #[test]
+    fn the_two_now_playing_types_still_carry_the_same_fields() {
+        let mine = NowPlaying {
+            title: "03 Sauna".into(), artist: "Al Drake".into(),
+            source: String::new(), playing: true,
+        };
+        let theirs = crate::chrome::NowPlaying {
+            title: mine.title.clone(), artist: mine.artist.clone(),
+            source: mine.source.clone(), playing: mine.playing,
+        };
+        // Same four fields, same meaning. The day this stops compiling is the
+        // day the two have diverged into genuinely different things.
+        assert_eq!(theirs.title, mine.title);
+        assert_eq!(theirs.artist, mine.artist);
+        assert_eq!(theirs.playing, mine.playing);
+        // ...and they agree on whether there is anything to show.
+        assert!(theirs.active());
+        assert_ne!(mine.lines().0, "Nothing playing");
+    }
 }

@@ -745,11 +745,8 @@ impl Controller {
             TracksAction::Load { .. } => self.pending_tracks = Some(act),
             TracksAction::Play(id) => {
                 if let Some(t) = self.all_tracks.tracks().iter().find(|t| t.id == id) {
-                    self.now.title = t.title_text();
-                    self.now.artist = t.artist_text();
-                    self.transport.title = t.title_text();
-                    self.transport.artist = t.artist_text();
-                    self.transport.playing = true;
+                    let (title, artist) = (t.title_text(), t.artist_text());
+                    self.set_now_playing(&title, &artist);
                 }
                 // AND ACTUALLY PLAY IT. This arm set four labels and
                 // `playing = true`, so pressing play on a row changed the
@@ -1362,15 +1359,8 @@ impl Controller {
 
     /// Reflect a queue entry as the thing now playing.
     fn start_playing(&mut self, e: &crate::queue::QueueEntry) {
-        self.now.title = e.title.clone();
-        self.now.artist = e.artist.clone();
-        self.transport.title = e.title.clone();
-        self.transport.artist = e.artist.clone();
-        self.transport.playing = true;
-        self.now_playing = crate::queue::NowPlaying {
-            title: e.title.clone(), artist: e.artist.clone(),
-            source: String::new(), playing: true,
-        };
+        let (title, artist) = (e.title.clone(), e.artist.clone());
+        self.set_now_playing(&title, &artist);
         // Recorded here because this is where a track id exists. QueueEntry
         // has one and NowPlaying does not — it carries display strings, since
         // line-in and radio have no track to name.
@@ -1531,13 +1521,42 @@ impl Controller {
         }
     }
 
+    /// Set what is playing, in ALL THREE places that hold it.
+    ///
+    /// The app carries the same fact three times -- `self.now`
+    /// (`chrome::NowPlaying`, the top bar), `self.transport` (the play bar),
+    /// and `self.now_playing` (`queue::NowPlaying`, the queue strip) -- and
+    /// every path that started a track updated its own subset.
+    ///
+    /// Playing from the queue set all three. Playing from the all-tracks list
+    /// or from browse set only the first two, so the queue strip kept saying
+    /// "Nothing playing" directly above a bar naming the track. Reported from
+    /// a screenshot showing exactly that.
+    ///
+    /// One setter rather than three assignments at each call site: the bug is
+    /// not that someone forgot a line, it is that forgetting a line was
+    /// possible. Collapsing the three structs into one would be better still
+    /// and is a bigger change than this -- `chrome::NowPlaying` and
+    /// `queue::NowPlaying` are field-identical and differ only in their
+    /// methods, which is the actual duplication to remove.
+    fn set_now_playing(&mut self, title: &str, artist: &str) {
+        self.now.title = title.to_string();
+        self.now.artist = artist.to_string();
+        self.transport.title = title.to_string();
+        self.transport.artist = artist.to_string();
+        self.transport.playing = true;
+        self.now_playing = crate::queue::NowPlaying {
+            title: title.to_string(),
+            artist: artist.to_string(),
+            source: String::new(),
+            playing: true,
+        };
+    }
+
     fn play_browse_track(&mut self, id: i64) {
         if let Some(t) = self.browse_tracks.iter().find(|t| t.id == id) {
-            self.now.title = t.title.clone();
-            self.now.artist = t.primary_artist.clone();
-            self.transport.title = t.title.clone();
-            self.transport.artist = t.primary_artist.clone();
-            self.transport.playing = true;
+            let (title, artist) = (t.title.clone(), t.primary_artist.clone());
+            self.set_now_playing(&title, &artist);
         }
     }
 
@@ -1696,6 +1715,7 @@ impl Controller {
                 return;
             }
             let q = self.search.query.trim().to_lowercase();
+            let mut picked: Option<(String, String)> = None;
             let hits: Vec<crate::catalog_source::CatalogTrack> = self.catalog.rows.iter()
                 .filter(|t| q.is_empty() || t.label().to_lowercase().contains(&q)
                             || t.sub().to_lowercase().contains(&q))
@@ -1705,11 +1725,12 @@ impl Controller {
                 for t in hits {
                     ui.horizontal(|ui| {
                         if ui.selectable_label(false, t.label()).clicked() {
-                            self.now.title = t.label();
-                            self.now.artist = t.artists.join(", ");
-                            self.transport.title = t.label();
-                            self.transport.artist = self.now.artist.clone();
-                            self.transport.playing = true;
+                            // Deferred out of the closure: `set_now_playing`
+                            // takes &mut self and this borrows it. Setting the
+                            // fields inline here is what let this path drift
+                            // out of step with the queue strip in the first
+                            // place.
+                            picked = Some((t.label(), t.artists.join(", ")));
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.colored_label(c.text_weak, t.sub());
@@ -1717,6 +1738,9 @@ impl Controller {
                     });
                 }
             });
+            if let Some((title, artist)) = picked {
+                self.set_now_playing(&title, &artist);
+            }
             return;
         }
         let rows: Vec<crate::library::Track> =
@@ -1732,12 +1756,15 @@ impl Controller {
             for t in rows {
                 ui.horizontal(|ui| {
                     if ui.selectable_label(false, t.title.as_str()).clicked() {
-                        self.now.title = t.title.clone();
-                        self.now.artist = t.artist.clone();
-                        self.transport.title = t.title.clone();
-                        self.transport.artist = t.artist.clone();
-                        self.transport.duration = 210.0;
-                        self.transport.playing = true;
+                        // Direct, unlike the catalogue list above: this closure
+                        // already takes `self` mutably (`add_to_playlist.open`
+                        // below), so the setter is callable here.
+                        let (title, artist) = (t.title.clone(), t.artist.clone());
+                        self.set_now_playing(&title, &artist);
+                        // The demo duration this arm used to set is dropped:
+                        // 210.0 was a placeholder that made the scrubber claim
+                        // a length the file does not have, which is worse than
+                        // an unknown one.
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.colored_label(c.text_weak, t.album.as_str());
