@@ -27,6 +27,10 @@ pub mod markers;
 /// what the weather is like at a place; this says what time it is, which is
 /// the other half of "LOS vs ears varies by time of day".
 pub mod daylight;
+/// The fresh-kill economy: caught, carried, piled, eaten before it turns.
+/// wildkit's forage modules are a creature feeding itself; nothing there
+/// carries prey home, and carrying it home is the meta.
+pub mod freshkill;
 pub mod weather;
 pub mod map_events;
 pub mod wild;

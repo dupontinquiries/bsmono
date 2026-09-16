@@ -171,7 +171,13 @@ What the passage asks for that is missing:
    constant and merely moves between channels. Raising hearing would make
    night strictly better for a hunter and invert the whole tension.
 5. Stalk posture and aimed leap in the rig.
-6. Fresh-kill economy, spirit sites, shadow realm.
+6. ~~**Fresh-kill economy**~~ — done, `src/freshkill.rs`. Caught, carried,
+   piled, eaten before it turns. Carrying is where the tension is: a cat's
+   jaws hold one mouthful, so a patrol bringing prey home cannot challenge an
+   intruder without dropping dinner. Spoilage is in stages rather than a
+   slope, because a pile you can hoard forever is a counter and not a
+   decision.
+7. Spirit sites and the shadow realm — still design, not code.
 
 Steps 1–4 are mostly wiring existing, tested code. Step 5 is real animation
 work. Step 6 is design.
