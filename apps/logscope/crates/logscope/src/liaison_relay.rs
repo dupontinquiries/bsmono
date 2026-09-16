@@ -106,6 +106,30 @@ pub fn apply(src: &str, edits: &[Edit]) -> Result<String, String> {
 working from a different version, or miscounted; applying it anywhere else would hide that"));
         }
     }
+    // TWO EDITS ON ONE LINE IS REFUSED, not resolved.
+    //
+    // Applying bottom-up (below) keeps earlier line numbers valid, which is
+    // the right fix for the shift problem and is why the sort is there. It
+    // does nothing for a collision. A Delete and a Replace both naming line 3
+    // of a 3-line file passes the bounds check above, deletes, and then
+    // indexes `lines[2]` into a 2-line vector — a PANIC, from untrusted model
+    // output, which is the one kind of input this function is built to
+    // receive.
+    //
+    // Refused rather than ordered, because there is no correct order. If the
+    // model asked to both delete and replace line 3 it does not know what it
+    // wants, and picking one silently applies half of a request the operator
+    // never saw. Two inserts after the same line have the same problem more
+    // quietly: the sort is stable, so they would land in reverse.
+    {
+        let mut seen: Vec<usize> = edits.iter().map(Edit::line).collect();
+        seen.sort_unstable();
+        if let Some(dup) = seen.windows(2).find(|w| w[0] == w[1]).map(|w| w[0]) {
+            return Err(format!("two edits both name line {dup} — the model asked for \
+conflicting changes to one line, and there is no order that applies both. Ask again rather \
+than guessing which it meant"));
+        }
+    }
     let mut sorted: Vec<&Edit> = edits.iter().collect();
     sorted.sort_by_key(|e| std::cmp::Reverse(e.line()));
     for e in sorted {
@@ -574,5 +598,44 @@ mod retry_tests {
         // Line numbers are what the model is worst at and anchors are what apply_verified checks
         // anyway, so the repair moves the edit onto the axis that is already verified.
         assert!(PatchError::Range("out of bounds".into()).retry().adjustment.contains("anchored"));
+    }
+
+    /// A PANIC FROM MODEL OUTPUT. Delete and Replace both naming the last line
+    /// passes the bounds check, deletes, then indexes past the end.
+    #[test]
+    fn two_edits_on_one_line_are_refused_rather_than_panicking() {
+        let src = "a\nb\nc";
+        let edits = vec![
+            Edit::Delete { at: 3 },
+            Edit::Replace { at: 3, text: "x".into() },
+        ];
+        let err = apply(src, &edits).unwrap_err();
+        assert!(err.contains("line 3"), "{err}");
+        assert!(err.contains("conflicting"), "{err}");
+    }
+
+    /// Two inserts after the same line fail the same way, more quietly: the
+    /// sort is stable, so without this they land in reverse order.
+    #[test]
+    fn two_inserts_after_the_same_line_are_refused() {
+        let src = "a\nb";
+        let edits = vec![
+            Edit::InsertAfter { at: 1, text: "first".into() },
+            Edit::InsertAfter { at: 1, text: "second".into() },
+        ];
+        assert!(apply(src, &edits).is_err());
+    }
+
+    /// Edits on DIFFERENT lines still apply, bottom-up, with earlier numbers
+    /// staying valid -- the property the sort exists for.
+    #[test]
+    fn edits_on_different_lines_all_land() {
+        let src = "a\nb\nc\nd";
+        let edits = vec![
+            Edit::Replace { at: 1, text: "A".into() },
+            Edit::Delete { at: 3 },
+            Edit::InsertAfter { at: 4, text: "E".into() },
+        ];
+        assert_eq!(apply(src, &edits).unwrap(), "A\nb\nd\nE");
     }
 }

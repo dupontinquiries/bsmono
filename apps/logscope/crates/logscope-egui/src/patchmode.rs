@@ -4,6 +4,16 @@
 //! result exactly as the full-file path does. Complements `merge.rs` (item-block lazy edits) and
 //! `workspace_exec`'s WriteFile (full overwrite) with a THIRD, diff-based edit mode.
 //!
+//! FOURTH, actually: `logscope::liaison_relay` applies edits by LINE NUMBER and
+//! is not counted above because it has no callers. It was written knowing about
+//! this module and argues the opposite trade deliberately — a diff needs
+//! matching context, and a model that misremembers the context produces a hunk
+//! that fails to apply, which this module handles only by rejecting it; a line
+//! number either exists or it does not, so the failure is immediate and local.
+//!
+//! That is a real argument and the two are not redundant. Whoever picks between
+//! them should know both exist, which the count above implied they did not.
+//!
 //! Format: git-style unified diff. Per file, a header naming the path, then one or more `@@` hunks:
 //!
 //! ```text
