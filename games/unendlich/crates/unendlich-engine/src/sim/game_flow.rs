@@ -12,6 +12,7 @@
 //! run. No RNG, I/O, GPU, or wall-clock; no `unwrap`/`expect`/`panic!`. Commands
 //! that don't apply in the current state are inert (no transition).
 
+use crate::sim::pause_overlay::{PauseOverlay, PauseScreen};
 use crate::sim::title_flow::{self, TitleEvent, TitleFlow};
 
 /// Outer application state.
@@ -54,6 +55,14 @@ pub enum AppEvent {
 pub struct GameFlow {
     state: AppState,
     title: TitleFlow,
+    /// The pause menu's sub-screens.
+    ///
+    /// Owned here for exactly the reason `title` is: an `AppState` with
+    /// sub-screens needs something to hold them, and `game_flow` is what holds
+    /// the app's shape. `pause_overlay` said its wiring "lives at the call
+    /// site" and no call site ever did it — the FSM had 26 tests and zero
+    /// references, so the pause menu could not actually open a settings page.
+    pause: PauseOverlay,
 }
 
 impl GameFlow {
@@ -63,6 +72,7 @@ impl GameFlow {
         GameFlow {
             state: AppState::MainMenu,
             title: TitleFlow::new(has_save, slot_count),
+            pause: PauseOverlay::new(),
         }
     }
 
@@ -74,6 +84,24 @@ impl GameFlow {
     /// Read-only view of the embedded menu flow (e.g. for rendering the menu).
     pub fn title(&self) -> &TitleFlow {
         &self.title
+    }
+
+    /// The pause overlay, for a caller that needs to drive its sub-screens.
+    pub fn pause(&self) -> &PauseOverlay {
+        &self.pause
+    }
+
+    pub fn pause_mut(&mut self) -> &mut PauseOverlay {
+        &mut self.pause
+    }
+
+    /// Which pause screen is showing, or `None` when not paused.
+    ///
+    /// `None` rather than `Root` when unpaused: a renderer asking "what pause
+    /// screen is up" during play should get "no pause menu", not "the root
+    /// one, which you should not draw".
+    pub fn pause_screen(&self) -> Option<PauseScreen> {
+        matches!(self.state, AppState::Paused).then(|| self.pause.screen())
     }
 
     /// Apply a command, transitioning the outer FSM and returning the app event.
@@ -91,6 +119,12 @@ impl GameFlow {
 
             AppState::InGame => match cmd {
                 AppCmd::PauseToggled => {
+                    // RESET ON ENTRY, the same rule quit-to-menu already
+                    // applies to the title. Without it you pause, open
+                    // Settings, resume, pause again — and are staring at
+                    // Settings, because the overlay kept the screen it was
+                    // last on. A menu should open where it opens.
+                    self.pause = PauseOverlay::new();
                     self.state = AppState::Paused;
                     AppEvent::ShowPause
                 }
@@ -333,5 +367,77 @@ mod tests {
         for _ in 0..50 {
             assert_eq!(run(), first, "non-deterministic");
         }
+    }
+
+    // ── the pause overlay, finally attached ──────────────────────────────
+
+    use crate::sim::pause_overlay::PauseCmd;
+
+    fn paused() -> GameFlow {
+        // `into_ingame` is the house helper; reaching for the private `state`
+        // field would test a path the app cannot take.
+        let mut gf = into_ingame(true, 3);
+        gf.apply(AppCmd::PauseToggled);
+        gf
+    }
+
+    /// THE BUG THE COMPOSITION PREVENTS. Pause, open Settings, resume, pause
+    /// again — without a reset you are staring at Settings, because the
+    /// overlay kept the screen it was last on. A menu should open where it
+    /// opens.
+    #[test]
+    fn pausing_again_reopens_at_the_root_screen() {
+        let mut gf = paused();
+        gf.pause_mut().apply(PauseCmd::OpenSettings);
+        assert_eq!(gf.pause_screen(), Some(PauseScreen::Settings));
+        gf.apply(AppCmd::BackToGame);
+        gf.apply(AppCmd::PauseToggled);
+        assert_eq!(gf.pause_screen(), Some(PauseScreen::Root),
+                   "the menu must open where it opens");
+    }
+
+    /// `None` rather than `Root` when unpaused: a renderer asking "what pause
+    /// screen is up" during play should get "no pause menu", not "the root
+    /// one, which you should not draw".
+    #[test]
+    fn there_is_no_pause_screen_while_playing() {
+        let menu = GameFlow::new(true, 3);
+        assert_eq!(menu.pause_screen(), None, "not at the main menu either");
+        let mut gf = into_ingame(true, 3);
+        assert_eq!(gf.pause_screen(), None);
+        gf.apply(AppCmd::PauseToggled);
+        assert!(gf.pause_screen().is_some());
+    }
+
+    /// The sub-screens are reachable at all, which they were not before: the
+    /// FSM had 26 tests and no owner, so nothing could open a settings page.
+    #[test]
+    fn the_pause_sub_screens_are_reachable_from_the_app() {
+        let mut gf = paused();
+        assert_eq!(gf.pause_screen(), Some(PauseScreen::Root));
+        gf.pause_mut().apply(PauseCmd::OpenSettings);
+        assert_eq!(gf.pause_screen(), Some(PauseScreen::Settings));
+        gf.pause_mut().apply(PauseCmd::Back);
+        assert_eq!(gf.pause_screen(), Some(PauseScreen::Root));
+        gf.pause_mut().apply(PauseCmd::QuitToMenu);
+        assert_eq!(gf.pause_screen(), Some(PauseScreen::ConfirmQuitToMenu),
+                   "quitting asks first");
+    }
+
+    /// Quitting to the menu resets BOTH sub-machines. The title already had
+    /// this; the pause menu now gets the same treatment, so returning to a
+    /// paused game does not find a stale confirmation dialog.
+    #[test]
+    fn quitting_to_the_menu_leaves_no_stale_pause_screen() {
+        let mut gf = paused();
+        gf.pause_mut().apply(PauseCmd::QuitToDesktop);
+        assert_eq!(gf.pause_screen(), Some(PauseScreen::ConfirmQuitToDesktop));
+        gf.apply(AppCmd::QuitToMenu);
+        assert_eq!(gf.state(), AppState::MainMenu);
+        assert_eq!(gf.pause_screen(), None);
+        // ...and a later game pauses cleanly.
+        let mut gf = into_ingame(true, 3);
+        gf.apply(AppCmd::PauseToggled);
+        assert_eq!(gf.pause_screen(), Some(PauseScreen::Root));
     }
 }
