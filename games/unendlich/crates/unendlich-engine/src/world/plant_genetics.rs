@@ -60,8 +60,14 @@ pub const RESONANCE_RATE_BOOST: f32 = 2.0;
 pub const RESONANCE_HEIGHT_BONUS: u8 = 8;
 
 /// Trait order — the index each gene occupies for `activator_for`. Stable.
-pub const PLANT_TRAITS: [&str; 5] =
-    ["max_height", "growth_rate", "drought_tolerance", "branchiness", "resonance_gain"];
+pub const PLANT_TRAITS: [&str; 6] = [
+    "max_height", "growth_rate", "drought_tolerance", "branchiness", "resonance_gain",
+    // APPENDED, never inserted. The index IS the identity here -- `activator_for`
+    // keys epigenetic switches off it, and popgen indexes `genes()` directly --
+    // so putting a new trait anywhere but the end would silently re-point every
+    // existing plant's switches at a different gene.
+    "fire_resistance",
+];
 
 #[inline]
 fn mix(seed: u64) -> u64 {
@@ -109,6 +115,19 @@ pub struct PlantGenome {
     pub branchiness: Gene,
     /// Sensitivity to grower resonance (Wood dragons / growth items).
     pub resonance_gain: Gene,
+    /// How well the plant survives fire.
+    ///
+    /// Recovered from `sim::flora_genetics`, a PARALLEL diploid engine that
+    /// this module's own header says should not exist ("one Mendelian machine
+    /// across the whole world, not a parallel one") and which nothing calls.
+    /// The trait it carried is worth having and the second machine is not, so
+    /// the trait moves here and rides the shared engine like every other.
+    ///
+    /// It matters because this world has dragons that breathe fire: without
+    /// it, a Fire dragon's pass over a forest is uniform, and a forest that
+    /// burns uniformly has no survivors to reseed from and no reason for one
+    /// stand to differ from the next.
+    pub fire_resistance: Gene,
 }
 
 impl PlantGenome {
@@ -120,17 +139,19 @@ impl PlantGenome {
             drought_tolerance: roll_gene(seed ^ 0x03),
             branchiness: roll_gene(seed ^ 0x04),
             resonance_gain: roll_gene(seed ^ 0x05),
+            fire_resistance: roll_gene(seed ^ 0x06),
         }
     }
 
     /// The genes in [`PLANT_TRAITS`] order (so the index matches `activator_for`).
-    pub fn genes(&self) -> [Gene; 5] {
+    pub fn genes(&self) -> [Gene; 6] {
         [
             self.max_height,
             self.growth_rate,
             self.drought_tolerance,
             self.branchiness,
             self.resonance_gain,
+            self.fire_resistance,
         ]
     }
 
@@ -145,6 +166,7 @@ impl PlantGenome {
             drought_threshold: lerp(DROUGHT_THRESHOLD_WET, DROUGHT_THRESHOLD_DRY, p(2)),
             branchiness: p(3),
             resonance_gain: p(4),
+            fire_resistance: p(5),
         }
     }
 
@@ -159,6 +181,7 @@ impl PlantGenome {
             drought_tolerance: cross(&self.drought_tolerance, &other.drought_tolerance, s(0x03)),
             branchiness: cross(&self.branchiness, &other.branchiness, s(0x04)),
             resonance_gain: cross(&self.resonance_gain, &other.resonance_gain, s(0x05)),
+            fire_resistance: cross(&self.fire_resistance, &other.fire_resistance, s(0x06)),
         }
     }
 }
@@ -176,6 +199,8 @@ pub struct PlantPhenotype {
     pub branchiness: f32,
     /// Resonance sensitivity, `0..=1`.
     pub resonance_gain: f32,
+    /// Fire survival, `0..=1`. 0 burns like tinder, 1 is fire-hardened bark.
+    pub fire_resistance: f32,
 }
 
 /// What a plant does this tick under a local grower-resonance level.
@@ -213,6 +238,7 @@ mod tests {
             drought_tolerance: g,
             branchiness: g,
             resonance_gain: g,
+            fire_resistance: g,
         }
     }
 
@@ -333,9 +359,54 @@ mod tests {
             drought_tolerance: g,
             branchiness: g,
             resonance_gain: g,
+            fire_resistance: g,
         };
         let off = genome.express(5, 0b0000_0000).growth_rate;
         let on = genome.express(5, 0b0000_0001).growth_rate;
         assert!(on < off, "env switch should up-regulate the low-value allele");
+    }
+
+    /// FIRE RESISTANCE, recovered from the orphaned parallel engine. It rides
+    /// the shared diploid machine like every other plant trait -- which is the
+    /// whole reason it moved here rather than the second machine being revived.
+    #[test]
+    fn fire_resistance_is_heritable_like_any_other_trait() {
+        let hardy = Gene::new(Allele::new(1.0, 0.5, 0), Allele::new(1.0, 0.5, 0));
+        let tinder = Gene::new(Allele::new(0.0, 0.5, 0), Allele::new(0.0, 0.5, 0));
+        let mut a = uniform(0.5); a.fire_resistance = hardy;
+        let mut b = uniform(0.5); b.fire_resistance = tinder;
+        // Hardy x hardy breeds true.
+        let child = a.breed(&a, 7);
+        assert!(child.express(1, 0).fire_resistance > 0.9,
+                "got {}", child.express(1, 0).fire_resistance);
+        // Hardy x tinder lands between, as a codominant cross should.
+        let mixed = a.breed(&b, 7).express(1, 0).fire_resistance;
+        assert!(mixed > 0.05 && mixed < 0.95, "got {mixed}");
+    }
+
+    /// THE INDEX IS THE IDENTITY. `activator_for` keys epigenetic switches off
+    /// a gene's position and popgen indexes `genes()` directly, so a new trait
+    /// must be APPENDED. Inserting one would silently re-point every existing
+    /// plant's switches at a different gene.
+    #[test]
+    fn the_new_trait_is_appended_so_existing_indices_do_not_move() {
+        assert_eq!(PLANT_TRAITS[0], "max_height");
+        assert_eq!(PLANT_TRAITS[4], "resonance_gain");
+        assert_eq!(PLANT_TRAITS[5], "fire_resistance", "appended, not inserted");
+        assert_eq!(PLANT_TRAITS.len(), PlantGenome::from_seed(1).genes().len(),
+                   "the trait names and the gene array must stay the same length");
+    }
+
+    /// Two plants from different seeds differ in fire resistance, or a forest
+    /// burns uniformly and no stand differs from the next.
+    #[test]
+    fn wild_plants_vary_in_fire_resistance() {
+        let vals: Vec<f32> = (1..40u64)
+            .map(|s| PlantGenome::from_seed(s).express(s, 0).fire_resistance)
+            .collect();
+        let lo = vals.iter().cloned().fold(f32::MAX, f32::min);
+        let hi = vals.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(hi - lo > 0.3, "wild stands barely vary: {lo}..{hi}");
+        assert!(vals.iter().all(|v| (0.0..=1.0).contains(v)));
     }
 }
