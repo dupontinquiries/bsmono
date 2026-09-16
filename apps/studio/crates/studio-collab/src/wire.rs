@@ -918,7 +918,7 @@ fn get_rack(r: &mut R) -> Option<Rack> {
     for _ in 0..pn { patterns.push(get_pattern(r)?); }
     let tempo_bpm = r.f32()?;
     let swing = r.f32()?;
-    Some(Rack { channels, patterns, tempo_bpm, swing })
+    Some(Rack { channels, patterns, tempo_bpm, swing, ..Default::default() })
 }
 
 impl Packet {
@@ -1345,8 +1345,7 @@ mod tests {
                 Channel { name: "hat".into(), kind: SynthKind::Sampler { source: SourceId(3) }, gain: 0.6, pan: 0.2, muted: true, choke_group: Some(0) },
             ],
             patterns: vec![pattern],
-            tempo_bpm: 140.0, swing: 0.11,
-        }
+            tempo_bpm: 140.0, swing: 0.11, ..Default::default() }
     }
 
     #[test]

@@ -477,8 +477,7 @@ mod tests {
                 gain: 1.0, pan: 0.0, muted: false, choke_group: None,
             }],
             patterns: vec![pattern],
-            tempo_bpm: 140.0, swing: 0.11,
-        };
+            tempo_bpm: 140.0, swing: 0.11, ..Default::default() };
         s.doc.set_rack(rack.clone());
 
         let mut newcomer = Doc::new(SiteId(5), Project { name: "cut".into(), ..Default::default() });

@@ -499,8 +499,7 @@ mod tests {
         let rack = studio_live::Rack {
             channels: vec![ch("piano", piano), ch("kit", kit)],
             patterns: vec![studio_live::Pattern::new("p", 16, 2)],
-            tempo_bpm: 120.0, swing: 0.0,
-        };
+            tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
 
         use studio_fx::retune::{Mode, Scale};
         let c = Scale { root: 0, mode: Mode::Minor };
@@ -794,6 +793,7 @@ mod tests {
             ],
             patterns: vec![pattern],
             tempo_bpm: 140.0, swing: 0.0,
+            ..Default::default()
         }
     }
 
@@ -900,6 +900,7 @@ mod tests {
             ],
             patterns: vec![],
             tempo_bpm: 140.0, swing: 0.0,
+            ..Default::default()
         }
     }
 

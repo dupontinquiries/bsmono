@@ -736,7 +736,7 @@ impl Rack {
         p.set_mod(4, 15, StepMod { vel: 0.85, ratchet: 3, ..StepMod::default() });
         p.set(5, 14, true);
         p.set_mod(5, 14, StepMod { vel: 0.6, ..StepMod::default() });
-        Rack { channels, patterns: vec![p], tempo_bpm: 140.0, swing: 0.14 }
+        Rack { channels, patterns: vec![p], tempo_bpm: 140.0, swing: 0.14, ..Default::default() }
     }
 }
 
@@ -1490,8 +1490,7 @@ mod tests {
                           gain: 1.0, pan: 0.0, muted: false, choke_group: None },
             ],
             patterns: vec![],
-            tempo_bpm: 120.0, swing: 0.0,
-        }
+            tempo_bpm: 120.0, swing: 0.0, ..Default::default() }
     }
 
     #[test]
@@ -2027,8 +2026,7 @@ mod tests {
                 kind: SynthKind::Sub { note: 0, glide_from: None, glide_ms: 30.0, drive: 0.0, decay_ms: 2000.0 },
                 gain: 1.0, pan: 0.0, muted: false, choke_group: None,
             }],
-            patterns: vec![], tempo_bpm: 120.0, swing: 0.0,
-        };
+            patterns: vec![], tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
         let mut pattern = Pattern::new("beat", 16, 1);
         pattern.toggle(0, 0);
         pattern.toggle(0, 4);
@@ -2270,8 +2268,7 @@ mod trap_tests {
                 kind: SynthKind::Drum { voice: DrumVoice::HatClosed, tone: 0.5,
                                         decay_ms: 40.0, tune: 0 },
                 gain: 1.0, pan: 0.0, muted: false, choke_group: None }],
-            patterns: vec![], tempo_bpm: 120.0, swing: 0.0,
-        };
+            patterns: vec![], tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
         let mut p = Pattern::new("A", 4, 1);
         p.set(0, 0, true);
         p.set(0, 1, true);
@@ -2396,8 +2393,7 @@ mod choke_tests {
                 ch("ohat", DrumVoice::HatOpen, 600.0, Some(1)),
                 ch("hat",  DrumVoice::HatClosed, 40.0, Some(1)),
             ],
-            patterns: vec![], tempo_bpm: 120.0, swing: 0.0,
-        }
+            patterns: vec![], tempo_bpm: 120.0, swing: 0.0, ..Default::default() }
     }
 
     fn render(rack: &Rack, p: &Pattern) -> (Vec<f32>, usize) {
@@ -2566,8 +2562,7 @@ mod roll_tests {
                 kind: SynthKind::Sub { note: 12, glide_from: None, glide_ms, drive: 0.0, decay_ms },
                 gain: 1.0, pan: 0.0, muted: false, choke_group: None,
             }],
-            patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0,
-        }
+            patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() }
     }
 
     fn render(rack: &Rack, p: &Pattern) -> (Vec<f32>, usize) {
@@ -2748,8 +2743,7 @@ mod roll_tests {
                 kind: SynthKind::Sampler { source: studio_core::SourceId(1) },
                 gain: 1.0, pan: 0.0, muted: false, choke_group: None,
             }],
-            patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0,
-        };
+            patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
         let t = rack.tempo();
         let mut up = Pattern::new("up", 4, 1);
         up.add_note(0, Note { key: 12, start: 0, len: 2, vel: 1.0, slide: false });
@@ -2780,8 +2774,7 @@ mod roll_tests {
                 kind: SynthKind::Sampler { source: studio_core::SourceId(1) },
                 gain: 1.0, pan: 0.0, muted: false, choke_group: None,
             }],
-            patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0,
-        };
+            patterns: Vec::new(), tempo_bpm: 120.0, swing: 0.0, ..Default::default() };
         let t = rack.tempo();
         let mut up = Pattern::new("up", 4, 1);
         up.set(0, 0, true);
