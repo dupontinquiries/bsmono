@@ -586,6 +586,25 @@ pub mod zbrackets;
 #[allow(dead_code, unused_imports)]
 pub mod note_blend;
 
+/// Per-diagram node pins, stored inline in the markdown under each mermaid
+/// block.
+///
+/// The frontend draws graphs — `graph_view`, `layered_graph`,
+/// `connections_graph` — and can persist NOTHING about them: drag a node and
+/// the position is gone on reload, because nowhere in this crate writes a pin.
+/// `src/transforms.rs` is that layer, 670 lines and 30 tests, with zero
+/// `crate::` references of any kind, so it mounts with one line.
+///
+/// Its storage decision is recorded in its own header as a user direction:
+/// "link transforms to the file with inline markdowns under the diagrams so
+/// that it is human readable in a text editor but also functional" — a fenced
+/// ```mermaid-transforms``` block following each ```mermaid``` block. A
+/// sidecar file would have been easier and would go stale the first time
+/// someone moved the note.
+#[path = "../../src/transforms.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod transforms;
+
 /// Joins `note_blend`'s active-line decision to `zbrackets`' rewriting. Both
 /// were here and neither had a caller; the seam between them is the feature.
 pub mod note_blend_view;
