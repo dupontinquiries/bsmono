@@ -705,6 +705,15 @@ mod tests {
 
     /// THE COLLISION, pinned directly rather than only through the matcher.
     ///
+    /// Note on verifying a change here without running it: a reimplementation
+    /// of `draw_glyph` + `normalise` in a scratch script is only trustworthy
+    /// once it REPRODUCES A KNOWN RESULT. Run it against the pre-fix segment
+    /// table first; if it does not return exactly
+    /// `(G,6) (I,1) (O,0) (S,5) (T,R) (W,U) (X,H) (Y,4) (Z,2)`, the model is
+    /// wrong and anything it says about a new table is worthless. I skipped
+    /// that step once and spent a while believing a stale log over a correct
+    /// fix.
+    ///
     /// Nine pairs used to rasterise byte-identically -- G/6, I/1, O/0, S/5,
     /// T/R, W/U, X/H, Y/4, Z/2 -- because the glyph table was pure
     /// seven-segment and a seven-segment display genuinely cannot separate
