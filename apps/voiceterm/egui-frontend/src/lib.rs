@@ -567,6 +567,28 @@ pub mod zellij_voice;
 /// the first time.
 #[path = "../../src/zbrackets.rs"]
 pub mod zbrackets;
+
+/// The note editor's live-preview blend, from `src/note_edit.rs`.
+///
+/// Mounted as `note_blend` rather than `note_edit` because this crate already
+/// has an unrelated `note_edit` (the palace's Fork and Tag actions). Same
+/// name, different module — a collision, not a duplicate, and renaming the
+/// mount is cheaper than renaming either original.
+///
+/// It is what gives `zbrackets` a caller. `zbrackets` has been mounted here
+/// with NOTHING calling it: the frontend could rewrite `[[name]]` into a link
+/// and never did, because the piece that decides WHICH lines to rewrite was
+/// the unported half. `blend_lines` is that decision — the cursor's line stays
+/// raw markdown so you can edit the syntax, every other line renders — and it
+/// deliberately does not do the rewriting itself, which is why it mounts
+/// with no dependencies at all.
+#[path = "../../src/note_edit.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod note_blend;
+
+/// Joins `note_blend`'s active-line decision to `zbrackets`' rewriting. Both
+/// were here and neither had a caller; the seam between them is the feature.
+pub mod note_blend_view;
 /// Modeless vim-style count-prefix accumulator (`{N}b` = cycle N forward,
 /// `{N}B` = N back) — the state machine behind TODO_tab_cycle_shortcut.md,
 /// fully done and wired in the Qt frontend since v0.1.719. Pure,
