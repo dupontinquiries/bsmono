@@ -17,6 +17,41 @@
 //! it is a guess. Recorded in PORT_STATUS as the next real step for whoever has
 //! a Qt host.
 //!
+//! ## The split, measured — so the next person moves rather than discovers
+//!
+//! That judgement still stands and this does not overturn it. What it removes
+//! is the discovery half: the boundary has now been computed rather than
+//! estimated, and it is far cleaner than a first look suggests. Grepping for
+//! `qml_gen`/`scraper`/`to_qml` finds 117 code lines in NINE clusters spread
+//! from line 453 to 4109, which reads as hopelessly interleaved. Attributing
+//! each line to its enclosing item instead:
+//!
+//! ```text
+//! Qt-FREE     36 top-level items
+//! Qt-COUPLED   9 items, and they are one coherent group:
+//!                to_qml, to_qml_with_source, not_found_qml,
+//!                emit_heading_qml, emit_paragraph_qml, emit_list_item_qml,
+//!                emit_code_block_qml, emit_block_image_qml
+//! ```
+//!
+//! Eight QML emitters plus their entry point. The nine "clusters" were those
+//! functions and their tests; nothing else in the file touches Qt. So the move
+//! is: lift those nine into `manpages_qml.rs`, leave everything else in
+//! `manpages_core.rs`, and have `manpages.rs` become two `include!`s — the
+//! same mechanism `bar_pages.rs` already uses here, and for the same reason
+//! (`#[path]` would re-root the original's `use crate::` lines).
+//!
+//! `percent_encode_into` looks coupled in a naive per-item scan and is NOT —
+//! the `#[cfg(test)]` module below it inflates its apparent extent. It is
+//! Qt-free and belongs in the core half.
+//!
+//! What still needs the Qt host, and is the reason this is a note rather than
+//! a commit: whether the core half is *closed* — that no Qt-free function
+//! calls into the nine — is a claim only the compiler settles, and being wrong
+//! about it breaks the app I cannot build. The analysis narrows the job from
+//! "understand 4,118 lines" to "move nine named functions and see if it
+//! compiles".
+//!
 //! ## So the view takes documents rather than fetching them
 //!
 //! The host owns the registry and the markdown→HTML conversion it already has;
