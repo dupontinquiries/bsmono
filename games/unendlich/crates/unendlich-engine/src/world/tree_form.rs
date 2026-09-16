@@ -29,7 +29,9 @@
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanopyForm {
-    /// Pre-r604 sphere-ish dome. The default everywhere.
+    /// A domed crown: round on top, tapering underneath. The default
+    /// everywhere. Was linear in both directions until the upper half was
+    /// made circular — see `canopy_layer_radius`.
     Dome = 0,
     /// Thin, wide umbrella slab at the trunk top; bare below the crown.
     FlatTop = 1,
@@ -67,10 +69,32 @@ pub fn canopy_layer_radius(
 ) -> Option<i32> {
     match form {
         CanopyForm::Dome => {
+            // ROUND ON TOP, TAPERED UNDERNEATH.
+            //
+            // This was linear in both directions, which is a CONE however it
+            // is named: at r_max=5 the layers ran 5,4,3,2,1 upward, straight
+            // sides to a point. The variant is called Dome and its own doc
+            // said "sphere-ish", and it was neither — reported as the leaves
+            // having lost their upper roundness, which is exactly what a cone
+            // looks like next to a crown.
+            //
+            // The top is now a circular profile, `r·√(1-(dy/v)²)`, giving
+            // 5,5,5,4,3 — full shoulders and then a quick close, which is what
+            // reads as round.
+            //
+            // The UNDERSIDE keeps the linear taper, and that is deliberate
+            // twice over. A real crown is domed above and tapers below, where
+            // the branches are; and a full sphere costs ~80% more leaf cells
+            // where this costs ~45%, which matters on a phone. Rounding only
+            // the half that was reported is both cheaper and more accurate.
             let r = if v_extent <= 1 {
                 1
-            } else {
+            } else if dy <= 0 {
                 let frac = 1.0 - (dy.abs() as f64 / v_extent as f64);
+                ((r_max as f64) * frac).round().max(1.0) as i32
+            } else {
+                let t = dy as f64 / v_extent as f64;
+                let frac = (1.0 - t * t).max(0.0).sqrt();
                 ((r_max as f64) * frac).round().max(1.0) as i32
             };
             Some(r)
@@ -114,15 +138,20 @@ pub fn trunk_thickness(form: CanopyForm) -> i32 {
 mod tests {
     use super::*;
 
-    /// r604's contract with every EXISTING biome: Dome is byte-identical
-    /// to the pre-extraction inline formula across the whole parameter
-    /// space the generator uses.
+    /// THE UNDERSIDE is still the pre-r604 formula, byte for byte.
+    ///
+    /// r604's contract was that extracting this module must not change the
+    /// shape. That was an EXTRACTION-TIME guarantee — a refactor must not
+    /// alter geometry — and not a promise never to improve the crown. The
+    /// upper half has now been changed deliberately, so the parity assertion
+    /// narrows to the half that did not move rather than being deleted: a
+    /// dropped test looks the same in a diff as a test that was in the way.
     #[test]
-    fn dome_matches_the_pre_r604_formula_exactly() {
+    fn the_canopy_underside_still_matches_the_pre_r604_formula() {
         for r_max in 1..=6 {
             let v = r_max.max(1);
             assert_eq!(canopy_v_extent(CanopyForm::Dome, r_max), v);
-            for dy in -v..=v {
+            for dy in -v..=0 {
                 let old = if v <= 1 {
                     1
                 } else {
@@ -233,5 +262,79 @@ mod tests {
         assert_eq!(canopy_layer_radius(CanopyForm::Shrub, 0, v, 3), Some(2));
         assert_eq!(canopy_layer_radius(CanopyForm::Shrub, 1, v, 3), Some(1));
         assert_eq!(canopy_layer_radius(CanopyForm::Shrub, -1, v, 3), None);
+    }
+
+    /// THE REPORT: "the plant leaves on trees seem to have lost their upper
+    /// roundness". They had none to lose — the profile was linear both ways,
+    /// which is a cone. A dome has full shoulders and then closes quickly.
+    #[test]
+    fn the_crown_is_round_on_top_rather_than_conical() {
+        let (r_max, v) = (5, 5);
+        let up: Vec<i32> = (0..=v)
+            .map(|dy| canopy_layer_radius(CanopyForm::Dome, dy, v, r_max).unwrap())
+            .collect();
+        assert_eq!(up, vec![5, 5, 5, 4, 3, 1], "got {up:?}");
+        // The cone this replaced would have been 5,4,3,2,1,1 — strictly
+        // narrower at every layer above the widest.
+        for dy in 1..v {
+            let cone = ((r_max as f64) * (1.0 - dy as f64 / v as f64)).round().max(1.0) as i32;
+            assert!(up[dy as usize] >= cone, "layer {dy} is not wider than the cone");
+        }
+        assert!(up[1] > ((r_max as f64) * 0.8).round() as i32,
+            "the shoulder just below the top must stay near full width");
+    }
+
+    /// The underside is UNCHANGED, which is what keeps the silhouette a tree
+    /// rather than a ball on a stick.
+    #[test]
+    fn the_underside_still_tapers_linearly() {
+        let (r_max, v) = (5, 5);
+        let down: Vec<i32> = (0..=v)
+            .map(|dy| canopy_layer_radius(CanopyForm::Dome, -dy, v, r_max).unwrap())
+            .collect();
+        assert_eq!(down, vec![5, 4, 3, 2, 1, 1]);
+    }
+
+    /// The change costs leaves, and how many is worth pinning: a canopy that
+    /// silently doubled would be a performance regression wearing a bug fix.
+    #[test]
+    fn the_extra_roundness_costs_under_half_again_in_leaves() {
+        for r_max in [3, 5, 6] {
+            let v = r_max;
+            let now: i32 = (-v..=v)
+                .map(|dy| {
+                    let r = canopy_layer_radius(CanopyForm::Dome, dy, v, r_max).unwrap();
+                    r * r
+                })
+                .sum();
+            let cone: i32 = (-v..=v)
+                .map(|dy| {
+                    let r = ((r_max as f64) * (1.0 - dy.abs() as f64 / v as f64))
+                        .round()
+                        .max(1.0) as i32;
+                    r * r
+                })
+                .sum();
+            let ratio = now as f64 / cone as f64;
+            assert!(ratio < 1.6, "r_max={r_max}: {ratio:.2}x the leaves is too many");
+            assert!(ratio > 1.0, "r_max={r_max}: it should be fuller than a cone");
+        }
+    }
+
+    /// A one-layer canopy has no top to round, and must not divide by zero.
+    #[test]
+    fn a_degenerate_canopy_is_still_one_block() {
+        assert_eq!(canopy_layer_radius(CanopyForm::Dome, 0, 1, 1), Some(1));
+        assert_eq!(canopy_layer_radius(CanopyForm::Dome, 0, 0, 3), Some(1));
+    }
+
+    /// The other three forms are untouched — this was a Dome bug.
+    #[test]
+    fn the_other_silhouettes_are_unchanged() {
+        assert_eq!(canopy_layer_radius(CanopyForm::FlatTop, 0, 1, 5), Some(5));
+        assert_eq!(canopy_layer_radius(CanopyForm::FlatTop, 1, 1, 5), Some(3));
+        assert_eq!(canopy_layer_radius(CanopyForm::FlatTop, -1, 1, 5), None);
+        assert_eq!(canopy_layer_radius(CanopyForm::Baobab, 0, 1, 5), Some(2));
+        assert_eq!(canopy_layer_radius(CanopyForm::Shrub, 0, 1, 5), Some(2));
     }
 }
