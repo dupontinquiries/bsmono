@@ -18,6 +18,11 @@ pub mod props;
 pub mod blockers;
 pub mod anim;
 pub mod camps;
+/// Clan border markers: placed, refreshed on patrol, and lasting days rather
+/// than minutes. The half of the scent system wildkit does not cover, because
+/// a trail answers "who walked here" and a marker answers "whose ground is
+/// this".
+pub mod markers;
 pub mod weather;
 pub mod map_events;
 pub mod wild;

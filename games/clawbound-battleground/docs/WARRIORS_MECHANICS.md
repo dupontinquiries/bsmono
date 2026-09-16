@@ -157,7 +157,12 @@ What the passage asks for that is missing:
    would animate a fast exhausted animal as a slow one and make its feet
    skate. Still to do: a **stream tile** that regenerates stamina, which is
    world content rather than animation.
-4. **Scent markers** as their own type, with refresh-on-patrol.
+4. ~~**Scent markers**~~ — done, `src/markers.rs`. Clan-owned, refreshed on
+   patrol, three-day half-life. `owner_at` answers "whose ground is this",
+   which is the question a border actually poses; a tie returns `None` because
+   contested ground is contested and picking a winner makes the border flicker
+   as you walk along it. `stalest` is the patrol's to-do list, and it is what
+   makes a border patrol a task rather than a walk.
 5. ~~**Extract `biome_climate`**~~ — the climate half is in as `sim::climate`.
    What remains is a day/night clock feeding `PerceptParams`, which is new code.
 5. Stalk posture and aimed leap in the rig.
