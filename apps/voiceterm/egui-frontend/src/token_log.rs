@@ -198,6 +198,35 @@ pub struct OpTotals {
     pub input: u64,
     pub output: u64,
     pub cached: u64,
+    /// Input-token distribution: median, p99, max. From the original's
+    /// `OpStats`, which carried min/median/max/p99 for both directions where
+    /// this port carried only the sums.
+    ///
+    /// Totals hide the thing a stats page is opened to find. 400k input tokens
+    /// on one op is a different problem depending on whether it is four
+    /// hundred ordinary calls or one runaway that should never have been sent,
+    /// and a sum cannot tell you which. The median against the max says it at
+    /// a glance.
+    pub median_in: u32,
+    pub p99_in: u32,
+    pub max_in: u32,
+}
+
+/// Percentile of a SORTED slice, nearest-rank. `p=50` is the median.
+///
+/// Ported verbatim from `token_log::pct`. Nearest-rank rather than
+/// interpolating because these are token counts of real calls — a p99 that
+/// reports a number no request ever had is a worse answer than one that names
+/// an actual call you can go and look at.
+///
+/// Empty is 0, not a panic: an op with no events in the window is a normal
+/// thing for a stats page to be asked about.
+pub fn pct(sorted: &[u32], p: u32) -> u32 {
+    if sorted.is_empty() { return 0; }
+    let p = p.min(100);
+    let idx = ((p as f64 / 100.0) * sorted.len() as f64).ceil() as usize;
+    let idx = idx.saturating_sub(1).min(sorted.len() - 1);
+    sorted[idx]
 }
 
 /// Per-op totals within a window, sorted by total tokens descending.
@@ -207,12 +236,24 @@ pub struct OpTotals {
 pub fn totals_by_op(events: &[TokenEvent], w: TimeWindow, now_ms: u64, session_ms: u64)
     -> Vec<(String, OpTotals)> {
     let mut map: std::collections::HashMap<String, OpTotals> = Default::default();
+    let mut ins: std::collections::HashMap<String, Vec<u32>> = Default::default();
     for e in events.iter().filter(|e| w.contains(e.ts_ms, now_ms, session_ms)) {
         let t = map.entry(e.op.clone()).or_default();
         t.calls += 1;
         t.input += e.input_tokens as u64;
         t.output += e.output_tokens as u64;
         t.cached += e.cached_input_tokens as u64;
+        ins.entry(e.op.clone()).or_default().push(e.input_tokens);
+    }
+    // The distribution, once per op. Sorted here rather than kept sorted,
+    // because a stats page builds this once and reads it many times.
+    for (op, t) in map.iter_mut() {
+        if let Some(v) = ins.get_mut(op) {
+            v.sort_unstable();
+            t.median_in = pct(v, 50);
+            t.p99_in = pct(v, 99);
+            t.max_in = *v.last().unwrap_or(&0);
+        }
     }
     let mut v: Vec<(String, OpTotals)> = map.into_iter().collect();
     v.sort_by(|a, b| (b.1.input + b.1.output).cmp(&(a.1.input + a.1.output))
@@ -387,5 +428,55 @@ mod tests {
     fn an_empty_log_produces_empty_views_rather_than_panicking() {
         assert!(totals_by_op(&[], TimeWindow::AllTime, 0, 0).is_empty());
         assert!(top_spikes(&[], TimeWindow::AllTime, 0, 0, 5).is_empty());
+    }
+
+    /// TokenEvent has no `Default` — every field is meaningful and a default
+    /// event would be a call that never happened — so tests build them.
+    fn ev(ts_ms: u64, op: &str, input_tokens: u32) -> TokenEvent {
+        TokenEvent { ts_ms, op: op.into(), model: "m".into(),
+                     input_tokens, output_tokens: 0, cached_input_tokens: 0 }
+    }
+
+    /// THE POINT OF CARRYING A DISTRIBUTION. Two ops with the SAME total tell
+    /// completely different stories, and a sum cannot separate them: one is
+    /// ordinary traffic, the other is a single runaway call.
+    #[test]
+    fn totals_alone_cannot_tell_steady_traffic_from_one_runaway() {
+        let steady: Vec<TokenEvent> = (0..10)
+            .map(|i| ev(1000 + i, "steady", 100))
+            .collect();
+        let mut spiky: Vec<TokenEvent> = (0..9)
+            .map(|i| ev(1000 + i, "spiky", 10))
+            .collect();
+        spiky.push(ev(1100, "spiky", 910));
+        let all: Vec<TokenEvent> = steady.into_iter().chain(spiky).collect();
+        let t = totals_by_op(&all, TimeWindow::AllTime, 2000, 0);
+        let get = |n: &str| t.iter().find(|(o, _)| o == n).unwrap().1.clone();
+        let (s, p) = (get("steady"), get("spiky"));
+        assert_eq!(s.input, p.input, "the sums are identical -- that is the premise");
+        assert_eq!(s.median_in, 100);
+        assert_eq!(p.median_in, 10, "the median separates them");
+        assert_eq!(p.max_in, 910);
+        assert!(p.max_in > p.median_in * 50, "and the ratio is the alarm");
+    }
+
+    /// Nearest-rank, so a p99 always names a call that really happened rather
+    /// than an interpolated number nobody can go and look at.
+    #[test]
+    fn percentiles_use_nearest_rank() {
+        let v = [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        assert_eq!(pct(&v, 50), 5);
+        assert_eq!(pct(&v, 100), 10);
+        assert_eq!(pct(&v, 0), 1);
+        assert!(v.contains(&pct(&v, 99)), "p99 is a real observation");
+    }
+
+    /// An op with no events in the window is normal for a stats page.
+    #[test]
+    fn an_empty_distribution_is_zero_not_a_panic() {
+        assert_eq!(pct(&[], 50), 0);
+        assert_eq!(pct(&[], 99), 0);
+        let t = totals_by_op(&[], TimeWindow::AllTime, 1000, 0);
+        assert!(t.is_empty());
     }
 }
