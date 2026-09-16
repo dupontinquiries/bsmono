@@ -19,6 +19,10 @@ use studio_live::transport::Transport;
 /// content hash existed (collab's Manifest) and the path existed; nothing
 /// joined them, so a moved sample failed as a decode error rather than as
 /// "this file moved".
+/// Dialogue/Music/Effects stems -- the shape a film mix is delivered in, so
+/// the picture can be dubbed by replacing one of the three. `export`'s
+/// per-track stems are the music convention and cannot answer that request.
+pub mod stems_dme;
 pub mod media_map;
 /// What a dropped file should become. The drop handler had one branch --
 /// directory is a kit, everything else is a rack channel -- so a video
