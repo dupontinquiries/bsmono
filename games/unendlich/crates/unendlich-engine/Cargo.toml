@@ -78,6 +78,16 @@ unendlich-ui = { path = "../unendlich-ui", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+[package.metadata.gitmind]
+# Read by gitmind's cockpit (crates/cockpit/src/buildflags.rs) to pre-tick the
+# feature boxes per target; see maintenance/DISTRIBUTION.md.
+#
+# Both arches get the playable set. ai-engine is offered and unticked on both:
+# the aarch64 handsets cannot usefully run the model, and on the desktop it is
+# a choice rather than a default.
+default-features-musl = ["gpu", "render", "window", "audio"]
+default-features-gnu  = ["gpu", "render", "window", "audio"]
+
 [features]
 # The model lives in this process, on the GPU. No server, no subprocess.
 # ai-gpu IMPLIES ai-engine. It did not, and the result was the worst kind
@@ -88,7 +98,17 @@ libc = "0.2"
 ai-gpu = ["ai-engine", "aperture-engine/gpu"]
 # The seam without the engine: /provider engine reports how to enable it.
 ai-engine = ["dep:aperture-engine"]
-default = ["gpu"]
+# DEFAULT: a playable window with sound. `["gpu"]` alone built the engine with
+# no render module, no window and no audio -- correct for a headless CI build
+# and wrong for anyone launching it to play, who then had to know that `render`
+# does not imply `window` and that `audio` exists at all.
+#
+# `ai-engine` is deliberately NOT here. It pulls aperture-engine and a model,
+# which is a heavy dependency and a running cost, and it is the one feature a
+# person should turn on knowingly rather than discover. It stays VISIBLE as a
+# toggle (gitmind lists every declared feature, defaults merely pre-ticked), so
+# off-but-offered rather than hidden.
+default = ["gpu", "render", "window", "audio"]
 gpu = ["ash"]
 # T06-R27 (GLFW_DECOUPLING Approach A): the render module split so it no longer
 # *forces* a window. `render-core` is the whole render module minus the glfw

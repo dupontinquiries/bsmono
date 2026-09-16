@@ -1633,4 +1633,32 @@ mod artifact_name_tests {
         assert!(i > argv.iter().position(|a| a == "-p").unwrap());
     }
 
+
+    /// UNENDLICH'S DEFAULTS, against the real manifest.
+    ///
+    /// The engine shipped `default = ["gpu"]`: no render module, no window, no
+    /// audio. Correct for a headless CI build and wrong for anyone launching
+    /// it to play, who then had to know that `render` does not imply `window`
+    /// and that `audio` exists at all.
+    ///
+    /// `ai-engine` is deliberately NOT a default -- it pulls aperture-engine
+    /// and a model -- but it must stay VISIBLE, because a feature that is
+    /// neither on nor offered is one nobody finds. `all` is every feature
+    /// except `default`, so it is listed and merely unticked.
+    #[test]
+    fn unendlich_defaults_to_a_playable_window_with_ai_offered_but_off() {
+        let toml = include_str!(
+            "../../../../../games/unendlich/crates/unendlich-engine/Cargo.toml");
+        for triple in BUILD_TARGETS {
+            let d = arch_default_features(toml, triple);
+            for want in ["gpu", "render", "window", "audio"] {
+                assert!(d.iter().any(|f| f == want), "{triple} is missing {want}: {d:?}");
+            }
+            assert!(!d.iter().any(|f| f == "ai-engine"),
+                    "{triple} enables the model by default: {d:?}");
+        }
+        let f = scan_cargo_features(toml);
+        assert!(f.all.iter().any(|x| x == "ai-engine"),
+                "ai-engine must stay offered as a toggle, not hidden");
+    }
 }

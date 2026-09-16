@@ -66,6 +66,10 @@
 //!
 //! Still behind: **perception field**, which reaches a GPU benchmark.
 
+/// The engine paths the extracted `sim/` files reach through inline. See
+/// `util/mod.rs` — two lines were missed at extraction because the scan looked
+/// for `use crate::` and these are inline paths.
+pub mod util;
 pub mod sim;
 
 pub use sim::{
