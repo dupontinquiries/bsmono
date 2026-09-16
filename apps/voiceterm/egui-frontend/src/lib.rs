@@ -98,6 +98,21 @@ pub mod speaker_claim;
 /// acoustic-wins security rule at the one point that matters: where a claim
 /// becomes an action.
 pub mod speaker_claim_view;
+
+/// Cleave dead air out of a voice capture -- silence detection and a
+/// variable-speed compression plan, ported verbatim from the reVos/kss
+/// lineage. Zero deps; nothing in this frontend trims a recording today.
+#[path = "../../src/dead_air.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod dead_air;
+
+/// "Insert that last IP address" -- scanning terminal output for IPs, MACs,
+/// hex hashes, PIDs, ports and paths, and parsing the spoken request for one.
+/// Zero deps; the dev-loop TODO this exists for
+/// (TODO_recent_fact_lookup.md) has no surface here yet.
+#[path = "../../src/fact_extract.rs"]
+#[allow(dead_code, unused_imports)]
+pub mod fact_extract;
 pub mod speaker_list;
 /// A keyboard in use holds the microphone off for five seconds. See the
 /// module header for why the command vocabulary being live while someone
