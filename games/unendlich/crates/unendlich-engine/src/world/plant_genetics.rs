@@ -59,14 +59,87 @@ pub const RESONANCE_RATE_BOOST: f32 = 2.0;
 /// …and height gains up to this many extra blocks (capped at [`HARD_MAX_HEIGHT`]).
 pub const RESONANCE_HEIGHT_BONUS: u8 = 8;
 
+/// The visible colour family of foliage.
+///
+/// Recovered with `pigment` from the orphaned `sim::flora_genetics`. Declaration
+/// order was its dominance ladder; here it is the order of the unit interval,
+/// which is what quantising a continuous gene gives. Green is widest because a
+/// forest that is mostly not green is a different game.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Hue {
+    Green,
+    Gold,
+    Crimson,
+    Violet,
+    Pale,
+}
+
+impl Hue {
+    pub const ALL: [Hue; 5] = [Hue::Green, Hue::Gold, Hue::Crimson, Hue::Violet, Hue::Pale];
+
+    /// Quantise an expressed gene value into a colour family.
+    ///
+    /// GREEN TAKES HALF THE RANGE and the other four split the rest. An even
+    /// split would make one wild plant in five violet, which is not a forest,
+    /// it is a fruit bowl. The rarities are the point of the trait: a crimson
+    /// stand should be worth walking to.
+    pub fn from_unit(v: f32) -> Hue {
+        match v.clamp(0.0, 1.0) {
+            x if x < 0.50 => Hue::Green,
+            x if x < 0.70 => Hue::Gold,
+            x if x < 0.85 => Hue::Crimson,
+            x if x < 0.95 => Hue::Violet,
+            _ => Hue::Pale,
+        }
+    }
+}
+
+/// How well a creature's colouring hides it against local foliage.
+///
+/// Ported from the orphan, and the reason the colour traits were worth
+/// recovering at all: they connect plants to the creatures in them. Matching
+/// hue and shade in DENSE foliage is near-total concealment; a mismatch, or
+/// sparse cover, offers little.
+///
+/// Density multiplies rather than adds, which is the load-bearing part: a
+/// perfectly-matched creature standing in the open is still standing in the
+/// open. Adding would let colour alone hide something on bare ground.
+pub fn crypsis(creature: (Hue, f32), foliage: (Hue, f32), foliage_density: f32) -> f32 {
+    let (ch, cs) = creature;
+    let (fh, fs) = foliage;
+    let shade_match = 1.0 - (cs - fs).abs().clamp(0.0, 1.0);
+    // A mismatch is 0.4 rather than 0: a brown creature in green leaves is
+    // still harder to see than one on stone, because a broken outline does
+    // most of the work.
+    let hue_match = if ch == fh { 1.0 } else { 0.4 };
+    (0.5 * shade_match + 0.5 * hue_match) * foliage_density.clamp(0.0, 1.0)
+}
+
+/// How much a dark plant benefits from its pigment, given how cold it is.
+///
+/// `cold01` is 0 at the heat end and 1 at the cold end. Dark foliage absorbs
+/// more sun, so it is an advantage in the cold and a LIABILITY in heat — the
+/// sign flips, which is what makes pigment a cline across latitude rather than
+/// a strictly better trait with a colour attached.
+pub fn pigment_thermal_bonus(pigment: f32, cold01: f32) -> f32 {
+    let p = pigment.clamp(0.0, 1.0);
+    let c = cold01.clamp(0.0, 1.0);
+    // -1..1 scaled by how dark it is: pale plants care about neither end.
+    (c * 2.0 - 1.0) * p
+}
+
 /// Trait order — the index each gene occupies for `activator_for`. Stable.
-pub const PLANT_TRAITS: [&str; 6] = [
+pub const PLANT_TRAITS: [&str; 8] = [
     "max_height", "growth_rate", "drought_tolerance", "branchiness", "resonance_gain",
     // APPENDED, never inserted. The index IS the identity here -- `activator_for`
     // keys epigenetic switches off it, and popgen indexes `genes()` directly --
     // so putting a new trait anywhere but the end would silently re-point every
     // existing plant's switches at a different gene.
     "fire_resistance",
+    // Appended for the same reason, and in this order: pigment then hue, so a
+    // species that only wants shade can stop reading at index 6.
+    "pigment",
+    "hue",
 ];
 
 #[inline]
@@ -128,6 +201,21 @@ pub struct PlantGenome {
     /// burns uniformly has no survivors to reseed from and no reason for one
     /// stand to differ from the next.
     pub fire_resistance: Gene,
+    /// Leaf/bark darkness, 0 pale to 1 dark.
+    ///
+    /// Not cosmetic. Dark foliage absorbs more sun, so it runs hotter: an
+    /// advantage in the cold and a liability in heat, which makes the same
+    /// species' colour a real cline across latitude rather than a skin.
+    pub pigment: Gene,
+    /// Colour family, quantised from a continuous gene into [`Hue`].
+    ///
+    /// Categorical traits usually want their own allele type, and the orphan
+    /// gave them one. Quantising a normal `Gene` instead is the price of
+    /// keeping ONE Mendelian machine — which this module's header is explicit
+    /// about, and which is worth more than an exact dominance ladder for a
+    /// colour. The cost is that hue blends where the orphan had strict
+    /// dominance; see [`Hue::from_unit`].
+    pub hue: Gene,
 }
 
 impl PlantGenome {
@@ -140,11 +228,13 @@ impl PlantGenome {
             branchiness: roll_gene(seed ^ 0x04),
             resonance_gain: roll_gene(seed ^ 0x05),
             fire_resistance: roll_gene(seed ^ 0x06),
+            pigment: roll_gene(seed ^ 0x07),
+            hue: roll_gene(seed ^ 0x08),
         }
     }
 
     /// The genes in [`PLANT_TRAITS`] order (so the index matches `activator_for`).
-    pub fn genes(&self) -> [Gene; 6] {
+    pub fn genes(&self) -> [Gene; 8] {
         [
             self.max_height,
             self.growth_rate,
@@ -152,6 +242,8 @@ impl PlantGenome {
             self.branchiness,
             self.resonance_gain,
             self.fire_resistance,
+            self.pigment,
+            self.hue,
         ]
     }
 
@@ -167,6 +259,8 @@ impl PlantGenome {
             branchiness: p(3),
             resonance_gain: p(4),
             fire_resistance: p(5),
+            pigment: p(6),
+            hue: Hue::from_unit(p(7)),
         }
     }
 
@@ -182,6 +276,8 @@ impl PlantGenome {
             branchiness: cross(&self.branchiness, &other.branchiness, s(0x04)),
             resonance_gain: cross(&self.resonance_gain, &other.resonance_gain, s(0x05)),
             fire_resistance: cross(&self.fire_resistance, &other.fire_resistance, s(0x06)),
+            pigment: cross(&self.pigment, &other.pigment, s(0x07)),
+            hue: cross(&self.hue, &other.hue, s(0x08)),
         }
     }
 }
@@ -201,6 +297,10 @@ pub struct PlantPhenotype {
     pub resonance_gain: f32,
     /// Fire survival, `0..=1`. 0 burns like tinder, 1 is fire-hardened bark.
     pub fire_resistance: f32,
+    /// Darkness, `0..=1`. Drives sun absorption and therefore leaf temperature.
+    pub pigment: f32,
+    /// Visible colour family.
+    pub hue: Hue,
 }
 
 /// What a plant does this tick under a local grower-resonance level.
@@ -239,6 +339,8 @@ mod tests {
             branchiness: g,
             resonance_gain: g,
             fire_resistance: g,
+            pigment: g,
+            hue: g,
         }
     }
 
@@ -360,6 +462,8 @@ mod tests {
             branchiness: g,
             resonance_gain: g,
             fire_resistance: g,
+            pigment: g,
+            hue: g,
         };
         let off = genome.express(5, 0b0000_0000).growth_rate;
         let on = genome.express(5, 0b0000_0001).growth_rate;
@@ -408,5 +512,75 @@ mod tests {
         let hi = vals.iter().cloned().fold(f32::MIN, f32::max);
         assert!(hi - lo > 0.3, "wild stands barely vary: {lo}..{hi}");
         assert!(vals.iter().all(|v| (0.0..=1.0).contains(v)));
+    }
+
+    /// GREEN TAKES HALF THE RANGE. An even split would make one wild plant in
+    /// five violet, which is a fruit bowl and not a forest.
+    #[test]
+    fn most_wild_foliage_is_green_and_pale_is_rare() {
+        let mut counts = std::collections::BTreeMap::new();
+        for seed in 1..600u64 {
+            let h = PlantGenome::from_seed(seed).express(seed, 0).hue;
+            *counts.entry(h).or_insert(0usize) += 1;
+        }
+        let green = counts.get(&Hue::Green).copied().unwrap_or(0);
+        let pale = counts.get(&Hue::Pale).copied().unwrap_or(0);
+        assert!(green > 599 / 3, "a forest should be mostly green, got {green}/599");
+        assert!(pale < green, "pale must be the rare one: {pale} vs {green}");
+    }
+
+    /// DENSITY MULTIPLIES. A perfectly-matched creature standing in the open
+    /// is still standing in the open -- adding would let colour alone hide
+    /// something on bare ground.
+    #[test]
+    fn colour_cannot_hide_a_creature_with_no_cover() {
+        let matched = (Hue::Green, 0.5);
+        assert_eq!(crypsis(matched, matched, 0.0), 0.0);
+        assert!(crypsis(matched, matched, 1.0) > 0.99, "and hides it completely in cover");
+    }
+
+    /// A mismatch is worse but not useless: a broken outline does most of the
+    /// work, so a brown creature in green leaves still beats bare stone.
+    #[test]
+    fn a_colour_mismatch_still_beats_no_cover_at_all() {
+        let dense = 1.0;
+        let matched = crypsis((Hue::Green, 0.5), (Hue::Green, 0.5), dense);
+        let mismatched = crypsis((Hue::Crimson, 0.5), (Hue::Green, 0.5), dense);
+        assert!(mismatched < matched);
+        assert!(mismatched > 0.5, "still substantial: {mismatched}");
+        // Shade matters independently of hue.
+        let wrong_shade = crypsis((Hue::Green, 0.0), (Hue::Green, 1.0), dense);
+        assert!(wrong_shade < matched);
+    }
+
+    /// THE SIGN FLIPS. Dark foliage is an advantage in the cold and a
+    /// liability in heat -- which is what makes pigment a cline across
+    /// latitude rather than a strictly better trait wearing a colour.
+    #[test]
+    fn dark_foliage_helps_in_the_cold_and_hurts_in_the_heat() {
+        assert!(pigment_thermal_bonus(1.0, 1.0) > 0.9, "dark plant, cold place");
+        assert!(pigment_thermal_bonus(1.0, 0.0) < -0.9, "dark plant, hot place");
+        // A pale plant is indifferent at both ends.
+        assert!(pigment_thermal_bonus(0.0, 1.0).abs() < 1e-6);
+        assert!(pigment_thermal_bonus(0.0, 0.0).abs() < 1e-6);
+    }
+
+    /// Colour is heritable through the same machine as everything else, which
+    /// is the whole reason it came here instead of the orphan being revived.
+    #[test]
+    fn pigment_is_inherited_like_any_other_trait() {
+        let dark = Gene::new(Allele::new(1.0, 0.5, 0), Allele::new(1.0, 0.5, 0));
+        let mut a = uniform(0.5); a.pigment = dark;
+        assert!(a.breed(&a, 3).express(1, 0).pigment > 0.9);
+    }
+
+    /// Eight traits, eight genes, and the earlier indices unmoved.
+    #[test]
+    fn the_trait_table_and_the_gene_array_stay_in_step() {
+        assert_eq!(PLANT_TRAITS.len(), 8);
+        assert_eq!(PLANT_TRAITS.len(), PlantGenome::from_seed(1).genes().len());
+        assert_eq!(PLANT_TRAITS[5], "fire_resistance");
+        assert_eq!(PLANT_TRAITS[6], "pigment");
+        assert_eq!(PLANT_TRAITS[7], "hue");
     }
 }
