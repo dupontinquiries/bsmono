@@ -20,6 +20,34 @@ pub mod decode;
 pub mod transcode;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+// ── PARITY STATUS, measured 2026-09-16 against fao_app/src/main.rs ──────────
+//
+// Tester report: "very little of the gtk viewer visually ... I can't use the
+// encode page or web view load libraries etc. I can only do a test frame that
+// doesn't even have feedback."
+//
+// Measured rather than guessed. fao_app is 12,957 lines in one file; this
+// frontend is ~2,700 across eleven modules. The gap is NOT that the ported
+// modules are thin -- `library.rs` calls the same `Library::init/open`,
+// `stats`, `prune_unused`, `rollback_manifest` backend the GTK handlers do,
+// and records its one divergence (folder chooser becomes a path field). What
+// is missing is WHOLE SURFACES:
+//
+//   * The GTK "Encode" page -- encoding a real file end to end. `lab.rs` runs
+//     the real encoder but only over `Source::pattern`, a synthetic test
+//     image, which is exactly the "test frame" in the report. `Source::load`
+//     for PNG/JPEG is written and works; what has no counterpart is encoding
+//     VIDEO, which is what the Encode page is for.
+//   * Any web view. `grep -ric webview` across this frontend returns 0 in
+//     every module. The GTK app's web surface has no port at all, not a thin
+//     one.
+//   * "Open Archive" / "Export" -- present in the GTK label set, absent here.
+//
+// So the honest framing for whoever picks this up: the five tabs below are
+// reachable and their backends are real, and the app is still not usable for
+// the task a tester sits down to do, because the task lives on a page that was
+// never ported. Adding feedback to the Encode Lab would not fix the report;
+// the Encode page would.
 pub enum Tab {
     Lab,
     SeqLab,
