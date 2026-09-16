@@ -890,7 +890,19 @@ impl<'w, W: VoxelWorld> VoxelTools<'w, W> {
             for dy in -span..=r {
                 let ry = if conical {
                     ((r as f32) * (1.0 - (dy + span) as f32 / (span + r + 1) as f32) * 1.6).round() as i32
-                } else { r - dy.abs() / 2 };
+                } else {
+                    // ROUND, as the comment above has always claimed. This was
+                    // `r - dy.abs() / 2`: an integer-divided linear taper that
+                    // never closes. At r=7 the top layer was still 4 wide and
+                    // then simply stopped, so an "oak" ended in a flat cut disc
+                    // — which is the reported loss of upper roundness.
+                    //
+                    // A circular profile costs nothing: at r=5 it is 175 leaf
+                    // cells against the old 175, because the shoulders gain
+                    // roughly what the flat cap gives back.
+                    let t = dy as f32 / r as f32;
+                    ((r as f32) * (1.0 - t * t).max(0.0).sqrt()).round() as i32
+                };
                 if ry <= 0 { continue; }
                 for dz in -ry..=ry { for dx in -ry..=ry {
                     if dx * dx + dz * dz > ry * ry + 1 { continue; }
@@ -1738,4 +1750,64 @@ mod derived_tests {
         }
         assert_eq!(schema.matches("\"type\":\"function\"").count(), tool_names().len());
     }
+
+#[cfg(test)]
+mod canopy_shape_tests {
+    /// The non-conical (oak) profile, as `place_tree_genome` computes it.
+    fn oak_radius(r: i32, dy: i32) -> i32 {
+        let t = dy as f32 / r as f32;
+        ((r as f32) * (1.0 - t * t).max(0.0).sqrt()).round() as i32
+    }
+
+    /// THE REPORT. The old profile was `r - dy.abs() / 2`, which at r=7 left
+    /// the top layer 4 blocks wide and then stopped -- an oak ending in a flat
+    /// cut disc. A round crown closes.
+    #[test]
+    fn the_oak_crown_closes_instead_of_ending_in_a_flat_disc() {
+        for r in [3, 5, 7] {
+            let old_top = r - r.abs() / 2;
+            assert!(old_top >= 2, "the premise: the old top was {old_top} wide at r={r}");
+            assert_eq!(oak_radius(r, r), 0, "r={r}: the crown must close");
+        }
+    }
+
+    /// Full shoulders through the middle -- roundness is not just a pointed
+    /// top, it is width where a cone would already have narrowed.
+    #[test]
+    fn the_shoulders_stay_wide_before_the_crown_turns_over() {
+        let r = 7;
+        assert_eq!(oak_radius(r, 0), r);
+        assert!(oak_radius(r, 2) >= r - 1, "still near full two layers up");
+        assert!(oak_radius(r, r - 1) < oak_radius(r, 2), "and then it turns over");
+    }
+
+    /// Symmetric: an oak is a ball, not a dome on a plate.
+    #[test]
+    fn the_oak_profile_is_symmetric() {
+        for r in [3, 5, 7] {
+            for dy in 0..=r {
+                assert_eq!(oak_radius(r, dy), oak_radius(r, -dy), "r={r} dy={dy}");
+            }
+        }
+    }
+
+    /// The change must not inflate the canopy: leaf cells drive chunk memory
+    /// and meshing, and a silent doubling would be a performance regression
+    /// wearing a bug fix.
+    #[test]
+    fn roundness_costs_no_more_leaves_than_the_flat_top_did() {
+        for r in [3, 5, 7] {
+            let now: i32 = (-r..=r).map(|dy| oak_radius(r, dy).max(0).pow(2)).sum();
+            let old: i32 = (-r..=r).map(|dy| (r - dy.abs() / 2).max(0).pow(2)).sum();
+            let ratio = now as f32 / old as f32;
+            assert!(ratio < 1.1, "r={r}: {ratio:.2}x the leaves");
+        }
+    }
+
+    /// A one-block canopy still places something rather than vanishing.
+    #[test]
+    fn a_minimal_canopy_is_not_empty() {
+        assert_eq!(oak_radius(1, 0), 1);
+    }
+}
 }
