@@ -746,4 +746,61 @@ mod tests {
             assert!((a - b).abs() < 1e-6, "zero fundamental → identity");
         }
     }
+
+    // ── the phase claim in this file's header, as arithmetic ─────────────
+    //
+    // The header justifies this whole module with "the network_sim fuzz
+    // harness reveals that with realistic latency + jitter the alignment is
+    // usually off, and an off-phase anti-noise signal ADDS to the noise".
+    // network_sim has 25 tests and NO CALLER -- it is a harness nothing runs,
+    // so a safety-relevant claim in live code rests on an observation that is
+    // not re-checked.
+    //
+    // The claim does not need the harness. Summing a tone with an inverted
+    // copy offset by phi leaves a residual of |2 sin(phi/2)| relative to the
+    // original, which is arithmetic, and these pin it.
+
+    /// Residual amplitude relative to doing nothing, for a phase error.
+    fn residual(phase_deg: f32) -> f32 {
+        (2.0 * (phase_deg.to_radians() / 2.0).sin()).abs()
+    }
+
+    /// THE HARD BOUNDARY: past 60 degrees the canceller makes it WORSE than
+    /// silence. That is not a tuning preference, it is where the sum of a tone
+    /// and its offset inverse exceeds the tone.
+    #[test]
+    fn anti_noise_past_sixty_degrees_is_worse_than_doing_nothing() {
+        assert!(residual(0.0) < 0.01, "perfect alignment cancels");
+        assert!(residual(20.0) < 0.4, "the quiet-room tolerance still helps a lot");
+        assert!((residual(60.0) - 1.0).abs() < 0.01, "60 degrees is exactly break-even");
+        for deg in [90.0f32, 120.0, 180.0] {
+            assert!(residual(deg) > 1.0, "{deg} degrees should be worse, got {}", residual(deg));
+        }
+        assert!((residual(180.0) - 2.0).abs() < 0.01, "in antiphase it doubles the noise");
+    }
+
+    /// The header's two tolerance figures are the same number read two ways:
+    /// 20 degrees is where the residual is still clearly quieter, and 60 is
+    /// break-even -- which is why masking music is what buys the wider window.
+    /// Without the music, running out to 60 buys nothing at all.
+    #[test]
+    fn the_sixty_degree_window_only_makes_sense_with_a_masker() {
+        assert!(residual(60.0) >= 1.0,
+                "at the edge of the wide window the canceller is not helping; \
+                 the music is doing the work");
+        assert!(residual(20.0) < residual(60.0) / 2.0,
+                "which is why the silent-room window has to be much tighter");
+    }
+
+    /// Jitter randomises phase rather than biasing it, so the honest figure is
+    /// the EXPECTED residual over uniform error — and it is above 1.0, i.e. an
+    /// uncorrected canceller on a jittery link is worse than off on average.
+    #[test]
+    fn uniformly_random_phase_is_worse_than_off_on_average() {
+        let n = 3600;
+        let mean: f32 = (0..n).map(|i| residual(i as f32 * 360.0 / n as f32)).sum::<f32>()
+            / n as f32;
+        assert!(mean > 1.0, "expected residual under random phase is {mean}, \
+                             which should exceed 1.0 or the header's warning is wrong");
+    }
 }
