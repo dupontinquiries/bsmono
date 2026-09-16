@@ -206,3 +206,57 @@ SPACESHIPS = [
 
 ALL = CARS + HOVERERS + FLYERS + SPACESHIPS
 BY_CLASS = {"car": CARS, "hoverer": HOVERERS, "flyer": FLYERS, "spaceship": SPACESHIPS}
+
+
+# ───────────────────────────────────────────── the default, written by hand
+#
+# Every other entry in this file varies one axis of a spectrum. This one does
+# not: it is the car the game opens on, so it has a different job — be legible
+# in three seconds, be forgiving to drive, and look deliberate enough that a
+# new player does not think they are looking at placeholder art.
+#
+# Design decisions, each of which is a departure from the spectrum cars:
+#
+#  * MID-SET HITBOX. Not the sponge of ANVIL nor the blade of LANCE. l/w ~1.9
+#    and a roofline that is neither a shelf nor a wedge, because the default
+#    should not teach a habit the player has to unlearn when they switch.
+#  * A WAIST. The hull pinches behind the front axle and flares again over the
+#    rear. Every other car here is monotonic nose-to-tail, which is why they
+#    read as loaves; a waist is the cheapest line that says "designed".
+#  * TWO-STAGE ROOF. A low cowl, then a distinct cabin step. The one silhouette
+#    cue that survives at 30 metres on a phone screen.
+#  * REAR HAUNCH WIDER THAN THE FRONT. Reads as drive-at-the-back without
+#    needing a single texture.
+#  * NINE HULL SECTIONS instead of four. The Catmull-Rom resample makes
+#    character lines from control points, so more points is more line, and
+#    this is the one model where that cost is worth paying.
+
+MOIRE = Spec(
+    name="MOIRE", cls="car",
+    role="The default. Mid-set hitbox, forgiving roof, and enough shape to "
+         "read at a glance — it teaches nothing you have to unlearn when you "
+         "switch to a specialist.",
+    hull=[
+        (-2.05, 0.44, 0.10, 0.34, 0.30),   # nose, low and narrow
+        (-1.55, 0.72, 0.07, 0.46, 0.34),   # front axle line
+        (-1.05, 0.88, 0.05, 0.52, 0.32),   # shoulder
+        (-0.55, 0.80, 0.05, 0.60, 0.30),   # WAIST — pinched, then flares
+        (-0.05, 0.86, 0.05, 0.74, 0.32),   # cabin front
+        ( 0.50, 0.92, 0.05, 0.78, 0.32),   # cabin rear
+        ( 1.05, 0.99, 0.06, 0.70, 0.30),   # REAR HAUNCH, widest point
+        ( 1.60, 0.86, 0.09, 0.60, 0.32),
+        # Tail cut SHORT and kept deep. The first version tapered to
+        # (0.58 wide, 0.29 deep) and read as a blade under flat shading — a
+        # thin flat surface at a shallow angle catches light like a wing. A
+        # tail wants to end, not thin out.
+        ( 1.92, 0.76, 0.10, 0.58, 0.30),
+    ],
+    ring=20,
+    wheels=[(-0.86, 0.31, -1.42, 0.31), (0.86, 0.31, -1.42, 0.31),
+            (-0.96, 0.34,  1.30, 0.34), (0.96, 0.34,  1.30, 0.34)],
+    pods=[(0.0, 0.80, -0.62, 0.10)],       # a sensor blister on the cowl
+)
+
+CARS.append(MOIRE)
+ALL.append(MOIRE)
+BY_CLASS["car"].append(MOIRE)
