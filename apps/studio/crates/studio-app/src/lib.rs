@@ -25,6 +25,10 @@ use studio_live::transport::Transport;
 /// Which of eight vocal takes is usable. `takes.rs` puts them on lanes and
 /// `comp_ops` copies chosen spans; neither helps you choose, and soloing each
 /// in turn is most of what comping costs.
+/// The part of an Ozone-style display that is not drawing: meter ballistics,
+/// a log frequency axis, and a rolling trace. The analysis existed; nothing
+/// turned it into something an eye can read.
+pub mod meter;
 pub mod take_report;
 pub mod stems_dme;
 pub mod media_map;
