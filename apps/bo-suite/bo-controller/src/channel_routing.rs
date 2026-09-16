@@ -12,6 +12,35 @@
 // 0.6 × drums, sent to the device with the soundbar; "ambient" =
 // piano + synth, sent to the bookshelf pair.
 //
+// ── STATUS, audited: this module has NO CALLERS ──────────────────────────
+//
+// 37 tests, 1,316 lines, and nothing in the crate references it. The
+// `#![allow(dead_code)]` above is the marker someone left when they noticed.
+// Two things a reader needs before wiring it, because the obvious move is
+// wrong:
+//
+// 1. IT IS NOT A SUPERSET OF `stem_stage`, which IS live (main.rs calls
+//    `stem_stage::stage`). Both define a `StemPlacement` and the two have
+//    DIVERGED into different designs, not two copies of one:
+//
+//        stem_stage:       pan, haas_ms, early_ms, early_gain, gain
+//        channel_routing:  stem, gain, pan
+//
+//    The live one is a spatialiser with Haas delay and early reflections —
+//    the part that makes four mono stems sound like a stage. This one has
+//    neither. Swapping `StereoStemChannel` in for `stem_stage::stage` would
+//    add routing and silently lose the staging, and the loss would be heard
+//    as "the separation sounds flat now" rather than traced to a type.
+//
+// 2. WHAT IS ACTUALLY UNIQUE HERE is `VirtualChannel` — a NAMED channel that
+//    is a weighted mix of stems ("front" = voice + 0.6 × drums) bound to a
+//    device URL. That is the multi-room feature the header describes and
+//    nothing else in the crate does it. It is worth wiring; the stereo
+//    staging alongside it is not, and should defer to `stem_stage`.
+//
+// Same-name-different-type across two modules in one crate is the hazard to
+// fix first, whichever way the wiring goes.
+//
 // Why a separate module: separation produces stems with fixed names
 // (drums/voice/piano/synth); routing decides what to DO with them
 // per-device. Same separation, different routing per setup → a
