@@ -151,8 +151,12 @@ What the passage asks for that is missing:
 
 1. ~~**Cover on blockers**~~ — done, `Footprint::cover`.
 2. ~~**Extract `stamina`**~~ — done, in wildkit.
-3. **Wire stamina**: a stream tile that regenerates it, and `gait_for` reading
-   the multiplier so an exhausted cat drops out of a bound.
+3. ~~**Wire stamina to the gait**~~ — done, `Build::gait_for_spent`. An
+   exhausted cat drops out of a bound into a trot. Note the rule it settled:
+   stamina caps the gait CEILING, it does not scale `speed`. Scaling speed
+   would animate a fast exhausted animal as a slow one and make its feet
+   skate. Still to do: a **stream tile** that regenerates stamina, which is
+   world content rather than animation.
 4. **Scent markers** as their own type, with refresh-on-patrol.
 5. ~~**Extract `biome_climate`**~~ — the climate half is in as `sim::climate`.
    What remains is a day/night clock feeding `PerceptParams`, which is new code.

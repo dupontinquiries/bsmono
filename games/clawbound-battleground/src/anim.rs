@@ -158,6 +158,41 @@ impl Build {
         }
     }
 
+    /// The gait, capped by what the animal can still sustain.
+    ///
+    /// Step 3 of `docs/WARRIORS_MECHANICS.md`. `wildkit::sim::stamina` came
+    /// across with the right shape already -- `can_sprint()` tests against
+    /// `SPRINT_FLOOR` rather than against zero, which IS the panting halt:
+    /// once spent you cannot sprint again until recovered past the floor, so a
+    /// chase costs something that outlives the chase.
+    ///
+    /// ## Stamina caps the GAIT, it does not slow the animal
+    ///
+    /// The tempting wiring is to scale `speed` by the stamina multiplier and
+    /// feed that to `gait_for`. That is wrong twice over. It makes an
+    /// exhausted animal animate as though it were moving slowly while it is
+    /// still covering ground, so the feet skate; and it silently changes what
+    /// the caller asked for, since `speed` is a measurement of the world and
+    /// not a request.
+    ///
+    /// An exhausted animal moving fast is still moving fast. What it cannot do
+    /// is SUSTAIN a suspension phase, so it drops to the next gait down and
+    /// takes more steps to cover the same ground. That is what a spent horse
+    /// or a spent cat actually looks like.
+    pub fn gait_for_spent(&self, speed: f32, stamina: &wildkit::sim::stamina::Stamina) -> Gait {
+        let want = self.gait_for(speed);
+        if stamina.can_sprint() {
+            return want;
+        }
+        // Below the floor, the suspension gaits are off the table. Walk and
+        // Trot are not: an exhausted animal still walks, and refusing to let
+        // it would leave it frozen mid-field.
+        match want {
+            Gait::Bound | Gait::Canter => Gait::Trot,
+            other => other,
+        }
+    }
+
     /// Stride frequency (cycles/sec).
     ///
     /// Derived from stride LENGTH, not picked per gait, so the feet keep up
@@ -420,5 +455,82 @@ mod tests {
             assert!(a.gait_phase.is_finite());
             assert!((0.0..std::f32::consts::TAU).contains(&a.gait_phase));
         }
+    }
+
+    // ── stamina caps the gait ────────────────────────────────────────────
+
+    use wildkit::sim::stamina::{Stamina, SPRINT_FLOOR};
+
+    /// A rested animal is unaffected -- stamina must not change anything until
+    /// it runs out, or every gait threshold shifts under a feature that was
+    /// supposed to add one state.
+    #[test]
+    fn a_rested_animal_gaits_exactly_as_before() {
+        let b = Build::hare();
+        let full = Stamina::full();
+        for speed in [0.0f32, 0.5, 1.4, 2.9, 5.0, 20.0] {
+            assert_eq!(b.gait_for_spent(speed, &full), b.gait_for(speed),
+                "speed {speed} changed for a rested animal");
+        }
+    }
+
+    /// THE PANTING HALT. Spent, the suspension gaits are off the table and the
+    /// animal drops to a trot -- still moving, and still moving fast.
+    #[test]
+    fn a_spent_animal_drops_out_of_a_bound() {
+        let b = Build::hare();
+        let spent = Stamina::new(SPRINT_FLOOR * 0.5);
+        assert!(!spent.can_sprint());
+        let fast = b.trot_to + 5.0;
+        assert_eq!(b.gait_for(fast), Gait::Bound, "the premise: rested, it bounds");
+        assert_eq!(b.gait_for_spent(fast, &spent), Gait::Trot);
+    }
+
+    /// Canter is a suspension gait too, and drops the same way.
+    #[test]
+    fn a_spent_animal_drops_out_of_a_canter() {
+        let b = Build::stag();
+        let spent = Stamina::new(0.0);
+        let fast = b.trot_to + 1.0;
+        assert_eq!(b.gait_for(fast), Gait::Canter);
+        assert_eq!(b.gait_for_spent(fast, &spent), Gait::Trot);
+    }
+
+    /// An exhausted animal still WALKS. Refusing the low gaits would leave it
+    /// frozen mid-field, which is worse than tired.
+    #[test]
+    fn exhaustion_never_takes_away_walking() {
+        let b = Build::megafauna();
+        let spent = Stamina::new(0.0);
+        for speed in [0.1f32, 1.0, b.walk_to] {
+            let g = b.gait_for_spent(speed, &spent);
+            assert!(matches!(g, Gait::Walk | Gait::Pace), "speed {speed} gave {g:?}");
+        }
+        assert_eq!(b.gait_for_spent(b.trot_to - 0.1, &spent), Gait::Trot,
+            "and still trots");
+    }
+
+    /// A colossus never bounds anyway, so exhaustion changes nothing for it --
+    /// the cap must not invent a gait change where there was no suspension to
+    /// lose.
+    #[test]
+    fn a_build_that_never_bounds_is_unaffected_by_exhaustion() {
+        let b = Build::colossus();
+        let spent = Stamina::new(0.0);
+        for speed in [0.5f32, 3.0, 50.0] {
+            assert_eq!(b.gait_for_spent(speed, &spent), b.gait_for(speed));
+        }
+    }
+
+    /// Recovery past the floor restores the top gait -- the other half of the
+    /// panting halt, and the reason the floor is a floor rather than zero.
+    #[test]
+    fn recovering_past_the_floor_restores_the_bound() {
+        let b = Build::hare();
+        let fast = b.trot_to + 5.0;
+        let just_under = Stamina::new(SPRINT_FLOOR - 0.01);
+        let just_over = Stamina::new(SPRINT_FLOOR + 0.01);
+        assert_eq!(b.gait_for_spent(fast, &just_under), Gait::Trot);
+        assert_eq!(b.gait_for_spent(fast, &just_over), Gait::Bound);
     }
 }

@@ -25,6 +25,10 @@ glam = "0.27"
 # which gait, how hard — because a bison that never bounds is a fact about
 # animals, not about posing boxes.
 creature-rig = { path = "../shared/creature-rig" }
+# Sensing and terrain extracted from unendlich: scent, perception, wind, fog,
+# path cost, river flow -- and `stamina`, which is what the gait selector needs
+# to know a cat is spent. See games/shared/wildkit.
+wildkit = { path = "../shared/wildkit" }
 bytemuck = { version = "1.15", features = ["derive"] }
 pollster = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
