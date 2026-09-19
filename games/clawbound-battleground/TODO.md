@@ -57,6 +57,17 @@ the single highest-value thing anyone can do with this repo next.
 
 ## Known gaps
 
+- **A rolling log has not been seen.** The seated log is rendered and spans
+  its sluice; the roll, the spin and a rider being thrown are tests only, and
+  the SIGN of the spin in `Scene::draw` is a guess. Minions on a log that
+  starts rolling are left behind rather than thrown. A lodged log never
+  returns, so after both are blown out the side lanes ford the river for the
+  rest of the match -- whether logs should respawn is a design call.
+- **The side lanes graze their rivers rather than crossing them** (nearly
+  parallel for ~25 u). The crossing is a sluice cut through the causeway,
+  which works, but a lane that met the river square-on would be a better
+  place for a log. That is a river-shape change (`consts::RIVER_*`).
+
 - **God rays through the canopy: attempted, not delivered.** `shaft_light`
   (voxel.wgsl, terrain.wgsl) marches the view ray through the shadow map with
   no new bindings, and is OFF (`Renderer::shaft_steps = 0`) because both
@@ -175,7 +186,7 @@ the single highest-value thing anyone can do with this repo next.
 ## Verification commands
 
 ```bash
-cargo test --no-default-features   # 226 lib + 13 + 2, no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
+cargo test --no-default-features   # 232 lib + 14 + 2, no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
 cargo test                          # same, plus links cpal (needs libasound2-dev)
 cargo check --features gamepad      # needs libudev-dev
 cargo run --example simdbg <seed>   # headless 12-minute AI match trace
