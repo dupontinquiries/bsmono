@@ -309,6 +309,7 @@ python3 maintenance/tools/cfg_feature_check.py .   # cfg(feature="x") where no m
 python3 maintenance/tools/aperture_cmdstrip_check.py . # aperture command-strip pins vs the palette labels they resolve against
 python3 maintenance/tools/textedit_id_check.py .   # TextEdit with no stable id — the one-character input bug
 python3 maintenance/tools/font_install_check.py . # every egui app reaches uikit-egui's fonts::install, or its symbol glyphs are boxes
+python3 maintenance/tools/palette_surface_check.py . # an egui app that draws a command palette draws it with command_bar::show (bottom and inverted on a phone)
 ```
 
 `maintenance/tools/break-test.sh` is for the §5b break test itself. `source` it,
