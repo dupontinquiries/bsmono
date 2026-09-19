@@ -688,7 +688,11 @@ fn write_gguf_q8_0(m: &HostModel) -> Vec<u8> {
 /// feeds measures dispatches on the path the app decodes through, and QK-norm plus grouped-query
 /// attention each ADD dispatches per layer. A fixture without them would undercount the very
 /// thing being counted.
-fn write_gguf_qwen3_q8(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) -> Vec<u8> {
+fn write_gguf_qwen3_q8(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) -> Vec<u8> { write_gguf_qwen3_q8_embed(m, q_norm, k_norm, false) }
+/// `q8_embed`: store token_embd.weight as Q8_0 too. Every other fixture in this file keeps the
+/// embedding f32 — the one case where the host table is deliberately NOT held raw — so without this
+/// nothing exercises embedtable's row-at-a-time path end to end.
+fn write_gguf_qwen3_q8_embed(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>], q8_embed: bool) -> Vec<u8> {
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
     let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
@@ -696,7 +700,7 @@ fn write_gguf_qwen3_q8(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) 
     let hd = m.d / m.n_heads;
     let kv = m.n_kv_heads * hd;
     let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
-    let (t, by) = f32t(&m.embed); ts.push(("token_embd.weight".into(), mat(m.vocab, m.d), t, by));
+    let (t, by) = if q8_embed { q8t(&m.embed) } else { f32t(&m.embed) }; ts.push(("token_embd.weight".into(), mat(m.vocab, m.d), t, by));
     for (i, b) in m.layers.iter().enumerate() {
         let (t, by) = f32t(&b.g1); ts.push((format!("blk.{i}.attn_norm.weight"), v1(m.d), t, by));
         let (t, by) = q8t(&b.wq); ts.push((format!("blk.{i}.attn_q.weight"), mat(m.d, m.d), t, by));
@@ -1547,6 +1551,33 @@ fn main() {
             ck(format!("(d) the state crosses five chunk boundaries intact: prompt {:.2e}, next step {:.2e}", diff(&la, &ld), diff(&la2, &ld2)),
                diff(&la, &ld) <= 2e-4 * scale.max(1.0) && diff(&la2, &ld2) <= 2e-4 * scale.max(1.0));
             ck(format!("(c) costs a fraction of the launches: {:.2} -> {:.2} dispatches per prompt token ({:.0}x fewer)", a[0], c[0], a[0] / c[0].max(1e-9)), c[0] * 8.0 <= a[0]);
+        }
+        // THE HOST EMBEDDING TABLE, held raw vs as f32. A file whose token_embd is QUANTIZED, loaded both
+        // ways: every logit of prefill + decode must be BIT-identical (a row dequantized alone is that
+        // row of the whole table), the default must really BE the raw table, and it must be smaller.
+        {
+            let hm_e = gen_model(64, 128, 2, 96, 4, 2);
+            let hde = hm_e.d / hm_e.n_heads;
+            let (qn_e, kn_e): (Vec<Vec<f32>>, Vec<Vec<f32>>) = ((0..hm_e.n_layers).map(|i| rnd(hde, 610 + i)).collect(), (0..hm_e.n_layers).map(|i| rnd(hde, 710 + i)).collect());
+            let bytes = write_gguf_qwen3_q8_embed(&hm_e, &qn_e, &kn_e, true);
+            let ids: Vec<u32> = (0..9u32).map(|i| (i * 37 + 5) % hm_e.vocab as u32).collect();
+            let mut run = |f32_table: bool| -> (Vec<Vec<f32>>, bool, usize) {
+                if f32_table { std::env::set_var("LOGSCOPE_EMBED_F32", "1"); } else { std::env::remove_var("LOGSCOPE_EMBED_F32"); }
+                let m = gpu.load_gguf_opt(&bytes, true).expect("load");
+                std::env::remove_var("LOGSCOPE_EMBED_F32");
+                let c = gpu.new_cache_for(&m, ids.len() + 2);
+                let mut out = vec![gpu.prefill_chunked(&m, &c, &ids[..6], 4)];
+                for p in 6..ids.len() { out.push(gpu.decode_step(&m, &c, ids[p], p)); }
+                gpu.end_frame();
+                (out, m.embed_is_raw(), m.embed_host_bytes())
+            };
+            let ((a, a_raw, a_bytes), (b, b_raw, b_bytes)) = (run(true), run(false));
+            let differing: usize = a.iter().zip(&b).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).sum();
+            let scale = a.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
+            ck(format!("Q8_0 token_embd: raw host table == f32 host table, {differing} differing logit bits over prefill + {} decode steps (scale {scale:.2e})", a.len() - 1),
+               differing == 0 && a.len() == b.len() && scale > 1e-3 && a.iter().flatten().all(|v| v.is_finite()));
+            ck(format!("the default IS the raw table, and it is smaller: {b_bytes} bytes on the host vs {a_bytes} as f32 ({:.1}x)", a_bytes as f64 / b_bytes.max(1) as f64),
+               !a_raw && b_raw && b_bytes * 3 < a_bytes);
         }
         // THE HOISTED RECURRENCE vs THE ORIGINAL, bit for bit, at Qwen3.5's state width (128: two
         // state rows per thread, strides that wrap) and at 200 (not a multiple of 64: ragged strides)

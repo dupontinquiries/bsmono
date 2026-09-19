@@ -26,6 +26,7 @@ use std::collections::HashMap;
 pub mod reverse; // search-based inversion: which token preceded a suffix (c11 experiment)
 pub mod flash_qblock;
 pub mod jsonmask; // byte-level JSON grammar constraint for structured decoding
+pub mod embedtable; // the host token-embedding table in its FILE format: one row dequantized per lookup, exactly
 pub mod blockquant; // the 32-weight block quantizer every load-time requantization runs: both loops vectorize, output bit-identical
 pub mod topk;     // the per-token full-vocabulary scans: O(n) exact top-k, vectorizable finite check and argmax
 pub mod imrope;   // ggml's multi-section rope, mirrored; decides per FILE whether text collapses to plain NEOX
@@ -5190,7 +5191,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// Quantize the (host-side) embedding table into an int8-resident `QWeight` for windowed
     /// decode's GPU-side row gather (`gather_q8_at`). ~4× smaller than an f32 embed copy — a
     /// 151k×2048 table costs ~350 MB instead of ~1.2 GB of Asahi's VMA budget.
-    pub fn embed_q8(&self, m: &Model) -> QWeight { self.quantize_q8_resident(&m.embed, m.vocab, m.d) }
+    pub fn embed_q8(&self, m: &Model) -> QWeight { self.quantize_q8_resident(&m.embed.to_f32(), m.vocab, m.d) }
 
     /// The GPU-resident embedding table for windowed decode. Under MoE streaming (tight VMA budget) the
     /// table is q8 — ~4× smaller than f32, saving ~2.9 GiB on a Scout-class vocab, at ~0.5% RMSE (the
@@ -5202,7 +5203,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         if std::env::var("LOGSCOPE_MOE_STREAM").is_ok() {
             ResidentEmbed::Q8(self.embed_q8(m))
         } else {
-            ResidentEmbed::F32(self.upload(&m.embed, m.vocab, m.d))
+            ResidentEmbed::F32(self.upload(&m.embed.to_f32(), m.vocab, m.d))
         }
     }
 
@@ -8018,7 +8019,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             for (i, &tok) in prompt[..t - 1].iter().enumerate() {
                 let st = tok as usize * m.d;
                 assert!(st + m.d <= m.embed.len(), "token id {tok} is outside this model's vocabulary of {}", m.embed.len() / m.d);
-                let x = self.embed_scaled(m, &m.embed[st..st + m.d]);
+                let x = self.embed_scaled(m, &m.embed.slice(st, m.d));
                 let _ = self.decode_hidden_t(m, c, x, first_pos + i);
                 if (i + 1) % window == 0 && i + 2 < t {
                     // FENCED: submit, WAIT, release retained bind groups, reopen — decode_layers_t's
@@ -8040,7 +8041,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         if t == 0 { return Vec::new(); }
         if let Some(why) = m.prefill_gap() { return self.prefill_sequential(m, c, prompt, 0, why); }
         let mut xh = Vec::with_capacity(t * m.d);
-        for &id in prompt { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
+        for &id in prompt { let s = id as usize * m.d; xh.extend_from_slice(&m.embed.slice(s, m.d)); }
         Self::scale_embed_rows(m, &mut xh);
         let mut x = self.upload(&xh, t, m.d);
         for li in 0..m.n_layers {
@@ -8106,7 +8107,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
 weights disagree. A BORROWED tokenizer (LOGSCOPE_TOKENIZER_GGUF) of a different width is the usual \
 cause: Llama-3's 128256 against a trimmed 126464 shares its low ids but not its specials, so the \
 prompt tokenises fine and then indexes past the embedding table.", m.embed.len() / m.d);
-                xh.extend_from_slice(&m.embed[st..st + m.d]);
+                xh.extend_from_slice(&m.embed.slice(st, m.d));
             }
             Self::scale_embed_rows(m, &mut xh);
             let mut x = self.upload(&xh, s, m.d);
@@ -10294,7 +10295,10 @@ const SAMPLE_AT: &str = include_str!("kernels/sample_at.wgsl");
 /// A loaded model: embedding (host, for lookup), N resident transformer blocks,
 /// final norm, and output projection. Single attention head per block for now.
 pub struct Model {
-    embed: Vec<f32>,
+    /// The host-side token embedding. Was `Vec<f32>` — 4.07 GB resident for a 248,320 x 4096
+    /// vocabulary, to serve one row per token. Now held in the file's own format where a row can be
+    /// dequantized exactly on its own (see embedtable.rs); f32 otherwise.
+    embed: crate::embedtable::EmbedTable,
     layers: Vec<BlockWeights>,
     out_norm: Tensor,
     output: Lin,
@@ -10562,6 +10566,10 @@ impl Model {
     /// Width of one K/V cache row = n_kv_heads × head_dim (== d for plain MHA, but NOT for Qwen3 where
     /// head_dim is decoupled from d/n_heads).
     pub fn kv_dim(&self) -> usize { self.n_kv_heads * self.head_dim }
+    /// Host bytes the token-embedding table occupies, and whether it is held in the file's format
+    /// (one row dequantized per lookup) rather than as a whole f32 table. See embedtable.rs.
+    pub fn embed_host_bytes(&self) -> usize { self.embed.host_bytes() }
+    pub fn embed_is_raw(&self) -> bool { self.embed.is_raw() }
 
     /// The first thing this model needs that the BATCHED PREFILL blocks (`block_prefill`,
     /// `block_prefill_ext`) do not implement, or None when they are exact for it.
@@ -11842,6 +11850,24 @@ last block and k's first would decode to garbage")),
         let embed = fetch("token_embd.weight")?;
         // Derive vocab from the embedding matrix (rows = vocab) when metadata omits it.
         let vocab = vocab_meta.unwrap_or(embed.len() / d);
+        // THE RESIDENT TABLE. `embed` (f32) is still needed below for a TIED output matrix, and is
+        // dropped when this function returns; what the Model KEEPS is the tensor's own bytes when
+        // every row can be dequantized alone, exactly. LOGSCOPE_EMBED_F32=1 keeps the f32 table (A/B).
+        let embed_raw: Option<crate::embedtable::EmbedTable> = if std::env::var("LOGSCOPE_EMBED_F32").as_deref() == Ok("1") { None } else {
+            g.tensor("token_embd.weight").and_then(|t| {
+                let rows = embed.len() / d;
+                let nbytes = gguf::type_nbytes(t.ggml_type, rows * d)?;
+                let raw = set.slice(t.offset, nbytes)?;
+                // f32 source: the "raw" form would BE the f32 table, copied — nothing to gain
+                if t.ggml_type == 0 { return None; }
+                crate::embedtable::EmbedTable::from_raw(t.ggml_type, raw, rows, d)
+            })
+        };
+        match &embed_raw {
+            Some(t) => eprintln!("loader: token embedding held in its file format on the host — {:.1} MiB instead of {:.1} MiB as f32; one row is dequantized per lookup (LOGSCOPE_EMBED_F32=1 for the f32 table)",
+                                 t.host_bytes() as f64 / (1u64 << 20) as f64, (embed.len() * 4) as f64 / (1u64 << 20) as f64),
+            None => {}
+        }
         // Build a resident linear, preferring the DIRECT q8_0 → int8 path (no f32 round-trip) when the
         // source tensor is q8_0 and we want int8 residency; otherwise dequant-then-quantize as before.
         let mut q4_mode = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok() || auto_q4;
@@ -13397,6 +13423,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
         // convention (expert_count is independently re-read at every site that needs it, e.g. the
         // treat_unsupported branch above) and costs nothing over trusting a 2500-line-old binding.
         let moe_variant = g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0);
+        let embed = embed_raw.unwrap_or(crate::embedtable::EmbedTable::F32(embed));
         Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale, attn_scale, logit_softcap, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, rope_neox: !acfg.rope_interleaved, rope_dims: rot, rope_mscale: mscale, trained_ctx, planned_weight_bytes, mla, dsa, mtp_layers: mtp, arch: arch.clone(), gaps: loaded_gaps, moe_variant, diffusion, mask_token_id, shift_logits })
     }
 
@@ -13436,7 +13463,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
                 _ => Some(format!("{name}: KIND differs")),
             }
         };
-        if a.embed.iter().map(|f| f.to_bits()).ne(b.embed.iter().map(|f| f.to_bits())) { return "embed differs".into(); }
+        if a.embed.to_f32().iter().map(|f| f.to_bits()).ne(b.embed.to_f32().iter().map(|f| f.to_bits())) { return "embed differs".into(); }
         if let Some(s) = cmp("rope_factors".into(), &a.rope_factors, &b.rope_factors) { return s; }
         if let Some(s) = cmp("out_norm".into(), &a.out_norm, &b.out_norm) { return s; }
         if let Some(s) = lin(self, "output", &a.output, &b.output) { return s; }
@@ -13488,7 +13515,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
         for v in [m.d, m.h, m.vocab, m.n_layers, m.n_heads, m.n_kv_heads] { o.extend_from_slice(&(v as u32).to_le_bytes()); }
         o.extend_from_slice(&m.base.to_le_bytes()); o.extend_from_slice(&m.eps.to_le_bytes());
         o.extend_from_slice(&(m.trained_ctx as u32).to_le_bytes());
-        o.extend_from_slice(&(m.embed.len() as u64).to_le_bytes()); o.extend_from_slice(bytemuck::cast_slice(&m.embed));
+        o.extend_from_slice(&(m.embed.len() as u64).to_le_bytes()); o.extend_from_slice(bytemuck::cast_slice(&m.embed.to_f32()));
         self.dump_tensor(&mut o, &m.rope_factors);
         self.dump_tensor(&mut o, &m.out_norm);
         self.dump_lin(&mut o, &m.output);
@@ -13533,6 +13560,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
         // defaulted from the same constraint the RoPE line above already relies on: this path is
         // llama-family only and never MoE, so "llama"/0 are not guesses, they're what loading via
         // this cache already guarantees about anything that reaches here.
+        let embed = crate::embedtable::EmbedTable::F32(embed);   // the store has no raw tensor bytes to keep
         Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale: 1.0, attn_scale: None, logit_softcap: None, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, rope_neox: false, rope_dims: d / n_heads.max(1), rope_mscale: 1.0, trained_ctx, planned_weight_bytes: 0, mla: None, dsa: None, mtp_layers: 0, arch: "llama".to_string(), gaps: Vec::new(), moe_variant: 0, diffusion: false, mask_token_id: None, shift_logits: false })
     }
     fn read_tensor(&self, r: &mut Rd) -> Option<Tensor> {
@@ -13590,7 +13618,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
         self.activate_model(m);
         let t = ids.len();
         let mut xh = Vec::with_capacity(t * m.d);
-        for &id in ids { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
+        for &id in ids { let s = id as usize * m.d; xh.extend_from_slice(&m.embed.slice(s, m.d)); }
         let mut x = self.upload(&xh, t, m.d);
         for layer in &m.layers { x = self.block_forward(layer, &x, &m.rope_factors, t, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, t, m.d, m.eps);
@@ -13607,7 +13635,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
         self.activate_model(m);
         let t = ids.len();
         let mut xh = Vec::with_capacity(t * m.d);
-        for &id in ids { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
+        for &id in ids { let s = id as usize * m.d; xh.extend_from_slice(&m.embed.slice(s, m.d)); }
         let mut x = self.upload(&xh, t, m.d);
         for layer in &m.layers { x = self.block_forward(layer, &x, &m.rope_factors, t, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps); }
         self.rmsnorm_t(&x, &m.out_norm, t, m.d, m.eps)
@@ -13655,7 +13683,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
             (row.iter().map(|x| x * x).sum::<f32>() / m.d as f32).sqrt()
         };
         let mut xh = Vec::with_capacity(t * m.d);
-        for &id in ids { let s = (id as usize).min(m.vocab - 1) * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
+        for &id in ids { let s = (id as usize).min(m.vocab - 1) * m.d; xh.extend_from_slice(&m.embed.slice(s, m.d)); }
         eprintln!("    eps={:.2e} embed rms={:.4}", m.eps, stat(&xh));
         let mut x = self.upload(&xh, t, m.d);
         let hd = m.head_dim; let kv = m.n_kv_heads * hd; let ad = m.n_heads * hd;
@@ -16053,7 +16081,7 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
         self.activate_model(m);
         self.begin_frame();
         let s = token as usize * m.d;
-        let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
+        let mut x = self.embed_scaled(m, &m.embed.slice(s, m.d));
         let fused = fused_qkv_enabled();
         let tracing = route_trace_armed();
         if tracing { self.trace_tok.store(token as i64, std::sync::atomic::Ordering::Relaxed); }
@@ -16083,7 +16111,7 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
         for (pos, &t) in tokens.iter().enumerate() {
             self.begin_frame();
             let s = t as usize * m.d;
-            let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
+            let mut x = self.embed_scaled(m, &m.embed.slice(s, m.d));
             for li in 0..m.n_layers { x = self.block_decode_q8_fused(&m.layers[li], &x, &m.rope_factors, &c.kq[li], &c.ks[li], &c.vq[li], &c.vs[li], pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps); }
             let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
             logits = self.download(&self.logits_out(m, &xn, 1));
@@ -16756,7 +16784,7 @@ from 0 per cache. Build a fresh new_cache_for per sequence.", pos + s);
         self.begin_frame();
         let (slot, attend_len) = stream_slot(pos, sink, window);
         let s = token as usize * m.d;
-        let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
+        let mut x = self.embed_scaled(m, &m.embed.slice(s, m.d));
         let fused = fused_qkv_enabled();
         for li in 0..m.n_layers {
             let (l, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
@@ -16817,7 +16845,7 @@ from 0 per cache. Build a fresh new_cache_for per sequence.", pos + s);
         self.activate_model(m);
         self.begin_frame();
         let s = token as usize * m.d;
-        let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
+        let mut x = self.embed_scaled(m, &m.embed.slice(s, m.d));
         let fused = fused_qkv_enabled();
         let tracing = route_trace_armed();
         if tracing { self.trace_tok.store(token as i64, std::sync::atomic::Ordering::Relaxed); }
@@ -16876,7 +16904,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         self.activate_model(m);
         self.begin_frame();
         let s = token as usize * m.d;
-        let x = self.upload(&m.embed[s..s + m.d], 1, m.d);
+        let x = self.upload(&m.embed.slice(s, m.d), 1, m.d);
         let out = self.decode_layers_staged(m, sc, x, pos);
         self.download(&out)
     }
@@ -16935,7 +16963,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         self.begin_frame();
         let d = m.d; let hd = m.head_dim; let kv = m.kv_dim(); let ad = m.n_heads * hd;
         let mut xh = Vec::with_capacity(n * d);
-        for &t in tokens { let s = t as usize * d; xh.extend_from_slice(&m.embed[s..s + d]); }
+        for &t in tokens { let s = t as usize * d; xh.extend_from_slice(&m.embed.slice(s, d)); }
         let mut x = self.upload(&xh, n, d);
         let posv: Vec<u32> = sessions.iter().map(|s| s.pos as u32).collect();
         let pos = self.upload_u32(&posv);
@@ -17180,7 +17208,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         if s == 0 { return c; }
         if let Some(why) = m.prefill_gap() { let _ = self.prefill_sequential(m, &c, seg, parent_len, why); return c; }
         let mut xh = Vec::with_capacity(s * m.d);
-        for &id in seg { let st = id as usize * m.d; xh.extend_from_slice(&m.embed[st..st + m.d]); }
+        for &id in seg { let st = id as usize * m.d; xh.extend_from_slice(&m.embed.slice(st, m.d)); }
         Self::scale_embed_rows(m, &mut xh);
         let mut x = self.upload(&xh, s, m.d);
         for li in 0..m.n_layers { x = self.prefill_layer(m, &c, li, &x, parent_len, s); }
@@ -17408,7 +17436,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         }
         let d = m.d; let hd = m.head_dim; let kv = m.kv_dim(); let ad = m.n_heads * hd;
         let mut xh = Vec::with_capacity(n * d);
-        for &t in tokens { let s = t as usize * d; xh.extend_from_slice(&m.embed[s..s + d]); }
+        for &t in tokens { let s = t as usize * d; xh.extend_from_slice(&m.embed.slice(s, d)); }
         let mut x = self.upload(&xh, n, d);
         let posv: Vec<u32> = sessions.iter().map(|s| s.pos as u32).collect();
         let pos = self.upload_u32(&posv);
@@ -17616,7 +17644,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         for pos in 0..prompt.len().saturating_sub(1) { let _ = self.decode_step(m, &c, prompt[pos], pos); }
         let last = prompt.len() - 1;
         self.begin_frame();
-        let x0 = self.upload(&m.embed[prompt[last] as usize * m.d..prompt[last] as usize * m.d + m.d], 1, m.d);
+        let x0 = self.upload(&m.embed.slice(prompt[last] as usize * m.d, m.d), 1, m.d);
         let mut logits_t = self.decode_layers_t(m, &c, x0, last);
         let mut out = Vec::with_capacity(n_new);
         for step in 0..n_new {
@@ -17661,7 +17689,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
             let _ = self.prefill_chunked(m, &c, &prompt[..l - 1], chunk);
         }
         self.begin_frame();
-        let x0 = self.upload(&m.embed[prompt[l - 1] as usize * m.d..prompt[l - 1] as usize * m.d + m.d], 1, m.d);
+        let x0 = self.upload(&m.embed.slice(prompt[l - 1] as usize * m.d, m.d), 1, m.d);
         let mut logits_t = self.decode_layers_t(m, &c, x0, l - 1);
         let mut out = Vec::with_capacity(n_new);
         let mut step = 0;
@@ -17723,7 +17751,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         }
         let mut rng = seed | 1;
         self.begin_frame();
-        let x0 = self.upload(&m.embed[prompt[l - 1] as usize * m.d..prompt[l - 1] as usize * m.d + m.d], 1, m.d);
+        let x0 = self.upload(&m.embed.slice(prompt[l - 1] as usize * m.d, m.d), 1, m.d);
         let mut logits_t = self.decode_layers_t(m, &c, x0, l - 1);
         let mut out = Vec::with_capacity(n_new);
         let mut step = 0usize;
@@ -17781,7 +17809,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
             let take = (s - done).min(max_rows);
             let block = &tokens[done..done + take];
             let mut xh = Vec::with_capacity(take * m.d);
-            for &id in block { let st = id as usize * m.d; xh.extend_from_slice(&m.embed[st..st + m.d]); }
+            for &id in block { let st = id as usize * m.d; xh.extend_from_slice(&m.embed.slice(st, m.d)); }
             Self::scale_embed_rows(m, &mut xh);
             let mut x = self.upload(&xh, take, m.d);
             for li in 0..m.n_layers {
@@ -17809,7 +17837,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
             let take = (s - done).min(max_rows);
             let block = &tokens[done..done + take];
             let mut xh = Vec::with_capacity(take * m.d);
-            for &id in block { let st = id as usize * m.d; xh.extend_from_slice(&m.embed[st..st + m.d]); }
+            for &id in block { let st = id as usize * m.d; xh.extend_from_slice(&m.embed.slice(st, m.d)); }
             Self::scale_embed_rows(m, &mut xh);
             let mut x = self.upload(&xh, take, m.d);
             for li in 0..m.n_layers {
@@ -18061,7 +18089,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         for (pos, &t) in tokens.iter().enumerate() {
             self.begin_frame();
             let s = t as usize * m.d;
-            let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
+            let mut x = self.embed_scaled(m, &m.embed.slice(s, m.d));
             for li in 0..m.n_layers { x = self.block_decode_fused(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li], pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps); }
             let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
             logits = self.download(&self.logits_out(m, &xn, 1));
@@ -21069,7 +21097,7 @@ impl Gpu {
         }
         self.begin_batch_frame();
         let mut xh = Vec::with_capacity(t * m.d);
-        for &id in tokens { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
+        for &id in tokens { let s = id as usize * m.d; xh.extend_from_slice(&m.embed.slice(s, m.d)); }
         let mut x = self.upload(&xh, t, m.d);
         let dbg = std::env::var("LOGSCOPE_DEBUG_B").is_ok();
         let probe = |gpu: &Self, x: &Tensor, tag: &str| {
@@ -21213,7 +21241,7 @@ impl Gpu {
         let mut xh = Vec::with_capacity(n * m.d);
         for &id in &tokens[row0..row0 + n] {
             let st = id as usize * m.d;
-            xh.extend_from_slice(&m.embed[st..st + m.d]);
+            xh.extend_from_slice(&m.embed.slice(st, m.d));
         }
         let mut x = self.upload(&xh, n, m.d);
         for li in 0..m.n_layers {
@@ -21280,7 +21308,7 @@ impl Gpu {
         }
         self.begin_batch_frame();
         let mut xh = Vec::with_capacity(t * m.d);
-        for &id in tokens { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
+        for &id in tokens { let s = id as usize * m.d; xh.extend_from_slice(&m.embed.slice(s, m.d)); }
         let mut x = self.upload(&xh, t, m.d);
         for li in 0..m.n_layers {
             x = self.block_forward(&m.layers[li], &x, &m.rope_factors, t, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
