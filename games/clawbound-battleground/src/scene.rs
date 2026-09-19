@@ -533,7 +533,9 @@ fn jungle_spot(rng: &mut Rng, min_clear: f32) -> Option<(f32, f32)> {
         let r = 22.0 + rng.f32() * (ARENA_RADIUS - 30.0);
         let x = a.cos() * r;
         let z = a.sin() * r;
-        if consts::lane_clearance(x, z) > min_clear && consts::river_dist(x, z) > 9.5 && !crate::bosses::in_pit(x, z) {
+        // ...and not on the authored centre: a random trunk in a run's
+        // floor or a doorway undoes the one part of the map that is designed.
+        if consts::lane_clearance(x, z) > min_clear && consts::river_dist(x, z) > 9.5 && !crate::bosses::in_pit(x, z) && !crate::midjungle::reserved(x, z) {
             return Some((x, z));
         }
     }
@@ -630,6 +632,33 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
             blockers.push_prop(PropKind::$kind, $x, $z, $y, 1.0);
             pieces.push(Piece { mesh: $mesh, pos: Vec3::new($x, $y, $z), quarter: $q, vsize: $vs, sway: $sw })
         }};
+    }
+
+    // --- the authored centre: the Hollow and the two screened Runs ---
+    // First, so that everything scattered afterwards is placed around it.
+    for (i, a) in crate::midjungle::layout().into_iter().enumerate() {
+        let (x, z, q, vi) = (a.x, a.z, a.quarter, i as i32);
+        match a.kind {
+            PropKind::Rock => put!(Rock; props::rock(a.scale), x, z, 0.0, q, V_MED),
+            PropKind::BoulderCluster => put!(BoulderCluster; props::boulder_cluster(a.scale, vi), x, z, 0.0, q, V_MED),
+            PropKind::RuinPillar => put!(RuinPillar; props::ruin_pillar(a.scale, vi), x, z, 0.0, q, V_MED),
+            PropKind::StoneHead => put!(StoneHead; props::stone_head(a.scale, vi), x, z, 0.0, q, V_MED),
+            PropKind::FallenLog => {
+                blockers.push_placed(PropKind::FallenLog, x, z, 0.0, q, a.scale);
+                pieces.push(Piece { mesh: props::fallen_log(a.scale), pos: Vec3::new(x, 0.0, z), quarter: q, vsize: V_MED, sway: 0.0 });
+            }
+            PropKind::JungleTree => {
+                plant!(JungleTree; props::jungle_tree(a.scale, vi), x, z, 0.0, q, V_MED, 1.0);
+                blockers.push_jungle_roots(x, z, 0.0, vi);
+            }
+            PropKind::StranglerFig => plant!(StranglerFig; props::strangler_fig(a.scale, vi), x, z, 0.0, q, V_MED, 0.8),
+            PropKind::Palm => plant!(Palm; props::palm(a.scale, vi), x, z, 0.0, q, V_MED, 1.6),
+            PropKind::Fern => plant!(Fern; props::fern(vi), x, z, 0.0, 0, V_SM, 2.6),
+            PropKind::Bush => plant!(Bush; props::bush(vi), x, z, 0.0, 0, V_SM, 1.8),
+            // A kind the layout uses and this match does not build would be
+            // a prop that collides and cannot be seen.
+            other => panic!("midjungle::layout places {other:?}, which build_world has no mesh arm for"),
+        }
     }
 
     // --- playable jungle flora ---
@@ -927,4 +956,70 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
         blockers.len()
     );
     (out, bird_mesh(), blockers)
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use crate::blockers::Perch;
+
+    /// An ASCII plan of the real world's blockers. `cargo test plan_of -- --nocapture`.
+    /// `#` wall (unstandable or tall), `o` perch, `"` cover, `.` lane, ` ` open.
+    pub fn plan(b: &Blockers, half: f32, cell: f32) -> String {
+        let n = (half * 2.0 / cell) as i32;
+        let mut out = String::new();
+        for iz in (0..n).rev() {
+            for ix in 0..n {
+                let (x, z) = (-half + (ix as f32 + 0.5) * cell, -half + (iz as f32 + 0.5) * cell);
+                let solid = b.blocked(x, z, 0.0);
+                let perch = b.with_perch().any(|(k, p)| {
+                    let (ax, az, r) = k.shape.nearest_axis(x, z);
+                    p != Perch::None && (x - ax).hypot(z - az) < r
+                });
+                out.push(if solid && perch { 'o' } else if solid { '#' } else if b.concealment_at(x, z) > 0.3 { '"' } else if consts::lane_clearance(x, z) < 3.5 { '.' } else { ' ' });
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The authored centre, checked in the REAL world: after every scatter
+    /// pass, camp ring and ruin has been placed round it, the runs are still
+    /// open, the doorways still doors, and the lane still clear.
+    #[test]
+    fn scatter_leaves_the_authored_centre_alone() {
+        use crate::midjungle::{DOORS, LANE_KEEP, RUN_X, RUN_Z};
+        let (_, _, b) = build_world();
+        let body = consts::GOD_RADIUS + 0.2;
+        let mut checked = 0;
+        for (sx, sz) in [(1.0f32, 1.0f32), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+            let mut z = RUN_Z.0;
+            while z <= RUN_Z.1 {
+                assert!(!b.blocked(sx * RUN_X, sz * z, body), "run ({sx},{sz}) plugged at z = {}", sz * z);
+                z += 0.5;
+                checked += 1;
+            }
+            for d in DOORS {
+                let mut x = LANE_KEEP - 2.0;
+                while x <= RUN_X {
+                    assert!(!b.blocked(sx * x, sz * d, body), "doorway z = {} plugged at x = {}", sz * d, sx * x);
+                    x += 0.5;
+                }
+            }
+        }
+        assert!(checked > 250);
+        let mut z = -60.0;
+        while z <= 60.0 {
+            assert!(!b.blocked(0.0, z, consts::GOD_RADIUS), "mid lane blocked at z = {z}");
+            z += 0.5;
+        }
+        // And the root steps registered for the screen's trees do not push.
+        assert!(b.steps().len() > 224, "the screen's jungle trees brought their roots: {}", b.steps().len());
+    }
+
+    #[test]
+    fn plan_of_the_centre() {
+        let (_, _, b) = build_world();
+        println!("{}", plan(&b, 62.0, 2.0));
+    }
 }

@@ -16,6 +16,8 @@ pub mod voxel;
 pub mod models;
 pub mod props;
 pub mod blockers;
+/// The authored centre of the map: the Hollow and the two screened Runs.
+pub mod midjungle;
 pub mod anim;
 /// Cut a voxel body into posable parts; posed rig -> per-part matrices.
 pub mod rigged;

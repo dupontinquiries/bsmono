@@ -463,6 +463,8 @@ pub fn run_rig_sheet() -> Result<(), String> {
         let side = Vec3::new(-along.z, 0.0, along.x);
         shots.push(Shot { name: "rig_wall_and_fall.png", eye: mid + side * 8.0 + Vec3::Y * 3.5, look: mid - Vec3::Y * 0.6 });
     }
+    // The authored centre from above: the Hollow, and a run either side of the lane.
+    shots.push(Shot { name: "map_centre.png", eye: Vec3::new(0.0, 62.0, -46.0), look: Vec3::new(0.0, 0.0, 8.0) });
     println!("wall at {wall:?}");
     // CLAWBOUND_SHEET=wall,sig_0 renders only the shots whose names match.
     let only: Vec<String> = std::env::var("CLAWBOUND_SHEET").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
@@ -517,6 +519,11 @@ pub fn run_rig_sheet() -> Result<(), String> {
                     let g = &mut game.gods[0];
                     g.yaw = dir.z.atan2(dir.x);
                     g.pos = a - dir * 1.2 + dir * (step as f32 * (2.0 / 60.0));
+                }
+                k if shots[k].name == "map_centre.png" => {
+                    for gi in 0..game.gods.len() {
+                        game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
+                    }
                 }
                 k if k == wall_shot => {
                     let (a, b) = wall.unwrap();
