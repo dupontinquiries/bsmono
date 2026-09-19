@@ -538,7 +538,7 @@ mod tests {
 
     fn one(shape: Shape) -> Blockers {
         let mut b = Blockers::new(100.0, 4.0);
-        b.push(Blocker { shape, top: 5.0 });
+        b.push(Blocker { shape, top: 5.0, cover: Cover::NONE });
         b
     }
 
@@ -612,10 +612,22 @@ mod tests {
     #[test]
     fn passable_props_are_not_added() {
         let mut b = Blockers::new(100.0, 4.0);
-        for k in [PropKind::Fern, PropKind::Bush, PropKind::VineCurtain, PropKind::LanePad, PropKind::Bridge] {
+        // Flat or spanning props record nothing at all.
+        for k in [PropKind::LanePad, PropKind::Bridge] {
             assert!(!b.push_prop(k, 0.0, 0.0, 0.0, 1.0), "{k:?} must be passable");
         }
         assert!(b.is_empty());
+        // Cover props DO record an entry (that is how `concealment_at` finds
+        // them) but must never push: this test predates `Footprint::cover`
+        // and asserted `is_empty()` here, which stopped being the design.
+        for k in [PropKind::Fern, PropKind::Bush, PropKind::VineCurtain] {
+            assert!(!b.push_prop(k, 0.0, 0.0, 0.0, 1.0), "{k:?} must be passable");
+        }
+        assert_eq!(b.len(), 3);
+        let at = Vec3::new(0.05, 0.0, 0.0);
+        assert_eq!(b.resolve(at, 0.6), at, "standing in a fern moves nobody");
+        assert!(b.concealment_at(0.0, 0.0) > 0.5);
+        let mut b = Blockers::new(100.0, 4.0);
         // And a solid one does get added.
         assert!(b.push_prop(PropKind::RuinPillar, 5.0, 5.0, 0.0, 1.0));
         assert_eq!(b.len(), 1);
