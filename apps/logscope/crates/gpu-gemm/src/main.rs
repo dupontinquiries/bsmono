@@ -5450,7 +5450,42 @@ reproducible in software and not a fault.", raw_diff - diff);
             let (cpu_blob, _) = gpu.quantize_q4_host_bytes(&f32ref, rows, k);
             let cpu_words: Vec<u32> = bytemuck::cast_slice(&cpu_blob).to_vec();
             let diff = got.iter().zip(&cpu_words).filter(|(a, b)| a != b).count();
-            ck(&format!("chunked conversion is exact across boundaries ({diff} words differ)"), diff == 0);
+            // TWO PROPERTIES, which this check used to report as one. It said "chunked conversion is
+            // exact across boundaries (13 words differ)" on lavapipe, which reads as an off-by-one at a
+            // chunk edge. It is not: the same bytes converted in ONE dispatch differ from the CPU by
+            // the same 13 words, and chunked == unchunked exactly. So:
+            //
+            //   (a) BOUNDARIES — chunked vs unchunked on THIS GPU. Adapter-independent; must be 0.
+            //   (b) GPU vs the CPU reference. The reference's reciprocal-and-round rule was tuned to
+            //       the target driver by measurement (see quantize_q4_resident). Another adapter may
+            //       land an ULP the other side of an exact .5 tie. Measured here: all 13 differing
+            //       nibbles are exact ties, and the GPU did NOT take the even neighbour in any, so it
+            //       is not ties-to-even either — just different arithmetic at a knife edge.
+            //
+            // (b) stays STRICT on real hardware. On the software adapter only, differences that are
+            // ALL exact ties are reported and tolerated; anything else still fails.
+            let one = gpu.alloc_words(total / 8 + total / 32);
+            gpu.q4k_convert_into(&one, &raw, rows, k, 0, total / 8);
+            let got1 = gpu.download_words(&one);
+            let boundary_diff = got.iter().zip(&got1).filter(|(a, b)| a != b).count();
+            ck(&format!("chunked conversion == ONE-dispatch conversion on this GPU ({boundary_diff} words differ) — the boundary logic"), boundary_diff == 0);
+            let (mut nibs, mut ties) = (0usize, 0usize);
+            for (wi, (a, b)) in got.iter().zip(&cpu_words).enumerate().filter(|(i, (a, b))| *i < total / 8 && a != b) {
+                for n_i in 0..8 {
+                    if (a >> (n_i * 4)) & 0xF == (b >> (n_i * 4)) & 0xF { continue; }
+                    nibs += 1;
+                    let j = wi * 8 + n_i; let blk = j / 32;
+                    let amax = f32ref[blk * 32..blk * 32 + 32].iter().fold(0f32, |m, x| m.max(x.abs()));
+                    let v = f32ref[j] * (1.0f32 / (amax * (1.0f32 / 7.0)));
+                    if (v.abs().fract() - 0.5).abs() < 1e-6 { ties += 1; }
+                }
+            }
+            let scale_diff = got.iter().zip(&cpu_words).skip(total / 8).filter(|(a, b)| a != b).count();
+            let software = gpu.adapter_name.contains("llvmpipe");
+            let only_ties = nibs == ties && scale_diff == 0;
+            ck(&format!("GPU == CPU reference ({diff} words differ: {nibs} nibbles, {ties} of them exact .5 ties, {scale_diff} scale words){}",
+                        if diff != 0 && software && only_ties { " — tolerated on the software adapter ONLY: every difference is an exact tie; the reference is tuned to the target driver" } else { "" }),
+               diff == 0 || (software && only_ties));
         }
 
         // CLAIMS ONLY WHAT IT TESTS. This said "the loader can stop requantizing", and I acted on
