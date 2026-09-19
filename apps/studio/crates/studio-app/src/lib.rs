@@ -1476,7 +1476,8 @@ impl Studio {
                             // from the tape, not both at once.
                             if self.rack_playing { self.transport.stop(); }
                             self.status = if self.rack_playing { "loop playing".into() }
-                                          else { "loop stopped".into() };, ..Default::default() } else if self.transport.playing {
+                                          else { "loop stopped".into() };
+                        } else if self.transport.playing {
                             self.transport.stop(); self.status = "stopped".into();
                         } else {
                             self.rack_playing = false;
@@ -3893,7 +3894,8 @@ impl eframe::App for App {
                     // at the voice window, which is never what a melody
                     // loop means.)
                     let id = if self.studio.panel == Panel::Rack {
-                        Some(self.studio.import_audio(&name, &path, &audio)), ..Default::default() } else {
+                        Some(self.studio.import_audio(&name, &path, &audio))
+                    } else {
                         self.studio.import_clip(&name, &path, &audio)
                     };
                     if let Some(id) = id {
