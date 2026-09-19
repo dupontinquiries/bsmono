@@ -378,7 +378,11 @@ impl Blockers {
     fn cell_of(&self, x: f32, z: f32) -> (i32, i32) {
         let gx = ((x + self.half_extent) / self.cell).floor() as i32;
         let gz = ((z + self.half_extent) / self.cell).floor() as i32;
-        (gx.clamp(0, self.dim - 1), gz.clamp(0, self.dim - 1))
+        // `dim` is 0 for a default-constructed set (a Game nobody has handed a
+        // scene's blockers to: every headless match, every server). `clamp`
+        // PANICS when min > max, so the first leap in such a game killed it.
+        let hi = (self.dim - 1).max(0);
+        (gx.clamp(0, hi), gz.clamp(0, hi))
     }
 
     /// Add a blocker, registering it in every cell its bounds touch.
@@ -601,6 +605,12 @@ impl Blockers {
 
     /// Candidate blocker indices near `(x, z)` within `pad`.
     fn near(&self, x: f32, z: f32, pad: f32, out: &mut Vec<u32>) {
+        // An empty grid has no cells to look in. Guarded HERE, at the one door
+        // every query comes through, rather than at each place it used to crash.
+        if self.cells.is_empty() {
+            out.clear();
+            return;
+        }
         out.clear();
         let (x0, z0) = self.cell_of(x - pad, z - pad);
         let (x1, z1) = self.cell_of(x + pad, z + pad);
@@ -924,6 +934,19 @@ mod tests {
         }
         assert_eq!(crossed, 40);
         assert_eq!(b.sight_obstruction((0.0, 30.0), (14.0, 30.0)), 0.0, "and past its end the view is open");
+    }
+
+    /// An empty world must answer every question with "nothing", not a panic.
+    #[test]
+    fn a_default_set_answers_nothing_instead_of_panicking() {
+        let b = Blockers::default();
+        assert!(!b.blocked(3.0, -7.0, 0.6));
+        assert_eq!(b.concealment_at(1.0, 1.0), 0.0);
+        assert_eq!(b.nearest_stem(0.0, 0.0, 2.0), None);
+        assert_eq!(b.sight_obstruction((0.0, 0.0), (30.0, 5.0)), 0.0);
+        let p = Vec3::new(4.0, 0.0, 4.0);
+        assert_eq!(b.resolve(p, 0.6), p);
+        assert_eq!(b.standing_on(0.0, 0.0, 1.0), None);
     }
 
     /// Stems are the light things only: a rock beside the path is the sim's
