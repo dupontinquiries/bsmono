@@ -1,14 +1,16 @@
-use super::{card, row};
+use super::{card, row, rule, well};
 use crate::hold::{self, Target, Targets};
 use crate::shell::ShellState;
 use crate::source;
 use egui::{Rect, RichText, Ui, UiBuilder};
 use stoat_core::backend::StepKind;
 use stoat_core::diag::Severity;
+use uikit_egui::callout;
+use uikit_egui::tokens::{FONT_LG, SPACE_SM, SPACE_XS};
 use stoat_core::model::RunState;
 use uikit_egui::{GestureLayer, PaletteColors};
 
-const BAR_H: f32 = 46.0;
+const BAR_H: f32 = 52.0;
 
 pub fn ui(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors, swipe: &mut GestureLayer, targets: &mut Targets, gestures: &[uikit_egui::touch::Gesture]) {
     // A long press, against what was drawn LAST frame (immediate mode: this
@@ -84,23 +86,25 @@ fn frame_body(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors, targets: &mut
     // inheriting the one you left the previous frame at.
     uikit_egui::scroll::area_keyed(ui, ("stack-frame", level), |ui| {
         ui.set_width(ui.available_width());
+        let mut diag_open = st.diag_open;
         if let Some((d, vitals_notes)) = &st.diagnostic {
-            card(ui, c, |ui| {
-                let (word, col) = match d.severity {
-                    Severity::Error => ("error", c.danger),
-                    Severity::Warning => ("warning", c.warning),
-                    Severity::Info => ("info", c.accent),
-                };
-                ui.label(RichText::new(format!("{word}[{}]: {}", d.code, d.title)).strong().color(col));
-                for n in d.notes.iter().chain(vitals_notes) {
-                    ui.label(RichText::new(format!("note: {n}")).small().color(c.text));
-                }
-                for h in &d.help {
-                    ui.label(RichText::new(format!("help: {h}")).small().color(c.success));
-                }
-            });
-            ui.add_space(6.0);
+            // The kit's callout, not a card: the most important thing on the page
+            // was drawn as one more dark box of small text between two others.
+            let sev = match d.severity {
+                Severity::Error => uikit_egui::toast::Severity::Error,
+                Severity::Warning => uikit_egui::toast::Severity::Warning,
+                Severity::Info => uikit_egui::toast::Severity::Info,
+            };
+            let lines: Vec<callout::Line> = d
+                .notes
+                .iter()
+                .map(callout::Line::note)
+                .chain(vitals_notes.iter().map(|n| callout::Line { tag: "run-up".into(), text: n.clone(), actionable: false }))
+                .chain(d.help.iter().map(callout::Line::help))
+                .collect();
+            callout::show_collapsible(ui, c, sev, &d.code, &d.title, &lines, &mut diag_open);
         }
+        st.diag_open = diag_open;
 
         let Some(f) = st.session.current_frame().cloned() else {
             ui.add_space(24.0);
@@ -115,37 +119,50 @@ fn frame_body(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors, targets: &mut
             return;
         };
 
-        let title = ui.label(RichText::new(f.func.as_deref().unwrap_or("??")).strong().size(17.0));
-        let loc = ui.label(RichText::new(format!("#{} · {}", f.level, f.location())).small().color(c.text_weak));
+        ui.add_space(SPACE_XS as f32);
+        let title = ui.add(egui::Label::new(RichText::new(f.func.as_deref().unwrap_or("??")).strong().size(FONT_LG as f32 + 1.0)).wrap());
+        let loc = ui.add(egui::Label::new(RichText::new(format!("#{} · {}", f.level, f.location())).small().color(c.text_weak)).wrap());
         targets.add(title.rect.union(loc.rect), Target::Location(f.location()));
-        ui.add_space(4.0);
+        ui.add_space(SPACE_SM as f32);
 
         let lines = f.file.as_deref().and_then(|p| st.sources.lines(p));
-        match (lines, f.line) {
-            (Some(lines), Some(line)) => {
-                let tints = source::Tints { text: c.text, weak: c.text_weak, current_bg: c.accent_soft };
-                let job = source::layout(&lines, line, 6, &tints, 12.0, ui.available_width());
-                // Laid out here rather than inside the Label so the rows are in
-                // hand: a long press needs to know which SOURCE line a wrapped
-                // row belongs to.
-                let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
-                let r = ui.add(egui::Label::new(galley.clone()).selectable(false));
-                if let (Some(file), Some(first)) = (f.file.clone(), source::window(&lines, line, 6).first().map(|w| w.0)) {
-                    let rows: Vec<(Rect, bool)> = galley.rows.iter().map(|row| (row.rect().translate(r.rect.min.to_vec2()), row.ends_with_newline)).collect();
-                    for (i, (rect, _)) in rows.iter().enumerate() {
-                        if let Some(n) = hold::line_at(&rows, first, rect.center()) {
-                            // One target per row; rows of one wrapped line share its number.
-                            let _ = i;
-                            targets.add(*rect, Target::SourceLine { file: file.clone(), line: n });
+        // The snippet sits in a recessed well: read-only text on a darker surface,
+        // so it is not one more pale card between the callout and the locals.
+        well(ui, c, |ui| {
+            match (lines, f.line) {
+                (Some(lines), Some(line)) => {
+                    let tints = source::Tints { text: c.text, weak: c.text_weak, current_bg: c.accent_soft };
+                    // Context is a budget, not a constant. On a phone-width column every
+                    // source line wraps to two or three rows, and +/-6 lines filled the
+                    // screen: once cards had real padding, the locals fell below the
+                    // fold. +/-3 there keeps the line, its neighbours and the locals on
+                    // one screen; a desk keeps +/-6.
+                    let context = if ui.available_width() < 420.0 { 3 } else { 6 };
+                    let job = source::layout(&lines, line, context, &tints, 12.0, ui.available_width());
+                    // Laid out here rather than inside the Label so the rows are in
+                    // hand: a long press needs to know which SOURCE line a wrapped
+                    // row belongs to.
+                    let galley = ui.ctx().fonts_mut(|fonts| fonts.layout_job(job));
+                    let r = ui.add(egui::Label::new(galley.clone()).selectable(false));
+                    if let (Some(file), Some(first)) = (f.file.clone(), source::window(&lines, line, context).first().map(|w| w.0)) {
+                        let rows: Vec<(Rect, bool)> = galley.rows.iter().map(|row| (row.rect().translate(r.rect.min.to_vec2()), row.ends_with_newline)).collect();
+                        for (i, (rect, _)) in rows.iter().enumerate() {
+                            if let Some(n) = hold::line_at(&rows, first, rect.center()) {
+                                // One target per row; rows of one wrapped line share its number.
+                                let _ = i;
+                                targets.add(*rect, Target::SourceLine { file: file.clone(), line: n });
+                            }
                         }
                     }
                 }
+                (None, Some(_)) => drop(ui.label(RichText::new("source file is not on this machine").small().color(c.text_weak))),
+                _ => drop(ui.label(RichText::new("no line info for this frame").small().color(c.text_weak))),
             }
-            (None, Some(_)) => drop(ui.label(RichText::new("source file is not on this machine").small().color(c.text_weak))),
-            _ => drop(ui.label(RichText::new("no line info for this frame").small().color(c.text_weak))),
-        }
 
-        ui.add_space(6.0);
+        });
+
+        ui.label(RichText::new("LOCALS").small().strong().color(c.text_weak));
+        ui.add_space(SPACE_XS as f32 - 2.0);
         let vars = st.session.locals.get(&f.level).cloned();
         match vars {
             None => drop(ui.label(RichText::new("locals…").small().color(c.text_weak))),
@@ -153,7 +170,10 @@ fn frame_body(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors, targets: &mut
             Some(vars) => {
                 let mut expand = None;
                 card(ui, c, |ui| {
-                    for v in &vars {
+                    for (i, v) in vars.iter().enumerate() {
+                        if i > 0 {
+                            rule(ui, c);
+                        }
                         let title = if v.is_arg { format!("{}  (arg)", v.name) } else { v.name.clone() };
                         let expanded = st.values.get(&(f.level, v.name.clone()));
                         match v.value.as_ref().or(expanded) {
@@ -161,7 +181,6 @@ fn frame_body(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors, targets: &mut
                                 let a = ui.label(RichText::new(title).small().color(c.text_weak));
                                 let b = ui.add(egui::Label::new(RichText::new(val).monospace()).wrap());
                                 targets.add(a.rect.union(b.rect), Target::Local { name: v.name.clone(), value: val.clone() });
-                                ui.add_space(4.0);
                             }
                             // Aggregates are not fetched at the stop (--simple-values):
                             // a phone should not print every struct in scope on every
@@ -191,11 +210,14 @@ fn transport(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors) {
     let n = st.session.frames.len();
     let at = st.session.selected;
 
+    // A hairline and a little air: the bar is chrome, the page above it is content.
+    uikit_egui::glass::paint_top_hairline(ui, ui.max_rect());
+    ui.add_space(SPACE_XS as f32);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         let w = ((ui.available_width() - 5.0 * 4.0) / 6.0).floor();
         let button = |ui: &mut Ui, enabled: bool, label: String, tip: &str| {
-            ui.add_enabled(enabled, egui::Button::new(RichText::new(label).size(16.0)).min_size(egui::vec2(w, BAR_H - 6.0))).on_hover_text(tip).clicked()
+            ui.add_enabled(enabled, egui::Button::new(RichText::new(label).size(16.0)).min_size(egui::vec2(w, BAR_H - 12.0))).on_hover_text(tip).clicked()
         };
         if button(ui, stopped && at > 0, g('‹', "in"), "toward the callee (gdb: down)") {
             st.toward_callee();
@@ -225,6 +247,12 @@ fn transport(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors) {
 pub fn header(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors) {
     let n = st.session.frames.len();
     if st.session.state != RunState::Stopped || n == 0 {
+        return;
+    }
+    // A plain label unless there is a picker to sit beside it: a horizontal row is
+    // at least a touch target tall, which put 40pt of nothing above the callout.
+    if st.session.threads.len() <= 1 {
+        ui.label(RichText::new(format!("frame {} of {n}", st.session.selected + 1)).small().color(c.text_weak));
         return;
     }
     ui.horizontal(|ui| {

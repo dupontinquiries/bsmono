@@ -62,19 +62,31 @@ fn no_page_overlaps_clips_or_clashes_at_phone_width() {
 fn the_recorded_crash_reaches_the_stack_page() {
     let (mut st, rec) = stopped_shell();
     st.page = PAGE_STACK;
+    // The replayed session never answers the fault-address probe, so this stop's
+    // diagnostic has a title and no notes. Give it one, to have a body to fold.
+    st.diagnostic.as_mut().expect("the stop produced a diagnostic").0.notes.push("a note from the fixture".into());
     let (_, texts) = probe(&mut st, PHONE, 3);
     let all = texts.join("\n");
-    assert!(all.contains("error[SIGSEGV]"), "diagnostic card: {all}");
+    // The callout's chip. Deliberately NOT "error[SIGSEGV]": that string is also in
+    // the rendered diagnostic the Wire page logs, and the wide-window test below
+    // passed on it for as long as it existed whether or not the Stack page drew
+    // anything - the pass came from a different page than the one being claimed.
+    assert!(all.contains("ERROR  SIGSEGV"), "callout chip: {all}");
+    assert!(all.contains("segmentation fault in `depth3`"), "callout title: {all}");
     assert!(all.contains("depth3"), "blamed frame's function: {all}");
     assert!(all.contains("frame 1 of 4"), "position: {all}");
 
     // Walk toward the caller through the shell, as the ‹ › buttons and the swipe do.
+    assert!(all.contains("a note from the fixture"), "open at the stop, notes showing: {all}");
     st.toward_caller();
     assert_eq!(st.session.selected, 1);
+    assert!(!st.diag_open, "walking to another frame folds the callout");
     let (_, texts) = probe(&mut st, PHONE, 3);
     let all = texts.join("\n");
     assert!(all.contains("depth2") && all.contains("frame 2 of 4"), "{all}");
-    assert!(all.contains("0x7fffffffe8d0"), "frame 1's locals came with the transcript: {all}");
+    assert!(all.contains("ERROR  SIGSEGV") && !all.contains("a note from the fixture"), "folded: the header stays, the notes go: {all}");
+    assert!(all.contains("LOCALS"), "the locals heading: {all}");
+    assert!(all.contains("0x7fffffffe8d0"), "and with it folded, frame 1's locals are on a 760pt screen without scrolling: {all}");
     // Frame 1's locals were already there; frame 0's were asked for at the stop.
     let asked: Vec<_> = rec.0.lock().unwrap().iter().filter(|r| matches!(r, Request::Locals { .. })).cloned().collect();
     assert_eq!(asked, [Request::Locals { thread: 1, frame: 0 }]);
@@ -87,7 +99,7 @@ fn a_wide_window_shows_stack_vitals_and_wire_side_by_side() {
     // 40 frames: the plan adopts a wider layout only after it has held for a dwell.
     let (r, texts) = probe(&mut st, [1300.0, 800.0], 40);
     let all = texts.join("\n");
-    for needle in ["error[SIGSEGV]", "MEMORY (resident, MiB)", "MI traffic"] {
+    for needle in ["ERROR  SIGSEGV", "MEMORY (resident, MiB)", "MI traffic"] {
         assert!(all.contains(needle), "{needle:?} missing from a 1300pt window: {all}");
     }
     assert!(r.id_clashes.is_empty(), "{}", r.describe());

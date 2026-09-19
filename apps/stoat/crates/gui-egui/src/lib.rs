@@ -35,7 +35,7 @@ use uikit_egui::responsive_nav::{self, NavLayout};
 use uikit_egui::segmented_tabs::TabStrip;
 use uikit_egui::{GestureLayer, PaletteColors};
 
-const GUTTER: f32 = 12.0;
+const GUTTER: f32 = 20.0;
 /// The narrowest a page is usable at; also what the dashboard packs columns by.
 const PAGE_MIN_W: f32 = 340.0;
 
@@ -174,6 +174,7 @@ pub fn draw(ui: &mut Ui, st: &mut ShellState, view: &mut View, c: &PaletteColors
         }
     }
 
+    ui.add_space(uikit_egui::tokens::SPACE_XS as f32);
     let w = ui.available_width();
     let cols = view.plan.decide(fit_cols(w, GUTTER, &view.metas), fit_cols(w * (1.0 - GROW_MARGIN), GUTTER, &view.metas), now).min(PAGES.len());
     let mut pages_mode = false;
@@ -192,7 +193,7 @@ pub fn draw(ui: &mut Ui, st: &mut ShellState, view: &mut View, c: &PaletteColors
     if visible.contains(&PAGE_STACK) {
         pages::stack::header(ui, st, c);
     }
-    ui.add_space(2.0);
+    ui.add_space(uikit_egui::tokens::SPACE_SM as f32);
 
     // ---- body ----
     let body = ui.available_rect_before_wrap();
@@ -214,9 +215,15 @@ pub fn draw(ui: &mut Ui, st: &mut ShellState, view: &mut View, c: &PaletteColors
         for (i, page) in visible.into_iter().enumerate() {
             let x = body.min.x + i as f32 * (col_w + GUTTER);
             let r = Rect::from_min_size(egui::pos2(x, body.min.y), egui::vec2(col_w, body.height()));
+            if i > 0 {
+                // Columns are separate pages side by side; say so with a rule in the gutter.
+                let gx = x - GUTTER * 0.5;
+                ui.painter().vline(gx, body.y_range(), egui::Stroke::new(1.0, uikit_egui::callout::mix(c.bg_base, c.border, 0.6)));
+            }
             ui.scope_builder(UiBuilder::new().max_rect(r), |ui| {
                 ui.push_id(("stoat-page", page), |ui| {
                     ui.label(RichText::new(PAGES[page]).small().strong().color(c.accent));
+                    ui.add_space(uikit_egui::tokens::SPACE_XS as f32);
                     page_ui(ui, page, st, view, c);
                 });
             });

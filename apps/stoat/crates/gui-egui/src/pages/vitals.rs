@@ -13,8 +13,14 @@ pub fn ui(ui: &mut Ui, st: &mut ShellState, c: &PaletteColors) {
         if summary.is_empty() {
             ui.label(RichText::new("No samples yet. Memory and CPU are sampled from /proc while the program runs; frame pacing needs a frame marker set on Launch.").color(c.text_weak));
         }
-        for line in &summary {
-            ui.label(RichText::new(line).small());
+        if !summary.is_empty() {
+            // In a card, at body size: two small unboxed lines above three graphs
+            // read as a caption, and this is the page's actual finding.
+            super::card(ui, c, |ui| {
+                for line in &summary {
+                    ui.add(egui::Label::new(RichText::new(line).size(uikit_egui::tokens::FONT_BASE as f32)).wrap());
+                }
+            });
         }
         section(ui, c, "MEMORY (resident, MiB)");
         let rss: Vec<f32> = samples.iter().map(|s| s.rss_kb as f32 / 1024.0).collect();

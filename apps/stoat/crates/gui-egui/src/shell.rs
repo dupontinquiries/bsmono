@@ -183,6 +183,10 @@ pub struct ShellState {
 
     /// Why we are stopped, plus the vitals summary captured at that moment.
     pub diagnostic: Option<(Diagnostic, Vec<String>)>,
+    /// Whether the stop's callout shows its notes. Open when a stop arrives; folded
+    /// once you walk to another frame - by then it has been read, and on a phone
+    /// it is a third of the screen between you and the frame you walked to.
+    pub diag_open: bool,
     /// Aggregates the user expanded: (frame level, expression) -> value.
     pub values: HashMap<(u32, String), String>,
 
@@ -237,6 +241,7 @@ impl ShellState {
             proc_query: String::new(),
             core_text: String::new(),
             diagnostic: None,
+            diag_open: true,
             values: HashMap::new(),
             debuginfod: false,
             usage: Vec::new(),
@@ -467,14 +472,17 @@ impl ShellState {
     }
 
     pub fn toward_caller(&mut self) {
+        self.diag_open = false;
         self.with_session(|s, b| s.up(b));
     }
 
     pub fn toward_callee(&mut self) {
+        self.diag_open = false;
         self.with_session(|s, b| s.down(b));
     }
 
     pub fn select_frame(&mut self, idx: usize) {
+        self.diag_open = false;
         self.with_session(|s, b| s.select_frame(idx, b));
     }
 
@@ -650,6 +658,7 @@ impl ShellState {
                     } else {
                         let notes = vitals::summarize(&self.vitals.lock().unwrap());
                         self.diagnostic = Some((d, notes));
+                        self.diag_open = true;
                     }
                 }
                 Change::Output { channel, text } => {
