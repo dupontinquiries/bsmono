@@ -36,7 +36,17 @@ pub enum Form {
     BottomSheet { max_h: f32, frac: f32 },
     /// Centered, no slide; the backdrop fade is its whole entrance.
     CenterPopup { w: f32, max_h: f32 },
+    /// Pinned near the nav bar rather than centred, following where the nav
+    /// is. `settingsPopup` is the only QML popup that does this, and it does
+    /// it because it is the nav bar's own menu — a settings panel that opens
+    /// in the middle of the screen has lost its relationship to the control
+    /// that opened it.
+    NavAnchored { w: f32, max_h: f32 },
 }
+
+/// `settingsPopup`'s gap from the bottom edge (main.qml:27731). The top-nav
+/// branch's 8pt/54pt pair is not carried — see `show`.
+pub const NAV_BOTTOM_GAP: f32 = 60.0;
 
 /// THE TABLE. One row per surface, each with its QML source.
 pub fn form(s: Surface) -> Form {
@@ -48,10 +58,17 @@ pub fn form(s: Surface) -> Form {
         // No QML counterpart (the QML has a workspaces PAGE, not a drawer).
         // Chosen to match missingPkg's right-edge shape; adjust freely.
         Surface::Workspaces => Form::RightDrawer { max_w: 420.0, frac: 0.85 },
-        // settingsPopup main.qml:27729 — width: 320, height: Math.min(root.height - 80, 760).
-        // The QML also anchors it near the nav bar (x depends on _navAtTop);
-        // centered here until a device says otherwise.
-        Surface::Settings => Form::CenterPopup { w: 320.0, max_h: 760.0 },
+        // settingsPopup main.qml:27729 — width: 320, height: Math.min(root.height - 80, 760),
+        // and anchored to the nav bar on BOTH branches:
+        //   x: _navAtTop ? (root.width - width - 8) : max(8, (root.width - width) / 2)
+        //   y: _navAtTop ? 54                       : max(8, root.height - height - 60)
+        // Top-right under a top nav; bottom-centre otherwise. It is never
+        // centred vertically.
+        //
+        // This said "centered here until a device says otherwise". A device
+        // said otherwise — reported as "menus in the wrong locations" — so it
+        // is anchored now.
+        Surface::Settings => Form::NavAnchored { w: 320.0, max_h: 760.0 },
         // favoritesPopup main.qml:30479 — width: Math.min(380, root.width - 32), centered
         Surface::Favorites => Form::CenterPopup { w: 380.0, max_h: 640.0 },
         // No QML counterpart — this surface is new. A centred popup like
@@ -97,7 +114,8 @@ pub fn resolved_size(f: Form, screen: Vec2) -> Vec2 {
             Vec2::new(max_w.min(screen.x * frac), screen.y)
         }
         Form::BottomSheet { max_h, frac } => Vec2::new(screen.x, max_h.min(screen.y * frac)),
-        Form::CenterPopup { w, max_h } => {
+        // Same sizing rule as a centre popup; only the POSITION differs.
+        Form::CenterPopup { w, max_h } | Form::NavAnchored { w, max_h } => {
             // The QML caps the popup's width to the screen (favoritesPopup:
             // root.width - 32) and its height to root.height - 80; keep both
             // so a phone in landscape does not clip.
@@ -121,6 +139,9 @@ pub fn slide_offset(f: Form, size: Vec2, t: f32) -> Vec2 {
         Form::RightDrawer { .. } => Vec2::new(size.x * out, 0.0),
         Form::BottomSheet { .. } => Vec2::new(0.0, size.y * out),
         Form::CenterPopup { .. } => Vec2::ZERO,
+        // The offset carries the nav anchoring, so `show` computes it from the
+        // live screen size rather than here where only `size` is known.
+        Form::NavAnchored { .. } => Vec2::ZERO,
     }
 }
 
@@ -130,6 +151,9 @@ fn anchor_of(f: Form) -> Align2 {
         Form::RightDrawer { .. } => Align2::RIGHT_TOP,
         Form::BottomSheet { .. } => Align2::CENTER_BOTTOM,
         Form::CenterPopup { .. } => Align2::CENTER_CENTER,
+        // Top-right under a top nav, bottom-centre otherwise. `show` picks
+        // between them; this is the top-nav case's anchor.
+        Form::NavAnchored { .. } => Align2::RIGHT_TOP,
     }
 }
 
@@ -171,15 +195,32 @@ pub fn show(
     let f = form(s);
     let screen = ctx.content_rect().size();
     let size = resolved_size(f, screen);
-    let area = egui::Modal::default_area(Id::new(("surface-modal", s)))
-        .anchor(anchor_of(f), slide_offset(f, size, t));
+    // NavAnchored follows the nav bar, which is the whole reason it is not a
+    // CenterPopup. The QML branches on `_navAtTop`; this frontend has no such concept —
+    // every chrome panel here is a `TopBottomPanel::bottom`, so the nav is
+    // always at the bottom and only QML's `!_navAtTop` branch can apply:
+    //
+    //   x: max(8, (root.width - width) / 2)     -> horizontally centred
+    //   y: max(8, root.height - height - 60)    -> 60pt above the bottom
+    //
+    // The top-nav branch is deliberately NOT carried. Implementing it would
+    // mean inventing a `nav_at_top` flag nothing sets and nothing reads, and a
+    // dead branch guarded by a constant `false` is worse than an honest note:
+    // it looks like working code the first time someone needs it.
+    let (anchor, offset) = match f {
+        Form::NavAnchored { .. } => (Align2::CENTER_BOTTOM, Vec2::new(0.0, -NAV_BOTTOM_GAP)),
+        _ => (anchor_of(f), slide_offset(f, size, t)),
+    };
+    let area = egui::Modal::default_area(Id::new(("surface-modal", s))).anchor(anchor, offset);
     let frame = match f {
         // Edge-flush surfaces: square the corners (QML drawers have none; the
         // cmd sheet's radius-20 top is a device-tuning candidate, not ported).
         Form::LeftDrawer { .. } | Form::RightDrawer { .. } | Form::BottomSheet { .. } => {
             egui::Frame::popup(&ctx.global_style()).corner_radius(0.0)
         }
-        Form::CenterPopup { .. } => egui::Frame::popup(&ctx.global_style()),
+        Form::CenterPopup { .. } | Form::NavAnchored { .. } => {
+            egui::Frame::popup(&ctx.global_style())
+        }
     };
     let resp = egui::Modal::new(Id::new(("surface", s)))
         .area(area)
@@ -197,7 +238,7 @@ pub fn show(
             // edge-flush surfaces whose whole point is a fixed extent, and a
             // content-sized drawer would jump width as its list changed.
             match f {
-                Form::CenterPopup { .. } => {
+                Form::CenterPopup { .. } | Form::NavAnchored { .. } => {
                     ui.set_width(size.x);
                     ui.set_max_height(size.y);
                 }
@@ -237,7 +278,9 @@ mod tests {
                     Form::LeftDrawer { .. } => assert_eq!(off, Vec2::new(-size.x, 0.0)),
                     Form::RightDrawer { .. } => assert_eq!(off, Vec2::new(size.x, 0.0)),
                     Form::BottomSheet { .. } => assert_eq!(off, Vec2::new(0.0, size.y)),
-                    Form::CenterPopup { .. } => assert_eq!(off, Vec2::ZERO),
+                    Form::CenterPopup { .. } | Form::NavAnchored { .. } => {
+                        assert_eq!(off, Vec2::ZERO)
+                    }
                 }
                 rows += 1;
             }
@@ -312,5 +355,27 @@ mod tests {
         for s in [Surface::Blocks, Surface::MissingPkg, Surface::Palette] {
             assert_eq!(resolved_size(form(s), PHONE).y, PHONE.y, "{s:?}");
         }
+    }
+
+    /// THE SETTINGS POPUP IS NOT CENTRED, and never was in the QML. Its table
+    /// row said "centered here until a device says otherwise"; a device said
+    /// otherwise, reported as "menus in the wrong locations".
+    #[test]
+    fn the_settings_popup_anchors_to_the_nav_bar() {
+        assert!(matches!(form(Surface::Settings), Form::NavAnchored { .. }),
+                "settings must follow the nav bar, not sit in the middle");
+        // Everything else that is a popup stays centred -- favourites really
+        // is `x: (root.width - width) / 2` in the QML.
+        assert!(matches!(form(Surface::Favorites), Form::CenterPopup { .. }));
+    }
+
+    /// It keeps a centre popup's SIZING; only the position differs. Sharing
+    /// the arm in `resolved_size` is what guarantees that, and this pins it so
+    /// a later edit cannot split them apart unnoticed.
+    #[test]
+    fn nav_anchoring_does_not_change_how_the_popup_is_sized() {
+        let nav = resolved_size(Form::NavAnchored { w: 320.0, max_h: 760.0 }, PHONE);
+        let mid = resolved_size(Form::CenterPopup { w: 320.0, max_h: 760.0 }, PHONE);
+        assert_eq!(nav, mid);
     }
 }
