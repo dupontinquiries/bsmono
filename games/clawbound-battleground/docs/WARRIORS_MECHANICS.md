@@ -170,7 +170,17 @@ What the passage asks for that is missing:
    contributing and the weights renormalise, so total perception is roughly
    constant and merely moves between channels. Raising hearing would make
    night strictly better for a hunter and invert the whole tension.
-5. Stalk posture and aimed leap in the rig.
+5. ~~**Stalk posture and aimed leap in the rig**~~ — done: `src/puppet.rs`
+   (stalk as a posture blend over cover, not a gait), `src/leap.rs` (a leap
+   aimed at a place, chained from perch to perch), `src/rigged.rs` (the
+   voxel body cut into parts the rig poses). The rule it settled, after
+   getting it wrong once: scale to the ANIMAL. The first leap capped at
+   2.4 u, a person's jump; a cat reaches five shoulder heights from where it
+   stands, walks ridges, and rights itself in any fall. And "can it be stood
+   on" is a fact about the prop (`blockers::Perch`), never about its height
+   — a pine blocks to 3 u and is not a platform.
+   "Dived for cover" is still open: the stalk lowers the body, but nothing
+   yet puts it BELOW the fern tops.
 6. ~~**Fresh-kill economy**~~ — done, `src/freshkill.rs`. Caught, carried,
    piled, eaten before it turns. Carrying is where the tension is: a cat's
    jaws hold one mouthful, so a patrol bringing prey home cannot challenge an

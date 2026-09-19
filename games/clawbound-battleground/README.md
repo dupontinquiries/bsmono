@@ -172,6 +172,7 @@ input model the monorepo's other games (skydribble, unendlich) use.
 | `W A S D` / arrows | Move (camera-relative) |
 | `Shift` (hold) | Auto-run toward the crosshair |
 | `LMB` | Basic attack (auto-assist target) |
+| `Space` / pad `A` / touch `^` | Leap: onto the rock, log, wall top or pillar cap you are steering at (up to 5.5 u above your paws), else up to 9 u forward. From a perch the next leap is free |
 | `1 2 3 4` or `Q E R F` | Cast abilities at crosshair ground point (4 = ultimate) |
 | `B` | Toggle the 100-item shop |
 | `Tab` / `C` (hold) | Scoreboard |

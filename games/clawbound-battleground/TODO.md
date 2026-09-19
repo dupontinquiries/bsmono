@@ -40,7 +40,41 @@ only had the former:
 **If you have a display:** `cargo run --release` and just look at it. That's
 the single highest-value thing anyone can do with this repo next.
 
+## Seen rendered (lavapipe, `--rig-sheet`), stills only
+
+- Ancestors posed per part: a `Rear` cast on vertical planted hind legs, a
+  forepaw mid-swipe, an `Arch` with the tail up, a cat on a buttress root's
+  crest, a cat trotting a log's moss top, a cat mid-tumble with the head
+  leading. Four of the thirteen cast signatures (Sunroar, Rake, Rainfall,
+  Umbra).
+- NOT seen: any of it in motion; the stalk-in-fern posture (the staged
+  camera landed inside a trunk, then the re-render was not viewed); a cat on
+  an actual RuinWall; the other nine signatures. `CLAWBOUND_SHEET=wall,fern`
+  renders named shots only.
+
 ## Known gaps
+
+- **High ground is real and untuned.** Auto-attack range is 3D distance
+  (`systems.rs`), so a cat on a 4 u pillar cap is out of reach of a 3.4 u
+  melee swing. A solid hit knocks a cat off a ridge, but only a ranged
+  attacker can land one. Needs a decision: measure melee range in the
+  ground plane with a height allowance, or make climbing out of reach the
+  point and give melee ancestors the better leap.
+- **Bots do not leap**, stand on nothing, and have not been run against the
+  new wall and log capsules. The ruin wall's L has a concave inner corner,
+  which is the shape that stalls a unit that paths by push-out. Run
+  `simdbg` across seeds before trusting it.
+- **Roots: outer slabs only.** `push_jungle_roots` registers the two outer
+  boxes of each jungle-tree root (1.8 u) as walkable. The inner three
+  (2.4 u and up) are still ghost geometry, and StranglerFig / MegaTree roots
+  are not registered at all.
+- **The ruin wall's long arm is crenellated** (1.8 to 3.6 u) and registered
+  flat at 3.0 u, so paws clip or float by up to a voxel along it. The short
+  arm is a true 3.0 u.
+- **`Grid::mesh` still emits interior voxels** (~877k instances for the
+  world). `mesh_where` hull-culls the ancestors' parts; doing the same for
+  props wants its own screenshot diff.
+- **Perching grants nothing** beyond position: no sight bonus, no cover.
 
 - **bsgames handoff plays solo.** `BSGAMES_HANDOFF_ROLE/ME/PEER` are read and
   logged (`src/launch.rs`), but there's no netcode — a "join a friend" handoff
@@ -102,9 +136,10 @@ the single highest-value thing anyone can do with this repo next.
 ## Verification commands
 
 ```bash
-cargo test --no-default-features   # 79 tests, no GPU, no audio libs needed
+cargo test --no-default-features   # 209 lib + 12 + 2, no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
 cargo test                          # same, plus links cpal (needs libasound2-dev)
 cargo check --features gamepad      # needs libudev-dev
 cargo run --example simdbg <seed>   # headless 12-minute AI match trace
 cargo run -- --screenshot           # headless PNG render (needs a GPU or lavapipe)
+cargo run -- --rig-sheet            # close-ups of posed ancestors, through the real draw path
 ```
