@@ -236,6 +236,22 @@ pub struct Project {
     /// module. A curve with no binding is inert; a curve is never removed
     /// while a binding names it. `serde(default)` for the usual reason.
     #[serde(default)]
+    /// Per-clip fades, in ticks from the clip's own start and end.
+    ///
+    /// A SPARSE MAP, not a field on `Clip`, for two reasons. There are 221
+    /// `Clip` literals in this tree and most clips have no fade, so the common
+    /// project stores nothing — the same trade `Rack::swing_overrides` makes.
+    /// And widening `Clip` would have meant a mechanical edit across all 221,
+    /// which is exactly the rewrite that corrupted studio-app earlier.
+    ///
+    /// On the PROJECT rather than the engine, which is the actual fix here.
+    /// `studio_audio::Fades` and the render's `fade.gain_at` already existed,
+    /// and `studio_engine::Device::set_fades` could hold them — with no
+    /// callers anywhere. So the machinery worked and a fade could not be
+    /// created, saved, undone, or seen by a collaborator. A fade is a fact
+    /// about the edit, not about this device's playback.
+    #[serde(default)]
+    pub fades: BTreeMap<ClipId, (Ticks, Ticks)>,
     pub curves: BTreeMap<CurveId, Curve>,
     /// Which curves drive which targets through which gates. Multiplied
     /// into the target's lane at render time; a binding whose gate clip is
@@ -916,6 +932,13 @@ pub enum Op {
     /// Add or move a named marker. Absolute by NAME: setting a marker
     /// that already exists moves it, which is what "set the chorus here"
     /// means when you meant it the second time.
+    /// Set a clip's fade in/out, in ticks from its own start and end.
+    ///
+    /// Both in one op because they are one gesture in every editor that has
+    /// them — you drag a clip's corner — and two ops would let `u` leave half
+    /// a crossfade. `(0, 0)` removes the entry rather than storing a no-op
+    /// fade, which keeps the map sparse and makes "has a fade" a real question.
+    SetClipFade { id: ClipId, fade_in: Ticks, fade_out: Ticks },
     SetMarker { at: Ticks, name: String },
     RemoveMarker { name: String },
     /// Both communities ask for this by name ("Delete All Timeline
@@ -959,6 +982,12 @@ pub enum EditError {
     /// past an edge is a non-event, not an empty half.
     OutOfComp { id: GroupId },
     /// A marker must have a name — an unnamed one cannot be jumped to.
+    /// A fade cannot be negative.
+    NegativeFade { id: ClipId },
+    /// `fade_in + fade_out` exceeds the clip. Refused rather than clamped:
+    /// clamping silently changes what was asked for, and `gain_at` would cope
+    /// either way, which is what makes the silence dangerous.
+    FadeLongerThanClip { id: ClipId, len: Ticks },
     EmptyMarker,
     NoSuchMarker(String),
     NoSuchGroup(GroupId),
@@ -1382,6 +1411,31 @@ impl Project {
                 let g = self.groups.get_mut(id).ok_or(EditError::NoSuchGroup(*id))?;
                 let inv = Op::SetGroupActive { id: *id, active: g.active };
                 g.active = *active;
+                Ok(inv)
+            }
+            Op::SetClipFade { id, fade_in, fade_out } => {
+                if !self.clips.contains_key(id) {
+                    return Err(EditError::NoSuchClip(*id));
+                }
+                // A fade longer than the clip is refused rather than clamped.
+                // Clamping looks helpful and silently changes what the person
+                // asked for; refusing lets the caller decide whether it meant
+                // "the whole clip" or made a mistake. `gain_at` would cope
+                // either way, which is what makes the silence dangerous.
+                let len = self.clips[id].len;
+                if fade_in.0 < 0 || fade_out.0 < 0 {
+                    return Err(EditError::NegativeFade { id: *id });
+                }
+                if fade_in.0 + fade_out.0 > len.0 {
+                    return Err(EditError::FadeLongerThanClip { id: *id, len });
+                }
+                let prev = self.fades.get(id).copied().unwrap_or((Ticks(0), Ticks(0)));
+                let inv = Op::SetClipFade { id: *id, fade_in: prev.0, fade_out: prev.1 };
+                if fade_in.0 == 0 && fade_out.0 == 0 {
+                    self.fades.remove(id);
+                } else {
+                    self.fades.insert(*id, (*fade_in, *fade_out));
+                }
                 Ok(inv)
             }
             Op::SetMarker { at, name } => {
@@ -3221,4 +3275,83 @@ mod source_kind_tests {
         let inv = p.apply(&Op::RemoveGroup { id: g }).unwrap();
         assert!(matches!(inv, Op::SetGroup { .. }), "not wrapped in a Group: {inv:?}");
     }
+
+#[cfg(test)]
+mod fade_tests {
+    use super::*;
+
+    fn one_clip() -> (Project, ClipId) {
+        let mut p = Project::default();
+        p.apply(&Op::AddTrack {
+            track: Track { id: TrackId(1), kind: TrackKind::Audio, name: "A".into(),
+                           muted: false, locked: false, gain: 1.0, route: None },
+            at: 0,
+        }).unwrap();
+        p.apply(&Op::AddSource {
+            source: Source::file(SourceId(1), "/a.wav", Ticks(1000), 48000, 2, false),
+        }).unwrap();
+        let id = ClipId(1);
+        p.apply(&Op::AddClip { clip: Clip {
+            id, source: SourceId(1), track: TrackId(1),
+            pos: Ticks(0), src_in: Ticks(0), len: Ticks(100),
+            gain: 1.0, effects: Vec::new(),
+        }}).unwrap();
+        (p, id)
+    }
+
+    /// SPARSE: no fade stores nothing, so "has a fade" is a real question and
+    /// the common project carries no entries at all.
+    #[test]
+    fn a_project_starts_with_no_fades_and_zero_removes_one() {
+        let (mut p, id) = one_clip();
+        assert!(p.fades.is_empty());
+        p.apply(&Op::SetClipFade { id, fade_in: Ticks(10), fade_out: Ticks(5) }).unwrap();
+        assert_eq!(p.fades.get(&id), Some(&(Ticks(10), Ticks(5))));
+        p.apply(&Op::SetClipFade { id, fade_in: Ticks(0), fade_out: Ticks(0) }).unwrap();
+        assert!(p.fades.is_empty(), "a zero fade is removed, not stored");
+    }
+
+    /// The op returns its own inverse, so a fade is one undo step -- both ends
+    /// together, because dragging a clip's corner is one gesture.
+    #[test]
+    fn undoing_a_fade_restores_the_previous_one() {
+        let (mut p, id) = one_clip();
+        p.apply(&Op::SetClipFade { id, fade_in: Ticks(10), fade_out: Ticks(10) }).unwrap();
+        let inv = p.apply(&Op::SetClipFade { id, fade_in: Ticks(40), fade_out: Ticks(0) }).unwrap();
+        p.apply(&inv).unwrap();
+        assert_eq!(p.fades.get(&id), Some(&(Ticks(10), Ticks(10))));
+    }
+
+    /// REFUSED, NOT CLAMPED. Clamping looks helpful and silently changes what
+    /// was asked for; `gain_at` would cope either way, which is exactly what
+    /// makes the silence dangerous.
+    #[test]
+    fn a_fade_longer_than_the_clip_is_refused() {
+        let (mut p, id) = one_clip();
+        match p.apply(&Op::SetClipFade { id, fade_in: Ticks(60), fade_out: Ticks(60) }) {
+            Err(EditError::FadeLongerThanClip { len, .. }) => assert_eq!(len, Ticks(100)),
+            other => panic!("must refuse: {other:?}"),
+        }
+        assert!(p.fades.is_empty(), "and must not have written anything");
+        // Exactly the clip's length is fine -- that is a crossfade through the
+        // whole clip, which is a real thing to want.
+        p.apply(&Op::SetClipFade { id, fade_in: Ticks(50), fade_out: Ticks(50) }).unwrap();
+    }
+
+    #[test]
+    fn a_negative_fade_is_refused() {
+        let (mut p, id) = one_clip();
+        assert!(matches!(
+            p.apply(&Op::SetClipFade { id, fade_in: Ticks(-1), fade_out: Ticks(0) }),
+            Err(EditError::NegativeFade { .. })));
+    }
+
+    #[test]
+    fn fading_a_clip_that_does_not_exist_is_refused() {
+        let (mut p, _) = one_clip();
+        assert!(matches!(
+            p.apply(&Op::SetClipFade { id: ClipId(99), fade_in: Ticks(1), fade_out: Ticks(0) }),
+            Err(EditError::NoSuchClip(_))));
+    }
+}
 }

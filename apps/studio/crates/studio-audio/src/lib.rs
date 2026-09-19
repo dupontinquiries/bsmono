@@ -650,7 +650,20 @@ pub fn mixdown_into(
             if clip.end() <= from || clip.pos >= to { continue; }
             let Some(src) = audio.get(&clip.source) else { continue };
             if src.channels.is_empty() { continue; }
-            let fade = fades.get(&clip.id).copied().unwrap_or_default();
+            // THE PROJECT'S FADE IS THE FADE. The `fades` parameter stays as
+            // an override for callers that have one (the engine's
+            // `set_fades`), but a fade is a fact about the edit, so the
+            // project is where it lives and where an empty override now falls
+            // back to.
+            //
+            // Before this, nothing anywhere populated `fades`: the map was
+            // always empty, `gain_at` always returned 1.0, and the whole fade
+            // path was dead while looking implemented.
+            let fade = fades.get(&clip.id).copied().unwrap_or_else(|| {
+                project.fades.get(&clip.id)
+                    .map(|(i, o)| Fades { fade_in: *i, fade_out: *o })
+                    .unwrap_or_default()
+            });
             // The clip's own effect chain, instantiated once per clip (not
             // per sample) so a stateful effect's filter history is
             // continuous across the whole clip rather than reset every
