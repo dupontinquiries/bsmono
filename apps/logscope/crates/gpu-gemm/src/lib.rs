@@ -1327,6 +1327,16 @@ fn fused_qkv_enabled() -> bool {
 /// Head shapes the fused QK-norm+rope kernels (QKNORM_ROPE, QKNORM_ROPE_KV_APPEND) can serve.
 /// `QKNORM_MAX_HD` is their `nx` workgroup scratch; the rest is what makes a rotary pair a pair.
 /// Pure so it can be tested without a GPU, and one definition so the two kernels cannot drift.
+/// What the GPU routing kernels (MOE_TOPK / MOE_TOPK_BIAS) can select: their `idx`/`lg` scratch is
+/// 16 wide and their group mask 64 wide. Both GPU-routed MoE paths used to `clamp(1, 16)` the
+/// model's top-k — a model routing to 20 experts silently ran with 16, which is a wrong answer
+/// that looks like a slightly worse model. Outside this they now DECLINE to the v1 grouped path,
+/// which routes on the CPU with no such bound. Ornith-1.5-397B is top-10 of 512 in one group: inside.
+pub const MOE_GPU_MAX_K: u32 = 16;
+pub const MOE_GPU_MAX_GROUPS: u32 = 64;
+pub fn moe_gpu_routable(n_used: u32, n_group: u32) -> bool {
+    (1..=MOE_GPU_MAX_K).contains(&n_used) && n_group <= MOE_GPU_MAX_GROUPS
+}
 pub const QKNORM_MAX_HD: usize = 512;
 pub fn qknorm_rope_fusable(hd: usize, rot: usize) -> bool {
     hd > 0 && hd <= QKNORM_MAX_HD && rot >= 2 && rot <= hd && rot % 2 == 0
@@ -7428,7 +7438,8 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             LinKind::Q4(w) => (&w.qw, &w.qs, w.k, MOE_DOWN_COMBINE_Q4),
             _ => return None,
         };
-        let slots = m.cfg.n_used.clamp(1, 16) as usize;
+        if !moe_gpu_routable(m.cfg.n_used, m.cfg.n_group) { return None; } // see moe_gpu_routable: decline, never clamp
+        let slots = m.cfg.n_used as usize;
         if t * slots > 65535 { return None; }
         let ne = m.cfg.n_routed as usize;
         let ff = dn_k; let ff2 = 2 * dn_k;
@@ -7540,7 +7551,8 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             LinKind::Iq1(q) => (&q.blocks, self.iq1s_grid_tensor(), q.k, MOE_MATVEC_IQ1_S),
             LinKind::F32(_) => return None,
         };
-        let slots = m.cfg.n_used.clamp(1, 16) as usize;
+        if !moe_gpu_routable(m.cfg.n_used, m.cfg.n_group) { return None; } // see moe_gpu_routable: decline, never clamp
+        let slots = m.cfg.n_used as usize;
         let ne = m.cfg.n_routed as usize;
         let ff2 = 2 * dn_k;              // fused gate||up rows per expert = 2·ff (ff == down's k)
         // 1) router logits stay on-GPU
@@ -19975,6 +19987,29 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 #[cfg(test)]
 mod qknorm_envelope_tests {
     use super::{qknorm_rope_fusable, QKNORM_MAX_HD, QKNORM_ROPE, QKNORM_ROPE_KV_APPEND};
+    use super::{moe_gpu_routable, MOE_GPU_MAX_GROUPS, MOE_GPU_MAX_K, MOE_TOPK, MOE_TOPK_BIAS};
+
+    /// Same shape of bug, same shape of guard: the routing kernels' scratch bounds top-k and the
+    /// group count, the Rust side clamped instead of declining, and nothing tied the two numbers.
+    #[test]
+    fn gpu_routing_declines_outside_its_scratch_instead_of_clamping() {
+        assert!(moe_gpu_routable(10, 1), "Ornith-1.5-397B / Qwen3.5-MoE: top-10, ungrouped");
+        assert!(moe_gpu_routable(8, 8), "DeepSeek-V3: top-8, 8 groups");
+        assert!(moe_gpu_routable(MOE_GPU_MAX_K, MOE_GPU_MAX_GROUPS));
+        assert!(!moe_gpu_routable(MOE_GPU_MAX_K + 1, 1), "was clamped to 16 and run");
+        assert!(!moe_gpu_routable(8, MOE_GPU_MAX_GROUPS + 1), "would index past the group mask");
+        assert!(!moe_gpu_routable(0, 1));
+        for (name, src) in [("MOE_TOPK", MOE_TOPK), ("MOE_TOPK_BIAS", MOE_TOPK_BIAS)] {
+            assert!(src.contains(&format!("var idx: array<u32,{MOE_GPU_MAX_K}>; var lg: array<f32,{MOE_GPU_MAX_K}>;")), "{name}: top-k scratch");
+        }
+        assert!(MOE_TOPK_BIAS.contains(&format!("var allowed: array<bool,{MOE_GPU_MAX_GROUPS}>;")), "group mask");
+        // and the clamp is gone from the routed paths (the debug-compare helper may keep its own)
+        let lib = include_str!("lib.rs");
+        // needle assembled at run time, or this test's own source would be the match
+        let needle = format!("let slots = m.cfg.n_used.{}(1, 16)", "clamp");
+        let routed = lib.matches(needle.as_str()).count();
+        assert_eq!(routed, 0, "a GPU-routed path clamps top-k again");
+    }
 
     /// The shapes that matter, by name. Qwen3.5 / Ornith-1.5 attention layers (config.json:
     /// head_dim 256, partial_rotary_factor 0.25) must be INSIDE, or every one of their 1-in-4
