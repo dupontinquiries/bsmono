@@ -31,6 +31,10 @@ use studio_live::transport::Transport;
 pub mod meter;
 pub mod take_report;
 pub mod stems_dme;
+/// Curve-to-curve references, the cycles they allow, and the dummy that
+/// repairs one. Cycles are accepted and reported rather than refused: an
+/// editor builds the clip first and finds the loop after.
+pub mod curve_refs;
 pub mod media_map;
 /// What a dropped file should become. The drop handler had one branch --
 /// directory is a kit, everything else is a rack channel -- so a video
