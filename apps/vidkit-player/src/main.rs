@@ -589,7 +589,7 @@ impl Player {
             }
         }
         if cmd_p {
-            if self.palette.open {
+            if self.palette.is_open() {
                 self.palette.close();
             } else {
                 self.palette.open();
@@ -600,7 +600,7 @@ impl Player {
         }
         // Space only when no overlay has the keyboard, or it types a space
         // into the query instead of toggling playback.
-        if space && !self.palette.open && self.picker.is_none() {
+        if space && !self.palette.is_open() && self.picker.is_none() {
             self.transport.playing = !self.transport.playing;
         }
     }
@@ -709,84 +709,26 @@ impl Player {
     }
 
     fn palette_ui(&mut self, ctx: &egui::Context) {
-        if !self.palette.open {
-            return;
-        }
-        let (up, down, enter) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::ArrowUp),
-                i.key_pressed(egui::Key::ArrowDown),
-                i.key_pressed(egui::Key::Enter),
-            )
-        });
-        if up {
-            self.palette.move_selection(-1);
-        }
-        if down {
-            self.palette.move_selection(1);
-        }
-
-        self.scrim(ctx);
-        let mut chosen = None;
-        egui::Window::new("Command palette")
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 60.0])
-            .collapsible(false)
-            .resizable(false)
-            .default_width(460.0)
-            .frame(self.overlay_frame())
-            .show(ctx, |ui| {
-                let edit = ui.add(
-                    egui::TextEdit::singleline(&mut self.palette.query).id_salt("vidkit-palette-query")
-                        .hint_text("type a command…")
-                        .desired_width(f32::INFINITY),
-                );
-                if self.palette.just_opened {
-                    edit.request_focus();
-                    self.palette.just_opened = false;
-                }
-                if edit.changed() {
-                    // Narrowing can leave the highlight past the end; Enter
-                    // would then run nothing, or the wrong row.
-                    self.palette.on_query_changed();
-                }
-
-                ui.separator();
-                let matches = self.palette.matches();
-                if matches.is_empty() {
-                    ui.weak("no matching command");
-                }
-                // Capped at the kit's MAX_ROWS: past that a palette stops
-                // being a shortcut and becomes a list you read.
-                for (i, c) in matches
-                    .iter()
-                    .take(uikit_egui::command_bar::MAX_ROWS)
-                    .enumerate()
-                {
-                    let sel = i == self.palette.selected;
-                    // Label and shortcut on ONE row, the shortcut pushed right.
-                    // Stacking them made every command look like two entries.
-                    let mut r = None;
-                    ui.horizontal(|ui| {
-                        r = Some(ui.selectable_label(sel, c.label()));
-                        if let Some(k) = c.shortcut() {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.weak(k);
-                                },
-                            );
-                        }
-                    });
-                    if r.map(|r| r.clicked()).unwrap_or(false) {
-                        chosen = Some(*c);
-                    }
-                }
-            });
-
-        if enter {
-            chosen = self.palette.chosen();
-        }
-        if let Some(c) = chosen {
+        // The surface is the kit's: placement (turned over on a phone, the usual
+        // card on a desk), scrim, keys, focus and one-line rows all come from
+        // `command_bar::show`. This supplies the rows and runs the choice.
+        let matches = self.palette.matches();
+        let rows: Vec<uikit_egui::command_bar::Row> = matches
+            .iter()
+            .map(|c| uikit_egui::command_bar::Row::new(c.label(), c.shortcut().unwrap_or("")))
+            .collect();
+        let adaptive = uikit_egui::Adaptive::detect(ctx);
+        let out = uikit_egui::command_bar::show(
+            ctx,
+            "vidkit-palette",
+            &mut self.palette.bar,
+            &rows,
+            "type a command…",
+            &self.colors,
+            &adaptive,
+            |_| {},
+        );
+        if let Some(c) = out.chosen.and_then(|i| matches.get(i).copied()) {
             self.palette.close();
             self.run(c);
         }

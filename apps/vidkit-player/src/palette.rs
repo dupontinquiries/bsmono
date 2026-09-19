@@ -143,67 +143,38 @@ pub fn rank(query: &str) -> Vec<Command> {
     scored.into_iter().map(|(_, _, c)| c).collect()
 }
 
-/// Palette state: the query, the highlighted row, and whether it is open.
+/// Palette state. The query, the cursor and the open/focus bookkeeping are the
+/// kit's (`command_bar::State`) since the surface became the kit's to draw; what
+/// is left here is the part that is about a video player: which commands match.
 #[derive(Clone, Debug, Default)]
 pub struct Palette {
-    pub open: bool,
-    pub query: String,
-    pub selected: usize,
-    /// Set when the palette opens, so the text field can take focus once
-    /// rather than stealing it every frame.
-    pub just_opened: bool,
+    pub bar: uikit_egui::command_bar::State,
 }
 
 impl Palette {
+    pub fn is_open(&self) -> bool {
+        self.bar.is_open()
+    }
+
+    /// Opens empty: the kit clears the query on open, not on close, for the
+    /// reason this module used to give itself - a palette that remembers the
+    /// last query shows stale matches the moment it appears.
     pub fn open(&mut self) {
-        self.open = true;
-        self.just_opened = true;
-        // Cleared on open, not on close: a palette that remembers the last
-        // query shows stale matches the moment it appears, and the first
-        // keystroke is almost always a new search.
-        self.query.clear();
-        self.selected = 0;
+        self.bar.open();
     }
 
     pub fn close(&mut self) {
-        self.open = false;
-        self.just_opened = false;
+        self.bar.close();
     }
 
     pub fn matches(&self) -> Vec<Command> {
-        rank(&self.query)
+        rank(&self.bar.query)
     }
 
-    /// Move the highlight, wrapping at both ends.
-    ///
-    /// Wrapping because the list is short and reaching the end by holding a key
-    /// should not feel like the control has jammed.
-    pub fn move_selection(&mut self, delta: i32) {
-        let n = self.matches().len();
-        if n == 0 {
-            self.selected = 0;
-            return;
-        }
-        let cur = self.selected.min(n - 1) as i32;
-        self.selected = (cur + delta).rem_euclid(n as i32) as usize;
-    }
-
-    /// The command Enter would run.
-    pub fn chosen(&self) -> Option<Command> {
-        let m = self.matches();
-        m.get(self.selected.min(m.len().saturating_sub(1))).copied()
-    }
-
-    /// Reset the highlight after the query changes.
-    ///
-    /// Back to the top, not clamped to the end. A new query produces a new
-    /// RANKING, so the row that was highlighted has no relationship to the row
-    /// now at that index — and clamping an out-of-range selection to the last
-    /// row highlights the WORST match, which is the opposite of what typing
-    /// asked for. The file picker already resets to 0 on every keystroke; the
-    /// two behaving differently was the inconsistency, and this test caught it.
-    pub fn on_query_changed(&mut self) {
-        self.selected = 0;
+    /// The command at row `i` of the current matches - what the surface reports
+    /// as chosen, by Enter on the cursor or by a tap.
+    pub fn at(&self, i: usize) -> Option<Command> {
+        self.matches().get(i).copied()
     }
 }
 
@@ -264,71 +235,45 @@ mod tests {
     fn opening_clears_the_previous_query() {
         let mut p = Palette::default();
         p.open();
-        p.query = "rot".into();
-        p.selected = 3;
+        p.bar.query = "rot".into();
+        p.bar.cursor = 3;
         p.close();
         p.open();
-        assert!(p.query.is_empty(), "stale query survived");
-        assert_eq!(p.selected, 0);
-        assert!(p.just_opened);
+        assert!(p.bar.query.is_empty(), "stale query survived");
+        assert_eq!(p.bar.cursor, 0);
+        assert!(p.is_open());
     }
 
+    // Removed with the port to `command_bar::show`, and why, since each pinned a
+    // decision this module no longer makes:
+    //  * selection_wraps_at_both_ends - the kit CLAMPS (its reasoning: the list
+    //    is short and ordered by score, so wrapping from the worst row back to
+    //    the best reads as having lost the selection). One fleet-wide answer
+    //    beats this player disagreeing with every other palette; pinned by
+    //    command_bar's the_cursor_clamps_rather_than_wrapping_past_the_best_match.
+    //  * changing_the_query_highlights_the_best_match_not_the_last and
+    //    chosen_stays_inside_the_visible_list_even_if_selected_is_stale - the
+    //    surface resets the cursor on every edit and clamps it to the rows it
+    //    shows; pinned by command_bar's surface_tests.
+
     #[test]
-    fn selection_wraps_at_both_ends() {
+    fn the_row_the_surface_reports_maps_to_the_command_ranked_there() {
         let mut p = Palette::default();
         p.open();
-        let n = Command::ALL.len();
-        p.move_selection(-1);
-        assert_eq!(p.selected, n - 1, "up from the first should wrap to the last");
-        p.move_selection(1);
-        assert_eq!(p.selected, 0, "down from the last should wrap to the first");
-    }
-
-    /// The bug this prevents: narrowing the list leaves the highlight past the
-    /// end, and Enter then runs nothing or the wrong row.
-    /// Typing must leave the BEST match under Enter, not whatever survived at
-    /// the old index. Clamping to the end selected the worst match.
-    #[test]
-    fn changing_the_query_highlights_the_best_match_not_the_last() {
-        let mut p = Palette::default();
-        p.open();
-        p.selected = Command::ALL.len() - 1;
-        p.query = "rot".into();
-        p.on_query_changed();
-
-        let n = p.matches().len();
-        assert!(p.selected < n, "selection {} past end {n}", p.selected);
-        assert_eq!(p.selected, 0, "should return to the top of the new ranking");
-        assert_eq!(
-            p.chosen(),
-            Some(Command::Rotate),
-            "Enter should run the best match, got {:?}",
-            p.chosen()
-        );
-    }
-
-    /// A stale index must never be able to run a command the user cannot see.
-    #[test]
-    fn chosen_stays_inside_the_visible_list_even_if_selected_is_stale() {
-        let mut p = Palette::default();
-        p.open();
-        p.query = "rot".into();
-        p.selected = 99;
-        let m = p.matches();
-        assert!(m.contains(&p.chosen().unwrap()), "ran something off-list");
+        p.bar.query = "rot".into();
+        assert_eq!(p.at(0), Some(Command::Rotate));
+        assert_eq!(p.at(99), None, "a stale index runs nothing rather than something else");
     }
 
     #[test]
     fn chosen_is_none_when_nothing_matches() {
         let mut p = Palette::default();
         p.open();
-        p.query = "zzzzzqqq".into();
-        p.on_query_changed();
-        assert_eq!(p.chosen(), None);
+        p.bar.query = "zzzzzqqq".into();
+        assert!(p.matches().is_empty());
+        assert_eq!(p.at(0), None);
     }
 
-    /// Every command must be reachable by typing its own label, or a row
-    /// exists that the palette cannot actually find.
     #[test]
     fn every_command_is_findable_by_its_own_label() {
         for c in Command::ALL {
