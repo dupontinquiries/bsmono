@@ -36,23 +36,22 @@ Also seen, unrelated to the above: `voxel-tools/harness/src/paintbrush.rs`
 and `unendlich-engine/src/voxel_chat.rs` call `looks_truncated` at lines
 1258/1248 and 1719/1710 -- they look like two copies of one ~3000-line file.
 
-## Found while checking: this crate's tests had not been running
+## Found while checking: this crate's tests had not been running -- NOW FIXED
 
-`cargo test --lib` did not COMPILE at HEAD: `lib.rs:1768`, `r.abs()` on an
-untyped integer literal (E0689). One token (`3i32`) fixes it, and is
-committed. With it, 863 tests pass and TWO FAIL, both in `job::tests` -- the
-multi-turn planning module -- and both look like they have never run:
+`cargo test --lib` did not COMPILE at HEAD (`lib.rs:1768`, `.abs()` on an
+untyped literal). Fixed in 6b4d41603. That exposed two failures in
+`job::tests`, both since fixed; the suite is 866/866.
 
-* `an_unknown_material_is_refused_and_a_real_one_suggested`:
-  `check_line(5,5,5,"brownwood")` returns `UnknownMaterial { suggestion: None }`.
-  The refusal cannot say what to use instead, which is rule zero of this
-  design: a refusal the author cannot act on is just a wall. The palette's
-  nearest-name lookup either is not wired into `check_line` or has no match
-  for a compound like brown+wood. NOT fixed.
-* `bounds_accumulate_over_steps`: `Job::readback()` prints no extent at all,
-  so the feature is missing. AND the test's expected string contradicts its
-  own doc comment: it says bounds ACCUMULATE, then expects `-6,8,-6 to
-  10,22,10`; the accumulated minimum of `[0,0,0]` and `[-6,8,-6]` is
-  `-6,0,-6`. Fix the readback and the expectation together. NOT fixed.
+* `bounds_accumulate_over_steps`: the CODE WAS RIGHT, the test expected the
+  last piece's bounds instead of the union. **Correction:** an earlier
+  version of this note said `readback()` printed no extent at all. That was
+  wrong -- I had truncated the failure message with `head -10` and drew a
+  conclusion from the half I could see.
+* `an_unknown_material_is_refused_and_a_real_one_suggested`: two real
+  faults in `palette::suggest` -- it could not see inside a run-together
+  compound (`brownwood`), and it let a name hit outvote a named family
+  (`darkstone` -> dark_oak_planks), against this module's own "family
+  dominates" rule. The second only showed when the test asked for the right
+  FAMILY rather than `is_some()`.
 
-Neither was touched: I had not read enough of `job.rs` to change it safely.
+The four questions above are still open; none has been checked.
