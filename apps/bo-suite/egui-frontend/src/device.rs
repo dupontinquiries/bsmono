@@ -56,6 +56,46 @@ impl Profile {
     }
 }
 
+/// The control a top-level view needs, or `None` for one every product has.
+///
+/// The QML drops a page from the swipe set entirely when a product lacks its
+/// control — "headphones don't get a Stream page, TVs don't get auto-route".
+/// This frontend has six views where the QML had three and shows all six on
+/// every device, so a pair of headphones offers a Mixer it cannot use and a
+/// Soundscape it cannot play.
+///
+/// Mapped by NAME rather than index so reordering `VIEWS` cannot silently
+/// re-point the rule at the wrong page — an index table is the kind of thing
+/// that stays correct until someone inserts a tab.
+pub fn view_requires(view: &str) -> Option<&'static str> {
+    match view {
+        // The EQ mixer is the one page that IS the control.
+        "Mixer" => Some("eq"),
+        // Soundscape plays a generated stream at the device.
+        "Soundscape" => Some("stream"),
+        // Spaces is multi-room: it needs somewhere to send audio.
+        "Spaces" => Some("autoroute"),
+        // Devices, Library and Settings are always available. Settings in
+        // particular must never be hidden — it is where a person fixes a
+        // wrong profile, and a device that guessed badly would otherwise have
+        // no way back.
+        _ => None,
+    }
+}
+
+/// The views this product should show, in `VIEWS` order.
+///
+/// An unknown product shows everything, because `has_control` falls back to
+/// true on an empty list — the QML's own rule, and the right one: hiding
+/// pages on an unrecognised device makes a new speaker look broken, while
+/// showing a page that turns out to do nothing is the lesser failure.
+pub fn views_for(profile: &Profile, all: &[&'static str]) -> Vec<&'static str> {
+    all.iter()
+        .copied()
+        .filter(|v| view_requires(v).is_none_or(|c| profile.has_control(c)))
+        .collect()
+}
+
 /// Which theme to use. `resolvedMode()` in the QML.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemeMode {
@@ -321,5 +361,65 @@ mod tests {
         assert_eq!(m.peak_boost_db(), 0.0);
         m.set_gain(1, 4.0);
         assert_eq!(m.peak_boost_db(), 4.0);
+    }
+
+    /// THE QML RULE THIS FRONTEND LOST: a product without a control does not
+    /// get the page. Headphones offering a Mixer they cannot use is the
+    /// symptom.
+    #[test]
+    fn a_product_without_a_control_does_not_get_its_page() {
+        let all = crate::VIEWS;
+        let phones = Profile {
+            controls: ["volume", "mute"].iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let v = views_for(&phones, &all);
+        assert!(!v.contains(&"Mixer"), "no eq, no Mixer: {v:?}");
+        assert!(!v.contains(&"Soundscape"), "no stream, no Soundscape: {v:?}");
+        assert!(!v.contains(&"Spaces"), "no autoroute, no Spaces: {v:?}");
+    }
+
+    /// AN UNKNOWN PRODUCT SHOWS EVERYTHING -- `has_control`'s fallback, and
+    /// the right one: hiding pages on an unrecognised device makes a new
+    /// speaker look broken, where a page that does nothing is the lesser
+    /// failure.
+    #[test]
+    fn an_unknown_product_keeps_every_view() {
+        let unknown = Profile { controls: vec![], ..Default::default() };
+        assert_eq!(views_for(&unknown, &crate::VIEWS).len(), crate::VIEWS.len());
+    }
+
+    /// Settings must NEVER be hidden: it is where a person fixes a wrong
+    /// profile, and a device that guessed badly would have no way back.
+    #[test]
+    fn settings_survives_the_emptiest_profile() {
+        let bare = Profile {
+            controls: vec!["nothing-real".to_string()],
+            ..Default::default()
+        };
+        let v = views_for(&bare, &crate::VIEWS);
+        assert!(v.contains(&"Settings"), "{v:?}");
+        assert!(v.contains(&"Devices"), "and the device list itself: {v:?}");
+    }
+
+    /// Order is preserved, so filtering cannot reshuffle the tab strip.
+    #[test]
+    fn the_surviving_views_keep_their_order() {
+        let full = Profile {
+            controls: ["eq", "stream", "autoroute"].iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let v = views_for(&full, &crate::VIEWS);
+        assert_eq!(v, crate::VIEWS.to_vec());
+    }
+
+    /// Mapped by NAME, not index: an index table stays correct until someone
+    /// inserts a tab, and then points the rule at the wrong page.
+    #[test]
+    fn the_rule_is_keyed_by_name_not_position() {
+        assert_eq!(view_requires("Mixer"), Some("eq"));
+        assert_eq!(view_requires("Devices"), None);
+        assert_eq!(view_requires("a view that does not exist"), None,
+                   "an unknown view is always shown rather than always hidden");
     }
 }
