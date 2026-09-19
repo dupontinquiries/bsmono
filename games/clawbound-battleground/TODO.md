@@ -57,6 +57,15 @@ the single highest-value thing anyone can do with this repo next.
 
 ## Known gaps
 
+- **Lockstep: the rule exists, the wire does not.** `lockstep.rs` proves the
+  sim deterministic (1800 ticks, bit-identical) and implements
+  advance-only-when-complete with stall, input delay and a desync checksum.
+  Next: carry `Input` over the den's socket, a "waiting for ..." overlay, and
+  a START from the host that fixes the slot order. OPEN AND IMPORTANT for
+  this fleet: determinism is shown on x86-64 only. An aarch64 handset may
+  not produce bit-identical floats (fused multiply-add, libm); test a
+  cross-architecture pair before trusting it.
+
 - **bsgames handoff: DONE as far as a den** (launched with bsgames' exact env,
   host and friend on separate network stacks, both seen on screen). Not
   done: bsgames itself was not run; `opendht` never exercised; and the den
@@ -237,7 +246,7 @@ the single highest-value thing anyone can do with this repo next.
 ## Verification commands
 
 ```bash
-cargo test --no-default-features   # 244 lib + 16 + 2 (+90 in games/shared/netcode, was +3 in games/shared/netcode), no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
+cargo test --no-default-features   # 248 lib + 16 + 2 (+90 in games/shared/netcode, was +3 in games/shared/netcode), no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
 cargo test                          # same, plus links cpal (needs libasound2-dev)
 cargo check --features gamepad      # needs libudev-dev
 cargo run --example simdbg <seed>   # headless 12-minute AI match trace
