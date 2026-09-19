@@ -57,6 +57,11 @@ the single highest-value thing anyone can do with this repo next.
 
 ## Known gaps
 
+- **AI map backend: the model-driving half exists** (`ChainCompleter` with
+  voxel-tools' `complete_chain` shape, `extract_calls`, `Brief`/`readback`,
+  `run_chain`), tested against a canned model. STILL no real model attached,
+  and `build_world` does not consume a `MapDraft`. Steps (1) and (2) below
+  are unchanged and are next.
 - **AI map backend: started (`mapgen.rs`), no model attached.** The tool
   surface, refusals-in-words, mirrored placement, digests, undo, validate and
   the visible transcript loop exist and are tested. Next, in order: (1) have
@@ -255,7 +260,7 @@ the single highest-value thing anyone can do with this repo next.
 ## Verification commands
 
 ```bash
-cargo test --no-default-features   # 251 lib + 16 + 2 (+90 in games/shared/netcode, was +3 in games/shared/netcode), no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
+cargo test --no-default-features   # 254 lib + 16 + 2 (+90 in games/shared/netcode, was +3 in games/shared/netcode), no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
 cargo test                          # same, plus links cpal (needs libasound2-dev)
 cargo check --features gamepad      # needs libudev-dev
 cargo run --example simdbg <seed>   # headless 12-minute AI match trace
