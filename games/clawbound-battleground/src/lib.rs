@@ -26,6 +26,8 @@ pub mod hitbox;
 pub mod logs;
 /// The authored centre of the map: the Hollow and the two screened Runs.
 pub mod midjungle;
+/// The surface an AI authors a map through: digests in, refusals in words.
+pub mod mapgen;
 pub mod anim;
 /// Cut a voxel body into posable parts; posed rig -> per-part matrices.
 pub mod rigged;
