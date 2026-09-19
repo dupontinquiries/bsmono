@@ -57,6 +57,20 @@ the single highest-value thing anyone can do with this repo next.
 
 ## Known gaps
 
+- **LAN: discovery only.** `netcode::lan` + `lanlobby` + the LOCAL NETWORK
+  screen find, host and pick a den over a real network. There is NO
+  networked match: JOIN ends at the host's address. Next is lockstep input
+  exchange over the game socket (the sim is already fixed-tick and seeded).
+  The screen has not been rendered; UDP broadcast was not exercised (one
+  interface, no peer); two copies on one machine cannot both browse.
+- **Performance is measured in instances, not milliseconds.** The hull cull
+  took the static world to 296,629 instances (from roughly 877k), but no
+  frame time has been taken on a real GPU, let alone a handset. Next
+  candidates: merge static chunks' draw calls, frustum-cull ancestors' ten
+  part draws as one, a half-res post pass, and `shaft_steps` stays 0.
+- **Hitboxes**: cats are capsules now; minions, towers and bosses are still
+  spheres, and nothing is swept (fine at today's 0.67 u/tick).
+
 - **The mid Runs are stubs.** Tower range went 16 -> 24 with a 28 u clearing
   (nothing that hides or lifts a cat inside it), and the lane-parallel Runs
   authored the same day ended INSIDE the old range. Truncated to 14 u. They
@@ -198,7 +212,7 @@ the single highest-value thing anyone can do with this repo next.
 ## Verification commands
 
 ```bash
-cargo test --no-default-features   # 235 lib + 15 + 2, no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
+cargo test --no-default-features   # 241 lib + 15 + 2 (+3 in games/shared/netcode), no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
 cargo test                          # same, plus links cpal (needs libasound2-dev)
 cargo check --features gamepad      # needs libudev-dev
 cargo run --example simdbg <seed>   # headless 12-minute AI match trace
