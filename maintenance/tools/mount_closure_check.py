@@ -41,6 +41,12 @@ import os
 import re
 import sys
 
+# `include!("shim.rs")` splices a file's text in at that point, so any `mod`
+# it declares belongs to the including module. blackstar-rs's examples each
+# include a shared shim that declares thirteen of them, and not following the
+# include reported all eleven mounts in every example as broken.
+INCLUDE = re.compile(r'include!\s*\(\s*"([^"]+)"\s*\)')
+
 MOUNT = re.compile(
     r'#\[path\s*=\s*"([^"]+)"\]\s*(?:#\[[^\]]*\]\s*)*(?:pub\s+)?mod\s+(\w+)\s*;'
 )
@@ -118,10 +124,48 @@ def host_modules(root_file: str) -> set:
                 | {m.group(2) for m in MOUNT.finditer(text)})
         mods |= here
         base = os.path.dirname(f)
+        for inc in INCLUDE.findall(text):
+            queue.append(os.path.normpath(os.path.join(base, inc)))
         for name in here:
             queue.append(os.path.join(base, name + ".rs"))
             queue.append(os.path.join(base, name, "mod.rs"))
     return mods
+
+
+def strip_test_modules(code: str) -> str:
+    """Drop `#[cfg(test)] mod ... { ... }` blocks.
+
+    A mounted file's tests are compiled out in a build that does not run them,
+    so a `crate::` path reachable only from a test is not a mount failure.
+    blackstar-rs's `xform.rs` refers to `crate::content` twice, both inside its
+    test module, and all four examples that mount it were reported as broken
+    for a dependency their builds never see.
+
+    Brace-counted rather than parsed: good enough to find the end of a module
+    whose braces balance, which is every module that compiles.
+    """
+    out, i = [], 0
+    while True:
+        m = re.search(r"#\[cfg\(test\)\]", code[i:])
+        if not m:
+            out.append(code[i:])
+            break
+        start = i + m.start()
+        out.append(code[i:start])
+        brace = code.find("{", start)
+        if brace < 0:
+            break
+        depth, j = 0, brace
+        while j < len(code):
+            if code[j] == "{":
+                depth += 1
+            elif code[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        i = j + 1
+    return "".join(out)
 
 
 def strip_line_comments(body: str) -> str:
@@ -165,12 +209,20 @@ def main(argv):
                     continue
                 checked += 1
                 with open(target, errors="replace") as fh:
-                    code = strip_line_comments(fh.read())
+                    code = strip_test_modules(strip_line_comments(fh.read()))
                 needs = set(CRATE_REF.findall(code))
                 for mac, dep in MACRO_DEPS.items():
                     if mac in code:
                         needs.add(dep)
-                missing = sorted(needs - declared - {name})
+                # A mounted file may declare modules ITSELF, and those sit at
+                # the host's root too -- ambient-learner's egui_lib.rs carries
+                # `pub mod ui { pub mod egui; }`, which is how its `crate::ui`
+                # resolves. Counting only the host's declarations reported it
+                # as broken.
+                own = set(MOD_DECL.findall(code)) | {
+                    n for pair in USE_ALIAS.findall(code) for n in pair if n
+                }
+                missing = sorted(needs - declared - own - {name})
                 if missing:
                     problems.append((root_file, name, rel, missing))
 
