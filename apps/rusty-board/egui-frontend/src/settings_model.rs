@@ -31,17 +31,18 @@
 
 /// Which group a setting belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Group { Layout, Typing, Colors, Experimental }
+pub enum Group { Layout, Typing, Colors, Llm, Experimental }
 
 impl Group {
-    pub const ALL: [Group; 4] =
-        [Group::Layout, Group::Typing, Group::Colors, Group::Experimental];
+    pub const ALL: [Group; 5] =
+        [Group::Layout, Group::Typing, Group::Colors, Group::Llm, Group::Experimental];
 
     pub fn title(self) -> &'static str {
         match self {
             Group::Layout => "Layout",
             Group::Typing => "Typing",
             Group::Colors => "Colors",
+            Group::Llm => "LLM",
             Group::Experimental => "Experimental",
         }
     }
@@ -49,6 +50,45 @@ impl Group {
 
 /// One multiple-choice setting.
 #[derive(Clone, Debug, PartialEq)]
+/// What kind of control a setting needs.
+///
+/// The GTK panel has exactly three row builders — `build_setting_row`,
+/// `build_text_row`, `build_color_row` — and this is that distinction carried
+/// across. It exists because the model was option-lists-only, which left two
+/// whole groups unportable: the LLM rows are free text and the Colors tab is
+/// hex strings, and faking either as a two-option toggle would be a lie about
+/// what the control does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// One of `options`. The original and still the common case.
+    Choice,
+    /// Free text — an endpoint, a prompt.
+    Text,
+    /// Free text that must not be shown: an API key.
+    ///
+    /// Distinct from `Text` rather than a flag on it, because the difference
+    /// changes what a UI may do — render dots, refuse to log the value, keep
+    /// it out of a settings export — and a `bool` beside the value is easy to
+    /// read past.
+    Secret,
+    /// A hex colour, or empty meaning "fall back to the theme".
+    ///
+    /// DECLARED, NOT YET USED: no `Setting` carries this kind. The GTK Colors
+    /// tab builds its pickers from a per-key list rather than a static table,
+    /// so porting them is a data question (which keys, in what order) and not
+    /// just a row type. The variant is here because `Kind` should describe the
+    /// three controls the predecessor actually has, and because the CLI's
+    /// handling of it is written and tested either way -- but nothing is
+    /// pretending the colour rows exist yet.
+    ///
+    /// Empty-is-default is the GTK panel's own convention: its "reset colors
+    /// to theme defaults" button "empties every hex string". Carried rather
+    /// than replaced with a sentinel colour, because an empty field and a
+    /// colour that happens to equal the theme's are different states — one
+    /// follows the theme when it changes and the other does not.
+    Color,
+}
+
 pub struct Setting {
     /// Config key, e.g. `layout.letters`.
     pub key: &'static str,
@@ -59,6 +99,9 @@ pub struct Setting {
     /// meaningful.
     pub help: &'static str,
     pub group: Group,
+    /// Which control this needs. `Choice` for everything that came across
+    /// before `Kind` existed.
+    pub kind: Kind,
     /// Display names, in order.
     pub options: &'static [&'static str],
     /// Values written to the config file, parallel to `options`.
@@ -93,18 +136,21 @@ pub const SETTINGS: &[Setting] = &[
         key: "layout.letters", label: "Letters",
         help: "Base letter layout. QWERTY or Dvorak.",
         group: Group::Layout,
+        kind: Kind::Choice,
         options: &["QWERTY", "Dvorak"], values: &["qwerty", "dvorak"],
     },
     Setting {
         key: "layout.geometry", label: "Geometry",
         help: "Staggered matches a physical keyboard; ortholinear is a strict grid.",
         group: Group::Layout,
+        kind: Kind::Choice,
         options: &["Staggered", "Ortholinear"], values: &["staggered", "ortho"],
     },
     Setting {
         key: "layout.density", label: "Density",
         help: "Compact reduces vertical padding for one-handed reach.",
         group: Group::Layout,
+        kind: Kind::Choice,
         options: &["Normal", "Compact"], values: &["normal", "compact"],
     },
     Setting {
@@ -113,6 +159,7 @@ pub const SETTINGS: &[Setting] = &[
                beside it stays live. GTK's own note says \"a future setting will let the \
                user choose\" the dominant side — this is that setting.",
         group: Group::Layout,
+        kind: Kind::Choice,
         options: &["Off", "Left", "Right"], values: &["off", "left", "right"],
     },
     Setting {
@@ -121,6 +168,7 @@ pub const SETTINGS: &[Setting] = &[
                Stenotype = 4-button steno (very experimental). \
                Words = 5-col cardinal with prose / C / Rust / Python clusters.",
         group: Group::Experimental,
+        kind: Kind::Choice,
         options: &["Off", "Cardinal", "Stenotype", "Words"],
         values: &["off", "cardinal", "stenotype", "words"],
     },
@@ -144,36 +192,42 @@ pub const SETTINGS: &[Setting] = &[
         key: "typing.swipe", label: "Swipe typing",
         help: "Drag across letters to type whole words. Off → spacebar drag becomes arrow keys.",
         group: Group::Typing,
+        kind: Kind::Choice,
         options: &["On", "Off"], values: &["on", "off"],
     },
     Setting {
         key: "typing.swipe_speed", label: "Swipe speed",
         help: "How hard you pause to mark a letter. Slow = gentle pauses count; Fast = only near-stops.",
         group: Group::Typing,
+        kind: Kind::Choice,
         options: &["Normal", "Slow", "Fast"], values: &["normal", "slow", "fast"],
     },
     Setting {
         key: "typing.lenient_swipe", label: "Lenient swipe",
         help: "Accept faster, sloppier swipes. Trades precision for forgiveness.",
         group: Group::Typing,
+        kind: Kind::Choice,
         options: &["Off", "On"], values: &["off", "on"],
     },
     Setting {
         key: "typing.auto_space", label: "Auto-space swipes",
         help: "Add a space automatically between consecutive swipe-typed words.",
         group: Group::Typing,
+        kind: Kind::Choice,
         options: &["On", "Off"], values: &["on", "off"],
     },
     Setting {
         key: "typing.auto_cap", label: "Auto-capitalize",
         help: "Capitalize the first letter after a period or at start of input.",
         group: Group::Typing,
+        kind: Kind::Choice,
         options: &["Off", "On"], values: &["off", "on"],
     },
     Setting {
         key: "typing.auto_hide", label: "Auto-hide on no focus",
         help: "Hide the keyboard when no text field has focus.",
         group: Group::Typing,
+        kind: Kind::Choice,
         options: &["On", "Off"], values: &["on", "off"],
     },
     // ── Colors ───────────────────────────────────────────────────────────
@@ -188,18 +242,45 @@ pub const SETTINGS: &[Setting] = &[
         key: "colors.glass", label: "Glass effect",
         help: "Translucent keyboard with refraction gradient. Wallpaper shows through.",
         group: Group::Colors,
+        kind: Kind::Choice,
         options: &["Off", "On"], values: &["off", "on"],
+    },
+    // ── LLM: the GTK panel's two text rows ──────────────────────────────
+    //
+    // `build_text_row` is used exactly twice in settings_panel.rs, for these
+    // two. There is no system-prompt or timeout ROW -- `llm.system_prompt` and
+    // `llm.timeout_ms` exist in the config and are set elsewhere, so porting
+    // them here would invent UI the predecessor does not have.
+    Setting {
+        key: "llm.endpoint", label: "LLM endpoint",
+        help: "URL of an OpenAI-compatible chat completions API.",
+        group: Group::Llm,
+        kind: Kind::Text,
+        // config/mod.rs: "http://localhost:11434/v1/chat/completions"
+        options: &["http://localhost:11434/v1/chat/completions"],
+        values: &["http://localhost:11434/v1/chat/completions"],
+    },
+    Setting {
+        key: "llm.api_key", label: "LLM API key",
+        help: "Bearer token (leave blank for local servers).",
+        group: Group::Llm,
+        kind: Kind::Secret,
+        // Blank is the default and a meaningful value: local servers want no
+        // token at all, which is why the help says so.
+        options: &[""], values: &[""],
     },
     Setting {
         key: "experimental.voice", label: "Voice input",
         help: "Dictate with the mic key.",
         group: Group::Experimental,
+        kind: Kind::Choice,
         options: &["Off", "On"], values: &["off", "on"],
     },
     Setting {
         key: "experimental.swipe_trail", label: "Swipe trail",
         help: "Draw the path your finger takes while swiping.",
         group: Group::Experimental,
+        kind: Kind::Choice,
         options: &["Off", "On"], values: &["off", "on"],
     },
 ];

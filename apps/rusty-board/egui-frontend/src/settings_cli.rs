@@ -24,7 +24,7 @@
 //! Parsing and validation only; applying a [`Change`] is the caller's, which
 //! is what lets the configurator preview a change and the CLI write one.
 
-use crate::settings_model::{group, Change, Group, Setting, SETTINGS};
+use crate::settings_model::{group, Change, Group, Kind, Setting, SETTINGS};
 
 /// One parsed command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +142,14 @@ pub fn parse(args: &[&str]) -> Result<Cmd, CmdError> {
                             allowed: s.values.to_vec(),
                         });
                     };
+                    // FREE TEXT TAKES THE VALUE AS GIVEN. Validating an
+                    // endpoint or an API key against `values` would reject
+                    // every real one -- those lists hold a single default,
+                    // which is a starting point and not a menu. Only `Choice`
+                    // has alternatives to be wrong about.
+                    if matches!(s.kind, Kind::Text | Kind::Secret | Kind::Color) {
+                        return Ok(Cmd::Set(s.key, (*v).to_string()));
+                    }
                     // Accept the DISPLAY label as well as the stored value:
                     // `set layout.letters Dvorak` is what someone reading the
                     // GUI will type, and refusing it to insist on "dvorak"
@@ -191,6 +199,15 @@ pub fn change_for(cmd: &Cmd) -> Option<Change> {
     }
 }
 
+fn kind_hint(k: Kind) -> &'static str {
+    match k {
+        Kind::Choice => "choice",
+        Kind::Text => "text",
+        Kind::Secret => "secret",
+        Kind::Color => "#rrggbb or empty",
+    }
+}
+
 /// Render a `List`, one line per setting.
 pub fn render_list(g: Option<Group>, current: impl Fn(&str) -> String) -> Vec<String> {
     let rows: Vec<&'static Setting> = match g {
@@ -199,8 +216,20 @@ pub fn render_list(g: Option<Group>, current: impl Fn(&str) -> String) -> Vec<St
     };
     rows.iter()
         .map(|s| {
-            let now = current(s.key);
-            format!("{:<28} {:<12} [{}]", s.key, now, s.values.join(", "))
+            // A SECRET IS NEVER PRINTED, not even partially. `list` is the
+            // command someone runs while screen-sharing or pasting output into
+            // a bug report, and a key that leaks there is leaked. Whether one
+            // is set is still worth showing.
+            let now = if s.kind == Kind::Secret {
+                let v = current(s.key);
+                if v.trim().is_empty() { "(unset)".to_string() } else { "(set)".to_string() }
+            } else {
+                current(s.key)
+            };
+            match s.kind {
+                Kind::Choice => format!("{:<28} {:<12} [{}]", s.key, now, s.values.join(", ")),
+                _ => format!("{:<28} {:<12} <{}>", s.key, now, kind_hint(s.kind)),
+            }
         })
         .collect()
 }
@@ -305,5 +334,50 @@ mod tests {
             let cmd = parse(&["set", s.key, s.values[0]]);
             assert!(cmd.is_ok(), "{} is not settable: {:?}", s.key, cmd.err());
         }
+    }
+
+    /// FREE TEXT IS TAKEN AS GIVEN. Validating an endpoint against `values`
+    /// would reject every real one -- that list holds a single default, which
+    /// is a starting point and not a menu.
+    #[test]
+    fn a_text_setting_accepts_any_value() {
+        let c = parse(&["set", "llm.endpoint", "https://example.test/v1/chat"]).unwrap();
+        assert_eq!(c, Cmd::Set("llm.endpoint", "https://example.test/v1/chat".into()));
+    }
+
+    /// ...and a choice still does not.
+    #[test]
+    fn a_choice_setting_still_refuses_an_unknown_value() {
+        assert!(parse(&["set", "layout.letters", "colemak"]).is_err());
+    }
+
+    /// A SECRET IS NEVER PRINTED. `list` is the command someone runs while
+    /// screen-sharing or pasting into a bug report.
+    #[test]
+    fn listing_never_prints_the_api_key() {
+        let lines = render_list(None, |k| {
+            if k == "llm.api_key" { "sk-super-secret-value".into() } else { "x".into() }
+        });
+        let joined = lines.join("\n");
+        assert!(!joined.contains("sk-super-secret"), "the key leaked into list output");
+        assert!(joined.contains("(set)"), "but whether one is set is worth showing");
+    }
+
+    /// An unset key says so rather than showing an empty column, because
+    /// "blank" is a meaningful state here -- local servers want no token.
+    #[test]
+    fn an_unset_secret_reads_as_unset() {
+        let lines = render_list(Some(crate::settings_model::Group::Llm), |_| "".into());
+        assert!(lines.join("\n").contains("(unset)"));
+    }
+
+    /// The hint tells a person what shape to type, which a `values` list of
+    /// one default cannot.
+    #[test]
+    fn non_choice_settings_advertise_their_shape_not_a_menu() {
+        let lines = render_list(Some(crate::settings_model::Group::Llm), |_| "".into());
+        let joined = lines.join("\n");
+        assert!(joined.contains("<text>") || joined.contains("<secret>"), "{joined}");
+        assert!(!joined.contains("[http"), "an endpoint default is not a menu: {joined}");
     }
 }
