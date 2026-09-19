@@ -21,6 +21,8 @@ pub mod anim;
 pub mod rigged;
 /// What a cat's body does about roots, ferns, rivers, leaps and fights.
 pub mod puppet;
+/// The aimed leap: onto rocks and logs, chained from perch to perch.
+pub mod leap;
 pub mod camps;
 /// Clan border markers: placed, refreshed on patrol, and lasting days rather
 /// than minutes. The half of the scent system wildkit does not cover, because

@@ -145,3 +145,53 @@ fn xp_curve_monotonic() {
         prev = x;
     }
 }
+
+
+/// The leap, through the real sim loop: press toward a rock, end up standing
+/// on it; press again toward the next, and the chain skips the cooldown;
+/// walk off, and come back down.
+#[test]
+fn a_cat_leaps_onto_a_rock_bounds_to_the_next_and_steps_off() {
+    use clawbound::blockers::{Blockers, PropKind};
+    use clawbound::leap::{LEAP_COOLDOWN, PERCH_MAX_TOP};
+    use glam::Vec3;
+    let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    let mut b = Blockers::new(200.0, 6.0);
+    let start = game.gods[0].pos;
+    b.push_prop(PropKind::Rock, start.x + 5.0, start.z, 0.0, 1.0);
+    b.push_prop(PropKind::BoulderCluster, start.x + 10.5, start.z, 0.0, 1.0);
+    game.blockers = std::sync::Arc::new(b);
+    let step = |g: &mut Game, n: usize| for _ in 0..n { g.tick(1.0 / 60.0); };
+
+    game.leap_queue.push((0, Vec3::X));
+    step(&mut game, 5);
+    assert!(game.gods[0].leap.is_some(), "the press was accepted");
+    let mut peak = 0.0f32;
+    for _ in 0..90 {
+        game.tick(1.0 / 60.0);
+        peak = peak.max(game.gods[0].pos.y);
+    }
+    let g = &game.gods[0];
+    assert_eq!(g.perch, Some(1.4), "standing on the rock");
+    assert!((g.pos - Vec3::new(start.x + 5.0, 1.4, start.z)).length() < 0.2, "at {}", g.pos);
+    assert!(peak > 1.8 && peak < PERCH_MAX_TOP + 2.0, "arced over it: {peak}");
+    assert!(g.leap_cd > LEAP_COOLDOWN * 0.3, "a ground leap costs a cooldown");
+
+    // Still cooling down -- but from a perch the chain is free.
+    game.leap_queue.push((0, Vec3::X));
+    step(&mut game, 90);
+    assert_eq!(game.gods[0].perch, Some(2.0), "bounded to the boulders while the cooldown was still running");
+
+    // Walk off the edge.
+    game.gods[0].move_dir = Vec3::Z;
+    step(&mut game, 60);
+    assert_eq!(game.gods[0].perch, None);
+    assert!(game.gods[0].pos.y < 0.01, "and came down: y = {}", game.gods[0].pos.y);
+
+    // On open ground with the cooldown running, a press is refused.
+    game.gods[0].move_dir = Vec3::ZERO;
+    game.gods[0].leap_cd = 1.0;
+    game.leap_queue.push((0, Vec3::Z));
+    step(&mut game, 3);
+    assert!(game.gods[0].leap.is_none(), "no back-to-back leaps across open ground");
+}

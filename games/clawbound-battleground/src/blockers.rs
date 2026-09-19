@@ -55,7 +55,7 @@ impl Shape {
     /// Collapsing both variants to (axis point, radius) is what keeps
     /// [`Blockers::resolve`] from branching per shape: a circle is just a
     /// segment whose endpoints coincide.
-    fn nearest_axis(&self, px: f32, pz: f32) -> (f32, f32, f32) {
+    pub fn nearest_axis(&self, px: f32, pz: f32) -> (f32, f32, f32) {
         match *self {
             Shape::Circle { x, z, r } => (x, z, r),
             Shape::Segment { x0, z0, x1, z1, r } => {

@@ -113,16 +113,53 @@ impl Game {
         // checker will not allow reading `self.blockers` inside it. An Arc
         // clone is a refcount bump, not a copy of the grid.
         let blockers = self.blockers.clone();
+        // Leap requests. Refused silently when the cat cannot leap right
+        // now; the binding is a press, not a promise.
+        for (i, aim) in std::mem::take(&mut self.leap_queue) {
+            let Some(g) = self.gods.get_mut(i) else { continue };
+            if g.respawn_t > 0.0 || g.dash.is_some() {
+                continue;
+            }
+            // Bounding: from a perch, or buffered during a landing, the next
+            // leap needs no cooldown and barely a gather.
+            let landing = matches!(g.leap, Some(l) if l.phase == crate::leap::Phase::Land);
+            let chained = g.perch.is_some() || landing;
+            if (g.leap.is_some() && !landing) || (!chained && g.leap_cd > 0.0) {
+                continue;
+            }
+            let aim = if aim.length_squared() > 1e-4 { aim } else { Vec3::new(g.yaw.cos(), 0.0, g.yaw.sin()) };
+            if let Some(plan) = crate::leap::plan(g.pos, aim, g.perch, &blockers) {
+                g.yaw = (plan.to.z - g.pos.z).atan2(plan.to.x - g.pos.x);
+                g.leap = Some(crate::leap::LeapState::begin(g.pos, plan, chained));
+                g.perch = None;
+            }
+        }
         for i in 0..self.gods.len() {
             if self.gods[i].respawn_t > 0.0 {
+                // A cat that dies mid-leap respawns on the ground.
+                self.gods[i].leap = None;
+                self.gods[i].perch = None;
                 continue;
             }
             let speed = self.move_speed(i);
             let dir = self.gods[i].move_dir;
             let yaw_cur = self.gods[i].yaw;
             let g = &mut self.gods[i];
-            // dash overrides
-            if let Some(d) = &mut g.dash {
+            g.leap_cd = (g.leap_cd - dt).max(0.0);
+            // A dash (an ability) outranks a leap (a move).
+            if g.dash.is_some() {
+                g.leap = None;
+                g.perch = None;
+            }
+            if let Some(l) = &mut g.leap {
+                let (p, done) = l.tick(dt);
+                g.pos = p;
+                if done {
+                    g.perch = l.perch;
+                    g.leap = None;
+                    g.leap_cd = crate::leap::LEAP_COOLDOWN;
+                }
+            } else if let Some(d) = &mut g.dash {
                 d.t += dt;
                 let a = (d.t / d.dur).min(1.0);
                 g.pos = d.from.lerp(d.to, a) + Vec3::Y * (a * (1.0 - a) * 4.0 * 0.35);
@@ -154,8 +191,30 @@ impl Game {
             // obstacles -- `resolve_at` skips blockers topping out below the
             // given height, which is what stops a leap over a boulder being
             // yanked sideways mid-flight.
-            let feet = if g.dash.is_some() { g.pos.y } else { f32::NEG_INFINITY };
+            let feet = match (&g.leap, g.perch) {
+                (Some(l), _) => l.feet_y(g.pos.y),
+                // Standing on a prop: that prop is below the feet, so it
+                // does not push; its taller neighbours still do.
+                (None, Some(top)) => top,
+                _ if g.dash.is_some() => g.pos.y,
+                _ => f32::NEG_INFINITY,
+            };
             g.pos = blockers.resolve_at(g.pos, GOD_RADIUS, feet);
+            // Perch upkeep: still over the thing we are standing on?
+            if let Some(top) = g.perch {
+                let under = blockers.all().iter().any(|b| {
+                    let (ax, az, r) = b.shape.nearest_axis(g.pos.x, g.pos.z);
+                    (b.top - top).abs() < 0.05 && (g.pos.x - ax).hypot(g.pos.z - az) < r + 0.15
+                });
+                if under {
+                    g.pos.y = top;
+                } else {
+                    g.perch = None; // walked off the edge
+                }
+            }
+            if g.perch.is_none() && g.leap.is_none() && g.dash.is_none() && g.pos.y > 0.0 {
+                g.pos.y = (g.pos.y - crate::leap::STEP_OFF_FALL * dt).max(0.0);
+            }
 
             // arena bounds
             let r = Vec3::new(g.pos.x, 0.0, g.pos.z).length();

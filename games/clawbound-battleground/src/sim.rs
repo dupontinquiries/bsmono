@@ -141,6 +141,11 @@ pub struct GodUnit {
     pub respawn_t: f32,
     pub last_dmg_t: f32,
     pub dash: Option<DashState>,
+    /// An aimed leap in progress (see `leap`).
+    pub leap: Option<crate::leap::LeapState>,
+    pub leap_cd: f32,
+    /// Standing on a prop it leapt onto: that prop's top.
+    pub perch: Option<f32>,
     pub recent_damagers: Vec<(usize, f32)>, // (god idx, time)
     pub move_dir: Vec3,
     pub attack_held: bool,
@@ -250,6 +255,8 @@ pub struct Game {
     pub over: Option<Team>,
     pub rng: Rng,
     pub cast_queue: Vec<(usize, u32, Vec3)>, // (god idx, slot, aim)
+    /// Leap requests: (god idx, aim direction). Drained by `move_gods`.
+    pub leap_queue: Vec<(usize, Vec3)>,
     pub tower_alive: [usize; 2],
     pub titan_vuln_announced: [bool; 2],
     pub weather: crate::weather::Weather,
@@ -321,6 +328,9 @@ impl Game {
                 respawn_t: 0.0,
                 last_dmg_t: -99.0,
                 dash: None,
+                leap: None,
+                leap_cd: 0.0,
+                perch: None,
                 recent_damagers: Vec::new(),
                 move_dir: Vec3::ZERO,
                 attack_held: false,
@@ -376,6 +386,7 @@ impl Game {
             over: None,
             rng,
             cast_queue: Vec::new(),
+            leap_queue: Vec::new(),
             tower_alive: [6, 6],
             titan_vuln_announced: [false, false],
             weather: crate::weather::Weather::new(),
