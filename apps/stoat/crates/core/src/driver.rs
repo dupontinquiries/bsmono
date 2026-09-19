@@ -21,6 +21,7 @@
 //! it changed without diffing.
 
 use crate::backend::{Backend, Event, Request};
+use crate::command::Command;
 use crate::model::RunState;
 use crate::session::{Change, Session};
 use crate::vitals::{self, Sampler};
@@ -50,6 +51,44 @@ impl Driver {
     pub fn with(&mut self, f: impl FnOnce(&mut Session, &mut dyn Backend) -> Vec<Change>) -> Vec<Change> {
         let changes = f(&mut self.session, self.backend.as_mut());
         self.after(changes)
+    }
+
+    /// Execute a session command. Loaders (`Command::is_loader`) replace the
+    /// session rather than act on it, so they come back as `Err` for the shell.
+    pub fn execute(&mut self, cmd: &Command) -> Result<Vec<Change>, ()> {
+        use crate::backend::Request as R;
+        let thread = self.session.thread;
+        let at = self.session.selected;
+        match cmd {
+            c if c.is_loader() => return Err(()),
+            Command::Continue => self.submit(R::Continue),
+            Command::Interrupt => self.submit(R::Interrupt),
+            Command::Run => self.submit(R::Run),
+            Command::Step(kind) => self.submit(R::Step { kind: *kind, thread }),
+            Command::Up(n) => return Ok(self.with(|s, b| s.select_frame(at + *n as usize, b))),
+            Command::Down(n) => return Ok(self.with(|s, b| s.select_frame(at.saturating_sub(*n as usize), b))),
+            Command::Frame(n) => {
+                let idx = self.session.frames.iter().position(|f| f.level == *n).unwrap_or(*n as usize);
+                return Ok(self.with(|s, b| s.select_frame(idx, b)));
+            }
+            Command::Thread(id) => {
+                let id = *id;
+                return Ok(self.with(|s, b| {
+                    s.select_thread(id, b);
+                    Vec::new()
+                }));
+            }
+            Command::Print(expr) => {
+                return Ok(self.with(|s, b| {
+                    s.evaluate(expr, b);
+                    Vec::new()
+                }))
+            }
+            Command::Break(location) => self.submit(R::InsertBreakpoint { location: location.clone() }),
+            Command::Raw(line) => self.submit(R::Raw(line.clone())),
+            _ => return Err(()),
+        }
+        Ok(Vec::new())
     }
 
     pub fn submit(&mut self, req: Request) {
