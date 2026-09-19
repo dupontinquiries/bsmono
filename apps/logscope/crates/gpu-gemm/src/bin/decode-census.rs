@@ -40,7 +40,10 @@ fn main() {
         gpu.adapter_name, path, m.d, m.n_layers, m.n_kv_heads, m.vocab);
 
     let prompt: Vec<u32> = (0..16u32).map(|i| 1 + (i * 7919) % (m.vocab as u32 - 2)).collect();
-    let cache = gpu.new_cache(m.n_layers, prompt.len() + n_tok + 4, m.kv_dim());
+    // new_cache_for, not new_cache: identical for a plain model, and a hybrid (Gated DeltaNet) or
+    // MLA model needs its per-layer state — without it this tool could not census the architecture
+    // most of the recent work targets.
+    let cache = gpu.new_cache_for(&m, prompt.len() + n_tok + 4);
     let mut logits = gpu.prefill_chunked(&m, &cache, &prompt, 512);
     gpu.end_frame();
 

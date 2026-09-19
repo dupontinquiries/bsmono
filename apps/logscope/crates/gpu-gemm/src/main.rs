@@ -255,7 +255,12 @@ fn align32(x: u64) -> u64 { x.div_ceil(32) * 32 }
 /// no `llama.vocab_size` key (must be derived from the embedding), no
 /// `output.weight` tensor (tied to `token_embd`), and exotic metadata value
 /// types (float64, int8) that the parser must tolerate.
-fn write_gguf_llama3(m: &HostModel) -> Vec<u8> {
+fn write_gguf_llama3(m: &HostModel) -> Vec<u8> { write_gguf_llama3_as(m, "llama", "llama") }
+/// The llama-shaped fixture under another architecture NAME and metadata PREFIX. The tensors are
+/// identical; what changes is what the registry turns on for that name — `("gemma3", "gemma3")`
+/// gives the (1+w) norm, GeGLU and the sqrt(d) EMBEDDING SCALE with no other prefill variant, which is the only way to test that scale in isolation (Gemma-4's fixture also has
+/// V-norm, which hides it).
+fn write_gguf_llama3_as(m: &HostModel, arch: &str, pfx: &str) -> Vec<u8> {
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
     let kv = m.n_kv_heads * (m.d / m.n_heads);
@@ -284,14 +289,14 @@ fn write_gguf_llama3(m: &HostModel) -> Vec<u8> {
     let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
     let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
     b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 10);
-    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "llama");
-    s(&mut b, "llama.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
-    s(&mut b, "llama.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
-    s(&mut b, "llama.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
-    s(&mut b, "llama.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
-    s(&mut b, "llama.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
-    s(&mut b, "llama.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
-    s(&mut b, "llama.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, arch);
+    s(&mut b, &format!("{pfx}.block_count")); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
+    s(&mut b, &format!("{pfx}.attention.head_count")); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
+    s(&mut b, &format!("{pfx}.attention.head_count_kv")); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
+    s(&mut b, &format!("{pfx}.embedding_length")); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
+    s(&mut b, &format!("{pfx}.feed_forward_length")); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
+    s(&mut b, &format!("{pfx}.rope.freq_base")); u32b(&mut b, 6); f32b(&mut b, m.base);
+    s(&mut b, &format!("{pfx}.attention.layer_norm_rms_epsilon")); u32b(&mut b, 6); f32b(&mut b, m.eps);
     s(&mut b, "test.scaling_factor"); u32b(&mut b, 12); b.extend_from_slice(&8.0f64.to_le_bytes()); // float64
     s(&mut b, "test.signed_byte"); u32b(&mut b, 1); b.push((-7i8) as u8);                          // int8
     // (deliberately no llama.vocab_size)
@@ -783,7 +788,9 @@ fn write_gguf_qwen2(m: &HostModel, biases: &[(Vec<f32>, Vec<f32>, Vec<f32>)]) ->
     b
 }
 
-fn write_gguf_qwen3(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) -> Vec<u8> {
+fn write_gguf_qwen3(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) -> Vec<u8> { write_gguf_qwen3_as(m, q_norm, k_norm, "qwen3", "qwen3") }
+/// The QK-norm fixture under another architecture name/prefix — see write_gguf_llama3_as.
+fn write_gguf_qwen3_as(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>], arch: &str, pfx: &str) -> Vec<u8> {
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
     let kv = m.n_kv_heads * (m.d / m.n_heads);
@@ -816,15 +823,15 @@ fn write_gguf_qwen3(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) -> 
     let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
 
     b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 9);
-    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "qwen3");
-    s(&mut b, "qwen3.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
-    s(&mut b, "qwen3.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
-    s(&mut b, "qwen3.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
-    s(&mut b, "qwen3.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
-    s(&mut b, "qwen3.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
-    s(&mut b, "qwen3.vocab_size"); u32b(&mut b, 4); u32b(&mut b, m.vocab as u32);
-    s(&mut b, "qwen3.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
-    s(&mut b, "qwen3.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, arch);
+    s(&mut b, &format!("{pfx}.block_count")); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
+    s(&mut b, &format!("{pfx}.attention.head_count")); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
+    s(&mut b, &format!("{pfx}.attention.head_count_kv")); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
+    s(&mut b, &format!("{pfx}.embedding_length")); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
+    s(&mut b, &format!("{pfx}.feed_forward_length")); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
+    s(&mut b, &format!("{pfx}.vocab_size")); u32b(&mut b, 4); u32b(&mut b, m.vocab as u32);
+    s(&mut b, &format!("{pfx}.rope.freq_base")); u32b(&mut b, 6); f32b(&mut b, m.base);
+    s(&mut b, &format!("{pfx}.attention.layer_norm_rms_epsilon")); u32b(&mut b, 6); f32b(&mut b, m.eps);
     for (i, (name, dims, _)) in ts.iter().enumerate() {
         s(&mut b, name); u32b(&mut b, dims.len() as u32);
         for &dd in dims { u64b(&mut b, dd); }
@@ -1409,6 +1416,128 @@ fn main() {
             "prompt-lookup decoding is bit-identical to plain decoding ✓"
         } else { "MISMATCH — speculative output diverged from plain decoding ✗" });
         std::process::exit(if fails == 0 { 0 } else { 1 });
+    }
+    if args.iter().any(|a| a == "--gate-prefill-parity") {
+        // PREFILL MUST AGREE WITH DECODE, per architecture family.
+        //
+        // decode_step routes per layer and implements every variant this engine knows: QK-norm,
+        // gated attention output, post-attention norm, V-norm / V-from-K, the embedding scale,
+        // Gated DeltaNet, MLA. The prefill blocks are a separate, older body of code, and nothing
+        // held the two together — so a variant taught to decode and not to prefill gives a model
+        // whose PROMPT is processed wrongly and whose generation then reads as "a bad model".
+        //
+        // For each family: the same tokens through (A) prefill_chunked + decode_step and (B)
+        // decode_step alone from position 0. Same logits at the same positions, or the prompt
+        // path is not running the same model. (B) is the reference because it is the path the
+        // per-family gates already hold against CPU oracles.
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        let gpu = Gpu::new();
+        eprintln!("gate-prefill-parity: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: String, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let hm = gen_model(64, 128, 2, 48, 4, 2);
+        let hd = hm.d / hm.n_heads;
+        let qn: Vec<Vec<f32>> = (0..hm.n_layers).map(|i| rnd(hd, 600 + i)).collect();
+        let kn: Vec<Vec<f32>> = (0..hm.n_layers).map(|i| rnd(hd, 700 + i)).collect();
+        let families: Vec<(&str, Vec<u8>)> = vec![
+            ("llama3 (plain)", write_gguf_llama3(&hm)),
+            // gemma3, not gemma/gemma2: the registry refuses those outright (soft-caps unimplemented).
+            // With no post_attention_norm and no q/k-norm tensors in the file, the embedding scale is
+            // the ONLY thing this family has that the prefill blocks used to lack.
+            ("gemma3-shaped (embedding scale and nothing else)", write_gguf_qwen3_as(&hm, &qn, &kn, "gemma3", "gemma3")),
+            ("qwen3 (QK-norm)", write_gguf_qwen3(&hm, &qn, &kn)),
+            ("qwen35moe hybrid (Gated DeltaNet + gated attention + MoE)", write_gguf_qwen35moe_hybrid(1, None)),
+            ("gemma4 alt-V (embed scale, V-norm, V-from-K, post norms)", write_gguf_gemma4_altv(false)),
+            ("deepseek2 (MLA)", write_gguf_deepseek2_mla()),
+        ];
+        let toks: [u32; 7] = [3, 9, 14, 21, 6, 9, 27];
+        let n_prompt = 5;
+        for (name, bytes) in &families {
+            let run = |prefill: bool| -> Result<Vec<Vec<f32>>, String> {
+                let m = gpu.load_gguf_opt(bytes, false)?;
+                let c = gpu.new_cache_for(&m, toks.len() + 2);
+                let ids: Vec<u32> = toks.iter().map(|t| t % m.vocab as u32).collect();
+                let mut out = Vec::new();
+                let from = if prefill { out.push(gpu.prefill_chunked(&m, &c, &ids[..n_prompt], 3)); n_prompt }   // chunk 3: two chunks
+                           else { for p in 0..n_prompt { let l = gpu.decode_step(&m, &c, ids[p], p); if p + 1 == n_prompt { out.push(l); } } n_prompt };
+                for p in from..ids.len() { out.push(gpu.decode_step(&m, &c, ids[p], p)); }
+                gpu.end_frame();
+                Ok(out)
+            };
+            let guarded = |prefill: bool| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(prefill)))
+                .unwrap_or_else(|e| Err(format!("PANICKED: {}", e.downcast_ref::<String>().map(|s| s.chars().take(110).collect::<String>()).unwrap_or_else(|| "(non-string panic)".into()))));
+            let (a, b) = (guarded(true), guarded(false));
+            match (&a, &b) {
+                (Ok(a), Ok(b)) => {
+                    let scale = b.iter().flatten().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+                    let worst = a.iter().zip(b).map(|(x, y)| x.iter().zip(y).map(|(p, q)| if p.is_finite() && q.is_finite() { (p - q).abs() } else { f32::INFINITY }).fold(0f32, f32::max)).fold(0f32, f32::max);
+                    ck(format!("{name}: prefill+decode == decode-only at the prompt's last token and {} decode steps (max |Δ| {worst:.2e}, logit scale {scale:.2e})", a.len() - 1),
+                       a.len() == b.len() && worst <= 2e-4 * scale.max(1.0));
+                }
+                (a, b) => ck(format!("{name}: both paths run (prefill path: {}; decode-only: {})",
+                    a.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| e.clone()), b.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| e.clone())), false),
+            }
+        }
+        // WHAT A PROMPT TOKEN COSTS on the sequential route, both ways, on the hybrid. The layers-only
+        // path must be BIT-identical at the end and must not pay the head, the copy, or a sync per token.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let snap = || [gpu_kernels::GPU_DISPATCHES.load(Relaxed), gpu_kernels::GPU_SUBMITS.load(Relaxed), gpu_kernels::GPU_POLLS.load(Relaxed), gpu_kernels::GPU_COPIES.load(Relaxed)];
+            let bytes = write_gguf_qwen35moe_hybrid(1, None);
+            let prompt: Vec<u32> = (0..33u32).map(|i| 1 + (i * 7) % 30).collect();
+            let mut measure = |with_logits: bool| -> (Vec<f32>, [f64; 4]) {
+                if with_logits { std::env::set_var("LOGSCOPE_PREFILL_SEQ_LOGITS", "1"); } else { std::env::remove_var("LOGSCOPE_PREFILL_SEQ_LOGITS"); }
+                // QUANTIZED-resident, as the app loads: f32 stacks make the GPU-routed MoE path decline to
+                // readback routing, which adds a sync per MoE layer per token and hides what is being measured.
+                let m = gpu.load_gguf_opt(&bytes, true).expect("load");
+                let c = gpu.new_cache_for(&m, prompt.len() + 2);
+                let causes = || [gpu_kernels::SUBMIT_BY_PASSES.load(Relaxed), gpu_kernels::SUBMIT_BY_RETAIN.load(Relaxed), gpu_kernels::SUBMIT_BY_DOWNLOAD.load(Relaxed),
+                                 gpu_kernels::SUBMIT_BY_DIMS_WRAP.load(Relaxed), gpu_kernels::SUBMIT_BY_END_FRAME.load(Relaxed), gpu_kernels::SUBMIT_BY_NO_FRAME.load(Relaxed)];
+                let c0 = causes();
+                let before = snap();
+                gpu_kernels::dispatch_histogram_reset();
+                let l = gpu.prefill_chunked(&m, &c, &prompt, 512);
+                gpu.end_frame();
+                let after = snap();
+                if std::env::var_os("GATE_DEBUG").is_some() {
+                    let c1 = causes();
+                    println!("    debug ({}): submits by cause over {} tokens — passes {} retain {} download {} dims-wrap {} end_frame {} no-frame {}",
+                        if with_logits { "old" } else { "new" }, prompt.len(), c1[0]-c0[0], c1[1]-c0[1], c1[2]-c0[2], c1[3]-c0[3], c1[4]-c0[4], c1[5]-c0[5]);
+                    let mut h: Vec<(String, u64)> = gpu_kernels::dispatch_histogram().iter()
+                        .map(|(id, c)| (gpu_kernels::shader_label(*id).unwrap_or_else(|| format!("pipeline@{id:x}")).chars().take(28).collect(), *c as u64)).collect();
+                    h.sort();
+                    println!("    debug ({}): {}", if with_logits { "old" } else { "new" }, h.iter().map(|(k, c)| format!("{k}={c}")).collect::<Vec<_>>().join(" "));
+                }
+                std::env::remove_var("LOGSCOPE_PREFILL_SEQ_LOGITS");
+                let n = prompt.len() as f64;
+                (l, [(after[0] - before[0]) as f64 / n, (after[1] - before[1]) as f64 / n, (after[2] - before[2]) as f64 / n, (after[3] - before[3]) as f64 / n])
+            };
+            let (la, a) = measure(true);
+            let (lb, b) = measure(false);
+            println!("  hybrid, 33-token prompt, per prompt token [dispatches, submits, polls, copies]:");
+            println!("    decode_step per token (old): {:.2} {:.2} {:.2} {:.2}", a[0], a[1], a[2], a[3]);
+            println!("    layers only, windowed (new): {:.2} {:.2} {:.2} {:.2}", b[0], b[1], b[2], b[3]);
+            ck("layers-only prefill ends on BIT-identical logits".to_string(), la == lb && !la.is_empty() && la.iter().all(|v| v.is_finite()));
+            // POLLS are the blocking syncs and fall to one per window. SUBMITS only halve, and that is
+            // by design: `flush_every` bounds the passes one submit may carry (the watchdog governor
+            // the SubmitTuner sweeps), so a token's ~28 passes still close a frame about once a token.
+            // Those submits do not block the CPU; the download's did. My first threshold demanded
+            // they vanish too — the cause tally (GATE_DEBUG=1) says 28 of 34 are SUBMIT_BY_PASSES.
+            ck(format!("it BLOCKS once per window, not once per token (polls/token {:.2} -> {:.2}; submits/token {:.2} -> {:.2}, the rest are flush_every's)", a[2], b[2], a[1], b[1]),
+               b[2] <= a[2] * 0.25 && b[1] <= a[1] * 0.6);
+            ck(format!("and the LM head is not run for discarded logits (dispatches/token {:.2} -> {:.2})", a[0], b[0]), b[0] < a[0] - 1.5);
+        }
+        println!("gate-prefill-parity: {}", if ok { "prefill agrees with decode for every family \u{2713}" } else { "FAIL \u{2717}" });
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+    if let Some(i) = args.iter().position(|a| a == "--write-hybrid-fixture") {
+        // The Qwen3.5-MoE hybrid (1 Gated DeltaNet block + 1 gated-attention block, MoE FFN with a
+        // gated shared expert) as a FILE, so decode-census can count what a token costs on the
+        // architecture Ornith actually is. Same bytes --gate-deltanet-load builds in-process.
+        let path = args.get(i + 1).cloned().unwrap_or("/tmp/tiny-qwen35moe-hybrid.gguf".to_string());
+        let bytes = write_gguf_qwen35moe_hybrid(1, None);
+        std::fs::write(&path, &bytes).expect("write fixture");
+        println!("wrote {} ({} bytes): qwen35moe hybrid, blk.0 DeltaNet + blk.1 gated attention, MoE + gated shared expert", path, bytes.len());
+        return;
     }
     if let Some(i) = args.iter().position(|a| a == "--write-fixture") {
         // Write the tiny qwen3 fixture that count-dispatch and spec.rs's Drafter tests read.
@@ -6287,7 +6416,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-batched-fused  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-gemma4-altv  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rope-kv  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-batched-fused  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-gemma4-altv  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-prefill-parity --gate-qwen3\n  --gate-residency  --gate-rope-kv  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }

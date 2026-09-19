@@ -7957,6 +7957,9 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// decode can continue from position `t`. K is rope'd per-row at positions 0..t-1,
     /// which is exactly what sequential decode would have stored.
     fn block_prefill(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, t: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        // The prefill blocks were the only block fns with no refuse-by-name guard. See Model::prefill_gap.
+        Self::refuse_mla_or_deltanet_on_dense_block(w, "block_prefill");
+        Self::refuse_attn_variants_where_unapplied(w, "block_prefill");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -7984,6 +7987,8 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// rows `[base, base+s)`, then segment attention runs over the full `[0, base+s)` cache.
     /// Mirrors `block_prefill` but starting from a non-zero base with a populated cache.
     fn block_prefill_ext(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, base: usize, s: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base_freq: f32, eps: f32) -> Tensor {
+        Self::refuse_mla_or_deltanet_on_dense_block(w, "block_prefill_ext");
+        Self::refuse_attn_variants_where_unapplied(w, "block_prefill_ext");
         let base_freq = w.rope_base.unwrap_or(base_freq);      // Gemma: windowed layers use freq_base_swa
         let base_freq = if w.nope { 0.0 } else { base_freq };   // Llama4 iRoPE NoPE switch
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
@@ -8012,12 +8017,65 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// to T sequential `decode_step`s but a single pass — and it projects only the last
     /// row to logits instead of all T (the per-token output projection sequential
     /// prefill wastes on the discarded rows).
+    /// Prefill by decoding — the route for every model `Model::prefill_gap` names, and the
+    /// reference --gate-prefill-parity holds batched prefill to.
+    ///
+    /// WHAT A PROMPT TOKEN DOES NOT NEED. The first version of this was `decode_step` per token,
+    /// and decode_step ends with the final norm, the LM HEAD and a full logits DOWNLOAD. For every
+    /// prompt token but the last those logits are thrown away — and they are the most expensive
+    /// thing in the step that is not a layer: on Ornith-1.5 the head is 248,320 x 4096, about a
+    /// billion weights (a third again on top of the 35B-A3B's ~3B active), followed by a 1 MB
+    /// readback that is also a full GPU SYNC, the thing Asahi measurements put at most of decode
+    /// wall. So: layers only (`decode_layers_t`, the same per-layer routing decode_step uses) for
+    /// tokens 0..t-1, several tokens to a frame with a FENCED flush between windows, and one real
+    /// decode_step for the last token, whose logits are the ones anyone reads.
+    ///
+    /// Counted by --gate-prefill-parity on the hybrid fixture, per prompt token: submits and
+    /// polls fall from one each to one per WINDOW, the head's two dispatches and its copy
+    /// disappear, and the final logits are BIT-IDENTICAL to the per-token path
+    /// (LOGSCOPE_PREFILL_SEQ_LOGITS=1 keeps that path, for exactly this A/B).
+    /// `embed_scaled` uploads into a fresh unpooled buffer, so a host write cannot land in a buffer
+    /// an earlier, not-yet-submitted command of the same frame still reads.
+    fn prefill_sequential(&self, m: &Model, c: &KvCache, prompt: &[u32], first_pos: usize, why: &str) -> Vec<f32> {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| eprintln!("wgpu-engine: prefill — this model needs {why}, which the batched prefill blocks do not implement; the prompt is decoded token by token instead (layers only until the last token: no LM head, no readback)"));
+        let t = prompt.len();
+        if t == 0 { return Vec::new(); }
+        if std::env::var("LOGSCOPE_PREFILL_SEQ_LOGITS").as_deref() == Ok("1") {
+            let mut logits = Vec::new();
+            for (i, &tok) in prompt.iter().enumerate() { logits = self.decode_step(m, c, tok, first_pos + i); }
+            return logits;
+        }
+        let window = std::env::var("LOGSCOPE_PREFILL_SEQ_WINDOW").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8).max(1);
+        if t > 1 {
+            self.begin_frame();
+            for (i, &tok) in prompt[..t - 1].iter().enumerate() {
+                let st = tok as usize * m.d;
+                assert!(st + m.d <= m.embed.len(), "token id {tok} is outside this model's vocabulary of {}", m.embed.len() / m.d);
+                let x = self.embed_scaled(m, &m.embed[st..st + m.d]);
+                let _ = self.decode_hidden_t(m, c, x, first_pos + i);
+                if (i + 1) % window == 0 && i + 2 < t {
+                    // FENCED: submit, WAIT, release retained bind groups, reopen — decode_layers_t's
+                    // own flush sequence, and for its reason: recycling is only safe after the wait.
+                    self.end_frame();
+                    crate::counted_poll(&self.device);
+                    self.clear_retained();
+                    self.begin_frame();
+                }
+            }
+            self.end_frame();
+        }
+        self.decode_step(m, c, prompt[t - 1], first_pos + t - 1)
+    }
+
     pub fn prefill_batched(&self, m: &Model, c: &KvCache, prompt: &[u32]) -> Vec<f32> {
         self.activate_model(m);
         let t = prompt.len();
         if t == 0 { return Vec::new(); }
+        if let Some(why) = m.prefill_gap() { return self.prefill_sequential(m, c, prompt, 0, why); }
         let mut xh = Vec::with_capacity(t * m.d);
         for &id in prompt { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
+        Self::scale_embed_rows(m, &mut xh);
         let mut x = self.upload(&xh, t, m.d);
         for li in 0..m.n_layers {
             x = self.block_prefill(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li], t, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
@@ -8052,6 +8110,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         self.activate_model(m);
         let t = prompt.len();
         if t == 0 { return Vec::new(); }
+        if let Some(why) = m.prefill_gap() { return self.prefill_sequential(m, c, prompt, first_pos, why); }
         // BATCH PREFILL INTO A FRAME. Prefill never opened one, so every dispatch took `dispatch`'s
         // no-frame branch and became its own command buffer — the same defect just fixed in decode, in
         // the path that dominates wall time for every MoE model measured (Qwen3-30B: 71 s of 75 s;
@@ -8082,6 +8141,7 @@ cause: Llama-3's 128256 against a trimmed 126464 shares its low ids but not its 
 prompt tokenises fine and then indexes past the embedding table.", m.embed.len() / m.d);
                 xh.extend_from_slice(&m.embed[st..st + m.d]);
             }
+            Self::scale_embed_rows(m, &mut xh);
             let mut x = self.upload(&xh, s, m.d);
             for li in 0..m.n_layers {
                 x = self.block_prefill_ext(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li],
@@ -10406,6 +10466,32 @@ impl Model {
     /// Width of one K/V cache row = n_kv_heads × head_dim (== d for plain MHA, but NOT for Qwen3 where
     /// head_dim is decoupled from d/n_heads).
     pub fn kv_dim(&self) -> usize { self.n_kv_heads * self.head_dim }
+
+    /// The first thing this model needs that the BATCHED PREFILL blocks (`block_prefill`,
+    /// `block_prefill_ext`) do not implement, or None when they are exact for it.
+    ///
+    /// decode_step routes per layer and implements every variant; the prefill blocks are an older,
+    /// separate body that was never held to it. --gate-prefill-parity measured the result on the
+    /// unmodified engine: a Qwen3.5 hybrid PANICKED on its first decode step (its recurrent state
+    /// was never advanced — d297e4df5 routed hybrids through sequential decode and a later merge,
+    /// which moved the flag from `m.delta` to per-block `w.deltanet`, dropped the route); Gemma-4's
+    /// prompt logits were off by 115% of the logit scale; MLA's by 100%. A model that needs any of
+    /// these is prefilled by `prefill_sequential` — decode_step per prompt token: slow, and the
+    /// same model that then decodes. Teaching a prefill block a variant means deleting it from this
+    /// list, with --gate-prefill-parity green for a fixture that has it.
+    pub fn prefill_gap(&self) -> Option<&'static str> {
+        // NOT listed: the embedding scale. Prefill applies it now (scale_embed_rows), held by the
+        // gemma3-shaped family in --gate-prefill-parity — the first variant to leave this list.
+        if self.mla.is_some() { return Some("MLA attention"); }
+        for w in &self.layers {
+            if w.deltanet.is_some() { return Some("Gated DeltaNet layers (recurrent state advances one token at a time)"); }
+            if w.mla.is_some() { return Some("MLA layers"); }
+            if w.attn_out_gate.is_some() { return Some("gated attention output (Qwen3.5)"); }
+            if w.post_attn.is_some() { return Some("a post-attention norm (Gemma 2/3)"); }
+            if w.v_norm.is_some() || w.v_from_k { return Some("V-norm / V-from-K (Gemma 4)"); }
+        }
+        None
+    }
 
     /// The first thing this model needs that `decode_batched`'s inline llama-shaped body does not
     /// implement, or None when that body is exact for it. `rot` is the engine's rotary span for
@@ -16151,6 +16237,15 @@ sequence.");
         self.scale_q_for_attn(x, t, width)
     }
 
+    /// Apply the embedding scale to host-gathered rows, in place. The SAME f32 multiply
+    /// `embed_scaled` does for a decode token, so a prompt row and a decode row for the same id are
+    /// bit-identical. Prefill used to upload raw rows: for Gemma (sqrt(d), ~45x at d=2048) the
+    /// whole prompt entered the stack that much too small while decode entered at full scale.
+    fn scale_embed_rows(m: &Model, xh: &mut [f32]) {
+        if (m.embed_scale - 1.0).abs() < f32::EPSILON { return; }
+        for v in xh.iter_mut() { *v *= m.embed_scale; }
+    }
+
     /// Apply the embedding scale to an already-resident gathered row.
     fn scale_embed_t(&self, m: &Model, x: Tensor) -> Tensor {
         if (m.embed_scale - 1.0).abs() < f32::EPSILON { return x; }
@@ -16923,8 +17018,10 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
             self.write_rows(&c.v[li], &parent.v[li], 0, parent_len, kv);
         }
         if s == 0 { return c; }
+        if let Some(why) = m.prefill_gap() { let _ = self.prefill_sequential(m, &c, seg, parent_len, why); return c; }
         let mut xh = Vec::with_capacity(s * m.d);
         for &id in seg { let st = id as usize * m.d; xh.extend_from_slice(&m.embed[st..st + m.d]); }
+        Self::scale_embed_rows(m, &mut xh);
         let mut x = self.upload(&xh, s, m.d);
         for li in 0..m.n_layers {
             x = self.block_prefill_ext(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li],
@@ -17139,6 +17236,19 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         self.activate_model(m);
         let n = sessions.len();
         if n == 0 { return; }
+        // The same inline llama-shaped body as decode_batched, and until now the same missing
+        // guard — 70c55a806 fixed the f32 sibling and not this one. Same predicate, same remedy:
+        // a model the body is not exact for decodes each session through decode_step_q8, whose
+        // block refuses by name anything IT cannot do.
+        if let Some(why) = m.batched_decode_gap(self.rope_rot(m.head_dim)) {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("wgpu-engine: decode_batched_q8 — this model needs {why}, which the [N, d] batched body does not implement; sessions decode one at a time through decode_step_q8 instead"));
+            for (s, &t) in sessions.iter_mut().zip(tokens) {
+                s.logits = self.decode_step_q8(m, &s.cache, t, s.pos);
+                s.pos += 1;
+            }
+            return;
+        }
         let d = m.d; let hd = m.head_dim; let kv = m.kv_dim(); let ad = m.n_heads * hd;
         let mut xh = Vec::with_capacity(n * d);
         for &t in tokens { let s = t as usize * d; xh.extend_from_slice(&m.embed[s..s + d]); }
@@ -17261,7 +17371,20 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         self.logits_out(m, &xn, 1)
     }
 
-    fn decode_layers_t(&self, m: &Model, c: &KvCache, mut x: Tensor, pos: usize) -> Tensor {
+    /// One token through the layers, the final norm and the LM head; returns the LOGITS tensor,
+    /// undownloaded. (The name says "layers"; it has always included the head. `decode_hidden_t` is
+    /// the part that does not.)
+    fn decode_layers_t(&self, m: &Model, c: &KvCache, x: Tensor, pos: usize) -> Tensor {
+        let x = self.decode_hidden_t(m, c, x, pos);
+        let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
+        self.logits_out(m, &xn, 1)
+    }
+
+    /// One token through the LAYERS ONLY: the hidden state after the last block, with every cache
+    /// and recurrent state advanced. No final norm, no LM head. This is what a prompt token needs —
+    /// split out of `decode_layers_t` when --gate-prefill-parity showed that the "layers only"
+    /// prefill built on it was still running the head (248,320 x 4096 on Ornith) per prompt token.
+    fn decode_hidden_t(&self, m: &Model, c: &KvCache, mut x: Tensor, pos: usize) -> Tensor {
         // Optional scratch-bounding for the memory-tight path (q4-30B OOMs on big prompts). DEFAULT OFF:
         // the confirmed-good decode path is unchanged unless LOGSCOPE_DECODE_FLUSH_LAYERS is set > 0.
         //
@@ -17320,8 +17443,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
             }
         }
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
-        let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
-        self.logits_out(m, &xn, 1)
+        x
     }
     /// Greedy generation that keeps the token id and input embedding ON THE GPU across steps: argmax
     /// and embedding gather are kernels, so each step reads back only the 4-byte id instead of [vocab]
@@ -17503,6 +17625,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
             let block = &tokens[done..done + take];
             let mut xh = Vec::with_capacity(take * m.d);
             for &id in block { let st = id as usize * m.d; xh.extend_from_slice(&m.embed[st..st + m.d]); }
+            Self::scale_embed_rows(m, &mut xh);
             let mut x = self.upload(&xh, take, m.d);
             for li in 0..m.n_layers {
                 x = self.block_prefill_ext(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li],
@@ -17530,6 +17653,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
             let block = &tokens[done..done + take];
             let mut xh = Vec::with_capacity(take * m.d);
             for &id in block { let st = id as usize * m.d; xh.extend_from_slice(&m.embed[st..st + m.d]); }
+            Self::scale_embed_rows(m, &mut xh);
             let mut x = self.upload(&xh, take, m.d);
             for li in 0..m.n_layers {
                 x = self.block_prefill_ext(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li],
