@@ -26,6 +26,7 @@ use std::collections::HashMap;
 pub mod reverse; // search-based inversion: which token preceded a suffix (c11 experiment)
 pub mod flash_qblock;
 pub mod jsonmask; // byte-level JSON grammar constraint for structured decoding
+pub mod topk;     // the per-token full-vocabulary scans: O(n) exact top-k, vectorizable finite check and argmax
 pub mod imrope;   // ggml's multi-section rope, mirrored; decides per FILE whether text collapses to plain NEOX
 pub mod pool_class;
 pub mod gguf;
@@ -14781,12 +14782,12 @@ pub fn argmax(v: &[f32]) -> u32 {
     // Skip non-finite entries (NaN/±Inf): a single poisoned logit must not pin the argmax. `x > bv` is
     // false for NaN, so a leading NaN with `bv=f32::MIN` would silently return index 0 forever (the
     // Colibri #369 failure). Seed from the first FINITE value and only compare finite entries.
-    let mut bi = 0usize; let mut bv = f32::NEG_INFINITY; let mut seen = false;
-    for (i, &x) in v.iter().enumerate() {
-        if x.is_finite() && (!seen || x > bv) { bv = x; bi = i; seen = true; }
-    }
-    // all-non-finite (fully poisoned row): fall back to index 0 rather than an out-of-range/garbage pick.
-    bi as u32
+    //
+    // The loop that did this carried an index, which no vectorizer will touch: 0.37 ms per call on a
+    // 248k vocabulary. `topk::argmax_finite` is a lane-wise max (vectorizes at baseline SSE2/NEON)
+    // plus a `position`, and is held EQUAL to that loop — ties, NaN, ±Inf, all-poisoned — by
+    // topk's tests against `argmax_reference`, which is that loop verbatim.
+    crate::topk::argmax_finite(v)
 }
 
 /// How far a candidate logit vector diverges from a reference one. `argmax_match` is the
@@ -18562,11 +18563,19 @@ pub fn sample(logits: &[f32], p: &SamplerParams, rng: &mut u64) -> u32 {
     // NaN/Inf guard (Colibri #369): one +Inf becomes mx → exp(NaN) → every prob NaN → sum NaN → the
     // draw silently collapses to token 0 forever. If any logit is non-finite, fall back to the
     // finite-aware argmax (a valid token) instead of sampling from a poisoned distribution.
-    if logits.iter().any(|x| !x.is_finite()) { return argmax(logits); }
-    let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
-    let k = if p.top_k == 0 { idx.len() } else { p.top_k.min(idx.len()) };
-    idx.truncate(k);
+    if crate::topk::any_non_finite(logits) { return argmax(logits); }
+    // THE TOP-K, NOT THE SORT. This used to sort every index in the vocabulary — 248,320 on
+    // Qwen3.5/Ornith, through an indirection, ~10 ms per token measured — and then keep 40. The
+    // default sampler is top_k 40, so that was every token of every ordinary chat.
+    // `top_k_desc` is an O(n) threshold scan returning EXACTLY the sort's first k (logit descending
+    // by total_cmp, ties by index ascending), so the draw below is bit-identical for a given rng.
+    // top_k == 0 ("no limit") keeps the full sort: every entry is needed there, in that order, and
+    // the probability sum below is order-sensitive in its last bits.
+    let mut idx: Vec<usize> = if p.top_k > 0 && p.top_k < logits.len() {
+        crate::topk::top_k_desc(logits, p.top_k)
+    } else {
+        crate::topk::top_k_reference(logits, logits.len())
+    };
     let mx = logits[idx[0]];
     let mut probs: Vec<f32> = idx.iter().map(|&i| ((logits[i] - mx) / p.temperature).exp()).collect();
     let sum: f32 = probs.iter().sum();
@@ -19035,6 +19044,61 @@ mod decode_cfg_tests {
         assert_eq!(argmax(&[0.1, 0.9, 0.3]), 1);
         // all non-finite → falls back to 0 (a valid in-range index), not garbage
         assert_eq!(argmax(&[f32::NAN, f32::NAN]), 0);
+    }
+
+    #[test]
+    fn sample_draws_the_same_token_as_the_full_sort_did() {
+        // `sample` as it was before topk: every index sorted, then truncated. Verbatim.
+        fn sample_before(logits: &[f32], p: &SamplerParams, rng: &mut u64) -> u32 {
+            if p.temperature <= 0.0 || p.top_k == 1 { return argmax(logits); }
+            if logits.iter().any(|x| !x.is_finite()) { return argmax(logits); }
+            let mut idx: Vec<usize> = (0..logits.len()).collect();
+            idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+            let k = if p.top_k == 0 { idx.len() } else { p.top_k.min(idx.len()) };
+            idx.truncate(k);
+            let mx = logits[idx[0]];
+            let mut probs: Vec<f32> = idx.iter().map(|&i| ((logits[i] - mx) / p.temperature).exp()).collect();
+            let sum: f32 = probs.iter().sum();
+            for q in &mut probs { *q /= sum; }
+            if p.min_p > 0.0 {
+                let thresh = p.min_p * probs[0];
+                let cut = probs.iter().position(|&pr| pr < thresh).unwrap_or(probs.len()).max(1);
+                idx.truncate(cut); probs.truncate(cut);
+                let s: f32 = probs.iter().sum(); for q in &mut probs { *q /= s; }
+            }
+            if p.top_p < 1.0 {
+                let mut cum = 0.0; let mut cut = probs.len();
+                for (i, &pr) in probs.iter().enumerate() { cum += pr; if cum >= p.top_p { cut = i + 1; break; } }
+                idx.truncate(cut); probs.truncate(cut);
+                let s: f32 = probs.iter().sum(); for q in &mut probs { *q /= s; }
+            }
+            let r = xorshift01(rng);
+            let mut cum = 0.0;
+            for (i, &pr) in probs.iter().enumerate() { cum += pr; if r < cum { return idx[i] as u32; } }
+            idx[idx.len() - 1] as u32
+        }
+        // Coarse-grid logits so TIES are everywhere — the one place a partial selection and a stable
+        // sort could part ways — and a flat-ish temperature so draws reach deep into the top-k.
+        let mut s = 0x2545F4914F6CDD1Du64;
+        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        let mut draws = 0usize; let mut distinct = std::collections::BTreeSet::new();
+        for (n, grid) in [(97usize, 0.5f32), (5000, 0.25), (5000, 0.0), (40_000, 1.0)] {
+            let logits: Vec<f32> = (0..n).map(|_| { let u = (next() >> 40) as f32 / (1u64 << 24) as f32; let x = (u * 2.0 - 1.0) * 6.0; if grid > 0.0 { (x / grid).round() * grid } else { x } }).collect();
+            for sp in [SamplerParams::default(),
+                       SamplerParams { temperature: 1.5, top_k: 40, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 },
+                       SamplerParams { temperature: 1.0, top_k: 300, top_p: 0.9, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 },
+                       SamplerParams { temperature: 0.7, top_k: 0, top_p: 0.95, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.02 },
+                       SamplerParams { temperature: 2.0, top_k: n + 5, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 }] {
+                let (mut ra, mut rb) = (0xDEADBEEFCAFEu64 ^ n as u64, 0xDEADBEEFCAFEu64 ^ n as u64);
+                for _ in 0..400 {
+                    let (a, b) = (sample_before(&logits, &sp, &mut ra), sample(&logits, &sp, &mut rb));
+                    assert_eq!(a, b, "n={n} grid={grid} top_k={} diverged", sp.top_k);
+                    distinct.insert((n, a)); draws += 1;
+                }
+                assert_eq!(ra, rb, "the rng advanced differently");
+            }
+        }
+        assert!(draws == 8000 && distinct.len() > 60, "the draws must actually spread over the top-k ({} distinct), or equality proves nothing", distinct.len());
     }
 
     #[test]
