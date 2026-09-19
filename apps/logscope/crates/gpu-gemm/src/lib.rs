@@ -11881,26 +11881,38 @@ last block and k's first would decode to garbage")),
                 "tensor {name} data out of range — a shard is missing or truncated ({} shard(s) loaded)", set.shards()))?;
             crate::par_dequantize(t.ggml_type, raw, count)
         };
-        let embed = fetch("token_embd.weight")?;
+        // THE EMBEDDING TABLE, WITHOUT DEQUANTIZING IT UNLESS SOMETHING NEEDS THE FLOATS.
+        //
+        // This used to open with `fetch("token_embd.weight")` — the whole table as f32, 4.07 GB and a
+        // couple of seconds of every core at 248,320 x 4096 — on EVERY load, and the first thing done
+        // with it was `len() / d`: one number the tensor's dimensions already state. The floats are
+        // needed in exactly two cases: the table cannot be held raw (then they ARE the table), or the
+        // output projection is TIED to it (Llama-3.2: no `output.weight`), which builds a Lin from them.
+        let embed_rows: usize = {
+            let t = g.tensor("token_embd.weight").ok_or("missing tensor token_embd.weight".to_string())?;
+            let n: u64 = t.dims.iter().product();
+            if d == 0 || n as usize % d != 0 { return Err(format!("token_embd.weight has {n} elements, not a multiple of the embedding width {d}")); }
+            n as usize / d
+        };
         // Derive vocab from the embedding matrix (rows = vocab) when metadata omits it.
-        let vocab = vocab_meta.unwrap_or(embed.len() / d);
-        // THE RESIDENT TABLE. `embed` (f32) is still needed below for a TIED output matrix, and is
-        // dropped when this function returns; what the Model KEEPS is the tensor's own bytes when
-        // every row can be dequantized alone, exactly. LOGSCOPE_EMBED_F32=1 keeps the f32 table (A/B).
+        let vocab = vocab_meta.unwrap_or(embed_rows);
+        // What the Model KEEPS: the tensor's own bytes when every row can be dequantized alone, exactly
+        // (embedtable.rs). LOGSCOPE_EMBED_F32=1 keeps the f32 table (A/B).
         let embed_raw: Option<crate::embedtable::EmbedTable> = if std::env::var("LOGSCOPE_EMBED_F32").as_deref() == Ok("1") { None } else {
             g.tensor("token_embd.weight").and_then(|t| {
-                let rows = embed.len() / d;
-                let nbytes = gguf::type_nbytes(t.ggml_type, rows * d)?;
+                let nbytes = gguf::type_nbytes(t.ggml_type, embed_rows * d)?;
                 let raw = set.slice(t.offset, nbytes)?;
                 // f32 source: the "raw" form would BE the f32 table, copied — nothing to gain
                 if t.ggml_type == 0 { return None; }
-                crate::embedtable::EmbedTable::from_raw(t.ggml_type, raw, rows, d)
+                crate::embedtable::EmbedTable::from_raw(t.ggml_type, raw, embed_rows, d)
             })
         };
-        match &embed_raw {
-            Some(t) => eprintln!("loader: token embedding held in its file format on the host — {:.1} MiB instead of {:.1} MiB as f32; one row is dequantized per lookup (LOGSCOPE_EMBED_F32=1 for the f32 table)",
-                                 t.host_bytes() as f64 / (1u64 << 20) as f64, (embed.len() * 4) as f64 / (1u64 << 20) as f64),
-            None => {}
+        let output_is_tied = g.tensor("output.weight").is_none();
+        let embed: Option<Vec<f32>> = if embed_raw.is_none() || output_is_tied { Some(fetch("token_embd.weight")?) } else { None };
+        if let Some(t) = &embed_raw {
+            eprintln!("loader: token embedding held in its file format on the host — {:.1} MiB instead of {:.1} MiB as f32; one row is dequantized per lookup{} (LOGSCOPE_EMBED_F32=1 for the f32 table)",
+                      t.host_bytes() as f64 / (1u64 << 20) as f64, (embed_rows * d * 4) as f64 / (1u64 << 20) as f64,
+                      if output_is_tied { "; the table WAS dequantized once, transiently, because the output projection is tied to it" } else { "; the table was never dequantized" });
         }
         // Build a resident linear, preferring the DIRECT q8_0 → int8 path (no f32 round-trip) when the
         // source tensor is q8_0 and we want int8 residency; otherwise dequant-then-quantize as before.
@@ -13235,7 +13247,7 @@ attn_k_b+attn_v_b), and attn_output closes the block", missing.join(", "))
         let output = if g.tensor("output.weight").is_some() {
             lin("output.weight", vocab, d, q)?
         } else {
-            self.make_lin(&embed, vocab, d, q, q4_mode)
+            self.make_lin(embed.as_deref().expect("a tied output projection fetched the f32 table above"), vocab, d, q, q4_mode)
         };
         // RoPE frequency factors (llama3 long-context scaling). GGUF ships them as
         // `rope_freqs.weight` (length head_dim/2); absent → all 1.0 (plain RoPE).
@@ -13457,7 +13469,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
         // convention (expert_count is independently re-read at every site that needs it, e.g. the
         // treat_unsupported branch above) and costs nothing over trusting a 2500-line-old binding.
         let moe_variant = g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0);
-        let embed = embed_raw.unwrap_or(crate::embedtable::EmbedTable::F32(embed));
+        let embed = match embed_raw { Some(t) => t, None => crate::embedtable::EmbedTable::F32(embed.expect("no raw table => the f32 table was fetched above")) };
         Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale, attn_scale, logit_softcap, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, rope_neox: !acfg.rope_interleaved, rope_dims: rot, rope_mscale: mscale, trained_ctx, planned_weight_bytes, mla, dsa, mtp_layers: mtp, arch: arch.clone(), gaps: loaded_gaps, moe_variant, diffusion, mask_token_id, shift_logits })
     }
 

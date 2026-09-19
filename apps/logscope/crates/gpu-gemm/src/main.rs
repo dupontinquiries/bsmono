@@ -692,7 +692,10 @@ fn write_gguf_qwen3_q8(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) 
 /// `q8_embed`: store token_embd.weight as Q8_0 too. Every other fixture in this file keeps the
 /// embedding f32 — the one case where the host table is deliberately NOT held raw — so without this
 /// nothing exercises embedtable's row-at-a-time path end to end.
-fn write_gguf_qwen3_q8_embed(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>], q8_embed: bool) -> Vec<u8> {
+fn write_gguf_qwen3_q8_embed(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>], q8_embed: bool) -> Vec<u8> { write_gguf_qwen3_q8_full(m, q_norm, k_norm, q8_embed, false) }
+/// `tied`: omit output.weight, so the loader ties the output projection to the embedding (Llama-3.2's
+/// layout). That is the ONE case where a raw host table still has to be dequantized, once, at load.
+fn write_gguf_qwen3_q8_full(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>], q8_embed: bool, tied: bool) -> Vec<u8> {
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
     let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
@@ -715,7 +718,7 @@ fn write_gguf_qwen3_q8_embed(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f
         let (t, by) = q8t(&b.wdown); ts.push((format!("blk.{i}.ffn_down.weight"), mat(m.d, m.h), t, by));
     }
     let (t, by) = f32t(&m.out_norm); ts.push(("output_norm.weight".into(), v1(m.d), t, by));
-    let (t, by) = q8t(&m.output); ts.push(("output.weight".into(), mat(m.vocab, m.d), t, by));
+    if !tied { let (t, by) = q8t(&m.output); ts.push(("output.weight".into(), mat(m.vocab, m.d), t, by)); }
 
     let mut offs = Vec::with_capacity(ts.len());
     let mut off = 0u64;
@@ -1578,6 +1581,27 @@ fn main() {
                differing == 0 && a.len() == b.len() && scale > 1e-3 && a.iter().flatten().all(|v| v.is_finite()));
             ck(format!("the default IS the raw table, and it is smaller: {b_bytes} bytes on the host vs {a_bytes} as f32 ({:.1}x)", a_bytes as f64 / b_bytes.max(1) as f64),
                !a_raw && b_raw && b_bytes * 3 < a_bytes);
+            // TIED OUTPUT: no output.weight, so the loader builds the output projection FROM the embedding —
+            // the one case a raw table is still dequantized (once, then dropped). Same question, same
+            // standard: both ways, every logit bit.
+            {
+                let tied = write_gguf_qwen3_q8_full(&hm_e, &qn_e, &kn_e, true, true);
+                let mut run_t = |f32_table: bool| -> (Vec<Vec<f32>>, bool) {
+                    if f32_table { std::env::set_var("LOGSCOPE_EMBED_F32", "1"); } else { std::env::remove_var("LOGSCOPE_EMBED_F32"); }
+                    let m = gpu.load_gguf_opt(&tied, true).expect("load tied");
+                    std::env::remove_var("LOGSCOPE_EMBED_F32");
+                    let c = gpu.new_cache_for(&m, ids.len() + 2);
+                    let mut out = vec![gpu.prefill_chunked(&m, &c, &ids[..6], 4)];
+                    for p in 6..ids.len() { out.push(gpu.decode_step(&m, &c, ids[p], p)); }
+                    gpu.end_frame();
+                    (out, m.embed_is_raw())
+                };
+                let ((ta, ta_raw), (tb, tb_raw)) = (run_t(true), run_t(false));
+                let dt: usize = ta.iter().zip(&tb).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count()).sum();
+                let untied_differs = tb.iter().zip(&b).any(|(x, y)| x != y);
+                ck(format!("TIED output + Q8_0 token_embd: raw table == f32 table, {dt} differing logit bits; and the tied model really is a different model from the untied one: {untied_differs}"),
+                   dt == 0 && !ta_raw && tb_raw && untied_differs && ta.iter().flatten().all(|v| v.is_finite()));
+            }
             // THE GPU-RESIDENT int8 EMBEDDING, built in row chunks from the raw table vs from one whole
             // f32 table. A vocabulary LARGER than one chunk and not a multiple of it, so the chunk
             // boundary — the only thing that changed — actually occurs, raggedly.
