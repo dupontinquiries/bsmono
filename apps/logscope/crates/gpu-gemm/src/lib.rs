@@ -1348,6 +1348,9 @@ pub fn deltanet_step_hoistable(s: usize) -> bool { s > 0 && s <= DELTANET_HOIST_
 fn deltanet_step_v1(s: usize) -> bool {
     !deltanet_step_hoistable(s) || std::env::var("LOGSCOPE_DELTANET_STEP_V1").as_deref() == Ok("1")
 }
+/// Rows dequantized at a time when building the GPU-resident int8 embedding from a raw host table.
+/// 4096 rows x d 4096 x 4 B = 64 MB of transient f32, against 4 GB for the whole table.
+pub const EMBED_Q8_CHUNK_ROWS: usize = 4096;
 pub const QKNORM_MAX_HD: usize = 512;
 pub fn qknorm_rope_fusable(hd: usize, rot: usize) -> bool {
     hd > 0 && hd <= QKNORM_MAX_HD && rot >= 2 && rot <= hd && rot % 2 == 0
@@ -5191,7 +5194,29 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// Quantize the (host-side) embedding table into an int8-resident `QWeight` for windowed
     /// decode's GPU-side row gather (`gather_q8_at`). ~4× smaller than an f32 embed copy — a
     /// 151k×2048 table costs ~350 MB instead of ~1.2 GB of Asahi's VMA budget.
-    pub fn embed_q8(&self, m: &Model) -> QWeight { self.quantize_q8_resident(&m.embed.to_f32(), m.vocab, m.d) }
+    ///
+    /// NO FULL f32 TABLE. This used to be `quantize_q8_resident(&whole_table_as_f32, ..)`: for a
+    /// 248,320 x 4096 vocabulary, a 4.07 GB f32 Vec built only to be quantized down to 1 GB and
+    /// dropped — a ~5 GB transient spike at the moment of the first generation, which is exactly when
+    /// a memory-tight run can least afford one. With the host table held in its file format
+    /// (embedtable.rs) the rows are dequantized `EMBED_Q8_CHUNK_ROWS` at a time and quantized into the
+    /// final buffers: the peak is the 1 GB result plus one chunk (~64 MB at d = 4096). BIT-IDENTICAL —
+    /// the quantizer works per 32-weight block, so where a chunk ends cannot matter; the gate holds
+    /// the two builds equal, scales and code words.
+    pub fn embed_q8(&self, m: &Model) -> QWeight {
+        let Some((rows, d)) = m.embed.raw_shape() else { return self.quantize_q8_resident(&m.embed.to_f32(), m.vocab, m.d) };
+        let kb = d / 32;
+        let mut qs = vec![0f32; rows * kb];
+        let mut codes = vec![0i8; rows * d];
+        let mut r0 = 0usize;
+        while r0 < rows {
+            let r1 = (r0 + EMBED_Q8_CHUNK_ROWS).min(rows);
+            let w = m.embed.rows_f32(r0, r1, d);
+            Self::quantize_q8_into(&w, r1 - r0, d, &mut qs[r0 * kb..r1 * kb], &mut codes[r0 * d..r1 * d]);
+            r0 = r1;
+        }
+        QWeight { qw: self.upload_i8_codes_resident(&codes), qs: self.upload_resident(&qs, rows, kb), n: rows, k: d }
+    }
 
     /// The GPU-resident embedding table for windowed decode. Under MoE streaming (tight VMA budget) the
     /// table is q8 — ~4× smaller than f32, saving ~2.9 GiB on a Scout-class vocab, at ~0.5% RMSE (the
@@ -5211,6 +5236,17 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let kb = k / 32;
         let mut qs = vec![0f32; n * kb];
         let mut qbytes = vec![0i8; n * k];
+        Self::quantize_q8_into(w, n, k, &mut qs, &mut qbytes);
+        // (no pack: the i8 codes ARE the little-endian words — see upload_i8_codes_resident)
+        QWeight { qw: self.upload_i8_codes_resident(&qbytes), qs: self.upload_resident(&qs, n, kb), n, k }
+    }
+
+    /// The resident int8 quantizer's loop, writing into caller-owned buffers so a table can be
+    /// quantized a chunk at a time. `w` is `[n, k]` row-major; `qs` is `n * k/32` scales, `qbytes`
+    /// `n * k` codes. Per-32-block and therefore indifferent to how the rows were grouped.
+    fn quantize_q8_into(w: &[f32], n: usize, k: usize, qs: &mut [f32], qbytes: &mut [i8]) {
+        let kb = k / 32;
+        assert!(w.len() == n * k && qs.len() == n * kb && qbytes.len() == n * k, "quantize_q8_into: shapes disagree");
         // Per-row quantization is independent (per-row scales, disjoint output slices) — fan it out
         // across all cores instead of one. Bit-exact to the sequential version (same per-row math).
         let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(8).max(1).min(n.max(1));
@@ -5236,8 +5272,6 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                 });
             }
         });
-        // (no pack: the i8 codes ARE the little-endian words — see upload_i8_codes_resident)
-        QWeight { qw: self.upload_i8_codes_resident(&qbytes), qs: self.upload_resident(&qs, n, kb), n, k }
     }
 
     /// Load GGUF q8_0 bytes [n,k] DIRECTLY into the int8-resident `QWeight`, skipping the f32 dequant +

@@ -62,6 +62,22 @@ impl EmbedTable {
         }
     }
 
+    /// Rows `r0..r1` of a `d`-wide table as f32. For a raw table this is one dequantize over those
+    /// rows' bytes — the same values `to_f32()[r0*d .. r1*d]` holds, without the rest of the table
+    /// ever existing.
+    pub fn rows_f32(&self, r0: usize, r1: usize, d: usize) -> Cow<'_, [f32]> {
+        match self {
+            EmbedTable::F32(v) => Cow::Borrowed(&v[r0 * d..r1 * d]),
+            EmbedTable::Raw { ty, bytes, d: td, rows, row_bytes } => {
+                assert!(d == *td && r0 <= r1 && r1 <= *rows, "rows {r0}..{r1} x {d} of a {rows} x {td} table");
+                Cow::Owned(crate::gguf::dequantize(*ty, &bytes[r0 * row_bytes..r1 * row_bytes], (r1 - r0) * d)
+                    .expect("from_raw checked that this type dequantizes"))
+            }
+        }
+    }
+    /// (rows, width) of a raw table.
+    pub fn raw_shape(&self) -> Option<(usize, usize)> { match self { EmbedTable::Raw { d, rows, .. } => Some((*rows, *d)), _ => None } }
+
     /// The whole table as f32 — for the few callers that need all of it (building a GPU-resident
     /// copy, a tied output matrix, the weight store). Transient for a raw table.
     pub fn to_f32(&self) -> Cow<'_, [f32]> {
@@ -110,6 +126,26 @@ mod tests {
             }
             assert!(t.to_f32().iter().zip(&whole).all(|(a, b)| a.to_bits() == b.to_bits()), "{name}: to_f32");
             assert!(t.host_bytes() * 3 < whole.len() * 4 || ty == 1, "{name}: raw should be far smaller than f32 ({} vs {})", t.host_bytes(), whole.len() * 4);
+        }
+    }
+
+    /// A RANGE of rows is those rows of the whole table, bit for bit — including ranges that start
+    /// and end mid-table, a single row, and an empty range.
+    #[test]
+    fn a_range_of_rows_is_that_range_of_the_whole_table() {
+        for ty in [8u32, 12, 14] {
+            let (rows, d) = (23usize, 256usize);
+            let bytes = raw(ty, rows * d, 77 ^ ty);
+            let whole = crate::gguf::dequantize(ty, &bytes, rows * d).unwrap();
+            let t = EmbedTable::from_raw(ty, &bytes, rows, d).unwrap();
+            for (r0, r1) in [(0usize, 23usize), (0, 1), (5, 17), (22, 23), (9, 9)] {
+                let got = t.rows_f32(r0, r1, d);
+                assert!(got.len() == (r1 - r0) * d && got.iter().zip(&whole[r0 * d..r1 * d]).all(|(a, b)| a.to_bits() == b.to_bits()), "type {ty} rows {r0}..{r1}");
+            }
+            assert_eq!(t.raw_shape(), Some((rows, d)));
+            let f = EmbedTable::F32(whole.clone());
+            assert_eq!(f.raw_shape(), None);
+            assert_eq!(&f.rows_f32(5, 7, d)[..], &whole[5 * d..7 * d]);
         }
     }
 

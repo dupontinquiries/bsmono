@@ -1578,6 +1578,24 @@ fn main() {
                differing == 0 && a.len() == b.len() && scale > 1e-3 && a.iter().flatten().all(|v| v.is_finite()));
             ck(format!("the default IS the raw table, and it is smaller: {b_bytes} bytes on the host vs {a_bytes} as f32 ({:.1}x)", a_bytes as f64 / b_bytes.max(1) as f64),
                !a_raw && b_raw && b_bytes * 3 < a_bytes);
+            // THE GPU-RESIDENT int8 EMBEDDING, built in row chunks from the raw table vs from one whole
+            // f32 table. A vocabulary LARGER than one chunk and not a multiple of it, so the chunk
+            // boundary — the only thing that changed — actually occurs, raggedly.
+            let big = gen_model(64, 128, 1, gpu_kernels::EMBED_Q8_CHUNK_ROWS + 904, 4, 2);
+            let bytes_big = write_gguf_qwen3_q8_embed(&big, &qn_e[..1], &kn_e[..1], true);
+            let mut build = |f32_table: bool| -> (Vec<f32>, Vec<u32>, bool) {
+                if f32_table { std::env::set_var("LOGSCOPE_EMBED_F32", "1"); } else { std::env::remove_var("LOGSCOPE_EMBED_F32"); }
+                let m = gpu.load_gguf_opt(&bytes_big, true).expect("load big-vocab fixture");
+                std::env::remove_var("LOGSCOPE_EMBED_F32");
+                let q = gpu.embed_q8(&m);
+                (gpu.download(&q.qs), gpu.download_words(&q.qw), m.embed_is_raw())
+            };
+            let ((s_old, w_old, raw_old), (s_new, w_new, raw_new)) = (build(true), build(false));
+            let ds = s_old.iter().zip(&s_new).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let dw = w_old.iter().zip(&w_new).filter(|(a, b)| a != b).count();
+            ck(format!("GPU int8 embedding built in {}-row chunks == built from one whole f32 table: {ds} differing scales, {dw} differing code words ({} rows, {} words)",
+                       gpu_kernels::EMBED_Q8_CHUNK_ROWS, big.vocab, w_new.len()),
+               ds == 0 && dw == 0 && !raw_old && raw_new && s_old.len() == s_new.len() && w_old.len() == w_new.len() && w_new.iter().any(|w| *w != 0));
         }
         // THE HOISTED RECURRENCE vs THE ORIGINAL, bit for bit, at Qwen3.5's state width (128: two
         // state rows per thread, strides that wrap) and at 200 (not a multiple of 64: ragged strides)
