@@ -444,9 +444,16 @@ fn write_gguf_qwen35moe_hybrid_sections(shexp: u8, out_scale: Option<f32>, secti
 /// break tests said so. A fixture for anything per-token has to have tokens that differ. The
 /// existing gates keep the generator they were written against; --gate-prefill-parity asks for this.
 fn write_gguf_qwen35moe_hybrid_full(shexp: u8, out_scale: Option<f32>, sections: Option<[i32; 4]>, centered: bool) -> Vec<u8> {
+    write_gguf_qwen35moe_hybrid_state(shexp, out_scale, sections, centered, 8)
+}
+/// `sst`: the DeltaNet state width. Every other hybrid fixture is 8 — at which 56 of the recurrence
+/// kernel's 64 threads do nothing, no thread owns more than one state row, and nothing indexed by
+/// column goes past 7. Qwen3.5 is 128: two rows per thread, strides that wrap. A kernel whose
+/// striding is wrong is RIGHT at 8.
+fn write_gguf_qwen35moe_hybrid_state(shexp: u8, out_scale: Option<f32>, sections: Option<[i32; 4]>, centered: bool, sst: usize) -> Vec<u8> {
     let (d, vocab, h) = (64usize, 32usize, 128usize);
     let (heads, kvh, hd) = (4usize, 2usize, 16usize);          // blk.1 attention
-    let (sst, hk, hv, dconv) = (8usize, 2usize, 4usize, 4usize); // blk.0 deltanet
+    let (hk, hv, dconv) = (2usize, 4usize, 4usize); // blk.0 deltanet
     let (nexp, nused, ffe, sff) = (2usize, 1usize, 32usize, 32usize); // blk.1 MoE + shared
     let (key_dim, value_dim) = (hk * sst, hv * sst);
     let conv_dim = 2 * key_dim + value_dim;
@@ -1538,6 +1545,59 @@ fn main() {
             ck(format!("(d) the state crosses five chunk boundaries intact: prompt {:.2e}, next step {:.2e}", diff(&la, &ld), diff(&la2, &ld2)),
                diff(&la, &ld) <= 2e-4 * scale.max(1.0) && diff(&la2, &ld2) <= 2e-4 * scale.max(1.0));
             ck(format!("(c) costs a fraction of the launches: {:.2} -> {:.2} dispatches per prompt token ({:.0}x fewer)", a[0], c[0], a[0] / c[0].max(1e-9)), c[0] * 8.0 <= a[0]);
+        }
+        // THE HOISTED RECURRENCE vs THE ORIGINAL, bit for bit, at Qwen3.5's state width (128: two
+        // state rows per thread, strides that wrap) and at 200 (not a multiple of 64: ragged strides)
+        // — decode AND chunked prefill, the prompt's logits AND the step after it, which reads the
+        // state both kernels left. Same operations on the same values in the same order per element,
+        // so on a conforming device the answer must be 0 differing bits.
+        // 300 is PAST the hoisted kernels' envelope (their scratch is DELTANET_HOIST_MAX_S wide): the
+        // predicate must send it to the originals. If the constant ever outgrows the shader's arrays,
+        // this is the width that reads past them — and stops matching.
+        for sst in [128usize, 200, 300] {
+            let bytes = write_gguf_qwen35moe_hybrid_state(1, None, None, true, sst);
+            let prompt: Vec<u32> = (0..19u32).map(|i| 1 + (i * 11) % 30).collect();
+            let mut run = |v1: bool, sequential: bool| -> (Vec<f32>, Vec<f32>) {
+                if v1 { std::env::set_var("LOGSCOPE_DELTANET_STEP_V1", "1"); } else { std::env::remove_var("LOGSCOPE_DELTANET_STEP_V1"); }
+                if sequential { std::env::set_var("LOGSCOPE_PREFILL_SEQUENTIAL", "1"); } else { std::env::remove_var("LOGSCOPE_PREFILL_SEQUENTIAL"); }
+                let m = gpu.load_gguf_opt(&bytes, false).expect("load");
+                let c = gpu.new_cache_for(&m, prompt.len() + 3);
+                let l = gpu.prefill_chunked(&m, &c, &prompt, 7);
+                let l2 = gpu.decode_step(&m, &c, 5, prompt.len());
+                gpu.end_frame();
+                std::env::remove_var("LOGSCOPE_DELTANET_STEP_V1"); std::env::remove_var("LOGSCOPE_PREFILL_SEQUENTIAL");
+                (l, l2)
+            };
+            let bits = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            for (route, seq) in [("decode (single-token kernel)", true), ("chunked prefill (token-looped kernel)", false)] {
+                let ((a1, a2), (b1, b2)) = (run(true, seq), run(false, seq));
+                let scale = a1.iter().fold(0f32, |m, v| m.max(v.abs()));
+                ck(format!("state {sst}x{sst} ({}), {route}: == original, {} + {} differing logit bits (scale {scale:.2e})",
+                           if gpu_kernels::deltanet_step_hoistable(sst) { "hoisted" } else { "past the envelope -> original kernel" }, bits(&a1, &b1), bits(&a2, &b2)),
+                   bits(&a1, &b1) == 0 && bits(&a2, &b2) == 0 && a1.len() == b1.len() && !a1.is_empty() && a1.iter().all(|v| v.is_finite()) && scale > 1e-3);
+            }
+        }
+        // INFORMATIONAL — and what it informs is that THIS ADAPTER CANNOT RESOLVE THE CHANGE. On
+        // lavapipe the two kernels time the same (20.6 vs 20.7 ms at 256x256; 13.8 vs 13.8 at 128),
+        // even though widening the state from 128 to 256 adds ~7 ms to the step, so the recurrence is
+        // a large share of it. A software rasterizer pays robustness clamping on every buffer access;
+        // three divisions per element are small beside that. A native CPU transcription of the same
+        // two loops measures 2.12x. Neither number is a GPU's. LOGSCOPE_DELTANET_STEP_V1=1 is the A/B.
+        {
+            let bytes = write_gguf_qwen35moe_hybrid_state(1, None, None, true, 256);   // the widest hoistable state: the most recurrence per step this fixture can offer
+            let mut time = |v1: bool| -> f64 {
+                if v1 { std::env::set_var("LOGSCOPE_DELTANET_STEP_V1", "1"); } else { std::env::remove_var("LOGSCOPE_DELTANET_STEP_V1"); }
+                let m = gpu.load_gguf_opt(&bytes, true).expect("load");
+                let c = gpu.new_cache_for(&m, 64);
+                for p in 0..4 { let _ = gpu.decode_step(&m, &c, 3 + p as u32, p); }          // warm: pipelines, bind groups
+                let t0 = std::time::Instant::now();
+                for p in 4..28 { let _ = gpu.decode_step(&m, &c, 1 + (p as u32 * 7) % 30, p); }
+                gpu.end_frame();
+                std::env::remove_var("LOGSCOPE_DELTANET_STEP_V1");
+                t0.elapsed().as_secs_f64() * 1000.0 / 24.0
+            };
+            let (a, b, a2, b2) = (time(true), time(false), time(true), time(false));
+            println!("  lavapipe, state 256x256 x 4 heads, whole decode step (1 DeltaNet + 1 attention layer): original {:.2} / {:.2} ms, hoisted {:.2} / {:.2} ms", a, a2, b, b2);
         }
         println!("gate-prefill-parity: {}", if ok { "prefill agrees with decode for every family \u{2713}" } else { "FAIL \u{2717}" });
         std::process::exit(if ok { 0 } else { 1 });

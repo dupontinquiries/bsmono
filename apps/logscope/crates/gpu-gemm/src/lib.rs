@@ -1339,6 +1339,14 @@ pub const MOE_GPU_MAX_GROUPS: u32 = 64;
 pub fn moe_gpu_routable(n_used: u32, n_group: u32) -> bool {
     (1..=MOE_GPU_MAX_K).contains(&n_used) && n_group <= MOE_GPU_MAX_GROUPS
 }
+/// State width the hoisted DeltaNet recurrence kernels can serve: their `kh` / `qh` workgroup scratch.
+pub const DELTANET_HOIST_MAX_S: usize = 256;
+pub fn deltanet_step_hoistable(s: usize) -> bool { s > 0 && s <= DELTANET_HOIST_MAX_S }
+/// Which recurrence kernels to run: the hoisted ones inside their envelope, unless the A/B lever asks
+/// for the originals. Read per call, like the other levers that must flip inside one process.
+fn deltanet_step_v1(s: usize) -> bool {
+    !deltanet_step_hoistable(s) || std::env::var("LOGSCOPE_DELTANET_STEP_V1").as_deref() == Ok("1")
+}
 pub const QKNORM_MAX_HD: usize = 512;
 pub fn qknorm_rope_fusable(hd: usize, rot: usize) -> bool {
     hd > 0 && hd <= QKNORM_MAX_HD && rot >= 2 && rot <= hd && rot % 2 == 0
@@ -9542,8 +9550,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// WORKGROUP per head, rows strided across 64 threads (each row of S is thread-private).
 /// Transcribes delta_rule_head_step + step() phases 4-6 exactly, including l2's max(eps),
 /// the decay-BEFORE-correction ordering, and rms = sqrt(mean+eps).
-const DELTANET_STEP: &str = r#"
-// DELTANET_STEP
+const DELTANET_STEP_V1: &str = r#"
+// DELTANET_STEP_V1
 struct D { s:u32, share:u32, kd:u32, cd:u32, hv:u32, eps:u32, _a:u32, _b:u32 };
 @group(0)@binding(0) var<storage,read> g: array<f32>;
 @group(0)@binding(1) var<storage,read> p: array<f32>;
@@ -9586,6 +9594,96 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     for (var cc = 0u; cc < s; cc = cc + 1u) {
       st[rb + cc] = st[rb + cc] + dd * (g[kb + cc] / kn);
       ov = ov + st[rb + cc] * (g[qb + cc] / qn) * qscale;
+    }
+    o[h * s + r] = ov;
+  }
+  workgroupBarrier();
+  if (lid.x == 0u) {
+    var ss = 0.0;
+    for (var i = 0u; i < s; i = i + 1u) { ss = ss + o[h * s + i] * o[h * s + i]; }
+    let rms = sqrt(ss / f32(s) + eps);
+    for (var i = 0u; i < s; i = i + 1u) {
+      let zv = p[d.cd + h * s + i];
+      o[h * s + i] = o[h * s + i] / rms * nrm[i] * (zv / (1.0 + exp(-zv)));
+    }
+  }
+}"#;
+
+/// THE SAME RECURRENCE WITH THE REDUNDANT ARITHMETIC REMOVED (DELTANET_STEP_V1 is the original).
+///
+/// V1 computed `g[kb+cc] / kn` for EVERY ELEMENT of the s x s state, in BOTH passes, and
+/// `g[qb+cc] / qn` in the second: three divisions per state element for quotients that depend only
+/// on the column. At Qwen3.5's s = 128, 32 heads: 1.57 M divisions per layer per token where 8,192
+/// suffice. It also wrote each state element twice — decayed, then corrected — where the corrected
+/// value is one expression.
+///
+/// Here the normalized key and query are filled ONCE per token into workgroup arrays (in parallel,
+/// each thread its stride), pass one reads `st*decay` without storing it, and pass two writes the
+/// state once. Per element these are the SAME operations on the SAME values in the SAME order — the
+/// quotient is the same f32 whether computed once or 16,384 times, and `st*decay` is the same f32
+/// whether stored or recomputed — so on a conforming device this is BIT-IDENTICAL to V1:
+/// --gate-prefill-parity holds the two against each other, logits and the next decode step. A CPU
+/// transcription of the two forms measured 2.12x with a bit-identical state after 40 tokens.
+///
+/// One honest caveat for real hardware: pass two's `st*decay + dd*kh` is now a single expression,
+/// and this driver is known to contract FMAs. V1 stored `st*decay` to memory between the passes,
+/// which no compiler can fuse across. If the two differ on the target it will be by that, by at
+/// most an ULP per element, and both are correct evaluations of the recurrence.
+/// LOGSCOPE_DELTANET_STEP_V1=1 selects the originals for exactly that A/B.
+///
+/// ENVELOPE: `kh`/`qh` are 256 wide, so s <= DELTANET_HOIST_MAX_S. `deltanet_step_hoistable` is the
+/// predicate, and past it the V1 kernels run — a written envelope with a fallback, not a silent cap
+/// (the QKNORM_ROPE lesson).
+const DELTANET_STEP: &str = r#"
+// DELTANET_STEP
+struct D { s:u32, share:u32, kd:u32, cd:u32, hv:u32, eps:u32, _a:u32, _b:u32 };
+@group(0)@binding(0) var<storage,read> g: array<f32>;
+@group(0)@binding(1) var<storage,read> p: array<f32>;
+@group(0)@binding(2) var<storage,read> nrm: array<f32>;
+@group(0)@binding(3) var<storage,read_write> st: array<f32>;
+@group(0)@binding(4) var<storage,read_write> o: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> qn: f32;
+var<workgroup> kn: f32;
+var<workgroup> decay: f32;
+var<workgroup> beta: f32;
+var<workgroup> kh: array<f32,256>;
+var<workgroup> qh: array<f32,256>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let h = wid.x;
+  let s = d.s;
+  let eps = bitcast<f32>(d.eps);
+  let sh = h / d.share;
+  let qb = sh * s;
+  let kb = d.kd + sh * s;
+  let vb = 2u * d.kd + h * s;
+  if (lid.x == 0u) {
+    var qs = 0.0; var ks = 0.0;
+    for (var i = 0u; i < s; i = i + 1u) { qs = qs + g[qb + i] * g[qb + i]; ks = ks + g[kb + i] * g[kb + i]; }
+    qn = max(sqrt(qs), eps);
+    kn = max(sqrt(ks), eps);
+    decay = exp(g[d.cd + d.hv + h]);
+    beta = g[d.cd + h];
+  }
+  workgroupBarrier();
+  // HOISTED: the normalized key and query depend only on the COLUMN. Each thread fills its
+  // stride; every value is the quotient the old kernel computed per state element.
+  for (var i = lid.x; i < s; i = i + 64u) { kh[i] = g[kb + i] / kn; qh[i] = g[qb + i] / qn; }
+  workgroupBarrier();
+  let qscale = 1.0 / sqrt(f32(s));
+  for (var r = lid.x; r < s; r = r + 64u) {
+    let rb = h * s * s + r * s;
+    var yhat = 0.0;
+    for (var cc = 0u; cc < s; cc = cc + 1u) {
+      yhat = yhat + (st[rb + cc] * decay) * kh[cc];
+    }
+    let dd = beta * (g[vb + r] - yhat);
+    var ov = 0.0;
+    for (var cc = 0u; cc < s; cc = cc + 1u) {
+      let ns = st[rb + cc] * decay + dd * kh[cc];
+      st[rb + cc] = ns;
+      ov = ov + ns * qh[cc] * qscale;
     }
     o[h * s + r] = ov;
   }
@@ -9661,8 +9759,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// and sets up token tk+1's scalars before it reaches the next barrier, where the others wait.
 /// Per token the arithmetic is DELTANET_STEP's, statement for statement: bit-identical to `nt`
 /// sequential dispatches.
-const DELTANET_STEP_T: &str = r#"
-// DELTANET_STEP_T
+const DELTANET_STEP_T_V1: &str = r#"
+// DELTANET_STEP_T_V1
 struct D { s:u32, share:u32, kd:u32, cd:u32, hv:u32, eps:u32, nt:u32, vd:u32 };
 @group(0)@binding(0) var<storage,read> g: array<f32>;
 @group(0)@binding(1) var<storage,read> p: array<f32>;
@@ -9710,6 +9808,77 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
       for (var cc = 0u; cc < s; cc = cc + 1u) {
         st[rb + cc] = st[rb + cc] + dd * (g[kb + cc] / kn);
         ov = ov + st[rb + cc] * (g[qb + cc] / qn) * qscale;
+      }
+      o[ob + r] = ov;
+    }
+    workgroupBarrier();
+    if (lid.x == 0u) {
+      var ss = 0.0;
+      for (var i = 0u; i < s; i = i + 1u) { ss = ss + o[ob + i] * o[ob + i]; }
+      let rms = sqrt(ss / f32(s) + eps);
+      for (var i = 0u; i < s; i = i + 1u) {
+        let zv = p[tk * ps + d.cd + h * s + i];
+        o[ob + i] = o[ob + i] / rms * nrm[i] * (zv / (1.0 + exp(-zv)));
+      }
+    }
+  }
+}"#;
+
+const DELTANET_STEP_T: &str = r#"
+// DELTANET_STEP_T
+struct D { s:u32, share:u32, kd:u32, cd:u32, hv:u32, eps:u32, nt:u32, vd:u32 };
+@group(0)@binding(0) var<storage,read> g: array<f32>;
+@group(0)@binding(1) var<storage,read> p: array<f32>;
+@group(0)@binding(2) var<storage,read> nrm: array<f32>;
+@group(0)@binding(3) var<storage,read_write> st: array<f32>;
+@group(0)@binding(4) var<storage,read_write> o: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> qn: f32;
+var<workgroup> kn: f32;
+var<workgroup> decay: f32;
+var<workgroup> beta: f32;
+var<workgroup> kh: array<f32,256>;
+var<workgroup> qh: array<f32,256>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let h = wid.x;
+  let s = d.s;
+  let eps = bitcast<f32>(d.eps);
+  let sh = h / d.share;
+  let ps = d.cd + d.vd + 2u * d.hv;
+  let gs = d.cd + 2u * d.hv;
+  let qscale = 1.0 / sqrt(f32(s));
+  for (var tk = 0u; tk < d.nt; tk = tk + 1u) {
+    let gb = tk * gs;
+    let qb = gb + sh * s;
+    let kb = gb + d.kd + sh * s;
+    let vb = gb + 2u * d.kd + h * s;
+    let ob = tk * d.vd + h * s;
+    if (lid.x == 0u) {
+      var qs = 0.0; var ks = 0.0;
+      for (var i = 0u; i < s; i = i + 1u) { qs = qs + g[qb + i] * g[qb + i]; ks = ks + g[kb + i] * g[kb + i]; }
+      qn = max(sqrt(qs), eps);
+      kn = max(sqrt(ks), eps);
+      decay = exp(g[gb + d.cd + d.hv + h]);
+      beta = g[gb + d.cd + h];
+    }
+    workgroupBarrier();
+    // HOISTED: the normalized key and query depend only on the COLUMN. Each thread fills its
+    // stride; every value is the quotient the old kernel computed per state element.
+    for (var i = lid.x; i < s; i = i + 64u) { kh[i] = g[kb + i] / kn; qh[i] = g[qb + i] / qn; }
+    workgroupBarrier();
+    for (var r = lid.x; r < s; r = r + 64u) {
+      let rb = h * s * s + r * s;
+      var yhat = 0.0;
+      for (var cc = 0u; cc < s; cc = cc + 1u) {
+        yhat = yhat + (st[rb + cc] * decay) * kh[cc];
+      }
+      let dd = beta * (g[vb + r] - yhat);
+      var ov = 0.0;
+      for (var cc = 0u; cc < s; cc = cc + 1u) {
+        let ns = st[rb + cc] * decay + dd * kh[cc];
+        st[rb + cc] = ns;
+        ov = ov + ns * qh[cc] * qscale;
       }
       o[ob + r] = ov;
     }
@@ -16288,7 +16457,7 @@ sequence.");
         let mix = self.alloc(1, vd);
         let dims2 = [ss as u32, (hv / md.h_k) as u32, md.key_dim() as u32, cd as u32,
                      hv as u32, eps.to_bits(), 0, 0];
-        self.dispatch_rw(DELTANET_STEP, &[&gbuf, &proj, &dg.norm, &st.s], 3, &mix,
+        self.dispatch_rw(if deltanet_step_v1(ss) { DELTANET_STEP_V1 } else { DELTANET_STEP }, &[&gbuf, &proj, &dg.norm, &st.s], 3, &mix,
                       bytemuck::cast_slice(&dims2), (hv as u32, 1, 1));
         // Fused matvec+residual (MATVEC_Q4_ADD / apply_add): one dispatch instead of wout-then-
         // ADD — a per-recurrent-layer-per-token saving the named profiler made visible.
@@ -16329,7 +16498,7 @@ from 0 per cache. Build a fresh new_cache_for per sequence.", pos + s);
         let mix = self.alloc(s, vd);
         let dims2 = [ss as u32, (hv / md.h_k) as u32, md.key_dim() as u32, cd as u32,
                      hv as u32, eps.to_bits(), s as u32, vd as u32];
-        self.dispatch_rw(DELTANET_STEP_T, &[&gbuf, &proj, &dg.norm, &st.s], 3, &mix,
+        self.dispatch_rw(if deltanet_step_v1(ss) { DELTANET_STEP_T_V1 } else { DELTANET_STEP_T }, &[&gbuf, &proj, &dg.norm, &st.s], 3, &mix,
                       bytemuck::cast_slice(&dims2), (hv as u32, 1, 1));
         let x2 = dg.wout.apply_add(self, &mix, s, x);
         self.ffn_apply(w, &x2, s, d, eps)
@@ -20339,6 +20508,25 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 mod qknorm_envelope_tests {
     use super::{qknorm_rope_fusable, QKNORM_MAX_HD, QKNORM_ROPE, QKNORM_ROPE_KV_APPEND};
     use super::{moe_gpu_routable, MOE_GPU_MAX_GROUPS, MOE_GPU_MAX_K, MOE_TOPK, MOE_TOPK_BIAS};
+    use super::{deltanet_step_hoistable, DELTANET_HOIST_MAX_S, DELTANET_STEP, DELTANET_STEP_T, DELTANET_STEP_T_V1, DELTANET_STEP_V1};
+
+    /// The hoisted recurrence kernels' scratch bounds the state width they can serve. Predicate and
+    /// shader are tied here; the originals must NOT have picked up the scratch (they are the fallback
+    /// precisely because they have no such bound).
+    #[test]
+    fn the_hoisted_deltanet_kernels_envelope_is_written_down() {
+        assert!(deltanet_step_hoistable(128), "Qwen3.5 / Ornith: linear_key_head_dim 128");
+        assert!(deltanet_step_hoistable(DELTANET_HOIST_MAX_S) && !deltanet_step_hoistable(DELTANET_HOIST_MAX_S + 1) && !deltanet_step_hoistable(0));
+        for (name, src) in [("DELTANET_STEP", DELTANET_STEP), ("DELTANET_STEP_T", DELTANET_STEP_T)] {
+            for arr in ["kh", "qh"] { assert!(src.contains(&format!("var<workgroup> {arr}: array<f32,{DELTANET_HOIST_MAX_S}>;")), "{name}: {arr} scratch"); }
+            assert!(!src.contains("/ kn)") && !src.contains("/ qn)"), "{name}: a per-element division came back");
+            assert_eq!(src.matches("st[rb + cc] =").count(), 1, "{name}: the state is written ONCE per element");
+        }
+        for (name, src) in [("DELTANET_STEP_V1", DELTANET_STEP_V1), ("DELTANET_STEP_T_V1", DELTANET_STEP_T_V1)] {
+            assert!(!src.contains("kh:") && src.contains("/ kn)"), "{name}: the fallback must stay the unbounded original");
+        }
+    }
+
 
     /// Same shape of bug, same shape of guard: the routing kernels' scratch bounds top-k and the
     /// group count, the Rust side clamped instead of declining, and nothing tied the two numbers.
