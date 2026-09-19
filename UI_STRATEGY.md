@@ -63,6 +63,21 @@ recorded here so the next app doesn't repeat them.
   instead of one picker three apps use. Search the kit before writing a file/fuzzy/dialog/picker widget;
   if it's there, use it; if it's *almost* there, extend it in place (small, tested, additive) rather than
   forking it, so every consumer gets the improvement.
+- **A command palette is `uikit_egui::command_bar::show`, and on a phone it is upside down.** Every app
+  used to draw its own, and every one drew the desktop shape: a card floating top-centre, input first,
+  matches below. Held in a hand that is backwards — the input is at the far end of the screen from the
+  thumb and the on-screen keyboard, and the best match is furthest of all. The kit's surface decides
+  this once: on a compact or touch surface (`Adaptive`) the card sits on the bottom edge, the input is
+  its last row, and matches stack upward with the BEST one directly above the input; arrow keys follow
+  the picture. On a desk it is the familiar card. Placement is about reach; the scrim is a separate
+  question about coverage (`mode_for_rows`). The app supplies `Row`s and decides what choosing one does
+  — nothing else. Pair it with `palette_flow` (Ctrl+P, idle-to-voice) and `cmdstrip::Hold` on a button
+  a thumb can reach, because a palette bound only to Ctrl+P does not exist on a phone. Three faults the
+  surface already carries fixes for, each found the hard way: rows must be `Button::truncate` (the
+  widget overrides a LayoutJob's own wrap settings); the click that opens the palette is, that frame, a
+  click outside it; and rows must use `clicked_by(Primary)`, because egui's arrow-key focus navigation
+  runs before you can consume the arrows and Enter then "clicks" whichever row took focus. First
+  consumers: `apps/stoat/crates/gui-egui/src/palette.rs`, `apps/vidkit-player`.
 - **The recurring bug worth naming: a fully-tested dialog struct with nobody drawing it.** Three separate
   dialogs in one app (`AddToPlaylist`, `EditTrack`, `ScanPicker`) each had a complete, unit-tested
   lifecycle — `open`/`close`/validation/`payload` — a real call site that called `.open(...)`, and *no
