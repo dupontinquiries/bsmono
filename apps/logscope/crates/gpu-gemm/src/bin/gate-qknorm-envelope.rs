@@ -243,6 +243,32 @@ fn main() {
             ck(format!("{name}: logits match the unfused reference (max diff {dl:.2e})"), dl < 1e-3);
         }
     }
+    // THE N-SESSION PATH. decode_batched's body is llama-shaped and applied no QK-norm and no
+    // partial rotary to anything, refusing nothing. Two sessions with DIFFERENT streams (so a
+    // row mix-up shows) against each stream decoded alone through the unfused reference.
+    for (hd, rot, heads, kvh) in [(128, 128, 2, 1), (256, 64, 2, 1)] {
+        println!("decode_batched, hd={hd} rot={rot}");
+        let m = gpu.load_gguf_opt(&write_gguf(hd, rot, heads, kvh), false).expect("load");
+        let streams: [[u32; 5]; 2] = [[3, 9, 14, 21, 6], [27, 4, 9, 30, 11]];
+        std::env::set_var("LOGSCOPE_FUSED_QKV", "0");
+        let solo: Vec<Vec<f32>> = streams.iter().map(|st| {
+            let c = poisoned_cache(&gpu, &m);
+            let mut last = Vec::new();
+            for (p, &t) in st.iter().enumerate() { last = gpu.decode_step(&m, &c, t, p); }
+            gpu.end_frame();
+            last
+        }).collect();
+        std::env::remove_var("LOGSCOPE_FUSED_QKV");
+        let mut sessions = vec![gpu.session_new(&m, 8, 1), gpu.session_new(&m, 8, 2)];
+        for step in 0..5 { gpu.decode_batched(&m, &mut sessions, &[streams[0][step], streams[1][step]]); }
+        ck(format!("the model is outside the batched body's envelope, and says why: {:?}", m.batched_decode_gap(rot)), m.batched_decode_gap(rot).is_some());
+        for i in 0..2 {
+            let d = max_abs_diff(&sessions[i].logits, &solo[i]);
+            ck(format!("session {i}: batched logits match that stream decoded alone (max diff {d:.2e}, pos {})", sessions[i].pos), d < 1e-3 && sessions[i].pos == 5);
+        }
+        let cross = max_abs_diff(&sessions[0].logits, &solo[1]);
+        ck(format!("and the two streams really differ, so a swapped row would show (cross diff {cross:.2e})"), cross > 1e-2);
+    }
     println!("{}", if ok { "gate-qknorm-envelope: PASS" } else { "gate-qknorm-envelope: FAIL" });
     std::process::exit(if ok { 0 } else { 1 });
 }

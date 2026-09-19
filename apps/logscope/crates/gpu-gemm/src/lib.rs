@@ -10394,6 +10394,33 @@ impl Model {
     /// Width of one K/V cache row = n_kv_heads × head_dim (== d for plain MHA, but NOT for Qwen3 where
     /// head_dim is decoupled from d/n_heads).
     pub fn kv_dim(&self) -> usize { self.n_kv_heads * self.head_dim }
+
+    /// The first thing this model needs that `decode_batched`'s inline llama-shaped body does not
+    /// implement, or None when that body is exact for it. `rot` is the engine's rotary span for
+    /// the active model (Gpu::rope_rot). One list, so the batched path's envelope is written down
+    /// in exactly one place instead of being whatever its body happens to skip.
+    pub fn batched_decode_gap(&self, rot: usize) -> Option<&'static str> {
+        if rot != self.head_dim { return Some("partial rotary (rope.dimension_count < head_dim; ROPE_MH_ROWS rotates the whole head)"); }
+        if self.embed_scale != 1.0 { return Some("an embedding scale"); }
+        if self.attn_scale.is_some() { return Some("an attention-scale hparam"); }
+        if self.mla.is_some() { return Some("MLA attention"); }
+        if self.diffusion { return Some("a diffusion forward"); }
+        for w in &self.layers {
+            if w.q_norm.is_some() || w.k_norm.is_some() { return Some("per-head QK-norm before rope (Qwen3 family)"); }
+            if w.kq_norm.is_some() { return Some("post-rope KQ-norm (Llama 4)"); }
+            if w.deltanet.is_some() { return Some("Gated DeltaNet layers (recurrent state)"); }
+            if w.mla.is_some() { return Some("MLA layers"); }
+            if w.attn_out_gate.is_some() { return Some("gated attention output (Qwen3.5)"); }
+            if w.v_norm.is_some() || w.v_from_k { return Some("V-norm / V-from-K (Gemma 4)"); }
+            if w.post_attn.is_some() || w.post_ffn.is_some() { return Some("post-attention / post-FFN norms (Gemma 2/3)"); }
+            // NOT listed: out_scale, geglu, MoE, the NoPE switch — ffn_apply and the body's own
+            // `rb` handle those, so the batched body is exact for them.
+            if w.rope_base.is_some() { return Some("a per-layer rope base"); }
+            if w.swa.is_some() { return Some("sliding-window attention"); }
+            if w.attn_temp.is_some() { return Some("attention temperature (Llama 4)"); }
+        }
+        None
+    }
     /// Whether the checkpoint ships a native multi-token-prediction draft head (GLM-5.2/DeepSeek-V3). When
     /// true, an MTP speculative-decode path could draft tokens from the head (lossless, verified) — not yet
     /// wired, but the presence is now recorded rather than silently dropped at load.
@@ -16620,6 +16647,24 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         self.activate_model(m);
         let n = sessions.len();
         if n == 0 { return; }
+        // This body is a LLAMA-SHAPED block written out inline: norm, q/k/v, rope, attention,
+        // FFN. It applies no QK-norm, no partial rotary, no attention gate, no post-norms, no
+        // sliding window, no per-layer rope base, no embedding scale — and it used to refuse
+        // nothing, so a Qwen3 model fanned out across sessions decoded WITHOUT its QK-norm and
+        // read as a slightly broken model. `batched_decode_gap` names what a model needs that
+        // this path lacks; when it names anything, each session takes `decode_step`, which
+        // routes per layer and implements all of it. N single steps instead of one [N, d]
+        // step: slower, and right. Teaching the batched body a variant means removing it from
+        // that list, with a gate.
+        if let Some(why) = m.batched_decode_gap(self.rope_rot(m.head_dim)) {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("wgpu-engine: decode_batched — this model needs {why}, which the [N, d] batched body does not implement; sessions decode one at a time through decode_step instead (correct, and N launches per step rather than one)"));
+            for (s, &t) in sessions.iter_mut().zip(tokens) {
+                s.logits = self.decode_step(m, &s.cache, t, s.pos);
+                s.pos += 1;
+            }
+            return;
+        }
         self.begin_frame();
         let d = m.d; let hd = m.head_dim; let kv = m.kv_dim(); let ad = m.n_heads * hd;
         let mut xh = Vec::with_capacity(n * d);
@@ -17912,7 +17957,10 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
     /// the weights stay shared.
     pub fn session_new(&self, m: &Model, max_seq: usize, seed: u64) -> Session {
         self.activate_model(m);
-        Session { cache: self.new_cache(m.n_layers, max_seq.max(1), m.kv_dim()),
+        // new_cache_for, not new_cache: a hybrid (Gated DeltaNet) or MLA model needs its per-layer
+        // state / latent side, and decode_batched now routes such models through decode_step,
+        // which refuses a cache without them. Identical to new_cache for a plain model.
+        Session { cache: self.new_cache_for(m, max_seq.max(1)),
                   pos: 0, logits: Vec::new(), generated: Vec::new(), rng: seed | 1, done: false }
     }
     /// Prefill a session's prompt into its cache (logits left at the last token).
