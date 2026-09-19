@@ -1323,6 +1323,13 @@ fn env_decode_tile() -> Option<u32> {
 fn fused_qkv_enabled() -> bool {
     std::env::var("LOGSCOPE_FUSED_QKV").as_deref() != Ok("0")
 }
+/// Head shapes the fused QK-norm+rope kernels (QKNORM_ROPE, QKNORM_ROPE_KV_APPEND) can serve.
+/// `QKNORM_MAX_HD` is their `nx` workgroup scratch; the rest is what makes a rotary pair a pair.
+/// Pure so it can be tested without a GPU, and one definition so the two kernels cannot drift.
+pub const QKNORM_MAX_HD: usize = 512;
+pub fn qknorm_rope_fusable(hd: usize, rot: usize) -> bool {
+    hd > 0 && hd <= QKNORM_MAX_HD && rot >= 2 && rot <= hd && rot % 2 == 0
+}
 /// ROPE_KV_APPEND on the f32-KV decode path: rope q, and write roped k and raw v straight into
 /// this token's cache rows, in ONE dispatch — replacing ROPE_MH plus five buffer copies per layer
 /// (decode-census: 6 dispatches + 5 copies -> 6 dispatches + 0). Same rotation math, so the
@@ -6826,19 +6833,47 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let out = self.alloc(t, d); let dims = [t as u32, d as u32, 1u32, 0];
         self.dispatch(ATTENTION, &[q, k, v], &out, bytemuck::cast_slice(&dims), ((t as u32).div_ceil(64), 1, 1)); out
     }
+    /// Rotary span for this model, clamped to the head (rope_mh_t's rule): 0 means "full head".
+    fn rope_rot(&self, hd: usize) -> usize {
+        let r = self.rope_dims.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        if r == 0 { hd } else { r.min(hd) }
+    }
+
     /// Fused QK-Norm + RoPE (decode t=1): one dispatch for what was a 4-dispatch chain. Input `qkv` is
     /// the fused projection [1, ad+2kv]; returns [1, ad+kv] = roped q ‖ roped k (v stays in `qkv`).
+    ///
+    /// TOTAL over head shapes: inside `qknorm_rope_fusable` it is the one-dispatch kernel, outside
+    /// it is the unfused reference chain (per-head rmsnorm, then ROPE_MH) assembled into the same
+    /// layout. The kernel once had an envelope nobody had written down — head_dim <= 128, full
+    /// rotation — and a model outside it got fluent garbage rather than an error.
     fn qknorm_rope_fused(&self, qkv: &Tensor, qn: &Tensor, kn: &Tensor, ff: &Tensor,
                          n_heads: usize, n_kv_heads: usize, hd: usize, base: f32, pos: usize, eps: f32) -> Tensor {
         let ad = n_heads * hd; let kv = n_kv_heads * hd;
+        let rot = self.rope_rot(hd);
         let out = self.alloc(1, ad + kv);
+        if !qknorm_rope_fusable(hd, rot) {
+            let (qr, kr) = self.qknorm_rope_unfused(qkv, qn, kn, ff, n_heads, n_kv_heads, hd, base, pos, eps);
+            self.copy_buf(&qr, 0, &out, 0, (ad * 4) as u64);
+            self.copy_buf(&kr, 0, &out, (ad * 4) as u64, (kv * 4) as u64);
+            return out;
+        }
         let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
         let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
         let dims = [n_heads as u32, n_kv_heads as u32, hd as u32, base.to_bits(),
-                    pos as u32, neox, eps.to_bits(), msc];
+                    pos as u32, neox, eps.to_bits(), msc, rot as u32, 0u32, 0u32, 0u32];
         self.dispatch(QKNORM_ROPE, &[qkv, qn, kn, ff], &out, bytemuck::cast_slice(&dims),
                       ((n_heads + n_kv_heads) as u32, 1, 1));
         out
+    }
+
+    /// The reference chain the fused kernels replace: slice q and k out of the packed projection,
+    /// rmsnorm each per head with its own weight, ROPE_MH each (which honours the rotary span).
+    fn qknorm_rope_unfused(&self, qkv: &Tensor, qn: &Tensor, kn: &Tensor, ff: &Tensor,
+                           n_heads: usize, n_kv_heads: usize, hd: usize, base: f32, pos: usize, eps: f32) -> (Tensor, Tensor) {
+        let ad = n_heads * hd; let kv = n_kv_heads * hd;
+        let mut q = self.rmsnorm_t(&self.slice_cols(qkv, 0, ad), qn, n_heads, hd, eps); q.rows = 1; q.cols = ad;
+        let mut k = self.rmsnorm_t(&self.slice_cols(qkv, ad, kv), kn, n_kv_heads, hd, eps); k.rows = 1; k.cols = kv;
+        (self.rope_mh_t(&q, ff, 1, ad, base, pos, hd), self.rope_mh_t(&k, ff, 1, kv, base, pos, hd))
     }
 
     /// qknorm_rope_fused with the cache rows as destinations: q → [1, ad]; normed+roped k →
@@ -6846,11 +6881,20 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     fn qknorm_rope_kv_append(&self, qkv: &Tensor, qn: &Tensor, kn: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor,
                              n_heads: usize, n_kv_heads: usize, hd: usize, base: f32, pos: usize, eps: f32) -> Tensor {
         let ad = n_heads * hd; let kv = n_kv_heads * hd;
+        let rot = self.rope_rot(hd);
+        if !qknorm_rope_fusable(hd, rot) {
+            // Outside the kernel's envelope: the reference chain, then the two cache-row copies the
+            // fusion exists to remove. Slower and correct, which is the right order.
+            let (qr, kr) = self.qknorm_rope_unfused(qkv, qn, kn, ff, n_heads, n_kv_heads, hd, base, pos, eps);
+            self.copy_buf(&kr, 0, kc, (pos * kv * 4) as u64, (kv * 4) as u64);
+            self.copy_buf(qkv, ((ad + kv) * 4) as u64, vc, (pos * kv * 4) as u64, (kv * 4) as u64);
+            return qr;
+        }
         let out = self.alloc(1, ad);
         let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
         let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
         let dims = [n_heads as u32, n_kv_heads as u32, hd as u32, base.to_bits(),
-                    pos as u32, neox, eps.to_bits(), msc, kv as u32, 0u32, 0u32, 0u32];
+                    pos as u32, neox, eps.to_bits(), msc, kv as u32, rot as u32, 0u32, 0u32];
         self.dispatch_rw(QKNORM_ROPE_KV_APPEND, &[qkv, qn, kn, ff, kc, vc], 4, &out, bytemuck::cast_slice(&dims),
                          ((n_heads + 2 * n_kv_heads) as u32, 1, 1));
         out
@@ -9334,44 +9378,10 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 // pairs) with the branch-free NORM/NEOX arithmetic. Output layout identical to the old chain:
 // [0,ad)=roped q, [ad,ad+kv)=roped k. Float-tolerance note: the RMS reduction order differs from the
 // standalone RMSNORM kernel → last-ulp differences, same tolerance class as the MoE v2 kernels.
-const QKNORM_ROPE: &str = r#"
-// QKNORM_ROPE
-struct D { nq:u32,nk:u32,hd:u32,base:f32,pos:u32,neox:u32,eps:f32,msc:f32 };
-@group(0)@binding(0) var<storage,read> x: array<f32>;
-@group(0)@binding(1) var<storage,read> qn: array<f32>;
-@group(0)@binding(2) var<storage,read> kn: array<f32>;
-@group(0)@binding(3) var<storage,read> ff: array<f32>;
-@group(0)@binding(4) var<storage,read_write> o: array<f32>;
-@group(0)@binding(5) var<uniform> d: D;
-var<workgroup> red: array<f32,64>;
-var<workgroup> nx: array<f32,128>;
-@compute @workgroup_size(64,1,1)
-fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
-  let head=wg.x; let tid=lid.x; let hd=d.hd; let half=hd/2u;
-  let off=head*hd; // heads are contiguous: q heads [0,nq), then k heads
-  // per-head sum of squares (each thread covers hd/64 elems)
-  var ss=0.0; var i=tid;
-  loop { if(i>=hd){break;} let v=x[off+i]; ss=ss+v*v; i=i+64u; }
-  red[tid]=ss; workgroupBarrier();
-  for(var s2=32u;s2>0u;s2=s2>>1u){ if(tid<s2){ red[tid]=red[tid]+red[tid+s2]; } workgroupBarrier(); }
-  let inv=inverseSqrt(red[0]/f32(hd)+d.eps);
-  // normalize with the head-family weight into workgroup memory
-  i=tid;
-  loop { if(i>=hd){break;}
-    let w=select(kn[i], qn[i], head<d.nq);
-    nx[i]=x[off+i]*inv*w; i=i+64u; }
-  workgroupBarrier();
-  // one rotation pair per thread (branch-free NORM/NEOX pairing, same arithmetic as ROPE_MH)
-  if(tid<half){
-    let freq=f32(d.pos)/(pow(d.base,(2.0*f32(tid))/f32(hd))*ff[tid]);
-    let c=cos(freq)*d.msc; let s=sin(freq)*d.msc;
-    let j0=tid*(2u-d.neox);
-    let j1=j0 + 1u + d.neox*(half-1u);
-    let x0=nx[j0]; let x1=nx[j1];
-    o[off+j0]=x0*c-x1*s;
-    o[off+j1]=x0*s+x1*c;
-  }
-}"#;
+// LIVE from the file, like its KV-append sibling: this kernel had an inline copy here AND a shadow
+// in src/kernels/ that a note_claims test held equal, and the envelope fix touched one of the two.
+// One copy cannot drift.
+const QKNORM_ROPE: &str = include_str!("kernels/qknorm_rope.wgsl");
 
 const GATHER_ROWS: &str = r#"
 // GATHER_ROWS
@@ -19892,6 +19902,40 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     }
 }
 "#;
+
+#[cfg(test)]
+mod qknorm_envelope_tests {
+    use super::{qknorm_rope_fusable, QKNORM_MAX_HD, QKNORM_ROPE, QKNORM_ROPE_KV_APPEND};
+
+    /// The shapes that matter, by name. Qwen3.5 / Ornith-1.5 attention layers (config.json:
+    /// head_dim 256, partial_rotary_factor 0.25) must be INSIDE, or every one of their 1-in-4
+    /// attention layers pays the four-dispatch fallback on the default decode path.
+    #[test]
+    fn the_envelope_covers_the_real_head_shapes() {
+        assert!(qknorm_rope_fusable(128, 128), "Qwen3");
+        assert!(qknorm_rope_fusable(256, 64), "Qwen3.5 / Ornith-1.5 / Qwen3.8: head_dim 256, 64 rotary dims");
+        assert!(qknorm_rope_fusable(QKNORM_MAX_HD, QKNORM_MAX_HD));
+        assert!(!qknorm_rope_fusable(QKNORM_MAX_HD + 2, 64), "past the scratch: must take the fallback");
+        assert!(!qknorm_rope_fusable(256, 63), "an odd rotary span has an unpaired lane");
+        assert!(!qknorm_rope_fusable(256, 258), "rot > hd would rotate into the next head");
+        assert!(!qknorm_rope_fusable(256, 0), "callers resolve 0 -> hd first (rope_rot); a raw 0 is a bug");
+    }
+
+    /// The predicate and the two kernels' scratch arrays are three copies of one number. If a kernel's
+    /// `nx` shrinks (or the constant grows) the predicate admits a head the kernel silently truncates —
+    /// the exact defect this module exists for, which presented as fluent garbage, not an error.
+    #[test]
+    fn both_kernels_scratch_matches_the_predicate() {
+        let want = format!("var<workgroup> nx: array<f32,{QKNORM_MAX_HD}>;");
+        for (name, src) in [("QKNORM_ROPE", QKNORM_ROPE), ("QKNORM_ROPE_KV_APPEND", QKNORM_ROPE_KV_APPEND)] {
+            assert!(src.contains(&want), "{name}: expected `{want}`");
+            // and neither went back to one-pair-per-thread, which caps head_dim at 128 by itself
+            assert!(src.contains("p=p+64u;") && src.contains("l=l+64u;"), "{name}: threads must loop over pairs and pass-through lanes");
+            // (not a bare "/f32(hd)": the norm legitimately divides the sum of squares by hd)
+            assert!(src.contains("(2.0*f32(p))/f32(d.rot)") && !src.contains("))/f32(hd))"), "{name}: the frequency exponent runs over the rotary span");
+        }
+    }
+}
 
 #[cfg(test)]
 mod shader_drift_tests {
