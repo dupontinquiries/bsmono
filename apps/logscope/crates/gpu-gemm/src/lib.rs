@@ -1351,6 +1351,9 @@ fn deltanet_step_v1(s: usize) -> bool {
 /// Rows dequantized at a time when building the GPU-resident int8 embedding from a raw host table.
 /// 4096 rows x d 4096 x 4 B = 64 MB of transient f32, against 4 GB for the whole table.
 pub const EMBED_Q8_CHUNK_ROWS: usize = 4096;
+/// How many times a GPU-resident embedding table has been BUILT (uploaded) in this process.
+pub static RESIDENT_EMBED_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn resident_embed_builds() -> u64 { RESIDENT_EMBED_BUILDS.load(std::sync::atomic::Ordering::Relaxed) }
 pub const QKNORM_MAX_HD: usize = 512;
 pub fn qknorm_rope_fusable(hd: usize, rot: usize) -> bool {
     hd > 0 && hd <= QKNORM_MAX_HD && rot >= 2 && rot <= hd && rot % 2 == 0
@@ -5223,13 +5226,20 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// input lookup is robust to it; logits use the separate output projection, untouched). Otherwise f32,
     /// byte-identical to before. Kept in sync with the memplan streaming preflight, which counts the embed
     /// q8 under the same flag so the budget matches what actually gets allocated.
-    pub fn resident_embed(&self, m: &Model) -> ResidentEmbed {
+    ///
+    /// BUILT ONCE PER MODEL and borrowed thereafter (`Model::gpu_embed`). The cost of that, stated:
+    /// the table stays on the GPU for the model's lifetime instead of being freed after each call —
+    /// for the f32 form, 4 GB at a 248k vocabulary. The app does not come through here (it builds and
+    /// caches its own int8 embedding, backend.rs); these are the CLI / bench / gate entry points, and
+    /// `resident_embed_builds()` counts builds so a test can hold "once".
+    pub fn resident_embed<'m>(&self, m: &'m Model) -> &'m ResidentEmbed {
         self.activate_model(m);
-        if std::env::var("LOGSCOPE_MOE_STREAM").is_ok() {
-            ResidentEmbed::Q8(self.embed_q8(m))
-        } else {
-            ResidentEmbed::F32(self.upload(&m.embed.to_f32(), m.vocab, m.d))
-        }
+        let q8 = std::env::var("LOGSCOPE_MOE_STREAM").is_ok();
+        m.gpu_embed[q8 as usize].get_or_init(|| {
+            RESIDENT_EMBED_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if q8 { ResidentEmbed::Q8(self.embed_q8(m)) }
+            else { ResidentEmbed::F32(self.upload(&m.embed.to_f32(), m.vocab, m.d)) }
+        })
     }
 
     pub fn quantize_q8_resident(&self, w: &[f32], n: usize, k: usize) -> QWeight {
@@ -10333,6 +10343,13 @@ pub struct Model {
     /// vocabulary, to serve one row per token. Now held in the file's own format where a row can be
     /// dequantized exactly on its own (see embedtable.rs); f32 otherwise.
     embed: crate::embedtable::EmbedTable,
+    /// The GPU-resident embedding `Gpu::resident_embed` builds, kept once built: [f32, int8].
+    /// generate_kv_gpu / generate_kv_window / _sampled used to call resident_embed at the START OF
+    /// EVERY CALL — the whole table uploaded to a fresh GPU buffer per generation (4 GB at
+    /// 248,320 x 4096), and, once the host table went raw, DEQUANTIZED first. Anything timed through
+    /// those functions was timing that. Two slots because the format follows a flag
+    /// (LOGSCOPE_MOE_STREAM) that a process may legitimately set between calls.
+    gpu_embed: [std::sync::OnceLock<ResidentEmbed>; 2],
     layers: Vec<BlockWeights>,
     out_norm: Tensor,
     output: Lin,
@@ -13470,7 +13487,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
         // treat_unsupported branch above) and costs nothing over trusting a 2500-line-old binding.
         let moe_variant = g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0);
         let embed = match embed_raw { Some(t) => t, None => crate::embedtable::EmbedTable::F32(embed.expect("no raw table => the f32 table was fetched above")) };
-        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale, attn_scale, logit_softcap, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, rope_neox: !acfg.rope_interleaved, rope_dims: rot, rope_mscale: mscale, trained_ctx, planned_weight_bytes, mla, dsa, mtp_layers: mtp, arch: arch.clone(), gaps: loaded_gaps, moe_variant, diffusion, mask_token_id, shift_logits })
+        Ok(Model { embed, gpu_embed: Default::default(), layers, out_norm, output, rope_factors, d, h, vocab, embed_scale, attn_scale, logit_softcap, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, rope_neox: !acfg.rope_interleaved, rope_dims: rot, rope_mscale: mscale, trained_ctx, planned_weight_bytes, mla, dsa, mtp_layers: mtp, arch: arch.clone(), gaps: loaded_gaps, moe_variant, diffusion, mask_token_id, shift_logits })
     }
 
     // ── int8-resident weight cache ───────────────────────────────────────────────────────────
@@ -13607,7 +13624,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
         // llama-family only and never MoE, so "llama"/0 are not guesses, they're what loading via
         // this cache already guarantees about anything that reaches here.
         let embed = crate::embedtable::EmbedTable::F32(embed);   // the store has no raw tensor bytes to keep
-        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale: 1.0, attn_scale: None, logit_softcap: None, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, rope_neox: false, rope_dims: d / n_heads.max(1), rope_mscale: 1.0, trained_ctx, planned_weight_bytes: 0, mla: None, dsa: None, mtp_layers: 0, arch: "llama".to_string(), gaps: Vec::new(), moe_variant: 0, diffusion: false, mask_token_id: None, shift_logits: false })
+        Some(Model { embed, gpu_embed: Default::default(), layers, out_norm, output, rope_factors, d, h, vocab, embed_scale: 1.0, attn_scale: None, logit_softcap: None, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, rope_neox: false, rope_dims: d / n_heads.max(1), rope_mscale: 1.0, trained_ctx, planned_weight_bytes: 0, mla: None, dsa: None, mtp_layers: 0, arch: "llama".to_string(), gaps: Vec::new(), moe_variant: 0, diffusion: false, mask_token_id: None, shift_logits: false })
     }
     fn read_tensor(&self, r: &mut Rd) -> Option<Tensor> {
         let (rows, cols) = (r.u32()? as usize, r.u32()? as usize);
@@ -16963,7 +16980,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         self.activate_model(m);
         let ids: Vec<u32> = if prefix.is_empty() { vec![0] } else { prefix.to_vec() };
         let cap = (ids.len() + max_new + 1).max(1);
-        let cache = self.new_cache(m.n_layers, cap, m.kv_dim());
+        let cache = self.new_cache_for(m, cap);
         let mut logits = self.prefill_chunked(m, &cache, &ids, 512);
         let mut rng = seed;
         let mut pos = ids.len();
@@ -17075,7 +17092,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
     /// in rows 0..prefix.len().
     pub fn prefill_prefix(&self, m: &Model, prefix: &[u32]) -> KvCache {
         self.activate_model(m);
-        let c = self.new_cache(m.n_layers, prefix.len().max(1), m.kv_dim());
+        let c = self.new_cache_for(m, prefix.len().max(1));
         if !prefix.is_empty() { self.prefill_batched(m, &c, prefix); }
         c
     }
@@ -17245,7 +17262,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         self.activate_model(m);
         let s = seg.len();
         let total = (parent_len + s).max(1);
-        let c = self.new_cache(m.n_layers, total, m.kv_dim());
+        let c = self.new_cache_for(m, total);
         let kv = m.kv_dim();
         for li in 0..m.n_layers {
             self.write_rows(&c.k[li], &parent.k[li], 0, parent_len, kv);
@@ -17570,7 +17587,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
     /// Greedy decode with the KV cache: O(1) attention growth per step.
     pub fn generate_kv(&self, m: &Model, prompt: &[u32], n_new: usize) -> Vec<u32> {
         self.activate_model(m);
-        let c = self.new_cache(m.n_layers, prompt.len() + n_new, m.kv_dim());
+        let c = self.new_cache_for(m, prompt.len() + n_new);
         let mut logits = Vec::new();
         for pos in 0..prompt.len() { logits = self.decode_step(m, &c, prompt[pos], pos); }
         let mut out = Vec::new();
@@ -17684,7 +17701,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         self.activate_model(m);
         self.clear_oom(); // fresh generation: a prior step's OOM must not poison this run's downloads
         let embed_t = self.resident_embed(m);
-        let c = self.new_cache(m.n_layers, prompt.len() + n_new, m.kv_dim());
+        let c = self.new_cache_for(m, prompt.len() + n_new);   // was new_cache: no recurrent / MLA state, so a hybrid could not run here
         // Prefill all but the last prompt token via the normal (downloaded) path; keep the LAST prompt
         // token's logits on the GPU to seed the on-device loop.
         for pos in 0..prompt.len().saturating_sub(1) { let _ = self.decode_step(m, &c, prompt[pos], pos); }
@@ -17715,7 +17732,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         self.activate_model(m);
         let k = k.max(1);
         let embed_t = self.resident_embed(m);
-        let c = self.new_cache(m.n_layers, prompt.len() + n_new, m.kv_dim());
+        let c = self.new_cache_for(m, prompt.len() + n_new);   // was new_cache: no recurrent / MLA state, so a hybrid could not run here
         let ids_buf = self.alloc(1, k);                       // [1, k] u32 — one slot per windowed step
         let l = prompt.len();
         // BATCHED PROMPT PREFILL. This was a decode_step PER PROMPT TOKEN —
@@ -17771,7 +17788,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         let k = k.max(1);
         let rcap: usize = 64; // ring capacity == the kernel's override-table bound (rlast ≤ 64)
         let embed_t = self.resident_embed(m);
-        let c = self.new_cache(m.n_layers, prompt.len() + n_new, m.kv_dim());
+        let c = self.new_cache_for(m, prompt.len() + n_new);   // was new_cache: no recurrent / MLA state, so a hybrid could not run here
         // o = [k deposit slots | rcap ring]; seed the ring with the prompt tail (what `seen` ends with)
         let mut o_init = vec![0u32; k + rcap];
         let tail = prompt.len().min(rcap);
@@ -18121,7 +18138,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
     /// (for cross-checking the cached path against the full forward, numerically).
     pub fn forward_kv(&self, m: &Model, tokens: &[u32]) -> Vec<f32> {
         self.activate_model(m);
-        let c = self.new_cache(m.n_layers, tokens.len(), m.kv_dim());
+        let c = self.new_cache_for(m, tokens.len());
         let mut logits = Vec::new();
         for (pos, &t) in tokens.iter().enumerate() { logits = self.decode_step(m, &c, t, pos); }
         logits
@@ -18130,7 +18147,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
     /// flag). Bit-exact to forward_kv — see --gate-qkv-e2e. The dispatch saving is the tok/s lever.
     pub fn forward_kv_fused(&self, m: &Model, tokens: &[u32]) -> Vec<f32> {
         self.activate_model(m);
-        let c = self.new_cache(m.n_layers, tokens.len(), m.kv_dim());
+        let c = self.new_cache_for(m, tokens.len());
         let mut logits = Vec::new();
         for (pos, &t) in tokens.iter().enumerate() {
             self.begin_frame();
@@ -18153,7 +18170,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         mut on_token: impl FnMut(u32) -> bool,
     ) -> usize {
         let cap = (prompt.len() + n_new).max(1);
-        let c = self.new_cache(m.n_layers, cap, m.kv_dim());
+        let c = self.new_cache_for(m, cap);
         let mut logits;
         let mut pos = prompt.len();
         // Batched prefill: one [T,d] pass that fills the cache, vs T sequential steps.
@@ -18690,6 +18707,58 @@ pub fn apply_repeat_penalty(logits: &mut [f32], recent: &[u32], penalty: f32) {
 /// then sample (temperature/top-k/top-p) or argmax. With `repeat_penalty == 1.0` this is
 /// exactly `sample`/`argmax`, so greedy paths stay bit-exact.
 pub fn pick(logits: &[f32], sampler: &SamplerParams, recent: &[u32], rng: &mut u64) -> u32 {
+    if let Some(tok) = pick_without_a_copy(logits, sampler, recent, rng) { return tok; }
+    pick_reference(logits, sampler, recent, rng)
+}
+
+/// The penalized pick WITHOUT cloning the vocabulary.
+///
+/// The default sampler has repeat_penalty 1.1, so `pick` cloned the whole logits row on EVERY sampled
+/// token — 1 MB at a 248k vocabulary, allocated, written, read and freed — to change at most 64 of its
+/// entries. A penalty above 1 only ever LOWERS a logit (positive / p, negative * p, zero unchanged), so
+/// the post-penalty top-k lies inside the RAW top-(k + distinct penalized tokens) — the argument the GPU
+/// sampler already rests on. So: raw top-(k + r) by threshold scan, penalize the candidates that were
+/// recent, re-sort that handful, truncate to k, and run `sample`'s own tail. Exact, and
+/// `pick_matches_the_copying_pick_exactly` holds it to `pick_reference` draw for draw.
+///
+/// The penalty is replayed ONCE PER OCCURRENCE, as `apply_repeat_penalty` applies it: a token seen
+/// three times in the window is penalized three times, by the same float operations in the same order.
+///
+/// `None` = "use the copying path": anything outside the envelope where the argument holds or the
+/// tail is `sample`'s — a penalty below 1 (it RAISES logits), greedy, top_k of 0 / 1 / nearly the
+/// whole vocabulary, or a non-finite value anywhere (raw, or produced by the penalty).
+fn pick_without_a_copy(logits: &[f32], sp: &SamplerParams, recent: &[u32], rng: &mut u64) -> Option<u32> {
+    if !(sp.repeat_penalty > 1.0) || recent.is_empty() || !(sp.temperature > 0.0) || sp.top_k <= 1 { return None; }
+    let window = &recent[recent.len() - sp.repeat_last_n.min(recent.len())..];
+    // distinct in-vocabulary tokens with their occurrence counts (<= repeat_last_n entries: a Vec scan is fine)
+    let mut pen: Vec<(usize, u32)> = Vec::with_capacity(window.len());
+    for &t in window {
+        let i = t as usize;
+        if i >= logits.len() { continue; }                       // apply_repeat_penalty ignores these too
+        match pen.iter_mut().find(|(j, _)| *j == i) { Some((_, c)) => *c += 1, None => pen.push((i, 1)) }
+    }
+    let want = sp.top_k.checked_add(pen.len())?;
+    if want >= logits.len() { return None; }
+    if crate::topk::any_non_finite(logits) { return None; }
+    // the penalized value of each recent token, by the reference's own operations, `count` times over
+    let penalized: Vec<(usize, f32)> = pen.iter().map(|&(i, count)| {
+        let mut v = logits[i];
+        for _ in 0..count { if v > 0.0 { v /= sp.repeat_penalty; } else { v *= sp.repeat_penalty; } }
+        (i, v)
+    }).collect();
+    if penalized.iter().any(|(_, v)| !v.is_finite()) { return None; }
+    let mut cand: Vec<(usize, f32)> = crate::topk::top_k_desc(logits, want).into_iter()
+        .map(|i| (i, penalized.iter().find(|(j, _)| *j == i).map(|(_, v)| *v).unwrap_or(logits[i]))).collect();
+    // the stable descending sort of the penalized row, restricted to the candidates
+    cand.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    cand.truncate(sp.top_k);
+    let (idx, vals): (Vec<usize>, Vec<f32>) = cand.into_iter().unzip();
+    Some(sample_sorted(idx, &vals, sp, rng))
+}
+
+/// `pick` as it was: penalize a COPY of the row, then sample / argmax it. The fallback for everything
+/// outside `pick_without_a_copy`'s envelope, and the oracle it is held to.
+pub fn pick_reference(logits: &[f32], sampler: &SamplerParams, recent: &[u32], rng: &mut u64) -> u32 {
     if sampler.repeat_penalty != 1.0 && !recent.is_empty() {
         let mut l = logits.to_vec();
         let n = sampler.repeat_last_n.min(recent.len());
@@ -18806,8 +18875,17 @@ pub fn sample(logits: &[f32], p: &SamplerParams, rng: &mut u64) -> u32 {
     } else {
         crate::topk::top_k_reference(logits, logits.len())
     };
-    let mx = logits[idx[0]];
-    let mut probs: Vec<f32> = idx.iter().map(|&i| ((logits[i] - mx) / p.temperature).exp()).collect();
+    let vals: Vec<f32> = idx.iter().map(|&i| logits[i]).collect();
+    sample_sorted(idx, &vals, p, rng)
+}
+
+/// `sample`'s tail: `idx` sorted by logit descending (ties by index ascending) and `vals[i]` the logit
+/// of `idx[i]`. Softmax at temperature, min-p, top-p, one uniform draw. Split out so `pick` can hand it
+/// candidates whose values carry a repetition penalty WITHOUT a penalized copy of the whole vocabulary
+/// ever existing. The float operations and their order are exactly what `sample` always did.
+fn sample_sorted(mut idx: Vec<usize>, vals: &[f32], p: &SamplerParams, rng: &mut u64) -> u32 {
+    let mx = vals[0];
+    let mut probs: Vec<f32> = vals.iter().map(|&v| ((v - mx) / p.temperature).exp()).collect();
     let sum: f32 = probs.iter().sum();
     for q in &mut probs { *q /= sum; }
     if p.min_p > 0.0 {
@@ -19329,6 +19407,53 @@ mod decode_cfg_tests {
             }
         }
         assert!(draws == 8000 && distinct.len() > 60, "the draws must actually spread over the top-k ({} distinct), or equality proves nothing", distinct.len());
+    }
+
+    /// The clone-free pick against the copying one, draw for draw, with the rng advancing identically.
+    /// Histories are built to make the argument WORK for its living: the recent tokens ARE the raw top
+    /// logits (so the post-penalty top-k reaches well past the raw top-k), with DUPLICATES (the penalty
+    /// is per occurrence), out-of-vocabulary ids, and a coarse logit grid so ties are everywhere.
+    #[test]
+    fn pick_matches_the_copying_pick_exactly() {
+        let mut s = 0x2545F4914F6CDD1Du64;
+        let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        let (mut fast_path, mut fallbacks, mut draws) = (0usize, 0usize, 0usize);
+        let mut distinct = std::collections::BTreeSet::new();
+        for (n, grid) in [(200usize, 0.5f32), (6000, 0.25), (6000, 0.0), (30_000, 1.0)] {
+            let logits: Vec<f32> = (0..n).map(|_| { let u = (next() >> 40) as f32 / (1u64 << 24) as f32; let x = (u * 2.0 - 1.0) * 6.0; if grid > 0.0 { (x / grid).round() * grid } else { x } }).collect();
+            let mut order: Vec<usize> = (0..n).collect(); order.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+            let histories: Vec<Vec<u32>> = vec![
+                vec![],
+                (0..50).map(|j| ((j * 131 + 7) % n) as u32).collect(),                                   // arbitrary ids
+                order[..60].iter().rev().map(|&i| i as u32).collect(),                                    // THE RAW TOP, penalized
+                order[..20].iter().flat_map(|&i| [i as u32, i as u32, i as u32]).collect(),               // ... three times each
+                order[..30].iter().map(|&i| i as u32).chain([n as u32 + 5, u32::MAX]).collect(),          // + out-of-vocabulary ids
+            ];
+            for sp in [SamplerParams::default(),
+                       SamplerParams { temperature: 1.4, top_k: 40, top_p: 1.0, repeat_penalty: 1.3, repeat_last_n: 64, min_p: 0.0 },
+                       SamplerParams { temperature: 0.9, top_k: 5,  top_p: 0.9, repeat_penalty: 1.15, repeat_last_n: 24, min_p: 0.02 },
+                       SamplerParams { temperature: 1.0, top_k: 64, top_p: 1.0, repeat_penalty: 0.8, repeat_last_n: 64, min_p: 0.0 },   // BOOST: must fall back
+                       SamplerParams { temperature: 0.0, top_k: 40, top_p: 1.0, repeat_penalty: 1.2, repeat_last_n: 64, min_p: 0.0 },   // greedy: falls back
+                       SamplerParams { temperature: 1.0, top_k: 0,  top_p: 0.95, repeat_penalty: 1.1, repeat_last_n: 64, min_p: 0.0 }] { // no top-k: falls back
+                for h in &histories {
+                    let (mut ra, mut rb) = (0xABCDEF ^ n as u64, 0xABCDEF ^ n as u64);
+                    for _ in 0..60 {
+                        let mut probe = rb;
+                        if pick_without_a_copy(&logits, &sp, h, &mut probe).is_some() { fast_path += 1 } else { fallbacks += 1 }
+                        let (a, b) = (pick_reference(&logits, &sp, h, &mut ra), pick(&logits, &sp, h, &mut rb));
+                        assert_eq!(a, b, "n={n} grid={grid} top_k={} penalty={} history of {}", sp.top_k, sp.repeat_penalty, h.len());
+                        distinct.insert((n, a)); draws += 1;
+                    }
+                    assert_eq!(ra, rb, "the rng advanced differently");
+                }
+            }
+        }
+        assert!(fast_path > 2000 && fallbacks > 1000, "both paths must be exercised: {fast_path} clone-free, {fallbacks} fallbacks of {draws}");
+        assert!(distinct.len() > 80, "draws must spread ({} distinct) or equality proves little", distinct.len());
+        // poisoned rows fall back, and fall back to the same answer
+        let mut bad = vec![0.5f32; 300]; bad[7] = f32::INFINITY; bad[9] = 3.0;
+        let (mut r1, mut r2) = (5u64, 5u64);
+        assert_eq!(pick(&bad, &SamplerParams::default(), &[9, 9], &mut r1), pick_reference(&bad, &SamplerParams::default(), &[9, 9], &mut r2));
     }
 
     #[test]

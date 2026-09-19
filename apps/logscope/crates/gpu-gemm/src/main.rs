@@ -1581,6 +1581,30 @@ fn main() {
                differing == 0 && a.len() == b.len() && scale > 1e-3 && a.iter().flatten().all(|v| v.is_finite()));
             ck(format!("the default IS the raw table, and it is smaller: {b_bytes} bytes on the host vs {a_bytes} as f32 ({:.1}x)", a_bytes as f64 / b_bytes.max(1) as f64),
                !a_raw && b_raw && b_bytes * 3 < a_bytes);
+            // THE GPU-RESIDENT TABLE IS BUILT ONCE. generate_kv_gpu / generate_kv_window used to upload the
+            // whole embedding to a fresh GPU buffer at the start of EVERY call. Five calls, one build —
+            // and the same tokens every time, equal to the plain host-gather path.
+            {
+                let m = gpu.load_gguf_opt(&bytes, true).expect("load");
+                let prompt: Vec<u32> = ids[..5].to_vec();
+                let before = gpu_kernels::resident_embed_builds();
+                let w1 = gpu.generate_kv_window(&m, &prompt, 9, 4);
+                let w2 = gpu.generate_kv_window(&m, &prompt, 9, 4);
+                let g1 = gpu.generate_kv_gpu(&m, &prompt, 9);
+                let g2 = gpu.generate_kv_gpu(&m, &prompt, 9);
+                let w3 = gpu.generate_kv_window(&m, &prompt, 9, 3);
+                let builds = gpu_kernels::resident_embed_builds() - before;
+                let plain = gpu.generate_kv(&m, &prompt, 9);
+                ck(format!("five windowed / GPU-gather generations on one model built the GPU embedding {builds} time(s)"), builds == 1);
+                if std::env::var_os("GATE_DEBUG").is_some() { println!("      debug: w1 {w1:?}\n      debug: g1 {g1:?}\n      debug: w3 {w3:?}\n      debug: plain {plain:?}"); }
+                // These return the NEW tokens only (my first assertion assumed prompt + new).
+                ck(format!("and they agree with each other and with the host-gather path ({} new tokens)", plain.len()),
+                   w1 == w2 && g1 == g2 && w1 == g1 && w3 == w1 && w1 == plain && plain.len() == 9);
+                // a SECOND model gets its own table — the cache is per model, not per process
+                let m2 = gpu.load_gguf_opt(&bytes, true).expect("load again");
+                let _ = gpu.generate_kv_window(&m2, &prompt, 3, 2);
+                ck("a second Model builds its own".to_string(), gpu_kernels::resident_embed_builds() - before == 2);
+            }
             // TIED OUTPUT: no output.weight, so the loader builds the output projection FROM the embedding —
             // the one case a raw table is still dequantized (once, then dropped). Same question, same
             // standard: both ways, every logit bit.
@@ -1620,6 +1644,40 @@ fn main() {
             ck(format!("GPU int8 embedding built in {}-row chunks == built from one whole f32 table: {ds} differing scales, {dw} differing code words ({} rows, {} words)",
                        gpu_kernels::EMBED_Q8_CHUNK_ROWS, big.vocab, w_new.len()),
                ds == 0 && dw == 0 && !raw_old && raw_new && s_old.len() == s_new.len() && w_old.len() == w_new.len() && w_new.iter().any(|w| *w != 0));
+        }
+        // A HYBRID THROUGH THE WINDOWED PATH. generate_kv_window / generate_kv_gpu allocated with
+        // new_cache — no recurrent state — so a Gated DeltaNet model could not run through them at all.
+        // With new_cache_for it must, and must produce the tokens step-by-step decode produces.
+        {
+            let bytes_h = write_gguf_qwen35moe_hybrid_full(1, None, None, true);
+            let m = gpu.load_gguf_opt(&bytes_h, true).expect("load hybrid");
+            let prompt: Vec<u32> = vec![3, 9, 14, 21, 6];
+            let reference: Vec<u32> = {
+                let c = gpu.new_cache_for(&m, prompt.len() + 8);
+                let mut out = prompt.clone(); let mut logits = Vec::new();
+                for (p, &t) in prompt.iter().enumerate() { logits = gpu.decode_step(&m, &c, t, p); }
+                for p in prompt.len()..prompt.len() + 7 { let nx = gpu_kernels::argmax(&logits); out.push(nx); logits = gpu.decode_step(&m, &c, nx, p); }
+                out.push(gpu_kernels::argmax(&logits)); gpu.end_frame(); out
+            };
+            let run = |f: &dyn Fn() -> Vec<u32>| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|e| e.downcast_ref::<String>().map(|s| s.chars().take(90).collect::<String>()).unwrap_or_default());
+            let reference: Vec<u32> = reference[prompt.len()..].to_vec();   // the generate_* fns return the NEW tokens only
+            let win = run(&|| gpu.generate_kv_window(&m, &prompt, 8, 3));
+            let gg = run(&|| gpu.generate_kv_gpu(&m, &prompt, 8));
+            if std::env::var_os("GATE_DEBUG").is_some() { println!("      debug: reference {reference:?}\n      debug: window    {win:?}\n      debug: gpu       {gg:?}"); }
+            ck(format!("hybrid: generate_kv_window runs and matches step-by-step decode ({})", match &win { Ok(v) => format!("{} tokens", v.len()), Err(e) => format!("PANICKED: {e}") }),
+               win.as_ref().map(|v| *v == reference).unwrap_or(false));
+            // and the two entry points other code is BUILT on: generate_kv (what the windowed paths are
+            // held bit-exact to) and run_tokens (the unit of work a fan/fabric worker runs). Greedy here.
+            let gk = run(&|| gpu.generate_kv(&m, &prompt, 8));
+            ck(format!("hybrid: generate_kv runs and matches ({})", match &gk { Ok(v) => format!("{} tokens", v.len()), Err(e) => format!("PANICKED: {e}") }),
+               gk.as_ref().map(|v| *v == reference).unwrap_or(false));
+            let greedy = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+            let rt = run(&|| gpu.run_tokens(&m, &prompt, 8, &greedy, &[], 1));
+            ck(format!("hybrid: run_tokens (the fabric worker's unit) runs and matches ({})", match &rt { Ok(v) => format!("{} tokens", v.len()), Err(e) => format!("PANICKED: {e}") }),
+               rt.as_ref().map(|v| *v == reference).unwrap_or(false));
+            if std::env::var_os("GATE_DEBUG").is_some() { println!("      debug: generate_kv {gk:?}\n      debug: run_tokens  {rt:?}"); }
+            ck(format!("hybrid: generate_kv_gpu runs and matches step-by-step decode ({})", match &gg { Ok(v) => format!("{} tokens", v.len()), Err(e) => format!("PANICKED: {e}") }),
+               gg.as_ref().map(|v| *v == reference).unwrap_or(false));
         }
         // THE HOISTED RECURRENCE vs THE ORIGINAL, bit for bit, at Qwen3.5's state width (128: two
         // state rows per thread, strides that wrap) and at 200 (not a multiple of 64: ragged strides)
