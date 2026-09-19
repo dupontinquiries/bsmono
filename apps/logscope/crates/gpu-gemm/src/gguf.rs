@@ -46,7 +46,12 @@ impl<'a> Cur<'a> {
             8 => Value::Str(self.gstr()?),
             9 => { // array: element type, count, then elements
                 let et = self.u32()?; let n = self.u64()? as usize;
-                let mut v = Vec::with_capacity(n);
+                // HOSTILE COUNT: `n` is 8 bytes straight from the file, and with_capacity(n) on a
+                // forged u64 panics (capacity overflow) or aborts (allocation failure) before a single element
+                // is read — the same class as the hostile-dimension guard in the loader, one layer
+                // down. Every element is at least one byte, so the bytes LEFT bound any honest
+                // count; a forged one then fails in take() with "unexpected EOF" like any truncation.
+                let mut v = Vec::with_capacity(n.min(self.b.len().saturating_sub(self.p)));
                 for _ in 0..n { v.push(self.value(et)?); }
                 Value::Arr(v)
             }
@@ -107,6 +112,18 @@ impl Gguf {
             Value::U64(v) if *v <= u32::MAX as u64 => Some(*v as u32),
             _ => None,
         }
+    }
+    /// An integer ARRAY as u32s, any element width — `rope.dimension_sections` is written as int32
+    /// by llama.cpp's converter and as uint32 by others. None if absent, not an array, or any
+    /// element is negative / too large: a partly-readable section list is not a section list.
+    pub fn get_u32_arr(&self, key: &str) -> Option<Vec<u32>> {
+        let Value::Arr(items) = self.metadata.get(key)? else { return None };
+        items.iter().map(|v| match v {
+            Value::U32(x) => Some(*x),
+            Value::I32(x) if *x >= 0 => Some(*x as u32),
+            Value::U64(x) if *x <= u32::MAX as u64 => Some(*x as u32),
+            _ => None,
+        }).collect()
     }
     pub fn get_str(&self, key: &str) -> Option<&str> {
         match self.metadata.get(key) { Some(Value::Str(s)) => Some(s.as_str()), _ => None }
@@ -1301,6 +1318,33 @@ mod arch_tests {
         Gguf { version: 3, metadata: m, tensors: vec![], data_offset: 0 }
     }
     fn emb(prefix: &str) -> (&'static str, Value) { (Box::leak(format!("{prefix}.embedding_length").into_boxed_str()), Value::U32(4096)) }
+
+    #[test]
+    fn a_forged_array_count_is_an_error_not_an_abort() {
+        // header + one metadata entry: key "k", type 9 (array), element type 4 (u32), count u64::MAX
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF"); b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes()); b.push(b'k');
+        b.extend_from_slice(&9u32.to_le_bytes()); b.extend_from_slice(&4u32.to_le_bytes());
+        b.extend_from_slice(&u64::MAX.to_le_bytes());
+        b.extend_from_slice(&7u32.to_le_bytes()); // one real element, then the file ends
+        assert_eq!(parse(&b).err().as_deref(), Some("unexpected EOF"));
+    }
+
+    #[test]
+    fn get_u32_arr_reads_any_integer_width_and_refuses_a_negative() {
+        let mut g = Gguf { version: 3, metadata: HashMap::new(), tensors: Vec::new(), data_offset: 0 };
+        g.metadata.insert("i32".into(), Value::Arr(vec![Value::I32(11), Value::I32(11), Value::I32(10), Value::I32(0)]));
+        g.metadata.insert("u32".into(), Value::Arr(vec![Value::U32(16), Value::U32(24)]));
+        g.metadata.insert("neg".into(), Value::Arr(vec![Value::I32(11), Value::I32(-1)]));
+        g.metadata.insert("str".into(), Value::Str("x".into()));
+        assert_eq!(g.get_u32_arr("i32"), Some(vec![11, 11, 10, 0]), "int32 is what llama.cpp's converter writes");
+        assert_eq!(g.get_u32_arr("u32"), Some(vec![16, 24]));
+        assert_eq!(g.get_u32_arr("neg"), None, "a partly-readable section list is not a section list");
+        assert_eq!(g.get_u32_arr("str"), None);
+        assert_eq!(g.get_u32_arr("absent"), None);
+    }
 
     #[test]
     fn get_u32_reads_any_integer_width() {
