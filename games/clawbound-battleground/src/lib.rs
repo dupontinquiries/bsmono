@@ -18,6 +18,8 @@ pub mod props;
 pub mod blockers;
 /// The state behind the LAN screen (discovery is `netcode::lan`).
 pub mod lanlobby;
+/// Input-only lockstep: the rule that lets two machines play one match.
+pub mod lockstep;
 /// Oriented capsule hit tests for the cats.
 pub mod hitbox;
 /// The river crossings: fallen logs that can be worked loose and roll.
