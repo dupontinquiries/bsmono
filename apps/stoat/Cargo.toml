@@ -11,8 +11,8 @@
 
 [workspace]
 resolver = "2"
-members = ["crates/mi", "crates/core", "crates/cli", "crates/gui-gtk"]
-default-members = ["crates/mi", "crates/core", "crates/cli", "crates/gui-gtk"]
+members = ["crates/mi", "crates/core", "crates/cli", "crates/gui-egui", "crates/gui-gtk"]
+default-members = ["crates/mi", "crates/core", "crates/cli", "crates/gui-egui", "crates/gui-gtk"]
 
 [workspace.package]
 version = "0.1.0"

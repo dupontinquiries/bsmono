@@ -1,0 +1,25 @@
+[package]
+name = "stoat-egui"
+description = "The stoat egui shell on uikit-egui: ranked binary launch with shell-history recovery, a swipeable stack with rustc-style stop diagnostics, pre-crash vitals and frame pacing, debug-cache pruning, and the raw MI wire - the same session the CLI drives, rendered."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "stoat-egui"
+path = "src/bin/stoat_egui.rs"
+required-features = ["app"]
+
+[dependencies]
+egui = "0.34"
+uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
+uikit-gesture = { path = "../../../../shared/uikit/crates/uikit-gesture" }
+snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
+stoat-core = { path = "../core" }
+stoat-mi = { path = "../mi" }
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+
+[features]
+# `app` default-on per the house convention for every -egui frontend.
+default = ["app"]
+app = ["dep:eframe"]
