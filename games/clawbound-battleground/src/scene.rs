@@ -1030,6 +1030,27 @@ mod plan_tests {
         assert!(b.steps().len() > 224, "the screen's jungle trees brought their roots: {}", b.steps().len());
     }
 
+    /// The performance claim, measured on the REAL world rather than argued:
+    /// how many instances the static world uploads. Floors on both sides --
+    /// a big drop, and not so big that visible surface went with it.
+    #[test]
+    fn the_world_uploads_its_hull_not_its_insides() {
+        let (pieces, _, _) = build_world();
+        let hull: usize = pieces.iter().map(|p| p.0.inst.len()).sum();
+        println!("static world: {hull} instances in {} pieces", pieces.len());
+        assert!(hull > 120_000, "{hull}: did the cull eat the surface?");
+        assert!(hull < 520_000, "{hull}: the world is still being uploaded solid (it was ~877k)");
+        // And per shape, against the solid: a boulder is mostly inside.
+        let mut g = crate::voxel::Grid::new(24, 24, 24);
+        g.ellipsoid(12.0, 12.0, 12.0, 10.0, 10.0, 10.0, [0.5, 0.5, 0.5, 1.0]);
+        let (h, s) = (g.mesh(0.5, true).inst.len(), g.mesh_solid(0.5, true).inst.len());
+        assert!((h as f32) < s as f32 * 0.45, "hull {h} of solid {s}");
+        // Leaves with alpha keep what is behind them.
+        let mut a = crate::voxel::Grid::new(5, 5, 5);
+        a.filled_box(0, 0, 0, 4, 4, 4, [0.2, 0.6, 0.2, 0.5]);
+        assert_eq!(a.mesh(0.5, true).inst.len(), 125, "nothing behind a translucent voxel is culled");
+    }
+
     #[test]
     fn plan_of_the_centre() {
         let (_, _, b) = build_world();

@@ -196,6 +196,19 @@ impl Grid {
     /// Mesh to world-scale instances.
     /// `feet_origin`: x/z centered, y starts at 0 (characters) — otherwise fully centered.
     pub fn mesh(&self, voxel: f32, feet_origin: bool) -> VoxelMesh {
+        // Hull only. This emitted EVERY filled voxel, so a boulder or a
+        // trunk was drawn solid all the way through: instances that cost a
+        // vertex-shader run and a slot in the buffer and can never be seen.
+        // A voxel is dropped only when all six neighbours are OPAQUE, so
+        // anything behind glass or leaves with alpha survives. Wind, brush
+        // and blast offsets are smooth in world position, so neighbours move
+        // together and no gap opens. AO still comes from the full grid.
+        self.mesh_impl(voxel, feet_origin, Some(&|_, _, _| true))
+    }
+
+    /// Every filled voxel, interior included. For measuring what `mesh`
+    /// saves, and for anything that needs the solid.
+    pub fn mesh_solid(&self, voxel: f32, feet_origin: bool) -> VoxelMesh {
         self.mesh_impl(voxel, feet_origin, None)
     }
 

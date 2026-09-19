@@ -473,7 +473,8 @@ mod tests {
     #[test]
     fn the_mesh_that_is_drawn_has_its_top_where_footing_says() {
         let mesh = crate::props::crossing_log();
-        assert!(mesh.inst.len() > 2000, "{} voxels", mesh.inst.len());
+        // A hull: `Grid::mesh` no longer emits the inside. (Was > 2000, solid.)
+        assert!(mesh.inst.len() > 1000, "{} voxels", mesh.inst.len());
         let ny = (SECTION_B as usize) * 2 + 3;
         let axis = ((ny / 2) as f32 + 0.5) * LOG_VOXEL;
         let mut checked = 0;
