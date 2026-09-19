@@ -172,6 +172,12 @@ impl Session {
                 return vec![Change::FrameMark(stop.at)];
             }
         }
+        // A marker resume normally consumes this flag with the *running that
+        // follows our continue. If that never came (the continue failed, the
+        // target died between the two), leaving it set would swallow the next
+        // resume the user actually asked for: the state would read "stopped"
+        // while the program ran, and vitals would stay frozen.
+        self.resumed_from_marker = false;
         if stop.is_exit() {
             self.state = RunState::Exited;
             self.pid = None;

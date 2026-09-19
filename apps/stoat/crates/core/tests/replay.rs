@@ -90,3 +90,19 @@ fn did_you_mean() {
     assert_eq!(d.code, "bad-address");
     assert_eq!(d.notes.len(), 1);
 }
+
+/// If the *running that should follow a marker resume never arrives, the next
+/// resume the user asks for must still be surfaced.
+#[test]
+fn an_unanswered_marker_resume_does_not_swallow_the_next_visible_one() {
+    let mut s = Session::new(None);
+    let mut b = Recorder::default();
+    s.insert_frame_marker("present_frame", &mut b);
+    s.handle(Event::Reply { id: 1001, result: Ok(Reply::Breakpoint { id: 7, pending: false, locations: 1 }) }, &mut b);
+    let at = Instant::now();
+    let stop = |reason| Event::Stopped(stoat_core::model::Stop { reason, thread: Some(1), frame: None, at });
+    s.handle(stop(stoat_core::model::StopReason::Breakpoint { id: 7 }), &mut b);
+    // no Event::Running here: the continue went unanswered
+    assert_eq!(s.handle(stop(stoat_core::model::StopReason::StepDone), &mut b), vec![Change::State(RunState::Stopped)]);
+    assert_eq!(s.handle(Event::Running, &mut b), vec![Change::State(RunState::Running)]);
+}
