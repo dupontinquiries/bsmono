@@ -178,7 +178,68 @@ pub fn quantize_act(act: &[f32]) -> Vec<(f32, [i8; 32])> {
 /// separately. `sum(w*a) = d*sc*sum(nib*a) - dmin*m*sum(a)` — two integer sums per sub-block, one
 /// float combine. The second sum is over the activation alone and is the same for every row, so it is
 /// computed once in `quantize_act` and reused.
+/// All eight (scale6, min6) pairs of a Q4_K super-block, unpacked in one straight line:
+/// `gguf::get_scale_min_k4(j, ..)` for j = 0..8 with its `j < 4` branch resolved at compile time.
+#[inline(always)]
+pub fn scales_k4(q: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
+    let (mut sc, mut mn) = ([0u8; 8], [0u8; 8]);
+    for j in 0..4 { sc[j] = q[j] & 63; mn[j] = q[j + 4] & 63; }
+    for j in 4..8 { sc[j] = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); mn[j] = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+    (sc, mn)
+}
+
+/// Dot a Q4_K weight row with a pre-quantized activation.
+///
+/// THE VECTOR LOOP WAS NEVER THE PROBLEM. This ran at half Q8_0's rate and gained almost nothing
+/// from wider SIMD (1.23 ms at SSE2, 1.05 at AVX2 per 1024x4096 matvec), which is the signature of
+/// scalar work starving the vector work. The disassembly said what: around the packed multiply-adds
+/// sat 32 scalar byte loads, 8 scalar multiplies, 28 branches and 3 bounds-check panic paths PER
+/// SUPER-BLOCK — `get_scale_min_k4` called eight times per 256 weights, each with its own `j < 4`
+/// branch, plus checked indexing into `act_q` and `act_sum` per sub-block. (Q8_0: 2 byte loads, 11
+/// branches.) Now the eight (scale, min) pairs are unpacked once in a straight line, and the three
+/// inputs are walked in lockstep as fixed-size chunks — one length proof per super-block.
+///
+/// What I tried first and did NOT keep: computing the products in i16 and widening only the sum,
+/// on the theory that the i32 multiply was the cost. Bit-identical, and exactly the same speed —
+/// LLVM was already narrowing it to the packed 16-bit form. Measured before editing; no edit.
+///
+/// The float expression and its ORDER are unchanged (low half, then high half, per pair), so this
+/// is BIT-IDENTICAL to `dot_q4_k_reference`, which is the old function verbatim and the oracle.
+/// 1.30 -> 0.64 ms at baseline x86-64, 1.48 -> 0.64 at AVX2. ARM not compiled or measured here; the
+/// gain is from removing scalar bookkeeping, which a narrow-SIMD core pays for at least as dearly.
+///
+/// One behavioural difference, on MALFORMED input only: a too-short `act_sum` used to panic on an
+/// index; the lockstep walk now stops at the shortest input instead.
 pub fn dot_q4_k(raw: &[u8], act_q: &[(f32, [i8; 32])], act_sum: &[f32]) -> f32 {
+    let nblk = act_q.len() / 8;              // 8 sub-blocks of 32 per super-block
+    let mut total = 0f32;
+    for ((blk, aq), asum) in raw.chunks_exact(144).zip(act_q.chunks_exact(8)).zip(act_sum.chunks_exact(8)).take(nblk) {
+        let blk: &[u8; 144] = blk.try_into().unwrap();
+        let aq: &[(f32, [i8; 32]); 8] = aq.try_into().unwrap();
+        let asum: &[f32; 8] = asum.try_into().unwrap();
+        let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dmin = half_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+        let (sc, mn) = scales_k4(blk[4..16].try_into().unwrap());
+        for pair in 0..4 {
+            // Each 32-byte run holds TWO sub-blocks: low nibbles, then high nibbles.
+            let nibs: &[u8; 32] = blk[16 + pair * 32..16 + pair * 32 + 32].try_into().unwrap();
+            let (lo, hi) = (2 * pair, 2 * pair + 1);
+            let mut acc_lo = 0i32;
+            for (&n, &a) in nibs.iter().zip(aq[lo].1.iter()) { acc_lo += ((n & 0xF) as i32) * (a as i32); }
+            let mut acc_hi = 0i32;
+            for (&n, &a) in nibs.iter().zip(aq[hi].1.iter()) { acc_hi += ((n >> 4) as i32) * (a as i32); }
+            // d*sc*sum(nib*a) - dmin*m*sum(a): the min term uses the activation sum, which does not
+            // depend on the weights and is therefore hoisted out of every row. SAME order as the
+            // reference: low half, then high half.
+            total += d * sc[lo] as f32 * aq[lo].0 * acc_lo as f32 - dmin * mn[lo] as f32 * asum[lo];
+            total += d * sc[hi] as f32 * aq[hi].0 * acc_hi as f32 - dmin * mn[hi] as f32 * asum[hi];
+        }
+    }
+    total
+}
+
+/// `dot_q4_k` as it was. Kept verbatim: it is the oracle the fast one is held bit-identical to.
+pub fn dot_q4_k_reference(raw: &[u8], act_q: &[(f32, [i8; 32])], act_sum: &[f32]) -> f32 {
     let nblk = act_q.len() / 8;              // 8 sub-blocks of 32 per super-block
     let mut total = 0f32;
     for b in 0..nblk {
@@ -640,6 +701,49 @@ mod tests {
             assert_eq!(got[r], dot_q6_k(&raw[r * rb..(r + 1) * rb], &prep.q), "row {r}");
         }
         assert!(got.iter().any(|v| *v != 0.0) && got.windows(2).any(|w| w[0] != w[1]), "rows are distinct and non-zero");
+    }
+
+    /// Valid-looking Q4_K rows: random quants and 6-bit scales, `d`/`dmin` set to normal f16s.
+    fn q4k_bytes(blocks: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed | 1; let mut v = Vec::with_capacity(blocks * 144);
+        for b in 0..blocks {
+            v.extend_from_slice(&f32_to_half(0.003 + 0.0007 * b as f32).to_le_bytes());
+            v.extend_from_slice(&f32_to_half(0.011 + 0.0003 * b as f32).to_le_bytes());
+            for _ in 0..140 { x = x.wrapping_mul(1664525).wrapping_add(1013904223); v.push((x >> 24) as u8); }
+        }
+        v
+    }
+
+    /// The fast Q4_K dot is the old one, bit for bit — every row, several shapes, negative and
+    /// zero activations — and its straight-line scale unpack is `get_scale_min_k4` for every j.
+    #[test]
+    fn the_q4k_dot_is_bit_identical_to_the_function_it_replaced() {
+        let mut x = 12345u32;
+        for (blocks, seed) in [(1usize, 3u32), (4, 77), (16, 4242), (16, 9)] {
+            let raw = q4k_bytes(blocks, seed);
+            let k = blocks * 256;
+            for shape in 0..3 {
+                let act: Vec<f32> = (0..k).map(|i| match shape { 0 => (((i * 31 + 7) % 61) as f32 - 30.0) * 0.173, 1 => if i % 5 == 0 { 0.0 } else { -((i % 13) as f32) * 0.4 }, _ => { x = x.wrapping_mul(1664525).wrapping_add(1013904223); ((x >> 9) as f32 / (1u32 << 23) as f32 - 0.5) * 9.0 } }).collect();
+                let prep = ActPrep::new(&act);
+                let (a, b) = (dot_q4_k_reference(&raw, &prep.q, &prep.sums), dot_q4_k(&raw, &prep.q, &prep.sums));
+                assert!(a.to_bits() == b.to_bits() && a != 0.0 && a.is_finite(), "{blocks} blocks seed {seed} shape {shape}: {a} vs {b}");
+            }
+            for sb in raw.chunks_exact(144) {
+                let (sc, mn) = scales_k4(sb[4..16].try_into().unwrap());
+                for j in 0..8 { assert_eq!(crate::gguf::get_scale_min_k4(j, &sb[4..16]), (sc[j], mn[j]), "j={j}"); }
+            }
+        }
+        // every 6-bit value reaches every slot: the two unpack branches (j<4, j>=4) each see all 64
+        for v in 0..64u8 { for j in 0..8usize {
+            let mut q = [0u8; 12];
+            if j < 4 { q[j] = v; q[j + 4] = 63 - v; } else { q[j + 4] = (v & 0xF) | (((63 - v) & 0xF) << 4); q[j - 4] = (v >> 4) << 6; q[j] = ((63 - v) >> 4) << 6; }
+            let (sc, mn) = scales_k4(&q);
+            assert_eq!((sc[j], mn[j]), (v, 63 - v), "slot {j} value {v}");
+            assert_eq!(crate::gguf::get_scale_min_k4(j, &q), (v, 63 - v));
+        } }
+        // truncated raw: both stop at the last whole super-block
+        let raw = q4k_bytes(4, 5); let act = vec![0.5f32; 1024]; let prep = ActPrep::new(&act);
+        assert_eq!(dot_q4_k(&raw[..400], &prep.q, &prep.sums).to_bits(), dot_q4_k_reference(&raw[..400], &prep.q, &prep.sums).to_bits());
     }
 
     #[test]
