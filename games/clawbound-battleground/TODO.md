@@ -57,6 +57,25 @@ the single highest-value thing anyone can do with this repo next.
 
 ## Known gaps
 
+- **God rays through the canopy: attempted, not delivered.** `shaft_light`
+  (voxel.wgsl, terrain.wgsl) marches the view ray through the shadow map with
+  no new bindings, and is OFF (`Renderer::shaft_steps = 0`) because both
+  tunings washed the far field milky instead of drawing shafts. Under this
+  canopy nearly every ray is half-occluded, so the term fires everywhere and
+  8 jittered samples average to glow. What it probably wants: noise that is
+  stable per pixel rather than per world position, a much lower gain, more
+  steps or a half-res pass with a depth-aware blur, and tuning by eye on real
+  hardware. `CLAWBOUND_NO_FX=1` plus a split-screen is how to judge it; a
+  luma number alone read as "working" when it was haze.
+- **Nothing in groundfx has been seen in motion**: the front crossing the
+  trees, the ring bending the air, a crack closing in rain. Heat shimmer has
+  not been seen at all (no fire was staged). Blast and crack counts are
+  capped at 4 and 8; ability hits under radius ~3 only shake the trees.
+- **The shadow pass takes neither the brush nor the blast**, so bent leaves
+  and whipping crowns cast their resting shadows.
+- **The fitted shadow box drops far shadows** beyond ~45-75 u in close play
+  (faded, not a line). Cascades would keep both; this is one map.
+
 - **Quiet is not wired to anyone's perception.** `Game::quiet` (stalking,
   an ability's hush, wounded) drives the body, the rustle and the leaf-bend,
   and nothing else. `wildkit`'s perception and `Blockers::concealment_at`
@@ -156,12 +175,13 @@ the single highest-value thing anyone can do with this repo next.
 ## Verification commands
 
 ```bash
-cargo test --no-default-features   # 221 lib + 13 + 2, no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
+cargo test --no-default-features   # 226 lib + 13 + 2, no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
 cargo test                          # same, plus links cpal (needs libasound2-dev)
 cargo check --features gamepad      # needs libudev-dev
 cargo run --example simdbg <seed>   # headless 12-minute AI match trace
 cargo run -- --screenshot           # headless PNG render (needs a GPU or lavapipe)
 cargo run -- --rig-sheet            # close-ups through the real draw path; CLAWBOUND_SHEET=fern,map_centre picks shots,
-                                    # CLAWBOUND_NO_BRUSH=1 renders the same frame without the leaf-bend, for diffing
+                                    # CLAWBOUND_NO_BRUSH=1 / CLAWBOUND_NO_FX=1 render the same frame without the leaf-bend /
+                                    # without blast, cracks and shafts, for diffing
 cargo test plan_of_the_centre -- --nocapture   # ASCII plan of the real world's blockers
 ```
