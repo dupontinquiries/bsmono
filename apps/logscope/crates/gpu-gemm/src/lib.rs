@@ -26,6 +26,7 @@ use std::collections::HashMap;
 pub mod reverse; // search-based inversion: which token preceded a suffix (c11 experiment)
 pub mod flash_qblock;
 pub mod jsonmask; // byte-level JSON grammar constraint for structured decoding
+pub mod imrope;   // ggml's multi-section rope, mirrored; decides per FILE whether text collapses to plain NEOX
 pub mod pool_class;
 pub mod gguf;
 pub mod fmapath;   // hardware-FMA dispatch: mul_add is a libm CALL on baseline x86-64 (measured 8x)
@@ -11156,6 +11157,26 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
             }
             rot
         };
+        // MULTI-SECTION ROPE (rope.dimension_sections — Qwen3.5 / Ornith / Qwen-VL). This engine ropes
+        // text with ONE position per token. That equals ggml's multi-section rope exactly when no
+        // rotary pair reads the 4th position channel (0 for text: such a pair is left UNROTATED by
+        // the reference) — a property of THIS FILE's sections, so it is checked here rather than
+        // assumed per architecture. See imrope.rs for the ggml source it transcribes. Absent key on
+        // a sectioned arch: llama.cpp requires it for qwen35moe, so say so and carry on as plain.
+        if let Some(layout) = crate::imrope::Layout::for_arch(&arch) {
+            match g.get_u32_arr(&format!("{pfx}.rope.dimension_sections")) {
+                Some(v) if !v.is_empty() && v.len() <= 4 => {
+                    let mut s = [0u32; 4];
+                    s[..v.len()].copy_from_slice(&v);
+                    match crate::imrope::text_is_plain_neox(s, rot, head_dim, layout) {
+                        Ok(()) => eprintln!("loader: multi-section rope {s:?} ({layout:?}) — every one of the {} rotary pairs reads t/h/w, so TEXT positions are plain NEOX rope, as ggml computes it. Image/video positions are not implemented", rot / 2),
+                        Err(why) => return Err(format!("'{arch}': {why}. Sections {s:?} over {rot} rotary dims ({layout:?}). This engine ropes text with a single position, which would be WRONG for this file — refusing rather than producing fluent garbage")),
+                    }
+                }
+                Some(v) => return Err(format!("'{arch}': rope.dimension_sections has {} entries; ggml reads 1 to 4", v.len())),
+                None => eprintln!("loader: '{arch}' ropes through rope.dimension_sections but this file carries none — treating as plain NEOX rope. llama.cpp REQUIRES the key for this family, so this file would not load there"),
+            }
+        }
         let attn_dim = n_heads * head_dim;      // Q / attention width (e.g. 4096 for Qwen3-4B, while d=2560)
         let kv = n_kv_heads * head_dim;         // K/V projection + cache row width (GQA when < attn_dim)
         // HOSTILE-DIMENSION GUARD (cf. Colibri's "absurd n from hostile model files" + matmul shape-overflow

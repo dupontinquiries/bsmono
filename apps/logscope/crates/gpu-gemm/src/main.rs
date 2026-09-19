@@ -421,6 +421,13 @@ fn write_gguf_deepseek2_mla() -> Vec<u8> {
 /// and this fixture exercises the ffn_apply funnel through its richest mix of paths
 /// (DeltaNet block, gated-attention MoE block). Some(1.0) must be an exact no-op.
 fn write_gguf_qwen35moe_hybrid(shexp: u8, out_scale: Option<f32>) -> Vec<u8> {
+    write_gguf_qwen35moe_hybrid_sections(shexp, out_scale, None)
+}
+/// `sections`: when Some, the file carries `qwen35moe.rope.dimension_sections` as an INT32 array —
+/// the width llama.cpp's converter writes — so the loader's per-file multi-section-rope check
+/// (imrope.rs) runs against real metadata bytes. The attention block here rotates 16 dims = 8
+/// pairs: [3, 3, 2, 0] keeps every pair on t/h/w; [4, 2, 2, 0] sends pair 7 to the e channel.
+fn write_gguf_qwen35moe_hybrid_sections(shexp: u8, out_scale: Option<f32>, sections: Option<[i32; 4]>) -> Vec<u8> {
     let (d, vocab, h) = (64usize, 32usize, 128usize);
     let (heads, kvh, hd) = (4usize, 2usize, 16usize);          // blk.1 attention
     let (sst, hk, hv, dconv) = (8usize, 2usize, 4usize, 4usize); // blk.0 deltanet
@@ -491,8 +498,12 @@ fn write_gguf_qwen35moe_hybrid(shexp: u8, out_scale: Option<f32>) -> Vec<u8> {
     let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
     let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
     let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
-    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 16);
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 16 + sections.is_some() as u64);
     sput(&mut b, "general.architecture"); u32b(&mut b, 8); sput(&mut b, "qwen35moe");
+    if let Some(sec) = sections {
+        sput(&mut b, "qwen35moe.rope.dimension_sections"); u32b(&mut b, 9); u32b(&mut b, 5); u64b(&mut b, 4);
+        for v in sec { b.extend_from_slice(&v.to_le_bytes()); }
+    }
     sput(&mut b, "qwen35moe.block_count"); u32b(&mut b, 4); u32b(&mut b, 2);
     sput(&mut b, "qwen35moe.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
     sput(&mut b, "qwen35moe.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, kvh as u32);
@@ -5938,6 +5949,28 @@ still pass, which is why this one exists."
                 }));
                 ck("a position SEEK on the recurrent state is refused", seek.is_err());
             }
+        }
+        // MULTI-SECTION ROPE, decided per FILE (imrope.rs). Three fixtures differing only in the
+        // sections key: absent, sections whose every pair reads t/h/w, sections that send a pair to
+        // the e channel. The first two must decode BIT-EQUAL (both are plain NEOX rope, which is the
+        // claim); the third must be REFUSED, naming the pair — ggml leaves it unrotated and we would not.
+        {
+            let l3 = |bytes: &[u8]| -> Result<Vec<f32>, String> {
+                let m = gpu.load_gguf_opt(bytes, false)?;
+                let c = gpu.new_cache_for(&m, 8);
+                let mut last = Vec::new();
+                for (p, &t) in [3u32, 9, 14].iter().enumerate() { last = gpu.decode_step(&m, &c, t, p); }
+                gpu.end_frame();
+                Ok(last)
+            };
+            let none = l3(&write_gguf_qwen35moe_hybrid_sections(1, None, None));
+            let plain = l3(&write_gguf_qwen35moe_hybrid_sections(1, None, Some([3, 3, 2, 0])));
+            let on_e = l3(&write_gguf_qwen35moe_hybrid_sections(1, None, Some([4, 2, 2, 0])));
+            ck("sections [3,3,2,0] (int32 array): loads, and decodes BIT-EQUAL to the file without the key",
+               matches!((&none, &plain), (Ok(a), Ok(b)) if a == b && a.iter().all(|v| v.is_finite())));
+            let msg = on_e.as_ref().err().cloned().unwrap_or_default();
+            ck(&format!("sections [4,2,2,0] are REFUSED, naming pair 7 ({})", if msg.is_empty() { "it LOADED".to_string() } else { msg.chars().take(90).collect::<String>() + "…" }),
+               on_e.is_err() && msg.contains("[7]") && msg.contains("UNROTATED"));
         }
         println!("gate-deltanet-load: {}", if ok { "hybrid DeltaNet loads + decodes \u{2713}" } else { "FAIL \u{2717}" });
         return;
