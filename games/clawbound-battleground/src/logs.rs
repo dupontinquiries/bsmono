@@ -44,14 +44,35 @@ pub const SNAG_AFTER: f32 = 24.0;
 pub const SHED_SPEED: f32 = 2.2;
 /// Torque per unit of weight per unit off the spine.
 const LEAN: f32 = 7.5;
-/// The mesh is `props::fallen_log`: 13.2 u long, 2 u in radius.
+/// The mesh is `props::crossing_log`, built from THESE numbers, so what is
+/// drawn and what is stood on cannot drift apart. A cylinder with an
+/// elliptical section, 0.3 u voxels: it was `props::fallen_log` at 0.6 u --
+/// half a cat per voxel, an ellipsoid whose top fell away toward both ends,
+/// and one slab of moss over the whole of it.
+pub const LOG_VOXEL: f32 = 0.3;
 pub const LOG_HALF_LEN: f32 = 6.6;
+/// Section half-width and half-height, in voxels.
+pub const SECTION_A: f32 = 6.8;
+pub const SECTION_B: f32 = 4.6;
+/// Nominal rolling radius for the physics.
 pub const LOG_RADIUS: f32 = 1.9;
 /// Half the width of the channel cut through the causeway under a log.
 /// Less than LOG_HALF_LEN by enough that both ends bear on the road.
 pub const SLUICE_HALF: f32 = 3.6;
 /// How far the top of a seated log stands above the lane.
 pub const LOG_TOP: f32 = 0.55;
+
+/// Height of the top FACE of the voxel column at lateral offset `off`,
+/// above the section's axis. Mirrors `props::crossing_log`: voxel `j` of
+/// column `k` is filled when `(j/B)^2 + (k/A)^2 <= 1` about the axis.
+pub fn column_top(off: f32) -> f32 {
+    let k = (off / LOG_VOXEL).round();
+    let room = 1.0 - (k / SECTION_A) * (k / SECTION_A);
+    if room <= 0.0 {
+        return 0.0;
+    }
+    ((SECTION_B * room.sqrt()).floor() + 0.5) * LOG_VOXEL
+}
 
 /// Where a side lane meets its river: the point, and the lane's direction there.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -142,6 +163,28 @@ impl RollingLog {
         let rel = Vec3::new(x, 0.0, z) - self.centre();
         let (along, off) = (rel.dot(self.axis), rel.dot(self.down));
         (along.abs() <= LOG_HALF_LEN && off.abs() <= LOG_RADIUS * 0.85).then_some(off)
+    }
+
+    /// World Y of the log's upper surface under `(x, z)`, or `None` off it.
+    ///
+    /// Seated, this is the top face of the actual voxel column under the
+    /// paw -- the same inequality the mesher fills by -- so a sole rests ON a
+    /// voxel, not in it or over it. Turned, the voxels turn too, and it is
+    /// the exact top of the rotated ellipse (the upper root of the line
+    /// x = off against it).
+    pub fn surface_y(&self, x: f32, z: f32) -> Option<f32> {
+        let off = self.on_top(x, z)?;
+        let (a, b) = (SECTION_A * LOG_VOXEL, SECTION_B * LOG_VOXEL);
+        let axis_y = LOG_TOP - column_top(0.0);
+        if self.angle.abs() < 0.02 {
+            return Some(axis_y + column_top(off));
+        }
+        let (s, c) = self.angle.sin_cos();
+        let qa = s * s / (a * a) + c * c / (b * b);
+        let qb = 2.0 * off * s * c * (1.0 / (a * a) - 1.0 / (b * b));
+        let qc = off * off * (c * c / (a * a) + s * s / (b * b)) - 1.0;
+        let disc = qb * qb - 4.0 * qa * qc;
+        (disc >= 0.0).then(|| axis_y + (-qb + disc.sqrt()) / (2.0 * qa))
     }
 
     /// Too fast to stand on.
@@ -389,6 +432,63 @@ mod tests {
         let mut far = log();
         far.shove(far.centre() - far.down * 40.0, 6.0, 1.0);
         assert_eq!(far.v, 0.0);
+    }
+
+    /// Footing is read off the same shape the mesh is built from. Across a
+    /// seated log every sampled paw position lands exactly on a voxel face;
+    /// the spine is the high point; and a turned log still has a top.
+    #[test]
+    fn paws_land_on_voxel_faces_and_the_spine_is_the_high_point() {
+        let l = log();
+        let spine = l.surface_y(l.seat.x, l.seat.z).unwrap();
+        assert!((spine - LOG_TOP).abs() < 1e-4, "the spine stands LOG_TOP above the lane: {spine}");
+        let mut checked = 0;
+        let mut last = f32::MAX;
+        for i in 0..=16 {
+            let off = i as f32 * 0.1;
+            let p = l.seat + l.down * off;
+            let y = l.surface_y(p.x, p.z).expect("on the log");
+            let faces = (y - spine) / LOG_VOXEL;
+            assert!((faces - faces.round()).abs() < 1e-3, "off {off}: surface {y} is not on a voxel face ({faces} voxels from the spine)");
+            assert!(y <= last + 1e-5 && y <= spine + 1e-5, "it only falls away from the spine");
+            last = y;
+            checked += 1;
+        }
+        assert_eq!(checked, 17);
+        assert!(spine - last > 0.25 && spine - last < 1.0, "the shoulder is lower, not a cliff: {}", spine - last);
+        // Same height all the way along: a cylinder, not the old ellipsoid.
+        let far = l.seat + l.axis * (LOG_HALF_LEN - 0.3);
+        assert_eq!(l.surface_y(far.x, far.z), Some(spine));
+        // Turned a quarter, the long side of the section is up.
+        let mut t = l;
+        t.angle = std::f32::consts::FRAC_PI_2;
+        let up = t.surface_y(t.seat.x, t.seat.z).unwrap();
+        assert!(up > spine + 0.4, "on its side it stands taller: {up} vs {spine}");
+    }
+
+    /// The other half of "drawn and stood-on cannot drift apart": build the
+    /// REAL mesh and hold its top faces against `column_top`. Nothing in the
+    /// suite built this mesh before (Scene needs a GPU), so an overflow in
+    /// its bark hash and a half-voxel sideways offset both got through.
+    #[test]
+    fn the_mesh_that_is_drawn_has_its_top_where_footing_says() {
+        let mesh = crate::props::crossing_log();
+        assert!(mesh.inst.len() > 2000, "{} voxels", mesh.inst.len());
+        let ny = (SECTION_B as usize) * 2 + 3;
+        let axis = ((ny / 2) as f32 + 0.5) * LOG_VOXEL;
+        let mut checked = 0;
+        for k in -5i32..=5 {
+            let off = k as f32 * LOG_VOXEL;
+            let top = mesh.inst.iter().filter(|v| (v.off_ao[2] - off).abs() < 0.01 && v.off_ao[0].abs() < 1.0).map(|v| v.off_ao[1] + LOG_VOXEL * 0.5).fold(f32::MIN, f32::max);
+            assert!(top > f32::MIN, "no voxel column at lateral offset {off}: the mesh is not centred on a column");
+            assert!((top - axis - column_top(off)).abs() < 1e-3, "column {k}: mesh top {} above the axis, footing says {}", top - axis, column_top(off));
+            checked += 1;
+        }
+        assert_eq!(checked, 11);
+        // Not a green slab: moss is a minority of what faces up.
+        let up: Vec<_> = mesh.inst.iter().filter(|v| v.off_ao[1] > axis + LOG_VOXEL).collect();
+        let mossy = up.iter().filter(|v| v.color[1] > v.color[0] * 1.5).count();
+        assert!((mossy as f32) < up.len() as f32 * 0.1, "{mossy} of {} upward voxels are moss", up.len());
     }
 
     #[test]

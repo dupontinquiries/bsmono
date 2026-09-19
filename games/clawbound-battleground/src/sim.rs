@@ -521,7 +521,13 @@ impl Game {
             if tw.hp <= 0.0 {
                 continue;
             }
-            let inside = me.respawn_t <= 0.0 && (tw.pos.x - me.pos.x).hypot(tw.pos.z - me.pos.z) < TOWER_RANGE;
+            let dist = (tw.pos.x - me.pos.x).hypot(tw.pos.z - me.pos.z);
+            // A line you are nowhere near is not information, it is a scratch
+            // across the scenery (seen in a render 40 u from an allied tower).
+            if dist > TOWER_RANGE + TOWER_RING_SHOW {
+                continue;
+            }
+            let inside = me.respawn_t <= 0.0 && dist < TOWER_RANGE;
             let state = if tw.team == me.team {
                 1.0
             } else if tw.aim == Some(TargetRef::God(viewer)) {

@@ -232,7 +232,7 @@ fn tower_ring(p: vec2<f32>) -> vec4<f32> {
         let ang = atan2(p.y - t.y, p.x - t.x);
         let dash = step(0.45, fract(ang * t.z / 2.4));
         var c = vec3(0.55, 0.80, 1.0);
-        var k = line * 0.45;
+        var k = line * 0.24; // yours: present, never loud
         if (t.w > 1.5) {
             c = vec3(1.0, 0.72, 0.20);
             k = line * dash * 0.75;
@@ -255,7 +255,15 @@ fn tower_ring(p: vec2<f32>) -> vec4<f32> {
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let cam_d = distance(in.world, frame.cam_pos.xyz);
-    let det = detail(in.world.xz, in.mat, cam_d);
+    // `mat` is a CATEGORY (1 lane, 2 river pebbles, 6 moss...) and the GPU
+    // interpolates it like any other number. Between a lane vertex and a
+    // moss vertex it sweeps through 2, which painted a strip of river
+    // pebbles along every road edge. So: snap to the nearest real id, and
+    // fade that id's pattern out toward plain ground wherever the value is
+    // in between -- which is exactly where two materials meet.
+    let mat_id = round(in.mat);
+    let purity = clamp(1.0 - 2.0 * abs(in.mat - mat_id), 0.0, 1.0);
+    let det = mix(detail(in.world.xz, 0.0, cam_d), detail(in.world.xz, mat_id, cam_d), purity);
     let N = normalize(in.normal + vec3(det.y, 0.0, det.z));
     let sun = normalize(frame.sun_dir.xyz);
     let ndl = max(dot(N, sun), 0.0);
@@ -297,7 +305,20 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let wet = frame.weather.z;
     let pud = smoothstep(0.55, 0.8, hash21(floor(in.world.xz * 0.35)) * 0.5 + 0.5 * hash21(floor(in.world.xz * 0.9 + 3.1)));
     let wetness = wet * (0.55 + 0.45 * pud);
-    var albedo = in.color * det.x * (1.0 - 0.32 * wetness);
+    // Ground noise, three scales: broad patches of richer and poorer ground,
+    // a mid scale that breaks up the vertex grid, and grain up close. Faded
+    // with distance so far terrain does not shimmer.
+    let gp = in.world.xz;
+    let broad = noise2(gp * 0.045) * 0.6 + noise2(gp * 0.11 + vec2(31.0, 7.0)) * 0.4;
+    let mid = noise2(gp * 0.42 + vec2(5.0, 19.0));
+    let grain = noise2(gp * 2.3) * (1.0 - smoothstep(18.0, 55.0, cam_d));
+    let ground = 0.84 + 0.20 * broad + 0.10 * (mid - 0.5) + 0.09 * (grain - 0.5);
+    // Where materials meet, let the mid noise decide per pixel which side
+    // wins, so the join is scuffed and patchy rather than a gradient.
+    let scuff = (1.0 - purity) * (mid - 0.5) * 0.45;
+    var albedo = in.color * det.x * (ground + scuff) * (1.0 - 0.32 * wetness);
+    // a little hue drift with the broad noise: sun-bleached vs damp
+    albedo = albedo * mix(vec3(1.05, 1.0, 0.90), vec3(0.93, 1.0, 1.04), broad);
     let broken = cracked(in.world.xz);
     albedo = albedo * (1.0 - 0.45 * broken.y) * (1.0 - 0.9 * broken.x);
     // snow cover settles on up-facing ground, patchy by the same noise as the puddles

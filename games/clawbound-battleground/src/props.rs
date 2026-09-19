@@ -361,6 +361,54 @@ pub fn bush(variant: i32) -> VoxelMesh {
 }
 
 /// Mossy fallen log.
+/// The river-crossing log. Shape constants come from `logs`, which also
+/// computes footing from them. Bark with ridges, a PALE WORN STRIP down the
+/// spine where paws go, end grain, a few knots -- and moss only in patches
+/// low on the flanks, where a log that gets walked on keeps it.
+pub fn crossing_log() -> VoxelMesh {
+    use crate::logs::{LOG_HALF_LEN, LOG_VOXEL, SECTION_A, SECTION_B};
+    let half = (LOG_HALF_LEN / LOG_VOXEL) as i32; // 22
+    // ODD in y and z, so one column is dead centre. With an even count the
+    // mesh centres BETWEEN two columns and is drawn 0.15 u to one side of the
+    // footing computed for it.
+    let (nx, ny, nz) = (half * 2, (SECTION_B as usize) * 2 + 3, (SECTION_A as usize) * 2 + 3);
+    let mut g = Grid::new(nx as usize, ny, nz);
+    let (cy, cz) = ((ny / 2) as i32, (nz / 2) as i32);
+    let h = |a: i32, b: i32| ((a.wrapping_mul(73856093) ^ b.wrapping_mul(19349663)) as u32 % 1000) as f32 / 1000.0;
+    for x in 0..nx {
+        for j in -(SECTION_B as i32 + 1)..=(SECTION_B as i32 + 1) {
+            for k in -(SECTION_A as i32 + 1)..=(SECTION_A as i32 + 1) {
+                let (fj, fk) = (j as f32 / SECTION_B, k as f32 / SECTION_A);
+                let r2 = fj * fj + fk * fk;
+                if r2 > 1.0 {
+                    continue;
+                }
+                let end = x < 1 || x >= nx - 1;
+                let ridge = 0.86 + 0.22 * h(x / 3, k * 7 + j);
+                let mut c = [0.33 * ridge, 0.245 * ridge, 0.15 * ridge];
+                if end {
+                    // end grain: rings
+                    let ring = ((r2.sqrt() * 5.0) as i32) % 2 == 0;
+                    c = if ring { [0.62, 0.50, 0.33] } else { [0.50, 0.39, 0.25] };
+                } else if j >= (SECTION_B * 0.8) as i32 && k.abs() <= 1 && h(x, k) > 0.18 {
+                    // The worn path down the spine: narrow, broken, and only a
+                    // shade paler than the bark. Five voxels wide and much
+                    // paler, it read as a sawn plank.
+                    let w = 0.9 + 0.15 * h(x, k);
+                    c = [0.45 * w, 0.35 * w, 0.22 * w];
+                } else if j <= 0 && k.abs() >= 4 && h(x / 5, k.signum() * 3) > 0.62 {
+                    // moss, low on a flank, in patches
+                    c = [MOSS[0] * 0.9, MOSS[1] * 0.9, MOSS[2] * 0.9];
+                } else if h(x / 2, j * 5 + k) > 0.965 {
+                    c = [0.20, 0.145, 0.09]; // a knot
+                }
+                g.set(x, cy + j, cz + k, solid(c));
+            }
+        }
+    }
+    g.mesh(LOG_VOXEL, true)
+}
+
 pub fn fallen_log(s: f32) -> VoxelMesh {
     let mut g = Grid::new(24, 7, 9);
     let bark = [0.31, 0.23, 0.14];

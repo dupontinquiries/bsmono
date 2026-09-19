@@ -303,6 +303,8 @@ pub const TOWER_RANGE: f32 = 24.0;
 /// grows inside this. The line a tower draws should be crossed in the open,
 /// on purpose, not skimmed from a bush three paces outside it.
 pub const TOWER_CLEARING: f32 = TOWER_RANGE + 4.0;
+/// A tower's line is drawn once the player is within this of it.
+pub const TOWER_RING_SHOW: f32 = 14.0;
 /// A tower's shot slows a cat: diving past is a decision, not a jog.
 pub const TOWER_SLOW: f32 = 0.25;
 pub const TOWER_SLOW_SECS: f32 = 1.2;

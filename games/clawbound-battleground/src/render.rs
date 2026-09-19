@@ -1476,16 +1476,21 @@ fn build_terrain() -> (Vec<TerrainVert>, Vec<u32>) {
                     mat = 6.0;
                 }
                 // dirt lane with worn edges + subtle checker
-                if ld < 5.4 {
-                    mat = 1.0;
-                    let t = (1.0 - ld / 5.4).clamp(0.0, 1.0);
+                if ld < 7.0 {
+                    // A soft shoulder, and no checker. The lane used to be a
+                    // hard `ld < 5.4` with a 3.2 u checkerboard darkening, both
+                    // evaluated per VERTEX on a 1.6 u grid: that is the
+                    // sawtooth along every road. The edge is now a smooth
+                    // ramp the grid can carry, broken up per-pixel by noise in
+                    // terrain.wgsl; the shader owns all fine pattern.
+                    let t = 1.0 - smoothstep(2.6, 7.0, ld + (n1 - 0.5) * 1.8);
+                    if t > 0.5 {
+                        mat = 1.0;
+                    }
                     let dirt = [0.42, 0.345, 0.26];
                     g = [g[0] + (dirt[0] - g[0]) * t, g[1] + (dirt[1] - g[1]) * t, g[2] + (dirt[2] - g[2]) * t];
-                    if ((x / 3.2).floor() + (z / 3.2).floor()) as i32 % 2 == 0 {
-                        g = [g[0] * 0.93, g[1] * 0.93, g[2] * 0.93];
-                    }
-                } else if ld < 7.0 {
-                    let t = (1.0 - (ld - 5.4) / 1.6) * 0.25;
+                } else if ld < 8.5 {
+                    let t = (1.0 - (ld - 7.0) / 1.5) * 0.25;
                     g = [g[0] * (1.0 - t * 0.4), g[1] * (1.0 - t * 0.25), g[2] * (1.0 - t * 0.5)];
                 }
                 // rivers: a pebbled bed under the water (the surface is its own

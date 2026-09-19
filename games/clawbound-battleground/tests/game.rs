@@ -396,7 +396,9 @@ fn a_tower_says_where_its_line_is_and_who_it_is_after() {
 
     game.gods[0].pos = tpos + glam::Vec3::X * (TOWER_RANGE + 3.0);
     game.tick(1.0 / 60.0);
-    assert_eq!(state(&game, mine), 1.0, "my own tower: calm");
+    assert_eq!(state(&game, mine), if (game.towers[mine].pos - game.gods[0].pos).length() < TOWER_RANGE + TOWER_RING_SHOW { 1.0 } else { 0.0 }, "my own tower: calm when near, not drawn when far");
+    let far = game.towers.iter().position(|t| (t.pos - game.gods[0].pos).length() > TOWER_RANGE + TOWER_RING_SHOW + 5.0).expect("some tower is far away");
+    assert_eq!(state(&game, far), 0.0, "a line I am nowhere near is not drawn");
     assert_eq!(state(&game, ti), 2.0, "theirs, and I am outside the line");
     assert_eq!(game.tower_rings(0)[ti][2], TOWER_RANGE);
     assert_eq!(game.towers[ti].aim, None);

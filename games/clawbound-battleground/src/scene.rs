@@ -76,10 +76,9 @@ impl Probe for WorldProbe<'_> {
     }
     fn step_top(&self, x: f32, z: f32) -> Option<f32> {
         // A crossing log is rounded footing: highest on the spine.
-        let log = self.logs.iter().find_map(|l| l.on_top(x, z)).map(|off| {
-            let r = crate::logs::LOG_RADIUS;
-            crate::logs::LOG_TOP - r + (r * r - off * off).max(0.0).sqrt()
-        });
+        // The exact surface: the voxel face under the paw on a seated log,
+        // the rotated section's top on a turned one.
+        let log = self.logs.iter().find_map(|l| l.surface_y(x, z));
         match (self.blockers.step_top(x, z), log) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
@@ -215,7 +214,7 @@ impl Scene {
         let boulder = models::build_boulder();
         total += boulder.inst.len();
         let boulder = r.upload_mesh(&boulder);
-        let river_log_mesh = props::fallen_log(1.0);
+        let river_log_mesh = props::crossing_log();
         total += river_log_mesh.inst.len();
         let river_log = r.upload_mesh(&river_log_mesh);
 
@@ -500,13 +499,17 @@ impl Scene {
         for l in &game.logs {
             use crate::logs::{LOG_RADIUS, LOG_TOP};
             let c = l.centre();
-            // The mesh lies along +X with its axis ~1.56 u up; spin it about
-            // that axis, then sink it so only LOG_TOP stands above the lane.
-            let m = Mat4::from_translation(Vec3::new(c.x, LOG_TOP - LOG_RADIUS, c.z))
+            // The mesh's section axis is at the middle of its grid; put that at
+            // the height `logs::surface_y` assumes, and turn about it.
+            let ny = (crate::logs::SECTION_B as usize) * 2 + 3;
+            let mesh_axis = ((ny / 2) as f32 + 0.5) * crate::logs::LOG_VOXEL;
+            let axis_y = LOG_TOP - crate::logs::column_top(0.0);
+            let _ = LOG_RADIUS;
+            let m = Mat4::from_translation(Vec3::new(c.x, axis_y, c.z))
                 * Mat4::from_axis_angle(Vec3::Y, (-l.axis.z).atan2(l.axis.x))
                 * Mat4::from_axis_angle(Vec3::X, l.angle)
-                * Mat4::from_translation(Vec3::new(0.0, -1.56, 0.0));
-            r.queue_draw(self.river_log, m, [1.0; 4], 0.0, 0.6, false);
+                * Mat4::from_translation(Vec3::new(0.0, -mesh_axis, 0.0));
+            r.queue_draw(self.river_log, m, [1.0; 4], 0.0, crate::logs::LOG_VOXEL, false);
         }
 
         // minions
