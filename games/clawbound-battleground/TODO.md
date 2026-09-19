@@ -57,6 +57,11 @@ the single highest-value thing anyone can do with this repo next.
 
 ## Known gaps
 
+- **bsgames handoff: DONE as far as a den** (launched with bsgames' exact env,
+  host and friend on separate network stacks, both seen on screen). Not
+  done: bsgames itself was not run; `opendht` never exercised; and the den
+  leads to no networked match. The older note below is superseded where it
+  says the launch path plays solo.
 - **bsgames handoff: the lobby can, the launch path does not yet.**
   `LanLobby::host_for_handoff` / `join_for_handoff` are tested end to end
   over a FileStore, but `app.rs` still only logs the handoff and plays solo.
@@ -232,7 +237,7 @@ the single highest-value thing anyone can do with this repo next.
 ## Verification commands
 
 ```bash
-cargo test --no-default-features   # 242 lib + 16 + 2 (+3 in games/shared/netcode), no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
+cargo test --no-default-features   # 244 lib + 16 + 2 (+90 in games/shared/netcode, was +3 in games/shared/netcode), no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
 cargo test                          # same, plus links cpal (needs libasound2-dev)
 cargo check --features gamepad      # needs libudev-dev
 cargo run --example simdbg <seed>   # headless 12-minute AI match trace
