@@ -1,0 +1,13 @@
+[package]
+name = "stoat-cli"
+description = "Line-oriented shell over stoat-core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "stoat"
+path = "src/main.rs"
+
+[dependencies]
+stoat-core = { path = "../core" }

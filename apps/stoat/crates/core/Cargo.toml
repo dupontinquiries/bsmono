@@ -1,0 +1,18 @@
+[package]
+name = "stoat-core"
+description = "Headless debugger session: backend trait, gdb/MI backend, sans-IO session state, binary discovery, shell history, build driving, debug cache management, pre-crash vitals."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+stoat-mi = { path = "../mi" }
+# One channel type that both shells can consume: recv_blocking() for the CLI,
+# recv().await under glib::spawn_future_local for GTK. (glib::MainContext::channel
+# was removed in glib-rs 0.19, so there is no glib-native option to prefer.)
+async-channel = "2"
+object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
+serde_json = "1"
+# posix_openpt/poll for the inferior's tty. libc rather than nix/rustix: five calls,
+# and it is already in every dependency tree on both glibc and musl (postmarketOS).
+libc = "0.2"

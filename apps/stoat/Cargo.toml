@@ -1,0 +1,25 @@
+# stoat — a debugger front half over gdb's engine. gdb keeps the hard parts
+# (149 *-tdep files, displaced stepping, pauth, gdbserver); this owns the
+# session layer and the UI: rustc-style stop diagnostics, ranked binary
+# selection with stated reasons, shell-history recovery of args/env, build
+# driving, pre-crash vitals + frame pacing, debug-cache management.
+#
+# Same shape as gitmind and drivemind: pure core, thin CLI, opt-in shells.
+# Both GUIs stay out of default-members so `cargo test` here never needs a
+# windowing stack; gui-egui is the primary frontend (UI_STRATEGY.md), gui-gtk
+# is the GTK4/libadwaita shell it was ported from, kept building.
+
+[workspace]
+resolver = "2"
+members = ["crates/mi", "crates/core", "crates/cli"]
+default-members = ["crates/mi", "crates/core", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.80"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
