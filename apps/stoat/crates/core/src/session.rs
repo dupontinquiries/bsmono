@@ -32,6 +32,8 @@ enum Awaiting {
     Marker,
     PanicBreak,
     FaultAddr,
+    CoreLoaded,
+    CoreSigno,
 }
 
 #[derive(Default)]
@@ -81,6 +83,15 @@ impl Session {
             let id = b.submit(Request::InsertBreakpoint { location: location.into() });
             self.awaiting.insert(id, Awaiting::PanicBreak);
         }
+    }
+
+    /// Open a core file. gdb emits no `*stopped` for a core - there was no stop,
+    /// only a corpse - so nothing would ask for frames. The session treats the
+    /// load's success as the stop, and rebuilds the reason from `$_siginfo` so the
+    /// ordinary crash diagnostic (fault address and all) applies to a core too.
+    pub fn load_core(&mut self, program: PathBuf, core: PathBuf, b: &mut dyn Backend) {
+        let id = b.submit(Request::LoadCore { program, core });
+        self.awaiting.insert(id, Awaiting::CoreLoaded);
     }
 
     pub fn select_frame(&mut self, idx: usize, b: &mut dyn Backend) -> Vec<Change> {
@@ -211,6 +222,33 @@ impl Session {
                 self.panic_breaks.insert(bp);
                 Vec::new()
             }
+            (Ok(_), Some(Awaiting::CoreLoaded)) => {
+                self.state = RunState::Stopped;
+                self.thread = Some(1);
+                // Submission order is reply order: signal, fault address, frames.
+                let signo = b.submit(Request::Evaluate { thread: 1, frame: 0, expr: "$_siginfo.si_signo".into() });
+                self.awaiting.insert(signo, Awaiting::CoreSigno);
+                let addr = b.submit(Request::Evaluate { thread: 1, frame: 0, expr: "$_siginfo._sifields._sigfault.si_addr".into() });
+                self.awaiting.insert(addr, Awaiting::FaultAddr);
+                b.submit(Request::Frames { thread: 1 });
+                b.submit(Request::Threads);
+                vec![Change::State(RunState::Stopped)]
+            }
+            (Ok(Reply::Value { value, .. }), Some(Awaiting::CoreSigno)) => {
+                let (name, meaning) = match value.trim().parse::<u32>() {
+                    Ok(4) => ("SIGILL", "Illegal instruction"),
+                    Ok(6) => ("SIGABRT", "Aborted"),
+                    Ok(7) => ("SIGBUS", "Bus error"),
+                    Ok(8) => ("SIGFPE", "Arithmetic exception"),
+                    Ok(11) => ("SIGSEGV", "Segmentation fault"),
+                    Ok(5) => ("SIGTRAP", "Trace/breakpoint trap"),
+                    _ => return Vec::new(),
+                };
+                self.last_stop = Some(Stop { reason: StopReason::Signal { name: name.into(), meaning: meaning.into() }, thread: Some(1), frame: None, at: Instant::now() });
+                Vec::new()
+            }
+            // A core written by something other than a signal has no siginfo.
+            (Err(_), Some(Awaiting::CoreSigno)) => Vec::new(),
             (Ok(Reply::Value { value, .. }), Some(Awaiting::FaultAddr)) => {
                 // Printed as `(void *) 0x8` or `0x8`.
                 self.fault_addr = value.split_whitespace().last().and_then(stoat_mi::parse_u64);

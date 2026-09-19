@@ -161,3 +161,87 @@ fn rust_panic_stops_in_user_frame_with_pretty_printers() {
         assert!(value.as_deref().is_some_and(|v| v.contains("Vec(size=3)")), "{value:?}");
     }
 }
+
+fn run_until(session: &mut Session, gdb: &mut GdbBackend, events: &async_channel::Receiver<Event>, secs: u64, mut done: impl FnMut(&Session, &[stoat_core::diag::Diagnostic]) -> bool) -> Vec<stoat_core::diag::Diagnostic> {
+    let mut diags = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline && !done(session, &diags) {
+        let Ok(ev) = events.try_recv() else {
+            std::thread::sleep(Duration::from_millis(2));
+            continue;
+        };
+        for c in session.handle(ev, gdb) {
+            if let Change::Diagnostic(d) = c {
+                diags.push(d);
+            }
+        }
+    }
+    diags
+}
+
+/// A core has no `*stopped`. The session has to make the stop itself, and the
+/// crash diagnostic should come out the same as for the live crash.
+#[test]
+fn a_core_file_gets_frames_and_the_same_crash_diagnostic() {
+    if !have("gdb") || !have("cc") {
+        eprintln!("NOT RUN: a_core_file_gets_frames_and_the_same_crash_diagnostic needs gdb and cc");
+        return;
+    }
+    let bin = build_fixture().expect("fixture builds");
+    let core = bin.with_file_name(format!("core-{}", std::process::id()));
+    let _ = std::fs::remove_file(&core);
+    // gdb writes the core itself, so this does not depend on ulimit or core_pattern.
+    let st = Command::new("gdb").args(["-q", "-nx", "-batch", "-ex", "run", "-ex"]).arg(format!("generate-core-file {}", core.display())).arg(&bin).output().expect("gdb runs");
+    assert!(core.is_file(), "gdb wrote a core: {}", String::from_utf8_lossy(&st.stderr));
+
+    let (mut gdb, events) = GdbBackend::spawn(&GdbConfig { rust_sysroot: None, ..Default::default() }).unwrap();
+    let mut session = Session::new(Some(PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures"))));
+    session.load_core(bin, core.clone(), &mut gdb);
+    let diags = run_until(&mut session, &mut gdb, &events, 30, |s, d| !d.is_empty() && s.locals.contains_key(&0));
+    let _ = std::fs::remove_file(&core);
+
+    assert_eq!(session.state, RunState::Stopped);
+    let funcs: Vec<_> = session.frames.iter().filter_map(|f| f.func.clone()).collect();
+    assert_eq!(funcs, ["depth3", "depth2", "depth1", "main"]);
+    let d = diags.iter().find(|d| d.code == "SIGSEGV").unwrap_or_else(|| panic!("crash diagnostic from a core: {diags:?}"));
+    assert!(d.notes.iter().any(|n| n.contains("null page") && n.contains("offset 8")), "{:?}", d.notes);
+    assert_eq!(session.fault_addr, Some(8));
+}
+
+#[test]
+fn attaching_to_a_running_process_stops_it_and_lists_its_frames() {
+    if !have("gdb") || !have("cc") {
+        eprintln!("NOT RUN: attaching_to_a_running_process_stops_it_and_lists_its_frames needs gdb and cc");
+        return;
+    }
+    if stoat_core::procs::ptrace_scope(std::path::Path::new("/proc")).unwrap_or(0) != 0 {
+        eprintln!("NOT RUN: attaching_to_a_running_process_stops_it_and_lists_its_frames - ptrace_scope forbids attaching to a non-child");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("stoat-attach-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("spin.c");
+    std::fs::write(&src, "#include <unistd.h>\nint ticks;\nvoid tick(void) { ticks++; usleep(2000); }\nint main(void) { for (;;) tick(); }\n").unwrap();
+    let bin = dir.join("spin");
+    assert!(Command::new("cc").args(["-g", "-O0", "-o"]).arg(&bin).arg(&src).status().unwrap().success());
+    let mut child = Command::new(&bin).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    let listed = stoat_core::procs::list_mine();
+    assert!(listed.iter().any(|p| p.pid == child.id() && p.exe.as_deref() == Some(bin.as_path())), "procs lists the target with its exe");
+
+    let (mut gdb, events) = GdbBackend::spawn(&GdbConfig { rust_sysroot: None, ..Default::default() }).unwrap();
+    let mut session = Session::new(Some(dir.clone()));
+    gdb.submit(Request::Attach { pid: child.id() });
+    run_until(&mut session, &mut gdb, &events, 30, |s, _| s.state == RunState::Stopped && !s.frames.is_empty());
+    let funcs: Vec<_> = session.frames.iter().filter_map(|f| f.func.clone()).collect();
+    drop(gdb); // detaches; gdb only kills what it started
+    let alive = child.try_wait().unwrap().is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(session.state, RunState::Stopped);
+    assert_eq!(session.pid, Some(child.id()), "pid is known, so vitals can sample an attached process too");
+    assert!(funcs.iter().any(|f| f == "main"), "{funcs:?}");
+    assert!(alive, "dropping the backend detached from the process instead of killing it");
+}
