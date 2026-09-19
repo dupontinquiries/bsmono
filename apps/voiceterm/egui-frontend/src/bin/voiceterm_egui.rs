@@ -3034,6 +3034,18 @@ impl eframe::App for VoicetermApp {
         //    hidden)" — while this surface stacks `sidebar` (160) beside
         //    `tabbar` (120) for 280px against Qt's 168. Merging them is the
         //    real fidelity fix and is not this change; gating and sizing are.
+        //
+        // ALL THREE ARE DONE, re-verified 2026-09-19 against main.qml after a
+        // report that "the left sidebar is not working yet like the -qt qml":
+        // the gate is `show_chrome` below, the width is `tabbar_width` (168.0,
+        // main.qml:4015) with the 110..=340 drag clamp (main.qml:4685), and
+        // the session list is merged in rather than a second panel — see the
+        // note at the top of `draw_sessions_strip`, "used to be its own
+        // SidePanel::left(\"sidebar\") at 160".
+        //
+        // Left here rather than deleted because the three-point comparison is
+        // the map someone checks the next time this surface looks wrong, and
+        // a resolved item with a date is more useful than a missing one.
         if show_chrome {
         // COLLAPSED, the column is one touch target wide — the same closed
         // width `rail` uses, so the two behave alike rather than each having
