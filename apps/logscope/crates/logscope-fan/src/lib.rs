@@ -94,6 +94,7 @@ pub mod stunwire;
 /// Bringing a machine into the hive: discovery, code, trust level.
 pub mod workermem;
 pub mod roster;
+pub mod hero;        // finite-state workers: tool calls on guarded edges; context-gated reflexes that save model turns
 pub mod deploy;      // the join: staffing -> confinement -> fan width -> hive placement, with a trail
 pub mod fan_policy;  // how wide to fan, decided outside the queen (moved here from logscope-egui)
 pub mod adddevice;
