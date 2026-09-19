@@ -260,6 +260,27 @@ impl PropKind {
     }
 }
 
+/// A hump a cat climbs OVER rather than walks around: a buttress root, a low
+/// slab. It never pushes anyone — `resolve` does not see it — it only answers
+/// "how high is the thing under this paw", which is `puppet::Probe::step_top`.
+///
+/// Why this is not a `Blocker` with a flag: a blocker's job is to say no to
+/// movement, and every consumer of `all` (collision, sight lines, the AI's
+/// `blocked`) would have had to learn to skip the flag. Jungle-tree roots
+/// reach 4.8 u from a trunk whose collision radius is 0.9 u; making them
+/// solid turns every tree into a plus-shaped trap for a bot that paths by
+/// push-out. Making them walkable changes nothing about where anyone can go.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Step {
+    pub shape: Shape,
+    /// Height of the crest above `base_y`.
+    pub top: f32,
+    pub base_y: f32,
+}
+
+/// Taller than this and a cat does not scramble over it, it leaps.
+pub const SCRAMBLE_MAX: f32 = 2.0;
+
 /// A uniform grid of blockers.
 ///
 /// Built once at world construction and queried every movement tick for every
@@ -268,6 +289,8 @@ impl PropKind {
 /// the handful of cells the unit's own radius overlaps.
 #[derive(Debug, Clone, Default)]
 pub struct Blockers {
+    /// Walkable humps standing on the terrain. See [`Step`].
+    steps: Vec<Step>,
     all: Vec<Blocker>,
     /// cell index -> indices into `all`.
     cells: Vec<Vec<u32>>,
@@ -284,6 +307,7 @@ impl Blockers {
         let cell = cell.max(1.0);
         let dim = ((half_extent * 2.0 / cell).ceil() as i32).max(1);
         Blockers {
+            steps: Vec::new(),
             all: Vec::new(),
             cells: vec![Vec::new(); (dim * dim) as usize],
             cell,
@@ -351,6 +375,57 @@ impl Blockers {
             },
         });
         solid
+    }
+
+    /// Register a walkable hump. Anything taller than [`SCRAMBLE_MAX`] is
+    /// refused: it would lift a cat clean off the ground by walking.
+    pub fn push_step(&mut self, shape: Shape, base_y: f32, top: f32) -> bool {
+        if !(top > 0.0 && top <= SCRAMBLE_MAX) {
+            return false;
+        }
+        self.steps.push(Step { shape, top, base_y });
+        true
+    }
+
+    /// The outer buttress roots of a jungle tree at `(x, z)`.
+    ///
+    /// Mirrors `props::jungle_tree`: four roots at `variant * 0.9 + 0.4 +
+    /// k * 90°`, boxes three voxels wide at 0.6 u/voxel. Only the outer two
+    /// boxes of each root are low enough (1.8 u) to scramble; the inner three
+    /// are 2.4 u and up and are still ghost geometry — see TODO.md. A
+    /// placement's quarter-turn maps the four directions onto themselves, so
+    /// it does not need to be known here.
+    pub fn push_jungle_roots(&mut self, x: f32, z: f32, base_y: f32, variant: i32) -> usize {
+        const VOX: f32 = 0.6;
+        let mut n = 0;
+        for k in 0..4 {
+            let a = variant as f32 * 0.9 + k as f32 * std::f32::consts::FRAC_PI_2 + 0.4;
+            let (dx, dz) = (a.cos(), a.sin());
+            // boxes i = 3, 4 of the mesh: centres at 6.65 and 8.0 voxels.
+            let (r0, r1) = (6.65 * VOX, 8.0 * VOX);
+            let shape = Shape::Segment { x0: x + dx * r0, z0: z + dz * r0, x1: x + dx * r1, z1: z + dz * r1, r: 1.5 * VOX };
+            n += self.push_step(shape, base_y, 3.0 * VOX) as usize;
+        }
+        n
+    }
+
+    /// World Y of the highest hump under `(x, z)`, if any. Rounded off
+    /// toward the rim so a paw rises onto it instead of snapping.
+    pub fn step_top(&self, x: f32, z: f32) -> Option<f32> {
+        let mut best: Option<f32> = None;
+        for s in &self.steps {
+            let (ax, az, br) = s.shape.nearest_axis(x, z);
+            let d2 = (x - ax) * (x - ax) + (z - az) * (z - az);
+            if br > 0.0 && d2 < br * br {
+                let h = s.base_y + s.top * (1.0 - d2 / (br * br)).sqrt();
+                best = Some(best.map_or(h, |b| b.max(h)));
+            }
+        }
+        best
+    }
+
+    pub fn steps(&self) -> &[Step] {
+        &self.steps
     }
 
     /// Add a long prop as a capsule between two points.
@@ -631,6 +706,28 @@ mod tests {
         // And a solid one does get added.
         assert!(b.push_prop(PropKind::RuinPillar, 5.0, 5.0, 0.0, 1.0));
         assert_eq!(b.len(), 1);
+    }
+
+    /// Roots lift paws and move nobody. Both halves matter: the first is
+    /// the feature, the second is the promise that bots path as before.
+    #[test]
+    fn roots_are_climbed_over_and_never_push() {
+        let mut b = Blockers::new(100.0, 6.0);
+        assert_eq!(b.push_jungle_roots(10.0, 10.0, 0.0, 0), 4);
+        assert!(b.is_empty(), "a root is not a blocker");
+        // variant 0, k 0: direction 0.4 rad, crest between 3.99 and 4.8 u out.
+        let (dx, dz) = (0.4f32.cos(), 0.4f32.sin());
+        let on = (10.0 + dx * 4.4, 10.0 + dz * 4.4);
+        let crest = b.step_top(on.0, on.1).expect("the crest of the root");
+        assert!((1.75..=1.8001).contains(&crest), "crest height {crest}");
+        let rim = b.step_top(on.0 - dz * 0.8, on.1 + dx * 0.8).expect("still on it");
+        assert!(rim < crest * 0.6, "the rim is rounded off, not a cliff: {rim}");
+        assert_eq!(b.step_top(10.0, 10.0), None, "the trunk itself is not a step");
+        assert_eq!(b.step_top(-50.0, -50.0), None);
+        let p = Vec3::new(on.0, 0.0, on.1);
+        assert_eq!(b.resolve(p, 0.6), p, "standing on a root moves nobody");
+        assert!(!b.blocked(on.0, on.1, 0.6));
+        assert!(!b.push_step(Shape::Circle { x: 0.0, z: 0.0, r: 1.0 }, 0.0, SCRAMBLE_MAX + 0.1), "too tall to scramble");
     }
 
     /// An arch is a doorway; walling its centre defeats the prop.
