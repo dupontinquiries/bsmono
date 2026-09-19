@@ -659,6 +659,46 @@ impl Controller {
             add_to_playlist: Default::default(), gesture: GestureLayer::horizontal_page(320.0), a11y: A11yScene::new(), palette: String::new() }
     }
 
+    /// The views this product actually has, in `VIEWS` order.
+    ///
+    /// The QML drops a page a device cannot use; `device::views_for` is that
+    /// rule and this is where it meets the live profile.
+    pub fn visible_views(&self) -> Vec<&'static str> {
+        crate::device::views_for(&self.profile, &VIEWS)
+    }
+
+    /// Keep the selection pointing at the same VIEW when the visible set
+    /// changes — a profile arriving, a device being swapped.
+    ///
+    /// ## Why by name, and why this needs doing at all
+    ///
+    /// `Nav` holds a bare index into a fixed count. Filter the list and the
+    /// index means a different page: on a profile with no `eq`, Mixer
+    /// disappears and index 3 slides from Mixer to Soundscape — the user is
+    /// moved to a page they did not pick, silently, while a device connects.
+    ///
+    /// So the anchor is the view's NAME. If it survived the filter the
+    /// selection follows it to its new index; if it did not, we fall back to
+    /// the first visible view rather than clamping the old index, because a
+    /// clamped index lands on whatever happens to be adjacent and that is a
+    /// coin flip dressed as a decision.
+    ///
+    /// Returns the name now selected, so a caller can say so if it wants to.
+    pub fn reconcile_views(&mut self, was: &str) -> &'static str {
+        let vis = self.visible_views();
+        // An empty visible set cannot happen -- Devices and Settings have no
+        // required control -- but the draw path must not divide by zero if it
+        // ever does.
+        let Some(first) = vis.first().copied() else { return VIEWS[0] };
+        let idx = vis.iter().position(|v| *v == was);
+        let target = idx.map(|i| vis[i]).unwrap_or(first);
+        // `Nav` indexes VIEWS, not the visible subset, so translate back --
+        // otherwise hiding one page shifts every index after it.
+        let in_all = VIEWS.iter().position(|v| *v == target).unwrap_or(0);
+        self.nav.go_page(in_all);
+        target
+    }
+
     pub fn current(&self) -> &'static str {
         // NOT `VIEWS[self.nav.page()]`. `view_idx` is written from
         // `strip_ui`'s return (line ~609) and from `page()`, so its bound
@@ -3329,4 +3369,68 @@ mod voice_command_tests {
         c.heard("quieter");
         assert_eq!(c.pending_volume, Some(0.0), "it went below zero");
     }
+
+#[cfg(test)]
+mod view_reconcile_tests {
+    use super::*;
+
+    fn limited() -> crate::device::Profile {
+        // volume and mute only: no eq, no stream, no autoroute.
+        crate::device::Profile {
+            controls: ["volume", "mute"].iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// THE SILENT MOVE THIS PREVENTS. `Nav` holds a bare index: filter Mixer
+    /// out and index 3 slides from Mixer to Soundscape, so a device
+    /// connecting moves the user to a page they did not pick.
+    #[test]
+    fn a_surviving_view_keeps_its_selection_across_a_filter() {
+        let mut c = Controller::new(Vec::new(), Vec::new());
+        // Library survives any profile.
+        let lib = VIEWS.iter().position(|v| *v == "Library").unwrap();
+        c.nav.go_page(lib);
+        assert_eq!(c.current(), "Library");
+        c.profile = limited();
+        assert_eq!(c.reconcile_views("Library"), "Library");
+        assert_eq!(c.current(), "Library", "and the index followed it");
+    }
+
+    /// A view that did NOT survive falls back to the first visible one, not to
+    /// a clamped index -- clamping lands on whatever happens to be adjacent,
+    /// which is a coin flip dressed as a decision.
+    #[test]
+    fn a_removed_view_falls_back_to_the_first_visible_one() {
+        let mut c = Controller::new(Vec::new(), Vec::new());
+        c.profile = limited();
+        let now = c.reconcile_views("Mixer");
+        assert_eq!(now, "Devices");
+        assert!(!c.visible_views().contains(&"Mixer"));
+    }
+
+    /// The translation back into VIEWS indices is the part that is easy to get
+    /// wrong: `Nav` indexes the FULL list, so a visible-subset index would
+    /// point at the wrong page for every view after a hidden one.
+    #[test]
+    fn the_index_is_translated_back_into_the_full_view_list() {
+        let mut c = Controller::new(Vec::new(), Vec::new());
+        c.profile = limited();
+        // Settings is last in VIEWS (index 5) but third in the visible set.
+        c.reconcile_views("Settings");
+        assert_eq!(c.current(), "Settings");
+        assert_eq!(c.nav.page(), VIEWS.iter().position(|v| *v == "Settings").unwrap());
+    }
+
+    /// An unknown product keeps every view, so reconciling is a no-op -- the
+    /// common case must not move anything.
+    #[test]
+    fn an_unknown_product_reconciles_to_where_it_already_was() {
+        let mut c = Controller::new(Vec::new(), Vec::new());
+        for v in VIEWS {
+            c.nav.go_page(VIEWS.iter().position(|x| *x == v).unwrap());
+            assert_eq!(c.reconcile_views(v), v, "{v} moved on a full profile");
+        }
+    }
+}
 }
