@@ -31,14 +31,16 @@
 
 /// Which group a setting belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Group { Layout, Colors, Experimental }
+pub enum Group { Layout, Typing, Colors, Experimental }
 
 impl Group {
-    pub const ALL: [Group; 3] = [Group::Layout, Group::Colors, Group::Experimental];
+    pub const ALL: [Group; 4] =
+        [Group::Layout, Group::Typing, Group::Colors, Group::Experimental];
 
     pub fn title(self) -> &'static str {
         match self {
             Group::Layout => "Layout",
+            Group::Typing => "Typing",
             Group::Colors => "Colors",
             Group::Experimental => "Experimental",
         }
@@ -121,6 +123,72 @@ pub const SETTINGS: &[Setting] = &[
         group: Group::Experimental,
         options: &["Off", "Cardinal", "Stenotype", "Words"],
         values: &["off", "cardinal", "stenotype", "words"],
+    },
+    // ── Typing: ported from the GTK panel, help text verbatim ───────────
+    //
+    // DECLARATION ORDER IS THE DEFAULT. `Setting::next` cycles from
+    // `values[0]` and `settings_cli::Reset` goes there, so the first option
+    // must be what a fresh install has. Checked against `src/config/mod.rs`
+    // rather than assumed, and four of these six needed reordering:
+    // swipe_typing, swipe_auto_space and auto_hide_on_no_focus all default
+    // TRUE, and swipe_speed_mode defaults to "normal", not the first of
+    // slow/normal/fast. Writing them Off-first would have made `reset` turn
+    // swipe typing off — a "restore defaults" that changes the default.
+    //
+    // `src/ui/settings_panel.rs` carries about two dozen settings; this model
+    // arrived with seven, all Layout plus two Experimental. The whole swipe
+    // group was missing, which is the group that changes how the keyboard
+    // FEELS -- and the help lines are the part worth carrying exactly, because
+    // they are where each choice is actually explained.
+    Setting {
+        key: "typing.swipe", label: "Swipe typing",
+        help: "Drag across letters to type whole words. Off → spacebar drag becomes arrow keys.",
+        group: Group::Typing,
+        options: &["On", "Off"], values: &["on", "off"],
+    },
+    Setting {
+        key: "typing.swipe_speed", label: "Swipe speed",
+        help: "How hard you pause to mark a letter. Slow = gentle pauses count; Fast = only near-stops.",
+        group: Group::Typing,
+        options: &["Normal", "Slow", "Fast"], values: &["normal", "slow", "fast"],
+    },
+    Setting {
+        key: "typing.lenient_swipe", label: "Lenient swipe",
+        help: "Accept faster, sloppier swipes. Trades precision for forgiveness.",
+        group: Group::Typing,
+        options: &["Off", "On"], values: &["off", "on"],
+    },
+    Setting {
+        key: "typing.auto_space", label: "Auto-space swipes",
+        help: "Add a space automatically between consecutive swipe-typed words.",
+        group: Group::Typing,
+        options: &["On", "Off"], values: &["on", "off"],
+    },
+    Setting {
+        key: "typing.auto_cap", label: "Auto-capitalize",
+        help: "Capitalize the first letter after a period or at start of input.",
+        group: Group::Typing,
+        options: &["Off", "On"], values: &["off", "on"],
+    },
+    Setting {
+        key: "typing.auto_hide", label: "Auto-hide on no focus",
+        help: "Hide the keyboard when no text field has focus.",
+        group: Group::Typing,
+        options: &["On", "Off"], values: &["on", "off"],
+    },
+    // ── Colors ───────────────────────────────────────────────────────────
+    //
+    // The GTK panel's Colors tab is mostly hex-string pickers with a "reset to
+    // theme defaults" button, and a hex field is not a `Setting` -- this model
+    // is option lists, deliberately ("what ports is the model, not the widget
+    // tree"). Glass effect is the one Colors row that IS a choice between
+    // named options, so it is the one that fits here. The pickers need their
+    // own type and are not faked as a two-option toggle.
+    Setting {
+        key: "colors.glass", label: "Glass effect",
+        help: "Translucent keyboard with refraction gradient. Wallpaper shows through.",
+        group: Group::Colors,
+        options: &["Off", "On"], values: &["off", "on"],
     },
     Setting {
         key: "experimental.voice", label: "Voice input",
@@ -301,5 +369,47 @@ mod tests {
         k.sort_unstable();
         k.dedup();
         assert_eq!(k.len(), 8, "and none repeats");
+    }
+
+    /// THE FIRST OPTION IS THE DEFAULT, because `next` cycles from there and
+    /// `settings_cli::Reset` goes there. Checked against the GTK config's real
+    /// defaults (`src/config/mod.rs`), not assumed.
+    ///
+    /// Four of the six Typing settings needed reordering to satisfy this:
+    /// writing them alphabetically or Off-first would have made "restore
+    /// defaults" turn swipe typing off.
+    #[test]
+    fn the_first_option_of_each_typing_setting_is_the_gtk_default() {
+        for (key, want) in [
+            ("typing.swipe", "on"),            // config: swipe_typing: true
+            ("typing.swipe_speed", "normal"),  // config: "normal".to_string()
+            ("typing.lenient_swipe", "off"),   // config: lenient_swipe: false
+            ("typing.auto_space", "on"),       // config: swipe_auto_space: true
+            ("typing.auto_cap", "off"),        // config: auto_capitalize: false
+            ("typing.auto_hide", "on"),        // config: auto_hide_on_no_focus: Some(true)
+            ("colors.glass", "off"),           // config: glass_effect: false
+        ] {
+            assert_eq!(find(key).values[0], want, "{key} resets to the wrong value");
+        }
+    }
+
+    /// The help lines are the part worth carrying exactly -- they are where
+    /// each choice is explained, and a paraphrase loses the distinction.
+    #[test]
+    fn the_swipe_speed_help_explains_what_the_setting_does() {
+        let h = find("typing.swipe_speed").help;
+        assert!(h.contains("pause"), "{h}");
+        assert!(h.contains("near-stops"), "verbatim from the GTK panel: {h}");
+    }
+
+    /// Every group has at least one setting. Colors did not until Glass
+    /// effect was ported -- the group existed as a tab with nothing in it,
+    /// because the rest of the GTK Colors tab is hex pickers and a hex field
+    /// is not an option list. An empty tab is a bug in the table.
+    #[test]
+    fn no_group_is_empty() {
+        for g in Group::ALL {
+            assert!(!group(g).is_empty(), "{:?} has no settings", g);
+        }
     }
 }
