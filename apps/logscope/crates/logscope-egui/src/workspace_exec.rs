@@ -236,9 +236,21 @@ pub struct Workspace {
     /// CHANGE, and a bee that cannot even look outside its lane cannot tell whether editing inside
     /// it is safe.
     owns: Vec<String>,
+    /// This run's TOOL WHITELIST (wire names). Empty = every tool, matching every caller that
+    /// predates it. Set from a staffed worker's spec (`logscope_fan::deploy::Confinement`): the
+    /// design's first claim is that a small model gets competent by having fewer CHOICES, and
+    /// until this field existed the spec's `tools` list was validated and then dropped — a
+    /// staffed bee ran with all thirteen. Enforced in `apply`, the one place every call passes.
+    tools: Vec<String>,
 }
 
 impl Workspace {
+    /// Confine this run to these tools. See the field doc; empty leaves every tool available.
+    pub fn with_tools(mut self, tools: Vec<String>) -> Self {
+        self.tools = tools;
+        self
+    }
+
     /// Tell the workspace which model is reading it — evidence budgets key on
     /// this (read_harness::ModelClass). Chainable at construction.
     pub fn with_model_label(mut self, label: impl Into<String>) -> Self {
@@ -276,6 +288,7 @@ impl Workspace {
             scratch_last: None,
             last_green: None,
             owns: Vec::new(),
+            tools: Vec::new(),
         }
     }
 
@@ -344,6 +357,15 @@ impl Workspace {
     /// Execute a tool, recording any file change. Never panics; every failure becomes an `err` result the
     /// model can read and recover from.
     pub fn apply(&mut self, tool: &Tool) -> ToolResult {
+        // THE WHITELIST, at the one place every call passes — so no tool, present or future, has
+        // its own chance to forget it (the archfeat lesson: a check on twelve of thirteen arms is
+        // the silent failure). The refusal names what the worker DOES have: a model told only
+        // "no" retries the same call; told its menu, it picks from it.
+        if !self.tools.is_empty() && !self.tools.iter().any(|t| t == tool.wire_name()) {
+            return ToolResult::err(format!(
+                "{}: not one of this worker's tools. You have: {}. If the task cannot be done with \
+those, say so and stop — it belongs to a different worker.", tool.wire_name(), self.tools.join(", ")));
+        }
         match tool {
             Tool::WriteFile { path, contents } => self.write_file(path, contents),
             Tool::ReadFile { path } => self.read_file(path),
@@ -1616,6 +1638,10 @@ pub struct AgentConfig {
     /// model is repeating text that looks like one", which is the failure that turns a hostile
     /// README into an executed command.
     pub gate: crate::taint::ToolGate,
+    /// The staffed worker's tool whitelist (wire names); empty = every tool. Applied to the
+    /// `Workspace` (enforcement) AND to `system_prompt` (the model is only taught what it has).
+    /// Set together with `owns` from one `deploy::Confinement` — see `Chat::stage_lane`.
+    pub tools: Vec<String>,
     /// Where irreversible actions are recorded. None = no audit (tests, previews).
     pub audit_log: Option<std::path::PathBuf>,
     /// Verify-as-you-go (1): after a turn that WROTE a file whose extension is in `verify_exts`, run this
@@ -1740,6 +1766,7 @@ impl Default for AgentConfig {
             extra_allow: Vec::new(),
             profiles: Vec::new(),
             owns: Vec::new(),
+            tools: Vec::new(),
         }
     }
 }
@@ -2713,6 +2740,51 @@ pub fn collect_shared_docs(root: &std::path::Path, budget: usize) -> String {
 }
 
 pub fn system_prompt(task: &str, cfg: &AgentConfig) -> String {
+    confine_prompt(system_prompt_all_tools(task, cfg), &cfg.tools)
+}
+
+/// Paragraphs of the prompt that exist to teach ONE tool, by their opening words. When a worker's
+/// whitelist lacks the tool the paragraph goes with it. A table rather than a guess, and
+/// `the_tool_paragraph_table_matches_the_prompt` fails when the prompt is reworded underneath it.
+const TOOL_PARAGRAPHS: &[(&str, &str)] = &[
+    ("SIDE IDEAS GO IN scratch_code", "scratch_code"),
+    ("CHECK A SECTION BEFORE YOU LAND IT", "propose"),
+    ("HISTORY IS EVIDENCE A FILE READ CANNOT GIVE YOU", "git_log"),
+];
+
+/// Cut the prompt down to a staffed worker's tools. Empty whitelist = unchanged, byte for byte.
+///
+/// docs/12: "a Small-class bee … never sees the JSON fence syntax at all. One shape to hold is
+/// the entire point." The same argument applies to the MENU: thirteen entries and three essays
+/// about tools the bee cannot call are attention spent on refusals. So the menu lines for absent
+/// tools go, the paragraphs that teach only an absent tool go, and the bee is told its list once,
+/// in words, with what to do when the list is not enough — stop, rather than improvise.
+pub fn confine_prompt(prompt: String, tools: &[String]) -> String {
+    if tools.is_empty() { return prompt; }
+    let has = |t: &str| tools.iter().any(|x| x == t);
+    let mut out = String::with_capacity(prompt.len());
+    for para in prompt.split("\n\n") {
+        if TOOL_PARAGRAPHS.iter().any(|(lead, tool)| para.starts_with(lead) && !has(tool)) { continue; }
+        let mut kept = String::new();
+        for line in para.split('\n') {
+            // a menu line is `- name  { "tool":"name", … }`; anything else passes through
+            let menu_tool = line.strip_prefix("- ").and_then(|r| {
+                let name = r.split_whitespace().next()?;
+                (r.contains(&format!("\"tool\":\"{name}\"")) && RUNTIME_TOOLS.contains(&name)).then_some(name)
+            });
+            if menu_tool.is_some_and(|t| !has(t)) { continue; }
+            if !kept.is_empty() { kept.push('\n'); }
+            kept.push_str(line);
+        }
+        if !out.is_empty() { out.push_str("\n\n"); }
+        out.push_str(&kept);
+    }
+    out.push_str(&format!("\n\nYOUR TOOLS: {}. These are ALL of your tools — a call to anything else is refused. \
+If the task cannot be done with them, say which tool is missing and stop; do not work around it.", tools.join(", ")));
+    out
+}
+
+fn system_prompt_all_tools(task: &str, cfg: &AgentConfig) -> String {
     // THE RUN TOKEN, INTO THE PROMPT.
     //
     // The gate has always required `nonce="..."` on the opener and the prompt
@@ -3501,6 +3573,7 @@ impl AgentRun {
             .with_model_label(cfg.model_label.clone())
             .with_model_params(cfg.model_params)
             .with_owns(cfg.owns.clone())
+            .with_tools(cfg.tools.clone())
             // The configured verify command is allowed to run: it comes from the operator, and
             // gating it on the model's allowlist made any non-cargo suite structurally unverifiable.
             .allow_also(cfg.verify_cmd.first().cloned())
@@ -4631,6 +4704,89 @@ error: could not compile `demo` (lib) due to 3 previous errors
         assert_eq!(parse_tools(call), vec![Tool::WriteFile { path: "real.rs".into(), contents: "\"path\": \"decoy.rs\"".into() }]);
     }
 
+    /// THE WHITELIST IS ENFORCED, at the funnel. A staffed reader asked to write is refused by
+    /// name, told what it has, and the file does not appear — and every tool it DOES have works.
+    #[test]
+    fn a_confined_worker_cannot_call_a_tool_outside_its_whitelist() {
+        let dir = std::env::temp_dir().join(format!("ls-whitelist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let mut ws = Workspace::new(&dir).with_tools(vec!["read_file".into(), "search".into()]);
+        let r = ws.apply(&Tool::WriteFile { path: "src/b.rs".into(), contents: "x".into() });
+        assert!(!r.ok && r.output.contains("write_file: not one of this worker's tools") && r.output.contains("read_file, search"), "{}", r.output);
+        assert!(!dir.join("src/b.rs").exists(), "a refused write must not have happened");
+        for t in [Tool::Edit { path: "src/a.rs".into(), find: "fn a".into(), replace: "fn z".into() },
+                  Tool::Run { argv: vec!["ls".into()] },
+                  Tool::MakeTool { name: "t".into(), source: "fn main(){}".into() },
+                  Tool::Doc { name: "survey".into(), content: "x".into() }] {
+            let r = ws.apply(&t);
+            assert!(!r.ok && r.output.contains("not one of this worker's tools"), "{}: {}", t.wire_name(), r.output);
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("src/a.rs")).unwrap(), "fn a() {}\n", "the refused edit changed nothing");
+        assert!(ws.apply(&Tool::ReadFile { path: "src/a.rs".into() }).ok, "a whitelisted tool still works");
+        // the complement: no whitelist = every tool, exactly as before this field existed
+        let mut open = Workspace::new(&dir);
+        assert!(open.apply(&Tool::WriteFile { path: "src/b.rs".into(), contents: "x".into() }).ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every variant of `Tool` is subject to the whitelist — checked over RUNTIME_TOOLS so a new
+    /// tool cannot be added to the enum and quietly bypass it (it goes through `apply` or nowhere).
+    #[test]
+    fn the_whitelist_covers_every_runtime_tool() {
+        let dir = std::env::temp_dir().join(format!("ls-whitelist-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let samples = vec![
+            Tool::WriteFile { path: "a".into(), contents: String::new() }, Tool::Edit { path: "a".into(), find: "x".into(), replace: "y".into() },
+            Tool::ReadFile { path: "a".into() }, Tool::ReadRange { path: "a".into(), start: 1, end: 2 }, Tool::ReadNear { path: "a".into(), name: "x".into() },
+            Tool::ListDir { path: String::new() }, Tool::Search { pattern: "x".into(), path: String::new() }, Tool::Run { argv: vec!["ls".into()] },
+            Tool::GitLog { n: 1, path: String::new() }, Tool::Doc { name: "d".into(), content: "c".into() },
+            Tool::Propose { path: "a".into(), content: "c".into() }, Tool::Scratch { title: "t".into(), lang: "rust".into(), body: "b".into() },
+            Tool::MakeTool { name: "t".into(), source: "fn main(){}".into() },
+        ];
+        let names: std::collections::BTreeSet<&str> = samples.iter().map(|t| t.wire_name()).collect();
+        assert_eq!(names, RUNTIME_TOOLS.iter().copied().collect(), "one sample per runtime tool");
+        let mut ws = Workspace::new(&dir).with_tools(vec!["no-such-tool".into()]);
+        for t in &samples { assert!(ws.apply(t).output.contains("not one of this worker's tools"), "{} bypassed the whitelist", t.wire_name()); }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The prompt teaches a confined worker ONLY its tools: menu lines and the essays about absent
+    /// tools go, its list is stated, and an unconfined prompt is untouched byte for byte.
+    #[test]
+    fn a_confined_prompt_teaches_only_the_whitelist() {
+        let open = AgentConfig::default();
+        let full = system_prompt("t", &open);
+        assert_eq!(full, confine_prompt(full.clone(), &[]), "no whitelist = the prompt every existing run gets");
+        let cfg = AgentConfig { tools: vec!["read_file".into(), "search".into(), "git_log".into()], ..AgentConfig::default() };
+        let p = system_prompt("t", &cfg);
+        for gone in ["- write_file ", "- edit ", "- run ", "- make_tool ", "- propose ", "- doc ", "- scratch_code ", "- list_dir ",
+                     "SIDE IDEAS GO IN scratch_code", "CHECK A SECTION BEFORE YOU LAND IT"] {
+            assert!(full.contains(gone), "fixture: the full prompt has {gone:?}");
+            assert!(!p.contains(gone), "a reader is still taught {gone:?}");
+        }
+        for kept in ["- read_file ", "- search ", "- git_log ", "HISTORY IS EVIDENCE A FILE READ CANNOT GIVE YOU", "THE CODE IS RIGHT THERE"] {
+            assert!(p.contains(kept), "lost {kept:?}");
+        }
+        assert!(p.contains("YOUR TOOLS: read_file, search, git_log. These are ALL of your tools"));
+        assert!(p.len() < full.len());
+    }
+
+    /// The table of tool-specific paragraphs is matched by opening words. If the prompt is
+    /// reworded, an entry silently stops matching and a confined worker gets the essay back —
+    /// so each entry must match exactly one paragraph of the real prompt.
+    #[test]
+    fn the_tool_paragraph_table_matches_the_prompt() {
+        let full = system_prompt("t", &AgentConfig::default());
+        for (lead, tool) in TOOL_PARAGRAPHS {
+            let hits = full.split("\n\n").filter(|p| p.starts_with(lead)).count();
+            assert_eq!(hits, 1, "{lead:?} should open exactly one paragraph");
+            assert!(RUNTIME_TOOLS.contains(tool), "{tool} is not a runtime tool");
+        }
+    }
+
     /// A native-shape call to a tool we do not implement is reported as that tool, not as prose.
     #[test]
     fn a_native_call_to_an_unknown_tool_is_named() {
@@ -5677,6 +5833,32 @@ mod long_horizon_tests {
         }
         // And nothing was actually written outside the lane — the refusal held every time.
         assert!(run.events().is_empty(), "no write should have landed: {:?}", run.events());
+    }
+
+    /// THE WIRE, end to end: `AgentConfig.tools` set on the config must be what the run's OWN
+    /// Workspace enforces — through the real agent loop, a scripted model, and the disk. Every
+    /// piece of the whitelist had a test (apply refuses, the prompt is cut, stage_lane sets the
+    /// field) and a break test showed nothing covered the one line that joins them: deleting
+    /// `.with_tools(cfg.tools.clone())` left all of those green while a staffed reader wrote files.
+    #[test]
+    fn a_run_enforces_the_whitelist_its_config_carries() {
+        let d = tmp("whitelist-wire");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6,
+            verify_cmd: Vec::new(), verify_exts: Vec::new(),
+            tools: vec!["read_file".into(), "search".into()], ..Default::default() };
+        let script = vec![write_call("src/sneaky.rs", 1), write_call("notes.md", 2)];
+        let (_stop, run) = drive(&d, "summarise the crate", cfg, &script);
+        assert!(run.events().is_empty(), "a reader's run wrote: {:?}", run.events());
+        assert!(!d.join("src/sneaky.rs").exists() && !d.join("notes.md").exists(), "a refused write reached the disk");
+        // the complement, same script, no whitelist: the writes land — so the refusal above is the
+        // whitelist's doing and not some other guard's
+        let d2 = tmp("whitelist-wire-open");
+        std::fs::write(d2.join("Cargo.toml"), "[package]\n").unwrap();
+        let open = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6,
+            verify_cmd: Vec::new(), verify_exts: Vec::new(), ..Default::default() };
+        let (_stop, run2) = drive(&d2, "summarise the crate", open, &script);
+        assert!(d2.join("src/sneaky.rs").exists(), "unconfined, the same script writes: {:?}", run2.events());
     }
 
     /// A write that succeeds INSIDE the lane, interleaved with out-of-lane attempts, must reset the

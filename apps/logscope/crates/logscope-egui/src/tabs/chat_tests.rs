@@ -749,11 +749,17 @@ mod stamp_persistence_tests {
         let line = chat.stage_lane(&mut cfg, "update docs/README.md with the finding");
         assert!(line.is_some(), "a docs-path task should staff to the seed doc-writer");
         assert_eq!(cfg.owns, vec!["docs".to_string()]);
+        // and the WHITELIST came with the lane — before this, staffing carried `owns` alone and
+        // the doc-writer ran with a shell and make_tool on its menu
+        assert_eq!(cfg.tools, ["read_file", "read_near", "write_file", "doc"]);
+        let hud = line.unwrap();
+        assert!(hud.contains("doc-writer") && hud.contains("writes only in docs") && hud.contains("tools: read_file"), "{hud}");
 
         let mut cfg2 = crate::workspace_exec::AgentConfig::default();
         let line2 = chat.stage_lane(&mut cfg2, "fix the renderer");
         assert!(line2.is_none(), "prose with no path names nobody, so nothing is staffed");
         assert!(cfg2.owns.is_empty(), "an unstaffed run must stay unrestricted");
+        assert!(cfg2.tools.is_empty(), "… in its tools as well as its lane");
     }
 
     /// A cold `Chat` is never actually cold — the Delegator always has the seed set to staff
@@ -787,10 +793,18 @@ Success:\n- cargo test passes cleanly with no warnings\n";
         assert!(chat.roster.get("rust-ratatui-coder").is_some());
 
         // An uncheckable success criterion — the exact failure `validate` exists to catch.
-        let bad = "Name: vague-bee\nPurpose: make things nice\nSuccess:\n- the code is clean\n";
+        // ONE fault, so the assertion below is about that fault: the fixture used to omit Tools
+        // too, which `validate` now refuses first (an empty whitelist deploys as "every tool").
+        let bad = "Name: vague-bee\nPurpose: make things nice\nTools:\n- read_file\nSuccess:\n- the code is clean\n";
         let bad_spec = logscope_fan::queen::WorkerSpec::parse(bad).expect("parses");
         let err = bad_spec.validate(crate::workspace_exec::RUNTIME_TOOLS).unwrap_err();
         assert!(err.correction().contains("cannot be checked"), "{}", err.correction());
+
+        // and the two refusals that keep a spec from deploying as "everything"
+        let toolless = logscope_fan::queen::WorkerSpec::parse("Name: thinker\nPurpose: think\nSuccess:\n- cargo test passes\n").expect("parses");
+        assert!(toolless.validate(crate::workspace_exec::RUNTIME_TOOLS).unwrap_err().correction().contains("no tools"));
+        let laneless = logscope_fan::queen::WorkerSpec::parse("Name: patcher\nPurpose: patch\nTools:\n- edit\nSuccess:\n- cargo test passes\n").expect("parses");
+        assert!(laneless.validate(crate::workspace_exec::RUNTIME_TOOLS).unwrap_err().correction().contains("owns no paths"));
     }
 
     /// `do_enlist`, exercised through the ACTUAL chain-walk (not just the parse/validate pieces

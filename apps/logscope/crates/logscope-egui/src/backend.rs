@@ -2593,7 +2593,7 @@ mod node_report_tests {
         let matrix = logscope_fan::hive::assemble(Some(&r), &[], &[]);
         let job = logscope_fan::hive::Job {
             reach: logscope_fan::workerkit::Reach::Lan,
-            partner_node: None, prompt_tokens: 3, models: vec![],
+            partner_node: None, prompt_tokens: 3, models: vec![], turns: 1,
         };
         let p = logscope_fan::hive::place(&job, &matrix).expect("a zero-rate cell is still a cell");
         assert_eq!(p.cell.node.id, "here");
@@ -2607,7 +2607,7 @@ mod node_report_tests {
         let matrix = logscope_fan::hive::assemble(Some(&r), &[], &[]);
         let job = logscope_fan::hive::Job {
             reach: logscope_fan::workerkit::Reach::Lan,
-            partner_node: None, prompt_tokens: 3, models: vec![],
+            partner_node: None, prompt_tokens: 3, models: vec![], turns: 1,
         };
         assert!(logscope_fan::hive::place(&job, &matrix).is_none());
         assert!(logscope_fan::hive::explain_empty(&job, &matrix).contains("wait, not a failure"));

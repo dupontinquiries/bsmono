@@ -3344,8 +3344,13 @@ the repository — a chat turn cannot open files.",
         match self.roster.staff(task) {
             logscope_fan::roster::Staffing::Reuse { worker, why } => {
                 if let Some(spec) = self.roster.get(&worker) {
-                    cfg.owns = spec.owns.clone();
-                    return Some(format!("staffed to {worker} ({why})"));
+                    // Lane AND whitelist, from one value, or neither. This used to be
+                    // `cfg.owns = spec.owns.clone()` alone: the spec's `tools` never reached the
+                    // run, and an empty `owns` means read-only THERE and unrestricted HERE.
+                    let c = logscope_fan::deploy::Confinement::of(spec);
+                    cfg.owns = c.runtime_owns();
+                    cfg.tools = c.tools.clone();
+                    return Some(format!("staffed to {} ({why})", c.describe()));
                 }
                 None
             }

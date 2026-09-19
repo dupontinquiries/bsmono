@@ -204,7 +204,35 @@ As of this pass, the following is real, running code, not just this document:
   action), stops the run and names the lane rather than burning the step budget. See
   `AgentRun::lane_refusals` / `Stop::LaneRefused` in `workspace_exec.rs`.
 
-**Still not built:** open question 1 (the focusing-effect measurement) needs an actual run, not
+* **Selection now binds deployment (`logscope-fan/src/deploy.rs`).** Until this pass the list
+  above overstated what staffing did: `stage_lane` copied **only `owns`** from the selected spec.
+  The `tools` whitelist — the first failure this document names — was parsed, validated against
+  the runtime's tool list, and dropped: a staffed bee ran with all thirteen tools and was taught
+  all thirteen. Now:
+  * `deploy::Confinement::of(spec)` carries lane **and** whitelist as one value. It exists
+    because `owns == []` means *read-only* in a `WorkerSpec` and *unrestricted* in a `Workspace`;
+    `Lane { ReadOnly, Paths }` makes that a type instead of a convention.
+  * `Workspace::apply` — the one funnel every tool call passes — refuses a call outside the
+    whitelist, names what the worker *does* have, and tells it to stop rather than work around it.
+  * `system_prompt` goes through `confine_prompt`: menu lines and the essays that teach only an
+    absent tool are removed, and the worker is told its list once. No whitelist = the prompt is
+    unchanged byte for byte.
+  * `validate` refuses the two specs that would deploy as "everything": a write tool with no lane
+    (`WriteWithoutLane`) and no tools at all (empty reads as "all" on the runtime side).
+
+* **The four decisions have one caller.** `deploy::plan` runs WHO (`roster::staff`) → WHAT
+  (`Confinement`) → HOW MANY (`fan_policy::decide`, moved into this crate; it had no caller) →
+  WHERE (`hive::place` / `place_fan`; also no caller) and returns a `Deployment` whose `trail`
+  records each stage's decision and reason in order. Two rules live in the join: an ambiguous WHO
+  stops the pipeline before width or placement, and a worker that can write is never fanned over
+  its own lane. `hive::Job` gained `turns`, because a tool loop pays the link once per turn and
+  `place` was charging it once per job.
+
+**Still not built:** `deploy::plan` is a tested library with **no caller in the app yet** — the
+runtime half above is wired through `stage_lane`, but width and placement are still not consulted
+by `:agent` / `:fan-agent` (a `:deploy <task>` dry-run that prints the trail is the obvious first
+consumer). `Confinement` also carries the spec's `context`, `constraints` and `success` lists and
+the run does not use them yet. Open question 1 (the focusing-effect measurement) needs an actual run, not
 code. `hive.rs`'s placement logic (`Reach::Anywhere` vs `Colocated`) is untouched — there is no
 remote/multi-box dispatch path yet to exercise it. Per-branch staffing in a fan-out (today
 `:fan-agent`/`:docs` staff the WHOLE task once, not each branch's sub-task independently) is not
