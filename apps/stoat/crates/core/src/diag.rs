@@ -105,6 +105,8 @@ pub fn for_stop(stop: &Stop, frames: &[Frame], blame: usize, fault_addr: Option<
         StopReason::Watchpoint { id } => Diagnostic::new(Severity::Info, "watch", format!("watchpoint {id} triggered in `{}`", fname(blamed))),
         StopReason::StepDone => Diagnostic::new(Severity::Info, "step", format!("stepped to `{}`", fname(blamed))),
         StopReason::FunctionFinished => Diagnostic::new(Severity::Info, "finish", format!("returned to `{}`", fname(blamed))),
+        // No reason at all is what an attach produces; "stopped (stopped)" said nothing twice.
+        StopReason::Other(r) if r == "stopped" => Diagnostic::new(Severity::Info, "stop", format!("stopped in `{}`", fname(blamed))),
         StopReason::Other(r) => Diagnostic::new(Severity::Info, "stop", format!("stopped ({r}) in `{}`", fname(blamed))),
     };
     if let Some(f) = blamed {

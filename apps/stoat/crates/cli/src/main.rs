@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 use stoat_core::backend::*;
+use stoat_core::command;
+use stoat_core::driver::Driver;
 use stoat_core::gdb::{GdbBackend, GdbConfig};
 use stoat_core::model::RunState;
 use stoat_core::session::{Change, Session};
-use stoat_core::vitals::{self, Sampler, Vitals};
+use stoat_core::vitals::{self, Vitals};
 use stoat_core::{build, cache, discover, history};
 
 const USAGE: &str = "\
@@ -24,6 +26,9 @@ stoat run [opts] [BINARY [ARGS...]]    debug; with no BINARY, the top pick and i
     --marker LOC     frame-marker breakpoint for pacing (e.g. a present/swap function)
     --batch          run to the first stop, report, exit
     --wire           show every MI line exchanged with gdb
+stoat attach [--batch] [--wire] PID    debug a running process; quitting detaches and leaves it running
+stoat core [--batch] [--wire] BINARY COREFILE
+                                       open a core file: frames, locals and the crash diagnostic
 ";
 
 fn main() {
@@ -36,6 +41,10 @@ fn main() {
         Some("run") => {
             args.remove(0);
             run(args)
+        }
+        Some("attach") | Some("core") => {
+            let verb = args.remove(0);
+            load(&verb, args)
         }
         _ => {
             eprint!("{USAGE}");
@@ -135,7 +144,7 @@ enum Input {
 
 fn run(mut args: Vec<String>) -> i32 {
     let mut flag = |name: &str| args.iter().position(|a| a == name).map(|i| args.remove(i)).is_some();
-    let (want_build, batch, mut wire) = (flag("--build"), flag("--batch"), flag("--wire"));
+    let (want_build, batch, wire) = (flag("--build"), flag("--batch"), flag("--wire"));
     let marker = args.iter().position(|a| a == "--marker").map(|i| {
         args.remove(i);
         args.remove(i)
@@ -167,25 +176,75 @@ fn run(mut args: Vec<String>) -> i32 {
         (p, args, Vec::new(), is_rust)
     };
 
-    let (mut gdb, events) = match GdbBackend::spawn(&GdbConfig::default()) {
+    debug_loop(root, batch, wire, move |session, b| {
+        b.submit(Request::Load { program, args: prog_args, env, cwd: None });
+        if is_rust {
+            session.break_on_rust_panic(b);
+        }
+        if let Some(loc) = &marker {
+            session.insert_frame_marker(loc, b);
+        }
+        b.submit(Request::Run);
+    })
+}
+
+/// `stoat attach PID` and `stoat core BINARY COREFILE`.
+fn load(verb: &str, mut args: Vec<String>) -> i32 {
+    let mut flag = |name: &str| args.iter().position(|a| a == name).map(|i| args.remove(i)).is_some();
+    let (batch, wire) = (flag("--batch"), flag("--wire"));
+    let root = dir_arg(None);
+    match (verb, args.as_slice()) {
+        ("attach", [pid]) => {
+            let Ok(pid) = pid.parse::<u32>() else {
+                println!("attach wants a pid; `stoat attach 4242`");
+                return 2;
+            };
+            if let Some(why) = stoat_core::procs::attach_caveat(stoat_core::procs::ptrace_scope(Path::new("/proc"))) {
+                println!("note: {why}");
+            }
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+            let is_rust = exe.as_deref().and_then(discover::inspect).is_some_and(|f| f.is_rust);
+            debug_loop(root, batch, wire, move |session, b| {
+                b.submit(Request::Attach { pid });
+                if is_rust {
+                    session.break_on_rust_panic(b);
+                }
+            })
+        }
+        ("core", [program, core]) => {
+            let (program, core) = (PathBuf::from(program), PathBuf::from(core));
+            for f in [&program, &core] {
+                if !f.is_file() {
+                    println!("no such file: {}", f.display());
+                    return 1;
+                }
+            }
+            debug_loop(root, batch, wire, move |session, b| session.load_core(program, core, b))
+        }
+        _ => {
+            eprint!("{USAGE}");
+            2
+        }
+    }
+}
+
+/// One loop for every way in: events and stdin lines go to the Driver, Changes
+/// get printed. The Driver owns the vitals glue (sampler, freeze on stop, frame
+/// marks), which this file used to carry its own copy of.
+fn debug_loop(root: PathBuf, batch: bool, mut wire: bool, init: impl FnOnce(&mut Session, &mut dyn Backend)) -> i32 {
+    let (gdb, events) = match GdbBackend::spawn(&GdbConfig::default()) {
         Ok(x) => x,
         Err(e) => {
             println!("could not start gdb: {e}");
             return 1;
         }
     };
-    let mut session = Session::new(Some(root));
     let vit = Vitals::shared(1200, 1200);
-    let mut sampler = None;
-
-    gdb.submit(Request::Load { program, args: prog_args, env, cwd: None });
-    if is_rust {
-        session.break_on_rust_panic(&mut gdb);
-    }
-    if let Some(loc) = &marker {
-        session.insert_frame_marker(loc, &mut gdb);
-    }
-    gdb.submit(Request::Run);
+    let mut driver = Driver::new(Session::new(Some(root)), Box::new(gdb), vit.clone());
+    driver.with(|s, b| {
+        init(s, b);
+        Vec::new()
+    });
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn({
@@ -223,33 +282,23 @@ fn run(mut args: Vec<String>) -> i32 {
     for input in rx {
         let changes = match input {
             Input::Eof => break,
-            Input::Backend(ev) => session.handle(ev, &mut gdb),
+            Input::Backend(ev) => driver.handle(ev),
             Input::Line(l) => {
                 show_console = l.trim_start().starts_with('!');
-                match command(&l, &mut session, &mut gdb, &vit, &mut wire) {
-                Some(c) => {
-                    if c.is_empty() {
-                        prompt(&session);
+                match command(&l, &mut driver, &vit, &mut wire) {
+                    Some(c) => {
+                        if c.is_empty() {
+                            prompt(&driver.session);
+                        }
+                        c
                     }
-                    c
+                    None => break,
                 }
-                None => break,
-            }}
+            }
         };
+        let session = &driver.session;
         for c in changes {
             match c {
-                Change::Started { pid: Some(pid) } => {
-                    vit.lock().unwrap().reset();
-                    sampler = Some(Sampler::start(pid, Duration::from_millis(100), vit.clone()));
-                }
-                Change::State(RunState::Stopped) => {
-                    if let Some(pid) = session.pid {
-                        vitals::sample_now(pid, &vit);
-                    }
-                    vit.lock().unwrap().set_frozen(true);
-                }
-                Change::State(RunState::Running) => vit.lock().unwrap().set_frozen(false),
-                Change::FrameMark(at) => vit.lock().unwrap().mark_frame(at),
                 Change::Output { channel: Channel::Target, text } => print!("{text}"),
                 Change::Output { channel: Channel::Console, text } if show_console => print!("{text}"),
                 Change::Output { channel: Channel::Log, text } if wire => eprint!("{text}"),
@@ -263,8 +312,8 @@ fn run(mut args: Vec<String>) -> i32 {
                     }
                     reported = true;
                 }
-                Change::Selection(_) if reported => print_frame(&session),
-                Change::Locals { frame } => print_locals(&session, frame),
+                Change::Selection(_) if reported => print_frame(session),
+                Change::Locals { frame } => print_locals(session, frame),
                 Change::Value { expr, value } => println!("{expr} = {value}"),
                 Change::Gone(why) => {
                     println!("{why}");
@@ -275,14 +324,19 @@ fn run(mut args: Vec<String>) -> i32 {
         }
         let _ = std::io::stdout().flush();
         if batch && reported && (session.state == RunState::Exited || session.current_frame().is_some_and(|f| session.locals.contains_key(&f.level))) {
-            print_backtrace(&session);
+            print_backtrace(session);
             break;
         }
+        // A load that failed (no such pid, ptrace refused, not a core file) leaves
+        // nothing running and nothing stopped. --batch would otherwise wait for
+        // a stop that cannot come; it hung a 300 s harness call before this.
+        if batch && reported && session.state == RunState::NotStarted {
+            return 1;
+        }
         if reported && session.state != RunState::Running {
-            prompt(&session);
+            prompt(session);
         }
     }
-    drop(sampler);
     0
 }
 
@@ -305,48 +359,40 @@ fn print_backtrace(s: &Session) {
     }
 }
 
-/// None means quit.
-fn command(line: &str, s: &mut Session, b: &mut GdbBackend, vit: &vitals::Shared, wire: &mut bool) -> Option<Vec<Change>> {
+/// None means quit. Verbs that only make sense in a terminal live here; every
+/// other line is `stoat_core::command` - the same vocabulary the egui palette and
+/// its speech input use, so `up 3`, `p expr`, `b loc` and `! gdb...` mean one thing
+/// in all three.
+fn command(line: &str, d: &mut Driver, vit: &vitals::Shared, wire: &mut bool) -> Option<Vec<Change>> {
     let (cmd, rest) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
-    let thread = s.thread;
-    let mut out = Vec::new();
-    match cmd {
-        "" => {}
-        "q" | "quit" => return None,
-        "c" => drop(b.submit(Request::Continue)),
-        "r" => drop(b.submit(Request::Run)),
-        "i" => drop(b.submit(Request::Interrupt)),
-        "n" => drop(b.submit(Request::Step { kind: StepKind::Over, thread })),
-        "s" => drop(b.submit(Request::Step { kind: StepKind::Into, thread })),
-        "fin" => drop(b.submit(Request::Step { kind: StepKind::Out, thread })),
-        "u" | "up" => out = s.up(b),
-        "d" | "down" => out = s.down(b),
-        "f" => out = s.select_frame(rest.trim().parse().unwrap_or(s.selected), b),
-        "bt" => print_backtrace(s),
-        "l" => {
-            if let Some(f) = s.current_frame() {
-                print_locals(s, f.level);
+    const HELP: &str = "c r i n s fin | u [N] d [N] f N bt l | p EXPR | b LOC | t [N] | vitals | wire on/off | in TEXT | ! GDB-COMMAND | q";
+    match (cmd, rest.trim()) {
+        ("", _) => {}
+        ("q" | "quit", _) => return None,
+        ("bt", _) => print_backtrace(&d.session),
+        ("l", _) => {
+            if let Some(f) = d.session.current_frame() {
+                print_locals(&d.session, f.level);
             }
         }
-        "p" => s.evaluate(rest, b),
-        "b" => drop(b.submit(Request::InsertBreakpoint { location: rest.into() })),
-        "t" => match rest.trim().parse() {
-            Ok(id) => s.select_thread(id, b),
-            Err(_) => {
-                for t in &s.threads {
-                    println!("{} {:<3} {:<16} {}", if Some(t.id) == s.thread { ">" } else { " " }, t.id, t.name.as_deref().unwrap_or(""), t.top.as_ref().map(|f| f.location()).unwrap_or_default());
-                }
+        ("t", "") => {
+            let s = &d.session;
+            for t in &s.threads {
+                println!("{} {:<3} {:<16} {}", if Some(t.id) == s.thread { ">" } else { " " }, t.id, t.name.as_deref().unwrap_or(""), t.top.as_ref().map(|f| f.location()).unwrap_or_default());
             }
-        },
-        "vitals" => {
+        }
+        ("vitals", _) => {
             for l in vitals::summarize(&vit.lock().unwrap()) {
                 println!("{l}");
             }
         }
-        "wire" => *wire = rest.trim() != "off",
-        "in" => drop(b.submit(Request::TargetInput(format!("{rest}\n")))),
-        "!" => drop(b.submit(Request::Raw(rest.into()))),
-        _ => println!("c r i n s fin | u d f N bt l | p EXPR | b LOC | t [N] | vitals | wire on/off | in TEXT | ! GDB-COMMAND | q"),
+        ("wire", r) => *wire = r != "off",
+        ("in", _) => d.submit(Request::TargetInput(format!("{rest}\n"))),
+        _ => match command::parse(line) {
+            Some(c) if c.is_loader() => println!("`{}` starts a different session: quit, then `stoat run`, `stoat attach PID` or `stoat core BINARY COREFILE`", c.typed()),
+            Some(c) => return Some(d.execute(&c).unwrap_or_default()),
+            None => println!("{HELP}"),
+        },
     }
-    Some(out)
+    Some(Vec::new())
 }
