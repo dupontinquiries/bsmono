@@ -78,6 +78,19 @@ recorded here so the next app doesn't repeat them.
   click outside it; and rows must use `clicked_by(Primary)`, because egui's arrow-key focus navigation
   runs before you can consume the arrows and Enter then "clicks" whichever row took focus. First
   consumers: `apps/stoat/crates/gui-egui/src/palette.rs`, `apps/vidkit-player`.
+- **An error is `uikit_egui::callout`, not a card with red text in it.** A message drawn on the same
+  surface as everything around it, in the same small weak text, disappears into it — most of all on a
+  phone, where a page is one column. The callout gives it a different KIND of surface (severity tint
+  mixed opaquely into the card fill, accent stripe, severity border, soft shadow), a chip for the
+  severity and code so the title can be normal text at a readable size, tagged body lines, and a fold
+  so it stops costing a third of the screen once it has been read. Its colours are checked for contrast
+  in every palette the fleet ships. Around it, give a page more than one surface: `glass::card` for
+  what you operate, a darker recessed well for what you only read (source, logs), and spacing from
+  `tokens` (XS inside a group, SM after a card, MD inside one and above a section) rather than a number
+  per call site. Two egui traps this cost: a row is at least `interact_size.y` tall and that is fixed
+  when the row is CREATED, so a compact chip needs the floor lowered on the PARENT first; and padding is
+  not free on a phone — budget what it displaces (stoat folds the callout on navigation and shows ±3
+  source lines instead of ±6 under 420pt) and let a phone-size layout test tell you when you have not.
 - **The recurring bug worth naming: a fully-tested dialog struct with nobody drawing it.** Three separate
   dialogs in one app (`AddToPlaylist`, `EditTrack`, `ScanPicker`) each had a complete, unit-tested
   lifecycle — `open`/`close`/validation/`payload` — a real call site that called `.open(...)`, and *no
