@@ -56,6 +56,40 @@ impl Profile {
     }
 }
 
+/// Resolve a product type to its profile, the QML's three-step chain.
+///
+/// ```text
+/// productMap[product_type] || productMap["Unknown Type"] || { …hardcoded… }
+/// ```
+///
+/// All three steps matter and they are not interchangeable:
+///
+/// 1. **The product's own entry**, when the daemon sent one.
+/// 2. **The map's own `"Unknown Type"`**, which lets a deployment describe
+///    what an unrecognised device should look like without a rebuild. Skipping
+///    to the hardcoded default would ignore that.
+/// 3. **The hardcoded fallback** ([`Profile::default`]), for when the map is
+///    empty or unparseable — which the QML treats as normal, not as an error:
+///    its `JSON.parse` is wrapped in a `try` returning `{}`.
+///
+/// Takes an already-parsed map rather than a JSON string. The QML parses
+/// because it is handed one by the daemon; this crate has no JSON dependency
+/// and adding one to reach a lookup would be the wrong trade. Whoever plumbs
+/// the daemon in parses at that boundary, which is also where a parse failure
+/// can be reported rather than silently becoming `{}`.
+pub fn resolve_profile(
+    map: &std::collections::BTreeMap<String, Profile>,
+    product_type: Option<&str>,
+) -> Profile {
+    if let Some(p) = product_type.and_then(|t| map.get(t)) {
+        return p.clone();
+    }
+    if let Some(p) = map.get("Unknown Type") {
+        return p.clone();
+    }
+    Profile::default()
+}
+
 /// The control a top-level view needs, or `None` for one every product has.
 ///
 /// The QML drops a page from the swipe set entirely when a product lacks its
@@ -421,5 +455,65 @@ mod tests {
         assert_eq!(view_requires("Devices"), None);
         assert_eq!(view_requires("a view that does not exist"), None,
                    "an unknown view is always shown rather than always hidden");
+    }
+
+    fn map(entries: &[(&str, &[&str])]) -> std::collections::BTreeMap<String, Profile> {
+        entries.iter().map(|(k, ctrls)| {
+            (k.to_string(), Profile {
+                name: k.to_string(),
+                controls: ctrls.iter().map(|c| c.to_string()).collect(),
+                ..Default::default()
+            })
+        }).collect()
+    }
+
+    /// Step 1: the product's own entry wins.
+    #[test]
+    fn a_known_product_gets_its_own_profile() {
+        let m = map(&[("Beosound A5", &["volume", "mute", "eq"])]);
+        let p = resolve_profile(&m, Some("Beosound A5"));
+        assert_eq!(p.name, "Beosound A5");
+        assert!(p.has_control("eq"));
+    }
+
+    /// Step 2 is NOT skippable. A deployment can describe what an
+    /// unrecognised device looks like without a rebuild, and falling straight
+    /// to the hardcoded default would ignore that.
+    #[test]
+    fn an_unknown_product_prefers_the_maps_own_unknown_entry() {
+        let m = map(&[("Unknown Type", &["volume"])]);
+        let p = resolve_profile(&m, Some("Something Nobody Shipped"));
+        assert_eq!(p.name, "Unknown Type", "the map's entry, not the hardcoded one");
+        assert!(!p.has_control("eq"));
+    }
+
+    /// Step 3: an empty or unparseable map is NORMAL, not an error -- the
+    /// QML's JSON.parse is wrapped in a try returning `{}`.
+    #[test]
+    fn an_empty_map_falls_back_to_the_hardcoded_profile() {
+        let empty = std::collections::BTreeMap::new();
+        let p = resolve_profile(&empty, Some("Beosound A5"));
+        assert_eq!(p.name, Profile::default().name);
+        assert!(p.has_control("stream"), "the hardcoded fallback is permissive");
+    }
+
+    /// No product type reported yet -- the state at startup -- still resolves
+    /// rather than erroring, and still prefers the map's Unknown entry.
+    #[test]
+    fn a_missing_product_type_resolves_like_an_unknown_one() {
+        let m = map(&[("Unknown Type", &["volume"])]);
+        assert_eq!(resolve_profile(&m, None).name, "Unknown Type");
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(resolve_profile(&empty, None).name, Profile::default().name);
+    }
+
+    /// The chain end to end: an unrecognised product on a map that does not
+    /// describe one still shows every view, which is the failure mode that
+    /// matters -- a new speaker must not look broken.
+    #[test]
+    fn an_unrecognised_product_on_a_bare_map_still_shows_everything() {
+        let m = map(&[("Beosound A5", &["volume", "eq"])]);
+        let p = resolve_profile(&m, Some("Beolab 90"));
+        assert_eq!(views_for(&p, &crate::VIEWS).len(), crate::VIEWS.len());
     }
 }
