@@ -218,7 +218,7 @@ pub fn draw_lan(ctx: &egui::Context, lobby: &mut crate::lanlobby::LanLobby) -> c
             });
             ui.add_space(10.0);
             ui.label(egui::RichText::new(&lobby.status).size(15.0).color(Color32::from_rgb(190, 188, 178)));
-            ui.label(egui::RichText::new("Finding and joining a den works. Playing a match across machines does not yet: the match itself is not networked.").size(13.0).color(Color32::from_rgb(230, 170, 110)));
+            ui.label(egui::RichText::new("Hosting, finding and joining a den work, and the den counts who is in it. Playing a match across machines does not yet.").size(13.0).color(Color32::from_rgb(230, 170, 110)));
         });
     });
     action

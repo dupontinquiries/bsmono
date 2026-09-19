@@ -12,8 +12,12 @@
 //! exchange exists. The screen says so rather than pretending.
 
 use netcode::lan::{Announcer, Beacon, Browser, Found};
-use std::net::SocketAddr;
-use std::time::Instant;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::time::{Duration, Instant};
+
+/// A member who has not said HELLO for this long has left.
+pub const MEMBER_TIMEOUT: Duration = Duration::from_millis(4000);
+const HELLO_EVERY: Duration = Duration::from_millis(1000);
 
 pub const GAME: &str = "clawbound";
 /// Bump when the sim changes in a way two builds could not share a match.
@@ -45,6 +49,17 @@ pub struct LanLobby {
     browser: Result<Browser, String>,
     announcer: Option<Announcer>,
     pub hosting: bool,
+    /// The den's GAME socket. Bound when hosting starts, and its real port is
+    /// what the beacon advertises. The app used to pass port 0 here, which
+    /// `Beacon::decode` rejects -- so a den hosted from the actual game never
+    /// appeared on anyone's screen, and the test passed a made-up 41000.
+    game_sock: Option<UdpSocket>,
+    /// Who has joined this den: address, name, last heard.
+    pub roster: Vec<(SocketAddr, String, Instant)>,
+    /// The den this player has joined, and what the host last said.
+    pub joined: Option<(SocketAddr, String)>,
+    join_sock: Option<UdpSocket>,
+    last_hello: Option<Instant>,
     pub rows: Vec<Row>,
     /// One line for the screen's footer: what is going on, or what is wrong.
     pub status: String,
@@ -67,7 +82,7 @@ impl LanLobby {
             }
         });
         let status = browser.as_ref().err().cloned().unwrap_or_else(|| "Searching the local network...".into());
-        LanLobby { my_name: my_name.into(), my_id, browser, announcer: None, hosting: false, rows: Vec::new(), status }
+        LanLobby { my_name: my_name.into(), my_id, browser, announcer: None, hosting: false, game_sock: None, roster: Vec::new(), joined: None, join_sock: None, last_hello: None, rows: Vec::new(), status }
     }
 
     pub fn port(&self) -> Option<u16> {
@@ -78,7 +93,10 @@ impl LanLobby {
         self.hosting = on;
         if !on {
             self.announcer = None;
+            self.game_sock = None;
+            self.roster.clear();
         } else if self.announcer.is_none() {
+            self.bind_game_sock();
             match Announcer::new() {
                 Ok(a) => self.announcer = Some(a),
                 Err(e) => {
@@ -93,12 +111,75 @@ impl LanLobby {
     pub fn host_to(&mut self, to: Vec<SocketAddr>) {
         self.announcer = Announcer::to(to).ok();
         self.hosting = self.announcer.is_some();
+        self.bind_game_sock();
+    }
+
+    fn bind_game_sock(&mut self) {
+        if self.game_sock.is_none() {
+            self.game_sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).and_then(|s| s.set_nonblocking(true).map(|_| s)).ok();
+        }
+    }
+
+    pub fn players(&self) -> u8 {
+        1 + self.roster.len().min(SLOTS as usize - 1) as u8
+    }
+
+    /// Ask to join a den. Keeps saying HELLO once a second, which is also
+    /// the keep-alive: stop, and the host forgets you.
+    pub fn join(&mut self, host: SocketAddr) {
+        self.join_sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).and_then(|s| s.set_nonblocking(true).map(|_| s)).ok();
+        self.joined = Some((host, "asking...".into()));
+        self.last_hello = None;
+    }
+
+    pub fn leave(&mut self) {
+        self.joined = None;
+        self.join_sock = None;
     }
 
     /// Once a frame.
-    pub fn tick(&mut self, now: Instant, game_port: u16, players: u8) {
-        if let (true, Some(a)) = (self.hosting, self.announcer.as_mut()) {
-            a.tick(&Beacon { game: GAME.into(), host_id: self.my_id.clone(), name: format!("{}'s den", self.my_name), port: game_port, players, slots: SLOTS, proto: PROTO }, now);
+    pub fn tick(&mut self, now: Instant) {
+        // Hosting: answer HELLOs on the game socket, age the roster, announce.
+        if let (true, Some(sock)) = (self.hosting, self.game_sock.as_ref()) {
+            let mut buf = [0u8; 256];
+            for _ in 0..32 {
+                let Ok((n, from)) = sock.recv_from(&mut buf) else { break };
+                let Some(name) = std::str::from_utf8(&buf[..n]).ok().and_then(|t| t.strip_prefix("CBHELLO\t")) else { continue };
+                let name: String = name.chars().filter(|c| !c.is_control()).take(24).collect();
+                let room = self.roster.len() + 1 < SLOTS as usize;
+                if let Some(m) = self.roster.iter_mut().find(|m| m.0 == from) {
+                    m.2 = now;
+                } else if room {
+                    self.roster.push((from, name, now));
+                } else {
+                    let _ = sock.send_to(b"CBFULL", from);
+                    continue;
+                }
+                let _ = sock.send_to(format!("CBWELCOME\t{}\t{}", 1 + self.roster.len(), SLOTS).as_bytes(), from);
+            }
+            self.roster.retain(|m| now.duration_since(m.2) < MEMBER_TIMEOUT);
+        }
+        let (port, players) = (self.game_sock.as_ref().and_then(|s| s.local_addr().ok()).map_or(0, |a| a.port()), self.players());
+        if let (true, Some(a)) = (self.hosting && port != 0, self.announcer.as_mut()) {
+            a.tick(&Beacon { game: GAME.into(), host_id: self.my_id.clone(), name: format!("{}'s den", self.my_name), port, players, slots: SLOTS, proto: PROTO }, now);
+        }
+        // Joined somewhere: HELLO once a second, and listen for the answer.
+        if let (Some((host, said)), Some(sock)) = (self.joined.as_mut(), self.join_sock.as_ref()) {
+            if self.last_hello.map_or(true, |t| now.duration_since(t) >= HELLO_EVERY) {
+                let _ = sock.send_to(format!("CBHELLO\t{}", self.my_name).as_bytes(), *host);
+                self.last_hello = Some(now);
+            }
+            let mut buf = [0u8; 64];
+            while let Ok((n, from)) = sock.recv_from(&mut buf) {
+                if from != *host {
+                    continue;
+                }
+                match std::str::from_utf8(&buf[..n]).unwrap_or("").split('\t').collect::<Vec<_>>().as_slice() {
+                    ["CBWELCOME", p, s] => *said = format!("in the den ({p}/{s})"),
+                    ["CBFULL"] => *said = "the den is full".into(),
+                    _ => {}
+                }
+            }
         }
         let Ok(b) = self.browser.as_mut() else { return };
         let found: Vec<Found> = b.poll(now).to_vec();
@@ -116,8 +197,12 @@ impl LanLobby {
                 Row { name: f.beacon.name.clone(), players: f.beacon.players, slots: f.beacon.slots, addr: f.addr, joinable, note }
             })
             .collect();
+        if let Some((host, said)) = &self.joined {
+            self.status = format!("{host}: {said}");
+            return;
+        }
         self.status = match (self.hosting, self.rows.len()) {
-            (true, _) => format!("Hosting as \"{}'s den\" -- visible to this network.", self.my_name),
+            (true, _) => format!("Hosting as \"{}'s den\" -- {}/{} here, visible to this network.", self.my_name, self.players(), SLOTS),
             (false, 0) => "Searching the local network... no games yet.".into(),
             (false, n) => format!("{n} game{} on this network.", if n == 1 { "" } else { "s" }),
         };
@@ -147,15 +232,15 @@ mod tests {
         let mut host = LanLobby::open_on("Bramble", 0);
         let to = vec![(Ipv4Addr::LOCALHOST, seeker.port().expect("seeker is listening")).into()];
         let t0 = Instant::now();
-        seeker.tick(t0, 0, 1);
+        seeker.tick(t0);
         assert!(seeker.rows.is_empty() && seeker.status.contains("no games"), "{}", seeker.status);
         assert_eq!(seeker.click_join(0), Action::None, "nothing to click");
 
         host.host_to(to);
-        host.tick(t0, 41_000, 3);
+        host.tick(t0);
         assert!(host.status.contains("Hosting"), "{}", host.status);
         for _ in 0..50 {
-            seeker.tick(t0, 0, 1);
+            seeker.tick(t0);
             if !seeker.rows.is_empty() {
                 break;
             }
@@ -163,14 +248,43 @@ mod tests {
         }
         assert_eq!(seeker.rows.len(), 1, "{}", seeker.status);
         let r = &seeker.rows[0];
-        assert_eq!((r.name.as_str(), r.players, r.slots, r.joinable, r.note), ("Bramble's den", 3, SLOTS, true, ""));
-        assert_eq!(seeker.click_join(0), Action::Join((Ipv4Addr::LOCALHOST, 41_000).into()), "JOIN hands back the host's GAME socket");
+        assert_eq!((r.name.as_str(), r.players, r.slots, r.joinable, r.note), ("Bramble's den", 1, SLOTS, true, ""));
+        // The advertised port is the den's REAL game socket -- not the 0 the
+        // app used to pass, which no browser would ever have listed.
+        let Action::Join(addr) = seeker.click_join(0) else { panic!("not joinable") };
+        assert!(addr.port() != 0 && addr.ip() == Ipv4Addr::LOCALHOST);
+
+        // JOIN reaches it: the host counts us, tells us so, and says so to
+        // the whole network in its next beacon.
+        seeker.join(addr);
+        let t1 = t0 + netcode::lan::ANNOUNCE_EVERY;
+        for _ in 0..60 {
+            seeker.tick(t1);
+            host.tick(t1);
+            if host.players() == 2 && seeker.status.contains("in the den (2/") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        assert_eq!((host.players(), host.roster[0].1.as_str()), (2, "Ash"), "the host has Ash on its roster");
+        assert!(seeker.status.contains("in the den (2/10)"), "{}", seeker.status);
+        assert!(host.status.contains("2/10"), "{}", host.status);
+        // Stop saying HELLO and the host lets the slot go.
+        seeker.leave();
+        host.tick(t1 + MEMBER_TIMEOUT + Duration::from_millis(50));
+        assert_eq!(host.players(), 1, "a member who goes quiet is dropped");
         assert!(host.rows.is_empty(), "a host does not list itself");
 
         host.set_hosting(false);
-        let later = t0 + netcode::lan::STALE_AFTER + Duration::from_millis(50);
-        host.tick(later, 41_000, 3);
-        seeker.tick(later, 0, 1);
+        // Drain first. The host announced again during the handshake, and that
+        // datagram is still sitting in the seeker's socket: read NOW it counts
+        // as heard now. Staleness is measured from the last thing heard.
+        let t2 = t1 + MEMBER_TIMEOUT + Duration::from_millis(100);
+        std::thread::sleep(Duration::from_millis(20));
+        seeker.tick(t2);
+        let later = t2 + netcode::lan::STALE_AFTER + Duration::from_millis(50);
+        host.tick(later);
+        seeker.tick(later);
         assert!(seeker.rows.is_empty(), "the den closed and the row went with it");
     }
 

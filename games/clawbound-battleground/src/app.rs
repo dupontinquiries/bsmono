@@ -941,7 +941,7 @@ fn render(s: &mut AppState) {
             Screen::Select => ui::draw_select(ctx, &mut s.ui, &mut locked_in),
             Screen::Lan => {
                 if let Some(l) = s.lan.as_mut() {
-                    l.tick(Instant::now(), 0, 1);
+                    l.tick(Instant::now());
                     lan_action = ui::draw_lan(ctx, l);
                 }
             }
@@ -1044,9 +1044,10 @@ fn render(s: &mut AppState) {
         crate::lanlobby::Action::Join(addr) => {
             // Discovery ends here. There is no synchronised match to enter
             // yet, and the screen's footer says so; do not fake one.
-            eprintln!("[clawbound] LAN: chose the den at {addr}; the match itself is not networked yet");
+            // Joins the den's roster for real. It still does not start a
+            // synchronised match -- there is none -- and the footer says so.
             if let Some(l) = s.lan.as_mut() {
-                l.status = format!("Found {addr}. Playing across machines is not built yet.");
+                l.join(addr);
             }
         }
         crate::lanlobby::Action::None => {}
