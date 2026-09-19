@@ -238,6 +238,186 @@ pub fn run(draft: &mut MapDraft, author: &mut dyn MapAuthor) -> String {
     t
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Driving a MODEL. Three things taken from unendlich's voxel-tools
+// (`llm.rs`, `job.rs`), each of which it learned by being bitten:
+//
+// 1. The conversation is PAIRS, not a blob. `Completer::complete_chain`
+//    takes `prior: &[(user, reply)]` so a provider with a KV cache prefills
+//    only the new turn. `MapAuthor::next(&transcript)` above re-sends
+//    everything every turn; fine for a script, ruinous for `ai-gpu`.
+// 2. A model's reply is not a call. It is prose, a code fence, several calls,
+//    and sometimes half a call where the token budget ran out.
+// 3. Multi-turn building needs a PLAN with checkable goals and a readback of
+//    what is still unmet, or the model wanders and nothing says when to stop.
+
+/// The same shape as `voxel_tools::llm::Completer::complete_chain`, so an
+/// adapter over the real thing is one line and nothing here depends on it.
+pub trait ChainCompleter {
+    fn complete_chain(&mut self, system: &str, prior: &[(String, String)], user: &str) -> Result<String, String>;
+}
+
+pub const MAX_CALLS_PER_REPLY: usize = 8;
+pub const MAX_TURNS: usize = 40;
+const TOOLS: [&str; 5] = ["place", "survey", "undo", "validate", "done"];
+
+/// The calls in a reply, and whether it was cut off.
+///
+/// Prose and fences are skipped: only a line that STARTS with a tool name is
+/// a call. A final line with no newline after it and too few arguments is a
+/// reply that ran out of tokens mid-call; it is dropped and reported, because
+/// executing half a call and explaining a parse error to the model are both
+/// worse than saying "you were cut off".
+pub fn extract_calls(reply: &str) -> (Vec<String>, bool) {
+    let mut calls: Vec<String> = Vec::new();
+    for raw in reply.lines() {
+        let line = raw.trim().trim_start_matches(['>', '-', '*', '`']).trim();
+        let first = line.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+        if TOOLS.contains(&first.as_str()) && calls.len() < MAX_CALLS_PER_REPLY {
+            calls.push(line.trim_end_matches('`').trim().to_string());
+        }
+    }
+    let arity = |c: &str| match c.split_whitespace().next().map(str::to_ascii_lowercase).as_deref() {
+        Some("place") => 4,
+        Some("survey") => 4,
+        _ => 1,
+    };
+    let cut = !reply.ends_with('\n') && calls.last().is_some_and(|c| c.split_whitespace().count() < arity(c));
+    if cut {
+        calls.pop();
+    }
+    (calls, cut)
+}
+
+/// One thing the map must end up having, with a check a machine can run.
+pub struct Goal {
+    pub name: &'static str,
+    pub want: &'static str,
+    /// `Ok(how it stands)` when met, `Err(how far short)` when not.
+    pub check: fn(&MapDraft) -> Result<String, String>,
+}
+
+/// A plan: the goals, in the order they should be worked.
+pub struct Brief {
+    pub title: &'static str,
+    pub goals: Vec<Goal>,
+}
+
+impl Brief {
+    /// The centre of the map: the same things `midjungle`'s tests demand of
+    /// the Hollow I built by hand, stated as goals an author can be given.
+    pub fn hollow() -> Brief {
+        const R: f32 = crate::midjungle::HOLLOW_RADIUS;
+        fn near(d: &MapDraft) -> impl Iterator<Item = &Placement> {
+            d.placements.iter().filter(|p| p.x.hypot(p.z) < R)
+        }
+        Brief {
+            title: "the Hollow: a furnished centre within 21 u of the origin",
+            goals: vec![
+                Goal { name: "perches", want: "at least 6 things to leap onto, at 3 or more heights", check: |d| {
+                    let tops: Vec<i32> = near(d).filter(|p| p.kind.perch() != crate::blockers::Perch::None).map(|p| (p.kind.footprint().top * 2.0) as i32).collect();
+                    let kinds = tops.iter().collect::<std::collections::BTreeSet<_>>().len();
+                    if tops.len() >= 6 && kinds >= 3 { Ok(format!("{} perches at {kinds} heights", tops.len())) } else { Err(format!("{} of 6 perches, {kinds} of 3 heights", tops.len())) }
+                } },
+                Goal { name: "cover", want: "at least 8 fern or bush beds to stalk through", check: |d| {
+                    let n = near(d).filter(|p| matches!(p.kind, PropKind::Fern | PropKind::Bush)).count();
+                    if n >= 8 { Ok(format!("{n} beds")) } else { Err(format!("{n} of 8 beds")) }
+                } },
+                Goal { name: "room", want: "still at least 72% walkable: furnished, not filled", check: |d| {
+                    let b = d.blockers();
+                    let (mut open, mut cells) = (0, 0);
+                    let mut x = -R;
+                    while x < R {
+                        let mut z = -R;
+                        while z < R {
+                            if x.hypot(z) < R {
+                                cells += 1;
+                                open += !b.blocked(x, z, consts::GOD_RADIUS) as usize;
+                            }
+                            z += 1.5;
+                        }
+                        x += 1.5;
+                    }
+                    let pct = open * 100 / cells.max(1);
+                    if pct >= 72 { Ok(format!("{pct}% walkable")) } else { Err(format!("only {pct}% walkable: take something out")) }
+                } },
+            ],
+        }
+    }
+
+    /// What is done and what is not, for the top of every turn. This is what
+    /// keeps a long build pointed somewhere (voxel-tools' `Job::readback`).
+    pub fn readback(&self, d: &MapDraft) -> String {
+        let mut out = format!("BRIEF: {}\n", self.title);
+        for (i, g) in self.goals.iter().enumerate() {
+            match (g.check)(d) {
+                Ok(how) => out.push_str(&format!("  {}. [done] {} -- {how}\n", i + 1, g.name)),
+                Err(short) => out.push_str(&format!("  {}. [TODO] {}: {} -- {short}\n", i + 1, g.name, g.want)),
+            }
+        }
+        out
+    }
+
+    pub fn met(&self, d: &MapDraft) -> bool {
+        self.goals.iter().all(|g| (g.check)(d).is_ok())
+    }
+}
+
+/// Drive a model through a brief. Returns the transcript.
+///
+/// Each turn the model is sent the readback and the last results, and may
+/// answer with several calls. They run in order and STOP AT THE FIRST
+/// REFUSAL: later calls in the same reply were written assuming the earlier
+/// ones worked, and building on a placement that never happened is how a
+/// structure goes wrong three steps before anyone notices.
+pub fn run_chain(draft: &mut MapDraft, brief: &Brief, model: &mut dyn ChainCompleter) -> String {
+    let system = format!("{}\n\n{}", tools(), "Reply with tool calls only, one per line, at most 8. Work the TODO goals in order. Say `done` when every goal is done.");
+    let mut prior: Vec<(String, String)> = Vec::new();
+    let mut transcript = String::new();
+    let mut last = String::from("(nothing yet)");
+    for turn in 0..MAX_TURNS {
+        let user = format!("{}LAST RESULTS:\n{last}", brief.readback(draft));
+        let reply = match model.complete_chain(&system, &prior, &user) {
+            Ok(r) => r,
+            Err(e) => {
+                transcript.push_str(&format!("-- turn {turn}: the model failed: {e}\n"));
+                break;
+            }
+        };
+        let (calls, cut) = extract_calls(&reply);
+        let mut results = String::new();
+        let mut finished = false;
+        for c in &calls {
+            if c.eq_ignore_ascii_case("done") {
+                finished = true;
+                break;
+            }
+            match draft.call(c) {
+                Ok(s) => results.push_str(&format!("> {c}\nok: {s}\n")),
+                Err(e) => {
+                    results.push_str(&format!("> {c}\nREFUSED: {e}\n(the rest of that reply was not run)\n"));
+                    break;
+                }
+            }
+        }
+        if calls.is_empty() {
+            results.push_str("no tool call found in your reply; reply with lines like `place Rock -9 3.5`\n");
+        }
+        if cut {
+            results.push_str("your reply was cut off mid-call; the unfinished call was NOT run. Send fewer calls per reply.\n");
+        }
+        transcript.push_str(&format!("-- turn {turn}\n{results}"));
+        prior.push((user, reply));
+        last = results;
+        if finished || (brief.met(draft) && draft.validate().is_empty()) {
+            transcript.push_str(&format!("-- finished after {} turns: {}\n", turn + 1, if brief.met(draft) { "every goal met" } else { "the author said done with goals unmet" }));
+            break;
+        }
+    }
+    transcript.push_str(&brief.readback(draft));
+    transcript
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +482,70 @@ mod tests {
         assert!(refused.is_empty(), "my layout breaks {} of the rules I wrote for an AI:\n{}", refused.len(), refused.join("\n"));
         assert!(d.validate().is_empty(), "{:?}", d.validate());
         assert!(d.placements.len() > 40);
+    }
+
+    /// A stand-in for a model: canned replies, written the way models write.
+    struct Canned(Vec<&'static str>, Vec<usize>);
+    impl ChainCompleter for Canned {
+        fn complete_chain(&mut self, system: &str, prior: &[(String, String)], user: &str) -> Result<String, String> {
+            assert!(system.contains("survey") && user.contains("BRIEF:"), "the model is always told the tools and the brief");
+            self.1.push(prior.len());
+            self.0.get(prior.len()).map(|s| s.to_string()).ok_or("out of replies".into())
+        }
+    }
+
+    #[test]
+    fn a_reply_is_prose_fences_several_calls_and_sometimes_half_a_call() {
+        let (calls, cut) = extract_calls("Sure! I'll start with the rocks.\n```\nplace Rock -9 3.5\n- place Fern 10 2.5 0\n```\nThen I will survey the area.\nsurvey 0 0 20\n");
+        assert_eq!(calls, vec!["place Rock -9 3.5", "place Fern 10 2.5 0", "survey 0 0 20"], "prose mentioning a tool mid-sentence is not a call");
+        assert!(!cut);
+        let (calls, cut) = extract_calls("place Rock -9 3.5\nplace BoulderCluster -13");
+        assert_eq!((calls, cut), (vec!["place Rock -9 3.5".to_string()], true), "out of tokens mid-call: dropped, and said so");
+        let (calls, cut) = extract_calls("place Rock -9 3.5\nundo");
+        assert_eq!((calls.len(), cut), (2, false), "a complete last line with no newline is fine");
+        let many = "place Fern 1 9\n".repeat(30);
+        assert_eq!(extract_calls(&many).0.len(), MAX_CALLS_PER_REPLY);
+    }
+
+    /// The whole loop, against a canned model that behaves like a real one:
+    /// chatty, batches calls, makes a mistake mid-batch, gets cut off once.
+    #[test]
+    fn a_model_is_driven_through_a_brief_turn_by_turn() {
+        let mut model = Canned(vec![
+            "Let me look first.\nsurvey 0 0 21\n",
+            // the third call is on the lane; the fourth must NOT run
+            "```\nplace Rock -9 3.5\nplace BoulderCluster -13.5 9.5\nplace RuinPillar 0 15\nplace StoneHead 14 14\n```\n",
+            "place RuinPillar -9.5 15.5\nplace Fern 10 2.5\nplace Fern 16.5 3.5\nplace Fern -15.5 3\nplace Fern -7.5 10\nplace Bush",
+            "done",
+        ], Vec::new());
+        let mut d = MapDraft::default();
+        let brief = Brief::hollow();
+        assert!(brief.readback(&d).contains("[TODO] perches") && brief.readback(&d).contains("0 of 6 perches"));
+        let t = run_chain(&mut d, &brief, &mut model);
+        println!("{t}");
+        // Three turns, not four: the loop ends ITSELF once every goal is met and
+        // the map validates, without waiting for the model to say `done`. (I
+        // first asserted four here, as if it would not.)
+        assert_eq!(model.1, vec![0, 1, 2], "each turn sees exactly the turns before it: pairs, not a growing blob");
+        assert!(t.contains("from a lane's centreline") && t.contains("the rest of that reply was not run"));
+        assert!(!d.placements.iter().any(|p| p.kind == PropKind::StoneHead), "the call after a refusal did not run");
+        assert!(t.contains("cut off mid-call") && !d.placements.iter().any(|p| p.kind == PropKind::Bush), "half a call is not run");
+        assert!(t.contains("finished after 3 turns: every goal met"), "{t}");
+        assert!(t.contains("[done] perches -- 6 perches at 3 heights"), "three placements and their mirrors: {t}");
+        assert!(t.contains("[done] cover -- 8 beds") && t.contains("[done] room"));
+        // A model that dies is a line in the transcript, not a panic.
+        let t = run_chain(&mut MapDraft::default(), &brief, &mut Canned(vec![], Vec::new()));
+        assert!(t.contains("the model failed: out of replies"));
+    }
+
+    /// The brief is not easier than what I asked of myself: the Hollow I
+    /// built by hand meets it.
+    #[test]
+    fn the_hand_built_hollow_meets_the_brief_given_to_a_model() {
+        let mut d = MapDraft::default();
+        d.placements = crate::midjungle::layout();
+        let brief = Brief::hollow();
+        assert!(brief.met(&d), "{}", brief.readback(&d));
     }
 
     #[test]
