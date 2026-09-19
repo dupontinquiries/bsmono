@@ -117,7 +117,7 @@ impl Game {
         // now; the binding is a press, not a promise.
         for (i, aim) in std::mem::take(&mut self.leap_queue) {
             let Some(g) = self.gods.get_mut(i) else { continue };
-            if g.respawn_t > 0.0 || g.dash.is_some() {
+            if g.respawn_t > 0.0 || g.dash.is_some() || g.fall.is_some() {
                 continue;
             }
             // Bounding: from a perch, or buffered during a landing, the next
@@ -139,6 +139,7 @@ impl Game {
                 // A cat that dies mid-leap respawns on the ground.
                 self.gods[i].leap = None;
                 self.gods[i].perch = None;
+                self.gods[i].fall = None;
                 continue;
             }
             let speed = self.move_speed(i);
@@ -150,6 +151,7 @@ impl Game {
             if g.dash.is_some() {
                 g.leap = None;
                 g.perch = None;
+                g.fall = None;
             }
             if let Some(l) = &mut g.leap {
                 let (p, done) = l.tick(dt);
@@ -169,7 +171,8 @@ impl Game {
                 }
                 g.walk_anim += dt * 12.0;
             } else if dir.length_squared() > 0.0001 {
-                g.pos += dir.normalize() * speed * dt;
+                let on_ridge = g.perch.is_some() && g.perch_narrow;
+                g.pos += dir.normalize() * speed * if on_ridge { crate::leap::NARROW_SPEED } else { 1.0 } * dt;
                 let want = dir.z.atan2(dir.x);
                 let mut d = want - yaw_cur;
                 while d > std::f32::consts::PI {
@@ -196,24 +199,67 @@ impl Game {
                 // Standing on a prop: that prop is below the feet, so it
                 // does not push; its taller neighbours still do.
                 (None, Some(top)) => top,
-                _ if g.dash.is_some() => g.pos.y,
+                // Falling: what is below the paws does not push, so a cat
+                // drops past a wall's top and is only then shouldered clear.
+                _ if g.dash.is_some() || g.fall.is_some() => g.pos.y,
                 _ => f32::NEG_INFINITY,
             };
             g.pos = blockers.resolve_at(g.pos, GOD_RADIUS, feet);
             // Perch upkeep: still over the thing we are standing on?
             if let Some(top) = g.perch {
-                let under = blockers.all().iter().any(|b| {
-                    let (ax, az, r) = b.shape.nearest_axis(g.pos.x, g.pos.z);
-                    (b.top - top).abs() < 0.05 && (g.pos.x - ax).hypot(g.pos.z - az) < r + 0.15
-                });
-                if under {
-                    g.pos.y = top;
-                } else {
-                    g.perch = None; // walked off the edge
+                use crate::leap::{Fall, KNOCK_OFF_FRAC};
+                // Which way a cat goes over is not a choice it gets; derive
+                // it from state so replays agree.
+                let sign = if (g.hp as i32 + i as i32) % 2 == 0 { 1.0 } else { -1.0 };
+                match blockers.standing_on(g.pos.x, g.pos.z, top) {
+                    Some(kind) => {
+                        g.pos.y = top;
+                        g.perch_narrow = kind == crate::blockers::Perch::Narrow;
+                        // A ridge is a strong place to stand and a poor one
+                        // to be hit: a solid blow takes the footing. The cat
+                        // goes over on its back -- and lands on its feet.
+                        if g.perch_narrow && g.perch_hp - g.hp > KNOCK_OFF_FRAC * g.max_hp {
+                            let side = Vec3::new(-g.yaw.sin(), 0.0, g.yaw.cos()) * sign;
+                            g.pos += side * 0.6;
+                            g.perch = None;
+                            g.fall = Some(Fall::new(top, sign * 2.4));
+                        }
+                    }
+                    None => {
+                        // Off the edge. Walked: a hop down, upright all the
+                        // way. Dragged or shoved with no input: a tumble.
+                        let meant_it = g.move_dir.length_squared() > 0.01;
+                        g.perch = None;
+                        g.fall = Some(Fall::new(top, if meant_it { 0.0 } else { sign * 1.5 }));
+                    }
                 }
             }
-            if g.perch.is_none() && g.leap.is_none() && g.dash.is_none() && g.pos.y > 0.0 {
-                g.pos.y = (g.pos.y - crate::leap::STEP_OFF_FALL * dt).max(0.0);
+            g.perch_hp = g.hp;
+            if g.perch.is_none() && g.leap.is_none() && g.dash.is_none() {
+                if g.pos.y > 0.0 && g.fall.is_none() {
+                    g.fall = Some(crate::leap::Fall::new(g.pos.y, 0.0)); // e.g. a dash that ended in the air
+                }
+                if let Some(f) = &mut g.fall {
+                    let y0 = g.pos.y;
+                    let y1 = f.tick(y0, dt);
+                    // Whatever standable thing is under the paws catches
+                    // the fall: the rock below the wall, not the floor
+                    // below the rock.
+                    // ...and strictly BELOW where the fall began. Without
+                    // that, a cat knocked off a ridge "lands" back on it in
+                    // the same tick: a shove of 0.6 u does not clear a wall
+                    // 0.9 u in radius, and the integration test said so.
+                    let from_y = f.from_y;
+                    let under = blockers.landing_under(g.pos.x, g.pos.z, y0).filter(|u| u.0 < from_y - 0.05);
+                    let floor = under.map_or(0.0, |u| u.0);
+                    if y1 <= floor {
+                        g.pos.y = floor;
+                        g.leap = Some(crate::leap::LeapState::landing(g.pos, under, (f.from_y - floor).max(0.0)));
+                        g.fall = None;
+                    } else {
+                        g.pos.y = y1;
+                    }
+                }
             }
 
             // arena bounds

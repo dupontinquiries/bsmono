@@ -235,6 +235,10 @@ pub struct BodyAdjust {
     pub tail_lash: f32,
     /// Front half vs hind half vertical shear (spine arch in flight).
     pub arch: f32,
+    /// Front half rolled this much FURTHER toward upright than the hind
+    /// half, radians. The air-righting reflex is two turns: head and
+    /// forelegs come round first, the hindquarters follow.
+    pub twist: f32,
     /// Where pitch and roll pivot, `[x, y]` in the rig frame. The body
     /// centre for a tilt over terrain; the hind hips for a rear, or the
     /// haunches sink through the floor as the chest comes up.
@@ -332,7 +336,20 @@ pub fn slot_transforms(rig: &QuadRig, posed: &[PosedBox], legs: &[LegAdjust; 4],
     let c = rig_to_model();
     let to_model = Mat4::from_translation(rig.body_centre) * c;
     let from_model = c.transpose() * Mat4::from_translation(-rig.body_centre);
-    std::array::from_fn(|i| to_model * whole * rig_space[i] * from_model)
+    // The twist splits the body along the spine (the rig X axis through the
+    // centre): front slots lead by half of it, hind slots lag by half. The
+    // torso is one mesh and takes neither, which is where a real cat's spine
+    // would be doing the work.
+    let half = |sign: f32| rig_rotation([-body.twist * 0.5 * sign, 0.0, 0.0]);
+    let (front, hind) = (half(1.0), half(-1.0));
+    std::array::from_fn(|i| {
+        let part = match slot_from_index(i) {
+            Slot::Head | Slot::LegFL | Slot::LegFR => front,
+            Slot::Torso => Mat4::IDENTITY,
+            _ => hind,
+        };
+        to_model * whole * part * rig_space[i] * from_model
+    })
 }
 
 fn ratio(a: f32, b: f32) -> f32 {

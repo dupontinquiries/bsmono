@@ -57,7 +57,12 @@ pub enum LeapView {
     /// body can follow the arc without this module knowing the arc.
     Flight { t: f32, climb: f32 },
     /// Absorbing the landing. `perched`: came down on something narrow.
-    Land { t: f32, perched: bool },
+    /// `impact`: how hard, `0..=1`.
+    Land { t: f32, perched: bool, impact: f32 },
+    /// Falling, not leaping. `roll` is what is left of the tumble it began
+    /// with, `twist` how far the front half leads the hind, `speed` the
+    /// downward speed. The sim owns the righting curve; this draws it.
+    Fall { roll: f32, twist: f32, speed: f32 },
 }
 
 /// How this ancestor's basic attack reads on the body.
@@ -97,6 +102,8 @@ pub struct PuppetInput {
     pub leap: Option<LeapView>,
     /// Standing on something it jumped onto.
     pub perched: bool,
+    /// ...and that something is a ridge: a wall top, a pillar cap.
+    pub narrow: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -447,7 +454,8 @@ impl Puppet {
             Some(LeapView::Flight { t, climb }) => {
                 planted = [false; 4];
                 let t = t.clamp(0.0, 1.0);
-                body.pitch += finite_or(climb, 0.0).atan().clamp(-0.75, 0.75);
+                // A leap to a pillar cap is nearly vertical; let it look it.
+                body.pitch += finite_or(climb, 0.0).atan().clamp(-1.0, 1.2);
                 // Stretched out going up, gathered coming down.
                 let reach = 1.0 - smooth(t, 0.35, 0.8);
                 for l in &mut legs[0..2] {
@@ -463,11 +471,12 @@ impl Puppet {
                 m.leg_phases = Some(Gait::Bound.leg_phases());
                 m.swing_scale = 0.0; // the gait must not fight the pose
             }
-            Some(LeapView::Land { t, perched }) => {
+            Some(LeapView::Land { t, perched, impact }) => {
                 let k = (1.0 - t.clamp(0.0, 1.0)).powi(2);
-                drop += 0.34 * leg_len * k;
+                let impact = finite_or(impact, 0.6).clamp(0.0, 1.0);
+                drop += (0.16 + 0.30 * impact) * leg_len * k;
                 body.pitch -= 0.16 * k;
-                m.impact = m.impact.max(k);
+                m.impact = m.impact.max(k * impact);
                 if perched {
                     // Narrow footing: the body rocks and the tail goes the
                     // other way, harder, because that is what a tail is for.
@@ -476,11 +485,56 @@ impl Puppet {
                     body.tail_lash -= 0.30 * wob;
                 }
             }
+            Some(LeapView::Fall { roll, twist, speed }) => {
+                planted = [false; 4];
+                let roll = finite_or(roll, 0.0);
+                let turned = (roll.abs() / std::f32::consts::PI).min(1.0);
+                body.roll += roll;
+                body.twist = finite_or(twist, 0.0);
+                // Forelegs TUCK while the front half turns (a smaller moment
+                // turns faster) and the hind legs stay out; once upright all
+                // four spread to the air and then reach for the ground.
+                let reach = (finite_or(speed, 0.0) / 9.0).clamp(0.0, 1.0) * (1.0 - turned);
+                for l in &mut legs[0..2] {
+                    l.fold += 0.40 * turned;
+                    l.pitch += 0.35 * (1.0 - turned) + 0.25 * reach;
+                    l.splay += 0.40 * (1.0 - turned) * (1.0 - reach);
+                }
+                for l in &mut legs[2..4] {
+                    l.pitch += -0.35 * (1.0 - reach) + 0.15 * reach;
+                    l.splay += 0.40 * (1.0 - reach);
+                }
+                // Forepaws first.
+                body.pitch -= 0.22 * (1.0 - turned);
+                // The tail goes the OTHER way: it is the only thing a falling
+                // cat has to push against.
+                body.tail_lash -= (roll * 0.6).clamp(-1.2, 1.2);
+                body.tail_lift += 0.4;
+                body.arch += 0.06 * turned;
+                m.swing_scale = 0.0;
+            }
             None => {}
         }
         if inp.perched && inp.leap.is_none() {
-            body.tail_lash += (time * 1.3).sin() * 0.22;
-            body.tail_lift -= 0.25;
+            if inp.narrow {
+                // A ridge: paws in one line, a walk however fast, and the
+                // tail swinging against every step. This is the fence-top
+                // trot, and it is the tail that makes it read.
+                let step = self.anim.gait_phase.sin();
+                let go = (self.speed / 5.0).clamp(0.0, 1.0);
+                for l in &mut legs {
+                    l.splay -= 0.13;
+                }
+                if moving {
+                    m.leg_phases = Some(Gait::Walk.leg_phases());
+                }
+                body.roll += step * 0.035 * go;
+                body.tail_lash += -step * 0.50 * go + (time * 1.1).sin() * 0.20 * (1.0 - go);
+                body.tail_lift += 0.20;
+            } else {
+                body.tail_lash += (time * 1.3).sin() * 0.22;
+                body.tail_lift -= 0.25;
+            }
         }
 
         // ── pay for the body's height with the legs ───────────────────
@@ -527,6 +581,7 @@ impl Puppet {
         body.tail_lift = finite_or(body.tail_lift, 0.0).clamp(-0.9, 1.4);
         body.tail_lash = finite_or(body.tail_lash, 0.0).clamp(-1.3, 1.3);
         body.arch = finite_or(body.arch, 0.0);
+        body.twist = finite_or(body.twist, 0.0).clamp(-1.6, 1.6);
         PuppetPose { motion: m, legs, body, lift: finite_or(lift, 0.0) }
     }
 }
@@ -643,7 +698,7 @@ mod tests {
         )
     }
     fn input(pos: Vec3) -> PuppetInput {
-        PuppetInput { pos, yaw: 0.0, hp01: 1.0, atk_pulse: 0.0, strike_style: StrikeStyle::Swipe, leap: None, perched: false }
+        PuppetInput { pos, yaw: 0.0, hp01: 1.0, atk_pulse: 0.0, strike_style: StrikeStyle::Swipe, leap: None, perched: false, narrow: false }
     }
     fn settle(p: &mut Puppet, inp: &PuppetInput, r: &QuadRig, w: &dyn Probe, secs: f32) -> Vec<PuppetEvent> {
         let mut ev = Vec::new();
@@ -689,7 +744,7 @@ mod tests {
         let fern = World { step: |_, _| None, cover: |_, _| 0.9, water: |_, _| 0.0 };
         let flat = open();
         let gather = PuppetInput { leap: Some(LeapView::Gather { t: 1.0 }), ..input(Vec3::ZERO) };
-        let land = PuppetInput { leap: Some(LeapView::Land { t: 0.1, perched: false }), ..input(Vec3::ZERO) };
+        let land = PuppetInput { leap: Some(LeapView::Land { t: 0.1, perched: false, impact: 0.6 }), ..input(Vec3::ZERO) };
         let cases: [(&str, &dyn Probe, PuppetInput, [f32; 4]); 4] = [
             ("root under the forepaws", &root, input(Vec3::ZERO), [0.35, 0.35, 0.0, 0.0]),
             ("stalking in a fern", &fern, input(Vec3::ZERO), [0.0; 4]),
@@ -789,8 +844,8 @@ mod tests {
         assert!(pu.legs[0].pitch > 0.8 && pu.legs[2].pitch < -0.7, "stretched: forepaws reach, hind legs trail");
         assert!(pd.legs[2].fold > 0.3, "gathered: hind legs tuck for the landing");
 
-        let perch = |t: f32| p.pose(&PuppetInput { leap: Some(LeapView::Land { t, perched: true }), perched: true, ..g }, &r).body;
-        let ground = |t: f32| p.pose(&PuppetInput { leap: Some(LeapView::Land { t, perched: false }), ..g }, &r).body;
+        let perch = |t: f32| p.pose(&PuppetInput { leap: Some(LeapView::Land { t, perched: true, impact: 0.6 }), perched: true, ..g }, &r).body;
+        let ground = |t: f32| p.pose(&PuppetInput { leap: Some(LeapView::Land { t, perched: false, impact: 0.6 }), ..g }, &r).body;
         assert!((perch(0.11).roll - ground(0.11).roll).abs() > 0.05, "a perch landing rocks; a ground landing does not");
         assert!(perch(0.11).roll * (perch(0.11).tail_lash - ground(0.11).tail_lash) < 0.0, "the tail swings AGAINST the roll");
     }
@@ -834,6 +889,52 @@ mod tests {
             varied += (seen.len() >= 3) as usize;
         }
         assert!(varied >= 9, "only {varied}/13 ancestors have three or more cast styles");
+    }
+
+    /// The reflex, as drawn: the body carries the roll the sim reports, the
+    /// front half is ahead of the hind, the forelegs are tucked while it
+    /// turns, and the tail is thrown the other way.
+    #[test]
+    fn a_tumbling_cat_tucks_twists_and_throws_its_tail_the_other_way() {
+        let r = rig();
+        let p = Puppet::new(Build::feline());
+        let on_its_back = PuppetInput { leap: Some(LeapView::Fall { roll: 2.4, twist: 0.9, speed: 2.0 }), ..input(Vec3::ZERO) };
+        let upright = PuppetInput { leap: Some(LeapView::Fall { roll: 0.0, twist: 0.0, speed: 9.0 }), ..input(Vec3::ZERO) };
+        let (a, b) = (p.pose(&on_its_back, &r), p.pose(&upright, &r));
+        assert!(a.body.roll > 0.75 && a.body.twist > 0.8, "rolled, and twisting: {:?}", a.body);
+        assert!(a.body.tail_lash < -0.5, "tail against the roll: {}", a.body.tail_lash);
+        assert!(a.legs[0].fold > b.legs[0].fold + 0.2, "forelegs tucked while turning, out again once upright");
+        assert!(b.body.roll.abs() < 1e-3 && b.body.twist == 0.0);
+        assert!(b.body.pitch < -0.15 && b.legs[0].pitch > 0.4, "upright and close to the ground: nose down, forepaws reaching");
+        // And in the matrices: the front half really is turned further than the hind.
+        let mut posed = Vec::new();
+        creature_rig::pose(r.parts(), r.torso_half, &a.motion, None, &mut posed);
+        let m = crate::rigged::slot_transforms(&r, &posed, &a.legs, &a.body);
+        let up = |s: crate::rigged::Slot| m[s as usize].transform_vector3(Vec3::Y).normalize().y;
+        assert!(up(crate::rigged::Slot::Head) > up(crate::rigged::Slot::Tail0) + 0.3, "head is nearer upright than the tail: {} vs {}", up(crate::rigged::Slot::Head), up(crate::rigged::Slot::Tail0));
+    }
+
+    /// The fence-top walk: paws pulled into one line, and the tail swinging
+    /// against the steps rather than idling.
+    #[test]
+    fn on_a_ridge_the_paws_line_up_and_the_tail_counters_each_step() {
+        let r = rig();
+        let w = open();
+        let mut p = Puppet::new(Build::feline());
+        let mut lashes = Vec::new();
+        let mut splay = 0.0;
+        for f in 0..90 {
+            let inp = PuppetInput { perched: true, narrow: true, ..input(Vec3::new(f as f32 * 0.06, 3.0, 0.0)) };
+            p.advance(1.0 / 60.0, &inp, &r, &w, &mut Vec::new());
+            let pose = p.pose(&inp, &r);
+            lashes.push(pose.body.tail_lash);
+            splay = pose.legs[0].splay;
+        }
+        assert!(splay < -0.1, "paws drawn in under the body: {splay}");
+        let (lo, hi) = lashes[30..].iter().fold((f32::MAX, f32::MIN), |(a, b), x| (a.min(*x), b.max(*x)));
+        assert!(hi > 0.2 && lo < -0.2, "the tail works both sides while walking: {lo}..{hi}");
+        let flat = PuppetInput { perched: true, narrow: false, ..input(Vec3::new(5.4, 3.0, 0.0)) };
+        assert!(p.pose(&flat, &r).legs[0].splay > -0.01, "a boulder is not a ridge");
     }
 
     #[test]

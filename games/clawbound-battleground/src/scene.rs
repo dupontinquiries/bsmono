@@ -403,7 +403,7 @@ impl Scene {
             let def = game.def(i);
             let di = g.def_id as usize;
             let rig = &self.god_rig[di];
-            let leap = g.leap.as_ref().map(|l| l.view()).or_else(|| g.dash.as_ref().map(|d| {
+            let leap = g.leap.as_ref().map(|l| l.view()).or_else(|| g.fall.as_ref().map(|f| f.view())).or_else(|| g.dash.as_ref().map(|d| {
                 // The sim's dash arc is y = 1.4 a (1 - a); its slope over
                 // ground covered is what the body pitches along.
                 let a = (d.t / d.dur.max(1e-3)).clamp(0.0, 1.0);
@@ -418,6 +418,7 @@ impl Scene {
                 strike_style: if def.auto_range > 6.0 { StrikeStyle::Snap } else { StrikeStyle::Swipe },
                 leap,
                 perched: g.perch.is_some(),
+                narrow: g.perch.is_some() && g.perch_narrow,
             };
             let puppet = &mut vfx.puppets.puppets[i];
             puppet.advance(dt, &inp, rig, &world, &mut pevents);
@@ -611,7 +612,7 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
             // what stops the two drifting -- a prop that moves takes its
             // collision with it, and a new prop cannot be added without the
             // compiler asking which PropKind it is.
-            blockers.push_prop(PropKind::$kind, $x, $z, $y, 1.0);
+            blockers.push_placed(PropKind::$kind, $x, $z, $y, $q, 1.0);
             pieces.push(Piece { mesh: $mesh, pos: Vec3::new($x, $y, $z), quarter: $q, vsize: $vs, sway: 0.0 })
         }};
     }
@@ -725,7 +726,11 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     }
     for _ in 0..11 {
         if let Some((x, z)) = jungle_spot(&mut rng, 7.5) {
-            put!(FallenLog; props::fallen_log(0.85 + rng.f32() * 0.3), x, z, 0.0, (v % 4) as u8, V_MED);
+            // Not `put!`: the log's length is its scale, and the capsule
+            // has to be as long as the mesh.
+            let (ls, q) = (0.85 + rng.f32() * 0.3, (v % 4) as u8);
+            blockers.push_placed(PropKind::FallenLog, x, z, 0.0, q, ls);
+            pieces.push(Piece { mesh: props::fallen_log(ls), pos: Vec3::new(x, 0.0, z), quarter: q, vsize: V_MED, sway: 0.0 });
         }
         v += 1;
     }

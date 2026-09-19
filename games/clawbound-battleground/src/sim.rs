@@ -146,6 +146,12 @@ pub struct GodUnit {
     pub leap_cd: f32,
     /// Standing on a prop it leapt onto: that prop's top.
     pub perch: Option<f32>,
+    /// ...and it is a ridge (a wall top, a pillar cap), not a platform.
+    pub perch_narrow: bool,
+    /// HP last tick, to notice a hit big enough to take a cat's footing.
+    pub perch_hp: f32,
+    /// Airborne without a leap: stepped, dragged or knocked off something.
+    pub fall: Option<crate::leap::Fall>,
     pub recent_damagers: Vec<(usize, f32)>, // (god idx, time)
     pub move_dir: Vec3,
     pub attack_held: bool,
@@ -331,6 +337,9 @@ impl Game {
                 leap: None,
                 leap_cd: 0.0,
                 perch: None,
+                perch_narrow: false,
+                perch_hp: 0.0,
+                fall: None,
                 recent_damagers: Vec::new(),
                 move_dir: Vec3::ZERO,
                 attack_held: false,

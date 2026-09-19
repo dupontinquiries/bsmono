@@ -449,7 +449,28 @@ pub fn run_rig_sheet() -> Result<(), String> {
     }
     let sig_first = shots.len() - 2;
 
+    // A real wall from the scene: one cat trotting its top, one knocked off
+    // it a tenth of a second ago and halfway through righting itself.
+    let wall = scene.blockers.with_perch().find_map(|(b, p)| match (b.shape, p) {
+        (crate::blockers::Shape::Segment { x0, z0, x1, z1, .. }, crate::blockers::Perch::Narrow)
+            if (x1 - x0).hypot(z1 - z0) > 6.0 && x0.hypot(z0) < 120.0 => Some((Vec3::new(x0, b.top, z0), Vec3::new(x1, b.top, z1))),
+        _ => None,
+    });
+    let wall_shot = shots.len();
+    if let Some((a, b)) = wall {
+        let mid = (a + b) * 0.5;
+        let along = (b - a).normalize_or_zero();
+        let side = Vec3::new(-along.z, 0.0, along.x);
+        shots.push(Shot { name: "rig_wall_and_fall.png", eye: mid + side * 8.0 + Vec3::Y * 3.5, look: mid - Vec3::Y * 0.6 });
+    }
+    println!("wall at {wall:?}");
+    // CLAWBOUND_SHEET=wall,sig_0 renders only the shots whose names match.
+    let only: Vec<String> = std::env::var("CLAWBOUND_SHEET").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
+
     for (si, shot) in shots.iter().enumerate() {
+        if !only.is_empty() && !only.iter().any(|o| shot.name.contains(o.as_str())) {
+            continue;
+        }
         let mut game = if si == sig_first + 1 {
             Game::new(6, [7, 8, 9, 10], [11, 12, 0, 1, 2])
         } else {
@@ -496,6 +517,28 @@ pub fn run_rig_sheet() -> Result<(), String> {
                     let g = &mut game.gods[0];
                     g.yaw = dir.z.atan2(dir.x);
                     g.pos = a - dir * 1.2 + dir * (step as f32 * (2.0 / 60.0));
+                }
+                k if k == wall_shot => {
+                    let (a, b) = wall.unwrap();
+                    let along = (b - a).normalize_or_zero();
+                    let side = Vec3::new(-along.z, 0.0, along.x);
+                    // On the ridge, as the sim holds a perched cat.
+                    let g = &mut game.gods[0];
+                    g.yaw = along.z.atan2(along.x);
+                    g.pos = a + along * (1.0 + step as f32 * (4.0 / 60.0));
+                    g.perch = Some(a.y);
+                    g.perch_narrow = true;
+                    // Knocked off 0.12 s ago: most of the way over, front leading.
+                    let mut fall = crate::leap::Fall::new(a.y, 2.4);
+                    fall.t = 0.12;
+                    fall.vy = -3.6;
+                    let g = &mut game.gods[1];
+                    g.yaw = along.z.atan2(along.x);
+                    g.pos = a + along * 7.5 + side * 2.2 + Vec3::Y * (-a.y * 0.0 - 0.25);
+                    g.fall = Some(fall);
+                    for gi in 2..game.gods.len() {
+                        game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
+                    }
                 }
                 k if k >= sig_first => {
                     let count = if k == sig_first { 6 } else { 7 };

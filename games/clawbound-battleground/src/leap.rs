@@ -19,32 +19,61 @@
 //! is and whether a boulder stops it. The wiggle, the stretch and the wobble
 //! are `puppet`'s, read through [`LeapState::view`].
 
+//! ## Scaled to a cat, not to a player capsule
+//!
+//! The first version of this capped a landing at 2.4 u and called anything
+//! taller a wall. An ancestor stands 1.1 u at the shoulder. A house cat
+//! clears five to six times its own height from a standstill, runs fence
+//! tops, and turns over in the air to land on its feet — so the cap was a
+//! person's jump in a cat's body. Now:
+//!
+//! * [`LEAP_UP`] is 5.5 u — five shoulder heights — and is measured from
+//!   where the cat is STANDING, so a rock is a step toward a colossus head.
+//! * What can be landed on is [`Perch`], a property of the prop. A ruin wall
+//!   is a destination. A pine is not, at any height.
+//! * A [`Perch::Narrow`] top is walked at nearly full speed. What it costs is
+//!   footing: a solid hit knocks a cat off it ([`KNOCK_OFF_FRAC`]).
+//! * Any fall is survived. A cat that leaves a perch without meaning to
+//!   starts the fall on its side or its back ([`Fall::tumble`]) and is
+//!   upright again inside [`RIGHTING_SECS`], front half first.
+
 use glam::Vec3;
 
-use crate::blockers::Blockers;
+use crate::blockers::{Blockers, Perch};
 use crate::puppet::LeapView;
 
-/// Shortest and longest ground distance a leap covers.
-pub const LEAP_MIN: f32 = 2.0;
-pub const LEAP_RANGE: f32 = 7.5;
-/// Tallest thing a cat lands on. A rock is 1.4, a boulder cluster 2.0, a
-/// fallen log 0.9; a ruin pillar (4.0) and any tree are out.
-pub const PERCH_MAX_TOP: f32 = 2.4;
-/// Too small to stand on.
+/// Shortest and longest ground distance a leap covers. About four body
+/// lengths: a cat's long jump, not its record.
+pub const LEAP_MIN: f32 = 1.5;
+pub const LEAP_RANGE: f32 = 9.0;
+/// How far UP a leap reaches, from the cat's own feet.
+pub const LEAP_UP: f32 = 5.5;
+/// Things that cannot be stood on are sailed over if they top out below
+/// this above the feet; above it they are walls.
+pub const CLEAR_OVER: f32 = 2.2;
+/// A solid hit of this fraction of max HP takes a cat's footing on a
+/// narrow perch.
+pub const KNOCK_OFF_FRAC: f32 = 0.10;
+/// Too small to put four paws on.
 pub const PERCH_MIN_RADIUS: f32 = 0.5;
+pub const GRAVITY: f32 = 30.0;
+/// The air-righting reflex: fully upright this long into any fall. A real
+/// cat needs about a third of a second, which is roughly half a metre.
+pub const RIGHTING_SECS: f32 = 0.30;
 /// How far off the aim line a perch can be and still be "what I meant".
 pub const AIM_SLACK: f32 = 1.3;
 pub const GATHER_SECS: f32 = 0.18;
 /// From a perch, or buffered during a landing: already coiled.
 pub const CHAIN_GATHER_SECS: f32 = 0.06;
 pub const LAND_SECS: f32 = 0.20;
-pub const LEAP_SPEED: f32 = 15.0;
+pub const LEAP_SPEED: f32 = 16.0;
 pub const LEAP_COOLDOWN: f32 = 1.6;
 /// Rise above the higher of the two ends, plus a share of the distance.
 const APEX_BASE: f32 = 0.7;
 const APEX_PER_UNIT: f32 = 0.11;
-/// How fast a cat drops when it walks off a perch.
-pub const STEP_OFF_FALL: f32 = 11.0;
+/// Speed along a narrow top, as a fraction of normal. Barely a cost — they
+/// are good at this — but a wall is not somewhere to sprint.
+pub const NARROW_SPEED: f32 = 0.85;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -65,6 +94,9 @@ pub struct LeapState {
     pub apex: f32,
     /// Landing on something: its top, which is also `to.y`.
     pub perch: Option<f32>,
+    pub narrow: bool,
+    /// How hard the landing is, `0..=1`, for the body to absorb.
+    pub impact: f32,
 }
 
 /// Where a leap would go.
@@ -72,14 +104,60 @@ pub struct LeapState {
 pub struct Plan {
     pub to: Vec3,
     pub perch: Option<f32>,
+    pub narrow: bool,
+}
+
+/// Airborne without a leap: walked off an edge, dragged off one, or knocked.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fall {
+    pub vy: f32,
+    pub t: f32,
+    /// Roll at the moment of leaving, radians. 0 for a deliberate hop down;
+    /// up to a full half-turn for a cat knocked off a wall on its back.
+    pub tumble: f32,
+    pub from_y: f32,
+}
+
+impl Fall {
+    pub fn new(from_y: f32, tumble: f32) -> Fall {
+        Fall { vy: 0.0, t: 0.0, tumble, from_y }
+    }
+
+    /// Roll remaining at time `t`. Smoothstep to zero over RIGHTING_SECS,
+    /// whatever it started at: the reflex does not take longer for a worse
+    /// start, the cat just turns faster.
+    pub fn roll(&self) -> f32 {
+        let k = (self.t / RIGHTING_SECS).clamp(0.0, 1.0);
+        self.tumble * (1.0 - k * k * (3.0 - 2.0 * k))
+    }
+
+    /// How far the front half leads the hind half, radians. The reflex is
+    /// two turns, not one: head and forelegs come round first and the
+    /// hindquarters follow. Peaks mid-righting, zero at both ends.
+    pub fn twist(&self) -> f32 {
+        let k = (self.t / RIGHTING_SECS).clamp(0.0, 1.0);
+        self.tumble * 0.45 * (std::f32::consts::PI * k).sin()
+    }
+
+    pub fn tick(&mut self, y: f32, dt: f32) -> f32 {
+        self.t += dt;
+        self.vy -= GRAVITY * dt;
+        y + self.vy * dt
+    }
+
+    pub fn view(&self) -> LeapView {
+        LeapView::Fall { roll: self.roll(), twist: self.twist(), speed: -self.vy }
+    }
 }
 
 /// Choose a landing for a leap from `pos` along `dir` (xz; need not be unit).
 ///
-/// A perch wins over open ground whenever one is near the aim line, because
-/// "I pressed leap while looking at a rock" means the rock. Among perches the
-/// NEAREST along the line wins, not the best-centred: the far one is the
-/// next leap.
+/// The aim is marched outward. The FIRST standable, reachable thing near the
+/// line wins — "I pressed leap looking at the wall" means the wall, and the
+/// rock behind it is the next leap. The landing is the point of its spine
+/// nearest the line, so a wall is landed on where it was aimed at, not at
+/// its midpoint. Anything unstandable and too tall to sail over ends the
+/// march: no landing beyond it, no perch behind it.
 pub fn plan(pos: Vec3, dir: Vec3, standing_on: Option<f32>, blockers: &Blockers) -> Option<Plan> {
     let d = Vec3::new(dir.x, 0.0, dir.z);
     let len = d.length();
@@ -87,60 +165,43 @@ pub fn plan(pos: Vec3, dir: Vec3, standing_on: Option<f32>, blockers: &Blockers)
         return None;
     }
     let d = d / len;
-
-    // Anything too tall to land on is a WALL: a leap neither lands beyond it
-    // nor picks a perch behind it. Without this a cat aimed at a pillar
-    // planned a landing on its far side and was shoved round it in mid-air.
     let body = crate::consts::GOD_RADIUS;
-    let mut wall = f32::INFINITY;
-    let mut s = 0.5;
-    while s <= LEAP_RANGE && wall.is_infinite() {
+    let feet = pos.y.max(0.0);
+    let underfoot = |b: &crate::blockers::Blocker| {
+        let (ax, az, r) = b.shape.nearest_axis(pos.x, pos.z);
+        standing_on.is_some() && (b.top - feet).abs() < 0.1 && (pos.x - ax).hypot(pos.z - az) < r + 0.2
+    };
+
+    let mut wall = LEAP_RANGE;
+    let mut s = 0.25;
+    'march: while s <= LEAP_RANGE {
         let (x, z) = (pos.x + d.x * s, pos.z + d.z * s);
-        for b in blockers.all() {
-            if b.top > PERCH_MAX_TOP {
-                let (ax, az, r) = b.shape.nearest_axis(x, z);
-                if (x - ax).hypot(z - az) < r + body {
-                    wall = s;
-                    break;
+        for (b, perch) in blockers.with_perch() {
+            if !b.top.is_finite() || underfoot(b) {
+                continue;
+            }
+            let (ax, az, r) = b.shape.nearest_axis(x, z);
+            let off = (x - ax).hypot(z - az);
+            let rise = b.top - feet;
+            let landable = perch != Perch::None && rise <= LEAP_UP && r >= PERCH_MIN_RADIUS;
+            if landable {
+                if s >= LEAP_MIN && off < r * 0.5 + AIM_SLACK * 0.5 {
+                    return Some(Plan { to: Vec3::new(ax, b.top, az), perch: Some(b.top), narrow: perch == Perch::Narrow });
                 }
+            } else if rise > CLEAR_OVER && off < r + body {
+                wall = s - 0.5;
+                break 'march;
             }
         }
-        s += 0.5;
+        s += 0.25;
     }
 
-    let mut best: Option<(f32, Plan)> = None;
-    for b in blockers.all() {
-        if !(b.top > 0.3 && b.top <= PERCH_MAX_TOP) {
-            continue;
-        }
-        let (ax, az, r) = b.shape.nearest_axis(pos.x + d.x * LEAP_RANGE * 0.5, pos.z + d.z * LEAP_RANGE * 0.5);
-        if r < PERCH_MIN_RADIUS {
-            continue;
-        }
-        let rel = Vec3::new(ax - pos.x, 0.0, az - pos.z);
-        let along = rel.dot(d);
-        let off = (rel - d * along).length();
-        if !(LEAP_MIN..=LEAP_RANGE.min(wall)).contains(&along) || off > AIM_SLACK + r * 0.5 {
-            continue;
-        }
-        // Not the thing we are already standing on.
-        if standing_on.is_some() && rel.length() < r {
-            continue;
-        }
-        if best.map_or(true, |(a, _)| along < a) {
-            best = Some((along, Plan { to: Vec3::new(ax, b.top, az), perch: Some(b.top) }));
-        }
-    }
-    if let Some((_, p)) = best {
-        return Some(p);
-    }
-
-    // Open ground: full range, pulled in until the landing is clear.
-    let mut reach = LEAP_RANGE.min(wall - 0.5);
+    // Open ground: as far as the wall allows, pulled in until the landing is clear.
+    let mut reach = wall;
     while reach >= LEAP_MIN {
         let (x, z) = (pos.x + d.x * reach, pos.z + d.z * reach);
-        if !blockers.blocked(x, z, crate::consts::GOD_RADIUS) {
-            return Some(Plan { to: Vec3::new(x, 0.0, z), perch: None });
+        if !blockers.blocked(x, z, body) {
+            return Some(Plan { to: Vec3::new(x, 0.0, z), perch: None, narrow: false });
         }
         reach -= 0.5;
     }
@@ -156,9 +217,30 @@ impl LeapState {
             from,
             to: plan.to,
             gather: if chained { CHAIN_GATHER_SECS } else { GATHER_SECS },
-            flight: (run / LEAP_SPEED).clamp(0.28, 0.6),
+            // A steep leap is slower than its ground distance suggests.
+            flight: ((run + (plan.to.y - from.y).abs() * 0.6) / LEAP_SPEED).clamp(0.28, 0.75),
             apex: APEX_BASE + APEX_PER_UNIT * run,
             perch: plan.perch,
+            narrow: plan.narrow,
+            impact: 0.6,
+        }
+    }
+
+    /// A landing with no leap before it: the end of a fall. `fell` is the
+    /// height dropped; it sets how deep the crouch is, and nothing else —
+    /// a cat is not hurt by any drop this map has.
+    pub fn landing(at: Vec3, perch: Option<(f32, Perch)>, fell: f32) -> LeapState {
+        LeapState {
+            phase: Phase::Land,
+            t: 0.0,
+            from: at,
+            to: at,
+            gather: GATHER_SECS,
+            flight: 0.3,
+            apex: 0.0,
+            perch: perch.map(|p| p.0),
+            narrow: matches!(perch, Some((_, Perch::Narrow))),
+            impact: (0.35 + fell / 8.0).clamp(0.35, 1.0),
         }
     }
 
@@ -208,7 +290,7 @@ impl LeapState {
                 let a = (self.t / self.flight).clamp(0.0, 1.0);
                 LeapView::Flight { t: a, climb: self.climb(a) }
             }
-            Phase::Land => LeapView::Land { t: (self.t / LAND_SECS).clamp(0.0, 1.0), perched: self.perch.is_some() },
+            Phase::Land => LeapView::Land { t: (self.t / LAND_SECS).clamp(0.0, 1.0), perched: self.narrow, impact: self.impact },
         }
     }
 
@@ -225,53 +307,82 @@ mod tests {
 
     fn world() -> Blockers {
         let mut b = Blockers::new(100.0, 6.0);
-        b.push_prop(PropKind::Rock, 5.0, 0.0, 0.0, 1.0); // top 1.4, 5 u ahead
-        b.push_prop(PropKind::BoulderCluster, 10.5, 0.4, 0.0, 1.0); // top 2.0, the next hop
-        b.push_prop(PropKind::RuinPillar, 0.0, 5.0, 0.0, 1.0); // top 4.0: not a perch
+        b.push_prop(PropKind::Rock, 5.0, 0.0, 0.0, 1.0); // Flat, 1.4
+        b.push_prop(PropKind::ColossusHead, 12.0, 0.0, 0.0, 1.0); // Flat, 6.0: out of reach from the floor
+        b.push_prop(PropKind::RuinPillar, 0.0, 5.0, 0.0, 1.0); // Narrow, 4.0
+        b.push_prop(PropKind::Pine, -5.0, 0.0, 0.0, 1.0); // blocks to 3.0, stands nobody
         b.push_prop(PropKind::Fern, 0.0, -5.0, 0.0, 1.0); // cover only
+        // a wall running along x at z = -12, seen side-on from the origin
+        b.push_segment(PropKind::RuinWall, -8.0, -12.0, 8.0, -12.0, 0.0, 1.0);
         b
     }
 
     #[test]
     fn a_leap_toward_a_rock_lands_on_the_rock() {
         let p = plan(Vec3::ZERO, Vec3::new(1.0, 0.0, 0.1), None, &world()).unwrap();
-        assert_eq!(p.perch, Some(1.4));
+        assert_eq!((p.perch, p.narrow), (Some(1.4), false));
         assert!((p.to - Vec3::new(5.0, 1.4, 0.0)).length() < 1e-3, "aimed near it, landed ON it: {}", p.to);
     }
 
-    /// Both directions matter: a pillar must not be a perch, and neither
-    /// must a fern — one is too tall and the other is not there.
+    /// The correction this module was rewritten for. A 4 u pillar is a
+    /// destination for an animal that jumps five times its height.
     #[test]
-    fn pillars_and_ferns_are_not_perches() {
-        let at_pillar = plan(Vec3::ZERO, Vec3::Z, None, &world()).unwrap();
-        assert_eq!(at_pillar.perch, None);
-        assert!(at_pillar.to.z < 5.0 - 0.8, "and the ground landing stops short of it: {}", at_pillar.to);
-        let at_fern = plan(Vec3::ZERO, -Vec3::Z, None, &world()).unwrap();
+    fn a_cat_leaps_to_the_top_of_a_pillar_four_times_its_height() {
+        let p = plan(Vec3::ZERO, Vec3::Z, None, &world()).unwrap();
+        assert_eq!((p.perch, p.narrow), (Some(4.0), true), "the pillar cap, and it is a narrow one");
+        let l = LeapState::begin(Vec3::ZERO, p, false);
+        let peak = (0..=30).map(|i| l.arc(i as f32 / 30.0).y).fold(0.0f32, f32::max);
+        assert!(peak > 4.0 && peak < 6.5, "rises past the cap and comes down onto it: {peak}");
+        assert!(l.climb(0.0) > 0.9, "and it goes UP: climb {}", l.climb(0.0));
+    }
+
+    /// Standable is not "short". A pine blocks to 3 u, under the reach, and
+    /// must still stop a leap rather than catch it; a fern must do neither.
+    #[test]
+    fn a_tree_is_a_wall_and_a_fern_is_nothing() {
+        let at_pine = plan(Vec3::ZERO, -Vec3::X, None, &world()).unwrap();
+        assert_eq!(at_pine.perch, None, "nobody lands on a pine");
+        assert!(at_pine.to.x > -5.0 + 0.75, "and the landing stops short of the trunk: {}", at_pine.to);
+        let at_fern = plan(Vec3::ZERO, Vec3::new(0.6, 0.0, -1.0), None, &world()).unwrap();
         assert_eq!(at_fern.perch, None);
-        assert!((at_fern.to.z + LEAP_RANGE).abs() < 1e-3, "ferns do not shorten a leap");
+    }
+
+    /// A wall is landed on WHERE IT WAS AIMED AT. The first planner took the
+    /// spine point nearest the ray's midpoint, which for a long wall seen
+    /// at an angle is somewhere else entirely.
+    #[test]
+    fn a_wall_is_landed_on_where_the_aim_crosses_it() {
+        let from = Vec3::new(3.0, 0.0, -5.0);
+        let p = plan(from, Vec3::new(0.4, 0.0, -1.0), None, &world()).unwrap();
+        assert_eq!((p.perch, p.narrow), (Some(3.0), true));
+        assert!((p.to.z + 12.0).abs() < 1e-3, "on the ridge: {}", p.to);
+        // The ray x = 3 + 0.4 t, z = -5 - t meets z = -12 at x = 5.8; the
+        // march stops a little early, where the ridge first comes in reach.
+        assert!((5.0..=5.9).contains(&p.to.x), "where the aim meets the wall, not its middle (0) or its end (8): x = {}", p.to.x);
+    }
+
+    /// Reach is from the feet. Both directions: out of reach from the
+    /// floor, in reach from the rock.
+    #[test]
+    fn a_rock_is_a_step_toward_something_higher() {
+        let w = world();
+        let from_floor = plan(Vec3::new(6.0, 0.0, 0.0), Vec3::X, None, &w);
+        assert!(from_floor.map_or(true, |p| p.perch.is_none()), "6.0 u is past 5.5 from the ground: {from_floor:?}");
+        let from_rock = plan(Vec3::new(5.0, 1.4, 0.0), Vec3::X, Some(1.4), &w).unwrap();
+        assert_eq!(from_rock.perch, Some(6.0), "4.6 u up from the rock: reachable, and not the rock underfoot");
     }
 
     #[test]
-    fn from_a_perch_the_next_rock_is_chosen_not_the_one_underfoot() {
-        let on_rock = Vec3::new(5.0, 1.4, 0.0);
-        let p = plan(on_rock, Vec3::X, Some(1.4), &world()).unwrap();
-        assert_eq!(p.perch, Some(2.0));
-        assert!((p.to.x - 10.5).abs() < 1e-3);
-    }
-
-    #[test]
-    fn the_arc_starts_and_ends_where_it_says_and_clears_both_ends() {
-        let plan = Plan { to: Vec3::new(6.0, 1.4, 0.0), perch: Some(1.4) };
+    fn the_arc_starts_and_ends_where_it_says() {
+        let plan = Plan { to: Vec3::new(6.0, 1.4, 0.0), perch: Some(1.4), narrow: false };
         let l = LeapState::begin(Vec3::ZERO, plan, false);
         assert!((l.arc(0.0) - l.from).length() < 1e-5 && (l.arc(1.0) - l.to).length() < 1e-5);
-        let top = (0..=20).map(|i| l.arc(i as f32 / 20.0).y).fold(0.0f32, f32::max);
-        assert!((2.0..3.5).contains(&top), "clears the rock without going into orbit: {top}");
         assert!(l.climb(0.0) > 0.3 && l.climb(1.0) < -0.2, "up then down");
     }
 
     #[test]
     fn phases_run_in_order_and_a_chain_gathers_faster() {
-        let plan = Plan { to: Vec3::new(6.0, 0.0, 0.0), perch: None };
+        let plan = Plan { to: Vec3::new(6.0, 0.0, 0.0), perch: None, narrow: false };
         let mut seen = Vec::new();
         let mut l = LeapState::begin(Vec3::ZERO, plan, false);
         let mut secs = 0.0;
@@ -288,8 +399,41 @@ mod tests {
         }
         assert_eq!(seen, vec![Phase::Gather, Phase::Flight, Phase::Land]);
         assert!((0.7..1.0).contains(&secs), "gather + 6 u flight + land: {secs}");
-        let chained = LeapState::begin(Vec3::ZERO, plan, true);
-        assert!(chained.gather < l.gather * 0.5);
+        assert!(LeapState::begin(Vec3::ZERO, plan, true).gather < l.gather * 0.5);
+    }
+
+    /// The righting reflex. Upright inside RIGHTING_SECS from ANY start,
+    /// never overshooting, front half leading, and done long before the
+    /// ground arrives from a wall.
+    #[test]
+    fn a_falling_cat_is_upright_before_it_lands() {
+        for tumble in [0.0, 1.3, -2.4, std::f32::consts::PI] {
+            let mut f = Fall::new(3.0, tumble);
+            let (mut y, mut upright_at, mut peak_twist) = (3.0f32, None, 0.0f32);
+            let mut last = tumble.abs();
+            while y > 0.0 {
+                y = f.tick(y, 1.0 / 120.0);
+                assert!(f.roll().abs() <= last + 1e-5, "righting never rolls the wrong way");
+                assert!(f.roll() * tumble >= -1e-5, "and never overshoots past upright");
+                last = f.roll().abs();
+                peak_twist = peak_twist.max(f.twist().abs());
+                if upright_at.is_none() && f.roll().abs() < 0.02 {
+                    upright_at = Some(f.t);
+                }
+                assert!(f.t < 2.0);
+            }
+            let landed = f.t;
+            let up = upright_at.expect("it never got upright");
+            assert!(up <= RIGHTING_SECS + 0.01, "tumble {tumble}: upright at {up}s");
+            assert!(up < landed, "tumble {tumble}: upright at {up}s but landed at {landed}s -- on its back");
+            assert!((0.40..0.50).contains(&landed), "3 u at g = 30 is sqrt(2h/g) = 0.447 s, got {landed}");
+            if tumble != 0.0 {
+                assert!(peak_twist > tumble.abs() * 0.3, "front half leads the hind: peak twist {peak_twist}");
+                assert!(f.twist().abs() < 0.02, "and the two halves agree again by the ground");
+            } else {
+                assert_eq!(peak_twist, 0.0, "a deliberate hop down does not twist");
+            }
+        }
     }
 
     #[test]
