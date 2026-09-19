@@ -52,7 +52,22 @@ pub fn dot_q8_0(raw: &[u8], act: &[f32]) -> f32 {
 /// Written out rather than reused across a crate boundary, and therefore a fourth copy of a function
 /// that has already gone wrong once — so the test below asserts it against the reference for every
 /// subnormal, not a sample.
-fn half_to_f32(h: u16) -> f32 {
+/// IEEE half -> f32: `gguf::f16_to_f32`, the ONE implementation.
+///
+/// This module used to carry its own — the branchy form gguf.rs replaced (three branches and a
+/// data-dependent normalising loop, so it neither pipelines nor vectorises), called once per block
+/// per row: 128 times per 4096-wide Q8_0 row. With realistic, VARYING block scales that cost the
+/// Q8_0 dot ~6% (1.205 -> 1.137 ms per 1024x4096, -O). The better reason is gguf.rs's own warning:
+/// that function HAS A HISTORY — decoding subnormal halves 4x small produced word salad from one
+/// model family while another stayed coherent — and two independent copies of it is how that
+/// happens twice. `the_half_decoder_is_the_one_in_gguf` pins the old copy to it over all 65536
+/// inputs: identical everywhere except the PAYLOAD bits of 1022 NaNs, which are NaN either way.
+#[inline(always)]
+fn half_to_f32(h: u16) -> f32 { crate::gguf::f16_to_f32(h) }
+
+/// The copy this module used to decode with. Kept only as the oracle for the test named above.
+#[cfg(test)]
+fn half_to_f32_branchy(h: u16) -> f32 {
     let (sign, exp, mant) = ((h >> 15) as u32, ((h >> 10) & 0x1F) as u32, (h & 0x3FF) as u32);
     let bits = if exp == 0 {
         if mant == 0 { sign << 31 } else {
@@ -792,6 +807,24 @@ mod tests {
             assert_eq!(got[r], dot_q6_k(&raw[r * rb..(r + 1) * rb], &prep.q), "row {r}");
         }
         assert!(got.iter().any(|v| *v != 0.0) && got.windows(2).any(|w| w[0] != w[1]), "rows are distinct and non-zero");
+    }
+
+    #[test]
+    fn the_half_decoder_is_the_one_in_gguf() {
+        let (mut differ, mut nan_pairs) = (0u32, 0u32);
+        for h in 0..=u16::MAX {
+            let (a, b) = (half_to_f32_branchy(h), half_to_f32(h));
+            if a.to_bits() != b.to_bits() { differ += 1; if a.is_nan() && b.is_nan() { nan_pairs += 1; } }
+        }
+        assert_eq!(differ, nan_pairs, "a non-NaN half decodes differently");
+        // every SUBNORMAL half, by value — the class the historical bug lived in
+        for m in 1..0x400u16 { for sign in [0u16, 0x8000] {
+            let want = (m as f32) * 2f32.powi(-24) * if sign == 0 { 1.0 } else { -1.0 };
+            assert_eq!(half_to_f32(m | sign), want, "subnormal 0x{:04x}", m | sign);
+        } }
+        assert_eq!((half_to_f32(0x3C00), half_to_f32(0xC000), half_to_f32(0x7BFF), half_to_f32(0x0000).to_bits(), half_to_f32(0x8000).to_bits()),
+                   (1.0, -2.0, 65504.0, 0, 0x8000_0000));
+        assert!(half_to_f32(0x7C00).is_infinite() && half_to_f32(0x7E00).is_nan());
     }
 
     /// BOTH COPIES, SAME BITS. The wide copy is the same source compiled with more instructions

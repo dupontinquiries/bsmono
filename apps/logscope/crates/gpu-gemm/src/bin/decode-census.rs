@@ -53,10 +53,20 @@ fn main() {
     for t in 0..n_tok {
         let next = logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY),
             |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) }).0 as u32;
-        let before = snap();
+        let host0 = [GPU_SETUP_NS.load(Relaxed), GPU_ENCODE_NS.load(Relaxed), GPU_SYNC_NS.load(Relaxed)];
+    let wall0 = std::time::Instant::now();
+    let before = snap();
         if t + 1 == n_tok { dispatch_histogram_reset(); }
         logits = gpu.decode_step(&m, &cache, next, pos);
         let after = snap();
+    // HOST TIME PER TOKEN: what the CPU spends preparing launches (bind-group keys, dims, cache
+    // lookups), recording them, and blocked in the sync — the split that says whether a launch-bound
+    // decode is bound by OUR bookkeeping or by the driver. Only meaningful from an OPTIMIZED build.
+    let wall = wall0.elapsed().as_secs_f64() * 1e3 / n_tok as f64;
+    let host1 = [GPU_SETUP_NS.load(Relaxed), GPU_ENCODE_NS.load(Relaxed), GPU_SYNC_NS.load(Relaxed)];
+    let ms = |i: usize| (host1[i] - host0[i]) as f64 / 1e6 / n_tok as f64;
+    println!("host ms/token: setup {:.3}  encode {:.3}  blocked-in-sync {:.3}  | wall {:.3}  (setup+encode = {:.1}% of wall; debug build? then ignore)",
+        ms(0), ms(1), ms(2), wall, 100.0 * (ms(0) + ms(1)) / wall.max(1e-9));
         let d: Vec<u64> = (0..5).map(|i| after[i] - before[i]).collect();
         for i in 0..5 { tot[i] += d[i]; }
         all.extend_from_slice(&logits);
