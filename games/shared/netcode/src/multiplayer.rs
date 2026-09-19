@@ -20,6 +20,30 @@ use crate::session::{SessionExt, SessionRecord};
 use crate::store::{FileStore, ProfileService};
 use std::net::UdpSocket;
 
+/// The address to ANNOUNCE for a socket bound at `local`.
+///
+/// `host("0.0.0.0:0")` is the natural way to accept from anywhere, and
+/// `local_addr()` then says `0.0.0.0:PORT` -- which was announced verbatim.
+/// A friend on another machine resolved that and dialled 0.0.0.0. It only
+/// ever worked because every test, and the FileStore fallback, is one
+/// machine. An unspecified address is replaced by this host's outbound one,
+/// found the dependency-free way: connect a UDP socket toward a
+/// documentation address (no packet is sent) and read which local address
+/// the kernel picked. No route at all falls back to loopback.
+pub fn routable(local: std::net::SocketAddr) -> std::net::SocketAddr {
+    if !local.ip().is_unspecified() {
+        return local;
+    }
+    let ip = UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| s.connect("192.0.2.1:9").map(|_| s))
+        .and_then(|s| s.local_addr())
+        .map(|a| a.ip())
+        .ok()
+        .filter(|ip| !ip.is_unspecified())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    std::net::SocketAddr::new(ip, local.port())
+}
+
 pub struct Multiplayer {
     svc: ProfileService<FileStore, FileStore>,
     /// The registry id of the game this instance plays (`"soldier"`, `"clawbound"`, …).
@@ -63,7 +87,7 @@ impl Multiplayer {
     pub fn host(&mut self, bind_addr: &str) -> Result<String, String> {
         let socket = UdpSocket::bind(bind_addr).map_err(|e| format!("bind {bind_addr}: {e}"))?;
         socket.set_nonblocking(true).ok();
-        let local = socket.local_addr().map_err(|e| e.to_string())?.to_string();
+        let local = routable(socket.local_addr().map_err(|e| e.to_string())?).to_string();
         let token = format!("{}@{}", self.game, self.me.id);
         let rec = SessionRecord::new(&self.game, &self.me.id, "udp", &local);
         self.svc.announce_session(&mut self.me, &token, &rec);
@@ -196,6 +220,22 @@ mod tests {
         let mut joiner = Multiplayer::at_store("soldier", "bob", "Bob", path.clone());
         let err = joiner.join("amy").unwrap_err();
         assert!(err.contains("clawbound"), "error should name the actual game: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Hosting on the wildcard must not ANNOUNCE the wildcard.
+    #[test]
+    fn a_wildcard_bind_announces_an_address_someone_can_dial() {
+        let path = tmp_path("routable");
+        let mut host = Multiplayer::at_store("clawbound", "wren", "Wren", path.clone());
+        host.host("0.0.0.0:0").unwrap();
+        let port = host.socket.as_ref().unwrap().local_addr().unwrap().port();
+        let mut joiner = Multiplayer::at_store("clawbound", "fox", "Fox", path.clone());
+        let addr: std::net::SocketAddr = joiner.join("wren").expect("wren is hosting").parse().expect("an address");
+        assert!(!addr.ip().is_unspecified(), "announced {addr}: nobody can dial that");
+        assert_eq!(addr.port(), port, "and it is the port that was actually bound");
+        let pinned: std::net::SocketAddr = "10.1.2.3:4000".parse().unwrap();
+        assert_eq!(routable(pinned), pinned, "an explicit bind is announced as given");
         let _ = std::fs::remove_file(&path);
     }
 
