@@ -328,20 +328,8 @@ impl Renderer {
         let shadow_pl = mk_layout([&shadow_bgl]);
         let post_pl = mk_layout([&post_bgl]);
 
-        let depth_state_write = wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
-            stencil: Default::default(),
-            bias: Default::default(),
-        };
-        let depth_state_ro = wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::Always,
-            stencil: Default::default(),
-            bias: Default::default(),
-        };
+        let depth_state_write = depth_state(DepthUse::Opaque);
+        let depth_state_ro = depth_state(DepthUse::Blended);
 
         let msaa = wgpu::MultisampleState { count: 4, ..Default::default() };
         let msaa1 = wgpu::MultisampleState::default();
@@ -765,6 +753,20 @@ impl Renderer {
     pub fn render_frame(&mut self, target: &wgpu::TextureView, cam: Camera, time: f32) {
         self.camera = cam;
         self.time = time;
+        // Depth-testing the blended pipelines fixes blended-vs-opaque
+        // ordering; two blended surfaces still composite in queue order
+        // unless sorted. Painter's order, far to near.
+        let eye = self.camera.eye;
+        let mut order: Vec<(f32, (u64, u32))> = self
+            .transparent
+            .iter()
+            .map(|t| {
+                let c = self.draws[t.1 as usize].model[3];
+                (Vec3::new(c[0], c[1], c[2]).distance_squared(eye), *t)
+            })
+            .collect();
+        sort_far_to_near(&mut order);
+        self.transparent = order.into_iter().map(|(_, t)| t).collect();
         let aspect = self.width as f32 / self.height as f32;
         let vp = cam.view_proj(aspect);
         let inv = vp.inverse();
@@ -1232,6 +1234,48 @@ fn lane_distance(x: f32, z: f32) -> f32 {
     best
 }
 
+/// What a pipeline does with the scene depth buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepthUse {
+    /// Terrain, opaque voxels: test and write.
+    Opaque,
+    /// Water, alpha voxels, particles, and the sky triangle: test, never write.
+    Blended,
+}
+
+/// The depth state for a pipeline. A free function on purpose: it needs no
+/// device, so `tests::blended_draws_are_depth_tested` can pin it.
+///
+/// History, because it has now happened twice: `Blended` shipped as
+/// `CompareFunction::Always`, which made the river sheet ignore the depth
+/// buffer and paint over canopies, banks and bridge piers. `3f70d2d7d` fixed
+/// it; the v8 merge `1d46c86c5` replaced this file wholesale and the fix went
+/// with it, because nothing but a screenshot could tell.
+///
+/// `LessEqual`, not `Less`: the sky is a full-screen triangle at NDC depth
+/// exactly 1.0, which is the clear value, and it shares this state. A strict
+/// `Less` would reject every sky fragment.
+pub fn depth_state(usage: DepthUse) -> wgpu::DepthStencilState {
+    let (write, compare) = match usage {
+        DepthUse::Opaque => (true, wgpu::CompareFunction::Less),
+        DepthUse::Blended => (false, wgpu::CompareFunction::LessEqual),
+    };
+    wgpu::DepthStencilState {
+        format: wgpu::TextureFormat::Depth32Float,
+        depth_write_enabled: write,
+        depth_compare: compare,
+        stencil: Default::default(),
+        bias: Default::default(),
+    }
+}
+
+/// Order blended draws far-to-near by squared distance. NaN sorts as
+/// "equal" rather than panicking: a degenerate model matrix costs one
+/// mis-ordered blend, not the frame.
+pub fn sort_far_to_near<T>(items: &mut [(f32, T)]) {
+    items.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+}
+
 /// Shared terrain height field: flat playable floor, rolling jungle hills
 /// beyond the arena bounds, a mountain rim at the horizon, and river valleys
 /// that dip under the lanes (roads stay solid — bridges span the crossings).
@@ -1502,4 +1546,37 @@ fn build_flood_plane() -> (Vec<WaterVert>, Vec<u32>) {
         }
     }
     (verts, idx)
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    /// The river painted over canopies twice (see `depth_state`). This is the
+    /// check that was missing both times: no GPU needed, so it runs anywhere.
+    #[test]
+    fn blended_draws_are_depth_tested() {
+        let d = depth_state(DepthUse::Blended);
+        assert_ne!(d.depth_compare, wgpu::CompareFunction::Always, "water would ignore the depth buffer");
+        assert!(!d.depth_write_enabled, "a blended surface must not occlude what is drawn after it");
+        // The sky shares this state and sits at exactly the clear depth.
+        assert_eq!(d.depth_compare, wgpu::CompareFunction::LessEqual, "strict Less rejects the sky at depth 1.0");
+    }
+
+    #[test]
+    fn opaque_draws_write_depth() {
+        let d = depth_state(DepthUse::Opaque);
+        assert!(d.depth_write_enabled);
+        assert_eq!(d.depth_compare, wgpu::CompareFunction::Less);
+    }
+
+    /// Both directions are failures here: near-to-far blends the far surface
+    /// over the near one.
+    #[test]
+    fn blended_draws_sort_far_to_near() {
+        let mut v = vec![(1.0, 'n'), (9.0, 'f'), (4.0, 'm'), (f32::NAN, 'x')];
+        sort_far_to_near(&mut v);
+        let order: Vec<char> = v.iter().filter(|e| e.1 != 'x').map(|e| e.1).collect();
+        assert_eq!(order, vec!['f', 'm', 'n']);
+    }
 }
