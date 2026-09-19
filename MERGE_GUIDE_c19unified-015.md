@@ -22,13 +22,14 @@ This bundle came from a single-branch clone: it has `main`, tags and
 
 ## Where it can collide
 
-Everything new is under `apps/stoat/` and cannot conflict. Outside it, five files:
+Everything new is under `apps/stoat/` and cannot conflict. Outside it, seven files:
 
 | file | change | collides if the other side… |
 |---|---|---|
 | `shared/uikit/crates/uikit-egui/src/segmented_tabs.rs` | `strip_ui` pins `item_spacing.x = 4`, `button_padding.x = 2`; new `tests` module | …edited `strip_ui` or added a tests module to this file (it had none) |
 | `shared/uikit/crates/uikit-egui/src/log_view.rs` | `log_row`: `horizontal_top`, message `Label::wrap()`; one new test | …edited `log_row` |
 | `shared/uikit/crates/uikit-egui/src/palette_flow.rs` | one test asserts against the constants; diagram says 5000 | …also fixed that red test (take either; keep exactly one) |
+| `tools/rustcheck/rustcheck.py` + `test_resolve_mod_files.py` | files in tests/, examples/, benches/, src/bin/ count as crate roots; 2 new test groups | …edited `_declared_crate_roots`, or appended test groups (the file ends with a hard-coded group count: it is 5 now) |
 | `manifest/projects.toml` | three entries appended: `stoat`, `stoat-egui` (primary), `stoat-gtk` | …appended at the same place — keep both sides |
 | `CLAUDE.md` §3 | GTK4/libadwaita are installable in the sandbox | …edited the same paragraph |
 
@@ -76,7 +77,9 @@ pacing measured against the UI's repaint rate, a frame view left offset after a
 swipe, palette rows swallowing the screen, a tap on ⌘ doing nothing); each now
 has a test or a comment at the site.
 
-Checkers: `verify.sh` (stoat clean), `lock_check`, `orphan_check`,
+Checkers: `verify.sh` (38 projects clean, projects-with-real-problems=0; stoat
+was PROBLEMS(2) until the rustcheck fix, from a false positive on `mod common;`
+in integration tests), `lock_check`, `orphan_check`,
 `eframe_backend_check`, `textedit_id_check`, `font_install_check` pass.
 `cfg_feature_check` FAILS on `apps/rusty-board` (`llm-swipe-ffi`) — on arrival,
 not from this drop.
