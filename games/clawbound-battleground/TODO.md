@@ -57,12 +57,20 @@ the single highest-value thing anyone can do with this repo next.
 
 ## Known gaps
 
+- **LAN: a den is a roster, not a match.** Hosting binds a real game socket;
+  JOIN says HELLO to it, is counted, and is dropped after 4 s of silence.
+  (A den hosted from the real game was INVISIBLE until this: the app
+  advertised port 0.) What follows is the older note, still true where it
+  says there is no networked match.
 - **LAN: discovery only.** `netcode::lan` + `lanlobby` + the LOCAL NETWORK
   screen find, host and pick a den over a real network. There is NO
   networked match: JOIN ends at the host's address. Next is lockstep input
   exchange over the game socket (the sim is already fixed-tick and seeded).
   The screen has not been rendered; UDP broadcast was not exercised (one
   interface, no peer); two copies on one machine cannot both browse.
+- **The sim is measured and is not the problem**: 0.056 ms/tick for a full
+  5v5, unoptimised. Do not optimise it further. Frame time on a GPU is still
+  the unknown.
 - **Performance is measured in instances, not milliseconds.** The hull cull
   took the static world to 296,629 instances (from roughly 877k), but no
   frame time has been taken on a real GPU, let alone a handset. Next
@@ -212,7 +220,7 @@ the single highest-value thing anyone can do with this repo next.
 ## Verification commands
 
 ```bash
-cargo test --no-default-features   # 241 lib + 15 + 2 (+3 in games/shared/netcode), no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
+cargo test --no-default-features   # 242 lib + 16 + 2 (+3 in games/shared/netcode), no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
 cargo test                          # same, plus links cpal (needs libasound2-dev)
 cargo check --features gamepad      # needs libudev-dev
 cargo run --example simdbg <seed>   # headless 12-minute AI match trace
