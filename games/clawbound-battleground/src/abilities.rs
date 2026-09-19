@@ -116,8 +116,7 @@ impl Game {
                 for j in 0..self.gods.len() {
                     let e = &self.gods[j];
                     if e.team != team && e.respawn_t <= 0.0 {
-                        let c = e.pos + Vec3::Y * 1.0;
-                        if point_segment_dist(c, pos_y, end) <= width + 0.7 {
+                        if crate::hitbox::cat(e.pos, e.yaw, false).hit_by_beam(pos_y, end, width + 0.2) {
                             hits.push(TargetRef::God(j));
                         }
                     }
@@ -277,7 +276,7 @@ impl Game {
         let mut out = Vec::new();
         for gi in 0..self.gods.len() {
             let g = &self.gods[gi];
-            if g.team != team && g.respawn_t <= 0.0 && g.pos.distance(center) <= radius + 0.7 {
+            if g.team != team && g.respawn_t <= 0.0 && crate::hitbox::cat(g.pos, g.yaw, false).in_disc(center, radius + 0.2) {
                 out.push(TargetRef::God(gi));
             }
         }

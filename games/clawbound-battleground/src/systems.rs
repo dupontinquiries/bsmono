@@ -763,8 +763,8 @@ impl Game {
             for gi in 0..self.gods.len() {
                 let g = &self.gods[gi];
                 if g.team != p.team && g.respawn_t <= 0.0 {
-                    let c = g.pos + Vec3::Y * 1.1;
-                    if (c - p.pos).length() < p.radius + 0.85 {
+                    // The body, not a ball over the feet: see `hitbox`.
+                    if crate::hitbox::cat(g.pos, g.yaw, g.sneak && g.hush_t <= 0.0).hit_by_sphere(p.pos, p.radius + 0.2) {
                         hit = Some(TargetRef::God(gi));
                         break;
                     }
@@ -837,7 +837,7 @@ impl Game {
         let mut hits: Vec<TargetRef> = Vec::new();
         for gi in 0..self.gods.len() {
             let g = &self.gods[gi];
-            if g.team != team && g.respawn_t <= 0.0 && g.pos.distance(center) <= radius + 0.7 {
+            if g.team != team && g.respawn_t <= 0.0 && crate::hitbox::cat(g.pos, g.yaw, false).in_disc(center, radius + 0.2) {
                 hits.push(TargetRef::God(gi));
             }
         }

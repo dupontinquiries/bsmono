@@ -16,6 +16,8 @@ pub mod voxel;
 pub mod models;
 pub mod props;
 pub mod blockers;
+/// Oriented capsule hit tests for the cats.
+pub mod hitbox;
 /// The river crossings: fallen logs that can be worked loose and roll.
 pub mod logs;
 /// The authored centre of the map: the Hollow and the two screened Runs.
