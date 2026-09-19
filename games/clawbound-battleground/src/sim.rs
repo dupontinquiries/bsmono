@@ -270,6 +270,9 @@ pub struct Game {
     pub cast_queue: Vec<(usize, u32, Vec3)>, // (god idx, slot, aim)
     /// Leap requests: (god idx, aim direction). Drained by `move_gods`.
     pub leap_queue: Vec<(usize, Vec3)>,
+    /// The river crossings. See `logs`.
+    pub logs: Vec<crate::logs::RollingLog>,
+    pub(crate) logs_seen: usize,
     pub tower_alive: [usize; 2],
     pub titan_vuln_announced: [bool; 2],
     pub weather: crate::weather::Weather,
@@ -406,6 +409,8 @@ impl Game {
             rng,
             cast_queue: Vec::new(),
             leap_queue: Vec::new(),
+            logs: crate::logs::crossings().iter().map(crate::logs::RollingLog::across).collect(),
+            logs_seen: 0,
             tower_alive: [6, 6],
             titan_vuln_announced: [false, false],
             weather: crate::weather::Weather::new(),

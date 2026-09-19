@@ -324,3 +324,55 @@ fn stalking_is_broken_by_a_fight_granted_by_the_kit_and_forced_by_wounds() {
     game.gods[0].hp = game.gods[0].max_hp * (WOUNDED_FRAC - 0.05);
     assert_eq!(game.quiet(0), 0.5, "a badly hurt cat slinks");
 }
+
+
+/// The bridges are gone: the river runs through the crossings, a log is the
+/// dry way over, and a log can be blown out of its seat and rolled away --
+/// after which the lane fords the river like anywhere else.
+#[test]
+fn the_crossing_is_a_log_the_log_can_be_rolled_away_and_then_it_is_a_ford() {
+    use clawbound::logs::{crossings, LOG_RADIUS};
+    use clawbound::sim::Event;
+    let mut game = Game::new(0, [1, 2, 3, 4], [5, 6, 7, 8, 9]);
+    assert_eq!(game.logs.len(), 2);
+    let c = crossings()[0];
+    let log = game.logs[0];
+
+    // There is a river under the crossing now. (Before: a causeway, depth 0.)
+    assert!(water_depth(c.at.x, c.at.z) > 1.0, "no channel under the crossing: depth {}", water_depth(c.at.x, c.at.z));
+    // On the log: dry, full speed. A log's width to the side: wading.
+    assert_eq!(game.water_depth_now(c.at.x, c.at.z), 0.0, "the log is the dry way over");
+    let beside = c.at + log.down * (LOG_RADIUS + 1.5);
+    assert!(game.water_depth_now(beside.x, beside.z) > 0.8, "beside it you wade");
+    game.gods[0].pos = c.at;
+    let dry = game.move_speed(0);
+    game.gods[0].pos = beside;
+    assert!(game.move_speed(0) < dry * 0.85, "and wading is slower: {} vs {dry}", game.move_speed(0));
+
+    // Park everyone far away; a cat rides the log.
+    for g in game.gods.iter_mut() {
+        g.pos = glam::Vec3::new(0.0, 0.0, 120.0);
+    }
+    game.gods[0].pos = c.at;
+    // A blast on the upstream side.
+    let from = c.at - log.down * 3.0;
+    game.events.push(Event::Explosion { pos: from, radius: 6.0, color: [1.0; 3] });
+    let mut thrown = false;
+    for _ in 0..(20 * 60) {
+        game.tick(1.0 / 60.0);
+        game.gods[0].move_dir = glam::Vec3::ZERO;
+        thrown |= game.gods[0].fall.is_some();
+        if game.logs[0].lodged {
+            break;
+        }
+    }
+    let l = game.logs[0];
+    assert!(l.lodged, "the log never came to rest: x = {}, free = {}", l.x, l.free);
+    assert!((l.centre() - c.at).length() > 15.0, "it went {} u", (l.centre() - c.at).length());
+    assert!(thrown, "the cat riding it was never thrown");
+    assert!(game.gods[0].fall.is_none() && game.gods[0].pos.y.abs() < 0.01, "and ended on its feet in the river");
+    // The lane now fords the river; the log is a dry perch downstream.
+    assert!(game.water_depth_now(c.at.x, c.at.z) > 1.0, "the crossing is a ford now");
+    assert_eq!(game.water_depth_now(l.centre().x, l.centre().z), 0.0);
+    assert!(!game.logs[1].free && game.logs[1].x.abs() < 0.01, "the other crossing, 150 u away, never noticed");
+}

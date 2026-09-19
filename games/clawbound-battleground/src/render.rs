@@ -1361,7 +1361,24 @@ pub fn terrain_height(x: f32, z: f32) -> f32 {
     let river_reach = RIVER_HALF_WIDTH + 7.0;
     if rd < river_reach {
         let ld = lane_distance(x, z);
-        let mask = smoothstep(4.0, 9.5, ld);
+        let mut mask = smoothstep(4.0, 9.5, ld);
+        // The lanes used to fill the channel in wherever they came near, so
+        // the "bridges" stood over a causeway with no water under it. At a
+        // crossing the river now runs THROUGH, and a log is the way over.
+        // A SLUICE, not a pond. The lane does not cross the river here, it
+        // grazes it, nearly parallel for ~25 u; opening a disc round the
+        // crossing flooded that whole stretch and left the 13 u log as a raft
+        // in the middle (one screenshot was enough). So the causeway stays,
+        // cut by a channel across it just narrower than the log is long: the
+        // log's ends rest on the road, and water runs through the gap the way
+        // the log will roll.
+        for c in crate::logs::crossings() {
+            let (rx, rz) = (x - c.at.x, z - c.at.z);
+            let along = (rx * c.along.x + rz * c.along.z).abs();
+            let across = (rx * -c.along.z + rz * c.along.x).abs();
+            let gap = (1.0 - smoothstep(crate::logs::SLUICE_HALF, crate::logs::SLUICE_HALF + 2.0, along)) * (1.0 - smoothstep(16.0, 22.0, across));
+            mask = mask.max(gap);
+        }
         // banks slope down past the water line, then the channel bowls out
         let t = (rd / river_reach).clamp(0.0, 1.0);
         let depth = (1.0 - t).powf(1.25) * (RIVER_DEPTH + 0.6) - 0.3;

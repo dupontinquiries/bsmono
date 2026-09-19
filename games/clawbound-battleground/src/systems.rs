@@ -42,6 +42,7 @@ impl Game {
         // 4. movement
         self.move_gods(dt);
         self.move_minions(dt);
+        self.logs_tick(dt);
 
         // 5. auto-attacks
         self.god_autoattacks(dt);

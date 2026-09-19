@@ -469,6 +469,11 @@ pub fn run_rig_sheet() -> Result<(), String> {
     // trees, the ground is freshly broken, and an older crack beside it is
     // half healed. Gameplay camera distance, so the fitted shadow box is tight.
     shots.push(Shot { name: "fx_blast.png", eye: Vec3::new(-21.0, 8.0, -1.0), look: Vec3::new(-9.0, 0.6, 10.0) });
+    // A crossing: the log in its seat with the river running under it.
+    if let Some(c) = crate::logs::crossings().first() {
+        let down = Vec3::new(-c.along.z, 0.0, c.along.x);
+        shots.push(Shot { name: "log_crossing.png", eye: c.at - down * 15.0 + c.along * 6.0 + Vec3::Y * 9.0, look: c.at });
+    }
     println!("wall at {wall:?}");
     // CLAWBOUND_SHEET=wall,sig_0 renders only the shots whose names match.
     let only: Vec<String> = std::env::var("CLAWBOUND_SHEET").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
@@ -540,6 +545,15 @@ pub fn run_rig_sheet() -> Result<(), String> {
                     if left == 20 {
                         vfx.quake(Vec3::new(-10.5, 0.0, 12.0), 6.0, 1.0);
                     }
+                }
+                k if shots[k].name == "log_crossing.png" => {
+                    let c = crate::logs::crossings()[0];
+                    for gi in 1..game.gods.len() {
+                        game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
+                    }
+                    // one cat walking the spine
+                    game.gods[0].yaw = c.along.z.atan2(c.along.x);
+                    game.gods[0].pos = c.at - c.along * (left as f32 * (3.0 / 60.0));
                 }
                 k if shots[k].name == "map_centre.png" => {
                     for gi in 0..game.gods.len() {

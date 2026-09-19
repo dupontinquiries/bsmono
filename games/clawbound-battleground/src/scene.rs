@@ -44,6 +44,8 @@ pub struct Scene {
     pub orb: u64,
     pub arrow: [u64; 2],
     pub boulder: u64,
+    /// The crossing log: `props::fallen_log`, drawn per frame because it rolls.
+    pub river_log: u64,
     pub total_voxels: usize,
     /// Static prop collision, built alongside the meshes in `build_world` so
     /// the two cannot disagree. Handed to `Game` by the app; see
@@ -63,6 +65,7 @@ pub struct PropChunk {
 /// blockers' walkable humps and cover discs, and the river.
 struct WorldProbe<'a> {
     blockers: &'a Blockers,
+    logs: &'a [crate::logs::RollingLog],
 }
 
 impl Probe for WorldProbe<'_> {
@@ -72,7 +75,15 @@ impl Probe for WorldProbe<'_> {
         terrain_height(x, z).max(0.0)
     }
     fn step_top(&self, x: f32, z: f32) -> Option<f32> {
-        self.blockers.step_top(x, z)
+        // A crossing log is rounded footing: highest on the spine.
+        let log = self.logs.iter().find_map(|l| l.on_top(x, z)).map(|off| {
+            let r = crate::logs::LOG_RADIUS;
+            crate::logs::LOG_TOP - r + (r * r - off * off).max(0.0).sqrt()
+        });
+        match (self.blockers.step_top(x, z), log) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
     }
     fn cover(&self, x: f32, z: f32) -> f32 {
         self.blockers.concealment_at(x, z)
@@ -204,6 +215,9 @@ impl Scene {
         let boulder = models::build_boulder();
         total += boulder.inst.len();
         let boulder = r.upload_mesh(&boulder);
+        let river_log_mesh = props::fallen_log(1.0);
+        total += river_log_mesh.inst.len();
+        let river_log = r.upload_mesh(&river_log_mesh);
 
         Scene {
             god_parts,
@@ -231,6 +245,7 @@ impl Scene {
             orb,
             arrow,
             boulder,
+            river_log,
             total_voxels: total,
             blockers: std::sync::Arc::new(blockers),
         }
@@ -390,7 +405,7 @@ impl Scene {
 
         // gods — posed per part. `puppet` decides what the body is doing,
         // `creature-rig` poses the boxes, `rigged` turns boxes into matrices.
-        let world = WorldProbe { blockers: &game.blockers };
+        let world = WorldProbe { blockers: &game.blockers, logs: &game.logs };
         let dt = (vfx.time - vfx.puppets.last_time).clamp(0.0, 0.1);
         vfx.puppets.last_time = vfx.time;
         vfx.puppets.ensure(game.gods.len());
@@ -464,12 +479,25 @@ impl Scene {
         vfx.puppet_events(&pevents);
         vfx.puppets.events = pevents;
 
+        // the crossing logs: on the lane, or wherever the river left them
+        for l in &game.logs {
+            use crate::logs::{LOG_RADIUS, LOG_TOP};
+            let c = l.centre();
+            // The mesh lies along +X with its axis ~1.56 u up; spin it about
+            // that axis, then sink it so only LOG_TOP stands above the lane.
+            let m = Mat4::from_translation(Vec3::new(c.x, LOG_TOP - LOG_RADIUS, c.z))
+                * Mat4::from_axis_angle(Vec3::Y, (-l.axis.z).atan2(l.axis.x))
+                * Mat4::from_axis_angle(Vec3::X, l.angle)
+                * Mat4::from_translation(Vec3::new(0.0, -1.56, 0.0));
+            r.queue_draw(self.river_log, m, [1.0; 4], 0.0, 0.6, false);
+        }
+
         // minions
         for m in &game.minions {
             let ti = m.team as usize;
             let bob = (m.walk_anim * 2.0).sin().abs() * 0.10;
             let lean = (m.walk_anim * 2.0).sin() * 0.06;
-            let pos = m.pos + Vec3::Y * bob;
+            let pos = m.pos + Vec3::Y * (bob + if game.on_a_log(m.pos.x, m.pos.z) { crate::logs::LOG_TOP } else { 0.0 });
             let base = Mat4::from_translation(pos)
                 * Mat4::from_axis_angle(Vec3::Y, -m.yaw + std::f32::consts::FRAC_PI_2)
                 * Mat4::from_axis_angle(Vec3::Z, lean);
@@ -561,40 +589,6 @@ fn hill_spot(rng: &mut Rng, landmarks: &[Vec3], keep_out: f32) -> Option<(f32, f
         return Some((x, z));
     }
     None
-}
-
-/// Find where a side lane crosses its river (for the wooden bridge).
-fn bridge_crossing(side: f32, lane: Lane) -> Option<Vec3> {
-    let pts = lane.polyline();
-    let mut best: Option<(Vec3, f32)> = None;
-    for w in pts.windows(2) {
-        let (a, b) = (w[0], w[1]);
-        let ab = b - a;
-        for i in 0..=48 {
-            let t = i as f32 / 48.0;
-            let p = a + ab * t;
-            let diff = (p.x - consts::river_x(side, p.z)).abs();
-            if diff > 9.0 {
-                continue;
-            }
-            // keep clear of the lane towers
-            let mut ok = true;
-            for team in [Team::Blue, Team::Red] {
-                for inner in [false, true] {
-                    if (consts::tower_pos(lane, team, inner) - p).length() < 13.0 {
-                        ok = false;
-                    }
-                }
-            }
-            if !ok {
-                continue;
-            }
-            if best.map_or(true, |(_, d)| diff < d) {
-                best = Some((p, diff));
-            }
-        }
-    }
-    best.map(|(p, _)| p)
 }
 
 fn bird_mesh() -> VoxelMesh {
@@ -827,12 +821,9 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
         v += 5;
     }
 
-    // --- bridges where the side lanes cross the rivers ---
-    for (side, lane) in [(-1.0f32, Lane::Top), (1.0f32, Lane::Bot)] {
-        if let Some(p) = bridge_crossing(side, lane) {
-            put!(Bridge; props::bridge(32), p.x, p.z, -0.35, 0, V_MED);
-        }
-    }
+    // The bridges that stood here are gone. The crossings are logs now, and
+    // logs move, so they are not part of the static world: see `logs` and
+    // the dynamic draw in `Scene::draw`.
 
     // --- braziers flanking the base gates ---
     for team in [Team::Blue, Team::Red] {
