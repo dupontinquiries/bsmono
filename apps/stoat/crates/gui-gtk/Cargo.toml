@@ -1,0 +1,15 @@
+[package]
+name = "stoat-gtk"
+description = "GTK4/libadwaita shell over stoat-core, laid out for a phone-width window first."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+stoat-core = { path = "../core" }
+async-channel = "2"
+# Feature floors are what the oldest target ships, not what the dev box has:
+# v4_12 for CssProvider::load_from_string, v1_5 for AdwBreakpoint-era widgets
+# (ToolbarView is 1.4). Raising these is an ABI decision for postmarketOS stable.
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
