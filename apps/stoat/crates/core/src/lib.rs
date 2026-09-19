@@ -5,6 +5,7 @@
 //!   gdb::process      child process + pty + threads (the only I/O in the backend)
 //!   backend           the seam: `trait Backend` + Request/Event
 //!   session           sans-IO state machine over Events
+//!   driver            session + backend + vitals glue, for the thread that receives events
 //!   diag              structured diagnostics
 //!   discover/history/build/cache/vitals   independent services a shell composes
 //!
@@ -16,6 +17,7 @@ pub mod build;
 pub mod cache;
 pub mod diag;
 pub mod discover;
+pub mod driver;
 pub mod gdb;
 pub mod history;
 pub mod model;
