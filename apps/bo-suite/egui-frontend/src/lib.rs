@@ -15,6 +15,10 @@ pub mod dep_audit;
 /// `diagnose_playback` walks, and what stopping at each rung means. Its value
 /// is naming the LAYER, since "playback is broken" is not actionable.
 pub mod playback_diag;
+/// The RESEARCH MODE gate from SettingsPage.qml, over three real bo-mux DSP
+/// features. Off by default because an anti-noise system that is wrong is
+/// worse than off, not merely ineffective.
+pub mod research_mode;
 pub mod dial_watermark;
 pub mod product_silhouette;
 pub mod transport;
