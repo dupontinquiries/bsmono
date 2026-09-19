@@ -217,6 +217,61 @@ pub fn dot_q4_k(raw: &[u8], act_q: &[(f32, [i8; 32])], act_sum: &[f32]) -> f32 {
     total
 }
 
+/// Dot a Q6_K weight row with a pre-quantized activation.
+///
+/// Why this format, and why now: `Q4_K_M` — the GGUF nearly everyone downloads — stores ffn_gate and
+/// ffn_up as Q4_K and **ffn_down as Q6_K**. With only Q4_K here, not one expert of such a file could
+/// be computed on the CPU, which is what stands between this module and computing a streamed MoE's
+/// MISSED experts in place against the mmap instead of copying them into a GPU slot (the GPU-side
+/// fill cannot take Q6_K either: see the LOGSCOPE_Q6K_VIEWS gate in the loader).
+///
+/// 210-byte super-block of 256 weights: 128 bytes `ql` (low nibbles), 64 bytes `qh` (high 2 bits),
+/// 16 int8 sub-block scales, f16 `d` LAST (offset 208 — Q4_K keeps its `d` first). A weight is
+/// `d * sc[j/16] * (q6 - 32)`. No min term: the -32 recentre folds into the integer, so unlike Q4_K
+/// there is one integer sum per sub-block and no activation-sum side channel.
+///
+/// The two granularities do not line up and that is the one thing to get right: weights are scaled
+/// per SIXTEEN, activations were quantized per THIRTY-TWO. So each activation block spans two weight
+/// sub-blocks with different scales, and the integer sum must be split at 16 — one sum per 32 with
+/// either scale is wrong by exactly the difference between neighbouring scales.
+pub fn dot_q6_k(raw: &[u8], act_q: &[(f32, [i8; 32])]) -> f32 {
+    let nblk = act_q.len() / 8;              // 8 activation blocks of 32 per super-block
+    let mut total = 0f32;
+    for b in 0..nblk {
+        let off = b * 210;
+        if off + 210 > raw.len() { break; }
+        let blk = &raw[off..off + 210];
+        let d = half_to_f32(u16::from_le_bytes([blk[208], blk[209]]));
+        // Unpack the 6-bit quants once into a flat, recentred array. gguf::dequantize's layout, in
+        // integers: two 128-wide halves, each interleaving four 32-runs across ql's nibbles and qh's
+        // bit pairs. Flat i8 is what lets the dot below be 16 identical lanes.
+        let mut q = [0i8; 256];
+        for half in 0..2usize {
+            let ql = &blk[half * 64..half * 64 + 64];
+            let qh = &blk[128 + half * 32..128 + half * 32 + 32];
+            let o = half * 128;
+            for l in 0..32 {
+                q[o + l]      = (((ql[l] & 0xF)      | ((qh[l] & 3) << 4)) as i32 - 32) as i8;
+                q[o + l + 32] = (((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32) as i8;
+                q[o + l + 64] = (((ql[l] >> 4)       | (((qh[l] >> 4) & 3) << 4)) as i32 - 32) as i8;
+                q[o + l + 96] = (((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) as i32 - 32) as i8;
+            }
+        }
+        let sc = &blk[192..208];
+        for a32 in 0..8 {
+            let (da, qa) = &act_q[b * 8 + a32];
+            for sub in 0..2 {
+                let w: &[i8; 16] = q[a32 * 32 + sub * 16..a32 * 32 + sub * 16 + 16].try_into().unwrap();
+                let a: &[i8; 16] = qa[sub * 16..sub * 16 + 16].try_into().unwrap();
+                let mut acc = 0i32;
+                for (&wv, &av) in w.iter().zip(a.iter()) { acc += (wv as i32) * (av as i32); }
+                total += d * (sc[a32 * 2 + sub] as i8) as f32 * da * acc as f32;
+            }
+        }
+    }
+    total
+}
+
 /// Per-block sums of the raw activation, for Q4_K's min term.
 ///
 /// Separate from `quantize_act` because it is the sum of the ORIGINAL floats, not the quantized ones —
@@ -232,12 +287,20 @@ pub fn act_block_sums(act: &[f32]) -> Vec<f32> {
 /// `Q8Zero` and `Q4K` would make a grep for the format name miss the enum representing it, and this
 /// codebase cross-references ggml type names constantly.
 #[allow(non_camel_case_types)]
-pub enum Quant { Q8_0, Q4_K }
+pub enum Quant { Q8_0, Q4_K, Q6_K }
 
 impl Quant {
+    /// Weights per quantization block. A row whose width is not a multiple of this has no on-disk
+    /// layout in this format, and `row_bytes` — integer division — would report ZERO bytes for a
+    /// 64-wide Q6_K row, which `matvec` then reads as "every row is empty" and returns zeros for.
+    /// Callers must check `fits` before trusting `row_bytes`.
+    pub fn block(self) -> usize {
+        match self { Quant::Q8_0 => 32, Quant::Q4_K | Quant::Q6_K => 256 }
+    }
+    pub fn fits(self, k: usize) -> bool { k > 0 && k % self.block() == 0 }
     /// Bytes one row of `k` weights occupies.
     pub fn row_bytes(self, k: usize) -> usize {
-        match self { Quant::Q8_0 => (k / 32) * 34, Quant::Q4_K => (k / 256) * 144 }
+        match self { Quant::Q8_0 => (k / 32) * 34, Quant::Q4_K => (k / 256) * 144, Quant::Q6_K => (k / 256) * 210 }
     }
     /// From a GGUF type id, or None for formats this path does not read.
     ///
@@ -245,7 +308,7 @@ impl Quant {
     /// Q4_K and produce plausible-looking garbage, which is the failure mode this project keeps paying
     /// for. Unsupported means fall back to the GPU, not improvise.
     pub fn from_gguf(t: u32) -> Option<Self> {
-        match t { 8 => Some(Quant::Q8_0), 12 => Some(Quant::Q4_K), _ => None }
+        match t { 8 => Some(Quant::Q8_0), 12 => Some(Quant::Q4_K), 14 => Some(Quant::Q6_K), _ => None }
     }
 }
 
@@ -312,6 +375,7 @@ pub fn matvec(pool: &crate::cpupool::Pool, q: Quant, raw: &[u8], n_rows: usize, 
             let v = match q {
                 Quant::Q8_0 => dot_q8_0_iq(&raw[off..off + row_bytes], &act.q),
                 Quant::Q4_K => dot_q4_k(&raw[off..off + row_bytes], &act.q, &act.sums),
+                Quant::Q6_K => dot_q6_k(&raw[off..off + row_bytes], &act.q),
             };
             // SAFETY: spans are disjoint, so no two workers write the same index, and `run` does not
             // return until every worker has finished.
@@ -487,6 +551,97 @@ mod tests {
         assert!(rel < 0.01, "want {want}, got {got}, rel {rel:.4}");
     }
 
+    /// Pseudo-random but VALID Q6_K rows: every byte pattern is a legal ql/qh/scale, and `d` is set to
+    /// a normal f16 so the oracle is not comparing NaNs. `rows` super-blocks per row, seeded.
+    fn q6k_bytes(blocks: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed | 1;
+        let mut v = Vec::with_capacity(blocks * 210);
+        for b in 0..blocks {
+            for _ in 0..208 { x = x.wrapping_mul(1664525).wrapping_add(1013904223); v.push((x >> 24) as u8); }
+            v.extend_from_slice(&f32_to_half(0.004 + 0.001 * b as f32).to_le_bytes());
+        }
+        v
+    }
+
+    /// The sharp oracle. Against the TRUE activation a quantized dot is only ever "within a percent",
+    /// and a percent hides a wrong sub-block scale. So compare against gguf::dequantize dotted with
+    /// the DEQUANTIZED QUANTIZED activation — the same two operands dot_q6_k sees — where the only
+    /// difference left is float summation order.
+    #[test]
+    fn the_q6k_dot_is_dequantize_then_multiply_on_the_same_operands() {
+        for (blocks, seed) in [(1usize, 7u32), (4, 99), (16, 12345)] {
+            let raw = q6k_bytes(blocks, seed);
+            let k = blocks * 256;
+            let w = crate::gguf::dequantize(14, &raw, k).expect("cpu q6_k");
+            let act: Vec<f32> = (0..k).map(|i| (((i * 31 + 7) % 61) as f32 - 30.0) * 0.173).collect();
+            let aq = quantize_act(&act);
+            let act_rt: Vec<f32> = aq.iter().flat_map(|(d, q)| q.iter().map(move |&v| v as f32 * d)).collect();
+            let want: f64 = w.iter().zip(&act_rt).map(|(a, b)| *a as f64 * *b as f64).sum();
+            let got = dot_q6_k(&raw, &aq) as f64;
+            let scale: f64 = w.iter().zip(&act_rt).map(|(a, b)| (*a as f64 * *b as f64).abs()).sum();
+            assert!((want - got).abs() <= 2e-6 * scale, "{blocks} blocks: want {want}, got {got}, |terms| {scale}");
+            // and against the true activation it is the usual percent-class agreement
+            let truth: f64 = w.iter().zip(&act).map(|(a, b)| *a as f64 * *b as f64).sum();
+            assert!((truth - got).abs() <= 0.02 * scale, "{blocks} blocks vs true activation: {truth} vs {got}");
+        }
+    }
+
+    /// Weights scale per 16, activations per 32: each activation block straddles two scales. Make
+    /// exactly ONE of the 16 sub-block scales non-zero and the dot must see exactly that sub-block —
+    /// a sum taken per 32 with either neighbour's scale gets this wrong for 15 of the 16.
+    #[test]
+    fn every_q6k_sub_block_uses_its_own_scale() {
+        let base = q6k_bytes(1, 4242);
+        let act: Vec<f32> = (0..256).map(|i| ((i % 17) as f32 - 8.0) * 0.5 + 0.25).collect();
+        let aq = quantize_act(&act);
+        let act_rt: Vec<f32> = aq.iter().flat_map(|(d, q)| q.iter().map(move |&v| v as f32 * d)).collect();
+        for live in 0..16usize {
+            let mut raw = base.clone();
+            for s in 0..16 { raw[192 + s] = if s == live { 0x51 } else { 0 }; }
+            let w = crate::gguf::dequantize(14, &raw, 256).unwrap();
+            assert!(w.iter().enumerate().all(|(j, v)| (j / 16 == live) || *v == 0.0), "fixture: only sub-block {live} is live");
+            let want: f64 = w.iter().zip(&act_rt).map(|(a, b)| *a as f64 * *b as f64).sum();
+            let got = dot_q6_k(&raw, &aq) as f64;
+            assert!(want.abs() > 1e-3, "sub-block {live}: a zero expectation would prove nothing");
+            assert!((want - got).abs() <= 1e-5 * want.abs(), "sub-block {live}: want {want}, got {got}");
+        }
+    }
+
+    #[test]
+    fn q6k_negative_scales_and_truncation() {
+        // scales are SIGNED int8; reading them unsigned flips the sign of half the model
+        let mut raw = q6k_bytes(1, 5);
+        for s in 0..16 { raw[192 + s] = 0xF0; } // -16
+        let act = vec![0.5f32; 256];
+        let aq = quantize_act(&act);
+        let w = crate::gguf::dequantize(14, &raw, 256).unwrap();
+        let want: f32 = w.iter().map(|v| v * 0.5).sum();
+        let got = dot_q6_k(&raw, &aq);
+        assert!(want.abs() > 1e-3 && (want - got).abs() <= 1e-4 * want.abs().max(1.0), "want {want}, got {got}");
+        raw.truncate(150);
+        assert_eq!(dot_q6_k(&raw, &aq), 0.0, "a truncated block stops rather than reading past the map");
+    }
+
+    /// Through the pool, as the caller will use it: a [rows, k] Q6_K matrix, every row against the
+    /// per-row reference, and the type plumbing (row_bytes, from_gguf) the loader would key on.
+    #[test]
+    fn q6k_matvec_through_the_pool_matches_per_row() {
+        assert_eq!(Quant::from_gguf(14), Some(Quant::Q6_K));
+        assert_eq!(Quant::Q6_K.row_bytes(1024), 4 * 210);
+        let (rows, k) = (37usize, 512usize);
+        let raw = q6k_bytes(rows * k / 256, 31337);
+        let act: Vec<f32> = (0..k).map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.31).collect();
+        let prep = ActPrep::new(&act);
+        let pool = crate::cpupool::Pool::new(3);
+        let got = matvec(&pool, Quant::Q6_K, &raw, rows, k, &prep);
+        assert_eq!(got.len(), rows);
+        let rb = Quant::Q6_K.row_bytes(k);
+        for r in 0..rows {
+            assert_eq!(got[r], dot_q6_k(&raw[r * rb..(r + 1) * rb], &prep.q), "row {r}");
+        }
+        assert!(got.iter().any(|v| *v != 0.0) && got.windows(2).any(|w| w[0] != w[1]), "rows are distinct and non-zero");
+    }
+
     #[test]
     fn the_q4k_min_term_uses_the_UNQUANTIZED_activation_sum() {
         // sum(w*a) = d*sc*sum(nib*a) - dmin*m*sum(a). The second sum is over the ORIGINAL floats:
@@ -577,7 +732,11 @@ mod tests {
         // failure this project keeps paying for. Unsupported means fall back to the GPU, not improvise.
         assert_eq!(Quant::from_gguf(8), Some(Quant::Q8_0));
         assert_eq!(Quant::from_gguf(12), Some(Quant::Q4_K));
-        for t in [14u32, 19, 0, 1, 99] { assert_eq!(Quant::from_gguf(t), None, "type {t}"); }
+        // 14 (Q6_K) sat in the None list until dot_q6_k existed. It left the list WITH its kernel and
+        // an oracle test, which is the only way a type should ever leave it. Q5_K (13) and Q3_K (11)
+        // are what a Q4_K_S / Q3_K_M file would add next; they are still refused.
+        assert_eq!(Quant::from_gguf(14), Some(Quant::Q6_K));
+        for t in [13u32, 11, 10, 19, 0, 1, 99] { assert_eq!(Quant::from_gguf(t), None, "type {t}"); }
     }
 
     #[test]

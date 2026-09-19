@@ -186,6 +186,12 @@ than guessing a layout", ti.ggml_type))?;
             // GGUF dims are [cols, rows]: ne0 varies fastest and is the reduction dimension.
             let cols = *ti.dims.first().unwrap_or(&0) as usize;
             let rows = ti.dims.get(1).copied().unwrap_or(1) as usize;
+            // A row that is not whole blocks has no layout in this format. Without this, row_bytes
+            // divides to 0 and the matvec returns a row of zeros — silence, not an error. It only
+            // became reachable for k-quants when their types became readable, which is how it surfaced.
+            if !quant.fits(cols) {
+                return Err(format!("{name} is {quant:?} with {cols} columns, not a multiple of its {}-weight block — no such row exists on disk; fall back to the GPU rather than guessing a layout", quant.block()));
+            }
             Ok(TensorRef { off: data_off + ti.offset as usize, rows, cols, quant })
         };
         let l = LayerRef {
@@ -460,15 +466,36 @@ mod tests {
         // Reading a Q6_K tensor as Q4_K produces plausible garbage. The message says to fall back to the
         // GPU, because that is the actual remedy rather than a request to fix the file.
         let mut raw = gguf_one_layer();
-        // rewrite the first tensor's ggml_type to 14 (Q6_K)
+        // rewrite the first tensor's ggml_type to 13 (Q5_K — no CPU kernel). This was 14 until
+        // Q6_K got one; see a_kquant_row_that_is_not_whole_blocks_is_refused for what 14 does now.
+        let pos = raw.windows(4).position(|w| w == 8u32.to_le_bytes()).unwrap();
+        raw[pos..pos + 4].copy_from_slice(&13u32.to_le_bytes());
+        let g = crate::gguf::parse(&raw).expect("parse");
+        let sh = Shape { d: 64, ff: 256, n_heads: 4, n_kv_heads: 2, head_dim: 16, n_layers: 1,
+                         rope_base: 10000.0, eps: 1e-5 };
+        let e = layers_from_gguf(&g, &sh, 0).unwrap_err();
+        assert!(e.contains("ggml type 13"), "{e}");
+        assert!(e.contains("fall back to the GPU rather than guessing"), "{e}");
+    }
+
+    #[test]
+    fn a_kquant_row_that_is_not_whole_blocks_is_refused() {
+        // This fixture's attn_q is 64 columns wide. Relabelled Q6_K (256-weight blocks) it is a
+        // READABLE type with an IMPOSSIBLE row: row_bytes(64) is 0, and the matvec would have
+        // returned 64 rows of zeros without a word. Found because making Q6_K readable turned the
+        // test above from "refused" into "accepted" — the type check had been hiding the width check
+        // that was never there.
+        let mut raw = gguf_one_layer();
         let pos = raw.windows(4).position(|w| w == 8u32.to_le_bytes()).unwrap();
         raw[pos..pos + 4].copy_from_slice(&14u32.to_le_bytes());
         let g = crate::gguf::parse(&raw).expect("parse");
         let sh = Shape { d: 64, ff: 256, n_heads: 4, n_kv_heads: 2, head_dim: 16, n_layers: 1,
                          rope_base: 10000.0, eps: 1e-5 };
         let e = layers_from_gguf(&g, &sh, 0).unwrap_err();
-        assert!(e.contains("ggml type 14"), "{e}");
-        assert!(e.contains("fall back to the GPU rather than guessing"), "{e}");
+        assert!(e.contains("Q6_K with 64 columns") && e.contains("256-weight block"), "{e}");
+        assert_eq!(Quant::Q6_K.row_bytes(64), 0, "the silent zero this refusal stands in front of");
+        assert!(Quant::Q6_K.fits(4096) && Quant::Q4_K.fits(1024) && Quant::Q8_0.fits(64));
+        assert!(!Quant::Q4_K.fits(64) && !Quant::Q8_0.fits(48) && !Quant::Q6_K.fits(0));
     }
 
     #[test]
@@ -490,8 +517,11 @@ mod tests {
         // error — the failure mode that has cost this project more time than every crash combined. So
         // the message names the tensor, the type, and says falling back to the GPU is the RIGHT answer
         // rather than a workaround.
-        let e = Quant::from_gguf(14);
-        assert!(e.is_none(), "Q6_K is not a CPU format yet");
+        // Q5_K here, not Q6_K as this test first had it: Q6_K became a CPU format (cpumatvec::dot_q6_k)
+        // so that a Q4_K_M file — Q4_K gate/up, Q6_K ffn_down — is readable end to end. The point of
+        // the test is unchanged: a type without a kernel is None, never a neighbouring layout.
+        let e = Quant::from_gguf(13);
+        assert!(e.is_none(), "Q5_K is not a CPU format yet");
         // and the message the planner would produce says so — checked here rather than by building a
         // whole Gguf, since the wording is the thing being asserted
         let msg = format!("blk.0.ffn_down.weight is ggml type {} which the CPU path does not read — falling back to the GPU is correct here; reading it as another format would produce plausible garbage", 14);
