@@ -433,6 +433,17 @@ fn write_gguf_qwen35moe_hybrid(shexp: u8, out_scale: Option<f32>) -> Vec<u8> {
 /// (imrope.rs) runs against real metadata bytes. The attention block here rotates 16 dims = 8
 /// pairs: [3, 3, 2, 0] keeps every pair on t/h/w; [4, 2, 2, 0] sends pair 7 to the e channel.
 fn write_gguf_qwen35moe_hybrid_sections(shexp: u8, out_scale: Option<f32>, sections: Option<[i32; 4]>) -> Vec<u8> {
+    write_gguf_qwen35moe_hybrid_full(shexp, out_scale, sections, false)
+}
+/// `centered`: draw the weights from [-amp, amp) instead of this file's usual [-amp, 0).
+///
+/// The usual generator is `u/2^23 - 1`: every weight NEGATIVE, so every token embeds to nearly the
+/// same vector, and everything downstream of the embedding is nearly the same for every token —
+/// each token's conv input, its decay, its beta. On that fixture a chunked DeltaNet kernel that
+/// reads TOKEN 0's projection (or token 0's decay/beta) for every token in the chunk PASSES: two
+/// break tests said so. A fixture for anything per-token has to have tokens that differ. The
+/// existing gates keep the generator they were written against; --gate-prefill-parity asks for this.
+fn write_gguf_qwen35moe_hybrid_full(shexp: u8, out_scale: Option<f32>, sections: Option<[i32; 4]>, centered: bool) -> Vec<u8> {
     let (d, vocab, h) = (64usize, 32usize, 128usize);
     let (heads, kvh, hd) = (4usize, 2usize, 16usize);          // blk.1 attention
     let (sst, hk, hv, dconv) = (8usize, 2usize, 4usize, 4usize); // blk.0 deltanet
@@ -442,7 +453,8 @@ fn write_gguf_qwen35moe_hybrid_sections(shexp: u8, out_scale: Option<f32>, secti
     let mk = |seed: u32, n: usize| -> Vec<f32> {
         let mut v = Vec::with_capacity(n); let mut x = seed | 1;
         for _ in 0..n { x = x.wrapping_mul(1664525).wrapping_add(1013904223);
-            v.push(((x >> 9) as f32 / (1u32 << 23) as f32 - 1.0) * 0.05); }
+            let u = (x >> 9) as f32 / (1u32 << 23) as f32;                       // [0, 1)
+            v.push(if centered { (u * 2.0 - 1.0) * 0.12 } else { (u - 1.0) * 0.05 }); }
         v };
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
@@ -1445,7 +1457,7 @@ fn main() {
             // the ONLY thing this family has that the prefill blocks used to lack.
             ("gemma3-shaped (embedding scale and nothing else)", write_gguf_qwen3_as(&hm, &qn, &kn, "gemma3", "gemma3")),
             ("qwen3 (QK-norm)", write_gguf_qwen3(&hm, &qn, &kn)),
-            ("qwen35moe hybrid (Gated DeltaNet + gated attention + MoE)", write_gguf_qwen35moe_hybrid(1, None)),
+            ("qwen35moe hybrid (Gated DeltaNet + gated attention + MoE)", write_gguf_qwen35moe_hybrid_full(1, None, None, true)),
             ("gemma4 alt-V (embed scale, V-norm, V-from-K, post norms)", write_gguf_gemma4_altv(false)),
             ("deepseek2 (MLA)", write_gguf_deepseek2_mla()),
         ];
@@ -1477,54 +1489,55 @@ fn main() {
                     a.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| e.clone()), b.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| e.clone())), false),
             }
         }
-        // WHAT A PROMPT TOKEN COSTS on the sequential route, both ways, on the hybrid. The layers-only
-        // path must be BIT-identical at the end and must not pay the head, the copy, or a sync per token.
+        // WHAT A PROMPT TOKEN COSTS on the hybrid, three ways, quantized-resident as the app loads:
+        //   (a) sequential, decode_step per token       — what d297e4df5 did, and what came back first
+        //   (b) sequential, layers only, windowed       — no LM head, no readback, one sync per window
+        //   (c) CHUNKED — DeltaNet's token loop inside DELTANET_CONV_T / _STEP_T; five dispatches a
+        //       layer per CHUNK instead of per token
+        // (a) and (b) are the same kernels, so BIT-identical. (c) projects with a GEMM where decode
+        // uses a fused norm+matvec, so it is held to a tolerance — the same one the families above get.
         {
             use std::sync::atomic::Ordering::Relaxed;
             let snap = || [gpu_kernels::GPU_DISPATCHES.load(Relaxed), gpu_kernels::GPU_SUBMITS.load(Relaxed), gpu_kernels::GPU_POLLS.load(Relaxed), gpu_kernels::GPU_COPIES.load(Relaxed)];
-            let bytes = write_gguf_qwen35moe_hybrid(1, None);
+            let bytes = write_gguf_qwen35moe_hybrid_full(1, None, None, true);   // centered: tokens must DIFFER, see the writer
             let prompt: Vec<u32> = (0..33u32).map(|i| 1 + (i * 7) % 30).collect();
-            let mut measure = |with_logits: bool| -> (Vec<f32>, [f64; 4]) {
-                if with_logits { std::env::set_var("LOGSCOPE_PREFILL_SEQ_LOGITS", "1"); } else { std::env::remove_var("LOGSCOPE_PREFILL_SEQ_LOGITS"); }
-                // QUANTIZED-resident, as the app loads: f32 stacks make the GPU-routed MoE path decline to
-                // readback routing, which adds a sync per MoE layer per token and hides what is being measured.
+            let mut measure = |sequential: bool, with_logits: bool, chunk: usize| -> (Vec<f32>, Vec<f32>, [f64; 4]) {
+                for (k, on) in [("LOGSCOPE_PREFILL_SEQUENTIAL", sequential), ("LOGSCOPE_PREFILL_SEQ_LOGITS", with_logits)] {
+                    if on { std::env::set_var(k, "1"); } else { std::env::remove_var(k); }
+                }
                 let m = gpu.load_gguf_opt(&bytes, true).expect("load");
-                let c = gpu.new_cache_for(&m, prompt.len() + 2);
-                let causes = || [gpu_kernels::SUBMIT_BY_PASSES.load(Relaxed), gpu_kernels::SUBMIT_BY_RETAIN.load(Relaxed), gpu_kernels::SUBMIT_BY_DOWNLOAD.load(Relaxed),
-                                 gpu_kernels::SUBMIT_BY_DIMS_WRAP.load(Relaxed), gpu_kernels::SUBMIT_BY_END_FRAME.load(Relaxed), gpu_kernels::SUBMIT_BY_NO_FRAME.load(Relaxed)];
-                let c0 = causes();
+                let c = gpu.new_cache_for(&m, prompt.len() + 3);
                 let before = snap();
-                gpu_kernels::dispatch_histogram_reset();
-                let l = gpu.prefill_chunked(&m, &c, &prompt, 512);
+                let l = gpu.prefill_chunked(&m, &c, &prompt, chunk);
                 gpu.end_frame();
                 let after = snap();
-                if std::env::var_os("GATE_DEBUG").is_some() {
-                    let c1 = causes();
-                    println!("    debug ({}): submits by cause over {} tokens — passes {} retain {} download {} dims-wrap {} end_frame {} no-frame {}",
-                        if with_logits { "old" } else { "new" }, prompt.len(), c1[0]-c0[0], c1[1]-c0[1], c1[2]-c0[2], c1[3]-c0[3], c1[4]-c0[4], c1[5]-c0[5]);
-                    let mut h: Vec<(String, u64)> = gpu_kernels::dispatch_histogram().iter()
-                        .map(|(id, c)| (gpu_kernels::shader_label(*id).unwrap_or_else(|| format!("pipeline@{id:x}")).chars().take(28).collect(), *c as u64)).collect();
-                    h.sort();
-                    println!("    debug ({}): {}", if with_logits { "old" } else { "new" }, h.iter().map(|(k, c)| format!("{k}={c}")).collect::<Vec<_>>().join(" "));
-                }
-                std::env::remove_var("LOGSCOPE_PREFILL_SEQ_LOGITS");
+                // one decode step AFTER the prompt: it reads the recurrent state and the ring the
+                // prefill left behind, so a wrong state shows here even if the prompt's last logits agree
+                let l2 = gpu.decode_step(&m, &c, 5, prompt.len());
+                gpu.end_frame();
+                for k in ["LOGSCOPE_PREFILL_SEQUENTIAL", "LOGSCOPE_PREFILL_SEQ_LOGITS"] { std::env::remove_var(k); }
                 let n = prompt.len() as f64;
-                (l, [(after[0] - before[0]) as f64 / n, (after[1] - before[1]) as f64 / n, (after[2] - before[2]) as f64 / n, (after[3] - before[3]) as f64 / n])
+                (l, l2, [(after[0] - before[0]) as f64 / n, (after[1] - before[1]) as f64 / n, (after[2] - before[2]) as f64 / n, (after[3] - before[3]) as f64 / n])
             };
-            let (la, a) = measure(true);
-            let (lb, b) = measure(false);
+            let (la, la2, a) = measure(true, true, 512);
+            let (lb, lb2, b) = measure(true, false, 512);
+            let (lc, lc2, c) = measure(false, false, 512);
+            let (ld, ld2, d) = measure(false, false, 7);      // 33 tokens in chunks of 7: five chunk boundaries, a ragged last one
             println!("  hybrid, 33-token prompt, per prompt token [dispatches, submits, polls, copies]:");
-            println!("    decode_step per token (old): {:.2} {:.2} {:.2} {:.2}", a[0], a[1], a[2], a[3]);
-            println!("    layers only, windowed (new): {:.2} {:.2} {:.2} {:.2}", b[0], b[1], b[2], b[3]);
-            ck("layers-only prefill ends on BIT-identical logits".to_string(), la == lb && !la.is_empty() && la.iter().all(|v| v.is_finite()));
-            // POLLS are the blocking syncs and fall to one per window. SUBMITS only halve, and that is
-            // by design: `flush_every` bounds the passes one submit may carry (the watchdog governor
-            // the SubmitTuner sweeps), so a token's ~28 passes still close a frame about once a token.
-            // Those submits do not block the CPU; the download's did. My first threshold demanded
-            // they vanish too — the cause tally (GATE_DEBUG=1) says 28 of 34 are SUBMIT_BY_PASSES.
-            ck(format!("it BLOCKS once per window, not once per token (polls/token {:.2} -> {:.2}; submits/token {:.2} -> {:.2}, the rest are flush_every's)", a[2], b[2], a[1], b[1]),
-               b[2] <= a[2] * 0.25 && b[1] <= a[1] * 0.6);
-            ck(format!("and the LM head is not run for discarded logits (dispatches/token {:.2} -> {:.2})", a[0], b[0]), b[0] < a[0] - 1.5);
+            println!("    (a) sequential, decode_step/token : {:>6.2} {:.2} {:.2} {:.2}", a[0], a[1], a[2], a[3]);
+            println!("    (b) sequential, layers only       : {:>6.2} {:.2} {:.2} {:.2}", b[0], b[1], b[2], b[3]);
+            println!("    (c) chunked, one chunk            : {:>6.2} {:.2} {:.2} {:.2}", c[0], c[1], c[2], c[3]);
+            println!("    (d) chunked, chunks of 7          : {:>6.2} {:.2} {:.2} {:.2}", d[0], d[1], d[2], d[3]);
+            let diff = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| if p.is_finite() && q.is_finite() { (p - q).abs() } else { f32::INFINITY }).fold(0f32, f32::max);
+            let scale = la.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            ck("(b) layers-only sequential ends on BIT-identical logits, prompt and next step".to_string(), la == lb && la2 == lb2 && !la.is_empty() && la.iter().all(|v| v.is_finite()));
+            ck(format!("(b) BLOCKS once per window, not once per token (polls/token {:.2} -> {:.2}; submits {:.2} -> {:.2}, the rest are flush_every's)", a[2], b[2], a[1], b[1]), b[2] <= a[2] * 0.25 && b[1] <= a[1] * 0.6);
+            ck(format!("(b) does not run the LM head for discarded logits (dispatches/token {:.2} -> {:.2})", a[0], b[0]), b[0] < a[0] - 1.5);
+            ck(format!("(c) chunked prefill agrees with sequential: prompt max |Δ| {:.2e}, NEXT decode step {:.2e} (logit scale {scale:.2e})", diff(&la, &lc), diff(&la2, &lc2)),
+               diff(&la, &lc) <= 2e-4 * scale.max(1.0) && diff(&la2, &lc2) <= 2e-4 * scale.max(1.0));
+            ck(format!("(d) the state crosses five chunk boundaries intact: prompt {:.2e}, next step {:.2e}", diff(&la, &ld), diff(&la2, &ld2)),
+               diff(&la, &ld) <= 2e-4 * scale.max(1.0) && diff(&la2, &ld2) <= 2e-4 * scale.max(1.0));
+            ck(format!("(c) costs a fraction of the launches: {:.2} -> {:.2} dispatches per prompt token ({:.0}x fewer)", a[0], c[0], a[0] / c[0].max(1e-9)), c[0] * 8.0 <= a[0]);
         }
         println!("gate-prefill-parity: {}", if ok { "prefill agrees with decode for every family \u{2713}" } else { "FAIL \u{2717}" });
         std::process::exit(if ok { 0 } else { 1 });

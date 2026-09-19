@@ -7930,7 +7930,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     fn block_prefill(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, t: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         // The prefill blocks were the only block fns with no refuse-by-name guard. See Model::prefill_gap.
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_prefill");
-        Self::refuse_attn_variants_where_unapplied(w, "block_prefill");
+        Self::refuse_attn_variants_in_prefill(w, "block_prefill");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -7948,6 +7948,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         self.write_rows(kc, &k, 0, t, kv);
         self.write_rows(vc, &v, 0, t, kv);
         let attn = self.attention_mh_t(&q, &k, &v, t, ad, n_heads, n_kv_heads);
+        let attn = self.attn_out_gated(w, attn, &n1, t);
         // Same fusion as the annotated site above: the residual folds into the matvec epilogue.
         let x2 = w.wo.apply_add(self, &attn, t, x);
         self.ffn_apply(w, &x2, t, d, eps)
@@ -7959,7 +7960,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// Mirrors `block_prefill` but starting from a non-zero base with a populated cache.
     fn block_prefill_ext(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, base: usize, s: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base_freq: f32, eps: f32) -> Tensor {
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_prefill_ext");
-        Self::refuse_attn_variants_where_unapplied(w, "block_prefill_ext");
+        Self::refuse_attn_variants_in_prefill(w, "block_prefill_ext");
         let base_freq = w.rope_base.unwrap_or(base_freq);      // Gemma: windowed layers use freq_base_swa
         let base_freq = if w.nope { 0.0 } else { base_freq };   // Llama4 iRoPE NoPE switch
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
@@ -7975,6 +7976,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         self.write_rows(vc, &v, base, s, kv);
         // per-row sliding window, from this layer's config (None = causal only)
         let attn = self.attention_mh_ext_swa(&q, kc, vc, base, s, ad, n_heads, n_kv_heads, w.swa);
+        let attn = self.attn_out_gated(w, attn, &n1, s);
         // Fuse the attention residual into the projection's epilogue: apply_add is what the
         // FFN's down-projection has always used, and it was simply never called here. An ADD
         // of two [1, d] vectors is 8 KB of work behind a full dispatch — one per layer, on a
@@ -7988,6 +7990,21 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// to T sequential `decode_step`s but a single pass — and it projects only the last
     /// row to logits instead of all T (the per-token output projection sequential
     /// prefill wastes on the discarded rows).
+    /// One layer of a prompt chunk. A Gated DeltaNet layer takes its batched GPU block; every
+    /// other layer takes `block_prefill_ext`, which refuses by name what it cannot do. Per-LAYER
+    /// routing, as in decode: a hybrid interleaves the two kinds three to one.
+    fn prefill_layer(&self, m: &Model, c: &KvCache, li: usize, x: &Tensor, pos: usize, s: usize) -> Tensor {
+        let w = &m.layers[li];
+        if let Some(dl) = &w.deltanet {
+            let dg = w.deltanet_gpu.as_ref().unwrap_or_else(|| panic!(
+                "layer {li} is Gated DeltaNet with no GPU-resident weights — Model::prefill_gap routes such a model through prefill_sequential, so a batched prefill should never have reached it"));
+            let sg = c.deltanet_gpu.as_ref().and_then(|v| v[li].as_ref()).unwrap_or_else(|| panic!(
+                "layer {li} is Gated DeltaNet but this cache has no GPU recurrent state slot — built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get per-layer states"));
+            return self.block_prefill_deltanet_gpu(w, dl, dg, sg, x, pos, s, m.d, m.eps);
+        }
+        self.block_prefill_ext(w, x, &m.rope_factors, &c.k[li], &c.v[li], pos, s, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps)
+    }
+
     /// Prefill by decoding — the route for every model `Model::prefill_gap` names, and the
     /// reference --gate-prefill-parity holds batched prefill to.
     ///
@@ -8049,6 +8066,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         Self::scale_embed_rows(m, &mut xh);
         let mut x = self.upload(&xh, t, m.d);
         for li in 0..m.n_layers {
+            if m.layers[li].deltanet.is_some() { x = self.prefill_layer(m, c, li, &x, 0, t); continue; }
             x = self.block_prefill(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li], t, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, t, m.d, m.eps);
@@ -8114,10 +8132,7 @@ prompt tokenises fine and then indexes past the embedding table.", m.embed.len()
             }
             Self::scale_embed_rows(m, &mut xh);
             let mut x = self.upload(&xh, s, m.d);
-            for li in 0..m.n_layers {
-                x = self.block_prefill_ext(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li],
-                                           first_pos + start, s, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
-            }
+            for li in 0..m.n_layers { x = self.prefill_layer(m, c, li, &x, first_pos + start, s); }
             if end == t {
                 let xn = self.rmsnorm_t(&x, &m.out_norm, s, m.d, m.eps);
                 let last = self.alloc(1, m.d);
@@ -9594,6 +9609,131 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
   }
 }"#;
 
+/// DELTANET_CONV over a CHUNK of `nt` tokens in one dispatch.
+///
+/// Still one thread per channel, and a channel's ring is private to its thread — so the token
+/// loop goes INSIDE the thread and performs, per token, exactly the statements DELTANET_CONV
+/// performs, in the same order, on the same values. Bit-identical to `nt` sequential dispatches
+/// of the single-token kernel; --gate-prefill-parity holds the two against each other.
+/// P rows are [qkv(cd) | z(vd) | betaL(hv) | alphaL(hv)], stride cd+vd+2hv. G rows stride cd+2hv.
+const DELTANET_CONV_T: &str = r#"
+// DELTANET_CONV_T
+struct D { cd:u32, dconv:u32, hv:u32, vd:u32, nt:u32, _a:u32, _b:u32, _c:u32 };
+@group(0)@binding(0) var<storage,read> p: array<f32>;
+@group(0)@binding(1) var<storage,read> c: array<f32>;
+@group(0)@binding(2) var<storage,read_write> ring: array<f32>;
+@group(0)@binding(3) var<storage,read_write> g: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+fn softplus(x: f32) -> f32 { return max(x, 0.0) + log(1.0 + exp(-abs(x))); }
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let i = gid.y * nwg.x * 64u + gid.x;
+  let ps = d.cd + d.vd + 2u * d.hv;
+  let gs = d.cd + 2u * d.hv;
+  if (i < d.cd) {
+    let hist = d.dconv - 1u;
+    let rb = i * hist;
+    for (var tk = 0u; tk < d.nt; tk = tk + 1u) {
+      let pv = p[tk * ps + i];
+      var acc = 0.0;
+      for (var t = 0u; t < hist; t = t + 1u) { acc = acc + c[i * d.dconv + t] * ring[rb + t]; }
+      acc = acc + c[i * d.dconv + hist] * pv;
+      for (var t = 0u; t + 1u < hist; t = t + 1u) { ring[rb + t] = ring[rb + t + 1u]; }
+      ring[rb + hist - 1u] = pv;
+      g[tk * gs + i] = acc / (1.0 + exp(-acc));
+    }
+  } else if (i < d.cd + d.hv) {
+    let j = i - d.cd;
+    for (var tk = 0u; tk < d.nt; tk = tk + 1u) {
+      let b = p[tk * ps + d.cd + d.vd + j];
+      g[tk * gs + d.cd + j] = 1.0 / (1.0 + exp(-b));
+    }
+  } else if (i < d.cd + 2u * d.hv) {
+    let j = i - d.cd - d.hv;
+    let dt = c[d.cd * d.dconv + j];
+    let av = c[d.cd * d.dconv + d.hv + j];
+    for (var tk = 0u; tk < d.nt; tk = tk + 1u) {
+      let al = p[tk * ps + d.cd + d.vd + d.hv + j];
+      g[tk * gs + d.cd + d.hv + j] = softplus(al + dt) * av;
+    }
+  }
+}"#;
+
+/// DELTANET_STEP over a CHUNK of `nt` tokens in one dispatch: the recurrence is sequential in the
+/// token, so the token loop is the OUTER loop of the kernel and the state never leaves the GPU.
+///
+/// Same shape as DELTANET_STEP — one workgroup per head, state rows strided over 64 threads, each
+/// row thread-private — with the three phases (head scalars on thread 0 / rows on every thread /
+/// gated norm on thread 0) inside `for tk`. The loop bound comes from the uniform buffer, so
+/// control flow is uniform and the barriers are legal inside it. Thread 0 finishes token tk's norm
+/// and sets up token tk+1's scalars before it reaches the next barrier, where the others wait.
+/// Per token the arithmetic is DELTANET_STEP's, statement for statement: bit-identical to `nt`
+/// sequential dispatches.
+const DELTANET_STEP_T: &str = r#"
+// DELTANET_STEP_T
+struct D { s:u32, share:u32, kd:u32, cd:u32, hv:u32, eps:u32, nt:u32, vd:u32 };
+@group(0)@binding(0) var<storage,read> g: array<f32>;
+@group(0)@binding(1) var<storage,read> p: array<f32>;
+@group(0)@binding(2) var<storage,read> nrm: array<f32>;
+@group(0)@binding(3) var<storage,read_write> st: array<f32>;
+@group(0)@binding(4) var<storage,read_write> o: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> qn: f32;
+var<workgroup> kn: f32;
+var<workgroup> decay: f32;
+var<workgroup> beta: f32;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let h = wid.x;
+  let s = d.s;
+  let eps = bitcast<f32>(d.eps);
+  let sh = h / d.share;
+  let ps = d.cd + d.vd + 2u * d.hv;
+  let gs = d.cd + 2u * d.hv;
+  let qscale = 1.0 / sqrt(f32(s));
+  for (var tk = 0u; tk < d.nt; tk = tk + 1u) {
+    let gb = tk * gs;
+    let qb = gb + sh * s;
+    let kb = gb + d.kd + sh * s;
+    let vb = gb + 2u * d.kd + h * s;
+    let ob = tk * d.vd + h * s;
+    if (lid.x == 0u) {
+      var qs = 0.0; var ks = 0.0;
+      for (var i = 0u; i < s; i = i + 1u) { qs = qs + g[qb + i] * g[qb + i]; ks = ks + g[kb + i] * g[kb + i]; }
+      qn = max(sqrt(qs), eps);
+      kn = max(sqrt(ks), eps);
+      decay = exp(g[gb + d.cd + d.hv + h]);
+      beta = g[gb + d.cd + h];
+    }
+    workgroupBarrier();
+    for (var r = lid.x; r < s; r = r + 64u) {
+      let rb = h * s * s + r * s;
+      var yhat = 0.0;
+      for (var cc = 0u; cc < s; cc = cc + 1u) {
+        st[rb + cc] = st[rb + cc] * decay;
+        yhat = yhat + st[rb + cc] * (g[kb + cc] / kn);
+      }
+      let dd = beta * (g[vb + r] - yhat);
+      var ov = 0.0;
+      for (var cc = 0u; cc < s; cc = cc + 1u) {
+        st[rb + cc] = st[rb + cc] + dd * (g[kb + cc] / kn);
+        ov = ov + st[rb + cc] * (g[qb + cc] / qn) * qscale;
+      }
+      o[ob + r] = ov;
+    }
+    workgroupBarrier();
+    if (lid.x == 0u) {
+      var ss = 0.0;
+      for (var i = 0u; i < s; i = i + 1u) { ss = ss + o[ob + i] * o[ob + i]; }
+      let rms = sqrt(ss / f32(s) + eps);
+      for (var i = 0u; i < s; i = i + 1u) {
+        let zv = p[tk * ps + d.cd + h * s + i];
+        o[ob + i] = o[ob + i] / rms * nrm[i] * (zv / (1.0 + exp(-zv)));
+      }
+    }
+  }
+}"#;
+
 const SIGMOID_MUL: &str = r#"
 // SIGMOID_MUL
 struct D { n:u32,_a:u32,_b:u32,_c:u32 };
@@ -10451,13 +10591,21 @@ impl Model {
     /// same model that then decodes. Teaching a prefill block a variant means deleting it from this
     /// list, with --gate-prefill-parity green for a fixture that has it.
     pub fn prefill_gap(&self) -> Option<&'static str> {
+        // The A/B lever: force the token-by-token route for ANY model, to compare against batched
+        // prefill on real hardware (and to blame batched prefill first when a prompt reads wrong).
+        if std::env::var("LOGSCOPE_PREFILL_SEQUENTIAL").as_deref() == Ok("1") { return Some("LOGSCOPE_PREFILL_SEQUENTIAL=1 (forced)"); }
         // NOT listed: the embedding scale. Prefill applies it now (scale_embed_rows), held by the
         // gemma3-shaped family in --gate-prefill-parity — the first variant to leave this list.
         if self.mla.is_some() { return Some("MLA attention"); }
         for w in &self.layers {
-            if w.deltanet.is_some() { return Some("Gated DeltaNet layers (recurrent state advances one token at a time)"); }
+            // Gated DeltaNet LEFT this list for the GPU-resident route: block_prefill_deltanet_gpu runs a
+            // whole chunk with the token loop inside DELTANET_CONV_T / _STEP_T. What remains is the
+            // CPU route (no GPU weights, or LOGSCOPE_DELTANET_CPU=1), which is one token at a time
+            // by construction. The attention OUTPUT GATE left too: both prefill blocks apply it.
+            if w.deltanet.is_some() && (w.deltanet_gpu.is_none() || std::env::var("LOGSCOPE_DELTANET_CPU").as_deref() == Ok("1")) {
+                return Some("Gated DeltaNet layers on the CPU route (recurrent state advances one token at a time)");
+            }
             if w.mla.is_some() { return Some("MLA layers"); }
-            if w.attn_out_gate.is_some() { return Some("gated attention output (Qwen3.5)"); }
             if w.post_attn.is_some() { return Some("a post-attention norm (Gemma 2/3)"); }
             if w.v_norm.is_some() || w.v_from_k { return Some("V-norm / V-from-K (Gemma 4)"); }
         }
@@ -16039,6 +16187,23 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     /// that apply the gate don't call this; paths that don't apply it refuse a gated layer by
     /// name. An ungated pass over a gated layer is not an error state the numerics would reveal —
     /// it is plausibly-shaped output at the wrong magnitude per head, the archfeat failure class.
+    /// `refuse_attn_variants_where_unapplied` for the PREFILL blocks, which — unlike the q8 and
+    /// staged blocks that guard is shared with — do apply the Qwen3.5 attention output gate.
+    fn refuse_attn_variants_in_prefill(w: &BlockWeights, block_fn: &str) {
+        if w.v_norm.is_some() || w.v_from_k || w.post_attn.is_some() {
+            Self::refuse_attn_variants_where_unapplied(w, block_fn);
+        }
+    }
+
+    /// Gated attention (Qwen3.5/3.6) for `t` rows: attn ∘ sigmoid(gate(n1)) before wo. The same two
+    /// calls block_decode makes for one row; both ops are row-generic.
+    fn attn_out_gated(&self, w: &BlockWeights, attn: Tensor, n1: &Tensor, t: usize) -> Tensor {
+        match &w.attn_out_gate {
+            Some(gl) => { let gv = gl.apply(self, n1, t); self.sigmoid_mul_t(&attn, &gv) }
+            None => attn,
+        }
+    }
+
     fn refuse_attn_variants_where_unapplied(w: &BlockWeights, block_fn: &str) {
         if w.v_norm.is_some() || w.v_from_k {
             panic!("{block_fn}: this layer's V is weightless-rmsnormed (and possibly sourced from \
@@ -16137,6 +16302,45 @@ sequence.");
         // ADD — a per-recurrent-layer-per-token saving the named profiler made visible.
         let x2 = dg.wout.apply_add(self, &mix, 1, x);
         self.ffn_apply(w, &x2, 1, d, eps)
+    }
+
+    /// One Gated DeltaNet block over a CHUNK of `s` prompt tokens: the batched twin of
+    /// `block_decode_deltanet_gpu`, and the reason a hybrid's prompt no longer costs a decode
+    /// step per token.
+    ///
+    /// Of the block's five dispatches, three were never sequential at all — the stacked input
+    /// projection, the output projection and the FFN are per-token maps and batch across the chunk
+    /// exactly as an attention block's do. The two that carry state, the causal conv and the
+    /// delta-rule recurrence, take the token loop INSIDE the kernel (DELTANET_CONV_T / _STEP_T),
+    /// where it is bit-identical to running the single-token kernels `s` times. So a chunk is five
+    /// dispatches, not 5·s, and the state never leaves the GPU.
+    ///
+    /// Not bit-identical to DECODE overall, and not meant to be: the projection is a GEMM here and
+    /// a fused norm+matvec there, which differ in the last bits exactly as attention prefill does
+    /// from attention decode. --gate-prefill-parity bounds it, per family, like the others.
+    pub fn block_prefill_deltanet_gpu(&self, w: &BlockWeights, dl: &crate::deltanet::DeltaNetLayerHost,
+                                      dg: &DeltaNetGpuWeights, st: &DeltaNetGpuState,
+                                      x: &Tensor, pos: usize, s: usize, d: usize, eps: f32) -> Tensor {
+        let md = &dl.dims;
+        let np = st.next_pos.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(np == pos,
+            "Gated DeltaNet layers are RECURRENT: this state is at position {np} but prefill asked \
+for positions {pos}..{}. Recurrent state cannot seek — positions must be consumed sequentially \
+from 0 per cache. Build a fresh new_cache_for per sequence.", pos + s);
+        st.next_pos.store(pos + s, std::sync::atomic::Ordering::Relaxed);
+        let (cd, vd, hv, ss) = (md.conv_dim(), md.value_dim(), md.h_v, md.s);
+        let proj = dg.w_all.norm_apply(self, x, &w.g1, d, eps, s);    // [s, cd+vd+2hv]
+        let gbuf = self.alloc(s, cd + 2 * hv);
+        let dims = [cd as u32, md.d_conv as u32, hv as u32, vd as u32, s as u32, 0, 0, 0];
+        self.dispatch_rw(DELTANET_CONV_T, &[&proj, &dg.conv_params, &st.ring], 2, &gbuf,
+                      bytemuck::cast_slice(&dims), wg1((cd + 2 * hv) as u32));
+        let mix = self.alloc(s, vd);
+        let dims2 = [ss as u32, (hv / md.h_k) as u32, md.key_dim() as u32, cd as u32,
+                     hv as u32, eps.to_bits(), s as u32, vd as u32];
+        self.dispatch_rw(DELTANET_STEP_T, &[&gbuf, &proj, &dg.norm, &st.s], 3, &mix,
+                      bytemuck::cast_slice(&dims2), (hv as u32, 1, 1));
+        let x2 = dg.wout.apply_add(self, &mix, s, x);
+        self.ffn_apply(w, &x2, s, d, eps)
     }
 
     pub fn block_decode_deltanet(&self, w: &BlockWeights, dl: &crate::deltanet::DeltaNetLayerHost,
@@ -16994,10 +17198,7 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
         for &id in seg { let st = id as usize * m.d; xh.extend_from_slice(&m.embed[st..st + m.d]); }
         Self::scale_embed_rows(m, &mut xh);
         let mut x = self.upload(&xh, s, m.d);
-        for li in 0..m.n_layers {
-            x = self.block_prefill_ext(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li],
-                                       parent_len, s, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
-        }
+        for li in 0..m.n_layers { x = self.prefill_layer(m, &c, li, &x, parent_len, s); }
         c
     }
 
