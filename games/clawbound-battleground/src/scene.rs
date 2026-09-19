@@ -8,12 +8,19 @@ use crate::consts::{self, Lane, Team, ARENA_RADIUS};
 use crate::gods::{ROSTER, ROSTER_LEN};
 use crate::models;
 use crate::props;
+use crate::puppet::{LeapView, Probe, PuppetInput, StrikeStyle};
 use crate::render::{sphere_in_frustum, terrain_height, Camera, Renderer};
+use crate::rigged::{slot_transforms, QuadRig, Slot, SLOTS};
 use crate::sim::{Game, ProjKind, Rng};
 use crate::vfx::Vfx;
 use crate::voxel::{merge_xform, VoxelMesh};
 
 pub struct Scene {
+    /// Ancestors cut into posable parts: `[ancestor][team][slot]`.
+    pub god_parts: Vec<[[u64; SLOTS]; 2]>,
+    /// One rig per ancestor (teams share anatomy).
+    pub god_rig: Vec<QuadRig>,
+    /// The uncut body. Still what the portrait renderer draws.
     pub god_body: [[u64; 2]; ROSTER_LEN],
     pub god_weapon: [[u64; 2]; ROSTER_LEN],
     pub minion_melee: [u64; 2],
@@ -52,6 +59,29 @@ pub struct PropChunk {
     pub vsize: f32,
 }
 
+/// `puppet::Probe` over the real arena: the terrain height field, the
+/// blockers' walkable humps and cover discs, and the river.
+struct WorldProbe<'a> {
+    blockers: &'a Blockers,
+}
+
+impl Probe for WorldProbe<'_> {
+    fn ground(&self, x: f32, z: f32) -> f32 {
+        // The sim walks the playable floor at y = 0 and sinks the DRAWN cat
+        // by the water depth, so the river bed is not "ground" here.
+        terrain_height(x, z).max(0.0)
+    }
+    fn step_top(&self, x: f32, z: f32) -> Option<f32> {
+        self.blockers.step_top(x, z)
+    }
+    fn cover(&self, x: f32, z: f32) -> f32 {
+        self.blockers.concealment_at(x, z)
+    }
+    fn water(&self, x: f32, z: f32) -> f32 {
+        consts::water_depth(x, z)
+    }
+}
+
 fn solid_tint(c: [f32; 3]) -> [f32; 4] {
     [c[0], c[1], c[2], 1.0]
 }
@@ -66,18 +96,31 @@ impl Scene {
 
         let mut god_body = [[0u64; 2]; ROSTER_LEN];
         let mut god_weapon = [[0u64; 2]; ROSTER_LEN];
+        let mut god_parts = Vec::with_capacity(ROSTER_LEN);
+        let mut god_rig = Vec::with_capacity(ROSTER_LEN);
         for (i, def) in ROSTER.iter().enumerate() {
+            let mut parts = [[0u64; SLOTS]; 2];
             for team in [Team::Blue, Team::Red] {
                 let ti = team as usize;
                 let body = models::build_god(def, team);
                 total += body.inst.len();
                 god_body[i][ti] = r.upload_mesh(&body);
+                let rigged = models::build_god_rigged(def, team);
+                for (s, m) in rigged.meshes.iter().enumerate() {
+                    total += m.inst.len();
+                    parts[ti][s] = r.upload_mesh(m);
+                }
+                if ti == 0 {
+                    god_rig.push(rigged.rig);
+                }
                 if let Some(w) = models::build_weapon(def.weapon, def, team) {
                     total += w.inst.len();
                     god_weapon[i][ti] = r.upload_mesh(&w);
                 }
             }
+            god_parts.push(parts);
         }
+        assert_eq!((god_parts.len(), god_rig.len()), (ROSTER_LEN, ROSTER_LEN), "one cut body and one rig per ancestor");
 
         let mut minion_melee = [0u64; 2];
         let mut minion_caster = [0u64; 2];
@@ -160,6 +203,8 @@ impl Scene {
         let boulder = r.upload_mesh(&boulder);
 
         Scene {
+            god_parts,
+            god_rig,
             god_body,
             god_weapon,
             minion_melee,
@@ -340,7 +385,15 @@ impl Scene {
             }
         }
 
-        // gods
+        // gods — posed per part. `puppet` decides what the body is doing,
+        // `creature-rig` poses the boxes, `rigged` turns boxes into matrices.
+        let world = WorldProbe { blockers: &game.blockers };
+        let dt = (vfx.time - vfx.puppets.last_time).clamp(0.0, 0.1);
+        vfx.puppets.last_time = vfx.time;
+        vfx.puppets.ensure(game.gods.len());
+        let mut pevents = std::mem::take(&mut vfx.puppets.events);
+        pevents.clear();
+        let mut posed = Vec::new();
         for i in 0..game.gods.len() {
             let g = &game.gods[i];
             if g.respawn_t > 0.0 {
@@ -349,24 +402,47 @@ impl Scene {
             let ti = g.team as usize;
             let def = game.def(i);
             let di = g.def_id as usize;
-            let moving = g.move_dir.length_squared() > 0.01;
-            let bob = if moving { (g.walk_anim * 2.0).sin().abs() * 0.09 } else { (g.walk_anim * 0.7).sin() * 0.02 };
-            let lean = if moving { (g.walk_anim * 2.0).sin() * 0.045 } else { 0.0 };
-            let lunge = g.atk_anim * 0.45;
-            let fwd = Vec3::new(g.yaw.cos(), 0.0, g.yaw.sin());
+            let rig = &self.god_rig[di];
+            let leap = g.dash.as_ref().map(|d| {
+                // The sim's dash arc is y = 1.4 a (1 - a); its slope over
+                // ground covered is what the body pitches along.
+                let a = (d.t / d.dur.max(1e-3)).clamp(0.0, 1.0);
+                let run = Vec3::new(d.to.x - d.from.x, 0.0, d.to.z - d.from.z).length().max(0.5);
+                LeapView::Flight { t: a, climb: 1.4 * (1.0 - 2.0 * a) / run * 2.0 }
+            });
+            let inp = PuppetInput {
+                pos: g.pos,
+                yaw: g.yaw,
+                hp01: (g.hp / g.max_hp.max(1.0)).clamp(0.0, 1.0),
+                atk_pulse: g.atk_anim,
+                strike_style: if def.auto_range > 6.0 { StrikeStyle::Snap } else { StrikeStyle::Swipe },
+                leap,
+                perched: false,
+            };
+            let puppet = &mut vfx.puppets.puppets[i];
+            puppet.advance(dt, &inp, rig, &world, &mut pevents);
+            let pose = puppet.pose(&inp, rig);
+            creature_rig::pose(rig.parts(), rig.torso_half, &pose.motion, None, &mut posed);
+            let mats = slot_transforms(rig, &posed, &pose.legs, &pose.body);
+
             // wading: sink toward the bed (capped so the head stays clear)
             let sink = consts::water_depth(g.pos.x, g.pos.z).min(0.9);
-            let pos = g.pos + fwd * lunge + Vec3::Y * (bob - sink);
-            let base = Mat4::from_translation(pos)
-                * Mat4::from_axis_angle(Vec3::Y, g.yaw - std::f32::consts::FRAC_PI_2)
-                * Mat4::from_axis_angle(Vec3::Z, lean);
-            r.queue_draw(self.god_body[di][ti], base, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
+            // Model faces +Z; glam's rotation_y(t) sends +Z to (sin t, 0,
+            // cos t), so facing (cos yaw, 0, sin yaw) needs t = pi/2 - yaw.
+            // This read `yaw - pi/2`, which mirrors the facing in X: right
+            // on the north-south lanes, backwards on any east-west run.
+            let base = Mat4::from_translation(g.pos + Vec3::Y * (pose.lift - sink))
+                * Mat4::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2 - g.yaw);
+            for (s, m) in mats.iter().enumerate() {
+                r.queue_draw(self.god_parts[di][ti][s], base * *m, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
+            }
 
             if self.god_weapon[di][ti] != 0 {
+                // The weapon rides the torso, so it lunges and rears with it.
                 let anchor = models::weapon_anchor(def);
-                let swing = -g.atk_anim * 1.5
-                    + if moving { (g.walk_anim * 2.0).sin() * 0.25 } else { (vfx.time * 1.4).sin() * 0.06 };
+                let swing = -g.atk_anim * 1.5 + (vfx.time * 1.4).sin() * 0.06;
                 let wm = base
+                    * mats[Slot::Torso as usize]
                     * Mat4::from_translation(Vec3::from_array(anchor))
                     * Mat4::from_axis_angle(Vec3::X, swing)
                     * Mat4::from_axis_angle(Vec3::Z, if def.auto_range > 6.0 { -0.5 } else { 0.2 })
@@ -374,6 +450,8 @@ impl Scene {
                 r.queue_draw(self.god_weapon[di][ti], wm, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
             }
         }
+        vfx.puppet_events(&pevents);
+        vfx.puppets.events = pevents;
 
         // minions
         for m in &game.minions {
@@ -549,6 +627,7 @@ fn build_world() -> (Vec<(VoxelMesh, Vec3, f32, f32)>, VoxelMesh, Blockers) {
     for _ in 0..56 {
         if let Some((x, z)) = jungle_spot(&mut rng, 8.5) {
             plant!(JungleTree; props::jungle_tree(0.85 + rng.f32() * 0.35, v), x, z, 0.0, (v % 4) as u8, V_MED, 1.0);
+            blockers.push_jungle_roots(x, z, 0.0, v);
         }
         v += 1;
     }

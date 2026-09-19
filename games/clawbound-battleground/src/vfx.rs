@@ -57,6 +57,9 @@ pub struct Vfx {
     seeded: bool,
     /// ground-bird flocks that flush when an ancestor comes close
     flocks: Vec<Flock>,
+    /// The ancestors' bodies: gait, posture, strikes, leaps. Advanced by
+    /// `Scene::draw`, which is where the rigs and the world probe are.
+    pub puppets: crate::puppet::Troupe,
 }
 
 /// A handful of small birds pecking at a jungle spot. When flushed they burst
@@ -253,6 +256,11 @@ impl Vfx {
                         }
                     }
                     let _ = amount;
+                }
+                Event::Cast { god, slot, .. } => {
+                    if let Some(a) = game.def(*god).abilities.get(*slot as usize) {
+                        self.puppets.on_cast(*god, crate::puppet::cast_style(&a.arch, a.ult));
+                    }
                 }
                 Event::Explosion { pos, radius, color } => {
                     let n = (*radius * 10.0).min(90.0) as usize;
@@ -564,6 +572,55 @@ impl Vfx {
         self.rings.retain(|r| r.until > 0.0);
         for r in self.rings.iter_mut() {
             r.until -= dt;
+        }
+    }
+
+    /// What the bodies did to the world this frame: leaves knocked loose,
+    /// water shaken off, dust from a slammed paw.
+    pub fn puppet_events(&mut self, events: &[crate::puppet::PuppetEvent]) {
+        use crate::puppet::PuppetEvent as E;
+        for e in events {
+            match *e {
+                E::Rustle { pos, strength } => {
+                    let n = (4.0 + strength * 8.0) as usize;
+                    for i in 0..n {
+                        let a = i as f32 / n as f32 * std::f32::consts::TAU + self.perturb(0.6);
+                        let v = 1.2 + self.perturb(1.0).abs() * strength * 2.0;
+                        let g = 0.30 + self.perturb(0.12);
+                        let up = 0.5 + self.perturb(0.3).abs();
+                        self.particles.push(Particle {
+                            pos: pos + Vec3::new(a.cos() * 0.5, up, a.sin() * 0.5),
+                            vel: Vec3::new(a.cos() * v, 1.6 + strength * 1.4, a.sin() * v),
+                            life: 0.9, max_life: 0.9, size: 0.13,
+                            color: [0.12, g, 0.10], alpha: 0.95, gravity: 5.0, drag: 2.2,
+                        });
+                    }
+                }
+                E::Droplets { pos } => {
+                    for i in 0..26 {
+                        let a = i as f32 / 26.0 * std::f32::consts::TAU;
+                        let v = 3.0 + self.perturb(1.5).abs();
+                        let vy = 1.5 + self.perturb(1.2).abs();
+                        self.particles.push(Particle {
+                            pos: pos + Vec3::new(0.0, 0.9, 0.0),
+                            vel: Vec3::new(a.cos() * v, vy, a.sin() * v),
+                            life: 0.5, max_life: 0.5, size: 0.07,
+                            color: [0.75, 0.88, 1.0], alpha: 0.8, gravity: 11.0, drag: 1.0,
+                        });
+                    }
+                }
+                E::PawSlam { pos } => {
+                    for i in 0..14 {
+                        let a = i as f32 / 14.0 * std::f32::consts::TAU;
+                        self.particles.push(Particle {
+                            pos: pos + Vec3::new(0.0, 0.1, 0.0),
+                            vel: Vec3::new(a.cos() * 3.2, 0.7, a.sin() * 3.2),
+                            life: 0.4, max_life: 0.4, size: 0.16,
+                            color: [0.55, 0.48, 0.36], alpha: 0.7, gravity: 1.5, drag: 4.0,
+                        });
+                    }
+                }
+            }
         }
     }
 
