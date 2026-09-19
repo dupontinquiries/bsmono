@@ -1552,6 +1552,38 @@ impl Studio {
 
     fn split_at_playhead(&mut self) {
         let at = self.transport.position();
+
+        // A FOLDED COMP IS CUT AS A COMP, not through the clips inside it.
+        //
+        // `split_group_ops` exists for exactly this and nothing called it, so
+        // splitting a folded composition went through `split_ops` and cut a
+        // MEMBER — material spliced out of a block the user cannot see into.
+        // The group split is two windows over the same member list and zero
+        // clip ops, so nothing inside is touched.
+        //
+        // Checked BEFORE the clip search, because a folded comp has member
+        // clips under the playhead too and the clip search would find one
+        // first. Folded-ness is view state (`closed_groups`, per device), so
+        // this is the app's call to make and not the project's: an OPEN comp
+        // splits its clips, which is what opening it meant.
+        if let Some(gid) = self.folded_group_at(at) {
+            let next = self.session.doc.project.groups.keys().map(|g| g.0).max().unwrap_or(0) + 1;
+            match self.session.doc.project
+                .split_group_ops(gid, at, studio_core::GroupId(next))
+            {
+                Ok(ops) => {
+                    // One undo step: a comp split is one gesture, and leaving
+                    // it as two ops would make `u` produce a half-split comp.
+                    self.edit_group(ops, "split comp");
+                    return;
+                }
+                Err(e) => {
+                    self.status = format!("split refused: {e:?}");
+                    return;
+                }
+            }
+        }
+
         let next = self.session.doc.project.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1;
         let target = self.selection.first().copied().or_else(|| {
             self.session.doc.project.clips.values()
@@ -1564,6 +1596,28 @@ impl Studio {
             }
             Err(e) => self.status = format!("split refused: {e:?}"),
         }
+    }
+
+    /// The folded composition spanning `at`, if one does.
+    ///
+    /// Only FOLDED comps qualify: an open one is showing its clips, and
+    /// cutting those is what the user is looking at. Strictly inside the span,
+    /// matching `split_group_ops`' own refusal at the edges — splitting a comp
+    /// at its own boundary is the same non-event as splitting a clip at its
+    /// start.
+    ///
+    /// Lowest id wins when comps nest, which is arbitrary but STABLE; a split
+    /// that picked a different comp depending on map iteration order would be
+    /// worse than one that always picks the same wrong one.
+    fn folded_group_at(&self, at: Ticks) -> Option<studio_core::GroupId> {
+        self.session.doc.project.groups.keys()
+            .filter(|gid| self.closed_groups.contains(gid))
+            .filter(|gid| {
+                self.session.doc.project.group_span(**gid)
+                    .is_some_and(|(a, b)| at > a && at < b)
+            })
+            .min()
+            .copied()
     }
 
     /// `y`: remember the selection for `p`. Ids, not clips — see
@@ -8979,4 +9033,72 @@ mod mix_pass_tests {
                 "the first move was rolled back");
         assert!(s.status.contains("nothing applied"), "{}", s.status);
     }
+
+#[cfg(test)]
+mod comp_split_tests {
+    use super::*;
+    use studio_core::{GroupId, Op};
+
+    /// Build a comp over the demo project's first two clips.
+    fn with_comp(s: &mut Studio) -> (GroupId, Ticks, Ticks) {
+        let ids: Vec<_> = s.session.doc.project.clips.keys().copied().take(2).collect();
+        assert_eq!(ids.len(), 2, "the demo project should have clips to group");
+        let gid = GroupId(1);
+        // SetGroup is { id, name, clips } only -- key/tempo/active/window are
+        // carried forward by the op's own handler rather than restated here,
+        // "so a rename must not silently erase a trim".
+        s.session.doc.project
+            .apply(&Op::SetGroup { id: gid, name: "comp".into(), clips: ids })
+            .expect("group");
+        let (a, b) = s.session.doc.project.group_span(gid).expect("a span");
+        (gid, a, b)
+    }
+
+    /// THE BUG: splitting a FOLDED comp went through `split_ops` and cut a
+    /// member clip -- material spliced out of a block the user cannot see
+    /// into. `split_group_ops` existed for this and nothing called it.
+    #[test]
+    fn a_folded_comp_is_found_under_the_playhead() {
+        let mut s = Studio::demo();
+        let (gid, a, b) = with_comp(&mut s);
+        let mid = Ticks((a.0 + b.0) / 2);
+
+        // OPEN: the clips are showing, so cutting them is what the user sees.
+        assert_eq!(s.folded_group_at(mid), None, "an open comp splits its clips");
+
+        s.closed_groups.insert(gid);
+        assert_eq!(s.folded_group_at(mid), Some(gid), "a folded comp is cut as a comp");
+    }
+
+    /// The edges are a non-event, matching `split_group_ops`' own refusal --
+    /// splitting a comp at its boundary is like splitting a clip at its start.
+    #[test]
+    fn the_comp_edges_are_not_a_split_point() {
+        let mut s = Studio::demo();
+        let (gid, a, b) = with_comp(&mut s);
+        s.closed_groups.insert(gid);
+        assert_eq!(s.folded_group_at(a), None, "the start edge");
+        assert_eq!(s.folded_group_at(b), None, "the end edge");
+        assert_eq!(s.folded_group_at(Ticks(b.0 + 1000)), None, "past the end");
+    }
+
+    /// A folded comp's split touches NO clips: two windows over the same
+    /// member list. That is the whole point -- nothing inside is spliced.
+    #[test]
+    fn splitting_a_folded_comp_emits_no_clip_ops() {
+        let mut s = Studio::demo();
+        let (gid, a, b) = with_comp(&mut s);
+        let mid = Ticks((a.0 + b.0) / 2);
+        let ops = s.session.doc.project
+            .split_group_ops(gid, mid, GroupId(2))
+            .expect("a split at the midpoint");
+        assert!(!ops.is_empty());
+        for op in &ops {
+            assert!(
+                matches!(op, Op::SetGroupWindow { .. } | Op::SetGroup { .. }),
+                "a comp split must not touch clips, got {op:?}"
+            );
+        }
+    }
+}
 }
