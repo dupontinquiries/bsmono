@@ -1960,6 +1960,11 @@ pub enum Rejected {
 pub fn parse_tools_reported(text: &str) -> (Vec<Tool>, Vec<Rejected>) {
     let (mut out, mut bad) = (Vec::new(), Vec::new());
     for raw in extract_blocks(text) {
+        if raw.cut_off {
+            bad.push(Rejected::MissingField { tool: raw.name.clone().unwrap_or_default(),
+                field: "closing </parameter> — the reply was cut off mid-value, so nothing was run; send the call again, in smaller pieces if it is a large write" });
+            continue;
+        }
         let block = canonical_block(&raw);
         match parse_one(&block) {
             Some(t) => out.push(t),
@@ -1972,7 +1977,14 @@ pub fn parse_tools_reported(text: &str) -> (Vec<Tool>, Vec<Rejected>) {
 /// A tool call as a model actually wrote it, before the per-tool field logic sees it: the name
 /// may come from a tag (`<function=NAME>`) rather than from the JSON, and the arguments may be
 /// nested under `arguments` / `parameters` (the shapes models are TRAINED on) rather than flat.
-struct RawCall { name: Option<String>, body: String }
+struct RawCall {
+    name: Option<String>,
+    body: String,
+    /// The XML-parameter grammar only: a `<parameter=…>` value never reached its closing tag,
+    /// i.e. the reply was cut off mid-value. Such a call must not RUN — `write_file` defaults a
+    /// missing `contents` to empty, so executing the prefix would truncate the file on disk.
+    cut_off: bool,
+}
 
 /// Rewrite a raw call into the flat `{"tool": NAME, ...args}` shape `parse_one` and `diagnose`
 /// were written against, so every family's native format reaches the same field logic.
@@ -2159,7 +2171,7 @@ fn extract_blocks(text: &str) -> Vec<RawCall> {
     let mut seen_json = |blocks: &mut Vec<RawCall>, body: &str| {
         // Fences of several kinds can wrap the same object; count it once.
         let b = body.trim();
-        if !blocks.iter().any(|r| r.name.is_none() && r.body == b) { blocks.push(RawCall { name: None, body: b.to_string() }); }
+        if !blocks.iter().any(|r| r.name.is_none() && r.body == b) { blocks.push(RawCall { name: None, body: b.to_string(), cut_off: false }); }
     };
     // fenced ```tool … ``` — and ```json … ``` when the object names a tool, which is what a model
     // told "reply with JSON" writes.
@@ -2185,7 +2197,12 @@ fn extract_blocks(text: &str) -> Vec<RawCall> {
     while let Some(start) = rest.find("<tool_call>") {
         let after = &rest[start + "<tool_call>".len()..];
         if let Some(end) = after.find("</tool_call>") {
-            seen_json(&mut blocks, &after[..end]);
+            // `<tool_call>` wraps TWO grammars. JSON (Qwen2.5 / Hermes) is handled here. A body that
+            // opens with `<function=` (Qwen3-Coder / Qwen3.5 / Ornith XML parameters, or Llama's
+            // JSON-bodied tag) is the `<function=` scan's — taking it here too reported every such
+            // call a second time, as a NoToolKey reject, feeding the refusal ladder on a turn that
+            // had called a tool correctly.
+            if !after[..end].trim_start().starts_with("<function=") { seen_json(&mut blocks, &after[..end]); }
             rest = &after[end + "</tool_call>".len()..];
         } else { break; }
     }
@@ -2196,8 +2213,17 @@ fn extract_blocks(text: &str) -> Vec<RawCall> {
         let Some(gt) = after.find('>') else { break };
         let name = after[..gt].trim().to_string();
         let body_from = &after[gt + 1..];
+        if body_from.trim_start().starts_with("<parameter=") || body_from.trim_start().starts_with("</function>") {
+            // XML-PARAMETER grammar (Qwen3-Coder / Qwen3.5 / Ornith-1.5 — their chat template's
+            // own instruction). Values are RAW text, so a value may itself contain `</function>`;
+            // the call closes at the first `</function>` that FOLLOWS a closed parameter list.
+            let (json, used, cut_off) = xml_parameters(body_from);
+            blocks.push(RawCall { name: Some(name), body: json, cut_off });
+            rest = &body_from[used..];
+            continue;
+        }
         let end = body_from.find("</function>").unwrap_or(body_from.len());
-        blocks.push(RawCall { name: Some(name), body: body_from[..end].trim().to_string() });
+        blocks.push(RawCall { name: Some(name), body: body_from[..end].trim().to_string(), cut_off: false });
         rest = &body_from[end..];
     }
     // [TOOL_CALLS][{…}, {…}]   (Mistral) and <|python_tag|>{…}   (Llama 3.1): a JSON array or object
@@ -2223,6 +2249,92 @@ fn extract_blocks(text: &str) -> Vec<RawCall> {
         }
     }
     blocks
+}
+
+/// Read a run of `<parameter=KEY>VALUE</parameter>` blocks into the flat JSON object the per-tool
+/// field logic was written against. Returns (json, bytes consumed, cut_off).
+///
+/// The grammar, from the template that trains it (Ornith-1.5 chat_template.jinja; Qwen3-Coder's is
+/// the same): `<parameter=K>\nV\n</parameter>`, V raw for strings and `tojson` for everything else.
+/// So there is NO escaping in V, and nothing stops V containing `</parameter>` — a model writing
+/// documentation about tool calls does exactly that. The close that counts is the STRUCTURAL one:
+/// a `</parameter>` followed (past whitespace) by the next `<parameter=`, by `</function>`, or by
+/// the end of the text. A mention mid-sentence is followed by more sentence, and is content.
+///
+/// What this cannot recover: a value that embeds a complete `</parameter>\n</function>` sequence.
+/// That closes the call early by construction — the grammar has no escape — and is left as the
+/// documented limit rather than guessed at with a greedy match, which over-reaches into the next
+/// call (the `parse_plan` rfind lesson, CLAUDE.md §5c).
+fn xml_parameters(src: &str) -> (String, usize, bool) {
+    const OPEN: &str = "<parameter=";
+    const CLOSE: &str = "</parameter>";
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut at = 0usize;
+    let mut cut_off = false;
+    loop {
+        let here = &src[at..];
+        let lead = here.len() - here.trim_start().len();
+        if !here[lead..].starts_with(OPEN) { break; }
+        let after_open = at + lead + OPEN.len();
+        let Some(gt) = src[after_open..].find('>') else { cut_off = true; at = src.len(); break };
+        let key = src[after_open..after_open + gt].trim().to_string();
+        let val_from = after_open + gt + 1;
+        // the structural close
+        let mut search = val_from;
+        let mut close = None;
+        while let Some(k) = src[search..].find(CLOSE) {
+            let end = search + k;
+            let tail = src[end + CLOSE.len()..].trim_start();
+            if tail.is_empty() || tail.starts_with(OPEN) || tail.starts_with("</function>") { close = Some(end); break; }
+            search = end + CLOSE.len();
+        }
+        let Some(end) = close else { cut_off = true; at = src.len(); break };
+        // strip exactly the one newline the grammar adds on each side; the rest is the value
+        let mut v = &src[val_from..end];
+        v = v.strip_prefix("\r\n").or_else(|| v.strip_prefix('\n')).unwrap_or(v);
+        v = v.strip_suffix("\r\n").or_else(|| v.strip_suffix('\n')).unwrap_or(v);
+        if !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || c == '_') { fields.push((key, v.to_string())); }
+        at = end + CLOSE.len();
+    }
+    // consume the call's own close when it is next, so the caller's scan resumes past it
+    let here = &src[at..];
+    let lead = here.len() - here.trim_start().len();
+    // A model that closed every parameter and forgot `</function>` still made a complete call:
+    // every VALUE is whole, which is the property `cut_off` protects.
+    if here[lead..].starts_with("</function>") { at += lead + "</function>".len(); }
+    let mut json = String::from("{");
+    for (i, (k, v)) in fields.iter().enumerate() {
+        if i > 0 { json.push_str(", "); }
+        // The one array-typed field any tool takes. The template emits sequences as JSON, so an
+        // argv that IS a JSON array passes through; one written as a command line becomes `cmd`,
+        // the spelling parse_one already splits on whitespace.
+        if k == "argv" {
+            if v.trim_start().starts_with('[') { json.push_str(&format!("\"argv\": {}", v.trim())); continue; }
+            json.push_str(&format!("\"cmd\": {}", json_quote(v))); continue;
+        }
+        json.push_str(&format!("\"{k}\": {}", json_quote(v)));
+    }
+    json.push('}');
+    (json, at, cut_off)
+}
+
+/// `s` as a JSON string literal, escaping exactly what `json_str` unescapes — the two are a pair,
+/// and `xml_values_round_trip_through_the_json_reader` holds them together.
+fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Every top-level `{…}` object in `payload`: the elements of a `[…]` array, or one bare object.
@@ -4427,6 +4539,96 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let data = "Here is the manifest:\n```json\n{\"name\": \"my-crate\", \"version\": \"0.1.0\"}\n```";
         let (tools, bad) = parse_tools_reported(data);
         assert!(tools.is_empty() && bad.is_empty(), "{tools:?} {bad:?}");
+    }
+
+    /// Qwen3-Coder / Qwen3.5 / Ornith-1.5: the XML-PARAMETER grammar. Transcribed from
+    /// Ornith-1.5's shipped chat_template.jinja, which tells the model to reply in exactly this
+    /// shape and renders its own history in it: the function name in a tag, one `<parameter=K>`
+    /// block per argument, string values RAW (no quoting, no escaping, newlines and all) between
+    /// a leading and a trailing newline, non-strings as JSON.
+    ///
+    /// Before this, one well-formed call produced ZERO tools and TWO rejections: the
+    /// `<tool_call>` scan handed the XML to the JSON path (NoToolKey) and the `<function=` scan
+    /// wrapped the parameter tags in braces (MissingField) — and the refusal ladder then told the
+    /// model its call was invalid, the C13 §57 loop for the one family this engine targets.
+    #[test]
+    fn the_xml_parameter_grammar_is_a_call() {
+        let one = "I'll read it.\n\n<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n</function>\n</tool_call>";
+        let (tools, bad) = parse_tools_reported(one);
+        assert_eq!(tools, vec![Tool::ReadFile { path: "src/main.rs".into() }]);
+        assert!(bad.is_empty(), "one call is one call — not a call plus a rejected shadow of itself: {bad:?}");
+    }
+
+    /// Raw multi-line values survive exactly: quotes, backslashes, braces, blank lines, and
+    /// leading indentation are file CONTENT here, and the only thing stripped is the one newline
+    /// the grammar itself puts on each side of a value.
+    #[test]
+    fn xml_parameter_values_are_raw_text_not_json() {
+        let body = "fn main() {\n    println!(\"a\\\\b {}\", 1);\n\n}\n";
+        let call = format!("<tool_call>\n<function=write_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n<parameter=contents>\n{body}\n</parameter>\n</function>\n</tool_call>");
+        assert_eq!(parse_tools(&call), vec![Tool::WriteFile { path: "src/main.rs".into(), contents: body.into() }]);
+        // inline form, no newlines around the value — models write this too
+        let inline = "<tool_call><function=read_file><parameter=path>a.rs</parameter></function></tool_call>";
+        assert_eq!(parse_tools(inline), vec![Tool::ReadFile { path: "a.rs".into() }]);
+    }
+
+    /// Non-string arguments arrive as JSON text (the template's `tojson` branch): an argv array
+    /// stays an array, a number stays readable as a number. And two calls in one turn are two.
+    #[test]
+    fn xml_parameter_non_strings_and_multiple_calls() {
+        let turn = "<tool_call>\n<function=run>\n<parameter=argv>\n[\"cargo\", \"check\", \"--lib\"]\n</parameter>\n</function>\n</tool_call>\n\
+<tool_call>\n<function=read_range>\n<parameter=path>\nsrc/lib.rs\n</parameter>\n<parameter=start>\n10\n</parameter>\n<parameter=end>\n24\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(parse_tools(turn), vec![
+            Tool::Run { argv: vec!["cargo".into(), "check".into(), "--lib".into()] },
+            Tool::ReadRange { path: "src/lib.rs".into(), start: 10, end: 24 },
+        ]);
+        // an argv written as a plain command line is still a run, via the `cmd` spelling
+        let plain = "<tool_call>\n<function=run>\n<parameter=argv>\ncargo test -q\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(parse_tools(plain), vec![Tool::Run { argv: vec!["cargo".into(), "test".into(), "-q".into()] }]);
+    }
+
+    /// The complement (CLAUDE.md §5c): what the new recognizer must NOT take. A file whose content
+    /// mentions the closing tag mid-line keeps its tail; an unknown function is NAMED; a required
+    /// parameter that is absent is reported as that field; and the JSON-bodied forms that shared
+    /// these tags before still parse, once.
+    #[test]
+    fn xml_parameter_complements() {
+        let tricky = "<tool_call>\n<function=write_file>\n<parameter=path>\nnotes.md\n</parameter>\n<parameter=contents>\nclose a value with </parameter> and a call with </function> — then more text\nlast line\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(parse_tools(tricky), vec![Tool::WriteFile { path: "notes.md".into(),
+            contents: "close a value with </parameter> and a call with </function> — then more text\nlast line".into() }]);
+
+        let (_, bad) = parse_tools_reported("<tool_call>\n<function=send_email>\n<parameter=to>\nx\n</parameter>\n</function>\n</tool_call>");
+        assert_eq!(bad, vec![Rejected::UnknownTool("send_email".into())]);
+
+        let (tools, bad) = parse_tools_reported("<tool_call>\n<function=write_file>\n<parameter=contents>\nx\n</parameter>\n</function>\n</tool_call>");
+        assert!(tools.is_empty());
+        assert_eq!(bad, vec![Rejected::MissingField { tool: "write_file".into(), field: "path" }]);
+
+        // Llama's JSON-bodied <function=…> inside a <tool_call> wrapper: one call, no shadow reject.
+        let (tools, bad) = parse_tools_reported("<tool_call><function=read_file>{\"path\": \"Cargo.toml\"}</function></tool_call>");
+        assert_eq!(tools, vec![Tool::ReadFile { path: "Cargo.toml".into() }]);
+        assert!(bad.is_empty(), "{bad:?}");
+        // Hermes/Qwen2.5 JSON inside <tool_call> is untouched by any of this.
+        assert_eq!(parse_tools("<tool_call>{\"name\": \"list_dir\", \"arguments\": {\"path\": \"src\"}}</tool_call>"),
+                   vec![Tool::ListDir { path: "src".into() }]);
+        // A truncated turn (token budget hit mid-value): nothing is executed from half a file.
+        let cut = "<tool_call>\n<function=write_file>\n<parameter=path>\na.rs\n</parameter>\n<parameter=contents>\nfn main() {";
+        let (tools, _) = parse_tools_reported(cut);
+        assert!(tools.is_empty(), "a write whose value never closed must not run: {tools:?}");
+    }
+
+    /// json_quote and json_str are inverses on everything a file can contain. If they drift, a
+    /// written file differs from what the model sent by exactly the characters hardest to notice.
+    #[test]
+    fn xml_values_round_trip_through_the_json_reader() {
+        for v in ["plain", "", "a\"b", "back\\slash", "trailing\\", "tab\there", "cr\r\nlf", "{\"json\": [1, 2]}",
+                  "\\n is two chars, not a newline", "unicode — ✓ 日本", "\"path\": \"decoy\""] {
+            let block = format!("{{\"tool\": \"x\", \"v\": {}}}", json_quote(v));
+            assert_eq!(json_str(&block, "v").as_deref(), Some(v), "round trip of {v:?} via {block}");
+        }
+        // and a value that LOOKS like another field cannot shadow the real one
+        let call = "<tool_call>\n<function=write_file>\n<parameter=contents>\n\"path\": \"decoy.rs\"\n</parameter>\n<parameter=path>\nreal.rs\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(parse_tools(call), vec![Tool::WriteFile { path: "real.rs".into(), contents: "\"path\": \"decoy.rs\"".into() }]);
     }
 
     /// A native-shape call to a tool we do not implement is reported as that tool, not as prose.
