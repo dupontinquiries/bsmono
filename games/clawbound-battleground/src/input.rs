@@ -41,9 +41,13 @@ pub enum Action {
     AutoRun,
     /// An aimed leap: onto whatever rock or log is ahead, else forward.
     Leap,
+    /// Toggle the stalk. A plain letter on purpose: a held Ctrl plus any
+    /// movement or ability key is some compositor's shortcut, and a handset
+    /// has no Ctrl at all.
+    Sneak,
 }
 
-pub const ACTIONS: [Action; 17] = [
+pub const ACTIONS: [Action; 18] = [
     Action::Forward,
     Action::Back,
     Action::Left,
@@ -61,6 +65,7 @@ pub const ACTIONS: [Action; 17] = [
     Action::Recenter,
     Action::AutoRun,
     Action::Leap,
+    Action::Sneak,
 ];
 
 impl Action {
@@ -83,6 +88,7 @@ impl Action {
             Action::Recenter => "CAMERA BEHIND ME",
             Action::AutoRun => "AUTO-RUN (HOLD)",
             Action::Leap => "LEAP",
+            Action::Sneak => "STALK (TOGGLE)",
         }
     }
     pub fn id(self) -> &'static str {
@@ -104,6 +110,7 @@ impl Action {
             Action::Recenter => "recenter",
             Action::AutoRun => "autorun",
             Action::Leap => "leap",
+            Action::Sneak => "sneak",
         }
     }
     pub fn from_id(s: &str) -> Option<Action> {
@@ -356,6 +363,7 @@ impl Bindings {
             // Space and the pad's south button: where a jump lives on every
             // controller, and free in both schemes (Dvorak inherits this).
             (Leap, vec![Bind::Named(Named::Space), Bind::Pad(PB_SOUTH)]),
+            (Sneak, vec![ch("z"), Bind::Pad(PB_LB)]),
         ];
         Bindings { map, scheme: Scheme::Classic }
     }
@@ -702,6 +710,9 @@ pub struct Controls {
     pub recenter: bool,
     /// Leap pressed this frame.
     pub leap: bool,
+    /// Stalk toggled this frame (keyboard), or held (pad LB).
+    pub sneak_toggle: bool,
+    pub sneak_held: bool,
     /// Normalized screen point tapped in the open area (walk-to), if any.
     pub tap: Option<Vec2>,
     /// Per-slot aim override, screen-space direction (y up): set only by a
@@ -757,6 +768,7 @@ pub fn resolve(
     c.zoom += (kb_edge(Action::ZoomIn) as i32 - kb_edge(Action::ZoomOut) as i32) as f32 * 1.5;
     c.recenter |= kb_edge(Action::Recenter);
     c.leap |= kb_edge(Action::Leap);
+    c.sneak_toggle |= kb_edge(Action::Sneak);
     // meta actions work regardless of capture
     c.shop |= state.action_edge(b, Action::Shop);
     c.scoreboard |= state.action_down(b, Action::Scoreboard);
@@ -776,6 +788,7 @@ pub fn resolve(
         c.zoom += (pe(Action::ZoomIn) as i32 - pe(Action::ZoomOut) as i32) as f32 * 1.5;
         c.recenter |= pe(Action::Recenter);
         c.leap |= pe(Action::Leap);
+        c.sneak_held |= pd(Action::Sneak);
         c.shop |= pe(Action::Shop);
         c.scoreboard |= pd(Action::Scoreboard);
         c.menu |= pe(Action::Menu);

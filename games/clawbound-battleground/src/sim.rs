@@ -155,6 +155,13 @@ pub struct GodUnit {
     pub recent_damagers: Vec<(usize, f32)>, // (god idx, time)
     pub move_dir: Vec3,
     pub attack_held: bool,
+    /// Stalk INTENT: a toggle, pad LB, or a gentle stick. Whether the cat is
+    /// actually stalking is `Game::stalking` -- fighting suspends it.
+    pub sneak: bool,
+    /// Seconds of ability-granted quiet left: full speed, low and silent.
+    pub hush_t: f32,
+    /// When this cat last attacked or cast.
+    pub last_act_t: f32,
     pub ai: Option<AiBrain>,
     // cached derived
     pub prot: f32,
@@ -343,6 +350,9 @@ impl Game {
                 recent_damagers: Vec::new(),
                 move_dir: Vec3::ZERO,
                 attack_held: false,
+                sneak: false,
+                hush_t: 0.0,
+                last_act_t: -99.0,
                 ai: if is_player { None } else { Some(AiBrain { lane, aggression: 0.45 + rng.f32() * 0.5, state: AiState::Push, target: None, strafe_dir: 1.0, strafe_t: 0.0, buy_t: 1.5, wp: 0 }) },
                 prot,
                 pen_pct: 0.0,
@@ -483,6 +493,37 @@ impl Game {
         g.ms_bonus = st.move_speed;
     }
 
+    /// Is this cat stalking right now? Intent, minus a fight: attacking,
+    /// casting or being hit suspends it for STALK_BREAK_SECS. The intent is
+    /// left alone, so the cat settles back into the stalk when the fight is
+    /// over -- and gets its full speed back the instant one starts.
+    pub fn stalking(&self, i: usize) -> bool {
+        let g = &self.gods[i];
+        let b = crate::consts::STALK_BREAK_SECS;
+        g.sneak && self.t - g.last_dmg_t > b && self.t - g.last_act_t > b
+    }
+
+    /// How quietly this cat carries itself, `0..=1`, from every source.
+    ///
+    /// Deliberately not a key you hold. Stalking is balanced against
+    /// fighting by what it is tied to: intent that a fight interrupts, a
+    /// window some abilities grant (the fast low run before a pounce, at
+    /// full speed), and the way a badly hurt animal slinks.
+    pub fn quiet(&self, i: usize) -> f32 {
+        let g = &self.gods[i];
+        let mut q: f32 = 0.0;
+        if self.stalking(i) {
+            q = 1.0;
+        }
+        if g.hush_t > 0.0 {
+            q = q.max(0.9);
+        }
+        if g.hp < g.max_hp * crate::consts::WOUNDED_FRAC {
+            q = q.max(0.5);
+        }
+        q
+    }
+
     pub fn move_speed(&self, i: usize) -> f32 {
         let g = &self.gods[i];
         let def = self.def(i);
@@ -491,7 +532,8 @@ impl Game {
         // wading: the rivers are slow going unless you were born to them
         let depth = self.water_depth_now(g.pos.x, g.pos.z);
         let wade = if g.blessing_t > 0.0 || crate::wild::is_riverborn(def) { 1.0 } else { wade_speed_mul(depth) };
-        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul()
+        let stalk = if self.stalking(i) { crate::consts::SNEAK_SPEED } else { 1.0 };
+        base * (1.0 - g.slow) * self.map_events.speed_mul(def.role, g.def_id) * wade * self.disasters.speed_mul() * stalk
     }
 
     pub fn auto_interval(&self, i: usize) -> f32 {

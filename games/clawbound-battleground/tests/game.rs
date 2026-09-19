@@ -268,3 +268,59 @@ fn a_cat_runs_a_wall_top_is_knocked_off_and_lands_on_its_feet() {
     let off_axis = (g.pos.z - (start.z + 4.0)).abs();
     assert!(off_axis > 0.9 + 0.5, "and it is beside the wall, not inside it: {off_axis} u from the spine");
 }
+
+/// Stalking is a state, not a key held down (review: a held Ctrl is a
+/// compositor shortcut on Linux and absent on a handset, and tying the stalk
+/// to the fight is better balance anyway). Three sources, one number.
+#[test]
+fn stalking_is_broken_by_a_fight_granted_by_the_kit_and_forced_by_wounds() {
+    use clawbound::consts::{SNEAK_SPEED, STALK_BREAK_SECS, WOUNDED_FRAC};
+    use clawbound::gods::Archetype;
+    // An ancestor with a movement or self-buff ability: the kit's sneak boost.
+    let (def_id, slot) = ROSTER
+        .iter()
+        .find_map(|d| d.abilities.iter().position(|a| matches!(a.arch, Archetype::Dash { .. } | Archetype::Blink { .. } | Archetype::Buff { .. })).map(|s| (d.id, s as u32)))
+        .expect("some ancestor has a dash, blink or buff");
+    let others: Vec<u32> = (0..ROSTER.len() as u32).filter(|i| *i != def_id).collect();
+    let mut game = Game::new(def_id, [others[0], others[1], others[2], others[3]], [others[4], others[5], others[6], others[7], others[8]]);
+    for g in game.gods.iter_mut().skip(1) {
+        g.respawn_t = 999.0;
+    }
+    let tick = |g: &mut Game, secs: f32| for _ in 0..(secs * 60.0) as usize { g.tick(1.0 / 60.0); };
+    tick(&mut game, 0.1);
+
+    // 1. Intent alone: stalking, fully quiet, and a quarter of the speed.
+    let run = game.move_speed(0);
+    game.gods[0].sneak = true;
+    assert!(game.stalking(0) && game.quiet(0) == 1.0);
+    assert!((game.move_speed(0) / run - SNEAK_SPEED).abs() < 1e-4);
+
+    // 2. A hit breaks it -- quiet AND the slow, at once, so a stalking cat
+    //    that is jumped can run -- and it comes back by itself afterwards.
+    game.gods[0].last_dmg_t = game.t;
+    assert!(!game.stalking(0) && game.quiet(0) == 0.0, "a fight is not a stalk");
+    assert_eq!(game.move_speed(0), run, "and the cat has its legs back immediately");
+    tick(&mut game, STALK_BREAK_SECS + 0.2);
+    assert!(game.stalking(0), "the intent was never cleared, so it settles back into the stalk");
+
+    // 3. The kit: a cast breaks the stalk (it is an act) but opens a hush --
+    //    nearly as quiet, at FULL speed.
+    game.gods[0].mana = game.gods[0].max_mana;
+    game.gods[0].cds = [0.0; 4];
+    let aim = game.gods[0].pos + glam::Vec3::Z * 6.0;
+    game.cast_queue.push((0, slot, aim));
+    tick(&mut game, 0.05);
+    assert!(!game.stalking(0), "casting is acting");
+    assert!(game.gods[0].hush_t > 1.0, "but this ability grants a hush: {}", game.gods[0].hush_t);
+    assert!((0.85..1.0).contains(&game.quiet(0)), "quiet {}", game.quiet(0));
+    game.gods[0].sneak = false;
+    let s = game.move_speed(0);
+    assert!(s >= run * 0.99, "hush costs no speed: {s} vs {run}");
+
+    // 4. Wounds. Both sides of the line.
+    game.gods[0].hush_t = 0.0;
+    game.gods[0].hp = game.gods[0].max_hp * (WOUNDED_FRAC + 0.05);
+    assert_eq!(game.quiet(0), 0.0, "hurt but not badly");
+    game.gods[0].hp = game.gods[0].max_hp * (WOUNDED_FRAC - 0.05);
+    assert_eq!(game.quiet(0), 0.5, "a badly hurt cat slinks");
+}

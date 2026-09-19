@@ -147,6 +147,7 @@ impl Game {
             let yaw_cur = self.gods[i].yaw;
             let g = &mut self.gods[i];
             g.leap_cd = (g.leap_cd - dt).max(0.0);
+            g.hush_t = (g.hush_t - dt).max(0.0);
             // A dash (an ability) outranks a leap (a move).
             if g.dash.is_some() {
                 g.leap = None;
@@ -428,9 +429,11 @@ impl Game {
             let (pen_pct, pen_flat) = (self.gods[i].pen_pct, self.gods[i].pen_flat);
             let team = self.gods[i].team;
             let from = self.gods[i].pos + Vec3::Y * 1.4;
+            let now_t = self.t;
             let g = &mut self.gods[i];
             g.atk_timer = interval;
             g.atk_anim = 1.0;
+            g.last_act_t = now_t;
             match def.auto {
                 AutoKind::Melee => {
                     let to = self.target_pos(target.unwrap());

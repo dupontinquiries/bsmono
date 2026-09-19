@@ -37,6 +37,15 @@ impl Game {
         g.mana -= ab.cost;
         g.cds[slot as usize] = cd;
         g.atk_anim = 1.0;
+        g.last_act_t = self.t;
+        // The sneak boost lives in the kit, not on a key: movement and
+        // self-buff abilities open a window of quiet at FULL speed.
+        g.hush_t = g.hush_t.max(match ab.arch {
+            Archetype::Buff { duration, .. } => duration,
+            Archetype::Blink { .. } => crate::consts::HUSH_BLINK_SECS,
+            Archetype::Dash { .. } => crate::consts::HUSH_DASH_SECS,
+            _ => 0.0,
+        });
 
         self.events.push(Event::Cast { god: gi, slot, aim });
 

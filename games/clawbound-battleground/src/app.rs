@@ -54,6 +54,9 @@ struct AppState {
     capturing: Option<Action>,
     /// Walk-to order from a tap (world ground point).
     walk_to: Option<Vec3>,
+    /// The stalk toggle. App state, not sim state: the sim decides whether
+    /// a cat that WANTS to stalk currently can.
+    stalk_on: bool,
     locked: bool,
     scoreboard: bool,
     cam_yaw: f32,
@@ -338,6 +341,7 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         controls_open: false,
         capturing: None,
         walk_to: None,
+        stalk_on: false,
         locked: false,
         scoreboard: false,
         cam_yaw: std::f32::consts::PI,
@@ -751,6 +755,10 @@ fn render(s: &mut AppState) {
         let aim = if s.game.is_some() { compute_aim(s) } else { Vec3::ZERO };
         let yaw = s.cam_yaw;
         let walk_to = s.walk_to;
+        if c.sneak_toggle {
+            s.stalk_on = !s.stalk_on;
+        }
+        let stalk_on = s.stalk_on;
         if let Some(g) = s.game.as_mut() {
             // A leap goes where the cat is being steered; standing still,
             // where the camera looks. `leap::plan` turns that direction into
@@ -794,7 +802,12 @@ fn render(s: &mut AppState) {
                         s.walk_to = None;
                     }
                 }
+                // A held stalk, or a stick or touch pad pushed gently: on an
+                // analogue input the magnitude IS the intent, and the sim is
+                // about to throw it away by normalising.
+                let gentle = walk_to.is_none() && c.mv.length() > 0.08 && c.mv.length() < 0.5;
                 let gi = &mut g.gods[0];
+                gi.sneak = stalk_on || c.sneak_held || gentle;
                 gi.move_dir = mv;
                 gi.attack_held = c.attack;
                 g.tick(1.0 / 60.0);

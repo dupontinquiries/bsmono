@@ -20,6 +20,17 @@ pub const ARENA_RADIUS: f32 = 95.0 * MAP_SCALE; // playable floor (~135)
 /// number would hold a cat half a body-width off every tree trunk, which
 /// reads as an invisible wall. This is the body.
 pub const GOD_RADIUS: f32 = 0.55;
+/// A stalk covers ground at about a quarter of a run. Before this existed
+/// there was no way to move slowly at all: `move_gods` normalises the move
+/// direction, so a gentle stick and a full one were the same 12 u/s.
+pub const SNEAK_SPEED: f32 = 0.26;
+/// Attacking, casting or being hit suspends a stalk for this long.
+pub const STALK_BREAK_SECS: f32 = 1.5;
+/// Below this fraction of max HP a cat slinks: lower, quieter, no slower.
+pub const WOUNDED_FRAC: f32 = 0.35;
+/// Quiet seconds granted by a blink or a dash. A buff grants its own duration.
+pub const HUSH_BLINK_SECS: f32 = 2.5;
+pub const HUSH_DASH_SECS: f32 = 1.5;
 
 /// Collision radius of a minion. Smaller because a minion is a mini cat.
 pub const MINION_RADIUS: f32 = 0.32;
