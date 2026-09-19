@@ -57,6 +57,18 @@ the single highest-value thing anyone can do with this repo next.
 
 ## Known gaps
 
+- **The mid Runs are stubs.** Tower range went 16 -> 24 with a 28 u clearing
+  (nothing that hides or lifts a cat inside it), and the lane-parallel Runs
+  authored the same day ended INSIDE the old range. Truncated to 14 u. They
+  want re-routing diagonally from the Hollow out to the side jungle. Bots do
+  not yet respect the larger tower zone; there is no lock-on delay before a
+  tower's first shot; Top/Bot clearings were not looked at in a render.
+- **Ground**: the lane/grass blend is still carried per vertex on a 1.6 u
+  grid (now smooth, and scuffed per pixel). A true per-pixel lane mask needs
+  lane data in the shader. River banks were not touched.
+- **Meshes nobody builds in a test are untested.** `crossing_log` had two
+  bugs for that reason. Other prop builders are in the same position.
+
 - **A rolling log has not been seen.** The seated log is rendered and spans
   its sluice; the roll, the spin and a rider being thrown are tests only, and
   the SIGN of the spin in `Scene::draw` is a guess. Minions on a log that
@@ -186,7 +198,7 @@ the single highest-value thing anyone can do with this repo next.
 ## Verification commands
 
 ```bash
-cargo test --no-default-features   # 232 lib + 14 + 2, no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
+cargo test --no-default-features   # 235 lib + 15 + 2, no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
 cargo test                          # same, plus links cpal (needs libasound2-dev)
 cargo check --features gamepad      # needs libudev-dev
 cargo run --example simdbg <seed>   # headless 12-minute AI match trace
