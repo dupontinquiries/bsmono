@@ -12,6 +12,7 @@ struct FrameData {
     weather: vec4<f32>,  // x rain, y snow, z wetness, w lightning
     wind: vec4<f32>,     // xyz wind (u/s), w gust front 0..1
     event: vec4<f32>,    // x flood rise, y quake shake, z fire glow, w unused
+    brush: array<vec4<f32>, 8>, // xyz where a cat is shouldering through, w how hard (signed)
 };
 
 fn hash21(p: vec2<f32>) -> f32 {
@@ -84,13 +85,54 @@ struct VSOut {
     @location(5) emissive: f32,
 };
 
+// A cat going through the flora. Same rule as the wind -- `sway` is the
+// piece's weight, the base stays planted, the tips move most -- but local:
+// leaves lean AWAY from each brush, and only leaves near the cat's own height,
+// so a cat at the foot of a tree does not shove its canopy twelve units up.
+//
+// `w` is how hard. A stalking cat sends ~0.02 and nothing visibly moves; one
+// at a run sends ~1.0 and a fern tip goes over by half a unit. It is signed:
+// a wake (where a cat WAS) rings like a damped spring, so the leaf swings
+// back through rest and leans briefly toward where the cat went.
+fn brush_offset(world: vec3<f32>, local_y: f32, sway: f32) -> vec3<f32> {
+    // Only what is LIGHTER than a cat gives way to one. Sway weights split
+    // cleanly: bush 1.8, bamboo 2.2, vine 2.4, fern 2.6 -- and every tree at
+    // 1.6 or under, whose weight covers trunk and roots too. Without this
+    // gate a running cat flexed buttress roots by a fifth of a unit, which a
+    // with/without diff of one frame showed as movement far outside the fern.
+    let light = smoothstep(1.65, 1.8, sway);
+    if (light <= 0.0) {
+        return vec3(0.0);
+    }
+    var o = vec3(0.0);
+    let h = clamp(local_y, 0.0, 2.6) * light;
+    for (var i = 0; i < 8; i = i + 1) {
+        let b = frame.brush[i];
+        if (abs(b.w) < 0.004) {
+            continue;
+        }
+        let d = world.xz - b.xz;
+        let dist = length(d);
+        let reach = 2.3;
+        if (dist >= reach) {
+            continue;
+        }
+        let near = 1.0 - dist / reach;
+        let level = 1.0 - clamp(abs(world.y - (b.y + 0.7)) / 2.2, 0.0, 1.0);
+        let away = d / max(dist, 0.08);
+        let amt = b.w * near * near * level * h * 0.24 * min(sway, 3.0) / 2.6;
+        o = o + vec3(away.x * amt, -abs(amt) * 0.4, away.y * amt);
+    }
+    return o;
+}
+
 @vertex
 fn vs_main(in: VSIn) -> VSOut {
     let d = draws[0]; // dynamic offset selects this draw
     let voxel = d.params.y * in.misc.x;
     let local = in.pos * voxel + in.off_ao.xyz;
     var world = d.model * vec4<f32>(local, 1.0);
-    world = vec4(world.xyz + wind_offset(world.xyz, in.off_ao.y, in.misc.y), 1.0);
+    world = vec4(world.xyz + wind_offset(world.xyz, in.off_ao.y, in.misc.y) + brush_offset(world.xyz, in.off_ao.y, in.misc.y), 1.0);
     let nrm = normalize((d.model * vec4<f32>(in.normal, 0.0)).xyz);
     var out: VSOut;
     out.clip = frame.view_proj * world;

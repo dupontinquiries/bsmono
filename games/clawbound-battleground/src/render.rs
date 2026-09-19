@@ -36,6 +36,12 @@ pub struct FrameUniform {
     pub wind: [f32; 4],
     /// x flood rise (u), y quake shake, z fire glow near camera, w unused
     pub event: [f32; 4],
+    /// What is shouldering through the flora: xyz where, w how hard (signed:
+    /// a wake swings leaves back through rest). APPENDED, and only
+    /// voxel.wgsl declares it -- the other shaders bind the same buffer with
+    /// the shorter struct, which is legal because no layout sets a
+    /// min_binding_size.
+    pub brush: [[f32; 4]; crate::puppet::MAX_BRUSHES],
 }
 
 #[repr(C)]
@@ -130,6 +136,8 @@ pub struct Renderer {
     pub exposure: f32,
     /// Sky state for this frame — set by the caller each frame (see weather.rs).
     pub atmosphere: crate::weather::Atmosphere,
+    /// Set by the scene each frame from `puppet::Troupe::brushes`.
+    pub brushes: Vec<[f32; 4]>,
     /// (flood rise, quake shake, fire glow) — set by the caller (disasters.rs).
     pub event: (f32, f32, f32),
 }
@@ -639,6 +647,7 @@ impl Renderer {
             time: 0.0,
             exposure: 0.92,
             atmosphere: crate::weather::Weather::new().atmosphere(),
+            brushes: Vec::new(),
             event: (0.0, 0.0, 0.0),
         };
         r.resize(width, height);
@@ -723,6 +732,14 @@ impl Renderer {
 pub const SUN_DIR: Vec3 = Vec3::new(-0.42, 0.82, 0.32);
 
 impl Renderer {
+    fn brush_uniform(&self) -> [[f32; 4]; crate::puppet::MAX_BRUSHES] {
+        let mut out = [[0.0f32; 4]; crate::puppet::MAX_BRUSHES];
+        for (slot, b) in out.iter_mut().zip(&self.brushes) {
+            *slot = *b;
+        }
+        out
+    }
+
     pub fn clear_queues(&mut self) {
         self.opaque.clear();
         self.transparent.clear();
@@ -792,6 +809,7 @@ impl Renderer {
             weather: [atm.rain, atm.snow, atm.wetness, atm.lightning],
             wind: [atm.wind.x, atm.wind.y, atm.wind.z, atm.gust],
             event: [self.event.0, self.event.1, self.event.2, 0.0],
+            brush: self.brush_uniform(),
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 
@@ -1062,6 +1080,7 @@ impl Renderer {
             weather: [0.0; 4],
             wind: [0.0; 4],
             event: [0.0; 4],
+            brush: self.brush_uniform(),
         };
         self.queue.write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&frame));
 

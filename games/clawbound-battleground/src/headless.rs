@@ -437,7 +437,7 @@ pub fn run_rig_sheet() -> Result<(), String> {
         shots.push(Shot { name: "rig_on_root.png", eye: mid + side * 1.2 + along * 6.5 + Vec3::Y * 2.4, look: mid + Vec3::Y * 1.6 });
     }
     if let Some(f) = fern {
-        shots.push(Shot { name: "rig_in_fern.png", eye: f + Vec3::new(1.6, 5.5, 1.6), look: f + Vec3::Y * 0.5 });
+        shots.push(Shot { name: "rig_in_fern.png", eye: f + Vec3::new(-2.2, 6.5, 3.4), look: f + Vec3::Y * 0.4 });
     }
 
     // Signature frames: every ancestor casting its ultimate, in a file down
@@ -561,15 +561,38 @@ pub fn run_rig_sheet() -> Result<(), String> {
                     continue;
                 }
                 _ => {
+                    // One real fern, two cats passing it on the capture frame.
+                    // Cat 0 stalks by, a hand's width from the stem: low, and
+                    // bent round it. Cat 1 runs through a unit the other side.
+                    // Both are driven the way the sim drives them: `sneak`
+                    // intent on one, speed on the other.
+                    let f = fern.unwrap();
+                    let yaw = 0.8f32;
+                    let dir = Vec3::new(yaw.cos(), 0.0, yaw.sin());
+                    let side = Vec3::new(-dir.z, 0.0, dir.x);
                     let g = &mut game.gods[0];
-                    g.yaw = 0.8;
-                    g.pos = fern.unwrap() + Vec3::new(g.yaw.cos(), 0.0, g.yaw.sin()) * (step as f32 * (0.8 / 60.0) - 0.6);
+                    g.yaw = yaw;
+                    g.sneak = true;
+                    g.pos = f - side * 0.3 - dir * (left as f32 * (3.2 / 60.0) + 0.35);
+                    let g = &mut game.gods[1];
+                    g.yaw = yaw;
+                    g.pos = f + side * 1.1 - dir * (left as f32 * (12.4 / 60.0) - 0.6);
+                    for gi in 2..game.gods.len() {
+                        game.gods[gi].pos = Vec3::new(0.0, 0.0, 150.0);
+                    }
                 }
             }
             vfx.update(1.0 / 60.0, &[], &game);
             renderer.clear_queues();
             scene.draw(&mut renderer, &game, &mut vfx, cam);
         }
+        // CLAWBOUND_NO_BRUSH=1 renders the same frame with the leaf-bend off,
+        // so the two can be diffed: everything else in the frame is identical,
+        // so any pixel that differs is a leaf that moved.
+        if std::env::var("CLAWBOUND_NO_BRUSH").is_ok() {
+            renderer.brushes.clear();
+        }
+        println!("brushes this frame: {:?}", renderer.brushes.iter().map(|b| (b[3] * 100.0).round() / 100.0).collect::<Vec<_>>());
         renderer.atmosphere = game.weather.atmosphere();
         renderer.render_frame(&view, cam, 1.0);
         save_shot(&renderer.device, &renderer.queue, &target, shot.name)?;

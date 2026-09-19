@@ -80,6 +80,9 @@ impl Probe for WorldProbe<'_> {
     fn water(&self, x: f32, z: f32) -> f32 {
         consts::water_depth(x, z)
     }
+    fn stem(&self, x: f32, z: f32, within: f32) -> Option<(f32, f32)> {
+        self.blockers.nearest_stem(x, z, within)
+    }
 }
 
 fn solid_tint(c: [f32; 3]) -> [f32; 4] {
@@ -419,6 +422,7 @@ impl Scene {
                 leap,
                 perched: g.perch.is_some(),
                 narrow: g.perch.is_some() && g.perch_narrow,
+                quiet: game.quiet(i),
             };
             let puppet = &mut vfx.puppets.puppets[i];
             puppet.advance(dt, &inp, rig, &world, &mut pevents);
@@ -451,6 +455,10 @@ impl Scene {
                 r.queue_draw(self.god_weapon[di][ti], wm, [1.0; 4], 0.0, models::GOD_DRAW_VOXEL, false);
             }
         }
+        // Leaves bend away from whoever is pushing through them, and swing
+        // back through where they were. A stalking cat contributes ~nothing.
+        vfx.puppets.trail(dt);
+        r.brushes = vfx.puppets.brushes();
         vfx.puppet_events(&pevents);
         vfx.puppets.events = pevents;
 
