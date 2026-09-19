@@ -849,7 +849,7 @@ flatpak = false
 runtime = "none"            # pure egui/glow (wayland/x11), same convention as the other -egui apps
 targets = ["desktop", "phone"]
 primary = true
-notes = "egui shell on shared/uikit (Night palette): Launch / Stack / Vitals / Wire / Caches. Tab strip when it fits, swipe pages when it does not, and on a wide window the active page and its followers side by side. On Stack a sideways drag walks frames through the kit GestureLayer. gdb events are handled off the UI thread by stoat-core's Driver so a frame-marker resume never waits for a repaint. `cargo build --release -p stoat-egui` from apps/stoat produces the bin (`app` feature default-on)."
+notes = "egui shell on shared/uikit (Night palette): Launch / Stack / Vitals / Wire / Caches. Tab strip when it fits, swipe pages when it does not, and on a wide window the active page and its followers side by side. On Stack a sideways drag walks frames through the kit GestureLayer, and a long press sets a breakpoint on a source line or copies a local. Command palette on Ctrl+P or the ⌘ button (tap to type, hold to speak): commands, frames, binaries, processes to attach to, shell-history args. Speech is the opt-in `voice` feature (whisper-rs + cpal via uikit-egui/voice-popup); spoken commands that resume the program are never run without a confirmation. Attach and core files from Launch. gdb events are handled off the UI thread by stoat-core's Driver so a frame-marker resume never waits for a repaint. `cargo build --release -p stoat-egui` from apps/stoat produces the bin (`app` feature default-on)."
 
 [apps.stoat-gtk]
 path = "apps/stoat/crates/gui-gtk"
