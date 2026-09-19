@@ -1421,7 +1421,9 @@ fn main() {
                 }
                 out
             };
-            let mut d = gpu_kernels::spec::PromptLookup { ngram: 2 };
+            // IndexedLookup: PromptLookup's drafts, O(1) per step instead of O(context). Identical
+            // proposals by test, so this run's spec-vs-plain comparison holds it end to end as well.
+            let mut d = gpu_kernels::spec::IndexedLookup::new(2);
             let mut st = gpu_kernels::SpecStats::default();
             let spec = gpu.speculative_generate_drafter(&model, &mut d, prompt, n_new, 4, &mut st);
             let same = spec.len() >= plain.len() && spec[..plain.len()] == plain[..];
@@ -8676,17 +8678,42 @@ gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
             gpu_kernels::SamplerParams { temperature: 0.4, top_k: 64, top_p: 0.9,  repeat_penalty: 1.1,  repeat_last_n: 64, min_p: 0.1  },
         ];
         let (mut trials, mut agree, mut hard_miss) = (0usize, 0usize, 0usize);
+        let (mut passes_old, mut passes_new, mut plain_old, mut plain_new, mut plain_n) = (0usize, 0usize, 0usize, 0usize, 0usize);
         let mut sd = 0xabcd_1234_u64;
         let mut rf = move || { sd ^= sd << 13; sd ^= sd >> 7; sd ^= sd << 17; ((sd >> 40) as f32 / 16_777_216.0) * 12.0 - 6.0 };
         for trial in 0..60 {
             for sp in &cases {
                 let logits: Vec<f32> = (0..vocab).map(|_| rf()).collect();
                 let hist_len = (trial * 7) % 80;
-                let recent: Vec<u32> = (0..hist_len).map(|j| (((trial + 3) * 131 + j * 17) % vocab) as u32).collect();
+                // ADVERSARIAL HISTORY on odd trials: the recent tokens ARE the raw top logits, so the
+                // penalty reshuffles the head of the distribution and the post-penalty top-k reaches
+                // well past the raw top-k. With arbitrary ids (the even trials) a penalized token is
+                // almost never near the top, and a candidate search that stopped at exactly top_k raw
+                // picks would pass every one of them.
+                let recent: Vec<u32> = if trial % 2 == 1 {
+                    let mut ix: Vec<usize> = (0..vocab).collect();
+                    ix.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+                    ix[..hist_len.min(64)].iter().rev().map(|&i| i as u32).collect()
+                } else { (0..hist_len).map(|j| (((trial + 3) * 131 + j * 17) % vocab) as u32).collect() };
                 let seed = 0x5eed_0000u64 + trial as u64 * 7919;
                 // CPU
                 let mut rc = seed | 1;
                 let want = gpu_kernels::pick(&logits, sp, &recent, &mut rc);
+                // PASSES over the vocabulary the GPU sampler needs for these inputs: the old bound
+                // (top_k + distinct penalized, capped at 128) vs the tight one (raw-descending picks
+                // until top_k of them are unpenalized). Computed here because a pass count inside one
+                // dispatch is not observable from outside it.
+                {
+                    let n_pen = sp.repeat_last_n.min(recent.len()).min(64);
+                    let pen: std::collections::BTreeSet<u32> = if sp.repeat_penalty != 1.0 { recent[recent.len() - n_pen..].iter().copied().collect() } else { Default::default() };
+                    let cap = (sp.top_k + pen.len()).min(128).min(vocab);
+                    let mut ord: Vec<usize> = (0..vocab).collect();
+                    ord.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+                    let (mut clean, mut tight) = (0usize, 0usize);
+                    for &i in ord.iter().take(cap) { tight += 1; if !pen.contains(&(i as u32)) { clean += 1; if clean >= sp.top_k { break; } } }
+                    passes_old += cap; passes_new += tight;
+                    if trial % 2 == 0 { plain_old += cap; plain_new += tight; plain_n += 1; }
+                }
                 // GPU: 1 deposit slot + 64-ring seeded with the same trailing history
                 let rcap = 64usize;
                 let mut o_init = vec![0u32; 1 + rcap];
@@ -8727,6 +8754,8 @@ gpu argmax {ga} (margin {gm:.3e}) | cross-impl max|Δlogit| {xe:.3e}{}",
             }
         }
         println!("  sample-at step-wise: {agree}/{trials} identical picks ({} knife-edge, {} hard)", trials - agree - hard_miss, hard_miss);
+        println!("  sample-at passes over the vocabulary per pick — ordinary histories: {:.1} -> {:.1}; all trials incl. the adversarial half (history = the raw top logits): {:.1} -> {:.1}",
+                 plain_old as f64 / plain_n.max(1) as f64, plain_new as f64 / plain_n.max(1) as f64, passes_old as f64 / trials as f64, passes_new as f64 / trials as f64);
         check("sample-at == cpu pick (step-wise)", if hard_miss == 0 && agree * 1000 >= trials * 995 { 0.0 } else { 1.0 }, 0.5);
     }
     // (b) END-TO-END: windowed GPU-sampled decode vs a CPU-sampled loop over the IDENTICAL
