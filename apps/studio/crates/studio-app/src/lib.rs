@@ -3847,9 +3847,56 @@ impl eframe::App for App {
         self.export_dialog_window(ctx);
         self.export_tracker_window(ctx);
 
-        // ── files dropped on the window become rack channels ─────────────
+        // ── files dropped on the window ──────────────────────────────────
+        //
+        // The zone decides, not the file type. `drop_plan` is the table; this
+        // is the only caller. Before it, this loop did one thing with every
+        // drop — decode as audio and make a channel or a clip — which meant a
+        // VIDEO dropped here went into the audio decoder and came back as
+        // "import failed", and an unsupported file said the same. Both are now
+        // answered before the decode, with the reason.
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped {
+            // The panel under the pointer IS the zone. The existing comment
+            // below already reasoned this way ("the panel you're looking at
+            // names the import you meant"); `drop_plan` makes it a value
+            // instead of an `if` buried after the decode.
+            let zone = if self.studio.panel == Panel::Rack {
+                crate::drop_plan::DropZone::Rack
+            } else {
+                crate::drop_plan::DropZone::Unspecified
+            };
+            if let Some(path) = f.path.as_ref() {
+                let media = crate::drop_plan::media_of(
+                    path,
+                    path.is_dir(),
+                    // EXTENSION, not a probe. `studio_video::probe` shells out
+                    // to ffmpeg, and this runs per dropped file on the UI
+                    // thread -- a folder of ninety samples would spawn ninety
+                    // processes to answer a question the filename settles.
+                    // `is_video_path` is the same classification the library
+                    // uses, so the two cannot disagree about what a video is.
+                    library::is_video_path,
+                );
+                let plan = crate::drop_plan::plan(path, media, zone, None);
+                if let Some(note) = &plan.caution {
+                    self.studio.status = note.clone();
+                }
+                // REFUSED BY NAME, before any decode. An unsupported file used
+                // to reach the audio decoder and come back with whatever
+                // studio-media said about its bytes, which describes the
+                // failure rather than the cause.
+                if let crate::drop_plan::Intent::Refuse { why, .. } = &plan.intent {
+                    self.studio.status = why.clone();
+                    continue;
+                }
+                // Video is NOT intercepted here. `drop_plan` sends it to a
+                // rack channel (its audio) or a timeline clip (its picture),
+                // and the block further down already implements exactly that
+                // split, with the better-argued version of the rule. Adding a
+                // second video path here would be a fork of a decision that is
+                // already made correctly one screen away.
+            }
             // A folder is a kit — see `Studio::import_kit`.
             if let Some(dir) = f.path.as_ref().filter(|p| p.is_dir()) {
                 match self.studio.import_kit(dir) {

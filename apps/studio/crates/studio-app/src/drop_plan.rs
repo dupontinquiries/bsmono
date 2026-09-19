@@ -121,12 +121,23 @@ pub fn plan(path: &Path, media: Media, zone: DropZone, secs: Option<f32>) -> Pla
                 intent: Intent::TimelineClip { path: p, video: true, track, at_ticks },
                 caution: None,
             },
-            // A video on a pad is the one case worth overriding: a sampler
-            // channel has nowhere to put the picture, so the drop would
-            // silently discard it.
+            // A VIDEO ON A PAD IS ITS AUDIO. I had this redirecting to the
+            // timeline, reasoning that a sampler channel has nowhere to put
+            // the picture and the drop would silently discard it.
+            //
+            // The live drop handler already disagreed, and its reason is
+            // better: "to the rack, a video is its audio (refusing a video's
+            // audio to a sampler would be the tool overruling the musician —
+            // library.rs's own words)". Someone dropping an mp4 on a pad wants
+            // the sound in it. Sending them to the timeline instead is the
+            // tool deciding it knows what they meant.
+            //
+            // The picture is not silently discarded, it is not wanted; and
+            // Unspecified follows the same rule for the same reason, since a
+            // drop with no target is a drop into the instrument.
             DropZone::Rack | DropZone::Unspecified => Plan {
-                intent: Intent::TimelineClip { path: p, video: true, track: 0, at_ticks: 0 },
-                caution: Some("Video goes on the timeline — a rack channel has no picture.".into()),
+                intent: Intent::RackChannel(p),
+                caution: Some("Using the video's audio. Drop it on a track for the picture.".into()),
             },
         },
         Media::Audio => match zone {
@@ -192,16 +203,31 @@ mod tests {
         assert!(got.caution.as_deref().unwrap().contains("track"), "{:?}", got.caution);
     }
 
-    /// The one override worth making: a sampler channel has nowhere to put
-    /// the picture, so a video on a pad would silently lose it.
+    /// A VIDEO ON A PAD IS ITS AUDIO, and the caution says where the picture
+    /// went rather than moving the drop.
+    ///
+    /// This test asserted the opposite -- that the drop was redirected to the
+    /// timeline -- until the live drop handler was read: "to the rack, a video
+    /// is its audio (refusing a video's audio to a sampler would be the tool
+    /// overruling the musician)". Someone dropping an mp4 on a pad wants the
+    /// sound in it.
     #[test]
-    fn video_on_the_rack_is_redirected_to_the_timeline_and_says_so() {
+    fn video_on_the_rack_becomes_a_channel_from_its_audio() {
         let got = plan(&p("/a/take.mp4"), Media::Video, DropZone::Rack, None);
         match got.intent {
-            Intent::TimelineClip { video: true, .. } => {}
-            other => panic!("video must reach the timeline: {other:?}"),
+            Intent::RackChannel(_) => {}
+            other => panic!("a video on a pad is its audio: {other:?}"),
         }
-        assert!(got.caution.as_deref().unwrap().contains("picture"));
+        assert!(got.caution.as_deref().unwrap().contains("picture"),
+                "say where the picture went: {:?}", got.caution);
+    }
+
+    /// Unspecified follows Rack for the same reason -- a drop with no target
+    /// is a drop into the instrument, which the zone's own doc already says.
+    #[test]
+    fn video_with_no_target_follows_the_rack_rule() {
+        let got = plan(&p("/a/take.mp4"), Media::Video, DropZone::Unspecified, None);
+        assert!(matches!(got.intent, Intent::RackChannel(_)), "{:?}", got.intent);
     }
 
     #[test]
