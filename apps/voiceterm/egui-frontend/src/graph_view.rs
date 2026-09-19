@@ -21,6 +21,22 @@
 #[path = "../../src/niftyplot_view.rs"]
 pub mod nifty;
 
+/// `link_graph::from_niftyplot` calls `crate::niftyplot::parse`, and the mount
+/// above names that module `nifty`. A `#[path]` module compiles as part of the
+/// HOST crate, so it resolves `crate::niftyplot` against THIS crate's tree --
+/// where, until this alias, no such name existed.
+///
+/// Latent rather than loud: `from_niftyplot` is a live `pub fn` that nothing in
+/// this frontend calls yet, so the crate builds and the first caller would have
+/// hit an E0433 with no obvious connection to a mount two files away. Found by
+/// `maintenance/tools/mount_closure_check.py`, which exists because this exact
+/// class of mistake broke voiceterm once and wildkit once.
+///
+/// An alias rather than a rename: `nifty` is the name this file's own code and
+/// docs use throughout, and renaming the mount to match one caller would break
+/// the other twenty.
+pub use nifty as niftyplot;
+
 /// Qt-free (0 qmetaobject/QString refs) wikilink extraction and the
 /// [[note]] graph it builds — the ACTUAL zettelkasten, as opposed to
 /// `nifty`'s hand-typed scratch documents. Mounted the same way, for the
