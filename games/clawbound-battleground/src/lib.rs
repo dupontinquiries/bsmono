@@ -60,6 +60,8 @@ pub mod ai;
 pub mod vfx;
 /// Per-ancestor elemental motifs thrown on every cast.
 pub mod signature;
+/// Blast fronts, ground cracks that heal in rain, the fitted shadow box.
+pub mod groundfx;
 pub mod render;
 pub mod scene;
 pub mod ui;
