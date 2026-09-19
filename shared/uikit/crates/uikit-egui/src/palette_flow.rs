@@ -21,9 +21,9 @@
 //!                    |                       |
 //!                    +------ typing ---------+
 //!                    |  (cancels in-flight capture,
-//!                    |   escalates next dwell to 1500ms)
+//!                    |   escalates next dwell to 5000ms)
 //!                    |
-//!                    +--idle 1500ms--> Voice (again)
+//!                    +--idle 5000ms--> Voice (again)
 //! ```
 //!
 //! Ctrl+P from either open state (`Command` or `Voice`) closes back to
@@ -406,9 +406,14 @@ mod tests {
         let mut f = PaletteFlow::new();
         f.ctrl_p_tapped();
         f.tick(FIRST_DWELL_MS); // -> Voice
-        f.on_type(); // -> Command, dwell escalated to 1500
-        f.tick(FIRST_DWELL_MS); // 750 of 1500
-        assert!((f.dwell_progress() - 0.5).abs() < 0.01, "progress must be against the ESCALATED dwell, not the original");
+        f.on_type(); // -> Command, dwell escalated
+        f.tick(FIRST_DWELL_MS);
+        // Against the constant, not a literal: this asserted 0.5 (750 of 1500)
+        // and went red when the escalated dwell became 5 s (4b1486d71), which
+        // changed the number and not the property.
+        let want = FIRST_DWELL_MS / ESCALATED_DWELL_MS;
+        assert!((f.dwell_progress() - want).abs() < 0.01, "progress must be against the ESCALATED dwell, not the original");
+        assert!(want < 0.5, "and the escalated dwell really is the longer one");
     }
 
     #[test]
