@@ -15,6 +15,19 @@
 //! positions + edges as JSON (the same shape scripts/layout_analyze.py expects,
 //! so the full Python metric suite can post-process it).
 
+// BROKEN: this tool has not compiled since `src/mermaid.rs` and
+// `src/graph_layout.rs` were removed or renamed. Neither file exists anywhere
+// in the tree, and nothing else in the repo references either name.
+//
+// It went unnoticed because layout_tool is in no workspace, so the fleet build
+// never touches it. Found by maintenance/tools/mount_closure_check.py, which
+// reports a `#[path]` pointing at a missing file as well as one whose
+// `crate::` paths cannot resolve.
+//
+// NOT repaired here: the parser this wants is most likely `note_graph.rs` or
+// `link_graph.rs` now, and picking one is a guess about what the tool was
+// measuring. Whoever needs it should point these two lines at the real modules
+// and check the metrics still mean what the description claims.
 #[path = "../../../src/mermaid.rs"] mod mermaid;
 #[path = "../../../src/graph_layout.rs"] mod graph_layout;
 #[path = "../../../src/layered_layout.rs"] mod layered_layout;

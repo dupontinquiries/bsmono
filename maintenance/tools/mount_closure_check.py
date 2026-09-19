@@ -50,10 +50,25 @@ MOUNT = re.compile(
 # as a dependency on a module named `clog`, and the tool reported 30 mounts
 # that compile today.
 CRATE_REF = re.compile(r"\bcrate::([a-z_][a-z0-9_]*)\b(?!\s*!)")
-MOD_DECL = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([a-z_][a-z0-9_]*)\s*[;{]", re.M)
+# Attributes may precede `mod` ON THE SAME LINE -- logscope writes
+# `#[cfg(feature = "gui")] pub mod analysis;` throughout, and anchoring to
+# line-start-then-`pub` missed every one, reporting four mounts as broken in a
+# crate that builds.
+MOD_DECL = re.compile(
+    r"^\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+([a-z_][a-z0-9_]*)\s*[;{]",
+    re.M,
+)
 # `pub use nifty as niftyplot;` makes `crate::niftyplot` resolve just as a
 # `mod` would. Counting only `mod` reported a real alias as a missing module.
-USE_ALIAS = re.compile(r"^\s*pub\s+use\s+[\w:]+\s+as\s+([a-z_][a-z0-9_]*)\s*;", re.M)
+# `pub use x as y;` AND `pub use other_crate::thing;` both put a name at the
+# crate root that `crate::name` resolves to. logscope re-exports whole modules
+# from sibling crates this way -- `pub use scene_kit::spatial;` -- and matching
+# only the `as` form reported four mounts in a crate that builds.
+USE_ALIAS = re.compile(
+    r"^\s*(?:#\[[^\]]*\]\s*)*pub\s+use\s+(?:[\w:]+\s+as\s+([a-z_][a-z0-9_]*)"
+    r"|(?:[\w]+::)*([a-z_][a-z0-9_]*))\s*;",
+    re.M,
+)
 
 # Macros that expand to a `$crate::` path, so using one is a dependency on the
 # module behind it even though no `crate::` appears at the call site.
@@ -99,7 +114,7 @@ def host_modules(root_file: str) -> set:
         except OSError:
             continue
         here = (set(MOD_DECL.findall(text))
-                | set(USE_ALIAS.findall(text))
+                | {n for pair in USE_ALIAS.findall(text) for n in pair if n}
                 | {m.group(2) for m in MOUNT.finditer(text)})
         mods |= here
         base = os.path.dirname(f)
