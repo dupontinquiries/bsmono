@@ -49,7 +49,7 @@ fn speech_navigates_at_once_but_never_resumes_without_a_confirmation() {
     assert_eq!(pal.heard("continue", &mut st), Heard::NeedsConfirm(Command::Continue));
     assert_eq!(sent(&rec).len(), before, "NOTHING was sent to gdb");
     assert!(pal.is_open(), "it waits, with the heard command in the box");
-    assert_eq!(pal.query, "continue");
+    assert_eq!(pal.bar.query, "continue");
     for u in ["step over", "Step into.", "restart", "finish"] {
         assert!(matches!(pal.heard(u, &mut st), Heard::NeedsConfirm(_)), "{u:?}");
     }
@@ -57,7 +57,7 @@ fn speech_navigates_at_once_but_never_resumes_without_a_confirmation() {
 
     // The confirmation is the ordinary row: first item for the heard text.
     pal.heard("continue", &mut st);
-    let first = Palette::items(&pal.query, &st).remove(0);
+    let first = Palette::items(&pal.bar.query, &st).remove(0);
     assert_eq!(first.action, Action::Session(Command::Continue));
     pal.run(&first, &mut st);
     assert_eq!(sent(&rec).last(), Some(&Request::Continue), "confirmed, it runs");
@@ -65,8 +65,8 @@ fn speech_navigates_at_once_but_never_resumes_without_a_confirmation() {
     // Not a command at all: shown as a search, so a wrong hearing is visible.
     pal.open();
     assert_eq!(pal.heard("Show me the vitals page.", &mut st), Heard::Searching);
-    assert_eq!(pal.query, "vitals", "the wrapping words are dropped so the search can match");
-    assert_eq!(labels(&pal.query, &st)[0], "go to Vitals", "and it is one Enter away, not run unasked");
+    assert_eq!(pal.bar.query, "vitals", "the wrapping words are dropped so the search can match");
+    assert_eq!(labels(&pal.bar.query, &st)[0], "go to Vitals", "and it is one Enter away, not run unasked");
     assert_eq!(st.page, stoat_egui::shell::PAGE_STACK, "the page did not change by itself");
 }
 
@@ -169,7 +169,7 @@ fn a_tap_on_the_command_button_opens_the_palette_and_it_stays_open() {
     let c = uikit_egui::apply_palette(&ctx, snapclone_theme::palette_for(snapclone_theme::PaletteId::Night));
     let mut view = stoat_egui::View::default();
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 760.0));
-    let mut frame = |t: f64, events: Vec<egui::Event>, st: &mut stoat_egui::shell::ShellState, view: &mut stoat_egui::View| {
+    let frame = |t: f64, events: Vec<egui::Event>, st: &mut stoat_egui::shell::ShellState, view: &mut stoat_egui::View| {
         let input = egui::RawInput { screen_rect: Some(screen), time: Some(t), events, ..Default::default() };
         #[allow(deprecated)]
         let out = ctx.run(input, |ctx| {

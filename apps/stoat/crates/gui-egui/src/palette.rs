@@ -3,7 +3,8 @@
 //
 // From the kit, not re-derived: `palette_flow` (Ctrl+P opens typed search; an
 // idle pause settles into voice), `command_bar` (bar vs pane by the space
-// available, ghost completion, clamped cursor), `cmdstrip` (tap-or-hold on a
+// available, ghost completion, clamped cursor, and since c19 the SURFACE: drawn
+// by `command_bar::show`, turned over on a phone), `cmdstrip` (tap-or-hold on a
 // button that a phone can reach, and a strip of recents), `fuzzy` (ranking).
 //
 // From stoat-core: `command`. A row, a typed line and an utterance all become a
@@ -16,14 +17,14 @@
 // for Enter or a tap.
 
 use crate::shell::{ShellState, PAGES};
-use egui::{Align2, Color32, Key, RichText};
+use egui::{Key, RichText};
 use stoat_core::command::{self, Command};
 use stoat_core::history::Invocation;
 use stoat_core::model::RunState;
 use uikit_egui::cmdstrip::{Cmd, Hold, Strip};
-use uikit_egui::command_bar::{self, Mode as Surface};
+use uikit_egui::command_bar;
 use uikit_egui::palette_flow::{Mode, PaletteFlow, Transition};
-use uikit_egui::{text_field, PaletteColors};
+use uikit_egui::PaletteColors;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -69,17 +70,12 @@ pub enum Heard {
 
 pub struct Palette {
     pub flow: PaletteFlow,
-    pub query: String,
-    pub cursor: usize,
+    /// The kit's surface state: query, cursor, open/focus bookkeeping.
+    pub bar: command_bar::State,
     pub strip: Strip,
     pub hold: Hold,
     /// The last utterance, shown in the surface so a wrong hearing is visible.
     pub heard_text: Option<String>,
-    wants_focus: bool,
-    /// The click that opened the palette is, on that same frame, a click outside
-    /// the palette. Without this it opened and closed in one frame (seen on
-    /// screen: a tap on ⌘ did nothing while a hold worked).
-    just_opened: bool,
     #[cfg(feature = "voice")]
     voice: uikit_egui::voice_popup::VoicePopup,
 }
@@ -92,13 +88,10 @@ impl Default for Palette {
         }
         Palette {
             flow: PaletteFlow::new(),
-            query: String::new(),
-            cursor: 0,
+            bar: command_bar::State::default(),
             strip,
             hold: Hold::new(),
             heard_text: None,
-            wants_focus: false,
-            just_opened: false,
             #[cfg(feature = "voice")]
             voice: Default::default(),
         }
@@ -116,15 +109,13 @@ impl Palette {
     pub fn open(&mut self) {
         if !self.is_open() {
             self.flow.ctrl_p_tapped();
-            self.query.clear();
-            self.cursor = 0;
+            self.bar.open();
             self.heard_text = None;
-            self.wants_focus = true;
-            self.just_opened = true;
         }
     }
 
     pub fn close(&mut self) {
+        self.bar.close();
         if self.flow.force_off() == Transition::Closed(Mode::Voice) {
             self.voice_cancel();
         }
@@ -262,9 +253,7 @@ impl Palette {
         let names: Vec<String> = st.session.current_frame().and_then(|f| st.session.locals.get(&f.level)).into_iter().flatten().map(|v| v.name.clone()).collect();
         match command::interpret_spoken(text, &names) {
             Some(cmd) if cmd.resumes_target() => {
-                self.query = cmd.typed();
-                self.cursor = 0;
-                self.wants_focus = true;
+                self.bar.set_query(cmd.typed());
                 self.flow.on_type();
                 Heard::NeedsConfirm(cmd)
             }
@@ -280,9 +269,7 @@ impl Palette {
                 // dropped, or "show me the vitals page" would match nothing.
                 const WRAPPING: [&str; 12] = ["show", "me", "the", "page", "go", "to", "open", "please", "switch", "tab", "a", "can"];
                 let cleaned: String = text.chars().map(|ch| if ch.is_alphanumeric() || ch == '_' || ch == '-' { ch } else { ' ' }).collect();
-                self.query = cleaned.split_whitespace().filter(|w| !WRAPPING.contains(&w.to_lowercase().as_str())).collect::<Vec<_>>().join(" ");
-                self.cursor = 0;
-                self.wants_focus = true;
+                self.bar.set_query(cleaned.split_whitespace().filter(|w| !WRAPPING.contains(&w.to_lowercase().as_str())).collect::<Vec<_>>().join(" "));
                 self.flow.on_type();
                 Heard::Searching
             }
@@ -370,120 +357,45 @@ pub fn ui(ctx: &egui::Context, st: &mut ShellState, pal: &mut Palette, c: &Palet
         return;
     }
 
-    // ---- keys ----
-    let items = Palette::items(&pal.query, st);
-    pal.cursor = pal.cursor.min(items.len().saturating_sub(1));
-    let (esc, up, down, tab, enter) = ctx.input_mut(|i| {
-        (i.consume_key(egui::Modifiers::NONE, Key::Escape), i.consume_key(egui::Modifiers::NONE, Key::ArrowUp), i.consume_key(egui::Modifiers::NONE, Key::ArrowDown), i.consume_key(egui::Modifiers::NONE, Key::Tab), i.key_pressed(Key::Enter))
+    // ---- the surface is the kit's; this supplies matches, the status line, and
+    // what choosing one does ----
+    let items = Palette::items(&pal.bar.query, st);
+    let rows: Vec<command_bar::Row> = items.iter().map(|it| command_bar::Row::new(it.label.clone(), it.detail.clone())).collect();
+    let hint = if HAS_VOICE { "command, frame, binary, pid… or pause to speak" } else { "command, frame, binary, pid…  (p expr · b loc · ! gdb)" };
+    let adaptive = uikit_egui::Adaptive::detect(ctx);
+    let (mode, heard, dwell) = (pal.flow.mode(), pal.heard_text.clone(), pal.flow.dwell_progress());
+    #[cfg(feature = "voice")]
+    let voice = &mut pal.voice;
+    let out = command_bar::show(ctx, "stoat-palette", &mut pal.bar, &rows, hint, c, &adaptive, |ui| {
+        #[cfg(feature = "voice")]
+        if mode == Mode::Voice {
+            voice.draw(ui, c);
+        }
+        if let Some(h) = &heard {
+            ui.label(RichText::new(format!("heard: “{h}” — Enter or tap to run it")).small().color(c.warning));
+        }
+        match mode {
+            Mode::Voice => drop(ui.label(RichText::new("listening… type to cancel").small().color(c.accent))),
+            _ if HAS_VOICE => {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 3.0), egui::Sense::hover());
+                ui.painter().rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(r.width() * dwell, 3.0)), 1.5, c.accent);
+            }
+            _ => {}
+        }
     });
-    if esc {
+    if out.dismissed {
         return pal.close();
     }
-    if up || down {
-        pal.cursor = command_bar::move_cursor(pal.cursor, items.len(), if down { 1 } else { -1 });
+    if out.query_changed {
+        pal.heard_text = None;
+        if pal.flow.on_type() == Transition::SwitchedToCommand {
+            pal.voice_cancel();
+        }
+    }
+    if out.navigated {
         pal.flow.on_navigate();
     }
-    if tab {
-        if let Some(best) = items.first() {
-            pal.query = command_bar::accept(&pal.query, &best.label);
-            pal.flow.on_type();
-        }
-    }
-    let mut chosen: Option<usize> = (enter && !items.is_empty()).then_some(pal.cursor);
-
-    // ---- surface ----
-    let screen = ctx.content_rect();
-    let surface = command_bar::mode_for(screen.height(), items.len());
-    let width = (screen.width() - 24.0).min(520.0);
-    if surface == Surface::Pane {
-        let scrim = Color32::from_black_alpha((command_bar::SCRIM_PANE * 255.0) as u8);
-        ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("stoat-palette-scrim"))).rect_filled(screen, 0.0, scrim);
-    }
-    let (anchor, offset) = match surface {
-        Surface::Pane => (Align2::CENTER_TOP, egui::vec2(0.0, 48.0)),
-        Surface::Bar => (Align2::CENTER_BOTTOM, egui::vec2(0.0, -10.0)),
-    };
-    let area = egui::Area::new(egui::Id::new("stoat-palette")).order(egui::Order::Foreground).anchor(anchor, offset).show(ctx, |ui| {
-        egui::Frame::new().fill(c.bg_raised).stroke(egui::Stroke::new(1.0, c.border)).corner_radius(10.0).inner_margin(10.0).show(ui, |ui| {
-            ui.set_width(width);
-            let cursor = pal.cursor;
-            let rows = |ui: &mut egui::Ui, chosen: &mut Option<usize>| {
-                for (i, it) in items.iter().enumerate() {
-                    let mut job = egui::text::LayoutJob::default();
-                    // One line, elided. A frame's detail is a path as long as
-                    // /rustc/<40 hex>/library/std/src/panicking.rs; wrapped, each row
-                    // grew to three lines and a "bar" sized for 34pt rows covered
-                    // the whole phone (seen on screen, not in any test).
-                    // (`.truncate()` on the Button below is what does it: the widget
-                    // overrides a LayoutJob's own wrap settings with its wrap mode,
-                    // so setting max_rows here changed nothing.)
-                    job.append(&it.label, 0.0, egui::TextFormat { font_id: egui::FontId::proportional(14.0), color: c.text, ..Default::default() });
-                    if !it.detail.is_empty() {
-                        job.append(&it.detail, 10.0, egui::TextFormat { font_id: egui::FontId::proportional(11.0), color: c.text_weak, ..Default::default() });
-                    }
-                    if ui.add_sized([width, command_bar::ROW_H], egui::Button::selectable(i == cursor, job).truncate()).clicked() {
-                        *chosen = Some(i);
-                    }
-                }
-            };
-            let status = |ui: &mut egui::Ui, pal: &Palette| {
-                if let Some(h) = &pal.heard_text {
-                    ui.label(RichText::new(format!("heard: “{h}” — Enter or tap to run it")).small().color(c.warning));
-                }
-                match pal.flow.mode() {
-                    Mode::Voice => drop(ui.label(RichText::new("listening… type to cancel").small().color(c.accent))),
-                    _ if HAS_VOICE => {
-                        let p = pal.flow.dwell_progress();
-                        let (r, _) = ui.allocate_exact_size(egui::vec2(width, 3.0), egui::Sense::hover());
-                        ui.painter().rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(r.width() * p, 3.0)), 1.5, c.accent);
-                    }
-                    _ => {}
-                }
-            };
-            let input = |ui: &mut egui::Ui, pal: &mut Palette| {
-                let hint = if HAS_VOICE { "command, frame, binary, pid… or pause to speak" } else { "command, frame, binary, pid…  (p expr · b loc · ! gdb)" };
-                let r = ui.add(text_field::edit("palette-query", &mut pal.query).hint_text(hint).desired_width(width));
-                if std::mem::take(&mut pal.wants_focus) {
-                    r.request_focus();
-                }
-                if r.changed() {
-                    pal.cursor = 0;
-                    pal.heard_text = None;
-                    if pal.flow.on_type() == Transition::SwitchedToCommand {
-                        pal.voice_cancel();
-                    }
-                }
-                if let Some(rest) = items.first().and_then(|b| command_bar::ghost(&pal.query, &b.label)) {
-                    ui.label(RichText::new(format!("tab → {}{rest}", pal.query)).small().color(c.text_weak));
-                }
-            };
-            #[cfg(feature = "voice")]
-            if pal.flow.mode() == Mode::Voice {
-                pal.voice.draw(ui, c);
-            }
-            // The bar sits on the bottom edge, so its input goes last: that is
-            // where the thumb and the on-screen keyboard are.
-            match surface {
-                Surface::Pane => {
-                    input(ui, pal);
-                    status(ui, pal);
-                    rows(ui, &mut chosen);
-                }
-                Surface::Bar => {
-                    rows(ui, &mut chosen);
-                    status(ui, pal);
-                    input(ui, pal);
-                }
-            }
-        });
-    });
-
-    let fresh = std::mem::take(&mut pal.just_opened);
-    if let Some(i) = chosen {
-        if let Some(it) = items.get(i).cloned() {
-            pal.run(&it, st);
-        }
-    } else if !fresh && ctx.input(|i| i.pointer.any_click()) && ctx.input(|i| i.pointer.interact_pos()).is_some_and(|p| !area.response.rect.contains(p)) {
-        pal.close();
+    if let Some(it) = out.chosen.and_then(|i| items.get(i)).cloned() {
+        pal.run(&it, st);
     }
 }
