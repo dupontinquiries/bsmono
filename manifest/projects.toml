@@ -829,3 +829,34 @@ runtime = "none"            # pure egui/glow (wayland/x11), same convention as t
 targets = ["desktop", "phone"]
 primary = true              # egui-first from birth; no Qt/GTK surface exists to archive
 notes = "phone calls over ModemManager (zbus blocking, poll loop) with a simulated-modem fallback for desktop/demo, plus a Matrix signalling backend (incoming m.call.invite rings, decline sends m.call.hangup; no media engine yet) on the same Command/Event link. Setup wizard: carrier APN suggestion from mobile-broadband-provider-info (system XML > downloaded XML > builtin snapshot) keyed by the modem's OperatorCode, applied as a NetworkManager GSM connection over D-Bus; Matrix sign-in with .well-known discovery. Headless dialer-core (19 unit tests) under crates/, dialer-egui on uikit-egui. `cargo build --release -p dialer-egui` = deployable bin (`app`+`mm`+`matrix` default-on); features peel off individually."
+
+[apps.stoat]
+path = "apps/stoat"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false             # it ptraces host processes through gdb; inside a sandbox there is nothing to debug
+runtime = "none"
+targets = ["desktop", "phone", "alpine"]
+notes = "debugger front half over gdb's engine (MI3): rustc-style stop diagnostics (null-page fault decoding, did-you-mean, Rust panic blame frame), ranked binary discovery with stated reasons, bash/zsh/fish/ash history recovery of args and env, build driving, pre-crash vitals + frame pacing from marker breakpoints, debug-cache measure/plan/prune. Pure mi parser + sans-IO session behind a dyn-compatible Backend trait (the seam a DAP or RSP backend would use); default-members build mi+core+cli only, binary `stoat`. Needs gdb at runtime; live tests need gdb + cc + rustc and say NOT RUN without them. Verified on x86_64 with gdb 15.1 only - nothing on aarch64 or musl yet."
+
+[apps.stoat-egui]
+path = "apps/stoat/crates/gui-egui"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"            # pure egui/glow (wayland/x11), same convention as the other -egui apps
+targets = ["desktop", "phone"]
+primary = true
+notes = "egui shell on shared/uikit (Night palette): Launch / Stack / Vitals / Wire / Caches. Tab strip when it fits, swipe pages when it does not, and on a wide window the active page and its followers side by side. On Stack a sideways drag walks frames through the kit GestureLayer. gdb events are handled off the UI thread by stoat-core's Driver so a frame-marker resume never waits for a repaint. `cargo build --release -p stoat-egui` from apps/stoat produces the bin (`app` feature default-on)."
+
+[apps.stoat-gtk]
+path = "apps/stoat/crates/gui-gtk"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "gnome"           # GTK4 4.12+ / libadwaita 1.5+
+targets = ["desktop", "phone"]
+notes = "the GTK4/libadwaita shell stoat-egui was ported from; archived tier, kept building (gtk4-rs 0.11 / libadwaita-rs 0.9, no templates, subclassing or clone!). Not primary. Does not use stoat-core's Driver; it wakes on event arrival so it does not need to."
