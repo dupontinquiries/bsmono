@@ -27,6 +27,8 @@ enum Screen {
     Menu,
     Select,
     Playing,
+    /// Browsing or hosting on the local network.
+    Lan,
 }
 
 struct AppState {
@@ -54,6 +56,8 @@ struct AppState {
     capturing: Option<Action>,
     /// Walk-to order from a tap (world ground point).
     walk_to: Option<Vec3>,
+    /// Open only while the LAN screen is: it holds a socket.
+    lan: Option<crate::lanlobby::LanLobby>,
     /// The stalk toggle. App state, not sim state: the sim decides whether
     /// a cat that WANTS to stalk currently can.
     stalk_on: bool,
@@ -341,6 +345,7 @@ fn init_window(target: &EventLoopWindowTarget<()>) -> Result<AppState, String> {
         controls_open: false,
         capturing: None,
         walk_to: None,
+        lan: None,
         stalk_on: false,
         locked: false,
         scoreboard: false,
@@ -838,7 +843,7 @@ fn render(s: &mut AppState) {
 
     // camera
     let cam = match s.screen {
-        Screen::Menu | Screen::Select => {
+        Screen::Menu | Screen::Select | Screen::Lan => {
             let t = s.last_frame.elapsed().as_secs_f32() * 0.05;
             let r = 55.0;
             Camera {
@@ -920,6 +925,8 @@ fn render(s: &mut AppState) {
     let raw_input = s.egui_winit.take_egui_input(s.window);
     let mut play = false;
     let mut quit = false;
+    let mut open_lan = false;
+    let mut lan_action = crate::lanlobby::Action::None;
     let mut locked_in = false;
     let mut again = false;
     let mut menu = false;
@@ -928,10 +935,16 @@ fn render(s: &mut AppState) {
     let output = s.egui_ctx.run(raw_input, |ctx| {
         match s.screen {
             Screen::Menu => {
-                ui::draw_menu(ctx, &mut play, &mut quit);
+                ui::draw_menu(ctx, &mut play, &mut quit, &mut open_lan);
                 ui::draw_controls_button(ctx, &mut open_controls);
             }
             Screen::Select => ui::draw_select(ctx, &mut s.ui, &mut locked_in),
+            Screen::Lan => {
+                if let Some(l) = s.lan.as_mut() {
+                    l.tick(Instant::now(), 0, 1);
+                    lan_action = ui::draw_lan(ctx, l);
+                }
+            }
             Screen::Playing => {
                 if let Some(g) = s.game.as_mut() {
                     if s.ui.shop_open {
@@ -1019,6 +1032,25 @@ fn render(s: &mut AppState) {
     frame.present();
 
     // transitions
+    if open_lan {
+        s.lan = Some(crate::lanlobby::LanLobby::open(&std::env::var("USER").unwrap_or_else(|_| "Cat".into())));
+        s.screen = Screen::Lan;
+    }
+    match lan_action {
+        crate::lanlobby::Action::Back => {
+            s.lan = None; // closes the socket and stops announcing
+            s.screen = Screen::Menu;
+        }
+        crate::lanlobby::Action::Join(addr) => {
+            // Discovery ends here. There is no synchronised match to enter
+            // yet, and the screen's footer says so; do not fake one.
+            eprintln!("[clawbound] LAN: chose the den at {addr}; the match itself is not networked yet");
+            if let Some(l) = s.lan.as_mut() {
+                l.status = format!("Found {addr}. Playing across machines is not built yet.");
+            }
+        }
+        crate::lanlobby::Action::None => {}
+    }
     if play {
         s.screen = Screen::Select;
     }
