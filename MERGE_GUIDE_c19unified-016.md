@@ -1,4 +1,4 @@
-# Merge guide — c19unified-015 (stoat)
+# Merge guide — c19unified-016 (stoat, and the palette canon)
 
 For whoever merges this drop into another copy of the repo, human or Claude.
 Same purpose as `MERGE_GUIDE_026.md` / `_028.md`: what changed, what was
@@ -6,11 +6,14 @@ verified and how, and where it can collide. The commit messages carry the detail
 this is the map.
 
 Base: `9acc004fe` (main of `c19unified-013-fleet`). Everything here is linear on
-top of it, so against an unmoved main it fast-forwards.
+top of it, so against an unmoved main it fast-forwards. 016 supersedes 015 (it is
+015 plus four commits: the palette surface moving into the kit, stoat and
+vidkit-player ported onto it, and the UI_STRATEGY entry). If 015 was already
+merged, only those four are new.
 
 ```sh
-git bundle verify c19unified-015-*.bundle
-git fetch /path/to/c19unified-015-*.bundle refs/heads/main:incoming-stoat
+git bundle verify c19unified-016-*.bundle
+git fetch /path/to/c19unified-016-*.bundle refs/heads/main:incoming-stoat
 git log --oneline main..incoming-stoat          # review first
 git fetch /path/to/bundle 'refs/notes/toolcalls:refs/notes/incoming-toolcalls'
 git notes --ref=toolcalls merge incoming-toolcalls   # only if you already have notes
@@ -22,7 +25,7 @@ This bundle came from a single-branch clone: it has `main`, tags and
 
 ## Where it can collide
 
-Everything new is under `apps/stoat/` and cannot conflict. Outside it, seven files:
+Everything new is under `apps/stoat/` and cannot conflict. Outside it:
 
 | file | change | collides if the other side… |
 |---|---|---|
@@ -30,6 +33,9 @@ Everything new is under `apps/stoat/` and cannot conflict. Outside it, seven fil
 | `shared/uikit/crates/uikit-egui/src/log_view.rs` | `log_row`: `horizontal_top`, message `Label::wrap()`; one new test | …edited `log_row` |
 | `shared/uikit/crates/uikit-egui/src/palette_flow.rs` | one test asserts against the constants; diagram says 5000 | …also fixed that red test (take either; keep exactly one) |
 | `tools/rustcheck/rustcheck.py` + `test_resolve_mod_files.py` | files in tests/, examples/, benches/, src/bin/ count as crate roots; 2 new test groups | …edited `_declared_crate_roots`, or appended test groups (the file ends with a hard-coded group count: it is 5 now) |
+| `shared/uikit/crates/uikit-egui/src/command_bar.rs` | the palette SURFACE: `show`, `State`, `Row`, `Outcome`, `Placement`, `placement_for`, `mode_for_rows`, `arrow`; a `surface_tests` module. The existing arithmetic and its tests are untouched | …added anything after `move_cursor` or edited the module header |
+| `apps/vidkit-player/src/palette.rs`, `src/main.rs` | palette state and drawing replaced by the kit surface; 111 -> 109 tests (three removed with reasons in place, two added) | …touched `Palette`, `palette_ui`, or the removed tests. NOTE the behaviour change: its cursor now clamps instead of wrapping |
+| `UI_STRATEGY.md` | one bullet under "New egui app: good defaults" | …added a bullet at the same spot — keep both |
 | `manifest/projects.toml` | three entries appended: `stoat`, `stoat-egui` (primary), `stoat-gtk` | …appended at the same place — keep both sides |
 | `CLAUDE.md` §3 | GTK4/libadwaita are installable in the sandbox | …edited the same paragraph |
 
@@ -57,7 +63,8 @@ time, x86_64, gdb 15.1, rustc 1.96, egui 0.34:
 | stoat-mi | 5 |
 | stoat-core | command 5, driver 1, live_gdb 4, replay 4, services 10 |
 | stoat-egui | unit 5, palette 6, phone 4 |
-| uikit-egui | lib 543 / 0 failed (it was 541 / 1 on arrival), integration 1 + 5 ignored |
+| uikit-egui | lib 547 / 0 failed (it was 541 / 1 on arrival), integration 1 + 5 ignored |
+| vidkit-player | 109 (baseline taken first by stashing the port: 111, same 5 warnings) |
 
 `live_gdb` drives a real gdb: C segfault, Rust panic, a core file written by
 gdb's own `generate-core-file`, attach to a running process. Those four, and one
@@ -65,7 +72,8 @@ services test, print `NOT RUN` and PASS when gdb/cc/rustc/strip are missing — 
 green run on a bare image has not exercised them. Look for the string.
 
 Break-tested (the thing broken, the test confirmed red, the file restored):
-12 breaks, 12 caught - 1 in `5d18e8a56`, 4 in `92efe5cf4`, 7 in `c75364404`.
+18 breaks, 18 caught - 1 in `5d18e8a56`, 4 in `92efe5cf4`, 7 in `c75364404`,
+6 on the kit surface in `7d0f9311f`.
 Separately, the two kit tests were written first and seen red against the
 unfixed code. NOT break-tested: the core-file and attach live tests.
 
@@ -84,7 +92,25 @@ in integration tests), `lock_check`, `orphan_check`,
 `cfg_feature_check` FAILS on `apps/rusty-board` (`llm-swipe-ffi`) — on arrival,
 not from this drop.
 
+## The palette canon, and who has not moved yet
+
+`uikit_egui::command_bar::show` is now THE palette surface: bottom edge and
+inverted (best match directly above the input) on a compact or touch surface,
+the familiar top-centre card on a desk. Consumers: stoat-egui, vidkit-player.
+Still drawing their own, from a grep for "command palette" in egui crates and NOT
+audited one by one: voiceterm-egui, beatspace, studio-egui, logscope-egui,
+snapclone-egui, aperture, tomescope. Each port is mostly deletion (vidkit-player:
++63 / -176), but each also takes the kit's clamp-not-wrap cursor and its
+arrow/Enter behaviour, so each needs its own look. There is no checker pinning
+this yet; `textedit_id_check.py` is the pattern to copy (a KNOWN_MISSES list with
+a reason per entry).
+
 ## Not verified — do not inherit these as claims
+
+* The ported palettes on screen beyond opening them: stoat-egui was not
+  re-looked-at after the port (its tests drive the tap, the long press and the
+  speech rule through real egui input and are green); vidkit-player was opened at
+  400x640 (bottom, inverted) and 1300x740 (top-centre) and nothing was typed.
 
 * Nothing on aarch64, musl or a phone. Frame-marker overhead (~2.3 ms a frame)
   is this sandbox's number.
