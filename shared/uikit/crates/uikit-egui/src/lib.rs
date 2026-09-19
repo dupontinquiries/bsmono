@@ -132,6 +132,9 @@ pub mod log_view;
 pub mod mono_tile;
 pub mod slide_menu;
 pub mod toast;
+/// A message with a severity that cannot be mistaken for the text around it:
+/// tinted surface, accent stripe, severity border, chip, tagged lines.
+pub mod callout;
 pub mod split_pane;
 pub mod toggle_grid;
 pub mod theme_bridge;
