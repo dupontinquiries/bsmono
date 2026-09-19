@@ -849,6 +849,46 @@ fn q4k_block(y: &mut [f32], blk: &[u8]) {
     q4k_block_core(y, blk)
 }
 
+/// F16 -> f32 over FIXED blocks of 64.
+///
+/// bench-dequant (optimized, one thread) put the SIMPLEST formats at the bottom: F16 336 and Q8_0
+/// 375 M weights/s, under Q4_K's 710 with its nibbles and 6-bit scales. That ordering means
+/// something is in the vectorizer's way, not that the work is hard. Here it was the
+/// `chunks_exact(2).map(..).collect()` shape: per-element iterator state and no trip count the
+/// compiler could plan around. Blocks of 64 with array-typed windows give it both.
+/// 363 -> 489 M weights/s at baseline x86-64, 338 -> 633 with AVX2; bit-identical, remainder included.
+fn dequant_f16(data: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0f32; n];
+    let mut oc = out.chunks_exact_mut(64);
+    let mut ic = data[..n * 2].chunks_exact(128);
+    for (o, c) in (&mut oc).zip(&mut ic) {
+        let o: &mut [f32; 64] = o.try_into().unwrap();
+        let c: &[u8; 128] = c.try_into().unwrap();
+        for j in 0..64 { o[j] = f16_to_f32(u16::from_le_bytes([c[2 * j], c[2 * j + 1]])); }
+    }
+    for (o, c) in oc.into_remainder().iter_mut().zip(ic.remainder().chunks_exact(2)) {
+        *o = f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+    }
+    out
+}
+
+/// Q8_0 -> f32: 34-byte blocks of 32 — f16 scale `d`, then 32 signed int8; w = q·d.
+///
+/// This arm did `out.push(..)` thirty-two times a block — a capacity check and a length store per
+/// WEIGHT, which no vectorizer sees through — over `chunks(34)`, which also bounds-checks every
+/// `blk[2 + j]`. Its neighbour Q4_0 already decoded into a local array and ran 1.4x faster for a
+/// harder format. Fixed-size views into a pre-sized output: 373 -> 769 M weights/s, bit-identical.
+fn dequant_q8_0(data: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0f32; n];
+    for (blk, o) in data.chunks_exact(34).zip(out.chunks_exact_mut(32)) {
+        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let q: &[u8; 32] = blk[2..34].try_into().unwrap();
+        let o: &mut [f32; 32] = o.try_into().unwrap();
+        for (w, &b) in o.iter_mut().zip(q.iter()) { *w = b as i8 as f32 * d; }
+    }
+    out
+}
+
 pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, String> {
     match ggml_type {
         // CHUNKS, NOT INDICES. Both of these ran `(0..n).map(|i| ... data[i * k ..] ...)`, which
@@ -863,8 +903,7 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
         }
         1 => {
             if data.len() < n * 2 { return Err("f16 data truncated".into()); }
-            Ok(data[..n * 2].chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect())
+            Ok(dequant_f16(&data[..n * 2], n))
         }
         2 => {
             if n % 32 != 0 { return Err("q4_0 element count not a multiple of 32".into()); }
@@ -884,12 +923,9 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
         8 => {
             // Q8_0: 34-byte blocks of 32 — f16 scale `d`, then 32 signed int8; w = d·q.
             if n % 32 != 0 { return Err("q8_0 element count not a multiple of 32".into()); }
-            let mut out = Vec::with_capacity(n);
-            for blk in data[..n / 32 * 34].chunks(34) {
-                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
-                for j in 0..32 { out.push(blk[2 + j] as i8 as f32 * d); }
-            }
-            Ok(out)
+            // The other arms all check this; Q8_0 indexed straight into a short slice and PANICKED.
+            if data.len() < n / 32 * 34 { return Err("q8_0 data truncated".into()); }
+            Ok(dequant_q8_0(&data[..n / 32 * 34], n))
         }
         6 => {
             // Q5_0: 22-byte blocks of 32 — f16 `d`, 4-byte `qh` (one 5th-bit per weight),
@@ -1091,6 +1127,38 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
 #[cfg(test)]
 mod kquant_tests {
     use super::*;
+
+    /// The two rewritten arms against the loops they replaced, VERBATIM, bit for bit — including
+    /// every F16 length class around the 64-wide block (0, 1, 63, 64, 65, 127, 128, 129 …) and
+    /// every half that exists, so subnormals, zeros, infinities and NaNs all pass through.
+    #[test]
+    fn the_f16_and_q8_0_arms_are_bit_identical_to_the_loops_they_replaced() {
+        let f16_before = |data: &[u8], n: usize| -> Vec<f32> {
+            data[..n * 2].chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect() };
+        let q8_before = |data: &[u8], n: usize| -> Vec<f32> {
+            let mut out = Vec::with_capacity(n);
+            for blk in data[..n / 32 * 34].chunks(34) {
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                for j in 0..32 { out.push(blk[2 + j] as i8 as f32 * d); }
+            }
+            out };
+        let same = |a: &[f32], b: &[f32]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+        let all_halves: Vec<u8> = (0..=u16::MAX).flat_map(|h| h.to_le_bytes()).collect();
+        for n in [0usize, 1, 2, 63, 64, 65, 127, 128, 129, 1000, 65536] {
+            assert!(same(&dequantize(1, &all_halves, n).unwrap(), &f16_before(&all_halves, n)), "f16 n={n}");
+        }
+        let mut x = 0x1234_5678u32;
+        let mut raw: Vec<u8> = (0..34 * 300).map(|_| { x = x.wrapping_mul(1664525).wrapping_add(1013904223); (x >> 24) as u8 }).collect();
+        for (b, blk) in raw.chunks_mut(34).enumerate() {   // scales: normal, subnormal, zero, negative, inf, NaN
+            let h: u16 = match b % 6 { 0 => 0x2C00 + b as u16, 1 => 0x0003, 2 => 0x0000, 3 => 0xAC00, 4 => 0x7C00, _ => 0x7E01 };
+            blk[0] = h as u8; blk[1] = (h >> 8) as u8;
+        }
+        for blocks in [0usize, 1, 2, 7, 300] {
+            assert!(same(&dequantize(8, &raw, blocks * 32).unwrap(), &q8_before(&raw, blocks * 32)), "q8_0 blocks={blocks}");
+        }
+        assert_eq!(dequantize(8, &raw[..100], 320).unwrap_err(), "q8_0 data truncated", "a short buffer is an error now, not an index panic");
+        assert!(dequantize(8, &raw, 33).is_err());
+    }
 
     // f32 → f16 bits (round-to-nearest-even), for building exact test blocks.
     fn f16_bits(x: f32) -> u16 {
