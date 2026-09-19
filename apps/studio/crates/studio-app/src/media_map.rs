@@ -41,17 +41,31 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Content identity. The caller's own hash — `Manifest.asset` in this app.
+/// Content identity: `studio_collab::assets::Manifest.asset`.
 ///
-/// A newtype rather than a bare array so a path and a hash cannot be swapped
+/// A newtype rather than a bare integer so a path and a hash cannot be swapped
 /// at a call site, which is the mistake this module exists to make impossible.
+///
+/// THE WIDTH IS THE APP'S, not a choice made here. I first wrote this as
+/// `[u8; 32]` on the assumption that a content hash is a SHA-256, and wrote
+/// "Manifest.asset in this app" directly above it without checking: that field
+/// is a `ChunkId`, which is a `u64` from a 64-bit FNV-1a walk
+/// (`assets::hash`). The doc named the right source and the type could not
+/// hold it, so the module could never actually have been wired to the thing it
+/// says it maps.
+///
+/// 64 bits of FNV is weak for adversarial collisions and fine for this: the
+/// question is "have I already imported this file", the corpus is one
+/// musician's sample folder, and a wrong answer costs a duplicate import
+/// rather than anything unrecoverable. Widening it would mean changing the
+/// wire format, which is a different and much larger decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AssetKey(pub [u8; 32]);
+pub struct AssetKey(pub u64);
 
 impl AssetKey {
     /// Short form for logs and for the clip inspector.
     pub fn short(&self) -> String {
-        self.0[..4].iter().map(|b| format!("{b:02x}")).collect()
+        format!("{:08x}", self.0 >> 32)
     }
 }
 
@@ -211,9 +225,7 @@ mod tests {
     use super::*;
 
     fn key(n: u8) -> AssetKey {
-        let mut k = [0u8; 32];
-        k[0] = n;
-        AssetKey(k)
+        AssetKey(n as u64)
     }
 
     /// THE DUPLICATE IMPORT. Dropping the same file from two folders is one
@@ -356,9 +368,21 @@ mod tests {
 
     #[test]
     fn a_short_key_is_readable_in_a_log() {
-        let mut k = [0u8; 32];
-        k[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-        assert_eq!(AssetKey(k).short(), "deadbeef");
+        // The TOP 32 bits: FNV-1a's low bits move most per input byte, so the
+        // high half is the more distinctive half to show in a log line.
+        assert_eq!(AssetKey(0xdead_beef_0000_0000).short(), "deadbeef");
+    }
+
+    /// The key is whatever `assets::hash` produced, so the same bytes give the
+    /// same key and different bytes almost never do. Pinned because the whole
+    /// dedupe rests on it.
+    #[test]
+    fn identical_bytes_give_an_identical_key() {
+        let a = AssetKey(studio_collab::assets::hash(b"the same take"));
+        let b = AssetKey(studio_collab::assets::hash(b"the same take"));
+        let c = AssetKey(studio_collab::assets::hash(b"a different take"));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 
     /// Nothing to search is not a crash.
