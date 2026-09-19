@@ -1240,6 +1240,8 @@ pub fn draw_touch_pad(ctx: &egui::Context, pad: &crate::touch::TouchPad, game: &
     // shop / board / menu — press feedback so taps feel acknowledged
     painter.circle(to_px(l.shop), r_px(crate::touch::BTN_R * 0.8), dim, Stroke::new(1.5, ring));
     painter.text(to_px(l.shop), Align2::CENTER_CENTER, "$", FontId::proportional(r_px(0.05)), GOLD);
+    painter.circle(to_px(l.leap), r_px(crate::touch::BTN_R * 0.8), dim, Stroke::new(1.5, ring));
+    painter.text(to_px(l.leap), Align2::CENTER_CENTER, "^", FontId::proportional(r_px(0.06)), GOLD);
     let board_t = ctx.animate_bool(egui::Id::new("touch_board_held"), pad.board_down());
     let board_fill = Color32::from_rgba_premultiplied((20.0 + board_t * 40.0) as u8, 20, 28, (120.0 + board_t * 60.0) as u8);
     painter.circle(to_px(l.board), r_px(crate::touch::BTN_R * 0.8) / pad.scale * (1.0 + board_t * 0.08), board_fill, Stroke::new(1.5, ring));

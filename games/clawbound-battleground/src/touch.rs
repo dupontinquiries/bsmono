@@ -71,12 +71,16 @@ pub enum Btn {
     Shop,
     Board,
     Menu,
+    /// The aimed leap. Sits inside the thumb's arc between attack and the
+    /// first ability: it is pressed mid-run, so it cannot be a reach.
+    Leap,
 }
 
 pub struct Layout {
     pub attack: Vec2,
     pub abilities: [Vec2; 4],
     pub shop: Vec2,
+    pub leap: Vec2,
     pub board: Vec2,
     pub menu: Vec2,
 }
@@ -97,6 +101,9 @@ pub fn layout(extent: Vec2, scale: f32) -> Layout {
             Vec2::new(right - 0.10 * s, bottom - 0.60 * s),
         ],
         shop: Vec2::new(right - 0.06 * s, bottom - 0.08 * s),
+        // Solved, not eyeballed: the bottom row between shop and ability 1
+        // has ONE spot clear of attack, shop and a1 at once.
+        leap: Vec2::new(right - 0.23 * s, bottom - 0.08 * s),
         board: Vec2::new(right - 0.05, 0.06),
         menu: Vec2::new(0.055, 0.055),
     }
@@ -191,6 +198,9 @@ impl TouchPad {
             if near(*a, BTN_R) {
                 return Some(Btn::Ability(i));
             }
+        }
+        if near(l.leap, BTN_R * 0.8) {
+            return Some(Btn::Leap);
         }
         if near(l.shop, BTN_R * 0.8) {
             return Some(Btn::Shop);
@@ -345,6 +355,9 @@ impl TouchPad {
     pub fn shop_edge(&self) -> bool {
         self.edges.contains(&Btn::Shop)
     }
+    pub fn leap_edge(&self) -> bool {
+        self.edges.contains(&Btn::Leap)
+    }
     pub fn menu_edge(&self) -> bool {
         self.edges.contains(&Btn::Menu)
     }
@@ -355,6 +368,34 @@ impl TouchPad {
 
 #[cfg(test)]
 mod tests {
+    /// The leap button must not steal taps from an old one. Hit radii are the
+    /// ones `hit` uses (1.15x), on a landscape phone and a portrait one.
+    #[test]
+    fn no_two_touch_buttons_overlap() {
+        let mut pairs = 0;
+        for extent in [Vec2::new(1.78, 1.0), Vec2::new(1.0, 2.1)] {
+            let l = layout(extent, 1.0);
+            let mut b = vec![("attack", l.attack, ATK_R), ("shop", l.shop, BTN_R * 0.8), ("leap", l.leap, BTN_R * 0.8)];
+            for (i, a) in l.abilities.iter().enumerate() {
+                b.push((["a1", "a2", "a3", "a4"][i], *a, BTN_R));
+            }
+            // Only pairs involving the NEW button. `attack` and `a2` have
+            // overlapped by 0.028 since before this test existed; `hit`
+            // settles it by testing attack first. Known, and not this
+            // test's claim -- asserting every pair would just fail on it.
+            let leap = b.iter().position(|x| x.0 == "leap").unwrap();
+            for j in 0..b.len() {
+                if j == leap {
+                    continue;
+                }
+                let gap = (b[leap].1 - b[j].1).length() - (b[leap].2 + b[j].2) * 1.15;
+                assert!(gap > 0.01, "leap and {} are {} apart on {extent}", b[j].0, gap);
+                pairs += 1;
+            }
+        }
+        assert_eq!(pairs, 12);
+    }
+
     use super::*;
 
     #[test]

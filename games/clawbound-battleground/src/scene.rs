@@ -403,13 +403,13 @@ impl Scene {
             let def = game.def(i);
             let di = g.def_id as usize;
             let rig = &self.god_rig[di];
-            let leap = g.dash.as_ref().map(|d| {
+            let leap = g.leap.as_ref().map(|l| l.view()).or_else(|| g.dash.as_ref().map(|d| {
                 // The sim's dash arc is y = 1.4 a (1 - a); its slope over
                 // ground covered is what the body pitches along.
                 let a = (d.t / d.dur.max(1e-3)).clamp(0.0, 1.0);
                 let run = Vec3::new(d.to.x - d.from.x, 0.0, d.to.z - d.from.z).length().max(0.5);
                 LeapView::Flight { t: a, climb: 1.4 * (1.0 - 2.0 * a) / run * 2.0 }
-            });
+            }));
             let inp = PuppetInput {
                 pos: g.pos,
                 yaw: g.yaw,
@@ -417,7 +417,7 @@ impl Scene {
                 atk_pulse: g.atk_anim,
                 strike_style: if def.auto_range > 6.0 { StrikeStyle::Snap } else { StrikeStyle::Swipe },
                 leap,
-                perched: false,
+                perched: g.perch.is_some(),
             };
             let puppet = &mut vfx.puppets.puppets[i];
             puppet.advance(dt, &inp, rig, &world, &mut pevents);

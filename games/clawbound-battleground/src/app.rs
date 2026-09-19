@@ -752,6 +752,14 @@ fn render(s: &mut AppState) {
         let yaw = s.cam_yaw;
         let walk_to = s.walk_to;
         if let Some(g) = s.game.as_mut() {
+            // A leap goes where the cat is being steered; standing still,
+            // where the camera looks. `leap::plan` turns that direction into
+            // a place -- the rock ahead, if there is one.
+            if c.leap {
+                let (fwd, right) = input::camera_basis(yaw);
+                let dir = if c.mv.length_squared() > 0.04 { fwd * c.mv.y + right * c.mv.x } else { fwd };
+                g.leap_queue.push((0, dir));
+            }
             // casts are edges: queue them once, outside the step loop
             for slot in 0..4u32 {
                 if c.cast[slot as usize] {
