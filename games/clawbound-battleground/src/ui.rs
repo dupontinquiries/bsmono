@@ -204,8 +204,11 @@ pub fn draw_lan(ctx: &egui::Context, lobby: &mut crate::lanlobby::LanLobby) -> c
                 }
             });
             ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                ui.add_space(120.0);
+            // A fixed-size block, so `vertical_centered` can centre it. This was
+            // `ui.horizontal` with a 120 px spacer, which centres nothing: the
+            // row sat at the left edge of an area the long footer line had
+            // stretched. Found by running the real binary under Xvfb.
+            ui.allocate_ui_with_layout(egui::vec2(230.0 + 150.0 + 8.0, 48.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 let label = if lobby.hosting { "■  STOP HOSTING" } else { "▶  HOST A DEN" };
                 let host = ui.add_sized([230.0, 48.0], egui::Button::new(egui::RichText::new(label).size(19.0).color(Color32::BLACK).strong()).fill(GOLD));
                 if host.clicked() {

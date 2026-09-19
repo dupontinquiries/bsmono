@@ -60,6 +60,9 @@ pub struct LanLobby {
     pub joined: Option<(SocketAddr, String)>,
     join_sock: Option<UdpSocket>,
     last_hello: Option<Instant>,
+    /// Kept alive while a bsgames handoff session is: dropping it would stop
+    /// the DHT announcement.
+    mp: Option<netcode::multiplayer::Multiplayer>,
     pub rows: Vec<Row>,
     /// One line for the screen's footer: what is going on, or what is wrong.
     pub status: String,
@@ -82,7 +85,7 @@ impl LanLobby {
             }
         });
         let status = browser.as_ref().err().cloned().unwrap_or_else(|| "Searching the local network...".into());
-        LanLobby { my_name: my_name.into(), my_id, browser, announcer: None, hosting: false, game_sock: None, roster: Vec::new(), joined: None, join_sock: None, last_hello: None, rows: Vec::new(), status }
+        LanLobby { my_name: my_name.into(), my_id, browser, announcer: None, hosting: false, game_sock: None, roster: Vec::new(), joined: None, join_sock: None, last_hello: None, mp: None, rows: Vec::new(), status }
     }
 
     pub fn port(&self) -> Option<u16> {
@@ -112,6 +115,29 @@ impl LanLobby {
         self.announcer = Announcer::to(to).ok();
         self.hosting = self.announcer.is_some();
         self.bind_game_sock();
+    }
+
+    /// bsgames launched us to HOST for a friend. The den's game socket IS the
+    /// socket `netcode::multiplayer` announces over the DHT, so a friend who
+    /// joins by id and a stranger who finds the den on the LAN screen arrive
+    /// at the same roster. Also announces on the LAN.
+    pub fn host_for_handoff(&mut self, mut mp: netcode::multiplayer::Multiplayer) -> Result<String, String> {
+        let token = mp.host("0.0.0.0:0")?;
+        let sock = mp.socket.as_ref().ok_or("no socket")?.try_clone().map_err(|e| e.to_string())?;
+        sock.set_nonblocking(true).map_err(|e| e.to_string())?;
+        self.game_sock = Some(sock);
+        self.mp = Some(mp);
+        self.set_hosting(true);
+        Ok(token)
+    }
+
+    /// bsgames launched us to JOIN a friend: resolve them through the DHT,
+    /// then say HELLO to the address they announced, exactly as a LAN join.
+    pub fn join_for_handoff(&mut self, mut mp: netcode::multiplayer::Multiplayer, friend_id: &str) -> Result<SocketAddr, String> {
+        let addr: SocketAddr = mp.join(friend_id)?.parse().map_err(|e| format!("{friend_id} announced an unusable address: {e}"))?;
+        self.mp = Some(mp);
+        self.join(addr);
+        Ok(addr)
     }
 
     fn bind_game_sock(&mut self) {
@@ -286,6 +312,37 @@ mod tests {
         host.tick(later);
         seeker.tick(later);
         assert!(seeker.rows.is_empty(), "the den closed and the row went with it");
+    }
+
+    /// The bsgames path, end to end on one machine: a host launched by
+    /// handoff announces over the (file-backed) DHT, a joiner launched by
+    /// handoff resolves the friend BY ID -- no LAN discovery involved -- and
+    /// lands on the same roster a LAN joiner would.
+    #[test]
+    fn a_friend_joining_by_id_through_the_dht_lands_in_the_den() {
+        use netcode::multiplayer::Multiplayer;
+        let store = std::env::temp_dir().join(format!("cb-handoff-{}.store", std::process::id()));
+        let _ = std::fs::remove_file(&store);
+        let mut host = LanLobby::open_on("Wren", 0);
+        let token = host.host_for_handoff(Multiplayer::at_store(GAME, "wren", "Wren", store.clone())).unwrap();
+        assert_eq!(token, "clawbound@wren");
+        let mut friend = LanLobby::open_on("Fox", 0);
+        let addr = friend.join_for_handoff(Multiplayer::at_store(GAME, "fox", "Fox", store.clone()), "wren").unwrap();
+        assert!(!addr.ip().is_unspecified(), "resolved {addr}");
+        let now = Instant::now();
+        for _ in 0..60 {
+            friend.tick(now);
+            host.tick(now);
+            if host.players() == 2 && friend.status.contains("in the den (2/") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        assert_eq!((host.players(), host.roster[0].1.as_str()), (2, "Fox"));
+        assert!(friend.status.contains("in the den (2/10)"), "{}", friend.status);
+        let mut stranger = LanLobby::open_on("Nobody", 0);
+        assert!(stranger.join_for_handoff(Multiplayer::at_store(GAME, "nobody", "N", store.clone()), "not-a-friend").is_err());
+        let _ = std::fs::remove_file(&store);
     }
 
     #[test]

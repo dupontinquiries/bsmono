@@ -99,6 +99,11 @@ pub fn run(opts: crate::launch::LaunchOptions) {
                             Ok(mut s) => {
                                 eprintln!("RESUMED: init ok — surface configured");
                                 s.launch = opts.clone();
+                                if opts.lan {
+                                    let me = opts.player_name.clone().or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "Cat".into());
+                                    s.lan = Some(crate::lanlobby::LanLobby::open(&me));
+                                    s.screen = Screen::Lan;
+                                }
                                 if let Some(n) = &opts.player_name {
                                     s.ui.player_label = Some(n.clone());
                                 }
