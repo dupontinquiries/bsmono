@@ -101,9 +101,39 @@ check(
     expect_missing=set(),
 )
 
+# 4. Roots cargo DISCOVERS: tests/*.rs (likewise examples/, benches/, src/bin/)
+#    are crates, so `mod common;` in tests/a.rs is tests/common/mod.rs - the
+#    standard shared-helper layout. Found when apps/stoat's two integration tests
+#    were both reported as missing a file that rustc finds. The must-still-warn
+#    halves: a helper that really is absent, and a package that turned discovery
+#    off (then tests/a.rs is NOT a root and the old expectation is the right one).
+check(
+    "auto-discovered integration test roots",
+    {
+        "Cargo.toml": '[package]\nname = "x"\nversion = "0.1.0"\n',
+        "src/lib.rs": "",
+        "tests/a.rs": "mod common;\nmod absent;\n",
+        "tests/b.rs": "mod common;\n",
+        "tests/common/mod.rs": "pub fn helper() {}\n",
+        "src/bin/tool.rs": "mod args;\n",
+        "src/bin/args.rs": "",
+    },
+    expect_missing={("tests/a.rs", "absent")},
+)
+check(
+    "autotests = false: a file in tests/ is not a root",
+    {
+        "Cargo.toml": '[package]\nname = "x"\nversion = "0.1.0"\nautotests = false\n',
+        "src/lib.rs": "",
+        "tests/a.rs": "mod common;\n",
+        "tests/common/mod.rs": "",
+    },
+    expect_missing={("tests/a.rs", "common")},
+)
+
 if FAILURES:
     print("\nFAILED:")
     for f in FAILURES:
         print(" -", f)
     sys.exit(1)
-print(f"\n{3} groups, all as expected")
+print(f"\n{5} groups, all as expected")
