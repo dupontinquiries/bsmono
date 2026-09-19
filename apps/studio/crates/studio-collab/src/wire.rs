@@ -540,6 +540,20 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
             put_u8(o, 40); put_u64(o, source.0); put_fingerprint(o, fingerprint);
         }
         Op::RemoveFingerprint { source } => { put_u8(o, 41); put_u64(o, source.0); }
+        // 43, 44: appended, never inserted. A tag byte IS the wire format --
+        // renumbering an existing op would make two peers on different builds
+        // decode each other's edits as the wrong operation, which is worse
+        // than failing to decode them at all.
+        Op::SetGroupWindow { id, window } => {
+            put_u8(o, 43); put_u64(o, id.0);
+            match window {
+                Some((a, b)) => { put_u8(o, 1); put_ticks(o, *a); put_ticks(o, *b); }
+                None => put_u8(o, 0),
+            }
+        }
+        Op::SetClipFade { id, fade_in, fade_out } => {
+            put_u8(o, 44); put_u64(o, id.0); put_ticks(o, *fade_in); put_ticks(o, *fade_out);
+        }
         Op::SetGroupActive { id, active } => {
             put_u8(o, 42); put_u64(o, id.0); put_opt_clip_id(o, *active);
         }
@@ -683,6 +697,19 @@ fn get_op(r: &mut R) -> Option<Op> {
         40 => Op::SetFingerprint { source: SourceId(r.u64()?), fingerprint: get_fingerprint(r)? },
         41 => Op::RemoveFingerprint { source: SourceId(r.u64()?) },
         42 => Op::SetGroupActive { id: GroupId(r.u64()?), active: get_opt_clip_id(r)? },
+        43 => {
+            let id = GroupId(r.u64()?);
+            let window = match r.u8()? {
+                0 => None,
+                _ => Some((Ticks(r.i64()?), Ticks(r.i64()?))),
+            };
+            Op::SetGroupWindow { id, window }
+        }
+        44 => Op::SetClipFade {
+            id: ClipId(r.u64()?),
+            fade_in: Ticks(r.i64()?),
+            fade_out: Ticks(r.i64()?),
+        },
         25 => {
             let n = r.u16()? as usize;
             let mut ops = Vec::with_capacity(n.min(4096));
@@ -1293,6 +1320,20 @@ mod tests {
             Op::RemoveFingerprint { source: SourceId(1) },
             Op::SetGroupActive { id: GroupId(1), active: Some(ClipId(2)) },
             Op::SetGroupActive { id: GroupId(1), active: None },
+            // Both window states, because the presence byte is the part that
+            // can be wrong -- a None that decoded as Some would read two ticks
+            // of the NEXT op's bytes and corrupt everything after it.
+            Op::SetGroupWindow {
+                id: GroupId(3),
+                window: Some((Ticks::from_seconds(1.0), Ticks::from_seconds(2.5))),
+            },
+            Op::SetGroupWindow { id: GroupId(3), window: None },
+            // Negative-capable: Ticks is i64 and a fade is arithmetic on it.
+            Op::SetClipFade {
+                id: ClipId(9),
+                fade_in: Ticks::from_seconds(0.25),
+                fade_out: Ticks(0),
+            },
         ]
     }
 

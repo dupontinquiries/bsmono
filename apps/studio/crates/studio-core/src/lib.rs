@@ -235,7 +235,6 @@ pub struct Project {
     /// Reusable automation curves, addressed by id — see the `curves`
     /// module. A curve with no binding is inert; a curve is never removed
     /// while a binding names it. `serde(default)` for the usual reason.
-    #[serde(default)]
     /// Per-clip fades, in ticks from the clip's own start and end.
     ///
     /// A SPARSE MAP, not a field on `Clip`, for two reasons. There are 221
@@ -252,6 +251,7 @@ pub struct Project {
     /// about the edit, not about this device's playback.
     #[serde(default)]
     pub fades: BTreeMap<ClipId, (Ticks, Ticks)>,
+    #[serde(default)]
     pub curves: BTreeMap<CurveId, Curve>,
     /// Which curves drive which targets through which gates. Multiplied
     /// into the target's lane at render time; a binding whose gate clip is
