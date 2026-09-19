@@ -57,6 +57,18 @@ the single highest-value thing anyone can do with this repo next.
 
 ## Known gaps
 
+- **bsgames handoff: the lobby can, the launch path does not yet.**
+  `LanLobby::host_for_handoff` / `join_for_handoff` are tested end to end
+  over a FileStore, but `app.rs` still only logs the handoff and plays solo.
+  Next: on `opts.handoff`, open `Screen::Lan` and call them; have bsgames
+  pass `--lan`. The `opendht` backend has never been run here.
+- **How to check LAN work**: `maintenance/tools/lan_sim.sh <lanbot> [n]`
+  (namespaced LAN, real broadcast), and the real binary under Xvfb with
+  `--lan`. Both found things tests did not. Never `pkill -f` a string that is
+  in your own command line.
+- **Menus sit over bare terrain**: with no match running the world is not
+  drawn at all. Pre-existing; seen in the Xvfb run.
+
 - **LAN: a den is a roster, not a match.** Hosting binds a real game socket;
   JOIN says HELLO to it, is counted, and is dropped after 4 s of silence.
   (A den hosted from the real game was INVISIBLE until this: the app
