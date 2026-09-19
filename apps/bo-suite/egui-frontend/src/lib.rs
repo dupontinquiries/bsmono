@@ -525,6 +525,19 @@ pub struct Controller {
     pub instrumental_col: crate::channel::ChannelColumn,
     pub mixer: crate::device::Mixer,
     pub profile: crate::device::Profile,
+    /// The product map, as the daemon described it.
+    ///
+    /// Empty until something fills it, which resolves to the permissive
+    /// hardcoded fallback — the QML's behaviour when its `JSON.parse` fails,
+    /// and the right one: an unrecognised device showing every control beats
+    /// a new speaker looking broken.
+    pub product_profiles: std::collections::BTreeMap<String, crate::device::Profile>,
+    /// Device address -> product type, as reported.
+    ///
+    /// Keyed on the ADDRESS because that is what `active_device_url` is
+    /// (outputs.rs: "a device here is an ADDRESS"), and a display name is not
+    /// unique — two Beoplays in one house are both "Beoplay".
+    pub product_types: std::collections::BTreeMap<String, String>,
     pub soundscape: crate::soundscape::Soundscape,
     /// Which scene preset was last loaded, for the status line.
     pub scene_loaded: Option<String>,
@@ -649,6 +662,8 @@ impl Controller {
                 ["weight", "midrange", "shimmer"]),
             mixer: Default::default(),
             profile: Default::default(),
+            product_profiles: Default::default(),
+            product_types: Default::default(),
             soundscape: Default::default(),
             settings: Default::default(),
             sinks: Default::default(),
@@ -663,6 +678,15 @@ impl Controller {
     ///
     /// The QML drops a page a device cannot use; `device::views_for` is that
     /// rule and this is where it meets the live profile.
+    /// The product type reported for a device address, if any.
+    ///
+    /// `None` is the ordinary state, not an error: a device the daemon has not
+    /// described yet resolves through the same fallback chain as an
+    /// unrecognised one.
+    pub fn product_type_of(&self, url: &str) -> Option<String> {
+        self.product_types.get(url).cloned()
+    }
+
     pub fn visible_views(&self) -> Vec<&'static str> {
         crate::device::views_for(&self.profile, &VIEWS)
     }
@@ -1019,6 +1043,26 @@ impl Controller {
             // otherwise revoke an unlock the operator just granted.
             if url != self.active_device_url {
                 self.safety.new_session();
+                // THE PROFILE FOLLOWS THE ACTIVE DEVICE, and this is the one
+                // place a device actually changes. What a Beosound can do is
+                // not what a Beoplay can, so the view set has to change with
+                // it — otherwise the filtering added alongside `views_for`
+                // never fires and headphones keep offering a Mixer.
+                //
+                // Reconciled by NAME immediately after, so the page you were
+                // on survives the switch when the new device also has it. The
+                // order matters: set the profile, THEN reconcile, or the
+                // reconcile computes the visible set from the old device.
+                let was = self.current();
+                // Resolved into a local first. `self.profile = f(&self.product_profiles, ..)`
+                // borrows self immutably on the right while assigning to a
+                // field of self on the left, and whether borrowck accepts that
+                // is exactly the kind of thing not worth being clever about.
+                let ty = self.product_type_of(&url);
+                let resolved =
+                    crate::device::resolve_profile(&self.product_profiles, ty.as_deref());
+                self.profile = resolved;
+                self.reconcile_views(was);
                 // A "device" here is an ADDRESS (outputs.rs's own doc), so
                 // an http(s) one is a networked B&O speaker to cast to —
                 // distinct from the Bluetooth/local sinks `SinkPicker`
@@ -3420,6 +3464,40 @@ mod view_reconcile_tests {
         c.reconcile_views("Settings");
         assert_eq!(c.current(), "Settings");
         assert_eq!(c.nav.page(), VIEWS.iter().position(|v| *v == "Settings").unwrap());
+    }
+
+    /// THE CHAIN END TO END. A device switch resolves a profile from the
+    /// product map and the view set follows it -- which is the whole point of
+    /// the three pieces and was not connected until the switch site was wired.
+    #[test]
+    fn switching_to_a_limited_device_drops_its_missing_views() {
+        let mut c = Controller::new(Vec::new(), Vec::new());
+        c.product_profiles.insert("Beoplay".into(), limited());
+        c.product_types.insert("http://phones".into(), "Beoplay".into());
+
+        // Before: default profile, everything visible.
+        assert_eq!(c.visible_views().len(), VIEWS.len());
+
+        // The switch, as `device_selector_ui` performs it.
+        let was = c.current();
+        let ty = c.product_type_of("http://phones");
+        let resolved = crate::device::resolve_profile(&c.product_profiles, ty.as_deref());
+        c.profile = resolved;
+        c.reconcile_views(was);
+
+        let v = c.visible_views();
+        assert!(!v.contains(&"Mixer"), "headphones keep offering a Mixer: {v:?}");
+        assert_eq!(c.current(), "Devices", "and the selection is still valid");
+    }
+
+    /// An address the daemon has not described resolves through the same
+    /// fallback as an unrecognised product -- ordinary, not an error.
+    #[test]
+    fn an_undescribed_address_keeps_every_view() {
+        let c = Controller::new(Vec::new(), Vec::new());
+        assert_eq!(c.product_type_of("http://never-seen"), None);
+        let p = crate::device::resolve_profile(&c.product_profiles, None);
+        assert_eq!(crate::device::views_for(&p, &VIEWS).len(), VIEWS.len());
     }
 
     /// An unknown product keeps every view, so reconciling is a no-op -- the
