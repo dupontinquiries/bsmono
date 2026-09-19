@@ -690,7 +690,21 @@ impl Blockers {
         self.near(x, z, self.cell * 2.0, &mut scratch);
         let mut best = 0.0f32;
         for &i in &scratch {
-            let c = self.all[i as usize].cover;
+            let b = &self.all[i as usize];
+            // A solid thing hides whatever is inside its footprint, whatever
+            // its SHAPE. Only the cover disc used to be consulted, and
+            // `push_segment` leaves that empty on the stated theory that a
+            // wall's own footprint does the hiding -- which nothing here ever
+            // checked. So when walls and logs became capsules (3e4574e4e)
+            // they also became transparent. The mid-jungle's screen test is
+            // what noticed.
+            if b.top > f32::NEG_INFINITY {
+                let (ax, az, r) = b.shape.nearest_axis(x, z);
+                if (x - ax).hypot(z - az) < r {
+                    return 1.0;
+                }
+            }
+            let c = b.cover;
             if c.amount <= 0.0 {
                 continue;
             }
@@ -718,8 +732,13 @@ impl Blockers {
         if len < 1e-4 {
             return self.concealment_at(a.0, a.1);
         }
-        let step = (self.cell * 0.5).max(0.25);
-        let n = ((len / step).ceil() as usize).clamp(1, 512);
+        // A fixed fine step. This was `cell * 0.5` -- 3 u on the scene's 6 u
+        // grid -- which is wider than most props: a ray straight across a
+        // 1.8 u wall could land a sample either side of it and report a clear
+        // view. The grid pitch is about finding candidates fast, and has
+        // nothing to do with how finely a line must be walked.
+        let step = 0.4;
+        let n = ((len / step).ceil() as usize).clamp(1, 1024);
         let mut worst = 0.0f32;
         for k in 0..=n {
             let t = k as f32 / n as f32;
@@ -888,6 +907,23 @@ mod tests {
             }
         }
         assert_eq!(checked, 8);
+    }
+
+    /// A wall hides what is behind it from EVERY angle, including square-on,
+    /// where the old 3 u sampling step walked straight over it.
+    #[test]
+    fn a_thin_wall_blocks_sight_wherever_the_ray_crosses_it() {
+        let mut b = Blockers::new(100.0, 6.0);
+        b.push_segment(PropKind::RuinWall, 8.0, -20.0, 8.0, 20.0, 0.0, 1.0);
+        let mut crossed = 0;
+        for k in 0..40 {
+            let z = -18.0 + k as f32 * 0.9;
+            let start = (0.13 * k as f32, z); // vary the phase of the samples against the wall
+            assert_eq!(b.sight_obstruction(start, (14.0, z + 1.0)), 1.0, "ray {k} saw through the wall");
+            crossed += 1;
+        }
+        assert_eq!(crossed, 40);
+        assert_eq!(b.sight_obstruction((0.0, 30.0), (14.0, 30.0)), 0.0, "and past its end the view is open");
     }
 
     /// Stems are the light things only: a rock beside the path is the sim's
