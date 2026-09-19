@@ -112,6 +112,20 @@ pub struct Studio {
     pub voice_inbox: Vec<studio_collab::wire::Packet>,
     /// Manifests for sources whose bytes this peer can serve.
     manifests: std::collections::BTreeMap<studio_core::SourceId, studio_collab::assets::Manifest>,
+    /// Content hash -> where that media is on disk, and which source it became.
+    ///
+    /// Populated in `register_asset`, which is where the hash already exists.
+    /// Two things need it: dropping the same file twice should reuse the
+    /// source rather than mint a second one with a second copy of the audio,
+    /// and a file that MOVED should be relinkable instead of failing to decode
+    /// at playback with no indication that a path is the problem.
+    pub media_map: crate::media_map::MediaMap,
+    /// Which source each asset key resolved to, for the dedupe lookup.
+    ///
+    /// Separate from `media_map` because the map is about media on disk and
+    /// this is about this project's sources — the same file in two projects is
+    /// one entry there and two here.
+    asset_sources: std::collections::BTreeMap<crate::media_map::AssetKey, studio_core::SourceId>,
     /// The content-addressed chunk store — shared across sources on purpose:
     /// a re-bounce that changed one bar re-ships one bar.
     chunk_store: std::collections::BTreeMap<studio_collab::assets::ChunkId, Vec<u8>>,
@@ -322,6 +336,8 @@ impl Studio {
             outbox: Vec::new(),
             voice_inbox: Vec::new(),
             manifests: Default::default(),
+            media_map: Default::default(),
+            asset_sources: Default::default(),
             chunk_store: Default::default(),
             pending_assets: Default::default(),
             incoming_audio: Vec::new(),
@@ -830,8 +846,35 @@ impl Studio {
     /// Make a source's media servable: chunk it into the content-addressed
     /// store and announce the manifest, so peers who just saw the
     /// `AddSource` op can fetch exactly the chunks they lack.
+    /// The source these exact bytes already became, if any.
+    ///
+    /// Answers "have I imported this file before" by CONTENT, so a sample
+    /// renamed or copied to a second folder is recognised as the take it is.
+    /// A path check would miss both, which is the case this exists for -- the
+    /// same loop lives in `bounces/` and in the project folder more often than
+    /// not.
+    ///
+    /// Only reports a source the project still has: an asset whose source was
+    /// deleted must re-import rather than hand back an id nothing resolves.
+    pub fn source_for_bytes(&self, bytes: &[u8]) -> Option<studio_core::SourceId> {
+        let key = crate::media_map::AssetKey(studio_collab::assets::hash(bytes));
+        let id = *self.asset_sources.get(&key)?;
+        self.session.doc.project.sources.contains_key(&id).then_some(id)
+    }
+
     pub fn register_asset(&mut self, source: studio_core::SourceId, bytes: &[u8]) {
         let (manifest, chunks) = studio_collab::assets::Manifest::build(bytes);
+        // RECORD WHAT THIS FILE IS, here, because this is the one place the
+        // content hash and the source id are both in hand. The path comes off
+        // the Source rather than being threaded in as a parameter: it is
+        // already stored there, and widening this signature would touch six
+        // call sites to pass a value five of them would have to look up
+        // anyway.
+        let key = crate::media_map::AssetKey(manifest.asset);
+        if let Some(src) = self.session.doc.project.sources.get(&source) {
+            self.media_map.record(key, src.path.clone(), bytes.len() as u64);
+        }
+        self.asset_sources.insert(key, source);
         self.chunk_store.extend(chunks);
         self.outbox.push(studio_collab::wire::Packet::AssetManifest {
             source, manifest: manifest.clone(),
@@ -3933,6 +3976,34 @@ impl eframe::App for App {
             };
             match decoded {
                 Ok((audio, path, raw)) => {
+                    // ALREADY HAVE THIS FILE? Reuse the source instead of
+                    // minting a second one. By content, so a sample renamed or
+                    // copied into a second folder is recognised as the take it
+                    // is -- a path check would miss both, and the same loop
+                    // living in `bounces/` and the project folder is the
+                    // common case rather than the odd one.
+                    //
+                    // The decode above is not wasted work worth avoiding: the
+                    // bytes have to be read to be hashed at all, and skipping
+                    // the decode would mean hashing separately and reading the
+                    // file twice.
+                    if let Some(existing) = self.studio.source_for_bytes(&raw) {
+                        // SKIPS the second import; does not yet place a second
+                        // clip from the existing source. Stated plainly because
+                        // the two are different gestures and only one is done:
+                        // dropping a file you already have no longer costs a
+                        // duplicate source and a second copy of the audio in
+                        // memory, but if you dropped it meaning "give me
+                        // another instance of this", that still needs the
+                        // library. Saying "reusing it" would have claimed the
+                        // second.
+                        let short = crate::media_map::AssetKey(
+                            studio_collab::assets::hash(&raw)).short();
+                        self.studio.status = format!(
+                            "'{name}' is already imported as source {} [{short}]",
+                            existing.0);
+                        continue;
+                    }
                     // The panel you're looking at names the import you meant:
                     // a file dropped on the Rack is a drum hit for a sampler
                     // channel; dropped anywhere else it's arrangement
