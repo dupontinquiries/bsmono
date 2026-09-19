@@ -57,6 +57,15 @@ the single highest-value thing anyone can do with this repo next.
 
 ## Known gaps
 
+- **AI map backend: started (`mapgen.rs`), no model attached.** The tool
+  surface, refusals-in-words, mirrored placement, digests, undo, validate and
+  the visible transcript loop exist and are tested. Next, in order: (1) have
+  `scene::build_world` consume a `MapDraft` (it already consumes the same
+  `Placement` type from `midjungle`); (2) implement `MapAuthor` over
+  `ai-gpu`/aperture, feeding `mapgen::tools()` as the system prompt; (3) rules
+  for leap chains, sight lines and camps; (4) derive `KINDS` and build_world's
+  mesh match from one table so they cannot drift.
+
 - **Lockstep: the rule exists, the wire does not.** `lockstep.rs` proves the
   sim deterministic (1800 ticks, bit-identical) and implements
   advance-only-when-complete with stall, input delay and a desync checksum.
@@ -246,7 +255,7 @@ the single highest-value thing anyone can do with this repo next.
 ## Verification commands
 
 ```bash
-cargo test --no-default-features   # 248 lib + 16 + 2 (+90 in games/shared/netcode, was +3 in games/shared/netcode), no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
+cargo test --no-default-features   # 251 lib + 16 + 2 (+90 in games/shared/netcode, was +3 in games/shared/netcode), no GPU, no audio libs needed (was '79': the lib tests had stopped compiling)
 cargo test                          # same, plus links cpal (needs libasound2-dev)
 cargo check --features gamepad      # needs libudev-dev
 cargo run --example simdbg <seed>   # headless 12-minute AI match trace
