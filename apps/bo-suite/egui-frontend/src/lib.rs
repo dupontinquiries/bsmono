@@ -6,6 +6,11 @@
 //! mixer/routing engine is already Qt-free, so on-device this drives it directly; here it
 //! carries a small view model so the crate builds and the logic is unit-tested.
 
+/// The RUNTIME DEPENDENCIES card from SettingsPage.qml, as a model. The real
+/// audit lives in `bo-controller::dep_wrangler`, which is a BINARY crate and
+/// so unreachable from here -- the audit arrives as data, exactly as the QML
+/// receives it.
+pub mod dep_audit;
 pub mod dial_watermark;
 pub mod product_silhouette;
 pub mod transport;
